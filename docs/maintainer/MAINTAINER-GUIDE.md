@@ -1857,8 +1857,12 @@ staleness→recompute loop — that is the platform's, not the engine's
   positive-proof equation (`fused + eager == calls × batches`) reads its `calls` term
   straight off this struct instead of a reader deriving it by hand from a config. **The
   invariant: every count is WALKED off the built structure — never config arithmetic.**
-  `lora_sites_wrapped` counts `MaybeLoraLinear::is_lora() == true` over the tower's own site
-  traversal; `layer_norms` counts the house `LayerNorm` instances the built tower actually
+  `lora_sites_wrapped` counts `jammi_lora::MaybeLoraLinear::takes_lora_linear_admission() ==
+  true` over the tower's own site traversal — a NARROWER predicate than `is_lora()`:
+  `LoraLinear::forward` branches on `FrozenBase::Dense` vs `FrozenBase::Quantized` before it
+  ever reaches `admit()`, so a `Lora` site over a `Quantized` base (a QLoRA backbone) is
+  adapted (`is_lora() == true`) but takes no `lora_linear_fused` admission decision and is not
+  counted here; `layer_norms` counts the house `LayerNorm` instances the built tower actually
   holds (a family that omits one, e.g. ModernBERT's `None` layer-0 pre-norm or an HTSAT stage
   with no `downsample`, contributes what it actually holds, not what `2 × layers` predicts);
   `gelu_seam_calls_per_forward` counts calls to `activations::gelu_erf` per forward (`0` for
@@ -1943,15 +1947,23 @@ staleness→recompute loop — that is the platform's, not the engine's
   `projection_hidden_act == "gelu"`; the tower's own module doc carries that arithmetic and
   the per-site oracles (including the `"relu"` negative control) that pin it.
 - **A config field that names a computation is dispatched on or REFUSED, never ignored** —
-  `HtsatAudioConfig.hidden_act` names the Swin MLP's activation, but `SwinBlock::forward`
-  is unconditionally GELU-erf, so `HtsatAudioEncoder::load` REFUSES any value other than
-  `"gelu"` (HF `ClapAudioConfig`'s only shipped value) at load, naming the field and the
-  offending value, through both entry points (`HtsatAudio::load` and
-  `HtsatAudio::builder().build(..)`). A checkpoint declaring `"relu"` there would otherwise
-  load and then silently compute something its own config does not describe — the worst
-  failure shape available, because every downstream number still looks well-formed.
-  Contrast `projection_hidden_act`, which IS genuinely dispatched on at forward (`"gelu"`
-  and `"relu"` are both real arms) and therefore needs no load-time refusal.
+  five `HtsatAudioConfig` fields name a computation the forward path has hard-coded to one
+  value, and `HtsatAudioEncoder::load_with` REFUSES, before any tensor is touched, any
+  checkpoint that declares the other one, through both entry points (`HtsatAudio::load` and
+  `HtsatAudio::builder().build(..)`): `hidden_act` (must be `"gelu"` — `SwinBlock::forward`
+  is unconditionally gelu-erf), `enable_fusion` (must be `true` — `HtsatPatchEmbed::forward`
+  always builds and applies the AFF fusion blend), `enable_patch_layer_norm` (must be
+  `true` — `HtsatPatchEmbed::forward` always applies its trailing LayerNorm),
+  `flatten_patch_embeds` (must be `true` — `HtsatPatchEmbed::forward` always flattens the
+  patch grid to `[B, num_patches, C]`), and `qkv_bias` (must be `true` —
+  `SwinSelfAttention::load_with` always builds bias-carrying `query`/`key`/`value` linears).
+  A checkpoint declaring any of the five otherwise would load and then silently compute
+  something its own config does not describe — the worst failure shape available, because
+  every downstream number still looks well-formed. Every HF `ClapAudioConfig` this tower has
+  ever shipped against (`laion/clap-htsat-fused`, this workspace's `htsat_clap_tiny` fixture)
+  already declares all five at the one supported value. Contrast `projection_hidden_act`,
+  which IS genuinely dispatched on at forward (`"gelu"` and `"relu"` are both real arms) and
+  therefore needs no load-time refusal.
 - **The de-facto BERT-family contract** — no Rust trait; the three encoders expose an
   *identical inherent-method surface* (`builder`, `forward`, `forward_hidden`,
   `hidden_size`, `max_seq_length`, `trainable_params`, `named_trainable_weights`,

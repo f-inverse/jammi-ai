@@ -373,11 +373,18 @@ byte-identical to what every invocation written before the flag produced — `ga
 exists because a `zeros_b` adapter has a zero `B`, hence a zero gradient into `A` at step
 0, which makes it useless as a dtype pre-flight); and `--expect-kernels-disabled <keys>`
 turns a forced-eager leg's premise into a checked one. That last flag is what makes an
-eager twin a datum rather than an assumption: the run refuses at START unless every named
-key is present in `JAMMI_KERNELS_DISABLE` (SUBSET semantics, deliberately weaker than
-`finetune-step`'s equality, because `--arm alloff` pins its own keys into the same
-variable), and refuses at the END unless no requested disable went unmatched AND every
-named key's fused dispatch counter read zero across the run. A leg that fails either check
+eager twin a datum rather than an assumption: the run refuses at START unless this flag's
+value EQUALS this process's real `JAMMI_KERNELS_DISABLE` exactly (unit-467 adversarial
+audit finding F1 tightened an earlier, weaker SUBSET check — `--arm alloff` already forces
+an exact-set match of its own two keys, so the "combined leg naming a chain key on top of
+alloff's pair" the subset check existed for can never occur, and the weaker check let an
+ambient/leftover env var through undetected), and refuses at the END unless no requested
+disable went unmatched AND every named key's fused dispatch counter read zero across the
+run. An unlabeled `--arm fused` leg (no `--expect-kernels-disabled` at all) now ALSO refuses
+at START whenever `JAMMI_KERNELS_DISABLE` resolves non-empty, naming the offending keys —
+closing the same finding's other half, where an ambient disable silently contaminated a
+"fused" leg while the positive-proof equation and every other check stayed green (a realized
+gain reading as zero with nothing red to explain why). A leg that fails any of these checks
 exits non-zero and writes no row — INVALID, never a datum. The claim itself is recorded on
 the report as provenance (`kernels_disabled_expected`), distinct from the process-OBSERVED
 `kernels_disabled_requested`/`kernels_disabled_fired` pair it was checked against.
@@ -386,7 +393,21 @@ the report as provenance (`kernels_disabled_expected`), distinct from the proces
 `profile_356_legs.sh` by tower: it builds the leg table, generates each leg's corpus and
 work dir, cross-checks provenance, stamps a per-leg manifest, and captures the census. The
 forced-eager disable list is PER TOWER for the reason above — the CLIP legs name only the
-keys those towers actually admit, HTSAT adds `gelu_erf_fused`. A hermetic dry-run suite
+keys those towers actually admit, HTSAT adds `gelu_erf_fused`. The driver refuses before any
+leg runs if `JAMMI_KERNELS_DISABLE` reaches its OWN process environment (it must only ever
+be scoped, per D leg, onto a single child invocation via `env VAR=... cmd`), plus a
+belt-and-braces read of each leg's own report that additionally refuses an A leg whose
+`kernels_disabled_requested` came back non-empty. Its `_checkpoint_identity_probe` refuses a
+`$MODEL_DIR_CLIP` carrying `config.json`/`model.safetensors` (`arch.rs`'s
+`Checkpoint::resolve` prefers those over the `open_clip_config.json`/
+`open_clip_model.safetensors` pair every CLIP leg declares, so such a directory would
+silently resolve to the wrong architecture family) and a `$MODEL_DIR_CLAP` missing any of
+`config.json`/`model.safetensors`/`preprocessor_config.json`. Each leg's manifest records
+`checkpoint_weights_sha256`/`fusible_site_census` per run, and `profile_421_merge.py`
+refuses, by name, an A leg whose report witnesses a non-empty disable list, and a per-tower
+cross-leg (and cross-P2) mismatch of either value — two legs of one tower that measured
+different checkpoint bytes or built a different encoder are not comparable, whatever their
+own within-leg checks found. A hermetic dry-run suite
 (`ci/scripts/perf/test_profile_421_legs_dry_run.py`) drives the real script end to end with
 no GPU, no `nsys`, no checkpoint and no network, on both its dry-run and its real-preflight
 surfaces, and is a matrix leg in `.github/workflows/ci.yml`.
@@ -394,15 +415,19 @@ surfaces, and is a matrix leg in `.github/workflows/ci.yml`.
 **The front end is measured, never differenced.** `finetune-run` reports
 `media_front_end_wall_s` on every media leg, read from
 `TrainingResult::media_front_end_wall` and summed across the resume-cycled epoch legs of a
-run. Its boundary is DECLARED, not implied: the wall around the decode + preprocess call —
-including the device tensor build those preprocess functions perform internally, which
-cannot be separated without splitting them — with the tower forward EXCLUDED, accumulated
-only while the loop is in training mode (held-out eval passes are excluded, so the number
-is a strict subset of the training wall), and `null` rather than `0.0` on a text leg
-because tokenization is not a media front end and stays in the residual. (The
-projection-head training target is the one arm where the frozen base's decode, preprocess
-and forward are one inseparable call; the whole call is charged there, and that field's own
-doc says so.) It is a MEASURED field — neither identity nor provenance — for the same
+run. Its boundary is DECLARED, not implied, and it has exactly ONE such boundary: on an
+`EncoderAdapters` target, the wall around the decode + preprocess call — including the
+device tensor build those preprocess functions perform internally, which cannot be
+separated without splitting them — with the tower forward EXCLUDED, accumulated only while
+the loop is in training mode (held-out eval passes are excluded, so the number is a strict
+subset of the training wall), and `null` rather than `0.0` on a text leg because
+tokenization is not a media front end and stays in the residual. On a `ProjectionHead`
+target, of any modality, the field never accumulates at all — the frozen base's decode,
+preprocess and forward are one inseparable call there with no seam to time in isolation, so
+charging that combined call to a field documented as front-end-only would give it a second,
+incompatible meaning (a residual computed against it would double-subtract the tower
+forward); reporting `0` is the honest reading, per that field's own doc. It is a MEASURED
+field — neither identity nor provenance — for the same
 reason the dispatch counters are, and it is deliberately NOT `wall − gpu_busy`: a
 difference would absorb launch latency, sync stalls and the optimizer's own CPU time into a
 number labelled "front end". Having it directly is what lets a profile report `launch/sync
@@ -420,9 +445,12 @@ is `fused + eager == calls × batches` per admission key. `fused`/`eager` are me
 process-wide `jammi_kernels::admission` counters) and `batches` is measured (training
 forwards taken), but `calls` — how many times ONE forward reaches a given seam — had no
 witness before `AnyEncoder::fusible_site_census() -> FusibleSiteCensus`
-(`crates/jammi-encoders/src/fusible_census.rs`): `lora_sites_wrapped` (sites the builder
-actually wrapped in a LoRA adapter — `MaybeLoraLinear::is_lora` over the tower's own site
-traversal — paired with `lora_linear_fused`), `layer_norms` (house `LayerNorm` instances the
+(`crates/jammi-encoders/src/fusible_census.rs`): `lora_sites_wrapped` (sites the built tower's
+ONE training forward actually takes a `lora_linear_fused` admission decision for —
+`jammi_lora::MaybeLoraLinear::takes_lora_linear_admission` over the tower's own site
+traversal, a NARROWER predicate than `is_lora`: a `Lora` site over a `FrozenBase::Quantized`
+base (a QLoRA backbone) is adapted but composes before ever reaching `admit()`, so it is not
+counted here — paired with `lora_linear_fused`), `layer_norms` (house `LayerNorm` instances the
 built tower actually holds on its forward path, paired with `layer_norm_fused`), and
 `gelu_seam_calls_per_forward` (calls to `activations::gelu_erf` per forward, paired with
 `gelu_erf_fused`). Every count is WALKED off the built structure — the `Vec<Layer>` the
@@ -461,7 +489,7 @@ before it ever evaluates the equation — never silently computing a wrong `call
 product.
 
 **`profile_421_merge.py`'s role.** The merge step (`ci/scripts/perf/profile_421_merge.py`,
-tested by 45 hermetic tests in `ci/scripts/perf/test_profile_421_merge.py`) is where the
+tested by 53 hermetic tests in `ci/scripts/perf/test_profile_421_merge.py`) is where the
 N/M wall-differencing method above becomes checked arithmetic for the towers. Per admission
 key it re-checks `fused + eager == fusible_site_census × steps_measured` (refusing INVALID
 first on the epochs/grad-accum convention above), and on a D leg it additionally requires

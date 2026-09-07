@@ -138,29 +138,30 @@ workspace ships every publishable crate at the same
 - **A checkable forced-eager premise, a selectable LoRA init, and a directly measured media
   front end (#421).** `jammi-bench finetune-run --expect-kernels-disabled <keys>` turns a
   forced-eager leg's premise into a checked one: the run refuses at start unless this flag's value
-  EQUALS this process's real `JAMMI_KERNELS_DISABLE` exactly (unit-467 adversarial audit finding
-  F1 tightened an earlier, weaker subset check — `--arm alloff` already forces an exact-set
-  match of its own two keys, so the "combined leg" the subset check existed for can never occur,
-  and the weaker check let an ambient/leftover env var through undetected), and refuses at the end
-  unless no requested disable went unmatched and every named key's fused dispatch counter read
-  zero across the run; either refusal exits non-zero and writes no row. An unlabeled `--arm fused`
-  leg (no `--expect-kernels-disabled`) now ALSO refuses at start when `JAMMI_KERNELS_DISABLE`
-  resolves non-empty, naming the offending keys — closing the same finding's other half, where an
-  ambient disable silently contaminated a "fused" leg while every other check stayed green.
-  `--lora-init {zeros_b,gaussian}` selects the adapter initialization — `zeros_b` is
-  the default and byte-identical to what every prior invocation produced, while `gaussian` gives a
-  non-zero gradient into `A` at step 0, which a zero-`B` adapter cannot. The report gains
-  `media_front_end_wall_s`: wall spent in the media decode/preprocess front end, read from the new
+  EQUALS this process's real `JAMMI_KERNELS_DISABLE` exactly, and refuses at the end unless no
+  requested disable went unmatched and every named key's fused dispatch counter read zero across
+  the run; either refusal exits non-zero and writes no row. An unlabeled `--arm fused` leg (no
+  `--expect-kernels-disabled` at all) likewise refuses at start whenever `JAMMI_KERNELS_DISABLE`
+  resolves non-empty, naming the offending keys, so an ambient or leftover disable can never
+  silently contaminate a leg claiming to be fully fused. `--lora-init {zeros_b,gaussian}` selects
+  the adapter initialization — `zeros_b` is the default and byte-identical to what every prior
+  invocation produced, while `gaussian` gives a non-zero gradient into `A` at step 0, which a
+  zero-`B` adapter cannot. The report gains `media_front_end_wall_s`: wall spent in the media
+  decode/preprocess front end, read from the new
   `jammi_ai::fine_tune::TrainingResult::media_front_end_wall` and summed across a run's
-  resume-cycled epoch legs. Its boundary is declared, not implied — decode plus preprocess
-  including the device tensor build those functions perform internally, tower forward excluded,
-  accumulated only in training mode (held-out eval passes excluded, so it is a strict subset of the
-  training wall), `null` rather than `0.0` on a text leg because tokenization is not a media front
-  end. It is measured directly, never `wall − gpu_busy`, so it does not absorb launch latency, sync
-  stalls and optimizer CPU time into a number labelled "front end". `--task`, `--lora-init` and the
-  media corpora's own content digests (`train_media_sha256`/`heldout_media_sha256`, digests of the
-  bytes behind a manifest that names only paths) join the report's identity tuple;
-  `kernels_disabled_expected` joins its provenance tuple; `media_front_end_wall_s` is in neither.
+  resume-cycled epoch legs. Its boundary is declared, not implied, and has exactly one shape — on
+  an `EncoderAdapters` target: decode plus preprocess including the device tensor build those
+  functions perform internally, tower forward excluded, accumulated only in training mode
+  (held-out eval passes excluded, so it is a strict subset of the training wall), `null` rather
+  than `0.0` on a text leg because tokenization is not a media front end. A `ProjectionHead`
+  target never accumulates into this field at all, on any modality: the frozen base's decode,
+  preprocess and forward there are one inseparable call with no seam to time in isolation, so
+  charging it here would give the field a second, incompatible meaning. It is measured directly,
+  never `wall − gpu_busy`, so it does not absorb launch latency, sync stalls and optimizer CPU time
+  into a number labelled "front end". `--task`, `--lora-init` and the media corpora's own content
+  digests (`train_media_sha256`/`heldout_media_sha256`, digests of the bytes behind a manifest
+  that names only paths) join the report's identity tuple; `kernels_disabled_expected` joins its
+  provenance tuple; `media_front_end_wall_s` is in neither.
 - **Held-out splits from the corpus producers (#421).** All three fixed-shape corpus producers
   (`ci/scripts/perf/gen_fixed_width_corpus.py`, `gen_fixed_shape_image_corpus.py`,
   `gen_fixed_length_audio_corpus.py`) emit a held-out split on `--heldout-rows`, writing a
@@ -183,7 +184,7 @@ workspace ships every publishable crate at the same
   answered correctly rather than by formula. Every count is per training forward only — an
   eval forward contributes `0` to both sides of the profile equation. `FinetuneRunTier` gains
   `fusible_site_census` as PROVENANCE (captured every epoch, refused if it changes;
-  `PROVENANCE_FIELDS` 11 → 12). `ci/scripts/perf/profile_421_merge.py` (45 hermetic tests)
+  `PROVENANCE_FIELDS` 11 → 12). `ci/scripts/perf/profile_421_merge.py` (53 hermetic tests)
   reads its `calls` term from this field and checks `fused + eager == fusible_site_census ×
   steps_measured` per key, `fused == 0` for every `kernels_disabled_expected` key on a D leg,
   and computes `residual = wall − front − busy` per step — a negative residual reports as
@@ -207,13 +208,15 @@ workspace ships every publishable crate at the same
   `HtsatAudio::set_training`'s single stored flag; the flag-less `HtsatAudioEncoder::forward_spine`
   and `ClapAudioProjection::forward_unnormalized` remain as eval conveniences defined in terms of
   their `_with_training(.., false)` twins.
-- **`MaybeLoraLinear` gains a public `is_lora` accessor (#421).** Whether a site carries an
-  adapter (the `Lora` arm) rather than a plain frozen base, for a consumer that needs to
-  COUNT wrapped sites — `jammi_encoders::FusibleSiteCensus`'s `lora_sites_wrapped` is the
-  first caller. Deliberately not the same measurement as counting
-  `trainable_params()` (a count of TENSORS, two per adapted site, which reads the same `0`
-  for "no adapter installed" as for "an adapter with an empty A/B pair"); a `true` here does
-  not by itself mean the fused kernel ran, only that the site is an adapted one.
+- **`MaybeLoraLinear` gains a public `is_lora` accessor, plus the narrower
+  `takes_lora_linear_admission` (#421/#467).** `is_lora` answers whether a site carries an
+  adapter (the `Lora` arm) rather than a plain frozen base — deliberately not the same
+  measurement as counting `trainable_params()` (a count of TENSORS, two per adapted site,
+  which reads the same `0` for "no adapter installed" as for "an adapter with an empty A/B
+  pair"); a `true` here does not by itself mean the fused kernel ran, only that the site is
+  an adapted one. `takes_lora_linear_admission` narrows that further to the sites a
+  `lora_linear_fused` call-count census needs — see the `lora_sites_wrapped` entry below for
+  why `is_lora` alone overstates that count on a quantized base.
 - **`HtsatAudioConfig.hidden_act` is validated at load instead of silently ignored (#421).** A
   checkpoint declaring any value other than `"gelu"` — the only value HF `ClapAudioConfig` ships —
   is now refused by name at load, through both `HtsatAudio::load` and

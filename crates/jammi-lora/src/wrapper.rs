@@ -52,6 +52,28 @@ impl MaybeLoraLinear {
         }
     }
 
+    /// Whether this site actually carries an adapter — the `Lora` arm.
+    ///
+    /// One accessor, for the same reason [`Self::base`] exists: a consumer
+    /// that needs to COUNT wrapped sites (a structural census of how many
+    /// `lora_linear_fused` admissions one training forward can take, e.g.
+    /// `jammi_encoders`' `FusibleSiteCensus`) would otherwise re-derive the
+    /// arm split with a `matches!` at every call site. Counting
+    /// [`Self::trainable_params`] instead is NOT the same measurement: that
+    /// is a count of TENSORS (two per adapted site), and it silently returns
+    /// the same `0` for "no adapter installed" as for "an adapter whose A/B
+    /// pair is empty" — this answers the structural question directly.
+    ///
+    /// A `true` here does NOT by itself mean the fused kernel runs: the
+    /// adapted site still takes its own admission decision per TRAINING
+    /// forward (and takes none at all in eval), and a
+    /// [`FrozenBase::Quantized`] base never reaches the fused seam at all
+    /// (see [`crate::LoraLinear::forward`]'s own doc). It means exactly that
+    /// this site is an adapted one.
+    pub fn is_lora(&self) -> bool {
+        matches!(self, Self::Lora(_))
+    }
+
     /// Trainable parameters of this layer. Empty for `Frozen`; the LoRA A and
     /// B tensors for `Lora`.
     pub fn trainable_params(&self) -> Vec<&Tensor> {

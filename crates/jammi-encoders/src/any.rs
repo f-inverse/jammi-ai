@@ -28,6 +28,7 @@ use crate::bert::Bert;
 use crate::clip_text::ClipText;
 use crate::distilbert::DistilBert;
 use crate::error::EncoderError;
+use crate::fusible_census::FusibleSiteCensus;
 use crate::htsat_audio::HtsatAudio;
 use crate::modernbert::ModernBert;
 use crate::open_clip_vision::OpenClipVisionTransformer;
@@ -552,6 +553,51 @@ impl AnyEncoder {
         }
     }
 
+    /// The per-forward [`FusibleSiteCensus`] of THIS built tower — how many
+    /// times one TRAINING forward calls each fusible seam, and therefore the
+    /// `calls` term of a fused-kernel profile's positive-proof equation
+    /// `fused + eager == calls * batches`.
+    ///
+    /// Read [`FusibleSiteCensus`]'s own doc first: it carries the
+    /// per-forward/training-only semantics, the field↔admission-key mapping,
+    /// and why every count is walked off the built structure rather than
+    /// computed from a config.
+    ///
+    /// TOTAL over the enum — every variant answers, and the families differ
+    /// only in what the walk finds:
+    ///
+    /// | variant | LoRA sites | LayerNorms | GELU seam calls |
+    /// |---|---|---|---|
+    /// | `Bert` | wrapped arms of 6 per layer | embeddings + 2 per layer | one per layer |
+    /// | `DistilBert` | wrapped arms of 6 per layer | embeddings + 2 per layer | one per layer |
+    /// | `ModernBert` | wrapped arms of 4 per layer | embeddings + final + `mlp_norm` per layer + `attn_norm` where present (`None` on layer 0) | `0` (GeGLU is its own key) |
+    /// | `ClipText` | wrapped arms of 4 per block | 2 per block + `ln_final` | `0` (`quick_gelu` has no seam) |
+    /// | `OpenClipVision` | wrapped arms of 4 per block | `ln_pre` + 2 per block + `ln_post` | `0` (`quick_gelu` has no seam) |
+    /// | `Htsat` | wrapped arms of the Swin/merge/projection traversal | patch-embed + 2 per Swin block + one per `downsample` + final | one per Swin block, `+1` when the projection act is `"gelu"` |
+    ///
+    /// A `0` in this table is an ASSERTION, not an omission: it says one
+    /// training forward of that family takes exactly zero admission
+    /// decisions on that key, which the per-tower oracles check against the
+    /// live counters rather than leave as prose.
+    ///
+    /// This is deliberately NOT derivable from
+    /// [`Self::lora_site_names`]: that returns the SELECTOR vocabulary (4
+    /// names for the OpenCLIP towers, 9 for HTSAT) — how a caller ASKS for
+    /// sites — while this counts the linears a build actually wrapped (48
+    /// and 77 respectively on the real checkpoints under `all-linear`).
+    /// Reading a selector count as a call count is exactly the confusion
+    /// this accessor exists to make impossible.
+    pub fn fusible_site_census(&self) -> FusibleSiteCensus {
+        match self {
+            Self::Bert(e) => e.fusible_site_census(),
+            Self::DistilBert(e) => e.fusible_site_census(),
+            Self::ModernBert(e) => e.fusible_site_census(),
+            Self::ClipText(e) => e.fusible_site_census(),
+            Self::OpenClipVision(e) => e.fusible_site_census(),
+            Self::Htsat(e) => e.fusible_site_census(),
+        }
+    }
+
     /// Trainable tensors across every LoRA-wrapped site. Empty for a fully
     /// frozen backbone.
     pub fn trainable_params(&self) -> Vec<&Tensor> {
@@ -986,5 +1032,66 @@ mod tests {
         assert_eq!(probe.modality(), Modality::Text);
         let out = encoder.forward_input(&probe.as_input()).unwrap();
         assert_eq!(out.dims(), &[1, cfg.embed_dim]);
+    }
+
+    /// #421 P1-a3, the purity control for [`AnyEncoder::fusible_site_census`]:
+    /// READING the census is a structural walk and nothing else — it runs no
+    /// forward, takes no admission decision, and moves no dispatch counter.
+    ///
+    /// This is what makes it safe for the bench to record the census INSIDE
+    /// its own measurement window, next to the counters it explains. A
+    /// census that dispatched while being read would contaminate exactly the
+    /// numbers it exists to witness, and every per-tower exact-count oracle
+    /// would still pass (they snapshot around the FORWARD, not around the
+    /// census read).
+    ///
+    /// Idempotence is asserted alongside it for the same reason: two reads of
+    /// the same built tower must be equal, or the "census" would be a
+    /// property of when it was read rather than of the structure.
+    #[test]
+    fn reading_the_fusible_site_census_dispatches_nothing() {
+        let device = Device::Cpu;
+        let cfg = tiny_config();
+        let varmap = VarMap::new();
+        let vb = VarBuilder::from_varmap(&varmap, DType::F32, &device);
+        let mut encoder = AnyEncoder::ClipText(ClipText::load(vb, &cfg).unwrap());
+        deterministic_fill_varmap(&varmap, &device);
+
+        // Lock order: attention_cascade THEN layer_norm — see
+        // `crate::htsat_audio`'s own multi-lock test doc. Held even though
+        // this test drives no forward: it reads the process-wide counters
+        // for an exact-equality assertion, so a concurrent training forward
+        // in another test would otherwise land inside the window.
+        let _attn_guard = crate::attention_cascade::ATTENTION_BLOCK_COUNTER_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let _ln_guard = crate::layer_norm::DISPATCH_COUNTER_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+
+        // Read in BOTH modes: the census is a structural property, so the
+        // training flag must not change it either.
+        let before = crate::test_support::seam_dispatch_totals();
+        encoder.set_training(true);
+        let training_read = encoder.fusible_site_census();
+        encoder.set_training(false);
+        let eval_read = encoder.fusible_site_census();
+        let after = crate::test_support::seam_dispatch_totals();
+
+        assert_eq!(
+            after, before,
+            "reading the census must not take a single admission decision"
+        );
+        assert_eq!(
+            training_read, eval_read,
+            "the census is a property of the built structure, not of the training flag"
+        );
+        assert_eq!(
+            training_read,
+            encoder.fusible_site_census(),
+            "two reads of the same built tower must be equal"
+        );
+        // Non-vacuity: this fixture really does hold seam sites to count.
+        assert!(eval_read.layer_norms > 0);
     }
 }

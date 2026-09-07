@@ -400,6 +400,28 @@ impl DistilBert {
         Ok(out)
     }
 
+    /// This family's [`crate::FusibleSiteCensus`], walked off the built
+    /// tower exactly as `crate::bert::Bert::fusible_site_census` walks its
+    /// own (see [`crate::FusibleSiteCensus`] for what each field means).
+    /// DistilBERT's shape happens to match BERT's — embeddings norm plus two
+    /// post-norms per layer, one GELU seam call per layer's
+    /// [`DistilBertFfn`] — but it is counted from THIS tower's structs, not
+    /// borrowed from that agreement.
+    pub(crate) fn fusible_site_census(&self) -> crate::FusibleSiteCensus {
+        crate::FusibleSiteCensus {
+            lora_sites_wrapped: self
+                .layers
+                .iter()
+                .flat_map(distil_lora_sites)
+                .filter(|(_, lin)| lin.is_lora())
+                .count(),
+            layer_norms: std::iter::once(&self.embeddings.layer_norm)
+                .chain(self.layers.iter().flat_map(distil_layer_norms))
+                .count(),
+            gelu_seam_calls_per_forward: self.layers.len(),
+        }
+    }
+
     /// Toggle training mode on every LoRA-augmented linear and every LayerNorm.
     /// LoRA layers gate dropout; LayerNorms switch between the fused no-bwd
     /// eval kernel and the primitive-op composition whose backward is well-
@@ -493,6 +515,14 @@ impl DistilBert {
 /// least one real site on a fixture while the union of all of them is
 /// exactly what `all-linear` selects.
 pub(crate) const LORA_SITE_NAMES: &[&str] = &["q_lin", "k_lin", "v_lin", "out_lin", "lin1", "lin2"];
+
+/// The two house LayerNorms one DistilBERT layer holds — the companion of
+/// [`distil_lora_sites`] for [`DistilBert::fusible_site_census`]'s LayerNorm
+/// walk. The embeddings norm belongs to the model, not a layer, and is
+/// chained in separately by the caller.
+fn distil_layer_norms(layer: &DistilBertLayer) -> [&LayerNorm; 2] {
+    [&layer.sa_layer_norm, &layer.output_layer_norm]
+}
 
 /// The six LoRA-wrappable linear sites of one DistilBERT layer paired with their
 /// `named_trainable_weights` site names.
@@ -1323,6 +1353,140 @@ mod tests {
         assert!(
             msg.contains("attention_block_fused") || msg.contains("head_dim"),
             "expected a StrictModeFallback naming the refused op/predicate: {msg}"
+        );
+    }
+
+    /// A minimal, DETERMINISTIC safetensors archive carrying every key
+    /// [`DistilBertBuilder::build`] reads for `config`.
+    ///
+    /// Synthesised rather than committed because this crate ships no
+    /// DistilBERT fixture (`tests/it/distilbert.rs` says the same and does
+    /// the same). Deterministic — a fixed LCG walk, not `Tensor::randn` —
+    /// because a census oracle should not have a second source of run-to-run
+    /// variation in it: the dispatch COUNTS do not depend on the values, and
+    /// a failure should therefore be reproducible from the test name alone.
+    fn write_synthetic_distilbert(
+        config: &DistilBertConfig,
+        device: &Device,
+    ) -> (tempfile::TempDir, std::path::PathBuf) {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("distilbert.safetensors");
+        let mut tensors: HashMap<String, Tensor> = HashMap::new();
+
+        let h = config.hidden_size;
+        let inter = config.intermediate_size;
+        let mut state: u32 = 1;
+        let mut filled = |shape: (usize, usize)| -> Tensor {
+            let n = shape.0 * shape.1;
+            let v: Vec<f32> = (0..n)
+                .map(|_| {
+                    state = state.wrapping_mul(1_103_515_245).wrapping_add(12_345);
+                    ((state >> 8) as f32 / (1u32 << 24) as f32 - 0.5) * 0.2
+                })
+                .collect();
+            Tensor::from_vec(v, shape, device).unwrap()
+        };
+        let ones = |n: usize| Tensor::ones((n,), DType::F32, device).unwrap();
+        let zeros = |n: usize| Tensor::zeros((n,), DType::F32, device).unwrap();
+
+        let emb = "distilbert.embeddings";
+        tensors.insert(
+            format!("{emb}.word_embeddings.weight"),
+            filled((config.vocab_size, h)),
+        );
+        tensors.insert(
+            format!("{emb}.position_embeddings.weight"),
+            filled((config.max_position_embeddings, h)),
+        );
+        tensors.insert(format!("{emb}.LayerNorm.weight"), ones(h));
+        tensors.insert(format!("{emb}.LayerNorm.bias"), zeros(h));
+
+        for n in 0..config.num_hidden_layers {
+            let p = format!("distilbert.transformer.layer.{n}");
+            for lin in ["q_lin", "k_lin", "v_lin", "out_lin"] {
+                tensors.insert(format!("{p}.attention.{lin}.weight"), filled((h, h)));
+                tensors.insert(format!("{p}.attention.{lin}.bias"), zeros(h));
+            }
+            tensors.insert(format!("{p}.sa_layer_norm.weight"), ones(h));
+            tensors.insert(format!("{p}.sa_layer_norm.bias"), zeros(h));
+            tensors.insert(format!("{p}.ffn.lin1.weight"), filled((inter, h)));
+            tensors.insert(format!("{p}.ffn.lin1.bias"), zeros(inter));
+            tensors.insert(format!("{p}.ffn.lin2.weight"), filled((h, inter)));
+            tensors.insert(format!("{p}.ffn.lin2.bias"), zeros(h));
+            tensors.insert(format!("{p}.output_layer_norm.weight"), ones(h));
+            tensors.insert(format!("{p}.output_layer_norm.bias"), zeros(h));
+        }
+
+        candle_core::safetensors::save(&tensors, &path).expect("save synthetic distilbert");
+        (dir, path)
+    }
+
+    /// #421 P1-a3, the DistilBERT leg — same oracle and same rationale as
+    /// `crate::bert::tests::
+    /// fusible_site_census_is_the_exact_per_forward_seam_call_count`
+    /// (see that test's doc for why the frozen half is the non-vacuity
+    /// control). This family's counts coincide with BERT's, which is exactly
+    /// why it needs its OWN measurement: an agreement asserted on one family
+    /// and assumed on the other is not a measurement of the second.
+    #[test]
+    fn fusible_site_census_is_the_exact_per_forward_seam_call_count() {
+        // Lock order: attention_cascade THEN layer_norm — see
+        // `crate::htsat_audio`'s own multi-lock test doc.
+        let _attn_guard = ATTENTION_BLOCK_COUNTER_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let _ln_guard = crate::layer_norm::DISPATCH_COUNTER_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+
+        let device = Device::Cpu;
+        let config: DistilBertConfig = serde_json::from_value(serde_json::json!({
+            "dim": 32,
+            "n_layers": 2,
+            "n_heads": 2,
+            "hidden_dim": 64,
+            "vocab_size": 100,
+            "max_position_embeddings": 128,
+        }))
+        .expect("synthetic DistilBERT config");
+        let (_dir, weights) = write_synthetic_distilbert(&config, &device);
+        let lora = crate::test_support::AllLinearGaussianLora::new();
+
+        let varmap = VarMap::new();
+        let adapted = DistilBert::builder()
+            .lora(lora.config())
+            .build(&[weights.as_path()], &config, &device, &varmap)
+            .expect("build DistilBERT with an all-linear Gaussian adapter");
+        let mut any = crate::AnyEncoder::DistilBert(adapted);
+        let census = crate::test_support::assert_fusible_site_census_is_exact(
+            &mut any,
+            &device,
+            "distilbert/all-linear",
+        );
+
+        let layers = config.num_hidden_layers;
+        assert_eq!(census.lora_sites_wrapped, 6 * layers);
+        assert_eq!(census.layer_norms, 2 * layers + 1);
+        assert_eq!(census.gelu_seam_calls_per_forward, layers);
+
+        let frozen_varmap = VarMap::new();
+        let frozen = DistilBert::builder()
+            .build(&[weights.as_path()], &config, &device, &frozen_varmap)
+            .expect("build a frozen DistilBERT");
+        let mut any_frozen = crate::AnyEncoder::DistilBert(frozen);
+        let frozen_census = crate::test_support::assert_fusible_site_census_is_exact(
+            &mut any_frozen,
+            &device,
+            "distilbert/frozen",
+        );
+        assert_eq!(
+            frozen_census.lora_sites_wrapped, 0,
+            "a frozen backbone wraps no site and takes no lora_linear_fused decision"
+        );
+        assert_eq!(frozen_census.layer_norms, census.layer_norms);
+        assert_eq!(
+            frozen_census.gelu_seam_calls_per_forward,
+            census.gelu_seam_calls_per_forward
         );
     }
 }

@@ -2530,6 +2530,40 @@ impl ModernBert {
         self.final_norm.set_training(training);
     }
 
+    /// This family's [`crate::FusibleSiteCensus`], walked off the built
+    /// tower (see that type's own doc for what each field means).
+    ///
+    /// Two ModernBERT-specific facts make the walk earn its keep here, and
+    /// both are structure a config formula would have to re-derive:
+    ///
+    /// * The layer-0 attention pre-norm is `None` — the embeddings
+    ///   `emb_norm` already normalised that input — so the LayerNorm count
+    ///   is NOT `2 * layers + 2`. The walk chains
+    ///   `layer.attention.attn_norm.iter()`, which yields nothing for that
+    ///   layer, and gets the right answer without knowing the rule.
+    /// * The GELU count is `0`. ModernBERT's FFN activation is a GeGLU, and
+    ///   its fused path is a DIFFERENT admission key (`geglu_fused`,
+    ///   `geglu_apply_training`) whose eager arm calls `Tensor::gelu_erf`
+    ///   directly, never `crate::activations::gelu_erf`. So one training
+    ///   forward takes exactly zero `gelu_erf_fused` decisions, and the
+    ///   profile's equation for that key on this family is
+    ///   `fused + eager == 0`.
+    pub(crate) fn fusible_site_census(&self) -> crate::FusibleSiteCensus {
+        crate::FusibleSiteCensus {
+            lora_sites_wrapped: self
+                .layers
+                .iter()
+                .flat_map(modern_lora_sites)
+                .filter(|(_, lin)| lin.is_lora())
+                .count(),
+            layer_norms: std::iter::once(&self.emb_norm)
+                .chain(self.layers.iter().flat_map(modern_layer_norms))
+                .chain(std::iter::once(&self.final_norm))
+                .count(),
+            gelu_seam_calls_per_forward: 0,
+        }
+    }
+
     /// Read-only accessor for the aggregate training-mode flag
     /// [`Self::set_training`] propagates to every layer (audit round 63,
     /// re-audit finding 1 — added so `jammi-ai`'s trainer can assert the
@@ -2609,6 +2643,24 @@ impl ModernBert {
 /// site on a fixture while the union of all of them is exactly what
 /// `all-linear` selects.
 pub(crate) const LORA_SITE_NAMES: &[&str] = &["Wqkv", "Wo", "Wi", "mlp.Wo"];
+
+/// The house LayerNorms one ModernBERT layer holds — the companion of
+/// [`modern_lora_sites`] for [`ModernBert::fusible_site_census`]'s LayerNorm
+/// walk.
+///
+/// An ITERATOR, not an array, because the count is genuinely per-layer: this
+/// family's attention pre-norm is `Option<LayerNorm>` and is `None` on layer
+/// 0 (the embeddings norm already pre-normalised that input), so layer 0
+/// yields one norm and every other layer yields two. `Option::iter` is what
+/// makes that fall out of the structure instead of out of an `if idx == 0`
+/// the caller would have to keep in step with the loader.
+fn modern_layer_norms(layer: &ModernBertLayer) -> impl Iterator<Item = &LayerNorm> {
+    layer
+        .attention
+        .attn_norm
+        .iter()
+        .chain(std::iter::once(&layer.mlp.mlp_norm))
+}
 
 /// The four LoRA-wrappable linear sites of one ModernBERT layer paired with their
 /// `named_trainable_weights` site names.
@@ -10667,5 +10719,96 @@ mod tests {
                 predicate: "mask_shape_batch_or_one_1_1_seq"
             }
         ));
+    }
+
+    /// The committed `tiny_modernbert_local` checkpoint — FOUR layers, so
+    /// the layer-0 `attn_norm: None` this family's LayerNorm walk has to
+    /// handle is a real minority case here rather than the whole model (a
+    /// one-layer fixture would make `2 * layers + 1` and `2 * layers` differ
+    /// by exactly the one norm that is missing, but would not distinguish a
+    /// walk that skips layer 0 from one that skips EVERY attention norm).
+    fn tiny_modernbert_fixture() -> (ModernBertConfig, std::path::PathBuf) {
+        let dir = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("../../cookbook/fixtures/tiny_modernbert_local");
+        let raw =
+            std::fs::read_to_string(dir.join("config.json")).expect("read tiny_modernbert config");
+        let config: ModernBertConfig = serde_json::from_str(&raw).expect("parse ModernBertConfig");
+        (config, dir.join("model.safetensors"))
+    }
+
+    /// #421 P1-a3, the ModernBERT leg — same oracle and rationale as
+    /// `crate::bert::tests::
+    /// fusible_site_census_is_the_exact_per_forward_seam_call_count`, plus
+    /// the two facts that are specific to this family and that a per-family
+    /// formula would get wrong:
+    ///
+    /// * the LayerNorm count is `2 * layers + 1`, NOT `2 * layers + 2`,
+    ///   because layer 0 holds no attention pre-norm; and
+    /// * `gelu_seam_calls_per_forward` is `0` — a MEASURED zero. This
+    ///   family's FFN is a GeGLU on its own admission key, so a training
+    ///   forward here must leave `gelu_erf_fused` untouched. If ModernBERT
+    ///   ever started routing through the `gelu_erf` seam without the census
+    ///   learning about it, this is the assertion that reds.
+    #[test]
+    fn fusible_site_census_is_the_exact_per_forward_seam_call_count() {
+        // Lock order: attention_cascade THEN layer_norm — see
+        // `crate::htsat_audio`'s own multi-lock test doc.
+        let _attn_guard = ATTENTION_BLOCK_COUNTER_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let _ln_guard = crate::layer_norm::DISPATCH_COUNTER_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+
+        let device = Device::Cpu;
+        let (config, weights) = tiny_modernbert_fixture();
+        assert!(
+            config.num_hidden_layers >= 2,
+            "the layer-0 pre-norm case needs a multi-layer fixture"
+        );
+        let lora = crate::test_support::AllLinearGaussianLora::new();
+
+        let varmap = VarMap::new();
+        let adapted = ModernBert::builder()
+            .lora(lora.config())
+            .build(&[weights.as_path()], &config, &device, &varmap)
+            .expect("build tiny_modernbert with an all-linear Gaussian adapter");
+        let mut any = crate::AnyEncoder::ModernBert(adapted);
+        let census = crate::test_support::assert_fusible_site_census_is_exact(
+            &mut any,
+            &device,
+            "modernbert/all-linear",
+        );
+
+        let layers = config.num_hidden_layers;
+        assert_eq!(census.lora_sites_wrapped, 4 * layers);
+        assert_eq!(
+            census.layer_norms,
+            2 * layers + 1,
+            "embeddings + final + one mlp_norm per layer + one attn_norm per layer EXCEPT \
+             layer 0"
+        );
+        assert_eq!(
+            census.gelu_seam_calls_per_forward, 0,
+            "ModernBERT's FFN is a GeGLU on its own admission key — it never reaches the \
+             gelu_erf seam"
+        );
+
+        let frozen_varmap = VarMap::new();
+        let frozen = ModernBert::builder()
+            .build(&[weights.as_path()], &config, &device, &frozen_varmap)
+            .expect("build a frozen tiny_modernbert");
+        let mut any_frozen = crate::AnyEncoder::ModernBert(frozen);
+        let frozen_census = crate::test_support::assert_fusible_site_census_is_exact(
+            &mut any_frozen,
+            &device,
+            "modernbert/frozen",
+        );
+        assert_eq!(
+            frozen_census.lora_sites_wrapped, 0,
+            "a frozen backbone wraps no site and takes no lora_linear_fused decision"
+        );
+        assert_eq!(frozen_census.layer_norms, census.layer_norms);
+        assert_eq!(frozen_census.gelu_seam_calls_per_forward, 0);
     }
 }

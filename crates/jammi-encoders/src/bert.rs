@@ -516,6 +516,33 @@ impl Bert {
         Ok(out)
     }
 
+    /// This family's [`crate::FusibleSiteCensus`], walked off the built
+    /// tower (see that type's own doc for what each field means and why it
+    /// is walked rather than computed from [`BertConfig`]).
+    ///
+    /// * LoRA sites: the `Lora` arms among `lora_sites`' six per layer.
+    /// * LayerNorms: the embeddings norm plus this family's TWO post-norms
+    ///   per layer (`attention.output.LayerNorm`, `output.LayerNorm`),
+    ///   chained into one iterator and counted, so a layer that stopped
+    ///   holding one would change the count.
+    /// * GELU: one [`BertIntermediate`] per layer, each of which calls
+    ///   `crate::activations::gelu_erf` exactly once per forward — so
+    ///   `layers.len()`, read off the built layer stack.
+    pub(crate) fn fusible_site_census(&self) -> crate::FusibleSiteCensus {
+        crate::FusibleSiteCensus {
+            lora_sites_wrapped: self
+                .layers
+                .iter()
+                .flat_map(lora_sites)
+                .filter(|(_, lin)| lin.is_lora())
+                .count(),
+            layer_norms: std::iter::once(&self.embeddings.layer_norm)
+                .chain(self.layers.iter().flat_map(layer_norms))
+                .count(),
+            gelu_seam_calls_per_forward: self.layers.len(),
+        }
+    }
+
     /// Switch every LoRA-wrapped linear and LayerNorm into / out of training
     /// mode, and (issue #462) `self` itself — the ONE flag
     /// [`Self::forward_hidden`] reads to pick its call chain and thread
@@ -638,6 +665,18 @@ pub(crate) const LORA_SITE_NAMES: &[&str] = &[
     "intermediate.dense",
     "output.dense",
 ];
+
+/// The two house LayerNorms one encoder layer holds — the companion of
+/// [`lora_sites`] for [`Bert::fusible_site_census`]'s LayerNorm walk. Both
+/// are POST-norms in this family (`attention.output.LayerNorm`,
+/// `output.LayerNorm`); the embeddings norm is the model's, not a layer's,
+/// and is chained in separately by the caller.
+fn layer_norms(layer: &BertLayer) -> [&LayerNorm; 2] {
+    [
+        &layer.attention.self_output.layer_norm,
+        &layer.output.layer_norm,
+    ]
+}
 
 /// The six LoRA-wrappable linear sites of one encoder layer paired with their
 /// `named_trainable_weights` site names — the single source of the site→name
@@ -1471,6 +1510,91 @@ mod tests {
         assert!(
             msg.contains("attention_block_fused") || msg.contains("head_dim"),
             "expected a StrictModeFallback naming the refused op/predicate: {msg}"
+        );
+    }
+
+    /// The committed `tiny_bert` checkpoint (`hidden_size=32, layers=1,
+    /// heads=2, intermediate=128`) — a REAL builder path, because the census
+    /// counts what a BUILD produced and a hand-assembled `Bert` would only
+    /// count what the test itself assembled.
+    fn tiny_bert_fixture() -> (BertConfig, std::path::PathBuf) {
+        let dir = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("../../cookbook/fixtures/tiny_bert");
+        let raw = std::fs::read_to_string(dir.join("config.json")).expect("read tiny_bert config");
+        let config: BertConfig = serde_json::from_str(&raw).expect("parse BertConfig");
+        (config, dir.join("model.safetensors"))
+    }
+
+    /// #421 P1-a3: [`Bert::fusible_site_census`] is the EXACT per-forward
+    /// call count of each fusible seam, not an estimate of it — the `calls`
+    /// witness the tower profile's `fused + eager == calls * batches`
+    /// equation had no source for.
+    ///
+    /// Both halves are needed, and the frozen half is the NON-VACUITY
+    /// control: it is the only leg that can fail if `lora_sites_wrapped`
+    /// were (say) the count of ALL sites rather than the wrapped ones. On an
+    /// `all-linear` build every site is wrapped, so a "count everything"
+    /// bug is invisible there and only shows up against a tower whose right
+    /// answer is `0`.
+    #[test]
+    fn fusible_site_census_is_the_exact_per_forward_seam_call_count() {
+        // Lock order: attention_cascade THEN layer_norm — see
+        // `crate::htsat_audio`'s own multi-lock test doc for why acquiring
+        // them the other way round deadlocks the whole test binary.
+        let _attn_guard = ATTENTION_BLOCK_COUNTER_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let _ln_guard = crate::layer_norm::DISPATCH_COUNTER_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+
+        let device = Device::Cpu;
+        let (config, weights) = tiny_bert_fixture();
+        let lora = crate::test_support::AllLinearGaussianLora::new();
+
+        let varmap = VarMap::new();
+        let adapted = Bert::builder()
+            .lora(lora.config())
+            .build(&[weights.as_path()], &config, &device, &varmap)
+            .expect("build tiny_bert with an all-linear Gaussian adapter");
+        let mut any = crate::AnyEncoder::Bert(adapted);
+        let census = crate::test_support::assert_fusible_site_census_is_exact(
+            &mut any,
+            &device,
+            "bert/all-linear",
+        );
+
+        // Independently-known values for this family's geometry, re-derived
+        // from the config the tower was built from rather than pinned as
+        // bare literals: six wrappable linears and two post-LayerNorms per
+        // layer, one embeddings LayerNorm, one FFN GELU per layer.
+        let layers = config.num_hidden_layers;
+        assert_eq!(census.lora_sites_wrapped, 6 * layers);
+        assert_eq!(census.layer_norms, 2 * layers + 1);
+        assert_eq!(census.gelu_seam_calls_per_forward, layers);
+
+        // Frozen twin: the SAME geometry, no adapters. Its LoRA field must be
+        // exactly 0 (and the oracle above proves its counter delta is 0 too),
+        // while the two structural counts are unchanged — installing adapters
+        // cannot add or remove a LayerNorm or a GELU call.
+        let frozen_varmap = VarMap::new();
+        let frozen = Bert::builder()
+            .build(&[weights.as_path()], &config, &device, &frozen_varmap)
+            .expect("build a frozen tiny_bert");
+        let mut any_frozen = crate::AnyEncoder::Bert(frozen);
+        let frozen_census = crate::test_support::assert_fusible_site_census_is_exact(
+            &mut any_frozen,
+            &device,
+            "bert/frozen",
+        );
+        assert_eq!(
+            frozen_census.lora_sites_wrapped, 0,
+            "a frozen backbone wraps no site and takes no lora_linear_fused decision"
+        );
+        assert_eq!(frozen_census.layer_norms, census.layer_norms);
+        assert_eq!(
+            frozen_census.gelu_seam_calls_per_forward,
+            census.gelu_seam_calls_per_forward
         );
     }
 }

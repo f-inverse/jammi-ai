@@ -688,6 +688,16 @@ const REDUCTION_SITE: &str = "reduction";
 const LINEAR1_SITE: &str = "linear1";
 /// See [`LINEAR1_SITE`].
 const LINEAR2_SITE: &str = "linear2";
+/// The ONE `projection_hidden_act` value that routes the projection head
+/// through the house GELU seam (`crate::activations::gelu_erf`) and so adds
+/// one `gelu_erf_fused` decision per training forward.
+///
+/// Named once and used in BOTH places that must agree about it — the
+/// dispatch site ([`ClapAudioProjection::forward_unnormalized_with_training`]'s
+/// match arm) and the census that predicts how often that site fires
+/// ([`HtsatAudio::fusible_site_census`]) — so the witness and the thing it
+/// witnesses cannot drift to two different spellings.
+const GELU_PROJECTION_ACT: &str = "gelu";
 
 /// The selector names a caller may write in `target_modules` to reach this
 /// tower's LoRA sites — the nine constants above, in the order the
@@ -1777,7 +1787,7 @@ impl ClapAudioProjection {
         let x = self.linear1.forward(x)?;
         let x = match self.act.as_str() {
             "relu" => x.relu()?,
-            "gelu" => activations::gelu_erf(&x, training)?,
+            GELU_PROJECTION_ACT => activations::gelu_erf(&x, training)?,
             other => {
                 return Err(EncoderError::Config(format!(
                     "unsupported projection activation '{other}'"
@@ -1993,6 +2003,59 @@ impl HtsatAudio {
             out.push((format!("audio_projection.{site}"), lin));
         }
         out
+    }
+
+    /// This tower's [`crate::FusibleSiteCensus`], walked off the built Swin
+    /// spine and projection head (see that type's own doc for what each
+    /// field means).
+    ///
+    /// Every term is structure, and on this tower that matters more than on
+    /// any other:
+    ///
+    /// * **LoRA sites** — `Self::lora_sites`, the same traversal the adapter
+    ///   export walks, filtered to the wrapped arms. It already handles the
+    ///   two irregularities a formula would have to encode by hand: the LAST
+    ///   stage has no `downsample`, so it contributes no `reduction` site,
+    ///   and the projection head's two linears belong to no stage at all.
+    /// * **LayerNorms** — the patch-embed norm, then per stage the two norms
+    ///   of every Swin block plus that stage's `downsample` norm when it has
+    ///   one, then the encoder's final norm. The AFF fusion block's norms are
+    ///   NOT here and must not be: they are `candle_nn::BatchNorm`, not the
+    ///   house LayerNorm, so they cannot reach the `layer_norm_fused` seam.
+    /// * **GELU** — one seam call per Swin block (`SwinBlock::forward`'s
+    ///   MLP), plus ONE more when the projection head's activation is
+    ///   `"gelu"`. The projection term is read off the BUILT head's own `act`
+    ///   string, not off a config: `"relu"` (the committed tiny fixture and
+    ///   HF's own default) contributes nothing, and `"gelu"` contributes
+    ///   exactly one. Both site classes report to the SAME `gelu_erf_fused`
+    ///   key, so this single number is what one forward's counter delta must
+    ///   equal — see this module's own doc for the measured `sum(depths)` /
+    ///   `sum(depths) + 1` oracles behind it.
+    pub(crate) fn fusible_site_census(&self) -> crate::FusibleSiteCensus {
+        crate::FusibleSiteCensus {
+            lora_sites_wrapped: self
+                .lora_sites()
+                .into_iter()
+                .filter(|(_, lin)| lin.is_lora())
+                .count(),
+            layer_norms: std::iter::once(&self.encoder.patch_embed.norm)
+                .chain(self.encoder.stages.iter().flat_map(|stage| {
+                    stage
+                        .blocks
+                        .iter()
+                        .flat_map(|block| [&block.layernorm_before, &block.layernorm_after])
+                        .chain(stage.downsample.iter().map(|merge| &merge.norm))
+                }))
+                .chain(std::iter::once(&self.encoder.norm))
+                .count(),
+            gelu_seam_calls_per_forward: self
+                .encoder
+                .stages
+                .iter()
+                .map(|stage| stage.blocks.len())
+                .sum::<usize>()
+                + usize::from(self.projection.act == GELU_PROJECTION_ACT),
+        }
     }
 
     /// Trainable tensors across every LoRA-wrapped site. Empty for a fully
@@ -3820,5 +3883,121 @@ mod tests {
             ),
             other => panic!("expected EncoderError::Config, got {other:?}"),
         }
+    }
+
+    /// #421 P1-a3, the HTSAT leg — the same oracle as
+    /// `crate::bert::tests::
+    /// fusible_site_census_is_the_exact_per_forward_seam_call_count`, run
+    /// on the committed `htsat_clap_tiny` checkpoint through the REAL
+    /// builder, at BOTH projection activations.
+    ///
+    /// This tower is where the census earns the most, because three of its
+    /// counts are genuinely irregular:
+    ///
+    /// * the LAST Swin stage has no `downsample`, so it contributes neither
+    ///   a `reduction` LoRA site nor a merging LayerNorm;
+    /// * the projection head's two linears belong to no stage at all; and
+    /// * the GELU count depends on a STRING in the built head
+    ///   (`projection_hidden_act`), which is why this test runs the `"relu"`
+    ///   fixture AND a `"gelu"` twin over the same geometry and asserts the
+    ///   two differ by exactly one. The sibling tests
+    ///   `training_true_full_forward_dispatches_the_gelu_seam_once_per_swin_block`
+    ///   and
+    ///   `training_true_full_forward_with_a_gelu_projection_dispatches_sum_depths_plus_one`
+    ///   already MEASURE those two counter deltas (8 and 9 on this fixture);
+    ///   this test is what ties them to the census, so the profile's `calls`
+    ///   term and the measured dispatch count are the same number by
+    ///   assertion rather than by coincidence.
+    #[test]
+    fn fusible_site_census_is_the_exact_per_forward_seam_call_count() {
+        // Lock order: attention_cascade THEN layer_norm — see this module's
+        // own multi-lock test doc.
+        let _attn_guard = crate::attention_cascade::ATTENTION_BLOCK_COUNTER_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let _ln_guard = crate::layer_norm::DISPATCH_COUNTER_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+
+        let device = Device::Cpu;
+        let dir = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("../../cookbook/fixtures/htsat_clap_tiny");
+        let weights = dir.join("model.safetensors");
+        let config = HtsatAudioConfig::from_hf_clap_config(&fixture_config()).unwrap();
+        assert_eq!(config.projection_hidden_act, "relu", "fixture act changed");
+        let lora = crate::test_support::AllLinearGaussianLora::new();
+
+        let varmap = VarMap::new();
+        let adapted = HtsatAudio::builder()
+            .lora(lora.config())
+            .build(&[weights.as_path()], &config, &device, &varmap)
+            .expect("build htsat with an all-linear Gaussian adapter");
+        let mut any = crate::AnyEncoder::Htsat(Box::new(adapted));
+        let census = crate::test_support::assert_fusible_site_census_is_exact(
+            &mut any,
+            &device,
+            "htsat/all-linear/relu",
+        );
+
+        // Re-derived from the geometry this tower was built from: six sites
+        // per Swin block, one `reduction` per stage EXCEPT the last, two
+        // projection linears.
+        let blocks: usize = config.depths.iter().sum();
+        let stages = config.num_stages();
+        assert_eq!(census.lora_sites_wrapped, 6 * blocks + (stages - 1) + 2);
+        assert_eq!(
+            census.layer_norms,
+            1 + 2 * blocks + (stages - 1) + 1,
+            "patch-embed norm + two per Swin block + one per downsample + the final norm \
+             (the AFF block's BatchNorms are NOT house LayerNorms and must not be counted)"
+        );
+        assert_eq!(
+            census.gelu_seam_calls_per_forward, blocks,
+            "one seam call per Swin block, and none from a \"relu\" projection head"
+        );
+
+        // The `"gelu"` projection twin: identical weights and geometry, one
+        // string changed, exactly one more seam call per forward.
+        let mut gelu_config = config.clone();
+        gelu_config.projection_hidden_act = GELU_PROJECTION_ACT.to_string();
+        let gelu_varmap = VarMap::new();
+        let gelu_tower = HtsatAudio::builder()
+            .lora(lora.config())
+            .build(&[weights.as_path()], &gelu_config, &device, &gelu_varmap)
+            .expect("build htsat with a gelu projection head");
+        let mut any_gelu = crate::AnyEncoder::Htsat(Box::new(gelu_tower));
+        let gelu_census = crate::test_support::assert_fusible_site_census_is_exact(
+            &mut any_gelu,
+            &device,
+            "htsat/all-linear/gelu",
+        );
+        assert_eq!(
+            gelu_census.gelu_seam_calls_per_forward,
+            census.gelu_seam_calls_per_forward + 1,
+            "a \"gelu\" projection head adds exactly ONE seam call per forward"
+        );
+        assert_eq!(gelu_census.layer_norms, census.layer_norms);
+        assert_eq!(gelu_census.lora_sites_wrapped, census.lora_sites_wrapped);
+
+        // Frozen twin: no wrapped site, everything else unchanged.
+        let frozen_varmap = VarMap::new();
+        let frozen = HtsatAudio::builder()
+            .build(&[weights.as_path()], &config, &device, &frozen_varmap)
+            .expect("build a frozen htsat");
+        let mut any_frozen = crate::AnyEncoder::Htsat(Box::new(frozen));
+        let frozen_census = crate::test_support::assert_fusible_site_census_is_exact(
+            &mut any_frozen,
+            &device,
+            "htsat/frozen",
+        );
+        assert_eq!(
+            frozen_census.lora_sites_wrapped, 0,
+            "a frozen backbone wraps no site and takes no lora_linear_fused decision"
+        );
+        assert_eq!(frozen_census.layer_norms, census.layer_norms);
+        assert_eq!(
+            frozen_census.gelu_seam_calls_per_forward,
+            census.gelu_seam_calls_per_forward
+        );
     }
 }

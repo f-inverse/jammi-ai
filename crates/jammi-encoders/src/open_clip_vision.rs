@@ -341,6 +341,26 @@ impl OpenClipVisionTransformer {
         self.training
     }
 
+    /// This tower's [`crate::FusibleSiteCensus`], walked off the built stack
+    /// (see that type's own doc for what each field means).
+    ///
+    /// Shares `block::fusible_site_counts` with the text tower — the blocks
+    /// are the identical type — and differs from it in exactly the head-side
+    /// norms: TWO here (`ln_pre` before the stack, `ln_post` on the pooled
+    /// row) against the text tower's one `ln_final`. That difference is the
+    /// reason the shared helper returns the stack's counts instead of a
+    /// finished census.
+    pub(crate) fn fusible_site_census(&self) -> crate::FusibleSiteCensus {
+        let (lora_sites_wrapped, block_layer_norms) = block::fusible_site_counts(&self.blocks);
+        crate::FusibleSiteCensus {
+            lora_sites_wrapped,
+            // + `ln_pre` and `ln_post`, the two house LayerNorms outside the
+            // stack.
+            layer_norms: block_layer_norms + 2,
+            gelu_seam_calls_per_forward: 0,
+        }
+    }
+
     /// Trainable tensors across every LoRA-wrapped site. Empty for a fully
     /// frozen tower.
     pub fn trainable_params(&self) -> Vec<&Tensor> {
@@ -930,5 +950,77 @@ mod tests {
         let after_bits = bits_of(&after);
 
         assert_eq!(before_bits, after_bits);
+    }
+
+    /// #421 P1-a3, the OpenCLIP-vision leg — same oracle and rationale as
+    /// `crate::bert::tests::
+    /// fusible_site_census_is_the_exact_per_forward_seam_call_count`, and the
+    /// twin of `crate::clip_text`'s own leg: identical block stack, and
+    /// therefore identical shared `block::fusible_site_counts`, differing in
+    /// exactly the head-side norms — TWO here (`ln_pre`, `ln_post`) against
+    /// the text tower's one `ln_final`. Measuring only one of the two towers
+    /// would leave that difference unwitnessed.
+    #[test]
+    fn fusible_site_census_is_the_exact_per_forward_seam_call_count() {
+        // Lock order: attention_cascade THEN layer_norm — see
+        // `crate::htsat_audio`'s own multi-lock test doc.
+        let _attn_guard = crate::attention_cascade::ATTENTION_BLOCK_COUNTER_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let _ln_guard = crate::layer_norm::DISPATCH_COUNTER_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+
+        let device = Device::Cpu;
+        let dir = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("../../tests/fixtures/tiny_open_clip");
+        let raw = std::fs::read_to_string(dir.join("open_clip_config.json"))
+            .expect("read tiny_open_clip config");
+        let json: serde_json::Value = serde_json::from_str(&raw).expect("parse open_clip config");
+        let config =
+            OpenClipVisionConfig::from_open_clip_config(&json).expect("OpenClipVisionConfig");
+        let weights = dir.join("open_clip_model.safetensors");
+        let lora = crate::test_support::AllLinearGaussianLora::new();
+
+        let varmap = VarMap::new();
+        let adapted = OpenClipVisionTransformer::builder()
+            .lora(lora.config())
+            .build(&[weights.as_path()], &config, &device, &varmap)
+            .expect("build open_clip_vision with an all-linear Gaussian adapter");
+        let mut any = crate::AnyEncoder::OpenClipVision(adapted);
+        let census = crate::test_support::assert_fusible_site_census_is_exact(
+            &mut any,
+            &device,
+            "open_clip_vision/all-linear",
+        );
+
+        let layers = config.layers;
+        assert_eq!(census.lora_sites_wrapped, 4 * layers);
+        assert_eq!(
+            census.layer_norms,
+            2 * layers + 2,
+            "ln_1/ln_2 per block plus the TWO head-side norms ln_pre and ln_post"
+        );
+        assert_eq!(
+            census.gelu_seam_calls_per_forward, 0,
+            "quick_gelu has no fused seam — this tower never reaches gelu_erf_fused"
+        );
+
+        let frozen_varmap = VarMap::new();
+        let frozen = OpenClipVisionTransformer::builder()
+            .build(&[weights.as_path()], &config, &device, &frozen_varmap)
+            .expect("build a frozen open_clip_vision");
+        let mut any_frozen = crate::AnyEncoder::OpenClipVision(frozen);
+        let frozen_census = crate::test_support::assert_fusible_site_census_is_exact(
+            &mut any_frozen,
+            &device,
+            "open_clip_vision/frozen",
+        );
+        assert_eq!(
+            frozen_census.lora_sites_wrapped, 0,
+            "a frozen backbone wraps no site and takes no lora_linear_fused decision"
+        );
+        assert_eq!(frozen_census.layer_norms, census.layer_norms);
+        assert_eq!(frozen_census.gelu_seam_calls_per_forward, 0);
     }
 }

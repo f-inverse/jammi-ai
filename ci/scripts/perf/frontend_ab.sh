@@ -379,12 +379,26 @@ train_per_step=0.150
 python3 -c "
 import json
 steps = int('\$steps_measured')
-print(json.dumps({
+# Mirrors the REAL 'jammi-bench finetune-run' envelope (report.rs's
+# FinetuneRunTier, serialized under tiers.finetune_run -- see
+# frontend_ab_merge.py's own doc for why a flat shape here is exactly the
+# bug this stub used to hide): steps_measured / media_front_end_wall_s /
+# train_run_wall_s / rayon_pool_threads all live UNDER tiers.finetune_run,
+# never at the report's top level. A real BASE-role binary (pre-#421
+# follow-on) never emits rayon_pool_threads at all -- this stub's '${role}'
+# arm mirrors that exactly, never fabricating a key the real binary that
+# role stands in for would not have written.
+tier = {
     'task': '\$task',
     'steps_measured': steps,
     'media_front_end_wall_s': float('\$front_per_step') * steps,
     'train_run_wall_s': float('\$train_per_step') * steps,
-    'rayon_pool_threads': int('\$rayon_threads'),
+}
+if '${role}' == 'tip':
+    tier['rayon_pool_threads'] = int('\$rayon_threads')
+print(json.dumps({
+    'host': {'logical_cpus': int('\$rayon_threads')},
+    'tiers': {'finetune_run': tier},
 }))
 "
 STUBEOF
@@ -540,149 +554,18 @@ for tower in htsat clip-vision; do
   run_leg "$tower" tip "$TIP_BIN" "$TIP_SHA" r2
 done
 
-# ── merge + bar decision (embedded, mirrors the shell drivers' own
-#    `_write_manifest` inline-python convention) ──────────────────────────
+# ── merge + bar decision (`frontend_ab_merge.py`, this directory) ────────
+# Extracted into an importable module (mirrors `finetune_run_ab.sh`'s own
+# `python3 "$DIR/ab_merge.py" ...` convention) specifically so
+# `test_frontend_ab_merge.py` can drive the real report-reading code path
+# with a fixture directory -- including a REAL, committed, envelope-
+# trimmed `finetune-run` report -- rather than only ever exercising it
+# through this script's own DRY_RUN stub (see that module's own doc for
+# why an inline heredoc could not catch this driver's own pod-p421b
+# defect).
 MERGE_OUT="$OUT_DIR/report.json"
-python3 - "$RAW_DIR" "$MERGE_OUT" "$FRONTEND_AB_SERIAL_TAIL_RATIO" "$N_ITEMS_PER_STEP" \
-  "$TIP_SHA" "$BASE_SHA" "$BOX" "$FRONTEND_AB_DRY_RUN" <<'PYEOF'
-import json
-import math
-import sys
-from pathlib import Path
-
-raw_dir, out_path, r_str, n_str, tip_sha, base_sha, box, dry_run = sys.argv[1:9]
-r = float(r_str)
-n = int(n_str)
-
-TOWERS = ["htsat", "clip-vision"]
-ROLES = ["base", "tip"]
-REPEATS = ["r1", "r2"]
-
-
-def load_leg(tower, role, repeat):
-    out_file = Path(raw_dir) / f"{tower}__{role}__{repeat}.json"
-    exit_file = Path(raw_dir) / f"{tower}__{role}__{repeat}.exit"
-    exit_code = int(exit_file.read_text().strip()) if exit_file.exists() else None
-    if exit_code != 0:
-        return {"outcome": "FAIL", "exit_code": exit_code}
-    try:
-        report = json.loads(out_file.read_text())
-    except (OSError, ValueError) as e:
-        return {"outcome": "FAIL", "exit_code": exit_code, "reason": f"unparseable report: {e}"}
-    for key in ("steps_measured", "media_front_end_wall_s", "train_run_wall_s"):
-        if key not in report or report[key] is None:
-            return {"outcome": "FAIL", "reason": f"report missing '{key}'"}
-    steps = report["steps_measured"]
-    if not isinstance(steps, (int, float)) or steps <= 0:
-        return {"outcome": "FAIL", "reason": f"steps_measured must be > 0, got {steps!r}"}
-    return {
-        "outcome": "OK",
-        "front_per_step": report["media_front_end_wall_s"] / steps,
-        "train_per_step": report["train_run_wall_s"] / steps,
-        "steps_measured": steps,
-        "rayon_pool_threads": report.get("rayon_pool_threads"),
-    }
-
-
-towers = {}
-for tower in TOWERS:
-    legs = {
-        role: {repeat: load_leg(tower, role, repeat) for repeat in REPEATS}
-        for role in ROLES
-    }
-    towers[tower] = legs
-
-status = "GREEN"
-for tower in TOWERS:
-    for role in ROLES:
-        for repeat in REPEATS:
-            if towers[tower][role][repeat]["outcome"] != "OK":
-                status = "INVALID"
-
-
-def mean_front(tower, role):
-    vals = [towers[tower][role][r]["front_per_step"] for r in REPEATS]
-    return sum(vals) / len(vals)
-
-
-def spread_front(tower, role):
-    vals = [towers[tower][role][r]["front_per_step"] for r in REPEATS]
-    return abs(vals[0] - vals[1])
-
-
-report = {
-    "tool": "frontend_ab.sh",
-    "dry_run": dry_run == "1",
-    "base_sha": base_sha,
-    "tip_sha": tip_sha,
-    "box": box,
-    "serial_tail_ratio": r,
-    "n_items_per_step": n,
-    "status": status,
-    "towers": towers,
-}
-
-htsat_bar = None
-if status == "GREEN":
-    tip_p_values = {
-        towers["htsat"]["tip"][repeat]["rayon_pool_threads"] for repeat in REPEATS
-    }
-    if len(tip_p_values) != 1 or None in tip_p_values:
-        report["status"] = "INVALID"
-        report["invalid_reason"] = (
-            f"htsat tip legs report inconsistent/missing rayon_pool_threads: {tip_p_values!r}"
-        )
-    else:
-        p = next(iter(tip_p_values))
-        ideal = n / math.ceil(n / p)
-        upper_bound = r + (1 - r) / (0.5 * ideal)
-        lower_bound = r + (1 - r) / ideal
-
-        front_tip = mean_front("htsat", "tip")
-        front_base = mean_front("htsat", "base")
-        ratio = front_tip / front_base
-        margin = spread_front("htsat", "base") / front_base
-
-        straddles_upper = (ratio - margin) <= upper_bound <= (ratio + margin)
-        straddles_lower = (ratio - margin) <= lower_bound <= (ratio + margin)
-        if straddles_upper or straddles_lower:
-            verdict = "UNRESOLVED"
-        elif ratio > upper_bound:
-            verdict = "FAIL"
-        elif ratio < lower_bound:
-            verdict = "INVALID_BEATS_IDEAL"
-        else:
-            verdict = "PASS"
-
-        htsat_bar = {
-            "p": p,
-            "n": n,
-            "ideal": ideal,
-            "r": r,
-            "upper_bound": upper_bound,
-            "lower_bound": lower_bound,
-            "front_tip_mean_s": front_tip,
-            "front_base_mean_s": front_base,
-            "ratio": ratio,
-            "base_to_base_spread_s": spread_front("htsat", "base"),
-            "verdict": verdict,
-        }
-report["htsat_bar"] = htsat_bar
-
-if status == "GREEN" and all(
-    towers["clip-vision"][role][repeat]["outcome"] == "OK"
-    for role in ROLES
-    for repeat in REPEATS
-):
-    report["clip_vision_report_only"] = {
-        "front_tip_mean_s": mean_front("clip-vision", "tip"),
-        "front_base_mean_s": mean_front("clip-vision", "base"),
-        "ratio": mean_front("clip-vision", "tip") / mean_front("clip-vision", "base"),
-    }
-
-Path(out_path).write_text(json.dumps(report, indent=2, sort_keys=True) + "\n")
-print(json.dumps(report, sort_keys=True))
-PYEOF
+python3 "$DIR/frontend_ab_merge.py" "$RAW_DIR" "$MERGE_OUT" "$FRONTEND_AB_SERIAL_TAIL_RATIO" \
+  "$N_ITEMS_PER_STEP" "$TIP_SHA" "$BASE_SHA" "$BOX" "$FRONTEND_AB_DRY_RUN"
 MERGE_RC=$?
 if [ "$MERGE_RC" -ne 0 ]; then
   echo "::error::merge step failed (exit $MERGE_RC)" >&2

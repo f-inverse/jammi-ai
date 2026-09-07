@@ -1,16 +1,32 @@
 //! CPU-local pre-measurement for the media front-end parallelization A/B's
 //! machine model (issue #421 follow-on, "media front-end parallelization"
-//! contract §"Measurement"): times the ONE piece of the front-end's cost
-//! that CANNOT be parallelized away by the rayon change under test —
-//! `Tensor::from_vec` (host-side tensor construction) plus the device
-//! upload — for a full per-step micro-batch shape, on the CURRENT device.
+//! contract §"Measurement"): times EXACTLY the batch's final tensor build
+//! (`Tensor::from_vec`, host-side) plus its device upload
+//! (`Tensor::to_device`) — for a full per-step micro-batch shape, on the
+//! CURRENT device. This is A serial cost the rayon change under test cannot
+//! parallelize away, never claimed here to be the ONLY one: the mel
+//! filterbank (`mel_filterbank_hz`) and analysis window
+//! (`hann_periodic`) `preprocess_clap_fusion_indexed` computes ONCE per
+//! batch, BEFORE its own parallel `par_chunks_mut` fan-out
+//! (`crates/jammi-ai/src/inference/audio_preprocess.rs`), are a SECOND,
+//! untimed serial term this example does not measure at all.
 //!
 //! `ci/scripts/perf/frontend_ab.sh`'s `--serial-tail-ratio` argument is
 //! `r = t_s / T`, where `t_s` is this example's printed value for the
 //! relevant task and `T` is the corresponding tier's measured
 //! `train_run_wall_s / steps_measured` (the per-step wall this front-end
 //! sits inside). This example does not compute `r` itself — it has no way
-//! to know `T` — it only measures `t_s`; the operator divides.
+//! to know `T` — it only measures `t_s`; the operator divides. Because the
+//! filterbank/window hoist is omitted, the `r` the operator supplies UNDERSTATES
+//! the true serial tail. The bar arithmetic stays conservative under that
+//! understatement rather than dangerous: both bounds are increasing in `r`
+//! (`ci/scripts/perf/frontend_ab_merge.py`'s own module doc has the
+//! formulas), so a smaller `r` only LOWERS `upper_bound` — the ceiling a
+//! ratio must clear to read PASS — making PASS strictly harder to reach,
+//! never easier. An omitted serial term can cost this bar a real PASS
+//! (an UNRESOLVED or a borderline FAIL where the true, larger `r` would
+//! have read PASS); it can never manufacture a PASS the true `r` would
+//! have refused.
 //!
 //! Two shapes, matching the contract's pre-registered legs exactly (batch
 //! 8, triplets, so 24 items/step):

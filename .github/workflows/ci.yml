@@ -1692,6 +1692,22 @@ jobs:
           # real under DRY_RUN.
           - name: frontend_ab.sh dry-run smoke
             cmd: python3 ci/scripts/perf/test_frontend_ab_dry_run.py
+          # `frontend_ab_merge.py`'s own suite (extracted out of
+          # `frontend_ab.sh`'s own inline heredoc for exactly the reason
+          # `ab_merge.py`'s own suite above was: an inline heredoc had ZERO
+          # automated coverage of its own report-reading code path beyond
+          # whatever the DRY_RUN stub fabricated -- the real A/B rehearsal
+          # on pod p421b found that reader assumed a FLAT report shape when
+          # the real `jammi-bench finetune-run` report nests every field
+          # this driver reads under `tiers.finetune_run`). Drives the real
+          # `load_leg`/`build_report`/`main` entry points against fixture
+          # raw-leg directories, including a REAL, committed,
+          # envelope-trimmed cut of that same rehearsal's own
+          # `htsat__tip__r1.json` (`fixtures/frontend_ab_rehearsal/`) --
+          # never a hand-rolled dict standing in for what a real report
+          # looks like. No GPU, no real jammi-bench, no network.
+          - name: frontend_ab_merge suite
+            cmd: python3 ci/scripts/perf/test_frontend_ab_merge.py
     steps:
       - uses: actions/checkout@v4
         with:

@@ -1874,7 +1874,23 @@ staleness→recompute loop — that is the platform's, not the engine's
   (`crates/jammi-bench/src/report.rs`) records the census as bench PROVENANCE, never
   IDENTITY — it is a structural property of the build, not a caller premise two legs must
   agree on — and `ci/scripts/perf/profile_421_merge.py` reads its own `calls` term from this
-  field.
+  field. Two more scripts sit downstream of the merge, both under `ci/scripts/perf/`:
+  `profile_421_attribute.py` reads the merged per-key equations and `kernel_census.py`'s
+  per-kernel breakdown into the contract's named chains (`C-LORA`, `C-LN`, `C-GELU`,
+  `C-ATTN-<tower>`, UNATTRIBUTED) and evaluates the two-sided ACTIVATE/DECLINE/UNRESOLVED
+  rule per candidate port; `profile_421_artifact.py` assembles the per-tower close-out JSON
+  (`crates/jammi-kernels/artifacts/cuda-runs/<date>-profile-421-towers-<sha>-<box>.json`)
+  from the twelve legs' manifests, the merge output and the attribution result.
+  `kernel_census.py` keys each GPU-kernel bucket on `COALESCE(demangledName, shortName)`
+  rather than `shortName` alone — cutlass's `Kernel2<...>` template wrapper gives every bf16
+  GEMM tile instantiation the same literal `shortName`, so keying on `shortName` alone
+  collapses distinct instantiations into one anonymous row; the demangled-name key is a
+  strict, sum-preserving refinement (a bucket can only split, never merge two old buckets
+  into fewer new ones). **Census reports produced before 2026-09-07 carry the pre-fix,
+  collapsed `Kernel2`/`magma_sgemmEx_kernel` rows in `by_kernel_and_grid`** — their
+  `by_kernel_name` totals and every other top-line number (`gpu_kernel_us_per_step`,
+  wall/front/busy per step) are unaffected; only the per-instantiation breakdown was
+  coarser.
 - **The three cross-modal towers and their LoRA sites** — each tower has its own
   builder (`ClipText::builder`, `OpenClipVisionTransformer::builder`,
   `HtsatAudio::builder`) with the same knobs the BERT family uses

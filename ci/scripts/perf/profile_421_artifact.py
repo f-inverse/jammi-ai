@@ -212,6 +212,11 @@ LEG_FIELDS_FROM_ATTRIBUTION = (
     "decision_grade",
     "decision_grade_reason",
     "outside_signature_plausibly_attention",
+    # HTSAT-only diagnostic (module doc, "Known, DOCUMENTED, UNRESOLVED
+    # collision"); `.get()` below is `None` on every non-HTSAT leg, copied
+    # verbatim rather than omitted so a consumer can tell "not applicable"
+    # (`None`) apart from "measured zero".
+    "ambiguous_out_mlp_collision",
 )
 
 

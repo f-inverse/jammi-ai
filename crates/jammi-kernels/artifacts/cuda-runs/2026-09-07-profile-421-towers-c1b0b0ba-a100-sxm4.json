@@ -37,10 +37,11 @@
   },
   "recorded_deviations": [
    "run1 (pod p421, session 1) was ALL-12-LEGS INVALID at the pre-fix tip (esc-088: profile_421_legs.sh's corpus tuple shared stdout with its own producers, fixed by PR #469, main c1b0b0ba) -- this artifact is the full 12-leg re-run (run2) on the merged fix.",
-   "The BF16 (A2) leg on each CLIP tower is INVALID for ATTRIBUTION only (an anonymous 'Kernel2' bf16 GEMM row exceeds profile_421_attribute.py's 1% known-kernel-name gate on each) -- both merge-level validity and every candidate-port decision below are F32-only by consequence, never a silent width choice.",
-   "HTSAT A1/A2 are VALID at the merge level but NOT decision-grade for attribution (their UNATTRIBUTED share exceeds the contract's 5% validity bound) -- HTSAT has no candidate port under this contract in the first place (C-ATTN-HTSAT is a named, measured, declared-out-of-tier chain, never folded into UNATTRIBUTED), so this never blocks a decision.",
+   "ROOT CAUSE of the run2-pass1..3 'A2 legs INVALID for attribution -> F32-only' state (pass-4 item 1, kernel_census.py): the module keyed each GPU-kernel bucket on shortName alone, and cutlass's Kernel2<...> template wrapper (same latent shape in magma_sgemmEx_kernel<...>) gives every bf16 GEMM tile instantiation the SAME literal shortName -- clip-text-A2's own run_m.sqlite has three DISTINCT cutlass instantiations sharing shortName='Kernel2' AND grid/block, so keying on shortName summed them into one anonymous row that tripped profile_421_attribute.py's 1% known-kernel-name gate. FIX: key on COALESCE(demangledName, shortName) instead -- a strict refinement (a bucket can only split, never merge two old buckets into fewer new ones), so gpu_kernel_us_per_step stays bit-identical and only by_kernel_and_grid resplits; only the cutlass Kernel2<...>(T1::Params) wrapper is stripped to its inner tile name, every other demangled name (magma's own template signature, splitKreduce_kernel<...>) is kept as-is since its template arguments are what distinguishes real instantiations there. All 12 censuses were regenerated under the fix for this run2 pass-4 pull -- every top-line number (gpu_kernel_us_per_step, wall/front/busy per_step) is UNCHANGED (sum-preserving refinement); only the per-instantiation by_kernel_and_grid breakdown resplit. Both CLIP-tower A2 legs (clip-text-A2, clip-vision-A2) are now VALID and decision-grade for attribution -- every candidate-port decision below is measured on BOTH the F32 (A1) and BF16 (A2) legs, never F32-only by consequence.",
+   "htsat-A2 (bf16) is VALID at the merge level but NOT decision-grade for attribution: UNATTRIBUTED share_gpu_busy is 5.66%, over the contract's 5% validity bound. Root cause: WINDOWING (window-partition/reverse/roll copies) and FRONT-FUSION (the audio front end's own activation) are still UNDECLARED chains -- a window-partition copy sits at the identical element count as a generic residual-stream PERMUTE/RESHAPE copy, so profile_421_attribute.py has no shape-only way to tell them apart, and declares neither rather than guess (module doc, 'declaring a chain with no matching rule is dishonest'). htsat-A1 (f32) clears the bound under the pass-4 census fix and IS decision-grade. HTSAT has no candidate port under this contract in the first place (C-ATTN-HTSAT is a named, measured, declared-out-of-tier chain, never folded into UNATTRIBUTED), so htsat-A2's own non-decision-grade status never blocks a candidate-port decision.",
    "Per-leg raw .nsys-rep exports were deleted on-pod after each leg's census.json was produced (disk budget); the raw sqlite exports (24 files, ~31 GB) were kept off-pod and were never committed.",
-   "Both media corpus producers (image, audio) emit families x instances = 24 files at any --rows, so the M-leg's 4800 rows cycle 16 distinct train clips (a page-cached working set, contract SS D6.3) -- the HTSAT/vision front-end finding below is a real per-item CPU decode/preprocess compute cost, not a realistic-corpus I/O cost, and every quote of that finding must carry this caveat."
+   "Both media corpus producers (image, audio) emit families x instances = 24 files at any --rows, so the M-leg's 4800 rows cycle 16 distinct train clips (a page-cached working set, contract SS D6.3) -- the HTSAT/vision front-end finding below is a real per-item CPU decode/preprocess compute cost, not a realistic-corpus I/O cost, and every quote of that finding must carry this caveat.",
+   "Census reports produced before the pass-4 kernel-identity fix (the #356 close-out and the #421 2026-09-01/06 pod artifacts) carry the pre-fix, collapsed Kernel2/magma_sgemmEx_kernel rows in by_kernel_and_grid -- their by_kernel_name totals and every other top-line number are unaffected (the refinement is sum-preserving, see the root-cause deviation above), only the per-instantiation breakdown was coarser."
   ]
  },
  "legs": [
@@ -188,9 +189,9 @@
     },
     "BASE-GEMM": {
      "status": "measured",
-     "gpu_busy_us": 21313.489296000007,
-     "share_gpu_busy": 0.35083139274277936,
-     "share_wall": 0.2122950436070498,
+     "gpu_busy_us": 22671.70389200001,
+     "share_gpu_busy": 0.3731883288474499,
+     "share_wall": 0.22582366967484557,
      "kernel_names": [
       "ampere_sgemm_128x32_nn",
       "ampere_sgemm_128x32_tn",
@@ -201,7 +202,9 @@
       "ampere_sgemm_32x32_sliced1x4_nn",
       "ampere_sgemm_32x32_sliced1x4_tn",
       "ampere_sgemm_64x32_sliced1x4_nn",
-      "splitKreduce_kernel"
+      "cutlass_80_simt_sgemm_128x32_8x5_nt_align1",
+      "cutlass_80_simt_sgemm_32x128_8x5_nt_align1",
+      "void cublasLt::splitKreduce_kernel<(int)32, (int)16, int, float, float, float, (bool)0, float, float, float, (bool)1, (bool)0, (bool)0>(cublasLt::cublasSplitKParams<T6>, const T4 *, const T9 *, T8 *, T5 *, const T6 *, const T6 *, const T10 *, const T4 *, T10 *, void *, long, T6 *, int *, T6 *, const T6 *, const T6 *, const T6 *, const T6 *)"
      ]
     },
     "BIAS/RESIDUAL-QKV": {
@@ -366,60 +369,23 @@
     },
     "UNATTRIBUTED": {
      "status": "measured",
-     "gpu_busy_us": 1794.3533599999998,
-     "share_gpu_busy": 0.029536012598351483,
-     "share_wall": 0.017872827837680596,
+     "gpu_busy_us": 436.138764,
+     "share_gpu_busy": 0.007179076493680958,
+     "share_wall": 0.004344201769884839,
      "kernel_names": [
-      "Kernel2",
       "badd_f32",
       "copy2d_f32"
      ]
     }
    },
-   "unknown_kernels": [
-    {
-     "kernel": "Kernel2",
-     "grid": [
-      16,
-      1,
-      10
-     ],
-     "share_gpu_busy": 0.009534007478941774
-    },
-    {
-     "kernel": "Kernel2",
-     "grid": [
-      4,
-      1,
-      24
-     ],
-     "share_gpu_busy": 0.009315438596698065
-    },
-    {
-     "kernel": "Kernel2",
-     "grid": [
-      12,
-      1,
-      8
-     ],
-     "share_gpu_busy": 0.003409594926943495
-    },
-    {
-     "kernel": "Kernel2",
-     "grid": [
-      64,
-      1,
-      1
-     ],
-     "share_gpu_busy": 9.789510208719259e-05
-    }
-   ],
+   "unknown_kernels": [],
    "decision_grade": true,
    "decision_grade_reason": null,
    "outside_signature_plausibly_attention": {
     "busy_us": 1386.574498,
     "share_wall": 0.013811107577424101
    },
+   "ambiguous_out_mlp_collision": null,
    "attribution_verdict": "VALID",
    "attribution_reasons": [],
    "launches_per_step": 3673.0
@@ -568,9 +534,9 @@
     },
     "BASE-GEMM": {
      "status": "measured",
-     "gpu_busy_us": 6416.541799999999,
-     "share_gpu_busy": 0.15480338639676625,
-     "share_wall": 0.06645946418161883,
+     "gpu_busy_us": 7776.156857999999,
+     "share_gpu_busy": 0.18760501408575533,
+     "share_wall": 0.08054170521805074,
      "kernel_names": [
       "ampere_bf16_s16816gemm_bf16_128x128_ldg8_f2f_stages_64x3_nn",
       "ampere_bf16_s16816gemm_bf16_128x128_ldg8_f2f_stages_64x3_tn",
@@ -584,7 +550,9 @@
       "ampere_sgemm_32x128_nn",
       "ampere_sgemm_32x128_tn",
       "ampere_sgemm_32x32_sliced1x4_nn",
-      "splitKreduce_kernel"
+      "cutlass_80_simt_sgemm_32x128_8x5_nt_align1",
+      "cutlass_80_wmma_tensorop_bf16_s161616gemm_bf16_32x32_64x1_nt_align8",
+      "void cublasLt::splitKreduce_kernel<(int)32, (int)16, int, float, float, float, (bool)0, float, float, float, (bool)1, (bool)0, (bool)0>(cublasLt::cublasSplitKParams<T6>, const T4 *, const T9 *, T8 *, T5 *, const T6 *, const T6 *, const T10 *, const T4 *, T10 *, void *, long, T6 *, int *, T6 *, const T6 *, const T6 *, const T6 *, const T6 *)"
      ]
     },
     "BIAS/RESIDUAL-QKV": {
@@ -732,13 +700,16 @@
      "share_gpu_busy": 0.19406472969198849,
      "share_wall": 0.08331496004114333,
      "kernel_names": [
-      "Kernel2",
       "affine_bf16",
       "badd_bf16",
       "bdiv_bf16",
       "bmul_bf16",
       "bsub_bf16",
       "cast_u8_bf16",
+      "cutlass_75_tensorop_bf16_s1688gemm_bf16_64x64_nn_align1",
+      "cutlass_75_tensorop_bf16_s1688gemm_bf16_64x64_nt_align1",
+      "cutlass_75_tensorop_bf16_s1688gemm_bf16_64x64_tn_align1",
+      "cutlass_75_wmma_tensorop_bf16_s161616gemm_bf16_32x32_32x1_nn_align1",
       "eq_bf16",
       "fast_max_bf16",
       "fast_sum_bf16",
@@ -748,66 +719,26 @@
     },
     "UNATTRIBUTED": {
      "status": "measured",
-     "gpu_busy_us": 1790.9124779999997,
-     "share_gpu_busy": 0.043206968017355414,
-     "share_wall": 0.01854941296946826,
+     "gpu_busy_us": 431.29742,
+     "share_gpu_busy": 0.010405340328366345,
+     "share_wall": 0.0044671719330363615,
      "kernel_names": [
-      "Kernel2",
       "badd_bf16",
       "badd_f32",
       "copy2d_bf16"
      ]
     }
    },
-   "unknown_kernels": [
-    {
-     "kernel": "Kernel2",
-     "grid": [
-      16,
-      1,
-      10
-     ],
-     "share_gpu_busy": 0.014001689196696428
-    },
-    {
-     "kernel": "Kernel2",
-     "grid": [
-      4,
-      1,
-      24
-     ],
-     "share_gpu_busy": 0.013669664887566664
-    },
-    {
-     "kernel": "Kernel2",
-     "grid": [
-      12,
-      1,
-      8
-     ],
-     "share_gpu_busy": 0.005020574219873638
-    },
-    {
-     "kernel": "Kernel2",
-     "grid": [
-      128,
-      2,
-      1
-     ],
-     "share_gpu_busy": 0.00010969938485233951
-    }
-   ],
-   "decision_grade": false,
-   "decision_grade_reason": "leg is INVALID: kernel 'Kernel2' (grid=[16, 1, 10]) is not a known kernel name and carries share_gpu_busy=0.0140 > 0.01 \u2014 the mapping cannot classify it and refuses to guess; kernel 'Kernel2' (grid=[4, 1, 24]) is not a known kernel name and carries share_gpu_busy=0.0137 > 0.01 \u2014 the mapping cannot classify it and refuses to guess",
+   "unknown_kernels": [],
+   "decision_grade": true,
+   "decision_grade_reason": null,
    "outside_signature_plausibly_attention": {
     "busy_us": 1351.568088,
     "share_wall": 0.013998894378503863
    },
-   "attribution_verdict": "INVALID",
-   "attribution_reasons": [
-    "kernel 'Kernel2' (grid=[16, 1, 10]) is not a known kernel name and carries share_gpu_busy=0.0140 > 0.01 \u2014 the mapping cannot classify it and refuses to guess",
-    "kernel 'Kernel2' (grid=[4, 1, 24]) is not a known kernel name and carries share_gpu_busy=0.0137 > 0.01 \u2014 the mapping cannot classify it and refuses to guess"
-   ],
+   "ambiguous_out_mlp_collision": null,
+   "attribution_verdict": "VALID",
+   "attribution_reasons": [],
    "launches_per_step": 3722.0
   },
   {
@@ -960,11 +891,10 @@
     },
     "BASE-GEMM": {
      "status": "measured",
-     "gpu_busy_us": 29200.23115,
-     "share_gpu_busy": 0.3263981107310846,
-     "share_wall": 0.1965518686718116,
+     "gpu_busy_us": 30118.739496,
+     "share_gpu_busy": 0.3366651318133863,
+     "share_wall": 0.20273450917453772,
      "kernel_names": [
-      "Kernel2",
       "ampere_sgemm_128x32_nn",
       "ampere_sgemm_128x32_tn",
       "ampere_sgemm_128x64_nn",
@@ -977,7 +907,9 @@
       "ampere_sgemm_32x32_sliced1x4_tn",
       "ampere_sgemm_64x32_sliced1x4_nn",
       "ampere_sgemm_64x32_sliced1x4_nt",
-      "splitKreduce_kernel"
+      "cutlass_80_simt_sgemm_128x32_8x5_nt_align1",
+      "cutlass_80_simt_sgemm_32x128_8x5_nt_align1",
+      "void cublasLt::splitKreduce_kernel<(int)32, (int)16, int, float, float, float, (bool)0, float, float, float, (bool)1, (bool)0, (bool)0>(cublasLt::cublasSplitKParams<T6>, const T4 *, const T9 *, T8 *, T5 *, const T6 *, const T6 *, const T10 *, const T4 *, T10 *, void *, long, T6 *, int *, T6 *, const T6 *, const T6 *, const T6 *, const T6 *)"
      ]
     },
     "BIAS/RESIDUAL-QKV": {
@@ -1142,60 +1074,23 @@
     },
     "UNATTRIBUTED": {
      "status": "measured",
-     "gpu_busy_us": 1982.641232,
-     "share_gpu_busy": 0.02216182293414311,
-     "share_wall": 0.013345505282254684,
+     "gpu_busy_us": 1064.1328859999999,
+     "share_gpu_busy": 0.011894801851841389,
+     "share_wall": 0.007162864779528564,
      "kernel_names": [
-      "Kernel2",
       "badd_f32",
       "copy2d_f32"
      ]
     }
    },
-   "unknown_kernels": [
-    {
-     "kernel": "Kernel2",
-     "grid": [
-      4,
-      1,
-      24
-     ],
-     "share_gpu_busy": 0.004134516390646977
-    },
-    {
-     "kernel": "Kernel2",
-     "grid": [
-      16,
-      1,
-      10
-     ],
-     "share_gpu_busy": 0.003540198335295808
-    },
-    {
-     "kernel": "Kernel2",
-     "grid": [
-      4,
-      1,
-      28
-     ],
-     "share_gpu_busy": 0.0025257711870860576
-    },
-    {
-     "kernel": "Kernel2",
-     "grid": [
-      64,
-      1,
-      1
-     ],
-     "share_gpu_busy": 6.653516927287702e-05
-    }
-   ],
+   "unknown_kernels": [],
    "decision_grade": true,
    "decision_grade_reason": null,
    "outside_signature_plausibly_attention": {
     "busy_us": 1391.340992,
     "share_wall": 0.00936535983336872
    },
+   "ambiguous_out_mlp_collision": null,
    "attribution_verdict": "VALID",
    "attribution_reasons": [],
    "launches_per_step": 4969.0
@@ -1346,11 +1241,10 @@
     },
     "BASE-GEMM": {
      "status": "measured",
-     "gpu_busy_us": 29206.051642000002,
-     "share_gpu_busy": 0.36778785829356153,
-     "share_wall": 0.21967834338219,
+     "gpu_busy_us": 30120.16417,
+     "share_gpu_busy": 0.3792991537275858,
+     "share_wall": 0.22655399806764456,
      "kernel_names": [
-      "Kernel2",
       "ampere_sgemm_128x32_nn",
       "ampere_sgemm_128x32_tn",
       "ampere_sgemm_128x64_nn",
@@ -1363,7 +1257,9 @@
       "ampere_sgemm_32x32_sliced1x4_tn",
       "ampere_sgemm_64x32_sliced1x4_nn",
       "ampere_sgemm_64x32_sliced1x4_nt",
-      "splitKreduce_kernel"
+      "cutlass_80_simt_sgemm_128x32_8x5_nt_align1",
+      "cutlass_80_simt_sgemm_32x128_8x5_nt_align1",
+      "void cublasLt::splitKreduce_kernel<(int)32, (int)16, int, float, float, float, (bool)0, float, float, float, (bool)1, (bool)0, (bool)0>(cublasLt::cublasSplitKParams<T6>, const T4 *, const T9 *, T8 *, T5 *, const T6 *, const T6 *, const T10 *, const T4 *, T10 *, void *, long, T6 *, int *, T6 *, const T6 *, const T6 *, const T6 *, const T6 *)"
      ]
     },
     "BIAS/RESIDUAL-QKV": {
@@ -1525,60 +1421,23 @@
     },
     "UNATTRIBUTED": {
      "status": "measured",
-     "gpu_busy_us": 1979.327602,
-     "share_gpu_busy": 0.024925404793643656,
-     "share_wall": 0.014887853173303057,
+     "gpu_busy_us": 1065.215074,
+     "share_gpu_busy": 0.013414109359619328,
+     "share_wall": 0.008012198487848475,
      "kernel_names": [
-      "Kernel2",
       "badd_f32",
       "copy2d_f32"
      ]
     }
    },
-   "unknown_kernels": [
-    {
-     "kernel": "Kernel2",
-     "grid": [
-      4,
-      1,
-      24
-     ],
-     "share_gpu_busy": 0.004618836119793679
-    },
-    {
-     "kernel": "Kernel2",
-     "grid": [
-      16,
-      1,
-      10
-     ],
-     "share_gpu_busy": 0.003987853958397304
-    },
-    {
-     "kernel": "Kernel2",
-     "grid": [
-      4,
-      1,
-      28
-     ],
-     "share_gpu_busy": 0.002829854966975005
-    },
-    {
-     "kernel": "Kernel2",
-     "grid": [
-      64,
-      1,
-      1
-     ],
-     "share_gpu_busy": 7.475038885833856e-05
-    }
-   ],
+   "unknown_kernels": [],
    "decision_grade": true,
    "decision_grade_reason": null,
    "outside_signature_plausibly_attention": {
     "busy_us": 1393.607804,
     "share_wall": 0.010482260918382983
    },
+   "ambiguous_out_mlp_collision": null,
    "attribution_verdict": "VALID",
    "attribution_reasons": [],
    "launches_per_step": 3950.0
@@ -1727,9 +1586,9 @@
     },
     "BASE-GEMM": {
      "status": "measured",
-     "gpu_busy_us": 29772.195265999995,
-     "share_gpu_busy": 0.4565433412849336,
-     "share_wall": 0.2596289448147352,
+     "gpu_busy_us": 30535.770763999997,
+     "share_gpu_busy": 0.46825243112750686,
+     "share_wall": 0.26628771817897295,
      "kernel_names": [
       "ampere_sgemm_128x32_nn",
       "ampere_sgemm_128x32_tn",
@@ -1741,7 +1600,8 @@
       "ampere_sgemm_32x32_sliced1x4_nt",
       "ampere_sgemm_32x32_sliced1x4_tn",
       "ampere_sgemm_64x32_sliced1x4_nn",
-      "splitKreduce_kernel"
+      "cutlass_80_simt_sgemm_32x128_8x5_nt_align1",
+      "void cublasLt::splitKreduce_kernel<(int)32, (int)16, int, float, float, float, (bool)0, float, float, float, (bool)1, (bool)0, (bool)0>(cublasLt::cublasSplitKParams<T6>, const T4 *, const T9 *, T8 *, T5 *, const T6 *, const T6 *, const T10 *, const T4 *, T10 *, void *, long, T6 *, int *, T6 *, const T6 *, const T6 *, const T6 *, const T6 *)"
      ]
     },
     "BIAS/RESIDUAL-QKV": {
@@ -1899,18 +1759,17 @@
       "eq_f32",
       "fast_max_f32",
       "fast_sum_f32",
-      "magma_sgemmEx_kernel",
       "uexp_f32",
-      "usqr_f32"
+      "usqr_f32",
+      "void magma_sgemmEx_kernel<float, float, float, (bool)0, (bool)0, (int)6, (int)3, (int)5, (int)3, (int)3>(int, int, int, Tensor, int, Tensor, int, Tensor, int, Tensor, int, int, int, const T1 *, const T1 *, T1, T1, int, cublasLtEpilogue_t, int, const void *, long)"
      ]
     },
     "UNATTRIBUTED": {
      "status": "measured",
-     "gpu_busy_us": 1349.9728619999999,
-     "share_gpu_busy": 0.020701231990282776,
-     "share_wall": 0.011772461740161024,
+     "gpu_busy_us": 586.3973639999999,
+     "share_gpu_busy": 0.008992142147709555,
+     "share_wall": 0.005113688375923277,
      "kernel_names": [
-      "Kernel2",
       "affine_f32",
       "badd_f32",
       "bmul_f32",
@@ -1920,32 +1779,14 @@
      ]
     }
    },
-   "unknown_kernels": [
-    {
-     "kernel": "Kernel2",
-     "grid": [
-      6,
-      1,
-      18
-     ],
-     "share_gpu_busy": 0.008442308673309844
-    },
-    {
-     "kernel": "Kernel2",
-     "grid": [
-      18,
-      1,
-      10
-     ],
-     "share_gpu_busy": 0.0032667811692633788
-    }
-   ],
+   "unknown_kernels": [],
    "decision_grade": true,
    "decision_grade_reason": null,
    "outside_signature_plausibly_attention": {
     "busy_us": 1352.6968219999999,
     "share_wall": 0.01179621608055141
    },
+   "ambiguous_out_mlp_collision": null,
    "attribution_verdict": "VALID",
    "attribution_reasons": [],
    "launches_per_step": 3638.0
@@ -2094,9 +1935,9 @@
     },
     "BASE-GEMM": {
      "status": "measured",
-     "gpu_busy_us": 7576.434142,
-     "share_gpu_busy": 0.19608499910575378,
-     "share_wall": 0.06975793797982499,
+     "gpu_busy_us": 8343.803587999999,
+     "share_gpu_busy": 0.2159452175558243,
+     "share_wall": 0.07682328154625769,
      "kernel_names": [
       "ampere_bf16_s16816gemm_bf16_128x128_ldg8_f2f_stages_64x3_nn",
       "ampere_bf16_s16816gemm_bf16_128x128_ldg8_f2f_stages_64x3_tn",
@@ -2110,7 +1951,9 @@
       "ampere_sgemm_32x128_tn",
       "ampere_sgemm_32x32_sliced1x4_nn",
       "ampere_sgemm_32x32_sliced1x4_nt",
-      "splitKreduce_kernel"
+      "cutlass_80_simt_sgemm_32x128_8x5_nt_align1",
+      "cutlass_80_wmma_tensorop_bf16_s161616gemm_bf16_32x32_32x1_nt_align8",
+      "void cublasLt::splitKreduce_kernel<(int)32, (int)16, int, float, float, float, (bool)0, float, float, float, (bool)1, (bool)0, (bool)0>(cublasLt::cublasSplitKParams<T6>, const T4 *, const T9 *, T8 *, T5 *, const T6 *, const T6 *, const T10 *, const T4 *, T10 *, void *, long, T6 *, int *, T6 *, const T6 *, const T6 *, const T6 *, const T6 *)"
      ]
     },
     "BIAS/RESIDUAL-QKV": {
@@ -2260,13 +2103,15 @@
      "share_gpu_busy": 0.1259721514524235,
      "share_wall": 0.04481504229430584,
      "kernel_names": [
-      "Kernel2",
       "affine_bf16",
       "badd_bf16",
       "bdiv_bf16",
       "bmul_bf16",
       "bsub_bf16",
       "cast_u8_bf16",
+      "cutlass_80_wmma_tensorop_bf16_s161616gemm_bf16_32x32_32x1_nt_align2",
+      "cutlass_80_wmma_tensorop_bf16_s161616gemm_bf16_32x32_64x1_nn_align2",
+      "cutlass_80_wmma_tensorop_bf16_s161616gemm_bf16_32x32_64x1_tn_align2",
       "eq_bf16",
       "fast_max_bf16",
       "fast_sum_bf16",
@@ -2276,11 +2121,10 @@
     },
     "UNATTRIBUTED": {
      "status": "measured",
-     "gpu_busy_us": 1346.488078,
-     "share_gpu_busy": 0.034848334799996224,
-     "share_wall": 0.012397419429148886,
+     "gpu_busy_us": 579.1186319999999,
+     "share_gpu_busy": 0.01498811634992568,
+     "share_wall": 0.005332075862716196,
      "kernel_names": [
-      "Kernel2",
       "affine_bf16",
       "badd_bf16",
       "badd_f32",
@@ -2291,45 +2135,16 @@
      ]
     }
    },
-   "unknown_kernels": [
-    {
-     "kernel": "Kernel2",
-     "grid": [
-      6,
-      1,
-      18
-     ],
-     "share_gpu_busy": 0.014277743953055057
-    },
-    {
-     "kernel": "Kernel2",
-     "grid": [
-      18,
-      1,
-      10
-     ],
-     "share_gpu_busy": 0.005470816803862402
-    },
-    {
-     "kernel": "Kernel2",
-     "grid": [
-      192,
-      2,
-      1
-     ],
-     "share_gpu_busy": 0.00011165769315308122
-    }
-   ],
-   "decision_grade": false,
-   "decision_grade_reason": "leg is INVALID: kernel 'Kernel2' (grid=[6, 1, 18]) is not a known kernel name and carries share_gpu_busy=0.0143 > 0.01 \u2014 the mapping cannot classify it and refuses to guess",
+   "unknown_kernels": [],
+   "decision_grade": true,
+   "decision_grade_reason": null,
    "outside_signature_plausibly_attention": {
     "busy_us": 1331.2846960000002,
     "share_wall": 0.012257438462012857
    },
-   "attribution_verdict": "INVALID",
-   "attribution_reasons": [
-    "kernel 'Kernel2' (grid=[6, 1, 18]) is not a known kernel name and carries share_gpu_busy=0.0143 > 0.01 \u2014 the mapping cannot classify it and refuses to guess"
-   ],
+   "ambiguous_out_mlp_collision": null,
+   "attribution_verdict": "VALID",
+   "attribution_reasons": [],
    "launches_per_step": 3696.0
   },
   {
@@ -2482,9 +2297,9 @@
     },
     "BASE-GEMM": {
      "status": "measured",
-     "gpu_busy_us": 40601.934666,
-     "share_gpu_busy": 0.4160626352220919,
-     "share_wall": 0.24484259606279948,
+     "gpu_busy_us": 41243.302938,
+     "share_gpu_busy": 0.422634966703124,
+     "share_wall": 0.24871025099206792,
      "kernel_names": [
       "ampere_sgemm_128x32_nn",
       "ampere_sgemm_128x32_sliced1x4_nt",
@@ -2499,7 +2314,9 @@
       "ampere_sgemm_32x32_sliced1x4_tn",
       "ampere_sgemm_64x32_sliced1x4_nn",
       "ampere_sgemm_64x32_sliced1x4_nt",
-      "splitKreduce_kernel"
+      "cutlass_80_simt_sgemm_128x32_8x5_nt_align1",
+      "cutlass_80_simt_sgemm_32x128_8x5_nt_align1",
+      "void cublasLt::splitKreduce_kernel<(int)32, (int)16, int, float, float, float, (bool)0, float, float, float, (bool)1, (bool)0, (bool)0>(cublasLt::cublasSplitKParams<T6>, const T4 *, const T9 *, T8 *, T5 *, const T6 *, const T6 *, const T10 *, const T4 *, T10 *, void *, long, T6 *, int *, T6 *, const T6 *, const T6 *, const T6 *, const T6 *)"
      ]
     },
     "BIAS/RESIDUAL-QKV": {
@@ -2658,18 +2475,17 @@
       "eq_f32",
       "fast_max_f32",
       "fast_sum_f32",
-      "magma_sgemmEx_kernel",
       "uexp_f32",
-      "usqr_f32"
+      "usqr_f32",
+      "void magma_sgemmEx_kernel<float, float, float, (bool)0, (bool)0, (int)6, (int)3, (int)5, (int)3, (int)3>(int, int, int, Tensor, int, Tensor, int, Tensor, int, Tensor, int, int, int, const T1 *, const T1 *, T1, T1, int, cublasLtEpilogue_t, int, const void *, long)"
      ]
     },
     "UNATTRIBUTED": {
      "status": "measured",
-     "gpu_busy_us": 2992.4736160000007,
-     "share_gpu_busy": 0.030664953991666584,
-     "share_wall": 0.018045568882815388,
+     "gpu_busy_us": 2351.105344,
+     "share_gpu_busy": 0.0240926225106345,
+     "share_wall": 0.014177913953546903,
      "kernel_names": [
-      "Kernel2",
       "affine_f32",
       "badd_f32",
       "bdiv_f32",
@@ -2680,32 +2496,14 @@
      ]
     }
    },
-   "unknown_kernels": [
-    {
-     "kernel": "Kernel2",
-     "grid": [
-      6,
-      1,
-      18
-     ],
-     "share_gpu_busy": 0.0036276122591383034
-    },
-    {
-     "kernel": "Kernel2",
-     "grid": [
-      8,
-      1,
-      18
-     ],
-     "share_gpu_busy": 0.0029447192218937743
-    }
-   ],
+   "unknown_kernels": [],
    "decision_grade": true,
    "decision_grade_reason": null,
    "outside_signature_plausibly_attention": {
     "busy_us": 1362.862024,
     "share_wall": 0.008218492019568467
    },
+   "ambiguous_out_mlp_collision": null,
    "attribution_verdict": "VALID",
    "attribution_reasons": [],
    "launches_per_step": 4903.0
@@ -2856,9 +2654,9 @@
     },
     "BASE-GEMM": {
      "status": "measured",
-     "gpu_busy_us": 40608.802968,
-     "share_gpu_busy": 0.46534749280848503,
-     "share_wall": 0.280090382524521,
+     "gpu_busy_us": 41247.05533,
+     "share_gpu_busy": 0.472661402964119,
+     "share_wall": 0.2844925893160048,
      "kernel_names": [
       "ampere_sgemm_128x32_nn",
       "ampere_sgemm_128x32_sliced1x4_nt",
@@ -2873,7 +2671,9 @@
       "ampere_sgemm_32x32_sliced1x4_tn",
       "ampere_sgemm_64x32_sliced1x4_nn",
       "ampere_sgemm_64x32_sliced1x4_nt",
-      "splitKreduce_kernel"
+      "cutlass_80_simt_sgemm_128x32_8x5_nt_align1",
+      "cutlass_80_simt_sgemm_32x128_8x5_nt_align1",
+      "void cublasLt::splitKreduce_kernel<(int)32, (int)16, int, float, float, float, (bool)0, float, float, float, (bool)1, (bool)0, (bool)0>(cublasLt::cublasSplitKParams<T6>, const T4 *, const T9 *, T8 *, T5 *, const T6 *, const T6 *, const T10 *, const T4 *, T10 *, void *, long, T6 *, int *, T6 *, const T6 *, const T6 *, const T6 *, const T6 *)"
      ]
     },
     "BIAS/RESIDUAL-QKV": {
@@ -3029,18 +2829,17 @@
       "eq_f32",
       "fast_max_f32",
       "fast_sum_f32",
-      "magma_sgemmEx_kernel",
       "uexp_f32",
-      "usqr_f32"
+      "usqr_f32",
+      "void magma_sgemmEx_kernel<float, float, float, (bool)0, (bool)0, (int)6, (int)3, (int)5, (int)3, (int)3>(int, int, int, Tensor, int, Tensor, int, Tensor, int, Tensor, int, int, int, const T1 *, const T1 *, T1, T1, int, cublasLtEpilogue_t, int, const void *, long)"
      ]
     },
     "UNATTRIBUTED": {
      "status": "measured",
-     "gpu_busy_us": 2353.7841740000003,
-     "share_gpu_busy": 0.026972663164839313,
-     "share_wall": 0.016234714187348356,
+     "gpu_busy_us": 1715.5318120000002,
+     "share_gpu_busy": 0.019658753009205353,
+     "share_wall": 0.011832507395864509,
      "kernel_names": [
-      "Kernel2",
       "affine_f32",
       "badd_f32",
       "bmul_f32",
@@ -3050,32 +2849,14 @@
      ]
     }
    },
-   "unknown_kernels": [
-    {
-     "kernel": "Kernel2",
-     "grid": [
-      6,
-      1,
-      18
-     ],
-     "share_gpu_busy": 0.004031332808263473
-    },
-    {
-     "kernel": "Kernel2",
-     "grid": [
-      8,
-      1,
-      18
-     ],
-     "share_gpu_busy": 0.0032825773473704836
-    }
-   ],
+   "unknown_kernels": [],
    "decision_grade": true,
    "decision_grade_reason": null,
    "outside_signature_plausibly_attention": {
     "busy_us": 1361.250484,
     "share_wall": 0.009388929022992747
    },
+   "ambiguous_out_mlp_collision": null,
    "attribution_verdict": "VALID",
    "attribution_reasons": [],
    "launches_per_step": 3915.0
@@ -3242,10 +3023,11 @@
       "eq_f32",
       "fast_max_f32",
       "fast_sum_f32",
-      "magma_sgemmEx_kernel",
       "ucopy_f32",
       "uexp_f32",
-      "usqr_f32"
+      "usqr_f32",
+      "void magma_sgemmEx_kernel<float, float, float, (bool)0, (bool)0, (int)6, (int)3, (int)5, (int)3, (int)3>(int, int, int, Tensor, int, Tensor, int, Tensor, int, Tensor, int, int, int, const T1 *, const T1 *, T1, T1, int, cublasLtEpilogue_t, int, const void *, long)",
+      "void magma_sgemmEx_kernel<float, float, float, (bool)1, (bool)0, (int)6, (int)4, (int)6, (int)3, (int)4>(int, int, int, Tensor, int, Tensor, int, Tensor, int, Tensor, int, int, int, const T1 *, const T1 *, T1, T1, int, cublasLtEpilogue_t, int, const void *, long)"
      ]
     },
     "C-LN": {
@@ -3260,9 +3042,9 @@
     },
     "BASE-GEMM": {
      "status": "measured",
-     "gpu_busy_us": 46451.53243200001,
-     "share_gpu_busy": 0.19786437144696498,
-     "share_wall": 0.029968940154908707,
+     "gpu_busy_us": 48832.001662,
+     "share_gpu_busy": 0.20800418865605916,
+     "share_wall": 0.03150473749375658,
      "kernel_names": [
       "ampere_sgemm_128x128_nn",
       "ampere_sgemm_128x128_tn",
@@ -3278,7 +3060,9 @@
       "ampere_sgemm_32x32_sliced1x4_tn",
       "ampere_sgemm_64x32_sliced1x4_nn",
       "ampere_sgemm_64x64_tn",
-      "splitKreduce_kernel"
+      "cutlass_80_simt_sgemm_128x32_8x5_nt_align1",
+      "cutlass_80_simt_sgemm_32x128_8x5_nt_align1",
+      "void cublasLt::splitKreduce_kernel<(int)32, (int)16, int, float, float, float, (bool)0, float, float, float, (bool)1, (bool)0, (bool)0>(cublasLt::cublasSplitKParams<T6>, const T4 *, const T9 *, T8 *, T5 *, const T6 *, const T6 *, const T10 *, const T4 *, T10 *, void *, long, T6 *, int *, T6 *, const T6 *, const T6 *, const T6 *, const T6 *)"
      ]
     },
     "BIAS/RESIDUAL-OUT": {
@@ -3391,11 +3175,10 @@
     },
     "UNATTRIBUTED": {
      "status": "measured",
-     "gpu_busy_us": 13512.585593999996,
-     "share_gpu_busy": 0.057558042010649915,
-     "share_wall": 0.008717858115821727,
+     "gpu_busy_us": 11132.116363999998,
+     "share_gpu_busy": 0.047418224801555726,
+     "share_wall": 0.007182060776973848,
      "kernel_names": [
-      "Kernel2",
       "affine_f32",
       "badd_f32",
       "bdiv_f32",
@@ -3414,67 +3197,20 @@
      ]
     }
    },
-   "unknown_kernels": [
-    {
-     "kernel": "Kernel2",
-     "grid": [
-      3,
-      1,
-      36
-     ],
-     "share_gpu_busy": 0.003968701561966253
-    },
-    {
-     "kernel": "Kernel2",
-     "grid": [
-      3,
-      1,
-      108
-     ],
-     "share_gpu_busy": 0.0023776961233310527
-    },
-    {
-     "kernel": "Kernel2",
-     "grid": [
-      12,
-      1,
-      24
-     ],
-     "share_gpu_busy": 0.0023305351621325447
-    },
-    {
-     "kernel": "Kernel2",
-     "grid": [
-      6,
-      1,
-      36
-     ],
-     "share_gpu_busy": 0.0013306204609108989
-    },
-    {
-     "kernel": "Kernel2",
-     "grid": [
-      16,
-      1,
-      1
-     ],
-     "share_gpu_busy": 6.695604852968402e-05
-    },
-    {
-     "kernel": "Kernel2",
-     "grid": [
-      12,
-      1,
-      8
-     ],
-     "share_gpu_busy": 6.53078522237597e-05
-    }
-   ],
-   "decision_grade": false,
-   "decision_grade_reason": "UNATTRIBUTED share_gpu_busy=0.0576 > 0.05",
+   "unknown_kernels": [],
+   "decision_grade": true,
+   "decision_grade_reason": null,
    "outside_signature_plausibly_attention": {
     "busy_us": 8153.340560000001,
     "share_wall": 0.005260256497736157
+   },
+   "ambiguous_out_mlp_collision": {
+    "busy_us": 40476.271673999996,
+    "share_gpu_busy": 0.1724122248284625,
+    "grids": [
+     4608,
+     9216
+    ]
    },
    "attribution_verdict": "VALID",
    "attribution_reasons": [],
@@ -3631,7 +3367,6 @@
      "share_gpu_busy": 0.3445381270175922,
      "share_wall": 0.04324423726244897,
      "kernel_names": [
-      "Kernel2",
       "affine_bf16",
       "ampere_bf16_s16816gemm_bf16_64x64_ldg8_f2f_nn",
       "ampere_bf16_s16816gemm_bf16_64x64_ldg8_f2f_tn",
@@ -3640,6 +3375,12 @@
       "bmul_bf16",
       "bsub_bf16",
       "cast_u8_bf16",
+      "cutlass_80_wmma_tensorop_bf16_s161616gemm_bf16_32x32_32x1_nn_align8",
+      "cutlass_80_wmma_tensorop_bf16_s161616gemm_bf16_32x32_32x1_nt_align8",
+      "cutlass_80_wmma_tensorop_bf16_s161616gemm_bf16_32x32_32x1_tn_align8",
+      "cutlass_80_wmma_tensorop_bf16_s161616gemm_bf16_32x32_64x1_nn_align8",
+      "cutlass_80_wmma_tensorop_bf16_s161616gemm_bf16_32x32_64x1_nt_align8",
+      "cutlass_80_wmma_tensorop_bf16_s161616gemm_bf16_32x32_64x1_tn_align8",
       "eq_bf16",
       "fast_max_bf16",
       "fast_sum_bf16",
@@ -3660,9 +3401,9 @@
     },
     "BASE-GEMM": {
      "status": "measured",
-     "gpu_busy_us": 17819.236574,
-     "share_gpu_busy": 0.09461597403648189,
-     "share_wall": 0.01187559607834757,
+     "gpu_busy_us": 20469.03919799999,
+     "share_gpu_busy": 0.10868580554879262,
+     "share_wall": 0.013641551960873105,
      "kernel_names": [
       "ampere_bf16_s16816gemm_bf16_128x128_ldg8_f2f_stages_32x5_nn",
       "ampere_bf16_s16816gemm_bf16_128x128_ldg8_f2f_stages_32x5_tn",
@@ -3684,7 +3425,11 @@
       "ampere_sgemm_32x32_sliced1x4_nn",
       "ampere_sgemm_32x32_sliced1x4_nt",
       "ampere_sgemm_64x64_tn",
-      "splitKreduce_kernel"
+      "cutlass_75_tensorop_bf16_s1688gemm_bf16_256x128_nn_align1",
+      "cutlass_80_simt_sgemm_128x32_8x5_nt_align1",
+      "cutlass_80_simt_sgemm_32x128_8x5_nt_align1",
+      "cutlass_80_wmma_tensorop_bf16_s161616gemm_bf16_32x32_32x1_tn_align8",
+      "void cublasLt::splitKreduce_kernel<(int)32, (int)16, int, float, float, float, (bool)0, float, float, float, (bool)1, (bool)0, (bool)0>(cublasLt::cublasSplitKParams<T6>, const T4 *, const T9 *, T8 *, T5 *, const T6 *, const T6 *, const T10 *, const T4 *, T10 *, void *, long, T6 *, int *, T6 *, const T6 *, const T6 *, const T6 *, const T6 *)"
      ]
     },
     "BIAS/RESIDUAL-OUT": {
@@ -3795,11 +3540,10 @@
     },
     "UNATTRIBUTED": {
      "status": "measured",
-     "gpu_busy_us": 13311.966208,
-     "share_gpu_busy": 0.07068342371908466,
-     "share_wall": 0.008871734377525763,
+     "gpu_busy_us": 10662.163583999998,
+     "share_gpu_busy": 0.05661359220677389,
+     "share_wall": 0.007105778495000224,
      "kernel_names": [
-      "Kernel2",
       "affine_bf16",
       "affine_f32",
       "badd_bf16",
@@ -3828,94 +3572,20 @@
      ]
     }
    },
-   "unknown_kernels": [
-    {
-     "kernel": "Kernel2",
-     "grid": [
-      3,
-      1,
-      36
-     ],
-     "share_gpu_busy": 0.004970932190157679
-    },
-    {
-     "kernel": "Kernel2",
-     "grid": [
-      3,
-      1,
-      108
-     ],
-     "share_gpu_busy": 0.0029629295705927614
-    },
-    {
-     "kernel": "Kernel2",
-     "grid": [
-      12,
-      1,
-      24
-     ],
-     "share_gpu_busy": 0.0029538660126580203
-    },
-    {
-     "kernel": "Kernel2",
-     "grid": [
-      6,
-      1,
-      36
-     ],
-     "share_gpu_busy": 0.001657838141623951
-    },
-    {
-     "kernel": "Kernel2",
-     "grid": [
-      192,
-      1,
-      1
-     ],
-     "share_gpu_busy": 0.0009186345633113985
-    },
-    {
-     "kernel": "Kernel2",
-     "grid": [
-      12288,
-      1,
-      1
-     ],
-     "share_gpu_busy": 0.00031869020362573173
-    },
-    {
-     "kernel": "Kernel2",
-     "grid": [
-      3072,
-      1,
-      1
-     ],
-     "share_gpu_busy": 0.00012163474643290439
-    },
-    {
-     "kernel": "Kernel2",
-     "grid": [
-      16,
-      1,
-      1
-     ],
-     "share_gpu_busy": 8.324347198864538e-05
-    },
-    {
-     "kernel": "Kernel2",
-     "grid": [
-      12,
-      1,
-      8
-     ],
-     "share_gpu_busy": 8.206261191966961e-05
-    }
-   ],
+   "unknown_kernels": [],
    "decision_grade": false,
-   "decision_grade_reason": "UNATTRIBUTED share_gpu_busy=0.0707 > 0.05",
+   "decision_grade_reason": "UNATTRIBUTED share_gpu_busy=0.0566 > 0.05",
    "outside_signature_plausibly_attention": {
     "busy_us": 7921.14459,
     "share_wall": 0.005279031637431814
+   },
+   "ambiguous_out_mlp_collision": {
+    "busy_us": 34920.34551600001,
+    "share_gpu_busy": 0.1854188584884565,
+    "grids": [
+     4608,
+     9216
+    ]
    },
    "attribution_verdict": "VALID",
    "attribution_reasons": [],
@@ -4088,10 +3758,11 @@
       "eq_f32",
       "fast_max_f32",
       "fast_sum_f32",
-      "magma_sgemmEx_kernel",
       "ucopy_f32",
       "uexp_f32",
-      "usqr_f32"
+      "usqr_f32",
+      "void magma_sgemmEx_kernel<float, float, float, (bool)0, (bool)0, (int)6, (int)3, (int)5, (int)3, (int)3>(int, int, int, Tensor, int, Tensor, int, Tensor, int, Tensor, int, int, int, const T1 *, const T1 *, T1, T1, int, cublasLtEpilogue_t, int, const void *, long)",
+      "void magma_sgemmEx_kernel<float, float, float, (bool)1, (bool)0, (int)6, (int)4, (int)6, (int)3, (int)4>(int, int, int, Tensor, int, Tensor, int, Tensor, int, Tensor, int, int, int, const T1 *, const T1 *, T1, T1, int, cublasLtEpilogue_t, int, const void *, long)"
      ]
     },
     "C-LN": {
@@ -4110,11 +3781,10 @@
     },
     "BASE-GEMM": {
      "status": "measured",
-     "gpu_busy_us": 61874.84537799997,
-     "share_gpu_busy": 0.17738617329554995,
-     "share_wall": 0.03662321950766019,
+     "gpu_busy_us": 63800.16848199997,
+     "share_gpu_busy": 0.18290579432554452,
+     "share_wall": 0.03776280264892219,
      "kernel_names": [
-      "Kernel2",
       "ampere_sgemm_128x128_nn",
       "ampere_sgemm_128x128_tn",
       "ampere_sgemm_128x32_nn",
@@ -4132,7 +3802,9 @@
       "ampere_sgemm_64x32_sliced1x4_nt",
       "ampere_sgemm_64x64_nn",
       "ampere_sgemm_64x64_tn",
-      "splitKreduce_kernel"
+      "cutlass_80_simt_sgemm_128x32_8x5_nt_align1",
+      "cutlass_80_simt_sgemm_32x128_8x5_nt_align1",
+      "void cublasLt::splitKreduce_kernel<(int)32, (int)16, int, float, float, float, (bool)0, float, float, float, (bool)1, (bool)0, (bool)0>(cublasLt::cublasSplitKParams<T6>, const T4 *, const T9 *, T8 *, T5 *, const T6 *, const T6 *, const T10 *, const T4 *, T10 *, void *, long, T6 *, int *, T6 *, const T6 *, const T6 *, const T6 *, const T6 *)"
      ]
     },
     "BIAS/RESIDUAL-OUT": {
@@ -4248,11 +3920,10 @@
     },
     "UNATTRIBUTED": {
      "status": "measured",
-     "gpu_busy_us": 13962.396385999999,
-     "share_gpu_busy": 0.04002815764334462,
-     "share_wall": 0.008264229261076304,
+     "gpu_busy_us": 12037.073282000001,
+     "share_gpu_busy": 0.03450853661335007,
+     "share_wall": 0.007124646119814309,
      "kernel_names": [
-      "Kernel2",
       "affine_f32",
       "badd_f32",
       "bdiv_f32",
@@ -4271,94 +3942,20 @@
      ]
     }
    },
-   "unknown_kernels": [
-    {
-     "kernel": "Kernel2",
-     "grid": [
-      3,
-      1,
-      36
-     ],
-     "share_gpu_busy": 0.001511867620960304
-    },
-    {
-     "kernel": "Kernel2",
-     "grid": [
-      4,
-      1,
-      53
-     ],
-     "share_gpu_busy": 0.0014737642819413748
-    },
-    {
-     "kernel": "Kernel2",
-     "grid": [
-      12,
-      1,
-      24
-     ],
-     "share_gpu_busy": 0.0008105633897582833
-    },
-    {
-     "kernel": "Kernel2",
-     "grid": [
-      3,
-      1,
-      108
-     ],
-     "share_gpu_busy": 0.0008079344269278837
-    },
-    {
-     "kernel": "Kernel2",
-     "grid": [
-      6,
-      1,
-      36
-     ],
-     "share_gpu_busy": 0.0004925979297187803
-    },
-    {
-     "kernel": "Kernel2",
-     "grid": [
-      8,
-      1,
-      13
-     ],
-     "share_gpu_busy": 0.0003441496569057434
-    },
-    {
-     "kernel": "Kernel2",
-     "grid": [
-      12,
-      1,
-      8
-     ],
-     "share_gpu_busy": 4.6854045145897744e-05
-    },
-    {
-     "kernel": "Kernel2",
-     "grid": [
-      64,
-      1,
-      1
-     ],
-     "share_gpu_busy": 1.630995902885684e-05
-    },
-    {
-     "kernel": "Kernel2",
-     "grid": [
-      16,
-      1,
-      1
-     ],
-     "share_gpu_busy": 1.5579719607433393e-05
-    }
-   ],
+   "unknown_kernels": [],
    "decision_grade": true,
    "decision_grade_reason": null,
    "outside_signature_plausibly_attention": {
     "busy_us": 8162.004822,
     "share_wall": 0.004831024504264371
+   },
+   "ambiguous_out_mlp_collision": {
+    "busy_us": 97794.224838,
+    "share_gpu_busy": 0.2803618046791178,
+    "grids": [
+     4608,
+     9216
+    ]
    },
    "attribution_verdict": "VALID",
    "attribution_reasons": [],
@@ -4528,10 +4125,11 @@
       "eq_f32",
       "fast_max_f32",
       "fast_sum_f32",
-      "magma_sgemmEx_kernel",
       "ucopy_f32",
       "uexp_f32",
-      "usqr_f32"
+      "usqr_f32",
+      "void magma_sgemmEx_kernel<float, float, float, (bool)0, (bool)0, (int)6, (int)3, (int)5, (int)3, (int)3>(int, int, int, Tensor, int, Tensor, int, Tensor, int, Tensor, int, int, int, const T1 *, const T1 *, T1, T1, int, cublasLtEpilogue_t, int, const void *, long)",
+      "void magma_sgemmEx_kernel<float, float, float, (bool)1, (bool)0, (int)6, (int)4, (int)6, (int)3, (int)4>(int, int, int, Tensor, int, Tensor, int, Tensor, int, Tensor, int, int, int, const T1 *, const T1 *, T1, T1, int, cublasLtEpilogue_t, int, const void *, long)"
      ]
     },
     "C-LN": {
@@ -4546,11 +4144,10 @@
     },
     "BASE-GEMM": {
      "status": "measured",
-     "gpu_busy_us": 61911.10350799998,
-     "share_gpu_busy": 0.20967358508914907,
-     "share_wall": 0.03791397367978707,
+     "gpu_busy_us": 63832.640883999964,
+     "share_gpu_busy": 0.2161812324686963,
+     "share_wall": 0.03909071118518426,
      "kernel_names": [
-      "Kernel2",
       "ampere_sgemm_128x128_nn",
       "ampere_sgemm_128x128_tn",
       "ampere_sgemm_128x32_nn",
@@ -4568,7 +4165,9 @@
       "ampere_sgemm_64x32_sliced1x4_nt",
       "ampere_sgemm_64x64_nn",
       "ampere_sgemm_64x64_tn",
-      "splitKreduce_kernel"
+      "cutlass_80_simt_sgemm_128x32_8x5_nt_align1",
+      "cutlass_80_simt_sgemm_32x128_8x5_nt_align1",
+      "void cublasLt::splitKreduce_kernel<(int)32, (int)16, int, float, float, float, (bool)0, float, float, float, (bool)1, (bool)0, (bool)0>(cublasLt::cublasSplitKParams<T6>, const T4 *, const T9 *, T8 *, T5 *, const T6 *, const T6 *, const T10 *, const T4 *, T10 *, void *, long, T6 *, int *, T6 *, const T6 *, const T6 *, const T6 *, const T6 *)"
      ]
     },
     "BIAS/RESIDUAL-OUT": {
@@ -4679,11 +4278,10 @@
     },
     "UNATTRIBUTED": {
      "status": "measured",
-     "gpu_busy_us": 13383.734709999997,
-     "share_gpu_busy": 0.04532653239115938,
-     "share_wall": 0.008196115668760835,
+     "gpu_busy_us": 11462.197333999999,
+     "share_gpu_busy": 0.03881888501161211,
+     "share_wall": 0.007019378163363646,
      "kernel_names": [
-      "Kernel2",
       "affine_f32",
       "badd_f32",
       "bdiv_f32",
@@ -4702,94 +4300,20 @@
      ]
     }
    },
-   "unknown_kernels": [
-    {
-     "kernel": "Kernel2",
-     "grid": [
-      3,
-      1,
-      36
-     ],
-     "share_gpu_busy": 0.001781889927610448
-    },
-    {
-     "kernel": "Kernel2",
-     "grid": [
-      4,
-      1,
-      53
-     ],
-     "share_gpu_busy": 0.00173544304062646
-    },
-    {
-     "kernel": "Kernel2",
-     "grid": [
-      3,
-      1,
-      108
-     ],
-     "share_gpu_busy": 0.0009557490166255618
-    },
-    {
-     "kernel": "Kernel2",
-     "grid": [
-      12,
-      1,
-      24
-     ],
-     "share_gpu_busy": 0.0009556843308866831
-    },
-    {
-     "kernel": "Kernel2",
-     "grid": [
-      6,
-      1,
-      36
-     ],
-     "share_gpu_busy": 0.0005795356484741544
-    },
-    {
-     "kernel": "Kernel2",
-     "grid": [
-      8,
-      1,
-      13
-     ],
-     "share_gpu_busy": 0.00040531843526472536
-    },
-    {
-     "kernel": "Kernel2",
-     "grid": [
-      12,
-      1,
-      8
-     ],
-     "share_gpu_busy": 5.629661492321915e-05
-    },
-    {
-     "kernel": "Kernel2",
-     "grid": [
-      64,
-      1,
-      1
-     ],
-     "share_gpu_busy": 1.9359026010814737e-05
-    },
-    {
-     "kernel": "Kernel2",
-     "grid": [
-      16,
-      1,
-      1
-     ],
-     "share_gpu_busy": 1.8371339125209025e-05
-    }
-   ],
+   "unknown_kernels": [],
    "decision_grade": true,
    "decision_grade_reason": null,
    "outside_signature_plausibly_attention": {
     "busy_us": 8157.221706000001,
     "share_wall": 0.004995431700252418
+   },
+   "ambiguous_out_mlp_collision": {
+    "busy_us": 68203.44201,
+    "share_gpu_busy": 0.2309837717528119,
+    "grids": [
+     4608,
+     9216
+    ]
    },
    "attribution_verdict": "VALID",
    "attribution_reasons": [],
@@ -4918,9 +4442,9 @@
     },
     "BASE-GEMM": {
      "status": "measured",
-     "gpu_busy_us": 21313.489296000007,
-     "share_gpu_busy": 0.35083139274277936,
-     "share_wall": 0.2122950436070498,
+     "gpu_busy_us": 22671.70389200001,
+     "share_gpu_busy": 0.3731883288474499,
+     "share_wall": 0.22582366967484557,
      "kernel_names": [
       "ampere_sgemm_128x32_nn",
       "ampere_sgemm_128x32_tn",
@@ -4931,7 +4455,9 @@
       "ampere_sgemm_32x32_sliced1x4_nn",
       "ampere_sgemm_32x32_sliced1x4_tn",
       "ampere_sgemm_64x32_sliced1x4_nn",
-      "splitKreduce_kernel"
+      "cutlass_80_simt_sgemm_128x32_8x5_nt_align1",
+      "cutlass_80_simt_sgemm_32x128_8x5_nt_align1",
+      "void cublasLt::splitKreduce_kernel<(int)32, (int)16, int, float, float, float, (bool)0, float, float, float, (bool)1, (bool)0, (bool)0>(cublasLt::cublasSplitKParams<T6>, const T4 *, const T9 *, T8 *, T5 *, const T6 *, const T6 *, const T10 *, const T4 *, T10 *, void *, long, T6 *, int *, T6 *, const T6 *, const T6 *, const T6 *, const T6 *)"
      ]
     },
     "BIAS/RESIDUAL-QKV": {
@@ -5096,54 +4622,16 @@
     },
     "UNATTRIBUTED": {
      "status": "measured",
-     "gpu_busy_us": 1794.3533599999998,
-     "share_gpu_busy": 0.029536012598351483,
-     "share_wall": 0.017872827837680596,
+     "gpu_busy_us": 436.138764,
+     "share_gpu_busy": 0.007179076493680958,
+     "share_wall": 0.004344201769884839,
      "kernel_names": [
-      "Kernel2",
       "badd_f32",
       "copy2d_f32"
      ]
     }
    },
-   "unknown_kernels": [
-    {
-     "kernel": "Kernel2",
-     "grid": [
-      16,
-      1,
-      10
-     ],
-     "share_gpu_busy": 0.009534007478941774
-    },
-    {
-     "kernel": "Kernel2",
-     "grid": [
-      4,
-      1,
-      24
-     ],
-     "share_gpu_busy": 0.009315438596698065
-    },
-    {
-     "kernel": "Kernel2",
-     "grid": [
-      12,
-      1,
-      8
-     ],
-     "share_gpu_busy": 0.003409594926943495
-    },
-    {
-     "kernel": "Kernel2",
-     "grid": [
-      64,
-      1,
-      1
-     ],
-     "share_gpu_busy": 9.789510208719259e-05
-    }
-   ],
+   "unknown_kernels": [],
    "decision_grade": true,
    "decision_grade_reason": null,
    "outside_signature_plausibly_attention": {
@@ -5167,11 +4655,8 @@
    "leg_id": "clip-text-A2",
    "tower": "clip-text",
    "dtype": "bf16",
-   "verdict": "INVALID",
-   "reasons": [
-    "kernel 'Kernel2' (grid=[16, 1, 10]) is not a known kernel name and carries share_gpu_busy=0.0140 > 0.01 \u2014 the mapping cannot classify it and refuses to guess",
-    "kernel 'Kernel2' (grid=[4, 1, 24]) is not a known kernel name and carries share_gpu_busy=0.0137 > 0.01 \u2014 the mapping cannot classify it and refuses to guess"
-   ],
+   "verdict": "VALID",
+   "reasons": [],
    "signatures": {
     "rows": {
      "value": 24,
@@ -5222,9 +4707,9 @@
     },
     "BASE-GEMM": {
      "status": "measured",
-     "gpu_busy_us": 6416.541799999999,
-     "share_gpu_busy": 0.15480338639676625,
-     "share_wall": 0.06645946418161883,
+     "gpu_busy_us": 7776.156857999999,
+     "share_gpu_busy": 0.18760501408575533,
+     "share_wall": 0.08054170521805074,
      "kernel_names": [
       "ampere_bf16_s16816gemm_bf16_128x128_ldg8_f2f_stages_64x3_nn",
       "ampere_bf16_s16816gemm_bf16_128x128_ldg8_f2f_stages_64x3_tn",
@@ -5238,7 +4723,9 @@
       "ampere_sgemm_32x128_nn",
       "ampere_sgemm_32x128_tn",
       "ampere_sgemm_32x32_sliced1x4_nn",
-      "splitKreduce_kernel"
+      "cutlass_80_simt_sgemm_32x128_8x5_nt_align1",
+      "cutlass_80_wmma_tensorop_bf16_s161616gemm_bf16_32x32_64x1_nt_align8",
+      "void cublasLt::splitKreduce_kernel<(int)32, (int)16, int, float, float, float, (bool)0, float, float, float, (bool)1, (bool)0, (bool)0>(cublasLt::cublasSplitKParams<T6>, const T4 *, const T9 *, T8 *, T5 *, const T6 *, const T6 *, const T10 *, const T4 *, T10 *, void *, long, T6 *, int *, T6 *, const T6 *, const T6 *, const T6 *, const T6 *)"
      ]
     },
     "BIAS/RESIDUAL-QKV": {
@@ -5386,13 +4873,16 @@
      "share_gpu_busy": 0.19406472969198849,
      "share_wall": 0.08331496004114333,
      "kernel_names": [
-      "Kernel2",
       "affine_bf16",
       "badd_bf16",
       "bdiv_bf16",
       "bmul_bf16",
       "bsub_bf16",
       "cast_u8_bf16",
+      "cutlass_75_tensorop_bf16_s1688gemm_bf16_64x64_nn_align1",
+      "cutlass_75_tensorop_bf16_s1688gemm_bf16_64x64_nt_align1",
+      "cutlass_75_tensorop_bf16_s1688gemm_bf16_64x64_tn_align1",
+      "cutlass_75_wmma_tensorop_bf16_s161616gemm_bf16_32x32_32x1_nn_align1",
       "eq_bf16",
       "fast_max_bf16",
       "fast_sum_bf16",
@@ -5402,57 +4892,19 @@
     },
     "UNATTRIBUTED": {
      "status": "measured",
-     "gpu_busy_us": 1790.9124779999997,
-     "share_gpu_busy": 0.043206968017355414,
-     "share_wall": 0.01854941296946826,
+     "gpu_busy_us": 431.29742,
+     "share_gpu_busy": 0.010405340328366345,
+     "share_wall": 0.0044671719330363615,
      "kernel_names": [
-      "Kernel2",
       "badd_bf16",
       "badd_f32",
       "copy2d_bf16"
      ]
     }
    },
-   "unknown_kernels": [
-    {
-     "kernel": "Kernel2",
-     "grid": [
-      16,
-      1,
-      10
-     ],
-     "share_gpu_busy": 0.014001689196696428
-    },
-    {
-     "kernel": "Kernel2",
-     "grid": [
-      4,
-      1,
-      24
-     ],
-     "share_gpu_busy": 0.013669664887566664
-    },
-    {
-     "kernel": "Kernel2",
-     "grid": [
-      12,
-      1,
-      8
-     ],
-     "share_gpu_busy": 0.005020574219873638
-    },
-    {
-     "kernel": "Kernel2",
-     "grid": [
-      128,
-      2,
-      1
-     ],
-     "share_gpu_busy": 0.00010969938485233951
-    }
-   ],
-   "decision_grade": false,
-   "decision_grade_reason": "leg is INVALID: kernel 'Kernel2' (grid=[16, 1, 10]) is not a known kernel name and carries share_gpu_busy=0.0140 > 0.01 \u2014 the mapping cannot classify it and refuses to guess; kernel 'Kernel2' (grid=[4, 1, 24]) is not a known kernel name and carries share_gpu_busy=0.0137 > 0.01 \u2014 the mapping cannot classify it and refuses to guess",
+   "unknown_kernels": [],
+   "decision_grade": true,
+   "decision_grade_reason": null,
    "outside_signature_plausibly_attention": {
     "busy_us": 1351.568088,
     "share_wall": 0.013998894378503863
@@ -5529,11 +4981,10 @@
     },
     "BASE-GEMM": {
      "status": "measured",
-     "gpu_busy_us": 29200.23115,
-     "share_gpu_busy": 0.3263981107310846,
-     "share_wall": 0.1965518686718116,
+     "gpu_busy_us": 30118.739496,
+     "share_gpu_busy": 0.3366651318133863,
+     "share_wall": 0.20273450917453772,
      "kernel_names": [
-      "Kernel2",
       "ampere_sgemm_128x32_nn",
       "ampere_sgemm_128x32_tn",
       "ampere_sgemm_128x64_nn",
@@ -5546,7 +4997,9 @@
       "ampere_sgemm_32x32_sliced1x4_tn",
       "ampere_sgemm_64x32_sliced1x4_nn",
       "ampere_sgemm_64x32_sliced1x4_nt",
-      "splitKreduce_kernel"
+      "cutlass_80_simt_sgemm_128x32_8x5_nt_align1",
+      "cutlass_80_simt_sgemm_32x128_8x5_nt_align1",
+      "void cublasLt::splitKreduce_kernel<(int)32, (int)16, int, float, float, float, (bool)0, float, float, float, (bool)1, (bool)0, (bool)0>(cublasLt::cublasSplitKParams<T6>, const T4 *, const T9 *, T8 *, T5 *, const T6 *, const T6 *, const T10 *, const T4 *, T10 *, void *, long, T6 *, int *, T6 *, const T6 *, const T6 *, const T6 *, const T6 *)"
      ]
     },
     "BIAS/RESIDUAL-QKV": {
@@ -5711,54 +5164,16 @@
     },
     "UNATTRIBUTED": {
      "status": "measured",
-     "gpu_busy_us": 1982.641232,
-     "share_gpu_busy": 0.02216182293414311,
-     "share_wall": 0.013345505282254684,
+     "gpu_busy_us": 1064.1328859999999,
+     "share_gpu_busy": 0.011894801851841389,
+     "share_wall": 0.007162864779528564,
      "kernel_names": [
-      "Kernel2",
       "badd_f32",
       "copy2d_f32"
      ]
     }
    },
-   "unknown_kernels": [
-    {
-     "kernel": "Kernel2",
-     "grid": [
-      4,
-      1,
-      24
-     ],
-     "share_gpu_busy": 0.004134516390646977
-    },
-    {
-     "kernel": "Kernel2",
-     "grid": [
-      16,
-      1,
-      10
-     ],
-     "share_gpu_busy": 0.003540198335295808
-    },
-    {
-     "kernel": "Kernel2",
-     "grid": [
-      4,
-      1,
-      28
-     ],
-     "share_gpu_busy": 0.0025257711870860576
-    },
-    {
-     "kernel": "Kernel2",
-     "grid": [
-      64,
-      1,
-      1
-     ],
-     "share_gpu_busy": 6.653516927287702e-05
-    }
-   ],
+   "unknown_kernels": [],
    "decision_grade": true,
    "decision_grade_reason": null,
    "outside_signature_plausibly_attention": {
@@ -5834,11 +5249,10 @@
     },
     "BASE-GEMM": {
      "status": "measured",
-     "gpu_busy_us": 29206.051642000002,
-     "share_gpu_busy": 0.36778785829356153,
-     "share_wall": 0.21967834338219,
+     "gpu_busy_us": 30120.16417,
+     "share_gpu_busy": 0.3792991537275858,
+     "share_wall": 0.22655399806764456,
      "kernel_names": [
-      "Kernel2",
       "ampere_sgemm_128x32_nn",
       "ampere_sgemm_128x32_tn",
       "ampere_sgemm_128x64_nn",
@@ -5851,7 +5265,9 @@
       "ampere_sgemm_32x32_sliced1x4_tn",
       "ampere_sgemm_64x32_sliced1x4_nn",
       "ampere_sgemm_64x32_sliced1x4_nt",
-      "splitKreduce_kernel"
+      "cutlass_80_simt_sgemm_128x32_8x5_nt_align1",
+      "cutlass_80_simt_sgemm_32x128_8x5_nt_align1",
+      "void cublasLt::splitKreduce_kernel<(int)32, (int)16, int, float, float, float, (bool)0, float, float, float, (bool)1, (bool)0, (bool)0>(cublasLt::cublasSplitKParams<T6>, const T4 *, const T9 *, T8 *, T5 *, const T6 *, const T6 *, const T10 *, const T4 *, T10 *, void *, long, T6 *, int *, T6 *, const T6 *, const T6 *, const T6 *, const T6 *)"
      ]
     },
     "BIAS/RESIDUAL-QKV": {
@@ -6013,54 +5429,16 @@
     },
     "UNATTRIBUTED": {
      "status": "measured",
-     "gpu_busy_us": 1979.327602,
-     "share_gpu_busy": 0.024925404793643656,
-     "share_wall": 0.014887853173303057,
+     "gpu_busy_us": 1065.215074,
+     "share_gpu_busy": 0.013414109359619328,
+     "share_wall": 0.008012198487848475,
      "kernel_names": [
-      "Kernel2",
       "badd_f32",
       "copy2d_f32"
      ]
     }
    },
-   "unknown_kernels": [
-    {
-     "kernel": "Kernel2",
-     "grid": [
-      4,
-      1,
-      24
-     ],
-     "share_gpu_busy": 0.004618836119793679
-    },
-    {
-     "kernel": "Kernel2",
-     "grid": [
-      16,
-      1,
-      10
-     ],
-     "share_gpu_busy": 0.003987853958397304
-    },
-    {
-     "kernel": "Kernel2",
-     "grid": [
-      4,
-      1,
-      28
-     ],
-     "share_gpu_busy": 0.002829854966975005
-    },
-    {
-     "kernel": "Kernel2",
-     "grid": [
-      64,
-      1,
-      1
-     ],
-     "share_gpu_busy": 7.475038885833856e-05
-    }
-   ],
+   "unknown_kernels": [],
    "decision_grade": true,
    "decision_grade_reason": null,
    "outside_signature_plausibly_attention": {
@@ -6136,9 +5514,9 @@
     },
     "BASE-GEMM": {
      "status": "measured",
-     "gpu_busy_us": 29772.195265999995,
-     "share_gpu_busy": 0.4565433412849336,
-     "share_wall": 0.2596289448147352,
+     "gpu_busy_us": 30535.770763999997,
+     "share_gpu_busy": 0.46825243112750686,
+     "share_wall": 0.26628771817897295,
      "kernel_names": [
       "ampere_sgemm_128x32_nn",
       "ampere_sgemm_128x32_tn",
@@ -6150,7 +5528,8 @@
       "ampere_sgemm_32x32_sliced1x4_nt",
       "ampere_sgemm_32x32_sliced1x4_tn",
       "ampere_sgemm_64x32_sliced1x4_nn",
-      "splitKreduce_kernel"
+      "cutlass_80_simt_sgemm_32x128_8x5_nt_align1",
+      "void cublasLt::splitKreduce_kernel<(int)32, (int)16, int, float, float, float, (bool)0, float, float, float, (bool)1, (bool)0, (bool)0>(cublasLt::cublasSplitKParams<T6>, const T4 *, const T9 *, T8 *, T5 *, const T6 *, const T6 *, const T10 *, const T4 *, T10 *, void *, long, T6 *, int *, T6 *, const T6 *, const T6 *, const T6 *, const T6 *)"
      ]
     },
     "BIAS/RESIDUAL-QKV": {
@@ -6308,18 +5687,17 @@
       "eq_f32",
       "fast_max_f32",
       "fast_sum_f32",
-      "magma_sgemmEx_kernel",
       "uexp_f32",
-      "usqr_f32"
+      "usqr_f32",
+      "void magma_sgemmEx_kernel<float, float, float, (bool)0, (bool)0, (int)6, (int)3, (int)5, (int)3, (int)3>(int, int, int, Tensor, int, Tensor, int, Tensor, int, Tensor, int, int, int, const T1 *, const T1 *, T1, T1, int, cublasLtEpilogue_t, int, const void *, long)"
      ]
     },
     "UNATTRIBUTED": {
      "status": "measured",
-     "gpu_busy_us": 1349.9728619999999,
-     "share_gpu_busy": 0.020701231990282776,
-     "share_wall": 0.011772461740161024,
+     "gpu_busy_us": 586.3973639999999,
+     "share_gpu_busy": 0.008992142147709555,
+     "share_wall": 0.005113688375923277,
      "kernel_names": [
-      "Kernel2",
       "affine_f32",
       "badd_f32",
       "bmul_f32",
@@ -6329,26 +5707,7 @@
      ]
     }
    },
-   "unknown_kernels": [
-    {
-     "kernel": "Kernel2",
-     "grid": [
-      6,
-      1,
-      18
-     ],
-     "share_gpu_busy": 0.008442308673309844
-    },
-    {
-     "kernel": "Kernel2",
-     "grid": [
-      18,
-      1,
-      10
-     ],
-     "share_gpu_busy": 0.0032667811692633788
-    }
-   ],
+   "unknown_kernels": [],
    "decision_grade": true,
    "decision_grade_reason": null,
    "outside_signature_plausibly_attention": {
@@ -6372,10 +5731,8 @@
    "leg_id": "clip-vision-A2",
    "tower": "clip-vision",
    "dtype": "bf16",
-   "verdict": "INVALID",
-   "reasons": [
-    "kernel 'Kernel2' (grid=[6, 1, 18]) is not a known kernel name and carries share_gpu_busy=0.0143 > 0.01 \u2014 the mapping cannot classify it and refuses to guess"
-   ],
+   "verdict": "VALID",
+   "reasons": [],
    "signatures": {
     "rows": {
      "value": 24,
@@ -6426,9 +5783,9 @@
     },
     "BASE-GEMM": {
      "status": "measured",
-     "gpu_busy_us": 7576.434142,
-     "share_gpu_busy": 0.19608499910575378,
-     "share_wall": 0.06975793797982499,
+     "gpu_busy_us": 8343.803587999999,
+     "share_gpu_busy": 0.2159452175558243,
+     "share_wall": 0.07682328154625769,
      "kernel_names": [
       "ampere_bf16_s16816gemm_bf16_128x128_ldg8_f2f_stages_64x3_nn",
       "ampere_bf16_s16816gemm_bf16_128x128_ldg8_f2f_stages_64x3_tn",
@@ -6442,7 +5799,9 @@
       "ampere_sgemm_32x128_tn",
       "ampere_sgemm_32x32_sliced1x4_nn",
       "ampere_sgemm_32x32_sliced1x4_nt",
-      "splitKreduce_kernel"
+      "cutlass_80_simt_sgemm_32x128_8x5_nt_align1",
+      "cutlass_80_wmma_tensorop_bf16_s161616gemm_bf16_32x32_32x1_nt_align8",
+      "void cublasLt::splitKreduce_kernel<(int)32, (int)16, int, float, float, float, (bool)0, float, float, float, (bool)1, (bool)0, (bool)0>(cublasLt::cublasSplitKParams<T6>, const T4 *, const T9 *, T8 *, T5 *, const T6 *, const T6 *, const T10 *, const T4 *, T10 *, void *, long, T6 *, int *, T6 *, const T6 *, const T6 *, const T6 *, const T6 *)"
      ]
     },
     "BIAS/RESIDUAL-QKV": {
@@ -6592,13 +5951,15 @@
      "share_gpu_busy": 0.1259721514524235,
      "share_wall": 0.04481504229430584,
      "kernel_names": [
-      "Kernel2",
       "affine_bf16",
       "badd_bf16",
       "bdiv_bf16",
       "bmul_bf16",
       "bsub_bf16",
       "cast_u8_bf16",
+      "cutlass_80_wmma_tensorop_bf16_s161616gemm_bf16_32x32_32x1_nt_align2",
+      "cutlass_80_wmma_tensorop_bf16_s161616gemm_bf16_32x32_64x1_nn_align2",
+      "cutlass_80_wmma_tensorop_bf16_s161616gemm_bf16_32x32_64x1_tn_align2",
       "eq_bf16",
       "fast_max_bf16",
       "fast_sum_bf16",
@@ -6608,11 +5969,10 @@
     },
     "UNATTRIBUTED": {
      "status": "measured",
-     "gpu_busy_us": 1346.488078,
-     "share_gpu_busy": 0.034848334799996224,
-     "share_wall": 0.012397419429148886,
+     "gpu_busy_us": 579.1186319999999,
+     "share_gpu_busy": 0.01498811634992568,
+     "share_wall": 0.005332075862716196,
      "kernel_names": [
-      "Kernel2",
       "affine_bf16",
       "badd_bf16",
       "badd_f32",
@@ -6623,37 +5983,9 @@
      ]
     }
    },
-   "unknown_kernels": [
-    {
-     "kernel": "Kernel2",
-     "grid": [
-      6,
-      1,
-      18
-     ],
-     "share_gpu_busy": 0.014277743953055057
-    },
-    {
-     "kernel": "Kernel2",
-     "grid": [
-      18,
-      1,
-      10
-     ],
-     "share_gpu_busy": 0.005470816803862402
-    },
-    {
-     "kernel": "Kernel2",
-     "grid": [
-      192,
-      2,
-      1
-     ],
-     "share_gpu_busy": 0.00011165769315308122
-    }
-   ],
-   "decision_grade": false,
-   "decision_grade_reason": "leg is INVALID: kernel 'Kernel2' (grid=[6, 1, 18]) is not a known kernel name and carries share_gpu_busy=0.0143 > 0.01 \u2014 the mapping cannot classify it and refuses to guess",
+   "unknown_kernels": [],
+   "decision_grade": true,
+   "decision_grade_reason": null,
    "outside_signature_plausibly_attention": {
     "busy_us": 1331.2846960000002,
     "share_wall": 0.012257438462012857
@@ -6730,9 +6062,9 @@
     },
     "BASE-GEMM": {
      "status": "measured",
-     "gpu_busy_us": 40601.934666,
-     "share_gpu_busy": 0.4160626352220919,
-     "share_wall": 0.24484259606279948,
+     "gpu_busy_us": 41243.302938,
+     "share_gpu_busy": 0.422634966703124,
+     "share_wall": 0.24871025099206792,
      "kernel_names": [
       "ampere_sgemm_128x32_nn",
       "ampere_sgemm_128x32_sliced1x4_nt",
@@ -6747,7 +6079,9 @@
       "ampere_sgemm_32x32_sliced1x4_tn",
       "ampere_sgemm_64x32_sliced1x4_nn",
       "ampere_sgemm_64x32_sliced1x4_nt",
-      "splitKreduce_kernel"
+      "cutlass_80_simt_sgemm_128x32_8x5_nt_align1",
+      "cutlass_80_simt_sgemm_32x128_8x5_nt_align1",
+      "void cublasLt::splitKreduce_kernel<(int)32, (int)16, int, float, float, float, (bool)0, float, float, float, (bool)1, (bool)0, (bool)0>(cublasLt::cublasSplitKParams<T6>, const T4 *, const T9 *, T8 *, T5 *, const T6 *, const T6 *, const T10 *, const T4 *, T10 *, void *, long, T6 *, int *, T6 *, const T6 *, const T6 *, const T6 *, const T6 *)"
      ]
     },
     "BIAS/RESIDUAL-QKV": {
@@ -6906,18 +6240,17 @@
       "eq_f32",
       "fast_max_f32",
       "fast_sum_f32",
-      "magma_sgemmEx_kernel",
       "uexp_f32",
-      "usqr_f32"
+      "usqr_f32",
+      "void magma_sgemmEx_kernel<float, float, float, (bool)0, (bool)0, (int)6, (int)3, (int)5, (int)3, (int)3>(int, int, int, Tensor, int, Tensor, int, Tensor, int, Tensor, int, int, int, const T1 *, const T1 *, T1, T1, int, cublasLtEpilogue_t, int, const void *, long)"
      ]
     },
     "UNATTRIBUTED": {
      "status": "measured",
-     "gpu_busy_us": 2992.4736160000007,
-     "share_gpu_busy": 0.030664953991666584,
-     "share_wall": 0.018045568882815388,
+     "gpu_busy_us": 2351.105344,
+     "share_gpu_busy": 0.0240926225106345,
+     "share_wall": 0.014177913953546903,
      "kernel_names": [
-      "Kernel2",
       "affine_f32",
       "badd_f32",
       "bdiv_f32",
@@ -6928,26 +6261,7 @@
      ]
     }
    },
-   "unknown_kernels": [
-    {
-     "kernel": "Kernel2",
-     "grid": [
-      6,
-      1,
-      18
-     ],
-     "share_gpu_busy": 0.0036276122591383034
-    },
-    {
-     "kernel": "Kernel2",
-     "grid": [
-      8,
-      1,
-      18
-     ],
-     "share_gpu_busy": 0.0029447192218937743
-    }
-   ],
+   "unknown_kernels": [],
    "decision_grade": true,
    "decision_grade_reason": null,
    "outside_signature_plausibly_attention": {
@@ -7023,9 +6337,9 @@
     },
     "BASE-GEMM": {
      "status": "measured",
-     "gpu_busy_us": 40608.802968,
-     "share_gpu_busy": 0.46534749280848503,
-     "share_wall": 0.280090382524521,
+     "gpu_busy_us": 41247.05533,
+     "share_gpu_busy": 0.472661402964119,
+     "share_wall": 0.2844925893160048,
      "kernel_names": [
       "ampere_sgemm_128x32_nn",
       "ampere_sgemm_128x32_sliced1x4_nt",
@@ -7040,7 +6354,9 @@
       "ampere_sgemm_32x32_sliced1x4_tn",
       "ampere_sgemm_64x32_sliced1x4_nn",
       "ampere_sgemm_64x32_sliced1x4_nt",
-      "splitKreduce_kernel"
+      "cutlass_80_simt_sgemm_128x32_8x5_nt_align1",
+      "cutlass_80_simt_sgemm_32x128_8x5_nt_align1",
+      "void cublasLt::splitKreduce_kernel<(int)32, (int)16, int, float, float, float, (bool)0, float, float, float, (bool)1, (bool)0, (bool)0>(cublasLt::cublasSplitKParams<T6>, const T4 *, const T9 *, T8 *, T5 *, const T6 *, const T6 *, const T10 *, const T4 *, T10 *, void *, long, T6 *, int *, T6 *, const T6 *, const T6 *, const T6 *, const T6 *)"
      ]
     },
     "BIAS/RESIDUAL-QKV": {
@@ -7196,18 +6512,17 @@
       "eq_f32",
       "fast_max_f32",
       "fast_sum_f32",
-      "magma_sgemmEx_kernel",
       "uexp_f32",
-      "usqr_f32"
+      "usqr_f32",
+      "void magma_sgemmEx_kernel<float, float, float, (bool)0, (bool)0, (int)6, (int)3, (int)5, (int)3, (int)3>(int, int, int, Tensor, int, Tensor, int, Tensor, int, Tensor, int, int, int, const T1 *, const T1 *, T1, T1, int, cublasLtEpilogue_t, int, const void *, long)"
      ]
     },
     "UNATTRIBUTED": {
      "status": "measured",
-     "gpu_busy_us": 2353.7841740000003,
-     "share_gpu_busy": 0.026972663164839313,
-     "share_wall": 0.016234714187348356,
+     "gpu_busy_us": 1715.5318120000002,
+     "share_gpu_busy": 0.019658753009205353,
+     "share_wall": 0.011832507395864509,
      "kernel_names": [
-      "Kernel2",
       "affine_f32",
       "badd_f32",
       "bmul_f32",
@@ -7217,26 +6532,7 @@
      ]
     }
    },
-   "unknown_kernels": [
-    {
-     "kernel": "Kernel2",
-     "grid": [
-      6,
-      1,
-      18
-     ],
-     "share_gpu_busy": 0.004031332808263473
-    },
-    {
-     "kernel": "Kernel2",
-     "grid": [
-      8,
-      1,
-      18
-     ],
-     "share_gpu_busy": 0.0032825773473704836
-    }
-   ],
+   "unknown_kernels": [],
    "decision_grade": true,
    "decision_grade_reason": null,
    "outside_signature_plausibly_attention": {
@@ -7330,10 +6626,11 @@
       "eq_f32",
       "fast_max_f32",
       "fast_sum_f32",
-      "magma_sgemmEx_kernel",
       "ucopy_f32",
       "uexp_f32",
-      "usqr_f32"
+      "usqr_f32",
+      "void magma_sgemmEx_kernel<float, float, float, (bool)0, (bool)0, (int)6, (int)3, (int)5, (int)3, (int)3>(int, int, int, Tensor, int, Tensor, int, Tensor, int, Tensor, int, int, int, const T1 *, const T1 *, T1, T1, int, cublasLtEpilogue_t, int, const void *, long)",
+      "void magma_sgemmEx_kernel<float, float, float, (bool)1, (bool)0, (int)6, (int)4, (int)6, (int)3, (int)4>(int, int, int, Tensor, int, Tensor, int, Tensor, int, Tensor, int, int, int, const T1 *, const T1 *, T1, T1, int, cublasLtEpilogue_t, int, const void *, long)"
      ]
     },
     "C-LN": {
@@ -7348,9 +6645,9 @@
     },
     "BASE-GEMM": {
      "status": "measured",
-     "gpu_busy_us": 46451.53243200001,
-     "share_gpu_busy": 0.19786437144696498,
-     "share_wall": 0.029968940154908707,
+     "gpu_busy_us": 48832.001662,
+     "share_gpu_busy": 0.20800418865605916,
+     "share_wall": 0.03150473749375658,
      "kernel_names": [
       "ampere_sgemm_128x128_nn",
       "ampere_sgemm_128x128_tn",
@@ -7366,7 +6663,9 @@
       "ampere_sgemm_32x32_sliced1x4_tn",
       "ampere_sgemm_64x32_sliced1x4_nn",
       "ampere_sgemm_64x64_tn",
-      "splitKreduce_kernel"
+      "cutlass_80_simt_sgemm_128x32_8x5_nt_align1",
+      "cutlass_80_simt_sgemm_32x128_8x5_nt_align1",
+      "void cublasLt::splitKreduce_kernel<(int)32, (int)16, int, float, float, float, (bool)0, float, float, float, (bool)1, (bool)0, (bool)0>(cublasLt::cublasSplitKParams<T6>, const T4 *, const T9 *, T8 *, T5 *, const T6 *, const T6 *, const T10 *, const T4 *, T10 *, void *, long, T6 *, int *, T6 *, const T6 *, const T6 *, const T6 *, const T6 *)"
      ]
     },
     "BIAS/RESIDUAL-OUT": {
@@ -7479,11 +6778,10 @@
     },
     "UNATTRIBUTED": {
      "status": "measured",
-     "gpu_busy_us": 13512.585593999996,
-     "share_gpu_busy": 0.057558042010649915,
-     "share_wall": 0.008717858115821727,
+     "gpu_busy_us": 11132.116363999998,
+     "share_gpu_busy": 0.047418224801555726,
+     "share_wall": 0.007182060776973848,
      "kernel_names": [
-      "Kernel2",
       "affine_f32",
       "badd_f32",
       "bdiv_f32",
@@ -7502,67 +6800,20 @@
      ]
     }
    },
-   "unknown_kernels": [
-    {
-     "kernel": "Kernel2",
-     "grid": [
-      3,
-      1,
-      36
-     ],
-     "share_gpu_busy": 0.003968701561966253
-    },
-    {
-     "kernel": "Kernel2",
-     "grid": [
-      3,
-      1,
-      108
-     ],
-     "share_gpu_busy": 0.0023776961233310527
-    },
-    {
-     "kernel": "Kernel2",
-     "grid": [
-      12,
-      1,
-      24
-     ],
-     "share_gpu_busy": 0.0023305351621325447
-    },
-    {
-     "kernel": "Kernel2",
-     "grid": [
-      6,
-      1,
-      36
-     ],
-     "share_gpu_busy": 0.0013306204609108989
-    },
-    {
-     "kernel": "Kernel2",
-     "grid": [
-      16,
-      1,
-      1
-     ],
-     "share_gpu_busy": 6.695604852968402e-05
-    },
-    {
-     "kernel": "Kernel2",
-     "grid": [
-      12,
-      1,
-      8
-     ],
-     "share_gpu_busy": 6.53078522237597e-05
-    }
-   ],
-   "decision_grade": false,
-   "decision_grade_reason": "UNATTRIBUTED share_gpu_busy=0.0576 > 0.05",
+   "unknown_kernels": [],
+   "decision_grade": true,
+   "decision_grade_reason": null,
    "outside_signature_plausibly_attention": {
     "busy_us": 8153.340560000001,
     "share_wall": 0.005260256497736157
+   },
+   "ambiguous_out_mlp_collision": {
+    "busy_us": 40476.271673999996,
+    "share_gpu_busy": 0.1724122248284625,
+    "grids": [
+     4608,
+     9216
+    ]
    },
    "gpu_busy_us_per_step": 234764.511126,
    "wall_s_per_step": 1.549989161842,
@@ -7640,7 +6891,6 @@
      "share_gpu_busy": 0.3445381270175922,
      "share_wall": 0.04324423726244897,
      "kernel_names": [
-      "Kernel2",
       "affine_bf16",
       "ampere_bf16_s16816gemm_bf16_64x64_ldg8_f2f_nn",
       "ampere_bf16_s16816gemm_bf16_64x64_ldg8_f2f_tn",
@@ -7649,6 +6899,12 @@
       "bmul_bf16",
       "bsub_bf16",
       "cast_u8_bf16",
+      "cutlass_80_wmma_tensorop_bf16_s161616gemm_bf16_32x32_32x1_nn_align8",
+      "cutlass_80_wmma_tensorop_bf16_s161616gemm_bf16_32x32_32x1_nt_align8",
+      "cutlass_80_wmma_tensorop_bf16_s161616gemm_bf16_32x32_32x1_tn_align8",
+      "cutlass_80_wmma_tensorop_bf16_s161616gemm_bf16_32x32_64x1_nn_align8",
+      "cutlass_80_wmma_tensorop_bf16_s161616gemm_bf16_32x32_64x1_nt_align8",
+      "cutlass_80_wmma_tensorop_bf16_s161616gemm_bf16_32x32_64x1_tn_align8",
       "eq_bf16",
       "fast_max_bf16",
       "fast_sum_bf16",
@@ -7669,9 +6925,9 @@
     },
     "BASE-GEMM": {
      "status": "measured",
-     "gpu_busy_us": 17819.236574,
-     "share_gpu_busy": 0.09461597403648189,
-     "share_wall": 0.01187559607834757,
+     "gpu_busy_us": 20469.03919799999,
+     "share_gpu_busy": 0.10868580554879262,
+     "share_wall": 0.013641551960873105,
      "kernel_names": [
       "ampere_bf16_s16816gemm_bf16_128x128_ldg8_f2f_stages_32x5_nn",
       "ampere_bf16_s16816gemm_bf16_128x128_ldg8_f2f_stages_32x5_tn",
@@ -7693,7 +6949,11 @@
       "ampere_sgemm_32x32_sliced1x4_nn",
       "ampere_sgemm_32x32_sliced1x4_nt",
       "ampere_sgemm_64x64_tn",
-      "splitKreduce_kernel"
+      "cutlass_75_tensorop_bf16_s1688gemm_bf16_256x128_nn_align1",
+      "cutlass_80_simt_sgemm_128x32_8x5_nt_align1",
+      "cutlass_80_simt_sgemm_32x128_8x5_nt_align1",
+      "cutlass_80_wmma_tensorop_bf16_s161616gemm_bf16_32x32_32x1_tn_align8",
+      "void cublasLt::splitKreduce_kernel<(int)32, (int)16, int, float, float, float, (bool)0, float, float, float, (bool)1, (bool)0, (bool)0>(cublasLt::cublasSplitKParams<T6>, const T4 *, const T9 *, T8 *, T5 *, const T6 *, const T6 *, const T10 *, const T4 *, T10 *, void *, long, T6 *, int *, T6 *, const T6 *, const T6 *, const T6 *, const T6 *)"
      ]
     },
     "BIAS/RESIDUAL-OUT": {
@@ -7804,11 +7064,10 @@
     },
     "UNATTRIBUTED": {
      "status": "measured",
-     "gpu_busy_us": 13311.966208,
-     "share_gpu_busy": 0.07068342371908466,
-     "share_wall": 0.008871734377525763,
+     "gpu_busy_us": 10662.163583999998,
+     "share_gpu_busy": 0.05661359220677389,
+     "share_wall": 0.007105778495000224,
      "kernel_names": [
-      "Kernel2",
       "affine_bf16",
       "affine_f32",
       "badd_bf16",
@@ -7837,94 +7096,20 @@
      ]
     }
    },
-   "unknown_kernels": [
-    {
-     "kernel": "Kernel2",
-     "grid": [
-      3,
-      1,
-      36
-     ],
-     "share_gpu_busy": 0.004970932190157679
-    },
-    {
-     "kernel": "Kernel2",
-     "grid": [
-      3,
-      1,
-      108
-     ],
-     "share_gpu_busy": 0.0029629295705927614
-    },
-    {
-     "kernel": "Kernel2",
-     "grid": [
-      12,
-      1,
-      24
-     ],
-     "share_gpu_busy": 0.0029538660126580203
-    },
-    {
-     "kernel": "Kernel2",
-     "grid": [
-      6,
-      1,
-      36
-     ],
-     "share_gpu_busy": 0.001657838141623951
-    },
-    {
-     "kernel": "Kernel2",
-     "grid": [
-      192,
-      1,
-      1
-     ],
-     "share_gpu_busy": 0.0009186345633113985
-    },
-    {
-     "kernel": "Kernel2",
-     "grid": [
-      12288,
-      1,
-      1
-     ],
-     "share_gpu_busy": 0.00031869020362573173
-    },
-    {
-     "kernel": "Kernel2",
-     "grid": [
-      3072,
-      1,
-      1
-     ],
-     "share_gpu_busy": 0.00012163474643290439
-    },
-    {
-     "kernel": "Kernel2",
-     "grid": [
-      16,
-      1,
-      1
-     ],
-     "share_gpu_busy": 8.324347198864538e-05
-    },
-    {
-     "kernel": "Kernel2",
-     "grid": [
-      12,
-      1,
-      8
-     ],
-     "share_gpu_busy": 8.206261191966961e-05
-    }
-   ],
+   "unknown_kernels": [],
    "decision_grade": false,
-   "decision_grade_reason": "UNATTRIBUTED share_gpu_busy=0.0707 > 0.05",
+   "decision_grade_reason": "UNATTRIBUTED share_gpu_busy=0.0566 > 0.05",
    "outside_signature_plausibly_attention": {
     "busy_us": 7921.14459,
     "share_wall": 0.005279031637431814
+   },
+   "ambiguous_out_mlp_collision": {
+    "busy_us": 34920.34551600001,
+    "share_gpu_busy": 0.1854188584884565,
+    "grids": [
+     4608,
+     9216
+    ]
    },
    "gpu_busy_us_per_step": 188332.22144,
    "wall_s_per_step": 1.50049197164,
@@ -8014,10 +7199,11 @@
       "eq_f32",
       "fast_max_f32",
       "fast_sum_f32",
-      "magma_sgemmEx_kernel",
       "ucopy_f32",
       "uexp_f32",
-      "usqr_f32"
+      "usqr_f32",
+      "void magma_sgemmEx_kernel<float, float, float, (bool)0, (bool)0, (int)6, (int)3, (int)5, (int)3, (int)3>(int, int, int, Tensor, int, Tensor, int, Tensor, int, Tensor, int, int, int, const T1 *, const T1 *, T1, T1, int, cublasLtEpilogue_t, int, const void *, long)",
+      "void magma_sgemmEx_kernel<float, float, float, (bool)1, (bool)0, (int)6, (int)4, (int)6, (int)3, (int)4>(int, int, int, Tensor, int, Tensor, int, Tensor, int, Tensor, int, int, int, const T1 *, const T1 *, T1, T1, int, cublasLtEpilogue_t, int, const void *, long)"
      ]
     },
     "C-LN": {
@@ -8036,11 +7222,10 @@
     },
     "BASE-GEMM": {
      "status": "measured",
-     "gpu_busy_us": 61874.84537799997,
-     "share_gpu_busy": 0.17738617329554995,
-     "share_wall": 0.03662321950766019,
+     "gpu_busy_us": 63800.16848199997,
+     "share_gpu_busy": 0.18290579432554452,
+     "share_wall": 0.03776280264892219,
      "kernel_names": [
-      "Kernel2",
       "ampere_sgemm_128x128_nn",
       "ampere_sgemm_128x128_tn",
       "ampere_sgemm_128x32_nn",
@@ -8058,7 +7243,9 @@
       "ampere_sgemm_64x32_sliced1x4_nt",
       "ampere_sgemm_64x64_nn",
       "ampere_sgemm_64x64_tn",
-      "splitKreduce_kernel"
+      "cutlass_80_simt_sgemm_128x32_8x5_nt_align1",
+      "cutlass_80_simt_sgemm_32x128_8x5_nt_align1",
+      "void cublasLt::splitKreduce_kernel<(int)32, (int)16, int, float, float, float, (bool)0, float, float, float, (bool)1, (bool)0, (bool)0>(cublasLt::cublasSplitKParams<T6>, const T4 *, const T9 *, T8 *, T5 *, const T6 *, const T6 *, const T10 *, const T4 *, T10 *, void *, long, T6 *, int *, T6 *, const T6 *, const T6 *, const T6 *, const T6 *)"
      ]
     },
     "BIAS/RESIDUAL-OUT": {
@@ -8174,11 +7361,10 @@
     },
     "UNATTRIBUTED": {
      "status": "measured",
-     "gpu_busy_us": 13962.396385999999,
-     "share_gpu_busy": 0.04002815764334462,
-     "share_wall": 0.008264229261076304,
+     "gpu_busy_us": 12037.073282000001,
+     "share_gpu_busy": 0.03450853661335007,
+     "share_wall": 0.007124646119814309,
      "kernel_names": [
-      "Kernel2",
       "affine_f32",
       "badd_f32",
       "bdiv_f32",
@@ -8197,94 +7383,20 @@
      ]
     }
    },
-   "unknown_kernels": [
-    {
-     "kernel": "Kernel2",
-     "grid": [
-      3,
-      1,
-      36
-     ],
-     "share_gpu_busy": 0.001511867620960304
-    },
-    {
-     "kernel": "Kernel2",
-     "grid": [
-      4,
-      1,
-      53
-     ],
-     "share_gpu_busy": 0.0014737642819413748
-    },
-    {
-     "kernel": "Kernel2",
-     "grid": [
-      12,
-      1,
-      24
-     ],
-     "share_gpu_busy": 0.0008105633897582833
-    },
-    {
-     "kernel": "Kernel2",
-     "grid": [
-      3,
-      1,
-      108
-     ],
-     "share_gpu_busy": 0.0008079344269278837
-    },
-    {
-     "kernel": "Kernel2",
-     "grid": [
-      6,
-      1,
-      36
-     ],
-     "share_gpu_busy": 0.0004925979297187803
-    },
-    {
-     "kernel": "Kernel2",
-     "grid": [
-      8,
-      1,
-      13
-     ],
-     "share_gpu_busy": 0.0003441496569057434
-    },
-    {
-     "kernel": "Kernel2",
-     "grid": [
-      12,
-      1,
-      8
-     ],
-     "share_gpu_busy": 4.6854045145897744e-05
-    },
-    {
-     "kernel": "Kernel2",
-     "grid": [
-      64,
-      1,
-      1
-     ],
-     "share_gpu_busy": 1.630995902885684e-05
-    },
-    {
-     "kernel": "Kernel2",
-     "grid": [
-      16,
-      1,
-      1
-     ],
-     "share_gpu_busy": 1.5579719607433393e-05
-    }
-   ],
+   "unknown_kernels": [],
    "decision_grade": true,
    "decision_grade_reason": null,
    "outside_signature_plausibly_attention": {
     "busy_us": 8162.004822,
     "share_wall": 0.004831024504264371
+   },
+   "ambiguous_out_mlp_collision": {
+    "busy_us": 97794.224838,
+    "share_gpu_busy": 0.2803618046791178,
+    "grids": [
+     4608,
+     9216
+    ]
    },
    "gpu_busy_us_per_step": 348814.364888,
    "wall_s_per_step": 1.689497706914,
@@ -8373,10 +7485,11 @@
       "eq_f32",
       "fast_max_f32",
       "fast_sum_f32",
-      "magma_sgemmEx_kernel",
       "ucopy_f32",
       "uexp_f32",
-      "usqr_f32"
+      "usqr_f32",
+      "void magma_sgemmEx_kernel<float, float, float, (bool)0, (bool)0, (int)6, (int)3, (int)5, (int)3, (int)3>(int, int, int, Tensor, int, Tensor, int, Tensor, int, Tensor, int, int, int, const T1 *, const T1 *, T1, T1, int, cublasLtEpilogue_t, int, const void *, long)",
+      "void magma_sgemmEx_kernel<float, float, float, (bool)1, (bool)0, (int)6, (int)4, (int)6, (int)3, (int)4>(int, int, int, Tensor, int, Tensor, int, Tensor, int, Tensor, int, int, int, const T1 *, const T1 *, T1, T1, int, cublasLtEpilogue_t, int, const void *, long)"
      ]
     },
     "C-LN": {
@@ -8391,11 +7504,10 @@
     },
     "BASE-GEMM": {
      "status": "measured",
-     "gpu_busy_us": 61911.10350799998,
-     "share_gpu_busy": 0.20967358508914907,
-     "share_wall": 0.03791397367978707,
+     "gpu_busy_us": 63832.640883999964,
+     "share_gpu_busy": 0.2161812324686963,
+     "share_wall": 0.03909071118518426,
      "kernel_names": [
-      "Kernel2",
       "ampere_sgemm_128x128_nn",
       "ampere_sgemm_128x128_tn",
       "ampere_sgemm_128x32_nn",
@@ -8413,7 +7525,9 @@
       "ampere_sgemm_64x32_sliced1x4_nt",
       "ampere_sgemm_64x64_nn",
       "ampere_sgemm_64x64_tn",
-      "splitKreduce_kernel"
+      "cutlass_80_simt_sgemm_128x32_8x5_nt_align1",
+      "cutlass_80_simt_sgemm_32x128_8x5_nt_align1",
+      "void cublasLt::splitKreduce_kernel<(int)32, (int)16, int, float, float, float, (bool)0, float, float, float, (bool)1, (bool)0, (bool)0>(cublasLt::cublasSplitKParams<T6>, const T4 *, const T9 *, T8 *, T5 *, const T6 *, const T6 *, const T10 *, const T4 *, T10 *, void *, long, T6 *, int *, T6 *, const T6 *, const T6 *, const T6 *, const T6 *)"
      ]
     },
     "BIAS/RESIDUAL-OUT": {
@@ -8524,11 +7638,10 @@
     },
     "UNATTRIBUTED": {
      "status": "measured",
-     "gpu_busy_us": 13383.734709999997,
-     "share_gpu_busy": 0.04532653239115938,
-     "share_wall": 0.008196115668760835,
+     "gpu_busy_us": 11462.197333999999,
+     "share_gpu_busy": 0.03881888501161211,
+     "share_wall": 0.007019378163363646,
      "kernel_names": [
-      "Kernel2",
       "affine_f32",
       "badd_f32",
       "bdiv_f32",
@@ -8547,94 +7660,20 @@
      ]
     }
    },
-   "unknown_kernels": [
-    {
-     "kernel": "Kernel2",
-     "grid": [
-      3,
-      1,
-      36
-     ],
-     "share_gpu_busy": 0.001781889927610448
-    },
-    {
-     "kernel": "Kernel2",
-     "grid": [
-      4,
-      1,
-      53
-     ],
-     "share_gpu_busy": 0.00173544304062646
-    },
-    {
-     "kernel": "Kernel2",
-     "grid": [
-      3,
-      1,
-      108
-     ],
-     "share_gpu_busy": 0.0009557490166255618
-    },
-    {
-     "kernel": "Kernel2",
-     "grid": [
-      12,
-      1,
-      24
-     ],
-     "share_gpu_busy": 0.0009556843308866831
-    },
-    {
-     "kernel": "Kernel2",
-     "grid": [
-      6,
-      1,
-      36
-     ],
-     "share_gpu_busy": 0.0005795356484741544
-    },
-    {
-     "kernel": "Kernel2",
-     "grid": [
-      8,
-      1,
-      13
-     ],
-     "share_gpu_busy": 0.00040531843526472536
-    },
-    {
-     "kernel": "Kernel2",
-     "grid": [
-      12,
-      1,
-      8
-     ],
-     "share_gpu_busy": 5.629661492321915e-05
-    },
-    {
-     "kernel": "Kernel2",
-     "grid": [
-      64,
-      1,
-      1
-     ],
-     "share_gpu_busy": 1.9359026010814737e-05
-    },
-    {
-     "kernel": "Kernel2",
-     "grid": [
-      16,
-      1,
-      1
-     ],
-     "share_gpu_busy": 1.8371339125209025e-05
-    }
-   ],
+   "unknown_kernels": [],
    "decision_grade": true,
    "decision_grade_reason": null,
    "outside_signature_plausibly_attention": {
     "busy_us": 8157.221706000001,
     "share_wall": 0.004995431700252418
+   },
+   "ambiguous_out_mlp_collision": {
+    "busy_us": 68203.44201,
+    "share_gpu_busy": 0.2309837717528119,
+    "grids": [
+     4608,
+     9216
+    ]
    },
    "gpu_busy_us_per_step": 295273.73933,
    "wall_s_per_step": 1.6329362896879998,
@@ -8743,28 +7782,28 @@
    "tower": "clip-text",
    "chain": "C-ATTN-clip-text",
    "verdict": "UNRESOLVED",
-   "reason": "neither ACTIVATE (s_wall>=10% on any decision-grade leg) nor DECLINE (combined share <5% on every decision-grade leg) \u2014 clip-text-A1: s_wall+U_wall=0.1166, s_busy+U_busy=0.1926 (F32-only: A2 not decision-grade \u2014 leg is INVALID: kernel 'Kernel2' (grid=[16, 1, 10]) is not a known kernel name and carries share_gpu_busy=0.0140 > 0.01 \u2014 the mapping cannot classify it and refuses to guess; kernel 'Kernel2' (grid=[4, 1, 24]) is not a known kernel name and carries share_gpu_busy=0.0137 > 0.01 \u2014 the mapping cannot classify it and refuses to guess)"
+   "reason": "neither ACTIVATE (s_wall>=10% on any decision-grade leg) nor DECLINE (combined share <5% on every decision-grade leg) \u2014 clip-text-A1: s_wall+U_wall=0.1030, s_busy+U_busy=0.1703; clip-text-A2: s_wall+U_wall=0.0878, s_busy+U_busy=0.2045"
   },
   {
    "port": "C-MLP-clip-text",
    "tower": "clip-text",
    "chain": "C-GELU",
    "verdict": "UNRESOLVED",
-   "reason": "neither ACTIVATE (s_wall>=10% on any decision-grade leg) nor DECLINE (combined share <5% on every decision-grade leg) \u2014 clip-text-A1: s_wall+U_wall=0.0573, s_busy+U_busy=0.0948 (F32-only: A2 not decision-grade \u2014 leg is INVALID: kernel 'Kernel2' (grid=[16, 1, 10]) is not a known kernel name and carries share_gpu_busy=0.0140 > 0.01 \u2014 the mapping cannot classify it and refuses to guess; kernel 'Kernel2' (grid=[4, 1, 24]) is not a known kernel name and carries share_gpu_busy=0.0137 > 0.01 \u2014 the mapping cannot classify it and refuses to guess)"
+   "reason": "neither ACTIVATE (s_wall>=10% on any decision-grade leg) nor DECLINE (combined share <5% on every decision-grade leg) \u2014 clip-text-A1: s_wall+U_wall=0.0438, s_busy+U_busy=0.0724; clip-text-A2: s_wall+U_wall=0.0356, s_busy+U_busy=0.0829"
   },
   {
    "port": "C-ATTN-clip-vision",
    "tower": "clip-vision",
    "chain": "C-ATTN-clip-vision",
    "verdict": "UNRESOLVED",
-   "reason": "neither ACTIVATE (s_wall>=10% on any decision-grade leg) nor DECLINE (combined share <5% on every decision-grade leg) \u2014 clip-vision-A1: s_wall+U_wall=0.0708, s_busy+U_busy=0.1245 (F32-only: A2 not decision-grade \u2014 leg is INVALID: kernel 'Kernel2' (grid=[6, 1, 18]) is not a known kernel name and carries share_gpu_busy=0.0143 > 0.01 \u2014 the mapping cannot classify it and refuses to guess)"
+   "reason": "neither ACTIVATE (s_wall>=10% on any decision-grade leg) nor DECLINE (combined share <5% on every decision-grade leg) \u2014 clip-vision-A1: s_wall+U_wall=0.0641, s_busy+U_busy=0.1128; clip-vision-A2: s_wall+U_wall=0.0501, s_busy+U_busy=0.1410"
   },
   {
    "port": "C-MLP-clip-vision",
    "tower": "clip-vision",
    "chain": "C-GELU",
    "verdict": "UNRESOLVED",
-   "reason": "neither ACTIVATE (s_wall>=10% on any decision-grade leg) nor DECLINE (combined share <5% on every decision-grade leg) \u2014 clip-vision-A1: s_wall+U_wall=0.0453, s_busy+U_busy=0.0797 (F32-only: A2 not decision-grade \u2014 leg is INVALID: kernel 'Kernel2' (grid=[6, 1, 18]) is not a known kernel name and carries share_gpu_busy=0.0143 > 0.01 \u2014 the mapping cannot classify it and refuses to guess)"
+   "reason": "neither ACTIVATE (s_wall>=10% on any decision-grade leg) nor DECLINE (combined share <5% on every decision-grade leg) \u2014 clip-vision-A1: s_wall+U_wall=0.0387, s_busy+U_busy=0.0680; clip-vision-A2: s_wall+U_wall=0.0319, s_busy+U_busy=0.0898"
   }
  ],
  "findings": [

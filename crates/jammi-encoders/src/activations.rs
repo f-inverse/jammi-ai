@@ -101,23 +101,49 @@ fn dispatch_gelu_erf_fused(x: &Tensor) -> Result<Tensor, EncoderError> {
 /// that function's own doc) or the same unchanged eager call, recording
 /// which happened either way. Wired at `bert.rs:296`
 /// (`BertIntermediate::forward`'s `activations::gelu_erf(&hidden,
-/// training)`) and `distilbert.rs:213` (`DistilBertFfn::forward`'s
-/// `activations::gelu_erf(&mid, training)`) only — as of this fix round
-/// (item 6) both receive `training` as a call-chain PARAMETER sourced
-/// from `Bert::training`/`DistilBert::training`, not a per-sub-struct
-/// stored copy, so this seam always sees the SAME value the encoder's own
-/// `forward_hidden` dispatched on (these two line numbers are NOT tracked
-/// by `ci/scripts/perf/check_citations.py`, which only resolves
-/// `finetune_step.rs`/`grad_oracle.rs` under `jammi-bench` — a future edit
-/// to either call site's surrounding code can silently drift this
-/// citation; verify by name if in doubt).
+/// training)`), `distilbert.rs:213` (`DistilBertFfn::forward`'s
+/// `activations::gelu_erf(&mid, training)`), and — as of #421 P1-a —
+/// `crate::htsat_audio`'s two sites (`SwinBlock::forward`'s MLP and
+/// `ClapAudioProjection::forward_unnormalized_with_training`'s `"gelu"`
+/// arm; see that module's own doc, "Every fusible activation goes through
+/// the house seam", for the flag thread and the exact per-forward
+/// dispatch-count oracles).
+///
+/// ALL FOUR sites receive `training` as a call-chain PARAMETER, never a
+/// per-sub-struct stored copy, so this seam always sees the SAME value the
+/// model's own forward dispatched on (audit round item 6, the defect that
+/// rule exists to prevent): `Bert::training`/`DistilBert::training` thread
+/// theirs through `BertLayer`/`DistilBertLayer`, and `HtsatAudio`'s single
+/// stored flag threads through
+/// `htsat_audio::HtsatAudioEncoder::forward_spine_with_training` to each
+/// `SwinBlock::forward` and directly to
+/// `htsat_audio::ClapAudioProjection::forward_unnormalized_with_training`.
+/// (HTSAT's flag-less `forward_spine`/`forward_unnormalized` are EVAL
+/// conveniences defined as `_with_training(.., false)` for boundary-parity
+/// harnesses that hold no flag of their own.) All four report to the SAME
+/// process-wide `gelu_erf_fused` registry entry, so a counter delta over a
+/// full HTSAT forward is the SUM of its two site classes —
+/// `sum(depths)` MLP dispatches plus one projection dispatch when
+/// `projection_hidden_act == "gelu"`; that tower's own module doc carries
+/// the arithmetic and the oracles that pin it.
+///
+/// Citation direction matters here, and the two directions are NOT
+/// symmetric (corrected in #421 P1-a, which tripped the second one):
+/// `ci/scripts/perf/check_citations.py` scans `crates/jammi-bench/**`,
+/// `ci/scripts/perf/**` and `crates/jammi-kernels/artifacts/cuda-runs/**`,
+/// re-resolving every `crates/<crate>/src/<file>.rs:<line>` citation it
+/// finds THERE. So (a) the `bert.rs:296`/`distilbert.rs:213` line numbers
+/// written HERE are NOT tracked — this file is not in any scanned root, and
+/// an edit to either call site's surrounding code drifts them silently
+/// (verify by name if in doubt) — while (b) a citation INTO this file from a
+/// scanned root IS mechanically re-checked every CI:
+/// `ci/scripts/perf/finetune_ab.sh` cites this function's own
+/// `"gelu_erf_fused"` op-key line by number, so any edit to this doc
+/// comment that shifts that line reds that gate until the citation is
+/// re-pointed.
 ///
 /// **Not wired** (recorded here, per plan v2 R5', rather than silently
-/// excluded): `crate::htsat_audio`'s two GELU sites (`SwinBlock`,
-/// `ClapAudioProjection`) have no training flag at all and
-/// `HtsatAudio::set_training` never reaches the projection — wiring them
-/// means two new propagation edges with no oracle and nothing trains HTSAT
-/// in this unit, a #421-adjacent gap tracked separately. `crate::context`'s
+/// excluded): `crate::context`'s
 /// GELU site has no train/eval split. The GeGLU eager reference arm
 /// (`crate::modernbert::geglu_apply_training`'s own `gate.gelu_erf()?`
 /// call) and `quick_gelu` (above) are architecturally different

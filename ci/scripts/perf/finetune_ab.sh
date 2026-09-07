@@ -328,7 +328,7 @@ REPO_ROOT="$(cd "$DIR/../../.." && pwd)"
 # training step (confirmed at this contract's tip: `layer_norm_fused`
 # `crates/jammi-encoders/src/layer_norm.rs:583`, `geglu_fused`
 # `crates/jammi-encoders/src/modernbert.rs:1424`, `gelu_erf_fused`
-# `crates/jammi-encoders/src/activations.rs:132`, `attention_block_flash`
+# `crates/jammi-encoders/src/activations.rs:158`, `attention_block_flash`
 # `crates/jammi-encoders/src/modernbert.rs:1990` (`op_disabled`, the
 # cascade's own capability gate), `attention_block_fused`
 # `crates/jammi-encoders/src/attention_cascade.rs:914` (moved out of

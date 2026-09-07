@@ -23,6 +23,53 @@
 //! `vb.pp("audio_model").pp("audio_encoder")`); the projection head lives at
 //! `audio_projection.*`, a sibling of `audio_model`. [`HtsatAudio::load`] takes
 //! the safetensors root and wires both.
+//!
+//! # Every fusible activation goes through the house seam
+//!
+//! This tower evaluates GELU-erf at exactly two places — each Swin block's MLP
+//! (`SwinBlock::forward`, one call per block, so `sum(depths)` calls per
+//! forward) and the projection head's `"gelu"` activation arm
+//! ([`ClapAudioProjection::forward_unnormalized_with_training`], one call per
+//! forward, and only when `projection_hidden_act == "gelu"`; the `"relu"` arm
+//! is a different activation and is untouched). Neither calls `Tensor::gelu_erf` directly:
+//! both route through `crate::activations::gelu_erf(x, training)`, the same
+//! house seam `crate::bert`'s `BertIntermediate::forward` and
+//! `crate::distilbert`'s `DistilBertFfn::forward` use. The invariant that seam
+//! carries, and that this tower therefore inherits:
+//!
+//! * `training == false` is the UNCHANGED `x.gelu_erf()` call, byte for byte —
+//!   no admission machinery runs at all, so eval bytes (and every golden-parity
+//!   / bits-snapshot row taken in eval) are exactly what they were before the
+//!   seam existed. Asserted by
+//!   `tests::eval_output_is_bit_identical_across_a_training_toggle_round_trip`.
+//! * `training == true` makes the fused-vs-eager choice a COUNTED admission
+//!   decision on tensor state (dtype/contiguity/device/non-emptiness), never on
+//!   model identity. Asserted by
+//!   `tests::training_true_full_forward_dispatches_the_gelu_seam_once_per_swin_block`
+//!   and `tests::projection_gelu_arm_dispatches_the_seam_exactly_once`.
+//!
+//! The `training` flag both sites read is a call-chain PARAMETER sourced from
+//! [`HtsatAudio::set_training`]'s single stored flag — threaded
+//! `HtsatAudio::forward` → [`HtsatAudioEncoder::forward_spine_with_training`]
+//! → `SwinBlock::forward`, and `HtsatAudio::forward` →
+//! [`ClapAudioProjection::forward_unnormalized_with_training`] — NOT a
+//! per-sub-struct stored copy (`crate::activations::gelu_erf`'s own doc
+//! records the drift defect that rule exists to prevent). The two
+//! flag-less public entry points ([`HtsatAudioEncoder::forward_spine`],
+//! [`ClapAudioProjection::forward_unnormalized`]) are EVAL conveniences for
+//! boundary-parity harnesses, defined as their `_with_training(.., false)`
+//! twins.
+//!
+//! One counter, two sites: both sites report to the SAME process-wide
+//! `gelu_erf_fused` registry entry, so a full-tower forward's dispatch delta
+//! is their SUM — `sum(depths)` (one per Swin block) plus one more when
+//! `projection_hidden_act == "gelu"`. On the `htsat_clap_tiny` fixture
+//! (`depths = [2, 2, 2, 2]`, projection act `"relu"`) that is exactly 8; the
+//! projection's own `+1` is pinned separately by
+//! `tests::projection_gelu_arm_dispatches_the_seam_exactly_once` on an
+//! explicitly-`"gelu"` fixture, with
+//! `tests::projection_relu_arm_never_touches_the_gelu_seam` as its negative
+//! control.
 
 use std::collections::HashMap;
 use std::path::Path;
@@ -34,6 +81,7 @@ use candle_nn::{
 };
 use jammi_lora::{FrozenBase, LoraBuildConfig, MaybeLoraLinear};
 
+use crate::activations;
 use crate::error::EncoderError;
 use crate::layer_norm::LayerNorm;
 use crate::lora_site::{FrozenSiteHolder, LoraSite};
@@ -1016,7 +1064,17 @@ impl SwinBlock {
         Ok(mask.to_dtype(dtype)?)
     }
 
-    fn forward(&self, hidden: &Tensor) -> Result<Tensor, EncoderError> {
+    /// `training` is a PARAMETER, not a stored copy — the same rule
+    /// `crate::bert::BertIntermediate::forward` and
+    /// `crate::distilbert::DistilBertFfn::forward` follow, and the one
+    /// `crate::activations::gelu_erf`'s own doc mandates:
+    /// [`HtsatAudio::set_training`]'s flag is the single source of truth,
+    /// threaded down through
+    /// [`HtsatAudioEncoder::forward_spine_with_training`] to this call, so a
+    /// desync between what the tower's own forward dispatched on and what
+    /// this block's MLP activation receives is unrepresentable — there is no
+    /// second copy of it left to drift.
+    fn forward(&self, hidden: &Tensor, training: bool) -> Result<Tensor, EncoderError> {
         let (b, _l, c) = hidden.dims3()?;
         let (h, w) = self.input_resolution;
         let ws = self.window_size;
@@ -1058,16 +1116,23 @@ impl SwinBlock {
         // Residual 1.
         let hidden = (shortcut + attn)?;
 
-        // MLP with residual 2.
+        // MLP with residual 2. The activation goes through the house GELU
+        // seam (`crate::activations::gelu_erf`), never `Tensor::gelu_erf`
+        // directly — see this module's own doc: `training == false` is that
+        // same call byte for byte, `true` is a counted admission decision on
+        // tensor state.
         let y = self.layernorm_after.forward(&hidden)?;
         let y = self.intermediate.forward(&y)?;
-        let y = y.gelu_erf()?;
+        let y = activations::gelu_erf(&y, training)?;
         let y = self.output.forward(&y)?;
         Ok((&hidden + y)?)
     }
 
     /// Propagates to the attention module (softmax arm + its three QKV LoRA
-    /// sites), both LayerNorms, and this block's own three LoRA sites.
+    /// sites), both LayerNorms, and this block's own three LoRA sites. It
+    /// deliberately does NOT reach the MLP's GELU seam arm: that one is a
+    /// [`Self::forward`] PARAMETER, not a stored copy — see that method's
+    /// own doc.
     fn set_training(&mut self, training: bool) {
         self.attention.set_training(training);
         self.layernorm_before.set_training(training);
@@ -1465,6 +1530,31 @@ impl HtsatAudioEncoder {
         patch_embed_out: &Tensor,
         frames_num: usize,
     ) -> Result<Spine, EncoderError> {
+        self.forward_spine_with_training(patch_embed_out, frames_num, false)
+    }
+
+    /// [`Self::forward_spine`] with each Swin block's MLP GELU-seam arm
+    /// chosen by the caller's `training` flag, a PARAMETER threaded down to
+    /// every `SwinBlock::forward` rather than a stored per-block copy (the
+    /// rule `crate::activations::gelu_erf`'s own doc mandates —
+    /// [`HtsatAudio::set_training`]'s flag is the single source of truth,
+    /// and [`HtsatAudio::forward`] is the caller that supplies it).
+    ///
+    /// Note what this flag does NOT select: the attention softmax arm and
+    /// every LayerNorm arm are propagated STATE (this encoder's own
+    /// crate-private `set_training`), not parameters, so
+    /// [`Self::forward_spine`] (the eval convenience) on a spine that
+    /// `set_training(true)` has already touched still takes the training
+    /// softmax arm — it only puts the GELU seam on its eval arm, which on
+    /// every supported device is numerically the same function. The
+    /// production path never mixes the two: `HtsatAudio::forward` passes its
+    /// own flag here.
+    pub fn forward_spine_with_training(
+        &self,
+        patch_embed_out: &Tensor,
+        frames_num: usize,
+        training: bool,
+    ) -> Result<Spine, EncoderError> {
         let mut blocks: Vec<Vec<Tensor>> = Vec::with_capacity(self.num_stages);
         let mut downsamples: Vec<Option<Tensor>> = Vec::with_capacity(self.num_stages);
 
@@ -1472,7 +1562,7 @@ impl HtsatAudioEncoder {
         for stage in &self.stages {
             let mut stage_blocks = Vec::with_capacity(stage.blocks.len());
             for block in &stage.blocks {
-                hidden = block.forward(&hidden)?;
+                hidden = block.forward(&hidden, training)?;
                 stage_blocks.push(hidden.clone());
             }
             blocks.push(stage_blocks);
@@ -1621,18 +1711,48 @@ impl ClapAudioProjection {
         ]
     }
 
+    /// Propagates to this head's two LoRA sites (dropout gating). It
+    /// deliberately does NOT store a GELU-seam arm flag: that one is a
+    /// [`Self::forward_unnormalized_with_training`] PARAMETER — see that
+    /// method's own doc.
     fn set_training(&mut self, training: bool) {
         for (_, lin) in self.lora_sites_mut() {
             lin.set_training(training);
         }
     }
 
-    /// Project `[B, hidden_size]` to the unnormalized latent `[B, projection_dim]`.
+    /// Project `[B, hidden_size]` to the unnormalized latent
+    /// `[B, projection_dim]` in EVAL mode — the exact
+    /// [`Self::forward_unnormalized_with_training`]`(x, false)` call, kept
+    /// as its own entry point because this head's public callers (a
+    /// boundary-parity harness such as `tests/golden_parity.rs`) are eval
+    /// harnesses that hold no training flag of their own. A caller that IS
+    /// training calls the `_with_training` twin with the tower's own flag,
+    /// which is exactly what [`HtsatAudio::forward`] does.
     pub fn forward_unnormalized(&self, x: &Tensor) -> Result<Tensor, EncoderError> {
+        self.forward_unnormalized_with_training(x, false)
+    }
+
+    /// [`Self::forward_unnormalized`] with the GELU seam's arm chosen by the
+    /// caller's `training` flag, a PARAMETER rather than a stored copy (the
+    /// rule `crate::activations::gelu_erf`'s own doc mandates —
+    /// [`HtsatAudio::set_training`]'s flag is the single source of truth).
+    ///
+    /// The `"gelu"` arm goes through the house GELU seam
+    /// (`crate::activations::gelu_erf`), never `Tensor::gelu_erf` directly —
+    /// see this module's own doc. At `training == false` that seam IS the
+    /// unchanged `Tensor::gelu_erf` call, byte for byte. The `"relu"` arm is
+    /// a different activation with no fused seam and is untouched by
+    /// `training` entirely.
+    pub fn forward_unnormalized_with_training(
+        &self,
+        x: &Tensor,
+        training: bool,
+    ) -> Result<Tensor, EncoderError> {
         let x = self.linear1.forward(x)?;
         let x = match self.act.as_str() {
             "relu" => x.relu()?,
-            "gelu" => x.gelu_erf()?,
+            "gelu" => activations::gelu_erf(&x, training)?,
             other => {
                 return Err(EncoderError::Config(format!(
                     "unsupported projection activation '{other}'"
@@ -1918,10 +2038,14 @@ impl HtsatAudio {
     ) -> Result<Tensor, EncoderError> {
         let front = self.encoder.forward_front(input_features, is_longer)?;
         let frames_num = front.post_reshape_mel2img.dim(2)?;
-        let spine = self
-            .encoder
-            .forward_spine(&front.patch_embed_out, frames_num)?;
-        let unnorm = self.projection.forward_unnormalized(&spine.pooler_out)?;
+        let spine = self.encoder.forward_spine_with_training(
+            &front.patch_embed_out,
+            frames_num,
+            self.training,
+        )?;
+        let unnorm = self
+            .projection
+            .forward_unnormalized_with_training(&spine.pooler_out, self.training)?;
         l2_normalize(&unnorm)
     }
 }
@@ -2130,17 +2254,23 @@ mod tests {
     /// through the tower's FINAL norm or a cross-stage `PatchMerging`
     /// downsample — this test stays scoped to a single stage's own blocks
     /// rather than the full `HtsatAudio::forward` for exactly that reason.
+    ///
+    /// `training` is passed through to [`SwinBlock::forward`] explicitly —
+    /// that flag is a call-chain parameter, not stage state (see that
+    /// method's own doc), so this helper's caller must supply the SAME value
+    /// it handed `SwinStage::set_training`.
     fn run_stage_backward(
         stage: &SwinStage,
         varmap: &VarMap,
         device: &Device,
+        training: bool,
     ) -> (Vec<Option<Tensor>>, Tensor) {
         let hidden = deterministic_tensor(16, 8, 11, device)
             .reshape((1, 16, 8))
             .unwrap();
         let mut x = hidden;
         for block in &stage.blocks {
-            x = block.forward(&x).unwrap();
+            x = block.forward(&x, training).unwrap();
         }
         let loss = nonuniform_loss(&x, 8, device);
         let grads = loss.backward().unwrap();
@@ -2180,7 +2310,7 @@ mod tests {
         deterministic_fill_varmap(&varmap, &device);
         stage.set_training(true);
 
-        let (rel_bias_grads, _) = run_stage_backward(&stage, &varmap, &device);
+        let (rel_bias_grads, _) = run_stage_backward(&stage, &varmap, &device, true);
         for (i, grad) in rel_bias_grads.iter().enumerate() {
             let g = grad.as_ref().unwrap_or_else(|| {
                 panic!("block {i}: rel_bias_table grad must be Some under training=true")
@@ -2215,7 +2345,7 @@ mod tests {
         deterministic_fill_varmap(&varmap, &device);
         // training defaults to false; forward without calling set_training.
 
-        let (rel_bias_grads, _) = run_stage_backward(&stage, &varmap, &device);
+        let (rel_bias_grads, _) = run_stage_backward(&stage, &varmap, &device, false);
         for (i, grad) in rel_bias_grads.iter().enumerate() {
             assert!(
                 grad.is_none(),
@@ -2265,12 +2395,18 @@ mod tests {
     /// backward-sound (see [`tile_nonoverlapping`]), this is the full
     /// production composition — no caller of this helper needs to route
     /// around the fused local branch.
+    ///
+    /// The spine is entered through `forward_spine_with_training` with the
+    /// TOWER'S OWN flag (`tower.is_training()`), not the flag-less eval
+    /// convenience: this helper stands in for the production composition
+    /// `HtsatAudio::forward` performs, and that one sources the GELU seam's
+    /// arm from the same single flag.
     fn run_front_and_spine(tower: &HtsatAudio, input: &Tensor, is_longer: &[bool]) -> Spine {
         let encoder = tower.encoder();
         let front = encoder.forward_front(input, is_longer).unwrap();
         let frames_num = front.post_reshape_mel2img.dim(2).unwrap();
         encoder
-            .forward_spine(&front.patch_embed_out, frames_num)
+            .forward_spine_with_training(&front.patch_embed_out, frames_num, tower.is_training())
             .unwrap()
     }
 
@@ -3133,10 +3269,361 @@ mod tests {
         tower.set_training(false);
         let after = tower.forward(&input, &is_longer).unwrap();
 
+        // Compared as RAW BITS, not as `f32` values: `==` on `f32` calls
+        // `-0.0` equal to `+0.0` and every `NaN` unequal to itself, so a
+        // value-level comparison neither proves "byte for byte" nor fails
+        // loudly on a degenerate output. Non-vacuity is asserted first —
+        // an empty (or all-zero) descriptor would make any equality below
+        // trivially true.
+        let before_bits: Vec<u32> = before
+            .flatten_all()
+            .unwrap()
+            .to_vec1::<f32>()
+            .unwrap()
+            .iter()
+            .map(|v| v.to_bits())
+            .collect();
+        let after_bits: Vec<u32> = after
+            .flatten_all()
+            .unwrap()
+            .to_vec1::<f32>()
+            .unwrap()
+            .iter()
+            .map(|v| v.to_bits())
+            .collect();
+        assert_eq!(before_bits.len(), cfg.projection_dim);
+        let norm = before
+            .sqr()
+            .unwrap()
+            .sum_all()
+            .unwrap()
+            .to_scalar::<f32>()
+            .unwrap()
+            .sqrt();
+        assert_finite_nonzero(norm, "eval-mode audio embedding");
         assert_eq!(
-            before.to_vec2::<f32>().unwrap(),
-            after.to_vec2::<f32>().unwrap(),
-            "eval output must be bit-identical across a training toggle round trip"
+            before_bits, after_bits,
+            "eval output must be bit-identical across a training toggle round trip -- \
+             every arm `set_training` flips (the attention softmax arms, both LayerNorms, \
+             and the MLP/projection GELU seam arms) must leave the EVAL forward's bytes \
+             exactly as they were"
+        );
+    }
+
+    /// The GELU seam's exact per-forward dispatch count (family F: an
+    /// independently-known number, computed live and asserted, not an
+    /// "advanced by some amount" smoke check). On the real `htsat_clap_tiny`
+    /// geometry `depths = [2, 2, 2, 2]`, so the spine has `2+2+2+2 = 8` Swin
+    /// blocks and `SwinBlock::forward` evaluates GELU exactly ONCE each
+    /// (`crate::activations::gelu_erf` on the MLP's intermediate output);
+    /// `projection_hidden_act` is `"relu"` in this fixture, so the
+    /// projection head contributes ZERO — total 8 per full-tower forward.
+    ///
+    /// This is the oracle that makes a broken flag thread fail loudly: if
+    /// `HtsatAudio::forward` ever stops passing its own flag down through
+    /// `forward_spine_with_training` (or a block stops forwarding it), those
+    /// blocks silently take the seam's EVAL arm — which makes no admission
+    /// decision at all — and the count comes in below 8 rather than
+    /// producing any visibly wrong number.
+    ///
+    /// # Why K4 (eval bytes) is untouched, and where CUDA is proved
+    ///
+    /// On CPU F32 every one of those 8 tensors is contiguous and non-empty,
+    /// so `gelu_admission_predicate` HOLDS and all 8 go down the FUSED arm —
+    /// and `GeluErfFused`'s CPU F32 forward is BIT-IDENTICAL to
+    /// `Tensor::gelu_erf` by that op's own documented contract (see
+    /// `crate::activations::dispatch_gelu_erf_fused`, and
+    /// `tests::projection_gelu_arm_dispatches_the_seam_exactly_once` for
+    /// this crate's own per-element bit assertion of it). So CPU bits are
+    /// unchanged in BOTH modes: eval because the seam short-circuits to the
+    /// unchanged call, training because the fused CPU arm reproduces it
+    /// exactly. Eval bytes crate-wide are pinned by `tests/bits_snapshot.rs`
+    /// and `tests/golden_parity.rs`, neither of which sets training at all.
+    /// The fused-vs-eager question that CANNOT be settled bit-exactly — CUDA
+    /// F32/BF16/F16 — is not this test's to settle: it is
+    /// `jammi-kernels`'s own `tests/cuda_parity.rs::gelu_erf_parity_*` suite
+    /// (`gelu_erf_parity_contiguous_small`,
+    /// `gelu_erf_parity_production_width`,
+    /// `gelu_erf_parity_non_multiple_of_launch_block`,
+    /// `gelu_erf_parity_narrowed_with_nonzero_offset`,
+    /// `gelu_erf_parity_empty_input_is_refused_on_both_devices`), which
+    /// bounds the same kernel this seam dispatches.
+    ///
+    /// The eager counter must stay exactly where it was. Both halves are
+    /// asserted — a one-sided "fused went up" check would pass even if half
+    /// the sites had fallen back.
+    ///
+    /// # Why two locks, in THIS order
+    ///
+    /// This test needs both crate-shared counter locks: the full forward
+    /// bumps `crate::layer_norm::LN_DISPATCH_COUNTERS` and the softmax
+    /// cascade counters as well as the `gelu_erf_fused` counters it reads
+    /// exactly, and every OTHER test that can bump `gelu_erf_fused` holds
+    /// one of the two (this module's own training-mode forwards hold the
+    /// `layer_norm` one; `crate::activations`/`crate::bert`/
+    /// `crate::distilbert`'s GELU counter tests hold the
+    /// `attention_cascade` one).
+    ///
+    /// The ORDER is not free: `crate::modernbert`'s own tests already
+    /// acquire both, `attention_cascade` FIRST and `layer_norm` second
+    /// (e.g. `modernbert::tests::
+    /// forward_hidden_with_lengths_none_is_bit_identical_to_forward_hidden`,
+    /// which takes `ATTENTION_BLOCK_COUNTER_TEST_LOCK` and then, a few lines
+    /// later, `crate::layer_norm::DISPATCH_COUNTER_TEST_LOCK`). Acquiring
+    /// them the other way round here is a lock-order INVERSION against those
+    /// tests, and the default parallel test runner deadlocks the whole
+    /// `cargo test --lib` binary on it — observed, not hypothesized, while
+    /// writing this test (every htsat/layer_norm/modernbert thread parked in
+    /// `__psynch_mutexwait` forever). Every multi-lock test in this crate
+    /// therefore takes `attention_cascade` before `layer_norm`, and any new
+    /// one must too.
+    #[test]
+    fn training_true_full_forward_dispatches_the_gelu_seam_once_per_swin_block() {
+        // Lock order: attention_cascade THEN layer_norm -- see this test's
+        // own doc.
+        let _attn_guard = crate::attention_cascade::ATTENTION_BLOCK_COUNTER_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let _ln_guard = crate::layer_norm::DISPATCH_COUNTER_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let device = Device::Cpu;
+        let varmap = VarMap::new();
+        let (mut tower, cfg, input) = build_full_tower_and_input(&varmap, &device, 101);
+
+        // The expected count, re-derived from the config this tower was
+        // actually built from (not a bare literal), then pinned against the
+        // independently-known fixture value.
+        assert_eq!(cfg.depths, vec![2, 2, 2, 2], "fixture geometry changed");
+        assert_eq!(
+            cfg.projection_hidden_act, "relu",
+            "fixture projection activation changed -- the projection head would then \
+             contribute one more GELU call per forward"
+        );
+        let expected: usize = cfg.depths.iter().sum();
+        assert_eq!(expected, 8, "sum(depths) for htsat_clap_tiny");
+
+        tower.set_training(true);
+        let before = crate::activations::GELU_DISPATCH_COUNTERS.snapshot();
+        let out = tower.forward(&input, &[true]).unwrap();
+        let after = crate::activations::GELU_DISPATCH_COUNTERS.snapshot();
+
+        // Non-vacuity: the forward really produced a descriptor.
+        assert_eq!(out.dims(), &[1, cfg.projection_dim]);
+
+        assert_eq!(
+            after.fused - before.fused,
+            expected as u64,
+            "the GELU seam must dispatch FUSED exactly once per Swin block \
+             (sum(depths)={expected}) at training=true on CPU F32"
+        );
+        assert_eq!(
+            after.eager, before.eager,
+            "every one of those sites is contiguous, non-empty CPU F32 -- none may fall \
+             back to the eager arm"
+        );
+    }
+
+    /// The eval half of the same mechanism, and the reason it is a SEPARATE
+    /// assertion: at `training == false` — which is what `HtsatAudio::forward`
+    /// passes down when nothing has called `set_training` — the seam
+    /// short-circuits to the unchanged `Tensor::gelu_erf` call before any
+    /// admission decision is taken, so NEITHER counter may move. Without this, the count oracle
+    /// above could be satisfied by a seam that admitted on every forward
+    /// regardless of mode — which would be a silent behavior change to
+    /// eval bytes on any device/dtype where fused and eager differ.
+    #[test]
+    fn eval_forward_takes_no_gelu_admission_decision_at_all() {
+        // Lock order: attention_cascade THEN layer_norm -- see this test's
+        // own doc.
+        let _attn_guard = crate::attention_cascade::ATTENTION_BLOCK_COUNTER_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let _ln_guard = crate::layer_norm::DISPATCH_COUNTER_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let device = Device::Cpu;
+        let varmap = VarMap::new();
+        let (tower, cfg, input) = build_full_tower_and_input(&varmap, &device, 101);
+        // `training` defaults to false; no `set_training` call at all.
+        assert!(!tower.is_training());
+
+        let before = crate::activations::GELU_DISPATCH_COUNTERS.snapshot();
+        let out = tower.forward(&input, &[true]).unwrap();
+        let after = crate::activations::GELU_DISPATCH_COUNTERS.snapshot();
+
+        assert_eq!(out.dims(), &[1, cfg.projection_dim]);
+        assert_eq!(
+            (after.fused, after.eager),
+            (before.fused, before.eager),
+            "eval must take no admission decision on ANY of the {} Swin-block GELU sites",
+            cfg.depths.iter().sum::<usize>()
+        );
+    }
+
+    /// The COMPOSITE count both site classes sum to, measured rather than
+    /// inferred (family F): the same `htsat_clap_tiny` geometry with
+    /// `projection_hidden_act` flipped to `"gelu"` must dispatch the seam
+    /// `sum(depths) + 1 = 9` times per full-tower forward — 8 Swin-block
+    /// MLPs plus the projection head, all reporting to the SAME process-wide
+    /// `gelu_erf_fused` counter. The sibling tests pin the two terms
+    /// separately; this one pins that they ADD, on one real tower, so the
+    /// arithmetic in this module's own doc is a measured claim and not a
+    /// hypothesis.
+    #[test]
+    fn training_true_full_forward_with_a_gelu_projection_dispatches_sum_depths_plus_one() {
+        // Lock order: attention_cascade THEN layer_norm -- see this test's
+        // own doc.
+        let _attn_guard = crate::attention_cascade::ATTENTION_BLOCK_COUNTER_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let _ln_guard = crate::layer_norm::DISPATCH_COUNTER_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let device = Device::Cpu;
+        let mut cfg = HtsatAudioConfig::from_hf_clap_config(&fixture_config()).unwrap();
+        cfg.projection_hidden_act = "gelu".to_string();
+        let varmap = VarMap::new();
+        let vb = VarBuilder::from_varmap(&varmap, DType::F32, &device);
+        let mut tower = HtsatAudio::load(vb, &cfg, &device).unwrap();
+        deterministic_fill_varmap(&varmap, &device);
+        let t = 40;
+        let input = deterministic_tensor(4 * t, cfg.num_mel_bins, 101, &device)
+            .reshape((1, 4, t, cfg.num_mel_bins))
+            .unwrap();
+
+        let expected = cfg.depths.iter().sum::<usize>() + 1;
+        assert_eq!(
+            expected, 9,
+            "sum(depths) + 1 projection for htsat_clap_tiny"
+        );
+
+        tower.set_training(true);
+        let before = crate::activations::GELU_DISPATCH_COUNTERS.snapshot();
+        let out = tower.forward(&input, &[true]).unwrap();
+        let after = crate::activations::GELU_DISPATCH_COUNTERS.snapshot();
+
+        assert_eq!(out.dims(), &[1, cfg.projection_dim]);
+        assert_eq!(
+            after.fused - before.fused,
+            expected as u64,
+            "both site classes report to one counter: {} Swin-block MLP dispatches plus \
+             the projection head's one",
+            cfg.depths.iter().sum::<usize>()
+        );
+        assert_eq!(after.eager, before.eager, "no eager fallback on CPU F32");
+    }
+
+    /// Build a standalone [`ClapAudioProjection`] whose activation is `act`,
+    /// over the minimal `tiny_stage_config` geometry, plus a deterministic
+    /// `[1, hidden_size]` pooled-descriptor input.
+    fn build_projection(
+        varmap: &VarMap,
+        device: &Device,
+        act: &str,
+    ) -> (ClapAudioProjection, Tensor) {
+        let mut cfg = tiny_stage_config();
+        cfg.projection_hidden_act = act.to_string();
+        let vb = VarBuilder::from_varmap(varmap, DType::F32, device);
+        let proj = ClapAudioProjection::load(vb, &cfg).unwrap();
+        deterministic_fill_varmap(varmap, device);
+        let x = deterministic_tensor(1, cfg.hidden_size, 7, device);
+        (proj, x)
+    }
+
+    /// The projection head's own GELU site (the `"gelu"` arm of
+    /// `projection_hidden_act`, which the `htsat_clap_tiny` fixture does not
+    /// select — hence this separate, explicitly-`"gelu"` fixture): exactly
+    /// ONE seam dispatch per `forward_unnormalized_with_training(.., true)`,
+    /// and ZERO counter movement through the flag-less
+    /// `forward_unnormalized` eval convenience. Together with the Swin-block
+    /// count above, this is the `+1` term in the tower's per-forward
+    /// dispatch total (`sum(depths) + 1` when `projection_hidden_act` is
+    /// `"gelu"` — both sites report to the SAME `gelu_erf_fused` counter). The eval output is asserted
+    /// bit-identical to the training-mode one as well: on CPU F32 the fused
+    /// arm IS `Tensor::gelu_erf` bit for bit
+    /// (`crate::activations::dispatch_gelu_erf_fused`'s own contract), so
+    /// this is a genuine numeric equality, not merely a counter equality.
+    #[test]
+    fn projection_gelu_arm_dispatches_the_seam_exactly_once() {
+        // Lock order: attention_cascade THEN layer_norm -- see this test's
+        // own doc.
+        let _attn_guard = crate::attention_cascade::ATTENTION_BLOCK_COUNTER_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let _ln_guard = crate::layer_norm::DISPATCH_COUNTER_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let device = Device::Cpu;
+        let varmap = VarMap::new();
+        let (proj, x) = build_projection(&varmap, &device, "gelu");
+
+        // Eval arm, through the flag-less public convenience: no admission
+        // decision at all.
+        let before_eval = crate::activations::GELU_DISPATCH_COUNTERS.snapshot();
+        let eval_out = proj.forward_unnormalized(&x).unwrap();
+        let after_eval = crate::activations::GELU_DISPATCH_COUNTERS.snapshot();
+        assert_eq!(
+            (after_eval.fused, after_eval.eager),
+            (before_eval.fused, before_eval.eager),
+            "the projection's eval arm must take no admission decision"
+        );
+
+        // Training arm: exactly one fused dispatch, no eager fallback.
+        let before = crate::activations::GELU_DISPATCH_COUNTERS.snapshot();
+        let train_out = proj.forward_unnormalized_with_training(&x, true).unwrap();
+        let after = crate::activations::GELU_DISPATCH_COUNTERS.snapshot();
+        assert_eq!(
+            after.fused - before.fused,
+            1,
+            "the projection head evaluates GELU exactly once per forward"
+        );
+        assert_eq!(after.eager, before.eager, "no eager fallback on CPU F32");
+
+        let eval_v: Vec<f32> = eval_out.flatten_all().unwrap().to_vec1().unwrap();
+        let train_v: Vec<f32> = train_out.flatten_all().unwrap().to_vec1().unwrap();
+        assert_eq!(eval_v.len(), 8, "tiny_stage_config projection_dim");
+        let norm = eval_v.iter().map(|v| v * v).sum::<f32>().sqrt();
+        assert_finite_nonzero(norm, "projection output");
+        for (i, (&e, &t)) in eval_v.iter().zip(train_v.iter()).enumerate() {
+            assert_eq!(
+                e.to_bits(),
+                t.to_bits(),
+                "elem[{i}]: eval {e} vs training {t} -- CPU F32 fused GELU is bit-identical \
+                 to the eager call it replaces"
+            );
+        }
+    }
+
+    /// Negative control for the site above: the `"relu"` arm is a DIFFERENT
+    /// activation with no fused seam, so a training-mode projection forward
+    /// on it must move NEITHER GELU counter. Without this, a seam wired at
+    /// the wrong place (outside the `match`, say) would still satisfy the
+    /// `"gelu"`-arm count oracle while silently applying GELU admission
+    /// machinery to a ReLU network.
+    #[test]
+    fn projection_relu_arm_never_touches_the_gelu_seam() {
+        // Lock order: attention_cascade THEN layer_norm -- see this test's
+        // own doc.
+        let _attn_guard = crate::attention_cascade::ATTENTION_BLOCK_COUNTER_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let _ln_guard = crate::layer_norm::DISPATCH_COUNTER_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let device = Device::Cpu;
+        let varmap = VarMap::new();
+        let (proj, x) = build_projection(&varmap, &device, "relu");
+
+        let before = crate::activations::GELU_DISPATCH_COUNTERS.snapshot();
+        let out = proj.forward_unnormalized_with_training(&x, true).unwrap();
+        let after = crate::activations::GELU_DISPATCH_COUNTERS.snapshot();
+
+        assert_eq!(out.dims(), &[1, 8]);
+        assert_eq!(
+            (after.fused, after.eager),
+            (before.fused, before.eager),
+            "the relu arm must not reach the GELU seam"
         );
     }
 

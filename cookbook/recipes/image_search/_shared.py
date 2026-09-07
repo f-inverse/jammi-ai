@@ -21,7 +21,8 @@ IMAGE_CORPUS_DIR = FIXTURES / "tiny_image_corpus"
 GOLDEN_PATH = FIXTURES / "tiny_image_golden.json"
 
 # Default to the hermetic local fixture (offline CI). Override with
-# JAMMI_IMAGE_MODEL=patentclip/PatentCLIP_Vit_B for the federal use case.
+# JAMMI_IMAGE_MODEL=<a domain-specialized checkpoint, e.g.
+# patentclip/PatentCLIP_Vit_B> when the corpus is technical drawings.
 DEFAULT_MODEL = f"local:{FIXTURES / 'tiny_open_clip'}"
 MODEL = os.environ.get("JAMMI_IMAGE_MODEL", DEFAULT_MODEL)
 

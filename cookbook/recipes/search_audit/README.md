@@ -5,9 +5,10 @@ what model, what came back, and when.* The substrate signs each record, stores
 it tenant-scoped, and publishes it to a trigger topic — so you do not hand-roll
 an audit schema, a signature scheme, and a stream integration in every project.
 
-This is the primitive every audited-ML deployment (financial, healthcare,
-federal, legal) needs to answer "show me exactly what this model returned for
-this query, and prove the record hasn't been altered."
+This is the primitive every audited-ML deployment in a regulated setting
+(finance, healthcare, legal, and the like) needs to answer "show me exactly
+what this model returned for this query, and prove the record hasn't been
+altered."
 
 ## What this recipe shows
 

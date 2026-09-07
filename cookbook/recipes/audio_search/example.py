@@ -9,13 +9,23 @@ The numbered scripts (`01-load-corpus.py` ... `04-eval.py`) decompose the
 search-and-eval flow step by step; this file runs every phase in one process
 and is the version wired into `tests/cookbook_smoke.py`.
 
-Fine-tuning. Phase 5 trains a lightweight projection head on a *frozen* CLAP
-audio tower from `(anchor, positive, negative)` audio triplets and re-runs the
-eval, showing the tuned embeddings differ from the base. The triplets here are
-synthetic — positive = a same-family clip, negative = a different-family clip —
-but what makes a clip a "positive" (augmentation-similar, or co-occurring-
-complementary) is entirely the caller's data; the trainer only minimizes the
-contrastive objective over whatever clips you pair.
+Fine-tuning, two modes. Phase 5 trains a lightweight projection head on a
+*frozen* CLAP audio tower from `(anchor, positive, negative)` audio triplets and
+re-runs the eval, showing the tuned embeddings differ from the base. Phase 6
+runs the other mode on the same triplets: LoRA adapters injected INSIDE the
+HTSAT-Swin tower's own sites (`query`/`value` are the Swin blocks' attention
+projections, `linear1` the audio projection head's first linear), so the
+tower's representation itself moves rather than a new head learning on top of a
+frozen one. Both are real and both ship — the head is cheap and leaves the
+tower untouched, the tower adapter has more capacity and costs more compute.
+Phase 7 is the refusal: a `target_modules` list naming no site on this tower
+fails the JOB instead of quietly training zero parameters.
+
+The triplets here are synthetic — positive = a same-family clip, negative = a
+different-family clip — but what makes a clip a "positive"
+(augmentation-similar, or co-occurring-complementary) is entirely the caller's
+data; the trainer only minimizes the contrastive objective over whatever clips
+you pair.
 
 Model. The default model is the hermetic `htsat_clap_tiny` fixture so the recipe
 runs offline in CI in well under 60s. Any HuggingFace CLAP audio model works the
@@ -45,6 +55,7 @@ import pyarrow as pa
 import pyarrow.parquet as pq
 
 import jammi
+from jammi.errors import TrainingError
 
 REPO_ROOT = Path(__file__).resolve().parent.parent.parent.parent
 FIXTURES = REPO_ROOT / "cookbook" / "fixtures"
@@ -288,6 +299,121 @@ def main() -> int:
             f"(max |Δ| = {max_abs_diff:.2e} <= 1e-4) — the projection head did "
             "not change the embedding"
         )
+
+        # 6. The OTHER fine-tune mode, on the SAME triplets: a NON-empty
+        #    target_modules puts LoRA adapters INSIDE the HTSAT-Swin tower
+        #    itself. Phase 5's head learns a new map on top of a tower whose
+        #    weights never move; this leg moves the tower's own representation
+        #    — more capacity for a domain the base checkpoint never saw, at
+        #    more compute, and it needs the site names of THIS architecture
+        #    (`query`/`value` are the Swin blocks' attention projections,
+        #    indexed by stage; `linear1` is the audio projection head's first
+        #    linear, an unindexed site).
+        tower_job = db.fine_tune(
+            source="triplets",
+            base_model=MODEL,
+            columns=["anchor", "positive", "negative"],
+            method="lora",
+            task="audio_embedding",
+            target_modules=["query", "value", "linear1"],
+            lora_rank=4,
+            learning_rate=5e-3,
+            epochs=2,
+            batch_size=4,
+            warmup_steps=0,
+            validation_fraction=0.0,
+            early_stopping_metric="train_loss",
+        )
+        tower_job.wait()
+        tower_model = tower_job.model_id
+        assert tower_model.startswith("jammi:fine-tuned:"), (
+            f"unexpected fine-tuned model_id: {tower_model}"
+        )
+        print(f"tower-adapted audio model: {tower_model}")
+
+        # The adapted model registers in the catalog under the MEDIA task, so
+        # model resolution finds an audio encoder, not a text one. This is the
+        # most the *client* surface says about the artifact: the saved
+        # adapter's kind (encoder adapters, and which tower they were injected
+        # into) is engine-internal and is pinned by the engine's own
+        # integration tests, not readable from `describe_model` here. What this
+        # recipe can prove at the consumer surface is the next check: the
+        # served embedding actually moved.
+        described = db.describe_model(tower_model)
+        assert described is not None, f"{tower_model} missing from the catalog"
+        assert described["task"] == "audio_embedding", (
+            f"tower-adapted model registered under the wrong task: {described}"
+        )
+
+        # Same invariant as phase 5, one layer deeper: the adapted tower serves
+        # under the new model id, so the SAME query clip encodes differently.
+        # A LoRA delta that trained but was silently dropped at serve time
+        # would leave these two vectors identical. Change, not improvement —
+        # the fixture's weights are random, so the direction means nothing.
+        tower_query_vec = db.encode_query(
+            model=tower_model, query=query_wav, modality="audio"
+        )
+        assert len(tower_query_vec) == len(query_vec), (
+            "tower-adapted query embedding dim must match the base dim "
+            f"(base={len(query_vec)}, tuned={len(tower_query_vec)})"
+        )
+        tower_max_abs_diff = max(
+            abs(b - t) for b, t in zip(query_vec, tower_query_vec)
+        )
+        print(
+            f"query embedding max |Δ| (base vs tower-adapted): "
+            f"{tower_max_abs_diff:.6f}"
+        )
+        assert tower_max_abs_diff > 1e-4, (
+            "the tower adapter should change the served audio embedding: the "
+            "adapted query vector is identical to the base vector "
+            f"(max |Δ| = {tower_max_abs_diff:.2e} <= 1e-4) — the adapter was "
+            "trained but is not being applied when the model is served"
+        )
+
+        # 7. The refusal. `q_proj` is a real site name on plenty of decoder
+        #    checkpoints and on nothing in an HTSAT-Swin tower — exactly the
+        #    plausible-but-wrong string carried over from another
+        #    architecture's recipe. Selecting no site would train zero
+        #    parameters and publish an adapter that changes nothing, so the
+        #    engine fails the JOB instead, and the message names this tower's
+        #    real sites so the fix is a paste, not a search.
+        refused = db.fine_tune(
+            source="triplets",
+            base_model=MODEL,
+            columns=["anchor", "positive", "negative"],
+            method="lora",
+            task="audio_embedding",
+            target_modules=["q_proj"],
+            lora_rank=4,
+            epochs=1,
+            batch_size=4,
+            warmup_steps=0,
+            validation_fraction=0.0,
+            early_stopping_metric="train_loss",
+        )
+        try:
+            refused.wait()
+        except TrainingError as exc:
+            message = str(exc)
+            print(f"refused, as designed: {message}")
+            assert "q_proj" in message, (
+                f"the refusal must echo the submitted selector: {message}"
+            )
+            # `linear1` is the discriminating half: it appears ONLY in this
+            # tower's site list. (`query` also appears in the message's
+            # generic suffix-matching aside, so on its own it would not prove
+            # the audio tower's vocabulary was printed.)
+            assert "query" in message and "linear1" in message, (
+                "the refusal must name this tower's real site names so the "
+                f"caller can paste one: {message}"
+            )
+        else:
+            raise AssertionError(
+                "a target_modules list matching no site on the audio tower "
+                "must FAIL the job, never publish an empty adapter under a "
+                "fine-tuned model id"
+            )
 
     print("audio_search: OK")
     return 0

@@ -7,8 +7,9 @@ MRR / nDCG per query and in aggregate.
 
 This script MEASURES and REPORTS the numbers — it does not assert an accuracy
 target. The shipped fixture model has random weights (its numbers are
-meaningless); run with JAMMI_IMAGE_MODEL=patentclip/PatentCLIP_Vit_B to get
-real retrieval quality.
+meaningless); point JAMMI_IMAGE_MODEL at a real checkpoint — a
+domain-specialized one such as patentclip/PatentCLIP_Vit_B when the corpus is
+technical drawings — to get real retrieval quality.
 """
 
 from __future__ import annotations

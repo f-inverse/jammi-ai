@@ -90,8 +90,26 @@
 #                                    about to run is refused if a manifest
 #                                    for it already exists under $OUT_DIR
 #   PROFILE_421_STEPS_N/M            override the pinned 100/600
+#   PROFILE_421_P2_BF16              "1" runs the BF16 PRE-FLIGHT MODE
+#                                    (contract "## P2" / v2.3 §D4 item 4)
+#                                    instead of the 12-leg sweep, and exits:
+#                                    one untraced `finetune-run` per tower at
+#                                    `--backbone-dtype bf16 --lora-init
+#                                    gaussian`, 16 rows / batch 8 / 1 epoch
+#                                    plus an 8-row held-out, into
+#                                    `$OUT_DIR/p2-bf16/<tower>/`. The
+#                                    ASSERTIONS on those reports live in
+#                                    `profile_421_merge.py --p2-dir`.
 #
-# Hermetic self-tests: `python3 ci/scripts/perf/test_profile_421_legs_dry_run.py`.
+# MERGE STEP: `ci/scripts/perf/profile_421_merge.py` reads this driver's
+# `$OUT_DIR` and turns it into the per-(tower, dtype, leg) table the artifact
+# producer embeds -- the positive-proof equation (`fused + eager == census x
+# steps_measured`), the D-leg forced-eager proof, and the per-step
+# wall/front/busy/residual decomposition. This driver deliberately does not
+# judge its own output.
+#
+# Hermetic self-tests: `python3 ci/scripts/perf/test_profile_421_legs_dry_run.py`
+# and `python3 ci/scripts/perf/test_profile_421_merge.py`.
 
 set -euo pipefail
 
@@ -110,6 +128,11 @@ OUT_DIR="${OUT_DIR:-$REPO_ROOT/.profile-421-legs/$TS}"
 PROFILE_421_LEGS_ONLY="${PROFILE_421_LEGS_ONLY:-}"
 STEPS_N="${PROFILE_421_STEPS_N:-100}"
 STEPS_M="${PROFILE_421_STEPS_M:-600}"
+# The BF16 pre-flight mode (contract "## P2", restated in emitted terms by
+# v2.3 §D4 item 4). A MODE of this driver, not a separate script, so the P2
+# invocation is pinned in exactly the same file the 12 legs are -- see the
+# `p2_bf16_sweep` function below for what it runs and why.
+PROFILE_421_P2_BF16="${PROFILE_421_P2_BF16:-0}"
 
 # ── Contract-pinned workload constants (`## Declared workload`) ──────────
 # Every one of these is a CONTRACT value, not a tuning knob: changing one
@@ -126,6 +149,20 @@ AUDIO_SAMPLE_RATE=48000    # 9.5 s @ 48 kHz = 456000 frames exactly
 HELDOUT_ROWS=8             # one --batch of held-out rows (8 % 8 == 0)
 MEDIA_FAMILIES=6           # 4 train + 2 reserved held-out (producer refuses <4)
 MEDIA_HELDOUT_FAMILIES=2
+
+# The P2 BF16 pre-flight's own pinned shape (contract §D4 item 4): 16 train
+# rows at --batch 8 --epochs 1 = exactly 2 optimizer steps, which is what
+# makes `train_probe_series` two entries long (index 0 = the untrained
+# init probe, index 1 = after the single epoch) and therefore what makes
+# the "the Gaussian adapter MOVED the loss at step 1" assertion expressible
+# at all. `--lora-init gaussian` is the whole point of the pre-flight: under
+# the wire default ZerosB, `dL/dA == 0` at step 1 by construction, so the
+# two probes could not differ and a dtype bug would be indistinguishable
+# from a correctly-frozen adapter.
+P2_ROWS=16
+P2_HELDOUT_ROWS=8
+P2_BACKBONE_DTYPE=bf16
+P2_LORA_INIT=gaussian
 
 # Full LoRA site sets per tower (`finetune_run.rs::tower_site_names`).
 CLIP_FULL="in_proj,out_proj,c_fc,c_proj"
@@ -371,6 +408,9 @@ fi
 # overwriting a prior run's recorded result.
 _existing_manifest_conflicts=()
 for _leg_id in "${ALL_LEG_IDS[@]}"; do
+  # In P2 mode no leg manifest is ever written, so a pre-existing one is not
+  # a conflict; `p2_bf16_sweep` runs the same guard over its OWN outputs.
+  if [ "$PROFILE_421_P2_BF16" = "1" ]; then break; fi
   if [ -n "$PROFILE_421_LEGS_ONLY" ]; then
     case ",$PROFILE_421_LEGS_ONLY," in
       *",$_leg_id,"*) ;;
@@ -439,7 +479,8 @@ FAKE_NSYS_EOF
 #!/usr/bin/env bash
 set -euo pipefail
 # $1=steps_measured $2=golden_json_path $3=task $4=disable_keys(csv, may be
-# empty) -- emits the golden-derived Report envelope on ITS OWN stdout
+# empty) $5=lora_init $6=backbone_dtype -- emits the golden-derived Report
+# envelope on ITS OWN stdout
 # (never writes a file directly), so the exec-wrapper's own "redirect this
 # child's stdout to the report file" mechanism is what actually produces
 # the report, for real. The overridden fields are exactly the ones this
@@ -447,8 +488,8 @@ set -euo pipefail
 # than papered over.
 python3 -c '
 import copy, json, sys
-steps_measured, golden_path, task, disable_csv = (
-    int(sys.argv[1]), sys.argv[2], sys.argv[3], sys.argv[4]
+steps_measured, golden_path, task, disable_csv, lora_init, dtype = (
+    int(sys.argv[1]), sys.argv[2], sys.argv[3], sys.argv[4], sys.argv[5], sys.argv[6]
 )
 golden = json.load(open(golden_path))
 tier = copy.deepcopy(golden["tiers"]["finetune_run"])
@@ -459,7 +500,16 @@ tier = copy.deepcopy(golden["tiers"]["finetune_run"])
 tier["train_run_wall_s"] = 0.01 * steps_measured
 tier["steps_measured"] = steps_measured
 tier["task"] = task
-tier["lora_init"] = "zeros_b"
+tier["lora_init"] = lora_init
+tier["backbone_dtype"] = dtype
+# The ZerosB-vs-Gaussian PROBE SPLIT, mirrored rather than faked flat: under
+# `zeros_b` the B matrix is zero at step 0, so `dL/dA == 0` and the init
+# probe and the post-epoch probe are the SAME number by construction; under
+# `gaussian` they must differ (that IS the P2 pre-flight`s assertion). A
+# stub that emitted a moving series on BOTH arms would make the P2 check
+# pass vacuously, so this fake reproduces the real split.
+_p0 = 0.6
+tier["train_probe_series"] = [_p0, _p0 - 0.05] if lora_init == "gaussian" else [_p0, _p0]
 expected = sorted(k for k in disable_csv.split(",") if k)
 tier["kernels_disabled_expected"] = expected
 tier["kernels_disabled_requested"] = expected
@@ -482,7 +532,7 @@ else:
     tier["media_front_end_wall_s"] = None
 report = {"tool": "dry-run", "profile_421_dry_run": True, "tiers": {"finetune_run": tier}}
 json.dump(report, sys.stdout)
-' "$1" "$2" "$3" "$4"
+' "$1" "$2" "$3" "$4" "$5" "$6"
 echo "fake_bench: stderr noise too, never captured into the report" >&2
 FAKE_BENCH_EOF
   chmod +x "$DRY_RUN_STUB_DIR/fake_bench.sh"
@@ -616,7 +666,8 @@ run_traced() {
     exec_nsys_bin="$DRY_RUN_STUB_DIR/fake_nsys.sh"
     exec_cmd=(
       "${env_prefix[@]}"
-      "$DRY_RUN_STUB_DIR/fake_bench.sh" "$steps_this_run" "$GOLDEN_FIXTURE" "$task" "$disable_keys"
+      "$DRY_RUN_STUB_DIR/fake_bench.sh" "$steps_this_run" "$GOLDEN_FIXTURE" "$task" \
+        "$disable_keys" "$LORA_INIT" "$dtype"
     )
   fi
 
@@ -655,6 +706,22 @@ run_traced() {
 # what the N/M wall differencing requires. The HELD-OUT split is generated
 # ONCE per leg and shared by both runs (it is not part of the differenced
 # workload -- `--eval-cadence` is fixed, so its cost cancels).
+#
+# WHICH held-out split is shared is NOT a free choice for the TEXT tower
+# (contract v2.3 §D4 item 3). `gen_fixed_width_corpus.py` draws
+# `rows + heldout_rows` rows from ONE seeded stream and slices the held-out
+# half OFF THE END: at `--rows R` the held-out rows are stream indices
+# `[R, R + heldout_rows)`. Both text runs share `--seed 42` and differ only
+# in `--rows`, so the N run's held-out rows (indices `[800, 808)`) are
+# INSIDE the M run's train corpus (indices `[0, 4800)`) -- byte-identical
+# texts under the same stream. Only the M corpus's own held-out slice
+# (indices `[4800, 4808)`) sits past BOTH train corpora, so `$dir_m`'s
+# held-out pair is what both runs are given. The two media producers are
+# NOT affected: they reserve `--heldout-families` out of the family pool, so
+# a held-out row's family never appears in EITHER train split regardless of
+# row count, and each of those arms keeps using its own `$dir_n` split.
+# `test_profile_421_legs_dry_run.py` drives the real (hermetic) text
+# producer and asserts no held-out anchor text appears in either train file.
 provision_corpus() {
   local tower="$1" leg_dir="$2"
   local rows_n=$(( BATCH * STEPS_N ))
@@ -672,10 +739,12 @@ provision_corpus() {
         --heldout-rows "$HELDOUT_ROWS" --heldout-batch "$BATCH" || return 1
       if [ "$PROFILE_421_LEGS_DRY_RUN" = "1" ]; then
         : > "$dir_n/train.jsonl"; : > "$dir_m/train.jsonl"
-        : > "$dir_n/heldout_ids.txt"; : > "$dir_n/heldout_triplets.jsonl"
+        : > "$dir_m/heldout_ids.txt"; : > "$dir_m/heldout_triplets.jsonl"
       fi
+      # `$dir_m`, NOT `$dir_n` -- see this function's own doc: only the M
+      # corpus's held-out slice is past BOTH train corpora's stream indices.
       printf '%s\t%s\t%s\t%s\n' "$dir_n/train.jsonl" "$dir_m/train.jsonl" \
-        "$dir_n/heldout_ids.txt" "$dir_n/heldout_triplets.jsonl"
+        "$dir_m/heldout_ids.txt" "$dir_m/heldout_triplets.jsonl"
       ;;
     clip-vision)
       run_cmd python3 "$DIR/gen_fixed_shape_image_corpus.py" --rows "$rows_n" \
@@ -967,6 +1036,206 @@ run_leg() {
   fi
   return 0
 }
+
+# =====================================================================
+# P2 -- the BF16 pre-flight (contract "## P2", restated in emitted terms by
+# v2.3 §D4 item 4). Its own MODE of this driver (`PROFILE_421_P2_BF16=1`),
+# never a separate script, so the pod session's P2 invocation is pinned in
+# the SAME file the 12 legs are and cannot drift from them.
+#
+# Per tower, ONE untraced `finetune-run`:
+#   --backbone-dtype bf16 --lora-init gaussian, 16 train rows at --batch 8
+#   --epochs 1 (= 2 optimizer steps), plus an 8-row held-out split.
+#
+# UNTRACED on purpose: nsys buys nothing here. P2 asks a QUALITATIVE
+# question ("does the bf16 backbone train at all, and does a non-degenerate
+# adapter actually move the loss?"), not a timing one, and wrapping it in a
+# profiler would make the pre-flight depend on the very tool whose absence
+# it is meant to be able to report before the legs. The stdout capture still
+# goes through the same `bash -c 'exec ... > "$0"'` redirect the traced legs
+# use, so the report file is produced by the same mechanism.
+#
+# This driver only RUNS P2 and records what came back (the report + the exit
+# status); the ASSERTIONS on it -- exit 0, `final_loss_diagnostic` finite,
+# `train_probe_series[0] != train_probe_series[1]`, `lora_linear_fused` and
+# `layer_norm_fused` fused counters > 0 -- live in
+# `ci/scripts/perf/profile_421_merge.py`'s `--p2-dir` mode, one reader, one
+# place, tested hermetically there. A driver that also judged its own output
+# would be two implementations of the same rule.
+p2_run_one() {
+  local tower="$1" task="$2" model_dir="$3" p2_dir="$4" target_modules="$5"
+  local corpus_dir="$p2_dir/corpus"
+  local train_jsonl heldout_ids heldout_jsonl
+
+  case "$tower" in
+    clip-text)
+      mkdir -p "$corpus_dir"
+      run_cmd python3 "$DIR/gen_fixed_width_corpus.py" --rows "$P2_ROWS" \
+        --min-wordpieces "$CLIP_TEXT_SEQ" --seed "$SEED" --out "$corpus_dir/train.jsonl" \
+        --heldout-rows "$P2_HELDOUT_ROWS" --heldout-batch "$BATCH" || return 1
+      train_jsonl="$corpus_dir/train.jsonl"
+      ;;
+    clip-vision)
+      run_cmd python3 "$DIR/gen_fixed_shape_image_corpus.py" --rows "$P2_ROWS" \
+        --size "$IMAGE_SIZE" --seed "$SEED" --out-dir "$corpus_dir" \
+        --families "$MEDIA_FAMILIES" --heldout-families "$MEDIA_HELDOUT_FAMILIES" \
+        --heldout-rows "$P2_HELDOUT_ROWS" --heldout-batch "$BATCH" || return 1
+      train_jsonl="$corpus_dir/triplets.jsonl"
+      ;;
+    htsat)
+      run_cmd python3 "$DIR/gen_fixed_length_audio_corpus.py" --rows "$P2_ROWS" \
+        --seconds "$AUDIO_SECONDS" --sample-rate "$AUDIO_SAMPLE_RATE" --seed "$SEED" \
+        --out-dir "$corpus_dir" --families "$MEDIA_FAMILIES" \
+        --heldout-families "$MEDIA_HELDOUT_FAMILIES" \
+        --heldout-rows "$P2_HELDOUT_ROWS" --heldout-batch "$BATCH" || return 1
+      train_jsonl="$corpus_dir/triplets.jsonl"
+      ;;
+    *)
+      echo "::error::p2_run_one: unknown tower '$tower'" >&2
+      return 1
+      ;;
+  esac
+  heldout_ids="$corpus_dir/heldout_ids.txt"
+  heldout_jsonl="$corpus_dir/heldout_triplets.jsonl"
+  if [ "$PROFILE_421_LEGS_DRY_RUN" = "1" ]; then
+    mkdir -p "$corpus_dir"
+    : > "$train_jsonl"; : > "$heldout_ids"; : > "$heldout_jsonl"
+  fi
+
+  # The full P2 command line, pinned here. Everything the legs pin is
+  # repeated verbatim EXCEPT the two knobs P2 exists to vary
+  # (`--backbone-dtype bf16`, `--lora-init gaussian`), so a P2 failure
+  # cannot be blamed on some third difference from the legs.
+  local -a cmd=(
+    "$BENCH_BIN" finetune-run
+    --model-dir "$model_dir" --arm fused --task "$task"
+    --train-jsonl "$train_jsonl" --heldout-ids "$heldout_ids" --heldout-jsonl "$heldout_jsonl"
+    --seed "$SEED" --epochs 1 --batch "$BATCH" --objective "$OBJECTIVE"
+    --validation-fraction 0 --early-stopping-metric train_loss --grad-accum 1
+    --early-stopping-patience 10000 --backbone-dtype "$P2_BACKBONE_DTYPE"
+    --lora-rank 8 --lora-alpha 16 --lora-dropout 0.05
+    --lora-init "$P2_LORA_INIT"
+    --target-modules "$target_modules"
+    --max-seq-length "$CLIP_TEXT_SEQ"
+    --eval-cadence "$EVAL_CADENCE"
+    --work-dir "$p2_dir/work" --cuda 0
+  )
+  local -a exec_cmd=("${cmd[@]}")
+  if [ "$PROFILE_421_LEGS_DRY_RUN" = "1" ]; then
+    exec_cmd=(
+      "$DRY_RUN_STUB_DIR/fake_bench.sh" 2 "$GOLDEN_FIXTURE" "$task" "" \
+        "$P2_LORA_INIT" "$P2_BACKBONE_DTYPE"
+    )
+  fi
+
+  mkdir -p "$p2_dir/work" || return 1
+  _print_cmd "${cmd[@]}"
+  local rc=0
+  bash -c 'exec "$1" "${@:2}" > "$0"' "$p2_dir/run.json" "${exec_cmd[@]}" \
+    2> "$p2_dir/run.stderr" || rc=$?
+  P2_EXIT="$rc"
+  if [ "$rc" -eq 0 ]; then
+    local validate_err
+    if ! validate_err="$(_validate_report_envelope "$p2_dir/run.json" 2>&1)"; then
+      printf '%s\n' "$validate_err" | tee -a "$p2_dir/run.stderr" >&2
+      return 1
+    fi
+  fi
+  return "$rc"
+}
+
+# Writes one tower's P2 manifest. Like `_write_manifest`, a write failure
+# here is FATAL: an unrecorded pre-flight result is worse than none.
+_write_p2_manifest() {
+  P2M_TOWER="$1" P2M_TASK="$2" P2M_GIT_SHA="$3" P2M_BOX="$4" P2M_DTYPE="$5" \
+  P2M_LORA_INIT="$6" P2M_ROWS="$7" P2M_HELDOUT_ROWS="$8" P2M_BATCH="$9" \
+  P2M_EPOCHS="${10}" P2M_OBJECTIVE="${11}" P2M_TARGET_MODULES="${12}" \
+  P2M_EXIT="${13}" P2M_STATUS="${14}" P2M_REASON="${15}" P2M_DRY_RUN="${16}" \
+  P2M_OUT="${17}" \
+  python3 -c '
+import json, os
+
+manifest = {
+    "mode": "p2-bf16-preflight",
+    "driver": "ci/scripts/perf/profile_421_legs.sh",
+    "tower": os.environ["P2M_TOWER"],
+    "task": os.environ["P2M_TASK"],
+    "git_sha": os.environ["P2M_GIT_SHA"],
+    "box": os.environ["P2M_BOX"],
+    "backbone_dtype": os.environ["P2M_DTYPE"],
+    "lora_init": os.environ["P2M_LORA_INIT"],
+    "rows": int(os.environ["P2M_ROWS"]),
+    "heldout_rows": int(os.environ["P2M_HELDOUT_ROWS"]),
+    "batch": int(os.environ["P2M_BATCH"]),
+    "epochs": int(os.environ["P2M_EPOCHS"]),
+    "objective": os.environ["P2M_OBJECTIVE"],
+    "target_modules": os.environ["P2M_TARGET_MODULES"].split(","),
+    # The RUN`s own exit status, recorded as an integer -- `profile_421_merge.py`
+    # asserts it is 0 rather than inferring success from the report existing.
+    "exit": int(os.environ["P2M_EXIT"]),
+    "status": os.environ["P2M_STATUS"],
+    "reason": os.environ["P2M_REASON"],
+    "dry_run": os.environ["P2M_DRY_RUN"] == "true",
+}
+json.dump(manifest, open(os.environ["P2M_OUT"], "w"), indent=1)
+'
+}
+
+p2_bf16_sweep() {
+  local dry_run_flag="false"
+  if [ "$PROFILE_421_LEGS_DRY_RUN" = "1" ]; then dry_run_flag="true"; fi
+  local root="$OUT_DIR/p2-bf16"
+
+  local tower
+  local conflicts=()
+  for tower in clip-text clip-vision htsat; do
+    if [ -f "$root/$tower/manifest.json" ]; then conflicts+=("$tower"); fi
+  done
+  if [ "${#conflicts[@]}" -gt 0 ]; then
+    echo "::error::OUT_DIR ($OUT_DIR) already has a P2 manifest for tower(s): ${conflicts[*]} -- refusing to silently overwrite; use a fresh OUT_DIR." >&2
+    exit 2
+  fi
+
+  for tower in clip-text clip-vision htsat; do
+    local task model_dir target_modules
+    case "$tower" in
+      clip-text)   task=text_embedding;  model_dir="$MODEL_DIR_CLIP"; target_modules="$CLIP_FULL" ;;
+      clip-vision) task=image_embedding; model_dir="$MODEL_DIR_CLIP"; target_modules="$CLIP_FULL" ;;
+      htsat)       task=audio_embedding; model_dir="$MODEL_DIR_CLAP"; target_modules="$CLAP_FULL" ;;
+    esac
+    echo "=== P2 bf16 pre-flight: tower=$tower task=$task dtype=$P2_BACKBONE_DTYPE lora_init=$P2_LORA_INIT rows=$P2_ROWS batch=$BATCH epochs=1 ==="
+
+    local p2_dir="$root/$tower"
+    local status="ok" reason=""
+    P2_EXIT=1
+    if ! mkdir -p "$p2_dir"; then
+      echo "::error::P2 $tower: could not create $p2_dir -- aborting (a pre-flight result that cannot be recorded is not a pre-flight)." >&2
+      exit 1
+    fi
+    if ! p2_run_one "$tower" "$task" "$model_dir" "$p2_dir" "$target_modules"; then
+      status="invalid"
+      reason="the P2 bf16 pre-flight run failed (exit $P2_EXIT, or its report failed envelope validation) -- see $p2_dir/run.stderr"
+    fi
+
+    if ! _write_p2_manifest "$tower" "$task" "$SHA" "$(hostname)" "$P2_BACKBONE_DTYPE" \
+        "$P2_LORA_INIT" "$P2_ROWS" "$P2_HELDOUT_ROWS" "$BATCH" 1 "$OBJECTIVE" \
+        "$target_modules" "$P2_EXIT" "$status" "$reason" "$dry_run_flag" \
+        "$p2_dir/manifest.json"; then
+      echo "::error::P2 $tower: could not write $p2_dir/manifest.json -- aborting." >&2
+      exit 1
+    fi
+    if [ "$status" != "ok" ]; then
+      echo "::warning::P2 $tower: INVALID -- $reason (recorded in $p2_dir/manifest.json; the sweep continues)." >&2
+    fi
+  done
+  echo "profile_421_legs: P2 bf16 pre-flight done -- artifacts under $root"
+  echo "::notice::assert them with: python3 ci/scripts/perf/profile_421_merge.py --p2-dir $root --out $root/p2_verdicts.json"
+}
+
+if [ "$PROFILE_421_P2_BF16" = "1" ]; then
+  p2_bf16_sweep
+  exit 0
+fi
 
 for spec in "${LEGS[@]}"; do
   run_leg "$spec"

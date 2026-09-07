@@ -1531,9 +1531,9 @@ pub struct FinetuneStepTier {
     /// or because the admission predicate failed for any other stated
     /// reason.
     pub geglu_eager_dispatches: u64,
-    /// How many times BERT's/DistilBERT's training-mode fused GELU-erf
-    /// activation kernel (`jammi_kernels::ops::GeluErfFused`, admit key
-    /// `gelu_erf_fused`) actually dispatched during this run — the same
+    /// How many times the training-mode fused GELU-erf activation kernel
+    /// (`jammi_kernels::ops::GeluErfFused`, admit key `gelu_erf_fused`)
+    /// actually dispatched during this run — the same
     /// positive-proof channel as `ln_fused_dispatches` /
     /// `rope_fused_dispatches` / `softmax_fused_dispatches` /
     /// `geglu_fused_dispatches`, for the C-MLP fused-kernels commit (see
@@ -1545,15 +1545,47 @@ pub struct FinetuneStepTier {
     /// the one production actually dispatches through), the same
     /// process-wide registry `adamw_fused_dispatches` reads directly
     /// rather than through a crate-local wrapper — this counter has no
-    /// `jammi_encoders`-side snapshot function of its own, since the call
-    /// site is wired at exactly two places (`bert.rs`, `distilbert.rs`)
-    /// and both are already this crate's own dependency. Distinct from
-    /// GeGLU's INTERNAL `gelu_erf` composition step counted (as eager,
-    /// always) inside `geglu_eager_dispatches` above: ModernBERT's FFN
-    /// never calls the standalone `gelu_erf` seam this counter tracks, so
-    /// a ModernBert run reads this pair `0`/`0` by construction, not by
-    /// domain decline — see [`Self::attention_block_fused_dispatches`]'s
-    /// doc for the parallel BERT/ModernBert split on that counter.
+    /// `jammi_encoders`-side snapshot function of its own.
+    ///
+    /// ## The FOUR seam sites this pair sums over (corrected in #421 P1-a)
+    ///
+    /// This doc previously said the seam was "wired at exactly two places
+    /// (`bert.rs`, `distilbert.rs`)" and described the counter as
+    /// BERT-family-only. That was true when it was written and is now
+    /// false: #421 P1-a routed HTSAT's two activation sites through the
+    /// same house seam. As of that commit
+    /// `jammi_encoders::activations::gelu_erf` is called from FOUR places,
+    /// and this counter is their SUM (they all report to the one
+    /// process-wide `gelu_erf_fused` registry entry):
+    ///
+    /// 1. `BertIntermediate::forward` (`jammi_encoders::bert`) — once per
+    ///    encoder layer per forward.
+    /// 2. `DistilBertFfn::forward` (`jammi_encoders::distilbert`) — once
+    ///    per layer per forward.
+    /// 3. `SwinBlock::forward`'s MLP (`jammi_encoders::htsat_audio`) —
+    ///    once per Swin block, i.e. `sum(depths)` per forward.
+    /// 4. `ClapAudioProjection`'s training-threaded forward
+    ///    (`jammi_encoders::htsat_audio`) — once per forward, and ONLY
+    ///    when that head's `projection_hidden_act` is `"gelu"`; a `relu`
+    ///    head contributes nothing.
+    ///
+    /// So an HTSAT run's per-forward count is `sum(depths) +
+    /// [projection_hidden_act == "gelu"]`, that tower's own module doc
+    /// carries the arithmetic, and a downstream reader that needs the
+    /// per-forward call count reads it off the run's own witnessed
+    /// `FinetuneRunTier::fusible_site_census` rather than deriving it
+    /// from a model name. The CLIP towers are the OTHER end of the same
+    /// fact: their MLP activation is `quick_gelu`, which has no fused seam
+    /// at all, so a `text_embedding`/`image_embedding` leg reads this pair
+    /// `0`/`0` by construction.
+    ///
+    /// Distinct from GeGLU's INTERNAL `gelu_erf` composition step counted
+    /// (as eager, always) inside `geglu_eager_dispatches` above:
+    /// ModernBERT's FFN never calls the standalone `gelu_erf` seam this
+    /// counter tracks, so a ModernBert run also reads this pair `0`/`0` by
+    /// construction, not by domain decline — see
+    /// [`Self::attention_block_fused_dispatches`]'s doc for the parallel
+    /// BERT/ModernBert split on that counter.
     pub gelu_fused_dispatches: u64,
     /// How many times that same call site fell back to the eager
     /// (`Tensor::gelu_erf`) composition instead — outside the fused
@@ -2282,17 +2314,29 @@ pub struct FinetuneRunTier {
     pub softmax_eager_dispatches: u64,
     pub geglu_fused_dispatches: u64,
     pub geglu_eager_dispatches: u64,
-    /// The BERT-family GELU-erf positive-proof pair (C-MLP): mirrors
+    /// The GELU-erf positive-proof pair (C-MLP): mirrors
     /// [`FinetuneStepTier::gelu_fused_dispatches`]'s own doc for the
-    /// production call site and the read API
+    /// production call sites and the read API
     /// (`jammi_kernels::admission::counters_for("gelu_erf_fused")`, taken as a
     /// before/after delta over this run's whole resume-cycled epoch loop,
-    /// the same convention every counter in this block uses). ModernBert
-    /// never calls the standalone `gelu_erf` seam this pair tracks (its
-    /// FFN activation is GeGLU, counted above), so a `modernbert` leg
-    /// reads this pair `0`/`0` by construction, the mirror image of
+    /// the same convention every counter in this block uses).
+    ///
+    /// It sums FOUR seam sites, not the two the BERT family alone
+    /// contributes (corrected in #421 P1-a, which routed HTSAT's MLP and
+    /// projection-head activations through the same
+    /// `jammi_encoders::activations::gelu_erf` seam) — the peer field's own
+    /// doc enumerates all four and gives the per-forward arithmetic. Two
+    /// classes of leg read this pair `0`/`0` BY CONSTRUCTION rather than by
+    /// domain decline, and for two different reasons: `modernbert`, whose
+    /// FFN activation is GeGLU (counted above) and which never calls the
+    /// standalone seam at all — the mirror image of
     /// [`Self::attention_block_fused_dispatches`]'s BERT-family split
-    /// below.
+    /// below — and the two CLIP towers, whose MLP activation is
+    /// `quick_gelu`, an activation with no fused seam and therefore no
+    /// admit key. Which of those a given leg is, is not inferred from the
+    /// model name: `fusible_site_census.gelu_seam_calls_per_forward` on
+    /// this same tier states the witnessed per-forward count, and it is `0`
+    /// for both.
     pub gelu_fused_dispatches: u64,
     pub gelu_eager_dispatches: u64,
     pub lora_epilogue_fused_dispatches: u64,

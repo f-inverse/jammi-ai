@@ -37,6 +37,7 @@ from __future__ import annotations
 
 import json
 import os
+import shlex
 import stat
 import subprocess
 import tempfile
@@ -324,6 +325,106 @@ class DryRunSmokeTests(unittest.TestCase):
                 _manifest(out_dir, "clip-text-A1")["media_front_end_wall_s"],
                 {"n": None, "m": None},
                 "a text leg has no media front end at all",
+            )
+
+    def test_the_text_legs_heldout_split_is_disjoint_from_BOTH_train_corpora(self):
+        """Contract v2.3 §D4 item 3, proven by DRIVING THE REAL PRODUCER.
+
+        `gen_fixed_width_corpus.py` draws `rows + heldout_rows` rows from one
+        seeded stream and slices the held-out half off the END, so at
+        `--rows R` the held-out rows are stream indices `[R, R+8)`. The two
+        text runs share `--seed 42` and differ only in `--rows`, which makes
+        the N run's held-out rows (indices `[800, 808)`) BYTE-IDENTICAL to
+        rows the M run TRAINS on (indices `[0, 4800)`). Only the M corpus's
+        own held-out slice sits past both train corpora.
+
+        This test takes the driver's OWN printed command lines -- the two
+        producer invocations AND the `--heldout-ids`/`--heldout-jsonl` paths
+        it hands `finetune-run` -- executes the (hermetic, CPU-only)
+        producers for real, and asserts no held-out text appears in either
+        train file. It then asserts the CONVERSE for the `corpus_n` split
+        the driver used to pass, so the check is demonstrably not vacuous:
+        if this test could pass with either choice, it would prove nothing.
+        """
+        with tempfile.TemporaryDirectory() as out_dir:
+            result = run_dry(out_dir, legs_only="clip-text-A1")
+            self.assertEqual(result.returncode, 0, _fail_msg(result))
+
+            producer_cmds = []
+            run_cmds = []
+            for line in result.stderr.splitlines():
+                if not line.startswith("+ "):
+                    continue
+                argv = shlex.split(line[2:])
+                if any(a.endswith("gen_fixed_width_corpus.py") for a in argv):
+                    producer_cmds.append(argv)
+                elif "--heldout-ids" in argv:
+                    run_cmds.append(argv)
+            self.assertEqual(len(producer_cmds), 2, result.stderr)
+            self.assertEqual(len(run_cmds), 2, result.stderr)
+
+            # Run the producers for real, exactly as the driver would.
+            for argv in producer_cmds:
+                produced = subprocess.run(argv, capture_output=True, text=True, timeout=600)
+                self.assertEqual(produced.returncode, 0,
+                                 f"{argv}\n{produced.stdout}\n{produced.stderr}")
+
+            heldout_paths = set()
+            train_paths = []
+            for argv in run_cmds:
+                heldout_paths.add(argv[argv.index("--heldout-jsonl") + 1])
+                heldout_paths.add(argv[argv.index("--heldout-ids") + 1])
+                train_paths.append(argv[argv.index("--train-jsonl") + 1])
+            # BOTH runs are handed the SAME held-out split, and it is the M
+            # corpus's -- the only one past both train corpora.
+            self.assertEqual(
+                sorted(heldout_paths),
+                sorted([
+                    os.path.join(out_dir, "clip-text-A1", "corpus_m", "heldout_ids.txt"),
+                    os.path.join(out_dir, "clip-text-A1", "corpus_m", "heldout_triplets.jsonl"),
+                ]),
+                result.stderr,
+            )
+
+            def texts(path):
+                out = set()
+                with open(path, encoding="utf-8") as f:
+                    for line in f:
+                        row = json.loads(line)
+                        out.update((row["anchor_text"], row["positive_text"],
+                                    row["negative_text"]))
+                return out
+
+            heldout_m = texts(
+                os.path.join(out_dir, "clip-text-A1", "corpus_m", "heldout_triplets.jsonl")
+            )
+            self.assertEqual(len(heldout_m), 3 * 8, "8 held-out triplets, 3 distinct texts each")
+            train_n_texts = texts(train_paths[0])
+            train_m_texts = texts(train_paths[1])
+            # The producers really did run at the pinned row counts (batch 8
+            # x steps 100/600) -- otherwise "no overlap" could just mean
+            # "one of these files is empty".
+            def rows(path):
+                with open(path, encoding="utf-8") as f:
+                    return sum(1 for line in f if line.strip())
+
+            self.assertEqual(rows(train_paths[0]), 800)
+            self.assertEqual(rows(train_paths[1]), 4800)
+            self.assertEqual(heldout_m & train_n_texts, set(),
+                             "a held-out text appears in the N train corpus")
+            self.assertEqual(heldout_m & train_m_texts, set(),
+                             "a held-out text appears in the M train corpus")
+
+            # Non-vacuity: the `corpus_n` split -- what this driver passed
+            # before §D4 item 3 -- IS inside the M train corpus. Were the
+            # driver to go back to it, the assertions above would fire.
+            heldout_n = texts(
+                os.path.join(out_dir, "clip-text-A1", "corpus_n", "heldout_triplets.jsonl")
+            )
+            self.assertTrue(
+                heldout_n and heldout_n <= train_m_texts,
+                "the N corpus's held-out rows must be a SUBSET of the M train corpus -- if they "
+                "were not, this test would pass no matter which split the driver chose",
             )
 
     def test_legs_only_filter_runs_exactly_the_named_legs(self):

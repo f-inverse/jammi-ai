@@ -94,6 +94,26 @@ class DryRunSmokeTests(unittest.TestCase):
                         )
                         self.assertEqual(leg["steps_measured"], 100)
 
+    def test_frontend_ab_repeats_widens_the_leg_set_to_r1_through_rn(self):
+        # FRONTEND_AB_REPEATS=3 -- non-vacuous: the default (2) already
+        # writes r1/r2, so this asserts r3 SPECIFICALLY exists, which a
+        # driver that silently ignored the knob would never produce.
+        with tempfile.TemporaryDirectory() as out_dir:
+            result = run_dry(out_dir, extra_env={"FRONTEND_AB_REPEATS": "3"})
+            self.assertEqual(result.returncode, 0, _fail_msg(result))
+            report = _report(out_dir)
+            self.assertEqual(report["repeats"], 3)
+            for tower in TOWERS:
+                for role in ROLES:
+                    self.assertIn("r3", report["towers"][tower][role])
+                    self.assertEqual(report["towers"][tower][role]["r3"]["outcome"], "OK")
+
+    def test_a_non_positive_frontend_ab_repeats_refuses_before_any_leg_runs(self):
+        with tempfile.TemporaryDirectory() as out_dir:
+            result = run_dry(out_dir, extra_env={"FRONTEND_AB_REPEATS": "0"})
+            self.assertEqual(result.returncode, 2, _fail_msg(result))
+            self.assertIn("FRONTEND_AB_REPEATS", result.stderr)
+
     def test_default_knobs_produce_a_pass_shaped_bar(self):
         # P = 13 -> ideal = 12; ratio = 0.10 sits inside [lower, upper] for
         # every r -- see frontend_ab.sh's own module doc.
@@ -210,7 +230,12 @@ class BarVerdictTests(unittest.TestCase):
             self.assertEqual(result.returncode, 0, _fail_msg(result))
             bar = _report(out_dir)["htsat_bar"]
             self.assertEqual(bar["verdict"], "UNRESOLVED")
-            self.assertGreater(bar["base_to_base_spread_s"], 0.0)
+            # A genuinely non-degenerate interval (the base-to-base spread
+            # the r2 override introduces) -- ratio_lo/ratio_hi propagate
+            # BOTH arms' observed repeats, never a `spread / mean` fraction
+            # added onto the point estimate (see frontend_ab_merge.py's own
+            # module doc for the units-error class that replaces).
+            self.assertLess(bar["ratio_lo"], bar["ratio_hi"])
 
     def test_a_bar_verdict_never_fails_the_scripts_own_exit_code(self):
         # The bar is RECORDED, never gated -- a FAIL-shaped bar is still a

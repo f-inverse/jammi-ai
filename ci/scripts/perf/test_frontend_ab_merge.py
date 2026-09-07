@@ -193,6 +193,156 @@ class FullBuildReportTests(unittest.TestCase):
         self.assertEqual(report["towers"]["htsat"]["base"]["r1"]["outcome"], "FAIL")
 
 
+class IntervalBarDecisionTests(unittest.TestCase):
+    """The interval-propagation rule (`ratio_lo`/`ratio_hi`, never a
+    `spread(base) / mean(base)` term added onto `ratio` -- the units error
+    that made almost any real result read UNRESOLVED). Every htsat leg
+    below is written with its OWN front_per_step (never uniform across
+    repeats), so `ratio_lo`/`ratio_hi` are genuinely the extremes of two
+    non-degenerate sets, not a min==max==mean degenerate case. P = 13 ->
+    ideal = 12, r = 0 -> lower_bound = 1/12 = 0.08333,
+    upper_bound = 1/6 = 0.16667 (same machine model every other suite in
+    this directory pins)."""
+
+    LOWER = 1.0 / 12.0
+    UPPER = 1.0 / 6.0
+
+    def _write_htsat(self, raw_dir, base_fronts, tip_fronts, p=13, steps=100):
+        for role, fronts in (("base", base_fronts), ("tip", tip_fronts)):
+            for i, front in enumerate(fronts, start=1):
+                tier = {
+                    "steps_measured": steps,
+                    "media_front_end_wall_s": front * steps,
+                    "train_run_wall_s": 0.15 * steps,
+                }
+                if role == "tip":
+                    tier["rayon_pool_threads"] = p
+                _write_leg(raw_dir, "htsat", role, f"r{i}", {"tiers": {"finetune_run": tier}})
+        # clip-vision is report-only and never gates htsat_bar -- filled in
+        # with the same shape so `status` reads GREEN.
+        for role, fronts in (("base", base_fronts), ("tip", tip_fronts)):
+            for i, front in enumerate(fronts, start=1):
+                tier = {
+                    "steps_measured": steps,
+                    "media_front_end_wall_s": front * steps,
+                    "train_run_wall_s": 0.15 * steps,
+                }
+                if role == "tip":
+                    tier["rayon_pool_threads"] = p
+                _write_leg(
+                    raw_dir, "clip-vision", role, f"r{i}", {"tiers": {"finetune_run": tier}}
+                )
+
+    def _bar(self, base_fronts, tip_fronts):
+        with tempfile.TemporaryDirectory() as raw_dir:
+            self._write_htsat(raw_dir, base_fronts, tip_fronts)
+            report = frontend_ab_merge.build_report(
+                Path(raw_dir), r=0.0, n=24, tip_sha="t" * 40, base_sha="b" * 40,
+                box="test-box", dry_run=True, repeats=len(base_fronts),
+            )
+        self.assertEqual(report["status"], "GREEN", report)
+        return report["htsat_bar"]
+
+    def test_whole_interval_inside_the_bounds_reads_pass(self):
+        # ratio_lo = 0.011/0.10 = 0.11, ratio_hi = 0.013/0.10 = 0.13 --
+        # both inside [0.08333, 0.16667].
+        bar = self._bar(base_fronts=[0.10, 0.10], tip_fronts=[0.011, 0.013])
+        self.assertAlmostEqual(bar["ratio_lo"], 0.11)
+        self.assertAlmostEqual(bar["ratio_hi"], 0.13)
+        self.assertEqual(bar["verdict"], "PASS", bar)
+
+    def test_whole_interval_above_upper_reads_fail(self):
+        # ratio_lo = 0.030/0.10 = 0.30 > upper_bound (0.16667): the
+        # WORST-case tip/base pairing is already too slow.
+        bar = self._bar(base_fronts=[0.10, 0.10], tip_fronts=[0.030, 0.032])
+        self.assertGreater(bar["ratio_lo"], self.UPPER)
+        self.assertEqual(bar["verdict"], "FAIL", bar)
+
+    def test_whole_interval_below_lower_reads_invalid_beats_ideal(self):
+        # ratio_hi = 0.006/0.10 = 0.06 < lower_bound (0.08333): even the
+        # BEST-case tip/base pairing beats the machine model's own ideal.
+        bar = self._bar(base_fronts=[0.10, 0.10], tip_fronts=[0.005, 0.006])
+        self.assertLess(bar["ratio_hi"], self.LOWER)
+        self.assertEqual(bar["verdict"], "INVALID_BEATS_IDEAL", bar)
+
+    def test_a_bound_strictly_inside_the_interval_reads_unresolved(self):
+        # [ratio_lo, ratio_hi] = [0.10, 0.20] straddles upper_bound
+        # (0.16667): neither "whole interval clears the bar" nor "whole
+        # interval fails" holds.
+        bar = self._bar(base_fronts=[0.10, 0.10], tip_fronts=[0.010, 0.020])
+        self.assertLess(bar["ratio_lo"], self.UPPER)
+        self.assertGreater(bar["ratio_hi"], self.UPPER)
+        self.assertEqual(bar["verdict"], "UNRESOLVED", bar)
+
+    def test_three_repeats_widens_the_interval_the_same_way(self):
+        # FRONTEND_AB_REPEATS=3 -- r1..r3 leg files, same rule, just more
+        # observations feeding min()/max().
+        bar = self._bar(base_fronts=[0.10, 0.10, 0.10], tip_fronts=[0.011, 0.013, 0.012])
+        self.assertAlmostEqual(bar["ratio_lo"], 0.11)
+        self.assertAlmostEqual(bar["ratio_hi"], 0.13)
+        self.assertEqual(bar["verdict"], "PASS", bar)
+
+
+class RealRehearsalIntervalRegressionTests(unittest.TestCase):
+    """The exact numbers the real A/B rehearsal on pod p421b produced
+    (`fixtures/frontend_ab_rehearsal/PROVENANCE.md`'s own htsat legs, all
+    8 real reports -- not the single envelope-trimmed cut
+    `RealEnvelopeFixtureTests` drives). Pins `ratio_lo`/`ratio_hi` to the
+    hand-computed values a reviewer can re-derive from the raw numbers
+    directly (`min(tip)/max(base)`, `max(tip)/min(base)`), never a value
+    merely copied out of a prior run of this same code."""
+
+    HTSAT_BASE_FRONT_PER_STEP = [1.5235636349200001, 1.39797600349]
+    HTSAT_TIP_FRONT_PER_STEP = [0.12049923687, 0.10237379909]
+
+    def test_ratio_lo_and_ratio_hi_match_the_hand_computed_extremes(self):
+        with tempfile.TemporaryDirectory() as raw_dir:
+            for i, front in enumerate(self.HTSAT_BASE_FRONT_PER_STEP, start=1):
+                tier = {
+                    "steps_measured": 100,
+                    "media_front_end_wall_s": front * 100,
+                    "train_run_wall_s": 17.0 * 100,
+                }
+                _write_leg(raw_dir, "htsat", "base", f"r{i}", {"tiers": {"finetune_run": tier}})
+            for i, front in enumerate(self.HTSAT_TIP_FRONT_PER_STEP, start=1):
+                tier = {
+                    "steps_measured": 100,
+                    "media_front_end_wall_s": front * 100,
+                    "train_run_wall_s": 3.4 * 100,
+                    "rayon_pool_threads": 26,
+                }
+                _write_leg(raw_dir, "htsat", "tip", f"r{i}", {"tiers": {"finetune_run": tier}})
+            # clip-vision is report-only -- reuse the same htsat numbers so
+            # `status` reads GREEN without a second real fixture.
+            for role, fronts in (
+                ("base", self.HTSAT_BASE_FRONT_PER_STEP),
+                ("tip", self.HTSAT_TIP_FRONT_PER_STEP),
+            ):
+                for i, front in enumerate(fronts, start=1):
+                    tier = {
+                        "steps_measured": 100,
+                        "media_front_end_wall_s": front * 100,
+                        "train_run_wall_s": 1.0 * 100,
+                    }
+                    if role == "tip":
+                        tier["rayon_pool_threads"] = 26
+                    _write_leg(
+                        raw_dir, "clip-vision", role, f"r{i}", {"tiers": {"finetune_run": tier}}
+                    )
+            report = frontend_ab_merge.build_report(
+                Path(raw_dir), r=0.0033, n=24, tip_sha="c" * 40, base_sha="b" * 40,
+                box="p421b", dry_run=False,
+            )
+        bar = report["htsat_bar"]
+        expected_ratio_lo = min(self.HTSAT_TIP_FRONT_PER_STEP) / max(self.HTSAT_BASE_FRONT_PER_STEP)
+        expected_ratio_hi = max(self.HTSAT_TIP_FRONT_PER_STEP) / min(self.HTSAT_BASE_FRONT_PER_STEP)
+        self.assertEqual(bar["ratio_lo"], expected_ratio_lo)
+        self.assertEqual(bar["ratio_hi"], expected_ratio_hi)
+        self.assertAlmostEqual(bar["ratio_lo"], 0.0672, places=4)
+        self.assertAlmostEqual(bar["ratio_hi"], 0.0862, places=4)
+        self.assertEqual(bar["verdict"], "PASS", bar)
+
+
 class MainEntryPointTests(unittest.TestCase):
     """`main(argv)` -- the exact call `frontend_ab.sh` makes -- writes the
     merged report to disk AND echoes it on stdout."""
@@ -219,6 +369,30 @@ class MainEntryPointTests(unittest.TestCase):
                 written = json.load(f)
             self.assertEqual(written["status"], "GREEN", written)
             self.assertFalse(written["dry_run"])
+
+    def test_main_accepts_an_explicit_repeats_positional_argument(self):
+        with tempfile.TemporaryDirectory() as raw_dir, tempfile.TemporaryDirectory() as out_dir:
+            for tower in frontend_ab_merge.TOWERS:
+                for role in frontend_ab_merge.ROLES:
+                    for repeat in frontend_ab_merge.repeat_labels(3):
+                        tier = {
+                            "steps_measured": 100,
+                            "media_front_end_wall_s": 1.0,
+                            "train_run_wall_s": 15.0,
+                        }
+                        if role == "tip":
+                            tier["rayon_pool_threads"] = 13
+                        _write_leg(raw_dir, tower, role, repeat, {"tiers": {"finetune_run": tier}})
+            out_path = os.path.join(out_dir, "report.json")
+            rc = frontend_ab_merge.main(
+                [raw_dir, out_path, "0.0", "24", "t" * 40, "b" * 40, "test-box", "0", "3"]
+            )
+            self.assertEqual(rc, 0)
+            with open(out_path, encoding="utf-8") as f:
+                written = json.load(f)
+            self.assertEqual(written["status"], "GREEN", written)
+            self.assertEqual(written["repeats"], 3)
+            self.assertIn("r3", written["towers"]["htsat"]["base"])
 
 
 if __name__ == "__main__":

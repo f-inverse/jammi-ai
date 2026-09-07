@@ -10,7 +10,9 @@
 # towers at the profile's pinned leg parameters (`--objective triplet`,
 # `--lora-init zeros_b`, the full per-tower LoRA site set, `--eval-cadence
 # 1`, N = 100 steps, batch 8 -- 24 items/step under triplet), interleaved
-# base, tip, base, tip per tower.
+# base, tip, base, tip, ... per tower -- `$FRONTEND_AB_REPEATS` base/tip
+# PAIRS per tower (default 2, the contract's own base/tip/base/tip; leg
+# files are named `..._r1.json` .. `..._rN.json`).
 #
 # DECISION QUANTITY (per report): `media_front_end_wall_s / steps_measured`.
 # COMPANION (report-only): `train_run_wall_s / steps_measured`.
@@ -23,18 +25,26 @@
 # `cargo run -p jammi-bench --example frontend_serial_tail` measurement,
 # divided by the corresponding tier's own per-step wall):
 #
-#   ratio = mean(front_tip) / mean(front_base)
+#   ratio    = mean(front_tip legs) / mean(front_base legs)   -- point estimate
+#   ratio_lo = min(front_tip legs)  / max(front_base legs)    -- worst case for PASS
+#   ratio_hi = max(front_tip legs)  / min(front_base legs)    -- best case for PASS
 #   upper_bound = r + (1 - r) / (0.5 * ideal)   -- at least a real win
 #   lower_bound = r + (1 - r) / ideal           -- never beats the ideal
 #
-# `ratio` inside `[lower_bound, upper_bound]` is PASS (the bar holds);
-# above `upper_bound` is FAIL (not enough speedup); below `lower_bound` is
-# INVALID_BEATS_IDEAL (the instrument, not the code, is broken -- nothing
-# can go faster than the machine model's own ideal). The base-to-base
-# spread of the interleaved runs (`|front_base_r1 - front_base_r2|`) is the
-# error bar: when that spread, added on either side of `ratio`, would cross
-# EITHER bound, the decision is UNRESOLVED rather than a confident
-# PASS/FAIL/INVALID_BEATS_IDEAL call.
+# `ratio_lo`/`ratio_hi` propagate EVERY repeat's own observed value against
+# every OTHER arm's own observed value, taking the extremes -- never
+# `spread / mean` added onto `ratio` as if `ratio` carried a normally
+# distributed error with that spread as its standard deviation (a UNITS
+# error: `spread / front_base_mean` is a dimensionless FRACTION of
+# `front_base`, not a fraction of `ratio`, so adding it directly to `ratio`
+# mixes two different reference scales). PASS iff `ratio_hi <= upper_bound`
+# AND `ratio_lo >= lower_bound` (the WHOLE observed interval clears the
+# bar); FAIL iff `ratio_lo > upper_bound` (the whole interval is too slow);
+# INVALID_BEATS_IDEAL iff `ratio_hi < lower_bound` (the whole interval
+# beats the machine model's own ideal -- the instrument, not the code, is
+# broken); UNRESOLVED otherwise (a bound falls STRICTLY inside
+# `[ratio_lo, ratio_hi]` -- the observed repeats are not tight enough to
+# call it either way).
 #
 # VERDICT (contract's own words): ACTIVATE (keep the change) iff the HTSAT
 # bar holds (PASS); this script only RECORDS the bar's outcome -- it never
@@ -90,6 +100,11 @@
 #                            parsing/validation path is always exercised):
 #                            a float in `[0, 1]`.
 #   FRONTEND_AB_STEPS_N      override the pinned N = 100 (default 100).
+#   FRONTEND_AB_REPEATS      number of interleaved base/tip PAIRS per tower
+#                            (default 2, the contract's own base/tip/base/
+#                            tip). Must be a positive integer -- e.g. 3 runs
+#                            base,tip,base,tip,base,tip, leg files
+#                            `..._r1.json` .. `..._r3.json`.
 #   FRONTEND_AB_BACKBONE_DTYPE
 #                            `--backbone-dtype` passthrough, every leg
 #                            (default "bf16" -- irrelevant to the CPU-side
@@ -146,9 +161,15 @@ BOX="${BOX:-}"
 MODEL_DIR_CLIP="${MODEL_DIR_CLIP:-}"
 MODEL_DIR_CLAP="${MODEL_DIR_CLAP:-}"
 FRONTEND_AB_STEPS_N="${FRONTEND_AB_STEPS_N:-100}"
+FRONTEND_AB_REPEATS="${FRONTEND_AB_REPEATS:-2}"
 FRONTEND_AB_BACKBONE_DTYPE="${FRONTEND_AB_BACKBONE_DTYPE:-bf16}"
 FRONTEND_AB_CUDA="${FRONTEND_AB_CUDA:-0}"
 FRONTEND_AB_CPU="${FRONTEND_AB_CPU:-0}"
+
+if ! [[ "$FRONTEND_AB_REPEATS" =~ ^[0-9]+$ ]] || [ "$FRONTEND_AB_REPEATS" -lt 1 ]; then
+  echo "::error::FRONTEND_AB_REPEATS ('$FRONTEND_AB_REPEATS') must be a positive integer -- refusing before any leg runs." >&2
+  exit 2
+fi
 
 SHA_RE='^[0-9a-f]{40}$'
 
@@ -548,10 +569,10 @@ run_leg() {
 }
 
 for tower in htsat clip-vision; do
-  run_leg "$tower" base "$BASE_BIN" "$BASE_SHA" r1
-  run_leg "$tower" tip "$TIP_BIN" "$TIP_SHA" r1
-  run_leg "$tower" base "$BASE_BIN" "$BASE_SHA" r2
-  run_leg "$tower" tip "$TIP_BIN" "$TIP_SHA" r2
+  for ((repeat_i = 1; repeat_i <= FRONTEND_AB_REPEATS; repeat_i++)); do
+    run_leg "$tower" base "$BASE_BIN" "$BASE_SHA" "r${repeat_i}"
+    run_leg "$tower" tip "$TIP_BIN" "$TIP_SHA" "r${repeat_i}"
+  done
 done
 
 # ── merge + bar decision (`frontend_ab_merge.py`, this directory) ────────
@@ -565,7 +586,7 @@ done
 # defect).
 MERGE_OUT="$OUT_DIR/report.json"
 python3 "$DIR/frontend_ab_merge.py" "$RAW_DIR" "$MERGE_OUT" "$FRONTEND_AB_SERIAL_TAIL_RATIO" \
-  "$N_ITEMS_PER_STEP" "$TIP_SHA" "$BASE_SHA" "$BOX" "$FRONTEND_AB_DRY_RUN"
+  "$N_ITEMS_PER_STEP" "$TIP_SHA" "$BASE_SHA" "$BOX" "$FRONTEND_AB_DRY_RUN" "$FRONTEND_AB_REPEATS"
 MERGE_RC=$?
 if [ "$MERGE_RC" -ne 0 ]; then
   echo "::error::merge step failed (exit $MERGE_RC)" >&2

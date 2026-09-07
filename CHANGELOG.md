@@ -200,6 +200,27 @@ workspace ships every publishable crate at the same
   dry-run tested through the real merge script.
 
 ### Changed
+- **The media front end's per-item decode/preprocess runs across the batch in parallel on
+  rayon's global pool (#421 follow-on).** `rayon` becomes a direct `jammi-ai` dependency (pinned
+  to the version already unified across the resolved tree; no version bump). Two stages, signatures
+  preserved: decode — new shared helpers `audio_preprocess::decode_audio_batch` /
+  `image_preprocess::decode_image_batch`, used by BOTH the serving decode loops
+  (`inference::arrow_to_audio` / `arrow_to_images`, which still return `Vec<Option<_>>` with the
+  same null bookkeeping) and the trainer's `audio_encoder_input` / `image_encoder_input`; a
+  path-valued arrow column still reads its bytes with a sequential `std::fs::read` OUTSIDE the
+  parallel stage. Preprocess — `preprocess_clap_fusion` / `preprocess_image_batch` preallocate the
+  batch's flat buffer once and write each item's disjoint, fixed-stride chunk via `par_chunks_mut`,
+  with the mel filterbank / Hann window (audio) hoisted and computed once, and a release-mode
+  per-item length check (`clap_fusion_row` / `image_row`) that returns a typed, row-indexed error
+  rather than ever reaching a mismatched `copy_from_slice`. Errors across a batch surface the
+  LOWEST-INDEX failing row; an empty batch is still refused before any chunking. There is no
+  thread-count knob anywhere: chunk count is `n`, and effective parallelism (`min(pool, n)`) is
+  emergent from whichever rayon pool a call runs under — candle installs no private pool, so this is
+  the one pool the process ever schedules media-batch work on. `fine_tune::media_front_end_pool_threads()`
+  exposes the pool size (`rayon::current_num_threads()`, not a per-batch thread count) for
+  `FinetuneRunTier` provenance. Bit-identical to the pre-unit sequential loop at every rayon pool
+  size tested (1, 5, 7, 24, including non-dividing counts) — proven for both CLAP-fusion branches
+  (repeatpad; fusion-crop, including the `total == chunk` corner case) and the image batch path.
 - **HTSAT's MLP and projection GELU reach the fused seam on the training path (#421).** The audio
   tower's two GELU-erf sites — each Swin block's MLP and the projection head's `"gelu"` arm — call
   the house seam `activations::gelu_erf(x, training)` instead of `Tensor::gelu_erf()` directly, the

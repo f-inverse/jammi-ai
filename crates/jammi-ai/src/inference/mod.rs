@@ -5,6 +5,8 @@ pub mod observer;
 pub mod runner;
 pub mod schema;
 
+use std::borrow::Cow;
+
 use arrow::array::{
     Array, ArrayRef, BinaryArray, BinaryViewArray, LargeBinaryArray, LargeStringArray, StringArray,
     StringViewArray,
@@ -12,6 +14,25 @@ use arrow::array::{
 use arrow::datatypes::DataType;
 use image::DynamicImage;
 use jammi_db::error::{JammiError, Result};
+
+/// Fold a batch of per-row `Result`s into either the ordered `Ok` values or
+/// the FIRST (lowest-index) `Err`.
+///
+/// The parallel decode/preprocess stages (`audio_preprocess::decode_audio_batch`
+/// / `image_preprocess::decode_image_batch` and the `par_chunks_mut` writers in
+/// [`audio_preprocess::preprocess_clap_fusion`] /
+/// [`image_preprocess::preprocess_image_batch`]) build their per-row results
+/// with a rayon `collect()` on an INDEXED parallel iterator, which preserves
+/// the original row order regardless of which thread finished which row
+/// first. So a single forward scan for the first `Err` already IS the
+/// lowest-index selection — no separate index bookkeeping is needed here.
+pub(crate) fn lowest_index_result<T>(results: Vec<Result<T>>) -> Result<Vec<T>> {
+    let mut out = Vec::with_capacity(results.len());
+    for r in results {
+        out.push(r?);
+    }
+    Ok(out)
+}
 
 /// Extract text from Arrow string columns (handles Utf8, LargeUtf8, and Utf8View).
 /// If multiple columns, concatenate with " " separator.
@@ -93,6 +114,14 @@ pub fn extract_column(
 /// - `Binary` / `LargeBinary`: values are image bytes, decoded in memory.
 ///
 /// Null values produce `None` (caller tracks via `row_status`).
+///
+/// Two stages: resolving each row to its raw bytes runs SEQUENTIALLY here (a
+/// path-valued row's `std::fs::read` happens outside the parallel stage);
+/// decoding those bytes to a [`DynamicImage`] runs in parallel across the
+/// batch on rayon's global pool, through the SAME
+/// [`image_preprocess::decode_image_batch`] helper the training path
+/// (`fine_tune::trainer`'s `image_encoder_input`) calls — one decode loop
+/// shared by both.
 pub fn arrow_to_images(columns: &[ArrayRef]) -> Result<Vec<Option<DynamicImage>>> {
     if columns.is_empty() {
         return Err(JammiError::Inference("No image columns provided".into()));
@@ -100,14 +129,17 @@ pub fn arrow_to_images(columns: &[ArrayRef]) -> Result<Vec<Option<DynamicImage>>
     // Use the first column only (image embedding expects a single column).
     let col = &columns[0];
     let row_count = col.len();
-    let mut images = Vec::with_capacity(row_count);
 
+    // Stage 1 (sequential): resolve every row to its raw bytes. Path-valued
+    // rows read the file from disk here; bytes-valued rows borrow straight
+    // out of the Arrow buffer (no copy). Null rows carry no bytes.
+    let mut byte_rows: Vec<Option<Cow<[u8]>>> = Vec::with_capacity(row_count);
     for i in 0..row_count {
         if col.is_null(i) {
-            images.push(None);
+            byte_rows.push(None);
             continue;
         }
-        let img = match col.data_type() {
+        let bytes: Cow<[u8]> = match col.data_type() {
             DataType::Utf8 => {
                 let path = col
                     .as_any()
@@ -116,9 +148,9 @@ pub fn arrow_to_images(columns: &[ArrayRef]) -> Result<Vec<Option<DynamicImage>>
                     .ok_or_else(|| {
                         JammiError::Inference(format!("Failed to read path at row {i}"))
                     })?;
-                image::open(path).map_err(|e| {
-                    JammiError::Inference(format!("Failed to load image '{path}': {e}"))
-                })?
+                Cow::Owned(std::fs::read(path).map_err(|e| {
+                    JammiError::Inference(format!("Failed to read image file '{path}': {e}"))
+                })?)
             }
             DataType::LargeUtf8 => {
                 let path = col
@@ -128,46 +160,34 @@ pub fn arrow_to_images(columns: &[ArrayRef]) -> Result<Vec<Option<DynamicImage>>
                     .ok_or_else(|| {
                         JammiError::Inference(format!("Failed to read path at row {i}"))
                     })?;
-                image::open(path).map_err(|e| {
-                    JammiError::Inference(format!("Failed to load image '{path}': {e}"))
-                })?
+                Cow::Owned(std::fs::read(path).map_err(|e| {
+                    JammiError::Inference(format!("Failed to read image file '{path}': {e}"))
+                })?)
             }
-            DataType::Binary => {
-                let bytes = col
-                    .as_any()
+            DataType::Binary => Cow::Borrowed(
+                col.as_any()
                     .downcast_ref::<BinaryArray>()
                     .map(|a| a.value(i))
                     .ok_or_else(|| {
                         JammiError::Inference(format!("Failed to read bytes at row {i}"))
-                    })?;
-                image::load_from_memory(bytes).map_err(|e| {
-                    JammiError::Inference(format!("Failed to decode image at row {i}: {e}"))
-                })?
-            }
-            DataType::LargeBinary => {
-                let bytes = col
-                    .as_any()
+                    })?,
+            ),
+            DataType::LargeBinary => Cow::Borrowed(
+                col.as_any()
                     .downcast_ref::<LargeBinaryArray>()
                     .map(|a| a.value(i))
                     .ok_or_else(|| {
                         JammiError::Inference(format!("Failed to read bytes at row {i}"))
-                    })?;
-                image::load_from_memory(bytes).map_err(|e| {
-                    JammiError::Inference(format!("Failed to decode image at row {i}: {e}"))
-                })?
-            }
-            DataType::BinaryView => {
-                let bytes = col
-                    .as_any()
+                    })?,
+            ),
+            DataType::BinaryView => Cow::Borrowed(
+                col.as_any()
                     .downcast_ref::<BinaryViewArray>()
                     .map(|a| a.value(i))
                     .ok_or_else(|| {
                         JammiError::Inference(format!("Failed to read bytes at row {i}"))
-                    })?;
-                image::load_from_memory(bytes).map_err(|e| {
-                    JammiError::Inference(format!("Failed to decode image at row {i}: {e}"))
-                })?
-            }
+                    })?,
+            ),
             dt => {
                 return Err(JammiError::Inference(format!(
                     "Unsupported column type for image input: {dt}. \
@@ -175,7 +195,24 @@ pub fn arrow_to_images(columns: &[ArrayRef]) -> Result<Vec<Option<DynamicImage>>
                 )));
             }
         };
-        images.push(Some(img));
+        byte_rows.push(Some(bytes));
+    }
+
+    // Stage 2 (parallel): decode every non-null row's bytes on rayon's global
+    // pool, then re-thread the per-row null bookkeeping.
+    let non_null: Vec<&Cow<[u8]>> = byte_rows.iter().flatten().collect();
+    let decoded = image_preprocess::decode_image_batch(&non_null)?;
+    let mut decoded_iter = decoded.into_iter();
+    let mut images = Vec::with_capacity(row_count);
+    for row in &byte_rows {
+        images.push(match row {
+            Some(_) => Some(decoded_iter.next().ok_or_else(|| {
+                JammiError::Inference(
+                    "internal error: decoded image count did not match non-null row count".into(),
+                )
+            })?),
+            None => None,
+        });
     }
 
     Ok(images)
@@ -188,9 +225,13 @@ pub fn arrow_to_images(columns: &[ArrayRef]) -> Result<Vec<Option<DynamicImage>>
 /// - `Binary` / `LargeBinary` / `BinaryView`: values are encoded audio bytes
 ///   (WAV/FLAC/MP3/Ogg), decoded in memory.
 ///
-/// Each value is decoded to mono PCM via
-/// [`audio_preprocess::decode_audio_bytes`]. Null values produce `None`
-/// (caller tracks via `row_status`).
+/// Two stages, mirroring [`arrow_to_images`]: resolving each row to its raw
+/// bytes runs SEQUENTIALLY (a path-valued row's `std::fs::read` happens
+/// outside the parallel stage); decoding those bytes to mono PCM runs in
+/// parallel across the batch on rayon's global pool, through the SAME
+/// [`audio_preprocess::decode_audio_batch`] helper the training path
+/// (`fine_tune::trainer`'s `audio_encoder_input`) calls. Null values produce
+/// `None` (caller tracks via `row_status`).
 pub fn arrow_to_audio(columns: &[ArrayRef]) -> Result<Vec<Option<audio_preprocess::DecodedAudio>>> {
     if columns.is_empty() {
         return Err(JammiError::Inference("No audio columns provided".into()));
@@ -198,14 +239,17 @@ pub fn arrow_to_audio(columns: &[ArrayRef]) -> Result<Vec<Option<audio_preproces
     // Use the first column only (audio embedding expects a single column).
     let col = &columns[0];
     let row_count = col.len();
-    let mut clips = Vec::with_capacity(row_count);
 
+    // Stage 1 (sequential): resolve every row to its raw bytes. Path-valued
+    // rows read the file from disk here; bytes-valued rows borrow straight
+    // out of the Arrow buffer (no copy). Null rows carry no bytes.
+    let mut byte_rows: Vec<Option<Cow<[u8]>>> = Vec::with_capacity(row_count);
     for i in 0..row_count {
         if col.is_null(i) {
-            clips.push(None);
+            byte_rows.push(None);
             continue;
         }
-        let bytes: std::borrow::Cow<[u8]> = match col.data_type() {
+        let bytes: Cow<[u8]> = match col.data_type() {
             DataType::Utf8 => {
                 let path = col
                     .as_any()
@@ -214,7 +258,7 @@ pub fn arrow_to_audio(columns: &[ArrayRef]) -> Result<Vec<Option<audio_preproces
                     .ok_or_else(|| {
                         JammiError::Inference(format!("Failed to read path at row {i}"))
                     })?;
-                std::borrow::Cow::Owned(std::fs::read(path).map_err(|e| {
+                Cow::Owned(std::fs::read(path).map_err(|e| {
                     JammiError::Inference(format!("Failed to read audio file '{path}': {e}"))
                 })?)
             }
@@ -226,11 +270,11 @@ pub fn arrow_to_audio(columns: &[ArrayRef]) -> Result<Vec<Option<audio_preproces
                     .ok_or_else(|| {
                         JammiError::Inference(format!("Failed to read path at row {i}"))
                     })?;
-                std::borrow::Cow::Owned(std::fs::read(path).map_err(|e| {
+                Cow::Owned(std::fs::read(path).map_err(|e| {
                     JammiError::Inference(format!("Failed to read audio file '{path}': {e}"))
                 })?)
             }
-            DataType::Binary => std::borrow::Cow::Borrowed(
+            DataType::Binary => Cow::Borrowed(
                 col.as_any()
                     .downcast_ref::<BinaryArray>()
                     .map(|a| a.value(i))
@@ -238,7 +282,7 @@ pub fn arrow_to_audio(columns: &[ArrayRef]) -> Result<Vec<Option<audio_preproces
                         JammiError::Inference(format!("Failed to read bytes at row {i}"))
                     })?,
             ),
-            DataType::LargeBinary => std::borrow::Cow::Borrowed(
+            DataType::LargeBinary => Cow::Borrowed(
                 col.as_any()
                     .downcast_ref::<LargeBinaryArray>()
                     .map(|a| a.value(i))
@@ -246,7 +290,7 @@ pub fn arrow_to_audio(columns: &[ArrayRef]) -> Result<Vec<Option<audio_preproces
                         JammiError::Inference(format!("Failed to read bytes at row {i}"))
                     })?,
             ),
-            DataType::BinaryView => std::borrow::Cow::Borrowed(
+            DataType::BinaryView => Cow::Borrowed(
                 col.as_any()
                     .downcast_ref::<BinaryViewArray>()
                     .map(|a| a.value(i))
@@ -261,10 +305,24 @@ pub fn arrow_to_audio(columns: &[ArrayRef]) -> Result<Vec<Option<audio_preproces
                 )));
             }
         };
-        let decoded = audio_preprocess::decode_audio_bytes(&bytes).map_err(|e| {
-            JammiError::Inference(format!("Failed to decode audio at row {i}: {e}"))
-        })?;
-        clips.push(Some(decoded));
+        byte_rows.push(Some(bytes));
+    }
+
+    // Stage 2 (parallel): decode every non-null row's bytes on rayon's global
+    // pool, then re-thread the per-row null bookkeeping.
+    let non_null: Vec<&Cow<[u8]>> = byte_rows.iter().flatten().collect();
+    let decoded = audio_preprocess::decode_audio_batch(&non_null)?;
+    let mut decoded_iter = decoded.into_iter();
+    let mut clips = Vec::with_capacity(row_count);
+    for row in &byte_rows {
+        clips.push(match row {
+            Some(_) => Some(decoded_iter.next().ok_or_else(|| {
+                JammiError::Inference(
+                    "internal error: decoded audio count did not match non-null row count".into(),
+                )
+            })?),
+            None => None,
+        });
     }
 
     Ok(clips)

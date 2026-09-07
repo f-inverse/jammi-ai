@@ -41,6 +41,21 @@ pub mod training_job;
 #[cfg(feature = "local")]
 pub mod worker;
 
+/// The rayon global-pool thread count backing the media front end's parallel
+/// decode/preprocess stages (`inference::audio_preprocess` /
+/// `inference::image_preprocess`'s `decode_*_batch` and `preprocess_*_batch`
+/// functions, and `trainer::Trainer`'s `audio_encoder_input` /
+/// `image_encoder_input` call sites). This is the POOL size — `rayon::
+/// current_num_threads()` — NOT the count of threads that actually ran a
+/// given batch's chunks (effective parallelism is `min(pool, n)`, emergent
+/// and never recorded); `host.logical_cpus` already covers the machine-wide
+/// count separately. Exposed for `FinetuneRunTier.rayon_pool_threads`
+/// provenance (never identity).
+#[cfg(feature = "local")]
+pub fn media_front_end_pool_threads() -> usize {
+    rayon::current_num_threads()
+}
+
 // The fine-tune request vocabulary — `FineTuneConfig`, the loss / schedule /
 // dtype enums, `FineTuneMethod`, and the `jammi_lora` init/dtype re-exports —
 // is transport-neutral and lives on the `jammi-wire` substrate (so the gRPC

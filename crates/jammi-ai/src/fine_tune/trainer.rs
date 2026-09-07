@@ -1958,13 +1958,12 @@ impl TrainingLoop {
             )));
         }
 
-        let mut decoded = Vec::with_capacity(clips.len());
-        for (i, clip) in clips.iter().enumerate() {
-            decoded.push(
-                audio_preprocess::decode_audio_bytes(clip)
-                    .map_err(|e| JammiError::FineTune(format!("Decode audio row {i}: {e}")))?,
-            );
-        }
+        // Shared with the serving path's decode loop
+        // (`inference::arrow_to_audio`): both call
+        // `audio_preprocess::decode_audio_batch`, which runs the per-clip
+        // decode in parallel across rayon's global pool.
+        let decoded = audio_preprocess::decode_audio_batch(clips)
+            .map_err(|e| JammiError::FineTune(format!("Decode audio batch: {e}")))?;
         let (input_features, is_longer) =
             audio_preprocess::preprocess_clap_fusion(&decoded, frontend, &self.device)
                 .map_err(|e| JammiError::FineTune(format!("CLAP fusion front end: {e}")))?;
@@ -1998,13 +1997,12 @@ impl TrainingLoop {
             .preprocess_std()
             .map_err(|e| geometry("preprocess_std", e))?;
 
-        let mut decoded = Vec::with_capacity(images.len());
-        for (i, bytes) in images.iter().enumerate() {
-            decoded.push(
-                image::load_from_memory(bytes)
-                    .map_err(|e| JammiError::FineTune(format!("Decode image row {i}: {e}")))?,
-            );
-        }
+        // Shared with the serving path's decode loop
+        // (`inference::arrow_to_images`): both call
+        // `image_preprocess::decode_image_batch`, which runs the per-image
+        // decode in parallel across rayon's global pool.
+        let decoded = image_preprocess::decode_image_batch(images)
+            .map_err(|e| JammiError::FineTune(format!("Decode image batch: {e}")))?;
         let pixel_values =
             image_preprocess::preprocess_image_batch(&decoded, side, &mean, &std, &self.device)
                 .map_err(|e| JammiError::FineTune(format!("Image front end: {e}")))?;

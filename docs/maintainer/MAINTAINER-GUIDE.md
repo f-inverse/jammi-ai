@@ -1848,6 +1848,29 @@ staleness→recompute loop — that is the platform's, not the engine's
   (`crates/jammi-ai/src/fine_tune/worker.rs`, `build_acceleration_report_json`) from
   degrading to `probe_forward_failed` on a media tower — an empty `ops` map there is the
   esc-075 "absence must fail, never read as clean" case (`.jammi/escapes.jsonl`).
+- **`AnyEncoder::fusible_site_census`** — `crates/jammi-encoders/src/fusible_census.rs`
+  (`FusibleSiteCensus`): `{lora_sites_wrapped, layer_norms, gelu_seam_calls_per_forward}`,
+  the per-forward call count for each of the three fusible seams, total over the enum (every
+  variant answers, a variant with no such seam answers `0` rather than declining). Each
+  field pairs with exactly one `jammi_kernels::admission` key
+  (`lora_linear_fused`/`layer_norm_fused`/`gelu_erf_fused`), so a fused-kernel profile's
+  positive-proof equation (`fused + eager == calls × batches`) reads its `calls` term
+  straight off this struct instead of a reader deriving it by hand from a config. **The
+  invariant: every count is WALKED off the built structure — never config arithmetic.**
+  `lora_sites_wrapped` counts `MaybeLoraLinear::is_lora() == true` over the tower's own site
+  traversal; `layer_norms` counts the house `LayerNorm` instances the built tower actually
+  holds (a family that omits one, e.g. ModernBERT's `None` layer-0 pre-norm or an HTSAT stage
+  with no `downsample`, contributes what it actually holds, not what `2 × layers` predicts);
+  `gelu_seam_calls_per_forward` counts calls to `activations::gelu_erf` per forward (`0` for
+  ModernBERT's GeGLU FFN and for both OpenCLIP towers' `quick_gelu`, which have no fused seam
+  at all — two different reasons for the same zero, both stated on the field's own doc). Every
+  count is per ONE forward at `training == true`: each seam short-circuits before any
+  admission decision in eval, so **an eval forward contributes `0` to both sides of the
+  equation** rather than counting as "all eager". `FinetuneRunTier::fusible_site_census`
+  (`crates/jammi-bench/src/report.rs`) records the census as bench PROVENANCE, never
+  IDENTITY — it is a structural property of the build, not a caller premise two legs must
+  agree on — and `ci/scripts/perf/profile_421_merge.py` reads its own `calls` term from this
+  field.
 - **The three cross-modal towers and their LoRA sites** — each tower has its own
   builder (`ClipText::builder`, `OpenClipVisionTransformer::builder`,
   `HtsatAudio::builder`) with the same knobs the BERT family uses

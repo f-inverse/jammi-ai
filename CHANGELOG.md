@@ -167,6 +167,27 @@ workspace ships every publishable crate at the same
   producer's split is id- and text-disjoint and carries the same width guarantee. On all three the
   held-out rows carry the train schema and the corpus's own pinned shape/duration/width, and
   requesting them leaves the train split byte-identical to a no-held-out run at the same seed.
+- **`AnyEncoder::fusible_site_census`, the witnessed `calls` term for the tower training-step
+  profile's positive-proof equation, and its merge script (#421).** `FusibleSiteCensus`
+  (`crates/jammi-encoders/src/fusible_census.rs`) is total over `AnyEncoder`:
+  `lora_sites_wrapped`, `layer_norms`, `gelu_seam_calls_per_forward`, one per fusible seam
+  (`lora_linear_fused`/`layer_norm_fused`/`gelu_erf_fused`), each WALKED off the built
+  structure rather than derived by config arithmetic, so a family whose built tower diverges
+  from its own config (a declined site, an omitted pre-norm, a stage with no downsample) is
+  answered correctly rather than by formula. Every count is per training forward only — an
+  eval forward contributes `0` to both sides of the profile equation. `FinetuneRunTier` gains
+  `fusible_site_census` as PROVENANCE (captured every epoch, refused if it changes;
+  `PROVENANCE_FIELDS` 11 → 12). `ci/scripts/perf/profile_421_merge.py` (45 hermetic tests)
+  reads its `calls` term from this field and checks `fused + eager == fusible_site_census ×
+  steps_measured` per key, `fused == 0` for every `kernels_disabled_expected` key on a D leg,
+  and computes `residual = wall − front − busy` per step — a negative residual reports as
+  `overlap_s` (front-end work pipelined against a prior step's kernels), never a leg
+  invalidation; an invalid leg exits `0` and is named in `summary.legs_invalid` rather than
+  failing the tool. `steps_measured` counts training forwards only at `--epochs 1
+  --grad-accum 1` (a resume-chained leg at `--epochs > 1` double-counts `global_step`,
+  measured), which every leg and the new `PROFILE_421_P2_BF16=1` driver mode pin; P2 is
+  UNTRACED by design (no `nsys` dependency for a qualitative dtype pre-flight) and is
+  dry-run tested through the real merge script.
 
 ### Changed
 - **HTSAT's MLP and projection GELU reach the fused seam on the training path (#421).** The audio
@@ -180,6 +201,13 @@ workspace ships every publishable crate at the same
   `HtsatAudio::set_training`'s single stored flag; the flag-less `HtsatAudioEncoder::forward_spine`
   and `ClapAudioProjection::forward_unnormalized` remain as eval conveniences defined in terms of
   their `_with_training(.., false)` twins.
+- **`MaybeLoraLinear` gains a public `is_lora` accessor (#421).** Whether a site carries an
+  adapter (the `Lora` arm) rather than a plain frozen base, for a consumer that needs to
+  COUNT wrapped sites — `jammi_encoders::FusibleSiteCensus`'s `lora_sites_wrapped` is the
+  first caller. Deliberately not the same measurement as counting
+  `trainable_params()` (a count of TENSORS, two per adapted site, which reads the same `0`
+  for "no adapter installed" as for "an adapter with an empty A/B pair"); a `true` here does
+  not by itself mean the fused kernel ran, only that the site is an adapted one.
 - **`HtsatAudioConfig.hidden_act` is validated at load instead of silently ignored (#421).** A
   checkpoint declaring any value other than `"gelu"` — the only value HF `ClapAudioConfig` ships —
   is now refused by name at load, through both `HtsatAudio::load` and

@@ -415,6 +415,75 @@ control would refuse every valid media leg. A tower family is judged on the LoRA
 dispatch counters instead: zero of those over a run that took optimizer steps proves the
 adapted encoder was never forwarded.
 
+**The witnessed `calls` term: `FusibleSiteCensus`.** The profile's positive-proof equation
+is `fused + eager == calls × batches` per admission key. `fused`/`eager` are measured (the
+process-wide `jammi_kernels::admission` counters) and `batches` is measured (training
+forwards taken), but `calls` — how many times ONE forward reaches a given seam — had no
+witness before `AnyEncoder::fusible_site_census() -> FusibleSiteCensus`
+(`crates/jammi-encoders/src/fusible_census.rs`): `lora_sites_wrapped` (sites the builder
+actually wrapped in a LoRA adapter — `MaybeLoraLinear::is_lora` over the tower's own site
+traversal — paired with `lora_linear_fused`), `layer_norms` (house `LayerNorm` instances the
+built tower actually holds on its forward path, paired with `layer_norm_fused`), and
+`gelu_seam_calls_per_forward` (calls to `activations::gelu_erf` per forward, paired with
+`gelu_erf_fused`). Every count is WALKED off the built structure — the `Vec<Layer>` the
+loader actually built, the `MaybeLoraLinear` arm each site landed on, the `Option<LayerNorm>`
+a layer actually holds — never derived by config arithmetic (`2 × layers`, and similar): a
+structural walk disagrees with a formula the moment the built tower stops matching its
+config (a site the selector declined, a pre-norm a family omits on layer 0, an HTSAT stage
+with no `downsample`), which is the only case a `calls` witness earns anything over a
+comment doing the same arithmetic by hand. The census is per-forward at `training == true`
+only: every seam short-circuits before any admission decision in eval, so an eval forward
+contributes `0` to BOTH sides of the equation — never "all eager" — and `0` is itself a
+real, falsifiable answer for a family with no such seam at all (ModernBERT's GeGLU FFN and
+both OpenCLIP towers' `quick_gelu` hold `gelu_seam_calls_per_forward == 0`, for two
+different architectural reasons named on the field's own doc). These are STRUCTURAL counts
+pinned per tower on the committed tiny fixtures by each encoder's own
+`fusible_site_census_is_the_exact_per_forward_seam_call_count` test — not a measurement of
+any run — and read (`lora_sites_wrapped`/`layer_norms`/`gelu_seam_calls_per_forward`): tiny
+BERT 6/3/1, DistilBERT 12/5/2, ModernBERT 16/9/0, CLIP-text 4/3/0, OpenCLIP-vision 4/4/0,
+HTSAT 53/21/8-or-9 (the audio tower's GELU term is 8 on the fixture's `"relu"` projection
+head and 9 on a `"gelu"` twin over the identical geometry — the real `laion/clap-htsat-fused`
+checkpoint's `projection_hidden_act` is read from its own config at run time and recorded by
+the census, never hardcoded). `FinetuneRunTier::fusible_site_census`
+(`crates/jammi-bench/src/report.rs`) records the census as PROVENANCE — a structural
+property of the build the bench captures every epoch and refuses if it changes mid-run —
+never IDENTITY (it is nothing a caller declared, so two legs cannot disagree about it the
+way they can about `lora_rank`) — and it is what `profile_421_merge.py` reads its own
+`calls` term from, rather than re-deriving it.
+
+**The `--epochs 1 --grad-accum 1` convention.** `steps_measured` counts TRAINING forwards
+only under that pinning: at `--epochs > 1`, `finetune-run`'s resume-chained legs double-count
+`global_step` (measured directly — a `--epochs 2` run reports 6 for 4 actual forwards).
+Every leg in the contract, and the P2 pre-flight below, pins `--epochs 1 --grad-accum 1` for
+exactly this reason: `batches == steps_measured` in the positive-proof equation is only true
+under that pinning, and `profile_421_merge.py` refuses a leg outside the convention BY NAME
+before it ever evaluates the equation — never silently computing a wrong `calls × batches`
+product.
+
+**`profile_421_merge.py`'s role.** The merge step (`ci/scripts/perf/profile_421_merge.py`,
+tested by 45 hermetic tests in `ci/scripts/perf/test_profile_421_merge.py`) is where the
+N/M wall-differencing method above becomes checked arithmetic for the towers. Per admission
+key it re-checks `fused + eager == fusible_site_census × steps_measured` (refusing INVALID
+first on the epochs/grad-accum convention above), and on a D leg it additionally requires
+`fused == 0` for every key named in `kernels_disabled_expected`. Per step it computes `wall`,
+`front` (the direct `media_front_end_wall_s` timer — `null` on a text leg is treated as `0`,
+with the residual labelled "front-end inside residual"), `busy` (from the kernel census),
+and `residual = wall − front − busy`; because `front` is CPU wall and `busy` is GPU device
+time on different timelines, a NEGATIVE residual is an OVERLAP measurement (front-end work
+pipelined against the previous step's still-running kernels), reported as `overlap_s` —
+never a leg invalidation. Every read is `isfinite`-guarded (a NaN comparison is proven False
+first, so a NaN measurement fails the check that reads it rather than silently comparing
+equal or unequal by accident). An invalid leg is an EXPERIMENTAL OUTCOME, not a tool
+failure: the script exits `0` with every invalid leg named in `summary.legs_invalid`, and
+the artifact producer gates on that field rather than on the script's own exit code.
+
+**P2, untraced by design.** The BF16 pre-flight (`PROFILE_421_P2_BF16=1` on
+`profile_421_legs.sh`) never runs under `nsys` — a qualitative "does this dtype even train"
+check has no business depending on the profiling instrument being present at all — and is
+dry-run tested straight through the real merge script, so the two P2 halves (the driver
+mode, the merge script's consumption of it) are proven to fit as shipped rather than as
+imagined.
+
 ### The bench and its torch twin
 
 `jammi-bench finetune-step`: three encoder forwards, a triplet hinge, one backward, one AdamW step; synthetic uniform token ids, so it measures *cost*, never learning. `torch_finetune_step.py` is matched argument for argument (`attn_implementation` read back from the config; `--attn eager` = semantic twin, `--attn sdpa` = the throughput bar; LoRA init distribution-matched; TF32 off). `ab_merge.py` refuses to compare legs whose `FINETUNE_IDENTITY_FIELDS` differ (the tuple is declared once, in `ci/scripts/perf/identity_fields.py`, and imported — 18 entries, including the padded-batch `row_lengths` vector); the raw attention string (`attn_requested`/`attn_implementation`) is recorded as provenance and never compared, while the reference *class* it implies is compared via the `attention_arm` identity field; the clip determinant `max_grad_norm` is in the comparison tuple (null = clip off is a value, never MISSING) and in the K7-completeness const (`FinetuneStepTier::IDENTITY_FIELDS`, a strict superset). A stdlib-`unittest` suite (`ci/scripts/perf/test_identity_fields_subset.py`) pins the claim mechanically: every Python comparison-tuple entry must be named in the corresponding Rust K7-completeness const, and the tuple cardinalities (18, 11) are asserted as numbers, not promises.

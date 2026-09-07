@@ -705,11 +705,10 @@ impl InferenceSession {
             .forward(&[binary_array], ModelTask::ImageEmbedding)
             .map_err(|e| JammiError::Inference(format!("encode_image_query forward: {e}")))?;
 
-        let dim = output.shapes.first().map(|(_, c)| *c).unwrap_or(0);
-        if output.float_outputs.is_empty() || output.float_outputs[0].is_empty() {
-            return Err(JammiError::Inference("No embedding output".into()));
-        }
-        Ok(output.float_outputs[0][..dim].to_vec())
+        // A single-row query has no other row to fall back on, so a corrupt
+        // image must surface as `Err`, never as the all-zero placeholder row
+        // the backend writes for a decode/preprocess failure.
+        Ok(output.single_row_or_err(0)?.to_vec())
     }
 
     /// Generate audio embeddings for a source and persist to Jammi DB.
@@ -759,11 +758,10 @@ impl InferenceSession {
             .forward(&[binary_array], ModelTask::AudioEmbedding)
             .map_err(|e| JammiError::Inference(format!("encode_audio_query forward: {e}")))?;
 
-        let dim = output.shapes.first().map(|(_, c)| *c).unwrap_or(0);
-        if output.float_outputs.is_empty() || output.float_outputs[0].is_empty() {
-            return Err(JammiError::Inference("No embedding output".into()));
-        }
-        Ok(output.float_outputs[0][..dim].to_vec())
+        // A single-row query has no other row to fall back on, so a corrupt
+        // clip must surface as `Err`, never as the all-zero placeholder row
+        // the backend writes for a decode/preprocess failure.
+        Ok(output.single_row_or_err(0)?.to_vec())
     }
 
     /// TEST-ONLY non-vacuity seam for the regression surface. Loads a fresh,

@@ -3470,7 +3470,7 @@ fn clap_frontend_from_preprocessor(
             .and_then(|v| v.as_f64())
             .ok_or_else(|| JammiError::Inference(format!("missing numeric field '{key}'")))
     };
-    Ok(audio_preprocess::ClapFrontendConfig {
+    let config = audio_preprocess::ClapFrontendConfig {
         n_mels: u("feature_size")? as usize,
         sample_rate: u("sampling_rate")? as u32,
         fft_window_size: u("fft_window_size")? as usize,
@@ -3478,7 +3478,93 @@ fn clap_frontend_from_preprocessor(
         frequency_min: f("frequency_min")?,
         frequency_max: f("frequency_max")?,
         max_length_s: u("max_length_s")? as u32,
-    })
+    };
+    // Validate the whole numeric domain HERE, at the parse edge, so a
+    // malformed `preprocessor_config.json` is a typed refusal at load time —
+    // never a panic or a silently wrong shape reached later, deep inside the
+    // fusion transform (see `ClapFrontendConfig::validate`'s doc for exactly
+    // which edge each field guards).
+    config.validate()?;
+    Ok(config)
+}
+
+/// `clap_frontend_from_preprocessor`'s PARSE-edge domain validation: a
+/// malformed `preprocessor_config.json` numeric must be a typed refusal
+/// right here, at parse time, never a panic or a silently wrong shape
+/// reached later inside the fusion transform.
+#[cfg(test)]
+mod clap_frontend_parse_validation_tests {
+    use super::*;
+
+    fn real_htsat_clap_preprocessor_config() -> serde_json::Value {
+        // Mirrors `cookbook/fixtures/htsat_clap_tiny/preprocessor_config.json`.
+        serde_json::json!({
+            "feature_extractor_type": "ClapFeatureExtractor",
+            "feature_size": 32,
+            "sampling_rate": 48000,
+            "hop_length": 577,
+            "fft_window_size": 1024,
+            "frequency_min": 50.0,
+            "frequency_max": 14000.0,
+            "max_length_s": 6,
+            "padding": "repeatpad",
+            "truncation": "fusion",
+        })
+    }
+
+    #[test]
+    fn parses_the_real_htsat_clap_config() {
+        let prep = real_htsat_clap_preprocessor_config();
+        assert!(clap_frontend_from_preprocessor(&prep).is_ok());
+    }
+
+    #[test]
+    fn rejects_zero_hop_length_at_parse_time() {
+        let mut prep = real_htsat_clap_preprocessor_config();
+        prep["hop_length"] = serde_json::json!(0);
+        let err = clap_frontend_from_preprocessor(&prep).unwrap_err();
+        assert!(err.to_string().contains("hop_length"));
+    }
+
+    #[test]
+    fn rejects_zero_sampling_rate_at_parse_time() {
+        let mut prep = real_htsat_clap_preprocessor_config();
+        prep["sampling_rate"] = serde_json::json!(0);
+        let err = clap_frontend_from_preprocessor(&prep).unwrap_err();
+        assert!(err.to_string().contains("sample_rate"));
+    }
+
+    #[test]
+    fn rejects_zero_max_length_s_at_parse_time() {
+        let mut prep = real_htsat_clap_preprocessor_config();
+        prep["max_length_s"] = serde_json::json!(0);
+        let err = clap_frontend_from_preprocessor(&prep).unwrap_err();
+        assert!(err.to_string().contains("max_length_s"));
+    }
+
+    #[test]
+    fn rejects_zero_feature_size_at_parse_time() {
+        let mut prep = real_htsat_clap_preprocessor_config();
+        prep["feature_size"] = serde_json::json!(0);
+        let err = clap_frontend_from_preprocessor(&prep).unwrap_err();
+        assert!(err.to_string().contains("n_mels"));
+    }
+
+    #[test]
+    fn rejects_non_power_of_two_fft_window_size_at_parse_time() {
+        let mut prep = real_htsat_clap_preprocessor_config();
+        prep["fft_window_size"] = serde_json::json!(1000);
+        let err = clap_frontend_from_preprocessor(&prep).unwrap_err();
+        assert!(err.to_string().contains("fft_window_size"));
+    }
+
+    #[test]
+    fn rejects_frequency_max_past_nyquist_at_parse_time() {
+        let mut prep = real_htsat_clap_preprocessor_config();
+        prep["frequency_max"] = serde_json::json!(30000.0); // > 48_000 / 2
+        let err = clap_frontend_from_preprocessor(&prep).unwrap_err();
+        assert!(err.to_string().contains("Nyquist"));
+    }
 }
 
 /// Convert token ID vectors into a candle Tensor on the given device.

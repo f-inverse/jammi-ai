@@ -174,7 +174,7 @@ pub fn decode_audio_batch_indexed<T>(row_ids: &[usize], items: &[T]) -> Result<V
 where
     T: AsRef<[u8]> + Sync,
 {
-    crate::inference::lowest_index_result(decode_audio_results(row_ids, items))
+    crate::inference::lowest_index_result(decode_audio_results(row_ids, items)?)
 }
 
 /// [`decode_audio_batch_indexed`]'s per-row outcomes, WITHOUT collapsing to
@@ -185,7 +185,7 @@ where
 pub fn decode_audio_batch_per_row_indexed<T>(
     row_ids: &[usize],
     items: &[T],
-) -> Vec<Result<DecodedAudio>>
+) -> Result<Vec<Result<DecodedAudio>>>
 where
     T: AsRef<[u8]> + Sync,
 {
@@ -196,16 +196,23 @@ where
 /// [`decode_audio_batch_per_row_indexed`] — the only difference between the
 /// two public entry points is whether the caller wants ALL per-row outcomes
 /// or just the lowest-index failure.
-fn decode_audio_results<T>(row_ids: &[usize], items: &[T]) -> Vec<Result<DecodedAudio>>
+///
+/// `row_ids.len() != items.len()` is a typed error, not a `debug_assert!`: in
+/// a release build a `debug_assert!` compiles out, and `.zip()` silently
+/// truncates to the SHORTER of the two slices — a short `row_ids` would then
+/// return zero outcomes for every item past its length, not an error.
+fn decode_audio_results<T>(row_ids: &[usize], items: &[T]) -> Result<Vec<Result<DecodedAudio>>>
 where
     T: AsRef<[u8]> + Sync,
 {
-    debug_assert_eq!(
-        row_ids.len(),
-        items.len(),
-        "row_ids must have one entry per item"
-    );
-    items
+    if row_ids.len() != items.len() {
+        return Err(JammiError::Inference(format!(
+            "decode_audio: row_ids has {} entries, expected one per item ({})",
+            row_ids.len(),
+            items.len()
+        )));
+    }
+    Ok(items
         .par_iter()
         .zip(row_ids.par_iter())
         .map(|(item, &row)| {
@@ -213,7 +220,7 @@ where
                 JammiError::Inference(format!("Failed to decode audio at row {row}: {e}"))
             })
         })
-        .collect()
+        .collect())
 }
 
 /// Resample mono PCM from `from_rate` to `to_rate` by linear interpolation.
@@ -283,6 +290,80 @@ impl ClapFrontendConfig {
     /// counts STFT frames over the padded window.
     fn chunk_frames(&self) -> usize {
         self.nb_max_samples() / self.hop_length + 1
+    }
+
+    /// Validate every numeric field the fusion front-end's math requires to
+    /// stay in a well-defined domain — called at the PARSE edge
+    /// (`clap_frontend_from_preprocessor`, right after a
+    /// `preprocessor_config.json` is read), never deferred to the point of
+    /// failure deep inside the transform:
+    ///
+    /// - `hop_length == 0` makes [`Self::chunk_frames`]'s `nb_max_samples /
+    ///   hop_length` an integer-division-by-zero panic.
+    /// - `sample_rate == 0` makes [`resample_linear`]'s ratio zero, so the
+    ///   resampled clip is empty and [`repeatpad`]'s `max_length / len`
+    ///   panics on the resulting `0 / 0`.
+    /// - `max_length_s == 0` collapses [`Self::nb_max_samples`] to zero
+    ///   without panicking anywhere, so every clip silently takes the
+    ///   fusion-crop branch over a near-empty window instead of failing —
+    ///   a confident-wrong shape, not a crash.
+    /// - `fft_window_size` must be a power of two (for the radix-2 FFT) AND
+    ///   at least 2: at `fft_window_size == 1`, `mel_filterbank_hz`'s bin
+    ///   count minus one is zero and its FFT-bin-frequency division degrades
+    ///   to `0.0 / 0.0` (NaN), silently, not a panic.
+    /// - `frequency_min`/`frequency_max` must be finite, ordered, and the
+    ///   upper edge must not exceed the Nyquist frequency implied by
+    ///   `sample_rate` — a filter edge past Nyquist is not a meaningful mel
+    ///   band for real audio.
+    pub fn validate(&self) -> Result<()> {
+        if self.n_mels == 0 {
+            return Err(JammiError::Inference(format!(
+                "Audio n_mels (feature_size) must be positive, got {}",
+                self.n_mels
+            )));
+        }
+        if self.sample_rate == 0 {
+            return Err(JammiError::Inference(
+                "Audio sample_rate (sampling_rate) must be positive, got 0".into(),
+            ));
+        }
+        if self.fft_window_size < 2 || !self.fft_window_size.is_power_of_two() {
+            return Err(JammiError::Inference(format!(
+                "Audio fft_window_size ({}) must be a power of two >= 2 for the radix-2 FFT",
+                self.fft_window_size
+            )));
+        }
+        if self.hop_length == 0 {
+            return Err(JammiError::Inference(
+                "Audio hop_length must be positive, got 0".into(),
+            ));
+        }
+        if self.max_length_s == 0 {
+            return Err(JammiError::Inference(
+                "Audio max_length_s must be positive, got 0".into(),
+            ));
+        }
+        if !self.frequency_min.is_finite() || self.frequency_min < 0.0 {
+            return Err(JammiError::Inference(format!(
+                "Audio frequency_min must be finite and non-negative, got {}",
+                self.frequency_min
+            )));
+        }
+        if !self.frequency_max.is_finite() || self.frequency_max <= self.frequency_min {
+            return Err(JammiError::Inference(format!(
+                "Audio frequency_max ({}) must be finite and greater than frequency_min ({})",
+                self.frequency_max, self.frequency_min
+            )));
+        }
+        let nyquist = self.sample_rate as f64 / 2.0;
+        if self.frequency_max > nyquist {
+            return Err(JammiError::Inference(format!(
+                "Audio frequency_max ({}) must not exceed the Nyquist frequency ({nyquist}) \
+                 implied by sample_rate ({})",
+                self.frequency_max, self.sample_rate
+            )));
+        }
+        Ok(())
     }
 }
 
@@ -357,23 +438,26 @@ pub fn preprocess_clap_fusion_indexed(
             "Cannot preprocess empty audio batch".into(),
         ));
     }
-    if config.n_mels == 0 {
+    // The comprehensive domain check ([`ClapFrontendConfig::validate`]) is
+    // also run at the config's PARSE edge
+    // (`clap_frontend_from_preprocessor`), but re-running it here defends a
+    // caller that builds/mutates a config directly (as this module's own
+    // tests do) rather than going through that funnel — a corrupt-domain
+    // config must never reach `mel_filterbank_hz`/`chunk_frames`/`repeatpad`
+    // below, whichever path constructed it.
+    config.validate()?;
+    // A typed error, not a `debug_assert!`: in a release build the
+    // three-way `.zip()` below (chunks / clips / row_ids) silently truncates
+    // to the SHORTEST of the three, so a short `row_ids` would leave every
+    // clip past its length UNWRITTEN in `flat` (still its zero-initialized
+    // placeholder) rather than failing.
+    if row_ids.len() != clips.len() {
         return Err(JammiError::Inference(format!(
-            "Audio n_mels must be positive, got {}",
-            config.n_mels
+            "preprocess_clap_fusion: row_ids has {} entries, expected one per clip ({})",
+            row_ids.len(),
+            clips.len()
         )));
     }
-    if !config.fft_window_size.is_power_of_two() {
-        return Err(JammiError::Inference(format!(
-            "Audio fft_window_size ({}) must be a power of two for the radix-2 FFT",
-            config.fft_window_size
-        )));
-    }
-    debug_assert_eq!(
-        row_ids.len(),
-        clips.len(),
-        "row_ids must have one entry per clip"
-    );
 
     let filters = mel_filterbank_hz(config);
     let window = hann_periodic(config.fft_window_size);
@@ -1007,6 +1091,163 @@ mod tests {
         );
     }
 
+    // -- `ClapFrontendConfig::validate` — per-field domain checks ------------
+
+    #[test]
+    fn validate_accepts_the_real_htsat_clap_config() {
+        // The actual `cookbook/fixtures/htsat_clap_tiny/preprocessor_config.json`
+        // values must never be rejected by the domain check.
+        let config = ClapFrontendConfig {
+            n_mels: 32,
+            sample_rate: 48_000,
+            fft_window_size: 1024,
+            hop_length: 577,
+            frequency_min: 50.0,
+            frequency_max: 14_000.0,
+            max_length_s: 6,
+        };
+        assert!(config.validate().is_ok());
+    }
+
+    #[test]
+    fn validate_rejects_zero_n_mels() {
+        let mut config = tiny_fusion_config();
+        config.n_mels = 0;
+        let err = config.validate().unwrap_err();
+        assert!(err.to_string().contains("n_mels"));
+    }
+
+    #[test]
+    fn validate_rejects_zero_sample_rate() {
+        let mut config = tiny_fusion_config();
+        config.sample_rate = 0;
+        let err = config.validate().unwrap_err();
+        assert!(err.to_string().contains("sample_rate"));
+    }
+
+    #[test]
+    fn validate_rejects_zero_hop_length() {
+        // `chunk_frames`'s `nb_max_samples / hop_length` is an
+        // integer-division-by-zero panic when `hop_length == 0`.
+        let mut config = tiny_fusion_config();
+        config.hop_length = 0;
+        let err = config.validate().unwrap_err();
+        assert!(err.to_string().contains("hop_length"));
+    }
+
+    #[test]
+    fn validate_rejects_zero_max_length_s() {
+        // `max_length_s == 0` collapses `nb_max_samples` to zero without
+        // panicking anywhere — a silent wrong-shape output, not a crash.
+        let mut config = tiny_fusion_config();
+        config.max_length_s = 0;
+        let err = config.validate().unwrap_err();
+        assert!(err.to_string().contains("max_length_s"));
+    }
+
+    #[test]
+    fn validate_rejects_non_power_of_two_fft_window_size() {
+        let mut config = tiny_fusion_config();
+        config.fft_window_size = 200;
+        let err = config.validate().unwrap_err();
+        assert!(err.to_string().contains("fft_window_size"));
+    }
+
+    #[test]
+    fn validate_rejects_fft_window_size_of_one() {
+        // A power of two (`2^0`) that still breaks `mel_filterbank_hz`'s
+        // `n_bins - 1` (== 0) division.
+        let mut config = tiny_fusion_config();
+        config.fft_window_size = 1;
+        let err = config.validate().unwrap_err();
+        assert!(err.to_string().contains("fft_window_size"));
+    }
+
+    #[test]
+    fn validate_rejects_non_finite_frequency_min() {
+        let mut config = tiny_fusion_config();
+        config.frequency_min = f64::NAN;
+        let err = config.validate().unwrap_err();
+        assert!(err.to_string().contains("frequency_min"));
+    }
+
+    #[test]
+    fn validate_rejects_negative_frequency_min() {
+        let mut config = tiny_fusion_config();
+        config.frequency_min = -1.0;
+        let err = config.validate().unwrap_err();
+        assert!(err.to_string().contains("frequency_min"));
+    }
+
+    #[test]
+    fn validate_rejects_frequency_max_at_or_below_frequency_min() {
+        let mut config = tiny_fusion_config();
+        config.frequency_min = 100.0;
+        config.frequency_max = 100.0;
+        let err = config.validate().unwrap_err();
+        assert!(err.to_string().contains("frequency_max"));
+    }
+
+    #[test]
+    fn validate_rejects_non_finite_frequency_max() {
+        let mut config = tiny_fusion_config();
+        config.frequency_max = f64::INFINITY;
+        let err = config.validate().unwrap_err();
+        assert!(err.to_string().contains("frequency_max"));
+    }
+
+    #[test]
+    fn validate_rejects_frequency_max_past_nyquist() {
+        let mut config = tiny_fusion_config();
+        config.sample_rate = 16_000;
+        config.frequency_max = 9_000.0; // > 16_000 / 2
+        let err = config.validate().unwrap_err();
+        assert!(err.to_string().contains("Nyquist"));
+    }
+
+    #[test]
+    fn validate_accepts_frequency_max_exactly_at_nyquist() {
+        let mut config = tiny_fusion_config();
+        config.sample_rate = 16_000;
+        config.frequency_max = 8_000.0; // == 16_000 / 2, the boundary
+        assert!(config.validate().is_ok());
+    }
+
+    #[test]
+    fn preprocess_clap_fusion_rejects_zero_sample_rate_without_panicking() {
+        // Pre-fix, `resample_linear`'s ratio-zero output feeds `repeatpad`'s
+        // `max_length / len` with `len == 0`, an integer-division-by-zero
+        // panic — the config-level `validate()` call inside
+        // `preprocess_clap_fusion_indexed` must refuse this before that code
+        // ever runs.
+        let clip = decode_audio_bytes(&sine_wav(440.0, 16_000, 2000)).unwrap();
+        let mut config = tiny_fusion_config();
+        config.sample_rate = 0;
+        let err = preprocess_clap_fusion(&[clip], &config, &Device::Cpu)
+            .expect_err("sample_rate == 0 must be a typed error, not a panic");
+        assert!(err.to_string().contains("sample_rate"));
+    }
+
+    #[test]
+    fn preprocess_clap_fusion_rejects_zero_hop_length_without_panicking() {
+        let clip = decode_audio_bytes(&sine_wav(440.0, 16_000, 2000)).unwrap();
+        let mut config = tiny_fusion_config();
+        config.hop_length = 0;
+        let err = preprocess_clap_fusion(&[clip], &config, &Device::Cpu)
+            .expect_err("hop_length == 0 must be a typed error, not a panic");
+        assert!(err.to_string().contains("hop_length"));
+    }
+
+    #[test]
+    fn preprocess_clap_fusion_rejects_zero_max_length_s() {
+        let clip = decode_audio_bytes(&sine_wav(440.0, 16_000, 2000)).unwrap();
+        let mut config = tiny_fusion_config();
+        config.max_length_s = 0;
+        let err = preprocess_clap_fusion(&[clip], &config, &Device::Cpu)
+            .expect_err("max_length_s == 0 must be a typed error, not a silent shape");
+        assert!(err.to_string().contains("max_length_s"));
+    }
+
     // -- Media front-end parallelization (#421 follow-on) --------------------
 
     #[test]
@@ -1044,9 +1285,9 @@ mod tests {
         );
     }
 
-    /// The row-index bug this fold closes: a caller that COMPACTS its batch
-    /// (drops null rows) before decoding must get the ORIGINAL row back in
-    /// the error, not the position in the compacted `items` slice.
+    /// A caller that COMPACTS its batch (drops null rows) before decoding
+    /// must get the ORIGINAL row back in the error, not the position in the
+    /// compacted `items` slice.
     #[test]
     fn decode_audio_batch_indexed_reports_the_given_row_id_not_the_position() {
         let good = sine_wav(440.0, 16_000, 2000);
@@ -1063,6 +1304,49 @@ mod tests {
             !msg.contains("row 1:"),
             "must never report the compacted position instead of the row id: {msg}"
         );
+    }
+
+    #[test]
+    fn decode_audio_results_rejects_short_row_ids_instead_of_dropping_tail_items() {
+        // `.zip()` silently truncates to the shorter of `items`/`row_ids` in
+        // a release build (`debug_assert!` compiles out there), so a short
+        // `row_ids` must be a typed error, not zero outcomes for the
+        // uncovered tail items.
+        let good = sine_wav(440.0, 16_000, 2000);
+        let items: Vec<Vec<u8>> = vec![good.clone(), good];
+        let row_ids = vec![0usize]; // one entry short of `items.len()`
+        let err = decode_audio_batch_indexed(&row_ids, &items)
+            .expect_err("a short row_ids must be a typed error, not silent truncation");
+        assert!(err.to_string().contains("row_ids"));
+    }
+
+    #[test]
+    fn decode_audio_batch_per_row_indexed_rejects_short_row_ids() {
+        let good = sine_wav(440.0, 16_000, 2000);
+        let items: Vec<Vec<u8>> = vec![good.clone(), good];
+        let row_ids = vec![0usize];
+        let err = decode_audio_batch_per_row_indexed(&row_ids, &items)
+            .expect_err("a short row_ids must be a typed error, not silent truncation");
+        assert!(err.to_string().contains("row_ids"));
+    }
+
+    #[test]
+    fn preprocess_clap_fusion_indexed_rejects_short_row_ids_instead_of_leaving_a_tail_unwritten() {
+        // The three-way `.zip()` (chunks / clips / row_ids) would otherwise
+        // leave every clip past `row_ids.len()` as its zero-initialized
+        // placeholder in `flat`, silently, rather than failing.
+        let bytes = sine_wav(220.0, 16_000, 2000);
+        let clips = vec![
+            decode_audio_bytes(&bytes).unwrap(),
+            decode_audio_bytes(&bytes).unwrap(),
+        ];
+        let row_ids = vec![0usize];
+        let err =
+            preprocess_clap_fusion_indexed(&row_ids, &clips, &tiny_fusion_config(), &Device::Cpu)
+                .expect_err(
+                    "a short row_ids must be a typed error, not a silently truncated tensor",
+                );
+        assert!(err.to_string().contains("row_ids"));
     }
 
     #[test]

@@ -109,11 +109,9 @@ fn arrow_to_images_two_bad_binary_rows_each_surface_their_own_row() {
     assert!(out[5].as_ref().unwrap().is_ok(), "row 5 must decode");
 }
 
-/// The mixed state the pre-fold tests never built: NULL rows AND a corrupt
-/// row in the SAME batch. Closes the row-index bug this fold fixes — the
-/// corrupt row's error must name its ARROW row (5), not its position among
-/// the non-null rows (2, since rows 1 and 3 are null and get compacted out
-/// before decoding).
+/// NULL rows AND a corrupt row in the SAME batch: the corrupt row's error
+/// must name its ARROW row (4), not its position among the non-null rows (2,
+/// since rows 1 and 3 are null and get compacted out before decoding).
 #[test]
 fn arrow_to_images_nulls_and_a_bad_row_together_report_the_arrow_row() {
     let corpus = tiny_image_corpus_dir();
@@ -144,6 +142,31 @@ fn arrow_to_images_nulls_and_a_bad_row_together_report_the_arrow_row() {
         "must never report the compacted position instead of the Arrow row: {row4}"
     );
     assert!(out[5].as_ref().unwrap().is_ok(), "row 5 must decode");
+}
+
+/// The ONE documented per-row decode-failure shape
+/// (`docs/guide/src/generate-image-embeddings.md`'s "Error handling" table:
+/// `"Failed to decode image at row N: ..."`) must hold for a PATH-valued
+/// corrupt row too, with the path appended AFTER that documented
+/// prefix+cause, never spliced into the middle of it.
+#[test]
+fn arrow_to_images_path_valued_bad_row_keeps_the_documented_prefix_and_appends_the_path() {
+    let dir = tempfile::tempdir().unwrap();
+    let bad_path = dir.path().join("corrupt.png");
+    std::fs::write(&bad_path, b"not an image at all").unwrap();
+
+    let col: ArrayRef = Arc::new(StringArray::from(vec![Some(bad_path.to_str().unwrap())]));
+    let out = arrow_to_images(&[col]).expect("a decode failure is per-row, not a hard Err");
+    let err = out[0].as_ref().unwrap().as_ref().unwrap_err().to_string();
+    assert!(
+        err.contains("Failed to decode image at row 0: "),
+        "must keep the documented prefix verbatim: {err}"
+    );
+    let path_str = bad_path.to_str().unwrap();
+    assert!(
+        err.ends_with(&format!("(path '{path_str}')")),
+        "must append the path AFTER the documented prefix+cause: {err}"
+    );
 }
 
 // ─── `arrow_to_audio` ────────────────────────────────────────────────────────
@@ -209,11 +232,9 @@ fn arrow_to_audio_two_bad_binary_rows_each_surface_their_own_row() {
     assert!(out[5].as_ref().unwrap().is_ok(), "row 5 must decode");
 }
 
-/// The mixed state the pre-fold tests never built: NULL rows AND a corrupt
-/// row in the SAME batch. Closes the row-index bug this fold fixes — the
-/// corrupt row's error must name its ARROW row (4), not its position among
-/// the non-null rows (2, since rows 1 and 3 are null and get compacted out
-/// before decoding).
+/// NULL rows AND a corrupt row in the SAME batch: the corrupt row's error
+/// must name its ARROW row (4), not its position among the non-null rows (2,
+/// since rows 1 and 3 are null and get compacted out before decoding).
 #[test]
 fn arrow_to_audio_nulls_and_a_bad_row_together_report_the_arrow_row() {
     let corpus = tiny_audio_corpus_dir();
@@ -244,6 +265,32 @@ fn arrow_to_audio_nulls_and_a_bad_row_together_report_the_arrow_row() {
         "must never report the compacted position instead of the Arrow row: {row4}"
     );
     assert!(out[5].as_ref().unwrap().is_ok(), "row 5 must decode");
+}
+
+/// The audio peer of
+/// `arrow_to_images_path_valued_bad_row_keeps_the_documented_prefix_and_appends_the_path`:
+/// the documented shape (`"Failed to decode audio at row N: ..."`) and the
+/// path-appended-after-the-prefix convention must hold identically for
+/// audio, not just image — `arrow_to_audio` must attach a path-valued row's
+/// source path to its decode failure exactly as `arrow_to_images` does.
+#[test]
+fn arrow_to_audio_path_valued_bad_row_keeps_the_documented_prefix_and_appends_the_path() {
+    let dir = tempfile::tempdir().unwrap();
+    let bad_path = dir.path().join("corrupt.wav");
+    std::fs::write(&bad_path, b"not audio at all").unwrap();
+
+    let col: ArrayRef = Arc::new(StringArray::from(vec![Some(bad_path.to_str().unwrap())]));
+    let out = arrow_to_audio(&[col]).expect("a decode failure is per-row, not a hard Err");
+    let err = out[0].as_ref().unwrap().as_ref().unwrap_err().to_string();
+    assert!(
+        err.contains("Failed to decode audio at row 0: "),
+        "must keep the documented prefix verbatim: {err}"
+    );
+    let path_str = bad_path.to_str().unwrap();
+    assert!(
+        err.ends_with(&format!("(path '{path_str}')")),
+        "must append the path AFTER the documented prefix+cause: {err}"
+    );
 }
 
 // ─── n = 1 serving-latency measurement (before vs after) ───────────────────
@@ -297,6 +344,25 @@ fn sequential_preprocess_one(
     out
 }
 
+/// [`sequential_preprocess_one`] plus the SAME `Tensor::from_vec` construction
+/// `preprocess_image_batch`'s "after" path ends with — so "before" and
+/// "after" do the same work end-to-end (pixel loop AND tensor build), not
+/// just the pixel loop. Omitting the tensor build from "before" would make
+/// "after" pay for work "before" never measured, silently flattering the
+/// parallel path's apparent overhead.
+fn sequential_preprocess_one_tensor(
+    img: &image::DynamicImage,
+    target_size: u32,
+    mean: &[f32; 3],
+    std: &[f32; 3],
+    device: &candle_core::Device,
+) -> candle_core::Tensor {
+    let row = sequential_preprocess_one(img, target_size, mean, std);
+    let t = target_size as usize;
+    candle_core::Tensor::from_vec(row, (1, 3, t, t), device)
+        .expect("sequential reference tensor build must succeed")
+}
+
 /// Measures the n=1 image-embedding front-end request path before (the
 /// sequential per-pixel loop reproduced above) and after (the shipped
 /// `image_preprocess::preprocess_image_batch`, which now runs its per-item
@@ -321,7 +387,7 @@ fn n1_image_request_latency_before_vs_after() {
 
     // Warm up (page faults, filter-table setup, allocator warm-up) so the
     // timed loop measures steady-state per-call cost, not one-time setup.
-    sequential_preprocess_one(&img, target_size, &mean, &std);
+    sequential_preprocess_one_tensor(&img, target_size, &mean, &std, &device);
     preprocess_image_batch(
         std::slice::from_ref(&img),
         target_size,
@@ -333,10 +399,13 @@ fn n1_image_request_latency_before_vs_after() {
 
     let before_start = std::time::Instant::now();
     for _ in 0..ITERS {
-        let row = sequential_preprocess_one(&img, target_size, &mean, &std);
+        // Same work as "after": pixel loop AND tensor build (see
+        // `sequential_preprocess_one_tensor`'s doc for why the tensor build
+        // must be included on both sides).
+        let t = sequential_preprocess_one_tensor(&img, target_size, &mean, &std, &device);
         assert_eq!(
-            row.len(),
-            3 * (target_size as usize) * (target_size as usize)
+            t.dims(),
+            &[1, 3, target_size as usize, target_size as usize]
         );
     }
     let before = before_start.elapsed() / ITERS;
@@ -363,18 +432,33 @@ fn n1_image_request_latency_before_vs_after() {
          before(sequential)={before:?}  after(par_chunks_mut, n=1)={after:?}"
     );
 
-    // This is a wall-clock, machine-load-sensitive measurement — unsuitable
-    // as a hard, always-on assertion in the default suite (flaky under CI
-    // contention). It is MEASURED and PRINTED on every run (see above); the
-    // contract's pre-registered bar (the pod's interleaved A/B is the
-    // authoritative ≤5% regression check, over N=100 steps on the real
+    // A tight 5% bar is a wall-clock, machine-load-sensitive measurement —
+    // unsuitable as a hard, always-on assertion in the default suite (flaky
+    // under CI contention). It is MEASURED and PRINTED on every run (see
+    // above); the contract's pre-registered bar (the pod's interleaved A/B is
+    // the authoritative ≤5% regression check, over N=100 steps on the real
     // corpus — this Mac-local n=1 check is a much coarser proxy for it) is
     // only ASSERTED when explicitly opted into via
     // `JAMMI_FRONTEND_N1_LATENCY=1`, so a noisy dev machine or CI runner
     // never reds the default suite on a wall-clock fluke. (This fn never
     // SKIPS — it always runs and always measures; the env var narrows only
-    // the assertion, not reachability, so KO-7's require-gate registry does
-    // not apply here.)
+    // the tight assertion, not reachability, so KO-7's require-gate registry
+    // does not apply here.)
+    //
+    // A much LOOSER bar stays ALWAYS-ON, though: n=1 has no parallel work to
+    // gain from (exactly one `par_chunks_mut` chunk), so "after" should never
+    // be dramatically slower than "before" — a regression that big (a stray
+    // per-call thread-pool install, a lock acquired every request, ...) is a
+    // real bug the default suite should catch on every run, not just an
+    // opted-in one. `before×3 + 5ms` is generous enough to absorb ordinary
+    // CI-machine noise while still catching an order-of-magnitude regression.
+    let gross_bar = before.mul_f64(3.0) + std::time::Duration::from_millis(5);
+    assert!(
+        after <= gross_bar,
+        "n=1 request latency regressed far beyond a gross always-on bar: \
+         before={before:?} after={after:?} bar(3x before + 5ms)={gross_bar:?}"
+    );
+
     if std::env::var_os("JAMMI_FRONTEND_N1_LATENCY").is_some() {
         let bar = before.mul_f64(1.05);
         assert!(

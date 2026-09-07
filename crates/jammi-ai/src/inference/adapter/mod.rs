@@ -5,7 +5,7 @@ pub mod ner;
 
 use arrow::array::{ArrayRef, Float32Array, StringArray};
 use arrow::datatypes::Field;
-use jammi_db::error::Result;
+use jammi_db::error::{JammiError, Result};
 
 pub use classification::ClassificationAdapter;
 pub use distribution::{DistributionAdapter, DistributionForm};
@@ -27,6 +27,67 @@ pub struct BackendOutput {
     pub shapes: Vec<(usize, usize)>,
 }
 
+impl BackendOutput {
+    /// Build the typed refusal for a failed row, using the row's recorded
+    /// message when present or a generic fallback otherwise. Shared by
+    /// [`Self::single_row_or_err`] and [`Self::all_rows_or_err`] so both
+    /// checked accessors report a failed row identically.
+    fn row_error(&self, row: usize) -> JammiError {
+        match self.row_errors.get(row).filter(|m| !m.is_empty()) {
+            Some(msg) => JammiError::Inference(msg.clone()),
+            None => JammiError::Inference(format!("Row {row} inference failed")),
+        }
+    }
+
+    /// Returns output head 0's slice for `row`, or `row`'s typed error when
+    /// `row_status[row]` is `false`.
+    ///
+    /// A per-row backend (`forward_image_embedding`, `forward_audio_embedding`)
+    /// writes an all-zero placeholder into `float_outputs[0]` for a row whose
+    /// decode/preprocess failed, so the rest of a multi-row batch can still
+    /// embed. A caller that serves exactly one row per call (a single-item
+    /// query) has no later row to recover with, so it MUST go through this
+    /// accessor rather than reading `float_outputs[0]` directly — otherwise a
+    /// corrupt input's refusal silently becomes a zero vector instead of an
+    /// `Err`.
+    pub fn single_row_or_err(&self, row: usize) -> Result<&[f32]> {
+        if !self.row_status.get(row).copied().unwrap_or(false) {
+            return Err(self.row_error(row));
+        }
+        let dim = self.shapes.first().map(|(_, c)| *c).unwrap_or(0);
+        let flat = self
+            .float_outputs
+            .first()
+            .filter(|v| !v.is_empty())
+            .ok_or_else(|| JammiError::Inference("No embedding output".into()))?;
+        let start = row * dim;
+        let end = start + dim;
+        flat.get(start..end)
+            .ok_or_else(|| JammiError::Inference("Embedding output shorter than its shape".into()))
+    }
+
+    /// Returns output head 0's full flattened matrix only when EVERY row
+    /// succeeded; otherwise returns the lowest-index failed row's typed error
+    /// (mirroring the trainer's decode-batch convention of surfacing the
+    /// lowest-index error as a whole-step refusal).
+    ///
+    /// A batch consumer that forwards several items in one call (e.g. a
+    /// fine-tune trainer projecting a frozen embedding for a training group)
+    /// must never silently train on the all-zero placeholder a per-row
+    /// backend substitutes for a decode/preprocess refusal — a corrupt
+    /// training item is a refusal, not a row to skip.
+    pub fn all_rows_or_err(&self) -> Result<&[f32]> {
+        if let Some(bad) = self.row_status.iter().position(|ok| !ok) {
+            return Err(self.row_error(bad));
+        }
+        self.float_outputs
+            .first()
+            .filter(|v| !v.is_empty())
+            .map(|v| v.as_slice())
+            .ok_or_else(|| JammiError::Inference("No embedding output".into()))
+    }
+}
+
 /// Converts raw backend output into Arrow arrays for a specific task.
 pub trait OutputAdapter: Send + Sync {
     /// Arrow schema for this task's output columns (excluding common prefix).
@@ -38,7 +99,6 @@ pub trait OutputAdapter: Send + Sync {
 
 /// Create an adapter for a given task with model-derived dimensions.
 pub fn create_adapter(task: ModelTask, model: &LoadedModel) -> Result<Box<dyn OutputAdapter>> {
-    use jammi_db::error::JammiError;
     match task {
         ModelTask::TextEmbedding | ModelTask::ImageEmbedding | ModelTask::AudioEmbedding => {
             let dim = model.embedding_dim().ok_or_else(|| {

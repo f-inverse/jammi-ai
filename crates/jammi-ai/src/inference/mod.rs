@@ -246,12 +246,12 @@ pub fn arrow_to_images(columns: &[ArrayRef]) -> Result<Vec<Option<Result<Dynamic
     // re-thread loop below runs — only `is_null` and the decoded outcomes
     // survive it.
     let decoded: Vec<Result<DynamicImage>> =
-        image_preprocess::decode_image_batch_per_row_indexed(&row_ids, &byte_rows)
+        image_preprocess::decode_image_batch_per_row_indexed(&row_ids, &byte_rows)?
             .into_iter()
             .zip(row_ids.iter())
             .zip(source_paths.iter())
             .map(|((outcome, &row), path)| {
-                outcome.map_err(|e| attach_source_path(e, row, path.as_deref()))
+                outcome.map_err(|e| attach_source_path(e, "image", row, path.as_deref()))
             })
             .collect();
     drop(byte_rows);
@@ -275,16 +275,26 @@ pub fn arrow_to_images(columns: &[ArrayRef]) -> Result<Vec<Option<Result<Dynamic
 }
 
 /// A row's decode failure re-attaches its source path (for a path-valued
-/// row) into the error text, restoring the pre-unit message shape
-/// (`"Failed to decode image at row {row} (path '{path}'): ..."`) that
+/// row) into the error text, in the ONE documented per-row decode-failure
+/// shape (`docs/guide/src/generate-image-embeddings.md`'s "Error handling"
+/// table: `"Failed to decode {kind} at row N: ..."`), shared by both media
+/// types (`kind` is `"image"` or `"audio"`) and both the path-valued and
+/// bytes-valued arms — a path, when present, is appended AFTER the
+/// documented prefix and cause (`"... (path '...')"`) rather than spliced
+/// into the middle of it, so a caller matching on the documented prefix
+/// never has to skip a variable-length path segment first. This is NOT the
+/// pre-unit path arm's shape (that was `"Failed to load image '{path}':
+/// {e}"`, a wholly different message with no row number) — it is the shape
+/// the per-row serving contract documents today, applied uniformly.
+///
 /// [`decode_image_batch_per_row_indexed`](image_preprocess::decode_image_batch_per_row_indexed)
-/// cannot produce itself — it only ever sees raw bytes, never a path. Finds
-/// the cause by matching the delimiter-safe `"row {row}: "` marker against
-/// `decode_image_batch_per_row_indexed`'s own, fully-controlled error format
-/// (never user data) and keeps only the text AFTER that marker (so the path
-/// is spliced in, not duplicated alongside the original text); a
-/// bytes-valued row (no path) or a match miss returns the error unchanged.
-fn attach_source_path(err: JammiError, row: usize, path: Option<&str>) -> JammiError {
+/// and its audio peer only ever see raw bytes, never a path, so they cannot
+/// produce this shape themselves; this function splices the path in
+/// afterward by matching the delimiter-safe `"row {row}: "` marker against
+/// their own, fully-controlled error format (never user data) and keeping
+/// only the text AFTER that marker; a bytes-valued row (no path) or a match
+/// miss returns the error unchanged.
+fn attach_source_path(err: JammiError, kind: &str, row: usize, path: Option<&str>) -> JammiError {
     let Some(path) = path else {
         return err;
     };
@@ -295,7 +305,7 @@ fn attach_source_path(err: JammiError, row: usize, path: Option<&str>) -> JammiE
         None => return err,
     };
     JammiError::Inference(format!(
-        "Failed to decode image at row {row} (path '{path}'): {cause}"
+        "Failed to decode {kind} at row {row}: {cause} (path '{path}')"
     ))
 }
 
@@ -340,13 +350,14 @@ pub fn arrow_to_audio(
     let mut is_null: Vec<bool> = Vec::with_capacity(row_count);
     let mut row_ids: Vec<usize> = Vec::new();
     let mut byte_rows: Vec<Cow<[u8]>> = Vec::new();
+    let mut source_paths: Vec<Option<String>> = Vec::new();
     for i in 0..row_count {
         if col.is_null(i) {
             is_null.push(true);
             continue;
         }
         is_null.push(false);
-        let bytes: Cow<[u8]> = match col.data_type() {
+        let (bytes, path): (Cow<[u8]>, Option<String>) = match col.data_type() {
             DataType::Utf8 => {
                 let path = col
                     .as_any()
@@ -355,9 +366,10 @@ pub fn arrow_to_audio(
                     .ok_or_else(|| {
                         JammiError::Inference(format!("Failed to read path at row {i}"))
                     })?;
-                Cow::Owned(std::fs::read(path).map_err(|e| {
+                let bytes = std::fs::read(path).map_err(|e| {
                     JammiError::Inference(format!("Failed to read audio file '{path}': {e}"))
-                })?)
+                })?;
+                (Cow::Owned(bytes), Some(path.to_string()))
             }
             DataType::LargeUtf8 => {
                 let path = col
@@ -367,33 +379,43 @@ pub fn arrow_to_audio(
                     .ok_or_else(|| {
                         JammiError::Inference(format!("Failed to read path at row {i}"))
                     })?;
-                Cow::Owned(std::fs::read(path).map_err(|e| {
+                let bytes = std::fs::read(path).map_err(|e| {
                     JammiError::Inference(format!("Failed to read audio file '{path}': {e}"))
-                })?)
+                })?;
+                (Cow::Owned(bytes), Some(path.to_string()))
             }
-            DataType::Binary => Cow::Borrowed(
-                col.as_any()
-                    .downcast_ref::<BinaryArray>()
-                    .map(|a| a.value(i))
-                    .ok_or_else(|| {
-                        JammiError::Inference(format!("Failed to read bytes at row {i}"))
-                    })?,
+            DataType::Binary => (
+                Cow::Borrowed(
+                    col.as_any()
+                        .downcast_ref::<BinaryArray>()
+                        .map(|a| a.value(i))
+                        .ok_or_else(|| {
+                            JammiError::Inference(format!("Failed to read bytes at row {i}"))
+                        })?,
+                ),
+                None,
             ),
-            DataType::LargeBinary => Cow::Borrowed(
-                col.as_any()
-                    .downcast_ref::<LargeBinaryArray>()
-                    .map(|a| a.value(i))
-                    .ok_or_else(|| {
-                        JammiError::Inference(format!("Failed to read bytes at row {i}"))
-                    })?,
+            DataType::LargeBinary => (
+                Cow::Borrowed(
+                    col.as_any()
+                        .downcast_ref::<LargeBinaryArray>()
+                        .map(|a| a.value(i))
+                        .ok_or_else(|| {
+                            JammiError::Inference(format!("Failed to read bytes at row {i}"))
+                        })?,
+                ),
+                None,
             ),
-            DataType::BinaryView => Cow::Borrowed(
-                col.as_any()
-                    .downcast_ref::<BinaryViewArray>()
-                    .map(|a| a.value(i))
-                    .ok_or_else(|| {
-                        JammiError::Inference(format!("Failed to read bytes at row {i}"))
-                    })?,
+            DataType::BinaryView => (
+                Cow::Borrowed(
+                    col.as_any()
+                        .downcast_ref::<BinaryViewArray>()
+                        .map(|a| a.value(i))
+                        .ok_or_else(|| {
+                            JammiError::Inference(format!("Failed to read bytes at row {i}"))
+                        })?,
+                ),
+                None,
             ),
             dt => {
                 return Err(JammiError::Inference(format!(
@@ -404,16 +426,27 @@ pub fn arrow_to_audio(
         };
         row_ids.push(i);
         byte_rows.push(bytes);
+        source_paths.push(path);
     }
 
     // Stage 2 (parallel): decode every non-null row's bytes on rayon's global
     // pool, Arrow-row-numbered via `row_ids`, keeping EVERY row's own outcome
-    // (not collapsed to the lowest-index failure). `byte_rows` (the resident
-    // encoded bytes) is dropped as soon as decode returns, before the
-    // re-thread loop below runs — only `is_null` and the decoded outcomes
-    // survive it.
-    let decoded = audio_preprocess::decode_audio_batch_per_row_indexed(&row_ids, &byte_rows);
+    // (not collapsed to the lowest-index failure) — a path-valued row's
+    // failure is re-attached to its source path, mirroring
+    // [`arrow_to_images`]. `byte_rows` (the resident encoded bytes) is
+    // dropped as soon as decode returns, before the re-thread loop below
+    // runs — only `is_null` and the decoded outcomes survive it.
+    let decoded: Vec<Result<audio_preprocess::DecodedAudio>> =
+        audio_preprocess::decode_audio_batch_per_row_indexed(&row_ids, &byte_rows)?
+            .into_iter()
+            .zip(row_ids.iter())
+            .zip(source_paths.iter())
+            .map(|((outcome, &row), path)| {
+                outcome.map_err(|e| attach_source_path(e, "audio", row, path.as_deref()))
+            })
+            .collect();
     drop(byte_rows);
+    drop(source_paths);
 
     let mut decoded_iter = decoded.into_iter();
     let mut clips = Vec::with_capacity(row_count);

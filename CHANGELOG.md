@@ -227,8 +227,10 @@ workspace ships every publishable crate at the same
   emergent from whichever rayon pool a call runs under — candle installs no private pool, so this is
   the one pool the process ever schedules media-batch work on. `fine_tune::media_front_end_pool_threads()`
   exposes the pool size (`rayon::current_num_threads()`, not a per-batch thread count) as
-  `FinetuneRunTier`'s new `rayon_pool_threads` provenance field (`PROVENANCE_FIELDS` 12 → 13,
-  mirrored in `identity_fields.py`'s own extraction of the Rust const). Bit-identical to the
+  `FinetuneRunTier`'s new `rayon_pool_threads` provenance field (`PROVENANCE_FIELDS` 12 → 13; the
+  exact-count pin against this Rust const lives in
+  `ci/scripts/perf/test_identity_fields_subset.py`, not `identity_fields.py`, which carries no
+  `PROVENANCE_FIELDS` extraction of its own). Bit-identical to the
   pre-unit sequential loop at every rayon pool size tested (1, 5, 7, 24, including non-dividing
   counts) — proven for both CLAP-fusion branches (repeatpad; fusion-crop, including the
   `total == chunk` corner case) and the image batch path. `ci/scripts/perf/frontend_ab.sh` is the

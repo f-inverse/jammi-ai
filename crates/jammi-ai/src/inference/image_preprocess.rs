@@ -50,7 +50,7 @@ pub fn decode_image_batch_indexed<T>(row_ids: &[usize], items: &[T]) -> Result<V
 where
     T: AsRef<[u8]> + Sync,
 {
-    crate::inference::lowest_index_result(decode_image_results(row_ids, items))
+    crate::inference::lowest_index_result(decode_image_results(row_ids, items)?)
 }
 
 /// [`decode_image_batch_indexed`]'s per-row outcomes, WITHOUT collapsing to
@@ -61,7 +61,7 @@ where
 pub fn decode_image_batch_per_row_indexed<T>(
     row_ids: &[usize],
     items: &[T],
-) -> Vec<Result<DynamicImage>>
+) -> Result<Vec<Result<DynamicImage>>>
 where
     T: AsRef<[u8]> + Sync,
 {
@@ -72,16 +72,23 @@ where
 /// [`decode_image_batch_per_row_indexed`] — the only difference between the
 /// two public entry points is whether the caller wants ALL per-row outcomes
 /// or just the lowest-index failure.
-fn decode_image_results<T>(row_ids: &[usize], items: &[T]) -> Vec<Result<DynamicImage>>
+///
+/// `row_ids.len() != items.len()` is a typed error, not a `debug_assert!`: in
+/// a release build a `debug_assert!` compiles out, and `.zip()` silently
+/// truncates to the SHORTER of the two slices — a short `row_ids` would then
+/// return zero outcomes for every item past its length, not an error.
+fn decode_image_results<T>(row_ids: &[usize], items: &[T]) -> Result<Vec<Result<DynamicImage>>>
 where
     T: AsRef<[u8]> + Sync,
 {
-    debug_assert_eq!(
-        row_ids.len(),
-        items.len(),
-        "row_ids must have one entry per item"
-    );
-    items
+    if row_ids.len() != items.len() {
+        return Err(JammiError::Inference(format!(
+            "decode_image: row_ids has {} entries, expected one per item ({})",
+            row_ids.len(),
+            items.len()
+        )));
+    }
+    Ok(items
         .par_iter()
         .zip(row_ids.par_iter())
         .map(|(item, &row)| {
@@ -89,7 +96,7 @@ where
                 JammiError::Inference(format!("Failed to decode image at row {row}: {e}"))
             })
         })
-        .collect()
+        .collect())
 }
 
 /// One image's normalized pixel row: pad to square → resize → normalize,
@@ -196,11 +203,37 @@ pub fn preprocess_image_batch_indexed(
             "Image target_size must be positive, got 0".into(),
         ));
     }
-    debug_assert_eq!(
-        row_ids.len(),
-        images.len(),
-        "row_ids must have one entry per image"
-    );
+    // `preprocess_one_image` divides by `std[c]`; a zero or non-finite
+    // component silently produces inf/NaN pixels rather than failing, so the
+    // domain is validated HERE, at the edge, for every channel — regardless
+    // of whether `mean`/`std` came from a hardcoded tower constant or a
+    // future config-driven source.
+    for c in 0..3 {
+        if !std[c].is_finite() || std[c] == 0.0 {
+            return Err(JammiError::Inference(format!(
+                "Image preprocess std[{c}] must be finite and non-zero, got {}",
+                std[c]
+            )));
+        }
+        if !mean[c].is_finite() {
+            return Err(JammiError::Inference(format!(
+                "Image preprocess mean[{c}] must be finite, got {}",
+                mean[c]
+            )));
+        }
+    }
+    // A typed error, not a `debug_assert!`: in a release build the
+    // three-way `.zip()` below (chunks / images / row_ids) silently
+    // truncates to the SHORTEST of the three, so a short `row_ids` would
+    // leave every image past its length UNWRITTEN in `flat` (still its
+    // zero-initialized placeholder) rather than failing.
+    if row_ids.len() != images.len() {
+        return Err(JammiError::Inference(format!(
+            "preprocess_image_batch: row_ids has {} entries, expected one per image ({})",
+            row_ids.len(),
+            images.len()
+        )));
+    }
 
     let pixels_per_image = 3 * (target_size as usize) * (target_size as usize);
     let mut flat = vec![0f32; images.len() * pixels_per_image];
@@ -381,10 +414,10 @@ mod tests {
         );
     }
 
-    /// The row-index bug this fold closes: a caller that COMPACTS its batch
-    /// (drops null rows) before decoding must get the ORIGINAL row back in
-    /// the error, not the position in the compacted `items` slice. Position 1
-    /// (the bad row) is deliberately given a row id far from its position.
+    /// A caller that COMPACTS its batch (drops null rows) before decoding
+    /// must get the ORIGINAL row back in the error, not the position in the
+    /// compacted `items` slice. Position 1 (the bad row) is deliberately
+    /// given a row id far from its position.
     #[test]
     fn decode_image_batch_indexed_reports_the_given_row_id_not_the_position() {
         let good = png_bytes(4, 4, [1, 2, 3]);
@@ -417,6 +450,85 @@ mod tests {
             msg.contains("target_size") && msg.contains('0'),
             "error must name the field and the offending value: {msg}"
         );
+    }
+
+    #[test]
+    fn preprocess_image_batch_rejects_zero_std_component() {
+        // `preprocess_one_image` divides by `std[c]`; a zero component would
+        // silently produce inf pixels rather than failing.
+        let images = vec![test_image(4, 4)];
+        let mut std = TEST_STD;
+        std[1] = 0.0;
+        let err = preprocess_image_batch(&images, 4, &TEST_MEAN, &std, &Device::Cpu)
+            .expect_err("std[1] == 0 must be a typed error, not silent inf pixels");
+        let msg = err.to_string();
+        assert!(
+            msg.contains("std[1]") && msg.contains('0'),
+            "error must name the field and the offending value: {msg}"
+        );
+    }
+
+    #[test]
+    fn preprocess_image_batch_rejects_non_finite_std_component() {
+        let images = vec![test_image(4, 4)];
+        let mut std = TEST_STD;
+        std[2] = f32::NAN;
+        let err = preprocess_image_batch(&images, 4, &TEST_MEAN, &std, &Device::Cpu)
+            .expect_err("a non-finite std component must be a typed error");
+        assert!(err.to_string().contains("std[2]"));
+    }
+
+    #[test]
+    fn preprocess_image_batch_rejects_non_finite_mean_component() {
+        let images = vec![test_image(4, 4)];
+        let mut mean = TEST_MEAN;
+        mean[0] = f32::INFINITY;
+        let err = preprocess_image_batch(&images, 4, &mean, &TEST_STD, &Device::Cpu)
+            .expect_err("a non-finite mean component must be a typed error");
+        assert!(err.to_string().contains("mean[0]"));
+    }
+
+    #[test]
+    fn decode_image_results_rejects_short_row_ids_instead_of_dropping_tail_items() {
+        // `.zip()` silently truncates to the shorter of `items`/`row_ids` in
+        // a release build (`debug_assert!` compiles out there), so a short
+        // `row_ids` must be a typed error, not zero outcomes for the
+        // uncovered tail items.
+        let good = png_bytes(4, 4, [1, 2, 3]);
+        let items: Vec<Vec<u8>> = vec![good.clone(), good];
+        let row_ids = vec![0usize]; // one entry short of `items.len()`
+        let err = decode_image_batch_indexed(&row_ids, &items)
+            .expect_err("a short row_ids must be a typed error, not silent truncation");
+        assert!(err.to_string().contains("row_ids"));
+    }
+
+    #[test]
+    fn decode_image_batch_per_row_indexed_rejects_short_row_ids() {
+        let good = png_bytes(4, 4, [1, 2, 3]);
+        let items: Vec<Vec<u8>> = vec![good.clone(), good];
+        let row_ids = vec![0usize];
+        let err = decode_image_batch_per_row_indexed(&row_ids, &items)
+            .expect_err("a short row_ids must be a typed error, not silent truncation");
+        assert!(err.to_string().contains("row_ids"));
+    }
+
+    #[test]
+    fn preprocess_image_batch_indexed_rejects_short_row_ids_instead_of_leaving_a_tail_unwritten() {
+        // The three-way `.zip()` (chunks / images / row_ids) would otherwise
+        // leave every image past `row_ids.len()` as its zero-initialized
+        // placeholder in `flat`, silently, rather than failing.
+        let images = vec![test_image(4, 4), test_image(4, 4)];
+        let row_ids = vec![0usize];
+        let err = preprocess_image_batch_indexed(
+            &row_ids,
+            &images,
+            4,
+            &TEST_MEAN,
+            &TEST_STD,
+            &Device::Cpu,
+        )
+        .expect_err("a short row_ids must be a typed error, not a silently truncated tensor");
+        assert!(err.to_string().contains("row_ids"));
     }
 
     #[test]

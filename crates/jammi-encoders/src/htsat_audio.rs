@@ -122,7 +122,16 @@ pub struct HtsatAudioConfig {
     pub projection_dim: usize,
     /// Activation applied inside the projection head.
     pub projection_hidden_act: String,
-    /// Activation applied inside each Swin block's MLP.
+    /// Activation applied inside each Swin block's MLP. Every config field
+    /// that NAMES a computation is either genuinely dispatched on or
+    /// refused as unsupported — never silently ignored (family D). Unlike
+    /// `projection_hidden_act` (dispatched at forward — see
+    /// [`ClapAudioProjection::forward_unnormalized_with_training`]),
+    /// `SwinBlock::forward` is unconditionally GELU-erf (this module's own
+    /// doc), so [`HtsatAudioEncoder::load`] REFUSES any value other than
+    /// `"gelu"` (HF `ClapAudioConfig`'s only shipped value) at load, naming
+    /// this field, rather than silently ignoring a checkpoint that declares
+    /// a different one.
     pub hidden_act: String,
     /// LayerNorm / BatchNorm epsilon.
     pub layer_norm_eps: f64,
@@ -1384,6 +1393,13 @@ impl HtsatAudioEncoder {
     /// doc for the PEFT rule that makes the STAGE the index). `ctx` carries
     /// the config, device and the dtype every load-time shift-window mask is
     /// materialised in (see [`HtsatLoadCtx`]).
+    ///
+    /// The config-validity edge for `config.hidden_act` (see that field's
+    /// own doc): both [`HtsatAudio::load`] and `HtsatAudioBuilder::build`
+    /// (`crate::htsat_audio`'s builder) funnel through this one loader, so
+    /// checking it here — before any tensor is touched — refuses an
+    /// unsupported checkpoint through EITHER entry point rather than
+    /// silently computing gelu-erf under a different declared activation.
     fn load_with<'a>(
         vb: VarBuilder,
         ctx: HtsatLoadCtx<'_>,
@@ -1391,6 +1407,15 @@ impl HtsatAudioEncoder {
         downsample_site: &dyn Fn(usize) -> LoraSite<'a>,
     ) -> Result<Self, EncoderError> {
         let HtsatLoadCtx { config, device, .. } = ctx;
+        if config.hidden_act != "gelu" {
+            return Err(EncoderError::Config(format!(
+                "HtsatAudioConfig.hidden_act = {:?} is unsupported: SwinBlock's MLP is \
+                 compiled to gelu-erf only (HF ClapAudioConfig's only shipped value is \
+                 \"gelu\") — refusing rather than silently computing gelu-erf under a \
+                 different declared activation",
+                config.hidden_act
+            )));
+        }
         let bn_cfg = BatchNormConfig {
             eps: config.layer_norm_eps,
             ..Default::default()
@@ -3723,6 +3748,77 @@ mod tests {
                     "ws={ws}: token {i} self-index must be the table centre"
                 );
             }
+        }
+    }
+
+    /// (a) Positive control: the `htsat_clap_tiny` fixture's own
+    /// `hidden_act` ("gelu" — the only HF `ClapAudioConfig` value the Swin
+    /// MLP's unconditional gelu-erf actually computes) loads cleanly
+    /// through [`HtsatAudio::load`]. Without this, the negative control
+    /// below could be satisfied by a check that rejects EVERY config, not
+    /// just an unsupported one.
+    #[test]
+    fn hidden_act_gelu_fixture_loads() {
+        let cfg = HtsatAudioConfig::from_hf_clap_config(&fixture_config()).unwrap();
+        assert_eq!(cfg.hidden_act, "gelu", "fixture activation changed");
+        let device = Device::Cpu;
+        let varmap = VarMap::new();
+        let vb = VarBuilder::from_varmap(&varmap, DType::F32, &device);
+        HtsatAudio::load(vb, &cfg, &device)
+            .expect("hidden_act='gelu' (the fixture's own value) must load");
+    }
+
+    /// (b) The domain-validity edge this unit closes: `SwinBlock::forward`
+    /// is unconditionally gelu-erf (this module's own doc), so a config
+    /// declaring any OTHER `hidden_act` must be REFUSED at load — named,
+    /// not silently computed as gelu-erf regardless — through BOTH
+    /// `HtsatAudio::load` (a `VarMap`-backed, no-checkpoint build, the
+    /// shape every other `HtsatAudio` unit test in this module uses) and
+    /// `HtsatAudio::builder().build(..)` (the mmaped-safetensors-backed
+    /// production entry point). The check in
+    /// `HtsatAudioEncoder::load_with` runs before ANY tensor is read, so an
+    /// EMPTY safetensors file is enough to prove the builder path refuses
+    /// too — a full checkpoint's worth of weights would prove nothing more
+    /// about this particular edge.
+    #[test]
+    fn hidden_act_other_than_gelu_is_refused_at_load_through_both_entry_points() {
+        let device = Device::Cpu;
+        let mut cfg = tiny_stage_config();
+        assert_eq!(cfg.hidden_act, "gelu", "tiny_stage_config's own default");
+        cfg.hidden_act = "relu".to_string();
+
+        // Through `HtsatAudio::load` (`VarBuilder::from_varmap`).
+        let varmap = VarMap::new();
+        let vb = VarBuilder::from_varmap(&varmap, DType::F32, &device);
+        let err = HtsatAudio::load(vb, &cfg, &device)
+            .err()
+            .expect("hidden_act='relu' must be refused through HtsatAudio::load");
+        match err {
+            EncoderError::Config(msg) => assert!(
+                msg.contains("hidden_act") && msg.contains("relu"),
+                "error must name the field and the offending value, got: {msg}"
+            ),
+            other => panic!("expected EncoderError::Config, got {other:?}"),
+        }
+
+        // Through `HtsatAudio::builder().build(..)` (mmaped safetensors) —
+        // an EMPTY checkpoint file: the refusal must fire before any tensor
+        // is even looked up.
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("hidden_act_relu_probe.safetensors");
+        let empty: HashMap<String, Tensor> = HashMap::new();
+        candle_core::safetensors::save(&empty, &path).unwrap();
+        let build_varmap = VarMap::new();
+        let err = HtsatAudio::builder()
+            .build(&[&path], &cfg, &device, &build_varmap)
+            .err()
+            .expect("hidden_act='relu' must be refused through HtsatAudio::builder().build(..)");
+        match err {
+            EncoderError::Config(msg) => assert!(
+                msg.contains("hidden_act") && msg.contains("relu"),
+                "error must name the field and the offending value, got: {msg}"
+            ),
+            other => panic!("expected EncoderError::Config, got {other:?}"),
         }
     }
 }

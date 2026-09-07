@@ -242,11 +242,11 @@ class IsKnownKernelNameTests(unittest.TestCase):
         self.assertIn(name, attribute.KNOWN_KERNEL_NAMES)
         self.assertTrue(attribute.is_known_kernel_name(name))
 
-    def test_an_unobserved_gemm_shaped_name_is_no_longer_known_by_substring(self):
-        """Pass 3, finding 3: `is_known_kernel_name` no longer admits ANY
-        name containing `"gemm"` — only exact, hand-listed names (plus the
-        BF16-twin rule). A brand-new, never-observed tile-variant string is
-        genuinely unknown now, even though it looks GEMM-shaped."""
+    def test_an_unobserved_gemm_shaped_name_is_not_known_by_substring(self):
+        """`is_known_kernel_name` admits ONLY exact, hand-listed names
+        (plus the BF16-twin rule) — never a name via the `"gemm"`
+        substring. A brand-new, never-observed tile-variant string is
+        genuinely unknown, even though it looks GEMM-shaped."""
         name = "some_future_tile_variant_gemm_v9"
         self.assertNotIn(name, attribute.KNOWN_KERNEL_NAMES)
         self.assertFalse(attribute.is_known_kernel_name(name))
@@ -446,17 +446,19 @@ class ClassifyKernelUnitTests(unittest.TestCase):
         )
 
     def test_named_kernel_at_a_3d_tile_grid_never_lands_base_gemm_via_the_fallback(self):
-        """Pass 3, finding 4 (adversarial re-audit): the anonymous
-        grid-family fallback is restricted to `Kernel<N>`/`magma_*` names
-        ONLY — a NAMED kernel at a genuine 3-D tile grid (every dimension
-        `>1`, product well above the magnitude floor) must NOT be routed
-        here just because its grid happens to look tile-shaped. These are
-        real shapes, never observed classifying this way."""
+        """The anonymous grid-family fallback is restricted to
+        `Kernel<N>`/`magma_*` names ONLY — a NAMED kernel at a genuine 3-D
+        tile grid (every dimension `>1`, product well above the magnitude
+        floor) must NOT be routed here just because its grid happens to
+        look tile-shaped. These are real shapes, never observed
+        classifying this way."""
         for name, grid in (
             ("badd_f32", [2, 2, 278]),
             ("ucopy_f32", [2, 2, 231]),
-            ("usqrt_f32", [2, 2, 2]),
+            ("usqrt_f32", [3, 3, 8]),
         ):
+            product = grid[0] * grid[1] * grid[2]
+            self.assertGreaterEqual(product, attribute.GEMM_TILE_GRID_PRODUCT_FLOOR, (name, grid))
             entry = {"kernel": name, "grid": grid, "block": [1, 1, 1]}
             result = attribute.classify_kernel(entry, self.sig, "clip-text")
             self.assertNotEqual(result, attribute.CHAIN_BASE_GEMM, (name, grid))
@@ -803,17 +805,14 @@ class UnknownKernelGateOnRealFixtureTests(unittest.TestCase):
 
 
 class Ln1VsD2DifferentialTests(unittest.TestCase):
-    """Pass 3, finding 2 (adversarial re-audit — corrects the ORIGINAL pass
-    3's own "less than" claim): the module doc's own "D1-vs-D2
-    differential: the measured split" section states the MEASURED numbers
-    on the real, full census (`C-LN` `12-18%` of the `D1-D2` total delta;
-    `ELEMENTWISE-OTHER-OUT` `43-46%`; `BIAS/RESIDUAL-OUT` `33-35%`) and the
-    mechanism (eager LN's own `gamma*x_hat+beta` affine lands as an
-    ordinary `badd_f32` at the `out` tier, whose `launches_per_step` forms
-    a DETERMINISTIC `337 -> 633 -> 874` ladder identically on BOTH towers
-    as fusion is progressively disabled — NOT run-to-run cuBLAS/
-    launch-count session noise, the ORIGINAL pass 3's own dismissal, now
-    corrected). This test asserts EXACTLY what that doc section states:
+    """The module doc's own "D1-vs-D2 differential: the measured split"
+    section states the mechanism: eager LN's own `gamma*x_hat+beta` affine
+    lands as an ordinary `badd_f32` at the `out` tier, whose
+    `launches_per_step` forms a three-point ladder as fusion is
+    progressively disabled — NOT run-to-run cuBLAS/launch-count session
+    noise (see `test_badd_ladder_launches_per_step_by_tower`, which
+    asserts each tower's own ladder point straight off the committed
+    fixtures). This test asserts EXACTLY what that doc section states:
     toggling `layer_norm_fused` off (`D1`) moves MASS INTO `C-LN` relative
     to the fused twin (`D2`) — a positive delta — and BOTH leak buckets
     (`BIAS/RESIDUAL-OUT`, `ELEMENTWISE-OTHER-OUT`) are NAMED as also
@@ -1556,10 +1555,9 @@ class TwoSidedDecisionRuleTests(unittest.TestCase):
         self.assertIn("F32-only", decision["reason"])
 
     def test_f32_only_caveat_fires_when_a2_is_absent(self):
-        """Pass 3, finding 1 (adversarial re-audit): the F32-only caveat
-        must fire for ALL THREE ways A2 can be not-decision-grade, not
-        only "present but INVALID" — this is the ABSENT case (no A2 leg
-        in `legs` at all)."""
+        """The F32-only caveat fires for EVERY way A2 can be
+        not-decision-grade, not only "present but INVALID" — this is the
+        ABSENT case (no A2 leg in `legs` at all)."""
         legs = [self._leg("clip-text-A1", "f32", s_wall=0.01, s_busy=0.01, u_wall=0.0, u_busy=0.0)]
         decision = attribute.decide_candidate_port(
             "C-ATTN-clip-text", self.CHAIN_KEY, "clip-text", legs, self._merge_for("clip-text-A1")
@@ -1808,12 +1806,11 @@ class AttributeLegAndReportTests(unittest.TestCase):
             self.assertIn("merge", row["decision_grade_reason"].lower())
 
     def test_manifest_less_directory_surfaces_as_invalid_not_dropped_silently(self):
-        """Pass 3 advisory (adversarial re-audit): `_leg_dirs` used to
-        SILENTLY DROP a directory with no `manifest.json` — `build_report`
-        now surfaces it as its own `INVALID` row instead, so a broken pull
-        (a leg directory whose driver crashed before writing a manifest)
-        shows up in `legs_total`/`legs_invalid`, never vanishing from the
-        report's own count."""
+        """A directory with no `manifest.json` is never silently dropped —
+        `build_report` surfaces it as its own `INVALID` row, so a broken
+        pull (a leg directory whose driver crashed before writing a
+        manifest) shows up in `legs_total`/`legs_invalid`, never vanishing
+        from the report's own count."""
         with tempfile.TemporaryDirectory() as tmp:
             legs_dir = Path(tmp) / "legs"
             _write_leg_dir(legs_dir, "clip-text-A1", {}, load_fixture_census())

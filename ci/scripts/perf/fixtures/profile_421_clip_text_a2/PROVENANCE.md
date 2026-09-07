@@ -52,16 +52,16 @@ so this fixture exercises the SAME declared shapes
   rule alone (`192 = rows*heads` sits at grid POSITION 2 — pass 3, finding
   1 — the rule does not care that the kernel has no name); a SECOND
   `Kernel2` row at `grid=[16,1,10]` (no `192` at position 2, and `dim[1]=1`
-  fails the anonymous-GEMM-tile test too) stays `UNATTRIBUTED` AND is now
-  (pass 3, finding 3 — `Kernel2` is REMOVED from `KNOWN_KERNEL_NAMES`)
-  flagged UNKNOWN at `share_gpu_busy=1.40%`, exceeding
-  `UNKNOWN_KERNEL_SHARE_LIMIT` and making this ENTIRE FIXTURE'S leg
-  `INVALID` when read through `attribute_leg` — this fixture is the
-  committed, small-scale reproduction of the real `clip-text-A2` leg's own
-  INVALIDATION (module doc, "Consequence, measured"); `AttributeCensusBf16
-  FixtureTests` therefore no longer asserts `unknown == []` for this
-  fixture (pass 2 did; pass 3's own `UnknownKernelGateOnRealFixtureTests`
-  asserts the INVALIDATING reason instead).
+  fails the anonymous-GEMM-tile test too) stays `UNATTRIBUTED` AND, since
+  the literal `Kernel2` is not in `KNOWN_KERNEL_NAMES`, is flagged UNKNOWN
+  at `share_gpu_busy=1.40%`, exceeding `UNKNOWN_KERNEL_SHARE_LIMIT` and
+  making this ENTIRE FIXTURE'S leg `INVALID` when read through
+  `attribute_leg` — this fixture is the committed, small-scale
+  reproduction of the real `clip-text-A2` leg's own INVALIDATION (module
+  doc, "Consequence, measured"); `AttributeCensusBf16FixtureTests` does
+  not assert `unknown == []` for this fixture —
+  `UnknownKernelGateOnRealFixtureTests` asserts the INVALIDATING reason
+  instead.
 - `cast_bf16_f32`/`cast_scale_bf16_f32` -> `CAST` by name
   (`"cast" in name.lower()`); `cast_add_bf16` -> `CAST` too, EVEN THOUGH it
   has no f32 twin in `KNOWN_KERNEL_NAMES` (`BF16_ONLY_KERNEL_NAMES`, hand

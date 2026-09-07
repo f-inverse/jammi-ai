@@ -181,41 +181,40 @@ never tiles a second or third grid dimension): evidenced by
 `clip-text-A2`'s anonymous `Kernel2 grid=[4,1,24]`, whose
 `total_threads=12,288` EXACTLY matches `LORA_RANK*3*width` (a param-scale
 element count) yet is plainly a 3-D tiled launch, not a 1-D bookkeeping
-op — pass 2's ungated rule would have (and, before this fold, silently
-did) swept it into the parameter-scale bucket by shape coincidence, hiding
-a row this module cannot actually explain.
+op — an ungated parameter-scale rule would sweep it into the
+parameter-scale bucket by shape coincidence, hiding a row this module
+cannot actually explain; the `grid[1]==1 and grid[2]==1` gate above closes
+that.
 
 **Anonymous kernels (`Kernel<N>`, `magma_*`, and any future unsymbolized
-launch) are classified ONLY by grid-family rules, LAST** (pass 3, finding
-4 — adversarial re-audit corrects the ORIGINAL pass 3's own priority,
-which ran this fallback BEFORE the attention-shape/activation-tier checks
-and was not restricted to anonymous names at all): after every named-shape
-and grid-position-2 check above has already failed to classify a row,
-`_is_anonymous_kernel_name` gates the fallback to `Kernel<N>`/`magma_*`
-names ONLY, and `_is_plausible_gemm_tile_grid` additionally requires EVERY
-one of the grid's three dimensions `> 1` AND the grid's own product to
-clear a documented magnitude floor (`GEMM_TILE_GRID_PRODUCT_FLOOR=64`,
-conservatively below the smallest real evidence, `448`) before landing
-`BASE-GEMM` — a `1` in some position is a 1-D-ish bookkeeping/reduction
-launch, `GRAD-BOOKKEEPING`'s own domain, not a tiled matmul. Evidenced
-BOTH ways on `clip-text-D1`/`D2`: `Kernel2 grid=[8,2,28]` (every dimension
-`>1`, product `448`) -> `BASE-GEMM` on both legs (cuBLAS picked a
-different, unsymbolized algorithm once the eager LoRA/LN arithmetic
-shifted the surrounding shapes/strides — the SAME anonymous grid on two
-independent legs, corroborating); `clip-text-A2`'s `Kernel2
-grid=[16,1,10]`/`[4,1,24]`/`[12,1,8]`/`[128,2,1]` (each has a `1` in some
-position) do NOT classify here and remain `UNATTRIBUTED`. NEGATIVE
-CONTROLS for the anonymous-name restriction (real shapes, never observed
-this way, but proving a NAMED kernel is never swept in by grid alone):
-`badd_f32 grid=[2,2,278]`, `ucopy_f32 grid=[2,2,231]`, `usqrt_f32
-grid=[2,2,2]` all satisfy the 3-D-tile-grid shape test yet stay OUT of
-`BASE-GEMM` — their own names already say what they are.
+launch) are classified ONLY by grid-family rules, LAST**: after every
+named-shape and grid-position-2 check above has already failed to
+classify a row, `_is_anonymous_kernel_name` gates the fallback to
+`Kernel<N>`/`magma_*` names ONLY, and `_is_plausible_gemm_tile_grid`
+additionally requires EVERY one of the grid's three dimensions `> 1` AND
+the grid's own product to clear a documented magnitude floor
+(`GEMM_TILE_GRID_PRODUCT_FLOOR=64`, conservatively below the smallest real
+evidence, `448`) before landing `BASE-GEMM` — a `1` in some position is a
+1-D-ish bookkeeping/reduction launch, `GRAD-BOOKKEEPING`'s own domain, not
+a tiled matmul. Evidenced BOTH ways on `clip-text-D1`/`D2`: `Kernel2
+grid=[8,2,28]` (every dimension `>1`, product `448`) -> `BASE-GEMM` on
+both legs (cuBLAS picked a different, unsymbolized algorithm once the
+eager LoRA/LN arithmetic shifted the surrounding shapes/strides — the
+SAME anonymous grid on two independent legs, corroborating); `clip-text-
+A2`'s `Kernel2 grid=[16,1,10]`/`[4,1,24]`/`[12,1,8]`/`[128,2,1]` (each has
+a `1` in some position) do NOT classify here and remain `UNATTRIBUTED`.
+NEGATIVE CONTROLS for the anonymous-name restriction (real shapes, never
+observed this way, but proving a NAMED kernel is never swept in by grid
+alone): `badd_f32 grid=[2,2,278]`, `ucopy_f32 grid=[2,2,231]`, `usqrt_f32
+grid=[3,3,8]` all satisfy the 3-D-tile-grid shape test (product `72`,
+clearing `GEMM_TILE_GRID_PRODUCT_FLOOR`) yet stay OUT of `BASE-GEMM` —
+their own names already say what they are.
 
 **An anonymous or unknown-name row that no rule classifies COUNTS toward
-the 1%-of-busy unknown-kernel gate** — `KNOWN_KERNEL_NAMES` no longer
-admits a name via the `"gemm"` substring, and the literal `Kernel2` is
-REMOVED from it: the gate now applies to EXACT names only (plus the BF16-
-twin rule, unchanged). Every real GEMM-family tile-variant name this
+the 1%-of-busy unknown-kernel gate** — `KNOWN_KERNEL_NAMES` admits a name
+ONLY via an exact literal match (there is no `"gemm"`-substring shortcut,
+and the literal `Kernel2` is not in the set): the gate applies to EXACT
+names only (plus the BF16-twin rule). Every real GEMM-family tile-variant name this
 module has actually observed (all `ampere_sgemm_*`/`ampere_bf16_*gemm*`/
 `magma_sgemmEx_kernel` variants pulled across all eight real CLIP legs) is
 hand-added to `KNOWN_KERNEL_NAMES` by its exact literal string — the
@@ -757,15 +756,16 @@ def declared_chains_for_tower(tower: str) -> tuple[str, ...]:
     raise SignatureError(f"no declared chain set for tower {tower!r}")
 
 
-# The exact kernel-name vocabulary observed across all eight real CLIP legs
+# The exact kernel-name vocabulary observed across the CLIP and HTSAT legs
 # pulled from pod `p421` run 2 at `c1b0b0ba` (`clip-text-{A1,A2,D1,D2}`,
-# `clip-vision-{A1,A2,D1,D2}`). Pass 3 (adversarial-audit finding 3) ADDS the
-# eight `ampere_bf16_s16816gemm_*` tile-variant names actually observed on
-# `clip-text-A2`/`clip-vision-A2` (previously admitted only via the removed
-# `"gemm"`-substring shortcut in `is_known_kernel_name` — see below) and
-# REMOVES the literal `Kernel2`: an anonymous kernel is admitted ONLY by
-# `classify_kernel`'s own grid-family rules now (module doc), never by a
-# blanket "we've seen an anonymous kernel before" entry in this vocabulary.
+# `clip-vision-{A1,A2,D1,D2}`, `htsat-{A1,A2,D1,D2}`). The
+# `ampere_bf16_s16816gemm_*` tile-variant names actually observed on the
+# BF16 legs are hand-admitted by their exact literal string (there is no
+# `"gemm"`-substring shortcut in `is_known_kernel_name` — see below), and
+# the literal `Kernel2` is not in this set: an anonymous kernel is admitted
+# ONLY by `classify_kernel`'s own grid-family rules (module doc), never by
+# a blanket "we've seen an anonymous kernel before" entry in this
+# vocabulary.
 KNOWN_KERNEL_NAMES: frozenset[str] = frozenset(
     {
         "badd_f32",
@@ -820,11 +820,13 @@ KNOWN_KERNEL_NAMES: frozenset[str] = frozenset(
         # clip-vision-only, evidenced on `clip-vision-A1`
         "im2col_f32",
         "magma_sgemmEx_kernel",
-        # BF16 GEMM tile variants, evidenced on `clip-text-A2`/`clip-vision-A2`
-        # (all EIGHT distinct tile-variant names observed across both legs —
-        # `is_known_kernel_name` no longer admits these via the `"gemm"`
-        # substring, so they are hand-listed here, same discipline as every
-        # other GEMM name above).
+        # BF16 GEMM tile variants, evidenced on the CLIP and HTSAT legs
+        # (`clip-text-A2`/`clip-vision-A2`; the `128x128_ldg8_f2f_stages_64x3`
+        # nn/tn pair is ALSO observed on `htsat-A2` — the HTSAT-only
+        # variants get their own section below). `is_known_kernel_name`
+        # admits these only by exact literal string (there is no
+        # `"gemm"`-substring shortcut), so they are hand-listed here, same
+        # discipline as every other GEMM name above.
         "ampere_bf16_s16816gemm_bf16_128x128_ldg8_f2f_stages_64x3_nn",
         "ampere_bf16_s16816gemm_bf16_128x128_ldg8_f2f_stages_64x3_tn",
         "ampere_bf16_s16816gemm_bf16_256x128_ldg8_f2f_stages_32x3_nn",
@@ -855,6 +857,8 @@ KNOWN_KERNEL_NAMES: frozenset[str] = frozenset(
         "ampere_bf16_s16816gemm_bf16_128x256_ldg8_f2f_stages_64x3_tn",
         "ampere_bf16_s16816gemm_bf16_64x64_ldg8_f2f_nn",
         "ampere_bf16_s16816gemm_bf16_64x64_ldg8_f2f_tn",
+        "ampere_bf16_s16816gemm_bf16_128x128_ldg8_f2f_stages_32x5_nn",
+        "ampere_bf16_s16816gemm_bf16_128x128_ldg8_f2f_stages_32x5_tn",
         "ampere_bf16_s1688gemm_bf16_128x128_ldg8_f2f_stages_32x1_nn",
         "ampere_bf16_s1688gemm_bf16_128x128_ldg8_f2f_stages_32x1_tn",
     }
@@ -1388,8 +1392,9 @@ def _is_anonymous_kernel_name(name: str) -> bool:
     dimension happens to be `> 1` is NOT a GEMM by construction — its name
     already says what it is. Negative controls (real shapes, never
     observed as GEMM): `badd_f32 grid=[2,2,278]`, `ucopy_f32
-    grid=[2,2,231]`, `usqrt_f32 grid=[2,2,2]` — all satisfy
-    `_is_plausible_gemm_tile_grid` but must NOT land `BASE-GEMM` through
+    grid=[2,2,231]`, `usqrt_f32 grid=[3,3,8]` — all satisfy
+    `_is_plausible_gemm_tile_grid` (every dimension `>1`, product clearing
+    `GEMM_TILE_GRID_PRODUCT_FLOOR`) but must NOT land `BASE-GEMM` through
     this fallback."""
     return bool(ANONYMOUS_KERNEL_NAME_RE.match(name))
 
@@ -2262,12 +2267,11 @@ def _leg_dirs(legs_dir: Path) -> list[Path]:
     """Every directory under `legs_dir` this module treats as a leg, EXCEPT
     the `p2-bf16` driver's own non-leg scratch directory (a known,
     legitimate sibling — the P2b BF16 corpus, never a
-    `profile_421_legs.sh` leg). Pass 3 (adversarial-audit advisory): a
-    directory with NO `manifest.json` is no longer silently dropped here —
-    it is now included, so `attribute_leg` (which already turns "manifest
-    could not be read" into an `INVALID` row with a reason) surfaces it
-    as a visible INVALID leg instead of a silent gap in the reported leg
-    count."""
+    `profile_421_legs.sh` leg). A directory with NO `manifest.json` is
+    included here (never silently dropped), so `attribute_leg` (which
+    already turns "manifest could not be read" into an `INVALID` row with
+    a reason) surfaces it as a visible INVALID leg instead of a silent gap
+    in the reported leg count."""
     return sorted(d for d in legs_dir.iterdir() if d.is_dir() and d.name != "p2-bf16")
 
 

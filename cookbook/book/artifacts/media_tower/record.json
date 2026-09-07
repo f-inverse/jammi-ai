@@ -1,0 +1,77 @@
+{
+  "audio_checkpoint": "/root/models/clap-htsat-fused",
+  "corrupt_rows": {
+    "audio": {
+      "corrupt_row": {
+        "message": "Inference error: Failed to decode audio at row 2: Inference error: Failed to probe audio container: unsupported feature: core (probe): no suitable format reader found",
+        "message_contains_row_index": true,
+        "status": "error"
+      },
+      "good_row_still_ok": true,
+      "null_row": {
+        "error": "Null or missing audio input",
+        "status": "error"
+      }
+    },
+    "image": {
+      "corrupt_row": {
+        "message": "Inference error: Failed to decode image at row 2: The image format could not be determined",
+        "message_contains_row_index": true,
+        "status": "error"
+      },
+      "good_row_still_ok": true,
+      "null_row": {
+        "error": "Null or missing image input",
+        "status": "error"
+      }
+    }
+  },
+  "engine_version": "0.49.1",
+  "rows_per_modality": 24,
+  "towers": {
+    "audio": {
+      "base_model": "local:/root/models/clap-htsat-fused",
+      "change_vs_base_max_abs_diff": 0.197455,
+      "epochs": 2,
+      "lora_rank": 4,
+      "model_id": "jammi:fine-tuned:9118aec4-c6a4-4648-bdff-3e17f1028e28",
+      "round_trip_max_abs_diff": 0.0,
+      "same_input_control_max_abs_diff": 0.0,
+      "target_modules": [
+        "query",
+        "value",
+        "linear1"
+      ],
+      "task": "audio_embedding"
+    },
+    "text": {
+      "base_model": "local:/root/models/open-clip-vit-b-32",
+      "change_vs_base_max_abs_diff": 0.346392,
+      "epochs": 2,
+      "lora_rank": 4,
+      "model_id": "jammi:fine-tuned:07b36eb7-d611-4191-9fad-f882f94dd890",
+      "round_trip_max_abs_diff": 0.0,
+      "same_input_control_max_abs_diff": 0.0,
+      "target_modules": [
+        "in_proj",
+        "c_fc"
+      ],
+      "task": "text_embedding"
+    },
+    "vision": {
+      "base_model": "local:/root/models/open-clip-vit-b-32",
+      "change_vs_base_max_abs_diff": 0.267908,
+      "epochs": 2,
+      "lora_rank": 4,
+      "model_id": "jammi:fine-tuned:2e9c1ea0-7f63-4951-8917-a006fd63b09f",
+      "round_trip_max_abs_diff": 0.0,
+      "same_input_control_max_abs_diff": 0.0,
+      "target_modules": [
+        "in_proj",
+        "c_fc"
+      ],
+      "task": "image_embedding"
+    }
+  },
+  "vision_checkpoint": "/root/models/open-clip-vit-b-32"
+}

@@ -1,0 +1,214 @@
+---
+title: "Real-checkpoint media-tower LoRA — change, control, round-trip, and the corrupt-row contract"
+---
+
+```{python}
+# | echo: false
+import jammi_cookbook
+```
+
+**Recipe:** `fine_tune(method="lora", task=...)` on `[gpu]` against REAL checkpoints
+· `infer` · `describe_model` — the SAME shipped Python surface the
+`image_search`/`audio_search` recipes drive, never the internal `jammi-bench`
+harness · **Theory:** LoRA — a frozen base weight plus a trainable low-rank update
+[@hu2022lora] — injected into OpenCLIP's shared vision/text `ResidualAttentionBlock`
+[@radford2021clip] and into CLAP's HTSAT-Swin audio tower [@wu2023clap] · **Rail:**
+measurement (a real GPU fine-tune of each of three towers, its four invariants read
+back through the public surface, frozen once and reasserted here).
+
+Every earlier fine-tuning chapter in this book trains a **text** encoder
+(ModernBERT). This one is the media front end's own proof: the SAME `fine_tune`
+verb, pointed at REAL OpenCLIP ViT-B-32 (vision **and** text towers — `task=`
+alone selects which) and REAL CLAP HTSAT (the audio tower) checkpoints, on real
+GPU hardware, exercising the `target_modules` LoRA-site selectors the
+`image_search`/`audio_search` recipes (PR #466) introduced for these
+architectures. The heavy work — three LoRA fine-tunes plus their probes — ran
+**once**, on a GPU `jammi-server`; this chapter reads that committed cache and
+asserts a measured verdict against `golden_metrics.json`, never recomputing
+upstream.
+
+## Four things worth measuring, not one
+
+A recipe that shows "the tuned vector differs from the base vector" is teaching
+one fact. This chapter measures four, because each closes a gap the others leave
+open:
+
+1. **Change, not improvement.** The adapter must move the served embedding.
+   Direction and quality are not claimed — a synthetic, generic triplet corpus
+   carries no semantic ground truth — only that training changed something real.
+2. **The same-input control.** A change could, in principle, be inference
+   noise rather than a real parameter delta. The control rules that out: the
+   SAME probe input, run through the SAME (base) checkpoint **twice**, in two
+   independent calls. If this were nonzero, the "change" measurement above
+   would be uninterpretable.
+3. **The round trip.** A LoRA delta that trains but is silently dropped at
+   serve time is the exact defect the recipes' own comments warn about. This
+   chapter closes the connection that trained the adapter and opens a **new**
+   one to the same server before re-deriving the tuned vector — proving the
+   adapter survived into the catalog, not merely a training session's live
+   state.
+4. **The corrupt-row contract.** `generate-image-embeddings.md`'s documented
+   claim is that a corrupt image is a per-row `_status="error"` outcome. This
+   chapter measures what the branch actually does, on both image and audio
+   media — see the finding below.
+
+```{python}
+from jammi_cookbook import contracts
+
+record = contracts.load_artifact("media_tower.record")
+print(f"engine version: {record['engine_version']}")
+print(f"vision/text checkpoint: {record['vision_checkpoint']}")
+print(f"audio checkpoint:       {record['audio_checkpoint']}")
+print(f"rows per modality: {record['rows_per_modality']}")
+```
+
+## The three towers, measured side by side
+
+`task=` is the only thing that changes which tower of the SAME OpenCLIP
+checkpoint gets adapted (`image_embedding` -> vision, `text_embedding` -> the
+CLIP text tower); the CLAP checkpoint carries a separate `audio_embedding`
+tower. Every tower's `target_modules` names REAL sites on that tower's own
+architecture (`in_proj`/`c_fc` on OpenCLIP's shared attention block;
+`query`/`value`/`linear1` on HTSAT-Swin) — the same selector vocabulary the
+`image_search`/`audio_search` recipes document.
+
+```{python}
+towers = record["towers"]
+print(f"{'tower':<8}{'task':<18}{'target_modules'}")
+for name, t in towers.items():
+    print(f"{name:<8}{t['task']:<18}{t['target_modules']}")
+```
+
+### 1 — Change vs. base
+
+Every tower's LoRA adapter measurably moved the served embedding on the SAME
+probe input:
+
+```{python}
+for name, t in towers.items():
+    diff = t["change_vs_base_max_abs_diff"]
+    contracts.assert_close(f"media_tower.{name}.change_vs_base_max_abs_diff", diff)
+    assert diff > 1e-4, (
+        f"{name}: the LoRA adapter should change the served embedding — "
+        f"max|Δ| = {diff:.6f} <= 1e-4 (adapter trained but not applied at serve time?)"
+    )
+    print(f"  {name:<6} change max|Δ| = {diff:.6f}  (> 1e-4 floor)")
+```
+
+### 2 — The same-input control
+
+Two independent `infer` calls through the SAME (base) checkpoint, over the
+SAME probe input. This is the control the "change" measurement above depends
+on: a nonzero control diff would mean the change above could be
+noise, not a real adapter effect.
+
+```{python}
+for name, t in towers.items():
+    diff = t["same_input_control_max_abs_diff"]
+    contracts.assert_close(f"media_tower.{name}.same_input_control_max_abs_diff", diff)
+    print(f"  {name:<6} control max|Δ| = {diff:.6g}")
+
+CONTROL_FLOOR = 1e-5  # far below every tower's own change-vs-base signal above
+for name, t in towers.items():
+    change = t["change_vs_base_max_abs_diff"]
+    control = t["same_input_control_max_abs_diff"]
+    assert control < CONTROL_FLOOR, (
+        f"{name}: repeated inference through the SAME checkpoint over the SAME "
+        f"input produced a non-negligible diff ({control:.6g}) — inference is "
+        f"not deterministic here, and the change measurement above cannot be "
+        f"trusted to reflect the adapter alone"
+    )
+    assert control < change, (
+        f"{name}: the same-input control ({control:.6g}) is not smaller than "
+        f"the change vs. base ({change:.6g}) — the measured change is not "
+        f"distinguishable from noise"
+    )
+print("every tower's control diff is negligible AND strictly below its own "
+      "change-vs-base signal ✓")
+```
+
+### 3 — The round trip: train → save → serve, from a NEW connection
+
+After each job completes, the emit script closes the connection that trained
+it and opens a **brand new** one to the same server before re-deriving the
+tuned vector. A LoRA delta that trained but was dropped at serve time — the
+exact defect the `image_search`/`audio_search` recipes' comments call out —
+would show up here as either a `describe_model` miss or a vector that
+disagrees with the first tuned read.
+
+```{python}
+for name, t in towers.items():
+    diff = t["round_trip_max_abs_diff"]
+    contracts.assert_close(f"media_tower.{name}.round_trip_max_abs_diff", diff)
+    assert diff < 1e-5, (
+        f"{name}: the tuned vector read from a BRAND NEW connection differs "
+        f"from the first tuned read (max|Δ| = {diff:.6g}) — the adapter is "
+        f"not being served consistently across sessions"
+    )
+    print(f"  {name:<6} round-trip max|Δ| = {diff:.6g}  (new connection agrees)")
+print("every tower's adapter round-trips train -> save (catalog) -> serve, "
+      "from a session that never trained it ✓")
+```
+
+## 4 — The corrupt-row contract, measured
+
+`docs/guide/src/generate-image-embeddings.md`'s Error-handling table documents
+three rows in ONE batch: a valid image (`_status="ok"`), a **null** image
+(`_status="error"`, `"Null or missing image input"`), and a **corrupt**
+image (`_status="error"`, `"Failed to decode image at row N: ..."`) — all
+three landing as per-row outcomes inside a single, otherwise-successful
+`infer` call. This chapter puts all three in one batch (one valid row, one
+null, one genuinely undecodable) and reads back every row's own outcome,
+rather than trusting the table.
+
+```{python}
+for modality, corrupt in record["corrupt_rows"].items():
+    print(f"\n--- {modality} ---")
+    print(f"  good row still ok:  {corrupt['good_row_still_ok']}")
+    print(f"  null row:           {corrupt['null_row']}")
+    print(f"  corrupt row:        {corrupt['corrupt_row']}")
+
+    assert corrupt["good_row_still_ok"], (
+        f"{modality}: a null/corrupt row in the SAME batch must not fail "
+        f"the other, valid row"
+    )
+    assert corrupt["null_row"]["status"] == "error", corrupt["null_row"]
+    assert "null" in corrupt["null_row"]["error"].lower(), corrupt["null_row"]
+
+    # The measured fact: a corrupt (undecodable) row is a per-row
+    # `_status="error"` outcome too, alongside the good row — the whole
+    # `infer` call does NOT raise, and its message names the offending row.
+    assert corrupt["corrupt_row"]["status"] == "error", corrupt["corrupt_row"]
+    assert corrupt["corrupt_row"]["message_contains_row_index"], corrupt["corrupt_row"]
+```
+
+**The finding — a real fold-round fix, caught mid-campaign.** Earlier work on
+this exact chapter measured a genuine gap: `forward_image_embedding`/
+`forward_audio_embedding` called `arrow_to_images`/`arrow_to_audio` with `?`,
+so a corrupt row failed the WHOLE `infer` call instead of landing as a
+per-row outcome — contradicting this very doc table, which has always
+described a uniform three-row contract. That measurement is cited here for
+the record, not reproduced: by the time this chapter's cache was re-emitted,
+`crates/jammi-ai`'s serving path had already been fixed on this same branch
+(`arrow_to_images`/`arrow_to_audio` now return one `Option<Result<T>>` per
+Arrow row — null -> `None`, a decode failure -> `Some(Err(..))` naming that
+row, success -> `Some(Ok(..))` — so `forward_*_embedding` marks only the
+failing row's status and the rest of the batch still embeds). What this
+chapter measures NOW, against the shipped fix, is that the doc's three-row
+contract genuinely holds: a null row and a corrupt row are BOTH per-row
+`_status="error"` outcomes, on both image and audio, and neither one fails
+the batch's other, valid row.
+
+## Bridge note
+
+> **The first real-checkpoint chapter in the fine-tuning line.** Every earlier
+> `fine_tune` chapter in this book trains a small, hermetic text encoder; this
+> one is the media front end's own proof, on real OpenCLIP and real CLAP
+> checkpoints, through the identical public surface. The four invariants this
+> chapter measures generalize past media: change-vs-base is the adapter's
+> reason to exist, the same-input control is what makes that change
+> interpretable rather than assumed, the round trip is what makes "saved"
+> mean something a new session can observe, and the corrupt-row measurement is
+> what proves a per-row contract against the branch it describes — closing,
+> not merely citing, the very gap an earlier measurement on this chapter
+> caught mid-campaign.

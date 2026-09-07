@@ -958,6 +958,28 @@ ARTIFACTS: dict[str, Artifact] = {
         produced_by="segmented_ann",
         note="sha256[:16] of every committed segmented_ann cache file.",
     ),
+    # --- real-checkpoint media-tower LoRA (#421 follow-on) -------------------
+    "media_tower.record": Artifact(
+        name="media_tower.record",
+        kind="model_id",
+        filename="record.json",
+        produced_by="media_tower",
+        note="LoRA fine-tuning driven through the SHIPPED Python surface "
+        "(fine_tune / infer / describe_model — never the internal jammi-bench "
+        "harness) against REAL checkpoints: OpenCLIP ViT-B-32 (vision + text "
+        "towers) and CLAP HTSAT (audio tower). Per tower: the fine-tuned "
+        "model id + target_modules, the change-vs-base max|Δ| on a fixed probe "
+        "input (the adapter must move the served embedding), the same-input "
+        "control max|Δ| (two independent forward passes through the SAME "
+        "checkpoint over the SAME input — rules out inference noise as the "
+        "source of the change above), and the round-trip max|Δ| (the tuned "
+        "vector re-derived from a BRAND NEW connection to the same server, "
+        "proving train -> save in the catalog -> serve, not process-local "
+        "state). Plus the measured (not assumed) per-row `_status`/`_error` "
+        "contract for a NULL media row and a CORRUPT (undecodable) media "
+        "row, in the same batch as a valid row: both fail their own row "
+        "only, on both image and audio.",
+    ),
 }
 
 

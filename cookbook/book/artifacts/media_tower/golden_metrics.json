@@ -1,0 +1,38 @@
+{
+  "audio.change_vs_base_max_abs_diff": {
+    "tol": 0.5,
+    "value": 0.197455
+  },
+  "audio.round_trip_max_abs_diff": {
+    "tol": 1e-06,
+    "value": 0.0
+  },
+  "audio.same_input_control_max_abs_diff": {
+    "tol": 1e-06,
+    "value": 0.0
+  },
+  "text.change_vs_base_max_abs_diff": {
+    "tol": 0.5,
+    "value": 0.346392
+  },
+  "text.round_trip_max_abs_diff": {
+    "tol": 1e-06,
+    "value": 0.0
+  },
+  "text.same_input_control_max_abs_diff": {
+    "tol": 1e-06,
+    "value": 0.0
+  },
+  "vision.change_vs_base_max_abs_diff": {
+    "tol": 0.5,
+    "value": 0.267908
+  },
+  "vision.round_trip_max_abs_diff": {
+    "tol": 1e-06,
+    "value": 0.0
+  },
+  "vision.same_input_control_max_abs_diff": {
+    "tol": 1e-06,
+    "value": 0.0
+  }
+}

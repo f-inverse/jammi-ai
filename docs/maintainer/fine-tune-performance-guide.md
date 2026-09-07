@@ -380,13 +380,14 @@ an exact-set match of its own two keys, so the "combined leg naming a chain key 
 alloff's pair" the subset check existed for can never occur, and the weaker check let an
 ambient/leftover env var through undetected), and refuses at the END unless no requested
 disable went unmatched AND every named key's fused dispatch counter read zero across the
-run. An unlabeled `--arm fused` leg (no `--expect-kernels-disabled` at all) now ALSO refuses
-at START whenever `JAMMI_KERNELS_DISABLE` resolves non-empty, naming the offending keys —
-closing the same finding's other half, where an ambient disable silently contaminated a
-"fused" leg while the positive-proof equation and every other check stayed green (a realized
-gain reading as zero with nothing red to explain why). A leg that fails any of these checks
-exits non-zero and writes no row — INVALID, never a datum. The claim itself is recorded on
-the report as provenance (`kernels_disabled_expected`), distinct from the process-OBSERVED
+run. `--arm fused` with no `--expect-kernels-disabled` at all makes NO claim about
+`JAMMI_KERNELS_DISABLE` — an operator may legitimately run a fused leg with OTHER,
+unrelated op keys disabled, so this binary does not, and must not, refuse an unlabeled
+fused leg on that basis; the two-sided witness that a `#421` DECISION leg's fused side was
+genuinely unlabeled lives outside this binary, in the driver and merger below. A leg that
+fails the alloff arm-level check or the `--expect-kernels-disabled` START/END checks exits
+non-zero and writes no row — INVALID, never a datum. The claim itself is recorded on the
+report as provenance (`kernels_disabled_expected`), distinct from the process-OBSERVED
 `kernels_disabled_requested`/`kernels_disabled_fired` pair it was checked against.
 
 **The driver.** `ci/scripts/perf/profile_421_legs.sh` runs the sweep, generalizing
@@ -395,19 +396,28 @@ work dir, cross-checks provenance, stamps a per-leg manifest, and captures the c
 forced-eager disable list is PER TOWER for the reason above — the CLIP legs name only the
 keys those towers actually admit, HTSAT adds `gelu_erf_fused`. The driver refuses before any
 leg runs if `JAMMI_KERNELS_DISABLE` reaches its OWN process environment (it must only ever
-be scoped, per D leg, onto a single child invocation via `env VAR=... cmd`), plus a
-belt-and-braces read of each leg's own report that additionally refuses an A leg whose
-`kernels_disabled_requested` came back non-empty. Its `_checkpoint_identity_probe` refuses a
+be scoped, per D leg, onto a single child invocation via `env VAR=... cmd`), plus two
+belt-and-braces reads of each leg's own report — since `--arm fused` itself makes no claim,
+this driver and the merger below are the ONLY witnesses of both directions of the DECISION
+legs' validity: `_check_no_ambient_disables` refuses an A leg whose report's
+`kernels_disabled_requested` came back non-empty at all, and `_check_expected_disables`
+refuses a D leg whose `kernels_disabled_requested` does not equal its own
+`kernels_disabled_expected` claim EXACTLY, naming the extra or missing keys — a strict
+superset (an ambient key beyond the claim, force-eagering an op the leg assumed fused and
+overstating the realized gain) is caught exactly like a strict subset (a dropped or
+unmatched key). Its `_checkpoint_identity_probe` refuses a
 `$MODEL_DIR_CLIP` carrying `config.json`/`model.safetensors` (`arch.rs`'s
 `Checkpoint::resolve` prefers those over the `open_clip_config.json`/
 `open_clip_model.safetensors` pair every CLIP leg declares, so such a directory would
 silently resolve to the wrong architecture family) and a `$MODEL_DIR_CLAP` missing any of
 `config.json`/`model.safetensors`/`preprocessor_config.json`. Each leg's manifest records
 `checkpoint_weights_sha256`/`fusible_site_census` per run, and `profile_421_merge.py`
-refuses, by name, an A leg whose report witnesses a non-empty disable list, and a per-tower
-cross-leg (and cross-P2) mismatch of either value — two legs of one tower that measured
-different checkpoint bytes or built a different encoder are not comparable, whatever their
-own within-leg checks found. A hermetic dry-run suite
+refuses, by name, an A leg whose report witnesses a non-empty disable list, a D leg whose
+`kernels_disabled_requested` does not exactly equal `kernels_disabled_expected` (before the
+positive-proof equation ever runs), and a per-tower cross-leg (and cross-P2) mismatch of
+either value — two legs of one tower that measured different checkpoint bytes or built a
+different encoder are not comparable, whatever their own within-leg checks found. A hermetic
+dry-run suite
 (`ci/scripts/perf/test_profile_421_legs_dry_run.py`) drives the real script end to end with
 no GPU, no `nsys`, no checkpoint and no network, on both its dry-run and its real-preflight
 surfaces, and is a matrix leg in `.github/workflows/ci.yml`.

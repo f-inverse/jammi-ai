@@ -522,6 +522,67 @@ dry-run tested straight through the real merge script, so the two P2 halves (the
 mode, the merge script's consumption of it) are proven to fit as shipped rather than as
 imagined.
 
+### The media front end: parallelized across rayon's global pool
+
+The #421 tower profile above named the front end as measured, not yet reduced — the
+per-item decode/preprocess work a media leg does before the tower ever forwards. A
+follow-on unit ("media front-end parallelization") closes that gap for HTSAT and
+CLIP-vision without touching a decoder body: the batch's per-item work is spread across
+rayon's GLOBAL pool (candle installs no private pool of its own, so this is the one pool
+the process ever schedules media-batch work on; `rayon` becomes a direct `jammi-ai`
+dependency, already unified at 1.11 in the lock).
+
+**No numbers are recorded here yet.** The profile artifact this section would otherwise
+cite for the HTSAT/vision front-end share of a step
+(`crates/jammi-kernels/artifacts/cuda-runs/2026-09-07-profile-421-towers-c1b0b0ba-a100-sxm4.json`)
+lands with its own artifact PR, not this branch — §11's first checklist applies
+unchanged: every number in a doc names its producer, or it is not written.
+
+**The mechanism.** Two parallel stages, the same shape on both towers:
+
+1. **Decode.** A shared helper per modality (`image_preprocess::decode_image_batch`,
+   `audio_preprocess::decode_audio_batch`) used by BOTH decode loops — the trainer's
+   `image_encoder_input`/`audio_encoder_input` and serving's `arrow_to_images`/
+   `arrow_to_audio` — so training and serving run the identical decode path. A
+   path-valued Arrow column reads its bytes SEQUENTIALLY first (`std::fs::read` never
+   runs inside the pool); decoding those bytes runs in parallel across the batch.
+2. **Preprocess.** `preprocess_image_batch`/`preprocess_clap_fusion` preallocate the
+   batch's output buffer once and have each item write its own disjoint, fixed-stride
+   chunk via `par_chunks_mut` — filters and the STFT window are hoisted out of the
+   per-item closure, and a release-mode (not `debug_assert!`) per-item length check
+   guards every chunk write.
+
+There is no thread-count knob anywhere in this path: chunk count is always the batch
+size, so the effective parallelism is `min(pool_size, batch_size)`, emergent from
+whichever pool the process happens to run under — never configured. Errors are
+collected per item and the LOWEST-INDEX failing row is the one surfaced, mirroring the
+order the pre-unit sequential loop failed in; an empty batch is refused before any
+chunking is attempted.
+
+**Provenance: `rayon_pool_threads`.** `FinetuneRunTier` grows a thirteenth provenance
+field, `rayon_pool_threads` (`PROVENANCE_FIELDS` 12 → 13) — `rayon::current_num_threads()`
+at report time, i.e. the rayon GLOBAL POOL SIZE the run's process resolved to, not how
+many of those threads actually touched a given batch's chunks. It is machine/build
+provenance, the same class `device_name`/`host.logical_cpus` already occupy — a fact
+about the box and the process, never a determinant of what a step computes, so it is
+never an identity field.
+
+**The pre-registered A/B.** `ci/scripts/perf/frontend_ab.sh` drives the contract's
+base/tip comparison: two prebuilt `jammi-bench` binaries, interleaved base/tip/base/tip
+legs over untraced `finetune-run` on HTSAT and CLIP-vision, at the profile's own pinned
+leg parameters. The decision quantity is `media_front_end_wall_s / steps_measured`; the
+bar is TWO-SIDED against the machine model (`P` read from the tip binary's own
+`rayon_pool_threads`, `ideal = n / ceil(n / P)` at the batch's item count `n`, `r` the
+operator-supplied CPU-local serial-tail ratio): a ratio above the upper bound is not
+enough speedup (FAIL), a ratio below the lower bound means the instrument, never the
+code, is broken (nothing can beat the ideal), and the base-to-base spread of the
+interleaved runs is the error bar a decision inside it treats as UNRESOLVED rather than
+a confident call. CLIP-vision is report-only. Verdict: ACTIVATE the change iff the
+HTSAT bar holds — the script only records the outcome, never gates or reverts a build on
+it. A hermetic dry-run suite (`ci/scripts/perf/test_frontend_ab_dry_run.py`) drives the
+real script end to end with hermetic stand-in binaries and no GPU, and is a matrix leg
+in `.github/workflows/ci.yml`.
+
 ### The bench and its torch twin
 
 `jammi-bench finetune-step`: three encoder forwards, a triplet hinge, one backward, one AdamW step; synthetic uniform token ids, so it measures *cost*, never learning. `torch_finetune_step.py` is matched argument for argument (`attn_implementation` read back from the config; `--attn eager` = semantic twin, `--attn sdpa` = the throughput bar; LoRA init distribution-matched; TF32 off). `ab_merge.py` refuses to compare legs whose `FINETUNE_IDENTITY_FIELDS` differ (the tuple is declared once, in `ci/scripts/perf/identity_fields.py`, and imported — 18 entries, including the padded-batch `row_lengths` vector); the raw attention string (`attn_requested`/`attn_implementation`) is recorded as provenance and never compared, while the reference *class* it implies is compared via the `attention_arm` identity field; the clip determinant `max_grad_norm` is in the comparison tuple (null = clip off is a value, never MISSING) and in the K7-completeness const (`FinetuneStepTier::IDENTITY_FIELDS`, a strict superset). A stdlib-`unittest` suite (`ci/scripts/perf/test_identity_fields_subset.py`) pins the claim mechanically: every Python comparison-tuple entry must be named in the corresponding Rust K7-completeness const, and the tuple cardinalities (18, 11) are asserted as numbers, not promises.

@@ -1681,6 +1681,17 @@ jobs:
           # no GPU, no real jammi-bench, no real checkpoint, no network.
           - name: lora_bias_ab.sh dry-run smoke
             cmd: python3 ci/scripts/perf/test_lora_bias_ab_sh_dry_run.py
+          # `frontend_ab.sh` ITSELF (issue #421 follow-on, "media front-end
+          # parallelization" contract's pre-registered base/tip A/B driver)
+          # -- the same "the shell PRODUCER itself must run in CI at least
+          # once, zero-execution is RED not a skip" doctrine the
+          # `finetune_ab.sh`/`lora_bias_ab.sh` dry-run legs above already
+          # carry. `FRONTEND_AB_DRY_RUN=1` swaps in hermetic stand-in
+          # binaries the script itself generates and validates argv
+          # against; the two real media corpus producers still run for
+          # real under DRY_RUN.
+          - name: frontend_ab.sh dry-run smoke
+            cmd: python3 ci/scripts/perf/test_frontend_ab_dry_run.py
     steps:
       - uses: actions/checkout@v4
         with:

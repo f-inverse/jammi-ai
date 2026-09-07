@@ -442,11 +442,11 @@ class FinetuneRunIdentityFieldsSubsetTests(unittest.TestCase):
             "FINETUNE_RUN_IDENTITY_FIELDS contains a duplicate entry",
         )
 
-    def test_rust_provenance_fields_has_exactly_12_entries(self):
+    def test_rust_provenance_fields_has_exactly_13_entries(self):
         self.assertEqual(
             len(self.rust_provenance_fields),
-            12,
-            f"FinetuneRunTier::PROVENANCE_FIELDS ({REPORT_RS}) must have EXACTLY 12 entries "
+            13,
+            f"FinetuneRunTier::PROVENANCE_FIELDS ({REPORT_RS}) must have EXACTLY 13 entries "
             "(CONTRACT H4's original 7 -- arm, device_name, kernels_disabled_requested, "
             "kernels_disabled_fired, flash_compiled, build_features, attention_arm -- plus the "
             "unit-63 adversarial-audit finding-5(c)/advisory-(d) reclassifications split_rule, "
@@ -456,7 +456,12 @@ class FinetuneRunIdentityFieldsSubsetTests(unittest.TestCase):
             "fusible_site_census, the WITNESSED per-forward seam census the tower profile's "
             "positive-proof equation reads its `calls` term off: a STRUCTURAL property of the "
             "build in batched_forward's sense, fully determined by the identity fields that "
-            "already select the model and the adapter set, so provenance and never identity) "
+            "already select the model and the adapter set, so provenance and never identity -- "
+            "12, plus the #421 media front-end parallelization follow-on's "
+            "rayon_pool_threads, the rayon GLOBAL pool size the run's process executed under "
+            "(machine/build provenance -- the pool size is fixed by the host and the process's "
+            "own thread-pool init, never a determinant of what a step computes -- so "
+            "provenance and never identity, same as `device_name`), 12 + 1 = 13) "
             "— got: "
             f"{sorted(self.rust_provenance_fields)}",
         )

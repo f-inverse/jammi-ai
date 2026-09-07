@@ -217,10 +217,17 @@ workspace ships every publishable crate at the same
   thread-count knob anywhere: chunk count is `n`, and effective parallelism (`min(pool, n)`) is
   emergent from whichever rayon pool a call runs under — candle installs no private pool, so this is
   the one pool the process ever schedules media-batch work on. `fine_tune::media_front_end_pool_threads()`
-  exposes the pool size (`rayon::current_num_threads()`, not a per-batch thread count) for
-  `FinetuneRunTier` provenance. Bit-identical to the pre-unit sequential loop at every rayon pool
-  size tested (1, 5, 7, 24, including non-dividing counts) — proven for both CLAP-fusion branches
-  (repeatpad; fusion-crop, including the `total == chunk` corner case) and the image batch path.
+  exposes the pool size (`rayon::current_num_threads()`, not a per-batch thread count) as
+  `FinetuneRunTier`'s new `rayon_pool_threads` provenance field (`PROVENANCE_FIELDS` 12 → 13,
+  mirrored in `identity_fields.py`'s own extraction of the Rust const). Bit-identical to the
+  pre-unit sequential loop at every rayon pool size tested (1, 5, 7, 24, including non-dividing
+  counts) — proven for both CLAP-fusion branches (repeatpad; fusion-crop, including the
+  `total == chunk` corner case) and the image batch path. `ci/scripts/perf/frontend_ab.sh` is the
+  contract's pre-registered base/tip A/B driver for this change (interleaved untraced
+  `finetune-run` legs over HTSAT and CLIP-vision, a two-sided bar against the `n / ideal` machine
+  model with the base-to-base spread as its own error bar, and a new committed cuda-run artifact
+  producer distinct from the existing #421 tower-profile artifact), with its own hermetic dry-run
+  suite wired into `ci.yml`; no numbers are recorded from a run yet.
 - **HTSAT's MLP and projection GELU reach the fused seam on the training path (#421).** The audio
   tower's two GELU-erf sites — each Swin block's MLP and the projection head's `"gelu"` arm — call
   the house seam `activations::gelu_erf(x, training)` instead of `Tensor::gelu_erf()` directly, the

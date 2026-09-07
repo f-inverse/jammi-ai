@@ -38,8 +38,60 @@ Both are deliberately mechanical (name/pattern presence), not a semantic
 understanding of the guard's control flow — the same "grep for the shape,
 not the meaning" stance `check_ci_guard_wiring.py`'s own module doc states.
 
+## (C) `*_DRY_RUN_*` knob admissibility — the class widened beyond `*FAKE*`
+
+(A) only ever looked at names containing the literal substring `FAKE`.
+#421 follow-ups round (esc-088 round-3 advisory) landed a SECOND shape of
+dry-run-only test lever that carries no `FAKE` in its name at all —
+`profile_421_legs.sh`'s `PROFILE_421_LEGS_DRY_RUN_EXTRA_REQUESTED_KEY` /
+`_TRUNCATE_CORPUS_VAR` and `lora_bias_ab.sh`'s `LORA_BIAS_AB_DRY_RUN_FAIL_OP`
+/ `_FAIL_PREDICATE` — every one named `<PREFIX>_DRY_RUN_<SUFFIX>`, i.e. the
+producer's OWN dry-run toggle (`<PREFIX>_DRY_RUN`) with a real suffix
+appended, structurally invisible to (A)'s `FAKE`-only name filter.
+
+A knob in this class is admissible by EITHER of two routes (never both
+required):
+
+  1. **Containment.** Every non-comment, non-self-defaulting read site of
+     the knob sits textually inside SOME `if [ "$<PREFIX>_DRY_RUN" = "1" ]`
+     -guarded region — most commonly a heredoc body written while
+     `<PREFIX>_DRY_RUN=1` (`profile_421_legs.sh`'s `fake_bench.sh` stub,
+     `lora_bias_ab.sh`'s `fake_bench.sh` stub): the knob is only ever READ
+     by code that cannot execute unless the toggle is already on, so no
+     separate preflight refusal is possible OR needed — there is no "real
+     run" code path that could ever reach it.
+  2. **Preflight refusal**, the exact (A) shape generalized off the `FAKE`
+     name requirement: a line combining the knob, the governing
+     `<PREFIX>_DRY_RUN` toggle, `!=`, and `"1"`, that `exit`s, appearing
+     BEFORE every other use — `profile_421_legs.sh`'s own
+     `PROFILE_421_LEGS_DRY_RUN_TRUNCATE_CORPUS_VAR` guard (its action
+     truncates a corpus file in place, which WOULD corrupt a real leg, so
+     it needs the same "refuse before any leg runs" contract (A) already
+     enforces for a `FAKE` knob).
+
+A "self-defaulting" read (`VAR="${VAR:-default}"`, the ordinary bash
+env-var-with-default idiom every knob in this file uses to declare its
+own default up front) is never counted as a read site: it captures the
+ambient value (or a fallback) into a same-named local, with no
+consequence of its own — the knob's real effect is wherever that value is
+later dereferenced for real, which the containment/refusal check inspects
+independently.
+
+Block extent (both for the (C) containment check above and reused nowhere
+else) is computed HEREDOC-AWARE: a heredoc body between a `<<[-]TERM`
+opener and its bare-`TERM` terminator line is treated as opaque data, never
+inspected for `if`/`fi` tokens of its own — exactly how bash itself treats
+it. A naive per-line `if`/`fi` depth counter that did NOT skip heredoc
+bodies would run straight past its block's real closing `fi`: both
+`profile_421_legs.sh`'s and `lora_bias_ab.sh`'s DRY_RUN stub heredocs embed
+a `python3 -c '...'` payload whose OWN `if`/`else` statements never close
+with a bash `fi` at all (Python doesn't have one) — those bare `if` tokens
+would inflate the depth counter with nothing to bring it back down,
+so the walker would search past the real `fi` chasing python conditionals
+that can never satisfy it.
+
 Run: `python3 ci/scripts/perf/check_producer_provenance_gates.py`
-Self-test (RED cases for both (A) and (B), on throwaway fixture files):
+Self-test (RED cases for (A), (B) and (C), on throwaway fixture files):
 `python3 ci/scripts/perf/check_producer_provenance_gates.py --self-test`
 Hermetic: reads tracked files via `git ls-files` only (no network, no
 build, no GPU).
@@ -88,6 +140,13 @@ DRY_RUN_VAR_RE = re.compile(r"[A-Z][A-Z0-9_]*DRY_RUN")
 # the CRATE source-tree shape (`crates/jammi-bench/reference/...`, which
 # also contains the bare substring `/jammi-bench` but is followed by `/`).
 BIN_ASSIGN_RE = re.compile(r"/jammi-bench(?!/)")
+
+# (C) — a `<PREFIX>_DRY_RUN_<SUFFIX>` test knob: the producer's OWN
+# `<PREFIX>_DRY_RUN` toggle with a REAL suffix appended (`_EXTRA_REQUESTED_
+# KEY`, `_FAIL_OP`, ...). Requires at least one char after the second
+# underscore so the BARE toggle itself (`PROFILE_421_LEGS_DRY_RUN`,
+# `MANIFEST_DRY_RUN`) never self-matches as its own sub-knob.
+DRY_RUN_KNOB_RE = re.compile(r"\b([A-Z][A-Z0-9_]*_DRY_RUN_[A-Z0-9_]+)\b")
 
 
 def _tracked_sh_under(repo_root: Path, prefix: str) -> list[Path]:
@@ -202,6 +261,136 @@ def check_producer_parity(path: Path) -> list[str]:
     return []
 
 
+def _governing_toggle(var: str) -> str:
+    """`<PREFIX>_DRY_RUN_<SUFFIX>` -> `<PREFIX>_DRY_RUN` — the toggle whose
+    `= "1"` truth gates every legitimate read site of `var` (see (C))."""
+    idx = var.index("_DRY_RUN_")
+    return var[:idx] + "_DRY_RUN"
+
+
+def _is_self_default_assignment(line: str, var: str) -> bool:
+    """`VAR="${VAR:-default}"` (or an empty default `${VAR:-}`) — the
+    ordinary bash env-var-with-default idiom. Captures the ambient value (or
+    a fallback) into a same-named local with no consequence of its own, so
+    it is never counted as a "read site" for (C)'s containment/refusal
+    check — see this module's own doc for why every real knob in this file
+    declares one of these up front."""
+    pattern = re.compile(r'^\s*' + re.escape(var) + r'\s*=\s*"\$\{' + re.escape(var) + r':-[^}]*\}"\s*$')
+    return bool(pattern.match(line))
+
+
+_HEREDOC_OPEN_RE = re.compile(r"<<-?\s*['\"]?([A-Za-z_][A-Za-z0-9_]*)['\"]?")
+_BLOCK_MAX_SCAN = 4000
+
+
+def _heredoc_aware_block_extent(lines: list[str], start_idx: int) -> tuple[int, int]:
+    """The `(start, end)` inclusive line-index range of the bash `if ...
+    fi` block whose OPENING line is `lines[start_idx]`, treating every
+    heredoc body between a `<<[-]TERM` opener and its bare-`TERM`
+    terminator line as OPAQUE DATA — see this module's own doc for why a
+    depth counter that does not skip heredoc bodies runs past its real
+    closing `fi` on both `profile_421_legs.sh` and `lora_bias_ab.sh`
+    (their DRY_RUN stub heredocs embed a `python3 -c '...'` payload whose
+    own `if`/`else` statements never close with a bash `fi`).
+
+    Comment lines (`_is_comment_line`) are never inspected for `if`/`fi`
+    tokens either, for the same reason `check_fake_knob_inertness` already
+    treats comments specially: this heavily-documented codebase's own prose
+    uses the bare English word "if" constantly (e.g. the very sentence
+    documenting `PROFILE_421_LEGS_DRY_RUN_TRUNCATE_CORPUS_VAR`'s guard, one
+    screen above its own real code, reads "... refuses loudly, by name,
+    before any leg runs, if it is ever set without DRY_RUN"). A trailing
+    inline comment on an otherwise-code line is a disclosed residual gap
+    (not hit by either tracked producer today) rather than something this
+    mechanical, grep-shaped scanner attempts to strip.
+    """
+    depth = 0
+    end = start_idx
+    heredoc_term: str | None = None
+    limit = min(len(lines), start_idx + _BLOCK_MAX_SCAN)
+    for i in range(start_idx, limit):
+        line = lines[i]
+        end = i
+        if heredoc_term is not None:
+            if line.strip() == heredoc_term:
+                heredoc_term = None
+            continue
+        if not _is_comment_line(line):
+            for tok in _IF_FI_TOKEN_RE.findall(line):
+                depth += 1 if tok == "if" else -1
+            m = _HEREDOC_OPEN_RE.search(line)
+            if m:
+                heredoc_term = m.group(1)
+        if depth <= 0:
+            break
+    return start_idx, end
+
+
+def _dry_run_true_block_intervals(lines: list[str], governing: str) -> list[tuple[int, int]]:
+    """Every `if [ "$<governing>" = "1" ]`-guarded region in `lines` (the
+    guard may be one ANDed clause of a larger compound condition — e.g.
+    `profile_421_legs.sh`'s `if [ "$leg_status" = "ok" ] && [
+    "$PROFILE_421_LEGS_DRY_RUN" = "1" ] && [ -n "..." ]; then` — the
+    equality test appearing ANYWHERE on the `if` line is what matters, not
+    that it is the line's only clause)."""
+    guard_re = re.compile(r'\bif\b.*\[\s*"\$' + re.escape(governing) + r'"\s*=\s*"1"\s*\]')
+    intervals: list[tuple[int, int]] = []
+    for i, line in enumerate(lines):
+        if _is_comment_line(line):
+            continue
+        if guard_re.search(line):
+            intervals.append(_heredoc_aware_block_extent(lines, i))
+    return intervals
+
+
+def _line_in_any_interval(idx: int, intervals: list[tuple[int, int]]) -> bool:
+    return any(start <= idx <= end for start, end in intervals)
+
+
+def check_dry_run_knob_containment(path: Path) -> list[str]:
+    """(C) — see module doc. Widens (A)'s `*FAKE*`-only name filter to any
+    `<PREFIX>_DRY_RUN_<SUFFIX>` test knob, admissible by EITHER containment
+    (every read site inside an `if [ "$<PREFIX>_DRY_RUN" = "1" ]`-guarded
+    region) or (A)'s own preflight-refusal shape, generalized off the
+    `FAKE` name requirement."""
+    text = path.read_text(encoding="utf-8", errors="replace")
+    lines = text.splitlines()
+    knob_vars = sorted(set(DRY_RUN_KNOB_RE.findall(text)))
+    findings: list[str] = []
+    for var in knob_vars:
+        governing = _governing_toggle(var)
+        code_use_idx = [
+            i
+            for i, line in enumerate(lines)
+            if not _is_comment_line(line) and var in line and not _is_self_default_assignment(line, var)
+        ]
+        if not code_use_idx:
+            continue  # only ever named in comments/docs, or only ever self-defaulted
+
+        governing_re = re.compile(r"\b" + re.escape(governing) + r"\b")
+        guard_idx = [
+            i for i in code_use_idx if governing_re.search(lines[i]) and "!=" in lines[i] and '"1"' in lines[i]
+        ]
+        if guard_idx:
+            first_guard = min(guard_idx)
+            guard_window = "\n".join(_guard_block_lines(lines, first_guard))
+            earlier = [i for i in code_use_idx if i < first_guard]
+            if "exit" in guard_window and not earlier:
+                continue  # admissible via preflight refusal (mode 2)
+
+        intervals = _dry_run_true_block_intervals(lines, governing)
+        uncovered = [i for i in code_use_idx if not _line_in_any_interval(i, intervals)]
+        if uncovered:
+            findings.append(
+                f"{path}: `{var}` is read at line(s) {[i + 1 for i in uncovered]} outside any "
+                f'`if [ "${governing}" = "1" ]`-guarded region, and no preflight refusal (a line '
+                f'combining `{var}`, `{governing}`, `!=`, and `"1"`, that `exit`s, before every '
+                f"other use) covers it either — this DRY_RUN-only test knob is not provably inert "
+                "in a real run."
+            )
+    return findings
+
+
 # CI incident (run 33230050451, main, "Guard (arch validation freshness
 # self-test)"), same class here: `shutil.rmtree` during a `tempfile.
 # TemporaryDirectory`'s teardown can hit `OSError: [Errno 39] Directory not
@@ -220,6 +409,7 @@ def run_gate(perf_dir: Path, repo_root: Path) -> list[str]:
     findings: list[str] = []
     for path in _tracked_sh_under(repo_root, "ci/scripts/"):
         findings += check_fake_knob_inertness(path)
+        findings += check_dry_run_knob_containment(path)
     for path in _tracked_sh_under(repo_root, "ci/scripts/perf/"):
         findings += check_producer_parity(path)
     return findings
@@ -368,6 +558,105 @@ def self_test() -> int:
             None,
         )
 
+        # (C) RED: a `_DRY_RUN_` knob read completely unguarded — no
+        # containment, no preflight refusal.
+        commit_and_check(
+            "ci/scripts/perf/bad_dry_run_knob_unguarded.sh",
+            (
+                '#!/usr/bin/env bash\n'
+                'FOO_DRY_RUN="${FOO_DRY_RUN:-0}"\n'
+                'echo "${FOO_DRY_RUN_BAR:-}"\n'
+            ),
+            check_dry_run_knob_containment,
+            "outside any",
+        )
+
+        # (C) RED, and the actual regression this class's heredoc-aware
+        # extent walker exists to catch: a knob read on the line
+        # IMMEDIATELY AFTER a DRY_RUN=1 block's real closing `fi`, where
+        # that block's own heredoc body embeds a `python3 -c` payload whose
+        # `if`/`else` never close with a bash `fi` (the exact shape both
+        # `profile_421_legs.sh` and `lora_bias_ab.sh` use). A depth counter
+        # that does NOT skip heredoc bodies never reaches depth<=0 at the
+        # real `fi` (the two dangling python `if`s leave it short), so it
+        # keeps scanning to the end of the file and wrongly reports the
+        # LAST line as still "inside" the block — silently passing an
+        # uncontained, unrefused knob. `FOO_DRY_RUN_BAZ` here sits outside
+        # the block on a real (non-heredoc) line, so a correct,
+        # heredoc-aware walker must still flag it.
+        commit_and_check(
+            "ci/scripts/perf/bad_dry_run_knob_after_heredoc_with_unmatched_if.sh",
+            (
+                '#!/usr/bin/env bash\n'
+                'FOO_DRY_RUN="${FOO_DRY_RUN:-0}"\n'
+                'if [ "$FOO_DRY_RUN" = "1" ]; then\n'
+                '  cat > /tmp/stub.sh <<STUBEOF\n'
+                'python3 -c "\n'
+                'if True:\n'
+                '    print(1)\n'
+                'else:\n'
+                '    print(2)\n'
+                '"\n'
+                'STUBEOF\n'
+                'fi\n'
+                'echo "${FOO_DRY_RUN_BAZ:-}"\n'
+            ),
+            check_dry_run_knob_containment,
+            "outside any",
+        )
+
+        # (C) GREEN control: containment — the knob is only ever read
+        # inside a heredoc body written while `FOO_DRY_RUN=1`.
+        commit_and_check(
+            "ci/scripts/perf/good_dry_run_knob_heredoc_containment.sh",
+            (
+                '#!/usr/bin/env bash\n'
+                'FOO_DRY_RUN="${FOO_DRY_RUN:-0}"\n'
+                'if [ "$FOO_DRY_RUN" = "1" ]; then\n'
+                '  cat > /tmp/stub.sh <<STUBEOF\n'
+                'echo "${FOO_DRY_RUN_BAR:-}"\n'
+                'STUBEOF\n'
+                'fi\n'
+            ),
+            check_dry_run_knob_containment,
+            None,
+        )
+
+        # (C) GREEN control: preflight refusal — `profile_421_legs.sh`'s
+        # own `PROFILE_421_LEGS_DRY_RUN_TRUNCATE_CORPUS_VAR` shape,
+        # generalized off the `FAKE` name requirement.
+        commit_and_check(
+            "ci/scripts/perf/good_dry_run_knob_preflight_refusal.sh",
+            (
+                '#!/usr/bin/env bash\n'
+                'FOO_DRY_RUN="${FOO_DRY_RUN:-0}"\n'
+                'if [ -n "${FOO_DRY_RUN_TRUNCATE_VAR:-}" ] && [ "$FOO_DRY_RUN" != "1" ]; then\n'
+                '  echo "::error::refusing" >&2\n'
+                '  exit 2\n'
+                'fi\n'
+                'if [ "$FOO_DRY_RUN" = "1" ] && [ -n "${FOO_DRY_RUN_TRUNCATE_VAR:-}" ]; then\n'
+                '  echo "$FOO_DRY_RUN_TRUNCATE_VAR"\n'
+                'fi\n'
+            ),
+            check_dry_run_knob_containment,
+            None,
+        )
+
+        # (C) GREEN control: a knob only ever named in a comment, or only
+        # ever self-defaulted (`VAR="${VAR:-...}"`) — neither is a live
+        # read site.
+        commit_and_check(
+            "ci/scripts/perf/good_dry_run_knob_comment_and_self_default_only.sh",
+            (
+                '#!/usr/bin/env bash\n'
+                '# FOO_DRY_RUN_BAR is documented elsewhere; not read by this script.\n'
+                'FOO_DRY_RUN_BAR="${FOO_DRY_RUN_BAR:-}"\n'
+                'echo hi\n'
+            ),
+            check_dry_run_knob_containment,
+            None,
+        )
+
     # Non-vacuousness control (the actual bug this round fixes): a wrong
     # `REPO_ROOT` (previously `parents[2]`, resolving to `<repo>/ci` instead
     # of `<repo>`) makes `git ls-files ci/scripts/` run with the WRONG `cwd`
@@ -403,10 +692,12 @@ def self_test() -> int:
     print(
         "check-producer-provenance-gates self-test: OK — (A) FAKE-knob inertness "
         "(no-guard / use-before-guard / guard-without-exit all RED; a real guard, a "
-        "comment-only mention, both GREEN) and (B) producer parity (a jammi-bench-binary "
+        "comment-only mention, both GREEN), (B) producer parity (a jammi-bench-binary "
         "producer missing provenance/build_sha is RED; one carrying both, or one that never "
-        "names a binary path at all, is GREEN) both bite on throwaway fixtures; the real "
-        "tree is clean."
+        "names a binary path at all, is GREEN), and (C) *_DRY_RUN_* knob containment "
+        "(unguarded, and a knob past a heredoc-embedded unmatched-if block's real `fi`, "
+        "both RED; heredoc containment, preflight refusal, and comment/self-default-only, "
+        "all GREEN) all bite on throwaway fixtures; the real tree is clean."
     )
     return 0
 
@@ -423,8 +714,9 @@ def main() -> int:
         print(f"\ncheck-producer-provenance-gates: {len(findings)} finding(s).", file=sys.stderr)
         return 1
     print(
-        "check-producer-provenance-gates: PASS — every FAKE-shaped test knob under "
-        "ci/scripts/ is inert unless *DRY_RUN=1, and every ci/scripts/perf/*.sh naming a "
+        "check-producer-provenance-gates: PASS — every FAKE-shaped and every "
+        "*_DRY_RUN_*-shaped test knob under ci/scripts/ is inert unless its own governing "
+        "toggle is 1 (contained or preflight-refused), and every ci/scripts/perf/*.sh naming a "
         "jammi-bench binary path cross-checks its provenance build_sha."
     )
     return 0

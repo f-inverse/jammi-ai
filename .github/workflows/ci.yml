@@ -149,6 +149,22 @@ jobs:
           # machine or a pod — never for this heterogeneous hosted lane.
         run: cargo test --workspace --exclude jammi-python
 
+      # golden-parity is opt-in (`crates/jammi-encoders/Cargo.toml`) so the
+      # default workspace test run above never compiles it, but it is fully
+      # hermetic: the oracle is a committed PyTorch dump
+      # (`cookbook/fixtures/htsat_clap_tiny/goldens.safetensors`, tracked
+      # binary), never a network call or a torch install. Without this step
+      # `htsat_audio.rs`'s own doc claim ("eval bytes crate-wide are pinned by
+      # ... tests/golden_parity.rs") describes a test that compiles and passes
+      # LOCALLY but that CI never runs — a doc citing a proof CI does not
+      # reproduce is exactly the drift this repo's gates exist to close. A
+      # dedicated step (not folded into the `--workspace` run above) because
+      # `golden-parity` is off by default for every OTHER crate too; passing
+      # it workspace-wide would be a silent feature-unification change this
+      # step does not need to make.
+      - name: Test jammi-encoders --features golden-parity (CPU-only, PyTorch reference committed)
+        run: cargo test -p jammi-encoders --features golden-parity --test golden_parity
+
       # Unification contract §6 F3 (round-2 audit B5): the designated
       # build-sha HERMETICITY falsifier, as a real CI step (never a
       # `#[test]` — C1.6's own text: this needs a REAL commit, and mutating

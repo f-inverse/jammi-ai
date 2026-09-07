@@ -17,6 +17,8 @@ embedding modality the engine supports alongside text and images.
 3. **Search** the index with an encoded audio query (cosine ANN)
 4. **Eval** retrieval quality (Recall@K / MRR) against a held-out golden set
 5. **Fine-tune** a projection head on audio triplets and re-eval (tuned ≠ base)
+6. **Fine-tune** LoRA adapters *inside* the audio tower on the same triplets
+   (adapted ≠ base), then watch a wrong selector get **refused**
 
 ## Model
 
@@ -67,6 +69,49 @@ meaningless — it exercises the full pipeline, not model quality. Point
    vectors move.) It proves the adapter alters audio retrieval — not that it
    improves it; the random-weight fixture's direction is not meaningful, real
    lift comes from a real checkpoint.
+8. Runs the **other** fine-tune mode on the same triplets:
+   `target_modules=["query", "value", "linear1"]` puts LoRA **inside the
+   HTSAT-Swin tower** itself — `query`/`value` are the Swin blocks' attention
+   projections (indexed by stage), `linear1` the audio projection head's first
+   linear (an unindexed site). It re-encodes the same query clip through the
+   adapted model and asserts the same `|Δ| > 1e-4` change.
+9. Submits one more job with `target_modules=["q_proj"]` — a real selector on
+   plenty of decoder checkpoints and on **nothing** in an HTSAT-Swin tower —
+   and asserts `job.wait()` raises `jammi.errors.TrainingError` whose message
+   echoes `q_proj` *and* names this tower's real sites (`query`, `linear1`, …).
+   It prints the message.
+
+### What each leg proves, and the honesty rule
+
+Both fine-tune legs ship and both are real; they are different capabilities:
+
+- **The projection-head leg** (empty `target_modules`) trains a new map on top
+  of a tower whose weights never move — cheap, low-risk, no site names needed.
+- **The tower leg** (non-empty `target_modules`) moves the tower's own
+  representation — more capacity for a domain the base checkpoint never saw, at
+  more compute, and it needs the site vocabulary of *this* architecture.
+
+Both prove the adapter is trained *and applied when the model is served*: an
+adapter that trained but was silently dropped at serve time leaves the two query
+vectors bit-identical, and that is what the `|Δ|` check catches. Both assert
+**change, not improvement** — the default fixture has **random weights**, so the
+*direction* of the change carries no information.
+
+What neither leg can check from here is the saved adapter's *kind* — that it is
+an encoder-adapters bundle carrying the audio tower's id. That is
+engine-internal and is pinned by the engine's own integration tests; the client
+surface (`describe_model`) reports only the model's id, backend, task and
+status, so the recipe asserts the task and leans on the `|Δ|` check for the rest.
+
+**The refusal leg** proves a selector matching no site fails the *job* rather
+than publishing an adapter that changes nothing, and that the message is
+actionable — it carries this architecture's own site names.
+
+The **independently-known improvement number** — tuned retrieval quality beating
+the base by a measured margin — is not this recipe's to claim. It belongs to the
+real-checkpoint chapter, which reads a committed cache produced on a GPU. A
+recipe running a random-weight fixture on a laptop can honestly prove mechanism;
+it cannot prove quality.
 
 The pairing semantics (what a "positive" *means*) are the caller's training
 data, not the trainer's: the trainer only minimizes the contrastive triplet
@@ -91,7 +136,8 @@ python cookbook/recipes/audio_search/04-eval.py
 - `Database.encode_query(*, model, query, modality="audio")` → `list[float]`
 - `Database.search(source, *, query, k, filter=None, select=None)` → `pyarrow.Table`
 - `Database.eval_embeddings(*, source, golden_source, model=None, k=10)`
-- `Database.fine_tune(*, source, base_model, columns, method, task="audio_embedding", ...)` → `TrainingJob`
+- `Database.fine_tune(*, source, base_model, columns, method, task="audio_embedding", target_modules=[...], ...)` → `TrainingJob`
+- `Database.describe_model(model_id)` → `dict | None`
 
 ### Audio triplet schema (fine-tune input)
 
@@ -103,6 +149,16 @@ python cookbook/recipes/audio_search/04-eval.py
 
 Same column shape as text triplets — `task="audio_embedding"` is what tells the
 loader to read the three columns as encoded audio rather than text.
+
+### Audio-tower LoRA sites
+
+`target_modules` names sites on **this** architecture. An **empty** list means
+"no tower sites" and selects the projection-head mode instead. The HTSAT-Swin
+audio tower offers `query`, `key`, `value`, `attention_output`,
+`intermediate_dense`, `output_dense`, `reduction`, `linear1` and `linear2`;
+`all-linear` selects every one. A selector matches a site name exactly or as a
+suffix of it. A **non-empty** list matching nothing fails the job with a message
+that echoes what you submitted and lists the tower's real names.
 
 ## Input schema
 

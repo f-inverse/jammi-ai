@@ -24,17 +24,29 @@ hermetically against SYNTHETIC merge/attribution/identity/legs-dir fixtures
 
 ## What comes from where
 
-- `git_sha` / `box`: read off every leg's (and, if `--p2-dir` is given,
-  every P2 tower's) own `manifest.json` under `--legs-dir` — WITNESSED per
-  run, never declared in the identity sidecar — and cross-checked to agree
-  on every single one. A run whose legs disagree on which build or which
-  physical box produced them is not one measurement session; this module
-  refuses rather than pick one arbitrarily.
+- `git_sha` / `box`: read off every leg's own `manifest.json` under
+  `--legs-dir` — WITNESSED per run, never declared in the identity sidecar
+  — and cross-checked to agree on every single one. A run whose legs
+  disagree on which build or which physical box produced them is not one
+  measurement session; this module refuses rather than pick one
+  arbitrarily. Whenever `--merge-json` itself carries any `p2_bf16` rows,
+  `--p2-dir` is REQUIRED (never optional) and EVERY named P2 tower's own
+  `manifest.json` must exist under it and agree too — a missing or
+  disagreeing P2 manifest is a refusal, never a silent skip past that
+  tower. The witnessed `(towers, git_sha, box)` triple is recorded at
+  `p2_witnessed` (`None` when `--merge-json` carries no `p2_bf16` rows at
+  all).
+- `status`: `"GREEN"` iff `--merge-json`'s own `summary.legs_invalid == 0`
+  and `summary.p2_fail == 0`, else a `"RED: ..."` string naming the actual
+  counts — derived, never hand-declared by the identity sidecar (see
+  `derive_status`).
 - `checkpoint_weights_sha256` (per tower family): read off `--merge-json`'s
   own per-leg `checkpoint_weights_sha256` (already cross-checked equal
   within a tower by `profile_421_merge.py`'s own `_check_cross_tower_
   identity`) — cross-checked AGAIN here across every leg of a family before
   it is trusted as "the" sha256 for that family's `notes.checkpoints` entry.
+  A leg whose tower HAS a known checkpoint family but no sha at all is a
+  refusal, never a silently-skipped leg.
 - `launches_per_step` (used only by the CLIP launch-bound finding below):
   read off each named leg's own `census.json` under `--legs-dir` — the one
   number neither the merge nor the attribution report carries.
@@ -44,12 +56,19 @@ hermetically against SYNTHETIC merge/attribution/identity/legs-dir fixtures
   `candidate_decisions` are copied character-for-character, never
   reformatted or re-derived, per the contract's own "the verdict strings
   written once (never edited)" line.
+- `notes.recorded_deviations`: `--identity`'s own entries are TEMPLATES —
+  any number the prose needs to quote (a chain share, a validity-gate
+  bound, a corpus file/row count) is a `{placeholder}` this module fills
+  from a live source (`_identity_template_context`) — see
+  `profile_421_run2_identity.json`'s own header comment for the "no bare
+  digit" guarantee this enforces. A run fact with NO in-tree witness at all
+  (e.g. an off-pod disk-usage total) belongs in `notes.operator_recorded`
+  instead, explicitly outside that guarantee.
 - Everything else in `notes` (`what`, `gpu`, `driver`, `cpu`, `nsys`,
-  checkpoint repo/file names, `recorded_deviations` prose, the producer
-  `invocation` string): read from `--identity`, which carries ONLY
-  provenance with no numeric guarantee attached (a device-model string is
-  not a measurement an oracle could re-derive) — see that file's own header
-  comment.
+  checkpoint repo/file names, the producer `invocation` string): read from
+  `--identity`, which carries ONLY provenance with no numeric guarantee
+  attached (a device-model string is not a measurement an oracle could
+  re-derive) — see that file's own header comment.
 
 ## Findings: computed, not hand-typed
 
@@ -75,10 +94,22 @@ from __future__ import annotations
 import argparse
 import json
 import math
+import re
 import sys
 from pathlib import Path
 
+# `profile_421_attribute.py`'s own validity-gate constants — imported, never
+# retyped, so the identity sidecar's "N% validity bound" / "N% known-kernel-
+# name gate" prose reads the SAME number this repo's attribution logic
+# actually enforces (see `_identity_template_context` below).
+import profile_421_attribute as _attribute_mod
+
 SCHEMA_VERSION = 1
+
+PERF_DIR = Path(__file__).resolve().parent
+LEGS_SH = PERF_DIR / "profile_421_legs.sh"
+IMAGE_CORPUS_PY = PERF_DIR / "gen_fixed_shape_image_corpus.py"
+AUDIO_CORPUS_PY = PERF_DIR / "gen_fixed_length_audio_corpus.py"
 
 
 class ArtifactBuildError(Exception):
@@ -103,6 +134,20 @@ def _finite(value: object, label: str) -> float:
     return as_float
 
 
+def _finite_share(value: object, label: str) -> float:
+    """`_finite` plus a `[0, 1]` domain check — every value this module
+    multiplies by `100.0` to report as a percentage is a SHARE (of wall or
+    GPU-busy time), and a share outside `[0, 1]` (negative, or > 1 from a
+    mis-summed denominator upstream) is exactly as uncomputable as a `NaN`:
+    it is not a number this module should silently round and print. Kept
+    separate from `_finite` (which is also used for plain durations and
+    counts that are never bounded to `[0, 1]`)."""
+    as_float = _finite(value, label)
+    if not (0.0 <= as_float <= 1.0):
+        raise ArtifactBuildError(f"{label} is not in [0, 1] ({as_float!r})")
+    return as_float
+
+
 def _load_json(path: Path, what: str) -> dict:
     try:
         return json.loads(path.read_text(encoding="utf-8"))
@@ -112,21 +157,123 @@ def _load_json(path: Path, what: str) -> dict:
         raise ArtifactBuildError(f"{what} at {path} is not valid JSON: {exc}") from exc
 
 
+def _load_text(path: Path, what: str) -> str:
+    try:
+        return path.read_text(encoding="utf-8")
+    except OSError as exc:
+        raise ArtifactBuildError(f"could not read {what} at {path}: {exc}") from exc
+
+
+# --------------------------------------------------------------------------- #
+# Driver/producer constants read live off their OWN source files — the media-
+# corpus pool arithmetic ("families x instances = N files, M distinct train
+# clips") the identity sidecar's own deviation prose quotes has no other
+# witness anywhere in a committed report, so it is read here from
+# `profile_421_legs.sh`'s own shell constants and the two corpus producers'
+# own `_DEFAULT_INSTANCES_PER_FAMILY`, never hand-retyped as a second,
+# independently-drifting copy.
+# --------------------------------------------------------------------------- #
+_SHELL_INT_CONST_RE = r'(?m)^{name}=(?:"\$\{{[A-Z0-9_]+:-(\d+)\}}"|(\d+)\b)'
+_PY_INT_CONST_RE = r"(?m)^{name}\s*=\s*(\d+)\b"
+
+
+def _read_shell_int_const(path: Path, name: str) -> int:
+    text = _load_text(path, f"shell script (for constant {name!r})")
+    m = re.search(_SHELL_INT_CONST_RE.format(name=re.escape(name)), text)
+    if not m:
+        raise ArtifactBuildError(f"could not find shell constant {name!r} in {path}")
+    raw = m.group(1) if m.group(1) is not None else m.group(2)
+    return int(raw)
+
+
+def _read_py_int_const(path: Path, name: str) -> int:
+    text = _load_text(path, f"python module (for constant {name!r})")
+    m = re.search(_PY_INT_CONST_RE.format(name=re.escape(name)), text)
+    if not m:
+        raise ArtifactBuildError(f"could not find Python constant {name!r} in {path}")
+    return int(m.group(1))
+
+
+def compute_media_corpus_pool() -> dict[str, int]:
+    """The media-corpus pool numbers the identity sidecar's own deviation
+    prose quotes ("families x instances = N files ... M distinct train
+    clips", "the M-leg's R rows"), read live off `profile_421_legs.sh`'s own
+    `MEDIA_FAMILIES`/`MEDIA_HELDOUT_FAMILIES`/`STEPS_M`/`BATCH` and the two
+    corpus producers' own `_DEFAULT_INSTANCES_PER_FAMILY` — cross-checked to
+    agree with each other (image vs audio) before either is trusted."""
+    media_families = _read_shell_int_const(LEGS_SH, "MEDIA_FAMILIES")
+    media_heldout_families = _read_shell_int_const(LEGS_SH, "MEDIA_HELDOUT_FAMILIES")
+    steps_m = _read_shell_int_const(LEGS_SH, "STEPS_M")
+    batch = _read_shell_int_const(LEGS_SH, "BATCH")
+    image_instances = _read_py_int_const(IMAGE_CORPUS_PY, "_DEFAULT_INSTANCES_PER_FAMILY")
+    audio_instances = _read_py_int_const(AUDIO_CORPUS_PY, "_DEFAULT_INSTANCES_PER_FAMILY")
+    if image_instances != audio_instances:
+        raise ArtifactBuildError(
+            "image/audio media corpus producers disagree on _DEFAULT_INSTANCES_PER_FAMILY: "
+            f"{image_instances} vs {audio_instances}"
+        )
+    if media_heldout_families > media_families:
+        raise ArtifactBuildError(
+            f"profile_421_legs.sh: MEDIA_HELDOUT_FAMILIES ({media_heldout_families}) exceeds "
+            f"MEDIA_FAMILIES ({media_families})"
+        )
+    return {
+        "corpus_total_files": media_families * image_instances,
+        "corpus_train_clips": (media_families - media_heldout_families) * image_instances,
+        "corpus_rows_m": batch * steps_m,
+    }
+
+
+def compute_sqlite_raw_export_count(legs_dir: Path) -> int:
+    """Two raw `.sqlite` exports (`run_n.sqlite`, `run_m.sqlite`) per leg —
+    the count the identity sidecar's own "the raw sqlite exports (N files,
+    ...)" deviation quotes, read live off how many legs `--legs-dir` itself
+    actually carries, never a hand-typed literal."""
+    return len(_leg_dirs(legs_dir)) * 2
+
+
 def _leg_dirs(legs_dir: Path) -> list[Path]:
     if not legs_dir.is_dir():
         raise ArtifactBuildError(f"--legs-dir {legs_dir} is not a directory")
     return sorted((p for p in legs_dir.iterdir() if p.is_dir()), key=lambda p: p.name)
 
 
+def p2_tower_names(merge_report: dict) -> list[str]:
+    """The distinct, sorted tower names `--merge-json`'s own `p2_bf16` rows
+    name — the set of P2 towers THIS merge report claims to have measured,
+    and therefore the exact set `collect_identity` below must witness a
+    manifest for. Never a directory listing (a tower this run never
+    measured has no row here at all, and a `p2_dir` scan could otherwise
+    pick up a stale or unrelated subdirectory)."""
+    towers: set[str] = set()
+    for row in merge_report.get("p2_bf16", []):
+        if isinstance(row, dict) and isinstance(row.get("tower"), str) and row["tower"]:
+            towers.add(row["tower"])
+    return sorted(towers)
+
+
 # --------------------------------------------------------------------------- #
 # git_sha / box: witnessed off every manifest.json, cross-checked to agree
 # --------------------------------------------------------------------------- #
-def collect_identity(legs_dir: Path, p2_dir: Path | None) -> tuple[str, str]:
-    """Reads `git_sha` + `box` off every leg's (and, if given, every P2
-    tower's) own `manifest.json`, and refuses (`ArtifactBuildError`) unless
-    every single one agrees — a mixed-build or mixed-box session is not one
+def collect_identity(legs_dir: Path, p2_dir: Path | None, p2_towers: list[str]) -> tuple[str, str, list[str]]:
+    """Reads `git_sha` + `box` off every leg's own `manifest.json`, and — if
+    `p2_towers` (the towers `--merge-json`'s own `p2_bf16` rows name) is
+    non-empty — off every ONE of those P2 towers' own `manifest.json` under
+    `--p2-dir` too, refusing (`ArtifactBuildError`) unless every single one
+    agrees on `(git_sha, box)`: a mixed-build or mixed-box session is not one
     measurement, and this module never silently picks the first value it
-    saw."""
+    saw.
+
+    When `p2_towers` is non-empty, `--p2-dir` is REQUIRED (a merge report
+    that measured P2 towers but was handed no `--p2-dir` to witness them
+    from is exactly the "byte-identical without --p2-dir" gap this function
+    closes), and a tower named in `p2_towers` with no `manifest.json` under
+    `--p2-dir` is a hard refusal, never a silent `continue` past it.
+
+    Returns `(git_sha, box, p2_towers)` — the third element is `p2_towers`
+    itself, echoed back so the caller can build the artifact's own
+    `p2_witnessed` block without re-deriving it.
+    """
     seen: dict[str, tuple[str, str]] = {}
     for leg_dir in _leg_dirs(legs_dir):
         manifest = _load_json(leg_dir / "manifest.json", f"{leg_dir.name}: manifest.json")
@@ -137,21 +284,30 @@ def collect_identity(legs_dir: Path, p2_dir: Path | None) -> tuple[str, str]:
         if not isinstance(box, str) or not box:
             raise ArtifactBuildError(f"{leg_dir.name}: manifest.json has no string box")
         seen[f"leg:{leg_dir.name}"] = (git_sha, box)
-    if p2_dir is not None:
+    if p2_towers:
+        if p2_dir is None:
+            raise ArtifactBuildError(
+                "--merge-json carries p2_bf16 rows for "
+                f"{p2_towers} but --p2-dir was not given — every P2 tower's own manifest.json "
+                "must be witnessed, never assumed to agree"
+            )
         if not p2_dir.is_dir():
             raise ArtifactBuildError(f"--p2-dir {p2_dir} is not a directory")
-        for tower_dir in sorted((p for p in p2_dir.iterdir() if p.is_dir()), key=lambda p: p.name):
-            manifest_path = tower_dir / "manifest.json"
+        for tower in p2_towers:
+            manifest_path = p2_dir / tower / "manifest.json"
             if not manifest_path.is_file():
-                continue
-            manifest = _load_json(manifest_path, f"p2/{tower_dir.name}: manifest.json")
+                raise ArtifactBuildError(
+                    f"p2/{tower}: --merge-json's p2_bf16 names this tower but no manifest.json exists "
+                    f"under --p2-dir {p2_dir} — a missing P2 manifest is a refusal, never a silent skip"
+                )
+            manifest = _load_json(manifest_path, f"p2/{tower}: manifest.json")
             git_sha = manifest.get("git_sha")
             box = manifest.get("box")
             if not isinstance(git_sha, str) or not git_sha:
-                raise ArtifactBuildError(f"p2/{tower_dir.name}: manifest.json has no string git_sha")
+                raise ArtifactBuildError(f"p2/{tower}: manifest.json has no string git_sha")
             if not isinstance(box, str) or not box:
-                raise ArtifactBuildError(f"p2/{tower_dir.name}: manifest.json has no string box")
-            seen[f"p2:{tower_dir.name}"] = (git_sha, box)
+                raise ArtifactBuildError(f"p2/{tower}: manifest.json has no string box")
+            seen[f"p2:{tower}"] = (git_sha, box)
     if not seen:
         raise ArtifactBuildError("no manifest.json found under --legs-dir (or --p2-dir) to witness git_sha/box from")
     distinct = set(seen.values())
@@ -159,7 +315,7 @@ def collect_identity(legs_dir: Path, p2_dir: Path | None) -> tuple[str, str]:
         detail = "; ".join(f"{k}={v}" for k, v in sorted(seen.items()))
         raise ArtifactBuildError(f"manifests disagree on (git_sha, box) — not one measurement session: {detail}")
     (git_sha, box) = next(iter(distinct))
-    return git_sha, box
+    return git_sha, box, p2_towers
 
 
 # --------------------------------------------------------------------------- #
@@ -173,13 +329,25 @@ _TOWER_FAMILY = {
 
 
 def collect_checkpoint_sha256(merge_legs: list[dict]) -> dict[str, str]:
+    """A leg whose tower maps to a known checkpoint family (`_TOWER_FAMILY`)
+    but carries no `checkpoint_weights_sha256` is a hard refusal, never a
+    silent skip — a silently-skipped leg could hide behind its OWN family's
+    other legs agreeing, reporting a checkpoint identity this leg itself
+    never actually confirmed. A tower with no family at all (not in
+    `_TOWER_FAMILY`) is genuinely not applicable and is skipped."""
     by_family: dict[str, set[str]] = {}
     for leg in merge_legs:
         tower = leg.get("tower")
         family = _TOWER_FAMILY.get(tower)
-        sha = leg.get("checkpoint_weights_sha256")
-        if family is None or not isinstance(sha, str) or not sha:
+        if family is None:
             continue
+        sha = leg.get("checkpoint_weights_sha256")
+        if not isinstance(sha, str) or not sha:
+            leg_id = leg.get("leg_id", "<unknown>")
+            raise ArtifactBuildError(
+                f"{leg_id}: tower {tower!r} (checkpoint family {family!r}) has no "
+                "checkpoint_weights_sha256 in --merge-json"
+            )
         by_family.setdefault(family, set()).add(sha)
     out: dict[str, str] = {}
     for family, shas in by_family.items():
@@ -221,7 +389,19 @@ LEG_FIELDS_FROM_ATTRIBUTION = (
 
 
 def _index_by_leg_id(rows: list[dict]) -> dict[str, dict]:
-    return {row["leg_id"]: row for row in rows if isinstance(row, dict) and "leg_id" in row}
+    """Refuses a duplicate `leg_id` rather than let a plain dict comprehension
+    silently keep only the LAST row with that id — a report that (by a
+    producer bug or a hand-edit) carries two rows for the same leg would
+    otherwise have one of them vanish with no signal at all."""
+    out: dict[str, dict] = {}
+    for row in rows:
+        if not isinstance(row, dict) or "leg_id" not in row:
+            continue
+        leg_id = row["leg_id"]
+        if leg_id in out:
+            raise ArtifactBuildError(f"duplicate leg_id {leg_id!r} in the same report")
+        out[leg_id] = row
+    return out
 
 
 def build_legs(merge_report: dict, attribution_report: dict, legs_dir: Path) -> list[dict]:
@@ -279,11 +459,23 @@ def _per_step_finite(merge_legs: list[dict], leg_id: str, field: str) -> float:
     return _finite(_per_step(merge_legs, leg_id).get(field), f"{leg_id}: per_step.{field}")
 
 
+def _per_step_share(merge_legs: list[dict], leg_id: str, field: str) -> float:
+    """`_per_step_finite`, domain-checked to `[0, 1]` — for fields that are a
+    SHARE of wall/busy time (never a plain duration or count)."""
+    return _finite_share(_per_step(merge_legs, leg_id).get(field), f"{leg_id}: per_step.{field}")
+
+
 def _chain(attribution_legs: list[dict], leg_id: str, chain: str) -> dict:
     row = _index_by_leg_id(attribution_legs).get(leg_id)
     if row is None or chain not in row.get("chains", {}):
         raise ArtifactBuildError(f"{leg_id}: no {chain!r} chain in --attribution-json to build a finding from")
     return row["chains"][chain]
+
+
+def _chain_share(attribution_legs: list[dict], leg_id: str, chain: str, field: str) -> float:
+    """A chain's own share field, domain-checked to `[0, 1]` via
+    `_finite_share` — same convention as `_per_step_share` above."""
+    return _finite_share(_chain(attribution_legs, leg_id, chain).get(field), f"{leg_id}: chains[{chain!r}].{field}")
 
 
 def compute_findings(merge_report: dict, attribution_report: dict, legs_dir: Path) -> list[dict]:
@@ -293,7 +485,7 @@ def compute_findings(merge_report: dict, attribution_report: dict, legs_dir: Pat
 
     # 1) HTSAT front-end share of wall (A1 f32, A2 bf16 decision legs).
     htsat_shares = {
-        leg_id: _per_step_finite(merge_legs, leg_id, "front_share_of_wall") * 100.0 for leg_id in ("htsat-A1", "htsat-A2")
+        leg_id: _per_step_share(merge_legs, leg_id, "front_share_of_wall") * 100.0 for leg_id in ("htsat-A1", "htsat-A2")
     }
     lo, hi = min(htsat_shares.values()), max(htsat_shares.values())
     findings.append(
@@ -310,7 +502,7 @@ def compute_findings(merge_report: dict, attribution_report: dict, legs_dir: Pat
 
     # 2) CLIP-vision front-end share of wall (A1 f32, A2 bf16 decision legs).
     vision_shares = {
-        leg_id: _per_step_finite(merge_legs, leg_id, "front_share_of_wall") * 100.0
+        leg_id: _per_step_share(merge_legs, leg_id, "front_share_of_wall") * 100.0
         for leg_id in ("clip-vision-A1", "clip-vision-A2")
     }
     lo, hi = min(vision_shares.values()), max(vision_shares.values())
@@ -341,13 +533,25 @@ def compute_findings(merge_report: dict, attribution_report: dict, legs_dir: Pat
         busy_a2 = _per_step_finite(merge_legs, a2, "busy_s_per_step")
         wall_a1 = _per_step_finite(merge_legs, a1, "wall_s_per_step")
         wall_a2 = _per_step_finite(merge_legs, a2, "wall_s_per_step")
+        # `busy_a1`/`wall_a1` are this delta's own denominator — a zero
+        # denominator is exactly as uncomputable as a NaN numerator, not a
+        # divide-by-zero this module should let Python turn into an `inf`
+        # or a `ZeroDivisionError` several lines away from its real cause.
+        if busy_a1 == 0.0:
+            raise ArtifactBuildError(f"{a1}: per_step.busy_s_per_step is 0 — cannot compute a BF16-vs-F32 busy delta")
+        if wall_a1 == 0.0:
+            raise ArtifactBuildError(f"{a1}: per_step.wall_s_per_step is 0 — cannot compute a BF16-vs-F32 wall delta")
         busy_deltas_pct[tower] = (busy_a2 - busy_a1) / busy_a1 * 100.0
         wall_deltas_pct[tower] = (wall_a2 - wall_a1) / wall_a1 * 100.0
     launch_lo, launch_hi = min(launches.values()), max(launches.values())
     # Both deltas are negative (BF16 is cheaper): order the range by
-    # ascending MAGNITUDE ("-32...-41%", smallest shrink first), not by
-    # ascending signed value, so the sentence reads as a growing effect —
-    # `sorted(..., key=abs)` rather than a plain `min`/`max` pick.
+    # ascending MAGNITUDE (smallest shrink first), not by ascending signed
+    # value, so the sentence reads as a growing effect — `sorted(...,
+    # key=abs)` rather than a plain `min`/`max` pick. The SENTENCE itself
+    # renders the magnitude (`abs(...)`) with "cuts"/"drops" already saying
+    # the direction in English — a signed "-32...-41%" would double-negate
+    # (a cut that is itself negative reads as a GROWTH, the opposite of
+    # what the number means).
     busy_by_magnitude = sorted(busy_deltas_pct.values(), key=abs)
     wall_by_magnitude = sorted(wall_deltas_pct.values(), key=abs)
     findings.append(
@@ -356,8 +560,8 @@ def compute_findings(merge_report: dict, attribution_report: dict, legs_dir: Pat
             "text": (
                 f"At batch 8 the CLIP training steps are launch-bound: {launch_lo:.0f}-{launch_hi:.0f} "
                 "launches/step across the four F32/BF16 A-arm CLIP legs (text and vision); switching to "
-                f"BF16 cuts GPU busy {busy_by_magnitude[0]:.0f}...{busy_by_magnitude[-1]:.0f}% per tower "
-                f"while wall drops only {wall_by_magnitude[0]:.0f}...{wall_by_magnitude[-1]:.0f}%."
+                f"BF16 cuts GPU busy by {abs(busy_by_magnitude[0]):.0f}-{abs(busy_by_magnitude[-1]):.0f}% per "
+                f"tower while wall drops by only {abs(wall_by_magnitude[0]):.0f}-{abs(wall_by_magnitude[-1]):.0f}%."
             ),
             "evidence": {
                 "launches_per_step": launches,
@@ -369,9 +573,8 @@ def compute_findings(merge_report: dict, attribution_report: dict, legs_dir: Pat
 
     # 4) C-ATTN-HTSAT: measured, out-of-tier (declared out of scope for a
     #    port decision under this contract — a NUMBER, never a verdict).
-    c_attn_htsat = _chain(attribution_legs, "htsat-A1", "C-ATTN-htsat")
-    share_gpu_busy = _finite(c_attn_htsat.get("share_gpu_busy"), "htsat-A1: chains['C-ATTN-htsat'].share_gpu_busy")
-    share_wall = _finite(c_attn_htsat.get("share_wall"), "htsat-A1: chains['C-ATTN-htsat'].share_wall")
+    share_gpu_busy = _chain_share(attribution_legs, "htsat-A1", "C-ATTN-htsat", "share_gpu_busy")
+    share_wall = _chain_share(attribution_legs, "htsat-A1", "C-ATTN-htsat", "share_wall")
     busy_pct = share_gpu_busy * 100.0
     wall_pct = share_wall * 100.0
     findings.append(
@@ -391,6 +594,71 @@ def compute_findings(merge_report: dict, attribution_report: dict, legs_dir: Pat
     return findings
 
 
+def derive_status(merge_report: dict) -> str:
+    """GREEN iff `--merge-json`'s own `summary` reports zero invalid legs
+    AND zero failed P2 towers — read live off that summary, never hand-
+    declared by the identity sidecar. A sidecar that could simply assert
+    `"status": "GREEN"` is exactly the "restored coverage" transcription
+    failure mode the house principles name: nothing would recompute it if
+    the underlying run actually went RED."""
+    summary = merge_report.get("summary")
+    if not isinstance(summary, dict):
+        raise ArtifactBuildError("--merge-json has no summary block to derive status from")
+    legs_invalid = summary.get("legs_invalid")
+    p2_fail = summary.get("p2_fail")
+    if not isinstance(legs_invalid, int) or isinstance(legs_invalid, bool):
+        raise ArtifactBuildError(f"--merge-json summary.legs_invalid is not an int ({legs_invalid!r})")
+    if not isinstance(p2_fail, int) or isinstance(p2_fail, bool):
+        raise ArtifactBuildError(f"--merge-json summary.p2_fail is not an int ({p2_fail!r})")
+    if legs_invalid == 0 and p2_fail == 0:
+        return "GREEN"
+    return f"RED: {legs_invalid} leg(s) INVALID, {p2_fail} P2 tower(s) FAIL"
+
+
+# --------------------------------------------------------------------------- #
+# identity-sidecar deviation TEMPLATES — every number the prose quotes is
+# filled in here from a live source, never hand-typed into the sidecar
+# itself (see `profile_421_run2_identity.json`'s own header comment).
+# --------------------------------------------------------------------------- #
+def _identity_template_context(merge_report: dict, attribution_report: dict, legs_dir: Path) -> dict[str, object]:
+    attribution_legs = attribution_report.get("legs", [])
+    pool = compute_media_corpus_pool()
+    return {
+        "htsat_a2_unattributed_share_gpu_busy_pct": _chain_share(
+            attribution_legs, "htsat-A2", _attribute_mod.CHAIN_UNATTRIBUTED, "share_gpu_busy"
+        )
+        * 100.0,
+        "unattributed_decision_grade_limit_pct": _attribute_mod.UNATTRIBUTED_DECISION_GRADE_LIMIT * 100.0,
+        "unknown_kernel_share_limit_pct": _attribute_mod.UNKNOWN_KERNEL_SHARE_LIMIT * 100.0,
+        "sqlite_raw_export_count": compute_sqlite_raw_export_count(legs_dir),
+        "corpus_total_files": pool["corpus_total_files"],
+        "corpus_train_clips": pool["corpus_train_clips"],
+        "corpus_rows_m": pool["corpus_rows_m"],
+    }
+
+
+def _render_recorded_deviations(templates: object, context: dict[str, object]) -> list[str]:
+    """`--identity`'s own `recorded_deviations` are TEMPLATES (plain prose,
+    optionally carrying `{name}`/`{name:.2f}`-style placeholders this
+    module fills from `context`) — never a pre-baked string carrying a
+    number nothing here recomputed. A template naming a placeholder not in
+    `context` is a refusal (`ArtifactBuildError`), never a silently-emitted
+    literal `{typo}` in the artifact."""
+    if not isinstance(templates, list):
+        raise ArtifactBuildError(f"--identity recorded_deviations must be a list, got {templates!r}")
+    rendered: list[str] = []
+    for i, template in enumerate(templates):
+        if not isinstance(template, str):
+            raise ArtifactBuildError(f"--identity recorded_deviations[{i}] is not a string ({template!r})")
+        try:
+            rendered.append(template.format(**context))
+        except (KeyError, IndexError, ValueError) as exc:
+            raise ArtifactBuildError(
+                f"--identity recorded_deviations[{i}] references an unfillable template placeholder: {exc}"
+            ) from exc
+    return rendered
+
+
 # --------------------------------------------------------------------------- #
 # top-level assembly
 # --------------------------------------------------------------------------- #
@@ -401,7 +669,8 @@ def build_report(
     attribution_report: dict,
     identity: dict,
 ) -> dict:
-    git_sha, box = collect_identity(legs_dir, p2_dir)
+    p2_towers = p2_tower_names(merge_report)
+    git_sha, box, witnessed_p2_towers = collect_identity(legs_dir, p2_dir, p2_towers)
     legs = build_legs(merge_report, attribution_report, legs_dir)
     merge_legs = merge_report.get("legs", [])
     checkpoint_sha256 = collect_checkpoint_sha256(merge_legs)
@@ -414,18 +683,23 @@ def build_report(
         checkpoints_notes[family] = entry
 
     findings = compute_findings(merge_report, attribution_report, legs_dir)
+    status = derive_status(merge_report)
+    template_context = _identity_template_context(merge_report, attribution_report, legs_dir)
+    recorded_deviations = _render_recorded_deviations(identity.get("recorded_deviations", []), template_context)
+    p2_witnessed = {"towers": witnessed_p2_towers, "git_sha": git_sha, "box": box} if witnessed_p2_towers else None
 
     return {
         "schema_version": SCHEMA_VERSION,
         "git_sha": git_sha,
         "box": box,
+        "p2_witnessed": p2_witnessed,
         "producer": {
             "path": "ci/scripts/perf/profile_421_legs.sh",
             "kind": "script",
             "invocation": identity.get("producer_invocation"),
             "gating": "none",
         },
-        "status": identity.get("status", "GREEN"),
+        "status": status,
         "notes": {
             "what": identity.get("what"),
             "gpu": identity.get("gpu"),
@@ -433,7 +707,13 @@ def build_report(
             "cpu": identity.get("cpu"),
             "nsys": identity.get("nsys_human"),
             "checkpoints": checkpoints_notes,
-            "recorded_deviations": identity.get("recorded_deviations", []),
+            "recorded_deviations": recorded_deviations,
+            # An operator-recorded fact with NO in-tree witness (e.g. an
+            # off-pod disk-usage total): explicitly NOT covered by
+            # `recorded_deviations`'s own "every number is filled from a
+            # live source" guarantee — see `profile_421_run2_identity.json`'s
+            # own header comment.
+            "operator_recorded": identity.get("operator_recorded", {}),
         },
         "legs": legs,
         "p2": merge_report.get("p2_bf16", []),
@@ -452,7 +732,13 @@ def main(argv: list[str] | None = None) -> int:
         formatter_class=argparse.RawDescriptionHelpFormatter,
     )
     ap.add_argument("--legs-dir", required=True, help="a profile_421_legs.sh $OUT_DIR/legs to read manifests/census from")
-    ap.add_argument("--p2-dir", help="the PROFILE_421_P2_BF16=1 output dir ($OUT_DIR/p2-bf16), for the git_sha/box cross-check")
+    ap.add_argument(
+        "--p2-dir",
+        help=(
+            "the PROFILE_421_P2_BF16=1 output dir ($OUT_DIR/p2-bf16), for the git_sha/box cross-check — "
+            "REQUIRED (refused otherwise) whenever --merge-json carries any p2_bf16 rows"
+        ),
+    )
     ap.add_argument("--merge-json", required=True, help="profile_421_merge.py's own output over the SAME --legs-dir")
     ap.add_argument("--attribution-json", required=True, help="profile_421_attribute.py's own output over the SAME --legs-dir")
     ap.add_argument("--identity", required=True, help="the non-numeric identity/notes sidecar (see profile_421_run2_identity.json)")

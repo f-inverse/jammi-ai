@@ -2,6 +2,15 @@
  "schema_version": 1,
  "git_sha": "c1b0b0bad1f79a4ad6c298400e6ea19cc1ca633c",
  "box": "4dc3a4394178",
+ "p2_witnessed": {
+  "towers": [
+   "clip-text",
+   "clip-vision",
+   "htsat"
+  ],
+  "git_sha": "c1b0b0bad1f79a4ad6c298400e6ea19cc1ca633c",
+  "box": "4dc3a4394178"
+ },
  "producer": {
   "path": "ci/scripts/perf/profile_421_legs.sh",
   "kind": "script",
@@ -39,10 +48,13 @@
    "run1 (pod p421, session 1) was ALL-12-LEGS INVALID at the pre-fix tip (esc-088: profile_421_legs.sh's corpus tuple shared stdout with its own producers, fixed by PR #469, main c1b0b0ba) -- this artifact is the full 12-leg re-run (run2) on the merged fix.",
    "ROOT CAUSE of the run2-pass1..3 'A2 legs INVALID for attribution -> F32-only' state (pass-4 item 1, kernel_census.py): the module keyed each GPU-kernel bucket on shortName alone, and cutlass's Kernel2<...> template wrapper (same latent shape in magma_sgemmEx_kernel<...>) gives every bf16 GEMM tile instantiation the SAME literal shortName -- clip-text-A2's own run_m.sqlite has three DISTINCT cutlass instantiations sharing shortName='Kernel2' AND grid/block, so keying on shortName summed them into one anonymous row that tripped profile_421_attribute.py's 1% known-kernel-name gate. FIX: key on COALESCE(demangledName, shortName) instead -- a strict refinement (a bucket can only split, never merge two old buckets into fewer new ones), so gpu_kernel_us_per_step stays bit-identical and only by_kernel_and_grid resplits; only the cutlass Kernel2<...>(T1::Params) wrapper is stripped to its inner tile name, every other demangled name (magma's own template signature, splitKreduce_kernel<...>) is kept as-is since its template arguments are what distinguishes real instantiations there. All 12 censuses were regenerated under the fix for this run2 pass-4 pull -- every top-line number (gpu_kernel_us_per_step, wall/front/busy per_step) is UNCHANGED (sum-preserving refinement); only the per-instantiation by_kernel_and_grid breakdown resplit. Both CLIP-tower A2 legs (clip-text-A2, clip-vision-A2) are now VALID and decision-grade for attribution -- every candidate-port decision below is measured on BOTH the F32 (A1) and BF16 (A2) legs, never F32-only by consequence.",
    "htsat-A2 (bf16) is VALID at the merge level but NOT decision-grade for attribution: UNATTRIBUTED share_gpu_busy is 5.66%, over the contract's 5% validity bound. Root cause: WINDOWING (window-partition/reverse/roll copies) and FRONT-FUSION (the audio front end's own activation) are still UNDECLARED chains -- a window-partition copy sits at the identical element count as a generic residual-stream PERMUTE/RESHAPE copy, so profile_421_attribute.py has no shape-only way to tell them apart, and declares neither rather than guess (module doc, 'declaring a chain with no matching rule is dishonest'). htsat-A1 (f32) clears the bound under the pass-4 census fix and IS decision-grade. HTSAT has no candidate port under this contract in the first place (C-ATTN-HTSAT is a named, measured, declared-out-of-tier chain, never folded into UNATTRIBUTED), so htsat-A2's own non-decision-grade status never blocks a candidate-port decision.",
-   "Per-leg raw .nsys-rep exports were deleted on-pod after each leg's census.json was produced (disk budget); the raw sqlite exports (24 files, ~31 GB) were kept off-pod and were never committed.",
+   "Per-leg raw .nsys-rep exports were deleted on-pod after each leg's census.json was produced (disk budget); the raw sqlite exports (24 files) were kept off-pod and were never committed -- see notes.operator_recorded for the on-pod-recorded total size, which has no in-tree witness.",
    "Both media corpus producers (image, audio) emit families x instances = 24 files at any --rows, so the M-leg's 4800 rows cycle 16 distinct train clips (a page-cached working set, contract SS D6.3) -- the HTSAT/vision front-end finding below is a real per-item CPU decode/preprocess compute cost, not a realistic-corpus I/O cost, and every quote of that finding must carry this caveat.",
    "Census reports produced before the pass-4 kernel-identity fix (the #356 close-out and the #421 2026-09-01/06 pod artifacts) carry the pre-fix, collapsed Kernel2/magma_sgemmEx_kernel rows in by_kernel_and_grid -- their by_kernel_name totals and every other top-line number are unaffected (the refinement is sum-preserving, see the root-cause deviation above), only the per-instantiation breakdown was coarser."
-  ]
+  ],
+  "operator_recorded": {
+   "raw_sqlite_export_total_size": "~31 GB (on-pod estimate at run2 close-out, before the exports were deleted per the disk-budget deviation above; the raw .sqlite files themselves were never committed, so no in-tree witness can re-derive this figure -- the file COUNT in notes.recorded_deviations IS witnessed, this size is not)"
+  }
  },
  "legs": [
   {
@@ -7829,7 +7841,7 @@
   },
   {
    "id": "clip-launch-bound-batch8",
-   "text": "At batch 8 the CLIP training steps are launch-bound: 3638-3722 launches/step across the four F32/BF16 A-arm CLIP legs (text and vision); switching to BF16 cuts GPU busy -32...-41% per tower while wall drops only -4...-5%.",
+   "text": "At batch 8 the CLIP training steps are launch-bound: 3638-3722 launches/step across the four F32/BF16 A-arm CLIP legs (text and vision); switching to BF16 cuts GPU busy by 32-41% per tower while wall drops by only 4-5%.",
    "evidence": {
     "launches_per_step": {
      "clip-text-A1": 3673.0,

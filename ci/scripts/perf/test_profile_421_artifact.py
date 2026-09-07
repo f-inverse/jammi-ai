@@ -21,7 +21,13 @@ module under test), per the house "numpy-first oracle" convention scaled
 down to plain-float arithmetic (the deltas here are simple enough that a
 second float computation IS the independent check;
 `profile_421_merge.py`'s own `test_profile_421_merge.py` is the numpy-first
-precedent for a case where the arithmetic is less trivial).
+precedent for a case where the arithmetic is less trivial). The media-
+corpus pool constants (`MEDIA_FAMILIES`, `_DEFAULT_INSTANCES_PER_FAMILY`,
+...) are re-derived here by a DIFFERENT parsing mechanism than the module
+under test (`_independent_read_shell_int`/`_independent_read_py_int`
+below), against the REAL committed `profile_421_legs.sh`/corpus-producer
+scripts, so the two independently agree rather than one merely echoing
+the other's regex.
 
 Run: `python3 ci/scripts/perf/test_profile_421_artifact.py`
 """
@@ -30,6 +36,8 @@ from __future__ import annotations
 
 import json
 import math
+import re
+import shutil
 import subprocess
 import sys
 import tempfile
@@ -38,9 +46,11 @@ from pathlib import Path
 
 PERF_DIR = Path(__file__).resolve().parent
 ARTIFACT = PERF_DIR / "profile_421_artifact.py"
+IDENTITY_SIDECAR = PERF_DIR / "profile_421_run2_identity.json"
 
 sys.path.insert(0, str(PERF_DIR))
 import profile_421_artifact as art  # noqa: E402
+import profile_421_attribute as attribute_mod  # noqa: E402
 
 SHA = "a" * 40
 BOX = "testbox0001"
@@ -62,6 +72,19 @@ LEG_SPECS = {
 }
 C_ATTN_HTSAT_BUSY = 0.3305
 C_ATTN_HTSAT_WALL = 0.0501
+UNATTRIBUTED_SHARE_GPU_BUSY = 0.02
+UNATTRIBUTED_SHARE_WALL = 0.01
+
+IDENTITY_TEMPLATE_DEVIATIONS = [
+    "fixture deviation, no placeholders.",
+    (
+        "UNATTRIBUTED share_gpu_busy is {htsat_a2_unattributed_share_gpu_busy_pct:.2f}%, "
+        "over the {unattributed_decision_grade_limit_pct:.0f}% validity bound "
+        "({unknown_kernel_share_limit_pct:.0f}% known-kernel-name gate)."
+    ),
+    "raw sqlite exports: {sqlite_raw_export_count} files.",
+    "corpus: {corpus_total_files} files, {corpus_train_clips} distinct train clips, {corpus_rows_m} rows.",
+]
 
 
 def _write_legs_dir(root: Path, specs: dict = LEG_SPECS) -> Path:
@@ -81,6 +104,17 @@ def _write_legs_dir(root: Path, specs: dict = LEG_SPECS) -> Path:
         (leg_dir / "manifest.json").write_text(json.dumps(manifest), encoding="utf-8")
         (leg_dir / "census.json").write_text(json.dumps({"launches_per_step": spec["launches"]}), encoding="utf-8")
     return legs_dir
+
+
+def _write_p2_dir(root: Path, towers: tuple[str, ...], *, git_sha: str = SHA, box: str = BOX) -> Path:
+    p2_dir = root / "p2-bf16"
+    p2_dir.mkdir(exist_ok=True)
+    for tower in towers:
+        tower_dir = p2_dir / tower
+        tower_dir.mkdir()
+        manifest = {"tower": tower, "git_sha": git_sha, "box": box}
+        (tower_dir / "manifest.json").write_text(json.dumps(manifest), encoding="utf-8")
+    return p2_dir
 
 
 def _merge_leg_row(leg_id: str, spec: dict) -> dict:
@@ -106,7 +140,13 @@ def _merge_leg_row(leg_id: str, spec: dict) -> dict:
 
 
 def _attr_leg_row(leg_id: str, spec: dict) -> dict:
-    chains = {"UNATTRIBUTED": {"status": "measured", "share_gpu_busy": 0.02, "share_wall": 0.01}}
+    chains = {
+        "UNATTRIBUTED": {
+            "status": "measured",
+            "share_gpu_busy": UNATTRIBUTED_SHARE_GPU_BUSY,
+            "share_wall": UNATTRIBUTED_SHARE_WALL,
+        }
+    }
     if spec["tower"] == "htsat":
         chains["C-ATTN-htsat"] = {"status": "measured", "share_gpu_busy": C_ATTN_HTSAT_BUSY, "share_wall": C_ATTN_HTSAT_WALL}
     return {
@@ -124,14 +164,30 @@ def _attr_leg_row(leg_id: str, spec: dict) -> dict:
     }
 
 
-def _write_fixture(root: Path, *, leg_specs: dict = LEG_SPECS, merge_override=None, attr_override=None) -> dict:
+def _write_fixture(
+    root: Path,
+    *,
+    leg_specs: dict = LEG_SPECS,
+    merge_override=None,
+    attr_override=None,
+    identity_override=None,
+    p2_towers: tuple[str, ...] = ("clip-text",),
+) -> dict:
     legs_dir = _write_legs_dir(root, leg_specs)
+    p2_dir = _write_p2_dir(root, p2_towers) if p2_towers else None
     merge_report = {
         "tool": "profile_421_merge",
         "schema": 1,
         "legs": [_merge_leg_row(leg_id, spec) for leg_id, spec in leg_specs.items()],
-        "p2_bf16": [{"tower": "clip-text", "verdict": "PASS", "reasons": []}],
-        "summary": {"legs_total": len(leg_specs), "legs_valid": len(leg_specs), "legs_invalid": 0},
+        "p2_bf16": [{"tower": tower, "verdict": "PASS", "reasons": []} for tower in p2_towers],
+        "summary": {
+            "legs_total": len(leg_specs),
+            "legs_valid": len(leg_specs),
+            "legs_invalid": 0,
+            "p2_total": len(p2_towers),
+            "p2_pass": len(p2_towers),
+            "p2_fail": 0,
+        },
     }
     attribution_report = {
         "tool": "profile_421_attribute",
@@ -155,10 +211,12 @@ def _write_fixture(root: Path, *, leg_specs: dict = LEG_SPECS, merge_override=No
             "clip": {"repo": "fixture/clip-repo", "files": ["a.json"]},
             "clap": {"repo": "fixture/clap-repo", "files": ["b.json"]},
         },
-        "recorded_deviations": ["fixture deviation"],
+        "recorded_deviations": list(IDENTITY_TEMPLATE_DEVIATIONS),
+        "operator_recorded": {"raw_sqlite_export_total_size": "fixture: ~0 GB, no in-tree witness"},
         "producer_invocation": "fixture invocation",
-        "status": "GREEN",
     }
+    if identity_override:
+        identity_override(identity)
     merge_path = root / "merge.json"
     attr_path = root / "attr.json"
     identity_path = root / "identity.json"
@@ -167,6 +225,7 @@ def _write_fixture(root: Path, *, leg_specs: dict = LEG_SPECS, merge_override=No
     identity_path.write_text(json.dumps(identity), encoding="utf-8")
     return {
         "legs_dir": legs_dir,
+        "p2_dir": p2_dir,
         "merge_path": merge_path,
         "attr_path": attr_path,
         "identity_path": identity_path,
@@ -192,7 +251,7 @@ class BuildReportHappyPathTests(unittest.TestCase):
     def _build(self):
         return art.build_report(
             self.fixture["legs_dir"],
-            None,
+            self.fixture["p2_dir"],
             self.fixture["merge_report"],
             self.fixture["attribution_report"],
             self.fixture["identity"],
@@ -201,7 +260,7 @@ class BuildReportHappyPathTests(unittest.TestCase):
     def test_top_level_shape(self):
         report = self._build()
         expected_keys = {
-            "schema_version", "git_sha", "box", "producer", "status", "notes",
+            "schema_version", "git_sha", "box", "p2_witnessed", "producer", "status", "notes",
             "legs", "p2", "attribution", "realized_gains", "candidate_decisions", "findings",
         }
         self.assertEqual(set(report.keys()), expected_keys)
@@ -211,6 +270,14 @@ class BuildReportHappyPathTests(unittest.TestCase):
         self.assertEqual(report["producer"]["path"], "ci/scripts/perf/profile_421_legs.sh")
         self.assertEqual(report["producer"]["kind"], "script")
         self.assertEqual(report["producer"]["gating"], "none")
+
+    def test_status_is_green_when_merge_summary_is_clean(self):
+        report = self._build()
+        self.assertEqual(report["status"], "GREEN")
+
+    def test_p2_witnessed_recorded_when_p2_rows_present(self):
+        report = self._build()
+        self.assertEqual(report["p2_witnessed"], {"towers": ["clip-text"], "git_sha": SHA, "box": BOX})
 
     def test_legs_combine_merge_and_attribution(self):
         report = self._build()
@@ -246,6 +313,157 @@ class BuildReportHappyPathTests(unittest.TestCase):
         report = self._build()
         self.assertEqual(len(report["attribution"]), 6)
 
+    def test_operator_recorded_passed_through_verbatim(self):
+        report = self._build()
+        self.assertEqual(
+            report["notes"]["operator_recorded"],
+            {"raw_sqlite_export_total_size": "fixture: ~0 GB, no in-tree witness"},
+        )
+
+
+class TemplatedDeviationTests(unittest.TestCase):
+    """`notes.recorded_deviations` templates are filled from LIVE sources —
+    every number checked here against an INDEPENDENT computation, never a
+    value copied out of `profile_421_artifact.py` itself."""
+
+    def setUp(self):
+        self._tmp = tempfile.TemporaryDirectory()
+        self.root = Path(self._tmp.name)
+        self.fixture = _write_fixture(self.root)
+        self.report = art.build_report(
+            self.fixture["legs_dir"], self.fixture["p2_dir"], self.fixture["merge_report"], self.fixture["attribution_report"], self.fixture["identity"]
+        )
+        self.deviations = self.report["notes"]["recorded_deviations"]
+
+    def tearDown(self):
+        self._tmp.cleanup()
+
+    def test_unfilled_template_passes_through_unchanged(self):
+        self.assertEqual(self.deviations[0], "fixture deviation, no placeholders.")
+
+    def test_htsat_a2_unattributed_share_and_contract_bounds_are_live(self):
+        # Independent oracle: multiply the FIXTURE's own chain share (never
+        # a value read back out of the module under test) by 100, and pull
+        # the contract bounds straight off `profile_421_attribute`'s own
+        # constants (imported directly, not re-typed).
+        expected_pct = UNATTRIBUTED_SHARE_GPU_BUSY * 100.0
+        expected_bound_pct = attribute_mod.UNATTRIBUTED_DECISION_GRADE_LIMIT * 100.0
+        expected_gate_pct = attribute_mod.UNKNOWN_KERNEL_SHARE_LIMIT * 100.0
+        self.assertEqual(expected_pct, 2.0)
+        self.assertEqual(expected_bound_pct, 5.0)
+        self.assertEqual(expected_gate_pct, 1.0)
+        self.assertIn(f"{expected_pct:.2f}%", self.deviations[1])
+        self.assertIn(f"{expected_bound_pct:.0f}%", self.deviations[1])
+        self.assertIn(f"{expected_gate_pct:.0f}%", self.deviations[1])
+
+    def test_sqlite_raw_export_count_is_two_per_leg_in_legs_dir(self):
+        expected = len(LEG_SPECS) * 2  # run_n.sqlite + run_m.sqlite per leg
+        self.assertEqual(expected, 12)
+        self.assertIn(f"{expected} files", self.deviations[2])
+
+    def test_corpus_pool_numbers_match_independent_parse_of_the_real_scripts(self):
+        # A SEPARATE, simpler parser than `art._read_shell_int_const`/
+        # `art._read_py_int_const` — deliberately not calling those
+        # functions, so this is a genuine second computation, not the same
+        # regex echoing itself.
+        def independent_shell_int(path: Path, name: str) -> int:
+            for line in path.read_text(encoding="utf-8").splitlines():
+                line = line.strip()
+                if line.startswith(f"{name}="):
+                    rhs = line.split("=", 1)[1].split()[0].split("#")[0]
+                    # `NAME="${ENV_VAR:-123}"` (env-defaulted) vs plain
+                    # `NAME=123` — only the tail after `:-` carries the
+                    # DEFAULT value; the env var's own name (e.g.
+                    # `PROFILE_421_STEPS_M`) can itself contain digits.
+                    tail = rhs.split(":-", 1)[1] if ":-" in rhs else rhs
+                    digits = "".join(ch for ch in tail if ch.isdigit())
+                    return int(digits)
+            raise AssertionError(f"{name} not found in {path}")
+
+        def independent_py_int(path: Path, name: str) -> int:
+            for line in path.read_text(encoding="utf-8").splitlines():
+                line = line.strip()
+                if line.startswith(f"{name} ="):
+                    return int(line.split("=", 1)[1].strip())
+            raise AssertionError(f"{name} not found in {path}")
+
+        media_families = independent_shell_int(art.LEGS_SH, "MEDIA_FAMILIES")
+        media_heldout_families = independent_shell_int(art.LEGS_SH, "MEDIA_HELDOUT_FAMILIES")
+        steps_m = independent_shell_int(art.LEGS_SH, "STEPS_M")
+        batch = independent_shell_int(art.LEGS_SH, "BATCH")
+        image_instances = independent_py_int(art.IMAGE_CORPUS_PY, "_DEFAULT_INSTANCES_PER_FAMILY")
+        audio_instances = independent_py_int(art.AUDIO_CORPUS_PY, "_DEFAULT_INSTANCES_PER_FAMILY")
+        self.assertEqual(image_instances, audio_instances)
+
+        expected_total_files = media_families * image_instances
+        expected_train_clips = (media_families - media_heldout_families) * image_instances
+        expected_rows_m = batch * steps_m
+
+        pool = art.compute_media_corpus_pool()
+        self.assertEqual(pool["corpus_total_files"], expected_total_files)
+        self.assertEqual(pool["corpus_train_clips"], expected_train_clips)
+        self.assertEqual(pool["corpus_rows_m"], expected_rows_m)
+        # Golden values as committed today (2026-09-07) — a change to any of
+        # these constants should also update the identity sidecar's own
+        # numbers via re-running the producer, never a hand-edit.
+        self.assertEqual((expected_total_files, expected_train_clips, expected_rows_m), (24, 16, 4800))
+
+        self.assertIn(f"{expected_total_files} files", self.deviations[3])
+        self.assertIn(f"{expected_train_clips} distinct train clips", self.deviations[3])
+        self.assertIn(f"{expected_rows_m} rows", self.deviations[3])
+
+    def test_unknown_placeholder_refuses(self):
+        def bad_identity(identity):
+            identity["recorded_deviations"] = ["a fixture value that does not exist: {not_a_real_placeholder}."]
+
+        alt_root = Path(tempfile.mkdtemp(dir=str(self.root)))
+        fixture = _write_fixture(alt_root, identity_override=bad_identity)
+        with self.assertRaises(art.ArtifactBuildError) as ctx:
+            art.build_report(fixture["legs_dir"], fixture["p2_dir"], fixture["merge_report"], fixture["attribution_report"], fixture["identity"])
+        self.assertIn("unfillable template placeholder", str(ctx.exception))
+
+    def test_recorded_deviations_must_be_a_list(self):
+        def bad_identity(identity):
+            identity["recorded_deviations"] = "not a list"
+
+        alt_root = Path(tempfile.mkdtemp(dir=str(self.root)))
+        fixture = _write_fixture(alt_root, identity_override=bad_identity)
+        with self.assertRaises(art.ArtifactBuildError) as ctx:
+            art.build_report(fixture["legs_dir"], fixture["p2_dir"], fixture["merge_report"], fixture["attribution_report"], fixture["identity"])
+        self.assertIn("must be a list", str(ctx.exception))
+
+
+class IdentitySidecarNoBareMeasurementTests(unittest.TestCase):
+    """The REAL committed `profile_421_run2_identity.json` carries no
+    digit-bearing MEASUREMENT (a bare percentage, or a bare count next to a
+    unit word like files/rows/clips/GB/MB) outside `operator_recorded` —
+    every such number must instead be a `{placeholder}` this module fills
+    live. Identifiers (git shas, issue/PR numbers, dates, `pass-4`-style
+    version labels) are not measurements and are not what this regex
+    targets."""
+
+    _PERCENT_RE = re.compile(r"\d+(\.\d+)?\s*%")
+    _UNIT_COUNT_RE = re.compile(r"\b\d+(\.\d+)?\b(?:\s+\S+){0,2}\s+(files?|rows?|clips?|GB|MB)\b")
+
+    def test_no_bare_percentage_or_unit_count_outside_operator_recorded(self):
+        identity = json.loads(IDENTITY_SIDECAR.read_text(encoding="utf-8"))
+        scrubbed = dict(identity)
+        scrubbed.pop("operator_recorded", None)
+        text = json.dumps(scrubbed)
+        percent_hits = self._PERCENT_RE.findall(text)
+        unit_hits = self._UNIT_COUNT_RE.findall(text)
+        self.assertEqual(percent_hits, [], f"bare percentage(s) found outside operator_recorded: {percent_hits}")
+        self.assertEqual(unit_hits, [], f"bare unit-count(s) found outside operator_recorded: {unit_hits}")
+
+    def test_operator_recorded_is_where_the_unwitnessed_size_lives(self):
+        identity = json.loads(IDENTITY_SIDECAR.read_text(encoding="utf-8"))
+        self.assertIn("operator_recorded", identity)
+        self.assertIn("GB", identity["operator_recorded"]["raw_sqlite_export_total_size"])
+
+    def test_status_field_no_longer_hand_declared_in_the_sidecar(self):
+        identity = json.loads(IDENTITY_SIDECAR.read_text(encoding="utf-8"))
+        self.assertNotIn("status", identity)
+
 
 class FindingsIndependentOracleTests(unittest.TestCase):
     """Every finding's `evidence` (and the rounded numbers baked into its
@@ -258,7 +476,7 @@ class FindingsIndependentOracleTests(unittest.TestCase):
         self.root = Path(self._tmp.name)
         self.fixture = _write_fixture(self.root)
         self.report = art.build_report(
-            self.fixture["legs_dir"], None, self.fixture["merge_report"], self.fixture["attribution_report"], self.fixture["identity"]
+            self.fixture["legs_dir"], self.fixture["p2_dir"], self.fixture["merge_report"], self.fixture["attribution_report"], self.fixture["identity"]
         )
         self.findings = {f["id"]: f for f in self.report["findings"]}
 
@@ -305,9 +523,15 @@ class FindingsIndependentOracleTests(unittest.TestCase):
         for tower, expected in expected_wall.items():
             self.assertAlmostEqual(finding["evidence"]["wall_delta_pct_bf16_vs_f32"][tower], expected, places=9)
         # Both deltas are negative here (BF16 cheaper): the sentence orders
-        # the range by ascending MAGNITUDE, never a plain min-then-max pick.
-        by_mag = sorted(expected_busy.values(), key=abs)
-        self.assertIn(f"{by_mag[0]:.0f}...{by_mag[-1]:.0f}%", finding["text"])
+        # the range by ascending MAGNITUDE, never a plain min-then-max pick,
+        # and renders the ABSOLUTE magnitude (never a bare negative sign —
+        # "cuts ... by -32%" would read as a GROWTH, not a cut).
+        by_mag_busy = sorted(expected_busy.values(), key=abs)
+        by_mag_wall = sorted(expected_wall.values(), key=abs)
+        self.assertIn(f"by {abs(by_mag_busy[0]):.0f}-{abs(by_mag_busy[-1]):.0f}%", finding["text"])
+        self.assertIn(f"by only {abs(by_mag_wall[0]):.0f}-{abs(by_mag_wall[-1]):.0f}%", finding["text"])
+        self.assertNotIn("-32", finding["text"])
+        self.assertNotIn("...", finding["text"])
 
     def test_c_attn_htsat_out_of_tier_oracle(self):
         finding = self.findings["c-attn-htsat-out-of-tier"]
@@ -331,7 +555,7 @@ class RefusalTests(unittest.TestCase):
         self._tmp.cleanup()
 
     def _build(self, fixture):
-        return art.build_report(fixture["legs_dir"], None, fixture["merge_report"], fixture["attribution_report"], fixture["identity"])
+        return art.build_report(fixture["legs_dir"], fixture["p2_dir"], fixture["merge_report"], fixture["attribution_report"], fixture["identity"])
 
     def test_refuses_git_sha_mismatch_across_manifests(self):
         fixture = _write_fixture(self.root)
@@ -362,6 +586,15 @@ class RefusalTests(unittest.TestCase):
             self._build(fixture)
         self.assertIn("checkpoint family", str(ctx.exception))
 
+    def test_refuses_leg_with_no_checkpoint_sha_at_all(self):
+        def corrupt(merge_report):
+            merge_report["legs"][0]["checkpoint_weights_sha256"] = None  # clip-text-A1
+
+        fixture = _write_fixture(self.root, merge_override=corrupt)
+        with self.assertRaises(art.ArtifactBuildError) as ctx:
+            self._build(fixture)
+        self.assertIn("no checkpoint_weights_sha256", str(ctx.exception))
+
     def test_refuses_merge_leg_set_not_matching_legs_dir(self):
         def drop_a_leg(merge_report):
             merge_report["legs"] = [row for row in merge_report["legs"] if row["leg_id"] != "htsat-A2"]
@@ -380,6 +613,15 @@ class RefusalTests(unittest.TestCase):
             self._build(fixture)
         self.assertIn("--attribution-json's leg set does not match", str(ctx.exception))
 
+    def test_refuses_duplicate_leg_id_in_merge_report(self):
+        def duplicate(merge_report):
+            merge_report["legs"].append(dict(merge_report["legs"][0]))
+
+        fixture = _write_fixture(self.root, merge_override=duplicate)
+        with self.assertRaises(art.ArtifactBuildError) as ctx:
+            self._build(fixture)
+        self.assertIn("duplicate leg_id", str(ctx.exception))
+
     def test_refuses_nonfinite_per_step_value_used_by_a_finding(self):
         # NaN > c and NaN < c are both False — a naive min/max or threshold
         # check would silently let this through and poison the finding's
@@ -393,6 +635,67 @@ class RefusalTests(unittest.TestCase):
         with self.assertRaises(art.ArtifactBuildError) as ctx:
             self._build(fixture)
         self.assertIn("not finite", str(ctx.exception))
+
+    def test_refuses_out_of_domain_share_above_one(self):
+        def poison(merge_report):
+            for row in merge_report["legs"]:
+                if row["leg_id"] == "htsat-A1":
+                    row["per_step"]["front_share_of_wall"] = 1.0001
+
+        fixture = _write_fixture(self.root, merge_override=poison)
+        with self.assertRaises(art.ArtifactBuildError) as ctx:
+            self._build(fixture)
+        self.assertIn("not in [0, 1]", str(ctx.exception))
+
+    def test_refuses_out_of_domain_share_below_zero(self):
+        def poison(merge_report):
+            for row in merge_report["legs"]:
+                if row["leg_id"] == "htsat-A1":
+                    row["per_step"]["front_share_of_wall"] = -0.0001
+
+        fixture = _write_fixture(self.root, merge_override=poison)
+        with self.assertRaises(art.ArtifactBuildError) as ctx:
+            self._build(fixture)
+        self.assertIn("not in [0, 1]", str(ctx.exception))
+
+    def test_boundary_shares_of_exactly_zero_and_one_are_accepted(self):
+        # The boundary itself (`0.0`, `1.0`) is INSIDE the domain — this is
+        # the oracle that proves `_finite_share`'s `<=`/`>=` are inclusive,
+        # not off-by-one `</>` checks that would wrongly reject the edges.
+        def boundary(merge_report):
+            for row in merge_report["legs"]:
+                if row["leg_id"] == "htsat-A1":
+                    row["per_step"]["front_share_of_wall"] = 0.0
+                if row["leg_id"] == "htsat-A2":
+                    row["per_step"]["front_share_of_wall"] = 1.0
+
+        fixture = _write_fixture(self.root, merge_override=boundary)
+        report = self._build(fixture)
+        finding = {f["id"]: f for f in report["findings"]}["htsat-front-end-bound"]
+        self.assertEqual(finding["evidence"]["front_share_of_wall_pct"]["htsat-A1"], 0.0)
+        self.assertEqual(finding["evidence"]["front_share_of_wall_pct"]["htsat-A2"], 100.0)
+
+    def test_refuses_zero_denominator_busy_delta(self):
+        def poison(merge_report):
+            for row in merge_report["legs"]:
+                if row["leg_id"] == "clip-text-A1":
+                    row["per_step"]["busy_s_per_step"] = 0.0
+
+        fixture = _write_fixture(self.root, merge_override=poison)
+        with self.assertRaises(art.ArtifactBuildError) as ctx:
+            self._build(fixture)
+        self.assertIn("cannot compute a BF16-vs-F32 busy delta", str(ctx.exception))
+
+    def test_refuses_zero_denominator_wall_delta(self):
+        def poison(merge_report):
+            for row in merge_report["legs"]:
+                if row["leg_id"] == "clip-vision-A1":
+                    row["per_step"]["wall_s_per_step"] = 0.0
+
+        fixture = _write_fixture(self.root, merge_override=poison)
+        with self.assertRaises(art.ArtifactBuildError) as ctx:
+            self._build(fixture)
+        self.assertIn("cannot compute a BF16-vs-F32 wall delta", str(ctx.exception))
 
     def test_refuses_nonfinite_launches_per_step(self):
         fixture = _write_fixture(self.root)
@@ -415,7 +718,107 @@ class RefusalTests(unittest.TestCase):
 
     def test_refuses_missing_manifest_directory(self):
         with self.assertRaises(art.ArtifactBuildError):
-            art.collect_identity(self.root / "does-not-exist", None)
+            art.collect_identity(self.root / "does-not-exist", None, [])
+
+
+class StatusDerivationTests(unittest.TestCase):
+    def setUp(self):
+        self._tmp = tempfile.TemporaryDirectory()
+        self.root = Path(self._tmp.name)
+
+    def tearDown(self):
+        self._tmp.cleanup()
+
+    def test_green_boundary_zero_invalid_zero_fail(self):
+        fixture = _write_fixture(self.root)
+        self.assertEqual(art.derive_status(fixture["merge_report"]), "GREEN")
+
+    def test_one_invalid_leg_is_red(self):
+        def poison(merge_report):
+            merge_report["summary"]["legs_invalid"] = 1
+
+        fixture = _write_fixture(self.root, merge_override=poison)
+        status = art.derive_status(fixture["merge_report"])
+        self.assertNotEqual(status, "GREEN")
+        self.assertIn("1 leg(s) INVALID", status)
+
+    def test_one_failed_p2_tower_is_red(self):
+        def poison(merge_report):
+            merge_report["summary"]["p2_fail"] = 1
+
+        fixture = _write_fixture(self.root, merge_override=poison)
+        status = art.derive_status(fixture["merge_report"])
+        self.assertNotEqual(status, "GREEN")
+        self.assertIn("1 P2 tower(s) FAIL", status)
+
+    def test_refuses_missing_summary(self):
+        fixture = _write_fixture(self.root, merge_override=lambda m: m.pop("summary"))
+        with self.assertRaises(art.ArtifactBuildError):
+            art.derive_status(fixture["merge_report"])
+
+    def test_refuses_non_int_legs_invalid(self):
+        def poison(merge_report):
+            merge_report["summary"]["legs_invalid"] = "0"
+
+        fixture = _write_fixture(self.root, merge_override=poison)
+        with self.assertRaises(art.ArtifactBuildError):
+            art.derive_status(fixture["merge_report"])
+
+
+class P2WitnessRequiredTests(unittest.TestCase):
+    """BLOCK fix: whenever `--merge-json` carries `p2_bf16` rows, `--p2-dir`
+    is REQUIRED and every named P2 tower's own `manifest.json` must exist
+    and agree — never a silent `continue` past a missing one, and never
+    byte-identical to a run that skipped `--p2-dir` entirely."""
+
+    def setUp(self):
+        self._tmp = tempfile.TemporaryDirectory()
+        self.root = Path(self._tmp.name)
+
+    def tearDown(self):
+        self._tmp.cleanup()
+
+    def test_p2_dir_required_when_merge_has_p2_rows(self):
+        fixture = _write_fixture(self.root, p2_towers=("clip-text",))
+        with self.assertRaises(art.ArtifactBuildError) as ctx:
+            art.build_report(fixture["legs_dir"], None, fixture["merge_report"], fixture["attribution_report"], fixture["identity"])
+        self.assertIn("--p2-dir was not given", str(ctx.exception))
+
+    def test_regenerating_without_p2_dir_is_not_byte_identical(self):
+        """The exact escape this fix closes: building WITH `--p2-dir` must
+        differ from building WITHOUT it (a refusal, not a silently-identical
+        report) whenever the merge report carries P2 rows."""
+        fixture = _write_fixture(self.root, p2_towers=("clip-text",))
+        with_p2 = art.build_report(
+            fixture["legs_dir"], fixture["p2_dir"], fixture["merge_report"], fixture["attribution_report"], fixture["identity"]
+        )
+        with self.assertRaises(art.ArtifactBuildError):
+            art.build_report(fixture["legs_dir"], None, fixture["merge_report"], fixture["attribution_report"], fixture["identity"])
+        self.assertIsNotNone(with_p2["p2_witnessed"])
+
+    def test_missing_manifest_for_a_named_p2_tower_refuses(self):
+        fixture = _write_fixture(self.root, p2_towers=("clip-text", "clip-vision"))
+        # clip-vision's manifest.json never got written for this tower.
+        shutil.rmtree(fixture["p2_dir"] / "clip-vision")
+        with self.assertRaises(art.ArtifactBuildError) as ctx:
+            art.build_report(fixture["legs_dir"], fixture["p2_dir"], fixture["merge_report"], fixture["attribution_report"], fixture["identity"])
+        self.assertIn("no manifest.json exists", str(ctx.exception))
+
+    def test_disagreeing_p2_manifest_refuses(self):
+        fixture = _write_fixture(self.root, p2_towers=("clip-text",))
+        manifest_path = fixture["p2_dir"] / "clip-text" / "manifest.json"
+        manifest = json.loads(manifest_path.read_text())
+        manifest["git_sha"] = "b" * 40
+        manifest_path.write_text(json.dumps(manifest), encoding="utf-8")
+        with self.assertRaises(art.ArtifactBuildError) as ctx:
+            art.build_report(fixture["legs_dir"], fixture["p2_dir"], fixture["merge_report"], fixture["attribution_report"], fixture["identity"])
+        self.assertIn("disagree", str(ctx.exception))
+
+    def test_no_p2_rows_means_p2_dir_is_optional_and_p2_witnessed_is_none(self):
+        fixture = _write_fixture(self.root, p2_towers=())
+        report = art.build_report(fixture["legs_dir"], None, fixture["merge_report"], fixture["attribution_report"], fixture["identity"])
+        self.assertIsNone(report["p2_witnessed"])
+        self.assertEqual(report["p2"], [])
 
 
 class CliEndToEndTests(unittest.TestCase):
@@ -431,6 +834,7 @@ class CliEndToEndTests(unittest.TestCase):
         out_path = self.root / "artifact.json"
         result = run_artifact_cli(
             "--legs-dir", str(self.fixture["legs_dir"]),
+            "--p2-dir", str(self.fixture["p2_dir"]),
             "--merge-json", str(self.fixture["merge_path"]),
             "--attribution-json", str(self.fixture["attr_path"]),
             "--identity", str(self.fixture["identity_path"]),
@@ -442,6 +846,18 @@ class CliEndToEndTests(unittest.TestCase):
         self.assertEqual(report["box"], BOX)
         self.assertEqual(len(report["legs"]), 6)
         self.assertEqual(len(report["findings"]), 4)
+        self.assertEqual(report["p2_witnessed"], {"towers": ["clip-text"], "git_sha": SHA, "box": BOX})
+        self.assertEqual(report["status"], "GREEN")
+
+    def test_cli_refuses_missing_p2_dir_when_merge_has_p2_rows(self):
+        result = run_artifact_cli(
+            "--legs-dir", str(self.fixture["legs_dir"]),
+            "--merge-json", str(self.fixture["merge_path"]),
+            "--attribution-json", str(self.fixture["attr_path"]),
+            "--identity", str(self.fixture["identity_path"]),
+        )
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("--p2-dir was not given", result.stderr)
 
     def test_cli_refuses_and_exits_nonzero_on_bad_input(self):
         bad_manifest_path = self.fixture["legs_dir"] / "clip-text-A1" / "manifest.json"
@@ -450,6 +866,7 @@ class CliEndToEndTests(unittest.TestCase):
         bad_manifest_path.write_text(json.dumps(manifest), encoding="utf-8")
         result = run_artifact_cli(
             "--legs-dir", str(self.fixture["legs_dir"]),
+            "--p2-dir", str(self.fixture["p2_dir"]),
             "--merge-json", str(self.fixture["merge_path"]),
             "--attribution-json", str(self.fixture["attr_path"]),
             "--identity", str(self.fixture["identity_path"]),

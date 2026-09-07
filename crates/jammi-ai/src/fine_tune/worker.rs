@@ -1406,20 +1406,25 @@ enum WorkerJobError {
 /// Render a terminal training failure's message for `record_failed` to
 /// persist as the job's durable `error_message`.
 ///
-/// `TrainingJob::wait()` (`training_job.rs`) re-wraps whatever this crate
-/// stored here in a fresh `JammiError::FineTune` when it reads a `failed`
-/// job back — that IS the one place a training-job failure's
-/// "Fine-tune error: " prefix belongs, since every failure this worker
-/// records is a training-job failure regardless of where it originated.
-/// `JammiError::FineTune`'s own `Display` already renders that SAME prefix,
-/// so storing `e.to_string()` unconditionally for a `FineTune`-typed source
-/// error would have `wait()`'s re-wrap double it verbatim: "Fine-tune
-/// error: Fine-tune error: …" reaching a Python caller as
-/// `TrainingError("Fine-tune error: Fine-tune error: …")`. Stripped to the
-/// raw inner message for that one variant here, so the prefix is applied
-/// exactly once, at `wait()`'s read site; every other variant's own
-/// (DIFFERENT) prefix is preserved unchanged — "Fine-tune error: Model
-/// error: …" is one informative nesting, not a literal duplicate.
+/// The stored value is the RAW inner message, never pre-fixed with
+/// "Fine-tune error: " here. That prefix is `JammiError::FineTune`'s own
+/// `Display` output, and two callers re-wrap the stored message in a fresh
+/// `JammiError::FineTune` when they read a `failed` job back —
+/// `TrainingJob::wait()` (`training_job.rs`) and the Python binding's
+/// `poll_until_terminal` (`jammi-python/src/job.rs`) — so those two surfaces
+/// each apply the prefix exactly once, on read. Two OTHER surfaces read the
+/// same durable `error_message` unprefixed and never re-wrap it: the gRPC
+/// `TrainingStatus.error` field (`jammi-server/src/grpc/training.rs`) and
+/// the Python `Database.list_training_jobs`/`get_training_job` `error` entry
+/// (`jammi-python/src/database.rs`) both relay the raw column verbatim.
+/// Storing `e.to_string()` unconditionally for a `FineTune`-typed source
+/// error would have `wait()`'s (or `poll_until_terminal`'s) re-wrap double
+/// the prefix verbatim: "Fine-tune error: Fine-tune error: …" reaching a
+/// Python caller as `TrainingError("Fine-tune error: Fine-tune error:
+/// …")`. Stripped to the raw inner message for that one variant here avoids
+/// that double; every other variant's own (DIFFERENT) prefix is preserved
+/// unchanged — "Fine-tune error: Model error: …" is one informative
+/// nesting, not a literal duplicate.
 fn failed_job_message(e: JammiError) -> String {
     match e {
         JammiError::FineTune(msg) => msg,
@@ -4020,9 +4025,9 @@ mod tests {
         // not cancelled + non-OOM: byte-identical passthrough of the RAW
         // inner message — `failed_job_message` strips `JammiError::FineTune`'s
         // own "Fine-tune error: " prefix here (see its doc): that prefix is
-        // re-applied exactly once, at `TrainingJob::wait()`'s read site, so
-        // it must not survive into the stored `WorkerJobError::Failed`
-        // message a second time.
+        // re-applied on read by `TrainingJob::wait()` and the Python
+        // binding's `poll_until_terminal`, so it must not survive into the
+        // stored `WorkerJobError::Failed` message a second time.
         let cancel = AtomicBool::new(false);
         let raw_inner = "Encoder forward: CUDA_ERROR_INVALID_PTX";
         let raw = JammiError::FineTune(raw_inner.into());

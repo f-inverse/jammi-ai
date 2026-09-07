@@ -215,13 +215,16 @@ workspace ships every publishable crate at the same
   checkpoint previously loaded and then computed something its own config did not describe.
   `projection_hidden_act` is unaffected: both its `"gelu"` and `"relu"` arms are genuinely
   dispatched on at forward.
-- **A failed training job's stored message is no longer double-prefixed (#421).** `TrainingJob`'s
-  read path re-wraps a stored failure in a fine-tune error, whose `Display` already renders the
-  "Fine-tune error: " prefix, so a failure that was itself a fine-tune error came back as
-  `TrainingError("Fine-tune error: Fine-tune error: …")`. The worker now stores the raw inner
-  message for that one variant, applying the prefix exactly once at the read site; every other
-  variant's own (different) prefix is preserved, since "Fine-tune error: Model error: …" is an
-  informative nesting rather than a duplicate.
+- **A failed training job's stored message is no longer double-prefixed (#421).** `TrainingJob::wait()`
+  and the Python binding's `poll_until_terminal` both re-wrap a stored failure in a fine-tune error,
+  whose `Display` already renders the "Fine-tune error: " prefix, so a failure that was itself a
+  fine-tune error came back as `TrainingError("Fine-tune error: Fine-tune error: …")`. The worker now
+  stores the raw inner message for that one variant, so each of those two re-wrapping read sites
+  applies the prefix exactly once; every other variant's own (different) prefix is preserved, since
+  "Fine-tune error: Model error: …" is an informative nesting rather than a duplicate. The gRPC
+  `TrainingStatus.error` field and the Python `Database` job-listing `error` entry read the same
+  durable message unprefixed and never re-wrap it, so they were never part of the double-prefix bug
+  and are unaffected by this change.
 - **Audio encoder-adapters fine-tuning is supported; the refusal is gone (#421).** An
   `audio_embedding` encoder-adapters job on an HF-CLAP checkpoint trains the HTSAT tower instead of
   failing with "LoRA injected inside the audio encoder is not supported. Leave `target_modules`

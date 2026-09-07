@@ -95,22 +95,32 @@ pub struct TrainingResult {
     /// checkpointing was disabled (`artifact_store` unset on the builder).
     /// The worker's finalize CAS registers one catalog row per entry.
     pub epoch_checkpoints: Vec<(usize, String)>,
-    /// The wall spent in the media front end during TRAINING.
+    /// The wall spent in the media front end during TRAINING, on the
+    /// `EncoderAdapters` target ONLY. `Duration::ZERO` by construction for a
+    /// text task and for a `ProjectionHead` target of any modality — see
+    /// below for why the latter is never measured, not merely small.
     ///
-    /// Declared boundary: the wall around the `image_encoder_input` /
-    /// `audio_encoder_input` calls inside `TrainingLoop::encode_media` —
-    /// decode + preprocess INCLUDING the device tensor build (H2D upload)
-    /// that `preprocess_image_batch` / `preprocess_clap_fusion` perform
-    /// internally, because the upload cannot be separated without splitting
-    /// those functions; the tower forward is NOT included; accumulated
-    /// ONLY when `self.training_mode` is true (eval passes through
-    /// `evaluate_held_out` are excluded, so this is a subset of the
-    /// trainer's training wall); zero for text tasks by construction
-    /// (tokenization is not a media front end and stays in the residual).
-    /// For a `ProjectionHead` target, the same boundary applies around the
-    /// frozen-base media encode (`project_frozen_embedding`) — that call
-    /// also includes the tower forward, which cannot be separated from the
-    /// frozen base's own combined decode/preprocess/forward path there.
+    /// Declared boundary (`EncoderAdapters` only): the wall around the
+    /// `image_encoder_input` / `audio_encoder_input` calls inside
+    /// `TrainingLoop::encode_media` — decode + preprocess INCLUDING the
+    /// device tensor build (H2D upload) that `preprocess_image_batch` /
+    /// `preprocess_clap_fusion` perform internally, because the upload
+    /// cannot be separated without splitting those functions; the tower
+    /// forward is NOT included; accumulated ONLY when `self.training_mode`
+    /// is true (eval passes through `evaluate_held_out` are excluded, so
+    /// this is a subset of the trainer's training wall).
+    ///
+    /// A `ProjectionHead` target's media encode
+    /// (`TrainingLoop::project_frozen_embedding`) never advances this field,
+    /// on any modality: that path has no seam between decode/preprocess and
+    /// the frozen base's tower forward — they are one combined call — so
+    /// there is no front-end-only quantity to time there. Charging the
+    /// combined call to a field documented as front-end-only would give it a
+    /// SECOND, incompatible meaning: a consumer computing
+    /// `residual = wall − front_end − busy` on a `ProjectionHead` job would
+    /// double-subtract the tower forward and land on a large negative
+    /// "residual" mislabelled as overlap. Reporting zero here is honest;
+    /// reporting the mixed number would not be.
     ///
     /// Measured with a `Cell<Duration>` on the loop (`encode_media` takes
     /// `&self`; `run` takes `&mut self`) and read into this field at the end
@@ -1834,14 +1844,15 @@ impl TrainingLoop {
                 let refs: Vec<&[u8]> = items.iter().map(|c| c.as_slice()).collect();
                 let arr = Arc::new(BinaryArray::from(refs)) as ArrayRef;
                 // The frozen base owns decode/preprocess AND the tower
-                // forward as one combined call here — unlike the
-                // `EncoderAdapters` arm below, this path has no seam between
-                // them to time separately, so the whole call is charged to
-                // `media_front_end_wall` (see that field's own doc).
-                let started = std::time::Instant::now();
-                let out = self.project_frozen_embedding(base, arr, self.task);
-                self.record_media_front_end_wall(started.elapsed());
-                out
+                // forward as one combined call here, with no seam between
+                // them to time separately — unlike the `EncoderAdapters` arm
+                // below, whose decode/preprocess call is genuinely disjoint
+                // from its tower forward. Timing this combined call would
+                // mix "front end" and "forward" under the one field
+                // `media_front_end_wall` documents as front-end-only, which
+                // is worse than reporting nothing: NOT accumulated here (see
+                // that field's own doc).
+                self.project_frozen_embedding(base, arr, self.task)
             }
             TrainingTarget::EncoderAdapters(state) => {
                 let encoder = &state.encoder;
@@ -11293,6 +11304,84 @@ mod media_front_end_wall_tests {
         assert!(
             loop_.media_front_end_wall.get() > Duration::ZERO,
             "encode_media must advance the accumulator once training_mode is true"
+        );
+    }
+
+    /// (c) the `ProjectionHead` arm of `encode_media` never advances the
+    /// accumulator, on a real audio forward, even while `training_mode` is
+    /// true. That arm's decode/preprocess and tower forward are one
+    /// combined call with no seam to time in isolation, so timing it would
+    /// give `media_front_end_wall` a second, incompatible meaning (see the
+    /// field's own doc) — this is the mechanism proof, modeled on test (b)
+    /// above, that the arm was changed to stop accumulating rather than
+    /// merely happening to report zero on this input.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn encode_media_projection_head_arm_never_advances_the_accumulator() {
+        use arrow::array::{ArrayRef, BinaryArray};
+        use candle_nn::VarBuilder;
+
+        let device = Device::Cpu;
+        let base_model = load_htsat_base_model().await;
+        let corpus = tiny_audio_corpus_dir();
+        let clip = std::fs::read(corpus.join("clip_sine_0.wav")).unwrap();
+
+        // Probe the frozen base's own pooled-output width for
+        // `AudioEmbedding` so the projection head's input dim matches it
+        // exactly — the SAME width `project_frozen_embedding` forwards
+        // through at test time.
+        let probe_arr = Arc::new(BinaryArray::from(vec![clip.as_slice()])) as ArrayRef;
+        let probe = base_model
+            .forward(&[probe_arr], ModelTask::AudioEmbedding)
+            .expect("htsat_clap_tiny fixture must forward a real audio clip");
+        let hidden = probe.shapes[0].1;
+
+        let varmap = VarMap::new();
+        let vb = VarBuilder::from_varmap(&varmap, DType::F32, &device);
+        let head = crate::fine_tune::lora::build_projection_head(
+            hidden,
+            &FineTuneConfig::default(),
+            &varmap,
+            &vb,
+        )
+        .unwrap();
+
+        let dir = tempfile::tempdir().unwrap();
+        let dir_path = dir.keep();
+        let catalog = Arc::new(jammi_db::catalog::Catalog::open(&dir_path).await.unwrap());
+        let mut loop_ = TrainingLoopBuilder::new(
+            TrainingTarget::ProjectionHead { head },
+            varmap,
+            FineTuneConfig {
+                epochs: 1,
+                batch_size: 1,
+                validation_fraction: 0.0,
+                early_stopping_metric: crate::fine_tune::EarlyStoppingMetric::TrainLoss,
+                warmup_steps: 0,
+                ..Default::default()
+            },
+        )
+        .device(device)
+        .base_model(base_model)
+        .task(ModelTask::AudioEmbedding)
+        .job_id("media-front-end-wall-projection-job".into())
+        .worker_id("media-front-end-wall-projection-worker".into())
+        .catalog(catalog)
+        .artifact_dir(dir_path)
+        .build()
+        .unwrap();
+
+        loop_.set_training(true);
+        assert_eq!(loop_.media_front_end_wall.get(), Duration::ZERO);
+        loop_
+            .encode_media(std::slice::from_ref(&clip))
+            .expect("encode_media must succeed on the ProjectionHead arm");
+        assert_eq!(
+            loop_.media_front_end_wall.get(),
+            Duration::ZERO,
+            "the ProjectionHead arm of encode_media must never advance \
+             media_front_end_wall, even while training_mode is true — it \
+             has no seam between decode/preprocess and the tower forward \
+             to time in isolation"
         );
     }
 }

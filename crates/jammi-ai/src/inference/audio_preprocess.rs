@@ -138,30 +138,82 @@ pub fn decode_audio_bytes(bytes: &[u8]) -> Result<DecodedAudio> {
 /// production; candle installs no private pool of its own, so this is the
 /// one pool the process ever schedules media-batch work on).
 ///
-/// Used by BOTH decode loops: `fine_tune::trainer`'s `audio_encoder_input`
-/// calls it directly on an already-filtered `&[Vec<u8>]`; [`super::arrow_to_audio`]
-/// calls it on the non-null rows it resolves from an Arrow column, re-threading
-/// the null bookkeeping around it. One decode task per item — chunk count is
-/// `items.len()`, no thread-count knob, so the effective parallelism is
-/// `min(pool_size, items.len())`, emergent from whichever pool is installed.
+/// Used by `fine_tune::trainer`'s `audio_encoder_input`, whose items are
+/// already the row space the caller wants reported (no compaction ever
+/// happens ahead of it — every `MediaTriplet` blob is present by
+/// construction), so this thin wrapper reports positions `0..items.len()`
+/// via [`decode_audio_batch_indexed`]. A caller that compacts rows first
+/// (dropping nulls before decoding, as [`super::arrow_to_audio`] and
+/// `CandleBackend::forward_audio_embedding` both do) must call
+/// [`decode_audio_batch_indexed`] directly with the ORIGINAL row ids, or
+/// every error message after the first null row reports the wrong (compacted)
+/// position instead of the caller's row.
+pub fn decode_audio_batch<T>(items: &[T]) -> Result<Vec<DecodedAudio>>
+where
+    T: AsRef<[u8]> + Sync,
+{
+    let row_ids: Vec<usize> = (0..items.len()).collect();
+    decode_audio_batch_indexed(&row_ids, items)
+}
+
+/// [`decode_audio_batch`], reporting `row_ids[i]` (not the position `i`) in
+/// every error — for a caller that has already compacted its batch (dropped
+/// null rows) before decoding, so the position in `items` and the row the
+/// caller (and its own caller, in turn) means by "row N" have diverged.
+/// `row_ids.len()` must equal `items.len()`.
+///
+/// One decode task per item — chunk count is `items.len()`, no thread-count
+/// knob, so the effective parallelism is `min(pool_size, items.len())`,
+/// emergent from whichever pool is installed.
 ///
 /// Errors are collected per row and the LOWEST-INDEX failing row is the one
 /// surfaced, with a row-indexed message — the same selection the pre-unit
 /// sequential decode loop made by construction (it returned on the first
 /// failure it walked into, in row order).
-pub fn decode_audio_batch<T>(items: &[T]) -> Result<Vec<DecodedAudio>>
+pub fn decode_audio_batch_indexed<T>(row_ids: &[usize], items: &[T]) -> Result<Vec<DecodedAudio>>
 where
     T: AsRef<[u8]> + Sync,
 {
-    let results: Vec<Result<DecodedAudio>> = items
+    crate::inference::lowest_index_result(decode_audio_results(row_ids, items))
+}
+
+/// [`decode_audio_batch_indexed`]'s per-row outcomes, WITHOUT collapsing to
+/// the lowest-index failure — for a caller (serving's `arrow_to_audio`) that
+/// marks each row's OWN status rather than refusing the whole batch because
+/// one row's bytes were corrupt. Every element is independently `Ok` or a
+/// row-indexed `Err`, in the same order as `items`/`row_ids`.
+pub fn decode_audio_batch_per_row_indexed<T>(
+    row_ids: &[usize],
+    items: &[T],
+) -> Vec<Result<DecodedAudio>>
+where
+    T: AsRef<[u8]> + Sync,
+{
+    decode_audio_results(row_ids, items)
+}
+
+/// The parallel per-row decode shared by [`decode_audio_batch_indexed`] and
+/// [`decode_audio_batch_per_row_indexed`] — the only difference between the
+/// two public entry points is whether the caller wants ALL per-row outcomes
+/// or just the lowest-index failure.
+fn decode_audio_results<T>(row_ids: &[usize], items: &[T]) -> Vec<Result<DecodedAudio>>
+where
+    T: AsRef<[u8]> + Sync,
+{
+    debug_assert_eq!(
+        row_ids.len(),
+        items.len(),
+        "row_ids must have one entry per item"
+    );
+    items
         .par_iter()
-        .enumerate()
-        .map(|(i, item)| {
-            decode_audio_bytes(item.as_ref())
-                .map_err(|e| JammiError::Inference(format!("Decode audio row {i}: {e}")))
+        .zip(row_ids.par_iter())
+        .map(|(item, &row)| {
+            decode_audio_bytes(item.as_ref()).map_err(|e| {
+                JammiError::Inference(format!("Failed to decode audio at row {row}: {e}"))
+            })
         })
-        .collect();
-    crate::inference::lowest_index_result(results)
+        .collect()
 }
 
 /// Resample mono PCM from `from_rate` to `to_rate` by linear interpolation.
@@ -267,7 +319,35 @@ pub struct ClapFusionFeatures {
 /// off). The CHANNEL construction stays length-determined (short → the repeatpad
 /// mel stacked four times; long → crops + downsample); only the emitted gate the
 /// tower keys fusion on is forced on, so the flags are simply `vec![true; n]`.
+///
+/// Reports row positions `0..clips.len()` in any per-row error via
+/// [`preprocess_clap_fusion_indexed`]; see that function's doc for the
+/// compacted-batch case (`CandleBackend::forward_audio_embedding` calls it
+/// directly with the original Arrow row ids for exactly that reason).
 pub fn preprocess_clap_fusion(
+    clips: &[DecodedAudio],
+    config: &ClapFrontendConfig,
+    device: &Device,
+) -> Result<(Tensor, Vec<bool>)> {
+    let row_ids: Vec<usize> = (0..clips.len()).collect();
+    preprocess_clap_fusion_indexed(&row_ids, clips, config, device)
+}
+
+/// [`preprocess_clap_fusion`], reporting `row_ids[i]` (not the position `i`)
+/// in every per-row error — for a caller that has already compacted its
+/// batch (dropped null rows) before preprocessing, so the position in
+/// `clips` and the row its own caller means by "row N" have diverged.
+/// `row_ids.len()` must equal `clips.len()`.
+///
+/// Preallocates the whole batch's flat buffer, then writes each clip's
+/// disjoint, fixed-stride `per_clip` chunk in PARALLEL across whichever
+/// rayon pool this call runs under (`par_chunks_mut` zipped with the clips —
+/// one task per clip, no thread-count knob). `filters` and `window` are
+/// computed once and shared read-only by every task. `row_ids` only changes
+/// what number a row is called in an error message; it never reorders the
+/// chunk a given clip writes to, so it cannot change the numeric output.
+pub fn preprocess_clap_fusion_indexed(
+    row_ids: &[usize],
     clips: &[DecodedAudio],
     config: &ClapFrontendConfig,
     device: &Device,
@@ -277,12 +357,23 @@ pub fn preprocess_clap_fusion(
             "Cannot preprocess empty audio batch".into(),
         ));
     }
+    if config.n_mels == 0 {
+        return Err(JammiError::Inference(format!(
+            "Audio n_mels must be positive, got {}",
+            config.n_mels
+        )));
+    }
     if !config.fft_window_size.is_power_of_two() {
         return Err(JammiError::Inference(format!(
             "Audio fft_window_size ({}) must be a power of two for the radix-2 FFT",
             config.fft_window_size
         )));
     }
+    debug_assert_eq!(
+        row_ids.len(),
+        clips.len(),
+        "row_ids must have one entry per clip"
+    );
 
     let filters = mel_filterbank_hz(config);
     let window = hann_periodic(config.fft_window_size);
@@ -298,10 +389,10 @@ pub fn preprocess_clap_fusion(
     let results: Vec<Result<()>> = flat
         .par_chunks_mut(per_clip)
         .zip(clips.par_iter())
-        .enumerate()
-        .map(|(i, (chunk, clip))| {
-            let row = clap_fusion_row(i, clip, config, &filters, &window, chunk.len())?;
-            chunk.copy_from_slice(&row);
+        .zip(row_ids.par_iter())
+        .map(|((chunk, clip), &row)| {
+            let row_values = clap_fusion_row(row, clip, config, &filters, &window, chunk.len())?;
+            chunk.copy_from_slice(&row_values);
             Ok(())
         })
         .collect();
@@ -899,6 +990,23 @@ mod tests {
         assert!(preprocess_clap_fusion(&[clip], &config, &Device::Cpu).is_err());
     }
 
+    #[test]
+    fn fusion_zero_n_mels_is_a_typed_error_not_a_panic() {
+        // `par_chunks_mut` panics on a zero chunk size — `n_mels == 0` makes
+        // `per_clip` zero, so this guard at the input edge is load-bearing,
+        // not decorative.
+        let clip = decode_audio_bytes(&sine_wav(440.0, 16_000, 2000)).unwrap();
+        let mut config = tiny_fusion_config();
+        config.n_mels = 0;
+        let err = preprocess_clap_fusion(&[clip], &config, &Device::Cpu)
+            .expect_err("n_mels == 0 must be a typed error, not a panic");
+        let msg = err.to_string();
+        assert!(
+            msg.contains("n_mels") && msg.contains('0'),
+            "error must name the field and the offending value: {msg}"
+        );
+    }
+
     // -- Media front-end parallelization (#421 follow-on) --------------------
 
     #[test]
@@ -933,6 +1041,27 @@ mod tests {
         assert!(
             !msg.contains("row 5"),
             "row 5's failure must not be the one surfaced when row 2 also failed: {msg}"
+        );
+    }
+
+    /// The row-index bug this fold closes: a caller that COMPACTS its batch
+    /// (drops null rows) before decoding must get the ORIGINAL row back in
+    /// the error, not the position in the compacted `items` slice.
+    #[test]
+    fn decode_audio_batch_indexed_reports_the_given_row_id_not_the_position() {
+        let good = sine_wav(440.0, 16_000, 2000);
+        let items: Vec<Vec<u8>> = vec![good.clone(), b"not audio at all".to_vec(), good];
+        let row_ids = vec![10usize, 42, 99];
+
+        let err = decode_audio_batch_indexed(&row_ids, &items).unwrap_err();
+        let msg = err.to_string();
+        assert!(
+            msg.contains("row 42"),
+            "expected the caller's row id (42), got: {msg}"
+        );
+        assert!(
+            !msg.contains("row 1:"),
+            "must never report the compacted position instead of the row id: {msg}"
         );
     }
 
@@ -1008,6 +1137,31 @@ mod tests {
             .collect()
     }
 
+    /// [`batch_24`] plus one clip decoded at HALF the config's target sample
+    /// rate — every other synthetic clip is generated AT `config.sample_rate`
+    /// specifically to isolate the parallel-write mechanism from
+    /// `resample_linear`'s own arithmetic (see `synthetic_clip`'s doc), which
+    /// means the K4 bit-identity oracle below would otherwise never exercise
+    /// per-clip resampling at all. Appending one clip that genuinely needs
+    /// resampling closes that gap without disturbing the other 24 clips'
+    /// existing branch coverage.
+    fn batch_25_with_a_resampled_clip(config: &ClapFrontendConfig) -> Vec<DecodedAudio> {
+        let mut clips = batch_24(config);
+        let half_rate = config.sample_rate / 2;
+        let n = config.nb_max_samples() / 4; // repeatpad branch at the native rate
+        let samples: Vec<f32> = (0..n)
+            .map(|i| {
+                let t = i as f32 / half_rate as f32;
+                0.5 * (2.0 * std::f32::consts::PI * 220.0 * t).sin()
+            })
+            .collect();
+        clips.push(DecodedAudio {
+            samples,
+            sample_rate: half_rate,
+        });
+        clips
+    }
+
     /// Run [`preprocess_clap_fusion`] under a rayon pool of exactly
     /// `pool_size` threads and return the flattened `f32` output plus the
     /// `is_longer` flags.
@@ -1027,43 +1181,113 @@ mod tests {
         })
     }
 
-    /// Oracle 1: element-wise bit identity between the pool-size-1 baseline
-    /// (the sequential-equivalent reference — every chunk is still written to
-    /// its OWN preallocated position regardless of thread count, so pool
-    /// size 1 forces the same total order the pre-unit sequential loop
-    /// produced) and non-dividing pool sizes {5, 7, 24}, on a 24-clip batch
-    /// that hits all three of `clap_fusion_features`'s length-determined
-    /// branches (repeatpad; fusion crop; fusion crop's `total == chunk`
-    /// corner case).
+    /// The PRE-UNIT sequential implementation, transcribed verbatim from
+    /// `c1b0b0ba`'s `preprocess_clap_fusion` (before the `par_chunks_mut`
+    /// rewrite) — kept ONLY as a test oracle, INDEPENDENT of the shipped
+    /// parallel code path, so the bit-identity assertions below compare the
+    /// new code against a second implementation rather than against itself
+    /// at a different pool size (a pool-1-vs-pool-k comparison alone cannot
+    /// catch a bug the SAME code makes at every pool size). Reuses
+    /// `mel_filterbank_hz`, `hann_periodic`, `resample_linear` and
+    /// `clap_fusion_features`, all unchanged by this unit.
+    fn preprocess_clap_fusion_reference_sequential(
+        clips: &[DecodedAudio],
+        config: &ClapFrontendConfig,
+        device: &Device,
+    ) -> (Tensor, Vec<bool>) {
+        let filters = mel_filterbank_hz(config);
+        let window = hann_periodic(config.fft_window_size);
+        let time = config.chunk_frames();
+        let per_clip = 4 * time * config.n_mels;
+        let mut flat = Vec::with_capacity(clips.len() * per_clip);
+        for clip in clips {
+            let resampled = resample_linear(&clip.samples, clip.sample_rate, config.sample_rate);
+            let feat = clap_fusion_features(&resampled, config, &filters, &window);
+            debug_assert_eq!(feat.time, time);
+            debug_assert_eq!(feat.features.len(), per_clip);
+            flat.extend_from_slice(&feat.features);
+        }
+        let tensor = Tensor::from_vec(flat, (clips.len(), 4, time, config.n_mels), device).unwrap();
+        (tensor, vec![true; clips.len()])
+    }
+
+    /// Oracle 1 (K4): element-wise bit identity between the PRE-UNIT
+    /// sequential reference above and the shipped parallel code at pool sizes
+    /// {1, 5, 7, 24} (non-dividing counts included), on a batch that hits all
+    /// three of `clap_fusion_features`'s length-determined branches
+    /// (repeatpad; fusion crop; fusion crop's `total == chunk` corner case)
+    /// PLUS one clip that genuinely needs resampling.
     #[test]
     fn clap_fusion_parallel_matches_sequential_bit_identical_across_pool_sizes() {
         let config = tiny_fusion_config();
-        let clips = batch_24(&config);
+        let clips = batch_25_with_a_resampled_clip(&config);
 
-        let (baseline, baseline_is_longer) = run_at_pool_size(1, &clips, &config);
-        assert_eq!(baseline_is_longer, vec![true; clips.len()]);
+        let (reference_tensor, reference_is_longer) =
+            preprocess_clap_fusion_reference_sequential(&clips, &config, &Device::Cpu);
+        let reference = reference_tensor
+            .flatten_all()
+            .unwrap()
+            .to_vec1::<f32>()
+            .unwrap();
+        assert_eq!(reference_is_longer, vec![true; clips.len()]);
 
-        for &k in &[5usize, 7, 24] {
+        for &k in &[1usize, 5, 7, 24] {
             let (got, got_is_longer) = run_at_pool_size(k, &clips, &config);
             assert_eq!(
-                got_is_longer, baseline_is_longer,
-                "is_longer flags must match the sequential baseline at pool size {k}"
+                got_is_longer, reference_is_longer,
+                "is_longer flags must match the pre-unit reference at pool size {k}"
             );
             assert_eq!(
                 got.len(),
-                baseline.len(),
-                "output length must match at pool size {k}"
+                reference.len(),
+                "output length must match the pre-unit reference at pool size {k}"
             );
-            for (idx, (&a, &b)) in got.iter().zip(baseline.iter()).enumerate() {
+            for (idx, (&a, &b)) in got.iter().zip(reference.iter()).enumerate() {
                 assert_eq!(
                     a.to_bits(),
                     b.to_bits(),
-                    "element {idx} differs from the sequential baseline at pool size {k}: \
-                     {a} (bits {:x}) vs {b} (bits {:x})",
+                    "element {idx} differs from the pre-unit sequential reference at pool \
+                     size {k}: {a} (bits {:x}) vs {b} (bits {:x})",
                     a.to_bits(),
                     b.to_bits()
                 );
             }
+        }
+    }
+
+    /// `row_ids` only changes what number a row is called in an error
+    /// message; it must never change the numeric output. Uses row ids that
+    /// are neither `0..n` nor monotonic-by-one.
+    #[test]
+    fn preprocess_clap_fusion_indexed_row_ids_do_not_affect_numeric_output() {
+        let config = tiny_fusion_config();
+        let clips = batch_24(&config);
+
+        let (sequential_tensor, sequential_is_longer) =
+            preprocess_clap_fusion(&clips, &config, &Device::Cpu).unwrap();
+        let sequential = sequential_tensor
+            .flatten_all()
+            .unwrap()
+            .to_vec1::<f32>()
+            .unwrap();
+
+        let row_ids: Vec<usize> = (0..clips.len()).map(|i| i * 7 + 1000).collect();
+        let (indexed_tensor, indexed_is_longer) =
+            preprocess_clap_fusion_indexed(&row_ids, &clips, &config, &Device::Cpu).unwrap();
+        let indexed = indexed_tensor
+            .flatten_all()
+            .unwrap()
+            .to_vec1::<f32>()
+            .unwrap();
+
+        assert_eq!(sequential_is_longer, indexed_is_longer);
+        assert_eq!(sequential.len(), indexed.len());
+        for (idx, (&a, &b)) in sequential.iter().zip(indexed.iter()).enumerate() {
+            assert_eq!(
+                a.to_bits(),
+                b.to_bits(),
+                "element {idx} changed when row_ids were non-sequential"
+            );
         }
     }
 

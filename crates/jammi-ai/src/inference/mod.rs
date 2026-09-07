@@ -113,16 +113,36 @@ pub fn extract_column(
 /// - `Utf8` / `LargeUtf8`: values are file paths, loaded from disk.
 /// - `Binary` / `LargeBinary`: values are image bytes, decoded in memory.
 ///
-/// Null values produce `None` (caller tracks via `row_status`).
+/// Null values produce `None` (caller tracks via `row_status`); a row whose
+/// bytes fail to DECODE produces `Some(Err(..))` rather than failing the
+/// whole batch — the caller (`CandleBackend::forward_image_embedding`) marks
+/// that one row's `_status`/`_error` and every other row's embedding still
+/// computes, per `docs/guide/src/generate-image-embeddings.md`'s
+/// "Error handling" table. A column-level problem (an unsupported Arrow
+/// type, an unreadable path) is still a hard `Err` on the whole call — those
+/// are not per-row concerns.
 ///
 /// Two stages: resolving each row to its raw bytes runs SEQUENTIALLY here (a
 /// path-valued row's `std::fs::read` happens outside the parallel stage);
 /// decoding those bytes to a [`DynamicImage`] runs in parallel across the
-/// batch on rayon's global pool, through the SAME
-/// [`image_preprocess::decode_image_batch`] helper the training path
-/// (`fine_tune::trainer`'s `image_encoder_input`) calls — one decode loop
-/// shared by both.
-pub fn arrow_to_images(columns: &[ArrayRef]) -> Result<Vec<Option<DynamicImage>>> {
+/// batch on rayon's global pool, through
+/// [`image_preprocess::decode_image_batch_per_row_indexed`] — the SAME
+/// per-item decode body the training path (`fine_tune::trainer`'s
+/// `image_encoder_input`) runs via `decode_image_batch` (which still hard-fails
+/// on the lowest-index error — a training corpus with a corrupt item is a
+/// refusal, not a per-row skip), called here with the ORIGINAL Arrow row of
+/// each non-null item (this function compacts nulls out before decoding, so
+/// the position in the compacted slice and the row a caller means by "row N"
+/// diverge after the first null — the per-row call keeps every outcome
+/// Arrow-row-numbered regardless of how many nulls precede it).
+///
+/// A path-valued row is decoded from its raw bytes (content sniffing, like
+/// every other row), not re-opened by path — so a file whose bytes need an
+/// extension hint to identify (rather than a magic-number match) fails here
+/// where `image::open` would have succeeded; a decode failure on a
+/// path-valued row still names its source path in the error, so the
+/// distinction from a bytes-valued row's failure is not lost.
+pub fn arrow_to_images(columns: &[ArrayRef]) -> Result<Vec<Option<Result<DynamicImage>>>> {
     if columns.is_empty() {
         return Err(JammiError::Inference("No image columns provided".into()));
     }
@@ -130,16 +150,23 @@ pub fn arrow_to_images(columns: &[ArrayRef]) -> Result<Vec<Option<DynamicImage>>
     let col = &columns[0];
     let row_count = col.len();
 
-    // Stage 1 (sequential): resolve every row to its raw bytes. Path-valued
-    // rows read the file from disk here; bytes-valued rows borrow straight
-    // out of the Arrow buffer (no copy). Null rows carry no bytes.
-    let mut byte_rows: Vec<Option<Cow<[u8]>>> = Vec::with_capacity(row_count);
+    // Stage 1 (sequential): resolve every non-null row to its raw bytes and
+    // its Arrow row id. Path-valued rows read the file from disk here;
+    // bytes-valued rows borrow straight out of the Arrow buffer (no copy).
+    // `is_null` is the ONLY thing carried past decode for null bookkeeping
+    // (advisory: a resident-bytes null mask, not the bytes themselves) — the
+    // resolved bytes live only through Stage 2's decode call, then drop.
+    let mut is_null: Vec<bool> = Vec::with_capacity(row_count);
+    let mut row_ids: Vec<usize> = Vec::new();
+    let mut byte_rows: Vec<Cow<[u8]>> = Vec::new();
+    let mut source_paths: Vec<Option<String>> = Vec::new();
     for i in 0..row_count {
         if col.is_null(i) {
-            byte_rows.push(None);
+            is_null.push(true);
             continue;
         }
-        let bytes: Cow<[u8]> = match col.data_type() {
+        is_null.push(false);
+        let (bytes, path): (Cow<[u8]>, Option<String>) = match col.data_type() {
             DataType::Utf8 => {
                 let path = col
                     .as_any()
@@ -148,9 +175,10 @@ pub fn arrow_to_images(columns: &[ArrayRef]) -> Result<Vec<Option<DynamicImage>>
                     .ok_or_else(|| {
                         JammiError::Inference(format!("Failed to read path at row {i}"))
                     })?;
-                Cow::Owned(std::fs::read(path).map_err(|e| {
+                let bytes = std::fs::read(path).map_err(|e| {
                     JammiError::Inference(format!("Failed to read image file '{path}': {e}"))
-                })?)
+                })?;
+                (Cow::Owned(bytes), Some(path.to_string()))
             }
             DataType::LargeUtf8 => {
                 let path = col
@@ -160,33 +188,43 @@ pub fn arrow_to_images(columns: &[ArrayRef]) -> Result<Vec<Option<DynamicImage>>
                     .ok_or_else(|| {
                         JammiError::Inference(format!("Failed to read path at row {i}"))
                     })?;
-                Cow::Owned(std::fs::read(path).map_err(|e| {
+                let bytes = std::fs::read(path).map_err(|e| {
                     JammiError::Inference(format!("Failed to read image file '{path}': {e}"))
-                })?)
+                })?;
+                (Cow::Owned(bytes), Some(path.to_string()))
             }
-            DataType::Binary => Cow::Borrowed(
-                col.as_any()
-                    .downcast_ref::<BinaryArray>()
-                    .map(|a| a.value(i))
-                    .ok_or_else(|| {
-                        JammiError::Inference(format!("Failed to read bytes at row {i}"))
-                    })?,
+            DataType::Binary => (
+                Cow::Borrowed(
+                    col.as_any()
+                        .downcast_ref::<BinaryArray>()
+                        .map(|a| a.value(i))
+                        .ok_or_else(|| {
+                            JammiError::Inference(format!("Failed to read bytes at row {i}"))
+                        })?,
+                ),
+                None,
             ),
-            DataType::LargeBinary => Cow::Borrowed(
-                col.as_any()
-                    .downcast_ref::<LargeBinaryArray>()
-                    .map(|a| a.value(i))
-                    .ok_or_else(|| {
-                        JammiError::Inference(format!("Failed to read bytes at row {i}"))
-                    })?,
+            DataType::LargeBinary => (
+                Cow::Borrowed(
+                    col.as_any()
+                        .downcast_ref::<LargeBinaryArray>()
+                        .map(|a| a.value(i))
+                        .ok_or_else(|| {
+                            JammiError::Inference(format!("Failed to read bytes at row {i}"))
+                        })?,
+                ),
+                None,
             ),
-            DataType::BinaryView => Cow::Borrowed(
-                col.as_any()
-                    .downcast_ref::<BinaryViewArray>()
-                    .map(|a| a.value(i))
-                    .ok_or_else(|| {
-                        JammiError::Inference(format!("Failed to read bytes at row {i}"))
-                    })?,
+            DataType::BinaryView => (
+                Cow::Borrowed(
+                    col.as_any()
+                        .downcast_ref::<BinaryViewArray>()
+                        .map(|a| a.value(i))
+                        .ok_or_else(|| {
+                            JammiError::Inference(format!("Failed to read bytes at row {i}"))
+                        })?,
+                ),
+                None,
             ),
             dt => {
                 return Err(JammiError::Inference(format!(
@@ -195,27 +233,70 @@ pub fn arrow_to_images(columns: &[ArrayRef]) -> Result<Vec<Option<DynamicImage>>
                 )));
             }
         };
-        byte_rows.push(Some(bytes));
+        row_ids.push(i);
+        byte_rows.push(bytes);
+        source_paths.push(path);
     }
 
     // Stage 2 (parallel): decode every non-null row's bytes on rayon's global
-    // pool, then re-thread the per-row null bookkeeping.
-    let non_null: Vec<&Cow<[u8]>> = byte_rows.iter().flatten().collect();
-    let decoded = image_preprocess::decode_image_batch(&non_null)?;
+    // pool, Arrow-row-numbered via `row_ids`, keeping EVERY row's own outcome
+    // (not collapsed to the lowest-index failure) — a path-valued row's
+    // failure is re-attached to its source path. `byte_rows` (the resident
+    // encoded bytes) is dropped as soon as decode returns, before the
+    // re-thread loop below runs — only `is_null` and the decoded outcomes
+    // survive it.
+    let decoded: Vec<Result<DynamicImage>> =
+        image_preprocess::decode_image_batch_per_row_indexed(&row_ids, &byte_rows)
+            .into_iter()
+            .zip(row_ids.iter())
+            .zip(source_paths.iter())
+            .map(|((outcome, &row), path)| {
+                outcome.map_err(|e| attach_source_path(e, row, path.as_deref()))
+            })
+            .collect();
+    drop(byte_rows);
+    drop(source_paths);
+
     let mut decoded_iter = decoded.into_iter();
     let mut images = Vec::with_capacity(row_count);
-    for row in &byte_rows {
-        images.push(match row {
-            Some(_) => Some(decoded_iter.next().ok_or_else(|| {
+    for &null in &is_null {
+        images.push(if null {
+            None
+        } else {
+            Some(decoded_iter.next().ok_or_else(|| {
                 JammiError::Inference(
                     "internal error: decoded image count did not match non-null row count".into(),
                 )
-            })?),
-            None => None,
+            })?)
         });
     }
 
     Ok(images)
+}
+
+/// A row's decode failure re-attaches its source path (for a path-valued
+/// row) into the error text, restoring the pre-unit message shape
+/// (`"Failed to decode image at row {row} (path '{path}'): ..."`) that
+/// [`decode_image_batch_per_row_indexed`](image_preprocess::decode_image_batch_per_row_indexed)
+/// cannot produce itself — it only ever sees raw bytes, never a path. Finds
+/// the cause by matching the delimiter-safe `"row {row}: "` marker against
+/// `decode_image_batch_per_row_indexed`'s own, fully-controlled error format
+/// (never user data) and keeps only the text AFTER that marker (so the path
+/// is spliced in, not duplicated alongside the original text); a
+/// bytes-valued row (no path) or a match miss returns the error unchanged.
+fn attach_source_path(err: JammiError, row: usize, path: Option<&str>) -> JammiError {
+    let Some(path) = path else {
+        return err;
+    };
+    let msg = err.to_string();
+    let marker = format!("row {row}: ");
+    let cause = match msg.find(&marker) {
+        Some(marker_at) => &msg[marker_at + marker.len()..],
+        None => return err,
+    };
+    JammiError::Inference(format!(
+        "Failed to decode image at row {row} (path '{path}'): {cause}"
+    ))
 }
 
 /// Extract and decode audio clips from an Arrow column.
@@ -228,11 +309,22 @@ pub fn arrow_to_images(columns: &[ArrayRef]) -> Result<Vec<Option<DynamicImage>>
 /// Two stages, mirroring [`arrow_to_images`]: resolving each row to its raw
 /// bytes runs SEQUENTIALLY (a path-valued row's `std::fs::read` happens
 /// outside the parallel stage); decoding those bytes to mono PCM runs in
-/// parallel across the batch on rayon's global pool, through the SAME
-/// [`audio_preprocess::decode_audio_batch`] helper the training path
-/// (`fine_tune::trainer`'s `audio_encoder_input`) calls. Null values produce
-/// `None` (caller tracks via `row_status`).
-pub fn arrow_to_audio(columns: &[ArrayRef]) -> Result<Vec<Option<audio_preprocess::DecodedAudio>>> {
+/// parallel across the batch on rayon's global pool, through
+/// [`audio_preprocess::decode_audio_batch_per_row_indexed`] — the SAME
+/// per-item decode body the training path (`fine_tune::trainer`'s
+/// `audio_encoder_input`) runs via `decode_audio_batch` (which still
+/// hard-fails on the lowest-index error — a training corpus with a corrupt
+/// item is a refusal, not a per-row skip), called here with the ORIGINAL
+/// Arrow row of each non-null item (see [`arrow_to_images`]'s doc for why:
+/// this function compacts nulls out before decoding, so the position in the
+/// compacted slice and the row a caller means by "row N" diverge after the
+/// first null). Null values produce `None`; a row whose bytes fail to decode
+/// produces `Some(Err(..))` rather than failing the whole batch — mirroring
+/// [`arrow_to_images`]'s per-row contract (caller tracks both via
+/// `row_status`).
+pub fn arrow_to_audio(
+    columns: &[ArrayRef],
+) -> Result<Vec<Option<Result<audio_preprocess::DecodedAudio>>>> {
     if columns.is_empty() {
         return Err(JammiError::Inference("No audio columns provided".into()));
     }
@@ -240,15 +332,20 @@ pub fn arrow_to_audio(columns: &[ArrayRef]) -> Result<Vec<Option<audio_preproces
     let col = &columns[0];
     let row_count = col.len();
 
-    // Stage 1 (sequential): resolve every row to its raw bytes. Path-valued
-    // rows read the file from disk here; bytes-valued rows borrow straight
-    // out of the Arrow buffer (no copy). Null rows carry no bytes.
-    let mut byte_rows: Vec<Option<Cow<[u8]>>> = Vec::with_capacity(row_count);
+    // Stage 1 (sequential): resolve every non-null row to its raw bytes and
+    // its Arrow row id. Path-valued rows read the file from disk here;
+    // bytes-valued rows borrow straight out of the Arrow buffer (no copy).
+    // `is_null` is the ONLY thing carried past decode for null bookkeeping —
+    // the resolved bytes live only through Stage 2's decode call, then drop.
+    let mut is_null: Vec<bool> = Vec::with_capacity(row_count);
+    let mut row_ids: Vec<usize> = Vec::new();
+    let mut byte_rows: Vec<Cow<[u8]>> = Vec::new();
     for i in 0..row_count {
         if col.is_null(i) {
-            byte_rows.push(None);
+            is_null.push(true);
             continue;
         }
+        is_null.push(false);
         let bytes: Cow<[u8]> = match col.data_type() {
             DataType::Utf8 => {
                 let path = col
@@ -305,23 +402,30 @@ pub fn arrow_to_audio(columns: &[ArrayRef]) -> Result<Vec<Option<audio_preproces
                 )));
             }
         };
-        byte_rows.push(Some(bytes));
+        row_ids.push(i);
+        byte_rows.push(bytes);
     }
 
     // Stage 2 (parallel): decode every non-null row's bytes on rayon's global
-    // pool, then re-thread the per-row null bookkeeping.
-    let non_null: Vec<&Cow<[u8]>> = byte_rows.iter().flatten().collect();
-    let decoded = audio_preprocess::decode_audio_batch(&non_null)?;
+    // pool, Arrow-row-numbered via `row_ids`, keeping EVERY row's own outcome
+    // (not collapsed to the lowest-index failure). `byte_rows` (the resident
+    // encoded bytes) is dropped as soon as decode returns, before the
+    // re-thread loop below runs — only `is_null` and the decoded outcomes
+    // survive it.
+    let decoded = audio_preprocess::decode_audio_batch_per_row_indexed(&row_ids, &byte_rows);
+    drop(byte_rows);
+
     let mut decoded_iter = decoded.into_iter();
     let mut clips = Vec::with_capacity(row_count);
-    for row in &byte_rows {
-        clips.push(match row {
-            Some(_) => Some(decoded_iter.next().ok_or_else(|| {
+    for &null in &is_null {
+        clips.push(if null {
+            None
+        } else {
+            Some(decoded_iter.next().ok_or_else(|| {
                 JammiError::Inference(
                     "internal error: decoded audio count did not match non-null row count".into(),
                 )
-            })?),
-            None => None,
+            })?)
         });
     }
 

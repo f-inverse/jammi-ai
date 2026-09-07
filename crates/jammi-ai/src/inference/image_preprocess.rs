@@ -14,30 +14,82 @@ use rayon::prelude::*;
 /// installs no private pool of its own, so this is the one pool the process
 /// ever schedules media-batch work on).
 ///
-/// Used by BOTH decode loops: `fine_tune::trainer`'s `image_encoder_input`
-/// calls it directly on an already-filtered `&[Vec<u8>]`; [`super::arrow_to_images`]
-/// calls it on the non-null rows it resolves from an Arrow column, re-threading
-/// the null bookkeeping around it. One decode task per item — chunk count is
-/// `items.len()`, no thread-count knob, so the effective parallelism is
-/// `min(pool_size, items.len())`, emergent from whichever pool is installed.
-///
-/// Errors are collected per row and the LOWEST-INDEX failing row is the one
-/// surfaced, with a row-indexed message — the same selection the pre-unit
-/// sequential decode loop made by construction (it returned on the first
-/// failure it walked into, in row order).
+/// Used by `fine_tune::trainer`'s `image_encoder_input`, whose items are
+/// already the row space the caller wants reported (no compaction ever
+/// happens ahead of it — every `MediaTriplet` blob is present by
+/// construction), so this thin wrapper reports positions `0..items.len()`
+/// via [`decode_image_batch_indexed`]. A caller that compacts rows first
+/// (dropping nulls before decoding, as [`super::arrow_to_images`] and
+/// `CandleBackend::forward_image_embedding` both do) must call
+/// [`decode_image_batch_indexed`] directly with the ORIGINAL row ids, or
+/// every error message after the first null row reports the wrong (compacted)
+/// position instead of the caller's row.
 pub fn decode_image_batch<T>(items: &[T]) -> Result<Vec<DynamicImage>>
 where
     T: AsRef<[u8]> + Sync,
 {
-    let results: Vec<Result<DynamicImage>> = items
+    let row_ids: Vec<usize> = (0..items.len()).collect();
+    decode_image_batch_indexed(&row_ids, items)
+}
+
+/// [`decode_image_batch`], reporting `row_ids[i]` (not the position `i`) in
+/// every error — for a caller that has already compacted its batch (dropped
+/// null rows) before decoding, so the position in `items` and the row the
+/// caller (and its own caller, in turn) means by "row N" have diverged.
+/// `row_ids.len()` must equal `items.len()`.
+///
+/// One decode task per item — chunk count is `items.len()`, no thread-count
+/// knob, so the effective parallelism is `min(pool_size, items.len())`,
+/// emergent from whichever pool is installed. Errors are collected per row
+/// and the LOWEST-INDEX failing row is the one surfaced, with a row-indexed
+/// message — the same selection the pre-unit sequential decode loop made by
+/// construction (it returned on the first failure it walked into, in row
+/// order); `row_ids` only changes what number a row is called, never the
+/// selection order.
+pub fn decode_image_batch_indexed<T>(row_ids: &[usize], items: &[T]) -> Result<Vec<DynamicImage>>
+where
+    T: AsRef<[u8]> + Sync,
+{
+    crate::inference::lowest_index_result(decode_image_results(row_ids, items))
+}
+
+/// [`decode_image_batch_indexed`]'s per-row outcomes, WITHOUT collapsing to
+/// the lowest-index failure — for a caller (serving's `arrow_to_images`) that
+/// marks each row's OWN status rather than refusing the whole batch because
+/// one row's bytes were corrupt. Every element is independently `Ok` or a
+/// row-indexed `Err`, in the same order as `items`/`row_ids`.
+pub fn decode_image_batch_per_row_indexed<T>(
+    row_ids: &[usize],
+    items: &[T],
+) -> Vec<Result<DynamicImage>>
+where
+    T: AsRef<[u8]> + Sync,
+{
+    decode_image_results(row_ids, items)
+}
+
+/// The parallel per-row decode shared by [`decode_image_batch_indexed`] and
+/// [`decode_image_batch_per_row_indexed`] — the only difference between the
+/// two public entry points is whether the caller wants ALL per-row outcomes
+/// or just the lowest-index failure.
+fn decode_image_results<T>(row_ids: &[usize], items: &[T]) -> Vec<Result<DynamicImage>>
+where
+    T: AsRef<[u8]> + Sync,
+{
+    debug_assert_eq!(
+        row_ids.len(),
+        items.len(),
+        "row_ids must have one entry per item"
+    );
+    items
         .par_iter()
-        .enumerate()
-        .map(|(i, item)| {
-            image::load_from_memory(item.as_ref())
-                .map_err(|e| JammiError::Inference(format!("Decode image row {i}: {e}")))
+        .zip(row_ids.par_iter())
+        .map(|(item, &row)| {
+            image::load_from_memory(item.as_ref()).map_err(|e| {
+                JammiError::Inference(format!("Failed to decode image at row {row}: {e}"))
+            })
         })
-        .collect();
-    crate::inference::lowest_index_result(results)
+        .collect()
 }
 
 /// One image's normalized pixel row: pad to square → resize → normalize,
@@ -98,11 +150,36 @@ fn image_row(
 /// Each image is: padded to square (white) → resized to `target_size` → normalized.
 /// Returns tensor of shape `(batch, 3, target_size, target_size)`.
 ///
+/// Reports row positions `0..images.len()` in any per-row error via
+/// [`preprocess_image_batch_indexed`]; see that function's doc for the
+/// compacted-batch case (`CandleBackend::forward_image_embedding` calls it
+/// directly with the original Arrow row ids for exactly that reason).
+pub fn preprocess_image_batch(
+    images: &[DynamicImage],
+    target_size: u32,
+    mean: &[f32; 3],
+    std: &[f32; 3],
+    device: &Device,
+) -> Result<Tensor> {
+    let row_ids: Vec<usize> = (0..images.len()).collect();
+    preprocess_image_batch_indexed(&row_ids, images, target_size, mean, std, device)
+}
+
+/// [`preprocess_image_batch`], reporting `row_ids[i]` (not the position `i`)
+/// in every per-row error — for a caller that has already compacted its
+/// batch (dropped null rows) before preprocessing, so the position in
+/// `images` and the row its own caller means by "row N" have diverged.
+/// `row_ids.len()` must equal `images.len()`.
+///
 /// Preallocates the whole batch's flat buffer, then writes each image's
 /// disjoint, fixed-stride `pixels_per_image` chunk in PARALLEL across
 /// whichever rayon pool this call runs under (`par_chunks_mut` zipped with
-/// the images — one task per image, no thread-count knob).
-pub fn preprocess_image_batch(
+/// the images — one task per image, no thread-count knob). `row_ids` only
+/// changes what number a row is called in an error message; it never
+/// reorders the chunk a given image writes to, so it cannot change the
+/// numeric output.
+pub fn preprocess_image_batch_indexed(
+    row_ids: &[usize],
     images: &[DynamicImage],
     target_size: u32,
     mean: &[f32; 3],
@@ -114,6 +191,16 @@ pub fn preprocess_image_batch(
             "Cannot preprocess empty image batch".into(),
         ));
     }
+    if target_size == 0 {
+        return Err(JammiError::Inference(
+            "Image target_size must be positive, got 0".into(),
+        ));
+    }
+    debug_assert_eq!(
+        row_ids.len(),
+        images.len(),
+        "row_ids must have one entry per image"
+    );
 
     let pixels_per_image = 3 * (target_size as usize) * (target_size as usize);
     let mut flat = vec![0f32; images.len() * pixels_per_image];
@@ -121,10 +208,10 @@ pub fn preprocess_image_batch(
     let results: Vec<Result<()>> = flat
         .par_chunks_mut(pixels_per_image)
         .zip(images.par_iter())
-        .enumerate()
-        .map(|(i, (chunk, img))| {
-            let row = image_row(i, img, target_size, mean, std, chunk.len())?;
-            chunk.copy_from_slice(&row);
+        .zip(row_ids.par_iter())
+        .map(|((chunk, img), &row)| {
+            let row_values = image_row(row, img, target_size, mean, std, chunk.len())?;
+            chunk.copy_from_slice(&row_values);
             Ok(())
         })
         .collect();
@@ -294,6 +381,44 @@ mod tests {
         );
     }
 
+    /// The row-index bug this fold closes: a caller that COMPACTS its batch
+    /// (drops null rows) before decoding must get the ORIGINAL row back in
+    /// the error, not the position in the compacted `items` slice. Position 1
+    /// (the bad row) is deliberately given a row id far from its position.
+    #[test]
+    fn decode_image_batch_indexed_reports_the_given_row_id_not_the_position() {
+        let good = png_bytes(4, 4, [1, 2, 3]);
+        let items: Vec<Vec<u8>> = vec![good.clone(), b"not an image".to_vec(), good];
+        let row_ids = vec![10usize, 42, 99];
+
+        let err = decode_image_batch_indexed(&row_ids, &items).unwrap_err();
+        let msg = err.to_string();
+        assert!(
+            msg.contains("row 42"),
+            "expected the caller's row id (42), got: {msg}"
+        );
+        assert!(
+            !msg.contains("row 1:"),
+            "must never report the compacted position instead of the row id: {msg}"
+        );
+    }
+
+    #[test]
+    fn preprocess_image_batch_zero_target_size_is_a_typed_error_not_a_panic() {
+        // `par_chunks_mut` panics on a zero chunk size — `target_size == 0`
+        // makes `pixels_per_image` zero, so this guard at the input edge is
+        // load-bearing, not decorative (base returned a `[1, 3, 0, 0]`
+        // tensor instead of refusing the request).
+        let images = vec![test_image(4, 4)];
+        let err = preprocess_image_batch(&images, 0, &TEST_MEAN, &TEST_STD, &Device::Cpu)
+            .expect_err("target_size == 0 must be a typed error, not a panic");
+        let msg = err.to_string();
+        assert!(
+            msg.contains("target_size") && msg.contains('0'),
+            "error must name the field and the offending value: {msg}"
+        );
+    }
+
     #[test]
     fn image_row_wrong_expected_len_is_a_typed_error_not_a_panic() {
         // The release-mode length check `image_row` performs before handing
@@ -351,34 +476,125 @@ mod tests {
         })
     }
 
-    /// Oracle 1: element-wise bit identity between the pool-size-1 baseline
-    /// (the sequential-equivalent reference — every chunk is still written to
-    /// its OWN preallocated position regardless of thread count) and
-    /// non-dividing pool sizes {5, 7, 24}, on a 24-image batch that exercises
-    /// every `pad_to_square` aspect-ratio branch.
+    /// The PRE-UNIT sequential implementation, transcribed verbatim from
+    /// `c1b0b0ba`'s `preprocess_image_batch` (before the `par_chunks_mut`
+    /// rewrite) — kept ONLY as a test oracle, INDEPENDENT of the shipped
+    /// parallel code path, so the bit-identity assertions below compare the
+    /// new code against a second implementation rather than against itself
+    /// at a different pool size (a pool-1-vs-pool-k comparison alone cannot
+    /// catch a bug the SAME code makes at every pool size). Reuses
+    /// `pad_to_square`, unchanged by this unit.
+    fn preprocess_image_batch_reference_sequential(
+        images: &[DynamicImage],
+        target_size: u32,
+        mean: &[f32; 3],
+        std: &[f32; 3],
+        device: &Device,
+    ) -> Tensor {
+        let pixels_per_image = 3 * (target_size as usize) * (target_size as usize);
+        let mut flat = Vec::with_capacity(images.len() * pixels_per_image);
+        for img in images {
+            let padded = pad_to_square(img);
+            let resized = padded.resize_exact(target_size, target_size, FilterType::CatmullRom);
+            let rgb = resized.to_rgb8();
+            for c in 0..3 {
+                let m = mean[c];
+                let s = std[c];
+                for y in 0..target_size {
+                    for x in 0..target_size {
+                        let pixel = rgb.get_pixel(x, y)[c];
+                        flat.push((pixel as f32 / 255.0 - m) / s);
+                    }
+                }
+            }
+        }
+        let t = target_size as usize;
+        Tensor::from_vec(flat, (images.len(), 3, t, t), device).unwrap()
+    }
+
+    /// Oracle 1 (K4): element-wise bit identity between the PRE-UNIT
+    /// sequential reference above and the shipped parallel code at pool sizes
+    /// {1, 5, 7, 24} (non-dividing counts included), on a 24-image batch that
+    /// exercises every `pad_to_square` aspect-ratio branch, at a
+    /// non-power-of-two `target_size` (17) so no accidental stride alignment
+    /// hides a bug.
     #[test]
     fn image_batch_parallel_matches_sequential_bit_identical_across_pool_sizes() {
         let images = batch_24();
-        let target_size = 16;
+        let target_size = 17;
 
-        let baseline = run_at_pool_size(1, &images, target_size);
-        for &k in &[5usize, 7, 24] {
+        let reference = preprocess_image_batch_reference_sequential(
+            &images,
+            target_size,
+            &TEST_MEAN,
+            &TEST_STD,
+            &Device::Cpu,
+        )
+        .flatten_all()
+        .unwrap()
+        .to_vec1::<f32>()
+        .unwrap();
+
+        for &k in &[1usize, 5, 7, 24] {
             let got = run_at_pool_size(k, &images, target_size);
             assert_eq!(
                 got.len(),
-                baseline.len(),
-                "output length must match at pool size {k}"
+                reference.len(),
+                "output length must match the pre-unit reference at pool size {k}"
             );
-            for (idx, (&a, &b)) in got.iter().zip(baseline.iter()).enumerate() {
+            for (idx, (&a, &b)) in got.iter().zip(reference.iter()).enumerate() {
                 assert_eq!(
                     a.to_bits(),
                     b.to_bits(),
-                    "element {idx} differs from the sequential baseline at pool size {k}: \
-                     {a} (bits {:x}) vs {b} (bits {:x})",
+                    "element {idx} differs from the pre-unit sequential reference at pool \
+                     size {k}: {a} (bits {:x}) vs {b} (bits {:x})",
                     a.to_bits(),
                     b.to_bits()
                 );
             }
+        }
+    }
+
+    /// `row_ids` only changes what number a row is called in an error
+    /// message; it must never change the numeric output. Uses row ids that
+    /// are neither `0..n` nor monotonic-by-one, so any accidental dependence
+    /// on `row_ids` ordering or magnitude (e.g. using it as a chunk offset)
+    /// would show up here.
+    #[test]
+    fn preprocess_image_batch_indexed_row_ids_do_not_affect_numeric_output() {
+        let images = batch_24();
+        let target_size = 16;
+
+        let sequential =
+            preprocess_image_batch(&images, target_size, &TEST_MEAN, &TEST_STD, &Device::Cpu)
+                .unwrap()
+                .flatten_all()
+                .unwrap()
+                .to_vec1::<f32>()
+                .unwrap();
+
+        let row_ids: Vec<usize> = (0..images.len()).map(|i| i * 7 + 1000).collect();
+        let indexed = preprocess_image_batch_indexed(
+            &row_ids,
+            &images,
+            target_size,
+            &TEST_MEAN,
+            &TEST_STD,
+            &Device::Cpu,
+        )
+        .unwrap()
+        .flatten_all()
+        .unwrap()
+        .to_vec1::<f32>()
+        .unwrap();
+
+        assert_eq!(sequential.len(), indexed.len());
+        for (idx, (&a, &b)) in sequential.iter().zip(indexed.iter()).enumerate() {
+            assert_eq!(
+                a.to_bits(),
+                b.to_bits(),
+                "element {idx} changed when row_ids were non-sequential"
+            );
         }
     }
 

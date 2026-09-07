@@ -2099,11 +2099,21 @@ impl CandleModel {
         let mut valid_indices = Vec::new();
         let mut valid_images = Vec::new();
 
-        for (i, img) in images.iter().enumerate() {
+        // A corrupt row's decode failure marks only THAT row's status; the
+        // rest of the batch still embeds (`docs/guide/src/generate-image-embeddings.md`'s
+        // documented per-row `_status`/`_error` contract) — unlike the
+        // trainer's `decode_image_batch`, which hard-fails a whole training
+        // step on its lowest-index error (a corrupt training item is a
+        // refusal, not a row to skip).
+        for (i, img) in images.into_iter().enumerate() {
             match img {
-                Some(im) => {
+                Some(Ok(im)) => {
                     valid_indices.push(i);
-                    valid_images.push(im.clone());
+                    valid_images.push(im);
+                }
+                Some(Err(e)) => {
+                    row_status[i] = false;
+                    row_errors[i] = e.to_string();
                 }
                 None => {
                     row_status[i] = false;
@@ -2119,7 +2129,12 @@ impl CandleModel {
             let target_size = vision.image_size() as u32;
             let mean = vision.preprocess_mean();
             let std = vision.preprocess_std();
-            let pixel_values = image_preprocess::preprocess_image_batch(
+            // Arrow-row-numbered: `valid_indices[k]` IS the Arrow row of
+            // `valid_images[k]` (built by the loop above from the
+            // null-compacted `images`), so any per-row preprocessing error
+            // names the caller's row, not this function's local position.
+            let pixel_values = image_preprocess::preprocess_image_batch_indexed(
+                &valid_indices,
                 &valid_images,
                 target_size,
                 &mean,
@@ -2183,11 +2198,19 @@ impl CandleModel {
         let mut valid_indices = Vec::new();
         let mut valid_clips = Vec::new();
 
+        // A corrupt row's decode failure marks only THAT row's status; the
+        // rest of the batch still embeds (mirroring `forward_image_embedding`'s
+        // per-row contract) — unlike the trainer's `decode_audio_batch`,
+        // which hard-fails a whole training step on its lowest-index error.
         for (i, clip) in clips.into_iter().enumerate() {
             match clip {
-                Some(c) => {
+                Some(Ok(c)) => {
                     valid_indices.push(i);
                     valid_clips.push(c);
+                }
+                Some(Err(e)) => {
+                    row_status[i] = false;
+                    row_errors[i] = e.to_string();
                 }
                 None => {
                     row_status[i] = false;
@@ -2216,8 +2239,16 @@ impl CandleModel {
             // (deterministic always-fusion) so every clip runs the AFF path,
             // reproducing HF's canonical get_audio_features embedding; the tower
             // gates fusion per sample, so it still honors a false flag if passed.
-            let (input_features, is_longer) =
-                audio_preprocess::preprocess_clap_fusion(&valid_clips, frontend, &self.device)?;
+            // Arrow-row-numbered: `valid_indices[k]` IS the Arrow row of
+            // `valid_clips[k]` (built by the loop above from the
+            // null-compacted `clips`), so any per-row preprocessing error
+            // names the caller's row, not this function's local position.
+            let (input_features, is_longer) = audio_preprocess::preprocess_clap_fusion_indexed(
+                &valid_indices,
+                &valid_clips,
+                frontend,
+                &self.device,
+            )?;
 
             // The CLAP audio tower emits L2-normalized embeddings directly
             // (like the text tower), so no further normalization is applied —

@@ -204,16 +204,25 @@ workspace ships every publishable crate at the same
   rayon's global pool (#421 follow-on).** `rayon` becomes a direct `jammi-ai` dependency (pinned
   to the version already unified across the resolved tree; no version bump). Two stages, signatures
   preserved: decode — new shared helpers `audio_preprocess::decode_audio_batch` /
-  `image_preprocess::decode_image_batch`, used by BOTH the serving decode loops
-  (`inference::arrow_to_audio` / `arrow_to_images`, which still return `Vec<Option<_>>` with the
-  same null bookkeeping) and the trainer's `audio_encoder_input` / `image_encoder_input`; a
-  path-valued arrow column still reads its bytes with a sequential `std::fs::read` OUTSIDE the
-  parallel stage. Preprocess — `preprocess_clap_fusion` / `preprocess_image_batch` preallocate the
+  `image_preprocess::decode_image_batch` (plus their `_indexed` / `_per_row_indexed` siblings,
+  which take the caller's own row ids so an error message names the CALLER's row, never the
+  position in a compacted batch), used by BOTH the serving decode loops
+  (`inference::arrow_to_audio` / `arrow_to_images`, which return `Vec<Option<Result<_>>>`: a null
+  row is `None`, a decode failure is `Some(Err(..))` and marks only that row's `_status`/`_error`
+  — the rest of the batch still embeds — while the trainer's `audio_encoder_input` /
+  `image_encoder_input` still hard-fail a training step on the lowest-index error, a corrupt
+  training item being a refusal rather than a row to skip) and the trainer; a path-valued arrow
+  column still reads its bytes with a sequential `std::fs::read` OUTSIDE the parallel stage, and a
+  path-valued row's decode failure still names its source path. Preprocess —
+  `preprocess_clap_fusion` / `preprocess_image_batch` (plus `_indexed` siblings) preallocate the
   batch's flat buffer once and write each item's disjoint, fixed-stride chunk via `par_chunks_mut`,
-  with the mel filterbank / Hann window (audio) hoisted and computed once, and a release-mode
+  with the mel filterbank / Hann window (audio) hoisted and computed once, a release-mode
   per-item length check (`clap_fusion_row` / `image_row`) that returns a typed, row-indexed error
-  rather than ever reaching a mismatched `copy_from_slice`. Errors across a batch surface the
-  LOWEST-INDEX failing row; an empty batch is still refused before any chunking. There is no
+  rather than ever reaching a mismatched `copy_from_slice`, and a typed refusal (naming the field
+  and the offending value) for `target_size == 0` / `n_mels == 0` — either would otherwise reach
+  `par_chunks_mut` with a zero chunk size and panic. Within the internal decode/preprocess helpers
+  and the training path, errors across a batch still surface the LOWEST-INDEX failing row; an
+  empty batch is still refused before any chunking. There is no
   thread-count knob anywhere: chunk count is `n`, and effective parallelism (`min(pool, n)`) is
   emergent from whichever rayon pool a call runs under — candle installs no private pool, so this is
   the one pool the process ever schedules media-batch work on. `fine_tune::media_front_end_pool_threads()`

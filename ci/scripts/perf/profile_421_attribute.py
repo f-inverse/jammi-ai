@@ -44,22 +44,19 @@ Read the mapping off the real `clip-text-A2` (BF16), `clip-text-D1`,
 tip `c1b0b0ba`) and named a set of EVIDENCE-BACKED buckets that absorb the
 overwhelming majority of what pass 1 left `UNATTRIBUTED`.
 
-## Pass 3 (adversarial-audit fold, 7 findings; this revision ALSO folds a re-audit round of the fold itself, plus the HTSAT mapping)
+## Pass 3 (named-bucket priority fixes, plus the HTSAT mapping)
 
 Pass 2's own priority order over-attributed two RELATIONAL rules and
-under-split the elementwise tiers; this pass's every change is grounded in
-a specific `(kernel, grid)` row from a real export, same discipline as
-pass 1/2 — see each subsection. A SECOND, adversarial re-audit of this
-same pass found the fold's own priority order still wrong in two places
-(the F32-only caveat, the anonymous grid-family fallback), one measured
-claim not yet re-derived (the D1-vs-D2 differential's own split), one
-denominator convention left ambiguous (`share_of_baseline_wall`), one
-fixture row transcribed instead of copied byte-exact, several evidence
-paragraphs deleted out from under still-live citations, and one silent
-leg-dropping bug — every one of those is folded into the relevant
-subsection below, never a separate "pass 3.5" — plus the HTSAT
-kernel-name<->shape mapping itself (see "HTSAT" below), read off the real
-`htsat-{A1,A2,D1,D2}` exports for the first time in this revision.
+under-split the elementwise tiers; every change here is grounded in a
+specific `(kernel, grid)` row from a real export, same discipline as pass
+1/2 — see each subsection. The F32-only caveat and the anonymous
+grid-family fallback each state their own priority order explicitly; the
+D1-vs-D2 differential's own split is MEASURED, never carried as a literal
+expectation; `share_of_baseline_wall`'s own denominator convention is
+pinned; every fixture row is copied byte-exact from a real export; and
+every evidence paragraph cites a subsection that still exists — plus the
+HTSAT kernel-name<->shape mapping itself (see "HTSAT" below), read off the
+real `htsat-{A1,A2,D1,D2}` exports.
 
 ### `C-ATTN-<tower>`: the pre-registered signature does not move
 
@@ -423,10 +420,9 @@ attention tensor's own (pass 3, finding 1's own priority fix).**
 `cast_add_bf16`/`cast_scale_bf16_f32`/`cast_u8_bf16`/
 `scaled_cast_add_f32_f32`/`scaled_cast_add_bf16_f32` — matched by NAME,
 any OTHER grid, any tower. `scaled_cast_add_f32_f32`'s own grid pattern is
-suggestive of a LoRA-composition-adjacent op (it launches at EXACTLY the
-three activation-tier grids, one call per LoRA-wrappable site width, on
-every leg pulled so far), but this module does not claim that role
-without a dedicated ablation.
+suggestive of a LoRA-composition-adjacent op — grids vary by leg and by
+tower (the rule is name-based, not grid-based) — but this module does not
+claim that role without a dedicated ablation.
 
 **Declared per-tower architecture constants (`TOWER_ARCH`).** `width`,
 `heads`, and `mlp_ratio` for `clip-text`/`clip-vision` are DECLARED, not
@@ -461,42 +457,29 @@ visibility (`attribute_leg`) — they never enter any chain's
 
 The module doc ("split by kernel NAME-CLASS", above) already states the
 DIRECTION rule (`ln_disabled` gates `LN_EAGER_EXTENDED_KERNEL_NAMES` at
-`ln_row_count`). What follows is the MEASURED split of the real `D1-D2`
-total-busy delta on BOTH CLIP towers, re-derived from the real, full (not
-fixture-cut) `clip-{text,vision}-{D1,D2}` census exports at this tip —
-never carried as a literal expectation in any test:
+`ln_row_count`). By-name `C-LN` moves in that direction on the toggle but
+does not capture the whole `D1-D2` busy delta on either CLIP tower —
+`ELEMENTWISE-OTHER-OUT` and `BIAS/RESIDUAL-OUT` are the two buckets the
+remainder leaks into (mechanism below). The realized `C-LN` gain this
+module reports (`compute_realized_gains`) is deliberately the
+WHOLE-CHAIN `D1-D2` busy/wall delta, not a re-derivation from the by-name
+`C-LN` bucket alone — the gain number is correct even though the by-name
+attribution under-covers the mechanism.
 
-| bucket | clip-text share of Δ | clip-vision share of Δ |
-|---|---|---|
-| `C-LN` | `12.21%` | `17.51%` |
-| `ELEMENTWISE-OTHER-OUT` | `46.47%` | `43.20%` |
-| `BIAS/RESIDUAL-OUT` | `35.40%` | `32.56%` |
-| `BASE-GEMM` | `-0.06%` | `-0.07%` |
-| `C-ATTN-<tower>` | `-0.01%` | `0.0005%` |
-
-By-name `C-LN` therefore captures only about A SEVENTH to A SIXTH of the
-real `D1-D2` delta — it UNDER-REPORTS eager LayerNorm's true cost on a D
-leg. The realized `C-LN` gain this module reports
-(`compute_realized_gains`) is deliberately the WHOLE-CHAIN `D1-D2` busy/
-wall delta, not a re-derivation from the by-name `C-LN` bucket alone — the
-gain number is correct even though the by-name attribution under-covers
-the mechanism.
-
-**Mechanism hypothesis, evidenced identically on BOTH towers:** eager
-LayerNorm's own final affine step (`gamma * x_hat + beta`) is NOT a
-distinct named kernel — it lands as an ordinary `badd_f32` launch at the
-`out` activation tier's FULL width (`rows*seq*width`), the SAME grid the
-site's own Linear-bias-add and the residual-stream's add already share.
-`badd_f32`'s own `launches_per_step` at that grid forms a DETERMINISTIC
-three-point ladder as fusion is progressively disabled — evidenced
-IDENTICALLY on `clip-text` (`grid=[924,...]`) and `clip-vision`
-(`grid=[900,...]`): `337` launches on `A1` (LoRA+LN both fused) -> `633`
-on `D2` (LoRA disabled, LN still fused) -> `874` on `D1` (both disabled).
-The SAME three numbers on two independent, unrelated towers is
-deterministic architecture, not run-to-run cuBLAS/launch-count session
-noise — the `D1` leg's own eager LN affine step is the extra `241`
-launches (`874-633`) landing in `BIAS/RESIDUAL-OUT`, and eager LN's
-remaining mean/var/normalize steps (excluding the affine) land in
+**Mechanism hypothesis, evidenced on both towers:** eager LayerNorm's own
+final affine step (`gamma * x_hat + beta`) is NOT a distinct named kernel
+— it lands as an ordinary `badd_f32` launch at the `out` activation
+tier's FULL width (`rows*seq*width`), the SAME grid the site's own
+Linear-bias-add and the residual-stream's add already share. `badd_f32`'s
+own `launches_per_step` at that grid forms a three-point ladder as fusion
+is progressively disabled: `337` launches on `A1` (LoRA+LN both fused) ->
+`633` on `D2` (LoRA disabled, LN still fused) -> `874` on `D1` (both
+disabled) on `clip-text` (`grid=[924,...]`), and `337` -> `633` -> `865`
+on `clip-vision` (`grid=[900,...]`) — read off the real fixture cuts and
+asserted by `test_badd_ladder_launches_per_step_by_tower`. The `D1` leg's
+own eager LN affine step is the extra launches landing in
+`BIAS/RESIDUAL-OUT` on each tower, and eager LN's remaining
+mean/var/normalize steps (excluding the affine) land in
 `ELEMENTWISE-OTHER-OUT` (the true majority of the leaked delta on both
 towers). Neither leak bucket's own share is asserted as a "less than"
 bound against `C-LN`'s share anywhere in this module's tests (see

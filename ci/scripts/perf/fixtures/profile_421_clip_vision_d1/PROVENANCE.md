@@ -52,14 +52,16 @@ real evidence across all eight pulled CLIP legs for the contract's own
   `launches_per_step` here relative to `clip-vision-a1`'s own fused count,
   same pattern `clip-text-d1`'s own fixture already documents).
 - `adamw_moment_update_f32` -> `OPTIMIZER`, unchanged.
-- `affine_f32` at `grid=[900,1,1]` (`out_shape_elements`) -> ADDED
-  post-audit (finding 2's own re-audit) so `Ln1VsD2DifferentialTests` has
-  a REAL `ELEMENTWISE-OTHER-OUT` row present on BOTH this leg and its
-  `D2` twin, at DIFFERENT busy (`438.6us`/`71` launches here vs `309.4us`/
-  `48` launches on `D2`) — the eager-LN-affine "leak" this module's own
-  docstring section "D1-vs-D2 differential: the measured split" describes
-  (a real, non-zero `D1 > D2` delta the differential test now asserts
-  directly, byte-for-byte from the same real export).
+- `affine_f32` at `grid=[900,1,1]` (`out_shape_elements`) so that
+  `Ln1VsD2DifferentialTests` has a REAL `ELEMENTWISE-OTHER-OUT` row
+  present on BOTH this leg and its `D2` twin, at DIFFERENT busy (more
+  launches here than on `D2`) — the eager-LN-affine "leak" this module's
+  own docstring section "D1-vs-D2 differential: the measured split"
+  describes (a real, non-zero `D1 > D2` delta the differential test
+  asserts directly, byte-for-byte from the same real export).
 
-None of the 15 rows' timing fields are asserted as literal expected values
-anywhere in the test suite.
+Only `badd_f32`'s own `launches_per_step` at `grid=[900,1,1]` is asserted
+as a literal value anywhere (`test_badd_ladder_launches_per_step_by_tower`,
+reading this leg's own point on the cross-leg launch-count ladder straight
+off this committed fixture); no other row's timing fields are asserted as
+literal expected values anywhere in the test suite.

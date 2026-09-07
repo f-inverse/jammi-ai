@@ -13,7 +13,7 @@ scratchpad/pod421-run2/legs/clip-text-A1/census.json
 NOT git-tracked (it lives in a scratch pull directory, not a branch), so it
 could not be `git show`n the way `p6_fa2_dense_raw_runs/`'s fixtures were —
 the cut below was made with a short `python3 -c` script reading the pulled
-file directly and writing out ONLY the 16 `by_kernel_and_grid` rows this
+file directly and writing out ONLY the `by_kernel_and_grid` rows this
 crate's tests need, byte-for-byte from the real export (no hand-edited
 field), plus the leg's own top-level `gpu_kernel_us_per_step` /
 `wall_s_per_step`:
@@ -41,6 +41,11 @@ wanted = [
     # `outside_signature_plausibly_attention` field's own "a present (not
     # absent) PERMUTE/RESHAPE bucket" test — see below.
     ("ucopy_f32", [924, 1, 1]),
+    # The ONE real `badd_f32` row at the `out` tier shape, needed by
+    # `test_badd_ladder_launches_per_step_by_tower`
+    # (`Ln1VsD2DifferentialTests`) to assert this leg's own point on the
+    # cross-leg launch-count ladder at that grid.
+    ("badd_f32", [924, 1, 1]),
 ]
 ```
 
@@ -83,23 +88,30 @@ likewise now FALLS THROUGH pass 1's GELU-shape gate (unchanged: it is still
 excluded from `C-GELU`) into the attention tensor's own elementwise tier
 (`attn_shape_elements() = rows*heads*seq*seq = 1,138,368`, which
 `1,138,688` covers) -> `C-ATTN-clip-text`, per `classify_kernel`'s
-documented "fall through" behavior. 15 of this fixture's 16 rows and their
-grids are UNCHANGED from pass 1 (nothing was re-cut) — only which chain
+documented "fall through" behavior. The rows already in this fixture's
+list keep their original grids unchanged from pass 1 — only which chain
 each classifies into changed, per the new rules `test_profile_421_attribute.py`
-now asserts. The 16th row (`ucopy_f32` at `grid=[924,1,1]`, the `out` tier
-shape) is a pass-3 addition, real and byte-for-byte from the same export:
+now asserts. The `ucopy_f32` row (`grid=[924,1,1]`, the `out` tier shape)
+is a pass-3 addition, real and byte-for-byte from the same export:
 `ucopy_f32`/`copy2d_f32` get their OWN `PERMUTE/RESHAPE` bucket now (module
 doc, "split by kernel NAME-CLASS"), and this row lets the fixture exercise
 `outside_signature_plausibly_attention`'s mirroring of a NON-`"absent"`
 `PERMUTE/RESHAPE` entry directly (the BF16 `clip-text-A2` fixture's own
 `Kernel2`/`badd_bf16` rows never include a `ucopy`/`copy2d` name, so that
-fixture alone could not exercise this).
+fixture alone could not exercise this). The `badd_f32` row at that same
+`grid=[924,1,1]` shape is likewise real and byte-for-byte from the same
+export, added so this leg's own point on the `badd_f32` launch-count
+ladder (module doc, "D1-vs-D2 differential") is present here alongside
+the `D1`/`D2` legs' own points.
 
-None of the 16 rows' `us_per_step`/`launches_per_step`/`share` fields are
-asserted as literal expected values anywhere in
-`test_profile_421_attribute.py` — only structural invariants (which chain a
-row lands in, that shares sum `<= 1`, that every declared chain is present)
-are asserted, per this crate's "never transcribe a timing number into a
-test" convention. The timing fields are kept in the fixture only because
-they are what a real export actually contains (never deleted to make the
-fixture "look" hermetic).
+Only `badd_f32`'s own `launches_per_step` at `grid=[924,1,1]` is asserted
+as a literal value anywhere (`test_badd_ladder_launches_per_step_by_tower`,
+reading this leg's own point on the cross-leg launch-count ladder straight
+off this committed fixture); no other row's `us_per_step`/
+`launches_per_step`/`share` field is asserted as a literal expected value
+anywhere in `test_profile_421_attribute.py` — otherwise only structural
+invariants (which chain a row lands in, that shares sum `<= 1`, that every
+declared chain is present) are asserted, per this crate's "never
+transcribe a timing number into a test" convention. The timing fields are
+kept in the fixture only because they are what a real export actually
+contains (never deleted to make the fixture "look" hermetic).

@@ -33,11 +33,11 @@ adversarial-audit finding 2), on the SECOND tower.
   BOTH legs of the pair — the differential test's own "not everything
   moves" control).
 - `badd_f32` at `grid=[900,1,1]` — `launches_per_step=633` here, `865` on
-  `clip-vision-d1` (adversarial re-audit, finding 2: NOT run-to-run count
-  noise — this is the SAME deterministic `337(A1) -> 633(D2) -> 874(D1)`
-  ladder `clip-text` shows identically, evidenced on the real, un-cut
-  `clip-vision-A1` export too; module doc, "D1-vs-D2 differential: the
-  measured split") -> `BIAS/RESIDUAL-OUT`.
+  `clip-vision-d1`: this tower's own `337(A1) -> 633(D2) -> 865(D1)` point
+  on the `badd_f32` launch-count ladder module doc "D1-vs-D2 differential"
+  describes and `test_badd_ladder_launches_per_step_by_tower` asserts,
+  read off this leg and its `clip-vision-A1`/`clip-vision-d1` twins, real
+  and un-cut -> `BIAS/RESIDUAL-OUT`.
 - `ampere_sgemm_128x64_nt`/`ampere_sgemm_128x128_nt`/`magma_sgemmEx_kernel`
   -> `BASE-GEMM`/`C-ATTN-clip-vision` exactly as on `clip-vision-d1`
   (unaffected by the LN toggle, another "does not move" control).
@@ -46,13 +46,16 @@ adversarial-audit finding 2), on the SECOND tower.
   legs (a `dim[1]=1` grid never qualifies for the anonymous-GEMM-tile
   rule, LN toggle or not).
 - `adamw_moment_update_f32` -> `OPTIMIZER`, unchanged.
-- `affine_f32` at `grid=[900,1,1]` -> ADDED post-audit (finding 2's own
-  re-audit), the SAME row `clip-vision-d1`'s own PROVENANCE.md describes
-  — present on BOTH legs at DIFFERENT busy (`309.4us`/`48` launches here
-  vs `438.6us`/`71` launches on `D1`), giving `Ln1VsD2DifferentialTests` a
-  real `ELEMENTWISE-OTHER-OUT` delta to assert directly.
+- `affine_f32` at `grid=[900,1,1]` — the SAME row `clip-vision-d1`'s own
+  PROVENANCE.md describes, present on BOTH legs at DIFFERENT busy (fewer
+  launches here than on `D1`), giving `Ln1VsD2DifferentialTests` a real
+  `ELEMENTWISE-OTHER-OUT` delta to assert directly.
 
-None of the 15 rows' timing fields are asserted as literal expected values
-anywhere in the test suite — only which chain each lands in, and (via the
-paired `clip-vision-d1`/`clip-vision-d2` differential test) the DIRECTION
-`C-LN`'s own busy moves when `layer_norm_fused` toggles.
+Only `badd_f32`'s own `launches_per_step` at `grid=[900,1,1]` is asserted
+as a literal value anywhere (`test_badd_ladder_launches_per_step_by_tower`,
+reading this leg's own point on the cross-leg launch-count ladder straight
+off this committed fixture); no other row's timing fields are asserted as
+literal expected values anywhere in the test suite — only which chain
+each lands in, and (via the paired `clip-vision-d1`/`clip-vision-d2`
+differential test) the DIRECTION `C-LN`'s own busy moves when
+`layer_norm_fused` toggles.

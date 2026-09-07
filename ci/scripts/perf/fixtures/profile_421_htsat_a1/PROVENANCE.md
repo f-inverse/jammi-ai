@@ -57,11 +57,10 @@ tier before the `mlp` tier (module doc), so a row at one of these TWO
 grids always resolves `BIAS/RESIDUAL-OUT`/`ELEMENTWISE-OTHER-OUT`/
 `PERMUTE/RESHAPE`, never the MLP-tier bucket — this is a DELIBERATE,
 DOCUMENTED priority choice, not a verified disambiguation (the real
-`badd_f32 grid=[9216,...]` row's own `launches_per_step=145` is far larger
-than any other single-stage bias-add on this leg, plausibly because it is
-ACTUALLY stage 2's own MLP bias, not stage 0's residual — this module does
-not have a shape-only way to tell the two apart and does not guess). This
-fixture therefore avoids `9216`/`4608` for its own `BIAS/RESIDUAL-OUT`/
+`badd_f32 grid=[9216,...]` row could plausibly be stage 2's own MLP bias
+rather than stage 0's residual — this module does not have a shape-only
+way to tell the two apart and does not guess). This fixture therefore
+avoids `9216`/`4608` for its own `BIAS/RESIDUAL-OUT`/
 `ELEMENTWISE-OTHER` test rows (using the UNAMBIGUOUS `2304`/`1152` grids,
 stages 2/3's own `out` tier, which have no stage-4/5 MLP to collide with)
 and instead documents the collision here rather than papering over it with

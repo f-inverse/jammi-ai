@@ -83,5 +83,9 @@ numbers would fail here:
   `UNATTRIBUTED` — all unchanged rules, re-confirmed on this tower's own
   numbers.
 
-None of the 21 rows' timing fields are asserted as literal values anywhere
-in the test suite — only which chain each lands in.
+Only `badd_f32`'s own `launches_per_step` at `grid=[900,1,1]` is asserted
+as a literal value anywhere (`test_badd_ladder_launches_per_step_by_tower`,
+reading this leg's own point on the cross-leg launch-count ladder straight
+off this committed fixture); no other row's timing fields are asserted as
+literal values anywhere in the test suite — only which chain each lands
+in.

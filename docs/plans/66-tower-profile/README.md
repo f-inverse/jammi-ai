@@ -115,7 +115,7 @@ on either side.
   20-22% of wall on the F32/BF16 decision legs."
 - **`clip-launch-bound-batch8`**: "At batch 8 the CLIP training steps are launch-bound:
   3638-3722 launches/step across the four F32/BF16 A-arm CLIP legs (text and vision);
-  switching to BF16 cuts GPU busy -32...-41% per tower while wall drops only -4...-5%."
+  switching to BF16 cuts GPU busy by 32-41% per tower while wall drops by only 4-5%."
 - **`c-attn-htsat-out-of-tier`**: "C-ATTN-HTSAT is measured, not a candidate port: 33% of
   GPU busy (~5% of wall) on the F32 decision leg (htsat-A1). HTSAT attention (head_dim 24
   at every stage) sits OUTSIDE the fixed-head-dim port tier by the contract's own
@@ -168,7 +168,7 @@ mechanism, only points at it.
 | — (pending) | `perf/421-artifact` | **this unit**: the close-out artifact, the frozen contract copy, this README, the guide/CHANGELOG/maintainer-guide updates |
 | #471 (open) | `perf/421-frontend` | The HTSAT/CLIP-vision front-end finding's follow-on: parallelizes the media front end across rayon's global pool |
 | #472 (open) | `perf/421-followups` | Other close-out follow-ups from this profile |
-| — (pending) | `cookbook/421-tower-chapter` | The cookbook chapter for the tower training-step profile |
+| #473 (open) | `cookbook/421-tower-chapter` | The cookbook chapter for the tower training-step profile (lands after #471 merges) |
 
 Landing status is stated as of this docs commit; an "(open)" PR that merges before this
 unit's own PR lands is updated by the lead at merge time, not backfilled here.

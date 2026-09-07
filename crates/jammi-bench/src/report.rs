@@ -2409,29 +2409,24 @@ pub struct FinetuneRunTier {
     /// classification every dispatch counter and [`Self::train_run_wall_s`]
     /// itself carry.
     ///
-    /// `null` on EVERY leg this build can produce, for one stated reason:
-    /// the measurement lives entirely inside `jammi-ai`'s
-    /// `TrainingLoop::run()` (`crates/jammi-ai/src/fine_tune/trainer.rs`'s
-    /// `encode_media`, lines ~1786-1815 — the two `*_encoder_input` arms),
-    /// and `TrainingResult` exposes no timing seam for this crate to read
-    /// it through (`artifact_dir`/`final_loss`/`total_steps`/`metrics_json`/
-    /// `epoch_checkpoints` — that is the whole struct). `jammi-ai` is
-    /// ai-core's crate, so this producer does NOT reach in and add one;
-    /// the field is declared here, `null`, with the seam it needs named,
-    /// rather than silently derived as `train_run_wall_s − gpu_busy` (a
-    /// DIFFERENCE is not a measurement: it absorbs launch latency, sync
-    /// stalls, and the optimizer's own CPU time into a number labelled
-    /// "front end"). The pending one-field seam: accumulate
-    /// `Instant::now()`/`elapsed()` around `encode_media`'s `let input =
-    /// match self.task {..}` into an interior-mutable counter on
-    /// `TrainingLoop` (an `AtomicU64` of nanoseconds — `encode_media`
-    /// takes `&self`) and surface it as
-    /// `TrainingResult::media_front_end_wall: std::time::Duration` at that
-    /// file's `TrainingResult` construction (~line 1360); this producer
-    /// then sums it across epoch legs exactly as it already sums
-    /// [`Self::train_run_wall_s`] and reports `Some`. A text-task leg
-    /// stays `null` either way — it never enters the media front end at
-    /// all, so `0.0` would be a claim about a path that never ran.
+    /// A DIRECT measurement, never `train_run_wall_s − gpu_busy`: a
+    /// DIFFERENCE would absorb launch latency, sync stalls and the
+    /// optimizer's own CPU time into a number labelled "front end". Read
+    /// from `jammi_ai::fine_tune::trainer::TrainingResult::media_front_end_wall`
+    /// (the seam ai-core landed for this field) and SUMMED across every
+    /// resume-cycled epoch leg here, because `TrainingLoop::run` resets its
+    /// accumulator at the start of every call — that field's own doc makes
+    /// the summing the caller's job. Because the measurement is taken
+    /// INSIDE `run()`, this is a strict subset of the span
+    /// [`Self::train_run_wall_s`] covers, which is what lets a profile
+    /// report `launch/sync residual = wall − front − busy`.
+    ///
+    /// `null` on a TEXT leg, and deliberately not `0.0`: the trainer reports
+    /// `Duration::ZERO` there by construction (tokenization is not a media
+    /// front end and stays in the residual), so `0.0` would claim a path was
+    /// timed that never ran — a reader could not tell "this tower has no
+    /// media front end" from "this tower's media front end cost nothing".
+    /// Non-null on every `image_embedding`/`audio_embedding` leg.
     pub media_front_end_wall_s: Option<f64>,
 
     // ── Mutant provenance (unit 63 round-7 audit, finding 1) — honest

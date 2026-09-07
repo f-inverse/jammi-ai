@@ -151,12 +151,12 @@ CLAP_FULL="query,key,value,attention_output,intermediate_dense,output_dense,redu
 #   CLIP D1  = lora_linear_fused + layer_norm_fused  -> C-LN = D1 - D2
 #   HTSAT D1 = those two + gelu_erf_fused            -> C-LN + C-GELU = D1 - D2
 #
-# The HTSAT D1 leg additionally PRESUPPOSES P1-a (HTSAT's MLP routed through
-# `activations::gelu_erf(x, training)` rather than calling `Tensor::gelu_erf`
-# directly at `htsat_audio.rs:1064`/`:1635`). If P1-a has not landed, that
-# leg refuses with "gelu_erf_fused ... never disabled a live dispatch this
-# run" -- the CORRECT outcome (the leg is invalid, not a datum), recorded in
-# its manifest while the other 11 legs continue.
+# The HTSAT D1 leg PRESUPPOSES P1-a (HTSAT's two GELU sites routed through
+# the house `activations::gelu_erf(x, training)` seam rather than calling
+# `Tensor::gelu_erf` directly), which landed on this branch. Were it ever
+# reverted, that leg would refuse with "gelu_erf_fused ... never disabled a
+# live dispatch this run" -- the CORRECT outcome (the leg is invalid, not a
+# datum), recorded in its manifest while the other 11 legs continue.
 D1_KEYS_CLIP="lora_linear_fused,layer_norm_fused"
 D1_KEYS_HTSAT="lora_linear_fused,layer_norm_fused,gelu_erf_fused"
 D2_KEYS="lora_linear_fused"
@@ -472,6 +472,14 @@ tier["lora_epilogue_eager_dispatches"] = 1
 if task != "text_embedding":
     tier["train_media_sha256"] = "a" * 64
     tier["heldout_media_sha256"] = "b" * 64
+    # The DIRECT front-end timer: a real producer reports it non-null on a
+    # media leg and NULL on a text one (`Duration::ZERO` there is not a
+    # measurement of anything -- see the field'"'"'s own doc), so the fake
+    # mirrors that split and this driver'"'"'s reader is exercised on BOTH arms.
+    # Proportional to steps, like the wall above, and strictly under it.
+    tier["media_front_end_wall_s"] = 0.004 * steps_measured
+else:
+    tier["media_front_end_wall_s"] = None
 report = {"tool": "dry-run", "profile_421_dry_run": True, "tiers": {"finetune_run": tier}}
 json.dump(report, sys.stdout)
 ' "$1" "$2" "$3" "$4"

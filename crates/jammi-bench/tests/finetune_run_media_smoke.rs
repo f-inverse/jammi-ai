@@ -265,6 +265,40 @@ fn assert_well_formed_media_report(stdout: &str, task: &str) {
             );
         }
     }
+    // Issue #421 P1-b(v): the DIRECT media front-end timer. On a media leg
+    // it must be a real, positive, FINITE measurement that is STRICTLY LESS
+    // than the run's own training wall (it is measured inside
+    // `TrainingLoop::run`, so it is a subset of that span) -- checking mere
+    // presence would pass on a hardcoded 0.0, and checking `> 0.0` alone
+    // would pass on a NaN-free-but-absurd value larger than the whole run.
+    // On a TEXT leg it must be `null`, never `0.0`: the two mean different
+    // things (see the field's own doc), and a producer stamping `0.0`
+    // everywhere would satisfy a presence-only check on both.
+    let train_wall = tier["train_run_wall_s"]
+        .as_f64()
+        .unwrap_or_else(|| panic!("{task}: train_run_wall_s must be a number"));
+    if is_media {
+        let front = tier["media_front_end_wall_s"].as_f64().unwrap_or_else(|| {
+            panic!("{task}: media_front_end_wall_s must be a number on a media leg")
+        });
+        assert!(
+            front.is_finite() && front > 0.0,
+            "{task}: the media front end DID run (this leg decodes real PNG/WAV bytes), so its \
+             measured wall must be positive and finite, got {front}"
+        );
+        assert!(
+            front < train_wall,
+            "{task}: the front-end timer is measured INSIDE TrainingLoop::run, so it must be \
+             strictly less than train_run_wall_s ({front} vs {train_wall})"
+        );
+    } else {
+        assert!(
+            tier["media_front_end_wall_s"].is_null(),
+            "{task}: a text leg never enters the media front end, so this must be null (not \
+             0.0, which would claim a path was timed that never ran), got {}",
+            tier["media_front_end_wall_s"]
+        );
+    }
     // Not merely present but DISTINCT: the train split and the held-out
     // fixture are different row sets here, so a digest helper that ignored
     // its argument (or hashed the manifest twice) would collide.

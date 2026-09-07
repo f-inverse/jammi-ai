@@ -1901,6 +1901,11 @@ fn run_impl(
     // resume-checkpoint fetch/restore, and every `evaluate_held_out` call,
     // all of which are separate statements outside this timer's span below).
     let mut train_run_wall_s = 0.0f64;
+    // The DIRECT media decode/preprocess wall (contract P1-b(v)), summed the
+    // same way across every resume-cycled epoch leg — see the accumulation
+    // site below and `crate::report::FinetuneRunTier::media_front_end_wall_s`'s
+    // own doc for the measured boundary.
+    let mut media_front_end_wall_s = 0.0f64;
     let mut last_final_loss = 0.0f64;
     let mut last_held_out = None;
     // Test-only (see `run_impl`'s own doc): the final epoch's `VarMap`
@@ -2030,6 +2035,18 @@ fn run_impl(
         let train_run_t0 = Instant::now();
         let result = training_loop.run(&train_loader)?;
         train_run_wall_s += train_run_t0.elapsed().as_secs_f64();
+        // The DIRECT media front-end wall (contract P1-b(v)), summed across
+        // resume legs exactly as `train_run_wall_s` above is —
+        // `TrainingResult::media_front_end_wall`'s own doc requires it:
+        // `TrainingLoop::run` RESETS its accumulator at the start of every
+        // call, so a caller driving `params.epochs` legs must add them up
+        // itself rather than reading the last leg's value as the run's.
+        //
+        // The measurement lives inside `run()`, so it is a strict subset of
+        // the span `train_run_wall_s` times — never a `wall - busy`
+        // difference, which would absorb launch latency, sync stalls and the
+        // optimizer's own CPU time into a number labelled "front end".
+        media_front_end_wall_s += result.media_front_end_wall.as_secs_f64();
         cumulative_steps += result.total_steps;
         last_final_loss = result.final_loss;
 
@@ -2363,14 +2380,17 @@ fn run_impl(
         trajectory: trajectory.points,
         train_probe_series,
         train_run_wall_s,
-        // `None` on every leg this build can produce — the measurement
-        // lives inside `jammi-ai`'s `TrainingLoop::encode_media` and
-        // `TrainingResult` exposes no seam to read it through; see
-        // `crate::report::FinetuneRunTier::media_front_end_wall_s`'s own doc
-        // for the exact one-field addition that would fill it, and for why
-        // this producer does not derive it as `train_run_wall_s - gpu_busy`
-        // instead.
-        media_front_end_wall_s: None,
+        // MEASURED on a media task, `None` on a text one — never `Some(0.0)`
+        // there: the trainer reports `Duration::ZERO` for a text run by
+        // construction (tokenization is not a media front end and stays in
+        // the residual), and reporting that as a measured zero would claim a
+        // path was timed that never ran. The null/zero distinction is what a
+        // downstream reader needs to tell "this tower has no media front
+        // end" from "this tower's media front end cost nothing".
+        media_front_end_wall_s: match params.task {
+            Task::Text => None,
+            Task::Image | Task::Audio => Some(media_front_end_wall_s),
+        },
         mutant_id,
         mutant_base_sha,
         mutant_patch_sha256,

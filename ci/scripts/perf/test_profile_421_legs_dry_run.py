@@ -298,17 +298,33 @@ class DryRunSmokeTests(unittest.TestCase):
             self.assertIn("train_run_wall_s", tier)
             self.assertEqual(tier["task"], "image_embedding")
 
-    def test_media_front_end_wall_is_recorded_as_null_when_the_seam_is_absent(self):
-        """P1-b(v): the direct front-end timer is read off the report, never
-        back-filled from `wall - busy`. The committed golden the dry-run
-        fake is derived from predates the `jammi-ai` seam, so both entries
-        must read `null` -- "not measured", explicitly, rather than a
-        fabricated 0.0 a consumer could not tell from a real zero."""
+    def test_media_front_end_wall_is_read_off_the_report_on_both_arms(self):
+        """P1-b(v): the direct front-end timer is READ off each run's report,
+        never back-filled from `wall - busy` (a difference is not a
+        measurement). A media leg carries a real number for both the N and
+        the M run; a TEXT leg carries `null` on both -- the trainer reports
+        `Duration::ZERO` there by construction, which is not a measurement
+        of anything, and a fabricated 0.0 would be indistinguishable from a
+        real zero. Both arms are asserted so the reader cannot pass by
+        degrading everything to null."""
         with tempfile.TemporaryDirectory() as out_dir:
-            result = run_dry(out_dir, legs_only="htsat-A1")
+            result = run_dry(out_dir, legs_only="htsat-A1,clip-vision-A1,clip-text-A1")
             self.assertEqual(result.returncode, 0, _fail_msg(result))
-            manifest = _manifest(out_dir, "htsat-A1")
-            self.assertEqual(manifest["media_front_end_wall_s"], {"n": None, "m": None}, manifest)
+            for leg_id in ("htsat-A1", "clip-vision-A1"):
+                front = _manifest(out_dir, leg_id)["media_front_end_wall_s"]
+                for run in ("n", "m"):
+                    self.assertIsInstance(front[run], float, f"{leg_id} {run}: {front}")
+                    self.assertGreater(front[run], 0.0, f"{leg_id} {run}: {front}")
+                self.assertLess(
+                    front["n"], front["m"],
+                    f"{leg_id}: the M run decodes 6x the rows, so its front-end wall must exceed "
+                    f"the N run's: {front}",
+                )
+            self.assertEqual(
+                _manifest(out_dir, "clip-text-A1")["media_front_end_wall_s"],
+                {"n": None, "m": None},
+                "a text leg has no media front end at all",
+            )
 
     def test_legs_only_filter_runs_exactly_the_named_legs(self):
         with tempfile.TemporaryDirectory() as out_dir:

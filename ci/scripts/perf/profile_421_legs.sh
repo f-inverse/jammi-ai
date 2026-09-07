@@ -269,15 +269,42 @@ _print_cmd() {
 }
 
 # --- state-changing command wrapper: echoes what it would run (stderr);
-# under DRY_RUN never executes. Used for invocations whose stdout is never
-# captured into a report file (corpus generation, `kernel_census.py`).
-# `run_traced`'s own nsys/bench invocation does NOT go through this.
+# under DRY_RUN never executes. Used for invocations that need `$NSYS_BIN`/
+# `$BENCH_BIN` or otherwise cannot run hermetically (`kernel_census.py`,
+# which reads a real `nsys`-exported sqlite that only exists on a real
+# run). Corpus generation uses `run_corpus_cmd` below instead -- see
+# esc-088. `run_traced`'s own nsys/bench invocation does NOT go through
+# either wrapper.
 run_cmd() {
   _print_cmd "$@"
   if [ "$PROFILE_421_LEGS_DRY_RUN" = "1" ]; then
     return 0
   fi
   "$@"
+}
+
+# --- corpus-producer wrapper: unlike `run_cmd`, this ALWAYS executes, even
+# under `PROFILE_421_LEGS_DRY_RUN=1` -- the three corpus producers
+# (`gen_fixed_width_corpus.py` and the two media producers) are CPU-
+# hermetic (no GPU, no network, no `$NSYS_BIN`/`$BENCH_BIN`) and cheap: each
+# writes a FIXED family x instances-per-family media pool regardless of
+# `--rows` (`preflight_probe` above already runs all three for real on
+# every non-dry invocation, at an even smaller scale, for exactly this
+# reason). Running them for real under DRY_RUN too is what makes
+# `test_profile_421_legs_dry_run.py` exercise `provision_corpus`'s own
+# nameref-out-parameter path with a REAL producer's real stdout, rather
+# than a path that never ran hermetically at all (esc-088,
+# `.jammi/escapes.jsonl`): under the OLD behaviour (touch empty placeholder
+# files, never invoke the producer, under DRY_RUN) no producer ever wrote a
+# byte of real stdout in any hermetic test, so a stdout-capture bug in
+# `provision_corpus` was invisible to the whole suite and only surfaced on
+# a real pod run. The child's own stdout is forwarded to THIS SCRIPT's
+# stderr -- the same place `_print_cmd`'s trace line already goes, and for
+# the same reason: never leave it on a channel a future capture point
+# could pick up again.
+run_corpus_cmd() {
+  _print_cmd "$@"
+  "$@" >&2
 }
 
 # --- provenance cross-check (unification contract C5.1): refuse BEFORE any
@@ -564,13 +591,29 @@ FAKE_NSYS_EOF
 #!/usr/bin/env bash
 set -euo pipefail
 # $1=steps_measured $2=golden_json_path $3=task $4=disable_keys(csv, may be
-# empty) $5=lora_init $6=backbone_dtype -- emits the golden-derived Report
-# envelope on ITS OWN stdout
+# empty) $5=lora_init $6=backbone_dtype $7=heldout_ids_path -- emits the
+# golden-derived Report envelope on ITS OWN stdout
 # (never writes a file directly), so the exec-wrapper's own "redirect this
 # child's stdout to the report file" mechanism is what actually produces
 # the report, for real. The overridden fields are exactly the ones this
 # driver's own readers consume, so a reader bug is exercised here rather
 # than papered over.
+#
+# esc-088 (`.jammi/escapes.jsonl`): $7 mirrors the REAL `finetune-run`'s own
+# `--heldout-ids <HELDOUT_IDS>` refusal -- a non-empty, EXISTING path is
+# required, exactly what clap's "a value is required ... but none was
+# supplied" enforces on a real pod run. `provision_corpus`'s stdout-capture
+# bug used to hand this driver an EMPTY `heldout_ids`, which every real leg
+# then passed straight through to a real `finetune-run` and every real leg
+# refused; the DRY_RUN path never caught it because nothing on this path
+# ever inspected the value. This stub now refuses the same way, so a
+# regression back to an empty/garbled `--heldout-ids` fails HERE, hermetically,
+# rather than only on a GPU pod.
+heldout_ids_path="${7:-}"
+if [ -z "$heldout_ids_path" ] || [ ! -f "$heldout_ids_path" ]; then
+  echo "error: a value is required for '--heldout-ids <HELDOUT_IDS>' but none was supplied (got '${heldout_ids_path}')" >&2
+  exit 2
+fi
 python3 -c '
 import copy, json, os, sys
 steps_measured, golden_path, task, disable_csv, lora_init, dtype = (
@@ -855,7 +898,7 @@ run_traced() {
     exec_cmd=(
       "${env_prefix[@]}"
       "$DRY_RUN_STUB_DIR/fake_bench.sh" "$steps_this_run" "$GOLDEN_FIXTURE" "$task" \
-        "$disable_keys" "$LORA_INIT" "$dtype"
+        "$disable_keys" "$LORA_INIT" "$dtype" "$heldout_ids"
     )
   fi
 
@@ -884,9 +927,29 @@ run_traced() {
 }
 
 # One leg's corpus pair (N and M) plus its held-out split, per TOWER.
-# Echoes "train_n<TAB>train_m<TAB>heldout_ids<TAB>heldout_jsonl" on success;
-# returns nonzero (with a stderr message) on failure, which `run_leg`
-# records as this leg's own INVALID reason.
+# Sets the CALLER's own train_n/train_m/heldout_ids/heldout_jsonl variables
+# via bash nameref out-parameters ($3-$6) -- NEVER this function's own
+# stdout; returns nonzero (with a stderr message) on failure, which
+# `run_leg` records as this leg's own INVALID reason.
+#
+# esc-088 (`.jammi/escapes.jsonl`): this function used to ECHO its 4-tuple
+# ("train_n<TAB>train_m<TAB>heldout_ids<TAB>heldout_jsonl") on ITS OWN
+# stdout, and `run_leg` captured the WHOLE function call with
+# `corpus_line="$(provision_corpus ...)"`. But the three real producers
+# (`gen_fixed_width_corpus.py`, the two media producers) ALSO print their
+# own one-line summary to stdout, and (at the time) that summary was never
+# redirected away -- `run_leg`'s command substitution therefore captured
+# the producer's summary line as its FIRST line and the tuple as its
+# SECOND, and `IFS=$'\t' read -r train_n train_m heldout_ids heldout_jsonl
+# <<< "$corpus_line"` only ever sees the first line: `train_n` became the
+# producer's prose, `heldout_ids` came out empty, and every real leg's
+# `finetune-run` invocation refused with `--heldout-ids` missing. Nameref
+# out-parameters carry no stdout at all, so there is no shared channel left
+# for a producer's own report to land on -- structural, not a per-call
+# redirect a future new producer could bypass by omission. See also
+# `run_corpus_cmd` below, which is what actually runs these producers now
+# (even under `PROFILE_421_LEGS_DRY_RUN=1`, unlike `run_cmd`) so this
+# capture-free path is itself hermetically exercised.
 #
 # The N corpus is a PREFIX of the M corpus for text (the producer's own
 # stream property) and a smaller row list over the SAME image/audio files
@@ -912,6 +975,7 @@ run_traced() {
 # producer and asserts no held-out anchor text appears in either train file.
 provision_corpus() {
   local tower="$1" leg_dir="$2"
+  local -n _pc_train_n="$3" _pc_train_m="$4" _pc_heldout_ids="$5" _pc_heldout_jsonl="$6"
   local rows_n=$(( BATCH * STEPS_N ))
   local rows_m=$(( BATCH * STEPS_M ))
   local dir_n="$leg_dir/corpus_n" dir_m="$leg_dir/corpus_m"
@@ -919,56 +983,48 @@ provision_corpus() {
   case "$tower" in
     clip-text)
       mkdir -p "$dir_n" "$dir_m"
-      run_cmd python3 "$DIR/gen_fixed_width_corpus.py" --rows "$rows_n" \
+      run_corpus_cmd python3 "$DIR/gen_fixed_width_corpus.py" --rows "$rows_n" \
         --min-wordpieces "$CLIP_TEXT_SEQ" --seed "$SEED" --out "$dir_n/train.jsonl" \
         --heldout-rows "$HELDOUT_ROWS" --heldout-batch "$BATCH" || return 1
-      run_cmd python3 "$DIR/gen_fixed_width_corpus.py" --rows "$rows_m" \
+      run_corpus_cmd python3 "$DIR/gen_fixed_width_corpus.py" --rows "$rows_m" \
         --min-wordpieces "$CLIP_TEXT_SEQ" --seed "$SEED" --out "$dir_m/train.jsonl" \
         --heldout-rows "$HELDOUT_ROWS" --heldout-batch "$BATCH" || return 1
-      if [ "$PROFILE_421_LEGS_DRY_RUN" = "1" ]; then
-        : > "$dir_n/train.jsonl"; : > "$dir_m/train.jsonl"
-        : > "$dir_m/heldout_ids.txt"; : > "$dir_m/heldout_triplets.jsonl"
-      fi
       # `$dir_m`, NOT `$dir_n` -- see this function's own doc: only the M
       # corpus's held-out slice is past BOTH train corpora's stream indices.
-      printf '%s\t%s\t%s\t%s\n' "$dir_n/train.jsonl" "$dir_m/train.jsonl" \
-        "$dir_m/heldout_ids.txt" "$dir_m/heldout_triplets.jsonl"
+      _pc_train_n="$dir_n/train.jsonl"
+      _pc_train_m="$dir_m/train.jsonl"
+      _pc_heldout_ids="$dir_m/heldout_ids.txt"
+      _pc_heldout_jsonl="$dir_m/heldout_triplets.jsonl"
       ;;
     clip-vision)
-      run_cmd python3 "$DIR/gen_fixed_shape_image_corpus.py" --rows "$rows_n" \
+      run_corpus_cmd python3 "$DIR/gen_fixed_shape_image_corpus.py" --rows "$rows_n" \
         --size "$IMAGE_SIZE" --seed "$SEED" --out-dir "$dir_n" \
         --families "$MEDIA_FAMILIES" --heldout-families "$MEDIA_HELDOUT_FAMILIES" \
         --heldout-rows "$HELDOUT_ROWS" --heldout-batch "$BATCH" || return 1
-      run_cmd python3 "$DIR/gen_fixed_shape_image_corpus.py" --rows "$rows_m" \
+      run_corpus_cmd python3 "$DIR/gen_fixed_shape_image_corpus.py" --rows "$rows_m" \
         --size "$IMAGE_SIZE" --seed "$SEED" --out-dir "$dir_m" \
         --families "$MEDIA_FAMILIES" --heldout-families "$MEDIA_HELDOUT_FAMILIES" \
         --heldout-rows "$HELDOUT_ROWS" --heldout-batch "$BATCH" || return 1
-      if [ "$PROFILE_421_LEGS_DRY_RUN" = "1" ]; then
-        mkdir -p "$dir_n" "$dir_m"
-        : > "$dir_n/triplets.jsonl"; : > "$dir_m/triplets.jsonl"
-        : > "$dir_n/heldout_ids.txt"; : > "$dir_n/heldout_triplets.jsonl"
-      fi
-      printf '%s\t%s\t%s\t%s\n' "$dir_n/triplets.jsonl" "$dir_m/triplets.jsonl" \
-        "$dir_n/heldout_ids.txt" "$dir_n/heldout_triplets.jsonl"
+      _pc_train_n="$dir_n/triplets.jsonl"
+      _pc_train_m="$dir_m/triplets.jsonl"
+      _pc_heldout_ids="$dir_n/heldout_ids.txt"
+      _pc_heldout_jsonl="$dir_n/heldout_triplets.jsonl"
       ;;
     htsat)
-      run_cmd python3 "$DIR/gen_fixed_length_audio_corpus.py" --rows "$rows_n" \
+      run_corpus_cmd python3 "$DIR/gen_fixed_length_audio_corpus.py" --rows "$rows_n" \
         --seconds "$AUDIO_SECONDS" --sample-rate "$AUDIO_SAMPLE_RATE" --seed "$SEED" \
         --out-dir "$dir_n" --families "$MEDIA_FAMILIES" \
         --heldout-families "$MEDIA_HELDOUT_FAMILIES" \
         --heldout-rows "$HELDOUT_ROWS" --heldout-batch "$BATCH" || return 1
-      run_cmd python3 "$DIR/gen_fixed_length_audio_corpus.py" --rows "$rows_m" \
+      run_corpus_cmd python3 "$DIR/gen_fixed_length_audio_corpus.py" --rows "$rows_m" \
         --seconds "$AUDIO_SECONDS" --sample-rate "$AUDIO_SAMPLE_RATE" --seed "$SEED" \
         --out-dir "$dir_m" --families "$MEDIA_FAMILIES" \
         --heldout-families "$MEDIA_HELDOUT_FAMILIES" \
         --heldout-rows "$HELDOUT_ROWS" --heldout-batch "$BATCH" || return 1
-      if [ "$PROFILE_421_LEGS_DRY_RUN" = "1" ]; then
-        mkdir -p "$dir_n" "$dir_m"
-        : > "$dir_n/triplets.jsonl"; : > "$dir_m/triplets.jsonl"
-        : > "$dir_n/heldout_ids.txt"; : > "$dir_n/heldout_triplets.jsonl"
-      fi
-      printf '%s\t%s\t%s\t%s\n' "$dir_n/triplets.jsonl" "$dir_m/triplets.jsonl" \
-        "$dir_n/heldout_ids.txt" "$dir_n/heldout_triplets.jsonl"
+      _pc_train_n="$dir_n/triplets.jsonl"
+      _pc_train_m="$dir_m/triplets.jsonl"
+      _pc_heldout_ids="$dir_n/heldout_ids.txt"
+      _pc_heldout_jsonl="$dir_n/heldout_triplets.jsonl"
       ;;
     *)
       echo "::error::provision_corpus: unknown tower '$tower'" >&2
@@ -1128,10 +1184,7 @@ run_leg() {
   local leg_reason=""
   local train_n="" train_m="" heldout_ids="" heldout_jsonl=""
 
-  local corpus_line
-  if corpus_line="$(provision_corpus "$tower" "$leg_dir")"; then
-    IFS=$'\t' read -r train_n train_m heldout_ids heldout_jsonl <<< "$corpus_line"
-  else
+  if ! provision_corpus "$tower" "$leg_dir" train_n train_m heldout_ids heldout_jsonl; then
     leg_status="invalid"
     leg_reason="corpus provisioning failed for tower $tower (see this leg's stderr above)"
   fi
@@ -1367,7 +1420,7 @@ p2_run_one() {
   if [ "$PROFILE_421_LEGS_DRY_RUN" = "1" ]; then
     exec_cmd=(
       "$DRY_RUN_STUB_DIR/fake_bench.sh" 2 "$GOLDEN_FIXTURE" "$task" "" \
-        "$P2_LORA_INIT" "$P2_BACKBONE_DTYPE"
+        "$P2_LORA_INIT" "$P2_BACKBONE_DTYPE" "$heldout_ids"
     )
   fi
 

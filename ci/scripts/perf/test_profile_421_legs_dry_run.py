@@ -428,6 +428,64 @@ class DryRunSmokeTests(unittest.TestCase):
                 "were not, this test would pass no matter which split the driver chose",
             )
 
+    def test_esc_088_corpus_producer_stdout_never_pollutes_the_traced_paths(self):
+        """esc-088 (`.jammi/escapes.jsonl`): `provision_corpus` used to hand
+        `run_leg` its 4-tuple ("train_n<TAB>train_m<TAB>heldout_ids<TAB>
+        heldout_jsonl") over ITS OWN stdout
+        (`corpus_line="$(provision_corpus ...)"` / `IFS=$'\\t' read`), and
+        the three real corpus producers ALSO print a one-line summary to
+        THEIR OWN stdout. On a real pod run that summary line became
+        `train_n` and every other field (`heldout_ids` included) came out
+        empty, and every one of the 12 real legs refused with clap's own
+        "a value is required for '--heldout-ids <HELDOUT_IDS>' but none was
+        supplied" -- while the hermetic dry-run suite stayed green, because
+        under the OLD dry-run behaviour the corpus producers never actually
+        ran (a touch-empty stand-in took their place), so the capture bug
+        never had a producer's real stdout to be polluted BY.
+
+        This test closes that gap for real: the corpus producers now
+        execute for REAL under DRY_RUN too (never a fake stand-in -- they
+        are CPU-hermetic and cheap, see `run_corpus_cmd`), so this drives
+        the actual `provision_corpus` capture path with actual producer
+        stdout. It asserts, off the driver's OWN printed (real,
+        would-be-production) command line, that `--train-jsonl`,
+        `--heldout-ids` and `--heldout-jsonl` each name a REAL, EXISTING,
+        NON-EMPTY file for every N/M run across all three towers -- proving
+        the mechanism, not merely that some file happens to exist (a
+        touch-empty placeholder would pass an `isfile` check but fail the
+        non-empty one)."""
+        with tempfile.TemporaryDirectory() as out_dir:
+            result = run_dry(out_dir, legs_only="clip-text-A1,clip-vision-A1,htsat-A1")
+            self.assertEqual(result.returncode, 0, _fail_msg(result))
+            for leg_id in ("clip-text-A1", "clip-vision-A1", "htsat-A1"):
+                manifest = _manifest(out_dir, leg_id)
+                self.assertEqual(manifest["status"], "ok", manifest)
+                self.assertEqual(manifest["reason"], "", manifest)
+
+            run_cmds = []
+            for line in result.stderr.splitlines():
+                if not line.startswith("+ "):
+                    continue
+                argv = shlex.split(line[2:])
+                if "--heldout-ids" in argv:
+                    run_cmds.append(argv)
+            # 3 towers x 2 runs (N, M) each.
+            self.assertEqual(len(run_cmds), 6, result.stderr)
+            for argv in run_cmds:
+                for flag in ("--train-jsonl", "--heldout-ids", "--heldout-jsonl"):
+                    value = argv[argv.index(flag) + 1]
+                    self.assertTrue(value, f"{flag} is empty on the traced command line: {argv}")
+                    self.assertTrue(
+                        os.path.isfile(value),
+                        f"{flag}={value!r} does not name a real file -- a corpus producer's own "
+                        f"stdout must never leak into this value: {argv}",
+                    )
+                    self.assertGreater(
+                        os.path.getsize(value), 0,
+                        f"{flag}={value!r} exists but is EMPTY -- the real producer must have "
+                        "actually written real content here, not a touch-empty stand-in",
+                    )
+
     def test_each_legs_report_satisfies_the_positive_proof_equation(self):
         """The dry-run reports the capture path actually produces must be
         SHAPED like a real leg's, or this whole suite proves the plumbing

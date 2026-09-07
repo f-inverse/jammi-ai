@@ -24,8 +24,9 @@ tower fails the JOB rather than quietly training zero parameters, and the
 failure message carries this tower's own site names so the fix is a paste.
 
 Model. The default model is the hermetic `tiny_open_clip` fixture so the
-recipe runs offline in CI in well under 60s. The federal use case driving
-this recipe is PatentCLIP — to run against it, set:
+recipe runs offline in CI in well under 60s. A domain-specialized CLIP
+checkpoint is a drop-in when your corpus is technical drawings or diagrams
+rather than photographs — e.g.:
 
     JAMMI_IMAGE_MODEL=patentclip/PatentCLIP_Vit_B
 
@@ -55,8 +56,9 @@ IMAGE_CORPUS_DIR = FIXTURES / "tiny_image_corpus"
 GOLDEN_PATH = FIXTURES / "tiny_image_golden.json"
 
 # Default to the hermetic local fixture so CI runs offline. Override with
-# JAMMI_IMAGE_MODEL=patentclip/PatentCLIP_Vit_B (the federal use case) or any
-# other OpenCLIP-format model ID / `local:<path>`.
+# JAMMI_IMAGE_MODEL=<a domain-specialized checkpoint, e.g.
+# patentclip/PatentCLIP_Vit_B> or any other OpenCLIP-format model ID /
+# `local:<path>`.
 DEFAULT_MODEL = f"local:{FIXTURES / 'tiny_open_clip'}"
 MODEL = os.environ.get("JAMMI_IMAGE_MODEL", DEFAULT_MODEL)
 
@@ -185,7 +187,7 @@ def main() -> int:
         #    eval encodes each golden `query_image`, searches, and reports
         #    Recall@K / MRR per query and in aggregate. We measure and report
         #    — we do NOT assert a quality target (the fixture model has random
-        #    weights; real numbers come from a real model like PatentCLIP).
+        #    weights; real numbers come from a real checkpoint).
         golden_parquet = tmp_path / "golden.parquet"
         pq.write_table(build_image_golden(GOLDEN_PATH), golden_parquet)
         db.add_source("golden", url=str(golden_parquet), format="parquet")

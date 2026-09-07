@@ -20,8 +20,11 @@ text `eval_embeddings` recipe.
 
 ## Model
 
-The example uses **PatentCLIP** as the reference model — it is the federal
-patent-figure-search use case driving this recipe:
+A **domain-specialized CLIP checkpoint** is a drop-in for the reference model
+when your corpus is technical drawings or diagrams rather than photographs — a
+generic CLIP has seen few of them, and a checkpoint tuned on that kind of
+imagery separates them far better. `patentclip/PatentCLIP_Vit_B` on the Hugging
+Face Hub is one such checkpoint:
 
 ```bash
 JAMMI_IMAGE_MODEL=patentclip/PatentCLIP_Vit_B \
@@ -36,8 +39,8 @@ encoder is auto-detected from the model's `open_clip_config.json`.
 By **default** (no env var) the recipe runs against the hermetic
 `cookbook/fixtures/tiny_open_clip` fixture so it runs offline in CI in under a
 few seconds. That fixture has random weights, so its retrieval numbers are
-meaningless — it exercises the full pipeline, not model quality. Use PatentCLIP
-(or any real model) for real numbers.
+meaningless — it exercises the full pipeline, not model quality. Point
+`JAMMI_IMAGE_MODEL` at any real checkpoint for real numbers.
 
 ## What `example.py` does
 
@@ -164,7 +167,7 @@ output) is handled inside the encoder per the model's `preprocess_cfg`.
 - `cookbook/fixtures/tiny_image_corpus/` — 20 synthetic 224×224 PNGs in 5 shape
   families (circle / triangle / square / hexagon / grating), 4 per family, plus
   a held-out query image per family under `queries/`. Rendered programmatically
-  by `cookbook/fixtures/generate.py` — **no real patent imagery** (licensing).
+  by `cookbook/fixtures/generate.py` — **no real-world imagery** (licensing).
 - `cookbook/fixtures/tiny_image_golden.json` — per-query → expected corpus IDs
   (same shape family).
 - `cookbook/fixtures/tiny_open_clip/` — tiny offline OpenCLIP fixture used as

@@ -6,8 +6,9 @@ written by step 01, and builds an L2-normalized vision-embedding index over the
 so step 03 (search) and step 04 (eval) reopen the same dir and reuse them.
 
 The model is auto-detected from its OpenCLIP config. Default is the hermetic
-`tiny_open_clip` fixture; set JAMMI_IMAGE_MODEL=patentclip/PatentCLIP_Vit_B for
-the federal use case.
+`tiny_open_clip` fixture; set JAMMI_IMAGE_MODEL to a domain-specialized
+checkpoint (e.g. patentclip/PatentCLIP_Vit_B) when the corpus is technical
+drawings rather than photographs.
 """
 
 from __future__ import annotations

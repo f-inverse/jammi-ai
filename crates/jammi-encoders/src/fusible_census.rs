@@ -73,20 +73,41 @@ use serde::{Deserialize, Serialize};
 /// witness recorded next to it cannot be re-checked after the fact.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct FusibleSiteCensus {
-    /// How many linear sites the builder actually wrapped in a LoRA adapter
-    /// (`jammi_lora::MaybeLoraLinear::is_lora`), counted over the tower's own
-    /// site traversal — the SAME traversal its adapter export walks, so the
-    /// census cannot see a site set the checkpoint writer does not.
+    /// How many linear sites the built tower's ONE training forward actually
+    /// takes a `lora_linear_fused` admission decision for —
+    /// `jammi_lora::MaybeLoraLinear::takes_lora_linear_admission`, counted
+    /// over the tower's own site traversal — the SAME traversal its adapter
+    /// export walks, so the census cannot see a site set the checkpoint
+    /// writer does not.
+    ///
+    /// This is a NARROWER question than "is this site adapted"
+    /// (`jammi_lora::MaybeLoraLinear::is_lora`, that method's own doc records
+    /// the caveat this field's doc used to omit): `LoraLinear::forward`
+    /// branches on `FrozenBase::Dense` vs `FrozenBase::Quantized` BEFORE it
+    /// ever reaches `admit()`, so a `Lora` site over a `FrozenBase::Quantized`
+    /// base — the shape a QLoRA backbone builds for every adapted site — is
+    /// adapted (`is_lora() == true`) but structurally composes and takes NO
+    /// `lora_linear_fused` admission decision at all. This field counts
+    /// exactly the sites that DO take that decision: `Lora` sites whose base
+    /// is `FrozenBase::Dense`.
     ///
     /// `0` for a fully frozen backbone, and that zero is load-bearing: a
     /// frozen tower takes NO `lora_linear_fused` admission decision at all,
-    /// so `fused + eager` must be `0` for it too. Unwrapped (`Frozen`) sites
-    /// are deliberately NOT counted — they forward through
-    /// `candle_nn::Linear` and never reach the seam.
+    /// so `fused + eager` must be `0` for it too. `0` is ALSO the correct
+    /// answer for a fully-adapted QLoRA backbone whose bases are all
+    /// quantized — same admission-side zero, a different structural reason.
+    /// Unwrapped (`Frozen`) sites are deliberately NOT counted either way —
+    /// they forward through `candle_nn::Linear`/`QuantizedLinear` directly
+    /// and never reach the seam.
     ///
-    /// This is a count of SITES, not of trainable tensors: an adapted site
-    /// owns two (`lora_a`, `lora_b`), so this is half of
-    /// `trainable_params().len()` on every tower that adapts whole sites.
+    /// This is a count of SITES taking the admission decision, not of
+    /// trainable tensors and not of adapted sites: an adapted site owns two
+    /// trainable tensors (`lora_a`, `lora_b`) regardless of its base storage,
+    /// so on a fully-dense-base tower this field equals half of
+    /// `trainable_params().len()`, but on a mixed or fully-quantized-base
+    /// QLoRA tower it is strictly LESS than half — the quantized-base
+    /// adapted sites still contribute their own `lora_a`/`lora_b` to
+    /// `trainable_params()` while contributing `0` here.
     pub lora_sites_wrapped: usize,
     /// How many house `crate::layer_norm::LayerNorm` instances the built
     /// tower holds on its forward path — counted by walking the struct, so a

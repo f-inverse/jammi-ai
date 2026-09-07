@@ -96,6 +96,31 @@ use crate::lora_site::{FrozenSiteHolder, LoraSite};
 /// time-frequency plane is square `spec_size × spec_size` after
 /// `reshape_mel2img`, with `freq_ratio = spec_size / num_mel_bins` crops folded
 /// along the channel axis.
+///
+/// # Every config field that names a computation is dispatched on or refused
+///
+/// Every field below that NAMES a computation is either genuinely dispatched
+/// on or refused as unsupported — never silently ignored (family D). Five
+/// fields name a computation this tower's forward path has hard-coded to one
+/// value, and `HtsatAudioEncoder::load_with` REFUSES, before any tensor is
+/// touched, any checkpoint that declares the other one: `hidden_act` (must be
+/// `"gelu"` — `SwinBlock::forward` is unconditionally gelu-erf), `enable_fusion`
+/// (must be `true` — `HtsatPatchEmbed::forward` always builds and applies the
+/// AFF fusion blend), `enable_patch_layer_norm` (must be `true` —
+/// `HtsatPatchEmbed::forward` always applies its trailing LayerNorm),
+/// `flatten_patch_embeds` (must be `true` — `HtsatPatchEmbed::forward` always
+/// flattens the patch grid to `[B, num_patches, C]`), and `qkv_bias` (must be
+/// `true` — `SwinSelfAttention::load_with` always builds `query`/`key`/`value`
+/// with `candle_nn::linear` (bias), never `linear_no_bias`). Refusing rather
+/// than silently computing a different forward under a declared-but-unread
+/// config keeps a confident wrong number from ever reaching a caller (this is
+/// this crate's core domain-validity mandate — see the crate's own
+/// module-level invariant). Every HF `ClapAudioConfig` this tower has ever
+/// shipped against (`laion/clap-htsat-fused`, this workspace's
+/// `htsat_clap_tiny` fixture) already declares all five at the one supported
+/// value; the unfused / no-norm / no-flatten / no-bias forward paths are
+/// simply not implemented, so a checkpoint declaring otherwise is refused,
+/// not silently mis-evaluated.
 #[derive(Debug, Clone, serde::Deserialize)]
 pub struct HtsatAudioConfig {
     /// Number of Swin blocks in each hierarchical stage.
@@ -122,20 +147,21 @@ pub struct HtsatAudioConfig {
     pub projection_dim: usize,
     /// Activation applied inside the projection head.
     pub projection_hidden_act: String,
-    /// Activation applied inside each Swin block's MLP. Every config field
-    /// that NAMES a computation is either genuinely dispatched on or
-    /// refused as unsupported — never silently ignored (family D). Unlike
+    /// Activation applied inside each Swin block's MLP. Unlike
     /// `projection_hidden_act` (dispatched at forward — see
     /// [`ClapAudioProjection::forward_unnormalized_with_training`]),
     /// `SwinBlock::forward` is unconditionally GELU-erf (this module's own
-    /// doc), so [`HtsatAudioEncoder::load`] REFUSES any value other than
-    /// `"gelu"` (HF `ClapAudioConfig`'s only shipped value) at load, naming
-    /// this field, rather than silently ignoring a checkpoint that declares
-    /// a different one.
+    /// doc), so `HtsatAudioEncoder::load_with` REFUSES any value other
+    /// than `"gelu"` (HF `ClapAudioConfig`'s only shipped value) at load —
+    /// see the struct-level "every config field..." doc above.
     pub hidden_act: String,
     /// LayerNorm / BatchNorm epsilon.
     pub layer_norm_eps: f64,
     /// Whether the fusion (AFF) path is enabled in the patch embedding.
+    /// `HtsatPatchEmbed::forward` always builds and applies the AFF blend,
+    /// so `HtsatAudioEncoder::load_with` REFUSES any value other than
+    /// `true` at load — see the struct-level "every config field..." doc
+    /// above.
     pub enable_fusion: bool,
     /// Number of input channels into the patch-embedding convolution (before
     /// fusion channel expansion).
@@ -144,12 +170,22 @@ pub struct HtsatAudioConfig {
     #[serde(default = "default_aff_block_r")]
     pub aff_block_r: usize,
     /// Whether a LayerNorm is applied to the flattened patch embeddings.
+    /// `HtsatPatchEmbed::forward` always applies its trailing LayerNorm, so
+    /// `HtsatAudioEncoder::load_with` REFUSES any value other than `true`
+    /// at load — see the struct-level "every config field..." doc above.
     #[serde(default = "default_true")]
     pub enable_patch_layer_norm: bool,
     /// Whether the patch embeddings are flattened to `[B, num_patches, C]`.
+    /// `HtsatPatchEmbed::forward` always flattens the patch grid, so
+    /// `HtsatAudioEncoder::load_with` REFUSES any value other than `true`
+    /// at load — see the struct-level "every config field..." doc above.
     #[serde(default = "default_true")]
     pub flatten_patch_embeds: bool,
     /// QKV-bias flag (consumed by the Swin spine).
+    /// `SwinSelfAttention::load_with` always builds `query`/`key`/`value`
+    /// with a bias term (`candle_nn::linear`, never `linear_no_bias`), so
+    /// `HtsatAudioEncoder::load_with` REFUSES any value other than `true`
+    /// at load — see the struct-level "every config field..." doc above.
     #[serde(default = "default_true")]
     pub qkv_bias: bool,
 }
@@ -1404,12 +1440,15 @@ impl HtsatAudioEncoder {
     /// the config, device and the dtype every load-time shift-window mask is
     /// materialised in (see [`HtsatLoadCtx`]).
     ///
-    /// The config-validity edge for `config.hidden_act` (see that field's
-    /// own doc): both [`HtsatAudio::load`] and `HtsatAudioBuilder::build`
-    /// (`crate::htsat_audio`'s builder) funnel through this one loader, so
-    /// checking it here — before any tensor is touched — refuses an
-    /// unsupported checkpoint through EITHER entry point rather than
-    /// silently computing gelu-erf under a different declared activation.
+    /// The config-validity edge for `config.hidden_act`, `config.enable_fusion`,
+    /// `config.enable_patch_layer_norm`, `config.flatten_patch_embeds` and
+    /// `config.qkv_bias` (see each field's own doc, and the struct-level
+    /// "every config field..." doc): both [`HtsatAudio::load`] and
+    /// `HtsatAudioBuilder::build` (`crate::htsat_audio`'s builder) funnel
+    /// through this one loader, so checking these here — before any tensor
+    /// is touched — refuses an unsupported checkpoint through EITHER entry
+    /// point rather than silently computing a forward that ignores what the
+    /// checkpoint declared.
     fn load_with<'a>(
         vb: VarBuilder,
         ctx: HtsatLoadCtx<'_>,
@@ -1425,6 +1464,42 @@ impl HtsatAudioEncoder {
                  different declared activation",
                 config.hidden_act
             )));
+        }
+        if !config.enable_fusion {
+            return Err(EncoderError::Config(
+                "HtsatAudioConfig.enable_fusion = false is unsupported: HtsatPatchEmbed's \
+                 forward is compiled to always build and apply the AFF fusion blend — \
+                 refusing rather than silently computing the fused patch embedding under a \
+                 checkpoint that declares fusion disabled"
+                    .to_string(),
+            ));
+        }
+        if !config.enable_patch_layer_norm {
+            return Err(EncoderError::Config(
+                "HtsatAudioConfig.enable_patch_layer_norm = false is unsupported: \
+                 HtsatPatchEmbed's forward is compiled to always apply its trailing \
+                 LayerNorm — refusing rather than silently normalizing patch embeddings \
+                 under a checkpoint that declares the norm disabled"
+                    .to_string(),
+            ));
+        }
+        if !config.flatten_patch_embeds {
+            return Err(EncoderError::Config(
+                "HtsatAudioConfig.flatten_patch_embeds = false is unsupported: \
+                 HtsatPatchEmbed's forward is compiled to always flatten the patch grid to \
+                 [B, num_patches, C] — refusing rather than silently flattening patch \
+                 embeddings under a checkpoint that declares flattening disabled"
+                    .to_string(),
+            ));
+        }
+        if !config.qkv_bias {
+            return Err(EncoderError::Config(
+                "HtsatAudioConfig.qkv_bias = false is unsupported: SwinSelfAttention's \
+                 query/key/value linears are compiled to always carry a bias term — \
+                 refusing rather than silently building bias-carrying linears under a \
+                 checkpoint that declares qkv_bias disabled"
+                    .to_string(),
+            ));
         }
         let bn_cfg = BatchNormConfig {
             eps: config.layer_norm_eps,
@@ -2036,7 +2111,7 @@ impl HtsatAudio {
             lora_sites_wrapped: self
                 .lora_sites()
                 .into_iter()
-                .filter(|(_, lin)| lin.is_lora())
+                .filter(|(_, lin)| lin.takes_lora_linear_admission())
                 .count(),
             layer_norms: std::iter::once(&self.encoder.patch_embed.norm)
                 .chain(self.encoder.stages.iter().flat_map(|stage| {
@@ -2271,6 +2346,15 @@ mod tests {
     /// against a `4×4` grid (`min(4,4) > window_size`) forces `shift_size=0`
     /// on block 0 (W-MSA) and `shift_size=window/2=1` on block 1 (SW-MSA,
     /// masked) — both attention arms in one 2-block stage.
+    ///
+    /// All four load-refused booleans are `true` (the only value
+    /// [`HtsatAudioEncoder::load_with`] accepts): `build_tiny_stage` below
+    /// feeds this config to `SwinStage::load_with` directly, which never
+    /// reads any of them, but `hidden_act_other_than_gelu_is_refused_at_load_through_both_entry_points`
+    /// and the new `_is_refused_at_load` tests reuse this same fixture
+    /// through `HtsatAudio::load`, which DOES route through the refusing
+    /// loader — so this fixture must already be on the one accepted value
+    /// for every field, exactly like a real checkpoint.
     fn tiny_stage_config() -> HtsatAudioConfig {
         HtsatAudioConfig {
             depths: vec![2],
@@ -2287,7 +2371,7 @@ mod tests {
             projection_hidden_act: "relu".to_string(),
             hidden_act: "gelu".to_string(),
             layer_norm_eps: 1e-5,
-            enable_fusion: false,
+            enable_fusion: true,
             patch_embed_input_channels: 1,
             aff_block_r: 4,
             enable_patch_layer_norm: true,
@@ -3882,6 +3966,74 @@ mod tests {
                 "error must name the field and the offending value, got: {msg}"
             ),
             other => panic!("expected EncoderError::Config, got {other:?}"),
+        }
+    }
+
+    /// (c) The same domain-validity edge as (b), for the four boolean
+    /// fields the struct-level "every config field..." doc names alongside
+    /// `hidden_act`: `enable_fusion`, `enable_patch_layer_norm`,
+    /// `flatten_patch_embeds`, `qkv_bias`. Each is hard-coded `true` in the
+    /// forward path this tower actually compiles (`HtsatPatchEmbed::forward`
+    /// always fuses/norms/flattens; `SwinSelfAttention::load_with` always
+    /// builds bias-carrying linears), so flipping any ONE to `false` must be
+    /// refused through BOTH `HtsatAudio::load` and
+    /// `HtsatAudio::builder().build(..)`, named — exactly the same shape as
+    /// `hidden_act_other_than_gelu_is_refused_at_load_through_both_entry_points`,
+    /// parametrised over the four fields since each is an independent
+    /// refusal at the same loader.
+    #[test]
+    fn bool_config_fields_false_are_refused_at_load_through_both_entry_points() {
+        type BoolFieldSetter = fn(&mut HtsatAudioConfig);
+        let device = Device::Cpu;
+
+        let fields: &[(&str, BoolFieldSetter)] = &[
+            ("enable_fusion", |c| c.enable_fusion = false),
+            ("enable_patch_layer_norm", |c| {
+                c.enable_patch_layer_norm = false
+            }),
+            ("flatten_patch_embeds", |c| c.flatten_patch_embeds = false),
+            ("qkv_bias", |c| c.qkv_bias = false),
+        ];
+
+        for &(name, set_false) in fields {
+            let mut cfg = tiny_stage_config();
+            set_false(&mut cfg);
+
+            // Through `HtsatAudio::load` (`VarBuilder::from_varmap`).
+            let varmap = VarMap::new();
+            let vb = VarBuilder::from_varmap(&varmap, DType::F32, &device);
+            let err = HtsatAudio::load(vb, &cfg, &device)
+                .err()
+                .unwrap_or_else(|| panic!("{name}=false must be refused through HtsatAudio::load"));
+            match err {
+                EncoderError::Config(msg) => assert!(
+                    msg.contains(name) && msg.contains("false"),
+                    "error must name the field and the offending value, got: {msg}"
+                ),
+                other => panic!("expected EncoderError::Config, got {other:?}"),
+            }
+
+            // Through `HtsatAudio::builder().build(..)` (mmaped safetensors)
+            // — an EMPTY checkpoint file: the refusal must fire before any
+            // tensor is even looked up.
+            let tmp = tempfile::tempdir().unwrap();
+            let path = tmp.path().join(format!("{name}_false_probe.safetensors"));
+            let empty: HashMap<String, Tensor> = HashMap::new();
+            candle_core::safetensors::save(&empty, &path).unwrap();
+            let build_varmap = VarMap::new();
+            let err = HtsatAudio::builder()
+                .build(&[&path], &cfg, &device, &build_varmap)
+                .err()
+                .unwrap_or_else(|| {
+                    panic!("{name}=false must be refused through HtsatAudio::builder().build(..)")
+                });
+            match err {
+                EncoderError::Config(msg) => assert!(
+                    msg.contains(name) && msg.contains("false"),
+                    "error must name the field and the offending value, got: {msg}"
+                ),
+                other => panic!("expected EncoderError::Config, got {other:?}"),
+            }
         }
     }
 

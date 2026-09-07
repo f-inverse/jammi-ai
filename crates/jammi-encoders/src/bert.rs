@@ -520,7 +520,11 @@ impl Bert {
     /// tower (see that type's own doc for what each field means and why it
     /// is walked rather than computed from [`BertConfig`]).
     ///
-    /// * LoRA sites: the `Lora` arms among `lora_sites`' six per layer.
+    /// * LoRA sites: the `Lora` arms among `lora_sites`' six per layer whose
+    ///   base is `FrozenBase::Dense` — see
+    ///   `crate::FusibleSiteCensus::lora_sites_wrapped`'s own doc for why a
+    ///   `Lora` arm over a `FrozenBase::Quantized` base (a QLoRA backbone)
+    ///   is excluded.
     /// * LayerNorms: the embeddings norm plus this family's TWO post-norms
     ///   per layer (`attention.output.LayerNorm`, `output.LayerNorm`),
     ///   chained into one iterator and counted, so a layer that stopped
@@ -534,7 +538,7 @@ impl Bert {
                 .layers
                 .iter()
                 .flat_map(lora_sites)
-                .filter(|(_, lin)| lin.is_lora())
+                .filter(|(_, lin)| lin.takes_lora_linear_admission())
                 .count(),
             layer_norms: std::iter::once(&self.embeddings.layer_norm)
                 .chain(self.layers.iter().flat_map(layer_norms))

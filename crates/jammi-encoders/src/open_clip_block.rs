@@ -283,7 +283,7 @@ pub(crate) fn fusible_site_counts(blocks: &[ResidualAttentionBlock]) -> (usize, 
     let lora_sites_wrapped = blocks
         .iter()
         .flat_map(|block| block.lora_sites())
-        .filter(|(_, lin)| lin.is_lora())
+        .filter(|(_, lin)| lin.takes_lora_linear_admission())
         .count();
     let layer_norms = blocks
         .iter()

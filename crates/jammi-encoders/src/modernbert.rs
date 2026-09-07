@@ -2554,7 +2554,7 @@ impl ModernBert {
                 .layers
                 .iter()
                 .flat_map(modern_lora_sites)
-                .filter(|(_, lin)| lin.is_lora())
+                .filter(|(_, lin)| lin.takes_lora_linear_admission())
                 .count(),
             layer_norms: std::iter::once(&self.emb_norm)
                 .chain(self.layers.iter().flat_map(modern_layer_norms))

@@ -215,6 +215,27 @@ workspace ships every publishable crate at the same
   checkpoint previously loaded and then computed something its own config did not describe.
   `projection_hidden_act` is unaffected: both its `"gelu"` and `"relu"` arms are genuinely
   dispatched on at forward.
+- **Four more `HtsatAudioConfig` fields are validated at load instead of silently ignored
+  (#421/#467).** `enable_fusion`, `enable_patch_layer_norm`, `flatten_patch_embeds` and
+  `qkv_bias` were parsed from the HF config and never read again: `HtsatPatchEmbed::forward`
+  unconditionally builds and applies the AFF fusion blend, applies its trailing LayerNorm and
+  flattens the patch grid, and `SwinSelfAttention::load_with` unconditionally builds
+  bias-carrying `query`/`key`/`value` linears, regardless of what any of the four fields
+  declared. Each is now refused at load, through both `HtsatAudio::load` and
+  `HtsatAudio::builder().build(..)`, the same shape as the existing `hidden_act` refusal, if it
+  is anything other than the one value the forward path implements (`true` in all four cases —
+  every shipped `ClapAudioConfig`, including `laion/clap-htsat-fused` and this workspace's own
+  `htsat_clap_tiny` fixture, already declares all four at that value).
+- **`FusibleSiteCensus::lora_sites_wrapped` is now exact on a quantized (QLoRA) base (#421/#467).**
+  `LoraLinear::forward` branches on `FrozenBase::Dense` vs `FrozenBase::Quantized` BEFORE it ever
+  reaches `admit()`, so a `Lora` site over a `FrozenBase::Quantized` base — the shape a QLoRA
+  BERT/DistilBERT/ModernBERT backbone builds for every adapted site — takes NO
+  `lora_linear_fused` admission decision at all, even though `MaybeLoraLinear::is_lora()` still
+  reports it as adapted. `lora_sites_wrapped` previously counted `is_lora()` directly, so it
+  overstated the admission-side count on a QLoRA backbone; every tower's census walk now counts
+  `jammi_lora::MaybeLoraLinear::takes_lora_linear_admission()` (`Lora` whose base is `Dense`)
+  instead, restoring `fused + eager == lora_sites_wrapped × batches` on a quantized base (both
+  sides now `0`).
 - **A failed training job's stored message is no longer double-prefixed (#421).** `TrainingJob::wait()`
   and the Python binding's `poll_until_terminal` both re-wrap a stored failure in a fine-tune error,
   whose `Display` already renders the "Fine-tune error: " prefix, so a failure that was itself a

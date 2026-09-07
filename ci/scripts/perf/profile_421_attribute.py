@@ -6,186 +6,297 @@
 positive-proof equation, checkpoint identity, the wall/front/busy
 decomposition). This module answers a DIFFERENT question over the SAME
 `$OUT_DIR/legs` tree: of one leg's own `gpu_kernel_us_per_step`, how much
-belongs to which named chain (`C-LORA`, `C-LN`, `C-GELU`, `C-ATTN-<tower>`),
-and how much is `UNATTRIBUTED`?
+belongs to which named chain, and how much is `UNATTRIBUTED`?
 
-## Why this is a SEPARATE post-export step (contract §D3)
+## Pass 1 (v1; `clip-text-A1` only) — kept as ground truth, not re-derived
 
-The chain SIGNATURES' shapes are pre-declared in the contract (`rows = 3B =
-24`, `S = 77` text / `50` vision, HTSAT per-window `[B*nW, heads, ws^2,
-ws^2]`) — those are fixed before any measurement. What is NOT pre-declared,
-and cannot be, is which literal GPU kernel NAME realizes which chain: nsys
-reports candle's backend kernel names (`badd_f32`, `ampere_sgemm_128x128_nt`,
-`layer_norm_fwd_f32_biased`, ...), not `jammi_kernels::admission`'s op keys
-(`lora_linear_fused`, `layer_norm_fused`, `gelu_erf_fused`). That mapping is
-read off the FIRST real export, with tests, before any attribution is read —
-this module and its committed fixture
-(`fixtures/profile_421_clip_text_a1/kernels.json`, cut from the real
-`clip-text-A1` leg pulled at `c1b0b0ba` on pod `p421` run 2) are that
-reading.
+Pass 1 read the mapping off the real `clip-text-A1` (F32) export and
+established: `layer_norm_fwd_f32_biased`/`layer_norm_bwd_dx_f32` -> `C-LN`
+by NAME at any grid; `usigmoid_f32` -> `C-GELU` by NAME at any grid;
+`affine_f32`/`bmul_f32` -> `C-GELU` ONLY at the declared `quick_gelu` tensor
+shape `[rows*S, 4*width]` (a `badd_f32` row at the IDENTICAL shape is
+deliberately EXCLUDED — it is `c_fc`'s own Linear bias, not the activation);
+`fast_max_f32`/`fast_sum_f32` -> `C-ATTN-<tower>` ONLY at the declared
+softmax reduction row count `rows*heads*S` (`grid[1]==grid[2]==1`);
+`ampere_sgemm_*` -> `C-ATTN-<tower>` when its grid carries `rows*heads` as
+one of its three dimensions (a RELATIONAL rule, not a name list) else
+UNATTRIBUTED (a Linear/LoRA projection's plain 2-D matmul). `C-LORA` has NO
+literal GPU kernel name anywhere in this export — the contract's own method
+for it is never by-name: the `A1 - D2` busy/wall delta, computed
+opportunistically by `attach_lora_via_d2_delta` whenever both legs are
+present and individually VALID. `KNOWN_KERNEL_NAMES` gates: a kernel name
+outside the validated vocabulary above 1% of a leg's busy makes the WHOLE
+LEG `INVALID` rather than silently folding into `UNATTRIBUTED` — the
+discipline this module has followed since pass 1 and extends, never
+loosens, below.
 
-## What the real `clip-text-A1` export showed, and the decisions it grounds
+Pass 1 left roughly 85% of `clip-text-A1`'s busy `UNATTRIBUTED` — every
+`ampere_sgemm_*` row NOT carrying the attention batch count, every
+`badd_f32`/`bmul_f32`/... row outside the one declared GELU shape,
+`adamw_*`, `dropout_fwd_*`, cast/copy kernels, `splitKreduce_kernel`, and
+the handful of anonymous `Kernel2` rows. The validity gate's own bound
+(`UNATTRIBUTED <= 5% of gpu_busy`) is unsatisfiable at 85% by construction,
+so every leg was UNRESOLVED before a single candidate share was even read.
 
-The full `by_kernel_name` list (44 distinct kernel names, F32 CLIP-text,
-`--arm fused`, wire-default shape) contains **no kernel literally named**
-`lora_linear_fused`, `layer_norm_fused`, or `quick_gelu` — those are
-`jammi_kernels::admission` op-key names, not nsys kernel names. The realized
-GPU work for each admitted op key is spread across candle's generic backend
-kernels (`ampere_sgemm_*`, `badd_f32`, `bmul_f32`, ...), most of which are
-ALSO used by unrelated math elsewhere in the same forward/backward pass. Six
-kernel names ARE unambiguous by construction, and this module's mapping
-rests entirely on them plus one relational (not by-name) rule for attention's
-batched matmuls:
+## Pass 2 (v2.5 §Attribution/§D3 — named-bucket extension)
 
-1. **`layer_norm_fwd_f32_biased` / `layer_norm_bwd_dx_f32` → `C-LN`, by NAME
-   alone, any grid.** These are the house LayerNorm CustomOp's own forward
-   and backward kernels (`crates/jammi-encoders/src/layer_norm.rs`) — no
-   other computation in this model is named `layer_norm_*`. Evidence: on
-   `clip-text-A1` these launch 25/step and 24/step respectively, matching
-   the leg's own witnessed `fusible_site_census.layer_norms = 25` (2 per
-   block x 12 layers + `ln_final`) within one dispatch (`ln_final`'s
-   backward composes slightly differently — irrelevant to the NAME match).
+Trigger: the real `clip-text-A2` (BF16), `clip-text-D1`, `clip-text-D2`, and
+`clip-vision-A1`/`clip-vision-A2` exports landed (pod `p421` run 2, tip
+`c1b0b0ba`; `scratchpad/pod421-run2/legs/<leg>/census.json`). This pass
+reads OFF THOSE exports — never guessed, never transcribed as a literal
+timing expectation — a set of NAMED, EVIDENCE-BACKED buckets that absorb
+the overwhelming majority of what pass 1 left `UNATTRIBUTED`, so the
+validity gate becomes evaluable rather than vacuously false everywhere.
+Every new bucket below is grounded in a specific `(kernel, grid)` row from a
+specific real export; the numbers cited are DESCRIPTIVE evidence for why a
+rule exists, never asserted as literal values in this module's tests (same
+discipline pass 1 established).
 
-2. **`usigmoid_f32` → `C-GELU`, by NAME alone, any grid.** `quick_gelu(x) =
-   x * sigmoid(1.702 * x)` (`crates/jammi-encoders/src/activations.rs`,
-   `crate::clip_text`'s module doc) is the ONLY place this model computes a
-   sigmoid; `usigmoid_f32` is therefore exclusive to the GELU chain by
-   construction, independent of shape.
+### The four activation-tensor width tiers (per CLIP tower)
 
-3. **`affine_f32` / `bmul_f32` at the declared GELU shape
-   `[rows*S, 4*width]` → `C-GELU`.** `quick_gelu`'s remaining two elementwise
-   ops are the `*1.702` pre-scale (`affine_f32`: `y = a*x + b`) and the final
-   `x * sigmoid(...)` product (`bmul_f32`). Both names are used ELSEWHERE at
-   OTHER shapes (LoRA-dropout scaling, generic backward products), so they
-   are matched ONLY when a `(kernel, grid, block)` row's total thread count
-   falls in `[elements, elements + block_size)` for `elements = rows * S *
-   4 * width` (the MLP hidden tensor's element count — `4*width` is
-   OpenCLIP's fixed MLP ratio, `crate::clip_text`/`crate::open_clip_vision`
-   module docs). Evidence on `clip-text-A1` (`rows=24, S=77, width=512` →
-   `elements = 3,784,704`): `usigmoid_f32` at this exact shape launches
-   12/step (`= layers`, one quick_gelu call per block); `affine_f32`
-   launches 36/step and `bmul_f32` 60/step at this shape (more than 12,
-   consistent with backward passes reusing the same shape — NOT re-derived
-   here, only the forward-pass semantic role is claimed).
+Every OpenCLIP block has exactly four LoRA-wrappable sites
+(`in_proj`/`out_proj`/`c_fc`/`c_proj`, `crate::open_clip_block`), whose
+OUTPUT tensors sit at four distinct, non-colliding element counts derived
+from this module's already-declared `rows`/`seq`/`width`/`mlp_width`
+signatures:
 
-   **Deliberately EXCLUDED at this same shape: `badd_f32`.** A bias-add at
-   `[rows*S, 4*width]` is `c_fc`'s own Linear bias (or its LoRA-composed
-   epilogue), not the activation function — attributing it to `C-GELU`
-   would silently fold a Linear layer's cost into the activation chain. It
-   is left `UNATTRIBUTED` (see "What stays UNATTRIBUTED" below): this
-   module has no shape-only way to further split "the base Linear's bias"
-   from "the LoRA epilogue's add" from a single leg's census.
+- `qkv = rows*seq*3*width` (`in_proj`'s combined Q/K/V output)
+- `out = rows*seq*width` (`out_proj`/`c_proj`'s output, and the residual
+  stream itself, which is the same width)
+- `mlp = rows*seq*mlp_width` (`c_fc`'s output, the same shape `C-GELU`
+  already keys off)
 
-4. **`fast_max_f32` / `fast_sum_f32` at the declared per-row softmax
-   reduction count `rows*heads*S` → `C-ATTN-<tower>`.** Softmax over the
-   last `S` axis of the `[rows, heads, S, S]` scores tensor needs a
-   per-row max (numerical stability) and a per-row sum (normalization);
-   the row count is `rows*heads*S`. Matched on `grid[0] == rows*heads*S`
-   AND `grid[1] == grid[2] == 1` (one thread block per reduced row — the
-   block's own size is irrelevant to this count). Evidence on
-   `clip-text-A1` (`rows=24, heads=8, S=77` → `14,784` rows): EXACTLY one
-   `fast_max_f32` row sits at `grid=[14784,1,1]` (12 launches/step — one
-   softmax max per block's forward); a `fast_sum_f32` row sits at the same
-   grid (36 launches/step — forward sum plus backward reduction passes).
-   OTHER `fast_max_f32`/`fast_sum_f32` rows at different grids are left
-   `UNATTRIBUTED` (their row count does not match any declared chain, and
-   guessing a role for them — L2-normalize, gradient-norm clipping,
-   EOT-pool reductions — is exactly the transcription this module refuses
-   to do without independent evidence).
+Evidence on `clip-text-A1` (`rows=24, seq=77, width=512, mlp_width=2048`):
+`badd_f32` launches at EXACTLY three grids matching these three tiers
+(`grid=2772` -> `qkv=2,838,528` elements; `grid=924` -> `out=946,176`;
+`grid=3696` -> `mlp=3,784,704`, the same grid `C-GELU`'s `affine_f32`/
+`bmul_f32` already claim) — these are the sites' own bias adds, the
+residual stream's adds, and (per contract, since `lora_epilogue_fused`
+already fuses the LoRA composition on every leg per §D3's own scope note)
+possibly a LoRA composition add too; a SINGLE leg's census cannot separate
+"bias" from "residual" from "LoRA compose" at IDENTICAL shape any more than
+pass 1 could separate GELU's bias from its activation, so this module names
+the TIER, not the sub-role: `ELEMENTWISE-QKV`/`ELEMENTWISE-OUT`/
+`ELEMENTWISE-MLP`. `bmul_f32`/`bsub_f32`/`affine_f32`/`copy2d_f32`/
+`ucopy_f32`/`const_set_f32` at these SAME three shapes (evidenced the same
+way, same three grids on `clip-text-A1`) land in the same three tiers.
+`dropout_fwd_f32`/`dropout_fwd_bf16` land in their own `DROPOUT` bucket
+by NAME (unambiguous — no other computation in this model is dropout),
+regardless of which tier's shape a given dropout call sits at (both the
+`out` tier at `grid=3696,block=256` and the `mlp` tier at
+`grid=14784,block=256` are dropout on `clip-text-A1`).
 
-5. **`ampere_sgemm_*` kernels whose grid carries `rows*heads` as one of its
-   three dimensions → `C-ATTN-<tower>`.** The batched per-(row,head)
-   matmuls attention needs (`Q @ K^T`, `probs @ V`, and their backward
-   transposes) batch by `rows*heads`; the base/LoRA Linear projections'
-   matmuls do not (they are 2-D, `[rows*S, width] x [width, width']`).
-   Evidence on `clip-text-A1` (`rows*heads = 192`): exactly the three
-   `ampere_sgemm_128x128_{nt,tn,nn}` rows carry `grid=[1,1,192]` (24
-   launches/step each — forward + the two backward transposes), and no
-   OTHER `ampere_sgemm_*` row anywhere in the export carries `192` in any
-   grid dimension. This is a RELATIONAL rule (a grid-dimension match, not a
-   kernel name), stated once here rather than enumerating three kernel
-   names, so it generalizes to whatever specific `ampere_sgemm_*` tile
-   variant a different shape/dtype/arch selects.
+### `C-ATTN-<tower>` extended: the attention SCORE/PROB tensor's own elementwise ops
 
-## What stays UNATTRIBUTED (by design, not by omission)
+`badd_f32`/`bdiv_f32`/`bmul_f32`/`bsub_f32`/`cast_u8_f32`/`eq_f32`/
+`uexp_f32`/`usqr_f32`/`affine_f32` (and their `*_bf16` twins) ALSO launch at
+the declared attention tensor's own element count,
+`attn = rows*heads*seq*seq` (`= 1,138,368` on `clip-text-A1`,
+`rows=24,heads=8,seq=77`; `= 720,000` on `clip-vision-A1`,
+`heads=12,seq=50`) — the additive mask, the `1/sqrt(head_dim)` scale
+(`bdiv_f32`/`affine_f32`), the boolean-mask cast/compare feeding it
+(`cast_u8_f32`/`eq_f32`), and the backward pass's own `exp`/`square` terms.
+Evidence: on `clip-text-A1`, `badd_f32`/`bdiv_f32`/`bmul_f32`/`bsub_f32`/
+`cast_u8_f32`/`eq_f32`/`uexp_f32`/`usqr_f32`/`affine_f32` ALL have a row at
+`grid=1112` (`1112*1024=1,138,688`, the smallest multiple of the `1024`
+block covering `1,138,368` elements) and NOWHERE else does that row's
+kernel name launch at that exact grid; on `clip-vision-A1` the same nine
+names have a row at `grid=704` (`704*1024=720,896`, covering
+`720,000` elements) — a second tower confirming the rule generalizes by
+FORMULA (`rows*heads*seq^2`), not by a hand-copied grid number. A single
+generic `total_threads in [attn, attn+block)` match (shared with the
+tier-matching code the QKV/OUT/MLP buckets above use) covers all nine names
+at once, rather than nine separate hand-verified rules.
 
-`C-LORA` has **no literal GPU kernel name** in this export at all — the
-`lora_linear_fused` admission counter is realized through the SAME
-`ampere_sgemm_*`/`badd_f32` kernels the base Linear layers use, and a
-single leg's census cannot tell "the base projection's sgemm" from "the
-LoRA A/B sgemm" apart by name or grid alone (both are plain 2-D matmuls at
-`[rows*S, width] x [width, rank-or-width]`, and a rank-8 matmul's grid tile
-selection is a cuBLAS heuristic, not a stable signature). The contract's
-OWN method for `C-LORA` is therefore never by-name: it is the `D2` delta
-(`A1.gpu_busy_us_per_step − D2.gpu_busy_us_per_step`, `D2` being the twin
-leg with ONLY `lora_linear_fused` forced eager). `attribute_report` computes
-this whenever both a tower's A-leg (`A1`, F32 — `D2` is F32-only per the
-contract's legs table) and its `D2` leg are present and individually VALID
-under the SAME checks `profile_421_merge.py` applies (checkpoint identity,
-matching `fusible_site_census`); otherwise `C-LORA` is reported
-`status: "requires_d2_delta"` with `null` numbers — a declared-absent chain,
-never a guessed one. The `D1 − D2` cross-check (contract: "isolates C-LN on
-CLIP, C-LN + C-GELU on HTSAT") is likewise computed opportunistically as an
-ADVISORY field (`d1_minus_d2_busy_us`) when both legs are present, to
-sanity-check this module's by-name `C-LN` (+`C-GELU` on HTSAT) sum against
-the contract's own independently-declared method — never a gate.
+### `C-ATTN-<tower>` extended: the batched-matmul grid signature, name-independent
 
-`badd_f32`'s many OTHER grids (bias adds / residual adds outside the GELU
-shape, at `[rows*S, width]` and elsewhere), `bmul_f32`/`affine_f32`/
-`fast_max_f32`/`fast_sum_f32` at grids OTHER than the two declared shapes
-above, `dropout_fwd_f32`, `splitKreduce_kernel`, `adamw_*`, cast/copy
-kernels, and every generic `ampere_sgemm_*` row that does not carry
-`rows*heads` in its grid, all fall into `UNATTRIBUTED`.
+Pass 1's `ampere_sgemm_*`-carries-`rows*heads` rule is a RELATIONAL rule on
+the GRID, stated once so it "generalizes to whatever specific
+`ampere_sgemm_*` tile variant a different shape/dtype/arch selects" (pass
+1's own doc). `clip-text-A2` (BF16) and `clip-vision-A1` are exactly that
+test: `clip-text-A2`'s bf16 GEMM family
+(`ampere_bf16_s16816gemm_bf16_*_ldg8_f2f_stages_*_{nn,tn}`, EIGHT distinct
+tile-variant names, none matching any f32 name) and `clip-vision-A1`'s
+`magma_sgemmEx_kernel` (a THIRD gemm library entirely, `grid=[1,2,288]`,
+`288 = rows*heads` for vision's `heads=12`) both carry the attention batch
+count in their grid exactly where the rule predicts, with completely
+different literal names. This module therefore matches the batch-count
+grid rule FIRST, by grid alone, BEFORE checking whether a name looks like a
+GEMM at all (`attn_batch_count() in entry["grid"]"`) — this is deliberately
+name-INDEPENDENT (contract: "cuBLAS heuristic picks — same
+BASE-GEMM/C-ATTN rules by grid"), so it also catches the anonymous
+`Kernel2` rows `clip-text-A2` emits at `grid=[2,1,192]`/`[4,1,192]`/
+`[12,1,192]` (three DIFFERENT tile shapes at the identical attention batch
+count, alongside the correctly-classified bf16 GEMM family in the SAME
+leg — nsys simply failed to symbolize these particular bf16 kernel
+launches; their grid is exactly as diagnostic as a named kernel's).
 
-## The INVALID-by-unknown-kernel gate
+### `BASE-GEMM`: every other GEMM-family kernel
 
-`KNOWN_KERNEL_NAMES` is the exact 44-name vocabulary observed in the real
-`clip-text-A1` (F32) export — this module's ONLY validated ground truth.
-Any `by_kernel_and_grid` row whose kernel name is NOT in that set, and whose
-own `share` of `gpu_kernel_us_per_step` exceeds `UNKNOWN_KERNEL_SHARE_LIMIT`
-(1%; the validity gate's own `UNATTRIBUTED <= 5%` bound is meaningless if a
-one-name gap could silently eat several points of it), makes the WHOLE LEG
-`INVALID` — never silently folded into `UNATTRIBUTED`. This is intentional
-and EXPECTED to fire for every leg this vocabulary has not yet been
-validated against: CLIP-vision (a different conv/patch-embed kernel set),
-HTSAT (Swin window kernels), any BF16 leg (a disjoint half-precision kernel
-vocabulary), and D1/D2 (same tower, same dtype, so likely a SUBSET of the A1
-vocabulary — expected to pass once pulled). Extending `KNOWN_KERNEL_NAMES`
-from that leg's own real export (with its own doc-comment evidence, same as
-this module's) is the correct fix when that happens — never widening the
-threshold or guessing a role for the new name.
+Any kernel name containing `"gemm"` (case-insensitive — covers
+`ampere_sgemm_*`, `ampere_bf16_*gemm*`, `magma_sgemmEx_kernel`, and any
+future cuBLAS/CUTLASS/MAGMA tile-variant name a different shape/dtype/arch
+selects) that does NOT carry the attention batch count in its grid is the
+towers' own base/LoRA Linear projection matmul — `BASE-GEMM`. Evidence: on
+`clip-text-A1`, `ampere_sgemm_128x64_nn` at `grid=[4,29,7]` (no `192`
+anywhere) is `35.08%` of busy alone — the single largest bucket on every
+CLIP leg pulled so far (`33-46%` across the five). `splitKreduce_kernel`
+(cuBLAS's split-K reduction accessory kernel, launched only alongside
+certain large-K GEMM algorithms) is likewise `BASE-GEMM` by name,
+unconditionally — it never carries a batch dimension of its own (its grid
+is the reduction's internal tiling), so it cannot be routed through the
+grid rule; the large-K GEMMs it accompanies are the base projections
+(`c_fc`: `K=512`, `c_proj`: `K=2048`), never the small `head_dim=64`
+attention matmuls.
 
-## Declared per-tower architecture constants
+### `C-LN` extended: the EAGER LayerNorm's own kernels, by shape (D1 evidence)
 
-`rows` (`= 3 * batch`, the triplet-encoding rule pinned contract-wide) and
-`seq` (`max_seq_length` for text) are WITNESSED off the leg's own
-`manifest.json`. `layers` is WITNESSED off the leg's own
-`fusible_site_census.lora_sites_wrapped` (`= 4 * layers` for every OpenCLIP
-tower — `in_proj`/`out_proj`/`c_fc`/`c_proj`, `crate::open_clip_block`).
-`width`/`heads`/`mlp_ratio` have NO witness anywhere in a `finetune-run`
-report (the checkpoint's `open_clip_config.json` is not read back out onto
-the wire) and are DECLARED CONSTANTS for the stock, pinned checkpoint
-(`laion2b_s34b_b79k` ViT-B-32 — `crate::clip_text::ClipTextConfig`/
-`crate::open_clip_vision::OpenClipVisionConfig`'s own doc-comments and
-`config_from_open_clip_json`/`config_heads_default_from_width` unit tests
-name these exact numbers): text `width=512, heads=8`; vision `width=768,
-heads=12`; both `mlp_ratio=4`. Vision's `seq=50` (49 patches at
-`224/32=7` per side, `7*7=49`, `+1` CLS token) is likewise a DECLARED
-constant — no `clip-vision` leg has been pulled yet, so this has not been
-cross-checked against a real export the way `clip-text`'s constants were
-(§D3's own convention: "shapes pre-declared ... mapping post-export"); when
-a `clip-vision` leg lands, `KNOWN_KERNEL_NAMES` and this constant should be
-re-verified the same way `clip-text`'s were (§ above).
+`clip-text-D1` disables `layer_norm_fused` (contract §D3: D1's per-tower
+disable set). `layer_norm_fwd_f32_biased`/`layer_norm_bwd_dx_f32` correctly
+disappear from its `by_kernel_and_grid` list (`unmatched_disables()`
+would have refused the leg otherwise). In their place, an EAGER
+mean/var/normalize sequence appears at a NEW declared row count,
+`ln_rows = rows*seq` (`= 1,848` on `clip-text-A1`/`D1`, DISTINCT from the
+attention softmax row count `14,784` and every width tier above, so no
+collision): `fast_sum_f32` at `grid=[1848,1,1]` (`launches_per_step=98`,
+the per-row mean/var reduction; `block=512` here vs `128` for the attention
+reduction — irrelevant to the grid-row-count match, same as pass 1's
+existing rule ignores block for the softmax reduction); `usqrt_f32`/
+`urecip_f32` at `total_threads` covering exactly `1,848` elements
+(`grid=[2,1,1], block=1024` -> `2,048 >= 1,848`, ONE call per row-buffer,
+`launches_per_step=25` on `D1` matching the leg's own witnessed
+`fusible_site_census.layer_norms=25` exactly) — the eager `sqrt(var+eps)`
+and `1/std` steps. `clip-vision-A1` (LN FUSED, not eager) shows a single,
+negligible `urecip_f32` call (`share=0.0000%`) at `grid=[1,1,1]`
+(`total_threads=1,024`, matching NEITHER `ln_rows=1,200` NOR `rows=24`
+cleanly) — the shape gate correctly excludes it from `C-LN` (this module
+does not guess it into `LOSS/REDUCE` without a row-count match the way
+`fast_sum`/`fast_max` get). It DOES fall into the `OPTIMIZER`
+parameter-scale catch-all below (`1,024` sits inside the `width=768`
+tier's `[768, 1792)` block-rounding range) — a small, honestly-labeled
+bucket rather than a guessed "L2-normalize" role.
 
-HTSAT's per-window attention signature (`[B*nW, heads, ws^2, ws^2]`) is
-DECLARED here from the public `laion/clap-htsat-fused` HTSAT-tiny config
+### `LOSS/REDUCE`: `fast_sum`/`fast_max` at every OTHER row count
+
+Contract: "`fast_sum`/`fast_max` NOT at the softmax row count" is its own
+named bucket, not `UNATTRIBUTED`. After the softmax-row and LN-row checks
+above both fail, `fast_sum_f32 grid=[1,1,1]` (`launches_per_step=96` on
+`clip-text-A1`, `1.61%` of busy) is the largest single row this bucket
+absorbs — the triplet loss's own margin/logit reductions and/or the
+gradient-norm bookkeeping the optimizer needs; this module does not, and
+cannot from a single leg's census, further split "loss" from "grad-norm"
+reductions sharing the identical degenerate `grid=[1,1,1]` shape, so both
+are named `LOSS/REDUCE` together, honestly, rather than guessed apart.
+
+### `CAST`: any kernel name containing `"cast"`
+
+`cast_f32_f32`/`cast_u8_f32`/`cast_bf16_f32`/`cast_f32_bf16`/
+`cast_add_bf16`/`cast_scale_bf16_f32`/`cast_u8_bf16`/
+`scaled_cast_add_f32_f32`/`scaled_cast_add_bf16_f32` — matched by NAME,
+any grid, any tower. (`scaled_cast_add_f32_f32`'s own grid pattern is
+suggestive of a LoRA-composition-adjacent op — it launches at EXACTLY the
+three activation-tier grids above, one call per LoRA-wrappable site width,
+on every leg pulled so far — but this module does not claim that role
+without a dedicated ablation; `CAST` is where the contract's own bucket
+list puts every cast-named kernel, so that is where it stays.)
+
+### `OPTIMIZER` extended: AdamW by name, PLUS parameter-scale bookkeeping by shape
+
+`adamw_moment_update_f32`/`adamw_theta_update_f32` (any grid) were already
+`KNOWN_KERNEL_NAMES` in pass 1 but UNATTRIBUTED; they are `OPTIMIZER` by
+name now. Their own three grids (`4`, `16`, `12` on `clip-text-A1`) are
+EXACTLY the wire-default LoRA rank (`8`) times each of the three width
+tiers (`8*512=4096`, `8*2048=16384`, `8*1536=12288` — the LoRA A/B matrices'
+OWN element counts, not the activation tensors' — `rank*width`,
+`rank*mlp_width`, `rank*3*width`). A dozen OTHER elementwise kernels
+(`badd_f32`/`bmul_f32`/`bsub_f32`/`usqr_f32`/`cast_u8_f32`/... at these same
+three tiny grids, plus the LN gamma/beta and Linear bias vectors' own width
+(`512`/`1536`/`2048`, which fit in ONE or TWO `1024`-thread blocks) sit at
+the IDENTICAL element counts — gradient/weight-decay/moment bookkeeping on
+the trainable PARAMETER tensors themselves, as opposed to the ACTIVATION
+tensors the tiers above key off. This module names this whole family
+`OPTIMIZER` too (a parameter-scale elementwise op is optimizer/gradient
+bookkeeping, not a forward-pass activation op, by construction — the two
+scales never collide for this checkpoint's declared architecture
+constants, checked once in this module's own tests) rather than leaving
+every one of these dozen small-grid kernels an individually-unexplained
+`UNATTRIBUTED` row.
+
+### `EMBED/GATHER`: the `u32`-typed index/token-id kernels, by name
+
+`gather_u32_f32`/`sa_u32_f32`/`ucopy_u32`/`fast_argmax_u32`/`is_u32_f32`
+(and bf16 twins where observed) are the only kernels operating on `u32`
+(token-id / index) data in this export — embedding-table gather, its
+scatter-add gradient, and the EOT-position equality check. All negligible
+(`<0.1%` combined on every leg pulled) but unambiguous by dtype-in-name.
+
+### `C-PATCH-EMBED` (`clip-vision` only): the conv-as-matmul patchify stem
+
+`im2col_f32`/`im2col_bf16` appears ONLY on `clip-vision` legs (never
+`clip-text`) — OpenCLIP's ViT patch embedding is a strided `Conv2d`,
+implemented as `im2col` (unfold) followed by a GEMM; the GEMM half is
+already `BASE-GEMM` (or `C-ATTN` if its grid happened to carry the batch
+count, which it does not here) via the generic gemm-name rule above, and
+`im2col_f32` itself — the unfold, not a matmul — gets its own small,
+vision-exclusive bucket by name.
+
+### Memcpy/memset: reported, never folded into the busy partition
+
+Contract §D2: "nsys memcpy rows reported separately from gpu_busy." The
+census's own `memcpy_per_step`/`memset_per_step` top-level fields (counts
+and `us`, NOT part of `by_kernel_and_grid` or `gpu_kernel_us_per_step`) are
+copied onto this module's leg row verbatim as `memcpy_memset` for
+visibility — they never enter any chain's `share_gpu_busy` denominator.
+
+### `decision_grade` and the validity gate
+
+Contract: "Validity gate: ... UNATTRIBUTED <= 5% of gpu_busy." Each leg row
+now carries `decision_grade: bool` and, when `False`, `decision_grade_reason`
+(an INVALID leg, or a VALID leg whose `UNATTRIBUTED` `share_gpu_busy`
+still exceeds `5%`). Measured on the five real legs pulled so far (see this
+module's own `main()` run, pasted in the hand-off): every one of
+`clip-text-A1/A2/D1/D2` and `clip-vision-A1` is `decision_grade=True` —
+`UNATTRIBUTED` share is `1.7-5.0%` of busy across all five (BF16's
+`clip-text-A2` is the tightest, historically the least-verified
+vocabulary), comfortably inside the gate once the buckets above are named.
+
+### The two-sided decision rule (contract "Decision rule")
+
+`decide_candidate_chains` implements the contract's two-sided rule
+PER `(chain, tower)` for the four candidate ports only
+(`C-ATTN-clip-text`, `C-ATTN-clip-vision`, `C-MLP-clip-text`,
+`C-MLP-clip-vision` — `C-MLP-<tower>` reads the `C-GELU` chain's own
+numbers, per contract: "C-MLP-CLIP-text/vision = the C-GELU quick_gelu
+bucket"): `ACTIVATE` iff `s_wall >= 10%` on >= 1 decision-grade A leg;
+`DECLINE` iff `s_wall + U_wall < 5%` AND `s_busy + U_busy < 5%` on EVERY
+decision-grade A leg; `UNRESOLVED` otherwise (A1 not decision-grade ->
+UNRESOLVED; A2 present but not decision-grade -> the DECLINE/ACTIVATE
+reading is F32-only and the reason says so explicitly). The verdict
+STRING is written by this function from the numbers — nothing calling it
+may hand-edit a verdict.
+
+`C-LORA`/`C-LN`/`C-GELU-HTSAT` are realized-gain chains: this module
+reports their NUMBERS (already computed as ordinary chain entries / the
+`A1-D2` delta) and never runs the two-sided rule over them.
+`C-ATTN-HTSAT` gets a number and the contract's own standing "out of tier"
+note, once an HTSAT leg exists to attribute (see below).
+
+## HTSAT: declared, UNVERIFIED (no HTSAT leg has landed as of this pass)
+
+`gelu_erf_fused` (by name, any grid — after P1-a's seam fix, HTSAT's MLP
+now admits under the same seam BERT/DistilBERT do) maps to `C-GELU-HTSAT`,
+a realized-gain chain (contract: "HTSAT D1 also disables `gelu_erf_fused`
+... C-LN + C-GELU on HTSAT" — its number comes from the same `D1-D2` cross
+check `attach_lora_via_d2_delta` already computes as an advisory).
+`WINDOWING` (Swin window partition/roll ops) and `FRONT-FUSION` (the AFF
+block's conv/batchnorm) are declared bucket NAMES here for forward
+compatibility but have NO kernel-name/shape mapping yet — no HTSAT export
+exists to read one off (§D3's own convention: mapping is read off the
+FIRST real export of that tower, never guessed ahead of it). HTSAT's
+per-window attention signature (`[B*nW, heads, ws^2, ws^2]`) is likewise
+declared from the public `laion/clap-htsat-fused` config
 (`depths=[2,2,6,2]`, `num_heads=[4,8,16,32]`, `window_size=8`,
-`crates/jammi-encoders/src/htsat_audio.rs`'s own module doc) — UNVERIFIED
-against any real export (no HTSAT leg has been pulled). `htsat_signatures`
-below derives the four stages' window/head geometry from these declared
-constants; its kernel-name mapping is not exercised by this module's tests
-(no committed HTSAT fixture exists yet) beyond the generic reduction/matmul
-rules above, which are tower-agnostic.
+`hidden_size=96`) and unverified.
 
 Run:
   python3 ci/scripts/perf/profile_421_attribute.py --legs-dir .profile-421-legs/<ts>/legs \\
@@ -197,19 +308,54 @@ from __future__ import annotations
 
 import argparse
 import json
+import re
 import sys
 from dataclasses import dataclass, field
 from pathlib import Path
 
-SCHEMA_VERSION = 1
+SCHEMA_VERSION = 2
 
 VERDICT_VALID = "VALID"
 VERDICT_INVALID = "INVALID"
 
+# --- Original (pass 1) chain names -----------------------------------------
 CHAIN_LORA = "C-LORA"
 CHAIN_LN = "C-LN"
 CHAIN_GELU = "C-GELU"
 CHAIN_UNATTRIBUTED = "UNATTRIBUTED"
+
+# --- Pass-2 named buckets ----------------------------------------------------
+CHAIN_BASE_GEMM = "BASE-GEMM"
+CHAIN_ELEMENTWISE_QKV = "ELEMENTWISE-QKV"
+CHAIN_ELEMENTWISE_OUT = "ELEMENTWISE-OUT"
+CHAIN_ELEMENTWISE_MLP = "ELEMENTWISE-MLP"
+CHAIN_DROPOUT = "DROPOUT"
+CHAIN_CAST = "CAST"
+CHAIN_OPTIMIZER = "OPTIMIZER"
+CHAIN_EMBED_GATHER = "EMBED/GATHER"
+CHAIN_LOSS_REDUCE = "LOSS/REDUCE"
+CHAIN_PATCH_EMBED = "C-PATCH-EMBED"
+
+# --- HTSAT-only, declared but unverified (module doc, "HTSAT") -------------
+CHAIN_GELU_HTSAT = "C-GELU-HTSAT"
+CHAIN_WINDOWING = "WINDOWING"
+CHAIN_FRONT_FUSION = "FRONT-FUSION"
+
+# Chain buckets attached to every CLIP leg's `chains` dict (present-or-absent,
+# same discipline pass 1 established for LN/GELU/ATTN — see `attribute_census`).
+CLIP_ALWAYS_DECLARED_CHAINS: tuple[str, ...] = (
+    CHAIN_LN,
+    CHAIN_GELU,
+    CHAIN_BASE_GEMM,
+    CHAIN_ELEMENTWISE_QKV,
+    CHAIN_ELEMENTWISE_OUT,
+    CHAIN_ELEMENTWISE_MLP,
+    CHAIN_DROPOUT,
+    CHAIN_CAST,
+    CHAIN_OPTIMIZER,
+    CHAIN_EMBED_GATHER,
+    CHAIN_LOSS_REDUCE,
+)
 
 
 def chain_attn(tower: str) -> str:
@@ -220,16 +366,35 @@ def chain_attn(tower: str) -> str:
     return f"C-ATTN-{tower}"
 
 
-# The exact 44 kernel names observed in the real `clip-text-A1` (F32) export
-# pulled from pod `p421` run 2 at `c1b0b0ba`
-# (`scratchpad/pod421-run2/legs/clip-text-A1/census.json`). See this
-# module's own doc for why a name OUTSIDE this set is a leg-INVALIDATING
-# finding, never a silent UNATTRIBUTED fold.
+def declared_chains_for_tower(tower: str) -> tuple[str, ...]:
+    """Every chain this module ALWAYS reports a `measured`-or-`absent`
+    entry for, given `tower` — see `attribute_census`'s "every declared
+    chain present or explicitly absent" invariant."""
+    if tower == "clip-vision":
+        return CLIP_ALWAYS_DECLARED_CHAINS + (CHAIN_PATCH_EMBED, chain_attn(tower))
+    if tower == "clip-text":
+        return CLIP_ALWAYS_DECLARED_CHAINS + (chain_attn(tower),)
+    # HTSAT: only the two name-only chains this pass can classify without a
+    # real export (module doc, "HTSAT"); `WINDOWING`/`FRONT-FUSION` have no
+    # mapping yet and are deliberately NOT declared here (declaring a chain
+    # with no matching rule would silently report it "absent" forever,
+    # which is indistinguishable from "not yet implemented" — dishonest).
+    return (CHAIN_GELU_HTSAT, chain_attn(tower))
+
+
+# The exact kernel-name vocabulary observed across the real `clip-text-A1`
+# (F32, pass 1), `clip-text-D1`/`clip-text-D2` (F32, eager-LoRA/LN tile
+# variants), and `clip-vision-A1` (F32) exports pulled from pod `p421` run 2
+# at `c1b0b0ba`. See `is_known_kernel_name` for how BF16 names (a twin-name
+# RULE, not a hand-list) and any GEMM-family name (a name-pattern rule) are
+# additionally admitted without being enumerated here.
 KNOWN_KERNEL_NAMES: frozenset[str] = frozenset(
     {
         "badd_f32",
         "ampere_sgemm_32x128_tn",
+        "ampere_sgemm_32x128_nt",
         "ampere_sgemm_128x64_nn",
+        "ampere_sgemm_128x64_nt",
         "bmul_f32",
         "ampere_sgemm_128x32_tn",
         "ampere_sgemm_128x32_nn",
@@ -241,22 +406,24 @@ KNOWN_KERNEL_NAMES: frozenset[str] = frozenset(
         "bdiv_f32",
         "ucopy_f32",
         "ampere_sgemm_32x32_sliced1x4_nn",
+        "ampere_sgemm_32x32_sliced1x4_nt",
+        "ampere_sgemm_32x32_sliced1x4_tn",
         "ampere_sgemm_32x128_nn",
         "copy2d_f32",
         "ampere_sgemm_128x128_nt",
-        "ampere_sgemm_64x32_sliced1x4_nn",
-        "scaled_cast_add_f32_f32",
-        "ampere_sgemm_128x128_tn",
-        "splitKreduce_kernel",
         "ampere_sgemm_128x128_nn",
+        "ampere_sgemm_128x128_tn",
+        "ampere_sgemm_64x32_sliced1x4_nn",
+        "ampere_sgemm_64x32_sliced1x4_nt",
+        "scaled_cast_add_f32_f32",
+        "splitKreduce_kernel",
         "cast_f32_f32",
         "layer_norm_bwd_dx_f32",
+        "layer_norm_fwd_f32_biased",
         "eq_f32",
         "usqr_f32",
         "adamw_moment_update_f32",
         "fast_max_f32",
-        "ampere_sgemm_128x64_tn",
-        "layer_norm_fwd_f32_biased",
         "usigmoid_f32",
         "adamw_theta_update_f32",
         "const_set_f32",
@@ -265,44 +432,120 @@ KNOWN_KERNEL_NAMES: frozenset[str] = frozenset(
         "bmaximum_f32",
         "bminimum_f32",
         "usqrt_f32",
+        "urecip_f32",
         "is_u32_f32",
-        "ampere_sgemm_32x32_sliced1x4_tn",
         "fast_argmax_u32",
         "ucopy_u32",
         "gather_u32_f32",
         "sa_u32_f32",
+        # clip-vision-only, evidenced on `clip-vision-A1`
+        "im2col_f32",
+        "magma_sgemmEx_kernel",
     }
 )
+
+# Genuinely BF16-only kernel names with NO f32 twin in `KNOWN_KERNEL_NAMES`
+# (`name.replace("bf16", "f32")` does not land on a known name) — hand
+# admitted from the real `clip-text-A2` export, same discipline as every
+# other entry in `KNOWN_KERNEL_NAMES` above, kept in a separate constant
+# only so the twin-rule's own doc/tests can show what it does NOT cover.
+BF16_ONLY_KERNEL_NAMES: frozenset[str] = frozenset({"cast_add_bf16", "cast_scale_bf16_f32"})
+
+# Any kernel name containing this (case-insensitive) is GEMM-family
+# (cuBLAS/CUTLASS/MAGMA), regardless of dtype or tile-variant string — see
+# module doc, "`BASE-GEMM`: every other GEMM-family kernel".
+GEMM_NAME_RE = re.compile(r"gemm", re.IGNORECASE)
+
+
+def is_known_kernel_name(name: str) -> bool:
+    """`True` iff `name` is admitted ground truth for the INVALID-by-
+    unknown-kernel gate (`UNKNOWN_KERNEL_SHARE_LIMIT`) — NOT the same
+    question as "does this row land in a named chain": `Kernel2` is KNOWN
+    (pass 1 hand-verified it exists and is unclassifiable) but usually
+    lands in `UNATTRIBUTED`. Three admission paths, in order: (1) the
+    explicit `KNOWN_KERNEL_NAMES`/`BF16_ONLY_KERNEL_NAMES` ground truth;
+    (2) any GEMM-family name (the tile-variant explosion is a cuBLAS
+    heuristic, not a stable vocabulary — module doc); (3) a BF16 elementwise
+    name whose f32 TWIN (`"bf16"` -> `"f32"`) is already known (the twin
+    RULE the contract asks for, rather than hand-listing every observed
+    `*_bf16` name)."""
+    if name in KNOWN_KERNEL_NAMES or name in BF16_ONLY_KERNEL_NAMES:
+        return True
+    if GEMM_NAME_RE.search(name):
+        return True
+    if "bf16" in name and name.replace("bf16", "f32") in KNOWN_KERNEL_NAMES:
+        return True
+    return False
+
 
 # A leg-invalidating "we cannot classify this kernel" finding requires the
 # unknown name to carry MORE than this share of `gpu_kernel_us_per_step` —
 # the contract's own validity gate bounds UNATTRIBUTED at 5%; a name outside
-# `KNOWN_KERNEL_NAMES` above 1% of busy is material enough that folding it
+# `is_known_kernel_name` above 1% of busy is material enough that folding it
 # into UNATTRIBUTED (rather than refusing) could silently mask a real
 # attribution gap.
 UNKNOWN_KERNEL_SHARE_LIMIT = 0.01
 
+# Contract: "Validity gate: ... UNATTRIBUTED <= 5% of gpu_busy" — the bound
+# `leg_decision_grade` checks against a VALID leg's own UNATTRIBUTED share.
+UNATTRIBUTED_DECISION_GRADE_LIMIT = 0.05
+
 # Exclusive-by-name kernels: matched at ANY grid, independent of shape.
-LN_KERNEL_NAMES: frozenset[str] = frozenset({"layer_norm_fwd_f32_biased", "layer_norm_bwd_dx_f32"})
-GELU_EXCLUSIVE_KERNEL_NAMES: frozenset[str] = frozenset({"usigmoid_f32"})
+LN_KERNEL_NAMES: frozenset[str] = frozenset(
+    {
+        "layer_norm_fwd_f32_biased",
+        "layer_norm_bwd_dx_f32",
+        "layer_norm_fwd_bf16_biased",
+        "layer_norm_bwd_dx_bf16",
+    }
+)
+GELU_EXCLUSIVE_KERNEL_NAMES: frozenset[str] = frozenset({"usigmoid_f32", "usigmoid_bf16"})
 
-# Shape-gated kernels: matched only at the declared GELU element-count shape.
-GELU_SHAPE_KERNEL_NAMES: frozenset[str] = frozenset({"affine_f32", "bmul_f32"})
+# Shape-gated kernels: matched only at the declared GELU element-count shape
+# (`TowerSignatures.gelu_shape_elements`, i.e. the `mlp` activation tier).
+GELU_SHAPE_KERNEL_NAMES: frozenset[str] = frozenset({"affine_f32", "bmul_f32", "affine_bf16", "bmul_bf16"})
 
-# Shape-gated (row-count) kernels: matched only at the declared attention
-# softmax reduction row count.
-ATTN_REDUCTION_KERNEL_NAMES: frozenset[str] = frozenset({"fast_max_f32", "fast_sum_f32"})
+# `fast_sum`/`fast_max`: matched against TWO declared row counts (softmax
+# reduction rows -> C-ATTN; LN row count -> C-LN, eager only); every OTHER
+# row count is `LOSS/REDUCE` (module doc).
+ROW_REDUCTION_KERNEL_NAMES: frozenset[str] = frozenset(
+    {"fast_max_f32", "fast_sum_f32", "fast_max_bf16", "fast_sum_bf16"}
+)
 
-ATTN_SGEMM_PREFIX = "ampere_sgemm"
+# The eager LayerNorm's own flat-elementwise std/reciprocal step (module
+# doc, "C-LN extended"). Matched at `total_threads` covering `ln_row_count`.
+LN_ROW_FLAT_KERNEL_NAMES: frozenset[str] = frozenset({"usqrt_f32", "urecip_f32", "usqrt_bf16", "urecip_bf16"})
+
+# `EMBED/GATHER`: u32-typed index/token-id bookkeeping, by name, any grid.
+EMBED_GATHER_KERNEL_NAMES: frozenset[str] = frozenset(
+    {
+        "gather_u32_f32",
+        "gather_u32_bf16",
+        "sa_u32_f32",
+        "sa_u32_bf16",
+        "ucopy_u32",
+        "fast_argmax_u32",
+        "is_u32_f32",
+        "is_u32_bf16",
+    }
+)
+
+# `clip-vision`-only conv-as-matmul unfold, by name (module doc,
+# "`C-PATCH-EMBED`"). Never appears on `clip-text`.
+PATCH_EMBED_KERNEL_NAMES: frozenset[str] = frozenset({"im2col_f32", "im2col_bf16"})
 
 # Declared architecture constants for the two OpenCLIP towers (see this
-# module's doc, "Declared per-tower architecture constants"). `sites_per_
-# layer` is witnessed elsewhere (`fusible_site_census.lora_sites_wrapped`)
-# but stated here as the divisor `layers` is derived by.
+# module's doc, "Declared per-tower architecture constants" below).
 TOWER_ARCH: dict[str, dict[str, object]] = {
     "clip-text": {"sites_per_layer": 4, "width": 512, "heads": 8, "mlp_ratio": 4, "declared_seq": None},
     "clip-vision": {"sites_per_layer": 4, "width": 768, "heads": 12, "mlp_ratio": 4, "declared_seq": 50},
 }
+
+# Wire-default LoRA rank (contract, "Wire defaults: rank 8, alpha 16, ...") —
+# used ONLY to identify parameter-scale (not activation-scale) elementwise
+# ops for the `OPTIMIZER` bucket (module doc). Never used to derive an
+# activation-tensor shape.
+LORA_RANK = 8
 
 # The `--task` value each tower's `finetune-run` manifest carries — used
 # only for a friendlier reason string, never for signature derivation.
@@ -336,6 +579,48 @@ class TowerSignatures:
 
     def attn_batch_count(self) -> int:
         return self.rows.value * self.heads.value
+
+    def attn_shape_elements(self) -> int:
+        """The attention score/prob tensor's own element count,
+        `rows*heads*seq*seq` — module doc, "the attention SCORE/PROB
+        tensor's own elementwise ops"."""
+        return self.rows.value * self.heads.value * self.seq.value * self.seq.value
+
+    def qkv_shape_elements(self) -> int:
+        """`in_proj`'s combined Q/K/V output tensor's element count."""
+        return self.rows.value * self.seq.value * 3 * self.width.value
+
+    def out_shape_elements(self) -> int:
+        """`out_proj`/`c_proj`'s output (and the residual stream's own
+        width) element count."""
+        return self.rows.value * self.seq.value * self.width.value
+
+    def ln_row_count(self) -> int:
+        """The eager LayerNorm's own per-row reduction/elementwise count,
+        `rows*seq` — module doc, "C-LN extended". Distinct from
+        `attn_softmax_rows` (`rows*heads*seq`) by construction (`heads>1`
+        for both towers), so no collision with the attention reduction
+        rule."""
+        return self.rows.value * self.seq.value
+
+    def param_scale_elements(self) -> frozenset[int]:
+        """Element counts of the trainable PARAMETER tensors themselves
+        (LoRA A/B matrices, Linear biases, LN gamma/beta) at the wire-
+        default rank — module doc, "`OPTIMIZER` extended". Distinct from
+        every activation-tier element count above for this checkpoint's
+        declared constants (checked in this module's own tests)."""
+        width = self.width.value
+        mlp_width = self.mlp_width.value
+        return frozenset(
+            {
+                width,
+                3 * width,
+                mlp_width,
+                LORA_RANK * width,
+                LORA_RANK * 3 * width,
+                LORA_RANK * mlp_width,
+            }
+        )
 
     def as_dict(self) -> dict[str, dict[str, object]]:
         return {
@@ -412,14 +697,19 @@ def derive_signatures(tower: str, manifest: dict) -> TowerSignatures:
 
 
 def htsat_stage_signatures() -> list[dict[str, int]]:
-    """The four Swin stages' declared window/head geometry for HTSAT, from
-    the public `laion/clap-htsat-fused` HTSAT-tiny config (module doc). NOT
-    cross-checked against a real export — no HTSAT leg has been pulled yet.
-    Returned for documentation/forward-compatibility; no HTSAT census
-    currently feeds through the by-name mapping below (the generic
-    reduction/matmul rules are tower-agnostic and would apply once a real
-    HTSAT `by_kernel_and_grid` export lands and this list is verified the
-    same way `clip-text`'s constants were)."""
+    """The four Swin stages' declared window/head geometry for HTSAT, read
+    from the public `laion/clap-htsat-fused` config's own `audio_config`
+    (`depths=[2,2,6,2]`, `num_attention_heads=[4,8,16,32]`, `window_size=8`,
+    `hidden_size=768`, `hidden_act="gelu"` — fetched and cross-checked
+    against the values below at pass-2 time; `hidden_act="gelu"` also
+    confirms `crates/jammi-encoders/src/htsat_audio.rs`'s own load-time
+    refusal of anything else, §D3). NOT cross-checked against a real
+    KERNEL export — no HTSAT `by_kernel_and_grid` leg has landed yet.
+    Returned for documentation/forward-compatibility; `derive_signatures`
+    does not yet support `tower="htsat"` (raises `SignatureError`) — the
+    kernel-name<->shape MAPPING is read off the first real HTSAT export,
+    never guessed ahead of it (this module's own §D3 discipline, applied
+    to itself)."""
     depths = [2, 2, 6, 2]
     num_heads = [4, 8, 16, 32]
     window_size = 8
@@ -440,38 +730,116 @@ def _entry_block_size(entry: dict) -> int:
     return block[0] * block[1] * block[2]
 
 
+def _in_element_range(entry: dict, elements: int) -> bool:
+    """`True` iff `entry`'s total launched thread count covers exactly
+    `elements` (allowing for the block-size rounding a real launch grid
+    always does — `elements <= total_threads < elements + block_size`,
+    the same tolerance pass 1's GELU-shape match used)."""
+    total = _entry_total_threads(entry)
+    block_size = _entry_block_size(entry)
+    return elements <= total < elements + block_size
+
+
+def _is_row_count_grid(entry: dict, count: int) -> bool:
+    """`True` iff `entry`'s grid is a "one block per row" launch over
+    exactly `count` rows — `grid[0] == count`, `grid[1] == grid[2] == 1`
+    (block size is irrelevant to this shape, same as pass 1's softmax-
+    reduction rule)."""
+    grid = entry["grid"]
+    return grid[0] == count and grid[1] == 1 and grid[2] == 1
+
+
 def classify_kernel(entry: dict, sig: TowerSignatures, tower: str) -> str | None:
     """`chain name` this `(kernel, grid, block)` row belongs to, or `None`
     (UNATTRIBUTED — including "unknown kernel name", handled separately by
     the caller so it can also feed the INVALID gate). See module doc for
-    the evidence behind every branch."""
+    the evidence behind every branch. Checks run in priority order; an
+    earlier match wins, but several branches deliberately FALL THROUGH
+    (rather than returning early) when their specific shape does not match,
+    so a kernel whose name is shape-gated for one chain (e.g. `bmul_f32`
+    for `C-GELU`) can still land in a DIFFERENT chain at a DIFFERENT shape
+    (e.g. `C-ATTN-<tower>`'s own elementwise tier) instead of falling all
+    the way through to `UNATTRIBUTED`."""
     name = entry["kernel"]
+    grid = entry["grid"]
+
+    # --- Name-only chains, independent of shape -----------------------
+    if "cast" in name.lower():
+        return CHAIN_CAST
+    if name.startswith("adamw_"):
+        return CHAIN_OPTIMIZER
+    if name in EMBED_GATHER_KERNEL_NAMES:
+        return CHAIN_EMBED_GATHER
+    if name.startswith("dropout_fwd"):
+        return CHAIN_DROPOUT
     if name in LN_KERNEL_NAMES:
         return CHAIN_LN
-    if name in GELU_EXCLUSIVE_KERNEL_NAMES:
-        return CHAIN_GELU
-    if name in GELU_SHAPE_KERNEL_NAMES:
-        elements = sig.gelu_shape_elements()
-        total = _entry_total_threads(entry)
-        block_size = _entry_block_size(entry)
-        if elements <= total < elements + block_size:
-            return CHAIN_GELU
-        return None
-    if name in ATTN_REDUCTION_KERNEL_NAMES:
-        grid = entry["grid"]
-        if grid[1] == 1 and grid[2] == 1 and grid[0] == sig.attn_softmax_rows():
+    if tower == "clip-vision" and name in PATCH_EMBED_KERNEL_NAMES:
+        return CHAIN_PATCH_EMBED
+
+    # --- Row-count-gated reductions: softmax rows -> ATTN; LN rows ->
+    #     C-LN (eager only); every other row count -> LOSS/REDUCE.
+    if name in ROW_REDUCTION_KERNEL_NAMES:
+        if _is_row_count_grid(entry, sig.attn_softmax_rows()):
             return chain_attn(tower)
-        return None
-    if name.startswith(ATTN_SGEMM_PREFIX):
-        if sig.attn_batch_count() in entry["grid"]:
-            return chain_attn(tower)
-        return None
-    return None
+        if _is_row_count_grid(entry, sig.ln_row_count()):
+            return CHAIN_LN
+        return CHAIN_LOSS_REDUCE
+
+    # --- Eager LN's own flat std/reciprocal step (module doc). Falls
+    #     through (does not return None) when the shape does not match,
+    #     so e.g. a stray `usqrt_f32` at parameter scale can still land in
+    #     `OPTIMIZER` below.
+    chain: str | None = None
+    if name in LN_ROW_FLAT_KERNEL_NAMES and _in_element_range(entry, sig.ln_row_count()):
+        chain = CHAIN_LN
+
+    # --- GELU: exclusive by name; shape-gated for the shared elementwise
+    #     names (falls through on a shape miss, same reasoning as above).
+    if chain is None and name in GELU_EXCLUSIVE_KERNEL_NAMES:
+        chain = CHAIN_GELU
+    if chain is None and name in GELU_SHAPE_KERNEL_NAMES and _in_element_range(entry, sig.gelu_shape_elements()):
+        chain = CHAIN_GELU
+
+    # --- Batched-attention grid signature: relational, NAME-INDEPENDENT
+    #     (module doc, "the batched-matmul grid signature") — catches any
+    #     GEMM-family kernel AND anonymous kernels alike.
+    if chain is None and sig.attn_batch_count() in grid:
+        chain = chain_attn(tower)
+
+    # --- GEMM-family by name (not carrying the attention batch count).
+    if chain is None and GEMM_NAME_RE.search(name):
+        chain = CHAIN_BASE_GEMM
+    if chain is None and name == "splitKreduce_kernel":
+        chain = CHAIN_BASE_GEMM
+
+    # --- Attention tensor's own elementwise ops (mask add, scale, cast,
+    #     backward exp/square, ...) — module doc, "the attention SCORE/PROB
+    #     tensor's own elementwise ops".
+    if chain is None and _in_element_range(entry, sig.attn_shape_elements()):
+        chain = chain_attn(tower)
+
+    # --- Parameter-scale bookkeeping (module doc, "OPTIMIZER extended").
+    if chain is None:
+        for elements in sig.param_scale_elements():
+            if _in_element_range(entry, elements):
+                chain = CHAIN_OPTIMIZER
+                break
+
+    # --- The three activation-tier elementwise buckets.
+    if chain is None and _in_element_range(entry, sig.qkv_shape_elements()):
+        chain = CHAIN_ELEMENTWISE_QKV
+    if chain is None and _in_element_range(entry, sig.out_shape_elements()):
+        chain = CHAIN_ELEMENTWISE_OUT
+    if chain is None and _in_element_range(entry, sig.gelu_shape_elements()):
+        chain = CHAIN_ELEMENTWISE_MLP
+
+    return chain
 
 
 @dataclass
 class ChainResult:
-    status: str  # "measured" | "absent" | "requires_d2_delta"
+    status: str  # "measured" | "absent" | "requires_d2_delta" | "measured_via_d2_delta"
     gpu_busy_us: float | None = None
     share_gpu_busy: float | None = None
     share_wall: float | None = None
@@ -499,10 +867,10 @@ def attribute_census(
     """Classify every `by_kernel_and_grid` row into a chain bucket.
 
     Returns `(chains, unknown_kernel_rows, invalid_reasons)`. `chains`
-    always carries an entry for `C-LN`, `C-GELU`, `C-ATTN-<tower>` and
-    `UNATTRIBUTED` (per-test invariant: "every declared chain present or
-    explicitly absent") — `status="absent"` means literally zero rows
-    matched, distinct from `status="measured"` with `gpu_busy_us=0.0`.
+    always carries an entry for every `declared_chains_for_tower(tower)`
+    name (per-test invariant: "every declared chain present or explicitly
+    absent") plus `UNATTRIBUTED` — `status="absent"` means literally zero
+    rows matched, distinct from `status="measured"` with `gpu_busy_us=0.0`.
     `C-LORA` is NOT added here (it needs a cross-leg D2 delta — see
     `attach_lora_via_d2_delta`).
     """
@@ -516,12 +884,9 @@ def attribute_census(
     if not isinstance(wall_s, (int, float)) or isinstance(wall_s, bool):
         raise SignatureError(f"census.wall_s_per_step is not a number ({wall_s!r})")
 
-    buckets: dict[str, float] = {
-        CHAIN_LN: 0.0,
-        CHAIN_GELU: 0.0,
-        chain_attn(tower): 0.0,
-        CHAIN_UNATTRIBUTED: 0.0,
-    }
+    declared = declared_chains_for_tower(tower)
+    buckets: dict[str, float] = {name: 0.0 for name in declared}
+    buckets[CHAIN_UNATTRIBUTED] = 0.0
     matched_kernels: dict[str, list[str]] = {k: [] for k in buckets}
     unknown_rows: list[dict[str, object]] = []
     invalid_reasons: list[str] = []
@@ -534,14 +899,14 @@ def attribute_census(
         ):
             invalid_reasons.append(f"by_kernel_and_grid row is malformed: {entry!r}")
             continue
-        if name not in KNOWN_KERNEL_NAMES:
+        if not is_known_kernel_name(name):
             share = (us_per_step / total_busy_us) if total_busy_us else 0.0
             unknown_rows.append(
                 {"kernel": name, "grid": entry.get("grid"), "share_gpu_busy": share}
             )
             if share > UNKNOWN_KERNEL_SHARE_LIMIT:
                 invalid_reasons.append(
-                    f"kernel {name!r} (grid={entry.get('grid')!r}) is not in KNOWN_KERNEL_NAMES "
+                    f"kernel {name!r} (grid={entry.get('grid')!r}) is not a known kernel name "
                     f"and carries share_gpu_busy={share:.4f} > {UNKNOWN_KERNEL_SHARE_LIMIT} — "
                     "the mapping cannot classify it and refuses to guess"
                 )
@@ -595,6 +960,32 @@ def leg_role(kernels_disabled: list[str], tower: str) -> str:
     return "other"
 
 
+def leg_decision_grade(row: dict) -> tuple[bool, str | None]:
+    """`(decision_grade, reason)` for one leg's already-built attribution
+    row (contract: "Validity gate: ... UNATTRIBUTED <= 5% of gpu_busy").
+    `reason` is `None` iff `decision_grade` is `True`."""
+    if row.get("verdict") != VERDICT_VALID:
+        return False, "leg is INVALID (see this leg's own `reasons`)"
+    chains = row.get("chains")
+    if not isinstance(chains, dict):
+        return False, "no chains computed for this leg"
+    unattributed = chains.get(CHAIN_UNATTRIBUTED)
+    if not isinstance(unattributed, dict):
+        return False, "no UNATTRIBUTED entry computed for this leg"
+    share = unattributed.get("share_gpu_busy")
+    if not isinstance(share, (int, float)) or isinstance(share, bool):
+        return False, "UNATTRIBUTED share_gpu_busy is not a number"
+    if share != share or share in (float("inf"), float("-inf")):  # NaN/inf guard (family F:
+        # `NaN > 0.05` is `False`, so a naive threshold check would let a
+        # diverged/non-finite share silently pass as decision_grade=True).
+        return False, f"UNATTRIBUTED share_gpu_busy is non-finite ({share!r})"
+    if share > UNATTRIBUTED_DECISION_GRADE_LIMIT:
+        return False, (
+            f"UNATTRIBUTED share_gpu_busy={share:.4f} > {UNATTRIBUTED_DECISION_GRADE_LIMIT}"
+        )
+    return True, None
+
+
 def attach_lora_via_d2_delta(leg_rows: list[dict]) -> None:
     """Mutates `leg_rows` IN PLACE: for every tower with a VALID F32 `A`
     leg (`A1`; `D2` is F32-only per the contract's legs table) AND a VALID
@@ -604,9 +995,10 @@ def attach_lora_via_d2_delta(leg_rows: list[dict]) -> None:
     `A2`/BF16, and any tower missing its `D2` twin) gets the declared-absent
     `status: "requires_d2_delta"` placeholder — never a guess.
 
-    Also attaches the ADVISORY `d1_minus_d2_busy_us` cross-check (contract:
-    "D1 - D2 = C-LN on CLIP, C-LN + C-GELU on HTSAT") to the A-leg's row
-    when both `D1` and `D2` are present and VALID for that tower.
+    Also attaches the ADVISORY `d1_minus_d2_busy_us_advisory` cross-check
+    (contract: "D1 - D2 = C-LN on CLIP, C-LN + C-GELU on HTSAT") to the
+    A-leg's row when both `D1` and `D2` are present and VALID for that
+    tower.
     """
     by_tower: dict[str, dict[str, dict]] = {}
     for row in leg_rows:
@@ -662,6 +1054,128 @@ def attach_lora_via_d2_delta(leg_rows: list[dict]) -> None:
             ).as_dict()
 
 
+# --- The two-sided decision rule (contract "Decision rule") -----------------
+
+ACTIVATE_WALL_THRESHOLD = 0.10
+DECLINE_COMBINED_THRESHOLD = 0.05
+
+# `(port name) -> (tower, chain key that port's numbers come from)`. Built
+# by `candidate_ports_for_tower` per tower — `C-MLP-<tower>` reads the
+# `C-GELU` chain's OWN numbers (contract: "C-MLP-CLIP-text/vision = the
+# C-GELU quick_gelu bucket"), never a separately-computed value.
+CANDIDATE_CHAIN_TOWERS: tuple[str, ...] = ("clip-text", "clip-vision")
+
+
+def candidate_ports_for_tower(tower: str) -> dict[str, str]:
+    return {f"C-ATTN-{tower}": chain_attn(tower), f"C-MLP-{tower}": CHAIN_GELU}
+
+
+def _leg_chain_shares(leg: dict, chain_key: str) -> tuple[float, float, float, float]:
+    """`(s_wall, s_busy, u_wall, u_busy)` for one leg row, `0.0` for any
+    missing/absent/non-finite entry (contract F: a `NaN`/absent share must
+    never silently pass a threshold check the way `NaN > c` would)."""
+    chains = leg.get("chains") or {}
+    chain = chains.get(chain_key) or {}
+    unattributed = chains.get(CHAIN_UNATTRIBUTED) or {}
+
+    def _finite(value: object) -> float:
+        if not isinstance(value, (int, float)) or isinstance(value, bool):
+            return 0.0
+        if value != value or value in (float("inf"), float("-inf")):  # NaN/inf guard
+            return 0.0
+        return float(value)
+
+    return (
+        _finite(chain.get("share_wall")),
+        _finite(chain.get("share_gpu_busy")),
+        _finite(unattributed.get("share_wall")),
+        _finite(unattributed.get("share_gpu_busy")),
+    )
+
+
+def decide_candidate_port(port_name: str, chain_key: str, tower: str, legs: list[dict]) -> dict:
+    """The contract's two-sided rule for ONE candidate port. `legs` must
+    still carry the internal `_role`/`_gpu_busy_us_per_step` fields (i.e.
+    called BEFORE `build_report` strips them, same requirement
+    `attach_lora_via_d2_delta` has)."""
+    a_legs = [
+        leg
+        for leg in legs
+        if leg.get("tower") == tower and leg.get("_role") == "A" and leg.get("verdict") == VERDICT_VALID
+    ]
+    a1 = next((leg for leg in a_legs if leg.get("dtype") == "f32"), None)
+    a2 = next((leg for leg in a_legs if leg.get("dtype") == "bf16"), None)
+
+    a1_grade, a1_reason = leg_decision_grade(a1) if a1 is not None else (False, "no A1 (F32) leg present")
+    if not a1_grade:
+        return {
+            "port": port_name,
+            "tower": tower,
+            "chain": chain_key,
+            "verdict": "UNRESOLVED",
+            "reason": f"A1 not decision-grade: {a1_reason}",
+        }
+
+    a2_grade, a2_reason = leg_decision_grade(a2) if a2 is not None else (False, "no A2 (BF16) leg present")
+    f32_only_note = ""
+    if a2 is not None and not a2_grade:
+        f32_only_note = f" (F32-only: A2 not decision-grade — {a2_reason})"
+
+    decision_grade_legs = [a1] + ([a2] if a2 is not None and a2_grade else [])
+
+    for leg in decision_grade_legs:
+        s_wall, _s_busy, _u_wall, _u_busy = _leg_chain_shares(leg, chain_key)
+        if s_wall >= ACTIVATE_WALL_THRESHOLD:
+            return {
+                "port": port_name,
+                "tower": tower,
+                "chain": chain_key,
+                "verdict": "ACTIVATE",
+                "reason": f"{leg['leg_id']}: s_wall={s_wall:.4f} >= {ACTIVATE_WALL_THRESHOLD}" + f32_only_note,
+            }
+
+    declines = True
+    decline_detail = []
+    for leg in decision_grade_legs:
+        s_wall, s_busy, u_wall, u_busy = _leg_chain_shares(leg, chain_key)
+        wall_combined = s_wall + u_wall
+        busy_combined = s_busy + u_busy
+        ok = wall_combined < DECLINE_COMBINED_THRESHOLD and busy_combined < DECLINE_COMBINED_THRESHOLD
+        decline_detail.append(
+            f"{leg['leg_id']}: s_wall+U_wall={wall_combined:.4f}, s_busy+U_busy={busy_combined:.4f}"
+        )
+        if not ok:
+            declines = False
+
+    if declines:
+        return {
+            "port": port_name,
+            "tower": tower,
+            "chain": chain_key,
+            "verdict": "DECLINE",
+            "reason": "; ".join(decline_detail) + f32_only_note,
+        }
+    return {
+        "port": port_name,
+        "tower": tower,
+        "chain": chain_key,
+        "verdict": "UNRESOLVED",
+        "reason": "neither ACTIVATE (s_wall>=10% on any decision-grade leg) nor DECLINE "
+        "(combined share <5% on every decision-grade leg) — " + "; ".join(decline_detail) + f32_only_note,
+    }
+
+
+def decide_all_candidates(legs: list[dict]) -> list[dict]:
+    """Every candidate port's decision, across every tower this module
+    knows candidate ports for. Called BEFORE `build_report` strips the
+    internal `_role`/`_gpu_busy_us_per_step` fields."""
+    decisions: list[dict] = []
+    for tower in CANDIDATE_CHAIN_TOWERS:
+        for port_name, chain_key in candidate_ports_for_tower(tower).items():
+            decisions.append(decide_candidate_port(port_name, chain_key, tower, legs))
+    return decisions
+
+
 def _load_json(path: Path) -> dict:
     with path.open(encoding="utf-8") as f:
         return json.load(f)
@@ -682,12 +1196,15 @@ def attribute_leg(leg_dir: Path) -> dict:
         "signatures": None,
         "chains": None,
         "unknown_kernels": [],
+        "decision_grade": False,
+        "decision_grade_reason": None,
     }
     reasons: list[str] = []
     try:
         manifest = _load_json(leg_dir / "manifest.json")
     except (OSError, json.JSONDecodeError) as exc:
         row["reasons"] = [f"{leg_id}: manifest.json could not be read: {exc}"]
+        row["decision_grade_reason"] = "leg is INVALID (see this leg's own `reasons`)"
         return row
 
     tower = manifest.get("tower")
@@ -697,6 +1214,7 @@ def attribute_leg(leg_dir: Path) -> dict:
     kernels_disabled = manifest.get("kernels_disabled")
     if not isinstance(kernels_disabled, list):
         row["reasons"] = [f"{leg_id}: manifest.kernels_disabled is not a list"]
+        row["decision_grade_reason"] = "leg is INVALID (see this leg's own `reasons`)"
         return row
     row["_role"] = leg_role([str(k) for k in kernels_disabled], str(tower))
 
@@ -712,6 +1230,7 @@ def attribute_leg(leg_dir: Path) -> dict:
     except (OSError, json.JSONDecodeError) as exc:
         reasons.append(f"{leg_id}: census.json could not be read: {exc}")
         row["reasons"] = reasons
+        row["decision_grade_reason"] = "leg is INVALID (see this leg's own `reasons`)"
         return row
 
     if census.get("excluded_from_chain_attribution") is True:
@@ -721,11 +1240,13 @@ def attribute_leg(leg_dir: Path) -> dict:
             "E1 exclusion)"
         )
         row["reasons"] = reasons
+        row["decision_grade_reason"] = "leg is INVALID (see this leg's own `reasons`)"
         return row
 
     if not isinstance(tower, str):
         reasons.append(f"{leg_id}: manifest.tower is not a string ({tower!r})")
         row["reasons"] = reasons
+        row["decision_grade_reason"] = "leg is INVALID (see this leg's own `reasons`)"
         return row
 
     try:
@@ -733,6 +1254,7 @@ def attribute_leg(leg_dir: Path) -> dict:
     except SignatureError as exc:
         reasons.append(f"{leg_id}: {exc}")
         row["reasons"] = reasons
+        row["decision_grade_reason"] = "leg is INVALID (see this leg's own `reasons`)"
         return row
     row["signatures"] = sig.as_dict()
 
@@ -741,6 +1263,7 @@ def attribute_leg(leg_dir: Path) -> dict:
     except SignatureError as exc:
         reasons.append(f"{leg_id}: {exc}")
         row["reasons"] = reasons
+        row["decision_grade_reason"] = "leg is INVALID (see this leg's own `reasons`)"
         return row
     reasons.extend(classify_reasons)
     row["unknown_kernels"] = unknown
@@ -749,9 +1272,19 @@ def attribute_leg(leg_dir: Path) -> dict:
     row["_wall_s_per_step"] = census.get("wall_s_per_step")
     row["gpu_busy_us_per_step"] = census.get("gpu_kernel_us_per_step")
     row["wall_s_per_step"] = census.get("wall_s_per_step")
+    memcpy = census.get("memcpy_per_step")
+    memset = census.get("memset_per_step")
+    if isinstance(memcpy, dict) or isinstance(memset, dict):
+        # Reported for visibility ONLY — never folded into any chain's
+        # `share_gpu_busy` denominator (contract §D2: "nsys memcpy rows
+        # reported separately from gpu_busy").
+        row["memcpy_memset"] = {"memcpy_per_step": memcpy, "memset_per_step": memset}
 
     row["reasons"] = reasons
     row["verdict"] = VERDICT_INVALID if reasons else VERDICT_VALID
+    grade, grade_reason = leg_decision_grade(row)
+    row["decision_grade"] = grade
+    row["decision_grade_reason"] = grade_reason
     return row
 
 
@@ -766,6 +1299,15 @@ def _leg_dirs(legs_dir: Path) -> list[Path]:
 def build_report(legs_dir: Path) -> dict:
     legs = [attribute_leg(d) for d in _leg_dirs(legs_dir)]
     attach_lora_via_d2_delta(legs)
+    # Recompute decision_grade for A legs now that `C-LORA` may have been
+    # attached (it never changes the UNATTRIBUTED share, so this is a
+    # no-op in practice, but keeps `decision_grade` a function of the
+    # FINAL published `chains` dict rather than an intermediate one).
+    for row in legs:
+        grade, grade_reason = leg_decision_grade(row)
+        row["decision_grade"] = grade
+        row["decision_grade_reason"] = grade_reason
+    candidate_decisions = decide_all_candidates(legs)
     # Strip the leading-underscore working fields — internal to this
     # module's cross-leg pass, not part of the published schema.
     for row in legs:
@@ -777,10 +1319,12 @@ def build_report(legs_dir: Path) -> dict:
         "schema": SCHEMA_VERSION,
         "legs_dir": str(legs_dir),
         "legs": legs,
+        "candidate_decisions": candidate_decisions,
         "summary": {
             "legs_total": len(legs),
             "legs_valid": sum(1 for row in legs if row["verdict"] == VERDICT_VALID),
             "legs_invalid": sum(1 for row in legs if row["verdict"] == VERDICT_INVALID),
+            "legs_decision_grade": sum(1 for row in legs if row["decision_grade"]),
         },
     }
     return report
@@ -792,17 +1336,18 @@ def format_table(report: dict) -> str:
     by eye."""
     lines: list[str] = []
     header = (
-        f"{'leg_id':<16} {'tower':<12} {'dtype':<5} {'verdict':<8} "
-        f"{'chain':<16} {'status':<20} {'share_busy':>10} {'share_wall':>10}"
+        f"{'leg_id':<16} {'tower':<12} {'dtype':<5} {'verdict':<8} {'grade':<6} "
+        f"{'chain':<20} {'status':<22} {'share_busy':>10} {'share_wall':>10}"
     )
     lines.append(header)
     lines.append("-" * len(header))
     for row in report.get("legs", []):
         chains = row.get("chains") or {}
+        grade = "yes" if row.get("decision_grade") else "no"
         if not chains:
             lines.append(
                 f"{row['leg_id']:<16} {str(row.get('tower')):<12} {str(row.get('dtype')):<5} "
-                f"{row['verdict']:<8} {'(none)':<16} {'':<20} {'':>10} {'':>10}"
+                f"{row['verdict']:<8} {grade:<6} {'(none)':<20} {'':<22} {'':>10} {'':>10}"
             )
             continue
         for chain_name in sorted(chains):
@@ -811,10 +1356,14 @@ def format_table(report: dict) -> str:
             share_wall = entry.get("share_wall")
             lines.append(
                 f"{row['leg_id']:<16} {str(row.get('tower')):<12} {str(row.get('dtype')):<5} "
-                f"{row['verdict']:<8} {chain_name:<16} {entry.get('status', ''):<20} "
+                f"{row['verdict']:<8} {grade:<6} {chain_name:<20} {entry.get('status', ''):<22} "
                 f"{(f'{share_busy:.4f}' if isinstance(share_busy, (int, float)) else ''):>10} "
                 f"{(f'{share_wall:.4f}' if isinstance(share_wall, (int, float)) else ''):>10}"
             )
+    lines.append("")
+    lines.append("candidate port decisions:")
+    for decision in report.get("candidate_decisions", []):
+        lines.append(f"  {decision['port']:<20} {decision['verdict']:<12} {decision['reason']}")
     return "\n".join(lines)
 
 
@@ -855,11 +1404,17 @@ def main(argv: list[str] | None = None) -> int:
             print(f"::warning::leg {row['leg_id']}: {row['verdict']}", file=sys.stderr)
             for reason in row["reasons"]:
                 print(f"  - {reason}", file=sys.stderr)
+        elif not row["decision_grade"]:
+            print(
+                f"::warning::leg {row['leg_id']}: not decision_grade: {row['decision_grade_reason']}",
+                file=sys.stderr,
+            )
     if not args.no_table:
         print(format_table(report), file=sys.stderr)
     summary = report["summary"]
     print(
-        f"profile_421_attribute: {summary['legs_valid']}/{summary['legs_total']} legs VALID",
+        f"profile_421_attribute: {summary['legs_valid']}/{summary['legs_total']} legs VALID, "
+        f"{summary['legs_decision_grade']}/{summary['legs_total']} decision_grade",
         file=sys.stderr,
     )
     return 0

@@ -1,0 +1,343 @@
+{
+ "source": "scratchpad/pod421-run2/legs/clip-vision-A1/census.json (pod p421 run 2, git_sha c1b0b0bad1f79a4ad6c298400e6ea19cc1ca633c)",
+ "gpu_kernel_us_per_step": 65212.199092,
+ "wall_s_per_step": 0.11467209593000001,
+ "by_kernel_and_grid": [
+  {
+   "kernel": "im2col_f32",
+   "grid": [
+    3528,
+    1,
+    1
+   ],
+   "block": [
+    1024,
+    1,
+    1
+   ],
+   "launches_per_step": 1.0,
+   "us_per_step": 106.51236,
+   "share": 0.0016333195549767397
+  },
+  {
+   "kernel": "magma_sgemmEx_kernel",
+   "grid": [
+    1,
+    2,
+    288
+   ],
+   "block": [
+    8,
+    8,
+    1
+   ],
+   "launches_per_step": 24.0,
+   "us_per_step": 487.364476,
+   "share": 0.007473516961334741
+  },
+  {
+   "kernel": "ampere_sgemm_128x32_tn",
+   "grid": [
+    24,
+    38,
+    1
+   ],
+   "block": [
+    256,
+    1,
+    1
+   ],
+   "launches_per_step": 12.0,
+   "us_per_step": 4174.919752,
+   "share": 0.06402053312310647
+  },
+  {
+   "kernel": "badd_f32",
+   "grid": [
+    704,
+    1,
+    1
+   ],
+   "block": [
+    1024,
+    1,
+    1
+   ],
+   "launches_per_step": 84.0,
+   "us_per_step": 854.199702,
+   "share": 0.013098771608589873
+  },
+  {
+   "kernel": "layer_norm_fwd_f32_biased",
+   "grid": [
+    1200,
+    1,
+    1
+   ],
+   "block": [
+    256,
+    1,
+    1
+   ],
+   "launches_per_step": 25.0,
+   "us_per_step": 274.480136,
+   "share": 0.004209030516096677
+  },
+  {
+   "kernel": "layer_norm_bwd_dx_f32",
+   "grid": [
+    1200,
+    1,
+    1
+   ],
+   "block": [
+    256,
+    1,
+    1
+   ],
+   "launches_per_step": 23.0,
+   "us_per_step": 449.24762400000003,
+   "share": 0.006889012029270948
+  },
+  {
+   "kernel": "usigmoid_f32",
+   "grid": [
+    3600,
+    1,
+    1
+   ],
+   "block": [
+    1024,
+    1,
+    1
+   ],
+   "launches_per_step": 12.0,
+   "us_per_step": 291.578828,
+   "share": 0.00447123133493239
+  },
+  {
+   "kernel": "affine_f32",
+   "grid": [
+    3600,
+    1,
+    1
+   ],
+   "block": [
+    1024,
+    1,
+    1
+   ],
+   "launches_per_step": 36.0,
+   "us_per_step": 843.538576,
+   "share": 0.012935287994351386
+  },
+  {
+   "kernel": "bmul_f32",
+   "grid": [
+    3600,
+    1,
+    1
+   ],
+   "block": [
+    1024,
+    1,
+    1
+   ],
+   "launches_per_step": 60.0,
+   "us_per_step": 2713.160486,
+   "share": 0.04160510646439526
+  },
+  {
+   "kernel": "fast_max_f32",
+   "grid": [
+    14400,
+    1,
+    1
+   ],
+   "block": [
+    64,
+    1,
+    1
+   ],
+   "launches_per_step": 12.0,
+   "us_per_step": 241.26480600000002,
+   "share": 0.0036996882386933264
+  },
+  {
+   "kernel": "fast_sum_f32",
+   "grid": [
+    14400,
+    1,
+    1
+   ],
+   "block": [
+    64,
+    1,
+    1
+   ],
+   "launches_per_step": 36.0,
+   "us_per_step": 721.415316,
+   "share": 0.011062582247567551
+  },
+  {
+   "kernel": "fast_sum_f32",
+   "grid": [
+    1,
+    1,
+    1
+   ],
+   "block": [
+    1024,
+    1,
+    1
+   ],
+   "launches_per_step": 96.0,
+   "us_per_step": 1314.031068,
+   "share": 0.02015008060295885
+  },
+  {
+   "kernel": "urecip_f32",
+   "grid": [
+    1,
+    1,
+    1
+   ],
+   "block": [
+    1024,
+    1,
+    1
+   ],
+   "launches_per_step": 1.0,
+   "us_per_step": 1.7178879999999999,
+   "share": 2.6343046606608674e-05
+  },
+  {
+   "kernel": "badd_f32",
+   "grid": [
+    900,
+    1,
+    1
+   ],
+   "block": [
+    1024,
+    1,
+    1
+   ],
+   "launches_per_step": 337.0,
+   "us_per_step": 4292.403196,
+   "share": 0.06582208936006541
+  },
+  {
+   "kernel": "badd_f32",
+   "grid": [
+    2700,
+    1,
+    1
+   ],
+   "block": [
+    1024,
+    1,
+    1
+   ],
+   "launches_per_step": 72.0,
+   "us_per_step": 3696.551532,
+   "share": 0.056684969736796986
+  },
+  {
+   "kernel": "badd_f32",
+   "grid": [
+    3600,
+    1,
+    1
+   ],
+   "block": [
+    1024,
+    1,
+    1
+   ],
+   "launches_per_step": 84.0,
+   "us_per_step": 4287.296326000001,
+   "share": 0.06574377778537376
+  },
+  {
+   "kernel": "adamw_moment_update_f32",
+   "grid": [
+    6,
+    1,
+    1
+   ],
+   "block": [
+    1024,
+    1,
+    1
+   ],
+   "launches_per_step": 120.0,
+   "us_per_step": 293.543276,
+   "share": 0.004501355269216965
+  },
+  {
+   "kernel": "cast_f32_f32",
+   "grid": [
+    3600,
+    1,
+    1
+   ],
+   "block": [
+    1024,
+    1,
+    1
+   ],
+   "launches_per_step": 12.0,
+   "us_per_step": 256.596838,
+   "share": 0.0039347981140460935
+  },
+  {
+   "kernel": "scaled_cast_add_f32_f32",
+   "grid": [
+    3600,
+    1,
+    1
+   ],
+   "block": [
+    1024,
+    1,
+    1
+   ],
+   "launches_per_step": 12.0,
+   "us_per_step": 368.96286,
+   "share": 0.005657880966097692
+  },
+  {
+   "kernel": "dropout_fwd_f32",
+   "grid": [
+    3600,
+    1,
+    1
+   ],
+   "block": [
+    256,
+    1,
+    1
+   ],
+   "launches_per_step": 108.0,
+   "us_per_step": 1042.951148,
+   "share": 0.015993190883328845
+  },
+  {
+   "kernel": "Kernel2",
+   "grid": [
+    6,
+    1,
+    18
+   ],
+   "block": [
+    128,
+    1,
+    1
+   ],
+   "launches_per_step": 60.0,
+   "us_per_step": 550.541514,
+   "share": 0.008442308673309844
+  }
+ ]
+}

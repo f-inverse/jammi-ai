@@ -56,15 +56,30 @@ exercises are:
 - Attention batched-matmul count `rows*heads = 192` (the three
   `ampere_sgemm_128x128_{nt,tn,nn}` rows at `grid=[1,1,192]`).
 
-Rows chosen to be NEGATIVE controls for the shape gate:
-`ampere_sgemm_128x64_nn` at `grid=[4,29,7]` (no `192` in any dimension — a
-base/LoRA Linear projection matmul, must land `UNATTRIBUTED`); `badd_f32` at
-the GELU shape (must land `UNATTRIBUTED`, not `C-GELU` — see
-`profile_421_attribute.py`'s module doc, "Deliberately EXCLUDED"); a SECOND
-`bmul_f32` row at `grid=[1112,1,1]` (`1112*1024=1,138,688` elements — NOT the
-GELU shape, must land `UNATTRIBUTED` even though `bmul_f32` is a
-shape-gated GELU kernel NAME); `dropout_fwd_f32`/`adamw_moment_update_f32`
-(known names, no chain rule matches either — must land `UNATTRIBUTED`).
+Rows chosen to be NEGATIVE controls for the shape gate (pass 1): `badd_f32`
+at the GELU shape (still lands OUT of `C-GELU`, not `C-GELU` — see
+`profile_421_attribute.py`'s module doc, "Deliberately EXCLUDED");
+`dropout_fwd_f32`/`adamw_moment_update_f32` (known names, no CHAIN-1 rule
+matched either).
+
+**Pass-2 update (contract v2.5 §Attribution, named-bucket extension — see
+`profile_421_attribute.py`'s own module doc):** three of these four
+"negative controls" were negative controls for pass 1's THREE-chain scope
+only, not for `UNATTRIBUTED` itself — they now land NAMED buckets pass 2
+adds: `ampere_sgemm_128x64_nn` at `grid=[4,29,7]` (no `192` in any
+dimension) -> `BASE-GEMM`; `badd_f32` at the GELU shape -> `ELEMENTWISE-MLP`
+(still not `C-GELU`, the exclusion itself is UNCHANGED, only where the
+excluded row now lands); `dropout_fwd_f32` -> `DROPOUT`;
+`adamw_moment_update_f32` -> `OPTIMIZER`. The SECOND `bmul_f32` row at
+`grid=[1112,1,1]` (`1112*1024=1,138,688` elements — NOT the GELU shape)
+likewise now FALLS THROUGH pass 1's GELU-shape gate (unchanged: it is still
+excluded from `C-GELU`) into the attention tensor's own elementwise tier
+(`attn_shape_elements() = rows*heads*seq*seq = 1,138,368`, which
+`1,138,688` covers) -> `C-ATTN-clip-text`, per `classify_kernel`'s
+documented "fall through" behavior. This fixture's OWN 15 rows and their
+grids are UNCHANGED from pass 1 (nothing was re-cut) — only which chain
+each classifies into changed, per the new rules `test_profile_421_attribute.py`
+now asserts.
 
 None of the 15 rows' `us_per_step`/`launches_per_step`/`share` fields are
 asserted as literal expected values anywhere in

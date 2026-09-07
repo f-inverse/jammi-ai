@@ -253,5 +253,227 @@ class CliTests(unittest.TestCase):
             self.assertEqual(rc, 2)
 
 
+class HeldOutSplitTests(unittest.TestCase):
+    """`--heldout-rows` (issue #421 P1-b(iv)): the held-out split's ROW
+    COUNT, its FAMILY-disjointness from the train split, its determinism,
+    and every refusal the family pool / batch divisibility can produce.
+
+    Disjointness is asserted on the FILE SETS the two row lists actually
+    reference -- not on the family indices the producer used internally --
+    so the assertion holds against what a consumer reads, and a future
+    change to the family-window arithmetic that reintroduced an overlap
+    reds here even if the internal bookkeeping still looked right.
+    """
+
+    @staticmethod
+    def _files_referenced(rows):
+        out = set()
+        for row in rows:
+            out.update({row["anchor_path"], row["positive_path"], row["negative_path"]})
+        return out
+
+    @staticmethod
+    def _ids(rows):
+        out = set()
+        for row in rows:
+            out.update({row["anchor_id"], row["positive_id"], row["negative_id"]})
+        return out
+
+    def test_row_count_is_exactly_what_was_asked_for(self):
+        _files, train, heldout = gfi.generate_split(
+            rows=12, size=8, seed=3, families=6, heldout_rows=4, heldout_batch=2
+        )
+        self.assertEqual(len(train), 12)
+        self.assertEqual(len(heldout), 4)
+
+    def test_the_two_splits_reference_disjoint_files_and_disjoint_ids(self):
+        _files, train, heldout = gfi.generate_split(
+            rows=12, size=8, seed=3, families=6, heldout_rows=4, heldout_batch=2
+        )
+        train_files = self._files_referenced(train)
+        heldout_files = self._files_referenced(heldout)
+        self.assertTrue(train_files, "the train split must reference some files at all")
+        self.assertTrue(heldout_files, "the held-out split must reference some files at all")
+        self.assertEqual(
+            train_files & heldout_files,
+            set(),
+            "a family-disjoint split must share NO image file between the two halves",
+        )
+        self.assertEqual(
+            self._ids(train) & self._ids(heldout),
+            set(),
+            "the two splits' id spaces must be disjoint (they are joined BY id downstream)",
+        )
+
+    def test_every_referenced_file_actually_exists_in_the_emitted_corpus(self):
+        """The held-out rows name files from the RESERVED families, which
+        the producer still generates -- a split that referenced a file it
+        never wrote would fail at load time on the pod, not here."""
+        files, train, heldout = gfi.generate_split(
+            rows=12, size=8, seed=3, families=6, heldout_rows=4, heldout_batch=2
+        )
+        for name in self._files_referenced(train) | self._files_referenced(heldout):
+            self.assertIn(name, files, f"{name} is referenced but was never emitted")
+
+    def test_heldout_rows_carry_the_train_schema_and_the_pinned_shape(self):
+        files, _train, heldout = gfi.generate_split(
+            rows=8, size=16, seed=4, families=6, heldout_rows=4, heldout_batch=4
+        )
+        for row in heldout:
+            self.assertEqual(set(row.keys()), _EXPECTED_KEYS)
+            for key in ("anchor_path", "positive_path", "negative_path"):
+                w, h, _pixels = gfi.decode_png_rgb(files[row[key]])
+                self.assertEqual((w, h), (16, 16))
+
+    def test_a_heldout_row_is_a_real_triplet_same_family_positive(self):
+        """Non-vacuity: the held-out rows must be well-formed TRIPLETS in
+        their own right (anchor and positive from ONE family, negative from
+        a different one) -- a "disjoint" split of degenerate rows would
+        satisfy every disjointness assertion above and be useless."""
+        _files, _train, heldout = gfi.generate_split(
+            rows=8, size=8, seed=4, families=6, heldout_rows=4, heldout_batch=4
+        )
+        for row in heldout:
+            anchor_fam = row["anchor_path"].split("_")[1]
+            positive_fam = row["positive_path"].split("_")[1]
+            negative_fam = row["negative_path"].split("_")[1]
+            self.assertEqual(anchor_fam, positive_fam, row)
+            self.assertNotEqual(anchor_fam, negative_fam, row)
+
+    def test_the_train_split_is_byte_identical_to_a_run_without_a_heldout_request(self):
+        """Adding a held-out split must not perturb the train corpus's IMAGE
+        bytes; the train ROW list legitimately narrows (it now draws from
+        the unreserved families only), which is the whole point of the
+        reservation -- so this pins the two claims separately rather than
+        conflating them."""
+        files_plain, train_plain = gfi.generate_corpus(rows=12, size=8, seed=3, families=6)
+        files_split, train_split, _heldout = gfi.generate_split(
+            rows=12, size=8, seed=3, families=6, heldout_rows=4, heldout_batch=2
+        )
+        self.assertEqual(files_plain, files_split, "the emitted image bytes must not change")
+        self.assertNotEqual(
+            train_plain,
+            train_split,
+            "the train rows MUST narrow to the unreserved families -- identical row lists would "
+            "mean the reservation did nothing and the split is not actually disjoint",
+        )
+
+    def test_same_seed_same_bytes(self):
+        a = gfi.generate_split(rows=8, size=8, seed=11, families=6, heldout_rows=4, heldout_batch=2)
+        b = gfi.generate_split(rows=8, size=8, seed=11, families=6, heldout_rows=4, heldout_batch=2)
+        self.assertEqual(a, b)
+
+    def test_refuses_when_the_family_pool_cannot_support_the_split(self):
+        # 3 families, 2 reserved -> 1 left for train, below the 2 a triplet
+        # needs. A REFUSAL, never a silently overlapping split.
+        with self.assertRaises(ValueError) as ctx:
+            gfi.generate_split(
+                rows=4, size=8, seed=1, families=3, heldout_rows=2, heldout_batch=2
+            )
+        self.assertIn("--families", str(ctx.exception))
+        # The default pool (4) reserving 2 leaves exactly 2 -- the boundary
+        # case must be ACCEPTED, so the refusal above is a real bound and
+        # not an off-by-one that rejects every legal split.
+        _files, train, heldout = gfi.generate_split(
+            rows=4, size=8, seed=1, families=4, heldout_rows=2, heldout_batch=2
+        )
+        self.assertEqual((len(train), len(heldout)), (4, 2))
+
+    def test_refuses_a_heldout_family_count_below_two(self):
+        with self.assertRaises(ValueError) as ctx:
+            gfi.generate_split(
+                rows=4, size=8, seed=1, families=6, heldout_rows=2, heldout_batch=2,
+                heldout_families=1,
+            )
+        self.assertIn("--heldout-families", str(ctx.exception))
+
+    def test_refuses_a_heldout_row_count_that_is_not_a_multiple_of_the_batch(self):
+        with self.assertRaises(ValueError) as ctx:
+            gfi.generate_split(
+                rows=8, size=8, seed=1, families=6, heldout_rows=5, heldout_batch=2
+            )
+        self.assertIn("--heldout-batch", str(ctx.exception))
+
+    def test_refuses_a_heldout_request_with_no_batch_stated(self):
+        with self.assertRaises(ValueError) as ctx:
+            gfi.generate_split(rows=8, size=8, seed=1, families=6, heldout_rows=4)
+        self.assertIn("--heldout-batch is required", str(ctx.exception))
+
+    def test_cli_writes_both_heldout_files_and_they_agree_row_for_row(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            out = Path(tmp) / "img"
+            rc = gfi.main([
+                "--rows", "8",
+                "--size", "8",
+                "--seed", "5",
+                "--out-dir", str(out),
+                "--families", "6",
+                "--heldout-rows", "4",
+                "--heldout-batch", "2",
+            ])
+            self.assertEqual(rc, 0)
+            ids_lines = (out / "heldout_ids.txt").read_text().splitlines()
+            jsonl_lines = (out / "heldout_triplets.jsonl").read_text().splitlines()
+            self.assertEqual(len(ids_lines), 4)
+            self.assertEqual(len(jsonl_lines), 4)
+            for ids_line, jsonl_line in zip(ids_lines, jsonl_lines, strict=True):
+                anchor, positive, negative = ids_line.split("\t")
+                row = json.loads(jsonl_line)
+                # The ids file IS the scoring order and the JSONL is joined
+                # to it BY anchor_id: a mismatch here is a fixture the
+                # loader would refuse (or, worse, silently reorder).
+                self.assertEqual(
+                    (anchor, positive, negative),
+                    (row["anchor_id"], row["positive_id"], row["negative_id"]),
+                )
+            # And the same run WITHOUT the flag writes neither file.
+            plain = Path(tmp) / "img_plain"
+            self.assertEqual(
+                gfi.main([
+                    "--rows", "8", "--size", "8", "--seed", "5",
+                    "--out-dir", str(plain), "--families", "6",
+                ]),
+                0,
+            )
+            self.assertFalse((plain / "heldout_ids.txt").exists())
+            self.assertFalse((plain / "heldout_triplets.jsonl").exists())
+
+    def test_cli_bytes_are_deterministic_across_two_runs(self):
+        """Family J, at the FILE level: the same argv twice must write
+        byte-identical trees, held-out files included."""
+        def run(dirpath):
+            self.assertEqual(
+                gfi.main([
+                    "--rows", "8", "--size", "8", "--seed", "9",
+                    "--out-dir", str(dirpath), "--families", "6",
+                    "--heldout-rows", "4", "--heldout-batch", "4",
+                ]),
+                0,
+            )
+            return {p.name: p.read_bytes() for p in sorted(dirpath.iterdir())}
+
+        with tempfile.TemporaryDirectory() as tmp:
+            first = run(Path(tmp) / "a")
+            second = run(Path(tmp) / "b")
+            self.assertEqual(first.keys(), second.keys())
+            self.assertEqual(first, second)
+            self.assertIn("heldout_ids.txt", first)
+            self.assertIn("heldout_triplets.jsonl", first)
+
+    def test_cli_returns_nonzero_on_an_unsupportable_split(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            rc = gfi.main([
+                "--rows", "4", "--size", "8", "--seed", "1",
+                "--out-dir", str(Path(tmp) / "x"), "--families", "3",
+                "--heldout-rows", "2", "--heldout-batch", "2",
+            ])
+            self.assertEqual(rc, 2)
+            self.assertFalse(
+                (Path(tmp) / "x").exists(),
+                "a refused split must write NOTHING -- not a partial corpus",
+            )
+
+
+
 if __name__ == "__main__":
     unittest.main()

@@ -276,3 +276,224 @@ fn fused_arm_never_hard_errors_on_a_missing_kernels_disable_env_var() {
     let tier = &report["tiers"]["finetune_run"];
     assert_eq!(tier["arm"], serde_json::json!("fused"), "tier={tier}");
 }
+
+// ─────────────────────────────────────────────────────────────────────────
+// `--expect-kernels-disabled` (issue #421 P1-b(i)) — the eager-twin proof
+// a forced-eager profile leg needs. Ported from `finetune-step`'s own flag
+// (`finetune_step_kernel_disable.rs`), with THREE checks instead of one:
+// (1) at START every named key must be present in the process's real
+// `JAMMI_KERNELS_DISABLE`, (2) at the END `unmatched_disables()` must be
+// empty, (3) at the END every named key's `fused` dispatch DELTA over the
+// measured epoch loop must be 0. Each case below drives exactly one of the
+// three, plus the subset semantics and the unchanged-by-default control.
+//
+// `lora_linear_fused` is the key used throughout: `jammi-lora`'s LoRA
+// linear calls `admit` once per training forward on EVERY architecture
+// including this CPU tiny-BERT fixture (`lora_linear.rs`'s own admit call),
+// so it is guaranteed to reach `admit` on this leg — which is what makes
+// check (2) non-vacuous here (a key that never fires would trip it).
+// ─────────────────────────────────────────────────────────────────────────
+
+/// Reads the emitted report's `finetune_run` tier, failing loudly (never
+/// silently returning an empty object) when the run did not emit one.
+fn tier_of(stdout: &str) -> serde_json::Value {
+    let report: serde_json::Value = serde_json::from_str(stdout)
+        .unwrap_or_else(|e| panic!("invalid JSON report: {e}\n{stdout}"));
+    report["tiers"]["finetune_run"].clone()
+}
+
+/// The happy path, with the POSITIVE PROOF attached: the named key is in
+/// the env, it actually fired, and the run's own `lora_linear` counters
+/// show the eager arm really ran (`fused == 0`, `eager > 0`). Asserting
+/// `fused == 0` alone would pass on a leg where NOTHING dispatched at all;
+/// requiring `eager > 0` in the same breath is what makes this a proof the
+/// forced-eager arm executed rather than a proof it was merely not fused.
+#[test]
+fn expect_kernels_disabled_succeeds_and_proves_the_eager_arm_actually_ran() {
+    let work_dir = tempfile::tempdir().expect("tempdir");
+    let fixtures_dir = tempfile::tempdir().expect("fixtures tempdir");
+    let output = base_command(work_dir.path(), fixtures_dir.path(), "fused")
+        .env("JAMMI_KERNELS_DISABLE", "lora_linear_fused")
+        .args(["--expect-kernels-disabled", "lora_linear_fused"])
+        .output()
+        .expect("spawn jammi-bench finetune-run");
+
+    assert!(
+        output.status.success(),
+        "a satisfied --expect-kernels-disabled must not refuse — stderr={}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let tier = tier_of(&String::from_utf8_lossy(&output.stdout));
+    assert_eq!(
+        tier["kernels_disabled_expected"],
+        serde_json::json!(["lora_linear_fused"]),
+        "the caller's claim must be RECORDED as provenance: tier={tier}"
+    );
+    assert_eq!(
+        tier["lora_linear_fused_dispatches"],
+        serde_json::json!(0),
+        "a disabled key must not have dispatched fused: tier={tier}"
+    );
+    let eager = tier["lora_linear_eager_dispatches"]
+        .as_u64()
+        .expect("lora_linear_eager_dispatches must be a number");
+    assert!(
+        eager > 0,
+        "the forced-eager arm must have actually EXECUTED (eager > 0), not merely failed to \
+         dispatch fused: tier={tier}"
+    );
+}
+
+/// Check (1): the "env var was dropped" failure mode — the flag names a key
+/// and `JAMMI_KERNELS_DISABLE` is not set at all. Must refuse, naming the
+/// key, and emit NO report (an INVALID leg is never a datum).
+#[test]
+fn expect_kernels_disabled_refuses_when_the_env_var_was_dropped() {
+    let work_dir = tempfile::tempdir().expect("tempdir");
+    let fixtures_dir = tempfile::tempdir().expect("fixtures tempdir");
+    let output = base_command(work_dir.path(), fixtures_dir.path(), "fused")
+        .env_remove("JAMMI_KERNELS_DISABLE")
+        .args(["--expect-kernels-disabled", "lora_linear_fused"])
+        .output()
+        .expect("spawn jammi-bench finetune-run");
+
+    assert!(
+        !output.status.success(),
+        "a dropped JAMMI_KERNELS_DISABLE must hard-fail when --expect-kernels-disabled named a \
+         key — stdout={}",
+        String::from_utf8_lossy(&output.stdout)
+    );
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("lora_linear_fused") && stderr.contains("INVALID run"),
+        "the refusal must name the missing key and say the leg is invalid: {stderr}"
+    );
+    assert!(
+        String::from_utf8_lossy(&output.stdout).trim().is_empty(),
+        "an INVALID leg must emit no report at all"
+    );
+}
+
+/// Check (1) again, on the MISTYPED-key half: the env var IS set, but to a
+/// different key than the one claimed. Distinguishes "dropped" from "wrong"
+/// — a check that only looked at emptiness would pass here.
+#[test]
+fn expect_kernels_disabled_refuses_when_the_env_names_a_different_key() {
+    let work_dir = tempfile::tempdir().expect("tempdir");
+    let fixtures_dir = tempfile::tempdir().expect("fixtures tempdir");
+    let output = base_command(work_dir.path(), fixtures_dir.path(), "fused")
+        .env("JAMMI_KERNELS_DISABLE", "layer_norm_fused")
+        .args(["--expect-kernels-disabled", "lora_linear_fused"])
+        .output()
+        .expect("spawn jammi-bench finetune-run");
+
+    assert!(
+        !output.status.success(),
+        "a JAMMI_KERNELS_DISABLE naming a DIFFERENT key must hard-fail — stdout={}",
+        String::from_utf8_lossy(&output.stdout)
+    );
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("lora_linear_fused"),
+        "the refusal must name the key that was claimed but absent: {stderr}"
+    );
+}
+
+/// The deliberate divergence from `finetune-step`'s set-EQUALITY check: a
+/// SUBSET is enough, so a leg may disable MORE than it claims. This is what
+/// lets a `--arm alloff` leg (which pins two other keys into the same env
+/// var) also claim a chain key. The two refusal cases above are what keep
+/// this from being vacuous.
+#[test]
+fn expect_kernels_disabled_accepts_extra_env_keys_beyond_the_claim() {
+    let work_dir = tempfile::tempdir().expect("tempdir");
+    let fixtures_dir = tempfile::tempdir().expect("fixtures tempdir");
+    let output = base_command(work_dir.path(), fixtures_dir.path(), "fused")
+        .env(
+            "JAMMI_KERNELS_DISABLE",
+            "lora_linear_fused,layer_norm_fused",
+        )
+        .args(["--expect-kernels-disabled", "lora_linear_fused"])
+        .output()
+        .expect("spawn jammi-bench finetune-run");
+
+    assert!(
+        output.status.success(),
+        "a SUPERSET JAMMI_KERNELS_DISABLE must be accepted (subset semantics) — stderr={}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let tier = tier_of(&String::from_utf8_lossy(&output.stdout));
+    assert_eq!(
+        tier["kernels_disabled_expected"],
+        serde_json::json!(["lora_linear_fused"]),
+        "the CLAIM is recorded, never widened to what the env happened to carry: tier={tier}"
+    );
+    assert_eq!(
+        tier["kernels_disabled_requested"],
+        serde_json::json!(["layer_norm_fused", "lora_linear_fused"]),
+        "the env-RESOLVED set stays its own, separately recorded fact: tier={tier}"
+    );
+}
+
+/// Check (2): a `JAMMI_KERNELS_DISABLE` entry that never disables a live
+/// dispatch is a TYPO, not evidence the eager arm ran. The claimed key is
+/// genuinely present and genuinely fires, so checks (1) and (3) both pass —
+/// only the unmatched sibling entry can fail this run, which is exactly the
+/// hole this check exists to close.
+#[test]
+fn expect_kernels_disabled_refuses_an_unmatched_disable_entry() {
+    let work_dir = tempfile::tempdir().expect("tempdir");
+    let fixtures_dir = tempfile::tempdir().expect("fixtures tempdir");
+    let output = base_command(work_dir.path(), fixtures_dir.path(), "fused")
+        .env(
+            "JAMMI_KERNELS_DISABLE",
+            "lora_linear_fused,not_a_real_op_key_at_all",
+        )
+        .args(["--expect-kernels-disabled", "lora_linear_fused"])
+        .output()
+        .expect("spawn jammi-bench finetune-run");
+
+    assert!(
+        !output.status.success(),
+        "an op key that never disabled a live dispatch must invalidate the run — stdout={}",
+        String::from_utf8_lossy(&output.stdout)
+    );
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("not_a_real_op_key_at_all") && stderr.contains("never disabled"),
+        "the refusal must name the entry that never fired: {stderr}"
+    );
+}
+
+/// The unchanged-behaviour control: WITHOUT `--expect-kernels-disabled`,
+/// the very same bogus disable entry that invalidates the run above is
+/// accepted exactly as it always has been (this tier never read
+/// `unmatched_disables()` before this flag existed). Pins "byte-identical
+/// for every existing invocation" as a mechanical fact rather than a claim,
+/// and proves the three new checks are gated on the flag, not firing
+/// unconditionally.
+#[test]
+fn without_the_flag_an_unmatched_disable_entry_is_accepted_exactly_as_before() {
+    let work_dir = tempfile::tempdir().expect("tempdir");
+    let fixtures_dir = tempfile::tempdir().expect("fixtures tempdir");
+    let output = base_command(work_dir.path(), fixtures_dir.path(), "fused")
+        .env(
+            "JAMMI_KERNELS_DISABLE",
+            "lora_linear_fused,not_a_real_op_key_at_all",
+        )
+        .output()
+        .expect("spawn jammi-bench finetune-run");
+
+    assert!(
+        output.status.success(),
+        "a run making no --expect-kernels-disabled claim must behave exactly as it did before \
+         the flag existed — stderr={}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let tier = tier_of(&String::from_utf8_lossy(&output.stdout));
+    assert_eq!(
+        tier["kernels_disabled_expected"],
+        serde_json::json!([]),
+        "an unclaimed leg records the empty claim, never omits the field: tier={tier}"
+    );
+}

@@ -2176,11 +2176,28 @@ def _finetune_run_tier(arm="fused", **overrides):
     tier = copy.deepcopy(load_golden("bert_fused")["tiers"]["finetune_run"])
     tier.update({
         "seed": 42,
+        # GOLDEN VINTAGE (same class as `layers_to_transform`'s own note
+        # below): `bert_fused.json` was frozen before issue #421 P1-b added
+        # `task`/`lora_init`/`train_media_sha256`/`heldout_media_sha256` to
+        # `FinetuneRunTier::IDENTITY_FIELDS`, so these four are supplied
+        # here rather than inherited from the golden. The same narrower
+        # footing applies, and the same live proof carries it: all four ARE
+        # `IDENTITY_FIELDS` members, so `finetune_run::run`'s own trailing
+        # `assert_identity_fields_present` panics on EVERY real run if any
+        # is absent from the serialized report — this override cannot mask
+        # an absent producer field, only a wrong VALUE in a regenerated
+        # golden, which is not what this suite reads the golden for.
+        #
+        # `text_embedding` + `null` media digests is the internally
+        # CONSISTENT clean default (a text leg has no media corpus to
+        # digest); a media-leg test would override all three together.
+        "task": "text_embedding",
         "batch": 32,
         "seq": 64,
         "lora_rank": 8,
         "lora_alpha": 16.0,
         "lora_dropout": 0.05,
+        "lora_init": "zeros_b",
         "margin": None,
         "target_modules": ["Wqkv", "Wo", "Wi"],
         # GOLDEN VINTAGE (phase-4 audit CLASS 5): `load_golden("bert_fused")`
@@ -2251,8 +2268,10 @@ def _finetune_run_tier(arm="fused", **overrides):
         "grad_accum": 1,
         "validation_fraction": 0.1,
         "train_pairs_file_sha256": "train-pairs-file-sha",
+        "train_media_sha256": None,
         "heldout_ids_sha256": "heldout-ids-sha",
         "heldout_pairs_sha256": "heldout-pairs-sha",
+        "heldout_media_sha256": None,
         "heldout_batch_partition_sha256": "partition-sha",
         "embedding_loss": "mnrl",
         "temperature": 20.0,
@@ -2265,6 +2284,11 @@ def _finetune_run_tier(arm="fused", **overrides):
         "device_name": "cuda:0-fixture",
         "kernels_disabled_requested": [] if arm == "fused" else ["attention_block_flash", "adamw_step_fused"],
         "kernels_disabled_fired": [] if arm == "fused" else ["attention_block_flash", "adamw_step_fused"],
+        # Issue #421 P1-b(i): the CALLER-declared `--expect-kernels-disabled`
+        # claim. `[]` (no claim) on both arms is this suite's clean default —
+        # `finetune_run_ab.sh`'s legs make no such claim; the #421 profile
+        # driver's D legs do, and record it here.
+        "kernels_disabled_expected": [],
         "flash_compiled": True,
         "build_features": ["cuda"],
         "attention_arm": "fused" if arm == "fused" else "eager",

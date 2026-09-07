@@ -2025,6 +2025,20 @@ pub struct FinetuneRunTier {
     // ── Identity: FinetuneStepTier's 18 (minus attention_arm — see struct
     //    doc), carried over by name ────────────────────────────────────
     pub seed: u64,
+    /// `--task`: which TOWER of `--model-dir`'s checkpoint this run
+    /// fine-tuned — `"text_embedding"`, `"image_embedding"`, or
+    /// `"audio_embedding"` ([`crate::finetune_run::Task::as_str`]).
+    /// IDENTITY, and the strongest one on this tier after the checkpoint
+    /// digests: on a multi-tower checkpoint (OpenCLIP holds a text tower
+    /// AND a vision tower behind ONE `checkpoint_weights_sha256`) the task
+    /// is the ONLY field that says which set of weights was actually
+    /// trained, so two legs agreeing on every other field but disagreeing
+    /// here measured DIFFERENT models. Recorded from this run's resolved
+    /// `Task`, never re-derived from the row shape. Added by issue #421
+    /// P1-b: `--task` landed as a tower selector without a mirror on this
+    /// tier at all, so every media leg's report was silent about which
+    /// tower produced it.
+    pub task: String,
     pub batch: usize,
     /// `--max-seq-length` — the tokenizer truncation cap this run's config
     /// used (NOT a per-batch measured width: real text pairs vary in
@@ -2033,6 +2047,23 @@ pub struct FinetuneRunTier {
     pub lora_rank: usize,
     pub lora_alpha: f64,
     pub lora_dropout: f64,
+    /// `--lora-init`: which LoRA initialization mode this run's adapters
+    /// were built under — `"zeros_b"` (the default, and the ONLY value any
+    /// invocation written before this flag existed can produce) or
+    /// `"gaussian"`. IDENTITY, for the same discriminating-power reason
+    /// `lora_rank`/`target_modules` are: a `gaussian` leg starts from a
+    /// DIFFERENT point on the loss surface than a `zeros_b` leg at the
+    /// identical seed and selectors (`ZerosB` makes `B = 0`, so the
+    /// adapter contributes exactly nothing at step 0 and `dL/dA = 0`
+    /// there; `Gaussian` does not), so two legs disagreeing here are not
+    /// comparable at all. Spelled as `jammi_lora::LoraInitMode`'s own
+    /// snake-case CLI spelling, never the Rust variant name, so the
+    /// emitted string is the same token a caller passes on the command
+    /// line. `ci/scripts/perf/identity_fields.py`'s
+    /// `FINETUNE_RUN_IDENTITY_FIELDS` carries the mirror entry
+    /// (set-equality pin against [`Self::IDENTITY_FIELDS`], docs-ci
+    /// domain).
+    pub lora_init: String,
     /// The Triplet objective's margin — `Some` only when
     /// [`crate::finetune_run::Objective::Triplet`] was selected for this
     /// run; `null` (`NullMeans("objective is mnrl")`) when
@@ -2083,6 +2114,26 @@ pub struct FinetuneRunTier {
     /// from the committed fixture manifest's `dataset_sha256` (a different
     /// quantity: a Merkle over per-pair digests, not this file's bytes).
     pub train_pairs_file_sha256: String,
+    /// The train MEDIA corpus's own CONTENT digest — sha256 over each
+    /// row's three member content digests (`anchor`, `positive`,
+    /// `negative`, each itself measured off the file bytes this run read),
+    /// concatenated as lowercase hex in MANIFEST ORDER. `null`
+    /// (`NullMeans`) on a text task, where the corpus content IS the
+    /// manifest and [`Self::train_pairs_file_sha256`] already digests it.
+    ///
+    /// IDENTITY, and it closes a real hole: on a media task
+    /// `train_pairs_file_sha256` digests the JSONL MANIFEST only, and that
+    /// manifest names PATHS. Swapping the bytes behind those paths (a
+    /// different corpus at the same file names — exactly what a second
+    /// producer run with different `--size`/`--seconds` writes) changes
+    /// every measured loss while leaving every other identity field
+    /// byte-identical, so two such legs would be merged as comparable.
+    /// The digest-of-digests framing is unambiguous by construction (each
+    /// member contributes a fixed-width 64-char hex string, so no
+    /// concatenation of one row's members can be re-read as another's) and
+    /// costs nothing: the per-member digests are already measured by the
+    /// media loader on the way in.
+    pub train_media_sha256: Option<String>,
     pub heldout_ids_sha256: String,
     /// sha256 (hex) of the `--heldout-jsonl` file's own raw bytes — see this
     /// struct's own doc, finding 5(a): the held-out TEXT is a total
@@ -2090,6 +2141,18 @@ pub struct FinetuneRunTier {
     /// [`Self::heldout_ids_sha256`]'s id-order anchor) it must be content-
     /// anchored, never merely trusted by filename.
     pub heldout_pairs_sha256: String,
+    /// [`Self::train_media_sha256`]'s held-out twin, over the held-out
+    /// rows in COMMITTED SCORING ORDER (the `--heldout-ids` order, which is
+    /// the order this run actually scored them in — not the
+    /// `--heldout-jsonl` file order, which need not match). `null`
+    /// (`NullMeans`) on a text task for the same reason its train twin is.
+    ///
+    /// IDENTITY for a STRONGER reason than the train digest: the held-out
+    /// content is a total determinant of every per-example loss `d_i` this
+    /// tier reports (the unit-63 finding-5(a) argument that added
+    /// `heldout_pairs_sha256` in the first place), and on a media task
+    /// that field digests the manifest, not the media.
+    pub heldout_media_sha256: Option<String>,
     /// `HeldOutLoss::batch_partition_sha256` at the FINAL epoch — the
     /// partition the reported [`Self::held_out_example_mean`] was scored
     /// under (CONTRACT H1 v2 delta 9: a property of `(model, partition)`).
@@ -2129,6 +2192,26 @@ pub struct FinetuneRunTier {
     pub device_name: String,
     pub kernels_disabled_requested: Vec<String>,
     pub kernels_disabled_fired: Vec<String>,
+    /// `--expect-kernels-disabled`: the op key set this invocation CLAIMED
+    /// `JAMMI_KERNELS_DISABLE` would carry, sorted — `[]` when the caller
+    /// made no claim (the ordinary, unchecked case, and what every
+    /// invocation written before this flag existed emits). PROVENANCE, for
+    /// exactly the reason [`Self::arm`] is: a CALLER-DECLARED intent
+    /// stated on the command line, never something this process measured.
+    /// Its VALIDATION is what makes it worth recording — when non-empty,
+    /// [`crate::finetune_run::run`] refuses at START unless every named
+    /// key is present in
+    /// [`jammi_kernels::admission::disabled_ops_requested`], and refuses at
+    /// the END unless [`jammi_kernels::admission::unmatched_disables`] is
+    /// empty AND every named key's `fused` dispatch counter reads `0`
+    /// (`jammi_kernels::admission::snapshot_all`), so a leg carrying a
+    /// non-empty value here is one whose forced-eager arm was proven, not
+    /// assumed. Distinct from [`Self::kernels_disabled_requested`] (what
+    /// the env var actually resolved to) and
+    /// [`Self::kernels_disabled_fired`] (which of those entries actually
+    /// disabled a live dispatch): those two are process-OBSERVED, this one
+    /// is the claim they were checked against.
+    pub kernels_disabled_expected: Vec<String>,
     pub flash_compiled: bool,
     pub build_features: Vec<&'static str>,
     /// The attention REFERENCE CLASS this process's `JAMMI_KERNELS_DISABLE`
@@ -2316,6 +2399,40 @@ pub struct FinetuneRunTier {
     /// checkpoint save) rather than requiring this producer to isolate that
     /// overhead itself.
     pub train_run_wall_s: f64,
+    /// Wall-clock seconds this run spent inside the MEDIA decode/preprocess
+    /// front end (`TrainingLoop::encode_media`'s
+    /// `image_encoder_input`/`audio_encoder_input` call — PNG/WAV decode,
+    /// resize+normalize or resample→STFT→mel, per item, sequential),
+    /// summed over every micro-batch of every resume-cycled epoch leg. A
+    /// MEASURED field: neither identity nor provenance (not in
+    /// [`Self::IDENTITY_FIELDS`] or [`Self::PROVENANCE_FIELDS`]), the same
+    /// classification every dispatch counter and [`Self::train_run_wall_s`]
+    /// itself carry.
+    ///
+    /// `null` on EVERY leg this build can produce, for one stated reason:
+    /// the measurement lives entirely inside `jammi-ai`'s
+    /// `TrainingLoop::run()` (`crates/jammi-ai/src/fine_tune/trainer.rs`'s
+    /// `encode_media`, lines ~1786-1815 — the two `*_encoder_input` arms),
+    /// and `TrainingResult` exposes no timing seam for this crate to read
+    /// it through (`artifact_dir`/`final_loss`/`total_steps`/`metrics_json`/
+    /// `epoch_checkpoints` — that is the whole struct). `jammi-ai` is
+    /// ai-core's crate, so this producer does NOT reach in and add one;
+    /// the field is declared here, `null`, with the seam it needs named,
+    /// rather than silently derived as `train_run_wall_s − gpu_busy` (a
+    /// DIFFERENCE is not a measurement: it absorbs launch latency, sync
+    /// stalls, and the optimizer's own CPU time into a number labelled
+    /// "front end"). The pending one-field seam: accumulate
+    /// `Instant::now()`/`elapsed()` around `encode_media`'s `let input =
+    /// match self.task {..}` into an interior-mutable counter on
+    /// `TrainingLoop` (an `AtomicU64` of nanoseconds — `encode_media`
+    /// takes `&self`) and surface it as
+    /// `TrainingResult::media_front_end_wall: std::time::Duration` at that
+    /// file's `TrainingResult` construction (~line 1360); this producer
+    /// then sums it across epoch legs exactly as it already sums
+    /// [`Self::train_run_wall_s`] and reports `Some`. A text-task leg
+    /// stays `null` either way — it never enters the media front end at
+    /// all, so `0.0` would be a claim about a path that never ran.
+    pub media_front_end_wall_s: Option<f64>,
 
     // ── Mutant provenance (unit 63 round-7 audit, finding 1) — honest
     //    labeling, NOT identity or provenance ───────────────────────────
@@ -2363,7 +2480,11 @@ impl FinetuneRunTier {
     /// — see struct doc for the full per-field rationale), `dataset_sha256`
     /// renamed to `train_pairs_file_sha256`, and `heldout_pairs_sha256`
     /// added. 17 + 18 − 4 + 1 = 32, THEN `layers_to_transform` added
-    /// (CONTRACT v2, #356 P1 item 5): 32 + 1 = 33.
+    /// (CONTRACT v2, #356 P1 item 5): 32 + 1 = 33, THEN issue #421 P1-b's
+    /// four (`lora_init`, `task`, `train_media_sha256`,
+    /// `heldout_media_sha256` — see each field's own doc; the last three
+    /// close K7 holes `--task`/the media loader opened, not new knobs):
+    /// 33 + 4 = 37.
     ///
     /// DISJOINT from [`Self::PROVENANCE_FIELDS`] (E3's convention, not
     /// `FinetuneStepTier`'s superset one) — see struct doc.
@@ -2372,11 +2493,24 @@ impl FinetuneRunTier {
         // `batched_forward`/`steps_measured` (finding 5(c)/advisory (d) —
         // both reclassified to PROVENANCE_FIELDS below).
         ("seed", Nullable::NonNull),
+        // Issue #421 P1-b: `--task`, the TOWER selector — see
+        // `Self::task`'s own doc for why this is the strongest identity
+        // field on a multi-tower checkpoint. `NonNull`: the flag has a
+        // default (`text_embedding`), so every leg states a tower.
+        ("task", Nullable::NonNull),
         ("batch", Nullable::NonNull),
         ("seq", Nullable::NonNull),
         ("lora_rank", Nullable::NonNull),
         ("lora_alpha", Nullable::NonNull),
         ("lora_dropout", Nullable::NonNull),
+        // Issue #421 P1-b(ii): `--lora-init`'s own resolved value. IDENTITY
+        // for the same discriminating-power reason `lora_rank` is — see
+        // `Self::lora_init`'s own doc. `NonNull`: the flag has a default
+        // (`zeros_b`), so every leg states a value; there is no "unknown"
+        // to represent. `ci/scripts/perf/identity_fields.py`'s
+        // `FINETUNE_RUN_IDENTITY_FIELDS` carries the mirror entry at this
+        // SAME position (set-equality pin, docs-ci domain).
+        ("lora_init", Nullable::NonNull),
         // H4a-delta (CONTRACT amendment 2026-08-28): unlike
         // `FinetuneStepTier::margin` (always NonNull, hardcoded Triplet),
         // this tier's `margin` is null exactly when `Objective::Mnrl` was
@@ -2429,8 +2563,28 @@ impl FinetuneRunTier {
         ("grad_accum", Nullable::NonNull),
         ("validation_fraction", Nullable::NonNull),
         ("train_pairs_file_sha256", Nullable::NonNull),
+        // Issue #421 P1-b: the media corpus CONTENT digests. On a media
+        // task the manifest digests above name PATHS only — see
+        // `Self::train_media_sha256`'s own doc. `NullMeans` on a text task
+        // (there the manifest IS the content), so both are also
+        // `FINETUNE_RUN_NULL_IS_A_VALUE_FIELDS` members in
+        // `ci/scripts/perf/identity_fields.py` (docs-ci's mirror).
+        (
+            "train_media_sha256",
+            Nullable::NullMeans(
+                "text task — the train corpus content IS the manifest, digested by \
+                 train_pairs_file_sha256",
+            ),
+        ),
         ("heldout_ids_sha256", Nullable::NonNull),
         ("heldout_pairs_sha256", Nullable::NonNull),
+        (
+            "heldout_media_sha256",
+            Nullable::NullMeans(
+                "text task — the held-out corpus content IS the manifest, digested by \
+                 heldout_pairs_sha256",
+            ),
+        ),
         ("heldout_batch_partition_sha256", Nullable::NonNull),
         ("embedding_loss", Nullable::NonNull),
         ("temperature", Nullable::NullMeans("objective is triplet")),
@@ -2447,12 +2601,18 @@ impl FinetuneRunTier {
     /// `split_rule` (a hardcoded constant), `batched_forward` (a build-time
     /// structural fact), and `steps_measured` (a measured outcome, not a
     /// premise) — none of the three is a genuine comparison determinant;
-    /// see struct doc for the full per-field rationale.
+    /// see struct doc for the full per-field rationale. Grew 10 -> 11 with
+    /// `kernels_disabled_expected` (issue #421 P1-b(i)), a CALLER-declared
+    /// claim in exactly `arm`'s sense — see that field's own doc.
     pub const PROVENANCE_FIELDS: &'static [(&'static str, Nullable)] = &[
         ("arm", Nullable::NonNull),
         ("device_name", Nullable::NonNull),
         ("kernels_disabled_requested", Nullable::NonNull),
         ("kernels_disabled_fired", Nullable::NonNull),
+        // Issue #421 P1-b(i): the CALLER-declared `--expect-kernels-disabled`
+        // claim, sorted (`[]` when unclaimed). PROVENANCE for the same
+        // reason `arm` is — see `Self::kernels_disabled_expected`'s own doc.
+        ("kernels_disabled_expected", Nullable::NonNull),
         ("flash_compiled", Nullable::NonNull),
         ("build_features", Nullable::NonNull),
         ("attention_arm", Nullable::NonNull),
@@ -3380,11 +3540,13 @@ mod tests {
     fn sample_finetune_run_tier() -> FinetuneRunTier {
         FinetuneRunTier {
             seed: 42,
+            task: "text_embedding".to_string(),
             batch: 4,
             seq: 64,
             lora_rank: 8,
             lora_alpha: 16.0,
             lora_dropout: 0.05,
+            lora_init: "zeros_b".to_string(),
             margin: Some(0.3),
             target_modules: vec!["Wqkv".to_string()],
             layers_to_transform: None,
@@ -3403,8 +3565,12 @@ mod tests {
             grad_accum: 1,
             validation_fraction: 0.1,
             train_pairs_file_sha256: "c".repeat(64),
+            // `None`: this sample is a TEXT leg (`task: "text_embedding"`),
+            // and both media digests are `NullMeans("text task ...")` there.
+            train_media_sha256: None,
             heldout_ids_sha256: "d".repeat(64),
             heldout_pairs_sha256: "f".repeat(64),
+            heldout_media_sha256: None,
             heldout_batch_partition_sha256: "e".repeat(64),
             embedding_loss: "triplet".to_string(),
             temperature: None,
@@ -3416,6 +3582,7 @@ mod tests {
             device_name: "cpu".to_string(),
             kernels_disabled_requested: Vec::new(),
             kernels_disabled_fired: Vec::new(),
+            kernels_disabled_expected: Vec::new(),
             flash_compiled: jammi_kernels::admission::FLASH_COMPILED,
             build_features: build_features(),
             attention_arm: "fused".to_string(),
@@ -3456,6 +3623,7 @@ mod tests {
             }],
             train_probe_series: vec![0.6, 0.55, 0.5],
             train_run_wall_s: 1.5,
+            media_front_end_wall_s: None,
             mutant_id: None,
             mutant_base_sha: None,
             mutant_patch_sha256: None,
@@ -3527,10 +3695,47 @@ mod tests {
     /// `split_seed`, `batched_forward`, `steps_measured` — 4 removed), plus
     /// `heldout_pairs_sha256` (finding 5(a), 1 added) = 17 + 18 − 4 + 1 = 32,
     /// plus `layers_to_transform` (CONTRACT v2, #356 P1 item 5, 1 added)
-    /// = 33.
+    /// = 33, plus issue #421 P1-b's four (`lora_init`, `task`,
+    /// `train_media_sha256`, `heldout_media_sha256`) = 37.
     #[test]
-    fn finetune_run_tier_identity_fields_cardinality_is_33() {
-        assert_eq!(FinetuneRunTier::IDENTITY_FIELDS.len(), 33);
+    fn finetune_run_tier_identity_fields_cardinality_is_37() {
+        assert_eq!(FinetuneRunTier::IDENTITY_FIELDS.len(), 37);
+    }
+
+    /// Issue #421 P1-b, per-field pin — a bare cardinality assertion goes
+    /// green again if one field is added while another is dropped, so the
+    /// four new entries are named individually, with their declared
+    /// nullability, against the const a run's self-check actually reads.
+    #[test]
+    fn finetune_run_tier_identity_carries_the_421_p1b_fields() {
+        let by_name: std::collections::HashMap<&str, &Nullable> = FinetuneRunTier::IDENTITY_FIELDS
+            .iter()
+            .map(|(name, nullable)| (*name, nullable))
+            .collect();
+        for field in ["lora_init", "task"] {
+            assert_eq!(
+                by_name.get(field),
+                Some(&&Nullable::NonNull),
+                "{field} must be an IDENTITY field declared NonNull"
+            );
+        }
+        for field in ["train_media_sha256", "heldout_media_sha256"] {
+            assert!(
+                matches!(by_name.get(field), Some(Nullable::NullMeans(_))),
+                "{field} must be an IDENTITY field whose null is a STATED value (a text leg has                  no media content to digest), not an absent measurement"
+            );
+        }
+        // The measured front-end timer is NOT identity and NOT provenance —
+        // the same classification every dispatch counter carries.
+        for (name, _) in FinetuneRunTier::IDENTITY_FIELDS
+            .iter()
+            .chain(FinetuneRunTier::PROVENANCE_FIELDS.iter())
+        {
+            assert_ne!(
+                *name, "media_front_end_wall_s",
+                "media_front_end_wall_s is a MEASURED field; naming it in either comparison                  tuple would make two legs at different front-end costs incomparable"
+            );
+        }
     }
 
     /// `PROVENANCE_FIELDS` carries `arm` + `attention_arm` (moved out of
@@ -3538,10 +3743,18 @@ mod tests {
     /// provenance carries (`device_name`, `kernels_disabled_requested`,
     /// `kernels_disabled_fired`, `flash_compiled`, `build_features`), plus
     /// the three unit-63 finding-5(c)/advisory-(d) reclassifications
-    /// (`split_rule`, `batched_forward`, `steps_measured`) = 10.
+    /// (`split_rule`, `batched_forward`, `steps_measured`) = 10, plus
+    /// `kernels_disabled_expected` (issue #421 P1-b(i)) = 11.
     #[test]
-    fn finetune_run_tier_provenance_fields_cardinality_is_10() {
-        assert_eq!(FinetuneRunTier::PROVENANCE_FIELDS.len(), 10);
+    fn finetune_run_tier_provenance_fields_cardinality_is_11() {
+        assert_eq!(FinetuneRunTier::PROVENANCE_FIELDS.len(), 11);
+        assert!(
+            FinetuneRunTier::PROVENANCE_FIELDS
+                .iter()
+                .any(|(name, nullable)| *name == "kernels_disabled_expected"
+                    && *nullable == Nullable::NonNull),
+            "kernels_disabled_expected is a CALLER-declared claim (arm's class), recorded on              every leg as [] when unclaimed — provenance, never identity"
+        );
     }
 
     /// Unit 63 round-7 audit, finding 1: the three mutant-provenance fields

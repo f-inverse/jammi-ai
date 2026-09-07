@@ -165,5 +165,150 @@ class VerifyTokenizerTests(unittest.TestCase):
         self.assertIsInstance(result, list)
 
 
+class HeldOutSplitTests(unittest.TestCase):
+    """`--heldout-rows` (issue #421 P1-b(iv)): `finetune-run` REQUIRES a
+    held-out fixture on every leg (`--heldout-ids` + `--heldout-jsonl` are
+    unconditional), so the text producer emits one too rather than leaving
+    a CLIP-text leg to reuse its own train rows as its held-out set.
+
+    Disjointness here is by CONSTRUCTION (the held-out rows are drawn as row
+    indices past every train row of the same single RNG stream), which is
+    what these tests assert -- on the emitted ids and texts, never on the
+    construction argument itself.
+    """
+
+    @staticmethod
+    def _ids(rows):
+        out = set()
+        for row in rows:
+            out.update({row["anchor_id"], row["positive_id"], row["negative_id"]})
+        return out
+
+    @staticmethod
+    def _texts(rows):
+        out = []
+        for row in rows:
+            out.extend([row["anchor_text"], row["positive_text"], row["negative_text"]])
+        return out
+
+    def test_row_count_is_exactly_what_was_asked_for(self):
+        train, heldout = gfw.generate_split(10, 5, seed=3, heldout_rows=4)
+        self.assertEqual(len(train), 10)
+        self.assertEqual(len(heldout), 4)
+
+    def test_the_two_splits_are_disjoint_in_ids_and_in_texts(self):
+        train, heldout = gfw.generate_split(10, 5, seed=3, heldout_rows=4)
+        self.assertEqual(
+            self._ids(train) & self._ids(heldout),
+            set(),
+            "the two splits are joined BY id downstream; a shared id would silently make a "
+            "train row the held-out row it is scored against",
+        )
+        self.assertEqual(
+            set(self._texts(train)) & set(self._texts(heldout)),
+            set(),
+            "an identical TEXT in both splits would be a leaked example even under distinct ids",
+        )
+
+    def test_the_train_split_is_byte_identical_to_a_run_with_no_heldout_request(self):
+        """The single RNG stream is consumed in row order, so asking for a
+        held-out split cannot perturb the train corpus -- the property that
+        lets a driver generate train-only and train+heldout corpora at the
+        same seed and still compare their legs."""
+        plain = gfw.generate_rows(10, 5, seed=3)
+        train, _heldout = gfw.generate_split(10, 5, seed=3, heldout_rows=4)
+        self.assertEqual(plain, train)
+
+    def test_the_heldout_split_carries_the_same_width_guarantee(self):
+        """Every held-out text is built by the SAME `_row_text`, so it
+        carries the same `>= min_wordpieces` word count the train texts do
+        -- asserted on the emitted strings, not assumed from the shared
+        code path (a CLIP-text leg's `--max-seq-length 77` pinning depends
+        on the HELD-OUT rows too, since `evaluate_held_out` encodes them)."""
+        min_wordpieces = 12
+        _train, heldout = gfw.generate_split(6, min_wordpieces, seed=8, heldout_rows=4)
+        self.assertTrue(heldout)
+        for text in self._texts(heldout):
+            self.assertGreaterEqual(
+                len(text.split()), min_wordpieces + gfw._BUFFER, repr(text)
+            )
+
+    def test_same_seed_same_rows(self):
+        self.assertEqual(
+            gfw.generate_split(6, 5, seed=17, heldout_rows=2),
+            gfw.generate_split(6, 5, seed=17, heldout_rows=2),
+        )
+
+    def test_a_different_seed_changes_the_heldout_rows(self):
+        _t1, h1 = gfw.generate_split(6, 5, seed=17, heldout_rows=2)
+        _t2, h2 = gfw.generate_split(6, 5, seed=18, heldout_rows=2)
+        self.assertNotEqual(h1, h2)
+
+    def test_zero_heldout_rows_is_the_unchanged_default(self):
+        train, heldout = gfw.generate_split(6, 5, seed=17)
+        self.assertEqual(heldout, [])
+        self.assertEqual(train, gfw.generate_rows(6, 5, seed=17))
+
+    def test_refuses_a_heldout_row_count_that_is_not_a_multiple_of_the_batch(self):
+        with self.assertRaises(ValueError) as ctx:
+            gfw.validate_heldout_split(5, 2)
+        self.assertIn("--heldout-batch", str(ctx.exception))
+
+    def test_refuses_a_heldout_request_with_no_batch_stated(self):
+        with self.assertRaises(ValueError) as ctx:
+            gfw.validate_heldout_split(4, None)
+        self.assertIn("--heldout-batch is required", str(ctx.exception))
+
+    def test_cli_writes_both_heldout_files_beside_out_and_they_agree_row_for_row(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            out = Path(tmp) / "train.jsonl"
+            rc = gfw.main([
+                "--rows", "8",
+                "--min-wordpieces", "5",
+                "--seed", "5",
+                "--out", str(out),
+                "--heldout-rows", "4",
+                "--heldout-batch", "2",
+            ])
+            self.assertEqual(rc, 0)
+            ids_lines = (Path(tmp) / "heldout_ids.txt").read_text().splitlines()
+            jsonl_lines = (Path(tmp) / "heldout_triplets.jsonl").read_text().splitlines()
+            self.assertEqual(len(ids_lines), 4)
+            self.assertEqual(len(jsonl_lines), 4)
+            for ids_line, jsonl_line in zip(ids_lines, jsonl_lines, strict=True):
+                anchor, positive, negative = ids_line.split("\t")
+                row = json.loads(jsonl_line)
+                self.assertEqual(
+                    (anchor, positive, negative),
+                    (row["anchor_id"], row["positive_id"], row["negative_id"]),
+                )
+            # The same run without the flag writes neither file, and its
+            # train bytes are identical.
+            plain_dir = Path(tmp) / "plain"
+            plain_dir.mkdir()
+            plain_out = plain_dir / "train.jsonl"
+            self.assertEqual(
+                gfw.main([
+                    "--rows", "8", "--min-wordpieces", "5", "--seed", "5",
+                    "--out", str(plain_out),
+                ]),
+                0,
+            )
+            self.assertFalse((plain_dir / "heldout_ids.txt").exists())
+            self.assertFalse((plain_dir / "heldout_triplets.jsonl").exists())
+            self.assertEqual(out.read_bytes(), plain_out.read_bytes())
+
+    def test_cli_returns_nonzero_on_an_indivisible_heldout_row_count(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            out = Path(tmp) / "train.jsonl"
+            rc = gfw.main([
+                "--rows", "8", "--min-wordpieces", "5", "--seed", "1",
+                "--out", str(out), "--heldout-rows", "5", "--heldout-batch", "2",
+            ])
+            self.assertEqual(rc, 2)
+            self.assertFalse(out.exists(), "a refused split must write NOTHING")
+
+
+
 if __name__ == "__main__":
     unittest.main()

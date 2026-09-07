@@ -48,10 +48,47 @@ plus seeded noise. No consumer's data, no recorded audio, no third-party
 package -- clips are written with the stdlib `wave` module over `array`, so
 this producer has NO dependency beyond the Python standard library.
 
+FRACTIONAL `--seconds`: `--seconds` is a float and the clip length is
+`round(seconds * sample_rate)` frames ([`frame_count`], one definition used
+by the generator AND re-asserted by the test suite off the written WAV
+header). `--seconds 9.5 --sample-rate 48000` is therefore exactly 456000
+frames -- the #421 profile's declared audio shape, chosen to sit strictly
+BELOW the CLAP front end's `nb_max_samples` so the repeat-pad branch is the
+declared branch rather than a boundary case.
+
+HELD-OUT SPLIT (issue #421 P1-b(iv)): `--heldout-rows N` additionally emits
+`heldout_ids.txt` (TAB-separated `anchor_id\tpositive_id\tnegative_id`, one
+row per line, in the order it was generated -- this file's ORDER is the
+scoring identity `jammi-bench finetune-run --heldout-ids` reads) and
+`heldout_triplets.jsonl` (the SAME row schema as the train JSONL), both in
+`--out-dir` so the JSONL-relative `*_path` resolution the loader performs
+(`crates/jammi-bench/src/main.rs::load_train_media_jsonl`, which resolves
+each path against the JSONL's OWN directory) finds the same clip files.
+
+The split is disjoint BY FAMILY, never by seed: the LAST
+`--heldout-families` of the `--families` pool are RESERVED for the held-out
+rows and the train rows are drawn from the remaining ones, so no clip
+referenced by a held-out row is ever referenced by a train row (a seed-based
+"different draw" split would still share family timbres, and two clips of
+one timbre are precisely what this producer calls a POSITIVE pair -- the
+held-out set would be contaminated by construction). A `--families` pool too
+small to give BOTH halves the two families a triplet needs is a REFUSAL,
+never a silently overlapping split. `--heldout-batch B` is required
+alongside `--heldout-rows` and refused unless it divides the held-out row
+count exactly: `finetune-run` itself refuses a held-out fixture that is not
+a nonzero multiple of `--batch`, and finding that out here (before any WAV
+is written) is cheaper than finding it out on a GPU pod.
+
+WITHOUT `--heldout-rows` (the default, 0) nothing about this producer's
+output changes: the train rows are drawn from the FULL family pool exactly
+as before, no extra files are written, and the emitted bytes are identical
+to what every existing invocation already gets.
+
 Usage:
   gen_fixed_length_audio_corpus.py --rows N --seconds T --sample-rate R
       --seed K --out-dir DIR [--families F] [--instances-per-family I]
       [--jitter J] [--jsonl-name NAME]
+      [--heldout-rows N --heldout-batch B [--heldout-families F]]
 
 Hermetic: no network, writes only under `--out-dir`.
 """
@@ -188,6 +225,102 @@ def _clip_name(family: int, instance: int) -> str:
     return f"clip_f{family:02d}_i{instance:03d}.wav"
 
 
+# How many of `--families` are reserved for the held-out split by default.
+# TWO is the floor, not a tuning knob: a triplet row needs a family for its
+# anchor/positive and a DIFFERENT one for its negative, so a one-family
+# held-out pool could not emit a well-formed row at all.
+_DEFAULT_HELDOUT_FAMILIES = 2
+
+# The names the held-out split is written under, inside `--out-dir` -- the
+# SAME two names `gen_fixed_shape_image_corpus.py` emits, so a driver
+# handles both modalities with one pair of paths.
+_HELDOUT_IDS_NAME = "heldout_ids.txt"
+_HELDOUT_JSONL_NAME = "heldout_triplets.jsonl"
+
+
+def _build_rows(
+    rows: int,
+    seed: int,
+    families: int,
+    instances_per_family: int,
+    family_offset: int,
+    id_tag: str,
+) -> list[dict]:
+    """`rows` triplet rows over the family window
+    `[family_offset, family_offset + families)`.
+
+    Deterministic assignment, NO RNG (so `--rows` never perturbs the audio
+    bytes) -- the same walk `gen_fixed_shape_image_corpus.py` uses, so the
+    two media corpora pair row-for-row by index. `family_offset` is what
+    makes the held-out split disjoint: the held-out call passes an offset
+    past every family the train call can reach, so the two row lists name
+    provably disjoint FILE sets. `id_tag` (`""` for train, `"h"` for
+    held-out) keeps the two id spaces disjoint even at the same row index.
+    """
+    out_rows: list[dict] = []
+    for i in range(rows):
+        fam = family_offset + (i % families)
+        neg_fam = family_offset + ((i % families) + 1 + (i // families) % (families - 1)) % families
+        anchor_i = (2 * i) % instances_per_family
+        positive_i = (anchor_i + 1) % instances_per_family
+        negative_i = i % instances_per_family
+        out_rows.append(
+            {
+                "anchor_id": f"aud-{seed}-{id_tag}{i:06d}-a",
+                "anchor_path": _clip_name(fam, anchor_i),
+                "positive_id": f"aud-{seed}-{id_tag}{i:06d}-p",
+                "positive_path": _clip_name(fam, positive_i),
+                "negative_id": f"aud-{seed}-{id_tag}{i:06d}-n",
+                "negative_path": _clip_name(neg_fam, negative_i),
+            }
+        )
+    return out_rows
+
+
+def validate_heldout_split(
+    families: int, heldout_families: int, heldout_rows: int, heldout_batch: int | None
+) -> int:
+    """Refuse a held-out request the family pool cannot support, and return
+    the TRAIN family count (`families - heldout_families`).
+
+    Every refusal here is a REFUSAL, never a silent degradation to an
+    overlapping split: an overlapping "held-out" set shares family timbres
+    with the train set, and two same-family instances are exactly what this
+    producer calls a POSITIVE pair -- so the leg would be scoring on rows it
+    trained the family of.
+    """
+    if heldout_rows <= 0:
+        raise ValueError(f"--heldout-rows must be positive when stated, got {heldout_rows}")
+    if heldout_batch is None:
+        raise ValueError(
+            "--heldout-batch is required alongside --heldout-rows: `finetune-run` refuses a "
+            "held-out fixture whose row count is not a nonzero multiple of --batch, and this "
+            "producer cannot check that without being told the divisor"
+        )
+    if heldout_batch <= 0:
+        raise ValueError(f"--heldout-batch must be positive, got {heldout_batch}")
+    if heldout_rows % heldout_batch != 0:
+        raise ValueError(
+            f"--heldout-rows {heldout_rows} is not a multiple of --heldout-batch "
+            f"{heldout_batch} (finetune-run refuses a held-out fixture that is not a nonzero "
+            f"multiple of --batch)"
+        )
+    if heldout_families < 2:
+        raise ValueError(
+            f"--heldout-families must be at least 2 (a held-out triplet needs a DIFFERENT "
+            f"family for its negative, exactly as a train triplet does), got {heldout_families}"
+        )
+    train_families = families - heldout_families
+    if train_families < 2:
+        raise ValueError(
+            f"--families {families} cannot support a family-disjoint held-out split reserving "
+            f"{heldout_families}: the train half would be left with {train_families} "
+            f"famil{'y' if train_families == 1 else 'ies'}, and both halves need at least 2. "
+            f"Raise --families to at least {heldout_families + 2}."
+        )
+    return train_families
+
+
 def generate_corpus(
     rows: int,
     seconds: float,
@@ -197,8 +330,39 @@ def generate_corpus(
     instances_per_family: int = _DEFAULT_INSTANCES_PER_FAMILY,
     jitter: int = _DEFAULT_JITTER,
 ) -> tuple[dict[str, bytes], list[dict]]:
-    """Build the whole corpus in memory: `(files, rows)` where `files` maps a
-    relative file name to its WAV bytes and `rows` is the JSONL row list.
+    """[`generate_split`] with NO held-out split — `(files, rows)`, the
+    exact shape and values this function returned before `--heldout-rows`
+    existed. Kept as the single-split entry point so every existing caller
+    is untouched; `main` calls [`generate_split`] directly.
+    """
+    files, train_rows, _heldout = generate_split(
+        rows=rows,
+        seconds=seconds,
+        sample_rate=sample_rate,
+        seed=seed,
+        families=families,
+        instances_per_family=instances_per_family,
+        jitter=jitter,
+    )
+    return files, train_rows
+
+
+def generate_split(
+    rows: int,
+    seconds: float,
+    sample_rate: int,
+    seed: int,
+    families: int = _DEFAULT_FAMILIES,
+    instances_per_family: int = _DEFAULT_INSTANCES_PER_FAMILY,
+    jitter: int = _DEFAULT_JITTER,
+    heldout_rows: int = 0,
+    heldout_families: int = _DEFAULT_HELDOUT_FAMILIES,
+    heldout_batch: int | None = None,
+) -> tuple[dict[str, bytes], list[dict], list[dict]]:
+    """Build the whole corpus in memory: `(files, rows, heldout_rows_list)`
+    where `files` maps a relative file name to its WAV bytes, `rows` is the
+    train JSONL row list, and `heldout_rows_list` is the held-out one
+    (EMPTY unless `heldout_rows > 0`).
 
     Pure with respect to its arguments -- no filesystem, no clock, no
     environment -- so determinism is testable without writing anything.
@@ -231,6 +395,15 @@ def generate_corpus(
             f"phase offset and a row's positive stops being a distinct recording), got {jitter}"
         )
 
+    # The family pool is SPLIT only when a held-out set is requested; with
+    # `--heldout-rows 0` (the default) `train_families == families` and
+    # every line below runs exactly as it did before this flag existed.
+    train_families = families
+    if heldout_rows > 0:
+        train_families = validate_heldout_split(
+            families, heldout_families, heldout_rows, heldout_batch
+        )
+
     rng = random.Random(seed)
     files: dict[str, bytes] = {}
     # Fixed draw order: family-major, instance-minor (family J).
@@ -239,35 +412,47 @@ def generate_corpus(
             samples = _instance_samples(family, instance, frames, sample_rate, rng, jitter)
             files[_clip_name(family, instance)] = encode_wav(samples, sample_rate)
 
-    out_rows: list[dict] = []
-    for i in range(rows):
-        # Deterministic assignment, no RNG (so `--rows` never perturbs the
-        # audio bytes) -- the same walk `gen_fixed_shape_image_corpus.py`
-        # uses, so the two media corpora pair row-for-row by index.
-        fam = i % families
-        neg_fam = (fam + 1 + (i // families) % (families - 1)) % families
-        anchor_i = (2 * i) % instances_per_family
-        positive_i = (anchor_i + 1) % instances_per_family
-        negative_i = i % instances_per_family
-        out_rows.append(
-            {
-                "anchor_id": f"aud-{seed}-{i:06d}-a",
-                "anchor_path": _clip_name(fam, anchor_i),
-                "positive_id": f"aud-{seed}-{i:06d}-p",
-                "positive_path": _clip_name(fam, positive_i),
-                "negative_id": f"aud-{seed}-{i:06d}-n",
-                "negative_path": _clip_name(neg_fam, negative_i),
-            }
+    out_rows = _build_rows(rows, seed, train_families, instances_per_family, 0, "")
+    heldout_out_rows: list[dict] = []
+    if heldout_rows > 0:
+        # The held-out window starts where the train window ends, so the two
+        # row lists cannot name a shared file.
+        heldout_out_rows = _build_rows(
+            heldout_rows, seed, heldout_families, instances_per_family, train_families, "h"
         )
-    return files, out_rows
+    return files, out_rows, heldout_out_rows
+
+
+def write_heldout(heldout_rows: list[dict], out_dir: Path) -> tuple[Path, Path]:
+    """Write `heldout_ids.txt` + `heldout_triplets.jsonl` under `out_dir`,
+    in the SAME row order, and return `(ids_path, jsonl_path)`.
+
+    The ids file is the SCORING ORDER (`finetune-run --heldout-ids`), the
+    JSONL is joined to it BY `anchor_id`; writing both from one list in one
+    pass is what makes them consistent by construction rather than by
+    convention."""
+    ids_path = out_dir / _HELDOUT_IDS_NAME
+    with ids_path.open("w") as f:
+        for row in heldout_rows:
+            f.write(f"{row['anchor_id']}\t{row['positive_id']}\t{row['negative_id']}\n")
+    jsonl_path = out_dir / _HELDOUT_JSONL_NAME
+    with jsonl_path.open("w") as f:
+        for row in heldout_rows:
+            f.write(json.dumps(row, sort_keys=True) + "\n")
+    return ids_path, jsonl_path
 
 
 def write_corpus(
-    files: dict[str, bytes], rows: list[dict], out_dir: Path, jsonl_name: str
+    files: dict[str, bytes],
+    rows: list[dict],
+    out_dir: Path,
+    jsonl_name: str,
+    heldout_rows: list[dict] | None = None,
 ) -> Path:
     """Write the WAVs and the JSONL under `out_dir` (created if absent), in
     SORTED file-name order (family J: the emission order is fixed, never the
-    dict's insertion order or the filesystem's). Returns the JSONL path."""
+    dict's insertion order or the filesystem's), plus the held-out pair of
+    files when `heldout_rows` is non-empty. Returns the train JSONL path."""
     out_dir.mkdir(parents=True, exist_ok=True)
     for name in sorted(files):
         (out_dir / name).write_bytes(files[name])
@@ -275,6 +460,8 @@ def write_corpus(
     with jsonl_path.open("w") as f:
         for row in rows:
             f.write(json.dumps(row, sort_keys=True) + "\n")
+    if heldout_rows:
+        write_heldout(heldout_rows, out_dir)
     return jsonl_path
 
 
@@ -301,10 +488,32 @@ def main(argv: list[str] | None = None) -> int:
         help="per-sample noise amplitude in int16 units (see module doc)",
     )
     ap.add_argument("--jsonl-name", default="triplets.jsonl")
+    ap.add_argument(
+        "--heldout-rows",
+        type=int,
+        default=0,
+        help="also emit a FAMILY-DISJOINT held-out split of this many rows "
+        "(heldout_ids.txt + heldout_triplets.jsonl in --out-dir); 0 (the default) emits "
+        "nothing extra and leaves every byte of the train corpus unchanged",
+    )
+    ap.add_argument(
+        "--heldout-families",
+        type=int,
+        default=_DEFAULT_HELDOUT_FAMILIES,
+        help="how many of --families to RESERVE for the held-out split (read only when "
+        "--heldout-rows > 0); the train rows use the rest",
+    )
+    ap.add_argument(
+        "--heldout-batch",
+        type=int,
+        default=None,
+        help="required alongside --heldout-rows: the --batch the consuming finetune-run leg "
+        "will use, which the held-out row count must be a nonzero multiple of",
+    )
     args = ap.parse_args(argv)
 
     try:
-        files, rows = generate_corpus(
+        files, rows, heldout_rows = generate_split(
             rows=args.rows,
             seconds=args.seconds,
             sample_rate=args.sample_rate,
@@ -312,12 +521,15 @@ def main(argv: list[str] | None = None) -> int:
             families=args.families,
             instances_per_family=args.instances_per_family,
             jitter=args.jitter,
+            heldout_rows=args.heldout_rows,
+            heldout_families=args.heldout_families,
+            heldout_batch=args.heldout_batch,
         )
     except ValueError as e:
         print(f"::error::gen_fixed_length_audio_corpus: {e}", file=sys.stderr)
         return 2
 
-    jsonl_path = write_corpus(files, rows, args.out_dir, args.jsonl_name)
+    jsonl_path = write_corpus(files, rows, args.out_dir, args.jsonl_name, heldout_rows)
     frames = frame_count(args.seconds, args.sample_rate)
     print(
         f"gen_fixed_length_audio_corpus: wrote {len(files)} clips of {frames} frames "
@@ -326,6 +538,13 @@ def main(argv: list[str] | None = None) -> int:
         f"instances_per_family={args.instances_per_family}, jitter={args.jitter}, "
         f"seed={args.seed})"
     )
+    if heldout_rows:
+        print(
+            f"gen_fixed_length_audio_corpus: wrote {len(heldout_rows)} held-out rows to "
+            f"{args.out_dir / _HELDOUT_IDS_NAME} + {args.out_dir / _HELDOUT_JSONL_NAME} "
+            f"(heldout_families={args.heldout_families} reserved from the family pool, "
+            f"heldout_batch={args.heldout_batch})"
+        )
     return 0
 
 

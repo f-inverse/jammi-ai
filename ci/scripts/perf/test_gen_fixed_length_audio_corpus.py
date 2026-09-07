@@ -295,5 +295,230 @@ class CliTests(unittest.TestCase):
             self.assertEqual(rc, 2)
 
 
+class FractionalSecondsTests(unittest.TestCase):
+    """`--seconds` is a FLOAT and the #421 profile's declared audio shape is
+    9.5 s at 48 kHz -- a fractional value on purpose (strictly below the CLAP
+    front end's `nb_max_samples`, so the repeat-pad branch is the declared
+    branch rather than a boundary case).
+
+    The expected frame counts here are stated as LITERALS computed by hand
+    (`9.5 * 48000 = 456_000`), never as `gfa.frame_count(...)` -- a test that
+    asked the producer what it produces would agree with itself after any
+    drift in the rounding rule.
+    """
+
+    def test_nine_point_five_seconds_at_48k_is_exactly_456000_frames(self):
+        files, _rows = gfa.generate_corpus(
+            rows=2, seconds=9.5, sample_rate=48000, seed=2, families=2, instances_per_family=2
+        )
+        self.assertTrue(files)
+        for name, data in files.items():
+            _channels, _width, rate, samples = gfa.read_wav(data)
+            self.assertEqual(rate, 48000, name)
+            self.assertEqual(
+                len(samples), 456_000,
+                f"{name}: 9.5 s at 48 kHz must be exactly 456000 frames, got {len(samples)}",
+            )
+
+    def test_other_fractional_durations_round_to_the_stated_frame_count(self):
+        # Hand-computed: 0.125 * 16000 = 2000; 1.5 * 44100 = 66150;
+        # 0.3 * 48000 = 14400 (0.3 is not exactly representable in binary
+        # floating point, so this also pins that `round` -- not `int` --
+        # is what the producer applies: `int(0.3 * 48000)` is 14399).
+        for seconds, rate, expected in ((0.125, 16000, 2000), (1.5, 44100, 66150), (0.3, 48000, 14400)):
+            files, _rows = gfa.generate_corpus(
+                rows=2, seconds=seconds, sample_rate=rate, seed=1,
+                families=2, instances_per_family=2,
+            )
+            for name, data in files.items():
+                _c, _w, _r, samples = gfa.read_wav(data)
+                self.assertEqual(
+                    len(samples), expected,
+                    f"{name}: {seconds} s at {rate} Hz must be {expected} frames",
+                )
+
+
+class HeldOutSplitTests(unittest.TestCase):
+    """`--heldout-rows` (issue #421 P1-b(iv)) -- the audio twin of
+    `test_gen_fixed_shape_image_corpus.py`'s own `HeldOutSplitTests`, making
+    the SAME assertions against this producer's own emitted tree.
+
+    Disjointness is asserted on the FILE SETS the two row lists actually
+    reference, not on the family indices used internally, so it holds
+    against what a consumer reads.
+    """
+
+    @staticmethod
+    def _files_referenced(rows):
+        out = set()
+        for row in rows:
+            out.update({row["anchor_path"], row["positive_path"], row["negative_path"]})
+        return out
+
+    @staticmethod
+    def _ids(rows):
+        out = set()
+        for row in rows:
+            out.update({row["anchor_id"], row["positive_id"], row["negative_id"]})
+        return out
+
+    def _split(self, **kw):
+        args = dict(rows=12, seconds=0.05, sample_rate=16000, seed=3, families=6,
+                    heldout_rows=4, heldout_batch=2)
+        args.update(kw)
+        return gfa.generate_split(**args)
+
+    def test_row_count_is_exactly_what_was_asked_for(self):
+        _files, train, heldout = self._split()
+        self.assertEqual(len(train), 12)
+        self.assertEqual(len(heldout), 4)
+
+    def test_the_two_splits_reference_disjoint_files_and_disjoint_ids(self):
+        _files, train, heldout = self._split()
+        train_files = self._files_referenced(train)
+        heldout_files = self._files_referenced(heldout)
+        self.assertTrue(train_files)
+        self.assertTrue(heldout_files)
+        self.assertEqual(
+            train_files & heldout_files,
+            set(),
+            "a family-disjoint split must share NO clip between the two halves",
+        )
+        self.assertEqual(self._ids(train) & self._ids(heldout), set())
+
+    def test_every_referenced_file_actually_exists_in_the_emitted_corpus(self):
+        files, train, heldout = self._split()
+        for name in self._files_referenced(train) | self._files_referenced(heldout):
+            self.assertIn(name, files, f"{name} is referenced but was never emitted")
+
+    def test_heldout_rows_carry_the_train_schema_and_the_pinned_length(self):
+        files, _train, heldout = self._split(seconds=0.1, sample_rate=16000)
+        for row in heldout:
+            self.assertEqual(set(row.keys()), _EXPECTED_KEYS)
+            for key in ("anchor_path", "positive_path", "negative_path"):
+                _c, _w, rate, samples = gfa.read_wav(files[row[key]])
+                self.assertEqual(rate, 16000)
+                self.assertEqual(len(samples), 1600)
+
+    def test_a_heldout_row_is_a_real_triplet_same_family_positive(self):
+        _files, _train, heldout = self._split()
+        for row in heldout:
+            anchor_fam = row["anchor_path"].split("_")[1]
+            positive_fam = row["positive_path"].split("_")[1]
+            negative_fam = row["negative_path"].split("_")[1]
+            self.assertEqual(anchor_fam, positive_fam, row)
+            self.assertNotEqual(anchor_fam, negative_fam, row)
+
+    def test_the_audio_bytes_are_unchanged_by_a_heldout_request(self):
+        files_plain, train_plain = gfa.generate_corpus(
+            rows=12, seconds=0.05, sample_rate=16000, seed=3, families=6
+        )
+        files_split, train_split, _heldout = self._split()
+        self.assertEqual(files_plain, files_split, "the emitted clip bytes must not change")
+        self.assertNotEqual(
+            train_plain,
+            train_split,
+            "the train rows MUST narrow to the unreserved families -- identical row lists would "
+            "mean the reservation did nothing and the split is not actually disjoint",
+        )
+
+    def test_same_seed_same_bytes(self):
+        self.assertEqual(self._split(seed=11), self._split(seed=11))
+
+    def test_refuses_when_the_family_pool_cannot_support_the_split(self):
+        with self.assertRaises(ValueError) as ctx:
+            self._split(rows=4, families=3, heldout_rows=2)
+        self.assertIn("--families", str(ctx.exception))
+        # Boundary: 4 families reserving 2 leaves exactly 2 -- accepted, so
+        # the refusal above is a real bound, not an off-by-one.
+        _files, train, heldout = self._split(rows=4, families=4, heldout_rows=2)
+        self.assertEqual((len(train), len(heldout)), (4, 2))
+
+    def test_refuses_a_heldout_family_count_below_two(self):
+        with self.assertRaises(ValueError) as ctx:
+            self._split(heldout_families=1)
+        self.assertIn("--heldout-families", str(ctx.exception))
+
+    def test_refuses_a_heldout_row_count_that_is_not_a_multiple_of_the_batch(self):
+        with self.assertRaises(ValueError) as ctx:
+            self._split(heldout_rows=5, heldout_batch=2)
+        self.assertIn("--heldout-batch", str(ctx.exception))
+
+    def test_refuses_a_heldout_request_with_no_batch_stated(self):
+        with self.assertRaises(ValueError) as ctx:
+            self._split(heldout_batch=None)
+        self.assertIn("--heldout-batch is required", str(ctx.exception))
+
+    def test_cli_writes_both_heldout_files_and_they_agree_row_for_row(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            out = Path(tmp) / "aud"
+            rc = gfa.main([
+                "--rows", "8",
+                "--seconds", "0.05",
+                "--sample-rate", "16000",
+                "--seed", "5",
+                "--out-dir", str(out),
+                "--families", "6",
+                "--heldout-rows", "4",
+                "--heldout-batch", "2",
+            ])
+            self.assertEqual(rc, 0)
+            ids_lines = (out / "heldout_ids.txt").read_text().splitlines()
+            jsonl_lines = (out / "heldout_triplets.jsonl").read_text().splitlines()
+            self.assertEqual(len(ids_lines), 4)
+            self.assertEqual(len(jsonl_lines), 4)
+            for ids_line, jsonl_line in zip(ids_lines, jsonl_lines, strict=True):
+                anchor, positive, negative = ids_line.split("\t")
+                row = json.loads(jsonl_line)
+                self.assertEqual(
+                    (anchor, positive, negative),
+                    (row["anchor_id"], row["positive_id"], row["negative_id"]),
+                )
+            plain = Path(tmp) / "aud_plain"
+            self.assertEqual(
+                gfa.main([
+                    "--rows", "8", "--seconds", "0.05", "--sample-rate", "16000",
+                    "--seed", "5", "--out-dir", str(plain), "--families", "6",
+                ]),
+                0,
+            )
+            self.assertFalse((plain / "heldout_ids.txt").exists())
+            self.assertFalse((plain / "heldout_triplets.jsonl").exists())
+
+    def test_cli_bytes_are_deterministic_across_two_runs(self):
+        def run(dirpath):
+            self.assertEqual(
+                gfa.main([
+                    "--rows", "8", "--seconds", "0.05", "--sample-rate", "16000",
+                    "--seed", "9", "--out-dir", str(dirpath), "--families", "6",
+                    "--heldout-rows", "4", "--heldout-batch", "4",
+                ]),
+                0,
+            )
+            return {p.name: p.read_bytes() for p in sorted(dirpath.iterdir())}
+
+        with tempfile.TemporaryDirectory() as tmp:
+            first = run(Path(tmp) / "a")
+            second = run(Path(tmp) / "b")
+            self.assertEqual(first.keys(), second.keys())
+            self.assertEqual(first, second)
+            self.assertIn("heldout_ids.txt", first)
+            self.assertIn("heldout_triplets.jsonl", first)
+
+    def test_cli_returns_nonzero_on_an_unsupportable_split(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            rc = gfa.main([
+                "--rows", "4", "--seconds", "0.05", "--sample-rate", "16000",
+                "--seed", "1", "--out-dir", str(Path(tmp) / "x"), "--families", "3",
+                "--heldout-rows", "2", "--heldout-batch", "2",
+            ])
+            self.assertEqual(rc, 2)
+            self.assertFalse(
+                (Path(tmp) / "x").exists(),
+                "a refused split must write NOTHING -- not a partial corpus",
+            )
+
+
+
 if __name__ == "__main__":
     unittest.main()

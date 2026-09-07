@@ -208,6 +208,32 @@ struct FinetuneRunArgs {
     lora_alpha: f64,
     #[arg(long, default_value_t = 0.05)]
     lora_dropout: f64,
+    /// `zeros_b` (the default) or `gaussian` — which LoRA initialization
+    /// this run's adapters are built under. `zeros_b` is byte-identical to
+    /// every invocation written before this flag existed (both
+    /// `LoraBuildConfig` sites and the `FineTuneConfig` hardcoded it).
+    /// `gaussian` exists for the BF16 pre-flight: under `zeros_b` every
+    /// LoRA `A` has `dL/dA == 0` at step 1 (`B == 0` kills the gradient
+    /// path), so a "every LoRA Var got a non-zero gradient" dtype check is
+    /// VACUOUS in that mode. See `finetune_run::FinetuneRunParams::lora_init`'s
+    /// doc.
+    #[arg(long, default_value = "zeros_b")]
+    lora_init: String,
+    /// Comma-separated op key(s) this invocation INTENDS
+    /// `JAMMI_KERNELS_DISABLE` to carry. When set, the run refuses (a) at
+    /// START unless every named key is present in the process's real
+    /// `JAMMI_KERNELS_DISABLE`, (b) at the END unless
+    /// `jammi_kernels::admission::unmatched_disables()` is empty, and (c)
+    /// at the END unless every named key's `fused` dispatch counter reads
+    /// `0` — a leg failing any of the three is INVALID, never a datum. The
+    /// eager-twin proof a forced-eager profile leg needs: without it, a
+    /// dropped/mistyped/unforwarded env var reads identically to "nothing
+    /// requested" and the leg silently measures the FUSED arm under an
+    /// eager label. Same grammar as `JAMMI_KERNELS_DISABLE` itself, parsed
+    /// by the SAME `jammi_kernels::admission::parse_disable_list`. See
+    /// `finetune_run::FinetuneRunParams::expect_kernels_disabled`'s doc.
+    #[arg(long)]
+    expect_kernels_disabled: Option<String>,
     /// Comma-separated LoRA target selectors.
     #[arg(long, default_value = "Wqkv,Wo,Wi")]
     target_modules: String,
@@ -869,6 +895,8 @@ async fn main() -> std::process::ExitCode {
                 lora_rank,
                 lora_alpha,
                 lora_dropout,
+                lora_init,
+                expect_kernels_disabled,
                 target_modules,
                 layers_to_transform,
                 backbone_dtype,
@@ -896,6 +924,17 @@ async fn main() -> std::process::ExitCode {
             };
             let task = match task.parse::<finetune_run::Task>() {
                 Ok(t) => t,
+                Err(e) => {
+                    eprintln!("finetune-run: {e}");
+                    return std::process::ExitCode::FAILURE;
+                }
+            };
+            // Parsed HERE, alongside `--arm`/`--objective`/`--task`, so an
+            // invalid token refuses before this process reads a single
+            // corpus file — a caller error, not something worth loading a
+            // media corpus to discover.
+            let lora_init = match finetune_run::parse_lora_init(&lora_init) {
+                Ok(m) => m,
                 Err(e) => {
                     eprintln!("finetune-run: {e}");
                     return std::process::ExitCode::FAILURE;
@@ -1028,6 +1067,24 @@ async fn main() -> std::process::ExitCode {
                 lora_rank,
                 lora_alpha,
                 lora_dropout,
+                lora_init,
+                // `--expect-kernels-disabled` and `JAMMI_KERNELS_DISABLE` are
+                // the SAME grammar (a caller states the same disable list two
+                // ways) — routed through the identical
+                // `jammi_kernels::admission::parse_disable_list` a genuine
+                // `JAMMI_KERNELS_DISABLE` read goes through, never a second,
+                // hand-rolled parser that could (and once did, on the
+                // `finetune-step` twin) diverge on duplicate entries. Sorted
+                // into a `Vec` here because `disabled_ops_requested()` — what
+                // `finetune_run::run` compares this against — is itself a
+                // sorted, deduplicated `Vec`.
+                expect_kernels_disabled: expect_kernels_disabled.map(|s| {
+                    let mut v: Vec<String> = jammi_kernels::admission::parse_disable_list(Some(&s))
+                        .into_iter()
+                        .collect();
+                    v.sort();
+                    v
+                }),
                 target_modules: target_modules
                     .split(',')
                     .map(str::trim)

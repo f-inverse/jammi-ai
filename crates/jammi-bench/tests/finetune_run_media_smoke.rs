@@ -103,13 +103,20 @@ fn write_heldout_ids(corpus: &Path, n: usize) -> PathBuf {
 
 /// One `finetune-run` invocation over a media corpus. Deliberately mirrors
 /// `finetune_run_smoke.rs`'s flag set so the two differ only in `--task`,
-/// `--model-dir` and `--target-modules`.
+/// `--model-dir`, `--target-modules` and `--objective`.
+///
+/// `--objective` is a PARAMETER rather than a pinned literal a caller could
+/// append a second copy of: `clap` refuses a repeated non-multiple argument
+/// outright ("cannot be used multiple times"), so an override-by-appending
+/// would have tested clap's own arity checking instead of this tier's
+/// media/objective refusal.
 fn media_command(
     model_dir: &Path,
     task: &str,
     corpus: &Path,
     work_dir: &Path,
     target_modules: &str,
+    objective: &str,
 ) -> Command {
     let heldout_ids = write_heldout_ids(corpus, 4);
     let jsonl = corpus.join("triplets.jsonl");
@@ -145,7 +152,7 @@ fn media_command(
             "--max-grad-norm",
             "0.0",
             "--objective",
-            "triplet",
+            objective,
             "--lora-rank",
             "2",
             "--lora-alpha",
@@ -214,6 +221,60 @@ fn assert_well_formed_media_report(stdout: &str, task: &str) {
             .is_some_and(|s| s.len() == 64),
         "{task}: checkpoint_weights_sha256 must be a measured sha256"
     );
+    // Issue #421 P1-b: the tower this leg trained is IDENTITY on the report,
+    // not something a reader has to infer from the row shape. On a
+    // multi-tower checkpoint (`tiny_open_clip` carries a text tower AND a
+    // vision tower behind ONE `checkpoint_weights_sha256`) this is the only
+    // field that says WHICH weights were trained.
+    assert_eq!(
+        tier["task"],
+        serde_json::json!(task),
+        "{task}: the tier must record the tower this run actually trained"
+    );
+    // `--objective triplet` is accepted, and RECORDED, for every one of the
+    // three tasks this helper drives (the media refusal is `mnrl`-only —
+    // see `a_media_task_under_the_mnrl_objective_is_refused` below).
+    assert_eq!(
+        tier["embedding_loss"],
+        serde_json::json!("triplet"),
+        "{task}: --objective triplet must be accepted and recorded for this task"
+    );
+    // Issue #421 P1-b: on a MEDIA task the JSONL is a manifest of PATHS, so
+    // `train_pairs_file_sha256` cannot anchor the corpus CONTENT — the two
+    // media digests do, and they must be real measured digests, not `null`.
+    // On the text task they are `null` BY DESIGN (there the manifest IS the
+    // content), which is the negative control that keeps the media
+    // assertion from being satisfiable by a producer that stamps a constant
+    // on every leg.
+    let is_media = task != "text_embedding";
+    for field in ["train_media_sha256", "heldout_media_sha256"] {
+        if is_media {
+            assert!(
+                tier[field]
+                    .as_str()
+                    .is_some_and(|s| s.len() == 64 && s.chars().all(|c| c.is_ascii_hexdigit())),
+                "{task}: {field} must be a measured sha256 over the corpus content, got {}",
+                tier[field]
+            );
+        } else {
+            assert!(
+                tier[field].is_null(),
+                "{task}: {field} must be null on a text task (the manifest IS the content), \
+                 got {}",
+                tier[field]
+            );
+        }
+    }
+    // Not merely present but DISTINCT: the train split and the held-out
+    // fixture are different row sets here, so a digest helper that ignored
+    // its argument (or hashed the manifest twice) would collide.
+    if is_media {
+        assert_ne!(
+            tier["train_media_sha256"], tier["heldout_media_sha256"],
+            "{task}: the train and held-out corpora are different row sets; equal digests mean \
+             the digest ignored its input"
+        );
+    }
 }
 
 /// The OpenCLIP VISION tower, end to end over the fixed-shape image corpus.
@@ -242,6 +303,7 @@ fn image_embedding_leg_runs_end_to_end_over_the_committed_producer() {
         &corpus,
         &work_dir,
         "in_proj,c_fc",
+        "triplet",
     )
     .output()
     .expect("run jammi-bench finetune-run --task image_embedding");
@@ -283,6 +345,7 @@ fn audio_embedding_leg_runs_end_to_end_over_the_committed_producer() {
         &corpus,
         &work_dir,
         "query,value",
+        "triplet",
     )
     .output()
     .expect("run jammi-bench finetune-run --task audio_embedding");
@@ -345,6 +408,7 @@ fn text_embedding_leg_selects_the_clip_text_tower_of_the_same_checkpoint() {
         &corpus,
         &work_dir,
         "in_proj,c_fc",
+        "triplet",
     )
     .args(["--max-seq-length", "16"])
     .output()
@@ -382,6 +446,7 @@ fn a_text_corpus_under_a_media_task_is_refused_by_the_cli() {
         &corpus,
         &work_dir,
         "in_proj,c_fc",
+        "triplet",
     )
     .output()
     .expect("run jammi-bench finetune-run");
@@ -393,5 +458,55 @@ fn a_text_corpus_under_a_media_task_is_refused_by_the_cli() {
     assert!(
         stderr.contains("anchor_path"),
         "the refusal must name the media field the row lacks: {stderr}"
+    );
+}
+
+/// `--objective mnrl` under a MEDIA task is refused (`finetune_run.rs`'s
+/// `RowSet::Media` × `Objective::Mnrl` arm) — the trainer's media loader
+/// carries the (anchor, positive, negative) triplet shape only, so running
+/// the triplet loss under an MNRL label would make the leg unpairable with
+/// every real MNRL leg. Driven through the real CLI, and paired with the
+/// three tests above (which prove `--objective triplet` IS accepted for all
+/// three tasks): without that pairing this assertion would also be
+/// satisfied by a build that refused every objective for every media task.
+#[test]
+fn a_media_task_under_the_mnrl_objective_is_refused() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let corpus = tmp.path().join("corpus");
+    if !run_producer(
+        "ci/scripts/perf/gen_fixed_shape_image_corpus.py",
+        &corpus,
+        8,
+        &["--size", "8"],
+    ) {
+        media_producer_require_gate();
+        return;
+    }
+    let work_dir = tmp.path().join("work");
+    std::fs::create_dir_all(&work_dir).expect("mkdir work");
+    let model_dir = repo_root().join("cookbook/fixtures/tiny_open_clip");
+    let output = media_command(
+        &model_dir,
+        "image_embedding",
+        &corpus,
+        &work_dir,
+        "in_proj,c_fc",
+        "mnrl",
+    )
+    .output()
+    .expect("run jammi-bench finetune-run --task image_embedding --objective mnrl");
+    assert!(
+        !output.status.success(),
+        "--objective mnrl under a media task must be refused, not run:\nstdout: {}",
+        String::from_utf8_lossy(&output.stdout)
+    );
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("mnrl") && stderr.contains("--objective triplet"),
+        "the refusal must name the objective it rejected AND the one to use: {stderr}"
+    );
+    assert!(
+        String::from_utf8_lossy(&output.stdout).trim().is_empty(),
+        "a refused invocation must emit no report at all"
     );
 }

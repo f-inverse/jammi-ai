@@ -37,9 +37,11 @@ numbers would fail here:
   -> `C-LN` (name-only, unchanged); `usigmoid_f32`/`affine_f32`/`bmul_f32`
   at `grid=[3600,1,1]` (`= rows*seq*mlp_width = 1200*3072`) -> `C-GELU`,
   the SAME rule at vision's own `mlp` tier, not `clip-text`'s `3696`.
-  `badd_f32` at the IDENTICAL `grid=[3600,1,1]` -> `ELEMENTWISE-MLP`, not
-  `C-GELU` — the same exclusion pass 1 first documented for `clip-text`,
-  reproduced on a second tower's own numbers.
+  `badd_f32` at the IDENTICAL `grid=[3600,1,1]` -> `BIAS/RESIDUAL-MLP`
+  (pass 3, finding 2 — `badd_*`'s own tier-suffixed name-class bucket,
+  replacing pass 2's coarser `ELEMENTWISE-MLP`), not `C-GELU` — the same
+  exclusion pass 1 first documented for `clip-text`, reproduced on a
+  second tower's own numbers.
 - `fast_max_f32`/`fast_sum_f32` at `grid=[14400,1,1]`
   (`= rows*heads*seq = 24*12*50`) -> `C-ATTN-clip-vision`; a THIRD
   `fast_sum_f32` at `grid=[1,1,1]` -> `LOSS/REDUCE` (matches neither
@@ -51,15 +53,18 @@ numbers would fail here:
   the rule generalizes by formula rather than being a hand-copied grid
   value from one tower.
 - `badd_f32` at `grid=[900,1,1]` (`out` tier, `rows*seq*width=1200*768`)
-  -> `ELEMENTWISE-OUT`; at `grid=[2700,1,1]` (`qkv` tier,
-  `rows*seq*3*width`) -> `ELEMENTWISE-QKV`.
+  -> `BIAS/RESIDUAL-OUT`; at `grid=[2700,1,1]` (`qkv` tier,
+  `rows*seq*3*width`) -> `BIAS/RESIDUAL-QKV` (pass 3, finding 2 — the two
+  tier-suffixed name-class buckets, replacing pass 2's `ELEMENTWISE-OUT`/
+  `ELEMENTWISE-QKV`).
 - `magma_sgemmEx_kernel` at `grid=[1,2,288]` — a THIRD gemm library
   entirely (neither `ampere_sgemm_*` nor `ampere_bf16_*gemm*`), observed
   ONLY on `clip-vision`, never `clip-text` — carries `288 = rows*heads`
-  (vision's OWN `attn_batch_count`, `heads=12`) in its grid ->
-  `C-ATTN-clip-vision`, via the SAME name-independent batched-grid rule
-  `Kernel2` uses on the BF16 `clip-text-A2` fixture; `ampere_sgemm_128x32_tn`
-  at `grid=[24,38,1]` (no `288`) -> `BASE-GEMM`.
+  (vision's OWN `attn_batch_count`) at grid POSITION 2 (pass 3, finding 1 —
+  the position every real match uses) -> `C-ATTN-clip-vision`, via the SAME
+  name-independent batched-grid rule `Kernel2` uses on the BF16
+  `clip-text-A2` fixture; `ampere_sgemm_128x32_tn` at `grid=[24,38,1]` (no
+  `288` at position 2) -> `BASE-GEMM`.
 - `im2col_f32` at `grid=[3528,1,1]` -> `C-PATCH-EMBED` — the ViT patch
   embedding's conv-as-matmul unfold step, observed ONLY on `clip-vision`
   (never `clip-text`, which has no convolutional stem at all).

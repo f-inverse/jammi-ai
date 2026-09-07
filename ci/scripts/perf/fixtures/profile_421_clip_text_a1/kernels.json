@@ -242,6 +242,22 @@
    "launches_per_step": 36.0,
    "us_per_step": 792.731598,
    "share": 0.013048784585907485
+  },
+  {
+   "kernel": "ucopy_f32",
+   "grid": [
+    924,
+    1,
+    1
+   ],
+   "block": [
+    1024,
+    1,
+    1
+   ],
+   "launches_per_step": 48.0,
+   "us_per_step": 996.61,
+   "share": 0.01640473173892743
   }
  ]
 }

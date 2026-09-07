@@ -1,0 +1,57 @@
+# Provenance — `profile_421_clip_vision_d1/kernels.json`
+
+Cut from the REAL `clip-vision-D1` leg's nsys census export, pulled by the
+lead from pod `p421` run 2 at `git_sha c1b0b0bad1f79a4ad6c298400e6ea19cc1ca633c`
+(F32, `JAMMI_KERNELS_DISABLE=lora_linear_fused,layer_norm_fused` — the
+per-tower D1 set, contract §D3):
+
+```
+scratchpad/pod421-run2/legs/clip-vision-D1/census.json
+```
+
+Same box/tooling as `profile_421_clip_vision_a1`. Leg parameters: `batch=8`
+(-> `rows=24`), `dtype="f32"`, `fusible_site_census.lora_sites_wrapped=48`
+(-> `layers=12`) — the SAME declared shapes as `clip-vision-a1`/`a2`
+(`ln_row_count=rows*seq=1200`, `attn_softmax_rows=14400`,
+`attn_batch_count=288`, `attn_shape_elements=720,000`,
+`out_shape_elements=921,600`). This is the SECOND tower's D1 fixture (the
+first, `clip-text-d1`, only carries `usqrt`/`urecip`/`bsub` at
+`ln_row_count`, never `usqr`) — this leg's own real export ALSO carries
+`usqr_f32` at `grid=[2,1,1]` (`ln_row_count` shape), which is the ONLY
+real evidence across all eight pulled CLIP legs for the contract's own
+`usqr` naming in `LN_EAGER_EXTENDED_KERNEL_NAMES` (pass 3, finding 2).
+
+## What this fixture is FOR: `usqr` at the LN row count, and the D1-vs-D2 pair
+
+- `usqr_f32`/`usqrt_f32`/`urecip_f32`/`bsub_f32`, ALL FOUR at
+  `grid=[2,1,1],block=[1024,1,1]` (`total_threads=2048` covering
+  `ln_row_count=1200`) -> `C-LN` (the eager LN's own mean/var/std/reciprocal
+  steps; `ln_disabled=True` on this leg, gating the rule on).
+  `launches_per_step` on the real export is `23`-`25` for all four,
+  matching this leg's own `fusible_site_census.layer_norms=26` (`clip-
+  vision`'s own LN-instance count, close but not asserted literally here).
+- `fast_sum_f32` at `grid=[1200,1,1],block=[1024,1,1]` -> `C-LN` (the
+  ROW-COUNT-gated reduction rule: `_is_row_count_grid` matches
+  `ln_row_count` exactly, distinct from the SAME kernel's `grid=[14400,
+  1,1]` row (softmax rows -> `C-ATTN-clip-vision`) and its `grid=[1,1,1]`
+  row (-> `LOSS/REDUCE`) — three rows, one name, disambiguated purely by
+  grid, same discipline `clip-text-d1`'s fixture already established.
+- `ampere_sgemm_128x64_nt` (no `288` in grid) -> `BASE-GEMM`;
+  `ampere_sgemm_128x128_nt` at `grid=[1,1,288]` and `magma_sgemmEx_kernel`
+  at `grid=[1,2,288]` (a THIRD gemm library, unsymbolized name aside) ->
+  `C-ATTN-clip-vision` (the batched-attention grid rule, gated on
+  `grid[2]==288` — pass 3, finding 1 — fires identically for a named
+  cuBLAS tile and a MAGMA kernel alike).
+- `Kernel2` at `grid=[6,1,18]` (`dim[1]=1`, fails the "every dimension
+  `>1`" anonymous-GEMM-tile test) stays `UNATTRIBUTED` — a SECOND tower's
+  evidence that the anonymous-kernel discipline (module doc, "classified
+  ONLY by grid-family rules") does not loosen just because `clip-text-D1`'s
+  OWN anonymous row (`grid=[8,2,28]`) happened to qualify.
+- `badd_f32` at `grid=[900,1,1]` -> `BIAS/RESIDUAL-OUT` (`out_shape_elements
+  =900*1024`, real evidence: eager LoRA's extra composition adds inflate
+  `launches_per_step` here relative to `clip-vision-a1`'s own fused count,
+  same pattern `clip-text-d1`'s own fixture already documents).
+- `adamw_moment_update_f32` -> `OPTIMIZER`, unchanged.
+
+None of the 14 rows' timing fields are asserted as literal expected values
+anywhere in the test suite.

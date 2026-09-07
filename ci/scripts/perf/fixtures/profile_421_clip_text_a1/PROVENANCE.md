@@ -13,7 +13,7 @@ scratchpad/pod421-run2/legs/clip-text-A1/census.json
 NOT git-tracked (it lives in a scratch pull directory, not a branch), so it
 could not be `git show`n the way `p6_fa2_dense_raw_runs/`'s fixtures were —
 the cut below was made with a short `python3 -c` script reading the pulled
-file directly and writing out ONLY the 15 `by_kernel_and_grid` rows this
+file directly and writing out ONLY the 16 `by_kernel_and_grid` rows this
 crate's tests need, byte-for-byte from the real export (no hand-edited
 field), plus the leg's own top-level `gpu_kernel_us_per_step` /
 `wall_s_per_step`:
@@ -36,6 +36,11 @@ wanted = [
     ("dropout_fwd_f32", [3696, 1, 1]),
     ("adamw_moment_update_f32", [4, 1, 1]),
     ("bmul_f32", [1112, 1, 1]),
+    # Added in pass 3 (adversarial-audit fold, finding 1/2): the ONE real
+    # `ucopy_f32` row at the `out` tier shape, for the
+    # `outside_signature_plausibly_attention` field's own "a present (not
+    # absent) PERMUTE/RESHAPE bucket" test — see below.
+    ("ucopy_f32", [924, 1, 1]),
 ]
 ```
 
@@ -67,8 +72,10 @@ matched either).
 "negative controls" were negative controls for pass 1's THREE-chain scope
 only, not for `UNATTRIBUTED` itself — they now land NAMED buckets pass 2
 adds: `ampere_sgemm_128x64_nn` at `grid=[4,29,7]` (no `192` in any
-dimension) -> `BASE-GEMM`; `badd_f32` at the GELU shape -> `ELEMENTWISE-MLP`
-(still not `C-GELU`, the exclusion itself is UNCHANGED, only where the
+dimension) -> `BASE-GEMM`; `badd_f32` at the GELU shape -> `BIAS/RESIDUAL-
+MLP` (pass 3, finding 2: `badd_*`'s own tier-suffixed name-class bucket —
+pass 2 first landed this row in the coarser `ELEMENTWISE-MLP`; still not
+`C-GELU` either way, the exclusion itself is UNCHANGED, only where the
 excluded row now lands); `dropout_fwd_f32` -> `DROPOUT`;
 `adamw_moment_update_f32` -> `OPTIMIZER`. The SECOND `bmul_f32` row at
 `grid=[1112,1,1]` (`1112*1024=1,138,688` elements — NOT the GELU shape)
@@ -76,12 +83,19 @@ likewise now FALLS THROUGH pass 1's GELU-shape gate (unchanged: it is still
 excluded from `C-GELU`) into the attention tensor's own elementwise tier
 (`attn_shape_elements() = rows*heads*seq*seq = 1,138,368`, which
 `1,138,688` covers) -> `C-ATTN-clip-text`, per `classify_kernel`'s
-documented "fall through" behavior. This fixture's OWN 15 rows and their
+documented "fall through" behavior. 15 of this fixture's 16 rows and their
 grids are UNCHANGED from pass 1 (nothing was re-cut) — only which chain
 each classifies into changed, per the new rules `test_profile_421_attribute.py`
-now asserts.
+now asserts. The 16th row (`ucopy_f32` at `grid=[924,1,1]`, the `out` tier
+shape) is a pass-3 addition, real and byte-for-byte from the same export:
+`ucopy_f32`/`copy2d_f32` get their OWN `PERMUTE/RESHAPE` bucket now (module
+doc, "split by kernel NAME-CLASS"), and this row lets the fixture exercise
+`outside_signature_plausibly_attention`'s mirroring of a NON-`"absent"`
+`PERMUTE/RESHAPE` entry directly (the BF16 `clip-text-A2` fixture's own
+`Kernel2`/`badd_bf16` rows never include a `ucopy`/`copy2d` name, so that
+fixture alone could not exercise this).
 
-None of the 15 rows' `us_per_step`/`launches_per_step`/`share` fields are
+None of the 16 rows' `us_per_step`/`launches_per_step`/`share` fields are
 asserted as literal expected values anywhere in
 `test_profile_421_attribute.py` — only structural invariants (which chain a
 row lands in, that shares sum `<= 1`, that every declared chain is present)

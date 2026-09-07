@@ -58,22 +58,27 @@ by construction):
   D-leg's shifted tile selection.
 - `badd_f32` at `grid=[924,1,1]` (`launches_per_step=874` on the real
   export, vs `337` on `clip-text-A1` — eager LoRA composition adds extra
-  calls at the SAME shape, not a new one) -> `ELEMENTWISE-OUT`, unchanged
-  bucket from `clip-text-A1`.
+  calls at the SAME shape, not a new one) -> `BIAS/RESIDUAL-OUT` (pass 3,
+  finding 2: `badd_*` is split out of the old coarse `ELEMENTWISE-<tier>`
+  bucket into its own tier-suffixed name-class).
 - `usqr_f32` at `grid=[924,1,1]` (`launches_per_step=25`, matching
   `layer_norms` exactly — plausibly the eager LN's own `(x-mean)^2` step)
-  -> `ELEMENTWISE-OUT`, NOT `C-LN`: `usqr_f32` is not in
-  `LN_ROW_FLAT_KERNEL_NAMES` (only `usqrt_f32`/`urecip_f32` are — the
-  launch-count match alone is not treated as sufficient evidence for a
-  by-name rule without an independent shape signature the way
-  `ln_row_count` is for `fast_sum`/`usqrt`/`urecip`); this row is the
-  fixture's evidence that the module does NOT over-fit a rule to a
-  launch-count coincidence.
+  -> `ELEMENTWISE-OTHER-OUT`, NOT `C-LN`: this row sits at the `out`
+  ACTIVATION-tier shape (`out_shape_elements=946,176`), not at
+  `ln_row_count=1,848` — `LN_EAGER_EXTENDED_KERNEL_NAMES`'s own shape gate
+  (pass 3, finding 2) only fires at the LATTER shape, so a launch-count
+  coincidence alone (`25` matching `layer_norms`) is never sufficient by
+  itself; `clip-vision-d1`'s own fixture shows the SAME name (`usqr_f32`)
+  DOES land `C-LN` on that tower, at `grid=[2,1,1]` (`ln_row_count` for
+  vision) — the rule is grounded in SHAPE, not name, and generalizes
+  per-tower exactly where the real export shows it firing.
 - `adamw_moment_update_f32` at `grid=[4,1,1]` -> `OPTIMIZER`, unchanged.
-- `Kernel2` at `grid=[8,2,28]` (`threads=57,344`, matching none of the
-  declared activation/attention/parameter tiers) stays `UNATTRIBUTED` —
-  the anonymous-kernel discipline (module doc, "never guess") holds even
-  on a leg where OTHER anonymous rows DO classify by grid.
+- `Kernel2` at `grid=[8,2,28]` (`threads=57,344`, EVERY one of the three
+  grid dimensions `>1`) -> `BASE-GEMM` (pass 3, finding 3: "Anonymous
+  kernels ... classified ONLY by grid-family rules" — a genuine 3-D tile
+  grid, not a guess; `clip-text-d2`'s own fixture carries the IDENTICAL
+  anonymous grid on an INDEPENDENT eager leg, corroborating). Pass 2 called
+  this row `UNATTRIBUTED`; the correction is pass 3's own.
 
 None of the 13 rows' timing fields are asserted as literal values anywhere
 in the test suite — only which chain each lands in.

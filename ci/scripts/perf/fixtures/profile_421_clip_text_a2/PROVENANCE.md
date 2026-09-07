@@ -45,22 +45,32 @@ so this fixture exercises the SAME declared shapes
   did not have (pass 1 would have called this `UNATTRIBUTED`).
 - `badd_bf16` at `grid=[1112,1,1]` (the attention tensor shape) ->
   `C-ATTN-clip-text`; at `grid=[924,1,1]` (the `out` activation tier) ->
-  `ELEMENTWISE-OUT`.
+  `BIAS/RESIDUAL-OUT` (pass 3, finding 2 — the tier-suffixed name-class
+  bucket `badd_*` gets, replacing pass 2's coarse `ELEMENTWISE-OUT`).
 - `Kernel2` (an ANONYMOUS/unsymbolized CUDA launch — no name at all) at
   `grid=[2,1,192]` -> `C-ATTN-clip-text` via the batched-grid RELATIONAL
-  rule alone (`192 = rows*heads` sits in the grid; the rule does not care
-  that the kernel has no name); a SECOND `Kernel2` row at `grid=[16,1,10]`
-  (no `192`, no tier match) stays `UNATTRIBUTED` — both anonymous, only one
-  classifiable, by grid alone.
+  rule alone (`192 = rows*heads` sits at grid POSITION 2 — pass 3, finding
+  1 — the rule does not care that the kernel has no name); a SECOND
+  `Kernel2` row at `grid=[16,1,10]` (no `192` at position 2, and `dim[1]=1`
+  fails the anonymous-GEMM-tile test too) stays `UNATTRIBUTED` AND is now
+  (pass 3, finding 3 — `Kernel2` is REMOVED from `KNOWN_KERNEL_NAMES`)
+  flagged UNKNOWN at `share_gpu_busy=1.40%`, exceeding
+  `UNKNOWN_KERNEL_SHARE_LIMIT` and making this ENTIRE FIXTURE'S leg
+  `INVALID` when read through `attribute_leg` — this fixture is the
+  committed, small-scale reproduction of the real `clip-text-A2` leg's own
+  INVALIDATION (module doc, "Consequence, measured"); `AttributeCensusBf16
+  FixtureTests` therefore no longer asserts `unknown == []` for this
+  fixture (pass 2 did; pass 3's own `UnknownKernelGateOnRealFixtureTests`
+  asserts the INVALIDATING reason instead).
 - `cast_bf16_f32`/`cast_scale_bf16_f32` -> `CAST` by name
   (`"cast" in name.lower()`); `cast_add_bf16` -> `CAST` too, EVEN THOUGH it
   has no f32 twin in `KNOWN_KERNEL_NAMES` (`BF16_ONLY_KERNEL_NAMES`, hand
   admitted from this same real export); `cast_u8_bf16` at
-  `grid=[1112,1,1]` (the attention tensor shape) -> `CAST`, NOT
-  `C-ATTN-clip-text` — the name-only `CAST` check runs BEFORE the
-  shape-based attention check in `classify_kernel`'s priority order, and
-  this row is the fixture's evidence that the ordering is deliberate, not
-  incidental.
+  `grid=[1112,1,1]` (the attention tensor's OWN shape) -> `C-ATTN-clip-text`
+  now, NOT `CAST` (pass 3, finding 1 corrects the priority: a cast-named
+  row is shape-gated to the attention chain FIRST; a cast row at any OTHER
+  shape still lands the generic `CAST` bucket — see the `A1` fixture's own
+  `cast_u8_f32` row at the SAME shape for the f32 analog).
 - `adamw_moment_update_f32` (an F32-NAMED kernel, even on this BF16 leg —
   the optimizer state itself stays F32 master weights) -> `OPTIMIZER` by
   name; `dropout_fwd_f32` (also F32-named on a BF16 leg) -> `DROPOUT` by
@@ -68,14 +78,17 @@ so this fixture exercises the SAME declared shapes
   name, never the leg's own dtype.
 - `gather_u32_bf16` -> `EMBED/GATHER`; `is_u32_bf16` at `grid=[924,1,1]`
   (the `out` activation tier shape) -> `EMBED/GATHER`, NOT
-  `ELEMENTWISE-OUT` — another priority-order fixture row (u32-typed name
-  checks run before the generic activation-tier fallback).
+  `BIAS/RESIDUAL-OUT`/`ELEMENTWISE-OTHER-OUT` — another priority-order
+  fixture row (u32-typed name checks run before the generic activation-tier
+  fallback).
 - `ampere_bf16_s16816gemm_bf16_128x128_ldg8_f2f_stages_64x3_nn` at
-  `grid=[4,15,1]` (no `192`) -> `BASE-GEMM`, via `GEMM_NAME_RE` (this exact
-  32-character tile-variant string is NOT, and will never be, hand-listed
-  in `KNOWN_KERNEL_NAMES` — `is_known_kernel_name` admits it because it
-  contains `"gemm"`, and `classify_kernel` routes it the same way it routes
-  every other GEMM-family kernel).
+  `grid=[4,15,1]` (no `192` at position 2) -> `BASE-GEMM`, via
+  `GEMM_NAME_RE` for CLASSIFICATION (unchanged from pass 2). For ADMISSION
+  (`is_known_kernel_name`), pass 3 (finding 3) REMOVES the `"gemm"`-
+  substring shortcut: this exact 32-character tile-variant string is now
+  hand-listed literally in `KNOWN_KERNEL_NAMES` (one of eight bf16 GEMM
+  tile names actually observed across `clip-text-A2`/`clip-vision-A2`),
+  never admitted by pattern alone.
 
 None of the 22 rows' `us_per_step`/`launches_per_step`/`share` fields are
 asserted as literal expected values anywhere in the test suite — only

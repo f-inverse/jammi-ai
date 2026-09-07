@@ -1,0 +1,231 @@
+{
+ "source": "scratchpad/pod421-run2/legs/clip-vision-D1/census.json (pod p421 run 2, git_sha c1b0b0bad1f79a4ad6c298400e6ea19cc1ca633c)",
+ "gpu_kernel_us_per_step": 97586.11139,
+ "wall_s_per_step": 0.16582872146799998,
+ "by_kernel_and_grid": [
+  {
+   "kernel": "fast_sum_f32",
+   "grid": [
+    1200,
+    1,
+    1
+   ],
+   "block": [
+    1024,
+    1,
+    1
+   ],
+   "launches_per_step": 96.0,
+   "us_per_step": 2362.432654,
+   "share": 0.024208697532363065
+  },
+  {
+   "kernel": "fast_sum_f32",
+   "grid": [
+    14400,
+    1,
+    1
+   ],
+   "block": [
+    64,
+    1,
+    1
+   ],
+   "launches_per_step": 36.0,
+   "us_per_step": 721.440772,
+   "share": 0.0073928632028054005
+  },
+  {
+   "kernel": "fast_max_f32",
+   "grid": [
+    14400,
+    1,
+    1
+   ],
+   "block": [
+    64,
+    1,
+    1
+   ],
+   "launches_per_step": 12.0,
+   "us_per_step": 241.32764799999998,
+   "share": 0.0024729712513652806
+  },
+  {
+   "kernel": "fast_sum_f32",
+   "grid": [
+    1,
+    1,
+    1
+   ],
+   "block": [
+    1024,
+    1,
+    1
+   ],
+   "launches_per_step": 96.0,
+   "us_per_step": 1324.9412439999999,
+   "share": 0.013577149710422535
+  },
+  {
+   "kernel": "ampere_sgemm_128x64_nt",
+   "grid": [
+    6,
+    48,
+    3
+   ],
+   "block": [
+    128,
+    1,
+    1
+   ],
+   "launches_per_step": 12.0,
+   "us_per_step": 3717.0850299999997,
+   "share": 0.038090307904008795
+  },
+  {
+   "kernel": "ampere_sgemm_128x128_nt",
+   "grid": [
+    1,
+    1,
+    288
+   ],
+   "block": [
+    256,
+    1,
+    1
+   ],
+   "launches_per_step": 24.0,
+   "us_per_step": 959.861256,
+   "share": 0.009836043698513028
+  },
+  {
+   "kernel": "magma_sgemmEx_kernel",
+   "grid": [
+    1,
+    2,
+    288
+   ],
+   "block": [
+    8,
+    8,
+    1
+   ],
+   "launches_per_step": 24.0,
+   "us_per_step": 488.435764,
+   "share": 0.005005177038441269
+  },
+  {
+   "kernel": "Kernel2",
+   "grid": [
+    6,
+    1,
+    18
+   ],
+   "block": [
+    128,
+    1,
+    1
+   ],
+   "launches_per_step": 36.0,
+   "us_per_step": 354.00457400000005,
+   "share": 0.0036276122591383034
+  },
+  {
+   "kernel": "usqr_f32",
+   "grid": [
+    2,
+    1,
+    1
+   ],
+   "block": [
+    1024,
+    1,
+    1
+   ],
+   "launches_per_step": 23.0,
+   "us_per_step": 47.652792,
+   "share": 0.0004883153075908212
+  },
+  {
+   "kernel": "usqrt_f32",
+   "grid": [
+    2,
+    1,
+    1
+   ],
+   "block": [
+    1024,
+    1,
+    1
+   ],
+   "launches_per_step": 25.0,
+   "us_per_step": 46.42138,
+   "share": 0.00047569658570038035
+  },
+  {
+   "kernel": "urecip_f32",
+   "grid": [
+    2,
+    1,
+    1
+   ],
+   "block": [
+    1024,
+    1,
+    1
+   ],
+   "launches_per_step": 25.0,
+   "us_per_step": 46.417212,
+   "share": 0.00047565387470451594
+  },
+  {
+   "kernel": "bsub_f32",
+   "grid": [
+    2,
+    1,
+    1
+   ],
+   "block": [
+    1024,
+    1,
+    1
+   ],
+   "launches_per_step": 23.0,
+   "us_per_step": 43.914228,
+   "share": 0.0004500048969519657
+  },
+  {
+   "kernel": "badd_f32",
+   "grid": [
+    900,
+    1,
+    1
+   ],
+   "block": [
+    1024,
+    1,
+    1
+   ],
+   "launches_per_step": 865.0,
+   "us_per_step": 10634.12566,
+   "share": 0.1089717123526014
+  },
+  {
+   "kernel": "adamw_moment_update_f32",
+   "grid": [
+    6,
+    1,
+    1
+   ],
+   "block": [
+    1024,
+    1,
+    1
+   ],
+   "launches_per_step": 120.0,
+   "us_per_step": 292.42872600000004,
+   "share": 0.002996622386471752
+  }
+ ]
+}

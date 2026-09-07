@@ -1666,24 +1666,30 @@ jobs:
           - name: profile_421_merge suite
             cmd: python3 ci/scripts/perf/test_profile_421_merge.py
           # `profile_421_attribute.py`'s own suite (#421 post-export
-          # attribution unit, CONTRACT v2.5 `### Attribution` / `§D3`) — the
-          # kernel-name<->shape MAPPING read off the first real
-          # `clip-text-A1` export, with tests, before any attribution is
-          # read. 45 hermetic tests: the LN/GELU/attention mapping decisions
-          # (by-name, by declared-shape, and by grid-dimension relation)
-          # against a SMALL, REAL, committed 15-row cut of that leg's own
-          # `by_kernel_and_grid` (`fixtures/profile_421_clip_text_a1/`,
-          # `PROVENANCE.md` names the exact source and selection), never a
-          # literal timing number asserted as an expectation — only
-          # structural invariants (chains partition busy exactly, shares
-          # `<= 1`, every declared chain present-or-explicitly-absent, the
-          # badd-at-the-GELU-shape and base-sgemm-without-the-attention-
-          # batch-count negative controls); the `C-LORA` A1-D2 delta and
-          # `D1-D2` advisory arithmetic; the unknown-kernel-name
-          # INVALIDATION gate (a name outside the validated 44-kernel
-          # vocabulary above 1% of busy refuses the leg by name, never folds
-          # silently into UNATTRIBUTED); and the CLI end to end at least
-          # once. No GPU, no `nsys`, no real checkpoint, no network.
+          # attribution unit, CONTRACT v2.5 `### Attribution` / `§D3`; pass 3
+          # = the adversarial-audit fold) — the kernel-name<->shape MAPPING
+          # read off the real CLIP legs, with tests, before any attribution
+          # is read. 157 hermetic tests: the LN/GELU/attention/PERMUTE-
+          # RESHAPE/BIAS-RESIDUAL mapping decisions (by-name, by declared-
+          # shape, and by grid-POSITION-2 relation) against SMALL, REAL,
+          # committed cuts of seven legs' own `by_kernel_and_grid`
+          # (`fixtures/profile_421_clip_{text,vision}_{a1,a2,d1,d2}/` minus
+          # `vision_a2`, `PROVENANCE.md` per directory names the exact
+          # source and selection), never a literal timing number asserted
+          # as an expectation — only structural invariants (chains partition
+          # busy exactly, shares `<= 1`, every declared chain present-or-
+          # explicitly-absent, the D1-vs-D2 differential's own direction/
+          # ordering, negative controls for the grid-position-2 and
+          # anonymous-GEMM-tile rules); `C-LORA`/`C-LN`'s realized-gain
+          # arithmetic (a SEPARATE `realized_gains` list, never a chain-
+          # partition member); the unknown-kernel-name INVALIDATION gate (a
+          # name outside the validated 59-kernel EXACT-NAME vocabulary above
+          # 1% of busy refuses the leg by name, never folds silently into
+          # UNATTRIBUTED, and no longer admits by a `"gemm"` substring or
+          # the anonymous `Kernel2` literal); `decision_grade`'s own
+          # `--merge-json` requirement; and the CLI end to end (incl. the
+          # `--merge-json` legs-set-mismatch refusal). No GPU, no `nsys`, no
+          # real checkpoint, no network.
           - name: profile_421_attribute suite
             cmd: python3 ci/scripts/perf/test_profile_421_attribute.py
           # `lora_bias_ab_merge.py`'s own suite (#428 P2b, docs-ci): drives

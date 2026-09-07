@@ -21,12 +21,12 @@ The recipes shipped at MVP:
 | [`mutable_tables`](#mutable-tables) | Create/insert/select/drop on a mutable companion table |
 | [`trigger_streams`](#trigger-streams) | Publish + subscribe on a topic via the in-process broker |
 | [`eval_embeddings`](#evaluate-retrieval-quality) | recall@k, MRR, nDCG against a golden set |
-| [`image_search`](#image-search) | Image-to-image search with PatentCLIP + Recall@K / MRR eval |
+| [`image_search`](#image-search) | Image-to-image search + Recall@K / MRR eval; vision-tower LoRA fine-tune with a served-change assertion; refusal on an unmatched selector |
 | [`eval_inference`](#evaluate-inference-classification) | Accuracy + macro F1 against gold labels |
 | [`eval_inference_ner`](#evaluate-inference-ner) | Entity-level precision / recall / F1 against gold spans |
 | [`fine_tune`](#fine-tune-an-encoder) | LoRA fine-tune end-to-end |
 | [`flight_sql`](#connect-via-flight-sql) | Query a remote `jammi-server` over Arrow Flight SQL |
-| [`audio_search`](#audio-search) | Audio-to-audio search with a CLAP encoder |
+| [`audio_search`](#audio-search) | Audio-to-audio search + Recall@K / MRR eval; audio-tower LoRA fine-tune with a served-change assertion; refusal on an unmatched selector |
 | [`search_audit`](#per-query-search-audit) | Per-query provenance audit of a search |
 | [`session_lifecycle`](#ephemeral-session-storage) | Ephemeral session storage with scoped cleanup |
 

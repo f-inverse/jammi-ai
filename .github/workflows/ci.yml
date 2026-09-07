@@ -1677,6 +1677,28 @@ jobs:
           # tree. No GPU, no `nsys`, no real checkpoint, no network.
           - name: profile_421_attribute suite
             cmd: python3 ci/scripts/perf/test_profile_421_attribute.py
+          # `profile_421_artifact.py`'s own suite (#421 close-out, contract
+          # v2.5 `## Artifacts`) — the third stage after merge/attribution:
+          # turns `--merge-json` + `--attribution-json` + a small non-numeric
+          # identity sidecar into the single committed `crates/jammi-kernels/
+          # artifacts/cuda-runs/*.json`. Six synthetic legs (the minimum that
+          # exercises every one of the four findings by leg id) drive: the
+          # `git_sha`/`box` cross-check across every leg's own `manifest.json`
+          # (never a value picked from just one), the per-tower-family
+          # checkpoint-sha256 cross-check, the merge/attribution/legs-dir
+          # leg-set-equality refusals, verbatim (not re-derived) copying of
+          # `p2`/`realized_gains`/`candidate_decisions`, and every finding's
+          # numeric `evidence` checked against an INDEPENDENT arithmetic
+          # oracle computed in the test file itself — never a value copied
+          # out of the module under test. A dedicated non-finite-input class
+          # (`NaN` in a per-step value, a launches-per-step count, or a chain
+          # share) proves the refusal fires rather than silently propagating
+          # (`NaN > c`/`NaN < c` are both `False`, so a naive `min`/`max` or
+          # threshold check would let it through). The CLI itself is driven
+          # end to end, incl. its non-zero exit on a refusal. No GPU, no
+          # `nsys`, no real checkpoint, no network, no real pod data.
+          - name: profile_421_artifact suite
+            cmd: python3 ci/scripts/perf/test_profile_421_artifact.py
           # `lora_bias_ab_merge.py`'s own suite (#428 P2b, docs-ci): drives
           # the REAL dispatch-proof/identity/differencing/verdict functions
           # (and `main` itself, end to end, at least once) against synthetic

@@ -1,0 +1,27 @@
+{
+  "_comment": "Identity/notes sidecar for the #421 tower-profile close-out artifact (pod p421, run2). Carries ONLY textual/declared provenance that has no numeric measurement to assert (device model strings, HF checkpoint repo+file names, prose) -- every NUMBER in the produced artifact (git_sha, box, checkpoint sha256, per-step wall/front/busy, chain shares, launches_per_step, ...) is read live off profile_421_merge.py / profile_421_attribute.py / the raw legs-dir by ci/scripts/perf/profile_421_artifact.py, never off this file. Consumed by: python3 ci/scripts/perf/profile_421_artifact.py --identity ci/scripts/perf/profile_421_run2_identity.json ...",
+  "what": "GH #421 tower training-step profile close-out: pre-registered (contract v2.5, frozen 2026-09-07 before measurement) census of the CLIP-text, OpenCLIP-vision and HTSAT LoRA training steps. Decides the candidate ports the contract names (C-ATTN-CLIP-text, C-ATTN-CLIP-vision, C-MLP-CLIP-text, C-MLP-CLIP-vision) and reports the already-realized fused-kernel gains (C-LORA, C-LN, C-GELU-HTSAT joint) plus the out-of-tier, named-but-undecided C-ATTN-HTSAT chain.",
+  "gpu": "NVIDIA A100-SXM4-80GB",
+  "driver": "580.126.16",
+  "cpu": "AMD EPYC 7742",
+  "nsys_human": "Nsight Systems 2025.3.2.474 (dnf-installed from the cuda-rhel8 repo; the pod image's own cuda-12.6 shim and an unpinned 2026.1.3 build were both refused by the job script)",
+  "checkpoints": {
+    "clip": {
+      "repo": "laion/CLIP-ViT-B-32-laion2B-s34B-b79K",
+      "files": ["open_clip_config.json", "open_clip_model.safetensors", "tokenizer.json"]
+    },
+    "clap": {
+      "repo": "laion/clap-htsat-fused",
+      "files": ["config.json", "model.safetensors", "preprocessor_config.json"]
+    }
+  },
+  "recorded_deviations": [
+    "run1 (pod p421, session 1) was ALL-12-LEGS INVALID at the pre-fix tip (esc-088: profile_421_legs.sh's corpus tuple shared stdout with its own producers, fixed by PR #469, main c1b0b0ba) -- this artifact is the full 12-leg re-run (run2) on the merged fix.",
+    "The BF16 (A2) leg on each CLIP tower is INVALID for ATTRIBUTION only (an anonymous 'Kernel2' bf16 GEMM row exceeds profile_421_attribute.py's 1% known-kernel-name gate on each) -- both merge-level validity and every candidate-port decision below are F32-only by consequence, never a silent width choice.",
+    "HTSAT A1/A2 are VALID at the merge level but NOT decision-grade for attribution (their UNATTRIBUTED share exceeds the contract's 5% validity bound) -- HTSAT has no candidate port under this contract in the first place (C-ATTN-HTSAT is a named, measured, declared-out-of-tier chain, never folded into UNATTRIBUTED), so this never blocks a decision.",
+    "Per-leg raw .nsys-rep exports were deleted on-pod after each leg's census.json was produced (disk budget); the raw sqlite exports (24 files, ~31 GB) were kept off-pod and were never committed.",
+    "Both media corpus producers (image, audio) emit families x instances = 24 files at any --rows, so the M-leg's 4800 rows cycle 16 distinct train clips (a page-cached working set, contract SS D6.3) -- the HTSAT/vision front-end finding below is a real per-item CPU decode/preprocess compute cost, not a realistic-corpus I/O cost, and every quote of that finding must carry this caveat."
+  ],
+  "producer_invocation": "identity (nvidia-smi, /proc/cpuinfo) -> nsys --version (pinned 2025.3.2.474, fails loudly if absent) -> build (cargo build --release -p jammi-bench --features cuda; JAMMI_BUILD_SHA baked from a byte-identical checkout) -> checkpoints (huggingface_hub fetch of the pinned per-repo file sets) -> PROFILE_421_LEGS_PREFLIGHT_ONLY=1 ci/scripts/perf/profile_421_legs.sh -> PROFILE_421_P2_BF16=1 ci/scripts/perf/profile_421_legs.sh + profile_421_merge.py --p2-dir -> ci/scripts/perf/profile_421_legs.sh (12 legs) -> profile_421_merge.py --legs-dir --p2-dir -> profile_421_attribute.py --legs-dir --merge-json",
+  "status": "GREEN"
+}

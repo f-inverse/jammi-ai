@@ -1898,6 +1898,37 @@ staleness→recompute loop — that is the platform's, not the engine's
   HF `ClapAudioLayer`'s own value and `exp(-100) ≈ 3.7e-44` is a denormal in F32, i.e.
   output-affecting. `-100.0` is exact in F32/F16/BF16 alike, and at F32 the `to_dtype`
   is candle's same-dtype early return (`self.clone()`).
+- **Every fusible activation goes through the house seam** — a tower never calls
+  `Tensor::gelu_erf()` directly. HTSAT's two GELU-erf sites (each Swin block's MLP in
+  `SwinBlock::forward`, and the projection head's `"gelu"` arm in
+  `ClapAudioProjection::forward_unnormalized_with_training`) both route through
+  `crate::activations::gelu_erf(x, training)` — the same seam `BertIntermediate::forward`
+  and `DistilBertFfn::forward` use, and the reason `gelu_erf_fused` is reachable on this
+  tower with no new kernel work. The seam's contract carries over unchanged: `training ==
+  false` is the unchanged eager call byte for byte, so eval bytes and every golden-parity /
+  bits-snapshot row taken in eval are what they were before the seam existed, while
+  `training == true` makes fused-vs-eager a COUNTED admission decision on tensor state
+  (dtype, contiguity, device, non-emptiness), never on model identity. The `training` flag
+  is a call-chain PARAMETER sourced from `HtsatAudio::set_training`'s single stored flag and
+  threaded to both sites, never a per-sub-struct stored copy — a stored copy is exactly how
+  a seam ends up dispatching on a flag the model's own forward has already moved past. The
+  two flag-less public entry points (`HtsatAudioEncoder::forward_spine`,
+  `ClapAudioProjection::forward_unnormalized`) are eval conveniences defined as their
+  `_with_training(.., false)` twins, for boundary-parity harnesses that hold no flag of
+  their own. Both sites report to ONE process-wide `gelu_erf_fused` registry entry, so a
+  full-tower forward's counter delta is their SUM — one per Swin block, plus one more when
+  `projection_hidden_act == "gelu"`; the tower's own module doc carries that arithmetic and
+  the per-site oracles (including the `"relu"` negative control) that pin it.
+- **A config field that names a computation is dispatched on or REFUSED, never ignored** —
+  `HtsatAudioConfig.hidden_act` names the Swin MLP's activation, but `SwinBlock::forward`
+  is unconditionally GELU-erf, so `HtsatAudioEncoder::load` REFUSES any value other than
+  `"gelu"` (HF `ClapAudioConfig`'s only shipped value) at load, naming the field and the
+  offending value, through both entry points (`HtsatAudio::load` and
+  `HtsatAudio::builder().build(..)`). A checkpoint declaring `"relu"` there would otherwise
+  load and then silently compute something its own config does not describe — the worst
+  failure shape available, because every downstream number still looks well-formed.
+  Contrast `projection_hidden_act`, which IS genuinely dispatched on at forward (`"gelu"`
+  and `"relu"` are both real arms) and therefore needs no load-time refusal.
 - **The de-facto BERT-family contract** — no Rust trait; the three encoders expose an
   *identical inherent-method surface* (`builder`, `forward`, `forward_hidden`,
   `hidden_size`, `max_seq_length`, `trainable_params`, `named_trainable_weights`,

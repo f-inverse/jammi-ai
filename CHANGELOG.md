@@ -135,8 +135,65 @@ workspace ships every publishable crate at the same
   PCIe: BERT and DistilBERT both ACTIVATE at both measured shapes, per-step wall gains 17.23–30.77%
   (artifact `crates/jammi-kernels/artifacts/cuda-runs/2026-09-05-lora-bias-428-c69dbd7-a100-pcie.json`;
   table and mechanism in `docs/maintainer/fine-tune-performance-guide.md` §4).
+- **A checkable forced-eager premise, a selectable LoRA init, and a directly measured media
+  front end (#421).** `jammi-bench finetune-run --expect-kernels-disabled <keys>` turns a
+  forced-eager leg's premise into a checked one: the run refuses at start unless every named op key
+  is present in `JAMMI_KERNELS_DISABLE` (subset semantics — `--arm alloff` pins its own keys into
+  the same variable), and refuses at the end unless no requested disable went unmatched and every
+  named key's fused dispatch counter read zero across the run; either refusal exits non-zero and
+  writes no row. `--lora-init {zeros_b,gaussian}` selects the adapter initialization — `zeros_b` is
+  the default and byte-identical to what every prior invocation produced, while `gaussian` gives a
+  non-zero gradient into `A` at step 0, which a zero-`B` adapter cannot. The report gains
+  `media_front_end_wall_s`: wall spent in the media decode/preprocess front end, read from the new
+  `jammi_ai::fine_tune::TrainingResult::media_front_end_wall` and summed across a run's
+  resume-cycled epoch legs. Its boundary is declared, not implied — decode plus preprocess
+  including the device tensor build those functions perform internally, tower forward excluded,
+  accumulated only in training mode (held-out eval passes excluded, so it is a strict subset of the
+  training wall), `null` rather than `0.0` on a text leg because tokenization is not a media front
+  end. It is measured directly, never `wall − gpu_busy`, so it does not absorb launch latency, sync
+  stalls and optimizer CPU time into a number labelled "front end". `--task`, `--lora-init` and the
+  media corpora's own content digests (`train_media_sha256`/`heldout_media_sha256`, digests of the
+  bytes behind a manifest that names only paths) join the report's identity tuple;
+  `kernels_disabled_expected` joins its provenance tuple; `media_front_end_wall_s` is in neither.
+- **Held-out splits from the corpus producers (#421).** All three fixed-shape corpus producers
+  (`ci/scripts/perf/gen_fixed_width_corpus.py`, `gen_fixed_shape_image_corpus.py`,
+  `gen_fixed_length_audio_corpus.py`) emit a held-out split on `--heldout-rows`, writing a
+  `heldout_ids.txt` and its own `heldout_triplets.jsonl` beside the train corpus —
+  `finetune-run` requires `--heldout-ids` + `--heldout-jsonl` on every leg, so a corpus without one
+  is not runnable and the producer that owns the corpus now owns the split. The two media producers
+  additionally take `--heldout-batch` (required alongside `--heldout-rows`, refused unless it
+  divides the held-out row count) and `--heldout-families`, which reserves that many of the family
+  pool for the split, making its rows id-, file- and family-disjoint from train; the text
+  producer's split is id- and text-disjoint and carries the same width guarantee. On all three the
+  held-out rows carry the train schema and the corpus's own pinned shape/duration/width, and
+  requesting them leaves the train split byte-identical to a no-held-out run at the same seed.
 
 ### Changed
+- **HTSAT's MLP and projection GELU reach the fused seam on the training path (#421).** The audio
+  tower's two GELU-erf sites — each Swin block's MLP and the projection head's `"gelu"` arm — call
+  the house seam `activations::gelu_erf(x, training)` instead of `Tensor::gelu_erf()` directly, the
+  same seam the BERT family's FFN uses, so `gelu_erf_fused` is reachable on this tower with no new
+  kernel work. **Eval bytes are unchanged**: the seam's `training == false` arm is the unchanged
+  eager call byte for byte, and no admission machinery runs there at all. In training the
+  fused-vs-eager choice is a counted admission decision on tensor state, never on model identity.
+  The `training` flag is threaded to both sites as a call-chain parameter from
+  `HtsatAudio::set_training`'s single stored flag; the flag-less `HtsatAudioEncoder::forward_spine`
+  and `ClapAudioProjection::forward_unnormalized` remain as eval conveniences defined in terms of
+  their `_with_training(.., false)` twins.
+- **`HtsatAudioConfig.hidden_act` is validated at load instead of silently ignored (#421).** A
+  checkpoint declaring any value other than `"gelu"` — the only value HF `ClapAudioConfig` ships —
+  is now refused by name at load, through both `HtsatAudio::load` and
+  `HtsatAudio::builder().build(..)`, because the Swin MLP is unconditionally GELU-erf. Such a
+  checkpoint previously loaded and then computed something its own config did not describe.
+  `projection_hidden_act` is unaffected: both its `"gelu"` and `"relu"` arms are genuinely
+  dispatched on at forward.
+- **A failed training job's stored message is no longer double-prefixed (#421).** `TrainingJob`'s
+  read path re-wraps a stored failure in a fine-tune error, whose `Display` already renders the
+  "Fine-tune error: " prefix, so a failure that was itself a fine-tune error came back as
+  `TrainingError("Fine-tune error: Fine-tune error: …")`. The worker now stores the raw inner
+  message for that one variant, applying the prefix exactly once at the read site; every other
+  variant's own (different) prefix is preserved, since "Fine-tune error: Model error: …" is an
+  informative nesting rather than a duplicate.
 - **Audio encoder-adapters fine-tuning is supported; the refusal is gone (#421).** An
   `audio_embedding` encoder-adapters job on an HF-CLAP checkpoint trains the HTSAT tower instead of
   failing with "LoRA injected inside the audio encoder is not supported. Leave `target_modules`

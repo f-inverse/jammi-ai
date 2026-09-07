@@ -467,6 +467,30 @@ class FinetuneRunIdentityFieldsSubsetTests(unittest.TestCase):
             "so the Python mirror is the WHOLE identity set, never merely a subset of it",
         )
 
+    def test_finetune_run_identity_fields_matches_the_rust_const_in_ORDER(self):
+        # `FINETUNE_RUN_IDENTITY_FIELDS`'s own inline comments CLAIM position
+        # parity with the Rust const ("same position as the Rust const's own
+        # listing, immediately after `seed`", and three more like it). Set
+        # equality above cannot see that claim: a mirror listing every right
+        # name in a shuffled order passes it while every one of those
+        # comments is false. The claim is worth keeping — the mirror is
+        # reviewed by reading it BESIDE the Rust const, which only works if
+        # the two read down in the same order — so it is pinned here as a
+        # property rather than left as prose. Ordering is never load-bearing
+        # for the comparison itself (both sides are consumed as sets); this
+        # pin exists so the comments stay TRUE.
+        rust_ordered = _extract_rust_fields_block(
+            REPORT_RS, _IDENTITY_FIELDS_BLOCK_RE, "FinetuneRunTier"
+        )
+        self.assertEqual(
+            list(identity_fields.FINETUNE_RUN_IDENTITY_FIELDS),
+            rust_ordered,
+            "identity_fields.py::FINETUNE_RUN_IDENTITY_FIELDS must list the same names in the "
+            "same ORDER as FinetuneRunTier::IDENTITY_FIELDS — a new field appended to the "
+            "Python mirror instead of inserted at the Rust const's own position keeps set "
+            "equality green while making the mirror's own position comments false",
+        )
+
     def test_identity_and_provenance_are_disjoint(self):
         overlap = self.rust_identity_fields & self.rust_provenance_fields
         self.assertFalse(
@@ -499,8 +523,13 @@ class FinetuneRunIdentityFieldsSubsetTests(unittest.TestCase):
 
     def test_objective_selected_nullable_fields_match_rust_null_means(self):
         # Non-vacuity anchor for FINETUNE_RUN_NULL_IS_A_VALUE_FIELDS: the
-        # five fields it names must be EXACTLY the Rust const's own
-        # `Nullable::NullMeans(...)` entries — a set this suite derives from
+        # fields it names must be EXACTLY the Rust const's own
+        # `Nullable::NullMeans(...)` entries — deliberately NOT restated
+        # here as a count, because the property is set EQUALITY against a
+        # set derived from source, and a hand-written count in this comment
+        # is a second copy of that fact that goes stale the moment a field
+        # crosses NonNull/NullMeans (it already had, twice). A set this
+        # suite derives from
         # `report.rs` independently of the hand-written Python frozenset
         # above (regex over the FULL `("field", Nullable::NullMeans...)`
         # tuple, not just the field name), so a field silently moved between

@@ -324,26 +324,89 @@ Sequences are packed into `qkv [total_q, 3, H, 64]` with a `cu_seqlens [B+1]` pr
 
 CLIP-text, OpenCLIP-vision and HTSAT-CLAP audio are LoRA-trainable on the same
 `MaybeLoraLinear` seam the BERT family uses (`docs/maintainer/MAINTAINER-GUIDE.md` §2.5),
-so two of this section's fused primitives are reachable on a tower training step **with no
-new kernel work at all**: the fused LoRA site (`lora_linear_fused`, every wrapped linear
-on every tower) and the fused biased LayerNorm (`layer_norm_fused` — all three towers
-carry a bias on their LayerNorms, the case #460 admitted). Two are not: CLIP's attention
-would need the house `MASKED_LOGIT` sentinel to reach `attention_block_fused` (a declared
-eval-bit change, so it is a port with its own oracle, not a wiring change), HTSAT's
-`head_dim` of 24 declines the block arm's domain outright, and CLIP's `quick_gelu`
-activation has no fused seam.
+so several of this section's fused primitives are reachable on a tower training step **with
+no new kernel work at all**: the fused LoRA site (`lora_linear_fused`, every wrapped linear
+on every tower), the fused biased LayerNorm (`layer_norm_fused` — all three towers
+carry a bias on their LayerNorms, the case #460 admitted), and, on HTSAT only, the fused
+dense erf-GELU (`gelu_erf_fused`): that tower's Swin-block MLP and its projection head's
+`"gelu"` arm both call the house seam `activations::gelu_erf(x, training)`, so the same
+op §4's BERT-family paragraph measures admits there on tensor state, with eval bytes
+unchanged (the seam's `training == false` arm is the unchanged `Tensor::gelu_erf` call).
+Two primitives remain out of reach: CLIP's attention would need the house `MASKED_LOGIT`
+sentinel to reach `attention_block_fused` (a declared eval-bit change, so it is a port with
+its own oracle, not a wiring change), HTSAT's `head_dim` of 24 declines the block arm's
+domain outright, and CLIP's `quick_gelu` activation has no fused seam at all — so the CLIP
+towers have no `gelu_erf_fused` admit site, and naming that key in a forced-eager CLIP leg
+would be an unmatched disable the bench refuses.
 
 **No tower numbers are recorded here, because none have been measured.** The training-step
 profile is pre-registered as its own unit (issue #421 PR B) and is written before any
-measurement: per-tower steps driven through `jammi-bench finetune-run --task` over the
-fixed-shape synthetic media the two committed producers emit
-(`ci/scripts/perf/gen_fixed_shape_image_corpus.py`,
-`ci/scripts/perf/gen_fixed_length_audio_corpus.py` — fixed shape so the timed region
-carries the tower's real front-end cost and nothing that varies row to row), ablation
-twins, wall-differenced shares, and two-sided ACTIVATE/DECLINE/UNRESOLVED thresholds
-declared up front so the unit closes on any outcome. Until that artifact exists, §11's
-first checklist applies unchanged: every number in a doc names its producer, or it is not
-written.
+measurement: per-tower steps driven through `jammi-bench finetune-run` over the
+fixed-shape synthetic media the committed producers emit, ablation twins, wall-differenced
+shares, and two-sided ACTIVATE/DECLINE/UNRESOLVED thresholds declared up front so the unit
+closes on any outcome. Until that artifact exists, §11's first checklist applies unchanged:
+every number in a doc names its producer, or it is not written.
+
+**The producers.** `ci/scripts/perf/gen_fixed_shape_image_corpus.py` and
+`ci/scripts/perf/gen_fixed_length_audio_corpus.py` emit the media corpora (fixed shape and
+fixed duration, so the timed region carries the tower's real front-end cost and nothing
+that varies row to row); `ci/scripts/perf/gen_fixed_width_corpus.py` emits the CLIP-text
+one. All three also emit a HELD-OUT split on `--heldout-rows`, writing a
+`heldout_ids.txt` plus its own `heldout_triplets.jsonl` beside the train corpus, because
+`finetune-run` REQUIRES `--heldout-ids` + `--heldout-jsonl` on every leg — a corpus without
+one is not runnable, so the producer that owns the corpus owns the split too. The media
+producers additionally take `--heldout-batch` (required alongside `--heldout-rows`, refused
+unless it divides the held-out row count) and `--heldout-families`, which RESERVES that
+many of the family pool for the split, making the held-out rows id-, file- and
+family-disjoint from train; the text producer's split is id- and text-disjoint and carries
+the same width guarantee. On every producer the held-out rows carry the train schema and
+the train corpus's own pinned shape/duration/width, and requesting them leaves the train
+split byte-identical to a no-held-out run at the same seed — so a driver can generate
+train-only and train+held-out corpora at the same seed and difference them. Each producer's
+suite is a matrix leg in `.github/workflows/ci.yml`.
+
+**The run flags the profile pins.** `jammi-bench finetune-run --task
+{text_embedding,image_embedding,audio_embedding}` selects the tower; `--objective triplet`
+pins the joined-forward row count (a media task refuses MNRL outright); `--lora-init
+{zeros_b,gaussian}` selects the adapter initialization (`zeros_b` is the default and is
+byte-identical to what every invocation written before the flag produced — `gaussian`
+exists because a `zeros_b` adapter has a zero `B`, hence a zero gradient into `A` at step
+0, which makes it useless as a dtype pre-flight); and `--expect-kernels-disabled <keys>`
+turns a forced-eager leg's premise into a checked one. That last flag is what makes an
+eager twin a datum rather than an assumption: the run refuses at START unless every named
+key is present in `JAMMI_KERNELS_DISABLE` (SUBSET semantics, deliberately weaker than
+`finetune-step`'s equality, because `--arm alloff` pins its own keys into the same
+variable), and refuses at the END unless no requested disable went unmatched AND every
+named key's fused dispatch counter read zero across the run. A leg that fails either check
+exits non-zero and writes no row — INVALID, never a datum. The claim itself is recorded on
+the report as provenance (`kernels_disabled_expected`), distinct from the process-OBSERVED
+`kernels_disabled_requested`/`kernels_disabled_fired` pair it was checked against.
+
+**The driver.** `ci/scripts/perf/profile_421_legs.sh` runs the sweep, generalizing
+`profile_356_legs.sh` by tower: it builds the leg table, generates each leg's corpus and
+work dir, cross-checks provenance, stamps a per-leg manifest, and captures the census. The
+forced-eager disable list is PER TOWER for the reason above — the CLIP legs name only the
+keys those towers actually admit, HTSAT adds `gelu_erf_fused`. A hermetic dry-run suite
+(`ci/scripts/perf/test_profile_421_legs_dry_run.py`) drives the real script end to end with
+no GPU, no `nsys`, no checkpoint and no network, on both its dry-run and its real-preflight
+surfaces, and is a matrix leg in `.github/workflows/ci.yml`.
+
+**The front end is measured, never differenced.** `finetune-run` reports
+`media_front_end_wall_s` on every media leg, read from
+`TrainingResult::media_front_end_wall` and summed across the resume-cycled epoch legs of a
+run. Its boundary is DECLARED, not implied: the wall around the decode + preprocess call —
+including the device tensor build those preprocess functions perform internally, which
+cannot be separated without splitting them — with the tower forward EXCLUDED, accumulated
+only while the loop is in training mode (held-out eval passes are excluded, so the number
+is a strict subset of the training wall), and `null` rather than `0.0` on a text leg
+because tokenization is not a media front end and stays in the residual. (The
+projection-head training target is the one arm where the frozen base's decode, preprocess
+and forward are one inseparable call; the whole call is charged there, and that field's own
+doc says so.) It is a MEASURED field — neither identity nor provenance — for the same
+reason the dispatch counters are, and it is deliberately NOT `wall − gpu_busy`: a
+difference would absorb launch latency, sync stalls and the optimizer's own CPU time into a
+number labelled "front end". Having it directly is what lets a profile report `launch/sync
+residual = wall − front − busy` instead of folding all three together.
 
 One measurement note carried over from the bench wiring: the three towers compose
 `attention_softmax` directly, with no admission counter behind it, so **all-zero attention
@@ -355,6 +418,8 @@ adapted encoder was never forwarded.
 ### The bench and its torch twin
 
 `jammi-bench finetune-step`: three encoder forwards, a triplet hinge, one backward, one AdamW step; synthetic uniform token ids, so it measures *cost*, never learning. `torch_finetune_step.py` is matched argument for argument (`attn_implementation` read back from the config; `--attn eager` = semantic twin, `--attn sdpa` = the throughput bar; LoRA init distribution-matched; TF32 off). `ab_merge.py` refuses to compare legs whose `FINETUNE_IDENTITY_FIELDS` differ (the tuple is declared once, in `ci/scripts/perf/identity_fields.py`, and imported — 18 entries, including the padded-batch `row_lengths` vector); the raw attention string (`attn_requested`/`attn_implementation`) is recorded as provenance and never compared, while the reference *class* it implies is compared via the `attention_arm` identity field; the clip determinant `max_grad_norm` is in the comparison tuple (null = clip off is a value, never MISSING) and in the K7-completeness const (`FinetuneStepTier::IDENTITY_FIELDS`, a strict superset). A stdlib-`unittest` suite (`ci/scripts/perf/test_identity_fields_subset.py`) pins the claim mechanically: every Python comparison-tuple entry must be named in the corresponding Rust K7-completeness const, and the tuple cardinalities (18, 11) are asserted as numbers, not promises.
+
+`jammi-bench finetune-run` is the multi-step tier over the same machinery, and its `FinetuneRunTier` keeps identity and provenance in two DISJOINT consts rather than the superset-folded shape `FinetuneStepTier` uses — so `identity_fields.py::FINETUNE_RUN_IDENTITY_FIELDS` is checked for set EQUALITY against `FinetuneRunTier::IDENTITY_FIELDS`, in the same order, not merely for subset. Every field lands in exactly one of three classes, and the class is the argument, not the field's type. **IDENTITY** is a premise two legs must AGREE on to be comparable at all: `task` (which TOWER of a multi-tower checkpoint was trained — the strongest identity field on this tier after the checkpoint digests, because one `checkpoint_weights_sha256` covers both OpenCLIP towers), `lora_init` (a `gaussian` leg starts from a different point on the loss surface than a `zeros_b` leg at the identical seed and selectors), and `train_media_sha256`/`heldout_media_sha256` (the media corpus's own CONTENT digests, a digest-of-digests in manifest and scoring order — the manifest digests beside them name PATHS, so swapping the bytes behind those paths moves every measured loss while leaving every other identity field byte-identical; `null` on a text leg, where the manifest IS the content, is a stated value and not a missing one). **PROVENANCE** is caller-declared or build-observed, recorded and never compared: `kernels_disabled_expected`, the `--expect-kernels-disabled` claim, in exactly `arm`'s sense. **MEASURED** is an outcome of running, in neither tuple: `media_front_end_wall_s`, the same class every dispatch counter and `train_run_wall_s` carry — naming it in a comparison tuple would make two legs at different front-end costs incomparable, which is the opposite of what it is for.
 
 ---
 

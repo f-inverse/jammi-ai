@@ -591,29 +591,39 @@ FAKE_NSYS_EOF
 #!/usr/bin/env bash
 set -euo pipefail
 # $1=steps_measured $2=golden_json_path $3=task $4=disable_keys(csv, may be
-# empty) $5=lora_init $6=backbone_dtype $7=heldout_ids_path -- emits the
-# golden-derived Report envelope on ITS OWN stdout
-# (never writes a file directly), so the exec-wrapper's own "redirect this
-# child's stdout to the report file" mechanism is what actually produces
-# the report, for real. The overridden fields are exactly the ones this
-# driver's own readers consume, so a reader bug is exercised here rather
-# than papered over.
+# empty) $5=lora_init $6=backbone_dtype $7=heldout_ids_path
+# $8=train_jsonl_path $9=heldout_jsonl_path -- emits the golden-derived
+# Report envelope on ITS OWN stdout (never writes a file directly), so the
+# exec-wrapper's own "redirect this child's stdout to the report file"
+# mechanism is what actually produces the report, for real. The overridden
+# fields are exactly the ones this driver's own readers consume, so a
+# reader bug is exercised here rather than papered over.
 #
-# esc-088 (`.jammi/escapes.jsonl`): $7 mirrors the REAL `finetune-run`'s own
-# `--heldout-ids <HELDOUT_IDS>` refusal -- a non-empty, EXISTING path is
-# required, exactly what clap's "a value is required ... but none was
-# supplied" enforces on a real pod run. `provision_corpus`'s stdout-capture
-# bug used to hand this driver an EMPTY `heldout_ids`, which every real leg
-# then passed straight through to a real `finetune-run` and every real leg
-# refused; the DRY_RUN path never caught it because nothing on this path
-# ever inspected the value. This stub now refuses the same way, so a
-# regression back to an empty/garbled `--heldout-ids` fails HERE, hermetically,
-# rather than only on a GPU pod.
+# esc-088 (`.jammi/escapes.jsonl`): $7/$8/$9 mirror the REAL
+# `finetune-run`'s own `--heldout-ids <HELDOUT_IDS>` /
+# `--train-jsonl <TRAIN_JSONL>` / `--heldout-jsonl <HELDOUT_JSONL>`
+# refusals -- a non-empty, EXISTING path is required for each, exactly what
+# clap's "a value is required ... but none was supplied" enforces on a real
+# pod run. `provision_corpus`'s stdout-capture bug used to hand this driver
+# an EMPTY `heldout_ids`, which every real leg then passed straight through
+# to a real `finetune-run` and every real leg refused; the DRY_RUN path
+# never caught it because nothing on this path ever inspected the value.
+# This stub now refuses the same way for all three corpus paths the real
+# binary requires, so a regression back to an empty/garbled/touch-empty
+# corpus path fails HERE, hermetically, rather than only on a GPU pod.
+_require_real_corpus_arg() {
+  local value="$1" flag="$2"
+  if [ -z "$value" ] || [ ! -s "$value" ]; then
+    echo "error: a value is required for '$flag' but none was supplied (got '${value}')" >&2
+    exit 2
+  fi
+}
 heldout_ids_path="${7:-}"
-if [ -z "$heldout_ids_path" ] || [ ! -f "$heldout_ids_path" ]; then
-  echo "error: a value is required for '--heldout-ids <HELDOUT_IDS>' but none was supplied (got '${heldout_ids_path}')" >&2
-  exit 2
-fi
+train_jsonl_path="${8:-}"
+heldout_jsonl_path="${9:-}"
+_require_real_corpus_arg "$heldout_ids_path" "--heldout-ids <HELDOUT_IDS>"
+_require_real_corpus_arg "$train_jsonl_path" "--train-jsonl <TRAIN_JSONL>"
+_require_real_corpus_arg "$heldout_jsonl_path" "--heldout-jsonl <HELDOUT_JSONL>"
 python3 -c '
 import copy, json, os, sys
 steps_measured, golden_path, task, disable_csv, lora_init, dtype = (
@@ -898,7 +908,7 @@ run_traced() {
     exec_cmd=(
       "${env_prefix[@]}"
       "$DRY_RUN_STUB_DIR/fake_bench.sh" "$steps_this_run" "$GOLDEN_FIXTURE" "$task" \
-        "$disable_keys" "$LORA_INIT" "$dtype" "$heldout_ids"
+        "$disable_keys" "$LORA_INIT" "$dtype" "$heldout_ids" "$train_jsonl" "$heldout_jsonl"
     )
   fi
 
@@ -1189,6 +1199,44 @@ run_leg() {
     leg_reason="corpus provisioning failed for tower $tower (see this leg's stderr above)"
   fi
 
+  # Test-only contamination lever (never set by the real leg sweep, same
+  # posture as `PROFILE_421_LEGS_DRY_RUN_EXTRA_REQUESTED_KEY` above): lets
+  # a hermetic test force a `provision_corpus` that reported SUCCESS to
+  # still leave one of its four paths empty, so the post-condition check
+  # right below is proven to fire on the mechanism rather than assumed.
+  if [ "$leg_status" = "ok" ] && [ -n "${PROFILE_421_LEGS_DRY_RUN_TRUNCATE_CORPUS_VAR:-}" ]; then
+    case "$PROFILE_421_LEGS_DRY_RUN_TRUNCATE_CORPUS_VAR" in
+      train_n) : > "$train_n" ;;
+      train_m) : > "$train_m" ;;
+      heldout_ids) : > "$heldout_ids" ;;
+      heldout_jsonl) : > "$heldout_jsonl" ;;
+      *)
+        echo "::error::unknown PROFILE_421_LEGS_DRY_RUN_TRUNCATE_CORPUS_VAR '$PROFILE_421_LEGS_DRY_RUN_TRUNCATE_CORPUS_VAR'" >&2
+        exit 2
+        ;;
+    esac
+  fi
+
+  # Post-condition on a REPORTED-success `provision_corpus`: a producer
+  # that exits 0 but writes an empty (or missing) file would otherwise sail
+  # straight into `run_traced`, and clap's own refusal downstream would
+  # blame `finetune-run` for something `provision_corpus` should have
+  # caught itself. Checked BY NAME so the manifest's reason names exactly
+  # which of the four paths failed.
+  if [ "$leg_status" = "ok" ]; then
+    for _corpus_check in \
+        "train_n:$train_n" "train_m:$train_m" \
+        "heldout_ids:$heldout_ids" "heldout_jsonl:$heldout_jsonl"; do
+      _corpus_check_name="${_corpus_check%%:*}"
+      _corpus_check_path="${_corpus_check#*:}"
+      if [ ! -s "$_corpus_check_path" ]; then
+        leg_status="invalid"
+        leg_reason="corpus provisioning returned success but $_corpus_check_name path is missing/empty: $_corpus_check_path"
+        break
+      fi
+    done
+  fi
+
   local out_n="$leg_dir/run_n.json" out_m="$leg_dir/run_m.json"
   local sqlite_n="$leg_dir/run_n.sqlite" sqlite_m="$leg_dir/run_m.sqlite"
 
@@ -1366,20 +1414,20 @@ p2_run_one() {
   case "$tower" in
     clip-text)
       mkdir -p "$corpus_dir"
-      run_cmd python3 "$DIR/gen_fixed_width_corpus.py" --rows "$P2_ROWS" \
+      run_corpus_cmd python3 "$DIR/gen_fixed_width_corpus.py" --rows "$P2_ROWS" \
         --min-wordpieces "$CLIP_TEXT_SEQ" --seed "$SEED" --out "$corpus_dir/train.jsonl" \
         --heldout-rows "$P2_HELDOUT_ROWS" --heldout-batch "$BATCH" || return 1
       train_jsonl="$corpus_dir/train.jsonl"
       ;;
     clip-vision)
-      run_cmd python3 "$DIR/gen_fixed_shape_image_corpus.py" --rows "$P2_ROWS" \
+      run_corpus_cmd python3 "$DIR/gen_fixed_shape_image_corpus.py" --rows "$P2_ROWS" \
         --size "$IMAGE_SIZE" --seed "$SEED" --out-dir "$corpus_dir" \
         --families "$MEDIA_FAMILIES" --heldout-families "$MEDIA_HELDOUT_FAMILIES" \
         --heldout-rows "$P2_HELDOUT_ROWS" --heldout-batch "$BATCH" || return 1
       train_jsonl="$corpus_dir/triplets.jsonl"
       ;;
     htsat)
-      run_cmd python3 "$DIR/gen_fixed_length_audio_corpus.py" --rows "$P2_ROWS" \
+      run_corpus_cmd python3 "$DIR/gen_fixed_length_audio_corpus.py" --rows "$P2_ROWS" \
         --seconds "$AUDIO_SECONDS" --sample-rate "$AUDIO_SAMPLE_RATE" --seed "$SEED" \
         --out-dir "$corpus_dir" --families "$MEDIA_FAMILIES" \
         --heldout-families "$MEDIA_HELDOUT_FAMILIES" \
@@ -1393,10 +1441,6 @@ p2_run_one() {
   esac
   heldout_ids="$corpus_dir/heldout_ids.txt"
   heldout_jsonl="$corpus_dir/heldout_triplets.jsonl"
-  if [ "$PROFILE_421_LEGS_DRY_RUN" = "1" ]; then
-    mkdir -p "$corpus_dir"
-    : > "$train_jsonl"; : > "$heldout_ids"; : > "$heldout_jsonl"
-  fi
 
   # The full P2 command line, pinned here. Everything the legs pin is
   # repeated verbatim EXCEPT the two knobs P2 exists to vary
@@ -1420,7 +1464,7 @@ p2_run_one() {
   if [ "$PROFILE_421_LEGS_DRY_RUN" = "1" ]; then
     exec_cmd=(
       "$DRY_RUN_STUB_DIR/fake_bench.sh" 2 "$GOLDEN_FIXTURE" "$task" "" \
-        "$P2_LORA_INIT" "$P2_BACKBONE_DTYPE" "$heldout_ids"
+        "$P2_LORA_INIT" "$P2_BACKBONE_DTYPE" "$heldout_ids" "$train_jsonl" "$heldout_jsonl"
     )
   fi
 

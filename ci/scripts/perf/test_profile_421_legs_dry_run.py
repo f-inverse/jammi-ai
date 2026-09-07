@@ -75,12 +75,45 @@ def _real_head() -> str:
     ).stdout.strip()
 
 
-def run_dry(out_dir, legs_only=None, extra_env=None):
+# Small pinned step counts for the ordinary hermetic case: `run_corpus_cmd`
+# now runs the three real corpus producers even under DRY_RUN (esc-088), so
+# every `run_dry()` call that leaves the driver's own N=100/M=600 defaults
+# in place generates a real rows_m = BATCH * 600 = 4800-row corpus per
+# selected leg/tower -- CPU-hermetic and correct, but needlessly slow for
+# tests that only care about the CONTROL FLOW around corpus provisioning,
+# not the pinned production row counts themselves. These two are small but
+# still N < M (so N/M wall-differencing assertions that merely check
+# `front["n"] < front["m"]` still hold) and both a nonzero multiple's worth
+# of rows above the fixed `HELDOUT_ROWS = 8` (`--batch 8`), so no producer's
+# own row-count invariants are violated.
+_SMALL_STEPS_N = "2"
+_SMALL_STEPS_M = "6"
+
+
+def run_dry(out_dir, legs_only=None, extra_env=None, pin_workload_steps=False):
+    """Drive the real `profile_421_legs.sh` under `PROFILE_421_LEGS_DRY_RUN=1`.
+
+    `pin_workload_steps=True` opts OUT of the small step-count override
+    below and leaves `PROFILE_421_STEPS_N`/`_M` unset, so the driver falls
+    back to its OWN pinned production defaults (100/600) -- for the small
+    number of tests that assert on those literal, contract-pinned values
+    themselves (`DryRunSmokeTests.test_every_leg_pins_the_contracts_workload_constants`,
+    `test_the_n_and_m_corpora_differ_only_in_row_count`,
+    `test_the_text_legs_heldout_split_is_disjoint_from_BOTH_train_corpora`).
+    Every other test only exercises CONTROL FLOW that is step-count
+    agnostic, so it runs against the small values instead.
+    """
     env = dict(os.environ)
     env["PROFILE_421_LEGS_DRY_RUN"] = "1"
     env["OUT_DIR"] = out_dir
     env["NSYS_BIN"] = "/nonexistent/nsys-DRY-RUN-PLACEHOLDER"
     env["BENCH_BIN"] = "/nonexistent/jammi-bench-DRY-RUN-PLACEHOLDER"
+    if not pin_workload_steps:
+        env["PROFILE_421_STEPS_N"] = _SMALL_STEPS_N
+        env["PROFILE_421_STEPS_M"] = _SMALL_STEPS_M
+    else:
+        env.pop("PROFILE_421_STEPS_N", None)
+        env.pop("PROFILE_421_STEPS_M", None)
     # A leftover JAMMI_KERNELS_DISABLE in the caller's environment must not
     # silently become part of what the legs measure.
     env.pop("JAMMI_KERNELS_DISABLE", None)
@@ -131,9 +164,15 @@ class DryRunSmokeTests(unittest.TestCase):
         """The pinned flags are pinned on EVERY leg -- batch 8, one epoch's
         worth of N=100/M=600 steps, `--objective triplet` (which is what
         makes `rows = 3B` on all three towers), `--lora-init zeros_b`, and a
-        held-out split that is a nonzero multiple of the batch."""
+        held-out split that is a nonzero multiple of the batch.
+
+        `pin_workload_steps=True`: this is the one test whose OWN point is
+        the literal 100/600 the contract pins, read off the driver's own
+        printout/manifest with no override in play -- every other test in
+        this suite runs against the small step-count override instead
+        (see `run_dry`'s own doc)."""
         with tempfile.TemporaryDirectory() as out_dir:
-            result = run_dry(out_dir)
+            result = run_dry(out_dir, pin_workload_steps=True)
             self.assertEqual(result.returncode, 0, _fail_msg(result))
             for leg_id in ALL_LEG_IDS:
                 manifest = _manifest(out_dir, leg_id)
@@ -192,9 +231,12 @@ class DryRunSmokeTests(unittest.TestCase):
 
     def test_the_n_and_m_corpora_differ_only_in_row_count(self):
         """The whole differencing method rests on this: `rows = batch *
-        steps`, so N asks for 800 rows and M for 4800 at the SAME seed."""
+        steps`, so N asks for 800 rows and M for 4800 at the SAME seed.
+        `pin_workload_steps=True`: this asserts the literal contract-pinned
+        row counts, so it must run against the real N=100/M=600 defaults,
+        not this suite's small override."""
         with tempfile.TemporaryDirectory() as out_dir:
-            result = run_dry(out_dir, legs_only="clip-text-A1")
+            result = run_dry(out_dir, legs_only="clip-text-A1", pin_workload_steps=True)
             self.assertEqual(result.returncode, 0, _fail_msg(result))
             self.assertIn("--rows 800", result.stderr)
             self.assertIn("--rows 4800", result.stderr)
@@ -346,9 +388,14 @@ class DryRunSmokeTests(unittest.TestCase):
         train file. It then asserts the CONVERSE for the `corpus_n` split
         the driver used to pass, so the check is demonstrably not vacuous:
         if this test could pass with either choice, it would prove nothing.
+
+        `pin_workload_steps=True`: the byte-identical-indices argument above
+        is stated in terms of the literal 100/600-step row counts, so this
+        test must run against the real defaults, not this suite's small
+        override.
         """
         with tempfile.TemporaryDirectory() as out_dir:
-            result = run_dry(out_dir, legs_only="clip-text-A1")
+            result = run_dry(out_dir, legs_only="clip-text-A1", pin_workload_steps=True)
             self.assertEqual(result.returncode, 0, _fail_msg(result))
 
             producer_cmds = []
@@ -485,6 +532,15 @@ class DryRunSmokeTests(unittest.TestCase):
                         f"{flag}={value!r} exists but is EMPTY -- the real producer must have "
                         "actually written real content here, not a touch-empty stand-in",
                     )
+            # Non-vacuity: the file-existence/non-empty checks above would
+            # ALSO pass if some OTHER mechanism (not the real producer) had
+            # written those files. Assert the real producer's own one-line
+            # summary actually reached this driver's stderr during THIS
+            # run, proving the producer process itself executed rather than
+            # merely that its declared output path happens to be populated.
+            self.assertIn("gen_fixed_width_corpus: wrote", result.stderr)
+            self.assertIn("gen_fixed_shape_image_corpus: wrote", result.stderr)
+            self.assertIn("gen_fixed_length_audio_corpus: wrote", result.stderr)
 
     def test_each_legs_report_satisfies_the_positive_proof_equation(self):
         """The dry-run reports the capture path actually produces must be
@@ -762,6 +818,45 @@ class DLegExpectedDisablesEqualityTests(unittest.TestCase):
             result = run_dry(out_dir, legs_only="clip-text-D2")
             self.assertEqual(result.returncode, 0, _fail_msg(result))
             manifest = _manifest(out_dir, "clip-text-D2")
+            self.assertEqual(manifest["status"], "ok", manifest)
+
+
+class CorpusPostConditionTests(unittest.TestCase):
+    """`run_leg`'s post-condition on a REPORTED-success `provision_corpus`:
+    a producer that exits 0 but leaves one of the four corpus paths
+    missing/empty must mark the leg INVALID by name, before `run_traced`
+    ever sees it -- rather than letting an empty `--train-jsonl` (etc.)
+    reach a real `finetune-run` and get blamed on the wrong layer.
+
+    `gen_fixed_width_corpus.py` refuses `--rows 0` outright (so it cannot
+    itself produce an EMPTY-but-successful corpus), so this class drives
+    the driver's own test-only `PROFILE_421_LEGS_DRY_RUN_TRUNCATE_CORPUS_VAR`
+    lever -- never set by the real leg sweep -- which truncates one of
+    `provision_corpus`'s own four output variables to empty AFTER it
+    reported success, proving the post-condition check fires on the
+    mechanism rather than being assumed."""
+
+    def test_each_truncated_corpus_var_marks_the_leg_invalid_by_name(self):
+        for var in ("train_n", "train_m", "heldout_ids", "heldout_jsonl"):
+            with self.subTest(var=var):
+                with tempfile.TemporaryDirectory() as out_dir:
+                    result = run_dry(
+                        out_dir, legs_only="clip-text-A1",
+                        extra_env={"PROFILE_421_LEGS_DRY_RUN_TRUNCATE_CORPUS_VAR": var},
+                    )
+                    self.assertEqual(result.returncode, 0, _fail_msg(result))
+                    manifest = _manifest(out_dir, "clip-text-A1")
+                    self.assertEqual(manifest["status"], "invalid", manifest)
+                    self.assertIn(f"{var} path is missing/empty", manifest["reason"])
+
+    def test_the_lever_left_unset_is_the_ordinary_unaffected_case(self):
+        """The non-vacuity control: the SAME leg with the lever genuinely
+        unset (the ordinary case) must pass -- proving the refusal above
+        fires on the truncation, not on this leg shape in general."""
+        with tempfile.TemporaryDirectory() as out_dir:
+            result = run_dry(out_dir, legs_only="clip-text-A1")
+            self.assertEqual(result.returncode, 0, _fail_msg(result))
+            manifest = _manifest(out_dir, "clip-text-A1")
             self.assertEqual(manifest["status"], "ok", manifest)
 
 

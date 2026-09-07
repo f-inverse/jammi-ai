@@ -475,11 +475,19 @@ FINETUNE_RUN_IDENTITY_FIELDS = (
     # `batched_forward`/`steps_measured` (15 entries) — carried over by
     # name, same order as the Rust const's own leading block.
     "seed",
+    # Issue #421 P1-b: `--task`, the TOWER selector (`text_embedding` /
+    # `image_embedding` / `audio_embedding`). Same position as the Rust
+    # const's own listing, immediately after `seed`.
+    "task",
     "batch",
     "seq",
     "lora_rank",
     "lora_alpha",
     "lora_dropout",
+    # Issue #421 P1-b: `--lora-init` (`zeros_b` / `gaussian`). Same
+    # position as the Rust const's own listing, immediately after
+    # `lora_dropout`.
+    "lora_init",
     "margin",
     "target_modules",
     # #356 P1 item 5 addition (see module doc above) -- same position as
@@ -503,8 +511,13 @@ FINETUNE_RUN_IDENTITY_FIELDS = (
     "grad_accum",
     "validation_fraction",
     "train_pairs_file_sha256",
+    # Issue #421 P1-b: the media corpus CONTENT digests, in the Rust
+    # const's own positions (each immediately after the MANIFEST digest it
+    # completes).
+    "train_media_sha256",
     "heldout_ids_sha256",
     "heldout_pairs_sha256",
+    "heldout_media_sha256",
     "heldout_batch_partition_sha256",
     "embedding_loss",
     "temperature",
@@ -531,12 +544,31 @@ FINETUNE_RUN_IDENTITY_FIELDS = (
 #                        #356 P1 item 5 addition (see this module's own
 #                        FINETUNE_RUN_IDENTITY_FIELDS doc above); `None` is
 #                        the meaningful "all layers" value, never "unknown".
+#   * `train_media_sha256`/`heldout_media_sha256` — NullMeans("text task —
+#                        the {train,held-out} corpus content IS the
+#                        manifest, digested by
+#                        {train_pairs_file_sha256,heldout_pairs_sha256}");
+#                        issue #421 P1-b. `None` is the meaningful "this
+#                        leg has no media corpus" value on a text task,
+#                        never "not measured": on a MEDIA task the manifest
+#                        digests name PATHS only, so the content digest is
+#                        the field that makes two media legs comparable at
+#                        all.
 # Every OTHER `FINETUNE_RUN_IDENTITY_FIELDS` member is `Nullable::NonNull`
 # on the Rust const, so a present `null` there still folds to MISSING (the
 # same "cannot verify this premise determinant" state `leg_identity_fields`
 # already applies to `FINETUNE_IDENTITY_FIELDS`).
 FINETUNE_RUN_NULL_IS_A_VALUE_FIELDS = frozenset(
-    {"margin", "temperature", "max_grad_norm", "warmup", "row_lengths", "layers_to_transform"}
+    {
+        "margin",
+        "temperature",
+        "max_grad_norm",
+        "warmup",
+        "row_lengths",
+        "layers_to_transform",
+        "train_media_sha256",
+        "heldout_media_sha256",
+    }
 )
 
 

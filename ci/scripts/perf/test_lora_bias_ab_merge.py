@@ -28,11 +28,21 @@ BERT_MODULES = ["query", "key", "value", "dense"]
 def base_identity(batch, width, dtype):
     d = {
         "seed": 42,
+        # Issue #421 P1-b grew `FINETUNE_RUN_IDENTITY_FIELDS` by four (the
+        # assertion at the end of this function is what named them). This
+        # A/B's legs are all BERT-family TEXT legs at the `zeros_b` default,
+        # so the clean, internally consistent values are `text_embedding` +
+        # `zeros_b` + `null` media digests (a text leg has no media corpus
+        # to digest — `FINETUNE_RUN_NULL_IS_A_VALUE_FIELDS` carries both, so
+        # `None` here is a STATED premise the merger compares, never a
+        # missing one it refuses on).
+        "task": "text_embedding",
         "batch": batch,
         "seq": width,
         "lora_rank": 8,
         "lora_alpha": 16.0,
         "lora_dropout": 0.05,
+        "lora_init": "zeros_b",
         "margin": None,
         "target_modules": BERT_MODULES,
         "layers_to_transform": None,
@@ -51,8 +61,10 @@ def base_identity(batch, width, dtype):
         "grad_accum": 1,
         "validation_fraction": 0.0,
         "train_pairs_file_sha256": "t" * 64,
+        "train_media_sha256": None,
         "heldout_ids_sha256": "h" * 64,
         "heldout_pairs_sha256": "p" * 64,
+        "heldout_media_sha256": None,
         "heldout_batch_partition_sha256": "b" * 64,
         "embedding_loss": "mnrl",
         "temperature": 20.0,

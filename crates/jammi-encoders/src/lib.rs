@@ -46,6 +46,10 @@ mod error;
 // The wave-3 GGUF-quantized-weight construction seam (`FrozenWeightLookup`)
 // shared by `bert`/`distilbert`/`modernbert` — see its own module doc.
 mod frozen_weight_source;
+// The per-forward fusible-seam census (`FusibleSiteCensus`, re-exported
+// below) every tower answers structurally — see its own module doc for why
+// a fused-kernel profile's `calls` term needs a witness at all.
+mod fusible_census;
 mod layer_norm;
 mod lora_site;
 mod mask;
@@ -74,6 +78,7 @@ pub use context::{
 pub use distilbert::{DistilBert, DistilBertConfig};
 pub use error::EncoderError;
 pub use frozen_weight_source::FrozenWeightLookup;
+pub use fusible_census::FusibleSiteCensus;
 pub use htsat_audio::{HtsatAudio, HtsatAudioBuilder, HtsatAudioConfig};
 pub use modernbert::{ModernBert, ModernBertConfig};
 pub use open_clip_vision::{

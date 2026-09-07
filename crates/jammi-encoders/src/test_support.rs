@@ -7,6 +7,9 @@
 use candle_core::backprop::GradStore;
 use candle_core::{Device, Tensor, Var};
 use candle_nn::VarMap;
+use jammi_lora::{LoraBuildConfig, LoraInitMode};
+
+use crate::{AnyEncoder, FusibleSiteCensus};
 
 /// Deterministic (non-RNG) fill: every variable gets values from a fixed LCG
 /// walk over a stably-ordered (sorted-by-key) variable list, so two
@@ -173,5 +176,186 @@ pub(crate) fn assert_every_var_grad_is_none(
             grads.get(var.as_tensor()).is_none(),
             "{key}: grad must be None under training=false, not merely small or zero"
         );
+    }
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// `FusibleSiteCensus` exact-count oracle (#421 P1-a3)
+// ─────────────────────────────────────────────────────────────────────────────
+
+/// The `fused + eager` TOTAL of each fusible seam's process-wide dispatch
+/// counters, read as one tuple so a before/after pair can be differenced in
+/// one place.
+///
+/// The two arms are SUMMED on purpose. Which arm a call lands on is a
+/// property of the batch and the machine (dtype, contiguity, device — the
+/// admission predicate), and it legitimately differs between a CPU test and
+/// a CUDA run. How many calls there ARE is a property of the built tower,
+/// and that is what [`FusibleSiteCensus`] claims. Asserting on `fused` alone
+/// would make the oracle a check of the admission predicate wearing a census
+/// oracle's name, and it would go red the first time a predicate tightened
+/// even though the census stayed exactly right.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct SeamDispatchTotals {
+    /// `lora_linear_fused` — `jammi_lora::LoraLinear::forward`'s training arm.
+    lora_linear: u64,
+    /// `layer_norm_fused` — `crate::layer_norm::LayerNorm`'s training arm,
+    /// ONE key for both the bias-free and the bias-carrying variant.
+    layer_norm: u64,
+    /// `gelu_erf_fused` — `crate::activations::gelu_erf`'s training arm.
+    gelu_erf: u64,
+}
+
+/// Snapshot all three seams at once. Every counter here is a PROCESS-WIDE
+/// static, so a caller must hold this crate's counter test locks — in the
+/// order `crate::attention_cascade::ATTENTION_BLOCK_COUNTER_TEST_LOCK` then
+/// `crate::layer_norm::DISPATCH_COUNTER_TEST_LOCK`, see `crate::htsat_audio`'s
+/// own multi-lock test doc for why that order is not free — across the
+/// before/after pair it differences.
+pub(crate) fn seam_dispatch_totals() -> SeamDispatchTotals {
+    let lora = jammi_lora::lora_linear_fused_dispatch_snapshot();
+    let ln = crate::layer_norm::LN_DISPATCH_COUNTERS.snapshot();
+    let gelu = crate::activations::GELU_DISPATCH_COUNTERS.snapshot();
+    SeamDispatchTotals {
+        lora_linear: lora.fused + lora.eager,
+        layer_norm: ln.fused + ln.eager,
+        gelu_erf: gelu.fused + gelu.eager,
+    }
+}
+
+/// A counter delta that refuses to go backwards. A wrapping subtraction here
+/// would turn "another test polluted the window" into a colossal `u64` and a
+/// baffling inequality; this names the real failure instead.
+fn seam_delta(after: u64, before: u64, key: &str) -> u64 {
+    after.checked_sub(before).unwrap_or_else(|| {
+        panic!(
+            "{key}: counter went BACKWARDS across the window ({before} -> {after}) — the \
+             dispatch-counter test locks cannot have been held for the whole measurement"
+        )
+    })
+}
+
+/// The EXACT-count oracle behind [`FusibleSiteCensus`]: drive ONE forward of
+/// `encoder` on its own `probe_input` batch, in each mode, and assert that
+/// each of the three seams moved by exactly what the census predicts.
+///
+/// Two legs, both load-bearing:
+///
+/// * **eval** — `set_training(false)`, one forward: NO counter may move at
+///   all, on any key. Each seam short-circuits before taking an admission
+///   decision in eval, so an eval forward is absent from the counters
+///   entirely rather than being "all eager". Without this leg the training
+///   leg could be satisfied by a seam that admitted unconditionally, and the
+///   profile's `batches` (a count of TRAINING forwards) would be the wrong
+///   denominator without anything failing.
+/// * **training** — `set_training(true)`, one forward: per key,
+///   `(fused + eager)` delta `==` the census field, EXACTLY. Not `>`, not "at
+///   least once": an exact count is the only form that witnesses the `calls`
+///   term of `fused + eager == calls * batches`.
+///
+/// Returns the census it checked, so the caller can go on to assert the
+/// tower-specific facts only it knows (a frozen tower's `0` wrapped sites, a
+/// fixture's known geometry).
+///
+/// The caller must hold both dispatch-counter test locks — see
+/// [`seam_dispatch_totals`].
+pub(crate) fn assert_fusible_site_census_is_exact(
+    encoder: &mut AnyEncoder,
+    device: &Device,
+    label: &str,
+) -> FusibleSiteCensus {
+    let census = encoder.fusible_site_census();
+    let probe = encoder
+        .probe_input(device)
+        .unwrap_or_else(|e| panic!("{label}: probe_input must build a valid batch: {e}"));
+
+    // Non-vacuity: every supported tower normalises somewhere on its forward
+    // path, so a census claiming zero LayerNorms is a broken walk, not a
+    // legitimate architecture.
+    assert!(
+        census.layer_norms > 0,
+        "{label}: every tower holds at least one house LayerNorm; census={census:?}"
+    );
+
+    encoder.set_training(false);
+    let before_eval = seam_dispatch_totals();
+    encoder
+        .forward_input(&probe.as_input())
+        .unwrap_or_else(|e| panic!("{label}: eval forward must succeed: {e}"));
+    let after_eval = seam_dispatch_totals();
+    assert_eq!(
+        after_eval, before_eval,
+        "{label}: an EVAL forward must take NO admission decision on any fusible seam — it \
+         contributes 0 to BOTH the fused and the eager side of every pair"
+    );
+
+    encoder.set_training(true);
+    let before = seam_dispatch_totals();
+    encoder
+        .forward_input(&probe.as_input())
+        .unwrap_or_else(|e| panic!("{label}: training forward must succeed: {e}"));
+    let after = seam_dispatch_totals();
+
+    assert_eq!(
+        seam_delta(after.lora_linear, before.lora_linear, "lora_linear_fused"),
+        census.lora_sites_wrapped as u64,
+        "{label}: one training forward must take exactly one lora_linear_fused decision per \
+         WRAPPED site; census={census:?}"
+    );
+    assert_eq!(
+        seam_delta(after.layer_norm, before.layer_norm, "layer_norm_fused"),
+        census.layer_norms as u64,
+        "{label}: one training forward must take exactly one layer_norm_fused decision per \
+         house LayerNorm the built tower holds; census={census:?}"
+    );
+    assert_eq!(
+        seam_delta(after.gelu_erf, before.gelu_erf, "gelu_erf_fused"),
+        census.gelu_seam_calls_per_forward as u64,
+        "{label}: one training forward must take exactly {} gelu_erf_fused decisions; \
+         census={census:?}",
+        census.gelu_seam_calls_per_forward
+    );
+
+    census
+}
+
+/// The one `all-linear`, `Gaussian`, fixed-seed LoRA build config every
+/// census oracle that needs a WRAPPED site set uses, owning the three
+/// borrowed fields a [`LoraBuildConfig`] holds.
+///
+/// `all-linear` because the census's LoRA field must be measured at its
+/// maximum, where a missed site class is visible at all; `Gaussian` rather
+/// than the default `ZerosB` for the reason `tests/tower_lora.rs`'s own
+/// module doc gives (a `ZerosB` adapter is numerically inert at step 1, so an
+/// oracle built on it cannot tell an unreached site from an
+/// initialised-to-zero one). No dropout: a dropout stream would add
+/// per-forward state this oracle has no use for.
+pub(crate) struct AllLinearGaussianLora {
+    targets: Vec<String>,
+    layers: Option<Vec<usize>>,
+    rank_pattern: std::collections::HashMap<String, usize>,
+}
+
+impl AllLinearGaussianLora {
+    pub(crate) fn new() -> Self {
+        Self {
+            targets: vec!["all-linear".to_string()],
+            layers: None,
+            rank_pattern: std::collections::HashMap::new(),
+        }
+    }
+
+    pub(crate) fn config(&self) -> LoraBuildConfig<'_> {
+        LoraBuildConfig {
+            target_modules: &self.targets,
+            layers_to_transform: &self.layers,
+            lora_rank: 4,
+            lora_alpha: 8.0,
+            use_rslora: false,
+            lora_dropout: None,
+            rank_pattern: &self.rank_pattern,
+            init_mode: LoraInitMode::Gaussian,
+            seed: 0x5eed_1234,
+        }
     }
 }

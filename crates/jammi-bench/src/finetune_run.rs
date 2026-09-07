@@ -169,6 +169,34 @@ fn sendify<E: std::fmt::Display>(e: E) -> Box<dyn std::error::Error + Send + Syn
 /// CONTRACT Frame's `ALLOFF=attention_block_flash,adamw_step_fused` verbatim.
 pub const ALLOFF_KEYS: [&str; 2] = ["attention_block_flash", "adamw_step_fused"];
 
+/// `--lora-init`'s CLI spelling → [`LoraInitMode`] (issue #421 P1-b(ii)).
+///
+/// The two tokens are `jammi_lora::LoraInitMode`'s own variants in
+/// snake_case, matching the spelling `grad_oracle.rs`'s tier already
+/// serializes (`format!("{:?}").to_lowercase()` would produce `zerosb`, a
+/// token no caller can type back in — this table is explicit for exactly
+/// that reason, and [`lora_init_as_str`] below is its inverse, so the
+/// emitted report field round-trips to the flag value that produced it).
+pub fn parse_lora_init(s: &str) -> Result<LoraInitMode, String> {
+    match s {
+        "zeros_b" => Ok(LoraInitMode::ZerosB),
+        "gaussian" => Ok(LoraInitMode::Gaussian),
+        other => Err(format!(
+            "--lora-init '{other}' is invalid: expected 'zeros_b' or 'gaussian'"
+        )),
+    }
+}
+
+/// [`parse_lora_init`]'s inverse — the token this tier records in
+/// [`crate::report::FinetuneRunTier::lora_init`], byte-identical to what a
+/// caller passes on the command line.
+pub fn lora_init_as_str(mode: LoraInitMode) -> &'static str {
+    match mode {
+        LoraInitMode::ZerosB => "zeros_b",
+        LoraInitMode::Gaussian => "gaussian",
+    }
+}
+
 /// Which embedding objective this run trains — CONTRACT H4's 2026-08-28
 /// amendment ("objective selection under the triplet-shaped fixture"): H4a
 /// found the committed H3 fixture TRIPLET-shaped
@@ -275,6 +303,33 @@ pub struct MediaTriplet {
     pub positive_sha256: String,
     /// sha256 (hex) of `negative`, measured off those bytes.
     pub negative_sha256: String,
+}
+
+/// The CONTENT digest of a media corpus — sha256 over each row's three
+/// member digests (`anchor_sha256`, `positive_sha256`, `negative_sha256`,
+/// each itself measured off the file bytes the loader read), lowercase hex,
+/// concatenated in the SLICE'S OWN ORDER with no separator.
+///
+/// No separator is needed and none is used: every contribution is exactly
+/// 64 hex characters, so the concatenation is uniquely decodable and no two
+/// distinct corpora can fold to the same pre-image (the ambiguity a
+/// variable-length concatenation would carry). The ORDER is part of the
+/// digest by design — for the train split that is manifest order, for the
+/// held-out fixture it is the committed scoring order the caller supplied,
+/// which is exactly the order each corpus is consumed in.
+///
+/// Feeds [`crate::report::FinetuneRunTier::train_media_sha256`]/
+/// `heldout_media_sha256`; see those fields' docs for why a media leg needs
+/// a content digest that the manifest digests cannot provide.
+pub fn media_corpus_sha256(rows: &[MediaTriplet]) -> String {
+    use sha2::{Digest, Sha256};
+    let mut hasher = Sha256::new();
+    for row in rows {
+        hasher.update(row.anchor_sha256.as_bytes());
+        hasher.update(row.positive_sha256.as_bytes());
+        hasher.update(row.negative_sha256.as_bytes());
+    }
+    hex::encode(hasher.finalize())
 }
 
 /// A borrowed view of ONE modality's rows — the single shape every loader
@@ -488,6 +543,76 @@ pub struct FinetuneRunParams {
     pub lora_rank: usize,
     pub lora_alpha: f64,
     pub lora_dropout: f64,
+    /// `--lora-init`: which LoRA initialization mode this run's adapters are
+    /// built under (issue #421 P1-b(ii)). Default
+    /// [`LoraInitMode::ZerosB`] — the value BOTH construction sites
+    /// hardcoded before this field existed
+    /// ([`build_encoder_adapters`]'s `LoraBuildConfig` and
+    /// [`base_config`]'s `FineTuneConfig::init_lora_weights`), so an
+    /// invocation written before this flag is byte-identical under the
+    /// default. Threaded into BOTH sites, never one: a run whose encoder
+    /// adapters were built `Gaussian` while the trainer's own config still
+    /// said `ZerosB` would carry a `FineTuneConfig` that DISAGREES with the
+    /// weights it is training (the config is what a resume/adapter-save
+    /// path re-reads), so splitting them would be a silent
+    /// provenance-vs-reality fork, not a smaller change.
+    ///
+    /// Why the flag exists: the #421 BF16 pre-flight (contract P2) needs a
+    /// non-identity adapter at step 0 — under `ZerosB` every LoRA `A` has
+    /// `dL/dA = 0` at the first step (`B = 0` kills the gradient path), so
+    /// a "every LoRA Var has a non-zero gradient" bf16 check is VACUOUS in
+    /// that mode and would pass on a dtype path that never worked.
+    /// IDENTITY on the emitted tier (see
+    /// [`crate::report::FinetuneRunTier::lora_init`]).
+    pub lora_init: LoraInitMode,
+    /// `--expect-kernels-disabled`: the op key set this invocation CLAIMS
+    /// `JAMMI_KERNELS_DISABLE` carries (issue #421 P1-b(i)), sorted and
+    /// deduplicated by
+    /// [`jammi_kernels::admission::parse_disable_list`] — the SAME parser
+    /// the env var itself is read through, never a second one (that
+    /// module's own doc records a round-3 audit where a divergent
+    /// duplicate-preserving parser hard-failed a VALID leg). `None` is the
+    /// ordinary, unchecked case and the ONLY state an invocation written
+    /// before this flag existed can be in. The `fused` arm in particular
+    /// makes no claim about `JAMMI_KERNELS_DISABLE` at all when this is
+    /// `None` — an operator may legitimately run it with OTHER, unrelated
+    /// op keys disabled; the two-sided witness that a DECISION leg's
+    /// `--arm fused` run really was unlabeled (no ambient contamination)
+    /// lives in the driver (`profile_421_legs.sh`'s
+    /// `_check_no_ambient_disables`) and the merger
+    /// (`profile_421_merge.py`'s A-leg refusal), not in this binary.
+    ///
+    /// When `Some`, [`run`] enforces THREE separate things a
+    /// `JAMMI_KERNELS_DISABLE` leg can each fail independently — the leg is
+    /// INVALID, never a datum, if any of them does:
+    ///
+    /// 1. At START (before any device/checkpoint/tensor work): this field
+    ///    must equal
+    ///    [`jammi_kernels::admission::disabled_ops_requested`] EXACTLY —
+    ///    the SAME set EQUALITY
+    ///    [`crate::finetune_step::FinetuneStepParams::expect_kernels_disabled`]
+    ///    uses. (Finding F1's fix: an earlier revision of this check was a
+    ///    SUBSET check, on the premise that `--arm alloff` could carry a
+    ///    "combined leg" naming a chain key on top of [`ALLOFF_KEYS`] — but
+    ///    the `--arm alloff` arm-level check below refuses anything but
+    ///    EXACT equality to `ALLOFF_KEYS`, so that combined leg can never
+    ///    exist, and the weaker subset check bought nothing while hiding
+    ///    an ambient extra key.) The failure mode the check exists for — a
+    ///    dropped, mistyped, unforwarded, or ambient-contaminated env var —
+    ///    is caught either way: a dropped var makes the requested set
+    ///    empty, a mistyped key is absent from it, and an ambient extra key
+    ///    makes the sets unequal.
+    /// 2. At END: [`jammi_kernels::admission::unmatched_disables`] must be
+    ///    empty — a requested key that never disabled a live `admit` call
+    ///    is a typo in the disable list, not evidence the forced-eager arm
+    ///    ran (that module's own "safety property").
+    /// 3. At END: every named key's `fused` dispatch counter
+    ///    ([`jammi_kernels::admission::snapshot_all`]) must read `0`. (1)
+    ///    and (2) together still admit a leg where the key fired eager on
+    ///    one call site while a DIFFERENT site dispatched the same key
+    ///    fused — the eager-twin premise this whole flag exists to prove
+    ///    would be false, with nothing else to catch it.
+    pub expect_kernels_disabled: Option<Vec<String>>,
     pub target_modules: Vec<String>,
     /// Optional restriction of LoRA injection to specific layer indices
     /// (`--layers-to-transform`; `jammi_lora::should_apply_lora`'s own doc:
@@ -972,6 +1097,10 @@ fn build_encoder_adapters(
     lora_rank: usize,
     lora_alpha: f64,
     lora_dropout: f64,
+    // Which LoRA initialization the built adapters use — threaded from
+    // `FinetuneRunParams::lora_init` (issue #421 P1-b(ii)), previously the
+    // hardcoded `LoraInitMode::ZerosB` literal in `lora_build_1` below.
+    lora_init: LoraInitMode,
     backbone_dtype: jammi_numerics::ComputePrecision,
     seed: u64,
     device: &Device,
@@ -992,7 +1121,7 @@ fn build_encoder_adapters(
         use_rslora: false,
         lora_dropout: lora_dropout_opt,
         rank_pattern: &empty_ranks,
-        init_mode: LoraInitMode::ZerosB,
+        init_mode: lora_init,
         seed,
     };
     let (mut encoder, tower) = match (family, task) {
@@ -1160,6 +1289,13 @@ fn build_encoder_adapters(
     // was already MOVED into `.lora(...)`, and `AdapterConfig::from_build`
     // needs its own borrow; the type is a plain, cheap struct of scalars and
     // borrowed slices, so building it twice is free.
+    //
+    // "Identical values" is load-bearing, not incidental: this one is what
+    // the SAVED `adapter_config.json` records (`AdapterConfig::from_build`),
+    // so a `lora_init` threaded into `lora_build_1` alone would ship an
+    // adapter whose declared init mode contradicts the weights actually
+    // built — hence BOTH sites read the same `lora_init` parameter (issue
+    // #421 P1-b(ii)), never one literal and one variable.
     let lora_build_2 = jammi_lora::LoraBuildConfig {
         target_modules,
         layers_to_transform,
@@ -1168,7 +1304,7 @@ fn build_encoder_adapters(
         use_rslora: false,
         lora_dropout: lora_dropout_opt,
         rank_pattern: &empty_ranks,
-        init_mode: LoraInitMode::ZerosB,
+        init_mode: lora_init,
         seed,
     };
     // `model_type` is the base ARCHITECTURE id (`EncoderFamily::
@@ -1242,7 +1378,14 @@ fn base_config(params: &FinetuneRunParams, epochs: usize) -> FineTuneConfig {
         layers_to_transform: params.layers_to_transform.clone(),
         use_rslora: false,
         rank_pattern: HashMap::new(),
-        init_lora_weights: LoraInitMode::ZerosB,
+        // The THIRD site `--lora-init` reaches (issue #421 P1-b(ii)): the
+        // `FineTuneConfig` the trainer itself carries. `build_encoder_adapters`
+        // above is what actually initializes this tier's weights, so this
+        // one is the config-vs-reality consistency half — a `FineTuneConfig`
+        // still claiming `ZerosB` while the encoder was built `Gaussian`
+        // would be a silent fork between what ran and what a resume /
+        // adapter-save path re-reads.
+        init_lora_weights: params.lora_init,
         backbone_dtype: params.backbone_dtype,
         weight_decay: params.weight_decay,
         max_grad_norm: params.max_grad_norm,
@@ -1546,6 +1689,39 @@ fn run_impl(
             .into());
         }
     }
+    // `--expect-kernels-disabled`, check (1) of 3 (issue #421 P1-b(i); the
+    // other two are at the END of this function, where the dispatch sites
+    // have had their chance to fire): this field must equal this process's
+    // real `JAMMI_KERNELS_DISABLE` EXACTLY. Checked HERE, at the very top,
+    // before the checkpoint is loaded or a single tensor is built —
+    // `disabled_ops_requested()` is a pure function of the env var,
+    // resolved once at first read and never dependent on anything below,
+    // so a mismatch can fail fast rather than after paying for a whole
+    // training run that was never going to produce a valid leg (the same
+    // posture, and the same reasoning, `finetune_step::run`'s own copy of
+    // this check states).
+    //
+    // Set EQUALITY, not a subset — see `FinetuneRunParams::expect_kernels_disabled`'s
+    // doc, finding F1, for why an earlier, weaker subset check here was
+    // wrong (the "legitimate combined leg on top of `--arm alloff`" premise
+    // it rested on cannot occur — the arm-level check above already forces
+    // `--arm alloff` to an exact set). Both `expected` and `requested` are
+    // sorted, deduplicated `Vec<String>`s built by the same
+    // `jammi_kernels::admission::parse_disable_list` (see the CLI fold in
+    // `main.rs` and `disabled_ops_requested`'s own doc), so `!=` is a
+    // genuine set comparison, not a string/order artifact.
+    if let Some(expected) = &params.expect_kernels_disabled {
+        let requested = jammi_kernels::admission::disabled_ops_requested();
+        if requested != *expected {
+            return Err(format!(
+                "finetune-run: --expect-kernels-disabled {expected:?} does not exactly equal \
+                 this process's real JAMMI_KERNELS_DISABLE (which resolved to {requested:?}) — \
+                 the env var was dropped, mistyped, not forwarded to this process, or carries \
+                 key(s) beyond what this leg declared (INVALID run, not a datum)"
+            )
+            .into());
+        }
+    }
     params.validate_rows_match_task()?;
     let train_rows = params.train_rows();
     let heldout_rows = params.heldout_rows();
@@ -1734,6 +1910,21 @@ fn run_impl(
     // resume-checkpoint fetch/restore, and every `evaluate_held_out` call,
     // all of which are separate statements outside this timer's span below).
     let mut train_run_wall_s = 0.0f64;
+    // The DIRECT media decode/preprocess wall (contract P1-b(v)), summed the
+    // same way across every resume-cycled epoch leg — see the accumulation
+    // site below and `crate::report::FinetuneRunTier::media_front_end_wall_s`'s
+    // own doc for the measured boundary.
+    let mut media_front_end_wall_s = 0.0f64;
+    // The WITNESSED per-forward fusible-seam census (contract §D4 item 1),
+    // taken off the encoder each epoch's `build_encoder_adapters` actually
+    // returned — see `crate::report::FinetuneRunTier::fusible_site_census`
+    // for what a downstream reader does with it. Captured every epoch, not
+    // only the first, and a DISAGREEMENT between epochs refuses the run:
+    // this tier's counters are a single before/after delta over the WHOLE
+    // resume-cycle, so a `calls` term that changed partway through would
+    // make `fused + eager == calls * batches` unanswerable rather than
+    // merely wrong.
+    let mut fusible_site_census: Option<jammi_encoders::FusibleSiteCensus> = None;
     let mut last_final_loss = 0.0f64;
     let mut last_held_out = None;
     // Test-only (see `run_impl`'s own doc): the final epoch's `VarMap`
@@ -1770,6 +1961,15 @@ fn run_impl(
         jammi_kernels::admission::counters_for("adamw_step_fused").snapshot();
     let attention_block_flash_dispatch_before =
         jammi_encoders::attention_block_flash_dispatch_snapshot();
+    // The WHOLE registry, by op name — the same before/after window every
+    // named counter above is read over, but keyed at RUNTIME so
+    // `--expect-kernels-disabled`'s arbitrary caller-supplied keys can be
+    // checked through it (issue #421 P1-b(i), check (3)). A DELTA, never an
+    // absolute read: the counters are process-wide and additive, so an
+    // absolute `fused > 0` would also indict dispatches from anything that
+    // ran before this window (this tier's own pre-loop init probe among
+    // them) rather than from the measured epoch loop.
+    let all_dispatch_before = jammi_kernels::admission::snapshot_all();
 
     for epoch_idx in 0..params.epochs {
         let varmap = VarMap::new();
@@ -1790,11 +1990,32 @@ fn run_impl(
             params.lora_rank,
             params.lora_alpha,
             params.lora_dropout,
+            params.lora_init,
             params.backbone_dtype,
             params.seed,
             &device,
             &varmap,
         )?;
+        // RIGHT AFTER the build, before the encoder is moved into the
+        // training target below: a pure structural walk
+        // (`AnyEncoder::fusible_site_census` dispatches nothing, so reading
+        // it inside this run's own counter window cannot perturb the very
+        // counters it exists to explain).
+        let epoch_census = encoder.fusible_site_census();
+        match &fusible_site_census {
+            None => fusible_site_census = Some(epoch_census),
+            Some(first) if *first != epoch_census => {
+                return Err(format!(
+                    "finetune-run: internal: epoch {epoch_idx}'s built encoder witnesses a \
+                     different fusible-seam census ({epoch_census:?}) than epoch 0's \
+                     ({first:?}) — this tier's dispatch counters are one delta over the whole \
+                     resume-cycle, so a `calls` term that moved partway through makes the \
+                     positive-proof equation unanswerable"
+                )
+                .into());
+            }
+            Some(_) => {}
+        }
         let target = TrainingTarget::EncoderAdapters(Box::new(EncoderAdaptersTarget {
             encoder,
             adapter_cfg,
@@ -1853,6 +2074,18 @@ fn run_impl(
         let train_run_t0 = Instant::now();
         let result = training_loop.run(&train_loader)?;
         train_run_wall_s += train_run_t0.elapsed().as_secs_f64();
+        // The DIRECT media front-end wall (contract P1-b(v)), summed across
+        // resume legs exactly as `train_run_wall_s` above is —
+        // `TrainingResult::media_front_end_wall`'s own doc requires it:
+        // `TrainingLoop::run` RESETS its accumulator at the start of every
+        // call, so a caller driving `params.epochs` legs must add them up
+        // itself rather than reading the last leg's value as the run's.
+        //
+        // The measurement lives inside `run()`, so it is a strict subset of
+        // the span `train_run_wall_s` times — never a `wall - busy`
+        // difference, which would absorb launch latency, sync stalls and the
+        // optimizer's own CPU time into a number labelled "front end".
+        media_front_end_wall_s += result.media_front_end_wall.as_secs_f64();
         cumulative_steps += result.total_steps;
         last_final_loss = result.final_loss;
 
@@ -1892,6 +2125,7 @@ fn run_impl(
         jammi_kernels::admission::counters_for("adamw_step_fused").snapshot();
     let attention_block_flash_dispatch_after =
         jammi_encoders::attention_block_flash_dispatch_snapshot();
+    let all_dispatch_after = jammi_kernels::admission::snapshot_all();
 
     let ln_fused_dispatches = ln_dispatch_after
         .fused
@@ -1990,6 +2224,79 @@ fn run_impl(
     let kernels_disabled_fired = jammi_kernels::admission::disabled_ops_fired();
     let resolved_attention_arm = attention_arm(&kernels_disabled_requested).to_string();
 
+    // `--expect-kernels-disabled`, checks (2) and (3) of 3 (issue #421
+    // P1-b(i)) — both END-of-run by necessity: `jammi_kernels::admission`'s
+    // fired-disable registry and its dispatch counters are populated by
+    // OBSERVATION, so neither can be validated before every call site that
+    // was going to fire this run has had its chance to.
+    //
+    // Scoped to `Some` deliberately: a run that makes no claim keeps EXACTLY
+    // the behaviour it had before this flag existed (this tier never read
+    // `unmatched_disables()` at all), so no existing invocation changes.
+    let kernels_disabled_expected = match &params.expect_kernels_disabled {
+        None => Vec::new(),
+        Some(expected) => {
+            // (2) The disable list's own safety property: a requested key
+            // that never disabled a live `admit` call is a TYPO, not
+            // evidence the forced-eager arm ran (`unmatched_disables`'s own
+            // doc). Read over the WHOLE requested set, not just the named
+            // subset: an unmatched entry means this process's disable list
+            // does not describe what actually happened, whichever entry it
+            // is.
+            let unmatched = jammi_kernels::admission::unmatched_disables();
+            if !unmatched.is_empty() {
+                return Err(format!(
+                    "finetune-run: JAMMI_KERNELS_DISABLE named op key(s) that never disabled a \
+                     live dispatch this run (INVALID run, not a datum): {unmatched:?} — \
+                     --expect-kernels-disabled was {expected:?}"
+                )
+                .into());
+            }
+            // (3) The premise the flag actually exists to prove: a key can
+            // be requested, and can have fired eager somewhere, while ANOTHER
+            // call site dispatched the SAME key FUSED — (1) and (2) both pass
+            // in that world and the "eager twin" leg would be a fused leg
+            // wearing an eager label. Read as a DELTA over the SAME
+            // before/after window every named counter on this tier is read
+            // over (`all_dispatch_before`/`all_dispatch_after`), so a
+            // dispatch from outside the measured epoch loop cannot indict a
+            // leg and one from inside it cannot hide behind a pre-existing
+            // count. `snapshot_all()` is keyed by the op name each call site
+            // passes to `admit`; a key absent from BOTH snapshots never
+            // registered a dispatch at all (delta 0) — which check (2) has
+            // already independently ruled out for a REQUESTED key.
+            let fused_delta = |key: &str| -> (u64, u64) {
+                let after = all_dispatch_after.get(key);
+                let before = all_dispatch_before.get(key);
+                let f = after
+                    .map_or(0, |s| s.fused)
+                    .saturating_sub(before.map_or(0, |s| s.fused));
+                let e = after
+                    .map_or(0, |s| s.eager)
+                    .saturating_sub(before.map_or(0, |s| s.eager));
+                (f, e)
+            };
+            let mut fused_leaks: Vec<String> = Vec::new();
+            for key in expected {
+                let (fused, eager) = fused_delta(key.as_str());
+                if fused != 0 {
+                    fused_leaks.push(format!("{key}: fused={fused} eager={eager}"));
+                }
+            }
+            if !fused_leaks.is_empty() {
+                return Err(format!(
+                    "finetune-run: --expect-kernels-disabled named op key(s) that STILL \
+                     dispatched fused this run (INVALID run, not a datum — the forced-eager arm \
+                     was not actually eager): {fused_leaks:?}"
+                )
+                .into());
+            }
+            let mut recorded = expected.clone();
+            recorded.sort();
+            recorded
+        }
+    };
+
     // A DECLARED premise, not a measurement: this tier's real-text path
     // never calls `forward_with_lengths` at all (`encode_chunk`'s plain
     // `encoder.forward` never routes through the dense-vs-padded fork
@@ -2007,13 +2314,29 @@ fn run_impl(
 
     let max_grad_norm = (params.max_grad_norm > 0.0).then_some(params.max_grad_norm);
 
+    // The media corpora's own CONTENT digests (issue #421 P1-b) — computed
+    // off the rows THIS run actually consumed, in the order it consumed
+    // them, never re-read from disk (the bytes are already here, and a
+    // second read could see a different file). `None` on a text task, where
+    // `train_pairs_file_sha256`/`heldout_pairs_sha256` already digest the
+    // content: for text the manifest IS the corpus.
+    let (train_media_sha256, heldout_media_sha256) = match params.task {
+        Task::Text => (None, None),
+        Task::Image | Task::Audio => (
+            Some(media_corpus_sha256(&params.train_media)),
+            Some(media_corpus_sha256(&params.heldout_media)),
+        ),
+    };
+
     let tier = FinetuneRunTier {
         seed: params.seed,
+        task: params.task.as_str().to_string(),
         batch: params.batch_size,
         seq: params.max_seq_length,
         lora_rank: params.lora_rank,
         lora_alpha: params.lora_alpha,
         lora_dropout: params.lora_dropout,
+        lora_init: lora_init_as_str(params.lora_init).to_string(),
         margin: match params.objective {
             Objective::Triplet => Some(params.margin),
             Objective::Mnrl => None,
@@ -2035,8 +2358,10 @@ fn run_impl(
         grad_accum: params.gradient_accumulation_steps,
         validation_fraction: params.validation_fraction,
         train_pairs_file_sha256: params.train_pairs_file_sha256.clone(),
+        train_media_sha256,
         heldout_ids_sha256: params.heldout_ids_sha256.clone(),
         heldout_pairs_sha256: params.heldout_pairs_sha256.clone(),
+        heldout_media_sha256,
         heldout_batch_partition_sha256: held_out.batch_partition_sha256.clone(),
         embedding_loss: params.objective.as_str().to_string(),
         temperature: match params.objective {
@@ -2055,6 +2380,16 @@ fn run_impl(
         device_name: crate::finetune_step::device_name(params.cuda_device),
         kernels_disabled_requested,
         kernels_disabled_fired,
+        kernels_disabled_expected,
+        // `epochs >= 1` is enforced upstream, so the loop above always ran
+        // at least once and this is always `Some` — but the error path is
+        // spelled out rather than unwrapped, because a fabricated all-zero
+        // census would read to a downstream merger as "this build wraps no
+        // LoRA sites and holds no LayerNorms", which is a FALSE claim about
+        // the model rather than a missing one.
+        fusible_site_census: fusible_site_census.ok_or(
+            "finetune-run: internal: no epoch ran, so no fusible-seam census was witnessed",
+        )?,
         flash_compiled: jammi_kernels::admission::FLASH_COMPILED,
         build_features: crate::report::build_features(),
         attention_arm: resolved_attention_arm,
@@ -2093,6 +2428,17 @@ fn run_impl(
         trajectory: trajectory.points,
         train_probe_series,
         train_run_wall_s,
+        // MEASURED on a media task, `None` on a text one — never `Some(0.0)`
+        // there: the trainer reports `Duration::ZERO` for a text run by
+        // construction (tokenization is not a media front end and stays in
+        // the residual), and reporting that as a measured zero would claim a
+        // path was timed that never ran. The null/zero distinction is what a
+        // downstream reader needs to tell "this tower has no media front
+        // end" from "this tower's media front end cost nothing".
+        media_front_end_wall_s: match params.task {
+            Task::Text => None,
+            Task::Image | Task::Audio => Some(media_front_end_wall_s),
+        },
         mutant_id,
         mutant_base_sha,
         mutant_patch_sha256,
@@ -2109,6 +2455,103 @@ fn run_impl(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // ── `media_corpus_sha256` (issue #421 P1-b) ─────────────────────────
+    //
+    // The reference values below are computed by an INDEPENDENT
+    // implementation (CPython's `hashlib`, not this crate's `sha2`), so
+    // these assertions check that this function's MECHANISM produces the
+    // digest a third party computing the documented construction would —
+    // not merely that it is self-consistent. Re-derive any of them with:
+    //
+    //   python3 -c "import hashlib; abc=hashlib.sha256(b'abc').hexdigest(); \
+    //               print(hashlib.sha256((abc*3).encode()).hexdigest())"
+    //
+    // `SHA256_OF_ABC`/`SHA256_OF_DEF` are the published single-message
+    // vectors those one-liners start from.
+
+    /// sha256("abc") — the published NIST test vector.
+    const SHA256_OF_ABC: &str = "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad";
+    /// sha256("def").
+    const SHA256_OF_DEF: &str = "cb8379ac2098aa165029e3938a51da0bcecfc008fd6795f401178647f96c5b34";
+
+    /// A row whose three members all carry `digest` — the member BYTES are
+    /// irrelevant to [`media_corpus_sha256`] by construction (it folds the
+    /// measured per-member digests, which the loader computed off those
+    /// bytes), so they are left empty here to make that explicit.
+    fn row_with(id: &str, digest: &str) -> MediaTriplet {
+        MediaTriplet {
+            id: id.to_string(),
+            anchor: Vec::new(),
+            positive: Vec::new(),
+            negative: Vec::new(),
+            anchor_sha256: digest.to_string(),
+            positive_sha256: digest.to_string(),
+            negative_sha256: digest.to_string(),
+        }
+    }
+
+    #[test]
+    fn media_corpus_sha256_matches_an_independent_implementations_value() {
+        // hashlib: sha256((sha256("abc").hexdigest() * 3).encode())
+        assert_eq!(
+            media_corpus_sha256(&[row_with("r0", SHA256_OF_ABC)]),
+            "c7690b2f3f908d77bc23701243fa861aa6f01ac3d80570a4b000a073600dadb9"
+        );
+        // hashlib: sha256((abc*3 + def*3).encode()) — two rows, in order.
+        assert_eq!(
+            media_corpus_sha256(&[row_with("r0", SHA256_OF_ABC), row_with("r1", SHA256_OF_DEF),]),
+            "00bdccf4b4640d72d226b663b9035f89698e3191e22c96af59be590508564a19"
+        );
+    }
+
+    /// ORDER is part of the digest — the held-out corpus is folded in
+    /// COMMITTED SCORING order, so a fold that sorted (or otherwise
+    /// normalized) its input would silently make two differently-ordered
+    /// fixtures compare as one. Pinned against the independent
+    /// implementation's own swapped-order value, not merely asserted
+    /// `!=` (a function returning a constant would pass a bare `!=` against
+    /// nothing).
+    #[test]
+    fn media_corpus_sha256_is_order_sensitive() {
+        let forward =
+            media_corpus_sha256(&[row_with("r0", SHA256_OF_ABC), row_with("r1", SHA256_OF_DEF)]);
+        let swapped =
+            media_corpus_sha256(&[row_with("r1", SHA256_OF_DEF), row_with("r0", SHA256_OF_ABC)]);
+        assert_eq!(
+            swapped, "443fe3bf3115710f962f245974e24f4e96722aa63db035440a6c9dd8e9d706cd",
+            "hashlib: sha256((def*3 + abc*3).encode())"
+        );
+        assert_ne!(forward, swapped);
+    }
+
+    /// The negative control that makes the field worth carrying at all: a
+    /// corpus whose MANIFEST is unchanged but whose file CONTENT differs
+    /// (the exact thing `train_pairs_file_sha256` cannot see) must produce a
+    /// different digest. The row id is held fixed here precisely so the only
+    /// varying input is content.
+    #[test]
+    fn media_corpus_sha256_changes_when_only_the_content_changes() {
+        let a = media_corpus_sha256(&[row_with("same-id", SHA256_OF_ABC)]);
+        let b = media_corpus_sha256(&[row_with("same-id", SHA256_OF_DEF)]);
+        assert_ne!(
+            a, b,
+            "swapping the bytes behind an unchanged manifest must change the content digest"
+        );
+    }
+
+    /// An empty corpus folds to sha256 of the EMPTY message — stated, not
+    /// left to a reader to assume, because `run_impl` computes this field
+    /// unconditionally on a media task and an "empty means unknown"
+    /// reading would be wrong (this tier refuses an empty train/held-out
+    /// row set upstream, so the value never stands in for a missing one).
+    #[test]
+    fn media_corpus_sha256_of_no_rows_is_the_empty_message_digest() {
+        assert_eq!(
+            media_corpus_sha256(&[]),
+            "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+        );
+    }
 
     /// `cookbook/fixtures/tiny_bert` — the SAME generic, committed fixture
     /// `finetune_run_smoke.rs` drives via the compiled CLI (BERT
@@ -2223,6 +2666,15 @@ mod tests {
             // that toggling training mode is what actually gates it (the
             // RED-provable mechanism `with_dropout_disabled` relies on).
             lora_dropout: 0.05,
+            // The default this tier had before `--lora-init` existed, so
+            // every test built on these params exercises the UNCHANGED
+            // path; `lora_init_mode_reaches_both_lora_build_sites` below
+            // overrides it explicitly to prove the other mode is threaded.
+            lora_init: LoraInitMode::ZerosB,
+            // `None` = the ordinary, unchecked case (no
+            // `--expect-kernels-disabled` claim), which is what every test
+            // in this module runs under.
+            expect_kernels_disabled: None,
             target_modules: vec!["query".to_string(), "value".to_string()],
             layers_to_transform: None,
             backbone_dtype: jammi_numerics::ComputePrecision::F32,
@@ -2296,6 +2748,7 @@ mod tests {
             2,
             4.0,
             0.05,
+            LoraInitMode::ZerosB,
             jammi_numerics::ComputePrecision::F32,
             7,
             &Device::Cpu,
@@ -2480,6 +2933,7 @@ mod tests {
             2,
             4.0,
             0.0,
+            LoraInitMode::ZerosB,
             jammi_numerics::ComputePrecision::F32,
             7,
             &Device::Cpu,
@@ -2529,6 +2983,7 @@ mod tests {
             2,
             4.0,
             0.0,
+            LoraInitMode::ZerosB,
             jammi_numerics::ComputePrecision::F32,
             7,
             &Device::Cpu,
@@ -2546,6 +3001,7 @@ mod tests {
             2,
             4.0,
             0.0,
+            LoraInitMode::ZerosB,
             jammi_numerics::ComputePrecision::F32,
             7,
             &Device::Cpu,
@@ -2591,6 +3047,7 @@ mod tests {
             2,
             4.0,
             0.0,
+            LoraInitMode::ZerosB,
             jammi_numerics::ComputePrecision::F32,
             7,
             &Device::Cpu,
@@ -2760,6 +3217,7 @@ mod tests {
             2,
             4.0,
             0.0,
+            LoraInitMode::ZerosB,
             jammi_numerics::ComputePrecision::F32,
             7,
             &Device::Cpu,
@@ -2831,6 +3289,7 @@ mod tests {
             2,
             4.0,
             0.0,
+            LoraInitMode::ZerosB,
             jammi_numerics::ComputePrecision::F32,
             7,
             &Device::Cpu,
@@ -3589,6 +4048,7 @@ mod tests {
             2,
             4.0,
             0.0,
+            LoraInitMode::ZerosB,
             jammi_numerics::ComputePrecision::F32,
             7,
             &Device::Cpu,
@@ -3626,6 +4086,7 @@ mod tests {
             2,
             4.0,
             0.0,
+            LoraInitMode::ZerosB,
             jammi_numerics::ComputePrecision::F32,
             7,
             &Device::Cpu,
@@ -3655,6 +4116,7 @@ mod tests {
             2,
             4.0,
             0.0,
+            LoraInitMode::ZerosB,
             jammi_numerics::ComputePrecision::F32,
             7,
             &Device::Cpu,
@@ -3693,6 +4155,7 @@ mod tests {
             2,
             4.0,
             0.0,
+            LoraInitMode::ZerosB,
             jammi_numerics::ComputePrecision::F32,
             7,
             &Device::Cpu,
@@ -3745,6 +4208,7 @@ mod tests {
                 2,
                 4.0,
                 0.0,
+                LoraInitMode::ZerosB,
                 jammi_numerics::ComputePrecision::F32,
                 7,
                 &Device::Cpu,
@@ -3784,6 +4248,7 @@ mod tests {
             2,
             4.0,
             0.0,
+            LoraInitMode::ZerosB,
             jammi_numerics::ComputePrecision::F32,
             7,
             &Device::Cpu,
@@ -3847,6 +4312,7 @@ mod tests {
                 2,
                 4.0,
                 0.0,
+                LoraInitMode::ZerosB,
                 jammi_numerics::ComputePrecision::F32,
                 7,
                 &Device::Cpu,

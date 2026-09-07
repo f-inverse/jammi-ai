@@ -1848,6 +1848,33 @@ staleness→recompute loop — that is the platform's, not the engine's
   (`crates/jammi-ai/src/fine_tune/worker.rs`, `build_acceleration_report_json`) from
   degrading to `probe_forward_failed` on a media tower — an empty `ops` map there is the
   esc-075 "absence must fail, never read as clean" case (`.jammi/escapes.jsonl`).
+- **`AnyEncoder::fusible_site_census`** — `crates/jammi-encoders/src/fusible_census.rs`
+  (`FusibleSiteCensus`): `{lora_sites_wrapped, layer_norms, gelu_seam_calls_per_forward}`,
+  the per-forward call count for each of the three fusible seams, total over the enum (every
+  variant answers, a variant with no such seam answers `0` rather than declining). Each
+  field pairs with exactly one `jammi_kernels::admission` key
+  (`lora_linear_fused`/`layer_norm_fused`/`gelu_erf_fused`), so a fused-kernel profile's
+  positive-proof equation (`fused + eager == calls × batches`) reads its `calls` term
+  straight off this struct instead of a reader deriving it by hand from a config. **The
+  invariant: every count is WALKED off the built structure — never config arithmetic.**
+  `lora_sites_wrapped` counts `jammi_lora::MaybeLoraLinear::takes_lora_linear_admission() ==
+  true` over the tower's own site traversal — a NARROWER predicate than `is_lora()`:
+  `LoraLinear::forward` branches on `FrozenBase::Dense` vs `FrozenBase::Quantized` before it
+  ever reaches `admit()`, so a `Lora` site over a `Quantized` base (a QLoRA backbone) is
+  adapted (`is_lora() == true`) but takes no `lora_linear_fused` admission decision and is not
+  counted here; `layer_norms` counts the house `LayerNorm` instances the built tower actually
+  holds (a family that omits one, e.g. ModernBERT's `None` layer-0 pre-norm or an HTSAT stage
+  with no `downsample`, contributes what it actually holds, not what `2 × layers` predicts);
+  `gelu_seam_calls_per_forward` counts calls to `activations::gelu_erf` per forward (`0` for
+  ModernBERT's GeGLU FFN and for both OpenCLIP towers' `quick_gelu`, which have no fused seam
+  at all — two different reasons for the same zero, both stated on the field's own doc). Every
+  count is per ONE forward at `training == true`: each seam short-circuits before any
+  admission decision in eval, so **an eval forward contributes `0` to both sides of the
+  equation** rather than counting as "all eager". `FinetuneRunTier::fusible_site_census`
+  (`crates/jammi-bench/src/report.rs`) records the census as bench PROVENANCE, never
+  IDENTITY — it is a structural property of the build, not a caller premise two legs must
+  agree on — and `ci/scripts/perf/profile_421_merge.py` reads its own `calls` term from this
+  field.
 - **The three cross-modal towers and their LoRA sites** — each tower has its own
   builder (`ClipText::builder`, `OpenClipVisionTransformer::builder`,
   `HtsatAudio::builder`) with the same knobs the BERT family uses
@@ -1898,6 +1925,45 @@ staleness→recompute loop — that is the platform's, not the engine's
   HF `ClapAudioLayer`'s own value and `exp(-100) ≈ 3.7e-44` is a denormal in F32, i.e.
   output-affecting. `-100.0` is exact in F32/F16/BF16 alike, and at F32 the `to_dtype`
   is candle's same-dtype early return (`self.clone()`).
+- **Every fusible activation goes through the house seam** — a tower never calls
+  `Tensor::gelu_erf()` directly. HTSAT's two GELU-erf sites (each Swin block's MLP in
+  `SwinBlock::forward`, and the projection head's `"gelu"` arm in
+  `ClapAudioProjection::forward_unnormalized_with_training`) both route through
+  `crate::activations::gelu_erf(x, training)` — the same seam `BertIntermediate::forward`
+  and `DistilBertFfn::forward` use, and the reason `gelu_erf_fused` is reachable on this
+  tower with no new kernel work. The seam's contract carries over unchanged: `training ==
+  false` is the unchanged eager call byte for byte, so eval bytes and every golden-parity /
+  bits-snapshot row taken in eval are what they were before the seam existed, while
+  `training == true` makes fused-vs-eager a COUNTED admission decision on tensor state
+  (dtype, contiguity, device, non-emptiness), never on model identity. The `training` flag
+  is a call-chain PARAMETER sourced from `HtsatAudio::set_training`'s single stored flag and
+  threaded to both sites, never a per-sub-struct stored copy — a stored copy is exactly how
+  a seam ends up dispatching on a flag the model's own forward has already moved past. The
+  two flag-less public entry points (`HtsatAudioEncoder::forward_spine`,
+  `ClapAudioProjection::forward_unnormalized`) are eval conveniences defined as their
+  `_with_training(.., false)` twins, for boundary-parity harnesses that hold no flag of
+  their own. Both sites report to ONE process-wide `gelu_erf_fused` registry entry, so a
+  full-tower forward's counter delta is their SUM — one per Swin block, plus one more when
+  `projection_hidden_act == "gelu"`; the tower's own module doc carries that arithmetic and
+  the per-site oracles (including the `"relu"` negative control) that pin it.
+- **A config field that names a computation is dispatched on or REFUSED, never ignored** —
+  five `HtsatAudioConfig` fields name a computation the forward path has hard-coded to one
+  value, and `HtsatAudioEncoder::load_with` REFUSES, before any tensor is touched, any
+  checkpoint that declares the other one, through both entry points (`HtsatAudio::load` and
+  `HtsatAudio::builder().build(..)`): `hidden_act` (must be `"gelu"` — `SwinBlock::forward`
+  is unconditionally gelu-erf), `enable_fusion` (must be `true` — `HtsatPatchEmbed::forward`
+  always builds and applies the AFF fusion blend), `enable_patch_layer_norm` (must be
+  `true` — `HtsatPatchEmbed::forward` always applies its trailing LayerNorm),
+  `flatten_patch_embeds` (must be `true` — `HtsatPatchEmbed::forward` always flattens the
+  patch grid to `[B, num_patches, C]`), and `qkv_bias` (must be `true` —
+  `SwinSelfAttention::load_with` always builds bias-carrying `query`/`key`/`value` linears).
+  A checkpoint declaring any of the five otherwise would load and then silently compute
+  something its own config does not describe — the worst failure shape available, because
+  every downstream number still looks well-formed. Every HF `ClapAudioConfig` this tower has
+  ever shipped against (`laion/clap-htsat-fused`, this workspace's `htsat_clap_tiny` fixture)
+  already declares all five at the one supported value. Contrast `projection_hidden_act`,
+  which IS genuinely dispatched on at forward (`"gelu"` and `"relu"` are both real arms) and
+  therefore needs no load-time refusal.
 - **The de-facto BERT-family contract** — no Rust trait; the three encoders expose an
   *identical inherent-method surface* (`builder`, `forward`, `forward_hidden`,
   `hidden_size`, `max_seq_length`, `trainable_params`, `named_trainable_weights`,

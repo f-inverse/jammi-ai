@@ -52,6 +52,46 @@ impl MaybeLoraLinear {
         }
     }
 
+    /// Whether this site actually carries an adapter — the `Lora` arm.
+    ///
+    /// One accessor, for the same reason [`Self::base`] exists: a consumer
+    /// that needs to COUNT wrapped sites (a structural census of how many
+    /// `lora_linear_fused` admissions one training forward can take, e.g.
+    /// `jammi_encoders`' `FusibleSiteCensus`) would otherwise re-derive the
+    /// arm split with a `matches!` at every call site. Counting
+    /// [`Self::trainable_params`] instead is NOT the same measurement: that
+    /// is a count of TENSORS (two per adapted site), and it silently returns
+    /// the same `0` for "no adapter installed" as for "an adapter whose A/B
+    /// pair is empty" — this answers the structural question directly.
+    ///
+    /// A `true` here does NOT by itself mean the fused kernel runs: the
+    /// adapted site still takes its own admission decision per TRAINING
+    /// forward (and takes none at all in eval), and a
+    /// [`FrozenBase::Quantized`] base never reaches the fused seam at all
+    /// (see [`crate::LoraLinear::forward`]'s own doc). It means exactly that
+    /// this site is an adapted one.
+    pub fn is_lora(&self) -> bool {
+        matches!(self, Self::Lora(_))
+    }
+
+    /// Whether this site takes a `lora_linear_fused` admission decision on a
+    /// TRAINING forward — `Lora` over a `FrozenBase::Dense` base.
+    ///
+    /// This is a NARROWER question than [`Self::is_lora`]. `LoraLinear::
+    /// forward` branches on `self.base` BEFORE it ever reaches `admit()`
+    /// (see that method's own doc, "the fused site is Dense-ONLY"): a `Lora`
+    /// site whose base is `FrozenBase::Quantized` — the shape a QLoRA
+    /// backbone builds for every adapted site — ALWAYS composes and takes NO
+    /// admission decision at all, neither `Fused` nor `Eager`. A `Frozen`
+    /// site (either base storage) likewise never calls `LoraLinear::forward`
+    /// and so never reaches `admit()` either. This method answers exactly
+    /// the predicate a `lora_linear_fused` call-count census needs — see
+    /// `jammi_encoders::FusibleSiteCensus::lora_sites_wrapped`'s own doc,
+    /// which counts this, not [`Self::is_lora`].
+    pub fn takes_lora_linear_admission(&self) -> bool {
+        matches!(self, Self::Lora(l) if matches!(l.base(), FrozenBase::Dense(_)))
+    }
+
     /// Trainable parameters of this layer. Empty for `Frozen`; the LoRA A and
     /// B tensors for `Lora`.
     pub fn trainable_params(&self) -> Vec<&Tensor> {
@@ -130,5 +170,112 @@ impl MaybeLoraLinear {
             }
         }
         Ok(())
+    }
+}
+
+/// [`MaybeLoraLinear::takes_lora_linear_admission`]: the Dense-vs-Quantized
+/// split that predicate exists to expose (see #467 F3 — a QLoRA backbone's
+/// `FusibleSiteCensus::lora_sites_wrapped` must not count a quantized-base
+/// adapted site).
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::frozen_base::QuantizedLinear;
+    use crate::init::LoraInitMode;
+    use candle_core::quantized::{GgmlDType, QTensor};
+    use candle_core::DType;
+    use candle_nn::{Linear, VarBuilder, VarMap};
+    use std::sync::Arc;
+
+    fn dense_lora_site(out_f: usize, in_f: usize) -> MaybeLoraLinear {
+        let device = Device::Cpu;
+        let varmap = VarMap::new();
+        let vb = VarBuilder::from_varmap(&varmap, DType::F32, &device);
+        let w_v: Vec<f32> = (0..out_f * in_f)
+            .map(|i| ((i as f64) * 0.037 + 0.3).sin() as f32)
+            .collect();
+        let w = Tensor::from_vec(w_v, (out_f, in_f), &device).unwrap();
+        let base = Linear::new(w, None);
+        let lora = LoraLinear::new(
+            base,
+            4,
+            8.0,
+            false,
+            LoraInitMode::Gaussian,
+            None,
+            7,
+            &varmap,
+            &vb,
+        )
+        .unwrap();
+        MaybeLoraLinear::Lora(lora)
+    }
+
+    fn quantized_lora_site(out_f: usize, in_f: usize) -> MaybeLoraLinear {
+        let device = Device::Cpu;
+        let varmap = VarMap::new();
+        let vb = VarBuilder::from_varmap(&varmap, DType::F32, &device);
+        let w_v: Vec<f32> = (0..out_f * in_f)
+            .map(|i| ((i as f64) * 0.029 + 0.7).sin() as f32)
+            .collect();
+        let w = Tensor::from_vec(w_v, (out_f, in_f), &device).unwrap();
+        let q = QTensor::quantize(&w, GgmlDType::Q8_0).unwrap();
+        let base = FrozenBase::Quantized(QuantizedLinear::new(Arc::new(q), None).unwrap());
+        let lora = LoraLinear::new_with_base(
+            base,
+            4,
+            8.0,
+            false,
+            LoraInitMode::Gaussian,
+            None,
+            11,
+            &varmap,
+            &vb,
+        )
+        .unwrap();
+        MaybeLoraLinear::Lora(lora)
+    }
+
+    /// Positive control: a `Lora` site over a `Dense` base — the ordinary
+    /// (non-quantized) case every LoRA site used before QLoRA existed — DOES
+    /// take the `lora_linear_fused` admission decision.
+    #[test]
+    fn takes_lora_linear_admission_is_true_for_a_lora_over_dense_base() {
+        let site = dense_lora_site(4, 8);
+        assert!(site.is_lora(), "sanity: this site is adapted");
+        assert!(
+            site.takes_lora_linear_admission(),
+            "a Lora site over a Dense base takes the lora_linear_fused admission decision"
+        );
+    }
+
+    /// The domain-validity edge #467 F3 closes: a `Lora` site over a
+    /// `Quantized` base is still adapted (`is_lora` stays `true`, this is a
+    /// non-vacuous control) but `LoraLinear::forward` composes it
+    /// unconditionally and never reaches `admit()` — so it must NOT be
+    /// counted as taking the admission decision.
+    #[test]
+    fn takes_lora_linear_admission_is_false_for_a_lora_over_quantized_base() {
+        let site = quantized_lora_site(4, 32);
+        assert!(
+            site.is_lora(),
+            "sanity: this site is adapted -- is_lora must stay true"
+        );
+        assert!(
+            !site.takes_lora_linear_admission(),
+            "a Lora site over a Quantized base ALWAYS composes (LoraLinear::forward's \
+             Dense-only fused branch) and so never reaches admit() -- must not be counted"
+        );
+    }
+
+    /// Negative control: an unwrapped `Frozen` site (dense storage) is
+    /// neither adapted nor admission-taking.
+    #[test]
+    fn takes_lora_linear_admission_is_false_for_a_frozen_dense_site() {
+        let device = Device::Cpu;
+        let w = Tensor::zeros((4, 8), DType::F32, &device).unwrap();
+        let site = MaybeLoraLinear::Frozen(FrozenBase::Dense(Linear::new(w, None)));
+        assert!(!site.is_lora());
+        assert!(!site.takes_lora_linear_admission());
     }
 }

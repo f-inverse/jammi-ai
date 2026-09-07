@@ -1310,3 +1310,144 @@ fn bert_head64_disabled_gelu_erf_fused_child_process_body() {
         "disabled gelu_erf_fused must count eager only (before={before:?}, after={after:?})"
     );
 }
+
+/// #467 F3: `FusibleSiteCensus::lora_sites_wrapped` must count only the
+/// `Lora` sites whose base is `FrozenBase::Dense` — `LoraLinear::forward`
+/// branches on `self.base` BEFORE it ever reaches `admit()` (that method's
+/// own doc, "the fused site is Dense-ONLY"), so a `Lora` site over a
+/// `FrozenBase::Quantized` base — the shape a QLoRA backbone builds for
+/// every adapted site, via the SAME `weight_source` seam
+/// `bert_rejects_a_weight_source_hit_with_mismatched_geometry` above
+/// exercises — takes NO `lora_linear_fused` admission decision at all. The
+/// census must therefore report `0` for a fully-quantized-base QLoRA BERT,
+/// not the count of ADAPTED sites.
+///
+/// The dense twin, built over the IDENTICAL `all-linear` LoRA config and
+/// geometry, is the non-vacuous control: it must report a POSITIVE wrapped
+/// count and its training forward must actually move the `fused` counter,
+/// which rules out a census walk that always answers `0` regardless of base
+/// storage.
+#[test]
+fn quantized_base_bert_reports_zero_lora_sites_wrapped_with_a_dense_twin_control() {
+    let _guard = crate::modernbert::DISPATCH_COUNTER_TEST_LOCK
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
+    use jammi_encoders::{AnyEncoder, EncoderInput};
+
+    let device = Device::Cpu;
+    let config = load_config();
+    let (h, i) = (config.hidden_size, config.intermediate_size);
+    let weights = weights_path();
+
+    let targets = vec!["all-linear".to_string()];
+    let no_layers: Option<Vec<usize>> = None;
+    let empty_pattern: HashMap<String, usize> = HashMap::new();
+    let lora_cfg = || LoraBuildConfig {
+        target_modules: &targets,
+        layers_to_transform: &no_layers,
+        lora_rank: 4,
+        lora_alpha: 8.0,
+        use_rslora: false,
+        lora_dropout: None,
+        rank_pattern: &empty_pattern,
+        init_mode: LoraInitMode::Gaussian,
+        seed: 0x5eed_1234,
+    };
+
+    let input_ids = Tensor::new(&[[1u32, 2, 3, 4, 5]], &device).unwrap();
+    let attention_mask = Tensor::new(&[[1u32, 1, 1, 1, 1]], &device).unwrap();
+
+    // A per-site correctly-shaped Q8_0 quantized base: `intermediate.dense`
+    // is h -> i; the FFN `output.dense` is i -> h, matched by the plain
+    // "output.dense" suffix -- checked AFTER the more specific
+    // "attention.output.dense" (itself square h -> h, like query/key/value)
+    // so the two are never confused. Every real BERT site lands on exactly
+    // one of these three arms.
+    let quantized_lookup = move |site: &str| -> Result<Option<FrozenBase>, EncoderError> {
+        let (in_f, out_f) = if site.contains("intermediate.dense") {
+            (h, i)
+        } else if site.contains("attention.output.dense") {
+            (h, h)
+        } else if site.ends_with("output.dense") {
+            (i, h)
+        } else {
+            (h, h)
+        };
+        let w_v: Vec<f32> = (0..out_f * in_f)
+            .map(|idx| ((idx as f64) * 0.037 + 0.3).sin() as f32)
+            .collect();
+        let w = Tensor::from_vec(w_v, (out_f, in_f), &Device::Cpu).unwrap();
+        let q = QTensor::quantize(&w, GgmlDType::Q8_0).unwrap();
+        Ok(Some(FrozenBase::Quantized(
+            QuantizedLinear::new(Arc::new(q), None).unwrap(),
+        )))
+    };
+
+    // --- The quantized-base (QLoRA) leg ---
+    let q_varmap = VarMap::new();
+    let q_bert = Bert::builder()
+        .pooling(Pooling::Mean)
+        .lora(lora_cfg())
+        .backbone_dtype(DType::F32)
+        .adapter(None)
+        .weight_source(&quantized_lookup)
+        .build(&[weights.as_path()], &config, &device, &q_varmap)
+        .expect("build a QLoRA (quantized-base + LoRA) BERT");
+    let mut q_encoder = AnyEncoder::Bert(q_bert);
+    let q_census = q_encoder.fusible_site_census();
+    assert_eq!(
+        q_census.lora_sites_wrapped, 0,
+        "a quantized-base LoRA site never reaches admit() (LoraLinear::forward's Dense-only \
+         fused branch), so the census must report 0 wrapped sites, not the count of ADAPTED \
+         sites; census={q_census:?}"
+    );
+
+    q_encoder.set_training(true);
+    let q_before = lora_linear_fused_dispatch_snapshot();
+    q_encoder
+        .forward_input(&EncoderInput::Text {
+            input_ids: &input_ids,
+            attention_mask: &attention_mask,
+        })
+        .expect("QLoRA training forward");
+    let q_after = lora_linear_fused_dispatch_snapshot();
+    assert_eq!(
+        (q_after.fused, q_after.eager),
+        (q_before.fused, q_before.eager),
+        "a QLoRA training forward must move NEITHER lora_linear_fused counter -- fused + eager \
+         must stay 0 (before={q_before:?}, after={q_after:?})"
+    );
+
+    // --- The dense twin: non-vacuous control ---
+    let d_varmap = VarMap::new();
+    let d_bert = Bert::builder()
+        .pooling(Pooling::Mean)
+        .lora(lora_cfg())
+        .backbone_dtype(DType::F32)
+        .adapter(None)
+        .build(&[weights.as_path()], &config, &device, &d_varmap)
+        .expect("build a dense-base LoRA BERT (control)");
+    let mut d_encoder = AnyEncoder::Bert(d_bert);
+    let d_census = d_encoder.fusible_site_census();
+    assert!(
+        d_census.lora_sites_wrapped > 0,
+        "non-vacuous control: the dense-base twin over the SAME all-linear LoRA config must \
+         report a POSITIVE wrapped-site count, or this test could pass by a census walk that \
+         always answers 0; census={d_census:?}"
+    );
+
+    d_encoder.set_training(true);
+    let d_before = lora_linear_fused_dispatch_snapshot();
+    d_encoder
+        .forward_input(&EncoderInput::Text {
+            input_ids: &input_ids,
+            attention_mask: &attention_mask,
+        })
+        .expect("dense-twin training forward");
+    let d_after = lora_linear_fused_dispatch_snapshot();
+    assert!(
+        d_after.fused > d_before.fused,
+        "non-vacuous control: the dense-base twin's training forward must actually move the \
+         lora_linear_fused fused counter (before={d_before:?}, after={d_after:?})"
+    );
+}

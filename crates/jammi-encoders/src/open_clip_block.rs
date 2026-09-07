@@ -263,6 +263,35 @@ pub(crate) fn set_training(blocks: &mut [ResidualAttentionBlock], training: bool
     }
 }
 
+/// The block stack's own contribution to a tower's
+/// [`crate::FusibleSiteCensus`]: `(lora_sites_wrapped, layer_norms)`, walked
+/// off the built blocks.
+///
+/// ONE helper for BOTH OpenCLIP towers, for the same reason
+/// `crate::any::AnyEncoder::lora_site_names` hands them one site list: they
+/// load the identical [`ResidualAttentionBlock`], so their per-block counts
+/// are equal BY CONSTRUCTION rather than by two loaders that happen to
+/// agree. What the towers do NOT share is what sits outside the stack — the
+/// text tower's `ln_final`, the vision tower's `ln_pre`/`ln_post` — so each
+/// adds its own head-side norms to the second element here and neither can
+/// inherit the other's.
+///
+/// There is no GELU term: this block's MLP activation is `quick_gelu`
+/// (`crate::activations::quick_gelu`), a different function with no fused
+/// seam, so neither tower ever takes a `gelu_erf_fused` decision.
+pub(crate) fn fusible_site_counts(blocks: &[ResidualAttentionBlock]) -> (usize, usize) {
+    let lora_sites_wrapped = blocks
+        .iter()
+        .flat_map(|block| block.lora_sites())
+        .filter(|(_, lin)| lin.takes_lora_linear_admission())
+        .count();
+    let layer_norms = blocks
+        .iter()
+        .flat_map(|block| [&block.ln_1, &block.ln_2])
+        .count();
+    (lora_sites_wrapped, layer_norms)
+}
+
 /// Trainable tensors across every LoRA-wrapped site, in the fixed traversal
 /// order. Empty for a fully frozen stack.
 pub(crate) fn trainable_params(blocks: &[ResidualAttentionBlock]) -> Vec<&Tensor> {

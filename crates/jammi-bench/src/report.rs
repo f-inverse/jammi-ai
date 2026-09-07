@@ -1531,9 +1531,9 @@ pub struct FinetuneStepTier {
     /// or because the admission predicate failed for any other stated
     /// reason.
     pub geglu_eager_dispatches: u64,
-    /// How many times BERT's/DistilBERT's training-mode fused GELU-erf
-    /// activation kernel (`jammi_kernels::ops::GeluErfFused`, admit key
-    /// `gelu_erf_fused`) actually dispatched during this run — the same
+    /// How many times the training-mode fused GELU-erf activation kernel
+    /// (`jammi_kernels::ops::GeluErfFused`, admit key `gelu_erf_fused`)
+    /// actually dispatched during this run — the same
     /// positive-proof channel as `ln_fused_dispatches` /
     /// `rope_fused_dispatches` / `softmax_fused_dispatches` /
     /// `geglu_fused_dispatches`, for the C-MLP fused-kernels commit (see
@@ -1545,15 +1545,47 @@ pub struct FinetuneStepTier {
     /// the one production actually dispatches through), the same
     /// process-wide registry `adamw_fused_dispatches` reads directly
     /// rather than through a crate-local wrapper — this counter has no
-    /// `jammi_encoders`-side snapshot function of its own, since the call
-    /// site is wired at exactly two places (`bert.rs`, `distilbert.rs`)
-    /// and both are already this crate's own dependency. Distinct from
-    /// GeGLU's INTERNAL `gelu_erf` composition step counted (as eager,
-    /// always) inside `geglu_eager_dispatches` above: ModernBERT's FFN
-    /// never calls the standalone `gelu_erf` seam this counter tracks, so
-    /// a ModernBert run reads this pair `0`/`0` by construction, not by
-    /// domain decline — see [`Self::attention_block_fused_dispatches`]'s
-    /// doc for the parallel BERT/ModernBert split on that counter.
+    /// `jammi_encoders`-side snapshot function of its own.
+    ///
+    /// ## The FOUR seam sites this pair sums over (corrected in #421 P1-a)
+    ///
+    /// This doc previously said the seam was "wired at exactly two places
+    /// (`bert.rs`, `distilbert.rs`)" and described the counter as
+    /// BERT-family-only. That was true when it was written and is now
+    /// false: #421 P1-a routed HTSAT's two activation sites through the
+    /// same house seam. As of that commit
+    /// `jammi_encoders::activations::gelu_erf` is called from FOUR places,
+    /// and this counter is their SUM (they all report to the one
+    /// process-wide `gelu_erf_fused` registry entry):
+    ///
+    /// 1. `BertIntermediate::forward` (`jammi_encoders::bert`) — once per
+    ///    encoder layer per forward.
+    /// 2. `DistilBertFfn::forward` (`jammi_encoders::distilbert`) — once
+    ///    per layer per forward.
+    /// 3. `SwinBlock::forward`'s MLP (`jammi_encoders::htsat_audio`) —
+    ///    once per Swin block, i.e. `sum(depths)` per forward.
+    /// 4. `ClapAudioProjection`'s training-threaded forward
+    ///    (`jammi_encoders::htsat_audio`) — once per forward, and ONLY
+    ///    when that head's `projection_hidden_act` is `"gelu"`; a `relu`
+    ///    head contributes nothing.
+    ///
+    /// So an HTSAT run's per-forward count is `sum(depths) +
+    /// [projection_hidden_act == "gelu"]`, that tower's own module doc
+    /// carries the arithmetic, and a downstream reader that needs the
+    /// per-forward call count reads it off the run's own witnessed
+    /// `FinetuneRunTier::fusible_site_census` rather than deriving it
+    /// from a model name. The CLIP towers are the OTHER end of the same
+    /// fact: their MLP activation is `quick_gelu`, which has no fused seam
+    /// at all, so a `text_embedding`/`image_embedding` leg reads this pair
+    /// `0`/`0` by construction.
+    ///
+    /// Distinct from GeGLU's INTERNAL `gelu_erf` composition step counted
+    /// (as eager, always) inside `geglu_eager_dispatches` above:
+    /// ModernBERT's FFN never calls the standalone `gelu_erf` seam this
+    /// counter tracks, so a ModernBert run also reads this pair `0`/`0` by
+    /// construction, not by domain decline — see
+    /// [`Self::attention_block_fused_dispatches`]'s doc for the parallel
+    /// BERT/ModernBert split on that counter.
     pub gelu_fused_dispatches: u64,
     /// How many times that same call site fell back to the eager
     /// (`Tensor::gelu_erf`) composition instead — outside the fused
@@ -2025,6 +2057,20 @@ pub struct FinetuneRunTier {
     // ── Identity: FinetuneStepTier's 18 (minus attention_arm — see struct
     //    doc), carried over by name ────────────────────────────────────
     pub seed: u64,
+    /// `--task`: which TOWER of `--model-dir`'s checkpoint this run
+    /// fine-tuned — `"text_embedding"`, `"image_embedding"`, or
+    /// `"audio_embedding"` ([`crate::finetune_run::Task::as_str`]).
+    /// IDENTITY, and the strongest one on this tier after the checkpoint
+    /// digests: on a multi-tower checkpoint (OpenCLIP holds a text tower
+    /// AND a vision tower behind ONE `checkpoint_weights_sha256`) the task
+    /// is the ONLY field that says which set of weights was actually
+    /// trained, so two legs agreeing on every other field but disagreeing
+    /// here measured DIFFERENT models. Recorded from this run's resolved
+    /// `Task`, never re-derived from the row shape. Added by issue #421
+    /// P1-b: `--task` landed as a tower selector without a mirror on this
+    /// tier at all, so every media leg's report was silent about which
+    /// tower produced it.
+    pub task: String,
     pub batch: usize,
     /// `--max-seq-length` — the tokenizer truncation cap this run's config
     /// used (NOT a per-batch measured width: real text pairs vary in
@@ -2033,6 +2079,23 @@ pub struct FinetuneRunTier {
     pub lora_rank: usize,
     pub lora_alpha: f64,
     pub lora_dropout: f64,
+    /// `--lora-init`: which LoRA initialization mode this run's adapters
+    /// were built under — `"zeros_b"` (the default, and the ONLY value any
+    /// invocation written before this flag existed can produce) or
+    /// `"gaussian"`. IDENTITY, for the same discriminating-power reason
+    /// `lora_rank`/`target_modules` are: a `gaussian` leg starts from a
+    /// DIFFERENT point on the loss surface than a `zeros_b` leg at the
+    /// identical seed and selectors (`ZerosB` makes `B = 0`, so the
+    /// adapter contributes exactly nothing at step 0 and `dL/dA = 0`
+    /// there; `Gaussian` does not), so two legs disagreeing here are not
+    /// comparable at all. Spelled as `jammi_lora::LoraInitMode`'s own
+    /// snake-case CLI spelling, never the Rust variant name, so the
+    /// emitted string is the same token a caller passes on the command
+    /// line. `ci/scripts/perf/identity_fields.py`'s
+    /// `FINETUNE_RUN_IDENTITY_FIELDS` carries the mirror entry
+    /// (set-equality pin against [`Self::IDENTITY_FIELDS`], docs-ci
+    /// domain).
+    pub lora_init: String,
     /// The Triplet objective's margin — `Some` only when
     /// [`crate::finetune_run::Objective::Triplet`] was selected for this
     /// run; `null` (`NullMeans("objective is mnrl")`) when
@@ -2083,6 +2146,26 @@ pub struct FinetuneRunTier {
     /// from the committed fixture manifest's `dataset_sha256` (a different
     /// quantity: a Merkle over per-pair digests, not this file's bytes).
     pub train_pairs_file_sha256: String,
+    /// The train MEDIA corpus's own CONTENT digest — sha256 over each
+    /// row's three member content digests (`anchor`, `positive`,
+    /// `negative`, each itself measured off the file bytes this run read),
+    /// concatenated as lowercase hex in MANIFEST ORDER. `null`
+    /// (`NullMeans`) on a text task, where the corpus content IS the
+    /// manifest and [`Self::train_pairs_file_sha256`] already digests it.
+    ///
+    /// IDENTITY, and it closes a real hole: on a media task
+    /// `train_pairs_file_sha256` digests the JSONL MANIFEST only, and that
+    /// manifest names PATHS. Swapping the bytes behind those paths (a
+    /// different corpus at the same file names — exactly what a second
+    /// producer run with different `--size`/`--seconds` writes) changes
+    /// every measured loss while leaving every other identity field
+    /// byte-identical, so two such legs would be merged as comparable.
+    /// The digest-of-digests framing is unambiguous by construction (each
+    /// member contributes a fixed-width 64-char hex string, so no
+    /// concatenation of one row's members can be re-read as another's) and
+    /// costs nothing: the per-member digests are already measured by the
+    /// media loader on the way in.
+    pub train_media_sha256: Option<String>,
     pub heldout_ids_sha256: String,
     /// sha256 (hex) of the `--heldout-jsonl` file's own raw bytes — see this
     /// struct's own doc, finding 5(a): the held-out TEXT is a total
@@ -2090,6 +2173,18 @@ pub struct FinetuneRunTier {
     /// [`Self::heldout_ids_sha256`]'s id-order anchor) it must be content-
     /// anchored, never merely trusted by filename.
     pub heldout_pairs_sha256: String,
+    /// [`Self::train_media_sha256`]'s held-out twin, over the held-out
+    /// rows in COMMITTED SCORING ORDER (the `--heldout-ids` order, which is
+    /// the order this run actually scored them in — not the
+    /// `--heldout-jsonl` file order, which need not match). `null`
+    /// (`NullMeans`) on a text task for the same reason its train twin is.
+    ///
+    /// IDENTITY for a STRONGER reason than the train digest: the held-out
+    /// content is a total determinant of every per-example loss `d_i` this
+    /// tier reports (the unit-63 finding-5(a) argument that added
+    /// `heldout_pairs_sha256` in the first place), and on a media task
+    /// that field digests the manifest, not the media.
+    pub heldout_media_sha256: Option<String>,
     /// `HeldOutLoss::batch_partition_sha256` at the FINAL epoch — the
     /// partition the reported [`Self::held_out_example_mean`] was scored
     /// under (CONTRACT H1 v2 delta 9: a property of `(model, partition)`).
@@ -2129,6 +2224,87 @@ pub struct FinetuneRunTier {
     pub device_name: String,
     pub kernels_disabled_requested: Vec<String>,
     pub kernels_disabled_fired: Vec<String>,
+    /// `--expect-kernels-disabled`: the op key set this invocation CLAIMED
+    /// `JAMMI_KERNELS_DISABLE` would carry, sorted — `[]` when the caller
+    /// made no claim (the ordinary, unchecked case, and what every
+    /// invocation written before this flag existed emits). PROVENANCE, for
+    /// exactly the reason [`Self::arm`] is: a CALLER-DECLARED intent
+    /// stated on the command line, never something this process measured.
+    /// Its VALIDATION is what makes it worth recording — when non-empty,
+    /// [`crate::finetune_run::run`] refuses at START unless every named
+    /// key is present in
+    /// [`jammi_kernels::admission::disabled_ops_requested`], and refuses at
+    /// the END unless [`jammi_kernels::admission::unmatched_disables`] is
+    /// empty AND every named key's `fused` dispatch counter reads `0`
+    /// (`jammi_kernels::admission::snapshot_all`), so a leg carrying a
+    /// non-empty value here is one whose forced-eager arm was proven, not
+    /// assumed. Distinct from [`Self::kernels_disabled_requested`] (what
+    /// the env var actually resolved to) and
+    /// [`Self::kernels_disabled_fired`] (which of those entries actually
+    /// disabled a live dispatch): those two are process-OBSERVED, this one
+    /// is the claim they were checked against.
+    pub kernels_disabled_expected: Vec<String>,
+    /// The per-forward fusible-seam census WITNESSED off the encoder this
+    /// run actually built — `jammi_encoders::AnyEncoder::fusible_site_census`
+    /// called on the value `crate::finetune_run::build_encoder_adapters`
+    /// (private to that module, so named as a code span rather than an
+    /// intra-doc link) returned, before it is moved into the training
+    /// target. Issue #421 §D4 item 1.
+    ///
+    /// ## What it is FOR: the `calls` term of the positive-proof equation
+    ///
+    /// A dispatch counter alone cannot be checked. `ln_fused_dispatches ==
+    /// 15000` is only a claim about a KERNEL if the reader also knows how
+    /// many admission decisions the run was supposed to take, and the only
+    /// honest source for that is the built model, not a formula over a
+    /// config (`2 * layers` is wrong for ModernBERT, whose layer-0 pre-norm
+    /// is absent, and for an HTSAT stage with no `downsample`). Each field
+    /// pairs with exactly one `jammi_kernels::admission` key —
+    /// `lora_sites_wrapped` ↔ `lora_linear_fused`, `layer_norms` ↔
+    /// `layer_norm_fused`, `gelu_seam_calls_per_forward` ↔ `gelu_erf_fused`
+    /// — and `ci/scripts/perf/profile_421_merge.py` reads its `calls`
+    /// straight off this struct to check `fused + eager == <field> ×
+    /// batches` per key, per run. A `0` is a real, FALSIFIABLE claim there,
+    /// not an absent one: a CLIP leg's `gelu_seam_calls_per_forward` is `0`
+    /// because `quick_gelu` has no seam, so that leg must read `0`/`0`
+    /// dispatches.
+    ///
+    /// `batches` counts TRAINING forwards ONLY. An eval forward contributes
+    /// nothing to EITHER side of any of the three pairs (the LoRA site
+    /// early-returns in eval, the house LayerNorm's fused arm is under its
+    /// training branch, and the GELU seam's eval arm is the plain
+    /// `Tensor::gelu_erf`), so held-out evaluations and train probes never
+    /// enter it. The equation is UNDEFINED for a window that mixes in
+    /// forwards this tier does not count as steps.
+    ///
+    /// [`Self::steps_measured`] is that `batches` term under EXACTLY one
+    /// convention, which the #421 legs pin and which a reader must pin
+    /// before comparing anything: `--grad-accum 1` AND `--epochs 1`. The
+    /// first is the obvious half (one optimizer step is one training
+    /// forward). The second is the half worth stating: [`crate::finetune_run::run`]
+    /// drives `epochs` resume-chained single-epoch `TrainingLoop::run` legs
+    /// and SUMS each leg's `TrainingResult::total_steps`, but that field is
+    /// the leg's own `global_step`, which a RESUMED leg carries forward
+    /// from before the resume — so a 2-epoch, 2-batch-per-epoch run reports
+    /// `steps_measured == 6` for 4 training forwards. At `--epochs 1` there
+    /// is one leg and the two coincide exactly;
+    /// `tests/finetune_run_smoke.rs`'s
+    /// `fusible_site_census_satisfies_the_positive_proof_equation_on_a_real_run`
+    /// proves it on the real CLI's own output, and
+    /// `ci/scripts/perf/profile_421_merge.py` REFUSES a leg outside the
+    /// convention by name rather than reporting a counter mismatch it never
+    /// had.
+    ///
+    /// PROVENANCE, not identity, and not a measurement. It is a structural
+    /// property of the build — the same class as [`Self::batched_forward`]
+    /// — fully determined by the identity fields that already select the
+    /// model and the adapter set (`checkpoint_weights_sha256`, `task`,
+    /// `target_modules`, `layers_to_transform`, `lora_rank`). Naming it an
+    /// identity field would add a comparison key that can never differ
+    /// between two legs whose identity already matches, while making a leg
+    /// produced by a build with no census permanently unpairable with one
+    /// that has it.
+    pub fusible_site_census: jammi_encoders::FusibleSiteCensus,
     pub flash_compiled: bool,
     pub build_features: Vec<&'static str>,
     /// The attention REFERENCE CLASS this process's `JAMMI_KERNELS_DISABLE`
@@ -2199,17 +2375,29 @@ pub struct FinetuneRunTier {
     pub softmax_eager_dispatches: u64,
     pub geglu_fused_dispatches: u64,
     pub geglu_eager_dispatches: u64,
-    /// The BERT-family GELU-erf positive-proof pair (C-MLP): mirrors
+    /// The GELU-erf positive-proof pair (C-MLP): mirrors
     /// [`FinetuneStepTier::gelu_fused_dispatches`]'s own doc for the
-    /// production call site and the read API
+    /// production call sites and the read API
     /// (`jammi_kernels::admission::counters_for("gelu_erf_fused")`, taken as a
     /// before/after delta over this run's whole resume-cycled epoch loop,
-    /// the same convention every counter in this block uses). ModernBert
-    /// never calls the standalone `gelu_erf` seam this pair tracks (its
-    /// FFN activation is GeGLU, counted above), so a `modernbert` leg
-    /// reads this pair `0`/`0` by construction, the mirror image of
+    /// the same convention every counter in this block uses).
+    ///
+    /// It sums FOUR seam sites, not the two the BERT family alone
+    /// contributes (corrected in #421 P1-a, which routed HTSAT's MLP and
+    /// projection-head activations through the same
+    /// `jammi_encoders::activations::gelu_erf` seam) — the peer field's own
+    /// doc enumerates all four and gives the per-forward arithmetic. Two
+    /// classes of leg read this pair `0`/`0` BY CONSTRUCTION rather than by
+    /// domain decline, and for two different reasons: `modernbert`, whose
+    /// FFN activation is GeGLU (counted above) and which never calls the
+    /// standalone seam at all — the mirror image of
     /// [`Self::attention_block_fused_dispatches`]'s BERT-family split
-    /// below.
+    /// below — and the two CLIP towers, whose MLP activation is
+    /// `quick_gelu`, an activation with no fused seam and therefore no
+    /// admit key. Which of those a given leg is, is not inferred from the
+    /// model name: `fusible_site_census.gelu_seam_calls_per_forward` on
+    /// this same tier states the witnessed per-forward count, and it is `0`
+    /// for both.
     pub gelu_fused_dispatches: u64,
     pub gelu_eager_dispatches: u64,
     pub lora_epilogue_fused_dispatches: u64,
@@ -2316,6 +2504,35 @@ pub struct FinetuneRunTier {
     /// checkpoint save) rather than requiring this producer to isolate that
     /// overhead itself.
     pub train_run_wall_s: f64,
+    /// Wall-clock seconds this run spent inside the MEDIA decode/preprocess
+    /// front end (`TrainingLoop::encode_media`'s
+    /// `image_encoder_input`/`audio_encoder_input` call — PNG/WAV decode,
+    /// resize+normalize or resample→STFT→mel, per item, sequential),
+    /// summed over every micro-batch of every resume-cycled epoch leg. A
+    /// MEASURED field: neither identity nor provenance (not in
+    /// [`Self::IDENTITY_FIELDS`] or [`Self::PROVENANCE_FIELDS`]), the same
+    /// classification every dispatch counter and [`Self::train_run_wall_s`]
+    /// itself carry.
+    ///
+    /// A DIRECT measurement, never `train_run_wall_s − gpu_busy`: a
+    /// DIFFERENCE would absorb launch latency, sync stalls and the
+    /// optimizer's own CPU time into a number labelled "front end". Read
+    /// from `jammi_ai::fine_tune::trainer::TrainingResult::media_front_end_wall`
+    /// (the seam ai-core landed for this field) and SUMMED across every
+    /// resume-cycled epoch leg here, because `TrainingLoop::run` resets its
+    /// accumulator at the start of every call — that field's own doc makes
+    /// the summing the caller's job. Because the measurement is taken
+    /// INSIDE `run()`, this is a strict subset of the span
+    /// [`Self::train_run_wall_s`] covers, which is what lets a profile
+    /// report `launch/sync residual = wall − front − busy`.
+    ///
+    /// `null` on a TEXT leg, and deliberately not `0.0`: the trainer reports
+    /// `Duration::ZERO` there by construction (tokenization is not a media
+    /// front end and stays in the residual), so `0.0` would claim a path was
+    /// timed that never ran — a reader could not tell "this tower has no
+    /// media front end" from "this tower's media front end cost nothing".
+    /// Non-null on every `image_embedding`/`audio_embedding` leg.
+    pub media_front_end_wall_s: Option<f64>,
 
     // ── Mutant provenance (unit 63 round-7 audit, finding 1) — honest
     //    labeling, NOT identity or provenance ───────────────────────────
@@ -2363,7 +2580,11 @@ impl FinetuneRunTier {
     /// — see struct doc for the full per-field rationale), `dataset_sha256`
     /// renamed to `train_pairs_file_sha256`, and `heldout_pairs_sha256`
     /// added. 17 + 18 − 4 + 1 = 32, THEN `layers_to_transform` added
-    /// (CONTRACT v2, #356 P1 item 5): 32 + 1 = 33.
+    /// (CONTRACT v2, #356 P1 item 5): 32 + 1 = 33, THEN issue #421 P1-b's
+    /// four (`lora_init`, `task`, `train_media_sha256`,
+    /// `heldout_media_sha256` — see each field's own doc; the last three
+    /// close K7 holes `--task`/the media loader opened, not new knobs):
+    /// 33 + 4 = 37.
     ///
     /// DISJOINT from [`Self::PROVENANCE_FIELDS`] (E3's convention, not
     /// `FinetuneStepTier`'s superset one) — see struct doc.
@@ -2372,11 +2593,24 @@ impl FinetuneRunTier {
         // `batched_forward`/`steps_measured` (finding 5(c)/advisory (d) —
         // both reclassified to PROVENANCE_FIELDS below).
         ("seed", Nullable::NonNull),
+        // Issue #421 P1-b: `--task`, the TOWER selector — see
+        // `Self::task`'s own doc for why this is the strongest identity
+        // field on a multi-tower checkpoint. `NonNull`: the flag has a
+        // default (`text_embedding`), so every leg states a tower.
+        ("task", Nullable::NonNull),
         ("batch", Nullable::NonNull),
         ("seq", Nullable::NonNull),
         ("lora_rank", Nullable::NonNull),
         ("lora_alpha", Nullable::NonNull),
         ("lora_dropout", Nullable::NonNull),
+        // Issue #421 P1-b(ii): `--lora-init`'s own resolved value. IDENTITY
+        // for the same discriminating-power reason `lora_rank` is — see
+        // `Self::lora_init`'s own doc. `NonNull`: the flag has a default
+        // (`zeros_b`), so every leg states a value; there is no "unknown"
+        // to represent. `ci/scripts/perf/identity_fields.py`'s
+        // `FINETUNE_RUN_IDENTITY_FIELDS` carries the mirror entry at this
+        // SAME position (set-equality pin, docs-ci domain).
+        ("lora_init", Nullable::NonNull),
         // H4a-delta (CONTRACT amendment 2026-08-28): unlike
         // `FinetuneStepTier::margin` (always NonNull, hardcoded Triplet),
         // this tier's `margin` is null exactly when `Objective::Mnrl` was
@@ -2429,8 +2663,28 @@ impl FinetuneRunTier {
         ("grad_accum", Nullable::NonNull),
         ("validation_fraction", Nullable::NonNull),
         ("train_pairs_file_sha256", Nullable::NonNull),
+        // Issue #421 P1-b: the media corpus CONTENT digests. On a media
+        // task the manifest digests above name PATHS only — see
+        // `Self::train_media_sha256`'s own doc. `NullMeans` on a text task
+        // (there the manifest IS the content), so both are also
+        // `FINETUNE_RUN_NULL_IS_A_VALUE_FIELDS` members in
+        // `ci/scripts/perf/identity_fields.py` (docs-ci's mirror).
+        (
+            "train_media_sha256",
+            Nullable::NullMeans(
+                "text task — the train corpus content IS the manifest, digested by \
+                 train_pairs_file_sha256",
+            ),
+        ),
         ("heldout_ids_sha256", Nullable::NonNull),
         ("heldout_pairs_sha256", Nullable::NonNull),
+        (
+            "heldout_media_sha256",
+            Nullable::NullMeans(
+                "text task — the held-out corpus content IS the manifest, digested by \
+                 heldout_pairs_sha256",
+            ),
+        ),
         ("heldout_batch_partition_sha256", Nullable::NonNull),
         ("embedding_loss", Nullable::NonNull),
         ("temperature", Nullable::NullMeans("objective is triplet")),
@@ -2447,12 +2701,26 @@ impl FinetuneRunTier {
     /// `split_rule` (a hardcoded constant), `batched_forward` (a build-time
     /// structural fact), and `steps_measured` (a measured outcome, not a
     /// premise) — none of the three is a genuine comparison determinant;
-    /// see struct doc for the full per-field rationale.
+    /// see struct doc for the full per-field rationale. Grew 10 -> 11 with
+    /// `kernels_disabled_expected` (issue #421 P1-b(i)), a CALLER-declared
+    /// claim in exactly `arm`'s sense — see that field's own doc. Grew
+    /// 11 -> 12 with `fusible_site_census` (issue #421 §D4 item 1), a
+    /// STRUCTURAL property of the build in `batched_forward`'s sense —
+    /// again, see that field's own doc.
     pub const PROVENANCE_FIELDS: &'static [(&'static str, Nullable)] = &[
         ("arm", Nullable::NonNull),
         ("device_name", Nullable::NonNull),
         ("kernels_disabled_requested", Nullable::NonNull),
         ("kernels_disabled_fired", Nullable::NonNull),
+        // Issue #421 P1-b(i): the CALLER-declared `--expect-kernels-disabled`
+        // claim, sorted (`[]` when unclaimed). PROVENANCE for the same
+        // reason `arm` is — see `Self::kernels_disabled_expected`'s own doc.
+        ("kernels_disabled_expected", Nullable::NonNull),
+        // Issue #421 §D4 item 1: the WITNESSED per-forward seam census the
+        // positive-proof equation reads `calls` off. Structural (the
+        // `batched_forward` class), never a measurement and never a
+        // comparison key — see `Self::fusible_site_census`'s own doc.
+        ("fusible_site_census", Nullable::NonNull),
         ("flash_compiled", Nullable::NonNull),
         ("build_features", Nullable::NonNull),
         ("attention_arm", Nullable::NonNull),
@@ -3380,11 +3648,13 @@ mod tests {
     fn sample_finetune_run_tier() -> FinetuneRunTier {
         FinetuneRunTier {
             seed: 42,
+            task: "text_embedding".to_string(),
             batch: 4,
             seq: 64,
             lora_rank: 8,
             lora_alpha: 16.0,
             lora_dropout: 0.05,
+            lora_init: "zeros_b".to_string(),
             margin: Some(0.3),
             target_modules: vec!["Wqkv".to_string()],
             layers_to_transform: None,
@@ -3403,8 +3673,12 @@ mod tests {
             grad_accum: 1,
             validation_fraction: 0.1,
             train_pairs_file_sha256: "c".repeat(64),
+            // `None`: this sample is a TEXT leg (`task: "text_embedding"`),
+            // and both media digests are `NullMeans("text task ...")` there.
+            train_media_sha256: None,
             heldout_ids_sha256: "d".repeat(64),
             heldout_pairs_sha256: "f".repeat(64),
+            heldout_media_sha256: None,
             heldout_batch_partition_sha256: "e".repeat(64),
             embedding_loss: "triplet".to_string(),
             temperature: None,
@@ -3416,6 +3690,17 @@ mod tests {
             device_name: "cpu".to_string(),
             kernels_disabled_requested: Vec::new(),
             kernels_disabled_fired: Vec::new(),
+            kernels_disabled_expected: Vec::new(),
+            // A BERT-shaped witnessed census (2 layers x 6 wrapped arms;
+            // embeddings + 2 norms per layer; one GELU seam call per layer)
+            // — plausible values for the sample, never a claim about any
+            // real checkpoint. The per-tower EXACT-count oracles live in
+            // `jammi-encoders` beside the walk that produces them.
+            fusible_site_census: jammi_encoders::FusibleSiteCensus {
+                lora_sites_wrapped: 12,
+                layer_norms: 5,
+                gelu_seam_calls_per_forward: 2,
+            },
             flash_compiled: jammi_kernels::admission::FLASH_COMPILED,
             build_features: build_features(),
             attention_arm: "fused".to_string(),
@@ -3456,6 +3741,7 @@ mod tests {
             }],
             train_probe_series: vec![0.6, 0.55, 0.5],
             train_run_wall_s: 1.5,
+            media_front_end_wall_s: None,
             mutant_id: None,
             mutant_base_sha: None,
             mutant_patch_sha256: None,
@@ -3527,10 +3813,47 @@ mod tests {
     /// `split_seed`, `batched_forward`, `steps_measured` — 4 removed), plus
     /// `heldout_pairs_sha256` (finding 5(a), 1 added) = 17 + 18 − 4 + 1 = 32,
     /// plus `layers_to_transform` (CONTRACT v2, #356 P1 item 5, 1 added)
-    /// = 33.
+    /// = 33, plus issue #421 P1-b's four (`lora_init`, `task`,
+    /// `train_media_sha256`, `heldout_media_sha256`) = 37.
     #[test]
-    fn finetune_run_tier_identity_fields_cardinality_is_33() {
-        assert_eq!(FinetuneRunTier::IDENTITY_FIELDS.len(), 33);
+    fn finetune_run_tier_identity_fields_cardinality_is_37() {
+        assert_eq!(FinetuneRunTier::IDENTITY_FIELDS.len(), 37);
+    }
+
+    /// Issue #421 P1-b, per-field pin — a bare cardinality assertion goes
+    /// green again if one field is added while another is dropped, so the
+    /// four new entries are named individually, with their declared
+    /// nullability, against the const a run's self-check actually reads.
+    #[test]
+    fn finetune_run_tier_identity_carries_the_421_p1b_fields() {
+        let by_name: std::collections::HashMap<&str, &Nullable> = FinetuneRunTier::IDENTITY_FIELDS
+            .iter()
+            .map(|(name, nullable)| (*name, nullable))
+            .collect();
+        for field in ["lora_init", "task"] {
+            assert_eq!(
+                by_name.get(field),
+                Some(&&Nullable::NonNull),
+                "{field} must be an IDENTITY field declared NonNull"
+            );
+        }
+        for field in ["train_media_sha256", "heldout_media_sha256"] {
+            assert!(
+                matches!(by_name.get(field), Some(Nullable::NullMeans(_))),
+                "{field} must be an IDENTITY field whose null is a STATED value (a text leg has                  no media content to digest), not an absent measurement"
+            );
+        }
+        // The measured front-end timer is NOT identity and NOT provenance —
+        // the same classification every dispatch counter carries.
+        for (name, _) in FinetuneRunTier::IDENTITY_FIELDS
+            .iter()
+            .chain(FinetuneRunTier::PROVENANCE_FIELDS.iter())
+        {
+            assert_ne!(
+                *name, "media_front_end_wall_s",
+                "media_front_end_wall_s is a MEASURED field; naming it in either comparison                  tuple would make two legs at different front-end costs incomparable"
+            );
+        }
     }
 
     /// `PROVENANCE_FIELDS` carries `arm` + `attention_arm` (moved out of
@@ -3538,10 +3861,62 @@ mod tests {
     /// provenance carries (`device_name`, `kernels_disabled_requested`,
     /// `kernels_disabled_fired`, `flash_compiled`, `build_features`), plus
     /// the three unit-63 finding-5(c)/advisory-(d) reclassifications
-    /// (`split_rule`, `batched_forward`, `steps_measured`) = 10.
+    /// (`split_rule`, `batched_forward`, `steps_measured`) = 10, plus
+    /// `kernels_disabled_expected` (issue #421 P1-b(i)) = 11, plus
+    /// `fusible_site_census` (issue #421 §D4 item 1) = 12.
     #[test]
-    fn finetune_run_tier_provenance_fields_cardinality_is_10() {
-        assert_eq!(FinetuneRunTier::PROVENANCE_FIELDS.len(), 10);
+    fn finetune_run_tier_provenance_fields_cardinality_is_12() {
+        assert_eq!(FinetuneRunTier::PROVENANCE_FIELDS.len(), 12);
+        assert!(
+            FinetuneRunTier::PROVENANCE_FIELDS
+                .iter()
+                .any(|(name, nullable)| *name == "kernels_disabled_expected"
+                    && *nullable == Nullable::NonNull),
+            "kernels_disabled_expected is a CALLER-declared claim (arm's class), recorded on              every leg as [] when unclaimed — provenance, never identity"
+        );
+        assert!(
+            FinetuneRunTier::PROVENANCE_FIELDS
+                .iter()
+                .any(|(name, nullable)| *name == "fusible_site_census"
+                    && *nullable == Nullable::NonNull),
+            "fusible_site_census is a STRUCTURAL property of the build (batched_forward's              class), fully determined by the identity fields that already select the model and              the adapter set — provenance, never identity, and never a measurement"
+        );
+        assert!(
+            !FinetuneRunTier::IDENTITY_FIELDS
+                .iter()
+                .any(|(name, _)| *name == "fusible_site_census"),
+            "naming fusible_site_census on IDENTITY_FIELDS would add a comparison key that              cannot differ between two legs whose identity already matches"
+        );
+    }
+
+    /// The witnessed census reaches the emitted JSON under the EXACT three
+    /// field names `ci/scripts/perf/profile_421_merge.py` reads its `calls`
+    /// term from (`lora_sites_wrapped` ↔ `lora_linear_fused`, `layer_norms`
+    /// ↔ `layer_norm_fused`, `gelu_seam_calls_per_forward` ↔
+    /// `gelu_erf_fused`). A rename on either side silently turns every
+    /// downstream positive-proof equation into "no census recorded", which
+    /// that merger treats as a leg-INVALID refusal — correct, but it would
+    /// invalidate a whole sweep after the fact rather than here.
+    #[test]
+    fn fusible_site_census_serializes_under_the_names_the_merger_reads() {
+        let tier = sample_finetune_run_tier();
+        let value = serde_json::to_value(&tier).expect("serialize FinetuneRunTier");
+        let census = value
+            .get("fusible_site_census")
+            .and_then(|v| v.as_object())
+            .expect("fusible_site_census must serialize as a JSON object");
+        assert_eq!(census.len(), 3, "unexpected census shape: {census:?}");
+        for (field, expected) in [
+            ("lora_sites_wrapped", 12),
+            ("layer_norms", 5),
+            ("gelu_seam_calls_per_forward", 2),
+        ] {
+            assert_eq!(
+                census.get(field).and_then(|v| v.as_u64()),
+                Some(expected),
+                "{field} must serialize as a non-negative integer the merger can multiply by                  steps_measured"
+            );
+        }
     }
 
     /// Unit 63 round-7 audit, finding 1: the three mutant-provenance fields

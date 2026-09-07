@@ -333,6 +333,25 @@ impl ClipText {
         self.training
     }
 
+    /// This tower's [`crate::FusibleSiteCensus`], walked off the built stack
+    /// (see that type's own doc for what each field means).
+    ///
+    /// The blocks' own two counts come from `block::fusible_site_counts`,
+    /// shared with the vision tower because both load the identical
+    /// residual-attention block; the ONE norm this tower adds on top is its
+    /// head-side `ln_final`. GELU is `0`: the block MLP's activation is
+    /// `quick_gelu`, which has no fused seam at all, so a training forward
+    /// here takes zero `gelu_erf_fused` decisions.
+    pub(crate) fn fusible_site_census(&self) -> crate::FusibleSiteCensus {
+        let (lora_sites_wrapped, block_layer_norms) = block::fusible_site_counts(&self.blocks);
+        crate::FusibleSiteCensus {
+            lora_sites_wrapped,
+            // + `ln_final`, the one house LayerNorm outside the stack.
+            layer_norms: block_layer_norms + 1,
+            gelu_seam_calls_per_forward: 0,
+        }
+    }
+
     /// Trainable tensors across every LoRA-wrapped site. Empty for a fully
     /// frozen tower.
     pub fn trainable_params(&self) -> Vec<&Tensor> {
@@ -1183,5 +1202,82 @@ mod tests {
             after.to_vec2::<f32>().unwrap(),
             "eval output must be bit-identical across a training toggle round trip"
         );
+    }
+
+    /// #421 P1-a3, the CLIP-text leg — same oracle and rationale as
+    /// `crate::bert::tests::
+    /// fusible_site_census_is_the_exact_per_forward_seam_call_count`, on the
+    /// committed `tiny_open_clip` checkpoint through the REAL builder.
+    ///
+    /// The head-side term is what this leg pins that the vision leg cannot:
+    /// this tower's LayerNorm count is the block stack's `2 * layers` plus
+    /// exactly ONE (`ln_final`), where the vision tower adds two. Both towers
+    /// share `block::fusible_site_counts`, so if that shared helper were the
+    /// whole census, one of the two legs would be wrong by one.
+    ///
+    /// `gelu_seam_calls_per_forward` is a MEASURED zero: this block's MLP
+    /// activation is `quick_gelu`, which has no fused seam, so a training
+    /// forward must leave `gelu_erf_fused` untouched.
+    #[test]
+    fn fusible_site_census_is_the_exact_per_forward_seam_call_count() {
+        // Lock order: attention_cascade THEN layer_norm — see
+        // `crate::htsat_audio`'s own multi-lock test doc.
+        let _attn_guard = crate::attention_cascade::ATTENTION_BLOCK_COUNTER_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let _ln_guard = crate::layer_norm::DISPATCH_COUNTER_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+
+        let device = Device::Cpu;
+        let dir = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("../../tests/fixtures/tiny_open_clip");
+        let raw = std::fs::read_to_string(dir.join("open_clip_config.json"))
+            .expect("read tiny_open_clip config");
+        let json: serde_json::Value = serde_json::from_str(&raw).expect("parse open_clip config");
+        let config = ClipTextConfig::from_open_clip_config(&json).expect("ClipTextConfig");
+        let weights = dir.join("open_clip_model.safetensors");
+        let lora = crate::test_support::AllLinearGaussianLora::new();
+
+        let varmap = VarMap::new();
+        let adapted = ClipText::builder()
+            .lora(lora.config())
+            .build(&[weights.as_path()], &config, &device, &varmap)
+            .expect("build clip_text with an all-linear Gaussian adapter");
+        let mut any = crate::AnyEncoder::ClipText(adapted);
+        let census = crate::test_support::assert_fusible_site_census_is_exact(
+            &mut any,
+            &device,
+            "clip_text/all-linear",
+        );
+
+        let layers = config.layers;
+        assert_eq!(census.lora_sites_wrapped, 4 * layers);
+        assert_eq!(
+            census.layer_norms,
+            2 * layers + 1,
+            "ln_1/ln_2 per block plus the ONE head-side ln_final"
+        );
+        assert_eq!(
+            census.gelu_seam_calls_per_forward, 0,
+            "quick_gelu has no fused seam — this tower never reaches gelu_erf_fused"
+        );
+
+        let frozen_varmap = VarMap::new();
+        let frozen = ClipText::builder()
+            .build(&[weights.as_path()], &config, &device, &frozen_varmap)
+            .expect("build a frozen clip_text");
+        let mut any_frozen = crate::AnyEncoder::ClipText(frozen);
+        let frozen_census = crate::test_support::assert_fusible_site_census_is_exact(
+            &mut any_frozen,
+            &device,
+            "clip_text/frozen",
+        );
+        assert_eq!(
+            frozen_census.lora_sites_wrapped, 0,
+            "a frozen backbone wraps no site and takes no lora_linear_fused decision"
+        );
+        assert_eq!(frozen_census.layer_norms, census.layer_norms);
+        assert_eq!(frozen_census.gelu_seam_calls_per_forward, 0);
     }
 }

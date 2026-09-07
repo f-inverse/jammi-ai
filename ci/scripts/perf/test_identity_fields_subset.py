@@ -419,34 +419,71 @@ class FinetuneRunIdentityFieldsSubsetTests(unittest.TestCase):
             _extract_rust_fields_block(REPORT_RS, _PROVENANCE_FIELDS_BLOCK_RE, "FinetuneRunTier")
         )
 
-    def test_finetune_run_identity_fields_has_exactly_33_entries(self):
+    def test_finetune_run_identity_fields_has_exactly_37_entries(self):
         self.assertEqual(
             len(identity_fields.FINETUNE_RUN_IDENTITY_FIELDS),
-            33,
-            "identity_fields.py::FINETUNE_RUN_IDENTITY_FIELDS must have EXACTLY 33 entries "
+            37,
+            "identity_fields.py::FINETUNE_RUN_IDENTITY_FIELDS must have EXACTLY 37 entries "
             "(unit-63 adversarial-audit finding 5's pinned count of 32 -- the original CONTRACT "
             "H4 35 minus split_rule/split_seed/batched_forward/steps_measured (4 reclassified "
             "out of identity), plus heldout_pairs_sha256 (1 added), 35 - 4 + 1 = 32 -- PLUS issue "
-            "#356 P1 item 5's layers_to_transform (1 added), 32 + 1 = 33, the SAME count "
-            "FinetuneRunTier's own Rust-side test pins). A count other than 33 means either this "
-            "mirror drifted from FinetuneRunTier::IDENTITY_FIELDS or the Rust side itself "
-            "grew/shrank; re-derive from source, never bump to make this test pass.",
+            "#356 P1 item 5's layers_to_transform (1 added), 32 + 1 = 33, PLUS issue #421 P1-b's "
+            "four (lora_init, task, train_media_sha256, heldout_media_sha256 -- the last three "
+            "close K7 holes --task and the media loader opened: the TOWER a leg trained and the "
+            "media corpus CONTENT behind a manifest of paths were both outside the comparison "
+            "tuple), 33 + 4 = 37, the SAME count FinetuneRunTier's own Rust-side test pins). A "
+            "count other than 37 means either this mirror drifted from "
+            "FinetuneRunTier::IDENTITY_FIELDS or the Rust side itself grew/shrank; re-derive "
+            "from source, never bump to make this test pass.",
         )
         self.assertEqual(
             len(set(identity_fields.FINETUNE_RUN_IDENTITY_FIELDS)),
-            33,
+            37,
             "FINETUNE_RUN_IDENTITY_FIELDS contains a duplicate entry",
         )
 
-    def test_rust_provenance_fields_has_exactly_10_entries(self):
+    def test_rust_provenance_fields_has_exactly_12_entries(self):
         self.assertEqual(
             len(self.rust_provenance_fields),
-            10,
-            f"FinetuneRunTier::PROVENANCE_FIELDS ({REPORT_RS}) must have EXACTLY 10 entries "
+            12,
+            f"FinetuneRunTier::PROVENANCE_FIELDS ({REPORT_RS}) must have EXACTLY 12 entries "
             "(CONTRACT H4's original 7 -- arm, device_name, kernels_disabled_requested, "
             "kernels_disabled_fired, flash_compiled, build_features, attention_arm -- plus the "
             "unit-63 adversarial-audit finding-5(c)/advisory-(d) reclassifications split_rule, "
-            f"batched_forward, steps_measured) — got: {sorted(self.rust_provenance_fields)}",
+            "batched_forward, steps_measured, plus issue #421 P1-b(i)'s "
+            "kernels_disabled_expected -- the CALLER-declared --expect-kernels-disabled claim, "
+            "provenance in exactly `arm`'s sense -- plus issue #421 §D4 item 1's "
+            "fusible_site_census, the WITNESSED per-forward seam census the tower profile's "
+            "positive-proof equation reads its `calls` term off: a STRUCTURAL property of the "
+            "build in batched_forward's sense, fully determined by the identity fields that "
+            "already select the model and the adapter set, so provenance and never identity) "
+            "— got: "
+            f"{sorted(self.rust_provenance_fields)}",
+        )
+
+    def test_fusible_site_census_is_provenance_and_never_identity(self):
+        """Issue #421 §D4 item 1, per-field pin: a bare cardinality
+        assertion goes green again if one field is added while another is
+        dropped, so the new entry is named on BOTH sides of the split."""
+        self.assertIn(
+            "fusible_site_census",
+            self.rust_provenance_fields,
+            "the witnessed seam census must be recorded as PROVENANCE on every leg — a leg "
+            "without it cannot support the positive-proof equation at all",
+        )
+        self.assertNotIn(
+            "fusible_site_census",
+            self.rust_identity_fields,
+            "naming the census on IDENTITY_FIELDS would add a comparison key that cannot "
+            "differ between two legs whose identity already matches (it is derived from the "
+            "checkpoint + task + target_modules + layers_to_transform + lora_rank those "
+            "fields already pin), while making a leg from a build without the census "
+            "permanently unpairable with one that has it",
+        )
+        self.assertNotIn(
+            "fusible_site_census",
+            set(identity_fields.FINETUNE_RUN_IDENTITY_FIELDS),
+            "the Python identity mirror must not carry the census either",
         )
 
     def test_finetune_run_identity_fields_equals_the_rust_const(self):
@@ -458,6 +495,30 @@ class FinetuneRunIdentityFieldsSubsetTests(unittest.TestCase):
             f"equal FinetuneRunTier::IDENTITY_FIELDS ({sorted(self.rust_identity_fields)}) "
             "EXACTLY — this tier's identity/provenance split is disjoint, not superset-folded, "
             "so the Python mirror is the WHOLE identity set, never merely a subset of it",
+        )
+
+    def test_finetune_run_identity_fields_matches_the_rust_const_in_ORDER(self):
+        # `FINETUNE_RUN_IDENTITY_FIELDS`'s own inline comments CLAIM position
+        # parity with the Rust const ("same position as the Rust const's own
+        # listing, immediately after `seed`", and three more like it). Set
+        # equality above cannot see that claim: a mirror listing every right
+        # name in a shuffled order passes it while every one of those
+        # comments is false. The claim is worth keeping — the mirror is
+        # reviewed by reading it BESIDE the Rust const, which only works if
+        # the two read down in the same order — so it is pinned here as a
+        # property rather than left as prose. Ordering is never load-bearing
+        # for the comparison itself (both sides are consumed as sets); this
+        # pin exists so the comments stay TRUE.
+        rust_ordered = _extract_rust_fields_block(
+            REPORT_RS, _IDENTITY_FIELDS_BLOCK_RE, "FinetuneRunTier"
+        )
+        self.assertEqual(
+            list(identity_fields.FINETUNE_RUN_IDENTITY_FIELDS),
+            rust_ordered,
+            "identity_fields.py::FINETUNE_RUN_IDENTITY_FIELDS must list the same names in the "
+            "same ORDER as FinetuneRunTier::IDENTITY_FIELDS — a new field appended to the "
+            "Python mirror instead of inserted at the Rust const's own position keeps set "
+            "equality green while making the mirror's own position comments false",
         )
 
     def test_identity_and_provenance_are_disjoint(self):
@@ -492,8 +553,13 @@ class FinetuneRunIdentityFieldsSubsetTests(unittest.TestCase):
 
     def test_objective_selected_nullable_fields_match_rust_null_means(self):
         # Non-vacuity anchor for FINETUNE_RUN_NULL_IS_A_VALUE_FIELDS: the
-        # five fields it names must be EXACTLY the Rust const's own
-        # `Nullable::NullMeans(...)` entries — a set this suite derives from
+        # fields it names must be EXACTLY the Rust const's own
+        # `Nullable::NullMeans(...)` entries — deliberately NOT restated
+        # here as a count, because the property is set EQUALITY against a
+        # set derived from source, and a hand-written count in this comment
+        # is a second copy of that fact that goes stale the moment a field
+        # crosses NonNull/NullMeans (it already had, twice). A set this
+        # suite derives from
         # `report.rs` independently of the hand-written Python frozenset
         # above (regex over the FULL `("field", Nullable::NullMeans...)`
         # tuple, not just the field name), so a field silently moved between

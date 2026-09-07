@@ -1403,9 +1403,38 @@ enum WorkerJobError {
     Failed(String),
 }
 
+/// Render a terminal training failure's message for `record_failed` to
+/// persist as the job's durable `error_message`.
+///
+/// The stored value is the RAW inner message, never pre-fixed with
+/// "Fine-tune error: " here. That prefix is `JammiError::FineTune`'s own
+/// `Display` output, and two callers re-wrap the stored message in a fresh
+/// `JammiError::FineTune` when they read a `failed` job back —
+/// `TrainingJob::wait()` (`training_job.rs`) and the Python binding's
+/// `poll_until_terminal` (`jammi-python/src/job.rs`) — so those two surfaces
+/// each apply the prefix exactly once, on read. Two OTHER surfaces read the
+/// same durable `error_message` unprefixed and never re-wrap it: the gRPC
+/// `TrainingStatus.error` field (`jammi-server/src/grpc/training.rs`) and
+/// the Python `Database.list_training_jobs`/`get_training_job` `error` entry
+/// (`jammi-python/src/database.rs`) both relay the raw column verbatim.
+/// Storing `e.to_string()` unconditionally for a `FineTune`-typed source
+/// error would have `wait()`'s (or `poll_until_terminal`'s) re-wrap double
+/// the prefix verbatim: "Fine-tune error: Fine-tune error: …" reaching a
+/// Python caller as `TrainingError("Fine-tune error: Fine-tune error:
+/// …")`. Stripped to the raw inner message for that one variant here avoids
+/// that double; every other variant's own (DIFFERENT) prefix is preserved
+/// unchanged — "Fine-tune error: Model error: …" is one informative
+/// nesting, not a literal duplicate.
+fn failed_job_message(e: JammiError) -> String {
+    match e {
+        JammiError::FineTune(msg) => msg,
+        other => other.to_string(),
+    }
+}
+
 impl From<JammiError> for WorkerJobError {
     fn from(e: JammiError) -> Self {
-        WorkerJobError::Failed(e.to_string())
+        WorkerJobError::Failed(failed_job_message(e))
     }
 }
 
@@ -1500,7 +1529,7 @@ fn classify(cancel: &AtomicBool, e: JammiError) -> WorkerJobError {
     if cancelled {
         WorkerJobError::Cancelled
     } else {
-        WorkerJobError::Failed(e.to_string())
+        WorkerJobError::Failed(failed_job_message(e))
     }
 }
 
@@ -3993,14 +4022,23 @@ mod tests {
             "must carry the classified OOM guidance, got: {msg}"
         );
 
-        // not cancelled + non-OOM: byte-identical passthrough.
+        // not cancelled + non-OOM: byte-identical passthrough of the RAW
+        // inner message — `failed_job_message` strips `JammiError::FineTune`'s
+        // own "Fine-tune error: " prefix here (see its doc): that prefix is
+        // re-applied on read by `TrainingJob::wait()` and the Python
+        // binding's `poll_until_terminal`, so it must not survive into the
+        // stored `WorkerJobError::Failed` message a second time.
         let cancel = AtomicBool::new(false);
-        let raw = JammiError::FineTune("Encoder forward: CUDA_ERROR_INVALID_PTX".into());
-        let raw_msg = raw.to_string();
+        let raw_inner = "Encoder forward: CUDA_ERROR_INVALID_PTX";
+        let raw = JammiError::FineTune(raw_inner.into());
         let WorkerJobError::Failed(msg) = classify_training_error(&cancel, &config, raw) else {
             panic!("a non-OOM failure must classify as Failed, not Cancelled");
         };
-        assert_eq!(msg, raw_msg, "a non-OOM error must pass through unchanged");
+        assert_eq!(
+            msg, raw_inner,
+            "a non-OOM error must pass through unchanged, minus the redundant \
+             Fine-tune-error prefix"
+        );
     }
 
     /// The lattice cell `classify`'s docstring claims but the composed test

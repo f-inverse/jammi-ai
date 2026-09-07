@@ -1580,8 +1580,11 @@ jobs:
           # the emitted JSONL schema (the exact six TripletRow keys
           # `crates/jammi-bench/src/main.rs` expects), and the width-margin
           # guarantee (every emitted text exceeds --min-wordpieces
-          # whitespace-separated words). Stdlib-only, no network, no
-          # `tokenizers` package required.
+          # whitespace-separated words). It also covers `--heldout-rows`:
+          # the held-out split is id- and text-DISJOINT from train, carries
+          # the same width guarantee, and leaves the train split
+          # byte-identical to a no-held-out run at the same seed.
+          # Stdlib-only, no network, no `tokenizers` package required.
           - name: perf gen_fixed_width_corpus suite
             cmd: python3 ci/scripts/perf/test_gen_fixed_width_corpus.py
           # The two MEDIA corpus producers' own suites (#421 PR B's declared
@@ -1594,8 +1597,13 @@ jobs:
           # inter-family separation the triplet structure claims is asserted
           # MECHANICALLY rather than assumed, and the degenerate corners
           # (`--jitter 0`, a duration rounding to zero frames, one family,
-          # one instance per family) are proven to refuse. Stdlib-only, no
-          # network, no image or audio package.
+          # one instance per family) are proven to refuse. Both also cover
+          # `--heldout-rows`/`--heldout-families`: the held-out split draws
+          # from RESERVED families, so it is id-, file- and family-disjoint
+          # from train, its rows carry the train schema and the pinned
+          # shape/duration, and a held-out request leaves the train media
+          # bytes unchanged. Stdlib-only, no network, no image or audio
+          # package.
           - name: perf gen_fixed_shape_image_corpus suite
             cmd: python3 ci/scripts/perf/test_gen_fixed_shape_image_corpus.py
           - name: perf gen_fixed_length_audio_corpus suite
@@ -1621,6 +1629,42 @@ jobs:
           # executed.
           - name: profile_356_legs.sh dry-run smoke
             cmd: python3 ci/scripts/perf/test_profile_356_legs_dry_run.py
+          # `profile_421_legs.sh`'s own suite (#421 P1-b(vi)), the tower
+          # twin of the leg above and the same doctrine: the shell PRODUCER
+          # runs in CI at least once, zero-execution is RED not a skip. Two
+          # surfaces in one suite — `PROFILE_421_LEGS_DRY_RUN=1` drives the
+          # whole 12-leg sweep through the REAL capture path with hermetic
+          # `$NSYS_BIN`/`$BENCH_BIN` stand-ins (every pinned leg-table
+          # column asserted on BOTH the manifest and the printed command
+          # line), and `PROFILE_421_LEGS_PREFLIGHT_ONLY=1` drives the real,
+          # non-dry preflight probe against a fake bench binary so each
+          # flag the legs depend on (`--expect-kernels-disabled`,
+          # `--lora-init`, `--task`, `--objective`) has its OWN
+          # distinguishable refusal, never one indistinguishable "failed".
+          # That second surface also RUNS all three real corpus producers,
+          # so this leg is where the held-out mode is proven end to end —
+          # it passes only if the committed producers really do emit
+          # `heldout_ids.txt` + `heldout_triplets.jsonl`. No GPU, no
+          # `nsys`, no real checkpoint, no network.
+          - name: profile_421_legs.sh dry-run smoke
+            cmd: python3 ci/scripts/perf/test_profile_421_legs_dry_run.py
+          # `profile_421_merge.py`'s own suite (#421 §D4 items 1, 4, 5 / §D5,
+          # docs-ci) — the tower twin of `ab_merge.py`'s/
+          # `lora_bias_ab_merge.py`'s own wired suites below, same doctrine:
+          # 45 hermetic tests drive the REAL per-key positive-proof equation
+          # (`fused + eager == census × steps_measured`), the D-leg
+          # `--expect-kernels-disabled` zero-delta check, the
+          # `residual = wall − front − busy` sign convention (a negative
+          # residual reports as `overlap_s`, never a leg invalidation), the
+          # `--epochs 1` convention refusal, and `summary.legs_invalid`
+          # exit-0 semantics — against an INDEPENDENT numpy-first oracle
+          # (`_oracle_per_step`), never a value copied out of a prior run.
+          # One test drives the real `profile_421_legs.sh`
+          # `PROFILE_421_P2_BF16=1` dry-run mode into the real merge script,
+          # so the two P2 halves are proven to fit as shipped. No GPU, no
+          # `nsys`, no real checkpoint, no network.
+          - name: profile_421_merge suite
+            cmd: python3 ci/scripts/perf/test_profile_421_merge.py
           # `lora_bias_ab_merge.py`'s own suite (#428 P2b, docs-ci): drives
           # the REAL dispatch-proof/identity/differencing/verdict functions
           # (and `main` itself, end to end, at least once) against synthetic

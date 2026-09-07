@@ -135,8 +135,129 @@ workspace ships every publishable crate at the same
   PCIe: BERT and DistilBERT both ACTIVATE at both measured shapes, per-step wall gains 17.23–30.77%
   (artifact `crates/jammi-kernels/artifacts/cuda-runs/2026-09-05-lora-bias-428-c69dbd7-a100-pcie.json`;
   table and mechanism in `docs/maintainer/fine-tune-performance-guide.md` §4).
+- **A checkable forced-eager premise, a selectable LoRA init, and a directly measured media
+  front end (#421).** `jammi-bench finetune-run --expect-kernels-disabled <keys>` turns a
+  forced-eager leg's premise into a checked one: the run refuses at start unless this flag's value
+  EQUALS this process's real `JAMMI_KERNELS_DISABLE` exactly, and refuses at the end unless no
+  requested disable went unmatched and every named key's fused dispatch counter read zero across
+  the run; either refusal exits non-zero and writes no row. An unlabeled `--arm fused` leg (no
+  `--expect-kernels-disabled` at all) makes NO claim about `JAMMI_KERNELS_DISABLE` — an operator
+  may legitimately run it with OTHER, unrelated op keys disabled, so this binary does not, and
+  must not, refuse it on that basis; the two-sided witness that a `#421` DECISION leg's `fused`
+  side was genuinely unlabeled lives in `ci/scripts/perf/profile_421_legs.sh`'s
+  `_check_no_ambient_disables` and `profile_421_merge.py`'s own A-leg refusal, not in this binary.
+  `--lora-init {zeros_b,gaussian}` selects the adapter initialization — `zeros_b` is the default
+  and byte-identical to what every prior invocation produced, while `gaussian` gives a non-zero
+  gradient into `A` at step 0, which a
+  zero-`B` adapter cannot. The report gains `media_front_end_wall_s`: wall spent in the media
+  decode/preprocess front end, read from the new
+  `jammi_ai::fine_tune::TrainingResult::media_front_end_wall` and summed across a run's
+  resume-cycled epoch legs. Its boundary is declared, not implied, and has exactly one shape — on
+  an `EncoderAdapters` target: decode plus preprocess including the device tensor build those
+  functions perform internally, tower forward excluded, accumulated only in training mode
+  (held-out eval passes excluded, so it is a strict subset of the training wall), `null` rather
+  than `0.0` on a text leg because tokenization is not a media front end. A `ProjectionHead`
+  target never accumulates into this field at all, on any modality: the frozen base's decode,
+  preprocess and forward there are one inseparable call with no seam to time in isolation, so
+  charging it here would give the field a second, incompatible meaning. It is measured directly,
+  never `wall − gpu_busy`, so it does not absorb launch latency, sync stalls and optimizer CPU time
+  into a number labelled "front end". `--task`, `--lora-init` and the media corpora's own content
+  digests (`train_media_sha256`/`heldout_media_sha256`, digests of the bytes behind a manifest
+  that names only paths) join the report's identity tuple; `kernels_disabled_expected` joins its
+  provenance tuple; `media_front_end_wall_s` is in neither.
+- **Held-out splits from the corpus producers (#421).** All three fixed-shape corpus producers
+  (`ci/scripts/perf/gen_fixed_width_corpus.py`, `gen_fixed_shape_image_corpus.py`,
+  `gen_fixed_length_audio_corpus.py`) emit a held-out split on `--heldout-rows`, writing a
+  `heldout_ids.txt` and its own `heldout_triplets.jsonl` beside the train corpus —
+  `finetune-run` requires `--heldout-ids` + `--heldout-jsonl` on every leg, so a corpus without one
+  is not runnable and the producer that owns the corpus now owns the split. The two media producers
+  additionally take `--heldout-batch` (required alongside `--heldout-rows`, refused unless it
+  divides the held-out row count) and `--heldout-families`, which reserves that many of the family
+  pool for the split, making its rows id-, file- and family-disjoint from train; the text
+  producer's split is id- and text-disjoint and carries the same width guarantee. On all three the
+  held-out rows carry the train schema and the corpus's own pinned shape/duration/width, and
+  requesting them leaves the train split byte-identical to a no-held-out run at the same seed.
+- **`AnyEncoder::fusible_site_census`, the witnessed `calls` term for the tower training-step
+  profile's positive-proof equation, and its merge script (#421).** `FusibleSiteCensus`
+  (`crates/jammi-encoders/src/fusible_census.rs`) is total over `AnyEncoder`:
+  `lora_sites_wrapped`, `layer_norms`, `gelu_seam_calls_per_forward`, one per fusible seam
+  (`lora_linear_fused`/`layer_norm_fused`/`gelu_erf_fused`), each WALKED off the built
+  structure rather than derived by config arithmetic, so a family whose built tower diverges
+  from its own config (a declined site, an omitted pre-norm, a stage with no downsample) is
+  answered correctly rather than by formula. Every count is per training forward only — an
+  eval forward contributes `0` to both sides of the profile equation. `FinetuneRunTier` gains
+  `fusible_site_census` as PROVENANCE (captured every epoch, refused if it changes;
+  `PROVENANCE_FIELDS` 11 → 12). `ci/scripts/perf/profile_421_merge.py` (53 hermetic tests)
+  reads its `calls` term from this field and checks `fused + eager == fusible_site_census ×
+  steps_measured` per key, `fused == 0` for every `kernels_disabled_expected` key on a D leg,
+  and computes `residual = wall − front − busy` per step — a negative residual reports as
+  `overlap_s` (front-end work pipelined against a prior step's kernels), never a leg
+  invalidation; an invalid leg exits `0` and is named in `summary.legs_invalid` rather than
+  failing the tool. `steps_measured` counts training forwards only at `--epochs 1
+  --grad-accum 1` (a resume-chained leg at `--epochs > 1` double-counts `global_step`,
+  measured), which every leg and the new `PROFILE_421_P2_BF16=1` driver mode pin; P2 is
+  UNTRACED by design (no `nsys` dependency for a qualitative dtype pre-flight) and is
+  dry-run tested through the real merge script.
 
 ### Changed
+- **HTSAT's MLP and projection GELU reach the fused seam on the training path (#421).** The audio
+  tower's two GELU-erf sites — each Swin block's MLP and the projection head's `"gelu"` arm — call
+  the house seam `activations::gelu_erf(x, training)` instead of `Tensor::gelu_erf()` directly, the
+  same seam the BERT family's FFN uses, so `gelu_erf_fused` is reachable on this tower with no new
+  kernel work. **Eval bytes are unchanged**: the seam's `training == false` arm is the unchanged
+  eager call byte for byte, and no admission machinery runs there at all. In training the
+  fused-vs-eager choice is a counted admission decision on tensor state, never on model identity.
+  The `training` flag is threaded to both sites as a call-chain parameter from
+  `HtsatAudio::set_training`'s single stored flag; the flag-less `HtsatAudioEncoder::forward_spine`
+  and `ClapAudioProjection::forward_unnormalized` remain as eval conveniences defined in terms of
+  their `_with_training(.., false)` twins.
+- **`MaybeLoraLinear` gains a public `is_lora` accessor, plus the narrower
+  `takes_lora_linear_admission` (#421/#467).** `is_lora` answers whether a site carries an
+  adapter (the `Lora` arm) rather than a plain frozen base — deliberately not the same
+  measurement as counting `trainable_params()` (a count of TENSORS, two per adapted site,
+  which reads the same `0` for "no adapter installed" as for "an adapter with an empty A/B
+  pair"); a `true` here does not by itself mean the fused kernel ran, only that the site is
+  an adapted one. `takes_lora_linear_admission` narrows that further to the sites a
+  `lora_linear_fused` call-count census needs — see the `lora_sites_wrapped` entry below for
+  why `is_lora` alone overstates that count on a quantized base.
+- **`HtsatAudioConfig.hidden_act` is validated at load instead of silently ignored (#421).** A
+  checkpoint declaring any value other than `"gelu"` — the only value HF `ClapAudioConfig` ships —
+  is now refused by name at load, through both `HtsatAudio::load` and
+  `HtsatAudio::builder().build(..)`, because the Swin MLP is unconditionally GELU-erf. Such a
+  checkpoint previously loaded and then computed something its own config did not describe.
+  `projection_hidden_act` is unaffected: both its `"gelu"` and `"relu"` arms are genuinely
+  dispatched on at forward.
+- **Four more `HtsatAudioConfig` fields are validated at load instead of silently ignored
+  (#421/#467).** `enable_fusion`, `enable_patch_layer_norm`, `flatten_patch_embeds` and
+  `qkv_bias` were parsed from the HF config and never read again: `HtsatPatchEmbed::forward`
+  unconditionally builds and applies the AFF fusion blend, applies its trailing LayerNorm and
+  flattens the patch grid, and `SwinSelfAttention::load_with` unconditionally builds
+  bias-carrying `query`/`key`/`value` linears, regardless of what any of the four fields
+  declared. Each is now refused at load, through both `HtsatAudio::load` and
+  `HtsatAudio::builder().build(..)`, the same shape as the existing `hidden_act` refusal, if it
+  is anything other than the one value the forward path implements (`true` in all four cases —
+  every shipped `ClapAudioConfig`, including `laion/clap-htsat-fused` and this workspace's own
+  `htsat_clap_tiny` fixture, already declares all four at that value).
+- **`FusibleSiteCensus::lora_sites_wrapped` is now exact on a quantized (QLoRA) base (#421/#467).**
+  `LoraLinear::forward` branches on `FrozenBase::Dense` vs `FrozenBase::Quantized` BEFORE it ever
+  reaches `admit()`, so a `Lora` site over a `FrozenBase::Quantized` base — the shape a QLoRA
+  BERT/DistilBERT/ModernBERT backbone builds for every adapted site — takes NO
+  `lora_linear_fused` admission decision at all, even though `MaybeLoraLinear::is_lora()` still
+  reports it as adapted. `lora_sites_wrapped` previously counted `is_lora()` directly, so it
+  overstated the admission-side count on a QLoRA backbone; every tower's census walk now counts
+  `jammi_lora::MaybeLoraLinear::takes_lora_linear_admission()` (`Lora` whose base is `Dense`)
+  instead, restoring `fused + eager == lora_sites_wrapped × batches` on a quantized base (both
+  sides now `0`).
+- **A failed training job's stored message is no longer double-prefixed (#421).** `TrainingJob::wait()`
+  and the Python binding's `poll_until_terminal` both re-wrap a stored failure in a fine-tune error,
+  whose `Display` already renders the "Fine-tune error: " prefix, so a failure that was itself a
+  fine-tune error came back as `TrainingError("Fine-tune error: Fine-tune error: …")`. The worker now
+  stores the raw inner message for that one variant, so each of those two re-wrapping read sites
+  applies the prefix exactly once; every other variant's own (different) prefix is preserved, since
+  "Fine-tune error: Model error: …" is an informative nesting rather than a duplicate. The gRPC
+  `TrainingStatus.error` field and the Python `Database` job-listing `error` entry read the same
+  durable message unprefixed and never re-wrap it, so they were never part of the double-prefix bug
+  and are unaffected by this change.
 - **Audio encoder-adapters fine-tuning is supported; the refusal is gone (#421).** An
   `audio_embedding` encoder-adapters job on an HF-CLAP checkpoint trains the HTSAT tower instead of
   failing with "LoRA injected inside the audio encoder is not supported. Leave `target_modules`
@@ -254,6 +375,34 @@ workspace ships every publishable crate at the same
   replacing the bare candle `Tensor` error a missing-tensor lookup previously produced. Every other
   LayerNorm call site — any prefix not
   keyed on a literal `LayerNorm` segment — is unchanged.
+- **The #421 profile driver and merger now witness checkpoint identity and close an ambient-env
+  contamination hole on the DECISION legs (unit-467 adversarial audit findings F1/R3).**
+  `ci/scripts/perf/profile_421_legs.sh` refuses before any leg runs if `JAMMI_KERNELS_DISABLE`
+  reaches the DRIVER's own process environment (it must only ever be scoped, per D leg, onto a
+  single child invocation via `env VAR=... cmd`), and a belt-and-braces read of each leg's own
+  report additionally refuses an A leg whose `kernels_disabled_requested` came back non-empty.
+  `_check_expected_disables`'s D-leg witness is now EQUALITY, not a subset: a D leg's report
+  `kernels_disabled_requested` must equal its own `--expect-kernels-disabled` claim exactly, not
+  merely be a superset of it — an extra ambient key beyond the claim was previously undetected
+  and would force-eager an op the leg assumed fused, inflating the D-leg wall and OVERSTATING the
+  realized gain; `profile_421_merge.py` carries the same equality check, on
+  `kernels_disabled_requested` vs. `kernels_disabled_expected`, refused by name before the
+  positive-proof equation ever runs.
+  A new `_checkpoint_identity_probe` refuses a `$MODEL_DIR_CLIP` carrying `config.json`/
+  `model.safetensors` (`arch.rs`'s `Checkpoint::resolve` prefers those over the
+  `open_clip_config.json`/`open_clip_model.safetensors` pair every CLIP leg declares, so such a
+  directory would silently resolve to the wrong architecture family) and a `$MODEL_DIR_CLAP`
+  missing any of `config.json`/`model.safetensors`/`preprocessor_config.json`. Each leg's manifest
+  now records `checkpoint_weights_sha256`/`fusible_site_census` per run (`n`/`m`), and
+  `ci/scripts/perf/profile_421_merge.py` refuses, by name, an A leg whose report witnesses a
+  non-empty disable list, and a per-tower cross-leg (A1/A2/D1/D2, and the P2 bf16 pre-flight when
+  it carries the fields) mismatch of either value — two legs of one tower that measured different
+  checkpoint bytes or built a different encoder are not comparable, whatever their own
+  within-leg checks found. `crates/jammi-bench/tests/finetune_run_media_smoke.rs`'s three
+  real-CLI media legs now drive the SAME full per-tower LoRA site sets the pod legs use and assert
+  the positive-proof equation exactly (all three keys, non-vacuity on `calls`, the GELU seam
+  non-zero on HTSAT / zero on both OpenCLIP towers) rather than witnessing it on tiny_bert/text
+  alone.
 
 ### Breaking
 - `jammi_encoders::{AnyAudioEncoder, AudioEncoder}` are removed

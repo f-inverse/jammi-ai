@@ -24,17 +24,17 @@ impl OutputAdapter for ClassificationAdapter {
                 output.string_outputs.first(),
                 &output.row_status,
                 row_count,
-            )),
+            )?),
             Arc::new(nullify_floats(
                 output.float_outputs.first(),
                 &output.row_status,
                 row_count,
-            )),
+            )?),
             Arc::new(nullify_strings(
                 output.string_outputs.get(1),
                 &output.row_status,
                 row_count,
-            )),
+            )?),
         ])
     }
 }

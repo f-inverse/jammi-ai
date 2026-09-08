@@ -337,48 +337,84 @@ pub(crate) fn create_adapter_for_schema(
 }
 
 // ─── Shared null-handling helpers ────────────────────────────────────────────
+//
+// Both helpers share [`build_prefix_columns`](super::schema::build_prefix_columns)'s
+// refuse-by-name policy: a `values`/`row_status` length that disagrees with the
+// caller's `row_count` is a producer bug, never a per-row default. Defaulting a
+// missing `row_status[i]` to `false` would mark an out-of-range row "errored"
+// instead of surfacing the length mismatch, and letting the emitted column's
+// length be governed by `values.len()` alone — with nothing pinning it to
+// `row_count` — would return a column shorter than the rest of the batch
+// instead of a refusal. `ClassificationAdapter`/`NerAdapter` pass their own
+// `row_count` so this check runs regardless of adapter call order.
 
-/// Build a nullable StringArray: rows where `row_status[i]` is false become null.
+/// Build a nullable StringArray: rows where `row_status[i]` is false become
+/// null. Refuses by name when `values` (if present) or `row_status` disagrees
+/// in length with `row_count` — see the module-level note above.
 pub(crate) fn nullify_strings(
     values: Option<&Vec<String>>,
     row_status: &[bool],
     row_count: usize,
-) -> StringArray {
+) -> Result<StringArray> {
     match values {
-        Some(v) => v
-            .iter()
-            .enumerate()
-            .map(|(i, s)| {
-                if row_status.get(i).copied().unwrap_or(false) {
-                    Some(s.as_str())
-                } else {
-                    None
-                }
-            })
-            .collect(),
-        None => vec![None::<&str>; row_count].into_iter().collect(),
+        Some(v) => {
+            if v.len() != row_count {
+                return Err(JammiError::Inference(format!(
+                    "nullify_strings: values has {} entries, expected one per row ({row_count})",
+                    v.len()
+                )));
+            }
+            if row_status.len() != row_count {
+                return Err(JammiError::Inference(format!(
+                    "nullify_strings: row_status has {} entries, expected one per row \
+                     ({row_count})",
+                    row_status.len()
+                )));
+            }
+            Ok(v.iter()
+                .enumerate()
+                .map(|(i, s)| {
+                    if row_status[i] {
+                        Some(s.as_str())
+                    } else {
+                        None
+                    }
+                })
+                .collect())
+        }
+        None => Ok(vec![None::<&str>; row_count].into_iter().collect()),
     }
 }
 
-/// Build a nullable Float32Array: rows where `row_status[i]` is false become null.
+/// Build a nullable Float32Array: rows where `row_status[i]` is false become
+/// null. Refuses by name when `values` (if present) or `row_status` disagrees
+/// in length with `row_count` — see the module-level note above.
 pub(crate) fn nullify_floats(
     values: Option<&Vec<f32>>,
     row_status: &[bool],
     row_count: usize,
-) -> Float32Array {
+) -> Result<Float32Array> {
     match values {
-        Some(v) => v
-            .iter()
-            .enumerate()
-            .map(|(i, &c)| {
-                if row_status.get(i).copied().unwrap_or(false) {
-                    Some(c)
-                } else {
-                    None
-                }
-            })
-            .collect(),
-        None => vec![None::<f32>; row_count].into_iter().collect(),
+        Some(v) => {
+            if v.len() != row_count {
+                return Err(JammiError::Inference(format!(
+                    "nullify_floats: values has {} entries, expected one per row ({row_count})",
+                    v.len()
+                )));
+            }
+            if row_status.len() != row_count {
+                return Err(JammiError::Inference(format!(
+                    "nullify_floats: row_status has {} entries, expected one per row \
+                     ({row_count})",
+                    row_status.len()
+                )));
+            }
+            Ok(v.iter()
+                .enumerate()
+                .map(|(i, &c)| if row_status[i] { Some(c) } else { None })
+                .collect())
+        }
+        None => Ok(vec![None::<f32>; row_count].into_iter().collect()),
     }
 }
 
@@ -386,6 +422,8 @@ pub(crate) fn nullify_floats(
 
 #[cfg(test)]
 mod tests {
+    use arrow::array::Array;
+
     use super::*;
 
     /// A well-formed 3-row, dim-2 head where row 1 failed. Both accessors
@@ -758,5 +796,121 @@ mod tests {
         )
         .unwrap_err();
         assert!(err.to_string().contains("row_errors"));
+    }
+
+    // -- `nullify_strings` / `nullify_floats` -------------------------------
+    //
+    // `ClassificationAdapter`/`NerAdapter` are the two readers of these
+    // helpers; both pass their own `row_count`, never the length of
+    // `row_status`. Defaulting (`unwrap_or(false)`) every out-of-range row to
+    // "errored" instead of refusing, and leaving a short `values` unchecked
+    // against `row_count` (the emitted column's length coming straight from
+    // `values.len()` instead) are exactly the two smells these tests pin
+    // shut.
+
+    #[test]
+    fn nullify_strings_refuses_a_row_status_shorter_than_row_count() {
+        // Verified by reverting the `row_status.len() != row_count` guard
+        // (restoring `row_status.get(i).copied().unwrap_or(false)`): this
+        // test goes RED — a 3-entry `values` with a 1-entry `row_status`
+        // silently returns `Ok` with rows 1 and 2 defaulted to null instead
+        // of the `Err` asserted below.
+        let values = vec!["a".to_string(), "b".to_string(), "c".to_string()];
+        let row_status = vec![true]; // one entry; row_count is 3
+        let err = nullify_strings(Some(&values), &row_status, 3)
+            .expect_err("a row_status shorter than row_count must be a typed refusal");
+        let msg = err.to_string();
+        assert!(msg.contains("row_status"), "must name the field: {msg}");
+        assert!(
+            msg.contains('1') && msg.contains('3'),
+            "must name both the got (1) and expected (3) lengths: {msg}"
+        );
+    }
+
+    #[test]
+    fn nullify_strings_refuses_values_shorter_than_row_count() {
+        // Verified by removing the `v.len() != row_count` guard: this test
+        // goes RED — `Ok` with a 1-entry column sitting next to the rest of
+        // the batch's 3-entry columns, instead of the `Err` asserted below.
+        let values = vec!["a".to_string()]; // one entry; row_count is 3
+        let row_status = vec![true, true, true];
+        let err = nullify_strings(Some(&values), &row_status, 3)
+            .expect_err("values shorter than row_count must be a typed refusal");
+        let msg = err.to_string();
+        assert!(msg.contains("values"), "must name the field: {msg}");
+        assert!(
+            msg.contains('1') && msg.contains('3'),
+            "must name both the got (1) and expected (3) lengths: {msg}"
+        );
+    }
+
+    #[test]
+    fn nullify_strings_nulls_out_failed_rows_on_the_happy_path() {
+        let values = vec!["a".to_string(), "b".to_string(), "c".to_string()];
+        let row_status = vec![true, false, true];
+        let array = nullify_strings(Some(&values), &row_status, 3)
+            .expect("mutually consistent lengths must not be refused");
+        assert_eq!(array.len(), 3);
+        assert_eq!(array.value(0), "a");
+        assert!(array.is_null(1));
+        assert_eq!(array.value(2), "c");
+    }
+
+    #[test]
+    fn nullify_strings_with_no_values_returns_an_all_null_column_of_row_count() {
+        let row_status = vec![true, false];
+        let array = nullify_strings(None, &row_status, 2).unwrap();
+        assert_eq!(array.len(), 2);
+        assert!(array.is_null(0));
+        assert!(array.is_null(1));
+    }
+
+    #[test]
+    fn nullify_floats_refuses_a_row_status_shorter_than_row_count() {
+        let values = vec![1.0_f32, 2.0, 3.0];
+        let row_status = vec![true]; // one entry; row_count is 3
+        let err = nullify_floats(Some(&values), &row_status, 3)
+            .expect_err("a row_status shorter than row_count must be a typed refusal");
+        let msg = err.to_string();
+        assert!(msg.contains("row_status"), "must name the field: {msg}");
+        assert!(
+            msg.contains('1') && msg.contains('3'),
+            "must name both the got (1) and expected (3) lengths: {msg}"
+        );
+    }
+
+    #[test]
+    fn nullify_floats_refuses_values_shorter_than_row_count() {
+        let values = vec![1.0_f32]; // one entry; row_count is 3
+        let row_status = vec![true, true, true];
+        let err = nullify_floats(Some(&values), &row_status, 3)
+            .expect_err("values shorter than row_count must be a typed refusal");
+        let msg = err.to_string();
+        assert!(msg.contains("values"), "must name the field: {msg}");
+        assert!(
+            msg.contains('1') && msg.contains('3'),
+            "must name both the got (1) and expected (3) lengths: {msg}"
+        );
+    }
+
+    #[test]
+    fn nullify_floats_nulls_out_failed_rows_on_the_happy_path() {
+        let values = vec![1.0_f32, 2.0, 3.0];
+        let row_status = vec![true, false, true];
+        let array = nullify_floats(Some(&values), &row_status, 3)
+            .expect("mutually consistent lengths must not be refused");
+        assert_eq!(array.len(), 3);
+        assert_eq!(array.value(0), 1.0);
+        assert!(array.is_null(1));
+        assert_eq!(array.value(2), 3.0);
+    }
+
+    #[test]
+    fn nullify_floats_with_no_values_returns_an_all_null_column_of_row_count() {
+        let row_status = vec![true, false];
+        let array = nullify_floats(None, &row_status, 2).unwrap();
+        assert_eq!(array.len(), 2);
+        assert!(array.is_null(0));
+        assert!(array.is_null(1));
     }
 }

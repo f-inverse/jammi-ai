@@ -49,11 +49,18 @@ pub fn build_output_schema(
 /// with the batch's row count — a shape bug that only
 /// `RecordBatch::try_new`'s generic length-mismatch error would ever catch,
 /// far from the producer that emitted the disagreeing lengths. This is the
-/// ONE policy applied at every reader of a possibly-short `row_status` /
-/// `row_errors` (this function, [`DistributionAdapter::adapt`](super::adapter::DistributionAdapter),
-/// and [`EmbeddingAdapter::adapt`](super::adapter::EmbeddingAdapter)): refuse
-/// by name the moment either field's length disagrees with the row count,
-/// rather than defaulting a missing entry to some policy-specific value.
+/// ONE policy applied at every reader of a possibly-short `row_status` (and,
+/// where read, `row_errors`): refuse by name the moment a field's length
+/// disagrees with the row count, rather than defaulting a missing entry to
+/// some policy-specific value. Every reader carries it independently —
+/// this function; [`DistributionAdapter::adapt`](super::adapter::DistributionAdapter)
+/// and [`EmbeddingAdapter::adapt`](super::adapter::EmbeddingAdapter), which
+/// also check `row_errors`; and the `nullify_strings`/`nullify_floats`
+/// helpers shared by `ClassificationAdapter` and `NerAdapter`, which check
+/// `values`/`row_status` against the `row_count` each adapter passes them.
+/// None of these readers depends on another reader running first: the
+/// runner building the prefix columns before calling the task adapter is
+/// call ordering, not a safety dependency.
 pub fn build_prefix_columns(
     keys: &ArrayRef,
     source_id: &str,

@@ -171,12 +171,11 @@ mod tests {
     /// refuse on row 1 -- the first row that disagrees with row 0's width
     /// -- without ever sizing a buffer off the unvalidated `dim`.
     ///
-    /// Verified by reverting the split (folding `validate_row_widths` back
-    /// into a loop that calls `Vec::with_capacity(n * dim)` before
-    /// checking any row, as in the pre-fold code): this test's caller in
-    /// `forward_embeddings` would then request a ~4 TB allocation before
-    /// row 1 is ever inspected, aborting the process rather than returning
-    /// the `Err` asserted here.
+    /// Verified by folding `validate_row_widths` back into a loop that calls
+    /// `Vec::with_capacity(n * dim)` before checking any row: this test's
+    /// caller in `forward_embeddings` would then request a ~4 TB allocation
+    /// before row 1 is ever inspected, aborting the process rather than
+    /// returning the `Err` asserted here.
     #[test]
     fn validate_row_widths_refuses_a_ragged_row_before_any_large_allocation() {
         let dim = 1_000_000;
@@ -207,5 +206,58 @@ mod tests {
             },
         ];
         assert!(validate_row_widths(&data, 2).is_ok());
+    }
+
+    /// Caller-level ordering oracle: a SMALL ragged response (row 0 width 2,
+    /// row 1 width 1 — deliberately too small to ever panic or exhaust
+    /// memory on either code path) driven through the public
+    /// `forward_embeddings` entry point, not `validate_row_widths` directly.
+    ///
+    /// `validate_row_widths`'s row/width message (`"row {i} has width {},
+    /// expected {dim}"`) is the ONLY place in `forward_embeddings` that can
+    /// produce that exact text, so asserting it on `forward_embeddings`'s own
+    /// `Err` proves validation ran and its result reached the caller
+    /// unchanged — no output is produced either way, since this is an
+    /// error path.
+    ///
+    /// This also pins that `validate_row_widths` still runs BEFORE the flat
+    /// buffer is built: if `forward_embeddings` were reordered to build the
+    /// buffer first, this fixture's row 1 (width 1) would extend `flat` by
+    /// only its own 1 element, leaving `flat.len() == 3` against the
+    /// expected `rows(2) * dim(2) == 4` — `BackendOutput::single_head`
+    /// would then refuse with ITS length-mismatch message instead
+    /// ("flat buffer has 3 value(s), expected rows*dim (2*2)"), which
+    /// contains neither "row 1" nor "width 1", failing the assertions below.
+    /// Verified by reordering `forward_embeddings` to call
+    /// `validate_row_widths` after building `flat`: this test goes RED (the
+    /// error message no longer names "row 1"/"width 1").
+    #[tokio::test]
+    async fn forward_embeddings_refuses_a_ragged_response_naming_row_and_widths() {
+        let server = wiremock::MockServer::start().await;
+        wiremock::Mock::given(wiremock::matchers::method("POST"))
+            .and(wiremock::matchers::path("/v1/embeddings"))
+            .respond_with(
+                wiremock::ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                    "data": [
+                        {"embedding": [0.1, 0.2]},
+                        {"embedding": [0.3]},
+                    ]
+                })),
+            )
+            .mount(&server)
+            .await;
+
+        let backend = HttpBackend::new(Duration::from_secs(5)).unwrap();
+        let inputs = vec!["a".to_string(), "b".to_string()];
+        let err = backend
+            .forward_embeddings(&server.uri(), &inputs, "model")
+            .await
+            .expect_err("a ragged response must never resolve to a BackendOutput");
+        let msg = err.to_string();
+        assert!(msg.contains("row 1"), "must name the offending row: {msg}");
+        assert!(
+            msg.contains("width 1") && msg.contains("expected 2"),
+            "must name both the row's own width (1) and row 0's width (2): {msg}"
+        );
     }
 }

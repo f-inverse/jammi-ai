@@ -64,12 +64,28 @@ is therefore split into two independent arms:
   OTHER field must also be byte-identical. None of this touches the
   checkout's own `HEAD` at all, so it is unaffected by whatever ref
   happens to be checked out.
-- **Arm (b), only when the caller supplies the unit's own PR head sha**
-  (CI wires this as `JAMMI_CI_UNIT_HEAD_SHA`, empty on a push-to-main
-  checkout): `C` itself must equal that head sha. Any later commit on the
-  PR -- whether or not it touches a file the record already names -- is a
-  named failure, since arm (a) alone cannot see a commit that never
-  touched the artifact file itself.
+- **Arm (b), event-keyed, never a silent empty-string skip:** CI wires
+  `JAMMI_CI_UNIT_HEAD_SHA: ${{ github.event.pull_request.head.sha ||
+  'push' }}` -- the literal string `push` on a push-to-main checkout,
+  never empty. `resolve_unit_head_sha` turns the raw env var into either a
+  full commit sha (arm (b) engages) or `None` (arm (b) is a deliberate
+  no-op): the literal `push` resolves to `None` with a printed notice
+  (the intentional push-to-main skip); an abbreviated sha or a ref name
+  resolves to its full sha via `git rev-parse --verify <v>^{commit}` (so
+  arm (b) compares full-sha-to-full-sha); a value `git` cannot resolve is
+  a named `AssertionError` citing the malformed value itself -- NEVER
+  diagnosed as staleness. Locally (no `JAMMI_CI_FRONTEND_AB_FINAL_
+  FIXTURE_EXPECTED=1`), an empty/unset var also resolves to `None` with a
+  printed notice. Under `JAMMI_CI_FRONTEND_AB_FINAL_FIXTURE_EXPECTED=1`
+  (CI), an empty/unset var is instead a named `AssertionError` -- the
+  matrix's own `|| 'push'` fallback means empty can only be a wiring
+  break, never a legitimate push-to-main checkout (this repo's own
+  zero-execution-is-RED doctrine: a stale artifact with no working env
+  var must never silently pass). Once resolved to a sha, arm (b) asserts
+  `C` itself equals that sha: any later commit on the PR -- whether or
+  not it touches a file the record already names -- is a named failure,
+  since arm (a) alone cannot see a commit that never touched the artifact
+  file itself.
 
 Both arms raise the same named `AssertionError`, "artifact record stale:
 regenerate as the final commit", never a silent pass.
@@ -81,15 +97,22 @@ present with no PR head known still green under (a) alone; a two-parent
 merge commit sitting AT `HEAD` with no PR head known still green under
 (a); and a tampered record -- a file dropped from the committed list --
 red under (a) even with no later commits at all).
+`UnitHeadShaResolutionTests` covers `resolve_unit_head_sha`'s own
+normalisation of the raw `JAMMI_CI_UNIT_HEAD_SHA` env var (the `push`
+sentinel, an empty value under CI vs a bare local run, an unresolvable
+value, and an abbreviated sha) on its own scratch repo, independent of
+`ArtifactRecordFreshnessGateTests`'s repo.
 `RealFixtureRegressionTests.test_committed_artifact_record_is_not_stale`
 then drives arm (a) against the REAL committed pod-p421c artifact, and
-arm (b) whenever `JAMMI_CI_UNIT_HEAD_SHA` is set in the environment.
+arm (b) via `resolve_unit_head_sha` whenever `JAMMI_CI_UNIT_HEAD_SHA` is
+set in the environment.
 
 Run: `python3 ci/scripts/perf/test_frontend_ab_artifact.py`
 """
 
 from __future__ import annotations
 
+import hashlib
 import json
 import math
 import os
@@ -194,6 +217,12 @@ def _git(args: list[str], cwd: Path) -> subprocess.CompletedProcess:
 # history rather than from whatever the checkout's own `HEAD` is.
 # --------------------------------------------------------------------------- #
 STALE_ARTIFACT_RECORD_MESSAGE = "artifact record stale: regenerate as the final commit"
+
+# `ci.yml`'s own matrix entry exports `JAMMI_CI_UNIT_HEAD_SHA: ${{
+# github.event.pull_request.head.sha || 'push' }}` -- see `resolve_unit_
+# head_sha` below for the full normalisation contract.
+_UNIT_HEAD_ENV_VAR = "JAMMI_CI_UNIT_HEAD_SHA"
+_PUSH_SENTINEL = "push"
 
 # The `notes.measured_tip_precedes_merge_tip` keys arm (a) checks against
 # `C`/`C^` directly (never against a fresh-at-HEAD regeneration's own
@@ -320,6 +349,66 @@ def assert_committed_artifact_record_matches_artifact_commit(
             "notes.measured_tip_precedes_merge_tip.{rendered_from_tree_sha,files_changed_since_measured_tip,"
             "diffstat} / measurement diverge between the committed artifact and a fresh regeneration"
         )
+
+
+def resolve_unit_head_sha(raw_value: str | None, repo_root: Path, *, ci_mode: bool) -> str | None:
+    """Normalises the raw `JAMMI_CI_UNIT_HEAD_SHA` env var into either a
+    full commit sha (arm (b), `assert_artifact_commit_is_unit_head`,
+    engages) or `None` (arm (b) is a deliberate no-op) -- reshaped to this
+    repo's own zero-execution-is-RED doctrine so an empty expansion under
+    CI can never silently turn arm (b) off (the round-7 audit's own
+    finding: "arm (b) engages only when non-empty and nothing asserts it
+    ever engaged").
+
+    `ci.yml`'s own matrix entry exports `JAMMI_CI_UNIT_HEAD_SHA: ${{
+    github.event.pull_request.head.sha || 'push' }}`, so under CI the raw
+    value is NEVER legitimately empty -- a push-to-main checkout carries
+    the literal string `push` instead. Four cases:
+
+    - `raw_value` is the literal `'push'`: the push-to-main sentinel --
+      `None` (arm (b) intentionally skipped), with a printed notice so the
+      skip shows up in the test's own stdout rather than disappearing.
+    - `raw_value` is empty/`None` and `ci_mode` is true: a named
+      `AssertionError` citing `JAMMI_CI_UNIT_HEAD_SHA` -- the matrix's own
+      `|| 'push'` fallback means an empty value here can only be a wiring
+      break (e.g. the matrix entry edited to drop the fallback), never a
+      legitimate push-to-main checkout.
+    - `raw_value` is empty/`None` and `ci_mode` is false: a bare local run
+      with the var unset -- `None`, with a printed notice, exactly like
+      the local-run doctrine this module's own top-of-file doc names.
+    - anything else: resolved via `git rev-parse --verify <v>^{commit}` to
+      its FULL sha (a full sha, an abbreviated sha, or a ref name all
+      work identically) so arm (b) always compares full-sha-to-full-sha;
+      a value `git` cannot resolve is a named `AssertionError` citing the
+      malformed value itself -- NEVER folded into `STALE_ARTIFACT_RECORD_
+      MESSAGE`, since an unresolvable env var is a wiring bug, not
+      evidence the artifact is out of date.
+    """
+    if raw_value == _PUSH_SENTINEL:
+        print(f"[frontend_ab_artifact] {_UNIT_HEAD_ENV_VAR}={_PUSH_SENTINEL!r} -- arm (b) intentionally skipped "
+              "(push-to-main checkout, no PR head to compare against)")
+        return None
+    if not raw_value:
+        if ci_mode:
+            raise AssertionError(
+                f"{_UNIT_HEAD_ENV_VAR} is empty/unset -- ci.yml's own matrix entry exports "
+                f"`${{{{ github.event.pull_request.head.sha || '{_PUSH_SENTINEL}' }}}}`, so an empty value here "
+                f"means that export itself broke, never a legitimate push-to-main checkout (which carries the "
+                f"literal string {_PUSH_SENTINEL!r})"
+            )
+        print(f"[frontend_ab_artifact] {_UNIT_HEAD_ENV_VAR} unset -- arm (b) skipped (local run)")
+        return None
+    proc = subprocess.run(
+        ["git", "rev-parse", "--verify", f"{raw_value}^{{commit}}"],
+        cwd=repo_root, capture_output=True, text=True,
+    )
+    if proc.returncode != 0:
+        raise AssertionError(
+            f"{_UNIT_HEAD_ENV_VAR}={raw_value!r} does not resolve to a commit in {repo_root} "
+            f"(`git rev-parse --verify {raw_value}^{{commit}}` failed: {proc.stderr.strip()}) -- refusing by "
+            "name rather than diagnosing this as artifact staleness"
+        )
+    return proc.stdout.strip()
 
 
 def assert_artifact_commit_is_unit_head(artifact_rel_path: str, repo_root: Path, unit_head_sha: str | None) -> None:
@@ -600,6 +689,38 @@ class HappyPathTests(unittest.TestCase):
         self.assertEqual(dev["rendered_from_tree_sha"], self.tip_sha)  # HEAD never moved past tip in this fixture
         self.assertEqual(dev["files_changed_since_measured_tip"], [])
         self.assertEqual(dev["commentary"], "fixture commentary")
+
+    def test_exit_byte_divergence_moves_only_that_legs_hash_and_the_run_hash(self):
+        """Advisory probe (round-7 audit): a divergence confined to a
+        `.exit` file's OWN bytes (`int(exit_text)` still `0` -- a valid
+        leg, never `ArtifactBuildError`'s own `exit_code != 0` refusal)
+        must move `input_sha256[that leg]` -- checked against an
+        INDEPENDENT `hashlib.sha256` oracle, never just "some hash
+        changed" -- and `run_sha256` (the run-wide digest folding every
+        input in), and ONLY that leg's own `.exit` entry: no sibling leg's
+        hash, and no OTHER input (`report_json`/`identity`/`serial_tail`)
+        moves alongside it, so a divergence is traceable to the one leg
+        that actually changed.
+        """
+        before = self._build()
+        exit_path = self.fixture["raw_dir"] / "htsat__base__r1.exit"
+        original_bytes = exit_path.read_bytes()
+        self.assertEqual(original_bytes, b"0")  # exit_code=0, _write_raw_leg's own default
+        exit_path.write_bytes(b"0\n")  # one-byte divergence; int("0\n") == 0, still a valid leg
+        after = self._build()
+
+        leg_key = "raw/htsat__base__r1.exit"
+        self.assertEqual(before["notes"]["input_sha256"][leg_key], hashlib.sha256(original_bytes).hexdigest())
+        self.assertEqual(after["notes"]["input_sha256"][leg_key], hashlib.sha256(b"0\n").hexdigest())
+        self.assertNotEqual(before["notes"]["input_sha256"][leg_key], after["notes"]["input_sha256"][leg_key])
+        self.assertNotEqual(before["notes"]["run_sha256"], after["notes"]["run_sha256"])
+
+        unaffected_keys = before["notes"]["input_sha256"].keys() - {leg_key}
+        for key in unaffected_keys:
+            self.assertEqual(
+                before["notes"]["input_sha256"][key], after["notes"]["input_sha256"][key],
+                msg=f"{key} moved from a divergence confined to {leg_key}",
+            )
 
     def test_legs_present_for_every_tower_role_repeat(self):
         report = self._build()
@@ -895,6 +1016,92 @@ class ArtifactRecordFreshnessGateTests(unittest.TestCase):
             assert_committed_artifact_not_stale(committed, regenerated, "artifact.json", self.root)
         self.assertIn(STALE_ARTIFACT_RECORD_MESSAGE, str(ctx.exception))
         self.assertIn("measurement block is not byte-identical", str(ctx.exception))
+
+
+class UnitHeadShaResolutionTests(unittest.TestCase):
+    """Exercises `resolve_unit_head_sha` -- the normaliser standing between
+    the raw `JAMMI_CI_UNIT_HEAD_SHA` env var and arm (b)
+    (`assert_artifact_commit_is_unit_head`) -- on a small scratch `git
+    init`'d repo, independent of both the real fixture
+    (`RealFixtureRegressionTests`) and `ArtifactRecordFreshnessGateTests`'s
+    own repo. This is the audit's own probe for "arm (b) engages only when
+    non-empty and nothing asserts it ever engaged": every case below
+    either engages arm (b) with a real resolved sha, or explicitly records
+    (via a printed notice, asserted present in no test here -- `stdout` is
+    not captured by this harness, only the return value / raised
+    exception are) that arm (b) was intentionally skipped, or REFUSES by
+    name.
+
+    Scratch-repo scenarios (mirroring the round-7 audit's own table):
+    PR-lane value == `C` -> green; PR-lane value != `C` -> RED (stale
+    message); `push` -> arm (a) only, green; empty under `ci_mode=True` ->
+    RED naming the variable; empty under `ci_mode=False` -> skipped, no
+    RED; `not-a-sha` -> RED naming the malformed input (never the stale
+    message); an abbreviated sha of `C` -> green (resolves to the full
+    sha).
+    """
+
+    def setUp(self):
+        self._tmp = tempfile.TemporaryDirectory()
+        self.root = Path(self._tmp.name)
+        _git(["init", "-q"], self.root)
+        (self.root / "artifact.json").write_text("{}\n", encoding="utf-8")
+        _git(["add", "."], self.root)
+        _git(["commit", "-q", "-m", "C: the artifact's own last commit"], self.root)
+        self.c = _git(["rev-parse", "HEAD"], self.root).stdout.strip()
+        self.c_short = self.c[:8]
+
+    def tearDown(self):
+        self._tmp.cleanup()
+
+    def test_pr_lane_value_equal_to_c_is_green(self):
+        resolved = resolve_unit_head_sha(self.c, self.root, ci_mode=True)
+        self.assertEqual(resolved, self.c)
+        assert_artifact_commit_is_unit_head("artifact.json", self.root, resolved)  # must not raise
+
+    def test_pr_lane_value_not_equal_to_c_is_red_with_stale_message(self):
+        (self.root / "other.txt").write_text("later\n", encoding="utf-8")
+        _git(["add", "other.txt"], self.root)
+        _git(["commit", "-q", "-m", "a later commit that never touches artifact.json"], self.root)
+        later = _git(["rev-parse", "HEAD"], self.root).stdout.strip()
+        resolved = resolve_unit_head_sha(later, self.root, ci_mode=True)
+        self.assertEqual(resolved, later)
+        with self.assertRaises(AssertionError) as ctx:
+            assert_artifact_commit_is_unit_head("artifact.json", self.root, resolved)
+        self.assertIn(STALE_ARTIFACT_RECORD_MESSAGE, str(ctx.exception))
+
+    def test_push_sentinel_skips_arm_b_and_is_green_in_either_mode(self):
+        for ci_mode in (True, False):
+            with self.subTest(ci_mode=ci_mode):
+                resolved = resolve_unit_head_sha("push", self.root, ci_mode=ci_mode)
+                self.assertIsNone(resolved)
+                assert_artifact_commit_is_unit_head("artifact.json", self.root, resolved)  # arm (a)-only, no-op
+
+    def test_empty_value_under_ci_mode_is_red_naming_the_variable(self):
+        for raw_value in ("", None):
+            with self.subTest(raw_value=raw_value):
+                with self.assertRaises(AssertionError) as ctx:
+                    resolve_unit_head_sha(raw_value, self.root, ci_mode=True)
+                self.assertIn(_UNIT_HEAD_ENV_VAR, str(ctx.exception))
+
+    def test_empty_value_outside_ci_mode_skips_arm_b_without_a_red(self):
+        for raw_value in ("", None):
+            with self.subTest(raw_value=raw_value):
+                resolved = resolve_unit_head_sha(raw_value, self.root, ci_mode=False)
+                self.assertIsNone(resolved)
+
+    def test_malformed_value_is_red_naming_the_malformed_input_not_staleness(self):
+        with self.assertRaises(AssertionError) as ctx:
+            resolve_unit_head_sha("not-a-sha", self.root, ci_mode=True)
+        message = str(ctx.exception)
+        self.assertIn("not-a-sha", message)
+        self.assertNotIn(STALE_ARTIFACT_RECORD_MESSAGE, message)
+
+    def test_abbreviated_sha_of_c_resolves_to_full_sha_and_is_green(self):
+        resolved = resolve_unit_head_sha(self.c_short, self.root, ci_mode=True)
+        self.assertEqual(resolved, self.c)
+        self.assertNotEqual(resolved, self.c_short)  # actually normalised, not just accepted verbatim
+        assert_artifact_commit_is_unit_head("artifact.json", self.root, resolved)  # must not raise
 
 
 class RefusalTests(unittest.TestCase):
@@ -1410,8 +1617,6 @@ class RealFixtureRegressionTests(unittest.TestCase):
         self.assertEqual(report["verdict"]["unit_verdict"], "UNRESOLVED")
         self.assertEqual(report["measurement"]["htsat_bar_driver_r"]["verdict"], "UNRESOLVED")
 
-    _UNIT_HEAD_ENV_VAR = "JAMMI_CI_UNIT_HEAD_SHA"
-
     def test_committed_artifact_record_is_not_stale(self):
         """Arms (a) and (b) of `assert_committed_artifact_not_stale` (see
         this module's own doc, "The 'measured tip precedes merge tip'
@@ -1422,13 +1627,18 @@ class RealFixtureRegressionTests(unittest.TestCase):
         at any tip: the committed record is checked directly against `C`
         (the artifact file's own last commit) and `C`'s own parent via git
         plumbing, never against whatever this checkout's own `HEAD`
-        happens to be. Arm (b) additionally engages whenever
-        `JAMMI_CI_UNIT_HEAD_SHA` is set in the environment (`ci.yml`'s own
-        matrix entry exports the PR's own head sha there, via `${{
-        github.event.pull_request.head.sha }}`, empty on a push-to-main
-        checkout) -- green when that sha equals `C`, RED (named) for any
-        other value, since a later, un-rendered commit landed on the unit
-        after the artifact was last regenerated.
+        happens to be. Arm (b) additionally engages once `resolve_unit_
+        head_sha` (see its own docstring) turns `JAMMI_CI_UNIT_HEAD_SHA`
+        into a resolved sha -- `ci.yml`'s own matrix entry exports `${{
+        github.event.pull_request.head.sha || 'push' }}`, so the raw value
+        is either a PR head sha, the literal `push` (arm (b) intentionally
+        skipped), or -- outside CI, when this suite is run by hand with the
+        var unset -- empty (also skipped, never a hard failure). Once
+        engaged, arm (b) is green when the resolved sha equals `C`, RED
+        (named) for any other value, since a later, un-rendered commit
+        landed on the unit after the artifact was last regenerated; an
+        unresolvable (malformed) value is a separate, differently-named RED
+        that never masquerades as staleness.
 
         The committed pod-p421c artifact was regenerated at this unit's own
         final tip with the `.exit`-file fold already in place (see
@@ -1479,7 +1689,9 @@ class RealFixtureRegressionTests(unittest.TestCase):
             serial_tail_path, repo_root, committed["producer"]["invocation"],
         )
         artifact_rel_path = str(committed_path.relative_to(repo_root))
-        unit_head_sha = os.environ.get(self._UNIT_HEAD_ENV_VAR) or None
+        unit_head_sha = resolve_unit_head_sha(
+            os.environ.get(_UNIT_HEAD_ENV_VAR), repo_root, ci_mode=self._ci_expects_real_fixture()
+        )
         assert_committed_artifact_not_stale(
             committed, regenerated, artifact_rel_path, repo_root, unit_head_sha=unit_head_sha
         )

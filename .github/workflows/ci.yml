@@ -1759,14 +1759,21 @@ jobs:
           # whatever this checkout's own HEAD happens to be -- so it is
           # unaffected by `refs/pull/N/merge`'s own synthetic merge commit,
           # or by later, unrelated commits on `main`); arm (b) additionally
-          # engages via `JAMMI_CI_UNIT_HEAD_SHA`, set here to this PR's own
-          # head sha (empty on a push-to-main checkout, where arm (a) alone
-          # applies) -- it asserts the artifact's own last commit IS that
-          # head, so ANY later commit on the PR (whether or not it touches a
-          # file the record already names) reds, named, rather than only the
-          # subset arm (a) alone can see. No GPU, no network.
+          # engages once `resolve_unit_head_sha` (in the test file itself)
+          # normalises `JAMMI_CI_UNIT_HEAD_SHA` -- set here to this PR's own
+          # head sha, falling back to the literal `push` on a push-to-main
+          # checkout (round-7 audit finding: an EMPTY expansion here would
+          # silently turn arm (b) off with nothing asserting it ever
+          # engaged, so the fallback is a literal sentinel, never blank) --
+          # into either a resolved sha (arm (b) engages: the artifact's own
+          # last commit must equal it, so ANY later commit on the PR,
+          # whether or not it touches a file the record already names,
+          # reds named, rather than only the subset arm (a) alone can see)
+          # or `None` (the `push` sentinel; arm (a) alone applies, recorded
+          # via a printed notice in the test's own stdout). No GPU, no
+          # network.
           - name: frontend_ab_artifact suite
-            cmd: JAMMI_CI_FRONTEND_AB_FINAL_FIXTURE_EXPECTED=1 JAMMI_CI_UNIT_HEAD_SHA=${{ github.event.pull_request.head.sha }} python3 ci/scripts/perf/test_frontend_ab_artifact.py
+            cmd: JAMMI_CI_FRONTEND_AB_FINAL_FIXTURE_EXPECTED=1 JAMMI_CI_UNIT_HEAD_SHA=${{ github.event.pull_request.head.sha || 'push' }} python3 ci/scripts/perf/test_frontend_ab_artifact.py
             fetch_depth: "0"
     steps:
       - uses: actions/checkout@v4

@@ -37,21 +37,86 @@ pub(crate) fn lowest_index_result<T>(results: Vec<Result<T>>) -> Result<Vec<T>> 
 /// Extract text from Arrow string columns (handles Utf8, LargeUtf8, and Utf8View).
 /// If multiple columns, concatenate with " " separator.
 /// Null values produce empty strings (caller handles null tracking).
+///
+/// Every column is COLUMN-level validated by `validate_text_column` before
+/// any row is read — a column whose physical type this text task cannot
+/// honestly read is a whole-call refusal naming the column's data type, never
+/// a per-row `""` reading (see that function's doc for why: this mirrors
+/// `fine_tune::worker::extract_string_column`'s policy exactly, closing the
+/// SAME class of confident-wrong-number the trainer already refuses/casts
+/// against).
 pub fn arrow_to_texts(columns: &[ArrayRef]) -> Result<Vec<String>> {
     if columns.is_empty() {
         return Err(JammiError::Inference("No content columns provided".into()));
     }
-    let row_count = columns[0].len();
+    let validated: Vec<ArrayRef> = columns
+        .iter()
+        .map(validate_text_column)
+        .collect::<Result<_>>()?;
+    let row_count = validated[0].len();
     let mut texts = Vec::with_capacity(row_count);
 
     for i in 0..row_count {
-        let parts: Vec<&str> = columns
+        let parts: Vec<&str> = validated
             .iter()
             .filter_map(|col| get_string_value(col, i))
             .collect();
         texts.push(parts.join(" "));
     }
     Ok(texts)
+}
+
+/// Validate a content column's PHYSICAL Arrow type is honestly readable as
+/// text for the caller's embedding/inference call — never per-row, never
+/// silent — mirroring `fine_tune::worker::extract_string_column`'s policy
+/// exactly (the trainer refuses/casts the identical input; this is the same
+/// class reached a second home at serve time, per the training-path fix's
+/// own doc: "one root cause can have a second home").
+///
+/// The string families (`Utf8`/`LargeUtf8`/`Utf8View`) pass through
+/// unchanged. The binary families (`Binary`/`LargeBinary`/`BinaryView`/
+/// `FixedSizeBinary`) are refused OUTRIGHT: `arrow::compute::cast`'s DEFAULT
+/// `safe: true` option turns a value the target type cannot represent into
+/// NULL rather than an error, and [`get_string_value`] reads a null slot as
+/// absent (contributing nothing to the joined text) — so, uncaught, an
+/// image/audio-bytes column submitted under a text task would cast
+/// cell-by-cell into NULLs and every row would silently embed as the empty
+/// string, with `row_status` reading all-ok: a confident wrong answer, not a
+/// refusal. Every OTHER type is cast to `Utf8`; a cast that introduces a
+/// null the source did not have is refused for the identical reason — the
+/// empty string it would otherwise read is fabricated, not a reading of the
+/// caller's data. A row that was ALREADY null keeps the documented `""`
+/// reading (via `get_string_value`'s null check) — a pre-existing
+/// null-handling contract this function does not disturb.
+fn validate_text_column(col: &ArrayRef) -> Result<ArrayRef> {
+    match col.data_type() {
+        DataType::Utf8 | DataType::LargeUtf8 | DataType::Utf8View => Ok(std::sync::Arc::clone(col)),
+        DataType::Binary
+        | DataType::LargeBinary
+        | DataType::BinaryView
+        | DataType::FixedSizeBinary(_) => Err(JammiError::Inference(format!(
+            "text embedding input column has type {dt}, which holds raw binary bytes, \
+                 not text — refusing to silently embed the bytes as an empty string for \
+                 every row",
+            dt = col.data_type()
+        ))),
+        other => {
+            let casted = arrow::compute::cast(col.as_ref(), &DataType::Utf8).map_err(|e| {
+                JammiError::Inference(format!(
+                    "text embedding input column has type {other}, which cannot be cast to \
+                     text: {e}"
+                ))
+            })?;
+            if (0..col.len()).any(|i| casted.is_null(i) && !col.is_null(i)) {
+                return Err(JammiError::Inference(format!(
+                    "text embedding input column has type {other}; casting it to text \
+                     introduced a null value the source column did not have — refusing to \
+                     silently drop data"
+                )));
+            }
+            Ok(casted)
+        }
+    }
 }
 
 /// Extract a string value from any Arrow string-like array type at index `i`.
@@ -110,8 +175,8 @@ pub fn extract_column(
 /// Extract images from an Arrow column.
 ///
 /// Supports two input modes:
-/// - `Utf8` / `LargeUtf8`: values are file paths, loaded from disk.
-/// - `Binary` / `LargeBinary`: values are image bytes, decoded in memory.
+/// - `Utf8` / `LargeUtf8` / `Utf8View`: values are file paths, loaded from disk.
+/// - `Binary` / `LargeBinary` / `BinaryView`: values are image bytes, decoded in memory.
 ///
 /// Null values produce `None` (caller tracks via `row_status`); a row whose
 /// bytes fail to DECODE produces `Some(Err(..))` rather than failing the
@@ -184,6 +249,22 @@ pub fn arrow_to_images(columns: &[ArrayRef]) -> Result<Vec<Option<Result<Dynamic
                 let path = col
                     .as_any()
                     .downcast_ref::<LargeStringArray>()
+                    .map(|a| a.value(i))
+                    .ok_or_else(|| {
+                        JammiError::Inference(format!("Failed to read path at row {i}"))
+                    })?;
+                let bytes = std::fs::read(path).map_err(|e| {
+                    JammiError::Inference(format!("Failed to read image file '{path}': {e}"))
+                })?;
+                (Cow::Owned(bytes), Some(path.to_string()))
+            }
+            // `Utf8View` is the physical layout DataFusion's Parquet scan gives a plain
+            // `Utf8` path column, so it takes the `Utf8` arm's contract exactly: the value
+            // is a file path, an unreadable path fails the whole call, nulls are per-row.
+            DataType::Utf8View => {
+                let path = col
+                    .as_any()
+                    .downcast_ref::<StringViewArray>()
                     .map(|a| a.value(i))
                     .ok_or_else(|| {
                         JammiError::Inference(format!("Failed to read path at row {i}"))
@@ -312,7 +393,7 @@ fn attach_source_path(err: JammiError, kind: &str, row: usize, path: Option<&str
 /// Extract and decode audio clips from an Arrow column.
 ///
 /// Supports two input modes, mirroring [`arrow_to_images`]:
-/// - `Utf8` / `LargeUtf8`: values are file paths, read and decoded from disk.
+/// - `Utf8` / `LargeUtf8` / `Utf8View`: values are file paths, read and decoded from disk.
 /// - `Binary` / `LargeBinary` / `BinaryView`: values are encoded audio bytes
 ///   (WAV/FLAC/MP3/Ogg), decoded in memory.
 ///
@@ -375,6 +456,22 @@ pub fn arrow_to_audio(
                 let path = col
                     .as_any()
                     .downcast_ref::<LargeStringArray>()
+                    .map(|a| a.value(i))
+                    .ok_or_else(|| {
+                        JammiError::Inference(format!("Failed to read path at row {i}"))
+                    })?;
+                let bytes = std::fs::read(path).map_err(|e| {
+                    JammiError::Inference(format!("Failed to read audio file '{path}': {e}"))
+                })?;
+                (Cow::Owned(bytes), Some(path.to_string()))
+            }
+            // `Utf8View` is the physical layout DataFusion's Parquet scan gives a plain
+            // `Utf8` path column, so it takes the `Utf8` arm's contract exactly: the value
+            // is a file path, an unreadable path fails the whole call, nulls are per-row.
+            DataType::Utf8View => {
+                let path = col
+                    .as_any()
+                    .downcast_ref::<StringViewArray>()
                     .map(|a| a.value(i))
                     .ok_or_else(|| {
                         JammiError::Inference(format!("Failed to read path at row {i}"))

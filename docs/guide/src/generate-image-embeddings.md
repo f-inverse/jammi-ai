@@ -43,8 +43,13 @@ db.generate_embeddings(
 
 The image column can be either:
 
-- **Binary** — inline image bytes (PNG, JPEG, TIFF) stored directly in Parquet
-- **Utf8** — file paths pointing to images on disk
+- **`Binary` / `LargeBinary` / `BinaryView`** — inline image bytes (PNG, JPEG, TIFF) stored
+  directly in Parquet
+- **`Utf8` / `LargeUtf8` / `Utf8View`** — file paths pointing to images on disk. `Utf8View` is
+  what a plain Parquet `Utf8` column becomes through a DataFusion scan under this workspace's
+  pinned Arrow/DataFusion versions, so an ordinary registered source's path column takes this
+  arm on the real, unmodified scan output — not just a hand-built array
+  (`arrow_to_images`, `crates/jammi-ai/src/inference/mod.rs:210`).
 
 ## Image preprocessing
 

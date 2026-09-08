@@ -364,6 +364,128 @@ async fn fine_tune_job_lifecycle_and_artifacts() {
     );
 }
 
+/// esc-089: a fine-tuned BERT-family model must serve the SAME adapted model
+/// across a cold restart — a SECOND `InferenceSession` opened over the SAME
+/// on-disk catalog + artifact store, exactly as `tower_adapters.rs`'s own
+/// esc-089 tests do for the three cross-modal towers (see that file's doc for
+/// what "cold restart" simulates and what the assertions catch: a silent
+/// fall-back to the unadapted base would make the cold embedding equal the
+/// base model's, not the warm fine-tuned one).
+#[tokio::test(flavor = "multi_thread")]
+async fn bert_fine_tuned_adapter_serves_cold_after_restart() {
+    let dir = TempDir::new().unwrap();
+    let session = Arc::new(
+        InferenceSession::new(common::test_config(dir.path()))
+            .await
+            .unwrap(),
+    );
+    session
+        .add_source(
+            "training",
+            SourceType::File,
+            SourceConnection {
+                url: Some(common::fixture_url("training_pairs.csv")),
+                format: Some(FileFormat::Csv),
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+    let _worker = jammi_ai::fine_tune::worker::EmbeddedWorker::spawn(&session)
+        .expect("default worker intervals are valid");
+    let model = tiny_bert_model();
+
+    let base_embedding = session
+        .encode_text_query(&model, "quantum computing")
+        .await
+        .unwrap();
+
+    let job = session
+        .fine_tune(
+            "training",
+            &model,
+            &[
+                "text_a".to_string(),
+                "text_b".to_string(),
+                "score".to_string(),
+            ],
+            FineTuneMethod::Lora,
+            ModelTask::TextEmbedding,
+            Some(FineTuneConfig {
+                epochs: 2,
+                batch_size: 8,
+                lora_rank: 4,
+                warmup_steps: 0,
+                ..Default::default()
+            }),
+        )
+        .await
+        .unwrap();
+    job.wait().await.unwrap();
+
+    let warm_embedding = session
+        .encode_text_query(job.model_id(), "quantum computing")
+        .await
+        .expect("the fine-tuned BERT model resolves and serves warm");
+    let warm_diff: f32 = base_embedding
+        .iter()
+        .zip(&warm_embedding)
+        .map(|(a, b)| (a - b).abs())
+        .sum();
+    assert!(
+        warm_diff > 1e-6,
+        "warm fine-tuned embedding should differ from base (LoRA delta should be \
+         non-zero), diff={warm_diff}"
+    );
+
+    // Cold read over a brand-new session pointed at the SAME artifact_dir —
+    // no in-process resolver/model-cache state survives from `session`.
+    let cold_session = Arc::new(
+        InferenceSession::new(common::test_config(dir.path()))
+            .await
+            .unwrap(),
+    );
+    let cold_embedding = cold_session
+        .encode_text_query(job.model_id(), "quantum computing")
+        .await
+        .expect("the fine-tuned BERT model resolves and serves cold");
+
+    let cold_vs_base_diff: f32 = base_embedding
+        .iter()
+        .zip(&cold_embedding)
+        .map(|(a, b)| (a - b).abs())
+        .sum();
+    assert!(
+        cold_vs_base_diff > 1e-6,
+        "cold fine-tuned embedding must differ from base — a cold restart silently \
+         served the unadapted base model, diff={cold_vs_base_diff}"
+    );
+    for (i, (a, b)) in warm_embedding.iter().zip(&cold_embedding).enumerate() {
+        assert_eq!(
+            a.to_bits(),
+            b.to_bits(),
+            "component {i} differs bit-for-bit between the warm and cold reads \
+             (warm {a}, cold {b}) — the cold session is not running the same adapter \
+             the warm session trained"
+        );
+    }
+
+    const PROBE: &str = "quantum computing";
+    common::assert_esc089_cold_restart_controls(common::Esc089ColdRestartControls {
+        session_root: dir.path(),
+        warm_session: &session,
+        cold_session: &cold_session,
+        model_id: job.model_id(),
+        label: "bert fine-tuned",
+        v_base: &base_embedding,
+        v_warm: &warm_embedding,
+        v_cold: &cold_embedding,
+        serve_base: &common::text_serve(model.clone(), PROBE),
+        serve_tuned: &common::text_serve(job.model_id().to_string(), PROBE),
+    })
+    .await;
+}
+
 // ─── Per-epoch adapter checkpoints (unit 348) ──────────────────────────────
 //
 // Round-2 reshape (F3): `keep_last_n_checkpoints` is DISABLED BY DEFAULT.
@@ -2576,30 +2698,38 @@ async fn cancelled_run_reclaims_epoch_checkpoints_that_actually_existed() {
 // tokio's separate blocking pool, but the warn under test fires from
 // `publish_and_finalize`, back on the single async thread, not from inside
 // that closure).
-/// PROBE a `chmod 0o555`'d directory for a real write-block: root (and a
-/// mode-ignoring filesystem) can write through it regardless, in which case
-/// the caller's failed-prune fault-injection premise never exists and it
-/// must skip loudly rather than assert against a fault that was never
-/// injected. Unless `JAMMI_REQUIRE_POSIX_PERMS` is set (the lane that is
-/// SUPPOSED to run unprivileged with real POSIX permission enforcement), in
-/// which case a bypassed chmod is itself a hard failure, never a silent
-/// skip — the same require-gate polarity every other `JAMMI_REQUIRE_*`
-/// skip-guard in this crate carries, applied to a filesystem-privilege
-/// probe instead of a hardware one.
+/// The require-gate polarity every `chmod` permission-fault probe in this
+/// suite shares (esc-089 F1): `probe` performs the fault-injection premise
+/// check itself — "can this process still read/write through a chmod'd
+/// path?" — and returns `true` if the fault was BYPASSED (root, or a
+/// mode-ignoring filesystem). A bypass is normally a loud, `eprintln`'d skip:
+/// the fault-injection premise the caller needs simply does not hold on this
+/// host. But under `JAMMI_REQUIRE_POSIX_PERMS=1` (the CI lane that is
+/// SUPPOSED to run unprivileged with real POSIX permission enforcement) a
+/// bypass is instead a hard `panic!` — silently returning `true` in that lane
+/// would let a permission-fault regression go completely uncaught.
+///
+/// This is a thin local wrapper of the same canonical shape carried by every
+/// other `chmod`/permission-fault probe in this crate (`ci/kernel-oracle-
+/// helpers.txt`'s KO-7 registry is `(file, fn)`-scoped: a shared helper
+/// defined in `common/mod.rs` cannot be registered for a call site in a
+/// DIFFERENT file, so each file that needs this polarity carries its own
+/// copy rather than delegating).
+///
+/// Returns `true` if the caller must restore permissions and skip; `false` if
+/// the fault was genuinely injected and the test should proceed.
 #[cfg(unix)]
-fn chmod_bypassed(dir: &std::path::Path) -> bool {
-    let probe = dir.join(".root_probe");
-    let bypassed = std::fs::write(&probe, b"x").is_ok();
+fn chmod_bypassed(test_name: &str, probe: impl FnOnce() -> bool) -> bool {
+    let bypassed = probe();
     if bypassed {
-        let _ = std::fs::remove_file(&probe);
         if std::env::var_os("JAMMI_REQUIRE_POSIX_PERMS").is_some() {
             panic!(
-                "JAMMI_REQUIRE_POSIX_PERMS is set but the process could write through a \
-                 0o555-chmod'd directory (root, or a mode-ignoring filesystem) — the \
-                 failed-prune fault-injection premise this test needs does not hold; a silent \
-                 skip is not acceptable here"
+                "JAMMI_REQUIRE_POSIX_PERMS is set but '{test_name}' could not inject its \
+                 permission fault (root, or a mode-ignoring filesystem) — the fault-injection \
+                 premise this test needs does not hold; a silent skip is not acceptable here"
             );
         }
+        eprintln!("{test_name}: chmod bypassed (root?) — skipping");
     }
     bypassed
 }
@@ -2728,13 +2858,20 @@ async fn finalize_reclaims_a_persistently_failed_prune_and_warns() {
     // convention this batch applies in candle.rs's device_tests too). The
     // run is aborted rather than awaited: nothing below is meaningful
     // without the injected fault.
-    if chmod_bypassed(&epoch0_dir) {
+    let probe = epoch0_dir.join(".root_probe");
+    let bypassed = chmod_bypassed(
+        "finalize_reclaims_a_persistently_failed_prune_and_warns",
+        || {
+            let ok = std::fs::write(&probe, b"x").is_ok();
+            if ok {
+                let _ = std::fs::remove_file(&probe);
+            }
+            ok
+        },
+    );
+    if bypassed {
         let _ = std::fs::set_permissions(&epoch0_dir, std::fs::Permissions::from_mode(0o755));
         handle.abort();
-        eprintln!(
-            "finalize_reclaims_a_persistently_failed_prune_and_warns: skipping — fault \
-             injection unavailable: process can write despite chmod (root?)"
-        );
         return;
     }
 

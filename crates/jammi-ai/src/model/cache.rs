@@ -10,7 +10,7 @@ use super::backend::candle::CandleBackend;
 use super::backend::ort::OrtBackend;
 use super::backend::{DeviceConfig, ModelBackend};
 use super::resolver::ModelResolver;
-use super::{BackendType, LoadedModel, ModelGuard, ModelId, ModelSource, ModelTask};
+use super::{BackendType, LoadedModel, ModelGuard, ModelId, ModelSource, ModelTask, ResolvedModel};
 use crate::concurrency::{GpuPermit, GpuScheduler};
 
 /// Where a cached model currently resides.
@@ -490,6 +490,131 @@ impl ModelCache {
         backend.load(&resolved, &self.device_config)
     }
 
+    /// Complete a generic (plain local/HuggingFace, or `"embedding"`
+    /// FK-placeholder) catalog row's registration after a successful load.
+    /// Store the parent directory of the first weights file so that
+    /// `build_encoder_adapters` can locate config.json and tokenizer.json.
+    ///
+    /// Split out of [`Self::do_load`] so this catalog-only read/write
+    /// mechanism can be driven directly by a test — independent of an
+    /// actual model resolve/load — for both the type-gate (esc-089 block 1)
+    /// and the read-failure fail-closed behaviour (esc-089 block 2) below.
+    ///
+    /// esc-089: this bookkeeping write must never touch a catalog row a
+    /// TERMINAL producer already committed with its own artifact/lineage
+    /// pointer. `source_str` can also name a fine-tuned model, an epoch
+    /// checkpoint, or a context-predictor — `ModelSource::parse`'s
+    /// fallback maps any string without a `local:`/`file://` prefix to
+    /// `HuggingFace`, so a fine-tuned id like `jammi:fine-tuned:{uuid}`
+    /// parses exactly like a real HF Hub repo id would. Registering it here
+    /// unconditionally, with `model_type: "huggingface"`, `base_model_id:
+    /// None`, and THIS resolve's already-adapted result's underlying BASE
+    /// weights directory as `artifact_path`, used to silently overwrite that
+    /// row: `model_type` is unconditional in `register_model`'s `ON
+    /// CONFLICT` clause, and a non-null `artifact_path` wins the
+    /// `COALESCE`, so both the served-adapter pointer and the
+    /// `base_model_id` lineage (folded into the clobbered `metadata` blob)
+    /// were lost right after a successful fine-tuned load. A cold restart's
+    /// `ModelResolver::try_catalog_lookup` then read the corrupted row as an
+    /// ordinary already-resolved local model and served the unadapted base
+    /// with no signal — the very failure this doc exists to prevent.
+    ///
+    /// `model_type` is an open TEXT domain: `"fine-tuned"`,
+    /// `"context-predictor"`, `"bert"`, `"distilbert"`, `"modernbert"`,
+    /// `"open_clip"`, `"clap_audio_model"` and any future architecture id
+    /// `EncoderFamily::adapter_model_type` mints all live in this same
+    /// column. A DENYLIST of the terminal types to protect fails open on
+    /// every one of those: an unenumerated type (or a typo, or a type this
+    /// crate has not been taught about yet) falls through and gets
+    /// rewritten. So this is an ALLOWLIST of the generic, non-terminal
+    /// kinds this call exists to COMPLETE, never a denylist of the
+    /// terminal ones to protect: only a plain `"local"`/`"huggingface"` row
+    /// (this call's own prior write, safe to refresh idempotently) or an
+    /// `"embedding"` placeholder row (the FK-satisfying pre-registration
+    /// `Session::submit_fine_tune_spec`/`ContextPredictor` write before the
+    /// base model is ever loaded, always `artifact_path: None`, meant to be
+    /// completed by this exact call) — or no row at all yet — may be
+    /// written here. Every other type, enumerated or not, is left
+    /// untouched; this call's own params already never carry a
+    /// `base_model_id` or an `artifact_path` other than the ones it
+    /// produces itself, so completing one of these rows can never clobber
+    /// a value some other producer wrote.
+    async fn complete_generic_registration(
+        &self,
+        source: &ModelSource,
+        source_str: &str,
+        resolved: &ResolvedModel,
+        task: ModelTask,
+    ) {
+        const GENERIC_COMPLETABLE_TYPES: &[&str] = &["local", "huggingface", "embedding"];
+        // esc-089: a catalog READ error is not "no row" — collapsing it to
+        // `None` (via `.ok().flatten()`) used to fall through to the write
+        // below and could clobber a row this call never actually inspected.
+        // This bookkeeping is best-effort (a `register_model` failure already
+        // only `warn!`s and keeps serving), so a read failure fails closed:
+        // skip the write entirely rather than guess the row is absent.
+        match self
+            .resolver
+            .catalog()
+            .get_model_version(source_str, 1)
+            .await
+        {
+            Err(e) => {
+                tracing::warn!(
+                    model_id = %source_str,
+                    "Failed to read catalog row before load bookkeeping ({e}); skipping \
+                     best-effort registration rather than writing over a row this call \
+                     could not inspect"
+                );
+            }
+            Ok(existing) => {
+                let can_complete = existing
+                    .as_ref()
+                    .is_none_or(|r| GENERIC_COMPLETABLE_TYPES.contains(&r.model_type.as_str()));
+                if !can_complete {
+                    tracing::debug!(
+                        model_id = %source_str,
+                        model_type = existing.as_ref().map(|r| r.model_type.as_str()).unwrap_or(""),
+                        "skipping generic load-bookkeeping registration: this id is already a \
+                         catalog-managed record of a different kind"
+                    );
+                } else {
+                    let backend_str = format!("{:?}", resolved.backend).to_lowercase();
+                    let model_type = match source {
+                        ModelSource::HuggingFace(_) => "huggingface",
+                        ModelSource::Local(_) => "local",
+                    };
+                    let artifact_dir_str: Option<String> = resolved
+                        .weights_paths
+                        .first()
+                        .and_then(|p| p.parent())
+                        .and_then(|p| p.to_str())
+                        .map(|s| s.to_owned());
+                    if let Err(e) = self
+                        .resolver
+                        .catalog()
+                        .register_model(RegisterModelParams {
+                            model_id: source_str,
+                            version: 1,
+                            model_type,
+                            backend: &backend_str,
+                            task,
+                            base_model_id: None,
+                            artifact_path: artifact_dir_str.as_deref(),
+                            config_json: None,
+                        })
+                        .await
+                    {
+                        tracing::warn!(
+                            model_id = %source_str,
+                            "Failed to register model in catalog: {e}"
+                        );
+                    }
+                }
+            }
+        }
+    }
+
     async fn do_load(
         &self,
         id: &ModelId,
@@ -621,36 +746,10 @@ impl ModelCache {
         let loaded = backend.load(&resolved, &self.device_config)?;
 
         // Register model in catalog (idempotent — ignores if already registered).
-        // Store the parent directory of the first weights file so that
-        // `build_encoder_adapters` can locate config.json and tokenizer.json.
-        let backend_str = format!("{:?}", resolved.backend).to_lowercase();
-        let model_type = match source {
-            ModelSource::HuggingFace(_) => "huggingface",
-            ModelSource::Local(_) => "local",
-        };
-        let artifact_dir_str: Option<String> = resolved
-            .weights_paths
-            .first()
-            .and_then(|p| p.parent())
-            .and_then(|p| p.to_str())
-            .map(|s| s.to_owned());
-        if let Err(e) = self
-            .resolver
-            .catalog()
-            .register_model(RegisterModelParams {
-                model_id: &source_str,
-                version: 1,
-                model_type,
-                backend: &backend_str,
-                task,
-                base_model_id: None,
-                artifact_path: artifact_dir_str.as_deref(),
-                config_json: None,
-            })
-            .await
-        {
-            tracing::warn!(model_id = %source_str, "Failed to register model in catalog: {e}");
-        }
+        // See `Self::complete_generic_registration`'s own doc for the full
+        // esc-089 contract this call must uphold.
+        self.complete_generic_registration(source, &source_str, &resolved, task)
+            .await;
 
         let mut cache = self.inner.write().await;
         let ref_count = Arc::new(AtomicUsize::new(1));
@@ -1661,5 +1760,392 @@ mod admission_wake_tests {
             "B occupies the entire 1-model budget after evicting the now-idle M1"
         );
         drop(guard_b);
+    }
+}
+
+// ── esc-089 (adversarial audit at bd1d7986): the load-bookkeeping write is an
+//    ALLOWLIST of the generic rows it may complete, fails CLOSED on a catalog
+//    read error, and never overwrites a row a terminal producer already owns
+//    ──
+
+#[cfg(test)]
+mod esc_089_bookkeeping_tests {
+    use super::*;
+
+    use jammi_db::catalog::model_repo::RegisterModelParams;
+    use jammi_db::catalog::Catalog;
+    use jammi_db::storage::{StorageRegistry, StorageUrl};
+    use jammi_db::store::ArtifactStore;
+
+    fn device_config() -> DeviceConfig {
+        DeviceConfig {
+            gpu_device: -1,
+            memory_fraction: 1.0,
+            require_gpu: false,
+            compute_precision: jammi_numerics::ComputePrecision::F32,
+        }
+    }
+
+    fn test_artifact_store() -> Arc<ArtifactStore> {
+        let cache_dir = tempfile::tempdir().unwrap().keep();
+        Arc::new(
+            ArtifactStore::with_root(
+                StorageUrl::memory("esc-089-test-artifacts"),
+                StorageRegistry::new(),
+                cache_dir,
+            )
+            .unwrap(),
+        )
+    }
+
+    /// A minimal, fabricated `ResolvedModel` — `complete_generic_registration`
+    /// only reads `resolved.backend` and `resolved.weights_paths`, so this
+    /// never needs a real resolve/load to drive its mechanism directly.
+    fn fake_resolved(model_id: &str, weights_dir: &std::path::Path) -> ResolvedModel {
+        ResolvedModel {
+            model_id: ModelId(model_id.to_string()),
+            backend: BackendType::Candle,
+            weights_format: super::super::WeightsFormat::Safetensors,
+            task: ModelTask::TextEmbedding,
+            config_path: weights_dir.join("config.json"),
+            weights_paths: vec![weights_dir.join("model.safetensors")],
+            tokenizer: None,
+            model_config: serde_json::json!({}),
+            preprocessor_config: None,
+            pooling_config: None,
+            base_model_id: None,
+            adapter_path: None,
+            estimated_memory: 1,
+        }
+    }
+
+    fn new_cache(catalog: Arc<Catalog>) -> ModelCache {
+        let resolver = ModelResolver::new(catalog, test_artifact_store()).unwrap();
+        ModelCache::new(
+            resolver,
+            device_config(),
+            Arc::new(GpuScheduler::new_unlimited()),
+        )
+    }
+
+    /// BLOCK 1, the audit's own probe: a pre-registered `"open_clip"` row
+    /// (a real, live `model_type` — `EncoderFamily::adapter_model_type`)
+    /// carrying its OWN pointers must survive `complete_generic_registration`
+    /// byte-for-byte. Revert the allowlist back to the old
+    /// `PROTECTED_MODEL_TYPES` denylist (`&["fine-tuned", "context-predictor",
+    /// "checkpoint"]`) to see this go RED: `"open_clip"` is not in that
+    /// denylist, so the old code falls through and rewrites `model_type` to
+    /// `"local"`, clobbering `base_model_id` and `artifact_path`.
+    #[tokio::test]
+    async fn open_clip_row_survives_generic_bookkeeping_byte_for_byte() {
+        let tmp = tempfile::tempdir().unwrap();
+        let catalog_dir = tempfile::tempdir().unwrap();
+        let catalog = Arc::new(Catalog::open(catalog_dir.path()).await.unwrap());
+        let model_id = "open-clip-probe-model";
+
+        catalog
+            .register_model(RegisterModelParams {
+                model_id,
+                version: 1,
+                model_type: "open_clip",
+                backend: "candle",
+                task: ModelTask::ImageEmbedding,
+                base_model_id: Some("audit-owned-base"),
+                artifact_path: Some("/audit/owned/artifact/prefix"),
+                config_json: Some("{\"audit\":true}"),
+            })
+            .await
+            .unwrap();
+        let before = catalog.get_model(model_id).await.unwrap().unwrap();
+
+        let cache = new_cache(Arc::clone(&catalog));
+        let resolved = fake_resolved(model_id, tmp.path());
+        cache
+            .complete_generic_registration(
+                &ModelSource::hf(model_id),
+                model_id,
+                &resolved,
+                ModelTask::TextEmbedding,
+            )
+            .await;
+
+        let after = catalog.get_model(model_id).await.unwrap().unwrap();
+        assert_eq!(
+            after.model_type, before.model_type,
+            "model_type must survive untouched"
+        );
+        assert_eq!(
+            after.base_model_id, before.base_model_id,
+            "base_model_id lineage must survive untouched"
+        );
+        assert_eq!(
+            after.artifact_path, before.artifact_path,
+            "artifact_path pointer must survive untouched"
+        );
+        assert_eq!(
+            after.config_json, before.config_json,
+            "config_json must survive untouched"
+        );
+        assert_eq!(
+            after.backend, before.backend,
+            "backend must survive untouched"
+        );
+        assert_eq!(after.task, before.task, "task must survive untouched");
+    }
+
+    /// BLOCK 1, general case: an entirely UNENUMERATED `model_type` — not one
+    /// of the specific architecture ids the audit named, just some future or
+    /// unrecognised string — must ALSO survive. This is what makes the fix
+    /// an allowlist rather than a denylist with more names added: the old
+    /// `PROTECTED_MODEL_TYPES` denylist protects only what someone thought to
+    /// enumerate, so a truly novel type would fail open on it exactly like
+    /// `"open_clip"` did.
+    #[tokio::test]
+    async fn wholly_unenumerated_model_type_survives_generic_bookkeeping() {
+        let tmp = tempfile::tempdir().unwrap();
+        let catalog_dir = tempfile::tempdir().unwrap();
+        let catalog = Arc::new(Catalog::open(catalog_dir.path()).await.unwrap());
+        let model_id = "unknown-type-probe-model";
+
+        catalog
+            .register_model(RegisterModelParams {
+                model_id,
+                version: 1,
+                model_type: "some-future-architecture-nobody-enumerated-yet",
+                backend: "candle",
+                task: ModelTask::TextEmbedding,
+                base_model_id: Some("some-base"),
+                artifact_path: Some("/some/owned/prefix"),
+                config_json: None,
+            })
+            .await
+            .unwrap();
+        let before = catalog.get_model(model_id).await.unwrap().unwrap();
+
+        let cache = new_cache(Arc::clone(&catalog));
+        let resolved = fake_resolved(model_id, tmp.path());
+        cache
+            .complete_generic_registration(
+                &ModelSource::hf(model_id),
+                model_id,
+                &resolved,
+                ModelTask::TextEmbedding,
+            )
+            .await;
+
+        let after = catalog.get_model(model_id).await.unwrap().unwrap();
+        assert_eq!(after.model_type, before.model_type);
+        assert_eq!(after.base_model_id, before.base_model_id);
+        assert_eq!(after.artifact_path, before.artifact_path);
+    }
+
+    /// BLOCK 1, positive case: a plain `"local"` row (this call's own prior
+    /// write) IS completed — the allowlist must not become so conservative
+    /// that it stops doing the one thing this bookkeeping exists for.
+    #[tokio::test]
+    async fn local_row_is_completed() {
+        let tmp = tempfile::tempdir().unwrap();
+        let catalog_dir = tempfile::tempdir().unwrap();
+        let catalog = Arc::new(Catalog::open(catalog_dir.path()).await.unwrap());
+        let model_id = "local-completion-probe-model";
+
+        catalog
+            .register_model(RegisterModelParams {
+                model_id,
+                version: 1,
+                model_type: "local",
+                backend: "candle",
+                task: ModelTask::TextEmbedding,
+                base_model_id: None,
+                artifact_path: None,
+                config_json: None,
+            })
+            .await
+            .unwrap();
+
+        let cache = new_cache(Arc::clone(&catalog));
+        let resolved = fake_resolved(model_id, tmp.path());
+        cache
+            .complete_generic_registration(
+                &ModelSource::local(tmp.path()),
+                model_id,
+                &resolved,
+                ModelTask::TextEmbedding,
+            )
+            .await;
+
+        let after = catalog.get_model(model_id).await.unwrap().unwrap();
+        assert_eq!(after.model_type, "local");
+        assert_eq!(
+            after.artifact_path.as_deref(),
+            Some(tmp.path().to_str().unwrap()),
+            "a plain local row must be completed with the resolved weights directory"
+        );
+    }
+
+    /// BLOCK 1, positive case: the `"embedding"` FK placeholder
+    /// (`Session::submit_fine_tune_spec`'s pre-registration, always
+    /// `artifact_path: None` before the base model is ever loaded) IS
+    /// completed by this call.
+    #[tokio::test]
+    async fn embedding_placeholder_is_completed() {
+        let tmp = tempfile::tempdir().unwrap();
+        let catalog_dir = tempfile::tempdir().unwrap();
+        let catalog = Arc::new(Catalog::open(catalog_dir.path()).await.unwrap());
+        let model_id = "embedding-placeholder-probe-model";
+
+        catalog
+            .register_model(RegisterModelParams {
+                model_id,
+                version: 1,
+                model_type: "embedding",
+                backend: "candle",
+                task: ModelTask::TextEmbedding,
+                base_model_id: None,
+                artifact_path: None,
+                config_json: None,
+            })
+            .await
+            .unwrap();
+
+        let cache = new_cache(Arc::clone(&catalog));
+        let resolved = fake_resolved(model_id, tmp.path());
+        cache
+            .complete_generic_registration(
+                &ModelSource::local(tmp.path()),
+                model_id,
+                &resolved,
+                ModelTask::TextEmbedding,
+            )
+            .await;
+
+        let after = catalog.get_model(model_id).await.unwrap().unwrap();
+        assert_eq!(
+            after.model_type, "local",
+            "the placeholder must be completed to the source's own generic type"
+        );
+        assert_eq!(
+            after.artifact_path.as_deref(),
+            Some(tmp.path().to_str().unwrap()),
+            "the placeholder's artifact_path must be completed, not left None"
+        );
+    }
+
+    /// BLOCK 2: a catalog READ error must skip the write entirely — never
+    /// collapse to "no row" and clobber a row this call never actually
+    /// inspected. Both the read AND a subsequent write attempt fail on the
+    /// SAME closed pool, so the final DB state alone cannot distinguish
+    /// "skipped" from "attempted and also failed" — the oracle instead
+    /// captures which `tracing::warn!` fires: the fixed code logs the
+    /// read-failure message and calls `register_model` NOT AT ALL, while
+    /// the pre-fix `.ok().flatten()` shape logs no read-failure message,
+    /// swallows the read error as "no row", and DOES call `register_model`
+    /// (whose own failure, on the same closed pool, logs the
+    /// register-failure message instead). Revert to `.ok().flatten()` to
+    /// see this go RED: `saw_write_attempt` becomes `true` and
+    /// `saw_read_failure_log` becomes `false`.
+    ///
+    /// Fault injection: two `Catalog` handles share the SAME backend `Arc`
+    /// (`Catalog::pinned_to_tenant`); closing one closes the shared
+    /// connection pool out from under the other, which is the closed/dropped
+    /// connection this crate's own `Catalog::close` doc describes as making
+    /// every sibling handle's next query fail.
+    #[test]
+    fn catalog_read_error_skips_bookkeeping_write() {
+        use std::io;
+        use std::sync::Mutex;
+        use tracing_subscriber::fmt::MakeWriter;
+
+        #[derive(Clone, Default)]
+        struct BufferWriter(Arc<Mutex<Vec<u8>>>);
+        impl io::Write for BufferWriter {
+            fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+                self.0.lock().unwrap().extend_from_slice(buf);
+                Ok(buf.len())
+            }
+            fn flush(&mut self) -> io::Result<()> {
+                Ok(())
+            }
+        }
+        impl<'w> MakeWriter<'w> for BufferWriter {
+            type Writer = BufferWriter;
+            fn make_writer(&'w self) -> Self::Writer {
+                self.clone()
+            }
+        }
+
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+
+        let buffer = Arc::new(Mutex::new(Vec::new()));
+        let subscriber = tracing_subscriber::fmt()
+            .with_writer(BufferWriter(buffer.clone()))
+            .with_ansi(false)
+            .finish();
+        let _guard = tracing::subscriber::set_default(subscriber);
+
+        runtime.block_on(async {
+            let tmp = tempfile::tempdir().unwrap();
+            let catalog_dir = tempfile::tempdir().unwrap();
+            let owner = Catalog::open(catalog_dir.path()).await.unwrap();
+            let model_id = "read-error-probe-model";
+
+            // Seed a pre-existing "local" row (a completable type) through
+            // the live handle, BEFORE the pool is closed, so a
+            // wrongly-proceeding write would have something real to clobber.
+            owner
+                .register_model(RegisterModelParams {
+                    model_id,
+                    version: 1,
+                    model_type: "local",
+                    backend: "candle",
+                    task: ModelTask::TextEmbedding,
+                    base_model_id: None,
+                    artifact_path: None,
+                    config_json: None,
+                })
+                .await
+                .unwrap();
+
+            let shared = owner.pinned_to_tenant(None);
+            owner.close().await;
+
+            // Confirm the fault actually landed: the shared handle's own
+            // read must now be an `Err`, not a `None` — otherwise this test
+            // would not be exercising the read-error path at all.
+            let probe_err = shared.get_model_version(model_id, 1).await;
+            assert!(
+                probe_err.is_err(),
+                "fault injection failed to land: expected the closed pool to make a \
+                 read error, got {probe_err:?}"
+            );
+
+            let cache = new_cache(Arc::new(shared));
+            let resolved = fake_resolved(model_id, tmp.path());
+            cache
+                .complete_generic_registration(
+                    &ModelSource::local(tmp.path()),
+                    model_id,
+                    &resolved,
+                    ModelTask::TextEmbedding,
+                )
+                .await;
+        });
+
+        let logs = String::from_utf8(buffer.lock().unwrap().clone()).expect("utf-8 logs");
+        let saw_read_failure_log =
+            logs.contains("Failed to read catalog row before load bookkeeping");
+        let saw_write_attempt = logs.contains("Failed to register model in catalog");
+        assert!(
+            saw_read_failure_log,
+            "expected the read-error path to log its own skip warning; captured logs:\n{logs}"
+        );
+        assert!(
+            !saw_write_attempt,
+            "a catalog read error must skip the write entirely, never fall through to \
+             attempting (and separately failing) a `register_model` call; captured logs:\n{logs}"
+        );
     }
 }

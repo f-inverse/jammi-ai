@@ -69,6 +69,24 @@ The sidecar files are disposable — deleting them falls back to brute-force exa
 
 Failed rows (null or empty text) are excluded — only successfully embedded rows appear in the output.
 
+## Text column format
+
+A text column can be:
+
+- **`Utf8` / `LargeUtf8` / `Utf8View`** — read directly, no conversion. `Utf8View` is what a
+  plain Parquet `Utf8` column becomes through a DataFusion scan under this workspace's pinned
+  Arrow/DataFusion versions, so an ordinary registered source's text column takes this arm on
+  the real, unmodified scan output.
+- **Any other non-binary type** (e.g. `Int64`, `Float64`) — cast to text (`"42"`, `"3.14"`, …).
+  The whole call is refused if the cast would introduce a null the source column did not have.
+- **`Binary` / `LargeBinary` / `BinaryView` / `FixedSizeBinary`** — refused outright, naming the
+  column's data type. These hold raw bytes, not text (e.g. image or audio bytes submitted under
+  a text-embedding task by mistake); the call never silently embeds an empty string for every
+  row.
+
+A null value in an otherwise-text column reads as the empty string (`""`), which the row-failure
+rule above then excludes from the output.
+
 ## Multiple text columns
 
 Pass multiple column names to concatenate them (space-separated) before embedding:

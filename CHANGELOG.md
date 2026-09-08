@@ -496,6 +496,56 @@ workspace ships every publishable crate at the same
   the positive-proof equation exactly (all three keys, non-vacuity on `calls`, the GELU seam
   non-zero on HTSAT / zero on both OpenCLIP towers) rather than witnessing it on tiny_bert/text
   alone.
+- **A fine-tuned model resolves to the SAME adapted checkpoint across a cold restart, never
+  silently to the unadapted base (esc-089).** Because `ModelSource::parse` maps a fine-tuned id
+  (`jammi:fine-tuned:{uuid}`) onto the same `HuggingFace` variant a real Hub repo id gets, a fresh
+  resolve of that id is indistinguishable from an ordinary Hub lookup by shape alone, so every
+  layer downstream of the id now defends its own catalog row rather than trusting shape:
+  `ModelCache::complete_generic_registration`'s post-load bookkeeping is an ALLOWLIST of the only
+  rows it may complete — `GENERIC_COMPLETABLE_TYPES = ["local", "huggingface", "embedding"]` —
+  proceeding only when the existing row is absent or already one of those generic kinds; every
+  other type (`"fine-tuned"`, `"context-predictor"`, or any future architecture id
+  `EncoderFamily::adapter_model_type` mints), enumerated or not, is left untouched, so this write
+  can no longer clobber a fine-tuned row's `model_type`/`artifact_path`/`base_model_id` out from
+  under a training-instance resolve. A catalog READ error fails CLOSED — the write is skipped
+  entirely (`warn!`, never guessed as "no row" and written over). `ModelResolver::try_catalog_lookup`
+  cross-checks the unforgeable `jammi:fine-tuned:` id prefix against the row's own `model_type`: a
+  mismatch is a typed `JammiError::Model` refusal naming the id and the row's actual type — the
+  backstop for a catalog a pre-fix build already corrupted — and separately refuses, naming the id
+  and the missing field, a `model_type == "fine-tuned"` record carrying no `base_model_id` or no
+  `artifact_path`. `ArtifactStore::fetch_artifact` distinguishes a `NotFound` reading
+  `manifest.json` itself (no bundle was ever published at this prefix — never published, a
+  misdirected catalog pointer, or a clobbered pointer left aimed at the base weights directory)
+  from a `NotFound` reading a key the manifest DOES name (genuine bundle corruption — a partial
+  publish or a manually-deleted file): the former reclassifies to `StorageError::NotPublished`,
+  the latter (and a digest mismatch) stays `StorageError::Layout`, the INTEGRITY bucket; every
+  other driver fault (a transport/IO error, a permission fault, a disabled scheme, driver-init
+  failure) stays `StorageError::Io` and propagates unchanged. `ModelResolver::try_catalog_lookup`'s
+  fine-tuned reload arm and the sibling `InferenceSession::load_context_predictor` reload arm each
+  re-type BOTH storage variants into their own `JammiError::Model` refusal (never
+  `JammiError::Inference`, which maps to gRPC `Internal` at the wire boundary instead of the
+  client-visible `InvalidArgument` a precondition failure needs) naming the model id and, per
+  outcome, the prefix ("no adapter bundle is published…") or the missing key ("…failed integrity
+  check…"), and apply the identical `Layout` rule to an `artifact_path` string that fails to parse
+  as a storage URL. `crates/jammi-server/src/grpc/wire.rs::tests::
+  adapter_bundle_refusal_codes_agree_across_both_reload_surfaces` pins each combination
+  (resolver/predictor × pointer/integrity/not-published/transport) through `map_engine_error`,
+  composing with the it-tests that pin each surface actually raising the claimed variant on a real
+  reload (a chmod fault's variant is pinned by name, `StorageError::Io`, never merely `!= Model`).
+  Cold-restart coverage opens a SECOND `InferenceSession` over the same catalog and asserts
+  bit-identical output against the training instance:
+  `crates/jammi-ai/tests/it/tower_adapters.rs::{open_clip_text,open_clip_vision,clap_audio}_
+  tower_adapter_serves_cold_after_restart` and
+  `crates/jammi-ai/tests/it/fine_tune.rs::bert_fine_tuned_adapter_serves_cold_after_restart`, each
+  with the negative control that a deleted adapter file refuses by name rather than serving the
+  base.
+- **A `Utf8View` path column is accepted by `arrow_to_images`/`arrow_to_audio`, matching `Utf8`
+  exactly (esc-090).** Both functions matched `Utf8`/`LargeUtf8`/`Binary`/`LargeBinary`/
+  `BinaryView` but had no `Utf8View` arm, so a `Utf8View` path column — DataFusion's parquet
+  reader's own default output for an ordinary `Utf8` column under this workspace's pinned Arrow/
+  DataFusion versions — refused the whole call with "Unsupported column type" even though every
+  row's path was valid. `Utf8View` now takes the identical arm `Utf8` takes: same file-path
+  read, same whole-call `Err` on a bad path, same per-row null handling.
 - **`InferenceSession::encode_text_query` refuses an empty/null text query instead of returning an
   all-zero vector (#421 frontend follow-on).** It read
   `output.float_outputs[0][..dim].to_vec()` directly, bypassing the checked
@@ -556,6 +606,30 @@ workspace ships every publishable crate at the same
   -guarded region, heredoc-aware so an embedded `python3 -c` payload's own dangling `if`s cannot
   fool the block-extent walk) or the existing preflight-refusal shape generalized off the `FAKE`
   name requirement.
+- **`load_context_predictor`'s corrupted-catalog-record refusals are typed `JammiError::Model`
+  naming the model id and the field, closing the same class esc-089 closed for the reload arm's
+  pointer/integrity/unpublished checks.** A missing or unparseable `config_json`, and a
+  parseable-but-incomplete config (missing `head`/`architecture`/`feature_dim`/`context_k`/
+  `hidden_dim`/`num_heads`/`num_layers`/`head_width`/`value_column`/`target_scaler`), previously
+  raised this surface's own `JammiError::Inference` — `Code::Internal` at the wire boundary,
+  wrong for a client-visible precondition failure. "No `config_json` recorded" and "`config_json`
+  unparseable: `<serde error>`" are now distinct messages, never collapsed into one "no parseable
+  config_json" claim. The `varmap.load` arm (a manifest-verified bundle missing
+  `model.safetensors`) now matches the resolver's peer refusal shape
+  (`CandleBackend::load`'s `"Failed to load safetensors: {e}"`) instead of its own
+  `JammiError::Inference`.
+- **`arrow_to_texts` refuses a binary content column by name instead of silently embedding empty
+  strings, and casts any other non-string column instead of dropping it.** `get_string_value`'s
+  catch-all treated any Arrow type that was not `Utf8`/`LargeUtf8`/`Utf8View` as absent, so a
+  `Binary`/`LargeBinary`/`BinaryView`/`FixedSizeBinary` content column (e.g. image or audio bytes
+  submitted under a text-embedding task) — or any other non-string type, e.g. `Int64` — read as
+  `""` for every row, with `row_status` all-ok and no error. `arrow_to_texts` now validates each
+  column's physical type up front, mirroring `fine_tune::worker::extract_string_column`'s policy
+  (the trainer already applied this rule) exactly: the string families pass through unchanged;
+  the binary families are refused outright with a typed `JammiError::Inference` naming the
+  column's data type; every other type is cast to `Utf8` via `arrow::compute::cast`, refused if
+  the cast introduces a null the source column did not have. A null value in an otherwise-text
+  column keeps its documented `""` reading (esc-091).
 
 ### Breaking
 - `jammi_ai::inference::{arrow_to_images, arrow_to_audio}` return one decode result per row

@@ -132,6 +132,24 @@ jobs:
           # python3-unavailable skip (KO-7 gate, see ci/kernel-oracle-helpers.txt)
           # must never fire silently here — a skip on this lane is a defect.
           JAMMI_REQUIRE_MEDIA_SMOKE: "1"
+          # The chmod fault-injection probes (`crates/jammi-ai/tests/it/`
+          # `{models,context_predictor,fine_tune}.rs`,
+          # `crates/jammi-db/src/store/artifact.rs`,
+          # `crates/jammi-ai/src/fine_tune/trainer.rs`) skip loudly — never
+          # silently — when a 0o000-chmod'd path is still readable/writable
+          # (root, or a mode-ignoring filesystem). This container's `Run
+          # tests` step runs as root by default (no non-root `USER` in
+          # `.docker/ci.Dockerfile`), which is exactly the bypass condition
+          # the probes exist to catch, so `JAMMI_REQUIRE_POSIX_PERMS` is
+          # deliberately UNSET here: arming the require gate on a root run
+          # would turn every probe's bypassed chmod into a hard `panic!`
+          # unconditionally (root can never fail to write through a 0o000
+          # path), not a real signal about a permission regression. The
+          # probes still run here — they just print their loud "chmod
+          # bypassed (root?) — skipping" notice and pass, same as any other
+          # dev box run as root. The require gate is armed for real, against
+          # a genuinely unprivileged process, by the "Permission-fault
+          # probes (unprivileged, require gate armed)" step below.
           # The K4 literal pin (bits_snapshot.rs, KO-7 gate, see
           # ci/kernel-oracle-helpers.txt's `k4_snapshot_require_gate` row) is a
           # SAME-CPU-MODEL oracle: its rows are keyed by exact CPU model, not
@@ -149,6 +167,135 @@ jobs:
           # machine or a pod — never for this heterogeneous hosted lane.
         run: cargo test --workspace --exclude jammi-python
 
+      # The chmod fault-injection probes above ran as root (this container's
+      # default user, per `.docker/ci.Dockerfile`'s missing `USER`), where
+      # `JAMMI_REQUIRE_POSIX_PERMS` is deliberately unset: root bypasses
+      # every POSIX permission bit, so arming the require gate on that run
+      # would turn an UNCONDITIONAL bypass into an unconditional panic —
+      # never a real signal about a permission regression. This step gives
+      # the SAME five probes (`crates/jammi-ai/tests/it/{models,
+      # context_predictor,fine_tune}.rs`'s
+      # `fine_tuned_adapter_bundle_permission_fault_is_not_a_typed_model_error`
+      # / `context_predictor_reload_permission_fault_is_not_a_typed_model_error`
+      # / `finalize_reclaims_a_persistently_failed_prune_and_warns`,
+      # `crates/jammi-db/src/store/artifact.rs`'s
+      # `permission_fault_on_a_present_key_stays_a_transport_error`, and
+      # `crates/jammi-ai/src/fine_tune/trainer.rs`'s
+      # `failed_prune_stays_tracked_and_catches_up_once_unblocked`) a REAL
+      # execution: build the three test binaries as root (this build reuses
+      # this SAME job's already-populated target dir from "Run tests"
+      # above — same filesystem, same job, no clean rebuild — so it only
+      # links the three `--no-run` test binaries rather than recompiling the
+      # workspace), open the checkout to a fresh unprivileged account, then run
+      # ONLY those five tests as that account with
+      # `JAMMI_REQUIRE_POSIX_PERMS=1` armed. The probes read fixtures from
+      # BOTH `cookbook/fixtures/` and `tests/fixtures/` at the workspace
+      # root (`jammi_test_utils::{cookbook_fixture,fixture}`, resolved via
+      # `CARGO_MANIFEST_DIR/../..`) as well as their own crate's `tests/`
+      # tree, so opening only `crates/jammi-ai`/`crates/jammi-db` would miss
+      # real read paths — this recurses the WHOLE checkout (read + traverse
+      # only, never write) rather than hand-enumerating every fixture root a
+      # probe might reach and re-drifting the day a fixture moves. Every
+      # path a probe itself `chmod`s to 0o000 is a tempdir it creates and
+      # owns at run time, never anything opened here.
+      #
+      # `useradd`/`runuser` are core `shadow-utils`/`util-linux` packages
+      # present on this AlmaLinux-8-based `manylinux_2_28` image; the
+      # `command -v` guards below fall back to installing them (already
+      # available in this image's `yum` cache from `.docker/ci.Dockerfile`'s
+      # own package installs) rather than assuming they can never go
+      # missing from a future base-image bump.
+      #
+      # Grepping each run's own `test result: ok. N passed` summary for
+      # `N > 0` is load-bearing, not decorative: a test-name filter that
+      # matches nothing exits 0 with an EMPTY (zero-passed) result, so a
+      # probe silently renamed out from under this step would otherwise
+      # read as a pass here while running NOTHING — exactly the silent-skip
+      # shape this whole step exists to close. A missing PASS line, or a
+      # `0 passed` line, is a hard failure of this step.
+      - name: Permission-fault probes (unprivileged, require gate armed)
+        run: |
+          set -euo pipefail
+
+          if ! command -v useradd >/dev/null 2>&1; then
+            yum install -y shadow-utils
+          fi
+          if ! command -v runuser >/dev/null 2>&1 && ! command -v su >/dev/null 2>&1; then
+            yum install -y util-linux
+          fi
+          useradd --no-create-home --shell /usr/sbin/nologin jammi-probe
+
+          # `--no-create-home` leaves `jammi-probe` with no home directory,
+          # so a bare `HOME=/home/jammi-probe` (the passwd-entry default)
+          # would point at a path that does not exist. Give the account a
+          # real, owned scratch HOME instead of creating one under
+          # `/home` (which this container image may not have writable).
+          PROBE_HOME="$(mktemp -d)"
+          chown jammi-probe "$PROBE_HOME"
+
+          # `--message-format=json` gives the EXACT compiled test-binary
+          # path -- never a hash-suffixed glob that could silently match a
+          # stale binary left over from a prior cache. A SINGLE physical
+          # line of python (`;`-joined, never a multi-line `-c` block) --
+          # a multi-line here would need its own internal indentation,
+          # which a YAML block scalar cannot host without every line
+          # meeting the scalar's own minimum indentation (breaking python's
+          # unrelated indentation rules in the process).
+          extract_test_binary() { python3 -c 'import json, sys; [print(m["executable"]) for m in (json.loads(l) for l in sys.stdin if l.strip()) if m.get("reason") == "compiler-artifact" and m.get("executable")]'; }
+
+          AI_IT_BIN="$(cargo test -p jammi-ai --test it --no-run --message-format=json | extract_test_binary | tail -n1)"
+          AI_LIB_BIN="$(cargo test -p jammi-ai --lib --no-run --message-format=json | extract_test_binary | tail -n1)"
+          DB_LIB_BIN="$(cargo test -p jammi-db --lib --no-run --message-format=json | extract_test_binary | tail -n1)"
+          test -x "$AI_IT_BIN"
+          test -x "$AI_LIB_BIN"
+          test -x "$DB_LIB_BIN"
+          echo "jammi-ai it binary:  $AI_IT_BIN"
+          echo "jammi-ai lib binary: $AI_LIB_BIN"
+          echo "jammi-db lib binary: $DB_LIB_BIN"
+
+          # Read + traverse only (`X`, never `w`) across the whole checkout --
+          # covers the target dir (default `$GITHUB_WORKSPACE/target` unless
+          # `CARGO_TARGET_DIR` overrides it), both crates' own `tests/`
+          # trees, and the workspace-root `cookbook/fixtures/` +
+          # `tests/fixtures/` the probes read via `jammi_test_utils`.
+          chmod -R o+rX "$GITHUB_WORKSPACE"
+          # `CARGO_TARGET_DIR` can point OUTSIDE `$GITHUB_WORKSPACE` (e.g. a
+          # pod/dev-box lane's shared build cache); the sweep above would
+          # silently miss it and every probe binary read from it would then
+          # fail closed for the wrong reason (EACCES on the target dir, not
+          # the fault this step exists to exercise).
+          if [ -n "${CARGO_TARGET_DIR:-}" ]; then
+            chmod -R o+rX "$CARGO_TARGET_DIR"
+          fi
+
+          if command -v runuser >/dev/null 2>&1; then
+            run_as_probe() { runuser -u jammi-probe -- "$@"; }
+          else
+            run_as_probe() { su -s /bin/bash jammi-probe -c "$(printf '%q ' "$@")"; }
+          fi
+
+          run_probe() {
+            local bin="$1" test_name="$2" out rc
+            # `set +e` around the capture only -- a REAL test failure (rc
+            # != 0) must still print its output and this function's own
+            # diagnostic before the step fails, not vanish into `set -e`
+            # exiting the whole script mid-assignment before either runs.
+            set +e
+            out="$(run_as_probe env HOME="$PROBE_HOME" JAMMI_REQUIRE_POSIX_PERMS=1 "$bin" "$test_name" --exact 2>&1)"
+            rc=$?
+            set -e
+            echo "$out"
+            if [ "$rc" -ne 0 ] || ! grep -Eq 'test result: ok\. [1-9][0-9]* passed' <<<"$out"; then
+              echo "::error::permission-fault probe '$test_name' in $bin failed (exit $rc) or ran ZERO tests -- a skipped/unmatched/failed probe must never read as a pass"
+              exit 1
+            fi
+          }
+
+          run_probe "$AI_IT_BIN" models::fine_tuned_adapter_bundle_permission_fault_is_not_a_typed_model_error
+          run_probe "$AI_IT_BIN" context_predictor::context_predictor_reload_permission_fault_is_not_a_typed_model_error
+          run_probe "$AI_IT_BIN" fine_tune::finalize_reclaims_a_persistently_failed_prune_and_warns
+          run_probe "$AI_LIB_BIN" fine_tune::trainer::epoch_checkpoint_retention_failure::failed_prune_stays_tracked_and_catches_up_once_unblocked
+          run_probe "$DB_LIB_BIN" store::artifact::tests::permission_fault_on_a_present_key_stays_a_transport_error
       # golden-parity is opt-in (`crates/jammi-encoders/Cargo.toml`) so the
       # default workspace test run above never compiles it, but it is fully
       # hermetic: the oracle is a committed PyTorch dump

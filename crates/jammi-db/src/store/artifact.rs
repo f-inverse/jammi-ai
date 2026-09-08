@@ -26,8 +26,13 @@
 //! consistency a reader relies on is read-after-write of a *new* object, which
 //! every object store (including S3) serves strongly; list-after-write and
 //! overwrite-then-read — the eventually-consistent operations — are never on the
-//! path. A manifest absent or a file whose bytes do not hash to the recorded
-//! digest is a hard error (a partial PUT, not a torn load to be papered over).
+//! path. A manifest-listed file whose bytes do not hash to the recorded digest,
+//! or that has gone missing after the manifest names it, is a hard integrity
+//! error (a partial PUT, not a torn load to be papered over) —
+//! [`StorageError::Layout`]. A manifest that is absent ENTIRELY is a distinct
+//! outcome, [`StorageError::NotPublished`]: no manifest is in hand, so there is
+//! nothing to say is corrupt — the prefix was simply never published, or a
+//! catalog pointer names the wrong prefix.
 //!
 //! ## Local cache
 //!
@@ -239,7 +244,10 @@ impl ArtifactStore {
         let tmp = tempfile::tempdir_in(&self.cache_root)?;
         for entry in &manifest.files {
             let path = self.child(prefix, &entry.name)?;
-            let bytes = handle.get_bytes(&path).await?;
+            let bytes = handle
+                .get_bytes(&path)
+                .await
+                .map_err(|e| reclassify_missing_key(e, prefix, &entry.name))?;
             verify_sha256(prefix, entry, &bytes)?;
             std::fs::write(tmp.path().join(&entry.name), &bytes)?;
         }
@@ -376,16 +384,21 @@ impl ArtifactStore {
         self.delete_artifact_prefix(&prefix).await
     }
 
-    /// Read and parse `manifest.json` under `prefix`. A missing or malformed
-    /// manifest is a hard error — without it the bundle's completeness cannot be
-    /// established.
+    /// Read and parse `manifest.json` under `prefix`. A manifest absent
+    /// entirely reclassifies to [`StorageError::NotPublished`] — "no bundle
+    /// published here", not corruption (see [`reclassify_missing_manifest`]).
+    /// A manifest present but malformed is a hard [`StorageError::Layout`]
+    /// error — it WAS published, but what's there is not valid JSON.
     async fn read_manifest(
         &self,
         handle: &JammiObjectStore,
         prefix: &StorageUrl,
     ) -> Result<Manifest> {
         let manifest_path = self.child(prefix, MANIFEST_NAME)?;
-        let bytes = handle.get_bytes(&manifest_path).await?;
+        let bytes = handle
+            .get_bytes(&manifest_path)
+            .await
+            .map_err(|e| reclassify_missing_manifest(e, prefix))?;
         serde_json::from_slice(&bytes).map_err(|e| {
             JammiError::Storage(StorageError::layout(
                 prefix.as_str(),
@@ -405,7 +418,10 @@ impl ArtifactStore {
     ) -> Result<()> {
         for entry in &manifest.files {
             let path = self.child(prefix, &entry.name)?;
-            let bytes = handle.get_bytes(&path).await?;
+            let bytes = handle
+                .get_bytes(&path)
+                .await
+                .map_err(|e| reclassify_missing_key(e, prefix, &entry.name))?;
             verify_sha256(prefix, entry, &bytes)?;
         }
         Ok(())
@@ -445,6 +461,67 @@ impl ArtifactStore {
             joined.push_str(&sanitize_segment(seg));
         }
         StorageUrl::parse(&joined).map_err(JammiError::from)
+    }
+}
+
+/// Re-type a `manifest.json` `get_bytes` fault as "no bundle is published at
+/// this prefix at all" ([`StorageError::NotPublished`]) when the driver
+/// reports the manifest does not exist, vs. leaving every other driver
+/// failure as the transport/IO fault it is.
+///
+/// No manifest is in hand at this point, so there is nothing to say the
+/// bundle's *content* is broken — the honest claim is narrower: this prefix
+/// was never published, a catalog pointer names the wrong prefix, or a
+/// pre-fix code path clobbered the pointer to point somewhere else entirely
+/// (e.g. a base weights directory). This is a DIFFERENT failure class than
+/// [`reclassify_missing_key`]'s "a manifest-listed key is gone" — that one
+/// DOES have a manifest in hand naming exactly what's missing, which is
+/// genuine bundle corruption. Conflating the two would call "nothing was
+/// ever published here" a corrupted bundle, which is a claim this call site
+/// carries no evidence for. Any other driver error (network fault,
+/// throttling, credential rot, a 5xx) is a genuine transport/IO problem and
+/// is left as [`StorageError::Io`] unchanged.
+fn reclassify_missing_manifest(err: StorageError, prefix: &StorageUrl) -> JammiError {
+    match &err {
+        StorageError::Io {
+            source: object_store::Error::NotFound { .. },
+            ..
+        } => JammiError::Storage(StorageError::not_published(prefix.as_str())),
+        _ => JammiError::from(err),
+    }
+}
+
+/// Re-type a `get_bytes` fault reading `name` under `prefix` as an INTEGRITY
+/// failure of the bundle when the driver reports the key does not exist, vs.
+/// leaving every other driver failure as the transport/IO fault it is.
+///
+/// A manifest names its keys after they were already written (`put_artifact`
+/// writes the manifest last), so once a fetcher has a manifest in hand, a
+/// `NotFound` on a key it names can only mean the object was deleted out from
+/// under a completed bundle, or the bundle was a partial/tampered write — the
+/// storage layer itself is healthy, the *bundle* is broken. That is the same
+/// failure class [`StorageError::Layout`] already carries for a malformed
+/// manifest or a digest mismatch, so this folds a missing key into the same
+/// variant rather than minting a fourth error path — callers that already
+/// match `StorageError::Layout` to detect "this artifact's bytes are wrong"
+/// catch a missing key for free. Distinct from [`reclassify_missing_manifest`]
+/// (the manifest itself absent, meaning nothing was ever published — never
+/// bundle corruption) — see that function's doc for why the two must not be
+/// conflated. Any other driver error (network fault, throttling, credential
+/// rot, a 5xx) is a genuine transport/IO problem unrelated to this bundle's
+/// own integrity and is left as [`StorageError::Io`] unchanged, so a caller
+/// can still tell "the store was unreachable" from "this artifact is
+/// corrupt".
+fn reclassify_missing_key(err: StorageError, prefix: &StorageUrl, name: &str) -> JammiError {
+    match &err {
+        StorageError::Io {
+            source: object_store::Error::NotFound { .. },
+            ..
+        } => JammiError::Storage(StorageError::layout(
+            prefix.as_str(),
+            format!("artifact file '{name}' missing under this prefix (manifest lists it)"),
+        )),
+        _ => JammiError::from(err),
     }
 }
 
@@ -489,6 +566,32 @@ mod tests {
 
     fn store_with_root(root: StorageUrl, cache: PathBuf) -> ArtifactStore {
         ArtifactStore::with_root(root, StorageRegistry::new(), cache).unwrap()
+    }
+
+    /// The require-gate polarity every `chmod` permission-fault probe in the
+    /// workspace's test suites shares (esc-089 F1): `probe` performs the
+    /// fault-injection premise check itself and returns `true` if the fault
+    /// was BYPASSED (root, or a mode-ignoring filesystem). A bypass is
+    /// normally a loud, `eprintln`'d skip; under `JAMMI_REQUIRE_POSIX_PERMS=1`
+    /// (the CI lane that is SUPPOSED to run unprivileged with real POSIX
+    /// permission enforcement) a bypass is instead a hard `panic!` — never a
+    /// silent `return`. Each probe file carries its own copy of this wrapper
+    /// in the canonical shape the kernel-oracle registry
+    /// (`ci/kernel-oracle-helpers.txt`) verifies per file.
+    fn chmod_bypassed(test_name: &str, probe: impl FnOnce() -> bool) -> bool {
+        let bypassed = probe();
+        if bypassed {
+            if std::env::var_os("JAMMI_REQUIRE_POSIX_PERMS").is_some() {
+                panic!(
+                    "JAMMI_REQUIRE_POSIX_PERMS is set but '{test_name}' could not inject its \
+                     permission fault (root, or a mode-ignoring filesystem) — the \
+                     fault-injection premise this test needs does not hold; a silent skip is \
+                     not acceptable here"
+                );
+            }
+            eprintln!("{test_name}: chmod bypassed (root?) — skipping");
+        }
+        bypassed
     }
 
     fn sample_files() -> Vec<(String, Bytes)> {
@@ -579,7 +682,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn missing_manifest_is_a_hard_error() {
+    async fn missing_manifest_is_not_published_not_corruption() {
         let cache = tempfile::tempdir().unwrap();
         let store = store_with_root(
             StorageUrl::memory("artifacts-nomanifest"),
@@ -588,8 +691,107 @@ mod tests {
         // A prefix that was never written — no manifest exists.
         let prefix = store.prefix_url(&["ghost", "worker", "0"]).unwrap();
         let err = store.fetch_artifact(&prefix).await.unwrap_err();
-        // The manifest GET 404s before any data file is touched.
-        assert!(!err.to_string().is_empty());
+        // The manifest GET 404s before any data file is even named. No
+        // manifest is in hand, so there is nothing to say the bundle's
+        // CONTENT is broken — this is "no bundle published here"
+        // (`StorageError::NotPublished`), never the `Layout` integrity-failure
+        // class a malformed manifest or a listed-key-absent 404 carries (those
+        // DO have a manifest in hand).
+        assert!(
+            matches!(err, JammiError::Storage(StorageError::NotPublished { .. })),
+            "a missing manifest.json must reclassify to StorageError::NotPublished, not the \
+             Layout integrity-failure class (no manifest is in hand to say anything is \
+             corrupt), got: {err:?}"
+        );
+        assert!(
+            err.to_string().contains(prefix.as_str()),
+            "the NotPublished error must name the prefix nothing was published at, got: {err}"
+        );
+    }
+
+    /// A manifest that DOES exist but names a key the store no longer has (the
+    /// object was deleted out from under a completed bundle) is the same
+    /// INTEGRITY failure class as a missing manifest or a digest mismatch —
+    /// `StorageError::Layout` — not the transport fault a `NotFound` might
+    /// otherwise suggest. The reclassified message still names the key so a
+    /// caller (e.g. `ModelResolver`) can surface which file is gone.
+    #[tokio::test]
+    async fn missing_manifest_listed_key_reclassifies_as_integrity_failure() {
+        let cache = tempfile::tempdir().unwrap();
+        let store = store_with_root(
+            StorageUrl::memory("artifacts-missing-key"),
+            cache.path().to_path_buf(),
+        );
+        let prefix = store
+            .put_artifact(&["job-4", "worker-d", "0"], &sample_files())
+            .await
+            .unwrap();
+        let handle = store.handle(&prefix).unwrap();
+        let path = store.child(&prefix, "adapter.safetensors").unwrap();
+        handle.delete_if_exists(&path).await.unwrap();
+
+        let err = store.fetch_artifact(&prefix).await.unwrap_err();
+        assert!(
+            matches!(err, JammiError::Storage(StorageError::Layout { .. })),
+            "a manifest-listed key absent from the store must reclassify to \
+             StorageError::Layout (an integrity failure), not stay StorageError::Io (a \
+             transport fault), got: {err:?}"
+        );
+        assert!(
+            err.to_string().contains("adapter.safetensors"),
+            "the reclassified error must still name the missing key, got: {err}"
+        );
+    }
+
+    /// The flip side of the two tests above: a key the manifest lists that IS
+    /// present but unreadable for a reason that has nothing to do with the
+    /// bundle's own content — a permission fault standing in for a transient
+    /// object-store outage — must NOT be folded into the same
+    /// `StorageError::Layout` integrity bucket. `object_store`'s
+    /// `LocalFileSystem` folds a permission-denied open into
+    /// `Error::Generic` (its own `UnableToOpenFile` is a private local error,
+    /// never constructed outside that crate), never `Error::NotFound`, so
+    /// `reclassify_missing_key` must leave it as `StorageError::Io` —
+    /// verified with a real `chmod` fault injection (Unix-only), never a
+    /// hand-built error the reclassifier was never actually asked to sort.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn permission_fault_on_a_present_key_stays_a_transport_error() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let root_dir = tempfile::tempdir().unwrap();
+        let cache = tempfile::tempdir().unwrap();
+        let root = StorageUrl::parse(root_dir.path().to_str().unwrap()).unwrap();
+        let store = store_with_root(root, cache.path().to_path_buf());
+        let prefix = store
+            .put_artifact(&["job-5", "worker-e", "0"], &sample_files())
+            .await
+            .unwrap();
+        let weights_path = std::path::PathBuf::from(prefix.path()).join("adapter.safetensors");
+
+        // PROBE: root (and a mode-ignoring filesystem) bypasses chmod — in
+        // which case the fault-injection premise this test needs never holds.
+        // Shared require-gate polarity (esc-089 F1): under
+        // `JAMMI_REQUIRE_POSIX_PERMS=1` a bypass panics rather than
+        // skipping — it must never be a silent `return`.
+        std::fs::set_permissions(&weights_path, std::fs::Permissions::from_mode(0o000)).unwrap();
+        let bypassed = chmod_bypassed(
+            "permission_fault_on_a_present_key_stays_a_transport_error",
+            || std::fs::read(&weights_path).is_ok(),
+        );
+        if bypassed {
+            let _ = std::fs::set_permissions(&weights_path, std::fs::Permissions::from_mode(0o644));
+            return;
+        }
+
+        let err = store.fetch_artifact(&prefix).await.unwrap_err();
+        let _ = std::fs::set_permissions(&weights_path, std::fs::Permissions::from_mode(0o644));
+        assert!(
+            matches!(err, JammiError::Storage(StorageError::Io { .. })),
+            "a permission-denied open is a genuine driver/transport fault, not this bundle's \
+             own integrity — it must stay StorageError::Io, never be reclassified to Layout, \
+             got: {err:?}"
+        );
     }
 
     #[tokio::test]

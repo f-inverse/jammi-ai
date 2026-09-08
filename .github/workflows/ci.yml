@@ -149,6 +149,22 @@ jobs:
           # machine or a pod — never for this heterogeneous hosted lane.
         run: cargo test --workspace --exclude jammi-python
 
+      # golden-parity is opt-in (`crates/jammi-encoders/Cargo.toml`) so the
+      # default workspace test run above never compiles it, but it is fully
+      # hermetic: the oracle is a committed PyTorch dump
+      # (`cookbook/fixtures/htsat_clap_tiny/goldens.safetensors`, tracked
+      # binary), never a network call or a torch install. Without this step
+      # `htsat_audio.rs`'s own doc claim ("eval bytes crate-wide are pinned by
+      # ... tests/golden_parity.rs") describes a test that compiles and passes
+      # LOCALLY but that CI never runs — a doc citing a proof CI does not
+      # reproduce is exactly the drift this repo's gates exist to close. A
+      # dedicated step (not folded into the `--workspace` run above) because
+      # `golden-parity` is off by default for every OTHER crate too; passing
+      # it workspace-wide would be a silent feature-unification change this
+      # step does not need to make.
+      - name: Test jammi-encoders --features golden-parity (CPU-only, PyTorch reference committed)
+        run: cargo test -p jammi-encoders --features golden-parity --test golden_parity
+
       # Unification contract §6 F3 (round-2 audit B5): the designated
       # build-sha HERMETICITY falsifier, as a real CI step (never a
       # `#[test]` — C1.6's own text: this needs a REAL commit, and mutating
@@ -1551,6 +1567,21 @@ jobs:
           # not a skip" reasoning as the other `perf/test_*.py` suites above.
           - name: perf kernel_census suite
             cmd: python3 ci/scripts/perf/test_kernel_census.py
+          # `gen_nsys_kernel_fixture.py`'s own self-test: builds both
+          # committed `n.sqlite`/`m.sqlite` counts fresh into a temp dir,
+          # asserts two independent fresh regenerations (same sqlite
+          # library) are byte-identical (the generator's OWN determinism --
+          # no RNG, no wall-clock, fixed StringIds ordering), then checks
+          # the checked-in fixtures against LOGICAL identity (schema +
+          # canonically-ordered row set, never raw bytes -- sqlite file
+          # bytes are not stable across library versions) and drives
+          # `kernel_census.build_report` directly over the committed files
+          # (mirrors `profile_421_legs.sh`'s DRY_RUN real call site) to
+          # prove they are consumer-usable, not merely regenerable -- a
+          # GATE here, not a doc note a future edit can silently
+          # invalidate.
+          - name: perf nsys kernel fixture self-test
+            cmd: python3 ci/scripts/perf/fixtures/nsys_kernel_census/gen_nsys_kernel_fixture.py --self-test
           # `convert_legacy_bert_checkpoint.py`'s own suite (#356 census
           # execution fix, defect 2): the `renamed_name` suffix-anchored
           # string logic is covered unconditionally; `convert`'s
@@ -1735,6 +1766,31 @@ jobs:
           # no GPU, no real jammi-bench, no real checkpoint, no network.
           - name: lora_bias_ab.sh dry-run smoke
             cmd: python3 ci/scripts/perf/test_lora_bias_ab_sh_dry_run.py
+          # `fa2_ab.sh`'s own shape test: the shell PRODUCER is a manual,
+          # exclusive-timing-box script with hardcoded `/root/...` paths
+          # and no `DRY_RUN` support at all, so this covers its flash/block
+          # leg LABELING shape specifically -- a narrower and DIFFERENT
+          # property than `check_producer_provenance_gates.py`'s own
+          # producer-parity check (that check covers fa2_ab.sh's
+          # provenance/build_sha cross-check; see that script's own module
+          # doc), never a claim of the same coverage restated here. The
+          # per-(shape,leg,repeat) step body fa2_ab.sh's sweep loop calls
+          # lives in `fa2_ab_leg.sh` (`fa2_ab_run_leg`), sourced by
+          # `fa2_ab.sh`; this greps the COMMITTED command-array text of
+          # both files for both `finetune-step` legs (the block leg must
+          # name its own disable key back via
+          # `--expect-kernels-disabled "$disable_key"`, and the flash leg
+          # must pass `--expect-kernels-disabled ""` — an exact-set-equality
+          # guard against an ambient `JAMMI_KERNELS_DISABLE` leaking into
+          # the "flash" leg from the calling shell), plus a `bash -n` parse
+          # check and a `shellcheck -S warning` pass on both files, plus a
+          # REAL execution: it `source`s the ACTUAL `fa2_ab_leg.sh` (never a
+          # hand-written stand-in of it) against a stub `finetune-step`
+          # replacement that succeeds once and then fails, and asserts the
+          # SOURCED function's own `overall_rc` moves from 0 to 1. No GPU,
+          # no network, no `/root` path ever touched.
+          - name: fa2_ab.sh shape
+            cmd: python3 ci/scripts/perf/test_fa2_ab_sh.py
     steps:
       - uses: actions/checkout@v4
         with:

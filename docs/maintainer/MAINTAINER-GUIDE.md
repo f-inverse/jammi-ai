@@ -2323,20 +2323,24 @@ existence. Outside its own domain, the training arm falls back to the *same*
 eager function eval uses, so a domain miss and eval-mode are one code path, not
 two independently-maintained ones.
 
-**The eval doctrine: parity/golden lanes are pod-run, not CI-wired (disclosed
-gap).** `jammi-encoders` carries two feature-gated oracle suites —
-`tests/parity.rs` (`#![cfg(feature = "parity-test")]`) and
-`tests/golden_parity.rs` (`#![cfg(feature = "golden-parity")]`) — and
-`jammi-kernels/tests/cuda_parity.rs` is `required-features = ["cuda"]`
-(`Cargo.toml`), gated on `JAMMI_REQUIRE_CUDA` for hard-fail-vs-skip semantics on
-a device-acquisition failure. **No CI workflow currently passes
-`--features parity-test` or `--features golden-parity`, and no CI runner has a
-GPU to build `--features cuda` against** — these lanes run only from a pod
-session (`ci/scripts/gpu-dev.sh`), by a human or an agent driving one. Wiring a
-parity/golden/cuda lane into a required CI check is a **human gate edit**
-(constitution: an executable gate is human-amend-only, tightening only) — this
-guide states the gap honestly rather than implying a green check exists where
-none runs today.
+**The eval doctrine: parity/golden lanes.** `jammi-encoders` carries two
+feature-gated oracle suites — `tests/parity.rs`
+(`#![cfg(feature = "parity-test")]`) and `tests/golden_parity.rs`
+(`#![cfg(feature = "golden-parity")]`) — and `jammi-kernels/tests/cuda_parity.rs`
+is `required-features = ["cuda"]` (`Cargo.toml`), gated on `JAMMI_REQUIRE_CUDA`
+for hard-fail-vs-skip semantics on a device-acquisition failure.
+`--features golden-parity` IS wired into CI's hermetic `test` job
+(`.github/workflows/ci.yml`): its oracle is a committed PyTorch dump
+(`cookbook/fixtures/htsat_clap_tiny/goldens.safetensors`, a tracked binary),
+never a network call or a torch install, so it needs no pod. **No CI workflow
+passes `--features parity-test`, and no CI runner has a GPU to build
+`--features cuda` against (disclosed gap)** — those two lanes run only from a
+pod session (`ci/scripts/gpu-dev.sh`), by a human or an agent driving one.
+Wiring any parity/golden/cuda lane into a required CI check is a **human
+gate edit** (constitution: an executable gate is human-amend-only, tightening
+only); `golden-parity` is wired into the hermetic `test` job under that
+rule, `parity-test`/`cuda` are not — this guide states the gap honestly
+rather than implying a green check exists where none runs today.
 
 **Numerics doctrine: reproduce-the-reference rounding decisions, not
 "whatever's convenient."** Each op's bf16 rounding order is a researched,

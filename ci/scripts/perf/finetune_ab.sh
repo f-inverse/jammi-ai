@@ -44,7 +44,7 @@
 #      over `Strict` (`crates/jammi-kernels/src/admission.rs:62-64`), and
 #      `--expect-kernels-disabled` hard-errors before a single step runs if
 #      `JAMMI_KERNELS_DISABLE` was dropped, mistyped, or not forwarded to
-#      this process — `params.expect_kernels_disabled` (`finetune_step.rs:702-715`)
+#      this process — `params.expect_kernels_disabled` (`finetune_step.rs:745-758`)
 #      checks it FIRST, before any device/checkpoint/tensor work — so a
 #      silently-clean env var can never masquerade as a real eager leg.
 #      `kernels_disabled_requested`/`kernels_disabled_fired` are surfaced on
@@ -174,7 +174,7 @@
 # happened to notice it. Both `jammi-fused` legs additionally pass
 # `--expect-kernels-disabled ""` (F5, adversarial audit): an EMPTY
 # expectation, checked via the SAME exact-SET-equality
-# `params.expect_kernels_disabled` (`finetune_step.rs:702-715`) machinery
+# `params.expect_kernels_disabled` (`finetune_step.rs:745-758`) machinery
 # the eager leg's own nonempty list uses —
 # `parse_disable_list` (`crates/jammi-kernels/src/admission.rs:1037-1046`)
 # is the empty set for `Some("")`, so

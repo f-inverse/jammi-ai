@@ -534,19 +534,50 @@ dependency, already unified at 1.11 in the lock).
 
 **Measured: the HTSAT/CLIP-vision front-end A/B.** The close-out run
 (`crates/jammi-kernels/artifacts/cuda-runs/2026-09-08-frontend-0a8562c4-a100-pcie.json`,
-A100 80GB PCIe, tip `0a8562c4` vs base `c1b0b0ba`, P=26, n=24 items/step, 3 interleaved
-base/tip pairs) measured HTSAT's front end at a 1.335 s → 0.108 s per-step mean (step wall
-≈1.56 s → 0.34 s); CLIP-vision's front end moved 0.0293 s → 0.0078 s (report-only, no
-bar). The HTSAT bar read ratio 0.0809, interval [0.0772, 0.0871], against bounds [0.0448,
-0.0864] — a bound falls strictly inside the interval, so the bar is UNRESOLVED, invariant
-under both the driver-default and the run's own measured serial-tail ratio. Per the
-contract's own Verdict clause this is not ACTIVATE: the unit ships because bit identity
-holds and there is no serving regression, with these numbers recorded and NO
-parallel-efficiency claim made. The separate #421 tower-profile artifact naming the front
-end's SHARE of a full training step (a different measurement from this unit's own
-base/tip A/B) still lands with its own artifact PR, not this branch — §11's first
-checklist applies unchanged: every number in a doc names its producer, or it is not
-written.
+A100 80GB PCIe, tip `0a8562c4` vs base `c1b0b0ba`, at the tip binary's own resolved
+rayon global-pool width and the profile's fixed per-step item count, over several
+interleaved base/tip repeats) measured HTSAT's front-end and full-step wall per-step
+means, base against tip, and CLIP-vision's report-only front-end per-step means, base
+against tip — every cell in the table below is bound to the committed artifact's own
+field. The HTSAT bar's ratio, its observed interval, and the two-sided machine-model
+bound it is judged against are bound the same way below, as are the driver-default and
+the run's own measured serial-tail ratio: a bound falls strictly inside the interval, so
+the bar is UNRESOLVED, invariant under both ratios. Per the contract's own Verdict clause
+this is not ACTIVATE: the unit ships because bit identity holds and there is no serving
+regression, with these numbers recorded and NO parallel-efficiency claim made. The
+separate #421 tower-profile artifact naming the front end's SHARE of a full training step
+(a different measurement from this unit's own base/tip A/B) still lands with its own
+artifact PR, not this branch — §11's first checklist applies unchanged: every number in a
+doc names its producer, or it is not written.
+
+| HTSAT/CLIP-vision front-end quantity | value (s or ratio) |
+|---|---:|
+<!-- claims: c1=crates/jammi-kernels/artifacts/cuda-runs/2026-09-08-frontend-0a8562c4-a100-pcie.json#/measurement/htsat_bar_driver_r/front_base_mean_s -->
+| HTSAT front-end s/step, base mean | 1.335 |
+<!-- claims: c1=crates/jammi-kernels/artifacts/cuda-runs/2026-09-08-frontend-0a8562c4-a100-pcie.json#/measurement/htsat_bar_driver_r/front_tip_mean_s -->
+| HTSAT front-end s/step, tip mean | 0.108 |
+<!-- claims: c1=mean(crates/jammi-kernels/artifacts/cuda-runs/2026-09-08-frontend-0a8562c4-a100-pcie.json#/measurement/legs/htsat__base__r1/train_per_step,crates/jammi-kernels/artifacts/cuda-runs/2026-09-08-frontend-0a8562c4-a100-pcie.json#/measurement/legs/htsat__base__r2/train_per_step,crates/jammi-kernels/artifacts/cuda-runs/2026-09-08-frontend-0a8562c4-a100-pcie.json#/measurement/legs/htsat__base__r3/train_per_step) -->
+| HTSAT step-wall s/step, base mean | 1.567 |
+<!-- claims: c1=mean(crates/jammi-kernels/artifacts/cuda-runs/2026-09-08-frontend-0a8562c4-a100-pcie.json#/measurement/legs/htsat__tip__r1/train_per_step,crates/jammi-kernels/artifacts/cuda-runs/2026-09-08-frontend-0a8562c4-a100-pcie.json#/measurement/legs/htsat__tip__r2/train_per_step,crates/jammi-kernels/artifacts/cuda-runs/2026-09-08-frontend-0a8562c4-a100-pcie.json#/measurement/legs/htsat__tip__r3/train_per_step) -->
+| HTSAT step-wall s/step, tip mean | 0.344 |
+<!-- claims: c1=crates/jammi-kernels/artifacts/cuda-runs/2026-09-08-frontend-0a8562c4-a100-pcie.json#/measurement/clip_vision_report_only/front_base_mean_s -->
+| CLIP-vision front-end s/step, base mean | 0.0293 |
+<!-- claims: c1=crates/jammi-kernels/artifacts/cuda-runs/2026-09-08-frontend-0a8562c4-a100-pcie.json#/measurement/clip_vision_report_only/front_tip_mean_s -->
+| CLIP-vision front-end s/step, tip mean | 0.0078 |
+<!-- claims: c1=crates/jammi-kernels/artifacts/cuda-runs/2026-09-08-frontend-0a8562c4-a100-pcie.json#/measurement/htsat_bar_driver_r/ratio -->
+| HTSAT bar ratio | 0.0809 |
+<!-- claims: c1=crates/jammi-kernels/artifacts/cuda-runs/2026-09-08-frontend-0a8562c4-a100-pcie.json#/measurement/htsat_bar_driver_r/ratio_lo -->
+| HTSAT bar ratio_lo | 0.0772 |
+<!-- claims: c1=crates/jammi-kernels/artifacts/cuda-runs/2026-09-08-frontend-0a8562c4-a100-pcie.json#/measurement/htsat_bar_driver_r/ratio_hi -->
+| HTSAT bar ratio_hi | 0.0871 |
+<!-- claims: c1=crates/jammi-kernels/artifacts/cuda-runs/2026-09-08-frontend-0a8562c4-a100-pcie.json#/measurement/htsat_bar_driver_r/lower_bound -->
+| HTSAT bar lower bound | 0.0448 |
+<!-- claims: c1=crates/jammi-kernels/artifacts/cuda-runs/2026-09-08-frontend-0a8562c4-a100-pcie.json#/measurement/htsat_bar_driver_r/upper_bound -->
+| HTSAT bar upper bound | 0.0864 |
+<!-- claims: c1=crates/jammi-kernels/artifacts/cuda-runs/2026-09-08-frontend-0a8562c4-a100-pcie.json#/verdict/serial_tail_ratio_deviation/r_driver -->
+| serial-tail ratio, driver-default | 0.0033 |
+<!-- claims: c1=crates/jammi-kernels/artifacts/cuda-runs/2026-09-08-frontend-0a8562c4-a100-pcie.json#/verdict/serial_tail_ratio_deviation/r_measured -->
+| serial-tail ratio, measured | 0.00355 |
 
 **The mechanism.** Two parallel stages, the same shape on both towers:
 

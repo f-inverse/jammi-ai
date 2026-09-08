@@ -2320,10 +2320,11 @@ never a network call or a torch install, so it needs no pod. **No CI workflow
 passes `--features parity-test`, and no CI runner has a GPU to build
 `--features cuda` against (disclosed gap)** — those two lanes run only from a
 pod session (`ci/scripts/gpu-dev.sh`), by a human or an agent driving one.
-Wiring parity-test/cuda into a required CI check is a **human gate edit**
-(constitution: an executable gate is human-amend-only, tightening only) — this
-guide states the gap honestly rather than implying a green check exists where
-none runs today.
+Wiring any parity/golden/cuda lane into a required CI check is a **human
+gate edit** (constitution: an executable gate is human-amend-only, tightening
+only); `golden-parity` is wired into the hermetic `test` job under that
+rule, `parity-test`/`cuda` are not — this guide states the gap honestly
+rather than implying a green check exists where none runs today.
 
 **Numerics doctrine: reproduce-the-reference rounding decisions, not
 "whatever's convenient."** Each op's bf16 rounding order is a researched,

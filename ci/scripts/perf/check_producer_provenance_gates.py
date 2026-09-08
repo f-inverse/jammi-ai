@@ -95,13 +95,20 @@ nothing left for the trigger/guard distinction to change.
 
 `self_test`'s `--self-test` arm additionally runs a full corpus scan: every
 tracked `.sh` line under `ci/scripts/` is lexed by `_lex_stream` AND by a
-second, independently-written state machine (`_independent_lex_stream` —
-deliberately simpler: two plain quote booleans, no `$(`/`$((`/`${` frame
-typing at all), and the two are asserted to agree on every line. The five
-lines above are pinned as explicit fixture cases with their expected
-classification, alongside the general corpus-wide agreement check, so a
-future regression in either implementation shows up as a named,
-attributable failure rather than a silent corpus-wide disagreement.
+second, independently-written IMPLEMENTATION of the exact same frame model
+(`_independent_lex_stream` — full `$(`/`$((`/`${` frame typing and the
+`ARITH`/`PARAM` `#`-exemption included, coded as a token-regex walk rather
+than the primary's per-character state machine, and with its OWN,
+separately-written heredoc-opener recognition — see its own doc for why a
+"simpler, conceptually different" description would be false and why the
+two lexers share no heredoc-detection code), and the two are asserted to
+agree on every line. The five lines above are pinned as explicit fixture
+cases with their expected classification, alongside the general
+corpus-wide agreement check, so a future TRANSCRIPTION regression in
+either implementation — a typo, a dropped case, an off-by-one — shows up
+as a named, attributable failure rather than a silent corpus-wide
+disagreement; it is not, and was never meant to be, an oracle for a
+different CONCEPT of the rules.
 
 ## (C) `*_DRY_RUN_*` knob admissibility — a second knob shape beyond `*FAKE*`
 
@@ -241,11 +248,17 @@ def _tracked_sh_under(repo_root: Path, prefix: str) -> list[Path]:
 # The comment/quote lexer.
 # ---------------------------------------------------------------------------
 
-# A `<<[-]TERM` or `<<[-]'TERM'`/`<<[-]"TERM"` heredoc opener. Shared by the
-# lexer itself (a heredoc body is opaque to quote/comment tracking) and by
-# `_heredoc_aware_block_extent` below (a heredoc body is opaque to `if`/`fi`
-# depth tracking) — one definition of "what a heredoc opener looks like".
-_HEREDOC_OPEN_RE = re.compile(r"<<-?\s*['\"]?([A-Za-z_][A-Za-z0-9_]*)['\"]?")
+# The heredoc TERMINATOR shape (`[-]TERM`, `[-]'TERM'`, `[-]"TERM"`) that
+# follows a `<<` operator ALREADY recognized, at a position the lexer itself
+# has already established is a genuine top-level heredoc opener (never a
+# raw-line search — see `_lex_one_line`'s own `<<` handling, the ONLY call
+# site). Anchored via `Pattern.match(line, pos)` (matches only exactly at
+# `pos`, never scans ahead), so this never independently decides WHETHER a
+# `<<` is a heredoc opener — only what its terminator name is once the lexer
+# has already decided it is one. `_heredoc_aware_block_extent` no longer
+# re-detects heredoc openers at all: it consumes the per-line `in_heredoc_
+# body` spans `_lex_stream` already computed.
+_HEREDOC_OPEN_AT_RE = re.compile(r"(-?)\s*(['\"]?)([A-Za-z_][A-Za-z0-9_]*)\2")
 
 # A `#` is bash's comment marker only when it is the first character of a
 # shell word: the start of the line, or immediately preceded by whitespace
@@ -279,17 +292,24 @@ class _LineLex(NamedTuple):
     comment was found. `undecidable` is True when this line's own
     classification could not be fully resolved (see module doc) — every
     consumer reads `code`/`undecidable` through `_trigger_text`/
-    `_guard_text`, never directly."""
+    `_guard_text`, never directly. `in_heredoc_body` is True for a line
+    `_lex_stream` classified as opaque heredoc-body data (between a `<<
+    [-]TERM` opener line, exclusive, and its bare-`TERM` terminator line,
+    inclusive) — the span `_heredoc_aware_block_extent` consumes directly
+    instead of re-detecting heredoc openers itself."""
 
     code: str
     undecidable: bool
+    in_heredoc_body: bool = False
 
 
-def _lex_one_line(line: str, stack: list[_Frame]) -> tuple[str, bool]:
+def _lex_one_line(line: str, stack: list[_Frame]) -> tuple[str, bool, str | None]:
     """Advance `stack` (the CROSS-LINE nesting state -- mutated in place,
     shared across every line of one file) through exactly one physical
-    line, returning `(code, undecidable)` for THIS line. See module doc for
-    the full rule set; in short:
+    line, returning `(code, undecidable, heredoc_open)` for THIS line.
+    `heredoc_open` is the terminator name of a `<<[-]TERM` heredoc opener
+    recognized DURING this line's walk, or `None` if none was. See module
+    doc for the full rule set; in short:
 
     - Backslash escapes the next character in every state (including
       inside single quotes -- a deliberate simplification of real bash,
@@ -321,11 +341,27 @@ def _lex_one_line(line: str, stack: list[_Frame]) -> tuple[str, bool]:
       span is NOT flagged this way: `"$(...)"` spanning several physical
       lines is this codebase's single most common multi-line shape (a
       captured command's output), and it is ordinary, fully-tracked real
-      code, not opaque literal data."""
+      code, not opaque literal data.
+    - `<<`/`<<-` is a heredoc-opener TOKEN this lexer recognizes ONLY when
+      encountered at genuine top level (`top == "TOP"` -- stack completely
+      empty, never inside a quote or a `CMD`/`ARITH`/`PARAM` frame: a `<<`
+      inside `'<<REMOTE'` or `"$(... <<REMOTE ...)"` is data/nested-command
+      text, not this line's own heredoc redirection) AND only when it is
+      not the leading two characters of a `<<<` here-string operator (a
+      bare `<<<` is never treated as a heredoc opener at all -- checked
+      BEFORE attempting the terminator parse, so `<<<foo`'s inner `<<` can
+      never be mistaken for one either). This is a product of the lexer's
+      OWN character position, never a regex re-scan of the finished line --
+      the exact class of bug (a raw-line regex matching a `<<` sitting
+      inside an already-closed quote, or inside a `<<<` operator) that is
+      live on `test_gpu_prove_lane.sh:93`'s
+      `grep -n '<<REMOTE' "$PROVE_SH"` (a single-quoted, fully top-level-
+      resolved-by-line-end argument, not a real heredoc opener at all)."""
     n = len(line)
     i = 0
     comment_at: int | None = None
     undecidable = False
+    heredoc_open: str | None = None
     while i < n:
         c = line[i]
         if c == "\\":
@@ -391,6 +427,24 @@ def _lex_one_line(line: str, stack: list[_Frame]) -> tuple[str, bool]:
                 stack.append(_Frame("PARAM"))
                 i += 2
                 continue
+        if top == "TOP" and c == "<" and i + 1 < n and line[i + 1] == "<":
+            if i + 2 < n and line[i + 2] == "<":
+                # `<<<` here-string operator -- never a heredoc opener,
+                # and its inner `<<` (positions i+1, i+2) must never be
+                # re-examined as one either.
+                i += 3
+                continue
+            m = _HEREDOC_OPEN_AT_RE.match(line, i + 2)
+            if m:
+                if heredoc_open is None:
+                    heredoc_open = m.group(3)
+                i = m.end()
+                continue
+            # `<<` with no parseable terminator following (malformed, or a
+            # shape outside this lexer's scope) -- ordinary characters,
+            # never a heredoc opener, never an error.
+            i += 2
+            continue
         if top in ("CMD", "ARITH") and c == "(":
             stack[-1].paren_depth += 1
             i += 1
@@ -426,7 +480,7 @@ def _lex_one_line(line: str, stack: list[_Frame]) -> tuple[str, bool]:
     code = line[:comment_at] if comment_at is not None else line
     if stack and stack[-1].kind == "SQ":
         undecidable = True
-    return code, undecidable
+    return code, undecidable, heredoc_open
 
 
 def _lex_stream(lines: list[str]) -> list[_LineLex]:
@@ -436,37 +490,56 @@ def _lex_stream(lines: list[str]) -> list[_LineLex]:
     correctly across the boundary. A heredoc body (`<<[-]TERM` opener up to
     its bare-`TERM` terminator line) is the one exception: it is lexed with
     a FRESH, throwaway stack per line (matching how `_heredoc_aware_block_
-    extent` already treats it as opaque data) so that prose inside an
-    embedded script or comment can never leak cross-line quote state into
-    the real code that follows the heredoc's close. The heredoc opener
-    itself is recognized off this line's own (already-lexed) `code`, and
-    only once this line's OWN nesting has fully settled back to top level
-    (a `<<EOF` appearing while still inside some OTHER open construct is
-    not this scanner's concern -- it is data of whatever that construct
-    is, not a fresh heredoc at top level). If the file ends with the
-    nesting stack still non-empty, the final line is marked UNDECIDABLE:
+    extent` now reads it back out via `in_heredoc_body`) so that prose
+    inside an embedded script or comment can never leak cross-line quote
+    state into the real code that follows the heredoc's close. The heredoc
+    opener itself is a TOKEN `_lex_one_line` recognizes off its own
+    character position (top level, never inside a quote/frame, never the
+    `<<<` here-string operator -- see its own doc), never a regex re-scan
+    of the finished line; a candidate is only honored once this line's OWN
+    nesting has ALSO fully settled back to top level by line's end (a
+    `<<EOF` recognized while some OTHER construct opened earlier on the
+    same line remains unresolved past it is not this scanner's concern).
+
+    `unresolved_since` tracks the line index where the currently-still-open
+    frame stack OR heredoc most recently transitioned from resolved to
+    unresolved (reset to `None` the moment both fully resolve). If the file
+    ends with EITHER still unresolved, EVERY line from `unresolved_since`
+    through the last line is marked UNDECIDABLE -- not just the final line:
     a construct that never resolves by end of file is a shape this lexer's
-    "subset that matters" does not fully model (unmatched, or a bash
-    feature outside its scope, e.g. backtick command substitution or
-    `$'...'` ANSI-C quoting), and it must never be silently trusted."""
+    "subset that matters" does not fully model (unmatched, an unterminated
+    heredoc, or a bash feature outside its scope, e.g. backtick command
+    substitution or `$'...'` ANSI-C quoting), and NONE of the lines inside
+    that unresolved span -- not only the last one -- can be trusted to have
+    been read as real, resolved code."""
     stack: list[_Frame] = []
     out: list[_LineLex] = []
     heredoc_term: str | None = None
-    for line in lines:
+    unresolved_since: int | None = None
+    for idx, line in enumerate(lines):
         if heredoc_term is not None:
             if line.strip() == heredoc_term:
                 heredoc_term = None
-            code, undecidable = _lex_one_line(line, [])
-            out.append(_LineLex(code=code, undecidable=undecidable))
+                unresolved_since = None
+            code, undecidable, _ = _lex_one_line(line, [])
+            out.append(_LineLex(code=code, undecidable=undecidable, in_heredoc_body=True))
             continue
-        code, undecidable = _lex_one_line(line, stack)
-        if not stack:
-            m = _HEREDOC_OPEN_RE.search(code)
-            if m:
-                heredoc_term = m.group(1)
+        was_open = bool(stack)
+        code, undecidable, heredoc_open = _lex_one_line(line, stack)
+        now_open = bool(stack)
+        if not was_open and now_open:
+            unresolved_since = idx
+        elif was_open and not now_open:
+            unresolved_since = None
+        if heredoc_open is not None and not stack:
+            heredoc_term = heredoc_open
+            if unresolved_since is None:
+                unresolved_since = idx
         out.append(_LineLex(code=code, undecidable=undecidable))
-    if stack and out:
-        out[-1] = _LineLex(code=out[-1].code, undecidable=True)
+    if (stack or heredoc_term is not None) and out and unresolved_since is not None:
+        for i in range(unresolved_since, len(out)):
+            prev = out[i]
+            out[i] = _LineLex(code=prev.code, undecidable=True, in_heredoc_body=prev.in_heredoc_body)
     return out
 
 
@@ -487,43 +560,62 @@ def _guard_text(lex: _LineLex) -> str:
 
 
 def _independent_lex_stream(lines: list[str]) -> list[_LineLex]:
-    """A second, independently-structured implementation of the SAME bash
-    rule `_lex_stream` implements, used ONLY by the corpus self-test below
-    to cross-check `_lex_stream`'s comment-boundary decision on every
-    tracked line. Deliberately simpler: two plain quote booleans threaded
-    across lines (no `$(`/`$((`/`${` frame typing, no `ARITH`/`PARAM`
-    `#`-is-never-a-comment special case at all) -- sufficient because every
-    real corpus line where `_lex_stream`'s `ARITH`/`PARAM` exemption fires
-    is ALSO mid-word under the plain word-initial rule alone (`$((10#$N))`'s
-    `#` is preceded by a digit; `${var#pattern}`'s by an identifier
-    character), so the two implementations agree on this corpus without
-    this one ever needing to model that exemption. Coded as a TOKEN-DRIVEN
-    scan (`_INDEPENDENT_TOKEN_RE.finditer`, jumping from match to match)
-    rather than the primary's character-by-character `while i < n` walk --
-    a genuinely different mechanism for finding the same handful of
-    special characters, sharing only the heredoc-opener regex and the
-    word-initial delimiter set with the primary (both are settled,
-    independently-obvious constants -- what a heredoc opener looks like,
-    what a shell-word delimiter is -- not part of the comment-decision
-    LOGIC under test)."""
+    """A second, independently-written IMPLEMENTATION of the exact same
+    frame model `_lex_stream` implements -- SQ/DQ quoting plus `$(`/`$((`/
+    `${` nesting, the `ARITH`/`PARAM` `#`-is-never-a-comment exemption, and
+    a top-level-only `<<[-]TERM` heredoc opener that is never the `<<<`
+    here-string operator -- coded as a TOKEN-DRIVEN scan
+    (`_INDEPENDENT_TOKEN_RE.finditer`, jumping from match to match) instead
+    of the primary's character-by-character `while i < n` walk. This is
+    NOT a conceptually different or deliberately-simplified lexer -- an
+    earlier version of this docstring claimed one (two plain quote
+    booleans, no frame typing, no `ARITH`/`PARAM` exemption at all), but
+    that variant does not match the code below (which has always tracked
+    `B`/`A`/`P` frames and the `ARITH`/`PARAM` exemption -- see `top in
+    ("A", "P")` below) and, run for real, disagrees with the primary on 21
+    real corpus lines. What this function actually is: a hand-transliterated
+    re-implementation of the SAME rules via a genuinely different
+    mechanism (regex-token jumps rather than a per-character `if`/`elif`
+    chain), so a TRANSCRIPTION bug in either implementation -- a typo, a
+    dropped case, an off-by-one -- shows up as a corpus disagreement,
+    rather than testing two different CONCEPTS of what the rules should
+    be. It shares the word-initial delimiter set with the primary (a
+    settled, independently-obvious constant -- what a shell-word delimiter
+    is -- not part of the comment-decision logic under test) but has its
+    OWN, separately-written heredoc-opener detection (see `_INDEPENDENT_
+    TOKEN_RE`'s `<<<`/`<<-?` alternatives and `_independent_heredoc_term`
+    below) -- no shared regex constant with the primary's `_lex_one_line`,
+    because a SHARED heredoc-detection constant
+    is exactly where a bug in one implementation can hide from this
+    cross-check."""
     stack: list[list] = []
     out: list[_LineLex] = []
     heredoc_term: str | None = None
-    for line in lines:
+    unresolved_since: int | None = None
+    for idx, line in enumerate(lines):
         if heredoc_term is not None:
             if line.strip() == heredoc_term:
                 heredoc_term = None
-            code, undecidable = _independent_lex_one_line(line, [])
-            out.append(_LineLex(code=code, undecidable=undecidable))
+                unresolved_since = None
+            code, undecidable, _ = _independent_lex_one_line(line, [])
+            out.append(_LineLex(code=code, undecidable=undecidable, in_heredoc_body=True))
             continue
-        code, undecidable = _independent_lex_one_line(line, stack)
-        if not stack:
-            m = _HEREDOC_OPEN_RE.search(code)
-            if m:
-                heredoc_term = m.group(1)
+        was_open = bool(stack)
+        code, undecidable, heredoc_open = _independent_lex_one_line(line, stack)
+        now_open = bool(stack)
+        if not was_open and now_open:
+            unresolved_since = idx
+        elif was_open and not now_open:
+            unresolved_since = None
+        if heredoc_open is not None and not stack:
+            heredoc_term = heredoc_open
+            if unresolved_since is None:
+                unresolved_since = idx
         out.append(_LineLex(code=code, undecidable=undecidable))
-    if stack and out:
-        out[-1] = _LineLex(code=out[-1].code, undecidable=True)
+    if (stack or heredoc_term is not None) and out and unresolved_since is not None:
+        for i in range(unresolved_since, len(out)):
+            prev = out[i]
+            out[i] = _LineLex(code=prev.code, undecidable=True, in_heredoc_body=prev.in_heredoc_body)
     return out
 
 
@@ -531,13 +623,46 @@ def _independent_lex_stream(lines: list[str]) -> list[_LineLex]:
 # of the primary's per-character `if`/`elif` chain: an escape pair, a
 # quote, a bracket opener (`$((`, tried before the shorter `$(` so the
 # arithmetic form is never mis-tokenized as a command substitution plus a
-# stray `(`), a bare paren (nested grouping inside `$(...)`/`$((...))`), a
+# stray `(`), the `<<<` here-string operator (tried before the shorter
+# `<<-?` so a genuine here-string's leading two `<` are never themselves
+# mis-tokenized as a heredoc opener), a heredoc opener candidate (`<<`/
+# `<<-`), a bare paren (nested grouping inside `$(...)`/`$((...))`), a
 # bracket closer, or a `#`. Everything between matches is ordinary text
-# this scanner does not need to look at at all.
-_INDEPENDENT_TOKEN_RE = re.compile(r"\\.|\\\Z|'|\"|\$\(\(|\$\(|\$\{|\(|\)|\}|#")
+# this scanner does not need to look at at all. Deliberately its OWN
+# alternation, sharing no heredoc-recognizing pattern with the primary's
+# `_HEREDOC_OPEN_AT_RE` -- see `_independent_lex_stream`'s own doc for why.
+_INDEPENDENT_TOKEN_RE = re.compile(r"\\.|\\\Z|'|\"|\$\(\(|\$\(|\$\{|<<<|<<-?|\(|\)|\}|#")
 
 
-def _independent_lex_one_line(line: str, stack: list[list]) -> tuple[str, bool]:
+def _independent_heredoc_term(line: str, after: int) -> tuple[str, int] | None:
+    """Manually scans `line[after:]` (the text immediately following a
+    recognized `<<`/`<<-` token) for a heredoc terminator: optional
+    leading whitespace, an optional quote character, a bare identifier,
+    and an optional matching quote -- returning `(term, end_index)`, or
+    `None` if no identifier follows. Written as plain character indexing
+    rather than a regex, deliberately unlike the primary's own anchored-
+    regex opener parse (`_HEREDOC_OPEN_AT_RE`) -- this lexer's heredoc-
+    opener recognition shares no code with the primary's beyond the
+    settled, independently-obvious `_WORD_INITIAL_DELIMS` constant."""
+    n = len(line)
+    j = after
+    while j < n and line[j] in " \t":
+        j += 1
+    quote = line[j] if j < n and line[j] in "'\"" else None
+    if quote is not None:
+        j += 1
+    start = j
+    while j < n and (line[j].isalpha() or line[j] == "_" or (j > start and line[j].isdigit())):
+        j += 1
+    if j == start:
+        return None
+    term = line[start:j]
+    if quote is not None and j < n and line[j] == quote:
+        j += 1
+    return term, j
+
+
+def _independent_lex_one_line(line: str, stack: list[list]) -> tuple[str, bool, str | None]:
     """`stack` holds a `[kind, paren_depth]` PAIR per open construct
     (`kind` one of `S` single-quote, `D` double-quote, `B` `$(...)`
     closing on `)`, `A` `$((...))` closing on `))`, `P` `${...}` closing
@@ -545,9 +670,14 @@ def _independent_lex_one_line(line: str, stack: list[list]) -> tuple[str, bool]:
     frame so an inner grouping paren -- a subshell inside a command
     substitution, a parenthesized arithmetic sub-expression -- does not
     prematurely close it), threaded across lines exactly like the
-    primary's `_lex_one_line`."""
+    primary's `_lex_one_line`. Returns `(code, undecidable, heredoc_open)`,
+    `heredoc_open` being a terminator name recognized at genuine top level
+    (`top is None`, stack empty) via this lexer's OWN token/parse pair
+    (`<<<`/`<<-?` tokens plus `_independent_heredoc_term`), never the
+    primary's `_HEREDOC_OPEN_AT_RE`."""
     comment_at: int | None = None
     undecidable = False
+    heredoc_open: str | None = None
     pos = 0
     for m in _INDEPENDENT_TOKEN_RE.finditer(line):
         if m.start() < pos:
@@ -601,6 +731,22 @@ def _independent_lex_one_line(line: str, stack: list[list]) -> tuple[str, bool]:
             stack.append(["P", 0])
             pos = m.end()
             continue
+        if tok == "<<<":
+            # A `<<<` here-string operand is never a heredoc opener, in
+            # any frame -- this token consumes all three characters, so
+            # its own inner `<<` is never re-examined as one either.
+            pos = m.end()
+            continue
+        if tok in ("<<", "<<-") and top is None:
+            parsed = _independent_heredoc_term(line, m.end())
+            if parsed is not None:
+                term, end_idx = parsed
+                if heredoc_open is None:
+                    heredoc_open = term
+                pos = end_idx
+            else:
+                pos = m.end()
+            continue
         if tok == "(" and top in ("B", "A"):
             frame[1] += 1
             pos = m.end()
@@ -646,7 +792,7 @@ def _independent_lex_one_line(line: str, stack: list[list]) -> tuple[str, bool]:
     code = line[:comment_at] if comment_at is not None else line
     if stack and stack[-1][0] == "S":
         undecidable = True
-    return code, undecidable
+    return code, undecidable, heredoc_open
 
 
 def _guard_block_lines(lines: list[str], lex: list[_LineLex], start_idx: int) -> tuple[int, int]:
@@ -784,10 +930,19 @@ def _heredoc_aware_block_extent(lines: list[str], lex: list[_LineLex], start_idx
     (their DRY_RUN stub heredocs embed a `python3 -c '...'` payload whose
     own `if`/`else` statements never close with a bash `fi`).
 
-    `if`/`fi` tokens and the heredoc opener itself are recognized off
-    `_guard_text(lex[i])`, never the raw line — a comment's own bare "if"
-    (this codebase's own prose uses the word constantly) cannot perturb
-    the depth walk, and an UNDECIDABLE line contributes nothing either.
+    Heredoc bodies are identified purely by reading `lex[i].in_heredoc_
+    body` — the span `_lex_stream` already computed once for the whole
+    file — never by re-detecting the opener with a fresh regex scan here:
+    a second, independent heredoc-opener detector living in this function
+    (sharing `_lex_stream`'s own heredoc regex constant) is exactly the
+    kind of duplication that hides a bug (the false heredoc opened by `_HEREDOC_OPEN_RE`
+    matching inside an already-closed quote, or inside a `<<<` here-string,
+    on a raw-line re-scan that ignored the lexer's own position).
+
+    `if`/`fi` tokens are recognized off `_guard_text(lex[i])`, never the
+    raw line — a comment's own bare "if" (this codebase's own prose uses
+    the word constantly) cannot perturb the depth walk, and an UNDECIDABLE
+    line contributes nothing either.
 
     A DIFFERENT residual gap, disclosed rather than papered over with a
     refusal this scanner cannot actually back up: every regex in this
@@ -812,20 +967,16 @@ def _heredoc_aware_block_extent(lines: list[str], lex: list[_LineLex], start_idx
     """
     depth = 0
     end = start_idx
-    heredoc_term: str | None = None
     limit = min(len(lines), start_idx + _BLOCK_MAX_SCAN)
     for i in range(start_idx, limit):
         end = i
-        if heredoc_term is not None:
-            if lines[i].strip() == heredoc_term:
-                heredoc_term = None
+        if lex[i].in_heredoc_body:
+            # Opaque heredoc-body data, per the lexer's own already-computed
+            # span -- never inspected for `if`/`fi` tokens of its own.
             continue
         code = _guard_text(lex[i])
         for tok in _IF_FI_TOKEN_RE.findall(code):
             depth += 1 if tok == "if" else -1
-        m = _HEREDOC_OPEN_RE.search(code)
-        if m:
-            heredoc_term = m.group(1)
         if depth <= 0:
             break
     return start_idx, end
@@ -957,7 +1108,7 @@ def _self_test_lexer() -> list[str]:
     # A line with no `#` at all is returned unchanged.
     check(lex_one('echo "no hash here"')[0], _LineLex('echo "no hash here"', False), "no hash at all")
     # `$((10#$N))`: the base-literal `#` sits inside ARITH -- never a
-    # comment, decidable, code unchanged (round-6 audit false-strip fix,
+    # comment, decidable, code unchanged (false-strip case,
     # `runpod_lib.sh:155`/`:173`'s real shape).
     check(
         lex_one("RP_SSH_WAIT_SECS=$((10#$RP_SSH_WAIT_SECS))")[0],
@@ -965,7 +1116,7 @@ def _self_test_lexer() -> list[str]:
         "arithmetic base-literal # (runpod_lib.sh:155 shape)",
     )
     # `${var#pattern}`: the strip-operator `#` sits inside PARAM -- never a
-    # comment, decidable, code unchanged (round-6 audit false-strip fix,
+    # comment, decidable, code unchanged (false-strip case,
     # `test_pod_substrate.sh:1170`'s real shape).
     check(
         lex_one('rsync ${rsync_flags_line#rsync } "$X"')[0],
@@ -975,7 +1126,7 @@ def _self_test_lexer() -> list[str]:
     # A single-quoted region genuinely spanning multiple physical lines: a
     # line that CLOSES a quote opened several lines earlier, with real
     # code and a real trailing comment after the close, must have that
-    # comment correctly stripped -- the round-6 audit fail-open fix
+    # comment correctly stripped -- the fail-open case
     # (`pod_push_stamp.sh:353`'s real shape: `python3 -c '...'` piped
     # across several lines, the closing line reading `' "$stamp"
     # 2>/dev/null)" # trailing comment`).
@@ -1017,7 +1168,7 @@ def _self_test_corpus_lexer_agreement(repo_root: Path) -> list[str]:
     zero disagreements — a differential proof that the primary lexer's
     comment-boundary decision is not merely tuned to this file's own
     hand-picked fixtures, and a regression detector for either
-    implementation going forward. The five real lines the round-6 audit's
+    implementation going forward. The five real lines a
     differential scan found disagreeing with the OLD (pre-this-file)
     hand-rolled `_strip_comment` are pinned as explicit, named
     expectations below, not just implicitly covered by the general scan."""
@@ -1042,7 +1193,7 @@ def _self_test_corpus_lexer_agreement(repo_root: Path) -> list[str]:
     if disagreements > 20:
         failures.append(f"... and {disagreements - 20} more disagreements (truncated)")
 
-    # The five real lines pinned by name (round-6 audit differential scan):
+    # The five real lines pinned by name (differential corpus scan):
     # two live fail-opens (a closing quote misread as opening one, so a
     # real trailing comment was never stripped) and three false-strips (a
     # non-comment `#` misread as a comment marker, truncating real code).
@@ -1484,7 +1635,7 @@ def self_test() -> int:
 
     # The full corpus lexer-agreement scan (see its own doc): every
     # tracked line, two independent implementations, zero disagreements —
-    # including the five real lines the round-6 differential scan named.
+    # including the five real lines the differential corpus scan named.
     failures += _self_test_corpus_lexer_agreement(REPO_ROOT)
 
     if failures:

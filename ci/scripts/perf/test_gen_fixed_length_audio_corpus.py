@@ -390,6 +390,20 @@ class PoolCacheTests(unittest.TestCase):
                 ),
                 0,
             )
+            # Non-vacuousness control: `hit`'s call above must actually have
+            # taken the HIT branch (read the pool `_build_pool` already
+            # wrote for `miss`), not silently rebuilt it under a second
+            # cache key -- nothing else in this test would distinguish a
+            # cache-key bug (`hit` never matching `miss`'s key, and so
+            # rebuilding from scratch every time) from a real hit, since the
+            # WAV bytes would come out identical either way (same seed/
+            # shape). `miss` and `hit` share the exact same pool-shaping
+            # arguments, so exactly ONE cache-key subdirectory must exist
+            # after both calls.
+            subdirs_after_hit = [p for p in cache_dir.iterdir() if p.is_dir()]
+            self.assertEqual(
+                len(subdirs_after_hit), 1, "the hit call must reuse the miss call's cache key, not create a second one"
+            )
             uncached_all = self._sha256_tree(uncached)
             miss_all = self._sha256_tree(miss_out)
             hit_all = self._sha256_tree(hit_out)

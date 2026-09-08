@@ -1987,12 +1987,23 @@ impl CandleModel {
         let num_rows = texts.len();
 
         if num_rows == 0 {
+            // `(0, 0)`, not `(0, self.dimensions.hidden_size)`: the SHARED
+            // empty-batch shape every `BackendOutput` producer reports for a
+            // zero-row float-embedding head, embedded (`CandleModel`) and
+            // remote (`HttpBackend`) alike -- see `HttpBackend::
+            // forward_embeddings`'s own `inputs.is_empty()` arm for why
+            // `(0, 0)` (`BackendOutput`'s documented "no real embedding"
+            // shape) is the one both surfaces can report honestly, and
+            // `EmbeddingAdapter::adapt`'s `row_count == 0` branch for why
+            // this value is descriptive only, never load-bearing (it never
+            // reads `shapes` at all for an empty batch, only its own
+            // separately-known `dimensions` field).
             return Ok(BackendOutput {
                 float_outputs: vec![vec![]],
                 string_outputs: vec![],
                 row_status: vec![],
                 row_errors: vec![],
-                shapes: vec![(0, self.dimensions.hidden_size)],
+                shapes: vec![(0, 0)],
             });
         }
 
@@ -2085,12 +2096,14 @@ impl CandleModel {
         let num_rows = images.len();
 
         if num_rows == 0 {
+            // `(0, 0)` -- the shared empty-batch shape; see
+            // `forward_embedding`'s own `num_rows == 0` arm above for why.
             return Ok(BackendOutput {
                 float_outputs: vec![vec![]],
                 string_outputs: vec![],
                 row_status: vec![],
                 row_errors: vec![],
-                shapes: vec![(0, self.dimensions.hidden_size)],
+                shapes: vec![(0, 0)],
             });
         }
 
@@ -2184,12 +2197,14 @@ impl CandleModel {
         let num_rows = clips.len();
 
         if num_rows == 0 {
+            // `(0, 0)` -- the shared empty-batch shape; see
+            // `forward_embedding`'s own `num_rows == 0` arm above for why.
             return Ok(BackendOutput {
                 float_outputs: vec![vec![]],
                 string_outputs: vec![],
                 row_status: vec![],
                 row_errors: vec![],
-                shapes: vec![(0, self.dimensions.hidden_size)],
+                shapes: vec![(0, 0)],
             });
         }
 

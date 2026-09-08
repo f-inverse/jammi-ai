@@ -116,6 +116,72 @@ class TestFa2AbShShape(unittest.TestCase):
         self.assertIn("JAMMI_KERNELS_STRICT=1", block_body)
         self.assertIn("JAMMI_KERNELS_STRICT=1", flash_body)
 
+    def test_missing_leg_file_makes_sourcing_refuse_with_exit_2(self) -> None:
+        """`set -uo pipefail` has no `-e`: a failed `.` is not fatal on its
+        own, so without the `|| { ...; exit 2; }` guard on the source line,
+        a missing/broken `fa2_ab_leg.sh` would leave `fa2_ab_run_leg`
+        undefined and every leg call below it a silent command-not-found
+        that never touches `overall_rc` -- the script would print
+        `FA2AB_EXIT=0` having run ZERO real legs. This copies the REAL,
+        committed `fa2_ab.sh` into an isolated tempdir WITHOUT
+        `fa2_ab_leg.sh` beside it and actually runs it (never a grep) --
+        the source failure is reached before any `/root`-touching command,
+        so this is fully hermetic."""
+        with tempfile.TemporaryDirectory() as tmp:
+            copied = os.path.join(tmp, "fa2_ab.sh")
+            shutil.copy(SCRIPT, copied)
+            os.chmod(copied, os.stat(copied).st_mode | stat.S_IEXEC)
+            result = subprocess.run(
+                ["bash", copied], capture_output=True, text=True, check=False, timeout=15
+            )
+            self.assertEqual(
+                result.returncode,
+                2,
+                f"a missing fa2_ab_leg.sh must make fa2_ab.sh refuse with exit 2:\n"
+                f"stdout={result.stdout}\nstderr={result.stderr}",
+            )
+            self.assertIn("failed to source fa2_ab_leg.sh", result.stderr)
+
+    def test_lock_is_released_on_a_refusal_exit_via_the_real_trap_line(self) -> None:
+        """The exclusive-timing-box lock (`/root/TIMING_IN_PROGRESS`) is
+        acquired once, near the top of the script, well before the four
+        refusal `exit`s the sha-format check / `provenance` call / its
+        build_sha parse / the build_sha-vs-sha mismatch can each take --
+        without a `trap ... EXIT` right after the acquire, every one of
+        those four leaks the lock and wedges every later invocation behind
+        the `while [ -f ... ]; do sleep 20; done` acquire loop forever.
+        Rather than running the WHOLE script (which needs a live `/root`
+        checkout, network, and a GPU), this extracts the ACTUAL, committed
+        lock-acquire line and `trap` line verbatim via regex, substitutes a
+        tempdir path for `/root/TIMING_IN_PROGRESS` in both (never a
+        hand-written stand-in of either line), and runs them followed by a
+        synthetic refusal `exit` -- proving the REAL trap line releases the
+        REAL lock file on any exit, not only the script's own final `rm -f`
+        at the bottom."""
+        lock_acquire_m = re.search(
+            r"while \[ -f /root/TIMING_IN_PROGRESS \];.*TIMING_IN_PROGRESS\n", self.text
+        )
+        trap_m = re.search(r"trap 'rm -f /root/TIMING_IN_PROGRESS' EXIT\n", self.text)
+        self.assertIsNotNone(lock_acquire_m, "expected the lock-acquire line in fa2_ab.sh")
+        self.assertIsNotNone(trap_m, "expected a `trap ... EXIT` releasing the lock in fa2_ab.sh")
+        self.assertLess(
+            lock_acquire_m.start(),
+            trap_m.start(),
+            "the trap must be installed AFTER the lock is acquired, not before",
+        )
+        with tempfile.TemporaryDirectory() as tmp:
+            lock_path = os.path.join(tmp, "TIMING_IN_PROGRESS")
+            sub_lock_acquire = lock_acquire_m.group(0).replace("/root/TIMING_IN_PROGRESS", lock_path)
+            sub_trap = trap_m.group(0).replace("/root/TIMING_IN_PROGRESS", lock_path)
+            harness = "set -uo pipefail\n" + sub_lock_acquire + sub_trap + "exit 5\n"
+            result = subprocess.run(["bash", "-c", harness], capture_output=True, text=True, check=False)
+            self.assertEqual(result.returncode, 5)
+            self.assertFalse(
+                os.path.exists(lock_path),
+                "the trap must remove the lock file on a refusal exit, not only at the "
+                "script's normal end",
+            )
+
     def test_fa2_ab_sh_sources_the_leg_file_and_calls_the_shared_function(self) -> None:
         """`fa2_ab.sh`'s sweep loop must call `fa2_ab_run_leg` (never keep
         its own copy of the step body inline) after sourcing `fa2_ab_leg.sh`

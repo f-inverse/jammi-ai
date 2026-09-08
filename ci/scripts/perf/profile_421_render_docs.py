@@ -36,7 +36,13 @@ marker pair, in `docs/plans/66-tower-profile/README.md` unless noted:
     `arm == "A"` leg, or `D1 (<chain>+<chain> eager)`/`D2 (<chain> eager)`
     for a `D` leg, built from `kernels_disabled` in a FIXED canonical order
     (LoRA, LN, GELU -- `_KERNEL_LABEL_ORDER`) rather than the JSON array's
-    own order, which is not itself canonical.
+    own order, which is not itself canonical. A trailing `gate` column
+    prints `OK`/`FAILS` per row, read off `contract_validity.legs_failing`
+    (cross-checked against `legs[].contract_valid` by `_contract_validity`)
+    -- a row-level marker so a reader scanning the table alone (never the
+    surrounding prose) still sees which leg the contract's validity gate
+    excludes, the exact blind spot `htsat-A2`'s own un-marked row left
+    before this column existed.
   - `candidate-reasons`: one bullet per `candidate_decisions[]` entry,
     `` - **`<port>`** — <verdict>: "<reason>" `` -- the reason string
     verbatim, never elided (elision, where it appears in
@@ -210,12 +216,24 @@ def _leg_label(leg: dict) -> str:
 
 
 def render_measured_towers_table(artifact: dict) -> str:
+    """One row per `legs[]` entry, PLUS a `gate` column marking whether that
+    leg is decision-grade under the contract's own validity gate --
+    `contract_validity.legs_failing` (never a hard-coded leg id: a table row
+    with no in-table marker at all is exactly how `htsat-A2`'s own
+    exclusion went unnoticed reading the table alone -- module doc's
+    "measured-towers-table" section). `_contract_validity` cross-checks
+    that block against every `legs[].contract_valid` before this function
+    trusts either one, so the marker can never silently disagree with the
+    per-leg field it is drawn from.
+    """
+    failing = {row["leg_id"]: _failing_leg_reason(row) for row in _contract_validity(artifact)["legs_failing"]}
     rows = []
     for leg in artifact["legs"]:
         ps = leg["per_step"]
+        gate = "FAILS" if leg["leg_id"] in failing else "OK"
         rows.append(
             "| {tower} | {leg} | {dtype} | {wall:.4f} | {front:.4f} | {busy:.4f} | "
-            "{residual:.4f} | {front_pct:.1f} | {busy_pct:.1f} |".format(
+            "{residual:.4f} | {front_pct:.1f} | {busy_pct:.1f} | {gate} |".format(
                 tower=_TOWER_DISPLAY[leg["tower"]],
                 leg=_leg_label(leg),
                 dtype=leg["dtype"],
@@ -225,6 +243,7 @@ def render_measured_towers_table(artifact: dict) -> str:
                 residual=ps["residual_s_per_step"],
                 front_pct=ps["front_share_of_wall"] * 100,
                 busy_pct=ps["busy_share_of_wall"] * 100,
+                gate=gate,
             )
         )
     return "\n".join(rows)

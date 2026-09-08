@@ -49,7 +49,7 @@ The image column can be either:
   what a plain Parquet `Utf8` column becomes through a DataFusion scan under this workspace's
   pinned Arrow/DataFusion versions, so an ordinary registered source's path column takes this
   arm on the real, unmodified scan output — not just a hand-built array
-  (`arrow_to_images`, `crates/jammi-ai/src/inference/mod.rs:209`).
+  (`arrow_to_images`, `crates/jammi-ai/src/inference/mod.rs:210`).
 
 ## Image preprocessing
 

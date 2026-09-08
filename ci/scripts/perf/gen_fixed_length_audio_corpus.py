@@ -108,6 +108,7 @@ from __future__ import annotations
 import argparse
 import array
 import hashlib
+import inspect
 import io
 import json
 import math
@@ -115,13 +116,6 @@ import random
 import sys
 import wave
 from pathlib import Path
-
-# Bumped whenever the WAVEFORM-LEVEL construction below
-# (`_instance_samples`/`encode_wav`) changes in any way that could move
-# emitted WAV bytes -- part of `--pool-cache-dir`'s own cache key (see
-# `_pool_cache_key`) so a stale on-disk pool from a PRIOR producer version
-# can never be read back as if it were this version's own output.
-_PRODUCER_VERSION = "v1"
 
 # 16-bit signed PCM, mono -- the shape every `*_path` in the emitted JSONL
 # carries. Named constants so the assertions below and the module doc's
@@ -363,6 +357,67 @@ def _build_pool(
     return files
 
 
+# Every function `_build_pool`'s own call graph transitively reaches to turn
+# `(family, instance)` into emitted WAV bytes: `_instance_samples` (the
+# int16 sample array, itself calling `_family_fundamental_hz`/
+# `_family_harmonic_gains`) and `encode_wav` (the file bytes). Named by
+# STRING here, not by direct function reference, and looked up via
+# `globals()` at fingerprint time in `_pool_construction_fingerprint` -- a
+# tuple of function OBJECTS captured once at import time would keep
+# pointing at the ORIGINAL functions even after a caller monkeypatches the
+# module-level name, defeating the one property this fingerprint exists to
+# prove (a live code change moves the key).
+_POOL_CONSTRUCTION_FUNCTION_NAMES = (
+    "_instance_samples",
+    "_family_fundamental_hz",
+    "_family_harmonic_gains",
+    "encode_wav",
+)
+
+# The waveform/WAV constants `_instance_samples`/`encode_wav` close over
+# rather than take as arguments -- `inspect.getsource` captures a
+# function's SOURCE TEXT, which is just the name `_PEAK`, never the value
+# bound to it, so a change to one of these (e.g. the harmonic count or the
+# sample width) would move the emitted bytes without moving any function's
+# source text. Folded into the fingerprint by VALUE so that gap is closed
+# too.
+_POOL_CONSTRUCTION_CONSTANT_NAMES = (
+    "_PEAK",
+    "_PHASE_DIVISOR",
+    "_HARMONICS",
+    "_SAMPLE_WIDTH_BYTES",
+    "_CHANNELS",
+)
+
+
+def _pool_construction_fingerprint() -> str:
+    """Hex digest of the ACTUAL construction code, not a hand-maintained
+    version string: source text (`inspect.getsource`) of every function in
+    `_POOL_CONSTRUCTION_FUNCTION_NAMES`, plus the `repr()` of every constant
+    in `_POOL_CONSTRUCTION_CONSTANT_NAMES`, looked up fresh via `globals()`
+    on every call.
+
+    Hashing the whole MODULE FILE's bytes would also be a complete fix (it
+    covers everything below, plus every byte outside the construction path
+    -- CLI parsing, docstrings, the held-out-split logic -- that cannot
+    possibly change emitted waveform/WAV bytes), but a test cannot observe
+    it responding to a live code change: `Path(__file__).read_bytes()`
+    reads the file on DISK, which a `unittest.mock`/monkeypatch of a
+    module-level function or constant never touches, so a regression that
+    quietly changes what `_build_pool` emits without a matching source edit
+    would pass such a test the same way it passed the old hand-bumped
+    `_PRODUCER_VERSION` scheme this replaces. Hashing live function/constant
+    OBJECTS via `globals()` fixes that: monkeypatching `_instance_samples`
+    (or any name in either tuple above) changes what THIS function reads on
+    its very next call, so a test can assert the cache key moves under a
+    patch and stays put when nothing relevant changed -- the property this
+    replacement exists to prove."""
+    g = globals()
+    parts = [inspect.getsource(g[name]) for name in _POOL_CONSTRUCTION_FUNCTION_NAMES]
+    parts.append(repr(tuple(g[name] for name in _POOL_CONSTRUCTION_CONSTANT_NAMES)))
+    return hashlib.sha256("".join(parts).encode("utf-8")).hexdigest()[:32]
+
+
 def _pool_cache_key(
     families: int,
     instances_per_family: int,
@@ -374,11 +429,13 @@ def _pool_cache_key(
     """Filesystem-safe cache key over every argument `_build_pool` actually
     reads (`frames`, not the raw `--seconds` float, since `frames` is what
     the pool construction itself consumes -- see `frame_count`), plus
-    `_PRODUCER_VERSION` -- omitting any one of these would let two
+    `_pool_construction_fingerprint()` (the construction CODE itself, not a
+    hand-bumped version string) -- omitting any one of these would let two
     genuinely different pools collide on the same cache directory."""
     canonical = (
-        f"v={_PRODUCER_VERSION}|families={families}|instances={instances_per_family}|"
-        f"frames={frames}|sample_rate={sample_rate}|jitter={jitter}|seed={seed}"
+        f"fingerprint={_pool_construction_fingerprint()}|families={families}|"
+        f"instances={instances_per_family}|frames={frames}|sample_rate={sample_rate}|"
+        f"jitter={jitter}|seed={seed}"
     )
     return hashlib.sha256(canonical.encode("utf-8")).hexdigest()[:32]
 

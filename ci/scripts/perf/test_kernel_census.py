@@ -896,6 +896,59 @@ class CensusClass4GuardTests(unittest.TestCase):
             with self.assertRaises(kernel_census.CensusDatabaseError):
                 kernel_census.build_report(a, b, steps_a=1, steps_b=2)
 
+    def _make_sqlite_without_demangled_name_column(self, path: str, launches: int) -> None:
+        """A `CUPTI_ACTIVITY_KIND_KERNEL` table PRESENT and non-empty but
+        missing the `demangledName` column entirely -- a schema variant
+        `census()`'s own SELECT (which names `k.demangledName`) does not
+        match, so this must raise `KernelTableSchemaError`, never an
+        unhandled `sqlite3.OperationalError` traceback."""
+        con = sqlite3.connect(path)
+        cur = con.cursor()
+        cur.execute("CREATE TABLE StringIds (id INTEGER PRIMARY KEY, value TEXT)")
+        cur.execute(
+            "CREATE TABLE CUPTI_ACTIVITY_KIND_KERNEL "
+            "(shortName INTEGER, gridX INTEGER, gridY INTEGER, gridZ INTEGER, "
+            "blockX INTEGER, blockY INTEGER, blockZ INTEGER, start INTEGER, end INTEGER)"
+        )
+        cur.execute("CREATE TABLE CUPTI_ACTIVITY_KIND_MEMCPY (start INTEGER, end INTEGER)")
+        cur.execute("CREATE TABLE CUPTI_ACTIVITY_KIND_MEMSET (start INTEGER, end INTEGER)")
+        cur.execute("INSERT INTO StringIds (id, value) VALUES (1, 'k1')")
+        cur.executemany(
+            "INSERT INTO CUPTI_ACTIVITY_KIND_KERNEL VALUES (?,?,?,?,?,?,?,?,?)",
+            [(1, 1, 1, 1, 32, 1, 1, i * 1000, i * 1000 + 1000) for i in range(launches)],
+        )
+        con.commit()
+        con.close()
+
+    def test_kernel_table_missing_a_queried_column_refuses_typed_not_a_traceback(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            a = os.path.join(tmp, "a.sqlite")
+            b = os.path.join(tmp, "b.sqlite")
+            self._make_sqlite_without_demangled_name_column(a, 5)
+            _make_sqlite(b, _k1(1))
+            with self.assertRaises(kernel_census.KernelTableSchemaError):
+                kernel_census.build_report(a, b, steps_a=1, steps_b=2)
+
+    def test_kernel_table_missing_a_queried_column_on_b_also_refuses(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            a = os.path.join(tmp, "a.sqlite")
+            b = os.path.join(tmp, "b.sqlite")
+            _make_sqlite(a, _k1(1))
+            self._make_sqlite_without_demangled_name_column(b, 5)
+            with self.assertRaises(kernel_census.KernelTableSchemaError):
+                kernel_census.build_report(a, b, steps_a=1, steps_b=2)
+
+    def test_kernel_table_missing_a_queried_column_exits_10_via_main(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            a = os.path.join(tmp, "a.sqlite")
+            b = os.path.join(tmp, "b.sqlite")
+            out = os.path.join(tmp, "out.json")
+            self._make_sqlite_without_demangled_name_column(a, 5)
+            _make_sqlite(b, _k1(1))
+            rc = kernel_census.main([a, b, "1", "2", out])
+            self.assertEqual(rc, 10)
+            self.assertFalse(os.path.exists(out))
+
     def test_wall_pair_zero_or_negative_refuses(self):
         with tempfile.TemporaryDirectory() as tmp:
             a = os.path.join(tmp, "a.sqlite")

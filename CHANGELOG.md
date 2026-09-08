@@ -406,7 +406,10 @@ workspace ships every publishable crate at the same
 - **#421 profile-campaign follow-ups: five re-audit advisories closed with a landing gate each
   (esc-088).** `ci/scripts/perf/fa2_ab.sh`'s unlabeled `finetune-step` flash/block legs now pass
   `--expect-kernels-disabled` explicitly (empty on the flash leg), so the binary's own START/END
-  checks gate the req/fired claim rather than a printed line a human has to eyeball.
+  checks refuse (nonzero exit) any single leg whose req/fired claim disagrees with the real env
+  var, and the script itself now tracks every leg's exit status (and its own JSON-parse outcome)
+  into one cumulative `FA2AB_EXIT` the script exits with — a refused leg moves the script's own
+  exit status, not just a `FAILED` line a human has to notice in scrollback.
   `profile_356_legs.sh`/`lora_bias_ab.sh` no longer touch-empty their corpus outputs under
   `DRY_RUN` — `gen_fixed_width_corpus.py` now runs for real (via `run_corpus_cmd`) on every
   `corpus_mode`, including the E1/heldout dry-run stand-in. `profile_421_legs.sh`'s `DRY_RUN`

@@ -101,6 +101,7 @@ from __future__ import annotations
 import argparse
 import binascii
 import hashlib
+import inspect
 import json
 import math
 import random
@@ -108,13 +109,6 @@ import struct
 import sys
 import zlib
 from pathlib import Path
-
-# Bumped whenever the PIXEL-LEVEL construction below (`_family_template`/
-# `_jittered`/`encode_png`) changes in any way that could move emitted PNG
-# bytes -- part of `--pool-cache-dir`'s own cache key (see `_pool_cache_key`)
-# so a stale on-disk pool from a PRIOR producer version can never be read
-# back as if it were this version's own output.
-_PRODUCER_VERSION = "v1"
 
 # PNG magic (8 bytes), fixed by the format.
 _PNG_SIGNATURE = b"\x89PNG\r\n\x1a\n"
@@ -379,15 +373,65 @@ def _build_pool(
     return files
 
 
+# Every function `_build_pool`'s own call graph transitively reaches to turn
+# `(family, instance)` into emitted PNG bytes: `_family_template`/`_jittered`
+# (the pixel array) and `encode_png`/`_png_chunk` (the file bytes). Named by
+# STRING here, not by direct function reference, and looked up via
+# `globals()` at fingerprint time in `_pool_construction_fingerprint` --
+# a tuple of function OBJECTS captured once at import time would keep
+# pointing at the ORIGINAL functions even after a caller monkeypatches the
+# module-level name, defeating the one property this fingerprint exists to
+# prove (a live code change moves the key).
+_POOL_CONSTRUCTION_FUNCTION_NAMES = ("_family_template", "_jittered", "encode_png", "_png_chunk")
+
+# The byte-level PNG constants `encode_png`/`_png_chunk` close over rather
+# than take as arguments -- `inspect.getsource` captures a function's SOURCE
+# TEXT, which is just the name `_ZLIB_LEVEL`, never the value bound to it, so
+# a change to one of these (e.g. bumping the zlib level) would move the
+# emitted bytes without moving any function's source text. Folded into the
+# fingerprint by VALUE so that gap is closed too.
+_POOL_CONSTRUCTION_CONSTANT_NAMES = ("_PNG_SIGNATURE", "_COLOR_TYPE_RGB", "_BIT_DEPTH", "_ZLIB_LEVEL")
+
+
+def _pool_construction_fingerprint() -> str:
+    """Hex digest of the ACTUAL construction code, not a hand-maintained
+    version string: source text (`inspect.getsource`) of every function in
+    `_POOL_CONSTRUCTION_FUNCTION_NAMES`, plus the `repr()` of every constant
+    in `_POOL_CONSTRUCTION_CONSTANT_NAMES`, looked up fresh via `globals()`
+    on every call.
+
+    Hashing the whole MODULE FILE's bytes would also be a complete fix (it
+    covers everything below, plus every byte outside the construction path
+    -- CLI parsing, docstrings, the held-out-split logic -- that cannot
+    possibly change emitted pixel/PNG bytes), but a test cannot observe it
+    responding to a live code change: `Path(__file__).read_bytes()` reads
+    the file on DISK, which a `unittest.mock`/monkeypatch of a module-level
+    function or constant never touches, so a regression that quietly
+    changes what `_build_pool` emits without a matching source edit would
+    pass such a test the same way it passed the old hand-bumped
+    `_PRODUCER_VERSION` scheme this replaces. Hashing live function/constant
+    OBJECTS via `globals()` fixes that: monkeypatching `_family_template` (or
+    any name in either tuple above) changes what THIS function reads on its
+    very next call, so a test can assert the cache key moves under a patch
+    and stays put when nothing relevant changed -- the property this
+    replacement exists to prove."""
+    g = globals()
+    parts = [inspect.getsource(g[name]) for name in _POOL_CONSTRUCTION_FUNCTION_NAMES]
+    parts.append(repr(tuple(g[name] for name in _POOL_CONSTRUCTION_CONSTANT_NAMES)))
+    return hashlib.sha256("".join(parts).encode("utf-8")).hexdigest()[:32]
+
+
 def _pool_cache_key(
     families: int, instances_per_family: int, size: int, jitter: int, seed: int
 ) -> str:
     """Filesystem-safe cache key over every argument `_build_pool` actually
-    reads, plus `_PRODUCER_VERSION` -- omitting any one of these would let
-    two genuinely different pools collide on the same cache directory."""
+    reads, plus `_pool_construction_fingerprint()` (the construction CODE
+    itself, not a hand-bumped version string) -- omitting any one of these
+    would let two genuinely different pools collide on the same cache
+    directory."""
     canonical = (
-        f"v={_PRODUCER_VERSION}|families={families}|instances={instances_per_family}|"
-        f"size={size}|jitter={jitter}|seed={seed}"
+        f"fingerprint={_pool_construction_fingerprint()}|families={families}|"
+        f"instances={instances_per_family}|size={size}|jitter={jitter}|seed={seed}"
     )
     return hashlib.sha256(canonical.encode("utf-8")).hexdigest()[:32]
 

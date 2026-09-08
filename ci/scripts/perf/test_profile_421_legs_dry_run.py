@@ -81,7 +81,7 @@ def _real_head() -> str:
 # tempdir, created once when this module is imported and removed once the
 # whole test run (this file, run standalone OR under `unittest discover`)
 # finishes -- shared by EVERY `run_dry()` call across every test method
-# below via `PROFILE_421_LEGS_POOL_CACHE_DIR`. `profile_421_legs.sh`'s own
+# below via `PROFILE_421_LEGS_DRY_RUN_POOL_CACHE_DIR`. `profile_421_legs.sh`'s own
 # media producer calls (clip-vision/htsat, both the 12-leg sweep and the
 # P2 pre-flight) all share the SAME `(families, instances, size or
 # seconds/sample-rate, jitter, seed)` tuple (module-wide constants, never
@@ -103,7 +103,7 @@ def run_dry(out_dir, legs_only=None, extra_env=None):
     those producers emit a fixed family x instances pool regardless of the
     step counts, so one workload serves every test with no override needed.
 
-    `PROFILE_421_LEGS_POOL_CACHE_DIR` is set to this MODULE's own shared
+    `PROFILE_421_LEGS_DRY_RUN_POOL_CACHE_DIR` is set to this MODULE's own shared
     `_POOL_CACHE_DIR` on every call (opt-in, test-harness-only -- see that
     variable's own doc) unless `extra_env` explicitly overrides it.
     """
@@ -112,7 +112,7 @@ def run_dry(out_dir, legs_only=None, extra_env=None):
     env["OUT_DIR"] = out_dir
     env["NSYS_BIN"] = "/nonexistent/nsys-DRY-RUN-PLACEHOLDER"
     env["BENCH_BIN"] = "/nonexistent/jammi-bench-DRY-RUN-PLACEHOLDER"
-    env["PROFILE_421_LEGS_POOL_CACHE_DIR"] = _POOL_CACHE_DIR
+    env["PROFILE_421_LEGS_DRY_RUN_POOL_CACHE_DIR"] = _POOL_CACHE_DIR
     env.pop("PROFILE_421_STEPS_N", None)
     env.pop("PROFILE_421_STEPS_M", None)
     # A leftover JAMMI_KERNELS_DISABLE in the caller's environment must not
@@ -728,7 +728,7 @@ class DryRunSmokeTests(unittest.TestCase):
 
 class MediaPoolCacheTests(unittest.TestCase):
     """`--pool-cache-dir` wiring (esc-088 round-4, hermetic dry-run suite
-    runtime): `run_dry()` sets `PROFILE_421_LEGS_POOL_CACHE_DIR` to this
+    runtime): `run_dry()` sets `PROFILE_421_LEGS_DRY_RUN_POOL_CACHE_DIR` to this
     MODULE's own shared `_POOL_CACHE_DIR` on every call, and
     `profile_421_legs.sh` forwards it to every clip-vision/htsat media
     producer call as `--pool-cache-dir` (`POOL_CACHE_ARGS`). This asserts
@@ -778,14 +778,49 @@ class MediaPoolCacheTests(unittest.TestCase):
             self.assertEqual(len(self._pool_subdirs_by_extension(".png")), 1)
             self.assertEqual(len(self._pool_subdirs_by_extension(".wav")), 1)
 
-    def test_real_run_never_sets_the_cache_dir_env_var(self):
-        """The variable name itself must never leak into a real (non-test)
-        invocation's env by way of this test file -- `run_dry` is the ONLY
-        place in this suite that sets it, and it always points at this
-        module's own throwaway tempdir, never a path a real leg sweep
-        would recognize as meaningful."""
-        self.assertTrue(os.path.isdir(_POOL_CACHE_DIR))
-        self.assertNotIn("PROFILE_421_LEGS_POOL_CACHE_DIR", os.environ)
+    def test_a_non_dry_invocation_with_the_cache_dir_var_set_refuses_at_preflight_by_name(self):
+        """`PROFILE_421_LEGS_DRY_RUN_POOL_CACHE_DIR` is named INTO the
+        `*_DRY_RUN_*` knob class precisely so a real
+        (non-dry) invocation that somehow inherits it refuses LOUDLY, by
+        name, before any leg runs -- exactly the
+        `TruncateCorpusVarPreflightGuardTests` posture for its own sibling
+        lever. `PROFILE_421_LEGS_DRY_RUN` is genuinely UNSET (never merely
+        "0") and `MODEL_DIR_CLIP`/`MODEL_DIR_CLAP` are ALSO left unset, so
+        the run would refuse LATER anyway (the missing-MODEL_DIR check) if
+        this refusal did not fire FIRST -- the assertion is on WHICH
+        refusal wins."""
+        with tempfile.TemporaryDirectory() as out_dir:
+            env = dict(os.environ)
+            env.pop("PROFILE_421_LEGS_DRY_RUN", None)
+            env.pop("MODEL_DIR_CLIP", None)
+            env.pop("MODEL_DIR_CLAP", None)
+            env.pop("JAMMI_KERNELS_DISABLE", None)
+            env["OUT_DIR"] = out_dir
+            env["NSYS_BIN"] = "/nonexistent/nsys-DRY-RUN-PLACEHOLDER"
+            env["BENCH_BIN"] = "/nonexistent/jammi-bench-DRY-RUN-PLACEHOLDER"
+            env["PROFILE_421_LEGS_DRY_RUN_POOL_CACHE_DIR"] = _POOL_CACHE_DIR
+            result = subprocess.run(
+                ["bash", SCRIPT], env=env, capture_output=True, text=True, timeout=300
+            )
+            self.assertEqual(result.returncode, 2, _fail_msg(result))
+            self.assertIn(
+                "PROFILE_421_LEGS_DRY_RUN_POOL_CACHE_DIR", result.stderr, _fail_msg(result)
+            )
+            # WHICH refusal fires first: the MODEL_DIR check never gets a
+            # chance to run (it would have refused too, since MODEL_DIR_*
+            # are also unset here), so its own message must not appear.
+            self.assertNotIn("MODEL_DIR_CLIP", result.stderr, _fail_msg(result))
+            self.assertEqual(list(Path(out_dir).rglob("manifest.json")), [], _fail_msg(result))
+
+    def test_the_cache_dir_var_with_dry_run_set_does_not_hit_this_refusal(self):
+        """The non-vacuity control: the SAME lever value, with
+        `PROFILE_421_LEGS_DRY_RUN=1` genuinely set (exactly what `run_dry`
+        does for every other test in this class), must NOT hit this
+        preflight refusal."""
+        with tempfile.TemporaryDirectory() as out_dir:
+            result = run_dry(out_dir, legs_only="clip-text-A1")
+            self.assertEqual(result.returncode, 0, _fail_msg(result))
+            self.assertNotIn("PROFILE_421_LEGS_DRY_RUN_POOL_CACHE_DIR is set", result.stderr)
 
 
 class CheckpointIdentityPreflightTests(unittest.TestCase):

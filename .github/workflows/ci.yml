@@ -1565,6 +1565,16 @@ jobs:
           # not a skip" reasoning as the other `perf/test_*.py` suites above.
           - name: perf kernel_census suite
             cmd: python3 ci/scripts/perf/test_kernel_census.py
+          # `gen_nsys_kernel_fixture.py`'s own self-test: builds both
+          # committed `n.sqlite`/`m.sqlite` counts
+          # fresh into a temp dir and drives `kernel_census.build_report`
+          # against them (mirrors `profile_421_legs.sh`'s DRY_RUN real
+          # call site), then asserts the freshly-built bytes are BYTE-
+          # IDENTICAL to the checked-in fixtures -- fixture determinism
+          # (no RNG, no wall-clock, fixed StringIds ordering) is a GATE
+          # here, not a doc note a future edit can silently invalidate.
+          - name: perf nsys kernel fixture self-test
+            cmd: python3 ci/scripts/perf/fixtures/nsys_kernel_census/gen_nsys_kernel_fixture.py --self-test
           # `convert_legacy_bert_checkpoint.py`'s own suite (#356 census
           # execution fix, defect 2): the `renamed_name` suffix-anchored
           # string logic is covered unconditionally; `convert`'s
@@ -1709,21 +1719,25 @@ jobs:
           # no GPU, no real jammi-bench, no real checkpoint, no network.
           - name: lora_bias_ab.sh dry-run smoke
             cmd: python3 ci/scripts/perf/test_lora_bias_ab_sh_dry_run.py
-          # `fa2_ab.sh`'s own shape test (#421 follow-ups, re-audit
-          # advisory): before this test, the shell PRODUCER — a manual,
+          # `fa2_ab.sh`'s own shape test: the shell PRODUCER is a manual,
           # exclusive-timing-box script with hardcoded `/root/...` paths
-          # and no `DRY_RUN` support at all — had ZERO automated coverage
-          # anywhere in this repo's CI. Rather than a dry-run execution
-          # (there is no producer pipeline downstream of it to exercise
-          # hermetically), this greps the COMMITTED command-array text for
-          # both `finetune-step` legs: the block leg must name its own
-          # `JAMMI_KERNELS_DISABLE=$K` key back via
-          # `--expect-kernels-disabled "$K"`, and the flash leg must pass
-          # `--expect-kernels-disabled ""` — an exact-set-equality guard
-          # against an ambient `JAMMI_KERNELS_DISABLE` leaking into the
-          # "flash" leg from the calling shell — plus a `bash -n` parse
-          # check and a `shellcheck -S warning` pass. No GPU, no network,
-          # no `/root` path ever touched.
+          # and no `DRY_RUN` support at all, so this covers its flash/block
+          # leg LABELING shape specifically -- a narrower and DIFFERENT
+          # property than `check_producer_provenance_gates.py`'s own
+          # producer-parity check (that check covers fa2_ab.sh's
+          # provenance/build_sha cross-check; see that script's own module
+          # doc), never a claim of the same coverage restated here. Rather
+          # than a dry-run execution (there is no producer pipeline
+          # downstream of it to exercise hermetically), this greps the
+          # COMMITTED command-array text for both `finetune-step` legs: the
+          # block leg must name its own `JAMMI_KERNELS_DISABLE=$K` key back
+          # via `--expect-kernels-disabled "$K"`, and the flash leg must
+          # pass `--expect-kernels-disabled ""` — an exact-set-equality
+          # guard against an ambient `JAMMI_KERNELS_DISABLE` leaking into
+          # the "flash" leg from the calling shell — plus a `bash -n` parse
+          # check, a `shellcheck -S warning` pass, and a real bash-harness
+          # execution proving a refused leg moves the script's own exit
+          # status. No GPU, no network, no `/root` path ever touched.
           - name: fa2_ab.sh shape
             cmd: python3 ci/scripts/perf/test_fa2_ab_sh.py
     steps:

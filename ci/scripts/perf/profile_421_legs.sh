@@ -118,6 +118,18 @@
 #                                    honours the same var over ITS OWN path
 #                                    names (train_jsonl/heldout_ids/
 #                                    heldout_jsonl -- P2 has no M run).
+#   PROFILE_421_LEGS_DRY_RUN_POOL_CACHE_DIR
+#                                    TEST-ONLY (never set by a real run;
+#                                    REFUSED at preflight, exit 2, unless
+#                                    PROFILE_421_LEGS_DRY_RUN=1 is also set):
+#                                    a suite-level tempdir a test harness
+#                                    owns, passed straight through to the
+#                                    media corpus producers' own
+#                                    `--pool-cache-dir` so their fixed family
+#                                    x instances pool synthesizes once
+#                                    across many hermetic subprocess
+#                                    invocations of this whole script,
+#                                    byte-identical either way.
 #   PROFILE_421_P2_BF16              "1" runs the BF16 PRE-FLIGHT MODE
 #                                    (contract "## P2" / v2.3 §D4 item 4)
 #                                    instead of the 12-leg sweep, and exits:
@@ -263,6 +275,22 @@ if [ -n "${PROFILE_421_LEGS_DRY_RUN_TRUNCATE_CORPUS_VAR:-}" ] && [ "$PROFILE_421
   exit 2
 fi
 
+# `PROFILE_421_LEGS_DRY_RUN_POOL_CACHE_DIR` is named INTO the
+# `*_DRY_RUN_*` knob class, exactly like
+# `PROFILE_421_LEGS_DRY_RUN_TRUNCATE_CORPUS_VAR` above -- a real leg sweep
+# must never set it either. It is a TEST-ONLY lever: a test
+# harness driving MANY separate subprocess invocations of this whole script
+# sets it to a suite-level tempdir so the media producers' `--pool-cache-dir`
+# can synthesize their fixed family x instances pool once and read it back
+# on every later call (see `POOL_CACHE_ARGS` below). Same refusal posture as
+# the truncate-corpus lever just above, for the same reason: this refuses
+# LOUDLY, by name, before any leg runs, rather than trusting every future
+# caller to remember the DRY_RUN convention.
+if [ -n "${PROFILE_421_LEGS_DRY_RUN_POOL_CACHE_DIR:-}" ] && [ "$PROFILE_421_LEGS_DRY_RUN" != "1" ]; then
+  echo "::error::PROFILE_421_LEGS_DRY_RUN_POOL_CACHE_DIR is set ('$PROFILE_421_LEGS_DRY_RUN_POOL_CACHE_DIR') without PROFILE_421_LEGS_DRY_RUN=1 -- refusing before any leg runs. This lever is TEST-ONLY: it exists so a hermetic test harness can cache the media producers' fixed pool across many subprocess invocations of this script, and a real leg sweep must always synthesize its own pool fresh. Unset it, or set PROFILE_421_LEGS_DRY_RUN=1, before running this driver." >&2
+  exit 2
+fi
+
 mkdir -p "$OUT_DIR"
 
 if [ "$PROFILE_421_LEGS_DRY_RUN" != "1" ]; then
@@ -335,12 +363,18 @@ run_corpus_cmd() {
 # off disk on every later call sharing its `(families, instances, size or
 # seconds/sample-rate, jitter, seed)` tuple -- byte-identical either way
 # (see each producer's own `PoolCacheTests`). A test harness sets
-# `PROFILE_421_LEGS_POOL_CACHE_DIR` to a SUITE-LEVEL tempdir it owns; a
+# `PROFILE_421_LEGS_DRY_RUN_POOL_CACHE_DIR` to a SUITE-LEVEL tempdir it owns; a
 # real run never sets it, so `POOL_CACHE_ARGS` stays empty and every media
-# call below is byte-for-byte what it always was.
+# call below is byte-for-byte what it always was. Read ONLY inside the
+# `PROFILE_421_LEGS_DRY_RUN=1` region -- belt-and-suspenders alongside the
+# preflight refusal above (which already exits before this line is ever
+# reached on a non-dry invocation): the `*_DRY_RUN_*` knob class this lever
+# was renamed into is a structural conjunct on `PROFILE_421_LEGS_DRY_RUN`,
+# never a bare env lookup a future refactor could accidentally move above
+# the preflight check.
 POOL_CACHE_ARGS=()
-if [ -n "${PROFILE_421_LEGS_POOL_CACHE_DIR:-}" ]; then
-  POOL_CACHE_ARGS=(--pool-cache-dir "$PROFILE_421_LEGS_POOL_CACHE_DIR")
+if [ "$PROFILE_421_LEGS_DRY_RUN" = "1" ] && [ -n "${PROFILE_421_LEGS_DRY_RUN_POOL_CACHE_DIR:-}" ]; then
+  POOL_CACHE_ARGS=(--pool-cache-dir "$PROFILE_421_LEGS_DRY_RUN_POOL_CACHE_DIR")
 fi
 
 # --- provenance cross-check (unification contract C5.1): refuse BEFORE any

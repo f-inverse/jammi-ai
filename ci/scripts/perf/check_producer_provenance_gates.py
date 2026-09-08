@@ -38,16 +38,16 @@ Both are deliberately mechanical (name/pattern presence), not a semantic
 understanding of the guard's control flow — the same "grep for the shape,
 not the meaning" stance `check_ci_guard_wiring.py`'s own module doc states.
 
-## (C) `*_DRY_RUN_*` knob admissibility — the class widened beyond `*FAKE*`
+## (C) `*_DRY_RUN_*` knob admissibility — a second knob shape beyond `*FAKE*`
 
-(A) only ever looked at names containing the literal substring `FAKE`.
-#421 follow-ups round (esc-088 round-3 advisory) landed a SECOND shape of
-dry-run-only test lever that carries no `FAKE` in its name at all —
-`profile_421_legs.sh`'s `PROFILE_421_LEGS_DRY_RUN_EXTRA_REQUESTED_KEY` /
-`_TRUNCATE_CORPUS_VAR` and `lora_bias_ab.sh`'s `LORA_BIAS_AB_DRY_RUN_FAIL_OP`
+(A) only ever looks at names containing the literal substring `FAKE`. A
+SECOND shape of dry-run-only test lever carries no `FAKE` in its name at
+all — `profile_421_legs.sh`'s `PROFILE_421_LEGS_DRY_RUN_EXTRA_REQUESTED_KEY`
+/ `_TRUNCATE_CORPUS_VAR` and `lora_bias_ab.sh`'s `LORA_BIAS_AB_DRY_RUN_FAIL_OP`
 / `_FAIL_PREDICATE` — every one named `<PREFIX>_DRY_RUN_<SUFFIX>`, i.e. the
 producer's OWN dry-run toggle (`<PREFIX>_DRY_RUN`) with a real suffix
-appended, structurally invisible to (A)'s `FAKE`-only name filter.
+appended, structurally invisible to (A)'s `FAKE`-only name filter. (C)
+below closes that gap.
 
 A knob in this class is admissible by EITHER of two routes (never both
 required):
@@ -303,6 +303,27 @@ def _heredoc_aware_block_extent(lines: list[str], start_idx: int) -> tuple[int, 
     inline comment on an otherwise-code line is a disclosed residual gap
     (not hit by either tracked producer today) rather than something this
     mechanical, grep-shaped scanner attempts to strip.
+
+    A second, DIFFERENT residual gap, disclosed alongside the one above
+    rather than papered over with a refusal this scanner cannot actually
+    back up: every regex in this module (`FAKE_VAR_RE`, `DRY_RUN_VAR_RE`,
+    `DRY_RUN_KNOB_RE`) matches a LITERAL identifier appearing in the
+    script's own text. A knob name built at RUNTIME -- bash indirect
+    expansion (`${!name}`), `eval "$name=..."`, or a name assembled by
+    string concatenation (`"${PREFIX}_DRY_RUN_${SUFFIX}"`) -- never
+    appears as that literal substring anywhere in the file, so neither
+    this containment/refusal walker nor (A)'s inertness check can see it
+    at all: not a false negative on a knob it inspected and misjudged, but
+    a knob it never knew existed. Not hit by any tracked producer today
+    (every real knob in this file is a bash-conventional literal
+    `NAME="${NAME:-default}"` declaration, never an indirect/constructed
+    one) -- this scanner staying grep-shaped for the two failure classes
+    it DOES catch is the same tradeoff its own module doc already states
+    for (A)/(B) ("mechanical... not a semantic understanding"), not a gap
+    this file should try to close by refusing the pattern outright (a
+    producer author who genuinely needs indirect expansion for an
+    unrelated reason would then be blocked by a check that cannot
+    actually evaluate whether THEIR specific use is safe).
     """
     depth = 0
     end = start_idx

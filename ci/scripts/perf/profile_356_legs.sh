@@ -259,13 +259,13 @@ run_cmd() {
 # ALWAYS executes, even under `PROFILE_356_LEGS_DRY_RUN=1` --
 # `gen_fixed_width_corpus.py` is CPU-hermetic (no GPU, no network, no
 # `$NSYS_BIN`/`$BENCH_BIN`) and cheap (well under a second at every row
-# count this driver uses). Touch-emptying `$full_corpus`/the N-slice under
-# DRY_RUN used to mean NO automated test anywhere ever exercised this
-# producer's own argv/stdout interface for real -- a bug there was
-# invisible to the whole hermetic suite and would only surface on a real
-# pod run (`.jammi/escapes.jsonl`). Running it for real under DRY_RUN too
-# closes that gap. The child's own stdout is forwarded to THIS SCRIPT's
-# stderr -- the same place `_print_cmd`'s trace line already goes, and for
+# count this driver uses). Running it for real under DRY_RUN (rather than
+# touch-emptying `$full_corpus`/the N-slice) is what makes the hermetic
+# suite exercise this producer's own argv/stdout interface for real on
+# every run -- a bug there is visible to CI rather than only surfacing on
+# a real pod run (`.jammi/escapes.jsonl`'s own admissible-escape class).
+# The child's own stdout is forwarded to THIS SCRIPT's stderr -- the same
+# place `_print_cmd`'s trace line already goes, and for
 # the same reason: never leave it on a channel a future capture point
 # could pick up again.
 run_corpus_cmd() {

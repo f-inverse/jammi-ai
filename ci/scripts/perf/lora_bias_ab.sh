@@ -275,12 +275,13 @@ _print_cmd() {
 # unlike a plain `if [ "$LORA_BIAS_AB_DRY_RUN" != "1" ]` guard, this ALWAYS
 # executes, even under `LORA_BIAS_AB_DRY_RUN=1` -- `gen_fixed_width_corpus.py`
 # is CPU-hermetic (no GPU, no network, no `$BENCH_BIN`) and cheap at every
-# row count this driver uses. Touch-emptying `$full`/`$n_file` under
-# DRY_RUN used to mean NO automated test anywhere ever exercised this
-# producer's own argv/stdout interface for real in `_corpus_for` -- a bug
-# there was invisible to the whole hermetic suite and would only surface
-# on a real pod run. The child's own stdout is forwarded to THIS SCRIPT's
-# stderr -- the same place `_print_cmd`'s trace line already goes, and for
+# row count this driver uses. Running it for real under DRY_RUN (rather
+# than touch-emptying `$full`/`$n_file`) is what makes the hermetic suite
+# exercise this producer's own argv/stdout interface for real in
+# `_corpus_for` on every run -- a bug there is visible to CI rather than
+# only surfacing on a real pod run. The child's own stdout is forwarded to
+# THIS SCRIPT's stderr -- the same place `_print_cmd`'s trace line already
+# goes, and for
 # the same reason: never leave it on a channel a future capture point
 # could pick up again.
 run_corpus_cmd() {

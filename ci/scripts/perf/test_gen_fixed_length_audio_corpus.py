@@ -313,14 +313,33 @@ class PoolCacheTests(unittest.TestCase):
         }
 
     def test_cache_hit_and_miss_are_byte_identical_to_the_uncached_path(self):
+        """Drives the PRODUCTION shape
+        (`--heldout-rows`/`--heldout-families`, exactly as
+        `profile_421_legs.sh` calls this producer) and compares EVERY
+        emitted file, not just the WAVs -- `triplets.jsonl`,
+        `heldout_ids.txt`, and `heldout_triplets.jsonl` all move under a
+        `--rows`/held-out-shape change the same way the audio pool moves
+        under a `--families`/`--seed` change, and a parity oracle that only
+        ever looked at `.wav` names could not catch a regression in any of
+        the three.
+
+        `uncached` and `miss` share the EXACT SAME arguments (including
+        `--rows`), so every file they emit -- pool WAVs AND
+        rows/held-out-derived JSONL/txt -- must be byte-for-byte identical.
+        `hit` deliberately varies `--rows` (never part of the pool cache
+        key -- see `_pool_cache_key`), so only its WAVs are compared; its
+        JSONL/held-out files differ from the other two BY DESIGN, proving
+        `--rows` reaches the row/held-out output without disturbing the
+        cached pool."""
         with tempfile.TemporaryDirectory() as tmp:
             uncached = Path(tmp) / "uncached"
             cache_dir = Path(tmp) / "cache"
             miss_out = Path(tmp) / "miss"
             hit_out = Path(tmp) / "hit"
             common = [
-                "--rows", "5", "--seconds", "0.05", "--sample-rate", "16000", "--seed", "3",
-                "--families", "4", "--instances-per-family", "3",
+                "--rows", "8", "--seconds", "0.05", "--sample-rate", "16000", "--seed", "3",
+                "--families", "6", "--instances-per-family", "3",
+                "--heldout-rows", "4", "--heldout-batch", "2", "--heldout-families", "2",
             ]
             self.assertEqual(gfa.main([*common, "--out-dir", str(uncached)]), 0)
             # First cached call: a cache MISS (builds + populates the cache).
@@ -334,18 +353,34 @@ class PoolCacheTests(unittest.TestCase):
                 gfa.main(
                     [
                         "--rows", "2", "--seconds", "0.05", "--sample-rate", "16000",
-                        "--seed", "3", "--families", "4", "--instances-per-family", "3",
+                        "--seed", "3", "--families", "6", "--instances-per-family", "3",
+                        "--heldout-rows", "2", "--heldout-batch", "2", "--heldout-families", "2",
                         "--out-dir", str(hit_out), "--pool-cache-dir", str(cache_dir),
                     ]
                 ),
                 0,
             )
-            uncached_wavs = {k: v for k, v in self._sha256_tree(uncached).items() if k.endswith(".wav")}
-            miss_wavs = {k: v for k, v in self._sha256_tree(miss_out).items() if k.endswith(".wav")}
-            hit_wavs = {k: v for k, v in self._sha256_tree(hit_out).items() if k.endswith(".wav")}
-            self.assertTrue(uncached_wavs, "no WAVs found -- test is vacuous")
-            self.assertEqual(uncached_wavs, miss_wavs)
+            uncached_all = self._sha256_tree(uncached)
+            miss_all = self._sha256_tree(miss_out)
+            hit_all = self._sha256_tree(hit_out)
+            expected_names = {
+                "triplets.jsonl", "heldout_ids.txt", "heldout_triplets.jsonl",
+            }
+            self.assertTrue(expected_names.issubset(uncached_all), uncached_all.keys())
+            self.assertTrue(any(k.endswith(".wav") for k in uncached_all), "no WAVs -- test is vacuous")
+            # Identical arguments -> EVERY emitted file byte-identical.
+            self.assertEqual(uncached_all, miss_all)
+            # Different --rows/held-out-rows -> pool WAVs still identical...
+            uncached_wavs = {k: v for k, v in uncached_all.items() if k.endswith(".wav")}
+            hit_wavs = {k: v for k, v in hit_all.items() if k.endswith(".wav")}
             self.assertEqual(uncached_wavs, hit_wavs)
+            # ...but the row/held-out-derived files differ BY DESIGN (a
+            # different --rows/--heldout-rows genuinely changes their
+            # content) -- asserting the difference keeps this a real
+            # non-vacuous control, not an accidental byte-identity that
+            # would mask a cache bug leaking downstream output.
+            for name in expected_names:
+                self.assertNotEqual(uncached_all[name], hit_all[name], name)
 
     def test_a_different_pool_shape_gets_a_different_cache_key(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -374,6 +409,50 @@ class PoolCacheTests(unittest.TestCase):
             ])
             after = set(Path(tmp).iterdir())
             self.assertEqual(after - before, {Path(tmp) / "out"})
+
+    def test_monkeypatching_a_construction_function_moves_the_cache_key(self):
+        """The cache key must depend on the ACTUAL
+        construction code, not a hand-bumped version string that a real edit
+        can forget to bump. Patching `_instance_samples` (one of
+        `_pool_construction_fingerprint`'s own named functions) to a
+        DIFFERENT implementation must move `_pool_cache_key`'s output even
+        though every numeric argument stays the same."""
+        # families, instances_per_family, frames, sample_rate, jitter, seed
+        args = (4, 3, 800, 16000, 200, 1)
+        before = gfa._pool_cache_key(*args)
+        original = gfa._instance_samples
+
+        def _different_instance_samples(family, instance, frames, sample_rate, rng, jitter):
+            return original(family, instance, frames, sample_rate, rng, jitter)
+
+        gfa._instance_samples = _different_instance_samples
+        try:
+            after = gfa._pool_cache_key(*args)
+        finally:
+            gfa._instance_samples = original
+        self.assertNotEqual(before, after, "monkeypatched construction code did not move the key")
+        self.assertEqual(before, gfa._pool_cache_key(*args))
+
+    def test_unchanged_construction_code_hits_the_same_cache_key(self):
+        """The non-vacuity control on the test above: calling the key
+        function twice with nothing patched must be IDENTICAL."""
+        args = (4, 3, 800, 16000, 200, 1)
+        self.assertEqual(gfa._pool_cache_key(*args), gfa._pool_cache_key(*args))
+
+    def test_monkeypatching_an_unrelated_module_function_never_moves_the_key(self):
+        """The negative control: patching a function OUTSIDE
+        `_POOL_CONSTRUCTION_FUNCTION_NAMES` (e.g. `_clip_name`, which names
+        files but never touches waveform/WAV bytes) must NOT move the cache
+        key."""
+        args = (4, 3, 800, 16000, 200, 1)
+        before = gfa._pool_cache_key(*args)
+        original = gfa._clip_name
+        gfa._clip_name = lambda family, instance: "unrelated"
+        try:
+            after = gfa._pool_cache_key(*args)
+        finally:
+            gfa._clip_name = original
+        self.assertEqual(before, after)
 
 
 class FractionalSecondsTests(unittest.TestCase):

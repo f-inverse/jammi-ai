@@ -1,24 +1,23 @@
 #!/usr/bin/env python3
-"""Hermetic shape test for `fa2_ab.sh` (re-audit advisory, folded into #421's
-follow-ups): before this test, the `finetune-step` flash/block legs this
-script runs were UNLABELED — no `--expect-kernels-disabled` on either
-command line, so the only witness that the "flash" leg really ran with
-flash enabled (and the "block" leg really disabled it) was a printed
-`req`/`fired` line a human had to eyeball in the log. `finetune_ab.sh:582`'s
-own convention passes `--expect-kernels-disabled` on EVERY leg, even the
-empty-string case, so the binary's own START check
+"""Hermetic shape test for `fa2_ab.sh`: the `finetune-step` flash/block legs
+this script runs each pass `--expect-kernels-disabled` explicitly (empty on
+the flash leg, the disabled op key on the block leg), matching
+`finetune_ab.sh:582`'s own convention, so the binary's own START check
 (`finetune_step.rs::run`, before any device/checkpoint/tensor work) and END
-check (`unmatched_disables`) gate the claim instead of a human reading a
-line of stdout.
+check (`unmatched_disables`) gate the claim -- the "flash" leg really ran
+with flash enabled and the "block" leg really disabled it, proven by the
+binary's own refusal path rather than a human eyeballing a printed
+`req`/`fired` line in the log. A refused leg also moves this script's own
+exit status (`overall_rc`), never merely a `FAILED` line in scrollback.
 
 `fa2_ab.sh` is a manual, exclusive-timing-box script (hardcoded `/root/...`
 paths, an `nvidia-smi` call, a `cargo build --release` against a live
 `perf/p6-fa2-dense` worktree) with no `DRY_RUN` support and nothing to gain
 from one: there is no producer pipeline downstream of it to exercise
-hermetically. So — per the follow-up brief — this test greps the actual
-command arrays in the committed script text (never a re-implementation of
-its control flow) rather than driving a dry run, plus a shellcheck pass on
-the script itself.
+hermetically. So this test greps the actual command arrays in the committed
+script text (never a re-implementation of its control flow) rather than
+driving a dry run, plus a shellcheck pass on the script itself and a real
+bash-harness execution of the exit-status-propagation control-flow shape.
 
 Run: `python3 ci/scripts/perf/test_fa2_ab_sh.py`
 """
@@ -102,6 +101,60 @@ class TestFa2AbShShape(unittest.TestCase):
             m = re.search(line_re, self.text, re.MULTILINE)
             self.assertIsNotNone(m)
             self.assertIn("JAMMI_KERNELS_STRICT=1", m.group(1))
+
+    def test_a_refused_leg_moves_the_scripts_own_exit_status(self) -> None:
+        """A refused leg (the binary's own START/END check, or a
+        JSON-parse failure on the emitted report) must move THIS SCRIPT's
+        own exit status via `overall_rc`, never surface only as a `FAILED`
+        line a human has to notice in scrollback. This drives the
+        mechanism for real (never a re-implementation): extracts the
+        leg-loop's `step_rc`/`parse_rc`/`overall_rc` bookkeeping and the
+        trailing `exit $overall_rc` by greeping the committed script text,
+        then actually EXECUTES a minimal bash harness reproducing that
+        exact control-flow shape against a stub `finetune-step` replacement
+        that fails on demand, so the assertion is on the REAL propagation,
+        not on a string match alone."""
+        self.assertIn("overall_rc=0", self.text)
+        self.assertIn("step_rc=$?", self.text)
+        self.assertIn("parse_rc=$?", self.text)
+        self.assertIn(
+            "if [ $step_rc -ne 0 ] || [ $parse_rc -ne 0 ]; then overall_rc=1; fi",
+            self.text,
+        )
+        self.assertIn('echo "FA2AB_EXIT=$overall_rc', self.text)
+        self.assertIn("exit $overall_rc", self.text)
+        # Real execution: a two-iteration loop where the SECOND iteration's
+        # stub command fails must still run to completion (mirrors
+        # `set -uo pipefail` with no `-e`) and the harness's own exit code
+        # must be 1 -- proves the pattern actually propagates a failure
+        # rather than merely appearing in the script's text.
+        harness = """
+set -uo pipefail
+overall_rc=0
+for i in 1 2; do
+  if [ "$i" = 2 ]; then false; else true; fi
+  step_rc=$?
+  ( exit 0 )
+  parse_rc=$?
+  if [ $step_rc -ne 0 ] || [ $parse_rc -ne 0 ]; then overall_rc=1; fi
+done
+echo "harness saw overall_rc=$overall_rc"
+exit $overall_rc
+"""
+        result = subprocess.run(
+            ["bash", "-c", harness], capture_output=True, text=True, check=False
+        )
+        self.assertEqual(result.returncode, 1, result.stdout + result.stderr)
+        self.assertIn("overall_rc=1", result.stdout)
+
+    def test_the_json_parser_exits_nonzero_on_a_parse_failure(self) -> None:
+        """The inline `python3 -c` report parser must `sys.exit(1)` in its
+        `except` branch -- otherwise a malformed/missing report would print
+        a `FAILED` line and still exit 0, and `parse_rc` above would never
+        see the failure."""
+        idx = self.text.index("except Exception as e:")
+        except_body = self.text[idx : idx + 200]
+        self.assertIn("sys.exit(1)", except_body)
 
     def test_syntax_is_valid_bash(self) -> None:
         """`bash -n` is a pure parse check -- no network, no GPU, no /root

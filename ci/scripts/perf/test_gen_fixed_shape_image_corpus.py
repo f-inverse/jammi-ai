@@ -271,14 +271,33 @@ class PoolCacheTests(unittest.TestCase):
         }
 
     def test_cache_hit_and_miss_are_byte_identical_to_the_uncached_path(self):
+        """Drives the PRODUCTION shape
+        (`--heldout-rows`/`--heldout-families`, exactly as
+        `profile_421_legs.sh` calls this producer) and compares EVERY
+        emitted file, not just the PNGs -- `triplets.jsonl`,
+        `heldout_ids.txt`, and `heldout_triplets.jsonl` all move under a
+        `--rows`/held-out-shape change the same way the image pool moves
+        under a `--families`/`--seed` change, and a parity oracle that only
+        ever looked at `.png` names could not catch a regression in any of
+        the three.
+
+        `uncached` and `miss` share the EXACT SAME arguments (including
+        `--rows`), so every file they emit -- pool PNGs AND
+        rows/held-out-derived JSONL/txt -- must be byte-for-byte identical.
+        `hit` deliberately varies `--rows` (never part of the pool cache
+        key -- see `_pool_cache_key`), so only its PNGs are compared; its
+        JSONL/held-out files differ from the other two BY DESIGN, proving
+        `--rows` reaches the row/held-out output without disturbing the
+        cached pool."""
         with tempfile.TemporaryDirectory() as tmp:
             uncached = Path(tmp) / "uncached"
             cache_dir = Path(tmp) / "cache"
             miss_out = Path(tmp) / "miss"
             hit_out = Path(tmp) / "hit"
             common = [
-                "--rows", "5", "--size", "12", "--seed", "3",
-                "--families", "4", "--instances-per-family", "3",
+                "--rows", "8", "--size", "12", "--seed", "3",
+                "--families", "6", "--instances-per-family", "3",
+                "--heldout-rows", "4", "--heldout-batch", "2", "--heldout-families", "2",
             ]
             self.assertEqual(gfi.main([*common, "--out-dir", str(uncached)]), 0)
             # First cached call: a cache MISS (builds + populates the cache).
@@ -292,19 +311,34 @@ class PoolCacheTests(unittest.TestCase):
                 gfi.main(
                     [
                         "--rows", "2", "--size", "12", "--seed", "3",
-                        "--families", "4", "--instances-per-family", "3",
+                        "--families", "6", "--instances-per-family", "3",
+                        "--heldout-rows", "2", "--heldout-batch", "2", "--heldout-families", "2",
                         "--out-dir", str(hit_out), "--pool-cache-dir", str(cache_dir),
                     ]
                 ),
                 0,
             )
-            uncached_pngs = self._sha256_tree(uncached)
-            miss_pngs = {k: v for k, v in self._sha256_tree(miss_out).items() if k.endswith(".png")}
-            hit_pngs = {k: v for k, v in self._sha256_tree(hit_out).items() if k.endswith(".png")}
-            uncached_only_pngs = {k: v for k, v in uncached_pngs.items() if k.endswith(".png")}
-            self.assertTrue(uncached_only_pngs, "no PNGs found -- test is vacuous")
-            self.assertEqual(uncached_only_pngs, miss_pngs)
-            self.assertEqual(uncached_only_pngs, hit_pngs)
+            uncached_all = self._sha256_tree(uncached)
+            miss_all = self._sha256_tree(miss_out)
+            hit_all = self._sha256_tree(hit_out)
+            expected_names = {
+                "triplets.jsonl", "heldout_ids.txt", "heldout_triplets.jsonl",
+            }
+            self.assertTrue(expected_names.issubset(uncached_all), uncached_all.keys())
+            self.assertTrue(any(k.endswith(".png") for k in uncached_all), "no PNGs -- test is vacuous")
+            # Identical arguments -> EVERY emitted file byte-identical.
+            self.assertEqual(uncached_all, miss_all)
+            # Different --rows/held-out-rows -> pool PNGs still identical...
+            uncached_pngs = {k: v for k, v in uncached_all.items() if k.endswith(".png")}
+            hit_pngs = {k: v for k, v in hit_all.items() if k.endswith(".png")}
+            self.assertEqual(uncached_pngs, hit_pngs)
+            # ...but the row/held-out-derived files differ BY DESIGN (a
+            # different --rows/--heldout-rows genuinely changes their
+            # content) -- asserting the difference keeps this a real
+            # non-vacuous control, not an accidental byte-identity that
+            # would mask a cache bug leaking downstream output.
+            for name in expected_names:
+                self.assertNotEqual(uncached_all[name], hit_all[name], name)
 
     def test_a_different_pool_shape_gets_a_different_cache_key(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -332,6 +366,55 @@ class PoolCacheTests(unittest.TestCase):
             ])
             after = set(Path(tmp).iterdir())
             self.assertEqual(after - before, {Path(tmp) / "out"})
+
+    def test_monkeypatching_a_construction_function_moves_the_cache_key(self):
+        """The cache key must depend on the ACTUAL
+        construction code, not a hand-bumped version string that a real edit
+        can forget to bump. Patching `_family_template` (one of
+        `_pool_construction_fingerprint`'s own named functions) to a
+        DIFFERENT implementation must move `_pool_cache_key`'s output even
+        though every numeric argument stays the same."""
+        args = (4, 3, 10, 8, 1)  # families, instances_per_family, size, jitter, seed
+        before = gfi._pool_cache_key(*args)
+        original = gfi._family_template
+
+        def _different_template(family, size):
+            return original(family, size)
+
+        gfi._family_template = _different_template
+        try:
+            after = gfi._pool_cache_key(*args)
+        finally:
+            gfi._family_template = original
+        self.assertNotEqual(before, after, "monkeypatched construction code did not move the key")
+        # Restored code must reproduce the ORIGINAL key exactly -- the
+        # fingerprint is a pure function of the live code, not a one-way
+        # ratchet that only ever changes.
+        self.assertEqual(before, gfi._pool_cache_key(*args))
+
+    def test_unchanged_construction_code_hits_the_same_cache_key(self):
+        """The non-vacuity control on the test above: calling the key
+        function twice with nothing patched must be IDENTICAL -- proves the
+        fingerprint is deterministic given unchanged code, not merely
+        "different every time a function object is looked up"."""
+        args = (4, 3, 10, 8, 1)
+        self.assertEqual(gfi._pool_cache_key(*args), gfi._pool_cache_key(*args))
+
+    def test_monkeypatching_an_unrelated_module_function_never_moves_the_key(self):
+        """The negative control: patching a function OUTSIDE
+        `_POOL_CONSTRUCTION_FUNCTION_NAMES` (e.g. `_image_name`, which names
+        files but never touches pixel/PNG bytes) must NOT move the cache
+        key -- the fingerprint is scoped to construction code, not "any
+        module-level function whatsoever"."""
+        args = (4, 3, 10, 8, 1)
+        before = gfi._pool_cache_key(*args)
+        original = gfi._image_name
+        gfi._image_name = lambda family, instance: "unrelated"
+        try:
+            after = gfi._pool_cache_key(*args)
+        finally:
+            gfi._image_name = original
+        self.assertEqual(before, after)
 
 
 class HeldOutSplitTests(unittest.TestCase):

@@ -23,6 +23,7 @@ if [ -z "$BIN_PROV_SHA" ] || [ "$BIN_PROV_SHA" != "$SHA" ]; then echo "::error::
 nvidia-smi --query-gpu=name,driver_version --format=csv,noheader
 c=(--model-dir "$MD" --lora-rank 16 --lora-alpha 32 --target-modules "Wqkv,Wo,Wi" --backbone-dtype bf16 --cuda 0 --seed 42 --batched-forward true --steps 25 --warmup 5 --lora-dropout 0)
 K=attention_block_flash
+overall_rc=0
 for shape in "8 512" "8 128"; do set -- $shape
   for leg in flash block; do for r in r1 r2; do
     # `--expect-kernels-disabled` is ALWAYS passed (finetune_ab.sh:582's
@@ -31,17 +32,25 @@ for shape in "8 512" "8 128"; do set -- $shape
     # an exact-set-equality guard against an ambient JAMMI_KERNELS_DISABLE
     # leaking into the "flash" leg from the calling shell, which would
     # otherwise silently turn it back into the block leg wearing a flash
-    # label. This makes the printed req/fired line below a GATE (the
-    # binary refuses, before any step runs, if the expectation and the
-    # real env var disagree), not just an eyeballed print.
+    # label. This makes the binary itself refuse (nonzero exit), before
+    # any step runs, if the expectation and the real env var disagree --
+    # `step_rc`/`parse_rc` below fold that refusal (and a JSON-parse
+    # failure on the emitted report) into `overall_rc`, so a refused leg
+    # moves THIS SCRIPT's own exit status, never merely a `FAILED` line a
+    # human has to notice in scrollback.
     if [ $leg = block ]; then JAMMI_KERNELS_STRICT=1 JAMMI_KERNELS_DISABLE=$K "$B" finetune-step "${c[@]}" --batch $1 --seq $2 --expect-kernels-disabled "$K" > $OUT/b$1_s$2_$leg.$r.json 2> $OUT/b$1_s$2_$leg.$r.err
     else JAMMI_KERNELS_STRICT=1 "$B" finetune-step "${c[@]}" --batch $1 --seq $2 --expect-kernels-disabled "" > $OUT/b$1_s$2_$leg.$r.json 2> $OUT/b$1_s$2_$leg.$r.err; fi
+    step_rc=$?
     python3 -c "
 import json,sys
 try:
   t=json.load(open(sys.argv[1]))['tiers']['finetune_step']; c={k:v for k,v in t.items() if 'flash' in k or k.startswith('attention_block')}
   print('FA2AB',sys.argv[2],sys.argv[3],'p50',round(t['s_per_step_p50']['value'],4),c,'req',t.get('kernels_disabled_requested'),'fired',t.get('kernels_disabled_fired'))
-except Exception as e: print('FA2AB',sys.argv[2],sys.argv[3],'FAILED',e, open(sys.argv[4]).read()[-300:].replace(chr(10),' | '))" $OUT/b$1_s$2_$leg.$r.json "b$1s$2" "$leg-$r" $OUT/b$1_s$2_$leg.$r.err
+except Exception as e:
+  print('FA2AB',sys.argv[2],sys.argv[3],'FAILED',e, open(sys.argv[4]).read()[-300:].replace(chr(10),' | '))
+  sys.exit(1)" $OUT/b$1_s$2_$leg.$r.json "b$1s$2" "$leg-$r" $OUT/b$1_s$2_$leg.$r.err
+    parse_rc=$?
+    if [ $step_rc -ne 0 ] || [ $parse_rc -ne 0 ]; then overall_rc=1; fi
   done; done
 done
-rm -f /root/TIMING_IN_PROGRESS; echo "FA2AB_EXIT=0 $(date -u +%FT%TZ)"
+rm -f /root/TIMING_IN_PROGRESS; echo "FA2AB_EXIT=$overall_rc $(date -u +%FT%TZ)"; exit $overall_rc

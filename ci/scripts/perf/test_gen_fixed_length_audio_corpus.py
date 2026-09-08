@@ -548,6 +548,25 @@ class PoolCacheKeyDeterminantTests(unittest.TestCase):
         sig_params = set(inspect.signature(gfa._pool_cache_key).parameters)
         self.assertEqual(set(gfa.POOL_KEY_DETERMINANTS), sig_params)
 
+    def test_build_pool_signature_matches_the_pool_cache_key_signature(self):
+        """`POOL_KEY_DETERMINANTS` is pinned against `_pool_cache_key`'s own
+        signature above, but the determinant SET only actually closes the
+        class if `_build_pool` -- the function whose OUTPUT the cache key is
+        supposed to determine -- cannot itself accept an argument the key
+        does not cover. Asserted directly off both signatures (never a
+        hand-copied parameter list) so a future `_build_pool` parameter
+        added without a matching `_pool_cache_key` parameter (or vice versa)
+        fails HERE, not as a silent stale-cache-hit bug on disk."""
+        build_pool_params = set(inspect.signature(gfa._build_pool).parameters)
+        cache_key_params = set(inspect.signature(gfa._pool_cache_key).parameters)
+        self.assertEqual(
+            build_pool_params,
+            cache_key_params,
+            "_build_pool's parameters must equal _pool_cache_key's (every output-affecting "
+            "determinant of _build_pool must be in the cache key, and the cache key must name "
+            "no determinant _build_pool does not actually consume)",
+        )
+
     @staticmethod
     def _key(**overrides) -> str:
         kw = {**PoolCacheKeyDeterminantTests._BASE, **overrides}

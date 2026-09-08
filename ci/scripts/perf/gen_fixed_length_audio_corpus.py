@@ -480,8 +480,9 @@ def _pool_marker_text(
 
 
 def _parse_pool_marker(text: str) -> dict[str, int]:
-    """Inverse of [`_pool_marker_text`]: `"families=4 instances=3 ..."` ->
-    `{"families": 4, "instances": 3, ...}`. Refuses (never guesses) on a
+    """Inverse of [`_pool_marker_text`]: `"families=4
+    instances_per_family=3 ..."` -> `{"families": 4,
+    "instances_per_family": 3, ...}`. Refuses (never guesses) on a
     marker that does not carry exactly the expected `key=int` tokens, so a
     hand-edited or truncated marker cannot be silently misread as a
     shape that happens to compare unequal-but-plausible."""

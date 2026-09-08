@@ -1065,7 +1065,7 @@ run_traced() {
 # for a producer's own report to land on -- structural, not a per-call
 # redirect a future new producer could bypass by omission. See also
 # `run_corpus_cmd` below, which is what actually runs these producers now
-# (even under `PROFILE_421_LEGS_DRY_RUN=1`, unlike `run_cmd`) so this
+# and is itself exercised even under `PROFILE_421_LEGS_DRY_RUN=1`, so this
 # capture-free path is itself hermetically exercised.
 #
 # The N corpus is a PREFIX of the M corpus for text (the producer's own

@@ -4,12 +4,145 @@
 //! way to avoid duplicating a test helper verbatim in every tower's own
 //! `tests` mod.
 
+use std::cell::Cell;
+use std::sync::{Mutex, MutexGuard};
+
 use candle_core::backprop::GradStore;
 use candle_core::{Device, Tensor, Var};
 use candle_nn::VarMap;
 use jammi_lora::{LoraBuildConfig, LoraInitMode};
 
 use crate::{AnyEncoder, FusibleSiteCensus};
+
+// ─────────────────────────────────────────────────────────────────────────────
+// The ONE seam-counter test lock (esc-092 / issue #476)
+// ─────────────────────────────────────────────────────────────────────────────
+//
+// Before this fix, two SEPARATE process-wide test locks
+// (`crate::layer_norm::DISPATCH_COUNTER_TEST_LOCK` and
+// `crate::attention_cascade::ATTENTION_BLOCK_COUNTER_TEST_LOCK`) each
+// claimed to serialize reads of the three fusible-seam dispatch-counter
+// registries (`layer_norm_fused`, `gelu_erf_fused`, `attention_block_fused`
+// plus `lora_linear_fused`), but nothing enumerated or checked their
+// WRITERS: a training-mode forward that reaches one of these seams'
+// `admit()` call without holding either lock could still bump a counter
+// mid-window, and the exact-count census oracle
+// (`assert_fusible_site_census_is_exact`) would misattribute the bump to
+// whichever tower happened to be under measurement (esc-092's observed
+// 50-vs-49 shape). Two writers proved this in practice:
+// `htsat_audio::tests::batch_norm_stays_on_eval_statistics_under_set_training`
+// and `layer_norm::tests::fused_training_path_matches_slow_within_tolerance_fwd_and_bwd`
+// took a training-mode `layer_norm_fused` decision under NO lock at all.
+//
+// The fix replaces BOTH locks with exactly one: [`seam_counter_lock`] over
+// the single [`SEAM_COUNTER_TEST_LOCK`] mutex, and makes the discipline
+// itself mechanically checked (not merely documented) via
+// [`assert_seam_lock_held`], called from the TRAINING arm of every fused-
+// seam dispatch site this crate owns (`crate::layer_norm::LayerNorm::forward_fused_or_fallback`,
+// `crate::activations::gelu_erf`'s training arm, and
+// `crate::attention_cascade::training_attention_cascade`'s `attention_block_fused`
+// decision) — immediately before the `admit()` call that would otherwise
+// silently bump a counter no lock is protecting. A single `std::sync::Mutex`
+// is not reentrant, so there is deliberately only ONE lock: a caller that
+// needs both the (former) attention and layer_norm windows now acquires
+// [`seam_counter_lock`] exactly once for both, rather than acquiring two
+// locks in a fixed order (the prior scheme's `attention_cascade` ->
+// `layer_norm` documented order, `htsat_audio.rs`'s own multi-lock test doc)
+// — a fixed acquisition order avoids deadlock between TWO locks, but a
+// single lock has no order to get wrong in the first place.
+//
+// **Rejected: per-thread (`cfg(test)` thread-local) counters instead of a
+// lock.** Two independent reasons, not the naive "cfg(test) doesn't cross
+// the process" one (that part would in fact stay byte-identical, since
+// `cfg(test)` is inactive wherever `jammi-bench` links this crate as a
+// library dependency):
+//
+// 1. `lora_linear_fused` is admitted inside `jammi_lora::lora_linear`
+//    (`crates/jammi-lora/src/lora_linear.rs:227`), compiled as a normal
+//    (non-`cfg(test)`) dependency of this crate. A per-thread counter
+//    scoped to `jammi-encoders`' own `cfg(test)` build cannot cover that
+//    key without an ALWAYS-ON API change to `jammi_lora` itself — which
+//    would move the shipped bench path at
+//    `crates/jammi-bench/src/finetune_run.rs:1958`/`:2122` that reads the
+//    SAME process-wide counter today. `lora_linear_fused` therefore stays
+//    convention-only: [`assert_seam_lock_held`] is not (and cannot be)
+//    called from inside `jammi_lora`, so a `LoraLinear::forward` training
+//    dispatch is not mechanically gated the way the other three seams are.
+// 2. `jammi-bench`'s own positive-proof equation (`fused + eager == census
+//    x steps_measured`, `FusibleSiteCensus`'s own doc) reads the SAME
+//    process-WIDE counters this crate's unit tests read, including across
+//    a `spawn_blocking` thread boundary. If the unit oracle switched to a
+//    thread-local instrument instead, it would stop binding the object it
+//    exists to bind (#421 P1-a3): the unit test would witness an instrument
+//    that never ships, while the bench path keeps emitting the process-wide
+//    one it always has.
+
+thread_local! {
+    /// Set by [`SeamCounterGuard`]'s constructor, cleared by its `Drop` —
+    /// the mechanical ground truth [`assert_seam_lock_held`] checks. A
+    /// `thread_local`, not a plain `bool`, because the counter registries
+    /// themselves are process-wide but `std::sync::Mutex` ownership is
+    /// per-thread: only the thread that actually holds
+    /// [`SEAM_COUNTER_TEST_LOCK`] may claim to.
+    static SEAM_LOCK_HELD: Cell<bool> = const { Cell::new(false) };
+}
+
+/// The ONE lock every writer of `layer_norm_fused` / `gelu_erf_fused` /
+/// `attention_block_fused` (and every reader of their registries) in this
+/// crate's unit-test binary must hold — see this module's own section doc
+/// above for why there is exactly one, and why a per-thread counter was
+/// rejected instead. Private: constructible only via [`seam_counter_lock`].
+static SEAM_COUNTER_TEST_LOCK: Mutex<()> = Mutex::new(());
+
+/// RAII guard over [`SEAM_COUNTER_TEST_LOCK`] — its private field means the
+/// only way to construct one is [`seam_counter_lock`], so a caller cannot
+/// synthesize proof of holding the lock without actually acquiring it.
+pub(crate) struct SeamCounterGuard<'a>(#[allow(dead_code)] MutexGuard<'a, ()>);
+
+impl Drop for SeamCounterGuard<'_> {
+    fn drop(&mut self) {
+        SEAM_LOCK_HELD.with(|held| held.set(false));
+    }
+}
+
+/// Acquire the one seam-counter test lock (poison-tolerant, like every
+/// other lock acquisition in this crate: a prior test's panic while holding
+/// it must not wedge every later test) and mark this thread as holding it
+/// for [`assert_seam_lock_held`]. Every `#[test]` that drives a training-
+/// mode forward through `layer_norm_fused`, `gelu_erf_fused`, or
+/// `attention_block_fused` — directly or via `assert_fusible_site_census_is_exact`
+/// — must hold the returned guard for the ENTIRE window it measures a
+/// counter delta over.
+pub(crate) fn seam_counter_lock() -> SeamCounterGuard<'static> {
+    let guard = SEAM_COUNTER_TEST_LOCK
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
+    SEAM_LOCK_HELD.with(|held| held.set(true));
+    SeamCounterGuard(guard)
+}
+
+/// The mechanical class gate esc-092 says was missing: called from the
+/// TRAINING arm of every fused-seam dispatch site this crate owns,
+/// immediately before the `admit()` call that would otherwise silently
+/// record a dispatch no lock is protecting. Panics naming `site` and
+/// esc-092 when the calling thread does not hold [`SEAM_COUNTER_TEST_LOCK`]
+/// (via [`seam_counter_lock`]) — eval-mode forwards never reach this (they
+/// short-circuit before `admit()`), so eval-only tests are unaffected. Not
+/// called from `jammi_lora::lora_linear` at all (see this module's section
+/// doc, "Rejected: per-thread counters", item 1) — `lora_linear_fused`
+/// stays convention-only.
+#[cfg(test)]
+pub(crate) fn assert_seam_lock_held(site: &'static str) {
+    let held = SEAM_LOCK_HELD.with(|held| held.get());
+    assert!(
+        held,
+        "{site}: a training-mode forward reached this fused seam's admit() without holding \
+         crate::test_support::seam_counter_lock() (esc-092) -- every #[test] that writes to \
+         layer_norm_fused/gelu_erf_fused/attention_block_fused's process-wide dispatch \
+         counters must hold the SAME lock seam_dispatch_totals()'s reader holds, or the \
+         exact-count census oracle can misattribute another test's dispatch"
+    );
+}
 
 /// Deterministic (non-RNG) fill: every variable gets values from a fixed LCG
 /// walk over a stably-ordered (sorted-by-key) variable list, so two

@@ -909,6 +909,8 @@ pub(crate) fn training_attention_cascade(
         window.is_some(),
         fused.local.as_ref(),
     );
+    #[cfg(test)]
+    crate::test_support::assert_seam_lock_held("attention_cascade::training_attention_cascade");
     let outcome = admit(
         admission_mode(),
         "attention_block_fused",

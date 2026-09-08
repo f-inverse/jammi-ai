@@ -311,38 +311,6 @@ pub async fn assert_deleted_adapter_refuses_by_name(
     }
 }
 
-/// The require-gate polarity every `chmod` permission-fault probe in this
-/// suite shares (esc-089 F1): `probe` performs the fault-injection premise
-/// check itself — "can this process still read/write through a chmod'd
-/// path?" — and returns `true` if the fault was BYPASSED (root, or a
-/// mode-ignoring filesystem). A bypass is normally a loud, `eprintln`'d skip:
-/// the fault-injection premise the caller needs simply does not hold on this
-/// host. But under `JAMMI_REQUIRE_POSIX_PERMS=1` (the CI lane that is
-/// SUPPOSED to run unprivileged with real POSIX permission enforcement) a
-/// bypass is instead a hard `panic!` — silently returning `true` in that lane
-/// would let a permission-fault regression go completely uncaught, which is
-/// exactly the gap a round-3 audit found in two of three call sites (this
-/// function is the fix: every chmod probe in the suite now shares ONE
-/// implementation of the polarity instead of three independently-drifting
-/// copies).
-///
-/// Returns `true` if the caller must restore permissions and skip; `false` if
-/// the fault was genuinely injected and the test should proceed.
-pub fn permission_fault_bypassed(test_name: &str, probe: impl FnOnce() -> bool) -> bool {
-    let bypassed = probe();
-    if bypassed {
-        if std::env::var_os("JAMMI_REQUIRE_POSIX_PERMS").is_some() {
-            panic!(
-                "JAMMI_REQUIRE_POSIX_PERMS is set but '{test_name}' could not inject its \
-                 permission fault (root, or a mode-ignoring filesystem) — the fault-injection \
-                 premise this test needs does not hold; a silent skip is not acceptable here"
-            );
-        }
-        eprintln!("{test_name}: chmod bypassed (root?) — skipping");
-    }
-    bypassed
-}
-
 /// Runs the FULL esc-089 `symptom_spec.control` set against one
 /// already-completed cold-restart round trip. Called identically by
 /// `tower_adapters.rs`'s three cross-modal `*_serves_cold_after_restart`

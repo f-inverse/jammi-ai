@@ -575,10 +575,10 @@ mod tests {
     /// normally a loud, `eprintln`'d skip; under `JAMMI_REQUIRE_POSIX_PERMS=1`
     /// (the CI lane that is SUPPOSED to run unprivileged with real POSIX
     /// permission enforcement) a bypass is instead a hard `panic!` — never a
-    /// silent `return`. This is jammi-db's own copy of the identical polarity
-    /// `jammi-ai`'s `tests/it/common::permission_fault_bypassed` carries (the
-    /// two crates' test suites do not share a test-utility crate for this).
-    fn permission_fault_bypassed(test_name: &str, probe: impl FnOnce() -> bool) -> bool {
+    /// silent `return`. Each probe file carries its own copy of this wrapper
+    /// in the canonical shape the kernel-oracle registry
+    /// (`ci/kernel-oracle-helpers.txt`) verifies per file.
+    fn chmod_bypassed(test_name: &str, probe: impl FnOnce() -> bool) -> bool {
         let bypassed = probe();
         if bypassed {
             if std::env::var_os("JAMMI_REQUIRE_POSIX_PERMS").is_some() {
@@ -775,7 +775,7 @@ mod tests {
         // `JAMMI_REQUIRE_POSIX_PERMS=1` a bypass panics rather than
         // skipping — it must never be a silent `return`.
         std::fs::set_permissions(&weights_path, std::fs::Permissions::from_mode(0o000)).unwrap();
-        let bypassed = permission_fault_bypassed(
+        let bypassed = chmod_bypassed(
             "permission_fault_on_a_present_key_stays_a_transport_error",
             || std::fs::read(&weights_path).is_ok(),
         );

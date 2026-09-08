@@ -179,9 +179,11 @@ jobs:
       # / `finalize_reclaims_a_persistently_failed_prune_and_warns`, and
       # `crates/jammi-db/src/store/artifact.rs`'s
       # `permission_fault_on_a_present_key_stays_a_transport_error`) a REAL
-      # execution: build the two test binaries as root (linking still needs
-      # the full toolchain and this job's warm sccache from "Run tests"
-      # above), open the checkout to a fresh unprivileged account, then run
+      # execution: build the two test binaries as root (this build reuses
+      # this SAME job's already-populated target dir from "Run tests"
+      # above — same filesystem, same job, no clean rebuild — so it only
+      # links the two `--no-run` test binaries rather than recompiling the
+      # workspace), open the checkout to a fresh unprivileged account, then run
       # ONLY those four tests as that account with
       # `JAMMI_REQUIRE_POSIX_PERMS=1` armed. The probes read fixtures from
       # BOTH `cookbook/fixtures/` and `tests/fixtures/` at the workspace
@@ -220,6 +222,14 @@ jobs:
           fi
           useradd --no-create-home --shell /usr/sbin/nologin jammi-probe
 
+          # `--no-create-home` leaves `jammi-probe` with no home directory,
+          # so a bare `HOME=/home/jammi-probe` (the passwd-entry default)
+          # would point at a path that does not exist. Give the account a
+          # real, owned scratch HOME instead of creating one under
+          # `/home` (which this container image may not have writable).
+          PROBE_HOME="$(mktemp -d)"
+          chown jammi-probe "$PROBE_HOME"
+
           # `--message-format=json` gives the EXACT compiled test-binary
           # path -- never a hash-suffixed glob that could silently match a
           # stale binary left over from a prior cache. A SINGLE physical
@@ -243,6 +253,14 @@ jobs:
           # trees, and the workspace-root `cookbook/fixtures/` +
           # `tests/fixtures/` the probes read via `jammi_test_utils`.
           chmod -R o+rX "$GITHUB_WORKSPACE"
+          # `CARGO_TARGET_DIR` can point OUTSIDE `$GITHUB_WORKSPACE` (e.g. a
+          # pod/dev-box lane's shared build cache); the sweep above would
+          # silently miss it and every probe binary read from it would then
+          # fail closed for the wrong reason (EACCES on the target dir, not
+          # the fault this step exists to exercise).
+          if [ -n "${CARGO_TARGET_DIR:-}" ]; then
+            chmod -R o+rX "$CARGO_TARGET_DIR"
+          fi
 
           if command -v runuser >/dev/null 2>&1; then
             run_as_probe() { runuser -u jammi-probe -- "$@"; }
@@ -257,7 +275,7 @@ jobs:
             # diagnostic before the step fails, not vanish into `set -e`
             # exiting the whole script mid-assignment before either runs.
             set +e
-            out="$(run_as_probe env JAMMI_REQUIRE_POSIX_PERMS=1 "$bin" "$test_name" --exact 2>&1)"
+            out="$(run_as_probe env HOME="$PROBE_HOME" JAMMI_REQUIRE_POSIX_PERMS=1 "$bin" "$test_name" --exact 2>&1)"
             rc=$?
             set -e
             echo "$out"
@@ -267,10 +285,10 @@ jobs:
             fi
           }
 
-          run_probe "$AI_IT_BIN" fine_tuned_adapter_bundle_permission_fault_is_not_a_typed_model_error
-          run_probe "$AI_IT_BIN" context_predictor_reload_permission_fault_is_not_a_typed_model_error
-          run_probe "$AI_IT_BIN" finalize_reclaims_a_persistently_failed_prune_and_warns
-          run_probe "$DB_LIB_BIN" permission_fault_on_a_present_key_stays_a_transport_error
+          run_probe "$AI_IT_BIN" models::fine_tuned_adapter_bundle_permission_fault_is_not_a_typed_model_error
+          run_probe "$AI_IT_BIN" context_predictor::context_predictor_reload_permission_fault_is_not_a_typed_model_error
+          run_probe "$AI_IT_BIN" fine_tune::finalize_reclaims_a_persistently_failed_prune_and_warns
+          run_probe "$DB_LIB_BIN" store::artifact::tests::permission_fault_on_a_present_key_stays_a_transport_error
 
       # Unification contract §6 F3 (round-2 audit B5): the designated
       # build-sha HERMETICITY falsifier, as a real CI step (never a

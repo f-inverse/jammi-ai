@@ -34,21 +34,21 @@ on all three towers. Source:
 `c1b0b0bad1f79a4ad6c298400e6ea19cc1ca633c`).
 <!-- /profile-421-generated -->
 
-| tower | leg | dtype | wall s/step | front s/step | GPU busy s/step | residual s/step | front % of wall | busy % of wall |
-|---|---|---|---:|---:|---:|---:|---:|---:|
+| tower | leg | dtype | wall s/step | front s/step | GPU busy s/step | residual s/step | front % of wall | busy % of wall | gate |
+|---|---|---|---:|---:|---:|---:|---:|---:|:--:|
 <!-- profile-421-generated: measured-towers-table -->
-| CLIP-text | A1 | f32 | 0.1004 | 0.0000 | 0.0608 | 0.0396 | 0.0 | 60.5 |
-| CLIP-text | A2 | bf16 | 0.0965 | 0.0000 | 0.0414 | 0.0551 | 0.0 | 42.9 |
-| CLIP-text | D1 (LoRA+LN eager) | f32 | 0.1486 | 0.0000 | 0.0895 | 0.0591 | 0.0 | 60.2 |
-| CLIP-text | D2 (LoRA eager) | f32 | 0.1329 | 0.0000 | 0.0794 | 0.0535 | 0.0 | 59.7 |
-| CLIP-vision | A1 | f32 | 0.1147 | 0.0235 | 0.0652 | 0.0260 | 20.5 | 56.9 |
-| CLIP-vision | A2 | bf16 | 0.1086 | 0.0241 | 0.0386 | 0.0459 | 22.2 | 35.6 |
-| CLIP-vision | D1 (LoRA+LN eager) | f32 | 0.1658 | 0.0243 | 0.0976 | 0.0439 | 14.7 | 58.8 |
-| CLIP-vision | D2 (LoRA eager) | f32 | 0.1450 | 0.0243 | 0.0873 | 0.0334 | 16.8 | 60.2 |
-| HTSAT | A1 | f32 | 1.5500 | 1.2509 | 0.2348 | 0.0643 | 80.7 | 15.1 |
-| HTSAT | A2 | bf16 | 1.5005 | 1.2516 | 0.1883 | 0.0606 | 83.4 | 12.6 |
-| HTSAT | D1 (LoRA+LN+GELU eager) | f32 | 1.6895 | 1.2493 | 0.3488 | 0.0914 | 73.9 | 20.6 |
-| HTSAT | D2 (LoRA eager) | f32 | 1.6329 | 1.2550 | 0.2953 | 0.0826 | 76.9 | 18.1 |
+| CLIP-text | A1 | f32 | 0.1004 | 0.0000 | 0.0608 | 0.0396 | 0.0 | 60.5 | OK |
+| CLIP-text | A2 | bf16 | 0.0965 | 0.0000 | 0.0414 | 0.0551 | 0.0 | 42.9 | OK |
+| CLIP-text | D1 (LoRA+LN eager) | f32 | 0.1486 | 0.0000 | 0.0895 | 0.0591 | 0.0 | 60.2 | OK |
+| CLIP-text | D2 (LoRA eager) | f32 | 0.1329 | 0.0000 | 0.0794 | 0.0535 | 0.0 | 59.7 | OK |
+| CLIP-vision | A1 | f32 | 0.1147 | 0.0235 | 0.0652 | 0.0260 | 20.5 | 56.9 | OK |
+| CLIP-vision | A2 | bf16 | 0.1086 | 0.0241 | 0.0386 | 0.0459 | 22.2 | 35.6 | OK |
+| CLIP-vision | D1 (LoRA+LN eager) | f32 | 0.1658 | 0.0243 | 0.0976 | 0.0439 | 14.7 | 58.8 | OK |
+| CLIP-vision | D2 (LoRA eager) | f32 | 0.1450 | 0.0243 | 0.0873 | 0.0334 | 16.8 | 60.2 | OK |
+| HTSAT | A1 | f32 | 1.5500 | 1.2509 | 0.2348 | 0.0643 | 80.7 | 15.1 | OK |
+| HTSAT | A2 | bf16 | 1.5005 | 1.2516 | 0.1883 | 0.0606 | 83.4 | 12.6 | FAILS |
+| HTSAT | D1 (LoRA+LN+GELU eager) | f32 | 1.6895 | 1.2493 | 0.3488 | 0.0914 | 73.9 | 20.6 | OK |
+| HTSAT | D2 (LoRA eager) | f32 | 1.6329 | 1.2550 | 0.2953 | 0.0826 | 76.9 | 18.1 | OK |
 <!-- /profile-421-generated -->
 
 `front` is a direct measurement (`media_front_end_wall_s`), never `wall − busy`; text legs

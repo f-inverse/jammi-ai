@@ -1358,13 +1358,15 @@ jobs:
           - name: citation resolver
             cmd: python3 ci/scripts/perf/check_citations.py
             fetch_depth: "0"
-          # `test_check_citations.py`'s own artifact-sha fixtures build and
-          # commit into a THROWAWAY `git init`'d temp repo (same discipline
-          # `check_cuda_run_artifacts.py --self-test` uses), so this suite
-          # needs no real history from the CI checkout itself and stays at
-          # the normal shallow default.
+          # `test_check_citations.py`'s artifact-sha fixtures build and commit
+          # into a THROWAWAY `git init`'d temp repo, but its real-contract
+          # coverage case runs the resolver over THIS checkout's epoch-pinned
+          # frozen contract, which needs the pinned sha's commit object --
+          # so this suite takes the full-history checkout too (quoted "0",
+          # same falsy-zero reasoning as above).
           - name: citation resolver suite
             cmd: python3 ci/scripts/perf/test_check_citations.py
+            fetch_depth: "0"
           # Two mechanical, grep-shaped assertions over every producer
           # script under ci/scripts/perf/ (unification contract C5.1/C5.2,
           # audit round on perf/unification-p2): (A) any `*FAKE*`-named test
@@ -1707,6 +1709,7 @@ jobs:
           # no network.
           - name: profile_421_render_docs suite
             cmd: python3 ci/scripts/perf/test_profile_421_render_docs.py
+            fetch_depth: "0"
           # Doc-freshness gate: `docs/plans/66-tower-profile/README.md`'s
           # measured-towers table, candidate-port reasons, and verbatim
           # findings must equal a fresh render of the committed close-out
@@ -1715,6 +1718,7 @@ jobs:
           # inside the script itself rather than an external `git diff`.
           - name: profile_421_render_docs freshness
             cmd: python3 ci/scripts/perf/profile_421_render_docs.py --check
+            fetch_depth: "0"
           # `lora_bias_ab_merge.py`'s own suite (#428 P2b, docs-ci): drives
           # the REAL dispatch-proof/identity/differencing/verdict functions
           # (and `main` itself, end to end, at least once) against synthetic

@@ -85,10 +85,10 @@
 //! unmatched rather than silently accepted).
 //!
 //! **Live standalone** (reachable directly, own call site, own predicate):
-//! `"layer_norm_fused"` (`jammi-encoders/src/layer_norm.rs:583`),
+//! `"layer_norm_fused"` (`jammi-encoders/src/layer_norm.rs:586`),
 //! `"geglu_fused"` (`jammi-encoders/src/modernbert.rs:1424`),
 //! `"lora_linear_fused"` (`jammi-lora/src/lora_linear.rs:1007`), and
-//! `"attention_block_fused"` (`jammi-encoders/src/attention_cascade.rs:914`) itself.
+//! `"attention_block_fused"` (`jammi-encoders/src/attention_cascade.rs:897`) itself.
 //!
 //! **Subsumed** (reachable ONLY when `"attention_block_fused"` is ALSO
 //! disabled, forcing `forward_training_attention` into
@@ -1779,7 +1779,7 @@ impl ProbedOp {
 /// | `cast_scale` | TwoArm | bf16 → `cast_scale_bf16_f32`, f16 → `cast_scale_f16_f32` | `cast_scale_bf16_f32`, `crates/jammi-kernels/src/ops/low_rank_residual_linear.rs:1054`; `cast_scale_f16_f32`, `crates/jammi-kernels/src/ops/low_rank_residual_linear.rs:1068` |
 /// | `cast_add` | TwoArm | bf16 → `cast_add_bf16`, f16 → `cast_add_f16` | `cast_add_bf16`, `crates/jammi-kernels/src/ops/low_rank_residual_linear.rs:1153`; `cast_add_f16`, `crates/jammi-kernels/src/ops/low_rank_residual_linear.rs:1165` |
 /// | `adamw_step` | TwoArm | `adamw_step_fused` | `adamw_step_fused`, `crates/jammi-ai/src/fine_tune/adamw.rs:33` (`admit`, `crates/jammi-ai/src/fine_tune/adamw.rs:257`) |
-/// | `mem_efficient_attention` | Cascade | `mem_efficient_attention` | `mem_efficient_attention`, `crates/jammi-encoders/src/attention_cascade.rs:868` |
+/// | `mem_efficient_attention` | Cascade | `mem_efficient_attention` | `mem_efficient_attention`, `crates/jammi-encoders/src/attention_cascade.rs:849` |
 /// | `rope_positions` | InternalSubkernel(`attention_block_flash`) | — | `rope_positions`, `crates/jammi-kernels/src/ops/flash_attention.rs:645` |
 /// | `scaled_cast_add` | InternalSubkernel(`low_rank_residual_linear`) | — | `ScaledCastAdd`, `crates/jammi-kernels/src/ops/low_rank_residual_linear.rs:946` (CPU), `ScaledCastAdd`, `crates/jammi-kernels/src/cuda/low_rank_residual_linear.rs:142` (CUDA) |
 ///

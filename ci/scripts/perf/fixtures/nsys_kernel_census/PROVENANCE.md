@@ -32,10 +32,32 @@ kernel bucket present — enough to clear `EmptyDifferencedCensusError`
 (at least one bucket must carry real added work) without tripping any
 negative-delta or fixed-cost-jitter guard; the generator's own
 `--self-test` arm asserts exactly this against the real
-`kernel_census.build_report`, AND asserts the freshly-built bytes are
-byte-identical to these two committed files — wired into
-`.github/workflows/ci.yml` ("perf nsys kernel fixture self-test"), so a
-generator edit that forgets to regenerate these files fails CI rather
-than shipping a silently stale fixture. Total fixture size is ~40KB
-(well under the 100KB budget) — both files are sqlite's own minimum
-on-disk page size for a handful of rows, not a designed-in bloat.
+`kernel_census.build_report`, run directly over these two committed files
+(`steps_a=0, steps_b=1` — `launches_per_step` lands exactly on the raw
+`dn=25`), so the committed bytes are proven USABLE by the real consumer,
+not merely regenerable.
+
+Staleness is checked by LOGICAL identity, not byte identity: the
+self-test also builds a fresh regeneration and compares its
+`sqlite_master` schema text plus every table's full row set (canonically
+ordered) against each committed file — raw sqlite file bytes are NOT a
+stable function of logical content across sqlite library versions
+(header fields, default page size, freelist bookkeeping, and page layout
+all vary release to release even for byte-for-byte identical rows), so a
+byte-equality check would be a false claim about cross-library stability,
+not merely a strict one; a CI runner's system `sqlite3` need not match
+the developer Mac's. The self-test separately proves the generator's OWN
+determinism honestly — two independent fresh regenerations on the SAME
+sqlite library ARE asserted byte-identical (no RNG, no wall-clock read,
+fixed StringIds ids/row order) — a claim that never crosses a library
+boundary. A meta-check drives the logical-identity comparator itself
+against a scratch row-mutated copy and a scratch schema-altered copy of a
+committed file (each must RED) and a scratch `PRAGMA
+user_version`-changed copy and a scratch `VACUUM`ed copy (each must stay
+GREEN), so the comparator's own discriminating power is gated too. Wired
+into `.github/workflows/ci.yml` ("perf nsys kernel fixture self-test"),
+so a generator edit that forgets to regenerate these files — or a
+row/schema drift the fixture no longer reflects — fails CI rather than
+shipping a silently stale fixture. Total fixture size is ~40KB (well
+under the 100KB budget) — both files are sqlite's own minimum on-disk
+page size for a handful of rows, not a designed-in bloat.

@@ -1566,13 +1566,18 @@ jobs:
           - name: perf kernel_census suite
             cmd: python3 ci/scripts/perf/test_kernel_census.py
           # `gen_nsys_kernel_fixture.py`'s own self-test: builds both
-          # committed `n.sqlite`/`m.sqlite` counts
-          # fresh into a temp dir and drives `kernel_census.build_report`
-          # against them (mirrors `profile_421_legs.sh`'s DRY_RUN real
-          # call site), then asserts the freshly-built bytes are BYTE-
-          # IDENTICAL to the checked-in fixtures -- fixture determinism
-          # (no RNG, no wall-clock, fixed StringIds ordering) is a GATE
-          # here, not a doc note a future edit can silently invalidate.
+          # committed `n.sqlite`/`m.sqlite` counts fresh into a temp dir,
+          # asserts two independent fresh regenerations (same sqlite
+          # library) are byte-identical (the generator's OWN determinism --
+          # no RNG, no wall-clock, fixed StringIds ordering), then checks
+          # the checked-in fixtures against LOGICAL identity (schema +
+          # canonically-ordered row set, never raw bytes -- sqlite file
+          # bytes are not stable across library versions) and drives
+          # `kernel_census.build_report` directly over the committed files
+          # (mirrors `profile_421_legs.sh`'s DRY_RUN real call site) to
+          # prove they are consumer-usable, not merely regenerable -- a
+          # GATE here, not a doc note a future edit can silently
+          # invalidate.
           - name: perf nsys kernel fixture self-test
             cmd: python3 ci/scripts/perf/fixtures/nsys_kernel_census/gen_nsys_kernel_fixture.py --self-test
           # `convert_legacy_bert_checkpoint.py`'s own suite (#356 census

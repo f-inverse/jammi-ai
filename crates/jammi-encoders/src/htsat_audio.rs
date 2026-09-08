@@ -3524,34 +3524,20 @@ mod tests {
     /// asserted — a one-sided "fused went up" check would pass even if half
     /// the sites had fallen back.
     ///
-    /// # Why two locks, in THIS order
+    /// # Why one lock, and no acquisition order to get wrong
     ///
-    /// This test needs both crate-shared counter locks: the full forward
-    /// bumps `crate::layer_norm::LN_DISPATCH_COUNTERS` and the softmax
-    /// cascade counters as well as the `gelu_erf_fused` counters it reads
-    /// exactly, and every OTHER test that can bump `gelu_erf_fused` holds
-    /// one of the two (this module's own training-mode forwards hold the
-    /// `layer_norm` one; `crate::activations`/`crate::bert`/
-    /// `crate::distilbert`'s GELU counter tests hold the
-    /// `attention_cascade` one).
-    ///
-    /// The ORDER is not free: `crate::modernbert`'s own tests already
-    /// acquire both, `attention_cascade` FIRST and `layer_norm` second
-    /// (e.g. `modernbert::tests::
-    /// forward_hidden_with_lengths_none_is_bit_identical_to_forward_hidden`,
-    /// which takes `crate::test_support::seam_counter_lock` and then, a few lines
-    /// later, `crate::test_support::seam_counter_lock`). Acquiring
-    /// them the other way round here is a lock-order INVERSION against those
-    /// tests, and the default parallel test runner deadlocks the whole
-    /// `cargo test --lib` binary on it — observed, not hypothesized, while
-    /// writing this test (every htsat/layer_norm/modernbert thread parked in
-    /// `__psynch_mutexwait` forever). Every multi-lock test in this crate
-    /// therefore takes `attention_cascade` before `layer_norm`, and any new
-    /// one must too.
+    /// This test's full forward bumps `crate::layer_norm::LN_DISPATCH_COUNTERS`,
+    /// the softmax/RoPE/GeGLU cascade counters, and the `gelu_erf_fused`
+    /// counters it reads exactly. All of these are guarded by the SAME
+    /// `crate::test_support::seam_counter_lock()` — see that function's own
+    /// module doc for the full registry table — so this test (and every
+    /// other test in this crate whose forward can bump more than one of
+    /// them) acquires it exactly ONCE and holds it for the whole window.
+    /// `std::sync::Mutex` is not reentrant, so a second acquisition attempt
+    /// on the same thread while already holding it would deadlock; there is
+    /// nothing to sequence here because there is only one lock to take.
     #[test]
     fn training_true_full_forward_dispatches_the_gelu_seam_once_per_swin_block() {
-        // Lock order: attention_cascade THEN layer_norm -- see this test's
-        // own doc.
         let _lock = crate::test_support::seam_counter_lock();
         let device = Device::Cpu;
         let varmap = VarMap::new();
@@ -3600,8 +3586,6 @@ mod tests {
     /// eval bytes on any device/dtype where fused and eager differ.
     #[test]
     fn eval_forward_takes_no_gelu_admission_decision_at_all() {
-        // Lock order: attention_cascade THEN layer_norm -- see this test's
-        // own doc.
         let _lock = crate::test_support::seam_counter_lock();
         let device = Device::Cpu;
         let varmap = VarMap::new();
@@ -3633,8 +3617,6 @@ mod tests {
     /// hypothesis.
     #[test]
     fn training_true_full_forward_with_a_gelu_projection_dispatches_sum_depths_plus_one() {
-        // Lock order: attention_cascade THEN layer_norm -- see this test's
-        // own doc.
         let _lock = crate::test_support::seam_counter_lock();
         let device = Device::Cpu;
         let mut cfg = HtsatAudioConfig::from_hf_clap_config(&fixture_config()).unwrap();
@@ -3702,8 +3684,6 @@ mod tests {
     /// this is a genuine numeric equality, not merely a counter equality.
     #[test]
     fn projection_gelu_arm_dispatches_the_seam_exactly_once() {
-        // Lock order: attention_cascade THEN layer_norm -- see this test's
-        // own doc.
         let _lock = crate::test_support::seam_counter_lock();
         let device = Device::Cpu;
         let varmap = VarMap::new();
@@ -3754,8 +3734,6 @@ mod tests {
     /// machinery to a ReLU network.
     #[test]
     fn projection_relu_arm_never_touches_the_gelu_seam() {
-        // Lock order: attention_cascade THEN layer_norm -- see this test's
-        // own doc.
         let _lock = crate::test_support::seam_counter_lock();
         let device = Device::Cpu;
         let varmap = VarMap::new();
@@ -4036,8 +4014,6 @@ mod tests {
     ///   assertion rather than by coincidence.
     #[test]
     fn fusible_site_census_is_the_exact_per_forward_seam_call_count() {
-        // Lock order: attention_cascade THEN layer_norm — see this module's
-        // own multi-lock test doc.
         let _lock = crate::test_support::seam_counter_lock();
 
         let device = Device::Cpu;

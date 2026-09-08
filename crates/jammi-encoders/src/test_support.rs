@@ -18,39 +18,61 @@ use crate::{AnyEncoder, FusibleSiteCensus};
 // The ONE seam-counter test lock (esc-092 / issue #476)
 // ─────────────────────────────────────────────────────────────────────────────
 //
-// Before this fix, two SEPARATE process-wide test locks
-// (`crate::layer_norm`'s `DISPATCH_COUNTER_TEST_LOCK` and
-// `crate::attention_cascade`'s `ATTENTION_BLOCK_COUNTER_TEST_LOCK`, both
-// now deleted) each claimed to serialize reads of the three fusible-seam
-// dispatch-counter
-// registries (`layer_norm_fused`, `gelu_erf_fused`, `attention_block_fused`
-// plus `lora_linear_fused`), but nothing enumerated or checked their
-// WRITERS: a training-mode forward that reaches one of these seams'
-// `admit()` call without holding either lock could still bump a counter
-// mid-window, and the exact-count census oracle
-// (`assert_fusible_site_census_is_exact`) would misattribute the bump to
-// whichever tower happened to be under measurement (esc-092's observed
-// 50-vs-49 shape). Two writers proved this in practice:
-// `htsat_audio::tests::batch_norm_stays_on_eval_statistics_under_set_training`
-// and `layer_norm::tests::fused_training_path_matches_slow_within_tolerance_fwd_and_bwd`
-// took a training-mode `layer_norm_fused` decision under NO lock at all.
+// This crate's unit-test binary reads and writes a set of PROCESS-WIDE
+// dispatch-counter registries across many `#[test]` functions running under
+// `cargo test`'s default parallel thread pool. [`seam_counter_lock`] is the
+// ONE lock every writer (a training-mode forward that reaches one of these
+// seams' `admit()`/`admit_cascade()` call) and every exact-delta reader must
+// hold for the whole before/after window it measures, so an exact-count
+// assertion can only ever attribute a counter's movement to the tower
+// actually under test. [`assert_seam_lock_held`] is the mechanical,
+// `#[cfg(test)]`-only check of that discipline: called immediately before
+// EVERY training-arm `admit()`/`admit_cascade()` call this crate owns, it
+// panics naming the site when the calling thread does not hold the lock —
+// eval-mode forwards never reach it, since every seam short-circuits before
+// taking an admission decision in eval.
 //
-// The fix replaces BOTH locks with exactly one: [`seam_counter_lock`] over
-// the single [`SEAM_COUNTER_TEST_LOCK`] mutex, and makes the discipline
-// itself mechanically checked (not merely documented) via
-// [`assert_seam_lock_held`], called from the TRAINING arm of every fused-
-// seam dispatch site this crate owns (`crate::layer_norm::LayerNorm::forward_fused_or_fallback`,
-// `crate::activations::gelu_erf`'s training arm, and
-// `crate::attention_cascade::training_attention_cascade`'s `attention_block_fused`
-// decision) — immediately before the `admit()` call that would otherwise
-// silently bump a counter no lock is protecting. A single `std::sync::Mutex`
-// is not reentrant, so there is deliberately only ONE lock: a caller that
-// needs both the (former) attention and layer_norm windows now acquires
-// [`seam_counter_lock`] exactly once for both, rather than acquiring two
-// locks in a fixed order (the prior scheme's `attention_cascade` ->
-// `layer_norm` documented order, `htsat_audio.rs`'s own multi-lock test doc)
-// — a fixed acquisition order avoids deadlock between TWO locks, but a
-// single lock has no order to get wrong in the first place.
+// The full protected set — every registry a training-mode forward in this
+// crate can bump, and every call site [`assert_seam_lock_held`] guards:
+//
+// | Registry (`admit`/`admit_cascade` key) | Guarded call site | Reader shape |
+// |---|---|---|
+// | `layer_norm_fused` | `crate::layer_norm::LayerNorm::forward_fused_or_fallback` | exact-delta ([`seam_dispatch_totals`] / `crate::layer_norm::ln_snapshot_locked`) |
+// | `gelu_erf_fused` | `crate::activations::gelu_erf` | exact-delta ([`seam_dispatch_totals`] / `crate::activations::gelu_snapshot_locked`) |
+// | `attention_block_fused` | `crate::attention_cascade::training_attention_cascade` (gated at cascade ENTRY, before any of its three writes) | exact-delta ([`seam_dispatch_totals`]) |
+// | `attention_block_flash` | `crate::attention_cascade::training_attention_cascade` (cascade entry) AND `crate::modernbert::ModernBertAttention::forward_padded_transport_attention` (its own, separate entry) | one-sided (`>`/exact-delta assertions ad hoc per test; no guard-taking accessor) |
+// | `mem_efficient_attention` | `crate::attention_cascade::training_attention_cascade` (cascade entry) | one-sided (same as above) |
+// | `softmax_last_dim_fused` | `crate::attention_cascade::softmax_apply_training` | one-sided (raw `SOFTMAX_DISPATCH_COUNTERS.snapshot()` reads, `>` assertions) |
+// | `rope_fused` | `crate::modernbert::RotaryEmbedding::apply_training` | one-sided (raw `ROPE_DISPATCH_COUNTERS.snapshot()` reads, `>` assertions) |
+// | `geglu_fused` | `crate::modernbert::geglu_apply_training` | one-sided (raw `GEGLU_DISPATCH_COUNTERS.snapshot()` reads, `>` assertions) |
+//
+// `lora_linear_fused` is NOT in this table: it is admitted inside
+// `jammi_lora::lora_linear`, a normal (non-`cfg(test)`) dependency of this
+// crate, so [`assert_seam_lock_held`] cannot be called from there — see
+// "Rejected: per-thread counters" below, item 1. It stays convention-only:
+// every test that reads it (via [`seam_dispatch_totals`]) still holds
+// [`seam_counter_lock`] by convention, but no mechanical gate enforces that
+// a `LoraLinear::forward` training dispatch does.
+//
+// `attention_block_flash`/`mem_efficient_attention`/`softmax_last_dim_fused`/
+// `rope_fused`/`geglu_fused` have NO guard-taking accessor the way
+// `layer_norm_fused`/`gelu_erf_fused`/`attention_block_fused` do: this
+// crate's own tests read those five registries directly
+// (`{ROPE,SOFTMAX,GEGLU}_DISPATCH_COUNTERS.snapshot()` /
+// `cascade_counters_for(..).snapshot()`) and assert a one-sided `>`/`==`
+// bound rather than an exact `(fused+eager)` delta against a structural
+// census. [`assert_seam_lock_held`] still gates the WRITE side of all
+// five identically to the three exact-delta registries; only the READ
+// side is looser for these five, and this doc states that asymmetry
+// rather than leaving it implicit.
+//
+// A single `std::sync::Mutex` is not reentrant, so this crate deliberately
+// keeps exactly ONE seam-counter lock rather than one per registry: a test
+// whose forward reaches more than one of the sites above (e.g. an
+// attention-cascade write followed by a layer-norm write in the same
+// window) acquires [`seam_counter_lock`] once and holds it for the whole
+// window, never two locks in sequence — a single lock has no acquisition
+// order to get wrong.
 //
 // **Rejected: per-thread (`cfg(test)` thread-local) counters instead of a
 // lock.** Two independent reasons, not the naive "cfg(test) doesn't cross
@@ -68,10 +90,7 @@ use crate::{AnyEncoder, FusibleSiteCensus};
 //    (`crates/jammi-bench/src/finetune_run.rs:1958`) /
 //    `lora_linear_fused_dispatch_after`
 //    (`crates/jammi-bench/src/finetune_run.rs:2122`) that reads the SAME
-//    process-wide counter today. `lora_linear_fused` therefore stays
-//    convention-only: [`assert_seam_lock_held`] is not (and cannot be)
-//    called from inside `jammi_lora`, so a `LoraLinear::forward` training
-//    dispatch is not mechanically gated the way the other three seams are.
+//    process-wide counter today.
 // 2. `jammi-bench`'s own positive-proof equation (`fused + eager == census
 //    x steps_measured`, `FusibleSiteCensus`'s own doc) reads the SAME
 //    process-WIDE counters this crate's unit tests read, including across
@@ -91,16 +110,26 @@ thread_local! {
     static SEAM_LOCK_HELD: Cell<bool> = const { Cell::new(false) };
 }
 
-/// The ONE lock every writer of `layer_norm_fused` / `gelu_erf_fused` /
-/// `attention_block_fused` (and every reader of their registries) in this
-/// crate's unit-test binary must hold — see this module's own section doc
-/// above for why there is exactly one, and why a per-thread counter was
-/// rejected instead. Private: constructible only via [`seam_counter_lock`].
+/// The ONE lock every writer and every exact-delta reader of the registries
+/// this module's own section doc's table names must hold — see that doc for
+/// the full set and for why there is exactly one lock, not one per registry.
+/// Private: constructible only via [`seam_counter_lock`].
 static SEAM_COUNTER_TEST_LOCK: Mutex<()> = Mutex::new(());
 
 /// RAII guard over [`SEAM_COUNTER_TEST_LOCK`] — its private field means the
-/// only way to construct one is [`seam_counter_lock`], so a caller cannot
-/// synthesize proof of holding the lock without actually acquiring it.
+/// only way to construct one is [`seam_counter_lock`]. Holding a
+/// `&SeamCounterGuard` proves a guard was constructed by SOME thread's call
+/// to [`seam_counter_lock`] and is still alive; it does NOT by itself prove
+/// the CURRENTLY EXECUTING thread is the one that acquired it —
+/// `MutexGuard<()>` is `Sync` (`()` is `Sync`, and `MutexGuard` is
+/// deliberately `!Send`, so it is the REFERENCE, not the guard itself, that
+/// could cross a thread boundary), so a `&SeamCounterGuard` could in
+/// principle be shared into a second thread that never called
+/// [`seam_counter_lock`] itself. The type is a compile-time nudge (a caller
+/// must at least be holding a live guard reference); [`assert_seam_lock_held`]'s
+/// per-thread [`SEAM_LOCK_HELD`] flag is the actual gate every writer this
+/// module guards is checked against, and it is set/cleared on the acquiring
+/// thread specifically.
 pub(crate) struct SeamCounterGuard<'a>(#[allow(dead_code)] MutexGuard<'a, ()>);
 
 impl Drop for SeamCounterGuard<'_> {
@@ -113,10 +142,10 @@ impl Drop for SeamCounterGuard<'_> {
 /// other lock acquisition in this crate: a prior test's panic while holding
 /// it must not wedge every later test) and mark this thread as holding it
 /// for [`assert_seam_lock_held`]. Every `#[test]` that drives a training-
-/// mode forward through `layer_norm_fused`, `gelu_erf_fused`, or
-/// `attention_block_fused` — directly or via `assert_fusible_site_census_is_exact`
-/// — must hold the returned guard for the ENTIRE window it measures a
-/// counter delta over.
+/// mode forward through any registry this module's own section doc's table
+/// names — directly or via `assert_fusible_site_census_is_exact` — must
+/// hold the returned guard for the ENTIRE window it measures a counter
+/// delta (exact or one-sided) over.
 pub(crate) fn seam_counter_lock() -> SeamCounterGuard<'static> {
     let guard = SEAM_COUNTER_TEST_LOCK
         .lock()
@@ -126,11 +155,20 @@ pub(crate) fn seam_counter_lock() -> SeamCounterGuard<'static> {
 }
 
 /// The mechanical class gate esc-092 says was missing: called from the
-/// TRAINING arm of every fused-seam dispatch site this crate owns,
-/// immediately before the `admit()` call that would otherwise silently
-/// record a dispatch no lock is protecting. Panics naming `site` and
-/// esc-092 when the calling thread does not hold [`SEAM_COUNTER_TEST_LOCK`]
-/// (via [`seam_counter_lock`]) — eval-mode forwards never reach this (they
+/// TRAINING arm of every fused-seam/cascade dispatch site this crate owns —
+/// `layer_norm::forward_fused_or_fallback`, `activations::gelu_erf`,
+/// `attention_cascade::training_attention_cascade` (at cascade ENTRY, before
+/// any of its three writes — not immediately before its last one, so an
+/// early return between two writes cannot skip this check),
+/// `attention_cascade::softmax_apply_training`,
+/// `modernbert::RotaryEmbedding::apply_training`,
+/// `modernbert::ModernBertAttention::forward_padded_transport_attention`
+/// (its own, separate `attention_block_flash` writer, entry-gated too), and
+/// `modernbert::geglu_apply_training` — immediately before the
+/// `admit()`/`admit_cascade()` call that would otherwise silently record a
+/// dispatch no lock is protecting. Panics naming `site` and esc-092 when the
+/// calling thread does not hold [`SEAM_COUNTER_TEST_LOCK`] (via
+/// [`seam_counter_lock`]) — eval-mode forwards never reach this (they
 /// short-circuit before `admit()`), so eval-only tests are unaffected. Not
 /// called from `jammi_lora::lora_linear` at all (see this module's section
 /// doc, "Rejected: per-thread counters", item 1) — `lora_linear_fused`
@@ -140,11 +178,11 @@ pub(crate) fn assert_seam_lock_held(site: &'static str) {
     let held = SEAM_LOCK_HELD.with(|held| held.get());
     assert!(
         held,
-        "{site}: a training-mode forward reached this fused seam's admit() without holding \
-         crate::test_support::seam_counter_lock() (esc-092) -- every #[test] that writes to \
-         layer_norm_fused/gelu_erf_fused/attention_block_fused's process-wide dispatch \
-         counters must hold the SAME lock seam_dispatch_totals()'s reader holds, or the \
-         exact-count census oracle can misattribute another test's dispatch"
+        "{site}: a training-mode forward reached this fused seam's admit()/admit_cascade() \
+         without holding crate::test_support::seam_counter_lock() (esc-092) -- every #[test] \
+         that writes to this module's own section doc's table of process-wide dispatch \
+         counters must hold the SAME lock every exact-delta reader holds, or a census/delta \
+         oracle can misattribute another test's dispatch"
     );
 }
 
@@ -343,12 +381,15 @@ pub(crate) struct SeamDispatchTotals {
     gelu_erf: u64,
 }
 
-/// Snapshot all three seams at once. Every counter here is a PROCESS-WIDE
-/// static, so a caller must hold [`SeamCounterGuard`] — taken by reference
-/// so this function cannot compile against a caller that lacks one — across
-/// the whole before/after pair it differences (see this module's own "The
-/// ONE seam-counter test lock" section doc for why there is exactly one
-/// lock, not the prior scheme's two acquired in a fixed order).
+/// Snapshot all three exact-delta seams at once. Every counter here is a
+/// PROCESS-WIDE static, so a caller must hold [`SeamCounterGuard`] — taken
+/// by reference, which proves a guard exists (see [`SeamCounterGuard`]'s own
+/// doc for what that does and does not prove on its own) — across the whole
+/// before/after pair it differences. See this module's own "The ONE
+/// seam-counter test lock" section doc for the full protected set (this
+/// function covers only the three with a guard-taking accessor;
+/// `attention_block_flash`/`mem_efficient_attention`/`softmax_last_dim_fused`/
+/// `rope_fused`/`geglu_fused` are read one-sided, not through here).
 pub(crate) fn seam_dispatch_totals(_lock: &SeamCounterGuard<'_>) -> SeamDispatchTotals {
     let lora = jammi_lora::lora_linear_fused_dispatch_snapshot();
     let ln = crate::layer_norm::LN_DISPATCH_COUNTERS.snapshot();

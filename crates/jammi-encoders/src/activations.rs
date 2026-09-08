@@ -31,11 +31,11 @@ pub(crate) static GELU_DISPATCH_COUNTERS: LazyLock<&'static DispatchCounters> =
     LazyLock::new(|| counters_for("gelu_erf_fused"));
 
 /// Test-only guarded read of [`GELU_DISPATCH_COUNTERS`]: takes
-/// `&SeamCounterGuard` (esc-092 / issue #476) so a test cannot read the
-/// fused/eager pair without holding `crate::test_support::seam_counter_lock()`
-/// — mirrors `crate::layer_norm::ln_snapshot_locked` exactly, for the tests
-/// in this module and `crate::htsat_audio` that read `GELU_DISPATCH_COUNTERS`
-/// alone rather than the summed three-seam tuple
+/// `&SeamCounterGuard` (esc-092 / issue #476, see that type's own doc for
+/// exactly what holding a reference to it proves) — mirrors
+/// `crate::layer_norm::ln_snapshot_locked` exactly, for the tests in this
+/// module and `crate::htsat_audio` that read `GELU_DISPATCH_COUNTERS` alone
+/// rather than the summed three-seam tuple
 /// `crate::test_support::seam_dispatch_totals` returns.
 #[cfg(test)]
 pub(crate) fn gelu_snapshot_locked(

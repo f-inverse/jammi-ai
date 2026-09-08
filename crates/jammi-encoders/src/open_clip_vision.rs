@@ -958,8 +958,6 @@ mod tests {
     /// would leave that difference unwitnessed.
     #[test]
     fn fusible_site_census_is_the_exact_per_forward_seam_call_count() {
-        // Lock order: attention_cascade THEN layer_norm — see
-        // `crate::htsat_audio`'s own multi-lock test doc.
         let _lock = crate::test_support::seam_counter_lock();
 
         let device = Device::Cpu;

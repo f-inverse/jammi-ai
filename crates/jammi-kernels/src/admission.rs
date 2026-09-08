@@ -39,8 +39,8 @@
 //! under the hood: `LN_DISPATCH_COUNTERS`, `crates/jammi-encoders/src/layer_norm.rs:128`;
 //! `ROPE_DISPATCH_COUNTERS`, `crates/jammi-encoders/src/modernbert.rs:180`;
 //! `SOFTMAX_DISPATCH_COUNTERS`, `crates/jammi-encoders/src/modernbert.rs:194`;
-//! `GEGLU_DISPATCH_COUNTERS`, `crates/jammi-encoders/src/modernbert.rs:1379`
-//! (`ATTENTION_BLOCK_DISPATCH_COUNTERS`, `crates/jammi-encoders/src/modernbert.rs:586`
+//! `GEGLU_DISPATCH_COUNTERS`, `crates/jammi-encoders/src/modernbert.rs:1391`
+//! (`ATTENTION_BLOCK_DISPATCH_COUNTERS`, `crates/jammi-encoders/src/modernbert.rs:588`
 //! is a fifth, added the same way rather than as a sixth hand-declared static).
 //! The paragraph above is kept for its historical rationale (why the
 //! registry exists at all), not as a description of the current state —
@@ -86,9 +86,9 @@
 //!
 //! **Live standalone** (reachable directly, own call site, own predicate):
 //! `"layer_norm_fused"` (`jammi-encoders/src/layer_norm.rs:586`),
-//! `"geglu_fused"` (`jammi-encoders/src/modernbert.rs:1424`),
+//! `"geglu_fused"` (`jammi-encoders/src/modernbert.rs:1438`),
 //! `"lora_linear_fused"` (`jammi-lora/src/lora_linear.rs:1007`), and
-//! `"attention_block_fused"` (`jammi-encoders/src/attention_cascade.rs:897`) itself.
+//! `"attention_block_fused"` (`jammi-encoders/src/attention_cascade.rs:908`) itself.
 //!
 //! **Subsumed** (reachable ONLY when `"attention_block_fused"` is ALSO
 //! disabled, forcing `forward_training_attention` into
@@ -1771,7 +1771,7 @@ impl ProbedOp {
 /// | `layer_norm` | TwoArm | `layer_norm_fused` | `layer_norm_fused`, `crates/jammi-encoders/src/layer_norm.rs:129` |
 /// | `rope` | TwoArm | `rope_fused` | `rope_fused`, `crates/jammi-encoders/src/modernbert.rs:181` |
 /// | `softmax` | TwoArm | `softmax_last_dim_fused` | `softmax_last_dim_fused`, `crates/jammi-encoders/src/attention_cascade.rs:404` |
-/// | `geglu` | TwoArm | `geglu_fused` | `geglu_fused`, `crates/jammi-encoders/src/modernbert.rs:1380` |
+/// | `geglu` | TwoArm | `geglu_fused` | `geglu_fused`, `crates/jammi-encoders/src/modernbert.rs:1392` |
 /// | `gelu_erf` | TwoArm | `gelu_erf_fused` | `gelu_erf_fused`, `crates/jammi-kernels/src/ops/gelu_erf.rs`'s `GeluErfFused::name()`; the `admit()` CALL SITE is `crates/jammi-encoders/src/activations.rs`'s `gelu_erf(x, training)`, reachable on every training-mode erf-GELU call for a head_dim-agnostic BERT-family MLP — `BertIntermediate::forward` (`bert.rs:296`) and `DistilBertFfn::forward` (`distilbert.rs:211`) both call it. |
 /// | `attention_block` | TwoArm | `attention_block_fused` | `attention_block_fused`, `crates/jammi-encoders/src/attention_cascade.rs:399` |
 /// | `dropout` | TwoArm | `lora_linear_fused` | `lora_linear_fused`, `crates/jammi-lora/src/lora_linear.rs:1007` (`admit` call site) |
@@ -1779,7 +1779,7 @@ impl ProbedOp {
 /// | `cast_scale` | TwoArm | bf16 → `cast_scale_bf16_f32`, f16 → `cast_scale_f16_f32` | `cast_scale_bf16_f32`, `crates/jammi-kernels/src/ops/low_rank_residual_linear.rs:1054`; `cast_scale_f16_f32`, `crates/jammi-kernels/src/ops/low_rank_residual_linear.rs:1068` |
 /// | `cast_add` | TwoArm | bf16 → `cast_add_bf16`, f16 → `cast_add_f16` | `cast_add_bf16`, `crates/jammi-kernels/src/ops/low_rank_residual_linear.rs:1153`; `cast_add_f16`, `crates/jammi-kernels/src/ops/low_rank_residual_linear.rs:1165` |
 /// | `adamw_step` | TwoArm | `adamw_step_fused` | `adamw_step_fused`, `crates/jammi-ai/src/fine_tune/adamw.rs:33` (`admit`, `crates/jammi-ai/src/fine_tune/adamw.rs:257`) |
-/// | `mem_efficient_attention` | Cascade | `mem_efficient_attention` | `mem_efficient_attention`, `crates/jammi-encoders/src/attention_cascade.rs:849` |
+/// | `mem_efficient_attention` | Cascade | `mem_efficient_attention` | `mem_efficient_attention`, `crates/jammi-encoders/src/attention_cascade.rs:862` |
 /// | `rope_positions` | InternalSubkernel(`attention_block_flash`) | — | `rope_positions`, `crates/jammi-kernels/src/ops/flash_attention.rs:645` |
 /// | `scaled_cast_add` | InternalSubkernel(`low_rank_residual_linear`) | — | `ScaledCastAdd`, `crates/jammi-kernels/src/ops/low_rank_residual_linear.rs:946` (CPU), `ScaledCastAdd`, `crates/jammi-kernels/src/cuda/low_rank_residual_linear.rs:142` (CUDA) |
 ///

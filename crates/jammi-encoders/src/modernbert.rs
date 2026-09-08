@@ -479,6 +479,8 @@ impl RotaryEmbedding {
 
         let (holds, predicate) =
             rope_admission_predicate(x_dtype, x.device(), &cos, &sin, head_dim);
+        #[cfg(test)]
+        crate::test_support::assert_seam_lock_held("modernbert::RotaryEmbedding::apply_training");
         let outcome = admit(
             admission_mode(),
             "rope_fused",
@@ -1093,6 +1095,16 @@ impl ModernBertAttention {
         let d = self.head_dim;
         let qkv = self.wqkv.forward(&normed)?;
 
+        // A SECOND `attention_block_flash`/`mem_efficient_attention` writer,
+        // separate from `attention_cascade::training_attention_cascade`'s own
+        // cascade entry gate: this method is the padded-transport call site
+        // `ModernBert::forward_hidden_with_lengths` reaches directly (never
+        // through that cascade), so it needs its own gate at entry to its
+        // own single write below, not a call into the other function.
+        #[cfg(test)]
+        crate::test_support::assert_seam_lock_held(
+            "modernbert::ModernBertAttention::forward_padded_transport_attention",
+        );
         let flash_dispatch = admit_cascade(
             admission_mode(),
             "attention_block_flash",
@@ -1419,6 +1431,8 @@ fn geglu_admission_predicate(wi_out: &Tensor) -> (bool, &'static str) {
 /// (see `forward`'s `match`), so it has no bearing on eval's bit-identity.
 fn geglu_apply_training(wi_out: &Tensor) -> Result<Tensor, EncoderError> {
     let (holds, predicate) = geglu_admission_predicate(wi_out);
+    #[cfg(test)]
+    crate::test_support::assert_seam_lock_held("modernbert::geglu_apply_training");
     let outcome = admit(
         admission_mode(),
         "geglu_fused",
@@ -7395,6 +7409,10 @@ mod tests {
     /// merely that this fixture happens to fail admission.
     #[test]
     fn eval_mode_rope_is_bit_identical_regardless_of_fused_eligibility() {
+        // The `apply_training` call below (exercising the fused arm this
+        // binary now has) bumps `ROPE_DISPATCH_COUNTERS` even though this
+        // test only asserts eval bit-identity (esc-092 / issue #476).
+        let _lock = crate::test_support::seam_counter_lock();
         let device = Device::Cpu;
         let head_dim = 8;
         let seq = 4;
@@ -7459,6 +7477,7 @@ mod tests {
     /// (the eager composition), fwd AND bwd.
     #[test]
     fn fused_training_rope_matches_eager_fwd_and_bwd() {
+        let _lock = crate::test_support::seam_counter_lock();
         let device = Device::Cpu;
         let head_dim = 8;
         let seq = 4;
@@ -7661,6 +7680,7 @@ mod tests {
     /// fail admission.
     #[test]
     fn eval_mode_attention_softmax_is_bit_identical_regardless_of_fused_eligibility() {
+        let _lock = crate::test_support::seam_counter_lock();
         let device = Device::Cpu;
         let batch = 1;
         let heads = 2;
@@ -7731,6 +7751,7 @@ mod tests {
     /// the fused/eager dispatch machinery.
     #[test]
     fn fused_training_softmax_matches_eager_fwd_and_bwd() {
+        let _lock = crate::test_support::seam_counter_lock();
         let device = Device::Cpu;
         let batch = 1;
         let heads = 2;
@@ -7868,6 +7889,7 @@ mod tests {
     /// an assertion.
     #[test]
     fn eager_fallback_softmax_matches_inline_reference_fwd_and_bwd() {
+        let _lock = crate::test_support::seam_counter_lock();
         let device = Device::Cpu;
         let batch = 2;
         let heads = 16;
@@ -8021,6 +8043,7 @@ mod tests {
     /// presence/absence of the `Op::Affine` node.
     #[test]
     fn fused_training_softmax_call_site_drops_the_affine_node() {
+        let _lock = crate::test_support::seam_counter_lock();
         let device = Device::Cpu;
         let batch = 1;
         let heads = 2;
@@ -8146,6 +8169,7 @@ mod tests {
     /// that WOULD be fused-eligible.
     #[test]
     fn eval_mode_mlp_geglu_is_bit_identical_regardless_of_fused_eligibility() {
+        let _lock = crate::test_support::seam_counter_lock();
         let device = Device::Cpu;
         let intermediate = 8;
         let rows = 2;
@@ -8200,6 +8224,7 @@ mod tests {
     /// `fused_training_softmax_matches_eager_fwd_and_bwd` exactly.
     #[test]
     fn fused_training_geglu_matches_eager_fwd_and_bwd() {
+        let _lock = crate::test_support::seam_counter_lock();
         let device = Device::Cpu;
         let intermediate = 8;
         let rows = 2;
@@ -8726,24 +8751,24 @@ mod tests {
             memeff_after.fused, memeff_before.fused,
             "memeff must never dispatch fused for a dtype its own op cannot serve"
         );
-        // `>=`, not `==` (pod-smoke fix, adversarial audit round 3
-        // follow-up): `forward_training_attention`'s memeff cascade is
-        // consulted on EVERY training-mode call in this shared test
-        // binary, including every pre-existing (unrelated, unlocked) test
-        // elsewhere in this file that reaches it at a short seq — each of
-        // those ALSO increments `declined`
-        // (`seq_within_attention_block_max_seq`), and this process-wide
-        // counter has no way to attribute an increment to the test that
-        // caused it. `crate::test_support::seam_counter_lock` only serializes
-        // THIS file's OWN counter-asserting tests against each other — it
-        // was never meant to (and cannot) silence hundreds of unrelated
-        // pre-existing training-mode tests. The property that matters —
-        // "this call's own decline was recorded" — is exact in spirit;
-        // `>=` is the honest statement of it under real parallelism (the
-        // `.expect` above already proved this call itself fell through).
-        assert!(
-            memeff_after.declined > memeff_before.declined,
-            "the dtype decline must still be recorded"
+        // Exact delta (esc-092 / issue #476 BLOCK C: this was previously a
+        // `>` bound, on the claim that unrelated tests elsewhere in this
+        // binary could also bump `declined` inside this same window).
+        // `attention_cascade::training_attention_cascade`'s mechanical gate
+        // (`crate::test_support::assert_seam_lock_held`, checked at cascade
+        // ENTRY before any of its writes) now means EVERY training-mode
+        // call anywhere in this crate that reaches `mem_efficient_attention`'s
+        // `admit_cascade` — the cascade's only writer of this registry —
+        // holds `crate::test_support::seam_counter_lock()` for its own
+        // whole before/after window; `cargo test -p jammi-encoders --lib`
+        // stays green only because that is true (an unlocked writer panics
+        // there instead). While THIS test holds the lock, no other test's
+        // forward can be concurrently bumping this counter, so one call's
+        // own decline is exactly `+1`, not merely `>`.
+        assert_eq!(
+            memeff_after.declined,
+            memeff_before.declined + 1,
+            "the dtype decline must be recorded exactly once for this one forward call"
         );
         assert_eq!(
             block_after.fused, block_before.fused,
@@ -8980,16 +9005,17 @@ mod tests {
             "memeff must never dispatch fused for F16 -- the bundle-suppression seam must have \
              correctly declined to suppress"
         );
-        // `>=`, not `==` (pod-smoke fix, adversarial audit round 3
-        // follow-up — same rationale as the sibling test above): every
-        // OTHER training-mode forward in this shared test binary ALSO
-        // consults (and declines) this predicate, so an exact delta over
-        // this ONE model's `layers.len()` is not a safe claim under real
-        // parallelism; `>=` proves this forward's own per-layer declines
-        // were genuinely recorded without asserting something false about
-        // concurrently-running, unrelated tests.
-        assert!(
-            memeff_after.declined - memeff_before.declined >= model.layers.len() as u64,
+        // Exact delta (esc-092 / issue #476 BLOCK C, same fix as the
+        // sibling test above): `training_attention_cascade`'s entry gate
+        // means every training-mode forward anywhere in this crate that
+        // reaches `mem_efficient_attention` holds
+        // `crate::test_support::seam_counter_lock()` for its own window, so
+        // while THIS test holds it, no concurrently-running test can also
+        // be bumping this counter — this forward's own per-layer declines
+        // are exactly `model.layers.len()`, not merely a lower bound.
+        assert_eq!(
+            memeff_after.declined - memeff_before.declined,
+            model.layers.len() as u64,
             "every layer's own per-layer predicate call must ALSO decline (dtype), consistent \
              with the once-per-forward suppression decision"
         );
@@ -9588,7 +9614,12 @@ mod tests {
         // PAST that guard and past the memeff cascade (`seq=4`, still
         // `<= ATTENTION_BLOCK_MAX_SEQ`, so memeff also declines) into the
         // block/eager fallthrough's OWN `masks.fused.is_none()` refusal —
-        // the one this test's name and doc actually describe.
+        // the one this test's name and doc actually describe. The cascade
+        // gate now sits at ENTRY (esc-092 / issue #476 BLOCK A fold-in), so
+        // this call bumps `attention_block_flash.declined` and
+        // `mem_efficient_attention.declined` before the refusal fires —
+        // this test IS a writer even though it never dispatches Fused.
+        let _lock = crate::test_support::seam_counter_lock();
         let device = Device::Cpu;
         let (b, s, h, d) = (1usize, 4usize, 2usize, ATTENTION_BLOCK_HEAD_DIM);
         let hidden = Tensor::zeros((b, s, h * d), DType::F32, &device).unwrap();
@@ -10598,8 +10629,6 @@ mod tests {
     ///   learning about it, this is the assertion that reds.
     #[test]
     fn fusible_site_census_is_the_exact_per_forward_seam_call_count() {
-        // Lock order: attention_cascade THEN layer_norm — see
-        // `crate::htsat_audio`'s own multi-lock test doc.
         let _lock = crate::test_support::seam_counter_lock();
 
         let device = Device::Cpu;

@@ -129,11 +129,11 @@ pub static LN_DISPATCH_COUNTERS: LazyLock<&'static DispatchCounters> =
     LazyLock::new(|| counters_for("layer_norm_fused"));
 
 /// Test-only guarded read of [`LN_DISPATCH_COUNTERS`]: takes
-/// `&SeamCounterGuard` (esc-092 / issue #476) so a test cannot read the
-/// fused/eager pair without holding `crate::test_support::seam_counter_lock()`
-/// — the single-key sibling of `crate::test_support::seam_dispatch_totals`
-/// for this module's own tests, which read `LN_DISPATCH_COUNTERS` alone
-/// rather than the summed three-seam tuple.
+/// `&SeamCounterGuard` (esc-092 / issue #476, see that type's own doc for
+/// exactly what holding a reference to it proves) — the single-key sibling
+/// of `crate::test_support::seam_dispatch_totals` for this module's own
+/// tests, which read `LN_DISPATCH_COUNTERS` alone rather than the summed
+/// three-seam tuple.
 #[cfg(test)]
 pub(crate) fn ln_snapshot_locked(
     _lock: &crate::test_support::SeamCounterGuard<'_>,
@@ -1314,11 +1314,9 @@ mod tests {
         let (holds, predicate) = fused_admission_predicate(x_fused.as_tensor(), &ln_fused.weight);
         assert!(holds, "fixture must be fused-eligible: {predicate}");
         // `LN_DISPATCH_COUNTERS` is one process-wide static shared with
-        // every other test in this binary (esc-092 / issue #476): this
-        // test now holds `crate::test_support::seam_counter_lock()` for
-        // the whole before/after window, so — unlike before this fix,
-        // when this test declined the lock and could only assert
-        // monotonic increase — it asserts the EXACT `+1` delta a single
+        // every other test in this binary (esc-092 / issue #476): this test
+        // holds `crate::test_support::seam_counter_lock()` for the whole
+        // before/after window, so it asserts the EXACT `+1` delta a single
         // training forward through one LayerNorm must produce.
         let _lock = crate::test_support::seam_counter_lock();
         let before = ln_snapshot_locked(&_lock);

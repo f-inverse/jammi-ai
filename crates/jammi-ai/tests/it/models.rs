@@ -883,3 +883,179 @@ async fn fine_tuned_prefix_with_wrong_model_type_refuses_to_resolve() {
         "refusal must name the row's actual (wrong) model_type, got: {message}"
     );
 }
+
+/// esc-089's OTHER pointer-corruption seam: a fine-tuned record whose
+/// `artifact_path` string does not even parse as a storage URL (an unknown
+/// scheme) is itself a corrupted CATALOG RECORD — never a storage-layer
+/// transport fault — so `ModelResolver::try_catalog_lookup` must refuse
+/// with the SAME typed `JammiError::Model` variant the sibling missing-file
+/// refusal above raises, naming both the model id and the invalid pointer.
+#[tokio::test]
+async fn fine_tuned_adapter_bundle_corrupted_pointer_refuses_as_typed_model_error() {
+    use jammi_db::catalog::model_repo::RegisterModelParams;
+
+    let dir = tempdir().unwrap();
+    let catalog = Arc::new(Catalog::open(dir.path()).await.unwrap());
+    let base_dir = crate::common::cookbook_fixture("tiny_bert");
+    let base_id = format!("local:{}", base_dir.display());
+
+    catalog
+        .register_model(RegisterModelParams {
+            model_id: "jammi:fine-tuned:corrupted-pointer",
+            version: 1,
+            model_type: "fine-tuned",
+            backend: "candle",
+            task: ModelTask::TextEmbedding,
+            base_model_id: Some(&base_id),
+            artifact_path: Some("not-a-real-scheme://nonsense"),
+            config_json: None,
+        })
+        .await
+        .unwrap();
+
+    let resolver = ModelResolver::new(catalog, crate::common::test_artifact_store()).unwrap();
+    let source = ModelSource::hf("jammi:fine-tuned:corrupted-pointer");
+    let result = resolver
+        .resolve(&source, ModelTask::TextEmbedding, None)
+        .await;
+    let err = match result {
+        Ok(_) => panic!(
+            "a fine-tuned record whose artifact_path does not parse as a storage URL must \
+             refuse to resolve, never silently serve the unadapted base"
+        ),
+        Err(e) => e,
+    };
+    assert!(
+        matches!(err, jammi_db::error::JammiError::Model { .. }),
+        "an unparseable artifact_path is a corrupted catalog record, not a storage-layer \
+         transport fault — it must be the SAME typed JammiError::Model variant every other \
+         fine-tuned-record refusal in this arm raises, got a different variant: {err:?}"
+    );
+    let message = err.to_string();
+    assert!(
+        message.contains("jammi:fine-tuned:corrupted-pointer"),
+        "refusal must name the broken model id, got: {message}"
+    );
+    assert!(
+        message.contains("not-a-real-scheme"),
+        "refusal must name the invalid pointer string, got: {message}"
+    );
+}
+
+/// esc-089's flip side: a fine-tuned record whose adapter bundle is
+/// published and INTACT, but whose backing file becomes unreadable for a
+/// reason that has nothing to do with the bundle's own integrity — a
+/// permission fault standing in for a transient object-store outage, via
+/// real fault injection (`chmod`, mirroring
+/// `crates/jammi-ai/src/fine_tune/trainer.rs`'s own technique) — must NOT
+/// be folded into the typed `JammiError::Model` refusal the sibling
+/// missing-file test above pins. `ArtifactStore::fetch_artifact` re-types
+/// ONLY a manifest-promised key that is truly absent
+/// (`object_store::Error::NotFound`) into an integrity failure
+/// (`StorageError::Layout`); every other driver fault — including a
+/// permission-denied open, which `object_store`'s `LocalFileSystem` maps to
+/// `Error::UnableToOpenFile`, never `NotFound` — stays `StorageError::Io`
+/// and must reach the caller unchanged, so a gRPC client sees `Internal`
+/// (a transient-outage shape), never `InvalidArgument` (a bad-request
+/// shape), for a fault that is not this model's fault at all.
+#[cfg(unix)]
+#[tokio::test]
+async fn fine_tuned_adapter_bundle_permission_fault_is_not_a_typed_model_error() {
+    use std::os::unix::fs::PermissionsExt;
+
+    use jammi_db::catalog::model_repo::RegisterModelParams;
+    use jammi_db::storage::{StorageRegistry, StorageUrl};
+    use jammi_db::store::ArtifactStore;
+
+    let dir = tempdir().unwrap();
+    let catalog = Arc::new(Catalog::open(dir.path()).await.unwrap());
+    let base_dir = crate::common::cookbook_fixture("tiny_bert");
+    let base_id = format!("local:{}", base_dir.display());
+
+    let artifacts_root = dir.path().join("artifacts");
+    let store = Arc::new(
+        ArtifactStore::with_root(
+            StorageUrl::parse(artifacts_root.to_str().unwrap()).unwrap(),
+            StorageRegistry::new(),
+            dir.path().join("artifact_cache"),
+        )
+        .unwrap(),
+    );
+    let prefix = store
+        .put_artifact(
+            &["permission-fault-bundle"],
+            &[
+                (
+                    "adapter_config.json".to_string(),
+                    bytes::Bytes::from_static(b"{}"),
+                ),
+                (
+                    "adapter.safetensors".to_string(),
+                    bytes::Bytes::from_static(b"weights"),
+                ),
+            ],
+        )
+        .await
+        .unwrap();
+    let weights_path = std::path::PathBuf::from(prefix.path()).join("adapter.safetensors");
+
+    // PROBE: chmod the file unreadable, then confirm the process actually
+    // cannot read it — root (and a mode-ignoring filesystem) bypasses this,
+    // in which case the fault-injection premise this test needs never holds.
+    std::fs::set_permissions(&weights_path, std::fs::Permissions::from_mode(0o000)).unwrap();
+    let bypassed = std::fs::read(&weights_path).is_ok();
+    if bypassed {
+        let _ = std::fs::set_permissions(&weights_path, std::fs::Permissions::from_mode(0o644));
+        if std::env::var_os("JAMMI_REQUIRE_POSIX_PERMS").is_some() {
+            panic!(
+                "JAMMI_REQUIRE_POSIX_PERMS is set but the process could read a 0o000-chmod'd \
+                 file (root, or a mode-ignoring filesystem) — the permission-fault \
+                 fault-injection premise this test needs does not hold"
+            );
+        }
+        eprintln!(
+            "fine_tuned_adapter_bundle_permission_fault_is_not_a_typed_model_error: chmod \
+             bypassed (root?) — skipping"
+        );
+        return;
+    }
+
+    catalog
+        .register_model(RegisterModelParams {
+            model_id: "jammi:fine-tuned:permission-fault-bundle",
+            version: 1,
+            model_type: "fine-tuned",
+            backend: "candle",
+            task: ModelTask::TextEmbedding,
+            base_model_id: Some(&base_id),
+            artifact_path: Some(prefix.as_str()),
+            config_json: None,
+        })
+        .await
+        .unwrap();
+
+    let resolver = ModelResolver::new(catalog, store).unwrap();
+    let source = ModelSource::hf("jammi:fine-tuned:permission-fault-bundle");
+    let result = resolver
+        .resolve(&source, ModelTask::TextEmbedding, None)
+        .await;
+
+    // Restore permissions unconditionally so the tempdir's own Drop cleanup
+    // never has to fight the chmod.
+    let _ = std::fs::set_permissions(&weights_path, std::fs::Permissions::from_mode(0o644));
+
+    let err = match result {
+        Ok(_) => panic!(
+            "resolving a fine-tuned model whose adapter file is permission-denied must fail, \
+             never silently serve a vector"
+        ),
+        Err(e) => e,
+    };
+    assert!(
+        !matches!(err, jammi_db::error::JammiError::Model { .. }),
+        "a permission/transport fault reading an INTACT bundle is NOT this model's fault — it \
+         must propagate as its own storage-layer variant, never be folded into \
+         JammiError::Model (which a gRPC client maps to InvalidArgument instead of Internal), \
+         got: {err:?}"
+    );
+}

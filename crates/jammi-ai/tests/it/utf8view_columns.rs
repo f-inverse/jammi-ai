@@ -299,3 +299,107 @@ async fn parquet_utf8_path_column_scans_as_utf8view_and_embeds() {
         assert!(!v.is_empty(), "embedding vector should not be empty");
     }
 }
+
+/// Writes a Parquet file with one plain `Utf8` column of audio file paths —
+/// the audio peer of [`write_image_path_parquet`].
+fn write_audio_path_parquet(dir: &std::path::Path) -> PathBuf {
+    use arrow::array::RecordBatch;
+    use arrow::datatypes::{DataType, Field, Schema};
+    use parquet::arrow::ArrowWriter;
+
+    let paths = [
+        audio_path("clip_harmonic_0.wav"),
+        audio_path("clip_noise_0.wav"),
+    ];
+    let path_strs: Vec<&str> = paths.iter().map(|p| p.to_str().unwrap()).collect();
+
+    let schema = Arc::new(Schema::new(vec![
+        Field::new("id", DataType::Utf8, false),
+        Field::new("audio_path", DataType::Utf8, false),
+    ]));
+    let ids = Arc::new(StringArray::from(vec!["a", "b"])) as ArrayRef;
+    let audio_paths = Arc::new(StringArray::from(path_strs)) as ArrayRef;
+    let batch = RecordBatch::try_new(schema.clone(), vec![ids, audio_paths]).unwrap();
+
+    let out = dir.join("audio_paths.parquet");
+    let mut writer =
+        ArrowWriter::try_new(std::fs::File::create(&out).unwrap(), schema, None).unwrap();
+    writer.write(&batch).unwrap();
+    writer.close().unwrap();
+    out
+}
+
+fn tiny_htsat_clap_model() -> String {
+    "local:".to_string()
+        + common::cookbook_fixture("htsat_clap_tiny")
+            .to_str()
+            .unwrap()
+}
+
+/// The audio peer of [`parquet_utf8_path_column_scans_as_utf8view_and_embeds`]:
+/// a Parquet source with a plain `Utf8` column of audio file paths, scanned
+/// through DataFusion (which — under this workspace's pinned Arrow/DataFusion
+/// versions — surfaces the column as `Utf8View`, not `Utf8`) and fed straight
+/// into audio-embedding generation.
+#[tokio::test(flavor = "multi_thread")]
+async fn parquet_utf8_audio_path_column_scans_as_utf8view_and_embeds() {
+    let dir = tempfile::TempDir::new().unwrap();
+    let session = Arc::new(
+        InferenceSession::new(common::test_config(dir.path()))
+            .await
+            .unwrap(),
+    );
+    let parquet_path = write_audio_path_parquet(dir.path());
+    session
+        .add_source(
+            "audio_paths",
+            SourceType::File,
+            SourceConnection {
+                url: Some(format!("file://{}", parquet_path.display())),
+                format: Some(FileFormat::Parquet),
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+
+    // Confirm the REAL trigger: the scanned batch's `audio_path` column is
+    // `Utf8View`, not `Utf8` — otherwise this test would not exercise the arm
+    // at all.
+    let batches = session
+        .sql("SELECT audio_path FROM audio_paths.public.audio_paths")
+        .await
+        .unwrap();
+    let col = batches[0].column_by_name("audio_path").unwrap();
+    assert_eq!(
+        col.data_type(),
+        &arrow::datatypes::DataType::Utf8View,
+        "expected the Parquet scan to surface Utf8View for a plain Utf8 column under this \
+         workspace's pinned Arrow/DataFusion versions — if this fails, the trigger this test \
+         exists to exercise no longer reproduces and the test needs a new trigger"
+    );
+
+    let (table, _outcome) = session
+        .generate_audio_embeddings(
+            "audio_paths",
+            &tiny_htsat_clap_model(),
+            "audio_path",
+            "id",
+            jammi_db::store::CachePolicy::Bypass,
+        )
+        .await
+        .expect(
+            "a Utf8View audio-path column (the real DataFusion scan output for a plain Utf8 \
+             Parquet column) must embed successfully, exactly like Utf8 does",
+        );
+
+    let vectors = session.read_vectors(&table).await.unwrap();
+    assert_eq!(
+        vectors.len(),
+        2,
+        "both rows should have produced an embedding"
+    );
+    for v in &vectors {
+        assert!(!v.is_empty(), "embedding vector should not be empty");
+    }
+}

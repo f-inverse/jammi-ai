@@ -3,6 +3,7 @@ use std::sync::Arc;
 
 use jammi_db::catalog::Catalog;
 use jammi_db::error::{JammiError, Result};
+use jammi_db::storage::StorageError;
 use jammi_db::store::ArtifactStore;
 
 use super::arch;
@@ -188,36 +189,53 @@ impl ModelResolver {
 
             let adapter_path = match &record.artifact_path {
                 Some(prefix) => {
-                    let prefix_url = jammi_db::storage::StorageUrl::parse(prefix)?;
+                    // A malformed `artifact_path` string is itself a corrupted
+                    // catalog record — never a storage-layer fault — so it is
+                    // always a typed `Model` refusal naming this id, regardless
+                    // of what the parser's own message says.
+                    let prefix_url = jammi_db::storage::StorageUrl::parse(prefix).map_err(|e| {
+                        JammiError::Model {
+                            model_id: model_id.0.clone(),
+                            message: format!(
+                                "fine-tuned model '{}' artifact_path '{prefix}' is not a \
+                                 valid storage URL: {e} — this catalog record's pointer is \
+                                 corrupted",
+                                model_id.0
+                            ),
+                        }
+                    })?;
                     // esc-089 negative control: `ArtifactStore::fetch_artifact`
-                    // raises `JammiError::Storage`/`JammiError::Io` for a
-                    // missing or corrupt bundle file — the right signal at
-                    // that layer, but every other refusal this arm raises
-                    // (the `base_model_id`/`artifact_path` checks above,
-                    // `CandleBackend::load`'s own missing-file refusal below)
-                    // is a typed `JammiError::Model` naming this model id, so
-                    // a caller distinguishing "this model's adapter is
-                    // broken" from any other storage fault by variant would
-                    // otherwise see the wrong one here. Re-type it here, at
-                    // the one seam that already knows both the model id and
-                    // the artifact prefix; the underlying error's own message
-                    // (which names the missing/corrupt key, e.g.
-                    // `adapter.safetensors`) is preserved verbatim in the
-                    // wrapped message.
-                    Some(
-                        self.artifact_store
-                            .fetch_artifact(&prefix_url)
-                            .await
-                            .map_err(|e| JammiError::Model {
+                    // raises `JammiError::Storage(StorageError::Layout)` for an
+                    // INTEGRITY failure of the bundle itself — the manifest is
+                    // missing/malformed, a manifest-listed key is absent, or a
+                    // digest mismatches — and re-typing ONLY that variant into
+                    // a typed `JammiError::Model` naming this model id matches
+                    // every other refusal this arm raises (the
+                    // `base_model_id`/`artifact_path` checks above,
+                    // `CandleBackend::load`'s own missing-file refusal below).
+                    // Any OTHER storage fault (a transport/IO error against
+                    // S3/GCS/azure, a disabled scheme, driver-init failure) is
+                    // NOT this model's fault — it propagates unchanged so a
+                    // gRPC client sees `Internal` (`wire.rs`'s catch-all),
+                    // never `InvalidArgument`, for a transient outage. The
+                    // underlying error's own message (which names the
+                    // missing/corrupt key, e.g. `adapter.safetensors`) is
+                    // preserved verbatim in the wrapped message.
+                    let local = match self.artifact_store.fetch_artifact(&prefix_url).await {
+                        Ok(local) => local,
+                        Err(JammiError::Storage(StorageError::Layout { path, reason })) => {
+                            return Err(JammiError::Model {
                                 model_id: model_id.0.clone(),
                                 message: format!(
-                                    "fine-tuned model '{}' adapter bundle fetch failed: {e}",
+                                    "fine-tuned model '{}' adapter bundle at '{path}' failed \
+                                     integrity check: {reason}",
                                     model_id.0
                                 ),
-                            })?
-                            .dir()
-                            .to_path_buf(),
-                    )
+                            });
+                        }
+                        Err(e) => return Err(e),
+                    };
+                    Some(local.dir().to_path_buf())
                 }
                 None => {
                     return Err(JammiError::Model {

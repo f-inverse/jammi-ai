@@ -438,6 +438,24 @@ workspace ships every publishable crate at the same
   `model_type`: a mismatch (a catalog a pre-fix build already corrupted) is a typed refusal naming
   the id and the row's actual type, never a silent base serve — the backstop for catalogs written
   before this fix.
+- **An adapter-fetch failure is typed by WHAT failed, not by which call site raised it — an
+  integrity failure of the bundle vs. a transport/IO fault of the store (esc-089 fold-in).**
+  `ArtifactStore::fetch_artifact` folded a manifest-promised key that is genuinely absent
+  (`object_store::Error::NotFound` — a partial publish, a manually-deleted file) into the SAME
+  `StorageError::Io` a real transport fault (a permission-denied open, an S3/GCS/azure outage)
+  raises, so `ModelResolver::try_catalog_lookup`'s fine-tuned reload arm — which re-typed EVERY
+  fetch error into `JammiError::Model` naming the model id — turned a transient store outage into
+  the same bad-request-shaped refusal a genuinely broken bundle gets, reaching a gRPC client as
+  `InvalidArgument` instead of `Internal`. `fetch_artifact` now reclassifies only the `NotFound`
+  case into `StorageError::Layout`, the same INTEGRITY bucket a malformed manifest or a digest
+  mismatch already carries; every other driver fault stays `StorageError::Io` unchanged.
+  `ModelResolver::try_catalog_lookup` and the sibling context-predictor reload arm
+  (`InferenceSession::load_context_predictor`) each re-type ONLY that `Layout` variant into their
+  own typed refusal (`JammiError::Model` / `JammiError::Inference`) naming the model id and the
+  missing key, and apply the identical rule to an `artifact_path` string that fails to parse as a
+  storage URL (itself a corrupted catalog record, never a storage fault) — every other fault
+  (a transport/IO error, a permission fault, a disabled scheme, driver-init failure) propagates
+  unchanged.
 - **A `Utf8View` path column is accepted by `arrow_to_images`/`arrow_to_audio`, matching `Utf8`
   exactly (esc-090).** Both functions matched `Utf8`/`LargeUtf8`/`Binary`/`LargeBinary`/
   `BinaryView` but had no `Utf8View` arm, so a `Utf8View` path column — DataFusion's parquet

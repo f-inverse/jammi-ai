@@ -2928,16 +2928,16 @@ retry loop re-taking the write lock:
   lineage a terminal producer already committed.
 
 Resolver chain (`crates/jammi-ai/src/model/resolver.rs`, `ModelResolver::resolve`):
-`try_catalog_lookup` (`crates/jammi-ai/src/model/resolver.rs:96`) first (refuses `Retired`;
+`try_catalog_lookup` (`crates/jammi-ai/src/model/resolver.rs:97`) first (refuses `Retired`;
 resolves fine-tuned base recursively + fetches adapter), else `resolve_local`/`resolve_hf_hub`
 (locate config, pick backend, gather weights, discover tokenizer, sum file sizes into
 `estimated_memory`). Before any of that, an id carrying the reserved `jammi:fine-tuned:` prefix
-(`FINE_TUNED_ID_PREFIX`, `crates/jammi-ai/src/model/resolver.rs:117`) whose row's `model_type` is
+(`FINE_TUNED_ID_PREFIX`, `crates/jammi-ai/src/model/resolver.rs:118`) whose row's `model_type` is
 NOT `fine-tuned` is refused by name — the backstop for a catalog a pre-fix build already
 corrupted, since nothing else ever mints that prefix. A record whose `model_type`
-(`crates/jammi-ai/src/model/resolver.rs:158`) is `fine-tuned` and missing `base_model_id`
-(`crates/jammi-ai/src/model/resolver.rs:173`) or missing `artifact_path`
-(`crates/jammi-ai/src/model/resolver.rs:189`) is refused with a typed error naming the model
+(`crates/jammi-ai/src/model/resolver.rs:159`) is `fine-tuned` and missing `base_model_id`
+(`crates/jammi-ai/src/model/resolver.rs:174`) or missing `artifact_path`
+(`crates/jammi-ai/src/model/resolver.rs:190`) is refused with a typed error naming the model
 id and the missing field, never silently resolved as an ordinary model or served as the
 unadapted base.
 

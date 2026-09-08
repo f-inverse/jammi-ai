@@ -239,7 +239,10 @@ impl ArtifactStore {
         let tmp = tempfile::tempdir_in(&self.cache_root)?;
         for entry in &manifest.files {
             let path = self.child(prefix, &entry.name)?;
-            let bytes = handle.get_bytes(&path).await?;
+            let bytes = handle
+                .get_bytes(&path)
+                .await
+                .map_err(|e| reclassify_missing_key(e, prefix, &entry.name))?;
             verify_sha256(prefix, entry, &bytes)?;
             std::fs::write(tmp.path().join(&entry.name), &bytes)?;
         }
@@ -385,7 +388,10 @@ impl ArtifactStore {
         prefix: &StorageUrl,
     ) -> Result<Manifest> {
         let manifest_path = self.child(prefix, MANIFEST_NAME)?;
-        let bytes = handle.get_bytes(&manifest_path).await?;
+        let bytes = handle
+            .get_bytes(&manifest_path)
+            .await
+            .map_err(|e| reclassify_missing_key(e, prefix, MANIFEST_NAME))?;
         serde_json::from_slice(&bytes).map_err(|e| {
             JammiError::Storage(StorageError::layout(
                 prefix.as_str(),
@@ -405,7 +411,10 @@ impl ArtifactStore {
     ) -> Result<()> {
         for entry in &manifest.files {
             let path = self.child(prefix, &entry.name)?;
-            let bytes = handle.get_bytes(&path).await?;
+            let bytes = handle
+                .get_bytes(&path)
+                .await
+                .map_err(|e| reclassify_missing_key(e, prefix, &entry.name))?;
             verify_sha256(prefix, entry, &bytes)?;
         }
         Ok(())
@@ -445,6 +454,37 @@ impl ArtifactStore {
             joined.push_str(&sanitize_segment(seg));
         }
         StorageUrl::parse(&joined).map_err(JammiError::from)
+    }
+}
+
+/// Re-type a `get_bytes` fault reading `name` under `prefix` as an INTEGRITY
+/// failure of the bundle when the driver reports the key does not exist, vs.
+/// leaving every other driver failure as the transport/IO fault it is.
+///
+/// A manifest names its keys after they were already written (`put_artifact`
+/// writes the manifest last), so once a fetcher has a manifest in hand, a
+/// `NotFound` on a key it names can only mean the object was deleted out from
+/// under a completed bundle, or the bundle was a partial/tampered write — the
+/// storage layer itself is healthy, the *bundle* is broken. That is the same
+/// failure class [`StorageError::Layout`] already carries for a malformed
+/// manifest or a digest mismatch, so this folds a missing key into the same
+/// variant rather than minting a fourth error path — callers that already
+/// match `StorageError::Layout` to detect "this artifact's bytes are wrong"
+/// catch a missing key for free. Any other driver error (network fault,
+/// throttling, credential rot, a 5xx) is a genuine transport/IO problem
+/// unrelated to this bundle's own integrity and is left as
+/// [`StorageError::Io`] unchanged, so a caller can still tell "the store was
+/// unreachable" from "this artifact is corrupt".
+fn reclassify_missing_key(err: StorageError, prefix: &StorageUrl, name: &str) -> JammiError {
+    match &err {
+        StorageError::Io {
+            source: object_store::Error::NotFound { .. },
+            ..
+        } => JammiError::Storage(StorageError::layout(
+            prefix.as_str(),
+            format!("artifact file '{name}' missing under this prefix (manifest lists it)"),
+        )),
+        _ => JammiError::from(err),
     }
 }
 
@@ -588,8 +628,99 @@ mod tests {
         // A prefix that was never written — no manifest exists.
         let prefix = store.prefix_url(&["ghost", "worker", "0"]).unwrap();
         let err = store.fetch_artifact(&prefix).await.unwrap_err();
-        // The manifest GET 404s before any data file is touched.
-        assert!(!err.to_string().is_empty());
+        // The manifest GET 404s before any data file is touched. A 404 on the
+        // manifest itself is an INTEGRITY failure of the bundle (nothing was
+        // ever published at this prefix), not a transport fault, so it is
+        // reclassified to `StorageError::Layout` — the same variant a
+        // malformed manifest or a digest mismatch already carries.
+        assert!(
+            matches!(err, JammiError::Storage(StorageError::Layout { .. })),
+            "a missing manifest.json must reclassify to StorageError::Layout, got: {err:?}"
+        );
+    }
+
+    /// A manifest that DOES exist but names a key the store no longer has (the
+    /// object was deleted out from under a completed bundle) is the same
+    /// INTEGRITY failure class as a missing manifest or a digest mismatch —
+    /// `StorageError::Layout` — not the transport fault a `NotFound` might
+    /// otherwise suggest. The reclassified message still names the key so a
+    /// caller (e.g. `ModelResolver`) can surface which file is gone.
+    #[tokio::test]
+    async fn missing_manifest_listed_key_reclassifies_as_integrity_failure() {
+        let cache = tempfile::tempdir().unwrap();
+        let store = store_with_root(
+            StorageUrl::memory("artifacts-missing-key"),
+            cache.path().to_path_buf(),
+        );
+        let prefix = store
+            .put_artifact(&["job-4", "worker-d", "0"], &sample_files())
+            .await
+            .unwrap();
+        let handle = store.handle(&prefix).unwrap();
+        let path = store.child(&prefix, "adapter.safetensors").unwrap();
+        handle.delete_if_exists(&path).await.unwrap();
+
+        let err = store.fetch_artifact(&prefix).await.unwrap_err();
+        assert!(
+            matches!(err, JammiError::Storage(StorageError::Layout { .. })),
+            "a manifest-listed key absent from the store must reclassify to \
+             StorageError::Layout (an integrity failure), not stay StorageError::Io (a \
+             transport fault), got: {err:?}"
+        );
+        assert!(
+            err.to_string().contains("adapter.safetensors"),
+            "the reclassified error must still name the missing key, got: {err}"
+        );
+    }
+
+    /// The flip side of the two tests above: a key the manifest lists that IS
+    /// present but unreadable for a reason that has nothing to do with the
+    /// bundle's own content — a permission fault standing in for a transient
+    /// object-store outage — must NOT be folded into the same
+    /// `StorageError::Layout` integrity bucket. `object_store`'s
+    /// `LocalFileSystem` maps a permission-denied open to
+    /// `Error::UnableToOpenFile`, never `Error::NotFound`, so
+    /// `reclassify_missing_key` must leave it as `StorageError::Io` —
+    /// verified with a real `chmod` fault injection (Unix-only), never a
+    /// hand-built error the reclassifier was never actually asked to sort.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn permission_fault_on_a_present_key_stays_a_transport_error() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let root_dir = tempfile::tempdir().unwrap();
+        let cache = tempfile::tempdir().unwrap();
+        let root = StorageUrl::parse(root_dir.path().to_str().unwrap()).unwrap();
+        let store = store_with_root(root, cache.path().to_path_buf());
+        let prefix = store
+            .put_artifact(&["job-5", "worker-e", "0"], &sample_files())
+            .await
+            .unwrap();
+        let weights_path = std::path::PathBuf::from(prefix.path()).join("adapter.safetensors");
+
+        // PROBE: root (and a mode-ignoring filesystem) bypasses chmod — in
+        // which case the fault-injection premise this test needs never holds,
+        // and it must skip loudly rather than assert against a fault that was
+        // never actually injected.
+        std::fs::set_permissions(&weights_path, std::fs::Permissions::from_mode(0o000)).unwrap();
+        let bypassed = std::fs::read(&weights_path).is_ok();
+        if bypassed {
+            let _ = std::fs::set_permissions(&weights_path, std::fs::Permissions::from_mode(0o644));
+            eprintln!(
+                "permission_fault_on_a_present_key_stays_a_transport_error: chmod bypassed \
+                 (root?) — skipping"
+            );
+            return;
+        }
+
+        let err = store.fetch_artifact(&prefix).await.unwrap_err();
+        let _ = std::fs::set_permissions(&weights_path, std::fs::Permissions::from_mode(0o644));
+        assert!(
+            matches!(err, JammiError::Storage(StorageError::Io { .. })),
+            "a permission-denied open is a genuine driver/transport fault, not this bundle's \
+             own integrity — it must stay StorageError::Io, never be reclassified to Layout, \
+             got: {err:?}"
+        );
     }
 
     #[tokio::test]

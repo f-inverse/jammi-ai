@@ -1232,8 +1232,36 @@ impl InferenceSession {
                 "context predictor '{model_id}' has no artifact path"
             ))
         })?;
-        let prefix_url = jammi_db::storage::StorageUrl::parse(prefix)?;
-        let local = self.artifact_store().fetch_artifact(&prefix_url).await?;
+        // A malformed `artifact_path` string is itself a corrupted catalog
+        // record — never a storage-layer fault — so it is always a typed
+        // reload refusal naming this model id, regardless of what the
+        // parser's own message says. Mirrors `ModelResolver`'s fine-tuned
+        // reload arm (`resolver.rs`) so both surfaces agree.
+        let prefix_url = jammi_db::storage::StorageUrl::parse(prefix).map_err(|e| {
+            JammiError::Inference(format!(
+                "context predictor '{model_id}' artifact_path '{prefix}' is not a valid \
+                 storage URL: {e} — this catalog record's pointer is corrupted"
+            ))
+        })?;
+        // esc-089 negative control (sibling reload surface): re-type ONLY an
+        // INTEGRITY failure of the bundle itself
+        // (`JammiError::Storage(StorageError::Layout)` — manifest
+        // missing/malformed, a manifest-listed key absent, a digest
+        // mismatch) into a typed reload refusal naming this model id. Any
+        // OTHER storage fault (a transport/IO error against S3/GCS/azure, a
+        // disabled scheme, driver-init failure) is NOT this predictor's
+        // fault — it propagates unchanged so a gRPC client sees `Internal`,
+        // never a bad-argument-shaped code, for a transient outage.
+        let local = match self.artifact_store().fetch_artifact(&prefix_url).await {
+            Ok(local) => local,
+            Err(JammiError::Storage(jammi_db::storage::StorageError::Layout { path, reason })) => {
+                return Err(JammiError::Inference(format!(
+                    "context predictor '{model_id}' adapter bundle at '{path}' failed \
+                     integrity check: {reason}"
+                )));
+            }
+            Err(e) => return Err(e),
+        };
         let weights_path = local.dir().join("model.safetensors");
         varmap
             .load(&weights_path)

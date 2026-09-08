@@ -1649,3 +1649,154 @@ async fn quantile_predictor_fits_high_offset_target_round_trip() {
         (median - base_year).abs()
     );
 }
+
+// =============================================================================
+// esc-089's sibling reload surface: `load_context_predictor` fetches its
+// bundle through the SAME `ArtifactStore::fetch_artifact` `ModelResolver`'s
+// fine-tuned arm does, so it must apply the SAME rule — an INTEGRITY failure
+// of the bundle (a manifest-listed key truly absent) is a typed refusal
+// naming the model, while a transport/IO fault (permission denied, standing
+// in for a transient object-store outage) is NOT this model's fault and must
+// propagate unchanged. This surface's own convention is `JammiError::Inference`
+// (never `JammiError::Model` — see `ModelResolver`'s tests in `models.rs` for
+// that surface's peer), so these tests pin the SAME distinguishing rule, not
+// the same literal error variant.
+// =============================================================================
+
+/// A context predictor's published bundle whose `model.safetensors` has since
+/// gone missing on disk must refuse a COLD reload — through the real
+/// `load_context_predictor` path over a brand-new session pointed at the SAME
+/// root, never a hand-built predictor — with a typed `JammiError::Inference`
+/// naming the missing file.
+#[tokio::test(flavor = "multi_thread")]
+async fn context_predictor_reload_missing_bundle_file_refuses_by_name() {
+    let rows = synthetic_meta_dataset(12, 16, 4243);
+    let (session, dir) = session_with_meta_dataset(&rows).await;
+
+    let spec = spec(
+        ContextArchitecture::AttnCnp,
+        PredictiveHead::Gaussian {
+            objective: GaussianObjective::Crps,
+        },
+    );
+    let model_id = train(&session, &spec).await;
+
+    let artifact = session
+        .catalog()
+        .get_model(&model_id)
+        .await
+        .unwrap()
+        .unwrap()
+        .artifact_path
+        .unwrap();
+    let prefix_url = jammi_db::storage::StorageUrl::parse(&artifact).unwrap();
+    let bundle_dir = std::path::PathBuf::from(prefix_url.path());
+    std::fs::remove_file(bundle_dir.join("model.safetensors")).unwrap();
+
+    // A brand-new session over the SAME root — the real cold-restart reload
+    // path, never a hand-built ResolvedModel.
+    let cold = Arc::new(
+        InferenceSession::new(common::test_config(dir.path()))
+            .await
+            .unwrap(),
+    );
+    cold.register_query_functions();
+
+    let err = match cold
+        .load_context_predictor(&model_id, "fns", ContextServeOptions::default())
+        .await
+    {
+        Ok(_) => panic!(
+            "reloading a context predictor whose model.safetensors was deleted must refuse, \
+             never silently serve a predictor"
+        ),
+        Err(e) => e,
+    };
+    assert!(
+        matches!(err, jammi_db::error::JammiError::Inference(_)),
+        "a missing bundle file is an INTEGRITY failure — the refusal must be this surface's \
+         typed JammiError::Inference, got a different variant: {err:?}"
+    );
+    let message = err.to_string();
+    assert!(
+        message.contains("model.safetensors"),
+        "refusal must name the missing file, got: {message}"
+    );
+}
+
+/// The flip side: a context predictor's bundle is published and INTACT, but
+/// `model.safetensors` is unreadable for a reason that has nothing to do with
+/// the bundle's own content — a permission fault standing in for a transient
+/// object-store outage (real `chmod` fault injection, Unix-only). This must
+/// NOT be folded into the typed `JammiError::Inference` refusal the sibling
+/// missing-file test above pins — it is not this model's fault, and must
+/// propagate as its own storage-layer variant so a gRPC client sees
+/// `Internal`, not a bad-request-shaped code.
+#[cfg(unix)]
+#[tokio::test(flavor = "multi_thread")]
+async fn context_predictor_reload_permission_fault_is_not_a_typed_inference_error() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let rows = synthetic_meta_dataset(12, 16, 4244);
+    let (session, dir) = session_with_meta_dataset(&rows).await;
+
+    let spec = spec(
+        ContextArchitecture::AttnCnp,
+        PredictiveHead::Gaussian {
+            objective: GaussianObjective::Crps,
+        },
+    );
+    let model_id = train(&session, &spec).await;
+
+    let artifact = session
+        .catalog()
+        .get_model(&model_id)
+        .await
+        .unwrap()
+        .unwrap()
+        .artifact_path
+        .unwrap();
+    let prefix_url = jammi_db::storage::StorageUrl::parse(&artifact).unwrap();
+    let bundle_dir = std::path::PathBuf::from(prefix_url.path());
+    let weights_path = bundle_dir.join("model.safetensors");
+
+    // PROBE: root (and a mode-ignoring filesystem) bypasses chmod — skip
+    // loudly rather than assert against a fault that was never injected.
+    std::fs::set_permissions(&weights_path, std::fs::Permissions::from_mode(0o000)).unwrap();
+    let bypassed = std::fs::read(&weights_path).is_ok();
+    if bypassed {
+        let _ = std::fs::set_permissions(&weights_path, std::fs::Permissions::from_mode(0o644));
+        eprintln!(
+            "context_predictor_reload_permission_fault_is_not_a_typed_inference_error: chmod \
+             bypassed (root?) — skipping"
+        );
+        return;
+    }
+
+    let cold = Arc::new(
+        InferenceSession::new(common::test_config(dir.path()))
+            .await
+            .unwrap(),
+    );
+    cold.register_query_functions();
+
+    let result = cold
+        .load_context_predictor(&model_id, "fns", ContextServeOptions::default())
+        .await;
+
+    let _ = std::fs::set_permissions(&weights_path, std::fs::Permissions::from_mode(0o644));
+
+    let err = match result {
+        Ok(_) => panic!(
+            "reloading a context predictor whose weights file is permission-denied must \
+             fail, never silently serve a predictor"
+        ),
+        Err(e) => e,
+    };
+    assert!(
+        !matches!(err, jammi_db::error::JammiError::Inference(_)),
+        "a permission/transport fault reading an INTACT bundle is NOT this model's fault — it \
+         must propagate as its own storage-layer variant, never be folded into this surface's \
+         typed reload refusal, got: {err:?}"
+    );
+}

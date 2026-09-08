@@ -1,0 +1,25 @@
+{
+ "mode": "p2-bf16-preflight",
+ "driver": "ci/scripts/perf/profile_421_legs.sh",
+ "tower": "clip-vision",
+ "task": "image_embedding",
+ "git_sha": "c1b0b0bad1f79a4ad6c298400e6ea19cc1ca633c",
+ "box": "4dc3a4394178",
+ "backbone_dtype": "bf16",
+ "lora_init": "gaussian",
+ "rows": 16,
+ "heldout_rows": 8,
+ "batch": 8,
+ "epochs": 1,
+ "objective": "triplet",
+ "target_modules": [
+  "in_proj",
+  "out_proj",
+  "c_fc",
+  "c_proj"
+ ],
+ "exit": 0,
+ "status": "ok",
+ "reason": "",
+ "dry_run": false
+}

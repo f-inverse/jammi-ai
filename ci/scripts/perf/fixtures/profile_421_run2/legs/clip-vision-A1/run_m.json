@@ -1,0 +1,123 @@
+{
+  "engine_version": "0.49.1",
+  "host": {
+    "logical_cpus": 13,
+    "total_ram_mib": 2051942
+  },
+  "subcommand": "finetune-run",
+  "provenance": {
+    "build_sha": "c1b0b0bad1f79a4ad6c298400e6ea19cc1ca633c",
+    "target": "x86_64-unknown-linux-gnu",
+    "profile": "release",
+    "build_features": [
+      "bench-cuda",
+      "cuda"
+    ],
+    "report_schema_version": 2
+  },
+  "tiers": {
+    "finetune_run": {
+      "seed": 42,
+      "task": "image_embedding",
+      "batch": 8,
+      "seq": 77,
+      "lora_rank": 8,
+      "lora_alpha": 16.0,
+      "lora_dropout": 0.05,
+      "lora_init": "zeros_b",
+      "margin": 0.3,
+      "target_modules": [
+        "in_proj",
+        "out_proj",
+        "c_fc",
+        "c_proj"
+      ],
+      "layers_to_transform": null,
+      "backbone_dtype": "f32",
+      "checkpoint_config_sha256": "4302a891b495ad0966d1e7eeff102b5f34a3f1e647e57a9198933f862d5f8ba7",
+      "checkpoint_weights_sha256": "ac4f8c4b88af6d963118cbf40ad93176d092abbedfcb752601ae1866352656e6",
+      "checkpoint_weights_size_bytes": 605143316,
+      "max_grad_norm": 1.0,
+      "warmup": null,
+      "row_lengths": null,
+      "epochs": 1,
+      "lr": 0.0002,
+      "schedule": "constant",
+      "warmup_steps": 0,
+      "weight_decay": 0.01,
+      "grad_accum": 1,
+      "validation_fraction": 0.0,
+      "train_pairs_file_sha256": "da5242d97420187db7321bc6f85b318e0ea615faf0339ee87b2f6344c82a855c",
+      "train_media_sha256": "307274377ffe4ea74fb774d226073c2712e96db0c45b1f1db497514e2879852a",
+      "heldout_ids_sha256": "b72cd62f09e0bd4ebeabefe34d94519145bfd53b5d651d7d225dabbd6f911aa6",
+      "heldout_pairs_sha256": "c2f5f1ef70cf53ffe67ef6c773a7bf01fac3c13b579600b6410fe5e6d2baf1e8",
+      "heldout_media_sha256": "d006e87dc3763979a883e7f1adad45da449c40d2086c9a129437c7006d318bcf",
+      "heldout_batch_partition_sha256": "37e902840531e77f01da16c68f702afc83a571592107d94834dd38fc2c3946c9",
+      "embedding_loss": "triplet",
+      "temperature": null,
+      "matryoshka_dims": [],
+      "early_stopping_patience": 10000,
+      "early_stopping_metric": "train_loss",
+      "eval_cadence": 1,
+      "arm": "fused",
+      "device_name": "NVIDIA A100-SXM4-80GB",
+      "kernels_disabled_requested": [],
+      "kernels_disabled_fired": [],
+      "kernels_disabled_expected": [],
+      "fusible_site_census": {
+        "lora_sites_wrapped": 48,
+        "layer_norms": 26,
+        "gelu_seam_calls_per_forward": 0
+      },
+      "flash_compiled": false,
+      "build_features": [
+        "bench-cuda",
+        "cuda"
+      ],
+      "attention_arm": "fused",
+      "split_rule": "positional_fraction_split",
+      "batched_forward": true,
+      "steps_measured": 600,
+      "ln_fused_dispatches": 15000,
+      "ln_eager_dispatches": 600,
+      "rope_fused_dispatches": 0,
+      "rope_eager_dispatches": 0,
+      "softmax_fused_dispatches": 0,
+      "softmax_eager_dispatches": 0,
+      "geglu_fused_dispatches": 0,
+      "geglu_eager_dispatches": 0,
+      "gelu_fused_dispatches": 0,
+      "gelu_eager_dispatches": 0,
+      "lora_epilogue_fused_dispatches": 0,
+      "lora_epilogue_eager_dispatches": 0,
+      "lora_linear_fused_dispatches": 28800,
+      "lora_linear_eager_dispatches": 0,
+      "attention_block_fused_dispatches": 0,
+      "attention_block_eager_dispatches": 0,
+      "adamw_fused_dispatches": 57600,
+      "adamw_eager_dispatches": 0,
+      "attention_block_flash_fused_dispatches": 0,
+      "attention_block_flash_declined_dispatches": 0,
+      "admission_is_dense": false,
+      "tie_fraction": 1.0,
+      "final_epoch": 0,
+      "held_out_example_mean": 0.0,
+      "held_out_count": 8,
+      "final_loss_diagnostic": 0.0009393884489933649,
+      "trajectory": [
+        {
+          "epoch": 0,
+          "held_out_mean": 0.0,
+          "held_out_tie_fraction": 1.0,
+          "held_out_batch_partition_sha256": "37e902840531e77f01da16c68f702afc83a571592107d94834dd38fc2c3946c9"
+        }
+      ],
+      "train_probe_series": [
+        0.2601407393813133,
+        0.0
+      ],
+      "train_run_wall_s": 68.940153511,
+      "media_front_end_wall_s": 14.114053346
+    }
+  }
+}

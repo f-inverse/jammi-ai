@@ -13,6 +13,7 @@ Run directly: `python3 ci/scripts/perf/test_check_citations.py`
 from __future__ import annotations
 
 import os
+import re
 import subprocess
 import sys
 import tempfile
@@ -35,6 +36,7 @@ class CheckCitationsFixture(unittest.TestCase):
         self._orig_perf_full_path_roots = cc._PERF_FULL_PATH_ROOTS
         self._orig_perf_full_path_exclude = cc._PERF_FULL_PATH_EXCLUDE
         self._orig_crate_comment_roots = cc._CRATE_COMMENT_ROOTS
+        self._orig_plan_contract_roots = cc._PLAN_CONTRACT_ROOTS
         self._orig_repo_root = cc.REPO_ROOT
         # Every root-scanning tuple defaults to the REAL repo tree (module
         # scope) -- reset ALL FIVE of them to empty here, not just
@@ -56,6 +58,7 @@ class CheckCitationsFixture(unittest.TestCase):
         cc._DOC_SEARCH_ROOTS = ()
         cc._PERF_FULL_PATH_ROOTS = ()
         cc._CRATE_COMMENT_ROOTS = ()
+        cc._PLAN_CONTRACT_ROOTS = ()
         self.addCleanup(self._restore)
 
     def _restore(self):
@@ -65,6 +68,7 @@ class CheckCitationsFixture(unittest.TestCase):
         cc._PERF_FULL_PATH_ROOTS = self._orig_perf_full_path_roots
         cc._PERF_FULL_PATH_EXCLUDE = self._orig_perf_full_path_exclude
         cc._CRATE_COMMENT_ROOTS = self._orig_crate_comment_roots
+        cc._PLAN_CONTRACT_ROOTS = self._orig_plan_contract_roots
         cc.REPO_ROOT = self._orig_repo_root
 
     def _write(self, rel: str, content: str) -> Path:
@@ -115,6 +119,10 @@ class GitFixture(CheckCitationsFixture):
         _run_git(["config", "user.email", "test@example.com"], self.root)
         _run_git(["config", "user.name", "Test"], self.root)
         cc._GIT_REPO_ROOT = self.root
+        # `_ls_tree_paths` memoizes per `(repo root, sha)` -- a throwaway
+        # tempdir path is never reused within one test run, but clearing
+        # this here keeps each test's `git ls-tree` reads honest regardless.
+        cc._LS_TREE_CACHE.clear()
 
     def _restore_git_repo_root(self):
         cc._GIT_REPO_ROOT = self._orig_git_repo_root
@@ -206,7 +214,7 @@ class LookbackWindowBacktickPairingTests(CheckCitationsFixture):
 class UnresolvableCitationsFail(CheckCitationsFixture):
     def test_stale_line_number_is_a_violation(self):
         """THE F7-CLASS REGRESSION this script exists to catch: the line
-        number is IN BOUNDS, but the code at that line is no longer what
+        number is IN BOUNDS, but the code at that line does not match what
         the citation names — an in-bounds-only check would miss this.
         """
         self._set_target("fake.rs", "line one\nlet totally_different = 1;\n")
@@ -252,17 +260,18 @@ class UnresolvableCitationsFail(CheckCitationsFixture):
 
 
 class PyFileSupportTests(CheckCitationsFixture):
-    """Round-4 audit fold-in on PR #372: `_KNOWN_FILES` used to resolve ONLY
-    `finetune_step.rs`/`grad_oracle.rs` — the dozens of `.py:<n>` citations
-    in `grad_oracle.rs`'s and `ab_merge.py`'s own determinant tables (naming
-    `torch_grad_oracle.py`/`torch_finetune_step.py` lines) were NEVER
-    mechanically re-checked at all, which is exactly how the `.py` line
-    drift this round's own audit caught went unnoticed. This class pins the
-    SAME `.rs` predicates (`UnresolvableCitationsFail`'s own shape) now also
-    hold for a `.py` target, via a THROWAWAY fixture -- never assuming
-    `_KNOWN_FILES` already contains a real `.py` entry (this class swaps its
-    own fixture in via `_set_target`, same as every other test in this
-    file).
+    """`_KNOWN_FILES` resolves BOTH `.rs` and `.py` targets: the dozens of
+    `.py:<n>` citations in `grad_oracle.rs`'s and `ab_merge.py`'s own
+    determinant tables (naming `torch_grad_oracle.py`/`torch_finetune_step.py`
+    lines) are mechanically re-checked exactly like an `.rs` citation --
+    nothing about the correctness argument for line-content resolution is
+    `.rs`-specific, so a `.py` line drifting out from under a citation is
+    exactly as dangerous, and exactly as checkable, as an `.rs` line doing
+    the same. This class pins the SAME `.rs` predicates
+    (`UnresolvableCitationsFail`'s own shape) also hold for a `.py` target,
+    via a THROWAWAY fixture -- never assuming `_KNOWN_FILES` already
+    contains a real `.py` entry (this class swaps its own fixture in via
+    `_set_target`, same as every other test in this file).
     """
 
     def test_resolvable_py_citation_passes(self):
@@ -272,10 +281,10 @@ class PyFileSupportTests(CheckCitationsFixture):
         self.assertEqual(violations, [], [str(v) for v in violations])
 
     def test_stale_py_line_number_is_a_violation(self):
-        """THE REPRODUCTION this round's own fold-in closes: a `.py` line
-        that has DRIFTED (in-bounds, but the code at that line is no longer
-        what the citation names) must fail loudly, exactly like the `.rs`
-        case `UnresolvableCitationsFail::test_stale_line_number_is_a_violation`
+        """A `.py` line that has DRIFTED (in-bounds, but the code at that
+        line does not match what the citation names) fails loudly, exactly
+        like the `.rs` case
+        `UnresolvableCitationsFail::test_stale_line_number_is_a_violation`
         already pins.
         """
         self._set_target("fake.py", "line one\ndef totally_different():\n    pass\n")
@@ -761,7 +770,7 @@ class LegacyNonAncestorExemptionTests(GitFixture):
         )
         self._commit("add legacy artifact citing the non-ancestor sha")
 
-        violations, exemptions = cc._check_file_impl(artifact)
+        violations, exemptions, _plan_contract_coverage, _unseen = cc._check_file_impl(artifact)
         self.assertEqual(violations, [], [str(v) for v in violations])
         self.assertEqual(len(exemptions), 1)
         msg = str(exemptions[0])
@@ -795,7 +804,7 @@ class LegacyNonAncestorExemptionTests(GitFixture):
         )
         self._commit("add legacy artifact")
 
-        violations, exemptions = cc._check_file_impl(artifact)
+        violations, exemptions, _plan_contract_coverage, _unseen = cc._check_file_impl(artifact)
         self.assertEqual(violations, [])
         self.assertEqual(len(exemptions), 1)
 
@@ -842,7 +851,7 @@ class LegacyNonAncestorExemptionTests(GitFixture):
         )
         self._commit("add artifact with a genuinely wrong citation")
 
-        violations, exemptions = cc._check_file_impl(artifact)
+        violations, exemptions, _plan_contract_coverage, _unseen = cc._check_file_impl(artifact)
         self.assertEqual(exemptions, [])
         self.assertEqual(len(violations), 1)
         self.assertIn("recorded git_sha", violations[0].message)
@@ -1331,7 +1340,7 @@ class InlineCommitPinResolutionTests(GitFixture):
             f"/// `real_thing` (`crates/other-crate/src/target.rs:2` at HEAD `{unknown_sha}`)\n",
         )
         self._commit("add citing source with an unknown pin")
-        violations, exemptions = cc._check_file_impl(source)
+        violations, exemptions, _plan_contract_coverage, _unseen = cc._check_file_impl(source)
         self.assertEqual(violations, [], [str(v) for v in violations])
         self.assertEqual(len(exemptions), 1)
         self.assertIn("EXEMPT", str(exemptions[0]))
@@ -1384,6 +1393,957 @@ class InlineCommitPinResolutionTests(GitFixture):
         self.assertEqual(len(violations), 1, [str(v) for v in violations])
         self.assertIn("STALE", violations[0].message)
         self.assertIn("code moved since this was written", violations[0].message)
+
+
+class FileCitationsEpochHeaderTests(GitFixture):
+    """The WHOLE-FILE `<!-- citations-resolve-at: <sha> -->` header (module
+    doc's "A frozen pre-registration's citations are pinned to their own
+    epoch" section) -- the whole-file analogue of
+    `InlineCommitPinResolutionTests` above, for a `.md` pre-registration
+    frozen all at once rather than pinned citation-by-citation.
+
+    Every fixture commits TWO revisions of a throwaway `fake.rs` into a
+    throwaway repo (`GitFixture`, never this checkout): `good_sha` (where
+    `real_thing` sits at line 2) and a later HEAD (where line 2 is
+    something else) -- proving resolution reads the PINNED tree, never the
+    working tree, exactly the discipline the inline-pin tests already
+    established.
+    """
+
+    def _two_revisions(self) -> str:
+        target = self._write("target/fake.rs", "line one\nfn real_thing() {}\nline three\n")
+        cc._KNOWN_FILES = {"fake.rs": target}
+        good_sha = self._commit("good revision")
+        self._write(
+            "target/fake.rs",
+            "inserted prefix\nline one\nfn real_thing() {}\nline three\nextra tail\n",
+        )
+        self._commit("code moved on")
+        return good_sha
+
+    def test_resolves_at_pinned_sha_but_not_at_head_ok(self):
+        """RED proof (a): true at the header's own pinned commit, stale at
+        HEAD -- must PASS."""
+        good_sha = self._two_revisions()
+        doc = self._write(
+            "doc.md",
+            f"<!-- citations-resolve-at: {good_sha} -->\n\n`real_thing` (`fake.rs:2`)\n",
+        )
+        self._commit("add frozen doc")
+        violations = cc.check_file(doc)
+        self.assertEqual(violations, [], [str(v) for v in violations])
+
+    def test_head_relative_resolution_of_the_same_citation_would_have_failed(self):
+        """Positive control for (a): the SAME citation, with NO header,
+        resolves against HEAD (where the code moved) and genuinely fails --
+        proving the PASS above comes from the epoch pin actually engaging."""
+        self._two_revisions()
+        doc = self._write("doc.md", "`real_thing` (`fake.rs:2`)\n")
+        self._commit("add doc with no header")
+        violations = cc.check_file(doc)
+        self.assertEqual(len(violations), 1, [str(v) for v in violations])
+        self.assertIn("STALE", violations[0].message)
+
+    def test_pinned_sha_not_an_ancestor_is_red(self):
+        """RED proof: a well-formed 40-hex sha that is NOT an ancestor of
+        HEAD fails CLOSED for this convention (never EXEMPT the way
+        pre-merge-commit-discipline artifact evidence can be)."""
+        self._two_revisions()
+        unknown_sha = "0123456789abcdef0123456789abcdef01234567"
+        # Guard: this made-up sha must genuinely not resolve in this
+        # throwaway repo -- otherwise the test proves nothing.
+        show = _run_git(["show", f"{unknown_sha}:target/fake.rs"], self.root)
+        self.assertNotEqual(show.returncode, 0)
+        doc = self._write(
+            "doc.md",
+            f"<!-- citations-resolve-at: {unknown_sha} -->\n\n`real_thing` (`fake.rs:2`)\n",
+        )
+        self._commit("add doc pinned to an unreachable sha")
+        violations = cc.check_file(doc)
+        self.assertEqual(len(violations), 1, [str(v) for v in violations])
+        self.assertIn("NOT an ancestor", violations[0].message)
+        self.assertIn(unknown_sha, violations[0].message)
+
+    def test_malformed_header_is_red(self):
+        """RED proof: a header LINE is present but its value is not a
+        well-formed 40-character hex sha -- never silently treated as "no
+        header" (which would quietly fall back to HEAD resolution)."""
+        self._two_revisions()
+        doc = self._write(
+            "doc.md",
+            "<!-- citations-resolve-at: not-a-real-sha -->\n\n`real_thing` (`fake.rs:2`)\n",
+        )
+        self._commit("add doc with a malformed header")
+        violations = cc.check_file(doc)
+        self.assertEqual(len(violations), 1, [str(v) for v in violations])
+        self.assertIn("not a well-formed 40-character hex commit sha", violations[0].message)
+
+    def test_a_citation_that_fails_even_at_the_pinned_sha_is_red(self):
+        """RED proof: the identifier is wrong even at the header's own
+        pinned commit -- STALE, attributed to the pinned epoch, never
+        silently passed."""
+        good_sha = self._two_revisions()
+        doc = self._write(
+            "doc.md",
+            f"<!-- citations-resolve-at: {good_sha} -->\n\n"
+            "`totally_wrong_identifier` (`fake.rs:2`)\n",
+        )
+        self._commit("add doc with a wrong identifier even at its own epoch")
+        violations = cc.check_file(doc)
+        self.assertEqual(len(violations), 1, [str(v) for v in violations])
+        self.assertIn("never true at the tree this file's header declares", violations[0].message)
+        self.assertIn(good_sha, violations[0].message)
+
+    def test_header_past_the_search_window_is_not_recognized(self):
+        """A `citations-resolve-at:`-shaped phrase deep in ordinary prose
+        (past the first few lines) must never be misread as the header --
+        the file falls back to ordinary HEAD-relative resolution instead,
+        and genuinely fails against the drifted HEAD content."""
+        good_sha = self._two_revisions()
+        padding = "\n".join(f"filler line {i}" for i in range(10))
+        doc = self._write(
+            "doc.md",
+            f"{padding}\n\n<!-- citations-resolve-at: {good_sha} -->\n\n`real_thing` (`fake.rs:2`)\n",
+        )
+        self._commit("add doc whose header sits past the search window")
+        violations = cc.check_file(doc)
+        self.assertEqual(len(violations), 1, [str(v) for v in violations])
+        self.assertIn("STALE", violations[0].message)
+
+    def test_non_markdown_file_ignores_the_header_shaped_text(self):
+        """The convention is scoped to `.md` files only (module doc) --
+        the IDENTICAL header text in a non-Markdown file is just ordinary
+        prose, never parsed as an epoch pin, and that file's citations keep
+        resolving against HEAD unchanged."""
+        good_sha = self._two_revisions()
+        cc._SEARCH_ROOTS = (self.root,)
+        doc = self._write(
+            "doc.txt",
+            f"<!-- citations-resolve-at: {good_sha} -->\n\n`real_thing` (`fake.rs:2`)\n",
+        )
+        self._commit("add a non-markdown file with header-shaped text")
+        violations = cc.check_file(doc)
+        self.assertEqual(len(violations), 1, [str(v) for v in violations])
+        self.assertIn("STALE", violations[0].message)
+
+    def test_unseen_suffix_token_in_an_epoch_pinned_file_is_a_named_diagnostic_never_a_violation(self):
+        """Module doc's "An unseen-suffix path-like token is a diagnostic,
+        never a Violation" section: a backtick-quoted `<path>.txt:<line>`
+        token's extension is not in `_FULL_PATH_SUFFIXES`, so no citation
+        recognizer in this file can ever match it -- it must surface as a
+        NAMED diagnostic (never silently dropped), and must never itself
+        become a `Violation`."""
+        good_sha = self._two_revisions()
+        doc = self._write(
+            "doc.md",
+            f"<!-- citations-resolve-at: {good_sha} -->\n\n"
+            "`real_thing` (`fake.rs:2`); see also `notes.txt:12` for context.\n",
+        )
+        self._commit("add doc with an unseen-suffix token")
+        violations, _exemptions, _pc, unseen = cc._check_file_impl(doc)
+        self.assertEqual(violations, [], [str(v) for v in violations])
+        self.assertEqual(len(unseen), 1, unseen)
+        upath, line_no, token = unseen[0]
+        self.assertEqual(upath, doc)
+        self.assertIn("notes.txt:12", token)
+
+    def test_unseen_suffix_token_outside_an_epoch_pinned_file_is_not_collected(self):
+        """The diagnostic is scoped to EPOCH-PINNED files only -- an
+        ordinary HEAD-relative `.md` file carrying the identical
+        unseen-suffix token is not scanned for it at all (this scope was
+        never meant to widen into every file this script touches)."""
+        doc = self._write("doc.md", "see `notes.txt:12` for context.\n")
+        self._commit("add an ordinary doc with an unseen-suffix token")
+        violations, _exemptions, _pc, unseen = cc._check_file_impl(doc)
+        self.assertEqual(violations, [], [str(v) for v in violations])
+        self.assertEqual(unseen, [])
+
+
+class PlanContractCitationTests(GitFixture):
+    """The `_PLAN_CONTRACT_ROOTS` bare-basename / full-path
+    `path:line[-line][, line[-line]]*` citation form (module doc's "A frozen
+    pre-registration's OWN citation shape is prose, not identifier-adjacent"
+    section) -- `docs/plans/66-tower-profile/CONTRACT.md`'s own prose shape,
+    never identifier-adjacent, opt-IN twice over (under `_PLAN_CONTRACT_
+    ROOTS` AND carrying the file's own `citations-resolve-at:` header).
+    """
+
+    def setUp(self):
+        super().setUp()
+        cc._PLAN_CONTRACT_ROOTS = (self.root,)
+
+    def test_unique_basename_resolves(self):
+        self._write("crates/foo/trainer.rs", "\n".join(f"line {i}" for i in range(1, 11)) + "\n")
+        good_sha = self._commit("add trainer.rs")
+        doc = self._write(
+            "doc.md",
+            f"<!-- citations-resolve-at: {good_sha} -->\n\n`trainer.rs:1-3, 5`\n",
+        )
+        self._commit("add contract")
+        violations = cc.check_file(doc)
+        self.assertEqual(violations, [], [str(v) for v in violations])
+
+    def test_ambiguous_basename_is_red(self):
+        self._write("crates/one/main.rs", "fn main() {}\n")
+        self._write("crates/two/main.rs", "fn main() {}\n")
+        good_sha = self._commit("add two main.rs files")
+        doc = self._write(
+            "doc.md",
+            f"<!-- citations-resolve-at: {good_sha} -->\n\n`main.rs:1`\n",
+        )
+        self._commit("add contract")
+        violations = cc.check_file(doc)
+        self.assertEqual(len(violations), 1, [str(v) for v in violations])
+        self.assertIn("AMBIGUOUS", violations[0].message)
+        self.assertIn("crates/one/main.rs", violations[0].message)
+        self.assertIn("crates/two/main.rs", violations[0].message)
+
+    def test_absent_basename_is_red(self):
+        self._write("crates/foo/trainer.rs", "line one\n")
+        good_sha = self._commit("add trainer.rs")
+        doc = self._write(
+            "doc.md",
+            f"<!-- citations-resolve-at: {good_sha} -->\n\n`nowhere.rs:1`\n",
+        )
+        self._commit("add contract")
+        violations = cc.check_file(doc)
+        self.assertEqual(len(violations), 1, [str(v) for v in violations])
+        self.assertIn("does not exist anywhere in the tree", violations[0].message)
+
+    def test_range_beyond_eof_is_red(self):
+        self._write("crates/foo/trainer.rs", "line one\nline two\nline three\n")
+        good_sha = self._commit("add trainer.rs")
+        doc = self._write(
+            "doc.md",
+            f"<!-- citations-resolve-at: {good_sha} -->\n\n`trainer.rs:1-5`\n",
+        )
+        self._commit("add contract")
+        violations = cc.check_file(doc)
+        self.assertEqual(len(violations), 1, [str(v) for v in violations])
+        self.assertIn("only has 3 lines", violations[0].message)
+
+    def test_comma_separated_ranges_all_checked(self):
+        """A `1-2, 10` spec where only `10` is out of range must still be a
+        violation -- every comma-separated part is checked, not just the
+        first."""
+        self._write("crates/foo/trainer.rs", "line one\nline two\nline three\n")
+        good_sha = self._commit("add trainer.rs")
+        doc = self._write(
+            "doc.md",
+            f"<!-- citations-resolve-at: {good_sha} -->\n\n`trainer.rs:1-2, 10`\n",
+        )
+        self._commit("add contract")
+        violations = cc.check_file(doc)
+        self.assertEqual(len(violations), 1, [str(v) for v in violations])
+        self.assertIn("trainer.rs:1-2, 10", violations[0].message)
+        self.assertIn("only has 3 lines", violations[0].message)
+
+    def test_full_path_citation_resolves_directly_even_when_basename_is_ambiguous(self):
+        """A full-path citation is unambiguous by construction -- it
+        resolves directly even when its OWN basename would be ambiguous if
+        cited bare."""
+        self._write("crates/one/main.rs", "fn main() {}\nfn second() {}\n")
+        self._write("crates/two/main.rs", "fn main() {}\n")
+        good_sha = self._commit("add two main.rs files")
+        doc = self._write(
+            "doc.md",
+            f"<!-- citations-resolve-at: {good_sha} -->\n\n`crates/one/main.rs:1-2`\n",
+        )
+        self._commit("add contract")
+        violations = cc.check_file(doc)
+        self.assertEqual(violations, [], [str(v) for v in violations])
+
+    def test_full_path_citation_missing_from_tree_is_red(self):
+        self._write("crates/foo/trainer.rs", "line one\n")
+        good_sha = self._commit("add trainer.rs")
+        doc = self._write(
+            "doc.md",
+            f"<!-- citations-resolve-at: {good_sha} -->\n\n`crates/foo/nowhere.rs:1`\n",
+        )
+        self._commit("add contract")
+        violations = cc.check_file(doc)
+        self.assertEqual(len(violations), 1, [str(v) for v in violations])
+        self.assertIn("does not exist in the tree", violations[0].message)
+
+    def test_no_content_match_required_unlike_other_citation_forms(self):
+        """This form gates resolution + in-bounds only, never a content
+        re-check (module doc: "No adjacent-identifier / content-match check
+        here") -- a citation whose line number is in-bounds but whose
+        content has nothing to do with the surrounding prose still passes."""
+        self._write("crates/foo/trainer.rs", "totally unrelated content\n")
+        good_sha = self._commit("add trainer.rs")
+        doc = self._write(
+            "doc.md",
+            f"<!-- citations-resolve-at: {good_sha} -->\n\n`trainer.rs:1`\n",
+        )
+        self._commit("add contract")
+        violations = cc.check_file(doc)
+        self.assertEqual(violations, [], [str(v) for v in violations])
+
+    def test_contract_md_without_the_epoch_header_is_a_violation_never_a_silent_skip(self):
+        """Never-checked must never read as checked-clean: `CONTRACT.md`
+        itself (`_is_frozen_contract_file`'s FILENAME arm, independent of
+        the marker arms below) with NO `citations-resolve-at:` header, and
+        carrying NEITHER declared marker either, is itself a `Violation` --
+        a marker-ONLY definition would fail to catch this exact,
+        un-decorated file, which is mechanically indistinguishable from
+        "this was never a contract"; silently skipping the whole
+        plan-contract citation scan instead (reporting zero violations)
+        would be equally indistinguishable from "every citation resolves".
+        """
+        self._write("crates/foo/trainer.rs", "line one\n")
+        self._commit("add trainer.rs")
+        doc = self._write("CONTRACT.md", "`trainer.rs:999`\n")
+        self._commit("add contract without a header")
+        violations = cc.check_file(doc)
+        self.assertEqual(len(violations), 1, [str(v) for v in violations])
+        self.assertIn("declares no 'citations-resolve-at:' header", violations[0].message)
+
+    def test_frozen_marker_via_first_heading_without_the_epoch_header_is_a_violation(self):
+        """Never-checked must never read as checked-clean: a `.md` file
+        whose FIRST heading names it a contract (`_is_frozen_contract_
+        file`'s heading arm) with NO `citations-resolve-at:` header is
+        itself a `Violation` -- the old behaviour (silently skip the whole
+        plan-contract citation scan, report zero violations) was
+        mechanically indistinguishable from "every citation resolves".
+        Deliberately named something OTHER than `CONTRACT.md` -- recognition
+        comes from the declared heading, never the filename.
+        """
+        self._write("crates/foo/trainer.rs", "line one\n")
+        self._commit("add trainer.rs")
+        doc = self._write("PLAN.md", "# CONTRACT\n\n`trainer.rs:999`\n")
+        self._commit("add a heading-marked frozen doc without a header")
+        violations = cc.check_file(doc)
+        self.assertEqual(len(violations), 1, [str(v) for v in violations])
+        self.assertIn("declares no 'citations-resolve-at:' header", violations[0].message)
+
+    def test_frozen_marker_via_html_comment_without_the_epoch_header_is_a_violation(self):
+        """The OTHER marker arm: a `<!-- Frozen ... -->` HTML comment,
+        with no heading at all, is equally sufficient to mark a file frozen
+        -- and equally mandatory about the epoch header once it does."""
+        self._write("crates/foo/trainer.rs", "line one\n")
+        self._commit("add trainer.rs")
+        doc = self._write(
+            "PLAN.md",
+            "<!-- Frozen ledger ts: 2026-01-01 -->\n\n`trainer.rs:999`\n",
+        )
+        self._commit("add a comment-marked frozen doc without a header")
+        violations = cc.check_file(doc)
+        self.assertEqual(len(violations), 1, [str(v) for v in violations])
+        self.assertIn("declares no 'citations-resolve-at:' header", violations[0].message)
+
+    def test_a_renamed_or_versioned_contract_file_is_still_caught_by_its_marker(self):
+        """A frozen contract renamed/versioned into its own title
+        (`CONTRACT-v2.5.md`, this plan group's own real shape) is caught
+        exactly the same way a plain `CONTRACT.md` would be -- recognition
+        is the declared marker, never the literal filename."""
+        self._write("crates/foo/trainer.rs", "line one\n")
+        self._commit("add trainer.rs")
+        doc = self._write(
+            "CONTRACT-v2.5.md",
+            "<!-- Frozen ledger ts: 2026-01-01 -->\n\n# CONTRACT -- v2.5\n\n`trainer.rs:999`\n",
+        )
+        self._commit("add a renamed frozen contract without a header")
+        violations = cc.check_file(doc)
+        self.assertEqual(len(violations), 1, [str(v) for v in violations])
+        self.assertIn("declares no 'citations-resolve-at:' header", violations[0].message)
+
+    def test_a_companion_doc_without_the_header_is_still_not_a_violation(self):
+        """The mandatory-header rule is scoped to `_is_frozen_contract_file`
+        (a declared FROZEN marker), never to every `.md` file `_plan_
+        contract_scope` recognizes: a companion doc in the same plan
+        directory (e.g. a close-out `README.md`) that carries NEITHER
+        marker shape and never declares the header stays completely
+        unaffected, exactly as before -- it may legitimately cite a mix of
+        the frozen contract's own facts and the CURRENT tree in the same
+        paragraph, which a single whole-file epoch pin could never honestly
+        cover."""
+        self._write("crates/foo/trainer.rs", "line one\n")
+        self._commit("add trainer.rs")
+        doc = self._write("README.md", "`trainer.rs:999`\n")
+        self._commit("add companion doc without a header")
+        violations = cc.check_file(doc)
+        self.assertEqual(violations, [], [str(v) for v in violations])
+
+    def test_a_heading_inside_a_fence_is_never_mistaken_for_the_first_heading(self):
+        """The first-heading scan is fence-aware: a heading-SHAPED line
+        quoted as an EXAMPLE inside a ``` fence (e.g. a doc showing readers
+        what a contract's own opening heading looks like), with no REAL
+        heading anywhere in the search window, must never be treated as
+        this document's own title -- the file is not recognized as frozen
+        at all, so it produces no violation (no header mandated, and the
+        frozen-only bare-basename citation form is the only thing that
+        would ever have looked at `trainer.rs:999` here in the first
+        place)."""
+        doc = self._write(
+            "NOTES.md",
+            "```\n# CONTRACT\n```\n\nSome prose.\n\n`trainer.rs:999`\n",
+        )
+        self._commit("add a doc whose only heading-shaped line is fenced")
+        violations = cc.check_file(doc)
+        self.assertEqual(violations, [], [str(v) for v in violations])
+
+    def test_a_frozen_comment_inside_a_closed_fence_is_still_recognized_raw_scan(self):
+        """The comment-marker scan is deliberately NOT fence-aware (round-7
+        audit at a0081c9d, unlike the heading scan, which stays fence-aware
+        -- `_is_frozen_contract_file`'s own "Fences apply to the heading
+        arm only" doc section): a doc that QUOTES the `<!-- Frozen ledger
+        ts: ... -->` convention inside a ``` fence (e.g. showing readers
+        what a frozen file's own opening comment looks like) is now
+        recognized as frozen regardless -- the RAW window is scanned
+        unconditionally, so this produces the mandatory-header violation."""
+        doc = self._write(
+            "NOTES.md",
+            "```\n<!-- Frozen ledger ts: 2026-01-01 -->\n```\n\nSome prose.\n\n`trainer.rs:999`\n",
+        )
+        self._commit("add a doc whose only frozen-marker-shaped line is fenced")
+        violations = cc.check_file(doc)
+        self.assertEqual(len(violations), 1, [str(v) for v in violations])
+        self.assertIn("declares no 'citations-resolve-at:' header", violations[0].message)
+
+    def test_a_frozen_comment_after_an_unterminated_fence_in_the_window_is_still_recognized(self):
+        """The motivating bug this raw scan fixes: a fence that OPENS on
+        line 1 but never CLOSES again before the search window ends (its
+        real closing fence -- if any -- sits past
+        `_CITATIONS_EPOCH_HEADER_SEARCH_LINES` == 6) must not silently
+        swallow a REAL marker on one of the later lines still inside the
+        window -- a fence-aware scan would leave `in_fence` stuck `True`
+        for the rest of the window and miss it entirely, reading a
+        genuinely frozen file as NOT frozen (exactly the "never-checked
+        reads as checked-clean" failure this whole mechanism exists to
+        rule out)."""
+        doc = self._write(
+            "NOTES.md",
+            "```\nsome code, never closed within the search window\n"
+            "<!-- Frozen ledger ts: 2026-01-01 -->\n\nprose\n`trainer.rs:999`\n",
+        )
+        self._commit("add a doc with an unterminated fence before its real marker")
+        violations = cc.check_file(doc)
+        self.assertEqual(len(violations), 1, [str(v) for v in violations])
+        self.assertIn("declares no 'citations-resolve-at:' header", violations[0].message)
+
+    def test_a_heading_naming_contract_is_recognized_after_a_fence_closes(self):
+        """The inverse: a fence that opens and closes BEFORE the document's
+        real first heading must not swallow that real heading -- the
+        fence-aware scan still finds it once the fence toggles closed
+        again, inside the same search window."""
+        self._write("crates/foo/trainer.rs", "line one\n")
+        self._commit("add trainer.rs")
+        doc = self._write(
+            "PLAN.md",
+            "```\nexample text, no heading here\n```\n\n# CONTRACT\n\n`trainer.rs:999`\n",
+        )
+        self._commit("add a doc with a closed fence before its real heading")
+        violations = cc.check_file(doc)
+        self.assertEqual(len(violations), 1, [str(v) for v in violations])
+        self.assertIn("declares no 'citations-resolve-at:' header", violations[0].message)
+
+    def test_a_later_heading_naming_contract_does_not_retroactively_mark_the_file_frozen(self):
+        """Only the FIRST heading in the search window is consulted -- a
+        document whose first heading is unrelated is never caught by some
+        deeper section heading that happens to mention "CONTRACT", and (with
+        no header declared and no citation this script's own `_KNOWN_FILES`
+        recognizes) produces no violation at all."""
+        doc = self._write(
+            "NOTES.md",
+            "# Notes\n\nSome prose.\n\n## CONTRACT recap\n\n`trainer.rs:999`\n",
+        )
+        self._commit("add a doc whose first heading is unrelated")
+        violations = cc.check_file(doc)
+        self.assertEqual(violations, [], [str(v) for v in violations])
+
+    def test_a_header_past_the_search_window_reads_as_absent_and_is_red(self):
+        """A `citations-resolve-at:` header that lands PAST
+        `_CITATIONS_EPOCH_HEADER_SEARCH_LINES` reads byte-for-byte like
+        absent to `_file_citations_epoch` -- so it must be equally red, not
+        silently ignored just because the string is present somewhere later
+        in the file (the FROZEN marker itself sits on line 1, well inside
+        the search window -- only the epoch header is pushed past it)."""
+        self._write("crates/foo/trainer.rs", "line one\n")
+        good_sha = self._commit("add trainer.rs")
+        marker = "<!-- Frozen ledger ts: 2026-01-01 -->"
+        padding = "\n".join(f"filler line {i}" for i in range(1, 10))
+        doc = self._write(
+            "CONTRACT.md",
+            f"{marker}\n\n{padding}\n\n<!-- citations-resolve-at: {good_sha} -->\n\n`trainer.rs:1`\n",
+        )
+        self._commit("add contract with a too-late header")
+        violations = cc.check_file(doc)
+        self.assertEqual(len(violations), 1, [str(v) for v in violations])
+        self.assertIn("declares no 'citations-resolve-at:' header", violations[0].message)
+
+    def test_relative_sub_path_unique_resolves(self):
+        """`ops/attention_block.rs:467,472` -- has a slash, but does not
+        start with a recognized `_FULL_PATH_ROOT_PREFIXES` prefix -- must
+        resolve by a unique SUFFIX match against the pinned tree, the shape
+        the old bare-basename-or-full-path regex could not even match."""
+        self._write("crates/jammi-kernels/src/ops/attention_block.rs", "\n".join(f"line {i}" for i in range(1, 500)) + "\n")
+        good_sha = self._commit("add attention_block.rs")
+        doc = self._write(
+            "doc.md",
+            f"<!-- citations-resolve-at: {good_sha} -->\n\n`ops/attention_block.rs:467,472`\n",
+        )
+        self._commit("add contract")
+        violations = cc.check_file(doc)
+        self.assertEqual(violations, [], [str(v) for v in violations])
+
+    def test_relative_sub_path_ambiguous_is_red(self):
+        self._write("crates/one/ops/attention_block.rs", "\n".join(f"line {i}" for i in range(1, 500)) + "\n")
+        self._write("crates/two/ops/attention_block.rs", "\n".join(f"line {i}" for i in range(1, 500)) + "\n")
+        good_sha = self._commit("add two attention_block.rs files under ops/")
+        doc = self._write(
+            "doc.md",
+            f"<!-- citations-resolve-at: {good_sha} -->\n\n`ops/attention_block.rs:1`\n",
+        )
+        self._commit("add contract")
+        violations = cc.check_file(doc)
+        self.assertEqual(len(violations), 1, [str(v) for v in violations])
+        self.assertIn("AMBIGUOUS", violations[0].message)
+        self.assertIn("relative sub-path", violations[0].message)
+
+    def test_relative_sub_path_absent_is_red(self):
+        self._write("crates/foo/trainer.rs", "line one\n")
+        good_sha = self._commit("add trainer.rs")
+        doc = self._write(
+            "doc.md",
+            f"<!-- citations-resolve-at: {good_sha} -->\n\n`ops/nowhere.rs:1`\n",
+        )
+        self._commit("add contract")
+        violations = cc.check_file(doc)
+        self.assertEqual(len(violations), 1, [str(v) for v in violations])
+        self.assertIn("does not exist anywhere in the tree", violations[0].message)
+        self.assertIn("relative sub-path", violations[0].message)
+
+    def test_unparsed_line_spec_is_a_violation_not_a_silent_skip(self):
+        """A backtick-quoted, path-ish, colon-numbered token whose line-spec
+        half is not a bare digit range must be reported (fail-closed on
+        unparsed citations), never silently excluded from being a citation
+        at all just because a stricter one-shot regex would not have
+        matched it."""
+        self._write("crates/foo/trainer.rs", "line one\n")
+        good_sha = self._commit("add trainer.rs")
+        doc = self._write(
+            "doc.md",
+            f"<!-- citations-resolve-at: {good_sha} -->\n\n`trainer.rs:not-a-line-spec`\n",
+        )
+        self._commit("add contract")
+        violations = cc.check_file(doc)
+        self.assertEqual(len(violations), 1, [str(v) for v in violations])
+        self.assertIn("could not be classified", violations[0].message)
+
+    def test_continuation_resolves_against_the_preceding_path_on_the_same_line(self):
+        """A bare `` `:<line>` `` continuation elides a path already named
+        earlier on the SAME LINE -- CONTRACT.md's own "`` `htsat_audio.rs:
+        1064` `` and `` `:1635` `` call ..." shape."""
+        self._write("crates/foo/trainer.rs", "\n".join(f"line {i}" for i in range(1, 11)) + "\n")
+        good_sha = self._commit("add trainer.rs")
+        doc = self._write(
+            "doc.md",
+            f"<!-- citations-resolve-at: {good_sha} -->\n\n"
+            "`trainer.rs:2` and `:5` call the same thing.\n",
+        )
+        self._commit("add contract")
+        violations = cc.check_file(doc)
+        self.assertEqual(violations, [], [str(v) for v in violations])
+
+    def test_continuation_coverage_counts_the_bare_token_too(self):
+        self._write("crates/foo/trainer.rs", "\n".join(f"line {i}" for i in range(1, 11)) + "\n")
+        good_sha = self._commit("add trainer.rs")
+        doc = self._write(
+            "doc.md",
+            f"<!-- citations-resolve-at: {good_sha} -->\n\n`trainer.rs:2` and `:5`\n",
+        )
+        self._commit("add contract")
+        cc._SEARCH_ROOTS = ()
+        cc._DOC_SEARCH_ROOTS = ()
+
+        import contextlib
+        import io
+
+        buf = io.StringIO()
+        with contextlib.redirect_stdout(buf):
+            code = cc.main()
+        self.assertEqual(code, 0)
+        self.assertIn("2 citation(s) checked", buf.getvalue())
+
+    def test_continuation_out_of_bounds_is_red(self):
+        self._write("crates/foo/trainer.rs", "line one\nline two\nline three\n")
+        good_sha = self._commit("add trainer.rs")
+        doc = self._write(
+            "doc.md",
+            f"<!-- citations-resolve-at: {good_sha} -->\n\n`trainer.rs:1` and `:999`\n",
+        )
+        self._commit("add contract")
+        violations = cc.check_file(doc)
+        self.assertEqual(len(violations), 1, [str(v) for v in violations])
+        self.assertIn("only has 3 lines", violations[0].message)
+
+    def test_second_continuation_on_same_line_still_resolves_against_first_path(self):
+        """A THIRD elided `:<n>` on the same line continues to resolve
+        against the SAME preceding path, not just the immediately-prior
+        token."""
+        self._write("crates/foo/trainer.rs", "\n".join(f"line {i}" for i in range(1, 11)) + "\n")
+        good_sha = self._commit("add trainer.rs")
+        doc = self._write(
+            "doc.md",
+            f"<!-- citations-resolve-at: {good_sha} -->\n\n"
+            "`trainer.rs:2`, `:5` and `:7` all call the same thing.\n",
+        )
+        self._commit("add contract")
+        violations = cc.check_file(doc)
+        self.assertEqual(violations, [], [str(v) for v in violations])
+
+    def test_continuation_with_no_preceding_path_is_a_violation(self):
+        """A bare line-spec token with no preceding path citation IN SCOPE
+        on this line is refused, never silently guessed against an earlier
+        line's path (or ignored)."""
+        self._write("crates/foo/trainer.rs", "line one\n")
+        good_sha = self._commit("add trainer.rs")
+        doc = self._write(
+            "doc.md",
+            f"<!-- citations-resolve-at: {good_sha} -->\n\n`:5` calls the same thing.\n",
+        )
+        self._commit("add contract")
+        violations = cc.check_file(doc)
+        self.assertEqual(len(violations), 1, [str(v) for v in violations])
+        self.assertIn("no path:line citation resolves earlier on this same line", violations[0].message)
+
+    def test_continuation_scope_resets_across_lines(self):
+        """A path citation named on one line is never a valid basis for a
+        DIFFERENT line's own bare continuation."""
+        self._write("crates/foo/trainer.rs", "\n".join(f"line {i}" for i in range(1, 11)) + "\n")
+        good_sha = self._commit("add trainer.rs")
+        doc = self._write(
+            "doc.md",
+            f"<!-- citations-resolve-at: {good_sha} -->\n\n"
+            "`trainer.rs:2` calls the thing.\n\n`:5` calls it too.\n",
+        )
+        self._commit("add contract")
+        violations = cc.check_file(doc)
+        self.assertEqual(len(violations), 1, [str(v) for v in violations])
+        self.assertIn("no path:line citation resolves earlier on this same line", violations[0].message)
+
+    def test_continuation_scope_does_not_survive_a_broken_preceding_citation(self):
+        """A path citation that itself FAILED to resolve is not a valid
+        basis for a later same-line continuation to lean on."""
+        self._write("crates/foo/trainer.rs", "line one\n")
+        good_sha = self._commit("add trainer.rs")
+        doc = self._write(
+            "doc.md",
+            f"<!-- citations-resolve-at: {good_sha} -->\n\n`nowhere.rs:1` and `:1`\n",
+        )
+        self._commit("add contract")
+        violations = cc.check_file(doc)
+        self.assertEqual(len(violations), 2, [str(v) for v in violations])
+        messages = [v.message for v in violations]
+        self.assertTrue(any("does not exist anywhere in the tree" in m for m in messages))
+        self.assertTrue(any("no path:line citation resolves earlier on this same line" in m for m in messages))
+
+    def test_backtick_prose_ending_in_a_bare_colon_is_not_a_false_positive_continuation(self):
+        """This repo's prose routinely closes a backtick-quoted term with a
+        bare colon immediately after (`` `<keys>`: refuses ... ``) --
+        without the continuation arm's own digit anchor, that ordinary
+        prose shape would read as an (empty, non-numeric) citation-shaped
+        token exactly as much as `` `:1635` `` does."""
+        self._write("crates/foo/trainer.rs", "line one\n")
+        good_sha = self._commit("add trainer.rs")
+        doc = self._write(
+            "doc.md",
+            f"<!-- citations-resolve-at: {good_sha} -->\n\n"
+            "`finetune-run --expect-kernels-disabled <keys>`: refuses at start unless every "
+            "named key is present in `JAMMI_KERNELS_DISABLE`.\n",
+        )
+        self._commit("add contract")
+        violations = cc.check_file(doc)
+        self.assertEqual(violations, [], [str(v) for v in violations])
+
+    def test_coverage_count_reported_for_a_pinned_file(self):
+        """`_check_plan_contract_citations` (driven here via `main()`, the
+        real coverage-reporting entry point) reports the exact count of
+        citation-shaped tokens found, not merely "zero violations"."""
+        self._write("crates/foo/trainer.rs", "\n".join(f"line {i}" for i in range(1, 11)) + "\n")
+        good_sha = self._commit("add trainer.rs")
+        doc = self._write(
+            "doc.md",
+            f"<!-- citations-resolve-at: {good_sha} -->\n\n"
+            "`trainer.rs:1-3, 5` and `trainer.rs:6` and `trainer.rs:7`\n",
+        )
+        self._commit("add contract")
+        cc._SEARCH_ROOTS = ()
+        cc._DOC_SEARCH_ROOTS = ()
+
+        import contextlib
+        import io
+
+        buf = io.StringIO()
+        with contextlib.redirect_stdout(buf):
+            code = cc.main()
+        self.assertEqual(code, 0)
+        self.assertIn("frozen-contract citation coverage", buf.getvalue())
+        self.assertIn("3 citation(s) checked", buf.getvalue())
+
+    def test_real_contract_epoch_and_scope_are_recognized(self):
+        """A cheap real-repo smoke check (never asserting the ambiguity-free
+        outcome, which depends on this repo's own filenames): the real
+        `docs/plans/66-tower-profile/CONTRACT.md` is under the real
+        `_PLAN_CONTRACT_ROOTS` and its header is well-formed."""
+        cc._PLAN_CONTRACT_ROOTS = self._orig_plan_contract_roots
+        contract = cc.REPO_ROOT / "docs" / "plans" / "66-tower-profile" / "CONTRACT.md"
+        self.assertTrue(contract.is_file())
+        self.assertTrue(cc._plan_contract_scope(contract))
+        text = contract.read_text()
+        epoch_sha, error = cc._file_citations_epoch(contract, text)
+        self.assertIsNone(error)
+        self.assertIsNotNone(epoch_sha)
+
+    def test_real_contract_citation_coverage_is_19_including_the_elided_line(self):
+        """`docs/plans/66-tower-profile/CONTRACT.md:16` cites `` `htsat_
+        audio.rs:1064` `` and `` `:1635` `` -- the elided second citation is
+        a 19th citation the OLD (path-only) recognizer could not see at
+        all (coverage read 18). Enumerating every backticked, colon-
+        numbered token in the real file independently (never trusting this
+        script's own regex to count itself) confirms the true total is 19:
+        18 named-path citations plus the one bare continuation."""
+        cc._PLAN_CONTRACT_ROOTS = self._orig_plan_contract_roots
+        contract = cc.REPO_ROOT / "docs" / "plans" / "66-tower-profile" / "CONTRACT.md"
+        text = contract.read_text()
+        independent_count = len(re.findall(r"`[^`]*:[0-9][^`]*`", text))
+        self.assertEqual(independent_count, 19)
+
+        # `GitFixture.setUp` points `_GIT_REPO_ROOT` at this test's own
+        # throwaway repo -- restored here (redundantly with `tearDown`) so
+        # `main()`'s own `git show`/`git ls-tree` calls resolve the REAL
+        # `CONTRACT.md`'s citations against the REAL repository, not the
+        # empty fixture one.
+        cc._GIT_REPO_ROOT = self._orig_git_repo_root
+        cc._SEARCH_ROOTS = ()
+        cc._DOC_SEARCH_ROOTS = ()
+        import contextlib
+        import io
+
+        buf = io.StringIO()
+        with contextlib.redirect_stdout(buf):
+            code = cc.main()
+        self.assertEqual(code, 0)
+        self.assertIn(
+            "docs/plans/66-tower-profile/CONTRACT.md: 19 citation(s) checked", buf.getvalue()
+        )
+
+
+class PlanContractHeadRelativeFullPathTests(GitFixture):
+    """The class fix for the audit's stale-citation-the-gate-cannot-see
+    finding: a `_PLAN_CONTRACT_ROOTS` `.md` file that carries NO
+    `citations-resolve-at:` header is HEAD-relative by definition (module
+    doc's "Never-checked must never read as checked-clean" section already
+    says so in prose -- `_full_path_mode` must actually turn full-path
+    scanning ON for such a file, never leave it silently uncovered the way
+    `docs/plans/66-tower-profile/README.md`'s own stale
+    `_checkpoint_identity_probe`/`preflight_probe` citations went unnoticed
+    by exactly this gap). A property test (a wrong line number is always
+    reported, a right one always passes), never a grep for the one
+    known-bad string.
+    """
+
+    def setUp(self):
+        super().setUp()
+        cc.REPO_ROOT = self.root
+        # An unrelated, never-matched entry -- `_citation_re` builds its
+        # pattern by joining `_KNOWN_FILES`'s keys, and an EMPTY dict
+        # degrades to an empty alternation that matches any bare `:<digit>`
+        # with an empty `file` group (a pre-existing footgun this fixture
+        # sidesteps the same way `MaintainerGuideFullPathTests` does).
+        cc._KNOWN_FILES = {"unrelated.rs": self.root / "unrelated.rs"}
+        cc._SEARCH_ROOTS = ()
+        cc._DOC_SEARCH_ROOTS = ()
+        cc._PERF_FULL_PATH_ROOTS = ()
+        cc._PLAN_CONTRACT_ROOTS = (self.root / "docs" / "plans" / "66-tower-profile",)
+
+    def _fixture(self, target_body: str, doc_body: str, doc_name: str = "README.md") -> Path:
+        self._write("ci/scripts/perf/driver.sh", target_body)
+        return self._write(f"docs/plans/66-tower-profile/{doc_name}", doc_body)
+
+    def test_a_correct_full_path_citation_resolves(self):
+        doc = self._fixture(
+            "line 1\nline 2\nline 3\nline 4\npreflight_probe() {\n",
+            "`preflight_probe` (`ci/scripts/perf/driver.sh:5`)\n",
+        )
+        self._commit("add driver and companion doc")
+        self.assertEqual(cc.check_file(doc), [])
+
+    def test_a_wrong_line_number_pointing_at_a_different_function_is_red(self):
+        """THE audit's own regression shape: a citation whose line number
+        now falls inside a DIFFERENT function's body must be reported --
+        never silently read as resolved because no full-path scanning mode
+        applied to this file at all (the bug this class fix closes)."""
+        doc = self._fixture(
+            "fi\nline 2\nline 3\nline 4\npreflight_probe() {\n",
+            "`preflight_probe` (`ci/scripts/perf/driver.sh:1`)\n",
+        )
+        self._commit("add driver and companion doc")
+        violations = cc.check_file(doc)
+        self.assertEqual(len(violations), 1, [str(v) for v in violations])
+        self.assertIn("STALE", violations[0].message)
+
+    def test_a_missing_full_path_target_still_fails_loudly(self):
+        doc = self._fixture(
+            "line 1\npreflight_probe() {\n",
+            "`preflight_probe` (`ci/scripts/perf/no_such_driver.sh:2`)\n",
+        )
+        self._commit("add driver and companion doc")
+        violations = cc.check_file(doc)
+        self.assertEqual(len(violations), 1, [str(v) for v in violations])
+        self.assertIn("does not exist", violations[0].message)
+
+    def test_an_epoch_pinned_sibling_keeps_its_current_sha_relative_behaviour(self):
+        """`CONTRACT.md` (or any epoch-pinned `.md` under the same root) is
+        deliberately EXCLUDED from this new HEAD-relative scope -- it keeps
+        resolving sha-relative to its own declared epoch through
+        `_check_plan_contract_citations` only; this new mode must never
+        also turn on for it (which would re-resolve its frozen citations
+        against HEAD, the exact drift the epoch-pin convention exists to
+        prevent)."""
+        self._write("crates/foo/trainer.rs", "line one\n")
+        good_sha = self._commit("add trainer.rs")
+        contract = self._write(
+            "docs/plans/66-tower-profile/CONTRACT.md",
+            f"<!-- citations-resolve-at: {good_sha} -->\n\n`trainer.rs:1`\n",
+        )
+        readme = self._fixture(
+            "line 1\npreflight_probe() {\n",
+            "`preflight_probe` (`ci/scripts/perf/driver.sh:2`)\n",
+        )
+        self._commit("add contract, driver, and companion doc")
+        self.assertIsNone(cc._full_path_mode(contract, contract.read_text()))
+        self.assertEqual(cc._full_path_mode(readme, readme.read_text()), "text")
+        self.assertEqual(cc.check_file(contract), [])
+        self.assertEqual(cc.check_file(readme), [])
+
+
+class BasenameMapHeaderTests(GitFixture):
+    """The `citations-basename-map:` header (module doc's "An ambiguous bare
+    basename can be disambiguated by a declared header map" section) --
+    disambiguates a `_PLAN_CONTRACT_ROOTS` file's own ambiguous bare-basename
+    citations without ever editing the frozen body, subject to the three
+    narrowing checks that keep a map from asserting an unverifiable fact.
+    """
+
+    def setUp(self):
+        super().setUp()
+        cc._PLAN_CONTRACT_ROOTS = (self.root,)
+
+    def test_mapped_ambiguous_basename_resolves(self):
+        self._write("crates/one/main.rs", "fn main() {}\nfn second() {}\n")
+        self._write("crates/two/main.rs", "fn main() {}\n")
+        good_sha = self._commit("add two main.rs files")
+        doc = self._write(
+            "doc.md",
+            f"<!-- citations-resolve-at: {good_sha} -->\n"
+            "<!-- citations-basename-map: main.rs=crates/one/main.rs -->\n\n"
+            "`main.rs:1-2`\n",
+        )
+        self._commit("add contract")
+        violations = cc.check_file(doc)
+        self.assertEqual(violations, [], [str(v) for v in violations])
+
+    def test_map_to_a_nonexistent_path_is_red(self):
+        self._write("crates/one/main.rs", "fn main() {}\n")
+        self._write("crates/two/main.rs", "fn main() {}\n")
+        good_sha = self._commit("add two main.rs files")
+        doc = self._write(
+            "doc.md",
+            f"<!-- citations-resolve-at: {good_sha} -->\n"
+            "<!-- citations-basename-map: main.rs=crates/nowhere/main.rs -->\n\n"
+            "`main.rs:1`\n",
+        )
+        self._commit("add contract")
+        violations = cc.check_file(doc)
+        self.assertEqual(len(violations), 1, [str(v) for v in violations])
+        self.assertIn("does not exist in the tree", violations[0].message)
+
+    def test_map_whose_basename_differs_from_the_key_is_red(self):
+        self._write("crates/one/main.rs", "fn main() {}\n")
+        self._write("crates/two/main.rs", "fn main() {}\n")
+        self._write("crates/one/other.rs", "fn other() {}\n")
+        good_sha = self._commit("add fixture files")
+        doc = self._write(
+            "doc.md",
+            f"<!-- citations-resolve-at: {good_sha} -->\n"
+            "<!-- citations-basename-map: main.rs=crates/one/other.rs -->\n\n"
+            "`main.rs:1`\n",
+        )
+        self._commit("add contract")
+        violations = cc.check_file(doc)
+        self.assertEqual(len(violations), 1, [str(v) for v in violations])
+        self.assertIn("own basename is", violations[0].message)
+
+    def test_map_that_repoints_a_unique_basename_elsewhere_is_red(self):
+        """`trainer.rs` is NOT ambiguous -- only one exists -- so a map entry
+        naming a DIFFERENT file for it must be refused, never silently
+        accepted (a map can only resolve a genuine ambiguity, never
+        re-point a citation that was already resolving correctly)."""
+        self._write("crates/foo/trainer.rs", "line one\nline two\n")
+        self._write("crates/foo/other.rs", "line one\nline two\n")
+        good_sha = self._commit("add trainer.rs and other.rs")
+        doc = self._write(
+            "doc.md",
+            f"<!-- citations-resolve-at: {good_sha} -->\n"
+            "<!-- citations-basename-map: trainer.rs=crates/foo/other.rs -->\n\n"
+            "`trainer.rs:1`\n",
+        )
+        self._commit("add contract")
+        violations = cc.check_file(doc)
+        self.assertEqual(len(violations), 1, [str(v) for v in violations])
+        self.assertIn("already resolves uniquely to", violations[0].message)
+        self.assertIn("crates/foo/trainer.rs", violations[0].message)
+
+    def test_unmapped_ambiguous_basename_still_red_even_with_a_map_present(self):
+        """A map entry for ONE ambiguous basename must never loosen the
+        ambiguity check for a DIFFERENT, unmapped one in the same file."""
+        self._write("crates/one/main.rs", "fn main() {}\n")
+        self._write("crates/two/main.rs", "fn main() {}\n")
+        self._write("crates/one/layer_norm.rs", "line one\n")
+        self._write("crates/two/layer_norm.rs", "line one\n")
+        good_sha = self._commit("add ambiguous fixture files")
+        doc = self._write(
+            "doc.md",
+            f"<!-- citations-resolve-at: {good_sha} -->\n"
+            "<!-- citations-basename-map: main.rs=crates/one/main.rs -->\n\n"
+            "`layer_norm.rs:1`\n",
+        )
+        self._commit("add contract")
+        violations = cc.check_file(doc)
+        self.assertEqual(len(violations), 1, [str(v) for v in violations])
+        self.assertIn("AMBIGUOUS", violations[0].message)
+
+    def test_malformed_map_entry_is_a_whole_file_violation(self):
+        self._write("crates/foo/trainer.rs", "line one\n")
+        good_sha = self._commit("add trainer.rs")
+        doc = self._write(
+            "doc.md",
+            f"<!-- citations-resolve-at: {good_sha} -->\n"
+            "<!-- citations-basename-map: main.rs -->\n\n"
+            "`trainer.rs:1`\n",
+        )
+        self._commit("add contract")
+        violations = cc.check_file(doc)
+        self.assertEqual(len(violations), 1, [str(v) for v in violations])
+        self.assertIn("citations-basename-map", violations[0].message)
+
+    def test_real_contract_basename_map_resolves_the_two_ambiguous_citations(self):
+        """A cheap real-repo smoke check, same shape as
+        `PlanContractCitationTests`'s `test_real_contract_epoch_and_scope_are_
+        recognized`: the real `CONTRACT.md` declares a `citations-basename-map`
+        header, and every one of its `layer_norm.rs`/`main.rs` citations
+        resolves cleanly through it."""
+        cc._PLAN_CONTRACT_ROOTS = self._orig_plan_contract_roots
+        contract = cc.REPO_ROOT / "docs" / "plans" / "66-tower-profile" / "CONTRACT.md"
+        self.assertTrue(contract.is_file())
+        text = contract.read_text()
+        basename_map, error = cc._file_citations_basename_map(contract, text)
+        self.assertIsNone(error)
+        self.assertIsNotNone(basename_map)
+        self.assertEqual(basename_map.get("layer_norm.rs"), "crates/jammi-encoders/src/layer_norm.rs")
+        self.assertEqual(basename_map.get("main.rs"), "crates/jammi-bench/src/main.rs")
 
 
 if __name__ == "__main__":

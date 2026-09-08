@@ -4,25 +4,20 @@ citation under `crates/jammi-bench/**`, `ci/scripts/perf/**`, and
 `crates/jammi-kernels/artifacts/cuda-runs/**` — against the actual file
 content AT HEAD for ordinary living files, or against the CITING artifact's
 own recorded `git_sha` for committed evidence (see this doc's own
-"Committed artifacts are append-only evidence" section below) — advisory
-(i), round-2 audit fix on PR #372; the artifact sha-relative resolution is
-the M1b audit round's own fix.
+"Committed artifacts are append-only evidence" section below).
 
-WHY THIS EXISTS: round 1 of this fix round "corrected" a stale citation in
-`finetune_step.rs` (originally naming Rust source lines 253 through 264,
-"fixed" to name line 290) by eyeballing the diff — but the code had ALREADY
-moved again by the time that commit landed, so the "fixed" citation (line
-290) was ALSO stale (the real line was 299) the moment it was committed.
-`p1_softmax_scale_fold_ab.json` carried this SAME stale line-290 citation in
-TWO fields, and `torch_finetune_step.py`/`README.md` independently carried a
-DIFFERENT stale citation naming Rust source lines 112 and 233 together
-(the second of those two line numbers pointed at unrelated LoRA-builder
-code, not the VRAM baseline capture it was meant to cite) that neither round
-noticed by eye either. A
-citation that is only ever checked "by eye" at commit time is exactly the
-kind of claim this repo's own `implementer-acceptance-clause` ("resolvable
-citations") exists to stop being trusted on prose alone — this script is the
-mechanical re-check, run every CI, not a one-time manual pass.
+WHY THIS EXISTS: a citation's line number can drift out from under it in
+more places than the one spot a hand-edit is likely to look — a corrected
+citation can already be wrong again by the time the correcting commit
+lands, if the cited code moves a second time in between; a JSON artifact
+can carry the SAME citation duplicated across more than one field, each
+needing its own re-check; and a sibling document (a README, a Python
+mirror of the same call site) can carry an INDEPENDENTLY stale citation
+that nothing else in a diff touches. A citation that is only ever checked
+"by eye" at commit time is exactly the kind of claim this repo's own
+`implementer-acceptance-clause` ("resolvable citations") exists to stop
+being trusted on prose alone — this script is the mechanical re-check, run
+every CI, not a one-time manual pass.
 
 CONVENTION THIS SCRIPT ENFORCES: every citation in scope must be immediately
 preceded by a backtick-quoted CODE IDENTIFIER (allowing only
@@ -188,14 +183,12 @@ component happens to be a registered basename — the FULL-PATH match wins and
 the basename match nested inside it is dropped, so one citation is never
 reported twice.
 
-## The full-path form's coverage extension: `ci/scripts/perf/**` and crate comments
+## The full-path form's coverage extension: `ci/scripts/perf/**`, crate comments, and un-pinned plan-contract docs
 
-The full-path form was originally `_DOC_SEARCH_ROOTS`-only; a DOCUMENTED
-RESIDUAL paragraph here used to name two real gaps this left open (found by
-a survey when the form was first added). Both are now closed, each by its
-own scope, never by widening `_DOC_SEARCH_ROOTS` itself (that tuple stays
-"the maintainer guides", a distinct citing-audience from either extension
-below):
+The full-path form covers `_DOC_SEARCH_ROOTS` PLUS three further scopes,
+each kept as its OWN scope rather than folded into `_DOC_SEARCH_ROOTS`
+itself (that tuple stays "the maintainer guides", a distinct citing-
+audience from any extension below):
 
   * **`_PERF_FULL_PATH_ROOTS`** (`ci/scripts/perf/**`, `.sh`/`.py` files
     only — not the `.json` fixtures or `.md` provenance notes living
@@ -232,13 +225,15 @@ below):
     non-match the lone `'` is consumed as an ordinary character and the
     identifier after it is left for normal processing, since it triggers no
     further lexical state on its own). Getting char-literal handling right
-    here is not cosmetic: BEFORE this fix, an unhandled `'"'`/`b'"'` char
-    literal opened a phantom ordinary-string state on its embedded `"` that
-    was never closed until the NEXT unrelated `"` anywhere later in the
-    file — silently swallowing every real `//`/`///`/`//!` comment line in
-    between as unscanned "string content" (measured: dozens of lines lost
-    in this repo's own `crates/jammi-encoders/src/layer_norm.rs` and
-    `crates/jammi-kernels/src/ops/launch_domain.rs`).
+    here is not cosmetic: an unhandled `'"'`/`b'"'` char literal would open
+    a phantom ordinary-string state on its embedded `"` that stays open
+    until the NEXT unrelated `"` anywhere later in the file — silently
+    swallowing every real `//`/`///`/`//!` comment line in between as
+    unscanned "string content", a failure mode that reaches dozens of
+    lines lost in a large enough file (this repo's own
+    `crates/jammi-encoders/src/layer_norm.rs` and
+    `crates/jammi-kernels/src/ops/launch_domain.rs` are both big enough to
+    show it).
 
     Block comments (`/* ... */`) are tracked (including nesting) so a
     `//`-shaped substring inside one is never misread as a line comment,
@@ -275,9 +270,263 @@ below):
     starts with `//`) is covered by at least one real span — the exact
     regression class the char-literal fix above closes.
 
-Both new scopes are subject to the IDENTICAL adjacent-identifier rule and
-in-bounds check the original `_DOC_SEARCH_ROOTS` form uses — the extension
-buys coverage, never a weaker check.
+  * **`_PLAN_CONTRACT_ROOTS`, un-pinned `.md` files only** (a file under
+    `docs/plans/66-tower-profile/` that carries NO well-formed
+    `citations-resolve-at:` header — module doc's "Never-checked must
+    never read as checked-clean" section below): such a file is
+    HEAD-relative by definition, the same as any doc outside every
+    plan-contract convention entirely, so it gets the SAME whole-file-text
+    full-path scan `_DOC_SEARCH_ROOTS` gets rather than silently falling
+    through every scope above unchecked. A companion doc like this plan
+    group's own `README.md` names real driver-script line numbers this
+    way (`` `_checkpoint_identity_probe` (`ci/scripts/perf/
+    profile_421_legs.sh:423-446`) ``) — an ordinary, identifier-adjacent
+    full-path citation, never the frozen contract's own bare-basename
+    prose form (that form is opt-in twice over: under this root AND
+    epoch-pinned — see "A frozen pre-registration's OWN citation shape is
+    prose, not identifier-adjacent" below). An EPOCH-PINNED file under
+    this same root (`CONTRACT.md`) is deliberately excluded from THIS
+    scope: its full-path citations resolve sha-relative to its own epoch
+    through `_check_plan_contract_citations` instead, never HEAD-relative
+    through this whole-file-text scan.
+
+All three new scopes are subject to the IDENTICAL adjacent-identifier rule
+and in-bounds check the original `_DOC_SEARCH_ROOTS` form uses — the
+extension buys coverage, never a weaker check.
+
+## A frozen pre-registration's citations are pinned to their own epoch
+
+A `docs/plans/<N>-<slug>/CONTRACT.md`-shaped pre-registration is reviewed
+and FROZEN before any measurement, then kept byte-identical to that frozen
+copy for the rest of the unit's life (the doctrine `docs/plans/66-tower-
+profile/CONTRACT.md` names explicitly) — its Scope-facts citations describe
+the code as it stood the day the freeze was reviewed, never as it reads at
+whatever LATER HEAD re-runs this gate. Re-resolving them against HEAD is
+the exact category error the "Committed artifacts are append-only
+evidence" section above already names for a JSON artifact's own `git_sha`
+field, and the inline-pin section names for a single citation's own "at
+HEAD `<sha>`" phrase — this is the WHOLE-FILE form of the same principle,
+for a class neither of those two covers: a file that is not JSON evidence
+and carries no per-citation pin phrase, but whose ENTIRE body is frozen at
+once. A file opts in with an HTML comment naming the epoch within its own
+first few lines, e.g. `<!-- citations-resolve-at:
+bff1fad65683760f6a6b2f6677b74e61f20d96f5 -->` (`_file_citations_epoch`) —
+every `path:line` citation the rest of THIS SAME FILE carries then resolves
+against that sha's tree (`git show <sha>:<path>`), never HEAD, under the
+IDENTICAL adjacent-identifier and in-bounds checks every other class above
+already gets. Two ways this differs from the artifacts/ arm, both
+deliberate: (1) the epoch sha MUST be an ancestor of `HEAD` — fails CLOSED,
+never EXEMPT, if it is not (a frozen contract's own declared epoch is
+reviewed, reachable prose about THIS branch's history, not
+squashed-away-and-ungraftable legacy evidence, so a non-ancestor pin here
+is a wrong or fabricated header, not a legitimate historical artifact); (2)
+a malformed header value (present but not a well-formed 40-character hex
+sha) is ALSO a hard fail, never silently treated as "no header" — a typo'd
+epoch must never quietly fall back to ordinary HEAD-relative resolution,
+which would paper over the very drift this convention exists to pin
+against. Scoped to `.md` files only (the pre-registration's own shape);
+every other file's citations keep the resolution behaviour described above
+completely unchanged by this.
+
+## An unseen-suffix path-like token is a diagnostic, never a Violation
+
+`_FULL_PATH_SUFFIXES` is deliberately closed (see that tuple's own module
+comment: "a permissive suffix set turns ordinary prose mentioning a path
+plus a number into one") -- every citation recognizer in this file
+(`_citation_re`, `_full_path_citation_re`, `_crate_relative_citation_re`,
+`_plan_contract_citation_like_re`) can therefore only ever MATCH a
+`path:line` token whose extension is one of those nine. A backtick-quoted
+token of the identical shape but a DIFFERENT extension -- `` `notes.txt:12`
+`` -- is invisible to every one of them: it is neither resolved nor
+reported, a genuine blind spot rather than a deliberately excluded case,
+since nothing distinguishes "a real citation this repo simply has not
+registered a suffix for yet" from "ordinary prose that happens to look
+path-shaped" without a human reading it.
+
+For each EPOCH-PINNED file (one that carries a well-formed
+`citations-resolve-at:` header -- the class most likely to accumulate
+exactly this kind of unregistered citation, since it is reviewed prose
+citing a wide variety of source files by hand), `_unseen_path_like_tokens`
+additionally scans for a backtick-quoted `<path>.<any-suffix>:<line-spec>`
+token whose suffix is NOT in `_FULL_PATH_SUFFIXES`, and `main()` prints
+each one found as a NAMED, non-failing diagnostic line -- never a
+`Violation`: widening `_FULL_PATH_SUFFIXES` itself to close the blind spot
+would risk exactly the false-positive class its own module comment already
+rules out, and failing CI on a token that might just be ordinary prose
+would be a worse mistake than the blind spot itself. The diagnostic exists
+so the blind spot is VISIBLE to a reader (or a future gate) rather than
+silent -- the same "never-checked must never read as checked-clean" spirit
+the mandatory frozen-contract header rule above already applies to a
+different blind spot, applied here to a narrower, print-only degree
+because there is no reliable mechanical rule for graduating a diagnostic
+into a Violation.
+
+## A frozen pre-registration's OWN citation shape is prose, not identifier-adjacent
+
+`docs/plans/66-tower-profile/CONTRACT.md`'s "Scope facts" section cites
+Rust source lines as bare backticked tokens -- `` `trainer.rs:1952-1965,
+2067-2106` ``, `` `finetune_run.rs:394` ``, occasionally a full path
+(`` `crates/jammi-lora/src/lora_linear.rs:973-1005` ``), occasionally a
+RELATIVE SUB-PATH that is neither (`` `ops/attention_block.rs:467,472` ``:
+has a slash, but does not start with a recognized full-path root prefix),
+and occasionally a bare CONTINUATION with no path half at all (`` `:1635`
+``, eliding a path already named earlier on the SAME LINE -- "``
+`htsat_audio.rs:1064` `` and `` `:1635` `` call ...") -- never
+identifier-adjacent the way every OTHER citation class in this file is
+(`_find_adjacent_identifier`'s connector convention does not apply here at
+all). `_PLAN_CONTRACT_ROOTS` (scoped to this one plan group; widen it, not
+the shape, the day a second frozen contract adopts the same prose
+convention) opts a `.md` file under it into a SEPARATE citation form. The
+RECOGNIZER (`_plan_contract_citation_like_re`) is deliberately as broad as
+the punctuation alone can support: ANY backtick-to-backtick token of the
+shape `` `<path-ish>:<line-spec>` `` where `<path-ish>` ends in a
+`_FULL_PATH_SUFFIXES` extension, OR a bare `` `:<line-spec>` `` continuation,
+is a citation this file owes a classification to -- never gated on the
+line-spec ALSO being well-formed digits in the same pattern that determines
+recognition, and never blind to a shape the punctuation alone does not
+distinguish from ordinary prose (a relative sub-path like
+`ops/attention_block.rs:467,472` has neither a bare basename, which forbids
+`/`, nor a recognized full-path prefix, so it needs the sub-path arm below;
+a bare continuation has no path half at all, so it needs its own scope-
+tracking arm, `_check_plan_contract_citations`'s own `pending_relpath`).
+Classification, once a candidate is recognized:
+
+  - the line-spec half must fully match `<line>[-<line>][, <line>[-<line>]]*`
+    (bare digit ranges only) -- a citation-shaped token whose line-spec does
+    not is a `Violation` ("could not be classified"), never silently
+    dropped from the checked set (module doc's "assert coverage" clause
+    below);
+  - a FULL PATH (starts with a recognized `_FULL_PATH_ROOT_PREFIXES`
+    prefix) resolves directly, checked to exist in the pinned tree;
+  - a RELATIVE SUB-PATH (contains a `/` but is not a full path) resolves by
+    a UNIQUE SUFFIX match against the pinned tree at that epoch (the one
+    path that IS the sub-path or ENDS WITH `/<sub-path>`) -- FAILING CLOSED
+    if absent or ambiguous, never a silent first-match guess;
+  - a BARE BASENAME (no `/`) resolves by searching the pinned tree at that
+    epoch (`git ls-tree -r --name-only <sha>`) for a unique basename match,
+    FAILING CLOSED if it is absent OR ambiguous (this repo genuinely reuses
+    generic filenames like `main.rs`/`layer_norm.rs`/`attention_block.rs`
+    across crates -- the same scaling limit `_KNOWN_FILES`'s own module doc
+    names for why a hand-registered map does not extend past a handful of
+    files), unless a `citations-basename-map` header entry narrows it (see
+    below);
+  - a bare CONTINUATION (no path half) resolves against the path most
+    recently resolved earlier on the SAME LINE (never an earlier line, and
+    never a path citation that itself failed to resolve) -- FAILING CLOSED
+    with no such scope in effect, never guessed against whichever path
+    happens to be nearest in the document.
+
+Gated STRICTLY by resolution and in-bounds -- never a content re-check,
+since the adjacent-identifier convention this file's other forms use has
+nothing to pair against here. Only engages for a file that ALSO carries the
+`citations-resolve-at:` header above (opt-IN twice over). Every individual
+line/range in a comma-separated spec is checked, not just the first. Every
+one of `CONTRACT.md`'s 19 citation-shaped tokens (18 named-path citations
+plus the one bare continuation) is classified this way -- see `check-
+citations: frozen-contract citation coverage` in this script's own `main()`
+output for the live count.
+
+## Never-checked must never read as checked-clean
+
+A frozen pre-registration (`_is_frozen_contract_file` -- a `_PLAN_CONTRACT_
+ROOTS` `.md` file that is EITHER named `CONTRACT.md` OR whose first
+`_CITATIONS_EPOCH_HEADER_SEARCH_LINES` lines carry a FROZEN MARKER, the ONE
+file class the "frozen pre-registration's citations are pinned to their
+own epoch" section above describes) recognized by the UNION of the literal
+filename and a DECLARED marker -- either arm is independently sufficient:
+`path.name == "CONTRACT.md"` (this plan group's real, un-renamed shape,
+which carries no marker of its own -- a marker-ONLY definition would fail
+to recognize this exact, un-decorated file, which is mechanically
+indistinguishable from "this was never a contract"); or either the
+`<!-- Frozen ledger ts: ... -->` HTML comment this contract group's own
+freeze convention opens every frozen file with, or a FIRST `#`-prefixed
+heading line, BOTH scanned fence-aware (a comment- or heading-shaped line
+quoted as an example inside a ``` / ~~~ fence is skipped for either arm,
+never mistaken for the document's own declared marker or title) in that
+same window whose text contains "CONTRACT" or "frozen" (case-insensitive)
+-- a LATER heading is never consulted, so recognition
+cannot be smuggled in by a deep section title that happens to use either
+word. The marker arm is what still catches a frozen contract RENAMED or
+VERSIONED into its own title (`CONTRACT-v2.5.md`), which the filename arm
+alone would miss -- widening one arm can never narrow the other. A
+recognized frozen file that does NOT carry a well-formed
+`citations-resolve-at:` header in that SAME window -- whether the header is
+genuinely absent, or it landed past the search window (which reads
+byte-for-byte identically to absent) -- is itself a `Violation`, never a
+silent skip: skipping the whole plan-contract citation scan and reporting
+zero violations would be mechanically indistinguishable from "every
+citation in this file resolves" -- exactly the false-negative shape a
+reviewer, or a later gate, would trust.
+
+Deliberately scoped to the frozen file ITSELF, not to every `.md` file
+`_plan_contract_scope` recognizes: a companion doc in the same directory
+(e.g. `docs/plans/66-tower-profile/README.md`) routinely cites a MIX of the
+contract's own frozen-epoch facts (quoted verbatim, for discussion) and the
+CURRENT tree (a stale-name deviation, a driver script's real line numbers)
+in the same paragraph -- a single whole-file epoch pin cannot honestly
+cover both, so such a file is never forced to declare one, and its
+citations keep resolving HEAD-relative through the ordinary (non-plan-
+contract) citation forms above. `_plan_contract_scope` itself stays
+name-agnostic: any `.md` file under the root MAY still opt a citation into
+this bare `path:line` form by carrying a well-formed header voluntarily
+(unchanged) -- only the FROZEN file is ever forced to.
+
+Coverage is also ASSERTED, not merely implied by the absence of a
+violation: `main()` prints, per successfully-scanned `_plan_contract_scope`
+file that carries a header, the exact count of citation-shaped tokens
+`_plan_contract_citation_like_re` found and classified (`check-citations:
+frozen-contract citation coverage: - <path>: <N> citation(s) checked`) -- a
+reviewer (or a future regression) can see that number move the day a
+citation is added, removed, or silently stops matching.
+
+## An ambiguous bare basename can be disambiguated by a declared header map, never re-written in the frozen body
+
+`docs/plans/66-tower-profile/CONTRACT.md` itself hit the ambiguity case the
+section above describes: at its own pinned epoch (`bff1fad6`) this repo
+already carries three `layer_norm.rs` files and ten `main.rs` files, so the
+frozen body's `` `layer_norm.rs:129, 552-583` `` and `` `main.rs:115-223` ``/
+`` `main.rs:1389-1400` `` citations are genuinely ambiguous by basename
+alone -- and the frozen body can never be edited to spell them out as full
+paths (the freeze doctrine the section above already names). The fix lives
+in the HEADER ZONE instead, which is not frozen prose: an optional SECOND
+HTML-comment line, immediately after `citations-resolve-at:`, e.g.
+
+    <!-- citations-basename-map: layer_norm.rs=crates/jammi-encoders/src/layer_norm.rs; main.rs=crates/jammi-bench/src/main.rs -->
+
+(`;`-separated `<basename>=<repo-root-relative-path>` entries; searched over
+the same leading `_CITATIONS_EPOCH_HEADER_SEARCH_LINES` lines the epoch
+header is, parsed by `_file_citations_basename_map`). A malformed entry
+(no `=`, or an empty key/value) is a hard fail for the WHOLE file, the same
+shape a malformed `citations-resolve-at:` value already is -- never silently
+treated as "no map".
+
+This is a NARROWING of the search space `_resolve_plan_contract_target`
+already does, never a way to assert a fact this script cannot itself check:
+every mapped entry is validated, at the moment a citation actually uses that
+basename, against the SAME pinned-tree lookup the ambiguity check itself
+uses, IN THIS ORDER --
+
+  1. if the basename is NOT actually ambiguous (one unique match already
+     exists in the pinned tree, without consulting the map at all), the
+     map's declared path must BE that unique match -- checked FIRST, ahead
+     of the two checks below, and regardless of whether the declared path
+     would otherwise pass them: a map entry is never allowed to re-point a
+     citation that was already resolving correctly on its own, and a bogus
+     declared value must never masquerade as a mere existence/basename
+     typo by having that more specific finding hidden behind a generic one.
+     This is the load-bearing property: a map can only ever RESOLVE a
+     genuine ambiguity the pinned tree itself has, never silently
+     substitute a different file for one a reviewer could otherwise have
+     verified by eye;
+  2. the declared path must exist in the pinned tree at all (a map entry
+     naming a path the epoch's tree never had is a `Violation`, not a
+     dead-but-harmless header line); and
+  3. the declared path's OWN basename must equal the map key (a map entry
+     `layer_norm.rs=crates/foo/attention.rs` is a `Violation` -- the key and
+     the target must actually agree on what they claim to name).
+
+An unmapped ambiguous basename still fails closed exactly as before -- the
+map is opt-in per basename, not a blanket relaxation of the ambiguity check.
 
 Run: `python3 ci/scripts/perf/check_citations.py`
 Hermetic for every non-artifact citation (reads only files in the working
@@ -325,33 +574,31 @@ class CitationError(Exception):
 _KNOWN_FILES = {
     "finetune_step.rs": REPO_ROOT / "crates" / "jammi-bench" / "src" / "finetune_step.rs",
     "grad_oracle.rs": REPO_ROOT / "crates" / "jammi-bench" / "src" / "grad_oracle.rs",
-    # round-4 audit fold-in on PR #372: the determinant tables in
-    # `grad_oracle.rs`/`ab_merge.py` cite dozens of `.py:<n>` lines in the
-    # torch reference scripts — those citations were NEVER mechanically
-    # re-checked (this script only knew about the two `.rs` files above),
-    # which is exactly how the `.py` line-drift this round's own audit
-    # caught went unnoticed.
+    # The determinant tables in `grad_oracle.rs`/`ab_merge.py` cite dozens
+    # of `.py:<n>` lines in the torch reference scripts below -- these are
+    # mechanically re-checked exactly like the two `.rs` files above, since
+    # a `.py` line can drift out from under a citation exactly as silently
+    # as an `.rs` line can.
     "torch_grad_oracle.py": REPO_ROOT / "crates" / "jammi-bench" / "reference" / "torch_grad_oracle.py",
     "torch_finetune_step.py": REPO_ROOT / "crates" / "jammi-bench" / "reference" / "torch_finetune_step.py",
 }
 
 # The roots this advisory names, all searched recursively for every file
 # (not just `.py`/`.json` -- a `.md` doc citation is just as resolvable
-# and just as capable of going stale, see README.md's own citation this
-# round fixed).
+# and just as capable of going stale).
 #
-# Unification contract C8.4/NF15: `crates/jammi-kernels/artifacts/cuda-runs`
-# joined this tuple in phase 2, the same PR that `git mv`s the two
+# `crates/jammi-kernels/artifacts/cuda-runs` is a root in its own right,
+# alongside the two `jammi-bench` roots, because it is where the
 # `finetune_step_reference.json`/`p1_softmax_scale_fold_ab.json` baselines
-# OUT of `crates/jammi-bench/baselines/` and into this directory (contract
-# C8) -- without this addition, the moved p1 record's own two citations of
-# finetune_step.rs's batched-forward concatenation call site (see that
-# record's own `_comment`) would silently drop OUT of this script's coverage
-# the moment the move landed (a citation this script used to check would
-# simply never be visited again, not a citation that fails loudly), which is
-# precisely the "coverage regression" pressure-v2 pin H / NF15 named. (This
-# comment deliberately avoids spelling out a bare `file.rs:N` citation of its
-# own -- this script scans `ci/scripts/perf/**`, itself included.)
+# actually live: the moved p1 record's own two citations of
+# `finetune_step.rs`'s batched-forward concatenation call site (see that
+# record's own `_comment`) are citations like any other, and a citation
+# living outside `_SEARCH_ROOTS` is never visited at all -- not a citation
+# that fails loudly, simply one this script cannot see, which is exactly
+# the coverage gap explicit, enumerated roots (never an implicit or
+# inferred set) exist to close. (This comment deliberately avoids spelling
+# out a bare `file.rs:N` citation of its own -- this script scans
+# `ci/scripts/perf/**`, itself included.)
 _SEARCH_ROOTS = (
     REPO_ROOT / "crates" / "jammi-bench",
     REPO_ROOT / "ci" / "scripts" / "perf",
@@ -421,6 +668,19 @@ _FULL_PATH_ROOT_PREFIXES = ("ci/scripts/", "crates/", "docs/", ".github/")
 # set turns ordinary prose mentioning a path plus a number into one.
 _FULL_PATH_SUFFIXES = ("sh", "py", "rs", "cu", "toml", "md", "yml", "yaml", "json")
 
+# A `docs/plans/<N>-<slug>/` group whose citation PROSE is a bare backticked
+# `<basename>.<ext>:<line>[-<line>][, <line>[-<line>]]*` token (never
+# identifier-adjacent -- `docs/plans/66-tower-profile/CONTRACT.md`'s own
+# "Scope facts" section is exactly this shape: `` `trainer.rs:1952-1965,
+# 2067-2106` ``, `` `finetune_run.rs:394` ``, alongside an occasional
+# full-path token, `` `crates/jammi-lora/src/lora_linear.rs:973-1005` ``).
+# Scoped narrowly to this one plan group (not every `docs/plans/**`
+# pre-registration) -- widen this tuple, not the citation shape, the day a
+# second frozen contract adopts the same prose convention.
+_PLAN_CONTRACT_ROOTS = (
+    REPO_ROOT / "docs" / "plans" / "66-tower-profile",
+)
+
 
 # --------------------------------------------------------------------------- #
 # Artifact sha-relative resolution -- see the module doc's "Committed
@@ -486,6 +746,123 @@ def _artifact_git_sha(path: Path) -> str | None:
     if isinstance(sha, str) and GIT_SHA_RE.match(sha):
         return sha
     return None
+
+
+# The whole-file epoch pin -- see the module doc's "A frozen
+# pre-registration's citations are pinned to their own epoch" section.
+_CITATIONS_EPOCH_HEADER_RE = re.compile(r"citations-resolve-at:\s*(\S+)")
+
+# How many leading lines of a Markdown file are searched for the header --
+# generous enough to cover a SECOND HTML comment line immediately after the
+# file's own opening comment (the shape a frozen contract's freeze-ledger
+# comment already uses), never the whole file: a `citations-resolve-at:`-
+# shaped phrase appearing deep in ordinary prose, unrelated to this
+# convention, must never be misread as the header.
+_CITATIONS_EPOCH_HEADER_SEARCH_LINES = 6
+
+
+def _file_citations_epoch(path: Path, text: str) -> tuple[str | None, str | None]:
+    """The commit sha a Markdown file's own `<!-- citations-resolve-at:
+    <sha> -->` header declares every one of ITS OWN `path:line` citations
+    resolves against -- the WHOLE-FILE analogue of the artifacts/ arm's
+    per-file `git_sha` JSON field and the inline arm's per-citation "at
+    HEAD `<sha>`" phrase, for a class neither of those two covers: a frozen
+    pre-registration whose body is reviewed BEFORE measurement and then
+    kept byte-identical to that frozen copy forever after -- its citations
+    describe the code as it stood at review time, never as it reads at
+    whatever later HEAD re-runs this gate, and the freeze doctrine forbids
+    re-pointing them the moment a later, unrelated commit inserts lines
+    above them.
+
+    Returns `(sha, None)` if a well-formed header is found in the first
+    `_CITATIONS_EPOCH_HEADER_SEARCH_LINES` lines; `(None, None)` if no
+    header line is present at all (ordinary HEAD-relative resolution,
+    completely unchanged -- this is an opt-IN convention, never a
+    heuristic guess); `(None, message)` if a header LINE is present but its
+    value is not a well-formed 40-character hex commit sha -- a malformed
+    pin is a HARD FAIL, never silently treated as "no header" (which would
+    silently fall back to HEAD-relative resolution for a file whose author
+    explicitly declared otherwise -- the same reviewability argument the
+    inline commit-pin arm's own module doc section already makes for a
+    fabricated sha, just for a value that is not even well-typed rather
+    than one this checkout's object database cannot find).
+    """
+    if path.suffix != ".md":
+        return None, None
+    for line in text.splitlines()[:_CITATIONS_EPOCH_HEADER_SEARCH_LINES]:
+        m = _CITATIONS_EPOCH_HEADER_RE.search(line)
+        if not m:
+            continue
+        candidate = m.group(1)
+        if GIT_SHA_RE.match(candidate):
+            return candidate, None
+        return None, (
+            f"declares a 'citations-resolve-at: {candidate}' header, but {candidate!r} "
+            "is not a well-formed 40-character hex commit sha"
+        )
+    return None, None
+
+
+# The disambiguation-map header -- see the module doc's "An ambiguous bare
+# basename can be disambiguated by a declared header map" section. A
+# non-greedy capture up to the closing `-->` so this matches a SINGLE header
+# line even though the whole thing is one HTML comment.
+_CITATIONS_BASENAME_MAP_HEADER_RE = re.compile(r"citations-basename-map:\s*(.*?)\s*-->")
+
+
+def _file_citations_basename_map(path: Path, text: str) -> tuple[dict[str, str] | None, str | None]:
+    """The `{basename: repo-root-relative-path}` map a Markdown file's own
+    `<!-- citations-basename-map: <basename>=<path>; <basename>=<path>; ... -->`
+    header declares, or `(None, None)` if no such header line is present at
+    all (ordinary ambiguity-checked resolution, completely unchanged -- this
+    is an opt-IN convention, same as `_file_citations_epoch`'s own header).
+    Searched over the SAME leading `_CITATIONS_EPOCH_HEADER_SEARCH_LINES`
+    lines the epoch header is (the map is documented as living immediately
+    after that header, but this function does not itself require ordering
+    relative to it -- only line-count proximity to the top of the file).
+
+    A malformed entry (missing `=`, or an empty key/value on either side of
+    it) is a hard fail for the WHOLE file, `(None, <message>)` -- never
+    silently dropped or treated as "no map", the same non-negotiable
+    strictness `_file_citations_epoch` already applies to a malformed sha:
+    a typo'd map entry must never quietly fall back to ordinary
+    ambiguity-checked resolution, which would silently re-enable the exact
+    AMBIGUOUS failure this header exists to name a fix for.
+
+    This function only PARSES the header -- it does not validate that a
+    declared path exists, or that its basename actually matches the key, or
+    that it agrees with an unambiguous match already in the tree. Those
+    three checks all need the PINNED TREE (`_ls_tree_paths(epoch_sha)`),
+    which this function has no epoch to look up against; they are instead
+    applied by `_resolve_plan_contract_target`, at the moment a citation
+    actually uses the mapped basename (see that function's own doc).
+    """
+    if path.suffix != ".md":
+        return None, None
+    for line in text.splitlines()[:_CITATIONS_EPOCH_HEADER_SEARCH_LINES]:
+        m = _CITATIONS_BASENAME_MAP_HEADER_RE.search(line)
+        if not m:
+            continue
+        mapping: dict[str, str] = {}
+        for entry in m.group(1).split(";"):
+            entry = entry.strip()
+            if not entry:
+                continue
+            if "=" not in entry:
+                return None, (
+                    f"declares a 'citations-basename-map' header entry {entry!r} that is not "
+                    "of the form <basename>=<repo-root-relative-path>"
+                )
+            key, _, value = entry.partition("=")
+            key, value = key.strip(), value.strip()
+            if not key or not value:
+                return None, (
+                    f"declares a 'citations-basename-map' header entry {entry!r} that is not "
+                    "of the form <basename>=<repo-root-relative-path>"
+                )
+            mapping[key] = value
+        return mapping, None
+    return None, None
 
 
 def _git_relpath(target_path: Path) -> str | None:
@@ -621,14 +998,13 @@ def _find_pin_sha(text: str, citation_start: int) -> str | None:
 # A known filename, a colon, and a line number -- optionally wrapped in a
 # matched pair of backticks around the whole citation (both forms are used
 # across this repo's own docs; see this script's own module doc for an
-# example of each). Deliberately does NOT match the legacy
-# comma-continuation shorthand this round's own fix retired (naming a
-# second Rust source line by writing only a bare `,:<n>` after the first) --
-# that shape now simply fails to match at all past the first number, which
-# is intentional: an isolated `,:<n>` fragment, unattached to a
-# `<filename>:` prefix, is not a citation this script recognizes at all, so
-# a leftover comma-shorthand citation degrades to "only the first number is
-# checked" rather than being silently mis-parsed as one unit.
+# example of each). A bare `,:<n>` continuation immediately after a
+# citation (naming a SECOND Rust source line with no `<filename>:` prefix
+# of its own) is NOT matched as part of it, and is not itself a citation
+# shape this pattern recognizes at all: an isolated `,:<n>` fragment,
+# unattached to a `<filename>:` prefix, simply fails to match past the
+# first number, degrading to "only the first number is checked" rather
+# than being silently mis-parsed as one unit.
 def _citation_re() -> re.Pattern:
     """Built fresh from the CURRENT `_KNOWN_FILES` on every call (never
     compiled once at import time against whatever `_KNOWN_FILES` happened to
@@ -690,6 +1066,520 @@ def _crate_relative_citation_re() -> re.Pattern:
         r"(?<![A-Za-z0-9_./-])`?(?P<path>jammi-[A-Za-z0-9_-]+/(?:src|tests)/[A-Za-z0-9_./-]+\.(?:"
         + suffixes + r")):(?P<line>\d+)`?"
     )
+
+
+_LINE_SPEC_FRAGMENT = r"\d+(?:-\d+)?(?:,\s*\d+(?:-\d+)?)*"
+_LINE_SPEC_ONLY_RE = re.compile(r"^" + _LINE_SPEC_FRAGMENT + r"$")
+
+# ANY backtick-quoted `<path>.<suffix>:<line-spec>` token, regardless of
+# suffix -- module doc's "An unseen-suffix path-like token is a diagnostic,
+# never a Violation" section. `_unseen_path_like_tokens` filters this down
+# to the suffixes NOT in `_FULL_PATH_SUFFIXES` -- every OTHER citation
+# recognizer in this file is suffix-restricted, so this is the one pattern
+# that deliberately is not, purely to surface what those recognizers can
+# never see.
+_UNSEEN_SUFFIX_TOKEN_RE = re.compile(
+    r"`(?P<path>[^`\s:]+\.(?P<suffix>[A-Za-z0-9]+)):(?P<lines>" + _LINE_SPEC_FRAGMENT + r")`"
+)
+
+
+def _unseen_path_like_tokens(text: str) -> list[tuple[int, str]]:
+    """Every backtick-quoted, path-line-shaped token in `text` whose
+    extension is NOT one of `_FULL_PATH_SUFFIXES` -- diagnostic-only (see
+    module doc's "An unseen-suffix path-like token is a diagnostic, never a
+    Violation" section), never gating CI. Returns `(line_no, token)` pairs
+    in document order; the caller (`_check_file_impl`) scopes this to
+    EPOCH-PINNED files only (a well-formed `citations-resolve-at:` header),
+    not every file this script scans.
+    """
+    found: list[tuple[int, str]] = []
+    for m in _UNSEEN_SUFFIX_TOKEN_RE.finditer(text):
+        if m.group("suffix").lower() in _FULL_PATH_SUFFIXES:
+            continue
+        line_no = text.count("\n", 0, m.start()) + 1
+        found.append((line_no, m.group(0)))
+    return found
+
+
+def _plan_contract_citation_like_re() -> re.Pattern:
+    r"""Every backtick-quoted, path-ish, colon-line-numbered token in a
+    `_PLAN_CONTRACT_ROOTS` file's prose -- module doc's "A frozen
+    pre-registration's OWN citation shape" section: ANY backtick-to-backtick
+    `` `<path-ish>:<line-spec>` `` where `<path-ish>` ends in a
+    `_FULL_PATH_SUFFIXES` extension is a citation this file OWES a
+    classification to, whether that citation is a bare basename
+    (`trainer.rs:1952-1965`), a full path
+    (`crates/jammi-lora/src/lora_linear.rs:973-1005`), a RELATIVE SUB-PATH
+    that is neither (`ops/attention_block.rs:467,472` -- has a slash, but
+    does not start with a recognized `_FULL_PATH_ROOT_PREFIXES` prefix --
+    see `_resolve_plan_contract_target`'s sub-path arm), OR a bare
+    CONTINUATION token with no path half at all (`` `:1635` ``, matched via
+    the SECOND alternative below into `clines` instead of `path`/`lines`) --
+    CONTRACT.md's own "`` `htsat_audio.rs:1064` `` and `` `:1635` `` call
+    ..." elision, where a second citation on the SAME LINE names only its
+    line number and leaves the path implicit. A continuation token resolves
+    against whichever path citation was most recently named earlier on that
+    SAME LINE (`_check_plan_contract_citations`'s own scope-tracking state);
+    one with no such preceding path is itself a `Violation`, never silently
+    dropped or guessed against some earlier line's path.
+
+    Deliberately LOOSE on each line-spec half: `(?P<lines>[^`]+)` /
+    `(?P<clines>\d[^`]*)`, not `_LINE_SPEC_FRAGMENT` -- this regex's whole
+    job is coverage (module doc's "assert coverage" clause: every
+    citation-shaped backtick token found here must be resolved OR reported,
+    never silently dropped because its line-spec half turns out to be
+    malformed). A match whose line-spec half does not fully match
+    `_LINE_SPEC_FRAGMENT` is itself reported as an unparsed citation by
+    `_check_plan_contract_citations`, never silently excluded by a stricter
+    regex that gated recognition on the line-spec ALSO being well-formed in
+    the same pattern. The PATH arm's own anchor of legitimacy is its
+    `_FULL_PATH_SUFFIXES` extension (any backtick span ending in `.rs`/
+    `.py`/etc followed by `:<anything>` is unambiguously citation-shaped);
+    the bare CONTINUATION arm has no path half to anchor on at all, so it
+    additionally requires its first character to be a DIGIT (`\d`) -- this
+    repo's prose routinely closes a backtick-quoted term with a bare colon
+    immediately after (`` `<keys>`: refuses ... `` ), and without the digit
+    anchor that ordinary prose shape reads as an (empty, non-numeric)
+    citation-shaped token every bit as much as `` `:1635` `` does.
+
+    Built fresh from `_FULL_PATH_SUFFIXES` on every call, same reason every
+    other citation regex here is. The two arms are mutually exclusive by
+    construction (`path` is set XOR `clines` is set), so a single
+    `finditer` pass sees every citation-shaped token, in document order --
+    required for the continuation arm to know which path citation came
+    immediately before it.
+    """
+    suffixes = "|".join(re.escape(s) for s in _FULL_PATH_SUFFIXES)
+    path = r"[^`\s:]+\.(?:" + suffixes + r")"
+    return re.compile(r"`(?:(?P<path>" + path + r"):(?P<lines>[^`]+)|:(?P<clines>\d[^`]*))`")
+
+
+def _plan_contract_scope(path: Path) -> bool:
+    """Whether `path` is a `.md` file under `_PLAN_CONTRACT_ROOTS` -- the
+    convention is opt-IN twice over: the file must live under the named
+    plan group AND (checked by the caller) carry its own
+    `citations-resolve-at:` header. Scoped to `.md` (the pre-registration's
+    own shape), same restriction `_file_citations_epoch` already applies.
+    Deliberately name-agnostic (a companion doc in the SAME plan directory
+    -- e.g. `README.md` -- may also opt a citation into this form by
+    carrying the header; see `_is_frozen_contract_file` for the NARROWER
+    predicate that makes the header itself MANDATORY).
+    """
+    return path.suffix == ".md" and _is_under(path, _PLAN_CONTRACT_ROOTS)
+
+
+# The declared FROZEN marker `_is_frozen_contract_file` recognizes -- see
+# that function's own doc and the module doc's "Never-checked must never
+# read as checked-clean" section. Two independent, either-is-sufficient
+# shapes: an HTML comment opening with "Frozen" (the freeze-ledger header
+# this contract group's own convention uses -- `<!-- Frozen ledger ts: ...
+# -->`), or a FIRST heading whose text names it a contract/frozen document.
+_FROZEN_MARKER_COMMENT_RE = re.compile(r"<!--\s*Frozen\b", re.IGNORECASE)
+_FROZEN_HEADING_WORD_RE = re.compile(r"contract|frozen", re.IGNORECASE)
+_FENCE_RE = re.compile(r"^(?:```|~~~)")
+
+
+def _non_fenced_lines(lines: list[str]):
+    """Yield each line of `lines` that lies OUTSIDE a ``` / ~~~ fenced
+    code block -- a fence toggles a skip-state, so a heading-shaped line
+    quoted as an EXAMPLE inside a fence is never mistaken for the
+    document's own title. Used by `_is_frozen_contract_file`'s HEADING arm
+    only -- the comment-marker arm deliberately scans the raw, un-toggled
+    window instead (see that function's own "Fences apply to the heading
+    arm only" doc section: a fence that opens but never closes again
+    inside the truncated search window would otherwise leave `in_fence`
+    stuck `True` for the rest of it, silently swallowing a REAL marker)."""
+    in_fence = False
+    for line in lines:
+        stripped = line.lstrip()
+        if _FENCE_RE.match(stripped):
+            in_fence = not in_fence
+            continue
+        if in_fence:
+            continue
+        yield line
+
+
+def _is_frozen_contract_file(path: Path, text: str) -> bool:
+    """Whether `path` (together with its OWN text, since recognition also
+    reads content, not just the name) is a frozen pre-registration --
+    module doc's "A frozen pre-registration's citations are pinned to their
+    own epoch" section -- the ONLY file class the "never-checked must never
+    read as checked-clean" mandatory-header rule applies to.
+
+    Recognized by the UNION of the literal filename AND a declared marker
+    -- either is independently sufficient, so widening one arm can never
+    narrow the other:
+
+      - `path.name == "CONTRACT.md"` (this plan group's own real, un-renamed
+        shape -- a marker-ONLY definition would silently stop recognizing
+        the plain, un-decorated file the moment neither the freeze-ledger
+        comment nor a matching first heading happens to be present, which
+        is mechanically indistinguishable from "this file was never a
+        contract" -- exactly the "never-checked reads as checked-clean"
+        failure this whole function exists to rule out); OR
+      - a DECLARED MARKER in the first `_CITATIONS_EPOCH_HEADER_SEARCH_LINES`
+        lines -- this arm is what still catches a frozen contract RENAMED or
+        VERSIONED into its own title (`CONTRACT-v2.5.md`), which the
+        filename arm alone would miss. Either marker shape is sufficient on
+        its own:
+
+        - `_FROZEN_MARKER_COMMENT_RE` matches anywhere in the RAW window
+          (the `<!-- Frozen ledger ts: ... -->` HTML comment this plan
+          group's own freeze convention opens every frozen file with) --
+          deliberately NOT fence-aware, unlike the heading arm below (see
+          "Fences apply to the heading arm only" below); or
+        - the FIRST `#`-prefixed heading line in that same window, OUTSIDE
+          a fenced code block (a heading-shaped line quoted as an EXAMPLE
+          inside a fence is never mistaken for this document's own title),
+          if its text matches `_FROZEN_HEADING_WORD_RE` ("contract" or
+          "frozen", case-insensitive). A LATER heading is never consulted
+          once the first non-fenced one is found -- whether or not it
+          matches -- so a document whose first heading is unrelated (a
+          companion `README.md` titled "66 — tower profile close-out") is
+          never accidentally caught by some deeper section heading that
+          happens to mention either word.
+
+        Fences apply to the HEADING arm only. The comment-marker arm scans
+        the RAW window, unconditionally, because the two arms' failure
+        modes are not symmetric: `_non_fenced_lines` tracks fence state by
+        scanning ONLY the truncated `window` slice, so a fence that OPENS
+        but never CLOSES again before the window ends (its real closing
+        fence sits past `_CITATIONS_EPOCH_HEADER_SEARCH_LINES`, or the
+        window simply cuts a long example block in half) leaves `in_fence`
+        stuck `True` for the rest of the window -- silently swallowing a
+        REAL, later marker on this file's own opening lines and reading a
+        genuinely frozen file as NOT frozen. That is exactly the "never-
+        checked reads as checked-clean" failure this whole function exists
+        to rule out, and it is a strictly worse outcome than the comment
+        arm's own false-positive risk (a doc that quotes the marker
+        convention inside a fully-closed fence, with no other marker or
+        heading anywhere in the window, now IS treated as frozen and must
+        declare a `citations-resolve-at:` header it did not need before) --
+        an over-eager epoch-pin requirement on an unrelated doc is a
+        trivial, loud, easily-fixed false alarm; a silently un-pinned
+        frozen contract is not. The heading arm keeps its own fence
+        awareness because an ordinary markdown heading is a far more
+        common shape to appear, unquoted, inside someone else's fenced
+        example (e.g. "here's what a contract's own opening heading looks
+        like: `` ```\n# CONTRACT\n``` ``) than the far more distinctive,
+        deliberate `<!-- Frozen ... -->` HTML-comment shape is.
+
+    Deliberately NARROWER than `_plan_contract_scope`: a plan group's
+    OTHER `.md` files (a close-out `README.md` discussing or quoting the
+    frozen contract's own citations, for instance) live under the same
+    `_PLAN_CONTRACT_ROOTS` directory but are named something other than
+    `CONTRACT.md` and carry NEITHER marker shape -- they are not the
+    frozen, single-epoch artifact this convention exists to guard, and
+    typically cite a MIX of the contract's own frozen-epoch facts and the
+    CURRENT (HEAD-relative) tree in the same paragraph -- a single
+    whole-file epoch pin cannot honestly cover both, so such a file is
+    never forced to declare one. Requiring a `citations-resolve-at:` header
+    from every `.md` file in the directory (not just the one that actually
+    is/carries a frozen contract) would either force those genuinely-
+    HEAD-relative citations to mis-resolve against a stale pinned tree, or
+    force the companion doc to stop quoting the contract's own citation
+    text altogether -- neither of which the "never-checked equals
+    checked-clean" property this rule protects actually requires: that
+    property is about a genuinely FROZEN file never silently losing its
+    own check, not about every neighboring doc opting into the same
+    one-epoch-per-file model.
+    """
+    if not _plan_contract_scope(path):
+        return False
+    if path.name == "CONTRACT.md":
+        return True
+    window = text.splitlines()[:_CITATIONS_EPOCH_HEADER_SEARCH_LINES]
+    # RAW window, deliberately never `_non_fenced_lines(window)` -- see this
+    # function's own "Fences apply to the heading arm only" doc section.
+    for line in window:
+        if _FROZEN_MARKER_COMMENT_RE.search(line):
+            return True
+    for line in _non_fenced_lines(window):
+        stripped = line.lstrip()
+        if stripped.startswith("#"):
+            return bool(_FROZEN_HEADING_WORD_RE.search(stripped.lstrip("#").strip()))
+    return False
+
+
+_LS_TREE_CACHE: dict[tuple[str, str], list[str]] = {}
+
+
+def _ls_tree_paths(sha: str) -> list[str]:
+    """Every path in the tree at `sha`, repo-root-relative POSIX form --
+    `git ls-tree -r --name-only <sha>`, memoized per `(repo root, sha)` (a
+    throwaway test fixture repo and this real checkout never collide on the
+    same sha, but keying on both keeps that true by construction rather
+    than by accident). Empty on a `git` failure (an unknown sha reaching
+    here is already a `CitationError`-shaped case the caller's own
+    `_require_history`/ancestor check rules out first)."""
+    key = (str(_GIT_REPO_ROOT), sha)
+    if key not in _LS_TREE_CACHE:
+        proc = _run_git(["ls-tree", "-r", "--name-only", sha])
+        _LS_TREE_CACHE[key] = proc.stdout.splitlines() if proc.returncode == 0 else []
+    return _LS_TREE_CACHE[key]
+
+
+def _resolve_plan_contract_target(
+    cited_path: str, epoch_sha: str, basename_map: dict[str, str] | None = None
+) -> tuple[str | None, str | None]:
+    """`cited_path` (the `path` group of `_plan_contract_citation_like_re`)
+    resolved to a repo-root-relative POSIX path in the tree at `epoch_sha`,
+    or `(None, <error>)` if it cannot be resolved AT ALL -- FAIL CLOSED,
+    never a guess:
+
+      - A FULL-PATH citation (starts with a recognized
+        `_FULL_PATH_ROOT_PREFIXES` prefix) resolves directly, checked to
+        actually exist in the pinned tree (a full path is unambiguous by
+        construction, so there is no uniqueness question -- only
+        existence).
+      - A RELATIVE SUB-PATH (contains a `/` but does NOT start with a
+        recognized `_FULL_PATH_ROOT_PREFIXES` prefix -- e.g.
+        `ops/attention_block.rs`, CONTRACT.md's own Scope-facts shape)
+        resolves by a UNIQUE SUFFIX match against the pinned tree: the one
+        path that either EQUALS `cited_path` or ENDS WITH `/<cited_path>`.
+        Absent (no match) or AMBIGUOUS (more than one match) are BOTH hard
+        failures, never a silent first-match guess -- the same fail-closed
+        posture the bare-basename arm below already has, for the same
+        reason (this repo's crate layout genuinely repeats path suffixes
+        across crates, e.g. multiple `ops/attention_block.rs`-shaped
+        trees, not just bare filenames).
+      - A BARE BASENAME (no `/` at all) resolves by searching every path in
+        the pinned tree whose own basename matches exactly: absent (no
+        match) or AMBIGUOUS (more than one match -- this repo genuinely
+        reuses generic filenames like `main.rs`/`layer_norm.rs` across
+        crates, the exact class `_KNOWN_FILES`'s own module doc already
+        names as the reason a hand-registered map does not scale) are BOTH
+        hard failures, never a silent first-match guess -- UNLESS
+        `basename_map` (the file's own `citations-basename-map:` header,
+        see that function's doc) declares this exact basename, in which
+        case it is resolved via the map instead, subject to three checks
+        that make the map narrow the search space rather than assert an
+        unverifiable fact (module doc's "An ambiguous bare basename can be
+        disambiguated" section), checked in this ORDER (deliberately, see
+        below): (1) if `cited_path` is not even ambiguous to begin with --
+        one unique match already exists in the pinned tree without
+        consulting the map at all -- the declared path must BE that one
+        match, checked FIRST and independently of whether the declared
+        path would otherwise pass existence/basename validation (a map
+        entry disagreeing with an already-correct, unique resolution is
+        the more specific, more actionable finding -- "you added an
+        unnecessary and WRONG map entry" -- than a generic "does not
+        exist"/"wrong basename" one, and reporting it first means a bogus
+        declared value never masquerades as a mere existence/basename
+        typo); (2) the declared path must exist in this same pinned tree;
+        (3) its own basename must equal the map key. Any of the three
+        failing is a `Violation`, never a silent fall-through to the
+        unmapped ambiguity check below. `basename_map` is never consulted
+        for a relative sub-path (its own module doc's disambiguation
+        section is scoped to bare basenames only) -- an ambiguous sub-path
+        is cited more precisely instead.
+    """
+    if cited_path.startswith(_FULL_PATH_ROOT_PREFIXES):
+        tree = _ls_tree_paths(epoch_sha)
+        if cited_path not in tree:
+            return None, f"{cited_path} does not exist in the tree at pinned epoch {epoch_sha}"
+        return cited_path, None
+    tree = _ls_tree_paths(epoch_sha)
+    if "/" in cited_path:
+        sub_matches = sorted(
+            p for p in tree if p == cited_path or p.endswith("/" + cited_path)
+        )
+        if not sub_matches:
+            return None, (
+                f"{cited_path!r} (a relative sub-path) does not exist anywhere in the tree "
+                f"at pinned epoch {epoch_sha}"
+            )
+        if len(sub_matches) > 1:
+            return None, (
+                f"{cited_path!r} (a relative sub-path) is AMBIGUOUS in the tree at pinned "
+                f"epoch {epoch_sha} ({len(sub_matches)} matches: {', '.join(sub_matches)}) -- "
+                "cite the full path instead"
+            )
+        return sub_matches[0], None
+    matches = sorted(p for p in tree if p.rsplit("/", 1)[-1] == cited_path)
+    if basename_map is not None and cited_path in basename_map:
+        mapped = basename_map[cited_path]
+        if len(matches) == 1 and matches[0] != mapped:
+            # Checked FIRST, ahead of existence/basename validation below --
+            # see the docstring's ordering rationale. `cited_path` was
+            # ALREADY resolving correctly, unambiguously, on its own; the
+            # map has no business disagreeing with that, whether or not its
+            # own declared value happens to separately be well-formed.
+            return None, (
+                f"'citations-basename-map' maps {cited_path!r} to {mapped!r}, but {cited_path!r} "
+                f"already resolves uniquely to {matches[0]!r} in the pinned tree -- a map entry "
+                "must never re-point a citation away from its one true match"
+            )
+        if mapped not in tree:
+            return None, (
+                f"'citations-basename-map' maps {cited_path!r} to {mapped!r}, but {mapped!r} "
+                f"does not exist in the tree at pinned epoch {epoch_sha}"
+            )
+        mapped_basename = mapped.rsplit("/", 1)[-1]
+        if mapped_basename != cited_path:
+            return None, (
+                f"'citations-basename-map' maps {cited_path!r} to {mapped!r}, but that path's "
+                f"own basename is {mapped_basename!r}, not {cited_path!r} -- fix the map entry"
+            )
+        return mapped, None
+    if not matches:
+        return None, f"{cited_path!r} does not exist anywhere in the tree at pinned epoch {epoch_sha}"
+    if len(matches) > 1:
+        return None, (
+            f"{cited_path!r} is AMBIGUOUS in the tree at pinned epoch {epoch_sha} "
+            f"({len(matches)} matches: {', '.join(matches)}) -- cite the full path instead, or "
+            "add a 'citations-basename-map' header entry"
+        )
+    return matches[0], None
+
+
+def _check_plan_contract_citations(
+    path: Path, text: str, epoch_sha: str, basename_map: dict[str, str] | None = None
+) -> tuple[list[Violation], int]:
+    """Every `_plan_contract_citation_like_re` match in `text`, resolved
+    against the tree at `epoch_sha` (never HEAD -- this file's own
+    `citations-resolve-at` header already fixed that for the whole file).
+    Returns `(violations, checked)` -- `checked` is the total number of
+    citation-shaped tokens found (module doc's "assert coverage" clause),
+    whether they ultimately resolved, failed resolution, or were REPORTED
+    AS UNPARSED (never silently dropped from the count).
+
+    Two match shapes, walked in ONE `finditer` pass (document order matters
+    -- see below): a PATH citation (`path` + `lines` groups) and a bare
+    CONTINUATION (`clines` only, no path half -- `` `:1635` `` eliding a
+    path already named earlier on the SAME LINE). Per PATH citation: first
+    its `lines` half must fully match `_LINE_SPEC_FRAGMENT` -- a token
+    whose line-spec is not a bare digit range (e.g. stray trailing text, a
+    non-numeric spec) is itself a `Violation` ("could not be classified"),
+    never silently excluded from being a citation at all. Otherwise:
+    resolve the path (`_resolve_plan_contract_target`, fail-closed on
+    absent/ambiguous), then every individual line and range in the
+    comma-separated spec must be in-bounds for that file at that sha -- ALL
+    of them, not just the first (a `1-2, 10` spec where only `10` is out of
+    range is still a violation). A successfully-resolved path citation
+    becomes the CONTINUATION SCOPE for any bare `:<line-spec>` token that
+    follows it later on the same line; the scope resets (to "none") the
+    moment a match on a DIFFERENT line is seen, and also resets past a
+    PATH citation that itself failed to resolve (a broken citation is not a
+    valid basis for a later elision to lean on). A bare continuation seen
+    with no such scope in effect is itself a `Violation`, never silently
+    dropped or resolved against some earlier line's path. No
+    adjacent-identifier / content-match check for either shape (unlike
+    every other citation form in this file): this convention's own doc
+    names only resolution + in-bounds as what it gates, not a content
+    re-check.
+    """
+    violations: list[Violation] = []
+    checked = 0
+    lines_cache: dict[str, list[str] | None] = {}
+
+    def _lines(relpath: str) -> list[str] | None:
+        if relpath not in lines_cache:
+            lines_cache[relpath] = _lines_at_sha(epoch_sha, relpath)
+        return lines_cache[relpath]
+
+    def _check_bounds(cited_label: str, relpath: str, lines_spec: str, line_no: int) -> None:
+        target_lines = _lines(relpath)
+        if target_lines is None:
+            violations.append(
+                Violation(
+                    path, line_no,
+                    f"cites {cited_label} (resolved to {relpath}), but "
+                    f"`git show {epoch_sha}:{relpath}` could not read that file",
+                )
+            )
+            return
+        for part in lines_spec.split(","):
+            part = part.strip()
+            lo_s, _, hi_s = part.partition("-")
+            lo = int(lo_s)
+            hi = int(hi_s) if hi_s else lo
+            if lo < 1 or hi > len(target_lines) or lo > hi:
+                violations.append(
+                    Violation(
+                        path, line_no,
+                        f"cites {cited_label} but {relpath} only has "
+                        f"{len(target_lines)} lines at pinned epoch {epoch_sha} (range {part!r} "
+                        "does not fit)",
+                    )
+                )
+
+    pending_relpath: str | None = None
+    pending_line: int | None = None
+
+    for m in _plan_contract_citation_like_re().finditer(text):
+        line_no = text.count("\n", 0, m.start()) + 1
+        if pending_line is not None and line_no != pending_line:
+            # The continuation scope is SAME-LINE only -- a path citation
+            # named on an earlier line is never a valid basis for a later
+            # line's own bare `:<n>` elision.
+            pending_relpath = None
+        checked += 1
+
+        if m.group("path") is not None:
+            cited_path = m.group("path")
+            lines_spec = m.group("lines")
+            cited_label = f"{cited_path}:{lines_spec}"
+            if not _LINE_SPEC_ONLY_RE.match(lines_spec):
+                violations.append(
+                    Violation(
+                        path, line_no,
+                        f"citation-shaped token `{cited_label}` could not be "
+                        "classified: its line-spec half is not a bare "
+                        "`<line>[-<line>][, <line>[-<line>]]*` digit range -- fix the token, "
+                        "or rewrite it so it does not read as a path:line citation",
+                    )
+                )
+                pending_relpath, pending_line = None, line_no
+                continue
+            relpath, error = _resolve_plan_contract_target(cited_path, epoch_sha, basename_map)
+            if error is not None:
+                violations.append(Violation(path, line_no, f"cites {cited_label} but {error}"))
+                pending_relpath, pending_line = None, line_no
+                continue
+            _check_bounds(cited_label, relpath, lines_spec, line_no)
+            pending_relpath, pending_line = relpath, line_no
+            continue
+
+        # Bare continuation: `clines` is set, `path` is not (the two arms
+        # are mutually exclusive by construction -- see `_plan_contract_
+        # citation_like_re`'s own doc).
+        lines_spec = m.group("clines")
+        cited_label = f":{lines_spec}"
+        if not _LINE_SPEC_ONLY_RE.match(lines_spec):
+            violations.append(
+                Violation(
+                    path, line_no,
+                    f"citation-shaped token `{cited_label}` could not be "
+                    "classified: its line-spec half is not a bare "
+                    "`<line>[-<line>][, <line>[-<line>]]*` digit range -- fix the token, "
+                    "or rewrite it so it does not read as a path:line citation",
+                )
+            )
+            pending_line = line_no
+            continue
+        if pending_relpath is None:
+            violations.append(
+                Violation(
+                    path, line_no,
+                    f"cites the bare continuation `{cited_label}` but no path:line citation "
+                    "resolves earlier on this same line for it to elide -- a bare line-spec "
+                    "token with no preceding path IN SCOPE is refused, never silently guessed "
+                    "against an earlier line's path",
+                )
+            )
+            pending_line = line_no
+            continue
+        _check_bounds(
+            f"{cited_label} (eliding the path resolved earlier on this line)",
+            pending_relpath, lines_spec, line_no,
+        )
+        pending_line = line_no
+        # `pending_relpath` is left in place: a THIRD elided `:<n>` later on
+        # the SAME line continues to resolve against the SAME preceding
+        # path, not just the immediately-prior token.
+    return violations, checked
 
 
 def _rust_string_prefix_len(text: str, i: int, n: int) -> int:
@@ -760,11 +1650,12 @@ def _rust_comment_line_spans(text: str) -> list[tuple[int, int]]:
     `_CRATE_COMMENT_ROOTS`).
 
     Getting the char-literal case right is load-bearing, not cosmetic: an
-    unhandled `'"'`/`b'"'` char literal's embedded `"` used to be misread
-    as OPENING an ordinary string, which then stayed open (there is no
-    closing `"` inside the char literal to pair against) until the NEXT
-    unrelated `"` anywhere later in the file -- silently swallowing every
-    real comment line in between as unscanned "string content".
+    unhandled `'"'`/`b'"'` char literal's embedded `"` would otherwise be
+    misread as OPENING an ordinary string, which would then stay open
+    (there is no closing `"` inside the char literal to pair against) until
+    the NEXT unrelated `"` anywhere later in the file -- silently
+    swallowing every real comment line in between as unscanned "string
+    content".
 
     Block comments are ALWAYS tracked (so their `//`-shaped or `"`-shaped
     content never confuses the rest of this scan) but their CONTENT is
@@ -895,15 +1786,27 @@ def _rust_comment_line_spans(text: str) -> list[tuple[int, int]]:
     return spans
 
 
-def _full_path_mode(path: Path) -> str | None:
+def _full_path_mode(path: Path, text: str) -> str | None:
     """Which full-path citation scanning mode applies to `path`, or `None`
     if the full-path form is disabled for it entirely (module doc's "The
     full-path form's coverage extension" section):
 
       - `"text"`: the ENTIRE file text is scanned -- `_DOC_SEARCH_ROOTS`
-        (any suffix; the original scope) and `_PERF_FULL_PATH_ROOTS`
+        (any suffix; the original scope), `_PERF_FULL_PATH_ROOTS`
         (`.sh`/`.py` only, excluding this checker's own implementation and
-        test file, `_PERF_FULL_PATH_EXCLUDE`).
+        test file, `_PERF_FULL_PATH_EXCLUDE`), and a `_PLAN_CONTRACT_ROOTS`
+        `.md` file that carries NO well-formed `citations-resolve-at:`
+        header (module doc's "Never-checked must never read as
+        checked-clean" section: such a file is HEAD-relative by
+        definition -- never epoch-pinned, since it declared no epoch to
+        pin against -- so it gets the SAME whole-file-text full-path scan
+        `_DOC_SEARCH_ROOTS`/`_PERF_FULL_PATH_ROOTS` already get, rather
+        than silently carrying zero full-path coverage the way a bare
+        `.md` file outside every scope above would; an EPOCH-PINNED file
+        under this same root is deliberately excluded here -- its
+        full-path citations are resolved sha-relative to its own epoch by
+        `_check_plan_contract_citations` instead, never HEAD-relative
+        through this scan).
       - `"comments"`: only Rust LINE-comment text is scanned (via
         `_rust_comment_line_spans`) -- `_CRATE_COMMENT_ROOTS` (`.rs` only).
       - `None`: the full-path form does not apply; only the basename form
@@ -919,6 +1822,10 @@ def _full_path_mode(path: Path) -> str | None:
         return "text"
     if path.suffix == ".rs" and _is_under(path, _CRATE_COMMENT_ROOTS):
         return "comments"
+    if path.suffix == ".md" and _is_under(path, _PLAN_CONTRACT_ROOTS):
+        epoch_sha, _epoch_header_error = _file_citations_epoch(path, text)
+        if epoch_sha is None:
+            return "text"
     return None
 
 
@@ -934,7 +1841,7 @@ def _cited_targets(path: Path, text: str) -> list[tuple[int, str, Path, int]]:
     its more specific form.
     """
     spans: list[tuple[int, int, str, Path, int]] = []
-    mode = _full_path_mode(path)
+    mode = _full_path_mode(path, text)
     if mode == "text":
         for m in _full_path_citation_re().finditer(text):
             rel = m.group("path")
@@ -1027,12 +1934,11 @@ def _find_adjacent_identifier(ident_spans: list[re.Match], citation_start: int) 
     opening backtick outside the slice, only its closing backtick inside),
     which silently shifts which backticks pair with which for every
     subsequent match in that slice -- a dense table row with several
-    citations close together can trip this (round-4 audit fold-in on PR
-    #372's own row_lengths addition hit it: a `` `...` `` pair straddling
-    the 300-char boundary made the NEXT citation's adjacent-identifier
-    lookup misfire on a truncated fragment like `') | '`). Operating on
-    globally-paired spans and only then filtering to the lookback window
-    makes that class of misparse structurally unreachable.
+    citations close together can trip this (a `` `...` `` pair straddling
+    an arbitrary slice boundary makes the NEXT citation's adjacent-
+    identifier lookup misfire on a truncated fragment like `') | '`).
+    Operating on globally-paired spans and only then filtering to the
+    lookback window makes that class of misparse structurally unreachable.
     """
     window_start = max(0, citation_start - _SEARCH_WINDOW)
     candidates = [m for m in ident_spans if m.end() <= citation_start and m.start() >= window_start]
@@ -1109,7 +2015,8 @@ def _iter_source_files():
     """
     seen = set()
     scoped_roots: list[tuple[Path, tuple[str, ...]]] = [
-        (root, _ALL_SCAN_SUFFIXES) for root in (*_SEARCH_ROOTS, *_DOC_SEARCH_ROOTS)
+        (root, _ALL_SCAN_SUFFIXES)
+        for root in (*_SEARCH_ROOTS, *_DOC_SEARCH_ROOTS, *_PLAN_CONTRACT_ROOTS)
     ]
     scoped_roots += [(root, (".rs",)) for root in _CRATE_COMMENT_ROOTS]
     for root, suffixes in scoped_roots:
@@ -1126,19 +2033,37 @@ def _iter_source_files():
             yield path
 
 
-def _check_file_impl(path: Path) -> tuple[list[Violation], list[Exemption]]:
+def _check_file_impl(
+    path: Path,
+) -> tuple[list[Violation], list[Exemption], list[tuple[Path, int]], list[tuple[Path, int, str]]]:
     """The real per-file scan: `check_file` (kept, unchanged signature, for
     every existing caller/test that only wants the failing findings) is a
-    thin wrapper discarding the second element. `main()` calls this
+    thin wrapper discarding the other three elements. `main()` calls this
     directly so it can also print the non-failing EXEMPT lines the
-    three-way split's case 3 produces (see module doc).
+    three-way split's case 3 produces (see module doc), the frozen-contract
+    CITATION COVERAGE the third element carries: a `(path, count)` entry
+    per `_plan_contract_scope` file this call actually scanned for that
+    citation form, `count` being the number of citation-shaped tokens
+    `_check_plan_contract_citations` found and classified (module doc's
+    "assert coverage" clause) -- empty for every other file, and empty
+    (never populated) for a plan-contract file whose missing epoch header
+    made this scan a whole-file `Violation` instead (there is nothing to
+    count when the file was never opted in) -- and the UNSEEN-SUFFIX
+    diagnostic tokens the fourth element carries: a `(path, line_no, token)`
+    entry per backtick-quoted path-like token this EPOCH-PINNED file
+    carries whose extension `_FULL_PATH_SUFFIXES` does not recognize
+    (module doc's "An unseen-suffix path-like token is a diagnostic, never
+    a Violation" section) -- empty for every non-epoch-pinned file, and
+    never gating a `Violation` regardless of how many are found.
     """
     violations: list[Violation] = []
     exemptions: list[Exemption] = []
+    plan_contract_coverage: list[tuple[Path, int]] = []
+    unseen_suffix_diagnostics: list[tuple[Path, int, str]] = []
     try:
         text = path.read_text()
     except (UnicodeDecodeError, OSError):
-        return violations, exemptions
+        return violations, exemptions, plan_contract_coverage, unseen_suffix_diagnostics
 
     # This citing file's own evidence sha, if it is a qualifying artifact --
     # computed ONCE per file (not per citation): every citation inside the
@@ -1156,6 +2081,117 @@ def _check_file_impl(path: Path) -> tuple[list[Violation], list[Exemption]]:
     if artifact_sha is not None:
         _require_history()
         sha_is_ancestor = _is_ancestor(artifact_sha)
+
+    # A frozen pre-registration's own whole-file epoch pin (module doc's "A
+    # frozen pre-registration's citations are pinned to their own epoch"
+    # section) -- computed ONCE per file, same as `artifact_sha`, and
+    # mutually exclusive with it by construction (`.md` vs `.json` under
+    # `artifacts/` never overlap on the same file). Unlike `artifact_sha`'s
+    # non-ancestor case (EXEMPT, historical evidence that may legitimately
+    # predate this repo's merge-commit discipline), a bad epoch header
+    # here FAILS CLOSED for the whole file, immediately, before any
+    # per-citation resolution: a frozen contract's declared epoch is
+    # reviewed, reachable prose about THIS branch's own history, so a
+    # malformed value or a non-ancestor sha is a wrong or fabricated
+    # header, never a legitimate reason to fall back to ordinary
+    # HEAD-relative resolution (which would silently paper over the exact
+    # drift this convention exists to pin against).
+    epoch_sha, epoch_header_error = _file_citations_epoch(path, text)
+    if epoch_header_error is not None:
+        violations.append(
+            Violation(
+                path, 1,
+                f"{epoch_header_error} -- fix the header (or remove it, which reverts this "
+                "file to ordinary HEAD-relative citation resolution)",
+            )
+        )
+        return violations, exemptions, plan_contract_coverage, unseen_suffix_diagnostics
+    if epoch_sha is not None:
+        _require_history()
+        if not _is_ancestor(epoch_sha):
+            violations.append(
+                Violation(
+                    path, 1,
+                    f"declares 'citations-resolve-at: {epoch_sha}', but that sha is NOT an "
+                    "ancestor of HEAD -- a frozen pre-registration's declared epoch must be "
+                    "real, reachable history on this branch (never EXEMPT the way pre-merge-"
+                    "commit-discipline artifact evidence can be); fix the pinned sha",
+                )
+            )
+            return violations, exemptions, plan_contract_coverage, unseen_suffix_diagnostics
+
+        # This file IS epoch-pinned, and its declared epoch is real,
+        # reachable history -- module doc's "An unseen-suffix path-like
+        # token is a diagnostic, never a Violation" section: a diagnostic
+        # only, collected here (never in the `else` branch below, which
+        # covers ordinary HEAD-relative files this scope was never meant to
+        # widen into).
+        for line_no, token in _unseen_path_like_tokens(text):
+            unseen_suffix_diagnostics.append((path, line_no, token))
+
+    # This file's own optional disambiguation map (module doc's "An
+    # ambiguous bare basename can be disambiguated by a declared header
+    # map" section) -- parsed unconditionally alongside the epoch header
+    # (a malformed entry is a whole-file FAIL, same shape as a malformed
+    # epoch sha), but only ever CONSULTED below when a plan-contract bare
+    # basename actually needs it (`_resolve_plan_contract_target`).
+    basename_map, map_header_error = _file_citations_basename_map(path, text)
+    if map_header_error is not None:
+        violations.append(
+            Violation(
+                path, 1,
+                f"{map_header_error} -- fix the header (or remove it, which reverts every "
+                "ambiguous basename in this file to the ordinary fail-closed AMBIGUOUS check)",
+            )
+        )
+        return violations, exemptions, plan_contract_coverage, unseen_suffix_diagnostics
+
+    # A `_PLAN_CONTRACT_ROOTS` file's own bare-basename / full-path /
+    # relative-sub-path `path:line[-line][, line[-line]]*` citations
+    # (module doc's "A frozen pre-registration's citations are pinned to
+    # their own epoch" section) -- opt-IN twice over (the file must both
+    # live under the named plan group AND carry the epoch header checked
+    # above), never identifier-adjacent, so this is a SEPARATE scan from
+    # the `_cited_targets` loop below (whose forms never match this file's
+    # own bare-basename prose at all: none of `trainer.rs`/
+    # `finetune_run.rs`/etc. are `_KNOWN_FILES` entries or under any of the
+    # other full-path roots).
+    #
+    # NEVER-CHECKED MUST NEVER READ AS CHECKED-CLEAN (module doc's
+    # "coverage" clause), scoped to `_is_frozen_contract_file` (a file
+    # recognized by its OWN declared frozen marker, NEVER by its filename,
+    # and NEVER every `.md` file under `_PLAN_CONTRACT_ROOTS` -- see that
+    # predicate's own doc for why a companion doc like `README.md` is
+    # deliberately exempt from the MANDATORY-header rule while still being
+    # free to opt a citation into this form voluntarily): a frozen contract
+    # that does NOT carry a well-formed epoch header (`epoch_sha is None`
+    # -- either the header is genuinely absent, or it landed past
+    # `_CITATIONS_EPOCH_HEADER_SEARCH_LINES` and therefore reads
+    # byte-for-byte like absent) is a whole-file `Violation` here, not a
+    # silent skip -- the OLD behaviour (skip, zero violations) is
+    # indistinguishable from "every citation in this file resolves", which
+    # is exactly the false-negative shape a reviewer or a later gate would
+    # trust.
+    if _is_frozen_contract_file(path, text) and epoch_sha is None:
+        violations.append(
+            Violation(
+                path, 1,
+                f"{path} carries a declared FROZEN marker under _PLAN_CONTRACT_ROOTS "
+                "(an HTML comment opening with 'Frozen', or a first heading naming it a "
+                "contract) but declares no 'citations-resolve-at:' header in its "
+                f"first {_CITATIONS_EPOCH_HEADER_SEARCH_LINES} lines -- a frozen "
+                "pre-registration's path:line citations must be pinned to an epoch and "
+                "mechanically checked, never silently skipped because the header is absent "
+                "or landed past the search window (which reads identically to absent); add "
+                "the header near the top of the file",
+            )
+        )
+    elif epoch_sha is not None and _plan_contract_scope(path):
+        pc_violations, pc_checked = _check_plan_contract_citations(
+            path, text, epoch_sha, basename_map
+        )
+        violations.extend(pc_violations)
+        plan_contract_coverage.append((path, pc_checked))
 
     for citation_start, cited_label, target_path, cited_line in _cited_targets(path, text):
         # `cited_file` keeps naming the citation exactly as the doc wrote it
@@ -1235,6 +2271,46 @@ def _check_file_impl(path: Path) -> tuple[list[Violation], list[Exemption]]:
                         path, source_line_no,
                         f"cites {cited_file}:{cited_line} but that file only has "
                         f"{len(target_lines)} lines at this artifact's own git_sha {artifact_sha}",
+                    )
+                )
+                continue
+        elif epoch_sha is not None:
+            # This citing file's own whole-file epoch header pins it --
+            # sha-relative resolve against THAT commit's tree, never
+            # against HEAD. Ancestry was already checked, fail-closed,
+            # once for the whole file above -- reaching here means
+            # `epoch_sha` IS an ancestor, so a `git show` miss below is a
+            # real finding about THIS citation (case 2's shape), never an
+            # EXEMPT (there is no non-ancestor case left to reach this
+            # branch at all).
+            relpath = _git_relpath(target_path)
+            if relpath is None:
+                violations.append(
+                    Violation(
+                        path, source_line_no,
+                        f"cites {cited_file} sha-relative to this file's own "
+                        f"'citations-resolve-at: {epoch_sha}' header, but {target_path} does not "
+                        f"resolve under {_GIT_REPO_ROOT} for `git show`",
+                    )
+                )
+                continue
+            target_lines = _lines_at_sha(epoch_sha, relpath)
+            if target_lines is None:
+                violations.append(
+                    Violation(
+                        path, source_line_no,
+                        f"cites {cited_file}:{cited_line} sha-relative to this file's own "
+                        f"'citations-resolve-at: {epoch_sha}' header (an ancestor of HEAD), but "
+                        f"`git show {epoch_sha}:{relpath}` could not read that file at that sha",
+                    )
+                )
+                continue
+            if cited_line < 1 or cited_line > len(target_lines):
+                violations.append(
+                    Violation(
+                        path, source_line_no,
+                        f"cites {cited_file}:{cited_line} but that file only has "
+                        f"{len(target_lines)} lines at this file's own pinned epoch {epoch_sha}",
                     )
                 )
                 continue
@@ -1332,6 +2408,19 @@ def _check_file_impl(path: Path) -> tuple[list[Violation], list[Exemption]]:
                         "number, or the sha it should have cited, is wrong and needs a hand fix)",
                     )
                 )
+            elif epoch_sha is not None:
+                violations.append(
+                    Violation(
+                        path, source_line_no,
+                        f"cites {cited_file}:{cited_line} for identifier {ident!r}, but that line "
+                        f"reads {cited_line_text.strip()!r} at this file's own pinned epoch "
+                        f"{epoch_sha} -- the citation was never true at the tree this file's header "
+                        "declares (a frozen pre-registration's citations are append-only, "
+                        "sha-relative to its own epoch -- never re-resolved against HEAD; the "
+                        "citation's line number needs a hand fix, which requires un-freezing this "
+                        "file first)",
+                    )
+                )
             elif pin_sha is not None:
                 violations.append(
                     Violation(
@@ -1352,24 +2441,28 @@ def _check_file_impl(path: Path) -> tuple[list[Violation], list[Exemption]]:
                         "since this was written); re-resolve it against the file at HEAD",
                     )
                 )
-    return violations, exemptions
+    return violations, exemptions, plan_contract_coverage, unseen_suffix_diagnostics
 
 
 def check_file(path: Path) -> list[Violation]:
-    violations, _exemptions = _check_file_impl(path)
+    violations, _exemptions, _plan_contract_coverage, _unseen_suffix_diagnostics = _check_file_impl(path)
     return violations
 
 
 def main() -> int:
     all_violations: list[Violation] = []
     all_exemptions: list[Exemption] = []
+    all_plan_contract_coverage: list[tuple[Path, int]] = []
+    all_unseen_suffix_diagnostics: list[tuple[Path, int, str]] = []
     checked = 0
     try:
         for path in _iter_source_files():
             checked += 1
-            v, e = _check_file_impl(path)
+            v, e, pc, u = _check_file_impl(path)
             all_violations.extend(v)
             all_exemptions.extend(e)
+            all_plan_contract_coverage.extend(pc)
+            all_unseen_suffix_diagnostics.extend(u)
     except CitationError as exc:
         print(f"check-citations: FAIL (uncomputable) — {exc}", file=sys.stderr)
         return 1
@@ -1382,6 +2475,36 @@ def main() -> int:
         )
         for e in all_exemptions:
             print(f"  - EXEMPT: {e}")
+
+    if all_plan_contract_coverage:
+        # Module doc's "assert coverage" clause: a per-pinned-file count of
+        # citations CHECKED, printed unconditionally (pass or fail) so
+        # "checked" is never conflated with "checked clean" -- a reader (or
+        # a future regression) can see the count move.
+        print("check-citations: frozen-contract citation coverage:")
+        for cpath, count in all_plan_contract_coverage:
+            try:
+                rel = cpath.relative_to(REPO_ROOT)
+            except ValueError:
+                rel = cpath
+            print(f"  - {rel}: {count} citation(s) checked")
+
+    if all_unseen_suffix_diagnostics:
+        # Module doc's "An unseen-suffix path-like token is a diagnostic,
+        # never a Violation" section: named and printed unconditionally
+        # (pass or fail), never gating CI -- the blind spot every citation
+        # recognizer in this file has for a suffix `_FULL_PATH_SUFFIXES`
+        # does not list, made visible rather than silent.
+        print(
+            "check-citations: unseen path-like token(s) outside _FULL_PATH_SUFFIXES "
+            "(diagnostic only, never a Violation):"
+        )
+        for upath, line_no, token in all_unseen_suffix_diagnostics:
+            try:
+                rel = upath.relative_to(REPO_ROOT)
+            except ValueError:
+                rel = upath
+            print(f"  - {rel}:{line_no}: {token}")
 
     if all_violations:
         print("check-citations: FAIL", file=sys.stderr)

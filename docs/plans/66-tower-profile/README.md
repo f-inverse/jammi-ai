@@ -31,6 +31,7 @@ All 12 legs are VALID; the BF16 pre-flight (P2) passes on all three towers. Sour
 
 | tower | leg | dtype | wall s/step | front s/step | GPU busy s/step | residual s/step | front % of wall | busy % of wall |
 |---|---|---|---:|---:|---:|---:|---:|---:|
+<!-- profile-421-generated: measured-towers-table -->
 | CLIP-text | A1 | f32 | 0.1004 | 0.0000 | 0.0608 | 0.0396 | 0.0 | 60.5 |
 | CLIP-text | A2 | bf16 | 0.0965 | 0.0000 | 0.0414 | 0.0551 | 0.0 | 42.9 |
 | CLIP-text | D1 (LoRA+LN eager) | f32 | 0.1486 | 0.0000 | 0.0895 | 0.0591 | 0.0 | 60.2 |
@@ -43,6 +44,7 @@ All 12 legs are VALID; the BF16 pre-flight (P2) passes on all three towers. Sour
 | HTSAT | A2 | bf16 | 1.5005 | 1.2516 | 0.1883 | 0.0606 | 83.4 | 12.6 |
 | HTSAT | D1 (LoRA+LN+GELU eager) | f32 | 1.6895 | 1.2493 | 0.3488 | 0.0914 | 73.9 | 20.6 |
 | HTSAT | D2 (LoRA eager) | f32 | 1.6329 | 1.2550 | 0.2953 | 0.0826 | 76.9 | 18.1 |
+<!-- /profile-421-generated -->
 
 `front` is a direct measurement (`media_front_end_wall_s`), never `wall − busy`; text legs
 carry `front = 0` by the contract's own stated boundary (tokenization stays in the
@@ -77,6 +79,7 @@ non-decision-grade, see the deviation below; HTSAT has no candidate port under t
 contract, so that never blocks a candidate-port decision — no candidate is F32-only by
 consequence):
 
+<!-- profile-421-generated: candidate-reasons -->
 - **`C-ATTN-clip-text`** — UNRESOLVED: "neither ACTIVATE (s_wall>=10% on any decision-grade
   leg) nor DECLINE (combined share <5% on every decision-grade leg) — clip-text-A1:
   s_wall+U_wall=0.1030, s_busy+U_busy=0.1703; clip-text-A2: s_wall+U_wall=0.0878,
@@ -93,6 +96,7 @@ consequence):
   decision-grade leg) nor DECLINE (combined share <5% on every decision-grade leg) —
   clip-vision-A1: s_wall+U_wall=0.0387, s_busy+U_busy=0.0680; clip-vision-A2:
   s_wall+U_wall=0.0319, s_busy+U_busy=0.0898"
+<!-- /profile-421-generated -->
 
 **No port is licensed under #421.** No candidate clears ACTIVATE (`s_wall>=10%` on any
 decision-grade leg) or DECLINE (both `s_wall+U_wall<5%` AND `s_busy+U_busy<5%` on every
@@ -108,6 +112,7 @@ on either side.
 
 ### Findings (verbatim text from the artifact's `findings`)
 
+<!-- profile-421-generated: findings -->
 - **`htsat-front-end-bound`**: "The HTSAT training step is CPU front-end-bound: front-end
   share of wall is 81-83% across the F32/BF16 decision legs (audio decode/resample/STFT/mel
   dominating wall time), dtype- and arm-invariant."
@@ -121,6 +126,7 @@ on either side.
   at every stage) sits OUTSIDE the fixed-head-dim port tier by the contract's own
   declaration — this stays a measured, OPEN number, never folded into UNATTRIBUTED and
   never decided under this issue."
+<!-- /profile-421-generated -->
 
 The HTSAT front-end finding is the next line of work, not under #421 — it is being closed
 on `perf/421-frontend` (PR #471), a separate, sibling unit; this doc does not duplicate its
@@ -164,6 +170,27 @@ mechanism, only points at it.
   about the suite's size, not a method parameter any decision rule reads, so this staleness
   never affected a verdict. `docs/maintainer/fine-tune-performance-guide.md` and
   `CHANGELOG.md` both already avoid citing a bare, drifting count for this suite.
+- **`CONTRACT.md`'s Scope-facts section carries three bare-basename citations that are
+  mechanically AMBIGUOUS at its own pinned epoch (`bff1fad6`), not stale.** `check_citations.py`'s
+  new `docs/plans/66-tower-profile`-scoped citation form resolves a bare `` `<basename>.rs:<line>` ``
+  by searching the pinned tree for a unique match; at `bff1fad6` this repo already has THREE
+  `layer_norm.rs` files (`crates/jammi-encoders/src/layer_norm.rs`,
+  `crates/jammi-kernels/src/cuda/layer_norm.rs`, `crates/jammi-kernels/src/ops/layer_norm.rs`) and
+  TEN `main.rs` files across crate/test binaries, so `` `layer_norm.rs:129, 552-583` `` (Scope
+  facts, para 1) and the two `` `main.rs:115-223` ``/`` `main.rs:1389-1400` `` citations (Scope
+  facts, para 5) each resolve to more than one candidate by basename alone — the checker fails
+  closed (AMBIGUOUS, never a first-match guess) rather than resolve silently to the wrong file.
+  The intended targets are, in fact, correct and resolvable by full path
+  (`crates/jammi-encoders/src/layer_norm.rs:129, 552-583` for the LayerNorm citation;
+  `crates/jammi-bench/src/main.rs:115-223`/`:1389-1400` for both `main.rs` citations — verified by
+  hand against `bff1fad6`), but the frozen body is never edited post-freeze (this same section's
+  own `citations-resolve-at` header note) to rewrite them as full paths. `check_citations.py`
+  therefore reports these three lines as violations on a real run; this is a known, recorded
+  limitation of citing a shared filename by basename in a repo that legitimately reuses
+  `main.rs`/`layer_norm.rs` across crates, not a content-drift finding, and is left for a human
+  decision (rewrite the frozen citations to full paths in a follow-on, non-freeze-violating edit,
+  or accept the gate's non-green status for this one file) rather than an autonomous tightening or
+  loosening of the gate.
 
 ## PR trail
 

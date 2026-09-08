@@ -212,8 +212,13 @@ workspace ships every publishable crate at the same
   row that could trip the attribution's known-kernel-name gate) without moving any top-line
   `gpu_kernel_us_per_step`/wall/front/busy number. **No kernel port lands under #421**: all four
   candidate ports the contract named (`C-ATTN-CLIP-text`, `C-MLP-CLIP-text`, `C-ATTN-CLIP-vision`,
-  `C-MLP-CLIP-vision`) resolve **UNRESOLVED** — every one sits in the contract's 5–10 % band, on
-  both the F32 and BF16 decision legs. The already-fused chains' realized gains, per step: C-LORA
+  `C-MLP-CLIP-vision`) resolve **UNRESOLVED** — none clears ACTIVATE (`s_wall≥10%` on any
+  decision-grade leg) or DECLINE (combined share <5% on wall AND busy on every decision-grade
+  leg), F32 and BF16 alike. This is not uniform across candidates or axes: only C-MLP's own
+  combined *busy* share (`s_busy+U_busy`, 6.80–8.98 % across the CLIP towers) lands in the
+  contract's 5–10 % band — its wall-axis share stays 2.66–3.95 % throughout, well under the 5 %
+  DECLINE floor — while C-ATTN's combined busy shares run 11–20 %, entirely outside that band.
+  The already-fused chains' realized gains, per step: C-LORA
   +32.6 ms (CLIP-text, 32.4 % of wall), +30.3 ms (CLIP-vision, 26.4 %), +82.9 ms (HTSAT, 5.4 %);
   C-LN +15.6 ms (CLIP-text), +20.8 ms (CLIP-vision); the joint C-LN+C-GELU-HTSAT chain +56.6 ms
   (3.6 %). Findings: the HTSAT training step is CPU front-end-bound (audio decode/resample/STFT/mel

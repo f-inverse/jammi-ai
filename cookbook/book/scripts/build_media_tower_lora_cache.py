@@ -31,16 +31,20 @@ derived tolerance this book adds):
    checkpoint and through the LoRA-adapted checkpoint, must differ — the
    adapter actually moved the tower's representation. (Direction/quality is not
    claimed; only that training moved something.) This is trained and measured
-   TWICE, independently, per tower — the observed spread between the two
-   independent runs is what derives this metric's committed tolerance (see
-   ``tolerance_derivation`` below): a fixed literal tolerance asserts nothing
-   about how noisy the underlying measurement actually is.
+   TWICE, independently, per tower, under the SAME pinned seed — the observed
+   spread between those two same-seed runs is what a re-emit tolerance actually
+   needs: same-seed re-emit nondeterminism. The committed tolerance is
+   ``max(SPREAD_K * spread, PRECISION_FLOOR)`` (see ``tolerance_derivation``
+   below): on this box, training is bit-deterministic under the fixed seed, the
+   observed spread is exactly 0.0, and PRECISION_FLOOR — a constant, the
+   record's own 6-decimal rounding resolution — binds instead.
 2. **The same-input control.** The SAME probe input encoded TWICE through the
    SAME (base) checkpoint, in two independent ``db.infer`` calls. Any nonzero
    diff observed in (1) could otherwise be inference noise rather than a real
    parameter change; this control is what rules that out, AND it is what
-   derives the "change must exceed this floor" threshold a chapter asserts —
-   the floor is a multiple of this measured control, never a bare literal.
+   derives the "change must exceed this floor" threshold a chapter asserts:
+   ``max(FLOOR_K * control, PRECISION_FLOOR)``. On this box the measured
+   control is also exactly 0.0, so PRECISION_FLOOR binds here too.
 3. **The round trip — a REAL process restart.** After a job completes, this
    script closes the training connection, TERMINATES the `jammi-server` OS
    process, and starts a BRAND NEW process against the SAME on-disk
@@ -60,12 +64,15 @@ derived tolerance this book adds):
    tower `task=` did not select.
 5. **The corrupt-media-row `_status`/`_error` contract, in BOTH input arms.**
    `docs/guide/src/generate-image-embeddings.md`'s Error-handling table
-   documents two accepted column shapes — inline bytes (`Binary`) and file
-   paths (`Utf8`) — and the SAME per-row contract for both. This script runs a
-   mixed batch (one valid row, one null row, one undecodable row) through EACH
-   arm, for both image and audio, and — rather than a substring check — asserts
-   the Arrow row index NAMED IN THE ERROR MESSAGE against the row's ACTUAL
-   position in the batch.
+   documents two accepted column shapes — inline bytes and file paths. Every
+   source this script registers is a Parquet source (`add_source(...,
+   format="parquet")`); DataFusion's default `schema_force_view_types=true`
+   materialises the inline-bytes column as `BinaryView` and the path column as
+   `Utf8View` — the arms a Parquet-backed consumer actually hits — and the SAME
+   per-row contract holds for both. This script runs a mixed batch (one valid
+   row, one null row, one undecodable row) through EACH arm, for both image and
+   audio, and — rather than a substring check — asserts the Arrow row index
+   NAMED IN THE ERROR MESSAGE against the row's ACTUAL position in the batch.
 6. **Provenance.** No sha is exposed anywhere on the shipped surface for THIS
    engine commit (`get_server_info()` carries `version`/`features`/
    `storage_backends`/`services` only — no build sha; the `jammi-ai` wheel
@@ -140,16 +147,24 @@ BATCH = 4
 LORA_RANK = 4
 
 # Tolerance derivation constants — stated here, never re-typed as bare literals
-# at the call sites below.
+# at the call sites below. `change_tol = max(SPREAD_K * spread, PRECISION_FLOOR)`
+# and `change_floor = max(FLOOR_K * control, PRECISION_FLOOR)`: the multiplier
+# (SPREAD_K/FLOOR_K) applies to a MEASURED quantity (this cache's own observed
+# spread/control); PRECISION_FLOOR is the one constant in the expression, and
+# it is a floor under the derived term, never a substitute for measuring it.
 REPEATS = 2  # independent LoRA trainings per tower, to OBSERVE a re-emit spread
 SPREAD_K = 5.0  # change_vs_base tol = SPREAD_K * the observed |repeat_b - repeat_a| spread
 FLOOR_K = 10.0  # change-must-exceed floor = FLOOR_K * that tower's OWN measured control
 # The golden files round every metric to 6 decimals (`round(x, 6)`): a "spread"
-# or "control" of exactly 0.0 (a perfectly deterministic GPU forward pass, which
-# the same-input control below has in fact measured) would otherwise derive a
-# tolerance/floor of exactly 0.0 too — technically correct but brittle against
-# the record's own rounding. PRECISION_FLOOR is that rounding resolution, used
-# as a floor under (never instead of) the derived value.
+# or "control" of exactly 0.0 would otherwise derive a tolerance/floor of
+# exactly 0.0 too — technically correct but brittle against the record's own
+# rounding. PRECISION_FLOOR is that rounding resolution, used as a floor under
+# (never instead of) the derived value. On this box both quantities DID
+# measure exactly 0.0 (training is bit-deterministic under the fixed seed, and
+# the same-input control's two forward passes over the same checkpoint agreed
+# bit-for-bit), so PRECISION_FLOOR is the term that actually binds in the
+# committed record — see the per-tower `tolerance_derivation` print below,
+# which names which term bound rather than printing a false equation.
 PRECISION_FLOOR = 1e-6
 
 # A round-trip diff is not a noisy measurement like change-vs-base: either the
@@ -539,7 +554,13 @@ def measure_tower(
             "precision_floor": PRECISION_FLOOR,
         },
         "round_trip": {
-            "server_restarted": True,
+            # Derived from the pid pair, never a hard-coded literal: a real OS
+            # restart is a distinct pid, and (since the record also carries
+            # wall-clock start times) a strictly later start time.
+            "server_restarted": (
+                restart["before"]["pid"] != restart["after"]["pid"]
+                and restart["after"]["start_time"] > restart["before"]["start_time"]
+            ),
             "before": restart["before"],
             "after": restart["after"],
         },
@@ -576,9 +597,11 @@ def measure_corrupt_rows(
 ) -> dict:
     """The real per-row behavior for a NULL row and a CORRUPT (undecodable)
     row, in the SAME batch as a valid row — measured, never assumed from the
-    doc table. `input_mode` is `"bytes"` (an inline `Binary` column) or
-    `"path"` (a `Utf8` column of file paths, the guide's OTHER documented
-    input shape) — the corrupt row's underlying file EXISTS and is readable in
+    doc table. `input_mode` is `"bytes"` (an inline-bytes column) or `"path"`
+    (a column of file paths, the guide's OTHER documented input shape) — both
+    registered as a Parquet source, which DataFusion's default
+    `schema_force_view_types=true` materialises as `BinaryView`/`Utf8View`
+    respectively. The corrupt row's underlying file EXISTS and is readable in
     both modes, so the failure is a genuine per-row DECODE failure, matching
     `docs/guide/src/generate-image-embeddings.md`'s Error-handling table (a
     missing/unreadable path is instead documented, in `arrow_to_images`'s own

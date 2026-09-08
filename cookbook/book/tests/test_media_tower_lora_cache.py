@@ -8,9 +8,11 @@ tower's own same-input control (never a bare literal), the adapter round-trips
 through a REAL `jammi-server` process restart (not merely a new connection to the
 same process), a fixed probe through the OTHER OpenCLIP tower is bit-identical to
 base after tuning ONE tower (the cross-tower selectivity oracle), and the
-corrupt-media-row contract is recorded — for BOTH a `Binary` and a `Utf8`
-(path-valued) input arm — with the error message's own named row index checked
-against the row's actual Arrow position.
+corrupt-media-row contract is recorded — for BOTH an inline-bytes arm and a
+path-valued arm (each reaching the engine through a Parquet source, which
+DataFusion materialises as `BinaryView`/`Utf8View` respectively under the
+engine's default `schema_force_view_types=true`) — with the error message's own
+named row index checked against the row's actual Arrow position.
 
 The committed cache (`artifacts/media_tower/`) is checked into the repo, not
 gitignored, so a normal checkout always has it; these tests do not skip when it is
@@ -20,14 +22,24 @@ is the correct outcome for a checked-out tree missing a committed artifact.
 
 from __future__ import annotations
 
+import hashlib
+
 import jammi
 
 from jammi_cookbook import contracts
+from scripts.build_media_tower_lora_cache import (
+    CORRUPT_ARROW_POSITION,
+    FLOOR_K,
+    PRECISION_FLOOR,
+    ROUND_TRIP_CEILING,
+    SPREAD_K,
+)
 
 _TOWERS = ("vision", "text", "audio")
 _CLIP_TOWERS = ("vision", "text")
 _MEDIA_TYPES = ("image", "audio")
 _INPUT_MODES = ("bytes", "path")
+_DIR = contracts._dataset_dir("media_tower")
 
 
 def test_installed_engine_identity_matches_the_recorded_provenance():
@@ -37,7 +49,9 @@ def test_installed_engine_identity_matches_the_recorded_provenance():
     finding); the finest-grained identity the shipped surface exposes is the
     declared VERSION, so that is what this asserts — the same pattern
     `chapters/14-scale/scale.qmd` uses for `usearch.__version__`. FAILS (never
-    skips) on a mismatch."""
+    skips) on a mismatch. The checkpoint digests are pinned as goldens (not merely
+    length-checked): a corrupted/substituted local checkpoint directory changes
+    the digest, and this test would catch it."""
     record = contracts.load_artifact("media_tower.record")
     provenance = record["provenance"]
     assert jammi.__version__ == provenance["installed_client_version"], (
@@ -46,8 +60,8 @@ def test_installed_engine_identity_matches_the_recorded_provenance():
     )
     assert jammi.__version__ == record["engine_version"]
     assert provenance["content_digest_via_shipped_surface"] is False
-    assert len(provenance["vision_checkpoint_sha256"]) == 64
-    assert len(provenance["audio_checkpoint_sha256"]) == 64
+    assert provenance["vision_checkpoint_sha256"] == contracts.MEDIA_TOWER_VISION_CHECKPOINT_SHA256
+    assert provenance["audio_checkpoint_sha256"] == contracts.MEDIA_TOWER_AUDIO_CHECKPOINT_SHA256
 
 
 def test_every_tower_changed_and_is_distinguishable_from_the_control():
@@ -68,10 +82,22 @@ def test_every_tower_changed_and_is_distinguishable_from_the_control():
         ).contains(control)
 
 
-def test_tolerance_derivation_is_from_an_observed_spread_not_a_bare_literal():
+def test_tolerance_derivation_uses_the_scripts_own_constants_and_formula():
+    """Proves the derivation, not merely that SOME value sits in `precision_floor`:
+    the record's `precision_floor` / `spread_multiplier_k` /
+    `control_floor_multiplier_k` must equal the emit script's own module
+    constants (never a value the record is free to redefine), and `change_tol` /
+    `change_floor` must equal `max(k * measured_quantity, PRECISION_FLOOR)`
+    recomputed from the record's OWN measured spread/control — not merely read
+    back from the record's own `precision_floor` field, which would pass for any
+    literal a mutated emit script wrote there."""
     record = contracts.load_artifact("media_tower.record")
     for name, t in record["towers"].items():
         td = t["tolerance_derivation"]
+        assert td["precision_floor"] == PRECISION_FLOOR, (name, td, PRECISION_FLOOR)
+        assert td["spread_multiplier_k"] == SPREAD_K, (name, td, SPREAD_K)
+        assert td["control_floor_multiplier_k"] == FLOOR_K, (name, td, FLOOR_K)
+
         assert td["repeats"] == len(t["repeats"]) >= 2, (name, td, t["repeats"])
         observed_spread = max(
             abs(a["change_vs_base_max_abs_diff"] - b["change_vs_base_max_abs_diff"])
@@ -80,13 +106,10 @@ def test_tolerance_derivation_is_from_an_observed_spread_not_a_bare_literal():
         assert round(observed_spread, 6) == td["observed_change_spread_max_abs_diff"], (
             name, observed_spread, td,
         )
-        expected_tol = max(
-            td["spread_multiplier_k"] * observed_spread, td["precision_floor"]
-        )
+        expected_tol = max(SPREAD_K * observed_spread, PRECISION_FLOOR)
         assert round(expected_tol, 6) == td["change_tol"], (name, expected_tol, td)
         expected_floor = max(
-            td["control_floor_multiplier_k"] * t["same_input_control_max_abs_diff"],
-            td["precision_floor"],
+            FLOOR_K * t["same_input_control_max_abs_diff"], PRECISION_FLOOR
         )
         assert round(expected_floor, 6) == td["change_floor"], (name, expected_floor, td)
 
@@ -95,28 +118,38 @@ def test_every_tower_round_trips_through_a_real_process_restart():
     """A round-trip diff is not noisy like change-vs-base: the golden alone is
     NOT sufficient here, since a broken persistence bug would happily commit
     (and then trivially match) a golden reflecting the break. This asserts a
-    tight, HARDCODED ceiling — independent of the golden — matching the
-    ceiling the emit script itself refuses to emit a cache past."""
+    tight ceiling — the emit script's own `ROUND_TRIP_CEILING`, imported rather
+    than re-typed — independent of the golden. `server_restarted` is re-derived
+    from the pid pair and start-time ordering, not trusted as a recorded literal:
+    a script that always wrote `server_restarted: True` regardless of the actual
+    pids would fail this test."""
     record = contracts.load_artifact("media_tower.record")
     for name, t in record["towers"].items():
         diff = t["round_trip_max_abs_diff"]
-        assert diff < 1e-5, (
+        assert diff < ROUND_TRIP_CEILING, (
             f"{name}: round-trip max|Δ| = {diff:.6f} is not near zero — the "
             "adapter did not survive a real process restart intact"
         )
         assert contracts.golden(f"media_tower.{name}.round_trip_max_abs_diff").contains(diff)
         assert t["model_id"].startswith("jammi:fine-tuned:"), t["model_id"]
         rt = t["round_trip"]
-        assert rt["server_restarted"] is True, (name, rt)
-        assert rt["before"]["pid"] != rt["after"]["pid"], (
-            f"{name}: round trip did not cross a real OS process boundary: {rt}"
+        pid_changed = rt["before"]["pid"] != rt["after"]["pid"]
+        later_start = rt["after"]["start_time"] > rt["before"]["start_time"]
+        assert pid_changed, f"{name}: round trip did not cross a real OS process boundary: {rt}"
+        assert later_start, f"{name}: the 'after' process did not start later than 'before': {rt}"
+        assert rt["server_restarted"] == (pid_changed and later_start), (
+            f"{name}: recorded server_restarted does not match the pid/start-time evidence: {rt}"
         )
 
 
 def test_cross_tower_selectivity_is_bit_identical_on_the_untouched_tower():
     """After tuning ONE OpenCLIP tower, a fixed probe through the OTHER tower
-    must be BIT-IDENTICAL to base (`max_abs_diff == 0.0`, exactly) — `task=`
-    scoped the trainable LoRA sites to the tuned tower only."""
+    reads BIT-IDENTICAL to base (`max_abs_diff == 0.0`, exactly). This shows the
+    adapter's effect did not reach the other tower's served embedding; it does
+    not, by itself, distinguish whether that is because training touched only
+    sites scoped to the tuned tower or because serving applies the adapter only
+    under the tuned task — either mechanism produces this same result, and this
+    test asserts only the observed outcome."""
     record = contracts.load_artifact("media_tower.record")
     for name in _CLIP_TOWERS:
         sel = record["towers"][name]["cross_tower_selectivity"]
@@ -141,11 +174,14 @@ def test_every_tower_uses_real_site_names_on_its_own_architecture():
 
 def test_corrupt_row_contract_is_recorded_honestly_for_both_media_types_and_input_arms():
     """A null row AND a corrupt (undecodable) row are BOTH per-row `_status`
-    outcomes, on both media types AND both input arms (`Binary` bytes and a
-    `Utf8` path column — the guide's other documented input shape) — the
-    batch's other, valid row still reads `_status="ok"` either way. The error
-    message's OWN row index is checked against the row's actual Arrow
-    position, not just a substring match.
+    outcomes, on both media types AND both input arms — an inline-bytes column
+    and a path column, each registered as a Parquet source and materialised by
+    DataFusion as `BinaryView`/`Utf8View` respectively under the engine's
+    default `schema_force_view_types=true` — the batch's other, valid row still
+    reads `_status="ok"` either way. The error message's OWN row index is
+    checked against the row's actual Arrow position (the script's own
+    `CORRUPT_ARROW_POSITION`, never a re-typed literal), not just a substring
+    match.
     """
     record = contracts.load_artifact("media_tower.record")
     for modality in _MEDIA_TYPES:
@@ -159,7 +195,17 @@ def test_corrupt_row_contract_is_recorded_honestly_for_both_media_types_and_inpu
             assert c["corrupt_row"]["row_index_matches_arrow_position"] is True, (
                 modality, mode, c["corrupt_row"],
             )
-            assert c["corrupt_row"]["row_index_in_message"] == 2, (modality, mode, c["corrupt_row"])
+            assert c["corrupt_row"]["row_index_in_message"] == CORRUPT_ARROW_POSITION, (
+                modality, mode, c["corrupt_row"],
+            )
+
+
+def test_checksums_cover_every_committed_file_and_match():
+    checksums = contracts.load_artifact("media_tower.checksums")
+    for name in ("record.json", "golden_metrics.json"):
+        assert name in checksums, name
+        digest = hashlib.sha256((_DIR / name).read_bytes()).hexdigest()[:16]
+        assert digest == checksums[name], f"{name}: on-disk file does not match committed checksum"
 
 
 def test_committed_artifacts_match_contract():

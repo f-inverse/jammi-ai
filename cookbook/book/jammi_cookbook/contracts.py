@@ -30,6 +30,23 @@ from pathlib import Path
 _REPO_ROOT = Path(__file__).resolve().parent.parent
 _ARTIFACT_ROOT = _REPO_ROOT / "artifacts"
 
+# --- media-tower LoRA checkpoint provenance goldens (#421 follow-on) --------
+# Pinned sha256 of each checkpoint directory's file bytes, computed by
+# scripts/build_media_tower_lora_cache.py's own `_dir_sha256` at emit time.
+# The chapter asserts the committed record's digests against these — change
+# detection for a future re-emit against the SAME local checkpoint bytes, not
+# a fetch or re-verification of the upstream repo. The upstream repo ids are
+# the stock checkpoints these local directories are populated from
+# (docs/plans/66-tower-profile/CONTRACT.md).
+MEDIA_TOWER_VISION_CHECKPOINT_SHA256 = (
+    "9eed8d5010babe30c1024f00106ddff41c339e4d382d9bf707c47996f8f9c904"
+)
+MEDIA_TOWER_VISION_CHECKPOINT_UPSTREAM = "laion/CLIP-ViT-B-32-laion2B-s34B-b79K"
+MEDIA_TOWER_AUDIO_CHECKPOINT_SHA256 = (
+    "8da528604e138614733cc515b4bbfd9e8f5dd1db6ed25fa5c14a0e13a1f51c9a"
+)
+MEDIA_TOWER_AUDIO_CHECKPOINT_UPSTREAM = "laion/clap-htsat-fused"
+
 
 # --------------------------------------------------------------------------- #
 # Layer 1 — schema
@@ -975,14 +992,28 @@ ARTIFACTS: dict[str, Artifact] = {
         "`jammi-server` OS-process restart (pid before/after recorded — not "
         "merely a new connection to the same still-running process), and the "
         "cross-tower selectivity max|Δ| (a fixed probe through the OTHER "
-        "OpenCLIP tower, exactly 0.0, after tuning one). Plus the measured "
+        "OpenCLIP tower, exactly 0.0, after tuning one — shows the adapter's "
+        "effect did not reach the other tower, without distinguishing "
+        "site-scoping from task-scoped application). Plus the measured "
         "per-row `_status`/`_error` contract for a NULL row and a CORRUPT "
-        "(undecodable) row, in BOTH a `Binary` and a `Utf8`-path input arm, on "
-        "both image and audio — the error message's own named row index "
-        "checked against the row's actual Arrow position. `provenance` records "
-        "the engine/client version, host, GPU, device, and an independent "
-        "sha256 of each checkpoint directory (content_digest is computed "
-        "internally by the engine but never crosses the shipped surface).",
+        "(undecodable) row, in BOTH an inline-bytes and a path input arm — "
+        "each reaching the engine through a Parquet source, which DataFusion "
+        "materialises as `BinaryView`/`Utf8View` respectively — on both image "
+        "and audio, with the error message's own named row index checked "
+        "against the row's actual Arrow position. `provenance` records the "
+        "engine/client version, host, GPU, device, and an independent sha256 "
+        "of each checkpoint directory, pinned against goldens "
+        "(MEDIA_TOWER_VISION_CHECKPOINT_SHA256 / "
+        "MEDIA_TOWER_AUDIO_CHECKPOINT_SHA256 below); content_digest is "
+        "computed internally by the engine but never crosses the shipped "
+        "surface.",
+    ),
+    "media_tower.checksums": Artifact(
+        name="media_tower.checksums",
+        kind="model_id",
+        filename="checksums.json",
+        produced_by="media_tower",
+        note="sha256[:16] of every committed media_tower cache file.",
     ),
 }
 

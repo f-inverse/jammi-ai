@@ -2,31 +2,91 @@
   "audio_checkpoint": "/root/models/clap-htsat-fused",
   "corrupt_rows": {
     "audio": {
-      "corrupt_row": {
-        "message": "Inference error: Failed to decode audio at row 2: Inference error: Failed to probe audio container: unsupported feature: core (probe): no suitable format reader found",
-        "message_contains_row_index": true,
-        "status": "error"
+      "bytes": {
+        "corrupt_row": {
+          "message": "Inference error: Failed to decode audio at row 2: Inference error: Failed to probe audio container: unsupported feature: core (probe): no suitable format reader found",
+          "row_index_in_message": 2,
+          "row_index_matches_arrow_position": true,
+          "status": "error"
+        },
+        "good_row_still_ok": true,
+        "input_mode": "bytes",
+        "null_row": {
+          "error": "Null or missing audio input",
+          "status": "error"
+        }
       },
-      "good_row_still_ok": true,
-      "null_row": {
-        "error": "Null or missing audio input",
-        "status": "error"
+      "path": {
+        "corrupt_row": {
+          "message": "Inference error: Failed to decode audio at row 2: Inference error: Failed to probe audio container: unsupported feature: core (probe): no suitable format reader found (path '/root/jammi-ai/cookbook/book/artifacts/media_tower/_work/corrupt_paths/audio_corrupt.bin')",
+          "row_index_in_message": 2,
+          "row_index_matches_arrow_position": true,
+          "status": "error"
+        },
+        "good_row_still_ok": true,
+        "input_mode": "path",
+        "null_row": {
+          "error": "Null or missing audio input",
+          "status": "error"
+        }
       }
     },
     "image": {
-      "corrupt_row": {
-        "message": "Inference error: Failed to decode image at row 2: The image format could not be determined",
-        "message_contains_row_index": true,
-        "status": "error"
+      "bytes": {
+        "corrupt_row": {
+          "message": "Inference error: Failed to decode image at row 2: The image format could not be determined",
+          "row_index_in_message": 2,
+          "row_index_matches_arrow_position": true,
+          "status": "error"
+        },
+        "good_row_still_ok": true,
+        "input_mode": "bytes",
+        "null_row": {
+          "error": "Null or missing image input",
+          "status": "error"
+        }
       },
-      "good_row_still_ok": true,
-      "null_row": {
-        "error": "Null or missing image input",
-        "status": "error"
+      "path": {
+        "corrupt_row": {
+          "message": "Inference error: Failed to decode image at row 2: The image format could not be determined (path '/root/jammi-ai/cookbook/book/artifacts/media_tower/_work/corrupt_paths/image_corrupt.bin')",
+          "row_index_in_message": 2,
+          "row_index_matches_arrow_position": true,
+          "status": "error"
+        },
+        "good_row_still_ok": true,
+        "input_mode": "path",
+        "null_row": {
+          "error": "Null or missing image input",
+          "status": "error"
+        }
       }
     }
   },
   "engine_version": "0.49.1",
+  "provenance": {
+    "audio_checkpoint_sha256": "8da528604e138614733cc515b4bbfd9e8f5dd1db6ed25fa5c14a0e13a1f51c9a",
+    "content_digest_via_shipped_surface": false,
+    "device": "0",
+    "engine_version": "0.49.1",
+    "gpu_name": "NVIDIA A100-SXM4-80GB",
+    "hostname": "b725e3d60251",
+    "installed_client_version": "0.49.1",
+    "server_info": {
+      "features": [],
+      "services": [
+        "core",
+        "eval",
+        "event",
+        "train"
+      ],
+      "storage_backends": [
+        "file",
+        "memory"
+      ],
+      "version": "0.49.1"
+    },
+    "vision_checkpoint_sha256": "9eed8d5010babe30c1024f00106ddff41c339e4d382d9bf707c47996f8f9c904"
+  },
   "rows_per_modality": 24,
   "towers": {
     "audio": {
@@ -34,7 +94,30 @@
       "change_vs_base_max_abs_diff": 0.197455,
       "epochs": 2,
       "lora_rank": 4,
-      "model_id": "jammi:fine-tuned:9118aec4-c6a4-4648-bdff-3e17f1028e28",
+      "model_id": "jammi:fine-tuned:8db52c49-656b-4050-8fc8-02852dc4dadc",
+      "repeats": [
+        {
+          "change_vs_base_max_abs_diff": 0.197455,
+          "model_id": "jammi:fine-tuned:46ad58ea-7b64-45d5-9c4b-b23c83079603",
+          "same_input_control_max_abs_diff": 0.0
+        },
+        {
+          "change_vs_base_max_abs_diff": 0.197455,
+          "model_id": "jammi:fine-tuned:8db52c49-656b-4050-8fc8-02852dc4dadc",
+          "same_input_control_max_abs_diff": 0.0
+        }
+      ],
+      "round_trip": {
+        "after": {
+          "pid": 45659,
+          "start_time": 1788874515.716965
+        },
+        "before": {
+          "pid": 45600,
+          "start_time": 1788874491.302494
+        },
+        "server_restarted": true
+      },
       "round_trip_max_abs_diff": 0.0,
       "same_input_control_max_abs_diff": 0.0,
       "target_modules": [
@@ -42,35 +125,116 @@
         "value",
         "linear1"
       ],
-      "task": "audio_embedding"
+      "task": "audio_embedding",
+      "tolerance_derivation": {
+        "change_floor": 1e-06,
+        "change_tol": 1e-06,
+        "control_floor_multiplier_k": 10.0,
+        "observed_change_spread_max_abs_diff": 0.0,
+        "precision_floor": 1e-06,
+        "repeats": 2,
+        "spread_multiplier_k": 5.0
+      }
     },
     "text": {
       "base_model": "local:/root/models/open-clip-vit-b-32",
       "change_vs_base_max_abs_diff": 0.346392,
+      "cross_tower_selectivity": {
+        "max_abs_diff": 0.0,
+        "probed_task": "image_embedding"
+      },
       "epochs": 2,
       "lora_rank": 4,
-      "model_id": "jammi:fine-tuned:07b36eb7-d611-4191-9fad-f882f94dd890",
+      "model_id": "jammi:fine-tuned:c30084eb-8840-45ff-917e-6ecc3a43f7ea",
+      "repeats": [
+        {
+          "change_vs_base_max_abs_diff": 0.346392,
+          "model_id": "jammi:fine-tuned:2958a3e5-c49f-432b-913d-ce4fdbcaef97",
+          "same_input_control_max_abs_diff": 0.0
+        },
+        {
+          "change_vs_base_max_abs_diff": 0.346392,
+          "model_id": "jammi:fine-tuned:c30084eb-8840-45ff-917e-6ecc3a43f7ea",
+          "same_input_control_max_abs_diff": 0.0
+        }
+      ],
+      "round_trip": {
+        "after": {
+          "pid": 45600,
+          "start_time": 1788874491.302494
+        },
+        "before": {
+          "pid": 45542,
+          "start_time": 1788874482.850614
+        },
+        "server_restarted": true
+      },
       "round_trip_max_abs_diff": 0.0,
       "same_input_control_max_abs_diff": 0.0,
       "target_modules": [
         "in_proj",
         "c_fc"
       ],
-      "task": "text_embedding"
+      "task": "text_embedding",
+      "tolerance_derivation": {
+        "change_floor": 1e-06,
+        "change_tol": 1e-06,
+        "control_floor_multiplier_k": 10.0,
+        "observed_change_spread_max_abs_diff": 0.0,
+        "precision_floor": 1e-06,
+        "repeats": 2,
+        "spread_multiplier_k": 5.0
+      }
     },
     "vision": {
       "base_model": "local:/root/models/open-clip-vit-b-32",
       "change_vs_base_max_abs_diff": 0.267908,
+      "cross_tower_selectivity": {
+        "max_abs_diff": 0.0,
+        "probed_task": "text_embedding"
+      },
       "epochs": 2,
       "lora_rank": 4,
-      "model_id": "jammi:fine-tuned:2e9c1ea0-7f63-4951-8917-a006fd63b09f",
+      "model_id": "jammi:fine-tuned:d91f4028-4539-4597-9f41-a9e7af61eea6",
+      "repeats": [
+        {
+          "change_vs_base_max_abs_diff": 0.267908,
+          "model_id": "jammi:fine-tuned:9028004c-bd91-4640-b8b9-3e97817a634f",
+          "same_input_control_max_abs_diff": 0.0
+        },
+        {
+          "change_vs_base_max_abs_diff": 0.267908,
+          "model_id": "jammi:fine-tuned:d91f4028-4539-4597-9f41-a9e7af61eea6",
+          "same_input_control_max_abs_diff": 0.0
+        }
+      ],
+      "round_trip": {
+        "after": {
+          "pid": 45542,
+          "start_time": 1788874482.850614
+        },
+        "before": {
+          "pid": 45481,
+          "start_time": 1788874451.4132717
+        },
+        "server_restarted": true
+      },
       "round_trip_max_abs_diff": 0.0,
       "same_input_control_max_abs_diff": 0.0,
       "target_modules": [
         "in_proj",
         "c_fc"
       ],
-      "task": "image_embedding"
+      "task": "image_embedding",
+      "tolerance_derivation": {
+        "change_floor": 1e-06,
+        "change_tol": 1e-06,
+        "control_floor_multiplier_k": 10.0,
+        "observed_change_spread_max_abs_diff": 0.0,
+        "precision_floor": 1e-06,
+        "repeats": 2,
+        "spread_multiplier_k": 5.0
+      }
     }
   },
   "vision_checkpoint": "/root/models/open-clip-vit-b-32"

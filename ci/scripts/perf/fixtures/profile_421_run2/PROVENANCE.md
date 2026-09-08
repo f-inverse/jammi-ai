@@ -9,17 +9,16 @@ below is re-derived by walking this fixture directory, never hand-typed —
 see `gen_provenance_table.py`-equivalent one-liner at the bottom to
 regenerate this table.
 
-Round-4 audit finding B4: `profile_421_artifact.py`'s own `producer.
-input_sha256` used to name only the three top-level report files
-(`--merge-json`/`--attribution-json`/`--identity`), leaving every byte read
-directly off `--legs-dir`/`--p2-dir` (and every byte `profile_421_merge.py`/
-`profile_421_attribute.py` themselves read to PRODUCE those two report
-files) uncaptured and, worse, committed nowhere — `census.pre-demangle.
+`profile_421_artifact.py`'s own `producer.input_sha256` names every byte
+read directly off `--legs-dir`/`--p2-dir` — every leg's own `manifest.json`
+and `census.json`, `census.pre-demangle.json` for every leg in
+`KERNEL_IDENTITY_SPLIT_LEGS`, and every witnessed P2 tower's own
+`manifest.json` — alongside the three top-level report files
+(`--merge-json`/`--attribution-json`/`--identity`); `census.pre-demangle.
 json` (the SOLE source of the identity sidecar's own kernel-identity split
-count) was never even pulled into this repo. This directory closes that gap
-the way the `profile_421_clip_text_a1/` (etc.) attribution fixtures closed
-theirs: every byte a producer script reads, committed here, real,
-byte-for-byte.
+count) is committed here for exactly that reason. This directory carries
+every byte a producer script reads, real, byte-for-byte, the same way the
+`profile_421_clip_text_a1/` (etc.) attribution fixtures carry theirs.
 
 ## What is included, and why
 
@@ -114,7 +113,7 @@ path, exactly as the original `main` invocation did.
   were never pulled off-pod at all — there is nothing to commit; the
   census JSON files above are the full extent of what survived the run.
 
-## sha256 manifest (every file in this directory)
+## sha256 manifest (every file in this directory except this one)
 
 Regenerate with:
 
@@ -123,7 +122,7 @@ import hashlib
 from pathlib import Path
 fix = Path("ci/scripts/perf/fixtures/profile_421_run2")
 for p in sorted(fix.rglob("*")):
-    if p.is_file():
+    if p.is_file() and p.name != "PROVENANCE.md":
         print(p.relative_to(fix).as_posix(), hashlib.sha256(p.read_bytes()).hexdigest(), p.stat().st_size)
 ```
 

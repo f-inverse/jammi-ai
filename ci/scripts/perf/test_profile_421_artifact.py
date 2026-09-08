@@ -101,13 +101,18 @@ IDENTITY_TEMPLATE_DEVIATIONS = [
         "htsat-A2 is {htsat_a2_merge_verdict} at the merge level but {htsat_a2_decision_grade_word} for "
         "attribution: UNATTRIBUTED share_gpu_busy is {htsat_a2_unattributed_share_gpu_busy_pct:.2f}%, "
         "{htsat_a2_bound_comparison_word} the {unattributed_decision_grade_limit_pct:.0f}% validity bound "
-        "({unknown_kernel_share_limit_pct:.0f}% known-kernel-name gate). So htsat-A2's own "
+        "({unknown_kernel_share_limit_pct:.0f}% known-kernel-name gate)."
+        "{htsat_a2_decision_grade_reason_clause} So htsat-A2's own "
         "{htsat_a2_decision_grade_status_word} status never blocks a candidate-port decision."
     ),
     "raw sqlite exports: {sqlite_raw_export_count} files.",
     "corpus: {corpus_total_files} files, {corpus_train_clips} distinct train clips, {corpus_rows_m} rows.",
     "kernel identity: {kernel_identity_split_count} distinct instantiations across {leg_count} legs.",
     "the live merge suite already carried {merge_suite_test_count} tests.",
+    (
+        "htsat-A1 (f32) {htsat_a1_bound_clears_word} the bound under the pass-4 census fix and "
+        "{htsat_a1_decision_grade_is_word} decision-grade{htsat_a1_decision_grade_reason_clause}."
+    ),
 ]
 
 
@@ -433,24 +438,27 @@ class TemplatedDeviationTests(unittest.TestCase):
         self.assertNotIn("NOT decision-grade", self.deviations[1])
 
     def test_htsat_a2_bound_comparison_word_is_truthful_in_the_decision_grade_arm(self):
-        # Round-4 audit B1: the base fixture has htsat-A2 decision_grade
-        # True with UNATTRIBUTED share_gpu_busy (2%) UNDER the 5% bound --
-        # the comparison word must say so ("at or under"), never the
-        # hard-coded "over" this deviation used to carry unconditionally
-        # (a decision_grade=True leg whose own prose still claimed it was
-        # over the bound was a self-contradiction the suite asserted as
-        # correct). The closing clause's own STATUS WORD must agree with
-        # the SAME live decision_grade flag too.
+        # The base fixture has htsat-A2 decision_grade True with
+        # UNATTRIBUTED share_gpu_busy (2%) UNDER the 5% bound -- the
+        # comparison word must say so ("at or under"), never a hard-coded
+        # "over" (a decision_grade=True leg whose own prose still claimed
+        # it was over the bound would be a self-contradiction). The closing
+        # clause's own STATUS WORD must agree with the SAME live
+        # decision_grade flag too, and no extra reason clause is needed
+        # (comparison and decision_grade agree here).
         self.assertIn("at or under the 5% validity bound", self.deviations[1])
         self.assertNotIn("over the 5% validity bound", self.deviations[1])
         self.assertIn("own decision-grade status never blocks a candidate-port decision", self.deviations[1])
         self.assertNotIn("non-decision-grade status", self.deviations[1])
+        self.assertNotIn("for a reason other than this share bound", self.deviations[1])
 
-    def test_htsat_a2_not_decision_grade_word_flips_live(self):
+    def test_htsat_a2_comparison_word_over_the_bound_when_decision_grade_false_for_the_bound_itself(self):
         def poison(attribution_report):
             for row in attribution_report["legs"]:
                 if row["leg_id"] == "htsat-A2":
                     row["decision_grade"] = False
+                    row["chains"]["UNATTRIBUTED"]["share_gpu_busy"] = 0.10  # 10% > the 5% bound
+                    row["decision_grade_reason"] = "UNATTRIBUTED share_gpu_busy=0.1000 > 0.05"
 
         alt_root = Path(tempfile.mkdtemp(dir=str(self.root)))
         fixture = _write_fixture(alt_root, attr_override=poison)
@@ -459,13 +467,141 @@ class TemplatedDeviationTests(unittest.TestCase):
         )
         deviation = report["notes"]["recorded_deviations"][1]
         self.assertIn("but NOT decision-grade for attribution", deviation)
-        # The comparison word and the closing clause's status word flip
-        # TOGETHER with the same live flag -- "over" and "non-decision-
-        # grade" are each licensed ONLY in this (actually non-decision-
-        # grade) arm, never the other way around (round-4 audit B1).
-        self.assertIn("over the 5% validity bound", deviation)
+        # The comparison and status words flip TOGETHER with the same live
+        # flag -- "over" and "non-decision-grade" are each licensed here
+        # because the share genuinely IS over the bound; no extra reason
+        # clause is needed (comparison and decision_grade agree).
+        self.assertIn("is 10.00%, over the 5% validity bound (1% known-kernel-name gate).", deviation)
         self.assertNotIn("at or under the 5% validity bound", deviation)
         self.assertIn("own non-decision-grade status never blocks a candidate-port decision", deviation)
+        self.assertNotIn("for a reason other than this share bound", deviation)
+
+    def test_htsat_a2_comparison_word_stays_truthful_when_decision_grade_false_for_a_different_reason(self):
+        # Round-5 audit B1: `decision_grade` can be False for a reason that
+        # has NOTHING to do with the UNATTRIBUTED share bound (here: the
+        # attribution's OWN verdict is INVALID) while that share itself
+        # (2%, the base fixture's own UNATTRIBUTED_SHARE_GPU_BUSY) is
+        # genuinely UNDER the 5% bound -- the comparison word must still
+        # read the TRUTHFUL "at or under" (never "over the bound" for a 2%
+        # share just because decision_grade happened to be False for some
+        # other reason), and the sentence must additionally NAME the real
+        # reason rather than let a reader infer a false "this bound is
+        # why" from the two clauses sitting next to each other.
+        def poison(attribution_report):
+            for row in attribution_report["legs"]:
+                if row["leg_id"] == "htsat-A2":
+                    row["decision_grade"] = False
+                    row["decision_grade_reason"] = "leg is INVALID: htsat-A2: some unrelated classify failure"
+
+        alt_root = Path(tempfile.mkdtemp(dir=str(self.root)))
+        fixture = _write_fixture(alt_root, attr_override=poison)
+        report = art.build_report(
+            fixture["legs_dir"], fixture["p2_dir"], fixture["merge_report"], fixture["attribution_report"], fixture["identity"]
+        )
+        deviation = report["notes"]["recorded_deviations"][1]
+        self.assertIn("but NOT decision-grade for attribution", deviation)
+        self.assertIn("is 2.00%, at or under the 5% validity bound", deviation)
+        self.assertNotIn("over the 5% validity bound", deviation)
+        self.assertIn(
+            "for a reason other than this share bound: leg is INVALID: htsat-A2: some unrelated classify failure",
+            deviation,
+        )
+        self.assertIn("own non-decision-grade status never blocks a candidate-port decision", deviation)
+
+    def test_htsat_a2_non_share_reason_fallback_when_decision_grade_reason_itself_is_absent(self):
+        # Same disagreement (decision_grade False, share genuinely under
+        # the bound) but with NO `decision_grade_reason` string recorded at
+        # all -- the fallback names the attribution row's own verdict
+        # rather than emitting an empty/unfillable clause.
+        def poison(attribution_report):
+            for row in attribution_report["legs"]:
+                if row["leg_id"] == "htsat-A2":
+                    row["decision_grade"] = False
+                    row["decision_grade_reason"] = None
+
+        alt_root = Path(tempfile.mkdtemp(dir=str(self.root)))
+        fixture = _write_fixture(alt_root, attr_override=poison)
+        report = art.build_report(
+            fixture["legs_dir"], fixture["p2_dir"], fixture["merge_report"], fixture["attribution_report"], fixture["identity"]
+        )
+        deviation = report["notes"]["recorded_deviations"][1]
+        self.assertIn("is 2.00%, at or under the 5% validity bound", deviation)
+        self.assertIn("for a reason other than this share bound: reason not recorded", deviation)
+
+    def test_htsat_a1_clears_the_bound_and_is_decision_grade_renders_from_the_base_fixture(self):
+        # Round-5 audit B2: the base fixture's htsat-A1 is merge-VALID,
+        # decision_grade True, UNATTRIBUTED share_gpu_busy (2%) under the
+        # 5% bound -- the SAME text the real committed identity sidecar's
+        # own hard-coded "htsat-A1 (f32) clears the bound ... and IS
+        # decision-grade" prose used to assert unconditionally, now
+        # rendered from the leg's own live attribution row instead.
+        self.assertEqual(
+            self.deviations[6],
+            "htsat-A1 (f32) clears the bound under the pass-4 census fix and IS decision-grade.",
+        )
+
+    def test_htsat_a1_does_not_clear_and_is_not_decision_grade_flips_live(self):
+        def poison(attribution_report):
+            for row in attribution_report["legs"]:
+                if row["leg_id"] == "htsat-A1":
+                    row["decision_grade"] = False
+                    row["chains"]["UNATTRIBUTED"]["share_gpu_busy"] = 0.10  # 10% > the 5% bound
+                    row["decision_grade_reason"] = "UNATTRIBUTED share_gpu_busy=0.1000 > 0.05"
+
+        alt_root = Path(tempfile.mkdtemp(dir=str(self.root)))
+        fixture = _write_fixture(alt_root, attr_override=poison)
+        report = art.build_report(
+            fixture["legs_dir"], fixture["p2_dir"], fixture["merge_report"], fixture["attribution_report"], fixture["identity"]
+        )
+        deviation = report["notes"]["recorded_deviations"][6]
+        self.assertEqual(
+            deviation,
+            "htsat-A1 (f32) does not clear the bound under the pass-4 census fix and is NOT decision-grade.",
+        )
+
+    def test_htsat_a1_names_the_actual_reason_when_not_decision_grade_for_a_non_share_reason(self):
+        def poison(attribution_report):
+            for row in attribution_report["legs"]:
+                if row["leg_id"] == "htsat-A1":
+                    row["decision_grade"] = False
+                    row["decision_grade_reason"] = "leg is INVALID: htsat-A1: some unrelated classify failure"
+
+        alt_root = Path(tempfile.mkdtemp(dir=str(self.root)))
+        fixture = _write_fixture(alt_root, attr_override=poison)
+        report = art.build_report(
+            fixture["legs_dir"], fixture["p2_dir"], fixture["merge_report"], fixture["attribution_report"], fixture["identity"]
+        )
+        deviation = report["notes"]["recorded_deviations"][6]
+        # Share is STILL 2% (under the bound) -- "clears the bound" stays
+        # truthful even though decision_grade is False, and the real reason
+        # is named rather than silently dropped.
+        self.assertIn("htsat-A1 (f32) clears the bound under the pass-4 census fix and is NOT decision-grade", deviation)
+        self.assertIn(
+            "for a reason other than this share bound: leg is INVALID: htsat-A1: some unrelated classify failure",
+            deviation,
+        )
+
+    def test_htsat_a1_suppressed_merge_invalid_refuses_the_sidecar_render(self):
+        # Round-5 audit B2: an artifact where htsat-A1 is suppressed
+        # (merge-INVALID, so `compute_findings` also drops the
+        # `c-attn-htsat-out-of-tier` finding that names this leg) must
+        # never still render a stale "clears the bound and IS
+        # decision-grade" claim about it -- the whole build refuses instead
+        # of emitting a self-contradicting artifact.
+        def poison(merge_report):
+            for row in merge_report["legs"]:
+                if row["leg_id"] == "htsat-A1":
+                    row["verdict"] = "INVALID"
+                    row["reasons"] = ["fixture: forced INVALID"]
+
+        alt_root = Path(tempfile.mkdtemp(dir=str(self.root)))
+        fixture = _write_fixture(alt_root, merge_override=poison)
+        with self.assertRaises(art.ArtifactBuildError) as ctx:
+            art.build_report(
+                fixture["legs_dir"], fixture["p2_dir"], fixture["merge_report"], fixture["attribution_report"], fixture["identity"]
+            )
+        self.assertIn("htsat-A1", str(ctx.exception))
+        self.assertIn("not VALID", str(ctx.exception))
 
     def test_htsat_a2_not_merge_valid_refuses_the_template_context(self):
         def poison(merge_report):
@@ -480,7 +616,7 @@ class TemplatedDeviationTests(unittest.TestCase):
                 fixture["legs_dir"], fixture["p2_dir"], fixture["merge_report"], fixture["attribution_report"], fixture["identity"]
             )
         self.assertIn("not VALID", str(ctx.exception))
-        self.assertIn("VALID at the merge level", str(ctx.exception))
+        self.assertIn("htsat-A2 deviation assumes this leg IS merge-VALID", str(ctx.exception))
 
     def test_merge_suite_test_count_matches_independent_unittest_discovery(self):
         # Independent oracle: `unittest`'s OWN loader, over the SAME real
@@ -1631,9 +1767,9 @@ class CliEndToEndTests(unittest.TestCase):
 
 
 class RealFixtureRegenerationTests(unittest.TestCase):
-    """Round-4 audit B4's own "regeneration proven in CI" precondition,
-    made real: `ci/scripts/perf/fixtures/profile_421_run2/` is the REAL
-    pod p421 run2 pull (see that directory's own `PROVENANCE.md`) — every
+    """"Regeneration proven in CI", made real: `ci/scripts/perf/fixtures/
+    profile_421_run2/` is the REAL pod p421 run2 pull (see that
+    directory's own `PROVENANCE.md`) — every
     file `profile_421_merge.py`/`profile_421_attribute.py`/
     `profile_421_artifact.py` read to produce the committed
     `2026-09-07-profile-421-towers-c1b0b0ba-a100-sxm4.json` artifact, minus
@@ -1720,9 +1856,9 @@ class RealFixtureRegenerationTests(unittest.TestCase):
         # NUMBER, every finding's text, every note string, and every
         # `producer` content-identity field must come out BYTE IDENTICAL
         # to the already-committed artifact (itself regenerated the SAME
-        # way, from this SAME fixture, as part of closing round-4 audit
-        # B4/B1/B2). Only `producer.invocation_argv` is LICENSED to
-        # differ: it echoes back THIS run's own `--legs-dir`/etc. argv,
+        # way, from this SAME fixture). Only `producer.invocation_argv` is
+        # LICENSED to differ: it echoes back THIS run's own `--legs-dir`/
+        # etc. argv,
         # which is a real, valid, repo-relative path (the SAME one the
         # committed artifact's own `invocation_argv` already names) but
         # not guaranteed to be the identical argv string forever (a
@@ -1760,8 +1896,8 @@ class RealFixtureRegenerationTests(unittest.TestCase):
         # "legs/clip-text-A2/census.pre-demangle.json" (the ONE leg in
         # art.KERNEL_IDENTITY_SPLIT_LEGS), and one "p2/<tower>/manifest.json"
         # per witnessed P2 tower (3) -- 12*2 + 1 + 3 = 28 keys, PLUS the
-        # three original top-level report files -- 31 total (round-4 audit
-        # B4: every byte read off --legs-dir/--p2-dir, captured).
+        # three original top-level report files -- 31 total (every byte
+        # read off --legs-dir/--p2-dir, captured).
         manifest_only_keys = {k for k in regen_producer["input_sha256"] if k.startswith(("legs/", "p2/"))}
         self.assertEqual(len(manifest_only_keys), 28)
         self.assertEqual(len(regen_producer["input_sha256"]), 31)
@@ -1778,17 +1914,41 @@ class RealFixtureRegenerationTests(unittest.TestCase):
 
         # No `findings[].text` / `notes` string differs on THIS real data:
         # htsat-A1/A2's front_share_of_wall (~81%/~83%) clears
-        # FRONT_END_BOUND_SHARE_OF_WALL_MIN on every leg read (round-4
-        # audit B2's neutral-arm rewrite never fires here), and htsat-A2's
-        # own UNATTRIBUTED share (~5.66%) is genuinely OVER the 5% bound
-        # (round-4 audit B1's rule-derived comparison word/status word
-        # compute to the SAME "over"/"non-decision-grade" text the old
-        # hard-coded prose happened to already have on THIS run) —
-        # asserted explicitly here (not just implied by the blanket
-        # top-level equality above) so a reviewer sees the claim, not just
-        # the pass.
+        # FRONT_END_BOUND_SHARE_OF_WALL_MIN on every leg read (the neutral,
+        # non-front-end-bound wording never fires here), and htsat-A2's own
+        # UNATTRIBUTED share (~5.66%) is genuinely OVER the 5% bound while
+        # htsat-A1's (~4.74%) genuinely clears it (the rule-derived
+        # comparison words compute to exactly the "over"/"clears" text this
+        # run's own numbers license) — asserted explicitly here (not just
+        # implied by the blanket top-level equality above) so a reviewer
+        # sees the claim, not just the pass.
         self.assertEqual(regenerated["findings"], committed["findings"])
         self.assertEqual(regenerated["notes"], committed["notes"])
+
+        # Round-5 audit advisory (c): everything above compares PARSED
+        # JSON (`json.loads`), which is blind to whitespace/key-order bytes
+        # a hand-edit could otherwise introduce without tripping a single
+        # `assertEqual` above. Compare the RAW BYTES too, with only the
+        # ONE licensed-to-differ line (`producer.invocation_argv`, an
+        # array of path strings that legitimately differs between this
+        # checkout's own tempdir path and the original pod invocation)
+        # normalized out of BOTH sides first — `.subn`'s own match COUNT
+        # is asserted (never just "the sub ran") so a future reformat that
+        # stops matching this regex reds this test instead of silently
+        # comparing an un-redacted argv line against itself and passing by
+        # accident.
+        argv_line_re = re.compile(rb'"invocation_argv": \[.*?\]', re.DOTALL)
+        regen_bytes = out_path.read_bytes()
+        committed_bytes = REAL_COMMITTED_ARTIFACT.read_bytes()
+        regen_normalized, regen_subs = argv_line_re.subn(b'"invocation_argv": REDACTED', regen_bytes)
+        committed_normalized, committed_subs = argv_line_re.subn(b'"invocation_argv": REDACTED', committed_bytes)
+        self.assertEqual(regen_subs, 1, "expected exactly one invocation_argv line in the regenerated artifact bytes")
+        self.assertEqual(committed_subs, 1, "expected exactly one invocation_argv line in the committed artifact bytes")
+        self.assertEqual(
+            regen_normalized,
+            committed_normalized,
+            "artifact bytes differ beyond the licensed producer.invocation_argv line",
+        )
 
 
 if __name__ == "__main__":

@@ -158,8 +158,8 @@ kinds of change are always distinguishable from the diff alone.
 module ALSO reads directly off `--legs-dir`/`--p2-dir` (every leg's own
 `manifest.json` and `census.json`, plus `census.pre-demangle.json` for
 every leg in `KERNEL_IDENTITY_SPLIT_LEGS`, plus every witnessed P2 tower's
-own `manifest.json`) output-affecting but uncaptured (round-4 audit finding
-B4). `build_input_manifest` now walks exactly that closed, declared file
+own `manifest.json`) output-affecting but uncaptured. `build_input_manifest`
+walks exactly that closed, declared file
 set (`LEG_INPUT_FILENAMES`, `KERNEL_IDENTITY_SPLIT_LEGS`,
 `P2_TOWER_INPUT_FILENAMES` below) and hashes every one of those files,
 keyed `"legs/<leg_id>/<filename>"` / `"p2/<tower>/<filename>"` (a
@@ -429,7 +429,7 @@ def _leg_dirs(legs_dir: Path) -> list[Path]:
 
 
 # --------------------------------------------------------------------------- #
-# input-completeness (round-4 audit B4): the CLOSED set of filenames this
+# input-completeness: the CLOSED set of filenames this
 # module itself reads off `--legs-dir`/`--p2-dir`, and the ONE gateway every
 # such read goes through — a filename outside this set is refused AT THE
 # READ, never silently uncaptured by `producer.input_sha256` (see the module
@@ -451,8 +451,8 @@ def _leg_file(legs_dir: Path, leg_id: str, filename: str, what: str) -> dict:
     `filename` outside `LEG_INPUT_FILENAMES` (or `census.pre-demangle.json`
     for a leg outside `KERNEL_IDENTITY_SPLIT_LEGS`) is refused HERE, at the
     point of the read — a byte this producer starts reading without first
-    declaring it in the closed set above would otherwise be exactly the
-    "uncaptured input" the round-4 audit's B4 finding named."""
+    declaring it in the closed set above would otherwise be an uncaptured
+    input: output-affecting, but invisible to `producer.input_sha256`."""
     allowed = filename in LEG_INPUT_FILENAMES or (
         filename == "census.pre-demangle.json" and leg_id in KERNEL_IDENTITY_SPLIT_LEGS
     )
@@ -486,7 +486,7 @@ def build_input_manifest(legs_dir: Path, p2_dir: Path | None, p2_towers: list[st
     never an absolute path, so the manifest's own VALUES reproduce byte-
     identically regardless of which directory `--legs-dir`/`--p2-dir`
     happen to be mounted at). A declared file that does not exist is a hard
-    refusal, never a silently-shrunk manifest (round-4 audit B4)."""
+    refusal, never a silently-shrunk manifest."""
     manifest: dict[str, str] = {}
     for leg_dir in _leg_dirs(legs_dir):
         for filename in LEG_INPUT_FILENAMES:
@@ -929,9 +929,8 @@ def compute_findings(
             # MECHANISM (audio decode/resample/STFT/mel) but drops
             # "dominating" — a magnitude/comparative word this arm has
             # exactly NOT earned (the share-of-wall rule that would license
-            # it did not hold on every leg read). Round-4 audit B2: this
-            # clause used to keep the comparative regardless of which arm
-            # fired.
+            # it did not hold on every leg read); the clause must drop that
+            # word rather than keep it regardless of which arm fired.
             bound_clause = (
                 f"HTSAT's front-end share of wall is {share_range}% across the F32/BF16 decision legs (rule: "
                 f"front_share_of_wall >= {FRONT_END_BOUND_SHARE_OF_WALL_MIN:.0%} on every leg read was NOT met "
@@ -1222,86 +1221,148 @@ def compute_kernel_identity_split_count(legs_dir: Path, leg_id: str, coalesced_n
 # filled in here from a live source, never hand-typed into the sidecar
 # itself (see `profile_421_run2_identity.json`'s own header comment).
 # --------------------------------------------------------------------------- #
+def _htsat_bound_deviation_context(
+    prefix: str,
+    leg_id: str,
+    merge_by_id: dict[str, dict],
+    attr_by_id: dict[str, dict],
+    attribution_legs: list[dict],
+) -> dict[str, object]:
+    """Every placeholder ONE htsat leg's own "is {merge_verdict} at the
+    merge level but {decision_grade_word} for attribution: UNATTRIBUTED
+    share_gpu_busy is X%, {comparison_word} the Y% validity bound"
+    deviation clause needs, read live off THAT SAME leg's own merge/
+    attribution rows, keyed under the given `prefix` (`"htsat_a1"` /
+    `"htsat_a2"`) so the SAME mechanism serves every leg the identity
+    sidecar's prose names — never hand-typed, and never one flag answering
+    two different questions.
+
+    `leg_decision_grade` (`profile_421_attribute.py`) has EIGHT return
+    points: one `True`, and seven distinct `False` reasons, of which "the
+    UNATTRIBUTED share is over the bound" is only ONE. `{prefix}_bound_
+    comparison_word` therefore answers the EXACT question a deviation's own
+    sentence asks — is THIS measured share over THIS bound — computed
+    directly from the two numbers that sentence quotes, never from
+    `decision_grade` itself (which is `False` for six OTHER reasons too: an
+    INVALID leg, a missing merge row, a non-VALID merge verdict, a missing
+    chains block, a missing UNATTRIBUTED entry, a non-finite share). A leg
+    whose `decision_grade` is `False` for one of those OTHER reasons while
+    its own share is genuinely at-or-under the bound must never read "over
+    the bound" merely because it is not decision-grade for some unrelated
+    cause. `{prefix}_decision_grade_reason_clause` names the ACTUAL reason
+    (the attribution row's own `decision_grade_reason`, or a synthesized
+    fallback when that field itself is absent) whenever the comparison and
+    `decision_grade` disagree; it is the empty string whenever they agree
+    (either "clears the bound and is decision-grade", or "is over the
+    bound and therefore not decision-grade" — each self-explanatory,
+    needing no extra clause).
+
+    A leg that is not merge-VALID, or carries no UNATTRIBUTED chain at all,
+    is refused HERE, never silently rendered with a stale claim: a
+    deviation quoting `{prefix}_bound_comparison_word`/`{prefix}_bound_
+    clears_word` for a SUPPRESSED leg would be exactly the kind of
+    self-contradiction a reader could never detect from the prose alone."""
+    merge_row = merge_by_id.get(leg_id)
+    if merge_row is None:
+        raise ArtifactBuildError(
+            f"{leg_id}: not present in --merge-json's own legs to build the identity template context from"
+        )
+    merge_verdict = merge_row.get("verdict")
+    if not isinstance(merge_verdict, str) or not merge_verdict:
+        raise ArtifactBuildError(f"{leg_id}: --merge-json verdict is not a non-empty string ({merge_verdict!r})")
+    if merge_verdict != "VALID":
+        raise ArtifactBuildError(
+            f"{leg_id}: --merge-json verdict is {merge_verdict!r}, not VALID — the identity sidecar's own "
+            f"{leg_id} deviation assumes this leg IS merge-VALID; update that deviation (and this gate) "
+            "before quoting its chain share under a different state"
+        )
+
+    attr_row = attr_by_id.get(leg_id)
+    if attr_row is None:
+        raise ArtifactBuildError(
+            f"{leg_id}: not present in --attribution-json's own legs to build the identity template context from"
+        )
+    decision_grade = attr_row.get("decision_grade")
+    if not isinstance(decision_grade, bool):
+        raise ArtifactBuildError(f"{leg_id}: --attribution-json decision_grade is not a bool ({decision_grade!r})")
+
+    share_pct = _chain_share(attribution_legs, leg_id, _attribute_mod.CHAIN_UNATTRIBUTED, "share_gpu_busy") * 100.0
+    bound_pct = _attribute_mod.UNATTRIBUTED_DECISION_GRADE_LIMIT * 100.0
+    # The comparison this deviation's own sentence actually asserts —
+    # computed straight from the two numbers it quotes, never from
+    # `decision_grade` (see the doc above: `decision_grade` can be `False`
+    # for six reasons that have nothing to do with this bound at all).
+    over_bound = share_pct > bound_pct
+    comparison_word = "over" if over_bound else "at or under"
+
+    reason_clause = ""
+    if (not decision_grade) and (not over_bound):
+        # `decision_grade` is False for a reason OTHER than this share
+        # bound (over_bound already says the share itself is fine) — name
+        # it, rather than let a reader infer a false "this bound is why"
+        # from the two clauses sitting next to each other.
+        reason = attr_row.get("decision_grade_reason")
+        if not isinstance(reason, str) or not reason:
+            attribution_verdict = attr_row.get("verdict")
+            reason = (
+                f"attribution verdict is {attribution_verdict!r}, not VALID"
+                if attribution_verdict != _attribute_mod.VERDICT_VALID
+                else "reason not recorded"
+            )
+        reason_clause = f" (attribution decision_grade is False for a reason other than this share bound: {reason})"
+
+    return {
+        f"{prefix}_merge_verdict": merge_verdict,
+        f"{prefix}_decision_grade_word": "decision-grade" if decision_grade else "NOT decision-grade",
+        # The status word for a deviation's own closing "so {leg}'s own
+        # {word} status never blocks a candidate-port decision" clause —
+        # that claim (HTSAT has no candidate port under this contract in
+        # the first place) is true regardless of this leg's own decision-
+        # grade state, so the clause itself is licensed in BOTH arms; only
+        # the STATUS WORD it names must flip with the SAME live flag.
+        f"{prefix}_decision_grade_status_word": "decision-grade" if decision_grade else "non-decision-grade",
+        f"{prefix}_bound_comparison_word": comparison_word,
+        # A second phrasing of the SAME `over_bound` fact ("clears"/"does
+        # not clear the bound") for a deviation whose own prose reads as a
+        # verb rather than an "over/at or under" comparison (htsat-A1's own
+        # "clears the bound ... and IS decision-grade" clause).
+        f"{prefix}_bound_clears_word": "does not clear" if over_bound else "clears",
+        f"{prefix}_decision_grade_is_word": "IS" if decision_grade else "is NOT",
+        f"{prefix}_unattributed_share_gpu_busy_pct": share_pct,
+        f"{prefix}_decision_grade_reason_clause": reason_clause,
+    }
+
+
 def _identity_template_context(merge_report: dict, attribution_report: dict, legs_dir: Path) -> dict[str, object]:
     attribution_legs = attribution_report.get("legs", [])
     merge_by_id = _index_by_leg_id(merge_report.get("legs", []))
     attr_by_id = _index_by_leg_id(attribution_legs)
     pool = compute_media_corpus_pool()
 
-    # The identity sidecar's own "htsat-A2 is {verdict} at the merge level
-    # but {word} for attribution" deviation used to hand-type "VALID" /
-    # "NOT decision-grade" as plain prose, with nothing checking either
-    # word against the leg the SAME deviation then quotes a chain share
-    # off. Both words are now read live off that SAME leg: the deviation's
-    # own premise (htsat-A2 IS merge-VALID) is refused, never silently
-    # requoted, if it stops holding -- a future run where this leg goes
-    # merge-INVALID must not keep asserting "VALID at the merge level" in
-    # prose while the chain-share number underneath it changes meaning.
-    htsat_a2_merge_row = merge_by_id.get("htsat-A2")
-    if htsat_a2_merge_row is None:
-        raise ArtifactBuildError(
-            "htsat-A2 not present in --merge-json's own legs to build the identity template context from"
-        )
-    htsat_a2_merge_verdict = htsat_a2_merge_row.get("verdict")
-    if not isinstance(htsat_a2_merge_verdict, str) or not htsat_a2_merge_verdict:
-        raise ArtifactBuildError(f"htsat-A2: --merge-json verdict is not a non-empty string ({htsat_a2_merge_verdict!r})")
-    if htsat_a2_merge_verdict != "VALID":
-        raise ArtifactBuildError(
-            f"htsat-A2: --merge-json verdict is {htsat_a2_merge_verdict!r}, not VALID — the identity sidecar's "
-            "own 'VALID at the merge level but NOT decision-grade' deviation assumes this leg IS merge-VALID; "
-            "update that deviation (and this gate) before quoting its chain share under a different state"
-        )
-
-    htsat_a2_attr_row = attr_by_id.get("htsat-A2")
-    if htsat_a2_attr_row is None:
-        raise ArtifactBuildError(
-            "htsat-A2 not present in --attribution-json's own legs to build the identity template context from"
-        )
-    htsat_a2_decision_grade = htsat_a2_attr_row.get("decision_grade")
-    if not isinstance(htsat_a2_decision_grade, bool):
-        raise ArtifactBuildError(f"htsat-A2: --attribution-json decision_grade is not a bool ({htsat_a2_decision_grade!r})")
-
-    return {
-        "htsat_a2_merge_verdict": htsat_a2_merge_verdict,
-        "htsat_a2_decision_grade_word": "decision-grade" if htsat_a2_decision_grade else "NOT decision-grade",
-        # The comparison word a deviation's own "UNATTRIBUTED share_gpu_busy
-        # is X%, {word} the Y% validity bound" prose needs — read off the
-        # SAME `htsat_a2_decision_grade` flag the word above is read off
-        # (never independently re-derived from the two percentages, which
-        # would let this word and `htsat_a2_decision_grade_word` disagree if
-        # a caller ever poisoned one without the other): "over" is licensed
-        # ONLY when NOT decision-grade (the gate `profile_421_attribute.py`
-        # itself applies is `share > LIMIT`, i.e. exactly the NOT-
-        # decision-grade case), else the truthful "at or under". Closes the
-        # round-4 audit's B1 finding: a hermetic decision_grade=True fixture
-        # used to still render a hard-coded "over ... validity bound",
-        # self-contradicting its own (correctly live-derived)
-        # "decision-grade" word one clause earlier.
-        "htsat_a2_bound_comparison_word": "over" if not htsat_a2_decision_grade else "at or under",
-        # The status word for a deviation's own closing "so htsat-A2's own
-        # {word} status never blocks a candidate-port decision" clause —
-        # that claim (HTSAT has no candidate port under this contract in
-        # the first place) is true regardless of htsat-A2's own decision-
-        # grade state, so the clause itself is licensed in BOTH arms; only
-        # the STATUS WORD it names must flip with the SAME live flag rather
-        # than hard-coding "non-decision-grade" (round-4 audit B1).
-        "htsat_a2_decision_grade_status_word": "decision-grade" if htsat_a2_decision_grade else "non-decision-grade",
-        "htsat_a2_unattributed_share_gpu_busy_pct": _chain_share(
-            attribution_legs, "htsat-A2", _attribute_mod.CHAIN_UNATTRIBUTED, "share_gpu_busy"
-        )
-        * 100.0,
-        "unattributed_decision_grade_limit_pct": _attribute_mod.UNATTRIBUTED_DECISION_GRADE_LIMIT * 100.0,
-        "unknown_kernel_share_limit_pct": _attribute_mod.UNKNOWN_KERNEL_SHARE_LIMIT * 100.0,
-        "sqlite_raw_export_count": compute_sqlite_raw_export_count(legs_dir),
-        "corpus_total_files": pool["corpus_total_files"],
-        "corpus_train_clips": pool["corpus_train_clips"],
-        "corpus_rows_m": pool["corpus_rows_m"],
-        "kernel_identity_split_count": compute_kernel_identity_split_count(
-            legs_dir, KERNEL_IDENTITY_SPLIT_LEGS[0], "Kernel2"
-        ),
-        "leg_count": len(_leg_dirs(legs_dir)),
-        "merge_suite_test_count": compute_merge_suite_test_count(),
-    }
+    context: dict[str, object] = {}
+    # Both htsat decision legs the identity sidecar's own deviation prose
+    # quotes — htsat-A1 ("clears the bound ... and IS decision-grade") and
+    # htsat-A2 ("is {verdict} ... but {word} for attribution") — through
+    # the SAME mechanism, so neither can carry a stale hand-typed claim the
+    # other's own gate would have refused.
+    context.update(_htsat_bound_deviation_context("htsat_a1", "htsat-A1", merge_by_id, attr_by_id, attribution_legs))
+    context.update(_htsat_bound_deviation_context("htsat_a2", "htsat-A2", merge_by_id, attr_by_id, attribution_legs))
+    context.update(
+        {
+            "unattributed_decision_grade_limit_pct": _attribute_mod.UNATTRIBUTED_DECISION_GRADE_LIMIT * 100.0,
+            "unknown_kernel_share_limit_pct": _attribute_mod.UNKNOWN_KERNEL_SHARE_LIMIT * 100.0,
+            "sqlite_raw_export_count": compute_sqlite_raw_export_count(legs_dir),
+            "corpus_total_files": pool["corpus_total_files"],
+            "corpus_train_clips": pool["corpus_train_clips"],
+            "corpus_rows_m": pool["corpus_rows_m"],
+            "kernel_identity_split_count": compute_kernel_identity_split_count(
+                legs_dir, KERNEL_IDENTITY_SPLIT_LEGS[0], "Kernel2"
+            ),
+            "leg_count": len(_leg_dirs(legs_dir)),
+            "merge_suite_test_count": compute_merge_suite_test_count(),
+        }
+    )
+    return context
 
 
 def _render_recorded_deviations(templates: object, context: dict[str, object]) -> list[str]:

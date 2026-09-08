@@ -33,7 +33,7 @@
   ],
   "identity": "source_sha256+input_manifest",
   "source_sha256": {
-   "ci/scripts/perf/profile_421_artifact.py": "b243858d7ac4c062edd0aae1ebc338c2a0a06f539be6f2922484ec6fb63e1109",
+   "ci/scripts/perf/profile_421_artifact.py": "24b13883f5d8d44068ad05521181cf4491d6a7478d25c28ae1c533ab4755a935",
    "ci/scripts/perf/profile_421_attribute.py": "60eb95b6d2b9c3dceb36c977dc6f3e74c72ca9eb48f6c24afdef7e709b1f8ff4",
    "ci/scripts/perf/profile_421_legs.sh": "ff15b0ce3784ace6fb521bfe1de47861fbb838194b1d286e4a472f9c0eddf1ce",
    "ci/scripts/perf/gen_fixed_shape_image_corpus.py": "93bf92c0e723a98d1e234d997d0270edfeec604343c45765e1cbf28e07028e2b",
@@ -43,7 +43,7 @@
   "input_sha256": {
    "merge_json": "c80cd7eaf480e6e167861b0ac7ae9855d58df0ec84c2799864cdfd6c931db264",
    "attribution_json": "3d5f33c280232f1ee2ee4740f3e18d84dffc6532f113b595bb1c9f34b63007a3",
-   "identity": "56723fa243dea7ee1a804049928519625eb41626985d642aeebeef71c1fc5cbf",
+   "identity": "40dcf2c1806146700c37a2306342300ceec9fb1d1f71e174e1c455255d4de6ad",
    "legs/clip-text-A1/manifest.json": "f7089429823a022363eb7b37ff47e3e1e3feca40a7b59effc8c5ddb4ce01e47c",
    "legs/clip-text-A1/census.json": "ddb381c27f6eba0e48100aa08f33554890763abf574cdc0e3d6bb169a6dad1e6",
    "legs/clip-text-A2/manifest.json": "13b976c19c156e7f705481f767209e92de3c075a1f82394d68bbd3ce84733104",

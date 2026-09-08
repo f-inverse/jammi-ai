@@ -1673,5 +1673,132 @@ class PlanContractCitationTests(GitFixture):
         self.assertIsNotNone(epoch_sha)
 
 
+class BasenameMapHeaderTests(GitFixture):
+    """The `citations-basename-map:` header (module doc's "An ambiguous bare
+    basename can be disambiguated by a declared header map" section) --
+    disambiguates a `_PLAN_CONTRACT_ROOTS` file's own ambiguous bare-basename
+    citations without ever editing the frozen body, subject to the three
+    narrowing checks that keep a map from asserting an unverifiable fact.
+    """
+
+    def setUp(self):
+        super().setUp()
+        cc._PLAN_CONTRACT_ROOTS = (self.root,)
+
+    def test_mapped_ambiguous_basename_resolves(self):
+        self._write("crates/one/main.rs", "fn main() {}\nfn second() {}\n")
+        self._write("crates/two/main.rs", "fn main() {}\n")
+        good_sha = self._commit("add two main.rs files")
+        doc = self._write(
+            "doc.md",
+            f"<!-- citations-resolve-at: {good_sha} -->\n"
+            "<!-- citations-basename-map: main.rs=crates/one/main.rs -->\n\n"
+            "`main.rs:1-2`\n",
+        )
+        self._commit("add contract")
+        violations = cc.check_file(doc)
+        self.assertEqual(violations, [], [str(v) for v in violations])
+
+    def test_map_to_a_nonexistent_path_is_red(self):
+        self._write("crates/one/main.rs", "fn main() {}\n")
+        self._write("crates/two/main.rs", "fn main() {}\n")
+        good_sha = self._commit("add two main.rs files")
+        doc = self._write(
+            "doc.md",
+            f"<!-- citations-resolve-at: {good_sha} -->\n"
+            "<!-- citations-basename-map: main.rs=crates/nowhere/main.rs -->\n\n"
+            "`main.rs:1`\n",
+        )
+        self._commit("add contract")
+        violations = cc.check_file(doc)
+        self.assertEqual(len(violations), 1, [str(v) for v in violations])
+        self.assertIn("does not exist in the tree", violations[0].message)
+
+    def test_map_whose_basename_differs_from_the_key_is_red(self):
+        self._write("crates/one/main.rs", "fn main() {}\n")
+        self._write("crates/two/main.rs", "fn main() {}\n")
+        self._write("crates/one/other.rs", "fn other() {}\n")
+        good_sha = self._commit("add fixture files")
+        doc = self._write(
+            "doc.md",
+            f"<!-- citations-resolve-at: {good_sha} -->\n"
+            "<!-- citations-basename-map: main.rs=crates/one/other.rs -->\n\n"
+            "`main.rs:1`\n",
+        )
+        self._commit("add contract")
+        violations = cc.check_file(doc)
+        self.assertEqual(len(violations), 1, [str(v) for v in violations])
+        self.assertIn("own basename is", violations[0].message)
+
+    def test_map_that_repoints_a_unique_basename_elsewhere_is_red(self):
+        """`trainer.rs` is NOT ambiguous -- only one exists -- so a map entry
+        naming a DIFFERENT file for it must be refused, never silently
+        accepted (a map can only resolve a genuine ambiguity, never
+        re-point a citation that was already resolving correctly)."""
+        self._write("crates/foo/trainer.rs", "line one\nline two\n")
+        self._write("crates/foo/other.rs", "line one\nline two\n")
+        good_sha = self._commit("add trainer.rs and other.rs")
+        doc = self._write(
+            "doc.md",
+            f"<!-- citations-resolve-at: {good_sha} -->\n"
+            "<!-- citations-basename-map: trainer.rs=crates/foo/other.rs -->\n\n"
+            "`trainer.rs:1`\n",
+        )
+        self._commit("add contract")
+        violations = cc.check_file(doc)
+        self.assertEqual(len(violations), 1, [str(v) for v in violations])
+        self.assertIn("already resolves uniquely to", violations[0].message)
+        self.assertIn("crates/foo/trainer.rs", violations[0].message)
+
+    def test_unmapped_ambiguous_basename_still_red_even_with_a_map_present(self):
+        """A map entry for ONE ambiguous basename must never loosen the
+        ambiguity check for a DIFFERENT, unmapped one in the same file."""
+        self._write("crates/one/main.rs", "fn main() {}\n")
+        self._write("crates/two/main.rs", "fn main() {}\n")
+        self._write("crates/one/layer_norm.rs", "line one\n")
+        self._write("crates/two/layer_norm.rs", "line one\n")
+        good_sha = self._commit("add ambiguous fixture files")
+        doc = self._write(
+            "doc.md",
+            f"<!-- citations-resolve-at: {good_sha} -->\n"
+            "<!-- citations-basename-map: main.rs=crates/one/main.rs -->\n\n"
+            "`layer_norm.rs:1`\n",
+        )
+        self._commit("add contract")
+        violations = cc.check_file(doc)
+        self.assertEqual(len(violations), 1, [str(v) for v in violations])
+        self.assertIn("AMBIGUOUS", violations[0].message)
+
+    def test_malformed_map_entry_is_a_whole_file_violation(self):
+        self._write("crates/foo/trainer.rs", "line one\n")
+        good_sha = self._commit("add trainer.rs")
+        doc = self._write(
+            "doc.md",
+            f"<!-- citations-resolve-at: {good_sha} -->\n"
+            "<!-- citations-basename-map: main.rs -->\n\n"
+            "`trainer.rs:1`\n",
+        )
+        self._commit("add contract")
+        violations = cc.check_file(doc)
+        self.assertEqual(len(violations), 1, [str(v) for v in violations])
+        self.assertIn("citations-basename-map", violations[0].message)
+
+    def test_real_contract_basename_map_resolves_the_two_ambiguous_citations(self):
+        """A cheap real-repo smoke check, same shape as
+        `PlanContractCitationTests`'s `test_real_contract_epoch_and_scope_are_
+        recognized`: the real `CONTRACT.md` declares a `citations-basename-map`
+        header, and every one of its `layer_norm.rs`/`main.rs` citations
+        resolves cleanly through it."""
+        cc._PLAN_CONTRACT_ROOTS = self._orig_plan_contract_roots
+        contract = cc.REPO_ROOT / "docs" / "plans" / "66-tower-profile" / "CONTRACT.md"
+        self.assertTrue(contract.is_file())
+        text = contract.read_text()
+        basename_map, error = cc._file_citations_basename_map(contract, text)
+        self.assertIsNone(error)
+        self.assertIsNotNone(basename_map)
+        self.assertEqual(basename_map.get("layer_norm.rs"), "crates/jammi-encoders/src/layer_norm.rs")
+        self.assertEqual(basename_map.get("main.rs"), "crates/jammi-bench/src/main.rs")
+
+
 if __name__ == "__main__":
     unittest.main()

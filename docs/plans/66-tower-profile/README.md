@@ -171,26 +171,24 @@ mechanism, only points at it.
   never affected a verdict. `docs/maintainer/fine-tune-performance-guide.md` and
   `CHANGELOG.md` both already avoid citing a bare, drifting count for this suite.
 - **`CONTRACT.md`'s Scope-facts section carries three bare-basename citations that are
-  mechanically AMBIGUOUS at its own pinned epoch (`bff1fad6`), not stale.** `check_citations.py`'s
-  new `docs/plans/66-tower-profile`-scoped citation form resolves a bare `` `<basename>.rs:<line>` ``
+  mechanically AMBIGUOUS at its own pinned epoch (`bff1fad6`), not stale — resolved through a
+  declared header map, never a frozen-body edit.** `check_citations.py`'s
+  `docs/plans/66-tower-profile`-scoped citation form resolves a bare `` `<basename>.rs:<line>` ``
   by searching the pinned tree for a unique match; at `bff1fad6` this repo already has THREE
   `layer_norm.rs` files (`crates/jammi-encoders/src/layer_norm.rs`,
   `crates/jammi-kernels/src/cuda/layer_norm.rs`, `crates/jammi-kernels/src/ops/layer_norm.rs`) and
   TEN `main.rs` files across crate/test binaries, so `` `layer_norm.rs:129, 552-583` `` (Scope
   facts, para 1) and the two `` `main.rs:115-223` ``/`` `main.rs:1389-1400` `` citations (Scope
-  facts, para 5) each resolve to more than one candidate by basename alone — the checker fails
-  closed (AMBIGUOUS, never a first-match guess) rather than resolve silently to the wrong file.
-  The intended targets are, in fact, correct and resolvable by full path
-  (`crates/jammi-encoders/src/layer_norm.rs:129, 552-583` for the LayerNorm citation;
-  `crates/jammi-bench/src/main.rs:115-223`/`:1389-1400` for both `main.rs` citations — verified by
-  hand against `bff1fad6`), but the frozen body is never edited post-freeze (this same section's
-  own `citations-resolve-at` header note) to rewrite them as full paths. `check_citations.py`
-  therefore reports these three lines as violations on a real run; this is a known, recorded
-  limitation of citing a shared filename by basename in a repo that legitimately reuses
-  `main.rs`/`layer_norm.rs` across crates, not a content-drift finding, and is left for a human
-  decision (rewrite the frozen citations to full paths in a follow-on, non-freeze-violating edit,
-  or accept the gate's non-green status for this one file) rather than an autonomous tightening or
-  loosening of the gate.
+  facts, para 5) each resolve to more than one candidate by basename alone. The frozen body is
+  never edited post-freeze (this same section's own `citations-resolve-at` header note) to spell
+  them out as full paths — instead `CONTRACT.md`'s HEADER ZONE (never frozen) carries a second
+  HTML comment, `<!-- citations-basename-map: layer_norm.rs=crates/jammi-encoders/src/layer_norm.rs;
+  main.rs=crates/jammi-bench/src/main.rs -->`, naming the two intended targets.
+  `check_citations.py` resolves each mapped basename to its declared path, validated against the
+  pinned tree (the path must exist there and its own basename must match the map key) so the map
+  can only disambiguate a genuine ambiguity, never silently re-point a citation — see
+  `check_citations.py`'s own module doc for the full narrowing-not-asserting argument. An unmapped
+  ambiguous basename anywhere else still fails closed exactly as before.
 
 ## PR trail
 

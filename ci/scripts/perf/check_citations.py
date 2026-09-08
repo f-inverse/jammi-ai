@@ -339,6 +339,55 @@ map does not extend past a handful of files); a full path resolves directly,
 checked to exist in that same pinned tree. Every individual line/range in a
 comma-separated spec is checked, not just the first.
 
+## An ambiguous bare basename can be disambiguated by a declared header map, never re-written in the frozen body
+
+`docs/plans/66-tower-profile/CONTRACT.md` itself hit the ambiguity case the
+section above describes: at its own pinned epoch (`bff1fad6`) this repo
+already carries three `layer_norm.rs` files and ten `main.rs` files, so the
+frozen body's `` `layer_norm.rs:129, 552-583` `` and `` `main.rs:115-223` ``/
+`` `main.rs:1389-1400` `` citations are genuinely ambiguous by basename
+alone -- and the frozen body can never be edited to spell them out as full
+paths (the freeze doctrine the section above already names). The fix lives
+in the HEADER ZONE instead, which is not frozen prose: an optional SECOND
+HTML-comment line, immediately after `citations-resolve-at:`, e.g.
+
+    <!-- citations-basename-map: layer_norm.rs=crates/jammi-encoders/src/layer_norm.rs; main.rs=crates/jammi-bench/src/main.rs -->
+
+(`;`-separated `<basename>=<repo-root-relative-path>` entries; searched over
+the same leading `_CITATIONS_EPOCH_HEADER_SEARCH_LINES` lines the epoch
+header is, parsed by `_file_citations_basename_map`). A malformed entry
+(no `=`, or an empty key/value) is a hard fail for the WHOLE file, the same
+shape a malformed `citations-resolve-at:` value already is -- never silently
+treated as "no map".
+
+This is a NARROWING of the search space `_resolve_plan_contract_target`
+already does, never a way to assert a fact this script cannot itself check:
+every mapped entry is validated, at the moment a citation actually uses that
+basename, against the SAME pinned-tree lookup the ambiguity check itself
+uses, IN THIS ORDER --
+
+  1. if the basename is NOT actually ambiguous (one unique match already
+     exists in the pinned tree, without consulting the map at all), the
+     map's declared path must BE that unique match -- checked FIRST, ahead
+     of the two checks below, and regardless of whether the declared path
+     would otherwise pass them: a map entry is never allowed to re-point a
+     citation that was already resolving correctly on its own, and a bogus
+     declared value must never masquerade as a mere existence/basename
+     typo by having that more specific finding hidden behind a generic one.
+     This is the load-bearing property: a map can only ever RESOLVE a
+     genuine ambiguity the pinned tree itself has, never silently
+     substitute a different file for one a reviewer could otherwise have
+     verified by eye;
+  2. the declared path must exist in the pinned tree at all (a map entry
+     naming a path the epoch's tree never had is a `Violation`, not a
+     dead-but-harmless header line); and
+  3. the declared path's OWN basename must equal the map key (a map entry
+     `layer_norm.rs=crates/foo/attention.rs` is a `Violation` -- the key and
+     the target must actually agree on what they claim to name).
+
+An unmapped ambiguous basename still fails closed exactly as before -- the
+map is opt-in per basename, not a blanket relaxation of the ambiguity check.
+
 Run: `python3 ci/scripts/perf/check_citations.py`
 Hermetic for every non-artifact citation (reads only files in the working
 tree; no network, no build). An artifact-scoped citation additionally shells
@@ -616,6 +665,68 @@ def _file_citations_epoch(path: Path, text: str) -> tuple[str | None, str | None
     return None, None
 
 
+# The disambiguation-map header -- see the module doc's "An ambiguous bare
+# basename can be disambiguated by a declared header map" section. A
+# non-greedy capture up to the closing `-->` so this matches a SINGLE header
+# line even though the whole thing is one HTML comment.
+_CITATIONS_BASENAME_MAP_HEADER_RE = re.compile(r"citations-basename-map:\s*(.*?)\s*-->")
+
+
+def _file_citations_basename_map(path: Path, text: str) -> tuple[dict[str, str] | None, str | None]:
+    """The `{basename: repo-root-relative-path}` map a Markdown file's own
+    `<!-- citations-basename-map: <basename>=<path>; <basename>=<path>; ... -->`
+    header declares, or `(None, None)` if no such header line is present at
+    all (ordinary ambiguity-checked resolution, completely unchanged -- this
+    is an opt-IN convention, same as `_file_citations_epoch`'s own header).
+    Searched over the SAME leading `_CITATIONS_EPOCH_HEADER_SEARCH_LINES`
+    lines the epoch header is (the map is documented as living immediately
+    after that header, but this function does not itself require ordering
+    relative to it -- only line-count proximity to the top of the file).
+
+    A malformed entry (missing `=`, or an empty key/value on either side of
+    it) is a hard fail for the WHOLE file, `(None, <message>)` -- never
+    silently dropped or treated as "no map", the same non-negotiable
+    strictness `_file_citations_epoch` already applies to a malformed sha:
+    a typo'd map entry must never quietly fall back to ordinary
+    ambiguity-checked resolution, which would silently re-enable the exact
+    AMBIGUOUS failure this header exists to name a fix for.
+
+    This function only PARSES the header -- it does not validate that a
+    declared path exists, or that its basename actually matches the key, or
+    that it agrees with an unambiguous match already in the tree. Those
+    three checks all need the PINNED TREE (`_ls_tree_paths(epoch_sha)`),
+    which this function has no epoch to look up against; they are instead
+    applied by `_resolve_plan_contract_target`, at the moment a citation
+    actually uses the mapped basename (see that function's own doc).
+    """
+    if path.suffix != ".md":
+        return None, None
+    for line in text.splitlines()[:_CITATIONS_EPOCH_HEADER_SEARCH_LINES]:
+        m = _CITATIONS_BASENAME_MAP_HEADER_RE.search(line)
+        if not m:
+            continue
+        mapping: dict[str, str] = {}
+        for entry in m.group(1).split(";"):
+            entry = entry.strip()
+            if not entry:
+                continue
+            if "=" not in entry:
+                return None, (
+                    f"declares a 'citations-basename-map' header entry {entry!r} that is not "
+                    "of the form <basename>=<repo-root-relative-path>"
+                )
+            key, _, value = entry.partition("=")
+            key, value = key.strip(), value.strip()
+            if not key or not value:
+                return None, (
+                    f"declares a 'citations-basename-map' header entry {entry!r} that is not "
+                    "of the form <basename>=<repo-root-relative-path>"
+                )
+            mapping[key] = value
+        return mapping, None
+    return None, None
+
+
 def _git_relpath(target_path: Path) -> str | None:
     """`target_path` (a `_KNOWN_FILES` entry, always absolute) expressed
     relative to `_GIT_REPO_ROOT` in POSIX form, the shape `git show
@@ -869,7 +980,9 @@ def _ls_tree_paths(sha: str) -> list[str]:
     return _LS_TREE_CACHE[key]
 
 
-def _resolve_plan_contract_target(cited_path: str, epoch_sha: str) -> tuple[str | None, str | None]:
+def _resolve_plan_contract_target(
+    cited_path: str, epoch_sha: str, basename_map: dict[str, str] | None = None
+) -> tuple[str | None, str | None]:
     """`cited_path` (the `path` group of `_plan_contract_citation_re`)
     resolved to a repo-root-relative POSIX path in the tree at `epoch_sha`,
     or `(None, <error>)` if it cannot be resolved AT ALL -- FAIL CLOSED,
@@ -886,7 +999,27 @@ def _resolve_plan_contract_target(cited_path: str, epoch_sha: str) -> tuple[str 
         generic filenames like `main.rs`/`layer_norm.rs` across crates, the
         exact class `_KNOWN_FILES`'s own module doc already names as the
         reason a hand-registered map does not scale) are BOTH hard
-        failures, never a silent first-match guess.
+        failures, never a silent first-match guess -- UNLESS `basename_map`
+        (the file's own `citations-basename-map:` header, see that
+        function's doc) declares this exact basename, in which case it is
+        resolved via the map instead, subject to three checks that make the
+        map narrow the search space rather than assert an unverifiable
+        fact (module doc's "An ambiguous bare basename can be
+        disambiguated" section), checked in this ORDER (deliberately, see
+        below): (1) if `cited_path` is not even ambiguous to begin with --
+        one unique match already exists in the pinned tree without
+        consulting the map at all -- the declared path must BE that one
+        match, checked FIRST and independently of whether the declared
+        path would otherwise pass existence/basename validation (a map
+        entry disagreeing with an already-correct, unique resolution is
+        the more specific, more actionable finding -- "you added an
+        unnecessary and WRONG map entry" -- than a generic "does not
+        exist"/"wrong basename" one, and reporting it first means a bogus
+        declared value never masquerades as a mere existence/basename
+        typo); (2) the declared path must exist in this same pinned tree;
+        (3) its own basename must equal the map key. Any of the three
+        failing is a `Violation`, never a silent fall-through to the
+        unmapped ambiguity check below.
     """
     if cited_path.startswith(_FULL_PATH_ROOT_PREFIXES):
         tree = _ls_tree_paths(epoch_sha)
@@ -895,17 +1028,45 @@ def _resolve_plan_contract_target(cited_path: str, epoch_sha: str) -> tuple[str 
         return cited_path, None
     tree = _ls_tree_paths(epoch_sha)
     matches = sorted(p for p in tree if p.rsplit("/", 1)[-1] == cited_path)
+    if basename_map is not None and cited_path in basename_map:
+        mapped = basename_map[cited_path]
+        if len(matches) == 1 and matches[0] != mapped:
+            # Checked FIRST, ahead of existence/basename validation below --
+            # see the docstring's ordering rationale. `cited_path` was
+            # ALREADY resolving correctly, unambiguously, on its own; the
+            # map has no business disagreeing with that, whether or not its
+            # own declared value happens to separately be well-formed.
+            return None, (
+                f"'citations-basename-map' maps {cited_path!r} to {mapped!r}, but {cited_path!r} "
+                f"already resolves uniquely to {matches[0]!r} in the pinned tree -- a map entry "
+                "must never re-point a citation away from its one true match"
+            )
+        if mapped not in tree:
+            return None, (
+                f"'citations-basename-map' maps {cited_path!r} to {mapped!r}, but {mapped!r} "
+                f"does not exist in the tree at pinned epoch {epoch_sha}"
+            )
+        mapped_basename = mapped.rsplit("/", 1)[-1]
+        if mapped_basename != cited_path:
+            return None, (
+                f"'citations-basename-map' maps {cited_path!r} to {mapped!r}, but that path's "
+                f"own basename is {mapped_basename!r}, not {cited_path!r} -- fix the map entry"
+            )
+        return mapped, None
     if not matches:
         return None, f"{cited_path!r} does not exist anywhere in the tree at pinned epoch {epoch_sha}"
     if len(matches) > 1:
         return None, (
             f"{cited_path!r} is AMBIGUOUS in the tree at pinned epoch {epoch_sha} "
-            f"({len(matches)} matches: {', '.join(matches)}) -- cite the full path instead"
+            f"({len(matches)} matches: {', '.join(matches)}) -- cite the full path instead, or "
+            "add a 'citations-basename-map' header entry"
         )
     return matches[0], None
 
 
-def _check_plan_contract_citations(path: Path, text: str, epoch_sha: str) -> list[Violation]:
+def _check_plan_contract_citations(
+    path: Path, text: str, epoch_sha: str, basename_map: dict[str, str] | None = None
+) -> list[Violation]:
     """Every `_plan_contract_citation_re` match in `text`, resolved against
     the tree at `epoch_sha` (never HEAD -- this file's own
     `citations-resolve-at` header already fixed that for the whole file):
@@ -931,7 +1092,7 @@ def _check_plan_contract_citations(path: Path, text: str, epoch_sha: str) -> lis
         lines_spec = m.group("lines")
         line_no = text.count("\n", 0, m.start()) + 1
 
-        relpath, error = _resolve_plan_contract_target(cited_path, epoch_sha)
+        relpath, error = _resolve_plan_contract_target(cited_path, epoch_sha, basename_map)
         if error is not None:
             violations.append(
                 Violation(path, line_no, f"cites {cited_path}:{lines_spec} but {error}")
@@ -1470,6 +1631,23 @@ def _check_file_impl(path: Path) -> tuple[list[Violation], list[Exemption]]:
             )
             return violations, exemptions
 
+    # This file's own optional disambiguation map (module doc's "An
+    # ambiguous bare basename can be disambiguated by a declared header
+    # map" section) -- parsed unconditionally alongside the epoch header
+    # (a malformed entry is a whole-file FAIL, same shape as a malformed
+    # epoch sha), but only ever CONSULTED below when a plan-contract bare
+    # basename actually needs it (`_resolve_plan_contract_target`).
+    basename_map, map_header_error = _file_citations_basename_map(path, text)
+    if map_header_error is not None:
+        violations.append(
+            Violation(
+                path, 1,
+                f"{map_header_error} -- fix the header (or remove it, which reverts every "
+                "ambiguous basename in this file to the ordinary fail-closed AMBIGUOUS check)",
+            )
+        )
+        return violations, exemptions
+
     # A `_PLAN_CONTRACT_ROOTS` file's own bare-basename / full-path
     # `path:line[-line][, line[-line]]*` citations (module doc's "A frozen
     # pre-registration's citations are pinned to their own epoch" section) --
@@ -1480,7 +1658,7 @@ def _check_file_impl(path: Path) -> tuple[list[Violation], list[Exemption]]:
     # `trainer.rs`/`finetune_run.rs`/etc. are `_KNOWN_FILES` entries or
     # under any of the other full-path roots).
     if epoch_sha is not None and _plan_contract_scope(path):
-        violations.extend(_check_plan_contract_citations(path, text, epoch_sha))
+        violations.extend(_check_plan_contract_citations(path, text, epoch_sha, basename_map))
 
     for citation_start, cited_label, target_path, cited_line in _cited_targets(path, text):
         # `cited_file` keeps naming the citation exactly as the doc wrote it

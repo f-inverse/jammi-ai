@@ -4364,6 +4364,7 @@ dependencies = [
  "jammi-numerics",
  "jammi-test-utils",
  "jammi-wire",
+ "object_store",
  "parquet",
  "pin-project",
  "prometheus",

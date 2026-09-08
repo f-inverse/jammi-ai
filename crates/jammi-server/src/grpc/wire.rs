@@ -263,31 +263,75 @@ mod tests {
         assert_eq!(bad.code(), Code::InvalidArgument);
     }
 
-    /// esc-089 F3 (round-3 audit): a resolver/predictor integrity failure OR
-    /// an unpublished-bundle refusal is a client-visible precondition
-    /// failure on BOTH adapter-reload surfaces — `ModelResolver`'s
-    /// fine-tuned arm (`crates/jammi-ai/src/model/resolver.rs`) and the
-    /// context-predictor reload arm
-    /// (`crates/jammi-ai/src/pipeline/context_predictor.rs`) both raise the
-    /// SAME `JammiError::Model`, which this wire boundary maps to
-    /// `Code::InvalidArgument` per the `model_not_found_maps_to_not_found`
-    /// test above. Before the fix, the predictor surface raised its own
-    /// `JammiError::Inference` for this case instead, which falls through
-    /// this function's catch-all arm to `Code::Internal` — wrong for a
-    /// client-visible precondition failure, and disagreeing with the
-    /// resolver surface for the identical class of outcome. A genuine
-    /// transport/IO fault (credential rot, a disabled cloud scheme, a
-    /// network fault against S3/GCS/azure) is propagated UNCHANGED as
-    /// `JammiError::Storage` by both surfaces and has no typed arm in this
-    /// function, so it falls through to `Code::Internal` on both — this is
-    /// the correct, deliberate asymmetry: a caller-visible precondition gets
-    /// `InvalidArgument`, a backend/transport fault gets `Internal`.
+    /// esc-089 F3 (round-3 audit) / F1 (review pass): this wire test pins
+    /// ONLY the LAST leg of the chain — a variant, once produced, maps to
+    /// the right gRPC code — never a substitute for the it-tests in
+    /// `crates/jammi-ai/tests/it/models.rs` /
+    /// `crates/jammi-ai/tests/it/context_predictor.rs`, which pin the FIRST
+    /// leg (a real reload surface, driven end-to-end, actually PRODUCES that
+    /// variant). Both legs are needed and neither substitutes for the
+    /// other: this test constructs the exact variants the two real reload
+    /// surfaces are proven (by the it-tests above) to raise — never a
+    /// stand-in — so a wire-boundary regression here composes with, rather
+    /// than merely echoes, the it-tests' surface→variant proof.
+    ///
+    /// The three variants both surfaces raise, per `resolver.rs`'s
+    /// fine-tuned arm and `context_predictor.rs`'s reload arm:
+    ///   - `JammiError::Model` for a corrupted catalog pointer (unparseable
+    ///     URL, no `artifact_path` recorded).
+    ///   - `JammiError::Model` for a manifest-verified integrity failure
+    ///     (`StorageError::Layout`, reclassified) — same variant, distinct
+    ///     message.
+    ///   - `JammiError::Model` for an absent bundle (`StorageError::
+    ///     NotPublished`, reclassified) — "no bundle published here", not
+    ///     corruption, but still the caller-visible precondition shape.
+    ///   - `JammiError::Storage(StorageError::Io { .. })` for a genuine
+    ///     transport/permission fault against an INTACT bundle — propagated
+    ///     UNCHANGED by both surfaces (never folded into `Model`), and the
+    ///     it-tests pin this EXACT variant
+    ///     (`fine_tuned_adapter_bundle_permission_fault_is_not_a_typed_model_error`
+    ///     / `context_predictor_reload_permission_fault_is_not_a_typed_model_error`
+    ///     assert `matches!(err, JammiError::Storage(StorageError::Io { .. }))`
+    ///     against a real chmod fault, not merely `!Model`) — `Io` is what a
+    ///     permission-denied read on `object_store::LocalFileSystem` folds
+    ///     into (`Error::Generic`, never its own `NotFound`), so that is the
+    ///     variant this test constructs too, not `DriverInit` (which stands
+    ///     for a cloud-driver construction fault neither reload surface's
+    ///     transport path actually raises for a local permission fault).
     #[test]
     fn adapter_bundle_refusal_codes_agree_across_both_reload_surfaces() {
-        use jammi_db::storage::{Scheme, StorageError};
+        use jammi_db::storage::StorageError;
 
-        // Resolver integrity failure (a manifest-listed key absent or hash
-        // mismatch) — `ModelResolver::try_catalog_lookup`'s fine-tuned arm.
+        fn io_fault(path: &str) -> JammiError {
+            JammiError::Storage(StorageError::Io {
+                path: path.to_string(),
+                source: object_store::Error::Generic {
+                    store: "LocalFileSystem",
+                    source: Box::new(std::io::Error::new(
+                        std::io::ErrorKind::PermissionDenied,
+                        "permission denied",
+                    )),
+                },
+            })
+        }
+
+        // Resolver: corrupted catalog pointer (unparseable artifact_path) —
+        // `ModelResolver::try_catalog_lookup`'s fine-tuned arm.
+        let resolver_bad_pointer = map_engine_error(JammiError::Model {
+            model_id: "jammi:fine-tuned:job-1".into(),
+            message: "fine-tuned model 'jammi:fine-tuned:job-1' artifact_path 'not a url' is \
+                      not a valid storage URL: invalid scheme — this catalog record's \
+                      pointer is corrupted"
+                .into(),
+        });
+        assert_eq!(
+            resolver_bad_pointer.code(),
+            Code::InvalidArgument,
+            "a corrupted catalog pointer must be a client-visible precondition failure"
+        );
+
+        // Resolver: manifest-verified integrity failure
+        // (`StorageError::Layout`, reclassified to `Model` by the resolver).
         let resolver_integrity = map_engine_error(JammiError::Model {
             model_id: "jammi:fine-tuned:job-1".into(),
             message: "adapter bundle at 'file:///artifacts/job-1' failed integrity check \
@@ -301,25 +345,39 @@ mod tests {
             "a resolver integrity failure must be a client-visible precondition failure"
         );
 
-        // Resolver transport/IO fault — propagated unchanged, never folded
-        // into `JammiError::Model`. `DriverInit` stands in for the class of
-        // fault named in `resolver.rs`'s own doc comment (credential rot, a
-        // disabled scheme, a network fault) — never this model's own
-        // content being wrong.
-        let resolver_transport = map_engine_error(JammiError::Storage(StorageError::DriverInit {
-            scheme: Scheme::S3,
-            reason: "credential rot: token expired".into(),
-        }));
+        // Resolver: no bundle ever published (`StorageError::NotPublished`,
+        // reclassified to `Model` by the resolver) — "no bundle published
+        // here", not corruption, but still the SAME caller-visible code.
+        let resolver_not_published = map_engine_error(JammiError::Model {
+            model_id: "jammi:fine-tuned:job-1".into(),
+            message: "no adapter bundle is published at 'file:///artifacts/job-1' for \
+                      fine-tuned model 'jammi:fine-tuned:job-1' (manifest.json absent); the \
+                      catalog pointer may be misdirected"
+                .into(),
+        });
+        assert_eq!(
+            resolver_not_published.code(),
+            Code::InvalidArgument,
+            "an unpublished bundle must be a client-visible precondition failure, the SAME \
+             code as an integrity failure"
+        );
+
+        // Resolver: transport/permission fault against an INTACT bundle —
+        // propagated UNCHANGED, never folded into `JammiError::Model`. This
+        // is the SAME `StorageError::Io` variant
+        // `fine_tuned_adapter_bundle_permission_fault_is_not_a_typed_model_error`
+        // (models.rs) proves the resolver actually raises against a real
+        // chmod fault.
+        let resolver_transport = map_engine_error(io_fault("file:///artifacts/job-1"));
         assert_eq!(
             resolver_transport.code(),
             Code::Internal,
             "a resolver transport/IO fault must stay Internal, never InvalidArgument"
         );
 
-        // Predictor integrity failure — the context-predictor reload arm's
-        // own typed refusal, unified onto the SAME `JammiError::Model`
-        // variant the resolver surface raises (this is the fix: it used to
-        // be `JammiError::Inference`, which mapped to `Internal` above).
+        // Predictor: manifest-verified integrity failure — the
+        // context-predictor reload arm's own typed refusal, unified onto
+        // the SAME `JammiError::Model` variant the resolver surface raises.
         let predictor_integrity = map_engine_error(JammiError::Model {
             model_id: "cnp-1".into(),
             message: "adapter bundle at 'file:///artifacts/cnp-1' failed integrity check \
@@ -334,12 +392,29 @@ mod tests {
              the SAME code the resolver surface gets for the same class of outcome"
         );
 
-        // Predictor transport/IO fault — propagated unchanged, same as the
-        // resolver surface.
-        let predictor_transport = map_engine_error(JammiError::Storage(StorageError::DriverInit {
-            scheme: Scheme::Gcs,
-            reason: "network fault: connection reset".into(),
-        }));
+        // Predictor: no bundle ever published — the predictor peer of
+        // `resolver_not_published`.
+        let predictor_not_published = map_engine_error(JammiError::Model {
+            model_id: "cnp-1".into(),
+            message: "no adapter bundle is published at 'file:///artifacts/cnp-1' for context \
+                      predictor 'cnp-1' (manifest.json absent); the catalog pointer may be \
+                      misdirected"
+                .into(),
+        });
+        assert_eq!(
+            predictor_not_published.code(),
+            Code::InvalidArgument,
+            "an unpublished predictor bundle must be a client-visible precondition failure, \
+             the SAME code as an integrity failure"
+        );
+
+        // Predictor: transport/permission fault against an INTACT bundle —
+        // propagated UNCHANGED, same as the resolver surface. This is the
+        // SAME `StorageError::Io` variant
+        // `context_predictor_reload_permission_fault_is_not_a_typed_model_error`
+        // (context_predictor.rs) proves the predictor reload arm actually
+        // raises against a real chmod fault.
+        let predictor_transport = map_engine_error(io_fault("file:///artifacts/cnp-1"));
         assert_eq!(
             predictor_transport.code(),
             Code::Internal,

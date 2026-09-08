@@ -120,3 +120,8 @@ prost-types.workspace = true
 hmac.workspace = true
 sha2.workspace = true
 hex.workspace = true
+# `grpc::wire`'s tests construct a real `StorageError::Io` (the transport
+# variant both adapter-reload surfaces actually raise) to prove the wire
+# boundary maps it to `Code::Internal` — needs the wrapped
+# `object_store::Error` type directly, never a stand-in variant.
+object_store.workspace = true

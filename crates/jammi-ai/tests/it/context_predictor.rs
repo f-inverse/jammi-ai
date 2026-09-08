@@ -1980,9 +1980,13 @@ async fn context_predictor_reload_permission_fault_is_not_a_typed_model_error() 
         Err(e) => e,
     };
     assert!(
-        !matches!(err, jammi_db::error::JammiError::Model { .. }),
+        matches!(
+            err,
+            jammi_db::error::JammiError::Storage(jammi_db::storage::StorageError::Io { .. })
+        ),
         "a permission/transport fault reading an INTACT bundle is NOT this model's fault — it \
-         must propagate as its own storage-layer variant, never be folded into this surface's \
-         typed reload refusal, got: {err:?}"
+         must propagate as the SAME variant both real reload surfaces actually raise for a \
+         transport fault, StorageError::Io (never be folded into this surface's typed reload \
+         refusal), got: {err:?}"
     );
 }

@@ -3008,10 +3008,26 @@ maps `JammiError::Inference` (`crates/jammi-server/src/grpc/wire.rs:138`) to
 bundle reads as the SAME `InvalidArgument` whether it is `ModelResolver` or
 `load_context_predictor` that hit it, and a genuine transient object-store outage on either
 surface reads as the SAME `Internal` — never conflated with the client-visible precondition
-failure. `adapter_bundle_refusal_codes_agree_across_both_reload_surfaces`
-(`crates/jammi-server/src/grpc/wire.rs:286`) pins all four combinations — resolver
-integrity, resolver transport, predictor integrity, predictor transport — against the codes
-each must produce.
+failure.
+
+Two DISTINCT proofs pin this, at two DISTINCT layers, and neither substitutes for the other.
+The it-tests pin the first layer — *surface → variant on a real resolve*: that
+`ModelResolver::try_catalog_lookup` and `load_context_predictor`, driven end-to-end against a
+real corrupted/unpublished/permission-faulted bundle on disk, actually PRODUCE the claimed
+variant. `crates/jammi-ai/tests/it/models.rs::fine_tuned_adapter_bundle_permission_fault_is_not_a_typed_model_error`
+and its context-predictor twin, `crates/jammi-ai/tests/it/context_predictor.rs::context_predictor_reload_permission_fault_is_not_a_typed_model_error`,
+inject a real `chmod 0o000` fault against an intact bundle and assert the EXACT variant each
+surface raises — `matches!(err, JammiError::Storage(StorageError::Io { .. }))` — never merely
+`!matches!(err, JammiError::Model { .. })`, which would pass for any other storage variant
+too and prove nothing about which one the surface actually hit.
+`crates/jammi-server/src/grpc/wire.rs::tests::adapter_bundle_refusal_codes_agree_across_both_reload_surfaces`
+pins the second layer — *variant → code at the wire boundary*: that each of those SAME
+variants, once produced (a corrupted pointer, a manifest-verified integrity failure, an
+unpublished bundle, and — the SAME `StorageError::Io` the it-tests above prove each surface
+actually raises, not a stand-in like `StorageError::DriverInit` — a transport/permission
+fault), maps to the right gRPC code on both surfaces: resolver bad-pointer / integrity /
+not-published and predictor integrity / not-published all map to `InvalidArgument`; resolver
+transport and predictor transport both map to `Internal`.
 
 ### 3.7 Crash recovery of building tables
 

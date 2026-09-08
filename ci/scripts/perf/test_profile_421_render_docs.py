@@ -243,10 +243,28 @@ def _full_synthetic_artifact() -> dict:
     return {
         "limits": {"unattributed_decision_grade_limit": 0.05, "unknown_kernel_share_limit": 0.01},
         "legs": [
-            {"leg_id": f"{t}-{a}", "verdict": "VALID", "merge_verdict": "VALID"}
+            {
+                "leg_id": f"{t}-{a}",
+                "dtype": "bf16" if a == "A2" else "f32",
+                "verdict": "VALID",
+                "merge_verdict": "VALID",
+                "contract_valid": not (t == "htsat" and a == "A2"),
+            }
             for t in ("clip-text", "clip-vision", "htsat")
             for a in ("A1", "A2", "D1", "D2")
         ],
+        "contract_validity": {
+            "gate": "fixture gate",
+            "legs_total": 12,
+            "legs_valid": 11,
+            "legs_failing": [
+                {
+                    "leg_id": "htsat-A2",
+                    "problems": ["htsat-A2: attribution decision_grade is False, not True"],
+                    "decision_grade_reason": "UNATTRIBUTED share_gpu_busy=0.0566 > 0.05",
+                }
+            ],
+        },
         "realized_gains": [
             {"chain": "C-LORA", "tower": "clip-text", "wall_delta_s_per_step": 0.010, "share_of_baseline_wall": 0.10},
             {"chain": "C-LORA", "tower": "clip-vision", "wall_delta_s_per_step": 0.020, "share_of_baseline_wall": 0.20},
@@ -292,11 +310,14 @@ def _full_synthetic_artifact() -> dict:
         "findings": [
             {
                 "id": "htsat-front-end-bound",
-                "text": "The HTSAT step: front-end share of wall is 80-90% across legs.",
+                "text": "The HTSAT step: front-end share of wall is 80% on the F32 decision leg (htsat-A1).",
                 "evidence": {
-                    "front_share_of_wall_pct": {"htsat-A1": 80.0, "htsat-A2": 90.0},
+                    "front_share_of_wall_pct": {"htsat-A1": 80.0},
                     "front_end_bound": True,
+                    "legs_read": ["htsat-A1"],
+                    "legs_excluded": {"htsat-A2": "htsat-A2: attribution decision_grade is False, not True"},
                     "arm_invariant": True,
+                    "invariance_axes": ["arm"],
                 },
             },
             {
@@ -393,8 +414,11 @@ class NewBlockRenderTests(unittest.TestCase):
             r.render_changelog_421_entry(artifact)
 
     def test_findings_guide_extracts_every_percentage_from_the_findings_text(self):
-        rendered = r.render_findings_guide(self.artifact)
-        self.assertIn("80–90 %", rendered)
+        rendered = _norm(r.render_findings_guide(self.artifact))
+        self.assertIn("80 %", rendered)
+        self.assertIn("on the F32 decision leg (`htsat-A1`; `htsat-A2` excluded: fails the contract's validity gate)", _norm(rendered))
+        self.assertIn("arm-invariant", rendered)
+        self.assertNotIn("dtype- and arm-invariant", rendered)
         self.assertIn("20–25 %", rendered)
         self.assertIn("30–40 %", rendered)
         self.assertIn("4–6 %", rendered)
@@ -444,7 +468,7 @@ class NewBlockRenderTests(unittest.TestCase):
         with self.assertRaises(ValueError) as ctx:
             r.render_findings_guide(artifact)
         self.assertIn("arm_invariant", str(ctx.exception))
-        self.assertIn("dtype- and arm-invariant", str(ctx.exception))
+        self.assertIn("invariant", str(ctx.exception))
 
     def test_findings_guide_refuses_when_launch_bound_is_withheld(self):
         artifact = self._withhold("clip-launch-bound-batch8", "launch_bound")
@@ -522,6 +546,123 @@ class NewBlockRenderTests(unittest.TestCase):
         with self.assertRaises(ValueError) as ctx:
             r.render_changelog_421_entry(artifact)
         self.assertIn("launch_bound", str(ctx.exception))
+
+    # -- every fixed verdict/relational word is licensed by the artifact's own numbers --
+
+    def _activate(self, index: int = 0):
+        artifact = _full_synthetic_artifact()
+        artifact["candidate_decisions"][index]["verdict"] = "ACTIVATE"
+        return artifact
+
+    def test_every_unresolved_renderer_refuses_when_a_candidate_activates(self):
+        for render in (
+            r.render_decision_grade_note,
+            r.render_decline_band_summary,
+            r.render_decline_band_guide,
+            r.render_changelog_421_entry,
+        ):
+            with self.subTest(renderer=render.__name__):
+                with self.assertRaises(ValueError) as ctx:
+                    render(self._activate())
+                self.assertIn("not UNRESOLVED", str(ctx.exception))
+                with self.assertRaises(ValueError):
+                    render(self._activate(3))
+
+    def test_decline_band_renderers_refuse_when_a_wall_share_is_not_under_the_floor(self):
+        artifact = _full_synthetic_artifact()
+        artifact["attribution"][0]["chains"]["C-GELU"]["share_wall"] = 0.061  # clip-text-A1: 6.1 % >= 5 %
+        for render in (r.render_decline_band_summary, r.render_decline_band_guide, r.render_changelog_421_entry):
+            with self.subTest(renderer=render.__name__):
+                with self.assertRaises(ValueError) as ctx:
+                    render(artifact)
+                self.assertIn("not below 5 %", str(ctx.exception))
+
+    def test_decline_band_renderers_refuse_when_a_busy_share_leaves_the_band(self):
+        artifact = _full_synthetic_artifact()
+        artifact["attribution"][1]["chains"]["C-GELU"]["share_gpu_busy"] = 0.20  # clip-text-A2: 22.1 % combined
+        for render in (r.render_decline_band_summary, r.render_decline_band_guide, r.render_changelog_421_entry):
+            with self.subTest(renderer=render.__name__):
+                with self.assertRaises(ValueError) as ctx:
+                    render(artifact)
+                self.assertIn("not in the 5-10 % band", str(ctx.exception))
+
+    def test_changelog_refuses_when_an_attention_busy_share_falls_inside_the_band(self):
+        artifact = _full_synthetic_artifact()
+        artifact["attribution"][0]["chains"]["C-ATTN-clip-text"]["share_gpu_busy"] = 0.05  # 7 % combined
+        with self.assertRaises(ValueError) as ctx:
+            r.render_changelog_421_entry(artifact)
+        self.assertIn("inside the 5-10 % band", str(ctx.exception))
+
+    def test_changelog_headline_counts_the_contract_gate_not_the_merge_verdict(self):
+        rendered = _norm(r.render_changelog_421_entry(self.artifact))
+        self.assertIn(
+            "11 of 12 legs (`A1`/`A2`/`D1`/`D2` × CLIP-text, OpenCLIP-vision, HTSAT) pass the contract's "
+            "validity gate — `htsat-A2` fails it (UNATTRIBUTED share_gpu_busy=0.0566 > 0.05) and is excluded "
+            "from every finding on",
+            rendered,
+        )
+        self.assertNotIn("are VALID", rendered)
+        self.assertIn("80 % of wall on the F32 decision leg", rendered)
+        self.assertIn("arm-invariant)", rendered)
+        self.assertNotIn("dtype- and arm-invariant", rendered)
+
+    def test_contract_validity_headline_refuses_an_artifact_that_contradicts_itself(self):
+        artifact = _full_synthetic_artifact()
+        artifact["contract_validity"]["legs_valid"] = 12  # says all pass, legs[] says htsat-A2 does not
+        with self.assertRaises(ValueError):
+            r.render_changelog_421_entry(artifact)
+        artifact = _full_synthetic_artifact()
+        del artifact["contract_validity"]
+        with self.assertRaises(ValueError) as ctx:
+            r.render_changelog_421_entry(artifact)
+        self.assertIn("contract_validity", str(ctx.exception))
+
+    def test_measured_summary_names_the_failing_leg_and_all_pass_when_none_fails(self):
+        base = {
+            "status": "GREEN",
+            "git_sha": "f" * 40,
+            "p2_witnessed": {"towers": ["clip-text", "clip-vision", "htsat"]},
+            "notes": {"gpu": "FIXTURE-GPU", "driver": "0.0.0", "nsys": "Nsight Systems 1.2.3 (fixture)"},
+        }
+        artifact = _full_synthetic_artifact()
+        for leg in artifact["legs"]:
+            leg["tower"] = leg["leg_id"].rsplit("-", 1)[0]
+        artifact.update(base)
+        rendered = _norm(r.render_measured_summary(artifact))
+        self.assertIn(
+            "11 of 12 legs pass the contract's validity gate — `htsat-A2` fails it (UNATTRIBUTED "
+            "share_gpu_busy=0.0566 > 0.05) and is excluded from every finding; the BF16 pre-flight",
+            rendered,
+        )
+        for leg in artifact["legs"]:
+            leg["contract_valid"] = True
+        artifact["contract_validity"] = {"gate": "fixture", "legs_total": 12, "legs_valid": 12, "legs_failing": []}
+        rendered = _norm(r.render_measured_summary(artifact))
+        self.assertIn("All 12 legs pass the contract's validity gate; the BF16 pre-flight", rendered)
+
+    def test_htsat_a2_deviation_refuses_when_the_finding_still_reads_htsat_a2(self):
+        artifact = _full_synthetic_artifact()
+        for finding in artifact["findings"]:
+            if finding["id"] == "htsat-front-end-bound":
+                finding["evidence"]["legs_excluded"] = {}
+                finding["evidence"]["legs_read"] = ["htsat-A1", "htsat-A2"]
+        with self.assertRaises(ValueError) as ctx:
+            r.render_htsat_a2_deviation(artifact)
+        self.assertIn("excluded", str(ctx.exception))
+
+    def test_htsat_a2_deviation_refuses_when_the_finding_claims_dtype_invariance(self):
+        artifact = _full_synthetic_artifact()
+        for finding in artifact["findings"]:
+            if finding["id"] == "htsat-front-end-bound":
+                finding["evidence"]["invariance_axes"] = ["dtype", "arm"]
+        with self.assertRaises(ValueError) as ctx:
+            r.render_htsat_a2_deviation(artifact)
+        self.assertIn("dtype-invariance", str(ctx.exception))
+
+    def test_htsat_a2_deviation_names_the_consequence(self):
+        rendered = _norm(r.render_htsat_a2_deviation(self.artifact))
+        self.assertIn("is merge-VALID but fails the contract's validity gate (not decision-grade for attribution)", rendered)
+        self.assertIn("the HTSAT front-end finding reads `htsat-A1` only and asserts no dtype-invariance.", rendered)
 
     def test_htsat_a2_deviation_refuses_when_decision_grade_becomes_true(self):
         """The bullet's own fixed prose ('is VALID but not decision-grade')

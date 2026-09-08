@@ -201,8 +201,10 @@ workspace ships every publishable crate at the same
   dry-run tested through the real merge script.
 <!-- profile-421-generated: changelog-421-entry -->
 - **The #421 tower training-step profile is closed out: driver, merge, attribution, and
-  a committed close-out artifact (issue #421 step 3, "PROFILE FIRST").** All 12 legs
-  (`A1`/`A2`/`D1`/`D2` × CLIP-text, OpenCLIP-vision, HTSAT) are VALID on
+  a committed close-out artifact (issue #421 step 3, "PROFILE FIRST").** 11 of 12 legs
+  (`A1`/`A2`/`D1`/`D2` × CLIP-text, OpenCLIP-vision, HTSAT) pass the contract's validity
+  gate — `htsat-A2` fails it (UNATTRIBUTED share_gpu_busy=0.0566 > 0.05) and is excluded
+  from every finding on
   `crates/jammi-kernels/artifacts/cuda-runs/2026-09-07-profile-421-towers-c1b0b0ba-a100-sxm4.json`
   (A100-SXM4-80GB); the BF16 pre-flight (P2) passes on all three towers.
   `profile_421_attribute.py` (new) reads `profile_421_merge.py`'s per-key equations and
@@ -225,14 +227,15 @@ workspace ships every publishable crate at the same
   of wall), +30.3 ms (CLIP-vision, 26.4 %), +82.9 ms (HTSAT, 5.4 %); C-LN +15.6 ms
   (CLIP-text), +20.8 ms (CLIP-vision); the joint C-LN+C-GELU-HTSAT chain +56.6 ms (3.6
   %). Findings: the HTSAT training step is CPU front-end-bound (audio
-  decode/resample/STFT/mel ≈ 81–83 % of wall, dtype- and arm-invariant); CLIP-vision's
-  image front end is ≈ 20–22 % of wall (both corpora cycle only 16 distinct train clips
-  at any row count — a page-cached working set, never a realistic-corpus I/O cost — so
-  both numbers are a real per-item CPU decode/preprocess compute cost; see
-  `docs/plans/66-tower-profile/README.md`'s deviations); at batch 8 the CLIP steps are
-  launch-bound (≈ 3.6–3.7 k launches/step; BF16 cuts GPU busy 32–41 % but wall only 4–5
-  %); `C-ATTN-HTSAT` is measured (≈ 33 % of GPU busy) and stays OUT OF TIER, a
-  named-but-undecided chain, never folded into UNATTRIBUTED. See
+  decode/resample/STFT/mel ≈ 81 % of wall on the F32 decision leg (`htsat-A1`;
+  `htsat-A2` excluded: fails the contract's validity gate), arm-invariant);
+  CLIP-vision's image front end is ≈ 20–22 % of wall (both corpora cycle only 16
+  distinct train clips at any row count — a page-cached working set, never a
+  realistic-corpus I/O cost — so both numbers are a real per-item CPU decode/preprocess
+  compute cost; see `docs/plans/66-tower-profile/README.md`'s deviations); at batch 8
+  the CLIP steps are launch-bound (≈ 3.6–3.7 k launches/step; BF16 cuts GPU busy 32–41 %
+  but wall only 4–5 %); `C-ATTN-HTSAT` is measured (≈ 33 % of GPU busy) and stays OUT OF
+  TIER, a named-but-undecided chain, never folded into UNATTRIBUTED. See
   `docs/plans/66-tower-profile/README.md` and `CONTRACT.md` (the frozen v2.5 contract)
   for the full per-leg table and PR trail.
 <!-- /profile-421-generated -->

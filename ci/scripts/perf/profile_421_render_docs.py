@@ -329,6 +329,138 @@ def _attribution_by_leg(artifact: dict) -> dict[str, dict]:
     return {a["leg_id"]: a for a in artifact["attribution"]}
 
 
+def _require_all_candidates_unresolved(artifact: dict, prose: str) -> None:
+    """Fails closed (`ValueError`, `--check` red) unless EVERY
+    `candidate_decisions[].verdict` is `UNRESOLVED` -- the fixed prose that
+    says "all four candidate ports are UNRESOLVED" / "no port is licensed"
+    is licensed by those verdicts alone, never assumed."""
+    verdicts = {cd["port"]: cd["verdict"] for cd in artifact["candidate_decisions"]}
+    if len(verdicts) != 4:
+        raise ValueError(f"expected exactly four candidate decisions, got {sorted(verdicts)!r} -- rewrite {prose!r}")
+    off = {port: v for port, v in verdicts.items() if v != "UNRESOLVED"}
+    if off:
+        raise ValueError(
+            f"candidate verdict(s) {off!r} are not UNRESOLVED -- the fixed prose {prose!r} asserts every "
+            "candidate is UNRESOLVED and no port is licensed; rewrite it to state the artifact's own verdicts"
+        )
+
+
+def _require_below(value: float, bound: float, what: str) -> None:
+    """A relational word ("well under", "still under") next to a live number
+    is licensed only by the comparison it names actually holding."""
+    if not value < bound:
+        raise ValueError(
+            f"{what} = {value:.2f} % is not below {bound:.0f} % -- the fixed prose asserts it is; rewrite the prose"
+        )
+
+
+def _require_in_band(value: float, lo: float, hi: float, what: str) -> None:
+    if not (lo <= value < hi):
+        raise ValueError(
+            f"{what} = {value:.2f} % is not in the {lo:.0f}-{hi:.0f} % band -- the fixed prose says it lands there; "
+            "rewrite the prose"
+        )
+
+
+def _require_outside_band(value: float, lo: float, hi: float, what: str) -> None:
+    if lo <= value < hi:
+        raise ValueError(
+            f"{what} = {value:.2f} % lies inside the {lo:.0f}-{hi:.0f} % band -- the fixed prose says it is entirely "
+            "outside it; rewrite the prose"
+        )
+
+
+def _decline_band_bounds(artifact: dict) -> tuple[float, float]:
+    """The two-sided rule's own bars, in percent: the DECLINE ceiling (the
+    artifact's recorded `limits.unattributed_decision_grade_limit` is the
+    same 5 % the contract's DECLINE clause uses) and the ACTIVATE floor read
+    off `profile_421_attribute.py` -- never typed into a sentence."""
+    return _pa._attribute_mod.DECLINE_COMBINED_THRESHOLD * 100, _pa._attribute_mod.ACTIVATE_WALL_THRESHOLD * 100
+
+
+def _contract_validity(artifact: dict) -> dict:
+    """The artifact's own per-leg tally of the contract's validity gate,
+    cross-checked against `legs[].contract_valid` -- the ONE source a
+    headline leg count is read from (`status` is the merge-level run status,
+    the gate's first three clauses only)."""
+    cv = artifact.get("contract_validity")
+    if not isinstance(cv, dict):
+        raise ValueError("artifact carries no 'contract_validity' block -- regenerate it")
+    legs = artifact["legs"]
+    if cv["legs_total"] != len(legs):
+        raise ValueError(f"contract_validity.legs_total {cv['legs_total']} != {len(legs)} legs in the artifact")
+    failing = {row["leg_id"] for row in cv["legs_failing"]}
+    per_leg_failing = {leg["leg_id"] for leg in legs if leg.get("contract_valid") is not True}
+    if failing != per_leg_failing:
+        raise ValueError(
+            f"contract_validity.legs_failing {sorted(failing)!r} disagrees with legs[].contract_valid "
+            f"{sorted(per_leg_failing)!r} -- the artifact contradicts itself"
+        )
+    if cv["legs_valid"] != len(legs) - len(failing):
+        raise ValueError("contract_validity.legs_valid does not equal legs_total minus the failing legs")
+    return cv
+
+
+def _failing_leg_reason(row: dict) -> str:
+    reason = row.get("decision_grade_reason")
+    if isinstance(reason, str) and reason:
+        return reason
+    problems = row.get("problems") or []
+    if not problems:
+        raise ValueError(f"contract_validity.legs_failing entry {row.get('leg_id')!r} records no reason")
+    return "; ".join(problems)
+
+
+def _contract_validity_headline(artifact: dict, legs_desc: str) -> str:
+    """"All N legs (...) pass the contract's validity gate" when every leg
+    does; otherwise "K of N legs (...) pass the contract's validity gate --
+    `leg` fails it (recorded reason) and is excluded from every finding"."""
+    cv = _contract_validity(artifact)
+    total, valid = cv["legs_total"], cv["legs_valid"]
+    if valid == total:
+        return f"All {total} legs {legs_desc}pass the contract's validity gate"
+    failing = "; ".join(f"`{row['leg_id']}` fails it ({_failing_leg_reason(row)})" for row in cv["legs_failing"])
+    return (
+        f"{valid} of {total} legs {legs_desc}pass the contract's validity gate — {failing} and "
+        f"{'is' if len(cv['legs_failing']) == 1 else 'are'} excluded from every finding"
+    )
+
+
+def _invariance_word(finding: dict) -> str:
+    """The invariance word the finding's OWN evidence licenses ("dtype- and
+    arm-invariant" / "arm-invariant"): the rule flag must be `True` AND the
+    axes list must be present -- composed by the producer's own
+    `invariance_word`, never typed here."""
+    _require_evidence_flag(finding, "arm_invariant", "dtype- and arm-invariant / arm-invariant")
+    axes = finding.get("evidence", {}).get("invariance_axes")
+    if not isinstance(axes, list) or not axes:
+        raise ValueError(
+            f"finding {finding['id']!r} evidence['invariance_axes'] is {axes!r} -- no axis is licensed; rewrite the "
+            "prose that asserts an invariance word"
+        )
+    return _pa.invariance_word(axes)
+
+
+def _decision_legs_phrase(artifact: dict, finding: dict) -> str:
+    """"across the F32/BF16 decision legs" / "on the F32 decision leg
+    (`htsat-A1`; `htsat-A2` excluded: fails the contract's validity gate)"
+    -- read off the finding's own `evidence.legs_read`/`legs_excluded` and
+    the artifact's own per-leg dtype, never a fixed "F32/BF16"."""
+    evidence = finding.get("evidence", {})
+    legs_read = evidence.get("legs_read")
+    if not isinstance(legs_read, list) or not legs_read:
+        raise ValueError(f"finding {finding['id']!r} evidence['legs_read'] is {legs_read!r} -- cannot name the legs read")
+    dtype_by_leg = {leg["leg_id"]: str(leg.get("dtype", "")).upper() for leg in artifact["legs"]}
+    excluded = evidence.get("legs_excluded") or {}
+    excluded_clause = "".join(
+        f"; `{leg_id}` excluded: fails the contract's validity gate" for leg_id in excluded
+    )
+    if len(legs_read) > 1:
+        phrase = f"across the {'/'.join(dtype_by_leg[leg_id] for leg_id in legs_read)} decision legs"
+        return phrase + (f" ({excluded_clause[2:]})" if excluded_clause else "")
+    return f"on the {dtype_by_leg[legs_read[0]]} decision leg (`{legs_read[0]}`{excluded_clause})"
+
+
 def render_decision_grade_note(artifact: dict) -> str:
     """The "decided on BOTH the F32 (A1) and BF16 (A2) decision legs"
     sentence -- keyed off `attribution[<leg>].decision_grade` for the two
@@ -349,13 +481,14 @@ def render_decision_grade_note(artifact: dict) -> str:
             "expected htsat-A2 non-decision-grade (its own Deviations bullet explains why) -- "
             "rewrite the README sentence this renders if the artifact's own verdict changed"
         )
+    _require_all_candidates_unresolved(artifact, "All four candidate ports the contract named are UNRESOLVED")
     body = (
         "All four candidate ports the contract named are **UNRESOLVED** — decided on BOTH the "
         "F32 (A1) and BF16 (A2) decision legs of each tower (the pass-4 census-key fix, below, "
-        "makes both CLIP-tower A2 legs decision-grade for attribution — `htsat-A2` stays VALID "
-        "but non-decision-grade, see the deviation below; HTSAT has no candidate port under "
-        "this contract, so that never blocks a candidate-port decision — no candidate is "
-        "F32-only by consequence):"
+        "makes both CLIP-tower A2 legs decision-grade for attribution — `htsat-A2` is merge-VALID "
+        "but fails the contract's validity gate and is excluded from every finding, see the "
+        "deviation below; HTSAT has no candidate port under this contract, so that never blocks "
+        "a candidate-port decision — no candidate is F32-only by consequence):"
     )
     return textwrap.fill(body, width=88, break_long_words=False, break_on_hyphens=False)
 
@@ -396,6 +529,13 @@ def render_decline_band_summary(artifact: dict) -> str:
     by_leg = _attribution_by_leg(artifact)
     gelu_wall_pct = lambda tower, arm: _gelu_wall_pct(by_leg, tower, arm)  # noqa: E731
     combined_pct = lambda tower, arm, kind: _combined_pct(by_leg, tower, arm, kind)  # noqa: E731
+    _require_all_candidates_unresolved(artifact, "No port is licensed under #421")
+    decline_pct, activate_pct = _decline_band_bounds(artifact)
+    for tower in _CLIP_DECISION_TOWERS:
+        for arm in ("A1", "A2"):
+            _require_below(gelu_wall_pct(tower, arm), decline_pct, f"C-MLP s_wall {tower}-{arm}")
+            _require_below(combined_pct(tower, arm, "wall"), decline_pct, f"C-MLP s_wall+U_wall {tower}-{arm}")
+            _require_in_band(combined_pct(tower, arm, "busy"), decline_pct, activate_pct, f"C-MLP s_busy+U_busy {tower}-{arm}")
 
     body = (
         "**No port is licensed under #421.** No candidate clears ACTIVATE "
@@ -570,15 +710,23 @@ def render_decline_band_guide(artifact: dict) -> str:
     by_leg = _attribution_by_leg(artifact)
     cd = artifact["candidate_decisions"]
     port0, port1, port2, port3 = cd[0], cd[1], cd[2], cd[3]
+    _require_all_candidates_unresolved(artifact, "All four candidate ports are UNRESOLVED — no port is licensed")
+    decline_pct, activate_pct = _decline_band_bounds(artifact)
+    for tower in _CLIP_DECISION_TOWERS:
+        for arm in ("A1", "A2"):
+            _require_below(_gelu_wall_pct(by_leg, tower, arm), decline_pct, f"C-MLP s_wall {tower}-{arm}")
+            _require_below(_combined_pct(by_leg, tower, arm, "wall"), decline_pct, f"C-MLP s_wall+U_wall {tower}-{arm}")
+            _require_in_band(_combined_pct(by_leg, tower, arm, "busy"), decline_pct, activate_pct, f"C-MLP s_busy+U_busy {tower}-{arm}")
 
     body = (
         "**All four candidate ports are UNRESOLVED — no port is licensed under #421.** No "
         "candidate clears ACTIVATE (`s_wall>=10%` on any decision-grade leg) or DECLINE (both "
         "`s_wall+U_wall<5%` AND `s_busy+U_busy<5%` on every decision-grade leg); the pass-4 "
         "`kernel_census.py` demangled-name fix (`docs/maintainer/MAINTAINER-GUIDE.md` §2.5) "
-        "makes both CLIP-tower A2 legs decision-grade for attribution (`htsat-A2` stays "
-        "non-decision-grade — HTSAT has no candidate port under this contract, so that never "
-        "blocks a verdict; see `docs/plans/66-tower-profile/README.md`), so no verdict below "
+        "makes both CLIP-tower A2 legs decision-grade for attribution (`htsat-A2` fails the "
+        "contract's validity gate and is excluded from every finding — HTSAT has no candidate "
+        "port under this contract, so that never blocks a verdict; see "
+        "`docs/plans/66-tower-profile/README.md`), so no verdict below "
         "is F32-only. This is not uniform across candidates or axes: `C-MLP`'s own measured "
         "`s_wall` (no `U` term) is only "
         f"{_gelu_wall_pct(by_leg, 'clip-text', 'A1'):.2f} %/"
@@ -623,7 +771,8 @@ def render_findings_guide(artifact: dict) -> str:
 
     htsat_finding = _finding(artifact, "htsat-front-end-bound")
     _require_evidence_flag(htsat_finding, "front_end_bound", "CPU front-end-bound")
-    _require_evidence_flag(htsat_finding, "arm_invariant", "dtype- and arm-invariant")
+    htsat_invariance = _invariance_word(htsat_finding)
+    htsat_legs_phrase = _decision_legs_phrase(artifact, htsat_finding)
     htsat_pct = _range_str(htsat_finding["evidence"]["front_share_of_wall_pct"]) + " %"
 
     clip_vision_finding = _finding(artifact, "clip-vision-front-end-share")
@@ -645,8 +794,8 @@ def render_findings_guide(artifact: dict) -> str:
 
     body = (
         f"**Findings.** The HTSAT training step is CPU front-end-bound: front-end share of "
-        f"wall is {htsat_pct} across the F32/BF16 decision legs (audio "
-        "decode/resample/STFT/mel dominating wall time), dtype- and arm-invariant — closed as "
+        f"wall is {htsat_pct} {htsat_legs_phrase} (audio "
+        f"decode/resample/STFT/mel dominating wall time), {htsat_invariance} — closed as "
         "its own follow-on unit on `perf/421-frontend` (parallelizing the media front end "
         "across rayon's global pool), not duplicated here. CLIP-vision's own image "
         f"decode/preprocess front end is {clip_vision_pct} of wall on the F32/BF16 decision "
@@ -680,13 +829,17 @@ def render_changelog_421_entry(artifact: dict) -> str:
     for leg in artifact["legs"]:
         if by_leg[leg["leg_id"]]["verdict"] != "VALID":
             raise ValueError(
-                f"leg {leg['leg_id']!r} is not VALID -- rewrite the CHANGELOG entry this "
-                "renders, its own headline claims all 12 legs VALID"
+                f"leg {leg['leg_id']!r} is not attribution-VALID -- rewrite the CHANGELOG entry this "
+                "renders, its own prose assumes every leg was attributed"
             )
     if len(artifact["legs"]) != 12:
         raise ValueError(
             f"expected 12 legs, got {len(artifact['legs'])} -- rewrite the CHANGELOG entry"
         )
+    headline = _contract_validity_headline(
+        artifact, "(`A1`/`A2`/`D1`/`D2` × CLIP-text, OpenCLIP-vision, HTSAT) "
+    )
+    _require_all_candidates_unresolved(artifact, "No kernel port lands under #421")
 
     gelu_wall_vals = [
         _gelu_wall_pct(by_leg, t, a) for t in _CLIP_DECISION_TOWERS for a in ("A1", "A2")
@@ -709,8 +862,16 @@ def render_changelog_421_entry(artifact: dict) -> str:
 
     htsat_finding = _finding(artifact, "htsat-front-end-bound")
     _require_evidence_flag(htsat_finding, "front_end_bound", "CPU front-end-bound")
-    _require_evidence_flag(htsat_finding, "arm_invariant", "dtype- and arm-invariant")
+    htsat_invariance = _invariance_word(htsat_finding)
+    htsat_legs_phrase = _decision_legs_phrase(artifact, htsat_finding)
     htsat_pct = _range_str(htsat_finding["evidence"]["front_share_of_wall_pct"])
+    decline_pct, activate_pct = _decline_band_bounds(artifact)
+    for value in gelu_busy_vals:
+        _require_in_band(value, decline_pct, activate_pct, "C-MLP combined busy share")
+    for value in gelu_wall_vals:
+        _require_below(value, decline_pct, "C-MLP wall-axis share")
+    for value in attn_busy_vals:
+        _require_outside_band(value, decline_pct, activate_pct, "C-ATTN combined busy share")
 
     clip_vision_finding = _finding(artifact, "clip-vision-front-end-share")
     clip_vision_pct = _range_str(clip_vision_finding["evidence"]["front_share_of_wall_pct"])
@@ -731,8 +892,8 @@ def render_changelog_421_entry(artifact: dict) -> str:
 
     body = (
         "**The #421 tower training-step profile is closed out: driver, merge, attribution, "
-        "and a committed close-out artifact (issue #421 step 3, \"PROFILE FIRST\").** All 12 "
-        "legs (`A1`/`A2`/`D1`/`D2` × CLIP-text, OpenCLIP-vision, HTSAT) are VALID on "
+        "and a committed close-out artifact (issue #421 step 3, \"PROFILE FIRST\").** "
+        f"{headline} on "
         "`crates/jammi-kernels/artifacts/cuda-runs/2026-09-07-profile-421-towers-c1b0b0ba-a100-sxm4.json` "
         "(A100-SXM4-80GB); the BF16 pre-flight (P2) passes on all three towers. "
         "`profile_421_attribute.py` (new) reads `profile_421_merge.py`'s per-key equations "
@@ -761,8 +922,8 @@ def render_changelog_421_entry(artifact: dict) -> str:
         f"C-LN +{_ms(ln_clip['clip-text']):.1f} ms (CLIP-text), +{_ms(ln_clip['clip-vision']):.1f} ms "
         f"(CLIP-vision); the joint C-LN+C-GELU-HTSAT chain +{_ms(joint):.1f} ms "
         f"({_pct_of_baseline(joint):.1f} %). Findings: the HTSAT training step is CPU "
-        f"front-end-bound (audio decode/resample/STFT/mel ≈ {htsat_pct} % of wall, dtype- and "
-        f"arm-invariant); CLIP-vision's image front end is ≈ {clip_vision_pct} % of wall "
+        f"front-end-bound (audio decode/resample/STFT/mel ≈ {htsat_pct} % of wall "
+        f"{htsat_legs_phrase}, {htsat_invariance}); CLIP-vision's image front end is ≈ {clip_vision_pct} % of wall "
         f"(both corpora cycle only {train_clips} distinct train clips at any row count — a "
         "page-cached working set, never a realistic-corpus I/O cost — so both numbers are a "
         "real per-item CPU decode/preprocess compute cost; see "
@@ -939,16 +1100,31 @@ def render_htsat_a2_deviation(artifact: dict) -> str:
             "('clears the bound') assumes it does; rewrite it if that changed"
         )
 
+    htsat_finding = _finding(artifact, "htsat-front-end-bound")
+    excluded = htsat_finding.get("evidence", {}).get("legs_excluded") or {}
+    if "htsat-A2" not in excluded:
+        raise ValueError(
+            "the HTSAT front-end finding does not record htsat-A2 among its excluded legs -- this bullet's "
+            "own fixed prose ('excluded from every finding') assumes it does; rewrite it if that changed"
+        )
+    legs_read = htsat_finding["evidence"].get("legs_read") or []
+    if "htsat-A2" in legs_read or not legs_read:
+        raise ValueError(f"the HTSAT front-end finding reads {legs_read!r} -- contradicts this bullet's prose")
+    axes = htsat_finding["evidence"].get("invariance_axes")
+    if axes is not None and "dtype" in axes:
+        raise ValueError("the HTSAT front-end finding claims dtype-invariance while htsat-A2 is excluded -- contradiction")
+    read_desc = ", ".join(f"`{leg_id}`" for leg_id in legs_read)
     body = (
-        f"**`htsat-A2` (bf16) is {htsat_a2_merge_verdict} but not decision-grade for "
-        f"attribution**: its UNATTRIBUTED share of GPU busy is {share_pct:.2f} %, "
+        f"**`htsat-A2` (bf16) is merge-{htsat_a2_merge_verdict} but fails the contract's validity gate "
+        f"(not decision-grade for attribution)**: its UNATTRIBUTED share of GPU busy is {share_pct:.2f} %, "
         f"{comparison_word} the contract's {bound_pct:.0f} % validity bound (window-partition "
         "copies and the audio front end's own activation are still undeclared chains at the "
         "identical element count as a generic residual-stream permute/reshape copy — the "
         "attribution module declares neither rather than guess). `htsat-A1` (f32) clears the "
         "bound and is decision-grade. HTSAT has no candidate port under this contract in the "
         "first place, so `htsat-A2`'s own non-decision-grade status never blocks a "
-        "candidate-port decision."
+        "candidate-port decision. It is excluded from every finding that would read it: the "
+        f"HTSAT front-end finding reads {read_desc} only and asserts no dtype-invariance."
     )
     return _bullet(body)
 
@@ -979,7 +1155,6 @@ def render_measured_summary(artifact: dict) -> str:
     the moment `status` is not GREEN or `p2_witnessed` does not name every
     tower this run actually measured.
     """
-    total_legs = len(artifact["legs"])
     status = artifact["status"]
     if status != "GREEN":
         raise ValueError(
@@ -1000,8 +1175,9 @@ def render_measured_summary(artifact: dict) -> str:
         raise ValueError(f"{tower_count} towers has no spelled-out form registered in _NUMBER_WORDS -- add one")
     notes = artifact["notes"]
     artifact_rel = ARTIFACT.relative_to(REPO_ROOT).as_posix()
+    headline = _contract_validity_headline(artifact, "")
     body = (
-        f"All {total_legs} legs are VALID; the BF16 pre-flight (P2) passes on all "
+        f"{headline}; the BF16 pre-flight (P2) passes on all "
         f"{_NUMBER_WORDS[tower_count].lower()} towers. Source: `{artifact_rel}` "
         f"({notes['gpu']}, driver {notes['driver']}, nsys {_nsys_version(notes['nsys'])}, "
         f"git sha `{artifact['git_sha']}`)."

@@ -2601,5 +2601,48 @@ class CliEndToEndTests(unittest.TestCase):
             self.assertEqual(result.returncode, 0, result.stderr)
 
 
+class ContractThresholdBindingTests(unittest.TestCase):
+    """The live decision-rule and validity-gate constants are bound to the
+    numbers the frozen contract declares. Every gate downstream reads the
+    constants (rule (j) hashes this module; the artifact records `limits`),
+    so without THIS test a moved constant would regenerate green while the
+    rendered prose still credited "the contract's" bar — the one guard
+    that makes the pre-registration mechanically enforced rather than
+    currently true."""
+
+    CONTRACT = PERF_DIR.parents[2] / "docs" / "plans" / "66-tower-profile" / "CONTRACT.md"
+
+    def _rule_section(self) -> str:
+        text = self.CONTRACT.read_text(encoding="utf-8")
+        start = text.index("## Decision rule")
+        end = text.index("\n## ", start + 1)
+        return text[start:end]
+
+    def test_activate_bar_matches_the_frozen_contract(self):
+        import re
+
+        rule = self._rule_section()
+        m = re.search(r"\*\*ACTIVATE\*\* iff `s_wall ≥ (\d+) %`", rule)
+        self.assertIsNotNone(m, "the contract's ACTIVATE clause is not in the shape this test reads")
+        self.assertEqual(int(m.group(1)) / 100.0, attribute.ACTIVATE_WALL_THRESHOLD)
+
+    def test_decline_bar_matches_the_frozen_contract(self):
+        import re
+
+        rule = self._rule_section()
+        m = re.search(r"\*\*DECLINE\*\* iff `s_wall \+ U_wall < (\d+) %` AND `s_busy \+ U_busy < (\d+) %`", rule)
+        self.assertIsNotNone(m, "the contract's DECLINE clause is not in the shape this test reads")
+        self.assertEqual(m.group(1), m.group(2))
+        self.assertEqual(int(m.group(1)) / 100.0, attribute.DECLINE_COMBINED_THRESHOLD)
+
+    def test_unattributed_validity_bound_matches_the_frozen_contract(self):
+        import re
+
+        text = self.CONTRACT.read_text(encoding="utf-8")
+        m = re.search(r"Validity gate:.*?\*\*UNATTRIBUTED ≤ (\d+) % of gpu_busy\*\*", text)
+        self.assertIsNotNone(m, "the contract's validity-gate UNATTRIBUTED clause is not in the shape this test reads")
+        self.assertEqual(int(m.group(1)) / 100.0, attribute.UNATTRIBUTED_DECISION_GRADE_LIMIT)
+
+
 if __name__ == "__main__":
     unittest.main()

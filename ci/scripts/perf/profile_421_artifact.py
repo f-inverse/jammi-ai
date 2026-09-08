@@ -748,8 +748,43 @@ def build_legs(merge_report: dict, attribution_report: dict, legs_dir: Path) -> 
         row["attribution_verdict"] = attr_leg.get("verdict")
         row["attribution_reasons"] = attr_leg.get("reasons")
         row["launches_per_step"] = launches
+        problems = _contract_validity_problems(merge_by_id, attr_by_id, (leg_id,))
+        row["contract_valid"] = not problems
+        row["contract_validity_problems"] = problems
         legs.append(row)
     return legs
+
+
+def build_contract_validity(merge_report: dict, attribution_report: dict, legs_dir: Path) -> dict:
+    """The contract's validity gate tallied over every leg — the ONE
+    headline count a downstream reader may quote ("N of M legs pass the
+    contract's validity gate"), never the merge-level `status` alone, which
+    reads only the gate's first three clauses."""
+    merge_by_id = _index_by_leg_id(merge_report.get("legs", []))
+    attr_by_id = _index_by_leg_id(attribution_report.get("legs", []))
+    leg_ids = [p.name for p in _leg_dirs(legs_dir)]
+    failing: list[dict] = []
+    for leg_id in leg_ids:
+        problems = _contract_validity_problems(merge_by_id, attr_by_id, (leg_id,))
+        if problems:
+            failing.append(
+                {
+                    "leg_id": leg_id,
+                    "problems": problems,
+                    "decision_grade_reason": attr_by_id[leg_id].get("decision_grade_reason"),
+                }
+            )
+    return {
+        "gate": (
+            "CONTRACT.md 'Validity gate' per leg: kernel table present; counter equations hold; "
+            "--expect-kernels-disabled satisfied on D legs (profile_421_merge.py verdict); "
+            "UNATTRIBUTED <= limits.unattributed_decision_grade_limit of gpu_busy "
+            "(profile_421_attribute.py decision_grade)"
+        ),
+        "legs_total": len(leg_ids),
+        "legs_valid": len(leg_ids) - len(failing),
+        "legs_failing": failing,
+    }
 
 
 # --------------------------------------------------------------------------- #
@@ -822,8 +857,60 @@ def _decision_grade_problems(attr_by_id: dict[str, dict], leg_ids: tuple[str, ..
         if row is None:
             raise ArtifactBuildError(f"{leg_id}: not present in --attribution-json's own legs to gate a finding on")
         if row.get("decision_grade") is not True:
-            problems.append(f"{leg_id}: attribution decision_grade is {row.get('decision_grade')!r}, not True")
+            reason = row.get("decision_grade_reason")
+            suffix = f" (recorded reason: {reason})" if isinstance(reason, str) and reason else ""
+            problems.append(f"{leg_id}: attribution decision_grade is {row.get('decision_grade')!r}, not True{suffix}")
     return problems
+
+
+def _contract_validity_problems(
+    merge_by_id: dict[str, dict], attr_by_id: dict[str, dict], leg_ids: tuple[str, ...]
+) -> list[str]:
+    """The contract's ONE validity gate (CONTRACT.md "Validity gate": kernel
+    table present; counter equations hold; `--expect-kernels-disabled`
+    satisfied on D legs; UNATTRIBUTED <= the recorded bound of gpu_busy),
+    applied per leg exactly as pre-registered: the first three clauses are
+    `profile_421_merge.py`'s own verdict (`_merge_verdict_problems`), the
+    fourth is `profile_421_attribute.py`'s `decision_grade`
+    (`_decision_grade_problems`). A leg failing ANY clause is not a valid
+    datum for ANY finding — whether the finding reads a chain share or a
+    plain per-step wall number. The gate was frozen as one gate; a finding
+    that read a per-step number off a leg the fourth clause refuses would be
+    splitting that gate after the numbers were seen, and that is exactly
+    what a pre-registration exists to forbid."""
+    return _merge_verdict_problems(merge_by_id, leg_ids) + _decision_grade_problems(attr_by_id, leg_ids)
+
+
+def _contract_valid(merge_by_id: dict[str, dict], attr_by_id: dict[str, dict], leg_id: str) -> bool:
+    """`True` iff `leg_id` is present in both reports AND passes every
+    clause of the contract's validity gate — for OPTIONAL supporting legs
+    (the A/D-arm set an invariance clause reads) that a finding may be
+    built WITHOUT; a REQUIRED leg goes through `_contract_validity_problems`
+    so its absence is a named refusal, never a silent "not applicable"."""
+    if leg_id not in merge_by_id or leg_id not in attr_by_id:
+        return False
+    return not _contract_validity_problems(merge_by_id, attr_by_id, (leg_id,))
+
+
+def _decision_legs_phrase(merge_by_id: dict[str, dict], legs_read: tuple[str, ...]) -> str:
+    """"across the F32/BF16 decision legs" when more than one decision leg
+    was read, "on the F32 decision leg (htsat-A1)" when exactly one was —
+    the sentence names the legs it was actually built from, never a fixed
+    "F32/BF16" that would keep claiming a dtype the gate excluded."""
+    dtypes = [str(merge_by_id[leg_id].get("dtype", "")).upper() for leg_id in legs_read]
+    if len(legs_read) > 1:
+        return f"across the {'/'.join(dtypes)} decision legs"
+    return f"on the {dtypes[0]} decision leg ({legs_read[0]})"
+
+
+def _excluded_legs_clause(legs_excluded: dict[str, str]) -> str:
+    if not legs_excluded:
+        return ""
+    parts = [
+        f"{leg_id} is excluded from this finding: it fails the contract's validity gate ({reason})"
+        for leg_id, reason in legs_excluded.items()
+    ]
+    return " " + "; ".join(parts) + "."
 
 
 def _direction_word(delta_pct: float, *, decrease: str, increase: str) -> str:
@@ -863,6 +950,17 @@ def _fmt_range(lo: float, hi: float, *, decimals: int = 0) -> str:
     if lo_s == hi_s:
         return lo_s
     return f"{lo_s}-{hi_s}"
+
+
+def invariance_word(axes: list[str]) -> str:
+    """The qualitative word an invariance clause may use for the axes the
+    legs it read actually span: `["dtype", "arm"]` -> "dtype- and
+    arm-invariant", `["arm"]` -> "arm-invariant". Shared with
+    `profile_421_render_docs.py` so a rendered restatement can never name
+    an axis the finding's own evidence does not carry."""
+    if not axes:
+        raise ArtifactBuildError("invariance_word: no axes — the clause has nothing to claim invariance over")
+    return "- and ".join(axes) + "-invariant"
 
 
 def _optional_leg_valid(merge_by_id: dict[str, dict], leg_id: str) -> bool:
@@ -925,22 +1023,28 @@ def compute_findings(
     #    cost not moving, which a share-of-wall ratio cannot show on its own
     #    (wall itself moves across arms as kernels are disabled).
     htsat_legs = ("htsat-A1", "htsat-A2")
-    problems = _merge_verdict_problems(merge_by_id, htsat_legs)
-    if problems:
-        _suppress("htsat-front-end-bound", htsat_legs, problems)
+    htsat_problems = {
+        leg_id: _contract_validity_problems(merge_by_id, attr_by_id, (leg_id,)) for leg_id in htsat_legs
+    }
+    legs_read = tuple(leg_id for leg_id in htsat_legs if not htsat_problems[leg_id])
+    legs_excluded = {leg_id: "; ".join(p) for leg_id, p in htsat_problems.items() if p}
+    if not legs_read:
+        _suppress("htsat-front-end-bound", htsat_legs, [p for ps in htsat_problems.values() for p in ps])
     else:
         htsat_shares = {
-            leg_id: _per_step_share(merge_legs, leg_id, "front_share_of_wall") * 100.0 for leg_id in htsat_legs
+            leg_id: _per_step_share(merge_legs, leg_id, "front_share_of_wall") * 100.0 for leg_id in legs_read
         }
         lo, hi = min(htsat_shares.values()), max(htsat_shares.values())
         front_end_bound = all(share >= FRONT_END_BOUND_SHARE_OF_WALL_MIN * 100.0 for share in htsat_shares.values())
         share_range = _fmt_range(lo, hi)
+        legs_phrase = _decision_legs_phrase(merge_by_id, legs_read)
+        excluded_clause = _excluded_legs_clause(legs_excluded)
         if front_end_bound:
             bound_clause = (
                 f"The HTSAT training step is CPU front-end-bound: front-end share of wall is {share_range}% "
-                f"across the F32/BF16 decision legs (rule: front_share_of_wall >= "
+                f"{legs_phrase} (rule: front_share_of_wall >= "
                 f"{FRONT_END_BOUND_SHARE_OF_WALL_MIN:.0%} on every leg read; audio decode/resample/STFT/mel "
-                "dominating wall time)."
+                f"dominating wall time).{excluded_clause}"
             )
         else:
             # The not-front-end-bound arm names the SAME front-end
@@ -950,23 +1054,35 @@ def compute_findings(
             # it did not hold on every leg read); the clause must drop that
             # word rather than keep it regardless of which arm fired.
             bound_clause = (
-                f"HTSAT's front-end share of wall is {share_range}% across the F32/BF16 decision legs (rule: "
+                f"HTSAT's front-end share of wall is {share_range}% {legs_phrase} (rule: "
                 f"front_share_of_wall >= {FRONT_END_BOUND_SHARE_OF_WALL_MIN:.0%} on every leg read was NOT met "
                 "on every leg, so 'front-end-bound' is not asserted; the front-end work here is audio "
-                "decode/resample/STFT/mel)."
+                f"decode/resample/STFT/mel).{excluded_clause}"
             )
 
         evidence: dict[str, object] = {
             "front_share_of_wall_pct": htsat_shares,
             "front_end_bound_rule": f"front_share_of_wall >= {FRONT_END_BOUND_SHARE_OF_WALL_MIN} on every leg read",
             "front_end_bound": front_end_bound,
+            "legs_read": list(legs_read),
+            "legs_excluded": legs_excluded,
         }
 
+        # The invariance clause reads every A/D-arm leg that passes the
+        # contract's validity gate. "arm-invariant" needs BOTH arms among
+        # the legs read; "dtype-" is added only when BOTH dtypes are — the
+        # words name the axes the legs read actually span, never a fixed
+        # "dtype- and arm-" that would keep claiming an axis the gate
+        # excluded every witness of.
         arm_leg_ids = ("htsat-A1", "htsat-A2", "htsat-D1", "htsat-D2")
+        arm_legs_read = tuple(leg_id for leg_id in arm_leg_ids if _contract_valid(merge_by_id, attr_by_id, leg_id))
+        arms_read = {str(merge_by_id[leg_id].get("arm")) for leg_id in arm_legs_read}
+        dtypes_read = {str(merge_by_id[leg_id].get("dtype")) for leg_id in arm_legs_read}
+        invariance_axes = (["dtype"] if {"f32", "bf16"} <= dtypes_read else []) + (["arm"] if {"A", "D"} <= arms_read else [])
         invariance_clause = ""
-        if all(_optional_leg_valid(merge_by_id, leg_id) for leg_id in arm_leg_ids):
+        if "arm" in invariance_axes:
             front_seconds = {
-                leg_id: _per_step_finite(merge_legs, leg_id, "front_s_per_step") for leg_id in arm_leg_ids
+                leg_id: _per_step_finite(merge_legs, leg_id, "front_s_per_step") for leg_id in arm_legs_read
             }
             smin, smax = min(front_seconds.values()), max(front_seconds.values())
             smean = sum(front_seconds.values()) / len(front_seconds)
@@ -978,31 +1094,52 @@ def compute_findings(
                 rel_spread = math.inf
             arm_invariant = rel_spread <= ARM_INVARIANCE_REL_SPREAD_MAX
             seconds_range = _fmt_range(smin, smax, decimals=3)
+            axes_word = invariance_word(invariance_axes)
+            legs_desc = (
+                f"every contract-valid {'/'.join(sorted(d.upper() for d in dtypes_read))} x "
+                f"{'/'.join(sorted(arms_read))}-arm leg read ({', '.join(arm_legs_read)})"
+            )
             if arm_invariant:
                 invariance_clause = (
-                    f" Front-end time itself is {seconds_range} s/step across every F32/BF16 x A/D-arm leg "
-                    f"read (relative spread {rel_spread * 100.0:.1f}%, within the "
-                    f"{ARM_INVARIANCE_REL_SPREAD_MAX:.0%} arm-invariance rule), so this cost is dtype- and "
-                    "arm-invariant."
+                    f" Front-end time itself is {seconds_range} s/step across {legs_desc} "
+                    f"(relative spread {rel_spread * 100.0:.1f}%, within the "
+                    f"{ARM_INVARIANCE_REL_SPREAD_MAX:.0%} arm-invariance rule), so this cost is {axes_word}."
                 )
             else:
                 invariance_clause = (
-                    f" Front-end time is {seconds_range} s/step across every F32/BF16 x A/D-arm leg read "
+                    f" Front-end time is {seconds_range} s/step across {legs_desc} "
                     f"(relative spread {rel_spread * 100.0:.1f}%, above the {ARM_INVARIANCE_REL_SPREAD_MAX:.0%} "
-                    "arm-invariance rule) — not treated as dtype-/arm-invariant here."
+                    f"arm-invariance rule) — not treated as invariant over {'/'.join(invariance_axes)} here."
                 )
+            arm_excluded = {
+                leg_id: "; ".join(_contract_validity_problems(merge_by_id, attr_by_id, (leg_id,)))
+                for leg_id in arm_leg_ids
+                if leg_id in merge_by_id and leg_id in attr_by_id and not _contract_valid(merge_by_id, attr_by_id, leg_id)
+            }
+            # A D-arm leg the gate excluded is named HERE (the decision legs'
+            # own exclusions are already named in the primary clause).
+            clause_only = {leg_id: r for leg_id, r in arm_excluded.items() if leg_id not in legs_excluded}
+            if clause_only:
+                invariance_clause += " " + "; ".join(
+                    f"{leg_id} is excluded from this clause: it fails the contract's validity gate ({reason})"
+                    for leg_id, reason in clause_only.items()
+                ) + "."
             evidence["front_s_per_step"] = front_seconds
             evidence["arm_invariance_rule"] = (
-                f"(max-min)/mean of front_s_per_step across every A/D leg read <= {ARM_INVARIANCE_REL_SPREAD_MAX}"
+                f"(max-min)/mean of front_s_per_step across every contract-valid A/D leg read <= "
+                f"{ARM_INVARIANCE_REL_SPREAD_MAX}"
             )
             evidence["arm_invariance_relative_spread"] = rel_spread
             evidence["arm_invariant"] = arm_invariant
+            evidence["invariance_axes"] = invariance_axes
+            evidence["arm_invariance_legs_read"] = list(arm_legs_read)
+            evidence["arm_invariance_legs_excluded"] = arm_excluded
 
         findings.append({"id": "htsat-front-end-bound", "text": bound_clause + invariance_clause, "evidence": evidence})
 
     # 2) CLIP-vision front-end share of wall (A1 f32, A2 bf16 decision legs).
     vision_legs = ("clip-vision-A1", "clip-vision-A2")
-    problems = _merge_verdict_problems(merge_by_id, vision_legs)
+    problems = _contract_validity_problems(merge_by_id, attr_by_id, vision_legs)
     if problems:
         _suppress("clip-vision-front-end-share", vision_legs, problems)
     else:
@@ -1023,7 +1160,7 @@ def compute_findings(
 
     # 3) CLIP launch-bound at batch 8, + the BF16 busy/wall trade.
     launch_legs = ("clip-text-A1", "clip-text-A2", "clip-vision-A1", "clip-vision-A2")
-    problems = _merge_verdict_problems(merge_by_id, launch_legs)
+    problems = _contract_validity_problems(merge_by_id, attr_by_id, launch_legs)
     if problems:
         _suppress("clip-launch-bound-batch8", launch_legs, problems)
     else:
@@ -1152,7 +1289,7 @@ def compute_findings(
     #    Reads a CHAIN SHARE, so this gates on decision_grade too, not just
     #    the merge verdict.
     c_attn_legs = ("htsat-A1",)
-    problems = _merge_verdict_problems(merge_by_id, c_attn_legs) + _decision_grade_problems(attr_by_id, c_attn_legs)
+    problems = _contract_validity_problems(merge_by_id, attr_by_id, c_attn_legs)
     if problems:
         _suppress("c-attn-htsat-out-of-tier", c_attn_legs, problems)
     else:
@@ -1550,6 +1687,25 @@ def _identity_template_context(
     # other's own gate would have refused.
     context.update(_htsat_bound_deviation_context("htsat_a1", "htsat-A1", merge_by_id, attr_by_id, attribution_legs, bound))
     context.update(_htsat_bound_deviation_context("htsat_a2", "htsat-A2", merge_by_id, attr_by_id, attribution_legs, bound))
+    # What failing the gate COSTS: the leg is excluded from every finding
+    # that would read it — stated next to the failure, never left for a
+    # reader to infer from a headline range that quietly narrowed.
+    htsat_decision_read = [
+        leg_id for leg_id in ("htsat-A1", "htsat-A2") if _contract_valid(merge_by_id, attr_by_id, leg_id)
+    ]
+    if _contract_valid(merge_by_id, attr_by_id, "htsat-A2"):
+        consequence = ""
+    elif htsat_decision_read:
+        consequence = (
+            " It is therefore excluded from every finding that would read it: the HTSAT front-end finding "
+            f"reads {', '.join(htsat_decision_read)} only and asserts no dtype-invariance."
+        )
+    else:
+        consequence = (
+            " It is therefore excluded from every finding that would read it, and with no contract-valid "
+            "HTSAT decision leg left the HTSAT front-end finding is suppressed."
+        )
+    context["htsat_a2_findings_consequence_clause"] = consequence
     context.update(
         {
             # The RUN'S OWN recorded bounds (`recorded_limits` — see
@@ -1625,6 +1781,7 @@ def build_report(
 
     findings, suppressed_findings = compute_findings(merge_report, attribution_report, legs_dir)
     status = derive_status(merge_report)
+    contract_validity = build_contract_validity(merge_report, attribution_report, legs_dir)
     # Resolved ONCE, off THIS run's own `attribution_report["limits"]"
     # (`_resolve_recorded_limits`), and threaded to both the sidecar's own
     # template context and the top-level `report["limits"]` below — a
@@ -1655,6 +1812,11 @@ def build_report(
             "gating": "none",
         },
         "status": status,
+        # The contract's validity gate tallied per leg (all four clauses) —
+        # `status` above is the merge-level run status (its first three);
+        # a headline "N of M legs pass the contract's validity gate" reads
+        # THIS block, never `status`.
+        "contract_validity": contract_validity,
         "notes": {
             "what": identity.get("what"),
             "gpu": identity.get("gpu"),

@@ -334,7 +334,7 @@ class BuildReportHappyPathTests(unittest.TestCase):
         expected_keys = {
             "schema_version", "git_sha", "box", "p2_witnessed", "limits", "producer", "status", "notes",
             "legs", "p2", "attribution", "realized_gains", "candidate_decisions", "findings",
-            "suppressed_findings",
+            "suppressed_findings", "contract_validity",
         }
         self.assertEqual(set(report.keys()), expected_keys)
         self.assertEqual(report["schema_version"], 1)
@@ -1171,6 +1171,149 @@ class SignDerivedBf16WordingTests(unittest.TestCase):
         self.assertIn("clip-vision BF16 grows GPU busy", finding["text"])
 
 
+class ContractValidityGateTests(unittest.TestCase):
+    """CONTRACT.md's validity gate is ONE pre-registered gate with four
+    clauses; `profile_421_merge.py` decides the first three and
+    `profile_421_attribute.py`'s `decision_grade` the fourth. A leg failing
+    ANY clause is not a datum for ANY finding — a per-step wall number is
+    not exempt just because it is not a chain share — and every exclusion
+    is named in the finding's own text and evidence, never absorbed into a
+    range that quietly narrowed."""
+
+    def setUp(self):
+        self._tmp = tempfile.TemporaryDirectory()
+        self.root = Path(self._tmp.name)
+
+    def tearDown(self):
+        self._tmp.cleanup()
+
+    @staticmethod
+    def _fail_a2(attribution_report):
+        for row in attribution_report["legs"]:
+            if row["leg_id"] == "htsat-A2":
+                row["decision_grade"] = False
+                row["chains"]["UNATTRIBUTED"]["share_gpu_busy"] = 0.0566
+                row["decision_grade_reason"] = "UNATTRIBUTED share_gpu_busy=0.0566 > 0.05"
+
+    def _fixture(self, **kwargs):
+        return _write_fixture(self.root, **kwargs)
+
+    def _report(self, fixture):
+        return art.build_report(
+            fixture["legs_dir"], fixture["p2_dir"], fixture["merge_report"], fixture["attribution_report"], fixture["identity"]
+        )
+
+    def test_a_decision_leg_failing_the_fourth_clause_is_excluded_from_the_front_end_finding(self):
+        specs = dict(LEG_SPECS)
+        specs.update(QualitativeWordRuleTests.HTSAT_D_LEGS_WITHIN_TOLERANCE)
+        fixture = self._fixture(leg_specs=specs, attr_override=self._fail_a2)
+        findings, suppressed = art.compute_findings(fixture["merge_report"], fixture["attribution_report"], fixture["legs_dir"])
+        finding = {f["id"]: f for f in findings}["htsat-front-end-bound"]
+        self.assertEqual(suppressed, [])
+        self.assertIn("on the F32 decision leg (htsat-A1)", finding["text"])
+        self.assertNotIn("F32/BF16", finding["text"])
+        self.assertIn(
+            "htsat-A2 is excluded from this finding: it fails the contract's validity gate "
+            "(htsat-A2: attribution decision_grade is False, not True (recorded reason: "
+            "UNATTRIBUTED share_gpu_busy=0.0566 > 0.05))",
+            finding["text"],
+        )
+        self.assertEqual(finding["evidence"]["legs_read"], ["htsat-A1"])
+        self.assertEqual(list(finding["evidence"]["legs_excluded"]), ["htsat-A2"])
+        self.assertEqual(finding["evidence"]["front_share_of_wall_pct"], {"htsat-A1": LEG_SPECS["htsat-A1"]["front_share"] * 100.0})
+        # No BF16 leg was read, so the invariance clause spans ARMS only —
+        # "dtype-" is not a word this run's own legs license.
+        self.assertEqual(finding["evidence"]["invariance_axes"], ["arm"])
+        self.assertIn("so this cost is arm-invariant.", finding["text"])
+        self.assertNotIn("dtype- and arm-invariant", finding["text"])
+        self.assertEqual(finding["evidence"]["arm_invariance_legs_read"], ["htsat-A1", "htsat-D1", "htsat-D2"])
+        self.assertEqual(list(finding["evidence"]["arm_invariance_legs_excluded"]), ["htsat-A2"])
+        # The decision-leg exclusion is named once, in the primary clause.
+        self.assertEqual(finding["text"].count("htsat-A2 is excluded"), 1)
+
+    def test_front_end_finding_is_suppressed_when_no_decision_leg_passes_the_gate(self):
+        def fail_both(attribution_report):
+            for row in attribution_report["legs"]:
+                if row["leg_id"] in ("htsat-A1", "htsat-A2"):
+                    row["decision_grade"] = False
+                    row["decision_grade_reason"] = "leg is INVALID: synthetic"
+
+        fixture = self._fixture(attr_override=fail_both)
+        findings, suppressed = art.compute_findings(fixture["merge_report"], fixture["attribution_report"], fixture["legs_dir"])
+        self.assertNotIn("htsat-front-end-bound", {f["id"] for f in findings})
+        row = {s["id"]: s for s in suppressed}["htsat-front-end-bound"]
+        self.assertEqual(row["legs"], ["htsat-A1", "htsat-A2"])
+        self.assertIn("htsat-A1: attribution decision_grade is False", row["reason"])
+        self.assertIn("htsat-A2: attribution decision_grade is False", row["reason"])
+
+    def test_a_per_step_finding_is_suppressed_when_its_leg_fails_the_fourth_clause(self):
+        """The CLIP-vision front-end share reads a per-step number, not a
+        chain share — it is still gated on the WHOLE contract gate."""
+        def fail_vision_a2(attribution_report):
+            for row in attribution_report["legs"]:
+                if row["leg_id"] == "clip-vision-A2":
+                    row["decision_grade"] = False
+                    row["decision_grade_reason"] = "UNATTRIBUTED share_gpu_busy=0.0700 > 0.05"
+
+        fixture = self._fixture(attr_override=fail_vision_a2)
+        findings, suppressed = art.compute_findings(fixture["merge_report"], fixture["attribution_report"], fixture["legs_dir"])
+        self.assertNotIn("clip-vision-front-end-share", {f["id"] for f in findings})
+        self.assertNotIn("clip-launch-bound-batch8", {f["id"] for f in findings})
+        reasons = {s["id"]: s["reason"] for s in suppressed}
+        self.assertIn("clip-vision-A2: attribution decision_grade is False", reasons["clip-vision-front-end-share"])
+        self.assertIn("(recorded reason: UNATTRIBUTED share_gpu_busy=0.0700 > 0.05)", reasons["clip-launch-bound-batch8"])
+
+    def test_report_tallies_the_gate_per_leg(self):
+        fixture = self._fixture(attr_override=self._fail_a2)
+        report = self._report(fixture)
+        cv = report["contract_validity"]
+        self.assertEqual((cv["legs_total"], cv["legs_valid"]), (6, 5))
+        self.assertEqual([f["leg_id"] for f in cv["legs_failing"]], ["htsat-A2"])
+        self.assertEqual(cv["legs_failing"][0]["decision_grade_reason"], "UNATTRIBUTED share_gpu_busy=0.0566 > 0.05")
+        self.assertIn("UNATTRIBUTED <= limits.unattributed_decision_grade_limit", cv["gate"])
+        by_id = {row["leg_id"]: row for row in report["legs"]}
+        self.assertFalse(by_id["htsat-A2"]["contract_valid"])
+        self.assertEqual(len(by_id["htsat-A2"]["contract_validity_problems"]), 1)
+        self.assertTrue(all(by_id[leg]["contract_valid"] for leg in by_id if leg != "htsat-A2"))
+        # The merge-level run status is a DIFFERENT, narrower fact and stays what it is.
+        self.assertEqual(report["status"], "GREEN")
+
+    def test_report_tallies_all_legs_valid_on_the_clean_fixture(self):
+        report = self._report(self._fixture())
+        cv = report["contract_validity"]
+        self.assertEqual((cv["legs_total"], cv["legs_valid"], cv["legs_failing"]), (6, 6, []))
+        self.assertTrue(all(row["contract_valid"] for row in report["legs"]))
+
+    def test_deviation_names_the_consequence_of_failing_the_gate(self):
+        template = (
+            "htsat-A2 is {htsat_a2_merge_verdict} at the merge level but {htsat_a2_decision_grade_word} for "
+            "attribution.{htsat_a2_findings_consequence_clause}"
+        )
+
+        def use_template(identity):
+            identity["recorded_deviations"] = [template]
+
+        failing = self._report(self._fixture(attr_override=self._fail_a2, identity_override=use_template))
+        self.assertEqual(
+            failing["notes"]["recorded_deviations"][0],
+            "htsat-A2 is VALID at the merge level but NOT decision-grade for attribution. It is therefore "
+            "excluded from every finding that would read it: the HTSAT front-end finding reads htsat-A1 only "
+            "and asserts no dtype-invariance.",
+        )
+        alt_root = Path(tempfile.mkdtemp(dir=str(self.root)))
+        clean = self._report(_write_fixture(alt_root, identity_override=use_template))
+        self.assertEqual(
+            clean["notes"]["recorded_deviations"][0],
+            "htsat-A2 is VALID at the merge level but decision-grade for attribution.",
+        )
+
+    def test_invariance_word_composes_from_the_axes_read(self):
+        self.assertEqual(art.invariance_word(["dtype", "arm"]), "dtype- and arm-invariant")
+        self.assertEqual(art.invariance_word(["arm"]), "arm-invariant")
+        with self.assertRaises(art.ArtifactBuildError):
+            art.invariance_word([])
+
+
 class QualitativeWordRuleTests(unittest.TestCase):
     """Every qualitative word `compute_findings` can emit is gated behind a
     NAMED, numeric rule recorded in the finding's own `evidence` — for each
@@ -1280,14 +1423,14 @@ class QualitativeWordRuleTests(unittest.TestCase):
         findings, _ = self._findings(leg_specs=specs)
         finding = self._by_id(findings)["htsat-front-end-bound"]
         self.assertNotIn("dtype- and arm-invariant", finding["text"])
-        self.assertIn("not treated as dtype-/arm-invariant here", finding["text"])
+        self.assertIn("not treated as invariant over dtype/arm here", finding["text"])
         self.assertFalse(finding["evidence"]["arm_invariant"])
         self.assertGreater(finding["evidence"]["arm_invariance_relative_spread"], art.ARM_INVARIANCE_REL_SPREAD_MAX)
         # The rule failing never suppresses the finding itself, nor the
         # PRIMARY (front_share_of_wall) clause -- only the invariance clause.
         self.assertIn("is CPU front-end-bound", finding["text"])
 
-    def test_arm_invariant_clause_absent_when_one_d_leg_is_invalid(self):
+    def test_arm_invariance_reads_only_the_contract_valid_d_legs_and_names_the_excluded_one(self):
         specs = dict(LEG_SPECS)
         specs.update(self.HTSAT_D_LEGS_WITHIN_TOLERANCE)
 
@@ -1298,9 +1441,31 @@ class QualitativeWordRuleTests(unittest.TestCase):
 
         findings, _ = self._findings(leg_specs=specs, merge_override=invalidate_one_d_leg)
         finding = self._by_id(findings)["htsat-front-end-bound"]
-        self.assertNotIn("arm-invariant", finding["text"])
+        # Both arms are still witnessed (A1, A2, D1), so the clause is built
+        # from exactly those legs and NAMES the leg the gate excluded.
+        self.assertIn("dtype- and arm-invariant", finding["text"])
+        self.assertIn("(htsat-A1, htsat-A2, htsat-D1)", finding["text"])
+        self.assertIn("htsat-D2 is excluded from this clause: it fails the contract's validity gate", finding["text"])
+        self.assertEqual(finding["evidence"]["arm_invariance_legs_read"], ["htsat-A1", "htsat-A2", "htsat-D1"])
+        self.assertEqual(list(finding["evidence"]["arm_invariance_legs_excluded"]), ["htsat-D2"])
+        self.assertEqual(finding["evidence"]["invariance_axes"], ["dtype", "arm"])
         # The REQUIRED (A-arm) finding is entirely unaffected by an
         # OPTIONAL D-arm leg going invalid.
+        self.assertIn("is CPU front-end-bound", finding["text"])
+
+    def test_arm_invariance_clause_absent_when_no_d_leg_passes_the_gate(self):
+        specs = dict(LEG_SPECS)
+        specs.update(self.HTSAT_D_LEGS_WITHIN_TOLERANCE)
+
+        def invalidate_both_d_legs(merge_report):
+            for row in merge_report["legs"]:
+                if row["leg_id"] in ("htsat-D1", "htsat-D2"):
+                    row["verdict"] = "INVALID"
+
+        findings, _ = self._findings(leg_specs=specs, merge_override=invalidate_both_d_legs)
+        finding = self._by_id(findings)["htsat-front-end-bound"]
+        self.assertNotIn("arm-invariant", finding["text"])
+        self.assertNotIn("invariance_axes", finding["evidence"])
         self.assertIn("is CPU front-end-bound", finding["text"])
 
     # -- "are launch-bound" -------------------------------------------------

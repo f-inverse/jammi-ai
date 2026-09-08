@@ -26,7 +26,9 @@ line of work, never folded into UNATTRIBUTED and never decided under #421.
 ## What was measured
 
 <!-- profile-421-generated: measured-summary -->
-All 12 legs are VALID; the BF16 pre-flight (P2) passes on all three towers. Source:
+11 of 12 legs pass the contract's validity gate — `htsat-A2` fails it (UNATTRIBUTED
+share_gpu_busy=0.0566 > 0.05) and is excluded from every finding; the BF16 pre-flight (P2) passes
+on all three towers. Source:
 `crates/jammi-kernels/artifacts/cuda-runs/2026-09-07-profile-421-towers-c1b0b0ba-a100-sxm4.json`
 (NVIDIA A100-SXM4-80GB, driver 580.126.16, nsys 2025.3.2.474, git sha
 `c1b0b0bad1f79a4ad6c298400e6ea19cc1ca633c`).
@@ -80,10 +82,10 @@ them bought.
 <!-- profile-421-generated: decision-grade-note -->
 All four candidate ports the contract named are **UNRESOLVED** — decided on BOTH the F32
 (A1) and BF16 (A2) decision legs of each tower (the pass-4 census-key fix, below, makes
-both CLIP-tower A2 legs decision-grade for attribution — `htsat-A2` stays VALID but
-non-decision-grade, see the deviation below; HTSAT has no candidate port under this
-contract, so that never blocks a candidate-port decision — no candidate is F32-only by
-consequence):
+both CLIP-tower A2 legs decision-grade for attribution — `htsat-A2` is merge-VALID but
+fails the contract's validity gate and is excluded from every finding, see the deviation
+below; HTSAT has no candidate port under this contract, so that never blocks a
+candidate-port decision — no candidate is F32-only by consequence):
 <!-- /profile-421-generated -->
 
 <!-- profile-421-generated: candidate-reasons -->
@@ -123,11 +125,13 @@ support, on either side.
 
 <!-- profile-421-generated: findings -->
 - **`htsat-front-end-bound`**: "The HTSAT training step is CPU front-end-bound: front-end
-  share of wall is 81-83% across the F32/BF16 decision legs (rule: front_share_of_wall >=
-  50% on every leg read; audio decode/resample/STFT/mel dominating wall time). Front-end
-  time itself is 1.249-1.255 s/step across every F32/BF16 x A/D-arm leg read (relative
-  spread 0.5%, within the 5% arm-invariance rule), so this cost is dtype- and
-  arm-invariant."
+  share of wall is 81% on the F32 decision leg (htsat-A1) (rule: front_share_of_wall >= 50%
+  on every leg read; audio decode/resample/STFT/mel dominating wall time). htsat-A2 is
+  excluded from this finding: it fails the contract's validity gate (htsat-A2: attribution
+  decision_grade is False, not True (recorded reason: UNATTRIBUTED share_gpu_busy=0.0566 >
+  0.05)). Front-end time itself is 1.249-1.255 s/step across every contract-valid F32 x
+  A/D-arm leg read (htsat-A1, htsat-D1, htsat-D2) (relative spread 0.5%, within the 5%
+  arm-invariance rule), so this cost is arm-invariant."
 - **`clip-vision-front-end-share`**: "CLIP-vision's image decode/preprocess front end is
   20-22% of wall on the F32/BF16 decision legs."
 - **`clip-launch-bound-batch8`**: "At batch 8 the CLIP training steps are launch-bound:
@@ -165,14 +169,16 @@ mechanism, only points at it.
   attribution under the fix.
 <!-- /profile-421-generated -->
 <!-- profile-421-generated: htsat-a2-deviation -->
-- **`htsat-A2` (bf16) is VALID but not decision-grade for attribution**: its UNATTRIBUTED
-  share of GPU busy is 5.66 %, over the contract's 5 % validity bound (window-partition
-  copies and the audio front end's own activation are still undeclared chains at the
-  identical element count as a generic residual-stream permute/reshape copy — the
-  attribution module declares neither rather than guess). `htsat-A1` (f32) clears the bound
-  and is decision-grade. HTSAT has no candidate port under this contract in the first
-  place, so `htsat-A2`'s own non-decision-grade status never blocks a candidate-port
-  decision.
+- **`htsat-A2` (bf16) is merge-VALID but fails the contract's validity gate (not
+  decision-grade for attribution)**: its UNATTRIBUTED share of GPU busy is 5.66 %, over the
+  contract's 5 % validity bound (window-partition copies and the audio front end's own
+  activation are still undeclared chains at the identical element count as a generic
+  residual-stream permute/reshape copy — the attribution module declares neither rather
+  than guess). `htsat-A1` (f32) clears the bound and is decision-grade. HTSAT has no
+  candidate port under this contract in the first place, so `htsat-A2`'s own
+  non-decision-grade status never blocks a candidate-port decision. It is excluded from
+  every finding that would read it: the HTSAT front-end finding reads `htsat-A1` only and
+  asserts no dtype-invariance.
 <!-- /profile-421-generated -->
 <!-- profile-421-generated: corpus-pool-note -->
 - Both media corpus producers emit families × instances = 24 files at any `--rows`, so the
@@ -229,6 +235,15 @@ mechanism, only points at it.
   function name in the frozen prose is stale. Not corrected in the frozen body (same
   never-edit-after-freeze doctrine as the "45 hermetic tests" bullet above), recorded here
   instead.
+
+- **`CONTRACT.md`'s own Status line (line 7) still reads "v2.4 … Not yet frozen" inside a
+  body whose header marks it frozen and whose title and §D6 declare v2.5.** The line is
+  frozen-body prose that was not updated when v2.5 froze (§D6 records v2.5 = v2.4 + the
+  round-3 folds). Not corrected in the frozen body (a pre-registration's text is never
+  edited after freezing — see the `citations-resolve-at` header note), recorded here
+  instead: the freeze itself is witnessed by the commit history (the freeze commit and the
+  citation epoch `bff1fad6` both precede the measured build `c1b0b0ba`), and the Status
+  line is descriptive prose no decision rule reads, so it never affected a verdict.
 
 ## PR trail
 

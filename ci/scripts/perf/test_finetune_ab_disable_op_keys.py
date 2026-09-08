@@ -10,7 +10,7 @@ eye.
 
 WHY THIS EXISTS: an eight-key version of `JAMMI_EAGER_DISABLE_OP_KEYS`
 shipped with a real gap (`mem_efficient_attention`, a live per-layer
-`admit_cascade` (`crates/jammi-encoders/src/attention_cascade.rs:860`) site AND
+`admit_cascade` (`crates/jammi-encoders/src/attention_cascade.rs:859`) site AND
 a live once-per-forward `op_disabled`
 (`crates/jammi-encoders/src/modernbert.rs:2364`) gate) that went
 undetected because every `finetune_ab.sh` sweep config has `seq <= 512`,
@@ -56,7 +56,7 @@ named two REAL, in-scope test call sites this excludes,
 `strict_mode_errors_instead_of_falling_back_on_a_failed_predicate`
 (`crates/jammi-encoders/src/layer_norm.rs:2428`) and
 `attention_block_strict_mode_errors_instead_of_falling_back_on_a_failed_predicate`
-(`crates/jammi-encoders/src/modernbert.rs:10582`), both `admit(AdmissionMode::Strict, "<a key
+(`crates/jammi-encoders/src/modernbert.rs:10578`), both `admit(AdmissionMode::Strict, "<a key
 already found at its own production site>", ...)` calls that exist purely
 to unit-test THAT op's Strict-mode error path, not a second live call
 site) — for every remaining `admit(`/`admit_cascade(`/`op_disabled(` call,

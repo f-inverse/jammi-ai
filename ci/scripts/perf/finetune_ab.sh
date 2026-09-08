@@ -331,14 +331,14 @@ REPO_ROOT="$(cd "$DIR/../../.." && pwd)"
 # `crates/jammi-encoders/src/activations.rs:174`, `attention_block_flash`
 # `crates/jammi-encoders/src/modernbert.rs:2004` (`op_disabled`, the
 # cascade's own capability gate), `attention_block_fused`
-# `crates/jammi-encoders/src/attention_cascade.rs:908` (moved out of
+# `crates/jammi-encoders/src/attention_cascade.rs:907` (moved out of
 # `crate::modernbert`, issue #462), `rope_fused`
 # `crates/jammi-encoders/src/modernbert.rs:486`, `softmax_last_dim_fused`
 # `crates/jammi-encoders/src/attention_cascade.rs:637` (moved out of
 # `crate::modernbert`, issue #462), `lora_linear_fused`
 # `crates/jammi-lora/src/lora_linear.rs:1007`, `adamw_step_fused`
 # `crates/jammi-ai/src/fine_tune/adamw.rs:259`, `mem_efficient_attention`
-# `crates/jammi-encoders/src/attention_cascade.rs:862` (`admit_cascade`, the
+# `crates/jammi-encoders/src/attention_cascade.rs:861` (`admit_cascade`, the
 # per-layer memeff cascade — consulted on EVERY training-mode attention
 # layer once the flash cascade has declined, BEFORE the block arm's own
 # `admit()`) and `op_disabled`

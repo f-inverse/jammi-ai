@@ -8751,20 +8751,17 @@ mod tests {
             memeff_after.fused, memeff_before.fused,
             "memeff must never dispatch fused for a dtype its own op cannot serve"
         );
-        // Exact delta (esc-092 / issue #476 BLOCK C: this was previously a
-        // `>` bound, on the claim that unrelated tests elsewhere in this
-        // binary could also bump `declined` inside this same window).
-        // `attention_cascade::training_attention_cascade`'s mechanical gate
-        // (`crate::test_support::assert_seam_lock_held`, checked at cascade
-        // ENTRY before any of its writes) now means EVERY training-mode
-        // call anywhere in this crate that reaches `mem_efficient_attention`'s
-        // `admit_cascade` — the cascade's only writer of this registry —
-        // holds `crate::test_support::seam_counter_lock()` for its own
-        // whole before/after window; `cargo test -p jammi-encoders --lib`
+        // Exact delta (esc-092 / issue #476). `attention_cascade::training_attention_cascade`'s
+        // mechanical gate (`crate::test_support::assert_seam_lock_held`,
+        // checked at cascade ENTRY before any of its writes) means EVERY
+        // training-mode call anywhere in this crate that reaches
+        // `mem_efficient_attention`'s `admit_cascade` — the cascade's only
+        // writer of this registry — holds `crate::test_support::seam_counter_lock()`
+        // for its own whole before/after window; `cargo test -p jammi-encoders --lib`
         // stays green only because that is true (an unlocked writer panics
         // there instead). While THIS test holds the lock, no other test's
         // forward can be concurrently bumping this counter, so one call's
-        // own decline is exactly `+1`, not merely `>`.
+        // own decline is exactly `+1`.
         assert_eq!(
             memeff_after.declined,
             memeff_before.declined + 1,
@@ -9005,14 +9002,13 @@ mod tests {
             "memeff must never dispatch fused for F16 -- the bundle-suppression seam must have \
              correctly declined to suppress"
         );
-        // Exact delta (esc-092 / issue #476 BLOCK C, same fix as the
-        // sibling test above): `training_attention_cascade`'s entry gate
-        // means every training-mode forward anywhere in this crate that
-        // reaches `mem_efficient_attention` holds
+        // Exact delta (esc-092 / issue #476): `training_attention_cascade`'s
+        // entry gate means every training-mode forward anywhere in this
+        // crate that reaches `mem_efficient_attention` holds
         // `crate::test_support::seam_counter_lock()` for its own window, so
         // while THIS test holds it, no concurrently-running test can also
         // be bumping this counter — this forward's own per-layer declines
-        // are exactly `model.layers.len()`, not merely a lower bound.
+        // are exactly `model.layers.len()`.
         assert_eq!(
             memeff_after.declined - memeff_before.declined,
             model.layers.len() as u64,
@@ -9615,10 +9611,10 @@ mod tests {
         // `<= ATTENTION_BLOCK_MAX_SEQ`, so memeff also declines) into the
         // block/eager fallthrough's OWN `masks.fused.is_none()` refusal —
         // the one this test's name and doc actually describe. The cascade
-        // gate now sits at ENTRY (esc-092 / issue #476 BLOCK A fold-in), so
-        // this call bumps `attention_block_flash.declined` and
-        // `mem_efficient_attention.declined` before the refusal fires —
-        // this test IS a writer even though it never dispatches Fused.
+        // gate sits at ENTRY (esc-092 / issue #476), so this call bumps
+        // `attention_block_flash.declined` and `mem_efficient_attention.declined`
+        // before the refusal fires — this test IS a writer even though it
+        // never dispatches Fused.
         let _lock = crate::test_support::seam_counter_lock();
         let device = Device::Cpu;
         let (b, s, h, d) = (1usize, 4usize, 2usize, ATTENTION_BLOCK_HEAD_DIM);

@@ -466,8 +466,8 @@ workspace ships every publishable crate at the same
   test's before/after window and a census/delta oracle would misattribute it to the wrong tower.
   `crate::test_support::seam_counter_lock()` replaces both locks with exactly one, and
   `crate::test_support::assert_seam_lock_held` is a `#[cfg(test)]`-only mechanical gate called from
-  the training arm of every one of those eight sites — critically, for `attention_cascade::training_attention_cascade`
-  (which writes THREE of the eight registries across four early-return branches) and
+  seven guard call sites covering all eight registries — critically, for `attention_cascade::training_attention_cascade`
+  (whose one guard call covers THREE of the eight registries across four early-return branches) and
   `modernbert::ModernBertAttention::forward_padded_transport_attention` (a second, separate
   `attention_block_flash` writer), the gate sits at each function's ENTRY, before its first write,
   not merely before its last — a first-round placement immediately before the LAST write left every

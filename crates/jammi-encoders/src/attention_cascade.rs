@@ -818,14 +818,13 @@ pub(crate) fn training_attention_cascade(
     on_flash_fused: impl FnOnce(&CompactedBatch) -> Result<Tensor, EncoderError>,
 ) -> Result<Tensor, EncoderError> {
     // The gate sits at ENTRY, before ANY of this cascade's three writes
-    // (`attention_block_flash`, `mem_efficient_attention`, `attention_block_fused`)
-    // — not immediately before the LAST one, the way an earlier revision of
-    // this fix placed it. Four early returns sit between entry and the
-    // final `attention_block_fused` admit() below (the flash-fused return,
-    // the memeff-fused return, and two typed-refusal returns); a caller
-    // that takes any of the earlier `admit_cascade` writes and then returns
-    // early bypasses a check placed later in this function, so the check
-    // must run before the FIRST write, not merely before the LAST one.
+    // (`attention_block_flash`, `mem_efficient_attention`, `attention_block_fused`).
+    // Four early returns sit between entry and the final `attention_block_fused`
+    // admit() below (the flash-fused return, the memeff-fused return, and two
+    // typed-refusal returns); a caller that takes any of the earlier
+    // `admit_cascade` writes and then returns early would bypass a check
+    // placed later in this function, so the check runs before the FIRST
+    // write, not merely before the LAST one.
     #[cfg(test)]
     crate::test_support::assert_seam_lock_held("attention_cascade::training_attention_cascade");
     // Flash cascade: reported here for EVERY caller (contract shared

@@ -558,8 +558,11 @@ workspace ships every publishable crate at the same
   one of these client-visible precondition failures — the context-predictor surface previously
   raised its own `JammiError::Inference` here, which maps to gRPC `Internal` at the wire boundary
   instead of `InvalidArgument`, disagreeing with the resolver surface for the identical class of
-  outcome; a wire-boundary test now pins all four combinations (resolver/predictor ×
-  integrity/transport) through `map_engine_error`.
+  outcome; a wire-boundary test now pins each combination (resolver/predictor ×
+  pointer/integrity/not-published/transport) through `map_engine_error`, composing with — never
+  substituting for — the it-tests that pin each surface actually raising the claimed variant on a
+  real reload (a chmod fault's variant is pinned by name, `StorageError::Io`, not merely
+  `!= Model`).
 - **A `Utf8View` path column is accepted by `arrow_to_images`/`arrow_to_audio`, matching `Utf8`
   exactly (esc-090).** Both functions matched `Utf8`/`LargeUtf8`/`Binary`/`LargeBinary`/
   `BinaryView` but had no `Utf8View` arm, so a `Utf8View` path column — DataFusion's parquet

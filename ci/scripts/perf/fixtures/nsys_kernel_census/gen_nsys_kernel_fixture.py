@@ -147,6 +147,19 @@ _N_LAUNCHES = 5
 _M_LAUNCHES = 30
 
 
+def _check(condition: object, message: object) -> None:
+    """`assert condition, message`, but never a bare `assert` statement: a
+    bare `assert` is stripped ENTIRELY under `python -O`, which would
+    silently disable every self-test check in this module in exactly the
+    deployment shape that removes the safety net without removing the code
+    path it protects (the same class of gap
+    `check_producer_provenance_gates.py`'s own `REPO_ROOT` guard was fixed
+    to avoid). Every self-test assertion in this file goes through this
+    function instead."""
+    if not condition:
+        raise AssertionError(message)
+
+
 def _normalize_sql(sql: str | None) -> str:
     """Collapses whitespace in a `sqlite_master.sql` `CREATE TABLE` string
     so an incidental reformatting (never observed from this module's own
@@ -157,29 +170,32 @@ def _normalize_sql(sql: str | None) -> str:
 
 def _logical_snapshot(path: str) -> tuple[dict[str, str], dict[str, list[tuple]]]:
     """Reads `path` as a sqlite file and returns `(schema, data)`:
-    `schema` maps each table name to its normalized `CREATE TABLE` text
-    (`sqlite_master.sql`), `data` maps each table name to its FULL row set
-    in a CANONICAL (sorted-tuple) order -- independent of insertion order,
-    rowid assignment, page layout, or any other on-disk-only detail. Two
-    sqlite files with equal `(schema, data)` snapshots describe the
-    identical logical content even if their raw bytes differ (a different
-    `PRAGMA user_version`, a `VACUUM`ed copy, a different sqlite library
-    version's header/page-layout choices)."""
+    `schema` maps each `sqlite_master` OBJECT (every `type` -- `table`,
+    `index`, `trigger`, `view` -- not `table` alone; a real nsys export or
+    a `VACUUM`/tooling pass can carry an index or a view alongside its
+    tables, and a schema-identity oracle that only ever looked at `table`
+    rows would miss drift in any of the others) keyed `"{type}:{name}"` to
+    its normalized DDL text (`sqlite_master.sql`, `NULL` for an
+    implicitly-created autoindex normalized to `""`), `data` maps each
+    TABLE name (the only object type that has its own row set to compare)
+    to its FULL row set in a CANONICAL (sorted-tuple) order -- independent
+    of insertion order, rowid assignment, page layout, or any other
+    on-disk-only detail. Two sqlite files with equal `(schema, data)`
+    snapshots describe the identical logical content even if their raw
+    bytes differ (a different `PRAGMA user_version`, a `VACUUM`ed copy, a
+    different sqlite library version's header/page-layout choices)."""
     con = sqlite3.connect(path)
     try:
-        names = [
-            row[0]
-            for row in con.execute(
-                "SELECT name FROM sqlite_master WHERE type='table' ORDER BY name"
-            ).fetchall()
-        ]
-        schema: dict[str, str] = {}
+        objects = con.execute(
+            "SELECT type, name, sql FROM sqlite_master ORDER BY type, name"
+        ).fetchall()
+        schema: dict[str, str] = {
+            f"{obj_type}:{name}": _normalize_sql(sql) for obj_type, name, sql in objects
+        }
         data: dict[str, list[tuple]] = {}
-        for name in names:
-            (sql,) = con.execute(
-                "SELECT sql FROM sqlite_master WHERE type='table' AND name=?", (name,)
-            ).fetchone()
-            schema[name] = _normalize_sql(sql)
+        for obj_type, name, _sql in objects:
+            if obj_type != "table":
+                continue
             # `name` is read from this same file's own `sqlite_master`, never caller input.
             rows = con.execute(f"SELECT * FROM {name}").fetchall()
             data[name] = sorted(rows)
@@ -310,10 +326,11 @@ def self_test() -> int:
             (m_path, m_path_repeat, "m.sqlite"),
         ):
             with open(a, "rb") as fa, open(b, "rb") as fb:
-                assert fa.read() == fb.read(), (
+                _check(
+                    fa.read() == fb.read(),
                     f"{label}: two fresh regenerations on this SAME sqlite library produced "
                     "different bytes -- the generator itself is not deterministic (check for "
-                    "RNG, a wall-clock read, or non-fixed StringIds/row ordering)"
+                    "RNG, a wall-clock read, or non-fixed StringIds/row ordering)",
                 )
 
         # (2) `kernel_census.build_report` accepts a fresh-built pair
@@ -322,9 +339,9 @@ def self_test() -> int:
         report = kernel_census.build_report(
             n_path, m_path, steps_a=100, steps_b=600, wall_a=1.0, wall_b=6.0
         )
-        assert report["nsys_sqlite_schema_ok"] is True, report
-        assert report["launches_per_step"] > 0, report
-        assert report["fixed_cost_buckets"] == 0, report
+        _check(report["nsys_sqlite_schema_ok"] is True, report)
+        _check(report["launches_per_step"] > 0, report)
+        _check(report["fixed_cost_buckets"] == 0, report)
 
         # (3) LOGICAL identity (schema + full row set, canonically ordered)
         # between a fresh regeneration and each committed file -- the
@@ -351,18 +368,18 @@ def self_test() -> int:
         committed_report = kernel_census.build_report(
             committed_n, committed_m, steps_a=0, steps_b=1
         )
-        assert committed_report["steps_diff"] == 1, committed_report
-        assert committed_report["launches_per_step"] == expected_dn, committed_report
-        assert committed_report["fixed_cost_buckets"] == 0, committed_report
+        _check(committed_report["steps_diff"] == 1, committed_report)
+        _check(committed_report["launches_per_step"] == expected_dn, committed_report)
+        _check(committed_report["fixed_cost_buckets"] == 0, committed_report)
         by_name = committed_report["by_kernel_name"]
-        assert len(by_name) == 1, by_name
-        assert by_name[0]["kernel"] == KERNEL_DEMANGLED_NAME, by_name
-        assert by_name[0]["launches_per_step"] == expected_dn, by_name
+        _check(len(by_name) == 1, by_name)
+        _check(by_name[0]["kernel"] == KERNEL_DEMANGLED_NAME, by_name)
+        _check(by_name[0]["launches_per_step"] == expected_dn, by_name)
         by_grid = committed_report["by_kernel_and_grid"]
-        assert len(by_grid) == 1, by_grid
-        assert by_grid[0]["kernel"] == KERNEL_DEMANGLED_NAME, by_grid
-        assert by_grid[0]["grid"] == list(GRID), by_grid
-        assert by_grid[0]["block"] == list(BLOCK), by_grid
+        _check(len(by_grid) == 1, by_grid)
+        _check(by_grid[0]["kernel"] == KERNEL_DEMANGLED_NAME, by_grid)
+        _check(by_grid[0]["grid"] == list(GRID), by_grid)
+        _check(by_grid[0]["block"] == list(BLOCK), by_grid)
 
         # Meta-check: the oracle used in (3) actually discriminates real
         # drift (row/schema mutation, must RED) from benign byte-level-only

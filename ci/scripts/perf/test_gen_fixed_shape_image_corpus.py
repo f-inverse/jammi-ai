@@ -404,219 +404,27 @@ class PoolCacheTests(unittest.TestCase):
         self.assertEqual(gfi._pool_cache_key(*args), gfi._pool_cache_key(*args))
 
 
-class PoolConstructionClosureTests(unittest.TestCase):
-    """`_pool_construction_closure`: the fingerprint's function/constant set
-    must be the ACTUAL transitive closure `_build_pool` reaches, derived by
-    an AST walk at runtime, never a hand-maintained tuple that can
-    under-name the very call graph it claims to cover."""
-
-    _EXPECTED_FUNCTIONS = {
-        "_build_pool",
-        "_family_template",
-        "_image_name",
-        "_jittered",
-        "_png_chunk",
-        "encode_png",
-    }
-    _EXPECTED_CONSTANTS = {"_PNG_SIGNATURE", "_COLOR_TYPE_RGB", "_BIT_DEPTH", "_ZLIB_LEVEL"}
-
-    def test_closure_is_exactly_the_six_audited_functions_and_their_constants(self):
-        functions, constants = gfi._pool_construction_closure()
-        self.assertEqual(set(functions), self._EXPECTED_FUNCTIONS)
-        self.assertEqual(set(constants), self._EXPECTED_CONSTANTS)
-
-    def test_a_module_reference_is_skipped_not_raised(self):
-        """`math` and `random` are referenced by real closure members
-        (`_family_template`, `_build_pool`) but must not land in either
-        bucket -- the module-skip arm, not merely their absence from the
-        pinned sets above."""
-        functions, constants = gfi._pool_construction_closure()
-        self.assertNotIn("math", functions)
-        self.assertNotIn("math", constants)
-        self.assertNotIn("random", functions)
-        self.assertNotIn("random", constants)
-
-
-class ScopedReferenceCollectionTests(unittest.TestCase):
-    """`_referenced_global_names` must scope BINDINGS to the function's OWN
-    scope -- a name bound only inside a nested `def`/`lambda`/comprehension
-    must never suppress the enclosing function's own reference to a
-    same-named module global -- while still counting a LOAD anywhere in a
-    nested scope as a real reference, and must refuse outright on a
-    `globals()`/`getattr(...)` call it cannot see through."""
-
-    def test_a_nested_def_binding_does_not_shadow_the_outer_reference(self):
-        def outer():
-            def _describe():
-                _ZLIB_LEVEL = "inner"  # noqa: F841 -- binds ONLY _describe's own scope
-                return _ZLIB_LEVEL
-
-            return _ZLIB_LEVEL + _describe()  # noqa: F821 -- parsed, never called
-
-        refs = gfi._referenced_global_names(outer)
-        self.assertIn(
-            "_ZLIB_LEVEL",
-            refs,
-            "a nested def's own local binding must not remove the outer function's real "
-            "reference to a same-named module global",
-        )
-
-    def test_a_load_inside_a_nested_lambda_still_counts_as_a_reference(self):
-        def outer():
-            f = lambda: _BIT_DEPTH  # noqa: F821 -- parsed, never called
-            return f
-
-        refs = gfi._referenced_global_names(outer)
-        self.assertIn("_BIT_DEPTH", refs)
-
-    def test_a_load_inside_a_nested_comprehension_still_counts_as_a_reference(self):
-        def outer():
-            return [_COLOR_TYPE_RGB for _ in range(1)]  # noqa: F821 -- parsed, never called
-
-        refs = gfi._referenced_global_names(outer)
-        self.assertIn("_COLOR_TYPE_RGB", refs)
-
-    def test_a_comprehension_loop_target_does_not_leak_into_the_outer_bound_set(self):
-        def outer():
-            _ZLIB_LEVEL = [_ZLIB_LEVEL for _ZLIB_LEVEL in range(1)]  # noqa: F821,F841
-            return _ZLIB_LEVEL
-
-        # `_ZLIB_LEVEL` IS bound directly in `outer`'s own scope here (the
-        # assignment target, not the comprehension's loop variable), so it
-        # is correctly excluded -- the non-vacuous control on the test
-        # above: this producer's OWN scope binding still shadows as
-        # expected.
-        refs = gfi._referenced_global_names(outer)
-        self.assertNotIn("_ZLIB_LEVEL", refs)
-
-    def test_globals_subscript_access_is_refused(self):
-        def outer():
-            return globals()["_ZLIB_LEVEL"]
-
-        with self.assertRaises(gfi._DynamicGlobalAccessRefusal):
-            gfi._referenced_global_names(outer)
-
-    def test_getattr_dynamic_access_is_refused(self):
-        def outer():
-            return getattr(gfi, "_ZLIB_LEVEL")
-
-        with self.assertRaises(gfi._DynamicGlobalAccessRefusal):
-            gfi._referenced_global_names(outer)
-
-
-class ReprStableConstantClassificationTests(unittest.TestCase):
-    """`_is_repr_stable_constant`: the exact boundary between "safe to hash
-    by `repr()`" and "must be refused" that
-    [`gfi._pool_construction_closure`] relies on."""
-
-    def test_scalars_are_repr_stable(self):
-        for value in (1, "s", b"b", 1.5, True, False):
-            self.assertTrue(gfi._is_repr_stable_constant(value), repr(value))
-
-    def test_tuple_and_frozenset_of_safe_scalars_are_repr_stable(self):
-        self.assertTrue(gfi._is_repr_stable_constant((1, "s", b"b")))
-        self.assertTrue(gfi._is_repr_stable_constant(frozenset({1, 2, 3})))
-
-    def test_a_tuple_containing_an_unsafe_element_is_not_repr_stable(self):
-        class _Thing:
-            pass
-
-        self.assertFalse(gfi._is_repr_stable_constant((1, _Thing())))
-
-    def test_a_foreign_function_a_class_instance_and_a_mutable_container_are_not_repr_stable(self):
-        class _Thing:
-            pass
-
-        self.assertFalse(gfi._is_repr_stable_constant(_Thing()))
-        self.assertFalse(gfi._is_repr_stable_constant([1, 2]))
-        self.assertFalse(gfi._is_repr_stable_constant({1: 2}))
-        self.assertFalse(gfi._is_repr_stable_constant(gfi.encode_png))
-
-
-class ForeignAndDynamicAccessRefusalTests(unittest.TestCase):
-    """`_pool_construction_closure` must REFUSE -- never silently mis-key --
-    when a real closure member references something this fingerprint
-    cannot represent. Exercised on a REAL edited copy of the producer
-    module (never a monkeypatch): a monkeypatched replacement is ITSELF a
-    foreign callable relative to the module's own `globals()`, so a
-    monkeypatch-based proof of this refusal would only show the refusal
-    fires on an ordinary test fixture, not on the case it exists for."""
-
-    def test_a_from_import_helper_referenced_by_a_closure_member_is_refused(self):
-        variant = _load_variant_module(
-            [
-                (
-                    "from pathlib import Path\n",
-                    "from pathlib import Path\nfrom os.path import basename as _foreign_helper\n",
-                ),
-                (
-                    '    return f"img_f{family:02d}_i{instance:03d}.png"',
-                    '    return _foreign_helper(f"img_f{family:02d}_i{instance:03d}.png")',
-                ),
-            ],
-            "foreign_import",
-            self.addCleanup,
-        )
-        with self.assertRaises(ValueError):
-            variant._pool_construction_closure()
-
-    def test_globals_subscript_access_inside_a_closure_member_is_refused(self):
-        variant = _load_variant_module(
-            [
-                (
-                    '    return f"img_f{family:02d}_i{instance:03d}.png"',
-                    '    _ = globals()["_ZLIB_LEVEL"]\n'
-                    '    return f"img_f{family:02d}_i{instance:03d}.png"',
-                )
-            ],
-            "globals_access",
-            self.addCleanup,
-        )
-        # `variant` is a SEPARATE module object with its own
-        # `_DynamicGlobalAccessRefusal` class, so the raised instance is
-        # not an instance of `gfi._DynamicGlobalAccessRefusal` -- assert on
-        # the shared builtin base class instead.
-        with self.assertRaises(ValueError):
-            variant._pool_construction_closure()
-
-    def test_getattr_dynamic_access_inside_a_closure_member_is_refused(self):
-        variant = _load_variant_module(
-            [
-                (
-                    '    return f"img_f{family:02d}_i{instance:03d}.png"',
-                    '    _ = getattr(sys.modules[__name__], "_ZLIB_LEVEL")\n'
-                    '    return f"img_f{family:02d}_i{instance:03d}.png"',
-                )
-            ],
-            "getattr_access",
-            self.addCleanup,
-        )
-        with self.assertRaises(ValueError):
-            variant._pool_construction_closure()
-
-
 class RealSourceEditMovesTheKeyTests(unittest.TestCase):
-    """`_pool_cache_key` must track the pool-construction code's ACTUAL
-    SOURCE, not the identity of whatever object a name happens to be bound
-    to at test time. A `unittest.mock`/monkeypatch replaces the OBJECT
-    `globals()` looks up; `inspect.getsource` on the replacement then reads
-    the REPLACEMENT's own source, so a test-module lambda substituted in as
-    "a different implementation" is a genuinely different function living
-    in a DIFFERENT module -- `_pool_construction_closure`'s
-    `__globals__ is g` check correctly refuses to treat it as this module's
-    own code (see `ForeignAndDynamicAccessRefusalTests`), so a
-    monkeypatch-based proof cannot observe the property this fingerprint
-    exists to prove.
+    """`_pool_cache_key` hashes the producer MODULE'S OWN SOURCE BYTES
+    (`Path(__file__).read_bytes()`), so the key is intentionally MAXIMAL: a
+    real on-disk edit to ANY line of this module -- a function the pool
+    construction actually calls, a constant, a function the pool
+    construction never calls (`decode_png_rgb`), or even the module
+    docstring -- must move the key. No false cache hit is possible under
+    this design: two module states that differ by even one byte always hash
+    to two different keys. The cost of that completeness is a comment-only
+    edit forcing one extra pool regeneration -- seconds, in a test-only
+    cache -- which is why every case below is a POSITIVE control (the key
+    moves), not a mix of positive and negative ones.
 
-    These tests instead take the PRODUCER'S OWN SOURCE FILE, apply exactly
-    one textual edit to a single line inside a named function or constant
-    (each substring asserted unique in the file before the edit), import
-    the edited copy under a FRESH module name, and compare its
-    `_pool_cache_key` output against the unedited module's for identical
-    arguments -- a real code edit, not an object swap. The hand-pinned
-    `_EXPECTED_FUNCTIONS`/`_EXPECTED_CONSTANTS` sets in
-    `PoolConstructionClosureTests` remain a second, independent oracle on
-    the same closure."""
+    These tests take the PRODUCER'S OWN SOURCE FILE, apply exactly one
+    textual edit to a single line (each substring asserted unique in the
+    file before the edit), import the edited copy under a FRESH module
+    name via `_load_variant_module`, and compare its `_pool_cache_key`
+    output against the unedited module's for identical arguments -- a real
+    code edit, not an object swap, so a change that only a monkeypatch
+    could observe (and this key deliberately does not need to observe)
+    is never mistaken for proof."""
 
     _ARGS = (4, 3, 10, 8, 1)  # families, instances_per_family, size, jitter, seed
 
@@ -683,25 +491,27 @@ class RealSourceEditMovesTheKeyTests(unittest.TestCase):
         key = self._key_after("_BIT_DEPTH = 8", "_BIT_DEPTH = 9", "bit_depth")
         self.assertNotEqual(self.baseline, key)
 
-    def test_editing_a_non_member_function_leaves_the_key_unchanged(self):
+    def test_editing_decode_png_rgb_moves_the_key(self):
         """`decode_png_rgb` decodes bytes this producer already wrote and
-        plays no part in constructing them -- editing it must NOT move the
-        key (the non-vacuous negative control: unlike `_image_name`, which
-        the closure DOES reach -- see the test above)."""
+        plays no part in constructing them -- yet the key is the WHOLE
+        module's bytes, so editing it moves the key exactly as editing a
+        function the pool construction actually calls does (see the design
+        note on the class docstring: this fingerprint tracks no smaller a
+        unit than the file)."""
         key = self._key_after(
             "    if not data.startswith(_PNG_SIGNATURE):",
             "    if not data.startswith(_PNG_SIGNATURE):  # source-edit-proof",
             "decode_png_rgb",
         )
-        self.assertEqual(self.baseline, key)
+        self.assertNotEqual(self.baseline, key)
 
-    def test_editing_the_module_docstring_leaves_the_key_unchanged(self):
+    def test_editing_the_module_docstring_moves_the_key(self):
         key = self._key_after(
             "SHAPE GUARANTEE (issue #421 PR B's pre-registered training-step profile):",
             "SHAPE GUARANTEE EDITED (issue #421 PR B's pre-registered training-step profile):",
             "docstring",
         )
-        self.assertEqual(self.baseline, key)
+        self.assertNotEqual(self.baseline, key)
 
 
 class HeldOutSplitTests(unittest.TestCase):

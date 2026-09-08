@@ -247,16 +247,28 @@ def check_fake_knob_inertness(path: Path) -> list[str]:
 def check_producer_parity(path: Path) -> list[str]:
     """(B) — see module doc. Only applies to scripts that actually name a
     jammi-bench BINARY PATH (`.../jammi-bench`, never the source-tree
-    `crates/jammi-bench/...`)."""
+    `crates/jammi-bench/...`) in CODE.
+
+    Both halves of this check are computed off CODE lines only
+    (`_is_comment_line` strips every comment line first, the same
+    comment/code distinction (A) and (C) already draw): a comment
+    mentioning `.../jammi-bench` must never pull a script INTO scope (a
+    prose reference to another producer's binary path is not this script
+    invoking one), and a comment mentioning `provenance`/`build_sha` must
+    never satisfy the cross-check for a script that only names the tokens
+    in prose — either direction would let a comment forge or dodge this
+    gate's verdict without a single real line of code backing it."""
     text = path.read_text(encoding="utf-8", errors="replace")
-    if not BIN_ASSIGN_RE.search(text):
+    code_text = "\n".join(line for line in text.splitlines() if not _is_comment_line(line))
+    if not BIN_ASSIGN_RE.search(code_text):
         return []
-    missing = [tok for tok in ("provenance", "build_sha") if tok not in text]
+    missing = [tok for tok in ("provenance", "build_sha") if tok not in code_text]
     if missing:
         return [
-            f"{path}: names a jammi-bench binary path but is missing {missing} — every producer "
-            "that runs a jammi-bench binary must cross-check `$BIN provenance`'s build_sha before "
-            "writing a GREEN leg (unification contract C5.1)"
+            f"{path}: names a jammi-bench binary path but is missing {missing} in CODE (a "
+            "comment mentioning the token does not count) — every producer that runs a "
+            "jammi-bench binary must cross-check `$BIN provenance`'s build_sha before writing "
+            "a GREEN leg (unification contract C5.1)"
         ]
     return []
 
@@ -577,6 +589,38 @@ def self_test() -> int:
             '#!/usr/bin/env bash\n# see crates/jammi-bench/reference/torch_finetune_step.py\necho hi\n',
             check_producer_parity,
             None,
+        )
+
+        # (B) GREEN control: the ONLY mention of a jammi-bench BINARY path
+        # is inside a COMMENT — must never pull the script into scope (a
+        # comment naming another producer's binary path is not this script
+        # invoking one), so this is out-of-scope, not a RED for missing
+        # provenance/build_sha.
+        commit_and_check(
+            "ci/scripts/perf/good_comment_only_bin_path.sh",
+            (
+                '#!/usr/bin/env bash\n'
+                '# for comparison, see: $TARGET_DIR/release/jammi-bench\n'
+                'echo hi\n'
+            ),
+            check_producer_parity,
+            None,
+        )
+
+        # (B) RED: names a REAL binary path in code and invokes it, but
+        # `provenance`/`build_sha` appear ONLY inside a comment — a comment
+        # must never satisfy the cross-check on a script with no real code
+        # backing it.
+        commit_and_check(
+            "ci/scripts/perf/bad_comment_only_provenance.sh",
+            (
+                '#!/usr/bin/env bash\n'
+                '# TODO: cross-check "$BIN" provenance build_sha before shipping\n'
+                'BIN="$TARGET_DIR/release/jammi-bench"\n'
+                '"$BIN" finetune-step --batch 1\n'
+            ),
+            check_producer_parity,
+            "missing",
         )
 
         # (C) RED: a `_DRY_RUN_` knob read completely unguarded — no

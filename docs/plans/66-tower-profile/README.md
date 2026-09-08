@@ -25,9 +25,12 @@ line of work, never folded into UNATTRIBUTED and never decided under #421.
 
 ## What was measured
 
+<!-- profile-421-generated: measured-summary -->
 All 12 legs are VALID; the BF16 pre-flight (P2) passes on all three towers. Source:
 `crates/jammi-kernels/artifacts/cuda-runs/2026-09-07-profile-421-towers-c1b0b0ba-a100-sxm4.json`
-(A100-SXM4-80GB, driver 580.126.16, nsys 2025.3.2.474, git sha `c1b0b0bad1f79a4ad6c298400e6ea19cc1ca633c`).
+(NVIDIA A100-SXM4-80GB, driver 580.126.16, nsys 2025.3.2.474, git sha
+`c1b0b0bad1f79a4ad6c298400e6ea19cc1ca633c`).
+<!-- /profile-421-generated -->
 
 | tower | leg | dtype | wall s/step | front s/step | GPU busy s/step | residual s/step | front % of wall | busy % of wall |
 |---|---|---|---:|---:|---:|---:|---:|---:|
@@ -149,16 +152,18 @@ mechanism, only points at it.
   with its own producers, corrupting every leg's manifest at the pre-fix tip. Fixed by PR
   #469 (`fix/421-driver-corpus-stdout`, four rounds); this artifact is the full 12-leg
   re-run (run2) on the merged fix.
-- **The census-key root cause (pass-4, PR #470 `perf/421-attribution`).** `kernel_census.py`
-  keyed each GPU-kernel bucket on `shortName` alone; cutlass's `Kernel2<...>` template
-  wrapper gives every bf16 GEMM tile instantiation the same literal `shortName`, so three
-  distinct cutlass instantiations on `clip-text-A2` collapsed into one anonymous row that
-  tripped the attribution's 1 % known-kernel-name gate. Fixed by keying on
-  `COALESCE(demangledName, shortName)` instead — a strict, sum-preserving refinement (a
-  bucket can only split, never merge two old buckets into fewer new ones): every top-line
-  number (`gpu_kernel_us_per_step`, wall/front/busy per step) is unchanged; only the
-  per-instantiation breakdown resplit. Both CLIP-tower A2 legs are decision-grade for
-  attribution under the fix.
+<!-- profile-421-generated: census-key-root-cause -->
+- **The census-key root cause (pass-4, PR #470 `perf/421-attribution`).**
+  `kernel_census.py` keyed each GPU-kernel bucket on `shortName` alone; cutlass's
+  `Kernel2<...>` template wrapper gives every bf16 GEMM tile instantiation the same literal
+  `shortName`, so three distinct cutlass instantiations on `clip-text-A2` collapsed into
+  one anonymous row that tripped the attribution's 1 % known-kernel-name gate. Fixed by
+  keying on `COALESCE(demangledName, shortName)` instead — a strict, sum-preserving
+  refinement (a bucket can only split, never merge two old buckets into fewer new ones):
+  every top-line number (`gpu_kernel_us_per_step`, wall/front/busy per step) is unchanged;
+  only the per-instantiation breakdown resplit. Both CLIP-tower A2 legs are decision-grade
+  for attribution under the fix.
+<!-- /profile-421-generated -->
 <!-- profile-421-generated: htsat-a2-deviation -->
 - **`htsat-A2` (bf16) is VALID but not decision-grade for attribution**: its UNATTRIBUTED
   share of GPU busy is 5.66 %, over the contract's 5 % validity bound (window-partition

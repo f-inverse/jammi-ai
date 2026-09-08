@@ -23,6 +23,11 @@ BLOCKS. Each spliced between its own
 `<!-- profile-421-generated: <block-id> -->` / `<!-- /profile-421-generated -->`
 marker pair, in `docs/plans/66-tower-profile/README.md` unless noted:
 
+  - `measured-summary`: the "## What was measured" opening paragraph's own
+    leg count, tower count, device/driver/nsys identity and git sha --
+    every one read live off `legs`/`p2_witnessed`/`status`/`notes`/`git_sha`,
+    never a hand-typed literal that could drift the moment a re-run changes
+    a count or an identity string.
   - `measured-towers-table`: one pipe-table row per artifact `legs[]` entry,
     in artifact order (which is already tower-grouped, A1/A2/D1/D2 within
     each tower) -- `wall`/`front`/`busy`/`residual` at 4 decimal places
@@ -51,9 +56,17 @@ marker pair, in `docs/plans/66-tower-profile/README.md` unless noted:
     percentage in it is `attribution[<leg>].chains["C-GELU"].share_wall`/
     `share_gpu_busy` plus `UNATTRIBUTED`'s own two shares, summed here
     rather than hand-added.
+  - `census-key-root-cause`: the Deviations bullet naming the cutlass
+    template-wrapper split count and the known-kernel-name gate percentage
+    -- read off the SAME rendered `notes.recorded_deviations` sentence
+    `profile_421_artifact.py`'s own `_identity_template_context` already
+    filled those two numbers into, never a second hand-typed copy.
   - `htsat-a2-deviation`: the Deviations bullet naming `htsat-A2`'s own
     UNATTRIBUTED share of GPU busy (`attribution["htsat-A2"].chains
-    ["UNATTRIBUTED"].share_gpu_busy`).
+    ["UNATTRIBUTED"].share_gpu_busy`), its "VALID"/"not decision-grade"
+    words (`legs[htsat-A2].merge_verdict` / `attribution[htsat-A2].
+    decision_grade`) and its "N %" validity bound (`profile_421_attribute.
+    py`'s own `UNATTRIBUTED_DECISION_GRADE_LIMIT`).
   - `corpus-pool-note`: the Deviations bullet naming the media corpus pool
     size and the M-leg's train-clip cycle count -- sourced live from
     `profile_421_legs.sh`'s own `MEDIA_FAMILIES`/`MEDIA_HELDOUT_FAMILIES`/
@@ -71,10 +84,16 @@ marker pair, in `docs/plans/66-tower-profile/README.md` unless noted:
     maintainer guide's own condensed restatement of the same three artifact
     facts, in the guide's own (denser) wording -- a SEPARATE render function
     per block, never a re-use of the README wording, because the two docs'
-    prose economy genuinely differs (elision, units, emphasis).
+    prose economy genuinely differs (elision, units, emphasis). Every number
+    `findings-guide` needs is read off a finding's own structured `evidence`
+    (never a digit regexed out of its `text`), and every QUALITATIVE word
+    ("front-end-bound", "launch-bound", "dtype- and arm-invariant", "only")
+    is gated on that finding's own `evidence.<rule>` flag (`_require_
+    evidence_flag`) -- withheld or `False` fails this renderer CLOSED.
   - `changelog-421-entry`: the CHANGELOG's own close-out entry -- the
     per-tower headline numbers restated one more time, in the CHANGELOG's
-    own terse style.
+    own terse style, gated on the SAME `evidence` flags `findings-guide`
+    reads.
 
 Run: `python3 ci/scripts/perf/profile_421_render_docs.py` writes the current
 render into every doc. `python3 ci/scripts/perf/profile_421_render_docs.py
@@ -100,6 +119,14 @@ REPO_ROOT = Path(__file__).resolve().parents[3]
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 import check_citations as _cc  # noqa: E402
+# `profile_421_artifact`'s own `_fmt_range` (the EXACT rounding/range-collapse
+# rule every finding's own text was rendered with) and `profile_421_
+# attribute`'s own validity-gate constants -- imported, never retyped, so a
+# renderer that needs a NUMBER these two modules already computed reads it
+# live off them (or off the artifact's own structured `evidence`), never a
+# second, independently-drifting hand-typed copy or a literal.
+import profile_421_artifact as _pa  # noqa: E402
+import profile_421_attribute as _attribute_mod  # noqa: E402
 
 ARTIFACT = (
     REPO_ROOT
@@ -405,6 +432,76 @@ def _reason_leg_shares(reason: str) -> str:
     return reason.split(" — ", 1)[1]
 
 
+def _finding(artifact: dict, finding_id: str) -> dict:
+    """The full `findings[]` entry (id/text/evidence) for `finding_id` --
+    never just its `text` -- so a renderer that needs a QUALITATIVE word
+    ("front-end-bound", "launch-bound", "dtype- and arm-invariant", "only")
+    can check the licensing `evidence.<rule>` flag the word is GATED on
+    (`profile_421_artifact.py`'s own `compute_findings`), rather than
+    re-derive whether the word applies by regexing the sentence it does (or
+    does not) appear in. A finding whose required leg(s) failed and was
+    therefore SUPPRESSED (`suppressed_findings`) is refused here BY NAME,
+    never silently treated as an absent/empty finding -- a renderer whose
+    prose depends on this finding existing must fail closed the moment it
+    does not, not render nothing.
+    """
+    for finding in artifact["findings"]:
+        if finding["id"] == finding_id:
+            return finding
+    suppressed_ids = {s["id"] for s in artifact.get("suppressed_findings", [])}
+    if finding_id in suppressed_ids:
+        raise ValueError(
+            f"finding {finding_id!r} is SUPPRESSED in this artifact (see suppressed_findings) "
+            "-- the prose that depends on it must be rewritten, never rendered from a finding "
+            "the producer never built"
+        )
+    raise ValueError(f"finding {finding_id!r} not present in artifact findings[]")
+
+
+def _require_evidence_flag(finding: dict, flag: str, word: str) -> None:
+    """Fails closed (`ValueError`, `--check` red) the moment the artifact
+    WITHHOLDS the rule outcome a piece of FIXED prose asserts
+    unconditionally -- `evidence[flag]` absent (the rule was never
+    evaluated on this run, e.g. an optional arm-invariance clause whose
+    D-arm legs were not all VALID) or `False` (evaluated and did NOT hold)
+    are BOTH refusals, never a silent "render the word anyway". A renderer
+    that hits this must be rewritten into a neutral sentence (the
+    artifact's own finding `text` already carries one -- `compute_findings`
+    drops the word for a neutral sentence stating the same numbers when its
+    rule does not hold) rather than keep asserting a word this run's own
+    evidence does not license.
+    """
+    value = finding.get("evidence", {}).get(flag)
+    if value is not True:
+        raise ValueError(
+            f"finding {finding['id']!r} evidence[{flag!r}] is {value!r}, not True -- the "
+            f"{word!r} wording this renderer's fixed prose asserts is NOT licensed by this "
+            "artifact; rewrite the renderer (and the prose) into a neutral sentence instead "
+            "of rendering a word the run's own evidence withholds"
+        )
+
+
+def _range_str(mapping: dict[str, float]) -> str:
+    """`lo-hi` (en-dash, `profile_421_artifact.py`'s own `_fmt_range` --
+    IDENTICAL rounding/collapse rule the finding's own `text` was rendered
+    with) over an `evidence` mapping's values -- never a digit regexed back
+    out of the finding's own prose sentence."""
+    lo, hi = min(mapping.values()), max(mapping.values())
+    return _pa._fmt_range(lo, hi).replace("-", "–")
+
+
+def _magnitude_range(mapping: dict[str, float]) -> str:
+    """The SAME magnitude-range computation `compute_findings`'s own
+    uniform-negative branch used to build the "cuts GPU busy by X%" /
+    "wall drops by only Y%" clause (sorted by `abs`, then `_fmt_range` over
+    the two magnitude extremes, en-dash not hyphen -- same convention as
+    `_range_str`) -- reused here rather than re-derived, so a renderer can
+    never drift from the exact numbers the finding's own text was built
+    from."""
+    by_magnitude = sorted(mapping.values(), key=abs)
+    return _pa._fmt_range(abs(by_magnitude[0]), abs(by_magnitude[-1])).replace("-", "–")
+
+
 def render_realized_gains_guide(artifact: dict) -> str:
     """The guide's own condensed restatement of the realized-gain figures
     (denser wording than README's three bullets -- one prose sentence, no
@@ -476,33 +573,38 @@ def render_decline_band_guide(artifact: dict) -> str:
 def render_findings_guide(artifact: dict) -> str:
     """The guide's own condensed restatement of the four `findings[]`
     entries -- one prose paragraph, no bullets, denser wording than
-    README's `findings` block; every percentage and count is read off the
-    same four findings (parsed by a small, explicit per-finding-id
-    extractor, never a blind string copy) plus the corpus-pool count
-    (`corpus_pool_counts`) the third finding's own prose folds in.
+    README's `findings` block. Every NUMBER is read off each finding's own
+    structured `evidence` (never a digit regexed back out of its `text`),
+    and every QUALITATIVE word this paragraph's fixed prose asserts
+    ("CPU front-end-bound", "dtype- and arm-invariant", "launch-bound",
+    "only") is gated on that SAME finding's own `evidence.<rule>` flag via
+    `_require_evidence_flag` -- a run whose evidence withholds one of those
+    words fails this renderer CLOSED rather than render a claim the run's
+    own numbers do not support.
     """
-    findings_by_id = {f["id"]: f["text"] for f in artifact["findings"]}
     total_files, train_clips, _m_leg_rows = corpus_pool_counts()
 
-    def pct(text: str, pattern: str) -> str:
-        m = re.search(pattern, text)
-        if m is None:
-            raise ValueError(f"pattern {pattern!r} not found in {text!r} -- rewrite the extractor")
-        return m.group(1).replace("-", "–") + " %"
+    htsat_finding = _finding(artifact, "htsat-front-end-bound")
+    _require_evidence_flag(htsat_finding, "front_end_bound", "CPU front-end-bound")
+    _require_evidence_flag(htsat_finding, "arm_invariant", "dtype- and arm-invariant")
+    htsat_pct = _range_str(htsat_finding["evidence"]["front_share_of_wall_pct"]) + " %"
 
-    htsat_front = findings_by_id["htsat-front-end-bound"]
-    clip_vision_front = findings_by_id["clip-vision-front-end-share"]
-    launch_bound = findings_by_id["clip-launch-bound-batch8"]
-    attn_htsat = findings_by_id["c-attn-htsat-out-of-tier"]
+    clip_vision_finding = _finding(artifact, "clip-vision-front-end-share")
+    clip_vision_pct = _range_str(clip_vision_finding["evidence"]["front_share_of_wall_pct"]) + " %"
 
-    htsat_pct = pct(htsat_front, r"share of wall is (\d+-\d+)%")
-    clip_vision_pct = pct(clip_vision_front, r"front end is (\d+-\d+)% of wall")
-    launches_m = re.search(r"(\d+-\d+) launches/step", launch_bound)
-    busy_cut_m = re.search(r"cuts GPU busy by (\d+-\d+)%", launch_bound)
-    wall_drop_m = re.search(r"wall drops by only (\d+-\d+)%", launch_bound)
-    attn_busy_m = re.search(r"(\d+)% of\s*GPU busy \(~(\d+)% of wall\)", attn_htsat)
-    if not (launches_m and busy_cut_m and wall_drop_m and attn_busy_m):
-        raise ValueError("clip-launch-bound-batch8 / c-attn-htsat-out-of-tier text shape changed -- rewrite the extractor")
+    launch_finding = _finding(artifact, "clip-launch-bound-batch8")
+    _require_evidence_flag(launch_finding, "launch_bound", "launch-bound")
+    _require_evidence_flag(
+        launch_finding, "wall_drop_smaller_than_busy_drop_every_tower", "only"
+    )
+    launch_evidence = launch_finding["evidence"]
+    launches_range = _range_str(launch_evidence["launches_per_step"])
+    busy_range = _magnitude_range(launch_evidence["busy_delta_pct_bf16_vs_f32"])
+    wall_range = _magnitude_range(launch_evidence["wall_delta_pct_bf16_vs_f32"])
+
+    attn_finding = _finding(artifact, "c-attn-htsat-out-of-tier")
+    attn_busy_pct = f"{attn_finding['evidence']['share_gpu_busy'] * 100:.0f}"
+    attn_wall_pct = f"{attn_finding['evidence']['share_wall'] * 100:.0f}"
 
     body = (
         f"**Findings.** The HTSAT training step is CPU front-end-bound: front-end share of "
@@ -516,11 +618,10 @@ def render_findings_guide(artifact: dict) -> str:
         "working set, not a realistic-corpus I/O cost — so both front-end numbers are a real "
         "per-item CPU decode/preprocess compute cost, never disk I/O (artifact "
         "`notes.recorded_deviations`; full caveat: `docs/plans/66-tower-profile/README.md`). "
-        f"At batch 8 the CLIP training steps are launch-bound ({launches_m.group(1).replace('-', '–')} "
+        f"At batch 8 the CLIP training steps are launch-bound ({launches_range} "
         f"launches/step across the four F32/BF16 A-arm CLIP legs); BF16 cuts GPU busy "
-        f"{busy_cut_m.group(1).replace('-', '–')} % per tower while wall drops only "
-        f"{wall_drop_m.group(1).replace('-', '–')} %. `C-ATTN-HTSAT` is measured, not a "
-        f"candidate port: {attn_busy_m.group(1)} % of GPU busy (~{attn_busy_m.group(2)} % of "
+        f"{busy_range} % per tower while wall drops only {wall_range} %. `C-ATTN-HTSAT` is "
+        f"measured, not a candidate port: {attn_busy_pct} % of GPU busy (~{attn_wall_pct} % of "
         "wall) on the F32 decision leg — HTSAT's head_dim of 24 at every stage sits outside "
         "the fixed-head-dim port tier by the contract's own declaration, so this stays a "
         "measured, OPEN number, never folded into UNATTRIBUTED and never decided under this "
@@ -567,29 +668,29 @@ def render_changelog_421_entry(artifact: dict) -> str:
     ln_clip = {t: by_key[("C-LN", t)] for t in ("clip-text", "clip-vision")}
     joint = by_key[("C-LN", "htsat")]
 
-    findings_by_id = {f["id"]: f["text"] for f in artifact["findings"]}
     _total_files, train_clips, _m_leg_rows = corpus_pool_counts()
 
-    def pct(text: str, pattern: str) -> str:
-        m = re.search(pattern, text)
-        if m is None:
-            raise ValueError(f"pattern {pattern!r} not found in {text!r} -- rewrite the extractor")
-        return m.group(1).replace("-", "–")
+    htsat_finding = _finding(artifact, "htsat-front-end-bound")
+    _require_evidence_flag(htsat_finding, "front_end_bound", "CPU front-end-bound")
+    _require_evidence_flag(htsat_finding, "arm_invariant", "dtype- and arm-invariant")
+    htsat_pct = _range_str(htsat_finding["evidence"]["front_share_of_wall_pct"])
 
-    htsat_pct = pct(findings_by_id["htsat-front-end-bound"], r"share of wall is (\d+-\d+)%")
-    clip_vision_pct = pct(
-        findings_by_id["clip-vision-front-end-share"], r"front end is (\d+-\d+)% of wall"
+    clip_vision_finding = _finding(artifact, "clip-vision-front-end-share")
+    clip_vision_pct = _range_str(clip_vision_finding["evidence"]["front_share_of_wall_pct"])
+
+    launch_finding = _finding(artifact, "clip-launch-bound-batch8")
+    _require_evidence_flag(launch_finding, "launch_bound", "launch-bound")
+    _require_evidence_flag(
+        launch_finding, "wall_drop_smaller_than_busy_drop_every_tower", "only"
     )
-    launch_bound = findings_by_id["clip-launch-bound-batch8"]
-    launches_m = re.search(r"(\d+)-(\d+) launches/step", launch_bound)
-    busy_cut_pct = pct(launch_bound, r"cuts GPU busy by (\d+-\d+)%")
-    wall_drop_pct = pct(launch_bound, r"wall drops by only (\d+-\d+)%")
-    attn_htsat_pct_m = re.search(
-        r"(\d+)% of\s*GPU busy \(~(\d+)% of wall\)", findings_by_id["c-attn-htsat-out-of-tier"]
-    )
-    if launches_m is None or attn_htsat_pct_m is None:
-        raise ValueError("finding text shape changed -- rewrite the CHANGELOG extractor")
-    launches_k = f"{int(launches_m.group(1)) / 1000:.1f}–{int(launches_m.group(2)) / 1000:.1f}"
+    launch_evidence = launch_finding["evidence"]
+    launches_vals = list(launch_evidence["launches_per_step"].values())
+    launches_k = f"{min(launches_vals) / 1000:.1f}–{max(launches_vals) / 1000:.1f}"
+    busy_cut_pct = _magnitude_range(launch_evidence["busy_delta_pct_bf16_vs_f32"])
+    wall_drop_pct = _magnitude_range(launch_evidence["wall_delta_pct_bf16_vs_f32"])
+
+    attn_finding = _finding(artifact, "c-attn-htsat-out-of-tier")
+    attn_htsat_busy_pct = f"{attn_finding['evidence']['share_gpu_busy'] * 100:.0f}"
 
     body = (
         "**The #421 tower training-step profile is closed out: driver, merge, attribution, "
@@ -629,7 +730,7 @@ def render_changelog_421_entry(artifact: dict) -> str:
         "real per-item CPU decode/preprocess compute cost; see "
         "`docs/plans/66-tower-profile/README.md`'s deviations); at batch 8 the CLIP steps "
         f"are launch-bound (≈ {launches_k} k launches/step; BF16 cuts GPU busy {busy_cut_pct} % "
-        f"but wall only {wall_drop_pct} %); `C-ATTN-HTSAT` is measured (≈ {attn_htsat_pct_m.group(1)} % "
+        f"but wall only {wall_drop_pct} %); `C-ATTN-HTSAT` is measured (≈ {attn_htsat_busy_pct} % "
         "of GPU busy) and stays OUT OF TIER, a named-but-undecided chain, never folded into "
         "UNATTRIBUTED. See `docs/plans/66-tower-profile/README.md` and `CONTRACT.md` (the "
         "frozen v2.5 contract) for the full per-leg table and PR trail."
@@ -642,22 +743,165 @@ def render_changelog_421_entry(artifact: dict) -> str:
 
 def render_htsat_a2_deviation(artifact: dict) -> str:
     """The Deviations bullet naming `htsat-A2`'s own UNATTRIBUTED share of
-    GPU busy -- the ONE number in this bullet the artifact carries
-    (`attribution["htsat-A2"].chains["UNATTRIBUTED"].share_gpu_busy`); the
-    rest of the bullet's prose is static (it explains WHY the share sits
-    where it does, not a fact the artifact states directly).
+    GPU busy. Every number AND word this bullet's fixed prose needs is read
+    live: the "VALID [at the merge level]" word from `legs[htsat-A2].
+    merge_verdict` (never assumed), the "not decision-grade" phrase from
+    `attribution[htsat-A2].decision_grade` itself (never a hard-coded
+    negation baked in ahead of the check), and the "N % validity bound"
+    from `profile_421_attribute.py`'s own `UNATTRIBUTED_DECISION_GRADE_
+    LIMIT` (the SAME constant `profile_421_artifact.py`'s own
+    `_identity_template_context` already quotes into `notes.
+    recorded_deviations` -- never a second, independently-drifting
+    literal). Fails closed (never silently re-labels the bullet) the
+    moment either boolean stops matching what this bullet's own prose
+    assumes.
     """
+    merge_by_leg = {leg["leg_id"]: leg for leg in artifact["legs"]}
+    htsat_a2_merge_verdict = merge_by_leg["htsat-A2"]["merge_verdict"]
+    if htsat_a2_merge_verdict != "VALID":
+        raise ValueError(
+            f"expected htsat-A2 merge_verdict VALID, got {htsat_a2_merge_verdict!r} -- this "
+            "bullet's own fixed prose ('is VALID but not decision-grade') assumes this leg IS "
+            "merge-VALID; rewrite it if that changed"
+        )
     by_leg = _attribution_by_leg(artifact)
+    decision_grade = by_leg["htsat-A2"]["decision_grade"]
+    if decision_grade is not False:
+        raise ValueError(
+            f"expected htsat-A2 decision_grade False, got {decision_grade!r} -- this bullet's "
+            "own fixed prose explains WHY it is non-decision-grade; rewrite it (and the "
+            "README section around it) if the artifact's own verdict changed"
+        )
     share_pct = by_leg["htsat-A2"]["chains"]["UNATTRIBUTED"]["share_gpu_busy"] * 100
+    bound_pct = _attribute_mod.UNATTRIBUTED_DECISION_GRADE_LIMIT * 100.0
     body = (
-        f"**`htsat-A2` (bf16) is VALID but not decision-grade for attribution**: its "
-        f"UNATTRIBUTED share of GPU busy is {share_pct:.2f} %, over the contract's 5 % "
-        "validity bound (window-partition copies and the audio front end's own activation are "
-        "still undeclared chains at the identical element count as a generic residual-stream "
-        "permute/reshape copy — the attribution module declares neither rather than guess). "
-        "`htsat-A1` (f32) clears the bound and is decision-grade. HTSAT has no candidate port "
-        "under this contract in the first place, so `htsat-A2`'s own non-decision-grade status "
-        "never blocks a candidate-port decision."
+        f"**`htsat-A2` (bf16) is {htsat_a2_merge_verdict} but not decision-grade for "
+        f"attribution**: its UNATTRIBUTED share of GPU busy is {share_pct:.2f} %, over the "
+        f"contract's {bound_pct:.0f} % validity bound (window-partition copies and the audio "
+        "front end's own activation are still undeclared chains at the identical element "
+        "count as a generic residual-stream permute/reshape copy — the attribution module "
+        "declares neither rather than guess). `htsat-A1` (f32) clears the bound and is "
+        "decision-grade. HTSAT has no candidate port under this contract in the first place, "
+        "so `htsat-A2`'s own non-decision-grade status never blocks a candidate-port decision."
+    )
+    return _bullet(body)
+
+
+def _nsys_version(nsys_human: str) -> str:
+    """The bare version token off the front of `notes.nsys` -- that field is
+    a longer provenance sentence (install source, refused alternates), not
+    a bare version string, so the README's own terse "nsys 2025.3.2.474"
+    parenthetical reads only its leading `Nsight Systems <version>` token,
+    never a hand-typed copy of the version alone."""
+    m = re.match(r"Nsight Systems (\S+)", nsys_human)
+    if m is None:
+        raise ValueError(
+            f"notes.nsys does not start with 'Nsight Systems <version>' ({nsys_human!r}) -- "
+            "rewrite this extractor (and the README sentence it feeds) if the identity "
+            "sidecar's own nsys field shape changed"
+        )
+    return m.group(1)
+
+
+def render_measured_summary(artifact: dict) -> str:
+    """The "## What was measured" opening paragraph -- its own leg count,
+    tower count, device/driver/nsys identity and git sha are ALL read live
+    off the artifact (`legs`, `p2_witnessed`, `status`, `notes`, `git_sha`),
+    never hand-typed literals a re-run's own numbers could drift under
+    without this block moving. Fails closed (the paragraph's fixed "All N
+    legs are VALID" / "passes on all N towers" wording is unconditional)
+    the moment `status` is not GREEN or `p2_witnessed` does not name every
+    tower this run actually measured.
+    """
+    total_legs = len(artifact["legs"])
+    status = artifact["status"]
+    if status != "GREEN":
+        raise ValueError(
+            f"artifact status is {status!r}, not GREEN -- this paragraph's fixed 'All N legs "
+            "are VALID; the BF16 pre-flight (P2) passes' wording assumes a clean pass; rewrite "
+            "it to name the actual failure(s) instead"
+        )
+    towers = sorted({leg["tower"] for leg in artifact["legs"]})
+    p2_witnessed = artifact.get("p2_witnessed") or {}
+    if sorted(p2_witnessed.get("towers", [])) != towers:
+        raise ValueError(
+            f"expected p2_witnessed to name every measured tower {towers!r}, got "
+            f"{p2_witnessed.get('towers')!r} -- rewrite the 'BF16 pre-flight (P2) passes on "
+            "all N towers' sentence if this run's own P2 tower set differs from its legs"
+        )
+    tower_count = len(towers)
+    if tower_count not in _NUMBER_WORDS:
+        raise ValueError(f"{tower_count} towers has no spelled-out form registered in _NUMBER_WORDS -- add one")
+    notes = artifact["notes"]
+    artifact_rel = ARTIFACT.relative_to(REPO_ROOT).as_posix()
+    body = (
+        f"All {total_legs} legs are VALID; the BF16 pre-flight (P2) passes on all "
+        f"{_NUMBER_WORDS[tower_count].lower()} towers. Source: `{artifact_rel}` "
+        f"({notes['gpu']}, driver {notes['driver']}, nsys {_nsys_version(notes['nsys'])}, "
+        f"git sha `{artifact['git_sha']}`)."
+    )
+    return textwrap.fill(body, width=97, break_long_words=False, break_on_hyphens=False)
+
+
+def _root_cause_deviation_text(artifact: dict) -> str:
+    """The ONE `notes.recorded_deviations` entry naming both the census-key
+    split count and the known-kernel-name gate percentage -- identified by
+    two stable substrings (never a positional index, which would silently
+    start reading the WRONG deviation the day the sidecar's own entry order
+    changes) -- so `render_census_key_root_cause_note` reads its two
+    numbers off the SAME rendered sentence `profile_421_artifact.py`'s own
+    `_identity_template_context` already filled in from a live source, not
+    a second, independently-drifting copy computed here (this doc-render
+    step never has the raw census files `kernel_identity_split_count`
+    itself needs -- only `profile_421_artifact.py`, which reads `--legs-dir`
+    directly, can compute that number from scratch)."""
+    for text in artifact["notes"]["recorded_deviations"]:
+        if "DISTINCT cutlass instantiations" in text and "known-kernel-name gate" in text:
+            return text
+    raise ValueError(
+        "no notes.recorded_deviations entry names both 'DISTINCT cutlass instantiations' and "
+        "'known-kernel-name gate' -- the census-key root-cause bullet's own split-count/gate-"
+        "percentage numbers have no live source to read from; rewrite this extractor (and the "
+        "bullet) if the identity sidecar's own deviation wording changed"
+    )
+
+
+def render_census_key_root_cause_note(artifact: dict) -> str:
+    """The "census-key root cause" Deviations bullet -- its own split count
+    ("N distinct cutlass instantiations") and known-kernel-name-gate
+    percentage are the SAME two numbers already rendered into `notes.
+    recorded_deviations` (`_root_cause_deviation_text`), read off THAT
+    sentence rather than hand-retyped a second time.
+    """
+    deviation_text = _root_cause_deviation_text(artifact)
+    split_m = re.search(r"has (\d+) DISTINCT cutlass instantiations", deviation_text)
+    gate_m = re.search(r"known-kernel-name gate", deviation_text) and re.search(
+        r"tripped profile_421_attribute\.py's (\d+)% known-kernel-name gate", deviation_text
+    )
+    if split_m is None or gate_m is None:
+        raise ValueError(
+            f"could not extract the split count / gate percentage from {deviation_text!r} -- "
+            "rewrite this extractor (and the census-key root-cause bullet) if the identity "
+            "sidecar's own deviation wording changed"
+        )
+    split_count_word = _NUMBER_WORDS.get(int(split_m.group(1)))
+    if split_count_word is None:
+        raise ValueError(
+            f"{split_m.group(1)} has no spelled-out form registered in _NUMBER_WORDS -- add one"
+        )
+    gate_pct = gate_m.group(1)
+    body = (
+        "**The census-key root cause (pass-4, PR #470 `perf/421-attribution`).** "
+        "`kernel_census.py` keyed each GPU-kernel bucket on `shortName` alone; cutlass's "
+        "`Kernel2<...>` template wrapper gives every bf16 GEMM tile instantiation the same "
+        f"literal `shortName`, so {split_count_word.lower()} distinct cutlass instantiations "
+        "on `clip-text-A2` collapsed into one anonymous row that tripped the attribution's "
+        f"{gate_pct} % known-kernel-name gate. Fixed by keying on `COALESCE(demangledName, "
+        "shortName)` instead — a strict, sum-preserving refinement (a bucket can only split, "
+        "never merge two old buckets into fewer new ones): every top-line number "
+        "(`gpu_kernel_us_per_step`, wall/front/busy per step) is unchanged; only the "
+        "per-instantiation breakdown resplit. Both CLIP-tower A2 legs are decision-grade for "
+        "attribution under the fix."
     )
     return _bullet(body)
 
@@ -808,12 +1052,14 @@ def render_basename_ambiguity_note(_artifact: dict) -> str:
 # a future block in a new doc is a one-line addition, never a signature
 # change.
 BLOCKS: dict[str, tuple[Path, Callable[[dict], str]]] = {
+    "measured-summary": (README, render_measured_summary),
     "measured-towers-table": (README, render_measured_towers_table),
     "candidate-reasons": (README, render_candidate_reasons),
     "findings": (README, render_findings),
     "realized-gains": (README, render_realized_gains),
     "decision-grade-note": (README, render_decision_grade_note),
     "decline-band-summary": (README, render_decline_band_summary),
+    "census-key-root-cause": (README, render_census_key_root_cause_note),
     "htsat-a2-deviation": (README, render_htsat_a2_deviation),
     "corpus-pool-note": (README, render_corpus_pool_note),
     "hermetic-test-count-note": (README, render_hermetic_test_count_note),

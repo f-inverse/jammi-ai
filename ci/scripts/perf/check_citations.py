@@ -318,25 +318,29 @@ completely unchanged by this.
 `docs/plans/66-tower-profile/CONTRACT.md`'s "Scope facts" section cites
 Rust source lines as bare backticked tokens -- `` `trainer.rs:1952-1965,
 2067-2106` ``, `` `finetune_run.rs:394` ``, occasionally a full path
-(`` `crates/jammi-lora/src/lora_linear.rs:973-1005` ``), and occasionally a
+(`` `crates/jammi-lora/src/lora_linear.rs:973-1005` ``), occasionally a
 RELATIVE SUB-PATH that is neither (`` `ops/attention_block.rs:467,472` ``:
-has a slash, but does not start with a recognized full-path root prefix) --
-never identifier-adjacent the way every OTHER citation class in this file
-is (`_find_adjacent_identifier`'s connector convention does not apply here
-at all). `_PLAN_CONTRACT_ROOTS` (scoped to this one plan group; widen it,
-not the shape, the day a second frozen contract adopts the same prose
+has a slash, but does not start with a recognized full-path root prefix),
+and occasionally a bare CONTINUATION with no path half at all (`` `:1635`
+``, eliding a path already named earlier on the SAME LINE -- "``
+`htsat_audio.rs:1064` `` and `` `:1635` `` call ...") -- never
+identifier-adjacent the way every OTHER citation class in this file is
+(`_find_adjacent_identifier`'s connector convention does not apply here at
+all). `_PLAN_CONTRACT_ROOTS` (scoped to this one plan group; widen it, not
+the shape, the day a second frozen contract adopts the same prose
 convention) opts a `.md` file under it into a SEPARATE citation form. The
 RECOGNIZER (`_plan_contract_citation_like_re`) is deliberately as broad as
 the punctuation alone can support: ANY backtick-to-backtick token of the
 shape `` `<path-ish>:<line-spec>` `` where `<path-ish>` ends in a
-`_FULL_PATH_SUFFIXES` extension is a citation this file owes a
-classification to -- never gated on the line-spec ALSO being well-formed
-digits in the same pattern that determines recognition (the old, narrower
-regex's mistake: a relative sub-path like `ops/attention_block.rs:467,472`
-matched neither its bare-basename branch, which forbids `/`, nor its
-full-path branch, which requires a recognized prefix, so the citation was
-simply INVISIBLE -- 17 of `CONTRACT.md`'s 18 citations checked, the 18th
-never even attempted, and the gate still reported "all citations resolve").
+`_FULL_PATH_SUFFIXES` extension, OR a bare `` `:<line-spec>` `` continuation,
+is a citation this file owes a classification to -- never gated on the
+line-spec ALSO being well-formed digits in the same pattern that determines
+recognition, and never blind to a shape the punctuation alone does not
+distinguish from ordinary prose (a relative sub-path like
+`ops/attention_block.rs:467,472` has neither a bare basename, which forbids
+`/`, nor a recognized full-path prefix, so it needs the sub-path arm below;
+a bare continuation has no path half at all, so it needs its own scope-
+tracking arm, `_check_plan_contract_citations`'s own `pending_relpath`).
 Classification, once a candidate is recognized:
 
   - the line-spec half must fully match `<line>[-<line>][, <line>[-<line>]]*`
@@ -357,13 +361,22 @@ Classification, once a candidate is recognized:
     across crates -- the same scaling limit `_KNOWN_FILES`'s own module doc
     names for why a hand-registered map does not extend past a handful of
     files), unless a `citations-basename-map` header entry narrows it (see
-    below).
+    below);
+  - a bare CONTINUATION (no path half) resolves against the path most
+    recently resolved earlier on the SAME LINE (never an earlier line, and
+    never a path citation that itself failed to resolve) -- FAILING CLOSED
+    with no such scope in effect, never guessed against whichever path
+    happens to be nearest in the document.
 
 Gated STRICTLY by resolution and in-bounds -- never a content re-check,
 since the adjacent-identifier convention this file's other forms use has
 nothing to pair against here. Only engages for a file that ALSO carries the
 `citations-resolve-at:` header above (opt-IN twice over). Every individual
-line/range in a comma-separated spec is checked, not just the first.
+line/range in a comma-separated spec is checked, not just the first. Every
+one of `CONTRACT.md`'s 19 citation-shaped tokens (18 named-path citations
+plus the one bare continuation) is classified this way -- see `check-
+citations: frozen-contract citation coverage` in this script's own `main()`
+output for the live count.
 
 ## Never-checked must never read as checked-clean
 
@@ -374,8 +387,8 @@ epoch" section above describes) that does NOT carry a well-formed
 `citations-resolve-at:` header in its first `_CITATIONS_EPOCH_HEADER_
 SEARCH_LINES` lines -- whether the header is genuinely absent, or it landed
 past that search window (which reads byte-for-byte identically to absent)
--- is itself a `Violation`, never a silent skip. The pre-fix behaviour
-(skip the whole plan-contract citation scan, report zero violations) is
+-- is itself a `Violation`, never a silent skip: skipping the whole
+plan-contract citation scan and reporting zero violations would be
 mechanically indistinguishable from "every citation in this file resolves"
 -- exactly the false-negative shape a reviewer, or a later gate, would
 trust.
@@ -998,36 +1011,56 @@ _LINE_SPEC_ONLY_RE = re.compile(r"^" + _LINE_SPEC_FRAGMENT + r"$")
 
 
 def _plan_contract_citation_like_re() -> re.Pattern:
-    """Every backtick-quoted, path-ish, colon-line-numbered token in a
+    r"""Every backtick-quoted, path-ish, colon-line-numbered token in a
     `_PLAN_CONTRACT_ROOTS` file's prose -- module doc's "A frozen
     pre-registration's OWN citation shape" section: ANY backtick-to-backtick
     `` `<path-ish>:<line-spec>` `` where `<path-ish>` ends in a
     `_FULL_PATH_SUFFIXES` extension is a citation this file OWES a
     classification to, whether that citation is a bare basename
     (`trainer.rs:1952-1965`), a full path
-    (`crates/jammi-lora/src/lora_linear.rs:973-1005`), or a RELATIVE
-    SUB-PATH that is neither (`ops/attention_block.rs:467,472` -- has a
-    slash, but does not start with a recognized `_FULL_PATH_ROOT_PREFIXES`
-    prefix; the shape the old, narrower regex silently could not match at
-    all -- see `_resolve_plan_contract_target`'s sub-path arm).
+    (`crates/jammi-lora/src/lora_linear.rs:973-1005`), a RELATIVE SUB-PATH
+    that is neither (`ops/attention_block.rs:467,472` -- has a slash, but
+    does not start with a recognized `_FULL_PATH_ROOT_PREFIXES` prefix --
+    see `_resolve_plan_contract_target`'s sub-path arm), OR a bare
+    CONTINUATION token with no path half at all (`` `:1635` ``, matched via
+    the SECOND alternative below into `clines` instead of `path`/`lines`) --
+    CONTRACT.md's own "`` `htsat_audio.rs:1064` `` and `` `:1635` `` call
+    ..." elision, where a second citation on the SAME LINE names only its
+    line number and leaves the path implicit. A continuation token resolves
+    against whichever path citation was most recently named earlier on that
+    SAME LINE (`_check_plan_contract_citations`'s own scope-tracking state);
+    one with no such preceding path is itself a `Violation`, never silently
+    dropped or guessed against some earlier line's path.
 
-    Deliberately LOOSE on the line-spec half: `(?P<lines>[^`]+)`, not
-    `_LINE_SPEC_FRAGMENT` -- this regex's whole job is coverage (module
-    doc's "assert coverage" clause: every path-ish:line-numbered backtick
-    token found here must be resolved OR reported, never silently dropped
-    because its line-spec half turns out to be malformed). A match whose
-    `lines` half does not fully match `_LINE_SPEC_FRAGMENT` is itself
-    reported as an unparsed citation by `_check_plan_contract_citations`,
-    not silently excluded by a stricter single regex the way the old
-    ONE-SHOT `_plan_contract_citation_re` gated matching on `_LINE_SPEC_
-    FRAGMENT` in the same pattern that determined recognition.
+    Deliberately LOOSE on each line-spec half: `(?P<lines>[^`]+)` /
+    `(?P<clines>\d[^`]*)`, not `_LINE_SPEC_FRAGMENT` -- this regex's whole
+    job is coverage (module doc's "assert coverage" clause: every
+    citation-shaped backtick token found here must be resolved OR reported,
+    never silently dropped because its line-spec half turns out to be
+    malformed). A match whose line-spec half does not fully match
+    `_LINE_SPEC_FRAGMENT` is itself reported as an unparsed citation by
+    `_check_plan_contract_citations`, never silently excluded by a stricter
+    regex that gated recognition on the line-spec ALSO being well-formed in
+    the same pattern. The PATH arm's own anchor of legitimacy is its
+    `_FULL_PATH_SUFFIXES` extension (any backtick span ending in `.rs`/
+    `.py`/etc followed by `:<anything>` is unambiguously citation-shaped);
+    the bare CONTINUATION arm has no path half to anchor on at all, so it
+    additionally requires its first character to be a DIGIT (`\d`) -- this
+    repo's prose routinely closes a backtick-quoted term with a bare colon
+    immediately after (`` `<keys>`: refuses ... `` ), and without the digit
+    anchor that ordinary prose shape reads as an (empty, non-numeric)
+    citation-shaped token every bit as much as `` `:1635` `` does.
 
-    Built fresh from `_FULL_PATH_SUFFIXES` on every call, same reason
-    every other citation regex here is.
+    Built fresh from `_FULL_PATH_SUFFIXES` on every call, same reason every
+    other citation regex here is. The two arms are mutually exclusive by
+    construction (`path` is set XOR `clines` is set), so a single
+    `finditer` pass sees every citation-shaped token, in document order --
+    required for the continuation arm to know which path citation came
+    immediately before it.
     """
     suffixes = "|".join(re.escape(s) for s in _FULL_PATH_SUFFIXES)
     path = r"[^`\s:]+\.(?:" + suffixes + r")"
-    return re.compile(r"`(?P<path>" + path + r"):(?P<lines>[^`]+)`")
+    return re.compile(r"`(?:(?P<path>" + path + r"):(?P<lines>[^`]+)|:(?P<clines>\d[^`]*))`")
 
 
 def _plan_contract_scope(path: Path) -> bool:
@@ -1215,18 +1248,29 @@ def _check_plan_contract_citations(
     whether they ultimately resolved, failed resolution, or were REPORTED
     AS UNPARSED (never silently dropped from the count).
 
-    Per match: first the `lines` half must fully match `_LINE_SPEC_
-    FRAGMENT` -- a token whose line-spec is not a bare digit range (e.g.
-    stray trailing text, a non-numeric spec) is itself a `Violation`
-    ("could not be classified"), never silently excluded from being a
-    citation at all. Otherwise: resolve the path
-    (`_resolve_plan_contract_target`, fail-closed on absent/ambiguous),
-    then every individual line and range in the comma-separated `lines`
-    spec must be in-bounds for that file at that sha -- ALL of them, not
-    just the first (a `1-2, 10` spec where only `10` is out of range is
-    still a violation). No adjacent-identifier / content-match check here
-    (unlike every other citation form in this file): this convention's own
-    doc names only resolution + in-bounds as what it gates, not a content
+    Two match shapes, walked in ONE `finditer` pass (document order matters
+    -- see below): a PATH citation (`path` + `lines` groups) and a bare
+    CONTINUATION (`clines` only, no path half -- `` `:1635` `` eliding a
+    path already named earlier on the SAME LINE). Per PATH citation: first
+    its `lines` half must fully match `_LINE_SPEC_FRAGMENT` -- a token
+    whose line-spec is not a bare digit range (e.g. stray trailing text, a
+    non-numeric spec) is itself a `Violation` ("could not be classified"),
+    never silently excluded from being a citation at all. Otherwise:
+    resolve the path (`_resolve_plan_contract_target`, fail-closed on
+    absent/ambiguous), then every individual line and range in the
+    comma-separated spec must be in-bounds for that file at that sha -- ALL
+    of them, not just the first (a `1-2, 10` spec where only `10` is out of
+    range is still a violation). A successfully-resolved path citation
+    becomes the CONTINUATION SCOPE for any bare `:<line-spec>` token that
+    follows it later on the same line; the scope resets (to "none") the
+    moment a match on a DIFFERENT line is seen, and also resets past a
+    PATH citation that itself failed to resolve (a broken citation is not a
+    valid basis for a later elision to lean on). A bare continuation seen
+    with no such scope in effect is itself a `Violation`, never silently
+    dropped or resolved against some earlier line's path. No
+    adjacent-identifier / content-match check for either shape (unlike
+    every other citation form in this file): this convention's own doc
+    names only resolution + in-bounds as what it gates, not a content
     re-check.
     """
     violations: list[Violation] = []
@@ -1238,42 +1282,17 @@ def _check_plan_contract_citations(
             lines_cache[relpath] = _lines_at_sha(epoch_sha, relpath)
         return lines_cache[relpath]
 
-    for m in _plan_contract_citation_like_re().finditer(text):
-        cited_path = m.group("path")
-        lines_spec = m.group("lines")
-        line_no = text.count("\n", 0, m.start()) + 1
-        checked += 1
-
-        if not _LINE_SPEC_ONLY_RE.match(lines_spec):
-            violations.append(
-                Violation(
-                    path, line_no,
-                    f"citation-shaped token `{cited_path}:{lines_spec}` could not be "
-                    "classified: its line-spec half is not a bare "
-                    "`<line>[-<line>][, <line>[-<line>]]*` digit range -- fix the token, "
-                    "or rewrite it so it does not read as a path:line citation",
-                )
-            )
-            continue
-
-        relpath, error = _resolve_plan_contract_target(cited_path, epoch_sha, basename_map)
-        if error is not None:
-            violations.append(
-                Violation(path, line_no, f"cites {cited_path}:{lines_spec} but {error}")
-            )
-            continue
-
+    def _check_bounds(cited_label: str, relpath: str, lines_spec: str, line_no: int) -> None:
         target_lines = _lines(relpath)
         if target_lines is None:
             violations.append(
                 Violation(
                     path, line_no,
-                    f"cites {cited_path}:{lines_spec} (resolved to {relpath}), but "
+                    f"cites {cited_label} (resolved to {relpath}), but "
                     f"`git show {epoch_sha}:{relpath}` could not read that file",
                 )
             )
-            continue
-
+            return
         for part in lines_spec.split(","):
             part = part.strip()
             lo_s, _, hi_s = part.partition("-")
@@ -1283,11 +1302,86 @@ def _check_plan_contract_citations(
                 violations.append(
                     Violation(
                         path, line_no,
-                        f"cites {cited_path}:{lines_spec} but {relpath} only has "
+                        f"cites {cited_label} but {relpath} only has "
                         f"{len(target_lines)} lines at pinned epoch {epoch_sha} (range {part!r} "
                         "does not fit)",
                     )
                 )
+
+    pending_relpath: str | None = None
+    pending_line: int | None = None
+
+    for m in _plan_contract_citation_like_re().finditer(text):
+        line_no = text.count("\n", 0, m.start()) + 1
+        if pending_line is not None and line_no != pending_line:
+            # The continuation scope is SAME-LINE only -- a path citation
+            # named on an earlier line is never a valid basis for a later
+            # line's own bare `:<n>` elision.
+            pending_relpath = None
+        checked += 1
+
+        if m.group("path") is not None:
+            cited_path = m.group("path")
+            lines_spec = m.group("lines")
+            cited_label = f"{cited_path}:{lines_spec}"
+            if not _LINE_SPEC_ONLY_RE.match(lines_spec):
+                violations.append(
+                    Violation(
+                        path, line_no,
+                        f"citation-shaped token `{cited_label}` could not be "
+                        "classified: its line-spec half is not a bare "
+                        "`<line>[-<line>][, <line>[-<line>]]*` digit range -- fix the token, "
+                        "or rewrite it so it does not read as a path:line citation",
+                    )
+                )
+                pending_relpath, pending_line = None, line_no
+                continue
+            relpath, error = _resolve_plan_contract_target(cited_path, epoch_sha, basename_map)
+            if error is not None:
+                violations.append(Violation(path, line_no, f"cites {cited_label} but {error}"))
+                pending_relpath, pending_line = None, line_no
+                continue
+            _check_bounds(cited_label, relpath, lines_spec, line_no)
+            pending_relpath, pending_line = relpath, line_no
+            continue
+
+        # Bare continuation: `clines` is set, `path` is not (the two arms
+        # are mutually exclusive by construction -- see `_plan_contract_
+        # citation_like_re`'s own doc).
+        lines_spec = m.group("clines")
+        cited_label = f":{lines_spec}"
+        if not _LINE_SPEC_ONLY_RE.match(lines_spec):
+            violations.append(
+                Violation(
+                    path, line_no,
+                    f"citation-shaped token `{cited_label}` could not be "
+                    "classified: its line-spec half is not a bare "
+                    "`<line>[-<line>][, <line>[-<line>]]*` digit range -- fix the token, "
+                    "or rewrite it so it does not read as a path:line citation",
+                )
+            )
+            pending_line = line_no
+            continue
+        if pending_relpath is None:
+            violations.append(
+                Violation(
+                    path, line_no,
+                    f"cites the bare continuation `{cited_label}` but no path:line citation "
+                    "resolves earlier on this same line for it to elide -- a bare line-spec "
+                    "token with no preceding path IN SCOPE is refused, never silently guessed "
+                    "against an earlier line's path",
+                )
+            )
+            pending_line = line_no
+            continue
+        _check_bounds(
+            f"{cited_label} (eliding the path resolved earlier on this line)",
+            pending_relpath, lines_spec, line_no,
+        )
+        pending_line = line_no
+        # `pending_relpath` is left in place: a THIRD elided `:<n>` later on
+        # the SAME line continues to resolve against the SAME preceding
+        # path, not just the immediately-prior token.
     return violations, checked
 
 
@@ -1359,11 +1453,12 @@ def _rust_comment_line_spans(text: str) -> list[tuple[int, int]]:
     `_CRATE_COMMENT_ROOTS`).
 
     Getting the char-literal case right is load-bearing, not cosmetic: an
-    unhandled `'"'`/`b'"'` char literal's embedded `"` used to be misread
-    as OPENING an ordinary string, which then stayed open (there is no
-    closing `"` inside the char literal to pair against) until the NEXT
-    unrelated `"` anywhere later in the file -- silently swallowing every
-    real comment line in between as unscanned "string content".
+    unhandled `'"'`/`b'"'` char literal's embedded `"` would otherwise be
+    misread as OPENING an ordinary string, which would then stay open
+    (there is no closing `"` inside the char literal to pair against) until
+    the NEXT unrelated `"` anywhere later in the file -- silently
+    swallowing every real comment line in between as unscanned "string
+    content".
 
     Block comments are ALWAYS tracked (so their `//`-shaped or `"`-shaped
     content never confuses the rest of this scan) but their CONTENT is

@@ -241,7 +241,11 @@ def _full_synthetic_artifact() -> dict:
         }
 
     return {
-        "legs": [{"leg_id": f"{t}-{a}", "verdict": "VALID"} for t in ("clip-text", "clip-vision", "htsat") for a in ("A1", "A2", "D1", "D2")],
+        "legs": [
+            {"leg_id": f"{t}-{a}", "verdict": "VALID", "merge_verdict": "VALID"}
+            for t in ("clip-text", "clip-vision", "htsat")
+            for a in ("A1", "A2", "D1", "D2")
+        ],
         "realized_gains": [
             {"chain": "C-LORA", "tower": "clip-text", "wall_delta_s_per_step": 0.010, "share_of_baseline_wall": 0.10},
             {"chain": "C-LORA", "tower": "clip-vision", "wall_delta_s_per_step": 0.020, "share_of_baseline_wall": 0.20},
@@ -272,11 +276,43 @@ def _full_synthetic_artifact() -> dict:
             {"port": "C-MLP-clip-vision", "verdict": "UNRESOLVED", "reason": "neither ACTIVATE nor DECLINE — clip-vision-A1: s_wall+U_wall=0.05, s_busy+U_busy=0.06"},
         ],
         "findings": [
-            {"id": "htsat-front-end-bound", "text": "The HTSAT step: front-end share of wall is 80-90% across legs."},
-            {"id": "clip-vision-front-end-share", "text": "CLIP-vision's own front end is 20-25% of wall on legs."},
-            {"id": "clip-launch-bound-batch8", "text": "3000-4000 launches/step; cuts GPU busy by 30-40%; wall drops by only 4-6%."},
-            {"id": "c-attn-htsat-out-of-tier", "text": "C-ATTN-HTSAT: 33% of GPU busy (~5% of wall)."},
+            {
+                "id": "htsat-front-end-bound",
+                "text": "The HTSAT step: front-end share of wall is 80-90% across legs.",
+                "evidence": {
+                    "front_share_of_wall_pct": {"htsat-A1": 80.0, "htsat-A2": 90.0},
+                    "front_end_bound": True,
+                    "arm_invariant": True,
+                },
+            },
+            {
+                "id": "clip-vision-front-end-share",
+                "text": "CLIP-vision's own front end is 20-25% of wall on legs.",
+                "evidence": {
+                    "front_share_of_wall_pct": {"clip-vision-A1": 20.0, "clip-vision-A2": 25.0},
+                },
+            },
+            {
+                "id": "clip-launch-bound-batch8",
+                "text": "3000-4000 launches/step; cuts GPU busy by 30-40%; wall drops by only 4-6%.",
+                "evidence": {
+                    "launches_per_step": {
+                        "clip-text-A1": 3000.0, "clip-text-A2": 3100.0,
+                        "clip-vision-A1": 3900.0, "clip-vision-A2": 4000.0,
+                    },
+                    "busy_delta_pct_bf16_vs_f32": {"clip-text": -30.0, "clip-vision": -40.0},
+                    "wall_delta_pct_bf16_vs_f32": {"clip-text": -4.0, "clip-vision": -6.0},
+                    "launch_bound": True,
+                    "wall_drop_smaller_than_busy_drop_every_tower": True,
+                },
+            },
+            {
+                "id": "c-attn-htsat-out-of-tier",
+                "text": "C-ATTN-HTSAT: 33% of GPU busy (~5% of wall).",
+                "evidence": {"share_gpu_busy": 0.33, "share_wall": 0.05},
+            },
         ],
+        "suppressed_findings": [],
     }
 
 
@@ -350,11 +386,102 @@ class NewBlockRenderTests(unittest.TestCase):
         self.assertIn("4–6 %", rendered)
         self.assertIn("33 %", rendered)
 
-    def test_findings_guide_refuses_on_an_unrecognized_findings_shape(self):
+    def test_findings_guide_refuses_when_the_finding_it_needs_is_absent(self):
+        """A finding this renderer's fixed prose depends on going missing
+        entirely (e.g. suppressed) must fail closed, never render around
+        the gap."""
         artifact = _full_synthetic_artifact()
-        artifact["findings"][0]["text"] = "totally reworded, no percentage pattern here"
-        with self.assertRaises(ValueError):
+        artifact["findings"] = [f for f in artifact["findings"] if f["id"] != "htsat-front-end-bound"]
+        with self.assertRaises(ValueError) as ctx:
             r.render_findings_guide(artifact)
+        self.assertIn("htsat-front-end-bound", str(ctx.exception))
+
+    def _withhold(self, finding_id: str, flag: str):
+        artifact = _full_synthetic_artifact()
+        for finding in artifact["findings"]:
+            if finding["id"] == finding_id:
+                finding["evidence"][flag] = False
+        return artifact
+
+    def _absent(self, finding_id: str, flag: str):
+        artifact = _full_synthetic_artifact()
+        for finding in artifact["findings"]:
+            if finding["id"] == finding_id:
+                del finding["evidence"][flag]
+        return artifact
+
+    # -- B3: the guide and CHANGELOG renderers must take every licensed
+    # word from the artifact's own `evidence`, and fail CLOSED (never
+    # render the word anyway) the moment a run's own evidence withholds it
+    # -- one test per word per surface (`findings-guide`, CHANGELOG).
+
+    def test_findings_guide_refuses_when_front_end_bound_is_withheld(self):
+        artifact = self._withhold("htsat-front-end-bound", "front_end_bound")
+        with self.assertRaises(ValueError) as ctx:
+            r.render_findings_guide(artifact)
+        self.assertIn("front_end_bound", str(ctx.exception))
+        self.assertIn("CPU front-end-bound", str(ctx.exception))
+
+    def test_findings_guide_refuses_when_arm_invariance_is_absent(self):
+        """Absent (never evaluated -- e.g. the D-arm legs were not all
+        VALID) must refuse exactly like an explicit `False`, never be
+        treated as 'not applicable, render the word anyway'."""
+        artifact = self._absent("htsat-front-end-bound", "arm_invariant")
+        with self.assertRaises(ValueError) as ctx:
+            r.render_findings_guide(artifact)
+        self.assertIn("arm_invariant", str(ctx.exception))
+        self.assertIn("dtype- and arm-invariant", str(ctx.exception))
+
+    def test_findings_guide_refuses_when_launch_bound_is_withheld(self):
+        artifact = self._withhold("clip-launch-bound-batch8", "launch_bound")
+        with self.assertRaises(ValueError) as ctx:
+            r.render_findings_guide(artifact)
+        self.assertIn("launch_bound", str(ctx.exception))
+        self.assertIn("launch-bound", str(ctx.exception))
+
+    def test_changelog_refuses_when_front_end_bound_is_withheld(self):
+        artifact = self._withhold("htsat-front-end-bound", "front_end_bound")
+        for leg in artifact["attribution"]:
+            leg["verdict"] = "VALID"
+        with self.assertRaises(ValueError) as ctx:
+            r.render_changelog_421_entry(artifact)
+        self.assertIn("front_end_bound", str(ctx.exception))
+
+    def test_changelog_refuses_when_arm_invariance_is_absent(self):
+        artifact = self._absent("htsat-front-end-bound", "arm_invariant")
+        for leg in artifact["attribution"]:
+            leg["verdict"] = "VALID"
+        with self.assertRaises(ValueError) as ctx:
+            r.render_changelog_421_entry(artifact)
+        self.assertIn("arm_invariant", str(ctx.exception))
+
+    def test_changelog_refuses_when_launch_bound_is_withheld(self):
+        artifact = self._withhold("clip-launch-bound-batch8", "launch_bound")
+        for leg in artifact["attribution"]:
+            leg["verdict"] = "VALID"
+        with self.assertRaises(ValueError) as ctx:
+            r.render_changelog_421_entry(artifact)
+        self.assertIn("launch_bound", str(ctx.exception))
+
+    def test_htsat_a2_deviation_refuses_when_decision_grade_becomes_true(self):
+        """The bullet's own fixed prose ('is VALID but not decision-grade')
+        is licensed by `attribution[htsat-A2].decision_grade` itself, never
+        a hard-coded negation -- a run where this leg becomes decision-grade
+        must fail this renderer closed, never keep asserting the opposite."""
+        artifact = _full_synthetic_artifact()
+        artifact["attribution"][4]["decision_grade"] = True  # htsat-A2
+        with self.assertRaises(ValueError) as ctx:
+            r.render_htsat_a2_deviation(artifact)
+        self.assertIn("decision_grade", str(ctx.exception))
+
+    def test_htsat_a2_deviation_refuses_when_merge_verdict_is_not_valid(self):
+        artifact = _full_synthetic_artifact()
+        for leg in artifact["legs"]:
+            if leg["leg_id"] == "htsat-A2":
+                leg["merge_verdict"] = "INVALID"
+        with self.assertRaises(ValueError) as ctx:
+            r.render_htsat_a2_deviation(artifact)
+        self.assertIn("merge_verdict", str(ctx.exception))
 
 
 class LiveSourceTests(unittest.TestCase):

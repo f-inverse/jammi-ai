@@ -13,6 +13,7 @@ Run directly: `python3 ci/scripts/perf/test_check_citations.py`
 from __future__ import annotations
 
 import os
+import re
 import subprocess
 import sys
 import tempfile
@@ -1755,6 +1756,132 @@ class PlanContractCitationTests(GitFixture):
         self.assertEqual(len(violations), 1, [str(v) for v in violations])
         self.assertIn("could not be classified", violations[0].message)
 
+    def test_continuation_resolves_against_the_preceding_path_on_the_same_line(self):
+        """A bare `` `:<line>` `` continuation elides a path already named
+        earlier on the SAME LINE -- CONTRACT.md's own "`` `htsat_audio.rs:
+        1064` `` and `` `:1635` `` call ..." shape."""
+        self._write("crates/foo/trainer.rs", "\n".join(f"line {i}" for i in range(1, 11)) + "\n")
+        good_sha = self._commit("add trainer.rs")
+        doc = self._write(
+            "doc.md",
+            f"<!-- citations-resolve-at: {good_sha} -->\n\n"
+            "`trainer.rs:2` and `:5` call the same thing.\n",
+        )
+        self._commit("add contract")
+        violations = cc.check_file(doc)
+        self.assertEqual(violations, [], [str(v) for v in violations])
+
+    def test_continuation_coverage_counts_the_bare_token_too(self):
+        self._write("crates/foo/trainer.rs", "\n".join(f"line {i}" for i in range(1, 11)) + "\n")
+        good_sha = self._commit("add trainer.rs")
+        doc = self._write(
+            "doc.md",
+            f"<!-- citations-resolve-at: {good_sha} -->\n\n`trainer.rs:2` and `:5`\n",
+        )
+        self._commit("add contract")
+        cc._SEARCH_ROOTS = ()
+        cc._DOC_SEARCH_ROOTS = ()
+
+        import contextlib
+        import io
+
+        buf = io.StringIO()
+        with contextlib.redirect_stdout(buf):
+            code = cc.main()
+        self.assertEqual(code, 0)
+        self.assertIn("2 citation(s) checked", buf.getvalue())
+
+    def test_continuation_out_of_bounds_is_red(self):
+        self._write("crates/foo/trainer.rs", "line one\nline two\nline three\n")
+        good_sha = self._commit("add trainer.rs")
+        doc = self._write(
+            "doc.md",
+            f"<!-- citations-resolve-at: {good_sha} -->\n\n`trainer.rs:1` and `:999`\n",
+        )
+        self._commit("add contract")
+        violations = cc.check_file(doc)
+        self.assertEqual(len(violations), 1, [str(v) for v in violations])
+        self.assertIn("only has 3 lines", violations[0].message)
+
+    def test_second_continuation_on_same_line_still_resolves_against_first_path(self):
+        """A THIRD elided `:<n>` on the same line continues to resolve
+        against the SAME preceding path, not just the immediately-prior
+        token."""
+        self._write("crates/foo/trainer.rs", "\n".join(f"line {i}" for i in range(1, 11)) + "\n")
+        good_sha = self._commit("add trainer.rs")
+        doc = self._write(
+            "doc.md",
+            f"<!-- citations-resolve-at: {good_sha} -->\n\n"
+            "`trainer.rs:2`, `:5` and `:7` all call the same thing.\n",
+        )
+        self._commit("add contract")
+        violations = cc.check_file(doc)
+        self.assertEqual(violations, [], [str(v) for v in violations])
+
+    def test_continuation_with_no_preceding_path_is_a_violation(self):
+        """A bare line-spec token with no preceding path citation IN SCOPE
+        on this line is refused, never silently guessed against an earlier
+        line's path (or ignored)."""
+        self._write("crates/foo/trainer.rs", "line one\n")
+        good_sha = self._commit("add trainer.rs")
+        doc = self._write(
+            "doc.md",
+            f"<!-- citations-resolve-at: {good_sha} -->\n\n`:5` calls the same thing.\n",
+        )
+        self._commit("add contract")
+        violations = cc.check_file(doc)
+        self.assertEqual(len(violations), 1, [str(v) for v in violations])
+        self.assertIn("no path:line citation resolves earlier on this same line", violations[0].message)
+
+    def test_continuation_scope_resets_across_lines(self):
+        """A path citation named on one line is never a valid basis for a
+        DIFFERENT line's own bare continuation."""
+        self._write("crates/foo/trainer.rs", "\n".join(f"line {i}" for i in range(1, 11)) + "\n")
+        good_sha = self._commit("add trainer.rs")
+        doc = self._write(
+            "doc.md",
+            f"<!-- citations-resolve-at: {good_sha} -->\n\n"
+            "`trainer.rs:2` calls the thing.\n\n`:5` calls it too.\n",
+        )
+        self._commit("add contract")
+        violations = cc.check_file(doc)
+        self.assertEqual(len(violations), 1, [str(v) for v in violations])
+        self.assertIn("no path:line citation resolves earlier on this same line", violations[0].message)
+
+    def test_continuation_scope_does_not_survive_a_broken_preceding_citation(self):
+        """A path citation that itself FAILED to resolve is not a valid
+        basis for a later same-line continuation to lean on."""
+        self._write("crates/foo/trainer.rs", "line one\n")
+        good_sha = self._commit("add trainer.rs")
+        doc = self._write(
+            "doc.md",
+            f"<!-- citations-resolve-at: {good_sha} -->\n\n`nowhere.rs:1` and `:1`\n",
+        )
+        self._commit("add contract")
+        violations = cc.check_file(doc)
+        self.assertEqual(len(violations), 2, [str(v) for v in violations])
+        messages = [v.message for v in violations]
+        self.assertTrue(any("does not exist anywhere in the tree" in m for m in messages))
+        self.assertTrue(any("no path:line citation resolves earlier on this same line" in m for m in messages))
+
+    def test_backtick_prose_ending_in_a_bare_colon_is_not_a_false_positive_continuation(self):
+        """This repo's prose routinely closes a backtick-quoted term with a
+        bare colon immediately after (`` `<keys>`: refuses ... ``) --
+        without the continuation arm's own digit anchor, that ordinary
+        prose shape would read as an (empty, non-numeric) citation-shaped
+        token exactly as much as `` `:1635` `` does."""
+        self._write("crates/foo/trainer.rs", "line one\n")
+        good_sha = self._commit("add trainer.rs")
+        doc = self._write(
+            "doc.md",
+            f"<!-- citations-resolve-at: {good_sha} -->\n\n"
+            "`finetune-run --expect-kernels-disabled <keys>`: refuses at start unless every "
+            "named key is present in `JAMMI_KERNELS_DISABLE`.\n",
+        )
+        self._commit("add contract")
+        violations = cc.check_file(doc)
+        self.assertEqual(violations, [], [str(v) for v in violations])
+
     def test_coverage_count_reported_for_a_pinned_file(self):
         """`_check_plan_contract_citations` (driven here via `main()`, the
         real coverage-reporting entry point) reports the exact count of
@@ -1793,6 +1920,39 @@ class PlanContractCitationTests(GitFixture):
         epoch_sha, error = cc._file_citations_epoch(contract, text)
         self.assertIsNone(error)
         self.assertIsNotNone(epoch_sha)
+
+    def test_real_contract_citation_coverage_is_19_including_the_elided_line(self):
+        """`docs/plans/66-tower-profile/CONTRACT.md:16` cites `` `htsat_
+        audio.rs:1064` `` and `` `:1635` `` -- the elided second citation is
+        a 19th citation the OLD (path-only) recognizer could not see at
+        all (coverage read 18). Enumerating every backticked, colon-
+        numbered token in the real file independently (never trusting this
+        script's own regex to count itself) confirms the true total is 19:
+        18 named-path citations plus the one bare continuation."""
+        cc._PLAN_CONTRACT_ROOTS = self._orig_plan_contract_roots
+        contract = cc.REPO_ROOT / "docs" / "plans" / "66-tower-profile" / "CONTRACT.md"
+        text = contract.read_text()
+        independent_count = len(re.findall(r"`[^`]*:[0-9][^`]*`", text))
+        self.assertEqual(independent_count, 19)
+
+        # `GitFixture.setUp` points `_GIT_REPO_ROOT` at this test's own
+        # throwaway repo -- restored here (redundantly with `tearDown`) so
+        # `main()`'s own `git show`/`git ls-tree` calls resolve the REAL
+        # `CONTRACT.md`'s citations against the REAL repository, not the
+        # empty fixture one.
+        cc._GIT_REPO_ROOT = self._orig_git_repo_root
+        cc._SEARCH_ROOTS = ()
+        cc._DOC_SEARCH_ROOTS = ()
+        import contextlib
+        import io
+
+        buf = io.StringIO()
+        with contextlib.redirect_stdout(buf):
+            code = cc.main()
+        self.assertEqual(code, 0)
+        self.assertIn(
+            "docs/plans/66-tower-profile/CONTRACT.md: 19 citation(s) checked", buf.getvalue()
+        )
 
 
 class BasenameMapHeaderTests(GitFixture):

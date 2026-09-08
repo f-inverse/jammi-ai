@@ -1,0 +1,16 @@
+{
+  "host": {
+    "logical_cpus": 26
+  },
+  "provenance": {
+    "build_sha": "0a8562c4ff6205a69150580ff70a8cd098a9ebba"
+  },
+  "tiers": {
+    "finetune_run": {
+      "steps_measured": 100,
+      "media_front_end_wall_s": 0.727087677,
+      "train_run_wall_s": 6.207345545,
+      "rayon_pool_threads": 26
+    }
+  }
+}

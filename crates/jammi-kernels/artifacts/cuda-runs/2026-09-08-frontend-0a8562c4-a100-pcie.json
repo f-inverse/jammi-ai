@@ -1,0 +1,189 @@
+{
+ "schema_version": 1,
+ "git_sha": "0a8562c4ff6205a69150580ff70a8cd098a9ebba",
+ "box": "NVIDIA A100 80GB PCIe, 570.172.08, 51a25f682a8d",
+ "producer": {
+  "path": "ci/scripts/perf/frontend_ab_artifact.py",
+  "kind": "script",
+  "invocation": "python3 ci/scripts/perf/frontend_ab_artifact.py --raw-dir ci/scripts/perf/fixtures/frontend_ab_final/raw --report-json ci/scripts/perf/fixtures/frontend_ab_final/report.json --identity ci/scripts/perf/frontend_ab_final_identity.json --measured-serial-tail-s 0.00474603615 --out crates/jammi-kernels/artifacts/cuda-runs/2026-09-08-frontend-0a8562c4-a100-pcie.json",
+  "gating": "none"
+ },
+ "status": "GREEN",
+ "notes": {
+  "what": "GH #421 follow-on ('media front-end parallelization') close-out: the pre-registered (contract perf/421-frontend v3) FINAL base/tip A/B of the HTSAT (--task audio_embedding) and CLIP-vision (--task image_embedding) finetune-run front ends, interleaved base/tip/base/tip/base/tip (FRONTEND_AB_REPEATS=3) at N=100 steps, batch 8 (24 items/step). Decides whether the rayon-parallel media front end (scope A) clears the HTSAT bar (contract 'Measurement'); the run's own numbers are recorded regardless of the bar's own verdict, per the contract's own Verdict clause.",
+  "gpu": "NVIDIA A100 80GB PCIe",
+  "driver": "570.172.08",
+  "cpu": "AMD EPYC 7763 64-Core Processor",
+  "driver_commit": "0a8562c4ff6205a69150580ff70a8cd098a9ebba",
+  "run_sha256": "e683f1fbe949ab3bbdfbbdd617f80938fa7cf8a3e50b400deb4431a9858c6158",
+  "rendered_from_tree_sha": "74c609f213cb538b944ae3fb494517dbdddc0c69",
+  "input_sha256": {
+   "report_json": "1995313b67e9f0e228f2bece7755b784b646be2fd68317b8117cbac98c48fa90",
+   "identity": "04874936d739484696e5cf8015d4e03e008b50770bb9a403b8e6c05fc8f83549",
+   "raw/clip-vision__base__r1.json": "323af10a1a747fc0cb7b84d6293c735e8ca675eb9cd8aef916e4eede9a97df6f",
+   "raw/clip-vision__base__r2.json": "a887fd418049809dd7dacec240d3b2ef7b7901da15ec795050209972aefd1a1b",
+   "raw/clip-vision__base__r3.json": "240dd51fcfe7d8aee26d6d2228078c8af250930153db6a7d418fe55efc07eae2",
+   "raw/clip-vision__tip__r1.json": "775179faef3d019d2c429c4429edea443a315612b51ed5d150a68ff7db2b9a74",
+   "raw/clip-vision__tip__r2.json": "d7c87a19b0e8f8b24b5973165000f57babdd1d22bf2ad8dafa2ba10d1d42e23b",
+   "raw/clip-vision__tip__r3.json": "d3fa382680131537b4ba0894c748d1befae0f4e0db16d64afaa76eeec4924d28",
+   "raw/htsat__base__r1.json": "9a515c3ed12d4aad48525bb5f2bf0d88a405ce7695b548927290c4226fc40ae9",
+   "raw/htsat__base__r2.json": "0b9e4c68ab0bdd6c0fd47c49b873847298b323b56d3d5fe24b673ee1ac7fbc97",
+   "raw/htsat__base__r3.json": "d2e54ffa4c54b15d95eeb9778a358900f0582d286d3bfc7288ec6eb8a04a594e",
+   "raw/htsat__tip__r1.json": "0721735f86d1db0e93e64f2f17d0180c5cbf97aed3aa378d8076649316e9fa13",
+   "raw/htsat__tip__r2.json": "17d66cdacbca8a66cd4788185d17e43267d832031055a6ba91df0ff8b2a5dafb",
+   "raw/htsat__tip__r3.json": "5249d6d2459ed1630886766007cc1f19296d431381dc3ecbecc535377a542252"
+  },
+  "measured_tip_precedes_merge_tip": {
+   "kind": "measured-tip-precedes-merge-tip",
+   "measured_tip": "0a8562c4ff6205a69150580ff70a8cd098a9ebba",
+   "rendered_from_tree_sha": "74c609f213cb538b944ae3fb494517dbdddc0c69",
+   "files_changed_since_measured_tip": [
+    "CHANGELOG.md",
+    "crates/jammi-ai/src/inference/adapter/mod.rs",
+    "crates/jammi-ai/src/inference/audio_preprocess.rs",
+    "crates/jammi-ai/src/model/backend/http.rs",
+    "crates/jammi-ai/src/session.rs",
+    "crates/jammi-ai/tests/it/backends.rs",
+    "crates/jammi-ai/tests/it/media_front_end.rs",
+    "crates/jammi-ai/tests/it/tower_adapters.rs"
+   ],
+   "diffstat": "CHANGELOG.md                                      |  24 ++\n crates/jammi-ai/src/inference/adapter/mod.rs      | 394 +++++++++++++++++++++-\n crates/jammi-ai/src/inference/audio_preprocess.rs |  88 ++++-\n crates/jammi-ai/src/model/backend/http.rs         |  21 +-\n crates/jammi-ai/src/session.rs                    |  12 +-\n crates/jammi-ai/tests/it/backends.rs              |  21 +-\n crates/jammi-ai/tests/it/media_front_end.rs       |  40 ++-\n crates/jammi-ai/tests/it/tower_adapters.rs        | 192 +++++++++++\n 8 files changed, 752 insertions(+), 40 deletions(-)",
+   "commentary": "crates/jammi-ai/src/inference/audio_preprocess.rs changed in two places on the timed path: resample_linear's output-length arithmetic was extracted into a shared resampled_len() helper (identical arithmetic; the branch's own byte-identity oracles at pool sizes 1/5/7/24 hold), and a sequential O(n) zero-sample refusal pass was added before the parallel per-clip stage; the par_chunks_mut stage, decode_*_results, and preprocess_image_batch* are untouched. Every other file in this deviation's own files_changed_since_measured_tip list is off the front-end path (BackendOutput row accessors, session query paths, HttpBackend, tests, CHANGELOG)."
+  },
+  "recorded_deviations": [
+   "the pod's own base-tree checkout emitted 'error: invalid object 100644 4dbdd2167e924cbd7b847b5588fe08748fb8e889 for .github/workflows/ci.yml' twice during the base-tree sync phase (job log 'base tree' phase) -- BASE_SYNC_RC=0 (the checkout still completed and the base binary's own provenance was cross-checked against c1b0b0ba by frontend_ab.sh's own _check_provenance before any leg ran), and .github/workflows/ci.yml is off this unit's own hot path (never read by finetune-run) -- recorded as an observed anomaly, never silently dropped.",
+   "the pod's own CPU was shared-host at launch: ~40 loadavg observed against a cgroup CPU quota of 26 (identity phase: '2635000 100000' -> 26.35 CPUs; the tip binary's own rayon_pool_threads=26 matches this quota, not the host's full logical CPU count) -- the HTSAT bar's own P=26 already reflects this quota mechanically (read from every tip leg's own report), so this is context for why P=26 rather than a full 64-core count, not a caveat on any re-derived number.",
+   "the driver's own FRONTEND_AB_SERIAL_TAIL_RATIO=0.0033 is a REHEARSAL-derived default, not this run's own measurement; this run's own 'cargo run -p jammi-bench --example frontend_serial_tail' measurement (t_s=0.00474603615 s for HTSAT, task=audio_embedding, dims=[24, 4, 1001, 64], reps=20, device=cuda:0) is passed separately as --measured-serial-tail-s and re-derives a SECOND htsat_bar block (htsat_bar_measured_r) under the SAME pinned rule -- both variants are carried in the committed artifact and their own verdicts are asserted equal (the 'driver default vs measured; verdict invariant' deviation), never only the driver-default one.",
+   "CLIP-vision's own serial-tail measurement (t_s=0.0011608887 s, dims=[24, 3, 224, 224]) was also captured this run but is not used by any bar (CLIP-vision is report-only under this contract) -- recorded here for completeness, not asserted against anything."
+  ]
+ },
+ "measurement": {
+  "base_sha": "c1b0b0bad1f79a4ad6c298400e6ea19cc1ca633c",
+  "tip_sha": "0a8562c4ff6205a69150580ff70a8cd098a9ebba",
+  "box": "NVIDIA A100 80GB PCIe, 570.172.08, 51a25f682a8d",
+  "n_items_per_step": 24,
+  "repeats": 3,
+  "legs": {
+   "clip-vision__base__r1": {
+    "front_per_step": 0.024169105330000003,
+    "train_per_step": 0.07682129577999999,
+    "steps_measured": 100,
+    "rayon_pool_threads": null
+   },
+   "clip-vision__base__r2": {
+    "front_per_step": 0.03891253023,
+    "train_per_step": 0.10723816097,
+    "steps_measured": 100,
+    "rayon_pool_threads": null
+   },
+   "clip-vision__base__r3": {
+    "front_per_step": 0.02474779946,
+    "train_per_step": 0.07938794017,
+    "steps_measured": 100,
+    "rayon_pool_threads": null
+   },
+   "clip-vision__tip__r1": {
+    "front_per_step": 0.007772863330000001,
+    "train_per_step": 0.06227709375,
+    "steps_measured": 100,
+    "rayon_pool_threads": 26
+   },
+   "clip-vision__tip__r2": {
+    "front_per_step": 0.00842913762,
+    "train_per_step": 0.0709237139,
+    "steps_measured": 100,
+    "rayon_pool_threads": 26
+   },
+   "clip-vision__tip__r3": {
+    "front_per_step": 0.00727087677,
+    "train_per_step": 0.06207345545,
+    "steps_measured": 100,
+    "rayon_pool_threads": 26
+   },
+   "htsat__base__r1": {
+    "front_per_step": 1.32944626602,
+    "train_per_step": 1.55996878124,
+    "steps_measured": 100,
+    "rayon_pool_threads": null
+   },
+   "htsat__base__r2": {
+    "front_per_step": 1.3440204546699999,
+    "train_per_step": 1.5767245209699998,
+    "steps_measured": 100,
+    "rayon_pool_threads": null
+   },
+   "htsat__base__r3": {
+    "front_per_step": 1.33212035452,
+    "train_per_step": 1.56453491759,
+    "steps_measured": 100,
+    "rayon_pool_threads": null
+   },
+   "htsat__tip__r1": {
+    "front_per_step": 0.10445164997999999,
+    "train_per_step": 0.34004634169,
+    "steps_measured": 100,
+    "rayon_pool_threads": 26
+   },
+   "htsat__tip__r2": {
+    "front_per_step": 0.10373479365999999,
+    "train_per_step": 0.33204042435,
+    "steps_measured": 100,
+    "rayon_pool_threads": 26
+   },
+   "htsat__tip__r3": {
+    "front_per_step": 0.11575477284999999,
+    "train_per_step": 0.36116788348999995,
+    "steps_measured": 100,
+    "rayon_pool_threads": 26
+   }
+  },
+  "htsat_bar_driver_r": {
+   "p": 26,
+   "n": 24,
+   "ideal": 24.0,
+   "r": 0.0033,
+   "upper_bound": 0.08635833333333333,
+   "lower_bound": 0.04482916666666666,
+   "front_tip_mean_s": 0.10798040549666665,
+   "front_base_mean_s": 1.3351956917366667,
+   "ratio": 0.08087234415519896,
+   "ratio_lo": 0.07718245157620775,
+   "ratio_hi": 0.08706991460176744,
+   "verdict": "UNRESOLVED"
+  },
+  "htsat_bar_measured_r": {
+   "p": 26,
+   "n": 24,
+   "ideal": 24.0,
+   "r": 0.003554562210897273,
+   "upper_bound": 0.08659168202665583,
+   "lower_bound": 0.04507312211877656,
+   "front_tip_mean_s": 0.10798040549666665,
+   "front_base_mean_s": 1.3351956917366667,
+   "ratio": 0.08087234415519896,
+   "ratio_lo": 0.07718245157620775,
+   "ratio_hi": 0.08706991460176744,
+   "verdict": "UNRESOLVED"
+  },
+  "clip_vision_report_only": {
+   "front_tip_mean_s": 0.007824292573333334,
+   "front_base_mean_s": 0.02927647834,
+   "ratio": 0.2672552512111105
+  }
+ },
+ "verdict": {
+  "unit_verdict": "UNRESOLVED",
+  "cross_checked_against_report_json_htsat_bar_verdict": "UNRESOLVED",
+  "serial_tail_ratio_deviation": {
+   "kind": "driver default vs measured; verdict invariant",
+   "r_driver": 0.0033,
+   "r_driver_source": "FRONTEND_AB_SERIAL_TAIL_RATIO (rehearsal-derived default, contract v3)",
+   "r_measured": 0.003554562210897273,
+   "r_measured_source": "this run's own 'cargo run -p jammi-bench --example frontend_serial_tail' measurement (--measured-serial-tail-s) divided by the re-derived HTSAT front_base_mean_s",
+   "verdict_under_r_driver": "UNRESOLVED",
+   "verdict_under_r_measured": "UNRESOLVED",
+   "invariant_holds": true
+  },
+  "contract_clause_applied": "not ACTIVATE (HTSAT bar UNRESOLVED under both the driver-default and the run's own measured serial-tail ratio); per contract v3's own Verdict clause the unit ships because bit identity holds and there is no serving regression, with the numbers recorded and NO efficiency claim."
+ }
+}

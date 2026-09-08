@@ -1708,6 +1708,28 @@ jobs:
           # looks like. No GPU, no real jammi-bench, no network.
           - name: frontend_ab_merge suite
             cmd: python3 ci/scripts/perf/test_frontend_ab_merge.py
+          # `frontend_ab_artifact.py`'s own suite (#421 follow-on close-out,
+          # contract `perf/421-frontend` v3 "Build" item 1) -- the SECOND,
+          # INDEPENDENT reader after `frontend_ab_merge.py`: re-derives every
+          # leg's own `front_per_step`/`train_per_step` and the HTSAT bar's
+          # own `p`/`ideal`/bounds/`ratio`/`ratio_lo`/`ratio_hi`/`verdict`
+          # DIRECTLY from the raw legs (never imports `frontend_ab_merge.py`'s
+          # own bar arithmetic -- a second, independent implementation of the
+          # SAME pinned formula), refusing the moment any re-derived number
+          # disagrees with `report.json`'s own value, or the driver-default
+          # vs the run's own measured serial-tail ratio disagree on the
+          # bar's own verdict (the "verdict invariant" this contract names is
+          # a checked equality here, not prose). A `git init`'d tempdir repo
+          # (mirroring `check_cuda_run_artifacts.py`'s own self-test
+          # discipline) drives the "files changed after the measured tip"
+          # deviation: off this unit's own hot-path file set is recorded,
+          # ON it is a hard refusal. Every numeric field is checked against
+          # an INDEPENDENT third arithmetic oracle written in the test file
+          # itself. A dedicated regression class drives the REAL, committed
+          # pod-p421c fixture (`fixtures/frontend_ab_final/`) end to end
+          # against this checkout's own git history. No GPU, no network.
+          - name: frontend_ab_artifact suite
+            cmd: python3 ci/scripts/perf/test_frontend_ab_artifact.py
     steps:
       - uses: actions/checkout@v4
         with:

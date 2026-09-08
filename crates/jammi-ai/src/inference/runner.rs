@@ -267,7 +267,7 @@ impl InferenceRunner {
             &raw_output.row_errors,
             latency_ms,
             row_count,
-        );
+        )?;
         let task_columns = ctx.adapter.adapt(raw_output, row_count)?;
 
         let mut all_columns = prefix;

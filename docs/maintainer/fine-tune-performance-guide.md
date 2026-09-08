@@ -339,13 +339,101 @@ domain outright, and CLIP's `quick_gelu` activation has no fused seam at all —
 towers have no `gelu_erf_fused` admit site, and naming that key in a forced-eager CLIP leg
 would be an unmatched disable the bench refuses.
 
-**No tower numbers are recorded here, because none have been measured.** The training-step
-profile is pre-registered as its own unit (issue #421 PR B) and is written before any
-measurement: per-tower steps driven through `jammi-bench finetune-run` over the
-fixed-shape synthetic media the committed producers emit, ablation twins, wall-differenced
-shares, and two-sided ACTIVATE/DECLINE/UNRESOLVED thresholds declared up front so the unit
-closes on any outcome. Until that artifact exists, §11's first checklist applies unchanged:
-every number in a doc names its producer, or it is not written.
+**The training-step profile is measured.** Issue #421 step 3 ("PROFILE FIRST", rule 12)
+pre-registered the workload, method and two-sided ACTIVATE/DECLINE/UNRESOLVED thresholds
+(`docs/plans/66-tower-profile/CONTRACT.md`, frozen v2.5) BEFORE any leg ran; 11 of the 12
+legs (`A1`/`A2`/`D1`/`D2` × the three towers) pass the contract's validity gate — `htsat-A2`
+fails its UNATTRIBUTED bound and is excluded from every finding, see the profile README's
+deviations — and the BF16 pre-flight (P2) passes on every tower, measured on
+`crates/jammi-kernels/artifacts/cuda-runs/2026-09-07-profile-421-towers-c1b0b0ba-a100-sxm4.json`
+(A100-SXM4-80GB):
+
+| tower | leg | dtype | wall s/step | front s | busy s | residual s | front % | busy % |
+|---|---|---|---:|---:|---:|---:|---:|---:|
+<!-- claims: c1=crates/jammi-kernels/artifacts/cuda-runs/2026-09-07-profile-421-towers-c1b0b0ba-a100-sxm4.json#/legs/0/per_step/wall_s_per_step; c2=crates/jammi-kernels/artifacts/cuda-runs/2026-09-07-profile-421-towers-c1b0b0ba-a100-sxm4.json#/legs/0/per_step/front_s_per_step; c3=crates/jammi-kernels/artifacts/cuda-runs/2026-09-07-profile-421-towers-c1b0b0ba-a100-sxm4.json#/legs/0/per_step/busy_s_per_step; c4=crates/jammi-kernels/artifacts/cuda-runs/2026-09-07-profile-421-towers-c1b0b0ba-a100-sxm4.json#/legs/0/per_step/residual_s_per_step; c5=crates/jammi-kernels/artifacts/cuda-runs/2026-09-07-profile-421-towers-c1b0b0ba-a100-sxm4.json#/legs/0/per_step/front_share_of_wall as %; c6=crates/jammi-kernels/artifacts/cuda-runs/2026-09-07-profile-421-towers-c1b0b0ba-a100-sxm4.json#/legs/0/per_step/busy_share_of_wall as % -->
+| CLIP-text | A1 | f32 | 0.1004 | 0.0000 | 0.0608 | 0.0396 | 0.0 | 60.5 |
+<!-- claims: c1=crates/jammi-kernels/artifacts/cuda-runs/2026-09-07-profile-421-towers-c1b0b0ba-a100-sxm4.json#/legs/1/per_step/wall_s_per_step; c2=crates/jammi-kernels/artifacts/cuda-runs/2026-09-07-profile-421-towers-c1b0b0ba-a100-sxm4.json#/legs/1/per_step/front_s_per_step; c3=crates/jammi-kernels/artifacts/cuda-runs/2026-09-07-profile-421-towers-c1b0b0ba-a100-sxm4.json#/legs/1/per_step/busy_s_per_step; c4=crates/jammi-kernels/artifacts/cuda-runs/2026-09-07-profile-421-towers-c1b0b0ba-a100-sxm4.json#/legs/1/per_step/residual_s_per_step; c5=crates/jammi-kernels/artifacts/cuda-runs/2026-09-07-profile-421-towers-c1b0b0ba-a100-sxm4.json#/legs/1/per_step/front_share_of_wall as %; c6=crates/jammi-kernels/artifacts/cuda-runs/2026-09-07-profile-421-towers-c1b0b0ba-a100-sxm4.json#/legs/1/per_step/busy_share_of_wall as % -->
+| CLIP-text | A2 (bf16) | bf16 | 0.0965 | 0.0000 | 0.0414 | 0.0551 | 0.0 | 42.9 |
+<!-- claims: c1=crates/jammi-kernels/artifacts/cuda-runs/2026-09-07-profile-421-towers-c1b0b0ba-a100-sxm4.json#/legs/2/per_step/wall_s_per_step; c2=crates/jammi-kernels/artifacts/cuda-runs/2026-09-07-profile-421-towers-c1b0b0ba-a100-sxm4.json#/legs/2/per_step/front_s_per_step; c3=crates/jammi-kernels/artifacts/cuda-runs/2026-09-07-profile-421-towers-c1b0b0ba-a100-sxm4.json#/legs/2/per_step/busy_s_per_step; c4=crates/jammi-kernels/artifacts/cuda-runs/2026-09-07-profile-421-towers-c1b0b0ba-a100-sxm4.json#/legs/2/per_step/residual_s_per_step; c5=crates/jammi-kernels/artifacts/cuda-runs/2026-09-07-profile-421-towers-c1b0b0ba-a100-sxm4.json#/legs/2/per_step/front_share_of_wall as %; c6=crates/jammi-kernels/artifacts/cuda-runs/2026-09-07-profile-421-towers-c1b0b0ba-a100-sxm4.json#/legs/2/per_step/busy_share_of_wall as % -->
+| CLIP-text | D1 (LoRA+LN eager) | f32 | 0.1486 | 0.0000 | 0.0895 | 0.0591 | 0.0 | 60.2 |
+<!-- claims: c1=crates/jammi-kernels/artifacts/cuda-runs/2026-09-07-profile-421-towers-c1b0b0ba-a100-sxm4.json#/legs/3/per_step/wall_s_per_step; c2=crates/jammi-kernels/artifacts/cuda-runs/2026-09-07-profile-421-towers-c1b0b0ba-a100-sxm4.json#/legs/3/per_step/front_s_per_step; c3=crates/jammi-kernels/artifacts/cuda-runs/2026-09-07-profile-421-towers-c1b0b0ba-a100-sxm4.json#/legs/3/per_step/busy_s_per_step; c4=crates/jammi-kernels/artifacts/cuda-runs/2026-09-07-profile-421-towers-c1b0b0ba-a100-sxm4.json#/legs/3/per_step/residual_s_per_step; c5=crates/jammi-kernels/artifacts/cuda-runs/2026-09-07-profile-421-towers-c1b0b0ba-a100-sxm4.json#/legs/3/per_step/front_share_of_wall as %; c6=crates/jammi-kernels/artifacts/cuda-runs/2026-09-07-profile-421-towers-c1b0b0ba-a100-sxm4.json#/legs/3/per_step/busy_share_of_wall as % -->
+| CLIP-text | D2 (LoRA eager) | f32 | 0.1329 | 0.0000 | 0.0794 | 0.0535 | 0.0 | 59.7 |
+<!-- claims: c1=crates/jammi-kernels/artifacts/cuda-runs/2026-09-07-profile-421-towers-c1b0b0ba-a100-sxm4.json#/legs/4/per_step/wall_s_per_step; c2=crates/jammi-kernels/artifacts/cuda-runs/2026-09-07-profile-421-towers-c1b0b0ba-a100-sxm4.json#/legs/4/per_step/front_s_per_step; c3=crates/jammi-kernels/artifacts/cuda-runs/2026-09-07-profile-421-towers-c1b0b0ba-a100-sxm4.json#/legs/4/per_step/busy_s_per_step; c4=crates/jammi-kernels/artifacts/cuda-runs/2026-09-07-profile-421-towers-c1b0b0ba-a100-sxm4.json#/legs/4/per_step/residual_s_per_step; c5=crates/jammi-kernels/artifacts/cuda-runs/2026-09-07-profile-421-towers-c1b0b0ba-a100-sxm4.json#/legs/4/per_step/front_share_of_wall as %; c6=crates/jammi-kernels/artifacts/cuda-runs/2026-09-07-profile-421-towers-c1b0b0ba-a100-sxm4.json#/legs/4/per_step/busy_share_of_wall as % -->
+| CLIP-vision | A1 | f32 | 0.1147 | 0.0235 | 0.0652 | 0.0260 | 20.5 | 56.9 |
+<!-- claims: c1=crates/jammi-kernels/artifacts/cuda-runs/2026-09-07-profile-421-towers-c1b0b0ba-a100-sxm4.json#/legs/5/per_step/wall_s_per_step; c2=crates/jammi-kernels/artifacts/cuda-runs/2026-09-07-profile-421-towers-c1b0b0ba-a100-sxm4.json#/legs/5/per_step/front_s_per_step; c3=crates/jammi-kernels/artifacts/cuda-runs/2026-09-07-profile-421-towers-c1b0b0ba-a100-sxm4.json#/legs/5/per_step/busy_s_per_step; c4=crates/jammi-kernels/artifacts/cuda-runs/2026-09-07-profile-421-towers-c1b0b0ba-a100-sxm4.json#/legs/5/per_step/residual_s_per_step; c5=crates/jammi-kernels/artifacts/cuda-runs/2026-09-07-profile-421-towers-c1b0b0ba-a100-sxm4.json#/legs/5/per_step/front_share_of_wall as %; c6=crates/jammi-kernels/artifacts/cuda-runs/2026-09-07-profile-421-towers-c1b0b0ba-a100-sxm4.json#/legs/5/per_step/busy_share_of_wall as % -->
+| CLIP-vision | A2 (bf16) | bf16 | 0.1086 | 0.0241 | 0.0386 | 0.0459 | 22.2 | 35.6 |
+<!-- claims: c1=crates/jammi-kernels/artifacts/cuda-runs/2026-09-07-profile-421-towers-c1b0b0ba-a100-sxm4.json#/legs/6/per_step/wall_s_per_step; c2=crates/jammi-kernels/artifacts/cuda-runs/2026-09-07-profile-421-towers-c1b0b0ba-a100-sxm4.json#/legs/6/per_step/front_s_per_step; c3=crates/jammi-kernels/artifacts/cuda-runs/2026-09-07-profile-421-towers-c1b0b0ba-a100-sxm4.json#/legs/6/per_step/busy_s_per_step; c4=crates/jammi-kernels/artifacts/cuda-runs/2026-09-07-profile-421-towers-c1b0b0ba-a100-sxm4.json#/legs/6/per_step/residual_s_per_step; c5=crates/jammi-kernels/artifacts/cuda-runs/2026-09-07-profile-421-towers-c1b0b0ba-a100-sxm4.json#/legs/6/per_step/front_share_of_wall as %; c6=crates/jammi-kernels/artifacts/cuda-runs/2026-09-07-profile-421-towers-c1b0b0ba-a100-sxm4.json#/legs/6/per_step/busy_share_of_wall as % -->
+| CLIP-vision | D1 (LoRA+LN eager) | f32 | 0.1658 | 0.0243 | 0.0976 | 0.0439 | 14.7 | 58.8 |
+<!-- claims: c1=crates/jammi-kernels/artifacts/cuda-runs/2026-09-07-profile-421-towers-c1b0b0ba-a100-sxm4.json#/legs/7/per_step/wall_s_per_step; c2=crates/jammi-kernels/artifacts/cuda-runs/2026-09-07-profile-421-towers-c1b0b0ba-a100-sxm4.json#/legs/7/per_step/front_s_per_step; c3=crates/jammi-kernels/artifacts/cuda-runs/2026-09-07-profile-421-towers-c1b0b0ba-a100-sxm4.json#/legs/7/per_step/busy_s_per_step; c4=crates/jammi-kernels/artifacts/cuda-runs/2026-09-07-profile-421-towers-c1b0b0ba-a100-sxm4.json#/legs/7/per_step/residual_s_per_step; c5=crates/jammi-kernels/artifacts/cuda-runs/2026-09-07-profile-421-towers-c1b0b0ba-a100-sxm4.json#/legs/7/per_step/front_share_of_wall as %; c6=crates/jammi-kernels/artifacts/cuda-runs/2026-09-07-profile-421-towers-c1b0b0ba-a100-sxm4.json#/legs/7/per_step/busy_share_of_wall as % -->
+| CLIP-vision | D2 (LoRA eager) | f32 | 0.1450 | 0.0243 | 0.0873 | 0.0334 | 16.8 | 60.2 |
+<!-- claims: c1=crates/jammi-kernels/artifacts/cuda-runs/2026-09-07-profile-421-towers-c1b0b0ba-a100-sxm4.json#/legs/8/per_step/wall_s_per_step; c2=crates/jammi-kernels/artifacts/cuda-runs/2026-09-07-profile-421-towers-c1b0b0ba-a100-sxm4.json#/legs/8/per_step/front_s_per_step; c3=crates/jammi-kernels/artifacts/cuda-runs/2026-09-07-profile-421-towers-c1b0b0ba-a100-sxm4.json#/legs/8/per_step/busy_s_per_step; c4=crates/jammi-kernels/artifacts/cuda-runs/2026-09-07-profile-421-towers-c1b0b0ba-a100-sxm4.json#/legs/8/per_step/residual_s_per_step; c5=crates/jammi-kernels/artifacts/cuda-runs/2026-09-07-profile-421-towers-c1b0b0ba-a100-sxm4.json#/legs/8/per_step/front_share_of_wall as %; c6=crates/jammi-kernels/artifacts/cuda-runs/2026-09-07-profile-421-towers-c1b0b0ba-a100-sxm4.json#/legs/8/per_step/busy_share_of_wall as % -->
+| HTSAT | A1 | f32 | 1.5500 | 1.2509 | 0.2348 | 0.0643 | 80.7 | 15.1 |
+<!-- claims: c1=crates/jammi-kernels/artifacts/cuda-runs/2026-09-07-profile-421-towers-c1b0b0ba-a100-sxm4.json#/legs/9/per_step/wall_s_per_step; c2=crates/jammi-kernels/artifacts/cuda-runs/2026-09-07-profile-421-towers-c1b0b0ba-a100-sxm4.json#/legs/9/per_step/front_s_per_step; c3=crates/jammi-kernels/artifacts/cuda-runs/2026-09-07-profile-421-towers-c1b0b0ba-a100-sxm4.json#/legs/9/per_step/busy_s_per_step; c4=crates/jammi-kernels/artifacts/cuda-runs/2026-09-07-profile-421-towers-c1b0b0ba-a100-sxm4.json#/legs/9/per_step/residual_s_per_step; c5=crates/jammi-kernels/artifacts/cuda-runs/2026-09-07-profile-421-towers-c1b0b0ba-a100-sxm4.json#/legs/9/per_step/front_share_of_wall as %; c6=crates/jammi-kernels/artifacts/cuda-runs/2026-09-07-profile-421-towers-c1b0b0ba-a100-sxm4.json#/legs/9/per_step/busy_share_of_wall as % -->
+| HTSAT | A2 (bf16) | bf16 | 1.5005 | 1.2516 | 0.1883 | 0.0606 | 83.4 | 12.6 |
+<!-- claims: c1=crates/jammi-kernels/artifacts/cuda-runs/2026-09-07-profile-421-towers-c1b0b0ba-a100-sxm4.json#/legs/10/per_step/wall_s_per_step; c2=crates/jammi-kernels/artifacts/cuda-runs/2026-09-07-profile-421-towers-c1b0b0ba-a100-sxm4.json#/legs/10/per_step/front_s_per_step; c3=crates/jammi-kernels/artifacts/cuda-runs/2026-09-07-profile-421-towers-c1b0b0ba-a100-sxm4.json#/legs/10/per_step/busy_s_per_step; c4=crates/jammi-kernels/artifacts/cuda-runs/2026-09-07-profile-421-towers-c1b0b0ba-a100-sxm4.json#/legs/10/per_step/residual_s_per_step; c5=crates/jammi-kernels/artifacts/cuda-runs/2026-09-07-profile-421-towers-c1b0b0ba-a100-sxm4.json#/legs/10/per_step/front_share_of_wall as %; c6=crates/jammi-kernels/artifacts/cuda-runs/2026-09-07-profile-421-towers-c1b0b0ba-a100-sxm4.json#/legs/10/per_step/busy_share_of_wall as % -->
+| HTSAT | D1 (LoRA+LN+GELU eager) | f32 | 1.6895 | 1.2493 | 0.3488 | 0.0914 | 73.9 | 20.6 |
+<!-- claims: c1=crates/jammi-kernels/artifacts/cuda-runs/2026-09-07-profile-421-towers-c1b0b0ba-a100-sxm4.json#/legs/11/per_step/wall_s_per_step; c2=crates/jammi-kernels/artifacts/cuda-runs/2026-09-07-profile-421-towers-c1b0b0ba-a100-sxm4.json#/legs/11/per_step/front_s_per_step; c3=crates/jammi-kernels/artifacts/cuda-runs/2026-09-07-profile-421-towers-c1b0b0ba-a100-sxm4.json#/legs/11/per_step/busy_s_per_step; c4=crates/jammi-kernels/artifacts/cuda-runs/2026-09-07-profile-421-towers-c1b0b0ba-a100-sxm4.json#/legs/11/per_step/residual_s_per_step; c5=crates/jammi-kernels/artifacts/cuda-runs/2026-09-07-profile-421-towers-c1b0b0ba-a100-sxm4.json#/legs/11/per_step/front_share_of_wall as %; c6=crates/jammi-kernels/artifacts/cuda-runs/2026-09-07-profile-421-towers-c1b0b0ba-a100-sxm4.json#/legs/11/per_step/busy_share_of_wall as % -->
+| HTSAT | D2 (LoRA eager) | f32 | 1.6329 | 1.2550 | 0.2953 | 0.0826 | 76.9 | 18.1 |
+
+`front` is a direct measurement (`media_front_end_wall_s`), never `wall − busy`; a text leg
+carries `front = 0` by the boundary declared above (tokenization stays in the residual).
+<!-- profile-421-generated: realized-gains-guide -->
+The already-fused chains' realized gains (eager twin minus fused, per step): C-LORA +32.6
+ms wall on CLIP-text (32.4 % of the A1 baseline wall), +30.3 ms on CLIP-vision (26.4 %),
++82.9 ms on HTSAT (5.4 %); C-LN +15.6 ms on CLIP-text, +20.8 ms on CLIP-vision; on HTSAT,
+D1 disables `layer_norm_fused` AND `gelu_erf_fused` together, so its D1-minus-D2 delta
+(+56.6 ms, 3.6 % of the A1 baseline wall) is the JOINT C-LN + C-GELU-HTSAT gain, not C-LN
+alone.
+<!-- /profile-421-generated -->
+
+<!-- profile-421-generated: decline-band-guide -->
+**All four candidate ports are UNRESOLVED — no port is licensed under #421.** No candidate
+clears ACTIVATE (`s_wall>=10%` on any decision-grade leg) or DECLINE (both
+`s_wall+U_wall<5%` AND `s_busy+U_busy<5%` on every decision-grade leg); the pass-4
+`kernel_census.py` demangled-name fix (`docs/maintainer/MAINTAINER-GUIDE.md` §2.5) makes
+both CLIP-tower A2 legs decision-grade for attribution (`htsat-A2` fails the contract's
+validity gate and is excluded from every finding — HTSAT has no candidate port under this
+contract, so that never blocks a verdict; see `docs/plans/66-tower-profile/README.md`), so
+no verdict below is F32-only. This is not uniform across candidates or axes: `C-MLP`'s own
+measured `s_wall` (no `U` term) is only 3.95 %/3.11 % on CLIP-text and 3.36 %/2.66 % on
+CLIP-vision — well under the 5 % DECLINE floor on wall, combined or not — it is the
+combined *busy* share (`s_busy+U_busy`, 7.24 %/8.29 % CLIP-text, 6.80 %/8.98 % CLIP-vision)
+that lands in the contract's 5–10 % band and keeps DECLINE from firing. Verbatim reasons
+(artifact `candidate_decisions[]`): `C-ATTN-CLIP-text` — UNRESOLVED, "neither ACTIVATE
+(s_wall>=10% on any decision-grade leg) nor DECLINE (combined share <5% on every
+decision-grade leg) — clip-text-A1: s_wall+U_wall=0.1030, s_busy+U_busy=0.1703;
+clip-text-A2: s_wall+U_wall=0.0878, s_busy+U_busy=0.2045"; `C-MLP-CLIP-text` — UNRESOLVED,
+"…clip-text-A1: s_wall+U_wall=0.0438, s_busy+U_busy=0.0724; clip-text-A2:
+s_wall+U_wall=0.0356, s_busy+U_busy=0.0829" (elided prefix identical to
+`C-ATTN-CLIP-text`'s above; full text at artifact `candidate_decisions[1].reason`);
+`C-ATTN-CLIP-vision` — UNRESOLVED, "…clip-vision-A1: s_wall+U_wall=0.0641,
+s_busy+U_busy=0.1128; clip-vision-A2: s_wall+U_wall=0.0501, s_busy+U_busy=0.1410"
+(`candidate_decisions[2].reason`); `C-MLP-CLIP-vision` — UNRESOLVED, "…clip-vision-A1:
+s_wall+U_wall=0.0387, s_busy+U_busy=0.0680; clip-vision-A2: s_wall+U_wall=0.0319,
+s_busy+U_busy=0.0898" (`candidate_decisions[3].reason`). The two-sided rule refuses to
+manufacture a verdict a 5–10 % share does not support on either side — that refusal, not a
+missing signal, is why nothing ports.
+<!-- /profile-421-generated -->
+
+<!-- profile-421-generated: findings-guide -->
+**Findings.** The HTSAT training step is CPU front-end-bound: front-end share of wall is 81
+% on the F32 decision leg (`htsat-A1`; `htsat-A2` excluded: fails the contract's validity
+gate) (audio decode/resample/STFT/mel dominating wall time), arm-invariant — closed as its
+own follow-on unit on `perf/421-frontend` (parallelizing the media front end across rayon's
+global pool), not duplicated here. CLIP-vision's own image decode/preprocess front end is
+20–22 % of wall on the F32/BF16 decision legs. Both media corpus producers cycle only 16
+distinct train clips (families × instances = 24 files at any `--rows`) — a page-cached
+working set, not a realistic-corpus I/O cost — so both front-end numbers are a real
+per-item CPU decode/preprocess compute cost, never disk I/O (artifact
+`notes.recorded_deviations`; full caveat: `docs/plans/66-tower-profile/README.md`). At
+batch 8 the CLIP training steps are launch-bound (3638–3722 launches/step across the four
+F32/BF16 A-arm CLIP legs); BF16 cuts GPU busy 32–41 % per tower while wall drops only 4–5
+%. `C-ATTN-HTSAT` is measured, not a candidate port: 33 % of GPU busy (~5 % of wall) on the
+F32 decision leg — HTSAT's head_dim of 24 at every stage sits outside the fixed-head-dim
+port tier by the contract's own declaration, so this stays a measured, OPEN number, never
+folded into UNATTRIBUTED and never decided under this issue. Full per-leg table, deviations
+and the PR trail: `docs/plans/66-tower-profile/README.md`.
+<!-- /profile-421-generated -->
 
 **The producers.** `ci/scripts/perf/gen_fixed_shape_image_corpus.py` and
 `ci/scripts/perf/gen_fixed_length_audio_corpus.py` emit the media corpora (fixed shape and
@@ -499,8 +587,9 @@ before it ever evaluates the equation — never silently computing a wrong `call
 product.
 
 **`profile_421_merge.py`'s role.** The merge step (`ci/scripts/perf/profile_421_merge.py`,
-tested by 53 hermetic tests in `ci/scripts/perf/test_profile_421_merge.py`) is where the
-N/M wall-differencing method above becomes checked arithmetic for the towers. Per admission
+tested by the hermetic `test_profile_421_merge.py` suite — the test count itself is not
+cited here since it drifts with every added case; run the suite for the current count) is
+where the N/M wall-differencing method above becomes checked arithmetic for the towers. Per admission
 key it re-checks `fused + eager == fusible_site_census × steps_measured` (refusing INVALID
 first on the epochs/grad-accum convention above), and on a D leg it additionally requires
 `fused == 0` for every key named in `kernels_disabled_expected`. Per step it computes `wall`,
@@ -521,6 +610,144 @@ check has no business depending on the profiling instrument being present at all
 dry-run tested straight through the real merge script, so the two P2 halves (the driver
 mode, the merge script's consumption of it) are proven to fit as shipped rather than as
 imagined.
+
+### The media front end: parallelized across rayon's global pool
+
+The #421 tower profile above named the front end as measured, not yet reduced — the
+per-item decode/preprocess work a media leg does before the tower ever forwards. A
+follow-on unit ("media front-end parallelization") closes that gap for HTSAT and
+CLIP-vision without touching a decoder body: the batch's per-item work is spread across
+rayon's GLOBAL pool (candle installs no private pool of its own, so this is the one pool
+the process ever schedules media-batch work on; `rayon` becomes a direct `jammi-ai`
+dependency, already unified at 1.11 in the lock).
+
+**Measured: the HTSAT/CLIP-vision front-end A/B.** The close-out run
+(`crates/jammi-kernels/artifacts/cuda-runs/2026-09-08-frontend-0a8562c4-a100-pcie.json`,
+A100 80GB PCIe, tip `0a8562c4` vs base `c1b0b0ba`, at the tip binary's own resolved
+rayon global-pool width and the profile's fixed per-step item count, over several
+interleaved base/tip repeats) measured HTSAT's front-end and full-step wall per-step
+means, base against tip, and CLIP-vision's report-only front-end per-step means, base
+against tip — every cell in the table below is bound to the committed artifact's own
+field. The HTSAT bar's ratio, its observed interval, and the two-sided machine-model
+bound it is judged against are bound the same way below, as are the driver-default and
+the run's own measured serial-tail ratio: a bound falls strictly inside the interval, so
+the bar is UNRESOLVED, invariant under both ratios. Per the contract's own Verdict clause
+this is not ACTIVATE: the unit ships because bit identity holds (pool sizes 1/5/7/24 against
+the pre-unit reference, `crates/jammi-ai/tests/it/media_front_end.rs`) and the n=1 image
+serving path stays within its always-on gross latency bar (3x before_min + before_spread,
+same suite); the pre-registered 5 % n=1 bar is opt-in (`JAMMI_FRONTEND_N1_LATENCY=1`) and
+no serving-latency measurement is recorded, so no serving-regression claim tighter than
+that bar is made, with these numbers recorded and NO parallel-efficiency claim made. The
+separate #421 tower-profile artifact naming the front end's SHARE of a full training step
+(a different measurement from this unit's own base/tip A/B) still lands with its own
+artifact PR, not this branch — §11's first checklist applies unchanged: every number in a
+doc names its producer, or it is not written.
+
+| HTSAT/CLIP-vision front-end quantity | value (s or ratio) |
+|---|---:|
+<!-- claims: c1=crates/jammi-kernels/artifacts/cuda-runs/2026-09-08-frontend-0a8562c4-a100-pcie.json#/measurement/htsat_bar_driver_r/front_base_mean_s -->
+| HTSAT front-end s/step, base mean | 1.335 |
+<!-- claims: c1=crates/jammi-kernels/artifacts/cuda-runs/2026-09-08-frontend-0a8562c4-a100-pcie.json#/measurement/htsat_bar_driver_r/front_tip_mean_s -->
+| HTSAT front-end s/step, tip mean | 0.108 |
+<!-- claims: c1=mean(crates/jammi-kernels/artifacts/cuda-runs/2026-09-08-frontend-0a8562c4-a100-pcie.json#/measurement/legs/htsat__base__r1/train_per_step,crates/jammi-kernels/artifacts/cuda-runs/2026-09-08-frontend-0a8562c4-a100-pcie.json#/measurement/legs/htsat__base__r2/train_per_step,crates/jammi-kernels/artifacts/cuda-runs/2026-09-08-frontend-0a8562c4-a100-pcie.json#/measurement/legs/htsat__base__r3/train_per_step) -->
+| HTSAT step-wall s/step, base mean | 1.567 |
+<!-- claims: c1=mean(crates/jammi-kernels/artifacts/cuda-runs/2026-09-08-frontend-0a8562c4-a100-pcie.json#/measurement/legs/htsat__tip__r1/train_per_step,crates/jammi-kernels/artifacts/cuda-runs/2026-09-08-frontend-0a8562c4-a100-pcie.json#/measurement/legs/htsat__tip__r2/train_per_step,crates/jammi-kernels/artifacts/cuda-runs/2026-09-08-frontend-0a8562c4-a100-pcie.json#/measurement/legs/htsat__tip__r3/train_per_step) -->
+| HTSAT step-wall s/step, tip mean | 0.344 |
+<!-- claims: c1=crates/jammi-kernels/artifacts/cuda-runs/2026-09-08-frontend-0a8562c4-a100-pcie.json#/measurement/clip_vision_report_only/front_base_mean_s -->
+| CLIP-vision front-end s/step, base mean | 0.0293 |
+<!-- claims: c1=crates/jammi-kernels/artifacts/cuda-runs/2026-09-08-frontend-0a8562c4-a100-pcie.json#/measurement/clip_vision_report_only/front_tip_mean_s -->
+| CLIP-vision front-end s/step, tip mean | 0.0078 |
+<!-- claims: c1=crates/jammi-kernels/artifacts/cuda-runs/2026-09-08-frontend-0a8562c4-a100-pcie.json#/measurement/htsat_bar_driver_r/ratio -->
+| HTSAT bar ratio | 0.0809 |
+<!-- claims: c1=crates/jammi-kernels/artifacts/cuda-runs/2026-09-08-frontend-0a8562c4-a100-pcie.json#/measurement/htsat_bar_driver_r/ratio_lo -->
+| HTSAT bar ratio_lo | 0.0772 |
+<!-- claims: c1=crates/jammi-kernels/artifacts/cuda-runs/2026-09-08-frontend-0a8562c4-a100-pcie.json#/measurement/htsat_bar_driver_r/ratio_hi -->
+| HTSAT bar ratio_hi | 0.0871 |
+<!-- claims: c1=crates/jammi-kernels/artifacts/cuda-runs/2026-09-08-frontend-0a8562c4-a100-pcie.json#/measurement/htsat_bar_driver_r/lower_bound -->
+| HTSAT bar lower bound | 0.0448 |
+<!-- claims: c1=crates/jammi-kernels/artifacts/cuda-runs/2026-09-08-frontend-0a8562c4-a100-pcie.json#/measurement/htsat_bar_driver_r/upper_bound -->
+| HTSAT bar upper bound | 0.0864 |
+<!-- claims: c1=crates/jammi-kernels/artifacts/cuda-runs/2026-09-08-frontend-0a8562c4-a100-pcie.json#/verdict/serial_tail_ratio_deviation/r_driver -->
+| serial-tail ratio, driver-default | 0.0033 |
+<!-- claims: c1=crates/jammi-kernels/artifacts/cuda-runs/2026-09-08-frontend-0a8562c4-a100-pcie.json#/verdict/serial_tail_ratio_deviation/r_measured -->
+| serial-tail ratio, measured | 0.00355 |
+
+**The mechanism.** Two parallel stages, the same shape on both towers:
+
+1. **Decode.** A shared per-item decode body per modality
+   (`image_preprocess`'s and `audio_preprocess`'s private `decode_*_results`)
+   backs two DIFFERENT public error contracts, not one. The trainer's
+   `image_encoder_input`/`audio_encoder_input` call `decode_image_batch`/
+   `decode_audio_batch`, which still hard-fail the whole job on the
+   LOWEST-INDEX decode error — a corrupt training item is a refusal, not a
+   row to skip. Serving's `arrow_to_images`/`arrow_to_audio` instead call the
+   `_per_row_indexed` variants (`decode_image_batch_per_row_indexed`,
+   `decode_audio_batch_per_row_indexed`), which return EVERY row's own
+   outcome: a corrupt row's bytes produce that Arrow row's own `Err` (surfaced
+   as that row's `_status=false` with an Arrow-row-indexed `_error` message in
+   `BackendOutput`, per `docs/guide/src/generate-image-embeddings.md`'s
+   error-handling table), the rest of the batch still embeds, and a null row
+   keeps its own `None`/"Null or missing …" treatment. Both variants decode in
+   parallel across the batch on rayon's global pool; a path-valued Arrow
+   column reads its bytes SEQUENTIALLY first (`std::fs::read` never runs
+   inside the pool).
+2. **Preprocess.** `preprocess_image_batch`/`preprocess_clap_fusion` preallocate the
+   batch's output buffer once and have each item write its own disjoint, fixed-stride
+   chunk via `par_chunks_mut` — filters and the STFT window are hoisted out of the
+   per-item closure, and a release-mode (not `debug_assert!`) per-item length check
+   guards every chunk write. Preprocess has no per-row variant: the trainer and
+   serving both call the lowest-index-hard-fail `_indexed` form (serving has already
+   dropped every decode-failed or null row before preprocessing runs, so a preprocess
+   failure there is never a corrupt-item skip either).
+
+There is no thread-count knob anywhere in this path: chunk count is always the batch
+size, so the effective parallelism is `min(pool_size, batch_size)`, emergent from
+whichever pool the process happens to run under — never configured. "The LOWEST-INDEX
+failing row is the one surfaced" holds for the training path's decode AND preprocess
+stages, and for the preprocess stage on the serving path — mirroring the order the
+pre-unit sequential loop failed in — but NOT for the serving path's decode stage,
+which surfaces every row's own outcome instead of collapsing to one. An empty batch is
+refused before any chunking is attempted.
+
+**Provenance: `rayon_pool_threads`.** `FinetuneRunTier` grows a thirteenth provenance
+field, `rayon_pool_threads` (`PROVENANCE_FIELDS` 12 → 13) — `rayon::current_num_threads()`
+at report time, i.e. the rayon GLOBAL POOL SIZE the run's process resolved to, not how
+many of those threads actually touched a given batch's chunks. It is machine/build
+provenance, the same class `device_name`/`host.logical_cpus` already occupy — a fact
+about the box and the process, never a determinant of what a step computes, so it is
+never an identity field.
+
+**The pre-registered A/B.** `ci/scripts/perf/frontend_ab.sh` drives the contract's
+base/tip comparison: two prebuilt `jammi-bench` binaries, interleaved base/tip legs
+(`$FRONTEND_AB_REPEATS` pairs, `r1`..`rN`) over untraced `finetune-run` on HTSAT and
+CLIP-vision, at the profile's own pinned leg parameters. The decision quantity is
+`media_front_end_wall_s / steps_measured`; the bar is TWO-SIDED against the machine model
+(`P` read from the tip binary's own `rayon_pool_threads`, `ideal = n / ceil(n / P)` at the
+batch's item count `n`, `r` the operator-supplied CPU-local serial-tail ratio).
+`frontend_ab_merge.py` propagates the interval from BOTH arms' own observed repeats, never
+from the base-to-base spread alone: `ratio_lo = min(tip legs) / max(base legs)`,
+`ratio_hi = max(tip legs) / min(base legs)`. PASS iff the WHOLE interval clears the bar
+(`ratio_hi <= upper_bound` and `ratio_lo >= lower_bound`); FAIL iff the whole interval is
+too slow (`ratio_lo > upper_bound`); INVALID_BEATS_IDEAL iff the whole interval beats the
+machine model's own ideal (`ratio_hi < lower_bound`); UNRESOLVED otherwise, a bound
+falling strictly inside `[ratio_lo, ratio_hi]`. CLIP-vision is report-only. Verdict:
+ACTIVATE the change iff the HTSAT bar holds — the script only records the outcome, never
+gates or reverts a build on it. The close-out run's own recorded deviations (named, never
+silently absorbed into the numbers above — see the committed artifact for detail): the
+measured tip commit precedes the tree the merge report was rendered from: the `par_chunks_mut`
+parallel stage and the decode helpers are byte-unchanged since the measured tip, and every
+later commit that touched the timed front-end path (`audio_preprocess.rs`) added only a
+sequential pre-check ahead of that parallel stage — a `resampled_len()` helper extracted with
+identical arithmetic, and, in a later commit still, a per-clip `sample_rate == 0` refusal and
+`resampled_len`'s own `from_rate == 0` branch — never a change to the parallel stage or the
+decode helpers themselves; every other file the later commits touched is off the timed path
+(tests, docs, CI, serving-path code), and the artifact's own deviation record names every file
+mechanically. The driver-default serial-tail ratio differs from this run's own measured
+serial-tail ratio, with the bar's verdict asserted invariant under both; and the pod's CPU was shared-host at
+launch, so `P` reflects the run's own cgroup quota rather than the box's full core count.
+A hermetic dry-run suite (`ci/scripts/perf/test_frontend_ab_dry_run.py`) drives the real
+script end to end with hermetic stand-in binaries and no GPU, and is a matrix leg in
+`.github/workflows/ci.yml`.
 
 ### The bench and its torch twin
 

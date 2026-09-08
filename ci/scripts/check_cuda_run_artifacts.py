@@ -59,6 +59,16 @@ must carry:
     was actually measured); `merged_as` only ever supplements it, never
     replaces it, and is only valid alongside a resolved `git_sha` (never
     `git_sha_unresolved`).
+  - `producer.source_sha256` (OPTIONAL — `{<repo-root-relative path>: <sha256
+    hex>}`): a producer's own CONTENT identity, for a producer whose module
+    doc names this the regeneration-provenance convention (e.g.
+    `profile_421_artifact.py`) instead of a git commit sha (see rule (j)).
+  - `producer.identity` (OPTIONAL — MANDATORY for a known convention-
+    declaring producer, see rule (j)): the fixed marker string
+    `"source_sha256+input_manifest"`, stamped by a producer whose module doc
+    declares that BOTH `producer.source_sha256` (its own content identity)
+    AND `producer.input_sha256` (its input files' content identity) are
+    always present together — never one without the other.
 
 ## Fail-closed contract
 
@@ -108,6 +118,37 @@ must carry:
       (h)" (the claim-value binding gate), so the v2 leg-identity rule is
       deliberately lettered (i). The letter is comment/self-test-label
       prose only — no gate, allowlist, or error message parses it.
+  (j) `producer.source_sha256`, when present, is re-hashed HERE — every
+      named repo-root-relative path is re-read from THIS gate's own HEAD
+      (the real working tree, never a historical blob) and its sha256
+      compared against the recorded value; a mismatch is a hard FAIL naming
+      the path (`check_producer_source_sha256`). This replaces `tree_sha`
+      (a git commit sha nothing ever validated, and the wrong determinant
+      in the first place — an artifact cannot know, at render time, which
+      future commit will contain it) with the producer's own CONTENT
+      identity: editing the producer (or a file it reads a live constant
+      from) and forgetting to regenerate the committed artifact is now
+      caught here, never silently accepted as still-valid provenance.
+      `source_sha256`/`input_sha256` stay OPTIONAL for a producer that never
+      opted into this convention — but a producer that DOES (stamped via
+      `producer.identity == "source_sha256+input_manifest"`) must carry
+      BOTH blocks together (a marker with only one is an incomplete
+      identity claim, refused by name, never treated as "no identity"), and
+      the marker becomes MANDATORY the moment any ONE of three independent
+      anchors fires: the producer's own PATH is a known, reviewed
+      convention-declarer (`SOURCE_IDENTITY_DECLARING_PRODUCER_PATHS`,
+      mirroring `LEGACY_NONE_ALLOWLIST`'s shape); the artifact ALREADY
+      carries a non-empty `producer.source_sha256` block (declaring the
+      convention by its own content, regardless of what `producer.path`
+      says); or the artifact's own committed FILENAME matches a known
+      profile/frontend artifact family
+      (`SOURCE_IDENTITY_DECLARING_FILENAME_RE`) — silently omitting the
+      marker on a future regeneration, OR renaming `producer.path` away
+      from the reviewed allowlist, would otherwise let that artifact
+      quietly fall back to the unchecked "no identity" state this rule has
+      always allowed for a producer that never opted in; the source_sha256/
+      filename anchors close exactly that escape hatch
+      (`check_producer_source_identity_marker`).
 
 Rule (d) needs REAL commit history to mean anything: `git merge-base
 --is-ancestor` on a shallow checkout (`actions/checkout`'s default
@@ -132,6 +173,7 @@ Hermetic: reads the working tree (or an ephemeral tempdir git repo under
 
 from __future__ import annotations
 
+import hashlib
 import json
 import re
 import subprocess
@@ -370,6 +412,200 @@ def check_producer_path(producer: dict, repo_root: Path, tracked: set[str]) -> l
         failures.append(f"producer.path `{path}` does not exist on disk")
     if path not in tracked:
         failures.append(f"producer.path `{path}` is not `git ls-files`-tracked")
+    return failures
+
+
+_SHA256_HEX_RE = re.compile(r"^[0-9a-f]{64}$")
+
+# The fixed marker a producer stamps to declare "regeneration provenance is
+# CONTENT identity, not a git commit sha" (rule (j)). Never a free-form
+# string — a single closed value, so a typo or a half-adopted convention
+# reads as "wrong marker", never as a silently-accepted new spelling.
+PRODUCER_SOURCE_IDENTITY_MARKER = "source_sha256+input_manifest"
+
+# Producer paths whose OWN module doc declares the source-identity
+# convention (`producer.identity == PRODUCER_SOURCE_IDENTITY_MARKER`) —
+# reviewed, closed set, same shape as `LEGACY_NONE_ALLOWLIST` above. A
+# producer added here MUST stamp the marker on every artifact it emits from
+# now on; this is the enforcement half of that promise, not a suggestion.
+SOURCE_IDENTITY_DECLARING_PRODUCER_PATHS: frozenset[str] = frozenset(
+    {
+        # `profile_421_artifact.py`'s own module doc, "Producer identity
+        # (regeneration provenance)" — `producer.path` on its own committed
+        # artifact names the LEG DRIVER script, not the artifact producer
+        # module itself (the schema's `producer.path` field is "the thing
+        # that ran", which for a `kind: "script"` producer is the driver a
+        # human invoked, not every module that driver's pipeline imports).
+        "ci/scripts/perf/profile_421_legs.sh",
+    }
+)
+
+# A SECOND, INDEPENDENT anchor for the same marker-mandatory arm
+# (`check_producer_source_identity_marker`): `producer.path` is a
+# self-declared, free-form string a later regeneration could rename with no
+# other signal changing at all, so membership in
+# `SOURCE_IDENTITY_DECLARING_PRODUCER_PATHS` alone is not enough to catch a
+# renamed producer. An artifact's own committed FILENAME (never
+# `producer.path`) is not something a producer's own code can rename without
+# also renaming what CI actually sees on disk — every "tower-profile" family
+# artifact (`-profile-<N>-towers-...`, one N per profile UNIT — issue #421's
+# own `2026-09-07-profile-421-towers-...json` is one instance, never the
+# only one this pattern is meant to survive) and every "frontend" follow-on
+# artifact (`-frontend-...`) is matched here by FAMILY TOKEN, deliberately
+# never by this one issue's own number: a future profile unit (#421's
+# eventual successor) that reuses the SAME `-profile-<N>-towers-` naming
+# convention under a DIFFERENT issue number must still be caught by this
+# anchor without an edit here, and a literal `-profile-421-` would silently
+# stop matching the moment that successor's own artifact used a different
+# N. The REQUIRED `-towers-` token (never a bare `-profile-\d+-`) is not
+# optional: `2026-08-31-profile-356-closeout-...json` (issue #356's OWN,
+# already-committed, pre-this-convention closeout artifact) also matches
+# `-profile-\d+-` but is NOT a tower-profile source-identity-declaring
+# artifact at all — a bare `-profile-\d+-` would wrongly retroactively
+# demand the marker on that unrelated, already-closed campaign's own
+# artifact. Matched against the artifact's own BASENAME ONLY
+# (`relpath.rsplit("/", 1)[-1]`, never the full `relpath`) — `relpath` can
+# carry directory segments (a `*-raw-runs/` subdirectory name, say) that
+# have nothing to do with THIS file's own identity, and matching the full
+# path would let an unrelated ancestor directory's name decide whether THIS
+# artifact is in the mandatory arm.
+SOURCE_IDENTITY_DECLARING_FILENAME_RE = re.compile(r"-profile-\d+-towers-|-frontend-")
+
+
+# --------------------------------------------------------------------------- #
+# rule (j) — producer.source_sha256: content-identity, re-hashed at THIS
+# gate's own HEAD, never a git commit sha nothing ever validated
+# --------------------------------------------------------------------------- #
+def check_producer_source_sha256(producer: dict, repo_root: Path) -> list[str]:
+    """`producer.source_sha256` (OPTIONAL — only carried by a producer whose
+    own module doc names this its regeneration-provenance convention, e.g.
+    `profile_421_artifact.py`) is a `{<repo-root-relative path>: <sha256
+    hex>}` map naming every file whose BYTES can change a NUMBER that
+    producer emits. Unlike the retired `producer.tree_sha` (a git commit sha
+    nothing ever validated, and the wrong determinant anyway — the artifact
+    cannot know, at render time, which future commit will contain it), this
+    IS checked: every named path is re-hashed at THIS gate's own HEAD (the
+    real working tree, never a historical git blob) and a mismatch is
+    refused BY NAME — regenerating the artifact is the only way to clear a
+    hit, never a hand-edit of the recorded hash."""
+    source_sha256 = producer.get("source_sha256")
+    if source_sha256 is None:
+        return []
+    if not isinstance(source_sha256, dict) or not source_sha256:
+        return [f"producer.source_sha256 must be a non-empty object, got {source_sha256!r}"]
+    failures: list[str] = []
+    for path, expected in sorted(source_sha256.items()):
+        if not isinstance(path, str) or not path:
+            failures.append(f"producer.source_sha256 has a non-string/empty path key {path!r}")
+            continue
+        if not isinstance(expected, str) or not _SHA256_HEX_RE.match(expected):
+            failures.append(f"producer.source_sha256[{path!r}] must be a 64-lowercase-hex sha256, got {expected!r}")
+            continue
+        full = repo_root / path
+        if not full.is_file():
+            failures.append(f"producer.source_sha256 names `{path}` which does not exist on disk at HEAD")
+            continue
+        actual = hashlib.sha256(full.read_bytes()).hexdigest()
+        if actual != expected:
+            failures.append(
+                f"producer.source_sha256[{path!r}] = {expected} does not match `{path}`'s OWN bytes at HEAD "
+                f"({actual}) — the producer (or a file it reads a live constant from) changed since this "
+                "artifact was rendered; regenerate the artifact, never hand-edit the recorded hash"
+            )
+    return failures
+
+
+def check_producer_input_sha256(producer: dict) -> list[str]:
+    """`producer.input_sha256` (OPTIONAL — `{<input label>: <sha256 hex>}`,
+    e.g. `profile_421_artifact.py`'s `{"merge_json": ..., "attribution_json":
+    ..., "identity": ...}`): the sha256 of the producer's own INPUT files as
+    given at render time. Unlike `source_sha256` (repo-root-relative PATHS,
+    re-hashable against this gate's own HEAD), an input's label is not a
+    path this gate can re-resolve on its own — the recorded value is
+    shape-checked here (a non-empty object of non-empty-string-keyed,
+    64-lowercase-hex values), never re-hashed against a file, which is the
+    one difference from rule (j)'s own `check_producer_source_sha256`."""
+    input_sha256 = producer.get("input_sha256")
+    if input_sha256 is None:
+        return []
+    if not isinstance(input_sha256, dict) or not input_sha256:
+        return [f"producer.input_sha256 must be a non-empty object, got {input_sha256!r}"]
+    failures: list[str] = []
+    for label, value in sorted(input_sha256.items()):
+        if not isinstance(label, str) or not label:
+            failures.append(f"producer.input_sha256 has a non-string/empty label key {label!r}")
+            continue
+        if not isinstance(value, str) or not _SHA256_HEX_RE.match(value):
+            failures.append(f"producer.input_sha256[{label!r}] must be a 64-lowercase-hex sha256, got {value!r}")
+    return failures
+
+
+def check_producer_source_identity_marker(producer: dict, relpath: str) -> list[str]:
+    """`producer.identity`, when present, must equal
+    `PRODUCER_SOURCE_IDENTITY_MARKER` and license BOTH `source_sha256` and
+    `input_sha256` to be present (a marker with only one of the two blocks
+    is an incomplete identity claim — refused BY NAME, never quietly
+    downgraded to "no identity was declared here"). Absent the marker,
+    `source_sha256`/`input_sha256` stay entirely OPTIONAL — UNLESS one of
+    THREE independent anchors fires: `producer.path` is itself one of the
+    reviewed, closed `SOURCE_IDENTITY_DECLARING_PRODUCER_PATHS`; the
+    artifact ALREADY carries a non-empty `producer.source_sha256` block (it
+    has, by its own content, declared the convention regardless of what
+    `producer.path` says today); or this artifact's own committed FILENAME
+    (`relpath`, never `producer.path`) matches a known profile/frontend
+    artifact family (`SOURCE_IDENTITY_DECLARING_FILENAME_RE`). A producer
+    this repo already knows declares the convention omitting the marker on
+    one of its own artifacts is exactly the silent-regression rule (j)'s own
+    docstring warns about (a future edit that regenerates without
+    re-stamping the marker, OR renames `producer.path` away from the
+    reviewed allowlist, would otherwise fall back to the unchecked "no
+    identity" state unnoticed — the source_sha256/filename anchors close
+    exactly that escape hatch)."""
+    identity = producer.get("identity")
+    path = producer.get("path")
+    if identity is None:
+        reasons: list[str] = []
+        if isinstance(path, str) and path in SOURCE_IDENTITY_DECLARING_PRODUCER_PATHS:
+            reasons.append(
+                f"producer.path `{path}` is a known source-identity-declaring producer "
+                "(SOURCE_IDENTITY_DECLARING_PRODUCER_PATHS)"
+            )
+        if isinstance(producer.get("source_sha256"), dict) and producer.get("source_sha256"):
+            reasons.append("this artifact already carries a non-empty producer.source_sha256 block")
+        # `relpath` is a posix-style, repo-cuda-runs-relative path
+        # (`Path.relative_to(...).as_posix()` at the call site) that can
+        # carry directory segments (e.g. a `*-raw-runs/` subdirectory name)
+        # with nothing to do with THIS file's own identity — matched
+        # against the BASENAME only, never the full path.
+        basename = relpath.rsplit("/", 1)[-1]
+        if SOURCE_IDENTITY_DECLARING_FILENAME_RE.search(basename):
+            reasons.append(
+                f"this artifact's own filename `{basename}` matches a known profile/frontend artifact family "
+                "(SOURCE_IDENTITY_DECLARING_FILENAME_RE)"
+            )
+        if reasons:
+            return [
+                "; ".join(reasons) + " — but this artifact carries no producer.identity marker: every artifact "
+                "from a source-identity-declaring producer (by producer.path, by already carrying "
+                "source_sha256, or by its own filename family) must stamp producer.identity = "
+                f"{PRODUCER_SOURCE_IDENTITY_MARKER!r}"
+            ]
+        return []
+    failures: list[str] = []
+    if identity != PRODUCER_SOURCE_IDENTITY_MARKER:
+        failures.append(
+            f"producer.identity must be {PRODUCER_SOURCE_IDENTITY_MARKER!r} when present, got {identity!r}"
+        )
+    if not isinstance(producer.get("source_sha256"), dict) or not producer.get("source_sha256"):
+        failures.append(
+            f"producer.identity == {PRODUCER_SOURCE_IDENTITY_MARKER!r} but producer.source_sha256 is "
+            "missing/empty — the marker declares BOTH blocks present, never just one"
+        )
+    if not isinstance(producer.get("input_sha256"), dict) or not producer.get("input_sha256"):
+        failures.append(
+            f"producer.identity == {PRODUCER_SOURCE_IDENTITY_MARKER!r} but producer.input_sha256 is "
+            "missing/empty — the marker declares BOTH blocks present, never just one"
+        )
     return failures
 
 
@@ -1389,6 +1625,9 @@ def validate_artifact(
     failures += check_producer_path(producer, repo_root, tracked)
     if producer.get("kind") == "cargo-test":
         failures += check_cargo_test_gating(data, producer, repo_root)
+    failures += check_producer_source_sha256(producer, repo_root)
+    failures += check_producer_input_sha256(producer)
+    failures += check_producer_source_identity_marker(producer, relpath)
     failures += check_none_allowlist(data, relpath, allowlist)
     failures += check_ancestry(data, repo_root)
     failures += check_oracle_separation(data)
@@ -1578,6 +1817,12 @@ def self_test() -> int:
         perf_dir = repo / "ci" / "scripts" / "perf"
         perf_dir.mkdir(parents=True)
         (perf_dir / "proof_artifact.py").write_text("# stub producer\n")
+        # A tracked stand-in for the ONE known source-identity-declaring
+        # producer path (`SOURCE_IDENTITY_DECLARING_PRODUCER_PATHS`) — rule
+        # (j)'s own marker-mandatory arm needs `producer.path` to exist +
+        # be tracked (rule (b)) so its own findings never contaminate the
+        # marker-specific `expect_hit` needle below.
+        (perf_dir / "profile_421_legs.sh").write_text("# stub source-identity-declaring producer\n")
 
         _run(["git", "add", "-A"], repo)
         _run(["git", "commit", "-q", "-m", "root"], repo)
@@ -1687,6 +1932,213 @@ def self_test() -> int:
         bad["producer"] = dict(bad["producer"])
         bad["producer"]["path"] = "crates/fixture-crate/tests/untracked.rs"
         expect_hit(bad, "x.json", "is not `git ls-files`-tracked", "rule (b): untracked producer.path")
+
+        # rule (j) — producer.source_sha256 re-hashed at THIS gate's own HEAD --
+        real_relpath = "crates/fixture-crate/tests/cuda_parity.rs"
+        real_hash = hashlib.sha256((repo / real_relpath).read_bytes()).hexdigest()
+
+        # Carrying `source_sha256` alone anchors the marker-mandatory arm
+        # too, so this control ALSO stamps the marker + `input_sha256` —
+        # a realistic fully-declared producer,
+        # exercising `check_producer_source_sha256`'s own hash-match logic
+        # without tripping the (separately self-tested, below) marker rule.
+        ok = baseline()
+        ok["producer"] = dict(ok["producer"])
+        ok["producer"]["source_sha256"] = {real_relpath: real_hash}
+        ok["producer"]["identity"] = "source_sha256+input_manifest"
+        ok["producer"]["input_sha256"] = {"merge_json": "0" * 64}
+        expect_clean(ok, "control-source-sha256.json", "rule (j): source_sha256 matching the real file's bytes")
+
+        # No `source_sha256` key at all (the retired `tree_sha` convention,
+        # or a producer kind that never carries this) is equally clean —
+        # rule (j) is entirely OPTIONAL, never required.
+        expect_clean(baseline(), "control-no-source-sha256.json", "rule (j): producer with no source_sha256 at all")
+
+        bad = baseline()
+        bad["producer"] = dict(bad["producer"])
+        bad["producer"]["source_sha256"] = {real_relpath: "0" * 64}
+        expect_hit(bad, "x.json", "does not match", "rule (j): wrong sha256 for a real, existing path")
+
+        bad = baseline()
+        bad["producer"] = dict(bad["producer"])
+        bad["producer"]["source_sha256"] = {"crates/fixture-crate/tests/does_not_exist.rs": real_hash}
+        expect_hit(bad, "x.json", "does not exist on disk at HEAD", "rule (j): source_sha256 names a nonexistent path")
+
+        bad = baseline()
+        bad["producer"] = dict(bad["producer"])
+        bad["producer"]["source_sha256"] = {real_relpath: "not-a-sha256"}
+        expect_hit(bad, "x.json", "must be a 64-lowercase-hex sha256", "rule (j): malformed sha256 value")
+
+        bad = baseline()
+        bad["producer"] = dict(bad["producer"])
+        bad["producer"]["source_sha256"] = {}
+        expect_hit(bad, "x.json", "must be a non-empty object", "rule (j): empty source_sha256 object")
+
+        # rule (j) — producer.input_sha256 shape (never re-hashed, no path) ---
+        ok = baseline()
+        ok["producer"] = dict(ok["producer"])
+        ok["producer"]["input_sha256"] = {"merge_json": "0" * 64}
+        expect_clean(ok, "control-input-sha256.json", "rule (j): well-shaped input_sha256")
+
+        bad = baseline()
+        bad["producer"] = dict(bad["producer"])
+        bad["producer"]["input_sha256"] = {}
+        expect_hit(bad, "x.json", "must be a non-empty object", "rule (j): empty input_sha256 object")
+
+        bad = baseline()
+        bad["producer"] = dict(bad["producer"])
+        bad["producer"]["input_sha256"] = {"merge_json": "not-a-sha256"}
+        expect_hit(bad, "x.json", "must be a 64-lowercase-hex sha256", "rule (j): malformed input_sha256 value")
+
+        # rule (j) — producer.identity marker: MANDATORY once stamped, and
+        # MANDATORY for a known source-identity-declaring producer.path -----
+        identity_source = {real_relpath: real_hash}
+        identity_input = {"merge_json": "0" * 64}
+
+        ok = baseline()
+        ok["producer"] = dict(ok["producer"])
+        ok["producer"]["identity"] = "source_sha256+input_manifest"
+        ok["producer"]["source_sha256"] = identity_source
+        ok["producer"]["input_sha256"] = identity_input
+        expect_clean(ok, "control-identity-marker.json", "rule (j): marker + both blocks present")
+
+        bad = baseline()
+        bad["producer"] = dict(bad["producer"])
+        bad["producer"]["identity"] = "bogus-marker"
+        bad["producer"]["source_sha256"] = identity_source
+        bad["producer"]["input_sha256"] = identity_input
+        expect_hit(bad, "x.json", "producer.identity must be", "rule (j): wrong marker string")
+
+        bad = baseline()
+        bad["producer"] = dict(bad["producer"])
+        bad["producer"]["identity"] = "source_sha256+input_manifest"
+        bad["producer"]["input_sha256"] = identity_input
+        expect_hit(bad, "x.json", "producer.source_sha256 is missing/empty", "rule (j): marker with no source_sha256")
+
+        bad = baseline()
+        bad["producer"] = dict(bad["producer"])
+        bad["producer"]["identity"] = "source_sha256+input_manifest"
+        bad["producer"]["source_sha256"] = identity_source
+        expect_hit(bad, "x.json", "producer.input_sha256 is missing/empty", "rule (j): marker with no input_sha256")
+
+        bad = baseline()
+        bad["producer"] = dict(bad["producer"])
+        bad["producer"]["path"] = "ci/scripts/perf/profile_421_legs.sh"
+        # No `producer.identity` at all — this path IS a known
+        # source-identity-declaring producer, so omitting the marker is
+        # itself a hit, never silently treated as "this producer never
+        # opted in".
+        expect_hit(
+            bad,
+            "x.json",
+            "known source-identity-declaring producer",
+            "rule (j): known convention-declaring producer.path with no marker",
+        )
+
+        # rule (j) — the marker-mandatory arm's THREE INDEPENDENT anchors:
+        # (1) `producer.path` already in
+        # `SOURCE_IDENTITY_DECLARING_PRODUCER_PATHS` (tested above); (2) an
+        # artifact that already carries a non-empty `producer.source_sha256`
+        # block; (3) an artifact whose own committed FILENAME matches a
+        # known profile/frontend artifact family
+        # (`SOURCE_IDENTITY_DECLARING_FILENAME_RE`). Each of the three fires
+        # the mandatory-marker arm on its own, independent of the other two
+        # — a `producer.path` RENAME away from the reviewed allowlist can
+        # never silently let an artifact that already declares the
+        # convention by (2) or (3) escape the marker requirement.
+        bad = baseline()
+        bad["producer"] = dict(bad["producer"])
+        # `producer.path` is NOT in SOURCE_IDENTITY_DECLARING_PRODUCER_PATHS
+        # (still the ordinary fixture-crate path) — only `source_sha256`
+        # itself anchors this arm.
+        bad["producer"]["source_sha256"] = identity_source
+        expect_hit(
+            bad,
+            "x.json",
+            "already carries a non-empty producer.source_sha256 block",
+            "rule (j): source_sha256 alone anchors the marker-mandatory arm, independent of producer.path",
+        )
+
+        bad = baseline()
+        bad["producer"] = dict(bad["producer"])
+        # No source_sha256/input_sha256 at all, and `producer.path` is NOT
+        # a known declaring path — only the artifact's own FILENAME anchors
+        # this arm.
+        expect_hit(
+            bad,
+            "2026-09-07-profile-421-towers-c1b0b0ba-a100-sxm4.json",
+            "matches a known profile/frontend artifact family",
+            "rule (j): -profile-<N>- filename family anchors the marker-mandatory arm (issue #421's own N), "
+            "independent of producer.path",
+        )
+
+        bad = baseline()
+        bad["producer"] = dict(bad["producer"])
+        # A DIFFERENT issue's own N (never 421) proves the anchor is a
+        # FAMILY TOKEN, not a hard-coded issue number this repo would have
+        # to keep editing for every future profile-family unit.
+        expect_hit(
+            bad,
+            "2027-01-01-profile-500-towers-deadbeef-a100-sxm4.json",
+            "matches a known profile/frontend artifact family",
+            "rule (j): -profile-<N>- filename family anchors the marker-mandatory arm for a DIFFERENT N (#500, "
+            "never hard-coded to #421), independent of producer.path",
+        )
+
+        bad = baseline()
+        bad["producer"] = dict(bad["producer"])
+        expect_hit(
+            bad,
+            "2026-09-07-frontend-towers-c1b0b0ba-a100-sxm4.json",
+            "matches a known profile/frontend artifact family",
+            "rule (j): -frontend- filename anchors the marker-mandatory arm, independent of producer.path",
+        )
+
+        # The filename anchor is matched against the BASENAME only — a
+        # DIRECTORY segment that happens to carry a family token (here, a
+        # `*-raw-runs/` sibling directory literally named
+        # `...-profile-421-...`) must never anchor an artifact whose own
+        # basename is an ordinary, non-family name.
+        expect_clean(
+            baseline(),
+            "2026-09-07-profile-421-towers-c1b0b0ba-a100-sxm4-raw-runs/ordinary-payload.json",
+            "rule (j): filename family anchor matches the BASENAME only, never an ancestor directory's own name",
+        )
+
+        # A GENUINE regression control, off the REAL committed
+        # `2026-08-31-profile-356-closeout-...json` filename: it matches a
+        # bare `-profile-\d+-` (issue #356's own closeout artifact, a
+        # DIFFERENT, already-closed campaign that never adopted the
+        # source-identity convention this rule enforces) but must NOT match
+        # `SOURCE_IDENTITY_DECLARING_FILENAME_RE`'s own required `-towers-`
+        # token — a bare `-profile-\d+-` regex (this rule's OWN prior
+        # shape) would wrongly retroactively demand the marker on this
+        # unrelated artifact.
+        expect_clean(
+            baseline(),
+            "2026-08-31-profile-356-closeout-7820d697-a100-sxm4.json",
+            "rule (j): a -profile-<N>- filename WITHOUT -towers- (issue #356's own closeout artifact) "
+            "anchors nothing",
+        )
+
+        # A filename NOT in either family, with no source_sha256 and an
+        # ordinary producer.path, stays clean — the anchors are additive,
+        # never a blanket "every artifact now needs the marker".
+        expect_clean(baseline(), "control-ordinary-filename.json", "rule (j): ordinary filename anchors nothing")
+
+        ok = baseline()
+        ok["producer"] = dict(ok["producer"])
+        # `kind`/`gating` switched to the real profile_421_artifact.py
+        # producer block's own shape ("script"/"none") — `cargo-test`'s
+        # own rule (c) static scan has nothing to do with this rule and
+        # would otherwise spuriously fire against a non-Rust stub path.
+        ok["producer"]["path"] = "ci/scripts/perf/profile_421_legs.sh"
+        ok["producer"]["kind"] = "script"
+        ok["producer"]["gating"] = "none"
+        ok["producer"]["identity"] = "source_sha256+input_manifest"
+        ok["producer"]["source_sha256"] = identity_source
+        ok["producer"]["input_sha256"] = identity_input
+        expect_clean(ok, "control-identity-marker-known-path.json", "rule (j): known producer.path WITH the marker")
 
         # rule (c) — cargo-test static verification ---------------------------
         bad = baseline()
@@ -2367,7 +2819,16 @@ def self_test() -> int:
         "closed-list rename-bypass rejection, and a v1 leg's unchanged no-op) all bite too; and a "
         "GENUINE `git clone --depth 1` fixture proves is_shallow_repository tells shallow from normal "
         "apart and run_gate raises the one explicit shallow-checkout ArtifactError instead of N false "
-        "per-file ancestry findings."
+        "per-file ancestry findings; and (j) producer.source_sha256 (OPTIONAL, matching a real file's own "
+        "bytes is clean, absent entirely is clean, a wrong hash / nonexistent path / malformed hash / "
+        "empty object are each caught by name) is re-hashed against THIS gate's own HEAD, never a "
+        "historical blob; producer.input_sha256 (OPTIONAL, shape-checked but never re-hashed) and "
+        "producer.identity (OPTIONAL in general, but MANDATORY once stamped — requiring BOTH blocks "
+        "together — and MANDATORY, even with no marker stamped at all, the moment ANY ONE of its three "
+        "INDEPENDENT anchors fires: a known SOURCE_IDENTITY_DECLARING_PRODUCER_PATHS producer.path, an "
+        "artifact that already carries a non-empty producer.source_sha256 block, or an artifact whose own "
+        "basename matches a known profile/frontend SOURCE_IDENTITY_DECLARING_FILENAME_RE family, matched "
+        "against the basename only, never an ancestor directory's own name) round out rule (j)."
     )
     return 0
 

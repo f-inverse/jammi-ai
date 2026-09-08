@@ -72,6 +72,7 @@ from __future__ import annotations
 
 import json
 import os
+import re
 import stat
 import subprocess
 import tempfile
@@ -332,6 +333,43 @@ class DryRunSmokeTests(unittest.TestCase):
             result = run_dry(out_dir, legs_only="bert-A1")
             self.assertEqual(result.returncode, 0, _fail_msg(result))
             self.assertIn("corpus=synthetic", result.stdout)
+
+    def test_corpus_producer_runs_for_real_under_dry_run(self):
+        """esc-088 class: `gen_fixed_width_corpus.py` must run FOR REAL
+        under DRY_RUN (via `run_corpus_cmd`), never a touch-empty stand-in
+        -- for BOTH corpus modes (`synthetic`: bert-A1; `heldout`/E1:
+        distilbert-E1, which has no network-provisioned `train_pairs.jsonl`
+        to fall back to and so uses the SAME hermetic producer as its own
+        dry-run stand-in). Asserts every `--train-jsonl <path>` this run's
+        OWN traced command line names (`run_traced`'s `_print_cmd`, always
+        the real would-be production command line, never the DRY_RUN
+        stub's) resolves to a file that actually exists AND is non-empty
+        -- the shape a touch-empty placeholder would fail (exists, but
+        zero bytes)."""
+        for legs_only, want_mode in (("bert-A1", "synthetic"), ("distilbert-E1", "heldout")):
+            with self.subTest(legs_only=legs_only):
+                with tempfile.TemporaryDirectory() as out_dir:
+                    result = run_dry(out_dir, legs_only=legs_only)
+                    self.assertEqual(result.returncode, 0, _fail_msg(result))
+                    self.assertIn(f"corpus={want_mode}", result.stdout)
+                    train_jsonl_paths = re.findall(r"--train-jsonl (\S+)", result.stderr)
+                    self.assertTrue(
+                        train_jsonl_paths,
+                        f"no --train-jsonl found on any traced command line:\n{_fail_msg(result)}",
+                    )
+                    for path in train_jsonl_paths:
+                        self.assertTrue(
+                            os.path.isfile(path), f"--train-jsonl names a missing file: {path}"
+                        )
+                        self.assertGreater(
+                            os.path.getsize(path),
+                            0,
+                            f"--train-jsonl names an EMPTY file (touch-empty idiom, esc-088): {path}",
+                        )
+                    # The producer's own real stdout (never a touch-empty
+                    # placeholder's silence) is forwarded to stderr by
+                    # `run_corpus_cmd`.
+                    self.assertIn("gen_fixed_width_corpus: wrote", result.stderr)
 
     def test_wall_pair_derived_from_the_stub_is_strictly_ordered(self):
         """CLASS 4 (kernel_census.py) needs wall_b > wall_a > 0 -- proves

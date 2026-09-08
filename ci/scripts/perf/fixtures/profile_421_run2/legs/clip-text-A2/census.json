@@ -1,0 +1,2563 @@
+{
+ "nsys_sqlite_schema_ok": true,
+ "steps_a": 100,
+ "steps_b": 600,
+ "steps_diff": 500,
+ "gpu_kernel_us_per_step": 41449.621674,
+ "launches_per_step": 3722.0,
+ "memcpy_per_step": {
+  "count": 743.02,
+  "us": 961.3195840000001
+ },
+ "memset_per_step": {
+  "count": 852.0,
+  "us": 2062.803422
+ },
+ "by_kernel_name": [
+  {
+   "kernel": "badd_bf16",
+   "launches_per_step": 658.0,
+   "us_per_step": 12466.399012000002,
+   "share": 0.30076026049279403
+  },
+  {
+   "kernel": "bmul_bf16",
+   "launches_per_step": 142.0,
+   "us_per_step": 3139.9456640000003,
+   "share": 0.07575330092746264
+  },
+  {
+   "kernel": "dropout_fwd_f32",
+   "launches_per_step": 144.0,
+   "us_per_step": 2172.747882,
+   "share": 0.05241900394383802
+  },
+  {
+   "kernel": "cutlass_80_simt_sgemm_32x128_8x5_nt_align1",
+   "launches_per_step": 96.0,
+   "us_per_step": 1355.0680599999998,
+   "share": 0.032691928304136725
+  },
+  {
+   "kernel": "fast_sum_bf16",
+   "launches_per_step": 53.0,
+   "us_per_step": 1221.9977159999999,
+   "share": 0.029481516758125666
+  },
+  {
+   "kernel": "bdiv_bf16",
+   "launches_per_step": 74.0,
+   "us_per_step": 1182.9250560000003,
+   "share": 0.028538862557146345
+  },
+  {
+   "kernel": "bsub_bf16",
+   "launches_per_step": 53.0,
+   "us_per_step": 1182.694626,
+   "share": 0.028533303278419686
+  },
+  {
+   "kernel": "ampere_sgemm_32x32_sliced1x4_nn",
+   "launches_per_step": 96.0,
+   "us_per_step": 1132.2177279999999,
+   "share": 0.027315514165722848
+  },
+  {
+   "kernel": "ampere_sgemm_32x128_nn",
+   "launches_per_step": 48.0,
+   "us_per_step": 1099.888702,
+   "share": 0.026535554670452502
+  },
+  {
+   "kernel": "ucopy_bf16",
+   "launches_per_step": 48.0,
+   "us_per_step": 986.037016,
+   "share": 0.023788806174279486
+  },
+  {
+   "kernel": "fast_sum_f32",
+   "launches_per_step": 96.0,
+   "us_per_step": 974.781968,
+   "share": 0.02351727057165033
+  },
+  {
+   "kernel": "cast_bf16_f32",
+   "launches_per_step": 99.0,
+   "us_per_step": 914.38208,
+   "share": 0.022060082651455468
+  },
+  {
+   "kernel": "void cublasLt::splitKreduce_kernel<(int)32, (int)16, int, float, float, float, (bool)0, float, float, float, (bool)1, (bool)0, (bool)0>(cublasLt::cublasSplitKParams<T6>, const T4 *, const T9 *, T8 *, T5 *, const T6 *, const T6 *, const T10 *, const T4 *, T10 *, void *, long, T6 *, int *, T6 *, const T6 *, const T6 *, const T6 *, const T6 *)",
+   "launches_per_step": 240.0,
+   "us_per_step": 839.0115199999999,
+   "share": 0.020241717200673137
+  },
+  {
+   "kernel": "badd_f32",
+   "launches_per_step": 337.0,
+   "us_per_step": 779.8277820000001,
+   "share": 0.018813869717155
+  },
+  {
+   "kernel": "scaled_cast_add_bf16_f32",
+   "launches_per_step": 48.0,
+   "us_per_step": 721.5991319999999,
+   "share": 0.01740906437398524
+  },
+  {
+   "kernel": "ampere_bf16_s16816gemm_bf16_128x128_ldg8_f2f_stages_64x3_nn",
+   "launches_per_step": 24.0,
+   "us_per_step": 662.759864,
+   "share": 0.015989527460891825
+  },
+  {
+   "kernel": "ampere_bf16_s16816gemm_bf16_256x128_ldg8_f2f_stages_32x3_tn",
+   "launches_per_step": 24.0,
+   "us_per_step": 658.6600699999999,
+   "share": 0.015890617173308384
+  },
+  {
+   "kernel": "affine_bf16",
+   "launches_per_step": 88.0,
+   "us_per_step": 629.461448,
+   "share": 0.015186180779904215
+  },
+  {
+   "kernel": "copy2d_bf16",
+   "launches_per_step": 91.0,
+   "us_per_step": 628.359484,
+   "share": 0.015159595157273761
+  },
+  {
+   "kernel": "ampere_sgemm_32x128_tn",
+   "launches_per_step": 72.0,
+   "us_per_step": 545.139856,
+   "share": 0.013151865662068237
+  },
+  {
+   "kernel": "layer_norm_bwd_dx_bf16",
+   "launches_per_step": 24.0,
+   "us_per_step": 537.9841899999999,
+   "share": 0.012979230407245426
+  },
+  {
+   "kernel": "eq_bf16",
+   "launches_per_step": 34.0,
+   "us_per_step": 515.84361,
+   "share": 0.012445074024006639
+  },
+  {
+   "kernel": "cast_add_bf16",
+   "launches_per_step": 48.0,
+   "us_per_step": 507.90055199999995,
+   "share": 0.012253442407620078
+  },
+  {
+   "kernel": "adamw_moment_update_f32",
+   "launches_per_step": 192.0,
+   "us_per_step": 466.431788,
+   "share": 0.011252980586131079
+  },
+  {
+   "kernel": "cast_scale_bf16_f32",
+   "launches_per_step": 48.0,
+   "us_per_step": 445.78423,
+   "share": 0.010754844362780418
+  },
+  {
+   "kernel": "ampere_bf16_s16816gemm_bf16_256x128_ldg8_f2f_stages_32x3_nn",
+   "launches_per_step": 12.0,
+   "us_per_step": 426.17830200000003,
+   "share": 0.010281838163732331
+  },
+  {
+   "kernel": "fast_max_bf16",
+   "launches_per_step": 12.0,
+   "us_per_step": 391.604018,
+   "share": 0.009447710309154412
+  },
+  {
+   "kernel": "cutlass_75_tensorop_bf16_s1688gemm_bf16_64x64_tn_align1",
+   "launches_per_step": 24.0,
+   "us_per_step": 385.74618399999997,
+   "share": 0.009306386124193891
+  },
+  {
+   "kernel": "ampere_bf16_s16816gemm_bf16_128x128_ldg8_f2f_stages_64x3_tn",
+   "launches_per_step": 12.0,
+   "us_per_step": 367.792686,
+   "share": 0.008873245910244444
+  },
+  {
+   "kernel": "ampere_sgemm_128x64_tn",
+   "launches_per_step": 24.0,
+   "us_per_step": 360.478254,
+   "share": 0.008696780318892905
+  },
+  {
+   "kernel": "bmul_f32",
+   "launches_per_step": 96.0,
+   "us_per_step": 357.800566,
+   "share": 0.00863217929500275
+  },
+  {
+   "kernel": "copy2d_f32",
+   "launches_per_step": 144.0,
+   "us_per_step": 325.247106,
+   "share": 0.007846805178538382
+  },
+  {
+   "kernel": "layer_norm_fwd_bf16_biased",
+   "launches_per_step": 25.0,
+   "us_per_step": 316.790206,
+   "share": 0.007642776778315257
+  },
+  {
+   "kernel": "usqr_bf16",
+   "launches_per_step": 24.0,
+   "us_per_step": 278.53429800000004,
+   "share": 0.006719827268645869
+  },
+  {
+   "kernel": "cutlass_75_tensorop_bf16_s1688gemm_bf16_64x64_nt_align1",
+   "launches_per_step": 24.0,
+   "us_per_step": 276.205548,
+   "share": 0.00666364460868541
+  },
+  {
+   "kernel": "usigmoid_bf16",
+   "launches_per_step": 12.0,
+   "us_per_step": 268.79141999999996,
+   "share": 0.006484773784282911
+  },
+  {
+   "kernel": "adamw_theta_update_f32",
+   "launches_per_step": 96.0,
+   "us_per_step": 266.994768,
+   "share": 0.006441428346437168
+  },
+  {
+   "kernel": "usqr_f32",
+   "launches_per_step": 96.0,
+   "us_per_step": 236.592064,
+   "share": 0.005707942664972657
+  },
+  {
+   "kernel": "cutlass_75_wmma_tensorop_bf16_s161616gemm_bf16_32x32_32x1_nn_align1",
+   "launches_per_step": 12.0,
+   "us_per_step": 228.155396,
+   "share": 0.005504402375356648
+  },
+  {
+   "kernel": "ucopy_f32",
+   "launches_per_step": 48.0,
+   "us_per_step": 179.135384,
+   "share": 0.004321761617244526
+  },
+  {
+   "kernel": "ampere_bf16_s16816gemm_bf16_128x64_ldg8_f2f_stages_64x3_nn",
+   "launches_per_step": 12.0,
+   "us_per_step": 157.242706,
+   "share": 0.003793586036483253
+  },
+  {
+   "kernel": "const_set_bf16",
+   "launches_per_step": 13.0,
+   "us_per_step": 154.20566,
+   "share": 0.003720315259155385
+  },
+  {
+   "kernel": "ampere_bf16_s16816gemm_bf16_128x64_ldg8_f2f_stages_64x3_tn",
+   "launches_per_step": 12.0,
+   "us_per_step": 154.191902,
+   "share": 0.0037199833381523855
+  },
+  {
+   "kernel": "cutlass_75_tensorop_bf16_s1688gemm_bf16_64x64_nn_align1",
+   "launches_per_step": 12.0,
+   "us_per_step": 141.29855600000002,
+   "share": 0.0034089226944291266
+  },
+  {
+   "kernel": "cast_u8_bf16",
+   "launches_per_step": 34.0,
+   "us_per_step": 117.40194000000001,
+   "share": 0.0028324007616610507
+  },
+  {
+   "kernel": "cast_f32_bf16",
+   "launches_per_step": 48.0,
+   "us_per_step": 82.298992,
+   "share": 0.0019855185325279696
+  },
+  {
+   "kernel": "uexp_bf16",
+   "launches_per_step": 12.0,
+   "us_per_step": 81.210306,
+   "share": 0.0019592532505776908
+  },
+  {
+   "kernel": "bmaximum_bf16",
+   "launches_per_step": 10.0,
+   "us_per_step": 29.672074000000002,
+   "share": 0.0007158587413262767
+  },
+  {
+   "kernel": "bminimum_bf16",
+   "launches_per_step": 9.0,
+   "us_per_step": 27.845072000000002,
+   "share": 0.0006717810893185138
+  },
+  {
+   "kernel": "usqrt_bf16",
+   "launches_per_step": 9.0,
+   "us_per_step": 16.805656,
+   "share": 0.00040544775371355535
+  },
+  {
+   "kernel": "is_u32_bf16",
+   "launches_per_step": 1.0,
+   "us_per_step": 13.861336,
+   "share": 0.0003344140534989434
+  },
+  {
+   "kernel": "ampere_bf16_s16816gemm_bf16_64x64_sliced1x2_ldg8_f2f_stages_64x5_nn",
+   "launches_per_step": 1.0,
+   "us_per_step": 6.552765999999999,
+   "share": 0.00015808988683991624
+  },
+  {
+   "kernel": "ampere_bf16_s16816gemm_bf16_64x64_sliced1x2_ldg8_f2f_stages_64x5_tn",
+   "launches_per_step": 1.0,
+   "us_per_step": 6.427444,
+   "share": 0.00015506640930408605
+  },
+  {
+   "kernel": "cutlass_80_wmma_tensorop_bf16_s161616gemm_bf16_32x32_64x1_nt_align8",
+   "launches_per_step": 1.0,
+   "us_per_step": 4.546997999999999,
+   "share": 0.00010969938485233951
+  },
+  {
+   "kernel": "fast_argmax_u32",
+   "launches_per_step": 1.0,
+   "us_per_step": 4.01555,
+   "share": 9.687784442478577e-05
+  },
+  {
+   "kernel": "ucopy_u32",
+   "launches_per_step": 1.0,
+   "us_per_step": 3.5415639999999997,
+   "share": 8.54426133935381e-05
+  },
+  {
+   "kernel": "sa_u32_bf16",
+   "launches_per_step": 1.0,
+   "us_per_step": 2.9634560000000003,
+   "share": 7.149536908460807e-05
+  },
+  {
+   "kernel": "gather_u32_bf16",
+   "launches_per_step": 1.0,
+   "us_per_step": 2.940216,
+   "share": 7.093468845444979e-05
+  },
+  {
+   "kernel": "bminimum_f32",
+   "launches_per_step": 1.0,
+   "us_per_step": 2.03174,
+   "share": 4.90170939551529e-05
+  },
+  {
+   "kernel": "bdiv_f32",
+   "launches_per_step": 1.0,
+   "us_per_step": 1.8970879999999999,
+   "share": 4.5768523894392535e-05
+  },
+  {
+   "kernel": "usqrt_f32",
+   "launches_per_step": 1.0,
+   "us_per_step": 1.6827480000000001,
+   "share": 4.05974272391377e-05
+  },
+  {
+   "kernel": "affine_f32",
+   "launches_per_step": 1.0,
+   "us_per_step": 1.618876,
+   "share": 3.9056472281759524e-05
+  },
+  {
+   "kernel": "const_set_f32",
+   "launches_per_step": 1.0,
+   "us_per_step": 1.473792,
+   "share": 3.555622320491436e-05
+  }
+ ],
+ "by_kernel_and_grid": [
+  {
+   "kernel": "badd_bf16",
+   "grid": [
+    924,
+    1,
+    1
+   ],
+   "block": [
+    1024,
+    1,
+    1
+   ],
+   "launches_per_step": 301.0,
+   "us_per_step": 3776.534656,
+   "share": 0.09111143850002609
+  },
+  {
+   "kernel": "badd_bf16",
+   "grid": [
+    2772,
+    1,
+    1
+   ],
+   "block": [
+    1024,
+    1,
+    1
+   ],
+   "launches_per_step": 72.0,
+   "us_per_step": 3371.257806,
+   "share": 0.0813338619231519
+  },
+  {
+   "kernel": "badd_bf16",
+   "grid": [
+    3696,
+    1,
+    1
+   ],
+   "block": [
+    1024,
+    1,
+    1
+   ],
+   "launches_per_step": 72.0,
+   "us_per_step": 3209.646502,
+   "share": 0.07743488052179996
+  },
+  {
+   "kernel": "bmul_bf16",
+   "grid": [
+    3696,
+    1,
+    1
+   ],
+   "block": [
+    1024,
+    1,
+    1
+   ],
+   "launches_per_step": 60.0,
+   "us_per_step": 2330.362122,
+   "share": 0.056221553487948
+  },
+  {
+   "kernel": "badd_bf16",
+   "grid": [
+    1112,
+    1,
+    1
+   ],
+   "block": [
+    1024,
+    1,
+    1
+   ],
+   "launches_per_step": 120.0,
+   "us_per_step": 1909.98773,
+   "share": 0.046079738556409386
+  },
+  {
+   "kernel": "fast_sum_bf16",
+   "grid": [
+    14784,
+    1,
+    1
+   ],
+   "block": [
+    128,
+    1,
+    1
+   ],
+   "launches_per_step": 36.0,
+   "us_per_step": 1165.26353,
+   "share": 0.028112766364063867
+  },
+  {
+   "kernel": "dropout_fwd_f32",
+   "grid": [
+    14784,
+    1,
+    1
+   ],
+   "block": [
+    256,
+    1,
+    1
+   ],
+   "launches_per_step": 36.0,
+   "us_per_step": 1137.590016,
+   "share": 0.027445124226877404
+  },
+  {
+   "kernel": "ampere_sgemm_32x32_sliced1x4_nn",
+   "grid": [
+    1,
+    58,
+    6
+   ],
+   "block": [
+    128,
+    1,
+    1
+   ],
+   "launches_per_step": 96.0,
+   "us_per_step": 1132.2177279999999,
+   "share": 0.027315514165722848
+  },
+  {
+   "kernel": "bdiv_bf16",
+   "grid": [
+    1112,
+    1,
+    1
+   ],
+   "block": [
+    1024,
+    1,
+    1
+   ],
+   "launches_per_step": 36.0,
+   "us_per_step": 1108.119736,
+   "share": 0.026734133901518516
+  },
+  {
+   "kernel": "dropout_fwd_f32",
+   "grid": [
+    3696,
+    1,
+    1
+   ],
+   "block": [
+    256,
+    1,
+    1
+   ],
+   "launches_per_step": 108.0,
+   "us_per_step": 1035.157866,
+   "share": 0.02497387971696062
+  },
+  {
+   "kernel": "ucopy_bf16",
+   "grid": [
+    924,
+    1,
+    1
+   ],
+   "block": [
+    1024,
+    1,
+    1
+   ],
+   "launches_per_step": 48.0,
+   "us_per_step": 986.037016,
+   "share": 0.023788806174279486
+  },
+  {
+   "kernel": "fast_sum_f32",
+   "grid": [
+    1,
+    1,
+    1
+   ],
+   "block": [
+    1024,
+    1,
+    1
+   ],
+   "launches_per_step": 96.0,
+   "us_per_step": 974.781968,
+   "share": 0.02351727057165033
+  },
+  {
+   "kernel": "ampere_sgemm_32x128_nn",
+   "grid": [
+    1,
+    15,
+    26
+   ],
+   "block": [
+    256,
+    1,
+    1
+   ],
+   "launches_per_step": 36.0,
+   "us_per_step": 871.26022,
+   "share": 0.021019738777169904
+  },
+  {
+   "kernel": "bmul_bf16",
+   "grid": [
+    1112,
+    1,
+    1
+   ],
+   "block": [
+    1024,
+    1,
+    1
+   ],
+   "launches_per_step": 36.0,
+   "us_per_step": 723.0955919999999,
+   "share": 0.017445167477935612
+  },
+  {
+   "kernel": "bsub_bf16",
+   "grid": [
+    1112,
+    1,
+    1
+   ],
+   "block": [
+    1024,
+    1,
+    1
+   ],
+   "launches_per_step": 36.0,
+   "us_per_step": 674.997622,
+   "share": 0.01628477160319666
+  },
+  {
+   "kernel": "ampere_bf16_s16816gemm_bf16_128x128_ldg8_f2f_stages_64x3_nn",
+   "grid": [
+    4,
+    15,
+    1
+   ],
+   "block": [
+    128,
+    1,
+    1
+   ],
+   "launches_per_step": 24.0,
+   "us_per_step": 662.759864,
+   "share": 0.015989527460891825
+  },
+  {
+   "kernel": "cutlass_80_simt_sgemm_32x128_8x5_nt_align1",
+   "grid": [
+    16,
+    1,
+    10
+   ],
+   "block": [
+    128,
+    1,
+    1
+   ],
+   "launches_per_step": 24.0,
+   "us_per_step": 580.3647199999999,
+   "share": 0.014001689196696428
+  },
+  {
+   "kernel": "cutlass_80_simt_sgemm_32x128_8x5_nt_align1",
+   "grid": [
+    4,
+    1,
+    24
+   ],
+   "block": [
+    128,
+    1,
+    1
+   ],
+   "launches_per_step": 60.0,
+   "us_per_step": 566.602438,
+   "share": 0.013669664887566664
+  },
+  {
+   "kernel": "layer_norm_bwd_dx_bf16",
+   "grid": [
+    1848,
+    1,
+    1
+   ],
+   "block": [
+    256,
+    1,
+    1
+   ],
+   "launches_per_step": 24.0,
+   "us_per_step": 537.9841899999999,
+   "share": 0.012979230407245426
+  },
+  {
+   "kernel": "void cublasLt::splitKreduce_kernel<(int)32, (int)16, int, float, float, float, (bool)0, float, float, float, (bool)1, (bool)0, (bool)0>(cublasLt::cublasSplitKParams<T6>, const T4 *, const T9 *, T8 *, T5 *, const T6 *, const T6 *, const T10 *, const T4 *, T10 *, void *, long, T6 *, int *, T6 *, const T6 *, const T6 *, const T6 *, const T6 *)",
+   "grid": [
+    1,
+    116,
+    1
+   ],
+   "block": [
+    32,
+    16,
+    1
+   ],
+   "launches_per_step": 144.0,
+   "us_per_step": 535.6482659999999,
+   "share": 0.012922874669710064
+  },
+  {
+   "kernel": "bsub_bf16",
+   "grid": [
+    3696,
+    1,
+    1
+   ],
+   "block": [
+    1024,
+    1,
+    1
+   ],
+   "launches_per_step": 12.0,
+   "us_per_step": 497.86636,
+   "share": 0.012011360777082685
+  },
+  {
+   "kernel": "eq_bf16",
+   "grid": [
+    1112,
+    1,
+    1
+   ],
+   "block": [
+    1024,
+    1,
+    1
+   ],
+   "launches_per_step": 12.0,
+   "us_per_step": 468.47976400000005,
+   "share": 0.011302389384505823
+  },
+  {
+   "kernel": "cast_bf16_f32",
+   "grid": [
+    3696,
+    1,
+    1
+   ],
+   "block": [
+    1024,
+    1,
+    1
+   ],
+   "launches_per_step": 24.0,
+   "us_per_step": 460.190834,
+   "share": 0.011102413373501615
+  },
+  {
+   "kernel": "cast_bf16_f32",
+   "grid": [
+    924,
+    1,
+    1
+   ],
+   "block": [
+    1024,
+    1,
+    1
+   ],
+   "launches_per_step": 72.0,
+   "us_per_step": 449.19381,
+   "share": 0.01083710277340757
+  },
+  {
+   "kernel": "ampere_bf16_s16816gemm_bf16_256x128_ldg8_f2f_stages_32x3_tn",
+   "grid": [
+    8,
+    15,
+    1
+   ],
+   "block": [
+    256,
+    1,
+    1
+   ],
+   "launches_per_step": 12.0,
+   "us_per_step": 428.09099599999996,
+   "share": 0.010327983192872602
+  },
+  {
+   "kernel": "ampere_bf16_s16816gemm_bf16_256x128_ldg8_f2f_stages_32x3_nn",
+   "grid": [
+    8,
+    15,
+    1
+   ],
+   "block": [
+    256,
+    1,
+    1
+   ],
+   "launches_per_step": 12.0,
+   "us_per_step": 426.17830200000003,
+   "share": 0.010281838163732331
+  },
+  {
+   "kernel": "affine_bf16",
+   "grid": [
+    3696,
+    1,
+    1
+   ],
+   "block": [
+    1024,
+    1,
+    1
+   ],
+   "launches_per_step": 24.0,
+   "us_per_step": 406.354578,
+   "share": 0.00980357748970464
+  },
+  {
+   "kernel": "ampere_sgemm_32x128_tn",
+   "grid": [
+    16,
+    15,
+    1
+   ],
+   "block": [
+    256,
+    1,
+    1
+   ],
+   "launches_per_step": 60.0,
+   "us_per_step": 398.75435600000003,
+   "share": 0.009620217022393853
+  },
+  {
+   "kernel": "fast_max_bf16",
+   "grid": [
+    14784,
+    1,
+    1
+   ],
+   "block": [
+    128,
+    1,
+    1
+   ],
+   "launches_per_step": 12.0,
+   "us_per_step": 391.604018,
+   "share": 0.009447710309154412
+  },
+  {
+   "kernel": "ampere_bf16_s16816gemm_bf16_128x128_ldg8_f2f_stages_64x3_tn",
+   "grid": [
+    4,
+    15,
+    1
+   ],
+   "block": [
+    128,
+    1,
+    1
+   ],
+   "launches_per_step": 12.0,
+   "us_per_step": 367.792686,
+   "share": 0.008873245910244444
+  },
+  {
+   "kernel": "copy2d_bf16",
+   "grid": [
+    924,
+    1,
+    1
+   ],
+   "block": [
+    1024,
+    1,
+    1
+   ],
+   "launches_per_step": 60.0,
+   "us_per_step": 365.531072,
+   "share": 0.00881868295143658
+  },
+  {
+   "kernel": "ampere_sgemm_128x64_tn",
+   "grid": [
+    16,
+    29,
+    1
+   ],
+   "block": [
+    128,
+    1,
+    1
+   ],
+   "launches_per_step": 24.0,
+   "us_per_step": 360.478254,
+   "share": 0.008696780318892905
+  },
+  {
+   "kernel": "layer_norm_fwd_bf16_biased",
+   "grid": [
+    1848,
+    1,
+    1
+   ],
+   "block": [
+    256,
+    1,
+    1
+   ],
+   "launches_per_step": 25.0,
+   "us_per_step": 316.790206,
+   "share": 0.007642776778315257
+  },
+  {
+   "kernel": "scaled_cast_add_bf16_f32",
+   "grid": [
+    3696,
+    1,
+    1
+   ],
+   "block": [
+    1024,
+    1,
+    1
+   ],
+   "launches_per_step": 12.0,
+   "us_per_step": 310.11605,
+   "share": 0.007481758276083993
+  },
+  {
+   "kernel": "adamw_moment_update_f32",
+   "grid": [
+    4,
+    1,
+    1
+   ],
+   "block": [
+    1024,
+    1,
+    1
+   ],
+   "launches_per_step": 120.0,
+   "us_per_step": 287.214336,
+   "share": 0.00692923902319138
+  },
+  {
+   "kernel": "cast_add_bf16",
+   "grid": [
+    3696,
+    1,
+    1
+   ],
+   "block": [
+    1024,
+    1,
+    1
+   ],
+   "launches_per_step": 12.0,
+   "us_per_step": 286.664946,
+   "share": 0.006915984619946859
+  },
+  {
+   "kernel": "badd_f32",
+   "grid": [
+    4,
+    1,
+    1
+   ],
+   "block": [
+    1024,
+    1,
+    1
+   ],
+   "launches_per_step": 96.0,
+   "us_per_step": 283.997578,
+   "share": 0.006851632572997462
+  },
+  {
+   "kernel": "cutlass_75_tensorop_bf16_s1688gemm_bf16_64x64_nt_align1",
+   "grid": [
+    2,
+    1,
+    192
+   ],
+   "block": [
+    128,
+    1,
+    1
+   ],
+   "launches_per_step": 24.0,
+   "us_per_step": 276.205548,
+   "share": 0.00666364460868541
+  },
+  {
+   "kernel": "usigmoid_bf16",
+   "grid": [
+    3696,
+    1,
+    1
+   ],
+   "block": [
+    1024,
+    1,
+    1
+   ],
+   "launches_per_step": 12.0,
+   "us_per_step": 268.79141999999996,
+   "share": 0.006484773784282911
+  },
+  {
+   "kernel": "usqr_bf16",
+   "grid": [
+    1112,
+    1,
+    1
+   ],
+   "block": [
+    1024,
+    1,
+    1
+   ],
+   "launches_per_step": 12.0,
+   "us_per_step": 253.444468,
+   "share": 0.006114518245626774
+  },
+  {
+   "kernel": "copy2d_bf16",
+   "grid": [
+    1848,
+    1,
+    1
+   ],
+   "block": [
+    1024,
+    1,
+    1
+   ],
+   "launches_per_step": 24.0,
+   "us_per_step": 247.40851800000002,
+   "share": 0.0059688968923736
+  },
+  {
+   "kernel": "cutlass_75_tensorop_bf16_s1688gemm_bf16_64x64_tn_align1",
+   "grid": [
+    4,
+    1,
+    192
+   ],
+   "block": [
+    128,
+    1,
+    1
+   ],
+   "launches_per_step": 12.0,
+   "us_per_step": 234.141062,
+   "share": 0.0056488105932911105
+  },
+  {
+   "kernel": "scaled_cast_add_bf16_f32",
+   "grid": [
+    2772,
+    1,
+    1
+   ],
+   "block": [
+    1024,
+    1,
+    1
+   ],
+   "launches_per_step": 12.0,
+   "us_per_step": 231.078178,
+   "share": 0.005574916456835789
+  },
+  {
+   "kernel": "ampere_bf16_s16816gemm_bf16_256x128_ldg8_f2f_stages_32x3_tn",
+   "grid": [
+    6,
+    15,
+    1
+   ],
+   "block": [
+    256,
+    1,
+    1
+   ],
+   "launches_per_step": 12.0,
+   "us_per_step": 230.569074,
+   "share": 0.005562633980435785
+  },
+  {
+   "kernel": "ampere_sgemm_32x128_nn",
+   "grid": [
+    1,
+    15,
+    13
+   ],
+   "block": [
+    256,
+    1,
+    1
+   ],
+   "launches_per_step": 12.0,
+   "us_per_step": 228.628482,
+   "share": 0.005515815893282597
+  },
+  {
+   "kernel": "cutlass_75_wmma_tensorop_bf16_s161616gemm_bf16_32x32_32x1_nn_align1",
+   "grid": [
+    12,
+    1,
+    192
+   ],
+   "block": [
+    128,
+    1,
+    1
+   ],
+   "launches_per_step": 12.0,
+   "us_per_step": 228.155396,
+   "share": 0.005504402375356648
+  },
+  {
+   "kernel": "bmul_f32",
+   "grid": [
+    4,
+    1,
+    1
+   ],
+   "block": [
+    1024,
+    1,
+    1
+   ],
+   "launches_per_step": 60.0,
+   "us_per_step": 222.574994,
+   "share": 0.005369771423984168
+  },
+  {
+   "kernel": "cast_add_bf16",
+   "grid": [
+    924,
+    1,
+    1
+   ],
+   "block": [
+    1024,
+    1,
+    1
+   ],
+   "launches_per_step": 36.0,
+   "us_per_step": 221.235606,
+   "share": 0.0053374577876732195
+  },
+  {
+   "kernel": "cutlass_80_simt_sgemm_32x128_8x5_nt_align1",
+   "grid": [
+    12,
+    1,
+    8
+   ],
+   "block": [
+    128,
+    1,
+    1
+   ],
+   "launches_per_step": 12.0,
+   "us_per_step": 208.100902,
+   "share": 0.005020574219873638
+  },
+  {
+   "kernel": "badd_f32",
+   "grid": [
+    1,
+    1,
+    1
+   ],
+   "block": [
+    1024,
+    1,
+    1
+   ],
+   "launches_per_step": 121.0,
+   "us_per_step": 197.384598,
+   "share": 0.004762036178578994
+  },
+  {
+   "kernel": "void cublasLt::splitKreduce_kernel<(int)32, (int)16, int, float, float, float, (bool)0, float, float, float, (bool)1, (bool)0, (bool)0>(cublasLt::cublasSplitKParams<T6>, const T4 *, const T9 *, T8 *, T5 *, const T6 *, const T6 *, const T10 *, const T4 *, T10 *, void *, long, T6 *, int *, T6 *, const T6 *, const T6 *, const T6 *, const T6 *)",
+   "grid": [
+    1,
+    32,
+    1
+   ],
+   "block": [
+    32,
+    16,
+    1
+   ],
+   "launches_per_step": 60.0,
+   "us_per_step": 185.834074,
+   "share": 0.004483372018726233
+  },
+  {
+   "kernel": "cast_scale_bf16_f32",
+   "grid": [
+    3696,
+    1,
+    1
+   ],
+   "block": [
+    1024,
+    1,
+    1
+   ],
+   "launches_per_step": 12.0,
+   "us_per_step": 183.134334,
+   "share": 0.004418238975504913
+  },
+  {
+   "kernel": "scaled_cast_add_bf16_f32",
+   "grid": [
+    924,
+    1,
+    1
+   ],
+   "block": [
+    1024,
+    1,
+    1
+   ],
+   "launches_per_step": 24.0,
+   "us_per_step": 180.40490400000002,
+   "share": 0.004352389641065461
+  },
+  {
+   "kernel": "adamw_theta_update_f32",
+   "grid": [
+    4,
+    1,
+    1
+   ],
+   "block": [
+    1024,
+    1,
+    1
+   ],
+   "launches_per_step": 60.0,
+   "us_per_step": 164.459812,
+   "share": 0.003967703572627788
+  },
+  {
+   "kernel": "ampere_bf16_s16816gemm_bf16_128x64_ldg8_f2f_stages_64x3_nn",
+   "grid": [
+    4,
+    29,
+    1
+   ],
+   "block": [
+    128,
+    1,
+    1
+   ],
+   "launches_per_step": 12.0,
+   "us_per_step": 157.242706,
+   "share": 0.003793586036483253
+  },
+  {
+   "kernel": "affine_bf16",
+   "grid": [
+    1112,
+    1,
+    1
+   ],
+   "block": [
+    1024,
+    1,
+    1
+   ],
+   "launches_per_step": 24.0,
+   "us_per_step": 155.53113000000002,
+   "share": 0.003752293114355725
+  },
+  {
+   "kernel": "ampere_bf16_s16816gemm_bf16_128x64_ldg8_f2f_stages_64x3_tn",
+   "grid": [
+    4,
+    29,
+    1
+   ],
+   "block": [
+    128,
+    1,
+    1
+   ],
+   "launches_per_step": 12.0,
+   "us_per_step": 154.191902,
+   "share": 0.0037199833381523855
+  },
+  {
+   "kernel": "const_set_bf16",
+   "grid": [
+    3696,
+    1,
+    1
+   ],
+   "block": [
+    1024,
+    1,
+    1
+   ],
+   "launches_per_step": 12.0,
+   "us_per_step": 152.675424,
+   "share": 0.003683397286488825
+  },
+  {
+   "kernel": "cutlass_75_tensorop_bf16_s1688gemm_bf16_64x64_tn_align1",
+   "grid": [
+    2,
+    1,
+    192
+   ],
+   "block": [
+    128,
+    1,
+    1
+   ],
+   "launches_per_step": 12.0,
+   "us_per_step": 151.605122,
+   "share": 0.0036575755309027815
+  },
+  {
+   "kernel": "ampere_sgemm_32x128_tn",
+   "grid": [
+    48,
+    15,
+    1
+   ],
+   "block": [
+    256,
+    1,
+    1
+   ],
+   "launches_per_step": 12.0,
+   "us_per_step": 146.3855,
+   "share": 0.0035316486396743847
+  },
+  {
+   "kernel": "usqr_f32",
+   "grid": [
+    4,
+    1,
+    1
+   ],
+   "block": [
+    1024,
+    1,
+    1
+   ],
+   "launches_per_step": 60.0,
+   "us_per_step": 145.98267199999998,
+   "share": 0.003521930143250744
+  },
+  {
+   "kernel": "copy2d_f32",
+   "grid": [
+    4,
+    1,
+    1
+   ],
+   "block": [
+    1024,
+    1,
+    1
+   ],
+   "launches_per_step": 60.0,
+   "us_per_step": 144.708376,
+   "share": 0.003491186895217691
+  },
+  {
+   "kernel": "cutlass_75_tensorop_bf16_s1688gemm_bf16_64x64_nn_align1",
+   "grid": [
+    2,
+    1,
+    192
+   ],
+   "block": [
+    128,
+    1,
+    1
+   ],
+   "launches_per_step": 12.0,
+   "us_per_step": 141.29855600000002,
+   "share": 0.0034089226944291266
+  },
+  {
+   "kernel": "cast_scale_bf16_f32",
+   "grid": [
+    2772,
+    1,
+    1
+   ],
+   "block": [
+    1024,
+    1,
+    1
+   ],
+   "launches_per_step": 12.0,
+   "us_per_step": 138.184692,
+   "share": 0.0033337986311869953
+  },
+  {
+   "kernel": "ucopy_f32",
+   "grid": [
+    4,
+    1,
+    1
+   ],
+   "block": [
+    1024,
+    1,
+    1
+   ],
+   "launches_per_step": 36.0,
+   "us_per_step": 131.532456,
+   "share": 0.003173308963698118
+  },
+  {
+   "kernel": "cast_scale_bf16_f32",
+   "grid": [
+    924,
+    1,
+    1
+   ],
+   "block": [
+    1024,
+    1,
+    1
+   ],
+   "launches_per_step": 24.0,
+   "us_per_step": 124.465204,
+   "share": 0.0030028067560885115
+  },
+  {
+   "kernel": "adamw_moment_update_f32",
+   "grid": [
+    16,
+    1,
+    1
+   ],
+   "block": [
+    1024,
+    1,
+    1
+   ],
+   "launches_per_step": 48.0,
+   "us_per_step": 119.74158,
+   "share": 0.0028888461501956238
+  },
+  {
+   "kernel": "badd_f32",
+   "grid": [
+    16,
+    1,
+    1
+   ],
+   "block": [
+    1024,
+    1,
+    1
+   ],
+   "launches_per_step": 36.0,
+   "us_per_step": 108.965592,
+   "share": 0.002628868192260258
+  },
+  {
+   "kernel": "bmul_f32",
+   "grid": [
+    16,
+    1,
+    1
+   ],
+   "block": [
+    1024,
+    1,
+    1
+   ],
+   "launches_per_step": 24.0,
+   "us_per_step": 90.245336,
+   "share": 0.002177229425874542
+  },
+  {
+   "kernel": "void cublasLt::splitKreduce_kernel<(int)32, (int)16, int, float, float, float, (bool)0, float, float, float, (bool)1, (bool)0, (bool)0>(cublasLt::cublasSplitKParams<T6>, const T4 *, const T9 *, T8 *, T5 *, const T6 *, const T6 *, const T10 *, const T4 *, T10 *, void *, long, T6 *, int *, T6 *, const T6 *, const T6 *, const T6 *, const T6 *)",
+   "grid": [
+    1,
+    128,
+    1
+   ],
+   "block": [
+    32,
+    16,
+    1
+   ],
+   "launches_per_step": 24.0,
+   "us_per_step": 84.56057799999999,
+   "share": 0.0020400808158170017
+  },
+  {
+   "kernel": "uexp_bf16",
+   "grid": [
+    1112,
+    1,
+    1
+   ],
+   "block": [
+    1024,
+    1,
+    1
+   ],
+   "launches_per_step": 12.0,
+   "us_per_step": 81.210306,
+   "share": 0.0019592532505776908
+  },
+  {
+   "kernel": "cast_u8_bf16",
+   "grid": [
+    1112,
+    1,
+    1
+   ],
+   "block": [
+    1024,
+    1,
+    1
+   ],
+   "launches_per_step": 12.0,
+   "us_per_step": 80.77004600000001,
+   "share": 0.001948631681979004
+  },
+  {
+   "kernel": "badd_bf16",
+   "grid": [
+    1,
+    1,
+    1
+   ],
+   "block": [
+    1024,
+    1,
+    1
+   ],
+   "launches_per_step": 46.0,
+   "us_per_step": 79.789392,
+   "share": 0.0019249727446860943
+  },
+  {
+   "kernel": "adamw_theta_update_f32",
+   "grid": [
+    16,
+    1,
+    1
+   ],
+   "block": [
+    1024,
+    1,
+    1
+   ],
+   "launches_per_step": 24.0,
+   "us_per_step": 68.724698,
+   "share": 0.0016580295603303122
+  },
+  {
+   "kernel": "copy2d_f32",
+   "grid": [
+    16,
+    1,
+    1
+   ],
+   "block": [
+    1024,
+    1,
+    1
+   ],
+   "launches_per_step": 24.0,
+   "us_per_step": 65.73110199999999,
+   "share": 0.001585807043474922
+  },
+  {
+   "kernel": "bdiv_bf16",
+   "grid": [
+    1,
+    1,
+    1
+   ],
+   "block": [
+    1024,
+    1,
+    1
+   ],
+   "launches_per_step": 35.0,
+   "us_per_step": 64.299234,
+   "share": 0.0015512622649661678
+  },
+  {
+   "kernel": "usqr_f32",
+   "grid": [
+    16,
+    1,
+    1
+   ],
+   "block": [
+    1024,
+    1,
+    1
+   ],
+   "launches_per_step": 24.0,
+   "us_per_step": 60.83337,
+   "share": 0.0014676459649849783
+  },
+  {
+   "kernel": "adamw_moment_update_f32",
+   "grid": [
+    12,
+    1,
+    1
+   ],
+   "block": [
+    1024,
+    1,
+    1
+   ],
+   "launches_per_step": 24.0,
+   "us_per_step": 59.475872,
+   "share": 0.0014348954127440753
+  },
+  {
+   "kernel": "affine_bf16",
+   "grid": [
+    1,
+    1,
+    1
+   ],
+   "block": [
+    1024,
+    1,
+    1
+   ],
+   "launches_per_step": 35.0,
+   "us_per_step": 57.055304,
+   "share": 0.0013764975817810404
+  },
+  {
+   "kernel": "bmul_bf16",
+   "grid": [
+    1,
+    1,
+    1
+   ],
+   "block": [
+    1024,
+    1,
+    1
+   ],
+   "launches_per_step": 32.0,
+   "us_per_step": 55.720620000000004,
+   "share": 0.0013442974326337877
+  },
+  {
+   "kernel": "badd_bf16",
+   "grid": [
+    15,
+    1,
+    1
+   ],
+   "block": [
+    1024,
+    1,
+    1
+   ],
+   "launches_per_step": 24.0,
+   "us_per_step": 55.543138,
+   "share": 0.0013400155600175334
+  },
+  {
+   "kernel": "ucopy_f32",
+   "grid": [
+    16,
+    1,
+    1
+   ],
+   "block": [
+    1024,
+    1,
+    1
+   ],
+   "launches_per_step": 12.0,
+   "us_per_step": 47.602928,
+   "share": 0.0011484526535464079
+  },
+  {
+   "kernel": "eq_bf16",
+   "grid": [
+    1,
+    1,
+    1
+   ],
+   "block": [
+    1024,
+    1,
+    1
+   ],
+   "launches_per_step": 22.0,
+   "us_per_step": 47.363845999999995,
+   "share": 0.0011426846395008183
+  },
+  {
+   "kernel": "bmul_f32",
+   "grid": [
+    12,
+    1,
+    1
+   ],
+   "block": [
+    1024,
+    1,
+    1
+   ],
+   "launches_per_step": 12.0,
+   "us_per_step": 44.980236,
+   "share": 0.0010851784451440395
+  },
+  {
+   "kernel": "cast_f32_bf16",
+   "grid": [
+    2,
+    1,
+    1
+   ],
+   "block": [
+    1024,
+    1,
+    1
+   ],
+   "launches_per_step": 24.0,
+   "us_per_step": 42.378308,
+   "share": 0.0010224051822065852
+  },
+  {
+   "kernel": "badd_f32",
+   "grid": [
+    2,
+    1,
+    1
+   ],
+   "block": [
+    1024,
+    1,
+    1
+   ],
+   "launches_per_step": 24.0,
+   "us_per_step": 42.359235999999996,
+   "share": 0.0010219450573796325
+  },
+  {
+   "kernel": "copy2d_f32",
+   "grid": [
+    1,
+    1,
+    1
+   ],
+   "block": [
+    1024,
+    1,
+    1
+   ],
+   "launches_per_step": 24.0,
+   "us_per_step": 42.06716,
+   "share": 0.001014898527442709
+  },
+  {
+   "kernel": "copy2d_f32",
+   "grid": [
+    2,
+    1,
+    1
+   ],
+   "block": [
+    1024,
+    1,
+    1
+   ],
+   "launches_per_step": 24.0,
+   "us_per_step": 41.90046,
+   "share": 0.0010108767778279335
+  },
+  {
+   "kernel": "fast_sum_bf16",
+   "grid": [
+    8,
+    1,
+    1
+   ],
+   "block": [
+    512,
+    1,
+    1
+   ],
+   "launches_per_step": 12.0,
+   "us_per_step": 41.64584,
+   "share": 0.0010047338990821979
+  },
+  {
+   "kernel": "badd_bf16",
+   "grid": [
+    4,
+    1,
+    1
+   ],
+   "block": [
+    1024,
+    1,
+    1
+   ],
+   "launches_per_step": 14.0,
+   "us_per_step": 40.569416,
+   "share": 0.0009787644461287778
+  },
+  {
+   "kernel": "cast_f32_bf16",
+   "grid": [
+    1,
+    1,
+    1
+   ],
+   "block": [
+    1024,
+    1,
+    1
+   ],
+   "launches_per_step": 24.0,
+   "us_per_step": 39.920684,
+   "share": 0.0009631133503213841
+  },
+  {
+   "kernel": "cast_u8_bf16",
+   "grid": [
+    1,
+    1,
+    1
+   ],
+   "block": [
+    1024,
+    1,
+    1
+   ],
+   "launches_per_step": 22.0,
+   "us_per_step": 36.631894,
+   "share": 0.0008837690796820468
+  },
+  {
+   "kernel": "adamw_theta_update_f32",
+   "grid": [
+    12,
+    1,
+    1
+   ],
+   "block": [
+    1024,
+    1,
+    1
+   ],
+   "launches_per_step": 12.0,
+   "us_per_step": 33.810258000000005,
+   "share": 0.0008156952134790673
+  },
+  {
+   "kernel": "badd_f32",
+   "grid": [
+    21,
+    1,
+    1
+   ],
+   "block": [
+    1024,
+    1,
+    1
+   ],
+   "launches_per_step": 12.0,
+   "us_per_step": 33.170336000000006,
+   "share": 0.0008002566648468755
+  },
+  {
+   "kernel": "void cublasLt::splitKreduce_kernel<(int)32, (int)16, int, float, float, float, (bool)0, float, float, float, (bool)1, (bool)0, (bool)0>(cublasLt::cublasSplitKParams<T6>, const T4 *, const T9 *, T8 *, T5 *, const T6 *, const T6 *, const T10 *, const T4 *, T10 *, void *, long, T6 *, int *, T6 *, const T6 *, const T6 *, const T6 *, const T6 *)",
+   "grid": [
+    1,
+    96,
+    1
+   ],
+   "block": [
+    32,
+    16,
+    1
+   ],
+   "launches_per_step": 12.0,
+   "us_per_step": 32.968602,
+   "share": 0.000795389696419838
+  },
+  {
+   "kernel": "copy2d_f32",
+   "grid": [
+    12,
+    1,
+    1
+   ],
+   "block": [
+    1024,
+    1,
+    1
+   ],
+   "launches_per_step": 12.0,
+   "us_per_step": 30.840008,
+   "share": 0.0007440359345751263
+  },
+  {
+   "kernel": "badd_f32",
+   "grid": [
+    18,
+    1,
+    1
+   ],
+   "block": [
+    1024,
+    1,
+    1
+   ],
+   "launches_per_step": 12.0,
+   "us_per_step": 29.847446,
+   "share": 0.0007200897087734418
+  },
+  {
+   "kernel": "usqr_f32",
+   "grid": [
+    12,
+    1,
+    1
+   ],
+   "block": [
+    1024,
+    1,
+    1
+   ],
+   "launches_per_step": 12.0,
+   "us_per_step": 29.776022,
+   "share": 0.0007183665567369347
+  },
+  {
+   "kernel": "bmaximum_bf16",
+   "grid": [
+    1,
+    1,
+    1
+   ],
+   "block": [
+    1024,
+    1,
+    1
+   ],
+   "launches_per_step": 10.0,
+   "us_per_step": 29.672074000000002,
+   "share": 0.0007158587413262767
+  },
+  {
+   "kernel": "badd_f32",
+   "grid": [
+    22,
+    1,
+    1
+   ],
+   "block": [
+    1024,
+    1,
+    1
+   ],
+   "launches_per_step": 12.0,
+   "us_per_step": 29.192792,
+   "share": 0.0007042957407331823
+  },
+  {
+   "kernel": "badd_f32",
+   "grid": [
+    9,
+    1,
+    1
+   ],
+   "block": [
+    1024,
+    1,
+    1
+   ],
+   "launches_per_step": 12.0,
+   "us_per_step": 27.938714,
+   "share": 0.0006740402655478288
+  },
+  {
+   "kernel": "bminimum_bf16",
+   "grid": [
+    1,
+    1,
+    1
+   ],
+   "block": [
+    1024,
+    1,
+    1
+   ],
+   "launches_per_step": 9.0,
+   "us_per_step": 27.845072000000002,
+   "share": 0.0006717810893185138
+  },
+  {
+   "kernel": "badd_f32",
+   "grid": [
+    12,
+    1,
+    1
+   ],
+   "block": [
+    1024,
+    1,
+    1
+   ],
+   "launches_per_step": 12.0,
+   "us_per_step": 26.971490000000003,
+   "share": 0.0006507053360373211
+  },
+  {
+   "kernel": "bmul_bf16",
+   "grid": [
+    4,
+    1,
+    1
+   ],
+   "block": [
+    1024,
+    1,
+    1
+   ],
+   "launches_per_step": 12.0,
+   "us_per_step": 26.227502,
+   "share": 0.00063275612516511
+  },
+  {
+   "kernel": "badd_bf16",
+   "grid": [
+    12,
+    1,
+    1
+   ],
+   "block": [
+    1024,
+    1,
+    1
+   ],
+   "launches_per_step": 8.0,
+   "us_per_step": 19.363813999999998,
+   "share": 0.00046716503596331465
+  },
+  {
+   "kernel": "usqrt_bf16",
+   "grid": [
+    1,
+    1,
+    1
+   ],
+   "block": [
+    1024,
+    1,
+    1
+   ],
+   "launches_per_step": 9.0,
+   "us_per_step": 16.805656,
+   "share": 0.00040544775371355535
+  },
+  {
+   "kernel": "usqr_bf16",
+   "grid": [
+    4,
+    1,
+    1
+   ],
+   "block": [
+    1024,
+    1,
+    1
+   ],
+   "launches_per_step": 8.0,
+   "us_per_step": 16.464362,
+   "share": 0.000397213806424862
+  },
+  {
+   "kernel": "is_u32_bf16",
+   "grid": [
+    924,
+    1,
+    1
+   ],
+   "block": [
+    1024,
+    1,
+    1
+   ],
+   "launches_per_step": 1.0,
+   "us_per_step": 13.861336,
+   "share": 0.0003344140534989434
+  },
+  {
+   "kernel": "copy2d_bf16",
+   "grid": [
+    4,
+    1,
+    1
+   ],
+   "block": [
+    1024,
+    1,
+    1
+   ],
+   "launches_per_step": 5.0,
+   "us_per_step": 10.929976,
+   "share": 0.0002636930220006331
+  },
+  {
+   "kernel": "bdiv_bf16",
+   "grid": [
+    12,
+    1,
+    1
+   ],
+   "block": [
+    1024,
+    1,
+    1
+   ],
+   "launches_per_step": 3.0,
+   "us_per_step": 10.506086,
+   "share": 0.00025346639066165774
+  },
+  {
+   "kernel": "affine_bf16",
+   "grid": [
+    4,
+    1,
+    1
+   ],
+   "block": [
+    1024,
+    1,
+    1
+   ],
+   "launches_per_step": 4.0,
+   "us_per_step": 8.404278,
+   "share": 0.00020275885908198118
+  },
+  {
+   "kernel": "fast_sum_bf16",
+   "grid": [
+    1,
+    1,
+    1
+   ],
+   "block": [
+    8,
+    1,
+    1
+   ],
+   "launches_per_step": 3.0,
+   "us_per_step": 7.788782,
+   "share": 0.0001879096041275969
+  },
+  {
+   "kernel": "bsub_bf16",
+   "grid": [
+    1,
+    1,
+    1
+   ],
+   "block": [
+    1024,
+    1,
+    1
+   ],
+   "launches_per_step": 4.0,
+   "us_per_step": 7.459636000000001,
+   "share": 0.0001799687355090912
+  },
+  {
+   "kernel": "fast_sum_bf16",
+   "grid": [
+    24,
+    1,
+    1
+   ],
+   "block": [
+    512,
+    1,
+    1
+   ],
+   "launches_per_step": 2.0,
+   "us_per_step": 7.299564,
+   "share": 0.00017610689085200453
+  },
+  {
+   "kernel": "ampere_bf16_s16816gemm_bf16_64x64_sliced1x2_ldg8_f2f_stages_64x5_nn",
+   "grid": [
+    8,
+    1,
+    1
+   ],
+   "block": [
+    128,
+    1,
+    1
+   ],
+   "launches_per_step": 1.0,
+   "us_per_step": 6.552765999999999,
+   "share": 0.00015808988683991624
+  },
+  {
+   "kernel": "ampere_bf16_s16816gemm_bf16_64x64_sliced1x2_ldg8_f2f_stages_64x5_tn",
+   "grid": [
+    8,
+    1,
+    1
+   ],
+   "block": [
+    128,
+    1,
+    1
+   ],
+   "launches_per_step": 1.0,
+   "us_per_step": 6.427444,
+   "share": 0.00015506640930408605
+  },
+  {
+   "kernel": "usqr_bf16",
+   "grid": [
+    12,
+    1,
+    1
+   ],
+   "block": [
+    1024,
+    1,
+    1
+   ],
+   "launches_per_step": 2.0,
+   "us_per_step": 5.289212,
+   "share": 0.00012760579678143964
+  },
+  {
+   "kernel": "cast_bf16_f32",
+   "grid": [
+    1,
+    1,
+    1
+   ],
+   "block": [
+    1024,
+    1,
+    1
+   ],
+   "launches_per_step": 3.0,
+   "us_per_step": 4.9974359999999995,
+   "share": 0.00012056650454628223
+  },
+  {
+   "kernel": "cutlass_80_wmma_tensorop_bf16_s161616gemm_bf16_32x32_64x1_nt_align8",
+   "grid": [
+    128,
+    2,
+    1
+   ],
+   "block": [
+    128,
+    1,
+    1
+   ],
+   "launches_per_step": 1.0,
+   "us_per_step": 4.546997999999999,
+   "share": 0.00010969938485233951
+  },
+  {
+   "kernel": "bmul_bf16",
+   "grid": [
+    12,
+    1,
+    1
+   ],
+   "block": [
+    1024,
+    1,
+    1
+   ],
+   "launches_per_step": 2.0,
+   "us_per_step": 4.539828000000001,
+   "share": 0.00010952640378012635
+  },
+  {
+   "kernel": "copy2d_bf16",
+   "grid": [
+    8,
+    1,
+    1
+   ],
+   "block": [
+    1024,
+    1,
+    1
+   ],
+   "launches_per_step": 2.0,
+   "us_per_step": 4.489917999999999,
+   "share": 0.00010832229146294908
+  },
+  {
+   "kernel": "fast_argmax_u32",
+   "grid": [
+    24,
+    1,
+    1
+   ],
+   "block": [
+    128,
+    1,
+    1
+   ],
+   "launches_per_step": 1.0,
+   "us_per_step": 4.01555,
+   "share": 9.687784442478577e-05
+  },
+  {
+   "kernel": "badd_bf16",
+   "grid": [
+    256,
+    1,
+    1
+   ],
+   "block": [
+    1024,
+    1,
+    1
+   ],
+   "launches_per_step": 1.0,
+   "us_per_step": 3.706558,
+   "share": 8.942320461093624e-05
+  },
+  {
+   "kernel": "ucopy_u32",
+   "grid": [
+    12,
+    1,
+    1
+   ],
+   "block": [
+    1024,
+    1,
+    1
+   ],
+   "launches_per_step": 1.0,
+   "us_per_step": 3.5415639999999997,
+   "share": 8.54426133935381e-05
+  },
+  {
+   "kernel": "usqr_bf16",
+   "grid": [
+    1,
+    1,
+    1
+   ],
+   "block": [
+    1024,
+    1,
+    1
+   ],
+   "launches_per_step": 2.0,
+   "us_per_step": 3.3362559999999997,
+   "share": 8.048941981279227e-05
+  },
+  {
+   "kernel": "sa_u32_bf16",
+   "grid": [
+    12,
+    1,
+    1
+   ],
+   "block": [
+    1024,
+    1,
+    1
+   ],
+   "launches_per_step": 1.0,
+   "us_per_step": 2.9634560000000003,
+   "share": 7.149536908460807e-05
+  },
+  {
+   "kernel": "gather_u32_bf16",
+   "grid": [
+    12,
+    1,
+    1
+   ],
+   "block": [
+    1024,
+    1,
+    1
+   ],
+   "launches_per_step": 1.0,
+   "us_per_step": 2.940216,
+   "share": 7.093468845444979e-05
+  },
+  {
+   "kernel": "bsub_bf16",
+   "grid": [
+    12,
+    1,
+    1
+   ],
+   "block": [
+    1024,
+    1,
+    1
+   ],
+   "launches_per_step": 1.0,
+   "us_per_step": 2.371008,
+   "share": 5.720216263125161e-05
+  },
+  {
+   "kernel": "affine_bf16",
+   "grid": [
+    12,
+    1,
+    1
+   ],
+   "block": [
+    1024,
+    1,
+    1
+   ],
+   "launches_per_step": 1.0,
+   "us_per_step": 2.116158,
+   "share": 5.105373498082847e-05
+  },
+  {
+   "kernel": "bminimum_f32",
+   "grid": [
+    1,
+    1,
+    1
+   ],
+   "block": [
+    1024,
+    1,
+    1
+   ],
+   "launches_per_step": 1.0,
+   "us_per_step": 2.03174,
+   "share": 4.90170939551529e-05
+  },
+  {
+   "kernel": "bdiv_f32",
+   "grid": [
+    1,
+    1,
+    1
+   ],
+   "block": [
+    1024,
+    1,
+    1
+   ],
+   "launches_per_step": 1.0,
+   "us_per_step": 1.8970879999999999,
+   "share": 4.5768523894392535e-05
+  },
+  {
+   "kernel": "usqrt_f32",
+   "grid": [
+    1,
+    1,
+    1
+   ],
+   "block": [
+    1024,
+    1,
+    1
+   ],
+   "launches_per_step": 1.0,
+   "us_per_step": 1.6827480000000001,
+   "share": 4.05974272391377e-05
+  },
+  {
+   "kernel": "affine_f32",
+   "grid": [
+    1,
+    1,
+    1
+   ],
+   "block": [
+    1024,
+    1,
+    1
+   ],
+   "launches_per_step": 1.0,
+   "us_per_step": 1.618876,
+   "share": 3.9056472281759524e-05
+  },
+  {
+   "kernel": "const_set_bf16",
+   "grid": [
+    1,
+    1,
+    1
+   ],
+   "block": [
+    1024,
+    1,
+    1
+   ],
+   "launches_per_step": 1.0,
+   "us_per_step": 1.5302360000000002,
+   "share": 3.6917972666560365e-05
+  },
+  {
+   "kernel": "const_set_f32",
+   "grid": [
+    1,
+    1,
+    1
+   ],
+   "block": [
+    1024,
+    1,
+    1
+   ],
+   "launches_per_step": 1.0,
+   "us_per_step": 1.473792,
+   "share": 3.555622320491436e-05
+  }
+ ],
+ "excluded_from_chain_attribution": false,
+ "fixed_cost_buckets": 27,
+ "fixed_cost_time_us": 17.451,
+ "fixed_cost_jitter_max_rel": 0.012276785714285714,
+ "wall_s_per_step": 0.096548202412
+}

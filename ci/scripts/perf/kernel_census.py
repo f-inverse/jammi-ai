@@ -313,7 +313,14 @@ fails finiteness (either `wall_a`/`wall_b`, when given) or
 `wall_b > wall_a > 0` (leg INVALID); 8 = a sqlite export is
 corrupt/unreadable (`sqlite3.DatabaseError`); 9 = the differenced census
 is EMPTY -- zero kernel buckets carried a positive launch-count delta
-(leg INVALID -- not a genuine declared M>N same-workload pair).
+(leg INVALID -- not a genuine declared M>N same-workload pair); 10 = the
+kernel table is present and non-empty on one or both exports but is
+MISSING a column the PRIMARY by-kernel-and-grid SELECT requires (leg
+INVALID -- schema mismatch, not this schema's normal shape; distinct from
+exit 8, where the file itself is unreadable). Exit 10 covers only that one
+query -- a missing column on the memcpy/memset aggregate queries degrades
+to a zero count instead (see `census()`'s own memcpy/memset paragraph;
+that signal is not what this census's validity depends on).
 """
 
 from __future__ import annotations
@@ -453,6 +460,31 @@ class CensusDatabaseError(RuntimeError):
     exit code instead of an unhandled traceback. See module doc."""
 
 
+class KernelTableSchemaError(RuntimeError):
+    """Named exception for the leg-INVALID "`CUPTI_ACTIVITY_KIND_KERNEL`
+    is present and non-empty but is MISSING a column this census queries"
+    condition (`sqlite3.OperationalError: no such column: ...`) -- a
+    schema variant this module's query does not match, never a generic
+    traceback: `main()` returns a declared, distinguishable exit code
+    naming the export and the underlying sqlite error rather than
+    crashing. Distinct from `CensusDatabaseError` (a corrupt/unreadable
+    file): here the file reads fine, the table exists and has rows, but
+    its column set does not match what `census()`'s own SELECT
+    requires (e.g. an export whose `CUPTI_ACTIVITY_KIND_KERNEL` never
+    carries `demangledName` at all).
+
+    Scope: raised ONLY by the primary `CUPTI_ACTIVITY_KIND_KERNEL`
+    by-kernel-and-grid SELECT (`census()`'s own `q`) -- the ONE query this
+    census's validity actually depends on. The memcpy/memset aggregate
+    queries and the kernel-table row-count query are NOT wrapped this way:
+    a `sqlite3.OperationalError` on either of the former degrades to
+    `(0, 0)` by design (see `census()`'s own memcpy/memset paragraph --
+    that signal is not what this census's validity depends on, so a schema
+    variant lacking it is not leg-INVALID), and the row-count query names
+    no column at all, so a genuine column-schema mismatch there is not a
+    reachable shape."""
+
+
 def _has_kernel_table(con: sqlite3.Connection) -> bool:
     row = con.execute(
         "SELECT name FROM sqlite_master WHERE type='table' AND name='CUPTI_ACTIVITY_KIND_KERNEL'"
@@ -468,9 +500,14 @@ def census(path: str) -> tuple[dict, dict, tuple]:
     `CUPTI_ACTIVITY_KIND_KERNEL` table, `KernelTableEmptyError` if that
     table exists but has zero rows (checked BEFORE any further query runs
     against it, so neither condition is ever silently read as "zero
-    kernels dispatched"), or `CensusDatabaseError` if `path` cannot be read
-    as a sqlite database at all (`sqlite3.DatabaseError` -- a corrupt or
-    truncated export).
+    kernels dispatched"), `KernelTableSchemaError` if the table is present
+    and non-empty but is missing a column the PRIMARY by-kernel-and-grid
+    SELECT (`q`, below) requires (`sqlite3.OperationalError: no such
+    column: ...` -- a schema variant this module has not been written
+    against; see `KernelTableSchemaError`'s own doc for why this is scoped
+    to that one query only), or `CensusDatabaseError` if `path` cannot be
+    read as a sqlite database at all (`sqlite3.DatabaseError` -- a corrupt
+    or truncated export).
     """
     con = sqlite3.connect(path)
     try:
@@ -513,8 +550,17 @@ def census(path: str) -> tuple[dict, dict, tuple]:
                LEFT JOIN StringIds sn ON k.shortName = sn.id
                GROUP BY COALESCE(dn.value, sn.value),
                         k.gridX, k.gridY, k.gridZ, k.blockX, k.blockY, k.blockZ"""
+        try:
+            rows = cur.execute(q).fetchall()
+        except sqlite3.OperationalError as e:
+            raise KernelTableSchemaError(
+                f"{path}: CUPTI_ACTIVITY_KIND_KERNEL is missing a column this census queries "
+                f"({e}) -- leg INVALID (schema mismatch, not this schema's normal shape; "
+                "see module doc's \"Kernel identity\" paragraph for the shortName/demangledName "
+                "columns this SELECT requires)"
+            ) from e
         out: dict[tuple, tuple[int, int]] = {}
-        for raw_name, gx, gy, gz, bx, by, bz, n, ns in cur.execute(q):
+        for raw_name, gx, gy, gz, bx, by, bz, n, ns in rows:
             name = _normalize_kernel_name(raw_name)
             key = (name, gx, gy, gz, bx, by, bz)
             prev_n, prev_ns = out.get(key, (0, 0))
@@ -985,6 +1031,9 @@ def main(argv: list[str] | None = None) -> int:
     except EmptyDifferencedCensusError as e:
         print(f"::error::kernel_census: {e}", file=sys.stderr)
         return 9
+    except KernelTableSchemaError as e:
+        print(f"::error::kernel_census: {e}", file=sys.stderr)
+        return 10
     except ValueError as e:
         print(f"::error::kernel_census: {e}", file=sys.stderr)
         return 2

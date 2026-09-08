@@ -289,6 +289,21 @@ jobs:
           run_probe "$AI_IT_BIN" context_predictor::context_predictor_reload_permission_fault_is_not_a_typed_model_error
           run_probe "$AI_IT_BIN" fine_tune::finalize_reclaims_a_persistently_failed_prune_and_warns
           run_probe "$DB_LIB_BIN" store::artifact::tests::permission_fault_on_a_present_key_stays_a_transport_error
+      # golden-parity is opt-in (`crates/jammi-encoders/Cargo.toml`) so the
+      # default workspace test run above never compiles it, but it is fully
+      # hermetic: the oracle is a committed PyTorch dump
+      # (`cookbook/fixtures/htsat_clap_tiny/goldens.safetensors`, tracked
+      # binary), never a network call or a torch install. Without this step
+      # `htsat_audio.rs`'s own doc claim ("eval bytes crate-wide are pinned by
+      # ... tests/golden_parity.rs") describes a test that compiles and passes
+      # LOCALLY but that CI never runs — a doc citing a proof CI does not
+      # reproduce is exactly the drift this repo's gates exist to close. A
+      # dedicated step (not folded into the `--workspace` run above) because
+      # `golden-parity` is off by default for every OTHER crate too; passing
+      # it workspace-wide would be a silent feature-unification change this
+      # step does not need to make.
+      - name: Test jammi-encoders --features golden-parity (CPU-only, PyTorch reference committed)
+        run: cargo test -p jammi-encoders --features golden-parity --test golden_parity
 
       # Unification contract §6 F3 (round-2 audit B5): the designated
       # build-sha HERMETICITY falsifier, as a real CI step (never a
@@ -1499,13 +1514,15 @@ jobs:
           - name: citation resolver
             cmd: python3 ci/scripts/perf/check_citations.py
             fetch_depth: "0"
-          # `test_check_citations.py`'s own artifact-sha fixtures build and
-          # commit into a THROWAWAY `git init`'d temp repo (same discipline
-          # `check_cuda_run_artifacts.py --self-test` uses), so this suite
-          # needs no real history from the CI checkout itself and stays at
-          # the normal shallow default.
+          # `test_check_citations.py`'s artifact-sha fixtures build and commit
+          # into a THROWAWAY `git init`'d temp repo, but its real-contract
+          # coverage case runs the resolver over THIS checkout's epoch-pinned
+          # frozen contract, which needs the pinned sha's commit object --
+          # so this suite takes the full-history checkout too (quoted "0",
+          # same falsy-zero reasoning as above).
           - name: citation resolver suite
             cmd: python3 ci/scripts/perf/test_check_citations.py
+            fetch_depth: "0"
           # Two mechanical, grep-shaped assertions over every producer
           # script under ci/scripts/perf/ (unification contract C5.1/C5.2,
           # audit round on perf/unification-p2): (A) any `*FAKE*`-named test
@@ -1690,6 +1707,21 @@ jobs:
           # not a skip" reasoning as the other `perf/test_*.py` suites above.
           - name: perf kernel_census suite
             cmd: python3 ci/scripts/perf/test_kernel_census.py
+          # `gen_nsys_kernel_fixture.py`'s own self-test: builds both
+          # committed `n.sqlite`/`m.sqlite` counts fresh into a temp dir,
+          # asserts two independent fresh regenerations (same sqlite
+          # library) are byte-identical (the generator's OWN determinism --
+          # no RNG, no wall-clock, fixed StringIds ordering), then checks
+          # the checked-in fixtures against LOGICAL identity (schema +
+          # canonically-ordered row set, never raw bytes -- sqlite file
+          # bytes are not stable across library versions) and drives
+          # `kernel_census.build_report` directly over the committed files
+          # (mirrors `profile_421_legs.sh`'s DRY_RUN real call site) to
+          # prove they are consumer-usable, not merely regenerable -- a
+          # GATE here, not a doc note a future edit can silently
+          # invalidate.
+          - name: perf nsys kernel fixture self-test
+            cmd: python3 ci/scripts/perf/fixtures/nsys_kernel_census/gen_nsys_kernel_fixture.py --self-test
           # `convert_legacy_bert_checkpoint.py`'s own suite (#356 census
           # execution fix, defect 2): the `renamed_name` suffix-anchored
           # string logic is covered unconditionally; `convert`'s
@@ -1818,6 +1850,46 @@ jobs:
           # tree. No GPU, no `nsys`, no real checkpoint, no network.
           - name: profile_421_attribute suite
             cmd: python3 ci/scripts/perf/test_profile_421_attribute.py
+          # `profile_421_artifact.py`'s own suite (#421 close-out, contract
+          # v2.5 `## Artifacts`) — the third stage after merge/attribution:
+          # turns `--merge-json` + `--attribution-json` + a small non-numeric
+          # identity sidecar into the single committed `crates/jammi-kernels/
+          # artifacts/cuda-runs/*.json`. Six synthetic legs (the minimum that
+          # exercises every one of the four findings by leg id) drive: the
+          # `git_sha`/`box` cross-check across every leg's own `manifest.json`
+          # (never a value picked from just one), the per-tower-family
+          # checkpoint-sha256 cross-check, the merge/attribution/legs-dir
+          # leg-set-equality refusals, verbatim (not re-derived) copying of
+          # `p2`/`realized_gains`/`candidate_decisions`, and every finding's
+          # numeric `evidence` checked against an INDEPENDENT arithmetic
+          # oracle computed in the test file itself — never a value copied
+          # out of the module under test. A dedicated non-finite-input class
+          # (`NaN` in a per-step value, a launches-per-step count, or a chain
+          # share) proves the refusal fires rather than silently propagating
+          # (`NaN > c`/`NaN < c` are both `False`, so a naive `min`/`max` or
+          # threshold check would let it through). The CLI itself is driven
+          # end to end, incl. its non-zero exit on a refusal. No GPU, no
+          # `nsys`, no real checkpoint, no network, no real pod data.
+          - name: profile_421_artifact suite
+            cmd: python3 ci/scripts/perf/test_profile_421_artifact.py
+          # `profile_421_render_docs.py`'s own suite (#421 close-out,
+          # docs-ci): drives the real render functions and `main`'s
+          # write/`--check` modes against a synthetic artifact + doc fixture
+          # (never this repo's own committed close-out artifact) — a
+          # one-digit edit to a committed block must red `--check`. No GPU,
+          # no network.
+          - name: profile_421_render_docs suite
+            cmd: python3 ci/scripts/perf/test_profile_421_render_docs.py
+            fetch_depth: "0"
+          # Doc-freshness gate: `docs/plans/66-tower-profile/README.md`'s
+          # measured-towers table, candidate-port reasons, and verbatim
+          # findings must equal a fresh render of the committed close-out
+          # artifact — the same generator-and-diff shape `gen_dep_dag.py`'s
+          # own freshness check uses, applied here to a `--check` mode
+          # inside the script itself rather than an external `git diff`.
+          - name: profile_421_render_docs freshness
+            cmd: python3 ci/scripts/perf/profile_421_render_docs.py --check
+            fetch_depth: "0"
           # `lora_bias_ab_merge.py`'s own suite (#428 P2b, docs-ci): drives
           # the REAL dispatch-proof/identity/differencing/verdict functions
           # (and `main` itself, end to end, at least once) against synthetic
@@ -1834,6 +1906,129 @@ jobs:
           # no GPU, no real jammi-bench, no real checkpoint, no network.
           - name: lora_bias_ab.sh dry-run smoke
             cmd: python3 ci/scripts/perf/test_lora_bias_ab_sh_dry_run.py
+          # `frontend_ab.sh` ITSELF (issue #421 follow-on, "media front-end
+          # parallelization" contract's pre-registered base/tip A/B driver)
+          # -- the same "the shell PRODUCER itself must run in CI at least
+          # once, zero-execution is RED not a skip" doctrine the
+          # `finetune_ab.sh`/`lora_bias_ab.sh` dry-run legs above already
+          # carry. `FRONTEND_AB_DRY_RUN=1` swaps in hermetic stand-in
+          # binaries the script itself generates and validates argv
+          # against; the two real media corpus producers still run for
+          # real under DRY_RUN.
+          - name: frontend_ab.sh dry-run smoke
+            cmd: python3 ci/scripts/perf/test_frontend_ab_dry_run.py
+          # `frontend_ab_merge.py`'s own suite (extracted out of
+          # `frontend_ab.sh`'s own inline heredoc for exactly the reason
+          # `ab_merge.py`'s own suite above was: an inline heredoc had ZERO
+          # automated coverage of its own report-reading code path beyond
+          # whatever the DRY_RUN stub fabricated -- the real A/B rehearsal
+          # on pod p421b found that reader assumed a FLAT report shape when
+          # the real `jammi-bench finetune-run` report nests every field
+          # this driver reads under `tiers.finetune_run`). Drives the real
+          # `load_leg`/`build_report`/`main` entry points against fixture
+          # raw-leg directories, including a REAL, committed,
+          # envelope-trimmed cut of that same rehearsal's own
+          # `htsat__tip__r1.json` (`fixtures/frontend_ab_rehearsal/`) --
+          # never a hand-rolled dict standing in for what a real report
+          # looks like. No GPU, no real jammi-bench, no network.
+          - name: frontend_ab_merge suite
+            cmd: python3 ci/scripts/perf/test_frontend_ab_merge.py
+          # `frontend_ab_artifact.py`'s own suite (#421 follow-on close-out,
+          # contract `perf/421-frontend` v3 "Build" item 1) -- the SECOND,
+          # INDEPENDENT reader after `frontend_ab_merge.py`: enumerates
+          # `--raw-dir` itself and refuses BY NAME unless its own leg set
+          # (and `--report-json`'s own `towers` object) equals EXACTLY
+          # TOWERS x ROLES x {r1..r<repeats>} in BOTH directions (an extra
+          # leg left over from a stale re-run, or a missing one, before a
+          # single number is read), then re-derives every leg's own
+          # `front_per_step`/`train_per_step` and the HTSAT bar's own
+          # `p`/`ideal`/bounds/`ratio`/`ratio_lo`/`ratio_hi`/`verdict`
+          # DIRECTLY from the raw legs (never imports `frontend_ab_merge.py`'s
+          # own bar arithmetic -- a second, independent implementation of the
+          # SAME pinned formula), refusing the moment any re-derived number
+          # disagrees with `report.json`'s own value, the per-leg
+          # `task`/`device_name` disagree with the tower/box being read, `r`
+          # (read from `report.json` and from a committed `--serial-tail`
+          # fixture, never a CLI float) falls outside its own `[0, 1)`
+          # domain, a would-be divisor is zero/non-positive, or the
+          # driver-default vs the run's own measured serial-tail ratio
+          # disagree on the bar's own verdict (the "verdict invariant" this
+          # contract names is a checked equality here, not prose). A `git
+          # init`'d tempdir repo (mirroring `check_cuda_run_artifacts.py`'s
+          # own self-test discipline) drives the "files changed after the
+          # measured tip" deviation: it is RECORDED mechanically regardless
+          # of whether the changed files sit on this unit's own hot path --
+          # never a refusal (a file diff alone cannot judge whether an edit
+          # changed timed behaviour; that judgement lives in `--identity`'s
+          # own reviewed commentary, attached alongside the mechanical list).
+          # Every numeric field is checked against an INDEPENDENT third
+          # arithmetic oracle written in the test file itself. A dedicated
+          # regression class drives the REAL, committed pod-p421c fixture
+          # (`fixtures/frontend_ab_final/`) end to end against this
+          # checkout's own git history -- both ancestry (`base_sha`/
+          # `tip_sha` must be reachable) and the post-tip diff need real
+          # history, hence `fetch_depth: "0"` below, the same exception the
+          # "CUDA run artifact schema"/"pod build timings" legs already
+          # carry. `JAMMI_CI_FRONTEND_AB_FINAL_FIXTURE_EXPECTED=1` (this
+          # repo's own zero-execution-is-RED doctrine, the
+          # `JAMMI_CI_SAFETENSORS_EXPECTED` precedent above) turns that
+          # regression class's own two "not applicable here" skips (fixture
+          # directory absent; history missing the fixture's shas) into a
+          # hard RED in CI, so the real-fixture class actually executes
+          # every run rather than silently re-skipping if the fixture is
+          # ever deleted or `fetch_depth: "0"` is ever dropped. The
+          # committed-record freshness gate (`assert_committed_artifact_not_
+          # stale`) is split into two arms: arm (a) is HEAD-independent (it
+          # checks the record against the artifact file's own last commit
+          # and that commit's own parent, via git plumbing, never against
+          # whatever this checkout's own HEAD happens to be -- so it is
+          # unaffected by `refs/pull/N/merge`'s own synthetic merge commit,
+          # or by later, unrelated commits on `main`); arm (b) additionally
+          # engages once `resolve_unit_head_sha` (in the test file itself)
+          # normalises `JAMMI_CI_UNIT_HEAD_SHA` -- set here to this PR's own
+          # head sha on a `pull_request`/`pull_request_target` checkout,
+          # falling back to the literal `push` on a `push` checkout, never
+          # empty on either. `resolve_unit_head_sha` also cross-checks the
+          # resolved value against `GITHUB_EVENT_NAME` (a GitHub Actions
+          # built-in already present on this job, no extra wiring needed):
+          # the `push` sentinel on a `pull_request`/`pull_request_target`
+          # event, or any non-sentinel value on a `push` event, is a named
+          # refusal citing both variables, never silently resolved. Past
+          # that cross-check the raw value normalises into either a
+          # resolved sha (arm (b) engages: the artifact's own last commit
+          # must equal it, so ANY later commit on the PR, whether or not it
+          # touches a file the record already names, reds named, rather
+          # than only the subset arm (a) alone can see) or `None` (the
+          # `push` sentinel; arm (a) alone applies, recorded via a printed
+          # notice in the test's own stdout). No GPU, no network.
+          - name: frontend_ab_artifact suite
+            cmd: JAMMI_CI_FRONTEND_AB_FINAL_FIXTURE_EXPECTED=1 JAMMI_CI_UNIT_HEAD_SHA=${{ github.event.pull_request.head.sha || 'push' }} python3 ci/scripts/perf/test_frontend_ab_artifact.py
+            fetch_depth: "0"
+          # `fa2_ab.sh`'s own shape test: the shell PRODUCER is a manual,
+          # exclusive-timing-box script with hardcoded `/root/...` paths
+          # and no `DRY_RUN` support at all, so this covers its flash/block
+          # leg LABELING shape specifically -- a narrower and DIFFERENT
+          # property than `check_producer_provenance_gates.py`'s own
+          # producer-parity check (that check covers fa2_ab.sh's
+          # provenance/build_sha cross-check; see that script's own module
+          # doc), never a claim of the same coverage restated here. The
+          # per-(shape,leg,repeat) step body fa2_ab.sh's sweep loop calls
+          # lives in `fa2_ab_leg.sh` (`fa2_ab_run_leg`), sourced by
+          # `fa2_ab.sh`; this greps the COMMITTED command-array text of
+          # both files for both `finetune-step` legs (the block leg must
+          # name its own disable key back via
+          # `--expect-kernels-disabled "$disable_key"`, and the flash leg
+          # must pass `--expect-kernels-disabled ""` — an exact-set-equality
+          # guard against an ambient `JAMMI_KERNELS_DISABLE` leaking into
+          # the "flash" leg from the calling shell), plus a `bash -n` parse
+          # check and a `shellcheck -S warning` pass on both files, plus a
+          # REAL execution: it `source`s the ACTUAL `fa2_ab_leg.sh` (never a
+          # hand-written stand-in of it) against a stub `finetune-step`
+          # replacement that succeeds once and then fails, and asserts the
+          # SOURCED function's own `overall_rc` moves from 0 to 1. No GPU,
+          # no network, no `/root` path ever touched.
+          - name: fa2_ab.sh shape
+            cmd: python3 ci/scripts/perf/test_fa2_ab_sh.py
     steps:
       - uses: actions/checkout@v4
         with:

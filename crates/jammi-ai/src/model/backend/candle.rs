@@ -2099,11 +2099,21 @@ impl CandleModel {
         let mut valid_indices = Vec::new();
         let mut valid_images = Vec::new();
 
-        for (i, img) in images.iter().enumerate() {
+        // A corrupt row's decode failure marks only THAT row's status; the
+        // rest of the batch still embeds (`docs/guide/src/generate-image-embeddings.md`'s
+        // documented per-row `_status`/`_error` contract) — unlike the
+        // trainer's `decode_image_batch`, which hard-fails a whole training
+        // step on its lowest-index error (a corrupt training item is a
+        // refusal, not a row to skip).
+        for (i, img) in images.into_iter().enumerate() {
             match img {
-                Some(im) => {
+                Some(Ok(im)) => {
                     valid_indices.push(i);
-                    valid_images.push(im.clone());
+                    valid_images.push(im);
+                }
+                Some(Err(e)) => {
+                    row_status[i] = false;
+                    row_errors[i] = e.to_string();
                 }
                 None => {
                     row_status[i] = false;
@@ -2119,7 +2129,12 @@ impl CandleModel {
             let target_size = vision.image_size() as u32;
             let mean = vision.preprocess_mean();
             let std = vision.preprocess_std();
-            let pixel_values = image_preprocess::preprocess_image_batch(
+            // Arrow-row-numbered: `valid_indices[k]` IS the Arrow row of
+            // `valid_images[k]` (built by the loop above from the
+            // null-compacted `images`), so any per-row preprocessing error
+            // names the caller's row, not this function's local position.
+            let pixel_values = image_preprocess::preprocess_image_batch_indexed(
+                &valid_indices,
                 &valid_images,
                 target_size,
                 &mean,
@@ -2183,11 +2198,19 @@ impl CandleModel {
         let mut valid_indices = Vec::new();
         let mut valid_clips = Vec::new();
 
+        // A corrupt row's decode failure marks only THAT row's status; the
+        // rest of the batch still embeds (mirroring `forward_image_embedding`'s
+        // per-row contract) — unlike the trainer's `decode_audio_batch`,
+        // which hard-fails a whole training step on its lowest-index error.
         for (i, clip) in clips.into_iter().enumerate() {
             match clip {
-                Some(c) => {
+                Some(Ok(c)) => {
                     valid_indices.push(i);
                     valid_clips.push(c);
+                }
+                Some(Err(e)) => {
+                    row_status[i] = false;
+                    row_errors[i] = e.to_string();
                 }
                 None => {
                     row_status[i] = false;
@@ -2216,8 +2239,16 @@ impl CandleModel {
             // (deterministic always-fusion) so every clip runs the AFF path,
             // reproducing HF's canonical get_audio_features embedding; the tower
             // gates fusion per sample, so it still honors a false flag if passed.
-            let (input_features, is_longer) =
-                audio_preprocess::preprocess_clap_fusion(&valid_clips, frontend, &self.device)?;
+            // Arrow-row-numbered: `valid_indices[k]` IS the Arrow row of
+            // `valid_clips[k]` (built by the loop above from the
+            // null-compacted `clips`), so any per-row preprocessing error
+            // names the caller's row, not this function's local position.
+            let (input_features, is_longer) = audio_preprocess::preprocess_clap_fusion_indexed(
+                &valid_indices,
+                &valid_clips,
+                frontend,
+                &self.device,
+            )?;
 
             // The CLAP audio tower emits L2-normalized embeddings directly
             // (like the text tower), so no further normalization is applied —
@@ -2286,12 +2317,17 @@ impl CandleModel {
         let num_rows = texts.len();
 
         if num_rows == 0 {
+            // The float head is one confidence score per row (width 1), the
+            // truthful shape for `all_confidences` below — never `(rows, 0)`,
+            // which `BackendOutput`'s row-major invariant reserves for "no
+            // embedding" (`ClassificationAdapter` does not read `shapes` at
+            // all, but the shape must still describe the head it labels).
             return Ok(BackendOutput {
                 float_outputs: vec![vec![]],
                 string_outputs: vec![vec![], vec![]],
                 row_status: vec![],
                 row_errors: vec![],
-                shapes: vec![(0, 0)],
+                shapes: vec![(0, 1)],
             });
         }
 
@@ -2381,7 +2417,9 @@ impl CandleModel {
             string_outputs: vec![all_labels, all_scores_json],
             row_status,
             row_errors,
-            shapes: vec![(num_rows, 0)],
+            // Width 1: one confidence score per row (see the empty-batch arm
+            // above for why this is `1`, never `0`).
+            shapes: vec![(num_rows, 1)],
         })
     }
 
@@ -2398,12 +2436,16 @@ impl CandleModel {
         let num_rows = texts.len();
 
         if num_rows == 0 {
+            // NER carries no float head at all (entities are serialized as
+            // JSON strings below) — `shapes` stays empty to match, rather
+            // than claiming a phantom `(rows, 0)` float-embedding shape for
+            // a head that does not exist.
             return Ok(BackendOutput {
                 float_outputs: vec![],
                 string_outputs: vec![vec![]],
                 row_status: vec![],
                 row_errors: vec![],
-                shapes: vec![(0, 0)],
+                shapes: vec![],
             });
         }
 
@@ -2502,7 +2544,10 @@ impl CandleModel {
             string_outputs: vec![all_entities_json],
             row_status,
             row_errors,
-            shapes: vec![(num_rows, 0)],
+            // No float head (see the empty-batch arm above): `shapes` stays
+            // empty rather than describing a `float_outputs[0]` that has no
+            // element 0.
+            shapes: vec![],
         })
     }
 }
@@ -3439,7 +3484,7 @@ fn clap_frontend_from_preprocessor(
             .and_then(|v| v.as_f64())
             .ok_or_else(|| JammiError::Inference(format!("missing numeric field '{key}'")))
     };
-    Ok(audio_preprocess::ClapFrontendConfig {
+    let config = audio_preprocess::ClapFrontendConfig {
         n_mels: u("feature_size")? as usize,
         sample_rate: u("sampling_rate")? as u32,
         fft_window_size: u("fft_window_size")? as usize,
@@ -3447,7 +3492,93 @@ fn clap_frontend_from_preprocessor(
         frequency_min: f("frequency_min")?,
         frequency_max: f("frequency_max")?,
         max_length_s: u("max_length_s")? as u32,
-    })
+    };
+    // Validate the whole numeric domain HERE, at the parse edge, so a
+    // malformed `preprocessor_config.json` is a typed refusal at load time —
+    // never a panic or a silently wrong shape reached later, deep inside the
+    // fusion transform (see `ClapFrontendConfig::validate`'s doc for exactly
+    // which edge each field guards).
+    config.validate()?;
+    Ok(config)
+}
+
+/// `clap_frontend_from_preprocessor`'s PARSE-edge domain validation: a
+/// malformed `preprocessor_config.json` numeric must be a typed refusal
+/// right here, at parse time, never a panic or a silently wrong shape
+/// reached later inside the fusion transform.
+#[cfg(test)]
+mod clap_frontend_parse_validation_tests {
+    use super::*;
+
+    fn real_htsat_clap_preprocessor_config() -> serde_json::Value {
+        // Mirrors `cookbook/fixtures/htsat_clap_tiny/preprocessor_config.json`.
+        serde_json::json!({
+            "feature_extractor_type": "ClapFeatureExtractor",
+            "feature_size": 32,
+            "sampling_rate": 48000,
+            "hop_length": 577,
+            "fft_window_size": 1024,
+            "frequency_min": 50.0,
+            "frequency_max": 14000.0,
+            "max_length_s": 6,
+            "padding": "repeatpad",
+            "truncation": "fusion",
+        })
+    }
+
+    #[test]
+    fn parses_the_real_htsat_clap_config() {
+        let prep = real_htsat_clap_preprocessor_config();
+        assert!(clap_frontend_from_preprocessor(&prep).is_ok());
+    }
+
+    #[test]
+    fn rejects_zero_hop_length_at_parse_time() {
+        let mut prep = real_htsat_clap_preprocessor_config();
+        prep["hop_length"] = serde_json::json!(0);
+        let err = clap_frontend_from_preprocessor(&prep).unwrap_err();
+        assert!(err.to_string().contains("hop_length"));
+    }
+
+    #[test]
+    fn rejects_zero_sampling_rate_at_parse_time() {
+        let mut prep = real_htsat_clap_preprocessor_config();
+        prep["sampling_rate"] = serde_json::json!(0);
+        let err = clap_frontend_from_preprocessor(&prep).unwrap_err();
+        assert!(err.to_string().contains("sample_rate"));
+    }
+
+    #[test]
+    fn rejects_zero_max_length_s_at_parse_time() {
+        let mut prep = real_htsat_clap_preprocessor_config();
+        prep["max_length_s"] = serde_json::json!(0);
+        let err = clap_frontend_from_preprocessor(&prep).unwrap_err();
+        assert!(err.to_string().contains("max_length_s"));
+    }
+
+    #[test]
+    fn rejects_zero_feature_size_at_parse_time() {
+        let mut prep = real_htsat_clap_preprocessor_config();
+        prep["feature_size"] = serde_json::json!(0);
+        let err = clap_frontend_from_preprocessor(&prep).unwrap_err();
+        assert!(err.to_string().contains("n_mels"));
+    }
+
+    #[test]
+    fn rejects_non_power_of_two_fft_window_size_at_parse_time() {
+        let mut prep = real_htsat_clap_preprocessor_config();
+        prep["fft_window_size"] = serde_json::json!(1000);
+        let err = clap_frontend_from_preprocessor(&prep).unwrap_err();
+        assert!(err.to_string().contains("fft_window_size"));
+    }
+
+    #[test]
+    fn rejects_frequency_max_past_nyquist_at_parse_time() {
+        let mut prep = real_htsat_clap_preprocessor_config();
+        prep["frequency_max"] = serde_json::json!(30000.0); // > 48_000 / 2
+        let err = clap_frontend_from_preprocessor(&prep).unwrap_err();
+        assert!(err.to_string().contains("Nyquist"));
+    }
 }
 
 /// Convert token ID vectors into a candle Tensor on the given device.
@@ -4530,6 +4661,20 @@ mod ner_nonfinite_logit_tests {
             output.row_status.iter().all(|&ok| ok),
             "expected every row to decode successfully, got row_status {:?}",
             output.row_status
+        );
+        // NER carries no float head at all
+        // (entities are serialized as JSON strings) — `float_outputs` and
+        // `shapes` must both stay empty, never claim a phantom `(rows, 0)`
+        // float-embedding shape for a head that does not exist.
+        assert!(
+            output.float_outputs.is_empty(),
+            "NER has no float head, got {:?}",
+            output.float_outputs
+        );
+        assert!(
+            output.shapes.is_empty(),
+            "NER's shapes must stay empty to match its absent float head, got {:?}",
+            output.shapes
         );
     }
 }
@@ -5872,7 +6017,22 @@ mod r5_f2_classification_pooling_tests {
         let content = two_row_content();
         let result = loaded.forward(&content, ModelTask::Classification);
         match result {
-            Ok(_) => {}
+            Ok(out) => {
+                // The float head is one
+                // confidence score per row — `shapes[0] = (rows, 1)`, never
+                // `(rows, 0)` (the shape `BackendOutput`'s doc reserves for
+                // "no embedding", which classification's confidence head is
+                // not).
+                assert_eq!(
+                    out.shapes,
+                    vec![(2, 1)],
+                    "classification's float head must describe itself truthfully: one \
+                     confidence score per row, got {:?}",
+                    out.shapes
+                );
+                assert_eq!(out.float_outputs.len(), 1);
+                assert_eq!(out.float_outputs[0].len(), 2);
+            }
             Err(e) => panic!(
                 "the classification wrapper's OWN task must still serve \
                  successfully — the fix refuses the TextEmbedding MISMATCH, \

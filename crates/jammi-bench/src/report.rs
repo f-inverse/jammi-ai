@@ -2351,6 +2351,24 @@ pub struct FinetuneRunTier {
     /// measured step count computed a different amount of work by that
     /// tier's own design.
     pub steps_measured: usize,
+    /// The media front-end's rayon GLOBAL pool size —
+    /// [`jammi_ai::fine_tune::media_front_end_pool_threads`]'s own reading of
+    /// `rayon::current_num_threads()` — the pool SIZE this process's decode
+    /// and preprocess stages parallelized across, NOT the (emergent, chunk-
+    /// count-bounded) number of threads that actually ran work on any given
+    /// batch (issue #421 follow-on, "media front-end parallelization"
+    /// contract §B). PROVENANCE, not identity, for the same reason
+    /// `device_name`/`build_features` are: it is a fact about the MACHINE
+    /// and BUILD this run executed on, never a determinant of what the held-
+    /// out loss itself computes — two legs agreeing on every identity field
+    /// but disagreeing here measured the identical model on differently-
+    /// provisioned hardware. `null` on no leg: the pool exists on every
+    /// build this crate makes (`rayon` is a `jammi-ai` dependency behind
+    /// its `local` feature, which `jammi-bench` requires — contract §A), so
+    /// this is `NonNull` on text legs too, even though text has no media
+    /// front end to parallelize — it states the pool's SIZE, not whether
+    /// this run's front end used it.
+    pub rayon_pool_threads: usize,
 
     // ── Fused-dispatch proof (unit 63 re-audit round-2 finding 2) ───────
     //
@@ -2706,7 +2724,13 @@ impl FinetuneRunTier {
     /// claim in exactly `arm`'s sense — see that field's own doc. Grew
     /// 11 -> 12 with `fusible_site_census` (issue #421 §D4 item 1), a
     /// STRUCTURAL property of the build in `batched_forward`'s sense —
-    /// again, see that field's own doc.
+    /// again, see that field's own doc. Grew 12 -> 13 with
+    /// `rayon_pool_threads` (issue #421 follow-on, "media front-end
+    /// parallelization" contract §B), a MACHINE/BUILD fact in
+    /// `device_name`'s sense — see that field's own doc.
+    /// `ci/scripts/perf/identity_fields.py`'s
+    /// `test_identity_fields_subset.py` pins this count at 13 (docs-ci
+    /// domain).
     pub const PROVENANCE_FIELDS: &'static [(&'static str, Nullable)] = &[
         ("arm", Nullable::NonNull),
         ("device_name", Nullable::NonNull),
@@ -2727,6 +2751,11 @@ impl FinetuneRunTier {
         ("split_rule", Nullable::NonNull),
         ("batched_forward", Nullable::NonNull),
         ("steps_measured", Nullable::NonNull),
+        // Issue #421 follow-on ("media front-end parallelization" contract
+        // §B): the rayon GLOBAL pool size this run's process executed
+        // under. Machine/build provenance, never identity — see
+        // `Self::rayon_pool_threads`'s own doc.
+        ("rayon_pool_threads", Nullable::NonNull),
     ];
 }
 
@@ -3707,6 +3736,7 @@ mod tests {
             split_rule: "positional_fraction_split".to_string(),
             batched_forward: true,
             steps_measured: 3,
+            rayon_pool_threads: 1,
             ln_fused_dispatches: 0,
             ln_eager_dispatches: 0,
             rope_fused_dispatches: 0,
@@ -3863,10 +3893,12 @@ mod tests {
     /// the three unit-63 finding-5(c)/advisory-(d) reclassifications
     /// (`split_rule`, `batched_forward`, `steps_measured`) = 10, plus
     /// `kernels_disabled_expected` (issue #421 P1-b(i)) = 11, plus
-    /// `fusible_site_census` (issue #421 §D4 item 1) = 12.
+    /// `fusible_site_census` (issue #421 §D4 item 1) = 12, plus
+    /// `rayon_pool_threads` (issue #421 follow-on, "media front-end
+    /// parallelization" contract §B) = 13.
     #[test]
-    fn finetune_run_tier_provenance_fields_cardinality_is_12() {
-        assert_eq!(FinetuneRunTier::PROVENANCE_FIELDS.len(), 12);
+    fn finetune_run_tier_provenance_fields_cardinality_is_13() {
+        assert_eq!(FinetuneRunTier::PROVENANCE_FIELDS.len(), 13);
         assert!(
             FinetuneRunTier::PROVENANCE_FIELDS
                 .iter()
@@ -3886,6 +3918,19 @@ mod tests {
                 .iter()
                 .any(|(name, _)| *name == "fusible_site_census"),
             "naming fusible_site_census on IDENTITY_FIELDS would add a comparison key that              cannot differ between two legs whose identity already matches"
+        );
+        assert!(
+            FinetuneRunTier::PROVENANCE_FIELDS
+                .iter()
+                .any(|(name, nullable)| *name == "rayon_pool_threads"
+                    && *nullable == Nullable::NonNull),
+            "rayon_pool_threads is a MACHINE/BUILD fact (device_name's class) — provenance,              never identity, and never a measurement"
+        );
+        assert!(
+            !FinetuneRunTier::IDENTITY_FIELDS
+                .iter()
+                .any(|(name, _)| *name == "rayon_pool_threads"),
+            "naming rayon_pool_threads on IDENTITY_FIELDS would make two legs on differently-              provisioned hardware incomparable even when every real determinant matches"
         );
     }
 

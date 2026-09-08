@@ -1,0 +1,128 @@
+{
+  "base_sha": "c1b0b0bad1f79a4ad6c298400e6ea19cc1ca633c",
+  "box": "NVIDIA A100 80GB PCIe, 570.172.08, 51a25f682a8d",
+  "clip_vision_report_only": {
+    "front_base_mean_s": 0.02927647834,
+    "front_tip_mean_s": 0.007824292573333334,
+    "ratio": 0.2672552512111105
+  },
+  "dry_run": false,
+  "htsat_bar": {
+    "front_base_mean_s": 1.3351956917366667,
+    "front_tip_mean_s": 0.10798040549666665,
+    "ideal": 24.0,
+    "lower_bound": 0.04482916666666666,
+    "n": 24,
+    "p": 26,
+    "r": 0.0033,
+    "ratio": 0.08087234415519896,
+    "ratio_hi": 0.08706991460176744,
+    "ratio_lo": 0.07718245157620775,
+    "upper_bound": 0.08635833333333333,
+    "verdict": "UNRESOLVED"
+  },
+  "n_items_per_step": 24,
+  "repeats": 3,
+  "serial_tail_ratio": 0.0033,
+  "status": "GREEN",
+  "tip_sha": "0a8562c4ff6205a69150580ff70a8cd098a9ebba",
+  "tool": "frontend_ab.sh",
+  "towers": {
+    "clip-vision": {
+      "base": {
+        "r1": {
+          "front_per_step": 0.024169105330000003,
+          "outcome": "OK",
+          "rayon_pool_threads": null,
+          "steps_measured": 100,
+          "train_per_step": 0.07682129577999999
+        },
+        "r2": {
+          "front_per_step": 0.03891253023,
+          "outcome": "OK",
+          "rayon_pool_threads": null,
+          "steps_measured": 100,
+          "train_per_step": 0.10723816097
+        },
+        "r3": {
+          "front_per_step": 0.02474779946,
+          "outcome": "OK",
+          "rayon_pool_threads": null,
+          "steps_measured": 100,
+          "train_per_step": 0.07938794017
+        }
+      },
+      "tip": {
+        "r1": {
+          "front_per_step": 0.007772863330000001,
+          "outcome": "OK",
+          "rayon_pool_threads": 26,
+          "steps_measured": 100,
+          "train_per_step": 0.06227709375
+        },
+        "r2": {
+          "front_per_step": 0.00842913762,
+          "outcome": "OK",
+          "rayon_pool_threads": 26,
+          "steps_measured": 100,
+          "train_per_step": 0.0709237139
+        },
+        "r3": {
+          "front_per_step": 0.00727087677,
+          "outcome": "OK",
+          "rayon_pool_threads": 26,
+          "steps_measured": 100,
+          "train_per_step": 0.06207345545
+        }
+      }
+    },
+    "htsat": {
+      "base": {
+        "r1": {
+          "front_per_step": 1.32944626602,
+          "outcome": "OK",
+          "rayon_pool_threads": null,
+          "steps_measured": 100,
+          "train_per_step": 1.55996878124
+        },
+        "r2": {
+          "front_per_step": 1.3440204546699999,
+          "outcome": "OK",
+          "rayon_pool_threads": null,
+          "steps_measured": 100,
+          "train_per_step": 1.5767245209699998
+        },
+        "r3": {
+          "front_per_step": 1.33212035452,
+          "outcome": "OK",
+          "rayon_pool_threads": null,
+          "steps_measured": 100,
+          "train_per_step": 1.56453491759
+        }
+      },
+      "tip": {
+        "r1": {
+          "front_per_step": 0.10445164997999999,
+          "outcome": "OK",
+          "rayon_pool_threads": 26,
+          "steps_measured": 100,
+          "train_per_step": 0.34004634169
+        },
+        "r2": {
+          "front_per_step": 0.10373479365999999,
+          "outcome": "OK",
+          "rayon_pool_threads": 26,
+          "steps_measured": 100,
+          "train_per_step": 0.33204042435
+        },
+        "r3": {
+          "front_per_step": 0.11575477284999999,
+          "outcome": "OK",
+          "rayon_pool_threads": 26,
+          "steps_measured": 100,
+          "train_per_step": 0.36116788348999995
+        }
+      }
+    }
+  }
+}

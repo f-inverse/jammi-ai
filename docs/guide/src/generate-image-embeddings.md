@@ -130,4 +130,4 @@ results = db.search("figures", query=vector, k=10)  # pyarrow.Table
 |-----------|-----------|----------|
 | Valid image | `"ok"` | null |
 | Null image | `"error"` | `"Null or missing image input"` |
-| Corrupt image | `"error"` | `"Failed to decode image at row N: ..."` |
+| Corrupt image | `"error"` | `"Failed to decode image at row N: ..."` (path-valued rows append `(path '...')` after the cause) |

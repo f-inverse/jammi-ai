@@ -20,6 +20,7 @@ use std::io::Cursor;
 
 use candle_core::{Device, Tensor};
 use jammi_db::error::{JammiError, Result};
+use rayon::prelude::*;
 use symphonia::core::audio::SampleBuffer;
 use symphonia::core::codecs::DecoderOptions;
 use symphonia::core::formats::FormatOptions;
@@ -28,6 +29,7 @@ use symphonia::core::meta::MetadataOptions;
 use symphonia::core::probe::Hint;
 
 /// Decoded mono PCM plus its native sample rate.
+#[derive(Debug)]
 pub struct DecodedAudio {
     /// Mono PCM samples in `[-1.0, 1.0]` (multi-channel sources are averaged).
     pub samples: Vec<f32>,
@@ -131,6 +133,125 @@ pub fn decode_audio_bytes(bytes: &[u8]) -> Result<DecodedAudio> {
     })
 }
 
+/// Decode a batch of encoded audio byte buffers to mono PCM in PARALLEL,
+/// across whichever rayon pool the call runs under (its global pool in
+/// production; candle installs no private pool of its own, so this is the
+/// one pool the process ever schedules media-batch work on).
+///
+/// Used by `fine_tune::trainer`'s `audio_encoder_input`, whose items are
+/// already the row space the caller wants reported (no compaction ever
+/// happens ahead of it — every `MediaTriplet` blob is present by
+/// construction), so this thin wrapper reports positions `0..items.len()`
+/// via [`decode_audio_batch_indexed`]. A caller that compacts rows first
+/// (dropping nulls before decoding, as [`super::arrow_to_audio`] and
+/// `CandleBackend::forward_audio_embedding` both do) must call
+/// [`decode_audio_batch_indexed`] directly with the ORIGINAL row ids, or
+/// every error message after the first null row reports the wrong (compacted)
+/// position instead of the caller's row.
+pub fn decode_audio_batch<T>(items: &[T]) -> Result<Vec<DecodedAudio>>
+where
+    T: AsRef<[u8]> + Sync,
+{
+    let row_ids: Vec<usize> = (0..items.len()).collect();
+    decode_audio_batch_indexed(&row_ids, items)
+}
+
+/// [`decode_audio_batch`], reporting `row_ids[i]` (not the position `i`) in
+/// every error — for a caller that has already compacted its batch (dropped
+/// null rows) before decoding, so the position in `items` and the row the
+/// caller (and its own caller, in turn) means by "row N" have diverged.
+/// `row_ids.len()` must equal `items.len()`.
+///
+/// One decode task per item — chunk count is `items.len()`, no thread-count
+/// knob, so the effective parallelism is `min(pool_size, items.len())`,
+/// emergent from whichever pool is installed.
+///
+/// Errors are collected per row and the LOWEST-INDEX failing row is the one
+/// surfaced, with a row-indexed message — the same selection the pre-unit
+/// sequential decode loop made by construction (it returned on the first
+/// failure it walked into, in row order).
+pub fn decode_audio_batch_indexed<T>(row_ids: &[usize], items: &[T]) -> Result<Vec<DecodedAudio>>
+where
+    T: AsRef<[u8]> + Sync,
+{
+    crate::inference::lowest_index_result(decode_audio_results(row_ids, items)?)
+}
+
+/// [`decode_audio_batch_indexed`]'s per-row outcomes, WITHOUT collapsing to
+/// the lowest-index failure — for a caller (serving's `arrow_to_audio`) that
+/// marks each row's OWN status rather than refusing the whole batch because
+/// one row's bytes were corrupt. Every element is independently `Ok` or a
+/// row-indexed `Err`, in the same order as `items`/`row_ids`.
+pub fn decode_audio_batch_per_row_indexed<T>(
+    row_ids: &[usize],
+    items: &[T],
+) -> Result<Vec<Result<DecodedAudio>>>
+where
+    T: AsRef<[u8]> + Sync,
+{
+    decode_audio_results(row_ids, items)
+}
+
+/// The parallel per-row decode shared by [`decode_audio_batch_indexed`] and
+/// [`decode_audio_batch_per_row_indexed`] — the only difference between the
+/// two public entry points is whether the caller wants ALL per-row outcomes
+/// or just the lowest-index failure.
+///
+/// `row_ids.len() != items.len()` is a typed error, not a `debug_assert!`: in
+/// a release build a `debug_assert!` compiles out, and `.zip()` silently
+/// truncates to the SHORTER of the two slices — a short `row_ids` would then
+/// return zero outcomes for every item past its length, not an error.
+fn decode_audio_results<T>(row_ids: &[usize], items: &[T]) -> Result<Vec<Result<DecodedAudio>>>
+where
+    T: AsRef<[u8]> + Sync,
+{
+    if row_ids.len() != items.len() {
+        return Err(JammiError::Inference(format!(
+            "decode_audio: row_ids has {} entries, expected one per item ({})",
+            row_ids.len(),
+            items.len()
+        )));
+    }
+    Ok(items
+        .par_iter()
+        .zip(row_ids.par_iter())
+        .map(|(item, &row)| {
+            decode_audio_bytes(item.as_ref()).map_err(|e| {
+                JammiError::Inference(format!("Failed to decode audio at row {row}: {e}"))
+            })
+        })
+        .collect())
+}
+
+/// The sample count [`resample_linear`] produces for `len` input samples
+/// resampled from `from_rate` to `to_rate`, WITHOUT doing the resample —
+/// shared by [`resample_linear`] itself and by
+/// [`preprocess_clap_fusion_indexed`]'s pre-check, which needs this exact
+/// arithmetic to refuse a clip that would round to zero output samples
+/// BEFORE the parallel per-clip stage ever runs `repeatpad` on it (a
+/// zero-length `repeatpad` input is an integer-division-by-zero panic:
+/// `max_length / len` with `len == 0`).
+///
+/// `from_rate == 0` is a degenerate source rate a `DecodedAudio` should never
+/// carry (its own decoder refuses one), but this function has no `Result` to
+/// refuse through, so it treats a zero `from_rate` as producing zero output
+/// samples rather than dividing by it: `to_rate as f64 / 0.0` is `+inf`, and
+/// `(len as f64 * inf).round() as usize` saturates to `usize::MAX` — a huge,
+/// confidently wrong length that then feeds `Vec::with_capacity(usize::MAX)`
+/// in [`resample_linear`] instead of the empty-clip guard below ever seeing
+/// it. Returning `0` here lets that same guard catch it by the ordinary
+/// "rounds to zero samples" path.
+fn resampled_len(len: usize, from_rate: u32, to_rate: u32) -> usize {
+    if from_rate == 0 {
+        return 0;
+    }
+    if from_rate == to_rate || len == 0 {
+        return len;
+    }
+    let ratio = to_rate as f64 / from_rate as f64;
+    ((len as f64) * ratio).round() as usize
+}
+
 /// Resample mono PCM from `from_rate` to `to_rate` by linear interpolation.
 ///
 /// Linear interpolation is the right primitive for a feature-extraction
@@ -142,7 +263,7 @@ pub fn resample_linear(samples: &[f32], from_rate: u32, to_rate: u32) -> Vec<f32
         return samples.to_vec();
     }
     let ratio = to_rate as f64 / from_rate as f64;
-    let out_len = ((samples.len() as f64) * ratio).round() as usize;
+    let out_len = resampled_len(samples.len(), from_rate, to_rate);
     let mut out = Vec::with_capacity(out_len);
     for i in 0..out_len {
         let src_pos = i as f64 / ratio;
@@ -199,6 +320,80 @@ impl ClapFrontendConfig {
     fn chunk_frames(&self) -> usize {
         self.nb_max_samples() / self.hop_length + 1
     }
+
+    /// Validate every numeric field the fusion front-end's math requires to
+    /// stay in a well-defined domain — called at the PARSE edge
+    /// (`clap_frontend_from_preprocessor`, right after a
+    /// `preprocessor_config.json` is read), never deferred to the point of
+    /// failure deep inside the transform:
+    ///
+    /// - `hop_length == 0` makes `chunk_frames`'s `nb_max_samples /
+    ///   hop_length` an integer-division-by-zero panic.
+    /// - `sample_rate == 0` makes [`resample_linear`]'s ratio zero, so the
+    ///   resampled clip is empty and `repeatpad`'s `max_length / len`
+    ///   panics on the resulting `0 / 0`.
+    /// - `max_length_s == 0` collapses `nb_max_samples` to zero
+    ///   without panicking anywhere, so every clip silently takes the
+    ///   fusion-crop branch over a near-empty window instead of failing —
+    ///   a confident-wrong shape, not a crash.
+    /// - `fft_window_size` must be a power of two (for the radix-2 FFT) AND
+    ///   at least 2: at `fft_window_size == 1`, `mel_filterbank_hz`'s bin
+    ///   count minus one is zero and its FFT-bin-frequency division degrades
+    ///   to `0.0 / 0.0` (NaN), silently, not a panic.
+    /// - `frequency_min`/`frequency_max` must be finite, ordered, and the
+    ///   upper edge must not exceed the Nyquist frequency implied by
+    ///   `sample_rate` — a filter edge past Nyquist is not a meaningful mel
+    ///   band for real audio.
+    pub fn validate(&self) -> Result<()> {
+        if self.n_mels == 0 {
+            return Err(JammiError::Inference(format!(
+                "Audio n_mels (feature_size) must be positive, got {}",
+                self.n_mels
+            )));
+        }
+        if self.sample_rate == 0 {
+            return Err(JammiError::Inference(
+                "Audio sample_rate (sampling_rate) must be positive, got 0".into(),
+            ));
+        }
+        if self.fft_window_size < 2 || !self.fft_window_size.is_power_of_two() {
+            return Err(JammiError::Inference(format!(
+                "Audio fft_window_size ({}) must be a power of two >= 2 for the radix-2 FFT",
+                self.fft_window_size
+            )));
+        }
+        if self.hop_length == 0 {
+            return Err(JammiError::Inference(
+                "Audio hop_length must be positive, got 0".into(),
+            ));
+        }
+        if self.max_length_s == 0 {
+            return Err(JammiError::Inference(
+                "Audio max_length_s must be positive, got 0".into(),
+            ));
+        }
+        if !self.frequency_min.is_finite() || self.frequency_min < 0.0 {
+            return Err(JammiError::Inference(format!(
+                "Audio frequency_min must be finite and non-negative, got {}",
+                self.frequency_min
+            )));
+        }
+        if !self.frequency_max.is_finite() || self.frequency_max <= self.frequency_min {
+            return Err(JammiError::Inference(format!(
+                "Audio frequency_max ({}) must be finite and greater than frequency_min ({})",
+                self.frequency_max, self.frequency_min
+            )));
+        }
+        let nyquist = self.sample_rate as f64 / 2.0;
+        if self.frequency_max > nyquist {
+            return Err(JammiError::Inference(format!(
+                "Audio frequency_max ({}) must not exceed the Nyquist frequency ({nyquist}) \
+                 implied by sample_rate ({})",
+                self.frequency_max, self.sample_rate
+            )));
+        }
+        Ok(())
+    }
 }
 
 /// One clip's CLAP fusion features: the 4-channel dB mel `[4, time, n_mels]`
@@ -234,7 +429,35 @@ pub struct ClapFusionFeatures {
 /// off). The CHANNEL construction stays length-determined (short → the repeatpad
 /// mel stacked four times; long → crops + downsample); only the emitted gate the
 /// tower keys fusion on is forced on, so the flags are simply `vec![true; n]`.
+///
+/// Reports row positions `0..clips.len()` in any per-row error via
+/// [`preprocess_clap_fusion_indexed`]; see that function's doc for the
+/// compacted-batch case (`CandleBackend::forward_audio_embedding` calls it
+/// directly with the original Arrow row ids for exactly that reason).
 pub fn preprocess_clap_fusion(
+    clips: &[DecodedAudio],
+    config: &ClapFrontendConfig,
+    device: &Device,
+) -> Result<(Tensor, Vec<bool>)> {
+    let row_ids: Vec<usize> = (0..clips.len()).collect();
+    preprocess_clap_fusion_indexed(&row_ids, clips, config, device)
+}
+
+/// [`preprocess_clap_fusion`], reporting `row_ids[i]` (not the position `i`)
+/// in every per-row error — for a caller that has already compacted its
+/// batch (dropped null rows) before preprocessing, so the position in
+/// `clips` and the row its own caller means by "row N" have diverged.
+/// `row_ids.len()` must equal `clips.len()`.
+///
+/// Preallocates the whole batch's flat buffer, then writes each clip's
+/// disjoint, fixed-stride `per_clip` chunk in PARALLEL across whichever
+/// rayon pool this call runs under (`par_chunks_mut` zipped with the clips —
+/// one task per clip, no thread-count knob). `filters` and `window` are
+/// computed once and shared read-only by every task. `row_ids` only changes
+/// what number a row is called in an error message; it never reorders the
+/// chunk a given clip writes to, so it cannot change the numeric output.
+pub fn preprocess_clap_fusion_indexed(
+    row_ids: &[usize],
     clips: &[DecodedAudio],
     config: &ClapFrontendConfig,
     device: &Device,
@@ -244,11 +467,60 @@ pub fn preprocess_clap_fusion(
             "Cannot preprocess empty audio batch".into(),
         ));
     }
-    if !config.fft_window_size.is_power_of_two() {
+    // The comprehensive domain check ([`ClapFrontendConfig::validate`]) is
+    // also run at the config's PARSE edge
+    // (`clap_frontend_from_preprocessor`), but re-running it here defends a
+    // caller that builds/mutates a config directly (as this module's own
+    // tests do) rather than going through that funnel — a corrupt-domain
+    // config must never reach `mel_filterbank_hz`/`chunk_frames`/`repeatpad`
+    // below, whichever path constructed it.
+    config.validate()?;
+    // A typed error, not a `debug_assert!`: in a release build the
+    // three-way `.zip()` below (chunks / clips / row_ids) silently truncates
+    // to the SHORTEST of the three, so a short `row_ids` would leave every
+    // clip past its length UNWRITTEN in `flat` (still its zero-initialized
+    // placeholder) rather than failing.
+    if row_ids.len() != clips.len() {
         return Err(JammiError::Inference(format!(
-            "Audio fft_window_size ({}) must be a power of two for the radix-2 FFT",
-            config.fft_window_size
+            "preprocess_clap_fusion: row_ids has {} entries, expected one per clip ({})",
+            row_ids.len(),
+            clips.len()
         )));
+    }
+    // A clip with zero raw samples, or one so short that resampling to
+    // `config.sample_rate` rounds it to zero samples, feeds `repeatpad`'s
+    // `max_length / len` with `len == 0` — an integer-division-by-zero panic.
+    // Refuse both causes here, in a SEQUENTIAL pass over every clip, before
+    // the parallel per-clip stage below ever dispatches a closure over them
+    // (this is a check before the parallel stage, not inside it: the
+    // `par_chunks_mut` writer and `clap_fusion_row` stay untouched).
+    for (clip, &row) in clips.iter().zip(row_ids.iter()) {
+        if clip.samples.is_empty() {
+            return Err(JammiError::Inference(format!(
+                "CLAP fusion row {row}: clip has zero samples"
+            )));
+        }
+        // Named separately from the "rounds to zero samples" refusal below:
+        // `clip.sample_rate == 0` makes `resampled_len`'s ratio `to_rate /
+        // 0.0`, which (pre-fix) rounds to `usize::MAX` rather than `0` and
+        // slips past that guard, then feeds `Vec::with_capacity(usize::MAX)`
+        // in `resample_linear`. A decoded clip's own decoder already refuses
+        // `sample_rate == 0`, but this is a defense-in-depth check for any
+        // other `DecodedAudio` producer (including this module's own tests).
+        if clip.sample_rate == 0 {
+            return Err(JammiError::Inference(format!(
+                "CLAP fusion row {row}: clip has sample_rate 0"
+            )));
+        }
+        if resampled_len(clip.samples.len(), clip.sample_rate, config.sample_rate) == 0 {
+            return Err(JammiError::Inference(format!(
+                "CLAP fusion row {row}: resampling {} sample(s) from {} Hz to {} Hz rounds to \
+                 zero samples",
+                clip.samples.len(),
+                clip.sample_rate,
+                config.sample_rate
+            )));
+        }
     }
 
     let filters = mel_filterbank_hz(config);
@@ -256,15 +528,23 @@ pub fn preprocess_clap_fusion(
     let time = config.chunk_frames();
     let per_clip = 4 * time * config.n_mels;
 
-    let mut flat = Vec::with_capacity(clips.len() * per_clip);
-
-    for clip in clips {
-        let resampled = resample_linear(&clip.samples, clip.sample_rate, config.sample_rate);
-        let feat = clap_fusion_features(&resampled, config, &filters, &window);
-        debug_assert_eq!(feat.time, time);
-        debug_assert_eq!(feat.features.len(), per_clip);
-        flat.extend_from_slice(&feat.features);
-    }
+    // Preallocate the whole batch's flat buffer, then write each clip's
+    // disjoint, fixed-stride `per_clip` chunk in PARALLEL across whichever
+    // rayon pool this call runs under (`par_chunks_mut` zipped with the
+    // clips — one task per clip, no thread-count knob). `filters` and
+    // `window` are computed once above and shared read-only by every task.
+    let mut flat = vec![0f32; clips.len() * per_clip];
+    let results: Vec<Result<()>> = flat
+        .par_chunks_mut(per_clip)
+        .zip(clips.par_iter())
+        .zip(row_ids.par_iter())
+        .map(|((chunk, clip), &row)| {
+            let row_values = clap_fusion_row(row, clip, config, &filters, &window, chunk.len())?;
+            chunk.copy_from_slice(&row_values);
+            Ok(())
+        })
+        .collect();
+    crate::inference::lowest_index_result(results)?;
 
     let tensor = Tensor::from_vec(flat, (clips.len(), 4, time, config.n_mels), device)
         .map_err(|e| JammiError::Inference(format!("Failed to create audio tensor: {e}")))?;
@@ -272,6 +552,37 @@ pub fn preprocess_clap_fusion(
     // AFF fusion path and reproduces HF's canonical `get_audio_features` vector
     // (see the policy note above). The flag is constant, not data-dependent.
     Ok((tensor, vec![true; clips.len()]))
+}
+
+/// Compute one clip's resampled CLAP-fusion feature row and verify its length
+/// against `expected_len` — the caller's preallocated, fixed-stride chunk —
+/// before handing it back to be copied in. This is the release-mode per-item
+/// length check the parallel writer in [`preprocess_clap_fusion`] depends on
+/// (a plain `if`, not `debug_assert!`, so it still runs in release builds):
+/// `clap_fusion_features`'s output length is always `expected_len` under a
+/// consistent config in practice, but a future change to its branch
+/// arithmetic must fail loudly here rather than silently
+/// truncate/short-`copy_from_slice`/misalign another clip's chunk.
+fn clap_fusion_row(
+    row_index: usize,
+    clip: &DecodedAudio,
+    config: &ClapFrontendConfig,
+    filters: &MelFilterbank,
+    window: &[f64],
+    expected_len: usize,
+) -> Result<Vec<f32>> {
+    let resampled = resample_linear(&clip.samples, clip.sample_rate, config.sample_rate);
+    let feat = clap_fusion_features(&resampled, config, filters, window);
+    if feat.features.len() != expected_len {
+        return Err(JammiError::Inference(format!(
+            "CLAP fusion row {row_index}: produced {} features, expected {expected_len} \
+             (time={}, n_mels={})",
+            feat.features.len(),
+            config.chunk_frames(),
+            config.n_mels
+        )));
+    }
+    Ok(feat.features)
 }
 
 /// `ClapFeatureExtractor._get_input_mel` for one resampled clip: repeatpad or
@@ -647,6 +958,20 @@ fn fft_f64(re: &mut [f64], im: &mut [f64]) {
 mod tests {
     use super::*;
 
+    /// Compile-time `Send` assertion (K4/family-J precedent:
+    /// `jammi-kernels/src/ops/saved.rs`'s `saved_is_send_and_sync`): the types
+    /// that cross the parallel decode/preprocess boundary in
+    /// [`decode_audio_batch`] and [`preprocess_clap_fusion`] must be `Send`,
+    /// or the crate would not compile — this only names the requirement, it
+    /// never silently loosens it.
+    #[test]
+    fn decoded_audio_and_fusion_features_are_send() {
+        fn assert_send<T: Send>() {}
+        assert_send::<DecodedAudio>();
+        assert_send::<ClapFusionFeatures>();
+        assert_send::<Result<DecodedAudio>>();
+    }
+
     /// Build a minimal 16-bit PCM mono WAV in memory at the given sample rate.
     fn wav_bytes(samples: &[i16], sample_rate: u32) -> Vec<u8> {
         let data_len = (samples.len() * 2) as u32;
@@ -811,6 +1136,607 @@ mod tests {
         let mut config = tiny_fusion_config();
         config.fft_window_size = 200; // not a power of two
         assert!(preprocess_clap_fusion(&[clip], &config, &Device::Cpu).is_err());
+    }
+
+    #[test]
+    fn fusion_zero_n_mels_is_a_typed_error_not_a_panic() {
+        // `par_chunks_mut` panics on a zero chunk size — `n_mels == 0` makes
+        // `per_clip` zero, so this guard at the input edge is load-bearing,
+        // not decorative.
+        let clip = decode_audio_bytes(&sine_wav(440.0, 16_000, 2000)).unwrap();
+        let mut config = tiny_fusion_config();
+        config.n_mels = 0;
+        let err = preprocess_clap_fusion(&[clip], &config, &Device::Cpu)
+            .expect_err("n_mels == 0 must be a typed error, not a panic");
+        let msg = err.to_string();
+        assert!(
+            msg.contains("n_mels") && msg.contains('0'),
+            "error must name the field and the offending value: {msg}"
+        );
+    }
+
+    // -- `ClapFrontendConfig::validate` — per-field domain checks ------------
+
+    #[test]
+    fn validate_accepts_the_real_htsat_clap_config() {
+        // The actual `cookbook/fixtures/htsat_clap_tiny/preprocessor_config.json`
+        // values must never be rejected by the domain check.
+        let config = ClapFrontendConfig {
+            n_mels: 32,
+            sample_rate: 48_000,
+            fft_window_size: 1024,
+            hop_length: 577,
+            frequency_min: 50.0,
+            frequency_max: 14_000.0,
+            max_length_s: 6,
+        };
+        assert!(config.validate().is_ok());
+    }
+
+    #[test]
+    fn validate_rejects_zero_n_mels() {
+        let mut config = tiny_fusion_config();
+        config.n_mels = 0;
+        let err = config.validate().unwrap_err();
+        assert!(err.to_string().contains("n_mels"));
+    }
+
+    #[test]
+    fn validate_rejects_zero_sample_rate() {
+        let mut config = tiny_fusion_config();
+        config.sample_rate = 0;
+        let err = config.validate().unwrap_err();
+        assert!(err.to_string().contains("sample_rate"));
+    }
+
+    #[test]
+    fn validate_rejects_zero_hop_length() {
+        // `chunk_frames`'s `nb_max_samples / hop_length` is an
+        // integer-division-by-zero panic when `hop_length == 0`.
+        let mut config = tiny_fusion_config();
+        config.hop_length = 0;
+        let err = config.validate().unwrap_err();
+        assert!(err.to_string().contains("hop_length"));
+    }
+
+    #[test]
+    fn validate_rejects_zero_max_length_s() {
+        // `max_length_s == 0` collapses `nb_max_samples` to zero without
+        // panicking anywhere — a silent wrong-shape output, not a crash.
+        let mut config = tiny_fusion_config();
+        config.max_length_s = 0;
+        let err = config.validate().unwrap_err();
+        assert!(err.to_string().contains("max_length_s"));
+    }
+
+    #[test]
+    fn validate_rejects_non_power_of_two_fft_window_size() {
+        let mut config = tiny_fusion_config();
+        config.fft_window_size = 200;
+        let err = config.validate().unwrap_err();
+        assert!(err.to_string().contains("fft_window_size"));
+    }
+
+    #[test]
+    fn validate_rejects_fft_window_size_of_one() {
+        // A power of two (`2^0`) that still breaks `mel_filterbank_hz`'s
+        // `n_bins - 1` (== 0) division.
+        let mut config = tiny_fusion_config();
+        config.fft_window_size = 1;
+        let err = config.validate().unwrap_err();
+        assert!(err.to_string().contains("fft_window_size"));
+    }
+
+    #[test]
+    fn validate_rejects_non_finite_frequency_min() {
+        let mut config = tiny_fusion_config();
+        config.frequency_min = f64::NAN;
+        let err = config.validate().unwrap_err();
+        assert!(err.to_string().contains("frequency_min"));
+    }
+
+    #[test]
+    fn validate_rejects_negative_frequency_min() {
+        let mut config = tiny_fusion_config();
+        config.frequency_min = -1.0;
+        let err = config.validate().unwrap_err();
+        assert!(err.to_string().contains("frequency_min"));
+    }
+
+    #[test]
+    fn validate_rejects_frequency_max_at_or_below_frequency_min() {
+        let mut config = tiny_fusion_config();
+        config.frequency_min = 100.0;
+        config.frequency_max = 100.0;
+        let err = config.validate().unwrap_err();
+        assert!(err.to_string().contains("frequency_max"));
+    }
+
+    #[test]
+    fn validate_rejects_non_finite_frequency_max() {
+        let mut config = tiny_fusion_config();
+        config.frequency_max = f64::INFINITY;
+        let err = config.validate().unwrap_err();
+        assert!(err.to_string().contains("frequency_max"));
+    }
+
+    #[test]
+    fn validate_rejects_frequency_max_past_nyquist() {
+        let mut config = tiny_fusion_config();
+        config.sample_rate = 16_000;
+        config.frequency_max = 9_000.0; // > 16_000 / 2
+        let err = config.validate().unwrap_err();
+        assert!(err.to_string().contains("Nyquist"));
+    }
+
+    #[test]
+    fn validate_accepts_frequency_max_exactly_at_nyquist() {
+        let mut config = tiny_fusion_config();
+        config.sample_rate = 16_000;
+        config.frequency_max = 8_000.0; // == 16_000 / 2, the boundary
+        assert!(config.validate().is_ok());
+    }
+
+    #[test]
+    fn preprocess_clap_fusion_rejects_zero_sample_rate_without_panicking() {
+        // Pre-fix, `resample_linear`'s ratio-zero output feeds `repeatpad`'s
+        // `max_length / len` with `len == 0`, an integer-division-by-zero
+        // panic — the config-level `validate()` call inside
+        // `preprocess_clap_fusion_indexed` must refuse this before that code
+        // ever runs.
+        let clip = decode_audio_bytes(&sine_wav(440.0, 16_000, 2000)).unwrap();
+        let mut config = tiny_fusion_config();
+        config.sample_rate = 0;
+        let err = preprocess_clap_fusion(&[clip], &config, &Device::Cpu)
+            .expect_err("sample_rate == 0 must be a typed error, not a panic");
+        assert!(err.to_string().contains("sample_rate"));
+    }
+
+    #[test]
+    fn preprocess_clap_fusion_rejects_zero_hop_length_without_panicking() {
+        let clip = decode_audio_bytes(&sine_wav(440.0, 16_000, 2000)).unwrap();
+        let mut config = tiny_fusion_config();
+        config.hop_length = 0;
+        let err = preprocess_clap_fusion(&[clip], &config, &Device::Cpu)
+            .expect_err("hop_length == 0 must be a typed error, not a panic");
+        assert!(err.to_string().contains("hop_length"));
+    }
+
+    #[test]
+    fn preprocess_clap_fusion_rejects_zero_max_length_s() {
+        let clip = decode_audio_bytes(&sine_wav(440.0, 16_000, 2000)).unwrap();
+        let mut config = tiny_fusion_config();
+        config.max_length_s = 0;
+        let err = preprocess_clap_fusion(&[clip], &config, &Device::Cpu)
+            .expect_err("max_length_s == 0 must be a typed error, not a silent shape");
+        assert!(err.to_string().contains("max_length_s"));
+    }
+
+    // -- Empty-clip refusal --------------------------------------------------
+    //
+    // Both causes below feed `repeatpad`'s `max_length / len` with `len ==
+    // 0`, an integer-division-by-zero panic — the fixed config here passes
+    // `ClapFrontendConfig::validate()` (unlike the zero-sample_rate case
+    // above), so only a per-clip length check catches them.
+
+    #[test]
+    fn preprocess_clap_fusion_rejects_a_zero_sample_clip_without_panicking() {
+        let clip = DecodedAudio {
+            samples: Vec::new(),
+            sample_rate: 16_000,
+        };
+        let config = tiny_fusion_config();
+        let err = preprocess_clap_fusion(&[clip], &config, &Device::Cpu)
+            .expect_err("a zero-sample clip must be a typed error, not a division-by-zero panic");
+        assert!(err.to_string().contains("zero samples"));
+    }
+
+    #[test]
+    fn preprocess_clap_fusion_rejects_a_clip_that_resamples_to_zero_samples() {
+        // 1 sample at 1,000,000 Hz resampled down to 16,000 Hz: ratio 0.016,
+        // round(1 * 0.016) == 0.
+        let clip = DecodedAudio {
+            samples: vec![0.5],
+            sample_rate: 1_000_000,
+        };
+        let config = tiny_fusion_config();
+        assert_eq!(config.sample_rate, 16_000);
+        let err = preprocess_clap_fusion(&[clip], &config, &Device::Cpu)
+            .expect_err("a clip that resamples to zero samples must be a typed error, not a panic");
+        assert!(err.to_string().contains("rounds to zero samples"));
+    }
+
+    #[test]
+    fn preprocess_clap_fusion_indexed_names_the_row_of_a_zero_sample_clip() {
+        let good = decode_audio_bytes(&sine_wav(440.0, 16_000, 2000)).unwrap();
+        let bad = DecodedAudio {
+            samples: Vec::new(),
+            sample_rate: 16_000,
+        };
+        let config = tiny_fusion_config();
+        let err = preprocess_clap_fusion(&[good, bad], &config, &Device::Cpu)
+            .expect_err("the second clip's zero samples must be refused");
+        assert!(err.to_string().contains("row 1"));
+    }
+
+    /// A clip carrying `sample_rate == 0` (a
+    /// decoder's own decode path already refuses this, but a directly
+    /// constructed `DecodedAudio` — as every test here does — is not routed
+    /// through that decoder) must be a NAMED typed refusal, never a
+    /// division-by-zero-derived `usize::MAX` that then feeds
+    /// `Vec::with_capacity` downstream. Verified by temporarily removing the
+    /// `clip.sample_rate == 0` check in the sequential pre-check above: this
+    /// test goes RED (`resample_linear`'s `Vec::with_capacity(usize::MAX)`
+    /// aborts the process rather than returning the typed `Err` asserted
+    /// below).
+    #[test]
+    fn preprocess_clap_fusion_indexed_rejects_a_zero_sample_rate_clip_by_name() {
+        let clip = DecodedAudio {
+            samples: vec![0.5; 100],
+            sample_rate: 0,
+        };
+        let config = tiny_fusion_config();
+        let err = preprocess_clap_fusion(&[clip], &config, &Device::Cpu)
+            .expect_err("sample_rate == 0 must be a typed error, not a huge-allocation abort");
+        assert!(err.to_string().contains("sample_rate 0"), "{err}");
+    }
+
+    /// `resampled_len`'s own domain edge: a zero
+    /// `from_rate` must return `0`, never round `to_rate / 0.0 == +inf` up
+    /// to `usize::MAX` (a confidently wrong length the empty-clip guard above
+    /// would then fail to catch, since `usize::MAX != 0`).
+    #[test]
+    fn resampled_len_returns_zero_for_a_zero_from_rate() {
+        assert_eq!(resampled_len(100, 0, 16_000), 0);
+    }
+
+    // -- Media front-end parallelization (#421 follow-on) --------------------
+
+    #[test]
+    fn decode_audio_batch_empty_is_ok_empty() {
+        // Decode-stage empty is a no-op (K2's "empty batch refused" guard
+        // lives at the PREPROCESS stage, which still refuses — see
+        // `fusion_empty_batch_errors` above — matching the pre-unit
+        // sequential decode loop, which also never rejected zero rows).
+        let items: Vec<Vec<u8>> = Vec::new();
+        let decoded = decode_audio_batch(&items).unwrap();
+        assert!(decoded.is_empty());
+    }
+
+    #[test]
+    fn decode_audio_batch_two_bad_rows_surfaces_the_lowest_index() {
+        let good = sine_wav(440.0, 16_000, 2000);
+        let items: Vec<Vec<u8>> = vec![
+            good.clone(),
+            good.clone(),
+            b"not audio at all".to_vec(), // row 2: bad
+            good.clone(),
+            good.clone(),
+            b"also not audio".to_vec(), // row 5: bad
+            good,
+        ];
+        let err = decode_audio_batch(&items).unwrap_err();
+        let msg = err.to_string();
+        assert!(
+            msg.contains("row 2"),
+            "expected the lowest-index (row 2) failure, got: {msg}"
+        );
+        assert!(
+            !msg.contains("row 5"),
+            "row 5's failure must not be the one surfaced when row 2 also failed: {msg}"
+        );
+    }
+
+    /// A caller that COMPACTS its batch (drops null rows) before decoding
+    /// must get the ORIGINAL row back in the error, not the position in the
+    /// compacted `items` slice.
+    #[test]
+    fn decode_audio_batch_indexed_reports_the_given_row_id_not_the_position() {
+        let good = sine_wav(440.0, 16_000, 2000);
+        let items: Vec<Vec<u8>> = vec![good.clone(), b"not audio at all".to_vec(), good];
+        let row_ids = vec![10usize, 42, 99];
+
+        let err = decode_audio_batch_indexed(&row_ids, &items).unwrap_err();
+        let msg = err.to_string();
+        assert!(
+            msg.contains("row 42"),
+            "expected the caller's row id (42), got: {msg}"
+        );
+        assert!(
+            !msg.contains("row 1:"),
+            "must never report the compacted position instead of the row id: {msg}"
+        );
+    }
+
+    #[test]
+    fn decode_audio_results_rejects_short_row_ids_instead_of_dropping_tail_items() {
+        // `.zip()` silently truncates to the shorter of `items`/`row_ids` in
+        // a release build (`debug_assert!` compiles out there), so a short
+        // `row_ids` must be a typed error, not zero outcomes for the
+        // uncovered tail items.
+        let good = sine_wav(440.0, 16_000, 2000);
+        let items: Vec<Vec<u8>> = vec![good.clone(), good];
+        let row_ids = vec![0usize]; // one entry short of `items.len()`
+        let err = decode_audio_batch_indexed(&row_ids, &items)
+            .expect_err("a short row_ids must be a typed error, not silent truncation");
+        assert!(err.to_string().contains("row_ids"));
+    }
+
+    #[test]
+    fn decode_audio_batch_per_row_indexed_rejects_short_row_ids() {
+        let good = sine_wav(440.0, 16_000, 2000);
+        let items: Vec<Vec<u8>> = vec![good.clone(), good];
+        let row_ids = vec![0usize];
+        let err = decode_audio_batch_per_row_indexed(&row_ids, &items)
+            .expect_err("a short row_ids must be a typed error, not silent truncation");
+        assert!(err.to_string().contains("row_ids"));
+    }
+
+    #[test]
+    fn preprocess_clap_fusion_indexed_rejects_short_row_ids_instead_of_leaving_a_tail_unwritten() {
+        // The three-way `.zip()` (chunks / clips / row_ids) would otherwise
+        // leave every clip past `row_ids.len()` as its zero-initialized
+        // placeholder in `flat`, silently, rather than failing.
+        let bytes = sine_wav(220.0, 16_000, 2000);
+        let clips = vec![
+            decode_audio_bytes(&bytes).unwrap(),
+            decode_audio_bytes(&bytes).unwrap(),
+        ];
+        let row_ids = vec![0usize];
+        let err =
+            preprocess_clap_fusion_indexed(&row_ids, &clips, &tiny_fusion_config(), &Device::Cpu)
+                .expect_err(
+                    "a short row_ids must be a typed error, not a silently truncated tensor",
+                );
+        assert!(err.to_string().contains("row_ids"));
+    }
+
+    #[test]
+    fn clap_fusion_row_wrong_expected_len_is_a_typed_error_not_a_panic() {
+        // The release-mode length check `clap_fusion_row` performs before
+        // handing its row back to `copy_from_slice` — exercised directly
+        // (not via `debug_assert!`, which would compile out in release) by
+        // asking for a length the real feature row can never have.
+        let config = tiny_fusion_config();
+        let clip = decode_audio_bytes(&sine_wav(220.0, 16_000, 2000)).unwrap();
+        let filters = mel_filterbank_hz(&config);
+        let window = hann_periodic(config.fft_window_size);
+        let real_len = 4 * config.chunk_frames() * config.n_mels;
+
+        let err = clap_fusion_row(3, &clip, &config, &filters, &window, real_len + 1)
+            .expect_err("a deliberately wrong expected_len must be a typed error");
+        let msg = err.to_string();
+        assert!(msg.contains("row 3"), "error must be row-indexed: {msg}");
+    }
+
+    /// One synthetic clip of `kind` at batch position `idx`, at the fixed
+    /// sample rate `config.sample_rate` (so `preprocess_clap_fusion` never
+    /// resamples — isolating the parallel-write mechanism under test from
+    /// `resample_linear`'s own arithmetic). `kind` selects which of
+    /// `clap_fusion_features`'s three length-determined branches the clip
+    /// hits: repeatpad (short), the generic fusion crop (long), and the
+    /// `total == chunk` fusion corner case (long, at the exact boundary
+    /// length derived from `config`).
+    #[derive(Clone, Copy)]
+    enum ClipKind {
+        Repeatpad,
+        FusionGeneric,
+        FusionCornerTotalEqChunk,
+    }
+
+    fn synthetic_clip(kind: ClipKind, idx: usize, config: &ClapFrontendConfig) -> DecodedAudio {
+        let max_length = config.nb_max_samples();
+        let n = match kind {
+            ClipKind::Repeatpad => max_length / 4,
+            ClipKind::FusionGeneric => max_length + max_length / 4,
+            // Derived so `linear_mel`'s frame count lands exactly on `chunk`:
+            // num_frames = 1 + len / hop (floor); solving for the smallest
+            // `len > max_length` that keeps `len / hop == chunk - 1`.
+            ClipKind::FusionCornerTotalEqChunk => {
+                (config.chunk_frames() - 1) * config.hop_length + config.hop_length - 1
+            }
+        };
+        let freq = 110.0 * (1.0 + idx as f32 * 0.37);
+        let sample_rate = config.sample_rate;
+        let samples: Vec<f32> = (0..n)
+            .map(|i| {
+                let t = i as f32 / sample_rate as f32;
+                0.5 * (2.0 * std::f32::consts::PI * freq * t).sin()
+            })
+            .collect();
+        DecodedAudio {
+            samples,
+            sample_rate,
+        }
+    }
+
+    fn batch_24(config: &ClapFrontendConfig) -> Vec<DecodedAudio> {
+        (0..24)
+            .map(|i| {
+                let kind = match i % 3 {
+                    0 => ClipKind::Repeatpad,
+                    1 => ClipKind::FusionGeneric,
+                    _ => ClipKind::FusionCornerTotalEqChunk,
+                };
+                synthetic_clip(kind, i, config)
+            })
+            .collect()
+    }
+
+    /// [`batch_24`] plus one clip decoded at HALF the config's target sample
+    /// rate — every other synthetic clip is generated AT `config.sample_rate`
+    /// specifically to isolate the parallel-write mechanism from
+    /// `resample_linear`'s own arithmetic (see `synthetic_clip`'s doc), which
+    /// means the K4 bit-identity oracle below would otherwise never exercise
+    /// per-clip resampling at all. Appending one clip that genuinely needs
+    /// resampling closes that gap without disturbing the other 24 clips'
+    /// existing branch coverage.
+    fn batch_25_with_a_resampled_clip(config: &ClapFrontendConfig) -> Vec<DecodedAudio> {
+        let mut clips = batch_24(config);
+        let half_rate = config.sample_rate / 2;
+        let n = config.nb_max_samples() / 4; // repeatpad branch at the native rate
+        let samples: Vec<f32> = (0..n)
+            .map(|i| {
+                let t = i as f32 / half_rate as f32;
+                0.5 * (2.0 * std::f32::consts::PI * 220.0 * t).sin()
+            })
+            .collect();
+        clips.push(DecodedAudio {
+            samples,
+            sample_rate: half_rate,
+        });
+        clips
+    }
+
+    /// Run [`preprocess_clap_fusion`] under a rayon pool of exactly
+    /// `pool_size` threads and return the flattened `f32` output plus the
+    /// `is_longer` flags.
+    fn run_at_pool_size(
+        pool_size: usize,
+        clips: &[DecodedAudio],
+        config: &ClapFrontendConfig,
+    ) -> (Vec<f32>, Vec<bool>) {
+        let pool = rayon::ThreadPoolBuilder::new()
+            .num_threads(pool_size)
+            .build()
+            .expect("build a fixed-size rayon pool");
+        pool.install(|| {
+            let (tensor, is_longer) = preprocess_clap_fusion(clips, config, &Device::Cpu).unwrap();
+            let flat = tensor.flatten_all().unwrap().to_vec1::<f32>().unwrap();
+            (flat, is_longer)
+        })
+    }
+
+    /// The PRE-UNIT sequential implementation, transcribed verbatim from
+    /// `c1b0b0ba`'s `preprocess_clap_fusion` (before the `par_chunks_mut`
+    /// rewrite) — kept ONLY as a test oracle, INDEPENDENT of the shipped
+    /// parallel code path, so the bit-identity assertions below compare the
+    /// new code against a second implementation rather than against itself
+    /// at a different pool size (a pool-1-vs-pool-k comparison alone cannot
+    /// catch a bug the SAME code makes at every pool size). Reuses
+    /// `mel_filterbank_hz`, `hann_periodic`, `resample_linear` and
+    /// `clap_fusion_features`, all unchanged by this unit.
+    fn preprocess_clap_fusion_reference_sequential(
+        clips: &[DecodedAudio],
+        config: &ClapFrontendConfig,
+        device: &Device,
+    ) -> (Tensor, Vec<bool>) {
+        let filters = mel_filterbank_hz(config);
+        let window = hann_periodic(config.fft_window_size);
+        let time = config.chunk_frames();
+        let per_clip = 4 * time * config.n_mels;
+        let mut flat = Vec::with_capacity(clips.len() * per_clip);
+        for clip in clips {
+            let resampled = resample_linear(&clip.samples, clip.sample_rate, config.sample_rate);
+            let feat = clap_fusion_features(&resampled, config, &filters, &window);
+            debug_assert_eq!(feat.time, time);
+            debug_assert_eq!(feat.features.len(), per_clip);
+            flat.extend_from_slice(&feat.features);
+        }
+        let tensor = Tensor::from_vec(flat, (clips.len(), 4, time, config.n_mels), device).unwrap();
+        (tensor, vec![true; clips.len()])
+    }
+
+    /// Oracle 1 (K4): element-wise bit identity between the PRE-UNIT
+    /// sequential reference above and the shipped parallel code at pool sizes
+    /// {1, 5, 7, 24} (non-dividing counts included), on a batch that hits all
+    /// three of `clap_fusion_features`'s length-determined branches
+    /// (repeatpad; fusion crop; fusion crop's `total == chunk` corner case)
+    /// PLUS one clip that genuinely needs resampling.
+    #[test]
+    fn clap_fusion_parallel_matches_sequential_bit_identical_across_pool_sizes() {
+        let config = tiny_fusion_config();
+        let clips = batch_25_with_a_resampled_clip(&config);
+
+        let (reference_tensor, reference_is_longer) =
+            preprocess_clap_fusion_reference_sequential(&clips, &config, &Device::Cpu);
+        let reference = reference_tensor
+            .flatten_all()
+            .unwrap()
+            .to_vec1::<f32>()
+            .unwrap();
+        assert_eq!(reference_is_longer, vec![true; clips.len()]);
+
+        for &k in &[1usize, 5, 7, 24] {
+            let (got, got_is_longer) = run_at_pool_size(k, &clips, &config);
+            assert_eq!(
+                got_is_longer, reference_is_longer,
+                "is_longer flags must match the pre-unit reference at pool size {k}"
+            );
+            assert_eq!(
+                got.len(),
+                reference.len(),
+                "output length must match the pre-unit reference at pool size {k}"
+            );
+            for (idx, (&a, &b)) in got.iter().zip(reference.iter()).enumerate() {
+                assert_eq!(
+                    a.to_bits(),
+                    b.to_bits(),
+                    "element {idx} differs from the pre-unit sequential reference at pool \
+                     size {k}: {a} (bits {:x}) vs {b} (bits {:x})",
+                    a.to_bits(),
+                    b.to_bits()
+                );
+            }
+        }
+    }
+
+    /// `row_ids` only changes what number a row is called in an error
+    /// message; it must never change the numeric output. Uses row ids that
+    /// are neither `0..n` nor monotonic-by-one.
+    #[test]
+    fn preprocess_clap_fusion_indexed_row_ids_do_not_affect_numeric_output() {
+        let config = tiny_fusion_config();
+        let clips = batch_24(&config);
+
+        let (sequential_tensor, sequential_is_longer) =
+            preprocess_clap_fusion(&clips, &config, &Device::Cpu).unwrap();
+        let sequential = sequential_tensor
+            .flatten_all()
+            .unwrap()
+            .to_vec1::<f32>()
+            .unwrap();
+
+        let row_ids: Vec<usize> = (0..clips.len()).map(|i| i * 7 + 1000).collect();
+        let (indexed_tensor, indexed_is_longer) =
+            preprocess_clap_fusion_indexed(&row_ids, &clips, &config, &Device::Cpu).unwrap();
+        let indexed = indexed_tensor
+            .flatten_all()
+            .unwrap()
+            .to_vec1::<f32>()
+            .unwrap();
+
+        assert_eq!(sequential_is_longer, indexed_is_longer);
+        assert_eq!(sequential.len(), indexed.len());
+        for (idx, (&a, &b)) in sequential.iter().zip(indexed.iter()).enumerate() {
+            assert_eq!(
+                a.to_bits(),
+                b.to_bits(),
+                "element {idx} changed when row_ids were non-sequential"
+            );
+        }
+    }
+
+    /// Oracle 2 (determinism): two independent parallel runs at the same pool
+    /// size reproduce the identical output — no unseeded RNG, no
+    /// timing-dependent behavior in the front end.
+    #[test]
+    fn clap_fusion_parallel_is_deterministic_across_two_runs() {
+        let config = tiny_fusion_config();
+        let clips = batch_24(&config);
+
+        let (first, first_is_longer) = run_at_pool_size(7, &clips, &config);
+        let (second, second_is_longer) = run_at_pool_size(7, &clips, &config);
+
+        assert_eq!(first_is_longer, second_is_longer);
+        assert_eq!(first.len(), second.len());
+        for (idx, (&a, &b)) in first.iter().zip(second.iter()).enumerate() {
+            assert_eq!(
+                a.to_bits(),
+                b.to_bits(),
+                "element {idx} differs between two runs at the same pool size"
+            );
+        }
     }
 
     // -- CLAP fusion front-end parity against the committed golden -----------

@@ -296,6 +296,22 @@ the unsafe case this refuses); the merge report MAY additionally cover
 legs this module does not attribute at all (e.g. an HTSAT leg, out of
 this pass's own scope — module doc, "HTSAT") without tripping the refusal.
 
+### `limits`: the report's own recorded validity-gate bounds
+
+`build_report`'s own top-level `limits` block (`unattributed_decision_
+grade_limit`, `unknown_kernel_share_limit`) records THIS module's live
+validity-gate constants (`UNATTRIBUTED_DECISION_GRADE_LIMIT`,
+`UNKNOWN_KERNEL_SHARE_LIMIT`) AT THE TIME this report was built — never
+re-derived downstream, never parsed back out of a leg's own
+`decision_grade_reason` string. A downstream reader
+(`profile_421_artifact.py`) that needs to know exactly what bound an
+ALREADY-MEASURED run was judged against reads it from HERE, by name,
+refusing if the key is absent, rather than parsing a leg's own English
+`decision_grade_reason` (a leg that failed for an unrelated reason records
+no such string at all — there would be nothing to parse) or trusting the
+LIVE import directly (which could have moved since this run was
+measured). `SCHEMA_VERSION` bumped `3 -> 4` for this new top-level key.
+
 ### Numbers in this doc are re-derived, never transcribed
 
 Every number in this docstring is RE-DERIVED from the real census exports,
@@ -618,7 +634,7 @@ import sys
 from dataclasses import dataclass, field
 from pathlib import Path
 
-SCHEMA_VERSION = 3
+SCHEMA_VERSION = 4
 
 VERDICT_VALID = "VALID"
 VERDICT_INVALID = "INVALID"
@@ -2274,6 +2290,14 @@ def build_report(legs_dir: Path, merge_report: dict) -> dict:
         "tool": "profile_421_attribute",
         "schema": SCHEMA_VERSION,
         "legs_dir": str(legs_dir),
+        # This module's OWN live validity-gate constants, recorded at
+        # report-build time (module doc, "`limits`: the report's own
+        # recorded validity-gate bounds") — a downstream reader trusts
+        # THIS, never a reason string, never the live import.
+        "limits": {
+            "unattributed_decision_grade_limit": UNATTRIBUTED_DECISION_GRADE_LIMIT,
+            "unknown_kernel_share_limit": UNKNOWN_KERNEL_SHARE_LIMIT,
+        },
         "legs": legs,
         "candidate_decisions": candidate_decisions,
         "realized_gains": realized_gains,

@@ -21,6 +21,6 @@ impl OutputAdapter for NerAdapter {
             output.string_outputs.first(),
             &output.row_status,
             row_count,
-        ))])
+        )?)])
     }
 }

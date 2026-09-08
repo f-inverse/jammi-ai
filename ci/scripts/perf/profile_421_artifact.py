@@ -963,19 +963,6 @@ def invariance_word(axes: list[str]) -> str:
     return "- and ".join(axes) + "-invariant"
 
 
-def _optional_leg_valid(merge_by_id: dict[str, dict], leg_id: str) -> bool:
-    """`True` iff `leg_id` is present in `--merge-json`'s own legs AND its
-    verdict is `VALID` — for OPTIONAL supporting evidence (the D-arm legs an
-    arm-invariance check reads) that a finding may still be built WITHOUT,
-    unlike `_merge_verdict_problems`'s REQUIRED legs (whose absence is a
-    hard refusal, never silently treated as "not applicable"). A run that
-    never measured the D-arm at all (or measured it but it came back
-    INVALID) simply does not get the arm-invariance CLAUSE — the finding's
-    other, required-leg-gated numbers are entirely unaffected."""
-    row = merge_by_id.get(leg_id)
-    return isinstance(row, dict) and row.get("verdict") == "VALID"
-
-
 # Rule thresholds for every QUALITATIVE word `compute_findings` can emit —
 # each is recorded (by name and value) in the finding's own `evidence` block
 # alongside the numbers it was evaluated against, so a downstream reader

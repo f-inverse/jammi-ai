@@ -183,12 +183,12 @@ component happens to be a registered basename — the FULL-PATH match wins and
 the basename match nested inside it is dropped, so one citation is never
 reported twice.
 
-## The full-path form's coverage extension: `ci/scripts/perf/**` and crate comments
+## The full-path form's coverage extension: `ci/scripts/perf/**`, crate comments, and un-pinned plan-contract docs
 
-The full-path form covers `_DOC_SEARCH_ROOTS` PLUS two further scopes, each
-kept as its OWN scope rather than folded into `_DOC_SEARCH_ROOTS` itself
-(that tuple stays "the maintainer guides", a distinct citing-audience from
-either extension below):
+The full-path form covers `_DOC_SEARCH_ROOTS` PLUS three further scopes,
+each kept as its OWN scope rather than folded into `_DOC_SEARCH_ROOTS`
+itself (that tuple stays "the maintainer guides", a distinct citing-
+audience from any extension below):
 
   * **`_PERF_FULL_PATH_ROOTS`** (`ci/scripts/perf/**`, `.sh`/`.py` files
     only — not the `.json` fixtures or `.md` provenance notes living
@@ -270,9 +270,29 @@ either extension below):
     starts with `//`) is covered by at least one real span — the exact
     regression class the char-literal fix above closes.
 
-Both new scopes are subject to the IDENTICAL adjacent-identifier rule and
-in-bounds check the original `_DOC_SEARCH_ROOTS` form uses — the extension
-buys coverage, never a weaker check.
+  * **`_PLAN_CONTRACT_ROOTS`, un-pinned `.md` files only** (a file under
+    `docs/plans/66-tower-profile/` that carries NO well-formed
+    `citations-resolve-at:` header — module doc's "Never-checked must
+    never read as checked-clean" section below): such a file is
+    HEAD-relative by definition, the same as any doc outside every
+    plan-contract convention entirely, so it gets the SAME whole-file-text
+    full-path scan `_DOC_SEARCH_ROOTS` gets rather than silently falling
+    through every scope above unchecked. A companion doc like this plan
+    group's own `README.md` names real driver-script line numbers this
+    way (`` `_checkpoint_identity_probe` (`ci/scripts/perf/
+    profile_421_legs.sh:423-446`) ``) — an ordinary, identifier-adjacent
+    full-path citation, never the frozen contract's own bare-basename
+    prose form (that form is opt-in twice over: under this root AND
+    epoch-pinned — see "A frozen pre-registration's OWN citation shape is
+    prose, not identifier-adjacent" below). An EPOCH-PINNED file under
+    this same root (`CONTRACT.md`) is deliberately excluded from THIS
+    scope: its full-path citations resolve sha-relative to its own epoch
+    through `_check_plan_contract_citations` instead, never HEAD-relative
+    through this whole-file-text scan.
+
+All three new scopes are subject to the IDENTICAL adjacent-identifier rule
+and in-bounds check the original `_DOC_SEARCH_ROOTS` form uses — the
+extension buys coverage, never a weaker check.
 
 ## A frozen pre-registration's citations are pinned to their own epoch
 
@@ -1766,15 +1786,27 @@ def _rust_comment_line_spans(text: str) -> list[tuple[int, int]]:
     return spans
 
 
-def _full_path_mode(path: Path) -> str | None:
+def _full_path_mode(path: Path, text: str) -> str | None:
     """Which full-path citation scanning mode applies to `path`, or `None`
     if the full-path form is disabled for it entirely (module doc's "The
     full-path form's coverage extension" section):
 
       - `"text"`: the ENTIRE file text is scanned -- `_DOC_SEARCH_ROOTS`
-        (any suffix; the original scope) and `_PERF_FULL_PATH_ROOTS`
+        (any suffix; the original scope), `_PERF_FULL_PATH_ROOTS`
         (`.sh`/`.py` only, excluding this checker's own implementation and
-        test file, `_PERF_FULL_PATH_EXCLUDE`).
+        test file, `_PERF_FULL_PATH_EXCLUDE`), and a `_PLAN_CONTRACT_ROOTS`
+        `.md` file that carries NO well-formed `citations-resolve-at:`
+        header (module doc's "Never-checked must never read as
+        checked-clean" section: such a file is HEAD-relative by
+        definition -- never epoch-pinned, since it declared no epoch to
+        pin against -- so it gets the SAME whole-file-text full-path scan
+        `_DOC_SEARCH_ROOTS`/`_PERF_FULL_PATH_ROOTS` already get, rather
+        than silently carrying zero full-path coverage the way a bare
+        `.md` file outside every scope above would; an EPOCH-PINNED file
+        under this same root is deliberately excluded here -- its
+        full-path citations are resolved sha-relative to its own epoch by
+        `_check_plan_contract_citations` instead, never HEAD-relative
+        through this scan).
       - `"comments"`: only Rust LINE-comment text is scanned (via
         `_rust_comment_line_spans`) -- `_CRATE_COMMENT_ROOTS` (`.rs` only).
       - `None`: the full-path form does not apply; only the basename form
@@ -1790,6 +1822,10 @@ def _full_path_mode(path: Path) -> str | None:
         return "text"
     if path.suffix == ".rs" and _is_under(path, _CRATE_COMMENT_ROOTS):
         return "comments"
+    if path.suffix == ".md" and _is_under(path, _PLAN_CONTRACT_ROOTS):
+        epoch_sha, _epoch_header_error = _file_citations_epoch(path, text)
+        if epoch_sha is None:
+            return "text"
     return None
 
 
@@ -1805,7 +1841,7 @@ def _cited_targets(path: Path, text: str) -> list[tuple[int, str, Path, int]]:
     its more specific form.
     """
     spans: list[tuple[int, int, str, Path, int]] = []
-    mode = _full_path_mode(path)
+    mode = _full_path_mode(path, text)
     if mode == "text":
         for m in _full_path_citation_re().finditer(text):
             rel = m.group("path")

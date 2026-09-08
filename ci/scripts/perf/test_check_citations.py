@@ -2130,6 +2130,95 @@ class PlanContractCitationTests(GitFixture):
         )
 
 
+class PlanContractHeadRelativeFullPathTests(GitFixture):
+    """The class fix for the audit's stale-citation-the-gate-cannot-see
+    finding: a `_PLAN_CONTRACT_ROOTS` `.md` file that carries NO
+    `citations-resolve-at:` header is HEAD-relative by definition (module
+    doc's "Never-checked must never read as checked-clean" section already
+    says so in prose -- `_full_path_mode` must actually turn full-path
+    scanning ON for such a file, never leave it silently uncovered the way
+    `docs/plans/66-tower-profile/README.md`'s own stale
+    `_checkpoint_identity_probe`/`preflight_probe` citations went unnoticed
+    by exactly this gap). A property test (a wrong line number is always
+    reported, a right one always passes), never a grep for the one
+    known-bad string.
+    """
+
+    def setUp(self):
+        super().setUp()
+        cc.REPO_ROOT = self.root
+        # An unrelated, never-matched entry -- `_citation_re` builds its
+        # pattern by joining `_KNOWN_FILES`'s keys, and an EMPTY dict
+        # degrades to an empty alternation that matches any bare `:<digit>`
+        # with an empty `file` group (a pre-existing footgun this fixture
+        # sidesteps the same way `MaintainerGuideFullPathTests` does).
+        cc._KNOWN_FILES = {"unrelated.rs": self.root / "unrelated.rs"}
+        cc._SEARCH_ROOTS = ()
+        cc._DOC_SEARCH_ROOTS = ()
+        cc._PERF_FULL_PATH_ROOTS = ()
+        cc._PLAN_CONTRACT_ROOTS = (self.root / "docs" / "plans" / "66-tower-profile",)
+
+    def _fixture(self, target_body: str, doc_body: str, doc_name: str = "README.md") -> Path:
+        self._write("ci/scripts/perf/driver.sh", target_body)
+        return self._write(f"docs/plans/66-tower-profile/{doc_name}", doc_body)
+
+    def test_a_correct_full_path_citation_resolves(self):
+        doc = self._fixture(
+            "line 1\nline 2\nline 3\nline 4\npreflight_probe() {\n",
+            "`preflight_probe` (`ci/scripts/perf/driver.sh:5`)\n",
+        )
+        self._commit("add driver and companion doc")
+        self.assertEqual(cc.check_file(doc), [])
+
+    def test_a_wrong_line_number_pointing_at_a_different_function_is_red(self):
+        """THE audit's own regression shape: a citation whose line number
+        now falls inside a DIFFERENT function's body must be reported --
+        never silently read as resolved because no full-path scanning mode
+        applied to this file at all (the bug this class fix closes)."""
+        doc = self._fixture(
+            "fi\nline 2\nline 3\nline 4\npreflight_probe() {\n",
+            "`preflight_probe` (`ci/scripts/perf/driver.sh:1`)\n",
+        )
+        self._commit("add driver and companion doc")
+        violations = cc.check_file(doc)
+        self.assertEqual(len(violations), 1, [str(v) for v in violations])
+        self.assertIn("STALE", violations[0].message)
+
+    def test_a_missing_full_path_target_still_fails_loudly(self):
+        doc = self._fixture(
+            "line 1\npreflight_probe() {\n",
+            "`preflight_probe` (`ci/scripts/perf/no_such_driver.sh:2`)\n",
+        )
+        self._commit("add driver and companion doc")
+        violations = cc.check_file(doc)
+        self.assertEqual(len(violations), 1, [str(v) for v in violations])
+        self.assertIn("does not exist", violations[0].message)
+
+    def test_an_epoch_pinned_sibling_keeps_its_current_sha_relative_behaviour(self):
+        """`CONTRACT.md` (or any epoch-pinned `.md` under the same root) is
+        deliberately EXCLUDED from this new HEAD-relative scope -- it keeps
+        resolving sha-relative to its own declared epoch through
+        `_check_plan_contract_citations` only; this new mode must never
+        also turn on for it (which would re-resolve its frozen citations
+        against HEAD, the exact drift the epoch-pin convention exists to
+        prevent)."""
+        self._write("crates/foo/trainer.rs", "line one\n")
+        good_sha = self._commit("add trainer.rs")
+        contract = self._write(
+            "docs/plans/66-tower-profile/CONTRACT.md",
+            f"<!-- citations-resolve-at: {good_sha} -->\n\n`trainer.rs:1`\n",
+        )
+        readme = self._fixture(
+            "line 1\npreflight_probe() {\n",
+            "`preflight_probe` (`ci/scripts/perf/driver.sh:2`)\n",
+        )
+        self._commit("add contract, driver, and companion doc")
+        self.assertIsNone(cc._full_path_mode(contract, contract.read_text()))
+        self.assertEqual(cc._full_path_mode(readme, readme.read_text()), "text")
+        self.assertEqual(cc.check_file(contract), [])
+        self.assertEqual(cc.check_file(readme), [])
+
+
 class BasenameMapHeaderTests(GitFixture):
     """The `citations-basename-map:` header (module doc's "An ambiguous bare
     basename can be disambiguated by a declared header map" section) --

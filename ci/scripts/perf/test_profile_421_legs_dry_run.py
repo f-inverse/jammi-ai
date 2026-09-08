@@ -164,19 +164,21 @@ class DryRunSmokeTests(unittest.TestCase):
     def test_kernel_census_runs_for_real_under_dry_run_and_census_ok_is_earned(self):
         """`census_ok`/`census_exit` in a DRY_RUN manifest must be EARNED by
         an actual passing `kernel_census.py` invocation, never DEFAULTED by
-        a `run_cmd` no-op that never ran anything: the DRY_RUN `nsys export`
-        stub copies a real, committed, schema-valid sqlite fixture
-        (`fixtures/nsys_kernel_census/{n,m}.sqlite`) into place and
-        `kernel_census.py` runs unconditionally -- this asserts the
-        MECHANISM, not just the boolean: `census.json` exists with the
-        keys `build_report` actually emits, `nsys_sqlite_schema_ok` is
-        `True` (a key `census()` can only set by successfully reading a
-        real `CUPTI_ACTIVITY_KIND_KERNEL`/`StringIds` schema), and this
-        script's own captured stdout carries `kernel_census.py`'s own
-        `steps_diff=...` success line -- a touch-empty sqlite would instead
-        produce a `KernelTableMissingError` (leg INVALID, `census_ok`
-        `false`), and a no-op `run_cmd` would produce NEITHER a
-        `census.json` NOR this stdout line at all."""
+        a stub `nsys export` that never wrote a real sqlite export at all:
+        the DRY_RUN `nsys export` stub (`fake_nsys.sh`, written out by
+        `run_traced`'s own DRY_RUN branch) copies a real, committed,
+        schema-valid sqlite fixture (`fixtures/nsys_kernel_census/{n,m}.
+        sqlite`) into place and `kernel_census.py` runs unconditionally --
+        this asserts the MECHANISM, not just the boolean: `census.json`
+        exists with the keys `build_report` actually emits,
+        `nsys_sqlite_schema_ok` is `True` (a key `census()` can only set by
+        successfully reading a real `CUPTI_ACTIVITY_KIND_KERNEL`/
+        `StringIds` schema), and this script's own captured stdout carries
+        `kernel_census.py`'s own `steps_diff=...` success line -- a
+        touch-empty sqlite would instead produce a `KernelTableMissingError`
+        (leg INVALID, `census_ok` `false`), and a stub that never wrote a
+        real export at all would produce NEITHER a `census.json` NOR this
+        stdout line at all."""
         with tempfile.TemporaryDirectory() as out_dir:
             result = run_dry(out_dir, legs_only="clip-text-A1")
             self.assertEqual(result.returncode, 0, _fail_msg(result))

@@ -293,6 +293,30 @@ fn arrow_to_audio_path_valued_bad_row_keeps_the_documented_prefix_and_appends_th
     );
 }
 
+/// The additive slack term for the gross always-on bar below, derived from
+/// THIS run's own measured timer floor rather than a fixed wall-clock
+/// constant. A fixed `5ms` either dominates the bar on a fast box (making it
+/// vacuous — nothing this cheap could ever regress by more than 5ms) or does
+/// nothing on a slow/noisy one; a slack derived from the box's own timer
+/// resolution scales with the machine the test actually runs on.
+///
+/// Takes the MIN of `K` back-to-back `Instant::now()`/`elapsed()` round trips
+/// — the cheapest operation this test can time, so its minimum is a floor on
+/// this box's timer/scheduler overhead — then scales it up by a constant
+/// factor so the slack is comfortably above ordinary scheduling jitter
+/// without being so large it never fires on a real regression.
+fn timer_floor_slack() -> std::time::Duration {
+    const K: u32 = 500;
+    const SCALE: u32 = 200;
+    let mut floor = std::time::Duration::MAX;
+    for _ in 0..K {
+        let start = std::time::Instant::now();
+        let elapsed = start.elapsed();
+        floor = floor.min(elapsed);
+    }
+    floor * SCALE
+}
+
 // ─── n = 1 serving-latency measurement (before vs after) ───────────────────
 
 /// The pre-unit sequential per-image write, reproduced here byte-for-byte
@@ -450,13 +474,21 @@ fn n1_image_request_latency_before_vs_after() {
     // be dramatically slower than "before" — a regression that big (a stray
     // per-call thread-pool install, a lock acquired every request, ...) is a
     // real bug the default suite should catch on every run, not just an
-    // opted-in one. `before×3 + 5ms` is generous enough to absorb ordinary
-    // CI-machine noise while still catching an order-of-magnitude regression.
-    let gross_bar = before.mul_f64(3.0) + std::time::Duration::from_millis(5);
+    // opted-in one. The additive slack term is this run's own measured timer
+    // floor (see `timer_floor_slack`'s doc), not a fixed wall-clock constant
+    // that would dominate the bar on a fast box and do nothing on a slow one;
+    // `before×3 + slack` is still generous enough to absorb ordinary
+    // CI-machine noise while catching an order-of-magnitude regression.
+    let slack = timer_floor_slack();
+    let gross_bar = before.mul_f64(3.0) + slack;
+    println!(
+        "n=1 image front-end gross bar: timer_floor_slack={slack:?} before={before:?} \
+         after={after:?} bar(3x before + slack)={gross_bar:?}"
+    );
     assert!(
         after <= gross_bar,
         "n=1 request latency regressed far beyond a gross always-on bar: \
-         before={before:?} after={after:?} bar(3x before + 5ms)={gross_bar:?}"
+         before={before:?} after={after:?} bar(3x before + timer_floor_slack {slack:?})={gross_bar:?}"
     );
 
     if std::env::var_os("JAMMI_FRONTEND_N1_LATENCY").is_some() {

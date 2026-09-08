@@ -82,16 +82,17 @@ impl HttpBackend {
             .first()
             .map(|d| d.embedding.len())
             .unwrap_or(0);
-        let float_outputs: Vec<Vec<f32>> = response.data.into_iter().map(|d| d.embedding).collect();
-        let n = float_outputs.len();
-
-        Ok(BackendOutput {
-            float_outputs,
-            string_outputs: Vec::new(),
-            row_status: vec![true; n],
-            row_errors: vec![String::new(); n],
-            shapes: vec![(n, dim)],
-        })
+        let n = response.data.len();
+        // `BackendOutput`'s row-major invariant (see its doc): output head 0
+        // is ONE flattened `[n, dim]` buffer, never one `Vec` per row. Build
+        // through `BackendOutput::single_head` so a row whose embedding width
+        // disagrees with the first row's fails the CONSTRUCTOR, rather than
+        // silently misaligning every later row's slice.
+        let mut flat = Vec::with_capacity(n * dim);
+        for d in &response.data {
+            flat.extend_from_slice(&d.embedding);
+        }
+        BackendOutput::single_head(flat, n, dim, vec![true; n], vec![String::new(); n])
     }
 }
 

@@ -223,6 +223,22 @@ where
         .collect())
 }
 
+/// The sample count [`resample_linear`] produces for `len` input samples
+/// resampled from `from_rate` to `to_rate`, WITHOUT doing the resample —
+/// shared by [`resample_linear`] itself and by
+/// [`preprocess_clap_fusion_indexed`]'s pre-check, which needs this exact
+/// arithmetic to refuse a clip that would round to zero output samples
+/// BEFORE the parallel per-clip stage ever runs `repeatpad` on it (a
+/// zero-length `repeatpad` input is an integer-division-by-zero panic:
+/// `max_length / len` with `len == 0`).
+fn resampled_len(len: usize, from_rate: u32, to_rate: u32) -> usize {
+    if from_rate == to_rate || len == 0 {
+        return len;
+    }
+    let ratio = to_rate as f64 / from_rate as f64;
+    ((len as f64) * ratio).round() as usize
+}
+
 /// Resample mono PCM from `from_rate` to `to_rate` by linear interpolation.
 ///
 /// Linear interpolation is the right primitive for a feature-extraction
@@ -234,7 +250,7 @@ pub fn resample_linear(samples: &[f32], from_rate: u32, to_rate: u32) -> Vec<f32
         return samples.to_vec();
     }
     let ratio = to_rate as f64 / from_rate as f64;
-    let out_len = ((samples.len() as f64) * ratio).round() as usize;
+    let out_len = resampled_len(samples.len(), from_rate, to_rate);
     let mut out = Vec::with_capacity(out_len);
     for i in 0..out_len {
         let src_pos = i as f64 / ratio;
@@ -457,6 +473,29 @@ pub fn preprocess_clap_fusion_indexed(
             row_ids.len(),
             clips.len()
         )));
+    }
+    // A clip with zero raw samples, or one so short that resampling to
+    // `config.sample_rate` rounds it to zero samples, feeds `repeatpad`'s
+    // `max_length / len` with `len == 0` — an integer-division-by-zero panic.
+    // Refuse both causes here, in a SEQUENTIAL pass over every clip, before
+    // the parallel per-clip stage below ever dispatches a closure over them
+    // (this is a check before the parallel stage, not inside it: the
+    // `par_chunks_mut` writer and `clap_fusion_row` stay untouched).
+    for (clip, &row) in clips.iter().zip(row_ids.iter()) {
+        if clip.samples.is_empty() {
+            return Err(JammiError::Inference(format!(
+                "CLAP fusion row {row}: clip has zero samples"
+            )));
+        }
+        if resampled_len(clip.samples.len(), clip.sample_rate, config.sample_rate) == 0 {
+            return Err(JammiError::Inference(format!(
+                "CLAP fusion row {row}: resampling {} sample(s) from {} Hz to {} Hz rounds to \
+                 zero samples",
+                clip.samples.len(),
+                clip.sample_rate,
+                config.sample_rate
+            )));
+        }
     }
 
     let filters = mel_filterbank_hz(config);
@@ -1246,6 +1285,53 @@ mod tests {
         let err = preprocess_clap_fusion(&[clip], &config, &Device::Cpu)
             .expect_err("max_length_s == 0 must be a typed error, not a silent shape");
         assert!(err.to_string().contains("max_length_s"));
+    }
+
+    // -- Empty-clip refusal (#421 frontend follow-on, round 3 advisory) ------
+    //
+    // Pre-fix, both causes below feed `repeatpad`'s `max_length / len` with
+    // `len == 0`, an integer-division-by-zero panic — the fixed config here
+    // passes `ClapFrontendConfig::validate()` (unlike the zero-sample_rate
+    // case above), so only a per-clip length check catches them.
+
+    #[test]
+    fn preprocess_clap_fusion_rejects_a_zero_sample_clip_without_panicking() {
+        let clip = DecodedAudio {
+            samples: Vec::new(),
+            sample_rate: 16_000,
+        };
+        let config = tiny_fusion_config();
+        let err = preprocess_clap_fusion(&[clip], &config, &Device::Cpu)
+            .expect_err("a zero-sample clip must be a typed error, not a division-by-zero panic");
+        assert!(err.to_string().contains("zero samples"));
+    }
+
+    #[test]
+    fn preprocess_clap_fusion_rejects_a_clip_that_resamples_to_zero_samples() {
+        // 1 sample at 1,000,000 Hz resampled down to 16,000 Hz: ratio 0.016,
+        // round(1 * 0.016) == 0.
+        let clip = DecodedAudio {
+            samples: vec![0.5],
+            sample_rate: 1_000_000,
+        };
+        let config = tiny_fusion_config();
+        assert_eq!(config.sample_rate, 16_000);
+        let err = preprocess_clap_fusion(&[clip], &config, &Device::Cpu)
+            .expect_err("a clip that resamples to zero samples must be a typed error, not a panic");
+        assert!(err.to_string().contains("rounds to zero samples"));
+    }
+
+    #[test]
+    fn preprocess_clap_fusion_indexed_names_the_row_of_a_zero_sample_clip() {
+        let good = decode_audio_bytes(&sine_wav(440.0, 16_000, 2000)).unwrap();
+        let bad = DecodedAudio {
+            samples: Vec::new(),
+            sample_rate: 16_000,
+        };
+        let config = tiny_fusion_config();
+        let err = preprocess_clap_fusion(&[good, bad], &config, &Device::Cpu)
+            .expect_err("the second clip's zero samples must be refused");
+        assert!(err.to_string().contains("row 1"));
     }
 
     // -- Media front-end parallelization (#421 follow-on) --------------------

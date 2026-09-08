@@ -583,12 +583,12 @@ impl InferenceSession {
             .forward(&[text_array], ModelTask::TextEmbedding)
             .map_err(|e| JammiError::Inference(format!("encode_query forward: {e}")))?;
 
-        // Extract the first (and only) vector from the output
-        let dim = output.shapes.first().map(|(_, c)| *c).unwrap_or(0);
-        if output.float_outputs.is_empty() || output.float_outputs[0].is_empty() {
-            return Err(JammiError::Inference("No embedding output".into()));
-        }
-        Ok(output.float_outputs[0][..dim].to_vec())
+        // A single-row query has no other row to fall back on, so an empty or
+        // otherwise refused text row must surface as `Err`, never as the
+        // all-zero placeholder a per-row backend substitutes for a
+        // decode/preprocess failure (mirroring `encode_image_query` /
+        // `encode_audio_query` below).
+        Ok(output.single_row_or_err(0)?.to_vec())
     }
 
     /// Generate embeddings for a source and persist to Jammi DB.

@@ -37,20 +37,33 @@ async fn http_backend_embedding_and_errors() {
         .await
         .unwrap();
 
+    // `BackendOutput`'s row-major invariant: ONE flattened `[rows, dim]`
+    // buffer in `float_outputs[0]`, never one `Vec` per row (#421 frontend
+    // follow-on, round 3: `HttpBackend` built the latter before this fold).
     assert_eq!(
         result.float_outputs.len(),
-        2,
-        "Should have 2 embedding vectors"
+        1,
+        "one flattened output head, not one Vec per row"
     );
     assert_eq!(
         result.float_outputs[0].len(),
-        3,
-        "Each vector should have dim 3"
+        6,
+        "2 rows * dim 3, flattened row-major"
     );
     assert_eq!(result.shapes[0], (2, 3));
     assert!(
         result.row_status.iter().all(|&s| s),
         "All rows should succeed"
+    );
+    assert_eq!(
+        result.single_row_or_err(0).unwrap(),
+        &[0.1_f32, 0.2, 0.3],
+        "row 0 must read back its own embedding, in row-major order"
+    );
+    assert_eq!(
+        result.single_row_or_err(1).unwrap(),
+        &[0.4_f32, 0.5, 0.6],
+        "row 1 must read back its own embedding, not row 0's"
     );
 
     // --- Non-embedding task returns error ---

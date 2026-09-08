@@ -442,6 +442,30 @@ workspace ships every publishable crate at the same
   the positive-proof equation exactly (all three keys, non-vacuity on `calls`, the GELU seam
   non-zero on HTSAT / zero on both OpenCLIP towers) rather than witnessing it on tiny_bert/text
   alone.
+- **`InferenceSession::encode_text_query` refuses an empty/null text query instead of returning an
+  all-zero vector (#421 frontend follow-on, round 3 adversarial audit).** It read
+  `output.float_outputs[0][..dim].to_vec()` directly, bypassing the checked
+  `BackendOutput::single_row_or_err` accessor `encode_image_query`/`encode_audio_query` already went
+  through (see the entry above) — an empty string still marks its row `row_status[0] == false`
+  (`"Empty or null text input"`, the same convention a corrupt image/audio row uses), so the same
+  silent zero-vector-instead-of-`Err` bug this session's earlier fold closed for image/audio was
+  still open for text. `encode_text_query` now goes through `single_row_or_err(0)` like its two
+  siblings. `BackendOutput` additionally documents its output-head-0 row-major invariant
+  (`shapes[0] = (rows, dim)`, `row_status`/`row_errors` one entry per row, `float_outputs[0].len() ==
+  rows * dim`) and both checked accessors now derive the row count from `shapes[0].0` and refuse, by
+  name, on any producer that violates it (an empty/short `row_status` previously let
+  `all_rows_or_err` fail OPEN — its failed-row scan found nothing wrong and returned the buffer
+  whole, as if every row had succeeded — while `single_row_or_err` already failed closed on the same
+  input); a new `BackendOutput::single_head` constructor validates the invariant at construction
+  time, and `HttpBackend`'s embedding response now builds through it, flattened row-major, instead
+  of one `Vec` per row (a convention neither accessor could read correctly).
+- **`preprocess_clap_fusion`/`preprocess_clap_fusion_indexed` refuse a clip with zero raw samples, or
+  one so short that resampling to the target sample rate rounds it to zero samples, instead of
+  panicking (#421 frontend follow-on, round 3 advisory).** Both feed `repeatpad`'s `max_length / len`
+  with `len == 0` — an integer-division-by-zero panic that `ClapFrontendConfig::validate()` cannot
+  catch, since neither cause is a domain violation of the config itself. The check runs sequentially
+  over every clip before the parallel per-clip preprocessing stage ever dispatches a closure over
+  them.
 
 ### Breaking
 - `jammi_encoders::{AnyAudioEncoder, AudioEncoder}` are removed

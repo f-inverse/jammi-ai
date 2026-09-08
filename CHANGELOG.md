@@ -210,10 +210,10 @@ workspace ships every publishable crate at the same
   ACTIVATE/DECLINE/UNRESOLVED rule per candidate port; `kernel_census.py` now keys each
   GPU-kernel bucket on `COALESCE(demangledName, shortName)` rather than `shortName`
   alone, a sum-preserving refinement that un-collapses cutlass's `Kernel2<...>` template
-  wrapper's distinct bf16 GEMM tile instantiations (previously summed into one anonymous
-  row that could trip the attribution's known-kernel-name gate) without moving any
-  top-line `gpu_kernel_us_per_step`/wall/front/busy number. **No kernel port lands under
-  #421**: all four candidate ports the contract named (`C-ATTN-CLIP-text`,
+  wrapper's distinct bf16 GEMM tile instantiations -- rather than summing them into one
+  anonymous row that could trip the attribution's known-kernel-name gate -- without
+  moving any top-line `gpu_kernel_us_per_step`/wall/front/busy number. **No kernel port
+  lands under #421**: all four candidate ports the contract named (`C-ATTN-CLIP-text`,
   `C-MLP-CLIP-text`, `C-ATTN-CLIP-vision`, `C-MLP-CLIP-vision`) resolve **UNRESOLVED** —
   none clears ACTIVATE (`s_wall≥10%` on any decision-grade leg) or DECLINE (combined
   share <5% on wall AND busy on every decision-grade leg), F32 and BF16 alike. This is

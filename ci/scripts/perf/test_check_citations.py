@@ -214,7 +214,7 @@ class LookbackWindowBacktickPairingTests(CheckCitationsFixture):
 class UnresolvableCitationsFail(CheckCitationsFixture):
     def test_stale_line_number_is_a_violation(self):
         """THE F7-CLASS REGRESSION this script exists to catch: the line
-        number is IN BOUNDS, but the code at that line is no longer what
+        number is IN BOUNDS, but the code at that line does not match what
         the citation names — an in-bounds-only check would miss this.
         """
         self._set_target("fake.rs", "line one\nlet totally_different = 1;\n")
@@ -260,17 +260,18 @@ class UnresolvableCitationsFail(CheckCitationsFixture):
 
 
 class PyFileSupportTests(CheckCitationsFixture):
-    """Round-4 audit fold-in on PR #372: `_KNOWN_FILES` used to resolve ONLY
-    `finetune_step.rs`/`grad_oracle.rs` — the dozens of `.py:<n>` citations
-    in `grad_oracle.rs`'s and `ab_merge.py`'s own determinant tables (naming
-    `torch_grad_oracle.py`/`torch_finetune_step.py` lines) were NEVER
-    mechanically re-checked at all, which is exactly how the `.py` line
-    drift this round's own audit caught went unnoticed. This class pins the
-    SAME `.rs` predicates (`UnresolvableCitationsFail`'s own shape) now also
-    hold for a `.py` target, via a THROWAWAY fixture -- never assuming
-    `_KNOWN_FILES` already contains a real `.py` entry (this class swaps its
-    own fixture in via `_set_target`, same as every other test in this
-    file).
+    """`_KNOWN_FILES` resolves BOTH `.rs` and `.py` targets: the dozens of
+    `.py:<n>` citations in `grad_oracle.rs`'s and `ab_merge.py`'s own
+    determinant tables (naming `torch_grad_oracle.py`/`torch_finetune_step.py`
+    lines) are mechanically re-checked exactly like an `.rs` citation --
+    nothing about the correctness argument for line-content resolution is
+    `.rs`-specific, so a `.py` line drifting out from under a citation is
+    exactly as dangerous, and exactly as checkable, as an `.rs` line doing
+    the same. This class pins the SAME `.rs` predicates
+    (`UnresolvableCitationsFail`'s own shape) also hold for a `.py` target,
+    via a THROWAWAY fixture -- never assuming `_KNOWN_FILES` already
+    contains a real `.py` entry (this class swaps its own fixture in via
+    `_set_target`, same as every other test in this file).
     """
 
     def test_resolvable_py_citation_passes(self):
@@ -280,10 +281,10 @@ class PyFileSupportTests(CheckCitationsFixture):
         self.assertEqual(violations, [], [str(v) for v in violations])
 
     def test_stale_py_line_number_is_a_violation(self):
-        """THE REPRODUCTION this round's own fold-in closes: a `.py` line
-        that has DRIFTED (in-bounds, but the code at that line is no longer
-        what the citation names) must fail loudly, exactly like the `.rs`
-        case `UnresolvableCitationsFail::test_stale_line_number_is_a_violation`
+        """A `.py` line that has DRIFTED (in-bounds, but the code at that
+        line does not match what the citation names) fails loudly, exactly
+        like the `.rs` case
+        `UnresolvableCitationsFail::test_stale_line_number_is_a_violation`
         already pins.
         """
         self._set_target("fake.py", "line one\ndef totally_different():\n    pass\n")
@@ -1681,15 +1682,14 @@ class PlanContractCitationTests(GitFixture):
 
     def test_contract_md_without_the_epoch_header_is_a_violation_never_a_silent_skip(self):
         """Never-checked must never read as checked-clean: `CONTRACT.md`
-        itself (`_is_frozen_contract_file`'s FILENAME arm, restored in the
-        round-5 fold-in as a UNION alongside the marker arms below) with NO
-        `citations-resolve-at:` header, and carrying NEITHER declared
-        marker either, is itself a `Violation` -- a marker-ONLY definition
-        silently stopped catching this exact, un-decorated file the moment
-        neither marker happened to be present, mechanically indistinguishable
-        from "this was never a contract"; the old behaviour (silently skip
-        the whole plan-contract citation scan, report zero violations) was
-        equally indistinguishable from "every citation resolves".
+        itself (`_is_frozen_contract_file`'s FILENAME arm, independent of
+        the marker arms below) with NO `citations-resolve-at:` header, and
+        carrying NEITHER declared marker either, is itself a `Violation` --
+        a marker-ONLY definition would fail to catch this exact,
+        un-decorated file, which is mechanically indistinguishable from
+        "this was never a contract"; silently skipping the whole
+        plan-contract citation scan instead (reporting zero violations)
+        would be equally indistinguishable from "every citation resolves".
         """
         self._write("crates/foo/trainer.rs", "line one\n")
         self._commit("add trainer.rs")
@@ -1780,6 +1780,23 @@ class PlanContractCitationTests(GitFixture):
             "```\n# CONTRACT\n```\n\nSome prose.\n\n`trainer.rs:999`\n",
         )
         self._commit("add a doc whose only heading-shaped line is fenced")
+        violations = cc.check_file(doc)
+        self.assertEqual(violations, [], [str(v) for v in violations])
+
+    def test_a_frozen_comment_inside_a_fence_is_never_mistaken_for_a_declared_marker(self):
+        """The comment-marker scan is fence-aware too, exactly like the
+        heading scan (same shared `_non_fenced_lines` scan): a doc that
+        QUOTES the `<!-- Frozen ledger ts: ... -->` convention inside a
+        ``` fence (e.g. showing readers what a frozen file's own opening
+        comment looks like), with no REAL marker or heading anywhere else
+        in the search window, must never be treated as itself frozen --
+        the file is not recognized as frozen at all, so it produces no
+        violation (no header mandated)."""
+        doc = self._write(
+            "NOTES.md",
+            "```\n<!-- Frozen ledger ts: 2026-01-01 -->\n```\n\nSome prose.\n\n`trainer.rs:999`\n",
+        )
+        self._commit("add a doc whose only frozen-marker-shaped line is fenced")
         violations = cc.check_file(doc)
         self.assertEqual(violations, [], [str(v) for v in violations])
 

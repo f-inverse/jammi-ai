@@ -520,12 +520,12 @@ def _magnitude_range(mapping: dict[str, float]) -> str:
     `evidence` (only the resulting numbers are), so every caller of this
     helper GATES the direction verbs on an explicit, live sign check of the
     SAME signed deltas `evidence` carries -- taking `abs()` unconditionally
-    (as this helper used to) would silently keep asserting "cuts"/"drops"
-    even the moment a future run's own deltas stopped being uniformly
-    negative, which is exactly the "prose stops matching the sign the
-    artifact actually recorded" drift this gate exists to make impossible.
-    Refuses (`ValueError`, `--check` red) rather than render a directional
-    verb the run's own signed evidence does not license.
+    would keep asserting "cuts"/"drops" even once a future run's own
+    deltas are not uniformly negative, which is exactly the "prose stops
+    matching the sign the artifact actually recorded" drift this gate
+    exists to make impossible. Refuses (`ValueError`, `--check` red) rather
+    than render a directional verb the run's own signed evidence does not
+    license.
     """
     if not all(v < 0.0 for v in mapping.values()):
         raise ValueError(
@@ -740,9 +740,10 @@ def render_changelog_421_entry(artifact: dict) -> str:
         "ACTIVATE/DECLINE/UNRESOLVED rule per candidate port; `kernel_census.py` now keys "
         "each GPU-kernel bucket on `COALESCE(demangledName, shortName)` rather than "
         "`shortName` alone, a sum-preserving refinement that un-collapses cutlass's "
-        "`Kernel2<...>` template wrapper's distinct bf16 GEMM tile instantiations (previously "
-        "summed into one anonymous row that could trip the attribution's known-kernel-name "
-        "gate) without moving any top-line `gpu_kernel_us_per_step`/wall/front/busy number. "
+        "`Kernel2<...>` template wrapper's distinct bf16 GEMM tile instantiations -- rather "
+        "than summing them into one anonymous row that could trip the attribution's "
+        "known-kernel-name gate -- without moving any top-line "
+        "`gpu_kernel_us_per_step`/wall/front/busy number. "
         "**No kernel port lands under #421**: all four candidate ports the contract named "
         "(`C-ATTN-CLIP-text`, `C-MLP-CLIP-text`, `C-ATTN-CLIP-vision`, `C-MLP-CLIP-vision`) "
         "resolve **UNRESOLVED** — none clears ACTIVATE (`s_wall≥10%` on any decision-grade "

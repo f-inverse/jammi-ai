@@ -470,7 +470,7 @@ class NewBlockRenderTests(unittest.TestCase):
         `clip-launch-bound-batch8` delta (`busy_delta_pct_bf16_vs_f32` or
         `wall_delta_pct_bf16_vs_f32`) has flipped sign (BF16 GREW that
         tower's number instead of shrinking it) -- the shape a run whose
-        own signed deltas no longer license the "cuts"/"drops" blanket verb
+        own signed deltas do not license the "cuts"/"drops" blanket verb
         would actually produce."""
         artifact = _full_synthetic_artifact()
         for finding in artifact["findings"]:

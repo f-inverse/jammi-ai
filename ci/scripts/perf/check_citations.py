@@ -4,25 +4,20 @@ citation under `crates/jammi-bench/**`, `ci/scripts/perf/**`, and
 `crates/jammi-kernels/artifacts/cuda-runs/**` — against the actual file
 content AT HEAD for ordinary living files, or against the CITING artifact's
 own recorded `git_sha` for committed evidence (see this doc's own
-"Committed artifacts are append-only evidence" section below) — advisory
-(i), round-2 audit fix on PR #372; the artifact sha-relative resolution is
-the M1b audit round's own fix.
+"Committed artifacts are append-only evidence" section below).
 
-WHY THIS EXISTS: round 1 of this fix round "corrected" a stale citation in
-`finetune_step.rs` (originally naming Rust source lines 253 through 264,
-"fixed" to name line 290) by eyeballing the diff — but the code had ALREADY
-moved again by the time that commit landed, so the "fixed" citation (line
-290) was ALSO stale (the real line was 299) the moment it was committed.
-`p1_softmax_scale_fold_ab.json` carried this SAME stale line-290 citation in
-TWO fields, and `torch_finetune_step.py`/`README.md` independently carried a
-DIFFERENT stale citation naming Rust source lines 112 and 233 together
-(the second of those two line numbers pointed at unrelated LoRA-builder
-code, not the VRAM baseline capture it was meant to cite) that neither round
-noticed by eye either. A
-citation that is only ever checked "by eye" at commit time is exactly the
-kind of claim this repo's own `implementer-acceptance-clause` ("resolvable
-citations") exists to stop being trusted on prose alone — this script is the
-mechanical re-check, run every CI, not a one-time manual pass.
+WHY THIS EXISTS: a citation's line number can drift out from under it in
+more places than the one spot a hand-edit is likely to look — a corrected
+citation can already be wrong again by the time the correcting commit
+lands, if the cited code moves a second time in between; a JSON artifact
+can carry the SAME citation duplicated across more than one field, each
+needing its own re-check; and a sibling document (a README, a Python
+mirror of the same call site) can carry an INDEPENDENTLY stale citation
+that nothing else in a diff touches. A citation that is only ever checked
+"by eye" at commit time is exactly the kind of claim this repo's own
+`implementer-acceptance-clause` ("resolvable citations") exists to stop
+being trusted on prose alone — this script is the mechanical re-check, run
+every CI, not a one-time manual pass.
 
 CONVENTION THIS SCRIPT ENFORCES: every citation in scope must be immediately
 preceded by a backtick-quoted CODE IDENTIFIER (allowing only
@@ -190,12 +185,10 @@ reported twice.
 
 ## The full-path form's coverage extension: `ci/scripts/perf/**` and crate comments
 
-The full-path form was originally `_DOC_SEARCH_ROOTS`-only; a DOCUMENTED
-RESIDUAL paragraph here used to name two real gaps this left open (found by
-a survey when the form was first added). Both are now closed, each by its
-own scope, never by widening `_DOC_SEARCH_ROOTS` itself (that tuple stays
-"the maintainer guides", a distinct citing-audience from either extension
-below):
+The full-path form covers `_DOC_SEARCH_ROOTS` PLUS two further scopes, each
+kept as its OWN scope rather than folded into `_DOC_SEARCH_ROOTS` itself
+(that tuple stays "the maintainer guides", a distinct citing-audience from
+either extension below):
 
   * **`_PERF_FULL_PATH_ROOTS`** (`ci/scripts/perf/**`, `.sh`/`.py` files
     only — not the `.json` fixtures or `.md` provenance notes living
@@ -232,13 +225,15 @@ below):
     non-match the lone `'` is consumed as an ordinary character and the
     identifier after it is left for normal processing, since it triggers no
     further lexical state on its own). Getting char-literal handling right
-    here is not cosmetic: BEFORE this fix, an unhandled `'"'`/`b'"'` char
-    literal opened a phantom ordinary-string state on its embedded `"` that
-    was never closed until the NEXT unrelated `"` anywhere later in the
-    file — silently swallowing every real `//`/`///`/`//!` comment line in
-    between as unscanned "string content" (measured: dozens of lines lost
-    in this repo's own `crates/jammi-encoders/src/layer_norm.rs` and
-    `crates/jammi-kernels/src/ops/launch_domain.rs`).
+    here is not cosmetic: an unhandled `'"'`/`b'"'` char literal would open
+    a phantom ordinary-string state on its embedded `"` that stays open
+    until the NEXT unrelated `"` anywhere later in the file — silently
+    swallowing every real `//`/`///`/`//!` comment line in between as
+    unscanned "string content", a failure mode that reaches dozens of
+    lines lost in a large enough file (this repo's own
+    `crates/jammi-encoders/src/layer_norm.rs` and
+    `crates/jammi-kernels/src/ops/launch_domain.rs` are both big enough to
+    show it).
 
     Block comments (`/* ... */`) are tracked (including nesting) so a
     `//`-shaped substring inside one is never misread as a line comment,
@@ -419,16 +414,17 @@ ROOTS` `.md` file that is EITHER named `CONTRACT.md` OR whose first
 file class the "frozen pre-registration's citations are pinned to their
 own epoch" section above describes) recognized by the UNION of the literal
 filename and a DECLARED marker -- either arm is independently sufficient:
-`path.name == "CONTRACT.md"` (this plan group's real, un-renamed shape --
-a marker-ONLY definition silently stopped recognizing this exact file the
-moment neither marker happened to be present, which is mechanically
+`path.name == "CONTRACT.md"` (this plan group's real, un-renamed shape,
+which carries no marker of its own -- a marker-ONLY definition would fail
+to recognize this exact, un-decorated file, which is mechanically
 indistinguishable from "this was never a contract"); or either the
 `<!-- Frozen ledger ts: ... -->` HTML comment this contract group's own
 freeze convention opens every frozen file with, or a FIRST `#`-prefixed
-heading line (fence-aware: a heading-shaped line quoted as an example
-inside a ``` / ~~~ fence is skipped, never mistaken for the document's own
-title) in that same window whose text contains "CONTRACT" or "frozen"
-(case-insensitive) -- a LATER heading is never consulted, so recognition
+heading line, BOTH scanned fence-aware (a comment- or heading-shaped line
+quoted as an example inside a ``` / ~~~ fence is skipped for either arm,
+never mistaken for the document's own declared marker or title) in that
+same window whose text contains "CONTRACT" or "frozen" (case-insensitive)
+-- a LATER heading is never consulted, so recognition
 cannot be smuggled in by a deep section title that happens to use either
 word. The marker arm is what still catches a frozen contract RENAMED or
 VERSIONED into its own title (`CONTRACT-v2.5.md`), which the filename arm
@@ -558,33 +554,31 @@ class CitationError(Exception):
 _KNOWN_FILES = {
     "finetune_step.rs": REPO_ROOT / "crates" / "jammi-bench" / "src" / "finetune_step.rs",
     "grad_oracle.rs": REPO_ROOT / "crates" / "jammi-bench" / "src" / "grad_oracle.rs",
-    # round-4 audit fold-in on PR #372: the determinant tables in
-    # `grad_oracle.rs`/`ab_merge.py` cite dozens of `.py:<n>` lines in the
-    # torch reference scripts — those citations were NEVER mechanically
-    # re-checked (this script only knew about the two `.rs` files above),
-    # which is exactly how the `.py` line-drift this round's own audit
-    # caught went unnoticed.
+    # The determinant tables in `grad_oracle.rs`/`ab_merge.py` cite dozens
+    # of `.py:<n>` lines in the torch reference scripts below -- these are
+    # mechanically re-checked exactly like the two `.rs` files above, since
+    # a `.py` line can drift out from under a citation exactly as silently
+    # as an `.rs` line can.
     "torch_grad_oracle.py": REPO_ROOT / "crates" / "jammi-bench" / "reference" / "torch_grad_oracle.py",
     "torch_finetune_step.py": REPO_ROOT / "crates" / "jammi-bench" / "reference" / "torch_finetune_step.py",
 }
 
 # The roots this advisory names, all searched recursively for every file
 # (not just `.py`/`.json` -- a `.md` doc citation is just as resolvable
-# and just as capable of going stale, see README.md's own citation this
-# round fixed).
+# and just as capable of going stale).
 #
-# Unification contract C8.4/NF15: `crates/jammi-kernels/artifacts/cuda-runs`
-# joined this tuple in phase 2, the same PR that `git mv`s the two
+# `crates/jammi-kernels/artifacts/cuda-runs` is a root in its own right,
+# alongside the two `jammi-bench` roots, because it is where the
 # `finetune_step_reference.json`/`p1_softmax_scale_fold_ab.json` baselines
-# OUT of `crates/jammi-bench/baselines/` and into this directory (contract
-# C8) -- without this addition, the moved p1 record's own two citations of
-# finetune_step.rs's batched-forward concatenation call site (see that
-# record's own `_comment`) would silently drop OUT of this script's coverage
-# the moment the move landed (a citation this script used to check would
-# simply never be visited again, not a citation that fails loudly), which is
-# precisely the "coverage regression" pressure-v2 pin H / NF15 named. (This
-# comment deliberately avoids spelling out a bare `file.rs:N` citation of its
-# own -- this script scans `ci/scripts/perf/**`, itself included.)
+# actually live: the moved p1 record's own two citations of
+# `finetune_step.rs`'s batched-forward concatenation call site (see that
+# record's own `_comment`) are citations like any other, and a citation
+# living outside `_SEARCH_ROOTS` is never visited at all -- not a citation
+# that fails loudly, simply one this script cannot see, which is exactly
+# the coverage gap explicit, enumerated roots (never an implicit or
+# inferred set) exist to close. (This comment deliberately avoids spelling
+# out a bare `file.rs:N` citation of its own -- this script scans
+# `ci/scripts/perf/**`, itself included.)
 _SEARCH_ROOTS = (
     REPO_ROOT / "crates" / "jammi-bench",
     REPO_ROOT / "ci" / "scripts" / "perf",
@@ -1165,6 +1159,24 @@ _FROZEN_HEADING_WORD_RE = re.compile(r"contract|frozen", re.IGNORECASE)
 _FENCE_RE = re.compile(r"^(?:```|~~~)")
 
 
+def _non_fenced_lines(lines: list[str]):
+    """Yield each line of `lines` that lies OUTSIDE a ``` / ~~~ fenced
+    code block -- a fence toggles a skip-state, so a marker- or
+    heading-shaped line quoted as an EXAMPLE inside a fence is never
+    mistaken for the document's own declared frozen marker or title.
+    Shared by every arm of `_is_frozen_contract_file`'s marker scan so no
+    arm can be fence-blind while another is fence-aware."""
+    in_fence = False
+    for line in lines:
+        stripped = line.lstrip()
+        if _FENCE_RE.match(stripped):
+            in_fence = not in_fence
+            continue
+        if in_fence:
+            continue
+        yield line
+
+
 def _is_frozen_contract_file(path: Path, text: str) -> bool:
     """Whether `path` (together with its OWN text, since recognition also
     reads content, not just the name) is a frozen pre-registration --
@@ -1189,20 +1201,30 @@ def _is_frozen_contract_file(path: Path, text: str) -> bool:
         filename arm alone would miss. Either marker shape is sufficient on
         its own:
 
-        - `_FROZEN_MARKER_COMMENT_RE` matches anywhere in the window (the
-          `<!-- Frozen ledger ts: ... -->` HTML comment this plan group's
-          own freeze convention opens every frozen file with); or
-        - the FIRST `#`-prefixed heading line in that same window OUTSIDE
-          a fenced code block (fence-aware: a ``` / ~~~ fence toggles a
-          skip-state, so a heading-shaped line quoted as an EXAMPLE inside
-          a fence is never mistaken for this document's own title), if its
-          text matches `_FROZEN_HEADING_WORD_RE` ("contract" or "frozen",
-          case-insensitive). A LATER heading is never consulted once the
-          first non-fenced one is found -- whether or not it matches -- so
-          a document whose first heading is unrelated (a companion
-          `README.md` titled "66 — tower profile close-out") is never
-          accidentally caught by some deeper section heading that happens
-          to mention either word.
+        - `_FROZEN_MARKER_COMMENT_RE` matches anywhere in the window,
+          OUTSIDE a fenced code block (the `<!-- Frozen ledger ts: ... -->`
+          HTML comment this plan group's own freeze convention opens every
+          frozen file with; a comment-shaped line quoted as an EXAMPLE
+          inside a fence is never mistaken for the document's own declared
+          marker); or
+        - the FIRST `#`-prefixed heading line in that same window, also
+          OUTSIDE a fenced code block (a heading-shaped line quoted as an
+          EXAMPLE inside a fence is never mistaken for this document's own
+          title), if its text matches `_FROZEN_HEADING_WORD_RE` ("contract"
+          or "frozen", case-insensitive). A LATER heading is never
+          consulted once the first non-fenced one is found -- whether or
+          not it matches -- so a document whose first heading is unrelated
+          (a companion `README.md` titled "66 — tower profile close-out")
+          is never accidentally caught by some deeper section heading that
+          happens to mention either word.
+
+        Both arms share the SAME `_non_fenced_lines` fence-tracking scan
+        (a ``` / ~~~ fence toggles a skip-state) -- one arm scanning the
+        raw window while the other skips fenced lines would let a doc
+        that merely QUOTES the frozen-comment convention inside a fence
+        get recognized as itself frozen, exactly the false positive the
+        heading arm's own fence-awareness already rules out for a quoted
+        heading.
 
     Deliberately NARROWER than `_plan_contract_scope`: a plan group's
     OTHER `.md` files (a close-out `README.md` discussing or quoting the
@@ -1229,17 +1251,11 @@ def _is_frozen_contract_file(path: Path, text: str) -> bool:
     if path.name == "CONTRACT.md":
         return True
     window = text.splitlines()[:_CITATIONS_EPOCH_HEADER_SEARCH_LINES]
-    for line in window:
+    for line in _non_fenced_lines(window):
         if _FROZEN_MARKER_COMMENT_RE.search(line):
             return True
-    in_fence = False
-    for line in window:
+    for line in _non_fenced_lines(window):
         stripped = line.lstrip()
-        if _FENCE_RE.match(stripped):
-            in_fence = not in_fence
-            continue
-        if in_fence:
-            continue
         if stripped.startswith("#"):
             return bool(_FROZEN_HEADING_WORD_RE.search(stripped.lstrip("#").strip()))
     return False
@@ -1861,12 +1877,11 @@ def _find_adjacent_identifier(ident_spans: list[re.Match], citation_start: int) 
     opening backtick outside the slice, only its closing backtick inside),
     which silently shifts which backticks pair with which for every
     subsequent match in that slice -- a dense table row with several
-    citations close together can trip this (round-4 audit fold-in on PR
-    #372's own row_lengths addition hit it: a `` `...` `` pair straddling
-    the 300-char boundary made the NEXT citation's adjacent-identifier
-    lookup misfire on a truncated fragment like `') | '`). Operating on
-    globally-paired spans and only then filtering to the lookback window
-    makes that class of misparse structurally unreachable.
+    citations close together can trip this (a `` `...` `` pair straddling
+    an arbitrary slice boundary makes the NEXT citation's adjacent-
+    identifier lookup misfire on a truncated fragment like `') | '`).
+    Operating on globally-paired spans and only then filtering to the
+    lookback window makes that class of misparse structurally unreachable.
     """
     window_start = max(0, citation_start - _SEARCH_WINDOW)
     candidates = [m for m in ident_spans if m.end() <= citation_start and m.start() >= window_start]

@@ -2073,15 +2073,17 @@ impl TrainingLoop {
         let output = base
             .forward(&[content], task)
             .map_err(|e| JammiError::FineTune(format!("Encode: {e}")))?;
-        let n = output.shapes[0].0;
-        let dim = output.shapes[0].1;
         // A corrupt training item is a refusal, not a row to skip: reject the
         // whole group on the lowest-index failed row rather than silently
         // training the projection head on the all-zero placeholder the
-        // backend substitutes for a decode/preprocess failure.
+        // backend substitutes for a decode/preprocess failure. Called BEFORE
+        // reading `shapes[0]` below, so an empty-`shapes` producer is refused
+        // by `all_rows_or_err` itself, not an index-out-of-bounds panic on
+        // `shapes[0]`.
         let flat = output
             .all_rows_or_err()
             .map_err(|e| JammiError::FineTune(format!("Encode: {e}")))?;
+        let (n, dim) = output.shapes[0];
         let raw = Tensor::from_vec(flat.to_vec(), (n, dim), &self.device)
             .map_err(|e| JammiError::FineTune(format!("Encode tensor: {e}")))?;
         head.layers[0]

@@ -231,7 +231,20 @@ where
 /// BEFORE the parallel per-clip stage ever runs `repeatpad` on it (a
 /// zero-length `repeatpad` input is an integer-division-by-zero panic:
 /// `max_length / len` with `len == 0`).
+///
+/// `from_rate == 0` is a degenerate source rate a `DecodedAudio` should never
+/// carry (its own decoder refuses one), but this function has no `Result` to
+/// refuse through, so it treats a zero `from_rate` as producing zero output
+/// samples rather than dividing by it: `to_rate as f64 / 0.0` is `+inf`, and
+/// `(len as f64 * inf).round() as usize` saturates to `usize::MAX` — a huge,
+/// confidently wrong length that then feeds `Vec::with_capacity(usize::MAX)`
+/// in [`resample_linear`] instead of the empty-clip guard below ever seeing
+/// it. Returning `0` here lets that same guard catch it by the ordinary
+/// "rounds to zero samples" path.
 fn resampled_len(len: usize, from_rate: u32, to_rate: u32) -> usize {
+    if from_rate == 0 {
+        return 0;
+    }
     if from_rate == to_rate || len == 0 {
         return len;
     }
@@ -485,6 +498,18 @@ pub fn preprocess_clap_fusion_indexed(
         if clip.samples.is_empty() {
             return Err(JammiError::Inference(format!(
                 "CLAP fusion row {row}: clip has zero samples"
+            )));
+        }
+        // Named separately from the "rounds to zero samples" refusal below:
+        // `clip.sample_rate == 0` makes `resampled_len`'s ratio `to_rate /
+        // 0.0`, which (pre-fix) rounds to `usize::MAX` rather than `0` and
+        // slips past that guard, then feeds `Vec::with_capacity(usize::MAX)`
+        // in `resample_linear`. A decoded clip's own decoder already refuses
+        // `sample_rate == 0`, but this is a defense-in-depth check for any
+        // other `DecodedAudio` producer (including this module's own tests).
+        if clip.sample_rate == 0 {
+            return Err(JammiError::Inference(format!(
+                "CLAP fusion row {row}: clip has sample_rate 0"
             )));
         }
         if resampled_len(clip.samples.len(), clip.sample_rate, config.sample_rate) == 0 {
@@ -1287,12 +1312,12 @@ mod tests {
         assert!(err.to_string().contains("max_length_s"));
     }
 
-    // -- Empty-clip refusal (#421 frontend follow-on, round 3 advisory) ------
+    // -- Empty-clip refusal --------------------------------------------------
     //
-    // Pre-fix, both causes below feed `repeatpad`'s `max_length / len` with
-    // `len == 0`, an integer-division-by-zero panic — the fixed config here
-    // passes `ClapFrontendConfig::validate()` (unlike the zero-sample_rate
-    // case above), so only a per-clip length check catches them.
+    // Both causes below feed `repeatpad`'s `max_length / len` with `len ==
+    // 0`, an integer-division-by-zero panic — the fixed config here passes
+    // `ClapFrontendConfig::validate()` (unlike the zero-sample_rate case
+    // above), so only a per-clip length check catches them.
 
     #[test]
     fn preprocess_clap_fusion_rejects_a_zero_sample_clip_without_panicking() {
@@ -1332,6 +1357,37 @@ mod tests {
         let err = preprocess_clap_fusion(&[good, bad], &config, &Device::Cpu)
             .expect_err("the second clip's zero samples must be refused");
         assert!(err.to_string().contains("row 1"));
+    }
+
+    /// Round-4 adversarial audit: a clip carrying `sample_rate == 0` (a
+    /// decoder's own decode path already refuses this, but a directly
+    /// constructed `DecodedAudio` — as every test here does — is not routed
+    /// through that decoder) must be a NAMED typed refusal, never a
+    /// division-by-zero-derived `usize::MAX` that then feeds
+    /// `Vec::with_capacity` downstream. Verified by temporarily removing the
+    /// `clip.sample_rate == 0` check in the sequential pre-check above: this
+    /// test goes RED (`resample_linear`'s `Vec::with_capacity(usize::MAX)`
+    /// aborts the process rather than returning the typed `Err` asserted
+    /// below).
+    #[test]
+    fn preprocess_clap_fusion_indexed_rejects_a_zero_sample_rate_clip_by_name() {
+        let clip = DecodedAudio {
+            samples: vec![0.5; 100],
+            sample_rate: 0,
+        };
+        let config = tiny_fusion_config();
+        let err = preprocess_clap_fusion(&[clip], &config, &Device::Cpu)
+            .expect_err("sample_rate == 0 must be a typed error, not a huge-allocation abort");
+        assert!(err.to_string().contains("sample_rate 0"), "{err}");
+    }
+
+    /// `resampled_len`'s own domain edge (round-4 adversarial audit): a zero
+    /// `from_rate` must return `0`, never round `to_rate / 0.0 == +inf` up
+    /// to `usize::MAX` (a confidently wrong length the empty-clip guard above
+    /// would then fail to catch, since `usize::MAX != 0`).
+    #[test]
+    fn resampled_len_returns_zero_for_a_zero_from_rate() {
+        assert_eq!(resampled_len(100, 0, 16_000), 0);
     }
 
     // -- Media front-end parallelization (#421 follow-on) --------------------

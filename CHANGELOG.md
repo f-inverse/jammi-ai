@@ -451,7 +451,7 @@ workspace ships every publishable crate at the same
   non-zero on HTSAT / zero on both OpenCLIP towers) rather than witnessing it on tiny_bert/text
   alone.
 - **`InferenceSession::encode_text_query` refuses an empty/null text query instead of returning an
-  all-zero vector (#421 frontend follow-on, round 3 adversarial audit).** It read
+  all-zero vector (#421 frontend follow-on).** It read
   `output.float_outputs[0][..dim].to_vec()` directly, bypassing the checked
   `BackendOutput::single_row_or_err` accessor `encode_image_query`/`encode_audio_query` already went
   through (see the entry above) — an empty string still marks its row `row_status[0] == false`
@@ -469,7 +469,7 @@ workspace ships every publishable crate at the same
   of one `Vec` per row (a convention neither accessor could read correctly).
 - **`preprocess_clap_fusion`/`preprocess_clap_fusion_indexed` refuse a clip with zero raw samples, or
   one so short that resampling to the target sample rate rounds it to zero samples, instead of
-  panicking (#421 frontend follow-on, round 3 advisory).** Both feed `repeatpad`'s `max_length / len`
+  panicking (#421 frontend follow-on).** Both feed `repeatpad`'s `max_length / len`
   with `len == 0` — an integer-division-by-zero panic that `ClapFrontendConfig::validate()` cannot
   catch, since neither cause is a domain violation of the config itself. The check runs sequentially
   over every clip before the parallel per-clip preprocessing stage ever dispatches a closure over

@@ -2317,12 +2317,17 @@ impl CandleModel {
         let num_rows = texts.len();
 
         if num_rows == 0 {
+            // The float head is one confidence score per row (width 1), the
+            // truthful shape for `all_confidences` below — never `(rows, 0)`,
+            // which `BackendOutput`'s row-major invariant reserves for "no
+            // embedding" (`ClassificationAdapter` does not read `shapes` at
+            // all, but the shape must still describe the head it labels).
             return Ok(BackendOutput {
                 float_outputs: vec![vec![]],
                 string_outputs: vec![vec![], vec![]],
                 row_status: vec![],
                 row_errors: vec![],
-                shapes: vec![(0, 0)],
+                shapes: vec![(0, 1)],
             });
         }
 
@@ -2412,7 +2417,9 @@ impl CandleModel {
             string_outputs: vec![all_labels, all_scores_json],
             row_status,
             row_errors,
-            shapes: vec![(num_rows, 0)],
+            // Width 1: one confidence score per row (see the empty-batch arm
+            // above for why this is `1`, never `0`).
+            shapes: vec![(num_rows, 1)],
         })
     }
 
@@ -2429,12 +2436,16 @@ impl CandleModel {
         let num_rows = texts.len();
 
         if num_rows == 0 {
+            // NER carries no float head at all (entities are serialized as
+            // JSON strings below) — `shapes` stays empty to match, rather
+            // than claiming a phantom `(rows, 0)` float-embedding shape for
+            // a head that does not exist.
             return Ok(BackendOutput {
                 float_outputs: vec![],
                 string_outputs: vec![vec![]],
                 row_status: vec![],
                 row_errors: vec![],
-                shapes: vec![(0, 0)],
+                shapes: vec![],
             });
         }
 
@@ -2533,7 +2544,10 @@ impl CandleModel {
             string_outputs: vec![all_entities_json],
             row_status,
             row_errors,
-            shapes: vec![(num_rows, 0)],
+            // No float head (see the empty-batch arm above): `shapes` stays
+            // empty rather than describing a `float_outputs[0]` that has no
+            // element 0.
+            shapes: vec![],
         })
     }
 }
@@ -4648,6 +4662,20 @@ mod ner_nonfinite_logit_tests {
             "expected every row to decode successfully, got row_status {:?}",
             output.row_status
         );
+        // Round-4 adversarial audit (F4): NER carries no float head at all
+        // (entities are serialized as JSON strings) — `float_outputs` and
+        // `shapes` must both stay empty, never claim a phantom `(rows, 0)`
+        // float-embedding shape for a head that does not exist.
+        assert!(
+            output.float_outputs.is_empty(),
+            "NER has no float head, got {:?}",
+            output.float_outputs
+        );
+        assert!(
+            output.shapes.is_empty(),
+            "NER's shapes must stay empty to match its absent float head, got {:?}",
+            output.shapes
+        );
     }
 }
 
@@ -5989,7 +6017,22 @@ mod r5_f2_classification_pooling_tests {
         let content = two_row_content();
         let result = loaded.forward(&content, ModelTask::Classification);
         match result {
-            Ok(_) => {}
+            Ok(out) => {
+                // Round-4 adversarial audit (F4): the float head is one
+                // confidence score per row — `shapes[0] = (rows, 1)`, never
+                // `(rows, 0)` (the shape `BackendOutput`'s doc reserves for
+                // "no embedding", which classification's confidence head is
+                // not).
+                assert_eq!(
+                    out.shapes,
+                    vec![(2, 1)],
+                    "classification's float head must describe itself truthfully: one \
+                     confidence score per row, got {:?}",
+                    out.shapes
+                );
+                assert_eq!(out.float_outputs.len(), 1);
+                assert_eq!(out.float_outputs[0].len(), 2);
+            }
             Err(e) => panic!(
                 "the classification wrapper's OWN task must still serve \
                  successfully — the fix refuses the TextEmbedding MISMATCH, \

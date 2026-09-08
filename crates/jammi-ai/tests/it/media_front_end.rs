@@ -293,28 +293,55 @@ fn arrow_to_audio_path_valued_bad_row_keeps_the_documented_prefix_and_appends_th
     );
 }
 
-/// The additive slack term for the gross always-on bar below, derived from
-/// THIS run's own measured timer floor rather than a fixed wall-clock
-/// constant. A fixed `5ms` either dominates the bar on a fast box (making it
-/// vacuous — nothing this cheap could ever regress by more than 5ms) or does
-/// nothing on a slow/noisy one; a slack derived from the box's own timer
-/// resolution scales with the machine the test actually runs on.
+/// Per-call timings for `ITERS` repeated measurements of the SAME "before"
+/// work `n1_image_request_latency_before_vs_after` compares against — the
+/// spread (max − min) of these is the honest additive slack term for the
+/// gross always-on bar below, because it is the in-test jitter of the very
+/// quantity being compared, not an unrelated proxy.
 ///
-/// Takes the MIN of `K` back-to-back `Instant::now()`/`elapsed()` round trips
-/// — the cheapest operation this test can time, so its minimum is a floor on
-/// this box's timer/scheduler overhead — then scales it up by a constant
-/// factor so the slack is comfortably above ordinary scheduling jitter
-/// without being so large it never fires on a real regression.
-fn timer_floor_slack() -> std::time::Duration {
-    const K: u32 = 500;
-    const SCALE: u32 = 200;
-    let mut floor = std::time::Duration::MAX;
-    for _ in 0..K {
+/// A prior version measured `K` back-to-back `Instant::now()`/`elapsed()`
+/// round trips with NO work between them and took their min as the slack.
+/// That proxy reads exactly `0ns` on macOS (two adjacent `Instant` reads
+/// coalesce to the same tick), so the bar it fed collapsed to exactly `3x
+/// before` with no real margin at all — the opposite of "generous enough to
+/// absorb ordinary CI-machine noise" the bar's comment claimed. Timing the
+/// SAME real work this test already does (image resize, pixel loop, tensor
+/// build) instead measures genuine scheduler/allocator/cache jitter, which is
+/// never zero on real hardware.
+struct BeforeTimings {
+    min: std::time::Duration,
+    max: std::time::Duration,
+    mean: std::time::Duration,
+}
+
+fn measure_before(
+    img: &image::DynamicImage,
+    target_size: u32,
+    mean: &[f32; 3],
+    std: &[f32; 3],
+    device: &candle_core::Device,
+    iters: u32,
+) -> BeforeTimings {
+    let mut min = std::time::Duration::MAX;
+    let mut max = std::time::Duration::ZERO;
+    let mut total = std::time::Duration::ZERO;
+    for _ in 0..iters {
         let start = std::time::Instant::now();
+        let t = sequential_preprocess_one_tensor(img, target_size, mean, std, device);
         let elapsed = start.elapsed();
-        floor = floor.min(elapsed);
+        assert_eq!(
+            t.dims(),
+            &[1, 3, target_size as usize, target_size as usize]
+        );
+        min = min.min(elapsed);
+        max = max.max(elapsed);
+        total += elapsed;
     }
-    floor * SCALE
+    BeforeTimings {
+        min,
+        max,
+        mean: total / iters,
+    }
 }
 
 // ─── n = 1 serving-latency measurement (before vs after) ───────────────────
@@ -421,18 +448,14 @@ fn n1_image_request_latency_before_vs_after() {
     )
     .unwrap();
 
-    let before_start = std::time::Instant::now();
-    for _ in 0..ITERS {
-        // Same work as "after": pixel loop AND tensor build (see
-        // `sequential_preprocess_one_tensor`'s doc for why the tensor build
-        // must be included on both sides).
-        let t = sequential_preprocess_one_tensor(&img, target_size, &mean, &std, &device);
-        assert_eq!(
-            t.dims(),
-            &[1, 3, target_size as usize, target_size as usize]
-        );
-    }
-    let before = before_start.elapsed() / ITERS;
+    // Same work as "after": pixel loop AND tensor build (see
+    // `sequential_preprocess_one_tensor`'s doc for why the tensor build must
+    // be included on both sides). Timed per-call (not just totalled and
+    // divided) so `before_timings.max - before_timings.min` is a real,
+    // in-test measurement of this run's own jitter on the exact quantity
+    // being compared — see `measure_before`'s doc.
+    let before_timings = measure_before(&img, target_size, &mean, &std, &device, ITERS);
+    let before = before_timings.mean;
 
     let after_start = std::time::Instant::now();
     for _ in 0..ITERS {
@@ -474,21 +497,26 @@ fn n1_image_request_latency_before_vs_after() {
     // be dramatically slower than "before" — a regression that big (a stray
     // per-call thread-pool install, a lock acquired every request, ...) is a
     // real bug the default suite should catch on every run, not just an
-    // opted-in one. The additive slack term is this run's own measured timer
-    // floor (see `timer_floor_slack`'s doc), not a fixed wall-clock constant
-    // that would dominate the bar on a fast box and do nothing on a slow one;
-    // `before×3 + slack` is still generous enough to absorb ordinary
-    // CI-machine noise while catching an order-of-magnitude regression.
-    let slack = timer_floor_slack();
-    let gross_bar = before.mul_f64(3.0) + slack;
+    // opted-in one. The additive slack term is the SPREAD (max − min) of the
+    // `before` timings themselves — this run's own measured in-test jitter of
+    // the exact quantity being compared (see `measure_before`'s doc for why
+    // a back-to-back-`Instant::now()` timer-resolution proxy is vacuous
+    // here); `3x before_min + spread` is still generous enough to absorb
+    // ordinary CI-machine noise while catching an order-of-magnitude
+    // regression.
+    let spread = before_timings.max - before_timings.min;
+    let gross_bar = before_timings.min.mul_f64(3.0) + spread;
     println!(
-        "n=1 image front-end gross bar: timer_floor_slack={slack:?} before={before:?} \
-         after={after:?} bar(3x before + slack)={gross_bar:?}"
+        "n=1 image front-end gross bar: before_min={:?} before_max={:?} spread={spread:?} \
+         before_mean={before:?} after={after:?} bar(3x before_min + spread)={gross_bar:?}",
+        before_timings.min, before_timings.max
     );
     assert!(
         after <= gross_bar,
         "n=1 request latency regressed far beyond a gross always-on bar: \
-         before={before:?} after={after:?} bar(3x before + timer_floor_slack {slack:?})={gross_bar:?}"
+         before_min={:?} spread={spread:?} after={after:?} \
+         bar(3x before_min + spread)={gross_bar:?}",
+        before_timings.min
     );
 
     if std::env::var_os("JAMMI_FRONTEND_N1_LATENCY").is_some() {

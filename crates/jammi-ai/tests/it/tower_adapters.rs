@@ -492,16 +492,19 @@ fn write_image_triplets_with_one_corrupt_cell(dir: &Path) -> PathBuf {
     path
 }
 
-/// BLOCK 1(c) (#421 frontend follow-on, round 3 adversarial audit):
 /// `project_frozen_embedding` is the ONLY caller of
 /// [`jammi_ai::inference::adapter::BackendOutput::all_rows_or_err`] in
 /// production. A corrupt item in a projection-head training group must fail
 /// the job, never silently train the head on the all-zero placeholder
 /// `forward_image_embedding` substitutes for that row's decode failure —
 /// verified by temporarily reverting `all_rows_or_err`'s body to the blind
-/// `&self.float_outputs[0]` read: `job.wait()` then returns `Ok` (this test
-/// goes RED, since `expect_err` panics on an `Ok`) instead of the `Err` this
-/// test asserts.
+/// `&self.float_outputs[0]` read: `job.wait()` still returns an `Err` (the
+/// all-zero placeholder trains the head into a NaN loss within a few steps,
+/// tripping the trainer's own "Training diverged" divergence guard), but its
+/// message is the divergence guard's ("Training diverged: loss was NaN or
+/// >100 for 3 consecutive batches"), not the corrupt row's own decode
+/// failure — so this test's message assertion below goes RED, even though
+/// `expect_err` alone would still pass.
 #[tokio::test(flavor = "multi_thread")]
 async fn project_frozen_embedding_refuses_a_corrupt_group_item_instead_of_training_it() {
     let dir = TempDir::new().unwrap();
@@ -1376,16 +1379,15 @@ async fn audio_training_refuses_a_mel_bin_mismatch_like_serving_does() {
 }
 
 // =============================================================================
-// BLOCK 1 (round 3 adversarial audit): single-row query accessors refuse a
-// corrupt input through the REAL fixture towers rather than serving the
-// all-zero placeholder `forward_image_embedding` / `forward_audio_embedding`
-// substitute for a decode/preprocess failure. `single_row_or_err`'s own
-// literal-`BackendOutput` oracles live in
-// `crates/jammi-ai/src/inference/adapter/mod.rs`'s `#[cfg(test)] mod tests`;
-// these three drive the SAME accessor end to end through
-// `InferenceSession::encode_{image,audio,text}_query`, so a caller that
-// bypassed the accessor (as `session.rs` did pre-fold: `output.float_outputs
-// [0][..dim].to_vec()`) is caught here too, not just at the unit level.
+// Single-row query accessors refuse a corrupt input through the REAL fixture
+// towers rather than serving the all-zero placeholder
+// `forward_image_embedding` / `forward_audio_embedding` substitute for a
+// decode/preprocess failure. `single_row_or_err`'s own literal-`BackendOutput`
+// oracles live in `crates/jammi-ai/src/inference/adapter/mod.rs`'s
+// `#[cfg(test)] mod tests`; these three drive the SAME accessor end to end
+// through `InferenceSession::encode_{image,audio,text}_query`, so a caller
+// that bypasses the accessor (reading `output.float_outputs[0][..dim]
+// .to_vec()` directly) is caught here too, not just at the unit level.
 // =============================================================================
 
 /// Verified by temporarily reverting `session.rs::encode_image_query` to
@@ -1406,7 +1408,7 @@ async fn encode_image_query_on_corrupt_bytes_refuses_never_a_zero_vector() {
         .expect_err("a corrupt image query must refuse, never silently zero-vector");
     let msg = err.to_string();
     assert!(
-        msg.contains("Failed to decode image") || msg.contains("row"),
+        msg.contains("Failed to decode image"),
         "must surface the row's own decode failure, not a generic error, got: {msg}"
     );
 }
@@ -1429,7 +1431,7 @@ async fn encode_audio_query_on_corrupt_bytes_refuses_never_a_zero_vector() {
         .expect_err("a corrupt audio query must refuse, never silently zero-vector");
     let msg = err.to_string();
     assert!(
-        msg.contains("Failed to decode audio") || msg.contains("row"),
+        msg.contains("Failed to decode audio"),
         "must surface the row's own decode failure, not a generic error, got: {msg}"
     );
 }
@@ -1456,7 +1458,7 @@ async fn encode_text_query_on_empty_text_refuses_never_a_zero_vector() {
         .expect_err("an empty text query must refuse, never silently zero-vector");
     let msg = err.to_string();
     assert!(
-        msg.contains("Empty or null text input") || msg.contains("row"),
+        msg.contains("Empty or null text input"),
         "must surface the row's own refusal, not a generic error, got: {msg}"
     );
 }

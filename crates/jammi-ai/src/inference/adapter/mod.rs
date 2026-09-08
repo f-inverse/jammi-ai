@@ -17,22 +17,36 @@ use crate::model::{LoadedModel, ModelTask};
 ///
 /// # Output head 0's row-major invariant
 ///
-/// [`Self::single_row_or_err`] and [`Self::all_rows_or_err`] read
-/// `float_outputs[0]` as one flattened ROW-MAJOR `[rows, dim]` matrix, where
-/// `rows` and `dim` are `shapes[0]` — never as one `Vec` per row. Every
-/// producer of a single float head must uphold, and both accessors verify
-/// before reading a single value (via the shared `checked_rows`):
+/// [`Self::single_row_or_err`] and [`Self::all_rows_or_err`] read a single
+/// FLOAT-EMBEDDING head: `float_outputs[0]`, one flattened ROW-MAJOR `[rows,
+/// dim]` matrix, where `rows` and `dim` are `shapes[0]` — never as one `Vec`
+/// per row. This is the accessors' whole domain, checked as ONE consistency
+/// gate (`checked_rows`) before either accessor reads a single value:
 ///
-/// - `shapes` has at least one entry (`shapes[0] = (rows, dim)`).
+/// - `float_outputs` has exactly one head (`float_outputs.len() == 1`).
+/// - `shapes` has at least one entry (`shapes[0] = (rows, dim)`), with
+///   `rows >= 1` (there is nothing to hand back for an empty output) and
+///   `dim >= 1` (a zero-width row carries no embedding).
 /// - `row_status.len() == rows` and `row_errors.len() == rows`.
-/// - `float_outputs[0].len() == rows * dim`.
+/// - `float_outputs[0].len() == rows * dim`, computed with a checked
+///   multiply (`rows.checked_mul(dim)`) rather than a raw `rows * dim` that
+///   could silently overflow on an adversarial shape.
 ///
-/// A producer that violates this (e.g. one `Vec<f32>` per row, as
-/// [`crate::model::backend::http::HttpBackend`] built before this fold) is a
-/// bug in the producer, not something a reader can safely reinterpret — both
-/// accessors refuse by name rather than misread the buffer. Use
-/// [`Self::single_head`] to construct a single-float-head `BackendOutput`
-/// with this invariant checked at construction time.
+/// A producer that violates this (e.g. one `Vec<f32>` per row, or a head
+/// that has no real embedding at all) is a bug in the producer, not
+/// something a reader can safely reinterpret — both accessors refuse by
+/// name rather than misread or panic on the buffer. Use [`Self::single_head`]
+/// to construct a single-float-head `BackendOutput` with this invariant
+/// checked at construction time.
+///
+/// This invariant is scoped to a float-EMBEDDING head; it says nothing
+/// about a producer with no embedding head at all. NER carries no float
+/// head (`float_outputs` is empty and `shapes` is likewise empty), and
+/// classification carries a width-1 float head (`shapes[0] = (rows, 1)`,
+/// one confidence score per row) — neither goes through
+/// [`Self::single_row_or_err`]/[`Self::all_rows_or_err`], whose task
+/// adapters (`ClassificationAdapter`, `NerAdapter`) read `float_outputs`/
+/// `string_outputs` directly instead.
 #[derive(Debug)]
 pub struct BackendOutput {
     /// Numeric output tensors flattened to 1-D (one vec per output head).
@@ -52,8 +66,11 @@ impl BackendOutput {
     /// flattened buffer, validating the row-major invariant documented on
     /// [`Self`] at construction time rather than leaving a malformed producer
     /// to be silently misread by [`Self::single_row_or_err`] /
-    /// [`Self::all_rows_or_err`] later. `flat.len()` must equal `rows * dim`;
-    /// `row_status`/`row_errors` must each carry exactly one entry per row.
+    /// [`Self::all_rows_or_err`] later. `rows` and `dim` must both be `>= 1`
+    /// (this constructor is for a real float-embedding head, never a
+    /// zero-row or zero-width placeholder); `flat.len()` must equal
+    /// `rows * dim`; `row_status`/`row_errors` must each carry exactly one
+    /// entry per row.
     pub fn single_head(
         flat: Vec<f32>,
         rows: usize,
@@ -61,7 +78,26 @@ impl BackendOutput {
         row_status: Vec<bool>,
         row_errors: Vec<String>,
     ) -> Result<Self> {
-        if flat.len() != rows * dim {
+        if rows == 0 {
+            return Err(JammiError::Inference(
+                "BackendOutput::single_head: rows must be >= 1 (a zero-row float-embedding \
+                 head has no embedding to construct)"
+                    .into(),
+            ));
+        }
+        if dim == 0 {
+            return Err(JammiError::Inference(
+                "BackendOutput::single_head: dim must be >= 1 (a zero-width row carries no \
+                 embedding)"
+                    .into(),
+            ));
+        }
+        let expected = rows.checked_mul(dim).ok_or_else(|| {
+            JammiError::Inference(format!(
+                "BackendOutput::single_head: rows*dim overflows (rows={rows}, dim={dim})"
+            ))
+        })?;
+        if flat.len() != expected {
             return Err(JammiError::Inference(format!(
                 "BackendOutput::single_head: flat buffer has {} value(s), expected rows*dim \
                  ({rows}*{dim})",
@@ -102,12 +138,13 @@ impl BackendOutput {
         }
     }
 
-    /// Derive output head 0's authoritative row count from `shapes[0].0` and
-    /// verify `row_status` and the flattened `float_outputs[0]` buffer agree
-    /// with it — the ONE consistency check both [`Self::single_row_or_err`]
-    /// and [`Self::all_rows_or_err`] run before looking at any individual
-    /// row's status, so an inconsistent producer is refused BY NAME on both
-    /// paths rather than read.
+    /// Verify the accessors' whole domain (see [`Self`]'s row-major
+    /// invariant doc) and return output head 0's authoritative row count
+    /// from `shapes[0].0` — the ONE consistency check both
+    /// [`Self::single_row_or_err`] and [`Self::all_rows_or_err`] run before
+    /// looking at any individual row's status, so an inconsistent producer
+    /// is refused BY NAME, on both paths, before either ever indexes
+    /// `float_outputs[0]` — never a panic, never a vacuous `Ok`.
     ///
     /// Deriving the row count from `shapes[0].0` (never from
     /// `row_status.len()`) is load-bearing: `all_rows_or_err`'s failed-row
@@ -120,8 +157,30 @@ impl BackendOutput {
     /// every malformed state instead of diverging on which they happen to
     /// notice.
     fn checked_rows(&self) -> Result<usize> {
+        if self.float_outputs.len() != 1 {
+            return Err(JammiError::Inference(format!(
+                "BackendOutput has {} float head(s), expected exactly one (a float-embedding \
+                 head)",
+                self.float_outputs.len()
+            )));
+        }
         let (rows, dim) = *self.shapes.first().ok_or_else(|| {
             JammiError::Inference("BackendOutput has no output-head shape".into())
+        })?;
+        if rows == 0 {
+            return Err(JammiError::Inference(
+                "BackendOutput has zero rows (no embedding output)".into(),
+            ));
+        }
+        if dim == 0 {
+            return Err(JammiError::Inference(
+                "BackendOutput's float-embedding head has dim 0 (no embedding output)".into(),
+            ));
+        }
+        let expected = rows.checked_mul(dim).ok_or_else(|| {
+            JammiError::Inference(format!(
+                "BackendOutput shape rows*dim overflows (rows={rows}, dim={dim})"
+            ))
         })?;
         if self.row_status.len() != rows {
             return Err(JammiError::Inference(format!(
@@ -129,8 +188,14 @@ impl BackendOutput {
                 self.row_status.len()
             )));
         }
-        let flat_len = self.float_outputs.first().map(Vec::len).unwrap_or(0);
-        if flat_len != rows * dim {
+        if self.row_errors.len() != rows {
+            return Err(JammiError::Inference(format!(
+                "BackendOutput row_errors has {} entries, expected one per row ({rows})",
+                self.row_errors.len()
+            )));
+        }
+        let flat_len = self.float_outputs[0].len();
+        if flat_len != expected {
             return Err(JammiError::Inference(format!(
                 "BackendOutput float_outputs[0] has {flat_len} value(s), expected rows*dim \
                  ({rows}*{dim})"
@@ -181,17 +246,15 @@ impl BackendOutput {
     /// backend substitutes for a decode/preprocess refusal — a corrupt
     /// training item is a refusal, not a row to skip.
     ///
-    /// Refuses (rather than reading) whenever `checked_rows` finds
-    /// `shapes`/`row_status`/`float_outputs[0]` mutually inconsistent — see
-    /// [`Self`]'s row-major invariant doc. An intentionally empty (zero-row)
-    /// output is also refused: there is no embedding to hand back.
+    /// Refuses (rather than reading) whenever `checked_rows` finds the
+    /// domain violated — see [`Self`]'s row-major invariant doc; this
+    /// includes an intentionally empty (zero-row) output, which
+    /// `checked_rows` refuses by name since there is no embedding to hand
+    /// back.
     pub fn all_rows_or_err(&self) -> Result<&[f32]> {
-        let rows = self.checked_rows()?;
+        let _rows = self.checked_rows()?;
         if let Some(bad) = self.row_status.iter().position(|ok| !ok) {
             return Err(self.row_error(bad));
-        }
-        if rows == 0 {
-            return Err(JammiError::Inference("No embedding output".into()));
         }
         Ok(&self.float_outputs[0])
     }
@@ -319,7 +382,7 @@ pub(crate) fn nullify_floats(
     }
 }
 
-// ─── `BackendOutput` accessor oracles (#421 frontend follow-on, round 3) ────
+// ─── `BackendOutput` accessor oracles ───────────────────────────────────────
 
 #[cfg(test)]
 mod tests {
@@ -447,11 +510,12 @@ mod tests {
 
     // -- Shared consistency check (`checked_rows`), both accessors ---------
     //
-    // BLOCK 2: `all_rows_or_err` pre-fix failed OPEN on an empty/short
+    // `all_rows_or_err` alone previously failed OPEN on an empty/short
     // `row_status` (its `.position(|ok| !ok)` scan finds nothing wrong and
     // would return a truncated/garbage slice as if every row succeeded),
     // while `single_row_or_err` failed CLOSED via `row_status.get(row)`. Both
-    // must now refuse, by name, on every one of these malformed states.
+    // now refuse, by name, on every one of these malformed states, via the
+    // one shared `checked_rows` gate.
 
     #[test]
     fn both_accessors_refuse_when_shapes_is_empty() {
@@ -518,6 +582,80 @@ mod tests {
         assert!(out.all_rows_or_err().is_err());
     }
 
+    #[test]
+    fn both_accessors_refuse_when_row_errors_length_mismatches_shapes_rows() {
+        let out = BackendOutput {
+            float_outputs: vec![vec![1.0, 2.0]],
+            string_outputs: vec![],
+            row_status: vec![true],
+            row_errors: vec![], // one short of rows(1)
+            shapes: vec![(1, 2)],
+        };
+        let single_err = out.single_row_or_err(0).unwrap_err();
+        assert!(
+            single_err.to_string().contains("row_errors"),
+            "{single_err}"
+        );
+        let all_err = out.all_rows_or_err().unwrap_err();
+        assert!(all_err.to_string().contains("row_errors"), "{all_err}");
+    }
+
+    /// Round-4 adversarial audit (F1): a producer with NO float head at all
+    /// (`float_outputs` empty) but a shape entry claiming 2 rows previously
+    /// PANICKED both accessors at `&self.float_outputs[0]` — `checked_rows`'s
+    /// old flat-length check read `float_outputs.first()` and treated an
+    /// absent head as an empty (len-0) buffer, which trivially satisfied
+    /// `rows*dim == 0` at `dim == 0` and let both accessors proceed to index
+    /// a `float_outputs` that has no element 0. Verified by reverting
+    /// `checked_rows` to drop the `float_outputs.len() != 1` check: this test
+    /// goes RED (a panic, not the `Err` asserted below).
+    #[test]
+    fn both_accessors_refuse_a_producer_with_no_float_head() {
+        let out = BackendOutput {
+            float_outputs: vec![],
+            string_outputs: vec![],
+            row_status: vec![true, true],
+            row_errors: vec![String::new(), String::new()],
+            shapes: vec![(2, 0)],
+        };
+        assert!(out.single_row_or_err(0).is_err());
+        assert!(out.all_rows_or_err().is_err());
+    }
+
+    /// Round-4 adversarial audit (F1): a zero-dim head (`shapes[0].1 == 0`)
+    /// with a present-but-empty `float_outputs[0]` previously returned
+    /// `Ok(&[])` from both accessors — a vacuous "embedding" with no
+    /// dimensions, silently accepted as valid. Verified by reverting
+    /// `checked_rows` to drop the `dim == 0` check: this test goes RED
+    /// (`Ok([])` instead of the `Err` asserted below).
+    #[test]
+    fn both_accessors_refuse_a_zero_dim_head() {
+        let out = BackendOutput {
+            float_outputs: vec![vec![]],
+            string_outputs: vec![],
+            row_status: vec![true, true],
+            row_errors: vec![String::new(), String::new()],
+            shapes: vec![(2, 0)],
+        };
+        assert!(out.single_row_or_err(0).is_err());
+        assert!(out.all_rows_or_err().is_err());
+    }
+
+    #[test]
+    fn checked_rows_refuses_an_overflowing_rows_times_dim_without_panicking() {
+        let out = BackendOutput {
+            float_outputs: vec![vec![]],
+            string_outputs: vec![],
+            row_status: vec![],
+            row_errors: vec![],
+            shapes: vec![(usize::MAX, 2)],
+        };
+        let err = out.single_row_or_err(0).unwrap_err();
+        assert!(err.to_string().contains("overflow"), "{err}");
+        let err = out.all_rows_or_err().unwrap_err();
+        assert!(err.to_string().contains("overflow"), "{err}");
+    }
+
     // -- `single_head` constructor ------------------------------------------
 
     #[test]
@@ -532,6 +670,34 @@ mod tests {
         .unwrap();
         assert_eq!(out.shapes[0], (2, 2));
         assert_eq!(out.single_row_or_err(1).unwrap(), &[3.0, 4.0]);
+    }
+
+    /// Round-4 adversarial audit (F1): pre-fold, `single_head(vec![], 2, 0,
+    /// ..)` succeeded — `flat.len() == 0` trivially matches `rows(2) *
+    /// dim(0) == 0`. `single_head` now refuses a zero-dim head outright.
+    #[test]
+    fn single_head_refuses_a_zero_dim_head() {
+        let err = BackendOutput::single_head(
+            vec![],
+            2,
+            0,
+            vec![true, true],
+            vec![String::new(), String::new()],
+        )
+        .unwrap_err();
+        assert!(err.to_string().contains("dim"), "{err}");
+    }
+
+    #[test]
+    fn single_head_refuses_zero_rows() {
+        let err = BackendOutput::single_head(vec![], 0, 4, vec![], vec![]).unwrap_err();
+        assert!(err.to_string().contains("rows"), "{err}");
+    }
+
+    #[test]
+    fn single_head_refuses_an_overflowing_rows_times_dim_without_panicking() {
+        let err = BackendOutput::single_head(vec![], usize::MAX, 2, vec![], vec![]).unwrap_err();
+        assert!(err.to_string().contains("overflow"), "{err}");
     }
 
     #[test]

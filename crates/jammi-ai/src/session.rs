@@ -818,14 +818,31 @@ impl InferenceSession {
         }
         let col: arrow::array::ArrayRef = Arc::new(StringArray::from(texts.to_vec()));
         let output = loaded.forward(&[col], ModelTask::Regression)?;
-        let (num_rows, head_width) = output.shapes[0];
+        let (num_rows, head_width) = *output.shapes.first().ok_or_else(|| {
+            JammiError::Inference(
+                "served_regression_col_for_test: backend emitted no output-head shape".into(),
+            )
+        })?;
         if col_idx >= head_width {
             return Err(JammiError::Inference(format!(
                 "served_regression_col_for_test: col_idx {col_idx} out of range for head_width \
                  {head_width}"
             )));
         }
-        let flat = &output.float_outputs[0];
+        let flat = output.float_outputs.first().ok_or_else(|| {
+            JammiError::Inference(
+                "served_regression_col_for_test: backend emitted no float head".into(),
+            )
+        })?;
+        if flat.len() != num_rows * head_width || output.row_status.len() != num_rows {
+            return Err(JammiError::Inference(format!(
+                "served_regression_col_for_test: backend output is inconsistent (float_outputs[0] \
+                 has {} value(s), row_status has {} entries, expected rows({num_rows}) * \
+                 head_width({head_width}) and one row_status entry per row)",
+                flat.len(),
+                output.row_status.len()
+            )));
+        }
         let mut col = Vec::with_capacity(num_rows);
         for row in 0..num_rows {
             if output.row_status[row] {

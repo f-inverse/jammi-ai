@@ -77,19 +77,39 @@ impl HttpBackend {
             .await
             .map_err(|e| JammiError::Backend(format!("Failed to parse embedding response: {e}")))?;
 
-        let dim = response
-            .data
-            .first()
-            .map(|d| d.embedding.len())
-            .unwrap_or(0);
+        if response.data.len() != inputs.len() {
+            return Err(JammiError::Backend(format!(
+                "HTTP embedding response returned {} vector(s), expected one per input ({})",
+                response.data.len(),
+                inputs.len()
+            )));
+        }
         let n = response.data.len();
+        if n == 0 {
+            return Err(JammiError::Backend(
+                "HTTP embedding request needs at least one input".into(),
+            ));
+        }
+        let dim = response.data[0].embedding.len();
         // `BackendOutput`'s row-major invariant (see its doc): output head 0
-        // is ONE flattened `[n, dim]` buffer, never one `Vec` per row. Build
-        // through `BackendOutput::single_head` so a row whose embedding width
-        // disagrees with the first row's fails the CONSTRUCTOR, rather than
-        // silently misaligning every later row's slice.
+        // is ONE flattened `[n, dim]` buffer, never one `Vec` per row.
+        // `single_head` enforces the AGGREGATE count (`flat.len() == n *
+        // dim`) at construction; that alone would still accept a response
+        // whose individual rows are ragged but happen to sum to `n * dim`
+        // (e.g. row 0 short by one value, a later row long by one) — such a
+        // response would splice a later row's tail into an earlier row's
+        // slice. The per-row check below refuses that case explicitly,
+        // naming the offending row and both widths, BEFORE any splicing can
+        // happen.
         let mut flat = Vec::with_capacity(n * dim);
-        for d in &response.data {
+        for (i, d) in response.data.iter().enumerate() {
+            if d.embedding.len() != dim {
+                return Err(JammiError::Backend(format!(
+                    "HTTP embedding response row {i} has width {}, expected {dim} (row 0's \
+                     width)",
+                    d.embedding.len()
+                )));
+            }
             flat.extend_from_slice(&d.embedding);
         }
         BackendOutput::single_head(flat, n, dim, vec![true; n], vec![String::new(); n])

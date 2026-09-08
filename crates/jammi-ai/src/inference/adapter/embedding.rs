@@ -3,7 +3,7 @@ use std::sync::Arc;
 use arrow::array::{ArrayRef, FixedSizeListArray, Float32Array};
 use arrow::buffer::NullBuffer;
 use arrow::datatypes::{DataType, Field};
-use jammi_db::error::Result;
+use jammi_db::error::{JammiError, Result};
 
 use super::{BackendOutput, OutputAdapter};
 
@@ -41,7 +41,17 @@ impl OutputAdapter for EmbeddingAdapter {
             return Ok(vec![Arc::new(empty)]);
         }
 
-        let flat_values = &output.float_outputs[0];
+        let flat_values = output.float_outputs.first().ok_or_else(|| {
+            JammiError::Inference("embedding adapter: backend emitted no float head".into())
+        })?;
+        if flat_values.len() != row_count * self.dimensions {
+            return Err(JammiError::Inference(format!(
+                "embedding adapter: head has {} floats, expected rows({row_count}) * \
+                 dim({})",
+                flat_values.len(),
+                self.dimensions
+            )));
+        }
         let values_array = Float32Array::from(flat_values.clone());
         let nulls = NullBuffer::from(output.row_status.clone());
         let field = Arc::new(Field::new("item", DataType::Float32, false));

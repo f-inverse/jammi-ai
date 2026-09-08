@@ -38,8 +38,7 @@ async fn http_backend_embedding_and_errors() {
         .unwrap();
 
     // `BackendOutput`'s row-major invariant: ONE flattened `[rows, dim]`
-    // buffer in `float_outputs[0]`, never one `Vec` per row (#421 frontend
-    // follow-on, round 3: `HttpBackend` built the latter before this fold).
+    // buffer in `float_outputs[0]`, never one `Vec` per row.
     assert_eq!(
         result.float_outputs.len(),
         1,
@@ -112,4 +111,46 @@ async fn http_backend_embedding_and_errors() {
         }
         Ok(_) => panic!("500 response should return an error"),
     }
+}
+
+/// A response whose individual rows are ragged but whose TOTAL element count
+/// still equals `rows * dim` (row 0's width) must be refused by name, not
+/// spliced. Three rows of width 2, 1, 3 sum to 6 == 3 * 2 — a check that only
+/// verifies the aggregate sum (`flat.len() == rows * dim`) would accept this
+/// and silently splice row 2's first element into row 1's slice.
+#[tokio::test]
+async fn http_backend_refuses_a_ragged_response_row_width() {
+    let server = MockServer::start().await;
+
+    Mock::given(method("POST"))
+        .and(path("/v1/embeddings"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "data": [
+                { "embedding": [0.1, 0.2] },
+                { "embedding": [0.3] },
+                { "embedding": [0.4, 0.5, 0.6] }
+            ]
+        })))
+        .mount(&server)
+        .await;
+
+    let backend = HttpBackend::new(Duration::from_secs(5)).unwrap();
+    let err = backend
+        .forward(
+            &server.uri(),
+            &["a".into(), "b".into(), "c".into()],
+            "test-model",
+            ModelTask::TextEmbedding,
+        )
+        .await
+        .expect_err(
+            "a per-row width that disagrees with row 0's, even when the total sum matches \
+             rows*dim, must be a typed refusal, not a spliced row",
+        );
+    let msg = err.to_string();
+    assert!(msg.contains("row 1"), "must name the offending row: {msg}");
+    assert!(
+        msg.contains('1') && msg.contains('2'),
+        "must name both the row's own width (1) and the expected width (2): {msg}"
+    );
 }

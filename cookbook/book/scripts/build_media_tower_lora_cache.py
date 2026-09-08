@@ -21,45 +21,91 @@ script registers, rather than a fourth, ad hoc corpus builder. Small counts
 throughout (24 rows per modality): this is a correctness/behavior cache, not a
 throughput benchmark.
 
-Four things this cache measures, per tower, through the public surface (the
+Six things this cache measures, per tower, through the public surface (the
 recipes' own template — ``cookbook/recipes/image_search`` /
-``cookbook/recipes/audio_search``, PR #466 — extended with a determinism
-control this book adds):
+``cookbook/recipes/audio_search`` — extended with a determinism control, a real
+process-restart round trip, a cross-tower selectivity oracle, and a spread-
+derived tolerance this book adds):
 
 1. **Change, not improvement.** The SAME probe input, encoded through the base
    checkpoint and through the LoRA-adapted checkpoint, must differ — the
    adapter actually moved the tower's representation. (Direction/quality is not
-   claimed; only that training moved something.)
+   claimed; only that training moved something.) This is trained and measured
+   TWICE, independently, per tower — the observed spread between the two
+   independent runs is what derives this metric's committed tolerance (see
+   ``tolerance_derivation`` below): a fixed literal tolerance asserts nothing
+   about how noisy the underlying measurement actually is.
 2. **The same-input control.** The SAME probe input encoded TWICE through the
    SAME (base) checkpoint, in two independent ``db.infer`` calls. Any nonzero
    diff observed in (1) could otherwise be inference noise rather than a real
-   parameter change; this control is what rules that out. Measured, not
-   assumed to be 0 — a real GPU kernel is only "deterministic across repeated
-   calls" if nothing in the dispatch path is order-nondeterministic (e.g. an
-   atomic-add reduction), so this script records the ACTUAL diff.
-3. **The round trip.** After a job completes, this script closes the training
-   connection and opens a BRAND NEW connection to the SAME server — proving
-   the adapter is discoverable and servable from a session that never trained
-   it (train -> save in the catalog -> serve from a new client), not merely
-   held live in the training connection's own process state.
-4. **Corrupt-media-row behavior.** A batch with one valid row, one NULL row,
-   and one row of undecodable garbage bytes, run through ``db.infer`` — the
-   real, MEASURED per-row `_status`/`_error` contract (`docs/guide/src/
-   generate-image-embeddings.md`'s Error-handling table is the documented
-   claim; this records what the engine actually does at this branch's tip,
-   never assumes the doc is still accurate).
+   parameter change; this control is what rules that out, AND it is what
+   derives the "change must exceed this floor" threshold a chapter asserts —
+   the floor is a multiple of this measured control, never a bare literal.
+3. **The round trip — a REAL process restart.** After a job completes, this
+   script closes the training connection, TERMINATES the `jammi-server` OS
+   process, and starts a BRAND NEW process against the SAME on-disk
+   `artifact_dir` (the SQLite catalog + result store) before re-deriving the
+   tuned vector. A reconnect to the SAME still-running process only proves the
+   process-local `ModelCache` kept the adapter warm; a real restart is the only
+   way to prove the adapter survived into the CATALOG, discoverable by a
+   process that never trained it. The record carries the OS pid and start time
+   before and after, so the restart is itself an auditable fact, not a claim.
+4. **Cross-tower selectivity.** OpenCLIP's vision and text towers share one
+   checkpoint and one `ResidualAttentionBlock` LoRA-site vocabulary
+   (`in_proj`/`c_fc`); `task=` alone is what is supposed to scope a fine-tune's
+   trainable LoRA sites to ONE tower. This measures that scoping directly: a
+   FIXED probe through the OTHER (untouched) tower, run through the just-tuned
+   model id, must be BIT-IDENTICAL (`max_abs_diff == 0.0`) to the same probe
+   run through the base model — proving the adapter did not leak sites into the
+   tower `task=` did not select.
+5. **The corrupt-media-row `_status`/`_error` contract, in BOTH input arms.**
+   `docs/guide/src/generate-image-embeddings.md`'s Error-handling table
+   documents two accepted column shapes — inline bytes (`Binary`) and file
+   paths (`Utf8`) — and the SAME per-row contract for both. This script runs a
+   mixed batch (one valid row, one null row, one undecodable row) through EACH
+   arm, for both image and audio, and — rather than a substring check — asserts
+   the Arrow row index NAMED IN THE ERROR MESSAGE against the row's ACTUAL
+   position in the batch.
+6. **Provenance.** No sha is exposed anywhere on the shipped surface for THIS
+   engine commit (`get_server_info()` carries `version`/`features`/
+   `storage_backends`/`services` only — no build sha; the `jammi-ai` wheel
+   carries a declared `version`, same story, no build sha — see the
+   `content_digest_via_shipped_surface: false` finding below). The finest-
+   grained identity available through the shipped surface is the declared
+   engine/client VERSION, so this script pins and records that, plus the
+   hostname, GPU name, GPU device ordinal, and an INDEPENDENT sha256 of each
+   checkpoint directory's file bytes computed by this script directly from
+   disk (never the engine's own internal digest routine — see below). At
+   render/test time the chapter re-asserts the installed `jammi` client's
+   `__version__` against this recorded value and FAILS (never skips) on a
+   mismatch, the same pattern `chapters/14-scale/scale.qmd` already uses for
+   `usearch.__version__`.
+
+   Engine finding, recorded for the record rather than silently worked around:
+   `ModelDescriptor` (`crates/jammi-db/src/catalog/model_repo.rs`) — the shape
+   `describe_model` returns — carries `{model_id, backend, task, status}` only.
+   The engine DOES compute a per-model `content_digest`
+   (`crates/jammi-ai/src/model/backend/candle.rs::compute_model_content_digest`)
+   but it never crosses the Python binding, the wire proto, or the CLI — there
+   is no shipped-surface way to read a registered model's content digest today.
+   This script's checkpoint sha256 is therefore computed independently, from
+   outside the engine, over the checkpoint directories directly.
 
 Usage::
 
-    # 1. start the GPU server against the real checkpoints (clean artifact
-    #    dir for a reproducible emit):
-    #    JAMMI_ARTIFACT_DIR=/tmp/srv-media-art JAMMI_GPU__DEVICE=0 \\
-    #    JAMMI_GPU__REQUIRE_GPU=true JAMMI_SERVER__FLIGHT_LISTEN=127.0.0.1:50051 \\
-    #    jammi-server &
-    # 2. emit against it:
-    python scripts/build_media_tower_lora_cache.py --target grpc://127.0.0.1:50051 \\
+    python scripts/build_media_tower_lora_cache.py \\
+        --server-bin /path/to/target/release/jammi-server \\
         --vision-checkpoint /root/models/open-clip-vit-b-32 \\
-        --audio-checkpoint /root/models/clap-htsat-fused
+        --audio-checkpoint /root/models/clap-htsat-fused \\
+        --device 0
+
+The script owns the `jammi-server` process itself (spawns it, and later
+terminates + respawns it for the round-trip measurement) rather than expecting
+one already running: owning the process is what makes a REAL OS-level restart
+possible, against a persistent `--artifact-dir` (defaults to a fresh temp dir
+for the duration of one run — every tower's training + round trip shares it, so
+the catalog and result store the round trip re-reads are the SAME ones the
+training wrote).
 """
 
 from __future__ import annotations
@@ -67,8 +113,14 @@ from __future__ import annotations
 import argparse
 import hashlib
 import json
+import os
+import re
+import shutil
+import socket
 import subprocess
 import sys
+import tempfile
+import time
 from pathlib import Path
 
 import jammi
@@ -87,14 +139,42 @@ EPOCHS = 2
 BATCH = 4
 LORA_RANK = 4
 
+# Tolerance derivation constants — stated here, never re-typed as bare literals
+# at the call sites below.
+REPEATS = 2  # independent LoRA trainings per tower, to OBSERVE a re-emit spread
+SPREAD_K = 5.0  # change_vs_base tol = SPREAD_K * the observed |repeat_b - repeat_a| spread
+FLOOR_K = 10.0  # change-must-exceed floor = FLOOR_K * that tower's OWN measured control
+# The golden files round every metric to 6 decimals (`round(x, 6)`): a "spread"
+# or "control" of exactly 0.0 (a perfectly deterministic GPU forward pass, which
+# the same-input control below has in fact measured) would otherwise derive a
+# tolerance/floor of exactly 0.0 too — technically correct but brittle against
+# the record's own rounding. PRECISION_FLOOR is that rounding resolution, used
+# as a floor under (never instead of) the derived value.
+PRECISION_FLOOR = 1e-6
+
+# A round-trip diff is not a noisy measurement like change-vs-base: either the
+# adapter survived the restart bit-for-bit (diff ~ 0, floating-point noise
+# only) or persistence is broken (diff is large — on the order of the change
+# itself, since a broken round trip serves the BASE model instead). A single
+# tight ceiling is the right shape here, independent of any golden — the emit
+# script REFUSES to write a cache around a broken round trip rather than
+# silently committing whatever it measured (see `measure_tower` below).
+ROUND_TRIP_CEILING = 1e-5
+
 # OpenCLIP's ResidualAttentionBlock LoRA sites — shared by the vision AND text
 # towers (crates/jammi-encoders/src/open_clip_block.rs). The image_search
-# recipe (PR #466) exercises the same two-site subset on the vision tower;
-# this cache exercises it on the text tower too, since the block is identical.
+# recipe exercises the same two-site subset on the vision tower; this cache
+# exercises it on the text tower too, since the block is identical.
 CLIP_TARGET_MODULES = ["in_proj", "c_fc"]
-# HTSAT-Swin's own LoRA sites (audio_search recipe, PR #466): the attention
-# projections plus the audio-projection head's first linear.
+# HTSAT-Swin's own LoRA sites (audio_search recipe): the attention projections
+# plus the audio-projection head's first linear.
 CLAP_TARGET_MODULES = ["query", "value", "linear1"]
+
+# The mixed-row batch's fixed row order for the corrupt-row contract (§5) — the
+# Arrow position of "corrupt_row" is this order's own index, never a bare `2`.
+ROW_ORDER = ("good", "null_row", "corrupt_row")
+CORRUPT_ARROW_POSITION = ROW_ORDER.index("corrupt_row")
+_ROW_INDEX_RE = re.compile(r"row (\d+)")
 
 
 def _checksum(path: Path) -> str:
@@ -106,12 +186,126 @@ def _run_generator(args: list[str]) -> None:
     subprocess.run(args, check=True)
 
 
+def _extract_row_index(message: str) -> int | None:
+    m = _ROW_INDEX_RE.search(message)
+    return int(m.group(1)) if m else None
+
+
+def _dir_sha256(root: Path) -> str:
+    """An INDEPENDENT content digest of a checkpoint directory: sha256 over
+    every regular file's (relative path, bytes), sorted by path. Computed by
+    THIS script, from outside the engine — never the engine's own internal
+    `compute_model_content_digest` — since that routine is not reachable
+    through any shipped surface (see the provenance finding above)."""
+    h = hashlib.sha256()
+    for f in sorted(p for p in root.rglob("*") if p.is_file()):
+        h.update(str(f.relative_to(root)).encode())
+        h.update(f.read_bytes())
+    return h.hexdigest()
+
+
+def _gpu_name() -> str:
+    try:
+        out = subprocess.run(
+            ["nvidia-smi", "--query-gpu=name", "--format=csv,noheader"],
+            capture_output=True, text=True, timeout=10, check=True,
+        )
+        lines = [ln for ln in out.stdout.strip().splitlines() if ln.strip()]
+        return lines[0] if lines else "unknown (nvidia-smi returned no rows)"
+    except Exception as exc:  # noqa: BLE001 — provenance is best-effort, recorded either way
+        return f"unavailable ({exc})"
+
+
+# --------------------------------------------------------------------------- #
+# a REAL, self-managed GPU server process — restart is the round-trip proof
+# --------------------------------------------------------------------------- #
+
+
+def _free_port() -> int:
+    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
+        s.bind(("127.0.0.1", 0))
+        return s.getsockname()[1]
+
+
+class GpuLiveServer:
+    """Owns a real GPU `jammi-server` OS process against a PERSISTENT
+    `artifact_dir` (the on-disk SQLite catalog + result store). `restart()`
+    terminates the process and starts a FRESH one against the SAME
+    `artifact_dir` — a real OS-level restart, not a reconnect to the same
+    still-running process's in-memory `ModelCache`/`InferenceSession`. This is
+    what lets the round-trip measurement prove catalog persistence rather than
+    merely process-local caching."""
+
+    def __init__(self, server_bin: str, artifact_dir: Path, device: str):
+        self.server_bin = server_bin
+        self.artifact_dir = artifact_dir
+        self.device = device
+        self.proc: subprocess.Popen | None = None
+        self.endpoint: str | None = None
+        self.pid: int | None = None
+        self.start_time: float | None = None
+
+    def start(self) -> str:
+        flight_port = _free_port()
+        env = dict(os.environ)
+        env["JAMMI_ARTIFACT_DIR"] = str(self.artifact_dir)
+        env["JAMMI_GPU__DEVICE"] = self.device
+        env["JAMMI_GPU__REQUIRE_GPU"] = "true"
+        env["JAMMI_SERVER__FLIGHT_LISTEN"] = f"127.0.0.1:{flight_port}"
+        env["JAMMI_SERVER__SERVICES"] = "all"
+        launch_time = time.time()
+        self.proc = subprocess.Popen(
+            [self.server_bin], env=env, stdout=subprocess.PIPE, stderr=subprocess.STDOUT
+        )
+        self.endpoint = f"grpc://127.0.0.1:{flight_port}"
+        # Real checkpoints + CUDA context bring-up are slower than the CPU
+        # servers other CacheLane scripts spawn — a generous readiness window.
+        deadline = time.time() + 120
+        while time.time() < deadline:
+            if self.proc.poll() is not None:
+                out = self.proc.stdout.read().decode(errors="replace") if self.proc.stdout else ""
+                raise RuntimeError(f"jammi-server exited early:\n{out}")
+            try:
+                probe = jammi.connect(self.endpoint)
+                probe.get_server_info()
+                probe.close()
+                self.pid = self.proc.pid
+                self.start_time = launch_time
+                return self.endpoint
+            except Exception:
+                time.sleep(0.5)
+        self.proc.terminate()
+        raise RuntimeError("jammi-server did not become ready within 120s")
+
+    def stop(self) -> None:
+        if self.proc is not None:
+            self.proc.terminate()
+            try:
+                self.proc.wait(timeout=20)
+            except subprocess.TimeoutExpired:
+                self.proc.kill()
+                self.proc.wait(timeout=20)
+        self.proc = None
+
+    def restart(self) -> dict:
+        """Stop this process and start a FRESH one against the SAME
+        `artifact_dir`. Returns `{endpoint, before, after}` — `before`/`after`
+        carry the OS pid + wall-clock start time, so a re-emit's record.json
+        proves a real restart happened rather than asserting it happened."""
+        before = {"pid": self.pid, "start_time": self.start_time}
+        self.stop()
+        endpoint = self.start()
+        after = {"pid": self.pid, "start_time": self.start_time}
+        assert after["pid"] != before["pid"], "restart did not spawn a new OS process"
+        return {"endpoint": endpoint, "before": before, "after": after}
+
+
 # --------------------------------------------------------------------------- #
 # corpora — generated by the engine's own committed producers
 # --------------------------------------------------------------------------- #
 
 
-def build_image_triplets(work: Path) -> pa.Table:
+def build_image_triplets(work: Path) -> tuple[pa.Table, bytes]:
     """Real-shape (anchor, positive, negative) PNG triplets via the committed
     fixed-shape image-corpus producer (224x224 — OpenCLIP ViT-B-32's own input
     size), read back with inline bytes."""
@@ -204,19 +398,14 @@ def _max_abs_diff(a: list[float], b: list[float]) -> float:
     return max(abs(x - y) for x, y in zip(a, b, strict=True))
 
 
-def measure_tower(
-    db, *, target: str, label: str, task: str, column: str, dtype,
-    base_model: str, triplets: pa.Table, probe_value, source_prefix: str,
-    target_modules: list[str],
+def train_and_probe_change(
+    db, *, task: str, column: str, dtype, base_model: str, triplets_src: str,
+    probe_value, target_modules: list[str], tag: str,
 ) -> dict:
-    """Fine-tune one tower's LoRA adapter, then measure the four invariants
-    (change / control / round-trip / corrupt-row) through the public surface."""
-    print(f"\n=== [{label}] task={task} base={base_model} ===", flush=True)
-    triplets_src = f"{source_prefix}_triplets"
-    triplets_path = ARTIFACTS / f"_{triplets_src}.parquet"
-    pq.write_table(triplets, triplets_path)
-    db.add_source(triplets_src, url=str(triplets_path), format="parquet")
-
+    """Run ONE independent LoRA fine-tune and measure change-vs-base + the
+    same-input control against a FRESH probe registration. Called `REPEATS`
+    times per tower so the caller can observe the re-emit spread across two
+    independent trainings, rather than asserting a spread of zero."""
     job = db.fine_tune(
         source=triplets_src, base_model=base_model,
         columns=["anchor", "positive", "negative"], method="lora", task=task,
@@ -226,70 +415,197 @@ def measure_tower(
     )
     job.wait()
     if job.status() != "completed":
-        raise RuntimeError(f"{label} fine-tune did not complete: status={job.status()}")
+        raise RuntimeError(f"{tag} fine-tune did not complete: status={job.status()}")
     tuned_model = job.model_id
     if not tuned_model.startswith("jammi:fine-tuned:"):
         raise RuntimeError(f"unexpected fine-tuned model_id: {tuned_model}")
-    print(f"  model_id: {tuned_model}", flush=True)
+    print(f"  [{tag}] model_id: {tuned_model}", flush=True)
 
-    probe = _probe_source(db, f"{source_prefix}_probe", column, dtype, probe_value)
-
-    # (1) change, not improvement.
+    probe = _probe_source(db, f"{tag}_probe", column, dtype, probe_value)
     base_vec = _infer_vector(db, probe, base_model, column, task)
     tuned_vec = _infer_vector(db, probe, tuned_model, column, task)
-    change_diff = _max_abs_diff(base_vec, tuned_vec)
-    print(f"  change (tuned vs base) max|Δ| = {change_diff:.6f}", flush=True)
+    change = _max_abs_diff(base_vec, tuned_vec)
 
-    # (2) the same-input control — TWO independent forward passes through the
-    # SAME (base) checkpoint over the SAME probe input.
+    # the same-input control: TWO independent forward passes through the SAME
+    # (base) checkpoint over the SAME probe input.
     base_vec_repeat = _infer_vector(db, probe, base_model, column, task)
-    control_diff = _max_abs_diff(base_vec, base_vec_repeat)
-    print(f"  same-input control max|Δ| = {control_diff:.6f}", flush=True)
+    control = _max_abs_diff(base_vec, base_vec_repeat)
+    print(f"  [{tag}] change={change:.6f}  control={control:.6f}", flush=True)
+    return {"model_id": tuned_model, "change": change, "control": control, "tuned_vec": tuned_vec}
 
-    # (3) the round trip: close THIS connection, open a NEW one to the SAME
-    # server, and re-derive the tuned vector from a session that never trained
-    # it — proving persistence through the catalog, not process-local state.
+
+def measure_tower(
+    db, *, server: GpuLiveServer, label: str, task: str, column: str, dtype,
+    base_model: str, triplets: pa.Table, probe_value, source_prefix: str,
+    target_modules: list[str],
+) -> tuple[dict, object]:
+    """Fine-tune one tower's LoRA adapter TWICE (independently), derive a
+    tolerance from the observed spread, then measure the round trip through a
+    REAL server-process restart on the canonical (second) run."""
+    print(f"\n=== [{label}] task={task} base={base_model} ===", flush=True)
+    triplets_src = f"{source_prefix}_triplets"
+    triplets_path = ARTIFACTS / f"_{triplets_src}.parquet"
+    pq.write_table(triplets, triplets_path)
+    db.add_source(triplets_src, url=str(triplets_path), format="parquet")
+
+    repeats = [
+        train_and_probe_change(
+            db, task=task, column=column, dtype=dtype, base_model=base_model,
+            triplets_src=triplets_src, probe_value=probe_value,
+            target_modules=target_modules, tag=f"{source_prefix}_r{i}",
+        )
+        for i in range(REPEATS)
+    ]
+    canonical = repeats[-1]
+    spread = max(
+        abs(a["change"] - b["change"]) for a in repeats for b in repeats
+    )
+    change_tol = max(SPREAD_K * spread, PRECISION_FLOOR)
+    change_floor = max(FLOOR_K * canonical["control"], PRECISION_FLOOR)
+    print(
+        f"  [{label}] observed change spread over {REPEATS} independent runs = "
+        f"{spread:.6g} -> tol = {SPREAD_K}*spread = {change_tol:.6g}; "
+        f"floor = {FLOOR_K}*control = {change_floor:.6g}",
+        flush=True,
+    )
+    tuned_model = canonical["model_id"]
+
+    # the round trip: close THIS connection, TERMINATE the server OS process,
+    # and start a FRESH one against the SAME on-disk artifact_dir before
+    # re-deriving the tuned vector — proving persistence through the catalog,
+    # not process-local ModelCache state.
     db.close()
-    db2 = jammi.connect(target)
+    restart = server.restart()
+    print(
+        f"  [{label}] server restarted: pid {restart['before']['pid']} -> "
+        f"{restart['after']['pid']}",
+        flush=True,
+    )
+    db2 = jammi.connect(restart["endpoint"])
     described = db2.describe_model(tuned_model)
     if described is None or described.get("task") != task:
         raise RuntimeError(f"{label}: round-trip describe_model mismatch: {described}")
-    tuned_vec_roundtrip = _infer_vector(db2, probe, tuned_model, column, task)
-    roundtrip_diff = _max_abs_diff(tuned_vec, tuned_vec_roundtrip)
-    print(f"  round-trip (new connection) max|Δ| vs first tuned read = "
+    roundtrip_probe = _probe_source(db2, f"{source_prefix}_roundtrip_probe", column, dtype,
+                                     probe_value)
+    tuned_vec_roundtrip = _infer_vector(db2, roundtrip_probe, tuned_model, column, task)
+    roundtrip_diff = _max_abs_diff(canonical["tuned_vec"], tuned_vec_roundtrip)
+    print(f"  [{label}] round-trip (new process) max|Δ| vs first tuned read = "
           f"{roundtrip_diff:.6f}", flush=True)
+    if roundtrip_diff >= ROUND_TRIP_CEILING:
+        # A real engine bug, not a noisy measurement to record and move past:
+        # refuse to emit a cache around a broken round trip rather than
+        # silently committing a golden that would make this pass. Compare
+        # against the base model's own read to name the failure precisely —
+        # a diff this large, equal to the change-vs-base signal, means the
+        # fresh process served the BASE model under the tuned model's id.
+        base_vec_after_restart = _infer_vector(db2, roundtrip_probe, base_model, column, task)
+        vs_base = _max_abs_diff(tuned_vec_roundtrip, base_vec_after_restart)
+        raise RuntimeError(
+            f"{label}: ROUND TRIP FAILED — a fresh jammi-server process (pid "
+            f"{restart['after']['pid']}, same --artifact-dir) served model_id="
+            f"{tuned_model!r} at max|Δ|={roundtrip_diff:.6f} from the pre-restart "
+            f"tuned read (ceiling {ROUND_TRIP_CEILING:g}); its distance from the "
+            f"BASE model's own read in this SAME fresh process is {vs_base:.6f} "
+            "-- describe_model found the catalog row, but infer did not apply "
+            "the persisted LoRA adapter after a real process restart. This is an "
+            "engine bug, not a cache to commit around."
+        )
 
-    # `db2` — the brand-new connection that just proved the round trip — is
-    # handed back as the caller's next `db`, rather than closed and reopened
-    # again: the round-trip claim is about the CONNECTION boundary the
-    # training session crossed, not about how many connections this script
-    # itself churns through.
-    return {
+    record = {
         "task": task,
         "base_model": base_model,
         "model_id": tuned_model,
         "target_modules": target_modules,
         "epochs": EPOCHS,
         "lora_rank": LORA_RANK,
-        "change_vs_base_max_abs_diff": round(change_diff, 6),
-        "same_input_control_max_abs_diff": round(control_diff, 6),
+        "change_vs_base_max_abs_diff": round(canonical["change"], 6),
+        "same_input_control_max_abs_diff": round(canonical["control"], 6),
         "round_trip_max_abs_diff": round(roundtrip_diff, 6),
-    }, db2
+        "repeats": [
+            {
+                "model_id": r["model_id"],
+                "change_vs_base_max_abs_diff": round(r["change"], 6),
+                "same_input_control_max_abs_diff": round(r["control"], 6),
+            }
+            for r in repeats
+        ],
+        "tolerance_derivation": {
+            "repeats": REPEATS,
+            "observed_change_spread_max_abs_diff": round(spread, 6),
+            "spread_multiplier_k": SPREAD_K,
+            "change_tol": round(change_tol, 6),
+            "control_floor_multiplier_k": FLOOR_K,
+            "change_floor": round(change_floor, 6),
+            "precision_floor": PRECISION_FLOOR,
+        },
+        "round_trip": {
+            "server_restarted": True,
+            "before": restart["before"],
+            "after": restart["after"],
+        },
+    }
+    # `db2` — the brand-new connection that just proved the round trip — is
+    # handed back as the caller's next `db`, rather than closed and reopened
+    # again: the round-trip claim is about the CONNECTION/PROCESS boundary the
+    # training session crossed, not about how many connections this script
+    # itself churns through.
+    return record, db2
 
 
-def measure_corrupt_rows(db, *, label: str, task: str, column: str, dtype,
-                          base_model: str, good_value, source_prefix: str) -> dict:
+def measure_cross_tower_selectivity(
+    db, *, tuned_model: str, base_model: str, other_task: str, other_column: str,
+    other_dtype, other_probe_value, source_prefix: str,
+) -> dict:
+    """`task=` is supposed to scope a fine-tune's trainable LoRA sites to ONE
+    tower of a shared OpenCLIP checkpoint. This measures that scoping: a FIXED
+    probe through the OTHER (untouched) tower, run through the just-tuned
+    model, must be bit-identical to the SAME probe run through the base
+    model."""
+    probe = _probe_source(db, f"{source_prefix}_xtower_probe", other_column, other_dtype,
+                           other_probe_value)
+    tuned_vec = _infer_vector(db, probe, tuned_model, other_column, other_task)
+    base_vec = _infer_vector(db, probe, base_model, other_column, other_task)
+    diff = _max_abs_diff(tuned_vec, base_vec)
+    print(f"  cross-tower selectivity (other task={other_task}) max|Δ| = {diff:.6g}", flush=True)
+    return {"probed_task": other_task, "max_abs_diff": round(diff, 6)}
+
+
+def measure_corrupt_rows(
+    db, *, label: str, task: str, column: str, base_model: str, good_value: bytes,
+    source_prefix: str, input_mode: str,
+) -> dict:
     """The real per-row behavior for a NULL row and a CORRUPT (undecodable)
     row, in the SAME batch as a valid row — measured, never assumed from the
-    doc table. Both a null row and a genuinely undecodable row are per-row
-    `_status="error"` outcomes here: the batch's one valid row still reads
-    `_status="ok"`, neither failure collapses the whole `infer` call."""
-    print(f"\n=== [{label}] corrupt-row behavior, task={task} ===", flush=True)
+    doc table. `input_mode` is `"bytes"` (an inline `Binary` column) or
+    `"path"` (a `Utf8` column of file paths, the guide's OTHER documented
+    input shape) — the corrupt row's underlying file EXISTS and is readable in
+    both modes, so the failure is a genuine per-row DECODE failure, matching
+    `docs/guide/src/generate-image-embeddings.md`'s Error-handling table (a
+    missing/unreadable path is instead documented, in `arrow_to_images`'s own
+    doc comment, as a whole-call `Err` — a different, column-level failure
+    mode this script does not claim is per-row)."""
+    print(f"\n=== [{label}] corrupt-row behavior ({input_mode} arm), task={task} ===", flush=True)
     corrupt_bytes = b"not a real " + column.encode() + b" file at all, just garbage bytes"
-    src = f"{source_prefix}_mixed_rows"
+
+    if input_mode == "bytes":
+        dtype = pa.binary()
+        good_arrow_value, corrupt_arrow_value = good_value, corrupt_bytes
+    elif input_mode == "path":
+        dtype = pa.utf8()
+        work = ARTIFACTS / "_work" / "corrupt_paths"
+        work.mkdir(parents=True, exist_ok=True)
+        good_path = work / f"{source_prefix}_good.bin"
+        corrupt_path = work / f"{source_prefix}_corrupt.bin"
+        good_path.write_bytes(good_value)
+        corrupt_path.write_bytes(corrupt_bytes)
+        good_arrow_value, corrupt_arrow_value = str(good_path), str(corrupt_path)
+    else:
+        raise ValueError(f"unknown input_mode: {input_mode!r}")
+
+    src = f"{source_prefix}_mixed_rows_{input_mode}"
     tbl = pa.table({
-        "id": pa.array(["good", "null_row", "corrupt_row"], type=pa.utf8()),
-        column: pa.array([good_value, None, corrupt_bytes], type=dtype),
+        "id": pa.array(list(ROW_ORDER), type=pa.utf8()),
+        column: pa.array([good_arrow_value, None, corrupt_arrow_value], type=dtype),
     })
     path = ARTIFACTS / f"_{src}.parquet"
     pq.write_table(tbl, path)
@@ -301,30 +617,43 @@ def measure_corrupt_rows(db, *, label: str, task: str, column: str, dtype,
     ids = out.column("_row_id").to_pylist()
     by_id = dict(zip(ids, zip(statuses, errors, strict=True), strict=True))
     null_result = {"status": by_id["null_row"][0], "error": by_id["null_row"][1]}
-    corrupt_result = {"status": by_id["corrupt_row"][0], "error": by_id["corrupt_row"][1]}
+    corrupt_status, corrupt_error = by_id["corrupt_row"]
     good_result = {"status": by_id["good"][0]}
+    row_index = _extract_row_index(corrupt_error or "")
     print(f"  good row:    {good_result}", flush=True)
     print(f"  null row:    {null_result}", flush=True)
-    print(f"  corrupt row: {corrupt_result}", flush=True)
+    print(f"  corrupt row: status={corrupt_status} row_index_in_message={row_index} "
+          f"(actual Arrow position={CORRUPT_ARROW_POSITION})", flush=True)
 
     return {
+        "input_mode": input_mode,
         "null_row": null_result,
         "corrupt_row": {
-            "status": corrupt_result["status"],
-            "message_contains_row_index": "row" in corrupt_result["error"].lower(),
-            "message": corrupt_result["error"][:300],
+            "status": corrupt_status,
+            "message": (corrupt_error or "")[:300],
+            "row_index_in_message": row_index,
+            "row_index_matches_arrow_position": row_index == CORRUPT_ARROW_POSITION,
         },
         "good_row_still_ok": good_result["status"] == "ok",
     }
 
 
-def emit(db, target: str, vision_checkpoint: str, audio_checkpoint: str) -> None:
+def emit(server: GpuLiveServer, vision_checkpoint: str, audio_checkpoint: str, device: str) -> None:
     ARTIFACTS.mkdir(parents=True, exist_ok=True)
+    endpoint = server.start()
+    db = jammi.connect(endpoint)
     info = db.get_server_info()
     print("server:", json.dumps(info), flush=True)
     if info.get("version") != ENGINE_VERSION:
         raise RuntimeError(
             f"server version {info.get('version')} != pinned {ENGINE_VERSION} — STOP")
+    if jammi.__version__ != ENGINE_VERSION:
+        raise RuntimeError(
+            f"installed jammi client {jammi.__version__} != pinned {ENGINE_VERSION} — STOP")
+
+    print("hashing checkpoint directories for an independent provenance digest...", flush=True)
+    vision_sha256 = _dir_sha256(Path(vision_checkpoint))
+    audio_sha256 = _dir_sha256(Path(audio_checkpoint))
 
     clip_base = f"local:{vision_checkpoint}"
     clap_base = f"local:{audio_checkpoint}"
@@ -338,33 +667,53 @@ def emit(db, target: str, vision_checkpoint: str, audio_checkpoint: str) -> None
     towers: dict[str, dict] = {}
 
     vision_record, db = measure_tower(
-        db, target=target, label="vision", task="image_embedding", column="image",
+        db, server=server, label="vision", task="image_embedding", column="image",
         dtype=pa.binary(), base_model=clip_base, triplets=image_triplets,
         probe_value=image_probe, source_prefix="vision", target_modules=CLIP_TARGET_MODULES,
+    )
+    vision_record["cross_tower_selectivity"] = measure_cross_tower_selectivity(
+        db, tuned_model=vision_record["model_id"], base_model=clip_base,
+        other_task="text_embedding", other_column="text", other_dtype=pa.utf8(),
+        other_probe_value=text_probe, source_prefix="vision",
     )
     towers["vision"] = vision_record
 
     text_record, db = measure_tower(
-        db, target=target, label="text", task="text_embedding", column="text",
+        db, server=server, label="text", task="text_embedding", column="text",
         dtype=pa.utf8(), base_model=clip_base, triplets=text_triplets,
         probe_value=text_probe, source_prefix="text", target_modules=CLIP_TARGET_MODULES,
+    )
+    text_record["cross_tower_selectivity"] = measure_cross_tower_selectivity(
+        db, tuned_model=text_record["model_id"], base_model=clip_base,
+        other_task="image_embedding", other_column="image", other_dtype=pa.binary(),
+        other_probe_value=image_probe, source_prefix="text",
     )
     towers["text"] = text_record
 
     audio_record, db = measure_tower(
-        db, target=target, label="audio", task="audio_embedding", column="audio",
+        db, server=server, label="audio", task="audio_embedding", column="audio",
         dtype=pa.binary(), base_model=clap_base, triplets=audio_triplets,
         probe_value=audio_probe, source_prefix="audio", target_modules=CLAP_TARGET_MODULES,
     )
     towers["audio"] = audio_record
 
     corrupt_rows = {
-        "image": measure_corrupt_rows(
-            db, label="vision", task="image_embedding", column="image", dtype=pa.binary(),
-            base_model=clip_base, good_value=image_probe, source_prefix="image"),
-        "audio": measure_corrupt_rows(
-            db, label="audio", task="audio_embedding", column="audio", dtype=pa.binary(),
-            base_model=clap_base, good_value=audio_probe, source_prefix="audio"),
+        "image": {
+            mode: measure_corrupt_rows(
+                db, label="vision", task="image_embedding", column="image",
+                base_model=clip_base, good_value=image_probe, source_prefix="image",
+                input_mode=mode,
+            )
+            for mode in ("bytes", "path")
+        },
+        "audio": {
+            mode: measure_corrupt_rows(
+                db, label="audio", task="audio_embedding", column="audio",
+                base_model=clap_base, good_value=audio_probe, source_prefix="audio",
+                input_mode=mode,
+            )
+            for mode in ("bytes", "path")
+        },
     }
 
     record = {
@@ -374,25 +723,41 @@ def emit(db, target: str, vision_checkpoint: str, audio_checkpoint: str) -> None
         "rows_per_modality": ROWS,
         "towers": towers,
         "corrupt_rows": corrupt_rows,
+        "provenance": {
+            "engine_version": ENGINE_VERSION,
+            "installed_client_version": jammi.__version__,
+            "server_info": info,
+            "hostname": socket.gethostname(),
+            "gpu_name": _gpu_name(),
+            "device": device,
+            "vision_checkpoint_sha256": vision_sha256,
+            "audio_checkpoint_sha256": audio_sha256,
+            "content_digest_via_shipped_surface": False,
+        },
     }
     (ARTIFACTS / "record.json").write_text(json.dumps(record, indent=2, sort_keys=True))
 
     metrics: dict[str, dict[str, float]] = {}
     for name, rec in towers.items():
+        td = rec["tolerance_derivation"]
         metrics[f"{name}.change_vs_base_max_abs_diff"] = {
-            "value": rec["change_vs_base_max_abs_diff"], "tol": 0.5}
+            "value": rec["change_vs_base_max_abs_diff"], "tol": td["change_tol"]}
         metrics[f"{name}.same_input_control_max_abs_diff"] = {
-            "value": rec["same_input_control_max_abs_diff"], "tol": 1e-6}
+            "value": rec["same_input_control_max_abs_diff"], "tol": PRECISION_FLOOR}
         metrics[f"{name}.round_trip_max_abs_diff"] = {
-            "value": rec["round_trip_max_abs_diff"], "tol": 1e-6}
+            "value": rec["round_trip_max_abs_diff"], "tol": PRECISION_FLOOR}
+    for name in ("vision", "text"):
+        metrics[f"{name}.cross_tower_selectivity_max_abs_diff"] = {
+            "value": towers[name]["cross_tower_selectivity"]["max_abs_diff"], "tol": 0.0}
     (ARTIFACTS / "golden_metrics.json").write_text(
         json.dumps(metrics, indent=2, sort_keys=True))
+
+    server.stop()
 
     # drop the working corpora + per-probe parquet scratch files — sources
     # only, not committed cache (mirrors build_finetune_cache.py's own cleanup).
     for tmp in sorted(ARTIFACTS.glob("_*.parquet")):
         tmp.unlink(missing_ok=True)
-    import shutil
     shutil.rmtree(work, ignore_errors=True)
 
     _write_checksums()
@@ -415,15 +780,35 @@ def _write_checksums() -> None:
 
 def main() -> None:
     ap = argparse.ArgumentParser()
-    ap.add_argument("--target", default="grpc://127.0.0.1:50051",
-                    help="connect() target — grpc://host:port for the GPU server.")
+    ap.add_argument("--server-bin", default=os.environ.get("JAMMI_SERVER_BIN"),
+                    help="built GPU jammi-server binary (or set JAMMI_SERVER_BIN)")
+    ap.add_argument("--artifact-dir",
+                    help="persistent JAMMI_ARTIFACT_DIR for the run's catalog + result store "
+                         "(defaults to a fresh temp dir that lives for this invocation, so "
+                         "the round-trip restart re-reads the SAME on-disk state training "
+                         "wrote)")
+    ap.add_argument("--device", default="0", help="JAMMI_GPU__DEVICE ordinal")
     ap.add_argument("--vision-checkpoint", required=True,
                     help="local filesystem path to the real OpenCLIP ViT-B-32 checkpoint dir")
     ap.add_argument("--audio-checkpoint", required=True,
                     help="local filesystem path to the real CLAP HTSAT checkpoint dir")
     args = ap.parse_args()
-    db = jammi.connect(args.target)
-    emit(db, args.target, args.vision_checkpoint, args.audio_checkpoint)
+    if not args.server_bin or not os.path.exists(args.server_bin):
+        raise SystemExit("pass --server-bin (or set JAMMI_SERVER_BIN) to a built GPU jammi-server")
+
+    artifact_dir = Path(args.artifact_dir) if args.artifact_dir else None
+    cleanup_artifact_dir = artifact_dir is None
+    if artifact_dir is None:
+        artifact_dir = Path(tempfile.mkdtemp(prefix="jammi_srv_media_tower_"))
+    artifact_dir.mkdir(parents=True, exist_ok=True)
+
+    server = GpuLiveServer(args.server_bin, artifact_dir, args.device)
+    try:
+        emit(server, args.vision_checkpoint, args.audio_checkpoint, args.device)
+    finally:
+        server.stop()
+        if cleanup_artifact_dir:
+            shutil.rmtree(artifact_dir, ignore_errors=True)
 
 
 if __name__ == "__main__":

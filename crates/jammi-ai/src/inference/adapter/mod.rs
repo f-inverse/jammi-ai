@@ -622,6 +622,27 @@ mod tests {
         assert!(out.all_rows_or_err().is_err());
     }
 
+    /// Isolates the `float_outputs.len() != 1` check from the `dim == 0`
+    /// check above: a NONZERO-dim shape with no float head at all would
+    /// still slip past a `dim == 0` guard alone and panic at
+    /// `self.float_outputs[0]`. Verified by reverting `checked_rows` to drop
+    /// the `float_outputs.len() != 1` check (with the `dim == 0` check left
+    /// in place): this test goes RED (a panic, not the `Err` asserted
+    /// below), while the `dim == 0` fixture above would stay accidentally
+    /// green off the OTHER check alone.
+    #[test]
+    fn both_accessors_refuse_a_producer_with_no_float_head_and_a_nonzero_dim() {
+        let out = BackendOutput {
+            float_outputs: vec![],
+            string_outputs: vec![],
+            row_status: vec![true, true],
+            row_errors: vec![String::new(), String::new()],
+            shapes: vec![(2, 3)],
+        };
+        assert!(out.single_row_or_err(0).is_err());
+        assert!(out.all_rows_or_err().is_err());
+    }
+
     /// Round-4 adversarial audit (F1): a zero-dim head (`shapes[0].1 == 0`)
     /// with a present-but-empty `float_outputs[0]` previously returned
     /// `Ok(&[])` from both accessors — a vacuous "embedding" with no

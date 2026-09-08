@@ -116,40 +116,70 @@ nothing left for the trigger/guard distinction to change.
 ## Message-argument literals — a comment is not the only way to embed prose
 
 A `#` comment is not the only bash shape that can carry arbitrary,
-never-executed prose: `echo '...'`/`printf '...'` (and their double-quoted
-forms) print a literal string that is never parsed as bash syntax either --
-`echo 'note: SWEEP_FAKE_BIN_SHA needs SWEEP_DRY_RUN != "1" -> exit 2'` reads,
-to every REGEX in this file, exactly like a real `!= "1"` guard, a real
-`provenance`/`build_sha` cross-check, or a real `exit` -- forging (A)/(B)/(C)
-with zero code that actually refuses or cross-checks anything, the same
-class of forgery the trailing-comment fixtures above already pin, one layer
-down. `_guard_text` therefore ALSO runs its `code` through
-`_blank_message_argument_literals` before returning it: every single-/
-double-quoted argument span of a word-initial `echo`/`printf` command word on
-that line has its CONTENT (not its delimiting quote characters) replaced
-with spaces, so none of a message argument's text can satisfy any
-satisfaction test in this file, while the command word itself, any
-unquoted argument, and everything textually outside the message argument
-list are untouched.
+never-executed prose. The PRINCIPLED class this section closes is: literal
+content that sits inside a construct bash can NEVER re-interpret as a
+guard/cross-check test, no matter what characters it contains --
 
-This is deliberately narrower than "blank every quoted span": the guard
-shape itself is written in quotes (`[ "$FOO_DRY_RUN" != "1" ]`), and real
-producers routinely pass a quoted script to an INTERPRETER, never a human
-reader (`python3 -c 'import json,sys; print(json.load(sys.stdin)
-["build_sha"])'` -- every tracked producer's own build_sha cross-check is
-written exactly this way) -- blanking ALL quoted content would blank both of
-those and turn the real, clean tree red. `echo`/`printf` are singled out
-because they are this codebase's only two commands whose quoted argument is
-addressed to a HUMAN (a log line, an `::error::` annotation) rather than
-parsed as code by whatever consumes it, so only their arguments are message
-text an attacker (or a copy-pasted TODO) could stuff with forged guard
-prose; a `[ ... ]` test's own quoted operands, and a quoted script handed to
-`python3 -c`/`bash -c`/etc., are never touched by this pass. Every real
-tracked producer's `provenance`/`build_sha` cross-check keeps at least one
-UNQUOTED-of-echo occurrence of both tokens (the bareword `"$BIN" provenance`
-subcommand invocation and the `python3 -c` payload's `["build_sha"]`), so
-this narrowing changes no real script's verdict while still emptying out
-every `echo`/`printf` message that merely LOOKS like a guard.
+  - the argument list of `echo`/`printf` (a command whose job IS to print
+    its argument, verbatim, to a human -- never to re-parse it as code),
+  - the argument list of `:`/`true`/`false` (three commands that
+    UNCONDITIONALLY ignore every argument they are given -- `:`/`true`/
+    `false` succeed or fail on their own name alone, never on their
+    argument's content),
+  - the right-hand side of a PLAIN assignment (`NAME=`/`export NAME=`/
+    `local NAME=`/`readonly NAME=`, immediately followed by a quote) -- a
+    value being STORED into a variable, not a command bash evaluates.
+
+`echo 'note: SWEEP_FAKE_BIN_SHA needs SWEEP_DRY_RUN != "1" -> exit 2'`,
+`: 'note: FOO_DRY_RUN_EVIL needs FOO_DRY_RUN != "1" -> exit 2'`,
+`true "provenance / build_sha cross-check"`, and
+`msg='note: SWEEP_FAKE_BIN_SHA needs SWEEP_DRY_RUN != "1" -> exit 2'` all
+read, to every REGEX in this file, exactly like a real `!= "1"` guard, a
+real `provenance`/`build_sha` cross-check, or a real `exit` -- forging
+(A)/(B)/(C) with zero code that actually refuses or cross-checks anything,
+the same class of forgery the trailing-comment fixtures above already pin,
+one layer down, and not specific to `echo`/`printf`: ANY sink whose
+argument is inert is an equally good vehicle for the same forgery, and a
+scanner that closes only the one shape an audit happened to hand-pick
+reopens the identical class the moment a producer author (or an attacker)
+reaches for a different inert sink.
+
+`_guard_text` therefore ALSO runs its `code` through
+`_blank_message_argument_literals` before returning it: every single-/
+double-quoted argument span DIRECTLY inside one of the sinks above has its
+CONTENT (never its delimiting quote characters) replaced with spaces, so
+none of that text can satisfy any satisfaction test in this file, while the
+sink word/assignment target itself, any unquoted argument, and everything
+textually outside a recognized sink are untouched.
+
+This is deliberately narrower than "blank every quoted span reachable from
+a sink": a quoted span NESTED inside a `$(`/`$((`/`${` construct -- even
+one sitting inside a sink's own argument list, e.g. `echo "$(jq
+'.build_sha' report.json)"` -- is never blanked, because a command
+substitution's content is REAL, EXECUTED code regardless of which sink
+ultimately consumes its output; `jq '.build_sha'` genuinely runs and its
+result is genuinely what gets printed/stored, so treating it as inert prose
+would hide a real cross-check, not a forged one (`_advance_blanking_step`
+tracks the SAME `'`/`"`/`$(`/`$((`/`${` nesting `_lex_one_line` does, and
+blanks a character only when it sits at nesting depth 1 inside a bare SQ/DQ
+frame — never inside a deeper CMD/ARITH/PARAM frame). This is also why the
+guard shape itself survives intact: `[ "$FOO_DRY_RUN" != "1" ]` is not
+inside any of the four sinks above at all (`[` is its own command, not
+`echo`/`:`/`true`/`false`/an assignment target), and a plain assignment's
+`=` requires no surrounding whitespace, so `[ "$X" = "1" ]`'s spaced `=`
+comparison can never be mistaken for one either. Real producers also
+routinely pass a quoted script to an INTERPRETER, never a human reader
+(`python3 -c 'import json,sys; print(json.load(sys.stdin)["build_sha"])'`
+-- every tracked producer's own build_sha cross-check is written exactly
+this way, as the argument to `python3 -c`, a command this pass does not
+touch at all since it is not one of the four sinks) -- blanking ALL quoted
+content reachable from ANY command would blank this too and turn the real,
+clean tree red. Every real tracked producer's `provenance`/`build_sha`
+cross-check keeps at least one occurrence of both tokens OUTSIDE any of
+these four sinks (the bareword `"$BIN" provenance` subcommand invocation
+and the `python3 -c` payload's `["build_sha"]`), so this narrowing changes
+no real script's verdict while still emptying out every sink argument or
+plain-assignment value that merely LOOKS like a guard.
 
 `self_test`'s `--self-test` arm additionally runs a full corpus scan: every
 tracked `.sh` line under `ci/scripts/` is lexed by `_lex_stream` AND by a
@@ -674,75 +704,204 @@ def _trigger_text(raw_line: str, lex: _LineLex) -> str:
     return raw_line if lex.undecidable else lex.code
 
 
-# A `echo`/`printf` command word recognized at the same word-initial
-# positions `#` is (see `_WORD_INITIAL_DELIMS`) -- BOF or preceded by
-# whitespace/`;`/`|`/`&`/`(`, so `$(echo ...)`'s nested invocation and an
-# `if ...; then echo ...; fi` one-liner's `then`-clause invocation (always
-# preceded by a space) are both recognized, and a word merely ENDING in
-# "echo" (`myecho`) is not.
-_MSG_CMD_RE = re.compile(r"\b(?:echo|printf)\b")
+# A `echo`/`printf`/`true`/`false` command word recognized at the same
+# word-initial positions `#` is (see `_WORD_INITIAL_DELIMS`) -- BOF or
+# preceded by whitespace/`;`/`|`/`&`/`(`, so `$(echo ...)`'s nested
+# invocation and an `if ...; then echo ...; fi` one-liner's `then`-clause
+# invocation (always preceded by a space) are both recognized, and a word
+# merely ENDING in "echo" (`myecho`) is not. `:` (the colon no-op builtin)
+# is handled separately below -- it is not a word character, so `\b`
+# cannot anchor it.
+_MSG_CMD_RE = re.compile(r"\b(?:echo|printf|true|false)\b")
+
+# A plain assignment's TARGET: an optional `export`/`local`/`readonly`
+# keyword (its own word, whitespace-separated) followed by a bare
+# identifier and `=`, with NO space before the `=` (bash's own assignment
+# syntax) -- so `if [ "$X" = "1" ]`'s spaced `=` comparison, and `c=(...)`
+# array literals (whose RHS does not start with a quote -- see the call
+# site below), are never mistaken for this shape.
+_SINK_ASSIGN_RE = re.compile(r"(?:\b(?:export|local|readonly)\s+)?([A-Za-z_][A-Za-z0-9_]*)=")
+
+
+def _advance_blanking_step(code: str, i: int, stack: list[_Frame]) -> tuple[int, bool]:
+    """One lexical step of `_lex_one_line`'s OWN nesting rules for `'`, `"`,
+    `$(`, `$((`, `${` and their closers (no comment/heredoc handling --
+    this only ever runs on a single already-classified line's surviving
+    `code`), returning `(next_i, blank_this_span)`. `blank_this_span` is
+    True only for an ORDINARY content character sitting DIRECTLY inside a
+    SQ/DQ frame with `len(stack) == 1` -- i.e. NOT inside any nested
+    `$(`/`$((`/`${` construct, whose content is real, potentially EXECUTED
+    (or referenced) code, never prose (a `jq '.build_sha'` cross-check
+    nested inside a sink command's own argument must never be blanked,
+    exactly the class this module's own "Message-argument literals" doc
+    names) -- and never a frame's own delimiting quote/bracket character.
+    A backslash escapes the next character in every state (matching
+    `_lex_one_line`'s own documented simplification), consumed as one
+    2-character step that is never itself blanked."""
+    n = len(code)
+    c = code[i]
+    if c == "\\" and i + 1 < n:
+        return i + 2, False
+    top = stack[-1].kind if stack else "TOP"
+    if top == "SQ":
+        if c == "'":
+            stack.pop()
+            return i + 1, False
+        return i + 1, len(stack) == 1
+    if top == "DQ":
+        if c == '"':
+            stack.pop()
+            return i + 1, False
+        if c == "$" and i + 1 < n:
+            if code[i + 1 : i + 3] == "((":
+                stack.append(_Frame("ARITH"))
+                return i + 3, False
+            if code[i + 1] == "(":
+                stack.append(_Frame("CMD"))
+                return i + 2, False
+            if code[i + 1] == "{":
+                stack.append(_Frame("PARAM"))
+                return i + 2, False
+        return i + 1, len(stack) == 1
+    # TOP / CMD / ARITH / PARAM -- code-like contexts, never blanked.
+    if c == "'":
+        stack.append(_Frame("SQ"))
+        return i + 1, False
+    if c == '"':
+        stack.append(_Frame("DQ"))
+        return i + 1, False
+    if c == "$" and i + 1 < n:
+        if code[i + 1 : i + 3] == "((":
+            stack.append(_Frame("ARITH"))
+            return i + 3, False
+        if code[i + 1] == "(":
+            stack.append(_Frame("CMD"))
+            return i + 2, False
+        if code[i + 1] == "{":
+            stack.append(_Frame("PARAM"))
+            return i + 2, False
+    if top in ("CMD", "ARITH") and c == "(":
+        stack[-1].paren_depth += 1
+        return i + 1, False
+    if top in ("CMD", "ARITH") and c == ")":
+        frame = stack[-1]
+        if frame.paren_depth > 0:
+            frame.paren_depth -= 1
+            return i + 1, False
+        if top == "ARITH" and i + 1 < n and code[i + 1] == ")":
+            stack.pop()
+            return i + 2, False
+        stack.pop()
+        return i + 1, False
+    if top == "PARAM" and c == "}":
+        stack.pop()
+        return i + 1, False
+    return i + 1, False
+
+
+def _blank_sink_argument_list(code: str, out: list[str], start: int) -> int:
+    """Blanks every SQ/DQ literal span (nested-frame-exempt -- see
+    `_advance_blanking_step`) from `start` (just past a recognized
+    `echo`/`printf`/`true`/`false`/`:` command word) up to the next
+    TOP-LEVEL `;`/`&`/`|`, or end of line -- the sink command's own
+    argument list. Returns the index to resume the outer scan from."""
+    n = len(code)
+    stack: list[_Frame] = []
+    i = start
+    while i < n:
+        if not stack and code[i] in (";", "&", "|"):
+            break
+        nxt, blank = _advance_blanking_step(code, i, stack)
+        if blank:
+            for k in range(i, nxt):
+                out[k] = " "
+        i = nxt
+    return i
+
+
+def _blank_one_quoted_span(code: str, out: list[str], start: int) -> int:
+    """Blanks the literal content (nested-frame-exempt) of exactly ONE
+    balanced SQ/DQ span opening at `code[start]` (which must be `'` or
+    `"`) -- a plain assignment's RHS, `NAME='literal'`/`NAME="literal"`.
+    Returns the index just past the matching close, or end of line if the
+    span never closes on this physical line (a multi-line single-quoted
+    RHS is already caught upstream: `_lex_stream` marks such a line
+    UNDECIDABLE, and `_guard_text` never calls this function on an
+    UNDECIDABLE line's code at all)."""
+    n = len(code)
+    stack: list[_Frame] = []
+    i = start
+    while i < n:
+        nxt, blank = _advance_blanking_step(code, i, stack)
+        if blank:
+            for k in range(i, nxt):
+                out[k] = " "
+        i = nxt
+        if not stack:
+            break
+    return i
 
 
 def _blank_message_argument_literals(code: str) -> str:
-    """See module doc, "Message-argument literals". Blanks the CONTENT
-    (never the delimiting quote characters themselves) of every single-/
-    double-quoted argument span belonging to a word-initial `echo`/`printf`
-    command on `code` -- an already comment-stripped SINGLE physical line's
-    text, never the raw line. Walks its own small quote-tracking state
-    machine from just past the recognized command word up to the next
-    TOP-LEVEL (`(`/`)` -balanced) `;`/`&`/`|`, or end of line -- deliberately
-    NOT `_lex_one_line`'s full `$(`/`$((`/`${` frame model: an `echo`/
-    `printf` argument list in this corpus is plain quoted prose plus `$VAR`
-    interpolation, never a nested construct whose own internal `;`/`&`/`|`
-    would need protecting, and reusing a lighter, purpose-built walk here
-    keeps this pass legible as exactly what it claims to be. A backslash
-    escapes the next character (matching `_lex_one_line`'s own
-    simplification) except inside a single-quoted span, where bash -- and
-    this walker -- treat `\\` as fully literal."""
+    """See module doc, "Message-argument literals" -- the CLASS this
+    blanks is "literal content that can never be executed as a check",
+    not merely `echo`/`printf`: a colon (`:`) or `true`/`false` command's
+    entire argument list is UNCONDITIONALLY ignored by bash itself (the
+    exact same "never re-parsed as a test" property `echo`/`printf`'s
+    arguments have), and the right-hand side of a PLAIN assignment
+    (`NAME=`/`export NAME=`/`local NAME=`/`readonly NAME=`, immediately
+    followed by a quote) is a value being STORED, never a command bash
+    evaluates as a guard/cross-check either -- `msg='note: SWEEP_DRY_RUN
+    != "1" -> exit 2'` forges (A)/(C) exactly as `echo '...'` does, and
+    `: '...'`/`true "..."` forge it with no `msg=` variable left over to
+    even look suspicious. Every one of these sinks is blanked through the
+    SAME nested-frame-exempt walk (`_advance_blanking_step`,
+    `_blank_sink_argument_list`/`_blank_one_quoted_span`): content sitting
+    DIRECTLY inside the sink's own SQ/DQ literal is blanked, but content
+    inside a NESTED `$(`/`$((`/`${` construct is never touched, because
+    that content can be real, EXECUTED code regardless of which sink
+    swallows its output -- `echo "$(jq '.build_sha' report.json)"`'s `jq`
+    invocation genuinely runs and its result is genuinely printed; blanking
+    it would hide a REAL cross-check, not a forged one. This is the module
+    doc's own "must never blank an argument to another command" line drawn
+    precisely: a command nested inside `$(...)` is a DIFFERENT command,
+    running for real, never this sink's own inert argument.
+
+    Operates on `code` -- an already comment-stripped SINGLE physical
+    line's text, never the raw line. Assignment blanking is deliberately
+    narrow: it fires ONLY when a quote character sits immediately after
+    the `=` (a pure literal assignment), never `NAME=$(...)` (unquoted
+    command substitution -- real code, never touched) nor `NAME=(...)`
+    (an array literal -- its `(` is not a quote, so this scanner leaves it
+    alone entirely, never even entering `_blank_one_quoted_span`), and
+    blanks exactly that one balanced span, not any further unquoted text
+    that might follow it on the same word (an unrealistic shape no
+    tracked producer uses)."""
     out = list(code)
     n = len(code)
     i = 0
     while i < n:
-        m = _MSG_CMD_RE.search(code, i)
-        if not m:
-            break
-        start = m.start()
-        prev = code[start - 1] if start > 0 else None
-        if start != 0 and prev not in _WORD_INITIAL_DELIMS:
-            i = m.end()
+        c = code[i]
+        if (
+            c == ":"
+            and (i == 0 or code[i - 1] in _WORD_INITIAL_DELIMS)
+            and (i + 1 >= n or code[i + 1] in (" ", "\t", ";", "&", "|"))
+        ):
+            i = _blank_sink_argument_list(code, out, i + 1)
             continue
-        j = m.end()
-        quote: str | None = None
-        paren_depth = 0
-        while j < n:
-            c = code[j]
-            if c == "\\" and quote != "'" and j + 1 < n:
-                j += 2
-                continue
-            if quote is not None:
-                if c == quote:
-                    quote = None
-                else:
-                    out[j] = " "
-                j += 1
-                continue
-            if c in ("'", '"'):
-                quote = c
-                j += 1
-                continue
-            if c == "(":
-                paren_depth += 1
-                j += 1
-                continue
-            if c == ")":
-                if paren_depth > 0:
-                    paren_depth -= 1
-                j += 1
-                continue
-            if paren_depth == 0 and c in (";", "&", "|"):
-                break
-            j += 1
-        i = j
+        m = _MSG_CMD_RE.match(code, i)
+        if m and (m.start() == 0 or code[m.start() - 1] in _WORD_INITIAL_DELIMS):
+            i = _blank_sink_argument_list(code, out, m.end())
+            continue
+        m2 = _SINK_ASSIGN_RE.match(code, i)
+        if m2 and (m2.start() == 0 or code[m2.start() - 1] in _WORD_INITIAL_DELIMS):
+            rhs_start = m2.end()
+            if rhs_start < n and code[rhs_start] in ("'", '"'):
+                i = _blank_one_quoted_span(code, out, rhs_start)
+            else:
+                i = rhs_start
+            continue
+        i += 1
     return "".join(out)
 
 
@@ -1771,6 +1930,37 @@ def self_test() -> int:
             "no refusal guard",
         )
 
+        # (A) RED, the SAME forgery through the `:` no-op builtin instead of
+        # `echo` -- `:`'s entire argument list is UNCONDITIONALLY ignored by
+        # bash, the same "never re-parsed as a test" property `echo`'s
+        # argument has, so this is an equally good vehicle for the class,
+        # not a shape specific to `echo`/`printf`.
+        commit_and_check(
+            "ci/scripts/perf/bad_fake_knob_guard_forged_by_colon_string.sh",
+            (
+                '#!/usr/bin/env bash\n'
+                'BIN_PROV_SHA="$SWEEP_FAKE_BIN_SHA"; '
+                ': \'note: SWEEP_FAKE_BIN_SHA needs SWEEP_DRY_RUN != "1" -> exit 2\'\n'
+            ),
+            check_fake_knob_inertness,
+            "no refusal guard",
+        )
+
+        # (A) RED, the SAME forgery as a plain SINGLE-quoted assignment's
+        # value -- `msg='...'` stores the forged text in a variable that is
+        # never itself read as a guard; a value being STORED is not a
+        # command bash evaluates either.
+        commit_and_check(
+            "ci/scripts/perf/bad_fake_knob_guard_forged_by_single_quoted_assignment.sh",
+            (
+                '#!/usr/bin/env bash\n'
+                'BIN_PROV_SHA="$SWEEP_FAKE_BIN_SHA"; '
+                'msg=\'note: SWEEP_FAKE_BIN_SHA needs SWEEP_DRY_RUN != "1" -> exit 2\'\n'
+            ),
+            check_fake_knob_inertness,
+            "no refusal guard",
+        )
+
         # (B) RED: names a jammi-bench binary path, invokes it, but never
         # cross-checks provenance.
         commit_and_check(
@@ -1885,6 +2075,60 @@ def self_test() -> int:
             "missing",
         )
 
+        # (B) RED, the SAME forgery through the `true` no-op builtin (its
+        # argument is UNCONDITIONALLY ignored -- `true` always succeeds
+        # regardless of what it is given, the same "never re-parsed"
+        # property `echo`'s argument has).
+        commit_and_check(
+            "ci/scripts/perf/bad_provenance_forged_by_true_string.sh",
+            (
+                '#!/usr/bin/env bash\n'
+                'BIN="$TARGET_DIR/release/jammi-bench"\n'
+                'true "provenance / build_sha cross-check"\n'
+                '"$BIN" finetune-step --batch 1\n'
+            ),
+            check_producer_parity,
+            "missing",
+        )
+
+        # (B) RED, the SAME forgery as a plain DOUBLE-quoted assignment's
+        # value -- unlike (A)'s `!= "1"` shape, (B)'s `provenance`/
+        # `build_sha` tokens need no surrounding quotes at all, so this is
+        # the natural, unescaped double-quoted forgery for THIS check
+        # (pinning it here rather than under (A), where the analogous
+        # double-quoted form would need an escaped `\"1\"` that already
+        # fails to match regardless of this blanking pass).
+        commit_and_check(
+            "ci/scripts/perf/bad_provenance_forged_by_double_quoted_assignment.sh",
+            (
+                '#!/usr/bin/env bash\n'
+                'BIN="$TARGET_DIR/release/jammi-bench"\n'
+                'msg="TODO: add a provenance / build_sha cross-check"\n'
+                '"$BIN" finetune-step --batch 1\n'
+            ),
+            check_producer_parity,
+            "missing",
+        )
+
+        # (B) GREEN control: `provenance`/`build_sha` sitting inside a
+        # NESTED `$(...)` command substitution embedded in an `echo`
+        # argument must NOT be blanked -- the substitution genuinely
+        # executes, so this is real code, not prose, and must still
+        # satisfy the cross-check (proves the fix is "blank only content
+        # DIRECTLY inside a sink's own literal, exempt nested `$(...)`",
+        # not a blanket "blank everything an echo argument reaches").
+        commit_and_check(
+            "ci/scripts/perf/good_provenance_nested_command_substitution_not_blanked.sh",
+            (
+                '#!/usr/bin/env bash\n'
+                'BIN="$TARGET_DIR/release/jammi-bench"\n'
+                'echo "cross-check: $(echo provenance build_sha)"\n'
+                '"$BIN" finetune-step --batch 1\n'
+            ),
+            check_producer_parity,
+            None,
+        )
+
         # (C) RED: a `_DRY_RUN_` knob read completely unguarded — no
         # containment, no preflight refusal.
         commit_and_check(
@@ -1975,6 +2219,34 @@ def self_test() -> int:
                 'FOO_DRY_RUN="${FOO_DRY_RUN:-0}"\n'
                 'rm -rf "$FOO_DRY_RUN_EVIL"; '
                 'echo \'note: FOO_DRY_RUN_EVIL needs FOO_DRY_RUN != "1" -> exit 2\'\n'
+            ),
+            check_dry_run_knob_containment,
+            "outside any",
+        )
+
+        # (C) RED, the SAME forgery through the `:` no-op builtin instead
+        # of `echo` (mirrors (A)'s colon fixture above, for mode 2).
+        commit_and_check(
+            "ci/scripts/perf/bad_dry_run_knob_guard_forged_by_colon_string.sh",
+            (
+                '#!/usr/bin/env bash\n'
+                'FOO_DRY_RUN="${FOO_DRY_RUN:-0}"\n'
+                'rm -rf "$FOO_DRY_RUN_EVIL"; '
+                ': \'note: FOO_DRY_RUN_EVIL needs FOO_DRY_RUN != "1" -> exit 2\'\n'
+            ),
+            check_dry_run_knob_containment,
+            "outside any",
+        )
+
+        # (C) RED, the SAME forgery as a plain SINGLE-quoted assignment's
+        # value (mirrors (A)'s assignment fixture above, for mode 2).
+        commit_and_check(
+            "ci/scripts/perf/bad_dry_run_knob_guard_forged_by_single_quoted_assignment.sh",
+            (
+                '#!/usr/bin/env bash\n'
+                'FOO_DRY_RUN="${FOO_DRY_RUN:-0}"\n'
+                'rm -rf "$FOO_DRY_RUN_EVIL"; '
+                'msg=\'note: FOO_DRY_RUN_EVIL needs FOO_DRY_RUN != "1" -> exit 2\'\n'
             ),
             check_dry_run_knob_containment,
             "outside any",
@@ -2341,22 +2613,25 @@ def self_test() -> int:
     print(
         "check-producer-provenance-gates self-test: OK — (A) FAKE-knob inertness "
         "(no-guard / use-before-guard / guard-without-exit / trailing-comment-forgery, plain, "
-        "with an added echo \"ok\", and as a quoted echo-message forgery, plus an `exit` living "
-        "only in a dead `else` arm or only inside a heredoc payload, all RED; a real guard, a "
-        "comment-only mention, and a real taken-arm `exit` with an unrelated `else` arm present, "
-        "all GREEN), (B) producer parity (a jammi-bench-binary producer missing provenance/"
-        "build_sha, including via a trailing-comment forgery plain, with an added echo \"ok\", "
-        "and as a quoted echo-message forgery, is RED; one carrying both, or one that never "
-        "names a binary path at all, is GREEN), and (C) *_DRY_RUN_* knob containment (unguarded, "
-        "a knob past a heredoc-embedded unmatched-if block's real `fi`, a trailing-comment or "
-        "quoted-echo-message forgery plain and with an added echo \"ok\", a read confined to a "
-        "dead `else`/`elif` arm, a knob covered only by a phantom guard opener whose text lives "
-        "inside a heredoc payload, an opener that is negated or `||`-disjunctive (never an "
-        "implication), an `exit` living only inside a heredoc payload, and an unterminated "
-        "heredoc that must TRUNCATE its containment interval rather than swallow a later real "
-        "read, all RED; heredoc containment, preflight refusal, comment/self-default-only, a "
-        "taken-arm read with an unrelated `else` arm present, a real opener appearing after a "
-        "heredoc closes, and a real `&&`-conjoined opener, all GREEN) all bite on throwaway "
+        "with an added echo \"ok\", and forged through echo/`:`/a single-quoted assignment's "
+        "value, plus an `exit` living only in a dead `else` arm or only inside a heredoc payload, "
+        "all RED; a real guard, a comment-only mention, and a real taken-arm `exit` with an "
+        "unrelated `else` arm present, all GREEN), (B) producer parity (a jammi-bench-binary "
+        "producer missing provenance/build_sha, including via a trailing-comment forgery plain, "
+        "with an added echo \"ok\", and forged through echo/`true`/a double-quoted assignment's "
+        "value, is RED; one carrying both, one that never names a binary path at all, or one "
+        "whose provenance/build_sha sits inside a NESTED $(...) reachable from an echo argument "
+        "(real, executed code, never blanked), is GREEN), and (C) *_DRY_RUN_* knob containment "
+        "(unguarded, a knob past a heredoc-embedded unmatched-if block's real `fi`, a "
+        "trailing-comment or echo/`:`/single-quoted-assignment forgery plain and with an added "
+        "echo \"ok\", a read confined to a dead `else`/`elif` arm, a knob covered only by a "
+        "phantom guard opener whose text lives inside a heredoc payload, an opener that is "
+        "negated or `||`-disjunctive (never an implication), an `exit` living only inside a "
+        "heredoc payload, and an unterminated heredoc that must TRUNCATE its containment interval "
+        "rather than swallow a later real read, all RED; heredoc containment, preflight refusal, "
+        "comment/self-default-only, a taken-arm read with an unrelated `else` arm present, a real "
+        "opener appearing after a heredoc closes, and a real `&&`-conjoined opener, all GREEN) "
+        "all bite on throwaway "
         "fixtures; the real tree is clean; and the lexer agrees with an independently-written "
         "second implementation on every tracked ci/scripts/ line, including the five real lines "
         "a differential audit scan found the pre-existing hand-rolled comment stripper "

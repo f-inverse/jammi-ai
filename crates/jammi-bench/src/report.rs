@@ -2363,10 +2363,11 @@ pub struct FinetuneRunTier {
     /// out loss itself computes — two legs agreeing on every identity field
     /// but disagreeing here measured the identical model on differently-
     /// provisioned hardware. `null` on no leg: the pool exists on every
-    /// build (`rayon` is a direct, unconditional `jammi-ai` dependency —
-    /// contract §A), so this is `NonNull` on text legs too, even though
-    /// text has no media front end to parallelize — it states the pool's
-    /// SIZE, not whether this run's front end used it.
+    /// build this crate makes (`rayon` is a `jammi-ai` dependency behind
+    /// its `local` feature, which `jammi-bench` requires — contract §A), so
+    /// this is `NonNull` on text legs too, even though text has no media
+    /// front end to parallelize — it states the pool's SIZE, not whether
+    /// this run's front end used it.
     pub rayon_pool_threads: usize,
 
     // ── Fused-dispatch proof (unit 63 re-audit round-2 finding 2) ───────

@@ -285,8 +285,13 @@ workspace ships every publishable crate at the same
   → 0.344 s), a bar ratio of 0.0809 with interval [0.0772, 0.0871] against
   bounds [0.0448, 0.0864] — UNRESOLVED under both the driver-default and the
   run's own measured serial-tail ratio. Per the contract's own Verdict
-  clause the unit ships because bit identity holds and there is no serving
-  regression, with these numbers recorded and no parallel-efficiency claim
+  clause the unit ships because bit identity holds (pool sizes 1/5/7/24
+  against the pre-unit reference, `crates/jammi-ai/tests/it/media_front_end.rs`)
+  and the n=1 image serving path stays within its always-on gross latency
+  bar (3x before_min + before_spread); the pre-registered 5 % n=1 bar is
+  opt-in (`JAMMI_FRONTEND_N1_LATENCY=1`) and no serving-latency measurement
+  is recorded, so no serving-regression claim tighter than the always-on
+  bar is made, with these numbers recorded and no parallel-efficiency claim
   made.
 - **HTSAT's MLP and projection GELU reach the fused seam on the training path (#421).** The audio
   tower's two GELU-erf sites — each Swin block's MLP and the projection head's `"gelu"` arm — call
@@ -553,6 +558,12 @@ workspace ships every publishable crate at the same
   name requirement.
 
 ### Breaking
+- `jammi_ai::inference::{arrow_to_images, arrow_to_audio}` return one decode result per row
+  (`Result<Vec<Option<Result<T>>>>`, previously `Result<Vec<Option<T>>>`) and
+  `jammi_ai::inference::schema::build_prefix_columns` returns a `Result`: a row that fails to
+  decode is a per-row value the caller marks in `_status`/`_error`, never a whole-batch error;
+  an unreadable path column value and a `row_status` shorter than the batch are still whole-call
+  refusals. Migration: match the inner `Result` per row (or `?` it to keep whole-batch failure).
 - `jammi_encoders::{AnyAudioEncoder, AudioEncoder}` are removed
   (`crates/jammi-encoders/src/lib.rs`). The audio-only dispatcher and its trait had no callers
   anywhere in the workspace, and audio is now a first-class `AnyEncoder` variant with real training

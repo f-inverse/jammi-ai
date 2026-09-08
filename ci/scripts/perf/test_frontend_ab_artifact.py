@@ -663,6 +663,14 @@ class HappyPathTests(unittest.TestCase):
         self.assertEqual(report["producer"]["path"], "ci/scripts/perf/frontend_ab_artifact.py")
         self.assertEqual(report["producer"]["kind"], "script")
         self.assertEqual(report["producer"]["gating"], "none")
+        # rule (j) source identity: the producer stamps the marker, hashes
+        # its OWN bytes, and carries the input manifest under `producer` too.
+        self.assertEqual(report["producer"]["identity"], "source_sha256+input_manifest")
+        self.assertEqual(
+            report["producer"]["source_sha256"],
+            {"ci/scripts/perf/frontend_ab_artifact.py": hashlib.sha256(Path(art.__file__).read_bytes()).hexdigest()},
+        )
+        self.assertEqual(report["producer"]["input_sha256"], report["notes"]["input_sha256"])
         self.assertEqual(report["status"], "GREEN")
 
     def test_htsat_bar_driver_matches_independent_oracle(self):

@@ -164,6 +164,26 @@ from pathlib import Path
 
 SCHEMA_VERSION = 1
 REPO_ROOT = Path(__file__).resolve().parents[3]
+
+# Producer identity (`check_cuda_run_artifacts.py` rule (j)): the sha256 of
+# every source file whose bytes determine a NUMBER in the artifact, keyed by
+# repo-root-relative path — this module alone. `frontend_ab_merge.py`'s
+# output (`report.json`) and `frontend_ab.sh`'s raw legs are INPUTS, hashed
+# per file into `producer.input_sha256`, so a change in either producer
+# that changes what it emitted moves an input hash, never a source hash.
+SOURCE_FILES_FOR_NUMBERS = (Path(__file__).resolve(),)
+PRODUCER_IDENTITY = "source_sha256+input_manifest"
+
+
+def _source_sha256() -> dict[str, str]:
+    out: dict[str, str] = {}
+    for path in SOURCE_FILES_FOR_NUMBERS:
+        try:
+            data = path.read_bytes()
+        except OSError as exc:
+            raise ArtifactBuildError(f"could not read producer source file {path} to hash it: {exc}") from exc
+        out[path.relative_to(REPO_ROOT).as_posix()] = hashlib.sha256(data).hexdigest()
+    return out
 TOWERS = ("htsat", "clip-vision")
 ROLES = ("base", "tip")
 # The task each tower's own `tiers.finetune_run.task` must carry -- read
@@ -735,7 +755,11 @@ def build_report(
         contract_clause = (
             f"not ACTIVATE (HTSAT bar {unit_verdict} under both the driver-default and the run's own measured "
             "serial-tail ratio); per contract v3's own Verdict clause the unit ships because bit identity holds "
-            "and there is no serving regression, with the numbers recorded and NO efficiency claim."
+            "(crates/jammi-ai/tests/it/media_front_end.rs: pool sizes 1/5/7/24 against the pre-unit reference) "
+            "and the n=1 image serving path stays within its always-on gross latency bar (3x before_min + "
+            "before_spread, same suite; the pre-registered 5 % n=1 bar is opt-in via JAMMI_FRONTEND_N1_LATENCY "
+            "and this artifact records no serving-latency measurement), with the numbers recorded and NO "
+            "efficiency claim."
         )
 
     return {
@@ -747,6 +771,9 @@ def build_report(
             "kind": "script",
             "invocation": invocation,
             "gating": "none",
+            "identity": PRODUCER_IDENTITY,
+            "source_sha256": _source_sha256(),
+            "input_sha256": input_sha256,
         },
         "status": report_json["status"],
         "notes": {

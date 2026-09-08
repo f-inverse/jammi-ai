@@ -632,8 +632,12 @@ field. The HTSAT bar's ratio, its observed interval, and the two-sided machine-m
 bound it is judged against are bound the same way below, as are the driver-default and
 the run's own measured serial-tail ratio: a bound falls strictly inside the interval, so
 the bar is UNRESOLVED, invariant under both ratios. Per the contract's own Verdict clause
-this is not ACTIVATE: the unit ships because bit identity holds and there is no serving
-regression, with these numbers recorded and NO parallel-efficiency claim made. The
+this is not ACTIVATE: the unit ships because bit identity holds (pool sizes 1/5/7/24 against
+the pre-unit reference, `crates/jammi-ai/tests/it/media_front_end.rs`) and the n=1 image
+serving path stays within its always-on gross latency bar (3x before_min + before_spread,
+same suite); the pre-registered 5 % n=1 bar is opt-in (`JAMMI_FRONTEND_N1_LATENCY=1`) and
+no serving-latency measurement is recorded, so no serving-regression claim tighter than
+that bar is made, with these numbers recorded and NO parallel-efficiency claim made. The
 separate #421 tower-profile artifact naming the front end's SHARE of a full training step
 (a different measurement from this unit's own base/tip A/B) still lands with its own
 artifact PR, not this branch — §11's first checklist applies unchanged: every number in a

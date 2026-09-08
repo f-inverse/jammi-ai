@@ -267,9 +267,9 @@ KNOWN_TABLES = {
 # after ANY change to KNOWN_TABLES, the exclusion class, or the guide's own
 # tagged tables — the bare run FAILS on a mismatch, naming both numbers.
 EXPECTED_TABLE_COUNTS = {
-    "docs/maintainer/fine-tune-performance-guide.md": 14,
+    "docs/maintainer/fine-tune-performance-guide.md": 15,
 }
-EXPECTED_DENOMINATOR = 354  # placeholder: recomputed after rebase
+EXPECTED_DENOMINATOR = 367
 
 # round-5 audit fix (class B, 2c): a POPULATION FLOOR for `--sweep`'s
 # enumerated candidate count — a matcher mutated to always return False

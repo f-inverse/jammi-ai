@@ -15,7 +15,28 @@
   "path": "ci/scripts/perf/profile_421_legs.sh",
   "kind": "script",
   "invocation": "identity (nvidia-smi, /proc/cpuinfo) -> nsys --version (pinned 2025.3.2.474, fails loudly if absent) -> build (cargo build --release -p jammi-bench --features cuda; JAMMI_BUILD_SHA baked from a byte-identical checkout) -> checkpoints (huggingface_hub fetch of the pinned per-repo file sets) -> PROFILE_421_LEGS_PREFLIGHT_ONLY=1 ci/scripts/perf/profile_421_legs.sh -> PROFILE_421_P2_BF16=1 ci/scripts/perf/profile_421_legs.sh + profile_421_merge.py --p2-dir -> ci/scripts/perf/profile_421_legs.sh (12 legs) -> profile_421_merge.py --legs-dir --p2-dir -> profile_421_attribute.py --legs-dir --merge-json",
-  "gating": "none"
+  "gating": "none",
+  "invocation_argv": [
+   "profile_421_artifact.py",
+   "--legs-dir",
+   "/private/tmp/claude-501/-Users-vijaychakilam-git-f-inverse-jammi-ai/4ac1595d-bdec-4db7-b4f7-9c3993c88377/scratchpad/pod421-run2/legs",
+   "--p2-dir",
+   "/private/tmp/claude-501/-Users-vijaychakilam-git-f-inverse-jammi-ai/4ac1595d-bdec-4db7-b4f7-9c3993c88377/scratchpad/pod421-run2/p2-bf16",
+   "--merge-json",
+   "/private/tmp/claude-501/-Users-vijaychakilam-git-f-inverse-jammi-ai/4ac1595d-bdec-4db7-b4f7-9c3993c88377/scratchpad/pod421-run2/merge.json",
+   "--attribution-json",
+   "/private/tmp/claude-501/-Users-vijaychakilam-git-f-inverse-jammi-ai/4ac1595d-bdec-4db7-b4f7-9c3993c88377/scratchpad/attr-pass4.json",
+   "--identity",
+   "ci/scripts/perf/profile_421_run2_identity.json",
+   "--out",
+   "crates/jammi-kernels/artifacts/cuda-runs/2026-09-07-profile-421-towers-c1b0b0ba-a100-sxm4.json"
+  ],
+  "tree_sha": "b9635f5b956f2c5d4b2dbab6c5b4b8332f6985be",
+  "input_sha256": {
+   "merge_json": "c80cd7eaf480e6e167861b0ac7ae9855d58df0ec84c2799864cdfd6c931db264",
+   "attribution_json": "3d5f33c280232f1ee2ee4740f3e18d84dffc6532f113b595bb1c9f34b63007a3",
+   "identity": "9223b54ad00e362afcbc05610d959c4af360b68dde468d1585920d8eea21defe"
+  }
  },
  "status": "GREEN",
  "notes": {
@@ -46,11 +67,12 @@
   },
   "recorded_deviations": [
    "run1 (pod p421, session 1) was ALL-12-LEGS INVALID at the pre-fix tip (esc-088: profile_421_legs.sh's corpus tuple shared stdout with its own producers, fixed by PR #469, main c1b0b0ba) -- this artifact is the full 12-leg re-run (run2) on the merged fix.",
-   "ROOT CAUSE of the run2-pass1..3 'A2 legs INVALID for attribution -> F32-only' state (pass-4 item 1, kernel_census.py): the module keyed each GPU-kernel bucket on shortName alone, and cutlass's Kernel2<...> template wrapper (same latent shape in magma_sgemmEx_kernel<...>) gives every bf16 GEMM tile instantiation the SAME literal shortName -- clip-text-A2's own run_m.sqlite has three DISTINCT cutlass instantiations sharing shortName='Kernel2' AND grid/block, so keying on shortName summed them into one anonymous row that tripped profile_421_attribute.py's 1% known-kernel-name gate. FIX: key on COALESCE(demangledName, shortName) instead -- a strict refinement (a bucket can only split, never merge two old buckets into fewer new ones), so gpu_kernel_us_per_step stays bit-identical and only by_kernel_and_grid resplits; only the cutlass Kernel2<...>(T1::Params) wrapper is stripped to its inner tile name, every other demangled name (magma's own template signature, splitKreduce_kernel<...>) is kept as-is since its template arguments are what distinguishes real instantiations there. All 12 censuses were regenerated under the fix for this run2 pass-4 pull -- every top-line number (gpu_kernel_us_per_step, wall/front/busy per_step) is UNCHANGED (sum-preserving refinement); only the per-instantiation by_kernel_and_grid breakdown resplit. Both CLIP-tower A2 legs (clip-text-A2, clip-vision-A2) are now VALID and decision-grade for attribution -- every candidate-port decision below is measured on BOTH the F32 (A1) and BF16 (A2) legs, never F32-only by consequence.",
+   "ROOT CAUSE of the run2-pass1..3 'A2 legs INVALID for attribution -> F32-only' state (pass-4 item 1, kernel_census.py): the module keyed each GPU-kernel bucket on shortName alone, and cutlass's Kernel2<...> template wrapper (same latent shape in magma_sgemmEx_kernel<...>) gives every bf16 GEMM tile instantiation the SAME literal shortName -- clip-text-A2's own run_m.sqlite has 3 DISTINCT cutlass instantiations sharing shortName='Kernel2' AND grid/block, so keying on shortName summed them into one anonymous row that tripped profile_421_attribute.py's 1% known-kernel-name gate. FIX: key on COALESCE(demangledName, shortName) instead -- a strict refinement (a bucket can only split, never merge two old buckets into fewer new ones), so gpu_kernel_us_per_step stays bit-identical and only by_kernel_and_grid resplits; only the cutlass Kernel2<...>(T1::Params) wrapper is stripped to its inner tile name, every other demangled name (magma's own template signature, splitKreduce_kernel<...>) is kept as-is since its template arguments are what distinguishes real instantiations there. All 12 censuses were regenerated under the fix for this run2 pass-4 pull -- every top-line number (gpu_kernel_us_per_step, wall/front/busy per_step) is UNCHANGED (sum-preserving refinement); only the per-instantiation by_kernel_and_grid breakdown resplit. Both CLIP-tower A2 legs (clip-text-A2, clip-vision-A2) are now VALID and decision-grade for attribution -- every candidate-port decision below is measured on BOTH the F32 (A1) and BF16 (A2) legs, never F32-only by consequence.",
    "htsat-A2 (bf16) is VALID at the merge level but NOT decision-grade for attribution: UNATTRIBUTED share_gpu_busy is 5.66%, over the contract's 5% validity bound. Root cause: WINDOWING (window-partition/reverse/roll copies) and FRONT-FUSION (the audio front end's own activation) are still UNDECLARED chains -- a window-partition copy sits at the identical element count as a generic residual-stream PERMUTE/RESHAPE copy, so profile_421_attribute.py has no shape-only way to tell them apart, and declares neither rather than guess (module doc, 'declaring a chain with no matching rule is dishonest'). htsat-A1 (f32) clears the bound under the pass-4 census fix and IS decision-grade. HTSAT has no candidate port under this contract in the first place (C-ATTN-HTSAT is a named, measured, declared-out-of-tier chain, never folded into UNATTRIBUTED), so htsat-A2's own non-decision-grade status never blocks a candidate-port decision.",
    "Per-leg raw .nsys-rep exports were deleted on-pod after each leg's census.json was produced (disk budget); the raw sqlite exports (24 files) were kept off-pod and were never committed -- see notes.operator_recorded for the on-pod-recorded total size, which has no in-tree witness.",
    "Both media corpus producers (image, audio) emit families x instances = 24 files at any --rows, so the M-leg's 4800 rows cycle 16 distinct train clips (a page-cached working set, contract SS D6.3) -- the HTSAT/vision front-end finding below is a real per-item CPU decode/preprocess compute cost, not a realistic-corpus I/O cost, and every quote of that finding must carry this caveat.",
-   "Census reports produced before the pass-4 kernel-identity fix (the #356 close-out and the #421 2026-09-01/06 pod artifacts) carry the pre-fix, collapsed Kernel2/magma_sgemmEx_kernel rows in by_kernel_and_grid -- their by_kernel_name totals and every other top-line number are unaffected (the refinement is sum-preserving, see the root-cause deviation above), only the per-instantiation breakdown was coarser."
+   "Census reports produced before the pass-4 kernel-identity fix (the #356 close-out and the #421 2026-09-01/06 pod artifacts) carry the pre-fix, collapsed Kernel2/magma_sgemmEx_kernel rows in by_kernel_and_grid -- their by_kernel_name totals and every other top-line number are unaffected (the refinement is sum-preserving, see the root-cause deviation above), only the per-instantiation breakdown was coarser.",
+   "CONTRACT.md's own SS D5 names profile_421_merge.py's hermetic suite at 45 tests -- already stale at the freeze commit (perf/421-profile-p1 @ aace002f), where the suite had already grown to 55 (python3 ci/scripts/perf/test_profile_421_merge.py -> 'Ran 55 tests'; unchanged at c1b0b0ba). Not corrected in the frozen body -- a pre-registration's text is never edited after freezing -- recorded here instead, per docs/plans/66-tower-profile/README.md's own 'Deviations from a clean single pass' section. The count is descriptive prose about the suite's size, not a method parameter any decision rule reads, so this staleness never affected a verdict."
   ],
   "operator_recorded": {
    "raw_sqlite_export_total_size": "~31 GB (on-pod estimate at run2 close-out, before the exports were deleted per the disk-budget deviation above; the raw .sqlite files themselves were never committed, so no in-tree witness can re-derive this figure -- the file COUNT in notes.recorded_deviations IS witnessed, this size is not)"
@@ -7868,5 +7890,6 @@
     "share_wall": 0.05006324585120546
    }
   }
- ]
+ ],
+ "suppressed_findings": []
 }

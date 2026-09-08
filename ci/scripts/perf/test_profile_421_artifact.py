@@ -75,6 +75,15 @@ C_ATTN_HTSAT_WALL = 0.0501
 UNATTRIBUTED_SHARE_GPU_BUSY = 0.02
 UNATTRIBUTED_SHARE_WALL = 0.01
 
+# `compute_kernel_identity_split_count`'s own fixture: TWO post-fix kernel
+# names sharing one (grid, block) that a single pre-fix "Kernel2" bucket
+# coalesced -- deliberately NOT 3 (the real committed identity sidecar's own
+# number), so a test asserting this exact fixture value proves the module
+# reads it LIVE rather than happening to agree with a hard-coded literal.
+KERNEL_IDENTITY_SPLIT_COUNT = 2
+_KERNEL2_GRID = [2, 1, 192]
+_KERNEL2_BLOCK = [128, 1, 1]
+
 IDENTITY_TEMPLATE_DEVIATIONS = [
     "fixture deviation, no placeholders.",
     (
@@ -84,6 +93,7 @@ IDENTITY_TEMPLATE_DEVIATIONS = [
     ),
     "raw sqlite exports: {sqlite_raw_export_count} files.",
     "corpus: {corpus_total_files} files, {corpus_train_clips} distinct train clips, {corpus_rows_m} rows.",
+    "kernel identity: {kernel_identity_split_count} distinct instantiations across {leg_count} legs.",
 ]
 
 
@@ -102,7 +112,41 @@ def _write_legs_dir(root: Path, specs: dict = LEG_SPECS) -> Path:
             "status": "ok",
         }
         (leg_dir / "manifest.json").write_text(json.dumps(manifest), encoding="utf-8")
-        (leg_dir / "census.json").write_text(json.dumps({"launches_per_step": spec["launches"]}), encoding="utf-8")
+        census: dict = {"launches_per_step": spec["launches"]}
+        if leg_id == "clip-text-A2":
+            # The one leg `compute_kernel_identity_split_count` reads by
+            # name: `KERNEL_IDENTITY_SPLIT_COUNT` distinct post-fix kernel
+            # names sharing (grid, block), collapsed pre-fix under a single
+            # "Kernel2" bucket at the SAME (grid, block).
+            census["by_kernel_and_grid"] = [
+                {
+                    "kernel": f"cutlass_fixture_{i}",
+                    "grid": _KERNEL2_GRID,
+                    "block": _KERNEL2_BLOCK,
+                    "launches_per_step": 1.0,
+                    "us_per_step": 1.0,
+                    "share": 0.001,
+                }
+                for i in range(KERNEL_IDENTITY_SPLIT_COUNT)
+            ]
+            (leg_dir / "census.pre-demangle.json").write_text(
+                json.dumps(
+                    {
+                        "by_kernel_and_grid": [
+                            {
+                                "kernel": "Kernel2",
+                                "grid": _KERNEL2_GRID,
+                                "block": _KERNEL2_BLOCK,
+                                "launches_per_step": float(KERNEL_IDENTITY_SPLIT_COUNT),
+                                "us_per_step": float(KERNEL_IDENTITY_SPLIT_COUNT),
+                                "share": 0.001 * KERNEL_IDENTITY_SPLIT_COUNT,
+                            }
+                        ]
+                    }
+                ),
+                encoding="utf-8",
+            )
+        (leg_dir / "census.json").write_text(json.dumps(census), encoding="utf-8")
     return legs_dir
 
 
@@ -262,6 +306,7 @@ class BuildReportHappyPathTests(unittest.TestCase):
         expected_keys = {
             "schema_version", "git_sha", "box", "p2_witnessed", "producer", "status", "notes",
             "legs", "p2", "attribution", "realized_gains", "candidate_decisions", "findings",
+            "suppressed_findings",
         }
         self.assertEqual(set(report.keys()), expected_keys)
         self.assertEqual(report["schema_version"], 1)
@@ -270,6 +315,7 @@ class BuildReportHappyPathTests(unittest.TestCase):
         self.assertEqual(report["producer"]["path"], "ci/scripts/perf/profile_421_legs.sh")
         self.assertEqual(report["producer"]["kind"], "script")
         self.assertEqual(report["producer"]["gating"], "none")
+        self.assertEqual(report["suppressed_findings"], [])
 
     def test_status_is_green_when_merge_summary_is_clean(self):
         report = self._build()
@@ -412,6 +458,28 @@ class TemplatedDeviationTests(unittest.TestCase):
         self.assertIn(f"{expected_train_clips} distinct train clips", self.deviations[3])
         self.assertIn(f"{expected_rows_m} rows", self.deviations[3])
 
+    def test_kernel_identity_split_count_and_leg_count_are_live(self):
+        # Independent oracle: group the FIXTURE's own by_kernel_and_grid
+        # rows for clip-text-A2 by (grid, block) and count distinct kernel
+        # names, never a value read back out of the module under test.
+        with open(self.fixture["legs_dir"] / "clip-text-A2" / "census.json", encoding="utf-8") as f:
+            post = json.load(f)
+        distinct_names = {row["kernel"] for row in post["by_kernel_and_grid"]}
+        expected_split = len(distinct_names)
+        expected_legs = len(LEG_SPECS)
+        self.assertEqual(expected_split, KERNEL_IDENTITY_SPLIT_COUNT)
+        self.assertEqual(expected_legs, 6)
+        self.assertEqual(
+            art.compute_kernel_identity_split_count(self.fixture["legs_dir"], "clip-text-A2", "Kernel2"),
+            expected_split,
+        )
+        self.assertIn(f"{expected_split} distinct instantiations across {expected_legs} legs", self.deviations[4])
+
+    def test_kernel_identity_split_count_refuses_when_coalesced_name_absent(self):
+        with self.assertRaises(art.ArtifactBuildError) as ctx:
+            art.compute_kernel_identity_split_count(self.fixture["legs_dir"], "clip-text-A2", "NoSuchBucket")
+        self.assertIn("no 'NoSuchBucket' bucket found", str(ctx.exception))
+
     def test_unknown_placeholder_refuses(self):
         def bad_identity(identity):
             identity["recorded_deviations"] = ["a fixture value that does not exist: {not_a_real_placeholder}."]
@@ -435,8 +503,9 @@ class TemplatedDeviationTests(unittest.TestCase):
 
 class IdentitySidecarNoBareMeasurementTests(unittest.TestCase):
     """The REAL committed `profile_421_run2_identity.json` carries no
-    digit-bearing MEASUREMENT (a bare percentage, or a bare count next to a
-    unit word like files/rows/clips/GB/MB) outside `operator_recorded` —
+    digit-bearing MEASUREMENT (a bare percentage, a bare count next to a
+    unit word like files/rows/clips/GB/MB, a SPELLED-OUT numeral next to
+    "DISTINCT", or a bare "All <N>" count) outside `operator_recorded` —
     every such number must instead be a `{placeholder}` this module fills
     live. Identifiers (git shas, issue/PR numbers, dates, `pass-4`-style
     version labels) are not measurements and are not what this regex
@@ -444,6 +513,16 @@ class IdentitySidecarNoBareMeasurementTests(unittest.TestCase):
 
     _PERCENT_RE = re.compile(r"\d+(\.\d+)?\s*%")
     _UNIT_COUNT_RE = re.compile(r"\b\d+(\.\d+)?\b(?:\s+\S+){0,2}\s+(files?|rows?|clips?|GB|MB)\b")
+    # "three DISTINCT ..." — a spelled-out numeral is exactly as much a
+    # transcribed measurement as a digit; caught generically for any of the
+    # small numerals this prose plausibly spells out.
+    _SPELLED_NUMERAL_DISTINCT_RE = re.compile(
+        r"\b(one|two|three|four|five|six|seven|eight|nine|ten|eleven|twelve)\s+DISTINCT\b"
+    )
+    # "All 12 censuses ..." — a bare count that the `{files?|rows?|...}`
+    # unit-word regex above does not cover (the noun here is "censuses",
+    # "legs", ...).
+    _BARE_ALL_COUNT_RE = re.compile(r"\bAll \d+\b")
 
     def test_no_bare_percentage_or_unit_count_outside_operator_recorded(self):
         identity = json.loads(IDENTITY_SIDECAR.read_text(encoding="utf-8"))
@@ -452,8 +531,12 @@ class IdentitySidecarNoBareMeasurementTests(unittest.TestCase):
         text = json.dumps(scrubbed)
         percent_hits = self._PERCENT_RE.findall(text)
         unit_hits = self._UNIT_COUNT_RE.findall(text)
+        spelled_hits = self._SPELLED_NUMERAL_DISTINCT_RE.findall(text)
+        all_count_hits = self._BARE_ALL_COUNT_RE.findall(text)
         self.assertEqual(percent_hits, [], f"bare percentage(s) found outside operator_recorded: {percent_hits}")
         self.assertEqual(unit_hits, [], f"bare unit-count(s) found outside operator_recorded: {unit_hits}")
+        self.assertEqual(spelled_hits, [], f"spelled-out numeral(s) found outside operator_recorded: {spelled_hits}")
+        self.assertEqual(all_count_hits, [], f"bare 'All <N>' count(s) found outside operator_recorded: {all_count_hits}")
 
     def test_operator_recorded_is_where_the_unwitnessed_size_lives(self):
         identity = json.loads(IDENTITY_SIDECAR.read_text(encoding="utf-8"))
@@ -541,6 +624,131 @@ class FindingsIndependentOracleTests(unittest.TestCase):
         self.assertIn("out-of-tier".replace("-", ""), finding["id"].replace("-", ""))
         self.assertIn("OUTSIDE", finding["text"])
         self.assertIn("never decided under this issue", finding["text"])
+
+
+class SignDerivedBf16WordingTests(unittest.TestCase):
+    """`clip-launch-bound-batch8`'s BF16-vs-F32 wording is SIGN-DERIVED —
+    never a hard-coded "cuts"/"drops" applied regardless of the measured
+    direction. Covers: the committed (uniform-negative) case, a positive
+    delta on ONE tower (mixed sign across towers), and a positive delta on
+    BOTH towers."""
+
+    def setUp(self):
+        self._tmp = tempfile.TemporaryDirectory()
+        self.root = Path(self._tmp.name)
+
+    def tearDown(self):
+        self._tmp.cleanup()
+
+    def _finding(self, merge_override=None):
+        fixture = _write_fixture(self.root, merge_override=merge_override)
+        report = art.build_report(
+            fixture["legs_dir"], fixture["p2_dir"], fixture["merge_report"], fixture["attribution_report"], fixture["identity"]
+        )
+        return {f["id"]: f for f in report["findings"]}["clip-launch-bound-batch8"]
+
+    def test_committed_negative_case_uses_a_single_cuts_drops_verb(self):
+        finding = self._finding()
+        self.assertLess(finding["evidence"]["busy_delta_pct_bf16_vs_f32"]["clip-text"], 0.0)
+        self.assertLess(finding["evidence"]["busy_delta_pct_bf16_vs_f32"]["clip-vision"], 0.0)
+        self.assertLess(finding["evidence"]["wall_delta_pct_bf16_vs_f32"]["clip-text"], 0.0)
+        self.assertLess(finding["evidence"]["wall_delta_pct_bf16_vs_f32"]["clip-vision"], 0.0)
+        self.assertIn("cuts GPU busy", finding["text"])
+        self.assertIn("drops by only", finding["text"])
+        self.assertNotIn("grows", finding["text"])
+
+    def test_positive_busy_delta_on_one_tower_never_says_cuts_for_it(self):
+        def bump(merge_report):
+            for row in merge_report["legs"]:
+                if row["leg_id"] == "clip-text-A2":
+                    row["per_step"]["busy_s_per_step"] = 0.075  # > clip-text-A1's 0.060: positive delta
+
+        finding = self._finding(bump)
+        self.assertGreater(finding["evidence"]["busy_delta_pct_bf16_vs_f32"]["clip-text"], 0.0)
+        self.assertLess(finding["evidence"]["busy_delta_pct_bf16_vs_f32"]["clip-vision"], 0.0)
+        self.assertNotIn("clip-text BF16 cuts GPU busy", finding["text"])
+        self.assertIn("clip-text BF16 grows GPU busy", finding["text"])
+        self.assertIn("clip-vision BF16 cuts GPU busy", finding["text"])
+
+    def test_positive_busy_delta_on_both_towers_never_says_cuts(self):
+        def bump(merge_report):
+            for row in merge_report["legs"]:
+                if row["leg_id"] == "clip-text-A2":
+                    row["per_step"]["busy_s_per_step"] = 0.075  # > clip-text-A1's 0.060
+                if row["leg_id"] == "clip-vision-A2":
+                    row["per_step"]["busy_s_per_step"] = 0.090  # > clip-vision-A1's 0.065
+
+        finding = self._finding(bump)
+        self.assertGreater(finding["evidence"]["busy_delta_pct_bf16_vs_f32"]["clip-text"], 0.0)
+        self.assertGreater(finding["evidence"]["busy_delta_pct_bf16_vs_f32"]["clip-vision"], 0.0)
+        self.assertNotIn("cuts GPU busy", finding["text"])
+        self.assertIn("clip-text BF16 grows GPU busy", finding["text"])
+        self.assertIn("clip-vision BF16 grows GPU busy", finding["text"])
+
+
+class SuppressedFindingsTests(unittest.TestCase):
+    """A finding is computed ONLY from legs whose merge verdict is VALID
+    (and, for a chain-share finding, whose attribution is decision_grade) —
+    an INVALID leg suppresses (never silently taints) the findings that
+    depend on it, and the suppression is named by finding id, leg(s), and
+    reason."""
+
+    def setUp(self):
+        self._tmp = tempfile.TemporaryDirectory()
+        self.root = Path(self._tmp.name)
+
+    def tearDown(self):
+        self._tmp.cleanup()
+
+    def _build(self, **kwargs):
+        fixture = _write_fixture(self.root, **kwargs)
+        return art.build_report(
+            fixture["legs_dir"], fixture["p2_dir"], fixture["merge_report"], fixture["attribution_report"], fixture["identity"]
+        )
+
+    def test_invalid_htsat_legs_suppress_dependent_findings_not_emit_them_unqualified(self):
+        def poison(merge_report):
+            for row in merge_report["legs"]:
+                if row["leg_id"] in ("htsat-A1", "htsat-A2"):
+                    row["verdict"] = "INVALID"
+                    row["reasons"] = ["synthetic: forced invalid for the suppression test"]
+
+        report = self._build(merge_override=poison)
+        finding_ids = {f["id"] for f in report["findings"]}
+        self.assertNotIn("htsat-front-end-bound", finding_ids)
+        self.assertNotIn("c-attn-htsat-out-of-tier", finding_ids)
+        # Unaffected findings still build.
+        self.assertIn("clip-vision-front-end-share", finding_ids)
+        self.assertIn("clip-launch-bound-batch8", finding_ids)
+
+        suppressed_by_id = {s["id"]: s for s in report["suppressed_findings"]}
+        self.assertIn("htsat-front-end-bound", suppressed_by_id)
+        entry = suppressed_by_id["htsat-front-end-bound"]
+        self.assertEqual(set(entry["legs"]), {"htsat-A1", "htsat-A2"})
+        self.assertIn("htsat-A1", entry["reason"])
+        self.assertIn("htsat-A2", entry["reason"])
+        self.assertIn("not VALID", entry["reason"])
+        self.assertIn("c-attn-htsat-out-of-tier", suppressed_by_id)
+        self.assertEqual(suppressed_by_id["c-attn-htsat-out-of-tier"]["legs"], ["htsat-A1"])
+
+    def test_non_decision_grade_htsat_a1_suppresses_only_the_chain_share_finding(self):
+        def poison(attribution_report):
+            for row in attribution_report["legs"]:
+                if row["leg_id"] == "htsat-A1":
+                    row["decision_grade"] = False
+                    row["decision_grade_reason"] = "synthetic: forced non-decision-grade"
+
+        report = self._build(attr_override=poison)
+        finding_ids = {f["id"] for f in report["findings"]}
+        self.assertNotIn("c-attn-htsat-out-of-tier", finding_ids)
+        # htsat-front-end-bound reads only merge per_step, not a chain share
+        # or decision_grade, so it is UNAFFECTED by htsat-A1's attribution
+        # status.
+        self.assertIn("htsat-front-end-bound", finding_ids)
+
+        suppressed_by_id = {s["id"]: s for s in report["suppressed_findings"]}
+        self.assertIn("c-attn-htsat-out-of-tier", suppressed_by_id)
+        self.assertIn("decision_grade", suppressed_by_id["c-attn-htsat-out-of-tier"]["reason"])
 
 
 class RefusalTests(unittest.TestCase):
@@ -720,6 +928,73 @@ class RefusalTests(unittest.TestCase):
         with self.assertRaises(art.ArtifactBuildError):
             art.collect_identity(self.root / "does-not-exist", None, [])
 
+    def test_collect_checkpoint_sha256_refuses_unknown_tower(self):
+        def poison(merge_report):
+            for row in merge_report["legs"]:
+                if row["leg_id"] == "clip-text-A1":
+                    row["tower"] = "unknown-tower"
+
+        fixture = _write_fixture(self.root, merge_override=poison)
+        with self.assertRaises(art.ArtifactBuildError) as ctx:
+            self._build(fixture)
+        self.assertIn("clip-text-A1", str(ctx.exception))
+        self.assertIn("not one of this contract's known towers", str(ctx.exception))
+
+
+class P2TowerNamesRefusalTests(unittest.TestCase):
+    """`p2_tower_names` refuses a `p2_bf16` row with no non-empty string
+    `tower` by name, rather than silently dropping it — a silent drop could
+    shrink `p2_towers` to empty even though `--merge-json` genuinely carries
+    `p2_bf16` rows, which would make `--p2-dir` wrongly optional and
+    `p2_witnessed: null` wrongly claim "no p2_bf16 rows in the merge"."""
+
+    def test_null_tower_refuses(self):
+        with self.assertRaises(art.ArtifactBuildError) as ctx:
+            art.p2_tower_names({"p2_bf16": [{"tower": None, "verdict": "PASS"}]})
+        self.assertIn("p2_bf16[0]", str(ctx.exception))
+
+    def test_blank_tower_refuses(self):
+        with self.assertRaises(art.ArtifactBuildError) as ctx:
+            art.p2_tower_names({"p2_bf16": [{"tower": "", "verdict": "PASS"}]})
+        self.assertIn("p2_bf16[0]", str(ctx.exception))
+
+    def test_all_rows_null_tower_refuses_never_treated_as_no_p2_rows(self):
+        # The exact escape this closes: EVERY row invalid must still refuse,
+        # never fall through to `p2_towers == []` (which would make
+        # `--p2-dir` silently optional for a merge report that DID carry
+        # p2_bf16 rows).
+        with self.assertRaises(art.ArtifactBuildError):
+            art.p2_tower_names({"p2_bf16": [{"tower": None}, {"tower": ""}]})
+
+    def test_non_dict_row_refuses(self):
+        with self.assertRaises(art.ArtifactBuildError) as ctx:
+            art.p2_tower_names({"p2_bf16": ["not-a-dict"]})
+        self.assertIn("p2_bf16[0]", str(ctx.exception))
+
+    def test_valid_rows_still_return_sorted_distinct_towers(self):
+        towers = art.p2_tower_names(
+            {"p2_bf16": [{"tower": "htsat"}, {"tower": "clip-text"}, {"tower": "clip-text"}]}
+        )
+        self.assertEqual(towers, ["clip-text", "htsat"])
+
+    def test_build_report_refuses_end_to_end_when_every_p2_row_tower_is_blank(self):
+        # The full pipeline, not just the unit function: a merge report that
+        # DOES carry p2_bf16 rows (so --p2-dir must be witnessed) must never
+        # silently fall through to "no p2_bf16 rows" just because every row
+        # happened to carry a blank tower.
+        def blank_p2_tower(merge_report):
+            for row in merge_report["p2_bf16"]:
+                row["tower"] = ""
+
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            fixture = _write_fixture(root, merge_override=blank_p2_tower)
+            with self.assertRaises(art.ArtifactBuildError) as ctx:
+                art.build_report(
+                    fixture["legs_dir"], fixture["p2_dir"], fixture["merge_report"], fixture["attribution_report"], fixture["identity"]
+                )
+            self.assertIn("p2_bf16[0]", str(ctx.exception))
+
 
 class StatusDerivationTests(unittest.TestCase):
     def setUp(self):
@@ -846,8 +1121,42 @@ class CliEndToEndTests(unittest.TestCase):
         self.assertEqual(report["box"], BOX)
         self.assertEqual(len(report["legs"]), 6)
         self.assertEqual(len(report["findings"]), 4)
+        self.assertEqual(report["suppressed_findings"], [])
         self.assertEqual(report["p2_witnessed"], {"towers": ["clip-text"], "git_sha": SHA, "box": BOX})
         self.assertEqual(report["status"], "GREEN")
+        # Producer identity: sha256 of the exact input FILES, the tree this
+        # JSON was rendered from, and this run's own invocation — never
+        # present on the hermetic `build_report` output, only on the CLI's.
+        producer = report["producer"]
+        self.assertEqual(
+            set(producer["input_sha256"].keys()), {"merge_json", "attribution_json", "identity"}
+        )
+        for digest in producer["input_sha256"].values():
+            self.assertRegex(digest, r"^[0-9a-f]{64}$")
+        self.assertRegex(producer["tree_sha"], r"^\S+$")
+        self.assertEqual(producer["invocation_argv"][0], "profile_421_artifact.py")
+        self.assertIn("--legs-dir", producer["invocation_argv"])
+
+    def test_cli_input_sha256_matches_independent_hash_of_the_same_files(self):
+        import hashlib
+
+        out_path = self.root / "artifact.json"
+        result = run_artifact_cli(
+            "--legs-dir", str(self.fixture["legs_dir"]),
+            "--p2-dir", str(self.fixture["p2_dir"]),
+            "--merge-json", str(self.fixture["merge_path"]),
+            "--attribution-json", str(self.fixture["attr_path"]),
+            "--identity", str(self.fixture["identity_path"]),
+            "--out", str(out_path),
+        )
+        self.assertEqual(result.returncode, 0, f"stdout={result.stdout}\nstderr={result.stderr}")
+        report = json.loads(out_path.read_text())
+        expected_merge_sha = hashlib.sha256(self.fixture["merge_path"].read_bytes()).hexdigest()
+        expected_attr_sha = hashlib.sha256(self.fixture["attr_path"].read_bytes()).hexdigest()
+        expected_identity_sha = hashlib.sha256(self.fixture["identity_path"].read_bytes()).hexdigest()
+        self.assertEqual(report["producer"]["input_sha256"]["merge_json"], expected_merge_sha)
+        self.assertEqual(report["producer"]["input_sha256"]["attribution_json"], expected_attr_sha)
+        self.assertEqual(report["producer"]["input_sha256"]["identity"], expected_identity_sha)
 
     def test_cli_refuses_missing_p2_dir_when_merge_has_p2_rows(self):
         result = run_artifact_cli(

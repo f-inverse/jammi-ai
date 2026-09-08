@@ -1347,57 +1347,6 @@ def _find_committed_frontend_artifact(repo_root: Path, tip_sha: str) -> Path | N
     return matches[0]
 
 
-def _regenerated_input_sha256_without_exit_additions(committed_input_sha256: dict, regenerated_input_sha256: dict) -> dict:
-    """The committed pod-p421c fixture was rendered BEFORE this suite's own
-    `.exit`-file folding into `notes.input_sha256` (see
-    `frontend_ab_artifact.py`'s own hash-computation section) -- a fresh
-    regeneration therefore carries 12 MORE keys (one `raw/<leg>.exit` entry
-    per raw leg) than the committed record does. This tolerates EXACTLY
-    that gap for `RealFixtureRegressionTests.
-    test_committed_artifact_record_is_not_stale`'s own comparison: any
-    regenerated `.exit` key ABSENT from the committed record is dropped
-    before comparison, but every OTHER key (including every regenerated
-    `.exit` key that IS already present in the committed record, and every
-    `.json`/`report_json`/`identity`/`serial_tail` key) is left untouched,
-    so a genuine hash divergence elsewhere still fails this comparison. The
-    lead's own final regeneration commit re-renders the fixture with the
-    folded `.exit` hashes, at which point this helper becomes a no-op (and
-    should be deleted)."""
-    return {
-        key: value
-        for key, value in regenerated_input_sha256.items()
-        if not (key.endswith(".exit") and key not in committed_input_sha256)
-    }
-
-
-def _tolerate_the_exit_fold_gap_for_the_legacy_committed_fixture(committed: dict, regenerated: dict) -> dict:
-    """The SAME `.exit`-file fold also changes `notes.run_sha256`'s own
-    VALUE (not just `notes.input_sha256`'s own key set): `run_sha256` is a
-    single fingerprint over every raw leg's own bytes, computed from
-    `.json` bytes alone by the pre-fold producer that rendered the
-    committed pod-p421c fixture, and from `.json` + `.exit` bytes by the
-    fold this change makes -- so the two values necessarily differ, not
-    because anything drifted, but because the FORMULA changed. This is
-    tolerated for `RealFixtureRegressionTests.
-    test_committed_artifact_record_is_not_stale`'s own comparison ONLY, by
-    pinning the regenerated copy's `run_sha256` to the committed value
-    verbatim -- `run_sha256` is a fingerprint REDUNDANT with the per-leg
-    `notes.input_sha256` entries (every `.json` and `.exit` file's own hash
-    is independently compared there, unaffected by this pin), so no
-    invariant strength is lost: a genuine drift in any raw leg's own bytes
-    still fails via `input_sha256`. Returns a NEW dict; does not mutate
-    either argument. The lead's own final regeneration commit re-renders
-    the fixture with the folded `run_sha256`, at which point this helper
-    becomes a no-op (and should be deleted, along with
-    `_regenerated_input_sha256_without_exit_additions` above)."""
-    out = json.loads(json.dumps(regenerated))
-    out["notes"]["input_sha256"] = _regenerated_input_sha256_without_exit_additions(
-        committed["notes"]["input_sha256"], regenerated["notes"]["input_sha256"]
-    )
-    out["notes"]["run_sha256"] = committed["notes"]["run_sha256"]
-    return out
-
-
 class RealFixtureRegressionTests(unittest.TestCase):
     """Drives the REAL, committed pod-p421c fixture (`fixtures/
     frontend_ab_final/`) through `build_report`, against the ACTUAL current
@@ -1481,17 +1430,11 @@ class RealFixtureRegressionTests(unittest.TestCase):
         other value, since a later, un-rendered commit landed on the unit
         after the artifact was last regenerated.
 
-        This same change folds every raw leg's own `.exit` file into
-        `notes.input_sha256`/`notes.run_sha256` (see
-        `frontend_ab_artifact.py`'s own hash-computation section) -- the
-        committed pod-p421c artifact predates that fold, so a fresh
-        regeneration's `input_sha256` carries 12 more keys and its
-        `run_sha256` is a different 64-char value. Both, and ONLY those,
-        are tolerated via
-        `_tolerate_the_exit_fold_gap_for_the_legacy_committed_fixture` (see
-        its own docstring for why this loses no invariant strength). The
-        lead's own final regeneration commit re-renders the fixture with
-        the folded hashes, at which point that helper becomes a no-op.
+        The committed pod-p421c artifact was regenerated at this unit's own
+        final tip with the `.exit`-file fold already in place (see
+        `frontend_ab_artifact.py`'s own hash-computation section), so
+        `notes.input_sha256`/`notes.run_sha256` compare byte-identical to a
+        fresh regeneration with no tolerance needed.
         """
         if not REAL_FIXTURE_DIR.is_dir():
             self._skip_or_fail(f"{REAL_FIXTURE_DIR} not present")
@@ -1535,14 +1478,6 @@ class RealFixtureRegressionTests(unittest.TestCase):
             raw_dir, report_path, report_json, identity_path, identity,
             serial_tail_path, repo_root, committed["producer"]["invocation"],
         )
-        # See `_tolerate_the_exit_fold_gap_for_the_legacy_committed_fixture`'s
-        # own docstring: the committed record predates this suite's own
-        # `.exit`-hash fold, so a fresh regeneration carries 12 more
-        # `notes.input_sha256` keys AND a different `notes.run_sha256` value
-        # than the committed record does -- both, and ONLY those, are
-        # tolerated here (the per-leg `input_sha256` entries that DO overlap
-        # are still compared exactly, so a genuine drift is still caught).
-        regenerated = _tolerate_the_exit_fold_gap_for_the_legacy_committed_fixture(committed, regenerated)
         artifact_rel_path = str(committed_path.relative_to(repo_root))
         unit_head_sha = os.environ.get(self._UNIT_HEAD_ENV_VAR) or None
         assert_committed_artifact_not_stale(

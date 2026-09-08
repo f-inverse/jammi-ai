@@ -471,18 +471,18 @@ async fn bert_fine_tuned_adapter_serves_cold_after_restart() {
     }
 
     const PROBE: &str = "quantum computing";
-    common::assert_esc089_cold_restart_controls(
-        dir.path(),
-        &session,
-        &cold_session,
-        job.model_id(),
-        "bert fine-tuned",
-        &base_embedding,
-        &warm_embedding,
-        &cold_embedding,
-        &common::text_serve(model.clone(), PROBE),
-        &common::text_serve(job.model_id().to_string(), PROBE),
-    )
+    common::assert_esc089_cold_restart_controls(common::Esc089ColdRestartControls {
+        session_root: dir.path(),
+        warm_session: &session,
+        cold_session: &cold_session,
+        model_id: job.model_id(),
+        label: "bert fine-tuned",
+        v_base: &base_embedding,
+        v_warm: &warm_embedding,
+        v_cold: &cold_embedding,
+        serve_base: &common::text_serve(model.clone(), PROBE),
+        serve_tuned: &common::text_serve(job.model_id().to_string(), PROBE),
+    })
     .await;
 }
 

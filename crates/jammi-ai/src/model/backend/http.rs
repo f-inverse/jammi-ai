@@ -29,6 +29,10 @@ impl HttpBackend {
     /// Forward inference to the remote endpoint.
     ///
     /// Only embedding tasks are supported via `POST {base_url}/v1/embeddings`.
+    /// An empty `inputs` batch sends no request at all and returns
+    /// immediately (see `forward_embeddings`'s own doc for the shared
+    /// empty-batch shape this returns, matching `CandleModel`'s
+    /// embedded-side behaviour).
     pub async fn forward(
         &self,
         base_url: &str,
@@ -50,6 +54,33 @@ impl HttpBackend {
         inputs: &[String],
         model_id: &str,
     ) -> Result<BackendOutput> {
+        // An empty batch of inputs needs no request: there is nothing to ask
+        // the remote model to embed, and `HttpBackend` -- unlike
+        // `CandleModel`, which always knows `self.dimensions.hidden_size`
+        // from the loaded model's own config -- carries no model config at
+        // all, so it has no honest embedding width to report even for a
+        // shape label. `(0, 0)` is `BackendOutput`'s own documented
+        // "no real embedding" shape (see its row-major-invariant doc: `dim
+        // >= 1` is required only when a REAL float-embedding head is being
+        // described), and it is the SAME shape `CandleModel::forward_embedding`
+        // / `forward_image_embedding` / `forward_audio_embedding` now return
+        // for `num_rows == 0` -- chosen for exactly this: it is the one
+        // empty-batch shape every `BackendOutput` producer can report
+        // honestly, embedded or remote alike, without fabricating a width it
+        // does not have. `EmbeddingAdapter::adapt`'s own `row_count == 0`
+        // branch never reads this shape anyway (it builds the empty output
+        // off its own separately-known `dimensions` field), so this value is
+        // purely descriptive for a zero-row head, never load-bearing.
+        if inputs.is_empty() {
+            return Ok(BackendOutput {
+                float_outputs: vec![vec![]],
+                string_outputs: vec![],
+                row_status: vec![],
+                row_errors: vec![],
+                shapes: vec![(0, 0)],
+            });
+        }
+
         let url = format!("{}/v1/embeddings", base_url.trim_end_matches('/'));
         let body = EmbeddingRequest {
             input: inputs.to_vec(),
@@ -84,12 +115,12 @@ impl HttpBackend {
                 inputs.len()
             )));
         }
+        // `n == 0` is unreachable here: the `inputs.is_empty()` guard above
+        // already returned before any request was sent, so `inputs.len() >=
+        // 1` on every path that reaches this line, and the length check just
+        // above asserts `response.data.len() == inputs.len()` -- so
+        // `response.data[0]` always has an element 0 to read `dim` off.
         let n = response.data.len();
-        if n == 0 {
-            return Err(JammiError::Backend(
-                "HTTP embedding request needs at least one input".into(),
-            ));
-        }
         let dim = response.data[0].embedding.len();
         // `BackendOutput`'s row-major invariant (see its doc): output head 0
         // is ONE flattened `[n, dim]` buffer, never one `Vec` per row.

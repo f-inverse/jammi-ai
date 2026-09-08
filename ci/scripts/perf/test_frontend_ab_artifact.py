@@ -625,7 +625,19 @@ def _write_serial_tail(root: Path, *, audio_t_s: float | str | None = MEASURED_S
     return path
 
 
-def _write_fixture(root: Path, base_sha: str, tip_sha: str, *, repeats: tuple[str, ...] = REPEATS) -> dict:
+def _write_fixture(
+    root: Path, base_sha: str, tip_sha: str, *, repeats: tuple[str, ...] = REPEATS,
+    front_per_step_overrides: dict[tuple[str, str], float] | None = None,
+) -> dict:
+    """`front_per_step_overrides` lets a caller move the htsat/clip-vision
+    `(tower, role)` front-per-step figures away from the PASS-scenario
+    defaults in `FRONT_PER_STEP` -- e.g. to drive `htsat_bar`'s own verdict
+    to FAIL or INVALID_BEATS_IDEAL for the contract-clause tests below --
+    while every other fixture field (repeats, rayon pool sizes, git shas)
+    stays exactly as the PASS-scenario fixture builds it."""
+    front_per_step = dict(FRONT_PER_STEP)
+    if front_per_step_overrides:
+        front_per_step.update(front_per_step_overrides)
     raw_dir = root / "raw"
     raw_dir.mkdir()
     for tower in TOWERS:
@@ -634,7 +646,7 @@ def _write_fixture(root: Path, base_sha: str, tip_sha: str, *, repeats: tuple[st
             for repeat in repeats:
                 _write_raw_leg(
                     raw_dir, tower, role, repeat, build_sha=sha,
-                    front_per_step=FRONT_PER_STEP[(tower, role)],
+                    front_per_step=front_per_step[(tower, role)],
                     train_per_step=TRAIN_PER_STEP[(tower, role)],
                     rayon_pool_threads=P if role == "tip" else None,
                 )
@@ -645,7 +657,7 @@ def _write_fixture(root: Path, base_sha: str, tip_sha: str, *, repeats: tuple[st
                 repeat: {
                     "outcome": "OK",
                     "steps_measured": STEPS,
-                    "front_per_step": FRONT_PER_STEP[(tower, role)],
+                    "front_per_step": front_per_step[(tower, role)],
                     "train_per_step": TRAIN_PER_STEP[(tower, role)],
                     "rayon_pool_threads": P if role == "tip" else None,
                 }
@@ -656,12 +668,12 @@ def _write_fixture(root: Path, base_sha: str, tip_sha: str, *, repeats: tuple[st
         for tower in TOWERS
     }
     htsat_bar = _oracle_bar(
-        [FRONT_PER_STEP[("htsat", "base")]] * len(repeats),
-        [FRONT_PER_STEP[("htsat", "tip")]] * len(repeats),
+        [front_per_step[("htsat", "base")]] * len(repeats),
+        [front_per_step[("htsat", "tip")]] * len(repeats),
         P, N_ITEMS_PER_STEP, R_DRIVER,
     )
-    cv_front_tip = FRONT_PER_STEP[("clip-vision", "tip")]
-    cv_front_base = FRONT_PER_STEP[("clip-vision", "base")]
+    cv_front_tip = front_per_step[("clip-vision", "tip")]
+    cv_front_base = front_per_step[("clip-vision", "base")]
     report_json = {
         "tool": "frontend_ab.sh",
         "dry_run": False,
@@ -860,6 +872,179 @@ class HappyPathTests(unittest.TestCase):
         payload_a = json.dumps(self._build(), sort_keys=False)
         payload_b = json.dumps(self._build(), sort_keys=False)
         self.assertEqual(payload_a, payload_b)
+
+
+class ContractClausePerVerdictClassTests(unittest.TestCase):
+    """Adversarial-audit advisory #1 (issue #421 frontend follow-on): the
+    pre-fix `contract_clause` had exactly two branches -- PASS, and a SHARED
+    non-PASS branch covering FAIL, UNRESOLVED, and INVALID_BEATS_IDEAL alike
+    -- and that shared branch always emitted a "the unit ships" sentence,
+    interpolating only the verdict word. Under FAIL (the tip leg is
+    measurably slower than the bar allows) contract v3's own Verdict clause
+    does NOT license that sentence, and under INVALID_BEATS_IDEAL (the tip
+    leg beats the theoretical ideal, i.e. the measurement itself is
+    invalid) it is equally unlicensed. This class drives `build_report`
+    through a FAIL fixture and an INVALID_BEATS_IDEAL fixture and asserts
+    NO "ships" sentence is emitted for either, then re-confirms the
+    UNRESOLVED text (the one non-PASS class the contract's Verdict clause
+    DOES license a shipping decision for) is unchanged from before this
+    fix."""
+
+    def setUp(self):
+        self._tmp = tempfile.TemporaryDirectory()
+        self.root = Path(self._tmp.name)
+        self.base_sha, self.tip_sha = _init_repo(self.root)
+
+    def tearDown(self):
+        self._tmp.cleanup()
+
+    def _build(self, htsat_tip_front_per_step: float):
+        fixture = _write_fixture(
+            self.root, self.base_sha, self.tip_sha,
+            front_per_step_overrides={("htsat", "tip"): htsat_tip_front_per_step},
+        )
+        return art.build_report(
+            fixture["raw_dir"], fixture["report_path"], fixture["report_json"],
+            fixture["identity_path"], fixture["identity"], fixture["serial_tail_path"], self.root,
+            "python3 ci/scripts/perf/frontend_ab_artifact.py (test invocation)",
+        )
+
+    def test_fail_emits_no_ships_sentence(self):
+        # tip/base = 0.3/1.0 = 0.3 > upper_bound(0.25 under r=0.0, 0.2875
+        # under r=0.05 measured) under BOTH r_driver and r_measured -> FAIL
+        # under the verdict invariant too (both agree), never UNRESOLVED.
+        report = self._build(htsat_tip_front_per_step=0.3)
+        v = report["verdict"]
+        self.assertEqual(v["unit_verdict"], "FAIL")
+        clause = v["contract_clause_applied"]
+        self.assertNotIn("the unit ships", clause)
+        self.assertNotIn("ACTIVATE", clause.replace("not ACTIVATE", ""))
+        self.assertIn("FAIL", clause)
+        self.assertIn("does NOT license a shipping decision", clause)
+
+    def test_invalid_beats_ideal_emits_no_ships_sentence(self):
+        # tip/base = 0.1/1.0 = 0.1 < lower_bound(0.125 under r=0.0, 0.16875
+        # under r=0.05 measured) under BOTH -> INVALID_BEATS_IDEAL under the
+        # verdict invariant too.
+        report = self._build(htsat_tip_front_per_step=0.1)
+        v = report["verdict"]
+        self.assertEqual(v["unit_verdict"], "INVALID_BEATS_IDEAL")
+        clause = v["contract_clause_applied"]
+        self.assertNotIn("the unit ships", clause)
+        self.assertNotIn("ACTIVATE", clause.replace("not ACTIVATE", ""))
+        self.assertIn("INVALID_BEATS_IDEAL", clause)
+        self.assertIn("does NOT license a shipping decision", clause)
+        self.assertIn("measurement itself is invalid", clause)
+
+    def test_unresolved_text_unchanged(self):
+        # UNRESOLVED requires nonzero spread across repeats (with spread 0
+        # the ratio_lo == ratio_hi == ratio boundary can only land PASS,
+        # FAIL, or INVALID_BEATS_IDEAL -- never the straddling case), so
+        # this builds the fixture by hand rather than via `_write_fixture`
+        # (whose per-repeat htsat values are identical by construction, see
+        # `FRONT_PER_STEP`'s own module comment). htsat tip repeats
+        # [0.15, 0.20, 0.30] against a constant base=1.0: ratio_lo=0.15,
+        # ratio_hi=0.30 straddles upper_bound under BOTH r=0.0 (upper=0.25)
+        # and r_measured=0.05 (upper=0.2875) without tripping lower_bound
+        # under either -- independently verified via `_oracle_bar` before
+        # writing this test, so both r_driver and r_measured land
+        # UNRESOLVED and the verdict invariant holds.
+        raw_dir = self.root / "raw"
+        raw_dir.mkdir()
+        htsat_tip_per_repeat = {"r1": 0.15, "r2": 0.20, "r3": 0.30}
+        htsat_base_per_repeat = {"r1": 1.0, "r2": 1.0, "r3": 1.0}
+        for repeat, val in htsat_tip_per_repeat.items():
+            _write_raw_leg(
+                raw_dir, "htsat", "tip", repeat, build_sha=self.tip_sha,
+                front_per_step=val, train_per_step=TRAIN_PER_STEP[("htsat", "tip")], rayon_pool_threads=P,
+            )
+        for repeat, val in htsat_base_per_repeat.items():
+            _write_raw_leg(
+                raw_dir, "htsat", "base", repeat, build_sha=self.base_sha,
+                front_per_step=val, train_per_step=TRAIN_PER_STEP[("htsat", "base")],
+            )
+        for role, sha in (("base", self.base_sha), ("tip", self.tip_sha)):
+            for repeat in REPEATS:
+                _write_raw_leg(
+                    raw_dir, "clip-vision", role, repeat, build_sha=sha,
+                    front_per_step=FRONT_PER_STEP[("clip-vision", role)],
+                    train_per_step=TRAIN_PER_STEP[("clip-vision", role)],
+                    rayon_pool_threads=P if role == "tip" else None,
+                )
+
+        htsat_bar = _oracle_bar(
+            list(htsat_base_per_repeat.values()), list(htsat_tip_per_repeat.values()), P, N_ITEMS_PER_STEP, R_DRIVER,
+        )
+        self.assertEqual(htsat_bar["verdict"], "UNRESOLVED")  # sanity: this fixture is an UNRESOLVED scenario
+        towers_json = {
+            "htsat": {
+                "base": {
+                    repeat: {
+                        "outcome": "OK", "steps_measured": STEPS, "front_per_step": val,
+                        "train_per_step": TRAIN_PER_STEP[("htsat", "base")], "rayon_pool_threads": None,
+                    }
+                    for repeat, val in htsat_base_per_repeat.items()
+                },
+                "tip": {
+                    repeat: {
+                        "outcome": "OK", "steps_measured": STEPS, "front_per_step": val,
+                        "train_per_step": TRAIN_PER_STEP[("htsat", "tip")], "rayon_pool_threads": P,
+                    }
+                    for repeat, val in htsat_tip_per_repeat.items()
+                },
+            },
+            "clip-vision": {
+                role: {
+                    repeat: {
+                        "outcome": "OK", "steps_measured": STEPS,
+                        "front_per_step": FRONT_PER_STEP[("clip-vision", role)],
+                        "train_per_step": TRAIN_PER_STEP[("clip-vision", role)],
+                        "rayon_pool_threads": P if role == "tip" else None,
+                    }
+                    for repeat in REPEATS
+                }
+                for role in ROLES
+            },
+        }
+        cv_front_tip = FRONT_PER_STEP[("clip-vision", "tip")]
+        cv_front_base = FRONT_PER_STEP[("clip-vision", "base")]
+        report_json = {
+            "tool": "frontend_ab.sh", "dry_run": False, "base_sha": self.base_sha, "tip_sha": self.tip_sha,
+            "box": BOX, "serial_tail_ratio": R_DRIVER, "n_items_per_step": N_ITEMS_PER_STEP,
+            "repeats": len(REPEATS), "status": "GREEN", "towers": towers_json, "htsat_bar": htsat_bar,
+            "clip_vision_report_only": {
+                "front_tip_mean_s": cv_front_tip, "front_base_mean_s": cv_front_base,
+                "ratio": cv_front_tip / cv_front_base,
+            },
+        }
+        identity = {
+            "what": "fixture identity", "gpu": "FIXTURE-GPU", "driver": "0.0.0", "cpu": "FIXTURE-CPU",
+            "recorded_deviations": ["fixture deviation"],
+            "measured_tip_precedes_merge_tip_commentary": "fixture commentary",
+        }
+        report_path = self.root / "report.json"
+        identity_path = self.root / "identity.json"
+        report_path.write_text(json.dumps(report_json), encoding="utf-8")
+        identity_path.write_text(json.dumps(identity), encoding="utf-8")
+        serial_tail_path = _write_serial_tail(self.root)  # default audio_t_s=0.05 -> r_measured=0.05
+
+        report = art.build_report(
+            raw_dir, report_path, report_json, identity_path, identity, serial_tail_path, self.root,
+            "python3 ci/scripts/perf/frontend_ab_artifact.py (test invocation)",
+        )
+        v = report["verdict"]
+        self.assertEqual(v["unit_verdict"], "UNRESOLVED")
+        clause = v["contract_clause_applied"]
+        self.assertEqual(
+            clause,
+            "not ACTIVATE (HTSAT bar UNRESOLVED under both the driver-default and the run's own measured "
+            "serial-tail ratio); per contract v3's own Verdict clause the unit ships because bit identity holds "
+            "(crates/jammi-ai/tests/it/media_front_end.rs: pool sizes 1/5/7/24 against the pre-unit reference) "
+            "and the n=1 image serving path stays within its always-on gross latency bar (3x before_min + "
+            "before_spread, same suite; the pre-registered 5 % n=1 bar is opt-in via JAMMI_FRONTEND_N1_LATENCY "
+            "and this artifact records no serving-latency measurement), with the numbers recorded and NO "
+            "efficiency claim.",
+        )
 
 
 class MeasuredTipPrecedesMergeTipTests(unittest.TestCase):

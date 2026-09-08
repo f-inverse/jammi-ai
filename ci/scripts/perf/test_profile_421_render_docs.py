@@ -31,6 +31,7 @@ def _synthetic_artifact() -> dict:
                 "dtype": "f32",
                 "arm": "A",
                 "kernels_disabled": [],
+                "contract_valid": True,
                 "per_step": {
                     "wall_s_per_step": 0.1004,
                     "front_s_per_step": 0.0,
@@ -46,6 +47,7 @@ def _synthetic_artifact() -> dict:
                 "dtype": "f32",
                 "arm": "D",
                 "kernels_disabled": ["layer_norm_fused", "lora_linear_fused"],
+                "contract_valid": True,
                 "per_step": {
                     "wall_s_per_step": 0.1486,
                     "front_s_per_step": 0.0,
@@ -56,6 +58,12 @@ def _synthetic_artifact() -> dict:
                 },
             },
         ],
+        "contract_validity": {
+            "gate": "fixture",
+            "legs_total": 2,
+            "legs_valid": 2,
+            "legs_failing": [],
+        },
         "candidate_decisions": [
             {"port": "C-ATTN-clip-text", "verdict": "UNRESOLVED", "reason": "a short reason"},
         ],
@@ -125,6 +133,42 @@ class RenderContentTests(RenderFixture):
     def test_a_leg_label_is_bare_suffix(self):
         table = r.render_measured_towers_table(self.artifact)
         self.assertIn("| A1 | f32 |", table)
+
+    def test_gate_column_marks_a_contract_valid_leg_ok(self):
+        table = r.render_measured_towers_table(self.artifact)
+        rows = table.splitlines()
+        self.assertTrue(rows[0].endswith("| OK |"))
+        self.assertTrue(rows[1].endswith("| OK |"))
+
+    def test_gate_column_marks_a_failing_leg_from_contract_validity_never_hard_coded(self):
+        """The `gate` column is read off `contract_validity.legs_failing`
+        (cross-checked against `legs[].contract_valid` by
+        `_contract_validity`), never a hard-coded leg id -- a leg the
+        artifact itself marks failing renders `FAILS`, any renamed/future
+        leg id included."""
+        artifact = _synthetic_artifact()
+        artifact["legs"][1]["contract_valid"] = False
+        artifact["contract_validity"]["legs_valid"] = 1
+        artifact["contract_validity"]["legs_failing"] = [
+            {"leg_id": "clip-text-D2", "decision_grade_reason": "a fixture reason"}
+        ]
+        table = r.render_measured_towers_table(artifact)
+        rows = table.splitlines()
+        self.assertTrue(rows[0].endswith("| OK |"))
+        self.assertTrue(rows[1].endswith("| FAILS |"))
+
+    def test_gate_column_refuses_a_self_contradicting_artifact(self):
+        """`render_measured_towers_table` must never render a plausible-
+        looking `gate` column off an artifact whose own `contract_validity`
+        block disagrees with `legs[].contract_valid` -- `_contract_validity`
+        catches this before any row is built."""
+        artifact = _synthetic_artifact()
+        artifact["contract_validity"]["legs_valid"] = 2
+        artifact["contract_validity"]["legs_failing"] = []
+        artifact["legs"][1]["contract_valid"] = False
+        with self.assertRaises(ValueError) as ctx:
+            r.render_measured_towers_table(artifact)
+        self.assertIn("disagrees", str(ctx.exception))
 
     def test_d_leg_unknown_kernels_disabled_key_is_refused_by_name(self):
         """`_leg_label` must refuse (never silently drop) a `kernels_

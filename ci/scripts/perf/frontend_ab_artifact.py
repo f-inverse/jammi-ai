@@ -104,8 +104,16 @@ re-derived `verdict` string, ASSERTED (refusing on disagreement, never
 silently picking one) to equal `htsat_bar_measured_r`'s own verdict too --
 the "verdict invariant" the contract names is a computed equality check,
 not prose. `verdict.contract_clause_applied` is prose selected by that
-computed verdict (PASS -> ACTIVATE; anything else -> the v3 contract's own
-"ships without the efficiency claim" clause), never independently typed.
+computed verdict, never independently typed, and the prose differs BY
+VERDICT CLASS rather than sharing one non-PASS branch: PASS -> ACTIVATE;
+UNRESOLVED -> the v3 contract's own "ships without the efficiency claim"
+clause (bit identity + the always-on n=1 latency bar still hold, so the
+contract's Verdict clause does license shipping even though the HTSAT bar
+itself is ambiguous); FAIL (tip measurably slower than the bar allows) and
+INVALID_BEATS_IDEAL (tip beats the theoretical ideal, i.e. the measurement
+itself is invalid) each get their own clause that states the verdict and
+that the contract's Verdict clause does NOT license a shipping decision on
+that class -- no "ships" sentence is emitted for either.
 
 ## Regeneration discipline: the artifact commit must be the unit's LAST commit
 
@@ -751,7 +759,7 @@ def build_report(
             "ACTIVATE (keep the change): the HTSAT bar holds under both the driver-default and the run's own "
             "measured serial-tail ratio."
         )
-    else:
+    elif unit_verdict == "UNRESOLVED":
         contract_clause = (
             f"not ACTIVATE (HTSAT bar {unit_verdict} under both the driver-default and the run's own measured "
             "serial-tail ratio); per contract v3's own Verdict clause the unit ships because bit identity holds "
@@ -761,6 +769,22 @@ def build_report(
             "and this artifact records no serving-latency measurement), with the numbers recorded and NO "
             "efficiency claim."
         )
+    elif unit_verdict == "FAIL":
+        contract_clause = (
+            f"not ACTIVATE (HTSAT bar {unit_verdict} under both the driver-default and the run's own measured "
+            "serial-tail ratio: the tip leg is measurably slower than the bar allows); contract v3's own Verdict "
+            "clause does NOT license a shipping decision on a FAIL verdict -- this artifact records the numbers "
+            "and stops there, with NO efficiency claim and no ships sentence."
+        )
+    elif unit_verdict == "INVALID_BEATS_IDEAL":
+        contract_clause = (
+            f"not ACTIVATE (HTSAT bar {unit_verdict}: the tip leg beats the theoretical ideal speed-up, which "
+            "means the measurement itself is invalid rather than that the change is fast); contract v3's own "
+            "Verdict clause does NOT license a shipping decision on an invalid measurement -- this artifact "
+            "records the numbers and stops there, with NO efficiency claim and no ships sentence."
+        )
+    else:
+        raise ArtifactBuildError(f"unit_verdict {unit_verdict!r} has no contract_clause rule")
 
     return {
         "schema_version": SCHEMA_VERSION,

@@ -2961,6 +2961,18 @@ corrupted, since nothing else ever mints that prefix. A record whose `model_type
 id and the missing field, never silently resolved as an ordinary model or served as the
 unadapted base.
 
+`load_context_predictor`'s own id-shape backstop
+(`record.model_type`, `crates/jammi-ai/src/pipeline/context_predictor.rs:1129`)
+mirrors the resolver's `FINE_TUNED_ID_PREFIX` cross-check, but a context-predictor id is
+caller-chosen — it carries no reserved prefix a fresh reload can cross-check by shape the way
+`try_catalog_lookup` does — so this surface asserts its own row-shape invariant directly,
+immediately after reading the row back: any record read under a context-predictor id whose
+`model_type` is not `"context-predictor"` is refused by name, naming the id and the row's
+actual type, before any of that row's `config_json`/`artifact_path` fields are trusted. This is
+the id-shape backstop's other member — the resolver's prefix check defends the `jammi:fine-tuned:`
+id space, this defends the context-predictor id space, and each surface owns its own check
+rather than trusting the id's shape alone.
+
 The adapter-fetch error contract both reload surfaces share: `fetch_artifact`
 (`crates/jammi-db/src/store/artifact.rs:220`) raises two DISTINCT typed storage outcomes,
 never folding them together. A manifest that is ABSENT entirely — nothing was ever
@@ -2987,27 +2999,27 @@ fine-tuned reload arm, matches `StorageError::NotPublished`
 (`crates/jammi-ai/src/model/resolver.rs:248`) into `JammiError::Model`, and
 `load_context_predictor` (`crates/jammi-ai/src/pipeline/context_predictor.rs:1110`) matches
 the identical pair — `StorageError::NotPublished`
-(`crates/jammi-ai/src/pipeline/context_predictor.rs:1292`) and `StorageError::Layout`
-(`crates/jammi-ai/src/pipeline/context_predictor.rs:1302`) — into `JammiError::Model` as
+(`crates/jammi-ai/src/pipeline/context_predictor.rs:1314`) and `StorageError::Layout`
+(`crates/jammi-ai/src/pipeline/context_predictor.rs:1324`) — into `JammiError::Model` as
 well, never its own `JammiError::Inference`. A catalog record that never recorded an
 `artifact_path` at all is a separate, earlier refusal on each surface that never reaches
 `fetch_artifact` — the resolver's arm also raises `JammiError::Model`
 (`crates/jammi-ai/src/model/resolver.rs:263`), and so does the predictor's own
-`JammiError::Model` (`crates/jammi-ai/src/pipeline/context_predictor.rs:1255`). Any OTHER
+`JammiError::Model` (`crates/jammi-ai/src/pipeline/context_predictor.rs:1277`). Any OTHER
 storage fault propagates unchanged past both surfaces' own catch-all —
 `Err(e) => return Err(e)` (`crates/jammi-ai/src/model/resolver.rs:258`) and the identical
-`Err(e) => return Err(e)` (`crates/jammi-ai/src/pipeline/context_predictor.rs:1311`).
+`Err(e) => return Err(e)` (`crates/jammi-ai/src/pipeline/context_predictor.rs:1333`).
 
 Every corrupted-catalog-record refusal EARLIER in this reload path — before `fetch_artifact` is
 even reached — is the SAME `JammiError::Model` variant too: an
 absent `config_json`
-(`crates/jammi-ai/src/pipeline/context_predictor.rs:1133`), an unparseable `config_json`
-(`crates/jammi-ai/src/pipeline/context_predictor.rs:1138`, a DISTINCT message from "absent",
+(`crates/jammi-ai/src/pipeline/context_predictor.rs:1155`), an unparseable `config_json`
+(`crates/jammi-ai/src/pipeline/context_predictor.rs:1160`, a DISTINCT message from "absent",
 never collapsed), and a parseable-but-incomplete config (missing `head`/`architecture`/
 `feature_dim`/`context_k`/`hidden_dim`/`num_heads`/`num_layers`/`head_width`/`value_column`/
 `target_scaler`) each name the model id and the specific field. The `varmap.load` arm — a
 manifest-verified bundle missing `model.safetensors`
-(`crates/jammi-ai/src/pipeline/context_predictor.rs:1320`) — matches `CandleBackend::load`'s
+(`crates/jammi-ai/src/pipeline/context_predictor.rs:1342`) — matches `CandleBackend::load`'s
 peer refusal for a fine-tuned model's weights file, `"Failed to load safetensors: {e}"`
 (`crates/jammi-ai/src/model/backend/candle.rs:2747`), instead of its own
 `JammiError::Inference`.

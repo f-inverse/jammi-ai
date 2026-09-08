@@ -497,72 +497,48 @@ workspace ships every publishable crate at the same
   non-zero on HTSAT / zero on both OpenCLIP towers) rather than witnessing it on tiny_bert/text
   alone.
 - **A fine-tuned model resolves to the SAME adapted checkpoint across a cold restart, never
-  silently to the unadapted base (esc-089).** `ModelCache::get_or_load`'s post-load catalog
-  bookkeeping — meant only to complete a plain local/HuggingFace source's registration, or a
-  placeholder `"embedding"` row pre-registered before a base model is ever loaded — was writing
-  unconditionally for ANY resolved model id, including one already resolved through the
-  fine-tuned branch of `ModelResolver::try_catalog_lookup`. Because `ModelSource::parse` maps a
-  fine-tuned id (`jammi:fine-tuned:{uuid}`) onto the same `HuggingFace` variant a real Hub repo id
-  gets, that write clobbered the fine-tuned row's `model_type` (to `"huggingface"`), its
-  `artifact_path` (to the underlying BASE checkpoint's directory) and its `base_model_id` lineage
-  right after a successful load — invisibly, since the just-loaded in-process model still had the
-  adapter applied. A subsequent resolve from a fresh process (or a fresh `ModelCache`) read the
-  clobbered row and served the base with no signal. The bookkeeping write now skips any catalog
-  row already committed by a terminal producer (`model_type` `"fine-tuned"`,
-  `"context-predictor"`, or `"checkpoint"`); `ModelResolver::try_catalog_lookup`'s fine-tuned
-  branch additionally refuses, naming the model id and the missing pointer, if a
-  `model_type == "fine-tuned"` record ever again carries no `base_model_id` or no
-  `artifact_path`, rather than falling through to resolve it as an ordinary model or serving the
-  base silently.
-- **The model cache's load-bookkeeping write is an ALLOWLIST of the generic rows it may complete,
-  never a denylist of the terminal ones to protect, and fails closed on a catalog read error
-  (esc-089 follow-up).** The prior fix's `PROTECTED_MODEL_TYPES` denylist (`"fine-tuned"`,
-  `"context-predictor"`, `"checkpoint"`) still failed OPEN on every other live `model_type` —
-  `"bert"`, `"distilbert"`, `"modernbert"`, `"open_clip"`, `"clap_audio_model"`, or any future
-  architecture id `EncoderFamily::adapter_model_type` mints — so an ordinary load of a
-  pre-registered non-BERT-family checkpoint still clobbered that row's `model_type`,
-  `base_model_id`, and `artifact_path`. `ModelCache::complete_generic_registration` now proceeds
-  only when the row is absent or already one of the generic kinds this call exists to complete
-  (`"local"`, `"huggingface"`, or the `"embedding"` FK placeholder); every other type, enumerated
-  or not, is left untouched. Separately, `.ok().flatten()` collapsed a catalog READ error into "no
-  row" and let the write proceed regardless; a read failure now skips the write entirely (`warn!`
-  and keep serving — this bookkeeping was always best-effort). `ModelResolver::try_catalog_lookup`
-  also cross-checks the unforgeable `jammi:fine-tuned:` id prefix against the row's own
-  `model_type`: a mismatch (a catalog a pre-fix build already corrupted) is a typed refusal naming
-  the id and the row's actual type, never a silent base serve — the backstop for catalogs written
-  before this fix.
-- **An adapter-fetch failure is typed by WHAT failed, not by which call site raised it — a wholly
-  absent bundle, a bundle whose manifest names a key that is truly gone, and a transport/IO fault
-  of the store are three DIFFERENT outcomes, and both reload surfaces now agree on ONE code per
-  outcome (esc-089 fold-in, round-3 audit).** `ArtifactStore::fetch_artifact` used to fold a
-  manifest-promised key that is genuinely absent (`object_store::Error::NotFound`) into the SAME
-  `StorageError::Io` a real transport fault (a permission-denied open, an S3/GCS/azure outage)
-  raises, so `ModelResolver::try_catalog_lookup`'s fine-tuned reload arm — which re-typed EVERY
-  fetch error into `JammiError::Model` — turned a transient store outage into the same
-  bad-request-shaped refusal a genuinely broken bundle gets. That first fix reclassified a
-  `NotFound` into `StorageError::Layout` regardless of WHICH read hit it, which conflated a
-  further pair of distinct outcomes: a `NotFound` reading `manifest.json` itself (no bundle was
-  ever published at this prefix — never published, a misdirected catalog pointer, or a pre-fix
-  clobbered pointer left aimed at the base weights directory) is NOT the same claim as a
-  `NotFound` reading a key the manifest DOES name (genuine bundle corruption — a partial publish or
-  a manually-deleted file). `read_manifest`'s own `NotFound` now reclassifies to a NEW
-  `StorageError::NotPublished` (there is no manifest in hand to say anything is corrupt); a
-  listed-key `NotFound` (or a digest mismatch) stays `StorageError::Layout`, the genuine INTEGRITY
-  bucket. `ModelResolver::try_catalog_lookup` and the sibling context-predictor reload arm
-  (`InferenceSession::load_context_predictor`) each re-type BOTH variants into their own refusal
-  naming the model id, with a distinct message per outcome ("no adapter bundle is published…"
-  vs. "…failed integrity check…"), and apply the identical rule to an `artifact_path` string that
-  fails to parse as a storage URL (itself a corrupted catalog record, never a storage fault) —
-  every other fault (a transport/IO error, a permission fault, a disabled scheme, driver-init
-  failure) propagates unchanged. Both surfaces now raise the SAME `JammiError::Model` for every
-  one of these client-visible precondition failures — the context-predictor surface previously
-  raised its own `JammiError::Inference` here, which maps to gRPC `Internal` at the wire boundary
-  instead of `InvalidArgument`, disagreeing with the resolver surface for the identical class of
-  outcome; a wire-boundary test now pins each combination (resolver/predictor ×
-  pointer/integrity/not-published/transport) through `map_engine_error`, composing with — never
-  substituting for — the it-tests that pin each surface actually raising the claimed variant on a
-  real reload (a chmod fault's variant is pinned by name, `StorageError::Io`, not merely
-  `!= Model`).
+  silently to the unadapted base (esc-089).** Because `ModelSource::parse` maps a fine-tuned id
+  (`jammi:fine-tuned:{uuid}`) onto the same `HuggingFace` variant a real Hub repo id gets, a fresh
+  resolve of that id is indistinguishable from an ordinary Hub lookup by shape alone, so every
+  layer downstream of the id now defends its own catalog row rather than trusting shape:
+  `ModelCache::complete_generic_registration`'s post-load bookkeeping is an ALLOWLIST of the only
+  rows it may complete — `GENERIC_COMPLETABLE_TYPES = ["local", "huggingface", "embedding"]` —
+  proceeding only when the existing row is absent or already one of those generic kinds; every
+  other type (`"fine-tuned"`, `"context-predictor"`, or any future architecture id
+  `EncoderFamily::adapter_model_type` mints), enumerated or not, is left untouched, so this write
+  can no longer clobber a fine-tuned row's `model_type`/`artifact_path`/`base_model_id` out from
+  under a training-instance resolve. A catalog READ error fails CLOSED — the write is skipped
+  entirely (`warn!`, never guessed as "no row" and written over). `ModelResolver::try_catalog_lookup`
+  cross-checks the unforgeable `jammi:fine-tuned:` id prefix against the row's own `model_type`: a
+  mismatch is a typed `JammiError::Model` refusal naming the id and the row's actual type — the
+  backstop for a catalog a pre-fix build already corrupted — and separately refuses, naming the id
+  and the missing field, a `model_type == "fine-tuned"` record carrying no `base_model_id` or no
+  `artifact_path`. `ArtifactStore::fetch_artifact` distinguishes a `NotFound` reading
+  `manifest.json` itself (no bundle was ever published at this prefix — never published, a
+  misdirected catalog pointer, or a clobbered pointer left aimed at the base weights directory)
+  from a `NotFound` reading a key the manifest DOES name (genuine bundle corruption — a partial
+  publish or a manually-deleted file): the former reclassifies to `StorageError::NotPublished`,
+  the latter (and a digest mismatch) stays `StorageError::Layout`, the INTEGRITY bucket; every
+  other driver fault (a transport/IO error, a permission fault, a disabled scheme, driver-init
+  failure) stays `StorageError::Io` and propagates unchanged. `ModelResolver::try_catalog_lookup`'s
+  fine-tuned reload arm and the sibling `InferenceSession::load_context_predictor` reload arm each
+  re-type BOTH storage variants into their own `JammiError::Model` refusal (never
+  `JammiError::Inference`, which maps to gRPC `Internal` at the wire boundary instead of the
+  client-visible `InvalidArgument` a precondition failure needs) naming the model id and, per
+  outcome, the prefix ("no adapter bundle is published…") or the missing key ("…failed integrity
+  check…"), and apply the identical `Layout` rule to an `artifact_path` string that fails to parse
+  as a storage URL. `crates/jammi-server/src/grpc/wire.rs::tests::
+  adapter_bundle_refusal_codes_agree_across_both_reload_surfaces` pins each combination
+  (resolver/predictor × pointer/integrity/not-published/transport) through `map_engine_error`,
+  composing with the it-tests that pin each surface actually raising the claimed variant on a real
+  reload (a chmod fault's variant is pinned by name, `StorageError::Io`, never merely `!= Model`).
+  Cold-restart coverage opens a SECOND `InferenceSession` over the same catalog and asserts
+  bit-identical output against the training instance:
+  `crates/jammi-ai/tests/it/tower_adapters.rs::{open_clip_text,open_clip_vision,clap_audio}_
+  tower_adapter_serves_cold_after_restart` and
+  `crates/jammi-ai/tests/it/fine_tune.rs::bert_fine_tuned_adapter_serves_cold_after_restart`, each
+  with the negative control that a deleted adapter file refuses by name rather than serving the
+  base.
 - **A `Utf8View` path column is accepted by `arrow_to_images`/`arrow_to_audio`, matching `Utf8`
   exactly (esc-090).** Both functions matched `Utf8`/`LargeUtf8`/`Binary`/`LargeBinary`/
   `BinaryView` but had no `Utf8View` arm, so a `Utf8View` path column — DataFusion's parquet
@@ -662,6 +638,12 @@ workspace ships every publishable crate at the same
   decode is a per-row value the caller marks in `_status`/`_error`, never a whole-batch error;
   an unreadable path column value and a `row_status` shorter than the batch are still whole-call
   refusals. Migration: match the inner `Result` per row (or `?` it to keep whole-batch failure).
+  `arrow_to_images`'s path-valued arm also changed from `image::open(path)` (extension hint AND
+  content sniff) to `std::fs::read` + `load_from_memory` (content sniff only, the same decode
+  path every bytes-valued row already used) — a file whose bytes need the extension to identify
+  now fails to decode where it previously succeeded — and a path-valued row's per-row decode
+  error text changed from `Failed to load image '{path}': {e}` to `Failed to decode image at row
+  N: {e} (path '...')`.
 - `jammi_encoders::{AnyAudioEncoder, AudioEncoder}` are removed
   (`crates/jammi-encoders/src/lib.rs`). The audio-only dispatcher and its trait had no callers
   anywhere in the workspace, and audio is now a first-class `AnyEncoder` variant with real training

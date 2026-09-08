@@ -72,7 +72,7 @@ Top level:
   fresh against this exact fixture (not a copy of some other run's file) —
   byte-for-byte the SAME as the committed artifact's own
   `producer.input_sha256.attribution_json` (verified: sha256
-  `3d5f33c280232f1ee2ee4740f3e18d84dffc6532f113b595bb1c9f34b63007a3`,
+  `af626cc56f3070d8ddeddd7191484950a7698e70e74e2bac6f772d78b859bf5b`,
   matching the committed artifact exactly). `profile_421_attribute.py` is
   deterministic (no timestamp, no wall-clock-dependent field), so
   regenerating it again from this fixture reproduces the identical bytes —
@@ -128,7 +128,7 @@ for p in sorted(fix.rglob("*")):
 
 | path | sha256 | bytes |
 | --- | --- | --- |
-| `attribution.json` | `3d5f33c280232f1ee2ee4740f3e18d84dffc6532f113b595bb1c9f34b63007a3` | 94122 |
+| `attribution.json` | `af626cc56f3070d8ddeddd7191484950a7698e70e74e2bac6f772d78b859bf5b` | 94135 |
 | `legs/clip-text-A1/census.json` | `ddb381c27f6eba0e48100aa08f33554890763abf574cdc0e3d6bb169a6dad1e6` | 33902 |
 | `legs/clip-text-A1/census.pre-demangle.json` | `d0784dd312f8b8916efc86f96928ef5b1a43c4cd252dd3fed479d3fc91d54ea0` | 31628 |
 | `legs/clip-text-A1/manifest.json` | `f7089429823a022363eb7b37ff47e3e1e3feca40a7b59effc8c5ddb4ce01e47c` | 1188 |
@@ -197,4 +197,4 @@ for p in sorted(fix.rglob("*")):
 | `p2-bf16/htsat/manifest.json` | `6f41b0551b4abeb9692e736f46bf75a4a3c5f1d3c81819802221d6a25eb6e9f8` | 570 |
 | `p2-bf16/htsat/run.json` | `58ca1df93e9b1d5e8a35f5d98c49d528049f3c4ba456d2d7453a624251c15428` | 4227 |
 
-Total: 68 files, 1,533,003 bytes.
+Total: 68 files, 1,533,016 bytes.

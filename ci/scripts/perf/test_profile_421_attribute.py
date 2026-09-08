@@ -1838,6 +1838,13 @@ class AttributeLegAndReportTests(unittest.TestCase):
             report = attribute.build_report(legs_dir, _merge_report_for("clip-text-A1"))
             self.assertEqual(report["summary"]["legs_total"], 1)
             self.assertEqual(report["summary"]["legs_valid"], 1)
+            self.assertEqual(
+                report["limits"],
+                {
+                    "unattributed_decision_grade_limit": attribute.UNATTRIBUTED_DECISION_GRADE_LIMIT,
+                    "unknown_kernel_share_limit": attribute.UNKNOWN_KERNEL_SHARE_LIMIT,
+                },
+            )
             row = report["legs"][0]
             self.assertEqual(row["verdict"], attribute.VERDICT_VALID)
             self.assertNotIn("_role", row)

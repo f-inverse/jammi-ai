@@ -11,6 +11,10 @@
   "git_sha": "c1b0b0bad1f79a4ad6c298400e6ea19cc1ca633c",
   "box": "4dc3a4394178"
  },
+ "limits": {
+  "unattributed_decision_grade_limit": 0.05,
+  "unknown_kernel_share_limit": 0.01
+ },
  "producer": {
   "path": "ci/scripts/perf/profile_421_legs.sh",
   "kind": "script",
@@ -33,8 +37,8 @@
   ],
   "identity": "source_sha256+input_manifest",
   "source_sha256": {
-   "ci/scripts/perf/profile_421_artifact.py": "d86fff8d1470d26ab68a2763eb3ec0ed960544258c480e850e1ccf909d834f97",
-   "ci/scripts/perf/profile_421_attribute.py": "60eb95b6d2b9c3dceb36c977dc6f3e74c72ca9eb48f6c24afdef7e709b1f8ff4",
+   "ci/scripts/perf/profile_421_artifact.py": "aa8b521c9700d0aeea79a4fea862fb5cbb7ddcbece7e488a0d80c37f11c2ce78",
+   "ci/scripts/perf/profile_421_attribute.py": "54d76682d59ea4adfc56c3b18d319d8de6c662f7a4740f05797a373a65d2aa47",
    "ci/scripts/perf/profile_421_legs.sh": "ff15b0ce3784ace6fb521bfe1de47861fbb838194b1d286e4a472f9c0eddf1ce",
    "ci/scripts/perf/gen_fixed_shape_image_corpus.py": "93bf92c0e723a98d1e234d997d0270edfeec604343c45765e1cbf28e07028e2b",
    "ci/scripts/perf/gen_fixed_length_audio_corpus.py": "9fa820486ed2e0b6565dd612c994b0cec38cbe98e940e363292ba6fd1a8727ea",
@@ -42,8 +46,8 @@
   },
   "input_sha256": {
    "merge_json": "c80cd7eaf480e6e167861b0ac7ae9855d58df0ec84c2799864cdfd6c931db264",
-   "attribution_json": "3d5f33c280232f1ee2ee4740f3e18d84dffc6532f113b595bb1c9f34b63007a3",
-   "identity": "40dcf2c1806146700c37a2306342300ceec9fb1d1f71e174e1c455255d4de6ad",
+   "attribution_json": "af626cc56f3070d8ddeddd7191484950a7698e70e74e2bac6f772d78b859bf5b",
+   "identity": "d5c9ad27fbf19d8625d12ba745888212a20f6bf1963c5c50b36e4caa58f8bdea",
    "legs/clip-text-A1/manifest.json": "f7089429823a022363eb7b37ff47e3e1e3feca40a7b59effc8c5ddb4ce01e47c",
    "legs/clip-text-A1/census.json": "ddb381c27f6eba0e48100aa08f33554890763abf574cdc0e3d6bb169a6dad1e6",
    "legs/clip-text-A2/manifest.json": "13b976c19c156e7f705481f767209e92de3c075a1f82394d68bbd3ce84733104",
@@ -104,7 +108,7 @@
   "recorded_deviations": [
    "run1 (pod p421, session 1) was ALL-12-LEGS INVALID at the pre-fix tip (esc-088: profile_421_legs.sh's corpus tuple shared stdout with its own producers, fixed by PR #469, main c1b0b0ba) -- this artifact is the full 12-leg re-run (run2) on the merged fix.",
    "ROOT CAUSE of the run2-pass1..3 'A2 legs INVALID for attribution -> F32-only' state (pass-4 item 1, kernel_census.py): the module keyed each GPU-kernel bucket on shortName alone, and cutlass's Kernel2<...> template wrapper (same latent shape in magma_sgemmEx_kernel<...>) gives every bf16 GEMM tile instantiation the SAME literal shortName -- clip-text-A2's own run_m.sqlite has 3 DISTINCT cutlass instantiations sharing shortName='Kernel2' AND grid/block, so keying on shortName summed them into one anonymous row that tripped profile_421_attribute.py's 1% known-kernel-name gate. FIX: key on COALESCE(demangledName, shortName) instead -- a strict refinement (a bucket can only split, never merge two old buckets into fewer new ones), so gpu_kernel_us_per_step stays bit-identical and only by_kernel_and_grid resplits; only the cutlass Kernel2<...>(T1::Params) wrapper is stripped to its inner tile name, every other demangled name (magma's own template signature, splitKreduce_kernel<...>) is kept as-is since its template arguments are what distinguishes real instantiations there. All 12 censuses were regenerated under the fix for this run2 pass-4 pull -- every top-line number (gpu_kernel_us_per_step, wall/front/busy per_step) is UNCHANGED (sum-preserving refinement); only the per-instantiation by_kernel_and_grid breakdown resplit. Both CLIP-tower A2 legs (clip-text-A2, clip-vision-A2) are now VALID and decision-grade for attribution -- every candidate-port decision below is measured on BOTH the F32 (A1) and BF16 (A2) legs, never F32-only by consequence.",
-   "htsat-A2 (bf16) is VALID at the merge level but NOT decision-grade for attribution: UNATTRIBUTED share_gpu_busy is 5.66%, over the contract's 5% validity bound. Root cause: WINDOWING (window-partition/reverse/roll copies) and FRONT-FUSION (the audio front end's own activation) are still UNDECLARED chains -- a window-partition copy sits at the identical element count as a generic residual-stream PERMUTE/RESHAPE copy, so profile_421_attribute.py has no shape-only way to tell them apart, and declares neither rather than guess (module doc, 'declaring a chain with no matching rule is dishonest'). htsat-A1 (f32) clears the bound under the pass-4 census fix and IS decision-grade. HTSAT has no candidate port under this contract in the first place (C-ATTN-HTSAT is a named, measured, declared-out-of-tier chain, never folded into UNATTRIBUTED), so htsat-A2's own non-decision-grade status never blocks a candidate-port decision.",
+   "htsat-A2 (bf16) is VALID at the merge level but NOT decision-grade for attribution (recorded reason: UNATTRIBUTED share_gpu_busy=0.0566 > 0.05). Its UNATTRIBUTED share_gpu_busy is 5.66%, over the recorded 5% validity bound. Root cause: WINDOWING (window-partition/reverse/roll copies) and FRONT-FUSION (the audio front end's own activation) are still UNDECLARED chains -- a window-partition copy sits at the identical element count as a generic residual-stream PERMUTE/RESHAPE copy, so profile_421_attribute.py has no shape-only way to tell them apart, and declares neither rather than guess (module doc, 'declaring a chain with no matching rule is dishonest'). htsat-A1 (f32) clears the bound under the pass-4 census fix and IS decision-grade. HTSAT has no candidate port under this contract in the first place (C-ATTN-HTSAT is a named, measured, declared-out-of-tier chain, never folded into UNATTRIBUTED), so htsat-A2's own non-decision-grade status never blocks a candidate-port decision.",
    "Per-leg raw .nsys-rep exports were deleted on-pod after each leg's census.json was produced (disk budget); the raw sqlite exports (24 files) were kept off-pod and were never committed -- see notes.operator_recorded for the on-pod-recorded total size, which has no in-tree witness.",
    "Both media corpus producers (image, audio) emit families x instances = 24 files at any --rows, so the M-leg's 4800 rows cycle 16 distinct train clips (a page-cached working set, contract SS D6.3) -- the HTSAT/vision front-end finding below is a real per-item CPU decode/preprocess compute cost, not a realistic-corpus I/O cost, and every quote of that finding must carry this caveat.",
    "Census reports produced before the pass-4 kernel-identity fix (the #356 close-out and the #421 2026-09-01/06 pod artifacts) carry the pre-fix, collapsed Kernel2/magma_sgemmEx_kernel rows in by_kernel_and_grid -- their by_kernel_name totals and every other top-line number are unaffected (the refinement is sum-preserving, see the root-cause deviation above), only the per-instantiation breakdown was coarser.",

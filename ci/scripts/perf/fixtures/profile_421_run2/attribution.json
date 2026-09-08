@@ -1,7 +1,11 @@
 {
  "tool": "profile_421_attribute",
- "schema": 3,
- "legs_dir": "/private/tmp/claude-501/-Users-vijaychakilam-git-f-inverse-jammi-ai/4ac1595d-bdec-4db7-b4f7-9c3993c88377/scratchpad/pod421-run2/legs",
+ "schema": 4,
+ "legs_dir": "ci/scripts/perf/fixtures/profile_421_run2/legs",
+ "limits": {
+  "unattributed_decision_grade_limit": 0.05,
+  "unknown_kernel_share_limit": 0.01
+ },
  "legs": [
   {
    "leg_id": "clip-text-A1",

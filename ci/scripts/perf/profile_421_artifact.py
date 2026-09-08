@@ -56,6 +56,14 @@ hermetically against SYNTHETIC merge/attribution/identity/legs-dir fixtures
   `candidate_decisions` are copied character-for-character, never
   reformatted or re-derived, per the contract's own "the verdict strings
   written once (never edited)" line.
+- `limits`: `attribution_report["limits"]`, read by name and cross-checked
+  to agree with the LIVE `profile_421_attribute.py` constants of the same
+  name (`_resolve_recorded_limits`) — the run's own recorded validity-gate
+  bounds, never a value re-parsed out of a leg's own `decision_grade_
+  reason` string and never the live import trusted directly. Every
+  downstream reader of a bound (this module's own identity-sidecar
+  clauses, `profile_421_render_docs.py`'s `render_htsat_a2_deviation`)
+  reads it from here.
 - `notes.recorded_deviations`: `--identity`'s own entries are TEMPLATES —
   any number the prose needs to quote (a chain share, a validity-gate
   bound, a corpus file/row count) is a `{placeholder}` this module fills
@@ -197,15 +205,19 @@ import unittest
 from pathlib import Path
 
 # `profile_421_attribute.py`'s own validity-gate constants — imported, never
-# retyped, so a refusal can name the LIVE `UNATTRIBUTED_DECISION_GRADE_LIMIT`
-# this repo's attribution logic currently enforces when it disagrees with
-# the bound this RUN's own `--attribution-json` recorded —
-# `_resolve_unattributed_bound` below never quotes this import directly —
-# only the run's own recorded `decision_grade_reason` licenses the sidecar's
-# "N% validity bound" prose). The "N% known-kernel-name gate" prose is the
-# ONE remaining place this module quotes a validity-gate constant live (see
-# `_identity_template_context` below) — a different gate, not a claim about
-# any one run's own UNATTRIBUTED share.
+# retyped, so a refusal can name the LIVE `UNATTRIBUTED_DECISION_GRADE_LIMIT`/
+# `UNKNOWN_KERNEL_SHARE_LIMIT` this repo's attribution logic currently
+# enforces when it disagrees with the bound of the SAME name a run's own
+# `--attribution-json` recorded in its own top-level `limits` block
+# (`profile_421_attribute.py`'s module doc, "`limits`: the report's own
+# recorded validity-gate bounds"). `_recorded_limit` below never quotes this
+# import directly for a PRINTED bound — every bound this module prints or
+# compares against is read from `attribution_report["limits"]` by name; the
+# live constant is consulted ONLY to refuse a regeneration whose value has
+# since moved away from what the run actually recorded, naming both (see
+# `_recorded_limit`'s own doc). Never a leg's own `decision_grade_reason`
+# string either — a leg that failed for an unrelated reason (or never
+# failed at all) records no such string to parse in the first place.
 import profile_421_attribute as _attribute_mod
 
 # `test_profile_421_merge.py`'s own hermetic-suite SIZE — imported (never
@@ -1232,77 +1244,94 @@ def compute_kernel_identity_split_count(legs_dir: Path, leg_id: str, coalesced_n
 # leg's UNATTRIBUTED share is over the validity bound — mirrored here
 # (never imported: it is a STRING SHAPE this run's own recorded record
 # produced, not a regex `profile_421_attribute.py` itself exposes) so this
-# producer can PARSE the bound and share this run was actually judged
-# against straight out of the run's own record, rather than trust a live
-# import that could have moved since the run was measured. Also mirrored
-# (independently) by `profile_421_render_docs.py`'s own
-# `_DECISION_GRADE_REASON_RE` — the two must parse the SAME shape, and each
-# refuses closed on a mismatch rather than silently diverge.
+# producer can detect that SHAPE and cross-check the reason's own SECOND,
+# independent copy of `share` against `chains.UNATTRIBUTED.share_gpu_busy`
+# (`_htsat_bound_deviation_context` below) — the BOUND itself is never read
+# off this string (see `_recorded_limit`); a leg that failed
+# `leg_decision_grade` for an unrelated reason records no such string to
+# parse a bound out of in the first place. Also mirrored (independently) by
+# `profile_421_render_docs.py`'s own `_DECISION_GRADE_REASON_RE` — the two
+# must parse the SAME shape, and each refuses closed on a mismatch rather
+# than silently diverge.
 _UNATTRIBUTED_OVER_BOUND_REASON_RE = re.compile(r"^UNATTRIBUTED share_gpu_busy=([0-9.eE+-]+) > ([0-9.eE+-]+)$")
 
 
-def _recorded_unattributed_bound(attribution_legs: list[dict]) -> float | None:
-    """The UNATTRIBUTED validity bound THIS RUN's own `--attribution-json`
-    actually recorded — read off whichever leg's own `decision_grade_reason`
-    matches `_UNATTRIBUTED_OVER_BOUND_REASON_RE` (the run's own written
-    record of a leg it judged over the bound), never the live
-    `_attribute_mod.UNATTRIBUTED_DECISION_GRADE_LIMIT` import: the
-    attribution report IS the run's record, and a run that measured an
-    over-bound leg has already, at measurement time, written down exactly
-    which bound it enforced. Cross-checked to agree across every leg that
-    recorded one (a run whose legs disagree on the bound they were each
-    judged against is not one measurement session); refuses on
-    disagreement rather than pick one. Returns `None` — never a guess, and
-    never the live constant — when NO leg recorded one (every leg cleared
-    the bound this run); the caller falls back to the live constant only in
-    that case, since there is then nothing in the run's own record for it
-    to disagree with."""
-    bounds: dict[str, float] = {}
-    for row in attribution_legs:
-        if not isinstance(row, dict):
-            continue
-        reason = row.get("decision_grade_reason")
-        if not isinstance(reason, str):
-            continue
-        match = _UNATTRIBUTED_OVER_BOUND_REASON_RE.match(reason)
-        if match is None:
-            continue
-        bounds[row.get("leg_id", "<unknown>")] = float(match.group(2))
-    if not bounds:
-        return None
-    distinct = set(bounds.values())
-    if len(distinct) != 1:
+def _recorded_limit(attribution_report: dict, key: str, live_value: float) -> float:
+    """The validity-gate bound named `key` THIS RUN's own `--attribution-
+    json` actually recorded, in its own top-level `limits` block
+    (`profile_421_attribute.py`'s `build_report` stamps this at
+    report-build time from its OWN live constants — module doc, "`limits`:
+    the report's own recorded validity-gate bounds") — the run's own
+    written record of what it enforced, never re-parsed out of any leg's
+    own `decision_grade_reason` string (a leg that failed for an unrelated
+    reason, or never failed at all, records no such string) and never the
+    live `_attribute_mod` import directly.
+
+    Refuses BY NAME if `limits` (or `key` within it) is absent — an
+    `--attribution-json` built before this block existed, or missing a
+    bound some future decision reads, carries no record for this producer
+    to trust; guessing (falling back to the live constant) would silently
+    re-judge an already-measured run against a bound it may never have
+    actually been held to at measurement time.
+
+    `live_value` (the CURRENT `profile_421_attribute.py` constant of the
+    SAME name) is consulted ONLY to refuse the build if it disagrees with
+    the recorded value — naming BOTH — never to supply a bound this run's
+    own record lacks: `profile_421_attribute.py`'s own constant can move (a
+    later, unrelated PR edits it) without this ALREADY-MEASURED run's own
+    artifact silently re-judging itself against a bound it was never
+    actually held to."""
+    limits = attribution_report.get("limits")
+    if not isinstance(limits, dict):
         raise ArtifactBuildError(
-            "legs disagree on the UNATTRIBUTED validity bound recorded in their own "
-            f"decision_grade_reason: {sorted(bounds.items())}"
+            "--attribution-json carries no top-level 'limits' block — regenerate it with a "
+            f"profile_421_attribute.py new enough to record its own validity-gate bounds (needed here for {key!r})"
         )
-    return next(iter(distinct))
+    if key not in limits:
+        raise ArtifactBuildError(
+            f"--attribution-json's own 'limits' block carries no {key!r} entry — regenerate it with a "
+            "profile_421_attribute.py new enough to record this bound"
+        )
+    recorded = limits[key]
+    if not isinstance(recorded, (int, float)) or isinstance(recorded, bool):
+        raise ArtifactBuildError(f"--attribution-json limits[{key!r}] is not a number ({recorded!r})")
+    if recorded != live_value:
+        raise ArtifactBuildError(
+            f"profile_421_attribute.py's own {key} ({live_value!r}) disagrees with the value this run's "
+            f"own --attribution-json recorded in limits[{key!r}] ({recorded!r}) — the constant has moved "
+            "since this run was measured; a regeneration must not silently re-judge an already-measured "
+            "run against a different bound than the one it was actually held to at measurement time"
+        )
+    return float(recorded)
 
 
-def _resolve_unattributed_bound(attribution_legs: list[dict]) -> float:
-    """`_recorded_unattributed_bound`, falling back to the live
-    `_attribute_mod.UNATTRIBUTED_DECISION_GRADE_LIMIT` ONLY when this run
-    recorded no witness at all. Whenever a recorded witness DOES exist, the
-    live constant is used ONLY to refuse the build if it disagrees with
-    that recorded value — `profile_421_attribute.py`'s
-    own constant can move (a later, unrelated PR edits it) without this
-    ALREADY-MEASURED run's own artifact silently re-judging itself against
-    a bound the run was never actually held to at measurement time. A
-    regeneration must fail loudly and name the disagreement, never quote a
-    bound the run's own recorded reason disagrees with."""
-    recorded = _recorded_unattributed_bound(attribution_legs)
-    live = _attribute_mod.UNATTRIBUTED_DECISION_GRADE_LIMIT
-    if recorded is None:
-        return live
-    if recorded != live:
-        raise ArtifactBuildError(
-            "profile_421_attribute.py's own UNATTRIBUTED_DECISION_GRADE_LIMIT "
-            f"({live!r}) disagrees with the bound this run's own --attribution-json recorded a leg "
-            f"failing against ({recorded!r}) — the constant has moved since this run was measured; "
-            "a regeneration must not silently re-judge an already-measured run against a different "
-            "bound than the one it was actually held to at measurement time"
-        )
-    return recorded
+def _resolve_recorded_limits(attribution_report: dict) -> dict[str, float]:
+    """Both validity-gate bounds this artifact's `limits` block and its
+    identity-sidecar prose need, resolved ONCE (never re-read per call site,
+    so every consumer — the sidecar's htsat clauses, the top-level
+    `report["limits"]`, the "N% known-kernel-name gate" prose — agrees on
+    the exact same recorded value). See `_recorded_limit`'s own doc."""
+    return {
+        "unattributed_decision_grade_limit": _recorded_limit(
+            attribution_report, "unattributed_decision_grade_limit", _attribute_mod.UNATTRIBUTED_DECISION_GRADE_LIMIT
+        ),
+        "unknown_kernel_share_limit": _recorded_limit(
+            attribution_report, "unknown_kernel_share_limit", _attribute_mod.UNKNOWN_KERNEL_SHARE_LIMIT
+        ),
+    }
+
+
+def _format_recorded_bound_pct(value: float) -> str:
+    """A recorded validity-gate bound, already multiplied by 100, printed
+    EXACTLY as recorded — `5.0 -> "5%"`, `5.5 -> "5.5%"` — never a fixed
+    `.0f`/`.2f` spec that would silently round a non-round bound down (or
+    dress a round one up in false precision). `%.6f` then a trailing-
+    zero/point strip absorbs ordinary float noise (e.g. `0.055 * 100.0`)
+    without inventing digits a bound was never measured to."""
+    text = f"{value:.6f}".rstrip("0").rstrip(".")
+    if text in ("", "-0"):
+        text = "0"
+    return f"{text}%"
 
 
 def _htsat_bound_deviation_context(
@@ -1313,50 +1342,65 @@ def _htsat_bound_deviation_context(
     attribution_legs: list[dict],
     bound: float,
 ) -> dict[str, object]:
-    """Every placeholder ONE htsat leg's own "is {merge_verdict} at the
-    merge level but {decision_grade_word} for attribution: UNATTRIBUTED
-    share_gpu_busy is X%, {comparison_word} the Y% validity bound"
-    deviation clause needs, read live off THAT SAME leg's own merge/
-    attribution rows, keyed under the given `prefix` (`"htsat_a1"` /
-    `"htsat_a2"`) so the SAME mechanism serves every leg the identity
-    sidecar's prose names — never hand-typed, and never one flag answering
-    two different questions. `bound` is the run's own RECORDED validity
-    bound (`_resolve_unattributed_bound`, computed once for the whole
-    report) — this function never reads the live import itself, so a
-    constant that moved since the run was measured cannot silently change
-    what this ONE leg's own clause quotes independently of the sibling leg.
+    """Every placeholder ONE htsat leg's own deviation clause needs, read
+    live off THAT SAME leg's own merge/attribution rows, keyed under the
+    given `prefix` (`"htsat_a1"` / `"htsat_a2"`) so the SAME mechanism
+    serves every leg the identity sidecar's prose names — never hand-typed,
+    and never one flag answering two different questions. `bound` is the
+    run's own RECORDED validity bound (`_resolve_recorded_limits`, resolved
+    once for the whole report off `attribution_report["limits"]`) — this
+    function never reads the live import itself, so a constant that moved
+    since the run was measured cannot silently change what this ONE leg's
+    own clause quotes independently of the sibling leg.
+
+    The sentence this feeds ALWAYS states the leg's own recorded
+    `decision_grade_reason` VERBATIM (`{prefix}_recorded_reason_clause`,
+    non-empty whenever `decision_grade` is `False`) and reports the
+    share/bound relation (`{prefix}_bound_comparison_word`) as a SEPARATE
+    clause, asserted as a fact this function itself checked — never as the
+    reason's claimed CAUSE, unless the reason string literally IS the
+    share-bound reason (in which case the two clauses simply agree, rather
+    than one silently standing in for the other on a run where they
+    diverge). `decision_grade=True` forces `reason` to `None`
+    (`leg_decision_grade` never returns `True` with one), so
+    `{prefix}_recorded_reason_clause` is always empty in that arm — there
+    is nothing recorded to quote.
 
     `leg_decision_grade` (`profile_421_attribute.py`) has EIGHT return
     points: one `True`, and seven distinct `False` reasons, of which "the
     UNATTRIBUTED share is over the bound" is only ONE. This function
-    therefore handles the full `(decision_grade, over_bound)` 2x2 lattice
-    explicitly, where `over_bound` is `share > bound`
-    computed against the SAME recorded `bound` this run was actually judged
-    against, never re-derived from `decision_grade` itself:
+    therefore handles the full `(decision_grade, over_bound, reason_is_
+    share_bound_shape)` lattice explicitly, where `over_bound` is
+    `share > bound` computed against the SAME recorded `bound` this run was
+    actually judged against, never re-derived from `decision_grade` itself:
 
-    - `(False, over)`: not decision-grade, and genuinely over the bound —
-      the leg's own `decision_grade_reason` is parsed for a SECOND,
-      independent copy of `share` and cross-checked to agree with
-      `chains.UNATTRIBUTED.share_gpu_busy` before being trusted (its own
-      `bound` is already guaranteed to agree with the run's resolved
-      `bound` — see `_recorded_unattributed_bound`); a share disagreement
-      refuses rather than picks one.
-    - `(True, under)`: decision-grade, and genuinely at-or-under the bound
-      — the truthful, unremarkable case.
-    - `(False, under)`: not decision-grade for a reason OTHER than this
-      share bound (six other `leg_decision_grade` reasons exist) while the
-      share itself is genuinely at-or-under — the ACTUAL reason (this
-      leg's own `decision_grade_reason`, or a synthesized fallback when
-      that field itself is absent) is named, rather than let a reader infer
-      a false "this bound is why" from the two clauses sitting next to
-      each other. Refuses if that named reason is ITSELF the share-bound
-      shape (a contradiction: the reason claims over-bound while this
-      function's own comparison against the SAME bound says otherwise).
-    - `(True, over)`: impossible from `profile_421_attribute.py`'s own
+    - `(True, under, *)`: decision-grade, genuinely at-or-under the bound —
+      the ordinary case; no reason was ever recorded to quote.
+    - `(True, over, *)`: impossible from `profile_421_attribute.py`'s own
       `leg_decision_grade` (which never returns `True` without itself
       having confirmed `share <= bound` against this exact bound) — refused
       by name, never rendered, since a live artifact reporting this
       combination is this producer's own inputs contradicting each other.
+    - `(False, over, share-shape)`: not decision-grade, and genuinely over
+      the bound, for exactly the reason recorded — the leg's own
+      `decision_grade_reason` is parsed for a SECOND, independent copy of
+      `share` and cross-checked to agree with `chains.UNATTRIBUTED.
+      share_gpu_busy` before being trusted; a disagreement refuses rather
+      than picks one.
+    - `(False, over, not-share-shape)`: not decision-grade for an UNRELATED
+      reason (stated verbatim) while the raw share INDEPENDENTLY also
+      happens to be over `bound` — both facts are true and both are
+      stated, but the sentence never claims the recorded reason IS this
+      bound (it demonstrably is not: its own text does not match the
+      share-bound shape at all).
+    - `(False, under, not-share-shape)`: not decision-grade for an
+      unrelated reason (stated verbatim) while the share genuinely clears
+      the bound.
+    - `(False, under, share-shape)`: impossible — the reason CLAIMS an
+      over-bound failure while this function's own comparison against the
+      SAME bound says the share is at-or-under — a self-contradiction in
+      the run's own record, refused rather than rendered as either
+      direction.
 
     A leg that is not merge-VALID, or carries no UNATTRIBUTED chain at all,
     is refused HERE, never silently rendered with a stale claim: a
@@ -1398,12 +1442,9 @@ def _htsat_bound_deviation_context(
         # of `share` — cross-checked against the artifact's own
         # `chains.UNATTRIBUTED.share_gpu_busy` before being trusted; a
         # disagreement refuses rather than silently picks one. The
-        # reason's OWN bound is NOT re-checked here against
-        # `bound`: `_recorded_unattributed_bound` already built `bound` by
-        # collecting every matching leg's own recorded bound (THIS leg
-        # included, since its reason matches here) and requiring them all
-        # to agree — by the time this line runs, `reason_bound == bound` is
-        # already guaranteed, never a second, independently-failable check.
+        # reason's OWN bound (`match.group(2)`) is never read for anything
+        # — `bound` comes from `attribution_report["limits"]`
+        # (`_resolve_recorded_limits`), independent of this string entirely.
         reason_share = float(match.group(1))
         if round(reason_share, 4) != round(share, 4):
             raise ArtifactBuildError(
@@ -1441,20 +1482,27 @@ def _htsat_bound_deviation_context(
         )
 
     comparison_word = "over" if over_bound else "at or under"
-    reason_clause = ""
-    if (not decision_grade) and (not over_bound):
-        # (False, under): `decision_grade` is False for a reason OTHER than
-        # this share bound (already ruled non-contradictory above) — name
-        # it, rather than let a reader infer a false "this bound is why"
-        # from the two clauses sitting next to each other.
-        if not isinstance(reason, str) or not reason:
+    # ALWAYS state the leg's own recorded reason VERBATIM whenever
+    # `decision_grade` is `False` — regardless of `over_bound`/`reason_is_
+    # share_bound` — never only for the "unrelated reason" cell: a reader
+    # must see the ACTUAL recorded reason, and the share/bound comparison
+    # this function computed is a SEPARATE, independently-true clause
+    # (`{prefix}_bound_comparison_word`) the caller's own template states
+    # next to it, never folded into this clause as a claimed cause. Empty
+    # when `decision_grade` is `True` — `leg_decision_grade` never records a
+    # reason in that arm, so there is nothing to quote.
+    if decision_grade:
+        recorded_reason_clause = ""
+    else:
+        display_reason = reason if isinstance(reason, str) and reason else None
+        if display_reason is None:
             attribution_verdict = attr_row.get("verdict")
-            reason = (
+            display_reason = (
                 f"attribution verdict is {attribution_verdict!r}, not VALID"
                 if attribution_verdict != _attribute_mod.VERDICT_VALID
                 else "reason not recorded"
             )
-        reason_clause = f" (attribution decision_grade is False for a reason other than this share bound: {reason})"
+        recorded_reason_clause = f" (recorded reason: {display_reason})"
 
     return {
         f"{prefix}_merge_verdict": merge_verdict,
@@ -1474,23 +1522,25 @@ def _htsat_bound_deviation_context(
         f"{prefix}_bound_clears_word": "does not clear" if over_bound else "clears",
         f"{prefix}_decision_grade_is_word": "IS" if decision_grade else "is NOT",
         f"{prefix}_unattributed_share_gpu_busy_pct": share_pct,
-        f"{prefix}_decision_grade_reason_clause": reason_clause,
+        f"{prefix}_recorded_reason_clause": recorded_reason_clause,
     }
 
 
-def _identity_template_context(merge_report: dict, attribution_report: dict, legs_dir: Path) -> dict[str, object]:
+def _identity_template_context(
+    merge_report: dict, attribution_report: dict, legs_dir: Path, recorded_limits: dict[str, float]
+) -> dict[str, object]:
     attribution_legs = attribution_report.get("legs", [])
     merge_by_id = _index_by_leg_id(merge_report.get("legs", []))
     attr_by_id = _index_by_leg_id(attribution_legs)
     pool = compute_media_corpus_pool()
 
-    # The bound BOTH htsat legs below are judged against — resolved ONCE
-    # from this SAME run's own recorded `decision_grade_reason` (falling
-    # back to the live constant only when this run recorded no witness at
-    # all), never re-read live per leg, so a constant that moved between
-    # the two calls could never make the two legs disagree on what bound
-    # they were each judged against.
-    bound = _resolve_unattributed_bound(attribution_legs)
+    # `recorded_limits` is resolved ONCE, by the caller (`build_report`), off
+    # this SAME run's own `attribution_report["limits"]` (`_resolve_recorded_
+    # limits`) — never re-read per leg here, so a constant that moved
+    # between two calls could never make the two htsat clauses (or the
+    # top-level `report["limits"]` this same dict also feeds) disagree on
+    # what bound this run was actually judged against.
+    bound = recorded_limits["unattributed_decision_grade_limit"]
 
     context: dict[str, object] = {}
     # Both htsat decision legs the identity sidecar's own deviation prose
@@ -1502,15 +1552,18 @@ def _identity_template_context(merge_report: dict, attribution_report: dict, leg
     context.update(_htsat_bound_deviation_context("htsat_a2", "htsat-A2", merge_by_id, attr_by_id, attribution_legs, bound))
     context.update(
         {
-            # The RUN'S OWN recorded bound (see `_resolve_unattributed_bound`
-            # above) — never the live import directly — so the sidecar's own
-            # printed "N% validity bound" always agrees with the two htsat
-            # clauses it sits next to in the SAME rendered sentence, even if
-            # `_attribute_mod.UNATTRIBUTED_DECISION_GRADE_LIMIT` has since
-            # moved — the sidecar prints the RECORDED bound.
-            "unattributed_decision_grade_limit_pct": bound * 100.0,
-            "unknown_kernel_share_limit_pct": _attribute_mod.UNKNOWN_KERNEL_SHARE_LIMIT * 100.0,
-            "unknown_kernel_share_limit_pct": _attribute_mod.UNKNOWN_KERNEL_SHARE_LIMIT * 100.0,
+            # The RUN'S OWN recorded bounds (`recorded_limits` — see
+            # `_resolve_recorded_limits`) — never the live import directly —
+            # so the sidecar's own printed "N% bound"/"N% gate" always
+            # agrees with the two htsat clauses (and the top-level
+            # `report["limits"]`) it sits next to, even if
+            # `_attribute_mod`'s own constants have since moved. Formatted
+            # EXACTLY as recorded (`_format_recorded_bound_pct`) — never a
+            # fixed `.0f`/`.2f` that could round a non-round bound.
+            "unattributed_decision_grade_limit_pct": _format_recorded_bound_pct(bound * 100.0),
+            "unknown_kernel_share_limit_pct": _format_recorded_bound_pct(
+                recorded_limits["unknown_kernel_share_limit"] * 100.0
+            ),
             "sqlite_raw_export_count": compute_sqlite_raw_export_count(legs_dir),
             "corpus_total_files": pool["corpus_total_files"],
             "corpus_train_clips": pool["corpus_train_clips"],
@@ -1572,7 +1625,14 @@ def build_report(
 
     findings, suppressed_findings = compute_findings(merge_report, attribution_report, legs_dir)
     status = derive_status(merge_report)
-    template_context = _identity_template_context(merge_report, attribution_report, legs_dir)
+    # Resolved ONCE, off THIS run's own `attribution_report["limits"]"
+    # (`_resolve_recorded_limits`), and threaded to both the sidecar's own
+    # template context and the top-level `report["limits"]` below — a
+    # single source of truth for every bound a downstream reader
+    # (`profile_421_render_docs.py`'s `render_htsat_a2_deviation`, this
+    # module's own identity-sidecar clauses) needs.
+    recorded_limits = _resolve_recorded_limits(attribution_report)
+    template_context = _identity_template_context(merge_report, attribution_report, legs_dir, recorded_limits)
     recorded_deviations = _render_recorded_deviations(identity.get("recorded_deviations", []), template_context)
     p2_witnessed = {"towers": witnessed_p2_towers, "git_sha": git_sha, "box": box} if witnessed_p2_towers else None
 
@@ -1581,6 +1641,13 @@ def build_report(
         "git_sha": git_sha,
         "box": box,
         "p2_witnessed": p2_witnessed,
+        # This run's own recorded validity-gate bounds (`attribution_report
+        # ["limits"]`, cross-checked to agree with the live
+        # `profile_421_attribute.py` constants — `_resolve_recorded_
+        # limits`) — the ONE place a downstream reader of the FINAL
+        # artifact (never `--attribution-json` directly) looks up a bound
+        # this run was actually judged against.
+        "limits": recorded_limits,
         "producer": {
             "path": "ci/scripts/perf/profile_421_legs.sh",
             "kind": "script",

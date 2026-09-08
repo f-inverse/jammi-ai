@@ -241,6 +241,7 @@ def _full_synthetic_artifact() -> dict:
         }
 
     return {
+        "limits": {"unattributed_decision_grade_limit": 0.05, "unknown_kernel_share_limit": 0.01},
         "legs": [
             {"leg_id": f"{t}-{a}", "verdict": "VALID", "merge_verdict": "VALID"}
             for t in ("clip-text", "clip-vision", "htsat")
@@ -542,14 +543,40 @@ class NewBlockRenderTests(unittest.TestCase):
             r.render_htsat_a2_deviation(artifact)
         self.assertIn("merge_verdict", str(ctx.exception))
 
-    def test_htsat_a2_deviation_reads_over_and_the_bound_off_decision_grade_reason(self):
-        """The comparison word and the "N %" bound are PARSED off
-        `attribution[htsat-A2].decision_grade_reason`, never a hard-coded
-        "over" and never a live import of the module constant that produced
-        it -- this fixture's reason string ("> 0.05") must still render
-        "over the ... 5 % validity bound"."""
+    def test_htsat_a2_deviation_reads_the_bound_off_the_artifacts_limits_block(self):
+        """The "N %" bound is read off the artifact's OWN top-level
+        `limits.unattributed_decision_grade_limit` (never a live import of
+        the module constant, and never re-parsed out of `attribution[htsat-
+        A2].decision_grade_reason` -- that string is still cross-checked
+        for a SECOND, independent copy of `share`, but no longer for the
+        bound itself); the comparison word is a live `>` comparison against
+        that SAME artifact-sourced bound -- this fixture's `limits` (5 %)
+        and share (5.66 %) must still render "over the ... 5 % validity
+        bound"."""
         rendered = _norm(r.render_htsat_a2_deviation(self.artifact))
         self.assertIn("over the contract's 5 % validity bound", rendered)
+
+    def test_htsat_a2_deviation_refuses_when_limits_block_is_absent(self):
+        artifact = _full_synthetic_artifact()
+        del artifact["limits"]
+        with self.assertRaises(ValueError) as ctx:
+            r.render_htsat_a2_deviation(artifact)
+        self.assertIn("limits", str(ctx.exception))
+
+    def test_htsat_a2_deviation_refuses_when_limits_disagrees_with_the_reason_share(self):
+        """The artifact's own `limits` bound (5 %) and its own
+        `decision_grade_reason` share (5.66 %, over 5 %) must independently
+        agree on DIRECTION -- an artifact whose `limits` bound was edited to
+        exceed the recorded share (a self-contradictory input this renderer
+        never received in practice, since `profile_421_artifact.py` itself
+        cross-checks `limits` against its own live constant) must still
+        fail this renderer CLOSED rather than silently flip the comparison
+        word."""
+        artifact = _full_synthetic_artifact()
+        artifact["limits"]["unattributed_decision_grade_limit"] = 0.90  # now over htsat-A2's 5.66 % share
+        with self.assertRaises(ValueError) as ctx:
+            r.render_htsat_a2_deviation(artifact)
+        self.assertIn("under its own bound", str(ctx.exception))
 
     def test_htsat_a2_deviation_refuses_when_decision_grade_reason_is_not_the_expected_shape(self):
         artifact = _full_synthetic_artifact()

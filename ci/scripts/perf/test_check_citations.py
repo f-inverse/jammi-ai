@@ -1783,22 +1783,44 @@ class PlanContractCitationTests(GitFixture):
         violations = cc.check_file(doc)
         self.assertEqual(violations, [], [str(v) for v in violations])
 
-    def test_a_frozen_comment_inside_a_fence_is_never_mistaken_for_a_declared_marker(self):
-        """The comment-marker scan is fence-aware too, exactly like the
-        heading scan (same shared `_non_fenced_lines` scan): a doc that
-        QUOTES the `<!-- Frozen ledger ts: ... -->` convention inside a
-        ``` fence (e.g. showing readers what a frozen file's own opening
-        comment looks like), with no REAL marker or heading anywhere else
-        in the search window, must never be treated as itself frozen --
-        the file is not recognized as frozen at all, so it produces no
-        violation (no header mandated)."""
+    def test_a_frozen_comment_inside_a_closed_fence_is_still_recognized_raw_scan(self):
+        """The comment-marker scan is deliberately NOT fence-aware (round-7
+        audit at a0081c9d, unlike the heading scan, which stays fence-aware
+        -- `_is_frozen_contract_file`'s own "Fences apply to the heading
+        arm only" doc section): a doc that QUOTES the `<!-- Frozen ledger
+        ts: ... -->` convention inside a ``` fence (e.g. showing readers
+        what a frozen file's own opening comment looks like) is now
+        recognized as frozen regardless -- the RAW window is scanned
+        unconditionally, so this produces the mandatory-header violation."""
         doc = self._write(
             "NOTES.md",
             "```\n<!-- Frozen ledger ts: 2026-01-01 -->\n```\n\nSome prose.\n\n`trainer.rs:999`\n",
         )
         self._commit("add a doc whose only frozen-marker-shaped line is fenced")
         violations = cc.check_file(doc)
-        self.assertEqual(violations, [], [str(v) for v in violations])
+        self.assertEqual(len(violations), 1, [str(v) for v in violations])
+        self.assertIn("declares no 'citations-resolve-at:' header", violations[0].message)
+
+    def test_a_frozen_comment_after_an_unterminated_fence_in_the_window_is_still_recognized(self):
+        """The motivating bug this raw scan fixes: a fence that OPENS on
+        line 1 but never CLOSES again before the search window ends (its
+        real closing fence -- if any -- sits past
+        `_CITATIONS_EPOCH_HEADER_SEARCH_LINES` == 6) must not silently
+        swallow a REAL marker on one of the later lines still inside the
+        window -- a fence-aware scan would leave `in_fence` stuck `True`
+        for the rest of the window and miss it entirely, reading a
+        genuinely frozen file as NOT frozen (exactly the "never-checked
+        reads as checked-clean" failure this whole mechanism exists to
+        rule out)."""
+        doc = self._write(
+            "NOTES.md",
+            "```\nsome code, never closed within the search window\n"
+            "<!-- Frozen ledger ts: 2026-01-01 -->\n\nprose\n`trainer.rs:999`\n",
+        )
+        self._commit("add a doc with an unterminated fence before its real marker")
+        violations = cc.check_file(doc)
+        self.assertEqual(len(violations), 1, [str(v) for v in violations])
+        self.assertIn("declares no 'citations-resolve-at:' header", violations[0].message)
 
     def test_a_heading_naming_contract_is_recognized_after_a_fence_closes(self):
         """The inverse: a fence that opens and closes BEFORE the document's

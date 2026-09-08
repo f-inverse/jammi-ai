@@ -102,11 +102,11 @@ IDENTITY_TEMPLATE_DEVIATIONS = [
     "fixture deviation, no placeholders.",
     (
         "htsat-A2 is {htsat_a2_merge_verdict} at the merge level but {htsat_a2_decision_grade_word} for "
-        "attribution: UNATTRIBUTED share_gpu_busy is {htsat_a2_unattributed_share_gpu_busy_pct:.2f}%, "
-        "{htsat_a2_bound_comparison_word} the {unattributed_decision_grade_limit_pct:.0f}% validity bound "
-        "({unknown_kernel_share_limit_pct:.0f}% known-kernel-name gate)."
-        "{htsat_a2_decision_grade_reason_clause} So htsat-A2's own "
-        "{htsat_a2_decision_grade_status_word} status never blocks a candidate-port decision."
+        "attribution{htsat_a2_recorded_reason_clause}. Its UNATTRIBUTED share_gpu_busy is "
+        "{htsat_a2_unattributed_share_gpu_busy_pct:.2f}%, {htsat_a2_bound_comparison_word} the recorded "
+        "{unattributed_decision_grade_limit_pct} validity bound "
+        "({unknown_kernel_share_limit_pct} known-kernel-name gate)."
+        " So htsat-A2's own {htsat_a2_decision_grade_status_word} status never blocks a candidate-port decision."
     ),
     "raw sqlite exports: {sqlite_raw_export_count} files.",
     "corpus: {corpus_total_files} files, {corpus_train_clips} distinct train clips, {corpus_rows_m} rows.",
@@ -114,7 +114,7 @@ IDENTITY_TEMPLATE_DEVIATIONS = [
     "the live merge suite already carried {merge_suite_test_count} tests.",
     (
         "htsat-A1 (f32) {htsat_a1_bound_clears_word} the bound under the pass-4 census fix and "
-        "{htsat_a1_decision_grade_is_word} decision-grade{htsat_a1_decision_grade_reason_clause}."
+        "{htsat_a1_decision_grade_is_word} decision-grade{htsat_a1_recorded_reason_clause}."
     ),
 ]
 
@@ -259,7 +259,11 @@ def _write_fixture(
     }
     attribution_report = {
         "tool": "profile_421_attribute",
-        "schema": 3,
+        "schema": 4,
+        "limits": {
+            "unattributed_decision_grade_limit": attribute_mod.UNATTRIBUTED_DECISION_GRADE_LIMIT,
+            "unknown_kernel_share_limit": attribute_mod.UNKNOWN_KERNEL_SHARE_LIMIT,
+        },
         "legs": [_attr_leg_row(leg_id, spec) for leg_id, spec in leg_specs.items()],
         "candidate_decisions": [{"port": "C-ATTN-clip-text", "tower": "clip-text", "chain": "C-ATTN-clip-text", "verdict": "UNRESOLVED", "reason": "synthetic fixture reason string"}],
         "realized_gains": [{"chain": "C-LORA", "tower": "clip-text", "share_of_baseline_wall": 0.3}],
@@ -328,7 +332,7 @@ class BuildReportHappyPathTests(unittest.TestCase):
     def test_top_level_shape(self):
         report = self._build()
         expected_keys = {
-            "schema_version", "git_sha", "box", "p2_witnessed", "producer", "status", "notes",
+            "schema_version", "git_sha", "box", "p2_witnessed", "limits", "producer", "status", "notes",
             "legs", "p2", "attribution", "realized_gains", "candidate_decisions", "findings",
             "suppressed_findings",
         }
@@ -340,6 +344,33 @@ class BuildReportHappyPathTests(unittest.TestCase):
         self.assertEqual(report["producer"]["kind"], "script")
         self.assertEqual(report["producer"]["gating"], "none")
         self.assertEqual(report["suppressed_findings"], [])
+
+    def test_limits_block_is_the_run_recorded_bounds(self):
+        # `report["limits"]` is `attribution_report["limits"]` (the fixture
+        # builds it directly off `attribute_mod`'s own live constants),
+        # cross-checked by `_resolve_recorded_limits` -- never a value this
+        # producer invents or re-parses out of a leg's own
+        # `decision_grade_reason` string.
+        report = self._build()
+        self.assertEqual(
+            report["limits"],
+            {
+                "unattributed_decision_grade_limit": attribute_mod.UNATTRIBUTED_DECISION_GRADE_LIMIT,
+                "unknown_kernel_share_limit": attribute_mod.UNKNOWN_KERNEL_SHARE_LIMIT,
+            },
+        )
+
+    def test_build_report_refuses_when_attribution_report_has_no_limits_block(self):
+        def poison(attribution_report):
+            del attribution_report["limits"]
+
+        alt_root = Path(tempfile.mkdtemp(dir=str(self.root)))
+        fixture = _write_fixture(alt_root, attr_override=poison)
+        with self.assertRaises(art.ArtifactBuildError) as ctx:
+            art.build_report(
+                fixture["legs_dir"], fixture["p2_dir"], fixture["merge_report"], fixture["attribution_report"], fixture["identity"]
+            )
+        self.assertIn("no top-level 'limits' block", str(ctx.exception))
 
     def test_status_is_green_when_merge_summary_is_clean(self):
         report = self._build()
@@ -448,13 +479,14 @@ class TemplatedDeviationTests(unittest.TestCase):
         # "over" (a decision_grade=True leg whose own prose still claimed
         # it was over the bound would be a self-contradiction). The closing
         # clause's own STATUS WORD must agree with the SAME live
-        # decision_grade flag too, and no extra reason clause is needed
-        # (comparison and decision_grade agree here).
-        self.assertIn("at or under the 5% validity bound", self.deviations[1])
-        self.assertNotIn("over the 5% validity bound", self.deviations[1])
+        # decision_grade flag too, and NO recorded-reason clause at all --
+        # `decision_grade=True` means `leg_decision_grade` never recorded a
+        # reason in the first place.
+        self.assertIn("at or under the recorded 5% validity bound", self.deviations[1])
+        self.assertNotIn("over the recorded 5% validity bound", self.deviations[1])
         self.assertIn("own decision-grade status never blocks a candidate-port decision", self.deviations[1])
         self.assertNotIn("non-decision-grade status", self.deviations[1])
-        self.assertNotIn("for a reason other than this share bound", self.deviations[1])
+        self.assertNotIn("(recorded reason:", self.deviations[1])
 
     def test_htsat_a2_comparison_word_over_the_bound_when_decision_grade_false_for_the_bound_itself(self):
         def poison(attribution_report):
@@ -473,12 +505,14 @@ class TemplatedDeviationTests(unittest.TestCase):
         self.assertIn("but NOT decision-grade for attribution", deviation)
         # The comparison and status words flip TOGETHER with the same live
         # flag -- "over" and "non-decision-grade" are each licensed here
-        # because the share genuinely IS over the bound; no extra reason
-        # clause is needed (comparison and decision_grade agree).
-        self.assertIn("is 10.00%, over the 5% validity bound (1% known-kernel-name gate).", deviation)
-        self.assertNotIn("at or under the 5% validity bound", deviation)
+        # because the share genuinely IS over the bound. The recorded
+        # reason is ALWAYS stated verbatim whenever decision_grade is
+        # False -- here it happens to BE the share-bound reason, so the two
+        # clauses simply agree.
+        self.assertIn("(recorded reason: UNATTRIBUTED share_gpu_busy=0.1000 > 0.05)", deviation)
+        self.assertIn("is 10.00%, over the recorded 5% validity bound (1% known-kernel-name gate).", deviation)
+        self.assertNotIn("at or under the recorded 5% validity bound", deviation)
         self.assertIn("own non-decision-grade status never blocks a candidate-port decision", deviation)
-        self.assertNotIn("for a reason other than this share bound", deviation)
 
     def test_htsat_a2_comparison_word_stays_truthful_when_decision_grade_false_for_a_different_reason(self):
         # `decision_grade` can be False for a reason that
@@ -488,9 +522,10 @@ class TemplatedDeviationTests(unittest.TestCase):
         # genuinely UNDER the 5% bound -- the comparison word must still
         # read the TRUTHFUL "at or under" (never "over the bound" for a 2%
         # share just because decision_grade happened to be False for some
-        # other reason), and the sentence must additionally NAME the real
-        # reason rather than let a reader infer a false "this bound is
-        # why" from the two clauses sitting next to each other.
+        # other reason), and the sentence must additionally state the real
+        # recorded reason VERBATIM, as its own separate clause -- never
+        # folded into (or implying it caused) the share/bound clause next
+        # to it.
         def poison(attribution_report):
             for row in attribution_report["legs"]:
                 if row["leg_id"] == "htsat-A2":
@@ -504,12 +539,9 @@ class TemplatedDeviationTests(unittest.TestCase):
         )
         deviation = report["notes"]["recorded_deviations"][1]
         self.assertIn("but NOT decision-grade for attribution", deviation)
-        self.assertIn("is 2.00%, at or under the 5% validity bound", deviation)
-        self.assertNotIn("over the 5% validity bound", deviation)
-        self.assertIn(
-            "for a reason other than this share bound: leg is INVALID: htsat-A2: some unrelated classify failure",
-            deviation,
-        )
+        self.assertIn("(recorded reason: leg is INVALID: htsat-A2: some unrelated classify failure)", deviation)
+        self.assertIn("is 2.00%, at or under the recorded 5% validity bound", deviation)
+        self.assertNotIn("over the recorded 5% validity bound", deviation)
         self.assertIn("own non-decision-grade status never blocks a candidate-port decision", deviation)
 
     def test_htsat_a2_non_share_reason_fallback_when_decision_grade_reason_itself_is_absent(self):
@@ -529,8 +561,8 @@ class TemplatedDeviationTests(unittest.TestCase):
             fixture["legs_dir"], fixture["p2_dir"], fixture["merge_report"], fixture["attribution_report"], fixture["identity"]
         )
         deviation = report["notes"]["recorded_deviations"][1]
-        self.assertIn("is 2.00%, at or under the 5% validity bound", deviation)
-        self.assertIn("for a reason other than this share bound: reason not recorded", deviation)
+        self.assertIn("is 2.00%, at or under the recorded 5% validity bound", deviation)
+        self.assertIn("(recorded reason: reason not recorded)", deviation)
 
     def test_htsat_a1_clears_the_bound_and_is_decision_grade_renders_from_the_base_fixture(self):
         # The base fixture's htsat-A1 is merge-VALID, decision_grade True,
@@ -559,7 +591,8 @@ class TemplatedDeviationTests(unittest.TestCase):
         deviation = report["notes"]["recorded_deviations"][6]
         self.assertEqual(
             deviation,
-            "htsat-A1 (f32) does not clear the bound under the pass-4 census fix and is NOT decision-grade.",
+            "htsat-A1 (f32) does not clear the bound under the pass-4 census fix and is NOT decision-grade "
+            "(recorded reason: UNATTRIBUTED share_gpu_busy=0.1000 > 0.05).",
         )
 
     def test_htsat_a1_names_the_actual_reason_when_not_decision_grade_for_a_non_share_reason(self):
@@ -576,30 +609,23 @@ class TemplatedDeviationTests(unittest.TestCase):
         )
         deviation = report["notes"]["recorded_deviations"][6]
         # Share is STILL 2% (under the bound) -- "clears the bound" stays
-        # truthful even though decision_grade is False, and the real reason
-        # is named rather than silently dropped.
+        # truthful even though decision_grade is False, and the real
+        # recorded reason is stated verbatim rather than silently dropped.
         self.assertIn("htsat-A1 (f32) clears the bound under the pass-4 census fix and is NOT decision-grade", deviation)
         self.assertIn(
-            "for a reason other than this share bound: leg is INVALID: htsat-A1: some unrelated classify failure",
+            "(recorded reason: leg is INVALID: htsat-A1: some unrelated classify failure)",
             deviation,
         )
 
-    def test_recorded_bound_disagreeing_with_live_constant_refuses_the_build(self):
-        # The identity sidecar's own printed bound (and
-        # every htsat clause's own comparison) is sourced from THIS run's
-        # own recorded `decision_grade_reason` -- the live
+    def test_recorded_limit_disagreeing_with_live_constant_refuses_the_build(self):
+        # The identity sidecar's own printed bound (and every htsat
+        # clause's own comparison) is sourced from THIS run's own
+        # `attribution_report["limits"]` block -- the live
         # `UNATTRIBUTED_DECISION_GRADE_LIMIT` import is used ONLY to refuse
-        # the build if it has since MOVED away from the bound this run was
-        # actually judged against, never to silently re-judge the run.
-        def poison(attribution_report):
-            for row in attribution_report["legs"]:
-                if row["leg_id"] == "htsat-A2":
-                    row["decision_grade"] = False
-                    row["chains"]["UNATTRIBUTED"]["share_gpu_busy"] = 0.10
-                    row["decision_grade_reason"] = "UNATTRIBUTED share_gpu_busy=0.1000 > 0.05"
-
+        # the build if it has since MOVED away from the value this run
+        # actually recorded, never to silently re-judge the run.
         alt_root = Path(tempfile.mkdtemp(dir=str(self.root)))
-        fixture = _write_fixture(alt_root, attr_override=poison)
+        fixture = _write_fixture(alt_root)  # base fixture's limits == 0.05, unmodified
         original_limit = art._attribute_mod.UNATTRIBUTED_DECISION_GRADE_LIMIT
         art._attribute_mod.UNATTRIBUTED_DECISION_GRADE_LIMIT = 0.10  # moved from 0.05 since this run
         try:
@@ -610,23 +636,23 @@ class TemplatedDeviationTests(unittest.TestCase):
         finally:
             art._attribute_mod.UNATTRIBUTED_DECISION_GRADE_LIMIT = original_limit
         message = str(ctx.exception)
-        self.assertIn("UNATTRIBUTED_DECISION_GRADE_LIMIT", message)
+        self.assertIn("unattributed_decision_grade_limit", message)
         self.assertIn("0.1", message)
         self.assertIn("0.05", message)
         self.assertIn("moved since this run was measured", message)
 
-    def test_no_run_witness_falls_back_to_the_live_constant(self):
-        # The base fixture never records an over-bound `decision_grade_
-        # reason` on ANY leg (both htsat-A1 and htsat-A2 are decision-grade
-        # True) -- there is no run witness for `_resolve_unattributed_bound`
-        # to prefer over the live constant, and nothing for the live
-        # constant to disagree with either, so the build succeeds and the
-        # sidecar's own printed bound is the (only available) live value.
-        self.assertIsNone(art._recorded_unattributed_bound(self.fixture["attribution_report"]["legs"]))
-        self.assertEqual(
-            art._resolve_unattributed_bound(self.fixture["attribution_report"]["legs"]),
-            attribute_mod.UNATTRIBUTED_DECISION_GRADE_LIMIT,
-        )
+    def test_base_fixture_limits_match_the_live_constants(self):
+        # The base fixture's own `attribution_report["limits"]` block was
+        # built directly off `attribute_mod`'s live constants
+        # (`_write_fixture`) -- `_resolve_recorded_limits` returns exactly
+        # those values, and the top-level `report["limits"]` this same call
+        # feeds agrees with it.
+        expected = {
+            "unattributed_decision_grade_limit": attribute_mod.UNATTRIBUTED_DECISION_GRADE_LIMIT,
+            "unknown_kernel_share_limit": attribute_mod.UNKNOWN_KERNEL_SHARE_LIMIT,
+        }
+        self.assertEqual(art._resolve_recorded_limits(self.fixture["attribution_report"]), expected)
+        self.assertEqual(self.report["limits"], expected)
 
     def test_decision_grade_true_but_share_over_the_bound_is_impossible_and_refuses(self):
         # `decision_grade=True` while the SAME leg's own
@@ -852,62 +878,87 @@ class TemplatedDeviationTests(unittest.TestCase):
         self.assertIn("must be a list", str(ctx.exception))
 
 
-class RecordedUnattributedBoundUnitTests(unittest.TestCase):
-    """`_recorded_unattributed_bound`/`_resolve_unattributed_bound` in
-    isolation, off hand-built `attribution_legs` lists — no fixture, no
-    tempdir, no `build_report` — the mechanism a run's own recorded
-    `decision_grade_reason` strings are turned into "the" bound this run
-    was judged against."""
+class RecordedLimitUnitTests(unittest.TestCase):
+    """`_recorded_limit`/`_resolve_recorded_limits` in isolation, off
+    hand-built `attribution_report` dicts — no fixture, no tempdir, no
+    `build_report` — the mechanism a run's own recorded top-level `limits`
+    block is read (never a leg's own `decision_grade_reason` string, never
+    the live import directly)."""
 
-    def test_no_leg_recorded_a_reason_returns_none(self):
-        self.assertIsNone(art._recorded_unattributed_bound([]))
-        self.assertIsNone(
-            art._recorded_unattributed_bound([{"leg_id": "x", "decision_grade_reason": None}])
-        )
-        self.assertIsNone(
-            art._recorded_unattributed_bound([{"leg_id": "x", "decision_grade_reason": "leg is INVALID: reasons"}])
-        )
-
-    def test_single_witness_is_trusted(self):
-        legs = [{"leg_id": "htsat-A2", "decision_grade_reason": "UNATTRIBUTED share_gpu_busy=0.0566 > 0.05"}]
-        self.assertEqual(art._recorded_unattributed_bound(legs), 0.05)
-
-    def test_agreeing_witnesses_across_legs_are_trusted(self):
-        legs = [
-            {"leg_id": "clip-text-A2", "decision_grade_reason": "UNATTRIBUTED share_gpu_busy=0.0700 > 0.05"},
-            {"leg_id": "htsat-A2", "decision_grade_reason": "UNATTRIBUTED share_gpu_busy=0.0566 > 0.05"},
-        ]
-        self.assertEqual(art._recorded_unattributed_bound(legs), 0.05)
-
-    def test_disagreeing_witnesses_across_legs_refuse(self):
-        legs = [
-            {"leg_id": "clip-text-A2", "decision_grade_reason": "UNATTRIBUTED share_gpu_busy=0.0700 > 0.10"},
-            {"leg_id": "htsat-A2", "decision_grade_reason": "UNATTRIBUTED share_gpu_busy=0.0566 > 0.05"},
-        ]
+    def test_missing_limits_block_refuses_by_name(self):
         with self.assertRaises(art.ArtifactBuildError) as ctx:
-            art._recorded_unattributed_bound(legs)
-        self.assertIn("legs disagree on the UNATTRIBUTED validity bound", str(ctx.exception))
+            art._recorded_limit({}, "unattributed_decision_grade_limit", 0.05)
+        message = str(ctx.exception)
+        self.assertIn("no top-level 'limits' block", message)
+        self.assertIn("unattributed_decision_grade_limit", message)
 
-    def test_resolve_falls_back_to_live_constant_when_no_witness(self):
-        self.assertEqual(art._resolve_unattributed_bound([]), attribute_mod.UNATTRIBUTED_DECISION_GRADE_LIMIT)
-
-    def test_resolve_returns_recorded_value_when_it_agrees_with_the_live_constant(self):
-        legs = [{"leg_id": "htsat-A2", "decision_grade_reason": "UNATTRIBUTED share_gpu_busy=0.0566 > 0.05"}]
-        self.assertEqual(attribute_mod.UNATTRIBUTED_DECISION_GRADE_LIMIT, 0.05)
-        self.assertEqual(art._resolve_unattributed_bound(legs), 0.05)
-
-    def test_resolve_refuses_when_recorded_disagrees_with_the_live_constant(self):
-        # `attribute_mod.UNATTRIBUTED_DECISION_GRADE_LIMIT` is 0.05 (checked
-        # above); a run whose own recorded reason names a DIFFERENT bound
-        # (0.10, as if the live constant moved after this run was measured)
-        # must refuse rather than silently re-judge the run against 0.05.
-        legs = [{"leg_id": "htsat-A2", "decision_grade_reason": "UNATTRIBUTED share_gpu_busy=0.0700 > 0.10"}]
+    def test_missing_key_within_limits_refuses_by_name(self):
         with self.assertRaises(art.ArtifactBuildError) as ctx:
-            art._resolve_unattributed_bound(legs)
+            art._recorded_limit({"limits": {}}, "unattributed_decision_grade_limit", 0.05)
+        self.assertIn("carries no 'unattributed_decision_grade_limit' entry", str(ctx.exception))
+
+    def test_non_numeric_recorded_value_refuses(self):
+        report = {"limits": {"unattributed_decision_grade_limit": "5%"}}
+        with self.assertRaises(art.ArtifactBuildError) as ctx:
+            art._recorded_limit(report, "unattributed_decision_grade_limit", 0.05)
+        self.assertIn("is not a number", str(ctx.exception))
+
+    def test_bool_recorded_value_refuses(self):
+        # `isinstance(True, int)` is `True` in Python -- a bool masquerading
+        # as a numeric bound must still be refused, never silently coerced.
+        report = {"limits": {"unattributed_decision_grade_limit": True}}
+        with self.assertRaises(art.ArtifactBuildError) as ctx:
+            art._recorded_limit(report, "unattributed_decision_grade_limit", 0.05)
+        self.assertIn("is not a number", str(ctx.exception))
+
+    def test_recorded_value_agreeing_with_live_constant_is_trusted(self):
+        report = {"limits": {"unattributed_decision_grade_limit": 0.05}}
+        self.assertEqual(art._recorded_limit(report, "unattributed_decision_grade_limit", 0.05), 0.05)
+
+    def test_recorded_value_disagreeing_with_live_constant_refuses_naming_both(self):
+        report = {"limits": {"unattributed_decision_grade_limit": 0.05}}
+        with self.assertRaises(art.ArtifactBuildError) as ctx:
+            art._recorded_limit(report, "unattributed_decision_grade_limit", 0.10)
         message = str(ctx.exception)
         self.assertIn("0.1", message)
         self.assertIn("0.05", message)
         self.assertIn("moved since this run was measured", message)
+
+    def test_resolve_recorded_limits_returns_both_named_keys(self):
+        report = {"limits": {"unattributed_decision_grade_limit": 0.05, "unknown_kernel_share_limit": 0.01}}
+        self.assertEqual(
+            art._resolve_recorded_limits(report),
+            {"unattributed_decision_grade_limit": 0.05, "unknown_kernel_share_limit": 0.01},
+        )
+
+    def test_resolve_recorded_limits_refuses_when_either_key_is_missing(self):
+        report = {"limits": {"unattributed_decision_grade_limit": 0.05}}
+        with self.assertRaises(art.ArtifactBuildError) as ctx:
+            art._resolve_recorded_limits(report)
+        self.assertIn("unknown_kernel_share_limit", str(ctx.exception))
+
+
+class FormatRecordedBoundPctTests(unittest.TestCase):
+    """`_format_recorded_bound_pct` prints a recorded bound EXACTLY, never a
+    fixed `.0f`/`.2f` spec — the mechanism, not one committed number."""
+
+    def test_round_number_prints_without_a_decimal(self):
+        self.assertEqual(art._format_recorded_bound_pct(5.0), "5%")
+        self.assertEqual(art._format_recorded_bound_pct(1.0), "1%")
+
+    def test_non_round_number_prints_exactly(self):
+        self.assertEqual(art._format_recorded_bound_pct(5.5), "5.5%")
+
+    def test_float_noise_from_ordinary_arithmetic_is_absorbed(self):
+        # `0.055 * 100.0` is exactly `5.5` in IEEE double (checked here as
+        # the independent oracle, never assumed) -- this formatter must
+        # still print `"5.5%"`, never invent trailing float-noise digits.
+        value = 0.055 * 100.0
+        self.assertEqual(value, 5.5)
+        self.assertEqual(art._format_recorded_bound_pct(value), "5.5%")
+
+    def test_zero_prints_as_zero_percent(self):
+        self.assertEqual(art._format_recorded_bound_pct(0.0), "0%")
 
 
 class IdentitySidecarNoBareMeasurementTests(unittest.TestCase):

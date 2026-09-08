@@ -799,6 +799,27 @@ def _htsat_a1_named_not_decision_grade(artifact: dict) -> list[dict]:
     ]
 
 
+def _artifact_limit(artifact: dict, key: str) -> float:
+    """The named validity-gate bound this ARTIFACT's own top-level `limits`
+    block recorded (`profile_421_attribute.py`'s live constant, stamped at
+    report-build time and cross-checked there against that same live
+    constant -- `profile_421_artifact.py`'s own `_recorded_limit`) -- the
+    ONE source every renderer in this module reads a bound from. Refuses
+    BY NAME if `limits` (or `key` within it) is absent, never a hard-coded
+    literal and never re-parsed out of some leg's own `decision_grade_
+    reason` string (a leg that never failed, or failed for an unrelated
+    reason, carries no such string to parse a bound out of)."""
+    limits = artifact.get("limits")
+    if not isinstance(limits, dict):
+        raise ValueError(f"artifact carries no top-level 'limits' block (needed for {key!r})")
+    if key not in limits:
+        raise ValueError(f"artifact's own 'limits' block carries no {key!r} entry")
+    value = limits[key]
+    if not isinstance(value, (int, float)) or isinstance(value, bool):
+        raise ValueError(f"artifact limits[{key!r}] is not a number ({value!r})")
+    return float(value)
+
+
 def render_htsat_a2_deviation(artifact: dict) -> str:
     """The Deviations bullet naming `htsat-A2`'s own UNATTRIBUTED share of
     GPU busy. Every number AND word this bullet's fixed prose needs is read
@@ -811,17 +832,25 @@ def render_htsat_a2_deviation(artifact: dict) -> str:
     - the "not decision-grade" phrase from `attribution[htsat-A2].
       decision_grade` itself (never a hard-coded negation baked in ahead of
       the check);
-    - the comparison word ("over") and the "N % validity bound" by PARSING
-      `attribution[htsat-A2].decision_grade_reason` (`profile_421_attribute.
-      py`'s own `leg_decision_grade` writes this exact
-      `"UNATTRIBUTED share_gpu_busy=<share> > <bound>"` string into the
-      artifact at run time) -- cross-checked against the same leg's own
-      `chains.UNATTRIBUTED.share_gpu_busy` (the two must agree) and against
-      an ACTUAL `>` comparison of the two floats (never assumed "over"
-      because that is the only branch this bullet has ever seen); a `<`/`=`
-      artifact, or a `decision_grade_reason` that is not this exact shape
-      (e.g. a non-finite-share refusal), fails this renderer CLOSED rather
-      than silently keep saying "over";
+    - the "N % validity bound" from the artifact's OWN top-level `limits.
+      unattributed_decision_grade_limit` block (`profile_421_attribute.py`'s
+      `build_report` stamps this at report-build time, cross-checked there
+      against its own live constant) -- refused BY NAME if `limits` (or the
+      key) is absent, never a hard-coded literal and never re-parsed out of
+      a `decision_grade_reason` string, which a leg failing for an
+      unrelated reason would not even carry; the comparison word ("over")
+      is still an ACTUAL `>` comparison of `attribution[htsat-A2].chains.
+      UNATTRIBUTED.share_gpu_busy` against that SAME artifact-sourced
+      bound. `attribution[htsat-A2].decision_grade_reason` is still PARSED
+      (`profile_421_attribute.py`'s own `leg_decision_grade` writes the
+      exact `"UNATTRIBUTED share_gpu_busy=<share> > <bound>"` string) for a
+      SECOND, independent copy of `share`, cross-checked against `chains.
+      UNATTRIBUTED.share_gpu_busy` (the two must agree); a `decision_grade_
+      reason` that is not this exact shape (e.g. a non-finite-share
+      refusal), or a share that does not actually clear/exceed the
+      artifact's own bound in the direction this bullet's fixed prose
+      asserts, fails this renderer CLOSED rather than silently keep saying
+      "over";
     - the `htsat-A1` clause off `attribution[htsat-A1]` itself
       (`decision_grade` for the True/False branch, `chains.UNATTRIBUTED.
       share_gpu_busy` to verify it ACTUALLY clears the same bound before
@@ -859,10 +888,11 @@ def render_htsat_a2_deviation(artifact: dict) -> str:
         raise ValueError(
             f"htsat-A2 decision_grade_reason {reason!r} is not the "
             "'UNATTRIBUTED share_gpu_busy=<share> > <bound>' shape this bullet's own "
-            "comparison and bound are parsed from -- rewrite this renderer (and the bullet) "
+            "comparison is cross-checked against -- rewrite this renderer (and the bullet) "
             "if the failing rule (or its reason string) changed"
         )
-    reason_share, bound = float(match.group(1)), float(match.group(2))
+    reason_share = float(match.group(1))
+    bound = _artifact_limit(artifact, "unattributed_decision_grade_limit")
     if round(reason_share, 4) != round(a2_share, 4):
         raise ValueError(
             f"htsat-A2 decision_grade_reason share ({reason_share!r}) disagrees with the same "

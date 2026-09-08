@@ -1161,11 +1161,14 @@ _FENCE_RE = re.compile(r"^(?:```|~~~)")
 
 def _non_fenced_lines(lines: list[str]):
     """Yield each line of `lines` that lies OUTSIDE a ``` / ~~~ fenced
-    code block -- a fence toggles a skip-state, so a marker- or
-    heading-shaped line quoted as an EXAMPLE inside a fence is never
-    mistaken for the document's own declared frozen marker or title.
-    Shared by every arm of `_is_frozen_contract_file`'s marker scan so no
-    arm can be fence-blind while another is fence-aware."""
+    code block -- a fence toggles a skip-state, so a heading-shaped line
+    quoted as an EXAMPLE inside a fence is never mistaken for the
+    document's own title. Used by `_is_frozen_contract_file`'s HEADING arm
+    only -- the comment-marker arm deliberately scans the raw, un-toggled
+    window instead (see that function's own "Fences apply to the heading
+    arm only" doc section: a fence that opens but never closes again
+    inside the truncated search window would otherwise leave `in_fence`
+    stuck `True` for the rest of it, silently swallowing a REAL marker)."""
     in_fence = False
     for line in lines:
         stripped = line.lstrip()
@@ -1201,30 +1204,46 @@ def _is_frozen_contract_file(path: Path, text: str) -> bool:
         filename arm alone would miss. Either marker shape is sufficient on
         its own:
 
-        - `_FROZEN_MARKER_COMMENT_RE` matches anywhere in the window,
-          OUTSIDE a fenced code block (the `<!-- Frozen ledger ts: ... -->`
-          HTML comment this plan group's own freeze convention opens every
-          frozen file with; a comment-shaped line quoted as an EXAMPLE
-          inside a fence is never mistaken for the document's own declared
-          marker); or
-        - the FIRST `#`-prefixed heading line in that same window, also
-          OUTSIDE a fenced code block (a heading-shaped line quoted as an
-          EXAMPLE inside a fence is never mistaken for this document's own
-          title), if its text matches `_FROZEN_HEADING_WORD_RE` ("contract"
-          or "frozen", case-insensitive). A LATER heading is never
-          consulted once the first non-fenced one is found -- whether or
-          not it matches -- so a document whose first heading is unrelated
-          (a companion `README.md` titled "66 — tower profile close-out")
-          is never accidentally caught by some deeper section heading that
+        - `_FROZEN_MARKER_COMMENT_RE` matches anywhere in the RAW window
+          (the `<!-- Frozen ledger ts: ... -->` HTML comment this plan
+          group's own freeze convention opens every frozen file with) --
+          deliberately NOT fence-aware, unlike the heading arm below (see
+          "Fences apply to the heading arm only" below); or
+        - the FIRST `#`-prefixed heading line in that same window, OUTSIDE
+          a fenced code block (a heading-shaped line quoted as an EXAMPLE
+          inside a fence is never mistaken for this document's own title),
+          if its text matches `_FROZEN_HEADING_WORD_RE` ("contract" or
+          "frozen", case-insensitive). A LATER heading is never consulted
+          once the first non-fenced one is found -- whether or not it
+          matches -- so a document whose first heading is unrelated (a
+          companion `README.md` titled "66 — tower profile close-out") is
+          never accidentally caught by some deeper section heading that
           happens to mention either word.
 
-        Both arms share the SAME `_non_fenced_lines` fence-tracking scan
-        (a ``` / ~~~ fence toggles a skip-state) -- one arm scanning the
-        raw window while the other skips fenced lines would let a doc
-        that merely QUOTES the frozen-comment convention inside a fence
-        get recognized as itself frozen, exactly the false positive the
-        heading arm's own fence-awareness already rules out for a quoted
-        heading.
+        Fences apply to the HEADING arm only. The comment-marker arm scans
+        the RAW window, unconditionally, because the two arms' failure
+        modes are not symmetric: `_non_fenced_lines` tracks fence state by
+        scanning ONLY the truncated `window` slice, so a fence that OPENS
+        but never CLOSES again before the window ends (its real closing
+        fence sits past `_CITATIONS_EPOCH_HEADER_SEARCH_LINES`, or the
+        window simply cuts a long example block in half) leaves `in_fence`
+        stuck `True` for the rest of the window -- silently swallowing a
+        REAL, later marker on this file's own opening lines and reading a
+        genuinely frozen file as NOT frozen. That is exactly the "never-
+        checked reads as checked-clean" failure this whole function exists
+        to rule out, and it is a strictly worse outcome than the comment
+        arm's own false-positive risk (a doc that quotes the marker
+        convention inside a fully-closed fence, with no other marker or
+        heading anywhere in the window, now IS treated as frozen and must
+        declare a `citations-resolve-at:` header it did not need before) --
+        an over-eager epoch-pin requirement on an unrelated doc is a
+        trivial, loud, easily-fixed false alarm; a silently un-pinned
+        frozen contract is not. The heading arm keeps its own fence
+        awareness because an ordinary markdown heading is a far more
+        common shape to appear, unquoted, inside someone else's fenced
+        example (e.g. "here's what a contract's own opening heading looks
+        like: `` ```\n# CONTRACT\n``` ``) than the far more distinctive,
+        deliberate `<!-- Frozen ... -->` HTML-comment shape is.
 
     Deliberately NARROWER than `_plan_contract_scope`: a plan group's
     OTHER `.md` files (a close-out `README.md` discussing or quoting the
@@ -1251,7 +1270,9 @@ def _is_frozen_contract_file(path: Path, text: str) -> bool:
     if path.name == "CONTRACT.md":
         return True
     window = text.splitlines()[:_CITATIONS_EPOCH_HEADER_SEARCH_LINES]
-    for line in _non_fenced_lines(window):
+    # RAW window, deliberately never `_non_fenced_lines(window)` -- see this
+    # function's own "Fences apply to the heading arm only" doc section.
+    for line in window:
         if _FROZEN_MARKER_COMMENT_RE.search(line):
             return True
     for line in _non_fenced_lines(window):

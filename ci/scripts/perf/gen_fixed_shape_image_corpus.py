@@ -83,14 +83,24 @@ Usage:
       [--families F] [--instances-per-family I] [--jitter J]
       [--jsonl-name NAME]
       [--heldout-rows N --heldout-batch B [--heldout-families F]]
+      [--pool-cache-dir DIR]
 
-Hermetic: no network, writes only under `--out-dir`.
+Hermetic: no network, writes only under `--out-dir` (and, only when
+`--pool-cache-dir` is explicitly given, under that path too).
+
+`--pool-cache-dir` (opt-in, default unset -- see that flag's own help):
+lets many invocations sharing one `(--families, --instances-per-family,
+--size, --jitter, --seed)` tuple synthesize the image pool ONCE instead of
+once per invocation, with byte-identical output either way. A real leg
+sweep never sets this; it exists for a test harness driving ~dozens of
+hermetic invocations of this producer at the same pool shape.
 """
 
 from __future__ import annotations
 
 import argparse
 import binascii
+import hashlib
 import json
 import math
 import random
@@ -341,6 +351,209 @@ def validate_heldout_split(
     return train_families
 
 
+def _build_pool(
+    families: int, instances_per_family: int, size: int, jitter: int, seed: int
+) -> dict[str, bytes]:
+    """The family x instances image pool -- a pure function of exactly
+    these five arguments (never `--rows`/`--heldout-*`/`--out-dir`/
+    `--jsonl-name`), which is what makes it safe to cache: any invocation
+    sharing this tuple, whatever it asks for downstream, gets the
+    byte-identical pool this same code would have built inline. Factored
+    out of `generate_split` so the cached and uncached paths run the
+    EXACT SAME construction, never two implementations that could drift
+    apart."""
+    rng = random.Random(seed)
+    files: dict[str, bytes] = {}
+    for family in range(families):
+        template = _family_template(family, size)
+        for instance in range(instances_per_family):
+            pixels = _jittered(template, rng, jitter)
+            files[_image_name(family, instance)] = encode_png(size, size, pixels)
+    return files
+
+
+# The ONLY five arguments `_build_pool` reads, in the ONE order every
+# consumer below iterates them in -- `_pool_cache_key`'s canonical string,
+# `_pool_marker_text`/`_parse_pool_marker`'s marker fields, and
+# `test_gen_fixed_shape_image_corpus.py::PoolCacheKeyDeterminantTests`'s own
+# test loop are all GENERATED from this one tuple rather than each
+# hand-copying the field list: a determinant added here without also being
+# threaded into `_pool_cache_key`'s call to `_pool_key_values` (or the
+# reverse) is refused BY NAME at the very next call (see `_pool_key_values`),
+# never silently under- or over-counted.
+POOL_KEY_DETERMINANTS: tuple[str, ...] = (
+    "families",
+    "instances_per_family",
+    "size",
+    "jitter",
+    "seed",
+)
+
+
+def _pool_key_values(**kwargs: int) -> dict[str, int]:
+    """Validates `kwargs`' key set against `POOL_KEY_DETERMINANTS` --
+    exactly, in BOTH directions -- before returning it unchanged: a
+    determinant `POOL_KEY_DETERMINANTS` names that `kwargs` does not
+    carry, or a `kwargs` entry `POOL_KEY_DETERMINANTS` does not name, is
+    refused BY NAME rather than silently under- or over-counted. Both
+    `_pool_cache_key` and `_pool_marker_text` route every call through
+    this one gate, so a producer signature that grows a new argument
+    without also adding it to `POOL_KEY_DETERMINANTS` (or vice versa) is
+    caught at the very next call, never left to a cache key that silently
+    ignores the new determinant."""
+    have = set(kwargs)
+    want = set(POOL_KEY_DETERMINANTS)
+    if have != want:
+        raise KeyError(
+            f"pool-cache determinant mismatch: caller supplied {sorted(have)}, "
+            f"POOL_KEY_DETERMINANTS names {sorted(want)} -- "
+            f"missing {sorted(want - have)}, unexpected {sorted(have - want)}"
+        )
+    return kwargs
+
+
+def _pool_cache_key(
+    families: int, instances_per_family: int, size: int, jitter: int, seed: int
+) -> str:
+    """Filesystem-safe cache key: a sha256 of the producer MODULE'S OWN
+    SOURCE BYTES (`Path(__file__).read_bytes()` -- the WHOLE file on disk)
+    folded together with every `POOL_KEY_DETERMINANTS` argument and the
+    interpreter's `(major, minor)` version.
+
+    Two module states on disk that differ by even one byte hash to two
+    different keys, by construction: nothing about the file is walked,
+    parsed, or classified, so there is no enumeration of "the functions
+    that matter" to get wrong. The key is intentionally MAXIMAL -- an
+    on-disk edit to ANY line of this module (a helper this call never
+    reaches, a constant, a comment, even the module docstring) moves the
+    key and costs one extra pool regeneration (seconds, in a test-only
+    cache).
+
+    Scope of the "no false cache hit" guarantee: it covers this file's
+    bytes and the `POOL_KEY_DETERMINANTS` arguments above, nothing else. A
+    determinant of the bytes `_build_pool` produces that lives OUTSIDE this
+    file and these arguments -- the zlib the interpreter links against, a
+    different CPython implementation entirely -- is not folded into this
+    key. That is safe only because `--pool-cache-dir` is per-process (the
+    caller allocates it via `tempfile.mkdtemp` and tears it down at
+    process exit -- see `test_profile_421_legs_dry_run.py`) and is
+    refused outside `DRY_RUN` (`profile_421_legs.sh`'s own
+    `POOL_CACHE_ARGS` guard): one invoking process, one interpreter, one
+    platform, per cache directory, so there is never a second environment
+    sharing that directory to collide against. `sys.version_info[:2]` is
+    included anyway because the interpreter that runs `_build_pool` is as
+    much a part of "what produced these bytes" as the source is, and it is
+    the one such determinant this module can read directly."""
+    values = _pool_key_values(
+        families=families, instances_per_family=instances_per_family, size=size, jitter=jitter, seed=seed
+    )
+    module_bytes = Path(__file__).read_bytes()
+    parts = [
+        f"module_sha256={hashlib.sha256(module_bytes).hexdigest()}",
+        f"py={sys.version_info[0]}.{sys.version_info[1]}",
+    ]
+    parts += [f"{name}={values[name]}" for name in POOL_KEY_DETERMINANTS]
+    canonical = "|".join(parts)
+    return hashlib.sha256(canonical.encode("utf-8")).hexdigest()[:32]
+
+
+_POOL_CACHE_DONE_MARKER = "_DONE"
+
+
+def _pool_marker_text(families: int, instances_per_family: int, size: int, jitter: int, seed: int) -> str:
+    """The `_DONE` marker's own recorded-shape line -- the single
+    definition [`_load_or_build_pool`] both WRITES on a cache miss and
+    PARSES (via [`_parse_pool_marker`]) on a cache hit, so the two can
+    never independently drift on the field set or the format. Built from
+    the SAME `POOL_KEY_DETERMINANTS` tuple `_pool_cache_key` iterates, via
+    the SAME `_pool_key_values` gate, so the marker's own field set can
+    never drift from the cache key's."""
+    values = _pool_key_values(
+        families=families, instances_per_family=instances_per_family, size=size, jitter=jitter, seed=seed
+    )
+    return " ".join(f"{name}={values[name]}" for name in POOL_KEY_DETERMINANTS) + "\n"
+
+
+def _parse_pool_marker(text: str) -> dict[str, int]:
+    """Inverse of [`_pool_marker_text`]: `"families=4
+    instances_per_family=3 ..."` -> `{"families": 4,
+    "instances_per_family": 3, ...}`. Refuses (never guesses) on a
+    marker that does not carry exactly the expected `key=int` tokens, so a
+    hand-edited or truncated marker cannot be silently misread as a shape
+    that happens to compare unequal-but-plausible."""
+    fields: dict[str, int] = {}
+    for token in text.split():
+        key, sep, value = token.partition("=")
+        if not sep or key in fields:
+            raise ValueError(f"malformed or duplicate pool marker field {token!r} in {text!r}")
+        fields[key] = int(value)
+    return fields
+
+
+def _load_or_build_pool(
+    pool_cache_dir: Path | None,
+    families: int,
+    instances_per_family: int,
+    size: int,
+    jitter: int,
+    seed: int,
+) -> dict[str, bytes]:
+    """[`_build_pool`] straight through when `pool_cache_dir` is `None`
+    (real runs never set it -- see module doc's `--pool-cache-dir`) --
+    IDENTICAL bytes to every invocation with `pool_cache_dir` set. With a
+    cache dir given: a cache HIT reads every expected file straight off
+    disk (never re-runs the pixel loop) -- but ONLY after re-checking the
+    `_DONE` marker's own recorded shape against the shape THIS call was
+    asked for; a cache MISS builds the pool once via `_build_pool`, writes
+    it into a fresh per-key subdirectory, and only then drops the `_DONE`
+    marker that makes it visible to a later hit -- so a process that dies
+    mid-write leaves an incomplete (marker-less) subdirectory that the
+    NEXT invocation rebuilds from scratch, rather than one that reads back
+    a partial pool.
+
+    The marker re-check is belt-and-braces at the point of use: `key`
+    already identifies the requested shape uniquely (see
+    `_pool_cache_key`'s own doc), so under that key's own guarantee the
+    marker recorded under `cache_dir` can only ever describe THIS shape.
+    Re-deriving the requested shape from the call's own arguments and
+    comparing it, BY NAME, against what the marker actually recorded costs
+    one dict comparison and catches, at the read site itself, any way a
+    directory could come to hold a marker for a shape other than the one
+    being asked for -- rather than trusting the key's uniqueness silently.
+    """
+    if pool_cache_dir is None:
+        return _build_pool(families, instances_per_family, size, jitter, seed)
+
+    key = _pool_cache_key(families, instances_per_family, size, jitter, seed)
+    cache_dir = Path(pool_cache_dir) / key
+    marker = cache_dir / _POOL_CACHE_DONE_MARKER
+    expected_names = [
+        _image_name(family, instance)
+        for family in range(families)
+        for instance in range(instances_per_family)
+    ]
+    if marker.is_file():
+        recorded = _parse_pool_marker(marker.read_text())
+        requested = _parse_pool_marker(
+            _pool_marker_text(families, instances_per_family, size, jitter, seed)
+        )
+        if recorded != requested:
+            raise ValueError(
+                f"pool cache dir {cache_dir} is marked done for shape {recorded} but this call "
+                f"requested shape {requested} under the SAME cache key {key!r} -- refusing to "
+                "return a pool that may not match the requested shape rather than trusting the "
+                "cache key's uniqueness silently"
+            )
+        return {name: (cache_dir / name).read_bytes() for name in expected_names}
+
+    files = _build_pool(families, instances_per_family, size, jitter, seed)
+    cache_dir.mkdir(parents=True, exist_ok=True)
+    for name, data in files.items():
+        (cache_dir / name).write_bytes(data)
+    marker.write_text(_pool_marker_text(families, instances_per_family, size, jitter, seed))
+    return files
+
+
 def generate_corpus(
     rows: int,
     size: int,
@@ -375,6 +588,7 @@ def generate_split(
     heldout_rows: int = 0,
     heldout_families: int = _DEFAULT_HELDOUT_FAMILIES,
     heldout_batch: int | None = None,
+    pool_cache_dir: Path | None = None,
 ) -> tuple[dict[str, bytes], list[dict], list[dict]]:
     """Build the whole corpus in memory: `(files, rows, heldout_rows_list)`
     where `files` maps a relative file name to its PNG bytes, `rows` is the
@@ -382,7 +596,11 @@ def generate_split(
     (EMPTY unless `heldout_rows > 0`).
 
     Pure with respect to its arguments -- no filesystem, no clock, no
-    environment -- so determinism is testable without writing anything.
+    environment -- so determinism is testable without writing anything --
+    UNLESS `pool_cache_dir` is given (opt-in only; every real invocation
+    leaves it `None`), in which case the image POOL (never the row lists)
+    is read from or written to that directory (see `_load_or_build_pool`)
+    but the RETURNED bytes are, by construction, identical either way.
     """
     if rows <= 0:
         raise ValueError(f"--rows must be positive, got {rows}")
@@ -413,16 +631,13 @@ def generate_split(
             families, heldout_families, heldout_rows, heldout_batch
         )
 
-    rng = random.Random(seed)
     # Fixed draw order: family-major, instance-minor. Every later draw
     # depends only on the draws before it, so a larger `--instances-per-family`
-    # run reproduces a smaller one's earlier images exactly.
-    files: dict[str, bytes] = {}
-    for family in range(families):
-        template = _family_template(family, size)
-        for instance in range(instances_per_family):
-            pixels = _jittered(template, rng, jitter)
-            files[_image_name(family, instance)] = encode_png(size, size, pixels)
+    # run reproduces a smaller one's earlier images exactly. `_build_pool`
+    # is the SAME function whether or not `pool_cache_dir` is given (see
+    # `_load_or_build_pool`'s own doc) -- caching can only skip re-running
+    # this construction, never change what it would have produced.
+    files = _load_or_build_pool(pool_cache_dir, families, instances_per_family, size, jitter, seed)
 
     out_rows = _build_rows(rows, seed, train_families, instances_per_family, 0, "")
     heldout_out_rows: list[dict] = []
@@ -521,6 +736,23 @@ def main(argv: list[str] | None = None) -> int:
         help="required alongside --heldout-rows: the --batch the consuming finetune-run leg "
         "will use, which the held-out row count must be a nonzero multiple of",
     )
+    ap.add_argument(
+        "--pool-cache-dir",
+        type=Path,
+        default=None,
+        help="OPT-IN (default: unset). When given, the family x instances image POOL -- a "
+        "pure function of (--families, --instances-per-family, --size, --jitter, --seed) that "
+        "never depends on --rows/--heldout-*/--out-dir -- is read from (or, on a first call, "
+        "written to) a per-key subdirectory of this path instead of being re-encoded on every "
+        "invocation. The cache key covers this WHOLE producer file's own source bytes (a "
+        "sha256 of Path(__file__).read_bytes(), plus the interpreter's (major, minor) version "
+        "and the pool-shape arguments above), so any on-disk edit to this module -- not only "
+        "one that touches _build_pool's own call graph -- forces a fresh pool build. Emitted "
+        "bytes are byte-identical with or without this flag (see "
+        "test_gen_fixed_shape_image_corpus.py); real runs never set it -- it exists ONLY to let "
+        "a test harness synthesize a shared pool once across many invocations of this producer "
+        "at the same (families, instances, size, jitter, seed) tuple.",
+    )
     args = ap.parse_args(argv)
 
     try:
@@ -534,6 +766,7 @@ def main(argv: list[str] | None = None) -> int:
             heldout_rows=args.heldout_rows,
             heldout_families=args.heldout_families,
             heldout_batch=args.heldout_batch,
+            pool_cache_dir=args.pool_cache_dir,
         )
     except ValueError as e:
         print(f"::error::gen_fixed_shape_image_corpus: {e}", file=sys.stderr)

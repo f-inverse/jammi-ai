@@ -118,6 +118,18 @@
 #                                    honours the same var over ITS OWN path
 #                                    names (train_jsonl/heldout_ids/
 #                                    heldout_jsonl -- P2 has no M run).
+#   PROFILE_421_LEGS_DRY_RUN_POOL_CACHE_DIR
+#                                    TEST-ONLY (never set by a real run;
+#                                    REFUSED at preflight, exit 2, unless
+#                                    PROFILE_421_LEGS_DRY_RUN=1 is also set):
+#                                    a suite-level tempdir a test harness
+#                                    owns, passed straight through to the
+#                                    media corpus producers' own
+#                                    `--pool-cache-dir` so their fixed family
+#                                    x instances pool synthesizes once
+#                                    across many hermetic subprocess
+#                                    invocations of this whole script,
+#                                    byte-identical either way.
 #   PROFILE_421_P2_BF16              "1" runs the BF16 PRE-FLIGHT MODE
 #                                    (contract "## P2" / v2.3 §D4 item 4)
 #                                    instead of the 12-leg sweep, and exits:
@@ -263,6 +275,22 @@ if [ -n "${PROFILE_421_LEGS_DRY_RUN_TRUNCATE_CORPUS_VAR:-}" ] && [ "$PROFILE_421
   exit 2
 fi
 
+# `PROFILE_421_LEGS_DRY_RUN_POOL_CACHE_DIR` is named INTO the
+# `*_DRY_RUN_*` knob class, exactly like
+# `PROFILE_421_LEGS_DRY_RUN_TRUNCATE_CORPUS_VAR` above -- a real leg sweep
+# must never set it either. It is a TEST-ONLY lever: a test
+# harness driving MANY separate subprocess invocations of this whole script
+# sets it to a suite-level tempdir so the media producers' `--pool-cache-dir`
+# can synthesize their fixed family x instances pool once and read it back
+# on every later call (see `POOL_CACHE_ARGS` below). Same refusal posture as
+# the truncate-corpus lever just above, for the same reason: this refuses
+# LOUDLY, by name, before any leg runs, rather than trusting every future
+# caller to remember the DRY_RUN convention.
+if [ -n "${PROFILE_421_LEGS_DRY_RUN_POOL_CACHE_DIR:-}" ] && [ "$PROFILE_421_LEGS_DRY_RUN" != "1" ]; then
+  echo "::error::PROFILE_421_LEGS_DRY_RUN_POOL_CACHE_DIR is set ('$PROFILE_421_LEGS_DRY_RUN_POOL_CACHE_DIR') without PROFILE_421_LEGS_DRY_RUN=1 -- refusing before any leg runs. This lever is TEST-ONLY: it exists so a hermetic test harness can cache the media producers' fixed pool across many subprocess invocations of this script, and a real leg sweep must always synthesize its own pool fresh. Unset it, or set PROFILE_421_LEGS_DRY_RUN=1, before running this driver." >&2
+  exit 2
+fi
+
 mkdir -p "$OUT_DIR"
 
 if [ "$PROFILE_421_LEGS_DRY_RUN" != "1" ]; then
@@ -300,23 +328,8 @@ _print_cmd() {
   printf '\n' >&2
 }
 
-# --- state-changing command wrapper: echoes what it would run (stderr);
-# under DRY_RUN never executes. Used for invocations that need `$NSYS_BIN`/
-# `$BENCH_BIN` or otherwise cannot run hermetically (`kernel_census.py`,
-# which reads a real `nsys`-exported sqlite that only exists on a real
-# run). Corpus generation uses `run_corpus_cmd` below instead -- see
-# esc-088. `run_traced`'s own nsys/bench invocation does NOT go through
-# either wrapper.
-run_cmd() {
-  _print_cmd "$@"
-  if [ "$PROFILE_421_LEGS_DRY_RUN" = "1" ]; then
-    return 0
-  fi
-  "$@"
-}
-
-# --- corpus-producer wrapper: unlike `run_cmd`, this ALWAYS executes, even
-# under `PROFILE_421_LEGS_DRY_RUN=1` -- the three corpus producers
+# --- corpus-producer wrapper: ALWAYS executes, even under
+# `PROFILE_421_LEGS_DRY_RUN=1` -- the three corpus producers
 # (`gen_fixed_width_corpus.py` and the two media producers) are CPU-
 # hermetic (no GPU, no network, no `$NSYS_BIN`/`$BENCH_BIN`) and cheap: each
 # writes a FIXED family x instances-per-family media pool regardless of
@@ -338,6 +351,31 @@ run_corpus_cmd() {
   _print_cmd "$@"
   "$@" >&2
 }
+
+# --- media pool cache (esc-088 round-4, hermetic dry-run suite runtime):
+# OPT-IN, unset by every real leg sweep. `gen_fixed_shape_image_corpus.py`/
+# `gen_fixed_length_audio_corpus.py` each synthesize a FIXED family x
+# instances media pool per invocation regardless of `--rows` -- this
+# driver alone calls them ~10 times per full sweep, and a test harness
+# driving MANY separate subprocess invocations of this whole script (one
+# per test method) multiplies that further. `--pool-cache-dir` (those
+# producers' own flag) makes that pool synthesize once and be read back
+# off disk on every later call sharing its `(families, instances, size or
+# seconds/sample-rate, jitter, seed)` tuple -- byte-identical either way
+# (see each producer's own `PoolCacheTests`). A test harness sets
+# `PROFILE_421_LEGS_DRY_RUN_POOL_CACHE_DIR` to a SUITE-LEVEL tempdir it owns; a
+# real run never sets it, so `POOL_CACHE_ARGS` stays empty and every media
+# call below is byte-for-byte what it always was. Read ONLY inside the
+# `PROFILE_421_LEGS_DRY_RUN=1` region -- belt-and-suspenders alongside the
+# preflight refusal above (which already exits before this line is ever
+# reached on a non-dry invocation): the `*_DRY_RUN_*` knob class this lever
+# was renamed into is a structural conjunct on `PROFILE_421_LEGS_DRY_RUN`,
+# never a bare env lookup a future refactor could accidentally move above
+# the preflight check.
+POOL_CACHE_ARGS=()
+if [ "$PROFILE_421_LEGS_DRY_RUN" = "1" ] && [ -n "${PROFILE_421_LEGS_DRY_RUN_POOL_CACHE_DIR:-}" ]; then
+  POOL_CACHE_ARGS=(--pool-cache-dir "$PROFILE_421_LEGS_DRY_RUN_POOL_CACHE_DIR")
+fi
 
 # --- provenance cross-check (unification contract C5.1): refuse BEFORE any
 # leg runs if the binary's own baked identity does not match this checkout.
@@ -581,6 +619,15 @@ fi
 
 GOLDEN_FIXTURE="$REPO_ROOT/ci/scripts/perf/fixtures/finetune_run_golden/bert_fused.json"
 
+# esc-088 round-4 advisory: a committed, schema-valid nsys sqlite export
+# pair (`gen_nsys_kernel_fixture.py`'s own doc) -- exported into the
+# environment so the single-quoted `fake_nsys.sh` heredoc below (which
+# must NOT shell-expand `$1`/`$a`/etc. at HEREDOC-WRITE time) can still
+# read this path at the stub's own RUN time, from its inherited
+# environment.
+NSYS_KERNEL_FIXTURE_DIR="$DIR/fixtures/nsys_kernel_census"
+export NSYS_KERNEL_FIXTURE_DIR
+
 # Hermetic fake nsys/bench stand-ins, used ONLY under DRY_RUN -- generated
 # ONCE, reused for every leg, so the DRY_RUN sweep drives the EXACT SAME
 # capture path (the exec-wrapper, the stderr redirect, the post-write
@@ -607,7 +654,26 @@ if [ "$1" = "export" ]; then
     esac
   done
   echo "fake_nsys: export writing to '$out' (more stdout noise)"
-  if [ -n "$out" ]; then : > "$out"; fi
+  # esc-088 round-4: copy a REAL, committed, schema-valid nsys sqlite
+  # export fixture into place -- `run_traced` (this script's ONLY export
+  # call site) always names its two exports `.../run_n.sqlite` and
+  # `.../run_m.sqlite`, so the suffix alone unambiguously selects which
+  # fixture is the N-step (fewer launches) vs M-step (more launches) half
+  # of the pair `kernel_census.py` needs. Never touch-empty: a touch-empty
+  # `$out` means `kernel_census.py` refuses on a missing-kernel-table
+  # (or, run via a no-op wrapper, never runs at all) -- either way NO
+  # producer stdout/behaviour is ever exercised, which is exactly the
+  # esc-088 class this closes.
+  if [ -n "$out" ]; then
+    case "$out" in
+      *run_n.sqlite) cp "$NSYS_KERNEL_FIXTURE_DIR/n.sqlite" "$out" ;;
+      *run_m.sqlite) cp "$NSYS_KERNEL_FIXTURE_DIR/m.sqlite" "$out" ;;
+      *)
+        echo "fake_nsys: export target '$out' does not match *run_n.sqlite or *run_m.sqlite -- refusing rather than touch-emptying it silently" >&2
+        exit 1
+        ;;
+    esac
+  fi
   exit 0
 fi
 if [ "$1" = "profile" ]; then
@@ -999,7 +1065,7 @@ run_traced() {
 # for a producer's own report to land on -- structural, not a per-call
 # redirect a future new producer could bypass by omission. See also
 # `run_corpus_cmd` below, which is what actually runs these producers now
-# (even under `PROFILE_421_LEGS_DRY_RUN=1`, unlike `run_cmd`) so this
+# and is itself exercised even under `PROFILE_421_LEGS_DRY_RUN=1`, so this
 # capture-free path is itself hermetically exercised.
 #
 # The N corpus is a PREFIX of the M corpus for text (the producer's own
@@ -1051,11 +1117,11 @@ provision_corpus() {
       run_corpus_cmd python3 "$DIR/gen_fixed_shape_image_corpus.py" --rows "$rows_n" \
         --size "$IMAGE_SIZE" --seed "$SEED" --out-dir "$dir_n" \
         --families "$MEDIA_FAMILIES" --heldout-families "$MEDIA_HELDOUT_FAMILIES" \
-        --heldout-rows "$HELDOUT_ROWS" --heldout-batch "$BATCH" || return 1
+        --heldout-rows "$HELDOUT_ROWS" --heldout-batch "$BATCH" "${POOL_CACHE_ARGS[@]}" || return 1
       run_corpus_cmd python3 "$DIR/gen_fixed_shape_image_corpus.py" --rows "$rows_m" \
         --size "$IMAGE_SIZE" --seed "$SEED" --out-dir "$dir_m" \
         --families "$MEDIA_FAMILIES" --heldout-families "$MEDIA_HELDOUT_FAMILIES" \
-        --heldout-rows "$HELDOUT_ROWS" --heldout-batch "$BATCH" || return 1
+        --heldout-rows "$HELDOUT_ROWS" --heldout-batch "$BATCH" "${POOL_CACHE_ARGS[@]}" || return 1
       _pc_train_n="$dir_n/triplets.jsonl"
       _pc_train_m="$dir_m/triplets.jsonl"
       _pc_heldout_ids="$dir_n/heldout_ids.txt"
@@ -1066,12 +1132,12 @@ provision_corpus() {
         --seconds "$AUDIO_SECONDS" --sample-rate "$AUDIO_SAMPLE_RATE" --seed "$SEED" \
         --out-dir "$dir_n" --families "$MEDIA_FAMILIES" \
         --heldout-families "$MEDIA_HELDOUT_FAMILIES" \
-        --heldout-rows "$HELDOUT_ROWS" --heldout-batch "$BATCH" || return 1
+        --heldout-rows "$HELDOUT_ROWS" --heldout-batch "$BATCH" "${POOL_CACHE_ARGS[@]}" || return 1
       run_corpus_cmd python3 "$DIR/gen_fixed_length_audio_corpus.py" --rows "$rows_m" \
         --seconds "$AUDIO_SECONDS" --sample-rate "$AUDIO_SAMPLE_RATE" --seed "$SEED" \
         --out-dir "$dir_m" --families "$MEDIA_FAMILIES" \
         --heldout-families "$MEDIA_HELDOUT_FAMILIES" \
-        --heldout-rows "$HELDOUT_ROWS" --heldout-batch "$BATCH" || return 1
+        --heldout-rows "$HELDOUT_ROWS" --heldout-batch "$BATCH" "${POOL_CACHE_ARGS[@]}" || return 1
       _pc_train_n="$dir_n/triplets.jsonl"
       _pc_train_m="$dir_m/triplets.jsonl"
       _pc_heldout_ids="$dir_n/heldout_ids.txt"
@@ -1415,10 +1481,20 @@ run_leg() {
     )
     if [ -n "$steps_measured_n" ]; then census_cmd+=(--steps-measured-a "$steps_measured_n"); fi
     if [ -n "$steps_measured_m" ]; then census_cmd+=(--steps-measured-b "$steps_measured_m"); fi
+    # esc-088 round-4: ALWAYS executes, even under DRY_RUN -- the
+    # DRY_RUN `nsys export` stub now copies a real, committed,
+    # schema-valid sqlite fixture into `$sqlite_n`/`$sqlite_m`
+    # (`fake_nsys.sh`'s own doc), so `kernel_census.py` can run its real
+    # query/domain-check machinery hermetically instead of being gated
+    # behind a no-op wrapper that defaulted `census_ok` to "true" without
+    # ever running it. `_print_cmd` traces it exactly like every other
+    # invocation, never silently.
+    #
     # `&&`/`||`, never a bare assignment: under `set -euo pipefail` a plain
     # command exiting nonzero (kernel_census.py legitimately REFUSING)
     # would abort the whole sweep before `census_exit` was ever set.
-    run_cmd "${census_cmd[@]}" >"$census_stdout" 2>"$census_stderr" && census_exit=0 || census_exit=$?
+    _print_cmd "${census_cmd[@]}"
+    "${census_cmd[@]}" >"$census_stdout" 2>"$census_stderr" && census_exit=0 || census_exit=$?
     cat "$census_stdout" || true
     cat "$census_stderr" >&2 || true
     if [ "$census_exit" -eq 0 ]; then
@@ -1496,7 +1572,7 @@ p2_run_one() {
       run_corpus_cmd python3 "$DIR/gen_fixed_shape_image_corpus.py" --rows "$P2_ROWS" \
         --size "$IMAGE_SIZE" --seed "$SEED" --out-dir "$corpus_dir" \
         --families "$MEDIA_FAMILIES" --heldout-families "$MEDIA_HELDOUT_FAMILIES" \
-        --heldout-rows "$P2_HELDOUT_ROWS" --heldout-batch "$BATCH" || return 1
+        --heldout-rows "$P2_HELDOUT_ROWS" --heldout-batch "$BATCH" "${POOL_CACHE_ARGS[@]}" || return 1
       train_jsonl="$corpus_dir/triplets.jsonl"
       ;;
     htsat)
@@ -1504,7 +1580,7 @@ p2_run_one() {
         --seconds "$AUDIO_SECONDS" --sample-rate "$AUDIO_SAMPLE_RATE" --seed "$SEED" \
         --out-dir "$corpus_dir" --families "$MEDIA_FAMILIES" \
         --heldout-families "$MEDIA_HELDOUT_FAMILIES" \
-        --heldout-rows "$P2_HELDOUT_ROWS" --heldout-batch "$BATCH" || return 1
+        --heldout-rows "$P2_HELDOUT_ROWS" --heldout-batch "$BATCH" "${POOL_CACHE_ARGS[@]}" || return 1
       train_jsonl="$corpus_dir/triplets.jsonl"
       ;;
     *)

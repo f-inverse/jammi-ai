@@ -254,6 +254,25 @@ run_cmd() {
   "$@"
 }
 
+# --- corpus-producer wrapper (esc-088 class, same shape as
+# profile_421_legs.sh's own `run_corpus_cmd`): unlike `run_cmd`, this
+# ALWAYS executes, even under `PROFILE_356_LEGS_DRY_RUN=1` --
+# `gen_fixed_width_corpus.py` is CPU-hermetic (no GPU, no network, no
+# `$NSYS_BIN`/`$BENCH_BIN`) and cheap (well under a second at every row
+# count this driver uses). Running it for real under DRY_RUN (rather than
+# touch-emptying `$full_corpus`/the N-slice) is what makes the hermetic
+# suite exercise this producer's own argv/stdout interface for real on
+# every run -- a bug there is visible to CI rather than only surfacing on
+# a real pod run (`.jammi/escapes.jsonl`'s own admissible-escape class).
+# The child's own stdout is forwarded to THIS SCRIPT's stderr -- the same
+# place `_print_cmd`'s trace line already goes, and for
+# the same reason: never leave it on a channel a future capture point
+# could pick up again.
+run_corpus_cmd() {
+  _print_cmd "$@"
+  "$@" >&2
+}
+
 # --- provenance cross-check (unification contract C5.1), same shape as
 # finetune_run_ab.sh/fa2_ab.sh/encode_ab.sh/stacked_sweep.sh/
 # clip_artifact_producer.sh: refuse BEFORE any leg runs if the binary's own
@@ -929,27 +948,23 @@ run_leg() {
     local full_corpus="$leg_dir/corpus_m${m_steps}.jsonl"
     local rows_m=$(( batch * m_steps ))
     local rows_n=$(( batch * n_steps ))
-    if [ "$PROFILE_356_LEGS_DRY_RUN" != "1" ]; then
-      if python3 "$DIR/gen_fixed_width_corpus.py" --rows "$rows_m" --min-wordpieces "$width" \
-          --seed 42 --out "$full_corpus" "${verify_tok_args[@]}"; then
-        if head -n "$rows_n" "$full_corpus" > "$leg_dir/corpus_n${n_steps}.jsonl"; then
-          train_n="$leg_dir/corpus_n${n_steps}.jsonl"
-          train_m="$full_corpus"
-        else
-          leg_status="invalid"
-          leg_reason="head -n $rows_n $full_corpus failed while slicing the N-step corpus"
-        fi
+    # `gen_fixed_width_corpus.py` is CPU-hermetic and cheap at every row
+    # count this driver uses (esc-088: run it for REAL unconditionally --
+    # `run_corpus_cmd`, not `run_cmd` -- so DRY_RUN exercises this
+    # producer's own argv/stdout interface too, never a touch-empty
+    # stand-in).
+    if run_corpus_cmd python3 "$DIR/gen_fixed_width_corpus.py" --rows "$rows_m" --min-wordpieces "$width" \
+        --seed 42 --out "$full_corpus" "${verify_tok_args[@]}"; then
+      if head -n "$rows_n" "$full_corpus" > "$leg_dir/corpus_n${n_steps}.jsonl"; then
+        train_n="$leg_dir/corpus_n${n_steps}.jsonl"
+        train_m="$full_corpus"
       else
         leg_status="invalid"
-        leg_reason="gen_fixed_width_corpus.py failed (see leg dir for any partial output)"
+        leg_reason="head -n $rows_n $full_corpus failed while slicing the N-step corpus"
       fi
     else
-      run_cmd python3 "$DIR/gen_fixed_width_corpus.py" --rows "$rows_m" --min-wordpieces "$width" \
-        --seed 42 --out "$full_corpus" "${verify_tok_args[@]}"
-      : > "$full_corpus"
-      : > "$leg_dir/corpus_n${n_steps}.jsonl"
-      train_n="$leg_dir/corpus_n${n_steps}.jsonl"
-      train_m="$full_corpus"
+      leg_status="invalid"
+      leg_reason="gen_fixed_width_corpus.py failed (see leg dir for any partial output)"
     fi
   else
     # E1: the REAL, network-provisioned + byte-verified train_pairs.jsonl
@@ -972,10 +987,30 @@ run_leg() {
         leg_reason="$TRAIN_JSONL_REAL failed byte-verification against the committed train_ids_sha256.json"
       fi
     else
-      : > "$leg_dir/corpus_n${n_steps}.jsonl"
-      : > "$leg_dir/corpus_m${m_steps}.jsonl"
-      train_n="$leg_dir/corpus_n${n_steps}.jsonl"
-      train_m="$leg_dir/corpus_m${m_steps}.jsonl"
+      # DRY_RUN has no network-provisioned `$TRAIN_JSONL_REAL` to verify
+      # (esc-088: the real E1 producer, `verify_train_pairs.py` against a
+      # real corpus, cannot run hermetically at all -- there is nothing
+      # committed for it to read). Rather than touch-empty stand-ins,
+      # stand in the SAME hermetic producer the "synthetic" arm uses,
+      # sized to this leg's own (n_steps, m_steps) -- a real producer
+      # executes and writes real, non-empty files that flow through the
+      # rest of the pipeline for real; `verify_train_pairs.py`'s own logic
+      # is separately hermetically self-tested via its `--self-test` arm.
+      local e1_rows_m=$(( batch * m_steps )) e1_rows_n=$(( batch * n_steps ))
+      run_corpus_cmd python3 "$DIR/gen_fixed_width_corpus.py" --rows "$e1_rows_m" --min-wordpieces "$width" \
+        --seed 42 --out "$leg_dir/corpus_m${m_steps}.jsonl" "${verify_tok_args[@]}" || {
+        leg_status="invalid"
+        leg_reason="gen_fixed_width_corpus.py failed (dry-run E1 stand-in producer)"
+      }
+      if [ "$leg_status" = "ok" ]; then
+        if head -n "$e1_rows_n" "$leg_dir/corpus_m${m_steps}.jsonl" > "$leg_dir/corpus_n${n_steps}.jsonl"; then
+          train_n="$leg_dir/corpus_n${n_steps}.jsonl"
+          train_m="$leg_dir/corpus_m${m_steps}.jsonl"
+        else
+          leg_status="invalid"
+          leg_reason="head -n $e1_rows_n $leg_dir/corpus_m${m_steps}.jsonl failed while slicing the dry-run E1 N-step corpus"
+        fi
+      fi
     fi
   fi
 

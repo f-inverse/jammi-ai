@@ -403,6 +403,42 @@ workspace ships every publishable crate at the same
   the positive-proof equation exactly (all three keys, non-vacuity on `calls`, the GELU seam
   non-zero on HTSAT / zero on both OpenCLIP towers) rather than witnessing it on tiny_bert/text
   alone.
+- **#421 profile-campaign follow-ups: five re-audit advisories closed with a landing gate each
+  (esc-088).** `ci/scripts/perf/fa2_ab.sh`'s unlabeled `finetune-step` flash/block legs now pass
+  `--expect-kernels-disabled` explicitly (empty on the flash leg), so the binary's own START/END
+  checks refuse (nonzero exit) any single leg whose req/fired claim disagrees with the real env
+  var, and the script itself now tracks every leg's exit status (and its own JSON-parse outcome)
+  into one cumulative `FA2AB_EXIT` the script exits with — a refused leg moves the script's own
+  exit status, not just a `FAILED` line a human has to notice in scrollback.
+  `profile_356_legs.sh`/`lora_bias_ab.sh` no longer touch-empty their corpus outputs under
+  `DRY_RUN` — `gen_fixed_width_corpus.py` now runs for real (via `run_corpus_cmd`) on every
+  `corpus_mode`, including the E1/heldout dry-run stand-in. `profile_421_legs.sh`'s `DRY_RUN`
+  nsys-export stub now copies a committed, schema-valid nsys sqlite fixture
+  (`ci/scripts/perf/fixtures/nsys_kernel_census/`) into place instead of touch-emptying it, so
+  `kernel_census.py` runs for real under `DRY_RUN` and `census_ok` is earned rather than defaulted
+  off a no-op wrapper. `gen_fixed_shape_image_corpus.py`/`gen_fixed_length_audio_corpus.py` gain an
+  opt-in, content-addressed `--pool-cache-dir` that the dry-run test harness points at one
+  suite-level tempdir, so the fixed media pool is synthesized once per suite instead of once per
+  subprocess invocation of `profile_421_legs.sh` (51 invocations in
+  `test_profile_421_legs_dry_run.py`), byte-identical output with/without the cache asserted via
+  sha256 by the corpus-generator tests. Box-specific, not a gated number: the round-1 adversarial
+  audit reproduced `test_profile_421_legs_dry_run.py` at 567.8s uncached vs 118.0s cached on one
+  developer box (Apple M5 Pro, 2026-09-07). `finetune_step.rs` documents the unlabeled-leg
+  contract (no
+  claim without `--expect-kernels-disabled`, same posture as `finetune-run`).
+  `crates/jammi-encoders --features golden-parity --test golden_parity` (6 CPU-only tests against a
+  committed PyTorch reference of the HTSAT-Swin CLAP audio tower) is now wired into CI's hermetic
+  `test` job, so `htsat_audio.rs`'s "eval bytes are pinned by `golden_parity.rs`" doc claim is true
+  of CI, not merely of a local run — `docs/maintainer/MAINTAINER-GUIDE.md`'s eval-doctrine section
+  is updated to match (parity-test/cuda_parity remain pod-run-only, disclosed). Finally,
+  `ci/scripts/perf/check_producer_provenance_gates.py`'s dry-run-knob-inertness check widens from
+  `*FAKE*`-named knobs to any `<PREFIX>_DRY_RUN_<SUFFIX>` test knob (`PROFILE_421_LEGS_DRY_RUN_
+  EXTRA_REQUESTED_KEY`/`_TRUNCATE_CORPUS_VAR`/`_POOL_CACHE_DIR`, `LORA_BIAS_AB_DRY_RUN_FAIL_OP`/
+  `_FAIL_PREDICATE`),
+  admissible by either containment (every read site inside an `if [ "$<PREFIX>_DRY_RUN" = "1" ]`
+  -guarded region, heredoc-aware so an embedded `python3 -c` payload's own dangling `if`s cannot
+  fool the block-extent walk) or the existing preflight-refusal shape generalized off the `FAKE`
+  name requirement.
 
 ### Breaking
 - `jammi_encoders::{AnyAudioEncoder, AudioEncoder}` are removed

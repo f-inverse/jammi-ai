@@ -699,6 +699,49 @@ pub fn run(params: &FinetuneStepParams) -> Result<FinetuneStepTier, Box<dyn std:
     // does afterward — so a mismatch here can fail fast, before paying for
     // a build + warmup + measured steps that were never going to produce a
     // valid report.
+    //
+    // THE UNLABELED-LEG CONTRACT (folded into #421's follow-ups, re-audit
+    // advisory): the SAME contract `finetune-run`'s own `--expect-
+    // kernels-disabled` carries — a leg that never passes this flag at
+    // all gets NO refusal and NO claim from `run()` about what
+    // `JAMMI_KERNELS_DISABLE` actually resolved to this process. This is
+    // deliberate, never an oversight: a caller with no intended disable
+    // set (an ordinary fused/control leg) has nothing to assert here, and
+    // a caller that DOES intend one but omits the flag is not caught by
+    // this function at all — it is caught (if at all) by whatever THAT
+    // caller's own script does with the emitted report's
+    // `kernels_disabled_requested`/`kernels_disabled_fired` fields after
+    // the fact. Every in-tree producer that runs an unlabeled
+    // `finetune-step` leg falls into exactly one of two witnessing
+    // shapes:
+    //
+    //   - BINARY-ENFORCED (this check, `--expect-kernels-disabled` always
+    //     passed, even as the empty string on a fused/control leg —
+    //     `finetune_ab.sh:582`'s own convention, adopted by `fa2_ab.sh`
+    //     after the re-audit that raised this doc): a mismatch refuses
+    //     BEFORE any step runs, per the doc above.
+    //   - POST-HOC SCRIPT PREDICATE (no `--expect-kernels-disabled` on
+    //     the command line at all; the calling script reads the emitted
+    //     JSON report's own `kernels_disabled_requested`/
+    //     `kernels_disabled_fired` fields after the run and requires them
+    //     empty/expected as one of several predicates for a GREEN
+    //     verdict): `stacked_sweep.sh`'s `check_stacked` (its "2x
+    //     stacked" fused leg) and `clip_artifact_producer.sh`'s
+    //     `nothing_disabled` predicate (its CLIP-ON-FLASH leg) both take
+    //     this shape — a report that came back with a non-empty
+    //     `kernels_disabled_requested` fails their own predicate set, but
+    //     ONLY after the (already-paid-for) run completes, never before.
+    //
+    // A script that runs an unlabeled leg and checks NEITHER of the above
+    // — i.e. calls `finetune-step` with no `--expect-kernels-disabled`
+    // and never reads `kernels_disabled_requested`/`kernels_disabled_fired`
+    // back off the report — makes no claim about the disable set at all,
+    // exactly like passing `--expect-kernels-disabled` never happened;
+    // that is this function's own contract working as designed, not a
+    // gap in it. The gap (if any) lives in the CALLING SCRIPT, and is
+    // exactly what `check_producer_provenance_gates.py`'s own FAKE-knob-
+    // inertness class of check exists to catch for OTHER test-only
+    // env-var knobs — this contract is orthogonal to that one.
     if let Some(expected) = &params.expect_kernels_disabled {
         let mut expected_sorted = expected.clone();
         expected_sorted.sort();

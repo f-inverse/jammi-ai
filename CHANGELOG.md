@@ -564,6 +564,12 @@ workspace ships every publishable crate at the same
   decode is a per-row value the caller marks in `_status`/`_error`, never a whole-batch error;
   an unreadable path column value and a `row_status` shorter than the batch are still whole-call
   refusals. Migration: match the inner `Result` per row (or `?` it to keep whole-batch failure).
+  `arrow_to_images`'s path-valued arm also changed from `image::open(path)` (extension hint AND
+  content sniff) to `std::fs::read` + `load_from_memory` (content sniff only, the same decode
+  path every bytes-valued row already used) — a file whose bytes need the extension to identify
+  now fails to decode where it previously succeeded — and a path-valued row's per-row decode
+  error text changed from `Failed to load image '{path}': {e}` to `Failed to decode image at row
+  N: {e} (path '...')`.
 - `jammi_encoders::{AnyAudioEncoder, AudioEncoder}` are removed
   (`crates/jammi-encoders/src/lib.rs`). The audio-only dispatcher and its trait had no callers
   anywhere in the workspace, and audio is now a first-class `AnyEncoder` variant with real training

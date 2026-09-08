@@ -229,8 +229,8 @@ mechanism, only points at it.
   It attributes the refusal of a `$MODEL_DIR_CLIP` carrying `config.json`/`model.safetensors`
   and a `$MODEL_DIR_CLAP` missing the HF triad to `preflight_probe`, but the shipped driver
   implements that refusal in `_checkpoint_identity_probe`
-  (`ci/scripts/perf/profile_421_legs.sh:387-411`, landed in 32db48bb); `preflight_probe`
-  (`ci/scripts/perf/profile_421_legs.sh:418-503`) checks pinned flags and producer output
+  (`ci/scripts/perf/profile_421_legs.sh:423-446`, landed in 32db48bb); `preflight_probe`
+  (`ci/scripts/perf/profile_421_legs.sh:456-541`) checks pinned flags and producer output
   only. The behavior the contract pre-registered exists and runs before every leg — only the
   function name in the frozen prose is stale. Not corrected in the frozen body (same
   never-edit-after-freeze doctrine as the "45 hermetic tests" bullet above), recorded here

@@ -1958,13 +1958,18 @@ impl TrainingLoop {
             )));
         }
 
-        let mut decoded = Vec::with_capacity(clips.len());
-        for (i, clip) in clips.iter().enumerate() {
-            decoded.push(
-                audio_preprocess::decode_audio_bytes(clip)
-                    .map_err(|e| JammiError::FineTune(format!("Decode audio row {i}: {e}")))?,
-            );
-        }
+        // Shared with the serving path's decode loop
+        // (`inference::arrow_to_audio`, which calls
+        // `audio_preprocess::decode_audio_batch_per_row_indexed`): this call
+        // and that one both run through the SAME per-item decode body
+        // (`audio_preprocess::decode_audio_results`), in parallel across
+        // rayon's global pool — this trainer path calls
+        // `audio_preprocess::decode_audio_batch`, which hard-fails the whole
+        // step on the lowest-index error rather than marking a per-row
+        // status, since a corrupt training item is a refusal, not a row to
+        // skip.
+        let decoded = audio_preprocess::decode_audio_batch(clips)
+            .map_err(|e| JammiError::FineTune(format!("Decode audio batch: {e}")))?;
         let (input_features, is_longer) =
             audio_preprocess::preprocess_clap_fusion(&decoded, frontend, &self.device)
                 .map_err(|e| JammiError::FineTune(format!("CLAP fusion front end: {e}")))?;
@@ -1998,13 +2003,18 @@ impl TrainingLoop {
             .preprocess_std()
             .map_err(|e| geometry("preprocess_std", e))?;
 
-        let mut decoded = Vec::with_capacity(images.len());
-        for (i, bytes) in images.iter().enumerate() {
-            decoded.push(
-                image::load_from_memory(bytes)
-                    .map_err(|e| JammiError::FineTune(format!("Decode image row {i}: {e}")))?,
-            );
-        }
+        // Shared with the serving path's decode loop
+        // (`inference::arrow_to_images`, which calls
+        // `image_preprocess::decode_image_batch_per_row_indexed`): this call
+        // and that one both run through the SAME per-item decode body
+        // (`image_preprocess::decode_image_results`), in parallel across
+        // rayon's global pool — this trainer path calls
+        // `image_preprocess::decode_image_batch`, which hard-fails the whole
+        // step on the lowest-index error rather than marking a per-row
+        // status, since a corrupt training item is a refusal, not a row to
+        // skip.
+        let decoded = image_preprocess::decode_image_batch(images)
+            .map_err(|e| JammiError::FineTune(format!("Decode image batch: {e}")))?;
         let pixel_values =
             image_preprocess::preprocess_image_batch(&decoded, side, &mean, &std, &self.device)
                 .map_err(|e| JammiError::FineTune(format!("Image front end: {e}")))?;
@@ -2063,9 +2073,18 @@ impl TrainingLoop {
         let output = base
             .forward(&[content], task)
             .map_err(|e| JammiError::FineTune(format!("Encode: {e}")))?;
-        let n = output.shapes[0].0;
-        let dim = output.shapes[0].1;
-        let raw = Tensor::from_vec(output.float_outputs[0].clone(), (n, dim), &self.device)
+        // A corrupt training item is a refusal, not a row to skip: reject the
+        // whole group on the lowest-index failed row rather than silently
+        // training the projection head on the all-zero placeholder the
+        // backend substitutes for a decode/preprocess failure. Called BEFORE
+        // reading `shapes[0]` below, so an empty-`shapes` producer is refused
+        // by `all_rows_or_err` itself, not an index-out-of-bounds panic on
+        // `shapes[0]`.
+        let flat = output
+            .all_rows_or_err()
+            .map_err(|e| JammiError::FineTune(format!("Encode: {e}")))?;
+        let (n, dim) = output.shapes[0];
+        let raw = Tensor::from_vec(flat.to_vec(), (n, dim), &self.device)
             .map_err(|e| JammiError::FineTune(format!("Encode tensor: {e}")))?;
         head.layers[0]
             .1

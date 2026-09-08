@@ -614,6 +614,144 @@ dry-run tested straight through the real merge script, so the two P2 halves (the
 mode, the merge script's consumption of it) are proven to fit as shipped rather than as
 imagined.
 
+### The media front end: parallelized across rayon's global pool
+
+The #421 tower profile above named the front end as measured, not yet reduced — the
+per-item decode/preprocess work a media leg does before the tower ever forwards. A
+follow-on unit ("media front-end parallelization") closes that gap for HTSAT and
+CLIP-vision without touching a decoder body: the batch's per-item work is spread across
+rayon's GLOBAL pool (candle installs no private pool of its own, so this is the one pool
+the process ever schedules media-batch work on; `rayon` becomes a direct `jammi-ai`
+dependency, already unified at 1.11 in the lock).
+
+**Measured: the HTSAT/CLIP-vision front-end A/B.** The close-out run
+(`crates/jammi-kernels/artifacts/cuda-runs/2026-09-08-frontend-0a8562c4-a100-pcie.json`,
+A100 80GB PCIe, tip `0a8562c4` vs base `c1b0b0ba`, at the tip binary's own resolved
+rayon global-pool width and the profile's fixed per-step item count, over several
+interleaved base/tip repeats) measured HTSAT's front-end and full-step wall per-step
+means, base against tip, and CLIP-vision's report-only front-end per-step means, base
+against tip — every cell in the table below is bound to the committed artifact's own
+field. The HTSAT bar's ratio, its observed interval, and the two-sided machine-model
+bound it is judged against are bound the same way below, as are the driver-default and
+the run's own measured serial-tail ratio: a bound falls strictly inside the interval, so
+the bar is UNRESOLVED, invariant under both ratios. Per the contract's own Verdict clause
+this is not ACTIVATE: the unit ships because bit identity holds (pool sizes 1/5/7/24 against
+the pre-unit reference, `crates/jammi-ai/tests/it/media_front_end.rs`) and the n=1 image
+serving path stays within its always-on gross latency bar (3x before_min + before_spread,
+same suite); the pre-registered 5 % n=1 bar is opt-in (`JAMMI_FRONTEND_N1_LATENCY=1`) and
+no serving-latency measurement is recorded, so no serving-regression claim tighter than
+that bar is made, with these numbers recorded and NO parallel-efficiency claim made. The
+separate #421 tower-profile artifact naming the front end's SHARE of a full training step
+(a different measurement from this unit's own base/tip A/B) still lands with its own
+artifact PR, not this branch — §11's first checklist applies unchanged: every number in a
+doc names its producer, or it is not written.
+
+| HTSAT/CLIP-vision front-end quantity | value (s or ratio) |
+|---|---:|
+<!-- claims: c1=crates/jammi-kernels/artifacts/cuda-runs/2026-09-08-frontend-0a8562c4-a100-pcie.json#/measurement/htsat_bar_driver_r/front_base_mean_s -->
+| HTSAT front-end s/step, base mean | 1.335 |
+<!-- claims: c1=crates/jammi-kernels/artifacts/cuda-runs/2026-09-08-frontend-0a8562c4-a100-pcie.json#/measurement/htsat_bar_driver_r/front_tip_mean_s -->
+| HTSAT front-end s/step, tip mean | 0.108 |
+<!-- claims: c1=mean(crates/jammi-kernels/artifacts/cuda-runs/2026-09-08-frontend-0a8562c4-a100-pcie.json#/measurement/legs/htsat__base__r1/train_per_step,crates/jammi-kernels/artifacts/cuda-runs/2026-09-08-frontend-0a8562c4-a100-pcie.json#/measurement/legs/htsat__base__r2/train_per_step,crates/jammi-kernels/artifacts/cuda-runs/2026-09-08-frontend-0a8562c4-a100-pcie.json#/measurement/legs/htsat__base__r3/train_per_step) -->
+| HTSAT step-wall s/step, base mean | 1.567 |
+<!-- claims: c1=mean(crates/jammi-kernels/artifacts/cuda-runs/2026-09-08-frontend-0a8562c4-a100-pcie.json#/measurement/legs/htsat__tip__r1/train_per_step,crates/jammi-kernels/artifacts/cuda-runs/2026-09-08-frontend-0a8562c4-a100-pcie.json#/measurement/legs/htsat__tip__r2/train_per_step,crates/jammi-kernels/artifacts/cuda-runs/2026-09-08-frontend-0a8562c4-a100-pcie.json#/measurement/legs/htsat__tip__r3/train_per_step) -->
+| HTSAT step-wall s/step, tip mean | 0.344 |
+<!-- claims: c1=crates/jammi-kernels/artifacts/cuda-runs/2026-09-08-frontend-0a8562c4-a100-pcie.json#/measurement/clip_vision_report_only/front_base_mean_s -->
+| CLIP-vision front-end s/step, base mean | 0.0293 |
+<!-- claims: c1=crates/jammi-kernels/artifacts/cuda-runs/2026-09-08-frontend-0a8562c4-a100-pcie.json#/measurement/clip_vision_report_only/front_tip_mean_s -->
+| CLIP-vision front-end s/step, tip mean | 0.0078 |
+<!-- claims: c1=crates/jammi-kernels/artifacts/cuda-runs/2026-09-08-frontend-0a8562c4-a100-pcie.json#/measurement/htsat_bar_driver_r/ratio -->
+| HTSAT bar ratio | 0.0809 |
+<!-- claims: c1=crates/jammi-kernels/artifacts/cuda-runs/2026-09-08-frontend-0a8562c4-a100-pcie.json#/measurement/htsat_bar_driver_r/ratio_lo -->
+| HTSAT bar ratio_lo | 0.0772 |
+<!-- claims: c1=crates/jammi-kernels/artifacts/cuda-runs/2026-09-08-frontend-0a8562c4-a100-pcie.json#/measurement/htsat_bar_driver_r/ratio_hi -->
+| HTSAT bar ratio_hi | 0.0871 |
+<!-- claims: c1=crates/jammi-kernels/artifacts/cuda-runs/2026-09-08-frontend-0a8562c4-a100-pcie.json#/measurement/htsat_bar_driver_r/lower_bound -->
+| HTSAT bar lower bound | 0.0448 |
+<!-- claims: c1=crates/jammi-kernels/artifacts/cuda-runs/2026-09-08-frontend-0a8562c4-a100-pcie.json#/measurement/htsat_bar_driver_r/upper_bound -->
+| HTSAT bar upper bound | 0.0864 |
+<!-- claims: c1=crates/jammi-kernels/artifacts/cuda-runs/2026-09-08-frontend-0a8562c4-a100-pcie.json#/verdict/serial_tail_ratio_deviation/r_driver -->
+| serial-tail ratio, driver-default | 0.0033 |
+<!-- claims: c1=crates/jammi-kernels/artifacts/cuda-runs/2026-09-08-frontend-0a8562c4-a100-pcie.json#/verdict/serial_tail_ratio_deviation/r_measured -->
+| serial-tail ratio, measured | 0.00355 |
+
+**The mechanism.** Two parallel stages, the same shape on both towers:
+
+1. **Decode.** A shared per-item decode body per modality
+   (`image_preprocess`'s and `audio_preprocess`'s private `decode_*_results`)
+   backs two DIFFERENT public error contracts, not one. The trainer's
+   `image_encoder_input`/`audio_encoder_input` call `decode_image_batch`/
+   `decode_audio_batch`, which still hard-fail the whole job on the
+   LOWEST-INDEX decode error — a corrupt training item is a refusal, not a
+   row to skip. Serving's `arrow_to_images`/`arrow_to_audio` instead call the
+   `_per_row_indexed` variants (`decode_image_batch_per_row_indexed`,
+   `decode_audio_batch_per_row_indexed`), which return EVERY row's own
+   outcome: a corrupt row's bytes produce that Arrow row's own `Err` (surfaced
+   as that row's `_status=false` with an Arrow-row-indexed `_error` message in
+   `BackendOutput`, per `docs/guide/src/generate-image-embeddings.md`'s
+   error-handling table), the rest of the batch still embeds, and a null row
+   keeps its own `None`/"Null or missing …" treatment. Both variants decode in
+   parallel across the batch on rayon's global pool; a path-valued Arrow
+   column reads its bytes SEQUENTIALLY first (`std::fs::read` never runs
+   inside the pool).
+2. **Preprocess.** `preprocess_image_batch`/`preprocess_clap_fusion` preallocate the
+   batch's output buffer once and have each item write its own disjoint, fixed-stride
+   chunk via `par_chunks_mut` — filters and the STFT window are hoisted out of the
+   per-item closure, and a release-mode (not `debug_assert!`) per-item length check
+   guards every chunk write. Preprocess has no per-row variant: the trainer and
+   serving both call the lowest-index-hard-fail `_indexed` form (serving has already
+   dropped every decode-failed or null row before preprocessing runs, so a preprocess
+   failure there is never a corrupt-item skip either).
+
+There is no thread-count knob anywhere in this path: chunk count is always the batch
+size, so the effective parallelism is `min(pool_size, batch_size)`, emergent from
+whichever pool the process happens to run under — never configured. "The LOWEST-INDEX
+failing row is the one surfaced" holds for the training path's decode AND preprocess
+stages, and for the preprocess stage on the serving path — mirroring the order the
+pre-unit sequential loop failed in — but NOT for the serving path's decode stage,
+which surfaces every row's own outcome instead of collapsing to one. An empty batch is
+refused before any chunking is attempted.
+
+**Provenance: `rayon_pool_threads`.** `FinetuneRunTier` grows a thirteenth provenance
+field, `rayon_pool_threads` (`PROVENANCE_FIELDS` 12 → 13) — `rayon::current_num_threads()`
+at report time, i.e. the rayon GLOBAL POOL SIZE the run's process resolved to, not how
+many of those threads actually touched a given batch's chunks. It is machine/build
+provenance, the same class `device_name`/`host.logical_cpus` already occupy — a fact
+about the box and the process, never a determinant of what a step computes, so it is
+never an identity field.
+
+**The pre-registered A/B.** `ci/scripts/perf/frontend_ab.sh` drives the contract's
+base/tip comparison: two prebuilt `jammi-bench` binaries, interleaved base/tip legs
+(`$FRONTEND_AB_REPEATS` pairs, `r1`..`rN`) over untraced `finetune-run` on HTSAT and
+CLIP-vision, at the profile's own pinned leg parameters. The decision quantity is
+`media_front_end_wall_s / steps_measured`; the bar is TWO-SIDED against the machine model
+(`P` read from the tip binary's own `rayon_pool_threads`, `ideal = n / ceil(n / P)` at the
+batch's item count `n`, `r` the operator-supplied CPU-local serial-tail ratio).
+`frontend_ab_merge.py` propagates the interval from BOTH arms' own observed repeats, never
+from the base-to-base spread alone: `ratio_lo = min(tip legs) / max(base legs)`,
+`ratio_hi = max(tip legs) / min(base legs)`. PASS iff the WHOLE interval clears the bar
+(`ratio_hi <= upper_bound` and `ratio_lo >= lower_bound`); FAIL iff the whole interval is
+too slow (`ratio_lo > upper_bound`); INVALID_BEATS_IDEAL iff the whole interval beats the
+machine model's own ideal (`ratio_hi < lower_bound`); UNRESOLVED otherwise, a bound
+falling strictly inside `[ratio_lo, ratio_hi]`. CLIP-vision is report-only. Verdict:
+ACTIVATE the change iff the HTSAT bar holds — the script only records the outcome, never
+gates or reverts a build on it. The close-out run's own recorded deviations (named, never
+silently absorbed into the numbers above — see the committed artifact for detail): the
+measured tip commit precedes the tree the merge report was rendered from: the `par_chunks_mut`
+parallel stage and the decode helpers are byte-unchanged since the measured tip, and every
+later commit that touched the timed front-end path (`audio_preprocess.rs`) added only a
+sequential pre-check ahead of that parallel stage — a `resampled_len()` helper extracted with
+identical arithmetic, and, in a later commit still, a per-clip `sample_rate == 0` refusal and
+`resampled_len`'s own `from_rate == 0` branch — never a change to the parallel stage or the
+decode helpers themselves; every other file the later commits touched is off the timed path
+(tests, docs, CI, serving-path code), and the artifact's own deviation record names every file
+mechanically. The driver-default serial-tail ratio differs from this run's own measured
+serial-tail ratio, with the bar's verdict asserted invariant under both; and the pod's CPU was shared-host at
+launch, so `P` reflects the run's own cgroup quota rather than the box's full core count.
+A hermetic dry-run suite (`ci/scripts/perf/test_frontend_ab_dry_run.py`) drives the real
+script end to end with hermetic stand-in binaries and no GPU, and is a matrix leg in
+`.github/workflows/ci.yml`.
+
 ### The bench and its torch twin
 
 `jammi-bench finetune-step`: three encoder forwards, a triplet hinge, one backward, one AdamW step; synthetic uniform token ids, so it measures *cost*, never learning. `torch_finetune_step.py` is matched argument for argument (`attn_implementation` read back from the config; `--attn eager` = semantic twin, `--attn sdpa` = the throughput bar; LoRA init distribution-matched; TF32 off). `ab_merge.py` refuses to compare legs whose `FINETUNE_IDENTITY_FIELDS` differ (the tuple is declared once, in `ci/scripts/perf/identity_fields.py`, and imported — 18 entries, including the padded-batch `row_lengths` vector); the raw attention string (`attn_requested`/`attn_implementation`) is recorded as provenance and never compared, while the reference *class* it implies is compared via the `attention_arm` identity field; the clip determinant `max_grad_norm` is in the comparison tuple (null = clip off is a value, never MISSING) and in the K7-completeness const (`FinetuneStepTier::IDENTITY_FIELDS`, a strict superset). A stdlib-`unittest` suite (`ci/scripts/perf/test_identity_fields_subset.py`) pins the claim mechanically: every Python comparison-tuple entry must be named in the corresponding Rust K7-completeness const, and the tuple cardinalities (18, 11) are asserted as numbers, not promises.

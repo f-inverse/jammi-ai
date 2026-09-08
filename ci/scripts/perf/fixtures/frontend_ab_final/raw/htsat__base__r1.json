@@ -1,0 +1,17 @@
+{
+  "host": {
+    "logical_cpus": 26
+  },
+  "provenance": {
+    "build_sha": "c1b0b0bad1f79a4ad6c298400e6ea19cc1ca633c"
+  },
+  "tiers": {
+    "finetune_run": {
+      "steps_measured": 100,
+      "media_front_end_wall_s": 132.944626602,
+      "train_run_wall_s": 155.996878124,
+      "task": "audio_embedding",
+      "device_name": "NVIDIA A100 80GB PCIe"
+    }
+  }
+}

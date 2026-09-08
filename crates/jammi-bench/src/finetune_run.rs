@@ -2396,6 +2396,14 @@ fn run_impl(
         split_rule: "positional_fraction_split".to_string(),
         batched_forward: true,
         steps_measured: cumulative_steps,
+        // Issue #421 follow-on ("media front-end parallelization" contract
+        // §B): the rayon GLOBAL pool size this process actually executed
+        // under, read via `jammi_ai::fine_tune::media_front_end_pool_threads()`
+        // (ai-core's own seam — never `rayon::current_num_threads()` called
+        // directly here, so this crate never gains a direct `rayon` dep) —
+        // MACHINE/BUILD provenance, never identity. See
+        // `FinetuneRunTier::rayon_pool_threads`'s own doc.
+        rayon_pool_threads: jammi_ai::fine_tune::media_front_end_pool_threads(),
 
         ln_fused_dispatches,
         ln_eager_dispatches,

@@ -443,6 +443,115 @@ fn write_image_triplets(dir: &Path) -> PathBuf {
     path
 }
 
+/// [`write_image_triplets`] with row 0's POSITIVE cell replaced by
+/// undecodable bytes — the fixture the `project_frozen_embedding` refusal
+/// test below drives through the frozen base tower's per-row-tolerant
+/// `forward()` path (`CandleBackend::forward_image_embedding` marks only the
+/// corrupt row's own status rather than hard-failing the whole call).
+fn write_image_triplets_with_one_corrupt_cell(dir: &Path) -> PathBuf {
+    use arrow::array::{ArrayRef, BinaryArray, RecordBatch};
+    use arrow::datatypes::{DataType, Field, Schema};
+    use parquet::arrow::ArrowWriter;
+
+    let families = image_corpus_by_family();
+    let fam_names: Vec<&String> = families.keys().collect();
+
+    let (mut anchors, mut positives, mut negatives) = (Vec::new(), Vec::new(), Vec::new());
+    for (fi, fam) in fam_names.iter().enumerate() {
+        let imgs = &families[*fam];
+        let other = &families[fam_names[(fi + 1) % fam_names.len()]];
+        for (ci, anchor) in imgs.iter().enumerate() {
+            anchors.push(anchor.clone());
+            positives.push(imgs[(ci + 1) % imgs.len()].clone());
+            negatives.push(other[ci % other.len()].clone());
+        }
+    }
+    // One cell, undecodable: neither a hard batch-build error nor a silent
+    // all-zero placeholder is the right answer for it.
+    positives[0] = b"not an image at all".to_vec();
+
+    let schema = Arc::new(Schema::new(vec![
+        Field::new("anchor", DataType::Binary, false),
+        Field::new("positive", DataType::Binary, false),
+        Field::new("negative", DataType::Binary, false),
+    ]));
+    let to_bin = |v: &[Vec<u8>]| -> ArrayRef {
+        Arc::new(BinaryArray::from(
+            v.iter().map(|b| b.as_slice()).collect::<Vec<_>>(),
+        )) as ArrayRef
+    };
+    let batch = RecordBatch::try_new(
+        schema.clone(),
+        vec![to_bin(&anchors), to_bin(&positives), to_bin(&negatives)],
+    )
+    .unwrap();
+    let path = dir.join("image_triplets_corrupt.parquet");
+    let mut w = ArrowWriter::try_new(std::fs::File::create(&path).unwrap(), schema, None).unwrap();
+    w.write(&batch).unwrap();
+    w.close().unwrap();
+    path
+}
+
+/// `project_frozen_embedding` is the ONLY caller of
+/// [`jammi_ai::inference::adapter::BackendOutput::all_rows_or_err`] in
+/// production. A corrupt item in a projection-head training group must fail
+/// the job, never silently train the head on the all-zero placeholder
+/// `forward_image_embedding` substitutes for that row's decode failure —
+/// verified by temporarily reverting `all_rows_or_err`'s body to the blind
+/// `&self.float_outputs[0]` read: `job.wait()` still returns an `Err` (the
+/// all-zero placeholder trains the head into a NaN loss within a few steps,
+/// tripping the trainer's own "Training diverged" divergence guard), but its
+/// message is the divergence guard's ("Training diverged: loss was NaN or
+/// >100 for 3 consecutive batches"), not the corrupt row's own decode
+/// failure — so this test's message assertion below goes RED, even though
+/// `expect_err` alone would still pass.
+#[tokio::test(flavor = "multi_thread")]
+async fn project_frozen_embedding_refuses_a_corrupt_group_item_instead_of_training_it() {
+    let dir = TempDir::new().unwrap();
+    let session = Arc::new(
+        InferenceSession::new(common::test_config(dir.path()))
+            .await
+            .unwrap(),
+    );
+    let _worker = jammi_ai::fine_tune::worker::EmbeddedWorker::spawn(&session)
+        .expect("default worker intervals are valid");
+    let triplets = write_image_triplets_with_one_corrupt_cell(dir.path());
+    session
+        .add_source(
+            "image_triplets_corrupt",
+            SourceType::File,
+            SourceConnection {
+                url: Some(format!("file://{}", triplets.display())),
+                format: Some(FileFormat::Parquet),
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+
+    let job = session
+        .fine_tune(
+            "image_triplets_corrupt",
+            &tiny_open_clip_model(),
+            &triplet_columns(),
+            FineTuneMethod::Lora,
+            ModelTask::ImageEmbedding,
+            // Empty target_modules -> ProjectionHead route -> project_frozen_embedding.
+            Some(tower_config(&[], 2, 5e-3)),
+        )
+        .await
+        .unwrap();
+    let err = job.wait().await.expect_err(
+        "a corrupt item in a training group must fail the job, never silently train the \
+         projection head on the all-zero placeholder that row's decode failure left behind",
+    );
+    let msg = err.to_string();
+    assert!(
+        msg.contains("Failed to decode image"),
+        "the refusal must surface the corrupt row's own decode failure, got: {msg}"
+    );
+}
+
 #[tokio::test(flavor = "multi_thread")]
 async fn open_clip_vision_tower_adapter_trains_and_serves() {
     let dir = TempDir::new().unwrap();
@@ -1266,5 +1375,90 @@ async fn audio_training_refuses_a_mel_bin_mismatch_like_serving_does() {
         msg.contains("num_mel_bins") && msg.contains(&(good + 1).to_string()),
         "the refusal must name the mismatched quantity and echo the front end's own \
          feature_size, got: {msg}"
+    );
+}
+
+// =============================================================================
+// Single-row query accessors refuse a corrupt input through the REAL fixture
+// towers rather than serving the all-zero placeholder
+// `forward_image_embedding` / `forward_audio_embedding` substitute for a
+// decode/preprocess failure. `single_row_or_err`'s own literal-`BackendOutput`
+// oracles live in `crates/jammi-ai/src/inference/adapter/mod.rs`'s
+// `#[cfg(test)] mod tests`; these three drive the SAME accessor end to end
+// through `InferenceSession::encode_{image,audio,text}_query`, so a caller
+// that bypasses the accessor (reading `output.float_outputs[0][..dim]
+// .to_vec()` directly) is caught here too, not just at the unit level.
+// =============================================================================
+
+/// Verified by temporarily reverting `session.rs::encode_image_query` to
+/// `output.float_outputs[0].to_vec()` (the blind read): this test
+/// goes RED (`Ok([0.0; dim])` instead of the `Err` asserted below).
+#[tokio::test(flavor = "multi_thread")]
+async fn encode_image_query_on_corrupt_bytes_refuses_never_a_zero_vector() {
+    let dir = TempDir::new().unwrap();
+    let session = Arc::new(
+        InferenceSession::new(common::test_config(dir.path()))
+            .await
+            .unwrap(),
+    );
+
+    let err = session
+        .encode_image_query(&tiny_open_clip_model(), b"not an image at all")
+        .await
+        .expect_err("a corrupt image query must refuse, never silently zero-vector");
+    let msg = err.to_string();
+    assert!(
+        msg.contains("Failed to decode image"),
+        "must surface the row's own decode failure, not a generic error, got: {msg}"
+    );
+}
+
+/// Peer of the image case above, over the HTSAT-Swin CLAP audio tower.
+/// Verified by temporarily reverting `session.rs::encode_audio_query` the
+/// same way: RED (`Ok([0.0; dim])`) instead of the expected `Err`.
+#[tokio::test(flavor = "multi_thread")]
+async fn encode_audio_query_on_corrupt_bytes_refuses_never_a_zero_vector() {
+    let dir = TempDir::new().unwrap();
+    let session = Arc::new(
+        InferenceSession::new(common::test_config(dir.path()))
+            .await
+            .unwrap(),
+    );
+
+    let err = session
+        .encode_audio_query(&htsat_clap_tiny_model(), b"not audio at all")
+        .await
+        .expect_err("a corrupt audio query must refuse, never silently zero-vector");
+    let msg = err.to_string();
+    assert!(
+        msg.contains("Failed to decode audio"),
+        "must surface the row's own decode failure, not a generic error, got: {msg}"
+    );
+}
+
+/// The text peer: `encode_text_query` read
+/// `output.float_outputs[0][..dim].to_vec()` directly, so an empty/null text
+/// query returned a ZERO VECTOR even though `forward_embedding` marks an
+/// empty text row's OWN status `false` (`"Empty or null text input"`) exactly
+/// like a corrupt image/audio row. Verified by temporarily reverting
+/// `encode_text_query` to that blind read: RED (`Ok([0.0; dim])`) instead of
+/// the `Err` this test asserts.
+#[tokio::test(flavor = "multi_thread")]
+async fn encode_text_query_on_empty_text_refuses_never_a_zero_vector() {
+    let dir = TempDir::new().unwrap();
+    let session = Arc::new(
+        InferenceSession::new(common::test_config(dir.path()))
+            .await
+            .unwrap(),
+    );
+
+    let err = session
+        .encode_text_query(&tiny_open_clip_model(), "")
+        .await
+        .expect_err("an empty text query must refuse, never silently zero-vector");
+    let msg = err.to_string();
+    assert!(
+        msg.contains("Empty or null text input"),
+        "must surface the row's own refusal, not a generic error, got: {msg}"
     );
 }

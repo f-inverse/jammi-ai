@@ -212,10 +212,32 @@ impl OutputAdapter for DistributionAdapter {
         let flat = output.float_outputs.first().ok_or_else(|| {
             JammiError::Inference("distribution adapter: backend emitted no float head".into())
         })?;
-        if flat.len() != row_count * width {
+        // Checked multiply (mirrors `BackendOutput::checked_rows`'s
+        // `rows.checked_mul(dim)`): a raw `row_count * width` could silently
+        // overflow on an adversarial `row_count`.
+        let expected = row_count.checked_mul(width).ok_or_else(|| {
+            JammiError::Inference(format!(
+                "distribution adapter: row_count*width overflows (row_count={row_count}, \
+                 width={width})"
+            ))
+        })?;
+        if flat.len() != expected {
             return Err(JammiError::Inference(format!(
                 "distribution adapter: head has {} floats, expected rows({row_count}) * width({width})",
                 flat.len()
+            )));
+        }
+        // ONE policy for a possibly-short `row_status`, shared with
+        // `EmbeddingAdapter::adapt` and `build_prefix_columns`: refuse by
+        // name when the length disagrees with `row_count`, rather than
+        // defaulting a missing entry to "not ok" (which would silently
+        // treat an out-of-bounds row as errored instead of surfacing the
+        // producer bug that shorted `row_status`).
+        if output.row_status.len() != row_count {
+            return Err(JammiError::Inference(format!(
+                "distribution adapter: row_status has {} entries, expected one per row \
+                 ({row_count})",
+                output.row_status.len()
             )));
         }
 
@@ -224,7 +246,7 @@ impl OutputAdapter for DistributionAdapter {
                 let mut means = Vec::with_capacity(row_count);
                 let mut stds = Vec::with_capacity(row_count);
                 for row in 0..row_count {
-                    let ok = output.row_status.get(row).copied().unwrap_or(false);
+                    let ok = output.row_status[row];
                     if ok {
                         let mean = flat[row * 2];
                         let raw_std = flat[row * 2 + 1];
@@ -260,7 +282,7 @@ impl OutputAdapter for DistributionAdapter {
                 // guard). A failed row is null across every level.
                 let mut cols: Vec<Vec<Option<f32>>> = vec![Vec::with_capacity(row_count); q];
                 for row in 0..row_count {
-                    let ok = output.row_status.get(row).copied().unwrap_or(false);
+                    let ok = output.row_status[row];
                     if ok {
                         let mut row_vals: Vec<f32> = flat[row * q..row * q + q].to_vec();
                         // Sort ascending — the post-hoc non-crossing guard. NaNs
@@ -497,5 +519,79 @@ mod tests {
         // Gaussian needs 2 floats per row; supply 3.
         let out = backend(vec![1.0, 2.0, 3.0], 1, 3, vec![true]);
         assert!(DistributionAdapter::gaussian().adapt(&out, 1).is_err());
+    }
+
+    /// A `row_status` shorter than `row_count` must be a named refusal for
+    /// the Gaussian form, the same policy `EmbeddingAdapter::adapt` and
+    /// `build_prefix_columns` apply. Verified by reverting the length check
+    /// (restoring `row_status.get(row).copied().unwrap_or(false)`): this
+    /// test goes RED (`Ok` with row 1 silently treated as errored — a
+    /// missing status masquerading as a row failure — instead of the `Err`
+    /// asserted below).
+    #[test]
+    fn gaussian_adapt_refuses_a_row_status_shorter_than_row_count() {
+        let out = BackendOutput {
+            float_outputs: vec![vec![0.0, 0.0, 0.0, 0.0]],
+            string_outputs: vec![],
+            row_status: vec![true], // one entry; row_count is 2
+            row_errors: vec![String::new(), String::new()],
+            shapes: vec![(2, 2)],
+        };
+        let err = DistributionAdapter::gaussian()
+            .adapt(&out, 2)
+            .expect_err("a row_status shorter than row_count must be a typed refusal");
+        let msg = err.to_string();
+        assert!(msg.contains("row_status"), "must name the field: {msg}");
+        assert!(
+            msg.contains('1') && msg.contains('2'),
+            "must name both the got (1) and expected (2) lengths: {msg}"
+        );
+    }
+
+    /// The Quantile-form peer of the above: the same short-`row_status`
+    /// input must be refused identically, not silently indexed through
+    /// `.get(row).unwrap_or(false)`.
+    #[test]
+    fn quantile_adapt_refuses_a_row_status_shorter_than_row_count() {
+        let out = BackendOutput {
+            float_outputs: vec![vec![0.05, 0.5, 0.95, 0.1, 0.6, 0.9]],
+            string_outputs: vec![],
+            row_status: vec![true], // one entry; row_count is 2
+            row_errors: vec![String::new(), String::new()],
+            shapes: vec![(2, 3)],
+        };
+        let adapter = DistributionAdapter::quantile(vec![0.05, 0.5, 0.95]).unwrap();
+        let err = adapter
+            .adapt(&out, 2)
+            .expect_err("a row_status shorter than row_count must be a typed refusal");
+        let msg = err.to_string();
+        assert!(msg.contains("row_status"), "must name the field: {msg}");
+        assert!(
+            msg.contains('1') && msg.contains('2'),
+            "must name both the got (1) and expected (2) lengths: {msg}"
+        );
+    }
+
+    /// `row_count * width` computed with a raw multiply could silently
+    /// overflow on an adversarial `row_count`; the checked multiply must
+    /// refuse by name instead. Verified by temporarily reverting the checked
+    /// multiply to a raw `row_count * width`: this test goes RED (a
+    /// debug-mode overflow panic, or a wrapped small `expected` in release,
+    /// rather than the `Err` asserted below).
+    #[test]
+    fn adapt_refuses_an_overflowing_row_count_times_width_without_panicking() {
+        // Built directly (not via `backend()`) so the fixture never
+        // allocates a `usize::MAX`-length `row_errors` vec.
+        let out = BackendOutput {
+            float_outputs: vec![vec![]],
+            string_outputs: vec![],
+            row_status: vec![],
+            row_errors: vec![],
+            shapes: vec![(usize::MAX, 2)],
+        };
+        let err = DistributionAdapter::gaussian()
+            .adapt(&out, usize::MAX)
+            .unwrap_err();
+        assert!(err.to_string().contains("overflow"), "{err}");
     }
 }

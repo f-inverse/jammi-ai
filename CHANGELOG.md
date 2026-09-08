@@ -241,6 +241,58 @@ workspace ships every publishable crate at the same
 <!-- /profile-421-generated -->
 
 ### Changed
+- **The media front end's per-item decode/preprocess runs across the batch in parallel on
+  rayon's global pool (#421 follow-on).** `rayon` becomes a direct `jammi-ai` dependency (pinned
+  to the version already unified across the resolved tree; no version bump). Two stages, signatures
+  preserved: decode — new shared helpers `audio_preprocess::decode_audio_batch` /
+  `image_preprocess::decode_image_batch` (plus their `_indexed` / `_per_row_indexed` siblings,
+  which take the caller's own row ids so an error message names the CALLER's row, never the
+  position in a compacted batch), used by BOTH the serving decode loops
+  (`inference::arrow_to_audio` / `arrow_to_images`, which return `Vec<Option<Result<_>>>`: a null
+  row is `None`, a decode failure is `Some(Err(..))` and marks only that row's `_status`/`_error`
+  — the rest of the batch still embeds — while the trainer's `audio_encoder_input` /
+  `image_encoder_input` still hard-fail a training step on the lowest-index error, a corrupt
+  training item being a refusal rather than a row to skip) and the trainer; a path-valued arrow
+  column still reads its bytes with a sequential `std::fs::read` OUTSIDE the parallel stage, and a
+  path-valued row's decode failure still names its source path. Preprocess —
+  `preprocess_clap_fusion` / `preprocess_image_batch` (plus `_indexed` siblings) preallocate the
+  batch's flat buffer once and write each item's disjoint, fixed-stride chunk via `par_chunks_mut`,
+  with the mel filterbank / Hann window (audio) hoisted and computed once, a release-mode
+  per-item length check (`clap_fusion_row` / `image_row`) that returns a typed, row-indexed error
+  rather than ever reaching a mismatched `copy_from_slice`, and a typed refusal (naming the field
+  and the offending value) for `target_size == 0` / `n_mels == 0` — either would otherwise reach
+  `par_chunks_mut` with a zero chunk size and panic. Within the internal decode/preprocess helpers
+  and the training path, errors across a batch still surface the LOWEST-INDEX failing row; an
+  empty batch is still refused before any chunking. There is no
+  thread-count knob anywhere: chunk count is `n`, and effective parallelism (`min(pool, n)`) is
+  emergent from whichever rayon pool a call runs under — candle installs no private pool, so this is
+  the one pool the process ever schedules media-batch work on. `fine_tune::media_front_end_pool_threads()`
+  exposes the pool size (`rayon::current_num_threads()`, not a per-batch thread count) as
+  `FinetuneRunTier`'s new `rayon_pool_threads` provenance field (`PROVENANCE_FIELDS` 12 → 13; the
+  exact-count pin against this Rust const lives in
+  `ci/scripts/perf/test_identity_fields_subset.py`, not `identity_fields.py`, which carries no
+  `PROVENANCE_FIELDS` extraction of its own). Bit-identical to the
+  pre-unit sequential loop at every rayon pool size tested (1, 5, 7, 24, including non-dividing
+  counts) — proven for both CLAP-fusion branches (repeatpad; fusion-crop, including the
+  `total == chunk` corner case) and the image batch path. `ci/scripts/perf/frontend_ab.sh` is the
+  contract's pre-registered base/tip A/B driver for this change (interleaved untraced
+  `finetune-run` legs over HTSAT and CLIP-vision, a two-sided bar against the `n / ideal` machine
+  model with the base-to-base spread as its own error bar, and a new committed cuda-run artifact
+  producer distinct from the existing #421 tower-profile artifact), with its own hermetic dry-run
+  suite wired into `ci.yml`. The close-out run (A100 80GB PCIe, P=26, n=24, 3
+  interleaved pairs, `crates/jammi-kernels/artifacts/cuda-runs/2026-09-08-frontend-0a8562c4-a100-pcie.json`)
+  measured HTSAT front-end mean 1.335 s → 0.108 s per step (step wall 1.567 s
+  → 0.344 s), a bar ratio of 0.0809 with interval [0.0772, 0.0871] against
+  bounds [0.0448, 0.0864] — UNRESOLVED under both the driver-default and the
+  run's own measured serial-tail ratio. Per the contract's own Verdict
+  clause the unit ships because bit identity holds (pool sizes 1/5/7/24
+  against the pre-unit reference, `crates/jammi-ai/tests/it/media_front_end.rs`)
+  and the n=1 image serving path stays within its always-on gross latency
+  bar (3x before_min + before_spread); the pre-registered 5 % n=1 bar is
+  opt-in (`JAMMI_FRONTEND_N1_LATENCY=1`) and no serving-latency measurement
+  is recorded, so no serving-regression claim tighter than the always-on
+  bar is made, with these numbers recorded and no parallel-efficiency claim
+  made.
 - **HTSAT's MLP and projection GELU reach the fused seam on the training path (#421).** The audio
   tower's two GELU-erf sites — each Swin block's MLP and the projection head's `"gelu"` arm — call
   the house seam `activations::gelu_erf(x, training)` instead of `Tensor::gelu_erf()` directly, the
@@ -444,6 +496,30 @@ workspace ships every publishable crate at the same
   the positive-proof equation exactly (all three keys, non-vacuity on `calls`, the GELU seam
   non-zero on HTSAT / zero on both OpenCLIP towers) rather than witnessing it on tiny_bert/text
   alone.
+- **`InferenceSession::encode_text_query` refuses an empty/null text query instead of returning an
+  all-zero vector (#421 frontend follow-on).** It read
+  `output.float_outputs[0][..dim].to_vec()` directly, bypassing the checked
+  `BackendOutput::single_row_or_err` accessor `encode_image_query`/`encode_audio_query` already went
+  through (see the entry above) — an empty string still marks its row `row_status[0] == false`
+  (`"Empty or null text input"`, the same convention a corrupt image/audio row uses), so the same
+  silent zero-vector-instead-of-`Err` bug this session's earlier fold closed for image/audio was
+  still open for text. `encode_text_query` now goes through `single_row_or_err(0)` like its two
+  siblings. `BackendOutput` additionally documents its output-head-0 row-major invariant
+  (`shapes[0] = (rows, dim)`, `row_status`/`row_errors` one entry per row, `float_outputs[0].len() ==
+  rows * dim`) and both checked accessors now derive the row count from `shapes[0].0` and refuse, by
+  name, on any producer that violates it (an empty/short `row_status` previously let
+  `all_rows_or_err` fail OPEN — its failed-row scan found nothing wrong and returned the buffer
+  whole, as if every row had succeeded — while `single_row_or_err` already failed closed on the same
+  input); a new `BackendOutput::single_head` constructor validates the invariant at construction
+  time, and `HttpBackend`'s embedding response now builds through it, flattened row-major, instead
+  of one `Vec` per row (a convention neither accessor could read correctly).
+- **`preprocess_clap_fusion`/`preprocess_clap_fusion_indexed` refuse a clip with zero raw samples, or
+  one so short that resampling to the target sample rate rounds it to zero samples, instead of
+  panicking (#421 frontend follow-on).** Both feed `repeatpad`'s `max_length / len`
+  with `len == 0` — an integer-division-by-zero panic that `ClapFrontendConfig::validate()` cannot
+  catch, since neither cause is a domain violation of the config itself. The check runs sequentially
+  over every clip before the parallel per-clip preprocessing stage ever dispatches a closure over
+  them.
 - **#421 profile-campaign follow-ups: five re-audit advisories closed with a landing gate each
   (esc-088).** `ci/scripts/perf/fa2_ab.sh`'s unlabeled `finetune-step` flash/block legs now pass
   `--expect-kernels-disabled` explicitly (empty on the flash leg), so the binary's own START/END
@@ -482,6 +558,18 @@ workspace ships every publishable crate at the same
   name requirement.
 
 ### Breaking
+- `jammi_ai::inference::{arrow_to_images, arrow_to_audio}` return one decode result per row
+  (`Result<Vec<Option<Result<T>>>>`, previously `Result<Vec<Option<T>>>`) and
+  `jammi_ai::inference::schema::build_prefix_columns` returns a `Result`: a row that fails to
+  decode is a per-row value the caller marks in `_status`/`_error`, never a whole-batch error;
+  an unreadable path column value and a `row_status` shorter than the batch are still whole-call
+  refusals. Migration: match the inner `Result` per row (or `?` it to keep whole-batch failure).
+  `arrow_to_images`'s path-valued arm also changed from `image::open(path)` (extension hint AND
+  content sniff) to `std::fs::read` + `load_from_memory` (content sniff only, the same decode
+  path every bytes-valued row already used) — a file whose bytes need the extension to identify
+  now fails to decode where it previously succeeded — and a path-valued row's per-row decode
+  error text changed from `Failed to load image '{path}': {e}` to `Failed to decode image at row
+  N: {e} (path '...')`.
 - `jammi_encoders::{AnyAudioEncoder, AudioEncoder}` are removed
   (`crates/jammi-encoders/src/lib.rs`). The audio-only dispatcher and its trait had no callers
   anywhere in the workspace, and audio is now a first-class `AnyEncoder` variant with real training

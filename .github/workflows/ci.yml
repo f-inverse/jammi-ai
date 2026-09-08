@@ -1766,6 +1766,108 @@ jobs:
           # no GPU, no real jammi-bench, no real checkpoint, no network.
           - name: lora_bias_ab.sh dry-run smoke
             cmd: python3 ci/scripts/perf/test_lora_bias_ab_sh_dry_run.py
+          # `frontend_ab.sh` ITSELF (issue #421 follow-on, "media front-end
+          # parallelization" contract's pre-registered base/tip A/B driver)
+          # -- the same "the shell PRODUCER itself must run in CI at least
+          # once, zero-execution is RED not a skip" doctrine the
+          # `finetune_ab.sh`/`lora_bias_ab.sh` dry-run legs above already
+          # carry. `FRONTEND_AB_DRY_RUN=1` swaps in hermetic stand-in
+          # binaries the script itself generates and validates argv
+          # against; the two real media corpus producers still run for
+          # real under DRY_RUN.
+          - name: frontend_ab.sh dry-run smoke
+            cmd: python3 ci/scripts/perf/test_frontend_ab_dry_run.py
+          # `frontend_ab_merge.py`'s own suite (extracted out of
+          # `frontend_ab.sh`'s own inline heredoc for exactly the reason
+          # `ab_merge.py`'s own suite above was: an inline heredoc had ZERO
+          # automated coverage of its own report-reading code path beyond
+          # whatever the DRY_RUN stub fabricated -- the real A/B rehearsal
+          # on pod p421b found that reader assumed a FLAT report shape when
+          # the real `jammi-bench finetune-run` report nests every field
+          # this driver reads under `tiers.finetune_run`). Drives the real
+          # `load_leg`/`build_report`/`main` entry points against fixture
+          # raw-leg directories, including a REAL, committed,
+          # envelope-trimmed cut of that same rehearsal's own
+          # `htsat__tip__r1.json` (`fixtures/frontend_ab_rehearsal/`) --
+          # never a hand-rolled dict standing in for what a real report
+          # looks like. No GPU, no real jammi-bench, no network.
+          - name: frontend_ab_merge suite
+            cmd: python3 ci/scripts/perf/test_frontend_ab_merge.py
+          # `frontend_ab_artifact.py`'s own suite (#421 follow-on close-out,
+          # contract `perf/421-frontend` v3 "Build" item 1) -- the SECOND,
+          # INDEPENDENT reader after `frontend_ab_merge.py`: enumerates
+          # `--raw-dir` itself and refuses BY NAME unless its own leg set
+          # (and `--report-json`'s own `towers` object) equals EXACTLY
+          # TOWERS x ROLES x {r1..r<repeats>} in BOTH directions (an extra
+          # leg left over from a stale re-run, or a missing one, before a
+          # single number is read), then re-derives every leg's own
+          # `front_per_step`/`train_per_step` and the HTSAT bar's own
+          # `p`/`ideal`/bounds/`ratio`/`ratio_lo`/`ratio_hi`/`verdict`
+          # DIRECTLY from the raw legs (never imports `frontend_ab_merge.py`'s
+          # own bar arithmetic -- a second, independent implementation of the
+          # SAME pinned formula), refusing the moment any re-derived number
+          # disagrees with `report.json`'s own value, the per-leg
+          # `task`/`device_name` disagree with the tower/box being read, `r`
+          # (read from `report.json` and from a committed `--serial-tail`
+          # fixture, never a CLI float) falls outside its own `[0, 1)`
+          # domain, a would-be divisor is zero/non-positive, or the
+          # driver-default vs the run's own measured serial-tail ratio
+          # disagree on the bar's own verdict (the "verdict invariant" this
+          # contract names is a checked equality here, not prose). A `git
+          # init`'d tempdir repo (mirroring `check_cuda_run_artifacts.py`'s
+          # own self-test discipline) drives the "files changed after the
+          # measured tip" deviation: it is RECORDED mechanically regardless
+          # of whether the changed files sit on this unit's own hot path --
+          # never a refusal (a file diff alone cannot judge whether an edit
+          # changed timed behaviour; that judgement lives in `--identity`'s
+          # own reviewed commentary, attached alongside the mechanical list).
+          # Every numeric field is checked against an INDEPENDENT third
+          # arithmetic oracle written in the test file itself. A dedicated
+          # regression class drives the REAL, committed pod-p421c fixture
+          # (`fixtures/frontend_ab_final/`) end to end against this
+          # checkout's own git history -- both ancestry (`base_sha`/
+          # `tip_sha` must be reachable) and the post-tip diff need real
+          # history, hence `fetch_depth: "0"` below, the same exception the
+          # "CUDA run artifact schema"/"pod build timings" legs already
+          # carry. `JAMMI_CI_FRONTEND_AB_FINAL_FIXTURE_EXPECTED=1` (this
+          # repo's own zero-execution-is-RED doctrine, the
+          # `JAMMI_CI_SAFETENSORS_EXPECTED` precedent above) turns that
+          # regression class's own two "not applicable here" skips (fixture
+          # directory absent; history missing the fixture's shas) into a
+          # hard RED in CI, so the real-fixture class actually executes
+          # every run rather than silently re-skipping if the fixture is
+          # ever deleted or `fetch_depth: "0"` is ever dropped. The
+          # committed-record freshness gate (`assert_committed_artifact_not_
+          # stale`) is split into two arms: arm (a) is HEAD-independent (it
+          # checks the record against the artifact file's own last commit
+          # and that commit's own parent, via git plumbing, never against
+          # whatever this checkout's own HEAD happens to be -- so it is
+          # unaffected by `refs/pull/N/merge`'s own synthetic merge commit,
+          # or by later, unrelated commits on `main`); arm (b) additionally
+          # engages once `resolve_unit_head_sha` (in the test file itself)
+          # normalises `JAMMI_CI_UNIT_HEAD_SHA` -- set here to this PR's own
+          # head sha on a `pull_request`/`pull_request_target` checkout,
+          # falling back to the literal `push` on a `push` checkout, never
+          # empty on either. `JAMMI_CI_UNIT_BASE_SHA` is the PR's own base
+          # sha (empty on a push checkout): arm (b) engages only when the
+          # artifact's own commit lies in this PR's range -- a PR whose base
+          # already carries the artifact merely inherits it and is never red
+          # for commits it did not make. `resolve_unit_head_sha` also cross-checks the
+          # resolved value against `GITHUB_EVENT_NAME` (a GitHub Actions
+          # built-in already present on this job, no extra wiring needed):
+          # the `push` sentinel on a `pull_request`/`pull_request_target`
+          # event, or any non-sentinel value on a `push` event, is a named
+          # refusal citing both variables, never silently resolved. Past
+          # that cross-check the raw value normalises into either a
+          # resolved sha (arm (b) engages: the artifact's own last commit
+          # must equal it, so ANY later commit on the PR, whether or not it
+          # touches a file the record already names, reds named, rather
+          # than only the subset arm (a) alone can see) or `None` (the
+          # `push` sentinel; arm (a) alone applies, recorded via a printed
+          # notice in the test's own stdout). No GPU, no network.
+          - name: frontend_ab_artifact suite
+            cmd: JAMMI_CI_FRONTEND_AB_FINAL_FIXTURE_EXPECTED=1 JAMMI_CI_UNIT_HEAD_SHA=${{ github.event.pull_request.head.sha || 'push' }} JAMMI_CI_UNIT_BASE_SHA=${{ github.event.pull_request.base.sha || '' }} python3 ci/scripts/perf/test_frontend_ab_artifact.py
+            fetch_depth: "0"
           # `fa2_ab.sh`'s own shape test: the shell PRODUCER is a manual,
           # exclusive-timing-box script with hardcoded `/root/...` paths
           # and no `DRY_RUN` support at all, so this covers its flash/block

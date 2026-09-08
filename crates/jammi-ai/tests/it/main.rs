@@ -27,6 +27,7 @@ mod import_pipeline;
 mod inference;
 mod jammi;
 mod local_session;
+mod media_front_end;
 mod merger;
 mod models;
 mod neighbor_graph;

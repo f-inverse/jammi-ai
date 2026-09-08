@@ -47,6 +47,21 @@ use crate::model::{LoadedModel, ModelTask};
 /// [`Self::single_row_or_err`]/[`Self::all_rows_or_err`], whose task
 /// adapters (`ClassificationAdapter`, `NerAdapter`) read `float_outputs`/
 /// `string_outputs` directly instead.
+///
+/// # The empty-batch shape: `(0, 0)`
+///
+/// A zero-row batch is reported as `shapes[0] = (0, 0)` by every
+/// float-embedding producer in this crate (`CandleModel::forward_embedding`
+/// / `forward_image_embedding` / `forward_audio_embedding`, and
+/// `HttpBackend::forward_embeddings`), never `(0, <a known dim>)`: `(rows,
+/// 0)` is already this doc's own "no real embedding" shape, and `(0, 0)` is
+/// the ONE such shape every producer can report honestly, including a
+/// remote backend that has no model config and so cannot know an embedding
+/// width before a request completes. This value is descriptive only —
+/// `EmbeddingAdapter::adapt`'s own `row_count == 0` branch never reads
+/// `shapes` at all, building the empty output off its own separately-known
+/// `dimensions` field instead — but every producer still reports it
+/// uniformly rather than each picking its own placeholder.
 #[derive(Debug)]
 pub struct BackendOutput {
     /// Numeric output tensors flattened to 1-D (one vec per output head).

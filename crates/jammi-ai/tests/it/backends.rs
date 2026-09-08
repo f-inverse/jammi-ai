@@ -222,30 +222,49 @@ async fn http_backend_refuses_more_response_rows_than_inputs() {
     assert!(msg.contains('3') && msg.contains('2'), "got: {msg}");
 }
 
-/// A response with ZERO rows (and zero inputs, so the count-mismatch check
-/// above does not fire first) must still be refused — there is nothing to
-/// hand back, and `response.data[0]` below would have no element 0 to read
-/// `dim` off. Verified by temporarily removing the `n == 0` check: this test
-/// goes RED (a panic reading `response.data[0].embedding.len()` instead of
-/// the `Err` asserted below).
+/// Advisory #421-frontend-follow-on-4: an empty batch of INPUTS (`&[]`) must
+/// send NO request at all and return `Ok` with `BackendOutput`'s shared
+/// empty-batch shape `(0, 0)` — the SAME shape `CandleModel::forward_embedding`
+/// / `forward_image_embedding` / `forward_audio_embedding` return for
+/// `num_rows == 0` (see `crates/jammi-ai/src/inference/adapter/mod.rs`'s
+/// `BackendOutput` doc, "The empty-batch shape: `(0, 0)`"), never the old
+/// `Err("HTTP embedding request needs at least one input")`. No `Mock` is
+/// mounted on `server` here — if `forward` sent a request anyway, wiremock's
+/// own unmatched-request panic (or, at minimum, a non-2xx-driven `Err`
+/// instead of the `Ok` asserted below) would fail this test; `received_
+/// requests()` asserts the same fact directly and by name rather than
+/// relying on that panic alone.
 #[tokio::test]
-async fn http_backend_refuses_zero_response_rows() {
+async fn http_backend_empty_batch_matches_embedded_shape_and_sends_no_request() {
     let server = MockServer::start().await;
-    Mock::given(method("POST"))
-        .and(path("/v1/embeddings"))
-        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({ "data": [] })))
-        .mount(&server)
-        .await;
 
     let backend = HttpBackend::new(Duration::from_secs(5)).unwrap();
-    let err = backend
+    let result = backend
         .forward(&server.uri(), &[], "test-model", ModelTask::TextEmbedding)
         .await
-        .expect_err("zero response rows must be a typed refusal, never a panic");
+        .expect("an empty input batch must succeed with the shared empty-batch shape");
+
+    assert_eq!(
+        result.float_outputs,
+        vec![Vec::<f32>::new()],
+        "one (empty) float head, matching CandleModel's own empty-batch float_outputs"
+    );
+    assert!(result.string_outputs.is_empty());
+    assert!(result.row_status.is_empty());
+    assert!(result.row_errors.is_empty());
+    assert_eq!(
+        result.shapes,
+        vec![(0, 0)],
+        "must match CandleModel's own (0, 0) empty-batch shape, not a fabricated dim"
+    );
+
+    let requests = server
+        .received_requests()
+        .await
+        .expect("wiremock request recording must be enabled by default");
     assert!(
-        err.to_string().contains("at least one input"),
-        "got: {}",
-        err
+        requests.is_empty(),
+        "an empty input batch must send no request at all, got: {requests:?}"
     );
 }
 

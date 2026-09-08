@@ -769,7 +769,7 @@ class LegacyNonAncestorExemptionTests(GitFixture):
         )
         self._commit("add legacy artifact citing the non-ancestor sha")
 
-        violations, exemptions, _plan_contract_coverage = cc._check_file_impl(artifact)
+        violations, exemptions, _plan_contract_coverage, _unseen = cc._check_file_impl(artifact)
         self.assertEqual(violations, [], [str(v) for v in violations])
         self.assertEqual(len(exemptions), 1)
         msg = str(exemptions[0])
@@ -803,7 +803,7 @@ class LegacyNonAncestorExemptionTests(GitFixture):
         )
         self._commit("add legacy artifact")
 
-        violations, exemptions, _plan_contract_coverage = cc._check_file_impl(artifact)
+        violations, exemptions, _plan_contract_coverage, _unseen = cc._check_file_impl(artifact)
         self.assertEqual(violations, [])
         self.assertEqual(len(exemptions), 1)
 
@@ -850,7 +850,7 @@ class LegacyNonAncestorExemptionTests(GitFixture):
         )
         self._commit("add artifact with a genuinely wrong citation")
 
-        violations, exemptions, _plan_contract_coverage = cc._check_file_impl(artifact)
+        violations, exemptions, _plan_contract_coverage, _unseen = cc._check_file_impl(artifact)
         self.assertEqual(exemptions, [])
         self.assertEqual(len(violations), 1)
         self.assertIn("recorded git_sha", violations[0].message)
@@ -1339,7 +1339,7 @@ class InlineCommitPinResolutionTests(GitFixture):
             f"/// `real_thing` (`crates/other-crate/src/target.rs:2` at HEAD `{unknown_sha}`)\n",
         )
         self._commit("add citing source with an unknown pin")
-        violations, exemptions, _plan_contract_coverage = cc._check_file_impl(source)
+        violations, exemptions, _plan_contract_coverage, _unseen = cc._check_file_impl(source)
         self.assertEqual(violations, [], [str(v) for v in violations])
         self.assertEqual(len(exemptions), 1)
         self.assertIn("EXEMPT", str(exemptions[0]))
@@ -1525,6 +1525,38 @@ class FileCitationsEpochHeaderTests(GitFixture):
         self.assertEqual(len(violations), 1, [str(v) for v in violations])
         self.assertIn("STALE", violations[0].message)
 
+    def test_unseen_suffix_token_in_an_epoch_pinned_file_is_a_named_diagnostic_never_a_violation(self):
+        """Module doc's "An unseen-suffix path-like token is a diagnostic,
+        never a Violation" section: a backtick-quoted `<path>.txt:<line>`
+        token's extension is not in `_FULL_PATH_SUFFIXES`, so no citation
+        recognizer in this file can ever match it -- it must surface as a
+        NAMED diagnostic (never silently dropped), and must never itself
+        become a `Violation`."""
+        good_sha = self._two_revisions()
+        doc = self._write(
+            "doc.md",
+            f"<!-- citations-resolve-at: {good_sha} -->\n\n"
+            "`real_thing` (`fake.rs:2`); see also `notes.txt:12` for context.\n",
+        )
+        self._commit("add doc with an unseen-suffix token")
+        violations, _exemptions, _pc, unseen = cc._check_file_impl(doc)
+        self.assertEqual(violations, [], [str(v) for v in violations])
+        self.assertEqual(len(unseen), 1, unseen)
+        upath, line_no, token = unseen[0]
+        self.assertEqual(upath, doc)
+        self.assertIn("notes.txt:12", token)
+
+    def test_unseen_suffix_token_outside_an_epoch_pinned_file_is_not_collected(self):
+        """The diagnostic is scoped to EPOCH-PINNED files only -- an
+        ordinary HEAD-relative `.md` file carrying the identical
+        unseen-suffix token is not scanned for it at all (this scope was
+        never meant to widen into every file this script touches)."""
+        doc = self._write("doc.md", "see `notes.txt:12` for context.\n")
+        self._commit("add an ordinary doc with an unseen-suffix token")
+        violations, _exemptions, _pc, unseen = cc._check_file_impl(doc)
+        self.assertEqual(violations, [], [str(v) for v in violations])
+        self.assertEqual(unseen, [])
+
 
 class PlanContractCitationTests(GitFixture):
     """The `_PLAN_CONTRACT_ROOTS` bare-basename / full-path
@@ -1647,34 +1679,83 @@ class PlanContractCitationTests(GitFixture):
         violations = cc.check_file(doc)
         self.assertEqual(violations, [], [str(v) for v in violations])
 
-    def test_contract_md_without_the_epoch_header_is_a_violation_never_a_silent_skip(self):
-        """Never-checked must never read as checked-clean: `CONTRACT.md`
-        itself (`_is_frozen_contract_file`) with NO `citations-resolve-at:`
-        header is itself a `Violation` now -- the old behaviour (silently
-        skip the whole plan-contract citation scan, report zero violations)
-        was mechanically indistinguishable from "every citation resolves".
+    def test_frozen_marker_via_first_heading_without_the_epoch_header_is_a_violation(self):
+        """Never-checked must never read as checked-clean: a `.md` file
+        whose FIRST heading names it a contract (`_is_frozen_contract_
+        file`'s heading arm) with NO `citations-resolve-at:` header is
+        itself a `Violation` -- the old behaviour (silently skip the whole
+        plan-contract citation scan, report zero violations) was
+        mechanically indistinguishable from "every citation resolves".
+        Deliberately named something OTHER than `CONTRACT.md` -- recognition
+        comes from the declared heading, never the filename.
         """
         self._write("crates/foo/trainer.rs", "line one\n")
         self._commit("add trainer.rs")
-        doc = self._write("CONTRACT.md", "`trainer.rs:999`\n")
-        self._commit("add contract without a header")
+        doc = self._write("PLAN.md", "# CONTRACT\n\n`trainer.rs:999`\n")
+        self._commit("add a heading-marked frozen doc without a header")
+        violations = cc.check_file(doc)
+        self.assertEqual(len(violations), 1, [str(v) for v in violations])
+        self.assertIn("declares no 'citations-resolve-at:' header", violations[0].message)
+
+    def test_frozen_marker_via_html_comment_without_the_epoch_header_is_a_violation(self):
+        """The OTHER marker arm: a `<!-- Frozen ... -->` HTML comment,
+        with no heading at all, is equally sufficient to mark a file frozen
+        -- and equally mandatory about the epoch header once it does."""
+        self._write("crates/foo/trainer.rs", "line one\n")
+        self._commit("add trainer.rs")
+        doc = self._write(
+            "PLAN.md",
+            "<!-- Frozen ledger ts: 2026-01-01 -->\n\n`trainer.rs:999`\n",
+        )
+        self._commit("add a comment-marked frozen doc without a header")
+        violations = cc.check_file(doc)
+        self.assertEqual(len(violations), 1, [str(v) for v in violations])
+        self.assertIn("declares no 'citations-resolve-at:' header", violations[0].message)
+
+    def test_a_renamed_or_versioned_contract_file_is_still_caught_by_its_marker(self):
+        """A frozen contract renamed/versioned into its own title
+        (`CONTRACT-v2.5.md`, this plan group's own real shape) is caught
+        exactly the same way a plain `CONTRACT.md` would be -- recognition
+        is the declared marker, never the literal filename."""
+        self._write("crates/foo/trainer.rs", "line one\n")
+        self._commit("add trainer.rs")
+        doc = self._write(
+            "CONTRACT-v2.5.md",
+            "<!-- Frozen ledger ts: 2026-01-01 -->\n\n# CONTRACT -- v2.5\n\n`trainer.rs:999`\n",
+        )
+        self._commit("add a renamed frozen contract without a header")
         violations = cc.check_file(doc)
         self.assertEqual(len(violations), 1, [str(v) for v in violations])
         self.assertIn("declares no 'citations-resolve-at:' header", violations[0].message)
 
     def test_a_companion_doc_without_the_header_is_still_not_a_violation(self):
         """The mandatory-header rule is scoped to `_is_frozen_contract_file`
-        (`CONTRACT.md` itself), never to every `.md` file `_plan_contract_
-        scope` recognizes: a companion doc in the same plan directory (e.g.
-        a close-out `README.md`) that never declares the header stays
-        completely unaffected, exactly as before -- it may legitimately
-        cite a mix of the frozen contract's own facts and the CURRENT tree
-        in the same paragraph, which a single whole-file epoch pin could
-        never honestly cover."""
+        (a declared FROZEN marker), never to every `.md` file `_plan_
+        contract_scope` recognizes: a companion doc in the same plan
+        directory (e.g. a close-out `README.md`) that carries NEITHER
+        marker shape and never declares the header stays completely
+        unaffected, exactly as before -- it may legitimately cite a mix of
+        the frozen contract's own facts and the CURRENT tree in the same
+        paragraph, which a single whole-file epoch pin could never honestly
+        cover."""
         self._write("crates/foo/trainer.rs", "line one\n")
         self._commit("add trainer.rs")
         doc = self._write("README.md", "`trainer.rs:999`\n")
         self._commit("add companion doc without a header")
+        violations = cc.check_file(doc)
+        self.assertEqual(violations, [], [str(v) for v in violations])
+
+    def test_a_later_heading_naming_contract_does_not_retroactively_mark_the_file_frozen(self):
+        """Only the FIRST heading in the search window is consulted -- a
+        document whose first heading is unrelated is never caught by some
+        deeper section heading that happens to mention "CONTRACT", and (with
+        no header declared and no citation this script's own `_KNOWN_FILES`
+        recognizes) produces no violation at all."""
+        doc = self._write(
+            "NOTES.md",
+            "# Notes\n\nSome prose.\n\n## CONTRACT recap\n\n`trainer.rs:999`\n",
+        )
+        self._commit("add a doc whose first heading is unrelated")
         violations = cc.check_file(doc)
         self.assertEqual(violations, [], [str(v) for v in violations])
 
@@ -1683,14 +1764,15 @@ class PlanContractCitationTests(GitFixture):
         `_CITATIONS_EPOCH_HEADER_SEARCH_LINES` reads byte-for-byte like
         absent to `_file_citations_epoch` -- so it must be equally red, not
         silently ignored just because the string is present somewhere later
-        in the file (checked against `CONTRACT.md` itself, the file class
-        the mandatory-header rule actually applies to)."""
+        in the file (the FROZEN marker itself sits on line 1, well inside
+        the search window -- only the epoch header is pushed past it)."""
         self._write("crates/foo/trainer.rs", "line one\n")
         good_sha = self._commit("add trainer.rs")
+        marker = "<!-- Frozen ledger ts: 2026-01-01 -->"
         padding = "\n".join(f"filler line {i}" for i in range(1, 10))
         doc = self._write(
             "CONTRACT.md",
-            f"{padding}\n\n<!-- citations-resolve-at: {good_sha} -->\n\n`trainer.rs:1`\n",
+            f"{marker}\n\n{padding}\n\n<!-- citations-resolve-at: {good_sha} -->\n\n`trainer.rs:1`\n",
         )
         self._commit("add contract with a too-late header")
         violations = cc.check_file(doc)

@@ -132,6 +132,20 @@ jobs:
           # python3-unavailable skip (KO-7 gate, see ci/kernel-oracle-helpers.txt)
           # must never fire silently here — a skip on this lane is a defect.
           JAMMI_REQUIRE_MEDIA_SMOKE: "1"
+          # The chmod fault-injection probes (`crates/jammi-ai/tests/it/`
+          # `{models,context_predictor,fine_tune}.rs`,
+          # `crates/jammi-db/src/store/artifact.rs`) skip loudly — never
+          # silently — when a 0o000-chmod'd path is still readable/writable
+          # (root, or a mode-ignoring filesystem). This container's `Run
+          # tests` step runs as root by default (no non-root `USER` in
+          # `.docker/ci.Dockerfile`), which is exactly the bypass condition
+          # the probes exist to catch, so leaving this unset here would let
+          # the probes go quietly inert on the one lane that actually runs
+          # `cargo test -p jammi-ai` / `-p jammi-db`. `JAMMI_REQUIRE_POSIX_PERMS=1`
+          # turns that silent skip into a hard failure, the same
+          # require-gate polarity as every other `JAMMI_REQUIRE_*` in this
+          # step.
+          JAMMI_REQUIRE_POSIX_PERMS: "1"
           # The K4 literal pin (bits_snapshot.rs, KO-7 gate, see
           # ci/kernel-oracle-helpers.txt's `k4_snapshot_require_gate` row) is a
           # SAME-CPU-MODEL oracle: its rows are keyed by exact CPU model, not

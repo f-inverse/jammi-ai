@@ -458,18 +458,18 @@ async fn open_clip_text_tower_adapter_serves_cold_after_restart() {
         "open_clip text (cold vs warm)",
     );
 
-    common::assert_esc089_cold_restart_controls(
-        dir.path(),
-        &session,
-        &cold_session,
-        job.model_id(),
-        "open_clip text",
-        &base_embedding,
-        &warm_embedding,
-        &cold_embedding,
-        &common::text_serve(base_model.clone(), PROBE),
-        &common::text_serve(job.model_id().to_string(), PROBE),
-    )
+    common::assert_esc089_cold_restart_controls(common::Esc089ColdRestartControls {
+        session_root: dir.path(),
+        warm_session: &session,
+        cold_session: &cold_session,
+        model_id: job.model_id(),
+        label: "open_clip text",
+        v_base: &base_embedding,
+        v_warm: &warm_embedding,
+        v_cold: &cold_embedding,
+        serve_base: &common::text_serve(base_model.clone(), PROBE),
+        serve_tuned: &common::text_serve(job.model_id().to_string(), PROBE),
+    })
     .await;
 }
 
@@ -840,18 +840,18 @@ async fn open_clip_vision_tower_adapter_serves_cold_after_restart() {
     );
 
     let probe_bytes = Arc::new(probe_bytes);
-    common::assert_esc089_cold_restart_controls(
-        dir.path(),
-        &session,
-        &cold_session,
-        job.model_id(),
-        "open_clip vision",
-        &base_embedding,
-        &warm_embedding,
-        &cold_embedding,
-        &common::image_serve(base_model.clone(), Arc::clone(&probe_bytes)),
-        &common::image_serve(job.model_id().to_string(), Arc::clone(&probe_bytes)),
-    )
+    common::assert_esc089_cold_restart_controls(common::Esc089ColdRestartControls {
+        session_root: dir.path(),
+        warm_session: &session,
+        cold_session: &cold_session,
+        model_id: job.model_id(),
+        label: "open_clip vision",
+        v_base: &base_embedding,
+        v_warm: &warm_embedding,
+        v_cold: &cold_embedding,
+        serve_base: &common::image_serve(base_model.clone(), Arc::clone(&probe_bytes)),
+        serve_tuned: &common::image_serve(job.model_id().to_string(), Arc::clone(&probe_bytes)),
+    })
     .await;
 }
 
@@ -1036,18 +1036,18 @@ async fn clap_audio_tower_adapter_serves_cold_after_restart() {
     );
 
     let probe_bytes = Arc::new(probe_bytes);
-    common::assert_esc089_cold_restart_controls(
-        dir.path(),
-        &session,
-        &cold_session,
-        job.model_id(),
-        "clap audio",
-        &base_embedding,
-        &warm_embedding,
-        &cold_embedding,
-        &common::audio_serve(base_model.clone(), Arc::clone(&probe_bytes)),
-        &common::audio_serve(job.model_id().to_string(), Arc::clone(&probe_bytes)),
-    )
+    common::assert_esc089_cold_restart_controls(common::Esc089ColdRestartControls {
+        session_root: dir.path(),
+        warm_session: &session,
+        cold_session: &cold_session,
+        model_id: job.model_id(),
+        label: "clap audio",
+        v_base: &base_embedding,
+        v_warm: &warm_embedding,
+        v_cold: &cold_embedding,
+        serve_base: &common::audio_serve(base_model.clone(), Arc::clone(&probe_bytes)),
+        serve_tuned: &common::audio_serve(job.model_id().to_string(), Arc::clone(&probe_bytes)),
+    })
     .await;
 }
 

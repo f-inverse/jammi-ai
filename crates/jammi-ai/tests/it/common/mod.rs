@@ -311,23 +311,61 @@ pub async fn assert_deleted_adapter_refuses_by_name(
     }
 }
 
+/// Named-field parameter bundle for [`assert_esc089_cold_restart_controls`].
+///
+/// The positional 10-arg signature this replaces held three same-typed
+/// `&[f32]` (`v_base`/`v_warm`/`v_cold`) and two same-typed `&ServeFn`
+/// (`serve_base`/`serve_tuned`) back to back — a caller transposing any pair
+/// compiles silently and asserts the wrong control. Named fields make a
+/// transposition a field-name typo instead. Follows this repo's
+/// params-struct convention for a naturally-wide argument list (see
+/// `crates/jammi-ai/src/fine_tune/worker.rs`'s `ModelRegistration`) rather
+/// than `#[allow(clippy::too_many_arguments)]`.
+pub struct Esc089ColdRestartControls<'a> {
+    /// The session's on-disk root, needed to locate and delete
+    /// `adapter.safetensors` for the negative control.
+    pub session_root: &'a Path,
+    /// The training instance's still-open session (serves `v_base`/`v_warm`).
+    pub warm_session: &'a InferenceSession,
+    /// A second, freshly-opened session over the same catalog/artifact dir
+    /// (serves `v_cold`).
+    pub cold_session: &'a InferenceSession,
+    /// The fine-tuned model id under test.
+    pub model_id: &'a str,
+    /// A short human-readable label for this call's assertions/panics.
+    pub label: &'a str,
+    /// The base model's embedding, captured in the warm session.
+    pub v_base: &'a [f32],
+    /// The fine-tuned model's embedding, captured in the warm session.
+    pub v_warm: &'a [f32],
+    /// The fine-tuned model's embedding, captured in the cold session.
+    pub v_cold: &'a [f32],
+    /// Re-serves the base model (used for the "served twice" positive
+    /// control), applied to `warm_session`.
+    pub serve_base: &'a ServeFn,
+    /// Re-serves the fine-tuned model, applied to `cold_session` for the
+    /// negative control after `adapter.safetensors` is deleted.
+    pub serve_tuned: &'a ServeFn,
+}
+
 /// Runs the FULL esc-089 `symptom_spec.control` set against one
 /// already-completed cold-restart round trip. Called identically by
 /// `tower_adapters.rs`'s three cross-modal `*_serves_cold_after_restart`
 /// tests and `fine_tune.rs`'s BERT-family peer.
-#[allow(clippy::too_many_arguments)]
-pub async fn assert_esc089_cold_restart_controls(
-    session_root: &Path,
-    warm_session: &InferenceSession,
-    cold_session: &InferenceSession,
-    model_id: &str,
-    label: &str,
-    v_base: &[f32],
-    v_warm: &[f32],
-    v_cold: &[f32],
-    serve_base: &ServeFn,
-    serve_tuned: &ServeFn,
-) {
+pub async fn assert_esc089_cold_restart_controls(controls: Esc089ColdRestartControls<'_>) {
+    let Esc089ColdRestartControls {
+        session_root,
+        warm_session,
+        cold_session,
+        model_id,
+        label,
+        v_base,
+        v_warm,
+        v_cold,
+        serve_base,
+        serve_tuned,
+    } = controls;
+
     // Positive controls (warm session).
     assert_finite_and_nondegenerate(v_base, &format!("{label}: v_base"));
     assert_finite_and_nondegenerate(v_warm, &format!("{label}: v_warm"));

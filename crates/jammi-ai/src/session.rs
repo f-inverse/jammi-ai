@@ -15,6 +15,7 @@ use crate::eval::runner::EvalRunner;
 use crate::fine_tune::spec::{TrainingCommon, TrainingSpec};
 use crate::fine_tune::training_job::{fine_tuned_model_id, TrainingJob};
 use crate::fine_tune::{FineTuneConfig, FineTuneMethod};
+use crate::inference::adapter::BackendOutput;
 use crate::inference::observer::InferenceObserver;
 use crate::model::backend::DeviceConfig;
 use crate::model::cache::ModelCache;
@@ -818,38 +819,7 @@ impl InferenceSession {
         }
         let col: arrow::array::ArrayRef = Arc::new(StringArray::from(texts.to_vec()));
         let output = loaded.forward(&[col], ModelTask::Regression)?;
-        let (num_rows, head_width) = *output.shapes.first().ok_or_else(|| {
-            JammiError::Inference(
-                "served_regression_col_for_test: backend emitted no output-head shape".into(),
-            )
-        })?;
-        if col_idx >= head_width {
-            return Err(JammiError::Inference(format!(
-                "served_regression_col_for_test: col_idx {col_idx} out of range for head_width \
-                 {head_width}"
-            )));
-        }
-        let flat = output.float_outputs.first().ok_or_else(|| {
-            JammiError::Inference(
-                "served_regression_col_for_test: backend emitted no float head".into(),
-            )
-        })?;
-        if flat.len() != num_rows * head_width || output.row_status.len() != num_rows {
-            return Err(JammiError::Inference(format!(
-                "served_regression_col_for_test: backend output is inconsistent (float_outputs[0] \
-                 has {} value(s), row_status has {} entries, expected rows({num_rows}) * \
-                 head_width({head_width}) and one row_status entry per row)",
-                flat.len(),
-                output.row_status.len()
-            )));
-        }
-        let mut col = Vec::with_capacity(num_rows);
-        for row in 0..num_rows {
-            if output.row_status[row] {
-                col.push(flat[row * head_width + col_idx]);
-            }
-        }
-        Ok(col)
+        extract_test_column(&output, col_idx)
     }
 
     /// Run inference on a registered source using a model.
@@ -1453,6 +1423,56 @@ impl InferenceSession {
     }
 }
 
+/// The validation core of [`InferenceSession::served_regression_col_for_test`]:
+/// pulls distribution column `col_idx` out of a regression `BackendOutput`,
+/// refusing (rather than indexing blindly) whenever the output's shape,
+/// float head, or row-count bookkeeping is inconsistent. Extracted to a free
+/// function of `&BackendOutput` (a `BackendOutput` literal, not a live model
+/// forward pass) so each fail-closed arm has a direct, deterministic oracle.
+fn extract_test_column(output: &BackendOutput, col_idx: usize) -> Result<Vec<f32>> {
+    let (num_rows, head_width) = *output.shapes.first().ok_or_else(|| {
+        JammiError::Inference(
+            "served_regression_col_for_test: backend emitted no output-head shape".into(),
+        )
+    })?;
+    if col_idx >= head_width {
+        return Err(JammiError::Inference(format!(
+            "served_regression_col_for_test: col_idx {col_idx} out of range for head_width \
+             {head_width}"
+        )));
+    }
+    let flat = output.float_outputs.first().ok_or_else(|| {
+        JammiError::Inference(
+            "served_regression_col_for_test: backend emitted no float head".into(),
+        )
+    })?;
+    // Checked multiply (mirrors `BackendOutput::checked_rows`'s
+    // `rows.checked_mul(dim)`): a raw `num_rows * head_width` could silently
+    // overflow on an adversarial shape.
+    let expected = num_rows.checked_mul(head_width).ok_or_else(|| {
+        JammiError::Inference(format!(
+            "served_regression_col_for_test: num_rows*head_width overflows (num_rows={num_rows}, \
+             head_width={head_width})"
+        ))
+    })?;
+    if flat.len() != expected || output.row_status.len() != num_rows {
+        return Err(JammiError::Inference(format!(
+            "served_regression_col_for_test: backend output is inconsistent (float_outputs[0] \
+             has {} value(s), row_status has {} entries, expected rows({num_rows}) * \
+             head_width({head_width}) and one row_status entry per row)",
+            flat.len(),
+            output.row_status.len()
+        )));
+    }
+    let mut col = Vec::with_capacity(num_rows);
+    for row in 0..num_rows {
+        if output.row_status[row] {
+            col.push(flat[row * head_width + col_idx]);
+        }
+    }
+    Ok(col)
+}
+
 /// Construct the session's [`ResultStore`], honouring `config.storage`.
 ///
 /// When `storage.result_root` is set, result tables (Parquet + USearch
@@ -1533,5 +1553,108 @@ fn fine_tune_loss_type(config: &FineTuneConfig, task: ModelTask) -> String {
             .embedding_loss
             .map(|l| format!("{l:?}"))
             .unwrap_or_else(|| "auto".into())
+    }
+}
+
+#[cfg(test)]
+mod extract_test_column_tests {
+    use super::*;
+
+    fn two_rows_width2(status: Vec<bool>) -> BackendOutput {
+        BackendOutput {
+            float_outputs: vec![vec![1.0, 2.0, 3.0, 4.0]],
+            string_outputs: vec![],
+            row_status: status,
+            row_errors: vec![String::new(), String::new()],
+            shapes: vec![(2, 2)],
+        }
+    }
+
+    #[test]
+    fn extracts_the_requested_column_skipping_failed_rows() {
+        let out = two_rows_width2(vec![true, false]);
+        let col = extract_test_column(&out, 0).unwrap();
+        assert_eq!(col, vec![1.0]);
+    }
+
+    /// A `BackendOutput` with no shape entry at all must be a named refusal,
+    /// not an index into an absent element 0. Verified by temporarily
+    /// reverting the `shapes.first()` guard to an unchecked `output.shapes[0]`:
+    /// this test goes RED (a panic, not the `Err` asserted below).
+    #[test]
+    fn refuses_when_no_output_head_shape_is_present() {
+        let out = BackendOutput {
+            float_outputs: vec![vec![1.0, 2.0]],
+            string_outputs: vec![],
+            row_status: vec![true],
+            row_errors: vec![String::new()],
+            shapes: vec![],
+        };
+        let err = extract_test_column(&out, 0).unwrap_err();
+        assert!(err.to_string().contains("output-head shape"), "{err}");
+    }
+
+    /// A `BackendOutput` with no float head at all must be a named refusal,
+    /// not an index into an absent element 0. Verified by temporarily
+    /// reverting the `float_outputs.first()` guard to an unchecked
+    /// `output.float_outputs[0]`: this test goes RED (a panic, not the `Err`
+    /// asserted below).
+    #[test]
+    fn refuses_when_no_float_head_is_present() {
+        let out = BackendOutput {
+            float_outputs: vec![],
+            string_outputs: vec![],
+            row_status: vec![true, true],
+            row_errors: vec![String::new(), String::new()],
+            shapes: vec![(2, 2)],
+        };
+        let err = extract_test_column(&out, 0).unwrap_err();
+        assert!(err.to_string().contains("no float head"), "{err}");
+    }
+
+    /// A flat buffer / `row_status` that disagree with `num_rows * head_width`
+    /// must be a named refusal, not a read past (or short of) the intended
+    /// rows. Verified by temporarily removing the consistency check: this
+    /// test goes RED (an out-of-bounds index panic, not the `Err` asserted
+    /// below).
+    #[test]
+    fn refuses_when_flat_and_row_status_disagree_with_shape() {
+        let out = BackendOutput {
+            // shapes say 2 rows of width 2 (4 values); the flat buffer is one
+            // short, and row_status is short too.
+            float_outputs: vec![vec![1.0, 2.0, 3.0]],
+            string_outputs: vec![],
+            row_status: vec![true],
+            row_errors: vec![String::new()],
+            shapes: vec![(2, 2)],
+        };
+        let err = extract_test_column(&out, 0).unwrap_err();
+        assert!(err.to_string().contains("inconsistent"), "{err}");
+    }
+
+    /// `num_rows * head_width` computed with a raw multiply could silently
+    /// overflow on an adversarial shape; the checked multiply must refuse by
+    /// name instead. Verified by temporarily reverting the checked multiply
+    /// to a raw `num_rows * head_width`: this test goes RED (a debug-mode
+    /// overflow panic, or a wrapped small `expected` in release, rather than
+    /// the `Err` asserted below).
+    #[test]
+    fn refuses_an_overflowing_num_rows_times_head_width_without_panicking() {
+        let out = BackendOutput {
+            float_outputs: vec![vec![]],
+            string_outputs: vec![],
+            row_status: vec![],
+            row_errors: vec![],
+            shapes: vec![(usize::MAX, 2)],
+        };
+        let err = extract_test_column(&out, 0).unwrap_err();
+        assert!(err.to_string().contains("overflow"), "{err}");
+    }
+
+    #[test]
+    fn refuses_a_col_idx_out_of_range_for_head_width() {
+        let out = two_rows_width2(vec![true, true]);
+        let err = extract_test_column(&out, 2).unwrap_err();
+        assert!(err.to_string().contains("col_idx"), "{err}");
     }
 }

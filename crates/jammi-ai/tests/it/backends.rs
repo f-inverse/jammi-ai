@@ -154,3 +154,130 @@ async fn http_backend_refuses_a_ragged_response_row_width() {
         "must name both the row's own width (1) and the expected width (2): {msg}"
     );
 }
+
+/// A response with FEWER rows than inputs must be a named refusal — the
+/// count-mismatch check must fire before any per-row width check runs (there
+/// is no row 2 to widen-check against). Verified by temporarily removing the
+/// `response.data.len() != inputs.len()` check: this test goes RED (the
+/// mismatched response is silently accepted, `dim` reads off a response
+/// row that does not correspond to the caller's 3rd input, rather than the
+/// `Err` asserted below).
+#[tokio::test]
+async fn http_backend_refuses_fewer_response_rows_than_inputs() {
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/v1/embeddings"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "data": [
+                { "embedding": [0.1, 0.2] }
+            ]
+        })))
+        .mount(&server)
+        .await;
+
+    let backend = HttpBackend::new(Duration::from_secs(5)).unwrap();
+    let err = backend
+        .forward(
+            &server.uri(),
+            &["a".into(), "b".into(), "c".into()],
+            "test-model",
+            ModelTask::TextEmbedding,
+        )
+        .await
+        .expect_err("fewer response rows than inputs must be a typed refusal");
+    let msg = err.to_string();
+    assert!(msg.contains('1') && msg.contains('3'), "got: {msg}");
+}
+
+/// The peer of the above: MORE response rows than inputs must be refused the
+/// same way, never silently truncated to the caller's input count. Verified
+/// by temporarily removing the count-mismatch check: this test goes RED (the
+/// extra row is silently accepted instead of the `Err` asserted below).
+#[tokio::test]
+async fn http_backend_refuses_more_response_rows_than_inputs() {
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/v1/embeddings"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "data": [
+                { "embedding": [0.1, 0.2] },
+                { "embedding": [0.3, 0.4] },
+                { "embedding": [0.5, 0.6] }
+            ]
+        })))
+        .mount(&server)
+        .await;
+
+    let backend = HttpBackend::new(Duration::from_secs(5)).unwrap();
+    let err = backend
+        .forward(
+            &server.uri(),
+            &["a".into(), "b".into()],
+            "test-model",
+            ModelTask::TextEmbedding,
+        )
+        .await
+        .expect_err("more response rows than inputs must be a typed refusal");
+    let msg = err.to_string();
+    assert!(msg.contains('3') && msg.contains('2'), "got: {msg}");
+}
+
+/// A response with ZERO rows (and zero inputs, so the count-mismatch check
+/// above does not fire first) must still be refused — there is nothing to
+/// hand back, and `response.data[0]` below would have no element 0 to read
+/// `dim` off. Verified by temporarily removing the `n == 0` check: this test
+/// goes RED (a panic reading `response.data[0].embedding.len()` instead of
+/// the `Err` asserted below).
+#[tokio::test]
+async fn http_backend_refuses_zero_response_rows() {
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/v1/embeddings"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({ "data": [] })))
+        .mount(&server)
+        .await;
+
+    let backend = HttpBackend::new(Duration::from_secs(5)).unwrap();
+    let err = backend
+        .forward(&server.uri(), &[], "test-model", ModelTask::TextEmbedding)
+        .await
+        .expect_err("zero response rows must be a typed refusal, never a panic");
+    assert!(
+        err.to_string().contains("at least one input"),
+        "got: {}",
+        err
+    );
+}
+
+/// A ZERO-WIDTH row 0 (`embedding: []`) carries no real embedding at all.
+/// The HTTP layer derives `dim` from row 0's own width and hands the whole
+/// buffer to `BackendOutput::single_head`, which refuses a zero-dim head by
+/// name — this test drives that refusal end to end through the HTTP path.
+/// Verified by temporarily reverting `single_head`'s `dim == 0` check: this
+/// test goes RED (`Ok` with a vacuous zero-width embedding instead of the
+/// `Err` asserted below).
+#[tokio::test]
+async fn http_backend_refuses_a_zero_width_row_zero() {
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/v1/embeddings"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "data": [
+                { "embedding": Vec::<f32>::new() }
+            ]
+        })))
+        .mount(&server)
+        .await;
+
+    let backend = HttpBackend::new(Duration::from_secs(5)).unwrap();
+    let err = backend
+        .forward(
+            &server.uri(),
+            &["a".into()],
+            "test-model",
+            ModelTask::TextEmbedding,
+        )
+        .await
+        .expect_err("a zero-width row 0 must be a typed refusal, never a vacuous embedding");
+    assert!(err.to_string().contains("dim"), "got: {err}");
+}

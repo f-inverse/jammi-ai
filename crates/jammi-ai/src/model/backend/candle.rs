@@ -4662,7 +4662,7 @@ mod ner_nonfinite_logit_tests {
             "expected every row to decode successfully, got row_status {:?}",
             output.row_status
         );
-        // Round-4 adversarial audit (F4): NER carries no float head at all
+        // NER carries no float head at all
         // (entities are serialized as JSON strings) — `float_outputs` and
         // `shapes` must both stay empty, never claim a phantom `(rows, 0)`
         // float-embedding shape for a head that does not exist.
@@ -6018,7 +6018,7 @@ mod r5_f2_classification_pooling_tests {
         let result = loaded.forward(&content, ModelTask::Classification);
         match result {
             Ok(out) => {
-                // Round-4 adversarial audit (F4): the float head is one
+                // The float head is one
                 // confidence score per row — `shapes[0] = (rows, 1)`, never
                 // `(rows, 0)` (the shape `BackendOutput`'s doc reserves for
                 // "no embedding", which classification's confidence head is

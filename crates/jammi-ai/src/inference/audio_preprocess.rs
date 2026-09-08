@@ -1359,7 +1359,7 @@ mod tests {
         assert!(err.to_string().contains("row 1"));
     }
 
-    /// Round-4 adversarial audit: a clip carrying `sample_rate == 0` (a
+    /// A clip carrying `sample_rate == 0` (a
     /// decoder's own decode path already refuses this, but a directly
     /// constructed `DecodedAudio` — as every test here does — is not routed
     /// through that decoder) must be a NAMED typed refusal, never a
@@ -1381,7 +1381,7 @@ mod tests {
         assert!(err.to_string().contains("sample_rate 0"), "{err}");
     }
 
-    /// `resampled_len`'s own domain edge (round-4 adversarial audit): a zero
+    /// `resampled_len`'s own domain edge: a zero
     /// `from_rate` must return `0`, never round `to_rate / 0.0 == +inf` up
     /// to `usize::MAX` (a confidently wrong length the empty-clip guard above
     /// would then fail to catch, since `usize::MAX != 0`).

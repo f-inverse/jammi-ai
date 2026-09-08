@@ -56,11 +56,16 @@ pub fn build_prefix_columns(
         .collect();
     let status = StringArray::from(status_strs);
 
+    // `row_status.get(i)` (never a raw `row_status[i]`): `row_errors` and
+    // `row_status` are two independently-sized fields on `BackendOutput`, so
+    // a producer that emits more `row_errors` than `row_status` entries must
+    // not panic here — a missing status is treated as "not ok" (the error
+    // message is still surfaced) rather than indexing out of bounds.
     let errors: StringArray = row_errors
         .iter()
         .enumerate()
         .map(|(i, e)| {
-            if row_status[i] {
+            if row_status.get(i).copied().unwrap_or(false) {
                 None
             } else {
                 Some(e.as_str())
@@ -83,4 +88,32 @@ pub fn build_prefix_columns(
         Arc::new(errors) as ArrayRef,                                          // _error
         Arc::new(Float32Array::from(vec![latency_ms; row_count])) as ArrayRef, // _latency_ms
     ]
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use arrow::array::Array;
+
+    /// `row_errors` longer than `row_status` (two independently-sized fields
+    /// on `BackendOutput`) must never panic indexing `row_status[i]` at the
+    /// tail entries — the missing status is treated as "not ok". Verified by
+    /// temporarily reverting `row_status.get(i).copied().unwrap_or(false)` to
+    /// the raw `row_status[i]`: this test goes RED (an out-of-bounds index
+    /// panic instead of returning the array below).
+    #[test]
+    fn build_prefix_columns_never_panics_when_row_errors_is_longer_than_row_status() {
+        let keys: ArrayRef = Arc::new(StringArray::from(vec!["a", "b", "c"]));
+        let row_status = vec![true]; // one entry; row_errors has three
+        let row_errors = vec![
+            String::new(),
+            "row 1 failed".to_string(),
+            "row 2 failed".to_string(),
+        ];
+        let cols = build_prefix_columns(&keys, "src", "model", &row_status, &row_errors, 1.0, 3);
+        let errors = cols[4].as_any().downcast_ref::<StringArray>().unwrap();
+        assert!(errors.is_null(0), "row 0's own recorded status was ok");
+        assert_eq!(errors.value(1), "row 1 failed");
+        assert_eq!(errors.value(2), "row 2 failed");
+    }
 }

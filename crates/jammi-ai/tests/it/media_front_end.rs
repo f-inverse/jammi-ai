@@ -293,11 +293,18 @@ fn arrow_to_audio_path_valued_bad_row_keeps_the_documented_prefix_and_appends_th
     );
 }
 
-/// Per-call timings for `ITERS` repeated measurements of the SAME "before"
-/// work `n1_image_request_latency_before_vs_after` compares against — the
-/// spread (max − min) of these is the honest additive slack term for the
-/// gross always-on bar below, because it is the in-test jitter of the very
-/// quantity being compared, not an unrelated proxy.
+/// Per-call timings for `ITERS` repeated measurements of ONE arm (before or
+/// after) `n1_image_request_latency_before_vs_after` compares — the spread
+/// (max − min) of these is the honest additive slack term for the gross
+/// always-on bar below, because it is the in-test jitter of the very
+/// quantity being compared, not an unrelated proxy. Both arms are measured
+/// through this SAME [`measure_calls`] helper (a shared, symmetric
+/// methodology) rather than one arm getting per-call min/max/mean and the
+/// other only a single `total_elapsed / iters` mean — an asymmetric
+/// methodology would let a rare, real slow call on one arm dilute into its
+/// mean while the other arm's `min` shrugs off the same kind of jitter,
+/// biasing the comparison in whichever direction the asymmetry happens to
+/// favor.
 ///
 /// A prior version measured `K` back-to-back `Instant::now()`/`elapsed()`
 /// round trips with NO work between them and took their min as the slack.
@@ -308,36 +315,30 @@ fn arrow_to_audio_path_valued_bad_row_keeps_the_documented_prefix_and_appends_th
 /// SAME real work this test already does (image resize, pixel loop, tensor
 /// build) instead measures genuine scheduler/allocator/cache jitter, which is
 /// never zero on real hardware.
-struct BeforeTimings {
+struct CallTimings {
     min: std::time::Duration,
     max: std::time::Duration,
     mean: std::time::Duration,
 }
 
-fn measure_before(
-    img: &image::DynamicImage,
-    target_size: u32,
-    mean: &[f32; 3],
-    std: &[f32; 3],
-    device: &candle_core::Device,
-    iters: u32,
-) -> BeforeTimings {
+/// Run `call` `iters` times, timing each call individually (never a single
+/// `total_elapsed / iters` division), and return the min/max/mean over the
+/// per-call durations. Shared by both the "before" and "after" arms so
+/// neither arm's bar-relevant statistic (`min`) is diluted by the other
+/// arm's own instrumentation overhead.
+fn measure_calls<F: FnMut()>(iters: u32, mut call: F) -> CallTimings {
     let mut min = std::time::Duration::MAX;
     let mut max = std::time::Duration::ZERO;
     let mut total = std::time::Duration::ZERO;
     for _ in 0..iters {
         let start = std::time::Instant::now();
-        let t = sequential_preprocess_one_tensor(img, target_size, mean, std, device);
+        call();
         let elapsed = start.elapsed();
-        assert_eq!(
-            t.dims(),
-            &[1, 3, target_size as usize, target_size as usize]
-        );
         min = min.min(elapsed);
         max = max.max(elapsed);
         total += elapsed;
     }
-    BeforeTimings {
+    CallTimings {
         min,
         max,
         mean: total / iters,
@@ -453,12 +454,22 @@ fn n1_image_request_latency_before_vs_after() {
     // be included on both sides). Timed per-call (not just totalled and
     // divided) so `before_timings.max - before_timings.min` is a real,
     // in-test measurement of this run's own jitter on the exact quantity
-    // being compared — see `measure_before`'s doc.
-    let before_timings = measure_before(&img, target_size, &mean, &std, &device, ITERS);
+    // being compared — see `measure_calls`'s doc.
+    let before_timings = measure_calls(ITERS, || {
+        let t = sequential_preprocess_one_tensor(&img, target_size, &mean, &std, &device);
+        assert_eq!(
+            t.dims(),
+            &[1, 3, target_size as usize, target_size as usize]
+        );
+    });
     let before = before_timings.mean;
 
-    let after_start = std::time::Instant::now();
-    for _ in 0..ITERS {
+    // The "after" arm is timed through the SAME `measure_calls` helper as
+    // "before" — never a single `total_elapsed / ITERS` division — so its
+    // own min/spread are directly comparable to before's, not an average
+    // that a rare slow call could inflate asymmetrically against before's
+    // noise-resistant `min`.
+    let after_timings = measure_calls(ITERS, || {
         let t = preprocess_image_batch(
             std::slice::from_ref(&img),
             target_size,
@@ -471,8 +482,8 @@ fn n1_image_request_latency_before_vs_after() {
             t.dims(),
             &[1, 3, target_size as usize, target_size as usize]
         );
-    }
-    let after = after_start.elapsed() / ITERS;
+    });
+    let after = after_timings.mean;
 
     println!(
         "n=1 image front-end latency (target_size={target_size}, {ITERS} iters): \
@@ -497,26 +508,51 @@ fn n1_image_request_latency_before_vs_after() {
     // be dramatically slower than "before" — a regression that big (a stray
     // per-call thread-pool install, a lock acquired every request, ...) is a
     // real bug the default suite should catch on every run, not just an
-    // opted-in one. The additive slack term is the SPREAD (max − min) of the
-    // `before` timings themselves — this run's own measured in-test jitter of
-    // the exact quantity being compared (see `measure_before`'s doc for why
-    // a back-to-back-`Instant::now()` timer-resolution proxy is vacuous
-    // here); `3x before_min + spread` is still generous enough to absorb
-    // ordinary CI-machine noise while catching an order-of-magnitude
-    // regression.
-    let spread = before_timings.max - before_timings.min;
-    let gross_bar = before_timings.min.mul_f64(3.0) + spread;
+    // opted-in one.
+    //
+    // The comparison is SYMMETRIC: both sides read their own min-of-K floor
+    // (`before_min`/`after_min`), not before's floor against after's mean —
+    // an asymmetric floor-vs-mean comparison lets a single slow "after" call
+    // inflate its mean above a bar sized off before's noise-resistant floor,
+    // reporting a regression that never happened on the floor either side
+    // actually reaches. The additive slack term is before's own SPREAD (max
+    // − min) — this run's own measured in-test jitter of the exact quantity
+    // being compared (see `measure_calls`'s doc for why a
+    // back-to-back-`Instant::now()` timer-resolution proxy is vacuous here).
+    //
+    // The slack is deliberately NOT after's own spread too: at n=1 the
+    // "after" path's rare outlier calls (an occasional rayon dispatch/thread
+    // wake-up) can spike far above its own floor — measured on this machine,
+    // `after_spread` alone reached 30ms against a `before_min` of ~2.3ms.
+    // Summing both spreads into the bar would let that single outlier's
+    // spread swallow the whole comparison, so a genuine order-of-magnitude
+    // regression on `after_min` itself would slip under a bar inflated by
+    // `after`'s own noise — the bar must never grow by the very quantity
+    // it is supposed to be catching a regression in. Anchoring the slack on
+    // `before_spread` only keeps `3x before_min + before_spread` a fixed,
+    // before-derived quantity that `after_min` cannot inflate, so a genuine
+    // 10x regression (`after_min == 10x before_min`) still reds: `10x
+    // before_min` is never `<= 3x before_min + before_spread` unless
+    // `before_spread` is itself ~7x `before_min`, which steady-state
+    // per-call timings on real hardware never are.
+    let before_spread = before_timings.max - before_timings.min;
+    let after_spread = after_timings.max - after_timings.min;
+    let gross_bar = before_timings.min.mul_f64(3.0) + before_spread;
     println!(
-        "n=1 image front-end gross bar: before_min={:?} before_max={:?} spread={spread:?} \
-         before_mean={before:?} after={after:?} bar(3x before_min + spread)={gross_bar:?}",
-        before_timings.min, before_timings.max
+        "n=1 image front-end gross bar: before_min={:?} before_max={:?} \
+         before_spread={before_spread:?} before_mean={before:?} after_min={:?} \
+         after_max={:?} after_spread={after_spread:?} after_mean={after:?} \
+         bar(3x before_min + before_spread)={gross_bar:?}",
+        before_timings.min, before_timings.max, after_timings.min, after_timings.max
     );
     assert!(
-        after <= gross_bar,
+        after_timings.min <= gross_bar,
         "n=1 request latency regressed far beyond a gross always-on bar: \
-         before_min={:?} spread={spread:?} after={after:?} \
-         bar(3x before_min + spread)={gross_bar:?}",
-        before_timings.min
+         before_min={:?} before_spread={before_spread:?} after_min={:?} \
+         after_spread={after_spread:?} \
+         bar(3x before_min + before_spread)={gross_bar:?}",
+        before_timings.min,
+        after_timings.min
     );
 
     if std::env::var_os("JAMMI_FRONTEND_N1_LATENCY").is_some() {

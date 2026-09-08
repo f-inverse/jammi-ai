@@ -600,7 +600,7 @@ mod tests {
         assert!(all_err.to_string().contains("row_errors"), "{all_err}");
     }
 
-    /// Round-4 adversarial audit (F1): a producer with NO float head at all
+    /// A producer with NO float head at all
     /// (`float_outputs` empty) but a shape entry claiming 2 rows previously
     /// PANICKED both accessors at `&self.float_outputs[0]` — `checked_rows`'s
     /// old flat-length check read `float_outputs.first()` and treated an
@@ -643,7 +643,7 @@ mod tests {
         assert!(out.all_rows_or_err().is_err());
     }
 
-    /// Round-4 adversarial audit (F1): a zero-dim head (`shapes[0].1 == 0`)
+    /// A zero-dim head (`shapes[0].1 == 0`)
     /// with a present-but-empty `float_outputs[0]` previously returned
     /// `Ok(&[])` from both accessors — a vacuous "embedding" with no
     /// dimensions, silently accepted as valid. Verified by reverting
@@ -693,9 +693,9 @@ mod tests {
         assert_eq!(out.single_row_or_err(1).unwrap(), &[3.0, 4.0]);
     }
 
-    /// Round-4 adversarial audit (F1): pre-fold, `single_head(vec![], 2, 0,
-    /// ..)` succeeded — `flat.len() == 0` trivially matches `rows(2) *
-    /// dim(0) == 0`. `single_head` now refuses a zero-dim head outright.
+    /// `single_head(vec![], 2, 0, ..)` would otherwise succeed — `flat.len()
+    /// == 0` trivially matches `rows(2) * dim(0) == 0`. `single_head` refuses
+    /// a zero-dim head outright.
     #[test]
     fn single_head_refuses_a_zero_dim_head() {
         let err = BackendOutput::single_head(

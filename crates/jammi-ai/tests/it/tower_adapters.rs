@@ -1391,7 +1391,7 @@ async fn audio_training_refuses_a_mel_bin_mismatch_like_serving_does() {
 // =============================================================================
 
 /// Verified by temporarily reverting `session.rs::encode_image_query` to
-/// `output.float_outputs[0].to_vec()` (the pre-fold blind read): this test
+/// `output.float_outputs[0].to_vec()` (the blind read): this test
 /// goes RED (`Ok([0.0; dim])` instead of the `Err` asserted below).
 #[tokio::test(flavor = "multi_thread")]
 async fn encode_image_query_on_corrupt_bytes_refuses_never_a_zero_vector() {
@@ -1436,7 +1436,7 @@ async fn encode_audio_query_on_corrupt_bytes_refuses_never_a_zero_vector() {
     );
 }
 
-/// The text peer (advisory item): `encode_text_query` pre-fold read
+/// The text peer: `encode_text_query` read
 /// `output.float_outputs[0][..dim].to_vec()` directly, so an empty/null text
 /// query returned a ZERO VECTOR even though `forward_embedding` marks an
 /// empty text row's OWN status `false` (`"Empty or null text input"`) exactly

@@ -27,13 +27,22 @@ import hashlib
 import jammi
 
 from jammi_cookbook import contracts
-from scripts.build_media_tower_lora_cache import (
-    CORRUPT_ARROW_POSITION,
-    FLOOR_K,
-    PRECISION_FLOOR,
-    ROUND_TRIP_CEILING,
-    SPREAD_K,
+from jammi_cookbook.contracts import (
+    MEDIA_TOWER_CORRUPT_ARROW_POSITION as CORRUPT_ARROW_POSITION,
 )
+from jammi_cookbook.contracts import (
+    MEDIA_TOWER_ROUND_TRIP_CEILING as ROUND_TRIP_CEILING,
+)
+
+# PRECISION_FLOOR / SPREAD_K / FLOOR_K are only consumed here (never by the
+# qmd, which cannot import `scripts` — quarto executes each chapter with cwd
+# set to the chapter's OWN directory, not `cookbook/book`), so they stay
+# single-sourced in the emit script and this test reads them from there —
+# the same pattern `tests/test_tenancy_h3_cache.py` uses for
+# `scripts.build_tenancy_h3_cache`; pytest itself always runs with
+# `cookbook/book` as pytest's rootdir (`pythonpath = ["."]` in
+# pyproject.toml), where `scripts` IS importable.
+from scripts.build_media_tower_lora_cache import FLOOR_K, PRECISION_FLOOR, SPREAD_K
 
 _TOWERS = ("vision", "text", "audio")
 _CLIP_TOWERS = ("vision", "text")
@@ -118,8 +127,9 @@ def test_every_tower_round_trips_through_a_real_process_restart():
     """A round-trip diff is not noisy like change-vs-base: the golden alone is
     NOT sufficient here, since a broken persistence bug would happily commit
     (and then trivially match) a golden reflecting the break. This asserts a
-    tight ceiling — the emit script's own `ROUND_TRIP_CEILING`, imported rather
-    than re-typed — independent of the golden. `server_restarted` is re-derived
+    tight ceiling — `contracts.MEDIA_TOWER_ROUND_TRIP_CEILING`, the ONE place
+    this value lives (the emit script reads the same constant), imported here
+    rather than re-typed — independent of the golden. `server_restarted` is re-derived
     from the pid pair and start-time ordering, not trusted as a recorded literal:
     a script that always wrote `server_restarted: True` regardless of the actual
     pids would fail this test."""
@@ -179,9 +189,9 @@ def test_corrupt_row_contract_is_recorded_honestly_for_both_media_types_and_inpu
     DataFusion as `BinaryView`/`Utf8View` respectively under the engine's
     default `schema_force_view_types=true` — the batch's other, valid row still
     reads `_status="ok"` either way. The error message's OWN row index is
-    checked against the row's actual Arrow position (the script's own
-    `CORRUPT_ARROW_POSITION`, never a re-typed literal), not just a substring
-    match.
+    checked against the row's actual Arrow position
+    (`contracts.MEDIA_TOWER_CORRUPT_ARROW_POSITION`, never a re-typed
+    literal), not just a substring match.
     """
     record = contracts.load_artifact("media_tower.record")
     for modality in _MEDIA_TYPES:

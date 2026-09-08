@@ -135,7 +135,7 @@ import pyarrow as pa
 import pyarrow.parquet as pq
 
 import jammi_cookbook  # noqa: F401  — applies the determinism env on import
-from jammi_cookbook import determinism
+from jammi_cookbook import contracts, determinism
 
 ENGINE_VERSION = "0.49.1"
 ARTIFACTS = Path(__file__).resolve().parent.parent / "artifacts" / "media_tower"
@@ -173,8 +173,14 @@ PRECISION_FLOOR = 1e-6
 # itself, since a broken round trip serves the BASE model instead). A single
 # tight ceiling is the right shape here, independent of any golden — the emit
 # script REFUSES to write a cache around a broken round trip rather than
-# silently committing whatever it measured (see `measure_tower` below).
-ROUND_TRIP_CEILING = 1e-5
+# silently committing whatever it measured (see `measure_tower` below). The
+# ceiling lives in `jammi_cookbook.contracts`, not here: quarto executes a
+# chapter with cwd set to the CHAPTER's own directory, not `cookbook/book`,
+# so a qmd cell cannot `import scripts.build_media_tower_lora_cache` (only
+# the installed `jammi_cookbook` package is reachable from there) — `contracts`
+# is therefore the one place BOTH this script and the chapter read the
+# ceiling from, never re-typed in either.
+ROUND_TRIP_CEILING = contracts.MEDIA_TOWER_ROUND_TRIP_CEILING
 
 # OpenCLIP's ResidualAttentionBlock LoRA sites — shared by the vision AND text
 # towers (crates/jammi-encoders/src/open_clip_block.rs). The image_search
@@ -187,8 +193,10 @@ CLAP_TARGET_MODULES = ["query", "value", "linear1"]
 
 # The mixed-row batch's fixed row order for the corrupt-row contract (§5) — the
 # Arrow position of "corrupt_row" is this order's own index, never a bare `2`.
-ROW_ORDER = ("good", "null_row", "corrupt_row")
-CORRUPT_ARROW_POSITION = ROW_ORDER.index("corrupt_row")
+# Also lives in `jammi_cookbook.contracts`, for the same reason as the ceiling
+# above.
+ROW_ORDER = contracts.MEDIA_TOWER_ROW_ORDER
+CORRUPT_ARROW_POSITION = contracts.MEDIA_TOWER_CORRUPT_ARROW_POSITION
 _ROW_INDEX_RE = re.compile(r"row (\d+)")
 
 

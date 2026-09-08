@@ -218,14 +218,16 @@ A round-trip diff is not noisy the way change-vs-base is: either the adapter
 survived the restart bit-for-bit or persistence is broken, so this asserts a
 tight, HARDCODED ceiling — never merely the golden, which would happily commit
 (and then trivially match) a broken measurement. The ceiling lives in ONE
-place, the emit script's own `ROUND_TRIP_CEILING`, imported here rather than
-re-typed. `server_restarted` is likewise not read as a recorded literal: it is
-re-derived from the pid pair (and, since the record also carries wall-clock
-start times, from start-time ordering) — the same evidence the record's
-`before`/`after` fields carry, not a separate claim to trust.
+place, `jammi_cookbook.contracts.MEDIA_TOWER_ROUND_TRIP_CEILING`, imported
+here rather than re-typed (the emit script reads the SAME constant from
+`contracts`, rather than each side keeping its own copy). `server_restarted`
+is likewise not read as a recorded literal: it is re-derived from the pid pair
+(and, since the record also carries wall-clock start times, from start-time
+ordering) — the same evidence the record's `before`/`after` fields carry, not
+a separate claim to trust.
 
 ```{python}
-from scripts.build_media_tower_lora_cache import ROUND_TRIP_CEILING
+ROUND_TRIP_CEILING = contracts.MEDIA_TOWER_ROUND_TRIP_CEILING
 
 for name, t in towers.items():
     diff = t["round_trip_max_abs_diff"]
@@ -289,7 +291,7 @@ checks the error message's OWN named row index against the row's actual Arrow
 position — not a substring match.
 
 ```{python}
-from scripts.build_media_tower_lora_cache import CORRUPT_ARROW_POSITION
+CORRUPT_ARROW_POSITION = contracts.MEDIA_TOWER_CORRUPT_ARROW_POSITION
 
 for modality, arms in record["corrupt_rows"].items():
     for mode, corrupt in arms.items():

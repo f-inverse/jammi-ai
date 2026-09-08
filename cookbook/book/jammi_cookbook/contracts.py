@@ -47,6 +47,19 @@ MEDIA_TOWER_AUDIO_CHECKPOINT_SHA256 = (
 )
 MEDIA_TOWER_AUDIO_CHECKPOINT_UPSTREAM = "laion/clap-htsat-fused"
 
+# A round-trip diff is not a noisy measurement like change-vs-base: either the
+# adapter survived the restart bit-for-bit (diff ~ 0, floating-point noise
+# only) or persistence is broken (diff is large). The emit script itself
+# refuses to write a cache around a broken round trip (diff >= this ceiling)
+# rather than silently committing one; the chapter and the test assert the
+# SAME ceiling, imported from here rather than each re-typing `1e-5`.
+MEDIA_TOWER_ROUND_TRIP_CEILING = 1e-5
+
+# The mixed-row batch's fixed row order for the corrupt-row contract: the
+# Arrow position of "corrupt_row" is this order's own index, never a bare `2`.
+MEDIA_TOWER_ROW_ORDER = ("good", "null_row", "corrupt_row")
+MEDIA_TOWER_CORRUPT_ARROW_POSITION = MEDIA_TOWER_ROW_ORDER.index("corrupt_row")
+
 
 # --------------------------------------------------------------------------- #
 # Layer 1 — schema

@@ -120,13 +120,18 @@ support, on either side.
 
 <!-- profile-421-generated: findings -->
 - **`htsat-front-end-bound`**: "The HTSAT training step is CPU front-end-bound: front-end
-  share of wall is 81-83% across the F32/BF16 decision legs (audio decode/resample/STFT/mel
-  dominating wall time), dtype- and arm-invariant."
+  share of wall is 81-83% across the F32/BF16 decision legs (rule: front_share_of_wall >=
+  50% on every leg read; audio decode/resample/STFT/mel dominating wall time). Front-end
+  time itself is 1.249-1.255 s/step across every F32/BF16 x A/D-arm leg read (relative
+  spread 0.5%, within the 5% arm-invariance rule), so this cost is dtype- and
+  arm-invariant."
 - **`clip-vision-front-end-share`**: "CLIP-vision's image decode/preprocess front end is
   20-22% of wall on the F32/BF16 decision legs."
 - **`clip-launch-bound-batch8`**: "At batch 8 the CLIP training steps are launch-bound:
-  3638-3722 launches/step across the four F32/BF16 A-arm CLIP legs (text and vision);
-  switching to BF16 cuts GPU busy by 32-41% per tower while wall drops by only 4-5%."
+  3638-3722 launches/step across the four F32/BF16 A-arm CLIP legs (text and vision) (rule:
+  launches/step >= 1000 and launch/sync residual share of wall (residual_s_per_step /
+  wall_s_per_step) >= 20%, both on every named leg); switching to BF16 cuts GPU busy by
+  32-41% per tower while wall drops by only 4-5%."
 - **`c-attn-htsat-out-of-tier`**: "C-ATTN-HTSAT is measured, not a candidate port: 33% of
   GPU busy (~5% of wall) on the F32 decision leg (htsat-A1). HTSAT attention (head_dim 24
   at every stage) sits OUTSIDE the fixed-head-dim port tier by the contract's own

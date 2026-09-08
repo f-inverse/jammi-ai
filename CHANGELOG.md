@@ -417,9 +417,14 @@ workspace ships every publishable crate at the same
   (`ci/scripts/perf/fixtures/nsys_kernel_census/`) into place instead of touch-emptying it, so
   `kernel_census.py` runs for real under `DRY_RUN` and `census_ok` is earned rather than defaulted
   off a no-op wrapper. `gen_fixed_shape_image_corpus.py`/`gen_fixed_length_audio_corpus.py` gain an
-  opt-in, content-addressed `--pool-cache-dir` (byte-identical output with/without it, asserted via
-  sha256) that the dry-run test harness points at one suite-level tempdir, cutting the hermetic perf
-  suite wall from ~598s to ~200-270s. `finetune_step.rs` documents the unlabeled-leg contract (no
+  opt-in, content-addressed `--pool-cache-dir` that the dry-run test harness points at one
+  suite-level tempdir, so the fixed media pool is synthesized once per suite instead of once per
+  subprocess invocation of `profile_421_legs.sh` (51 invocations in
+  `test_profile_421_legs_dry_run.py`), byte-identical output with/without the cache asserted via
+  sha256 by the corpus-generator tests. Box-specific, not a gated number: the round-1 adversarial
+  audit reproduced `test_profile_421_legs_dry_run.py` at 567.8s uncached vs 118.0s cached on one
+  developer box (Apple M5 Pro, 2026-09-07). `finetune_step.rs` documents the unlabeled-leg
+  contract (no
   claim without `--expect-kernels-disabled`, same posture as `finetune-run`).
   `crates/jammi-encoders --features golden-parity --test golden_parity` (6 CPU-only tests against a
   committed PyTorch reference of the HTSAT-Swin CLAP audio tower) is now wired into CI's hermetic

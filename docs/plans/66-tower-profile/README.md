@@ -189,6 +189,17 @@ mechanism, only points at it.
   can only disambiguate a genuine ambiguity, never silently re-point a citation — see
   `check_citations.py`'s own module doc for the full narrowing-not-asserting argument. An unmapped
   ambiguous basename anywhere else still fails closed exactly as before.
+- **`CONTRACT.md`'s §D6 item 1 (`CONTRACT.md:113`) names the wrong function for the
+  checkpoint-content refusal — the frozen prose itself is not wrong, only stale on a name.**
+  It attributes the refusal of a `$MODEL_DIR_CLIP` carrying `config.json`/`model.safetensors`
+  and a `$MODEL_DIR_CLAP` missing the HF triad to `preflight_probe`, but the shipped driver
+  implements that refusal in `_checkpoint_identity_probe`
+  (`ci/scripts/perf/profile_421_legs.sh:387-411`, landed in 32db48bb); `preflight_probe`
+  (`ci/scripts/perf/profile_421_legs.sh:418-503`) checks pinned flags and producer output
+  only. The behavior the contract pre-registered exists and runs before every leg — only the
+  function name in the frozen prose is stale. Not corrected in the frozen body (same
+  never-edit-after-freeze doctrine as the "45 hermetic tests" bullet above), recorded here
+  instead.
 
 ## PR trail
 

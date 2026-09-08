@@ -63,13 +63,15 @@ fn arrow_to_images_utf8view_matches_utf8_on_valid_paths() {
     for (i, (a, b)) in from_utf8.iter().zip(&from_utf8view).enumerate() {
         match (a, b) {
             (None, None) => {}
-            (Some(a), Some(b)) => {
+            (Some(Ok(a)), Some(Ok(b))) => {
                 assert_eq!(
                     a.to_rgba8().into_raw(),
                     b.to_rgba8().into_raw(),
                     "row {i}: Utf8 and Utf8View must decode to the identical image"
                 );
             }
+            (Some(Err(a)), _) => panic!("row {i}: Utf8 decode failed unexpectedly: {a}"),
+            (_, Some(Err(b))) => panic!("row {i}: Utf8View decode failed unexpectedly: {b}"),
             _ => panic!("row {i}: null-handling differs between Utf8 ({a:?}) and Utf8View ({b:?})"),
         }
     }
@@ -96,11 +98,13 @@ fn arrow_to_images_utf8view_bad_path_fails_whole_call_like_utf8() {
     // `Vec` with a per-row hole. Comparing message content (not just
     // "is_err") pins that both arms hit the SAME `image::open` failure path.
     assert!(
-        utf8_err.to_string().contains("Failed to load image"),
+        utf8_err.to_string().contains("Failed to read image file"),
         "unexpected Utf8 error shape: {utf8_err}"
     );
     assert!(
-        utf8view_err.to_string().contains("Failed to load image"),
+        utf8view_err
+            .to_string()
+            .contains("Failed to read image file"),
         "unexpected Utf8View error shape: {utf8view_err}"
     );
 }
@@ -137,7 +141,7 @@ fn arrow_to_audio_utf8view_matches_utf8_on_valid_paths() {
     for (i, (a, b)) in from_utf8.iter().zip(&from_utf8view).enumerate() {
         match (a, b) {
             (None, None) => {}
-            (Some(a), Some(b)) => {
+            (Some(Ok(a)), Some(Ok(b))) => {
                 assert_eq!(
                     a.samples, b.samples,
                     "row {i}: Utf8 and Utf8View must decode to identical PCM samples"
@@ -147,6 +151,8 @@ fn arrow_to_audio_utf8view_matches_utf8_on_valid_paths() {
                     "row {i}: Utf8 and Utf8View must decode to the identical sample rate"
                 );
             }
+            (Some(Err(a)), _) => panic!("row {i}: Utf8 decode failed unexpectedly: {a}"),
+            (_, Some(Err(b))) => panic!("row {i}: Utf8View decode failed unexpectedly: {b}"),
             (a, b) => {
                 let a_is_some = a.is_some();
                 let b_is_some = b.is_some();

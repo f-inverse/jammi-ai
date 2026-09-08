@@ -19,9 +19,10 @@ use crate::{AnyEncoder, FusibleSiteCensus};
 // ─────────────────────────────────────────────────────────────────────────────
 //
 // Before this fix, two SEPARATE process-wide test locks
-// (`crate::layer_norm::DISPATCH_COUNTER_TEST_LOCK` and
-// `crate::attention_cascade::ATTENTION_BLOCK_COUNTER_TEST_LOCK`) each
-// claimed to serialize reads of the three fusible-seam dispatch-counter
+// (`crate::layer_norm`'s `DISPATCH_COUNTER_TEST_LOCK` and
+// `crate::attention_cascade`'s `ATTENTION_BLOCK_COUNTER_TEST_LOCK`, both
+// now deleted) each claimed to serialize reads of the three fusible-seam
+// dispatch-counter
 // registries (`layer_norm_fused`, `gelu_erf_fused`, `attention_block_fused`
 // plus `lora_linear_fused`), but nothing enumerated or checked their
 // WRITERS: a training-mode forward that reaches one of these seams'
@@ -340,12 +341,12 @@ pub(crate) struct SeamDispatchTotals {
 }
 
 /// Snapshot all three seams at once. Every counter here is a PROCESS-WIDE
-/// static, so a caller must hold this crate's counter test locks — in the
-/// order `crate::attention_cascade::ATTENTION_BLOCK_COUNTER_TEST_LOCK` then
-/// `crate::layer_norm::DISPATCH_COUNTER_TEST_LOCK`, see `crate::htsat_audio`'s
-/// own multi-lock test doc for why that order is not free — across the
-/// before/after pair it differences.
-pub(crate) fn seam_dispatch_totals() -> SeamDispatchTotals {
+/// static, so a caller must hold [`SeamCounterGuard`] — taken by reference
+/// so this function cannot compile against a caller that lacks one — across
+/// the whole before/after pair it differences (see this module's own "The
+/// ONE seam-counter test lock" section doc for why there is exactly one
+/// lock, not the prior scheme's two acquired in a fixed order).
+pub(crate) fn seam_dispatch_totals(_lock: &SeamCounterGuard<'_>) -> SeamDispatchTotals {
     let lora = jammi_lora::lora_linear_fused_dispatch_snapshot();
     let ln = crate::layer_norm::LN_DISPATCH_COUNTERS.snapshot();
     let gelu = crate::activations::GELU_DISPATCH_COUNTERS.snapshot();
@@ -390,12 +391,12 @@ fn seam_delta(after: u64, before: u64, key: &str) -> u64 {
 /// tower-specific facts only it knows (a frozen tower's `0` wrapped sites, a
 /// fixture's known geometry).
 ///
-/// The caller must hold both dispatch-counter test locks — see
-/// [`seam_dispatch_totals`].
+/// The caller must hold [`SeamCounterGuard`] — see [`seam_dispatch_totals`].
 pub(crate) fn assert_fusible_site_census_is_exact(
     encoder: &mut AnyEncoder,
     device: &Device,
     label: &str,
+    lock: &SeamCounterGuard<'_>,
 ) -> FusibleSiteCensus {
     let census = encoder.fusible_site_census();
     let probe = encoder
@@ -411,11 +412,11 @@ pub(crate) fn assert_fusible_site_census_is_exact(
     );
 
     encoder.set_training(false);
-    let before_eval = seam_dispatch_totals();
+    let before_eval = seam_dispatch_totals(lock);
     encoder
         .forward_input(&probe.as_input())
         .unwrap_or_else(|e| panic!("{label}: eval forward must succeed: {e}"));
-    let after_eval = seam_dispatch_totals();
+    let after_eval = seam_dispatch_totals(lock);
     assert_eq!(
         after_eval, before_eval,
         "{label}: an EVAL forward must take NO admission decision on any fusible seam — it \
@@ -423,11 +424,11 @@ pub(crate) fn assert_fusible_site_census_is_exact(
     );
 
     encoder.set_training(true);
-    let before = seam_dispatch_totals();
+    let before = seam_dispatch_totals(lock);
     encoder
         .forward_input(&probe.as_input())
         .unwrap_or_else(|e| panic!("{label}: training forward must succeed: {e}"));
-    let after = seam_dispatch_totals();
+    let after = seam_dispatch_totals(lock);
 
     assert_eq!(
         seam_delta(after.lora_linear, before.lora_linear, "lora_linear_fused"),

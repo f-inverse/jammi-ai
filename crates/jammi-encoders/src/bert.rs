@@ -959,8 +959,6 @@ mod tests {
     use jammi_kernels::ops::ATTENTION_BLOCK_HEAD_DIM;
     use jammi_lora::LoraInitMode;
 
-    use crate::attention_cascade::ATTENTION_BLOCK_COUNTER_TEST_LOCK;
-
     fn seeded_linear(rows: usize, cols: usize, phase: f32, device: &Device) -> Linear {
         let v: Vec<f32> = (0..rows * cols)
             .map(|i| ((i as f32 + phase) * 0.0137).sin() * 0.2)
@@ -997,9 +995,7 @@ mod tests {
     /// process-wide admission switch) within `1e-4` on identical `q`/`k`/`v`.
     #[test]
     fn bert_head64_fused_attention_matches_eager_composition_within_tolerance() {
-        let _guard = ATTENTION_BLOCK_COUNTER_TEST_LOCK
-            .lock()
-            .unwrap_or_else(|e| e.into_inner());
+        let _lock = crate::test_support::seam_counter_lock();
         let device = Device::Cpu;
         let (b, s, h) = (2usize, 5usize, 2usize);
         let d = ATTENTION_BLOCK_HEAD_DIM;
@@ -1088,9 +1084,7 @@ mod tests {
     /// that this version does reach that branch.
     #[test]
     fn bert_head64_all_padding_row_propagate_fused_matches_eager_within_tolerance() {
-        let _guard = ATTENTION_BLOCK_COUNTER_TEST_LOCK
-            .lock()
-            .unwrap_or_else(|e| e.into_inner());
+        let _lock = crate::test_support::seam_counter_lock();
         let device = Device::Cpu;
         let (b, s, h) = (2usize, 4usize, 1usize);
         let d = ATTENTION_BLOCK_HEAD_DIM;
@@ -1208,9 +1202,7 @@ mod tests {
     /// `crate::modernbert::tests::fused_attention_block_matches_eager_lora_gradients_at_production_seq_on_head64`).
     #[test]
     fn bert_head64_fused_attention_lora_gradients_are_finite_and_nonzero() {
-        let _guard = ATTENTION_BLOCK_COUNTER_TEST_LOCK
-            .lock()
-            .unwrap_or_else(|e| e.into_inner());
+        let _lock = crate::test_support::seam_counter_lock();
         let device = Device::Cpu;
         let (b, s, h) = (2usize, 5usize, 2usize);
         let d = ATTENTION_BLOCK_HEAD_DIM;
@@ -1321,9 +1313,7 @@ mod tests {
     /// permutation-shaped defect from a correct one.
     #[test]
     fn bert_head64_fused_attention_lora_gradients_match_eager_within_tolerance() {
-        let _guard = ATTENTION_BLOCK_COUNTER_TEST_LOCK
-            .lock()
-            .unwrap_or_else(|e| e.into_inner());
+        let _lock = crate::test_support::seam_counter_lock();
         let device = Device::Cpu;
         let (b, s, h) = (2usize, 5usize, 2usize);
         let d = ATTENTION_BLOCK_HEAD_DIM;
@@ -1498,6 +1488,12 @@ mod tests {
     #[test]
     #[ignore]
     fn strict_mode_child_process_body() {
+        // The sole test running in this spawned child process (no real
+        // contention), but the assertion at `training_attention_cascade`'s
+        // own `admit()` call site is unconditional (esc-092) — it does not
+        // know this process holds no other test, only whether this thread
+        // holds the lock.
+        let _lock = crate::test_support::seam_counter_lock();
         let device = Device::Cpu;
         let (b, s, h, d) = (1usize, 4usize, 1usize, 16usize);
         let attn = self_attention_fixture(h, d, &device);
@@ -1545,12 +1541,7 @@ mod tests {
         // Lock order: attention_cascade THEN layer_norm — see
         // `crate::htsat_audio`'s own multi-lock test doc for why acquiring
         // them the other way round deadlocks the whole test binary.
-        let _attn_guard = ATTENTION_BLOCK_COUNTER_TEST_LOCK
-            .lock()
-            .unwrap_or_else(|e| e.into_inner());
-        let _ln_guard = crate::layer_norm::DISPATCH_COUNTER_TEST_LOCK
-            .lock()
-            .unwrap_or_else(|e| e.into_inner());
+        let _lock = crate::test_support::seam_counter_lock();
 
         let device = Device::Cpu;
         let (config, weights) = tiny_bert_fixture();
@@ -1566,6 +1557,7 @@ mod tests {
             &mut any,
             &device,
             "bert/all-linear",
+            &_lock,
         );
 
         // Independently-known values for this family's geometry, re-derived
@@ -1590,6 +1582,7 @@ mod tests {
             &mut any_frozen,
             &device,
             "bert/frozen",
+            &_lock,
         );
         assert_eq!(
             frozen_census.lora_sites_wrapped, 0,

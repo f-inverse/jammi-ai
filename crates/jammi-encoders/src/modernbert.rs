@@ -3005,15 +3005,6 @@ mod tests {
     use candle_core::Var;
     use half::{bf16, f16};
 
-    /// Promoted to `crate::attention_cascade::ATTENTION_BLOCK_COUNTER_TEST_LOCK`
-    /// (issue #462, R2', crate-visible) — imported here under its original
-    /// bare name so every one of this module's existing
-    /// `ATTENTION_BLOCK_COUNTER_TEST_LOCK.lock()` call sites keeps compiling
-    /// and passing unmodified. See that static's own doc for the
-    /// serialization rationale (unchanged) and why `crate::bert`/
-    /// `crate::distilbert` now share it too.
-    use crate::attention_cascade::ATTENTION_BLOCK_COUNTER_TEST_LOCK;
-
     /// A flash-cascade decision that always declines — the stub every
     /// pre-existing (pre-flash) test in this module passes so its call to
     /// `ModernBertAttention::forward`/`forward_training_attention` keeps
@@ -3034,10 +3025,12 @@ mod tests {
     // ─────────────────────────────────────────────────────────────────
 
     /// Serializes every test in this module that reads [`FLASH_D2H_SYNCS`]
-    /// — the SAME process-wide-static hazard [`ATTENTION_BLOCK_COUNTER_TEST_LOCK`]
+    /// — the SAME process-wide-static hazard `crate::test_support::seam_counter_lock`
     /// already documents for `ATTENTION_BLOCK_DISPATCH_COUNTERS`, for the
     /// same reason: `cargo test`'s default parallel thread pool would
-    /// otherwise let two tests' "exactly `+1`" assertions race.
+    /// otherwise let two tests' "exactly `+1`" assertions race. A SEPARATE
+    /// lock from `seam_counter_lock`'s (never the same mutex): this one
+    /// serializes `FLASH_D2H_SYNCS` reads only, out of esc-092's scope.
     static FLASH_D2H_TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
     #[test]
@@ -3802,19 +3795,8 @@ mod tests {
     /// seam's commit message makes.
     #[test]
     fn flash_cascade_never_changes_the_block_arm_dispatch_or_output() {
-        let _guard = ATTENTION_BLOCK_COUNTER_TEST_LOCK
-            .lock()
-            .unwrap_or_else(|e| e.into_inner());
+        let _lock = crate::test_support::seam_counter_lock();
         let _d2h_guard = FLASH_D2H_TEST_LOCK
-            .lock()
-            .unwrap_or_else(|e| e.into_inner());
-        // `forward_hidden` below runs every layer's `attn_norm`/`mlp_norm`
-        // (biased, training mode) — a counter bumper on
-        // `crate::layer_norm::LN_DISPATCH_COUNTERS`, a SEPARATE registry
-        // from the attention-block/flash-cascade counters this test already
-        // locks above (see `crate::layer_norm::DISPATCH_COUNTER_TEST_LOCK`'s
-        // doc).
-        let _ln_guard = crate::layer_norm::DISPATCH_COUNTER_TEST_LOCK
             .lock()
             .unwrap_or_else(|e| e.into_inner());
         let device = Device::Cpu;
@@ -3910,18 +3892,8 @@ mod tests {
         let Some(device) = growth_oracle_cuda_device() else {
             return;
         };
-        let _guard = ATTENTION_BLOCK_COUNTER_TEST_LOCK
-            .lock()
-            .unwrap_or_else(|e| e.into_inner());
+        let _lock = crate::test_support::seam_counter_lock();
         let _d2h_guard = FLASH_D2H_TEST_LOCK
-            .lock()
-            .unwrap_or_else(|e| e.into_inner());
-        // `forward_hidden` below runs every layer's `attn_norm`/`mlp_norm`
-        // (biased, training mode) — a counter bumper on
-        // `crate::layer_norm::LN_DISPATCH_COUNTERS`, a SEPARATE registry
-        // from the attention-block/flash-cascade counters this test already
-        // locks above.
-        let _ln_guard = crate::layer_norm::DISPATCH_COUNTER_TEST_LOCK
             .lock()
             .unwrap_or_else(|e| e.into_inner());
         let dir = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
@@ -4056,19 +4028,8 @@ mod tests {
     /// build flavors — never weakened to "any error".
     #[test]
     fn padded_vs_dense_flash_decision_reaches_the_ragged_vs_dense_stub_respectively() {
-        let _guard = ATTENTION_BLOCK_COUNTER_TEST_LOCK
-            .lock()
-            .unwrap_or_else(|e| e.into_inner());
+        let _lock = crate::test_support::seam_counter_lock();
         let _d2h_guard = FLASH_D2H_TEST_LOCK
-            .lock()
-            .unwrap_or_else(|e| e.into_inner());
-        // `forward_hidden_forcing_flash_decision` below still runs the
-        // model's own `attn_norm`/`mlp_norm` at `training=true` up to the
-        // point each arm errors — a counter bumper on
-        // `crate::layer_norm::LN_DISPATCH_COUNTERS`, a SEPARATE registry
-        // from the attention-block/flash-cascade counters this test already
-        // locks above.
-        let _ln_guard = crate::layer_norm::DISPATCH_COUNTER_TEST_LOCK
             .lock()
             .unwrap_or_else(|e| e.into_inner());
         let device = Device::Cpu;
@@ -4152,19 +4113,8 @@ mod tests {
     /// `admit_cascade` fires BEFORE either variant is even called.
     #[test]
     fn padded_flash_decision_fires_the_cascade_fused_counter_before_the_cpu_stub_errors() {
-        let _guard = ATTENTION_BLOCK_COUNTER_TEST_LOCK
-            .lock()
-            .unwrap_or_else(|e| e.into_inner());
+        let _lock = crate::test_support::seam_counter_lock();
         let _d2h_guard = FLASH_D2H_TEST_LOCK
-            .lock()
-            .unwrap_or_else(|e| e.into_inner());
-        // `forward_hidden_forcing_flash_decision` below still runs the
-        // model's own `attn_norm`/`mlp_norm` at `training=true` up to the
-        // point the ragged arm errors — a counter bumper on
-        // `crate::layer_norm::LN_DISPATCH_COUNTERS`, a SEPARATE registry
-        // from the attention-block/flash-cascade counters this test already
-        // locks above.
-        let _ln_guard = crate::layer_norm::DISPATCH_COUNTER_TEST_LOCK
             .lock()
             .unwrap_or_else(|e| e.into_inner());
         let device = Device::Cpu;
@@ -4277,9 +4227,7 @@ mod tests {
     #[test]
     fn op_disabled_padded_batch_child_process_body() {
         if std::env::var_os("OP_DISABLED_PADDED_CHILD").is_some() {
-            let _guard = ATTENTION_BLOCK_COUNTER_TEST_LOCK
-                .lock()
-                .unwrap_or_else(|e| e.into_inner());
+            let _lock = crate::test_support::seam_counter_lock();
             let _d2h_guard = FLASH_D2H_TEST_LOCK
                 .lock()
                 .unwrap_or_else(|e| e.into_inner());
@@ -4397,9 +4345,7 @@ mod tests {
                 "sanity: this test's own claim depends on JAMMI_KERNELS_STRICT=1 actually \
                  reading as Strict in this fresh process"
             );
-            let _guard = ATTENTION_BLOCK_COUNTER_TEST_LOCK
-                .lock()
-                .unwrap_or_else(|e| e.into_inner());
+            let _lock = crate::test_support::seam_counter_lock();
             let _d2h_guard = FLASH_D2H_TEST_LOCK
                 .lock()
                 .unwrap_or_else(|e| e.into_inner());
@@ -4647,9 +4593,7 @@ mod tests {
         let Some(cuda) = growth_oracle_cuda_device() else {
             return;
         };
-        let _guard = ATTENTION_BLOCK_COUNTER_TEST_LOCK
-            .lock()
-            .unwrap_or_else(|e| e.into_inner());
+        let _lock = crate::test_support::seam_counter_lock();
         let _d2h_guard = FLASH_D2H_TEST_LOCK
             .lock()
             .unwrap_or_else(|e| e.into_inner());
@@ -4735,9 +4679,7 @@ mod tests {
         let Some(cuda) = growth_oracle_cuda_device() else {
             return;
         };
-        let _guard = ATTENTION_BLOCK_COUNTER_TEST_LOCK
-            .lock()
-            .unwrap_or_else(|e| e.into_inner());
+        let _lock = crate::test_support::seam_counter_lock();
         let _d2h_guard = FLASH_D2H_TEST_LOCK
             .lock()
             .unwrap_or_else(|e| e.into_inner());
@@ -4840,9 +4782,7 @@ mod tests {
         let Some(cuda) = growth_oracle_cuda_device() else {
             return;
         };
-        let _guard = ATTENTION_BLOCK_COUNTER_TEST_LOCK
-            .lock()
-            .unwrap_or_else(|e| e.into_inner());
+        let _lock = crate::test_support::seam_counter_lock();
         let _d2h_guard = FLASH_D2H_TEST_LOCK
             .lock()
             .unwrap_or_else(|e| e.into_inner());
@@ -5123,9 +5063,7 @@ mod tests {
         let Some(cuda) = growth_oracle_cuda_device() else {
             return;
         };
-        let _guard = ATTENTION_BLOCK_COUNTER_TEST_LOCK
-            .lock()
-            .unwrap_or_else(|e| e.into_inner());
+        let _lock = crate::test_support::seam_counter_lock();
         let _d2h_guard = FLASH_D2H_TEST_LOCK
             .lock()
             .unwrap_or_else(|e| e.into_inner());
@@ -6516,9 +6454,7 @@ mod tests {
         ) {
             return;
         }
-        let _guard = ATTENTION_BLOCK_COUNTER_TEST_LOCK
-            .lock()
-            .unwrap_or_else(|e| e.into_inner());
+        let _lock = crate::test_support::seam_counter_lock();
         let _d2h_guard = FLASH_D2H_TEST_LOCK
             .lock()
             .unwrap_or_else(|e| e.into_inner());
@@ -6612,9 +6548,7 @@ mod tests {
         ) {
             return;
         }
-        let _guard = ATTENTION_BLOCK_COUNTER_TEST_LOCK
-            .lock()
-            .unwrap_or_else(|e| e.into_inner());
+        let _lock = crate::test_support::seam_counter_lock();
         let _d2h_guard = FLASH_D2H_TEST_LOCK
             .lock()
             .unwrap_or_else(|e| e.into_inner());
@@ -6650,9 +6584,7 @@ mod tests {
         let Some(cuda) = growth_oracle_cuda_device() else {
             return;
         };
-        let _guard = ATTENTION_BLOCK_COUNTER_TEST_LOCK
-            .lock()
-            .unwrap_or_else(|e| e.into_inner());
+        let _lock = crate::test_support::seam_counter_lock();
         let _d2h_guard = FLASH_D2H_TEST_LOCK
             .lock()
             .unwrap_or_else(|e| e.into_inner());
@@ -6725,9 +6657,7 @@ mod tests {
         ) {
             return;
         }
-        let _guard = ATTENTION_BLOCK_COUNTER_TEST_LOCK
-            .lock()
-            .unwrap_or_else(|e| e.into_inner());
+        let _lock = crate::test_support::seam_counter_lock();
         let _d2h_guard = FLASH_D2H_TEST_LOCK
             .lock()
             .unwrap_or_else(|e| e.into_inner());
@@ -6806,9 +6736,7 @@ mod tests {
         if !vram_capable_or_skip(label, &cuda) {
             return;
         }
-        let _guard = ATTENTION_BLOCK_COUNTER_TEST_LOCK
-            .lock()
-            .unwrap_or_else(|e| e.into_inner());
+        let _lock = crate::test_support::seam_counter_lock();
         let _d2h_guard = FLASH_D2H_TEST_LOCK
             .lock()
             .unwrap_or_else(|e| e.into_inner());
@@ -6881,17 +6809,7 @@ mod tests {
     /// dormant exactly like the path-F seam is.
     #[test]
     fn forward_hidden_with_lengths_none_is_bit_identical_to_forward_hidden() {
-        let _guard = ATTENTION_BLOCK_COUNTER_TEST_LOCK
-            .lock()
-            .unwrap_or_else(|e| e.into_inner());
-        // The three `forward_hidden`/`forward_hidden_with_lengths` calls
-        // below run every layer's `attn_norm`/`mlp_norm` at `training=true`
-        // — a counter bumper on `crate::layer_norm::LN_DISPATCH_COUNTERS`,
-        // a SEPARATE registry from the attention-block counter this test
-        // already locks above.
-        let _ln_guard = crate::layer_norm::DISPATCH_COUNTER_TEST_LOCK
-            .lock()
-            .unwrap_or_else(|e| e.into_inner());
+        let _lock = crate::test_support::seam_counter_lock();
         let device = Device::Cpu;
         let dir = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
             .join("tests/fixtures/tiny_modernbert_head64");
@@ -8561,9 +8479,7 @@ mod tests {
     /// with a finite, correctly-shaped, still-F16 output.
     #[test]
     fn attention_block_f16_cpu_forward_falls_through_to_eager_without_error() {
-        let _guard = ATTENTION_BLOCK_COUNTER_TEST_LOCK
-            .lock()
-            .unwrap_or_else(|e| e.into_inner());
+        let _lock = crate::test_support::seam_counter_lock();
         let device = Device::Cpu;
         let (b, s, h, d) = (1usize, 4usize, 2usize, ATTENTION_BLOCK_HEAD_DIM);
         let n = b * s * 3 * h * d;
@@ -8767,9 +8683,7 @@ mod tests {
     /// never an error.
     #[test]
     fn mem_efficient_attention_f16_long_seq_falls_through_to_eager_exactly_as_at_base() {
-        let _guard = ATTENTION_BLOCK_COUNTER_TEST_LOCK
-            .lock()
-            .unwrap_or_else(|e| e.into_inner());
+        let _lock = crate::test_support::seam_counter_lock();
         let device = Device::Cpu;
         let (b, s, h, d) = (1usize, ATTENTION_BLOCK_MAX_SEQ + 1, 1usize, 8usize);
         let attn = memeff_fixture(false, h, d, s, None, &device);
@@ -8820,7 +8734,7 @@ mod tests {
         // those ALSO increments `declined`
         // (`seq_within_attention_block_max_seq`), and this process-wide
         // counter has no way to attribute an increment to the test that
-        // caused it. `ATTENTION_BLOCK_COUNTER_TEST_LOCK` only serializes
+        // caused it. `crate::test_support::seam_counter_lock` only serializes
         // THIS file's OWN counter-asserting tests against each other — it
         // was never meant to (and cannot) silence hundreds of unrelated
         // pre-existing training-mode tests. The property that matters —
@@ -8996,18 +8910,7 @@ mod tests {
     /// `Some`), and the output is finite and correctly shaped.
     #[test]
     fn forward_hidden_full_forward_suppresses_the_bundle_and_dispatches_memeff_at_long_seq() {
-        let _guard = ATTENTION_BLOCK_COUNTER_TEST_LOCK
-            .lock()
-            .unwrap_or_else(|e| e.into_inner());
-        // `tiny_full_model_fixture` bakes `training: true` into `emb_norm`/
-        // `mlp_norm`/`final_norm` (all real `crate::layer_norm::LayerNorm`
-        // instances), and the forward below runs them — a counter bumper on
-        // `crate::layer_norm::LN_DISPATCH_COUNTERS`, a SEPARATE registry
-        // from the attention-block/memeff-cascade counters this test
-        // already locks above/reads below.
-        let _ln_guard = crate::layer_norm::DISPATCH_COUNTER_TEST_LOCK
-            .lock()
-            .unwrap_or_else(|e| e.into_inner());
+        let _lock = crate::test_support::seam_counter_lock();
         let device = Device::Cpu;
         let model = tiny_full_model_fixture(&device, DType::F32, false);
         let seq = ATTENTION_BLOCK_MAX_SEQ + 1;
@@ -9054,17 +8957,7 @@ mod tests {
     /// regression looked like before its fix).
     #[test]
     fn forward_hidden_f16_long_seq_does_not_suppress_the_bundle_and_falls_through_to_eager() {
-        let _guard = ATTENTION_BLOCK_COUNTER_TEST_LOCK
-            .lock()
-            .unwrap_or_else(|e| e.into_inner());
-        // `tiny_full_model_fixture` bakes `training: true` into `emb_norm`/
-        // `mlp_norm`/`final_norm`, and the forward below runs them — a
-        // counter bumper on `crate::layer_norm::LN_DISPATCH_COUNTERS`, a
-        // SEPARATE registry from the memeff-cascade counter this test
-        // already locks above/reads below.
-        let _ln_guard = crate::layer_norm::DISPATCH_COUNTER_TEST_LOCK
-            .lock()
-            .unwrap_or_else(|e| e.into_inner());
+        let _lock = crate::test_support::seam_counter_lock();
         let device = Device::Cpu;
         let model = tiny_full_model_fixture(&device, DType::F16, false);
         let seq = ATTENTION_BLOCK_MAX_SEQ + 1;
@@ -9120,17 +9013,7 @@ mod tests {
     #[test]
     fn forward_hidden_full_forward_local_layer_suppresses_the_bundle_and_dispatches_memeff_at_long_seq(
     ) {
-        let _guard = ATTENTION_BLOCK_COUNTER_TEST_LOCK
-            .lock()
-            .unwrap_or_else(|e| e.into_inner());
-        // `tiny_full_model_fixture` bakes `training: true` into `emb_norm`/
-        // `mlp_norm`/`final_norm`, and the forward below runs them — a
-        // counter bumper on `crate::layer_norm::LN_DISPATCH_COUNTERS`, a
-        // SEPARATE registry from the attention-block/memeff-cascade
-        // counters this test already locks above/reads below.
-        let _ln_guard = crate::layer_norm::DISPATCH_COUNTER_TEST_LOCK
-            .lock()
-            .unwrap_or_else(|e| e.into_inner());
+        let _lock = crate::test_support::seam_counter_lock();
         let device = Device::Cpu;
         let model = tiny_full_model_fixture(&device, DType::F32, true);
         let seq = ATTENTION_BLOCK_MAX_SEQ + 1;
@@ -9184,12 +9067,10 @@ mod tests {
     fn mem_efficient_attention_dispatches_at_long_seq_when_flash_declined() {
         // `ATTENTION_BLOCK_DISPATCH_COUNTERS` is a process-wide static this
         // test asserts is UNCHANGED — held for the same reason every other
-        // test that makes that claim does (see `ATTENTION_BLOCK_COUNTER_TEST_LOCK`'s
+        // test that makes that claim does (see `crate::test_support::seam_counter_lock`'s
         // own doc): without it, a concurrently-running block-arm test in
         // this shared test binary races this assertion.
-        let _guard = ATTENTION_BLOCK_COUNTER_TEST_LOCK
-            .lock()
-            .unwrap_or_else(|e| e.into_inner());
+        let _lock = crate::test_support::seam_counter_lock();
         let device = Device::Cpu;
         let (b, s, h, d) = (1usize, ATTENTION_BLOCK_MAX_SEQ + 1, 1usize, 8usize);
         let attn = memeff_fixture(false, h, d, s, None, &device);
@@ -9247,15 +9128,13 @@ mod tests {
         // (observed on real CUDA hardware, both A100 and L40S: higher
         // parallelism there made the race land reliably, unlike this
         // author's own lower-core-count local runs, where it never
-        // reproduced). `ATTENTION_BLOCK_COUNTER_TEST_LOCK` is reused here,
+        // reproduced). `crate::test_support::seam_counter_lock` is reused here,
         // not a new dedicated lock — the SAME "one shared lock guards every
         // process-wide dispatch/cascade counter assertion in this file"
         // precedent `padded_flash_decision_fires_the_cascade_fused_counter_before_the_cpu_stub_errors`
         // already established for `attention_block_flash`'s OWN (distinct)
         // cascade counter.
-        let _guard = ATTENTION_BLOCK_COUNTER_TEST_LOCK
-            .lock()
-            .unwrap_or_else(|e| e.into_inner());
+        let _lock = crate::test_support::seam_counter_lock();
         let device = Device::Cpu;
         let (b, s, h, d) = (1usize, ATTENTION_BLOCK_MAX_SEQ + 1, 1usize, 8usize);
         let attn = memeff_fixture(true, h, d, s, Some(64), &device);
@@ -9293,9 +9172,7 @@ mod tests {
     /// arm's addition to the cascade.
     #[test]
     fn mem_efficient_attention_declines_at_short_seq_leaving_block_dispatch_unchanged() {
-        let _guard = ATTENTION_BLOCK_COUNTER_TEST_LOCK
-            .lock()
-            .unwrap_or_else(|e| e.into_inner());
+        let _lock = crate::test_support::seam_counter_lock();
         let device = Device::Cpu;
         let (b, s, h, d) = (1usize, 8usize, 2usize, ATTENTION_BLOCK_HEAD_DIM);
         let attn = attention_block_fixture(false, h, s, &device);
@@ -9412,9 +9289,7 @@ mod tests {
     /// hitting that unrelated, pre-existing CPU-backend limitation.
     #[test]
     fn mem_efficient_attention_f16_on_cpu_declines_at_the_predicate_before_reaching_the_op() {
-        let _guard = ATTENTION_BLOCK_COUNTER_TEST_LOCK
-            .lock()
-            .unwrap_or_else(|e| e.into_inner());
+        let _lock = crate::test_support::seam_counter_lock();
         let device = Device::Cpu;
         let (b, s, h, d) = (1usize, ATTENTION_BLOCK_MAX_SEQ + 1, 1usize, 8usize);
         let attn = memeff_fixture(false, h, d, s, None, &device);
@@ -9514,9 +9389,7 @@ mod tests {
             // counter here — held anyway for consistency with
             // `op_disabled_padded_batch_child_process_body`'s identical
             // precedent.
-            let _guard = ATTENTION_BLOCK_COUNTER_TEST_LOCK
-                .lock()
-                .unwrap_or_else(|e| e.into_inner());
+            let _lock = crate::test_support::seam_counter_lock();
             let device = Device::Cpu;
             let (b, s, h, d) = (1usize, ATTENTION_BLOCK_MAX_SEQ + 1, 1usize, 8usize);
             let attn = memeff_fixture(false, h, d, s, None, &device);
@@ -9602,9 +9475,7 @@ mod tests {
                 "sanity: this test's own claim depends on JAMMI_KERNELS_STRICT=1 actually \
                  reading as Strict in this fresh process"
             );
-            let _guard = ATTENTION_BLOCK_COUNTER_TEST_LOCK
-                .lock()
-                .unwrap_or_else(|e| e.into_inner());
+            let _lock = crate::test_support::seam_counter_lock();
             let device = Device::Cpu;
             let (b, s, h, d) = (1usize, 8usize, 2usize, ATTENTION_BLOCK_HEAD_DIM);
             let attn = attention_block_fixture(false, h, s, &device);
@@ -9746,9 +9617,7 @@ mod tests {
     /// re-proven here).
     #[test]
     fn fused_training_attention_block_matches_eager_composition_within_tolerance_global() {
-        let _guard = ATTENTION_BLOCK_COUNTER_TEST_LOCK
-            .lock()
-            .unwrap_or_else(|e| e.into_inner());
+        let _lock = crate::test_support::seam_counter_lock();
         let device = Device::Cpu;
         let (b, s, h, d) = (2usize, 5usize, 2usize, ATTENTION_BLOCK_HEAD_DIM);
         let n = b * s * 3 * h * d;
@@ -9799,9 +9668,7 @@ mod tests {
     /// window band supplied to both arms.
     #[test]
     fn fused_training_attention_block_matches_eager_composition_within_tolerance_local() {
-        let _guard = ATTENTION_BLOCK_COUNTER_TEST_LOCK
-            .lock()
-            .unwrap_or_else(|e| e.into_inner());
+        let _lock = crate::test_support::seam_counter_lock();
         let device = Device::Cpu;
         let (b, s, h, d) = (1usize, 9usize, 3usize, ATTENTION_BLOCK_HEAD_DIM);
         let half_window = 2usize;
@@ -9864,9 +9731,7 @@ mod tests {
     /// self-comparison).
     #[test]
     fn fused_attention_block_retains_fewer_tape_nodes_than_the_eager_training_composition() {
-        let _guard = ATTENTION_BLOCK_COUNTER_TEST_LOCK
-            .lock()
-            .unwrap_or_else(|e| e.into_inner());
+        let _lock = crate::test_support::seam_counter_lock();
         let device = Device::Cpu;
         let (b, s, h, d) = (1usize, 4usize, 1usize, ATTENTION_BLOCK_HEAD_DIM);
         let n = b * s * 3 * h * d;
@@ -9967,9 +9832,7 @@ mod tests {
     /// fused-eligibility assertion's predicate (`assert!(!holds)`).
     #[test]
     fn attention_block_eval_output_is_bit_identical_regardless_of_fused_eligibility() {
-        let _guard = ATTENTION_BLOCK_COUNTER_TEST_LOCK
-            .lock()
-            .unwrap_or_else(|e| e.into_inner());
+        let _lock = crate::test_support::seam_counter_lock();
         let device = Device::Cpu;
         let (b, s, h, d) = (2usize, 5usize, 2usize, ATTENTION_BLOCK_HEAD_DIM);
         let n = b * s * h * d;
@@ -10117,9 +9980,7 @@ mod tests {
     /// drives through the full `ModernBert::forward_hidden`.)
     #[test]
     fn set_training_threading_gates_the_fused_attention_block_dispatch_counters() {
-        let _guard = ATTENTION_BLOCK_COUNTER_TEST_LOCK
-            .lock()
-            .unwrap_or_else(|e| e.into_inner());
+        let _lock = crate::test_support::seam_counter_lock();
         let device = Device::Cpu;
         let (b, s, h, d) = (1usize, 4usize, 2usize, ATTENTION_BLOCK_HEAD_DIM);
         let n = b * s * h * d;
@@ -10180,17 +10041,7 @@ mod tests {
     /// layer's combined mask carry all three lattice values.
     #[test]
     fn forward_hidden_reaches_the_fused_attention_block_on_a_head_dim_64_checkpoint() {
-        let _guard = ATTENTION_BLOCK_COUNTER_TEST_LOCK
-            .lock()
-            .unwrap_or_else(|e| e.into_inner());
-        // The `forward_hidden` calls below (both eval and, further down,
-        // `training=true`) run every layer's `attn_norm`/`mlp_norm` — a
-        // counter bumper on `crate::layer_norm::LN_DISPATCH_COUNTERS` at
-        // the `training=true` call, a SEPARATE registry from the
-        // attention-block counter this test already locks above.
-        let _ln_guard = crate::layer_norm::DISPATCH_COUNTER_TEST_LOCK
-            .lock()
-            .unwrap_or_else(|e| e.into_inner());
+        let _lock = crate::test_support::seam_counter_lock();
         let device = Device::Cpu;
         let dir = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
             .join("tests/fixtures/tiny_modernbert_head64");
@@ -10275,9 +10126,7 @@ mod tests {
     /// oracle.
     #[test]
     fn fused_attention_block_matches_eager_lora_gradients_at_production_seq_on_head64() {
-        let _guard = ATTENTION_BLOCK_COUNTER_TEST_LOCK
-            .lock()
-            .unwrap_or_else(|e| e.into_inner());
+        let _lock = crate::test_support::seam_counter_lock();
         let device = Device::Cpu;
         let b = 2usize;
         let s = 512usize; // production ModernBERT-large seq the pod repro used
@@ -10452,9 +10301,7 @@ mod tests {
         let Some(device) = growth_oracle_cuda_device() else {
             return;
         };
-        let _guard = ATTENTION_BLOCK_COUNTER_TEST_LOCK
-            .lock()
-            .unwrap_or_else(|e| e.into_inner());
+        let _lock = crate::test_support::seam_counter_lock();
 
         const L_MAX: usize = 28; // the real ModernBERT-large depth this defect was found on.
         let (b, s, h): (usize, usize, usize) = (8, 512, 16);
@@ -10753,12 +10600,7 @@ mod tests {
     fn fusible_site_census_is_the_exact_per_forward_seam_call_count() {
         // Lock order: attention_cascade THEN layer_norm — see
         // `crate::htsat_audio`'s own multi-lock test doc.
-        let _attn_guard = ATTENTION_BLOCK_COUNTER_TEST_LOCK
-            .lock()
-            .unwrap_or_else(|e| e.into_inner());
-        let _ln_guard = crate::layer_norm::DISPATCH_COUNTER_TEST_LOCK
-            .lock()
-            .unwrap_or_else(|e| e.into_inner());
+        let _lock = crate::test_support::seam_counter_lock();
 
         let device = Device::Cpu;
         let (config, weights) = tiny_modernbert_fixture();
@@ -10778,6 +10620,7 @@ mod tests {
             &mut any,
             &device,
             "modernbert/all-linear",
+            &_lock,
         );
 
         let layers = config.num_hidden_layers;
@@ -10803,6 +10646,7 @@ mod tests {
             &mut any_frozen,
             &device,
             "modernbert/frozen",
+            &_lock,
         );
         assert_eq!(
             frozen_census.lora_sites_wrapped, 0,

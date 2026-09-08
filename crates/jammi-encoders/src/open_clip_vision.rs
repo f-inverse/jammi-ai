@@ -695,10 +695,8 @@ mod tests {
         // (biased, training mode) bumps
         // `crate::layer_norm::LN_DISPATCH_COUNTERS` even though this test
         // never reads that counter itself (see
-        // `crate::layer_norm::DISPATCH_COUNTER_TEST_LOCK`'s doc).
-        let _guard = crate::layer_norm::DISPATCH_COUNTER_TEST_LOCK
-            .lock()
-            .unwrap_or_else(|e| e.into_inner());
+        // `crate::test_support::seam_counter_lock`'s doc).
+        let _lock = crate::test_support::seam_counter_lock();
         let config = tiny_config();
         let width = config.width;
         let device = Device::Cpu;
@@ -866,9 +864,7 @@ mod tests {
                 // `crate::layer_norm::LN_DISPATCH_COUNTERS` even though this
                 // block never reads it — same lock discipline as the other
                 // training-forward tests in this module.
-                let _guard = crate::layer_norm::DISPATCH_COUNTER_TEST_LOCK
-                    .lock()
-                    .unwrap_or_else(|e| e.into_inner());
+                let _lock = crate::test_support::seam_counter_lock();
                 let varmap = VarMap::new();
                 let vb = VarBuilder::from_varmap(&varmap, DType::F32, &device);
                 let mut model = OpenClipVisionTransformer::load(vb.pp("visual"), &config).unwrap();
@@ -964,12 +960,7 @@ mod tests {
     fn fusible_site_census_is_the_exact_per_forward_seam_call_count() {
         // Lock order: attention_cascade THEN layer_norm — see
         // `crate::htsat_audio`'s own multi-lock test doc.
-        let _attn_guard = crate::attention_cascade::ATTENTION_BLOCK_COUNTER_TEST_LOCK
-            .lock()
-            .unwrap_or_else(|e| e.into_inner());
-        let _ln_guard = crate::layer_norm::DISPATCH_COUNTER_TEST_LOCK
-            .lock()
-            .unwrap_or_else(|e| e.into_inner());
+        let _lock = crate::test_support::seam_counter_lock();
 
         let device = Device::Cpu;
         let dir = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
@@ -992,6 +983,7 @@ mod tests {
             &mut any,
             &device,
             "open_clip_vision/all-linear",
+            &_lock,
         );
 
         let layers = config.layers;
@@ -1015,6 +1007,7 @@ mod tests {
             &mut any_frozen,
             &device,
             "open_clip_vision/frozen",
+            &_lock,
         );
         assert_eq!(
             frozen_census.lora_sites_wrapped, 0,

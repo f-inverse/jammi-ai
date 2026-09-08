@@ -2942,39 +2942,56 @@ id and the missing field, never silently resolved as an ordinary model or served
 unadapted base.
 
 The adapter-fetch error contract both reload surfaces share: `fetch_artifact`
-(`crates/jammi-db/src/store/artifact.rs:220`) returns exactly one integrity-failure bucket,
-`StorageError::Layout`, for three underlying causes it deliberately folds together — a
-malformed manifest, an ABSENT manifest (nothing was ever published at that prefix; see
-`missing_manifest_is_a_hard_error` (`crates/jammi-db/src/store/artifact.rs:622`)), or a
-manifest-listed key that is missing or hash-mismatched on an otherwise-published bundle
-(`reclassify_missing_key` (`crates/jammi-db/src/store/artifact.rs:515`), `verify_sha256`
-(`crates/jammi-db/src/store/artifact.rs:530`)). "Never published" and "corrupted after publish"
-are not distinct variants here, only distinct `reason` strings inside the same
-`StorageError::Layout { path, reason }`. Both reload surfaces re-type ONLY that variant into a
-refusal naming the model id, but not into the same error type: `ModelResolver::try_catalog_lookup`
-re-types `StorageError::Layout` (`crates/jammi-ai/src/model/resolver.rs:248`) into
-`JammiError::Model`, while `load_context_predictor` re-types the identical fault, its own
-`StorageError::Layout` (`crates/jammi-ai/src/pipeline/context_predictor.rs:1286`), into
-`JammiError::Inference` instead. A catalog record that never recorded an `artifact_path`
-(`crates/jammi-ai/src/pipeline/context_predictor.rs:1237`) at all is a separate, earlier refusal
-on each surface that never reaches `fetch_artifact` — the resolver's arm raises `JammiError::Model`
-(`crates/jammi-ai/src/model/resolver.rs:263`), the predictor's raises `JammiError::Inference`.
-Any OTHER storage fault off `fetch_artifact` — transport/IO, a disabled scheme, driver-init
-failure, or a permission-denied open on a present key (which stays `StorageError::Io`, never
-reclassified — `permission_fault_on_a_present_key_stays_a_transport_error`
-(`crates/jammi-db/src/store/artifact.rs:759`)) — propagates unchanged past the resolver's own
-catch-all, `Err(e) => return Err(e)` (`crates/jammi-ai/src/model/resolver.rs:258`), and the
-predictor's identical catch-all, `Err(e) => return Err(e)`
-(`crates/jammi-ai/src/pipeline/context_predictor.rs:1295`). At the gRPC edge, `map_engine_error`
-(`crates/jammi-server/src/grpc/wire.rs:109`) maps `JammiError::Model`
-(`crates/jammi-server/src/grpc/wire.rs:115`) to `Code::InvalidArgument`, maps
-`JammiError::Inference` (`crates/jammi-server/src/grpc/wire.rs:138`) to `Code::Internal`, and
-lets every unmatched variant — including the propagated `JammiError::Storage` transport fault —
-fall through its own catch-all to `Code::Internal`
-(`crates/jammi-server/src/grpc/wire.rs:186`). So the SAME adapter-bundle integrity failure reads
-as `InvalidArgument` through `ModelResolver` but `Internal` through `load_context_predictor`, and
-on the predictor surface a genuine transient object-store outage is indistinguishable, by gRPC
-code alone, from this engine's own internal defect (both `Internal`).
+(`crates/jammi-db/src/store/artifact.rs:220`) raises two DISTINCT typed storage outcomes,
+never folding them together. A manifest that is ABSENT entirely — nothing was ever
+published at that prefix, or a catalog pointer names the wrong one — reclassifies to
+`StorageError::NotPublished` (`reclassify_missing_manifest`,
+`crates/jammi-db/src/store/artifact.rs:484`; covered by
+`missing_manifest_is_not_published_not_corruption`,
+`crates/jammi-db/src/store/artifact.rs:685`): no manifest is in hand, so there is nothing
+to say is corrupt. A manifest that IS present but malformed, or that names a key which is
+missing or hash-mismatched on an otherwise-published bundle, is the genuine integrity
+failure, `StorageError::Layout` (`reclassify_missing_key`,
+`crates/jammi-db/src/store/artifact.rs:515`; `verify_sha256`,
+`crates/jammi-db/src/store/artifact.rs:530`). Any OTHER storage fault off `fetch_artifact`
+— transport/IO, a disabled scheme, driver-init failure, or a permission-denied open on a
+present key (which stays `StorageError::Io`, never reclassified —
+`permission_fault_on_a_present_key_stays_a_transport_error`,
+`crates/jammi-db/src/store/artifact.rs:759`) — is left unchanged.
+
+Both reload surfaces match on these two variants explicitly and re-type BOTH into the SAME
+`JammiError::Model`, naming the model id with a distinct message per variant.
+`try_catalog_lookup` (`crates/jammi-ai/src/model/resolver.rs:97`), `ModelResolver`'s
+fine-tuned reload arm, matches `StorageError::NotPublished`
+(`crates/jammi-ai/src/model/resolver.rs:237`) and `StorageError::Layout`
+(`crates/jammi-ai/src/model/resolver.rs:248`) into `JammiError::Model`, and
+`load_context_predictor` (`crates/jammi-ai/src/pipeline/context_predictor.rs:1110`) matches
+the identical pair — `StorageError::NotPublished`
+(`crates/jammi-ai/src/pipeline/context_predictor.rs:1276`) and `StorageError::Layout`
+(`crates/jammi-ai/src/pipeline/context_predictor.rs:1286`) — into `JammiError::Model` as
+well, never its own `JammiError::Inference`. A catalog record that never recorded an
+`artifact_path` at all is a separate, earlier refusal on each surface that never reaches
+`fetch_artifact` — the resolver's arm also raises `JammiError::Model`
+(`crates/jammi-ai/src/model/resolver.rs:263`), and so does the predictor's own
+`JammiError::Model` (`crates/jammi-ai/src/pipeline/context_predictor.rs:1239`). Any OTHER
+storage fault propagates unchanged past both surfaces' own catch-all —
+`Err(e) => return Err(e)` (`crates/jammi-ai/src/model/resolver.rs:258`) and the identical
+`Err(e) => return Err(e)` (`crates/jammi-ai/src/pipeline/context_predictor.rs:1295`).
+
+At the gRPC edge, `map_engine_error` (`crates/jammi-server/src/grpc/wire.rs:109`) maps
+`JammiError::Model` (`crates/jammi-server/src/grpc/wire.rs:115`) to `Code::InvalidArgument`,
+maps `JammiError::Inference` (`crates/jammi-server/src/grpc/wire.rs:138`) to
+`Code::Internal`, and lets every unmatched variant — including the propagated
+`JammiError::Storage` transport fault — fall through its own catch-all to `Code::Internal`
+(`crates/jammi-server/src/grpc/wire.rs:186`). Because both reload surfaces raise the same
+`JammiError::Model` for the same class of outcome, an unpublished OR a corrupted adapter
+bundle reads as the SAME `InvalidArgument` whether it is `ModelResolver` or
+`load_context_predictor` that hit it, and a genuine transient object-store outage on either
+surface reads as the SAME `Internal` — never conflated with the client-visible precondition
+failure. `adapter_bundle_refusal_codes_agree_across_both_reload_surfaces`
+(`crates/jammi-server/src/grpc/wire.rs:286`) pins all four combinations — resolver
+integrity, resolver transport, predictor integrity, predictor transport — against the codes
+each must produce.
 
 ### 3.7 Crash recovery of building tables
 

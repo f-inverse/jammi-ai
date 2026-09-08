@@ -1116,6 +1116,28 @@ impl InferenceSession {
         let record = self.catalog().get_model(model_id).await?.ok_or_else(|| {
             JammiError::Catalog(format!("context predictor '{model_id}' not found"))
         })?;
+        // Advisory 2 (esc-089 fold, id-shape backstop's second member): unlike
+        // a fine-tuned id, a context-predictor id is caller-chosen and carries
+        // no reserved prefix `ModelResolver::try_catalog_lookup` can cross-check
+        // by shape, so this surface asserts its own row-shape invariant
+        // directly — every row this call reads must actually BE a
+        // context-predictor row, never a same-id row some OTHER terminal
+        // producer (or a stale/reused id) committed. Refusing here, before any
+        // field below is read, keeps a mismatched row from being silently
+        // parsed as a context-predictor config that happens to fail some
+        // other, less legible way downstream.
+        if record.model_type != "context-predictor" {
+            return Err(JammiError::Model {
+                model_id: model_id.to_string(),
+                message: format!(
+                    "'{model_id}' was requested as a context predictor but its catalog row's \
+                     model_type is '{}', not 'context-predictor' — refusing to read this row as \
+                     a context-predictor config, which would silently trust fields this \
+                     producer never wrote",
+                    record.model_type
+                ),
+            });
+        }
         // A corrupted catalog record — absent `config_json`, or `config_json`
         // present but unparseable, or present-and-parseable JSON missing a
         // required field — is a client-visible precondition failure, never

@@ -1807,6 +1807,90 @@ async fn context_predictor_reload_corrupted_pointer_refuses_as_typed_model_error
     );
 }
 
+/// Advisory 2 (esc-089 id-shape backstop's second member): a context-predictor
+/// id is caller-chosen and carries no reserved prefix
+/// `ModelResolver::try_catalog_lookup` can cross-check by shape the way it
+/// does for a `jammi:fine-tuned:` id, so `load_context_predictor` must assert
+/// its OWN row-shape invariant — the catalog row it reads back under this id
+/// must actually be typed `"context-predictor"` — before trusting any of that
+/// row's fields. A row registered under the SAME id but a different
+/// `model_type` (e.g. a stale/reused id, or a same-id row a different
+/// terminal producer committed) must refuse by name, naming the id and the
+/// row's actual type, rather than parsing that row's `config_json` as if it
+/// were an honest context-predictor config.
+#[tokio::test(flavor = "multi_thread")]
+async fn context_predictor_reload_wrong_model_type_refuses_as_typed_model_error() {
+    use jammi_db::catalog::model_repo::RegisterModelParams;
+
+    let rows = synthetic_meta_dataset(12, 16, 4252);
+    let (session, dir) = session_with_meta_dataset(&rows).await;
+
+    let spec = spec(
+        ContextArchitecture::AttnCnp,
+        PredictiveHead::Gaussian {
+            objective: GaussianObjective::Crps,
+        },
+    );
+    let model_id = train(&session, &spec).await;
+
+    // Re-register the SAME id with an honest, otherwise-untouched config —
+    // only `model_type` is corrupted, mirroring exactly what a same-id row
+    // from a different terminal producer (or a pre-fix build) would look
+    // like from this surface's point of view.
+    let record = session
+        .catalog()
+        .get_model(&model_id)
+        .await
+        .unwrap()
+        .unwrap();
+    session
+        .catalog()
+        .register_model(RegisterModelParams {
+            model_id: &model_id,
+            version: 1,
+            model_type: "fine-tuned",
+            backend: "candle",
+            task: ModelTask::Regression,
+            base_model_id: record.base_model_id.as_deref(),
+            artifact_path: record.artifact_path.as_deref(),
+            config_json: record.config_json.as_deref(),
+        })
+        .await
+        .unwrap();
+
+    let cold = Arc::new(
+        InferenceSession::new(common::test_config(dir.path()))
+            .await
+            .unwrap(),
+    );
+    cold.register_query_functions();
+
+    let err = match cold
+        .load_context_predictor(&model_id, "fns", ContextServeOptions::default())
+        .await
+    {
+        Ok(_) => panic!(
+            "reloading a context predictor whose catalog row is typed 'fine-tuned', not \
+             'context-predictor', must refuse, never silently serve it as a predictor"
+        ),
+        Err(e) => e,
+    };
+    assert!(
+        matches!(err, jammi_db::error::JammiError::Model { .. }),
+        "a model_type mismatch on the context-predictor id-shape backstop must be the SAME \
+         typed JammiError::Model variant the sibling reload refusals raise, got: {err:?}"
+    );
+    let message = err.to_string();
+    assert!(
+        message.contains(&model_id),
+        "refusal must name the model id, got: {message}"
+    );
+    assert!(
+        message.contains("model_type") && message.contains("fine-tuned"),
+        "refusal must name the field and the row's actual (wrong) model_type, got: {message}"
+    );
+}
+
 /// a corrupted `config_json` — absent
 /// entirely, or present but not even valid JSON — must refuse with the
 /// SAME typed `JammiError::Model` variant every other corrupted-

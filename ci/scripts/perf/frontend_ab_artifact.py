@@ -134,11 +134,17 @@ unrelated churn as spurious staleness). Instead it has two arms -- (a) a
 record check against `C` (the artifact file's own last commit, `git log -1
 -- <artifact path>`) and `C`'s own parent, computed purely from git
 history, ALWAYS; and (b), only when the caller knows the unit's own PR head
-sha (CI wires this as `JAMMI_CI_UNIT_HEAD_SHA`, empty on a push-to-main
-checkout), a check that `C` itself IS that head -- any later commit on the
-PR, whether or not it touches a file the record already names, is then a
-named failure, "artifact record stale: regenerate as the final commit",
-never a silent pass.
+sha (CI wires `JAMMI_CI_UNIT_HEAD_SHA: ${{ github.event.pull_request.
+head.sha || 'push' }}` -- the PR's own head sha on a `pull_request` (or
+`pull_request_target`) checkout, the literal string `push` on a `push`
+checkout, NEVER empty on either; `resolve_unit_head_sha` additionally
+cross-checks the resolved value against `GITHUB_EVENT_NAME` itself,
+refusing the `push` sentinel on a `pull_request`/`pull_request_target`
+event and refusing any non-sentinel value on a `push` event, naming both
+variables either way), a check that `C` itself IS that head -- any later
+commit on the PR, whether or not it touches a file the record already
+names, is then a named failure, "artifact record stale: regenerate as the
+final commit", never a silent pass.
 
 Run: `python3 ci/scripts/perf/frontend_ab_artifact.py --raw-dir <dir>
 --report-json <path> --identity <path> --serial-tail <path>

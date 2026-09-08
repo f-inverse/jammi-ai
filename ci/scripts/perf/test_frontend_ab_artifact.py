@@ -66,20 +66,29 @@ is therefore split into two independent arms:
   happens to be checked out.
 - **Arm (b), event-keyed, never a silent empty-string skip:** CI wires
   `JAMMI_CI_UNIT_HEAD_SHA: ${{ github.event.pull_request.head.sha ||
-  'push' }}` -- the literal string `push` on a push-to-main checkout,
-  never empty. `resolve_unit_head_sha` turns the raw env var into either a
-  full commit sha (arm (b) engages) or `None` (arm (b) is a deliberate
-  no-op): the literal `push` resolves to `None` with a printed notice
-  (the intentional push-to-main skip); an abbreviated sha or a ref name
+  'push' }}` -- the PR's own head sha on a `pull_request` (or
+  `pull_request_target`) checkout, the literal string `push` on a `push`
+  checkout, never empty on either. `resolve_unit_head_sha` cross-checks
+  the raw value against `GITHUB_EVENT_NAME` itself (a GitHub Actions
+  built-in, present on every job with no extra wiring needed): on
+  `pull_request`/`pull_request_target`, the `push` sentinel is REFUSED
+  naming both `GITHUB_EVENT_NAME` and `JAMMI_CI_UNIT_HEAD_SHA` (the PR's
+  own head sha must have been exported); on `push`, any value other than
+  the sentinel is REFUSED as inconsistent, naming both variables. Past
+  that cross-check, the raw env var is turned into either a full commit
+  sha (arm (b) engages) or `None` (arm (b) is a deliberate no-op): the
+  literal `push` resolves to `None` with a printed notice (the
+  intentional push-to-main skip); an abbreviated sha or a ref name
   resolves to its full sha via `git rev-parse --verify <v>^{commit}` (so
   arm (b) compares full-sha-to-full-sha); a value `git` cannot resolve is
   a named `AssertionError` citing the malformed value itself -- NEVER
-  diagnosed as staleness. Locally (no `JAMMI_CI_FRONTEND_AB_FINAL_
-  FIXTURE_EXPECTED=1`), an empty/unset var also resolves to `None` with a
-  printed notice. Under `JAMMI_CI_FRONTEND_AB_FINAL_FIXTURE_EXPECTED=1`
-  (CI), an empty/unset var is instead a named `AssertionError` -- the
-  matrix's own `|| 'push'` fallback means empty can only be a wiring
-  break, never a legitimate push-to-main checkout (this repo's own
+  diagnosed as staleness. Locally (no `GITHUB_EVENT_NAME` and no
+  `JAMMI_CI_FRONTEND_AB_FINAL_FIXTURE_EXPECTED=1`), the event cross-check
+  never engages and an empty/unset var resolves to `None` with a printed
+  notice. Under `JAMMI_CI_FRONTEND_AB_FINAL_FIXTURE_EXPECTED=1` (CI), an
+  empty/unset var is instead a named `AssertionError` -- the matrix's own
+  `|| 'push'` fallback means empty can only be a wiring break, never a
+  legitimate checkout of either event (this repo's own
   zero-execution-is-RED doctrine: a stale artifact with no working env
   var must never silently pass). Once resolved to a sha, arm (b) asserts
   `C` itself equals that sha: any later commit on the PR -- whether or
@@ -100,8 +109,9 @@ red under (a) even with no later commits at all).
 `UnitHeadShaResolutionTests` covers `resolve_unit_head_sha`'s own
 normalisation of the raw `JAMMI_CI_UNIT_HEAD_SHA` env var (the `push`
 sentinel, an empty value under CI vs a bare local run, an unresolvable
-value, and an abbreviated sha) on its own scratch repo, independent of
-`ArtifactRecordFreshnessGateTests`'s repo.
+value, an abbreviated sha, and the `GITHUB_EVENT_NAME` cross-check
+against the sentinel in both directions) on its own scratch repo,
+independent of `ArtifactRecordFreshnessGateTests`'s repo.
 `RealFixtureRegressionTests.test_committed_artifact_record_is_not_stale`
 then drives arm (a) against the REAL committed pod-p421c artifact, and
 arm (b) via `resolve_unit_head_sha` whenever `JAMMI_CI_UNIT_HEAD_SHA` is
@@ -223,6 +233,11 @@ STALE_ARTIFACT_RECORD_MESSAGE = "artifact record stale: regenerate as the final 
 # head_sha` below for the full normalisation contract.
 _UNIT_HEAD_ENV_VAR = "JAMMI_CI_UNIT_HEAD_SHA"
 _PUSH_SENTINEL = "push"
+# GitHub Actions' own built-in env var, present on every job with no extra
+# wiring -- `resolve_unit_head_sha` cross-checks it against `_PUSH_SENTINEL`
+# so the sentinel and the event that produced it can never disagree.
+_EVENT_NAME_ENV_VAR = "GITHUB_EVENT_NAME"
+_PR_EVENT_NAMES = ("pull_request", "pull_request_target")
 
 # The `notes.measured_tip_precedes_merge_tip` keys arm (a) checks against
 # `C`/`C^` directly (never against a fresh-at-HEAD regeneration's own
@@ -351,28 +366,42 @@ def assert_committed_artifact_record_matches_artifact_commit(
         )
 
 
-def resolve_unit_head_sha(raw_value: str | None, repo_root: Path, *, ci_mode: bool) -> str | None:
+def resolve_unit_head_sha(
+    raw_value: str | None, repo_root: Path, *, ci_mode: bool, event_name: str | None = None
+) -> str | None:
     """Normalises the raw `JAMMI_CI_UNIT_HEAD_SHA` env var into either a
     full commit sha (arm (b), `assert_artifact_commit_is_unit_head`,
     engages) or `None` (arm (b) is a deliberate no-op) -- reshaped to this
     repo's own zero-execution-is-RED doctrine so an empty expansion under
-    CI can never silently turn arm (b) off (the round-7 audit's own
-    finding: "arm (b) engages only when non-empty and nothing asserts it
-    ever engaged").
+    CI can never silently turn arm (b) off.
 
     `ci.yml`'s own matrix entry exports `JAMMI_CI_UNIT_HEAD_SHA: ${{
-    github.event.pull_request.head.sha || 'push' }}`, so under CI the raw
-    value is NEVER legitimately empty -- a push-to-main checkout carries
-    the literal string `push` instead. Four cases:
+    github.event.pull_request.head.sha || 'push' }}`: on a `pull_request`
+    (or `pull_request_target`) checkout that is the PR's own head sha,
+    NEVER empty and NEVER the literal `push`; on a `push` checkout it is
+    the literal string `push`, NEVER empty and NEVER a resolved sha.
+    `event_name` (CI passes `GITHUB_EVENT_NAME`, a GitHub Actions built-in
+    present on every job with no extra wiring) lets this function cross-
+    check the two variables against each other rather than trusting
+    `raw_value` alone. Six cases, checked in this order:
 
-    - `raw_value` is the literal `'push'`: the push-to-main sentinel --
-      `None` (arm (b) intentionally skipped), with a printed notice so the
-      skip shows up in the test's own stdout rather than disappearing.
+    - `event_name` is `pull_request`/`pull_request_target` and `raw_value`
+      is the literal `push`: REFUSED naming both `GITHUB_EVENT_NAME` and
+      `JAMMI_CI_UNIT_HEAD_SHA` -- a pull-request checkout's own head sha
+      must have been exported; the sentinel here can only mean the
+      matrix's own expression broke.
+    - `event_name` is `push` and `raw_value` is a non-empty value other
+      than the literal `push`: REFUSED as inconsistent, naming both
+      variables -- a push-to-main checkout never carries a resolved sha.
+    - `raw_value` is the literal `'push'` (and the event cross-check above
+      did not already refuse it): the push-to-main sentinel -- `None`
+      (arm (b) intentionally skipped), with a printed notice so the skip
+      shows up in the test's own stdout rather than disappearing.
     - `raw_value` is empty/`None` and `ci_mode` is true: a named
       `AssertionError` citing `JAMMI_CI_UNIT_HEAD_SHA` -- the matrix's own
       `|| 'push'` fallback means an empty value here can only be a wiring
       break (e.g. the matrix entry edited to drop the fallback), never a
-      legitimate push-to-main checkout.
+      legitimate checkout of either event.
     - `raw_value` is empty/`None` and `ci_mode` is false: a bare local run
       with the var unset -- `None`, with a printed notice, exactly like
       the local-run doctrine this module's own top-of-file doc names.
@@ -383,7 +412,25 @@ def resolve_unit_head_sha(raw_value: str | None, repo_root: Path, *, ci_mode: bo
       malformed value itself -- NEVER folded into `STALE_ARTIFACT_RECORD_
       MESSAGE`, since an unresolvable env var is a wiring bug, not
       evidence the artifact is out of date.
+
+    When `event_name` is anything else (including `None` -- a bare local
+    run, where `GITHUB_EVENT_NAME` is normally unset), the two event
+    cross-checks above never engage and only the plain `raw_value`/
+    `ci_mode` cases apply, unchanged from before this function knew about
+    `GITHUB_EVENT_NAME` at all.
     """
+    if event_name in _PR_EVENT_NAMES and raw_value == _PUSH_SENTINEL:
+        raise AssertionError(
+            f"{_EVENT_NAME_ENV_VAR}={event_name!r} but {_UNIT_HEAD_ENV_VAR}={_PUSH_SENTINEL!r} -- a pull_request "
+            f"checkout must export the PR's own head sha, never the push-to-main sentinel; check both "
+            f"{_EVENT_NAME_ENV_VAR} and {_UNIT_HEAD_ENV_VAR}"
+        )
+    if event_name == _PUSH_SENTINEL and raw_value and raw_value != _PUSH_SENTINEL:
+        raise AssertionError(
+            f"{_EVENT_NAME_ENV_VAR}={_PUSH_SENTINEL!r} but {_UNIT_HEAD_ENV_VAR}={raw_value!r} -- a push-to-main "
+            f"checkout must carry the literal sentinel {_PUSH_SENTINEL!r}, never a resolved sha; check both "
+            f"{_EVENT_NAME_ENV_VAR} and {_UNIT_HEAD_ENV_VAR}"
+        )
     if raw_value == _PUSH_SENTINEL:
         print(f"[frontend_ab_artifact] {_UNIT_HEAD_ENV_VAR}={_PUSH_SENTINEL!r} -- arm (b) intentionally skipped "
               "(push-to-main checkout, no PR head to compare against)")
@@ -691,7 +738,7 @@ class HappyPathTests(unittest.TestCase):
         self.assertEqual(dev["commentary"], "fixture commentary")
 
     def test_exit_byte_divergence_moves_only_that_legs_hash_and_the_run_hash(self):
-        """Advisory probe (round-7 audit): a divergence confined to a
+        """Advisory probe: a divergence confined to a
         `.exit` file's OWN bytes (`int(exit_text)` still `0` -- a valid
         leg, never `ArtifactBuildError`'s own `exit_code != 0` refusal)
         must move `input_sha256[that leg]` -- checked against an
@@ -1024,21 +1071,25 @@ class UnitHeadShaResolutionTests(unittest.TestCase):
     (`assert_artifact_commit_is_unit_head`) -- on a small scratch `git
     init`'d repo, independent of both the real fixture
     (`RealFixtureRegressionTests`) and `ArtifactRecordFreshnessGateTests`'s
-    own repo. This is the audit's own probe for "arm (b) engages only when
-    non-empty and nothing asserts it ever engaged": every case below
-    either engages arm (b) with a real resolved sha, or explicitly records
-    (via a printed notice, asserted present in no test here -- `stdout` is
-    not captured by this harness, only the return value / raised
-    exception are) that arm (b) was intentionally skipped, or REFUSES by
-    name.
+    own repo. Every case below either engages arm (b) with a real resolved
+    sha, or explicitly records (via a printed notice, asserted present in
+    no test here -- `stdout` is not captured by this harness, only the
+    return value / raised exception are) that arm (b) was intentionally
+    skipped, or REFUSES by name.
 
-    Scratch-repo scenarios (mirroring the round-7 audit's own table):
-    PR-lane value == `C` -> green; PR-lane value != `C` -> RED (stale
-    message); `push` -> arm (a) only, green; empty under `ci_mode=True` ->
-    RED naming the variable; empty under `ci_mode=False` -> skipped, no
-    RED; `not-a-sha` -> RED naming the malformed input (never the stale
-    message); an abbreviated sha of `C` -> green (resolves to the full
-    sha).
+    Scratch-repo scenarios: PR-lane value == `C` -> green; PR-lane value
+    != `C` -> RED (stale message); `push` -> arm (a) only, green; empty
+    under `ci_mode=True` -> RED naming the variable; empty under
+    `ci_mode=False` -> skipped, no RED; `not-a-sha` -> RED naming the
+    malformed input (never the stale message); an abbreviated sha of `C`
+    -> green (resolves to the full sha); and, event-keyed:
+    `GITHUB_EVENT_NAME=pull_request` (or `pull_request_target`) with the
+    `push` sentinel -> RED naming both `GITHUB_EVENT_NAME` and
+    `JAMMI_CI_UNIT_HEAD_SHA`; `GITHUB_EVENT_NAME=push` with a resolved sha
+    -> RED naming both variables as inconsistent; `GITHUB_EVENT_NAME=push`
+    with the `push` sentinel -> green; no `GITHUB_EVENT_NAME` at all (a
+    bare local run) -> the event cross-check never engages, so `push`
+    still skips arm (b) regardless of `ci_mode`.
     """
 
     def setUp(self):
@@ -1096,6 +1147,43 @@ class UnitHeadShaResolutionTests(unittest.TestCase):
         message = str(ctx.exception)
         self.assertIn("not-a-sha", message)
         self.assertNotIn(STALE_ARTIFACT_RECORD_MESSAGE, message)
+
+    def test_pull_request_event_with_pr_head_sha_is_green(self):
+        resolved = resolve_unit_head_sha(self.c, self.root, ci_mode=True, event_name="pull_request")
+        self.assertEqual(resolved, self.c)
+        assert_artifact_commit_is_unit_head("artifact.json", self.root, resolved)  # must not raise
+
+    def test_pull_request_event_with_push_sentinel_is_red_naming_both_variables(self):
+        with self.assertRaises(AssertionError) as ctx:
+            resolve_unit_head_sha("push", self.root, ci_mode=True, event_name="pull_request")
+        message = str(ctx.exception)
+        self.assertIn(_EVENT_NAME_ENV_VAR, message)
+        self.assertIn(_UNIT_HEAD_ENV_VAR, message)
+
+    def test_pull_request_target_event_with_push_sentinel_is_also_red(self):
+        with self.assertRaises(AssertionError) as ctx:
+            resolve_unit_head_sha("push", self.root, ci_mode=True, event_name="pull_request_target")
+        message = str(ctx.exception)
+        self.assertIn(_EVENT_NAME_ENV_VAR, message)
+        self.assertIn(_UNIT_HEAD_ENV_VAR, message)
+
+    def test_push_event_with_push_sentinel_is_green(self):
+        resolved = resolve_unit_head_sha("push", self.root, ci_mode=True, event_name="push")
+        self.assertIsNone(resolved)
+        assert_artifact_commit_is_unit_head("artifact.json", self.root, resolved)  # arm (a)-only, no-op
+
+    def test_push_event_with_a_resolved_sha_is_red_naming_both_variables_as_inconsistent(self):
+        with self.assertRaises(AssertionError) as ctx:
+            resolve_unit_head_sha(self.c, self.root, ci_mode=True, event_name="push")
+        message = str(ctx.exception)
+        self.assertIn(_EVENT_NAME_ENV_VAR, message)
+        self.assertIn(_UNIT_HEAD_ENV_VAR, message)
+
+    def test_no_event_name_keeps_current_behaviour_push_sentinel_still_skips(self):
+        for ci_mode in (True, False):
+            with self.subTest(ci_mode=ci_mode):
+                resolved = resolve_unit_head_sha("push", self.root, ci_mode=ci_mode, event_name=None)
+                self.assertIsNone(resolved)
 
     def test_abbreviated_sha_of_c_resolves_to_full_sha_and_is_green(self):
         resolved = resolve_unit_head_sha(self.c_short, self.root, ci_mode=True)
@@ -1631,14 +1719,20 @@ class RealFixtureRegressionTests(unittest.TestCase):
         head_sha` (see its own docstring) turns `JAMMI_CI_UNIT_HEAD_SHA`
         into a resolved sha -- `ci.yml`'s own matrix entry exports `${{
         github.event.pull_request.head.sha || 'push' }}`, so the raw value
-        is either a PR head sha, the literal `push` (arm (b) intentionally
-        skipped), or -- outside CI, when this suite is run by hand with the
-        var unset -- empty (also skipped, never a hard failure). Once
-        engaged, arm (b) is green when the resolved sha equals `C`, RED
-        (named) for any other value, since a later, un-rendered commit
-        landed on the unit after the artifact was last regenerated; an
-        unresolvable (malformed) value is a separate, differently-named RED
-        that never masquerades as staleness.
+        is the PR's own head sha on a `pull_request`/`pull_request_target`
+        checkout, the literal `push` on a `push` checkout (arm (b)
+        intentionally skipped), or -- outside CI, when this suite is run by
+        hand with the var unset -- empty (also skipped, never a hard
+        failure). `resolve_unit_head_sha` cross-checks the raw value
+        against `GITHUB_EVENT_NAME` itself: the `push` sentinel on a
+        `pull_request`/`pull_request_target` event, or any non-sentinel
+        value on a `push` event, is REFUSED naming both variables, never
+        silently resolved either way. Once engaged, arm (b) is green when
+        the resolved sha equals `C`, RED (named) for any other value, since
+        a later, un-rendered commit landed on the unit after the artifact
+        was last regenerated; an unresolvable (malformed) value is a
+        separate, differently-named RED that never masquerades as
+        staleness.
 
         The committed pod-p421c artifact was regenerated at this unit's own
         final tip with the `.exit`-file fold already in place (see
@@ -1690,7 +1784,8 @@ class RealFixtureRegressionTests(unittest.TestCase):
         )
         artifact_rel_path = str(committed_path.relative_to(repo_root))
         unit_head_sha = resolve_unit_head_sha(
-            os.environ.get(_UNIT_HEAD_ENV_VAR), repo_root, ci_mode=self._ci_expects_real_fixture()
+            os.environ.get(_UNIT_HEAD_ENV_VAR), repo_root, ci_mode=self._ci_expects_real_fixture(),
+            event_name=os.environ.get(_EVENT_NAME_ENV_VAR),
         )
         assert_committed_artifact_not_stale(
             committed, regenerated, artifact_rel_path, repo_root, unit_head_sha=unit_head_sha

@@ -403,6 +403,24 @@ workspace ships every publishable crate at the same
   the positive-proof equation exactly (all three keys, non-vacuity on `calls`, the GELU seam
   non-zero on HTSAT / zero on both OpenCLIP towers) rather than witnessing it on tiny_bert/text
   alone.
+- **A fine-tuned model resolves to the SAME adapted checkpoint across a cold restart, never
+  silently to the unadapted base (esc-089).** `ModelCache::get_or_load`'s post-load catalog
+  bookkeeping — meant only to complete a plain local/HuggingFace source's registration, or a
+  placeholder `"embedding"` row pre-registered before a base model is ever loaded — was writing
+  unconditionally for ANY resolved model id, including one already resolved through the
+  fine-tuned branch of `ModelResolver::try_catalog_lookup`. Because `ModelSource::parse` maps a
+  fine-tuned id (`jammi:fine-tuned:{uuid}`) onto the same `HuggingFace` variant a real Hub repo id
+  gets, that write clobbered the fine-tuned row's `model_type` (to `"huggingface"`), its
+  `artifact_path` (to the underlying BASE checkpoint's directory) and its `base_model_id` lineage
+  right after a successful load — invisibly, since the just-loaded in-process model still had the
+  adapter applied. A subsequent resolve from a fresh process (or a fresh `ModelCache`) read the
+  clobbered row and served the base with no signal. The bookkeeping write now skips any catalog
+  row already committed by a terminal producer (`model_type` `"fine-tuned"`,
+  `"context-predictor"`, or `"checkpoint"`); `ModelResolver::try_catalog_lookup`'s fine-tuned
+  branch additionally refuses, naming the model id and the missing pointer, if a
+  `model_type == "fine-tuned"` record ever again carries no `base_model_id` or no
+  `artifact_path`, rather than falling through to resolve it as an ordinary model or serving the
+  base silently.
 
 ### Breaking
 - `jammi_encoders::{AnyAudioEncoder, AudioEncoder}` are removed

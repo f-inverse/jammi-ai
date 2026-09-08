@@ -111,41 +111,76 @@ impl ModelResolver {
         // bug, only a verbatim reader of one that used to be.
 
         if record.model_type == "fine-tuned" {
-            if let Some(ref base_id) = record.base_model_id {
-                let base_source = ModelSource::parse(base_id);
-                let base_resolved =
-                    Box::pin(self.resolve(&base_source, task, backend_hint)).await?;
+            // esc-089: a `model_type == "fine-tuned"` record MUST carry a
+            // resolvable adapter pointer. `artifact_path` is committed
+            // exactly once, by the lease-guarded finalize CAS
+            // (`Catalog::finalize_training_job`) — a `None` here means the
+            // pointer was never written (or was clobbered after the fact,
+            // as `ModelCache::get_or_load`'s post-load catalog bookkeeping
+            // used to do for a fine-tuned id — see that call site's own
+            // fix). Either way this is a broken record, not "no adapter":
+            // silently falling through to serve the unadapted base would
+            // drop the fine-tuning with no signal (K2/K7), so this is a
+            // typed refusal naming the id and the missing pointer, exactly
+            // like the sibling refusal `CandleBackend::load` raises when
+            // `adapter_path` resolves but the bundle files under it are
+            // missing (audit round 62, F-1).
+            let Some(ref base_id) = record.base_model_id else {
+                return Err(JammiError::Model {
+                    model_id: model_id.0.clone(),
+                    message: format!(
+                        "fine-tuned model '{}' has no base_model_id recorded in the \
+                         catalog — its lineage pointer was never written or was lost; \
+                         refusing to silently resolve it as a directly-registered model, \
+                         which would misread its adapter-only artifact directory as a \
+                         full checkpoint",
+                        model_id.0
+                    ),
+                });
+            };
+            let base_source = ModelSource::parse(base_id);
+            let base_resolved = Box::pin(self.resolve(&base_source, task, backend_hint)).await?;
 
-                let adapter_path = match &record.artifact_path {
-                    Some(prefix) => {
-                        let prefix_url = jammi_db::storage::StorageUrl::parse(prefix)?;
-                        Some(
-                            self.artifact_store
-                                .fetch_artifact(&prefix_url)
-                                .await?
-                                .dir()
-                                .to_path_buf(),
-                        )
-                    }
-                    None => None,
-                };
+            let adapter_path = match &record.artifact_path {
+                Some(prefix) => {
+                    let prefix_url = jammi_db::storage::StorageUrl::parse(prefix)?;
+                    Some(
+                        self.artifact_store
+                            .fetch_artifact(&prefix_url)
+                            .await?
+                            .dir()
+                            .to_path_buf(),
+                    )
+                }
+                None => {
+                    return Err(JammiError::Model {
+                        model_id: model_id.0.clone(),
+                        message: format!(
+                            "fine-tuned model '{}' has no artifact_path recorded in the \
+                             catalog — its adapter bundle was never committed by a \
+                             finalize, or the pointer was lost after the fact; refusing \
+                             to silently serve the unadapted base model '{base_id}'",
+                            model_id.0
+                        ),
+                    });
+                }
+            };
 
-                return Ok(Some(ResolvedModel {
-                    model_id,
-                    backend: base_resolved.backend,
-                    weights_format: base_resolved.weights_format,
-                    task,
-                    config_path: base_resolved.config_path,
-                    weights_paths: base_resolved.weights_paths,
-                    tokenizer: base_resolved.tokenizer,
-                    model_config: base_resolved.model_config,
-                    preprocessor_config: base_resolved.preprocessor_config,
-                    pooling_config: base_resolved.pooling_config,
-                    base_model_id: Some(ModelId(base_id.clone())),
-                    adapter_path,
-                    estimated_memory: base_resolved.estimated_memory,
-                }));
-            }
+            return Ok(Some(ResolvedModel {
+                model_id,
+                backend: base_resolved.backend,
+                weights_format: base_resolved.weights_format,
+                task,
+                config_path: base_resolved.config_path,
+                weights_paths: base_resolved.weights_paths,
+                tokenizer: base_resolved.tokenizer,
+                model_config: base_resolved.model_config,
+                preprocessor_config: base_resolved.preprocessor_config,
+                pooling_config: base_resolved.pooling_config,
+                base_model_id: Some(ModelId(base_id.clone())),
+                adapter_path,
+                estimated_memory: base_resolved.estimated_memory,
+            }));
         }
 
         // Only use the catalog hit if artifact_path is set and still exists

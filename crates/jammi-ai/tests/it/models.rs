@@ -624,3 +624,112 @@ async fn ner_model_round_trips_through_catalog() {
     assert_eq!(fetched.task, ModelTask::Ner);
     assert_eq!(fetched.backend, "candle");
 }
+
+// =============================================================================
+// esc-089: a `model_type == "fine-tuned"` catalog record with a broken
+// lineage/adapter pointer is a typed refusal, never a silent fall-back to
+// the base model. `crate::tower_adapters`/`crate::fine_tune`'s own
+// `*_serves_cold_after_restart` tests pin the end-to-end, happy-path
+// mechanism this unit fixed (`ModelCache::get_or_load`'s post-load
+// bookkeeping no longer clobbers a fine-tuned row); these two pin the
+// resolver's OWN defense-in-depth refusal directly, independent of how a
+// record ends up broken.
+// =============================================================================
+
+/// A fine-tuned record whose `artifact_path` is `None` (the finalize CAS
+/// never ran, or its pointer was lost after the fact) must refuse to
+/// resolve — never silently resolve to the unadapted base model.
+#[tokio::test]
+async fn fine_tuned_record_without_artifact_path_refuses_to_resolve() {
+    use jammi_db::catalog::model_repo::RegisterModelParams;
+
+    let dir = tempdir().unwrap();
+    let catalog = Arc::new(Catalog::open(dir.path()).await.unwrap());
+    let base_dir = crate::common::cookbook_fixture("tiny_bert");
+    let base_id = format!("local:{}", base_dir.display());
+
+    catalog
+        .register_model(RegisterModelParams {
+            model_id: "jammi:fine-tuned:broken-artifact-path",
+            version: 1,
+            model_type: "fine-tuned",
+            backend: "candle",
+            task: ModelTask::TextEmbedding,
+            base_model_id: Some(&base_id),
+            artifact_path: None,
+            config_json: None,
+        })
+        .await
+        .unwrap();
+
+    let resolver = ModelResolver::new(catalog, crate::common::test_artifact_store()).unwrap();
+    let source = ModelSource::hf("jammi:fine-tuned:broken-artifact-path");
+    let result = resolver
+        .resolve(&source, ModelTask::TextEmbedding, None)
+        .await;
+    let err = match result {
+        Ok(_) => panic!(
+            "a fine-tuned record with no artifact_path must refuse to resolve, never \
+             silently serve the unadapted base model"
+        ),
+        Err(e) => e,
+    };
+    let message = err.to_string();
+    assert!(
+        message.contains("jammi:fine-tuned:broken-artifact-path"),
+        "refusal must name the broken model id, got: {message}"
+    );
+    assert!(
+        message.contains("artifact_path"),
+        "refusal must name the missing pointer, got: {message}"
+    );
+}
+
+/// A fine-tuned record whose `base_model_id` is `None` (the lineage pointer
+/// was never written, or was lost) must refuse to resolve — never silently
+/// fall through to resolving it as an ordinary directly-registered model,
+/// which would misread its adapter-only artifact directory as a full
+/// checkpoint.
+#[tokio::test]
+async fn fine_tuned_record_without_base_model_id_refuses_to_resolve() {
+    use jammi_db::catalog::model_repo::RegisterModelParams;
+
+    let dir = tempdir().unwrap();
+    let catalog = Arc::new(Catalog::open(dir.path()).await.unwrap());
+
+    catalog
+        .register_model(RegisterModelParams {
+            model_id: "jammi:fine-tuned:broken-base-id",
+            version: 1,
+            model_type: "fine-tuned",
+            backend: "candle",
+            task: ModelTask::TextEmbedding,
+            base_model_id: None,
+            artifact_path: Some("/nonexistent/adapter/prefix"),
+            config_json: None,
+        })
+        .await
+        .unwrap();
+
+    let resolver = ModelResolver::new(catalog, crate::common::test_artifact_store()).unwrap();
+    let source = ModelSource::hf("jammi:fine-tuned:broken-base-id");
+    let result = resolver
+        .resolve(&source, ModelTask::TextEmbedding, None)
+        .await;
+    let err = match result {
+        Ok(_) => panic!(
+            "a fine-tuned record with no base_model_id must refuse to resolve, never \
+             silently fall through to treating it as a directly-registered model"
+        ),
+        Err(e) => e,
+    };
+    let message = err.to_string();
+    assert!(
+        message.contains("jammi:fine-tuned:broken-base-id"),
+        "refusal must name the broken model id, got: {message}"
+    );
+    assert!(
+        message.contains("base_model_id"),
+        "refusal must name the missing pointer, got: {message}"
+    );
+}

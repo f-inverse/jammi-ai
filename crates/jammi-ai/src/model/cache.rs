@@ -623,33 +623,82 @@ impl ModelCache {
         // Register model in catalog (idempotent — ignores if already registered).
         // Store the parent directory of the first weights file so that
         // `build_encoder_adapters` can locate config.json and tokenizer.json.
-        let backend_str = format!("{:?}", resolved.backend).to_lowercase();
-        let model_type = match source {
-            ModelSource::HuggingFace(_) => "huggingface",
-            ModelSource::Local(_) => "local",
-        };
-        let artifact_dir_str: Option<String> = resolved
-            .weights_paths
-            .first()
-            .and_then(|p| p.parent())
-            .and_then(|p| p.to_str())
-            .map(|s| s.to_owned());
-        if let Err(e) = self
+        //
+        // esc-089: this bookkeeping write must never touch a catalog row a
+        // TERMINAL producer already committed with its own artifact/lineage
+        // pointer. `source_str` can also name a fine-tuned model, an epoch
+        // checkpoint, or a context-predictor — `ModelSource::parse`'s
+        // fallback maps any string without a `local:`/`file://` prefix to
+        // `HuggingFace`, so a fine-tuned id like `jammi:fine-tuned:{uuid}`
+        // parses exactly like a real HF Hub repo id would. Registering it here
+        // unconditionally, with `model_type: "huggingface"`, `base_model_id:
+        // None`, and THIS resolve's already-adapted result's underlying BASE
+        // weights directory as `artifact_path`, used to silently overwrite that
+        // row: `model_type` is unconditional in `register_model`'s `ON
+        // CONFLICT` clause, and a non-null `artifact_path` wins the
+        // `COALESCE`, so both the served-adapter pointer and the
+        // `base_model_id` lineage (folded into the clobbered `metadata` blob)
+        // were lost right after a successful fine-tuned load. A cold restart's
+        // `ModelResolver::try_catalog_lookup` then read the corrupted row as an
+        // ordinary already-resolved local model and served the unadapted base
+        // with no signal — the very failure this comment exists to prevent.
+        //
+        // This is an ALLOWLIST of the terminal, catalog-authoritative types to
+        // protect, never a denylist of the generic ones to allow: a plain
+        // `"local"`/`"huggingface"` row (this call's own prior write) and a
+        // `"embedding"` placeholder row (the FK-satisfying pre-registration
+        // `Session::submit_fine_tune_spec`/`ContextPredictor` write before the
+        // base model is ever loaded, always `artifact_path: None`, meant to be
+        // COMPLETED by this exact call) must both still be freely
+        // overwritten/refreshed here — only a row a terminal producer already
+        // finished committing is off-limits.
+        const PROTECTED_MODEL_TYPES: &[&str] = &["fine-tuned", "context-predictor", "checkpoint"];
+        let existing = self
             .resolver
             .catalog()
-            .register_model(RegisterModelParams {
-                model_id: &source_str,
-                version: 1,
-                model_type,
-                backend: &backend_str,
-                task,
-                base_model_id: None,
-                artifact_path: artifact_dir_str.as_deref(),
-                config_json: None,
-            })
+            .get_model(&source_str)
             .await
-        {
-            tracing::warn!(model_id = %source_str, "Failed to register model in catalog: {e}");
+            .ok()
+            .flatten();
+        let already_managed = existing
+            .as_ref()
+            .is_some_and(|r| PROTECTED_MODEL_TYPES.contains(&r.model_type.as_str()));
+        if already_managed {
+            tracing::debug!(
+                model_id = %source_str,
+                model_type = existing.as_ref().map(|r| r.model_type.as_str()).unwrap_or(""),
+                "skipping generic load-bookkeeping registration: this id is already a \
+                 catalog-managed record of a different kind"
+            );
+        } else {
+            let backend_str = format!("{:?}", resolved.backend).to_lowercase();
+            let model_type = match source {
+                ModelSource::HuggingFace(_) => "huggingface",
+                ModelSource::Local(_) => "local",
+            };
+            let artifact_dir_str: Option<String> = resolved
+                .weights_paths
+                .first()
+                .and_then(|p| p.parent())
+                .and_then(|p| p.to_str())
+                .map(|s| s.to_owned());
+            if let Err(e) = self
+                .resolver
+                .catalog()
+                .register_model(RegisterModelParams {
+                    model_id: &source_str,
+                    version: 1,
+                    model_type,
+                    backend: &backend_str,
+                    task,
+                    base_model_id: None,
+                    artifact_path: artifact_dir_str.as_deref(),
+                    config_json: None,
+                })
+                .await
+            {
+                tracing::warn!(model_id = %source_str, "Failed to register model in catalog: {e}");
+            }
         }
 
         let mut cache = self.inner.write().await;

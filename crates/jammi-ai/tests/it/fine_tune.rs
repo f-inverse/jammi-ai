@@ -364,6 +364,113 @@ async fn fine_tune_job_lifecycle_and_artifacts() {
     );
 }
 
+/// esc-089: a fine-tuned BERT-family model must serve the SAME adapted model
+/// across a cold restart — a SECOND `InferenceSession` opened over the SAME
+/// on-disk catalog + artifact store, exactly as `tower_adapters.rs`'s own
+/// esc-089 tests do for the three cross-modal towers (see that file's doc for
+/// what "cold restart" simulates and what the assertions catch: a silent
+/// fall-back to the unadapted base would make the cold embedding equal the
+/// base model's, not the warm fine-tuned one).
+#[tokio::test(flavor = "multi_thread")]
+async fn bert_fine_tuned_adapter_serves_cold_after_restart() {
+    let dir = TempDir::new().unwrap();
+    let session = Arc::new(
+        InferenceSession::new(common::test_config(dir.path()))
+            .await
+            .unwrap(),
+    );
+    session
+        .add_source(
+            "training",
+            SourceType::File,
+            SourceConnection {
+                url: Some(common::fixture_url("training_pairs.csv")),
+                format: Some(FileFormat::Csv),
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+    let _worker = jammi_ai::fine_tune::worker::EmbeddedWorker::spawn(&session)
+        .expect("default worker intervals are valid");
+    let model = tiny_bert_model();
+
+    let base_embedding = session
+        .encode_text_query(&model, "quantum computing")
+        .await
+        .unwrap();
+
+    let job = session
+        .fine_tune(
+            "training",
+            &model,
+            &[
+                "text_a".to_string(),
+                "text_b".to_string(),
+                "score".to_string(),
+            ],
+            FineTuneMethod::Lora,
+            ModelTask::TextEmbedding,
+            Some(FineTuneConfig {
+                epochs: 2,
+                batch_size: 8,
+                lora_rank: 4,
+                warmup_steps: 0,
+                ..Default::default()
+            }),
+        )
+        .await
+        .unwrap();
+    job.wait().await.unwrap();
+
+    let warm_embedding = session
+        .encode_text_query(job.model_id(), "quantum computing")
+        .await
+        .expect("the fine-tuned BERT model resolves and serves warm");
+    let warm_diff: f32 = base_embedding
+        .iter()
+        .zip(&warm_embedding)
+        .map(|(a, b)| (a - b).abs())
+        .sum();
+    assert!(
+        warm_diff > 1e-6,
+        "warm fine-tuned embedding should differ from base (LoRA delta should be \
+         non-zero), diff={warm_diff}"
+    );
+
+    // Cold read over a brand-new session pointed at the SAME artifact_dir —
+    // no in-process resolver/model-cache state survives from `session`.
+    let cold_session = Arc::new(
+        InferenceSession::new(common::test_config(dir.path()))
+            .await
+            .unwrap(),
+    );
+    let cold_embedding = cold_session
+        .encode_text_query(job.model_id(), "quantum computing")
+        .await
+        .expect("the fine-tuned BERT model resolves and serves cold");
+
+    let cold_vs_base_diff: f32 = base_embedding
+        .iter()
+        .zip(&cold_embedding)
+        .map(|(a, b)| (a - b).abs())
+        .sum();
+    assert!(
+        cold_vs_base_diff > 1e-6,
+        "cold fine-tuned embedding must differ from base — a cold restart silently \
+         served the unadapted base model, diff={cold_vs_base_diff}"
+    );
+    for (i, (a, b)) in warm_embedding.iter().zip(&cold_embedding).enumerate() {
+        assert_eq!(
+            a.to_bits(),
+            b.to_bits(),
+            "component {i} differs bit-for-bit between the warm and cold reads \
+             (warm {a}, cold {b}) — the cold session is not running the same adapter \
+             the warm session trained"
+        );
+    }
+}
+
 // ─── Per-epoch adapter checkpoints (unit 348) ──────────────────────────────
 //
 // Round-2 reshape (F3): `keep_last_n_checkpoints` is DISABLED BY DEFAULT.

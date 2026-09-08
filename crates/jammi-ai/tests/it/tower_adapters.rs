@@ -365,6 +365,101 @@ async fn open_clip_text_tower_adapter_trains_and_serves() {
 }
 
 // =============================================================================
+// esc-089: a fine-tuned model must serve the SAME adapted tower across a cold
+// restart. A "cold restart" here is a SECOND `InferenceSession` opened over
+// the SAME on-disk catalog + artifact store (`storage_precision.rs`'s own
+// precedent for simulating a restart without actually re-execing the process:
+// no in-process resolver/model-cache state survives from the first session).
+// Each test trains inside session 1 (the warm read), then resolves the SAME
+// fine-tuned model id from a brand-new session 2 (the cold read) and asserts
+// the cold embedding is bit-identical to the warm one — catching a silent
+// fall-back to the unadapted base, which would instead make the cold
+// embedding equal the BASE model's.
+// =============================================================================
+
+#[tokio::test(flavor = "multi_thread")]
+async fn open_clip_text_tower_adapter_serves_cold_after_restart() {
+    let dir = TempDir::new().unwrap();
+    let session = Arc::new(
+        InferenceSession::new(common::test_config(dir.path()))
+            .await
+            .unwrap(),
+    );
+    let _worker = jammi_ai::fine_tune::worker::EmbeddedWorker::spawn(&session)
+        .expect("default worker intervals are valid");
+    session
+        .add_source(
+            "training",
+            SourceType::File,
+            SourceConnection {
+                url: Some(common::fixture_url("training_pairs.csv")),
+                format: Some(FileFormat::Csv),
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+
+    const PROBE: &str = "a photograph of a small round object";
+    let base_model = tiny_open_clip_model();
+    let base_embedding = session
+        .encode_text_query(&base_model, PROBE)
+        .await
+        .expect("the OpenCLIP text tower serves the base model");
+
+    let job = session
+        .fine_tune(
+            "training",
+            &base_model,
+            &[
+                "text_a".to_string(),
+                "text_b".to_string(),
+                "score".to_string(),
+            ],
+            FineTuneMethod::Lora,
+            ModelTask::TextEmbedding,
+            Some(tower_config(&["in_proj", "c_fc"], 2, 5e-3)),
+        )
+        .await
+        .unwrap();
+    job.wait()
+        .await
+        .expect("the text-tower fine-tune completes");
+
+    let warm_embedding = session
+        .encode_text_query(job.model_id(), PROBE)
+        .await
+        .expect("the fine-tuned OpenCLIP text model resolves and serves warm");
+    assert_differs(
+        &base_embedding,
+        &warm_embedding,
+        "open_clip text (warm vs base)",
+    );
+
+    // Cold read over a brand-new session pointed at the SAME artifact_dir.
+    let cold_session = Arc::new(
+        InferenceSession::new(common::test_config(dir.path()))
+            .await
+            .unwrap(),
+    );
+    let cold_embedding = cold_session
+        .encode_text_query(job.model_id(), PROBE)
+        .await
+        .expect("the fine-tuned OpenCLIP text model resolves and serves cold");
+
+    assert_differs(
+        &base_embedding,
+        &cold_embedding,
+        "open_clip text (cold vs base)",
+    );
+    assert_bit_equal(
+        &warm_embedding,
+        &cold_embedding,
+        "open_clip text (cold vs warm)",
+    );
+}
+
+// =============================================================================
 // A3 (image): the OpenCLIP VISION tower
 // =============================================================================
 
@@ -539,6 +634,89 @@ async fn open_clip_vision_tower_adapter_trains_and_serves() {
     assert_bit_equal(&tuned_embedding, &reference, "open_clip vision");
 }
 
+/// esc-089, the vision-tower peer of
+/// `open_clip_text_tower_adapter_serves_cold_after_restart`: see that test's
+/// doc for what "cold restart" means here and what the assertions catch.
+#[tokio::test(flavor = "multi_thread")]
+async fn open_clip_vision_tower_adapter_serves_cold_after_restart() {
+    let dir = TempDir::new().unwrap();
+    let session = Arc::new(
+        InferenceSession::new(common::test_config(dir.path()))
+            .await
+            .unwrap(),
+    );
+    let _worker = jammi_ai::fine_tune::worker::EmbeddedWorker::spawn(&session)
+        .expect("default worker intervals are valid");
+    let triplets = write_image_triplets(dir.path());
+    session
+        .add_source(
+            "image_triplets",
+            SourceType::File,
+            SourceConnection {
+                url: Some(format!("file://{}", triplets.display())),
+                format: Some(FileFormat::Parquet),
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+
+    let probe_bytes =
+        std::fs::read(common::cookbook_fixture("tiny_image_corpus").join("img_circle_0.png"))
+            .unwrap();
+    let base_model = tiny_open_clip_model();
+    let base_embedding = session
+        .encode_image_query(&base_model, &probe_bytes)
+        .await
+        .expect("the OpenCLIP vision tower serves the base model");
+
+    let job = session
+        .fine_tune(
+            "image_triplets",
+            &base_model,
+            &triplet_columns(),
+            FineTuneMethod::Lora,
+            ModelTask::ImageEmbedding,
+            Some(tower_config(&["in_proj", "c_fc"], 2, 5e-3)),
+        )
+        .await
+        .unwrap();
+    job.wait()
+        .await
+        .expect("the vision-tower fine-tune completes");
+
+    let warm_embedding = session
+        .encode_image_query(job.model_id(), &probe_bytes)
+        .await
+        .expect("the fine-tuned OpenCLIP vision model resolves and serves warm");
+    assert_differs(
+        &base_embedding,
+        &warm_embedding,
+        "open_clip vision (warm vs base)",
+    );
+
+    let cold_session = Arc::new(
+        InferenceSession::new(common::test_config(dir.path()))
+            .await
+            .unwrap(),
+    );
+    let cold_embedding = cold_session
+        .encode_image_query(job.model_id(), &probe_bytes)
+        .await
+        .expect("the fine-tuned OpenCLIP vision model resolves and serves cold");
+
+    assert_differs(
+        &base_embedding,
+        &cold_embedding,
+        "open_clip vision (cold vs base)",
+    );
+    assert_bit_equal(
+        &warm_embedding,
+        &cold_embedding,
+        "open_clip vision (cold vs warm)",
+    );
+}
+
 // =============================================================================
 // A3 (audio): the HTSAT-Swin CLAP audio tower
 // =============================================================================
@@ -635,6 +813,89 @@ async fn clap_audio_tower_adapter_trains_and_serves() {
     let reference = row0(&tower.forward(&features, &is_longer).unwrap());
 
     assert_bit_equal(&tuned_embedding, &reference, "clap audio");
+}
+
+/// esc-089, the audio-tower peer of
+/// `open_clip_text_tower_adapter_serves_cold_after_restart`: see that test's
+/// doc for what "cold restart" means here and what the assertions catch.
+#[tokio::test(flavor = "multi_thread")]
+async fn clap_audio_tower_adapter_serves_cold_after_restart() {
+    let dir = TempDir::new().unwrap();
+    let session = Arc::new(
+        InferenceSession::new(common::test_config(dir.path()))
+            .await
+            .unwrap(),
+    );
+    let _worker = jammi_ai::fine_tune::worker::EmbeddedWorker::spawn(&session)
+        .expect("default worker intervals are valid");
+    let triplets = crate::fine_tune::write_audio_triplets(dir.path());
+    session
+        .add_source(
+            "audio_triplets",
+            SourceType::File,
+            SourceConnection {
+                url: Some(format!("file://{}", triplets.display())),
+                format: Some(FileFormat::Parquet),
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+
+    let probe_bytes =
+        std::fs::read(common::cookbook_fixture("tiny_audio_corpus").join("clip_sine_0.wav"))
+            .unwrap();
+    let base_model = htsat_clap_tiny_model();
+    let base_embedding = session
+        .encode_audio_query(&base_model, &probe_bytes)
+        .await
+        .expect("the CLAP audio tower serves the base model");
+
+    let job = session
+        .fine_tune(
+            "audio_triplets",
+            &base_model,
+            &triplet_columns(),
+            FineTuneMethod::Lora,
+            ModelTask::AudioEmbedding,
+            Some(tower_config(&["query", "value", "linear1"], 2, 5e-3)),
+        )
+        .await
+        .unwrap();
+    job.wait()
+        .await
+        .expect("the audio-tower fine-tune completes");
+
+    let warm_embedding = session
+        .encode_audio_query(job.model_id(), &probe_bytes)
+        .await
+        .expect("the fine-tuned CLAP audio model resolves and serves warm");
+    assert_differs(
+        &base_embedding,
+        &warm_embedding,
+        "clap audio (warm vs base)",
+    );
+
+    let cold_session = Arc::new(
+        InferenceSession::new(common::test_config(dir.path()))
+            .await
+            .unwrap(),
+    );
+    let cold_embedding = cold_session
+        .encode_audio_query(job.model_id(), &probe_bytes)
+        .await
+        .expect("the fine-tuned CLAP audio model resolves and serves cold");
+
+    assert_differs(
+        &base_embedding,
+        &cold_embedding,
+        "clap audio (cold vs base)",
+    );
+    assert_bit_equal(
+        &warm_embedding,
+        &cold_embedding,
+        "clap audio (cold vs warm)",
+    );
 }
 
 // =============================================================================

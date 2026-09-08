@@ -81,9 +81,11 @@ a `ZeroDivisionError`.
   mechanically-computed file list rather than replacing it.
 - `notes.input_sha256` / `notes.run_sha256`: sha256 digests computed live
   over the exact input bytes this run reads (`--report-json`, `--identity`,
-  `--serial-tail`, and every raw leg under `--raw-dir`), so a downstream
-  reader can verify the committed artifact was rendered from the exact
-  fixture bytes also committed alongside it.
+  `--serial-tail`, and both the `.json` report AND the `.exit` code of
+  every raw leg under `--raw-dir` -- `_read_raw_leg` reads and refuses on
+  the `.exit` file just as much as the report, so it is hashed too), so a
+  downstream reader can verify the committed artifact was rendered from the
+  exact fixture bytes also committed alongside it.
 - `verdict.serial_tail_ratio_deviation.r_measured`: `--serial-tail`'s own
   `task=audio_embedding ... t_s=...` line, divided by the re-derived HTSAT
   `front_base_mean_s` -- read from a committed fixture file (the job log's
@@ -122,14 +124,21 @@ The discipline this buys is therefore procedural, not something this
 script can enforce on itself at build time: **regenerating and committing
 this artifact must be the LAST commit of whatever unit produces it.** A
 gate exists to CATCH a violation of that discipline after the fact --
-`test_frontend_ab_artifact.py`'s `RealFixtureRegressionTests.
-test_committed_artifact_record_is_not_stale` re-derives the report at HEAD
-and asserts the committed record equals what a regeneration would produce,
-except for exactly the drift attributable to the commit(s) that last
-touched the artifact file itself (`git log -1 -- <artifact path>`) -- any
-OTHER divergence (a later commit the artifact was never re-rendered
-against) is a named failure, "artifact record stale: regenerate as the
-final commit", not a silent pass.
+`test_frontend_ab_artifact.py`'s `assert_committed_artifact_not_stale`,
+exercised by `RealFixtureRegressionTests.
+test_committed_artifact_record_is_not_stale`. That gate is HEAD-independent
+by construction: it never re-derives the record against whatever the
+checkout's own `HEAD` happens to be (a PR's `refs/pull/N/merge` ref, or a
+later merge to `main`, would otherwise name files that ARE this repo's own
+unrelated churn as spurious staleness). Instead it has two arms -- (a) a
+record check against `C` (the artifact file's own last commit, `git log -1
+-- <artifact path>`) and `C`'s own parent, computed purely from git
+history, ALWAYS; and (b), only when the caller knows the unit's own PR head
+sha (CI wires this as `JAMMI_CI_UNIT_HEAD_SHA`, empty on a push-to-main
+checkout), a check that `C` itself IS that head -- any later commit on the
+PR, whether or not it touches a file the record already names, is then a
+named failure, "artifact record stale: regenerate as the final commit",
+never a silent pass.
 
 Run: `python3 ci/scripts/perf/frontend_ab_artifact.py --raw-dir <dir>
 --report-json <path> --identity <path> --serial-tail <path>
@@ -454,6 +463,7 @@ def _read_raw_leg(raw_dir: Path, tower: str, role: str, repeat: str, declared_sh
     return {
         "leg_id": leg_id,
         "json_path": json_path,
+        "exit_path": exit_path,
         "steps_measured": steps,
         "front_per_step": front_wall / steps,
         "train_per_step": train_wall / steps,
@@ -690,6 +700,11 @@ def build_report(
     }
 
     # ---- input hashes + a single run fingerprint over every raw leg read ----
+    # Both files this module actually reads per leg -- the `.json` report AND
+    # the `.exit` code (the leg-outcome gate at the top of `_read_raw_leg`
+    # reads and refuses on the latter just as much as it reads the former,
+    # so a downstream reader verifying "this artifact was rendered from
+    # exactly these committed bytes" needs both hashed, not only the report).
     input_sha256 = {
         "report_json": _sha256_file(report_json_path),
         "identity": _sha256_file(identity_path),
@@ -697,8 +712,12 @@ def build_report(
     }
     for key, leg in sorted(legs.items()):
         input_sha256[f"raw/{key}.json"] = _sha256_file(leg["json_path"])
+        input_sha256[f"raw/{key}.exit"] = _sha256_file(leg["exit_path"])
     run_sha256 = hashlib.sha256(
-        b"".join(f"{key}\n".encode("utf-8") + legs[key]["json_path"].read_bytes() for key in sorted(legs))
+        b"".join(
+            f"{key}\n".encode("utf-8") + legs[key]["exit_path"].read_bytes() + legs[key]["json_path"].read_bytes()
+            for key in sorted(legs)
+        )
     ).hexdigest()
 
     if unit_verdict == "PASS":

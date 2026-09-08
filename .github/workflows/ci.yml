@@ -1751,10 +1751,22 @@ jobs:
           # directory absent; history missing the fixture's shas) into a
           # hard RED in CI, so the real-fixture class actually executes
           # every run rather than silently re-skipping if the fixture is
-          # ever deleted or `fetch_depth: "0"` is ever dropped. No GPU, no
-          # network.
+          # ever deleted or `fetch_depth: "0"` is ever dropped. The
+          # committed-record freshness gate (`assert_committed_artifact_not_
+          # stale`) is split into two arms: arm (a) is HEAD-independent (it
+          # checks the record against the artifact file's own last commit
+          # and that commit's own parent, via git plumbing, never against
+          # whatever this checkout's own HEAD happens to be -- so it is
+          # unaffected by `refs/pull/N/merge`'s own synthetic merge commit,
+          # or by later, unrelated commits on `main`); arm (b) additionally
+          # engages via `JAMMI_CI_UNIT_HEAD_SHA`, set here to this PR's own
+          # head sha (empty on a push-to-main checkout, where arm (a) alone
+          # applies) -- it asserts the artifact's own last commit IS that
+          # head, so ANY later commit on the PR (whether or not it touches a
+          # file the record already names) reds, named, rather than only the
+          # subset arm (a) alone can see. No GPU, no network.
           - name: frontend_ab_artifact suite
-            cmd: JAMMI_CI_FRONTEND_AB_FINAL_FIXTURE_EXPECTED=1 python3 ci/scripts/perf/test_frontend_ab_artifact.py
+            cmd: JAMMI_CI_FRONTEND_AB_FINAL_FIXTURE_EXPECTED=1 JAMMI_CI_UNIT_HEAD_SHA=${{ github.event.pull_request.head.sha }} python3 ci/scripts/perf/test_frontend_ab_artifact.py
             fetch_depth: "0"
     steps:
       - uses: actions/checkout@v4

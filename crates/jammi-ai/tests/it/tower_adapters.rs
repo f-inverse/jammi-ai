@@ -457,6 +457,20 @@ async fn open_clip_text_tower_adapter_serves_cold_after_restart() {
         &cold_embedding,
         "open_clip text (cold vs warm)",
     );
+
+    common::assert_esc089_cold_restart_controls(
+        dir.path(),
+        &session,
+        &cold_session,
+        job.model_id(),
+        "open_clip text",
+        &base_embedding,
+        &warm_embedding,
+        &cold_embedding,
+        &common::text_serve(base_model.clone(), PROBE),
+        &common::text_serve(job.model_id().to_string(), PROBE),
+    )
+    .await;
 }
 
 // =============================================================================
@@ -715,6 +729,21 @@ async fn open_clip_vision_tower_adapter_serves_cold_after_restart() {
         &cold_embedding,
         "open_clip vision (cold vs warm)",
     );
+
+    let probe_bytes = Arc::new(probe_bytes);
+    common::assert_esc089_cold_restart_controls(
+        dir.path(),
+        &session,
+        &cold_session,
+        job.model_id(),
+        "open_clip vision",
+        &base_embedding,
+        &warm_embedding,
+        &cold_embedding,
+        &common::image_serve(base_model.clone(), Arc::clone(&probe_bytes)),
+        &common::image_serve(job.model_id().to_string(), Arc::clone(&probe_bytes)),
+    )
+    .await;
 }
 
 // =============================================================================
@@ -896,6 +925,21 @@ async fn clap_audio_tower_adapter_serves_cold_after_restart() {
         &cold_embedding,
         "clap audio (cold vs warm)",
     );
+
+    let probe_bytes = Arc::new(probe_bytes);
+    common::assert_esc089_cold_restart_controls(
+        dir.path(),
+        &session,
+        &cold_session,
+        job.model_id(),
+        "clap audio",
+        &base_embedding,
+        &warm_embedding,
+        &cold_embedding,
+        &common::audio_serve(base_model.clone(), Arc::clone(&probe_bytes)),
+        &common::audio_serve(job.model_id().to_string(), Arc::clone(&probe_bytes)),
+    )
+    .await;
 }
 
 // =============================================================================

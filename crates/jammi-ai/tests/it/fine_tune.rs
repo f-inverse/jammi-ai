@@ -469,6 +469,21 @@ async fn bert_fine_tuned_adapter_serves_cold_after_restart() {
              the warm session trained"
         );
     }
+
+    const PROBE: &str = "quantum computing";
+    common::assert_esc089_cold_restart_controls(
+        dir.path(),
+        &session,
+        &cold_session,
+        job.model_id(),
+        "bert fine-tuned",
+        &base_embedding,
+        &warm_embedding,
+        &cold_embedding,
+        &common::text_serve(model.clone(), PROBE),
+        &common::text_serve(job.model_id().to_string(), PROBE),
+    )
+    .await;
 }
 
 // ─── Per-epoch adapter checkpoints (unit 348) ──────────────────────────────

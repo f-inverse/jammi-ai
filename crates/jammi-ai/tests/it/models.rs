@@ -733,3 +733,96 @@ async fn fine_tuned_record_without_base_model_id_refuses_to_resolve() {
         "refusal must name the missing pointer, got: {message}"
     );
 }
+
+/// esc-089's negative-control seam: a fine-tuned record whose adapter bundle
+/// WAS published successfully but whose `adapter.safetensors` has since gone
+/// missing on disk (a partial delete, artifact-store corruption — the exact
+/// shape the cold-restart integration tests' negative control produces) must
+/// still refuse through the REAL resolver, and with the SAME typed
+/// `JammiError::Model` variant every other refusal in this arm raises.
+///
+/// Before this test's fix: `ArtifactStore::fetch_artifact`'s own `file://`
+/// in-place verification (`ArtifactStore::verify_files`) already raised loudly
+/// on the missing file, but as `JammiError::Storage`/`JammiError::Io` —
+/// `ModelResolver::try_catalog_lookup` propagated it via `?` untouched. A
+/// caller matching on `JammiError::Model` (as this file's other two esc-089
+/// tests, and the cold-restart integration tests' negative control, do) would
+/// see the wrong variant despite the refusal firing and naming the file. This
+/// uses a real `file://` `ArtifactStore` (never `memory://`) so the missing
+/// file is a genuine on-disk absence, matching production.
+#[tokio::test]
+async fn fine_tuned_adapter_bundle_missing_file_refuses_as_typed_model_error() {
+    use jammi_db::catalog::model_repo::RegisterModelParams;
+    use jammi_db::storage::{StorageRegistry, StorageUrl};
+    use jammi_db::store::ArtifactStore;
+
+    let dir = tempdir().unwrap();
+    let catalog = Arc::new(Catalog::open(dir.path()).await.unwrap());
+    let base_dir = crate::common::cookbook_fixture("tiny_bert");
+    let base_id = format!("local:{}", base_dir.display());
+
+    let artifacts_root = dir.path().join("artifacts");
+    let store = Arc::new(
+        ArtifactStore::with_root(
+            StorageUrl::parse(artifacts_root.to_str().unwrap()).unwrap(),
+            StorageRegistry::new(),
+            dir.path().join("artifact_cache"),
+        )
+        .unwrap(),
+    );
+    let prefix = store
+        .put_artifact(
+            &["broken-bundle"],
+            &[
+                (
+                    "adapter_config.json".to_string(),
+                    bytes::Bytes::from_static(b"{}"),
+                ),
+                (
+                    "adapter.safetensors".to_string(),
+                    bytes::Bytes::from_static(b"weights"),
+                ),
+            ],
+        )
+        .await
+        .unwrap();
+    std::fs::remove_file(std::path::PathBuf::from(prefix.path()).join("adapter.safetensors"))
+        .unwrap();
+
+    catalog
+        .register_model(RegisterModelParams {
+            model_id: "jammi:fine-tuned:missing-adapter-file",
+            version: 1,
+            model_type: "fine-tuned",
+            backend: "candle",
+            task: ModelTask::TextEmbedding,
+            base_model_id: Some(&base_id),
+            artifact_path: Some(prefix.as_str()),
+            config_json: None,
+        })
+        .await
+        .unwrap();
+
+    let resolver = ModelResolver::new(catalog, store).unwrap();
+    let source = ModelSource::hf("jammi:fine-tuned:missing-adapter-file");
+    let result = resolver
+        .resolve(&source, ModelTask::TextEmbedding, None)
+        .await;
+    let err = match result {
+        Ok(_) => panic!(
+            "a fine-tuned record whose adapter.safetensors was deleted must refuse to \
+             resolve through the real resolver, never silently serve the unadapted base"
+        ),
+        Err(e) => e,
+    };
+    assert!(
+        matches!(err, jammi_db::error::JammiError::Model { .. }),
+        "the refusal must be the SAME typed JammiError::Model variant every other \
+         fine-tuned-record refusal in this arm raises, got a different variant: {err:?}"
+    );
+    let message = err.to_string();
+    assert!(
+        message.contains("adapter.safetensors"),
+        "refusal must name the missing file, got: {message}"
+    );
+}

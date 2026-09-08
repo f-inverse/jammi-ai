@@ -411,7 +411,7 @@ async fn parquet_utf8_audio_path_column_scans_as_utf8view_and_embeds() {
 }
 
 // =============================================================================
-// F4 (review pass on esc-090/esc-091): `arrow_to_texts` must apply the SAME
+// `arrow_to_texts` must apply the SAME
 // column-type policy `fine_tune::worker::extract_string_column` already
 // applies on the training path — binary families refused outright, other
 // non-string types cast with a refusal on any introduced null, nulls keep

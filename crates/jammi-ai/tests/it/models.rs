@@ -1041,7 +1041,7 @@ async fn fine_tuned_adapter_bundle_corrupted_pointer_refuses_as_typed_model_erro
 /// shape), for a fault that is not this model's fault at all.
 ///
 /// The require-gate polarity every `chmod` permission-fault probe in this
-/// suite shares (esc-089 F1): `probe` performs the fault-injection premise
+/// suite shares (esc-089): `probe` performs the fault-injection premise
 /// check itself — "can this process still read/write through a chmod'd
 /// path?" — and returns `true` if the fault was BYPASSED (root, or a
 /// mode-ignoring filesystem). A bypass is normally a loud, `eprintln`'d skip:
@@ -1120,7 +1120,7 @@ async fn fine_tuned_adapter_bundle_permission_fault_is_not_a_typed_model_error()
     // PROBE: chmod the file unreadable, then confirm the process actually
     // cannot read it — root (and a mode-ignoring filesystem) bypasses this,
     // in which case the fault-injection premise this test needs never holds.
-    // Shared require-gate polarity (esc-089 F1): under
+    // Shared require-gate polarity (esc-089): under
     // `JAMMI_REQUIRE_POSIX_PERMS=1` a bypass panics rather than skipping.
     std::fs::set_permissions(&weights_path, std::fs::Permissions::from_mode(0o000)).unwrap();
     let bypassed = chmod_bypassed(

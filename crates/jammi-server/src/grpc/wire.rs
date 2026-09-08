@@ -263,7 +263,7 @@ mod tests {
         assert_eq!(bad.code(), Code::InvalidArgument);
     }
 
-    /// esc-089 F3 (round-3 audit) / F1 (review pass): this wire test pins
+    /// esc-089: this wire test pins
     /// ONLY the LAST leg of the chain — a variant, once produced, maps to
     /// the right gRPC code — never a substitute for the it-tests in
     /// `crates/jammi-ai/tests/it/models.rs` /

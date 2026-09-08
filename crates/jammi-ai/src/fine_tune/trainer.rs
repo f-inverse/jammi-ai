@@ -10039,7 +10039,7 @@ mod epoch_checkpoint_retention_failure {
     use jammi_db::store::ArtifactStore;
 
     /// The require-gate polarity every `chmod` permission-fault probe in this
-    /// crate shares (esc-089 F1): `probe` performs the fault-injection
+    /// crate shares (esc-089): `probe` performs the fault-injection
     /// premise check itself — "can this process still write through a
     /// chmod'd path?" — and returns `true` if the fault was BYPASSED (root,
     /// or a mode-ignoring filesystem). A bypass is normally a loud,
@@ -10151,8 +10151,8 @@ mod epoch_checkpoint_retention_failure {
             // PROBE the injection before relying on it: root (and
             // mode-ignoring filesystems) can delete through a 0o555
             // directory, in which case the failed-prune premise this test
-            // asserts never exists. Shared require-gate polarity (esc-089
-            // F1, same canonical shape as every other chmod probe in this
+            // asserts never exists. Shared require-gate polarity (esc-089,
+            // the same canonical shape as every other chmod probe in this
             // crate): under `JAMMI_REQUIRE_POSIX_PERMS=1` a bypass panics
             // rather than skipping.
             let probe = epoch0_dir.join(".root_probe");

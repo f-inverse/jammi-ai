@@ -2999,7 +2999,7 @@ storage fault propagates unchanged past both surfaces' own catch-all —
 `Err(e) => return Err(e)` (`crates/jammi-ai/src/pipeline/context_predictor.rs:1311`).
 
 Every corrupted-catalog-record refusal EARLIER in this reload path — before `fetch_artifact` is
-even reached — is the SAME `JammiError::Model` variant too (review pass on esc-089, F3): an
+even reached — is the SAME `JammiError::Model` variant too: an
 absent `config_json`
 (`crates/jammi-ai/src/pipeline/context_predictor.rs:1133`), an unparseable `config_json`
 (`crates/jammi-ai/src/pipeline/context_predictor.rs:1138`, a DISTINCT message from "absent",

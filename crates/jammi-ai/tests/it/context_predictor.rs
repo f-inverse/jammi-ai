@@ -1807,7 +1807,7 @@ async fn context_predictor_reload_corrupted_pointer_refuses_as_typed_model_error
     );
 }
 
-/// F3 (review pass on esc-089): a corrupted `config_json` — absent
+/// a corrupted `config_json` — absent
 /// entirely, or present but not even valid JSON — must refuse with the
 /// SAME typed `JammiError::Model` variant every other corrupted-
 /// catalog-record refusal on this surface raises, naming the field, never
@@ -2032,7 +2032,7 @@ async fn context_predictor_reload_unpublished_bundle_is_not_described_as_corrupt
 /// `Internal`, not a bad-request-shaped code.
 ///
 /// The require-gate polarity every `chmod` permission-fault probe in this
-/// suite shares (esc-089 F1): `probe` performs the fault-injection premise
+/// suite shares (esc-089): `probe` performs the fault-injection premise
 /// check itself — "can this process still read/write through a chmod'd
 /// path?" — and returns `true` if the fault was BYPASSED (root, or a
 /// mode-ignoring filesystem). A bypass is normally a loud, `eprintln`'d skip:
@@ -2097,7 +2097,7 @@ async fn context_predictor_reload_permission_fault_is_not_a_typed_model_error() 
 
     // PROBE: root (and a mode-ignoring filesystem) bypasses chmod — skip
     // loudly rather than assert against a fault that was never injected.
-    // Shared require-gate polarity (esc-089 F1): under
+    // Shared require-gate polarity (esc-089): under
     // `JAMMI_REQUIRE_POSIX_PERMS=1` a bypass panics rather than skipping.
     std::fs::set_permissions(&weights_path, std::fs::Permissions::from_mode(0o000)).unwrap();
     let bypassed = chmod_bypassed(

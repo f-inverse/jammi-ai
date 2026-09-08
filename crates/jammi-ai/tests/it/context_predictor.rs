@@ -1657,16 +1657,19 @@ async fn quantile_predictor_fits_high_offset_target_round_trip() {
 // of the bundle (a manifest-listed key truly absent) is a typed refusal
 // naming the model, while a transport/IO fault (permission denied, standing
 // in for a transient object-store outage) is NOT this model's fault and must
-// propagate unchanged. This surface's own convention is `JammiError::Inference`
-// (never `JammiError::Model` — see `ModelResolver`'s tests in `models.rs` for
-// that surface's peer), so these tests pin the SAME distinguishing rule, not
-// the same literal error variant.
+// propagate unchanged. A round-3 audit (F3) found this surface used to raise
+// its OWN `JammiError::Inference` for the integrity case, which maps to
+// `Code::Internal` at the wire boundary — wrong for a client-visible
+// precondition failure. Both reload surfaces now raise the SAME
+// `JammiError::Model` (-> `Code::InvalidArgument`) for the SAME class of
+// outcome, so these tests pin the SAME error variant `ModelResolver`'s tests
+// in `models.rs` pin for that surface's peer, not merely an analogous rule.
 // =============================================================================
 
 /// A context predictor's published bundle whose `model.safetensors` has since
 /// gone missing on disk must refuse a COLD reload — through the real
 /// `load_context_predictor` path over a brand-new session pointed at the SAME
-/// root, never a hand-built predictor — with a typed `JammiError::Inference`
+/// root, never a hand-built predictor — with a typed `JammiError::Model`
 /// naming the missing file.
 #[tokio::test(flavor = "multi_thread")]
 async fn context_predictor_reload_missing_bundle_file_refuses_by_name() {
@@ -1713,14 +1716,159 @@ async fn context_predictor_reload_missing_bundle_file_refuses_by_name() {
         Err(e) => e,
     };
     assert!(
-        matches!(err, jammi_db::error::JammiError::Inference(_)),
-        "a missing bundle file is an INTEGRITY failure — the refusal must be this surface's \
-         typed JammiError::Inference, got a different variant: {err:?}"
+        matches!(err, jammi_db::error::JammiError::Model { .. }),
+        "a missing bundle file is an INTEGRITY failure — the refusal must be the typed \
+         JammiError::Model both reload surfaces share, got a different variant: {err:?}"
     );
     let message = err.to_string();
     assert!(
         message.contains("model.safetensors"),
         "refusal must name the missing file, got: {message}"
+    );
+    assert!(
+        message.contains("integrity check"),
+        "an integrity failure (a manifest-listed key absent) must say so, distinct from an \
+         unpublished-bundle refusal, got: {message}"
+    );
+}
+
+/// esc-089's OTHER pointer-corruption seam, on this surface's peer of
+/// `models.rs::fine_tuned_adapter_bundle_corrupted_pointer_refuses_as_typed_model_error`:
+/// a context-predictor record whose `artifact_path` string does not even
+/// parse as a storage URL is itself a corrupted CATALOG RECORD — never a
+/// storage-layer transport fault — so `load_context_predictor` must refuse
+/// with the SAME typed `JammiError::Model` variant the missing-file and
+/// unpublished-bundle siblings raise, naming the invalid pointer.
+#[tokio::test(flavor = "multi_thread")]
+async fn context_predictor_reload_corrupted_pointer_refuses_as_typed_model_error() {
+    use jammi_db::catalog::model_repo::RegisterModelParams;
+
+    let rows = synthetic_meta_dataset(12, 16, 4250);
+    let (session, dir) = session_with_meta_dataset(&rows).await;
+
+    let spec = spec(
+        ContextArchitecture::AttnCnp,
+        PredictiveHead::Gaussian {
+            objective: GaussianObjective::Crps,
+        },
+    );
+    let model_id = train(&session, &spec).await;
+
+    // Read the trained row's own base_model_id/config_json back so
+    // re-registering to corrupt ONLY artifact_path does not also corrupt
+    // the config the reload parses before it ever reaches the pointer.
+    let record = session
+        .catalog()
+        .get_model(&model_id)
+        .await
+        .unwrap()
+        .unwrap();
+    session
+        .catalog()
+        .register_model(RegisterModelParams {
+            model_id: &model_id,
+            version: 1,
+            model_type: "context-predictor",
+            backend: "candle",
+            task: ModelTask::Regression,
+            base_model_id: record.base_model_id.as_deref(),
+            artifact_path: Some("not-a-real-scheme://nonsense"),
+            config_json: record.config_json.as_deref(),
+        })
+        .await
+        .unwrap();
+
+    let cold = Arc::new(
+        InferenceSession::new(common::test_config(dir.path()))
+            .await
+            .unwrap(),
+    );
+    cold.register_query_functions();
+
+    let err = match cold
+        .load_context_predictor(&model_id, "fns", ContextServeOptions::default())
+        .await
+    {
+        Ok(_) => panic!(
+            "reloading a context predictor whose artifact_path does not parse as a storage \
+             URL must refuse, never silently serve a predictor"
+        ),
+        Err(e) => e,
+    };
+    assert!(
+        matches!(err, jammi_db::error::JammiError::Model { .. }),
+        "a corrupted (unparseable) artifact_path pointer must be the SAME typed \
+         JammiError::Model variant the sibling reload refusals raise, got: {err:?}"
+    );
+    let message = err.to_string();
+    assert!(
+        message.contains("not-a-real-scheme"),
+        "refusal must name the invalid pointer, got: {message}"
+    );
+}
+
+/// The manifest itself is absent (never published / a misdirected pointer) —
+/// distinct from the sibling test above, where a manifest WAS read and it
+/// named a now-missing key. This must NOT be described as "failed integrity
+/// check": no manifest is in hand to say anything is corrupt.
+#[tokio::test(flavor = "multi_thread")]
+async fn context_predictor_reload_unpublished_bundle_is_not_described_as_corrupt() {
+    let rows = synthetic_meta_dataset(12, 16, 4249);
+    let (session, dir) = session_with_meta_dataset(&rows).await;
+
+    let spec = spec(
+        ContextArchitecture::AttnCnp,
+        PredictiveHead::Gaussian {
+            objective: GaussianObjective::Crps,
+        },
+    );
+    let model_id = train(&session, &spec).await;
+
+    let artifact = session
+        .catalog()
+        .get_model(&model_id)
+        .await
+        .unwrap()
+        .unwrap()
+        .artifact_path
+        .unwrap();
+    let prefix_url = jammi_db::storage::StorageUrl::parse(&artifact).unwrap();
+    let bundle_dir = std::path::PathBuf::from(prefix_url.path());
+    // Remove the WHOLE bundle directory (never a bundle at this prefix at
+    // all), not just one file — the manifest itself is gone.
+    std::fs::remove_dir_all(&bundle_dir).unwrap();
+
+    let cold = Arc::new(
+        InferenceSession::new(common::test_config(dir.path()))
+            .await
+            .unwrap(),
+    );
+    cold.register_query_functions();
+
+    let err = match cold
+        .load_context_predictor(&model_id, "fns", ContextServeOptions::default())
+        .await
+    {
+        Ok(_) => panic!(
+            "reloading a context predictor whose whole bundle directory was deleted must \
+             refuse, never silently serve a predictor"
+        ),
+        Err(e) => e,
+    };
+    assert!(
+        matches!(err, jammi_db::error::JammiError::Model { .. }),
+        "an unpublished bundle must still be the typed JammiError::Model both reload surfaces \
+         share, got a different variant: {err:?}"
+    );
+    let message = err.to_string();
+    assert!(
+        message.contains("no adapter bundle is published"),
+        "the message must say no bundle is published, never call this corruption, got: {message}"
+    );
+    assert!(
+        !message.contains("integrity check"),
+        "an unpublished bundle is NOT an integrity failure — no manifest is in hand to say \
+         anything is corrupt, got: {message}"
     );
 }
 
@@ -1728,13 +1876,13 @@ async fn context_predictor_reload_missing_bundle_file_refuses_by_name() {
 /// `model.safetensors` is unreadable for a reason that has nothing to do with
 /// the bundle's own content — a permission fault standing in for a transient
 /// object-store outage (real `chmod` fault injection, Unix-only). This must
-/// NOT be folded into the typed `JammiError::Inference` refusal the sibling
+/// NOT be folded into the typed `JammiError::Model` refusal the sibling
 /// missing-file test above pins — it is not this model's fault, and must
 /// propagate as its own storage-layer variant so a gRPC client sees
 /// `Internal`, not a bad-request-shaped code.
 #[cfg(unix)]
 #[tokio::test(flavor = "multi_thread")]
-async fn context_predictor_reload_permission_fault_is_not_a_typed_inference_error() {
+async fn context_predictor_reload_permission_fault_is_not_a_typed_model_error() {
     use std::os::unix::fs::PermissionsExt;
 
     let rows = synthetic_meta_dataset(12, 16, 4244);
@@ -1762,14 +1910,15 @@ async fn context_predictor_reload_permission_fault_is_not_a_typed_inference_erro
 
     // PROBE: root (and a mode-ignoring filesystem) bypasses chmod — skip
     // loudly rather than assert against a fault that was never injected.
+    // Shared require-gate polarity (esc-089 F1): under
+    // `JAMMI_REQUIRE_POSIX_PERMS=1` a bypass panics rather than skipping.
     std::fs::set_permissions(&weights_path, std::fs::Permissions::from_mode(0o000)).unwrap();
-    let bypassed = std::fs::read(&weights_path).is_ok();
+    let bypassed = crate::common::permission_fault_bypassed(
+        "context_predictor_reload_permission_fault_is_not_a_typed_model_error",
+        || std::fs::read(&weights_path).is_ok(),
+    );
     if bypassed {
         let _ = std::fs::set_permissions(&weights_path, std::fs::Permissions::from_mode(0o644));
-        eprintln!(
-            "context_predictor_reload_permission_fault_is_not_a_typed_inference_error: chmod \
-             bypassed (root?) — skipping"
-        );
         return;
     }
 
@@ -1794,7 +1943,7 @@ async fn context_predictor_reload_permission_fault_is_not_a_typed_inference_erro
         Err(e) => e,
     };
     assert!(
-        !matches!(err, jammi_db::error::JammiError::Inference(_)),
+        !matches!(err, jammi_db::error::JammiError::Model { .. }),
         "a permission/transport fault reading an INTACT bundle is NOT this model's fault — it \
          must propagate as its own storage-layer variant, never be folded into this surface's \
          typed reload refusal, got: {err:?}"

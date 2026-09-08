@@ -64,6 +64,21 @@ pub enum StorageError {
         /// Specific layout invariant that was violated.
         reason: String,
     },
+
+    /// No `manifest.json` exists at this prefix at all — distinct from
+    /// [`Self::Layout`], which means a manifest WAS read and it names bytes
+    /// that turned out to be wrong (a corrupted bundle). This variant means
+    /// there is no manifest in hand to judge: nothing was ever published at
+    /// this prefix, or a catalog pointer names the wrong prefix entirely
+    /// (never published, misdirected, or clobbered to point somewhere else,
+    /// e.g. a base weights directory). Conflating the two would call an
+    /// absent bundle "corrupt", which is a claim this variant carries no
+    /// evidence for.
+    #[error("no artifact bundle is published at '{path}' (manifest.json absent)")]
+    NotPublished {
+        /// Prefix URL a caller expected an artifact bundle under.
+        path: String,
+    },
 }
 
 impl StorageError {
@@ -81,5 +96,10 @@ impl StorageError {
             path: path.into(),
             reason: reason.into(),
         }
+    }
+
+    /// Construct a [`StorageError::NotPublished`] error.
+    pub(crate) fn not_published(path: impl Into<String>) -> Self {
+        Self::NotPublished { path: path.into() }
     }
 }

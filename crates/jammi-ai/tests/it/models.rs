@@ -825,6 +825,86 @@ async fn fine_tuned_adapter_bundle_missing_file_refuses_as_typed_model_error() {
         message.contains("adapter.safetensors"),
         "refusal must name the missing file, got: {message}"
     );
+    assert!(
+        message.contains("integrity check"),
+        "a manifest-listed key truly absent is an INTEGRITY failure and must say so, distinct \
+         from an unpublished-bundle refusal, got: {message}"
+    );
+}
+
+/// The flip side of the missing-FILE test above (round-3 audit F2): the
+/// `manifest.json` itself is absent — no bundle was ever published at this
+/// prefix at all. This is NOT bundle corruption (there is no manifest in
+/// hand to say anything is corrupt); it must be a DIFFERENT message than the
+/// integrity-failure refusal, though the SAME `JammiError::Model` variant.
+#[tokio::test]
+async fn fine_tuned_adapter_bundle_unpublished_refuses_as_typed_model_error() {
+    use jammi_db::catalog::model_repo::RegisterModelParams;
+    use jammi_db::storage::{StorageRegistry, StorageUrl};
+    use jammi_db::store::ArtifactStore;
+
+    let dir = tempdir().unwrap();
+    let catalog = Arc::new(Catalog::open(dir.path()).await.unwrap());
+    let base_dir = crate::common::cookbook_fixture("tiny_bert");
+    let base_id = format!("local:{}", base_dir.display());
+
+    let artifacts_root = dir.path().join("artifacts");
+    let store = Arc::new(
+        ArtifactStore::with_root(
+            StorageUrl::parse(artifacts_root.to_str().unwrap()).unwrap(),
+            StorageRegistry::new(),
+            dir.path().join("artifact_cache"),
+        )
+        .unwrap(),
+    );
+    // A prefix the catalog points at that was NEVER written — no
+    // `put_artifact` call at all, so no manifest exists. Stands in for a
+    // never-published bundle, a misdirected pointer, or a pre-fix clobbered
+    // pointer left aimed at the wrong directory.
+    let never_published = artifacts_root.join("ghost-bundle");
+    let prefix = format!("file://{}", never_published.display());
+
+    catalog
+        .register_model(RegisterModelParams {
+            model_id: "jammi:fine-tuned:unpublished-bundle",
+            version: 1,
+            model_type: "fine-tuned",
+            backend: "candle",
+            task: ModelTask::TextEmbedding,
+            base_model_id: Some(&base_id),
+            artifact_path: Some(&prefix),
+            config_json: None,
+        })
+        .await
+        .unwrap();
+
+    let resolver = ModelResolver::new(catalog, store).unwrap();
+    let source = ModelSource::hf("jammi:fine-tuned:unpublished-bundle");
+    let result = resolver
+        .resolve(&source, ModelTask::TextEmbedding, None)
+        .await;
+    let err = match result {
+        Ok(_) => panic!(
+            "a fine-tuned record whose artifact_path names a prefix nothing was ever \
+             published at must refuse to resolve, never silently serve the unadapted base"
+        ),
+        Err(e) => e,
+    };
+    assert!(
+        matches!(err, jammi_db::error::JammiError::Model { .. }),
+        "the refusal must be the SAME typed JammiError::Model variant the integrity-failure \
+         sibling test raises, got a different variant: {err:?}"
+    );
+    let message = err.to_string();
+    assert!(
+        message.contains("no adapter bundle is published"),
+        "the message must say no bundle is published, never call this corruption, got: {message}"
+    );
+    assert!(
+        !message.contains("integrity check"),
+        "an unpublished bundle is NOT an integrity failure — no manifest is in hand to say \
+         anything is corrupt, got: {message}"
+    );
 }
 
 /// esc-089 backstop: a catalog corrupted by a pre-fix build (the model
@@ -953,9 +1033,10 @@ async fn fine_tuned_adapter_bundle_corrupted_pointer_refuses_as_typed_model_erro
 /// ONLY a manifest-promised key that is truly absent
 /// (`object_store::Error::NotFound`) into an integrity failure
 /// (`StorageError::Layout`); every other driver fault — including a
-/// permission-denied open, which `object_store`'s `LocalFileSystem` maps to
-/// `Error::UnableToOpenFile`, never `NotFound` — stays `StorageError::Io`
-/// and must reach the caller unchanged, so a gRPC client sees `Internal`
+/// permission-denied open, which `object_store`'s `LocalFileSystem` folds
+/// into `Error::Generic` (its own `UnableToOpenFile` is a private local
+/// error, never constructed outside that crate), never `NotFound` — stays
+/// `StorageError::Io` and must reach the caller unchanged, so a gRPC client sees `Internal`
 /// (a transient-outage shape), never `InvalidArgument` (a bad-request
 /// shape), for a fault that is not this model's fault at all.
 #[cfg(unix)]
@@ -1002,21 +1083,15 @@ async fn fine_tuned_adapter_bundle_permission_fault_is_not_a_typed_model_error()
     // PROBE: chmod the file unreadable, then confirm the process actually
     // cannot read it — root (and a mode-ignoring filesystem) bypasses this,
     // in which case the fault-injection premise this test needs never holds.
+    // Shared require-gate polarity (esc-089 F1): under
+    // `JAMMI_REQUIRE_POSIX_PERMS=1` a bypass panics rather than skipping.
     std::fs::set_permissions(&weights_path, std::fs::Permissions::from_mode(0o000)).unwrap();
-    let bypassed = std::fs::read(&weights_path).is_ok();
+    let bypassed = crate::common::permission_fault_bypassed(
+        "fine_tuned_adapter_bundle_permission_fault_is_not_a_typed_model_error",
+        || std::fs::read(&weights_path).is_ok(),
+    );
     if bypassed {
         let _ = std::fs::set_permissions(&weights_path, std::fs::Permissions::from_mode(0o644));
-        if std::env::var_os("JAMMI_REQUIRE_POSIX_PERMS").is_some() {
-            panic!(
-                "JAMMI_REQUIRE_POSIX_PERMS is set but the process could read a 0o000-chmod'd \
-                 file (root, or a mode-ignoring filesystem) — the permission-fault \
-                 fault-injection premise this test needs does not hold"
-            );
-        }
-        eprintln!(
-            "fine_tuned_adapter_bundle_permission_fault_is_not_a_typed_model_error: chmod \
-             bypassed (root?) — skipping"
-        );
         return;
     }
 

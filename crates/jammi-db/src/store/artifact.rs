@@ -26,8 +26,13 @@
 //! consistency a reader relies on is read-after-write of a *new* object, which
 //! every object store (including S3) serves strongly; list-after-write and
 //! overwrite-then-read — the eventually-consistent operations — are never on the
-//! path. A manifest absent or a file whose bytes do not hash to the recorded
-//! digest is a hard error (a partial PUT, not a torn load to be papered over).
+//! path. A manifest-listed file whose bytes do not hash to the recorded digest,
+//! or that has gone missing after the manifest names it, is a hard integrity
+//! error (a partial PUT, not a torn load to be papered over) —
+//! [`StorageError::Layout`]. A manifest that is absent ENTIRELY is a distinct
+//! outcome, [`StorageError::NotPublished`]: no manifest is in hand, so there is
+//! nothing to say is corrupt — the prefix was simply never published, or a
+//! catalog pointer names the wrong prefix.
 //!
 //! ## Local cache
 //!
@@ -379,9 +384,11 @@ impl ArtifactStore {
         self.delete_artifact_prefix(&prefix).await
     }
 
-    /// Read and parse `manifest.json` under `prefix`. A missing or malformed
-    /// manifest is a hard error — without it the bundle's completeness cannot be
-    /// established.
+    /// Read and parse `manifest.json` under `prefix`. A manifest absent
+    /// entirely reclassifies to [`StorageError::NotPublished`] — "no bundle
+    /// published here", not corruption (see [`reclassify_missing_manifest`]).
+    /// A manifest present but malformed is a hard [`StorageError::Layout`]
+    /// error — it WAS published, but what's there is not valid JSON.
     async fn read_manifest(
         &self,
         handle: &JammiObjectStore,
@@ -391,7 +398,7 @@ impl ArtifactStore {
         let bytes = handle
             .get_bytes(&manifest_path)
             .await
-            .map_err(|e| reclassify_missing_key(e, prefix, MANIFEST_NAME))?;
+            .map_err(|e| reclassify_missing_manifest(e, prefix))?;
         serde_json::from_slice(&bytes).map_err(|e| {
             JammiError::Storage(StorageError::layout(
                 prefix.as_str(),
@@ -457,6 +464,33 @@ impl ArtifactStore {
     }
 }
 
+/// Re-type a `manifest.json` `get_bytes` fault as "no bundle is published at
+/// this prefix at all" ([`StorageError::NotPublished`]) when the driver
+/// reports the manifest does not exist, vs. leaving every other driver
+/// failure as the transport/IO fault it is.
+///
+/// No manifest is in hand at this point, so there is nothing to say the
+/// bundle's *content* is broken — the honest claim is narrower: this prefix
+/// was never published, a catalog pointer names the wrong prefix, or a
+/// pre-fix code path clobbered the pointer to point somewhere else entirely
+/// (e.g. a base weights directory). This is a DIFFERENT failure class than
+/// [`reclassify_missing_key`]'s "a manifest-listed key is gone" — that one
+/// DOES have a manifest in hand naming exactly what's missing, which is
+/// genuine bundle corruption. Conflating the two would call "nothing was
+/// ever published here" a corrupted bundle, which is a claim this call site
+/// carries no evidence for. Any other driver error (network fault,
+/// throttling, credential rot, a 5xx) is a genuine transport/IO problem and
+/// is left as [`StorageError::Io`] unchanged.
+fn reclassify_missing_manifest(err: StorageError, prefix: &StorageUrl) -> JammiError {
+    match &err {
+        StorageError::Io {
+            source: object_store::Error::NotFound { .. },
+            ..
+        } => JammiError::Storage(StorageError::not_published(prefix.as_str())),
+        _ => JammiError::from(err),
+    }
+}
+
 /// Re-type a `get_bytes` fault reading `name` under `prefix` as an INTEGRITY
 /// failure of the bundle when the driver reports the key does not exist, vs.
 /// leaving every other driver failure as the transport/IO fault it is.
@@ -470,11 +504,14 @@ impl ArtifactStore {
 /// manifest or a digest mismatch, so this folds a missing key into the same
 /// variant rather than minting a fourth error path — callers that already
 /// match `StorageError::Layout` to detect "this artifact's bytes are wrong"
-/// catch a missing key for free. Any other driver error (network fault,
-/// throttling, credential rot, a 5xx) is a genuine transport/IO problem
-/// unrelated to this bundle's own integrity and is left as
-/// [`StorageError::Io`] unchanged, so a caller can still tell "the store was
-/// unreachable" from "this artifact is corrupt".
+/// catch a missing key for free. Distinct from [`reclassify_missing_manifest`]
+/// (the manifest itself absent, meaning nothing was ever published — never
+/// bundle corruption) — see that function's doc for why the two must not be
+/// conflated. Any other driver error (network fault, throttling, credential
+/// rot, a 5xx) is a genuine transport/IO problem unrelated to this bundle's
+/// own integrity and is left as [`StorageError::Io`] unchanged, so a caller
+/// can still tell "the store was unreachable" from "this artifact is
+/// corrupt".
 fn reclassify_missing_key(err: StorageError, prefix: &StorageUrl, name: &str) -> JammiError {
     match &err {
         StorageError::Io {
@@ -529,6 +566,32 @@ mod tests {
 
     fn store_with_root(root: StorageUrl, cache: PathBuf) -> ArtifactStore {
         ArtifactStore::with_root(root, StorageRegistry::new(), cache).unwrap()
+    }
+
+    /// The require-gate polarity every `chmod` permission-fault probe in the
+    /// workspace's test suites shares (esc-089 F1): `probe` performs the
+    /// fault-injection premise check itself and returns `true` if the fault
+    /// was BYPASSED (root, or a mode-ignoring filesystem). A bypass is
+    /// normally a loud, `eprintln`'d skip; under `JAMMI_REQUIRE_POSIX_PERMS=1`
+    /// (the CI lane that is SUPPOSED to run unprivileged with real POSIX
+    /// permission enforcement) a bypass is instead a hard `panic!` — never a
+    /// silent `return`. This is jammi-db's own copy of the identical polarity
+    /// `jammi-ai`'s `tests/it/common::permission_fault_bypassed` carries (the
+    /// two crates' test suites do not share a test-utility crate for this).
+    fn permission_fault_bypassed(test_name: &str, probe: impl FnOnce() -> bool) -> bool {
+        let bypassed = probe();
+        if bypassed {
+            if std::env::var_os("JAMMI_REQUIRE_POSIX_PERMS").is_some() {
+                panic!(
+                    "JAMMI_REQUIRE_POSIX_PERMS is set but '{test_name}' could not inject its \
+                     permission fault (root, or a mode-ignoring filesystem) — the \
+                     fault-injection premise this test needs does not hold; a silent skip is \
+                     not acceptable here"
+                );
+            }
+            eprintln!("{test_name}: chmod bypassed (root?) — skipping");
+        }
+        bypassed
     }
 
     fn sample_files() -> Vec<(String, Bytes)> {
@@ -619,7 +682,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn missing_manifest_is_a_hard_error() {
+    async fn missing_manifest_is_not_published_not_corruption() {
         let cache = tempfile::tempdir().unwrap();
         let store = store_with_root(
             StorageUrl::memory("artifacts-nomanifest"),
@@ -628,14 +691,21 @@ mod tests {
         // A prefix that was never written — no manifest exists.
         let prefix = store.prefix_url(&["ghost", "worker", "0"]).unwrap();
         let err = store.fetch_artifact(&prefix).await.unwrap_err();
-        // The manifest GET 404s before any data file is touched. A 404 on the
-        // manifest itself is an INTEGRITY failure of the bundle (nothing was
-        // ever published at this prefix), not a transport fault, so it is
-        // reclassified to `StorageError::Layout` — the same variant a
-        // malformed manifest or a digest mismatch already carries.
+        // The manifest GET 404s before any data file is even named. No
+        // manifest is in hand, so there is nothing to say the bundle's
+        // CONTENT is broken — this is "no bundle published here"
+        // (`StorageError::NotPublished`), never the `Layout` integrity-failure
+        // class a malformed manifest or a listed-key-absent 404 carries (those
+        // DO have a manifest in hand).
         assert!(
-            matches!(err, JammiError::Storage(StorageError::Layout { .. })),
-            "a missing manifest.json must reclassify to StorageError::Layout, got: {err:?}"
+            matches!(err, JammiError::Storage(StorageError::NotPublished { .. })),
+            "a missing manifest.json must reclassify to StorageError::NotPublished, not the \
+             Layout integrity-failure class (no manifest is in hand to say anything is \
+             corrupt), got: {err:?}"
+        );
+        assert!(
+            err.to_string().contains(prefix.as_str()),
+            "the NotPublished error must name the prefix nothing was published at, got: {err}"
         );
     }
 
@@ -678,8 +748,9 @@ mod tests {
     /// bundle's own content — a permission fault standing in for a transient
     /// object-store outage — must NOT be folded into the same
     /// `StorageError::Layout` integrity bucket. `object_store`'s
-    /// `LocalFileSystem` maps a permission-denied open to
-    /// `Error::UnableToOpenFile`, never `Error::NotFound`, so
+    /// `LocalFileSystem` folds a permission-denied open into
+    /// `Error::Generic` (its own `UnableToOpenFile` is a private local error,
+    /// never constructed outside that crate), never `Error::NotFound`, so
     /// `reclassify_missing_key` must leave it as `StorageError::Io` —
     /// verified with a real `chmod` fault injection (Unix-only), never a
     /// hand-built error the reclassifier was never actually asked to sort.
@@ -699,17 +770,17 @@ mod tests {
         let weights_path = std::path::PathBuf::from(prefix.path()).join("adapter.safetensors");
 
         // PROBE: root (and a mode-ignoring filesystem) bypasses chmod — in
-        // which case the fault-injection premise this test needs never holds,
-        // and it must skip loudly rather than assert against a fault that was
-        // never actually injected.
+        // which case the fault-injection premise this test needs never holds.
+        // Shared require-gate polarity (esc-089 F1): under
+        // `JAMMI_REQUIRE_POSIX_PERMS=1` a bypass panics rather than
+        // skipping — it must never be a silent `return`.
         std::fs::set_permissions(&weights_path, std::fs::Permissions::from_mode(0o000)).unwrap();
-        let bypassed = std::fs::read(&weights_path).is_ok();
+        let bypassed = permission_fault_bypassed(
+            "permission_fault_on_a_present_key_stays_a_transport_error",
+            || std::fs::read(&weights_path).is_ok(),
+        );
         if bypassed {
             let _ = std::fs::set_permissions(&weights_path, std::fs::Permissions::from_mode(0o644));
-            eprintln!(
-                "permission_fault_on_a_present_key_stays_a_transport_error: chmod bypassed \
-                 (root?) — skipping"
-            );
             return;
         }
 

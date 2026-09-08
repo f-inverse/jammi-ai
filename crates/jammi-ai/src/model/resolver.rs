@@ -205,30 +205,52 @@ impl ModelResolver {
                         }
                     })?;
                     // esc-089 negative control: `ArtifactStore::fetch_artifact`
-                    // raises `JammiError::Storage(StorageError::Layout)` for an
-                    // INTEGRITY failure of the bundle itself — the manifest is
-                    // missing/malformed, a manifest-listed key is absent, or a
-                    // digest mismatches — and re-typing ONLY that variant into
-                    // a typed `JammiError::Model` naming this model id matches
-                    // every other refusal this arm raises (the
-                    // `base_model_id`/`artifact_path` checks above,
-                    // `CandleBackend::load`'s own missing-file refusal below).
-                    // Any OTHER storage fault (a transport/IO error against
-                    // S3/GCS/azure, a disabled scheme, driver-init failure) is
-                    // NOT this model's fault — it propagates unchanged so a
-                    // gRPC client sees `Internal` (`wire.rs`'s catch-all),
-                    // never `InvalidArgument`, for a transient outage. The
-                    // underlying error's own message (which names the
-                    // missing/corrupt key, e.g. `adapter.safetensors`) is
-                    // preserved verbatim in the wrapped message.
+                    // raises two DISTINCT typed storage outcomes this arm must
+                    // NOT conflate (F2, round-3 audit):
+                    //
+                    //   - `StorageError::NotPublished` — no manifest is in
+                    //     hand at all. This is NOT bundle corruption; it is
+                    //     "no bundle was ever published at this prefix" —
+                    //     never published, a misdirected catalog pointer, or
+                    //     (pre-fix) a clobbered pointer left aimed at the base
+                    //     weights directory instead. The message says exactly
+                    //     that, never "failed integrity check".
+                    //   - `StorageError::Layout` — a manifest WAS read and it
+                    //     names a key that is absent or hashes wrong. THIS is
+                    //     the genuine integrity failure, matching every other
+                    //     refusal this arm raises (the
+                    //     `base_model_id`/`artifact_path` checks above,
+                    //     `CandleBackend::load`'s own missing-file refusal
+                    //     below).
+                    //
+                    // Both re-type into a typed `JammiError::Model` naming
+                    // this model id (`map_engine_error` gives `Model` ->
+                    // `Code::InvalidArgument`, a client-visible precondition
+                    // failure). Any OTHER storage fault (a transport/IO error
+                    // against S3/GCS/azure, a disabled scheme, driver-init
+                    // failure) is NOT this model's fault — it propagates
+                    // unchanged so a gRPC client sees `Internal` (`wire.rs`'s
+                    // catch-all), never `InvalidArgument`, for a transient
+                    // outage.
                     let local = match self.artifact_store.fetch_artifact(&prefix_url).await {
                         Ok(local) => local,
+                        Err(JammiError::Storage(StorageError::NotPublished { path })) => {
+                            return Err(JammiError::Model {
+                                model_id: model_id.0.clone(),
+                                message: format!(
+                                    "no adapter bundle is published at '{path}' for \
+                                     fine-tuned model '{}' (manifest.json absent); the \
+                                     catalog pointer may be misdirected",
+                                    model_id.0
+                                ),
+                            });
+                        }
                         Err(JammiError::Storage(StorageError::Layout { path, reason })) => {
                             return Err(JammiError::Model {
                                 model_id: model_id.0.clone(),
                                 message: format!(
-                                    "fine-tuned model '{}' adapter bundle at '{path}' failed \
-                                     integrity check: {reason}",
+                                    "adapter bundle at '{path}' failed integrity check for \
+                                     fine-tuned model '{}': {reason}",
                                     model_id.0
                                 ),
                             });

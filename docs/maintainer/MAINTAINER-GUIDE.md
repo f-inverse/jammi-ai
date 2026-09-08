@@ -2942,30 +2942,30 @@ id and the missing field, never silently resolved as an ordinary model or served
 unadapted base.
 
 The adapter-fetch error contract both reload surfaces share: `fetch_artifact`
-(`crates/jammi-db/src/store/artifact.rs:215`) returns exactly one integrity-failure bucket,
+(`crates/jammi-db/src/store/artifact.rs:220`) returns exactly one integrity-failure bucket,
 `StorageError::Layout`, for three underlying causes it deliberately folds together — a
 malformed manifest, an ABSENT manifest (nothing was ever published at that prefix; see
 `missing_manifest_is_a_hard_error` (`crates/jammi-db/src/store/artifact.rs:622`)), or a
 manifest-listed key that is missing or hash-mismatched on an otherwise-published bundle
-(`reclassify_missing_key` (`crates/jammi-db/src/store/artifact.rs:478`), `verify_sha256`
-(`crates/jammi-db/src/store/artifact.rs:493`)). "Never published" and "corrupted after publish"
+(`reclassify_missing_key` (`crates/jammi-db/src/store/artifact.rs:515`), `verify_sha256`
+(`crates/jammi-db/src/store/artifact.rs:530`)). "Never published" and "corrupted after publish"
 are not distinct variants here, only distinct `reason` strings inside the same
 `StorageError::Layout { path, reason }`. Both reload surfaces re-type ONLY that variant into a
 refusal naming the model id, but not into the same error type: `ModelResolver::try_catalog_lookup`
-re-types `StorageError::Layout` (`crates/jammi-ai/src/model/resolver.rs:226`) into
+re-types `StorageError::Layout` (`crates/jammi-ai/src/model/resolver.rs:248`) into
 `JammiError::Model`, while `load_context_predictor` re-types the identical fault, its own
-`StorageError::Layout` (`crates/jammi-ai/src/pipeline/context_predictor.rs:1257`), into
+`StorageError::Layout` (`crates/jammi-ai/src/pipeline/context_predictor.rs:1286`), into
 `JammiError::Inference` instead. A catalog record that never recorded an `artifact_path`
-(`crates/jammi-ai/src/pipeline/context_predictor.rs:1230`) at all is a separate, earlier refusal
+(`crates/jammi-ai/src/pipeline/context_predictor.rs:1237`) at all is a separate, earlier refusal
 on each surface that never reaches `fetch_artifact` — the resolver's arm raises `JammiError::Model`
-(`crates/jammi-ai/src/model/resolver.rs:241`), the predictor's raises `JammiError::Inference`.
+(`crates/jammi-ai/src/model/resolver.rs:263`), the predictor's raises `JammiError::Inference`.
 Any OTHER storage fault off `fetch_artifact` — transport/IO, a disabled scheme, driver-init
 failure, or a permission-denied open on a present key (which stays `StorageError::Io`, never
 reclassified — `permission_fault_on_a_present_key_stays_a_transport_error`
-(`crates/jammi-db/src/store/artifact.rs:688`)) — propagates unchanged past the resolver's own
-catch-all, `Err(e) => return Err(e)` (`crates/jammi-ai/src/model/resolver.rs:236`), and the
+(`crates/jammi-db/src/store/artifact.rs:759`)) — propagates unchanged past the resolver's own
+catch-all, `Err(e) => return Err(e)` (`crates/jammi-ai/src/model/resolver.rs:258`), and the
 predictor's identical catch-all, `Err(e) => return Err(e)`
-(`crates/jammi-ai/src/pipeline/context_predictor.rs:1263`). At the gRPC edge, `map_engine_error`
+(`crates/jammi-ai/src/pipeline/context_predictor.rs:1295`). At the gRPC edge, `map_engine_error`
 (`crates/jammi-server/src/grpc/wire.rs:109`) maps `JammiError::Model`
 (`crates/jammi-server/src/grpc/wire.rs:115`) to `Code::InvalidArgument`, maps
 `JammiError::Inference` (`crates/jammi-server/src/grpc/wire.rs:138`) to `Code::Internal`, and

@@ -2708,22 +2708,25 @@ async fn cancelled_run_reclaims_epoch_checkpoints_that_actually_existed() {
 /// skip — the same require-gate polarity every other `JAMMI_REQUIRE_*`
 /// skip-guard in this crate carries, applied to a filesystem-privilege
 /// probe instead of a hardware one.
+// Delegates to the ONE shared require-gate polarity
+// (`common::permission_fault_bypassed`, esc-089 F1) so this probe, the
+// `models.rs` permission-fault probe, and the `context_predictor.rs`
+// permission-fault probe can never independently drift out of sync on
+// whether a bypass under `JAMMI_REQUIRE_POSIX_PERMS=1` panics or silently
+// skips.
 #[cfg(unix)]
 fn chmod_bypassed(dir: &std::path::Path) -> bool {
     let probe = dir.join(".root_probe");
-    let bypassed = std::fs::write(&probe, b"x").is_ok();
-    if bypassed {
-        let _ = std::fs::remove_file(&probe);
-        if std::env::var_os("JAMMI_REQUIRE_POSIX_PERMS").is_some() {
-            panic!(
-                "JAMMI_REQUIRE_POSIX_PERMS is set but the process could write through a \
-                 0o555-chmod'd directory (root, or a mode-ignoring filesystem) — the \
-                 failed-prune fault-injection premise this test needs does not hold; a silent \
-                 skip is not acceptable here"
-            );
-        }
-    }
-    bypassed
+    crate::common::permission_fault_bypassed(
+        "finalize_reclaims_a_persistently_failed_prune_and_warns",
+        || {
+            let ok = std::fs::write(&probe, b"x").is_ok();
+            if ok {
+                let _ = std::fs::remove_file(&probe);
+            }
+            ok
+        },
+    )
 }
 
 #[cfg(unix)]

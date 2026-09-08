@@ -1227,38 +1227,70 @@ impl InferenceSession {
         // worker wrote the weights under. Fetch the bundle into a local cache
         // dir (a no-op copy for a `file://` root) and load `model.safetensors`
         // from there — so a predictor trained on one host reloads on another.
-        let prefix = record.artifact_path.as_deref().ok_or_else(|| {
-            JammiError::Inference(format!(
-                "context predictor '{model_id}' has no artifact path"
-            ))
-        })?;
-        // A malformed `artifact_path` string is itself a corrupted catalog
-        // record — never a storage-layer fault — so it is always a typed
-        // reload refusal naming this model id, regardless of what the
-        // parser's own message says. Mirrors `ModelResolver`'s fine-tuned
-        // reload arm (`resolver.rs`) so both surfaces agree.
-        let prefix_url = jammi_db::storage::StorageUrl::parse(prefix).map_err(|e| {
-            JammiError::Inference(format!(
-                "context predictor '{model_id}' artifact_path '{prefix}' is not a valid \
-                 storage URL: {e} — this catalog record's pointer is corrupted"
-            ))
-        })?;
-        // esc-089 negative control (sibling reload surface): re-type ONLY an
-        // INTEGRITY failure of the bundle itself
-        // (`JammiError::Storage(StorageError::Layout)` — manifest
-        // missing/malformed, a manifest-listed key absent, a digest
-        // mismatch) into a typed reload refusal naming this model id. Any
-        // OTHER storage fault (a transport/IO error against S3/GCS/azure, a
-        // disabled scheme, driver-init failure) is NOT this predictor's
-        // fault — it propagates unchanged so a gRPC client sees `Internal`,
-        // never a bad-argument-shaped code, for a transient outage.
+        // A corrupted catalog record (no pointer at all, or a pointer that
+        // does not even parse as a storage URL) is a client-visible
+        // precondition failure, not this surface's own `JammiError::Inference`
+        // — `JammiError::Model` mirrors `ModelResolver`'s fine-tuned reload
+        // arm (`resolver.rs`) exactly, so both surfaces genuinely agree
+        // (round-3 audit F3) rather than merely claiming to.
+        let prefix = record
+            .artifact_path
+            .as_deref()
+            .ok_or_else(|| JammiError::Model {
+                model_id: model_id.to_string(),
+                message: format!("context predictor '{model_id}' has no artifact path"),
+            })?;
+        let prefix_url =
+            jammi_db::storage::StorageUrl::parse(prefix).map_err(|e| JammiError::Model {
+                model_id: model_id.to_string(),
+                message: format!(
+                    "context predictor '{model_id}' artifact_path '{prefix}' is not a valid \
+                     storage URL: {e} — this catalog record's pointer is corrupted"
+                ),
+            })?;
+        // esc-089 negative control (sibling reload surface): re-type two
+        // DISTINCT typed storage outcomes this arm must NOT conflate (F2/F3,
+        // round-3 audit), matching `ModelResolver`'s fine-tuned reload arm so
+        // both surfaces agree:
+        //
+        //   - `StorageError::NotPublished` — no manifest is in hand at all.
+        //     This is NOT bundle corruption; it is "no bundle was ever
+        //     published at this prefix" — never published, a misdirected
+        //     catalog pointer, or a clobbered pointer.
+        //   - `StorageError::Layout` — a manifest WAS read and it names a key
+        //     that is absent or hashes wrong. THIS is the genuine integrity
+        //     failure.
+        //
+        // Both re-type into `JammiError::Model` (never `JammiError::Inference`
+        // — `Inference` maps to `Code::Internal` at the wire boundary, which
+        // is wrong for a client-visible precondition failure; `Model` maps to
+        // `Code::InvalidArgument`, matching `ModelResolver`'s sibling arm) so
+        // both reload surfaces raise the SAME code for the SAME class of
+        // outcome. Any OTHER storage fault (a transport/IO error against
+        // S3/GCS/azure, a disabled scheme, driver-init failure) is NOT this
+        // predictor's fault — it propagates unchanged so a gRPC client sees
+        // `Internal`, never a bad-argument-shaped code, for a transient
+        // outage.
         let local = match self.artifact_store().fetch_artifact(&prefix_url).await {
             Ok(local) => local,
+            Err(JammiError::Storage(jammi_db::storage::StorageError::NotPublished { path })) => {
+                return Err(JammiError::Model {
+                    model_id: model_id.to_string(),
+                    message: format!(
+                        "no adapter bundle is published at '{path}' for context predictor \
+                         '{model_id}' (manifest.json absent); the catalog pointer may be \
+                         misdirected"
+                    ),
+                });
+            }
             Err(JammiError::Storage(jammi_db::storage::StorageError::Layout { path, reason })) => {
-                return Err(JammiError::Inference(format!(
-                    "context predictor '{model_id}' adapter bundle at '{path}' failed \
-                     integrity check: {reason}"
-                )));
+                return Err(JammiError::Model {
+                    model_id: model_id.to_string(),
+                    message: format!(
+                        "adapter bundle at '{path}' failed integrity check for context \
+                         predictor '{model_id}': {reason}"
+                    ),
+                });
             }
             Err(e) => return Err(e),
         };

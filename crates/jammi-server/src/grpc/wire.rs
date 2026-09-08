@@ -263,6 +263,90 @@ mod tests {
         assert_eq!(bad.code(), Code::InvalidArgument);
     }
 
+    /// esc-089 F3 (round-3 audit): a resolver/predictor integrity failure OR
+    /// an unpublished-bundle refusal is a client-visible precondition
+    /// failure on BOTH adapter-reload surfaces — `ModelResolver`'s
+    /// fine-tuned arm (`crates/jammi-ai/src/model/resolver.rs`) and the
+    /// context-predictor reload arm
+    /// (`crates/jammi-ai/src/pipeline/context_predictor.rs`) both raise the
+    /// SAME `JammiError::Model`, which this wire boundary maps to
+    /// `Code::InvalidArgument` per the `model_not_found_maps_to_not_found`
+    /// test above. Before the fix, the predictor surface raised its own
+    /// `JammiError::Inference` for this case instead, which falls through
+    /// this function's catch-all arm to `Code::Internal` — wrong for a
+    /// client-visible precondition failure, and disagreeing with the
+    /// resolver surface for the identical class of outcome. A genuine
+    /// transport/IO fault (credential rot, a disabled cloud scheme, a
+    /// network fault against S3/GCS/azure) is propagated UNCHANGED as
+    /// `JammiError::Storage` by both surfaces and has no typed arm in this
+    /// function, so it falls through to `Code::Internal` on both — this is
+    /// the correct, deliberate asymmetry: a caller-visible precondition gets
+    /// `InvalidArgument`, a backend/transport fault gets `Internal`.
+    #[test]
+    fn adapter_bundle_refusal_codes_agree_across_both_reload_surfaces() {
+        use jammi_db::storage::{Scheme, StorageError};
+
+        // Resolver integrity failure (a manifest-listed key absent or hash
+        // mismatch) — `ModelResolver::try_catalog_lookup`'s fine-tuned arm.
+        let resolver_integrity = map_engine_error(JammiError::Model {
+            model_id: "jammi:fine-tuned:job-1".into(),
+            message: "adapter bundle at 'file:///artifacts/job-1' failed integrity check \
+                      for fine-tuned model 'jammi:fine-tuned:job-1': artifact file \
+                      'adapter.safetensors' missing under this prefix (manifest lists it)"
+                .into(),
+        });
+        assert_eq!(
+            resolver_integrity.code(),
+            Code::InvalidArgument,
+            "a resolver integrity failure must be a client-visible precondition failure"
+        );
+
+        // Resolver transport/IO fault — propagated unchanged, never folded
+        // into `JammiError::Model`. `DriverInit` stands in for the class of
+        // fault named in `resolver.rs`'s own doc comment (credential rot, a
+        // disabled scheme, a network fault) — never this model's own
+        // content being wrong.
+        let resolver_transport = map_engine_error(JammiError::Storage(StorageError::DriverInit {
+            scheme: Scheme::S3,
+            reason: "credential rot: token expired".into(),
+        }));
+        assert_eq!(
+            resolver_transport.code(),
+            Code::Internal,
+            "a resolver transport/IO fault must stay Internal, never InvalidArgument"
+        );
+
+        // Predictor integrity failure — the context-predictor reload arm's
+        // own typed refusal, unified onto the SAME `JammiError::Model`
+        // variant the resolver surface raises (this is the fix: it used to
+        // be `JammiError::Inference`, which mapped to `Internal` above).
+        let predictor_integrity = map_engine_error(JammiError::Model {
+            model_id: "cnp-1".into(),
+            message: "adapter bundle at 'file:///artifacts/cnp-1' failed integrity check \
+                      for context predictor 'cnp-1': artifact file 'model.safetensors' \
+                      missing under this prefix (manifest lists it)"
+                .into(),
+        });
+        assert_eq!(
+            predictor_integrity.code(),
+            Code::InvalidArgument,
+            "a predictor integrity failure must be a client-visible precondition failure, \
+             the SAME code the resolver surface gets for the same class of outcome"
+        );
+
+        // Predictor transport/IO fault — propagated unchanged, same as the
+        // resolver surface.
+        let predictor_transport = map_engine_error(JammiError::Storage(StorageError::DriverInit {
+            scheme: Scheme::Gcs,
+            reason: "network fault: connection reset".into(),
+        }));
+        assert_eq!(
+            predictor_transport.code(),
+            Code::Internal,
+            "a predictor transport/IO fault must stay Internal, matching the resolver surface"
+        );
+    }
+
     /// The faithful detail attached to the Status reconstructs the exact
     /// `ModelNotFound` variant on the client side — not a coarse code guess.
     #[test]

@@ -438,24 +438,35 @@ workspace ships every publishable crate at the same
   `model_type`: a mismatch (a catalog a pre-fix build already corrupted) is a typed refusal naming
   the id and the row's actual type, never a silent base serve — the backstop for catalogs written
   before this fix.
-- **An adapter-fetch failure is typed by WHAT failed, not by which call site raised it — an
-  integrity failure of the bundle vs. a transport/IO fault of the store (esc-089 fold-in).**
-  `ArtifactStore::fetch_artifact` folded a manifest-promised key that is genuinely absent
-  (`object_store::Error::NotFound` — a partial publish, a manually-deleted file) into the SAME
+- **An adapter-fetch failure is typed by WHAT failed, not by which call site raised it — a wholly
+  absent bundle, a bundle whose manifest names a key that is truly gone, and a transport/IO fault
+  of the store are three DIFFERENT outcomes, and both reload surfaces now agree on ONE code per
+  outcome (esc-089 fold-in, round-3 audit).** `ArtifactStore::fetch_artifact` used to fold a
+  manifest-promised key that is genuinely absent (`object_store::Error::NotFound`) into the SAME
   `StorageError::Io` a real transport fault (a permission-denied open, an S3/GCS/azure outage)
   raises, so `ModelResolver::try_catalog_lookup`'s fine-tuned reload arm — which re-typed EVERY
-  fetch error into `JammiError::Model` naming the model id — turned a transient store outage into
-  the same bad-request-shaped refusal a genuinely broken bundle gets, reaching a gRPC client as
-  `InvalidArgument` instead of `Internal`. `fetch_artifact` now reclassifies only the `NotFound`
-  case into `StorageError::Layout`, the same INTEGRITY bucket a malformed manifest or a digest
-  mismatch already carries; every other driver fault stays `StorageError::Io` unchanged.
-  `ModelResolver::try_catalog_lookup` and the sibling context-predictor reload arm
-  (`InferenceSession::load_context_predictor`) each re-type ONLY that `Layout` variant into their
-  own typed refusal (`JammiError::Model` / `JammiError::Inference`) naming the model id and the
-  missing key, and apply the identical rule to an `artifact_path` string that fails to parse as a
-  storage URL (itself a corrupted catalog record, never a storage fault) — every other fault
-  (a transport/IO error, a permission fault, a disabled scheme, driver-init failure) propagates
-  unchanged.
+  fetch error into `JammiError::Model` — turned a transient store outage into the same
+  bad-request-shaped refusal a genuinely broken bundle gets. That first fix reclassified a
+  `NotFound` into `StorageError::Layout` regardless of WHICH read hit it, which conflated a
+  further pair of distinct outcomes: a `NotFound` reading `manifest.json` itself (no bundle was
+  ever published at this prefix — never published, a misdirected catalog pointer, or a pre-fix
+  clobbered pointer left aimed at the base weights directory) is NOT the same claim as a
+  `NotFound` reading a key the manifest DOES name (genuine bundle corruption — a partial publish or
+  a manually-deleted file). `read_manifest`'s own `NotFound` now reclassifies to a NEW
+  `StorageError::NotPublished` (there is no manifest in hand to say anything is corrupt); a
+  listed-key `NotFound` (or a digest mismatch) stays `StorageError::Layout`, the genuine INTEGRITY
+  bucket. `ModelResolver::try_catalog_lookup` and the sibling context-predictor reload arm
+  (`InferenceSession::load_context_predictor`) each re-type BOTH variants into their own refusal
+  naming the model id, with a distinct message per outcome ("no adapter bundle is published…"
+  vs. "…failed integrity check…"), and apply the identical rule to an `artifact_path` string that
+  fails to parse as a storage URL (itself a corrupted catalog record, never a storage fault) —
+  every other fault (a transport/IO error, a permission fault, a disabled scheme, driver-init
+  failure) propagates unchanged. Both surfaces now raise the SAME `JammiError::Model` for every
+  one of these client-visible precondition failures — the context-predictor surface previously
+  raised its own `JammiError::Inference` here, which maps to gRPC `Internal` at the wire boundary
+  instead of `InvalidArgument`, disagreeing with the resolver surface for the identical class of
+  outcome; a wire-boundary test now pins all four combinations (resolver/predictor ×
+  integrity/transport) through `map_engine_error`.
 - **A `Utf8View` path column is accepted by `arrow_to_images`/`arrow_to_audio`, matching `Utf8`
   exactly (esc-090).** Both functions matched `Utf8`/`LargeUtf8`/`Binary`/`LargeBinary`/
   `BinaryView` but had no `Utf8View` arm, so a `Utf8View` path column — DataFusion's parquet

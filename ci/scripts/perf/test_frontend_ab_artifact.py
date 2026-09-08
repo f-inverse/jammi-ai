@@ -32,6 +32,40 @@ zero/non-positive divisor (a named refusal, never a `ZeroDivisionError`).
 missing-line/malformed-`t_s` refusals; `TowerTaskAndDeviceNameTests` covers
 the per-leg `task`/`device_name` cross-check.
 
+## The "measured tip precedes merge tip" record is a FIXPOINT (round-5 audit F1)
+
+`notes.measured_tip_precedes_merge_tip` (and the top-level
+`notes.rendered_from_tree_sha` it mirrors) is only ever correct AT THE
+INSTANT it is rendered -- `frontend_ab_artifact.py`'s own "Regeneration
+discipline" module-doc section names why: the producer records `git
+rev-parse HEAD` BEFORE the commit that adds/updates the artifact file
+itself lands, so the value is always that commit's own PARENT, and any
+LATER commit on the branch makes the committed record stale relative to a
+fresh regeneration through no fault of the number itself. The house
+discipline is therefore: regenerating and committing this artifact is the
+unit's own LAST commit.
+
+`assert_committed_artifact_not_stale` below is the mechanical gate for
+that discipline: given `C` (the artifact file's own last commit, `git log
+-1 -- <path>`), it asserts (1) the committed `rendered_from_tree_sha`
+equals `C`'s own PARENT (never `C` itself), (2) a fresh-at-HEAD
+`files_changed_since_measured_tip` equals the committed list UNION `C`'s
+own changed files EXACTLY (a later, un-rendered commit shows up as an
+"unaccounted for" extra), (3) the `measurement` block is byte-identical
+between the committed artifact and a fresh regeneration (numbers never
+move), and (4) every OTHER field is also byte-identical -- any divergence
+there is not explained by "the artifact's own last commit changed things"
+and is refused, named, as "artifact record stale: regenerate as the final
+commit". `ArtifactRecordFreshnessGateTests` proves the mechanism itself on
+a scratch `git init`'d repo (regenerated-as-final-commit -> green; one
+more commit touching a source file afterwards -> red, named; a commit
+touching only the artifact itself -> green again).
+`RealFixtureRegressionTests.test_committed_artifact_record_is_not_stale`
+then drives the SAME gate against the REAL committed pod-p421c artifact --
+this is EXPECTED to be RED at a tip where a fold landed after the artifact
+was last rendered (exactly `perf/421-frontend`'s own current tip), by
+design: that redness IS the discipline working, not a bug in the gate.
+
 Run: `python3 ci/scripts/perf/test_frontend_ab_artifact.py`
 """
 
@@ -128,6 +162,141 @@ def _git(args: list[str], cwd: Path) -> subprocess.CompletedProcess:
     if proc.returncode != 0:
         raise RuntimeError(f"git {args} failed: {proc.stderr}")
     return proc
+
+
+# --------------------------------------------------------------------------- #
+# round-5 audit finding F1: the "measured tip precedes merge tip" record is a
+# FIXPOINT -- see this module's own doc and `frontend_ab_artifact.py`'s own
+# "Regeneration discipline" section. `assert_committed_artifact_not_stale` is
+# the mechanical gate; the three small `git` helpers below give it exactly
+# the facts it needs about `C`, the artifact file's own last commit.
+# --------------------------------------------------------------------------- #
+STALE_ARTIFACT_RECORD_MESSAGE = "artifact record stale: regenerate as the final commit"
+
+# The `notes.measured_tip_precedes_merge_tip` keys that are EXPECTED to move
+# between a committed artifact and a fresh-at-HEAD regeneration -- each one
+# is a function of WHEN the tree was rendered, which necessarily differs
+# once ANY later commit lands, including the artifact's own re-render
+# commit. Every other field is asserted byte-identical by
+# `_report_sans_freshness_fields`'s own caller.
+_MEASURED_TIP_DEV_VOLATILE_KEYS = ("rendered_from_tree_sha", "files_changed_since_measured_tip", "diffstat")
+
+
+def _artifact_own_last_commit(artifact_rel_path: str, repo_root: Path) -> str:
+    """`C`: the commit that last touched `artifact_rel_path` (`git log -1
+    --format=%H -- <path>`) -- the SAME discriminator the module doc names.
+    """
+    proc = subprocess.run(
+        ["git", "log", "-1", "--format=%H", "--", artifact_rel_path],
+        cwd=repo_root, capture_output=True, text=True,
+    )
+    if proc.returncode != 0:
+        raise RuntimeError(f"git log -1 --format=%H -- {artifact_rel_path} failed in {repo_root}: {proc.stderr}")
+    sha = proc.stdout.strip()
+    if not sha:
+        raise RuntimeError(f"no commit touches {artifact_rel_path} in {repo_root} -- is it tracked?")
+    return sha
+
+
+def _commit_parent(sha: str, repo_root: Path) -> str:
+    proc = subprocess.run(["git", "rev-parse", f"{sha}^"], cwd=repo_root, capture_output=True, text=True)
+    if proc.returncode != 0:
+        raise RuntimeError(f"git rev-parse {sha}^ failed in {repo_root}: {proc.stderr}")
+    return proc.stdout.strip()
+
+
+def _commit_own_files_changed(sha: str, repo_root: Path) -> set[str]:
+    """Exactly the files `sha` itself changed (relative to its first
+    parent) -- `git diff-tree`, never `git diff <sha>^ <sha>` through this
+    module's own `_diff_name_only`-shaped helper, so a merge commit (two
+    parents) still resolves unambiguously."""
+    proc = subprocess.run(
+        ["git", "diff-tree", "--no-commit-id", "--name-only", "-r", sha],
+        cwd=repo_root, capture_output=True, text=True,
+    )
+    if proc.returncode != 0:
+        raise RuntimeError(f"git diff-tree --no-commit-id --name-only -r {sha} failed in {repo_root}: {proc.stderr}")
+    return {line for line in proc.stdout.splitlines() if line.strip()}
+
+
+def _report_sans_freshness_fields(report: dict) -> dict:
+    """A deep copy of `report` with every field this gate KNOWINGLY allows
+    to move between a committed record and a fresh-at-HEAD regeneration
+    (the top-level `notes.rendered_from_tree_sha` mirror, plus
+    `_MEASURED_TIP_DEV_VOLATILE_KEYS` inside `notes.
+    measured_tip_precedes_merge_tip`) stripped out -- so a plain equality
+    check on the remainder catches every OTHER divergence, by name, rather
+    than requiring a bespoke per-field comparison a future field addition
+    could silently bypass.
+    """
+    out = json.loads(json.dumps(report))
+    notes = out.get("notes", {})
+    notes.pop("rendered_from_tree_sha", None)
+    dev = notes.get("measured_tip_precedes_merge_tip")
+    if isinstance(dev, dict):
+        for key in _MEASURED_TIP_DEV_VOLATILE_KEYS:
+            dev.pop(key, None)
+    return out
+
+
+def assert_committed_artifact_not_stale(
+    committed: dict, regenerated: dict, artifact_rel_path: str, repo_root: Path
+) -> None:
+    """Round-5 audit finding F1's own gate -- see this module's doc and
+    `frontend_ab_artifact.py`'s "Regeneration discipline" section for the
+    full argument. `committed` is the artifact JSON as it sits in the
+    working tree; `regenerated` is a FRESH `build_report(...)` call made at
+    `repo_root`'s current HEAD, using the SAME recorded inputs/invocation.
+    Raises `AssertionError` (never returns a bool) on any divergence not
+    attributable to `C` (`artifact_rel_path`'s own last commit).
+    """
+    c = _artifact_own_last_commit(artifact_rel_path, repo_root)
+    expected_rendered_from_tree_sha = _commit_parent(c, repo_root)
+
+    committed_dev = committed["notes"]["measured_tip_precedes_merge_tip"]
+    regenerated_dev = regenerated["notes"]["measured_tip_precedes_merge_tip"]
+
+    if committed["notes"]["rendered_from_tree_sha"] != committed_dev["rendered_from_tree_sha"]:
+        raise AssertionError(
+            f"{STALE_ARTIFACT_RECORD_MESSAGE}: committed notes.rendered_from_tree_sha disagrees with "
+            "notes.measured_tip_precedes_merge_tip.rendered_from_tree_sha within the SAME committed artifact "
+            "-- this is not a valid frontend_ab_artifact.py output at all"
+        )
+    if committed_dev["rendered_from_tree_sha"] != expected_rendered_from_tree_sha:
+        raise AssertionError(
+            f"{STALE_ARTIFACT_RECORD_MESSAGE}: committed rendered_from_tree_sha "
+            f"{committed_dev['rendered_from_tree_sha']!r} != {artifact_rel_path}'s own last commit ({c})'s "
+            f"own parent ({expected_rendered_from_tree_sha!r})"
+        )
+
+    c_own_files = _commit_own_files_changed(c, repo_root)
+    expected_files = set(committed_dev["files_changed_since_measured_tip"]) | c_own_files
+    regenerated_files = set(regenerated_dev["files_changed_since_measured_tip"])
+    if regenerated_files != expected_files:
+        extra = sorted(regenerated_files - expected_files)
+        missing = sorted(expected_files - regenerated_files)
+        raise AssertionError(
+            f"{STALE_ARTIFACT_RECORD_MESSAGE}: a fresh-at-HEAD files_changed_since_measured_tip does not "
+            f"equal the committed list UNION {artifact_rel_path} @ {c}'s own changed files -- unaccounted "
+            f"for by a later, never-re-rendered-against commit: {extra!r}; expected but absent: {missing!r}"
+        )
+
+    committed_measurement = json.dumps(committed["measurement"], sort_keys=True)
+    regenerated_measurement = json.dumps(regenerated["measurement"], sort_keys=True)
+    if committed_measurement != regenerated_measurement:
+        raise AssertionError(
+            f"{STALE_ARTIFACT_RECORD_MESSAGE}: the committed measurement block is not byte-identical to a "
+            "fresh regeneration -- a number moved"
+        )
+
+    committed_rest = _report_sans_freshness_fields(committed)
+    regenerated_rest = _report_sans_freshness_fields(regenerated)
+    if committed_rest != regenerated_rest:
+        raise AssertionError(
+            f"{STALE_ARTIFACT_RECORD_MESSAGE}: fields outside notes.rendered_from_tree_sha / "
+            "notes.measured_tip_precedes_merge_tip.{rendered_from_tree_sha,files_changed_since_measured_tip,"
+            "diffstat} / measurement diverge between the committed artifact and a fresh regeneration"
+        )
 
 
 def _init_repo(root: Path) -> tuple[str, str]:
@@ -449,6 +618,119 @@ class MeasuredTipPrecedesMergeTipTests(unittest.TestCase):
             with self.assertRaises(art.ArtifactBuildError) as ctx:
                 self._build()
         self.assertIn("shallow checkout", str(ctx.exception))
+
+
+class ArtifactRecordFreshnessGateTests(unittest.TestCase):
+    """Exercises `assert_committed_artifact_not_stale` (round-5 audit
+    finding F1) on a small scratch `git init`'d repo, independent of the
+    real committed fixture -- `RealFixtureRegressionTests.
+    test_committed_artifact_record_is_not_stale` below drives the SAME
+    gate against the real repo, and is EXPECTED to fail at the current tip
+    (see that test's own docstring).
+
+    Three scenarios, per the audit finding's own acceptance list:
+      (a) the artifact is regenerated and committed as the unit's OWN LAST
+          commit -> green.
+      (b) one MORE commit lands afterwards, touching a source file the
+          artifact was never re-rendered against -> RED, with the named
+          "artifact record stale: regenerate as the final commit" message.
+      (c) a commit lands afterwards that touches ONLY the artifact file
+          itself (a legitimate re-render, e.g. the fix for scenario (b))
+          -> green again.
+    """
+
+    def setUp(self):
+        self._tmp = tempfile.TemporaryDirectory()
+        self.root = Path(self._tmp.name)
+        _git(["init", "-q"], self.root)
+        (self.root / "src.rs").write_text("v0\n", encoding="utf-8")
+        _git(["add", "."], self.root)
+        _git(["commit", "-q", "-m", "measured tip"], self.root)
+        self.measured_tip = _git(["rev-parse", "HEAD"], self.root).stdout.strip()
+        self.artifact_path = self.root / "artifact.json"
+
+    def tearDown(self):
+        self._tmp.cleanup()
+
+    def _render_and_commit_artifact(self, measurement: dict, message: str) -> dict:
+        """Mirrors the real producer's own discipline (see
+        `frontend_ab_artifact.py`'s "Regeneration discipline" section):
+        `rendered_from_tree_sha` is `git rev-parse HEAD` taken BEFORE this
+        commit is made -- the producer writes the file, and only THEN does
+        a human/CI commit it."""
+        rendered_from_tree_sha = _git(["rev-parse", "HEAD"], self.root).stdout.strip()
+        files_changed = sorted(art._diff_name_only(self.measured_tip, rendered_from_tree_sha, self.root))
+        report = {
+            "measurement": measurement,
+            "notes": {
+                "rendered_from_tree_sha": rendered_from_tree_sha,
+                "measured_tip_precedes_merge_tip": {
+                    "kind": "measured-tip-precedes-merge-tip",
+                    "measured_tip": self.measured_tip,
+                    "rendered_from_tree_sha": rendered_from_tree_sha,
+                    "files_changed_since_measured_tip": files_changed,
+                    "diffstat": "synthetic-at-render-time",
+                    "commentary": "synthetic",
+                },
+            },
+        }
+        self.artifact_path.write_text(json.dumps(report), encoding="utf-8")
+        _git(["add", "artifact.json"], self.root)
+        _git(["commit", "-q", "-m", message], self.root)
+        return report
+
+    def _regenerate(self, measurement: dict) -> dict:
+        """A fresh-at-HEAD regeneration -- real `git diff` output, never
+        hand-typed, so this mirrors what `build_report` itself would
+        compute at the CURRENT tip."""
+        head = _git(["rev-parse", "HEAD"], self.root).stdout.strip()
+        files_changed = sorted(art._diff_name_only(self.measured_tip, head, self.root))
+        return {
+            "measurement": measurement,
+            "notes": {
+                "rendered_from_tree_sha": head,
+                "measured_tip_precedes_merge_tip": {
+                    "kind": "measured-tip-precedes-merge-tip",
+                    "measured_tip": self.measured_tip,
+                    "rendered_from_tree_sha": head,
+                    "files_changed_since_measured_tip": files_changed,
+                    "diffstat": "synthetic-regenerated",
+                    "commentary": "synthetic",
+                },
+            },
+        }
+
+    def test_a_regenerated_as_final_commit_is_green(self):
+        committed = self._render_and_commit_artifact({"m": 1}, "add artifact (final commit)")
+        regenerated = self._regenerate({"m": 1})
+        assert_committed_artifact_not_stale(committed, regenerated, "artifact.json", self.root)  # must not raise
+
+    def test_b_one_more_commit_touching_a_source_file_is_red(self):
+        committed = self._render_and_commit_artifact({"m": 1}, "add artifact (final commit)")
+        (self.root / "src.rs").write_text("v1 -- touched after the artifact's own last commit\n", encoding="utf-8")
+        _git(["commit", "-q", "-am", "post-artifact source change"], self.root)
+        regenerated = self._regenerate({"m": 1})
+        with self.assertRaises(AssertionError) as ctx:
+            assert_committed_artifact_not_stale(committed, regenerated, "artifact.json", self.root)
+        self.assertIn(STALE_ARTIFACT_RECORD_MESSAGE, str(ctx.exception))
+        self.assertIn("src.rs", str(ctx.exception))
+
+    def test_c_a_commit_touching_only_the_artifact_is_green(self):
+        self._render_and_commit_artifact({"m": 1}, "add artifact (final commit)")
+        # A SECOND, legitimate re-render: only artifact.json changes again
+        # (e.g. the fix for a scenario-(b)-shaped finding is "re-run the
+        # producer", not "touch a source file").
+        committed = self._render_and_commit_artifact({"m": 1}, "re-render artifact only")
+        regenerated = self._regenerate({"m": 1})
+        assert_committed_artifact_not_stale(committed, regenerated, "artifact.json", self.root)
+
+    def test_measurement_drift_is_a_named_failure_even_with_a_fresh_render(self):
+        committed = self._render_and_commit_artifact({"m": 1}, "add artifact (final commit)")
+        regenerated = self._regenerate({"m": 2})  # a number moved, nothing else did
+        with self.assertRaises(AssertionError) as ctx:
+            assert_committed_artifact_not_stale(committed, regenerated, "artifact.json", self.root)
+        self.assertIn(STALE_ARTIFACT_RECORD_MESSAGE, str(ctx.exception))
+        self.assertIn("measurement block is not byte-identical", str(ctx.exception))
 
 
 class RefusalTests(unittest.TestCase):
@@ -883,6 +1165,24 @@ class CliEndToEndTests(unittest.TestCase):
         self.assertIn("leg exited 7", result.stderr)
 
 
+def _find_committed_frontend_artifact(repo_root: Path, tip_sha: str) -> Path | None:
+    """The ONE committed `crates/jammi-kernels/artifacts/cuda-runs/
+    *-frontend-<8-char-short-sha>-*.json` artifact for this fixture's own
+    `tip_sha` (the producer's own filename convention, e.g. `2026-09-08-
+    frontend-0a8562c4-a100-pcie.json`) -- `None` if the directory is
+    absent or zero/more-than-one file matches (an ambiguous match is a
+    repo-layout finding for the caller to report, never silently picked
+    from)."""
+    cuda_runs_dir = repo_root / "crates" / "jammi-kernels" / "artifacts" / "cuda-runs"
+    if not cuda_runs_dir.is_dir():
+        return None
+    short_sha = tip_sha[:8]
+    matches = sorted(p for p in cuda_runs_dir.glob("*-frontend-*.json") if short_sha in p.name)
+    if len(matches) != 1:
+        return None
+    return matches[0]
+
+
 class RealFixtureRegressionTests(unittest.TestCase):
     """Drives the REAL, committed pod-p421c fixture (`fixtures/
     frontend_ab_final/`) through `build_report`, against the ACTUAL current
@@ -945,6 +1245,66 @@ class RealFixtureRegressionTests(unittest.TestCase):
         self.assertEqual(report["git_sha"], report_json["tip_sha"])
         self.assertEqual(report["verdict"]["unit_verdict"], "UNRESOLVED")
         self.assertEqual(report["measurement"]["htsat_bar_driver_r"]["verdict"], "UNRESOLVED")
+
+    def test_committed_artifact_record_is_not_stale(self):
+        """Round-5 audit finding F1's own gate (see this module's own doc
+        and `frontend_ab_artifact.py`'s "Regeneration discipline" section),
+        driven against the REAL committed artifact.
+
+        EXPECTED TO FAIL (RED) at any tip where a commit landed on this
+        branch AFTER the committed artifact was last rendered -- exactly
+        `perf/421-frontend`'s own tip at the time this gate was written
+        (the artifact was last re-rendered at commit `bce32eef` against
+        `890e090e`, and later commits on this same branch touched files
+        the artifact was never regenerated against). That redness IS the
+        discipline working: the fix is "regenerate the artifact as this
+        unit's own final commit", never a change to this gate or a hand
+        edit to the artifact's own `files_changed_since_measured_tip`.
+        """
+        if not REAL_FIXTURE_DIR.is_dir():
+            self._skip_or_fail(f"{REAL_FIXTURE_DIR} not present")
+            return
+        report_path = REAL_FIXTURE_DIR / "report.json"
+        identity_path = PERF_DIR / "frontend_ab_final_identity.json"
+        raw_dir = REAL_FIXTURE_DIR / "raw"
+        serial_tail_path = REAL_FIXTURE_DIR / "serial_tail.txt"
+        report_json = json.loads(report_path.read_text())
+        identity = json.loads(identity_path.read_text())
+        repo_root = PERF_DIR.parents[2]
+
+        def _has_commit(sha: str) -> bool:
+            proc = subprocess.run(["git", "cat-file", "-e", sha], cwd=repo_root, capture_output=True, text=True)
+            return proc.returncode == 0
+
+        if not (_has_commit(report_json["base_sha"]) and _has_commit(report_json["tip_sha"])):
+            self._skip_or_fail(
+                "this checkout's history does not contain the real fixture's base_sha/tip_sha "
+                "(a shallow checkout -- fetch_depth: '0' is required for this matrix entry)"
+            )
+            return
+
+        committed_path = _find_committed_frontend_artifact(repo_root, report_json["tip_sha"])
+        if committed_path is None:
+            self._skip_or_fail(
+                "no single crates/jammi-kernels/artifacts/cuda-runs/*-frontend-*.json artifact for this "
+                f"fixture's own tip_sha ({report_json['tip_sha']})"
+            )
+            return
+
+        committed = json.loads(committed_path.read_text())
+        # Regenerated with the COMMITTED record's own recorded invocation --
+        # so `producer.invocation` is byte-identical between the two and
+        # this gate never flags a divergence that is only "this test's
+        # harness described itself differently", the same reason the
+        # committed inputs (raw legs / report.json / identity / serial-tail)
+        # are read from the SAME fixture files the committed artifact itself
+        # was rendered from.
+        regenerated = art.build_report(
+            raw_dir, report_path, report_json, identity_path, identity,
+            serial_tail_path, repo_root, committed["producer"]["invocation"],
+        )
+        artifact_rel_path = str(committed_path.relative_to(repo_root))
+        assert_committed_artifact_not_stale(committed, regenerated, artifact_rel_path, repo_root)
 
 
 if __name__ == "__main__":

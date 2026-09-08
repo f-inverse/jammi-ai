@@ -105,6 +105,32 @@ not prose. `verdict.contract_clause_applied` is prose selected by that
 computed verdict (PASS -> ACTIVATE; anything else -> the v3 contract's own
 "ships without the efficiency claim" clause), never independently typed.
 
+## Regeneration discipline: the artifact commit must be the unit's LAST commit
+
+`notes.rendered_from_tree_sha` is `git rev-parse HEAD` taken AT BUILD TIME --
+i.e. BEFORE the commit that adds or updates the committed artifact file
+itself is made (this script only WRITES the file; something else commits
+it afterwards). That ordering means the value this module records is
+ALWAYS the artifact file's own eventual commit's PARENT, never that commit
+itself, and it is a FIXPOINT: the moment any later commit lands on the
+branch, the committed `files_changed_since_measured_tip` list (and,
+transitively, `rendered_from_tree_sha`) is stale relative to a fresh
+regeneration, through no fault of anything this module computed -- it was
+correct at the instant it was rendered, and time moved on underneath it.
+
+The discipline this buys is therefore procedural, not something this
+script can enforce on itself at build time: **regenerating and committing
+this artifact must be the LAST commit of whatever unit produces it.** A
+gate exists to CATCH a violation of that discipline after the fact --
+`test_frontend_ab_artifact.py`'s `RealFixtureRegressionTests.
+test_committed_artifact_record_is_not_stale` re-derives the report at HEAD
+and asserts the committed record equals what a regeneration would produce,
+except for exactly the drift attributable to the commit(s) that last
+touched the artifact file itself (`git log -1 -- <artifact path>`) -- any
+OTHER divergence (a later commit the artifact was never re-rendered
+against) is a named failure, "artifact record stale: regenerate as the
+final commit", not a silent pass.
+
 Run: `python3 ci/scripts/perf/frontend_ab_artifact.py --raw-dir <dir>
 --report-json <path> --identity <path> --serial-tail <path>
 [--repo-root <dir>] [--out <path>]`

@@ -64,10 +64,11 @@ exploitable gap — a bug this exact file's differential corpus scan (see
 CLOSES a quote OPENED several lines earlier was misread as OPENING a new
 one, so the line's own real trailing comment was never stripped — a
 fail-open that could let arbitrary prose satisfy a guard or a cross-check)
-and two more (`runpod_lib.sh`, `test_pod_substrate.sh`: a `#` inside
-`$((10#$VAR))` or `${var#pattern}` was misread as a comment marker,
-truncating real code — a false-strip that could hide a real guard from
-this scanner entirely).
+and three more (`runpod_lib.sh` at two lines, `test_pod_substrate.sh` at a
+third: a `#` inside `$((10#$VAR))` or `${var#pattern}` was misread as a
+comment marker, truncating real code — a false-strip that could hide a
+real guard from this scanner entirely) — five pinned lines in total (see
+the five named cases below).
 
 Two lines the lexer cannot fully resolve on their own are marked
 UNDECIDABLE rather than guessed at: a `#` that is not bash's comment
@@ -172,6 +173,23 @@ REAL, cross-line-persisting bash quote characters that could otherwise
 corrupt every line of live code that follows the heredoc's closing
 terminator.
 
+Both block-extent walkers ((A)/(C)'s shared `_guard_block_lines` and (C)'s
+own `_heredoc_aware_block_extent`, via their shared `_if_taken_branch_
+extent`) window on the TAKEN branch only: an `if`/`fi` depth walk that
+additionally stops the instant it sees an `else`/`elif` token at the
+guard's OWN depth (never a nested `if`'s). A guard's condition selects
+exactly one branch to execute; a `!= "1"` refusal's `exit` sitting only in
+a dead `else` arm never actually refuses anything, and a `= "1"`
+containment guard's read sitting only in its dead `else`/`elif` arm was
+never actually contained by it — crediting either would prove a bypass is
+inert when it is provably live in a REAL run. A heredoc-body line can never
+itself be treated as this guard's own opener either: `_dry_run_true_block_
+intervals` and (A)/(C)'s own preflight-refusal detection both skip any
+line `_lex_stream` marked `in_heredoc_body` before matching the guard
+shape, so a stub script's heredoc payload that happens to contain the
+literal text of a real bash guard can never open a phantom "covered"
+interval from inside opaque data.
+
 Run: `python3 ci/scripts/perf/check_producer_provenance_gates.py`
 Self-test (RED cases for (A), (B) and (C), on throwaway fixture files, plus
 a full corpus scan cross-checking the lexer against a second, independent
@@ -266,6 +284,12 @@ _HEREDOC_OPEN_AT_RE = re.compile(r"(-?)\s*(['\"]?)([A-Za-z_][A-Za-z0-9_]*)\2")
 _WORD_INITIAL_DELIMS = (" ", "\t", ";", "|", "&", "(")
 
 _IF_FI_TOKEN_RE = re.compile(r"\b(if|fi)\b")
+# `else`/`elif` included alongside `if`/`fi`: both block-extent walkers below
+# must stop at the guard's OWN `else`/`elif` (see `_if_taken_branch_extent`)
+# so an `if [ ... ]; then <taken> else <dead> fi` guard's window covers only
+# the branch that actually executes when the guard's condition is true,
+# never the sibling branch that never runs.
+_IF_FI_ELSE_ELIF_TOKEN_RE = re.compile(r"\b(if|fi|else|elif)\b")
 _GUARD_BLOCK_MAX_SCAN = 40
 _BLOCK_MAX_SCAN = 4000
 
@@ -795,35 +819,80 @@ def _independent_lex_one_line(line: str, stack: list[list]) -> tuple[str, bool, 
     return code, undecidable, heredoc_open
 
 
-def _guard_block_lines(lines: list[str], lex: list[_LineLex], start_idx: int) -> tuple[int, int]:
-    """The inclusive `(start, end)` line-index range of the `if [...];
-    then ... fi` block whose OWN condition line is `lines[start_idx]` — a
-    `bash`-`if`/`fi` DEPTH walk (nested `if`s inside the guard both
-    increment and later decrement the same counter, so a nested
-    conditional inside the guard body does not prematurely end the scan),
-    not a fixed line count.
+def _if_taken_branch_extent(
+    lines: list[str], lex: list[_LineLex], start_idx: int, max_scan: int, heredoc_aware: bool
+) -> tuple[int, int]:
+    """Shared walker behind `_guard_block_lines` and `_heredoc_aware_block_
+    extent` (see their own docs for the two callers' distinct purposes,
+    caps, and heredoc handling): the inclusive `(start, end)` line-index
+    range of ONLY the TAKEN branch — the `then` arm — of the `if [...];
+    then ... [else ...|elif ...] fi` block whose OWN condition line is
+    `lines[start_idx]`.
 
-    Bounded at `_GUARD_BLOCK_MAX_SCAN` lines so a malformed/never-closed
-    `if` cannot make this loop unbounded — an unterminated block still
-    returns everything up to the cap, which keeps the caller's `"exit" not
-    in guard_window` check fail-closed (a guard whose `fi` never resolves
-    within the cap is treated the same as one with no `exit` at all, never
-    silently credited). `if`/`fi` tokens are counted off `_guard_text(lex
-    [i])`, never the raw line: a comment's own bare "if"/"fi" (this
-    codebase's own prose uses both constantly) cannot perturb the depth
-    walk, and an UNDECIDABLE line contributes no tokens either (the same
-    fail-closed reading every guard/satisfaction test in this module
-    uses)."""
+    A `bash`-`if`/`fi` DEPTH walk (nested `if`s inside the taken branch
+    both increment and later decrement the same counter, so a nested
+    conditional does not prematurely end the scan), but one that ALSO stops
+    the instant it sees an `else`/`elif` token at the guard's OWN depth
+    (`depth == 1` — still directly inside the opening `if`, never a nested
+    one: a nested `if`'s own `else`/`elif` sits at `depth >= 2` and is
+    correctly ignored). A guard's condition selects exactly ONE branch to
+    execute; code sitting in the sibling `else`/`elif` arm never runs when
+    the guard fires, so it must never be credited as though it did — an
+    `exit` living only in a dead `else` arm does not refuse anything (a
+    read living only in a dead `else`/`elif` arm is likewise never
+    "contained" by a `= "1"` guard that never took that branch).
+
+    Bounded at `max_scan` lines so a malformed/never-closed `if` cannot make
+    this loop unbounded — an unterminated block still returns everything up
+    to the cap, which keeps every caller's own "`exit`/read must be found
+    inside this window" check fail-closed. `if`/`fi`/`else`/`elif` tokens
+    are counted off `_guard_text(lex[i])`, never the raw line: a comment's
+    own bare "if"/"else" (this codebase's own prose uses all of these
+    constantly) cannot perturb the depth walk, and an UNDECIDABLE line
+    contributes no tokens either (the same fail-closed reading every guard/
+    satisfaction test in this module uses). When `heredoc_aware` is set, a
+    line `_lex_stream` already marked `in_heredoc_body` is opaque data —
+    never inspected for any of these tokens, exactly as `_heredoc_aware_
+    block_extent`'s own doc explains."""
     depth = 0
     end = start_idx
-    limit = min(len(lines), start_idx + _GUARD_BLOCK_MAX_SCAN)
+    limit = min(len(lines), start_idx + max_scan)
     for i in range(start_idx, limit):
-        for tok in _IF_FI_TOKEN_RE.findall(_guard_text(lex[i])):
-            depth += 1 if tok == "if" else -1
+        if heredoc_aware and lex[i].in_heredoc_body:
+            end = i
+            continue
+        stop = False
+        for tok in _IF_FI_ELSE_ELIF_TOKEN_RE.findall(_guard_text(lex[i])):
+            if tok == "if":
+                depth += 1
+            elif tok == "fi":
+                depth -= 1
+            elif depth == 1:  # "else" or "elif" at the guard's own depth
+                stop = True
+                break
+        if stop:
+            # The else/elif line itself is not part of the taken branch —
+            # exclude it (unless it shares the opener's own line, a rare
+            # single-line `if X; then Y; else Z; fi` shape this line-level
+            # walk cannot split further; the window then still includes at
+            # least the opener line).
+            end = i - 1 if i > start_idx else start_idx
+            break
         end = i
         if depth <= 0:
             break
     return start_idx, end
+
+
+def _guard_block_lines(lines: list[str], lex: list[_LineLex], start_idx: int) -> tuple[int, int]:
+    """The inclusive `(start, end)` line-index range of ONLY the TAKEN
+    (`then`) branch of the `if [...]; then ... fi` block whose OWN
+    condition line is `lines[start_idx]` — see `_if_taken_branch_extent`
+    for the full depth-walk/else-elif-stop rule this delegates to. Bounded
+    at `_GUARD_BLOCK_MAX_SCAN` lines; not heredoc-aware (callers of this
+    function inspect a guard's own condition/body, never a heredoc payload
+    at this call site)."""
+    return _if_taken_branch_extent(lines, lex, start_idx, _GUARD_BLOCK_MAX_SCAN, heredoc_aware=False)
 
 
 def check_fake_knob_inertness(path: Path) -> list[str]:
@@ -831,7 +900,12 @@ def check_fake_knob_inertness(path: Path) -> list[str]:
     knob only ever named in a module-doc comment above its real guard is
     never mistaken for an unguarded use), and every remaining token/regex
     test below runs against `_trigger_text`/`_guard_text` (see module doc,
-    "Comment handling"), never the raw line."""
+    "Comment handling"), never the raw line. `guard_idx` also excludes any
+    line `_lex_stream` marked `in_heredoc_body`, symmetrically with
+    `_dry_run_true_block_intervals`'s own opener skip: a heredoc payload
+    that happens to contain the literal text of a real refusal guard
+    (`<PREFIX>_DRY_RUN`, `!=`, `"1"`) is opaque data, not this script's own
+    top-level guard code, and must never be credited as one."""
     text = path.read_text(encoding="utf-8", errors="replace")
     lines = text.splitlines()
     lex = _lex_stream(lines)
@@ -846,7 +920,10 @@ def check_fake_knob_inertness(path: Path) -> list[str]:
         guard_idx = [
             i
             for i in code_use_idx
-            if DRY_RUN_VAR_RE.search(guard[i]) and "!=" in guard[i] and '"1"' in guard[i]
+            if not lex[i].in_heredoc_body
+            and DRY_RUN_VAR_RE.search(guard[i])
+            and "!=" in guard[i]
+            and '"1"' in guard[i]
         ]
         if not guard_idx:
             findings.append(
@@ -921,8 +998,10 @@ def _is_self_default_assignment(line: str, var: str) -> bool:
 
 
 def _heredoc_aware_block_extent(lines: list[str], lex: list[_LineLex], start_idx: int) -> tuple[int, int]:
-    """The `(start, end)` inclusive line-index range of the bash `if ...
-    fi` block whose OPENING line is `lines[start_idx]`, treating every
+    """The `(start, end)` inclusive line-index range of ONLY the TAKEN
+    (`then`) branch of the bash `if ... fi` block whose OPENING line is
+    `lines[start_idx]` — see `_if_taken_branch_extent` for the full
+    depth-walk/else-elif-stop rule this delegates to — treating every
     heredoc body between a `<<[-]TERM` opener and its bare-`TERM`
     terminator line as OPAQUE DATA — see this module's own doc for why a
     depth counter that does not skip heredoc bodies runs past its real
@@ -937,12 +1016,16 @@ def _heredoc_aware_block_extent(lines: list[str], lex: list[_LineLex], start_idx
     (sharing `_lex_stream`'s own heredoc regex constant) is exactly the
     kind of duplication that hides a bug (the false heredoc opened by `_HEREDOC_OPEN_RE`
     matching inside an already-closed quote, or inside a `<<<` here-string,
-    on a raw-line re-scan that ignored the lexer's own position).
+    on a raw-line re-scan that ignored the lexer's own position). Note that
+    `start_idx` itself must never be a heredoc-body line — the caller
+    (`_dry_run_true_block_intervals`) is responsible for skipping those when
+    it looks for an opener in the first place, so this walker is never
+    asked to open a block from inside a heredoc payload's own text.
 
-    `if`/`fi` tokens are recognized off `_guard_text(lex[i])`, never the
-    raw line — a comment's own bare "if" (this codebase's own prose uses
-    the word constantly) cannot perturb the depth walk, and an UNDECIDABLE
-    line contributes nothing either.
+    `if`/`fi`/`else`/`elif` tokens are recognized off `_guard_text(lex[i])`,
+    never the raw line — a comment's own bare "if" (this codebase's own
+    prose uses the word constantly) cannot perturb the depth walk, and an
+    UNDECIDABLE line contributes nothing either.
 
     A DIFFERENT residual gap, disclosed rather than papered over with a
     refusal this scanner cannot actually back up: every regex in this
@@ -965,21 +1048,7 @@ def _heredoc_aware_block_extent(lines: list[str], lex: list[_LineLex], start_idx
     be blocked by a check that cannot actually evaluate whether THEIR
     specific use is safe).
     """
-    depth = 0
-    end = start_idx
-    limit = min(len(lines), start_idx + _BLOCK_MAX_SCAN)
-    for i in range(start_idx, limit):
-        end = i
-        if lex[i].in_heredoc_body:
-            # Opaque heredoc-body data, per the lexer's own already-computed
-            # span -- never inspected for `if`/`fi` tokens of its own.
-            continue
-        code = _guard_text(lex[i])
-        for tok in _IF_FI_TOKEN_RE.findall(code):
-            depth += 1 if tok == "if" else -1
-        if depth <= 0:
-            break
-    return start_idx, end
+    return _if_taken_branch_extent(lines, lex, start_idx, _BLOCK_MAX_SCAN, heredoc_aware=True)
 
 
 def _dry_run_true_block_intervals(lines: list[str], lex: list[_LineLex], governing: str) -> list[tuple[int, int]]:
@@ -991,10 +1060,23 @@ def _dry_run_true_block_intervals(lines: list[str], lex: list[_LineLex], governi
     that it is the line's only clause). Matched against `_guard_text`, so a
     trailing comment that merely LOOKS like this guard shape (or an
     UNDECIDABLE line) can never open a phantom "covered" interval that
-    hides a genuinely unguarded read site elsewhere in the file."""
+    hides a genuinely unguarded read site elsewhere in the file. A
+    heredoc-body line (`lex[i].in_heredoc_body`) is skipped BEFORE the
+    opener regex even runs: a stub script's own heredoc payload can
+    legitimately contain the literal text of a real bash `if [ "$X" = "1"
+    ]; then` (a producer that writes ITS OWN dry-run guard into a generated
+    stub script), and that payload text is opaque data from this file's own
+    top-level perspective, not a real, top-level guard opening a real
+    interval — `_heredoc_aware_block_extent` already treats heredoc bodies
+    as opaque for its OWN `if`/`fi` counting, so the opener search here must
+    apply that same rule symmetrically, or a phantom interval opened from
+    inside heredoc text can swallow a genuinely unguarded read that follows
+    the heredoc's close."""
     guard_re = re.compile(r'\bif\b.*\[\s*"\$' + re.escape(governing) + r'"\s*=\s*"1"\s*\]')
     intervals: list[tuple[int, int]] = []
     for i, _line in enumerate(lines):
+        if lex[i].in_heredoc_body:
+            continue
         if guard_re.search(_guard_text(lex[i])):
             intervals.append(_heredoc_aware_block_extent(lines, lex, i))
     return intervals
@@ -1013,7 +1095,11 @@ def check_dry_run_knob_containment(path: Path) -> list[str]:
     `_trigger_text` (the widest reading — a real use this lexer could not
     fully parse is never dropped); guard-shape and self-default-exemption
     checks run against `_guard_text` (the narrowest reading — see module
-    doc, "Comment handling")."""
+    doc, "Comment handling"). `guard_idx`'s preflight-refusal detection also
+    excludes any line `_lex_stream` marked `in_heredoc_body`, symmetrically
+    with `_dry_run_true_block_intervals`'s own opener skip — a heredoc
+    payload's own text can never forge this script's own top-level
+    preflight-refusal guard."""
     text = path.read_text(encoding="utf-8", errors="replace")
     lines = text.splitlines()
     lex = _lex_stream(lines)
@@ -1035,7 +1121,10 @@ def check_dry_run_knob_containment(path: Path) -> list[str]:
         guard_idx = [
             i
             for i in code_use_idx
-            if governing_re.search(guard[i]) and "!=" in guard[i] and '"1"' in guard[i]
+            if not lex[i].in_heredoc_body
+            and governing_re.search(guard[i])
+            and "!=" in guard[i]
+            and '"1"' in guard[i]
         ]
         if guard_idx:
             first_guard = min(guard_idx)
@@ -1606,6 +1695,150 @@ def self_test() -> int:
             None,
         )
 
+        # (C) RED — F1, else-arm read: `FOO_DRY_RUN_EVIL`'s only read site
+        # sits in the `else` arm of `if [ "$FOO_DRY_RUN" = "1" ]`, which
+        # never runs while DRY_RUN=1 (the only time this containment guard
+        # is satisfied at all) — a knob read exclusively in the sibling
+        # dead arm must never be credited as contained.
+        commit_and_check(
+            "ci/scripts/perf/bad_dry_run_knob_read_in_else_arm.sh",
+            (
+                '#!/usr/bin/env bash\n'
+                'FOO_DRY_RUN="${FOO_DRY_RUN:-0}"\n'
+                'if [ "$FOO_DRY_RUN" = "1" ]; then\n'
+                '  echo dry\n'
+                'else\n'
+                '  rm -rf "$FOO_DRY_RUN_EVIL"\n'
+                'fi\n'
+            ),
+            check_dry_run_knob_containment,
+            "outside any",
+        )
+
+        # (C) RED — F1, elif-arm read: same class, the dead arm is an
+        # `elif` rather than a bare `else`.
+        commit_and_check(
+            "ci/scripts/perf/bad_dry_run_knob_read_in_elif_arm.sh",
+            (
+                '#!/usr/bin/env bash\n'
+                'FOO_DRY_RUN="${FOO_DRY_RUN:-0}"\n'
+                'if [ "$FOO_DRY_RUN" = "1" ]; then\n'
+                '  echo dry\n'
+                'elif [ "$OTHER_TOGGLE" = "1" ]; then\n'
+                '  rm -rf "$FOO_DRY_RUN_EVIL2"\n'
+                'fi\n'
+            ),
+            check_dry_run_knob_containment,
+            "outside any",
+        )
+
+        # (C) GREEN control — F1 positive control: the same else-arm shape,
+        # but the knob is read ONLY inside the taken (`then`) branch — an
+        # else arm being present at all must not perturb a genuinely
+        # contained read.
+        commit_and_check(
+            "ci/scripts/perf/good_dry_run_knob_read_in_then_arm_with_else_present.sh",
+            (
+                '#!/usr/bin/env bash\n'
+                'FOO_DRY_RUN="${FOO_DRY_RUN:-0}"\n'
+                'if [ "$FOO_DRY_RUN" = "1" ]; then\n'
+                '  echo "${FOO_DRY_RUN_BAR:-}"\n'
+                'else\n'
+                '  echo no-op\n'
+                'fi\n'
+            ),
+            check_dry_run_knob_containment,
+            None,
+        )
+
+        # (A) RED — F1, dead exit in a dead else arm: `X_FAKE_THING`'s
+        # refusal guard's `then` arm only `echo`s; the ONLY `exit` in the
+        # block lives inside a NESTED `if false; then exit 9; fi` sitting in
+        # the guard's OWN `else` arm — an arm that never runs when the
+        # refusal condition (`X_DRY_RUN != "1"`) is true. That dead `exit`
+        # must never be credited as a real refusal.
+        commit_and_check(
+            "ci/scripts/perf/bad_fake_knob_exit_only_in_dead_else_arm.sh",
+            (
+                '#!/usr/bin/env bash\n'
+                'if [ -n "${X_FAKE_THING:-}" ] && [ "$X_DRY_RUN" != "1" ]; then\n'
+                '  echo warn\n'
+                'else\n'
+                '  echo not-exiting\n'
+                '  if false; then\n'
+                '    exit 9\n'
+                '  fi\n'
+                'fi\n'
+            ),
+            check_fake_knob_inertness,
+            "does not `exit`",
+        )
+
+        # (A) GREEN control — F1 positive control: the same refusal-guard
+        # shape, `exit` correctly placed in the TAKEN (`then`) arm, with an
+        # unrelated `else` arm present — the else arm's mere presence must
+        # not stop the block-extent walk from finding the real, taken-arm
+        # `exit`.
+        commit_and_check(
+            "ci/scripts/perf/good_fake_knob_exit_in_taken_arm_with_else_present.sh",
+            (
+                '#!/usr/bin/env bash\n'
+                'if [ -n "${X_FAKE_THING:-}" ] && [ "$X_DRY_RUN" != "1" ]; then\n'
+                '  echo "::error::refusing" >&2\n'
+                '  exit 2\n'
+                'else\n'
+                '  echo "not taken: a real run always refuses above"\n'
+                'fi\n'
+            ),
+            check_fake_knob_inertness,
+            None,
+        )
+
+        # (C) RED — F2, phantom opener inside a heredoc body: the ONLY text
+        # matching `if [ "$WUP_DRY_RUN" = "1" ]` sits inside a heredoc
+        # payload (a stub script this producer writes out, whose own
+        # generated content happens to contain that literal guard shape).
+        # `WUP_DRY_RUN_EVIL` is read at TOP LEVEL, after the heredoc closes,
+        # with no real guard anywhere in the file — the opener match must
+        # never fire on heredoc-body text, or this read is wrongly credited
+        # as contained by a phantom interval opened from inside opaque data.
+        commit_and_check(
+            "ci/scripts/perf/bad_dry_run_knob_phantom_opener_in_heredoc.sh",
+            (
+                '#!/usr/bin/env bash\n'
+                'WUP_DRY_RUN="${WUP_DRY_RUN:-0}"\n'
+                'cat > /tmp/stub.sh <<'"'"'EOS'"'"'\n'
+                'echo start\n'
+                'if [ "$WUP_DRY_RUN" = "1" ]; then\n'
+                '  echo fake\n'
+                'fi\n'
+                'EOS\n'
+                'curl "$WUP_DRY_RUN_EVIL"\n'
+            ),
+            check_dry_run_knob_containment,
+            "outside any",
+        )
+
+        # (C) GREEN control — F2 positive control: a REAL, top-level opener
+        # appearing AFTER a heredoc closes must still open a real interval
+        # (proves the fix is the heredoc-body skip specifically, not a
+        # blanket "ignore every opener" regression).
+        commit_and_check(
+            "ci/scripts/perf/good_dry_run_knob_real_opener_after_heredoc.sh",
+            (
+                '#!/usr/bin/env bash\n'
+                'WUP_DRY_RUN="${WUP_DRY_RUN:-0}"\n'
+                'cat > /tmp/stub.sh <<'"'"'EOS'"'"'\n'
+                'echo just data, no guard shape here\n'
+                'EOS\n'
+                'if [ "$WUP_DRY_RUN" = "1" ]; then\n'
+                '  echo "${WUP_DRY_RUN_EVIL:-}"\n'
+                'fi\n'
+            ),
+            check_dry_run_knob_containment,
+            None,
+        )
+
     # Non-vacuousness control (the actual bug this round fixes): a wrong
     # `REPO_ROOT` (previously `parents[2]`, resolving to `<repo>/ci` instead
     # of `<repo>`) makes `git ls-files ci/scripts/` run with the WRONG `cwd`
@@ -1646,17 +1879,22 @@ def self_test() -> int:
     print(
         "check-producer-provenance-gates self-test: OK — (A) FAKE-knob inertness "
         "(no-guard / use-before-guard / guard-without-exit / trailing-comment-forgery, plain "
-        "and with an added echo \"ok\", all RED; a real guard, a comment-only mention, both "
-        "GREEN), (B) producer parity (a jammi-bench-binary producer missing provenance/"
-        "build_sha, including via a trailing-comment forgery plain and with an added echo "
-        "\"ok\", is RED; one carrying both, or one that never names a binary path at all, is "
-        "GREEN), and (C) *_DRY_RUN_* knob containment (unguarded, a knob past a "
-        "heredoc-embedded unmatched-if block's real `fi`, and a trailing-comment forgery plain "
-        "and with an added echo \"ok\", all RED; heredoc containment, preflight refusal, and "
-        "comment/self-default-only, all GREEN) all bite on throwaway fixtures; the real tree is "
-        "clean; and the lexer agrees with an independently-written second implementation on "
-        "every tracked ci/scripts/ line, including the five real lines a differential audit "
-        "scan found the pre-existing hand-rolled comment stripper misreading."
+        "and with an added echo \"ok\", plus an `exit` living only in a dead `else` arm, all "
+        "RED; a real guard, a comment-only mention, and a real taken-arm `exit` with an "
+        "unrelated `else` arm present, all GREEN), (B) producer parity (a jammi-bench-binary "
+        "producer missing provenance/build_sha, including via a trailing-comment forgery plain "
+        "and with an added echo \"ok\", is RED; one carrying both, or one that never names a "
+        "binary path at all, is GREEN), and (C) *_DRY_RUN_* knob containment (unguarded, a "
+        "knob past a heredoc-embedded unmatched-if block's real `fi`, a trailing-comment "
+        "forgery plain and with an added echo \"ok\", a read confined to a dead `else`/`elif` "
+        "arm, and a knob covered only by a phantom guard opener whose text lives inside a "
+        "heredoc payload, all RED; heredoc containment, preflight refusal, "
+        "comment/self-default-only, a taken-arm read with an unrelated `else` arm present, and "
+        "a real opener appearing after a heredoc closes, all GREEN) all bite on throwaway "
+        "fixtures; the real tree is clean; and the lexer agrees with an independently-written "
+        "second implementation on every tracked ci/scripts/ line, including the five real lines "
+        "a differential audit scan found the pre-existing hand-rolled comment stripper "
+        "misreading."
     )
     return 0
 

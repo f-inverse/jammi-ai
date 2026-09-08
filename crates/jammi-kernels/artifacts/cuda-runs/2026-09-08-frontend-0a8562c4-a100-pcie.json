@@ -16,7 +16,7 @@
   "cpu": "AMD EPYC 7763 64-Core Processor",
   "driver_commit": "0a8562c4ff6205a69150580ff70a8cd098a9ebba",
   "run_sha256": "f38ce29bee7e583d75b89029f9c28878d537fd7eeb6c586a455b0cd2f47cc4b0",
-  "rendered_from_tree_sha": "890e090e6a27b153a87eb528ef6f35800bdf611f",
+  "rendered_from_tree_sha": "10e667202aee82fc7a59fec78ae56e765dbcdc18",
   "input_sha256": {
    "report_json": "1995313b67e9f0e228f2bece7755b784b646be2fd68317b8117cbac98c48fa90",
    "identity": "07486884c5b370b4ad1c28e5a66defaf75c38ba3e3d1c6efdad3abb502357f9c",
@@ -37,7 +37,7 @@
   "measured_tip_precedes_merge_tip": {
    "kind": "measured-tip-precedes-merge-tip",
    "measured_tip": "0a8562c4ff6205a69150580ff70a8cd098a9ebba",
-   "rendered_from_tree_sha": "890e090e6a27b153a87eb528ef6f35800bdf611f",
+   "rendered_from_tree_sha": "10e667202aee82fc7a59fec78ae56e765dbcdc18",
    "files_changed_since_measured_tip": [
     ".github/workflows/ci.yml",
     "CHANGELOG.md",
@@ -68,11 +68,18 @@
     "ci/scripts/perf/fixtures/frontend_ab_final/raw/htsat__tip__r3.exit",
     "ci/scripts/perf/fixtures/frontend_ab_final/raw/htsat__tip__r3.json",
     "ci/scripts/perf/fixtures/frontend_ab_final/report.json",
+    "ci/scripts/perf/fixtures/frontend_ab_final/serial_tail.txt",
+    "ci/scripts/perf/fixtures/frontend_ab_final/trim_legs.py",
     "ci/scripts/perf/frontend_ab_artifact.py",
     "ci/scripts/perf/frontend_ab_final_identity.json",
     "ci/scripts/perf/test_frontend_ab_artifact.py",
+    "crates/jammi-ai/src/fine_tune/trainer.rs",
+    "crates/jammi-ai/src/inference/adapter/distribution.rs",
+    "crates/jammi-ai/src/inference/adapter/embedding.rs",
     "crates/jammi-ai/src/inference/adapter/mod.rs",
     "crates/jammi-ai/src/inference/audio_preprocess.rs",
+    "crates/jammi-ai/src/inference/schema.rs",
+    "crates/jammi-ai/src/model/backend/candle.rs",
     "crates/jammi-ai/src/model/backend/http.rs",
     "crates/jammi-ai/src/session.rs",
     "crates/jammi-ai/tests/it/backends.rs",
@@ -81,7 +88,7 @@
     "crates/jammi-kernels/artifacts/cuda-runs/2026-09-08-frontend-0a8562c4-a100-pcie.json",
     "docs/maintainer/fine-tune-performance-guide.md"
    ],
-   "diffstat": ".github/workflows/ci.yml                           |  22 +\n CHANGELOG.md                                       |  34 +-\n ci/scripts/check_perf_claims.py                    |   4 +-\n .../perf/fixtures/frontend_ab_final/PROVENANCE.md  |  47 ++\n .../raw/clip-vision__base__r1.exit                 |   1 +\n .../raw/clip-vision__base__r1.json                 |  15 +\n .../raw/clip-vision__base__r2.exit                 |   1 +\n .../raw/clip-vision__base__r2.json                 |  15 +\n .../raw/clip-vision__base__r3.exit                 |   1 +\n .../raw/clip-vision__base__r3.json                 |  15 +\n .../raw/clip-vision__tip__r1.exit                  |   1 +\n .../raw/clip-vision__tip__r1.json                  |  16 +\n .../raw/clip-vision__tip__r2.exit                  |   1 +\n .../raw/clip-vision__tip__r2.json                  |  16 +\n .../raw/clip-vision__tip__r3.exit                  |   1 +\n .../raw/clip-vision__tip__r3.json                  |  16 +\n .../frontend_ab_final/raw/htsat__base__r1.exit     |   1 +\n .../frontend_ab_final/raw/htsat__base__r1.json     |  15 +\n .../frontend_ab_final/raw/htsat__base__r2.exit     |   1 +\n .../frontend_ab_final/raw/htsat__base__r2.json     |  15 +\n .../frontend_ab_final/raw/htsat__base__r3.exit     |   1 +\n .../frontend_ab_final/raw/htsat__base__r3.json     |  15 +\n .../frontend_ab_final/raw/htsat__tip__r1.exit      |   1 +\n .../frontend_ab_final/raw/htsat__tip__r1.json      |  16 +\n .../frontend_ab_final/raw/htsat__tip__r2.exit      |   1 +\n .../frontend_ab_final/raw/htsat__tip__r2.json      |  16 +\n .../frontend_ab_final/raw/htsat__tip__r3.exit      |   1 +\n .../frontend_ab_final/raw/htsat__tip__r3.json      |  16 +\n .../perf/fixtures/frontend_ab_final/report.json    | 128 +++++\n ci/scripts/perf/frontend_ab_artifact.py            | 619 +++++++++++++++++++++\n ci/scripts/perf/frontend_ab_final_identity.json    |  14 +\n ci/scripts/perf/test_frontend_ab_artifact.py       | 608 ++++++++++++++++++++\n crates/jammi-ai/src/inference/adapter/mod.rs       | 394 ++++++++++++-\n crates/jammi-ai/src/inference/audio_preprocess.rs  |  88 ++-\n crates/jammi-ai/src/model/backend/http.rs          |  21 +-\n crates/jammi-ai/src/session.rs                     |  12 +-\n crates/jammi-ai/tests/it/backends.rs               |  21 +-\n crates/jammi-ai/tests/it/media_front_end.rs        |  40 +-\n crates/jammi-ai/tests/it/tower_adapters.rs         | 192 +++++++\n .../2026-09-08-frontend-0a8562c4-a100-pcie.json    | 189 +++++++\n docs/maintainer/fine-tune-performance-guide.md     |  89 ++-\n 41 files changed, 2658 insertions(+), 62 deletions(-)",
+   "diffstat": ".github/workflows/ci.yml                           |   48 +\n CHANGELOG.md                                       |   34 +-\n ci/scripts/check_perf_claims.py                    |    4 +-\n .../perf/fixtures/frontend_ab_final/PROVENANCE.md  |  119 ++\n .../raw/clip-vision__base__r1.exit                 |    1 +\n .../raw/clip-vision__base__r1.json                 |   17 +\n .../raw/clip-vision__base__r2.exit                 |    1 +\n .../raw/clip-vision__base__r2.json                 |   17 +\n .../raw/clip-vision__base__r3.exit                 |    1 +\n .../raw/clip-vision__base__r3.json                 |   17 +\n .../raw/clip-vision__tip__r1.exit                  |    1 +\n .../raw/clip-vision__tip__r1.json                  |   18 +\n .../raw/clip-vision__tip__r2.exit                  |    1 +\n .../raw/clip-vision__tip__r2.json                  |   18 +\n .../raw/clip-vision__tip__r3.exit                  |    1 +\n .../raw/clip-vision__tip__r3.json                  |   18 +\n .../frontend_ab_final/raw/htsat__base__r1.exit     |    1 +\n .../frontend_ab_final/raw/htsat__base__r1.json     |   17 +\n .../frontend_ab_final/raw/htsat__base__r2.exit     |    1 +\n .../frontend_ab_final/raw/htsat__base__r2.json     |   17 +\n .../frontend_ab_final/raw/htsat__base__r3.exit     |    1 +\n .../frontend_ab_final/raw/htsat__base__r3.json     |   17 +\n .../frontend_ab_final/raw/htsat__tip__r1.exit      |    1 +\n .../frontend_ab_final/raw/htsat__tip__r1.json      |   18 +\n .../frontend_ab_final/raw/htsat__tip__r2.exit      |    1 +\n .../frontend_ab_final/raw/htsat__tip__r2.json      |   18 +\n .../frontend_ab_final/raw/htsat__tip__r3.exit      |    1 +\n .../frontend_ab_final/raw/htsat__tip__r3.json      |   18 +\n .../perf/fixtures/frontend_ab_final/report.json    |  128 ++\n .../fixtures/frontend_ab_final/serial_tail.txt     |    5 +\n .../perf/fixtures/frontend_ab_final/trim_legs.py   |  167 +++\n ci/scripts/perf/frontend_ab_artifact.py            |  842 +++++++++++++\n ci/scripts/perf/frontend_ab_final_identity.json    |   14 +\n ci/scripts/perf/test_frontend_ab_artifact.py       | 1311 ++++++++++++++++++++\n crates/jammi-ai/src/fine_tune/trainer.rs           |    8 +-\n .../jammi-ai/src/inference/adapter/distribution.rs |   34 +-\n crates/jammi-ai/src/inference/adapter/embedding.rs |  138 ++-\n crates/jammi-ai/src/inference/adapter/mod.rs       |  581 ++++++++-\n crates/jammi-ai/src/inference/audio_preprocess.rs  |  144 ++-\n crates/jammi-ai/src/inference/schema.rs            |   35 +-\n crates/jammi-ai/src/model/backend/candle.rs        |   53 +-\n crates/jammi-ai/src/model/backend/http.rs          |   51 +-\n crates/jammi-ai/src/session.rs                     |  182 ++-\n crates/jammi-ai/tests/it/backends.rs               |  189 ++-\n crates/jammi-ai/tests/it/media_front_end.rs        |  130 +-\n crates/jammi-ai/tests/it/tower_adapters.rs         |  194 +++\n .../2026-09-08-frontend-0a8562c4-a100-pcie.json    |  223 ++++\n docs/maintainer/fine-tune-performance-guide.md     |   95 +-\n 48 files changed, 4844 insertions(+), 107 deletions(-)",
    "commentary": "crates/jammi-ai/src/inference/audio_preprocess.rs changed in two places on the timed path: resample_linear's output-length arithmetic was extracted into a shared resampled_len() helper (identical arithmetic; the branch's own byte-identity oracles at pool sizes 1/5/7/24 hold), and a sequential O(n) zero-sample refusal pass was added before the parallel per-clip stage; the par_chunks_mut stage, decode_*_results, and preprocess_image_batch* are untouched. Every other file in this deviation's own files_changed_since_measured_tip list is off the front-end path (BackendOutput row accessors, session query paths, HttpBackend, tests, CHANGELOG)."
   },
   "recorded_deviations": [

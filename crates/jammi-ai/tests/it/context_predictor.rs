@@ -1807,6 +1807,156 @@ async fn context_predictor_reload_corrupted_pointer_refuses_as_typed_model_error
     );
 }
 
+/// F3 (review pass on esc-089): a corrupted `config_json` — absent
+/// entirely, or present but not even valid JSON — must refuse with the
+/// SAME typed `JammiError::Model` variant every other corrupted-
+/// catalog-record refusal on this surface raises, naming the field, never
+/// this surface's own `JammiError::Inference` (`Code::Internal` at the wire
+/// boundary — wrong for a client-visible precondition failure). "Absent"
+/// and "unparseable" are DISTINCT messages, never collapsed: a
+/// syntactically-broken `config_json` string is not "no config recorded".
+/// RED without the fix: pre-fix, both cases raised
+/// `JammiError::Inference("... has no parseable config_json")`, an
+/// `Internal` at the wire boundary.
+#[tokio::test(flavor = "multi_thread")]
+async fn context_predictor_reload_missing_config_json_refuses_as_typed_model_error() {
+    use jammi_db::catalog::model_repo::RegisterModelParams;
+
+    let rows = synthetic_meta_dataset(12, 16, 4251);
+    let (session, dir) = session_with_meta_dataset(&rows).await;
+
+    let spec = spec(
+        ContextArchitecture::AttnCnp,
+        PredictiveHead::Gaussian {
+            objective: GaussianObjective::Crps,
+        },
+    );
+    let model_id = train(&session, &spec).await;
+
+    let record = session
+        .catalog()
+        .get_model(&model_id)
+        .await
+        .unwrap()
+        .unwrap();
+    // Re-register with `config_json: None` — an absent config, distinct
+    // from a present-but-unparseable one (the sibling test below).
+    session
+        .catalog()
+        .register_model(RegisterModelParams {
+            model_id: &model_id,
+            version: 1,
+            model_type: "context-predictor",
+            backend: "candle",
+            task: ModelTask::Regression,
+            base_model_id: record.base_model_id.as_deref(),
+            artifact_path: record.artifact_path.as_deref(),
+            config_json: None,
+        })
+        .await
+        .unwrap();
+
+    let cold = Arc::new(
+        InferenceSession::new(common::test_config(dir.path()))
+            .await
+            .unwrap(),
+    );
+    cold.register_query_functions();
+
+    let err = match cold
+        .load_context_predictor(&model_id, "fns", ContextServeOptions::default())
+        .await
+    {
+        Ok(_) => panic!(
+            "reloading a context predictor with no config_json recorded must refuse, never \
+             silently serve a predictor"
+        ),
+        Err(e) => e,
+    };
+    assert!(
+        matches!(err, jammi_db::error::JammiError::Model { .. }),
+        "an absent config_json must be the SAME typed JammiError::Model variant the sibling \
+         reload refusals raise, got: {err:?}"
+    );
+    let message = err.to_string();
+    assert!(
+        message.contains("config_json"),
+        "refusal must name the missing field, got: {message}"
+    );
+    assert!(
+        !message.contains("unparseable"),
+        "an ABSENT config_json is not the same claim as an unparseable one, got: {message}"
+    );
+}
+
+/// The unparseable-JSON sibling of the test above: `config_json` IS
+/// recorded, but its bytes are not valid JSON at all — distinct from
+/// "absent", and the refusal must say so (never collapse the two).
+#[tokio::test(flavor = "multi_thread")]
+async fn context_predictor_reload_unparseable_config_json_refuses_as_typed_model_error() {
+    use jammi_db::catalog::model_repo::RegisterModelParams;
+
+    let rows = synthetic_meta_dataset(12, 16, 4252);
+    let (session, dir) = session_with_meta_dataset(&rows).await;
+
+    let spec = spec(
+        ContextArchitecture::AttnCnp,
+        PredictiveHead::Gaussian {
+            objective: GaussianObjective::Crps,
+        },
+    );
+    let model_id = train(&session, &spec).await;
+
+    let record = session
+        .catalog()
+        .get_model(&model_id)
+        .await
+        .unwrap()
+        .unwrap();
+    session
+        .catalog()
+        .register_model(RegisterModelParams {
+            model_id: &model_id,
+            version: 1,
+            model_type: "context-predictor",
+            backend: "candle",
+            task: ModelTask::Regression,
+            base_model_id: record.base_model_id.as_deref(),
+            artifact_path: record.artifact_path.as_deref(),
+            config_json: Some("{ not valid json"),
+        })
+        .await
+        .unwrap();
+
+    let cold = Arc::new(
+        InferenceSession::new(common::test_config(dir.path()))
+            .await
+            .unwrap(),
+    );
+    cold.register_query_functions();
+
+    let err = match cold
+        .load_context_predictor(&model_id, "fns", ContextServeOptions::default())
+        .await
+    {
+        Ok(_) => panic!(
+            "reloading a context predictor whose config_json is not valid JSON must refuse, \
+             never silently serve a predictor"
+        ),
+        Err(e) => e,
+    };
+    assert!(
+        matches!(err, jammi_db::error::JammiError::Model { .. }),
+        "an unparseable config_json must be the SAME typed JammiError::Model variant the \
+         sibling reload refusals raise, got: {err:?}"
+    );
+    let message = err.to_string();
+    assert!(
+        message.contains("unparseable"),
+        "refusal must say the config_json is unparseable (distinct from absent), got: {message}"
+    );
+}
+
 /// The manifest itself is absent (never published / a misdirected pointer) —
 /// distinct from the sibling test above, where a manifest WAS read and it
 /// named a now-missing key. This must NOT be described as "failed integrity

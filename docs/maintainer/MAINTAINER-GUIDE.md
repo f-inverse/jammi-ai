@@ -2987,16 +2987,30 @@ fine-tuned reload arm, matches `StorageError::NotPublished`
 (`crates/jammi-ai/src/model/resolver.rs:248`) into `JammiError::Model`, and
 `load_context_predictor` (`crates/jammi-ai/src/pipeline/context_predictor.rs:1110`) matches
 the identical pair — `StorageError::NotPublished`
-(`crates/jammi-ai/src/pipeline/context_predictor.rs:1276`) and `StorageError::Layout`
-(`crates/jammi-ai/src/pipeline/context_predictor.rs:1286`) — into `JammiError::Model` as
+(`crates/jammi-ai/src/pipeline/context_predictor.rs:1292`) and `StorageError::Layout`
+(`crates/jammi-ai/src/pipeline/context_predictor.rs:1302`) — into `JammiError::Model` as
 well, never its own `JammiError::Inference`. A catalog record that never recorded an
 `artifact_path` at all is a separate, earlier refusal on each surface that never reaches
 `fetch_artifact` — the resolver's arm also raises `JammiError::Model`
 (`crates/jammi-ai/src/model/resolver.rs:263`), and so does the predictor's own
-`JammiError::Model` (`crates/jammi-ai/src/pipeline/context_predictor.rs:1239`). Any OTHER
+`JammiError::Model` (`crates/jammi-ai/src/pipeline/context_predictor.rs:1255`). Any OTHER
 storage fault propagates unchanged past both surfaces' own catch-all —
 `Err(e) => return Err(e)` (`crates/jammi-ai/src/model/resolver.rs:258`) and the identical
-`Err(e) => return Err(e)` (`crates/jammi-ai/src/pipeline/context_predictor.rs:1295`).
+`Err(e) => return Err(e)` (`crates/jammi-ai/src/pipeline/context_predictor.rs:1311`).
+
+Every corrupted-catalog-record refusal EARLIER in this reload path — before `fetch_artifact` is
+even reached — is the SAME `JammiError::Model` variant too (review pass on esc-089, F3): an
+absent `config_json`
+(`crates/jammi-ai/src/pipeline/context_predictor.rs:1133`), an unparseable `config_json`
+(`crates/jammi-ai/src/pipeline/context_predictor.rs:1138`, a DISTINCT message from "absent",
+never collapsed), and a parseable-but-incomplete config (missing `head`/`architecture`/
+`feature_dim`/`context_k`/`hidden_dim`/`num_heads`/`num_layers`/`head_width`/`value_column`/
+`target_scaler`) each name the model id and the specific field. The `varmap.load` arm — a
+manifest-verified bundle missing `model.safetensors`
+(`crates/jammi-ai/src/pipeline/context_predictor.rs:1320`) — matches `CandleBackend::load`'s
+peer refusal for a fine-tuned model's weights file, `"Failed to load safetensors: {e}"`
+(`crates/jammi-ai/src/model/backend/candle.rs:2747`), instead of its own
+`JammiError::Inference`.
 
 At the gRPC edge, `map_engine_error` (`crates/jammi-server/src/grpc/wire.rs:109`) maps
 `JammiError::Model` (`crates/jammi-server/src/grpc/wire.rs:115`) to `Code::InvalidArgument`,

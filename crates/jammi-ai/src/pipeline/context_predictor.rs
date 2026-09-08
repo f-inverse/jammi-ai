@@ -1116,31 +1116,48 @@ impl InferenceSession {
         let record = self.catalog().get_model(model_id).await?.ok_or_else(|| {
             JammiError::Catalog(format!("context predictor '{model_id}' not found"))
         })?;
-        let config: serde_json::Value = record
-            .config_json
-            .as_deref()
-            .and_then(|s| serde_json::from_str(s).ok())
-            .ok_or_else(|| {
-                JammiError::Inference(format!(
-                    "context predictor '{model_id}' has no parseable config_json"
-                ))
-            })?;
+        // A corrupted catalog record — absent `config_json`, or `config_json`
+        // present but unparseable, or present-and-parseable JSON missing a
+        // required field — is a client-visible precondition failure, never
+        // this surface's own `JammiError::Inference` (which the wire
+        // boundary maps to `Code::Internal`). Every refusal below is a typed
+        // `JammiError::Model` naming this model id and the specific field,
+        // mirroring `ModelResolver`'s fine-tuned reload arm. "Absent" and
+        // "unparseable" are DISTINCT messages — collapsing them would call a
+        // syntactically-broken `config_json` string "absent", which is a
+        // claim the absent case carries no evidence for (and vice versa).
+        let config: serde_json::Value = match record.config_json.as_deref() {
+            None => {
+                return Err(JammiError::Model {
+                    model_id: model_id.to_string(),
+                    message: "no config_json is recorded for this context predictor".into(),
+                });
+            }
+            Some(raw) => serde_json::from_str(raw).map_err(|e| JammiError::Model {
+                model_id: model_id.to_string(),
+                message: format!("config_json unparseable: {e}"),
+            })?,
+        };
 
         let form = PredictiveHead::form_from_config(config.get("head").ok_or_else(|| {
-            JammiError::Inference(format!(
-                "context predictor '{model_id}' config carries no head form"
-            ))
-        })?)?;
+            JammiError::Model {
+                model_id: model_id.to_string(),
+                message: "config missing 'head'".into(),
+            }
+        })?)
+        .map_err(|e| JammiError::Model {
+            model_id: model_id.to_string(),
+            message: e.to_string(),
+        })?;
 
         let read_usize = |key: &str| -> Result<usize> {
             config
                 .get(key)
                 .and_then(|v| v.as_u64())
                 .map(|v| v as usize)
-                .ok_or_else(|| {
-                    JammiError::Inference(format!(
-                        "context predictor '{model_id}' config missing '{key}'"
-                    ))
+                .ok_or_else(|| JammiError::Model {
+                    model_id: model_id.to_string(),
+                    message: format!("config missing '{key}'"),
                 })
         };
         let architecture = match config.get("architecture").and_then(|v| v.as_str()) {
@@ -1148,9 +1165,10 @@ impl InferenceSession {
             Some("AttnCnp") => ContextArchitecture::AttnCnp,
             Some("Tnp") => ContextArchitecture::Tnp,
             other => {
-                return Err(JammiError::Inference(format!(
-                    "context predictor '{model_id}' has an unknown architecture {other:?}"
-                )))
+                return Err(JammiError::Model {
+                    model_id: model_id.to_string(),
+                    message: format!("config has an unknown 'architecture' {other:?}"),
+                });
             }
         };
         let feature_dim = read_usize("feature_dim")?;
@@ -1162,10 +1180,9 @@ impl InferenceSession {
         let value_column = config
             .get("value_column")
             .and_then(|v| v.as_str())
-            .ok_or_else(|| {
-                JammiError::Inference(format!(
-                    "context predictor '{model_id}' config missing 'value_column'"
-                ))
+            .ok_or_else(|| JammiError::Model {
+                model_id: model_id.to_string(),
+                message: "config missing 'value_column'".into(),
             })?
             .to_string();
         // The train-derived target standardiser. A predictor without it in its
@@ -1179,10 +1196,9 @@ impl InferenceSession {
                 let std = s.get("std").and_then(|v| v.as_f64())?;
                 Some(TargetScaler::from_mean_std(mean, std))
             })
-            .ok_or_else(|| {
-                JammiError::Inference(format!(
-                    "context predictor '{model_id}' config missing a 'target_scaler'"
-                ))
+            .ok_or_else(|| JammiError::Model {
+                model_id: model_id.to_string(),
+                message: "config missing a 'target_scaler'".into(),
             })?;
 
         let table = self
@@ -1294,10 +1310,18 @@ impl InferenceSession {
             }
             Err(e) => return Err(e),
         };
+        // A manifest-verified bundle missing `model.safetensors` (or whose
+        // safetensors header doesn't match the rebuilt varmap's shapes) is
+        // the SAME class of client-visible precondition failure as every
+        // other corrupted-catalog-record refusal above — mirrors the
+        // resolver's peer refusal shape for a fine-tuned model's weights
+        // file (`CandleBackend::load`, `crates/jammi-ai/src/model/backend/
+        // candle.rs`'s `"Failed to load safetensors: {e}"` arm).
         let weights_path = local.dir().join("model.safetensors");
-        varmap
-            .load(&weights_path)
-            .map_err(|e| JammiError::Inference(format!("load predictor weights: {e}")))?;
+        varmap.load(&weights_path).map_err(|e| JammiError::Model {
+            model_id: model_id.to_string(),
+            message: format!("Failed to load predictor weights: {e}"),
+        })?;
 
         Ok(ServedContextPredictor {
             predictor,

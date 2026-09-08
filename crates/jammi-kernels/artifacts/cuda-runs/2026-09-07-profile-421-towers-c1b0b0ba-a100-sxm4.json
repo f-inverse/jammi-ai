@@ -37,17 +37,17 @@
   ],
   "identity": "source_sha256+input_manifest",
   "source_sha256": {
-   "ci/scripts/perf/profile_421_artifact.py": "aa8b521c9700d0aeea79a4fea862fb5cbb7ddcbece7e488a0d80c37f11c2ce78",
+   "ci/scripts/perf/profile_421_artifact.py": "8bbb1fe560574e9f6f786469c402b3001c64e3719978eedf5bc5fb4f6efcf300",
    "ci/scripts/perf/profile_421_attribute.py": "54d76682d59ea4adfc56c3b18d319d8de6c662f7a4740f05797a373a65d2aa47",
-   "ci/scripts/perf/profile_421_legs.sh": "ff15b0ce3784ace6fb521bfe1de47861fbb838194b1d286e4a472f9c0eddf1ce",
-   "ci/scripts/perf/gen_fixed_shape_image_corpus.py": "93bf92c0e723a98d1e234d997d0270edfeec604343c45765e1cbf28e07028e2b",
-   "ci/scripts/perf/gen_fixed_length_audio_corpus.py": "9fa820486ed2e0b6565dd612c994b0cec38cbe98e940e363292ba6fd1a8727ea",
+   "ci/scripts/perf/profile_421_legs.sh": "b1b1e5db474bc804d20209c817f13fb0ff56af48aafcd70459ff527e0afb014c",
+   "ci/scripts/perf/gen_fixed_shape_image_corpus.py": "3d8a9c0bb6ef19bc2f78eebb3d200f04fe0c1d4889443f160a854c3d603e5149",
+   "ci/scripts/perf/gen_fixed_length_audio_corpus.py": "8cad14f1463d2cad8c355034150541add6ec50c2286555d305d11093c05809f6",
    "ci/scripts/perf/test_profile_421_merge.py": "d9bdadada34546e2598d8ccb551eed90586703fccfc8d140e6d0603892724f17"
   },
   "input_sha256": {
    "merge_json": "c80cd7eaf480e6e167861b0ac7ae9855d58df0ec84c2799864cdfd6c931db264",
    "attribution_json": "af626cc56f3070d8ddeddd7191484950a7698e70e74e2bac6f772d78b859bf5b",
-   "identity": "d5c9ad27fbf19d8625d12ba745888212a20f6bf1963c5c50b36e4caa58f8bdea",
+   "identity": "93aa3599d57dc22272085a7952f982bff5b04aa58ae6079c3b3e3c354d987323",
    "legs/clip-text-A1/manifest.json": "f7089429823a022363eb7b37ff47e3e1e3feca40a7b59effc8c5ddb4ce01e47c",
    "legs/clip-text-A1/census.json": "ddb381c27f6eba0e48100aa08f33554890763abf574cdc0e3d6bb169a6dad1e6",
    "legs/clip-text-A2/manifest.json": "13b976c19c156e7f705481f767209e92de3c075a1f82394d68bbd3ce84733104",
@@ -79,6 +79,20 @@
   }
  },
  "status": "GREEN",
+ "contract_validity": {
+  "gate": "CONTRACT.md 'Validity gate' per leg: kernel table present; counter equations hold; --expect-kernels-disabled satisfied on D legs (profile_421_merge.py verdict); UNATTRIBUTED <= limits.unattributed_decision_grade_limit of gpu_busy (profile_421_attribute.py decision_grade)",
+  "legs_total": 12,
+  "legs_valid": 11,
+  "legs_failing": [
+   {
+    "leg_id": "htsat-A2",
+    "problems": [
+     "htsat-A2: attribution decision_grade is False, not True (recorded reason: UNATTRIBUTED share_gpu_busy=0.0566 > 0.05)"
+    ],
+    "decision_grade_reason": "UNATTRIBUTED share_gpu_busy=0.0566 > 0.05"
+   }
+  ]
+ },
  "notes": {
   "what": "GH #421 tower training-step profile close-out: pre-registered (contract v2.5, frozen 2026-09-07 before measurement) census of the CLIP-text, OpenCLIP-vision and HTSAT LoRA training steps. Decides the candidate ports the contract names (C-ATTN-CLIP-text, C-ATTN-CLIP-vision, C-MLP-CLIP-text, C-MLP-CLIP-vision) and reports the already-realized fused-kernel gains (C-LORA, C-LN, C-GELU-HTSAT joint) plus the out-of-tier, named-but-undecided C-ATTN-HTSAT chain.",
   "gpu": "NVIDIA A100-SXM4-80GB",
@@ -108,7 +122,7 @@
   "recorded_deviations": [
    "run1 (pod p421, session 1) was ALL-12-LEGS INVALID at the pre-fix tip (esc-088: profile_421_legs.sh's corpus tuple shared stdout with its own producers, fixed by PR #469, main c1b0b0ba) -- this artifact is the full 12-leg re-run (run2) on the merged fix.",
    "ROOT CAUSE of the run2-pass1..3 'A2 legs INVALID for attribution -> F32-only' state (pass-4 item 1, kernel_census.py): the module keyed each GPU-kernel bucket on shortName alone, and cutlass's Kernel2<...> template wrapper (same latent shape in magma_sgemmEx_kernel<...>) gives every bf16 GEMM tile instantiation the SAME literal shortName -- clip-text-A2's own run_m.sqlite has 3 DISTINCT cutlass instantiations sharing shortName='Kernel2' AND grid/block, so keying on shortName summed them into one anonymous row that tripped profile_421_attribute.py's 1% known-kernel-name gate. FIX: key on COALESCE(demangledName, shortName) instead -- a strict refinement (a bucket can only split, never merge two old buckets into fewer new ones), so gpu_kernel_us_per_step stays bit-identical and only by_kernel_and_grid resplits; only the cutlass Kernel2<...>(T1::Params) wrapper is stripped to its inner tile name, every other demangled name (magma's own template signature, splitKreduce_kernel<...>) is kept as-is since its template arguments are what distinguishes real instantiations there. All 12 censuses were regenerated under the fix for this run2 pass-4 pull -- every top-line number (gpu_kernel_us_per_step, wall/front/busy per_step) is UNCHANGED (sum-preserving refinement); only the per-instantiation by_kernel_and_grid breakdown resplit. Both CLIP-tower A2 legs (clip-text-A2, clip-vision-A2) are now VALID and decision-grade for attribution -- every candidate-port decision below is measured on BOTH the F32 (A1) and BF16 (A2) legs, never F32-only by consequence.",
-   "htsat-A2 (bf16) is VALID at the merge level but NOT decision-grade for attribution (recorded reason: UNATTRIBUTED share_gpu_busy=0.0566 > 0.05). Its UNATTRIBUTED share_gpu_busy is 5.66%, over the recorded 5% validity bound. Root cause: WINDOWING (window-partition/reverse/roll copies) and FRONT-FUSION (the audio front end's own activation) are still UNDECLARED chains -- a window-partition copy sits at the identical element count as a generic residual-stream PERMUTE/RESHAPE copy, so profile_421_attribute.py has no shape-only way to tell them apart, and declares neither rather than guess (module doc, 'declaring a chain with no matching rule is dishonest'). htsat-A1 (f32) clears the bound under the pass-4 census fix and IS decision-grade. HTSAT has no candidate port under this contract in the first place (C-ATTN-HTSAT is a named, measured, declared-out-of-tier chain, never folded into UNATTRIBUTED), so htsat-A2's own non-decision-grade status never blocks a candidate-port decision.",
+   "htsat-A2 (bf16) is VALID at the merge level but NOT decision-grade for attribution (recorded reason: UNATTRIBUTED share_gpu_busy=0.0566 > 0.05). Its UNATTRIBUTED share_gpu_busy is 5.66%, over the recorded 5% validity bound. Root cause: WINDOWING (window-partition/reverse/roll copies) and FRONT-FUSION (the audio front end's own activation) are still UNDECLARED chains -- a window-partition copy sits at the identical element count as a generic residual-stream PERMUTE/RESHAPE copy, so profile_421_attribute.py has no shape-only way to tell them apart, and declares neither rather than guess (module doc, 'declaring a chain with no matching rule is dishonest'). htsat-A1 (f32) clears the bound under the pass-4 census fix and IS decision-grade. HTSAT has no candidate port under this contract in the first place (C-ATTN-HTSAT is a named, measured, declared-out-of-tier chain, never folded into UNATTRIBUTED), so htsat-A2's own non-decision-grade status never blocks a candidate-port decision. It is therefore excluded from every finding that would read it: the HTSAT front-end finding reads htsat-A1 only and asserts no dtype-invariance.",
    "Per-leg raw .nsys-rep exports were deleted on-pod after each leg's census.json was produced (disk budget); the raw sqlite exports (24 files) were kept off-pod and were never committed -- see notes.operator_recorded for the on-pod-recorded total size, which has no in-tree witness.",
    "Both media corpus producers (image, audio) emit families x instances = 24 files at any --rows, so the M-leg's 4800 rows cycle 16 distinct train clips (a page-cached working set, contract SS D6.3) -- the HTSAT/vision front-end finding below is a real per-item CPU decode/preprocess compute cost, not a realistic-corpus I/O cost, and every quote of that finding must carry this caveat.",
    "Census reports produced before the pass-4 kernel-identity fix (the #356 close-out and the #421 2026-09-01/06 pod artifacts) carry the pre-fix, collapsed Kernel2/magma_sgemmEx_kernel rows in by_kernel_and_grid -- their by_kernel_name totals and every other top-line number are unaffected (the refinement is sum-preserving, see the root-cause deviation above), only the per-instantiation breakdown was coarser.",
@@ -462,7 +476,9 @@
    "ambiguous_out_mlp_collision": null,
    "attribution_verdict": "VALID",
    "attribution_reasons": [],
-   "launches_per_step": 3673.0
+   "launches_per_step": 3673.0,
+   "contract_valid": true,
+   "contract_validity_problems": []
   },
   {
    "leg_id": "clip-text-A2",
@@ -813,7 +829,9 @@
    "ambiguous_out_mlp_collision": null,
    "attribution_verdict": "VALID",
    "attribution_reasons": [],
-   "launches_per_step": 3722.0
+   "launches_per_step": 3722.0,
+   "contract_valid": true,
+   "contract_validity_problems": []
   },
   {
    "leg_id": "clip-text-D1",
@@ -1167,7 +1185,9 @@
    "ambiguous_out_mlp_collision": null,
    "attribution_verdict": "VALID",
    "attribution_reasons": [],
-   "launches_per_step": 4969.0
+   "launches_per_step": 4969.0,
+   "contract_valid": true,
+   "contract_validity_problems": []
   },
   {
    "leg_id": "clip-text-D2",
@@ -1514,7 +1534,9 @@
    "ambiguous_out_mlp_collision": null,
    "attribution_verdict": "VALID",
    "attribution_reasons": [],
-   "launches_per_step": 3950.0
+   "launches_per_step": 3950.0,
+   "contract_valid": true,
+   "contract_validity_problems": []
   },
   {
    "leg_id": "clip-vision-A1",
@@ -1863,7 +1885,9 @@
    "ambiguous_out_mlp_collision": null,
    "attribution_verdict": "VALID",
    "attribution_reasons": [],
-   "launches_per_step": 3638.0
+   "launches_per_step": 3638.0,
+   "contract_valid": true,
+   "contract_validity_problems": []
   },
   {
    "leg_id": "clip-vision-A2",
@@ -2219,7 +2243,9 @@
    "ambiguous_out_mlp_collision": null,
    "attribution_verdict": "VALID",
    "attribution_reasons": [],
-   "launches_per_step": 3696.0
+   "launches_per_step": 3696.0,
+   "contract_valid": true,
+   "contract_validity_problems": []
   },
   {
    "leg_id": "clip-vision-D1",
@@ -2580,7 +2606,9 @@
    "ambiguous_out_mlp_collision": null,
    "attribution_verdict": "VALID",
    "attribution_reasons": [],
-   "launches_per_step": 4903.0
+   "launches_per_step": 4903.0,
+   "contract_valid": true,
+   "contract_validity_problems": []
   },
   {
    "leg_id": "clip-vision-D2",
@@ -2933,7 +2961,9 @@
    "ambiguous_out_mlp_collision": null,
    "attribution_verdict": "VALID",
    "attribution_reasons": [],
-   "launches_per_step": 3915.0
+   "launches_per_step": 3915.0,
+   "contract_valid": true,
+   "contract_validity_problems": []
   },
   {
    "leg_id": "htsat-A1",
@@ -3288,7 +3318,9 @@
    },
    "attribution_verdict": "VALID",
    "attribution_reasons": [],
-   "launches_per_step": 5303.0
+   "launches_per_step": 5303.0,
+   "contract_valid": true,
+   "contract_validity_problems": []
   },
   {
    "leg_id": "htsat-A2",
@@ -3663,7 +3695,11 @@
    },
    "attribution_verdict": "VALID",
    "attribution_reasons": [],
-   "launches_per_step": 5382.0
+   "launches_per_step": 5382.0,
+   "contract_valid": false,
+   "contract_validity_problems": [
+    "htsat-A2: attribution decision_grade is False, not True (recorded reason: UNATTRIBUTED share_gpu_busy=0.0566 > 0.05)"
+   ]
   },
   {
    "leg_id": "htsat-D1",
@@ -4033,7 +4069,9 @@
    },
    "attribution_verdict": "VALID",
    "attribution_reasons": [],
-   "launches_per_step": 7080.0
+   "launches_per_step": 7080.0,
+   "contract_valid": true,
+   "contract_validity_problems": []
   },
   {
    "leg_id": "htsat-D2",
@@ -4391,7 +4429,9 @@
    },
    "attribution_verdict": "VALID",
    "attribution_reasons": [],
-   "launches_per_step": 5792.0
+   "launches_per_step": 5792.0,
+   "contract_valid": true,
+   "contract_validity_problems": []
   }
  ],
  "p2": [
@@ -7883,23 +7923,38 @@
  "findings": [
   {
    "id": "htsat-front-end-bound",
-   "text": "The HTSAT training step is CPU front-end-bound: front-end share of wall is 81-83% across the F32/BF16 decision legs (rule: front_share_of_wall >= 50% on every leg read; audio decode/resample/STFT/mel dominating wall time). Front-end time itself is 1.249-1.255 s/step across every F32/BF16 x A/D-arm leg read (relative spread 0.5%, within the 5% arm-invariance rule), so this cost is dtype- and arm-invariant.",
+   "text": "The HTSAT training step is CPU front-end-bound: front-end share of wall is 81% on the F32 decision leg (htsat-A1) (rule: front_share_of_wall >= 50% on every leg read; audio decode/resample/STFT/mel dominating wall time). htsat-A2 is excluded from this finding: it fails the contract's validity gate (htsat-A2: attribution decision_grade is False, not True (recorded reason: UNATTRIBUTED share_gpu_busy=0.0566 > 0.05)). Front-end time itself is 1.249-1.255 s/step across every contract-valid F32 x A/D-arm leg read (htsat-A1, htsat-D1, htsat-D2) (relative spread 0.5%, within the 5% arm-invariance rule), so this cost is arm-invariant.",
    "evidence": {
     "front_share_of_wall_pct": {
-     "htsat-A1": 80.70459923277278,
-     "htsat-A2": 83.41211050160044
+     "htsat-A1": 80.70459923277278
     },
     "front_end_bound_rule": "front_share_of_wall >= 0.5 on every leg read",
     "front_end_bound": true,
+    "legs_read": [
+     "htsat-A1"
+    ],
+    "legs_excluded": {
+     "htsat-A2": "htsat-A2: attribution decision_grade is False, not True (recorded reason: UNATTRIBUTED share_gpu_busy=0.0566 > 0.05)"
+    },
     "front_s_per_step": {
      "htsat-A1": 1.250912541216,
-     "htsat-A2": 1.251592021452,
      "htsat-D1": 1.249312950748,
      "htsat-D2": 1.2550384823760001
     },
-    "arm_invariance_rule": "(max-min)/mean of front_s_per_step across every A/D leg read <= 0.05",
-    "arm_invariance_relative_spread": 0.00457415322734431,
-    "arm_invariant": true
+    "arm_invariance_rule": "(max-min)/mean of front_s_per_step across every contract-valid A/D leg read <= 0.05",
+    "arm_invariance_relative_spread": 0.004574004650903132,
+    "arm_invariant": true,
+    "invariance_axes": [
+     "arm"
+    ],
+    "arm_invariance_legs_read": [
+     "htsat-A1",
+     "htsat-D1",
+     "htsat-D2"
+    ],
+    "arm_invariance_legs_excluded": {
+     "htsat-A2": "htsat-A2: attribution decision_grade is False, not True (recorded reason: UNATTRIBUTED share_gpu_busy=0.0566 > 0.05)"
+    }
    }
   },
   {

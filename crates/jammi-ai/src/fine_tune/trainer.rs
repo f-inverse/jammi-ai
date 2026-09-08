@@ -10038,6 +10038,44 @@ mod epoch_checkpoint_retention_failure {
     use jammi_db::storage::{StorageRegistry, StorageUrl};
     use jammi_db::store::ArtifactStore;
 
+    /// The require-gate polarity every `chmod` permission-fault probe in this
+    /// crate shares (esc-089 F1): `probe` performs the fault-injection
+    /// premise check itself — "can this process still write through a
+    /// chmod'd path?" — and returns `true` if the fault was BYPASSED (root,
+    /// or a mode-ignoring filesystem). A bypass is normally a loud,
+    /// `eprintln`'d skip: the fault-injection premise the caller needs
+    /// simply does not hold on this host. But under
+    /// `JAMMI_REQUIRE_POSIX_PERMS=1` (the CI lane that is SUPPOSED to run
+    /// unprivileged with real POSIX permission enforcement) a bypass is
+    /// instead a hard `panic!` — silently returning `true` in that lane
+    /// would let a permission-fault regression go completely uncaught.
+    ///
+    /// This is a thin local wrapper of the same canonical shape carried by
+    /// every other `chmod`/permission-fault probe in this crate
+    /// (`ci/kernel-oracle-helpers.txt`'s KO-7 registry is `(file, fn)`-
+    /// scoped: a shared helper cannot be registered for a call site in a
+    /// DIFFERENT file, so each file that needs this polarity carries its own
+    /// copy rather than delegating).
+    ///
+    /// Returns `true` if the caller must restore permissions and skip;
+    /// `false` if the fault was genuinely injected and the test should
+    /// proceed.
+    fn chmod_bypassed(test_name: &str, probe: impl FnOnce() -> bool) -> bool {
+        let bypassed = probe();
+        if bypassed {
+            if std::env::var_os("JAMMI_REQUIRE_POSIX_PERMS").is_some() {
+                panic!(
+                    "JAMMI_REQUIRE_POSIX_PERMS is set but '{test_name}' could not inject its \
+                     permission fault (root, or a mode-ignoring filesystem) — the \
+                     fault-injection premise this test needs does not hold; a silent skip is \
+                     not acceptable here"
+                );
+            }
+            eprintln!("{test_name}: chmod bypassed (root?) — skipping");
+        }
+        bypassed
+    }
+
     const HIDDEN: usize = 4;
 
     /// Build the loop synchronously from an already-open `Arc<Catalog>` — the
@@ -10113,18 +10151,24 @@ mod epoch_checkpoint_retention_failure {
             // PROBE the injection before relying on it: root (and
             // mode-ignoring filesystems) can delete through a 0o555
             // directory, in which case the failed-prune premise this test
-            // asserts never exists — skip loudly, mirroring the
-            // `skip_on_cuda_capable_host` convention in candle.rs's
-            // device_tests (the same environment-conditional-test class).
+            // asserts never exists. Shared require-gate polarity (esc-089
+            // F1, same canonical shape as every other chmod probe in this
+            // crate): under `JAMMI_REQUIRE_POSIX_PERMS=1` a bypass panics
+            // rather than skipping.
             let probe = epoch0_dir.join(".root_probe");
-            if std::fs::write(&probe, b"x").is_ok() {
-                let _ = std::fs::remove_file(&probe);
+            let bypassed = chmod_bypassed(
+                "failed_prune_stays_tracked_and_catches_up_once_unblocked",
+                || {
+                    let writable = std::fs::write(&probe, b"x").is_ok();
+                    if writable {
+                        let _ = std::fs::remove_file(&probe);
+                    }
+                    writable
+                },
+            );
+            if bypassed {
                 let _ =
                     std::fs::set_permissions(&epoch0_dir, std::fs::Permissions::from_mode(0o755));
-                eprintln!(
-                    "epoch_checkpoint_retention_failure: skipping — fault injection \
-                     unavailable: process can write despite chmod (root?)"
-                );
                 return;
             }
 

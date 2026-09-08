@@ -134,7 +134,8 @@ jobs:
           JAMMI_REQUIRE_MEDIA_SMOKE: "1"
           # The chmod fault-injection probes (`crates/jammi-ai/tests/it/`
           # `{models,context_predictor,fine_tune}.rs`,
-          # `crates/jammi-db/src/store/artifact.rs`) skip loudly — never
+          # `crates/jammi-db/src/store/artifact.rs`,
+          # `crates/jammi-ai/src/fine_tune/trainer.rs`) skip loudly — never
           # silently — when a 0o000-chmod'd path is still readable/writable
           # (root, or a mode-ignoring filesystem). This container's `Run
           # tests` step runs as root by default (no non-root `USER` in
@@ -172,19 +173,21 @@ jobs:
       # every POSIX permission bit, so arming the require gate on that run
       # would turn an UNCONDITIONAL bypass into an unconditional panic —
       # never a real signal about a permission regression. This step gives
-      # the SAME four probes (`crates/jammi-ai/tests/it/{models,
+      # the SAME five probes (`crates/jammi-ai/tests/it/{models,
       # context_predictor,fine_tune}.rs`'s
       # `fine_tuned_adapter_bundle_permission_fault_is_not_a_typed_model_error`
       # / `context_predictor_reload_permission_fault_is_not_a_typed_model_error`
-      # / `finalize_reclaims_a_persistently_failed_prune_and_warns`, and
+      # / `finalize_reclaims_a_persistently_failed_prune_and_warns`,
       # `crates/jammi-db/src/store/artifact.rs`'s
-      # `permission_fault_on_a_present_key_stays_a_transport_error`) a REAL
-      # execution: build the two test binaries as root (this build reuses
+      # `permission_fault_on_a_present_key_stays_a_transport_error`, and
+      # `crates/jammi-ai/src/fine_tune/trainer.rs`'s
+      # `failed_prune_stays_tracked_and_catches_up_once_unblocked`) a REAL
+      # execution: build the three test binaries as root (this build reuses
       # this SAME job's already-populated target dir from "Run tests"
       # above — same filesystem, same job, no clean rebuild — so it only
-      # links the two `--no-run` test binaries rather than recompiling the
+      # links the three `--no-run` test binaries rather than recompiling the
       # workspace), open the checkout to a fresh unprivileged account, then run
-      # ONLY those four tests as that account with
+      # ONLY those five tests as that account with
       # `JAMMI_REQUIRE_POSIX_PERMS=1` armed. The probes read fixtures from
       # BOTH `cookbook/fixtures/` and `tests/fixtures/` at the workspace
       # root (`jammi_test_utils::{cookbook_fixture,fixture}`, resolved via
@@ -241,10 +244,13 @@ jobs:
           extract_test_binary() { python3 -c 'import json, sys; [print(m["executable"]) for m in (json.loads(l) for l in sys.stdin if l.strip()) if m.get("reason") == "compiler-artifact" and m.get("executable")]'; }
 
           AI_IT_BIN="$(cargo test -p jammi-ai --test it --no-run --message-format=json | extract_test_binary | tail -n1)"
+          AI_LIB_BIN="$(cargo test -p jammi-ai --lib --no-run --message-format=json | extract_test_binary | tail -n1)"
           DB_LIB_BIN="$(cargo test -p jammi-db --lib --no-run --message-format=json | extract_test_binary | tail -n1)"
           test -x "$AI_IT_BIN"
+          test -x "$AI_LIB_BIN"
           test -x "$DB_LIB_BIN"
           echo "jammi-ai it binary:  $AI_IT_BIN"
+          echo "jammi-ai lib binary: $AI_LIB_BIN"
           echo "jammi-db lib binary: $DB_LIB_BIN"
 
           # Read + traverse only (`X`, never `w`) across the whole checkout --
@@ -288,6 +294,7 @@ jobs:
           run_probe "$AI_IT_BIN" models::fine_tuned_adapter_bundle_permission_fault_is_not_a_typed_model_error
           run_probe "$AI_IT_BIN" context_predictor::context_predictor_reload_permission_fault_is_not_a_typed_model_error
           run_probe "$AI_IT_BIN" fine_tune::finalize_reclaims_a_persistently_failed_prune_and_warns
+          run_probe "$AI_LIB_BIN" fine_tune::trainer::epoch_checkpoint_retention_failure::failed_prune_stays_tracked_and_catches_up_once_unblocked
           run_probe "$DB_LIB_BIN" store::artifact::tests::permission_fault_on_a_present_key_stays_a_transport_error
       # golden-parity is opt-in (`crates/jammi-encoders/Cargo.toml`) so the
       # default workspace test run above never compiles it, but it is fully

@@ -2907,14 +2907,30 @@ retry loop re-taking the write lock:
   strand waiters).
 - `ModelCache::do_load`: `resolver.resolve` → pick backend by `resolved.backend` →
   `estimate_memory` → **admission loop** (`try_acquire`; on `None` take the lock and
-  `evict_one`; if nothing evictable, error) → `backend.load` → best-effort catalog
-  `register_model` (failure logged & swallowed) → insert `CacheEntry` (permit moved in) →
-  return guard with refcount 1.
+  `evict_one`; if nothing evictable, error) → `backend.load` → post-load catalog bookkeeping
+  → insert `CacheEntry` (permit moved in) → return guard with refcount 1. The bookkeeping
+  write is gated against an allowlist of terminal-producer types, `PROTECTED_MODEL_TYPES`
+  (`crates/jammi-ai/src/model/cache.rs:655`): for a row already owned by a terminal producer
+  — `fine-tuned`, `context-predictor`, `checkpoint` — the write is skipped outright when
+  `already_managed` (`crates/jammi-ai/src/model/cache.rs:666`) is true; otherwise it proceeds to
+  `register_model` (`crates/jammi-ai/src/model/cache.rs:688`), which completes a
+  `local`/`huggingface` row or the `embedding` FK placeholder — the one case where a
+  `register_model` failure is still logged and swallowed rather than propagated. A fine-tuned
+  id can reach this same call (`ModelSource::parse`'s HuggingFace fallback matches it like any
+  other non-`local:` string), so without the gate this generic write would overwrite the
+  served-adapter `artifact_path` and the `base_model_id` lineage a terminal producer already
+  committed.
 
 Resolver chain (`crates/jammi-ai/src/model/resolver.rs`, `ModelResolver::resolve`):
-`try_catalog_lookup` first (refuses `Retired`; resolves fine-tuned base recursively + fetches
-adapter), else `resolve_local`/`resolve_hf_hub` (locate config, pick backend, gather weights,
-discover tokenizer, sum file sizes into `estimated_memory`).
+`try_catalog_lookup` (`crates/jammi-ai/src/model/resolver.rs:81`) first (refuses `Retired`;
+resolves fine-tuned base recursively + fetches adapter), else `resolve_local`/`resolve_hf_hub`
+(locate config, pick backend, gather weights, discover tokenizer, sum file sizes into
+`estimated_memory`). A record whose `model_type`
+(`crates/jammi-ai/src/model/resolver.rs:113`) is `fine-tuned` and missing `base_model_id`
+(`crates/jammi-ai/src/model/resolver.rs:128`) or missing `artifact_path`
+(`crates/jammi-ai/src/model/resolver.rs:144`) is refused with a typed error naming the model
+id and the missing field, never silently resolved as an ordinary model or served as the
+unadapted base.
 
 ### 3.7 Crash recovery of building tables
 

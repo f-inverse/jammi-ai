@@ -1,0 +1,129 @@
+{
+  "engine_version": "0.49.1",
+  "host": {
+    "logical_cpus": 13,
+    "total_ram_mib": 2051942
+  },
+  "subcommand": "finetune-run",
+  "provenance": {
+    "build_sha": "c1b0b0bad1f79a4ad6c298400e6ea19cc1ca633c",
+    "target": "x86_64-unknown-linux-gnu",
+    "profile": "release",
+    "build_features": [
+      "bench-cuda",
+      "cuda"
+    ],
+    "report_schema_version": 2
+  },
+  "tiers": {
+    "finetune_run": {
+      "seed": 42,
+      "task": "text_embedding",
+      "batch": 8,
+      "seq": 77,
+      "lora_rank": 8,
+      "lora_alpha": 16.0,
+      "lora_dropout": 0.05,
+      "lora_init": "zeros_b",
+      "margin": 0.3,
+      "target_modules": [
+        "in_proj",
+        "out_proj",
+        "c_fc",
+        "c_proj"
+      ],
+      "layers_to_transform": null,
+      "backbone_dtype": "f32",
+      "checkpoint_config_sha256": "4302a891b495ad0966d1e7eeff102b5f34a3f1e647e57a9198933f862d5f8ba7",
+      "checkpoint_weights_sha256": "ac4f8c4b88af6d963118cbf40ad93176d092abbedfcb752601ae1866352656e6",
+      "checkpoint_weights_size_bytes": 605143316,
+      "max_grad_norm": 1.0,
+      "warmup": null,
+      "row_lengths": null,
+      "epochs": 1,
+      "lr": 0.0002,
+      "schedule": "constant",
+      "warmup_steps": 0,
+      "weight_decay": 0.01,
+      "grad_accum": 1,
+      "validation_fraction": 0.0,
+      "train_pairs_file_sha256": "5c01ae3ea070d3c405aaba4aa55ad51de975563d0fa6d129d91108a138c78938",
+      "train_media_sha256": null,
+      "heldout_ids_sha256": "90856a60a341624f5042b91ae86a19caacb01bb9a771405a02b727990966af99",
+      "heldout_pairs_sha256": "259a101b139e2138e7cb6d80e3be155a7e72b53e1366f8739b384f48c36dcc0d",
+      "heldout_media_sha256": null,
+      "heldout_batch_partition_sha256": "deb89874f7ef0e3c3b8f255940135c25ea2e3c3f9d710540a2fc8bcea3647985",
+      "embedding_loss": "triplet",
+      "temperature": null,
+      "matryoshka_dims": [],
+      "early_stopping_patience": 10000,
+      "early_stopping_metric": "train_loss",
+      "eval_cadence": 1,
+      "arm": "fused",
+      "device_name": "NVIDIA A100-SXM4-80GB",
+      "kernels_disabled_requested": [
+        "lora_linear_fused"
+      ],
+      "kernels_disabled_fired": [
+        "lora_linear_fused"
+      ],
+      "kernels_disabled_expected": [
+        "lora_linear_fused"
+      ],
+      "fusible_site_census": {
+        "lora_sites_wrapped": 48,
+        "layer_norms": 25,
+        "gelu_seam_calls_per_forward": 0
+      },
+      "flash_compiled": false,
+      "build_features": [
+        "bench-cuda",
+        "cuda"
+      ],
+      "attention_arm": "fused",
+      "split_rule": "positional_fraction_split",
+      "batched_forward": true,
+      "steps_measured": 100,
+      "ln_fused_dispatches": 2500,
+      "ln_eager_dispatches": 0,
+      "rope_fused_dispatches": 0,
+      "rope_eager_dispatches": 0,
+      "softmax_fused_dispatches": 0,
+      "softmax_eager_dispatches": 0,
+      "geglu_fused_dispatches": 0,
+      "geglu_eager_dispatches": 0,
+      "gelu_fused_dispatches": 0,
+      "gelu_eager_dispatches": 0,
+      "lora_epilogue_fused_dispatches": 0,
+      "lora_epilogue_eager_dispatches": 0,
+      "lora_linear_fused_dispatches": 0,
+      "lora_linear_eager_dispatches": 4800,
+      "attention_block_fused_dispatches": 0,
+      "attention_block_eager_dispatches": 0,
+      "adamw_fused_dispatches": 9600,
+      "adamw_eager_dispatches": 0,
+      "attention_block_flash_fused_dispatches": 0,
+      "attention_block_flash_declined_dispatches": 0,
+      "admission_is_dense": false,
+      "tie_fraction": 0.0,
+      "final_epoch": 0,
+      "held_out_example_mean": 0.2951773554086685,
+      "held_out_count": 8,
+      "final_loss_diagnostic": 0.3025781160593033,
+      "trajectory": [
+        {
+          "epoch": 0,
+          "held_out_mean": 0.2951773554086685,
+          "held_out_tie_fraction": 0.0,
+          "held_out_batch_partition_sha256": "deb89874f7ef0e3c3b8f255940135c25ea2e3c3f9d710540a2fc8bcea3647985"
+        }
+      ],
+      "train_probe_series": [
+        0.28712664544582367,
+        0.29220400005578995
+      ],
+      "train_run_wall_s": 13.281617787,
+      "media_front_end_wall_s": null
+    }
+  }
+}

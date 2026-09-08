@@ -63,6 +63,12 @@ must carry:
     hex>}`): a producer's own CONTENT identity, for a producer whose module
     doc names this the regeneration-provenance convention (e.g.
     `profile_421_artifact.py`) instead of a git commit sha (see rule (j)).
+  - `producer.identity` (OPTIONAL — MANDATORY for a known convention-
+    declaring producer, see rule (j)): the fixed marker string
+    `"source_sha256+input_manifest"`, stamped by a producer whose module doc
+    declares that BOTH `producer.source_sha256` (its own content identity)
+    AND `producer.input_sha256` (its input files' content identity) are
+    always present together — never one without the other.
 
 ## Fail-closed contract
 
@@ -123,6 +129,18 @@ must carry:
       identity: editing the producer (or a file it reads a live constant
       from) and forgetting to regenerate the committed artifact is now
       caught here, never silently accepted as still-valid provenance.
+      `source_sha256`/`input_sha256` stay OPTIONAL for a producer that never
+      opted into this convention — but a producer that DOES (stamped via
+      `producer.identity == "source_sha256+input_manifest"`) must carry
+      BOTH blocks together (a marker with only one is an incomplete
+      identity claim, refused by name, never treated as "no identity"), and
+      a producer whose own PATH is a known, reviewed convention-declarer
+      (`SOURCE_IDENTITY_DECLARING_PRODUCER_PATHS`, mirroring
+      `LEGACY_NONE_ALLOWLIST`'s shape) must stamp the marker on every
+      artifact it emits — silently omitting it on a future regeneration
+      would let that artifact quietly fall back to the unchecked "no
+      identity" state this rule has always allowed for a producer that
+      never opted in (`check_producer_source_identity_marker`).
 
 Rule (d) needs REAL commit history to mean anything: `git merge-base
 --is-ancestor` on a shallow checkout (`actions/checkout`'s default
@@ -391,6 +409,29 @@ def check_producer_path(producer: dict, repo_root: Path, tracked: set[str]) -> l
 
 _SHA256_HEX_RE = re.compile(r"^[0-9a-f]{64}$")
 
+# The fixed marker a producer stamps to declare "regeneration provenance is
+# CONTENT identity, not a git commit sha" (rule (j)). Never a free-form
+# string — a single closed value, so a typo or a half-adopted convention
+# reads as "wrong marker", never as a silently-accepted new spelling.
+PRODUCER_SOURCE_IDENTITY_MARKER = "source_sha256+input_manifest"
+
+# Producer paths whose OWN module doc declares the source-identity
+# convention (`producer.identity == PRODUCER_SOURCE_IDENTITY_MARKER`) —
+# reviewed, closed set, same shape as `LEGACY_NONE_ALLOWLIST` above. A
+# producer added here MUST stamp the marker on every artifact it emits from
+# now on; this is the enforcement half of that promise, not a suggestion.
+SOURCE_IDENTITY_DECLARING_PRODUCER_PATHS: frozenset[str] = frozenset(
+    {
+        # `profile_421_artifact.py`'s own module doc, "Producer identity
+        # (regeneration provenance)" — `producer.path` on its own committed
+        # artifact names the LEG DRIVER script, not the artifact producer
+        # module itself (the schema's `producer.path` field is "the thing
+        # that ran", which for a `kind: "script"` producer is the driver a
+        # human invoked, not every module that driver's pipeline imports).
+        "ci/scripts/perf/profile_421_legs.sh",
+    }
+)
+
 
 # --------------------------------------------------------------------------- #
 # rule (j) — producer.source_sha256: content-identity, re-hashed at THIS
@@ -432,6 +473,74 @@ def check_producer_source_sha256(producer: dict, repo_root: Path) -> list[str]:
                 f"({actual}) — the producer (or a file it reads a live constant from) changed since this "
                 "artifact was rendered; regenerate the artifact, never hand-edit the recorded hash"
             )
+    return failures
+
+
+def check_producer_input_sha256(producer: dict) -> list[str]:
+    """`producer.input_sha256` (OPTIONAL — `{<input label>: <sha256 hex>}`,
+    e.g. `profile_421_artifact.py`'s `{"merge_json": ..., "attribution_json":
+    ..., "identity": ...}`): the sha256 of the producer's own INPUT files as
+    given at render time. Unlike `source_sha256` (repo-root-relative PATHS,
+    re-hashable against this gate's own HEAD), an input's label is not a
+    path this gate can re-resolve on its own — the recorded value is
+    shape-checked here (a non-empty object of non-empty-string-keyed,
+    64-lowercase-hex values), never re-hashed against a file, which is the
+    one difference from rule (j)'s own `check_producer_source_sha256`."""
+    input_sha256 = producer.get("input_sha256")
+    if input_sha256 is None:
+        return []
+    if not isinstance(input_sha256, dict) or not input_sha256:
+        return [f"producer.input_sha256 must be a non-empty object, got {input_sha256!r}"]
+    failures: list[str] = []
+    for label, value in sorted(input_sha256.items()):
+        if not isinstance(label, str) or not label:
+            failures.append(f"producer.input_sha256 has a non-string/empty label key {label!r}")
+            continue
+        if not isinstance(value, str) or not _SHA256_HEX_RE.match(value):
+            failures.append(f"producer.input_sha256[{label!r}] must be a 64-lowercase-hex sha256, got {value!r}")
+    return failures
+
+
+def check_producer_source_identity_marker(producer: dict) -> list[str]:
+    """`producer.identity`, when present, must equal
+    `PRODUCER_SOURCE_IDENTITY_MARKER` and license BOTH `source_sha256` and
+    `input_sha256` to be present (a marker with only one of the two blocks
+    is an incomplete identity claim — refused BY NAME, never quietly
+    downgraded to "no identity was declared here"). Absent the marker,
+    `source_sha256`/`input_sha256` stay entirely OPTIONAL — UNLESS
+    `producer.path` is itself one of the reviewed, closed
+    `SOURCE_IDENTITY_DECLARING_PRODUCER_PATHS`: a producer this repo already
+    knows declares the convention omitting the marker on one of its own
+    artifacts is exactly the silent-regression rule (j)'s own docstring
+    warns about (a future edit that regenerates without re-stamping the
+    marker would otherwise fall back to the unchecked "no identity" state
+    unnoticed)."""
+    identity = producer.get("identity")
+    path = producer.get("path")
+    if identity is None:
+        if isinstance(path, str) and path in SOURCE_IDENTITY_DECLARING_PRODUCER_PATHS:
+            return [
+                f"producer.path `{path}` is a known source-identity-declaring producer "
+                "(SOURCE_IDENTITY_DECLARING_PRODUCER_PATHS) but this artifact carries no producer.identity "
+                f"marker — every artifact this producer emits must stamp "
+                f"producer.identity = {PRODUCER_SOURCE_IDENTITY_MARKER!r}"
+            ]
+        return []
+    failures: list[str] = []
+    if identity != PRODUCER_SOURCE_IDENTITY_MARKER:
+        failures.append(
+            f"producer.identity must be {PRODUCER_SOURCE_IDENTITY_MARKER!r} when present, got {identity!r}"
+        )
+    if not isinstance(producer.get("source_sha256"), dict) or not producer.get("source_sha256"):
+        failures.append(
+            f"producer.identity == {PRODUCER_SOURCE_IDENTITY_MARKER!r} but producer.source_sha256 is "
+            "missing/empty — the marker declares BOTH blocks present, never just one"
+        )
+    if not isinstance(producer.get("input_sha256"), dict) or not producer.get("input_sha256"):
+        failures.append(
+            f"producer.identity == {PRODUCER_SOURCE_IDENTITY_MARKER!r} but producer.input_sha256 is "
+            "missing/empty — the marker declares BOTH blocks present, never just one"
+        )
     return failures
 
 
@@ -1452,6 +1561,8 @@ def validate_artifact(
     if producer.get("kind") == "cargo-test":
         failures += check_cargo_test_gating(data, producer, repo_root)
     failures += check_producer_source_sha256(producer, repo_root)
+    failures += check_producer_input_sha256(producer)
+    failures += check_producer_source_identity_marker(producer)
     failures += check_none_allowlist(data, relpath, allowlist)
     failures += check_ancestry(data, repo_root)
     failures += check_oracle_separation(data)
@@ -1641,6 +1752,12 @@ def self_test() -> int:
         perf_dir = repo / "ci" / "scripts" / "perf"
         perf_dir.mkdir(parents=True)
         (perf_dir / "proof_artifact.py").write_text("# stub producer\n")
+        # A tracked stand-in for the ONE known source-identity-declaring
+        # producer path (`SOURCE_IDENTITY_DECLARING_PRODUCER_PATHS`) — rule
+        # (j)'s own marker-mandatory arm needs `producer.path` to exist +
+        # be tracked (rule (b)) so its own findings never contaminate the
+        # marker-specific `expect_hit` needle below.
+        (perf_dir / "profile_421_legs.sh").write_text("# stub source-identity-declaring producer\n")
 
         _run(["git", "add", "-A"], repo)
         _run(["git", "commit", "-q", "-m", "root"], repo)
@@ -1784,6 +1901,81 @@ def self_test() -> int:
         bad["producer"] = dict(bad["producer"])
         bad["producer"]["source_sha256"] = {}
         expect_hit(bad, "x.json", "must be a non-empty object", "rule (j): empty source_sha256 object")
+
+        # rule (j) — producer.input_sha256 shape (never re-hashed, no path) ---
+        ok = baseline()
+        ok["producer"] = dict(ok["producer"])
+        ok["producer"]["input_sha256"] = {"merge_json": "0" * 64}
+        expect_clean(ok, "control-input-sha256.json", "rule (j): well-shaped input_sha256")
+
+        bad = baseline()
+        bad["producer"] = dict(bad["producer"])
+        bad["producer"]["input_sha256"] = {}
+        expect_hit(bad, "x.json", "must be a non-empty object", "rule (j): empty input_sha256 object")
+
+        bad = baseline()
+        bad["producer"] = dict(bad["producer"])
+        bad["producer"]["input_sha256"] = {"merge_json": "not-a-sha256"}
+        expect_hit(bad, "x.json", "must be a 64-lowercase-hex sha256", "rule (j): malformed input_sha256 value")
+
+        # rule (j) — producer.identity marker: MANDATORY once stamped, and
+        # MANDATORY for a known source-identity-declaring producer.path -----
+        identity_source = {real_relpath: real_hash}
+        identity_input = {"merge_json": "0" * 64}
+
+        ok = baseline()
+        ok["producer"] = dict(ok["producer"])
+        ok["producer"]["identity"] = "source_sha256+input_manifest"
+        ok["producer"]["source_sha256"] = identity_source
+        ok["producer"]["input_sha256"] = identity_input
+        expect_clean(ok, "control-identity-marker.json", "rule (j): marker + both blocks present")
+
+        bad = baseline()
+        bad["producer"] = dict(bad["producer"])
+        bad["producer"]["identity"] = "bogus-marker"
+        bad["producer"]["source_sha256"] = identity_source
+        bad["producer"]["input_sha256"] = identity_input
+        expect_hit(bad, "x.json", "producer.identity must be", "rule (j): wrong marker string")
+
+        bad = baseline()
+        bad["producer"] = dict(bad["producer"])
+        bad["producer"]["identity"] = "source_sha256+input_manifest"
+        bad["producer"]["input_sha256"] = identity_input
+        expect_hit(bad, "x.json", "producer.source_sha256 is missing/empty", "rule (j): marker with no source_sha256")
+
+        bad = baseline()
+        bad["producer"] = dict(bad["producer"])
+        bad["producer"]["identity"] = "source_sha256+input_manifest"
+        bad["producer"]["source_sha256"] = identity_source
+        expect_hit(bad, "x.json", "producer.input_sha256 is missing/empty", "rule (j): marker with no input_sha256")
+
+        bad = baseline()
+        bad["producer"] = dict(bad["producer"])
+        bad["producer"]["path"] = "ci/scripts/perf/profile_421_legs.sh"
+        # No `producer.identity` at all — this path IS a known
+        # source-identity-declaring producer, so omitting the marker is
+        # itself a hit, never silently treated as "this producer never
+        # opted in".
+        expect_hit(
+            bad,
+            "x.json",
+            "known source-identity-declaring producer",
+            "rule (j): known convention-declaring producer.path with no marker",
+        )
+
+        ok = baseline()
+        ok["producer"] = dict(ok["producer"])
+        # `kind`/`gating` switched to the real profile_421_artifact.py
+        # producer block's own shape ("script"/"none") — `cargo-test`'s
+        # own rule (c) static scan has nothing to do with this rule and
+        # would otherwise spuriously fire against a non-Rust stub path.
+        ok["producer"]["path"] = "ci/scripts/perf/profile_421_legs.sh"
+        ok["producer"]["kind"] = "script"
+        ok["producer"]["gating"] = "none"
+        ok["producer"]["identity"] = "source_sha256+input_manifest"
+        ok["producer"]["source_sha256"] = identity_source
+        ok["producer"]["input_sha256"] = identity_input
+        expect_clean(ok, "control-identity-marker-known-path.json", "rule (j): known producer.path WITH the marker")
 
         # rule (c) — cargo-test static verification ---------------------------
         bad = baseline()
@@ -2467,7 +2659,10 @@ def self_test() -> int:
         "per-file ancestry findings; and (j) producer.source_sha256 (OPTIONAL, matching a real file's own "
         "bytes is clean, absent entirely is clean, a wrong hash / nonexistent path / malformed hash / "
         "empty object are each caught by name) is re-hashed against THIS gate's own HEAD, never a "
-        "historical blob."
+        "historical blob; producer.input_sha256 (OPTIONAL, shape-checked but never re-hashed) and "
+        "producer.identity (OPTIONAL in general, but MANDATORY once stamped — requiring BOTH blocks "
+        "together — and MANDATORY for a known SOURCE_IDENTITY_DECLARING_PRODUCER_PATHS entry even with "
+        "no marker at all) round out rule (j)."
     )
     return 0
 

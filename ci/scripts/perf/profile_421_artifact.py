@@ -112,11 +112,16 @@ never from re-deriving the English.
 ## Producer identity (regeneration provenance)
 
 The CLI (`main`, not the hermetic `build_report` core) stamps
+`producer.identity` (the fixed marker `"source_sha256+input_manifest"`,
+checked by `check_cuda_run_artifacts.py`'s rule (j) — a producer that
+stamps this marker MUST carry both blocks below, never just one),
 `producer.source_sha256` (the sha256 of every file in
 `SOURCE_FILES_FOR_NUMBERS` below, keyed by its repo-root-relative posix
 path), `producer.input_sha256` (the sha256 of the `--merge-json`/
-`--attribution-json`/`--identity` FILES as given), and
-`producer.invocation_argv` (this run's own argv) onto the artifact.
+`--attribution-json`/`--identity` FILES as given, PLUS a full manifest over
+every file this module itself reads off `--legs-dir`/`--p2-dir` — see
+"Input-completeness" below), and `producer.invocation_argv` (this run's own
+argv) onto the artifact.
 
 `source_sha256` replaces a git commit sha (the old `producer.tree_sha`,
 `JAMMI_BUILD_SHA` if set else `git rev-parse HEAD`). A commit sha is the
@@ -134,14 +139,46 @@ BY NAME, so editing this module (or a file it reads a live constant from —
 producers' own `_DEFAULT_INSTANCES_PER_FAMILY`, `test_profile_421_merge.py`'s
 own hermetic-suite size) and forgetting to regenerate the committed artifact
 is now a hard CI failure, never a silent staleness. Regenerating from the
-SAME three input files against the SAME producer source bytes reproduces a
-byte-identical artifact (proof by regeneration: the committed artifact's own
-`source_sha256` values are re-derived and diffed against a fresh render
-before every commit that touches a source file); regenerating after editing
-this module's wording (even prose-only) changes `source_sha256` (and, if a
-finding's wording changed, the affected `findings[].text`) while every
-measured NUMBER stays the same — the two kinds of change are always
-distinguishable from the diff alone.
+SAME `--legs-dir`/`--p2-dir` tree (byte-identical to the one the input
+manifest below names) and the SAME three top-level report files against the
+SAME producer source bytes reproduces a byte-identical artifact (proof by
+regeneration: `test_profile_421_artifact.py`'s own
+`RealFixtureRegenerationTests` regenerates the committed artifact from the
+committed `ci/scripts/perf/fixtures/profile_421_run2/` fixture and diffs it
+byte-for-byte before every commit that touches a source file or that
+fixture); regenerating after editing this module's wording (even prose-only)
+changes `source_sha256` (and, if a finding's wording changed, the affected
+`findings[].text`) while every measured NUMBER stays the same — the two
+kinds of change are always distinguishable from the diff alone.
+
+### Input-completeness
+
+`producer.input_sha256` used to name only the three TOP-LEVEL report files
+(`--merge-json`/`--attribution-json`/`--identity`) — leaving every byte this
+module ALSO reads directly off `--legs-dir`/`--p2-dir` (every leg's own
+`manifest.json` and `census.json`, plus `census.pre-demangle.json` for
+every leg in `KERNEL_IDENTITY_SPLIT_LEGS`, plus every witnessed P2 tower's
+own `manifest.json`) output-affecting but uncaptured (round-4 audit finding
+B4). `build_input_manifest` now walks exactly that closed, declared file
+set (`LEG_INPUT_FILENAMES`, `KERNEL_IDENTITY_SPLIT_LEGS`,
+`P2_TOWER_INPUT_FILENAMES` below) and hashes every one of those files,
+keyed `"legs/<leg_id>/<filename>"` / `"p2/<tower>/<filename>"` (a
+LEG/TOWER-RELATIVE key, never an absolute path, so the manifest's own
+VALUES reproduce byte-identically regardless of which directory
+`--legs-dir`/`--p2-dir` happen to be mounted at — a pod's own scratch path
+vs. this repo's own committed fixture directory). Every actual read this
+module performs off `--legs-dir`/`--p2-dir` is routed through `_leg_file`/
+`_p2_tower_file`, which refuse (by name) a filename outside that declared
+set — a future edit that starts reading some new per-leg file without
+first adding it to `LEG_INPUT_FILENAMES` (and therefore to the manifest) is
+a hard refusal at the point of the read, never a silently uncaptured byte.
+`run_n.json`/`run_m.json` (per leg) and each P2 tower's own `run.json` are
+NOT in this module's own manifest — `profile_421_merge.py` reads those to
+produce `--merge-json`, whose bytes are already covered by
+`input_sha256["merge_json"]`; they, and every other file the merge/
+attribution pipeline reads, are committed in the fixture directory (for the
+regeneration test's own end-to-end proof) but are not this module's OWN
+declared read set.
 
 Run: `python3 ci/scripts/perf/profile_421_artifact.py --legs-dir <dir>
 [--p2-dir <dir>] --merge-json <path> --attribution-json <path>
@@ -209,6 +246,17 @@ SOURCE_FILES_FOR_NUMBERS: tuple[Path, ...] = (
 
 class ArtifactBuildError(Exception):
     """Uncomputable or inconsistent input — fails closed, never guesses."""
+
+
+# The fixed marker `producer.identity` is stamped with — `check_cuda_run_
+# artifacts.py`'s rule (j) treats this EXACT string as "this producer
+# declares BOTH `source_sha256` and `input_sha256` always present together"
+# (see that module's own `PRODUCER_SOURCE_IDENTITY_MARKER` and
+# `SOURCE_IDENTITY_DECLARING_PRODUCER_PATHS`, which names
+# `ci/scripts/perf/profile_421_legs.sh` — this module's own `producer.path`
+# — as a known convention-declarer that must stamp this marker on every
+# artifact it emits).
+PRODUCER_SOURCE_IDENTITY_MARKER = "source_sha256+input_manifest"
 
 
 def _finite(value: object, label: str) -> float:
@@ -380,6 +428,89 @@ def _leg_dirs(legs_dir: Path) -> list[Path]:
     return sorted((p for p in legs_dir.iterdir() if p.is_dir()), key=lambda p: p.name)
 
 
+# --------------------------------------------------------------------------- #
+# input-completeness (round-4 audit B4): the CLOSED set of filenames this
+# module itself reads off `--legs-dir`/`--p2-dir`, and the ONE gateway every
+# such read goes through — a filename outside this set is refused AT THE
+# READ, never silently uncaptured by `producer.input_sha256` (see the module
+# doc's "Input-completeness" section).
+# --------------------------------------------------------------------------- #
+LEG_INPUT_FILENAMES: tuple[str, ...] = ("manifest.json", "census.json")
+# Legs whose `census.pre-demangle.json` this module ALSO reads (via
+# `compute_kernel_identity_split_count`, called once per leg named here from
+# `_identity_template_context`) — kept as an explicit, closed list (rather
+# than "whichever leg the call site happens to name") so `build_input_
+# manifest` below can name exactly these bytes without first running
+# `_identity_template_context` to discover them.
+KERNEL_IDENTITY_SPLIT_LEGS: tuple[str, ...] = ("clip-text-A2",)
+P2_TOWER_INPUT_FILENAMES: tuple[str, ...] = ("manifest.json",)
+
+
+def _leg_file(legs_dir: Path, leg_id: str, filename: str, what: str) -> dict:
+    """The ONE gateway for reading a per-leg input file under `--legs-dir`.
+    `filename` outside `LEG_INPUT_FILENAMES` (or `census.pre-demangle.json`
+    for a leg outside `KERNEL_IDENTITY_SPLIT_LEGS`) is refused HERE, at the
+    point of the read — a byte this producer starts reading without first
+    declaring it in the closed set above would otherwise be exactly the
+    "uncaptured input" the round-4 audit's B4 finding named."""
+    allowed = filename in LEG_INPUT_FILENAMES or (
+        filename == "census.pre-demangle.json" and leg_id in KERNEL_IDENTITY_SPLIT_LEGS
+    )
+    if not allowed:
+        raise ArtifactBuildError(
+            f"{leg_id}: refusing to read {filename!r} — not in LEG_INPUT_FILENAMES/"
+            "KERNEL_IDENTITY_SPLIT_LEGS; declare it there (so build_input_manifest captures it) "
+            "before reading it"
+        )
+    return _load_json(legs_dir / leg_id / filename, what)
+
+
+def _p2_tower_file(p2_dir: Path, tower: str, filename: str, what: str) -> dict:
+    """The ONE gateway for reading a per-P2-tower input file under
+    `--p2-dir` — mirrors `_leg_file` above; a filename outside
+    `P2_TOWER_INPUT_FILENAMES` is refused at the read."""
+    if filename not in P2_TOWER_INPUT_FILENAMES:
+        raise ArtifactBuildError(
+            f"p2/{tower}: refusing to read {filename!r} — not in P2_TOWER_INPUT_FILENAMES; declare it "
+            "there (so build_input_manifest captures it) before reading it"
+        )
+    return _load_json(p2_dir / tower / filename, what)
+
+
+def build_input_manifest(legs_dir: Path, p2_dir: Path | None, p2_towers: list[str]) -> dict[str, str]:
+    """Walks the CLOSED, declared file set (`LEG_INPUT_FILENAMES`,
+    `KERNEL_IDENTITY_SPLIT_LEGS`, `P2_TOWER_INPUT_FILENAMES`) and hashes
+    every one of those files — this producer's own full account of every
+    byte it reads off `--legs-dir`/`--p2-dir`, keyed `"legs/<leg_id>/
+    <filename>"` / `"p2/<tower>/<filename>"` (a leg/tower-RELATIVE key,
+    never an absolute path, so the manifest's own VALUES reproduce byte-
+    identically regardless of which directory `--legs-dir`/`--p2-dir`
+    happen to be mounted at). A declared file that does not exist is a hard
+    refusal, never a silently-shrunk manifest (round-4 audit B4)."""
+    manifest: dict[str, str] = {}
+    for leg_dir in _leg_dirs(legs_dir):
+        for filename in LEG_INPUT_FILENAMES:
+            path = leg_dir / filename
+            if not path.is_file():
+                raise ArtifactBuildError(f"{leg_dir.name}: expected input file {filename!r} missing under --legs-dir")
+            manifest[f"legs/{leg_dir.name}/{filename}"] = _sha256_file(path, f"{leg_dir.name}/{filename}")
+    for leg_id in KERNEL_IDENTITY_SPLIT_LEGS:
+        path = legs_dir / leg_id / "census.pre-demangle.json"
+        if not path.is_file():
+            raise ArtifactBuildError(f"{leg_id}: expected input file 'census.pre-demangle.json' missing under --legs-dir")
+        manifest[f"legs/{leg_id}/census.pre-demangle.json"] = _sha256_file(path, f"{leg_id}/census.pre-demangle.json")
+    if p2_towers:
+        if p2_dir is None:
+            raise ArtifactBuildError("--merge-json carries p2_bf16 rows but --p2-dir is None building the input manifest")
+        for tower in p2_towers:
+            for filename in P2_TOWER_INPUT_FILENAMES:
+                path = p2_dir / tower / filename
+                if not path.is_file():
+                    raise ArtifactBuildError(f"p2/{tower}: expected input file {filename!r} missing under --p2-dir")
+                manifest[f"p2/{tower}/{filename}"] = _sha256_file(path, f"p2/{tower}/{filename}")
+    return manifest
+
+
 def p2_tower_names(merge_report: dict) -> list[str]:
     """The distinct, sorted tower names `--merge-json`'s own `p2_bf16` rows
     name — the set of P2 towers THIS merge report claims to have measured,
@@ -429,7 +560,7 @@ def collect_identity(legs_dir: Path, p2_dir: Path | None, p2_towers: list[str]) 
     """
     seen: dict[str, tuple[str, str]] = {}
     for leg_dir in _leg_dirs(legs_dir):
-        manifest = _load_json(leg_dir / "manifest.json", f"{leg_dir.name}: manifest.json")
+        manifest = _leg_file(legs_dir, leg_dir.name, "manifest.json", f"{leg_dir.name}: manifest.json")
         git_sha = manifest.get("git_sha")
         box = manifest.get("box")
         if not isinstance(git_sha, str) or not git_sha:
@@ -453,7 +584,7 @@ def collect_identity(legs_dir: Path, p2_dir: Path | None, p2_towers: list[str]) 
                     f"p2/{tower}: --merge-json's p2_bf16 names this tower but no manifest.json exists "
                     f"under --p2-dir {p2_dir} — a missing P2 manifest is a refusal, never a silent skip"
                 )
-            manifest = _load_json(manifest_path, f"p2/{tower}: manifest.json")
+            manifest = _p2_tower_file(p2_dir, tower, "manifest.json", f"p2/{tower}: manifest.json")
             git_sha = manifest.get("git_sha")
             box = manifest.get("box")
             if not isinstance(git_sha, str) or not git_sha:
@@ -586,7 +717,7 @@ def build_legs(merge_report: dict, attribution_report: dict, legs_dir: Path) -> 
         leg_id = leg_dir.name
         merge_leg = merge_by_id[leg_id]
         attr_leg = attr_by_id[leg_id]
-        census = _load_json(leg_dir / "census.json", f"{leg_id}: census.json")
+        census = _leg_file(legs_dir, leg_id, "census.json", f"{leg_id}: census.json")
         launches = _finite(census.get("launches_per_step"), f"{leg_id}: census.json launches_per_step")
 
         row: dict[str, object] = {"leg_id": leg_id}
@@ -794,11 +925,18 @@ def compute_findings(
                 "dominating wall time)."
             )
         else:
+            # The not-front-end-bound arm names the SAME front-end
+            # MECHANISM (audio decode/resample/STFT/mel) but drops
+            # "dominating" — a magnitude/comparative word this arm has
+            # exactly NOT earned (the share-of-wall rule that would license
+            # it did not hold on every leg read). Round-4 audit B2: this
+            # clause used to keep the comparative regardless of which arm
+            # fired.
             bound_clause = (
                 f"HTSAT's front-end share of wall is {share_range}% across the F32/BF16 decision legs (rule: "
                 f"front_share_of_wall >= {FRONT_END_BOUND_SHARE_OF_WALL_MIN:.0%} on every leg read was NOT met "
-                "on every leg, so 'front-end-bound' is not asserted; audio decode/resample/STFT/mel dominating "
-                "wall time)."
+                "on every leg, so 'front-end-bound' is not asserted; the front-end work here is audio "
+                "decode/resample/STFT/mel)."
             )
 
         evidence: dict[str, object] = {
@@ -877,7 +1015,7 @@ def compute_findings(
         for leg_id in launch_legs:
             if leg_id not in legs_by_id:
                 raise ArtifactBuildError(f"{leg_id}: not present under --legs-dir; cannot build the launch-bound finding")
-            census = _load_json(legs_dir / leg_id / "census.json", f"{leg_id}: census.json")
+            census = _leg_file(legs_dir, leg_id, "census.json", f"{leg_id}: census.json")
             launches[leg_id] = _finite(census.get("launches_per_step"), f"{leg_id}: census.json launches_per_step")
         busy_deltas_pct: dict[str, float] = {}
         wall_deltas_pct: dict[str, float] = {}
@@ -1054,8 +1192,8 @@ def compute_kernel_identity_split_count(legs_dir: Path, leg_id: str, coalesced_n
     hand-typed count. The identity sidecar's own "N DISTINCT ... instantiations
     sharing shortName=... AND grid/block" prose quotes the MAXIMUM split any
     single `coalesced_name` bucket underwent for this leg."""
-    pre = _load_json(legs_dir / leg_id / "census.pre-demangle.json", f"{leg_id}: census.pre-demangle.json")
-    post = _load_json(legs_dir / leg_id / "census.json", f"{leg_id}: census.json")
+    pre = _leg_file(legs_dir, leg_id, "census.pre-demangle.json", f"{leg_id}: census.pre-demangle.json")
+    post = _leg_file(legs_dir, leg_id, "census.json", f"{leg_id}: census.json")
     pre_rows = pre.get("by_kernel_and_grid")
     post_rows = post.get("by_kernel_and_grid")
     if not isinstance(pre_rows, list) or not isinstance(post_rows, list):
@@ -1126,6 +1264,28 @@ def _identity_template_context(merge_report: dict, attribution_report: dict, leg
     return {
         "htsat_a2_merge_verdict": htsat_a2_merge_verdict,
         "htsat_a2_decision_grade_word": "decision-grade" if htsat_a2_decision_grade else "NOT decision-grade",
+        # The comparison word a deviation's own "UNATTRIBUTED share_gpu_busy
+        # is X%, {word} the Y% validity bound" prose needs — read off the
+        # SAME `htsat_a2_decision_grade` flag the word above is read off
+        # (never independently re-derived from the two percentages, which
+        # would let this word and `htsat_a2_decision_grade_word` disagree if
+        # a caller ever poisoned one without the other): "over" is licensed
+        # ONLY when NOT decision-grade (the gate `profile_421_attribute.py`
+        # itself applies is `share > LIMIT`, i.e. exactly the NOT-
+        # decision-grade case), else the truthful "at or under". Closes the
+        # round-4 audit's B1 finding: a hermetic decision_grade=True fixture
+        # used to still render a hard-coded "over ... validity bound",
+        # self-contradicting its own (correctly live-derived)
+        # "decision-grade" word one clause earlier.
+        "htsat_a2_bound_comparison_word": "over" if not htsat_a2_decision_grade else "at or under",
+        # The status word for a deviation's own closing "so htsat-A2's own
+        # {word} status never blocks a candidate-port decision" clause —
+        # that claim (HTSAT has no candidate port under this contract in
+        # the first place) is true regardless of htsat-A2's own decision-
+        # grade state, so the clause itself is licensed in BOTH arms; only
+        # the STATUS WORD it names must flip with the SAME live flag rather
+        # than hard-coding "non-decision-grade" (round-4 audit B1).
+        "htsat_a2_decision_grade_status_word": "decision-grade" if htsat_a2_decision_grade else "non-decision-grade",
         "htsat_a2_unattributed_share_gpu_busy_pct": _chain_share(
             attribution_legs, "htsat-A2", _attribute_mod.CHAIN_UNATTRIBUTED, "share_gpu_busy"
         )
@@ -1136,7 +1296,9 @@ def _identity_template_context(merge_report: dict, attribution_report: dict, leg
         "corpus_total_files": pool["corpus_total_files"],
         "corpus_train_clips": pool["corpus_train_clips"],
         "corpus_rows_m": pool["corpus_rows_m"],
-        "kernel_identity_split_count": compute_kernel_identity_split_count(legs_dir, "clip-text-A2", "Kernel2"),
+        "kernel_identity_split_count": compute_kernel_identity_split_count(
+            legs_dir, KERNEL_IDENTITY_SPLIT_LEGS[0], "Kernel2"
+        ),
         "leg_count": len(_leg_dirs(legs_dir)),
         "merge_suite_test_count": compute_merge_suite_test_count(),
     }
@@ -1271,11 +1433,20 @@ def main(argv: list[str] | None = None) -> int:
         # artifacts.py` recomputes `source_sha256` at its own HEAD and
         # refuses a mismatch by name).
         report["producer"]["invocation_argv"] = ["profile_421_artifact.py", *argv]
+        # `producer.identity`: the fixed marker `check_cuda_run_
+        # artifacts.py`'s rule (j) requires BOTH `source_sha256` and
+        # `input_sha256` alongside, stamped BEFORE either so a mid-build
+        # refusal below never leaves a half-stamped producer block on a
+        # written artifact (`main` returns 1 before `args.out` is ever
+        # touched on any `ArtifactBuildError`).
+        report["producer"]["identity"] = PRODUCER_SOURCE_IDENTITY_MARKER
         report["producer"]["source_sha256"] = _source_sha256()
+        p2_towers_for_manifest = p2_tower_names(merge_report)
         report["producer"]["input_sha256"] = {
             "merge_json": _sha256_file(merge_json_path, "--merge-json"),
             "attribution_json": _sha256_file(attribution_json_path, "--attribution-json"),
             "identity": _sha256_file(identity_path, "--identity"),
+            **build_input_manifest(legs_dir, p2_dir, p2_towers_for_manifest),
         }
     except ArtifactBuildError as exc:
         print(f"::error::profile_421_artifact: {exc}", file=sys.stderr)

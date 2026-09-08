@@ -1,0 +1,56 @@
+{
+ "leg_id": "clip-vision-A2",
+ "git_sha": "c1b0b0bad1f79a4ad6c298400e6ea19cc1ca633c",
+ "box": "4dc3a4394178",
+ "driver": "ci/scripts/perf/profile_421_legs.sh",
+ "nsys_version": "NVIDIA Nsight Systems version 2025.3.2.474-253236389321v0",
+ "tower": "clip-vision",
+ "task": "image_embedding",
+ "dtype": "bf16",
+ "target_modules": [
+  "in_proj",
+  "out_proj",
+  "c_fc",
+  "c_proj"
+ ],
+ "kernels_disabled": [],
+ "max_seq_length": 77,
+ "batch": 8,
+ "objective": "triplet",
+ "lora_init": "zeros_b",
+ "eval_cadence": 1,
+ "heldout_rows": 8,
+ "steps_declared": {
+  "n": 100,
+  "m": 600
+ },
+ "steps_measured": {
+  "n": 100,
+  "m": 600
+ },
+ "media_front_end_wall_s": {
+  "n": 2.372191203,
+  "m": 14.410173456
+ },
+ "checkpoint_weights_sha256": {
+  "n": "ac4f8c4b88af6d963118cbf40ad93176d092abbedfcb752601ae1866352656e6",
+  "m": "ac4f8c4b88af6d963118cbf40ad93176d092abbedfcb752601ae1866352656e6"
+ },
+ "fusible_site_census": {
+  "n": {
+   "lora_sites_wrapped": 48,
+   "layer_norms": 26,
+   "gelu_seam_calls_per_forward": 0
+  },
+  "m": {
+   "lora_sites_wrapped": 48,
+   "layer_norms": 26,
+   "gelu_seam_calls_per_forward": 0
+  }
+ },
+ "status": "ok",
+ "reason": "",
+ "census_ok": true,
+ "census_exit": 0,
+ "dry_run": false
+}

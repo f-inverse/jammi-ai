@@ -1,0 +1,123 @@
+{
+  "engine_version": "0.49.1",
+  "host": {
+    "logical_cpus": 13,
+    "total_ram_mib": 2051942
+  },
+  "subcommand": "finetune-run",
+  "provenance": {
+    "build_sha": "c1b0b0bad1f79a4ad6c298400e6ea19cc1ca633c",
+    "target": "x86_64-unknown-linux-gnu",
+    "profile": "release",
+    "build_features": [
+      "bench-cuda",
+      "cuda"
+    ],
+    "report_schema_version": 2
+  },
+  "tiers": {
+    "finetune_run": {
+      "seed": 42,
+      "task": "text_embedding",
+      "batch": 8,
+      "seq": 77,
+      "lora_rank": 8,
+      "lora_alpha": 16.0,
+      "lora_dropout": 0.05,
+      "lora_init": "gaussian",
+      "margin": 0.3,
+      "target_modules": [
+        "in_proj",
+        "out_proj",
+        "c_fc",
+        "c_proj"
+      ],
+      "layers_to_transform": null,
+      "backbone_dtype": "bf16",
+      "checkpoint_config_sha256": "4302a891b495ad0966d1e7eeff102b5f34a3f1e647e57a9198933f862d5f8ba7",
+      "checkpoint_weights_sha256": "ac4f8c4b88af6d963118cbf40ad93176d092abbedfcb752601ae1866352656e6",
+      "checkpoint_weights_size_bytes": 605143316,
+      "max_grad_norm": 1.0,
+      "warmup": null,
+      "row_lengths": null,
+      "epochs": 1,
+      "lr": 0.0002,
+      "schedule": "constant",
+      "warmup_steps": 0,
+      "weight_decay": 0.01,
+      "grad_accum": 1,
+      "validation_fraction": 0.0,
+      "train_pairs_file_sha256": "6a991f8b3c5a13eb52e28806ce56bb6ce62669e792a98a3e2041ce30d8131fba",
+      "train_media_sha256": null,
+      "heldout_ids_sha256": "a2ef64f35190968bd266227d8d82f0c3efda89c23e6a1844cc7589b155c51066",
+      "heldout_pairs_sha256": "255a0dd5d9d33b70c9f3132173d9760f8d04e96550376a65203446ae77b0095c",
+      "heldout_media_sha256": null,
+      "heldout_batch_partition_sha256": "5408e26adf5794dfd3d131f1956e6ea64f5ad29962c74a49a718d345a227c0ad",
+      "embedding_loss": "triplet",
+      "temperature": null,
+      "matryoshka_dims": [],
+      "early_stopping_patience": 10000,
+      "early_stopping_metric": "train_loss",
+      "eval_cadence": 1,
+      "arm": "fused",
+      "device_name": "NVIDIA A100-SXM4-80GB",
+      "kernels_disabled_requested": [],
+      "kernels_disabled_fired": [],
+      "kernels_disabled_expected": [],
+      "fusible_site_census": {
+        "lora_sites_wrapped": 48,
+        "layer_norms": 25,
+        "gelu_seam_calls_per_forward": 0
+      },
+      "flash_compiled": false,
+      "build_features": [
+        "bench-cuda",
+        "cuda"
+      ],
+      "attention_arm": "fused",
+      "split_rule": "positional_fraction_split",
+      "batched_forward": true,
+      "steps_measured": 2,
+      "ln_fused_dispatches": 50,
+      "ln_eager_dispatches": 0,
+      "rope_fused_dispatches": 0,
+      "rope_eager_dispatches": 0,
+      "softmax_fused_dispatches": 0,
+      "softmax_eager_dispatches": 0,
+      "geglu_fused_dispatches": 0,
+      "geglu_eager_dispatches": 0,
+      "gelu_fused_dispatches": 0,
+      "gelu_eager_dispatches": 0,
+      "lora_epilogue_fused_dispatches": 0,
+      "lora_epilogue_eager_dispatches": 0,
+      "lora_linear_fused_dispatches": 96,
+      "lora_linear_eager_dispatches": 0,
+      "attention_block_fused_dispatches": 0,
+      "attention_block_eager_dispatches": 0,
+      "adamw_fused_dispatches": 192,
+      "adamw_eager_dispatches": 0,
+      "attention_block_flash_fused_dispatches": 0,
+      "attention_block_flash_declined_dispatches": 0,
+      "admission_is_dense": false,
+      "tie_fraction": 0.0,
+      "final_epoch": 0,
+      "held_out_example_mean": 0.32568359375,
+      "held_out_count": 8,
+      "final_loss_diagnostic": 0.2900390625,
+      "trajectory": [
+        {
+          "epoch": 0,
+          "held_out_mean": 0.32568359375,
+          "held_out_tie_fraction": 0.0,
+          "held_out_batch_partition_sha256": "5408e26adf5794dfd3d131f1956e6ea64f5ad29962c74a49a718d345a227c0ad"
+        }
+      ],
+      "train_probe_series": [
+        0.28857421875,
+        0.23291015625
+      ],
+      "train_run_wall_s": 0.204259118,
+      "media_front_end_wall_s": null
+    }
+  }
+}

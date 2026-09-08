@@ -47,6 +47,17 @@ from pathlib import Path
 PERF_DIR = Path(__file__).resolve().parent
 ARTIFACT = PERF_DIR / "profile_421_artifact.py"
 IDENTITY_SIDECAR = PERF_DIR / "profile_421_run2_identity.json"
+MERGE_SCRIPT = PERF_DIR / "profile_421_merge.py"
+ATTRIBUTE_SCRIPT = PERF_DIR / "profile_421_attribute.py"
+REAL_FIXTURE_DIR = PERF_DIR / "fixtures" / "profile_421_run2"
+REAL_COMMITTED_ARTIFACT = (
+    PERF_DIR.parents[2]
+    / "crates"
+    / "jammi-kernels"
+    / "artifacts"
+    / "cuda-runs"
+    / "2026-09-07-profile-421-towers-c1b0b0ba-a100-sxm4.json"
+)
 
 sys.path.insert(0, str(PERF_DIR))
 import profile_421_artifact as art  # noqa: E402
@@ -89,8 +100,9 @@ IDENTITY_TEMPLATE_DEVIATIONS = [
     (
         "htsat-A2 is {htsat_a2_merge_verdict} at the merge level but {htsat_a2_decision_grade_word} for "
         "attribution: UNATTRIBUTED share_gpu_busy is {htsat_a2_unattributed_share_gpu_busy_pct:.2f}%, "
-        "over the {unattributed_decision_grade_limit_pct:.0f}% validity bound "
-        "({unknown_kernel_share_limit_pct:.0f}% known-kernel-name gate)."
+        "{htsat_a2_bound_comparison_word} the {unattributed_decision_grade_limit_pct:.0f}% validity bound "
+        "({unknown_kernel_share_limit_pct:.0f}% known-kernel-name gate). So htsat-A2's own "
+        "{htsat_a2_decision_grade_status_word} status never blocks a candidate-port decision."
     ),
     "raw sqlite exports: {sqlite_raw_export_count} files.",
     "corpus: {corpus_total_files} files, {corpus_train_clips} distinct train clips, {corpus_rows_m} rows.",
@@ -420,6 +432,20 @@ class TemplatedDeviationTests(unittest.TestCase):
         self.assertIn("but decision-grade for attribution", self.deviations[1])
         self.assertNotIn("NOT decision-grade", self.deviations[1])
 
+    def test_htsat_a2_bound_comparison_word_is_truthful_in_the_decision_grade_arm(self):
+        # Round-4 audit B1: the base fixture has htsat-A2 decision_grade
+        # True with UNATTRIBUTED share_gpu_busy (2%) UNDER the 5% bound --
+        # the comparison word must say so ("at or under"), never the
+        # hard-coded "over" this deviation used to carry unconditionally
+        # (a decision_grade=True leg whose own prose still claimed it was
+        # over the bound was a self-contradiction the suite asserted as
+        # correct). The closing clause's own STATUS WORD must agree with
+        # the SAME live decision_grade flag too.
+        self.assertIn("at or under the 5% validity bound", self.deviations[1])
+        self.assertNotIn("over the 5% validity bound", self.deviations[1])
+        self.assertIn("own decision-grade status never blocks a candidate-port decision", self.deviations[1])
+        self.assertNotIn("non-decision-grade status", self.deviations[1])
+
     def test_htsat_a2_not_decision_grade_word_flips_live(self):
         def poison(attribution_report):
             for row in attribution_report["legs"]:
@@ -431,7 +457,15 @@ class TemplatedDeviationTests(unittest.TestCase):
         report = art.build_report(
             fixture["legs_dir"], fixture["p2_dir"], fixture["merge_report"], fixture["attribution_report"], fixture["identity"]
         )
-        self.assertIn("but NOT decision-grade for attribution", report["notes"]["recorded_deviations"][1])
+        deviation = report["notes"]["recorded_deviations"][1]
+        self.assertIn("but NOT decision-grade for attribution", deviation)
+        # The comparison word and the closing clause's status word flip
+        # TOGETHER with the same live flag -- "over" and "non-decision-
+        # grade" are each licensed ONLY in this (actually non-decision-
+        # grade) arm, never the other way around (round-4 audit B1).
+        self.assertIn("over the 5% validity bound", deviation)
+        self.assertNotIn("at or under the 5% validity bound", deviation)
+        self.assertIn("own non-decision-grade status never blocks a candidate-port decision", deviation)
 
     def test_htsat_a2_not_merge_valid_refuses_the_template_context(self):
         def poison(merge_report):
@@ -838,6 +872,22 @@ class QualitativeWordRuleTests(unittest.TestCase):
         self.assertFalse(finding["evidence"]["front_end_bound"])
         # The numbers are still stated even though the word is dropped.
         self.assertIn("30-83%", finding["text"])
+        # Round-4 audit B2: the not-front-end-bound arm names the SAME
+        # front-end MECHANISM (audio decode/resample/STFT/mel) but must
+        # drop every comparative/magnitude word ("dominating") the rule
+        # did NOT license on every leg read -- a mechanism description,
+        # never an unqualified magnitude claim.
+        self.assertIn("audio decode/resample/STFT/mel", finding["text"])
+        self.assertNotIn("dominating", finding["text"])
+
+    def test_front_end_bound_word_present_still_carries_dominating_clause(self):
+        # The licensed (True) arm keeps the magnitude word -- the rule DID
+        # hold on every leg read, so "dominating" is an earned claim here,
+        # not a hard-coded one (contrast with the dropped-word test above).
+        findings, _ = self._findings()
+        finding = self._by_id(findings)["htsat-front-end-bound"]
+        self.assertIn("dominating", finding["text"])
+        self.assertIn("audio decode/resample/STFT/mel", finding["text"])
 
     # -- "dtype- and arm-invariant" ---------------------------------------
     def test_arm_invariant_clause_absent_when_d_legs_are_not_present(self):
@@ -1411,12 +1461,27 @@ class CliEndToEndTests(unittest.TestCase):
         # invocation — never present on the hermetic `build_report` output,
         # only on the CLI's.
         producer = report["producer"]
-        self.assertEqual(
-            set(producer["input_sha256"].keys()), {"merge_json", "attribution_json", "identity"}
-        )
+        # `input_sha256` now names BOTH the three top-level report files AND
+        # a full manifest over every file this producer itself reads off
+        # `--legs-dir`/`--p2-dir` (round-4 audit B4) — one
+        # `"legs/<leg_id>/manifest.json"` + `"legs/<leg_id>/census.json"`
+        # pair per fixture leg, `"legs/clip-text-A2/census.pre-demangle.
+        # json"` (the ONE leg in `art.KERNEL_IDENTITY_SPLIT_LEGS`), and
+        # `"p2/<tower>/manifest.json"` per witnessed P2 tower.
+        expected_input_keys = {"merge_json", "attribution_json", "identity"}
+        for leg_id in LEG_SPECS:
+            expected_input_keys.add(f"legs/{leg_id}/manifest.json")
+            expected_input_keys.add(f"legs/{leg_id}/census.json")
+        for leg_id in art.KERNEL_IDENTITY_SPLIT_LEGS:
+            expected_input_keys.add(f"legs/{leg_id}/census.pre-demangle.json")
+        for tower in ("clip-text",):  # this fixture's own p2_towers
+            expected_input_keys.add(f"p2/{tower}/manifest.json")
+        self.assertEqual(set(producer["input_sha256"].keys()), expected_input_keys)
         for digest in producer["input_sha256"].values():
             self.assertRegex(digest, r"^[0-9a-f]{64}$")
         self.assertNotIn("tree_sha", producer)
+        self.assertEqual(producer["identity"], "source_sha256+input_manifest")
+        self.assertEqual(producer["identity"], art.PRODUCER_SOURCE_IDENTITY_MARKER)
         self.assertEqual(
             set(producer["source_sha256"].keys()),
             {
@@ -1473,6 +1538,72 @@ class CliEndToEndTests(unittest.TestCase):
         self.assertEqual(report["producer"]["input_sha256"]["attribution_json"], expected_attr_sha)
         self.assertEqual(report["producer"]["input_sha256"]["identity"], expected_identity_sha)
 
+    def test_cli_input_manifest_legs_and_p2_hashes_match_independent_walk_of_the_fixture(self):
+        """Round-4 audit B4: every byte read off `--legs-dir`/`--p2-dir` is
+        output-affecting and must be captured — checked here against an
+        INDEPENDENT walk of the SAME fixture directory (never a value read
+        back out of the module under test)."""
+        import hashlib
+
+        out_path = self.root / "artifact.json"
+        result = run_artifact_cli(
+            "--legs-dir", str(self.fixture["legs_dir"]),
+            "--p2-dir", str(self.fixture["p2_dir"]),
+            "--merge-json", str(self.fixture["merge_path"]),
+            "--attribution-json", str(self.fixture["attr_path"]),
+            "--identity", str(self.fixture["identity_path"]),
+            "--out", str(out_path),
+        )
+        self.assertEqual(result.returncode, 0, f"stdout={result.stdout}\nstderr={result.stderr}")
+        report = json.loads(out_path.read_text())
+        input_sha256 = report["producer"]["input_sha256"]
+
+        for leg_id in LEG_SPECS:
+            for filename in ("manifest.json", "census.json"):
+                path = self.fixture["legs_dir"] / leg_id / filename
+                expected = hashlib.sha256(path.read_bytes()).hexdigest()
+                self.assertEqual(input_sha256[f"legs/{leg_id}/{filename}"], expected)
+        for leg_id in art.KERNEL_IDENTITY_SPLIT_LEGS:
+            path = self.fixture["legs_dir"] / leg_id / "census.pre-demangle.json"
+            expected = hashlib.sha256(path.read_bytes()).hexdigest()
+            self.assertEqual(input_sha256[f"legs/{leg_id}/census.pre-demangle.json"], expected)
+        for tower in ("clip-text",):
+            path = self.fixture["p2_dir"] / tower / "manifest.json"
+            expected = hashlib.sha256(path.read_bytes()).hexdigest()
+            self.assertEqual(input_sha256[f"p2/{tower}/manifest.json"], expected)
+        # `run_n.json`/`run_m.json` (per leg) and each P2 tower's own
+        # `run.json` are NOT this producer's own declared read set (module
+        # doc, "Input-completeness") -- they never appear here.
+        for key in input_sha256:
+            self.assertNotIn("run_n.json", key)
+            self.assertNotIn("run_m.json", key)
+            self.assertNotIn("/run.json", key)
+
+    def test_leg_file_refuses_a_filename_outside_the_declared_set(self):
+        with self.assertRaises(art.ArtifactBuildError) as ctx:
+            art._leg_file(self.fixture["legs_dir"], "clip-text-A1", "run_n.json", "clip-text-A1: run_n.json")
+        self.assertIn("refusing to read", str(ctx.exception))
+        self.assertIn("run_n.json", str(ctx.exception))
+
+    def test_leg_file_refuses_pre_demangle_json_outside_kernel_identity_split_legs(self):
+        with self.assertRaises(art.ArtifactBuildError) as ctx:
+            art._leg_file(
+                self.fixture["legs_dir"], "htsat-A1", "census.pre-demangle.json", "htsat-A1: census.pre-demangle.json"
+            )
+        self.assertIn("refusing to read", str(ctx.exception))
+
+    def test_p2_tower_file_refuses_a_filename_outside_the_declared_set(self):
+        with self.assertRaises(art.ArtifactBuildError) as ctx:
+            art._p2_tower_file(self.fixture["p2_dir"], "clip-text", "run.json", "p2/clip-text: run.json")
+        self.assertIn("refusing to read", str(ctx.exception))
+        self.assertIn("run.json", str(ctx.exception))
+
+    def test_build_input_manifest_refuses_a_missing_declared_file(self):
+        (self.fixture["legs_dir"] / "clip-text-A1" / "census.json").unlink()
+        with self.assertRaises(art.ArtifactBuildError) as ctx:
+            art.build_input_manifest(self.fixture["legs_dir"], self.fixture["p2_dir"], ["clip-text"])
+        self.assertIn("missing under --legs-dir", str(ctx.exception))
+
     def test_cli_refuses_missing_p2_dir_when_merge_has_p2_rows(self):
         result = run_artifact_cli(
             "--legs-dir", str(self.fixture["legs_dir"]),
@@ -1497,6 +1628,167 @@ class CliEndToEndTests(unittest.TestCase):
         )
         self.assertNotEqual(result.returncode, 0)
         self.assertIn("disagree", result.stderr)
+
+
+class RealFixtureRegenerationTests(unittest.TestCase):
+    """Round-4 audit B4's own "regeneration proven in CI" precondition,
+    made real: `ci/scripts/perf/fixtures/profile_421_run2/` is the REAL
+    pod p421 run2 pull (see that directory's own `PROVENANCE.md`) — every
+    file `profile_421_merge.py`/`profile_421_attribute.py`/
+    `profile_421_artifact.py` read to produce the committed
+    `2026-09-07-profile-421-towers-c1b0b0ba-a100-sxm4.json` artifact, minus
+    only `*.stderr`/`*.stdout` (never read) and files superseded/never
+    pulled before this repo could commit them (that directory's own
+    PROVENANCE.md names each). This class is NOT decorator-gated (no
+    `@unittest.skipUnless`, no `JAMMI_CI_*` env-var check) — it needs no
+    GPU, no network, and no optional dependency, only files already
+    committed to this repo, so it runs UNCONDITIONALLY every time this
+    already-CI-wired suite runs (`.github/workflows/ci.yml`'s "profile_421
+    artifact suite" step) — the "zero-execution is RED, not a skip"
+    doctrine applied by simply never introducing an execution gap to
+    guard against, rather than by adding a gate and then separately
+    proving the gate opens."""
+
+    def setUp(self):
+        self._tmp = tempfile.TemporaryDirectory()
+        self.root = Path(self._tmp.name)
+
+    def tearDown(self):
+        self._tmp.cleanup()
+
+    def test_merge_regenerates_the_fixtures_own_committed_merge_json(self):
+        # `profile_421_merge.py` over the SAME fixture legs/p2 dirs
+        # reproduces the fixture's own committed `merge.json` structurally
+        # (every field except `legs_dir`/`p2_dir`, which echo back
+        # whichever directory was PASSED and therefore legitimately differ
+        # between this checkout's own path and the original pod path) —
+        # the full-pipeline half of the regeneration promise, not just the
+        # close-out producer's own narrower slice.
+        out_path = self.root / "merge.json"
+        result = subprocess.run(
+            [
+                sys.executable, str(MERGE_SCRIPT),
+                "--legs-dir", str(REAL_FIXTURE_DIR / "legs"),
+                "--p2-dir", str(REAL_FIXTURE_DIR / "p2-bf16"),
+                "--out", str(out_path),
+            ],
+            capture_output=True, text=True, timeout=120,
+        )
+        self.assertEqual(result.returncode, 0, f"stdout={result.stdout}\nstderr={result.stderr}")
+        regenerated = json.loads(out_path.read_text())
+        committed = json.loads((REAL_FIXTURE_DIR / "merge.json").read_text())
+        for key in set(regenerated) | set(committed):
+            if key in ("legs_dir", "p2_dir"):
+                continue
+            self.assertEqual(regenerated.get(key), committed.get(key), f"merge.json[{key!r}] regenerated differently")
+
+    def test_attribute_regenerates_the_fixtures_own_committed_attribution_json(self):
+        # `profile_421_attribute.py` over the SAME fixture legs dir +
+        # its own committed `merge.json` reproduces the fixture's own
+        # committed `attribution.json` structurally (every field except
+        # `legs_dir`, which echoes back whichever directory was PASSED and
+        # therefore legitimately differs between this checkout's own path
+        # and the original pod path — same convention as `merge.json`'s
+        # own `legs_dir`/`p2_dir` echo). This module is otherwise
+        # deterministic: no timestamp, no wall-clock-dependent field.
+        out_path = self.root / "attribution.json"
+        result = subprocess.run(
+            [
+                sys.executable, str(ATTRIBUTE_SCRIPT),
+                "--legs-dir", str(REAL_FIXTURE_DIR / "legs"),
+                "--merge-json", str(REAL_FIXTURE_DIR / "merge.json"),
+                "--out", str(out_path),
+                "--no-table",
+            ],
+            capture_output=True, text=True, timeout=120,
+        )
+        self.assertEqual(result.returncode, 0, f"stdout={result.stdout}\nstderr={result.stderr}")
+        regenerated = json.loads(out_path.read_text())
+        committed = json.loads((REAL_FIXTURE_DIR / "attribution.json").read_text())
+        for key in set(regenerated) | set(committed):
+            if key == "legs_dir":
+                continue
+            self.assertEqual(
+                regenerated.get(key), committed.get(key), f"attribution.json[{key!r}] regenerated differently"
+            )
+
+    def test_artifact_regenerates_the_real_committed_artifact_byte_identically(self):
+        # The close-out producer itself, driven end to end off the
+        # fixture's own committed `merge.json`/`attribution.json`/
+        # `--legs-dir`/`--p2-dir` plus the REAL (not synthetic)
+        # `profile_421_run2_identity.json` sidecar -- every measured
+        # NUMBER, every finding's text, every note string, and every
+        # `producer` content-identity field must come out BYTE IDENTICAL
+        # to the already-committed artifact (itself regenerated the SAME
+        # way, from this SAME fixture, as part of closing round-4 audit
+        # B4/B1/B2). Only `producer.invocation_argv` is LICENSED to
+        # differ: it echoes back THIS run's own `--legs-dir`/etc. argv,
+        # which is a real, valid, repo-relative path (the SAME one the
+        # committed artifact's own `invocation_argv` already names) but
+        # not guaranteed to be the identical argv string forever (a
+        # renamed fixture directory, e.g., would legitimately change it
+        # without changing any measured number).
+        out_path = self.root / "artifact.json"
+        result = run_artifact_cli(
+            "--legs-dir", str(REAL_FIXTURE_DIR / "legs"),
+            "--p2-dir", str(REAL_FIXTURE_DIR / "p2-bf16"),
+            "--merge-json", str(REAL_FIXTURE_DIR / "merge.json"),
+            "--attribution-json", str(REAL_FIXTURE_DIR / "attribution.json"),
+            "--identity", str(IDENTITY_SIDECAR),
+            "--out", str(out_path),
+        )
+        self.assertEqual(result.returncode, 0, f"stdout={result.stdout}\nstderr={result.stderr}")
+        regenerated = json.loads(out_path.read_text())
+        committed = json.loads(REAL_COMMITTED_ARTIFACT.read_text())
+
+        non_producer_keys = (set(regenerated) | set(committed)) - {"producer"}
+        for key in non_producer_keys:
+            self.assertEqual(
+                regenerated.get(key), committed.get(key), f"artifact[{key!r}] is not byte-identical on regeneration"
+            )
+
+        regen_producer = regenerated["producer"]
+        committed_producer = committed["producer"]
+        for key in ("path", "kind", "invocation", "gating", "identity", "source_sha256", "input_sha256"):
+            self.assertEqual(
+                regen_producer[key], committed_producer[key], f"producer.{key} is not byte-identical on regeneration"
+            )
+        self.assertEqual(regen_producer["identity"], "source_sha256+input_manifest")
+
+        # The expanded input manifest: exactly one "legs/<leg>/manifest.json"
+        # + "legs/<leg>/census.json" pair per fixture leg (12), one
+        # "legs/clip-text-A2/census.pre-demangle.json" (the ONE leg in
+        # art.KERNEL_IDENTITY_SPLIT_LEGS), and one "p2/<tower>/manifest.json"
+        # per witnessed P2 tower (3) -- 12*2 + 1 + 3 = 28 keys, PLUS the
+        # three original top-level report files -- 31 total (round-4 audit
+        # B4: every byte read off --legs-dir/--p2-dir, captured).
+        manifest_only_keys = {k for k in regen_producer["input_sha256"] if k.startswith(("legs/", "p2/"))}
+        self.assertEqual(len(manifest_only_keys), 28)
+        self.assertEqual(len(regen_producer["input_sha256"]), 31)
+        for key in manifest_only_keys:
+            self.assertRegex(regen_producer["input_sha256"][key], r"^[0-9a-f]{64}$")
+
+        # `invocation_argv` is licensed to differ (absolute vs. repo-
+        # relative --legs-dir/etc. strings resolve to the SAME files but
+        # are not the same argv bytes) -- checked structurally (the same
+        # FLAGS, in the same order) rather than for byte equality.
+        regen_flags = [a for a in regen_producer["invocation_argv"] if a.startswith("--")]
+        committed_flags = [a for a in committed_producer["invocation_argv"] if a.startswith("--")]
+        self.assertEqual(regen_flags, committed_flags)
+
+        # No `findings[].text` / `notes` string differs on THIS real data:
+        # htsat-A1/A2's front_share_of_wall (~81%/~83%) clears
+        # FRONT_END_BOUND_SHARE_OF_WALL_MIN on every leg read (round-4
+        # audit B2's neutral-arm rewrite never fires here), and htsat-A2's
+        # own UNATTRIBUTED share (~5.66%) is genuinely OVER the 5% bound
+        # (round-4 audit B1's rule-derived comparison word/status word
+        # compute to the SAME "over"/"non-decision-grade" text the old
+        # hard-coded prose happened to already have on THIS run) —
+        # asserted explicitly here (not just implied by the blanket
+        # top-level equality above) so a reviewer sees the claim, not just
+        # the pass.
+        self.assertEqual(regenerated["findings"], committed["findings"])
+        self.assertEqual(regenerated["notes"], committed["notes"])
 
 
 if __name__ == "__main__":

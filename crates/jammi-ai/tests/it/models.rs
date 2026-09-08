@@ -826,3 +826,60 @@ async fn fine_tuned_adapter_bundle_missing_file_refuses_as_typed_model_error() {
         "refusal must name the missing file, got: {message}"
     );
 }
+
+/// esc-089 backstop: a catalog corrupted by a pre-fix build (the model
+/// cache's post-load bookkeeping used to rewrite ANY resolved id's
+/// `model_type` unconditionally) can leave a `jammi:fine-tuned:{job_id}`
+/// row typed as `"huggingface"` instead of `"fine-tuned"`. Nothing else ever
+/// mints this reserved prefix (`fine_tuned_model_id` is its sole producer),
+/// so this shape can only be corruption, never an honestly-registered base
+/// model that happens to share the naming convention. `try_catalog_lookup`
+/// must refuse it by name rather than resolve it as a base checkpoint —
+/// serving the unadapted base with no signal is exactly the esc-089 failure
+/// this whole unit exists to close.
+#[tokio::test]
+async fn fine_tuned_prefix_with_wrong_model_type_refuses_to_resolve() {
+    use jammi_db::catalog::model_repo::RegisterModelParams;
+
+    let dir = tempdir().unwrap();
+    let catalog = Arc::new(Catalog::open(dir.path()).await.unwrap());
+    let base_dir = crate::common::cookbook_fixture("tiny_bert");
+    let base_id = format!("local:{}", base_dir.display());
+
+    catalog
+        .register_model(RegisterModelParams {
+            model_id: "jammi:fine-tuned:corrupted-by-old-build",
+            version: 1,
+            model_type: "huggingface",
+            backend: "candle",
+            task: ModelTask::TextEmbedding,
+            base_model_id: Some(&base_id),
+            artifact_path: Some(base_dir.to_str().unwrap()),
+            config_json: None,
+        })
+        .await
+        .unwrap();
+
+    let resolver = ModelResolver::new(catalog, crate::common::test_artifact_store()).unwrap();
+    let source = ModelSource::hf("jammi:fine-tuned:corrupted-by-old-build");
+    let result = resolver
+        .resolve(&source, ModelTask::TextEmbedding, None)
+        .await;
+    let err = match result {
+        Ok(_) => panic!(
+            "a jammi:fine-tuned: id whose row is typed 'huggingface' must refuse to \
+             resolve, never silently serve the row's artifact_path as an ordinary \
+             base checkpoint"
+        ),
+        Err(e) => e,
+    };
+    let message = err.to_string();
+    assert!(
+        message.contains("jammi:fine-tuned:corrupted-by-old-build"),
+        "refusal must name the broken model id, got: {message}"
+    );
+    assert!(
+        message.contains("huggingface"),
+        "refusal must name the row's actual (wrong) model_type, got: {message}"
+    );
+}

@@ -25,6 +25,21 @@ use super::{
 /// tracked-candidate list share ONE spelling of every weights file name.
 const GGUF_WEIGHTS_FILENAME: &str = arch::GGUF_WEIGHTS_FILENAME;
 
+/// The unforgeable prefix every trained-output model id carries — mirrors
+/// [`crate::fine_tune::training_job::fine_tuned_model_id`]'s
+/// `"jammi:fine-tuned:{job_id}"` format string verbatim (that function is the
+/// one and only minter; this is a reader-side recognizer, not a second
+/// source of truth for the format).
+///
+/// A catalog row whose `model_id` carries this prefix but whose `model_type`
+/// column is NOT `"fine-tuned"` cannot be an ordinary base model that
+/// happens to share the naming convention — nothing else mints an id shaped
+/// like this — so it can only be a row a pre-esc-089 build corrupted (the
+/// model cache's load-bookkeeping used to rewrite `model_type` and
+/// `artifact_path` unconditionally). [`ModelResolver::try_catalog_lookup`]
+/// refuses such a row by name rather than serving it as a base checkpoint.
+const FINE_TUNED_ID_PREFIX: &str = "jammi:fine-tuned:";
+
 /// Resolves a `ModelSource` to file paths and backend selection.
 pub struct ModelResolver {
     catalog: Arc<Catalog>,
@@ -89,6 +104,36 @@ impl ModelResolver {
             Some(r) => r,
             None => return Ok(None),
         };
+
+        // esc-089 backstop: the id shape and the row's `model_type` must
+        // agree. `ModelSource::parse` maps a `jammi:fine-tuned:{job_id}`
+        // string to `HuggingFace` exactly like a real Hub repo id, so ONLY
+        // the catalog row distinguishes the two — and only
+        // `fine_tuned_model_id` ever mints this prefix. A row bearing the
+        // prefix but a different `model_type` cannot be an honest base
+        // model; it is a catalog a pre-esc-089 build corrupted (or someone
+        // reused the reserved prefix by hand). Refuse it by name rather than
+        // resolve it as a base checkpoint and silently drop the fine-tuning.
+        if model_id.0.starts_with(FINE_TUNED_ID_PREFIX) && record.model_type != "fine-tuned" {
+            return Err(JammiError::Model {
+                model_id: model_id.0.clone(),
+                message: format!(
+                    "'{}' carries the reserved fine-tuned-output prefix \
+                     '{FINE_TUNED_ID_PREFIX}' but its catalog row is typed \
+                     '{}', not 'fine-tuned' — this catalog was corrupted by a \
+                     build predating esc-089 (the model cache's post-load \
+                     bookkeeping used to rewrite this row's type, \
+                     base_model_id and artifact_path unconditionally). \
+                     Refusing to resolve it as a base model, which would \
+                     silently serve the unadapted checkpoint with no signal. \
+                     Remedy: re-run the fine-tune job that produced this id \
+                     so it re-finalizes the row, or repair the row's \
+                     model_type/base_model_id/artifact_path columns by hand \
+                     from its training_jobs record.",
+                    model_id.0, record.model_type
+                ),
+            });
+        }
 
         // For fine-tuned models: resolve via the base model, set adapter_path.
         // The artifact_path for a fine-tuned model is the object-store prefix the

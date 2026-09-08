@@ -2908,27 +2908,36 @@ retry loop re-taking the write lock:
 - `ModelCache::do_load`: `resolver.resolve` → pick backend by `resolved.backend` →
   `estimate_memory` → **admission loop** (`try_acquire`; on `None` take the lock and
   `evict_one`; if nothing evictable, error) → `backend.load` → post-load catalog bookkeeping
-  → insert `CacheEntry` (permit moved in) → return guard with refcount 1. The bookkeeping
-  write is gated against an allowlist of terminal-producer types, `PROTECTED_MODEL_TYPES`
-  (`crates/jammi-ai/src/model/cache.rs:655`): for a row already owned by a terminal producer
-  — `fine-tuned`, `context-predictor`, `checkpoint` — the write is skipped outright when
-  `already_managed` (`crates/jammi-ai/src/model/cache.rs:666`) is true; otherwise it proceeds to
-  `register_model` (`crates/jammi-ai/src/model/cache.rs:688`), which completes a
-  `local`/`huggingface` row or the `embedding` FK placeholder — the one case where a
-  `register_model` failure is still logged and swallowed rather than propagated. A fine-tuned
-  id can reach this same call (`ModelSource::parse`'s HuggingFace fallback matches it like any
-  other non-`local:` string), so without the gate this generic write would overwrite the
-  served-adapter `artifact_path` and the `base_model_id` lineage a terminal producer already
-  committed.
+  (`complete_generic_registration`,
+  `crates/jammi-ai/src/model/cache.rs:542`) → insert `CacheEntry` (permit moved in) → return
+  guard with refcount 1. The bookkeeping write is gated by an ALLOWLIST of the generic,
+  non-terminal row kinds it exists to complete, `GENERIC_COMPLETABLE_TYPES`
+  (`crates/jammi-ai/src/model/cache.rs:549`, `&["local", "huggingface", "embedding"]`) — never a
+  denylist of the terminal types to protect, which would fail open on every unenumerated
+  `model_type` (`fine-tuned`, `context-predictor`, `bert`, `open_clip`, `clap_audio_model`, …). A
+  catalog READ error also skips the write outright (`get_model_version`,
+  `crates/jammi-ai/src/model/cache.rs:559`, `warn!` and keep serving) rather than collapsing to
+  "no row" and writing over an uninspected row; only when the read succeeds and the row is absent
+  or already one of the completable kinds
+  (`can_complete`, `crates/jammi-ai/src/model/cache.rs:571`) does it proceed to `register_model`
+  (`crates/jammi-ai/src/model/cache.rs:596`), which completes a `local`/`huggingface` row or the
+  `embedding` FK placeholder — the one case where a `register_model` failure is still logged and
+  swallowed rather than propagated. A fine-tuned id can reach this same call (`ModelSource::parse`'s
+  HuggingFace fallback matches it like any other non-`local:` string), so without the allowlist
+  this generic write would overwrite the served-adapter `artifact_path` and the `base_model_id`
+  lineage a terminal producer already committed.
 
 Resolver chain (`crates/jammi-ai/src/model/resolver.rs`, `ModelResolver::resolve`):
-`try_catalog_lookup` (`crates/jammi-ai/src/model/resolver.rs:81`) first (refuses `Retired`;
+`try_catalog_lookup` (`crates/jammi-ai/src/model/resolver.rs:96`) first (refuses `Retired`;
 resolves fine-tuned base recursively + fetches adapter), else `resolve_local`/`resolve_hf_hub`
 (locate config, pick backend, gather weights, discover tokenizer, sum file sizes into
-`estimated_memory`). A record whose `model_type`
-(`crates/jammi-ai/src/model/resolver.rs:113`) is `fine-tuned` and missing `base_model_id`
-(`crates/jammi-ai/src/model/resolver.rs:128`) or missing `artifact_path`
-(`crates/jammi-ai/src/model/resolver.rs:144`) is refused with a typed error naming the model
+`estimated_memory`). Before any of that, an id carrying the reserved `jammi:fine-tuned:` prefix
+(`FINE_TUNED_ID_PREFIX`, `crates/jammi-ai/src/model/resolver.rs:117`) whose row's `model_type` is
+NOT `fine-tuned` is refused by name — the backstop for a catalog a pre-fix build already
+corrupted, since nothing else ever mints that prefix. A record whose `model_type`
+(`crates/jammi-ai/src/model/resolver.rs:158`) is `fine-tuned` and missing `base_model_id`
+(`crates/jammi-ai/src/model/resolver.rs:173`) or missing `artifact_path`
+(`crates/jammi-ai/src/model/resolver.rs:189`) is refused with a typed error naming the model
 id and the missing field, never silently resolved as an ordinary model or served as the
 unadapted base.
 

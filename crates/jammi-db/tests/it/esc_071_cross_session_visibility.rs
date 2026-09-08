@@ -11,7 +11,7 @@
 //! The gate this closes: the only pre-existing two-sessions-one-file catalog
 //! test (`tenant_scope.rs:65-125`) is tenant-DISJOINT, so a stale read passes it
 //! vacuously; the single-pool read-after-write coverage in
-//! `fine_tune_job_catalog_crud`, crates/jammi-ai/tests/it/fine_tune.rs:1186-1272
+//! `fine_tune_job_catalog_crud`, crates/jammi-ai/tests/it/fine_tune.rs:1201-1287
 //! never opens a second pool at all (`backend_sqlite.rs:24-41` builds one pool
 //! per session).
 //!

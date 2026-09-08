@@ -421,6 +421,23 @@ workspace ships every publishable crate at the same
   `model_type == "fine-tuned"` record ever again carries no `base_model_id` or no
   `artifact_path`, rather than falling through to resolve it as an ordinary model or serving the
   base silently.
+- **The model cache's load-bookkeeping write is an ALLOWLIST of the generic rows it may complete,
+  never a denylist of the terminal ones to protect, and fails closed on a catalog read error
+  (esc-089 follow-up).** The prior fix's `PROTECTED_MODEL_TYPES` denylist (`"fine-tuned"`,
+  `"context-predictor"`, `"checkpoint"`) still failed OPEN on every other live `model_type` —
+  `"bert"`, `"distilbert"`, `"modernbert"`, `"open_clip"`, `"clap_audio_model"`, or any future
+  architecture id `EncoderFamily::adapter_model_type` mints — so an ordinary load of a
+  pre-registered non-BERT-family checkpoint still clobbered that row's `model_type`,
+  `base_model_id`, and `artifact_path`. `ModelCache::complete_generic_registration` now proceeds
+  only when the row is absent or already one of the generic kinds this call exists to complete
+  (`"local"`, `"huggingface"`, or the `"embedding"` FK placeholder); every other type, enumerated
+  or not, is left untouched. Separately, `.ok().flatten()` collapsed a catalog READ error into "no
+  row" and let the write proceed regardless; a read failure now skips the write entirely (`warn!`
+  and keep serving — this bookkeeping was always best-effort). `ModelResolver::try_catalog_lookup`
+  also cross-checks the unforgeable `jammi:fine-tuned:` id prefix against the row's own
+  `model_type`: a mismatch (a catalog a pre-fix build already corrupted) is a typed refusal naming
+  the id and the row's actual type, never a silent base serve — the backstop for catalogs written
+  before this fix.
 - **A `Utf8View` path column is accepted by `arrow_to_images`/`arrow_to_audio`, matching `Utf8`
   exactly (esc-090).** Both functions matched `Utf8`/`LargeUtf8`/`Binary`/`LargeBinary`/
   `BinaryView` but had no `Utf8View` arm, so a `Utf8View` path column — DataFusion's parquet

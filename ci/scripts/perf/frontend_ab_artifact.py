@@ -21,19 +21,36 @@ name: a number could drift from its source, or never have come from a real
 run at all, and a bare wrapper would read as equally authoritative either
 way.
 
-This module is the SECOND, INDEPENDENT reader: `build_report()` reads every
-raw leg (`<raw-dir>/<tower>__<role>__<repeat>.{exit,json}`) directly,
-re-derives `front_per_step`/`train_per_step` per leg and the HTSAT bar's own
+This module is the SECOND, INDEPENDENT reader: `build_report()` FIRST
+enumerates `--raw-dir` itself (every `<tower>__<role>__<repeat>.{exit,json}`
+stem actually present on disk) and refuses BY NAME unless that set equals
+EXACTLY `TOWERS x ROLES x {r1..r<repeats>}` -- both directions: an extra
+leg left over from a different `--repeats` value, or a leg the raw dir is
+missing, is a refusal before a single number is read, never a silent
+under- or over-count. The same exact-set discipline applies to
+`--report-json`'s own `towers.<tower>.<role>` object: its repeat keys must
+match `{r1..r<repeats>}` exactly too (a report claiming `repeats: 2` while
+still carrying an `"r3"` entry is refused, not silently ignored). Only
+THEN does it read every raw leg directly, re-derive `front_per_step`/
+`train_per_step` per leg and the HTSAT bar's own
 `p`/`ideal`/bounds/`ratio`/`ratio_lo`/`ratio_hi`/`verdict` from the SAME
 pinned formula `frontend_ab_merge.py::build_report` uses (re-implemented
 here, not imported, so the two readers cannot share a single bug) --
-against `--measured-serial-tail-s` (the run's own `frontend_serial_tail`
-example measurement) as WELL as `report.json`'s own `serial_tail_ratio` --
-and REFUSES (`ArtifactBuildError`) the moment ANY re-derived number disagrees
-with `--report-json`'s own value, or the two serial-tail-ratio variants
-disagree on the bar's own VERDICT (the "driver default vs measured; verdict
-invariant" deviation this contract names is a claim this module actually
-checks, not merely a sentence a human typed).
+against `--serial-tail`'s own committed `task=... t_s=...` measurement line
+(the run's own `frontend_serial_tail` example output, read verbatim off a
+fixture file rather than transcribed onto a CLI flag) as WELL as
+`report.json`'s own `serial_tail_ratio` -- and REFUSES (`ArtifactBuildError`)
+the moment ANY re-derived number disagrees with `--report-json`'s own
+value, or the two serial-tail-ratio variants disagree on the bar's own
+VERDICT (the "driver default vs measured; verdict invariant" deviation
+this contract names is a claim this module actually checks, not merely a
+sentence a human typed). Every leg's own `tiers.finetune_run.task` and
+`.device_name` are cross-checked against the tower being read and
+`--report-json`'s own `box`, refusing by name on either mismatch. Both
+serial-tail ratios (`r`) are domain-checked to `[0, 1)` at read time, and
+every value this module would otherwise divide by is checked positive and
+finite first -- a degenerate zero front-end time is a named refusal, never
+a `ZeroDivisionError`.
 
 ## What comes from where
 
@@ -63,9 +80,14 @@ checks, not merely a sentence a human typed).
   (`measured_tip_precedes_merge_tip_commentary`), attached to the
   mechanically-computed file list rather than replacing it.
 - `notes.input_sha256` / `notes.run_sha256`: sha256 digests computed live
-  over the exact input bytes this run reads, so a downstream reader can
-  verify the committed artifact was rendered from the exact fixture bytes
-  also committed alongside it.
+  over the exact input bytes this run reads (`--report-json`, `--identity`,
+  `--serial-tail`, and every raw leg under `--raw-dir`), so a downstream
+  reader can verify the committed artifact was rendered from the exact
+  fixture bytes also committed alongside it.
+- `verdict.serial_tail_ratio_deviation.r_measured`: `--serial-tail`'s own
+  `task=audio_embedding ... t_s=...` line, divided by the re-derived HTSAT
+  `front_base_mean_s` -- read from a committed fixture file (the job log's
+  own serial-tail phase output), never a hand-typed CLI float.
 - Everything else in `notes` (`what`, `gpu`, `driver`, `cpu`,
   `recorded_deviations`'s own static prose, `producer_invocation`): read
   from `--identity`, which carries ONLY provenance/prose that has no
@@ -84,7 +106,7 @@ computed verdict (PASS -> ACTIVATE; anything else -> the v3 contract's own
 "ships without the efficiency claim" clause), never independently typed.
 
 Run: `python3 ci/scripts/perf/frontend_ab_artifact.py --raw-dir <dir>
---report-json <path> --identity <path> --measured-serial-tail-s <float>
+--report-json <path> --identity <path> --serial-tail <path>
 [--repo-root <dir>] [--out <path>]`
 """
 
@@ -94,6 +116,7 @@ import argparse
 import hashlib
 import json
 import math
+import re
 import subprocess
 import sys
 from pathlib import Path
@@ -102,8 +125,23 @@ SCHEMA_VERSION = 1
 REPO_ROOT = Path(__file__).resolve().parents[3]
 TOWERS = ("htsat", "clip-vision")
 ROLES = ("base", "tip")
+# The task each tower's own `tiers.finetune_run.task` must carry -- read
+# straight off the raw leg and cross-checked against the tower this reader
+# thinks it is reading (advisory: a leg copied into the wrong tower's own
+# filename slot is a refusal, never a silently-mislabeled measurement).
+TOWER_TASK = {"htsat": "audio_embedding", "clip-vision": "image_embedding"}
 REDERIVE_REL_TOL = 1e-9
 REDERIVE_ABS_TOL = 1e-12
+# `r` (a serial-tail-time / front-end-time ratio) is a proper fraction by
+# construction of the bar formula (`ideal = n / ceil(n/p)`, `bound = r +
+# (1-r)/x`): `r == 1` degenerates every bound to exactly `1`, and `r > 1`
+# or `r < 0` is not a ratio this formula was derived for at all -- both
+# edges are refused, never silently accepted into arithmetic that would
+# still "run" and produce a number.
+R_DOMAIN_LO = 0.0
+R_DOMAIN_HI = 1.0
+
+_SERIAL_TAIL_LINE_RE = re.compile(r"^task=(?P<task>\S+)\s.*\bt_s=(?P<t_s>[^\s]+)\s*$")
 
 # Same discipline as `check_cuda_run_artifacts.py`'s own `_run` helper: kill
 # a background `git maintenance`/`gc --auto` writer at the source for every
@@ -168,6 +206,112 @@ def _repeat_labels(repeats: int) -> tuple[str, ...]:
     return tuple(f"r{i}" for i in range(1, repeats + 1))
 
 
+def _validate_r(value: float, label: str) -> float:
+    """`r` is a serial-tail/front-end time ratio the bar formula is only
+    defined for on `[0, 1)` -- see the module-level `R_DOMAIN_LO`/`_HI`
+    comment. Both edges (`r == 1`, `r > 1`, `r < 0`) are named refusals,
+    never silently accepted into arithmetic that would still 'run'."""
+    value = _finite(value, label)
+    if not (R_DOMAIN_LO <= value < R_DOMAIN_HI):
+        raise ArtifactBuildError(f"{label} must be in [{R_DOMAIN_LO}, {R_DOMAIN_HI}), got {value!r}")
+    return value
+
+
+def _require_positive_divisor(value: float, label: str) -> float:
+    """Every value this module divides BY must be finite and strictly
+    positive -- a degenerate zero (or negative, or non-finite) front-end
+    measurement used as a divisor is a named refusal, never a
+    `ZeroDivisionError` or a silently-propagated `NaN`/`inf`."""
+    value = _finite(value, label)
+    if value <= 0:
+        raise ArtifactBuildError(f"{label} must be a finite positive number to divide by, got {value!r}")
+    return value
+
+
+def _validate_leg_set(raw_dir: Path, repeat_ids: tuple[str, ...]) -> None:
+    """Enumerates `--raw-dir` itself (every `.json`/`.exit` file's own
+    stem) and refuses BY NAME unless that set equals EXACTLY
+    `TOWERS x ROLES x repeat_ids` -- in BOTH directions. This runs BEFORE
+    a single leg is read: a stale `r3` pair left over from a `--repeats 3`
+    run sitting next to a `report.json` that now declares `repeats: 2`
+    would otherwise never be looked at (the per-leg reader below only ever
+    asks for `repeat_ids`, so it cannot notice an EXTRA file on disk on
+    its own)."""
+    try:
+        entries = list(raw_dir.iterdir())
+    except OSError as exc:
+        raise ArtifactBuildError(f"could not list --raw-dir at {raw_dir}: {exc}") from exc
+
+    present_stems: set[str] = set()
+    for entry in entries:
+        if not entry.is_file() or entry.suffix not in (".json", ".exit"):
+            continue
+        present_stems.add(entry.stem)
+
+    expected_stems = {f"{tower}__{role}__{repeat}" for tower in TOWERS for role in ROLES for repeat in repeat_ids}
+    if present_stems != expected_stems:
+        extra = sorted(present_stems - expected_stems)
+        missing = sorted(expected_stems - present_stems)
+        raise ArtifactBuildError(
+            f"--raw-dir at {raw_dir} does not carry exactly TOWERS x ROLES x {{{', '.join(repeat_ids)}}} "
+            f"(from --report-json's own 'repeats'={len(repeat_ids)}) -- extra leg stems: {extra!r}, "
+            f"missing leg stems: {missing!r}"
+        )
+
+
+def _validate_towers_repeat_keys(towers: dict, repeat_ids: tuple[str, ...]) -> None:
+    """The same exact-set discipline as `_validate_leg_set`, applied to
+    `--report-json`'s own `towers.<tower>.<role>` object: a report
+    claiming `repeats: 2` while still carrying a leftover `'r3'` entry (or
+    missing one of `r1`/`r2`) is refused here, independent of whatever is
+    sitting on `--raw-dir`."""
+    for tower in TOWERS:
+        by_tower = towers.get(tower)
+        if not isinstance(by_tower, dict):
+            raise ArtifactBuildError(f"--report-json's own towers.{tower} is not an object")
+        for role in ROLES:
+            by_role = by_tower.get(role)
+            if not isinstance(by_role, dict):
+                raise ArtifactBuildError(f"--report-json's own towers.{tower}.{role} is not an object")
+            actual_keys = set(by_role.keys())
+            expected_keys = set(repeat_ids)
+            if actual_keys != expected_keys:
+                raise ArtifactBuildError(
+                    f"--report-json's own towers.{tower}.{role} does not carry exactly "
+                    f"{{{', '.join(repeat_ids)}}} (from its own 'repeats'={len(repeat_ids)}) -- "
+                    f"extra keys: {sorted(actual_keys - expected_keys)!r}, "
+                    f"missing keys: {sorted(expected_keys - actual_keys)!r}"
+                )
+
+
+def _read_measured_serial_tail_s(serial_tail_path: Path, task: str) -> float:
+    """Reads the run's own `cargo run -p jammi-bench --example
+    frontend_serial_tail` measurement for `task` off a committed fixture
+    file (the job log's own serial-tail phase output, verbatim) rather
+    than a hand-typed CLI float. Named refusal if the file cannot be read,
+    or if no `task=<task> ... t_s=<float>` line is present for `task`, or
+    if that line's own `t_s` does not parse as a float."""
+    try:
+        text = serial_tail_path.read_text(encoding="utf-8")
+    except OSError as exc:
+        raise ArtifactBuildError(f"could not read --serial-tail at {serial_tail_path}: {exc}") from exc
+
+    for line in text.splitlines():
+        match = _SERIAL_TAIL_LINE_RE.match(line.strip())
+        if match is None or match.group("task") != task:
+            continue
+        raw_t_s = match.group("t_s")
+        try:
+            return float(raw_t_s)
+        except ValueError as exc:
+            raise ArtifactBuildError(
+                f"--serial-tail {serial_tail_path}: task={task} line's own t_s does not parse as a float "
+                f"({raw_t_s!r})"
+            ) from exc
+
+    raise ArtifactBuildError(f"--serial-tail {serial_tail_path}: no 'task={task} ... t_s=...' line found")
+
+
 # --------------------------------------------------------------------------- #
 # git helpers -- mirrors `check_cuda_run_artifacts.py`'s own discipline
 # --------------------------------------------------------------------------- #
@@ -206,7 +350,7 @@ def _diff_stat(a: str, b: str, repo_root: Path) -> str:
 # --------------------------------------------------------------------------- #
 # raw-leg reading -- independent of `frontend_ab_merge.py::load_leg`
 # --------------------------------------------------------------------------- #
-def _read_raw_leg(raw_dir: Path, tower: str, role: str, repeat: str, declared_sha: str) -> dict:
+def _read_raw_leg(raw_dir: Path, tower: str, role: str, repeat: str, declared_sha: str, declared_box: str) -> dict:
     leg_id = f"{tower}/{role}/{repeat}"
     exit_path = raw_dir / f"{tower}__{role}__{repeat}.exit"
     json_path = raw_dir / f"{tower}__{role}__{repeat}.json"
@@ -245,6 +389,30 @@ def _read_raw_leg(raw_dir: Path, tower: str, role: str, repeat: str, declared_sh
         raise ArtifactBuildError(f"{leg_id}: steps_measured is not a positive int ({steps!r})")
     front_wall = _finite(tier.get("media_front_end_wall_s"), f"{leg_id}: media_front_end_wall_s")
     train_wall = _finite(tier.get("train_run_wall_s"), f"{leg_id}: train_run_wall_s")
+
+    # Advisory: `task` (does this leg's own filename tower match what it
+    # was actually run as?) and `device_name` (does it match the box
+    # `--report-json` declares?) are cross-checked here, refusing by name
+    # on either mismatch -- a leg copied into the wrong tower's own
+    # filename slot, or run on a different box than the driver declares,
+    # would otherwise read back as a silently-mislabeled measurement.
+    task = tier.get("task")
+    if not isinstance(task, str) or not task:
+        raise ArtifactBuildError(f"{leg_id}: report carries no tiers.finetune_run.task")
+    expected_task = TOWER_TASK[tower]
+    if task != expected_task:
+        raise ArtifactBuildError(
+            f"{leg_id}: tiers.finetune_run.task is {task!r}, but tower {tower!r} expects {expected_task!r}"
+        )
+    device_name = tier.get("device_name")
+    if not isinstance(device_name, str) or not device_name:
+        raise ArtifactBuildError(f"{leg_id}: report carries no tiers.finetune_run.device_name")
+    declared_box_device = declared_box.split(",")[0].strip()
+    if device_name != declared_box_device:
+        raise ArtifactBuildError(
+            f"{leg_id}: tiers.finetune_run.device_name ({device_name!r}) does not match --report-json's own "
+            f"box device prefix ({declared_box_device!r} of box {declared_box!r})"
+        )
 
     rayon_pool_threads = tier.get("rayon_pool_threads")
     if role == "tip":
@@ -288,17 +456,20 @@ def _get_reported_leg(report_json: dict, tower: str, role: str, repeat: str) -> 
 # cannot share a single formula bug.
 # --------------------------------------------------------------------------- #
 def _compute_bar(front_by_role: dict[str, dict[str, float]], p: int, n: int, r: float) -> dict:
+    r = _validate_r(r, "bar's own r")
     ideal = n / math.ceil(n / p)
     upper_bound = r + (1 - r) / (0.5 * ideal)
     lower_bound = r + (1 - r) / ideal
 
     tip_vals = list(front_by_role["tip"].values())
     base_vals = list(front_by_role["base"].values())
+    max_base = _require_positive_divisor(max(base_vals), "front_per_step base values' own max (ratio_lo's own divisor)")
+    min_base = _require_positive_divisor(min(base_vals), "front_per_step base values' own min (ratio_hi's own divisor)")
     front_tip = sum(tip_vals) / len(tip_vals)
-    front_base = sum(base_vals) / len(base_vals)
+    front_base = _require_positive_divisor(sum(base_vals) / len(base_vals), "front_base_mean_s (ratio's own divisor)")
     ratio = front_tip / front_base
-    ratio_lo = min(tip_vals) / max(base_vals)
-    ratio_hi = max(tip_vals) / min(base_vals)
+    ratio_lo = min(tip_vals) / max_base
+    ratio_hi = max(tip_vals) / min_base
 
     if ratio_hi <= upper_bound and ratio_lo >= lower_bound:
         verdict = "PASS"
@@ -340,7 +511,7 @@ def build_report(
     report_json: dict,
     identity_path: Path,
     identity: dict,
-    measured_serial_tail_s: float,
+    serial_tail_path: Path,
     repo_root: Path,
     invocation: str,
 ) -> dict:
@@ -361,12 +532,23 @@ def build_report(
     if not isinstance(box, str) or not box:
         raise ArtifactBuildError(f"--report-json's own box must be a non-empty string, got {box!r}")
 
-    r_driver = _finite(report_json["serial_tail_ratio"], "--report-json serial_tail_ratio")
+    r_driver = _validate_r(report_json["serial_tail_ratio"], "--report-json serial_tail_ratio")
     n = report_json["n_items_per_step"]
     if isinstance(n, bool) or not isinstance(n, int) or n <= 0:
         raise ArtifactBuildError(f"--report-json's own n_items_per_step must be a positive int, got {n!r}")
     repeat_ids = _repeat_labels(report_json["repeats"])
     declared_sha_by_role = {"base": base_sha, "tip": tip_sha}
+
+    towers_obj = report_json["towers"]
+    if not isinstance(towers_obj, dict):
+        raise ArtifactBuildError("--report-json's own towers is not an object")
+    # ---- leg-set enumeration: refuse BY NAME before a single number is
+    # read unless --raw-dir and --report-json's own towers object both
+    # carry EXACTLY TOWERS x ROLES x repeat_ids -- neither an extra leg
+    # left over from a different --repeats value nor a missing one can
+    # slip past the per-repeat-id loop below on its own.
+    _validate_leg_set(raw_dir, repeat_ids)
+    _validate_towers_repeat_keys(towers_obj, repeat_ids)
 
     # ---- re-derive every leg directly from --raw-dir, cross-checked ----
     legs: dict[str, dict] = {}
@@ -374,7 +556,7 @@ def build_report(
     for tower in TOWERS:
         for role in ROLES:
             for repeat in repeat_ids:
-                leg = _read_raw_leg(raw_dir, tower, role, repeat, declared_sha_by_role[role])
+                leg = _read_raw_leg(raw_dir, tower, role, repeat, declared_sha_by_role[role], box)
                 legs[f"{tower}__{role}__{repeat}"] = leg
                 front_by_tower[tower][role][repeat] = leg["front_per_step"]
 
@@ -419,9 +601,14 @@ def build_report(
             f"{rj_bar.get('verdict')!r}"
         )
 
-    # ---- the run's OWN measured serial-tail ratio, same pinned rule ----
-    front_base_mean_s = htsat_bar_driver["front_base_mean_s"]
-    r_measured = _finite(measured_serial_tail_s, "--measured-serial-tail-s") / front_base_mean_s
+    # ---- the run's OWN measured serial-tail ratio, read off --serial-tail
+    # (a committed fixture carrying the job log's own verbatim
+    # 'task=... t_s=...' line), same pinned rule ----
+    measured_serial_tail_s = _read_measured_serial_tail_s(serial_tail_path, TOWER_TASK["htsat"])
+    front_base_mean_s = _require_positive_divisor(
+        htsat_bar_driver["front_base_mean_s"], "htsat_bar_driver's own front_base_mean_s (r_measured's own divisor)"
+    )
+    r_measured = _validate_r(measured_serial_tail_s / front_base_mean_s, "r_measured (--serial-tail / front_base_mean_s)")
     htsat_bar_measured = _compute_bar(front_by_tower["htsat"], p, n, r_measured)
 
     if htsat_bar_driver["verdict"] != htsat_bar_measured["verdict"]:
@@ -440,7 +627,9 @@ def build_report(
     cv_tip_vals = list(front_by_tower["clip-vision"]["tip"].values())
     cv_base_vals = list(front_by_tower["clip-vision"]["base"].values())
     cv_front_tip = sum(cv_tip_vals) / len(cv_tip_vals)
-    cv_front_base = sum(cv_base_vals) / len(cv_base_vals)
+    cv_front_base = _require_positive_divisor(
+        sum(cv_base_vals) / len(cv_base_vals), "clip_vision_report_only.front_base_mean_s (ratio's own divisor)"
+    )
     cv_ratio = cv_front_tip / cv_front_base
     _assert_close(
         cv_front_tip, _finite(rj_cv.get("front_tip_mean_s"), "clip_vision_report_only.front_tip_mean_s"),
@@ -478,6 +667,7 @@ def build_report(
     input_sha256 = {
         "report_json": _sha256_file(report_json_path),
         "identity": _sha256_file(identity_path),
+        "serial_tail": _sha256_file(serial_tail_path),
     }
     for key, leg in sorted(legs.items()):
         input_sha256[f"raw/{key}.json"] = _sha256_file(leg["json_path"])
@@ -552,8 +742,10 @@ def build_report(
                 "r_driver_source": "FRONTEND_AB_SERIAL_TAIL_RATIO (rehearsal-derived default, contract v3)",
                 "r_measured": r_measured,
                 "r_measured_source": (
-                    "this run's own 'cargo run -p jammi-bench --example frontend_serial_tail' measurement "
-                    "(--measured-serial-tail-s) divided by the re-derived HTSAT front_base_mean_s"
+                    "this run's own 'cargo run -p jammi-bench --example frontend_serial_tail' measurement, read "
+                    f"off --serial-tail's own 'task={TOWER_TASK['htsat']} ... t_s=...' line (a committed fixture "
+                    "carrying the job log's own verbatim serial-tail phase output), divided by the re-derived "
+                    "HTSAT front_base_mean_s"
                 ),
                 "verdict_under_r_driver": htsat_bar_driver["verdict"],
                 "verdict_under_r_measured": htsat_bar_measured["verdict"],
@@ -573,8 +765,12 @@ def main(argv: list[str] | None = None) -> int:
     ap.add_argument("--report-json", required=True, help="frontend_ab_merge.py's own merged report.json over the SAME --raw-dir")
     ap.add_argument("--identity", required=True, help="the non-numeric identity/notes sidecar (see frontend_ab_final_identity.json)")
     ap.add_argument(
-        "--measured-serial-tail-s", required=True, type=float,
-        help="this run's own 'cargo run -p jammi-bench --example frontend_serial_tail' t_s measurement",
+        "--serial-tail", required=True,
+        help=(
+            "path to a fixture carrying this run's own 'cargo run -p jammi-bench --example "
+            "frontend_serial_tail' output verbatim (a 'task=... t_s=...' line per task; see "
+            "fixtures/frontend_ab_final/serial_tail.txt)"
+        ),
     )
     ap.add_argument("--repo-root", default=str(REPO_ROOT), help="git repo root (default: this checkout's own root)")
     ap.add_argument("--out", help="write the artifact here (default: stdout)")
@@ -583,6 +779,7 @@ def main(argv: list[str] | None = None) -> int:
     raw_dir = Path(args.raw_dir)
     report_json_path = Path(args.report_json)
     identity_path = Path(args.identity)
+    serial_tail_path = Path(args.serial_tail)
     repo_root = Path(args.repo_root)
     invocation = "python3 ci/scripts/perf/frontend_ab_artifact.py " + " ".join(argv)
 
@@ -591,7 +788,7 @@ def main(argv: list[str] | None = None) -> int:
         identity = _load_json(identity_path, "--identity")
         report = build_report(
             raw_dir, report_json_path, report_json, identity_path, identity,
-            args.measured_serial_tail_s, repo_root, invocation,
+            serial_tail_path, repo_root, invocation,
         )
     except ArtifactBuildError as exc:
         print(f"::error::frontend_ab_artifact: {exc}", file=sys.stderr)

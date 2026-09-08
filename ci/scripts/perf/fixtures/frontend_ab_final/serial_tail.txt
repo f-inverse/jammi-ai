@@ -1,0 +1,5 @@
+task=audio_embedding device=cuda:0 reps=20 dims=[24, 4, 1001, 64] t_s=0.00474603615
+task=image_embedding device=cuda:0 reps=20 dims=[24, 3, 224, 224] t_s=0.0011608887
+  "build_sha": "0a8562c4ff6205a69150580ff70a8cd098a9ebba",
+  "build_sha": "c1b0b0bad1f79a4ad6c298400e6ea19cc1ca633c",
+PROV_RC=0

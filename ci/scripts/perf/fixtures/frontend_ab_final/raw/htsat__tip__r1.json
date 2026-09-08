@@ -10,6 +10,8 @@
       "steps_measured": 100,
       "media_front_end_wall_s": 10.445164998,
       "train_run_wall_s": 34.004634169,
+      "task": "audio_embedding",
+      "device_name": "NVIDIA A100 80GB PCIe",
       "rayon_pool_threads": 26
     }
   }

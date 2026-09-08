@@ -20,6 +20,18 @@ computation IS the independent check"). Every numeric field this suite
 checks is checked against THIS oracle, never against a value copied out of
 the module under test.
 
+`LegSetEnumerationTests` drives the audit's own probe: a `--repeats`
+shrink (3 -> 2) with the `r3` raw-leg files still present on disk (a stale
+re-run) must REFUSE, never silently read only `r1`/`r2` and PASS -- in
+both directions (extra legs, missing legs), on both `--raw-dir` and
+`--report-json`'s own `towers` object independently. `RDomainTests`/
+`RDomainEndToEndTests` cover `r`'s own `[0, 1)` domain at both edges (and
+beyond), plus every division this module performs being guarded against a
+zero/non-positive divisor (a named refusal, never a `ZeroDivisionError`).
+`SerialTailFixtureTests` covers `--serial-tail`'s own missing-file/
+missing-line/malformed-`t_s` refusals; `TowerTaskAndDeviceNameTests` covers
+the per-leg `task`/`device_name` cross-check.
+
 Run: `python3 ci/scripts/perf/test_frontend_ab_artifact.py`
 """
 
@@ -27,6 +39,7 @@ from __future__ import annotations
 
 import json
 import math
+import os
 import subprocess
 import sys
 import tempfile
@@ -48,6 +61,9 @@ N_ITEMS_PER_STEP = 24
 P = 8
 R_DRIVER = 0.0
 MEASURED_SERIAL_TAIL_S = 0.05  # -> r_measured = 0.05 / front_base_mean_s(=1.0) = 0.05
+BOX = "TESTBOX"
+DEVICE_NAME = "TESTBOX"  # -- box.split(',')[0].strip(): the per-leg device_name cross-check
+TASK_BY_TOWER = {"htsat": "audio_embedding", "clip-vision": "image_embedding"}
 
 # front_per_step per (tower, role) -- identical across repeats (spread 0)
 # keeps the oracle arithmetic trivial to hand-check; the "spread" family is
@@ -132,6 +148,7 @@ def _write_raw_leg(
     raw_dir: Path, tower: str, role: str, repeat: str, *, build_sha: str,
     front_per_step: float, train_per_step: float, steps: int = STEPS,
     rayon_pool_threads: int | None = None, exit_code: int = 0, report_override: dict | None = None,
+    task: str | None = None, device_name: str = DEVICE_NAME,
 ) -> None:
     stem = f"{tower}__{role}__{repeat}"
     (raw_dir / f"{stem}.exit").write_text(str(exit_code), encoding="utf-8")
@@ -143,6 +160,8 @@ def _write_raw_leg(
             "steps_measured": steps,
             "media_front_end_wall_s": front_per_step * steps,
             "train_run_wall_s": train_per_step * steps,
+            "task": task if task is not None else TASK_BY_TOWER[tower],
+            "device_name": device_name,
         }
         if rayon_pool_threads is not None:
             tier["rayon_pool_threads"] = rayon_pool_threads
@@ -152,6 +171,24 @@ def _write_raw_leg(
             "tiers": {"finetune_run": tier},
         }
     (raw_dir / f"{stem}.json").write_text(json.dumps(report), encoding="utf-8")
+
+
+def _write_serial_tail(root: Path, *, audio_t_s: float | str | None = MEASURED_SERIAL_TAIL_S, extra_lines: list[str] | None = None) -> Path:
+    """A synthetic stand-in for the committed `fixtures/frontend_ab_final/
+    serial_tail.txt` -- the same 'task=... t_s=...' line shape, never the
+    real file (that is exercised separately by `RealFixtureRegressionTests`
+    below). `audio_t_s=None` omits the audio_embedding line entirely (for
+    the 'missing line' refusal test); a string value writes it verbatim
+    (for the 'malformed t_s' refusal test)."""
+    lines = []
+    if audio_t_s is not None:
+        lines.append(f"task=audio_embedding device=cuda:0 reps=20 dims=[24, 4, 1001, 64] t_s={audio_t_s}")
+    lines.append("task=image_embedding device=cuda:0 reps=20 dims=[24, 3, 224, 224] t_s=0.0011608887")
+    if extra_lines:
+        lines.extend(extra_lines)
+    path = root / "serial_tail.txt"
+    path.write_text("\n".join(lines) + "\n", encoding="utf-8")
+    return path
 
 
 def _write_fixture(root: Path, base_sha: str, tip_sha: str, *, repeats: tuple[str, ...] = REPEATS) -> dict:
@@ -196,7 +233,7 @@ def _write_fixture(root: Path, base_sha: str, tip_sha: str, *, repeats: tuple[st
         "dry_run": False,
         "base_sha": base_sha,
         "tip_sha": tip_sha,
-        "box": "TESTBOX",
+        "box": BOX,
         "serial_tail_ratio": R_DRIVER,
         "n_items_per_step": N_ITEMS_PER_STEP,
         "repeats": len(repeats),
@@ -221,12 +258,14 @@ def _write_fixture(root: Path, base_sha: str, tip_sha: str, *, repeats: tuple[st
     identity_path = root / "identity.json"
     report_path.write_text(json.dumps(report_json), encoding="utf-8")
     identity_path.write_text(json.dumps(identity), encoding="utf-8")
+    serial_tail_path = _write_serial_tail(root)
     return {
         "raw_dir": raw_dir,
         "report_path": report_path,
         "report_json": report_json,
         "identity_path": identity_path,
         "identity": identity,
+        "serial_tail_path": serial_tail_path,
         "htsat_bar_oracle": htsat_bar,
     }
 
@@ -241,10 +280,11 @@ class HappyPathTests(unittest.TestCase):
     def tearDown(self):
         self._tmp.cleanup()
 
-    def _build(self, measured_serial_tail_s=MEASURED_SERIAL_TAIL_S):
+    def _build(self, serial_tail_path=None):
         return art.build_report(
             self.fixture["raw_dir"], self.fixture["report_path"], self.fixture["report_json"],
-            self.fixture["identity_path"], self.fixture["identity"], measured_serial_tail_s, self.root,
+            self.fixture["identity_path"], self.fixture["identity"],
+            serial_tail_path if serial_tail_path is not None else self.fixture["serial_tail_path"], self.root,
             "python3 ci/scripts/perf/frontend_ab_artifact.py (test invocation)",
         )
 
@@ -314,7 +354,8 @@ class HappyPathTests(unittest.TestCase):
         self.assertEqual(notes["rendered_from_tree_sha"], self.tip_sha)  # HEAD never moved past tip in this fixture
         self.assertIn("report_json", notes["input_sha256"])
         self.assertIn("identity", notes["input_sha256"])
-        self.assertEqual(len(notes["input_sha256"]), 2 + len(TOWERS) * len(ROLES) * len(REPEATS))  # report+identity + every raw leg
+        self.assertIn("serial_tail", notes["input_sha256"])
+        self.assertEqual(len(notes["input_sha256"]), 3 + len(TOWERS) * len(ROLES) * len(REPEATS))  # report+identity+serial_tail + every raw leg
         self.assertTrue(all(len(v) == 64 for v in notes["input_sha256"].values()))
         self.assertEqual(len(notes["run_sha256"]), 64)
         self.assertIn("fixture deviation", notes["recorded_deviations"])
@@ -362,7 +403,7 @@ class MeasuredTipPrecedesMergeTipTests(unittest.TestCase):
     def _build(self):
         return art.build_report(
             self.fixture["raw_dir"], self.fixture["report_path"], self.fixture["report_json"],
-            self.fixture["identity_path"], self.fixture["identity"], MEASURED_SERIAL_TAIL_S, self.root, "inv",
+            self.fixture["identity_path"], self.fixture["identity"], self.fixture["serial_tail_path"], self.root, "inv",
         )
 
     def test_post_tip_change_is_recorded_mechanically_with_reviewed_commentary(self):
@@ -422,10 +463,11 @@ class RefusalTests(unittest.TestCase):
     def tearDown(self):
         self._tmp.cleanup()
 
-    def _build(self, fixture, measured_serial_tail_s=MEASURED_SERIAL_TAIL_S):
+    def _build(self, fixture, serial_tail_path=None):
         return art.build_report(
             fixture["raw_dir"], fixture["report_path"], fixture["report_json"],
-            fixture["identity_path"], fixture["identity"], measured_serial_tail_s, self.root, "inv",
+            fixture["identity_path"], fixture["identity"],
+            serial_tail_path if serial_tail_path is not None else fixture["serial_tail_path"], self.root, "inv",
         )
 
     def test_refuses_missing_exit_file(self):
@@ -508,8 +550,9 @@ class RefusalTests(unittest.TestCase):
         # invariant" this contract names must be a checked equality, not
         # merely asserted prose.
         fixture = _write_fixture(self.root, self.base_sha, self.tip_sha)
+        bad_serial_tail = _write_serial_tail(self.root, audio_t_s=0.5)  # r_measured = 0.5 -> way past PASS
         with self.assertRaises(art.ArtifactBuildError) as ctx:
-            self._build(fixture, measured_serial_tail_s=0.5)  # r_measured = 0.5 -> way past PASS
+            self._build(fixture, serial_tail_path=bad_serial_tail)
         self.assertIn("verdict invariant", str(ctx.exception))
 
     def test_refuses_missing_towers_key(self):
@@ -525,6 +568,279 @@ class RefusalTests(unittest.TestCase):
         with self.assertRaises(art.ArtifactBuildError) as ctx:
             self._build(fixture)
         self.assertIn("own outcome is", str(ctx.exception))
+
+
+class LegSetEnumerationTests(unittest.TestCase):
+    """`_validate_leg_set`/`_validate_towers_repeat_keys` -- the leg set on
+    `--raw-dir` and `--report-json`'s own `towers` object must equal
+    EXACTLY `TOWERS x ROLES x {r1..r<repeats>}`, in BOTH directions. This
+    covers the audit's own probe: `--repeats` shrinking from 3 to 2 while
+    the `r3` raw-leg files are STILL PRESENT on disk (e.g. a stale re-run
+    left them behind) must REFUSE, never silently read only r1/r2 and
+    PASS."""
+
+    def setUp(self):
+        self._tmp = tempfile.TemporaryDirectory()
+        self.root = Path(self._tmp.name)
+        self.base_sha, self.tip_sha = _init_repo(self.root)
+
+    def tearDown(self):
+        self._tmp.cleanup()
+
+    def _build(self, fixture):
+        return art.build_report(
+            fixture["raw_dir"], fixture["report_path"], fixture["report_json"],
+            fixture["identity_path"], fixture["identity"], fixture["serial_tail_path"], self.root, "inv",
+        )
+
+    def test_extra_leg_on_disk_beyond_declared_repeats_is_refused(self):
+        fixture = _write_fixture(self.root, self.base_sha, self.tip_sha, repeats=("r1", "r2", "r3"))
+        fixture["report_json"]["repeats"] = 2
+        for tower in TOWERS:
+            for role in ROLES:
+                del fixture["report_json"]["towers"][tower][role]["r3"]
+        with self.assertRaises(art.ArtifactBuildError) as ctx:
+            self._build(fixture)
+        self.assertIn("does not carry exactly", str(ctx.exception))
+        self.assertIn("extra leg stems", str(ctx.exception))
+
+    def test_missing_leg_on_disk_is_refused(self):
+        fixture = _write_fixture(self.root, self.base_sha, self.tip_sha)
+        (fixture["raw_dir"] / "htsat__tip__r3.json").unlink()
+        (fixture["raw_dir"] / "htsat__tip__r3.exit").unlink()
+        with self.assertRaises(art.ArtifactBuildError) as ctx:
+            self._build(fixture)
+        self.assertIn("does not carry exactly", str(ctx.exception))
+        self.assertIn("missing leg stems", str(ctx.exception))
+
+    def test_stray_extra_file_of_an_unknown_tower_is_refused(self):
+        fixture = _write_fixture(self.root, self.base_sha, self.tip_sha)
+        (fixture["raw_dir"] / "unknown-tower__base__r1.json").write_text("{}", encoding="utf-8")
+        (fixture["raw_dir"] / "unknown-tower__base__r1.exit").write_text("0", encoding="utf-8")
+        with self.assertRaises(art.ArtifactBuildError) as ctx:
+            self._build(fixture)
+        self.assertIn("extra leg stems", str(ctx.exception))
+
+    def test_report_json_towers_with_extra_repeat_key_is_refused(self):
+        # --raw-dir itself carries EXACTLY the repeats=2 leg set, but
+        # --report-json's own towers.htsat.tip object still carries a
+        # leftover 'r3' entry -- independent of whatever sits on disk.
+        fixture = _write_fixture(self.root, self.base_sha, self.tip_sha, repeats=("r1", "r2"))
+        fixture["report_json"]["towers"]["htsat"]["tip"]["r3"] = dict(
+            fixture["report_json"]["towers"]["htsat"]["tip"]["r1"]
+        )
+        with self.assertRaises(art.ArtifactBuildError) as ctx:
+            self._build(fixture)
+        self.assertIn("towers.htsat.tip", str(ctx.exception))
+
+    def test_report_json_towers_missing_a_repeat_key_is_refused(self):
+        fixture = _write_fixture(self.root, self.base_sha, self.tip_sha)
+        del fixture["report_json"]["towers"]["clip-vision"]["base"]["r2"]
+        with self.assertRaises(art.ArtifactBuildError) as ctx:
+            self._build(fixture)
+        self.assertIn("towers.clip-vision.base", str(ctx.exception))
+
+
+class TowerTaskAndDeviceNameTests(unittest.TestCase):
+    """Advisory cross-check: every leg's own `tiers.finetune_run.task`/
+    `.device_name` must match the tower being read / `--report-json`'s own
+    `box` device prefix -- refusing by name on either mismatch, rather than
+    trusting the filename alone."""
+
+    def setUp(self):
+        self._tmp = tempfile.TemporaryDirectory()
+        self.root = Path(self._tmp.name)
+        self.base_sha, self.tip_sha = _init_repo(self.root)
+
+    def tearDown(self):
+        self._tmp.cleanup()
+
+    def _build(self, fixture):
+        return art.build_report(
+            fixture["raw_dir"], fixture["report_path"], fixture["report_json"],
+            fixture["identity_path"], fixture["identity"], fixture["serial_tail_path"], self.root, "inv",
+        )
+
+    def test_refuses_task_tower_mismatch(self):
+        fixture = _write_fixture(self.root, self.base_sha, self.tip_sha)
+        raw_path = fixture["raw_dir"] / "htsat__base__r1.json"
+        report = json.loads(raw_path.read_text())
+        report["tiers"]["finetune_run"]["task"] = "image_embedding"
+        raw_path.write_text(json.dumps(report), encoding="utf-8")
+        with self.assertRaises(art.ArtifactBuildError) as ctx:
+            self._build(fixture)
+        self.assertIn("tiers.finetune_run.task", str(ctx.exception))
+
+    def test_refuses_device_name_mismatch(self):
+        fixture = _write_fixture(self.root, self.base_sha, self.tip_sha)
+        raw_path = fixture["raw_dir"] / "clip-vision__tip__r2.json"
+        report = json.loads(raw_path.read_text())
+        report["tiers"]["finetune_run"]["device_name"] = "SOME OTHER GPU"
+        raw_path.write_text(json.dumps(report), encoding="utf-8")
+        with self.assertRaises(art.ArtifactBuildError) as ctx:
+            self._build(fixture)
+        self.assertIn("device_name", str(ctx.exception))
+
+    def test_refuses_missing_task_field(self):
+        fixture = _write_fixture(self.root, self.base_sha, self.tip_sha)
+        raw_path = fixture["raw_dir"] / "htsat__tip__r3.json"
+        report = json.loads(raw_path.read_text())
+        del report["tiers"]["finetune_run"]["task"]
+        raw_path.write_text(json.dumps(report), encoding="utf-8")
+        with self.assertRaises(art.ArtifactBuildError) as ctx:
+            self._build(fixture)
+        self.assertIn("carries no tiers.finetune_run.task", str(ctx.exception))
+
+    def test_refuses_missing_device_name_field(self):
+        fixture = _write_fixture(self.root, self.base_sha, self.tip_sha)
+        raw_path = fixture["raw_dir"] / "clip-vision__base__r1.json"
+        report = json.loads(raw_path.read_text())
+        del report["tiers"]["finetune_run"]["device_name"]
+        raw_path.write_text(json.dumps(report), encoding="utf-8")
+        with self.assertRaises(art.ArtifactBuildError) as ctx:
+            self._build(fixture)
+        self.assertIn("carries no tiers.finetune_run.device_name", str(ctx.exception))
+
+
+class SerialTailFixtureTests(unittest.TestCase):
+    """`_read_measured_serial_tail_s` -- named refusal if `--serial-tail`
+    cannot be read, carries no `task=audio_embedding ... t_s=...` line, or
+    that line's own `t_s` does not parse as a float."""
+
+    def setUp(self):
+        self._tmp = tempfile.TemporaryDirectory()
+        self.root = Path(self._tmp.name)
+        self.base_sha, self.tip_sha = _init_repo(self.root)
+        self.fixture = _write_fixture(self.root, self.base_sha, self.tip_sha)
+
+    def tearDown(self):
+        self._tmp.cleanup()
+
+    def _build(self, serial_tail_path):
+        return art.build_report(
+            self.fixture["raw_dir"], self.fixture["report_path"], self.fixture["report_json"],
+            self.fixture["identity_path"], self.fixture["identity"], serial_tail_path, self.root, "inv",
+        )
+
+    def test_refuses_missing_serial_tail_file(self):
+        with self.assertRaises(art.ArtifactBuildError) as ctx:
+            self._build(self.root / "does-not-exist.txt")
+        self.assertIn("could not read --serial-tail", str(ctx.exception))
+
+    def test_refuses_missing_audio_task_line(self):
+        bad = _write_serial_tail(self.root, audio_t_s=None)
+        with self.assertRaises(art.ArtifactBuildError) as ctx:
+            self._build(bad)
+        self.assertIn("no 'task=audio_embedding ... t_s=...' line found", str(ctx.exception))
+
+    def test_refuses_malformed_t_s(self):
+        bad = _write_serial_tail(self.root, audio_t_s="not-a-float")
+        with self.assertRaises(art.ArtifactBuildError) as ctx:
+            self._build(bad)
+        self.assertIn("does not parse as a float", str(ctx.exception))
+
+
+class RDomainTests(unittest.TestCase):
+    """`r` (a serial-tail/front-end time ratio) is only defined on
+    `[0, 1)` -- both edges, and beyond, are named refusals. Boundary
+    matrix: r=0 (valid), r just under 1 (valid), r=1 (refused), r=1.5
+    (refused), r=-0.5 (refused). Also: any zero/non-positive front-end
+    time used as a divisor (`front_base_mean_s`==0) is a named
+    `ArtifactBuildError`, never a `ZeroDivisionError`."""
+
+    def test_validate_r_accepts_zero(self):
+        self.assertEqual(art._validate_r(0.0, "r"), 0.0)
+
+    def test_validate_r_accepts_just_under_one(self):
+        self.assertAlmostEqual(art._validate_r(0.999999, "r"), 0.999999)
+
+    def test_validate_r_refuses_exactly_one(self):
+        with self.assertRaises(art.ArtifactBuildError) as ctx:
+            art._validate_r(1.0, "r")
+        self.assertIn("must be in [0.0, 1.0)", str(ctx.exception))
+
+    def test_validate_r_refuses_above_one(self):
+        with self.assertRaises(art.ArtifactBuildError):
+            art._validate_r(1.5, "r")
+
+    def test_validate_r_refuses_negative(self):
+        with self.assertRaises(art.ArtifactBuildError):
+            art._validate_r(-0.5, "r")
+
+    def test_require_positive_divisor_refuses_zero(self):
+        with self.assertRaises(art.ArtifactBuildError) as ctx:
+            art._require_positive_divisor(0.0, "front_base")
+        self.assertIn("must be a finite positive number to divide by", str(ctx.exception))
+
+    def test_require_positive_divisor_refuses_negative(self):
+        with self.assertRaises(art.ArtifactBuildError):
+            art._require_positive_divisor(-1.0, "front_base")
+
+    def test_require_positive_divisor_accepts_positive(self):
+        self.assertEqual(art._require_positive_divisor(0.5, "front_base"), 0.5)
+
+
+class RDomainEndToEndTests(unittest.TestCase):
+    """The same boundary matrix as `RDomainTests`, driven end to end
+    through `build_report` -- proving the domain guard is actually wired
+    into the pipeline, not just a helper nothing calls."""
+
+    def setUp(self):
+        self._tmp = tempfile.TemporaryDirectory()
+        self.root = Path(self._tmp.name)
+        self.base_sha, self.tip_sha = _init_repo(self.root)
+
+    def tearDown(self):
+        self._tmp.cleanup()
+
+    def _build(self, fixture, serial_tail_path=None):
+        return art.build_report(
+            fixture["raw_dir"], fixture["report_path"], fixture["report_json"],
+            fixture["identity_path"], fixture["identity"],
+            serial_tail_path if serial_tail_path is not None else fixture["serial_tail_path"], self.root, "inv",
+        )
+
+    def test_refuses_r_driver_equal_to_one(self):
+        fixture = _write_fixture(self.root, self.base_sha, self.tip_sha)
+        fixture["report_json"]["serial_tail_ratio"] = 1.0
+        with self.assertRaises(art.ArtifactBuildError) as ctx:
+            self._build(fixture)
+        self.assertIn("must be in [0.0, 1.0)", str(ctx.exception))
+
+    def test_refuses_r_driver_above_one(self):
+        fixture = _write_fixture(self.root, self.base_sha, self.tip_sha)
+        fixture["report_json"]["serial_tail_ratio"] = 1.5
+        with self.assertRaises(art.ArtifactBuildError) as ctx:
+            self._build(fixture)
+        self.assertIn("must be in [0.0, 1.0)", str(ctx.exception))
+
+    def test_refuses_r_driver_negative(self):
+        fixture = _write_fixture(self.root, self.base_sha, self.tip_sha)
+        fixture["report_json"]["serial_tail_ratio"] = -0.5
+        with self.assertRaises(art.ArtifactBuildError) as ctx:
+            self._build(fixture)
+        self.assertIn("must be in [0.0, 1.0)", str(ctx.exception))
+
+    def test_refuses_r_measured_above_one(self):
+        # front_base_mean_s == 1.0 in this fixture's own HTSAT base legs,
+        # so a measured t_s of 1.5 -> r_measured = 1.5.
+        fixture = _write_fixture(self.root, self.base_sha, self.tip_sha)
+        bad_serial_tail = _write_serial_tail(self.root, audio_t_s=1.5)
+        with self.assertRaises(art.ArtifactBuildError) as ctx:
+            self._build(fixture, serial_tail_path=bad_serial_tail)
+        self.assertIn("must be in [0.0, 1.0)", str(ctx.exception))
+
+    def test_zero_htsat_front_base_is_a_named_refusal_not_zero_division(self):
+        fixture = _write_fixture(self.root, self.base_sha, self.tip_sha)
+        for repeat in REPEATS:
+            raw_path = fixture["raw_dir"] / f"htsat__base__{repeat}.json"
+            report = json.loads(raw_path.read_text())
+            report["tiers"]["finetune_run"]["media_front_end_wall_s"] = 0.0
+            raw_path.write_text(json.dumps(report), encoding="utf-8")
+            fixture["report_json"]["towers"]["htsat"]["base"][repeat]["front_per_step"] = 0.0
+        with self.assertRaises(art.ArtifactBuildError) as ctx:
+            self._build(fixture)
+        self.assertIn("must be a finite positive number to divide by", str(ctx.exception))
 
 
 class CliEndToEndTests(unittest.TestCase):
@@ -544,7 +860,7 @@ class CliEndToEndTests(unittest.TestCase):
                 "--raw-dir", str(self.fixture["raw_dir"]),
                 "--report-json", str(self.fixture["report_path"]),
                 "--identity", str(self.fixture["identity_path"]),
-                "--measured-serial-tail-s", str(MEASURED_SERIAL_TAIL_S),
+                "--serial-tail", str(self.fixture["serial_tail_path"]),
                 "--repo-root", str(self.root),
                 *extra_args,
             ],
@@ -572,18 +888,41 @@ class RealFixtureRegressionTests(unittest.TestCase):
     frontend_ab_final/`) through `build_report`, against the ACTUAL current
     checkout as `--repo-root` -- a regression guard that the committed
     `report.json` + raw legs still cross-check cleanly against this module's
-    own re-derivation. Skips (never fails) if the real fixture directory is
-    absent so this file stays runnable before that directory lands, and
-    skips if `--repo-root`'s own git history does not contain the fixture's
-    `tip_sha`/`base_sha` (e.g. a shallow CI checkout of an unrelated repo
-    running this file in isolation)."""
+    own re-derivation.
+
+    Locally (or on any OTHER CI leg), this SKIPS -- never fails -- if the
+    real fixture directory is absent, or if `--repo-root`'s own git history
+    does not contain the fixture's `tip_sha`/`base_sha` (a shallow checkout
+    of an unrelated repo running this file in isolation is not this test's
+    concern). But `ci.yml`'s own `frontend_ab_artifact suite` matrix entry
+    sets `JAMMI_CI_FRONTEND_AB_FINAL_FIXTURE_EXPECTED=1` (this repo's own
+    zero-execution-is-RED doctrine, the same precedent
+    `test_convert_legacy_bert_checkpoint.py::CiExecutionAssertionTests`
+    already establishes for `JAMMI_CI_SAFETENSORS_EXPECTED`) AND
+    `fetch_depth: "0"` -- under that env var, BOTH escape hatches turn into
+    a hard `fail()` instead of a silent skip, so a regression that deletes
+    the fixture directory, or a matrix-entry edit that drops `fetch_depth:
+    "0"` and reintroduces a shallow checkout, shows up as a RED leg rather
+    than an indistinguishable quiet skip."""
+
+    _CI_ENV_VAR = "JAMMI_CI_FRONTEND_AB_FINAL_FIXTURE_EXPECTED"
+
+    def _ci_expects_real_fixture(self) -> bool:
+        return os.environ.get(self._CI_ENV_VAR) == "1"
+
+    def _skip_or_fail(self, message: str) -> None:
+        if self._ci_expects_real_fixture():
+            self.fail(f"{message} -- but {self._CI_ENV_VAR}=1 (ci.yml's own matrix entry expects this to run)")
+        self.skipTest(message)
 
     def test_real_fixture_cross_checks_cleanly(self):
         if not REAL_FIXTURE_DIR.is_dir():
-            self.skipTest(f"{REAL_FIXTURE_DIR} not present")
+            self._skip_or_fail(f"{REAL_FIXTURE_DIR} not present")
+            return
         report_path = REAL_FIXTURE_DIR / "report.json"
         identity_path = PERF_DIR / "frontend_ab_final_identity.json"
         raw_dir = REAL_FIXTURE_DIR / "raw"
+        serial_tail_path = REAL_FIXTURE_DIR / "serial_tail.txt"
         report_json = json.loads(report_path.read_text())
         identity = json.loads(identity_path.read_text())
         repo_root = PERF_DIR.parents[2]
@@ -593,11 +932,15 @@ class RealFixtureRegressionTests(unittest.TestCase):
             return proc.returncode == 0
 
         if not (_has_commit(report_json["base_sha"]) and _has_commit(report_json["tip_sha"])):
-            self.skipTest("this checkout's history does not contain the real fixture's base_sha/tip_sha")
+            self._skip_or_fail(
+                "this checkout's history does not contain the real fixture's base_sha/tip_sha "
+                "(a shallow checkout -- fetch_depth: '0' is required for this matrix entry)"
+            )
+            return
 
         report = art.build_report(
             raw_dir, report_path, report_json, identity_path, identity,
-            0.00474603615, repo_root, "python3 ci/scripts/perf/frontend_ab_artifact.py (regression test)",
+            serial_tail_path, repo_root, "python3 ci/scripts/perf/frontend_ab_artifact.py (regression test)",
         )
         self.assertEqual(report["git_sha"], report_json["tip_sha"])
         self.assertEqual(report["verdict"]["unit_verdict"], "UNRESOLVED")

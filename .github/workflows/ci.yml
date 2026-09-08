@@ -1710,26 +1710,52 @@ jobs:
             cmd: python3 ci/scripts/perf/test_frontend_ab_merge.py
           # `frontend_ab_artifact.py`'s own suite (#421 follow-on close-out,
           # contract `perf/421-frontend` v3 "Build" item 1) -- the SECOND,
-          # INDEPENDENT reader after `frontend_ab_merge.py`: re-derives every
-          # leg's own `front_per_step`/`train_per_step` and the HTSAT bar's
-          # own `p`/`ideal`/bounds/`ratio`/`ratio_lo`/`ratio_hi`/`verdict`
+          # INDEPENDENT reader after `frontend_ab_merge.py`: enumerates
+          # `--raw-dir` itself and refuses BY NAME unless its own leg set
+          # (and `--report-json`'s own `towers` object) equals EXACTLY
+          # TOWERS x ROLES x {r1..r<repeats>} in BOTH directions (an extra
+          # leg left over from a stale re-run, or a missing one, before a
+          # single number is read), then re-derives every leg's own
+          # `front_per_step`/`train_per_step` and the HTSAT bar's own
+          # `p`/`ideal`/bounds/`ratio`/`ratio_lo`/`ratio_hi`/`verdict`
           # DIRECTLY from the raw legs (never imports `frontend_ab_merge.py`'s
           # own bar arithmetic -- a second, independent implementation of the
           # SAME pinned formula), refusing the moment any re-derived number
-          # disagrees with `report.json`'s own value, or the driver-default
-          # vs the run's own measured serial-tail ratio disagree on the
-          # bar's own verdict (the "verdict invariant" this contract names is
-          # a checked equality here, not prose). A `git init`'d tempdir repo
-          # (mirroring `check_cuda_run_artifacts.py`'s own self-test
-          # discipline) drives the "files changed after the measured tip"
-          # deviation: off this unit's own hot-path file set is recorded,
-          # ON it is a hard refusal. Every numeric field is checked against
-          # an INDEPENDENT third arithmetic oracle written in the test file
-          # itself. A dedicated regression class drives the REAL, committed
-          # pod-p421c fixture (`fixtures/frontend_ab_final/`) end to end
-          # against this checkout's own git history. No GPU, no network.
+          # disagrees with `report.json`'s own value, the per-leg
+          # `task`/`device_name` disagree with the tower/box being read, `r`
+          # (read from `report.json` and from a committed `--serial-tail`
+          # fixture, never a CLI float) falls outside its own `[0, 1)`
+          # domain, a would-be divisor is zero/non-positive, or the
+          # driver-default vs the run's own measured serial-tail ratio
+          # disagree on the bar's own verdict (the "verdict invariant" this
+          # contract names is a checked equality here, not prose). A `git
+          # init`'d tempdir repo (mirroring `check_cuda_run_artifacts.py`'s
+          # own self-test discipline) drives the "files changed after the
+          # measured tip" deviation: it is RECORDED mechanically regardless
+          # of whether the changed files sit on this unit's own hot path --
+          # never a refusal (a file diff alone cannot judge whether an edit
+          # changed timed behaviour; that judgement lives in `--identity`'s
+          # own reviewed commentary, attached alongside the mechanical list).
+          # Every numeric field is checked against an INDEPENDENT third
+          # arithmetic oracle written in the test file itself. A dedicated
+          # regression class drives the REAL, committed pod-p421c fixture
+          # (`fixtures/frontend_ab_final/`) end to end against this
+          # checkout's own git history -- both ancestry (`base_sha`/
+          # `tip_sha` must be reachable) and the post-tip diff need real
+          # history, hence `fetch_depth: "0"` below, the same exception the
+          # "CUDA run artifact schema"/"pod build timings" legs already
+          # carry. `JAMMI_CI_FRONTEND_AB_FINAL_FIXTURE_EXPECTED=1` (this
+          # repo's own zero-execution-is-RED doctrine, the
+          # `JAMMI_CI_SAFETENSORS_EXPECTED` precedent above) turns that
+          # regression class's own two "not applicable here" skips (fixture
+          # directory absent; history missing the fixture's shas) into a
+          # hard RED in CI, so the real-fixture class actually executes
+          # every run rather than silently re-skipping if the fixture is
+          # ever deleted or `fetch_depth: "0"` is ever dropped. No GPU, no
+          # network.
           - name: frontend_ab_artifact suite
-            cmd: python3 ci/scripts/perf/test_frontend_ab_artifact.py
+            cmd: JAMMI_CI_FRONTEND_AB_FINAL_FIXTURE_EXPECTED=1 python3 ci/scripts/perf/test_frontend_ab_artifact.py
+            fetch_depth: "0"
     steps:
       - uses: actions/checkout@v4
         with:

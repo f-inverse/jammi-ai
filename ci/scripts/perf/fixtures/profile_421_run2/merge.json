@@ -1,0 +1,1237 @@
+{
+ "tool": "profile_421_merge",
+ "schema": 1,
+ "legs_dir": "/root/profile-421/run2/legs",
+ "legs": [
+  {
+   "leg_id": "clip-text-A1",
+   "tower": "clip-text",
+   "task": "text_embedding",
+   "dtype": "f32",
+   "arm": "A",
+   "kernels_disabled": [],
+   "verdict": "VALID",
+   "reasons": [],
+   "positive_proof": {
+    "run_n": {
+     "lora_linear_fused": {
+      "census_field": "lora_sites_wrapped",
+      "calls_per_forward": 48,
+      "steps_measured": 100,
+      "expected_total": 4800,
+      "fused": 4800,
+      "eager": 0,
+      "equation_ok": true,
+      "eager_share": 0.0
+     },
+     "layer_norm_fused": {
+      "census_field": "layer_norms",
+      "calls_per_forward": 25,
+      "steps_measured": 100,
+      "expected_total": 2500,
+      "fused": 2500,
+      "eager": 0,
+      "equation_ok": true,
+      "eager_share": 0.0
+     },
+     "gelu_erf_fused": {
+      "census_field": "gelu_seam_calls_per_forward",
+      "calls_per_forward": 0,
+      "steps_measured": 100,
+      "expected_total": 0,
+      "fused": 0,
+      "eager": 0,
+      "equation_ok": true,
+      "eager_share": null
+     }
+    },
+    "run_m": {
+     "lora_linear_fused": {
+      "census_field": "lora_sites_wrapped",
+      "calls_per_forward": 48,
+      "steps_measured": 600,
+      "expected_total": 28800,
+      "fused": 28800,
+      "eager": 0,
+      "equation_ok": true,
+      "eager_share": 0.0
+     },
+     "layer_norm_fused": {
+      "census_field": "layer_norms",
+      "calls_per_forward": 25,
+      "steps_measured": 600,
+      "expected_total": 15000,
+      "fused": 15000,
+      "eager": 0,
+      "equation_ok": true,
+      "eager_share": 0.0
+     },
+     "gelu_erf_fused": {
+      "census_field": "gelu_seam_calls_per_forward",
+      "calls_per_forward": 0,
+      "steps_measured": 600,
+      "expected_total": 0,
+      "fused": 0,
+      "eager": 0,
+      "equation_ok": true,
+      "eager_share": null
+     }
+    }
+   },
+   "per_step": {
+    "steps_measured_n": 100,
+    "steps_measured_m": 600,
+    "steps_diff": 500,
+    "wall_s_per_step": 0.100395604786,
+    "front_s_per_step": 0.0,
+    "busy_s_per_step": 0.060751374412,
+    "residual_s_per_step": 0.039644230374,
+    "overlap_s_per_step": null,
+    "front_end_inside_residual": true,
+    "front_share_of_wall": 0.0,
+    "busy_share_of_wall": 0.6051198609888914
+   },
+   "checkpoint_weights_sha256": "ac4f8c4b88af6d963118cbf40ad93176d092abbedfcb752601ae1866352656e6",
+   "fusible_site_census": {
+    "lora_sites_wrapped": 48,
+    "layer_norms": 25,
+    "gelu_seam_calls_per_forward": 0
+   }
+  },
+  {
+   "leg_id": "clip-text-A2",
+   "tower": "clip-text",
+   "task": "text_embedding",
+   "dtype": "bf16",
+   "arm": "A",
+   "kernels_disabled": [],
+   "verdict": "VALID",
+   "reasons": [],
+   "positive_proof": {
+    "run_n": {
+     "lora_linear_fused": {
+      "census_field": "lora_sites_wrapped",
+      "calls_per_forward": 48,
+      "steps_measured": 100,
+      "expected_total": 4800,
+      "fused": 4800,
+      "eager": 0,
+      "equation_ok": true,
+      "eager_share": 0.0
+     },
+     "layer_norm_fused": {
+      "census_field": "layer_norms",
+      "calls_per_forward": 25,
+      "steps_measured": 100,
+      "expected_total": 2500,
+      "fused": 2500,
+      "eager": 0,
+      "equation_ok": true,
+      "eager_share": 0.0
+     },
+     "gelu_erf_fused": {
+      "census_field": "gelu_seam_calls_per_forward",
+      "calls_per_forward": 0,
+      "steps_measured": 100,
+      "expected_total": 0,
+      "fused": 0,
+      "eager": 0,
+      "equation_ok": true,
+      "eager_share": null
+     }
+    },
+    "run_m": {
+     "lora_linear_fused": {
+      "census_field": "lora_sites_wrapped",
+      "calls_per_forward": 48,
+      "steps_measured": 600,
+      "expected_total": 28800,
+      "fused": 28800,
+      "eager": 0,
+      "equation_ok": true,
+      "eager_share": 0.0
+     },
+     "layer_norm_fused": {
+      "census_field": "layer_norms",
+      "calls_per_forward": 25,
+      "steps_measured": 600,
+      "expected_total": 15000,
+      "fused": 15000,
+      "eager": 0,
+      "equation_ok": true,
+      "eager_share": 0.0
+     },
+     "gelu_erf_fused": {
+      "census_field": "gelu_seam_calls_per_forward",
+      "calls_per_forward": 0,
+      "steps_measured": 600,
+      "expected_total": 0,
+      "fused": 0,
+      "eager": 0,
+      "equation_ok": true,
+      "eager_share": null
+     }
+    }
+   },
+   "per_step": {
+    "steps_measured_n": 100,
+    "steps_measured_m": 600,
+    "steps_diff": 500,
+    "wall_s_per_step": 0.096548202412,
+    "front_s_per_step": 0.0,
+    "busy_s_per_step": 0.041449621674,
+    "residual_s_per_step": 0.055098580738,
+    "overlap_s_per_step": null,
+    "front_end_inside_residual": true,
+    "front_share_of_wall": 0.0,
+    "busy_share_of_wall": 0.4293153123361333
+   },
+   "checkpoint_weights_sha256": "ac4f8c4b88af6d963118cbf40ad93176d092abbedfcb752601ae1866352656e6",
+   "fusible_site_census": {
+    "lora_sites_wrapped": 48,
+    "layer_norms": 25,
+    "gelu_seam_calls_per_forward": 0
+   }
+  },
+  {
+   "leg_id": "clip-text-D1",
+   "tower": "clip-text",
+   "task": "text_embedding",
+   "dtype": "f32",
+   "arm": "D",
+   "kernels_disabled": [
+    "layer_norm_fused",
+    "lora_linear_fused"
+   ],
+   "verdict": "VALID",
+   "reasons": [],
+   "positive_proof": {
+    "run_n": {
+     "lora_linear_fused": {
+      "census_field": "lora_sites_wrapped",
+      "calls_per_forward": 48,
+      "steps_measured": 100,
+      "expected_total": 4800,
+      "fused": 0,
+      "eager": 4800,
+      "equation_ok": true,
+      "eager_share": 1.0
+     },
+     "layer_norm_fused": {
+      "census_field": "layer_norms",
+      "calls_per_forward": 25,
+      "steps_measured": 100,
+      "expected_total": 2500,
+      "fused": 0,
+      "eager": 2500,
+      "equation_ok": true,
+      "eager_share": 1.0
+     },
+     "gelu_erf_fused": {
+      "census_field": "gelu_seam_calls_per_forward",
+      "calls_per_forward": 0,
+      "steps_measured": 100,
+      "expected_total": 0,
+      "fused": 0,
+      "eager": 0,
+      "equation_ok": true,
+      "eager_share": null
+     }
+    },
+    "run_m": {
+     "lora_linear_fused": {
+      "census_field": "lora_sites_wrapped",
+      "calls_per_forward": 48,
+      "steps_measured": 600,
+      "expected_total": 28800,
+      "fused": 0,
+      "eager": 28800,
+      "equation_ok": true,
+      "eager_share": 1.0
+     },
+     "layer_norm_fused": {
+      "census_field": "layer_norms",
+      "calls_per_forward": 25,
+      "steps_measured": 600,
+      "expected_total": 15000,
+      "fused": 0,
+      "eager": 15000,
+      "equation_ok": true,
+      "eager_share": 1.0
+     },
+     "gelu_erf_fused": {
+      "census_field": "gelu_seam_calls_per_forward",
+      "calls_per_forward": 0,
+      "steps_measured": 600,
+      "expected_total": 0,
+      "fused": 0,
+      "eager": 0,
+      "equation_ok": true,
+      "eager_share": null
+     }
+    }
+   },
+   "per_step": {
+    "steps_measured_n": 100,
+    "steps_measured_m": 600,
+    "steps_diff": 500,
+    "wall_s_per_step": 0.14856247029000003,
+    "front_s_per_step": 0.0,
+    "busy_s_per_step": 0.089462010318,
+    "residual_s_per_step": 0.05910045997200003,
+    "overlap_s_per_step": null,
+    "front_end_inside_residual": true,
+    "front_share_of_wall": 0.0,
+    "busy_share_of_wall": 0.6021844557603713
+   },
+   "checkpoint_weights_sha256": "ac4f8c4b88af6d963118cbf40ad93176d092abbedfcb752601ae1866352656e6",
+   "fusible_site_census": {
+    "lora_sites_wrapped": 48,
+    "layer_norms": 25,
+    "gelu_seam_calls_per_forward": 0
+   }
+  },
+  {
+   "leg_id": "clip-text-D2",
+   "tower": "clip-text",
+   "task": "text_embedding",
+   "dtype": "f32",
+   "arm": "D",
+   "kernels_disabled": [
+    "lora_linear_fused"
+   ],
+   "verdict": "VALID",
+   "reasons": [],
+   "positive_proof": {
+    "run_n": {
+     "lora_linear_fused": {
+      "census_field": "lora_sites_wrapped",
+      "calls_per_forward": 48,
+      "steps_measured": 100,
+      "expected_total": 4800,
+      "fused": 0,
+      "eager": 4800,
+      "equation_ok": true,
+      "eager_share": 1.0
+     },
+     "layer_norm_fused": {
+      "census_field": "layer_norms",
+      "calls_per_forward": 25,
+      "steps_measured": 100,
+      "expected_total": 2500,
+      "fused": 2500,
+      "eager": 0,
+      "equation_ok": true,
+      "eager_share": 0.0
+     },
+     "gelu_erf_fused": {
+      "census_field": "gelu_seam_calls_per_forward",
+      "calls_per_forward": 0,
+      "steps_measured": 100,
+      "expected_total": 0,
+      "fused": 0,
+      "eager": 0,
+      "equation_ok": true,
+      "eager_share": null
+     }
+    },
+    "run_m": {
+     "lora_linear_fused": {
+      "census_field": "lora_sites_wrapped",
+      "calls_per_forward": 48,
+      "steps_measured": 600,
+      "expected_total": 28800,
+      "fused": 0,
+      "eager": 28800,
+      "equation_ok": true,
+      "eager_share": 1.0
+     },
+     "layer_norm_fused": {
+      "census_field": "layer_norms",
+      "calls_per_forward": 25,
+      "steps_measured": 600,
+      "expected_total": 15000,
+      "fused": 15000,
+      "eager": 0,
+      "equation_ok": true,
+      "eager_share": 0.0
+     },
+     "gelu_erf_fused": {
+      "census_field": "gelu_seam_calls_per_forward",
+      "calls_per_forward": 0,
+      "steps_measured": 600,
+      "expected_total": 0,
+      "fused": 0,
+      "eager": 0,
+      "equation_ok": true,
+      "eager_share": null
+     }
+    }
+   },
+   "per_step": {
+    "steps_measured_n": 100,
+    "steps_measured_m": 600,
+    "steps_diff": 500,
+    "wall_s_per_step": 0.13294916190800002,
+    "front_s_per_step": 0.0,
+    "busy_s_per_step": 0.079410048438,
+    "residual_s_per_step": 0.053539113470000024,
+    "overlap_s_per_step": null,
+    "front_end_inside_residual": true,
+    "front_share_of_wall": 0.0,
+    "busy_share_of_wall": 0.5972963446956608
+   },
+   "checkpoint_weights_sha256": "ac4f8c4b88af6d963118cbf40ad93176d092abbedfcb752601ae1866352656e6",
+   "fusible_site_census": {
+    "lora_sites_wrapped": 48,
+    "layer_norms": 25,
+    "gelu_seam_calls_per_forward": 0
+   }
+  },
+  {
+   "leg_id": "clip-vision-A1",
+   "tower": "clip-vision",
+   "task": "image_embedding",
+   "dtype": "f32",
+   "arm": "A",
+   "kernels_disabled": [],
+   "verdict": "VALID",
+   "reasons": [],
+   "positive_proof": {
+    "run_n": {
+     "lora_linear_fused": {
+      "census_field": "lora_sites_wrapped",
+      "calls_per_forward": 48,
+      "steps_measured": 100,
+      "expected_total": 4800,
+      "fused": 4800,
+      "eager": 0,
+      "equation_ok": true,
+      "eager_share": 0.0
+     },
+     "layer_norm_fused": {
+      "census_field": "layer_norms",
+      "calls_per_forward": 26,
+      "steps_measured": 100,
+      "expected_total": 2600,
+      "fused": 2500,
+      "eager": 100,
+      "equation_ok": true,
+      "eager_share": 0.038461538461538464
+     },
+     "gelu_erf_fused": {
+      "census_field": "gelu_seam_calls_per_forward",
+      "calls_per_forward": 0,
+      "steps_measured": 100,
+      "expected_total": 0,
+      "fused": 0,
+      "eager": 0,
+      "equation_ok": true,
+      "eager_share": null
+     }
+    },
+    "run_m": {
+     "lora_linear_fused": {
+      "census_field": "lora_sites_wrapped",
+      "calls_per_forward": 48,
+      "steps_measured": 600,
+      "expected_total": 28800,
+      "fused": 28800,
+      "eager": 0,
+      "equation_ok": true,
+      "eager_share": 0.0
+     },
+     "layer_norm_fused": {
+      "census_field": "layer_norms",
+      "calls_per_forward": 26,
+      "steps_measured": 600,
+      "expected_total": 15600,
+      "fused": 15000,
+      "eager": 600,
+      "equation_ok": true,
+      "eager_share": 0.038461538461538464
+     },
+     "gelu_erf_fused": {
+      "census_field": "gelu_seam_calls_per_forward",
+      "calls_per_forward": 0,
+      "steps_measured": 600,
+      "expected_total": 0,
+      "fused": 0,
+      "eager": 0,
+      "equation_ok": true,
+      "eager_share": null
+     }
+    }
+   },
+   "per_step": {
+    "steps_measured_n": 100,
+    "steps_measured_m": 600,
+    "steps_diff": 500,
+    "wall_s_per_step": 0.11467209593000001,
+    "front_s_per_step": 0.023469370928,
+    "busy_s_per_step": 0.065212199092,
+    "residual_s_per_step": 0.025990525910000006,
+    "overlap_s_per_step": null,
+    "front_end_inside_residual": false,
+    "front_share_of_wall": 0.20466505593764112,
+    "busy_share_of_wall": 0.5686841124087231
+   },
+   "checkpoint_weights_sha256": "ac4f8c4b88af6d963118cbf40ad93176d092abbedfcb752601ae1866352656e6",
+   "fusible_site_census": {
+    "lora_sites_wrapped": 48,
+    "layer_norms": 26,
+    "gelu_seam_calls_per_forward": 0
+   }
+  },
+  {
+   "leg_id": "clip-vision-A2",
+   "tower": "clip-vision",
+   "task": "image_embedding",
+   "dtype": "bf16",
+   "arm": "A",
+   "kernels_disabled": [],
+   "verdict": "VALID",
+   "reasons": [],
+   "positive_proof": {
+    "run_n": {
+     "lora_linear_fused": {
+      "census_field": "lora_sites_wrapped",
+      "calls_per_forward": 48,
+      "steps_measured": 100,
+      "expected_total": 4800,
+      "fused": 4800,
+      "eager": 0,
+      "equation_ok": true,
+      "eager_share": 0.0
+     },
+     "layer_norm_fused": {
+      "census_field": "layer_norms",
+      "calls_per_forward": 26,
+      "steps_measured": 100,
+      "expected_total": 2600,
+      "fused": 2500,
+      "eager": 100,
+      "equation_ok": true,
+      "eager_share": 0.038461538461538464
+     },
+     "gelu_erf_fused": {
+      "census_field": "gelu_seam_calls_per_forward",
+      "calls_per_forward": 0,
+      "steps_measured": 100,
+      "expected_total": 0,
+      "fused": 0,
+      "eager": 0,
+      "equation_ok": true,
+      "eager_share": null
+     }
+    },
+    "run_m": {
+     "lora_linear_fused": {
+      "census_field": "lora_sites_wrapped",
+      "calls_per_forward": 48,
+      "steps_measured": 600,
+      "expected_total": 28800,
+      "fused": 28800,
+      "eager": 0,
+      "equation_ok": true,
+      "eager_share": 0.0
+     },
+     "layer_norm_fused": {
+      "census_field": "layer_norms",
+      "calls_per_forward": 26,
+      "steps_measured": 600,
+      "expected_total": 15600,
+      "fused": 15000,
+      "eager": 600,
+      "equation_ok": true,
+      "eager_share": 0.038461538461538464
+     },
+     "gelu_erf_fused": {
+      "census_field": "gelu_seam_calls_per_forward",
+      "calls_per_forward": 0,
+      "steps_measured": 600,
+      "expected_total": 0,
+      "fused": 0,
+      "eager": 0,
+      "equation_ok": true,
+      "eager_share": null
+     }
+    }
+   },
+   "per_step": {
+    "steps_measured_n": 100,
+    "steps_measured_m": 600,
+    "steps_diff": 500,
+    "wall_s_per_step": 0.108610351186,
+    "front_s_per_step": 0.024075964506,
+    "busy_s_per_step": 0.03863851991,
+    "residual_s_per_step": 0.04589586677,
+    "overlap_s_per_step": null,
+    "front_end_inside_residual": false,
+    "front_share_of_wall": 0.22167283544428332,
+    "busy_share_of_wall": 0.35575356757506327
+   },
+   "checkpoint_weights_sha256": "ac4f8c4b88af6d963118cbf40ad93176d092abbedfcb752601ae1866352656e6",
+   "fusible_site_census": {
+    "lora_sites_wrapped": 48,
+    "layer_norms": 26,
+    "gelu_seam_calls_per_forward": 0
+   }
+  },
+  {
+   "leg_id": "clip-vision-D1",
+   "tower": "clip-vision",
+   "task": "image_embedding",
+   "dtype": "f32",
+   "arm": "D",
+   "kernels_disabled": [
+    "layer_norm_fused",
+    "lora_linear_fused"
+   ],
+   "verdict": "VALID",
+   "reasons": [],
+   "positive_proof": {
+    "run_n": {
+     "lora_linear_fused": {
+      "census_field": "lora_sites_wrapped",
+      "calls_per_forward": 48,
+      "steps_measured": 100,
+      "expected_total": 4800,
+      "fused": 0,
+      "eager": 4800,
+      "equation_ok": true,
+      "eager_share": 1.0
+     },
+     "layer_norm_fused": {
+      "census_field": "layer_norms",
+      "calls_per_forward": 26,
+      "steps_measured": 100,
+      "expected_total": 2600,
+      "fused": 0,
+      "eager": 2600,
+      "equation_ok": true,
+      "eager_share": 1.0
+     },
+     "gelu_erf_fused": {
+      "census_field": "gelu_seam_calls_per_forward",
+      "calls_per_forward": 0,
+      "steps_measured": 100,
+      "expected_total": 0,
+      "fused": 0,
+      "eager": 0,
+      "equation_ok": true,
+      "eager_share": null
+     }
+    },
+    "run_m": {
+     "lora_linear_fused": {
+      "census_field": "lora_sites_wrapped",
+      "calls_per_forward": 48,
+      "steps_measured": 600,
+      "expected_total": 28800,
+      "fused": 0,
+      "eager": 28800,
+      "equation_ok": true,
+      "eager_share": 1.0
+     },
+     "layer_norm_fused": {
+      "census_field": "layer_norms",
+      "calls_per_forward": 26,
+      "steps_measured": 600,
+      "expected_total": 15600,
+      "fused": 0,
+      "eager": 15600,
+      "equation_ok": true,
+      "eager_share": 1.0
+     },
+     "gelu_erf_fused": {
+      "census_field": "gelu_seam_calls_per_forward",
+      "calls_per_forward": 0,
+      "steps_measured": 600,
+      "expected_total": 0,
+      "fused": 0,
+      "eager": 0,
+      "equation_ok": true,
+      "eager_share": null
+     }
+    }
+   },
+   "per_step": {
+    "steps_measured_n": 100,
+    "steps_measured_m": 600,
+    "steps_diff": 500,
+    "wall_s_per_step": 0.16582872146799998,
+    "front_s_per_step": 0.024295422772000003,
+    "busy_s_per_step": 0.09758611139000001,
+    "residual_s_per_step": 0.043947187305999974,
+    "overlap_s_per_step": null,
+    "front_end_inside_residual": false,
+    "front_share_of_wall": 0.14650913639642513,
+    "busy_share_of_wall": 0.5884753287977995
+   },
+   "checkpoint_weights_sha256": "ac4f8c4b88af6d963118cbf40ad93176d092abbedfcb752601ae1866352656e6",
+   "fusible_site_census": {
+    "lora_sites_wrapped": 48,
+    "layer_norms": 26,
+    "gelu_seam_calls_per_forward": 0
+   }
+  },
+  {
+   "leg_id": "clip-vision-D2",
+   "tower": "clip-vision",
+   "task": "image_embedding",
+   "dtype": "f32",
+   "arm": "D",
+   "kernels_disabled": [
+    "lora_linear_fused"
+   ],
+   "verdict": "VALID",
+   "reasons": [],
+   "positive_proof": {
+    "run_n": {
+     "lora_linear_fused": {
+      "census_field": "lora_sites_wrapped",
+      "calls_per_forward": 48,
+      "steps_measured": 100,
+      "expected_total": 4800,
+      "fused": 0,
+      "eager": 4800,
+      "equation_ok": true,
+      "eager_share": 1.0
+     },
+     "layer_norm_fused": {
+      "census_field": "layer_norms",
+      "calls_per_forward": 26,
+      "steps_measured": 100,
+      "expected_total": 2600,
+      "fused": 2500,
+      "eager": 100,
+      "equation_ok": true,
+      "eager_share": 0.038461538461538464
+     },
+     "gelu_erf_fused": {
+      "census_field": "gelu_seam_calls_per_forward",
+      "calls_per_forward": 0,
+      "steps_measured": 100,
+      "expected_total": 0,
+      "fused": 0,
+      "eager": 0,
+      "equation_ok": true,
+      "eager_share": null
+     }
+    },
+    "run_m": {
+     "lora_linear_fused": {
+      "census_field": "lora_sites_wrapped",
+      "calls_per_forward": 48,
+      "steps_measured": 600,
+      "expected_total": 28800,
+      "fused": 0,
+      "eager": 28800,
+      "equation_ok": true,
+      "eager_share": 1.0
+     },
+     "layer_norm_fused": {
+      "census_field": "layer_norms",
+      "calls_per_forward": 26,
+      "steps_measured": 600,
+      "expected_total": 15600,
+      "fused": 15000,
+      "eager": 600,
+      "equation_ok": true,
+      "eager_share": 0.038461538461538464
+     },
+     "gelu_erf_fused": {
+      "census_field": "gelu_seam_calls_per_forward",
+      "calls_per_forward": 0,
+      "steps_measured": 600,
+      "expected_total": 0,
+      "fused": 0,
+      "eager": 0,
+      "equation_ok": true,
+      "eager_share": null
+     }
+    }
+   },
+   "per_step": {
+    "steps_measured_n": 100,
+    "steps_measured_m": 600,
+    "steps_diff": 500,
+    "wall_s_per_step": 0.144984638894,
+    "front_s_per_step": 0.024333530482,
+    "busy_s_per_step": 0.08726554584599999,
+    "residual_s_per_step": 0.03338556256600002,
+    "overlap_s_per_step": null,
+    "front_end_inside_residual": false,
+    "front_share_of_wall": 0.16783523183990914,
+    "busy_share_of_wall": 0.601895114625218
+   },
+   "checkpoint_weights_sha256": "ac4f8c4b88af6d963118cbf40ad93176d092abbedfcb752601ae1866352656e6",
+   "fusible_site_census": {
+    "lora_sites_wrapped": 48,
+    "layer_norms": 26,
+    "gelu_seam_calls_per_forward": 0
+   }
+  },
+  {
+   "leg_id": "htsat-A1",
+   "tower": "htsat",
+   "task": "audio_embedding",
+   "dtype": "f32",
+   "arm": "A",
+   "kernels_disabled": [],
+   "verdict": "VALID",
+   "reasons": [],
+   "positive_proof": {
+    "run_n": {
+     "lora_linear_fused": {
+      "census_field": "lora_sites_wrapped",
+      "calls_per_forward": 77,
+      "steps_measured": 100,
+      "expected_total": 7700,
+      "fused": 7700,
+      "eager": 0,
+      "equation_ok": true,
+      "eager_share": 0.0
+     },
+     "layer_norm_fused": {
+      "census_field": "layer_norms",
+      "calls_per_forward": 29,
+      "steps_measured": 100,
+      "expected_total": 2900,
+      "fused": 2900,
+      "eager": 0,
+      "equation_ok": true,
+      "eager_share": 0.0
+     },
+     "gelu_erf_fused": {
+      "census_field": "gelu_seam_calls_per_forward",
+      "calls_per_forward": 12,
+      "steps_measured": 100,
+      "expected_total": 1200,
+      "fused": 1200,
+      "eager": 0,
+      "equation_ok": true,
+      "eager_share": 0.0
+     }
+    },
+    "run_m": {
+     "lora_linear_fused": {
+      "census_field": "lora_sites_wrapped",
+      "calls_per_forward": 77,
+      "steps_measured": 600,
+      "expected_total": 46200,
+      "fused": 46200,
+      "eager": 0,
+      "equation_ok": true,
+      "eager_share": 0.0
+     },
+     "layer_norm_fused": {
+      "census_field": "layer_norms",
+      "calls_per_forward": 29,
+      "steps_measured": 600,
+      "expected_total": 17400,
+      "fused": 17400,
+      "eager": 0,
+      "equation_ok": true,
+      "eager_share": 0.0
+     },
+     "gelu_erf_fused": {
+      "census_field": "gelu_seam_calls_per_forward",
+      "calls_per_forward": 12,
+      "steps_measured": 600,
+      "expected_total": 7200,
+      "fused": 7200,
+      "eager": 0,
+      "equation_ok": true,
+      "eager_share": 0.0
+     }
+    }
+   },
+   "per_step": {
+    "steps_measured_n": 100,
+    "steps_measured_m": 600,
+    "steps_diff": 500,
+    "wall_s_per_step": 1.549989161842,
+    "front_s_per_step": 1.250912541216,
+    "busy_s_per_step": 0.234764511126,
+    "residual_s_per_step": 0.06431210950000005,
+    "overlap_s_per_step": null,
+    "front_end_inside_residual": false,
+    "front_share_of_wall": 0.8070459923277278,
+    "busy_share_of_wall": 0.15146203399706804
+   },
+   "checkpoint_weights_sha256": "3f648de6d030e17494be455d323b8d191233fbae0c7ce0ba745fd21a926a63a6",
+   "fusible_site_census": {
+    "lora_sites_wrapped": 77,
+    "layer_norms": 29,
+    "gelu_seam_calls_per_forward": 12
+   }
+  },
+  {
+   "leg_id": "htsat-A2",
+   "tower": "htsat",
+   "task": "audio_embedding",
+   "dtype": "bf16",
+   "arm": "A",
+   "kernels_disabled": [],
+   "verdict": "VALID",
+   "reasons": [],
+   "positive_proof": {
+    "run_n": {
+     "lora_linear_fused": {
+      "census_field": "lora_sites_wrapped",
+      "calls_per_forward": 77,
+      "steps_measured": 100,
+      "expected_total": 7700,
+      "fused": 7700,
+      "eager": 0,
+      "equation_ok": true,
+      "eager_share": 0.0
+     },
+     "layer_norm_fused": {
+      "census_field": "layer_norms",
+      "calls_per_forward": 29,
+      "steps_measured": 100,
+      "expected_total": 2900,
+      "fused": 2900,
+      "eager": 0,
+      "equation_ok": true,
+      "eager_share": 0.0
+     },
+     "gelu_erf_fused": {
+      "census_field": "gelu_seam_calls_per_forward",
+      "calls_per_forward": 12,
+      "steps_measured": 100,
+      "expected_total": 1200,
+      "fused": 1200,
+      "eager": 0,
+      "equation_ok": true,
+      "eager_share": 0.0
+     }
+    },
+    "run_m": {
+     "lora_linear_fused": {
+      "census_field": "lora_sites_wrapped",
+      "calls_per_forward": 77,
+      "steps_measured": 600,
+      "expected_total": 46200,
+      "fused": 46200,
+      "eager": 0,
+      "equation_ok": true,
+      "eager_share": 0.0
+     },
+     "layer_norm_fused": {
+      "census_field": "layer_norms",
+      "calls_per_forward": 29,
+      "steps_measured": 600,
+      "expected_total": 17400,
+      "fused": 17400,
+      "eager": 0,
+      "equation_ok": true,
+      "eager_share": 0.0
+     },
+     "gelu_erf_fused": {
+      "census_field": "gelu_seam_calls_per_forward",
+      "calls_per_forward": 12,
+      "steps_measured": 600,
+      "expected_total": 7200,
+      "fused": 7200,
+      "eager": 0,
+      "equation_ok": true,
+      "eager_share": 0.0
+     }
+    }
+   },
+   "per_step": {
+    "steps_measured_n": 100,
+    "steps_measured_m": 600,
+    "steps_diff": 500,
+    "wall_s_per_step": 1.50049197164,
+    "front_s_per_step": 1.251592021452,
+    "busy_s_per_step": 0.18833222144,
+    "residual_s_per_step": 0.06056772874800004,
+    "overlap_s_per_step": null,
+    "front_end_inside_residual": false,
+    "front_share_of_wall": 0.8341211050160044,
+    "busy_share_of_wall": 0.1255136481897718
+   },
+   "checkpoint_weights_sha256": "3f648de6d030e17494be455d323b8d191233fbae0c7ce0ba745fd21a926a63a6",
+   "fusible_site_census": {
+    "lora_sites_wrapped": 77,
+    "layer_norms": 29,
+    "gelu_seam_calls_per_forward": 12
+   }
+  },
+  {
+   "leg_id": "htsat-D1",
+   "tower": "htsat",
+   "task": "audio_embedding",
+   "dtype": "f32",
+   "arm": "D",
+   "kernels_disabled": [
+    "gelu_erf_fused",
+    "layer_norm_fused",
+    "lora_linear_fused"
+   ],
+   "verdict": "VALID",
+   "reasons": [],
+   "positive_proof": {
+    "run_n": {
+     "lora_linear_fused": {
+      "census_field": "lora_sites_wrapped",
+      "calls_per_forward": 77,
+      "steps_measured": 100,
+      "expected_total": 7700,
+      "fused": 0,
+      "eager": 7700,
+      "equation_ok": true,
+      "eager_share": 1.0
+     },
+     "layer_norm_fused": {
+      "census_field": "layer_norms",
+      "calls_per_forward": 29,
+      "steps_measured": 100,
+      "expected_total": 2900,
+      "fused": 0,
+      "eager": 2900,
+      "equation_ok": true,
+      "eager_share": 1.0
+     },
+     "gelu_erf_fused": {
+      "census_field": "gelu_seam_calls_per_forward",
+      "calls_per_forward": 12,
+      "steps_measured": 100,
+      "expected_total": 1200,
+      "fused": 0,
+      "eager": 1200,
+      "equation_ok": true,
+      "eager_share": 1.0
+     }
+    },
+    "run_m": {
+     "lora_linear_fused": {
+      "census_field": "lora_sites_wrapped",
+      "calls_per_forward": 77,
+      "steps_measured": 600,
+      "expected_total": 46200,
+      "fused": 0,
+      "eager": 46200,
+      "equation_ok": true,
+      "eager_share": 1.0
+     },
+     "layer_norm_fused": {
+      "census_field": "layer_norms",
+      "calls_per_forward": 29,
+      "steps_measured": 600,
+      "expected_total": 17400,
+      "fused": 0,
+      "eager": 17400,
+      "equation_ok": true,
+      "eager_share": 1.0
+     },
+     "gelu_erf_fused": {
+      "census_field": "gelu_seam_calls_per_forward",
+      "calls_per_forward": 12,
+      "steps_measured": 600,
+      "expected_total": 7200,
+      "fused": 0,
+      "eager": 7200,
+      "equation_ok": true,
+      "eager_share": 1.0
+     }
+    }
+   },
+   "per_step": {
+    "steps_measured_n": 100,
+    "steps_measured_m": 600,
+    "steps_diff": 500,
+    "wall_s_per_step": 1.689497706914,
+    "front_s_per_step": 1.249312950748,
+    "busy_s_per_step": 0.348814364888,
+    "residual_s_per_step": 0.09137039127799995,
+    "overlap_s_per_step": null,
+    "front_end_inside_residual": false,
+    "front_share_of_wall": 0.739458210351743,
+    "busy_share_of_wall": 0.20646039557232473
+   },
+   "checkpoint_weights_sha256": "3f648de6d030e17494be455d323b8d191233fbae0c7ce0ba745fd21a926a63a6",
+   "fusible_site_census": {
+    "lora_sites_wrapped": 77,
+    "layer_norms": 29,
+    "gelu_seam_calls_per_forward": 12
+   }
+  },
+  {
+   "leg_id": "htsat-D2",
+   "tower": "htsat",
+   "task": "audio_embedding",
+   "dtype": "f32",
+   "arm": "D",
+   "kernels_disabled": [
+    "lora_linear_fused"
+   ],
+   "verdict": "VALID",
+   "reasons": [],
+   "positive_proof": {
+    "run_n": {
+     "lora_linear_fused": {
+      "census_field": "lora_sites_wrapped",
+      "calls_per_forward": 77,
+      "steps_measured": 100,
+      "expected_total": 7700,
+      "fused": 0,
+      "eager": 7700,
+      "equation_ok": true,
+      "eager_share": 1.0
+     },
+     "layer_norm_fused": {
+      "census_field": "layer_norms",
+      "calls_per_forward": 29,
+      "steps_measured": 100,
+      "expected_total": 2900,
+      "fused": 2900,
+      "eager": 0,
+      "equation_ok": true,
+      "eager_share": 0.0
+     },
+     "gelu_erf_fused": {
+      "census_field": "gelu_seam_calls_per_forward",
+      "calls_per_forward": 12,
+      "steps_measured": 100,
+      "expected_total": 1200,
+      "fused": 1200,
+      "eager": 0,
+      "equation_ok": true,
+      "eager_share": 0.0
+     }
+    },
+    "run_m": {
+     "lora_linear_fused": {
+      "census_field": "lora_sites_wrapped",
+      "calls_per_forward": 77,
+      "steps_measured": 600,
+      "expected_total": 46200,
+      "fused": 0,
+      "eager": 46200,
+      "equation_ok": true,
+      "eager_share": 1.0
+     },
+     "layer_norm_fused": {
+      "census_field": "layer_norms",
+      "calls_per_forward": 29,
+      "steps_measured": 600,
+      "expected_total": 17400,
+      "fused": 17400,
+      "eager": 0,
+      "equation_ok": true,
+      "eager_share": 0.0
+     },
+     "gelu_erf_fused": {
+      "census_field": "gelu_seam_calls_per_forward",
+      "calls_per_forward": 12,
+      "steps_measured": 600,
+      "expected_total": 7200,
+      "fused": 7200,
+      "eager": 0,
+      "equation_ok": true,
+      "eager_share": 0.0
+     }
+    }
+   },
+   "per_step": {
+    "steps_measured_n": 100,
+    "steps_measured_m": 600,
+    "steps_diff": 500,
+    "wall_s_per_step": 1.6329362896879998,
+    "front_s_per_step": 1.2550384823760001,
+    "busy_s_per_step": 0.29527373933,
+    "residual_s_per_step": 0.08262406798199962,
+    "overlap_s_per_step": null,
+    "front_end_inside_residual": false,
+    "front_share_of_wall": 0.7685777395612884,
+    "busy_share_of_wall": 0.18082379649142163
+   },
+   "checkpoint_weights_sha256": "3f648de6d030e17494be455d323b8d191233fbae0c7ce0ba745fd21a926a63a6",
+   "fusible_site_census": {
+    "lora_sites_wrapped": 77,
+    "layer_norms": 29,
+    "gelu_seam_calls_per_forward": 12
+   }
+  }
+ ],
+ "p2_dir": "/root/profile-421/run2/p2-bf16",
+ "p2_bf16": [
+  {
+   "tower": "clip-text",
+   "verdict": "PASS",
+   "reasons": [],
+   "exit": 0,
+   "backbone_dtype": "bf16",
+   "lora_init": "gaussian",
+   "final_loss_diagnostic": 0.2900390625,
+   "train_probe_series_head": [
+    0.28857421875,
+    0.23291015625
+   ],
+   "lora_linear_fused_dispatches": 96,
+   "ln_fused_dispatches": 50,
+   "checkpoint_weights_sha256": "ac4f8c4b88af6d963118cbf40ad93176d092abbedfcb752601ae1866352656e6",
+   "fusible_site_census": {
+    "lora_sites_wrapped": 48,
+    "layer_norms": 25,
+    "gelu_seam_calls_per_forward": 0
+   }
+  },
+  {
+   "tower": "clip-vision",
+   "verdict": "PASS",
+   "reasons": [],
+   "exit": 0,
+   "backbone_dtype": "bf16",
+   "lora_init": "gaussian",
+   "final_loss_diagnostic": 0.21240234375,
+   "train_probe_series_head": [
+    0.267578125,
+    0.0537109375
+   ],
+   "lora_linear_fused_dispatches": 96,
+   "ln_fused_dispatches": 50,
+   "checkpoint_weights_sha256": "ac4f8c4b88af6d963118cbf40ad93176d092abbedfcb752601ae1866352656e6",
+   "fusible_site_census": {
+    "lora_sites_wrapped": 48,
+    "layer_norms": 26,
+    "gelu_seam_calls_per_forward": 0
+   }
+  },
+  {
+   "tower": "htsat",
+   "verdict": "PASS",
+   "reasons": [],
+   "exit": 0,
+   "backbone_dtype": "bf16",
+   "lora_init": "gaussian",
+   "final_loss_diagnostic": 0.1240234375,
+   "train_probe_series_head": [
+    0.13134765625,
+    0.041015625
+   ],
+   "lora_linear_fused_dispatches": 154,
+   "ln_fused_dispatches": 58,
+   "checkpoint_weights_sha256": "3f648de6d030e17494be455d323b8d191233fbae0c7ce0ba745fd21a926a63a6",
+   "fusible_site_census": {
+    "lora_sites_wrapped": 77,
+    "layer_norms": 29,
+    "gelu_seam_calls_per_forward": 12
+   }
+  }
+ ],
+ "summary": {
+  "legs_total": 12,
+  "legs_valid": 12,
+  "legs_invalid": 0,
+  "p2_total": 3,
+  "p2_pass": 3,
+  "p2_fail": 0
+ }
+}

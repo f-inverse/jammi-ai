@@ -41,6 +41,7 @@ from __future__ import annotations
 
 import json
 import os
+import re
 import subprocess
 import tempfile
 import unittest
@@ -86,6 +87,53 @@ class DryRunSmokeTests(unittest.TestCase):
             for row in rows:
                 self.assertEqual(row["status"], "ok", row)
                 self.assertEqual(row["rc"], 0, row)
+
+    def test_corpus_producer_runs_for_real_under_dry_run(self):
+        """esc-088 class: `gen_fixed_width_corpus.py` must run FOR REAL
+        under DRY_RUN (via `run_corpus_cmd`, both in `_corpus_for` and in
+        `preflight_probe`'s own probe corpus), never a touch-empty stand-in
+        -- so no automated test ever runs with a producer that never wrote
+        a byte of real output. Every `--train-jsonl <path>` this run's own
+        traced command lines name (`_print_cmd`, always the real would-be
+        production command line) must resolve to a file that actually
+        exists AND is non-empty -- the shape a touch-empty placeholder
+        would fail (exists, but zero bytes)."""
+        with tempfile.TemporaryDirectory() as out_dir:
+            result = run_dry(out_dir)
+            self.assertEqual(result.returncode, 0, _fail_msg(result))
+            train_jsonl_paths = re.findall(r"--train-jsonl (\S+)", result.stderr)
+            self.assertTrue(
+                train_jsonl_paths,
+                f"no --train-jsonl found on any traced command line:\n{_fail_msg(result)}",
+            )
+            # `_corpus_for`'s own corpus lives under `$OUT_DIR/corpus` and
+            # persists after the run; `preflight_probe`'s own probe corpus
+            # lives under a scratch `mktemp -d` this script itself
+            # `rm -rf`s once the probe completes, so only the persistent
+            # ones can be checked post-hoc here.
+            persistent_paths = {p for p in train_jsonl_paths if p.startswith(out_dir)}
+            self.assertTrue(
+                persistent_paths,
+                f"no --train-jsonl under $OUT_DIR/corpus found:\n{_fail_msg(result)}",
+            )
+            for path in persistent_paths:
+                self.assertTrue(
+                    os.path.isfile(path), f"--train-jsonl names a missing file: {path}"
+                )
+                self.assertGreater(
+                    os.path.getsize(path),
+                    0,
+                    f"--train-jsonl names an EMPTY file (touch-empty idiom, esc-088): {path}",
+                )
+            # The producer's own real stdout (never a touch-empty
+            # placeholder's silence, never silenced to /dev/null) is
+            # forwarded to stderr by `run_corpus_cmd` -- for BOTH the
+            # `preflight_probe` probe corpus and every `_corpus_for` call,
+            # so more than one line is expected.
+            wrote_lines = [
+                line for line in result.stderr.splitlines() if "gen_fixed_width_corpus: wrote" in line
+            ]
+            self.assertGreater(len(wrote_lines), 1, _fail_msg(result))
 
     def test_every_declared_leg_table_column_reaches_the_manifest(self):
         with tempfile.TemporaryDirectory() as out_dir:

@@ -11,11 +11,49 @@ is IDENTICAL across the two runs and cancels in the subtraction.
 
 Promoted from the throwaway `scratchpad/pod/kernel_census.py` ancestor
 (P4, contract's precondition table): same schema query (CUPTI_ACTIVITY_
-KIND_KERNEL joined to StringIds on `shortName`; memcpy/memset totals; GPU
-wall span), hardened per contract. Every guard below is a DOMAIN check on
-whether the two sqlite exports actually describe the declared
-same-workload (N, M) pair -- none of them are generic exception handling
-for its own sake:
+KIND_KERNEL joined to StringIds; memcpy/memset totals; GPU wall span),
+hardened per contract. Every guard below is a DOMAIN check on whether the
+two sqlite exports actually describe the declared same-workload (N, M)
+pair -- none of them are generic exception handling for its own sake:
+
+Kernel identity (round-4 pod-run fix, template-wrapper collapse): the
+per-bucket key is `(COALESCE(demangledName.value, shortName.value), grid,
+block)`, never `shortName` alone. cutlass's `Kernel2<...>` template
+wrapper -- and the same latent class in `magma_sgemmEx_kernel<...>` --
+gives every GEMM tile instantiation the SAME literal `shortName`
+(`Kernel2`, `magma_sgemmEx_kernel`); a same-workload leg's own captured
+export (`clip-text-A2`, `run_m.sqlite`) has three DISTINCT cutlass
+instantiations (`cutlass_75_tensorop_bf16_s1688gemm_bf16_64x64_{nn,nt,tn}_
+align1`) sharing `shortName='Kernel2'` AND `grid=[2,1,192]`,
+`block=[128,1,1]` -- grouping on `shortName` alone SUMS all three into one
+`Kernel2` row, hiding which tile shape actually ran. `demangledName` is
+NOT NULL on every row of this schema's `CUPTI_ACTIVITY_KIND_KERNEL` table
+(nsys 2025.3.2), so `COALESCE` is a defensive fallback for schema variance
+this module has not observed, not the common case; `LEFT JOIN` (not
+`JOIN`) on the demangled-name string, so a dangling/orphaned
+`demangledName` id (a corrupt export, not this schema's normal shape)
+degrades to the `shortName` value rather than dropping the row. Because
+`demangledName` is always at least as specific as `shortName` (it is
+`shortName`'s own template instantiation), this key is a strict
+REFINEMENT of the old `(shortName, grid, block)` key -- a bucket can only
+SPLIT under the new key, never merge two old buckets into fewer new ones
+-- so `gpu_kernel_us_per_step` (a straight sum over every bucket's time
+delta) is bit-identical under the key change; only `by_kernel_and_grid`'s
+row count and per-row shares change. `magma_sgemmEx_kernel<...>`'s full
+demangled signature (its template bools/ints already distinguish real
+instantiations) and every other non-cutlass demangled name (`badd_bf16`,
+`splitKreduce_kernel<...>`) are reported AS-IS, unstripped -- only
+`void cutlass::Kernel2<INNER>(T1::Params)` is stripped down to `INNER`
+(`_strip_cutlass_kernel2_wrapper`), since `INNER` alone (e.g.
+`cutlass_75_tensorop_bf16_s1688gemm_bf16_64x64_nt_align1`) is what a
+downstream reader (and the `#421` attribution's GEMM-family name rule)
+matches against, not the C++ wrapper syntax around it. Census reports
+produced before this change (the `#356` closeout and the `#421`
+2026-09-01/06 pod artifacts) carry the pre-fix, collapsed `Kernel2`/
+`magma_sgemmEx_kernel` rows in `by_kernel_and_grid` -- their `by_kernel_
+name` totals and every other headline number are unaffected (the
+refinement is sum-preserving, see above), only the per-instantiation
+breakdown was coarser.
 
   - refuses (exit nonzero, no report) if EITHER export lacks a
     `CUPTI_ACTIVITY_KIND_KERNEL` table -- the contract's own "Per-leg
@@ -275,7 +313,14 @@ fails finiteness (either `wall_a`/`wall_b`, when given) or
 `wall_b > wall_a > 0` (leg INVALID); 8 = a sqlite export is
 corrupt/unreadable (`sqlite3.DatabaseError`); 9 = the differenced census
 is EMPTY -- zero kernel buckets carried a positive launch-count delta
-(leg INVALID -- not a genuine declared M>N same-workload pair).
+(leg INVALID -- not a genuine declared M>N same-workload pair); 10 = the
+kernel table is present and non-empty on one or both exports but is
+MISSING a column the PRIMARY by-kernel-and-grid SELECT requires (leg
+INVALID -- schema mismatch, not this schema's normal shape; distinct from
+exit 8, where the file itself is unreadable). Exit 10 covers only that one
+query -- a missing column on the memcpy/memset aggregate queries degrades
+to a zero count instead (see `census()`'s own memcpy/memset paragraph;
+that signal is not what this census's validity depends on).
 """
 
 from __future__ import annotations
@@ -284,8 +329,37 @@ import argparse
 import collections
 import json
 import math
+import re
 import sqlite3
 import sys
+
+# The cutlass `Kernel2<...>` template-wrapper shape (module doc's "Kernel
+# identity" paragraph): every GEMM tile instantiation's demangled name is
+# `void cutlass::Kernel2<INNER>(T1::Params)` -- `INNER` (e.g.
+# `cutlass_75_tensorop_bf16_s1688gemm_bf16_64x64_nt_align1`) is the actual
+# tile identity a downstream reader (and the `#421` attribution's
+# GEMM-family name rule) matches against, so this is the only wrapper this
+# module strips. Every other demangled name -- including
+# `magma_sgemmEx_kernel<...>`'s own template signature and
+# `splitKreduce_kernel<...>`'s -- is reported AS-IS: their template
+# arguments are what DISTINGUISHES real instantiations for those kernels
+# (unlike `Kernel2`, whose own name never varies across instantiations),
+# so stripping them would re-introduce the exact collapse this fix closes.
+_CUTLASS_KERNEL2_WRAPPER_RE = re.compile(r"^void cutlass::Kernel2<(.+)>\(T1::Params\)$")
+
+
+def _normalize_kernel_name(raw_name: str | None) -> str:
+    """Strips the cutlass `Kernel2<...>` template-wrapper syntax down to
+    the inner tile-instantiation name (see `_CUTLASS_KERNEL2_WRAPPER_RE`'s
+    own comment); every other name (including `None`, when both
+    `demangledName` and `shortName` failed to resolve -- an orphaned
+    export this schema has not been observed to produce) is returned
+    unchanged."""
+    if raw_name is None:
+        return "<unresolved>"
+    m = _CUTLASS_KERNEL2_WRAPPER_RE.match(raw_name)
+    return m.group(1) if m else raw_name
+
 
 # A "tiny tolerance" (contract's own phrasing): raw (pre-division) delta
 # floors below which a negative per-key delta is treated as capture/export
@@ -386,6 +460,31 @@ class CensusDatabaseError(RuntimeError):
     exit code instead of an unhandled traceback. See module doc."""
 
 
+class KernelTableSchemaError(RuntimeError):
+    """Named exception for the leg-INVALID "`CUPTI_ACTIVITY_KIND_KERNEL`
+    is present and non-empty but is MISSING a column this census queries"
+    condition (`sqlite3.OperationalError: no such column: ...`) -- a
+    schema variant this module's query does not match, never a generic
+    traceback: `main()` returns a declared, distinguishable exit code
+    naming the export and the underlying sqlite error rather than
+    crashing. Distinct from `CensusDatabaseError` (a corrupt/unreadable
+    file): here the file reads fine, the table exists and has rows, but
+    its column set does not match what `census()`'s own SELECT
+    requires (e.g. an export whose `CUPTI_ACTIVITY_KIND_KERNEL` never
+    carries `demangledName` at all).
+
+    Scope: raised ONLY by the primary `CUPTI_ACTIVITY_KIND_KERNEL`
+    by-kernel-and-grid SELECT (`census()`'s own `q`) -- the ONE query this
+    census's validity actually depends on. The memcpy/memset aggregate
+    queries and the kernel-table row-count query are NOT wrapped this way:
+    a `sqlite3.OperationalError` on either of the former degrades to
+    `(0, 0)` by design (see `census()`'s own memcpy/memset paragraph --
+    that signal is not what this census's validity depends on, so a schema
+    variant lacking it is not leg-INVALID), and the row-count query names
+    no column at all, so a genuine column-schema mismatch there is not a
+    reachable shape."""
+
+
 def _has_kernel_table(con: sqlite3.Connection) -> bool:
     row = con.execute(
         "SELECT name FROM sqlite_master WHERE type='table' AND name='CUPTI_ACTIVITY_KIND_KERNEL'"
@@ -401,9 +500,14 @@ def census(path: str) -> tuple[dict, dict, tuple]:
     `CUPTI_ACTIVITY_KIND_KERNEL` table, `KernelTableEmptyError` if that
     table exists but has zero rows (checked BEFORE any further query runs
     against it, so neither condition is ever silently read as "zero
-    kernels dispatched"), or `CensusDatabaseError` if `path` cannot be read
-    as a sqlite database at all (`sqlite3.DatabaseError` -- a corrupt or
-    truncated export).
+    kernels dispatched"), `KernelTableSchemaError` if the table is present
+    and non-empty but is missing a column the PRIMARY by-kernel-and-grid
+    SELECT (`q`, below) requires (`sqlite3.OperationalError: no such
+    column: ...` -- a schema variant this module has not been written
+    against; see `KernelTableSchemaError`'s own doc for why this is scoped
+    to that one query only), or `CensusDatabaseError` if `path` cannot be
+    read as a sqlite database at all (`sqlite3.DatabaseError` -- a corrupt
+    or truncated export).
     """
     con = sqlite3.connect(path)
     try:
@@ -434,14 +538,33 @@ def census(path: str) -> tuple[dict, dict, tuple]:
                 "trace was actually captured; a genuine all-zero census cannot be distinguished "
                 "from a broken capture, so this refuses rather than emitting an all-zero report)"
             )
-        # nsys 2025.x schema: CUPTI_ACTIVITY_KIND_KERNEL joined to StringIds for names.
-        q = """SELECT s.value, k.gridX, k.gridY, k.gridZ, k.blockX, k.blockY, k.blockZ,
-                      COUNT(*), SUM(k.end - k.start)
-               FROM CUPTI_ACTIVITY_KIND_KERNEL k JOIN StringIds s ON k.shortName = s.id
-               GROUP BY s.value, k.gridX, k.gridY, k.gridZ, k.blockX, k.blockY, k.blockZ"""
+        # nsys 2025.x schema: CUPTI_ACTIVITY_KIND_KERNEL joined to StringIds
+        # for names -- COALESCE(demangled, short), LEFT JOIN on both string
+        # lookups so a NULL/dangling id degrades to the other name rather
+        # than dropping the row (see module doc's "Kernel identity"
+        # paragraph for why `shortName` alone is not a usable kernel key).
+        q = """SELECT COALESCE(dn.value, sn.value), k.gridX, k.gridY, k.gridZ,
+                      k.blockX, k.blockY, k.blockZ, COUNT(*), SUM(k.end - k.start)
+               FROM CUPTI_ACTIVITY_KIND_KERNEL k
+               LEFT JOIN StringIds dn ON k.demangledName = dn.id
+               LEFT JOIN StringIds sn ON k.shortName = sn.id
+               GROUP BY COALESCE(dn.value, sn.value),
+                        k.gridX, k.gridY, k.gridZ, k.blockX, k.blockY, k.blockZ"""
+        try:
+            rows = cur.execute(q).fetchall()
+        except sqlite3.OperationalError as e:
+            raise KernelTableSchemaError(
+                f"{path}: CUPTI_ACTIVITY_KIND_KERNEL is missing a column this census queries "
+                f"({e}) -- leg INVALID (schema mismatch, not this schema's normal shape; "
+                "see module doc's \"Kernel identity\" paragraph for the shortName/demangledName "
+                "columns this SELECT requires)"
+            ) from e
         out: dict[tuple, tuple[int, int]] = {}
-        for name, gx, gy, gz, bx, by, bz, n, ns in cur.execute(q):
-            out[(name, gx, gy, gz, bx, by, bz)] = (n, ns or 0)
+        for raw_name, gx, gy, gz, bx, by, bz, n, ns in rows:
+            name = _normalize_kernel_name(raw_name)
+            key = (name, gx, gy, gz, bx, by, bz)
+            prev_n, prev_ns = out.get(key, (0, 0))
+            out[key] = (prev_n + n, prev_ns + (ns or 0))
 
         # memcpy / memset totals too (host<->device traffic is a
         # capture-relevant signal) -- a missing table here (older/newer
@@ -908,6 +1031,9 @@ def main(argv: list[str] | None = None) -> int:
     except EmptyDifferencedCensusError as e:
         print(f"::error::kernel_census: {e}", file=sys.stderr)
         return 9
+    except KernelTableSchemaError as e:
+        print(f"::error::kernel_census: {e}", file=sys.stderr)
+        return 10
     except ValueError as e:
         print(f"::error::kernel_census: {e}", file=sys.stderr)
         return 2

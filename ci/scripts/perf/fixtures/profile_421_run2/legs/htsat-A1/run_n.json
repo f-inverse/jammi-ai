@@ -1,0 +1,128 @@
+{
+  "engine_version": "0.49.1",
+  "host": {
+    "logical_cpus": 13,
+    "total_ram_mib": 2051942
+  },
+  "subcommand": "finetune-run",
+  "provenance": {
+    "build_sha": "c1b0b0bad1f79a4ad6c298400e6ea19cc1ca633c",
+    "target": "x86_64-unknown-linux-gnu",
+    "profile": "release",
+    "build_features": [
+      "bench-cuda",
+      "cuda"
+    ],
+    "report_schema_version": 2
+  },
+  "tiers": {
+    "finetune_run": {
+      "seed": 42,
+      "task": "audio_embedding",
+      "batch": 8,
+      "seq": 77,
+      "lora_rank": 8,
+      "lora_alpha": 16.0,
+      "lora_dropout": 0.05,
+      "lora_init": "zeros_b",
+      "margin": 0.3,
+      "target_modules": [
+        "query",
+        "key",
+        "value",
+        "attention_output",
+        "intermediate_dense",
+        "output_dense",
+        "reduction",
+        "linear1",
+        "linear2"
+      ],
+      "layers_to_transform": null,
+      "backbone_dtype": "f32",
+      "checkpoint_config_sha256": "b1d63489dc5061da229c23d2b11e9ca731639574449f82319fabb01da7fcf480",
+      "checkpoint_weights_sha256": "3f648de6d030e17494be455d323b8d191233fbae0c7ce0ba745fd21a926a63a6",
+      "checkpoint_weights_size_bytes": 614496152,
+      "max_grad_norm": 1.0,
+      "warmup": null,
+      "row_lengths": null,
+      "epochs": 1,
+      "lr": 0.0002,
+      "schedule": "constant",
+      "warmup_steps": 0,
+      "weight_decay": 0.01,
+      "grad_accum": 1,
+      "validation_fraction": 0.0,
+      "train_pairs_file_sha256": "19fb58143d5f1424e6c50c5e1f84fd58fea8891c66584a60b69beae6030c3ff9",
+      "train_media_sha256": "9e0fe1872ecdb79453b07d32c3d83ccfaae74e793e5801e81478c787d91cb253",
+      "heldout_ids_sha256": "766de99e789238eaed9aee1a2a8960497265dbc98e417ae34a4abcd4efa294f8",
+      "heldout_pairs_sha256": "752eeb01df541d8b7b77e54e9ba7ec6212250a03e77a0d3acf6d1fcac44a7ffa",
+      "heldout_media_sha256": "a75ee9a17ba6e4cc6e0c335221e6fc317613a7a50004dce7457c936bafa3cbc3",
+      "heldout_batch_partition_sha256": "05bc24b00e807877e73a6ecdcd211f32a6c7496c231f81ec12513ab8d07b9714",
+      "embedding_loss": "triplet",
+      "temperature": null,
+      "matryoshka_dims": [],
+      "early_stopping_patience": 10000,
+      "early_stopping_metric": "train_loss",
+      "eval_cadence": 1,
+      "arm": "fused",
+      "device_name": "NVIDIA A100-SXM4-80GB",
+      "kernels_disabled_requested": [],
+      "kernels_disabled_fired": [],
+      "kernels_disabled_expected": [],
+      "fusible_site_census": {
+        "lora_sites_wrapped": 77,
+        "layer_norms": 29,
+        "gelu_seam_calls_per_forward": 12
+      },
+      "flash_compiled": false,
+      "build_features": [
+        "bench-cuda",
+        "cuda"
+      ],
+      "attention_arm": "fused",
+      "split_rule": "positional_fraction_split",
+      "batched_forward": true,
+      "steps_measured": 100,
+      "ln_fused_dispatches": 2900,
+      "ln_eager_dispatches": 0,
+      "rope_fused_dispatches": 0,
+      "rope_eager_dispatches": 0,
+      "softmax_fused_dispatches": 0,
+      "softmax_eager_dispatches": 0,
+      "geglu_fused_dispatches": 0,
+      "geglu_eager_dispatches": 0,
+      "gelu_fused_dispatches": 1200,
+      "gelu_eager_dispatches": 0,
+      "lora_epilogue_fused_dispatches": 0,
+      "lora_epilogue_eager_dispatches": 0,
+      "lora_linear_fused_dispatches": 7700,
+      "lora_linear_eager_dispatches": 0,
+      "attention_block_fused_dispatches": 0,
+      "attention_block_eager_dispatches": 0,
+      "adamw_fused_dispatches": 15400,
+      "adamw_eager_dispatches": 0,
+      "attention_block_flash_fused_dispatches": 0,
+      "attention_block_flash_declined_dispatches": 0,
+      "admission_is_dense": false,
+      "tie_fraction": 0.0,
+      "final_epoch": 0,
+      "held_out_example_mean": 0.1361684501171112,
+      "held_out_count": 8,
+      "final_loss_diagnostic": 0.0029461756348609924,
+      "trajectory": [
+        {
+          "epoch": 0,
+          "held_out_mean": 0.1361684501171112,
+          "held_out_tie_fraction": 0.0,
+          "held_out_batch_partition_sha256": "05bc24b00e807877e73a6ecdcd211f32a6c7496c231f81ec12513ab8d07b9714"
+        }
+      ],
+      "train_probe_series": [
+        0.13210340589284897,
+        0.0
+      ],
+      "train_run_wall_s": 153.017936948,
+      "media_front_end_wall_s": 123.433286419
+    }
+  }
+}

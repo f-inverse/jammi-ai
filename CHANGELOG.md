@@ -187,8 +187,9 @@ workspace ships every publishable crate at the same
   answered correctly rather than by formula. Every count is per training forward only — an
   eval forward contributes `0` to both sides of the profile equation. `FinetuneRunTier` gains
   `fusible_site_census` as PROVENANCE (captured every epoch, refused if it changes;
-  `PROVENANCE_FIELDS` 11 → 12). `ci/scripts/perf/profile_421_merge.py` (53 hermetic tests)
-  reads its `calls` term from this field and checks `fused + eager == fusible_site_census ×
+  `PROVENANCE_FIELDS` 11 → 12). `ci/scripts/perf/profile_421_merge.py` (tested by the
+  hermetic `test_profile_421_merge.py` suite) reads its `calls` term from this field and
+  checks `fused + eager == fusible_site_census ×
   steps_measured` per key, `fused == 0` for every `kernels_disabled_expected` key on a D leg,
   and computes `residual = wall − front − busy` per step — a negative residual reports as
   `overlap_s` (front-end work pipelined against a prior step's kernels), never a leg
@@ -198,6 +199,46 @@ workspace ships every publishable crate at the same
   measured), which every leg and the new `PROFILE_421_P2_BF16=1` driver mode pin; P2 is
   UNTRACED by design (no `nsys` dependency for a qualitative dtype pre-flight) and is
   dry-run tested through the real merge script.
+<!-- profile-421-generated: changelog-421-entry -->
+- **The #421 tower training-step profile is closed out: driver, merge, attribution, and
+  a committed close-out artifact (issue #421 step 3, "PROFILE FIRST").** 11 of 12 legs
+  (`A1`/`A2`/`D1`/`D2` × CLIP-text, OpenCLIP-vision, HTSAT) pass the contract's validity
+  gate — `htsat-A2` fails it (UNATTRIBUTED share_gpu_busy=0.0566 > 0.05) and is excluded
+  from every finding on
+  `crates/jammi-kernels/artifacts/cuda-runs/2026-09-07-profile-421-towers-c1b0b0ba-a100-sxm4.json`
+  (A100-SXM4-80GB); the BF16 pre-flight (P2) passes on all three towers.
+  `profile_421_attribute.py` (new) reads `profile_421_merge.py`'s per-key equations and
+  the kernel census into the contract's named chains and evaluates the two-sided
+  ACTIVATE/DECLINE/UNRESOLVED rule per candidate port; `kernel_census.py` now keys each
+  GPU-kernel bucket on `COALESCE(demangledName, shortName)` rather than `shortName`
+  alone, a sum-preserving refinement that un-collapses cutlass's `Kernel2<...>` template
+  wrapper's distinct bf16 GEMM tile instantiations -- rather than summing them into one
+  anonymous row that could trip the attribution's known-kernel-name gate -- without
+  moving any top-line `gpu_kernel_us_per_step`/wall/front/busy number. **No kernel port
+  lands under #421**: all four candidate ports the contract named (`C-ATTN-CLIP-text`,
+  `C-MLP-CLIP-text`, `C-ATTN-CLIP-vision`, `C-MLP-CLIP-vision`) resolve **UNRESOLVED** —
+  none clears ACTIVATE (`s_wall≥10%` on any decision-grade leg) or DECLINE (combined
+  share <5% on wall AND busy on every decision-grade leg), F32 and BF16 alike. This is
+  not uniform across candidates or axes: only C-MLP's own combined *busy* share
+  (`s_busy+U_busy`, 6.80–8.98 % across the CLIP towers) lands in the contract's 5–10 %
+  band — its wall-axis share stays 2.66–3.95 % throughout, well under the 5 % DECLINE
+  floor — while C-ATTN's combined busy shares run 11–20 %, entirely outside that band.
+  The already-fused chains' realized gains, per step: C-LORA +32.6 ms (CLIP-text, 32.4 %
+  of wall), +30.3 ms (CLIP-vision, 26.4 %), +82.9 ms (HTSAT, 5.4 %); C-LN +15.6 ms
+  (CLIP-text), +20.8 ms (CLIP-vision); the joint C-LN+C-GELU-HTSAT chain +56.6 ms (3.6
+  %). Findings: the HTSAT training step is CPU front-end-bound (audio
+  decode/resample/STFT/mel ≈ 81 % of wall on the F32 decision leg (`htsat-A1`;
+  `htsat-A2` excluded: fails the contract's validity gate), arm-invariant);
+  CLIP-vision's image front end is ≈ 20–22 % of wall (both corpora cycle only 16
+  distinct train clips at any row count — a page-cached working set, never a
+  realistic-corpus I/O cost — so both numbers are a real per-item CPU decode/preprocess
+  compute cost; see `docs/plans/66-tower-profile/README.md`'s deviations); at batch 8
+  the CLIP steps are launch-bound (≈ 3.6–3.7 k launches/step; BF16 cuts GPU busy 32–41 %
+  but wall only 4–5 %); `C-ATTN-HTSAT` is measured (≈ 33 % of GPU busy) and stays OUT OF
+  TIER, a named-but-undecided chain, never folded into UNATTRIBUTED. See
+  `docs/plans/66-tower-profile/README.md` and `CONTRACT.md` (the frozen v2.5 contract)
+  for the full per-leg table and PR trail.
+<!-- /profile-421-generated -->
 
 ### Changed
 - **The media front end's per-item decode/preprocess runs across the batch in parallel on
@@ -474,6 +515,42 @@ workspace ships every publishable crate at the same
   catch, since neither cause is a domain violation of the config itself. The check runs sequentially
   over every clip before the parallel per-clip preprocessing stage ever dispatches a closure over
   them.
+- **#421 profile-campaign follow-ups: five re-audit advisories closed with a landing gate each
+  (esc-088).** `ci/scripts/perf/fa2_ab.sh`'s unlabeled `finetune-step` flash/block legs now pass
+  `--expect-kernels-disabled` explicitly (empty on the flash leg), so the binary's own START/END
+  checks refuse (nonzero exit) any single leg whose req/fired claim disagrees with the real env
+  var, and the script itself now tracks every leg's exit status (and its own JSON-parse outcome)
+  into one cumulative `FA2AB_EXIT` the script exits with — a refused leg moves the script's own
+  exit status, not just a `FAILED` line a human has to notice in scrollback.
+  `profile_356_legs.sh`/`lora_bias_ab.sh` no longer touch-empty their corpus outputs under
+  `DRY_RUN` — `gen_fixed_width_corpus.py` now runs for real (via `run_corpus_cmd`) on every
+  `corpus_mode`, including the E1/heldout dry-run stand-in. `profile_421_legs.sh`'s `DRY_RUN`
+  nsys-export stub now copies a committed, schema-valid nsys sqlite fixture
+  (`ci/scripts/perf/fixtures/nsys_kernel_census/`) into place instead of touch-emptying it, so
+  `kernel_census.py` runs for real under `DRY_RUN` and `census_ok` is earned rather than defaulted
+  off a no-op wrapper. `gen_fixed_shape_image_corpus.py`/`gen_fixed_length_audio_corpus.py` gain an
+  opt-in, content-addressed `--pool-cache-dir` that the dry-run test harness points at one
+  suite-level tempdir, so the fixed media pool is synthesized once per suite instead of once per
+  subprocess invocation of `profile_421_legs.sh` (51 invocations in
+  `test_profile_421_legs_dry_run.py`), byte-identical output with/without the cache asserted via
+  sha256 by the corpus-generator tests. Box-specific, not a gated number: the round-1 adversarial
+  audit reproduced `test_profile_421_legs_dry_run.py` at 567.8s uncached vs 118.0s cached on one
+  developer box (Apple M5 Pro, 2026-09-07). `finetune_step.rs` documents the unlabeled-leg
+  contract (no
+  claim without `--expect-kernels-disabled`, same posture as `finetune-run`).
+  `crates/jammi-encoders --features golden-parity --test golden_parity` (6 CPU-only tests against a
+  committed PyTorch reference of the HTSAT-Swin CLAP audio tower) is now wired into CI's hermetic
+  `test` job, so `htsat_audio.rs`'s "eval bytes are pinned by `golden_parity.rs`" doc claim is true
+  of CI, not merely of a local run — `docs/maintainer/MAINTAINER-GUIDE.md`'s eval-doctrine section
+  is updated to match (parity-test/cuda_parity remain pod-run-only, disclosed). Finally,
+  `ci/scripts/perf/check_producer_provenance_gates.py`'s dry-run-knob-inertness check widens from
+  `*FAKE*`-named knobs to any `<PREFIX>_DRY_RUN_<SUFFIX>` test knob (`PROFILE_421_LEGS_DRY_RUN_
+  EXTRA_REQUESTED_KEY`/`_TRUNCATE_CORPUS_VAR`/`_POOL_CACHE_DIR`, `LORA_BIAS_AB_DRY_RUN_FAIL_OP`/
+  `_FAIL_PREDICATE`),
+  admissible by either containment (every read site inside an `if [ "$<PREFIX>_DRY_RUN" = "1" ]`
+  -guarded region, heredoc-aware so an embedded `python3 -c` payload's own dangling `if`s cannot
+  fool the block-extent walk) or the existing preflight-refusal shape generalized off the `FAKE`
+  name requirement.
 
 ### Breaking
 - `jammi_encoders::{AnyAudioEncoder, AudioEncoder}` are removed

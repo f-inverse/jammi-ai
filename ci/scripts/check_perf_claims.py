@@ -269,7 +269,7 @@ KNOWN_TABLES = {
 EXPECTED_TABLE_COUNTS = {
     "docs/maintainer/fine-tune-performance-guide.md": 14,
 }
-EXPECTED_DENOMINATOR = 295
+EXPECTED_DENOMINATOR = 354  # placeholder: recomputed after rebase
 
 # round-5 audit fix (class B, 2c): a POPULATION FLOOR for `--sweep`'s
 # enumerated candidate count — a matcher mutated to always return False

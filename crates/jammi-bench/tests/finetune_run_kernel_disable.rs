@@ -489,6 +489,76 @@ fn expect_kernels_disabled_refuses_an_extra_env_key_beyond_the_claim() {
     );
 }
 
+/// Advisory A1 (round-4 adversarial audit, `fa2_ab.sh`): the SAME
+/// `--expect-kernels-disabled ""` equality semantics `finetune_step_kernel_
+/// disable.rs`'s sibling test pins for `finetune-step`, ported to
+/// `finetune-run`'s identical check (mirrors `FinetuneRunParams::
+/// expect_kernels_disabled`'s doc, finding F1: equality, never subset).
+/// `""` claims NOTHING is disabled (`parse_disable_list(Some(""))` is the
+/// empty set); a non-empty ambient `JAMMI_KERNELS_DISABLE` must therefore
+/// refuse. This is the negative control that fails under subset semantics
+/// (the empty expected set is trivially a subset of anything) and must pass
+/// under equality.
+#[test]
+fn expect_kernels_disabled_empty_string_refuses_against_nonempty_ambient_disable() {
+    let work_dir = tempfile::tempdir().expect("tempdir");
+    let fixtures_dir = tempfile::tempdir().expect("fixtures tempdir");
+    let output = base_command(work_dir.path(), fixtures_dir.path(), "fused")
+        .args(["--expect-kernels-disabled", ""])
+        .env("JAMMI_KERNELS_DISABLE", "attention_block_flash")
+        .output()
+        .expect("spawn jammi-bench finetune-run");
+
+    assert!(
+        !output.status.success(),
+        "--expect-kernels-disabled \"\" (claims NOTHING disabled) with a non-empty ambient \
+         JAMMI_KERNELS_DISABLE must refuse under set EQUALITY — a subset check would let this \
+         through vacuously — stdout={}",
+        String::from_utf8_lossy(&output.stdout)
+    );
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("[]") && stderr.contains("attention_block_flash"),
+        "the refusal must name both the empty expectation and the real ambient value: {stderr}"
+    );
+    assert!(
+        String::from_utf8_lossy(&output.stdout).trim().is_empty(),
+        "an INVALID leg must emit no report at all"
+    );
+}
+
+/// The positive-control half: `--expect-kernels-disabled ""` with a CLEAN
+/// environment must pass the check and run to completion — proving the
+/// refusal above is about the ambient value disagreeing with the claim, not
+/// about `""` itself being malformed input.
+#[test]
+fn expect_kernels_disabled_empty_string_passes_with_clean_env() {
+    let work_dir = tempfile::tempdir().expect("tempdir");
+    let fixtures_dir = tempfile::tempdir().expect("fixtures tempdir");
+    let output = base_command(work_dir.path(), fixtures_dir.path(), "fused")
+        .args(["--expect-kernels-disabled", ""])
+        .env_remove("JAMMI_KERNELS_DISABLE")
+        .output()
+        .expect("spawn jammi-bench finetune-run");
+
+    assert!(
+        output.status.success(),
+        "--expect-kernels-disabled \"\" with a clean environment must succeed — stderr={}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let tier = tier_of(&String::from_utf8_lossy(&output.stdout));
+    assert_eq!(
+        tier["kernels_disabled_expected"],
+        serde_json::json!([]),
+        "tier={tier}"
+    );
+    assert_eq!(
+        tier["kernels_disabled_requested"],
+        serde_json::json!([]),
+        "tier={tier}"
+    );
+}
+
 /// Check (2): a `JAMMI_KERNELS_DISABLE` entry that never disables a live
 /// dispatch is a TYPO, not evidence the eager arm ran. Both entries are
 /// named on `--expect-kernels-disabled` (so check (1)'s set EQUALITY passes

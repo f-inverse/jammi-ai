@@ -1,0 +1,61 @@
+{
+ "leg_id": "htsat-A2",
+ "git_sha": "c1b0b0bad1f79a4ad6c298400e6ea19cc1ca633c",
+ "box": "4dc3a4394178",
+ "driver": "ci/scripts/perf/profile_421_legs.sh",
+ "nsys_version": "NVIDIA Nsight Systems version 2025.3.2.474-253236389321v0",
+ "tower": "htsat",
+ "task": "audio_embedding",
+ "dtype": "bf16",
+ "target_modules": [
+  "query",
+  "key",
+  "value",
+  "attention_output",
+  "intermediate_dense",
+  "output_dense",
+  "reduction",
+  "linear1",
+  "linear2"
+ ],
+ "kernels_disabled": [],
+ "max_seq_length": 77,
+ "batch": 8,
+ "objective": "triplet",
+ "lora_init": "zeros_b",
+ "eval_cadence": 1,
+ "heldout_rows": 8,
+ "steps_declared": {
+  "n": 100,
+  "m": 600
+ },
+ "steps_measured": {
+  "n": 100,
+  "m": 600
+ },
+ "media_front_end_wall_s": {
+  "n": 125.0752105,
+  "m": 750.871221226
+ },
+ "checkpoint_weights_sha256": {
+  "n": "3f648de6d030e17494be455d323b8d191233fbae0c7ce0ba745fd21a926a63a6",
+  "m": "3f648de6d030e17494be455d323b8d191233fbae0c7ce0ba745fd21a926a63a6"
+ },
+ "fusible_site_census": {
+  "n": {
+   "lora_sites_wrapped": 77,
+   "layer_norms": 29,
+   "gelu_seam_calls_per_forward": 12
+  },
+  "m": {
+   "lora_sites_wrapped": 77,
+   "layer_norms": 29,
+   "gelu_seam_calls_per_forward": 12
+  }
+ },
+ "status": "ok",
+ "reason": "",
+ "census_ok": true,
+ "census_exit": 0,
+ "dry_run": false
+}

@@ -62,15 +62,23 @@ def _make_sqlite(
     memset=(0, 0),
     with_kernel_table: bool = True,
 ) -> None:
-    """`kernel_rows`: list of (name, gx, gy, gz, bx, by, bz, start, end)."""
+    """`kernel_rows`: list of (name, gx, gy, gz, bx, by, bz, start, end).
+    `name` is either a plain string (used as BOTH `shortName` and
+    `demangledName` -- the common case every pre-existing test below
+    relies on) or a `(short_name, demangled_name)` tuple (the
+    template-wrapper-collapse shape `CensusKernelIdentityTests` below
+    drives -- real cutlass/magma exports carry a `shortName` that
+    collapses distinct instantiations while `demangledName` does not; see
+    `kernel_census.py`'s own module doc)."""
     con = sqlite3.connect(path)
     cur = con.cursor()
     cur.execute("CREATE TABLE StringIds (id INTEGER PRIMARY KEY, value TEXT)")
     if with_kernel_table:
         cur.execute(
             "CREATE TABLE CUPTI_ACTIVITY_KIND_KERNEL "
-            "(shortName INTEGER, gridX INTEGER, gridY INTEGER, gridZ INTEGER, "
-            "blockX INTEGER, blockY INTEGER, blockZ INTEGER, start INTEGER, end INTEGER)"
+            "(shortName INTEGER, demangledName INTEGER, gridX INTEGER, gridY INTEGER, "
+            "gridZ INTEGER, blockX INTEGER, blockY INTEGER, blockZ INTEGER, "
+            "start INTEGER, end INTEGER)"
         )
     cur.execute(
         "CREATE TABLE CUPTI_ACTIVITY_KIND_MEMCPY (start INTEGER, end INTEGER)"
@@ -79,19 +87,34 @@ def _make_sqlite(
         "CREATE TABLE CUPTI_ACTIVITY_KIND_MEMSET (start INTEGER, end INTEGER)"
     )
 
+    def _short_demangled(name) -> tuple[str, str]:
+        return name if isinstance(name, tuple) else (name, name)
+
     name_to_id: dict[str, int] = {}
     next_id = 1
     for row in kernel_rows:
-        name = row[0]
-        if name not in name_to_id:
-            name_to_id[name] = next_id
-            cur.execute("INSERT INTO StringIds VALUES (?, ?)", (next_id, name))
-            next_id += 1
+        for value in _short_demangled(row[0]):
+            if value not in name_to_id:
+                name_to_id[value] = next_id
+                cur.execute("INSERT INTO StringIds VALUES (?, ?)", (next_id, value))
+                next_id += 1
     if with_kernel_table:
         for name, gx, gy, gz, bx, by, bz, start, end in kernel_rows:
+            short_name, demangled_name = _short_demangled(name)
             cur.execute(
-                "INSERT INTO CUPTI_ACTIVITY_KIND_KERNEL VALUES (?,?,?,?,?,?,?,?,?)",
-                (name_to_id[name], gx, gy, gz, bx, by, bz, start, end),
+                "INSERT INTO CUPTI_ACTIVITY_KIND_KERNEL VALUES (?,?,?,?,?,?,?,?,?,?)",
+                (
+                    name_to_id[short_name],
+                    name_to_id[demangled_name],
+                    gx,
+                    gy,
+                    gz,
+                    bx,
+                    by,
+                    bz,
+                    start,
+                    end,
+                ),
             )
     mcount, mtime = memcpy
     for _ in range(mcount):
@@ -148,6 +171,115 @@ class CensusHappyPathTests(unittest.TestCase):
                 a, b, steps_a=1, steps_b=2, excluded_from_chain_attribution=True
             )
             self.assertTrue(report["excluded_from_chain_attribution"])
+
+
+class CensusKernelIdentityTests(unittest.TestCase):
+    """Round-4 pod-run fix (`clip-text-A2`'s real `run_m.sqlite`, verified
+    read-only against the actual capture): cutlass's `Kernel2<...>`
+    template wrapper gives every GEMM tile instantiation the SAME literal
+    `shortName` ('Kernel2'), so a same-(grid,block) collision between
+    DISTINCT tile shapes previously SUMMED into one `Kernel2` row. Keys on
+    `(COALESCE(demangledName, shortName), grid, block)` instead -- see
+    `kernel_census.py`'s own module doc's "Kernel identity" paragraph."""
+
+    _NT = (
+        "Kernel2",
+        "void cutlass::Kernel2<cutlass_75_tensorop_bf16_s1688gemm_bf16_64x64_nt_align1>"
+        "(T1::Params)",
+    )
+    _NN = (
+        "Kernel2",
+        "void cutlass::Kernel2<cutlass_75_tensorop_bf16_s1688gemm_bf16_64x64_nn_align1>"
+        "(T1::Params)",
+    )
+    _MAGMA = (
+        "magma_sgemmEx_kernel",
+        "void magma_sgemmEx_kernel<float, float, float, (bool)0, (bool)0, (int)6, (int)3, "
+        "(int)5, (int)3, (int)3>(int, int, int)",
+    )
+
+    def test_normalize_strips_cutlass_kernel2_wrapper(self):
+        import kernel_census as kc
+
+        self.assertEqual(
+            kc._normalize_kernel_name(
+                "void cutlass::Kernel2<cutlass_75_tensorop_bf16_s1688gemm_bf16_64x64_nt_align1>"
+                "(T1::Params)"
+            ),
+            "cutlass_75_tensorop_bf16_s1688gemm_bf16_64x64_nt_align1",
+        )
+
+    def test_normalize_leaves_non_cutlass_names_unstripped(self):
+        import kernel_census as kc
+
+        magma_name = self._MAGMA[1]
+        self.assertEqual(kc._normalize_kernel_name(magma_name), magma_name)
+        self.assertEqual(kc._normalize_kernel_name("badd_bf16"), "badd_bf16")
+        self.assertEqual(kc._normalize_kernel_name(None), "<unresolved>")
+
+    def test_shared_shortname_same_grid_block_resplits_two_rows(self):
+        # `_NT` and `_NN` share shortName='Kernel2' AND the SAME
+        # grid/block (the exact clip-text-A2 collision shape) -- keying on
+        # shortName alone would SUM them into one row; keying on
+        # demangledName resplits into two, each named by its stripped
+        # cutlass instantiation.
+        with tempfile.TemporaryDirectory() as tmp:
+            a = os.path.join(tmp, "a.sqlite")
+            b = os.path.join(tmp, "b.sqlite")
+            rows_a = [(self._NT, 2, 1, 192, 128, 1, 1, i * 1000, i * 1000 + 1000) for i in range(3)]
+            rows_a += [(self._NN, 2, 1, 192, 128, 1, 1, i * 2000, i * 2000 + 2000) for i in range(2)]
+            rows_b = [(self._NT, 2, 1, 192, 128, 1, 1, i * 1000, i * 1000 + 1000) for i in range(9)]
+            rows_b += [(self._NN, 2, 1, 192, 128, 1, 1, i * 2000, i * 2000 + 2000) for i in range(6)]
+            _make_sqlite(a, rows_a)
+            _make_sqlite(b, rows_b)
+            report = kernel_census.build_report(a, b, steps_a=1, steps_b=2)
+            names = {r["kernel"] for r in report["by_kernel_and_grid"]}
+            self.assertEqual(
+                names,
+                {
+                    "cutlass_75_tensorop_bf16_s1688gemm_bf16_64x64_nt_align1",
+                    "cutlass_75_tensorop_bf16_s1688gemm_bf16_64x64_nn_align1",
+                },
+            )
+            self.assertNotIn("Kernel2", names)
+            self.assertEqual(len(report["by_kernel_and_grid"]), 2)
+
+    def test_gpu_kernel_us_per_step_invariant_under_key_change(self):
+        # The oracle: sum every raw row's own (end - start) directly (never
+        # via the grouped query this test exercises) for BOTH exports,
+        # difference, divide by steps -- independent of whatever key the
+        # census groups by. A resplit key can only partition existing
+        # buckets more finely; it can never change this grand total.
+        with tempfile.TemporaryDirectory() as tmp:
+            a = os.path.join(tmp, "a.sqlite")
+            b = os.path.join(tmp, "b.sqlite")
+            rows_a = [(self._NT, 2, 1, 192, 128, 1, 1, i * 1000, i * 1000 + 1000) for i in range(3)]
+            rows_a += [(self._NN, 2, 1, 192, 128, 1, 1, i * 2000, i * 2000 + 2000) for i in range(2)]
+            rows_a += [(self._MAGMA, 4, 1, 1, 32, 1, 1, i * 500, i * 500 + 500) for i in range(4)]
+            rows_b = [(self._NT, 2, 1, 192, 128, 1, 1, i * 1000, i * 1000 + 1000) for i in range(9)]
+            rows_b += [(self._NN, 2, 1, 192, 128, 1, 1, i * 2000, i * 2000 + 2000) for i in range(6)]
+            rows_b += [(self._MAGMA, 4, 1, 1, 32, 1, 1, i * 500, i * 500 + 500) for i in range(12)]
+            _make_sqlite(a, rows_a)
+            _make_sqlite(b, rows_b)
+
+            def _total_ns(rows):
+                return sum(end - start for _name, _gx, _gy, _gz, _bx, _by, _bz, start, end in rows)
+
+            expected_us_per_step = (_total_ns(rows_b) - _total_ns(rows_a)) / (2 - 1) / 1000.0
+            report = kernel_census.build_report(a, b, steps_a=1, steps_b=2)
+            self.assertAlmostEqual(report["gpu_kernel_us_per_step"], expected_us_per_step)
+
+    def test_magma_template_signature_reported_unstripped(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            a = os.path.join(tmp, "a.sqlite")
+            b = os.path.join(tmp, "b.sqlite")
+            rows_a = [(self._MAGMA, 4, 1, 1, 32, 1, 1, i * 500, i * 500 + 500) for i in range(4)]
+            rows_b = [(self._MAGMA, 4, 1, 1, 32, 1, 1, i * 500, i * 500 + 500) for i in range(12)]
+            _make_sqlite(a, rows_a)
+            _make_sqlite(b, rows_b)
+            report = kernel_census.build_report(a, b, steps_a=1, steps_b=2)
+            names = {r["kernel"] for r in report["by_kernel_and_grid"]}
+            self.assertEqual(names, {self._MAGMA[1]})
 
 
 class CensusRefusalTests(unittest.TestCase):
@@ -763,6 +895,59 @@ class CensusClass4GuardTests(unittest.TestCase):
             _make_sqlite(b, _k1(1))
             with self.assertRaises(kernel_census.CensusDatabaseError):
                 kernel_census.build_report(a, b, steps_a=1, steps_b=2)
+
+    def _make_sqlite_without_demangled_name_column(self, path: str, launches: int) -> None:
+        """A `CUPTI_ACTIVITY_KIND_KERNEL` table PRESENT and non-empty but
+        missing the `demangledName` column entirely -- a schema variant
+        `census()`'s own SELECT (which names `k.demangledName`) does not
+        match, so this must raise `KernelTableSchemaError`, never an
+        unhandled `sqlite3.OperationalError` traceback."""
+        con = sqlite3.connect(path)
+        cur = con.cursor()
+        cur.execute("CREATE TABLE StringIds (id INTEGER PRIMARY KEY, value TEXT)")
+        cur.execute(
+            "CREATE TABLE CUPTI_ACTIVITY_KIND_KERNEL "
+            "(shortName INTEGER, gridX INTEGER, gridY INTEGER, gridZ INTEGER, "
+            "blockX INTEGER, blockY INTEGER, blockZ INTEGER, start INTEGER, end INTEGER)"
+        )
+        cur.execute("CREATE TABLE CUPTI_ACTIVITY_KIND_MEMCPY (start INTEGER, end INTEGER)")
+        cur.execute("CREATE TABLE CUPTI_ACTIVITY_KIND_MEMSET (start INTEGER, end INTEGER)")
+        cur.execute("INSERT INTO StringIds (id, value) VALUES (1, 'k1')")
+        cur.executemany(
+            "INSERT INTO CUPTI_ACTIVITY_KIND_KERNEL VALUES (?,?,?,?,?,?,?,?,?)",
+            [(1, 1, 1, 1, 32, 1, 1, i * 1000, i * 1000 + 1000) for i in range(launches)],
+        )
+        con.commit()
+        con.close()
+
+    def test_kernel_table_missing_a_queried_column_refuses_typed_not_a_traceback(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            a = os.path.join(tmp, "a.sqlite")
+            b = os.path.join(tmp, "b.sqlite")
+            self._make_sqlite_without_demangled_name_column(a, 5)
+            _make_sqlite(b, _k1(1))
+            with self.assertRaises(kernel_census.KernelTableSchemaError):
+                kernel_census.build_report(a, b, steps_a=1, steps_b=2)
+
+    def test_kernel_table_missing_a_queried_column_on_b_also_refuses(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            a = os.path.join(tmp, "a.sqlite")
+            b = os.path.join(tmp, "b.sqlite")
+            _make_sqlite(a, _k1(1))
+            self._make_sqlite_without_demangled_name_column(b, 5)
+            with self.assertRaises(kernel_census.KernelTableSchemaError):
+                kernel_census.build_report(a, b, steps_a=1, steps_b=2)
+
+    def test_kernel_table_missing_a_queried_column_exits_10_via_main(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            a = os.path.join(tmp, "a.sqlite")
+            b = os.path.join(tmp, "b.sqlite")
+            out = os.path.join(tmp, "out.json")
+            self._make_sqlite_without_demangled_name_column(a, 5)
+            _make_sqlite(b, _k1(1))
+            rc = kernel_census.main([a, b, "1", "2", out])
+            self.assertEqual(rc, 10)
+            self.assertFalse(os.path.exists(out))
 
     def test_wall_pair_zero_or_negative_refuses(self):
         with tempfile.TemporaryDirectory() as tmp:

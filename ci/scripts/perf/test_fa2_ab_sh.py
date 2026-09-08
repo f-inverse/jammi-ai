@@ -16,8 +16,13 @@ paths, an `nvidia-smi` call, a `cargo build --release` against a live
 from one: there is no producer pipeline downstream of it to exercise
 hermetically. So this test greps the actual command arrays in the committed
 script text (never a re-implementation of its control flow) rather than
-driving a dry run, plus a shellcheck pass on the script itself and a real
-bash-harness execution of the exit-status-propagation control-flow shape.
+driving a dry run, plus a shellcheck pass on the script itself and a REAL
+execution of the exit-status-propagation control flow: the per-leg step
+body fa2_ab.sh's sweep loop calls lives in `fa2_ab_leg.sh`
+(`fa2_ab_run_leg`), and this suite `source`s that file -- the exact code
+fa2_ab.sh runs, never a hand-written stand-in of it -- against a stub
+`finetune-step` replacement that succeeds on one call and fails on the
+next, asserting the SOURCED function's own `overall_rc` moves.
 
 Run: `python3 ci/scripts/perf/test_fa2_ab_sh.py`
 """
@@ -27,43 +32,58 @@ from __future__ import annotations
 import os
 import re
 import shutil
+import stat
 import subprocess
+import tempfile
 import unittest
 
 PERF_DIR = os.path.dirname(os.path.abspath(__file__))
 SCRIPT = os.path.join(PERF_DIR, "fa2_ab.sh")
+LEG_SCRIPT = os.path.join(PERF_DIR, "fa2_ab_leg.sh")
 
 
-def _read_script() -> str:
-    with open(SCRIPT, encoding="utf-8") as fh:
+def _read_script(path: str = SCRIPT) -> str:
+    with open(path, encoding="utf-8") as fh:
         return fh.read()
 
 
 class TestFa2AbShShape(unittest.TestCase):
+    """The flash/block leg-dispatch shape now lives in `fa2_ab_leg.sh`
+    (`fa2_ab_run_leg`), sourced by `fa2_ab.sh`'s sweep loop -- these tests
+    grep the file that actually contains it."""
+
     def setUp(self) -> None:
         self.text = _read_script()
+        self.leg_text = _read_script(LEG_SCRIPT)
+
+    @staticmethod
+    def _if_else_bodies(text: str) -> tuple[str, str]:
+        m = re.search(
+            r'if \[ "\$leg" = block \]; then\n(.*?)\n\s*else\n(.*?)\n\s*fi',
+            text,
+            re.DOTALL,
+        )
+        assert m is not None, "expected an `if [ \"$leg\" = block ]; then ... else ... fi` block"
+        return m.group(1), m.group(2)
 
     def test_block_leg_names_its_own_disable_key(self) -> None:
-        """The `if [ $leg = block ]` branch must run `JAMMI_KERNELS_DISABLE=$K`
-        AND pass `--expect-kernels-disabled "$K"` on the SAME command line --
-        the same op key, not just any non-empty expectation -- so the
+        """The `if [ "$leg" = block ]` branch must run
+        `JAMMI_KERNELS_DISABLE="$disable_key"` AND pass
+        `--expect-kernels-disabled "$disable_key"` on the SAME command line
+        -- the same op key, not just any non-empty expectation -- so the
         binary's own START check refuses before any step runs if the two
         ever disagree (a typo, a dropped env var, or an ambient
         `JAMMI_KERNELS_DISABLE` leaking in)."""
-        m = re.search(
-            r"^\s*if \[ \$leg = block \]; then (.*)$", self.text, re.MULTILINE
-        )
-        self.assertIsNotNone(m, "expected an `if [ $leg = block ]; then ...` line")
-        block_line = m.group(1)
+        block_body, _flash_body = self._if_else_bodies(self.leg_text)
         self.assertIn(
-            "JAMMI_KERNELS_DISABLE=$K",
-            block_line,
-            "block leg must set JAMMI_KERNELS_DISABLE=$K",
+            'JAMMI_KERNELS_DISABLE="$disable_key"',
+            block_body,
+            "block leg must set JAMMI_KERNELS_DISABLE=\"$disable_key\"",
         )
         self.assertIn(
-            '--expect-kernels-disabled "$K"',
-            block_line,
-            "block leg must pass --expect-kernels-disabled \"$K\" -- the "
+            '--expect-kernels-disabled "$disable_key"',
+            block_body,
+            "block leg must pass --expect-kernels-disabled \"$disable_key\" -- the "
             "SAME key it disables via JAMMI_KERNELS_DISABLE, not left "
             "unlabeled",
         )
@@ -74,17 +94,15 @@ class TestFa2AbShShape(unittest.TestCase):
         guard against an ambient `JAMMI_KERNELS_DISABLE` leaking into this
         process from the calling shell/CI runner and silently turning the
         "flash" leg back into the block leg wearing a flash label."""
-        m = re.search(r"^\s*else (.*); fi$", self.text, re.MULTILINE)
-        self.assertIsNotNone(m, "expected an `else ...; fi` line")
-        flash_line = m.group(1)
+        _block_body, flash_body = self._if_else_bodies(self.leg_text)
         self.assertNotIn(
             "JAMMI_KERNELS_DISABLE=",
-            flash_line,
+            flash_body,
             "flash leg must not set JAMMI_KERNELS_DISABLE",
         )
         self.assertIn(
             '--expect-kernels-disabled ""',
-            flash_line,
+            flash_body,
             'flash leg must pass --expect-kernels-disabled "" so an '
             "ambient JAMMI_KERNELS_DISABLE cannot leak in unnoticed",
         )
@@ -94,67 +112,93 @@ class TestFa2AbShShape(unittest.TestCase):
         fused op must ERROR, never silently fall back to eager numbers
         wearing a fused label (admission.rs's disable-wins-over-strict
         contract)."""
-        for line_re in (
-            r"^\s*if \[ \$leg = block \]; then (.*)$",
-            r"^\s*else (.*); fi$",
-        ):
-            m = re.search(line_re, self.text, re.MULTILINE)
-            self.assertIsNotNone(m)
-            self.assertIn("JAMMI_KERNELS_STRICT=1", m.group(1))
+        block_body, flash_body = self._if_else_bodies(self.leg_text)
+        self.assertIn("JAMMI_KERNELS_STRICT=1", block_body)
+        self.assertIn("JAMMI_KERNELS_STRICT=1", flash_body)
 
-    def test_a_refused_leg_moves_the_scripts_own_exit_status(self) -> None:
-        """A refused leg (the binary's own START/END check, or a
-        JSON-parse failure on the emitted report) must move THIS SCRIPT's
-        own exit status via `overall_rc`, never surface only as a `FAILED`
-        line a human has to notice in scrollback. This drives the
-        mechanism for real (never a re-implementation): extracts the
-        leg-loop's `step_rc`/`parse_rc`/`overall_rc` bookkeeping and the
-        trailing `exit $overall_rc` by greeping the committed script text,
-        then actually EXECUTES a minimal bash harness reproducing that
-        exact control-flow shape against a stub `finetune-step` replacement
-        that fails on demand, so the assertion is on the REAL propagation,
-        not on a string match alone."""
+    def test_fa2_ab_sh_sources_the_leg_file_and_calls_the_shared_function(self) -> None:
+        """`fa2_ab.sh`'s sweep loop must call `fa2_ab_run_leg` (never keep
+        its own copy of the step body inline) after sourcing `fa2_ab_leg.sh`
+        -- otherwise the two files could drift into two different
+        implementations of "run one leg"."""
+        self.assertIn('. "$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/fa2_ab_leg.sh"', self.text)
+        self.assertIn("fa2_ab_run_leg ", self.text)
         self.assertIn("overall_rc=0", self.text)
-        self.assertIn("step_rc=$?", self.text)
-        self.assertIn("parse_rc=$?", self.text)
-        self.assertIn(
-            "if [ $step_rc -ne 0 ] || [ $parse_rc -ne 0 ]; then overall_rc=1; fi",
-            self.text,
-        )
         self.assertIn('echo "FA2AB_EXIT=$overall_rc', self.text)
         self.assertIn("exit $overall_rc", self.text)
-        # Real execution: a two-iteration loop where the SECOND iteration's
-        # stub command fails must still run to completion (mirrors
-        # `set -uo pipefail` with no `-e`) and the harness's own exit code
-        # must be 1 -- proves the pattern actually propagates a failure
-        # rather than merely appearing in the script's text.
-        harness = """
-set -uo pipefail
-overall_rc=0
-for i in 1 2; do
-  if [ "$i" = 2 ]; then false; else true; fi
-  step_rc=$?
-  ( exit 0 )
-  parse_rc=$?
-  if [ $step_rc -ne 0 ] || [ $parse_rc -ne 0 ]; then overall_rc=1; fi
-done
-echo "harness saw overall_rc=$overall_rc"
-exit $overall_rc
-"""
-        result = subprocess.run(
-            ["bash", "-c", harness], capture_output=True, text=True, check=False
+
+    def test_leg_sh_carries_the_step_rc_parse_rc_overall_rc_bookkeeping(self) -> None:
+        """The bookkeeping a refused leg (the binary's own START/END check,
+        or a JSON-parse failure on the emitted report) rides to move
+        `overall_rc` now lives in `fa2_ab_leg.sh`, not inline in
+        `fa2_ab.sh` -- greeped off the committed text of the file that
+        actually contains it."""
+        leg_text = _read_script(LEG_SCRIPT)
+        self.assertIn("step_rc=$?", leg_text)
+        self.assertIn("parse_rc=$?", leg_text)
+        self.assertIn(
+            'if [ "$step_rc" -ne 0 ] || [ "$parse_rc" -ne 0 ]; then overall_rc=1; fi',
+            leg_text,
         )
-        self.assertEqual(result.returncode, 1, result.stdout + result.stderr)
-        self.assertIn("overall_rc=1", result.stdout)
 
     def test_the_json_parser_exits_nonzero_on_a_parse_failure(self) -> None:
-        """The inline `python3 -c` report parser must `sys.exit(1)` in its
-        `except` branch -- otherwise a malformed/missing report would print
-        a `FAILED` line and still exit 0, and `parse_rc` above would never
-        see the failure."""
-        idx = self.text.index("except Exception as e:")
-        except_body = self.text[idx : idx + 200]
+        """The inline `python3 -c` report parser (now in `fa2_ab_leg.sh`)
+        must `sys.exit(1)` in its `except` branch -- otherwise a
+        malformed/missing report would print a `FAILED` line and still
+        exit 0, and `parse_rc` above would never see the failure."""
+        leg_text = _read_script(LEG_SCRIPT)
+        idx = leg_text.index("except Exception as e:")
+        except_body = leg_text[idx : idx + 200]
         self.assertIn("sys.exit(1)", except_body)
+
+    def test_sourcing_the_real_leg_file_moves_overall_rc_on_a_failing_leg(self) -> None:
+        """Not a re-implementation: this `source`s the ACTUAL
+        `fa2_ab_leg.sh` (the exact file `fa2_ab.sh` sources in its own
+        sweep loop) and calls its `fa2_ab_run_leg` twice against a stub
+        `finetune-step` replacement that succeeds on the first call and
+        fails (nonzero exit, no report) on the second -- proving the
+        SHIPPED code's `overall_rc` moves from 0 to 1 across that exact
+        transition, not a hand-written stand-in of its control flow."""
+        with tempfile.TemporaryDirectory() as tmp:
+            out_dir = os.path.join(tmp, "out")
+            os.makedirs(out_dir)
+            counter_path = os.path.join(tmp, "calls")
+            stub_path = os.path.join(tmp, "finetune-step-stub.sh")
+            with open(stub_path, "w", encoding="utf-8") as fh:
+                fh.write(
+                    "#!/usr/bin/env bash\n"
+                    f'n=0; [ -f "{counter_path}" ] && n=$(cat "{counter_path}")\n'
+                    f'n=$((n + 1)); echo "$n" > "{counter_path}"\n'
+                    'if [ "$n" -eq 1 ]; then\n'
+                    "  cat <<'JSON'\n"
+                    '{"tiers": {"finetune_step": {"s_per_step_p50": {"value": 0.1}}}}\n'
+                    "JSON\n"
+                    "  exit 0\n"
+                    "else\n"
+                    '  echo "stub refusal" >&2\n'
+                    "  exit 7\n"
+                    "fi\n"
+                )
+            os.chmod(stub_path, os.stat(stub_path).st_mode | stat.S_IEXEC)
+
+            harness = f"""
+set -uo pipefail
+. "{LEG_SCRIPT}"
+overall_rc=0
+fa2_ab_run_leg "{stub_path}" "{out_dir}" K flash 8 128 r1 dummyarg
+first="$overall_rc"
+fa2_ab_run_leg "{stub_path}" "{out_dir}" K flash 8 128 r2 dummyarg
+echo "FIRST=$first SECOND=$overall_rc"
+"""
+            result = subprocess.run(
+                ["bash", "-c", harness], capture_output=True, text=True, check=False
+            )
+            self.assertIn(
+                "FIRST=0 SECOND=1",
+                result.stdout,
+                f"sourced fa2_ab_run_leg's overall_rc did not move as expected:\n"
+                f"stdout={result.stdout}\nstderr={result.stderr}",
+            )
 
     def test_syntax_is_valid_bash(self) -> None:
         """`bash -n` is a pure parse check -- no network, no GPU, no /root
@@ -183,6 +227,25 @@ exit $overall_rc
             result.returncode,
             0,
             f"shellcheck -S warning flagged fa2_ab.sh:\n{result.stdout}\n{result.stderr}",
+        )
+
+    @unittest.skipUnless(shutil.which("shellcheck"), "shellcheck not installed")
+    def test_leg_sh_is_shellcheck_clean_at_warning_severity(self) -> None:
+        """`fa2_ab_leg.sh` is sourced, never executed standalone -- its own
+        `SC2034` on `overall_rc` (assigned for the caller that sources it)
+        is suppressed inline (see that file's own comment), so a clean
+        shellcheck pass here catches any OTHER warning a future edit
+        introduces."""
+        result = subprocess.run(
+            ["shellcheck", "-S", "warning", "-x", LEG_SCRIPT],
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+        self.assertEqual(
+            result.returncode,
+            0,
+            f"shellcheck -S warning flagged fa2_ab_leg.sh:\n{result.stdout}\n{result.stderr}",
         )
 
 

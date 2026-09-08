@@ -371,7 +371,7 @@ class PoolCacheTests(unittest.TestCase):
         """The cache key must depend on the ACTUAL
         construction code, not a hand-bumped version string that a real edit
         can forget to bump. Patching `_family_template` (one of
-        `_pool_construction_fingerprint`'s own named functions) to a
+        `_pool_construction_closure`'s own reachable functions) to a
         DIFFERENT implementation must move `_pool_cache_key`'s output even
         though every numeric argument stays the same."""
         args = (4, 3, 10, 8, 1)  # families, instances_per_family, size, jitter, seed
@@ -400,21 +400,77 @@ class PoolCacheTests(unittest.TestCase):
         args = (4, 3, 10, 8, 1)
         self.assertEqual(gfi._pool_cache_key(*args), gfi._pool_cache_key(*args))
 
-    def test_monkeypatching_an_unrelated_module_function_never_moves_the_key(self):
-        """The negative control: patching a function OUTSIDE
-        `_POOL_CONSTRUCTION_FUNCTION_NAMES` (e.g. `_image_name`, which names
-        files but never touches pixel/PNG bytes) must NOT move the cache
-        key -- the fingerprint is scoped to construction code, not "any
-        module-level function whatsoever"."""
+    def test_monkeypatching_an_unreachable_function_never_moves_the_key(self):
+        """The negative control: patching a function `_build_pool`'s closure
+        genuinely never reaches must NOT move the cache key --
+        `decode_png_rgb` decodes bytes this producer already wrote and plays
+        no part in constructing them, so it is a non-vacuous control (unlike
+        `_image_name`, which the closure DOES reach: see
+        `PoolConstructionClosureTests`)."""
         args = (4, 3, 10, 8, 1)
         before = gfi._pool_cache_key(*args)
-        original = gfi._image_name
-        gfi._image_name = lambda family, instance: "unrelated"
+        original = gfi.decode_png_rgb
+        gfi.decode_png_rgb = lambda data: (0, 0, b"")
         try:
             after = gfi._pool_cache_key(*args)
         finally:
-            gfi._image_name = original
+            gfi.decode_png_rgb = original
         self.assertEqual(before, after)
+
+
+class PoolConstructionClosureTests(unittest.TestCase):
+    """`_pool_construction_closure` (round-2 audit finding B1): the
+    fingerprint's function/constant set must be the ACTUAL transitive
+    closure `_build_pool` reaches, derived by an AST walk at runtime, never
+    a hand-maintained tuple that can under-name the very call graph it
+    claims to cover."""
+
+    _EXPECTED_FUNCTIONS = {
+        "_build_pool",
+        "_family_template",
+        "_image_name",
+        "_jittered",
+        "_png_chunk",
+        "encode_png",
+    }
+    _EXPECTED_CONSTANTS = {"_PNG_SIGNATURE", "_COLOR_TYPE_RGB", "_BIT_DEPTH", "_ZLIB_LEVEL"}
+
+    def test_closure_is_exactly_the_six_audited_functions_and_their_constants(self):
+        functions, constants = gfi._pool_construction_closure()
+        self.assertEqual(set(functions), self._EXPECTED_FUNCTIONS)
+        self.assertEqual(set(constants), self._EXPECTED_CONSTANTS)
+
+    def test_monkeypatching_every_reachable_function_moves_the_cache_key(self):
+        """Every one of the six -- `_build_pool` itself (RNG seeding, draw
+        order, dict keys) and `_image_name` included, both of which a
+        hand-maintained tuple had previously left out -- must move the key
+        when replaced."""
+        args = (4, 3, 10, 8, 1)
+        baseline = gfi._pool_cache_key(*args)
+        for name in sorted(self._EXPECTED_FUNCTIONS):
+            original = getattr(gfi, name)
+            setattr(gfi, name, lambda *a, __orig=original, **kw: __orig(*a, **kw))
+            try:
+                patched = gfi._pool_cache_key(*args)
+            finally:
+                setattr(gfi, name, original)
+            self.assertNotEqual(baseline, patched, f"patching {name} did not move the cache key")
+        # Every patch above was restored -- the key must land back exactly
+        # where it started, not drift from residual state.
+        self.assertEqual(baseline, gfi._pool_cache_key(*args))
+
+    def test_monkeypatching_every_reachable_constant_moves_the_cache_key(self):
+        args = (4, 3, 10, 8, 1)
+        baseline = gfi._pool_cache_key(*args)
+        for name in sorted(self._EXPECTED_CONSTANTS):
+            original = getattr(gfi, name)
+            setattr(gfi, name, (original, "patched"))
+            try:
+                patched = gfi._pool_cache_key(*args)
+            finally:
+                setattr(gfi, name, original)
+            self.assertNotEqual(baseline, patched, f"patching {name} did not move the cache key")
+        self.assertEqual(baseline, gfi._pool_cache_key(*args))
 
 
 class HeldOutSplitTests(unittest.TestCase):

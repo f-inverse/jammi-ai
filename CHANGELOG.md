@@ -433,7 +433,8 @@ workspace ships every publishable crate at the same
   is updated to match (parity-test/cuda_parity remain pod-run-only, disclosed). Finally,
   `ci/scripts/perf/check_producer_provenance_gates.py`'s dry-run-knob-inertness check widens from
   `*FAKE*`-named knobs to any `<PREFIX>_DRY_RUN_<SUFFIX>` test knob (`PROFILE_421_LEGS_DRY_RUN_
-  EXTRA_REQUESTED_KEY`/`_TRUNCATE_CORPUS_VAR`, `LORA_BIAS_AB_DRY_RUN_FAIL_OP`/`_FAIL_PREDICATE`),
+  EXTRA_REQUESTED_KEY`/`_TRUNCATE_CORPUS_VAR`/`_POOL_CACHE_DIR`, `LORA_BIAS_AB_DRY_RUN_FAIL_OP`/
+  `_FAIL_PREDICATE`),
   admissible by either containment (every read site inside an `if [ "$<PREFIX>_DRY_RUN" = "1" ]`
   -guarded region, heredoc-aware so an embedded `python3 -c` payload's own dangling `if`s cannot
   fool the block-extent walk) or the existing preflight-refusal shape generalized off the `FAKE`

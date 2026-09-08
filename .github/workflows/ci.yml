@@ -1726,18 +1726,22 @@ jobs:
           # property than `check_producer_provenance_gates.py`'s own
           # producer-parity check (that check covers fa2_ab.sh's
           # provenance/build_sha cross-check; see that script's own module
-          # doc), never a claim of the same coverage restated here. Rather
-          # than a dry-run execution (there is no producer pipeline
-          # downstream of it to exercise hermetically), this greps the
-          # COMMITTED command-array text for both `finetune-step` legs: the
-          # block leg must name its own `JAMMI_KERNELS_DISABLE=$K` key back
-          # via `--expect-kernels-disabled "$K"`, and the flash leg must
-          # pass `--expect-kernels-disabled ""` — an exact-set-equality
+          # doc), never a claim of the same coverage restated here. The
+          # per-(shape,leg,repeat) step body fa2_ab.sh's sweep loop calls
+          # lives in `fa2_ab_leg.sh` (`fa2_ab_run_leg`), sourced by
+          # `fa2_ab.sh`; this greps the COMMITTED command-array text of
+          # both files for both `finetune-step` legs (the block leg must
+          # name its own disable key back via
+          # `--expect-kernels-disabled "$disable_key"`, and the flash leg
+          # must pass `--expect-kernels-disabled ""` — an exact-set-equality
           # guard against an ambient `JAMMI_KERNELS_DISABLE` leaking into
-          # the "flash" leg from the calling shell — plus a `bash -n` parse
-          # check, a `shellcheck -S warning` pass, and a real bash-harness
-          # execution proving a refused leg moves the script's own exit
-          # status. No GPU, no network, no `/root` path ever touched.
+          # the "flash" leg from the calling shell), plus a `bash -n` parse
+          # check and a `shellcheck -S warning` pass on both files, plus a
+          # REAL execution: it `source`s the ACTUAL `fa2_ab_leg.sh` (never a
+          # hand-written stand-in of it) against a stub `finetune-step`
+          # replacement that succeeds once and then fails, and asserts the
+          # SOURCED function's own `overall_rc` moves from 0 to 1. No GPU,
+          # no network, no `/root` path ever touched.
           - name: fa2_ab.sh shape
             cmd: python3 ci/scripts/perf/test_fa2_ab_sh.py
     steps:

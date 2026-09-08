@@ -162,13 +162,10 @@ class DryRunSmokeTests(unittest.TestCase):
                 self.assertEqual(manifest["git_sha"], _real_head())
 
     def test_kernel_census_runs_for_real_under_dry_run_and_census_ok_is_earned(self):
-        """esc-088 round-4 advisory: before this fix, `kernel_census.py`
-        was gated behind a bare `run_cmd` no-op under DRY_RUN and the
-        `nsys export` stub touch-emptied its sqlite output -- so
-        `census_ok="true"` in every DRY_RUN manifest was DEFAULTED (the
-        `census_exit=0` from a command that never ran), never EARNED by an
-        actual passing invocation. Now the DRY_RUN `nsys export` stub
-        copies a real, committed, schema-valid sqlite fixture
+        """`census_ok`/`census_exit` in a DRY_RUN manifest must be EARNED by
+        an actual passing `kernel_census.py` invocation, never DEFAULTED by
+        a `run_cmd` no-op that never ran anything: the DRY_RUN `nsys export`
+        stub copies a real, committed, schema-valid sqlite fixture
         (`fixtures/nsys_kernel_census/{n,m}.sqlite`) into place and
         `kernel_census.py` runs unconditionally -- this asserts the
         MECHANISM, not just the boolean: `census.json` exists with the
@@ -178,7 +175,7 @@ class DryRunSmokeTests(unittest.TestCase):
         script's own captured stdout carries `kernel_census.py`'s own
         `steps_diff=...` success line -- a touch-empty sqlite would instead
         produce a `KernelTableMissingError` (leg INVALID, `census_ok`
-        `false`), and a still-no-op `run_cmd` would produce NEITHER a
+        `false`), and a no-op `run_cmd` would produce NEITHER a
         `census.json` NOR this stdout line at all."""
         with tempfile.TemporaryDirectory() as out_dir:
             result = run_dry(out_dir, legs_only="clip-text-A1")

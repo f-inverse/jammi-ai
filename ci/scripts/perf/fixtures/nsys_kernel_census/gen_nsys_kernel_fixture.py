@@ -16,15 +16,14 @@ real, hermetically, against real (if synthetic) kernel rows.
 `fixture_attention_block_kernel`) and `demangledName` (the full
 demangled signature `census()`'s own query keys on, per its module
 doc's "Kernel identity" paragraph -- e.g. `void jammi_kernels::
-fixture_attention_block_kernel(float const*, float*)`). An earlier
-version of this fixture stored only ONE string and used it AS
-`shortName`, even though its value was shaped like a demangled
-signature -- that inversion is exactly the shape a real export never
-takes (a genuine `shortName` is never a full signature) and is why
-`census()`'s `k.demangledName` reference against this fixture raised
-`sqlite3.OperationalError: no such column: k.demangledName` outright:
-the column did not exist at all. Both columns are now present and
-distinct, each carrying the string its own name promises.
+fixture_attention_block_kernel(float const*, float*)`). Both columns
+are present and hold DISTINCT StringIds rows, each carrying the string
+its own name promises -- a fixture that collapsed the two (storing one
+string and using it as both, or storing only a `demangledName`-shaped
+value AS `shortName`) would not be the shape a real nsys export takes
+(a genuine `shortName` is never a full signature) and would make
+`census()`'s `k.demangledName` reference fail outright against a
+schema that never carried that column.
 
 Deterministic and reproducible by construction: no RNG, no wall-clock
 read, no environment-dependent ordering -- fixed kernel name, fixed

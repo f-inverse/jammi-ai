@@ -107,6 +107,7 @@ from __future__ import annotations
 
 import argparse
 import array
+import ast
 import hashlib
 import inspect
 import io
@@ -114,6 +115,8 @@ import json
 import math
 import random
 import sys
+import textwrap
+import types
 import wave
 from pathlib import Path
 
@@ -357,45 +360,69 @@ def _build_pool(
     return files
 
 
-# Every function `_build_pool`'s own call graph transitively reaches to turn
-# `(family, instance)` into emitted WAV bytes: `_instance_samples` (the
-# int16 sample array, itself calling `_family_fundamental_hz`/
-# `_family_harmonic_gains`) and `encode_wav` (the file bytes). Named by
-# STRING here, not by direct function reference, and looked up via
-# `globals()` at fingerprint time in `_pool_construction_fingerprint` -- a
-# tuple of function OBJECTS captured once at import time would keep
-# pointing at the ORIGINAL functions even after a caller monkeypatches the
-# module-level name, defeating the one property this fingerprint exists to
-# prove (a live code change moves the key).
-_POOL_CONSTRUCTION_FUNCTION_NAMES = (
-    "_instance_samples",
-    "_family_fundamental_hz",
-    "_family_harmonic_gains",
-    "encode_wav",
-)
+def _referenced_global_names(fn) -> set[str]:
+    """The module-level names `fn`'s own SOURCE TEXT loads, parsed fresh via
+    `ast` on every call -- never a hand-maintained list that can go stale the
+    moment `fn`'s body changes. Excludes every name `fn` itself BINDS
+    (parameters, locals, loop/comprehension targets), so a name that merely
+    shadows a module global inside the function is not mistaken for a
+    reference to it."""
+    fn_def = ast.parse(textwrap.dedent(inspect.getsource(fn))).body[0]
+    bound = {n.arg for n in ast.walk(fn_def) if isinstance(n, ast.arg)}
+    bound |= {
+        n.id for n in ast.walk(fn_def) if isinstance(n, ast.Name) and isinstance(n.ctx, ast.Store)
+    }
+    loaded = {
+        n.id for n in ast.walk(fn_def) if isinstance(n, ast.Name) and isinstance(n.ctx, ast.Load)
+    }
+    return loaded - bound
 
-# The waveform/WAV constants `_instance_samples`/`encode_wav` close over
-# rather than take as arguments -- `inspect.getsource` captures a
-# function's SOURCE TEXT, which is just the name `_PEAK`, never the value
-# bound to it, so a change to one of these (e.g. the harmonic count or the
-# sample width) would move the emitted bytes without moving any function's
-# source text. Folded into the fingerprint by VALUE so that gap is closed
-# too.
-_POOL_CONSTRUCTION_CONSTANT_NAMES = (
-    "_PEAK",
-    "_PHASE_DIVISOR",
-    "_HARMONICS",
-    "_SAMPLE_WIDTH_BYTES",
-    "_CHANNELS",
-)
+
+def _pool_construction_closure() -> tuple[list[str], list[str]]:
+    """The TRANSITIVE CLOSURE of module-level functions and constants
+    `_build_pool` reaches, derived by walking its own source (and the source
+    of everything it reaches, recursively) rather than read off a
+    hand-maintained tuple -- the same graph an auditor would draw by hand,
+    rebuilt fresh by the code itself on every call so a name can never fall
+    out of it by someone forgetting to add it.
+
+    A referenced name that resolves (via `globals()`) to a module-level
+    FUNCTION is recursed into; one that resolves to an imported MODULE or a
+    class is skipped (neither is "this module's construction code", and a
+    module's own `repr()` embeds its filesystem path, which would make the
+    fingerprint move across machines for no code reason); anything else --
+    an int, a str, a tuple, a bytes literal -- is a CONSTANT, hashed by
+    value. Returns `(function_names, constant_names)`, both sorted.
+    """
+    g = globals()
+    seen_functions: set[str] = set()
+    constant_names: set[str] = set()
+    worklist = ["_build_pool"]
+    while worklist:
+        name = worklist.pop()
+        if name in seen_functions:
+            continue
+        seen_functions.add(name)
+        for ref in _referenced_global_names(g[name]):
+            if ref not in g:
+                continue  # builtin, or a name this function's own scope binds
+            value = g[ref]
+            if inspect.isfunction(value) and getattr(value, "__globals__", None) is g:
+                if ref not in seen_functions:
+                    worklist.append(ref)
+            elif isinstance(value, types.ModuleType) or inspect.isclass(value):
+                continue
+            else:
+                constant_names.add(ref)
+    return sorted(seen_functions), sorted(constant_names)
 
 
 def _pool_construction_fingerprint() -> str:
     """Hex digest of the ACTUAL construction code, not a hand-maintained
     version string: source text (`inspect.getsource`) of every function in
-    `_POOL_CONSTRUCTION_FUNCTION_NAMES`, plus the `repr()` of every constant
-    in `_POOL_CONSTRUCTION_CONSTANT_NAMES`, looked up fresh via `globals()`
-    on every call.
+    [`_pool_construction_closure`]'s function set, plus the `repr()` of every
+    constant in its constant set, looked up fresh via `globals()` on every
+    call.
 
     Hashing the whole MODULE FILE's bytes would also be a complete fix (it
     covers everything below, plus every byte outside the construction path
@@ -408,13 +435,15 @@ def _pool_construction_fingerprint() -> str:
     would pass such a test the same way it passed the old hand-bumped
     `_PRODUCER_VERSION` scheme this replaces. Hashing live function/constant
     OBJECTS via `globals()` fixes that: monkeypatching `_instance_samples`
-    (or any name in either tuple above) changes what THIS function reads on
-    its very next call, so a test can assert the cache key moves under a
-    patch and stays put when nothing relevant changed -- the property this
-    replacement exists to prove."""
+    (or any name the closure reaches, `_build_pool` and `_clip_name`
+    included) changes what THIS function reads on its very next call, so a
+    test can assert the cache key moves under a patch and stays put when
+    nothing relevant changed -- the property this replacement exists to
+    prove."""
     g = globals()
-    parts = [inspect.getsource(g[name]) for name in _POOL_CONSTRUCTION_FUNCTION_NAMES]
-    parts.append(repr(tuple(g[name] for name in _POOL_CONSTRUCTION_CONSTANT_NAMES)))
+    function_names, constant_names = _pool_construction_closure()
+    parts = [inspect.getsource(g[name]) for name in function_names]
+    parts.append(repr(tuple(g[name] for name in constant_names)))
     return hashlib.sha256("".join(parts).encode("utf-8")).hexdigest()[:32]
 
 

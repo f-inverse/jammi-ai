@@ -89,8 +89,8 @@ pub fn extract_column(
 /// Extract images from an Arrow column.
 ///
 /// Supports two input modes:
-/// - `Utf8` / `LargeUtf8`: values are file paths, loaded from disk.
-/// - `Binary` / `LargeBinary`: values are image bytes, decoded in memory.
+/// - `Utf8` / `LargeUtf8` / `Utf8View`: values are file paths, loaded from disk.
+/// - `Binary` / `LargeBinary` / `BinaryView`: values are image bytes, decoded in memory.
 ///
 /// Null values produce `None` (caller tracks via `row_status`).
 pub fn arrow_to_images(columns: &[ArrayRef]) -> Result<Vec<Option<DynamicImage>>> {
@@ -124,6 +124,26 @@ pub fn arrow_to_images(columns: &[ArrayRef]) -> Result<Vec<Option<DynamicImage>>
                 let path = col
                     .as_any()
                     .downcast_ref::<LargeStringArray>()
+                    .map(|a| a.value(i))
+                    .ok_or_else(|| {
+                        JammiError::Inference(format!("Failed to read path at row {i}"))
+                    })?;
+                image::open(path).map_err(|e| {
+                    JammiError::Inference(format!("Failed to load image '{path}': {e}"))
+                })?
+            }
+            // esc-090: `Utf8View` mirrors `Utf8` exactly — same "value is a
+            // file path" contract, same whole-call `?`-propagated `Err` on a
+            // bad path, same per-row null handling (the `col.is_null(i)`
+            // check above already covers this arm). DataFusion's parquet
+            // reader (Arrow 57 under this workspace's pinned DataFusion 52)
+            // returns `Utf8View` for a plain Parquet `Utf8` column by
+            // default, so an ordinary registered source's path column hits
+            // this arm on the real scan output, not just a hand-built array.
+            DataType::Utf8View => {
+                let path = col
+                    .as_any()
+                    .downcast_ref::<StringViewArray>()
                     .map(|a| a.value(i))
                     .ok_or_else(|| {
                         JammiError::Inference(format!("Failed to read path at row {i}"))
@@ -184,7 +204,7 @@ pub fn arrow_to_images(columns: &[ArrayRef]) -> Result<Vec<Option<DynamicImage>>
 /// Extract and decode audio clips from an Arrow column.
 ///
 /// Supports two input modes, mirroring [`arrow_to_images`]:
-/// - `Utf8` / `LargeUtf8`: values are file paths, read and decoded from disk.
+/// - `Utf8` / `LargeUtf8` / `Utf8View`: values are file paths, read and decoded from disk.
 /// - `Binary` / `LargeBinary` / `BinaryView`: values are encoded audio bytes
 ///   (WAV/FLAC/MP3/Ogg), decoded in memory.
 ///
@@ -222,6 +242,23 @@ pub fn arrow_to_audio(columns: &[ArrayRef]) -> Result<Vec<Option<audio_preproces
                 let path = col
                     .as_any()
                     .downcast_ref::<LargeStringArray>()
+                    .map(|a| a.value(i))
+                    .ok_or_else(|| {
+                        JammiError::Inference(format!("Failed to read path at row {i}"))
+                    })?;
+                std::borrow::Cow::Owned(std::fs::read(path).map_err(|e| {
+                    JammiError::Inference(format!("Failed to read audio file '{path}': {e}"))
+                })?)
+            }
+            // esc-090: `Utf8View` mirrors `Utf8` exactly — see the identical
+            // arm in `arrow_to_images` for the full rationale (DataFusion's
+            // parquet reader surfaces a plain Utf8 path column as Utf8View
+            // by default under this workspace's pinned Arrow/DataFusion
+            // versions).
+            DataType::Utf8View => {
+                let path = col
+                    .as_any()
+                    .downcast_ref::<StringViewArray>()
                     .map(|a| a.value(i))
                     .ok_or_else(|| {
                         JammiError::Inference(format!("Failed to read path at row {i}"))

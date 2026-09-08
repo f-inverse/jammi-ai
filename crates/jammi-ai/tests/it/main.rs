@@ -44,3 +44,4 @@ mod storage_precision;
 mod storage_root;
 mod tower_adapters;
 mod uat_workflows;
+mod utf8view_columns;

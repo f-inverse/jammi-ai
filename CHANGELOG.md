@@ -421,6 +421,13 @@ workspace ships every publishable crate at the same
   `model_type == "fine-tuned"` record ever again carries no `base_model_id` or no
   `artifact_path`, rather than falling through to resolve it as an ordinary model or serving the
   base silently.
+- **A `Utf8View` path column is accepted by `arrow_to_images`/`arrow_to_audio`, matching `Utf8`
+  exactly (esc-090).** Both functions matched `Utf8`/`LargeUtf8`/`Binary`/`LargeBinary`/
+  `BinaryView` but had no `Utf8View` arm, so a `Utf8View` path column — DataFusion's parquet
+  reader's own default output for an ordinary `Utf8` column under this workspace's pinned Arrow/
+  DataFusion versions — refused the whole call with "Unsupported column type" even though every
+  row's path was valid. `Utf8View` now takes the identical arm `Utf8` takes: same file-path
+  read, same whole-call `Err` on a bad path, same per-row null handling.
 
 ### Breaking
 - `jammi_encoders::{AnyAudioEncoder, AudioEncoder}` are removed

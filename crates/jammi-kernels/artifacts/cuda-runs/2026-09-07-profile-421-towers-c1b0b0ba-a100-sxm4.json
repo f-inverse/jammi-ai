@@ -25,17 +25,24 @@
    "--merge-json",
    "/private/tmp/claude-501/-Users-vijaychakilam-git-f-inverse-jammi-ai/4ac1595d-bdec-4db7-b4f7-9c3993c88377/scratchpad/pod421-run2/merge.json",
    "--attribution-json",
-   "/private/tmp/claude-501/-Users-vijaychakilam-git-f-inverse-jammi-ai/4ac1595d-bdec-4db7-b4f7-9c3993c88377/scratchpad/attr-pass4.json",
+   "/private/tmp/claude-501/-Users-vijaychakilam-git-f-inverse-jammi-ai/4ac1595d-bdec-4db7-b4f7-9c3993c88377/scratchpad/regen-attr.json",
    "--identity",
    "ci/scripts/perf/profile_421_run2_identity.json",
    "--out",
    "crates/jammi-kernels/artifacts/cuda-runs/2026-09-07-profile-421-towers-c1b0b0ba-a100-sxm4.json"
   ],
-  "tree_sha": "b9635f5b956f2c5d4b2dbab6c5b4b8332f6985be",
+  "source_sha256": {
+   "ci/scripts/perf/profile_421_artifact.py": "581b96f657847ea36cf37281a56d6ae91431fbbc8a3f16e349cd12ce089bb984",
+   "ci/scripts/perf/profile_421_attribute.py": "60eb95b6d2b9c3dceb36c977dc6f3e74c72ca9eb48f6c24afdef7e709b1f8ff4",
+   "ci/scripts/perf/profile_421_legs.sh": "ff15b0ce3784ace6fb521bfe1de47861fbb838194b1d286e4a472f9c0eddf1ce",
+   "ci/scripts/perf/gen_fixed_shape_image_corpus.py": "93bf92c0e723a98d1e234d997d0270edfeec604343c45765e1cbf28e07028e2b",
+   "ci/scripts/perf/gen_fixed_length_audio_corpus.py": "9fa820486ed2e0b6565dd612c994b0cec38cbe98e940e363292ba6fd1a8727ea",
+   "ci/scripts/perf/test_profile_421_merge.py": "d9bdadada34546e2598d8ccb551eed90586703fccfc8d140e6d0603892724f17"
+  },
   "input_sha256": {
    "merge_json": "c80cd7eaf480e6e167861b0ac7ae9855d58df0ec84c2799864cdfd6c931db264",
    "attribution_json": "3d5f33c280232f1ee2ee4740f3e18d84dffc6532f113b595bb1c9f34b63007a3",
-   "identity": "9223b54ad00e362afcbc05610d959c4af360b68dde468d1585920d8eea21defe"
+   "identity": "dbb6d3631294ca3ef67ddfbb3f7bc56bd8890033f958da645493df58b11156e3"
   }
  },
  "status": "GREEN",
@@ -72,7 +79,7 @@
    "Per-leg raw .nsys-rep exports were deleted on-pod after each leg's census.json was produced (disk budget); the raw sqlite exports (24 files) were kept off-pod and were never committed -- see notes.operator_recorded for the on-pod-recorded total size, which has no in-tree witness.",
    "Both media corpus producers (image, audio) emit families x instances = 24 files at any --rows, so the M-leg's 4800 rows cycle 16 distinct train clips (a page-cached working set, contract SS D6.3) -- the HTSAT/vision front-end finding below is a real per-item CPU decode/preprocess compute cost, not a realistic-corpus I/O cost, and every quote of that finding must carry this caveat.",
    "Census reports produced before the pass-4 kernel-identity fix (the #356 close-out and the #421 2026-09-01/06 pod artifacts) carry the pre-fix, collapsed Kernel2/magma_sgemmEx_kernel rows in by_kernel_and_grid -- their by_kernel_name totals and every other top-line number are unaffected (the refinement is sum-preserving, see the root-cause deviation above), only the per-instantiation breakdown was coarser.",
-   "CONTRACT.md's own SS D5 names profile_421_merge.py's hermetic suite at 45 tests -- already stale at the freeze commit (perf/421-profile-p1 @ aace002f), where the suite had already grown to 55 (python3 ci/scripts/perf/test_profile_421_merge.py -> 'Ran 55 tests'; unchanged at c1b0b0ba). Not corrected in the frozen body -- a pre-registration's text is never edited after freezing -- recorded here instead, per docs/plans/66-tower-profile/README.md's own 'Deviations from a clean single pass' section. The count is descriptive prose about the suite's size, not a method parameter any decision rule reads, so this staleness never affected a verdict."
+   "CONTRACT.md's own SS D5 (docs/plans/66-tower-profile/CONTRACT.md, frozen body) names profile_421_merge.py's hermetic suite at a fixed pre-registration-time count -- already stale at the freeze commit (perf/421-profile-p1 @ aace002f), where the live suite (unittest discovery over the REAL committed test_profile_421_merge.py, never hand-typed -- see profile_421_artifact.py's compute_merge_suite_test_count) already carried 55 tests; unchanged at c1b0b0ba. Not corrected in the frozen body -- a pre-registration's text is never edited after freezing -- recorded here instead, per docs/plans/66-tower-profile/README.md's own 'Deviations from a clean single pass' section (see CONTRACT.md SS D5 itself, never quoted here as a second, independently-drifting digit, for the exact stale figure it names). The count is descriptive prose about the suite's size, not a method parameter any decision rule reads, so this staleness never affected a verdict."
   ],
   "operator_recorded": {
    "raw_sqlite_export_total_size": "~31 GB (on-pod estimate at run2 close-out, before the exports were deleted per the disk-budget deviation above; the raw .sqlite files themselves were never committed, so no in-tree witness can re-derive this figure -- the file COUNT in notes.recorded_deviations IS witnessed, this size is not)"
@@ -7843,12 +7850,23 @@
  "findings": [
   {
    "id": "htsat-front-end-bound",
-   "text": "The HTSAT training step is CPU front-end-bound: front-end share of wall is 81-83% across the F32/BF16 decision legs (audio decode/resample/STFT/mel dominating wall time), dtype- and arm-invariant.",
+   "text": "The HTSAT training step is CPU front-end-bound: front-end share of wall is 81-83% across the F32/BF16 decision legs (rule: front_share_of_wall >= 50% on every leg read; audio decode/resample/STFT/mel dominating wall time). Front-end time itself is 1.249-1.255 s/step across every F32/BF16 x A/D-arm leg read (relative spread 0.5%, within the 5% arm-invariance rule), so this cost is dtype- and arm-invariant.",
    "evidence": {
     "front_share_of_wall_pct": {
      "htsat-A1": 80.70459923277278,
      "htsat-A2": 83.41211050160044
-    }
+    },
+    "front_end_bound_rule": "front_share_of_wall >= 0.5 on every leg read",
+    "front_end_bound": true,
+    "front_s_per_step": {
+     "htsat-A1": 1.250912541216,
+     "htsat-A2": 1.251592021452,
+     "htsat-D1": 1.249312950748,
+     "htsat-D2": 1.2550384823760001
+    },
+    "arm_invariance_rule": "(max-min)/mean of front_s_per_step across every A/D leg read <= 0.05",
+    "arm_invariance_relative_spread": 0.00457415322734431,
+    "arm_invariant": true
    }
   },
   {
@@ -7863,7 +7881,7 @@
   },
   {
    "id": "clip-launch-bound-batch8",
-   "text": "At batch 8 the CLIP training steps are launch-bound: 3638-3722 launches/step across the four F32/BF16 A-arm CLIP legs (text and vision); switching to BF16 cuts GPU busy by 32-41% per tower while wall drops by only 4-5%.",
+   "text": "At batch 8 the CLIP training steps are launch-bound: 3638-3722 launches/step across the four F32/BF16 A-arm CLIP legs (text and vision) (rule: launches/step >= 1000 and launch/sync residual share of wall (residual_s_per_step / wall_s_per_step) >= 20%, both on every named leg); switching to BF16 cuts GPU busy by 32-41% per tower while wall drops by only 4-5%.",
    "evidence": {
     "launches_per_step": {
      "clip-text-A1": 3673.0,
@@ -7878,7 +7896,16 @@
     "wall_delta_pct_bf16_vs_f32": {
      "clip-text": -3.832241841862495,
      "clip-vision": -5.286155009933992
-    }
+    },
+    "residual_share_of_wall": {
+     "clip-text-A1": 0.3948801390111086,
+     "clip-text-A2": 0.5706846876638667,
+     "clip-vision-A1": 0.22665083165363578,
+     "clip-vision-A2": 0.42257359698065344
+    },
+    "launch_bound_rule": "launches/step >= 1000 and launch/sync residual share of wall (residual_s_per_step / wall_s_per_step) >= 20%, both on every named leg",
+    "launch_bound": true,
+    "wall_drop_smaller_than_busy_drop_every_tower": true
    }
   },
   {

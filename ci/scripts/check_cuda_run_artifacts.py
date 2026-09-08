@@ -59,6 +59,10 @@ must carry:
     was actually measured); `merged_as` only ever supplements it, never
     replaces it, and is only valid alongside a resolved `git_sha` (never
     `git_sha_unresolved`).
+  - `producer.source_sha256` (OPTIONAL — `{<repo-root-relative path>: <sha256
+    hex>}`): a producer's own CONTENT identity, for a producer whose module
+    doc names this the regeneration-provenance convention (e.g.
+    `profile_421_artifact.py`) instead of a git commit sha (see rule (j)).
 
 ## Fail-closed contract
 
@@ -108,6 +112,17 @@ must carry:
       (h)" (the claim-value binding gate), so the v2 leg-identity rule is
       deliberately lettered (i). The letter is comment/self-test-label
       prose only — no gate, allowlist, or error message parses it.
+  (j) `producer.source_sha256`, when present, is re-hashed HERE — every
+      named repo-root-relative path is re-read from THIS gate's own HEAD
+      (the real working tree, never a historical blob) and its sha256
+      compared against the recorded value; a mismatch is a hard FAIL naming
+      the path (`check_producer_source_sha256`). This replaces `tree_sha`
+      (a git commit sha nothing ever validated, and the wrong determinant
+      in the first place — an artifact cannot know, at render time, which
+      future commit will contain it) with the producer's own CONTENT
+      identity: editing the producer (or a file it reads a live constant
+      from) and forgetting to regenerate the committed artifact is now
+      caught here, never silently accepted as still-valid provenance.
 
 Rule (d) needs REAL commit history to mean anything: `git merge-base
 --is-ancestor` on a shallow checkout (`actions/checkout`'s default
@@ -132,6 +147,7 @@ Hermetic: reads the working tree (or an ephemeral tempdir git repo under
 
 from __future__ import annotations
 
+import hashlib
 import json
 import re
 import subprocess
@@ -370,6 +386,52 @@ def check_producer_path(producer: dict, repo_root: Path, tracked: set[str]) -> l
         failures.append(f"producer.path `{path}` does not exist on disk")
     if path not in tracked:
         failures.append(f"producer.path `{path}` is not `git ls-files`-tracked")
+    return failures
+
+
+_SHA256_HEX_RE = re.compile(r"^[0-9a-f]{64}$")
+
+
+# --------------------------------------------------------------------------- #
+# rule (j) — producer.source_sha256: content-identity, re-hashed at THIS
+# gate's own HEAD, never a git commit sha nothing ever validated
+# --------------------------------------------------------------------------- #
+def check_producer_source_sha256(producer: dict, repo_root: Path) -> list[str]:
+    """`producer.source_sha256` (OPTIONAL — only carried by a producer whose
+    own module doc names this its regeneration-provenance convention, e.g.
+    `profile_421_artifact.py`) is a `{<repo-root-relative path>: <sha256
+    hex>}` map naming every file whose BYTES can change a NUMBER that
+    producer emits. Unlike the retired `producer.tree_sha` (a git commit sha
+    nothing ever validated, and the wrong determinant anyway — the artifact
+    cannot know, at render time, which future commit will contain it), this
+    IS checked: every named path is re-hashed at THIS gate's own HEAD (the
+    real working tree, never a historical git blob) and a mismatch is
+    refused BY NAME — regenerating the artifact is the only way to clear a
+    hit, never a hand-edit of the recorded hash."""
+    source_sha256 = producer.get("source_sha256")
+    if source_sha256 is None:
+        return []
+    if not isinstance(source_sha256, dict) or not source_sha256:
+        return [f"producer.source_sha256 must be a non-empty object, got {source_sha256!r}"]
+    failures: list[str] = []
+    for path, expected in sorted(source_sha256.items()):
+        if not isinstance(path, str) or not path:
+            failures.append(f"producer.source_sha256 has a non-string/empty path key {path!r}")
+            continue
+        if not isinstance(expected, str) or not _SHA256_HEX_RE.match(expected):
+            failures.append(f"producer.source_sha256[{path!r}] must be a 64-lowercase-hex sha256, got {expected!r}")
+            continue
+        full = repo_root / path
+        if not full.is_file():
+            failures.append(f"producer.source_sha256 names `{path}` which does not exist on disk at HEAD")
+            continue
+        actual = hashlib.sha256(full.read_bytes()).hexdigest()
+        if actual != expected:
+            failures.append(
+                f"producer.source_sha256[{path!r}] = {expected} does not match `{path}`'s OWN bytes at HEAD "
+                f"({actual}) — the producer (or a file it reads a live constant from) changed since this "
+                "artifact was rendered; regenerate the artifact, never hand-edit the recorded hash"
+            )
     return failures
 
 
@@ -1389,6 +1451,7 @@ def validate_artifact(
     failures += check_producer_path(producer, repo_root, tracked)
     if producer.get("kind") == "cargo-test":
         failures += check_cargo_test_gating(data, producer, repo_root)
+    failures += check_producer_source_sha256(producer, repo_root)
     failures += check_none_allowlist(data, relpath, allowlist)
     failures += check_ancestry(data, repo_root)
     failures += check_oracle_separation(data)
@@ -1687,6 +1750,40 @@ def self_test() -> int:
         bad["producer"] = dict(bad["producer"])
         bad["producer"]["path"] = "crates/fixture-crate/tests/untracked.rs"
         expect_hit(bad, "x.json", "is not `git ls-files`-tracked", "rule (b): untracked producer.path")
+
+        # rule (j) — producer.source_sha256 re-hashed at THIS gate's own HEAD --
+        real_relpath = "crates/fixture-crate/tests/cuda_parity.rs"
+        real_hash = hashlib.sha256((repo / real_relpath).read_bytes()).hexdigest()
+
+        ok = baseline()
+        ok["producer"] = dict(ok["producer"])
+        ok["producer"]["source_sha256"] = {real_relpath: real_hash}
+        expect_clean(ok, "control-source-sha256.json", "rule (j): source_sha256 matching the real file's bytes")
+
+        # No `source_sha256` key at all (the retired `tree_sha` convention,
+        # or a producer kind that never carries this) is equally clean —
+        # rule (j) is entirely OPTIONAL, never required.
+        expect_clean(baseline(), "control-no-source-sha256.json", "rule (j): producer with no source_sha256 at all")
+
+        bad = baseline()
+        bad["producer"] = dict(bad["producer"])
+        bad["producer"]["source_sha256"] = {real_relpath: "0" * 64}
+        expect_hit(bad, "x.json", "does not match", "rule (j): wrong sha256 for a real, existing path")
+
+        bad = baseline()
+        bad["producer"] = dict(bad["producer"])
+        bad["producer"]["source_sha256"] = {"crates/fixture-crate/tests/does_not_exist.rs": real_hash}
+        expect_hit(bad, "x.json", "does not exist on disk at HEAD", "rule (j): source_sha256 names a nonexistent path")
+
+        bad = baseline()
+        bad["producer"] = dict(bad["producer"])
+        bad["producer"]["source_sha256"] = {real_relpath: "not-a-sha256"}
+        expect_hit(bad, "x.json", "must be a 64-lowercase-hex sha256", "rule (j): malformed sha256 value")
+
+        bad = baseline()
+        bad["producer"] = dict(bad["producer"])
+        bad["producer"]["source_sha256"] = {}
+        expect_hit(bad, "x.json", "must be a non-empty object", "rule (j): empty source_sha256 object")
 
         # rule (c) — cargo-test static verification ---------------------------
         bad = baseline()
@@ -2367,7 +2464,10 @@ def self_test() -> int:
         "closed-list rename-bypass rejection, and a v1 leg's unchanged no-op) all bite too; and a "
         "GENUINE `git clone --depth 1` fixture proves is_shallow_repository tells shallow from normal "
         "apart and run_gate raises the one explicit shallow-checkout ArtifactError instead of N false "
-        "per-file ancestry findings."
+        "per-file ancestry findings; and (j) producer.source_sha256 (OPTIONAL, matching a real file's own "
+        "bytes is clean, absent entirely is clean, a wrong hash / nonexistent path / malformed hash / "
+        "empty object are each caught by name) is re-hashed against THIS gate's own HEAD, never a "
+        "historical blob."
     )
     return 0
 

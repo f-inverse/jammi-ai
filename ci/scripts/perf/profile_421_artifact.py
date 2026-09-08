@@ -85,25 +85,61 @@ rounded number in the sentence from the unrounded evidence without trusting
 the sentence's own English. The CLIP launch-bound finding's own BF16-vs-F32
 wording is SIGN-DERIVED, never a hard-coded "cuts"/"drops": a blanket verb
 is used only when every tower's delta agrees on direction, else each tower
-gets its own sign-derived verb (`_direction_word`). Every finding is
-computed ONLY from legs whose `--merge-json` verdict is VALID (and, for a
-finding built off a CHAIN SHARE, whose `--attribution-json` row is also
-`decision_grade`) — a finding whose required leg(s) fail either gate is
-never built; it is instead named, with its leg(s) and the reason, in the
-sibling `suppressed_findings` list (`compute_findings`'s own
-`_merge_verdict_problems`/`_decision_grade_problems`).
+gets its own sign-derived clause (`_direction_clause`, with its own shape
+for an exact-zero delta). Every finding is computed ONLY from legs whose
+`--merge-json` verdict is VALID (and, for a finding built off a CHAIN
+SHARE, whose `--attribution-json` row is also `decision_grade`) — a finding
+whose required leg(s) fail either gate is never built; it is instead named,
+with its leg(s) and the reason, in the sibling `suppressed_findings` list
+(`compute_findings`'s own `_merge_verdict_problems`/
+`_decision_grade_problems`).
+
+Every QUALITATIVE word a finding's own prose can use ("front-end-bound",
+"dtype- and arm-invariant", "launch-bound", "only") is gated behind a
+NAMED, numeric rule (`FRONT_END_BOUND_SHARE_OF_WALL_MIN`,
+`ARM_INVARIANCE_REL_SPREAD_MAX`, `LAUNCH_BOUND_LAUNCHES_PER_STEP_MIN` +
+`LAUNCH_BOUND_RESIDUAL_SHARE_OF_WALL_MIN`, and the "only" pointwise
+magnitude comparison), evaluated against the SAME required legs and
+recorded — by name, threshold, and outcome — in that finding's own
+`evidence` block. When a rule does not hold on every leg it was evaluated
+against, the finding still builds (never suppressed for a wording reason
+alone) but drops the word for a neutral sentence stating the same numbers
+— a leg going from decisively front-end-bound to marginally so must change
+the SENTENCE, not just the number inside it, and a reader must be able to
+see the exact bar that either cleared or did not from `evidence` alone,
+never from re-deriving the English.
 
 ## Producer identity (regeneration provenance)
 
 The CLI (`main`, not the hermetic `build_report` core) stamps
-`producer.tree_sha` (`JAMMI_BUILD_SHA` if set, else `git rev-parse HEAD`),
-`producer.input_sha256` (the sha256 of the `--merge-json`/
+`producer.source_sha256` (the sha256 of every file in
+`SOURCE_FILES_FOR_NUMBERS` below, keyed by its repo-root-relative posix
+path), `producer.input_sha256` (the sha256 of the `--merge-json`/
 `--attribution-json`/`--identity` FILES as given), and
 `producer.invocation_argv` (this run's own argv) onto the artifact.
-Regenerating from the SAME three input files at the SAME tree reproduces a
-byte-identical artifact; regenerating at a DIFFERENT tree (a later commit,
-even one that only touches this module's wording) changes `tree_sha` (and,
-if the wording changed, the affected `findings[].text`) while every
+
+`source_sha256` replaces a git commit sha (the old `producer.tree_sha`,
+`JAMMI_BUILD_SHA` if set else `git rev-parse HEAD`). A commit sha is the
+wrong determinant here: this artifact cannot know, at render time, which
+future commit will contain it (an ordinary `git commit` of this very file
+changes `HEAD` out from under an already-rendered JSON with no code
+change at all), and nothing ever validated a dirty-tree render's `tree_sha`
+against anything — it was stamped and then never re-checked. The
+producer's own CONTENT identity is the right thing to check regeneration
+against instead: `check_cuda_run_artifacts.py` recomputes the sha256 of
+every path named in `source_sha256` at ITS OWN HEAD and refuses a mismatch
+BY NAME, so editing this module (or a file it reads a live constant from —
+`profile_421_attribute.py`'s validity-gate constants,
+`profile_421_legs.sh`'s media-corpus shell constants, the two corpus
+producers' own `_DEFAULT_INSTANCES_PER_FAMILY`, `test_profile_421_merge.py`'s
+own hermetic-suite size) and forgetting to regenerate the committed artifact
+is now a hard CI failure, never a silent staleness. Regenerating from the
+SAME three input files against the SAME producer source bytes reproduces a
+byte-identical artifact (proof by regeneration: the committed artifact's own
+`source_sha256` values are re-derived and diffed against a fresh render
+before every commit that touches a source file); regenerating after editing
+this module's wording (even prose-only) changes `source_sha256` (and, if a
+finding's wording changed, the affected `findings[].text`) while every
 measured NUMBER stays the same — the two kinds of change are always
 distinguishable from the diff alone.
 
@@ -118,10 +154,9 @@ import argparse
 import hashlib
 import json
 import math
-import os
 import re
-import subprocess
 import sys
+import unittest
 from pathlib import Path
 
 # `profile_421_attribute.py`'s own validity-gate constants — imported, never
@@ -130,12 +165,46 @@ from pathlib import Path
 # actually enforces (see `_identity_template_context` below).
 import profile_421_attribute as _attribute_mod
 
+# `test_profile_421_merge.py`'s own hermetic-suite SIZE — imported (never
+# executed: `unittest.defaultTestLoader.loadTestsFromModule` enumerates test
+# methods without ever calling `.run()`) so the identity sidecar's "the live
+# suite already carried N tests" prose quotes a live `unittest` discovery
+# count over the REAL committed test file, never a hand-typed number that
+# could silently drift as tests are added or removed (see
+# `compute_merge_suite_test_count` below). Its own bytes are therefore one of
+# this module's `SOURCE_FILES_FOR_NUMBERS` too.
+import test_profile_421_merge as _merge_test_mod
+
 SCHEMA_VERSION = 1
 
 PERF_DIR = Path(__file__).resolve().parent
+# `ci/scripts/perf/profile_421_artifact.py` -> repo root is three parents up
+# (`ci/scripts/perf` -> `ci/scripts` -> `ci` -> repo root).
+REPO_ROOT = PERF_DIR.parents[2]
 LEGS_SH = PERF_DIR / "profile_421_legs.sh"
 IMAGE_CORPUS_PY = PERF_DIR / "gen_fixed_shape_image_corpus.py"
 AUDIO_CORPUS_PY = PERF_DIR / "gen_fixed_length_audio_corpus.py"
+ATTRIBUTE_MODULE_PY = PERF_DIR / "profile_421_attribute.py"
+MERGE_TEST_PY = PERF_DIR / "test_profile_421_merge.py"
+
+# Every file whose BYTES can change a NUMBER (never just prose) this producer
+# emits: itself, the attribution module it imports for the validity-gate
+# constants `_identity_template_context` quotes, the three driver/producer
+# files `compute_media_corpus_pool` regexes live constants out of, and the
+# test module `compute_merge_suite_test_count` counts test cases from.
+# Deliberately NOT `profile_421_merge.py`: this module imports no constant
+# from it and reads no number off its own source (`--merge-json` is a
+# separate FILE input already covered by `producer.input_sha256`, not a
+# module import) — listing it here would assert a coupling this producer
+# does not actually have.
+SOURCE_FILES_FOR_NUMBERS: tuple[Path, ...] = (
+    Path(__file__).resolve(),
+    ATTRIBUTE_MODULE_PY,
+    LEGS_SH,
+    IMAGE_CORPUS_PY,
+    AUDIO_CORPUS_PY,
+    MERGE_TEST_PY,
+)
 
 
 class ArtifactBuildError(Exception):
@@ -202,32 +271,28 @@ def _sha256_file(path: Path, what: str) -> str:
     return hashlib.sha256(data).hexdigest()
 
 
-def _resolve_tree_sha() -> str:
-    """The commit this artifact JSON was RENDERED from (as opposed to
-    `git_sha` at the top level, which is the commit the profiled BUILD ran
-    at, witnessed off the legs' own `manifest.json`) — `JAMMI_BUILD_SHA` if
-    set (the same convention the pod build step itself uses), else a live
-    `git rev-parse HEAD` in this checkout. Refuses rather than guess: a
-    producer block that could silently omit this is exactly as unverifiable
-    as one that never recorded it."""
-    env_sha = os.environ.get("JAMMI_BUILD_SHA")
-    if env_sha:
-        return env_sha
-    try:
-        result = subprocess.run(
-            ["git", "rev-parse", "HEAD"],
-            cwd=PERF_DIR,
-            capture_output=True,
-            text=True,
-            timeout=30,
-            check=True,
-        )
-    except (OSError, subprocess.CalledProcessError) as exc:
-        raise ArtifactBuildError(f"could not resolve the rendered-from tree sha (git rev-parse HEAD): {exc}") from exc
-    sha = result.stdout.strip()
-    if not sha:
-        raise ArtifactBuildError("git rev-parse HEAD returned an empty sha")
-    return sha
+def _source_sha256() -> dict[str, str]:
+    """The sha256 of every file in `SOURCE_FILES_FOR_NUMBERS`, keyed by its
+    repo-root-relative posix path — this producer's own CONTENT identity,
+    replacing a git commit sha (the old `tree_sha`) as the thing a reader
+    checks regeneration against (see the module doc's "Producer identity"
+    section for why a commit sha was the wrong determinant). Refuses rather
+    than guess: a file this module depends on for a NUMBER that cannot be
+    read at all is exactly as unverifiable as a producer block that never
+    recorded its own identity."""
+    out: dict[str, str] = {}
+    for path in SOURCE_FILES_FOR_NUMBERS:
+        resolved = path.resolve()
+        try:
+            data = resolved.read_bytes()
+        except OSError as exc:
+            raise ArtifactBuildError(f"could not read producer source file {resolved} to hash it: {exc}") from exc
+        try:
+            rel = resolved.relative_to(REPO_ROOT).as_posix()
+        except ValueError as exc:
+            raise ArtifactBuildError(f"producer source file {resolved} is not under REPO_ROOT {REPO_ROOT}") from exc
+        out[rel] = hashlib.sha256(data).hexdigest()
+    return out
 
 
 # --------------------------------------------------------------------------- #
@@ -288,6 +353,17 @@ def compute_media_corpus_pool() -> dict[str, int]:
         "corpus_train_clips": (media_families - media_heldout_families) * image_instances,
         "corpus_rows_m": batch * steps_m,
     }
+
+
+def compute_merge_suite_test_count() -> int:
+    """`profile_421_merge.py`'s own hermetic suite's LIVE test count — the
+    identity sidecar's own "the live suite already carried N tests"
+    deviation quotes this, via `unittest`'s own discovery
+    (`TestLoader.loadTestsFromModule(...).countTestCases()`, which
+    ENUMERATES test methods without RUNNING any of them) against the REAL
+    committed `test_profile_421_merge.py`, never a hand-typed count that
+    could silently drift as tests are added or removed."""
+    return unittest.defaultTestLoader.loadTestsFromModule(_merge_test_mod).countTestCases()
 
 
 def compute_sqlite_raw_export_count(legs_dir: Path) -> int:
@@ -615,6 +691,61 @@ def _direction_word(delta_pct: float, *, decrease: str, increase: str) -> str:
     return "leaves unchanged"
 
 
+def _direction_clause(metric: str, delta_pct: float, *, decrease: str, increase: str) -> str:
+    """`_direction_word` wrapped into a full clause — the exact-zero arm gets
+    its OWN clause shape (`"leaves {metric} unchanged"`) rather than being
+    jammed into the `"{verb} {metric} by {pct}%"` template with a `by 0%`
+    tail that reads as a (redundant, slightly dishonest-sounding) magnitude
+    claim about a delta that is not a magnitude at all."""
+    word = _direction_word(delta_pct, decrease=decrease, increase=increase)
+    if word == "leaves unchanged":
+        return f"leaves {metric} unchanged"
+    return f"{word} {metric} by {abs(delta_pct):.0f}%"
+
+
+def _fmt_range(lo: float, hi: float, *, decimals: int = 0) -> str:
+    """Formats a `lo <= hi` pair as `"{lo}-{hi}"` at the given decimal
+    precision — UNLESS the two round to the identical string at that
+    precision, in which case the degenerate `"32-32"` collapses to the
+    single value `"32"` (equal after rounding is not a genuine range, and a
+    reader should never see a range whose two ends print identically)."""
+    lo_s = f"{lo:.{decimals}f}"
+    hi_s = f"{hi:.{decimals}f}"
+    if lo_s == hi_s:
+        return lo_s
+    return f"{lo_s}-{hi_s}"
+
+
+def _optional_leg_valid(merge_by_id: dict[str, dict], leg_id: str) -> bool:
+    """`True` iff `leg_id` is present in `--merge-json`'s own legs AND its
+    verdict is `VALID` — for OPTIONAL supporting evidence (the D-arm legs an
+    arm-invariance check reads) that a finding may still be built WITHOUT,
+    unlike `_merge_verdict_problems`'s REQUIRED legs (whose absence is a
+    hard refusal, never silently treated as "not applicable"). A run that
+    never measured the D-arm at all (or measured it but it came back
+    INVALID) simply does not get the arm-invariance CLAUSE — the finding's
+    other, required-leg-gated numbers are entirely unaffected."""
+    row = merge_by_id.get(leg_id)
+    return isinstance(row, dict) and row.get("verdict") == "VALID"
+
+
+# Rule thresholds for every QUALITATIVE word `compute_findings` can emit —
+# each is recorded (by name and value) in the finding's own `evidence` block
+# alongside the numbers it was evaluated against, so a downstream reader
+# never has to trust the English alone. When a rule does not hold, the
+# finding still builds (from the SAME required legs) but drops the
+# qualitative word for a neutral sentence stating the same numbers.
+FRONT_END_BOUND_SHARE_OF_WALL_MIN = 0.5  # front_share_of_wall >= this, on EVERY leg read
+ARM_INVARIANCE_REL_SPREAD_MAX = 0.05  # (max-min)/mean of front_s_per_step across every A/D leg read
+LAUNCH_BOUND_LAUNCHES_PER_STEP_MIN = 1000.0  # launches/step >= this, on EVERY leg read
+# residual_s_per_step / wall_s_per_step (the contract's own "launch/sync
+# residual = wall - front - busy", CONTRACT.md SS Method) >= this, on EVERY
+# leg read — "launch-bound" is licensed by the contract's OWN wall
+# decomposition, not an externally-assumed microsecond launch-overhead
+# figure this module has no way to independently know.
+LAUNCH_BOUND_RESIDUAL_SHARE_OF_WALL_MIN = 0.2
+
+
 def compute_findings(
     merge_report: dict, attribution_report: dict, legs_dir: Path
 ) -> tuple[list[dict], list[dict]]:
@@ -634,7 +765,16 @@ def compute_findings(
     def _suppress(finding_id: str, leg_ids: tuple[str, ...], problems: list[str]) -> None:
         suppressed.append({"id": finding_id, "legs": list(leg_ids), "reason": "; ".join(problems)})
 
-    # 1) HTSAT front-end share of wall (A1 f32, A2 bf16 decision legs).
+    # 1) HTSAT front-end share of wall (A1 f32, A2 bf16 decision legs) —
+    #    "is CPU front-end-bound" is a NAMED rule (FRONT_END_BOUND_SHARE_OF_
+    #    WALL_MIN, evaluated on every REQUIRED leg read), dropped for a
+    #    neutral sentence stating the same shares when it does not hold. The
+    #    "dtype- and arm-invariant" clause is a SECOND, independent rule
+    #    that additionally requires the D-arm legs (OPTIONAL — never a hard
+    #    refusal if absent/INVALID) and is phrased about SECONDS, not
+    #    shares — arm-invariance is a claim about the front end's absolute
+    #    cost not moving, which a share-of-wall ratio cannot show on its own
+    #    (wall itself moves across arms as kernels are disabled).
     htsat_legs = ("htsat-A1", "htsat-A2")
     problems = _merge_verdict_problems(merge_by_id, htsat_legs)
     if problems:
@@ -644,17 +784,66 @@ def compute_findings(
             leg_id: _per_step_share(merge_legs, leg_id, "front_share_of_wall") * 100.0 for leg_id in htsat_legs
         }
         lo, hi = min(htsat_shares.values()), max(htsat_shares.values())
-        findings.append(
-            {
-                "id": "htsat-front-end-bound",
-                "text": (
-                    f"The HTSAT training step is CPU front-end-bound: front-end share of wall is "
-                    f"{lo:.0f}-{hi:.0f}% across the F32/BF16 decision legs (audio decode/resample/STFT/mel "
-                    "dominating wall time), dtype- and arm-invariant."
-                ),
-                "evidence": {"front_share_of_wall_pct": htsat_shares},
+        front_end_bound = all(share >= FRONT_END_BOUND_SHARE_OF_WALL_MIN * 100.0 for share in htsat_shares.values())
+        share_range = _fmt_range(lo, hi)
+        if front_end_bound:
+            bound_clause = (
+                f"The HTSAT training step is CPU front-end-bound: front-end share of wall is {share_range}% "
+                f"across the F32/BF16 decision legs (rule: front_share_of_wall >= "
+                f"{FRONT_END_BOUND_SHARE_OF_WALL_MIN:.0%} on every leg read; audio decode/resample/STFT/mel "
+                "dominating wall time)."
+            )
+        else:
+            bound_clause = (
+                f"HTSAT's front-end share of wall is {share_range}% across the F32/BF16 decision legs (rule: "
+                f"front_share_of_wall >= {FRONT_END_BOUND_SHARE_OF_WALL_MIN:.0%} on every leg read was NOT met "
+                "on every leg, so 'front-end-bound' is not asserted; audio decode/resample/STFT/mel dominating "
+                "wall time)."
+            )
+
+        evidence: dict[str, object] = {
+            "front_share_of_wall_pct": htsat_shares,
+            "front_end_bound_rule": f"front_share_of_wall >= {FRONT_END_BOUND_SHARE_OF_WALL_MIN} on every leg read",
+            "front_end_bound": front_end_bound,
+        }
+
+        arm_leg_ids = ("htsat-A1", "htsat-A2", "htsat-D1", "htsat-D2")
+        invariance_clause = ""
+        if all(_optional_leg_valid(merge_by_id, leg_id) for leg_id in arm_leg_ids):
+            front_seconds = {
+                leg_id: _per_step_finite(merge_legs, leg_id, "front_s_per_step") for leg_id in arm_leg_ids
             }
-        )
+            smin, smax = min(front_seconds.values()), max(front_seconds.values())
+            smean = sum(front_seconds.values()) / len(front_seconds)
+            if smax == smin:
+                rel_spread = 0.0
+            elif smean > 0.0:
+                rel_spread = (smax - smin) / smean
+            else:
+                rel_spread = math.inf
+            arm_invariant = rel_spread <= ARM_INVARIANCE_REL_SPREAD_MAX
+            seconds_range = _fmt_range(smin, smax, decimals=3)
+            if arm_invariant:
+                invariance_clause = (
+                    f" Front-end time itself is {seconds_range} s/step across every F32/BF16 x A/D-arm leg "
+                    f"read (relative spread {rel_spread * 100.0:.1f}%, within the "
+                    f"{ARM_INVARIANCE_REL_SPREAD_MAX:.0%} arm-invariance rule), so this cost is dtype- and "
+                    "arm-invariant."
+                )
+            else:
+                invariance_clause = (
+                    f" Front-end time is {seconds_range} s/step across every F32/BF16 x A/D-arm leg read "
+                    f"(relative spread {rel_spread * 100.0:.1f}%, above the {ARM_INVARIANCE_REL_SPREAD_MAX:.0%} "
+                    "arm-invariance rule) — not treated as dtype-/arm-invariant here."
+                )
+            evidence["front_s_per_step"] = front_seconds
+            evidence["arm_invariance_rule"] = (
+                f"(max-min)/mean of front_s_per_step across every A/D leg read <= {ARM_INVARIANCE_REL_SPREAD_MAX}"
+            )
+            evidence["arm_invariance_relative_spread"] = rel_spread
+            evidence["arm_invariant"] = arm_invariant
+
+        findings.append({"id": "htsat-front-end-bound", "text": bound_clause + invariance_clause, "evidence": evidence})
 
     # 2) CLIP-vision front-end share of wall (A1 f32, A2 bf16 decision legs).
     vision_legs = ("clip-vision-A1", "clip-vision-A2")
@@ -670,7 +859,7 @@ def compute_findings(
             {
                 "id": "clip-vision-front-end-share",
                 "text": (
-                    f"CLIP-vision's image decode/preprocess front end is {lo:.0f}-{hi:.0f}% of wall on the "
+                    f"CLIP-vision's image decode/preprocess front end is {_fmt_range(lo, hi)}% of wall on the "
                     "F32/BF16 decision legs."
                 ),
                 "evidence": {"front_share_of_wall_pct": vision_shares},
@@ -712,11 +901,49 @@ def compute_findings(
                 raise ArtifactBuildError(f"{a1}: per_step.wall_s_per_step is 0 — cannot compute a BF16-vs-F32 wall delta")
             busy_deltas_pct[tower] = (busy_a2 - busy_a1) / busy_a1 * 100.0
             wall_deltas_pct[tower] = (wall_a2 - wall_a1) / wall_a1 * 100.0
-        launch_lo, launch_hi = min(launches.values()), max(launches.values())
-        launch_sentence = (
-            f"At batch 8 the CLIP training steps are launch-bound: {launch_lo:.0f}-{launch_hi:.0f} "
-            "launches/step across the four F32/BF16 A-arm CLIP legs (text and vision); "
+
+        # "are launch-bound" is a NAMED rule too: launches/step above a
+        # floor AND the contract's own launch/sync RESIDUAL a material share
+        # of wall, both true on every named leg — never a hard-coded verb
+        # regardless of what the numbers say.
+        residual_shares: dict[str, float] = {}
+        for leg_id in launch_legs:
+            residual_s = _per_step_finite(merge_legs, leg_id, "residual_s_per_step")
+            wall_s = _per_step_finite(merge_legs, leg_id, "wall_s_per_step")
+            if wall_s == 0.0:
+                raise ArtifactBuildError(f"{leg_id}: per_step.wall_s_per_step is 0 — cannot compute a residual share of wall")
+            residual_shares[leg_id] = residual_s / wall_s
+        launch_bound = all(
+            launches[leg_id] >= LAUNCH_BOUND_LAUNCHES_PER_STEP_MIN
+            and residual_shares[leg_id] >= LAUNCH_BOUND_RESIDUAL_SHARE_OF_WALL_MIN
+            for leg_id in launch_legs
         )
+        launch_lo, launch_hi = min(launches.values()), max(launches.values())
+        launch_range = _fmt_range(launch_lo, launch_hi)
+        launch_bound_rule = (
+            f"launches/step >= {LAUNCH_BOUND_LAUNCHES_PER_STEP_MIN:.0f} and launch/sync residual share of wall "
+            f"(residual_s_per_step / wall_s_per_step) >= {LAUNCH_BOUND_RESIDUAL_SHARE_OF_WALL_MIN:.0%}, both on "
+            "every named leg"
+        )
+        if launch_bound:
+            launch_sentence = (
+                f"At batch 8 the CLIP training steps are launch-bound: {launch_range} launches/step across the "
+                f"four F32/BF16 A-arm CLIP legs (text and vision) (rule: {launch_bound_rule}); "
+            )
+        else:
+            launch_sentence = (
+                f"At batch 8 the CLIP training steps issue {launch_range} launches/step across the four "
+                f"F32/BF16 A-arm CLIP legs (text and vision) (rule: {launch_bound_rule} was NOT true on every "
+                "leg, so 'launch-bound' is not asserted); "
+            )
+        evidence: dict[str, object] = {
+            "launches_per_step": launches,
+            "busy_delta_pct_bf16_vs_f32": busy_deltas_pct,
+            "wall_delta_pct_bf16_vs_f32": wall_deltas_pct,
+            "residual_share_of_wall": residual_shares,
+            "launch_bound_rule": launch_bound_rule,
+            "launch_bound": launch_bound,
+        }
         if all(v < 0.0 for v in busy_deltas_pct.values()) and all(v < 0.0 for v in wall_deltas_pct.values()):
             # Every tower's delta is negative (BF16 cheaper everywhere): a
             # single blanket "cuts"/"drops" verb is honest here, so the
@@ -725,45 +952,45 @@ def compute_findings(
             # `min`/`max` pick) rather than repeating the sign per tower —
             # a signed "-32...-41%" would double-negate (a cut that is
             # itself negative reads as a GROWTH, the opposite of what the
-            # number means).
+            # number means). `_fmt_range` collapses a degenerate equal-after-
+            # -rounding pair (e.g. "1-1%") to the single value "1%".
             busy_by_magnitude = sorted(busy_deltas_pct.values(), key=abs)
             wall_by_magnitude = sorted(wall_deltas_pct.values(), key=abs)
+            busy_range = _fmt_range(abs(busy_by_magnitude[0]), abs(busy_by_magnitude[-1]))
+            wall_range = _fmt_range(abs(wall_by_magnitude[0]), abs(wall_by_magnitude[-1]))
+            # "only" is itself a NAMED rule: it claims wall moved LESS than
+            # busy did, so it is licensed iff that magnitude comparison
+            # holds POINTWISE on every tower — never assumed just because
+            # both deltas happen to be negative.
+            wall_smaller_every_tower = all(
+                abs(wall_deltas_pct[tower]) < abs(busy_deltas_pct[tower]) for tower in tower_order
+            )
+            only_word = "only " if wall_smaller_every_tower else ""
             text = (
                 launch_sentence
                 + "switching to "
-                f"BF16 cuts GPU busy by {abs(busy_by_magnitude[0]):.0f}-{abs(busy_by_magnitude[-1]):.0f}% per "
-                f"tower while wall drops by only {abs(wall_by_magnitude[0]):.0f}-{abs(wall_by_magnitude[-1]):.0f}%."
+                f"BF16 cuts GPU busy by {busy_range}% per tower while wall drops by {only_word}{wall_range}%."
             )
+            evidence["wall_drop_smaller_than_busy_drop_every_tower"] = wall_smaller_every_tower
         else:
             # A mixed-sign pair across towers, or a non-negative delta: a
             # blanket "cuts" would be dishonest for whichever tower actually
-            # GREW, so each tower gets its own sign-derived verb instead of
-            # a single magnitude range.
+            # GREW, so each tower gets its own sign-derived clause instead
+            # of a single magnitude range (`_direction_clause` gives an
+            # exact-zero delta its own "leaves X unchanged" shape rather
+            # than a degenerate "by 0%").
             per_tower_sentences = []
             for tower in tower_order:
-                busy_word = _direction_word(busy_deltas_pct[tower], decrease="cuts", increase="grows")
-                wall_word = _direction_word(wall_deltas_pct[tower], decrease="cuts", increase="grows")
-                per_tower_sentences.append(
-                    f"{tower} BF16 {busy_word} GPU busy by {abs(busy_deltas_pct[tower]):.0f}% and {wall_word} "
-                    f"wall by {abs(wall_deltas_pct[tower]):.0f}% vs F32"
-                )
+                busy_clause = _direction_clause("GPU busy", busy_deltas_pct[tower], decrease="cuts", increase="grows")
+                wall_clause = _direction_clause("wall", wall_deltas_pct[tower], decrease="cuts", increase="grows")
+                per_tower_sentences.append(f"{tower} BF16 {busy_clause} and {wall_clause} vs F32")
             text = (
                 launch_sentence
                 + "BF16-vs-F32 per tower (not uniformly one direction, so no single verb applies): "
                 + "; ".join(per_tower_sentences)
                 + "."
             )
-        findings.append(
-            {
-                "id": "clip-launch-bound-batch8",
-                "text": text,
-                "evidence": {
-                    "launches_per_step": launches,
-                    "busy_delta_pct_bf16_vs_f32": busy_deltas_pct,
-                    "wall_delta_pct_bf16_vs_f32": wall_deltas_pct,
-                },
-            }
-        )
+        findings.append({"id": "clip-launch-bound-batch8", "text": text, "evidence": evidence})
 
     # 4) C-ATTN-HTSAT: measured, out-of-tier (declared out of scope for a
     #    port decision under this contract — a NUMBER, never a verdict).
@@ -859,8 +1086,46 @@ def compute_kernel_identity_split_count(legs_dir: Path, leg_id: str, coalesced_n
 # --------------------------------------------------------------------------- #
 def _identity_template_context(merge_report: dict, attribution_report: dict, legs_dir: Path) -> dict[str, object]:
     attribution_legs = attribution_report.get("legs", [])
+    merge_by_id = _index_by_leg_id(merge_report.get("legs", []))
+    attr_by_id = _index_by_leg_id(attribution_legs)
     pool = compute_media_corpus_pool()
+
+    # The identity sidecar's own "htsat-A2 is {verdict} at the merge level
+    # but {word} for attribution" deviation used to hand-type "VALID" /
+    # "NOT decision-grade" as plain prose, with nothing checking either
+    # word against the leg the SAME deviation then quotes a chain share
+    # off. Both words are now read live off that SAME leg: the deviation's
+    # own premise (htsat-A2 IS merge-VALID) is refused, never silently
+    # requoted, if it stops holding -- a future run where this leg goes
+    # merge-INVALID must not keep asserting "VALID at the merge level" in
+    # prose while the chain-share number underneath it changes meaning.
+    htsat_a2_merge_row = merge_by_id.get("htsat-A2")
+    if htsat_a2_merge_row is None:
+        raise ArtifactBuildError(
+            "htsat-A2 not present in --merge-json's own legs to build the identity template context from"
+        )
+    htsat_a2_merge_verdict = htsat_a2_merge_row.get("verdict")
+    if not isinstance(htsat_a2_merge_verdict, str) or not htsat_a2_merge_verdict:
+        raise ArtifactBuildError(f"htsat-A2: --merge-json verdict is not a non-empty string ({htsat_a2_merge_verdict!r})")
+    if htsat_a2_merge_verdict != "VALID":
+        raise ArtifactBuildError(
+            f"htsat-A2: --merge-json verdict is {htsat_a2_merge_verdict!r}, not VALID — the identity sidecar's "
+            "own 'VALID at the merge level but NOT decision-grade' deviation assumes this leg IS merge-VALID; "
+            "update that deviation (and this gate) before quoting its chain share under a different state"
+        )
+
+    htsat_a2_attr_row = attr_by_id.get("htsat-A2")
+    if htsat_a2_attr_row is None:
+        raise ArtifactBuildError(
+            "htsat-A2 not present in --attribution-json's own legs to build the identity template context from"
+        )
+    htsat_a2_decision_grade = htsat_a2_attr_row.get("decision_grade")
+    if not isinstance(htsat_a2_decision_grade, bool):
+        raise ArtifactBuildError(f"htsat-A2: --attribution-json decision_grade is not a bool ({htsat_a2_decision_grade!r})")
+
     return {
+        "htsat_a2_merge_verdict": htsat_a2_merge_verdict,
+        "htsat_a2_decision_grade_word": "decision-grade" if htsat_a2_decision_grade else "NOT decision-grade",
         "htsat_a2_unattributed_share_gpu_busy_pct": _chain_share(
             attribution_legs, "htsat-A2", _attribute_mod.CHAIN_UNATTRIBUTED, "share_gpu_busy"
         )
@@ -873,6 +1138,7 @@ def _identity_template_context(merge_report: dict, attribution_report: dict, leg
         "corpus_rows_m": pool["corpus_rows_m"],
         "kernel_identity_split_count": compute_kernel_identity_split_count(legs_dir, "clip-text-A2", "Kernel2"),
         "leg_count": len(_leg_dirs(legs_dir)),
+        "merge_suite_test_count": compute_merge_suite_test_count(),
     }
 
 
@@ -997,12 +1263,15 @@ def main(argv: list[str] | None = None) -> int:
         report = build_report(legs_dir, p2_dir, merge_report, attribution_report, identity)
         # Identity-completeness (never part of the hermetic `build_report`
         # core, which takes already-parsed dicts with no file identity of
-        # their own): the sha256 of every INPUT FILE and the tree this JSON
-        # was RENDERED from, so regeneration from the SAME inputs at the
-        # SAME tree is provably byte-identical, and a later regeneration at
-        # a different tree or from a hand-edited input is provably NOT.
+        # their own): the sha256 of every INPUT FILE and of this producer's
+        # OWN source (`SOURCE_FILES_FOR_NUMBERS`), so regeneration from the
+        # SAME inputs against the SAME producer bytes is provably
+        # byte-identical, and a later regeneration from a hand-edited input
+        # or an edited producer is provably NOT (`check_cuda_run_
+        # artifacts.py` recomputes `source_sha256` at its own HEAD and
+        # refuses a mismatch by name).
         report["producer"]["invocation_argv"] = ["profile_421_artifact.py", *argv]
-        report["producer"]["tree_sha"] = _resolve_tree_sha()
+        report["producer"]["source_sha256"] = _source_sha256()
         report["producer"]["input_sha256"] = {
             "merge_json": _sha256_file(merge_json_path, "--merge-json"),
             "attribution_json": _sha256_file(attribution_json_path, "--attribution-json"),

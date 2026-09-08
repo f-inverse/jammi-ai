@@ -141,15 +141,42 @@ class TestFa2AbShShape(unittest.TestCase):
             leg_text,
         )
 
-    def test_the_json_parser_exits_nonzero_on_a_parse_failure(self) -> None:
-        """The inline `python3 -c` report parser (now in `fa2_ab_leg.sh`)
-        must `sys.exit(1)` in its `except` branch -- otherwise a
-        malformed/missing report would print a `FAILED` line and still
-        exit 0, and `parse_rc` above would never see the failure."""
-        leg_text = _read_script(LEG_SCRIPT)
-        idx = leg_text.index("except Exception as e:")
-        except_body = leg_text[idx : idx + 200]
-        self.assertIn("sys.exit(1)", except_body)
+    def test_parse_only_arm_executed_for_real(self) -> None:
+        """A stub `finetune-step` that EXITS 0 but writes a malformed
+        report: `step_rc` is 0, so this exercises the parser's OWN
+        `except` branch through the REAL sourced `fa2_ab_run_leg` -- never
+        a grep for `sys.exit(1)` in the committed text, which would pass
+        even if that branch were unreachable or its exit code wrong. A
+        malformed/missing report must still move `overall_rc` to 1 via
+        `parse_rc`, exactly as a genuinely broken binary would."""
+        with tempfile.TemporaryDirectory() as tmp:
+            out_dir = os.path.join(tmp, "out")
+            os.makedirs(out_dir)
+            stub_path = os.path.join(tmp, "finetune-step-stub.sh")
+            with open(stub_path, "w", encoding="utf-8") as fh:
+                fh.write(
+                    "#!/usr/bin/env bash\n"
+                    "echo 'not a json report'\n"
+                    "exit 0\n"
+                )
+            os.chmod(stub_path, os.stat(stub_path).st_mode | stat.S_IEXEC)
+
+            harness = f"""
+set -uo pipefail
+. "{LEG_SCRIPT}"
+overall_rc=0
+fa2_ab_run_leg "{stub_path}" "{out_dir}" K flash 8 128 r1 dummyarg
+echo "STEP_RC=$step_rc PARSE_RC=$parse_rc OVERALL=$overall_rc"
+"""
+            result = subprocess.run(
+                ["bash", "-c", harness], capture_output=True, text=True, check=False
+            )
+            self.assertIn(
+                "STEP_RC=0 PARSE_RC=1 OVERALL=1",
+                result.stdout,
+                f"a malformed report from an otherwise-successful binary did not move "
+                f"parse_rc/overall_rc as expected:\nstdout={result.stdout}\nstderr={result.stderr}",
+            )
 
     def test_sourcing_the_real_leg_file_moves_overall_rc_on_a_failing_leg(self) -> None:
         """Not a re-implementation: this `source`s the ACTUAL
@@ -198,6 +225,62 @@ echo "FIRST=$first SECOND=$overall_rc"
                 result.stdout,
                 f"sourced fa2_ab_run_leg's overall_rc did not move as expected:\n"
                 f"stdout={result.stdout}\nstderr={result.stderr}",
+            )
+
+    def test_block_leg_forwards_env_and_flags_for_real(self) -> None:
+        """Not a grep of the `if [ "$leg" = block ]` body: this `source`s
+        the ACTUAL `fa2_ab_leg.sh` and calls `fa2_ab_run_leg` with
+        `leg=block`, against a stub `finetune-step` that records its OWN
+        environment and argv to a file before succeeding -- proving the
+        SHIPPED code really sets `JAMMI_KERNELS_DISABLE`/
+        `JAMMI_KERNELS_STRICT` in the stub's environment and really passes
+        `--expect-kernels-disabled` with the SAME key, `--batch`, and
+        `--seq` on its argv, not merely that the committed text contains
+        those substrings somewhere."""
+        with tempfile.TemporaryDirectory() as tmp:
+            out_dir = os.path.join(tmp, "out")
+            os.makedirs(out_dir)
+            record_path = os.path.join(tmp, "record.txt")
+            stub_path = os.path.join(tmp, "finetune-step-stub.sh")
+            with open(stub_path, "w", encoding="utf-8") as fh:
+                fh.write(
+                    "#!/usr/bin/env bash\n"
+                    "{\n"
+                    '  echo "ENV_DISABLE=${JAMMI_KERNELS_DISABLE-<unset>}"\n'
+                    '  echo "ENV_STRICT=${JAMMI_KERNELS_STRICT-<unset>}"\n'
+                    '  echo "ARGS=$*"\n'
+                    f'}} > "{record_path}"\n'
+                    "cat <<'JSON'\n"
+                    '{"tiers": {"finetune_step": {"s_per_step_p50": {"value": 0.2}}}}\n'
+                    "JSON\n"
+                    "exit 0\n"
+                )
+            os.chmod(stub_path, os.stat(stub_path).st_mode | stat.S_IEXEC)
+
+            harness = f"""
+set -uo pipefail
+. "{LEG_SCRIPT}"
+overall_rc=0
+fa2_ab_run_leg "{stub_path}" "{out_dir}" MY_DISABLE_KEY block 8 128 r1 --some-config-flag
+echo "OVERALL=$overall_rc"
+"""
+            result = subprocess.run(
+                ["bash", "-c", harness], capture_output=True, text=True, check=False
+            )
+            self.assertIn(
+                "OVERALL=0",
+                result.stdout,
+                f"a well-formed block-leg stub run must not refuse:\n"
+                f"stdout={result.stdout}\nstderr={result.stderr}",
+            )
+            with open(record_path, encoding="utf-8") as fh:
+                record = fh.read()
+            self.assertIn("ENV_DISABLE=MY_DISABLE_KEY", record)
+            self.assertIn("ENV_STRICT=1", record)
+            self.assertIn(
+                "ARGS=finetune-step --some-config-flag --batch 8 --seq 128 "
+                "--expect-kernels-disabled MY_DISABLE_KEY",
+                record,
             )
 
     def test_syntax_is_valid_bash(self) -> None:

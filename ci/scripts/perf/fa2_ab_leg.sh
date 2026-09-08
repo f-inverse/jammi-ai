@@ -14,7 +14,7 @@
 # producer-parity gate reads that assignment, and the `provenance`/
 # `build_sha` cross-check it pairs with, off fa2_ab.sh's own text -- both
 # stay there, never here). This file takes the binary as a PARAMETER and
-# assigns no `.../jammi-bench` path of its own.
+# assigns no jammi-bench BINARY path of its own.
 #
 # Must be `source`d, not executed in a subshell: `step_rc`, `parse_rc`, and
 # (only on a refusal) `overall_rc` are written into the CALLING shell, the

@@ -376,22 +376,134 @@ def _build_pool(
     return files
 
 
+class _DynamicGlobalAccessRefusal(ValueError):
+    """Raised when a function's source contains a `globals()[...]` or
+    `getattr(...)` call the AST walk cannot see through: both can read an
+    arbitrary module-level name at RUNTIME without that name ever appearing
+    as an `ast.Name` load in the source, so the closure walk has no way to
+    know it is a real dependency of the function being hashed. Silently
+    under-naming the closure is exactly the failure this fingerprint exists
+    to prevent, so this case fails CLOSED -- by name -- rather than
+    guessing."""
+
+
+class _ScopedNameCollector(ast.NodeVisitor):
+    """Collects the Load/Store names in ONE function's own scope, never
+    crossing into a NESTED scope's bindings: plain `ast.walk` visits every
+    descendant regardless of scope, so a name bound inside a nested
+    `def`/`lambda`/comprehension (e.g. a helper `_describe()` that happens
+    to assign a local also named after a module constant) would otherwise
+    be treated as binding the OUTER function's own reference to that name,
+    silently removing a real module-level dependency from the closure.
+
+    A nested scope's BINDINGS (its own parameters and assignment/`for`/
+    `with` targets) never count towards the caller's `bound` set; a nested
+    scope's LOADS still do -- a module-level name loaded anywhere inside a
+    function's scope tree is a real dependency of that function, wherever
+    in its body the load textually sits.
+    """
+
+    def __init__(self) -> None:
+        self.bound: set[str] = set()
+        self.loaded: set[str] = set()
+        self.dynamic_access_found = False
+
+    def visit_Name(self, node: ast.Name) -> None:
+        if isinstance(node.ctx, ast.Store):
+            self.bound.add(node.id)
+        elif isinstance(node.ctx, ast.Load):
+            self.loaded.add(node.id)
+
+    def visit_Call(self, node: ast.Call) -> None:
+        func = node.func
+        if isinstance(func, ast.Name) and func.id in ("globals", "getattr"):
+            self.dynamic_access_found = True
+        self.generic_visit(node)
+
+    def _collect_nested_loads_only(self, node: ast.AST) -> None:
+        inner = _ScopedNameCollector()
+        inner.generic_visit(node)
+        self.loaded |= inner.loaded
+        self.dynamic_access_found = self.dynamic_access_found or inner.dynamic_access_found
+
+    def visit_FunctionDef(self, node: ast.FunctionDef) -> None:
+        self._collect_nested_loads_only(node)
+
+    def visit_AsyncFunctionDef(self, node: ast.AsyncFunctionDef) -> None:
+        self._collect_nested_loads_only(node)
+
+    def visit_Lambda(self, node: ast.Lambda) -> None:
+        self._collect_nested_loads_only(node)
+
+    def visit_ListComp(self, node: ast.ListComp) -> None:
+        self._collect_nested_loads_only(node)
+
+    def visit_SetComp(self, node: ast.SetComp) -> None:
+        self._collect_nested_loads_only(node)
+
+    def visit_DictComp(self, node: ast.DictComp) -> None:
+        self._collect_nested_loads_only(node)
+
+    def visit_GeneratorExp(self, node: ast.GeneratorExp) -> None:
+        self._collect_nested_loads_only(node)
+
+
 def _referenced_global_names(fn) -> set[str]:
     """The module-level names `fn`'s own SOURCE TEXT loads, parsed fresh via
     `ast` on every call -- never a hand-maintained list that can go stale the
-    moment `fn`'s body changes. Excludes every name `fn` itself BINDS
-    (parameters, locals, loop/comprehension targets), so a name that merely
-    shadows a module global inside the function is not mistaken for a
-    reference to it."""
+    moment `fn`'s body changes.
+
+    Scoped per the function's OWN scope, not merely excluded by name: a
+    name is dropped from the result only when `fn`'s OWN scope binds it
+    (its parameters, or an assignment/`for`/`with` target directly in its
+    body) -- a same-named binding inside a NESTED `def`/`lambda`/
+    comprehension does not shadow `fn`'s own reference to a module global,
+    and a load anywhere in `fn`'s scope tree (nested scopes included) still
+    counts as a reference (see [`_ScopedNameCollector`]).
+
+    Refuses (via [`_DynamicGlobalAccessRefusal`]) when `fn`'s source calls
+    `globals()` or `getattr(...)` anywhere: both can reach an arbitrary
+    module-level name at runtime without it ever appearing as an `ast.Name`
+    load, which this walk has no way to verify -- fail closed rather than
+    silently under-naming the closure.
+    """
     fn_def = ast.parse(textwrap.dedent(inspect.getsource(fn))).body[0]
-    bound = {n.arg for n in ast.walk(fn_def) if isinstance(n, ast.arg)}
-    bound |= {
-        n.id for n in ast.walk(fn_def) if isinstance(n, ast.Name) and isinstance(n.ctx, ast.Store)
-    }
-    loaded = {
-        n.id for n in ast.walk(fn_def) if isinstance(n, ast.Name) and isinstance(n.ctx, ast.Load)
-    }
-    return loaded - bound
+    collector = _ScopedNameCollector()
+    args = fn_def.args
+    own_params = {a.arg for a in (*args.posonlyargs, *args.args, *args.kwonlyargs)}
+    if args.vararg is not None:
+        own_params.add(args.vararg.arg)
+    if args.kwarg is not None:
+        own_params.add(args.kwarg.arg)
+    collector.bound |= own_params
+    for stmt in fn_def.body:
+        collector.visit(stmt)
+    if collector.dynamic_access_found:
+        raise _DynamicGlobalAccessRefusal(
+            f"_referenced_global_names: {fn.__name__!r} calls globals()/getattr(...) -- a "
+            "dynamic global access this AST walk cannot see through, so the pool-construction "
+            "closure cannot be trusted to be complete for this function. Rewrite it to reference "
+            "module-level names directly, or extend the closure walk to model this access "
+            "explicitly."
+        )
+    return collector.loaded - collector.bound
+
+
+def _is_repr_stable_constant(value: object) -> bool:
+    """True for a value whose `repr()` is a pure function of its DATA, never
+    of the running process: ints, strs, bytes, floats, and bools qualify
+    outright; tuples and frozensets qualify when every element does
+    (recursively), so a tuple of ints is safe but a tuple containing a
+    class instance is not. Every other type -- a foreign callable, a class
+    instance, a list/dict/set, anything mutable -- falls through to
+    Python's default `repr()`, which embeds the object's memory address and
+    therefore moves on every interpreter invocation whether or not the
+    underlying code changed."""
+    if isinstance(value, (int, str, bytes, float, bool)):
+        return True
+    if isinstance(value, (tuple, frozenset)):
+        return all(_is_repr_stable_constant(v) for v in value)
+    return False
 
 
 def _pool_construction_closure() -> tuple[list[str], list[str]]:
@@ -402,13 +514,29 @@ def _pool_construction_closure() -> tuple[list[str], list[str]]:
     rebuilt fresh by the code itself on every call so a name can never fall
     out of it by someone forgetting to add it.
 
-    A referenced name that resolves (via `globals()`) to a module-level
-    FUNCTION is recursed into; one that resolves to an imported MODULE or a
-    class is skipped (neither is "this module's construction code", and a
-    module's own `repr()` embeds its filesystem path, which would make the
-    fingerprint move across machines for no code reason); anything else --
-    an int, a str, a tuple, a bytes literal -- is a CONSTANT, hashed by
-    value. Returns `(function_names, constant_names)`, both sorted.
+    Every referenced name is classified STRICTLY into exactly one of four
+    buckets -- collapsing the last two into one (a plain
+    function-or-module-or-class-else split) would hash a foreign callable
+    by `repr()`, i.e. by memory address: a per-process key that never moves
+    when the callable's real SOURCE changes:
+
+    1. a module-LOCAL function (`__globals__ is` this module's `globals()`)
+       -- recursed into, its source hashed;
+    2. an imported MODULE or a class -- skipped (disclosed: neither is
+       "this module's construction code", and a module's own `repr()`
+       embeds its filesystem path, which would move the fingerprint across
+       machines for no code reason);
+    3. an int/str/bytes/float/bool, or a tuple/frozenset built only from
+       such (see [`_is_repr_stable_constant`]) -- a CONSTANT, hashed by
+       `repr()`;
+    4. anything else -- a foreign callable (e.g. `from x import fn`, whose
+       `__globals__` belongs to `x`, not this module), a class instance, a
+       mutable container -- REFUSED by name: this fingerprint has no way to
+       represent it that survives a process restart, so pretending it does
+       (by falling back to a value-independent `repr()`) would be worse
+       than refusing.
+
+    Returns `(function_names, constant_names)`, both sorted.
     """
     g = globals()
     seen_functions: set[str] = set()
@@ -428,8 +556,18 @@ def _pool_construction_closure() -> tuple[list[str], list[str]]:
                     worklist.append(ref)
             elif isinstance(value, types.ModuleType) or inspect.isclass(value):
                 continue
-            else:
+            elif _is_repr_stable_constant(value):
                 constant_names.add(ref)
+            else:
+                raise ValueError(
+                    f"_pool_construction_closure: {name!r} references {ref!r}, a "
+                    f"{type(value).__name__} this fingerprint cannot represent -- it is neither "
+                    "a module-local function (recursed into), a module/class (skipped), nor a "
+                    "repr-stable constant (int/str/bytes/float/bool, or a tuple/frozenset of "
+                    "such). Hashing it by its default repr() would key on a memory address, not "
+                    "on its value or source -- refusing by name instead of silently mis-keying "
+                    "the pool cache."
+                )
     return sorted(seen_functions), sorted(constant_names)
 
 

@@ -17,8 +17,10 @@ Run: `python3 -m pytest ci/scripts/perf/test_gen_fixed_length_audio_corpus.py`
 
 from __future__ import annotations
 
+import importlib.util
 import json
 import os
+import shutil
 import sys
 import tempfile
 import unittest
@@ -44,6 +46,32 @@ def _mean_abs_diff(a, b) -> float:
     if len(a) != len(b):
         raise AssertionError(f"length mismatch: {len(a)} vs {len(b)}")
     return sum(abs(x - y) for x, y in zip(a, b, strict=True)) / len(a)
+
+
+def _load_variant_module(replacements: list[tuple[str, str]], tag: str, add_cleanup) -> object:
+    """Import a temp copy of `gen_fixed_length_audio_corpus.py` with each
+    `(old, new)` in `replacements` applied as a literal one-occurrence
+    source substitution -- REAL SOURCE, never a monkeypatch of a live
+    object. A monkeypatch replaces the OBJECT `globals()` finds; it does
+    not move `inspect.getsource`, so it cannot distinguish "the source
+    moved" from "a different object with the same source is now bound to
+    this name". `add_cleanup` is normally a `TestCase.addCleanup` bound
+    method, so the temp directory is removed once the calling test
+    finishes."""
+    src = Path(gfa.__file__).read_text(encoding="utf-8")
+    for old, new in replacements:
+        occurrences = src.count(old)
+        if occurrences != 1:
+            raise AssertionError(f"expected exactly one occurrence of {old!r}, found {occurrences}")
+        src = src.replace(old, new, 1)
+    tmp_dir = tempfile.mkdtemp(prefix=f"gfa_variant_{tag}_")
+    add_cleanup(shutil.rmtree, tmp_dir, ignore_errors=True)
+    mod_path = Path(tmp_dir) / f"gfa_variant_{tag}.py"
+    mod_path.write_text(src, encoding="utf-8")
+    spec = importlib.util.spec_from_file_location(mod_path.stem, mod_path)
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
 
 
 class LengthTests(unittest.TestCase):
@@ -410,59 +438,20 @@ class PoolCacheTests(unittest.TestCase):
             after = set(Path(tmp).iterdir())
             self.assertEqual(after - before, {Path(tmp) / "out"})
 
-    def test_monkeypatching_a_construction_function_moves_the_cache_key(self):
-        """The cache key must depend on the ACTUAL
-        construction code, not a hand-bumped version string that a real edit
-        can forget to bump. Patching `_instance_samples` (one of
-        `_pool_construction_closure`'s own reachable functions) to a
-        DIFFERENT implementation must move `_pool_cache_key`'s output even
-        though every numeric argument stays the same."""
-        # families, instances_per_family, frames, sample_rate, jitter, seed
-        args = (4, 3, 800, 16000, 200, 1)
-        before = gfa._pool_cache_key(*args)
-        original = gfa._instance_samples
-
-        def _different_instance_samples(family, instance, frames, sample_rate, rng, jitter):
-            return original(family, instance, frames, sample_rate, rng, jitter)
-
-        gfa._instance_samples = _different_instance_samples
-        try:
-            after = gfa._pool_cache_key(*args)
-        finally:
-            gfa._instance_samples = original
-        self.assertNotEqual(before, after, "monkeypatched construction code did not move the key")
-        self.assertEqual(before, gfa._pool_cache_key(*args))
-
     def test_unchanged_construction_code_hits_the_same_cache_key(self):
-        """The non-vacuity control on the test above: calling the key
-        function twice with nothing patched must be IDENTICAL."""
+        """Calling the key function twice with nothing patched must be
+        IDENTICAL -- proves the fingerprint is deterministic given
+        unchanged code, not merely "different every time a function object
+        is looked up"."""
         args = (4, 3, 800, 16000, 200, 1)
         self.assertEqual(gfa._pool_cache_key(*args), gfa._pool_cache_key(*args))
 
-    def test_monkeypatching_an_unreachable_function_never_moves_the_key(self):
-        """The negative control: patching a function `_build_pool`'s closure
-        genuinely never reaches must NOT move the cache key -- `read_wav`
-        decodes bytes this producer already wrote and plays no part in
-        constructing them, so it is a non-vacuous control (unlike
-        `_clip_name`, which the closure DOES reach: see
-        `PoolConstructionClosureTests`)."""
-        args = (4, 3, 800, 16000, 200, 1)
-        before = gfa._pool_cache_key(*args)
-        original = gfa.read_wav
-        gfa.read_wav = lambda data: (0, 0, 0, None)
-        try:
-            after = gfa._pool_cache_key(*args)
-        finally:
-            gfa.read_wav = original
-        self.assertEqual(before, after)
-
 
 class PoolConstructionClosureTests(unittest.TestCase):
-    """`_pool_construction_closure` (round-2 audit finding B2): the
-    fingerprint's function/constant set must be the ACTUAL transitive
-    closure `_build_pool` reaches, derived by an AST walk at runtime, never
-    a hand-maintained tuple that can under-name the very call graph it
-    claims to cover."""
+    """`_pool_construction_closure`: the fingerprint's function/constant set
+    must be the ACTUAL transitive closure `_build_pool` reaches, derived by
+    an AST walk at runtime, never a hand-maintained tuple that can
+    under-name the very call graph it claims to cover."""
 
     _EXPECTED_FUNCTIONS = {
         "_build_pool",
@@ -479,35 +468,296 @@ class PoolConstructionClosureTests(unittest.TestCase):
         self.assertEqual(set(functions), self._EXPECTED_FUNCTIONS)
         self.assertEqual(set(constants), self._EXPECTED_CONSTANTS)
 
-    def test_monkeypatching_every_reachable_function_moves_the_cache_key(self):
-        """Every one of the six -- `_build_pool` itself (RNG seeding, draw
-        order, dict keys) and `_clip_name` included, both of which a
-        hand-maintained tuple had previously left out -- must move the key
-        when replaced."""
-        args = (4, 3, 800, 16000, 200, 1)
-        baseline = gfa._pool_cache_key(*args)
-        for name in sorted(self._EXPECTED_FUNCTIONS):
-            original = getattr(gfa, name)
-            setattr(gfa, name, lambda *a, __orig=original, **kw: __orig(*a, **kw))
-            try:
-                patched = gfa._pool_cache_key(*args)
-            finally:
-                setattr(gfa, name, original)
-            self.assertNotEqual(baseline, patched, f"patching {name} did not move the cache key")
-        self.assertEqual(baseline, gfa._pool_cache_key(*args))
+    def test_a_module_reference_is_skipped_not_raised(self):
+        """`math` and `random` are referenced by real closure members
+        (`_family_fundamental_hz`/`_instance_samples`, `_build_pool`) but
+        must not land in either bucket -- the module-skip arm, not merely
+        their absence from the pinned sets above."""
+        functions, constants = gfa._pool_construction_closure()
+        self.assertNotIn("math", functions)
+        self.assertNotIn("math", constants)
+        self.assertNotIn("random", functions)
+        self.assertNotIn("random", constants)
 
-    def test_monkeypatching_every_reachable_constant_moves_the_cache_key(self):
-        args = (4, 3, 800, 16000, 200, 1)
-        baseline = gfa._pool_cache_key(*args)
-        for name in sorted(self._EXPECTED_CONSTANTS):
-            original = getattr(gfa, name)
-            setattr(gfa, name, (original, "patched"))
-            try:
-                patched = gfa._pool_cache_key(*args)
-            finally:
-                setattr(gfa, name, original)
-            self.assertNotEqual(baseline, patched, f"patching {name} did not move the cache key")
-        self.assertEqual(baseline, gfa._pool_cache_key(*args))
+
+class ScopedReferenceCollectionTests(unittest.TestCase):
+    """`_referenced_global_names` must scope BINDINGS to the function's OWN
+    scope -- a name bound only inside a nested `def`/`lambda`/comprehension
+    must never suppress the enclosing function's own reference to a
+    same-named module global -- while still counting a LOAD anywhere in a
+    nested scope as a real reference, and must refuse outright on a
+    `globals()`/`getattr(...)` call it cannot see through."""
+
+    def test_a_nested_def_binding_does_not_shadow_the_outer_reference(self):
+        def outer():
+            def _describe():
+                _PEAK = "inner"  # noqa: F841 -- binds ONLY _describe's own scope
+                return _PEAK
+
+            return _PEAK + _describe()  # noqa: F821 -- parsed, never called
+
+        refs = gfa._referenced_global_names(outer)
+        self.assertIn(
+            "_PEAK",
+            refs,
+            "a nested def's own local binding must not remove the outer function's real "
+            "reference to a same-named module global",
+        )
+
+    def test_a_load_inside_a_nested_lambda_still_counts_as_a_reference(self):
+        def outer():
+            f = lambda: _HARMONICS  # noqa: F821 -- parsed, never called
+            return f
+
+        refs = gfa._referenced_global_names(outer)
+        self.assertIn("_HARMONICS", refs)
+
+    def test_a_load_inside_a_nested_comprehension_still_counts_as_a_reference(self):
+        def outer():
+            return [_CHANNELS for _ in range(1)]  # noqa: F821 -- parsed, never called
+
+        refs = gfa._referenced_global_names(outer)
+        self.assertIn("_CHANNELS", refs)
+
+    def test_a_comprehension_loop_target_does_not_leak_into_the_outer_bound_set(self):
+        def outer():
+            _PEAK = [_PEAK for _PEAK in range(1)]  # noqa: F821,F841
+            return _PEAK
+
+        # `_PEAK` IS bound directly in `outer`'s own scope here (the
+        # assignment target, not the comprehension's loop variable), so it
+        # is correctly excluded -- the non-vacuous control on the test
+        # above: this producer's OWN scope binding still shadows as
+        # expected.
+        refs = gfa._referenced_global_names(outer)
+        self.assertNotIn("_PEAK", refs)
+
+    def test_globals_subscript_access_is_refused(self):
+        def outer():
+            return globals()["_PEAK"]
+
+        with self.assertRaises(gfa._DynamicGlobalAccessRefusal):
+            gfa._referenced_global_names(outer)
+
+    def test_getattr_dynamic_access_is_refused(self):
+        def outer():
+            return getattr(gfa, "_PEAK")
+
+        with self.assertRaises(gfa._DynamicGlobalAccessRefusal):
+            gfa._referenced_global_names(outer)
+
+
+class ReprStableConstantClassificationTests(unittest.TestCase):
+    """`_is_repr_stable_constant`: the exact boundary between "safe to hash
+    by `repr()`" and "must be refused" that
+    [`gfa._pool_construction_closure`] relies on."""
+
+    def test_scalars_are_repr_stable(self):
+        for value in (1, "s", b"b", 1.5, True, False):
+            self.assertTrue(gfa._is_repr_stable_constant(value), repr(value))
+
+    def test_tuple_and_frozenset_of_safe_scalars_are_repr_stable(self):
+        self.assertTrue(gfa._is_repr_stable_constant((1, "s", b"b")))
+        self.assertTrue(gfa._is_repr_stable_constant(frozenset({1, 2, 3})))
+
+    def test_a_tuple_containing_an_unsafe_element_is_not_repr_stable(self):
+        class _Thing:
+            pass
+
+        self.assertFalse(gfa._is_repr_stable_constant((1, _Thing())))
+
+    def test_a_foreign_function_a_class_instance_and_a_mutable_container_are_not_repr_stable(self):
+        class _Thing:
+            pass
+
+        self.assertFalse(gfa._is_repr_stable_constant(_Thing()))
+        self.assertFalse(gfa._is_repr_stable_constant([1, 2]))
+        self.assertFalse(gfa._is_repr_stable_constant({1: 2}))
+        self.assertFalse(gfa._is_repr_stable_constant(gfa.encode_wav))
+
+
+class ForeignAndDynamicAccessRefusalTests(unittest.TestCase):
+    """`_pool_construction_closure` must REFUSE -- never silently mis-key --
+    when a real closure member references something this fingerprint
+    cannot represent. Exercised on a REAL edited copy of the producer
+    module (never a monkeypatch): a monkeypatched replacement is ITSELF a
+    foreign callable relative to the module's own `globals()`, so a
+    monkeypatch-based proof of this refusal would only show the refusal
+    fires on an ordinary test fixture, not on the case it exists for."""
+
+    def test_a_from_import_helper_referenced_by_a_closure_member_is_refused(self):
+        variant = _load_variant_module(
+            [
+                (
+                    "from pathlib import Path\n",
+                    "from pathlib import Path\nfrom os.path import basename as _foreign_helper\n",
+                ),
+                (
+                    '    return f"clip_f{family:02d}_i{instance:03d}.wav"',
+                    '    return _foreign_helper(f"clip_f{family:02d}_i{instance:03d}.wav")',
+                ),
+            ],
+            "foreign_import",
+            self.addCleanup,
+        )
+        with self.assertRaises(ValueError):
+            variant._pool_construction_closure()
+
+    def test_globals_subscript_access_inside_a_closure_member_is_refused(self):
+        variant = _load_variant_module(
+            [
+                (
+                    '    return f"clip_f{family:02d}_i{instance:03d}.wav"',
+                    '    _ = globals()["_PEAK"]\n'
+                    '    return f"clip_f{family:02d}_i{instance:03d}.wav"',
+                )
+            ],
+            "globals_access",
+            self.addCleanup,
+        )
+        # `variant` is a SEPARATE module object with its own
+        # `_DynamicGlobalAccessRefusal` class, so the raised instance is
+        # not an instance of `gfa._DynamicGlobalAccessRefusal` -- assert on
+        # the shared builtin base class instead.
+        with self.assertRaises(ValueError):
+            variant._pool_construction_closure()
+
+    def test_getattr_dynamic_access_inside_a_closure_member_is_refused(self):
+        variant = _load_variant_module(
+            [
+                (
+                    '    return f"clip_f{family:02d}_i{instance:03d}.wav"',
+                    '    _ = getattr(sys.modules[__name__], "_PEAK")\n'
+                    '    return f"clip_f{family:02d}_i{instance:03d}.wav"',
+                )
+            ],
+            "getattr_access",
+            self.addCleanup,
+        )
+        with self.assertRaises(ValueError):
+            variant._pool_construction_closure()
+
+
+class RealSourceEditMovesTheKeyTests(unittest.TestCase):
+    """`_pool_cache_key` must track the pool-construction code's ACTUAL
+    SOURCE, not the identity of whatever object a name happens to be bound
+    to at test time. A `unittest.mock`/monkeypatch replaces the OBJECT
+    `globals()` looks up; `inspect.getsource` on the replacement then reads
+    the REPLACEMENT's own source, so a test-module lambda substituted in as
+    "a different implementation" is a genuinely different function living
+    in a DIFFERENT module -- `_pool_construction_closure`'s
+    `__globals__ is g` check correctly refuses to treat it as this module's
+    own code (see `ForeignAndDynamicAccessRefusalTests`), so a
+    monkeypatch-based proof cannot observe the property this fingerprint
+    exists to prove.
+
+    These tests instead take the PRODUCER'S OWN SOURCE FILE, apply exactly
+    one textual edit to a single line inside a named function or constant
+    (each substring asserted unique in the file before the edit), import
+    the edited copy under a FRESH module name, and compare its
+    `_pool_cache_key` output against the unedited module's for identical
+    arguments -- a real code edit, not an object swap. The hand-pinned
+    `_EXPECTED_FUNCTIONS`/`_EXPECTED_CONSTANTS` sets in
+    `PoolConstructionClosureTests` remain a second, independent oracle on
+    the same closure."""
+
+    _ARGS = (4, 3, 800, 16000, 200, 1)  # families, instances_per_family, frames, sample_rate, jitter, seed
+
+    def setUp(self) -> None:
+        self.baseline = gfa._pool_cache_key(*self._ARGS)
+
+    def _key_after(self, old: str, new: str, tag: str) -> str:
+        variant = _load_variant_module([(old, new)], tag, self.addCleanup)
+        return variant._pool_cache_key(*self._ARGS)
+
+    def test_editing_build_pool_moves_the_key(self):
+        key = self._key_after(
+            "    rng = random.Random(seed)",
+            "    rng = random.Random(seed)  # source-edit-proof",
+            "build_pool",
+        )
+        self.assertNotEqual(self.baseline, key)
+
+    def test_editing_family_fundamental_hz_moves_the_key(self):
+        key = self._key_after(
+            "    nyquist = sample_rate / 2.0",
+            "    nyquist = sample_rate / 2.0  # source-edit-proof",
+            "family_fundamental_hz",
+        )
+        self.assertNotEqual(self.baseline, key)
+
+    def test_editing_family_harmonic_gains_moves_the_key(self):
+        key = self._key_after(
+            "    raw = [1.0 / (1.0 + ((h + family) % _HARMONICS)) for h in range(_HARMONICS)]",
+            "    raw = [1.0 / (1.0 + ((h + family) % _HARMONICS)) for h in range(_HARMONICS)]"
+            "  # source-edit-proof",
+            "family_harmonic_gains",
+        )
+        self.assertNotEqual(self.baseline, key)
+
+    def test_editing_instance_samples_moves_the_key(self):
+        key = self._key_after(
+            '    out = array.array("h", bytes(_SAMPLE_WIDTH_BYTES * frames))',
+            '    out = array.array("h", bytes(_SAMPLE_WIDTH_BYTES * frames))  # source-edit-proof',
+            "instance_samples",
+        )
+        self.assertNotEqual(self.baseline, key)
+
+    def test_editing_clip_name_moves_the_key(self):
+        key = self._key_after(
+            '    return f"clip_f{family:02d}_i{instance:03d}.wav"',
+            '    return f"clip_f{family:02d}_i{instance:03d}.wav"  # source-edit-proof',
+            "clip_name",
+        )
+        self.assertNotEqual(self.baseline, key)
+
+    def test_editing_encode_wav_moves_the_key(self):
+        key = self._key_after(
+            "    buf = io.BytesIO()",
+            "    buf = io.BytesIO()  # source-edit-proof",
+            "encode_wav",
+        )
+        self.assertNotEqual(self.baseline, key)
+
+    def test_editing_peak_moves_the_key(self):
+        key = self._key_after("_PEAK = 12000", "_PEAK = 12001", "peak")
+        self.assertNotEqual(self.baseline, key)
+
+    def test_editing_phase_divisor_moves_the_key(self):
+        key = self._key_after("_PHASE_DIVISOR = 256.0", "_PHASE_DIVISOR = 257.0", "phase_divisor")
+        self.assertNotEqual(self.baseline, key)
+
+    def test_editing_harmonics_moves_the_key(self):
+        key = self._key_after("_HARMONICS = 4", "_HARMONICS = 5", "harmonics")
+        self.assertNotEqual(self.baseline, key)
+
+    def test_editing_sample_width_bytes_moves_the_key(self):
+        key = self._key_after("_SAMPLE_WIDTH_BYTES = 2", "_SAMPLE_WIDTH_BYTES = 3", "sample_width")
+        self.assertNotEqual(self.baseline, key)
+
+    def test_editing_channels_moves_the_key(self):
+        key = self._key_after("_CHANNELS = 1", "_CHANNELS = 2", "channels")
+        self.assertNotEqual(self.baseline, key)
+
+    def test_editing_a_non_member_function_leaves_the_key_unchanged(self):
+        """`read_wav` decodes bytes this producer already wrote and plays
+        no part in constructing them -- editing it must NOT move the key
+        (the non-vacuous negative control: unlike `_clip_name`, which the
+        closure DOES reach -- see the tests above)."""
+        key = self._key_after(
+            '    with wave.open(io.BytesIO(data), "rb") as w:',
+            '    with wave.open(io.BytesIO(data), "rb") as w:  # source-edit-proof',
+            "read_wav",
+        )
+        self.assertEqual(self.baseline, key)
+
+    def test_editing_the_module_docstring_leaves_the_key_unchanged(self):
+        key = self._key_after(
+            "LENGTH GUARANTEE (issue #421 PR B's pre-registered training-step profile):",
+            "LENGTH GUARANTEE EDITED (issue #421 PR B's pre-registered training-step profile):",
+            "docstring",
+        )
+        self.assertEqual(self.baseline, key)
 
 
 class FractionalSecondsTests(unittest.TestCase):

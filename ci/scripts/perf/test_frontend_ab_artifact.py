@@ -232,6 +232,12 @@ STALE_ARTIFACT_RECORD_MESSAGE = "artifact record stale: regenerate as the final 
 # github.event.pull_request.head.sha || 'push' }}` -- see `resolve_unit_
 # head_sha` below for the full normalisation contract.
 _UNIT_HEAD_ENV_VAR = "JAMMI_CI_UNIT_HEAD_SHA"
+# `ci.yml`'s matrix entry also exports `JAMMI_CI_UNIT_BASE_SHA: ${{
+# github.event.pull_request.base.sha || '' }}` -- the PR's own base -- so
+# arm (b) can tell a PR that DELIVERS the artifact (its commit lies in the
+# PR's own range) from one whose base already carries it (see
+# `resolve_unit_base_sha` / `assert_artifact_commit_is_unit_head`).
+_UNIT_BASE_ENV_VAR = "JAMMI_CI_UNIT_BASE_SHA"
 _PUSH_SENTINEL = "push"
 # GitHub Actions' own built-in env var, present on every job with no extra
 # wiring -- `resolve_unit_head_sha` cross-checks it against `_PUSH_SENTINEL`
@@ -458,7 +464,50 @@ def resolve_unit_head_sha(
     return proc.stdout.strip()
 
 
-def assert_artifact_commit_is_unit_head(artifact_rel_path: str, repo_root: Path, unit_head_sha: str | None) -> None:
+def resolve_unit_base_sha(
+    raw_value: str | None, repo_root: Path, *, ci_mode: bool, event_name: str | None = None
+) -> str | None:
+    """Normalises the raw `JAMMI_CI_UNIT_BASE_SHA` env var (`ci.yml` exports
+    `${{ github.event.pull_request.base.sha || '' }}`) into a full commit
+    sha or `None`, under the same zero-execution-is-RED doctrine as
+    `resolve_unit_head_sha`: on a pull-request checkout under CI an empty
+    value can only be a wiring break and is refused by name; on a push
+    checkout (or a bare local run) `None` is the honest answer; anything
+    else must resolve via `git rev-parse --verify`, and a value that does
+    not is refused by name rather than read as staleness."""
+    if not raw_value:
+        if ci_mode and event_name in _PR_EVENT_NAMES:
+            raise AssertionError(
+                f"{_UNIT_BASE_ENV_VAR} is empty/unset on a {event_name!r} checkout -- ci.yml's own matrix entry "
+                "exports `${{ github.event.pull_request.base.sha || '' }}`, so an empty value here means that "
+                "export itself broke"
+            )
+        return None
+    proc = subprocess.run(
+        ["git", "rev-parse", "--verify", f"{raw_value}^{{commit}}"],
+        cwd=repo_root, capture_output=True, text=True,
+    )
+    if proc.returncode != 0:
+        raise AssertionError(
+            f"{_UNIT_BASE_ENV_VAR}={raw_value!r} does not resolve to a commit in {repo_root} "
+            f"(`git rev-parse --verify {raw_value}^{{commit}}` failed: {proc.stderr.strip()}) -- refusing by "
+            "name rather than diagnosing this as artifact staleness"
+        )
+    return proc.stdout.strip()
+
+
+def _is_ancestor(ancestor: str, descendant: str, repo_root: Path) -> bool:
+    proc = subprocess.run(
+        ["git", "merge-base", "--is-ancestor", ancestor, descendant], cwd=repo_root, capture_output=True, text=True
+    )
+    if proc.returncode not in (0, 1):
+        raise RuntimeError(f"git merge-base --is-ancestor {ancestor} {descendant} failed in {repo_root}: {proc.stderr}")
+    return proc.returncode == 0
+
+
+def assert_artifact_commit_is_unit_head(
+    artifact_rel_path: str, repo_root: Path, unit_head_sha: str | None, unit_base_sha: str | None = None
+) -> None:
     """Arm (b): only when `unit_head_sha` (the unit's own PR head sha,
     e.g. CI's `JAMMI_CI_UNIT_HEAD_SHA`) is given, assert that `C`
     (`artifact_rel_path`'s own last commit) IS that head -- a no-op when
@@ -467,10 +516,27 @@ def assert_artifact_commit_is_unit_head(artifact_rel_path: str, repo_root: Path,
     it touches a file arm (a)'s own file list already names -- fails this,
     since arm (a) alone has no way to see a commit that never touched the
     artifact file itself.
+
+    Arm (b) is a property of the PR that DELIVERS the artifact: when
+    `unit_base_sha` (the PR's own base, CI's `JAMMI_CI_UNIT_BASE_SHA`) is
+    given and `C` is already an ancestor of it, this PR's range does not
+    contain `C` at all -- the artifact was delivered by an earlier merge
+    and this PR merely carries it -- so arm (b) is not applicable and is
+    skipped with a printed notice. Without that distinction every PR opened
+    after the artifact landed on the base branch would red on a commit it
+    never made. Without a known base (a bare local run) arm (b) engages
+    exactly as before.
     """
     if not unit_head_sha:
         return
     c = _artifact_own_last_commit(artifact_rel_path, repo_root)
+    if unit_base_sha and _is_ancestor(c, unit_base_sha, repo_root):
+        print(
+            f"[frontend_ab_artifact] arm (b) not applicable: {artifact_rel_path}'s own last commit ({c}) is "
+            f"already an ancestor of this PR's base ({unit_base_sha}) -- this PR carries the artifact, it does "
+            "not deliver it"
+        )
+        return
     if c != unit_head_sha:
         raise AssertionError(
             f"{STALE_ARTIFACT_RECORD_MESSAGE}: {artifact_rel_path}'s own last commit ({c}) is not this unit's "
@@ -485,15 +551,17 @@ def assert_committed_artifact_not_stale(
     artifact_rel_path: str,
     repo_root: Path,
     unit_head_sha: str | None = None,
+    unit_base_sha: str | None = None,
 ) -> None:
     """Runs arm (a) (`assert_committed_artifact_record_matches_artifact_
     commit`) always, then arm (b) (`assert_artifact_commit_is_unit_head`)
-    whenever `unit_head_sha` is given -- see this module's own doc, "The
-    'measured tip precedes merge tip' record is a FIXPOINT of `C`" section,
-    for the full argument for why the two are independent checks.
+    whenever `unit_head_sha` is given and the PR's own range contains the
+    artifact commit -- see this module's own doc, "The 'measured tip
+    precedes merge tip' record is a FIXPOINT of `C`" section, for the full
+    argument for why the two are independent checks.
     """
     assert_committed_artifact_record_matches_artifact_commit(committed, regenerated, artifact_rel_path, repo_root)
-    assert_artifact_commit_is_unit_head(artifact_rel_path, repo_root, unit_head_sha)
+    assert_artifact_commit_is_unit_head(artifact_rel_path, repo_root, unit_head_sha, unit_base_sha)
 
 
 def _init_repo(root: Path) -> tuple[str, str]:
@@ -891,6 +959,10 @@ class ArtifactRecordFreshnessGateTests(unittest.TestCase):
       (6) the committed record is tampered with (a file dropped from its
           own `files_changed_since_measured_tip`) with NO later commits at
           all -> RED under arm (a) alone.
+      (7) the PR's own base already contains `C` (the artifact landed on
+          the base branch earlier) and the PR head is a later commit ->
+          arm (b) is not applicable and the gate is green; the same head
+          with a base that predates `C` (the delivering PR) is RED.
     """
 
     def setUp(self):
@@ -996,6 +1068,30 @@ class ArtifactRecordFreshnessGateTests(unittest.TestCase):
             )
         self.assertIn(STALE_ARTIFACT_RECORD_MESSAGE, str(ctx.exception))
 
+    def test_scenario7_artifact_already_in_the_pr_base_makes_arm_b_not_applicable(self):
+        """A PR opened AFTER the artifact landed on its base branch carries
+        `C` in its base and never made it: later commits on that PR are
+        that PR's own work, not staleness of an artifact it does not
+        deliver -- arm (b) is skipped, arm (a) still runs."""
+        committed = self._render_and_commit_artifact({"m": 1}, "add artifact (final commit)")
+        base = _git(["rev-parse", "HEAD"], self.root).stdout.strip()  # the base branch, C included
+        (self.root / "other.rs").write_text("unrelated PR work\n", encoding="utf-8")
+        _git(["add", "other.rs"], self.root)
+        _git(["commit", "-q", "-m", "a later PR's own commit"], self.root)
+        later_head = _git(["rev-parse", "HEAD"], self.root).stdout.strip()
+        regenerated = self._regenerate({"m": 1})
+        assert_committed_artifact_not_stale(
+            committed, regenerated, "artifact.json", self.root, unit_head_sha=later_head, unit_base_sha=base
+        )
+        # The SAME head with a base that predates `C` is the delivering PR:
+        # arm (b) engages and the later commit is red.
+        with self.assertRaises(AssertionError) as ctx:
+            assert_committed_artifact_not_stale(
+                committed, regenerated, "artifact.json", self.root, unit_head_sha=later_head,
+                unit_base_sha=self.measured_tip,
+            )
+        self.assertIn(STALE_ARTIFACT_RECORD_MESSAGE, str(ctx.exception))
+
     def test_scenario3_later_commit_touching_a_never_listed_file_is_red_under_arm_b(self):
         committed = self._render_and_commit_artifact({"m": 1}, "add artifact (final commit)")
         (self.root / "docs").mkdir()
@@ -1071,6 +1167,38 @@ class ArtifactRecordFreshnessGateTests(unittest.TestCase):
             assert_committed_artifact_not_stale(committed, regenerated, "artifact.json", self.root)
         self.assertIn(STALE_ARTIFACT_RECORD_MESSAGE, str(ctx.exception))
         self.assertIn("measurement block is not byte-identical", str(ctx.exception))
+
+
+class UnitBaseShaResolutionTests(unittest.TestCase):
+    def setUp(self):
+        self._tmp = tempfile.TemporaryDirectory()
+        self.root = Path(self._tmp.name)
+        _git(["init", "-q"], self.root)
+        (self.root / "f").write_text("x\n", encoding="utf-8")
+        _git(["add", "."], self.root)
+        _git(["commit", "-q", "-m", "c0"], self.root)
+        self.sha = _git(["rev-parse", "HEAD"], self.root).stdout.strip()
+
+    def tearDown(self):
+        self._tmp.cleanup()
+
+    def test_empty_on_a_pull_request_checkout_under_ci_is_refused_by_name(self):
+        with self.assertRaises(AssertionError) as ctx:
+            resolve_unit_base_sha("", self.root, ci_mode=True, event_name="pull_request")
+        self.assertIn(_UNIT_BASE_ENV_VAR, str(ctx.exception))
+
+    def test_empty_on_a_push_checkout_or_local_run_is_none(self):
+        self.assertIsNone(resolve_unit_base_sha("", self.root, ci_mode=True, event_name="push"))
+        self.assertIsNone(resolve_unit_base_sha(None, self.root, ci_mode=False, event_name=None))
+
+    def test_abbreviated_sha_resolves_to_the_full_sha(self):
+        self.assertEqual(resolve_unit_base_sha(self.sha[:8], self.root, ci_mode=True, event_name="pull_request"), self.sha)
+
+    def test_unresolvable_value_is_refused_by_name(self):
+        with self.assertRaises(AssertionError) as ctx:
+            resolve_unit_base_sha("not-a-commit", self.root, ci_mode=True, event_name="pull_request")
+        self.assertIn(_UNIT_BASE_ENV_VAR, str(ctx.exception))
+        self.assertNotIn(STALE_ARTIFACT_RECORD_MESSAGE, str(ctx.exception))
 
 
 class UnitHeadShaResolutionTests(unittest.TestCase):
@@ -1795,8 +1923,13 @@ class RealFixtureRegressionTests(unittest.TestCase):
             os.environ.get(_UNIT_HEAD_ENV_VAR), repo_root, ci_mode=self._ci_expects_real_fixture(),
             event_name=os.environ.get(_EVENT_NAME_ENV_VAR),
         )
+        unit_base_sha = resolve_unit_base_sha(
+            os.environ.get(_UNIT_BASE_ENV_VAR), repo_root, ci_mode=self._ci_expects_real_fixture(),
+            event_name=os.environ.get(_EVENT_NAME_ENV_VAR),
+        )
         assert_committed_artifact_not_stale(
-            committed, regenerated, artifact_rel_path, repo_root, unit_head_sha=unit_head_sha
+            committed, regenerated, artifact_rel_path, repo_root, unit_head_sha=unit_head_sha,
+            unit_base_sha=unit_base_sha,
         )
 
 

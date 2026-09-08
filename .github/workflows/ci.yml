@@ -1848,7 +1848,11 @@ jobs:
           # normalises `JAMMI_CI_UNIT_HEAD_SHA` -- set here to this PR's own
           # head sha on a `pull_request`/`pull_request_target` checkout,
           # falling back to the literal `push` on a `push` checkout, never
-          # empty on either. `resolve_unit_head_sha` also cross-checks the
+          # empty on either. `JAMMI_CI_UNIT_BASE_SHA` is the PR's own base
+          # sha (empty on a push checkout): arm (b) engages only when the
+          # artifact's own commit lies in this PR's range -- a PR whose base
+          # already carries the artifact merely inherits it and is never red
+          # for commits it did not make. `resolve_unit_head_sha` also cross-checks the
           # resolved value against `GITHUB_EVENT_NAME` (a GitHub Actions
           # built-in already present on this job, no extra wiring needed):
           # the `push` sentinel on a `pull_request`/`pull_request_target`
@@ -1862,7 +1866,7 @@ jobs:
           # `push` sentinel; arm (a) alone applies, recorded via a printed
           # notice in the test's own stdout). No GPU, no network.
           - name: frontend_ab_artifact suite
-            cmd: JAMMI_CI_FRONTEND_AB_FINAL_FIXTURE_EXPECTED=1 JAMMI_CI_UNIT_HEAD_SHA=${{ github.event.pull_request.head.sha || 'push' }} python3 ci/scripts/perf/test_frontend_ab_artifact.py
+            cmd: JAMMI_CI_FRONTEND_AB_FINAL_FIXTURE_EXPECTED=1 JAMMI_CI_UNIT_HEAD_SHA=${{ github.event.pull_request.head.sha || 'push' }} JAMMI_CI_UNIT_BASE_SHA=${{ github.event.pull_request.base.sha || '' }} python3 ci/scripts/perf/test_frontend_ab_artifact.py
             fetch_depth: "0"
           # `fa2_ab.sh`'s own shape test: the shell PRODUCER is a manual,
           # exclusive-timing-box script with hardcoded `/root/...` paths

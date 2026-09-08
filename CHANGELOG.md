@@ -504,7 +504,7 @@ workspace ships every publishable crate at the same
   `ModelCache::complete_generic_registration`'s post-load bookkeeping is an ALLOWLIST of the only
   rows it may complete — `GENERIC_COMPLETABLE_TYPES = ["local", "huggingface", "embedding"]` —
   proceeding only when the existing row is absent or already one of those generic kinds; every
-  other type (`"fine-tuned"`, `"context-predictor"`, `"checkpoint"`, or any future architecture id
+  other type (`"fine-tuned"`, `"context-predictor"`, or any future architecture id
   `EncoderFamily::adapter_model_type` mints), enumerated or not, is left untouched, so this write
   can no longer clobber a fine-tuned row's `model_type`/`artifact_path`/`base_model_id` out from
   under a training-instance resolve. A catalog READ error fails CLOSED — the write is skipped

@@ -453,6 +453,27 @@ workspace ships every publishable crate at the same
   completed attempt sitting behind an in-flight rerun still denies (F5).
 
 ### Fixed
+- **`jammi-encoders`' unit-test binary now serializes every writer of the `layer_norm_fused` /
+  `gelu_erf_fused` / `attention_block_fused` process-wide dispatch counters through the SAME lock
+  the exact-count census oracle's reader holds (esc-092 / #476).** The prior scheme's two separate
+  locks (`layer_norm::DISPATCH_COUNTER_TEST_LOCK`, `attention_cascade::ATTENTION_BLOCK_COUNTER_TEST_LOCK`)
+  enforced reader-exclusivity only by convention at each writer; nothing enumerated or checked that
+  every training-mode forward reaching one of these seams' `admit()` call actually held one, so an
+  unlocked writer's bump could land inside another test's before/after window and the census oracle
+  would misattribute it to the wrong tower. `crate::test_support::seam_counter_lock()` replaces both
+  locks with exactly one (`std::sync::Mutex` is not reentrant, so a caller that previously needed
+  both windows now acquires this single lock once instead of two in a fixed order), and
+  `crate::test_support::assert_seam_lock_held` is a `#[cfg(test)]`-only mechanical gate called from
+  the training arm of every fused-seam dispatch site this crate owns
+  (`LayerNorm::forward_fused_or_fallback`, `activations::gelu_erf`,
+  `attention_cascade::training_attention_cascade`'s `attention_block_fused` decision), immediately
+  before the `admit()` call that would otherwise silently record a dispatch no lock is protecting —
+  it panics naming the site when the calling thread does not hold the lock. `seam_dispatch_totals`
+  and `assert_fusible_site_census_is_exact` now take `&SeamCounterGuard` by parameter, so a test
+  cannot compile against them without holding it. `lora_linear_fused` stays convention-only: it is
+  admitted inside `jammi_lora::lora_linear`, a normal (non-`cfg(test)`) dependency this crate cannot
+  instrument from the outside without moving `jammi-bench`'s own shipped read of the same
+  process-wide counter.
 - **BERT-family loader accepts the original Google LayerNorm tensor names (`…LayerNorm.gamma`/
   `…LayerNorm.beta`) the stock `bert-base-uncased` checkpoint carries (#423).** `LayerNorm::new`
   (`crates/jammi-encoders/src/layer_norm.rs`) now aliases `gamma`->`weight` and `beta`->`bias` at

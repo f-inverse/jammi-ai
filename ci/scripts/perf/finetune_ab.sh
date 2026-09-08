@@ -326,19 +326,19 @@ REPO_ROOT="$(cd "$DIR/../../.." && pwd)"
 # ten LIVE, STANDALONE `admit()`/`admit_cascade()`/`op_disabled()` op keys
 # this crate's fused finetune-step call graph actually reaches on a real
 # training step (confirmed at this contract's tip: `layer_norm_fused`
-# `crates/jammi-encoders/src/layer_norm.rs:583`, `geglu_fused`
+# `crates/jammi-encoders/src/layer_norm.rs:586`, `geglu_fused`
 # `crates/jammi-encoders/src/modernbert.rs:1424`, `gelu_erf_fused`
-# `crates/jammi-encoders/src/activations.rs:158`, `attention_block_flash`
+# `crates/jammi-encoders/src/activations.rs:174`, `attention_block_flash`
 # `crates/jammi-encoders/src/modernbert.rs:1990` (`op_disabled`, the
 # cascade's own capability gate), `attention_block_fused`
-# `crates/jammi-encoders/src/attention_cascade.rs:914` (moved out of
+# `crates/jammi-encoders/src/attention_cascade.rs:897` (moved out of
 # `crate::modernbert`, issue #462), `rope_fused`
 # `crates/jammi-encoders/src/modernbert.rs:484`, `softmax_last_dim_fused`
-# `crates/jammi-encoders/src/attention_cascade.rs:654` (moved out of
+# `crates/jammi-encoders/src/attention_cascade.rs:635` (moved out of
 # `crate::modernbert`, issue #462), `lora_linear_fused`
 # `crates/jammi-lora/src/lora_linear.rs:1007`, `adamw_step_fused`
 # `crates/jammi-ai/src/fine_tune/adamw.rs:259`, `mem_efficient_attention`
-# `crates/jammi-encoders/src/attention_cascade.rs:868` (`admit_cascade`, the
+# `crates/jammi-encoders/src/attention_cascade.rs:849` (`admit_cascade`, the
 # per-layer memeff cascade — consulted on EVERY training-mode attention
 # layer once the flash cascade has declined, BEFORE the block arm's own
 # `admit()`) and `op_disabled`

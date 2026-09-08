@@ -58,14 +58,17 @@ use crate::{AnyEncoder, FusibleSiteCensus};
 // `cfg(test)` is inactive wherever `jammi-bench` links this crate as a
 // library dependency):
 //
-// 1. `lora_linear_fused` is admitted inside `jammi_lora::lora_linear`
-//    (`crates/jammi-lora/src/lora_linear.rs:227`), compiled as a normal
-//    (non-`cfg(test)`) dependency of this crate. A per-thread counter
-//    scoped to `jammi-encoders`' own `cfg(test)` build cannot cover that
-//    key without an ALWAYS-ON API change to `jammi_lora` itself — which
-//    would move the shipped bench path at
-//    `crates/jammi-bench/src/finetune_run.rs:1958`/`:2122` that reads the
-//    SAME process-wide counter today. `lora_linear_fused` therefore stays
+// 1. `lora_linear_fused` is admitted inside `jammi_lora::lora_linear`, where
+//    `counters_for("lora_linear_fused")` (`crates/jammi-lora/src/lora_linear.rs:227`)
+//    resolves the registry entry, compiled as a normal (non-`cfg(test)`)
+//    dependency of this crate. A per-thread counter scoped to
+//    `jammi-encoders`' own `cfg(test)` build cannot cover that key without
+//    an ALWAYS-ON API change to `jammi_lora` itself — which would move the
+//    shipped bench path at `lora_linear_fused_dispatch_before`
+//    (`crates/jammi-bench/src/finetune_run.rs:1958`) /
+//    `lora_linear_fused_dispatch_after`
+//    (`crates/jammi-bench/src/finetune_run.rs:2122`) that reads the SAME
+//    process-wide counter today. `lora_linear_fused` therefore stays
 //    convention-only: [`assert_seam_lock_held`] is not (and cannot be)
 //    called from inside `jammi_lora`, so a `LoraLinear::forward` training
 //    dispatch is not mechanically gated the way the other three seams are.

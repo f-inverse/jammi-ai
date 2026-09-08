@@ -641,10 +641,16 @@ falling strictly inside `[ratio_lo, ratio_hi]`. CLIP-vision is report-only. Verd
 ACTIVATE the change iff the HTSAT bar holds — the script only records the outcome, never
 gates or reverts a build on it. The close-out run's own recorded deviations (named, never
 silently absorbed into the numbers above — see the committed artifact for detail): the
-measured tip commit precedes the tree the merge report was rendered from (later commits on
-top touched tests/docs/serving-path code, never the timed front-end path); the
-driver-default serial-tail ratio differs from this run's own measured serial-tail ratio,
-with the bar's verdict asserted invariant under both; and the pod's CPU was shared-host at
+measured tip commit precedes the tree the merge report was rendered from: the `par_chunks_mut`
+parallel stage and the decode helpers are byte-unchanged since the measured tip, and every
+later commit that touched the timed front-end path (`audio_preprocess.rs`) added only a
+sequential pre-check ahead of that parallel stage — a `resampled_len()` helper extracted with
+identical arithmetic, and, in a later commit still, a per-clip `sample_rate == 0` refusal and
+`resampled_len`'s own `from_rate == 0` branch — never a change to the parallel stage or the
+decode helpers themselves; every other file the later commits touched is off the timed path
+(tests, docs, CI, serving-path code), and the artifact's own deviation record names every file
+mechanically. The driver-default serial-tail ratio differs from this run's own measured
+serial-tail ratio, with the bar's verdict asserted invariant under both; and the pod's CPU was shared-host at
 launch, so `P` reflects the run's own cgroup quota rather than the box's full core count.
 A hermetic dry-run suite (`ci/scripts/perf/test_frontend_ab_dry_run.py`) drives the real
 script end to end with hermetic stand-in binaries and no GPU, and is a matrix leg in

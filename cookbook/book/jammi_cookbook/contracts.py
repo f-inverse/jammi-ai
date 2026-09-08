@@ -30,6 +30,36 @@ from pathlib import Path
 _REPO_ROOT = Path(__file__).resolve().parent.parent
 _ARTIFACT_ROOT = _REPO_ROOT / "artifacts"
 
+# --- media-tower LoRA checkpoint provenance goldens (#421 follow-on) --------
+# Pinned sha256 of each checkpoint directory's file bytes, computed by
+# scripts/build_media_tower_lora_cache.py's own `_dir_sha256` at emit time.
+# The chapter asserts the committed record's digests against these — change
+# detection for a future re-emit against the SAME local checkpoint bytes, not
+# a fetch or re-verification of the upstream repo. The upstream repo ids are
+# the stock checkpoints these local directories are populated from
+# (docs/plans/66-tower-profile/CONTRACT.md).
+MEDIA_TOWER_VISION_CHECKPOINT_SHA256 = (
+    "9eed8d5010babe30c1024f00106ddff41c339e4d382d9bf707c47996f8f9c904"
+)
+MEDIA_TOWER_VISION_CHECKPOINT_UPSTREAM = "laion/CLIP-ViT-B-32-laion2B-s34B-b79K"
+MEDIA_TOWER_AUDIO_CHECKPOINT_SHA256 = (
+    "8da528604e138614733cc515b4bbfd9e8f5dd1db6ed25fa5c14a0e13a1f51c9a"
+)
+MEDIA_TOWER_AUDIO_CHECKPOINT_UPSTREAM = "laion/clap-htsat-fused"
+
+# A round-trip diff is not a noisy measurement like change-vs-base: either the
+# adapter survived the restart bit-for-bit (diff ~ 0, floating-point noise
+# only) or persistence is broken (diff is large). The emit script itself
+# refuses to write a cache around a broken round trip (diff >= this ceiling)
+# rather than silently committing one; the chapter and the test assert the
+# SAME ceiling, imported from here rather than each re-typing `1e-5`.
+MEDIA_TOWER_ROUND_TRIP_CEILING = 1e-5
+
+# The mixed-row batch's fixed row order for the corrupt-row contract: the
+# Arrow position of "corrupt_row" is this order's own index, never a bare `2`.
+MEDIA_TOWER_ROW_ORDER = ("good", "null_row", "corrupt_row")
+MEDIA_TOWER_CORRUPT_ARROW_POSITION = MEDIA_TOWER_ROW_ORDER.index("corrupt_row")
+
 
 # --------------------------------------------------------------------------- #
 # Layer 1 — schema
@@ -957,6 +987,46 @@ ARTIFACTS: dict[str, Artifact] = {
         filename="checksums.json",
         produced_by="segmented_ann",
         note="sha256[:16] of every committed segmented_ann cache file.",
+    ),
+    # --- real-checkpoint media-tower LoRA (#421 follow-on) -------------------
+    "media_tower.record": Artifact(
+        name="media_tower.record",
+        kind="model_id",
+        filename="record.json",
+        produced_by="media_tower",
+        note="LoRA fine-tuning driven through the SHIPPED Python surface "
+        "(fine_tune / infer / describe_model — never the internal jammi-bench "
+        "harness) against REAL checkpoints: OpenCLIP ViT-B-32 (vision + text "
+        "towers) and CLAP HTSAT (audio tower). Per tower: the fine-tuned model "
+        "id + target_modules, two independently-trained runs' change-vs-base "
+        "max|Δ| (the observed spread between them derives the golden tolerance, "
+        "never a bare literal), the same-input control max|Δ| (derives the "
+        "change-must-exceed floor), the round-trip max|Δ| through a REAL "
+        "`jammi-server` OS-process restart (pid before/after recorded — not "
+        "merely a new connection to the same still-running process), and the "
+        "cross-tower selectivity max|Δ| (a fixed probe through the OTHER "
+        "OpenCLIP tower, exactly 0.0, after tuning one — shows the adapter's "
+        "effect did not reach the other tower, without distinguishing "
+        "site-scoping from task-scoped application). Plus the measured "
+        "per-row `_status`/`_error` contract for a NULL row and a CORRUPT "
+        "(undecodable) row, in BOTH an inline-bytes and a path input arm — "
+        "each reaching the engine through a Parquet source, which DataFusion "
+        "materialises as `BinaryView`/`Utf8View` respectively — on both image "
+        "and audio, with the error message's own named row index checked "
+        "against the row's actual Arrow position. `provenance` records the "
+        "engine/client version, host, GPU, device, and an independent sha256 "
+        "of each checkpoint directory, pinned against goldens "
+        "(MEDIA_TOWER_VISION_CHECKPOINT_SHA256 / "
+        "MEDIA_TOWER_AUDIO_CHECKPOINT_SHA256 below); content_digest is "
+        "computed internally by the engine but never crosses the shipped "
+        "surface.",
+    ),
+    "media_tower.checksums": Artifact(
+        name="media_tower.checksums",
+        kind="model_id",
+        filename="checksums.json",
+        produced_by="media_tower",
+        note="sha256[:16] of every committed media_tower cache file.",
     ),
 }
 

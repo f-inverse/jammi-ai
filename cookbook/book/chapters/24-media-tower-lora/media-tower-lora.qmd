@@ -1,0 +1,367 @@
+---
+title: "Real-checkpoint media-tower LoRA — change, control, round-trip, and the corrupt-row contract"
+---
+
+```{python}
+# | echo: false
+import jammi
+import jammi_cookbook
+```
+
+**Recipe:** `fine_tune(method="lora", task=...)` on `[gpu]` against REAL checkpoints
+· `infer` · `describe_model` — the SAME shipped Python surface the
+`image_search`/`audio_search` recipes drive, never the internal `jammi-bench`
+harness · **Theory:** LoRA — a frozen base weight plus a trainable low-rank update
+[@hu2022lora] — injected into OpenCLIP's shared vision/text `ResidualAttentionBlock`
+[@radford2021clip] and into CLAP's HTSAT-Swin audio tower [@wu2023clap] · **Rail:**
+measurement (a real GPU fine-tune of each of three towers, its invariants read back
+through the public surface, frozen once and reasserted here).
+
+Every earlier fine-tuning chapter in this book trains a **text** encoder
+(ModernBERT). This one is the media front end's own proof: the SAME `fine_tune`
+verb, pointed at REAL OpenCLIP ViT-B-32 (vision **and** text towers — `task=`
+alone selects which) and REAL CLAP HTSAT (the audio tower) checkpoints, on real
+GPU hardware, exercising the `target_modules` LoRA-site selectors the
+`image_search`/`audio_search` recipes introduced for these architectures. The
+heavy work ran **once**, on a GPU `jammi-server`; this chapter reads that
+committed cache and asserts a measured verdict against `golden_metrics.json`,
+never recomputing upstream.
+
+## Provenance, checked before anything else
+
+No sha is exposed anywhere on the shipped surface for the engine commit this
+cache was emitted against: `get_server_info()` carries `version` / `features` /
+`storage_backends` / `services` only, and the `jammi-ai` client wheel carries a
+declared `version`, same story — neither carries a build sha. The finest-grained
+identity the shipped surface exposes is the declared VERSION, so that is what
+gets checked here, against the CURRENTLY INSTALLED client — the same pattern
+Chapter 14 uses for `usearch.__version__` before touching its frozen index.
+
+This section checks two DIFFERENT things, and states which is which: (1) the
+installed `jammi` client version, against this record — a change-detection
+check that runs HERE, live, every time this chapter executes; (2) the two
+checkpoint directories' sha256 digests, against the two pinned goldens below —
+also change detection, for a future re-emit on a GPU box against the SAME
+checkpoint directories, not a fetch or a recompute of the checkpoints
+themselves. Each digest is computed by this chapter's emit script directly
+over the LOCAL checkpoint directory's file bytes; the checkpoints are named by
+their upstream repo id (`laion/CLIP-ViT-B-32-laion2B-s34B-b79K`,
+`laion/clap-htsat-fused`) for provenance, but that upstream identity is never
+fetched or re-verified here — only the local bytes this cache was actually
+trained against are.
+
+```{python}
+from jammi_cookbook import contracts
+
+record = contracts.load_artifact("media_tower.record")
+provenance = record["provenance"]
+
+assert jammi.__version__ == provenance["installed_client_version"], (
+    f"installed jammi {jammi.__version__} != the {provenance['installed_client_version']} "
+    "this cache was emitted against — a stale cache under a different engine build."
+)
+vision_sha = contracts.MEDIA_TOWER_VISION_CHECKPOINT_SHA256
+audio_sha = contracts.MEDIA_TOWER_AUDIO_CHECKPOINT_SHA256
+assert provenance["vision_checkpoint_sha256"] == vision_sha, (
+    "vision checkpoint directory bytes do not match the pinned golden digest — "
+    "a different checkpoint than the one this cache was trained against"
+)
+assert provenance["audio_checkpoint_sha256"] == audio_sha, (
+    "audio checkpoint directory bytes do not match the pinned golden digest — "
+    "a different checkpoint than the one this cache was trained against"
+)
+print(f"engine version:          {record['engine_version']}")
+print(f"installed client:        {jammi.__version__}  (matches)")
+print(f"box:                     {provenance['hostname']} / {provenance['gpu_name']} "
+      f"(device {provenance['device']})")
+print(f"vision/text checkpoint:  {record['vision_checkpoint']}")
+print(f"  upstream:              {contracts.MEDIA_TOWER_VISION_CHECKPOINT_UPSTREAM}")
+print(f"  local sha256:          {provenance['vision_checkpoint_sha256']}  (matches pinned golden)")
+print(f"audio checkpoint:        {record['audio_checkpoint']}")
+print(f"  upstream:              {contracts.MEDIA_TOWER_AUDIO_CHECKPOINT_UPSTREAM}")
+print(f"  local sha256:          {provenance['audio_checkpoint_sha256']}  (matches pinned golden)")
+print(f"rows per modality:       {record['rows_per_modality']}")
+```
+
+Each checkpoint's sha256 above is computed by THIS chapter's emit script,
+directly over the LOCAL checkpoint directory's file bytes, independent of the
+engine's own internal per-model digest (`compute_model_content_digest` in
+`crates/jammi-ai/src/model/backend/candle.rs`) — that routine never crosses
+`describe_model`, the wire proto, or the CLI, so there is no shipped-surface way
+to read a registered model's content digest today (`provenance
+["content_digest_via_shipped_surface"]` records that fact rather than silently
+working around it).
+
+## Five things worth measuring, not one
+
+A recipe that shows "the tuned vector differs from the base vector" is teaching
+one fact. This chapter measures five, because each closes a gap the others leave
+open:
+
+1. **Change, not improvement.** The adapter must move the served embedding.
+   Direction and quality are not claimed — a synthetic, generic triplet corpus
+   carries no semantic ground truth — only that training changed something real,
+   past a floor and tolerance DERIVED from this cache's own measurements (below),
+   never a hand-picked literal.
+2. **The same-input control.** A change could, in principle, be inference
+   noise rather than a real parameter delta. The control rules that out: the
+   SAME probe input, run through the SAME (base) checkpoint **twice**, in two
+   independent calls — and it is what derives the change-must-exceed floor
+   below.
+3. **The round trip — a REAL process restart.** A LoRA delta that trains but is
+   silently dropped at serve time is the exact defect the recipes' own comments
+   warn about. This chapter's emit script closes the connection that trained the
+   adapter, TERMINATES the `jammi-server` OS process, and starts a FRESH one
+   against the SAME on-disk catalog before re-deriving the tuned vector — a
+   reconnect to the still-running process would only prove the process-local
+   cache kept the adapter warm.
+4. **Cross-tower selectivity.** OpenCLIP's vision and text towers share one
+   checkpoint and one LoRA-site vocabulary; `task=` is supposed to scope a
+   fine-tune's trainable sites to ONE tower. A fixed probe through the OTHER,
+   untouched tower must be bit-identical to base.
+5. **The corrupt-row contract, in both input arms.** The doc's Error-handling
+   table covers two column shapes for a media input: inline bytes and a file
+   path. Every source this chapter registers is a Parquet source; DataFusion's
+   default `schema_force_view_types=true` materialises the inline-bytes column
+   as `BinaryView` and the path column as `Utf8View` — the arms a Parquet-backed
+   consumer actually hits. This chapter measures both, on both media types.
+
+## The three towers, measured side by side
+
+`task=` is the only thing that changes which tower of the SAME OpenCLIP
+checkpoint gets adapted (`image_embedding` -> vision, `text_embedding` -> the
+CLIP text tower); the CLAP checkpoint carries a separate `audio_embedding`
+tower. Every tower's `target_modules` names REAL sites on that tower's own
+architecture (`in_proj`/`c_fc` on OpenCLIP's shared attention block;
+`query`/`value`/`linear1` on HTSAT-Swin) — the same selector vocabulary the
+`image_search`/`audio_search` recipes document.
+
+```{python}
+towers = record["towers"]
+print(f"{'tower':<8}{'task':<18}{'target_modules'}")
+for name, t in towers.items():
+    print(f"{name:<8}{t['task']:<18}{t['target_modules']}")
+```
+
+### 1 — Change vs. base, at a DERIVED tolerance and floor
+
+Each tower's LoRA adapter was trained **twice**, independently, under the SAME
+pinned seed (`REPEATS = 2` in the emit script). Both repeats running the same
+seed is deliberate: the spread between them measures same-seed re-emit
+nondeterminism, which is the exact quantity a re-emit tolerance needs. The
+committed tolerance is `max(SPREAD_K * spread, PRECISION_FLOOR)` — never a
+hand-picked literal — and the change-must-exceed floor (derived from the
+same-input control, measured next) is `max(FLOOR_K * control, PRECISION_FLOOR)`.
+On this box training is bit-deterministic under the fixed seed: BOTH the
+observed spread and the observed control measured exactly `0.0`, so
+`PRECISION_FLOOR` — a constant, the record's own 6-decimal rounding
+resolution — is the term that actually binds for every tower below. The print
+names which term bound rather than showing an equation (`k·spread`) that would
+be false whenever the floor binds.
+
+```{python}
+for name, t in towers.items():
+    diff = t["change_vs_base_max_abs_diff"]
+    td = t["tolerance_derivation"]
+    contracts.assert_close(f"media_tower.{name}.change_vs_base_max_abs_diff", diff)
+    assert diff > td["change_floor"], (
+        f"{name}: the LoRA adapter should change the served embedding past its "
+        f"derived floor — max|Δ| = {diff:.6f} <= floor {td['change_floor']:.6g} "
+        "(adapter trained but not applied at serve time?)"
+    )
+    spread = td["observed_change_spread_max_abs_diff"]
+    control = t["same_input_control_max_abs_diff"]
+    k_spread = td["spread_multiplier_k"] * spread
+    k_control = td["control_floor_multiplier_k"] * control
+    precision_floor = td["precision_floor"]
+    tol_bound_by = "floor" if k_spread < precision_floor else "k·spread"
+    floor_bound_by = "floor" if k_control < precision_floor else "k·control"
+    print(f"  {name:<6} change max|Δ| = {diff:.6f}")
+    print(f"    tol:   spread={spread:.4g}  k·spread={k_spread:.4g}  "
+          f"precision_floor={precision_floor:.4g}  -> tol={td['change_tol']:.4g} "
+          f"({tol_bound_by} binds)")
+    print(f"    floor: control={control:.4g}  k·control={k_control:.4g}  "
+          f"precision_floor={precision_floor:.4g}  -> floor={td['change_floor']:.4g} "
+          f"({floor_bound_by} binds)")
+```
+
+### 2 — The same-input control
+
+Two independent `infer` calls through the SAME (base) checkpoint, over the
+SAME probe input, on each of the two independent training runs above.
+
+```{python}
+for name, t in towers.items():
+    diff = t["same_input_control_max_abs_diff"]
+    contracts.assert_close(f"media_tower.{name}.same_input_control_max_abs_diff", diff)
+    print(f"  {name:<6} control max|Δ| = {diff:.6g}")
+
+for name, t in towers.items():
+    change = t["change_vs_base_max_abs_diff"]
+    control = t["same_input_control_max_abs_diff"]
+    assert control < change, (
+        f"{name}: the same-input control ({control:.6g}) is not smaller than "
+        f"the change vs. base ({change:.6g}) — the measured change is not "
+        f"distinguishable from noise"
+    )
+print("every tower's control diff is strictly below its own change-vs-base signal ✓")
+```
+
+### 3 — The round trip: train → save → a REAL process restart → serve
+
+The emit script closes the connection that trained each tower's adapter,
+terminates the `jammi-server` OS process, and starts a brand-new one against
+the SAME `artifact_dir` before re-deriving the tuned vector. The record carries
+the OS pid before and after, so the restart is auditable, not merely claimed.
+
+A round-trip diff is not noisy the way change-vs-base is: either the adapter
+survived the restart bit-for-bit or persistence is broken, so this asserts a
+tight, HARDCODED ceiling — never merely the golden, which would happily commit
+(and then trivially match) a broken measurement. The ceiling lives in ONE
+place, `jammi_cookbook.contracts.MEDIA_TOWER_ROUND_TRIP_CEILING`, imported
+here rather than re-typed (the emit script reads the SAME constant from
+`contracts`, rather than each side keeping its own copy). `server_restarted`
+is likewise not read as a recorded literal: it is re-derived from the pid pair
+(and, since the record also carries wall-clock start times, from start-time
+ordering) — the same evidence the record's `before`/`after` fields carry, not
+a separate claim to trust.
+
+```{python}
+ROUND_TRIP_CEILING = contracts.MEDIA_TOWER_ROUND_TRIP_CEILING
+
+for name, t in towers.items():
+    diff = t["round_trip_max_abs_diff"]
+    rt = t["round_trip"]
+    assert diff < ROUND_TRIP_CEILING, (
+        f"{name}: round-trip max|Δ| = {diff:.6f} is not near zero — the "
+        "adapter did not survive a real process restart intact"
+    )
+    contracts.assert_close(f"media_tower.{name}.round_trip_max_abs_diff", diff)
+    pid_changed = rt["before"]["pid"] != rt["after"]["pid"]
+    later_start = rt["after"]["start_time"] > rt["before"]["start_time"]
+    assert pid_changed, f"{name}: round trip did not cross a real OS process boundary"
+    assert later_start, f"{name}: the 'after' process did not start later than 'before'"
+    assert rt["server_restarted"] == (pid_changed and later_start), (
+        f"{name}: recorded server_restarted does not match the pid/start-time evidence"
+    )
+    print(f"  {name:<6} round-trip max|Δ| = {diff:.6g}  "
+          f"(pid {rt['before']['pid']} -> {rt['after']['pid']}, restarted={rt['server_restarted']})")
+print("every tower's adapter round-trips train -> save (catalog) -> a REAL process "
+      "restart -> serve ✓")
+```
+
+### 4 — Cross-tower selectivity
+
+After tuning the **vision** tower, a fixed probe through the **text** tower
+(same checkpoint, untouched) must read bit-identically to base — and
+symmetrically after tuning **text**, a probe through **vision** must too.
+`max_abs_diff` is asserted **exactly** `0.0`, not within a tolerance: this is a
+selectivity property, not a noisy measurement.
+
+What this measurement shows and does not show: the OTHER tower's served
+embedding is unaffected after tuning ONE tower. It does not, by itself,
+distinguish WHY — whether training touched only sites scoped to the tuned
+tower, or whether serving applies the adapter only under the tuned task
+regardless of which sites training touched. Either mechanism produces this
+same bit-identical result; this chapter asserts only the observed outcome.
+
+```{python}
+for name in ("vision", "text"):
+    sel = towers[name]["cross_tower_selectivity"]
+    contracts.assert_close(f"media_tower.{name}.cross_tower_selectivity_max_abs_diff",
+                            sel["max_abs_diff"])
+    assert sel["max_abs_diff"] == 0.0, (name, sel)
+    print(f"  {name:<6} tuned model probed on {sel['probed_task']:<16} "
+          f"max|Δ| vs base = {sel['max_abs_diff']:.1f}  (bit-identical)")
+print("tuning one OpenCLIP tower left the other's served embedding untouched ✓")
+```
+
+## 5 — The corrupt-row contract, measured in both input arms
+
+`docs/guide/src/generate-image-embeddings.md`'s Error-handling table documents
+two accepted input shapes for a media column — inline bytes and a file path —
+and the SAME three-row contract for both: a valid row (`_status="ok"`), a
+**null** row (`_status="error"`, `"Null or missing ... input"`), and a
+**corrupt** (undecodable) row (`_status="error"`, naming the row). Both arms
+reach the engine through a Parquet source this chapter registers; DataFusion's
+default `schema_force_view_types=true` materialises the inline-bytes arm as
+`BinaryView` and the path arm as `Utf8View` — the arms a Parquet-backed
+consumer actually hits. This chapter measures both, on both media types, and
+checks the error message's OWN named row index against the row's actual Arrow
+position — not a substring match.
+
+```{python}
+CORRUPT_ARROW_POSITION = contracts.MEDIA_TOWER_CORRUPT_ARROW_POSITION
+
+for modality, arms in record["corrupt_rows"].items():
+    for mode, corrupt in arms.items():
+        print(f"\n--- {modality} / {mode} ---")
+        print(f"  good row still ok:      {corrupt['good_row_still_ok']}")
+        print(f"  null row status:        {corrupt['null_row']['status']}")
+        print(f"  corrupt row status:     {corrupt['corrupt_row']['status']}")
+        # The message itself may embed the emit box's own local filesystem path
+        # (the `path` arm's undecodable file); only the row-index match — the
+        # contract this chapter asserts — is printed, never the raw message.
+        print(f"  corrupt row index (message vs. Arrow position): "
+              f"{corrupt['corrupt_row']['row_index_in_message']} vs. "
+              f"{CORRUPT_ARROW_POSITION}  (match={corrupt['corrupt_row']['row_index_matches_arrow_position']})")
+
+        assert corrupt["good_row_still_ok"], (
+            f"{modality}/{mode}: a null/corrupt row in the SAME batch must not "
+            f"fail the other, valid row"
+        )
+        assert corrupt["null_row"]["status"] == "error", corrupt["null_row"]
+        assert "null" in corrupt["null_row"]["error"].lower(), corrupt["null_row"]
+
+        # The measured fact: a corrupt (undecodable) row is a per-row
+        # `_status="error"` outcome, alongside the good row — the whole `infer`
+        # call does NOT raise — and the row index NAMED in its own error
+        # message matches the row's actual Arrow position in the batch.
+        assert corrupt["corrupt_row"]["status"] == "error", corrupt["corrupt_row"]
+        assert corrupt["corrupt_row"]["row_index_in_message"] == CORRUPT_ARROW_POSITION
+        assert corrupt["corrupt_row"]["row_index_matches_arrow_position"], (
+            f"{modality}/{mode}: message row index "
+            f"{corrupt['corrupt_row']['row_index_in_message']} does not match this "
+            "row's actual Arrow position"
+        )
+```
+
+A genuinely missing/unreadable path (as opposed to an existing, undecodable
+file) is a different, column-level failure — `arrow_to_images`/`arrow_to_audio`
+raise a whole-call `Err` for that case by design, since resolving a path to
+bytes happens before the per-row decode stage. This chapter's path arm uses an
+existing file with undecodable bytes, so it measures the per-row contract the
+doc table describes, not that column-level case.
+
+## Reproducing this cache
+
+This chapter reads a cache pinned to the `jammi-ai` client version checked
+above and to the two checkpoint digests checked above. Re-emitting it needs a
+GPU box (the committed record's own provenance names an A100) with the two
+real checkpoints on disk locally — no GPU is available in this render
+environment, so this chapter reads the committed cache rather than
+recomputing it:
+
+```
+python scripts/build_media_tower_lora_cache.py \
+    --server-bin /path/to/target/release/jammi-server \
+    --vision-checkpoint /path/to/open-clip-vit-b-32 \
+    --audio-checkpoint /path/to/clap-htsat-fused \
+    --device 0
+```
+
+## Bridge note
+
+> **The first real-checkpoint chapter in the fine-tuning line.** Every earlier
+> `fine_tune` chapter in this book trains a small, hermetic text encoder; this
+> one is the media front end's own proof, on real OpenCLIP and real CLAP
+> checkpoints, through the identical public surface. The invariants this
+> chapter measures generalize past media: change-vs-base is the adapter's
+> reason to exist, the same-input control is what makes that change
+> interpretable and derives the floor it must clear, the round trip through a
+> real process restart is what makes "saved" mean something a new OS process
+> can observe, cross-tower selectivity shows the adapter's effect stayed off
+> the OTHER tower's served embedding after tuning one, and the corrupt-row
+> measurement — in both input arms — proves a per-row contract against the
+> branch it describes, with the message's own row index checked, not merely
+> searched for.

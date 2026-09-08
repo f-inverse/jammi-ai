@@ -581,3 +581,51 @@
   year      = {2022},
   note      = {arXiv:2205.14135}
 }
+
+% LoRA: the low-rank adapter method this book's every fine-tune chapter
+% trains through -- a frozen base weight plus a trainable rank-r update,
+% which is exactly what `target_modules`' per-tower site names
+% (`in_proj`/`c_fc` on OpenCLIP's ResidualAttentionBlock, `query`/`value`/
+% `linear1` on HTSAT-Swin) select into. Verified: Hu et al., ICLR 2022,
+% arXiv:2106.09685.
+@inproceedings{hu2022lora,
+  title     = {{LoRA}: Low-Rank Adaptation of Large Language Models},
+  author    = {Hu, Edward J. and Shen, Yelong and Wallis, Phillip and
+               Allen-Zhu, Zeyuan and Li, Yuanzhi and Wang, Shean and Wang,
+               Lu and Chen, Weizhu},
+  booktitle = {International Conference on Learning Representations (ICLR)},
+  year      = {2022},
+  note      = {arXiv:2106.09685}
+}
+
+% CLIP / OpenCLIP: the contrastive image-text pretraining architecture whose
+% shared ResidualAttentionBlock backs BOTH towers this chapter LoRA-adapts
+% (the vision tower over image triplets, the text tower over text triplets,
+% task= alone selecting which). Verified: Radford et al., ICML 2021,
+% arXiv:2103.00020.
+@inproceedings{radford2021clip,
+  title     = {Learning Transferable Visual Models From Natural Language
+               Supervision},
+  author    = {Radford, Alec and Kim, Jong Wook and Hallacy, Chris and
+               Ramesh, Aditya and Goh, Gabriel and Agarwal, Sandhini and
+               Sastry, Girish and Askell, Amanda and Mishkin, Pamela and
+               Clark, Jack and Krueger, Gretchen and Sutskever, Ilya},
+  booktitle = {International Conference on Machine Learning (ICML)},
+  year      = {2021},
+  note      = {arXiv:2103.00020}
+}
+
+% CLAP: contrastive language-audio pretraining -- the architecture whose
+% HTSAT-Swin audio tower this chapter LoRA-adapts (the `query`/`value`
+% attention-projection + `linear1` projection-head sites). Verified: Wu et
+% al., ICASSP 2023, arXiv:2211.06687.
+@inproceedings{wu2023clap,
+  title     = {Large-Scale Contrastive Language-Audio Pretraining with
+               Feature Fusion and Keyword-to-Caption Augmentation},
+  author    = {Wu, Yusong and Chen, Ke and Zhang, Tianyu and Hui, Yuchen and
+               Berg-Kirkpatrick, Taylor and Dubnov, Shlomo},
+  booktitle = {IEEE International Conference on Acoustics, Speech and Signal
+               Processing (ICASSP)},
+  year      = {2023},
+  note      = {arXiv:2211.06687}
+}

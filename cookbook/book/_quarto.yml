@@ -73,6 +73,9 @@ book:
     - part: "The ANN index as a set of segments"
       chapters:
         - chapters/23-segmented-ann/segmented-ann.qmd
+    - part: "Real-checkpoint media-tower LoRA"
+      chapters:
+        - chapters/24-media-tower-lora/media-tower-lora.qmd
   appendices:
     - chapters/api-reference.qmd
 

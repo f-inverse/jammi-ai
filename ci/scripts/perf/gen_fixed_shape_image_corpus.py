@@ -375,26 +375,35 @@ def _build_pool(
 def _pool_cache_key(
     families: int, instances_per_family: int, size: int, jitter: int, seed: int
 ) -> str:
-    """Filesystem-safe cache key whose identity is the producer MODULE'S OWN
-    SOURCE BYTES, plus every argument `_build_pool` actually reads.
+    """Filesystem-safe cache key: a sha256 of the producer MODULE'S OWN
+    SOURCE BYTES (`Path(__file__).read_bytes()` -- the WHOLE file on disk)
+    folded together with every argument `_build_pool` actually reads and
+    the interpreter's `(major, minor)` version.
 
-    The key hashes `Path(__file__).read_bytes()` -- the whole file on disk,
-    not a hand-picked closure of "the functions that matter" walked off the
-    AST. That earlier approach needed to enumerate every scope a name could
-    be read from, every way a name could be reached dynamically, and every
-    shape a referenced value could take, and each of those enumerations
-    proved incomplete in turn. Hashing the file's own bytes has no such
-    enumeration to get wrong: there is no code path left to walk, no scope to
-    misclassify, no dynamic-access primitive to miss, because nothing is
-    walked at all. The key is intentionally MAXIMAL -- a real on-disk edit to
-    ANY line of this module (a helper this call never reaches, a constant, a
-    comment, even the module docstring) moves the key and forces one extra
-    pool regeneration (seconds, in a test-only cache) -- in exchange for a
-    guarantee no partial closure can give: two module states that differ by
-    even one byte always produce two different keys, so no false cache hit
-    is possible. `sys.version_info[:2]` is included because the interpreter
-    that runs `_build_pool` is as much a part of "what produced these bytes"
-    as the source is."""
+    Two module states on disk that differ by even one byte hash to two
+    different keys, by construction: nothing about the file is walked,
+    parsed, or classified, so there is no enumeration of "the functions
+    that matter" to get wrong. The key is intentionally MAXIMAL -- an
+    on-disk edit to ANY line of this module (a helper this call never
+    reaches, a constant, a comment, even the module docstring) moves the
+    key and costs one extra pool regeneration (seconds, in a test-only
+    cache).
+
+    Scope of the "no false cache hit" guarantee: it covers this file's
+    bytes and the five arguments above, nothing else. A determinant of the
+    bytes `_build_pool` produces that lives OUTSIDE this file and these
+    arguments -- the zlib the interpreter links against, a different
+    CPython implementation entirely -- is not folded into this key. That
+    is safe only because `--pool-cache-dir` is per-process (the caller
+    allocates it via `tempfile.mkdtemp` and tears it down at process exit
+    -- see `test_profile_421_legs_dry_run.py`) and is refused outside
+    `DRY_RUN` (`profile_421_legs.sh`'s own `POOL_CACHE_ARGS` guard): one
+    invoking process, one interpreter, one platform, per cache directory,
+    so there is never a second environment sharing that directory to
+    collide against. `sys.version_info[:2]` is included anyway because
+    the interpreter that runs `_build_pool` is as much a part of "what
+    produced these bytes" as the source is, and it is the one such
+    determinant this module can read directly."""
     module_bytes = Path(__file__).read_bytes()
     canonical = (
         f"module_sha256={hashlib.sha256(module_bytes).hexdigest()}|"
@@ -406,6 +415,29 @@ def _pool_cache_key(
 
 
 _POOL_CACHE_DONE_MARKER = "_DONE"
+
+
+def _pool_marker_text(families: int, instances_per_family: int, size: int, jitter: int, seed: int) -> str:
+    """The `_DONE` marker's own recorded-shape line -- the single
+    definition [`_load_or_build_pool`] both WRITES on a cache miss and
+    PARSES (via [`_parse_pool_marker`]) on a cache hit, so the two can
+    never independently drift on the field set or the format."""
+    return f"families={families} instances={instances_per_family} size={size} jitter={jitter} seed={seed}\n"
+
+
+def _parse_pool_marker(text: str) -> dict[str, int]:
+    """Inverse of [`_pool_marker_text`]: `"families=4 instances=3 ..."` ->
+    `{"families": 4, "instances": 3, ...}`. Refuses (never guesses) on a
+    marker that does not carry exactly the expected `key=int` tokens, so a
+    hand-edited or truncated marker cannot be silently misread as a shape
+    that happens to compare unequal-but-plausible."""
+    fields: dict[str, int] = {}
+    for token in text.split():
+        key, sep, value = token.partition("=")
+        if not sep or key in fields:
+            raise ValueError(f"malformed or duplicate pool marker field {token!r} in {text!r}")
+        fields[key] = int(value)
+    return fields
 
 
 def _load_or_build_pool(
@@ -420,12 +452,24 @@ def _load_or_build_pool(
     (real runs never set it -- see module doc's `--pool-cache-dir`) --
     IDENTICAL bytes to every invocation with `pool_cache_dir` set. With a
     cache dir given: a cache HIT reads every expected file straight off
-    disk (never re-runs the pixel loop); a cache MISS builds the pool
-    once via `_build_pool`, writes it into a fresh per-key subdirectory,
-    and only then drops the `_DONE` marker that makes it visible to a
-    later hit -- so a process that dies mid-write leaves an incomplete
-    (marker-less) subdirectory that the NEXT invocation rebuilds from
-    scratch, rather than one that reads back a partial pool.
+    disk (never re-runs the pixel loop) -- but ONLY after re-checking the
+    `_DONE` marker's own recorded shape against the shape THIS call was
+    asked for; a cache MISS builds the pool once via `_build_pool`, writes
+    it into a fresh per-key subdirectory, and only then drops the `_DONE`
+    marker that makes it visible to a later hit -- so a process that dies
+    mid-write leaves an incomplete (marker-less) subdirectory that the
+    NEXT invocation rebuilds from scratch, rather than one that reads back
+    a partial pool.
+
+    The marker re-check is belt-and-braces at the point of use: `key`
+    already identifies the requested shape uniquely (see
+    `_pool_cache_key`'s own doc), so under that key's own guarantee the
+    marker recorded under `cache_dir` can only ever describe THIS shape.
+    Re-deriving the requested shape from the call's own arguments and
+    comparing it, BY NAME, against what the marker actually recorded costs
+    one dict comparison and catches, at the read site itself, any way a
+    directory could come to hold a marker for a shape other than the one
+    being asked for -- rather than trusting the key's uniqueness silently.
     """
     if pool_cache_dir is None:
         return _build_pool(families, instances_per_family, size, jitter, seed)
@@ -439,14 +483,24 @@ def _load_or_build_pool(
         for instance in range(instances_per_family)
     ]
     if marker.is_file():
+        recorded = _parse_pool_marker(marker.read_text())
+        requested = _parse_pool_marker(
+            _pool_marker_text(families, instances_per_family, size, jitter, seed)
+        )
+        if recorded != requested:
+            raise ValueError(
+                f"pool cache dir {cache_dir} is marked done for shape {recorded} but this call "
+                f"requested shape {requested} under the SAME cache key {key!r} -- refusing to "
+                "return a pool that may not match the requested shape rather than trusting the "
+                "cache key's uniqueness silently"
+            )
         return {name: (cache_dir / name).read_bytes() for name in expected_names}
 
     files = _build_pool(families, instances_per_family, size, jitter, seed)
     cache_dir.mkdir(parents=True, exist_ok=True)
     for name, data in files.items():
         (cache_dir / name).write_bytes(data)
-    marker.write_text(f"families={families} instances={instances_per_family} "
-                       f"size={size} jitter={jitter} seed={seed}\n")
+    marker.write_text(_pool_marker_text(families, instances_per_family, size, jitter, seed))
     return files
 
 

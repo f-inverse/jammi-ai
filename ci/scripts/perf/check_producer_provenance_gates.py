@@ -38,6 +38,19 @@ Both are deliberately mechanical (name/pattern presence), not a semantic
 understanding of the guard's control flow — the same "grep for the shape,
 not the meaning" stance `check_ci_guard_wiring.py`'s own module doc states.
 
+## Comment handling — a shared rule, applied uniformly across (A), (B), (C)
+
+Every token/regex test in all three checks below runs against
+`_strip_comment(line)`, never the raw line: bash treats an unquoted,
+unescaped `#` as the start of a comment running to end of line, so a
+trailing `# ...` on an otherwise-real line of code must not be able to
+satisfy (B)'s `provenance`/`build_sha` cross-check, nor forge a guard
+shape (A)/(C) would otherwise accept. `_is_comment_line` (a full-line
+predicate — true only when `#` is the first non-blank character) still
+decides whether a whole line counts as a "use" of a variable at all;
+`_strip_comment` additionally trims any trailing comment off a line that
+IS counted, before that line's content is matched against anything.
+
 ## (C) `*_DRY_RUN_*` knob admissibility — a second knob shape beyond `*FAKE*`
 
 (A) only ever looks at names containing the literal substring `FAKE`. A
@@ -164,6 +177,57 @@ def _is_comment_line(line: str) -> bool:
     return line.strip().startswith("#")
 
 
+def _strip_comment(line: str) -> str:
+    """Return `line` with everything from the first UNQUOTED `#` to end of
+    line removed -- the shared abstraction every token/regex test in (A),
+    (B), and (C) below is run against, never the raw line.
+
+    `_is_comment_line` above is a FULL-LINE predicate: it only ever
+    recognizes a line as a comment when the `#` is the first non-blank
+    character. A line that carries real code followed by a trailing `#
+    ...` comment (`BIN="$TARGET_DIR/release/jammi-bench"  # provenance
+    build_sha`, `BIN_PROV_SHA="$SWEEP_FAKE_BIN_SHA"  # SWEEP_DRY_RUN !=
+    "1"; exit 2`) is correctly classified as CODE by `_is_comment_line`,
+    but every downstream check that then scans the RAW line for a token
+    or a regex match reads the trailing comment's text too -- letting a
+    comment alone forge a satisfied cross-check in (B), or forge a guard
+    that is not actually there in (A)/(C). `_strip_comment` closes that
+    hole at its source: apply it once, before any token/regex test, and
+    a trailing comment can no longer contribute a token this scanner
+    treats as code.
+
+    An unquoted `#` is bash's own comment marker; three shapes are NOT
+    comment markers and must survive: a `#` inside a single- or
+    double-quoted string (`echo "a#b"`, `echo 'a#b'`), `$#` (the
+    positional-parameter-count variable), and `${#name}` (bash's
+    string/array-length expansion) -- both of the latter two are
+    recognized by the character immediately preceding the `#` (`$` or
+    `{`)."""
+    in_single = False
+    in_double = False
+    i = 0
+    n = len(line)
+    while i < n:
+        c = line[i]
+        if in_single:
+            if c == "'":
+                in_single = False
+        elif in_double:
+            if c == "\\" and i + 1 < n:
+                i += 1  # an escaped character inside "..." never ends the quote
+            elif c == '"':
+                in_double = False
+        else:
+            if c == "'":
+                in_single = True
+            elif c == '"':
+                in_double = True
+            elif c == "#" and not (i > 0 and line[i - 1] in ("$", "{")):
+                return line[:i]
+        i += 1
+    return line
+
+
 _IF_FI_TOKEN_RE = re.compile(r"\b(if|fi)\b")
 _GUARD_BLOCK_MAX_SCAN = 40
 
@@ -188,13 +252,16 @@ def _guard_block_lines(lines: list[str], start_idx: int) -> list[str]:
     unterminated block still returns everything up to the cap, which keeps
     the caller's `"exit" not in guard_window` check fail-closed (a
     guard whose `fi` never resolves within the cap is treated the same as
-    one with no `exit` at all, never silently credited).
+    one with no `exit` at all, never silently credited). `if`/`fi` tokens
+    are counted off `_strip_comment(lines[i])`, never the raw line, so a
+    comment's own bare "if"/"fi" (this codebase's own prose uses both
+    constantly) cannot perturb the depth walk.
     """
     depth = 0
     end = start_idx
     limit = min(len(lines), start_idx + _GUARD_BLOCK_MAX_SCAN)
     for i in range(start_idx, limit):
-        for tok in _IF_FI_TOKEN_RE.findall(lines[i]):
+        for tok in _IF_FI_TOKEN_RE.findall(_strip_comment(lines[i])):
             depth += 1 if tok == "if" else -1
         end = i
         if depth <= 0:
@@ -207,19 +274,23 @@ def check_fake_knob_inertness(path: Path) -> list[str]:
     lines are skipped when looking for "uses", so a knob merely NAMED in a
     module-doc comment above its real guard is not mistaken for an
     unguarded use — the same comment-vs-code distinction
-    `check_ci_guard_wiring.py`'s `workflow_run_text()` already draws)."""
+    `check_ci_guard_wiring.py`'s `workflow_run_text()` already draws), and
+    every remaining token/regex test below runs against `_strip_comment`'d
+    text, so a trailing `# ...` on a code line cannot forge a guard shape
+    that is not actually there (see module doc, "Comment handling")."""
     text = path.read_text(encoding="utf-8", errors="replace")
     lines = text.splitlines()
+    stripped = [_strip_comment(line) for line in lines]
     fake_vars = sorted(set(FAKE_VAR_RE.findall(text)))
     findings: list[str] = []
     for var in fake_vars:
-        code_use_idx = [i for i, line in enumerate(lines) if not _is_comment_line(line) and var in line]
+        code_use_idx = [i for i, line in enumerate(lines) if not _is_comment_line(line) and var in stripped[i]]
         if not code_use_idx:
             continue  # only ever named in comments/docs — nothing live to guard
         guard_idx = [
             i
             for i in code_use_idx
-            if DRY_RUN_VAR_RE.search(lines[i]) and "!=" in lines[i] and '"1"' in lines[i]
+            if DRY_RUN_VAR_RE.search(stripped[i]) and "!=" in stripped[i] and '"1"' in stripped[i]
         ]
         if not guard_idx:
             findings.append(
@@ -229,7 +300,7 @@ def check_fake_knob_inertness(path: Path) -> list[str]:
             )
             continue
         first_guard = min(guard_idx)
-        guard_window = "\n".join(_guard_block_lines(lines, first_guard))
+        guard_window = "\n".join(_strip_comment(l) for l in _guard_block_lines(lines, first_guard))
         if "exit" not in guard_window:
             findings.append(
                 f"{path}:{first_guard + 1}: `{var}`'s guard line does not `exit` — a guard that "
@@ -249,17 +320,21 @@ def check_producer_parity(path: Path) -> list[str]:
     jammi-bench BINARY PATH (`.../jammi-bench`, never the source-tree
     `crates/jammi-bench/...`) in CODE.
 
-    Both halves of this check are computed off CODE lines only
-    (`_is_comment_line` strips every comment line first, the same
-    comment/code distinction (A) and (C) already draw): a comment
+    Both halves of this check are computed off CODE lines only, with every
+    trailing comment additionally stripped (`_strip_comment`, applied
+    after `_is_comment_line` drops every WHOLE-line comment first — the
+    same comment/code distinction (A) and (C) already draw): a comment
     mentioning `.../jammi-bench` must never pull a script INTO scope (a
     prose reference to another producer's binary path is not this script
-    invoking one), and a comment mentioning `provenance`/`build_sha` must
-    never satisfy the cross-check for a script that only names the tokens
-    in prose — either direction would let a comment forge or dodge this
-    gate's verdict without a single real line of code backing it."""
+    invoking one), and a comment mentioning `provenance`/`build_sha` --
+    whether the comment is the whole line or trails real code on it --
+    must never satisfy the cross-check for a script that only names the
+    tokens in prose — either direction would let a comment forge or dodge
+    this gate's verdict without a single real line of code backing it."""
     text = path.read_text(encoding="utf-8", errors="replace")
-    code_text = "\n".join(line for line in text.splitlines() if not _is_comment_line(line))
+    code_text = "\n".join(
+        _strip_comment(line) for line in text.splitlines() if not _is_comment_line(line)
+    )
     if not BIN_ASSIGN_RE.search(code_text):
         return []
     missing = [tok for tok in ("provenance", "build_sha") if tok not in code_text]
@@ -306,36 +381,36 @@ def _heredoc_aware_block_extent(lines: list[str], start_idx: int) -> tuple[int, 
     own `if`/`else` statements never close with a bash `fi`).
 
     Comment lines (`_is_comment_line`) are never inspected for `if`/`fi`
-    tokens either, for the same reason `check_fake_knob_inertness` already
-    treats comments specially: this heavily-documented codebase's own prose
-    uses the bare English word "if" constantly (e.g. the very sentence
-    documenting `PROFILE_421_LEGS_DRY_RUN_TRUNCATE_CORPUS_VAR`'s guard, one
-    screen above its own real code, reads "... refuses loudly, by name,
-    before any leg runs, if it is ever set without DRY_RUN"). A trailing
-    inline comment on an otherwise-code line is a disclosed residual gap
-    (not hit by either tracked producer today) rather than something this
-    mechanical, grep-shaped scanner attempts to strip.
+    tokens at all, and a CODE line's own trailing `# ...` is stripped
+    (`_strip_comment`) before its `if`/`fi` tokens are counted or its text
+    is checked for a heredoc opener -- this heavily-documented codebase's
+    own prose uses the bare English word "if" constantly (e.g. the very
+    sentence documenting `PROFILE_421_LEGS_DRY_RUN_TRUNCATE_CORPUS_VAR`'s
+    guard, one screen above its own real code, reads "... refuses loudly,
+    by name, before any leg runs, if it is ever set without DRY_RUN"), and
+    without the strip a comment's own "if" could inflate the depth counter
+    with nothing to bring it back down.
 
-    A second, DIFFERENT residual gap, disclosed alongside the one above
-    rather than papered over with a refusal this scanner cannot actually
-    back up: every regex in this module (`FAKE_VAR_RE`, `DRY_RUN_VAR_RE`,
-    `DRY_RUN_KNOB_RE`) matches a LITERAL identifier appearing in the
-    script's own text. A knob name built at RUNTIME -- bash indirect
-    expansion (`${!name}`), `eval "$name=..."`, or a name assembled by
-    string concatenation (`"${PREFIX}_DRY_RUN_${SUFFIX}"`) -- never
-    appears as that literal substring anywhere in the file, so neither
-    this containment/refusal walker nor (A)'s inertness check can see it
-    at all: not a false negative on a knob it inspected and misjudged, but
-    a knob it never knew existed. Not hit by any tracked producer today
-    (every real knob in this file is a bash-conventional literal
-    `NAME="${NAME:-default}"` declaration, never an indirect/constructed
-    one) -- this scanner staying grep-shaped for the two failure classes
-    it DOES catch is the same tradeoff its own module doc already states
-    for (A)/(B) ("mechanical... not a semantic understanding"), not a gap
-    this file should try to close by refusing the pattern outright (a
-    producer author who genuinely needs indirect expansion for an
-    unrelated reason would then be blocked by a check that cannot
-    actually evaluate whether THEIR specific use is safe).
+    A DIFFERENT residual gap, disclosed rather than papered over with a
+    refusal this scanner cannot actually back up: every regex in this
+    module (`FAKE_VAR_RE`, `DRY_RUN_VAR_RE`, `DRY_RUN_KNOB_RE`) matches a
+    LITERAL identifier appearing in the script's own text. A knob name
+    built at RUNTIME -- bash indirect expansion (`${!name}`), `eval
+    "$name=..."`, or a name assembled by string concatenation
+    (`"${PREFIX}_DRY_RUN_${SUFFIX}"`) -- never appears as that literal
+    substring anywhere in the file, so neither this containment/refusal
+    walker nor (A)'s inertness check can see it at all: not a false
+    negative on a knob it inspected and misjudged, but a knob it never
+    knew existed. Not hit by any tracked producer today (every real knob
+    in this file is a bash-conventional literal `NAME="${NAME:-default}"`
+    declaration, never an indirect/constructed one) -- this scanner
+    staying grep-shaped for the failure class it DOES catch is the same
+    tradeoff its own module doc already states for (A)/(B) ("mechanical...
+    not a semantic understanding"), not a gap this file should try to
+    close by refusing the pattern outright (a producer author who
+    genuinely needs indirect expansion for an unrelated reason would then
+    be blocked by a check that cannot actually evaluate whether THEIR
+    specific use is safe).
     """
     depth = 0
     end = start_idx
@@ -349,9 +424,10 @@ def _heredoc_aware_block_extent(lines: list[str], start_idx: int) -> tuple[int, 
                 heredoc_term = None
             continue
         if not _is_comment_line(line):
-            for tok in _IF_FI_TOKEN_RE.findall(line):
+            code = _strip_comment(line)
+            for tok in _IF_FI_TOKEN_RE.findall(code):
                 depth += 1 if tok == "if" else -1
-            m = _HEREDOC_OPEN_RE.search(line)
+            m = _HEREDOC_OPEN_RE.search(code)
             if m:
                 heredoc_term = m.group(1)
         if depth <= 0:
@@ -365,13 +441,16 @@ def _dry_run_true_block_intervals(lines: list[str], governing: str) -> list[tupl
     `profile_421_legs.sh`'s `if [ "$leg_status" = "ok" ] && [
     "$PROFILE_421_LEGS_DRY_RUN" = "1" ] && [ -n "..." ]; then` — the
     equality test appearing ANYWHERE on the `if` line is what matters, not
-    that it is the line's only clause)."""
+    that it is the line's only clause). Matched against `_strip_comment`'d
+    text, so a trailing comment that merely LOOKS like this guard shape
+    can never open a phantom "covered" interval that hides a genuinely
+    unguarded read site elsewhere in the file."""
     guard_re = re.compile(r'\bif\b.*\[\s*"\$' + re.escape(governing) + r'"\s*=\s*"1"\s*\]')
     intervals: list[tuple[int, int]] = []
     for i, line in enumerate(lines):
         if _is_comment_line(line):
             continue
-        if guard_re.search(line):
+        if guard_re.search(_strip_comment(line)):
             intervals.append(_heredoc_aware_block_extent(lines, i))
     return intervals
 
@@ -385,9 +464,11 @@ def check_dry_run_knob_containment(path: Path) -> list[str]:
     `<PREFIX>_DRY_RUN_<SUFFIX>` test knob, admissible by EITHER containment
     (every read site inside an `if [ "$<PREFIX>_DRY_RUN" = "1" ]`-guarded
     region) or (A)'s own preflight-refusal shape, generalized off the
-    `FAKE` name requirement."""
+    `FAKE` name requirement. Every token/regex test below runs against
+    `_strip_comment`'d text (see module doc, "Comment handling")."""
     text = path.read_text(encoding="utf-8", errors="replace")
     lines = text.splitlines()
+    stripped = [_strip_comment(line) for line in lines]
     knob_vars = sorted(set(DRY_RUN_KNOB_RE.findall(text)))
     findings: list[str] = []
     for var in knob_vars:
@@ -395,18 +476,22 @@ def check_dry_run_knob_containment(path: Path) -> list[str]:
         code_use_idx = [
             i
             for i, line in enumerate(lines)
-            if not _is_comment_line(line) and var in line and not _is_self_default_assignment(line, var)
+            if not _is_comment_line(line)
+            and var in stripped[i]
+            and not _is_self_default_assignment(stripped[i], var)
         ]
         if not code_use_idx:
             continue  # only ever named in comments/docs, or only ever self-defaulted
 
         governing_re = re.compile(r"\b" + re.escape(governing) + r"\b")
         guard_idx = [
-            i for i in code_use_idx if governing_re.search(lines[i]) and "!=" in lines[i] and '"1"' in lines[i]
+            i
+            for i in code_use_idx
+            if governing_re.search(stripped[i]) and "!=" in stripped[i] and '"1"' in stripped[i]
         ]
         if guard_idx:
             first_guard = min(guard_idx)
-            guard_window = "\n".join(_guard_block_lines(lines, first_guard))
+            guard_window = "\n".join(_strip_comment(l) for l in _guard_block_lines(lines, first_guard))
             earlier = [i for i in code_use_idx if i < first_guard]
             if "exit" in guard_window and not earlier:
                 continue  # admissible via preflight refusal (mode 2)
@@ -438,6 +523,41 @@ def _scratch_git(args: list[str], cwd: Path) -> subprocess.CompletedProcess:
     return subprocess.run(["git", *_GIT_NO_BACKGROUND_MAINTENANCE, *args], cwd=cwd, check=True)
 
 
+def _self_test_strip_comment() -> list[str]:
+    """Direct, fixture-free assertions on `_strip_comment` itself -- the
+    shared primitive every arm's forged-GREEN self-test fixtures below
+    exercise only indirectly through a full `check_*` call. Returns a list
+    of failure descriptions (empty when everything passes)."""
+    failures: list[str] = []
+
+    def check(got: str, expected: str, label: str) -> None:
+        if got != expected:
+            failures.append(f"_strip_comment self-check FAILED ({label}): got {got!r}, expected {expected!r}")
+
+    # Trailing comment on an otherwise-real code line is stripped.
+    check(
+        _strip_comment('BIN="$X"  # provenance build_sha'),
+        'BIN="$X"  ',
+        "trailing comment on a code line",
+    )
+    # A whole-line comment strips to nothing but leading whitespace.
+    check(_strip_comment("# just a comment"), "", "whole-line comment")
+    check(_strip_comment("  # indented comment"), "  ", "indented whole-line comment")
+    # A `#` inside a double-quoted string is NOT a comment marker.
+    check(_strip_comment('echo "value#1"'), 'echo "value#1"', "# inside double quotes")
+    # A `#` inside a single-quoted string is NOT a comment marker.
+    check(_strip_comment("echo 'a#b'"), "echo 'a#b'", "# inside single quotes")
+    # `${#name}` (bash length expansion) is NOT a comment marker.
+    check(_strip_comment("n=${#myvar}"), "n=${#myvar}", "${#var} length expansion")
+    # `$#` (positional-parameter count) is NOT a comment marker.
+    check(_strip_comment("echo $# arguments"), "echo $# arguments", "$# positional count")
+    # A REAL comment following a closed quoted string is still stripped.
+    check(_strip_comment('echo "ok" # trailing'), 'echo "ok" ', "comment after a closed quote")
+    # A line with no `#` at all is returned unchanged.
+    check(_strip_comment('echo "no hash here"'), 'echo "no hash here"', "no hash at all")
+    return failures
+
+
 def run_gate(perf_dir: Path, repo_root: Path) -> list[str]:
     findings: list[str] = []
     for path in _tracked_sh_under(repo_root, "ci/scripts/"):
@@ -450,6 +570,7 @@ def run_gate(perf_dir: Path, repo_root: Path) -> list[str]:
 
 def self_test() -> int:
     failures: list[str] = []
+    failures += _self_test_strip_comment()
 
     with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as tmp:
         repo = Path(tmp)
@@ -560,6 +681,27 @@ def self_test() -> int:
             None,
         )
 
+        # (A) RED, round-5 audit B2's "trailing-comment trigger": a knob use
+        # whose ONLY guard-shaped text (`SWEEP_DRY_RUN`, `!=`, `"1"`, and
+        # `exit`) sits inside a TRAILING comment on the very same line as the
+        # use. Before `_strip_comment`, this single line satisfied `var in
+        # line`, `DRY_RUN_VAR_RE.search(line)`, `"!=" in line`, `'"1"' in
+        # line`, AND `"exit" in guard_window` all at once — the whole line
+        # counted as both its own "use" and its own "guard", so this knob
+        # forged a full GREEN (zero findings) despite having no real guard
+        # control flow at all. With comments stripped first, the use survives
+        # but the (fake) guard vanishes, correctly reporting "no refusal
+        # guard".
+        commit_and_check(
+            "ci/scripts/perf/bad_fake_knob_guard_forged_by_trailing_comment.sh",
+            (
+                '#!/usr/bin/env bash\n'
+                'BIN_PROV_SHA="$SWEEP_FAKE_BIN_SHA"  # SWEEP_DRY_RUN != "1"; exit 2 if triggered\n'
+            ),
+            check_fake_knob_inertness,
+            "no refusal guard",
+        )
+
         # (B) RED: names a jammi-bench binary path, invokes it, but never
         # cross-checks provenance.
         commit_and_check(
@@ -623,6 +765,25 @@ def self_test() -> int:
             "missing",
         )
 
+        # (B) RED, round-5 audit B2's "trailing-comment satisfaction": the
+        # binary-path line itself carries the ONLY mention of
+        # `provenance`/`build_sha`, as a TRAILING comment on that very line
+        # (never a whole comment line `_is_comment_line` would already
+        # exclude). Before `_strip_comment`, `code_text` kept this line's
+        # RAW text (since `_is_comment_line` correctly calls it a code
+        # line), so the trailing comment's tokens satisfied the cross-check
+        # with no real code backing it — a comment alone forging GREEN.
+        commit_and_check(
+            "ci/scripts/perf/bad_provenance_satisfied_only_by_trailing_comment.sh",
+            (
+                '#!/usr/bin/env bash\n'
+                'BIN="$TARGET_DIR/release/jammi-bench"  # would check "$BIN" provenance build_sha but skipped\n'
+                '"$BIN" finetune-step --batch 1\n'
+            ),
+            check_producer_parity,
+            "missing",
+        )
+
         # (C) RED: a `_DRY_RUN_` knob read completely unguarded — no
         # containment, no preflight refusal.
         commit_and_check(
@@ -665,6 +826,29 @@ def self_test() -> int:
                 'STUBEOF\n'
                 'fi\n'
                 'echo "${FOO_DRY_RUN_BAZ:-}"\n'
+            ),
+            check_dry_run_knob_containment,
+            "outside any",
+        )
+
+        # (C) RED, round-5 audit B2's "trailing-comment trigger" for arm (C):
+        # the knob's use line carries NO real guard code of its own, but a
+        # TRAILING comment on that same line spells out the full preflight
+        # shape (`FOO_DRY_RUN`, `!=`, `"1"`, `exit`). Before `_strip_comment`
+        # this one line satisfied `governing_re.search`/`"!=" in`/`'"1"' in`
+        # AND `"exit" in guard_window` simultaneously (the guard-block walk
+        # off a line with no if/fi tokens returns just that one line), so
+        # the knob was admitted via preflight refusal (mode 2) with zero
+        # real guarding code — a forged GREEN. With comments stripped, no
+        # guard shape remains on the line and no `if [ "$FOO_DRY_RUN" = "1"
+        # ]`-guarded interval exists anywhere in the file either, so the use
+        # correctly reports "outside any".
+        commit_and_check(
+            "ci/scripts/perf/bad_dry_run_knob_guard_forged_by_trailing_comment.sh",
+            (
+                '#!/usr/bin/env bash\n'
+                'FOO_DRY_RUN="${FOO_DRY_RUN:-0}"\n'
+                'echo "${FOO_DRY_RUN_BAR:-}"  # FOO_DRY_RUN != "1"; exit 2 if triggered\n'
             ),
             check_dry_run_knob_containment,
             "outside any",

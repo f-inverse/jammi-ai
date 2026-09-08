@@ -75,14 +75,15 @@ when nothing about this generator or its fixtures has drifted:
      by the real consumer today, not merely "regenerable to the same
      logical content" in the abstract.
 
-A final internal meta-check drives (3)'s own comparator against a
-scratch row-mutated copy and a scratch schema-altered copy of a
-committed file (each must RED) and against a scratch `PRAGMA
-user_version`-changed copy and a scratch `VACUUM`ed copy (each must stay
-GREEN) -- so the oracle's own discriminating power is itself gated, not
-merely asserted in a comment. Wired into `.github/workflows/ci.yml`
-("perf nsys kernel fixture self-test"), not a doc claim a future edit to
-this generator (or a regeneration someone forgets to run) can silently
+A final internal meta-check drives (3)'s own comparator against a scratch
+row-mutated copy, a scratch schema-altered (`ALTER TABLE`) copy, and a
+scratch copy with an added INDEX, VIEW, or TRIGGER of a committed file
+(each must RED) and against a scratch `PRAGMA user_version`-changed copy
+and a scratch `VACUUM`ed copy (each must stay GREEN) -- so the oracle's
+own discriminating power is itself gated, not merely asserted in a
+comment. Wired into `.github/workflows/ci.yml` ("perf nsys kernel fixture
+self-test"), not a doc claim a future edit to this generator (or a
+regeneration someone forgets to run) can silently
 invalidate.
 """
 
@@ -228,9 +229,12 @@ def _self_test_oracle_meta(committed_path: str) -> None:
     """Proves `_assert_logically_identical` itself discriminates real
     drift from benign byte-level-only differences, against scratch copies
     of `committed_path` (never the committed file itself, which is never
-    mutated): a row-mutated copy and a schema-altered copy must each RED
-    (raise `AssertionError`); a copy with a different `PRAGMA user_version`
-    and a `VACUUM`ed copy -- two ways to change a sqlite file's raw bytes
+    mutated): a row-mutated copy, a schema-altered copy (`ALTER TABLE`),
+    and a copy with an added INDEX, VIEW, or TRIGGER (three more
+    `sqlite_master` OBJECT TYPES `_logical_snapshot`'s schema dict keys on
+    -- see that function's own doc) must each RED (raise
+    `AssertionError`); a copy with a different `PRAGMA user_version` and a
+    `VACUUM`ed copy -- two ways to change a sqlite file's raw bytes
     without changing its logical content -- must each stay GREEN (compare
     logically identical to the original). Without this, the comparator
     above could silently degrade into a no-op (e.g. a typo that always
@@ -273,6 +277,78 @@ def _self_test_oracle_meta(committed_path: str) -> None:
                 "gen_nsys_kernel_fixture self-test meta-check: a schema-altered scratch copy "
                 "compared logically IDENTICAL to the committed fixture -- "
                 "_assert_logically_identical is not detecting schema drift"
+            )
+
+        # `_logical_snapshot`'s schema dict is keyed by every `sqlite_master`
+        # OBJECT TYPE (`table`, `index`, `trigger`, `view`), not `table`
+        # alone (see that function's own doc) -- but until now this
+        # meta-check only ever exercised the `table` row via `ALTER TABLE`.
+        # An added INDEX/VIEW/TRIGGER is a DIFFERENT kind of drift (a whole
+        # new `sqlite_master` row, not a change to an existing table's
+        # columns), and a real nsys export or a `VACUUM`/tooling pass can
+        # add any of the three alongside its tables -- each must RED here
+        # too, proving the multi-type schema comparison the module doc
+        # promises actually discriminates on TYPE, not merely on `table`.
+        index_added = os.path.join(tmp, "index_added.sqlite")
+        shutil.copyfile(committed_path, index_added)
+        con = sqlite3.connect(index_added)
+        try:
+            con.execute("CREATE INDEX idx_kernel_start ON CUPTI_ACTIVITY_KIND_KERNEL(start)")
+            con.commit()
+        finally:
+            con.close()
+        try:
+            _assert_logically_identical(committed_path, index_added, "meta-index-added")
+        except AssertionError:
+            pass
+        else:
+            raise AssertionError(
+                "gen_nsys_kernel_fixture self-test meta-check: a scratch copy with an added "
+                "INDEX compared logically IDENTICAL to the committed fixture -- "
+                "_assert_logically_identical is not detecting a new sqlite_master OBJECT"
+            )
+
+        view_added = os.path.join(tmp, "view_added.sqlite")
+        shutil.copyfile(committed_path, view_added)
+        con = sqlite3.connect(view_added)
+        try:
+            con.execute(
+                "CREATE VIEW kernel_launches_view AS SELECT * FROM CUPTI_ACTIVITY_KIND_KERNEL"
+            )
+            con.commit()
+        finally:
+            con.close()
+        try:
+            _assert_logically_identical(committed_path, view_added, "meta-view-added")
+        except AssertionError:
+            pass
+        else:
+            raise AssertionError(
+                "gen_nsys_kernel_fixture self-test meta-check: a scratch copy with an added "
+                "VIEW compared logically IDENTICAL to the committed fixture -- "
+                "_assert_logically_identical is not detecting a new sqlite_master OBJECT"
+            )
+
+        trigger_added = os.path.join(tmp, "trigger_added.sqlite")
+        shutil.copyfile(committed_path, trigger_added)
+        con = sqlite3.connect(trigger_added)
+        try:
+            con.execute(
+                "CREATE TRIGGER trg_kernel_noop AFTER INSERT ON CUPTI_ACTIVITY_KIND_MEMCPY "
+                "BEGIN SELECT 1; END"
+            )
+            con.commit()
+        finally:
+            con.close()
+        try:
+            _assert_logically_identical(committed_path, trigger_added, "meta-trigger-added")
+        except AssertionError:
+            pass
+        else:
+            raise AssertionError(
+                "gen_nsys_kernel_fixture self-test meta-check: a scratch copy with an added "
+                "TRIGGER compared logically IDENTICAL to the committed fixture -- "
+                "_assert_logically_identical is not detecting a new sqlite_master OBJECT"
             )
 
         user_version_changed = os.path.join(tmp, "user_version_changed.sqlite")

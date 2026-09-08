@@ -25,6 +25,7 @@ import shutil
 import sys
 import tempfile
 import unittest
+import unittest.mock
 from pathlib import Path
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
@@ -53,13 +54,13 @@ def _mean_abs_diff(a: bytes, b: bytes) -> float:
 def _load_variant_module(replacements: list[tuple[str, str]], tag: str, add_cleanup) -> object:
     """Import a temp copy of `gen_fixed_shape_image_corpus.py` with each
     `(old, new)` in `replacements` applied as a literal one-occurrence
-    source substitution -- REAL SOURCE, never a monkeypatch of a live
-    object. A monkeypatch replaces the OBJECT `globals()` finds; it does
-    not move `inspect.getsource`, so it cannot distinguish "the source
-    moved" from "a different object with the same source is now bound to
-    this name". `add_cleanup` is normally a `TestCase.addCleanup` bound
-    method, so the temp directory is removed once the calling test
-    finishes."""
+    source substitution -- a REAL file on disk, imported under a FRESH
+    module name. `_pool_cache_key` hashes `Path(__file__).read_bytes()`,
+    so the only way to prove a real source edit moves the key is to give
+    the key function an actual, differently-byted file to hash; nothing
+    short of a real edited file on disk exercises that read path.
+    `add_cleanup` is normally a `TestCase.addCleanup` bound method, so the
+    temp directory is removed once the calling test finishes."""
     src = Path(gfi.__file__).read_text(encoding="utf-8")
     for old, new in replacements:
         occurrences = src.count(old)
@@ -396,12 +397,96 @@ class PoolCacheTests(unittest.TestCase):
             self.assertEqual(after - before, {Path(tmp) / "out"})
 
     def test_unchanged_construction_code_hits_the_same_cache_key(self):
-        """Calling the key function twice with nothing patched must be
-        IDENTICAL -- proves the fingerprint is deterministic given
-        unchanged code, not merely "different every time a function object
-        is looked up"."""
+        """Calling the key function twice with nothing edited must be
+        IDENTICAL: the fingerprint is a pure function of its arguments and
+        this file's current on-disk bytes, so two calls against unchanged
+        source can never disagree."""
         args = (4, 3, 10, 8, 1)
         self.assertEqual(gfi._pool_cache_key(*args), gfi._pool_cache_key(*args))
+
+    def test_a_marker_recorded_for_a_different_shape_under_the_same_key_is_refused(self):
+        """Belt-and-braces at the point of use (round-5 audit B1(b)): a
+        `_DONE` marker's OWN recorded shape must agree, BY NAME, with the
+        shape this call actually requested -- checked even though `key`
+        already claims to identify the requested shape uniquely. Simulates
+        the one way that claim could fail (a hand-corrupted marker, or a
+        would-be cache-key collision) by writing a marker for a DIFFERENT
+        `size` value into the exact directory this key resolves to, then
+        driving the real lookup path (`_load_or_build_pool`, never the
+        marker file directly) at the ORIGINAL shape."""
+        with tempfile.TemporaryDirectory() as tmp:
+            cache_dir = Path(tmp) / "cache"
+            args = (4, 3, 10, 8, 1)  # families, instances, size, jitter, seed
+            key = gfi._pool_cache_key(*args)
+            key_dir = cache_dir / key
+            key_dir.mkdir(parents=True)
+            (key_dir / gfi._POOL_CACHE_DONE_MARKER).write_text(
+                "families=4 instances=3 size=9 jitter=8 seed=1\n"
+            )
+            with self.assertRaises(ValueError) as ctx:
+                gfi._load_or_build_pool(cache_dir, *args)
+            self.assertIn("'size': 9", str(ctx.exception))
+            self.assertIn("'size': 10", str(ctx.exception))
+
+    def test_marker_round_trips_through_write_and_parse(self):
+        """[`gfi._pool_marker_text`]/[`gfi._parse_pool_marker`] are exact
+        inverses for every field the marker carries -- the single
+        definition the write path (a cache MISS) and the read path (a
+        cache HIT's belt-and-braces check) both go through, so they cannot
+        independently drift on the field set."""
+        args = dict(families=6, instances_per_family=3, size=32, jitter=12, seed=9)
+        text = gfi._pool_marker_text(**args)
+        parsed = gfi._parse_pool_marker(text)
+        self.assertEqual(
+            parsed, {"families": 6, "instances": 3, "size": 32, "jitter": 12, "seed": 9}
+        )
+
+
+class PoolCacheKeyDeterminantTests(unittest.TestCase):
+    """Round-5 audit B1(a): the numeric-arg half of `_pool_cache_key`'s
+    canonical string previously had exactly ONE tested oracle (`--seed`,
+    via `test_a_different_pool_shape_gets_a_different_cache_key`) --
+    drop-one-determinant mutants (delete `families=...|` from the
+    canonical f-string, or `instances=...|`, or `size=...|`, or
+    `jitter=...|`, or the `py=...|` interpreter segment) would each still
+    pass every test in this file, and a jitter-blind mutant would produce
+    a real false cache hit (two genuinely different pools sharing one
+    cache directory) undetected.
+
+    This is a LOOP over an explicit determinant list, not one hand-written
+    test per field, precisely so a determinant added to the canonical
+    string LATER but never added to `_BASE` below is a `KeyError` this
+    test raises immediately -- never a determinant that silently stops
+    being tested."""
+
+    _BASE = dict(families=4, instances_per_family=3, size=10, jitter=8, seed=1)
+
+    @staticmethod
+    def _key(**overrides) -> str:
+        kw = {**PoolCacheKeyDeterminantTests._BASE, **overrides}
+        return gfi._pool_cache_key(
+            kw["families"], kw["instances_per_family"], kw["size"], kw["jitter"], kw["seed"]
+        )
+
+    def test_each_numeric_determinant_moves_the_key_alone(self):
+        baseline = self._key()
+        for determinant in ("families", "instances_per_family", "size", "jitter", "seed"):
+            with self.subTest(determinant=determinant):
+                bumped = self._key(**{determinant: self._BASE[determinant] + 1})
+                self.assertNotEqual(
+                    baseline, bumped, f"changing {determinant!r} alone must move the cache key"
+                )
+
+    def test_interpreter_version_is_a_determinant(self):
+        """`sys.version_info[:2]` is folded into the canonical string
+        directly off the real `sys` module (never an argument), so this
+        one determinant is exercised by patching the ACTUAL global state
+        `_pool_cache_key` reads -- not a source edit -- since there is no
+        other way to observe a second interpreter version in one process."""
+        baseline = self._key()
+        with unittest.mock.patch.object(gfi.sys, "version_info", (3, 1, 0, "final", 0)):
+            other = self._key()
+        self.assertNotEqual(baseline, other)
 
 
 class RealSourceEditMovesTheKeyTests(unittest.TestCase):

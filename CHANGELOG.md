@@ -238,7 +238,15 @@ workspace ships every publishable crate at the same
   `finetune-run` legs over HTSAT and CLIP-vision, a two-sided bar against the `n / ideal` machine
   model with the base-to-base spread as its own error bar, and a new committed cuda-run artifact
   producer distinct from the existing #421 tower-profile artifact), with its own hermetic dry-run
-  suite wired into `ci.yml`; no numbers are recorded from a run yet.
+  suite wired into `ci.yml`. The close-out run (A100 80GB PCIe, P=26, n=24, 3
+  interleaved pairs, `crates/jammi-kernels/artifacts/cuda-runs/2026-09-08-frontend-0a8562c4-a100-pcie.json`)
+  measured HTSAT front-end mean 1.335 s → 0.108 s per step (step wall ≈1.56 s
+  → 0.34 s), a bar ratio of 0.0809 with interval [0.0772, 0.0871] against
+  bounds [0.0448, 0.0864] — UNRESOLVED under both the driver-default and the
+  run's own measured serial-tail ratio. Per the contract's own Verdict
+  clause the unit ships because bit identity holds and there is no serving
+  regression, with these numbers recorded and no parallel-efficiency claim
+  made.
 - **HTSAT's MLP and projection GELU reach the fused seam on the training path (#421).** The audio
   tower's two GELU-erf sites — each Swin block's MLP and the projection head's `"gelu"` arm — call
   the house seam `activations::gelu_erf(x, training)` instead of `Tensor::gelu_erf()` directly, the

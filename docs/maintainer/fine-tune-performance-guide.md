@@ -532,11 +532,21 @@ rayon's GLOBAL pool (candle installs no private pool of its own, so this is the 
 the process ever schedules media-batch work on; `rayon` becomes a direct `jammi-ai`
 dependency, already unified at 1.11 in the lock).
 
-**No numbers are recorded here yet.** The profile artifact this section would otherwise
-cite for the HTSAT/vision front-end share of a step
-(`crates/jammi-kernels/artifacts/cuda-runs/2026-09-07-profile-421-towers-c1b0b0ba-a100-sxm4.json`)
-lands with its own artifact PR, not this branch — §11's first checklist applies
-unchanged: every number in a doc names its producer, or it is not written.
+**Measured: the HTSAT/CLIP-vision front-end A/B.** The close-out run
+(`crates/jammi-kernels/artifacts/cuda-runs/2026-09-08-frontend-0a8562c4-a100-pcie.json`,
+A100 80GB PCIe, tip `0a8562c4` vs base `c1b0b0ba`, P=26, n=24 items/step, 3 interleaved
+base/tip pairs) measured HTSAT's front end at a 1.335 s → 0.108 s per-step mean (step wall
+≈1.56 s → 0.34 s); CLIP-vision's front end moved 0.0293 s → 0.0078 s (report-only, no
+bar). The HTSAT bar read ratio 0.0809, interval [0.0772, 0.0871], against bounds [0.0448,
+0.0864] — a bound falls strictly inside the interval, so the bar is UNRESOLVED, invariant
+under both the driver-default and the run's own measured serial-tail ratio. Per the
+contract's own Verdict clause this is not ACTIVATE: the unit ships because bit identity
+holds and there is no serving regression, with these numbers recorded and NO
+parallel-efficiency claim made. The separate #421 tower-profile artifact naming the front
+end's SHARE of a full training step (a different measurement from this unit's own
+base/tip A/B) still lands with its own artifact PR, not this branch — §11's first
+checklist applies unchanged: every number in a doc names its producer, or it is not
+written.
 
 **The mechanism.** Two parallel stages, the same shape on both towers:
 
@@ -584,20 +594,30 @@ about the box and the process, never a determinant of what a step computes, so i
 never an identity field.
 
 **The pre-registered A/B.** `ci/scripts/perf/frontend_ab.sh` drives the contract's
-base/tip comparison: two prebuilt `jammi-bench` binaries, interleaved base/tip/base/tip
-legs over untraced `finetune-run` on HTSAT and CLIP-vision, at the profile's own pinned
-leg parameters. The decision quantity is `media_front_end_wall_s / steps_measured`; the
-bar is TWO-SIDED against the machine model (`P` read from the tip binary's own
-`rayon_pool_threads`, `ideal = n / ceil(n / P)` at the batch's item count `n`, `r` the
-operator-supplied CPU-local serial-tail ratio): a ratio above the upper bound is not
-enough speedup (FAIL), a ratio below the lower bound means the instrument, never the
-code, is broken (nothing can beat the ideal), and the base-to-base spread of the
-interleaved runs is the error bar a decision inside it treats as UNRESOLVED rather than
-a confident call. CLIP-vision is report-only. Verdict: ACTIVATE the change iff the
-HTSAT bar holds — the script only records the outcome, never gates or reverts a build on
-it. A hermetic dry-run suite (`ci/scripts/perf/test_frontend_ab_dry_run.py`) drives the
-real script end to end with hermetic stand-in binaries and no GPU, and is a matrix leg
-in `.github/workflows/ci.yml`.
+base/tip comparison: two prebuilt `jammi-bench` binaries, interleaved base/tip legs
+(`$FRONTEND_AB_REPEATS` pairs, `r1`..`rN`) over untraced `finetune-run` on HTSAT and
+CLIP-vision, at the profile's own pinned leg parameters. The decision quantity is
+`media_front_end_wall_s / steps_measured`; the bar is TWO-SIDED against the machine model
+(`P` read from the tip binary's own `rayon_pool_threads`, `ideal = n / ceil(n / P)` at the
+batch's item count `n`, `r` the operator-supplied CPU-local serial-tail ratio).
+`frontend_ab_merge.py` propagates the interval from BOTH arms' own observed repeats, never
+from the base-to-base spread alone: `ratio_lo = min(tip legs) / max(base legs)`,
+`ratio_hi = max(tip legs) / min(base legs)`. PASS iff the WHOLE interval clears the bar
+(`ratio_hi <= upper_bound` and `ratio_lo >= lower_bound`); FAIL iff the whole interval is
+too slow (`ratio_lo > upper_bound`); INVALID_BEATS_IDEAL iff the whole interval beats the
+machine model's own ideal (`ratio_hi < lower_bound`); UNRESOLVED otherwise, a bound
+falling strictly inside `[ratio_lo, ratio_hi]`. CLIP-vision is report-only. Verdict:
+ACTIVATE the change iff the HTSAT bar holds — the script only records the outcome, never
+gates or reverts a build on it. The close-out run's own recorded deviations (named, never
+silently absorbed into the numbers above — see the committed artifact for detail): the
+measured tip commit precedes the tree the merge report was rendered from (later commits on
+top touched tests/docs/serving-path code, never the timed front-end path); the
+driver-default serial-tail ratio differs from this run's own measured serial-tail ratio,
+with the bar's verdict asserted invariant under both; and the pod's CPU was shared-host at
+launch, so `P` reflects the run's own cgroup quota rather than the box's full core count.
+A hermetic dry-run suite (`ci/scripts/perf/test_frontend_ab_dry_run.py`) drives the real
+script end to end with hermetic stand-in binaries and no GPU, and is a matrix leg in
+`.github/workflows/ci.yml`.
 
 ### The bench and its torch twin
 

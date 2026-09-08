@@ -279,6 +279,40 @@ Both new scopes are subject to the IDENTICAL adjacent-identifier rule and
 in-bounds check the original `_DOC_SEARCH_ROOTS` form uses — the extension
 buys coverage, never a weaker check.
 
+## A frozen pre-registration's citations are pinned to their own epoch
+
+A `docs/plans/<N>-<slug>/CONTRACT.md`-shaped pre-registration is reviewed
+and FROZEN before any measurement, then kept byte-identical to that frozen
+copy for the rest of the unit's life (the doctrine `docs/plans/66-tower-
+profile/CONTRACT.md` names explicitly) — its Scope-facts citations describe
+the code as it stood the day the freeze was reviewed, never as it reads at
+whatever LATER HEAD re-runs this gate. Re-resolving them against HEAD is
+the exact category error the "Committed artifacts are append-only
+evidence" section above already names for a JSON artifact's own `git_sha`
+field, and the inline-pin section names for a single citation's own "at
+HEAD `<sha>`" phrase — this is the WHOLE-FILE form of the same principle,
+for a class neither of those two covers: a file that is not JSON evidence
+and carries no per-citation pin phrase, but whose ENTIRE body is frozen at
+once. A file opts in with an HTML comment naming the epoch within its own
+first few lines, e.g. `<!-- citations-resolve-at:
+bff1fad65683760f6a6b2f6677b74e61f20d96f5 -->` (`_file_citations_epoch`) —
+every `path:line` citation the rest of THIS SAME FILE carries then resolves
+against that sha's tree (`git show <sha>:<path>`), never HEAD, under the
+IDENTICAL adjacent-identifier and in-bounds checks every other class above
+already gets. Two ways this differs from the artifacts/ arm, both
+deliberate: (1) the epoch sha MUST be an ancestor of `HEAD` — fails CLOSED,
+never EXEMPT, if it is not (a frozen contract's own declared epoch is
+reviewed, reachable prose about THIS branch's history, not
+squashed-away-and-ungraftable legacy evidence, so a non-ancestor pin here
+is a wrong or fabricated header, not a legitimate historical artifact); (2)
+a malformed header value (present but not a well-formed 40-character hex
+sha) is ALSO a hard fail, never silently treated as "no header" — a typo'd
+epoch must never quietly fall back to ordinary HEAD-relative resolution,
+which would paper over the very drift this convention exists to pin
+against. Scoped to `.md` files only (the pre-registration's own shape);
+every other file's citations keep the resolution behaviour described above
+completely unchanged by this.
+
 Run: `python3 ci/scripts/perf/check_citations.py`
 Hermetic for every non-artifact citation (reads only files in the working
 tree; no network, no build). An artifact-scoped citation additionally shells
@@ -486,6 +520,61 @@ def _artifact_git_sha(path: Path) -> str | None:
     if isinstance(sha, str) and GIT_SHA_RE.match(sha):
         return sha
     return None
+
+
+# The whole-file epoch pin -- see the module doc's "A frozen
+# pre-registration's citations are pinned to their own epoch" section.
+_CITATIONS_EPOCH_HEADER_RE = re.compile(r"citations-resolve-at:\s*(\S+)")
+
+# How many leading lines of a Markdown file are searched for the header --
+# generous enough to cover a SECOND HTML comment line immediately after the
+# file's own opening comment (the shape a frozen contract's freeze-ledger
+# comment already uses), never the whole file: a `citations-resolve-at:`-
+# shaped phrase appearing deep in ordinary prose, unrelated to this
+# convention, must never be misread as the header.
+_CITATIONS_EPOCH_HEADER_SEARCH_LINES = 6
+
+
+def _file_citations_epoch(path: Path, text: str) -> tuple[str | None, str | None]:
+    """The commit sha a Markdown file's own `<!-- citations-resolve-at:
+    <sha> -->` header declares every one of ITS OWN `path:line` citations
+    resolves against -- the WHOLE-FILE analogue of the artifacts/ arm's
+    per-file `git_sha` JSON field and the inline arm's per-citation "at
+    HEAD `<sha>`" phrase, for a class neither of those two covers: a frozen
+    pre-registration whose body is reviewed BEFORE measurement and then
+    kept byte-identical to that frozen copy forever after -- its citations
+    describe the code as it stood at review time, never as it reads at
+    whatever later HEAD re-runs this gate, and the freeze doctrine forbids
+    re-pointing them the moment a later, unrelated commit inserts lines
+    above them.
+
+    Returns `(sha, None)` if a well-formed header is found in the first
+    `_CITATIONS_EPOCH_HEADER_SEARCH_LINES` lines; `(None, None)` if no
+    header line is present at all (ordinary HEAD-relative resolution,
+    completely unchanged -- this is an opt-IN convention, never a
+    heuristic guess); `(None, message)` if a header LINE is present but its
+    value is not a well-formed 40-character hex commit sha -- a malformed
+    pin is a HARD FAIL, never silently treated as "no header" (which would
+    silently fall back to HEAD-relative resolution for a file whose author
+    explicitly declared otherwise -- the same reviewability argument the
+    inline commit-pin arm's own module doc section already makes for a
+    fabricated sha, just for a value that is not even well-typed rather
+    than one this checkout's object database cannot find).
+    """
+    if path.suffix != ".md":
+        return None, None
+    for line in text.splitlines()[:_CITATIONS_EPOCH_HEADER_SEARCH_LINES]:
+        m = _CITATIONS_EPOCH_HEADER_RE.search(line)
+        if not m:
+            continue
+        candidate = m.group(1)
+        if GIT_SHA_RE.match(candidate):
+            return candidate, None
+        return None, (
+            f"declares a 'citations-resolve-at: {candidate}' header, but {candidate!r} "
+            "is not a well-formed 40-character hex commit sha"
+        )
+    return None, None
 
 
 def _git_relpath(target_path: Path) -> str | None:
@@ -1157,6 +1246,44 @@ def _check_file_impl(path: Path) -> tuple[list[Violation], list[Exemption]]:
         _require_history()
         sha_is_ancestor = _is_ancestor(artifact_sha)
 
+    # A frozen pre-registration's own whole-file epoch pin (module doc's "A
+    # frozen pre-registration's citations are pinned to their own epoch"
+    # section) -- computed ONCE per file, same as `artifact_sha`, and
+    # mutually exclusive with it by construction (`.md` vs `.json` under
+    # `artifacts/` never overlap on the same file). Unlike `artifact_sha`'s
+    # non-ancestor case (EXEMPT, historical evidence that may legitimately
+    # predate this repo's merge-commit discipline), a bad epoch header
+    # here FAILS CLOSED for the whole file, immediately, before any
+    # per-citation resolution: a frozen contract's declared epoch is
+    # reviewed, reachable prose about THIS branch's own history, so a
+    # malformed value or a non-ancestor sha is a wrong or fabricated
+    # header, never a legitimate reason to fall back to ordinary
+    # HEAD-relative resolution (which would silently paper over the exact
+    # drift this convention exists to pin against).
+    epoch_sha, epoch_header_error = _file_citations_epoch(path, text)
+    if epoch_header_error is not None:
+        violations.append(
+            Violation(
+                path, 1,
+                f"{epoch_header_error} -- fix the header (or remove it, which reverts this "
+                "file to ordinary HEAD-relative citation resolution)",
+            )
+        )
+        return violations, exemptions
+    if epoch_sha is not None:
+        _require_history()
+        if not _is_ancestor(epoch_sha):
+            violations.append(
+                Violation(
+                    path, 1,
+                    f"declares 'citations-resolve-at: {epoch_sha}', but that sha is NOT an "
+                    "ancestor of HEAD -- a frozen pre-registration's declared epoch must be "
+                    "real, reachable history on this branch (never EXEMPT the way pre-merge-"
+                    "commit-discipline artifact evidence can be); fix the pinned sha",
+                )
+            )
+            return violations, exemptions
+
     for citation_start, cited_label, target_path, cited_line in _cited_targets(path, text):
         # `cited_file` keeps naming the citation exactly as the doc wrote it
         # (a bare basename, or a full path) so every message below quotes
@@ -1235,6 +1362,46 @@ def _check_file_impl(path: Path) -> tuple[list[Violation], list[Exemption]]:
                         path, source_line_no,
                         f"cites {cited_file}:{cited_line} but that file only has "
                         f"{len(target_lines)} lines at this artifact's own git_sha {artifact_sha}",
+                    )
+                )
+                continue
+        elif epoch_sha is not None:
+            # This citing file's own whole-file epoch header pins it --
+            # sha-relative resolve against THAT commit's tree, never
+            # against HEAD. Ancestry was already checked, fail-closed,
+            # once for the whole file above -- reaching here means
+            # `epoch_sha` IS an ancestor, so a `git show` miss below is a
+            # real finding about THIS citation (case 2's shape), never an
+            # EXEMPT (there is no non-ancestor case left to reach this
+            # branch at all).
+            relpath = _git_relpath(target_path)
+            if relpath is None:
+                violations.append(
+                    Violation(
+                        path, source_line_no,
+                        f"cites {cited_file} sha-relative to this file's own "
+                        f"'citations-resolve-at: {epoch_sha}' header, but {target_path} does not "
+                        f"resolve under {_GIT_REPO_ROOT} for `git show`",
+                    )
+                )
+                continue
+            target_lines = _lines_at_sha(epoch_sha, relpath)
+            if target_lines is None:
+                violations.append(
+                    Violation(
+                        path, source_line_no,
+                        f"cites {cited_file}:{cited_line} sha-relative to this file's own "
+                        f"'citations-resolve-at: {epoch_sha}' header (an ancestor of HEAD), but "
+                        f"`git show {epoch_sha}:{relpath}` could not read that file at that sha",
+                    )
+                )
+                continue
+            if cited_line < 1 or cited_line > len(target_lines):
+                violations.append(
+                    Violation(
+                        path, source_line_no,
+                        f"cites {cited_file}:{cited_line} but that file only has "
+                        f"{len(target_lines)} lines at this file's own pinned epoch {epoch_sha}",
                     )
                 )
                 continue
@@ -1330,6 +1497,19 @@ def _check_file_impl(path: Path) -> tuple[list[Violation], list[Exemption]]:
                         "describes (committed artifacts are append-only, sha-relative evidence -- "
                         "never re-resolve this class of citation against HEAD; the citation's line "
                         "number, or the sha it should have cited, is wrong and needs a hand fix)",
+                    )
+                )
+            elif epoch_sha is not None:
+                violations.append(
+                    Violation(
+                        path, source_line_no,
+                        f"cites {cited_file}:{cited_line} for identifier {ident!r}, but that line "
+                        f"reads {cited_line_text.strip()!r} at this file's own pinned epoch "
+                        f"{epoch_sha} -- the citation was never true at the tree this file's header "
+                        "declares (a frozen pre-registration's citations are append-only, "
+                        "sha-relative to its own epoch -- never re-resolved against HEAD; the "
+                        "citation's line number needs a hand fix, which requires un-freezing this "
+                        "file first)",
                     )
                 )
             elif pin_sha is not None:

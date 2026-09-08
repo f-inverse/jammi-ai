@@ -1386,5 +1386,137 @@ class InlineCommitPinResolutionTests(GitFixture):
         self.assertIn("code moved since this was written", violations[0].message)
 
 
+class FileCitationsEpochHeaderTests(GitFixture):
+    """The WHOLE-FILE `<!-- citations-resolve-at: <sha> -->` header (module
+    doc's "A frozen pre-registration's citations are pinned to their own
+    epoch" section) -- the whole-file analogue of
+    `InlineCommitPinResolutionTests` above, for a `.md` pre-registration
+    frozen all at once rather than pinned citation-by-citation.
+
+    Every fixture commits TWO revisions of a throwaway `fake.rs` into a
+    throwaway repo (`GitFixture`, never this checkout): `good_sha` (where
+    `real_thing` sits at line 2) and a later HEAD (where line 2 is
+    something else) -- proving resolution reads the PINNED tree, never the
+    working tree, exactly the discipline the inline-pin tests already
+    established.
+    """
+
+    def _two_revisions(self) -> str:
+        target = self._write("target/fake.rs", "line one\nfn real_thing() {}\nline three\n")
+        cc._KNOWN_FILES = {"fake.rs": target}
+        good_sha = self._commit("good revision")
+        self._write(
+            "target/fake.rs",
+            "inserted prefix\nline one\nfn real_thing() {}\nline three\nextra tail\n",
+        )
+        self._commit("code moved on")
+        return good_sha
+
+    def test_resolves_at_pinned_sha_but_not_at_head_ok(self):
+        """RED proof (a): true at the header's own pinned commit, stale at
+        HEAD -- must PASS."""
+        good_sha = self._two_revisions()
+        doc = self._write(
+            "doc.md",
+            f"<!-- citations-resolve-at: {good_sha} -->\n\n`real_thing` (`fake.rs:2`)\n",
+        )
+        self._commit("add frozen doc")
+        violations = cc.check_file(doc)
+        self.assertEqual(violations, [], [str(v) for v in violations])
+
+    def test_head_relative_resolution_of_the_same_citation_would_have_failed(self):
+        """Positive control for (a): the SAME citation, with NO header,
+        resolves against HEAD (where the code moved) and genuinely fails --
+        proving the PASS above comes from the epoch pin actually engaging."""
+        self._two_revisions()
+        doc = self._write("doc.md", "`real_thing` (`fake.rs:2`)\n")
+        self._commit("add doc with no header")
+        violations = cc.check_file(doc)
+        self.assertEqual(len(violations), 1, [str(v) for v in violations])
+        self.assertIn("STALE", violations[0].message)
+
+    def test_pinned_sha_not_an_ancestor_is_red(self):
+        """RED proof: a well-formed 40-hex sha that is NOT an ancestor of
+        HEAD fails CLOSED for this convention (never EXEMPT the way
+        pre-merge-commit-discipline artifact evidence can be)."""
+        self._two_revisions()
+        unknown_sha = "0123456789abcdef0123456789abcdef01234567"
+        # Guard: this made-up sha must genuinely not resolve in this
+        # throwaway repo -- otherwise the test proves nothing.
+        show = _run_git(["show", f"{unknown_sha}:target/fake.rs"], self.root)
+        self.assertNotEqual(show.returncode, 0)
+        doc = self._write(
+            "doc.md",
+            f"<!-- citations-resolve-at: {unknown_sha} -->\n\n`real_thing` (`fake.rs:2`)\n",
+        )
+        self._commit("add doc pinned to an unreachable sha")
+        violations = cc.check_file(doc)
+        self.assertEqual(len(violations), 1, [str(v) for v in violations])
+        self.assertIn("NOT an ancestor", violations[0].message)
+        self.assertIn(unknown_sha, violations[0].message)
+
+    def test_malformed_header_is_red(self):
+        """RED proof: a header LINE is present but its value is not a
+        well-formed 40-character hex sha -- never silently treated as "no
+        header" (which would quietly fall back to HEAD resolution)."""
+        self._two_revisions()
+        doc = self._write(
+            "doc.md",
+            "<!-- citations-resolve-at: not-a-real-sha -->\n\n`real_thing` (`fake.rs:2`)\n",
+        )
+        self._commit("add doc with a malformed header")
+        violations = cc.check_file(doc)
+        self.assertEqual(len(violations), 1, [str(v) for v in violations])
+        self.assertIn("not a well-formed 40-character hex commit sha", violations[0].message)
+
+    def test_a_citation_that_fails_even_at_the_pinned_sha_is_red(self):
+        """RED proof: the identifier is wrong even at the header's own
+        pinned commit -- STALE, attributed to the pinned epoch, never
+        silently passed."""
+        good_sha = self._two_revisions()
+        doc = self._write(
+            "doc.md",
+            f"<!-- citations-resolve-at: {good_sha} -->\n\n"
+            "`totally_wrong_identifier` (`fake.rs:2`)\n",
+        )
+        self._commit("add doc with a wrong identifier even at its own epoch")
+        violations = cc.check_file(doc)
+        self.assertEqual(len(violations), 1, [str(v) for v in violations])
+        self.assertIn("never true at the tree this file's header declares", violations[0].message)
+        self.assertIn(good_sha, violations[0].message)
+
+    def test_header_past_the_search_window_is_not_recognized(self):
+        """A `citations-resolve-at:`-shaped phrase deep in ordinary prose
+        (past the first few lines) must never be misread as the header --
+        the file falls back to ordinary HEAD-relative resolution instead,
+        and genuinely fails against the drifted HEAD content."""
+        good_sha = self._two_revisions()
+        padding = "\n".join(f"filler line {i}" for i in range(10))
+        doc = self._write(
+            "doc.md",
+            f"{padding}\n\n<!-- citations-resolve-at: {good_sha} -->\n\n`real_thing` (`fake.rs:2`)\n",
+        )
+        self._commit("add doc whose header sits past the search window")
+        violations = cc.check_file(doc)
+        self.assertEqual(len(violations), 1, [str(v) for v in violations])
+        self.assertIn("STALE", violations[0].message)
+
+    def test_non_markdown_file_ignores_the_header_shaped_text(self):
+        """The convention is scoped to `.md` files only (module doc) --
+        the IDENTICAL header text in a non-Markdown file is just ordinary
+        prose, never parsed as an epoch pin, and that file's citations keep
+        resolving against HEAD unchanged."""
+        good_sha = self._two_revisions()
+        cc._SEARCH_ROOTS = (self.root,)
+        doc = self._write(
+            "doc.txt",
+            f"<!-- citations-resolve-at: {good_sha} -->\n\n`real_thing` (`fake.rs:2`)\n",
+        )
+        self._commit("add a non-markdown file with header-shaped text")
+        violations = cc.check_file(doc)
+        self.assertEqual(len(violations), 1, [str(v) for v in violations])
+        self.assertIn("STALE", violations[0].message)
+
+
 if __name__ == "__main__":
     unittest.main()

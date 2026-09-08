@@ -154,6 +154,16 @@ mechanism, only points at it.
   M-leg's 4800 rows cycle 16 distinct train clips (a page-cached working set) — the
   HTSAT/vision front-end finding is a real per-item CPU decode/preprocess compute cost, not
   a realistic-corpus I/O cost.
+- **`CONTRACT.md`'s own §D5 "45 hermetic tests" figure was already stale at freeze.**
+  `profile_421_merge.py`'s hermetic suite had grown to 55 tests by the freeze commit
+  (`perf/421-profile-p1` @ aace002f) and stays at 55 at `c1b0b0ba` (`python3
+  ci/scripts/perf/test_profile_421_merge.py` → "Ran 55 tests"); the count was true earlier
+  on `perf/421-profile-p1` but drifted before the freeze landed. Not corrected in the frozen
+  body (a pre-registration's text is never edited after freezing — see `CONTRACT.md`'s own
+  `citations-resolve-at` header note), recorded here instead: the count is descriptive prose
+  about the suite's size, not a method parameter any decision rule reads, so this staleness
+  never affected a verdict. `docs/maintainer/fine-tune-performance-guide.md` and
+  `CHANGELOG.md` both already avoid citing a bare, drifting count for this suite.
 
 ## PR trail
 

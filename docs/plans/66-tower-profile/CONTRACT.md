@@ -1,4 +1,5 @@
 <!-- Frozen ledger ts: 2026-09-07. Measured artifact: crates/jammi-kernels/artifacts/cuda-runs/2026-09-07-profile-421-towers-c1b0b0ba-a100-sxm4.json -->
+<!-- citations-resolve-at: bff1fad65683760f6a6b2f6677b74e61f20d96f5 -- the Scope-facts section's path:line citations below are read against main's tree as of this sha (the round-1 tester's own re-verification tip, per that section's own header clause); they are NEVER re-pointed against a later HEAD (this contract is frozen: the body below this comment is byte-identical to the pre-registered, reviewed copy). -->
 
 # CONTRACT — #421 tower training-step profile (PR B; pre-registered BEFORE any measurement) — v2.5
 

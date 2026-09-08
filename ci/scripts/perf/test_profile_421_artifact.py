@@ -34,8 +34,11 @@ Run: `python3 ci/scripts/perf/test_profile_421_artifact.py`
 
 from __future__ import annotations
 
+import contextlib
+import io
 import json
 import math
+import os
 import re
 import shutil
 import subprocess
@@ -424,9 +427,10 @@ class TemplatedDeviationTests(unittest.TestCase):
         self.assertIn(f"{expected_gate_pct:.0f}%", self.deviations[1])
 
     def test_htsat_a2_merge_verdict_and_decision_grade_word_are_live(self):
-        # Both used to be hand-typed prose ("VALID" / "NOT decision-grade")
-        # -- now read off the SAME fixture rows the chain-share number
-        # above is read off, never independently asserted. The BASE fixture
+        # Both the "VALID" merge word and the "decision-grade"/"NOT
+        # decision-grade" word are read off the SAME fixture rows the
+        # chain-share number above is read off, never independently
+        # asserted (never hand-typed prose). The BASE fixture
         # has htsat-A2 both merge-VALID and (unlike the real committed run)
         # decision_grade True — the positive ("decision-grade", no "NOT")
         # word is exactly as live-derived as the negative one.
@@ -477,7 +481,7 @@ class TemplatedDeviationTests(unittest.TestCase):
         self.assertNotIn("for a reason other than this share bound", deviation)
 
     def test_htsat_a2_comparison_word_stays_truthful_when_decision_grade_false_for_a_different_reason(self):
-        # Round-5 audit B1: `decision_grade` can be False for a reason that
+        # `decision_grade` can be False for a reason that
         # has NOTHING to do with the UNATTRIBUTED share bound (here: the
         # attribution's OWN verdict is INVALID) while that share itself
         # (2%, the base fixture's own UNATTRIBUTED_SHARE_GPU_BUSY) is
@@ -529,12 +533,11 @@ class TemplatedDeviationTests(unittest.TestCase):
         self.assertIn("for a reason other than this share bound: reason not recorded", deviation)
 
     def test_htsat_a1_clears_the_bound_and_is_decision_grade_renders_from_the_base_fixture(self):
-        # Round-5 audit B2: the base fixture's htsat-A1 is merge-VALID,
-        # decision_grade True, UNATTRIBUTED share_gpu_busy (2%) under the
-        # 5% bound -- the SAME text the real committed identity sidecar's
-        # own hard-coded "htsat-A1 (f32) clears the bound ... and IS
-        # decision-grade" prose used to assert unconditionally, now
-        # rendered from the leg's own live attribution row instead.
+        # The base fixture's htsat-A1 is merge-VALID, decision_grade True,
+        # UNATTRIBUTED share_gpu_busy (2%) under the 5% bound -- the "htsat-
+        # A1 (f32) clears the bound ... and IS decision-grade" prose in the
+        # real committed identity sidecar is rendered from the leg's own
+        # live attribution row, never a hard-coded, unconditional claim.
         self.assertEqual(
             self.deviations[6],
             "htsat-A1 (f32) clears the bound under the pass-4 census fix and IS decision-grade.",
@@ -581,8 +584,129 @@ class TemplatedDeviationTests(unittest.TestCase):
             deviation,
         )
 
+    def test_recorded_bound_disagreeing_with_live_constant_refuses_the_build(self):
+        # The identity sidecar's own printed bound (and
+        # every htsat clause's own comparison) is sourced from THIS run's
+        # own recorded `decision_grade_reason` -- the live
+        # `UNATTRIBUTED_DECISION_GRADE_LIMIT` import is used ONLY to refuse
+        # the build if it has since MOVED away from the bound this run was
+        # actually judged against, never to silently re-judge the run.
+        def poison(attribution_report):
+            for row in attribution_report["legs"]:
+                if row["leg_id"] == "htsat-A2":
+                    row["decision_grade"] = False
+                    row["chains"]["UNATTRIBUTED"]["share_gpu_busy"] = 0.10
+                    row["decision_grade_reason"] = "UNATTRIBUTED share_gpu_busy=0.1000 > 0.05"
+
+        alt_root = Path(tempfile.mkdtemp(dir=str(self.root)))
+        fixture = _write_fixture(alt_root, attr_override=poison)
+        original_limit = art._attribute_mod.UNATTRIBUTED_DECISION_GRADE_LIMIT
+        art._attribute_mod.UNATTRIBUTED_DECISION_GRADE_LIMIT = 0.10  # moved from 0.05 since this run
+        try:
+            with self.assertRaises(art.ArtifactBuildError) as ctx:
+                art.build_report(
+                    fixture["legs_dir"], fixture["p2_dir"], fixture["merge_report"], fixture["attribution_report"], fixture["identity"]
+                )
+        finally:
+            art._attribute_mod.UNATTRIBUTED_DECISION_GRADE_LIMIT = original_limit
+        message = str(ctx.exception)
+        self.assertIn("UNATTRIBUTED_DECISION_GRADE_LIMIT", message)
+        self.assertIn("0.1", message)
+        self.assertIn("0.05", message)
+        self.assertIn("moved since this run was measured", message)
+
+    def test_no_run_witness_falls_back_to_the_live_constant(self):
+        # The base fixture never records an over-bound `decision_grade_
+        # reason` on ANY leg (both htsat-A1 and htsat-A2 are decision-grade
+        # True) -- there is no run witness for `_resolve_unattributed_bound`
+        # to prefer over the live constant, and nothing for the live
+        # constant to disagree with either, so the build succeeds and the
+        # sidecar's own printed bound is the (only available) live value.
+        self.assertIsNone(art._recorded_unattributed_bound(self.fixture["attribution_report"]["legs"]))
+        self.assertEqual(
+            art._resolve_unattributed_bound(self.fixture["attribution_report"]["legs"]),
+            attribute_mod.UNATTRIBUTED_DECISION_GRADE_LIMIT,
+        )
+
+    def test_decision_grade_true_but_share_over_the_bound_is_impossible_and_refuses(self):
+        # `decision_grade=True` while the SAME leg's own
+        # chains['UNATTRIBUTED']['share_gpu_busy'] is over the run's own
+        # resolved bound is impossible from `profile_421_attribute.py`'s
+        # own `leg_decision_grade` (which never returns True without first
+        # confirming share <= bound) -- refused by name, never rendered.
+        def poison(attribution_report):
+            for row in attribution_report["legs"]:
+                if row["leg_id"] == "htsat-A2":
+                    row["chains"]["UNATTRIBUTED"]["share_gpu_busy"] = 0.10  # over the 5% bound
+                    # decision_grade stays True (the base fixture's own
+                    # default) and decision_grade_reason stays None --
+                    # exactly the impossible combination this cell refuses.
+
+        alt_root = Path(tempfile.mkdtemp(dir=str(self.root)))
+        fixture = _write_fixture(alt_root, attr_override=poison)
+        with self.assertRaises(art.ArtifactBuildError) as ctx:
+            art.build_report(
+                fixture["legs_dir"], fixture["p2_dir"], fixture["merge_report"], fixture["attribution_report"], fixture["identity"]
+            )
+        message = str(ctx.exception)
+        self.assertIn("htsat-A2", message)
+        self.assertIn("decision_grade is True", message)
+        self.assertIn("is impossible from profile_421_attribute.py's own leg_decision_grade", message)
+
+    def test_reason_claiming_over_bound_while_share_is_actually_under_refuses(self):
+        # `decision_grade=False` with a recorded reason
+        # that CLAIMS an over-bound failure ("share_gpu_busy=0.0400 > 0.05")
+        # while the SAME leg's chain share (0.04, cross-checked to agree
+        # with the reason's own quoted share) is genuinely AT-OR-UNDER that
+        # same 0.05 bound by this module's own comparison -- the reason's
+        # own arithmetic disagrees with itself, and this is refused rather
+        # than rendered as either "over" or "for a reason other than this
+        # share bound".
+        def poison(attribution_report):
+            for row in attribution_report["legs"]:
+                if row["leg_id"] == "htsat-A2":
+                    row["decision_grade"] = False
+                    row["chains"]["UNATTRIBUTED"]["share_gpu_busy"] = 0.04
+                    row["decision_grade_reason"] = "UNATTRIBUTED share_gpu_busy=0.0400 > 0.05"
+
+        alt_root = Path(tempfile.mkdtemp(dir=str(self.root)))
+        fixture = _write_fixture(alt_root, attr_override=poison)
+        with self.assertRaises(art.ArtifactBuildError) as ctx:
+            art.build_report(
+                fixture["legs_dir"], fixture["p2_dir"], fixture["merge_report"], fixture["attribution_report"], fixture["identity"]
+            )
+        message = str(ctx.exception)
+        self.assertIn("htsat-A2", message)
+        self.assertIn("reports an over-bound failure", message)
+        self.assertIn("self-contradictory deviation", message)
+
+    def test_reason_share_disagreeing_with_chain_share_refuses(self):
+        # The leg's own `decision_grade_reason` is a SECOND, independent
+        # copy of `share` -- a mismatch against the SAME leg's own
+        # `chains.UNATTRIBUTED.share_gpu_busy` is refused rather than one
+        # of the two disagreeing numbers silently picked.
+        def poison(attribution_report):
+            for row in attribution_report["legs"]:
+                if row["leg_id"] == "htsat-A2":
+                    row["decision_grade"] = False
+                    row["decision_grade_reason"] = "UNATTRIBUTED share_gpu_busy=0.1000 > 0.05"
+                    # chains['UNATTRIBUTED']['share_gpu_busy'] left at the
+                    # base fixture's own 2% -- disagrees with the reason's
+                    # own quoted 10%.
+
+        alt_root = Path(tempfile.mkdtemp(dir=str(self.root)))
+        fixture = _write_fixture(alt_root, attr_override=poison)
+        with self.assertRaises(art.ArtifactBuildError) as ctx:
+            art.build_report(
+                fixture["legs_dir"], fixture["p2_dir"], fixture["merge_report"], fixture["attribution_report"], fixture["identity"]
+            )
+        message = str(ctx.exception)
+        self.assertIn("htsat-A2", message)
+        self.assertIn("decision_grade_reason share", message)
+        self.assertIn("disagrees with the same leg's own chains", message)
+
     def test_htsat_a1_suppressed_merge_invalid_refuses_the_sidecar_render(self):
-        # Round-5 audit B2: an artifact where htsat-A1 is suppressed
+        # An artifact where htsat-A1 is suppressed
         # (merge-INVALID, so `compute_findings` also drops the
         # `c-attn-htsat-out-of-tier` finding that names this leg) must
         # never still render a stale "clears the bound and IS
@@ -728,6 +852,64 @@ class TemplatedDeviationTests(unittest.TestCase):
         self.assertIn("must be a list", str(ctx.exception))
 
 
+class RecordedUnattributedBoundUnitTests(unittest.TestCase):
+    """`_recorded_unattributed_bound`/`_resolve_unattributed_bound` in
+    isolation, off hand-built `attribution_legs` lists — no fixture, no
+    tempdir, no `build_report` — the mechanism a run's own recorded
+    `decision_grade_reason` strings are turned into "the" bound this run
+    was judged against."""
+
+    def test_no_leg_recorded_a_reason_returns_none(self):
+        self.assertIsNone(art._recorded_unattributed_bound([]))
+        self.assertIsNone(
+            art._recorded_unattributed_bound([{"leg_id": "x", "decision_grade_reason": None}])
+        )
+        self.assertIsNone(
+            art._recorded_unattributed_bound([{"leg_id": "x", "decision_grade_reason": "leg is INVALID: reasons"}])
+        )
+
+    def test_single_witness_is_trusted(self):
+        legs = [{"leg_id": "htsat-A2", "decision_grade_reason": "UNATTRIBUTED share_gpu_busy=0.0566 > 0.05"}]
+        self.assertEqual(art._recorded_unattributed_bound(legs), 0.05)
+
+    def test_agreeing_witnesses_across_legs_are_trusted(self):
+        legs = [
+            {"leg_id": "clip-text-A2", "decision_grade_reason": "UNATTRIBUTED share_gpu_busy=0.0700 > 0.05"},
+            {"leg_id": "htsat-A2", "decision_grade_reason": "UNATTRIBUTED share_gpu_busy=0.0566 > 0.05"},
+        ]
+        self.assertEqual(art._recorded_unattributed_bound(legs), 0.05)
+
+    def test_disagreeing_witnesses_across_legs_refuse(self):
+        legs = [
+            {"leg_id": "clip-text-A2", "decision_grade_reason": "UNATTRIBUTED share_gpu_busy=0.0700 > 0.10"},
+            {"leg_id": "htsat-A2", "decision_grade_reason": "UNATTRIBUTED share_gpu_busy=0.0566 > 0.05"},
+        ]
+        with self.assertRaises(art.ArtifactBuildError) as ctx:
+            art._recorded_unattributed_bound(legs)
+        self.assertIn("legs disagree on the UNATTRIBUTED validity bound", str(ctx.exception))
+
+    def test_resolve_falls_back_to_live_constant_when_no_witness(self):
+        self.assertEqual(art._resolve_unattributed_bound([]), attribute_mod.UNATTRIBUTED_DECISION_GRADE_LIMIT)
+
+    def test_resolve_returns_recorded_value_when_it_agrees_with_the_live_constant(self):
+        legs = [{"leg_id": "htsat-A2", "decision_grade_reason": "UNATTRIBUTED share_gpu_busy=0.0566 > 0.05"}]
+        self.assertEqual(attribute_mod.UNATTRIBUTED_DECISION_GRADE_LIMIT, 0.05)
+        self.assertEqual(art._resolve_unattributed_bound(legs), 0.05)
+
+    def test_resolve_refuses_when_recorded_disagrees_with_the_live_constant(self):
+        # `attribute_mod.UNATTRIBUTED_DECISION_GRADE_LIMIT` is 0.05 (checked
+        # above); a run whose own recorded reason names a DIFFERENT bound
+        # (0.10, as if the live constant moved after this run was measured)
+        # must refuse rather than silently re-judge the run against 0.05.
+        legs = [{"leg_id": "htsat-A2", "decision_grade_reason": "UNATTRIBUTED share_gpu_busy=0.0700 > 0.10"}]
+        with self.assertRaises(art.ArtifactBuildError) as ctx:
+            art._resolve_unattributed_bound(legs)
+        message = str(ctx.exception)
+        self.assertIn("0.1", message)
+        self.assertIn("0.05", message)
+        self.assertIn("moved since this run was measured", message)
+
+
 class IdentitySidecarNoBareMeasurementTests(unittest.TestCase):
     """The REAL committed `profile_421_run2_identity.json` carries no
     digit-bearing MEASUREMENT (a bare percentage, a bare count next to a
@@ -766,16 +948,15 @@ class IdentitySidecarNoBareMeasurementTests(unittest.TestCase):
         self.assertEqual(all_count_hits, [], f"bare 'All <N>' count(s) found outside operator_recorded: {all_count_hits}")
 
     def test_unit_count_regex_catches_a_bare_test_count(self):
-        # Regression for the gap this suite's own regex used to have: "45
-        # tests" (CONTRACT.md's own stale, frozen figure) and "55 tests"
-        # (the live count) both slipped through the old `_UNIT_COUNT_RE`
-        # (which named `files?|rows?|clips?|GB|MB` but not `tests?`) — the
-        # real committed sidecar no longer carries either as a bare digit
-        # (the live one is `{merge_suite_test_count}`, the frozen one is
-        # dropped in favor of a citation, see `test_no_bare_percentage_or_
-        # unit_count_outside_operator_recorded` above), but the REGEX itself
-        # must independently catch this shape so a FUTURE hand-typed count
-        # cannot silently slip back in.
+        # "45 tests" (CONTRACT.md's own stale, frozen figure) and "55 tests"
+        # (the live count) are both a shape `_UNIT_COUNT_RE` must catch —
+        # `files?|rows?|clips?|GB|MB|tests?` — so a bare hand-typed test
+        # count can never slip past this regex undetected. The real
+        # committed sidecar carries neither as a bare digit (the live one
+        # is `{merge_suite_test_count}`, the frozen one is a citation, see
+        # `test_no_bare_percentage_or_unit_count_outside_operator_recorded`
+        # above); this test proves the REGEX ITSELF independently catches
+        # the shape, so a FUTURE hand-typed count cannot silently slip in.
         hits = self._UNIT_COUNT_RE.findall("the suite already carried 55 tests as of this run")
         self.assertNotEqual(hits, [], "widened _UNIT_COUNT_RE failed to catch a bare 'N tests' count")
 
@@ -1008,7 +1189,7 @@ class QualitativeWordRuleTests(unittest.TestCase):
         self.assertFalse(finding["evidence"]["front_end_bound"])
         # The numbers are still stated even though the word is dropped.
         self.assertIn("30-83%", finding["text"])
-        # Round-4 audit B2: the not-front-end-bound arm names the SAME
+        # The not-front-end-bound arm names the SAME
         # front-end MECHANISM (audio decode/resample/STFT/mel) but must
         # drop every comparative/magnitude word ("dominating") the rule
         # did NOT license on every leg read -- a mechanism description,
@@ -1597,9 +1778,9 @@ class CliEndToEndTests(unittest.TestCase):
         # invocation — never present on the hermetic `build_report` output,
         # only on the CLI's.
         producer = report["producer"]
-        # `input_sha256` now names BOTH the three top-level report files AND
+        # `input_sha256` names BOTH the three top-level report files AND
         # a full manifest over every file this producer itself reads off
-        # `--legs-dir`/`--p2-dir` (round-4 audit B4) — one
+        # `--legs-dir`/`--p2-dir` — one
         # `"legs/<leg_id>/manifest.json"` + `"legs/<leg_id>/census.json"`
         # pair per fixture leg, `"legs/clip-text-A2/census.pre-demangle.
         # json"` (the ONE leg in `art.KERNEL_IDENTITY_SPLIT_LEGS`), and
@@ -1675,7 +1856,7 @@ class CliEndToEndTests(unittest.TestCase):
         self.assertEqual(report["producer"]["input_sha256"]["identity"], expected_identity_sha)
 
     def test_cli_input_manifest_legs_and_p2_hashes_match_independent_walk_of_the_fixture(self):
-        """Round-4 audit B4: every byte read off `--legs-dir`/`--p2-dir` is
+        """Every byte read off `--legs-dir`/`--p2-dir` is
         output-affecting and must be captured — checked here against an
         INDEPENDENT walk of the SAME fixture directory (never a value read
         back out of the module under test)."""
@@ -1764,6 +1945,81 @@ class CliEndToEndTests(unittest.TestCase):
         )
         self.assertNotEqual(result.returncode, 0)
         self.assertIn("disagree", result.stderr)
+
+
+class ProvenanceRecipeTests(unittest.TestCase):
+    """`fixtures/profile_421_run2/PROVENANCE.md`'s own "Regenerate with"
+    fenced Python recipe is not prose sitting next to a hand-typed sha256
+    table that could silently drift from it — this test EXECUTES that
+    EXACT code block (extracted from the committed markdown byte-for-byte,
+    never retyped a second time here) against the REAL committed fixture
+    directory and asserts its OWN stdout matches the markdown table
+    beneath it, row for row: the numpy-first-oracle doctrine applied to a
+    fixture's own provenance claim — the recipe must PRODUCE the table,
+    never merely sit next to one a human could have hand-edited out of
+    step with the directory's real bytes."""
+
+    def test_provenance_recipe_output_matches_its_own_committed_table(self):
+        provenance_path = REAL_FIXTURE_DIR / "PROVENANCE.md"
+        text = provenance_path.read_text(encoding="utf-8")
+
+        code_match = re.search(r"```python\n(.*?)\n```", text, re.DOTALL)
+        self.assertIsNotNone(code_match, "PROVENANCE.md has no fenced ```python regeneration recipe")
+        recipe = code_match.group(1)
+
+        # The recipe's own `Path("ci/scripts/perf/fixtures/profile_421_run2")`
+        # is REPO-ROOT-relative (the same convention every other path in
+        # this markdown file uses) -- run it with the repo root as cwd,
+        # restoring the original cwd afterward regardless of outcome.
+        repo_root = PERF_DIR.parents[2]
+        original_cwd = Path.cwd()
+        buf = io.StringIO()
+        try:
+            os.chdir(repo_root)
+            with contextlib.redirect_stdout(buf):
+                exec(compile(recipe, str(provenance_path), "exec"), {"__name__": "__provenance_recipe__"})
+        finally:
+            os.chdir(original_cwd)
+
+        recipe_rows = []
+        for line in buf.getvalue().splitlines():
+            if not line.strip():
+                continue
+            path, sha, size = line.split()
+            recipe_rows.append((path, sha, size))
+        self.assertTrue(recipe_rows, "the recipe printed no rows at all")
+
+        # The markdown table itself: `| \`path\` | \`sha256\` | bytes |`
+        # rows only (never the header/separator rows) -- parsed
+        # structurally, never by re-typing the numbers by hand.
+        table_rows = []
+        for line in text.splitlines():
+            row_match = re.match(r"^\|\s*`([^`]+)`\s*\|\s*`([0-9a-f]{64})`\s*\|\s*(\d+)\s*\|$", line)
+            if row_match:
+                table_rows.append((row_match.group(1), row_match.group(2), row_match.group(3)))
+        self.assertTrue(table_rows, "PROVENANCE.md has no parseable sha256 table rows")
+
+        # Row-for-row identical, including ORDER (both the recipe's own
+        # `sorted(fix.rglob("*"))` walk and the committed table are sorted
+        # by path) -- a mismatch here means either the fixture directory's
+        # real bytes moved, or the committed table was hand-edited out of
+        # step with them.
+        self.assertEqual(
+            recipe_rows, table_rows,
+            "PROVENANCE.md's own committed sha256 table does not match its own recipe's live output "
+            "over the REAL fixture directory",
+        )
+
+        # The closing "Total: N files, M bytes." line is a SEPARATE,
+        # independently-checkable claim the recipe itself does not print --
+        # cross-checked here against the SAME parsed table so that number,
+        # too, is measured, never merely quoted.
+        total_match = re.search(r"Total: ([\d,]+) files, ([\d,]+) bytes\.", text)
+        self.assertIsNotNone(total_match, "PROVENANCE.md has no closing 'Total: N files, M bytes.' line")
+        expected_files = int(total_match.group(1).replace(",", ""))
+        expected_bytes = int(total_match.group(2).replace(",", ""))
+        self.assertEqual(expected_files, len(table_rows))
+        self.assertEqual(expected_bytes, sum(int(size) for _, _, size in table_rows))
 
 
 class RealFixtureRegenerationTests(unittest.TestCase):
@@ -1925,7 +2181,7 @@ class RealFixtureRegenerationTests(unittest.TestCase):
         self.assertEqual(regenerated["findings"], committed["findings"])
         self.assertEqual(regenerated["notes"], committed["notes"])
 
-        # Round-5 audit advisory (c): everything above compares PARSED
+        # Everything above compares PARSED
         # JSON (`json.loads`), which is blind to whitespace/key-order bytes
         # a hand-edit could otherwise introduce without tripping a single
         # `assertEqual` above. Compare the RAW BYTES too, with only the

@@ -447,11 +447,29 @@ SOURCE_IDENTITY_DECLARING_PRODUCER_PATHS: frozenset[str] = frozenset(
 # `SOURCE_IDENTITY_DECLARING_PRODUCER_PATHS` alone is not enough to catch a
 # renamed producer. An artifact's own committed FILENAME (never
 # `producer.path`) is not something a producer's own code can rename without
-# also renaming what CI actually sees on disk — the profile-421 and (its
-# planned `perf/421-frontend` follow-on unit's) frontend artifact families
-# are named here directly so a `producer.path` rename cannot silently drop
-# an artifact out of the mandatory arm.
-SOURCE_IDENTITY_DECLARING_FILENAME_RE = re.compile(r"-profile-421-|-frontend-")
+# also renaming what CI actually sees on disk — every "tower-profile" family
+# artifact (`-profile-<N>-towers-...`, one N per profile UNIT — issue #421's
+# own `2026-09-07-profile-421-towers-...json` is one instance, never the
+# only one this pattern is meant to survive) and every "frontend" follow-on
+# artifact (`-frontend-...`) is matched here by FAMILY TOKEN, deliberately
+# never by this one issue's own number: a future profile unit (#421's
+# eventual successor) that reuses the SAME `-profile-<N>-towers-` naming
+# convention under a DIFFERENT issue number must still be caught by this
+# anchor without an edit here, and a literal `-profile-421-` would silently
+# stop matching the moment that successor's own artifact used a different
+# N. The REQUIRED `-towers-` token (never a bare `-profile-\d+-`) is not
+# optional: `2026-08-31-profile-356-closeout-...json` (issue #356's OWN,
+# already-committed, pre-this-convention closeout artifact) also matches
+# `-profile-\d+-` but is NOT a tower-profile source-identity-declaring
+# artifact at all — a bare `-profile-\d+-` would wrongly retroactively
+# demand the marker on that unrelated, already-closed campaign's own
+# artifact. Matched against the artifact's own BASENAME ONLY
+# (`relpath.rsplit("/", 1)[-1]`, never the full `relpath`) — `relpath` can
+# carry directory segments (a `*-raw-runs/` subdirectory name, say) that
+# have nothing to do with THIS file's own identity, and matching the full
+# path would let an unrelated ancestor directory's name decide whether THIS
+# artifact is in the mandatory arm.
+SOURCE_IDENTITY_DECLARING_FILENAME_RE = re.compile(r"-profile-\d+-towers-|-frontend-")
 
 
 # --------------------------------------------------------------------------- #
@@ -554,9 +572,15 @@ def check_producer_source_identity_marker(producer: dict, relpath: str) -> list[
             )
         if isinstance(producer.get("source_sha256"), dict) and producer.get("source_sha256"):
             reasons.append("this artifact already carries a non-empty producer.source_sha256 block")
-        if SOURCE_IDENTITY_DECLARING_FILENAME_RE.search(relpath):
+        # `relpath` is a posix-style, repo-cuda-runs-relative path
+        # (`Path.relative_to(...).as_posix()` at the call site) that can
+        # carry directory segments (e.g. a `*-raw-runs/` subdirectory name)
+        # with nothing to do with THIS file's own identity — matched
+        # against the BASENAME only, never the full path.
+        basename = relpath.rsplit("/", 1)[-1]
+        if SOURCE_IDENTITY_DECLARING_FILENAME_RE.search(basename):
             reasons.append(
-                f"this artifact's own filename `{relpath}` matches a known profile/frontend artifact family "
+                f"this artifact's own filename `{basename}` matches a known profile/frontend artifact family "
                 "(SOURCE_IDENTITY_DECLARING_FILENAME_RE)"
             )
         if reasons:
@@ -2011,12 +2035,17 @@ def self_test() -> int:
             "rule (j): known convention-declaring producer.path with no marker",
         )
 
-        # rule (j) — the marker-mandatory arm's two INDEPENDENT anchors:
-        # `producer.path` renamed away from
-        # regenerated artifact escape the mandatory marker as long as
-        # EITHER the artifact already carries `producer.source_sha256`, or
-        # its own committed FILENAME matches a known profile/frontend
-        # artifact family. -----------------------------------------------
+        # rule (j) — the marker-mandatory arm's THREE INDEPENDENT anchors:
+        # (1) `producer.path` already in
+        # `SOURCE_IDENTITY_DECLARING_PRODUCER_PATHS` (tested above); (2) an
+        # artifact that already carries a non-empty `producer.source_sha256`
+        # block; (3) an artifact whose own committed FILENAME matches a
+        # known profile/frontend artifact family
+        # (`SOURCE_IDENTITY_DECLARING_FILENAME_RE`). Each of the three fires
+        # the mandatory-marker arm on its own, independent of the other two
+        # — a `producer.path` RENAME away from the reviewed allowlist can
+        # never silently let an artifact that already declares the
+        # convention by (2) or (3) escape the marker requirement.
         bad = baseline()
         bad["producer"] = dict(bad["producer"])
         # `producer.path` is NOT in SOURCE_IDENTITY_DECLARING_PRODUCER_PATHS
@@ -2039,7 +2068,21 @@ def self_test() -> int:
             bad,
             "2026-09-07-profile-421-towers-c1b0b0ba-a100-sxm4.json",
             "matches a known profile/frontend artifact family",
-            "rule (j): -profile-421- filename anchors the marker-mandatory arm, independent of producer.path",
+            "rule (j): -profile-<N>- filename family anchors the marker-mandatory arm (issue #421's own N), "
+            "independent of producer.path",
+        )
+
+        bad = baseline()
+        bad["producer"] = dict(bad["producer"])
+        # A DIFFERENT issue's own N (never 421) proves the anchor is a
+        # FAMILY TOKEN, not a hard-coded issue number this repo would have
+        # to keep editing for every future profile-family unit.
+        expect_hit(
+            bad,
+            "2027-01-01-profile-500-towers-deadbeef-a100-sxm4.json",
+            "matches a known profile/frontend artifact family",
+            "rule (j): -profile-<N>- filename family anchors the marker-mandatory arm for a DIFFERENT N (#500, "
+            "never hard-coded to #421), independent of producer.path",
         )
 
         bad = baseline()
@@ -2049,6 +2092,33 @@ def self_test() -> int:
             "2026-09-07-frontend-towers-c1b0b0ba-a100-sxm4.json",
             "matches a known profile/frontend artifact family",
             "rule (j): -frontend- filename anchors the marker-mandatory arm, independent of producer.path",
+        )
+
+        # The filename anchor is matched against the BASENAME only — a
+        # DIRECTORY segment that happens to carry a family token (here, a
+        # `*-raw-runs/` sibling directory literally named
+        # `...-profile-421-...`) must never anchor an artifact whose own
+        # basename is an ordinary, non-family name.
+        expect_clean(
+            baseline(),
+            "2026-09-07-profile-421-towers-c1b0b0ba-a100-sxm4-raw-runs/ordinary-payload.json",
+            "rule (j): filename family anchor matches the BASENAME only, never an ancestor directory's own name",
+        )
+
+        # A GENUINE regression control, off the REAL committed
+        # `2026-08-31-profile-356-closeout-...json` filename: it matches a
+        # bare `-profile-\d+-` (issue #356's own closeout artifact, a
+        # DIFFERENT, already-closed campaign that never adopted the
+        # source-identity convention this rule enforces) but must NOT match
+        # `SOURCE_IDENTITY_DECLARING_FILENAME_RE`'s own required `-towers-`
+        # token — a bare `-profile-\d+-` regex (this rule's OWN prior
+        # shape) would wrongly retroactively demand the marker on this
+        # unrelated artifact.
+        expect_clean(
+            baseline(),
+            "2026-08-31-profile-356-closeout-7820d697-a100-sxm4.json",
+            "rule (j): a -profile-<N>- filename WITHOUT -towers- (issue #356's own closeout artifact) "
+            "anchors nothing",
         )
 
         # A filename NOT in either family, with no source_sha256 and an
@@ -2754,8 +2824,11 @@ def self_test() -> int:
         "empty object are each caught by name) is re-hashed against THIS gate's own HEAD, never a "
         "historical blob; producer.input_sha256 (OPTIONAL, shape-checked but never re-hashed) and "
         "producer.identity (OPTIONAL in general, but MANDATORY once stamped — requiring BOTH blocks "
-        "together — and MANDATORY for a known SOURCE_IDENTITY_DECLARING_PRODUCER_PATHS entry even with "
-        "no marker at all) round out rule (j)."
+        "together — and MANDATORY, even with no marker stamped at all, the moment ANY ONE of its three "
+        "INDEPENDENT anchors fires: a known SOURCE_IDENTITY_DECLARING_PRODUCER_PATHS producer.path, an "
+        "artifact that already carries a non-empty producer.source_sha256 block, or an artifact whose own "
+        "basename matches a known profile/frontend SOURCE_IDENTITY_DECLARING_FILENAME_RE family, matched "
+        "against the basename only, never an ancestor directory's own name) round out rule (j)."
     )
     return 0
 

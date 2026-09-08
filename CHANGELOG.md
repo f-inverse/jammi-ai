@@ -199,38 +199,43 @@ workspace ships every publishable crate at the same
   measured), which every leg and the new `PROFILE_421_P2_BF16=1` driver mode pin; P2 is
   UNTRACED by design (no `nsys` dependency for a qualitative dtype pre-flight) and is
   dry-run tested through the real merge script.
-- **The #421 tower training-step profile is closed out: driver, merge, attribution, and a
-  committed close-out artifact (issue #421 step 3, "PROFILE FIRST").** All 12 legs (`A1`/`A2`/
-  `D1`/`D2` × CLIP-text, OpenCLIP-vision, HTSAT) are VALID on
+<!-- profile-421-generated: changelog-421-entry -->
+- **The #421 tower training-step profile is closed out: driver, merge, attribution, and
+  a committed close-out artifact (issue #421 step 3, "PROFILE FIRST").** All 12 legs
+  (`A1`/`A2`/`D1`/`D2` × CLIP-text, OpenCLIP-vision, HTSAT) are VALID on
   `crates/jammi-kernels/artifacts/cuda-runs/2026-09-07-profile-421-towers-c1b0b0ba-a100-sxm4.json`
-  (A100-SXM4-80GB); the BF16 pre-flight (P2) passes on all three towers. `profile_421_attribute.py`
-  (new) reads `profile_421_merge.py`'s per-key equations and the kernel census into the contract's
-  named chains and evaluates the two-sided ACTIVATE/DECLINE/UNRESOLVED rule per candidate port;
-  `kernel_census.py` now keys each GPU-kernel bucket on `COALESCE(demangledName, shortName)` rather
-  than `shortName` alone, a sum-preserving refinement that un-collapses cutlass's `Kernel2<...>`
-  template wrapper's distinct bf16 GEMM tile instantiations (previously summed into one anonymous
-  row that could trip the attribution's known-kernel-name gate) without moving any top-line
-  `gpu_kernel_us_per_step`/wall/front/busy number. **No kernel port lands under #421**: all four
-  candidate ports the contract named (`C-ATTN-CLIP-text`, `C-MLP-CLIP-text`, `C-ATTN-CLIP-vision`,
-  `C-MLP-CLIP-vision`) resolve **UNRESOLVED** — none clears ACTIVATE (`s_wall≥10%` on any
-  decision-grade leg) or DECLINE (combined share <5% on wall AND busy on every decision-grade
-  leg), F32 and BF16 alike. This is not uniform across candidates or axes: only C-MLP's own
-  combined *busy* share (`s_busy+U_busy`, 6.80–8.98 % across the CLIP towers) lands in the
-  contract's 5–10 % band — its wall-axis share stays 2.66–3.95 % throughout, well under the 5 %
-  DECLINE floor — while C-ATTN's combined busy shares run 11–20 %, entirely outside that band.
-  The already-fused chains' realized gains, per step: C-LORA
-  +32.6 ms (CLIP-text, 32.4 % of wall), +30.3 ms (CLIP-vision, 26.4 %), +82.9 ms (HTSAT, 5.4 %);
-  C-LN +15.6 ms (CLIP-text), +20.8 ms (CLIP-vision); the joint C-LN+C-GELU-HTSAT chain +56.6 ms
-  (3.6 %). Findings: the HTSAT training step is CPU front-end-bound (audio decode/resample/STFT/mel
-  ≈ 81–83 % of wall, dtype- and arm-invariant); CLIP-vision's image front end is ≈ 20–22 % of wall
-  (both corpora cycle only 16 distinct train clips at any row count — a page-cached working set,
-  never a realistic-corpus I/O cost — so both numbers are a real per-item CPU decode/preprocess
-  compute cost; see `docs/plans/66-tower-profile/README.md`'s deviations); at batch 8 the CLIP
-  steps are launch-bound (≈ 3.6–3.7 k launches/step; BF16 cuts GPU busy 32–41 %
-  but wall only 4–5 %); `C-ATTN-HTSAT` is measured (≈ 33 % of GPU busy) and stays OUT OF TIER, a
+  (A100-SXM4-80GB); the BF16 pre-flight (P2) passes on all three towers.
+  `profile_421_attribute.py` (new) reads `profile_421_merge.py`'s per-key equations and
+  the kernel census into the contract's named chains and evaluates the two-sided
+  ACTIVATE/DECLINE/UNRESOLVED rule per candidate port; `kernel_census.py` now keys each
+  GPU-kernel bucket on `COALESCE(demangledName, shortName)` rather than `shortName`
+  alone, a sum-preserving refinement that un-collapses cutlass's `Kernel2<...>` template
+  wrapper's distinct bf16 GEMM tile instantiations (previously summed into one anonymous
+  row that could trip the attribution's known-kernel-name gate) without moving any
+  top-line `gpu_kernel_us_per_step`/wall/front/busy number. **No kernel port lands under
+  #421**: all four candidate ports the contract named (`C-ATTN-CLIP-text`,
+  `C-MLP-CLIP-text`, `C-ATTN-CLIP-vision`, `C-MLP-CLIP-vision`) resolve **UNRESOLVED** —
+  none clears ACTIVATE (`s_wall≥10%` on any decision-grade leg) or DECLINE (combined
+  share <5% on wall AND busy on every decision-grade leg), F32 and BF16 alike. This is
+  not uniform across candidates or axes: only C-MLP's own combined *busy* share
+  (`s_busy+U_busy`, 6.80–8.98 % across the CLIP towers) lands in the contract's 5–10 %
+  band — its wall-axis share stays 2.66–3.95 % throughout, well under the 5 % DECLINE
+  floor — while C-ATTN's combined busy shares run 11–20 %, entirely outside that band.
+  The already-fused chains' realized gains, per step: C-LORA +32.6 ms (CLIP-text, 32.4 %
+  of wall), +30.3 ms (CLIP-vision, 26.4 %), +82.9 ms (HTSAT, 5.4 %); C-LN +15.6 ms
+  (CLIP-text), +20.8 ms (CLIP-vision); the joint C-LN+C-GELU-HTSAT chain +56.6 ms (3.6
+  %). Findings: the HTSAT training step is CPU front-end-bound (audio
+  decode/resample/STFT/mel ≈ 81–83 % of wall, dtype- and arm-invariant); CLIP-vision's
+  image front end is ≈ 20–22 % of wall (both corpora cycle only 16 distinct train clips
+  at any row count — a page-cached working set, never a realistic-corpus I/O cost — so
+  both numbers are a real per-item CPU decode/preprocess compute cost; see
+  `docs/plans/66-tower-profile/README.md`'s deviations); at batch 8 the CLIP steps are
+  launch-bound (≈ 3.6–3.7 k launches/step; BF16 cuts GPU busy 32–41 % but wall only 4–5
+  %); `C-ATTN-HTSAT` is measured (≈ 33 % of GPU busy) and stays OUT OF TIER, a
   named-but-undecided chain, never folded into UNATTRIBUTED. See
-  `docs/plans/66-tower-profile/README.md` and `CONTRACT.md` (the frozen v2.5 contract) for the full
-  per-leg table and PR trail.
+  `docs/plans/66-tower-profile/README.md` and `CONTRACT.md` (the frozen v2.5 contract)
+  for the full per-leg table and PR trail.
+<!-- /profile-421-generated -->
 
 ### Changed
 - **HTSAT's MLP and projection GELU reach the fused seam on the training path (#421).** The audio

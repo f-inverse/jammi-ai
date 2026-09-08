@@ -126,6 +126,17 @@ class RenderContentTests(RenderFixture):
         table = r.render_measured_towers_table(self.artifact)
         self.assertIn("| A1 | f32 |", table)
 
+    def test_d_leg_unknown_kernels_disabled_key_is_refused_by_name(self):
+        """`_leg_label` must refuse (never silently drop) a `kernels_
+        disabled` key `_KERNEL_LABEL_ORDER` does not know -- the same
+        refuse-by-name posture `_TOWER_DISPLAY`'s own dict lookup already
+        has for an unrecognized tower."""
+        artifact = _synthetic_artifact()
+        artifact["legs"][1]["kernels_disabled"] = ["layer_norm_fused", "some_future_kernel_fused"]
+        with self.assertRaises(ValueError) as ctx:
+            r.render_measured_towers_table(artifact)
+        self.assertIn("some_future_kernel_fused", str(ctx.exception))
+
     def test_table_precision_matches_the_doc(self):
         table = r.render_measured_towers_table(self.artifact)
         self.assertIn("0.1004 | 0.0000 | 0.0608 | 0.0396 | 0.0 | 60.5", table)
@@ -208,6 +219,183 @@ class CheckModeTests(RenderFixture):
     def test_write_then_check_is_idempotent(self):
         self._write_doc(table="STALE", reasons="STALE", findings="STALE")
         self.assertEqual(r.main([]), 0)
+        self.assertEqual(r.main(["--check"]), 0)
+
+
+def _full_synthetic_artifact() -> dict:
+    """A second, richer fixture -- covers `realized_gains[]`/`attribution[]`,
+    the two fields `_synthetic_artifact()` above never carries -- used only
+    by the tests exercising the newer, non-table/non-verbatim-string
+    blocks (realized gains, decision-grade note, DECLINE-band summary,
+    the `htsat-A2` deviation, and their guide/CHANGELOG restatements).
+    Deliberately round, distinguishable numbers (never the real repo's own
+    measured values) so a test asserting against them can never pass by
+    accident against the wrong source.
+    """
+
+    def chains(gelu_wall, gelu_busy, attn_busy, unattr_wall, unattr_busy, attn_tower):
+        return {
+            "C-GELU": {"share_wall": gelu_wall, "share_gpu_busy": gelu_busy},
+            f"C-ATTN-{attn_tower}": {"share_gpu_busy": attn_busy},
+            "UNATTRIBUTED": {"share_wall": unattr_wall, "share_gpu_busy": unattr_busy},
+        }
+
+    return {
+        "legs": [{"leg_id": f"{t}-{a}", "verdict": "VALID"} for t in ("clip-text", "clip-vision", "htsat") for a in ("A1", "A2", "D1", "D2")],
+        "realized_gains": [
+            {"chain": "C-LORA", "tower": "clip-text", "wall_delta_s_per_step": 0.010, "share_of_baseline_wall": 0.10},
+            {"chain": "C-LORA", "tower": "clip-vision", "wall_delta_s_per_step": 0.020, "share_of_baseline_wall": 0.20},
+            {"chain": "C-LORA", "tower": "htsat", "wall_delta_s_per_step": 0.030, "share_of_baseline_wall": 0.05},
+            {"chain": "C-LN", "tower": "clip-text", "wall_delta_s_per_step": 0.005, "share_of_baseline_wall": 0.05},
+            {"chain": "C-LN", "tower": "clip-vision", "wall_delta_s_per_step": 0.006, "share_of_baseline_wall": 0.06},
+            {"chain": "C-LN", "tower": "htsat", "wall_delta_s_per_step": 0.007, "share_of_baseline_wall": 0.07, "note": "joint"},
+        ],
+        "attribution": [
+            {"leg_id": "clip-text-A1", "verdict": "VALID", "decision_grade": True, "chains": chains(0.03, 0.04, 0.10, 0.01, 0.02, "clip-text")},
+            {"leg_id": "clip-text-A2", "verdict": "VALID", "decision_grade": True, "chains": chains(0.031, 0.041, 0.11, 0.011, 0.021, "clip-text")},
+            {"leg_id": "clip-vision-A1", "verdict": "VALID", "decision_grade": True, "chains": chains(0.032, 0.042, 0.12, 0.012, 0.022, "clip-vision")},
+            {"leg_id": "clip-vision-A2", "verdict": "VALID", "decision_grade": True, "chains": chains(0.033, 0.043, 0.13, 0.013, 0.023, "clip-vision")},
+            {"leg_id": "htsat-A2", "verdict": "VALID", "decision_grade": False, "chains": {"UNATTRIBUTED": {"share_wall": 0.0, "share_gpu_busy": 0.0566}}},
+            *[
+                {"leg_id": f"{t}-{a}", "verdict": "VALID", "decision_grade": True, "chains": {}}
+                for t, a in (
+                    ("clip-text", "D1"), ("clip-text", "D2"),
+                    ("clip-vision", "D1"), ("clip-vision", "D2"),
+                    ("htsat", "A1"), ("htsat", "D1"), ("htsat", "D2"),
+                )
+            ],
+        ],
+        "candidate_decisions": [
+            {"port": "C-ATTN-clip-text", "verdict": "UNRESOLVED", "reason": "neither ACTIVATE nor DECLINE — clip-text-A1: s_wall+U_wall=0.11, s_busy+U_busy=0.12"},
+            {"port": "C-MLP-clip-text", "verdict": "UNRESOLVED", "reason": "neither ACTIVATE nor DECLINE — clip-text-A1: s_wall+U_wall=0.04, s_busy+U_busy=0.06"},
+            {"port": "C-ATTN-clip-vision", "verdict": "UNRESOLVED", "reason": "neither ACTIVATE nor DECLINE — clip-vision-A1: s_wall+U_wall=0.13, s_busy+U_busy=0.14"},
+            {"port": "C-MLP-clip-vision", "verdict": "UNRESOLVED", "reason": "neither ACTIVATE nor DECLINE — clip-vision-A1: s_wall+U_wall=0.05, s_busy+U_busy=0.06"},
+        ],
+        "findings": [
+            {"id": "htsat-front-end-bound", "text": "The HTSAT step: front-end share of wall is 80-90% across legs."},
+            {"id": "clip-vision-front-end-share", "text": "CLIP-vision's own front end is 20-25% of wall on legs."},
+            {"id": "clip-launch-bound-batch8", "text": "3000-4000 launches/step; cuts GPU busy by 30-40%; wall drops by only 4-6%."},
+            {"id": "c-attn-htsat-out-of-tier", "text": "C-ATTN-HTSAT: 33% of GPU busy (~5% of wall)."},
+        ],
+    }
+
+
+def _norm(text: str) -> str:
+    """Whitespace-collapsed `text` -- these blocks are `textwrap.fill`-ed at
+    a fixed column width, so a substring assertion must not care which
+    exact line a word-wrap boundary landed the space on."""
+    return " ".join(text.split())
+
+
+class NewBlockRenderTests(unittest.TestCase):
+    def setUp(self):
+        self.artifact = _full_synthetic_artifact()
+
+    def test_realized_gains_reads_all_three_bullets_from_the_artifact(self):
+        rendered = _norm(r.render_realized_gains(self.artifact))
+        self.assertIn("+10.0 ms/step (10.0 % of the A1 baseline wall)", rendered)
+        self.assertIn("+20.0 ms/step (20.0 %)", rendered)
+        self.assertIn("HTSAT +30.0 ms/step (5.0 %)", rendered)
+        self.assertIn("+5.0 ms/step (5.0 % of A1 baseline wall)", rendered)
+        self.assertIn("+6.0 ms/step (6.0 %)", rendered)
+        self.assertIn("C-LN + C-GELU-HTSAT joint", rendered)
+        self.assertIn("+7.0 ms/step (7.0 % of the A1 baseline wall)", rendered)
+
+    def test_realized_gains_guide_and_readme_agree_on_the_same_numbers(self):
+        readme_block = _norm(r.render_realized_gains(self.artifact))
+        guide_block = _norm(r.render_realized_gains_guide(self.artifact))
+        for token in ("+10.0 ms", "+20.0 ms", "+30.0 ms", "+5.0 ms", "+6.0 ms", "+7.0 ms"):
+            self.assertIn(token, readme_block)
+            self.assertIn(token, guide_block)
+
+    def test_decision_grade_note_renders_when_expectations_hold(self):
+        rendered = r.render_decision_grade_note(self.artifact)
+        self.assertIn("UNRESOLVED", rendered)
+        self.assertIn("htsat-A2", rendered)
+
+    def test_decision_grade_note_refuses_when_a_clip_a2_leg_is_not_decision_grade(self):
+        artifact = _full_synthetic_artifact()
+        artifact["attribution"][1]["decision_grade"] = False  # clip-text-A2
+        with self.assertRaises(ValueError) as ctx:
+            r.render_decision_grade_note(artifact)
+        self.assertIn("decision-grade", str(ctx.exception))
+
+    def test_decision_grade_note_refuses_when_htsat_a2_becomes_decision_grade(self):
+        artifact = _full_synthetic_artifact()
+        artifact["attribution"][4]["decision_grade"] = True  # htsat-A2
+        with self.assertRaises(ValueError):
+            r.render_decision_grade_note(artifact)
+
+    def test_decline_band_summary_computes_combined_shares_never_hand_adds(self):
+        rendered = _norm(r.render_decline_band_summary(self.artifact))
+        # gelu_wall_pct('clip-text', 'A1') == 3.00 %, combined wall == (0.03+0.01)*100 == 4.00 %
+        self.assertIn("3.00 %/3.10 %", rendered)
+        self.assertIn("4.00 %/4.20 %", rendered)
+
+    def test_htsat_a2_deviation_reads_the_unattributed_share(self):
+        rendered = r.render_htsat_a2_deviation(self.artifact)
+        self.assertIn("5.66 %", rendered)
+
+    def test_changelog_entry_refuses_when_a_leg_is_not_valid(self):
+        artifact = _full_synthetic_artifact()
+        artifact["attribution"][0]["verdict"] = "INVALID"
+        with self.assertRaises(ValueError):
+            r.render_changelog_421_entry(artifact)
+
+    def test_findings_guide_extracts_every_percentage_from_the_findings_text(self):
+        rendered = r.render_findings_guide(self.artifact)
+        self.assertIn("80–90 %", rendered)
+        self.assertIn("20–25 %", rendered)
+        self.assertIn("30–40 %", rendered)
+        self.assertIn("4–6 %", rendered)
+        self.assertIn("33 %", rendered)
+
+    def test_findings_guide_refuses_on_an_unrecognized_findings_shape(self):
+        artifact = _full_synthetic_artifact()
+        artifact["findings"][0]["text"] = "totally reworded, no percentage pattern here"
+        with self.assertRaises(ValueError):
+            r.render_findings_guide(artifact)
+
+
+class LiveSourceTests(unittest.TestCase):
+    """`corpus_pool_counts`/`hermetic_test_count`/`basename_ambiguity_counts`
+    read this REAL repo's own live source files -- never the synthetic
+    artifact fixture -- so these are cheap real-repo smoke checks, the same
+    shape `test_check_citations.py`'s own `test_real_contract_epoch_and_
+    scope_are_recognized` already is.
+    """
+
+    def test_corpus_pool_counts_match_the_live_driver_and_producer_constants(self):
+        total_files, train_clips, m_leg_rows = r.corpus_pool_counts()
+        self.assertEqual((total_files, train_clips, m_leg_rows), (24, 16, 4800))
+
+    def test_hermetic_test_count_matches_an_independent_discovery_pass(self):
+        import importlib.util
+
+        spec = importlib.util.spec_from_file_location(
+            "independent_test_profile_421_merge", r.PROFILE_421_MERGE_TEST
+        )
+        module = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(module)
+        expected = unittest.TestLoader().loadTestsFromModule(module).countTestCases()
+        self.assertEqual(r.hermetic_test_count(), expected)
+        self.assertGreater(expected, 0)
+
+    def test_basename_ambiguity_counts_match_the_pinned_epoch_tree(self):
+        epoch_sha, layer_norm_count, main_count = r.basename_ambiguity_counts()
+        self.assertTrue(epoch_sha.startswith("bff1fad6"))
+        self.assertEqual((layer_norm_count, main_count), (3, 10))
+
+
+class RealRepoCheckTests(unittest.TestCase):
+    """The master regression check: every block this script owns, rendered
+    from the REAL committed artifact, must match the REAL committed text in
+    README/the guide/CHANGELOG.md -- exercised by every other test above
+    only through a synthetic fixture, this is the one test that proves the
+    wiring in the actual tracked docs is live and green.
+    """
+
+    def test_check_passes_against_the_real_repo_docs(self):
         self.assertEqual(r.main(["--check"]), 0)
 
 

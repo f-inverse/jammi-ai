@@ -318,26 +318,88 @@ completely unchanged by this.
 `docs/plans/66-tower-profile/CONTRACT.md`'s "Scope facts" section cites
 Rust source lines as bare backticked tokens -- `` `trainer.rs:1952-1965,
 2067-2106` ``, `` `finetune_run.rs:394` ``, occasionally a full path
-(`` `crates/jammi-lora/src/lora_linear.rs:973-1005` ``) -- never
-identifier-adjacent the way every OTHER citation class in this file is
-(`_find_adjacent_identifier`'s connector convention does not apply here at
-all). `_PLAN_CONTRACT_ROOTS` (scoped to this one plan group; widen it, not
-the shape, the day a second frozen contract adopts the same prose
-convention) opts a `.md` file under it into a SEPARATE citation form,
-`_plan_contract_citation_re`: the WHOLE citation, backtick to backtick, is
-`` `<basename-or-path>:<line>[-<line>][, <line>[-<line>]]*` ``, gated
-STRICTLY by resolution and in-bounds -- never a content re-check, since the
-adjacent-identifier convention this file's other forms use has nothing to
-pair against here. Only engages for a file that ALSO carries the
-`citations-resolve-at:` header above (opt-IN twice over): a bare basename
-resolves by searching the pinned tree at that epoch
-(`git ls-tree -r --name-only <sha>`), FAILING CLOSED if it is absent OR
-ambiguous (this repo genuinely reuses generic filenames like
-`main.rs`/`layer_norm.rs`/`attention_block.rs` across crates -- the same
-scaling limit `_KNOWN_FILES`'s own module doc names for why a hand-registered
-map does not extend past a handful of files); a full path resolves directly,
-checked to exist in that same pinned tree. Every individual line/range in a
-comma-separated spec is checked, not just the first.
+(`` `crates/jammi-lora/src/lora_linear.rs:973-1005` ``), and occasionally a
+RELATIVE SUB-PATH that is neither (`` `ops/attention_block.rs:467,472` ``:
+has a slash, but does not start with a recognized full-path root prefix) --
+never identifier-adjacent the way every OTHER citation class in this file
+is (`_find_adjacent_identifier`'s connector convention does not apply here
+at all). `_PLAN_CONTRACT_ROOTS` (scoped to this one plan group; widen it,
+not the shape, the day a second frozen contract adopts the same prose
+convention) opts a `.md` file under it into a SEPARATE citation form. The
+RECOGNIZER (`_plan_contract_citation_like_re`) is deliberately as broad as
+the punctuation alone can support: ANY backtick-to-backtick token of the
+shape `` `<path-ish>:<line-spec>` `` where `<path-ish>` ends in a
+`_FULL_PATH_SUFFIXES` extension is a citation this file owes a
+classification to -- never gated on the line-spec ALSO being well-formed
+digits in the same pattern that determines recognition (the old, narrower
+regex's mistake: a relative sub-path like `ops/attention_block.rs:467,472`
+matched neither its bare-basename branch, which forbids `/`, nor its
+full-path branch, which requires a recognized prefix, so the citation was
+simply INVISIBLE -- 17 of `CONTRACT.md`'s 18 citations checked, the 18th
+never even attempted, and the gate still reported "all citations resolve").
+Classification, once a candidate is recognized:
+
+  - the line-spec half must fully match `<line>[-<line>][, <line>[-<line>]]*`
+    (bare digit ranges only) -- a citation-shaped token whose line-spec does
+    not is a `Violation` ("could not be classified"), never silently
+    dropped from the checked set (module doc's "assert coverage" clause
+    below);
+  - a FULL PATH (starts with a recognized `_FULL_PATH_ROOT_PREFIXES`
+    prefix) resolves directly, checked to exist in the pinned tree;
+  - a RELATIVE SUB-PATH (contains a `/` but is not a full path) resolves by
+    a UNIQUE SUFFIX match against the pinned tree at that epoch (the one
+    path that IS the sub-path or ENDS WITH `/<sub-path>`) -- FAILING CLOSED
+    if absent or ambiguous, never a silent first-match guess;
+  - a BARE BASENAME (no `/`) resolves by searching the pinned tree at that
+    epoch (`git ls-tree -r --name-only <sha>`) for a unique basename match,
+    FAILING CLOSED if it is absent OR ambiguous (this repo genuinely reuses
+    generic filenames like `main.rs`/`layer_norm.rs`/`attention_block.rs`
+    across crates -- the same scaling limit `_KNOWN_FILES`'s own module doc
+    names for why a hand-registered map does not extend past a handful of
+    files), unless a `citations-basename-map` header entry narrows it (see
+    below).
+
+Gated STRICTLY by resolution and in-bounds -- never a content re-check,
+since the adjacent-identifier convention this file's other forms use has
+nothing to pair against here. Only engages for a file that ALSO carries the
+`citations-resolve-at:` header above (opt-IN twice over). Every individual
+line/range in a comma-separated spec is checked, not just the first.
+
+## Never-checked must never read as checked-clean
+
+A `CONTRACT.md`-shaped frozen pre-registration (`_is_frozen_contract_file`
+-- `path.name == "CONTRACT.md"` under `_PLAN_CONTRACT_ROOTS`, the ONE file
+class the "frozen pre-registration's citations are pinned to their own
+epoch" section above describes) that does NOT carry a well-formed
+`citations-resolve-at:` header in its first `_CITATIONS_EPOCH_HEADER_
+SEARCH_LINES` lines -- whether the header is genuinely absent, or it landed
+past that search window (which reads byte-for-byte identically to absent)
+-- is itself a `Violation`, never a silent skip. The pre-fix behaviour
+(skip the whole plan-contract citation scan, report zero violations) is
+mechanically indistinguishable from "every citation in this file resolves"
+-- exactly the false-negative shape a reviewer, or a later gate, would
+trust.
+
+Deliberately scoped to the frozen file ITSELF, not to every `.md` file
+`_plan_contract_scope` recognizes: a companion doc in the same directory
+(e.g. `docs/plans/66-tower-profile/README.md`) routinely cites a MIX of the
+contract's own frozen-epoch facts (quoted verbatim, for discussion) and the
+CURRENT tree (a stale-name deviation, a driver script's real line numbers)
+in the same paragraph -- a single whole-file epoch pin cannot honestly
+cover both, so such a file is never forced to declare one, and its
+citations keep resolving HEAD-relative through the ordinary (non-plan-
+contract) citation forms above. `_plan_contract_scope` itself stays
+name-agnostic: any `.md` file under the root MAY still opt a citation into
+this bare `path:line` form by carrying a well-formed header voluntarily
+(unchanged) -- only the FROZEN file is ever forced to.
+
+Coverage is also ASSERTED, not merely implied by the absence of a
+violation: `main()` prints, per successfully-scanned `_plan_contract_scope`
+file that carries a header, the exact count of citation-shaped tokens
+`_plan_contract_citation_like_re` found and classified (`check-citations:
+frozen-contract citation coverage: - <path>: <N> citation(s) checked`) -- a
+reviewer (or a future regression) can see that number move the day a
+citation is added, removed, or silently stops matching.
 
 ## An ambiguous bare basename can be disambiguated by a declared header map, never re-written in the frozen body
 
@@ -932,24 +994,40 @@ def _crate_relative_citation_re() -> re.Pattern:
 
 
 _LINE_SPEC_FRAGMENT = r"\d+(?:-\d+)?(?:,\s*\d+(?:-\d+)?)*"
+_LINE_SPEC_ONLY_RE = re.compile(r"^" + _LINE_SPEC_FRAGMENT + r"$")
 
 
-def _plan_contract_citation_re() -> re.Pattern:
-    """The bare-backtick `<basename>.<ext>:<line>[-<line>][, <line>[-<line>]]*`
-    or full-path `path:line[-line][, line[-line]]*` shape a
-    `_PLAN_CONTRACT_ROOTS` file's prose carries (module doc's "A frozen
-    pre-registration's citations are pinned to their own epoch" section) --
-    the WHOLE citation, backtick to backtick, is exactly `` `<path>:<lines>`
-    ``, never identifier-adjacent (unlike every other citation form in this
-    file). Built fresh from `_FULL_PATH_ROOT_PREFIXES`/`_FULL_PATH_SUFFIXES`
-    on every call, same reason every other citation regex here is.
+def _plan_contract_citation_like_re() -> re.Pattern:
+    """Every backtick-quoted, path-ish, colon-line-numbered token in a
+    `_PLAN_CONTRACT_ROOTS` file's prose -- module doc's "A frozen
+    pre-registration's OWN citation shape" section: ANY backtick-to-backtick
+    `` `<path-ish>:<line-spec>` `` where `<path-ish>` ends in a
+    `_FULL_PATH_SUFFIXES` extension is a citation this file OWES a
+    classification to, whether that citation is a bare basename
+    (`trainer.rs:1952-1965`), a full path
+    (`crates/jammi-lora/src/lora_linear.rs:973-1005`), or a RELATIVE
+    SUB-PATH that is neither (`ops/attention_block.rs:467,472` -- has a
+    slash, but does not start with a recognized `_FULL_PATH_ROOT_PREFIXES`
+    prefix; the shape the old, narrower regex silently could not match at
+    all -- see `_resolve_plan_contract_target`'s sub-path arm).
+
+    Deliberately LOOSE on the line-spec half: `(?P<lines>[^`]+)`, not
+    `_LINE_SPEC_FRAGMENT` -- this regex's whole job is coverage (module
+    doc's "assert coverage" clause: every path-ish:line-numbered backtick
+    token found here must be resolved OR reported, never silently dropped
+    because its line-spec half turns out to be malformed). A match whose
+    `lines` half does not fully match `_LINE_SPEC_FRAGMENT` is itself
+    reported as an unparsed citation by `_check_plan_contract_citations`,
+    not silently excluded by a stricter single regex the way the old
+    ONE-SHOT `_plan_contract_citation_re` gated matching on `_LINE_SPEC_
+    FRAGMENT` in the same pattern that determined recognition.
+
+    Built fresh from `_FULL_PATH_SUFFIXES` on every call, same reason
+    every other citation regex here is.
     """
-    prefixes = "|".join(re.escape(p) for p in _FULL_PATH_ROOT_PREFIXES)
     suffixes = "|".join(re.escape(s) for s in _FULL_PATH_SUFFIXES)
-    path = (
-        r"(?:(?:" + prefixes + r")[A-Za-z0-9_./-]+|[A-Za-z0-9_-]+)\.(?:" + suffixes + r")"
-    )
-    return re.compile(r"`(?P<path>" + path + r"):(?P<lines>" + _LINE_SPEC_FRAGMENT + r")`")
+    path = r"[^`\s:]+\.(?:" + suffixes + r")"
+    return re.compile(r"`(?P<path>" + path + r"):(?P<lines>[^`]+)`")
 
 
 def _plan_contract_scope(path: Path) -> bool:
@@ -958,8 +1036,40 @@ def _plan_contract_scope(path: Path) -> bool:
     plan group AND (checked by the caller) carry its own
     `citations-resolve-at:` header. Scoped to `.md` (the pre-registration's
     own shape), same restriction `_file_citations_epoch` already applies.
+    Deliberately name-agnostic (a companion doc in the SAME plan directory
+    -- e.g. `README.md` -- may also opt a citation into this form by
+    carrying the header; see `_is_frozen_contract_file` for the NARROWER
+    predicate that makes the header itself MANDATORY).
     """
     return path.suffix == ".md" and _is_under(path, _PLAN_CONTRACT_ROOTS)
+
+
+def _is_frozen_contract_file(path: Path) -> bool:
+    """Whether `path` is the `CONTRACT.md`-SHAPED frozen pre-registration
+    itself (module doc's "A frozen pre-registration's citations are pinned
+    to their own epoch" section: "A `docs/plans/<N>-<slug>/CONTRACT.md`-
+    shaped pre-registration") -- the ONLY file class the "never-checked
+    must never read as checked-clean" mandatory-header rule applies to.
+
+    Deliberately NARROWER than `_plan_contract_scope`: a plan group's
+    OTHER `.md` files (a close-out `README.md` discussing or quoting the
+    frozen contract's own citations, for instance) live under the same
+    `_PLAN_CONTRACT_ROOTS` directory but are NOT the frozen, single-epoch
+    artifact this convention exists to guard, and typically cite a MIX of
+    the contract's own frozen-epoch facts and the CURRENT (HEAD-relative)
+    tree in the same paragraph -- a single whole-file epoch pin cannot
+    honestly cover both, so such a file is never forced to declare one.
+    Requiring a `citations-resolve-at:` header from every `.md` file in
+    the directory (not just the one that is actually frozen) would either
+    force those genuinely-HEAD-relative citations to mis-resolve against a
+    stale pinned tree, or force the companion doc to stop quoting the
+    contract's own citation text altogether -- neither of which the
+    "never-checked equals checked-clean" property this rule protects
+    actually requires: that property is about the FROZEN file never
+    silently losing its own check, not about every neighboring doc opting
+    into the same one-epoch-per-file model.
+    """
+    return path.name == "CONTRACT.md" and _is_under(path, _PLAN_CONTRACT_ROOTS)
 
 
 _LS_TREE_CACHE: dict[tuple[str, str], list[str]] = {}
@@ -983,7 +1093,7 @@ def _ls_tree_paths(sha: str) -> list[str]:
 def _resolve_plan_contract_target(
     cited_path: str, epoch_sha: str, basename_map: dict[str, str] | None = None
 ) -> tuple[str | None, str | None]:
-    """`cited_path` (the `path` group of `_plan_contract_citation_re`)
+    """`cited_path` (the `path` group of `_plan_contract_citation_like_re`)
     resolved to a repo-root-relative POSIX path in the tree at `epoch_sha`,
     or `(None, <error>)` if it cannot be resolved AT ALL -- FAIL CLOSED,
     never a guess:
@@ -993,18 +1103,29 @@ def _resolve_plan_contract_target(
         actually exist in the pinned tree (a full path is unambiguous by
         construction, so there is no uniqueness question -- only
         existence).
-      - A BARE BASENAME resolves by searching every path in the pinned
-        tree whose own basename matches exactly: absent (no match) or
-        AMBIGUOUS (more than one match -- this repo genuinely reuses
-        generic filenames like `main.rs`/`layer_norm.rs` across crates, the
-        exact class `_KNOWN_FILES`'s own module doc already names as the
-        reason a hand-registered map does not scale) are BOTH hard
-        failures, never a silent first-match guess -- UNLESS `basename_map`
-        (the file's own `citations-basename-map:` header, see that
-        function's doc) declares this exact basename, in which case it is
-        resolved via the map instead, subject to three checks that make the
-        map narrow the search space rather than assert an unverifiable
-        fact (module doc's "An ambiguous bare basename can be
+      - A RELATIVE SUB-PATH (contains a `/` but does NOT start with a
+        recognized `_FULL_PATH_ROOT_PREFIXES` prefix -- e.g.
+        `ops/attention_block.rs`, CONTRACT.md's own Scope-facts shape)
+        resolves by a UNIQUE SUFFIX match against the pinned tree: the one
+        path that either EQUALS `cited_path` or ENDS WITH `/<cited_path>`.
+        Absent (no match) or AMBIGUOUS (more than one match) are BOTH hard
+        failures, never a silent first-match guess -- the same fail-closed
+        posture the bare-basename arm below already has, for the same
+        reason (this repo's crate layout genuinely repeats path suffixes
+        across crates, e.g. multiple `ops/attention_block.rs`-shaped
+        trees, not just bare filenames).
+      - A BARE BASENAME (no `/` at all) resolves by searching every path in
+        the pinned tree whose own basename matches exactly: absent (no
+        match) or AMBIGUOUS (more than one match -- this repo genuinely
+        reuses generic filenames like `main.rs`/`layer_norm.rs` across
+        crates, the exact class `_KNOWN_FILES`'s own module doc already
+        names as the reason a hand-registered map does not scale) are BOTH
+        hard failures, never a silent first-match guess -- UNLESS
+        `basename_map` (the file's own `citations-basename-map:` header,
+        see that function's doc) declares this exact basename, in which
+        case it is resolved via the map instead, subject to three checks
+        that make the map narrow the search space rather than assert an
+        unverifiable fact (module doc's "An ambiguous bare basename can be
         disambiguated" section), checked in this ORDER (deliberately, see
         below): (1) if `cited_path` is not even ambiguous to begin with --
         one unique match already exists in the pinned tree without
@@ -1019,7 +1140,10 @@ def _resolve_plan_contract_target(
         typo); (2) the declared path must exist in this same pinned tree;
         (3) its own basename must equal the map key. Any of the three
         failing is a `Violation`, never a silent fall-through to the
-        unmapped ambiguity check below.
+        unmapped ambiguity check below. `basename_map` is never consulted
+        for a relative sub-path (its own module doc's disambiguation
+        section is scoped to bare basenames only) -- an ambiguous sub-path
+        is cited more precisely instead.
     """
     if cited_path.startswith(_FULL_PATH_ROOT_PREFIXES):
         tree = _ls_tree_paths(epoch_sha)
@@ -1027,6 +1151,22 @@ def _resolve_plan_contract_target(
             return None, f"{cited_path} does not exist in the tree at pinned epoch {epoch_sha}"
         return cited_path, None
     tree = _ls_tree_paths(epoch_sha)
+    if "/" in cited_path:
+        sub_matches = sorted(
+            p for p in tree if p == cited_path or p.endswith("/" + cited_path)
+        )
+        if not sub_matches:
+            return None, (
+                f"{cited_path!r} (a relative sub-path) does not exist anywhere in the tree "
+                f"at pinned epoch {epoch_sha}"
+            )
+        if len(sub_matches) > 1:
+            return None, (
+                f"{cited_path!r} (a relative sub-path) is AMBIGUOUS in the tree at pinned "
+                f"epoch {epoch_sha} ({len(sub_matches)} matches: {', '.join(sub_matches)}) -- "
+                "cite the full path instead"
+            )
+        return sub_matches[0], None
     matches = sorted(p for p in tree if p.rsplit("/", 1)[-1] == cited_path)
     if basename_map is not None and cited_path in basename_map:
         mapped = basename_map[cited_path]
@@ -1066,20 +1206,31 @@ def _resolve_plan_contract_target(
 
 def _check_plan_contract_citations(
     path: Path, text: str, epoch_sha: str, basename_map: dict[str, str] | None = None
-) -> list[Violation]:
-    """Every `_plan_contract_citation_re` match in `text`, resolved against
-    the tree at `epoch_sha` (never HEAD -- this file's own
-    `citations-resolve-at` header already fixed that for the whole file):
-    resolve the path (`_resolve_plan_contract_target`, fail-closed on
-    absent/ambiguous), then every individual line and range in the
-    comma-separated `lines` spec must be in-bounds for that file at that
-    sha -- ALL of them, not just the first (a `1-2, 10` spec where only `10`
-    is out of range is still a violation). No adjacent-identifier /
-    content-match check here (unlike every other citation form in this
-    file): this convention's own doc names only resolution + in-bounds as
-    what it gates, not a content re-check.
+) -> tuple[list[Violation], int]:
+    """Every `_plan_contract_citation_like_re` match in `text`, resolved
+    against the tree at `epoch_sha` (never HEAD -- this file's own
+    `citations-resolve-at` header already fixed that for the whole file).
+    Returns `(violations, checked)` -- `checked` is the total number of
+    citation-shaped tokens found (module doc's "assert coverage" clause),
+    whether they ultimately resolved, failed resolution, or were REPORTED
+    AS UNPARSED (never silently dropped from the count).
+
+    Per match: first the `lines` half must fully match `_LINE_SPEC_
+    FRAGMENT` -- a token whose line-spec is not a bare digit range (e.g.
+    stray trailing text, a non-numeric spec) is itself a `Violation`
+    ("could not be classified"), never silently excluded from being a
+    citation at all. Otherwise: resolve the path
+    (`_resolve_plan_contract_target`, fail-closed on absent/ambiguous),
+    then every individual line and range in the comma-separated `lines`
+    spec must be in-bounds for that file at that sha -- ALL of them, not
+    just the first (a `1-2, 10` spec where only `10` is out of range is
+    still a violation). No adjacent-identifier / content-match check here
+    (unlike every other citation form in this file): this convention's own
+    doc names only resolution + in-bounds as what it gates, not a content
+    re-check.
     """
     violations: list[Violation] = []
+    checked = 0
     lines_cache: dict[str, list[str] | None] = {}
 
     def _lines(relpath: str) -> list[str] | None:
@@ -1087,10 +1238,23 @@ def _check_plan_contract_citations(
             lines_cache[relpath] = _lines_at_sha(epoch_sha, relpath)
         return lines_cache[relpath]
 
-    for m in _plan_contract_citation_re().finditer(text):
+    for m in _plan_contract_citation_like_re().finditer(text):
         cited_path = m.group("path")
         lines_spec = m.group("lines")
         line_no = text.count("\n", 0, m.start()) + 1
+        checked += 1
+
+        if not _LINE_SPEC_ONLY_RE.match(lines_spec):
+            violations.append(
+                Violation(
+                    path, line_no,
+                    f"citation-shaped token `{cited_path}:{lines_spec}` could not be "
+                    "classified: its line-spec half is not a bare "
+                    "`<line>[-<line>][, <line>[-<line>]]*` digit range -- fix the token, "
+                    "or rewrite it so it does not read as a path:line citation",
+                )
+            )
+            continue
 
         relpath, error = _resolve_plan_contract_target(cited_path, epoch_sha, basename_map)
         if error is not None:
@@ -1124,7 +1288,7 @@ def _check_plan_contract_citations(
                         "does not fit)",
                     )
                 )
-    return violations
+    return violations, checked
 
 
 def _rust_string_prefix_len(text: str, i: int, n: int) -> int:
@@ -1562,19 +1726,30 @@ def _iter_source_files():
             yield path
 
 
-def _check_file_impl(path: Path) -> tuple[list[Violation], list[Exemption]]:
+def _check_file_impl(
+    path: Path,
+) -> tuple[list[Violation], list[Exemption], list[tuple[Path, int]]]:
     """The real per-file scan: `check_file` (kept, unchanged signature, for
     every existing caller/test that only wants the failing findings) is a
-    thin wrapper discarding the second element. `main()` calls this
-    directly so it can also print the non-failing EXEMPT lines the
-    three-way split's case 3 produces (see module doc).
+    thin wrapper discarding the second and third elements. `main()` calls
+    this directly so it can also print the non-failing EXEMPT lines the
+    three-way split's case 3 produces (see module doc), and the
+    frozen-contract CITATION COVERAGE the third element carries: a
+    `(path, count)` entry per `_plan_contract_scope` file this call
+    actually scanned for that citation form, `count` being the number of
+    citation-shaped tokens `_check_plan_contract_citations` found and
+    classified (module doc's "assert coverage" clause) -- empty for every
+    other file, and empty (never populated) for a plan-contract file whose
+    missing epoch header made this scan a whole-file `Violation` instead
+    (there is nothing to count when the file was never opted in).
     """
     violations: list[Violation] = []
     exemptions: list[Exemption] = []
+    plan_contract_coverage: list[tuple[Path, int]] = []
     try:
         text = path.read_text()
     except (UnicodeDecodeError, OSError):
-        return violations, exemptions
+        return violations, exemptions, plan_contract_coverage
 
     # This citing file's own evidence sha, if it is a qualifying artifact --
     # computed ONCE per file (not per citation): every citation inside the
@@ -1616,7 +1791,7 @@ def _check_file_impl(path: Path) -> tuple[list[Violation], list[Exemption]]:
                 "file to ordinary HEAD-relative citation resolution)",
             )
         )
-        return violations, exemptions
+        return violations, exemptions, plan_contract_coverage
     if epoch_sha is not None:
         _require_history()
         if not _is_ancestor(epoch_sha):
@@ -1629,7 +1804,7 @@ def _check_file_impl(path: Path) -> tuple[list[Violation], list[Exemption]]:
                     "commit-discipline artifact evidence can be); fix the pinned sha",
                 )
             )
-            return violations, exemptions
+            return violations, exemptions, plan_contract_coverage
 
     # This file's own optional disambiguation map (module doc's "An
     # ambiguous bare basename can be disambiguated by a declared header
@@ -1646,19 +1821,53 @@ def _check_file_impl(path: Path) -> tuple[list[Violation], list[Exemption]]:
                 "ambiguous basename in this file to the ordinary fail-closed AMBIGUOUS check)",
             )
         )
-        return violations, exemptions
+        return violations, exemptions, plan_contract_coverage
 
-    # A `_PLAN_CONTRACT_ROOTS` file's own bare-basename / full-path
-    # `path:line[-line][, line[-line]]*` citations (module doc's "A frozen
-    # pre-registration's citations are pinned to their own epoch" section) --
-    # opt-IN twice over (the file must both live under the named plan group
-    # AND carry the epoch header checked above), never identifier-adjacent,
-    # so this is a SEPARATE scan from the `_cited_targets` loop below (whose
-    # forms never match this file's own bare-basename prose at all: none of
-    # `trainer.rs`/`finetune_run.rs`/etc. are `_KNOWN_FILES` entries or
-    # under any of the other full-path roots).
-    if epoch_sha is not None and _plan_contract_scope(path):
-        violations.extend(_check_plan_contract_citations(path, text, epoch_sha, basename_map))
+    # A `_PLAN_CONTRACT_ROOTS` file's own bare-basename / full-path /
+    # relative-sub-path `path:line[-line][, line[-line]]*` citations
+    # (module doc's "A frozen pre-registration's citations are pinned to
+    # their own epoch" section) -- opt-IN twice over (the file must both
+    # live under the named plan group AND carry the epoch header checked
+    # above), never identifier-adjacent, so this is a SEPARATE scan from
+    # the `_cited_targets` loop below (whose forms never match this file's
+    # own bare-basename prose at all: none of `trainer.rs`/
+    # `finetune_run.rs`/etc. are `_KNOWN_FILES` entries or under any of the
+    # other full-path roots).
+    #
+    # NEVER-CHECKED MUST NEVER READ AS CHECKED-CLEAN (module doc's
+    # "coverage" clause), scoped to `_is_frozen_contract_file` (the
+    # `CONTRACT.md`-named file itself, NEVER every `.md` file under
+    # `_PLAN_CONTRACT_ROOTS` -- see that predicate's own doc for why a
+    # companion doc like `README.md` is deliberately exempt from the
+    # MANDATORY-header rule while still being free to opt a citation into
+    # this form voluntarily): a frozen contract that does NOT carry a
+    # well-formed epoch header (`epoch_sha is None` -- either the header is
+    # genuinely absent, or it landed past
+    # `_CITATIONS_EPOCH_HEADER_SEARCH_LINES` and therefore reads
+    # byte-for-byte like absent) is a whole-file `Violation` here, not a
+    # silent skip -- the OLD behaviour (skip, zero violations) is
+    # indistinguishable from "every citation in this file resolves", which
+    # is exactly the false-negative shape a reviewer or a later gate would
+    # trust.
+    if _is_frozen_contract_file(path) and epoch_sha is None:
+        violations.append(
+            Violation(
+                path, 1,
+                f"{path} is a CONTRACT.md-shaped frozen pre-registration under "
+                "_PLAN_CONTRACT_ROOTS but declares no 'citations-resolve-at:' header in its "
+                f"first {_CITATIONS_EPOCH_HEADER_SEARCH_LINES} lines -- a frozen "
+                "pre-registration's path:line citations must be pinned to an epoch and "
+                "mechanically checked, never silently skipped because the header is absent "
+                "or landed past the search window (which reads identically to absent); add "
+                "the header near the top of the file",
+            )
+        )
+    elif epoch_sha is not None and _plan_contract_scope(path):
+        pc_violations, pc_checked = _check_plan_contract_citations(
+            path, text, epoch_sha, basename_map
+        )
+        violations.extend(pc_violations)
+        plan_contract_coverage.append((path, pc_checked))
 
     for citation_start, cited_label, target_path, cited_line in _cited_targets(path, text):
         # `cited_file` keeps naming the citation exactly as the doc wrote it
@@ -1908,24 +2117,26 @@ def _check_file_impl(path: Path) -> tuple[list[Violation], list[Exemption]]:
                         "since this was written); re-resolve it against the file at HEAD",
                     )
                 )
-    return violations, exemptions
+    return violations, exemptions, plan_contract_coverage
 
 
 def check_file(path: Path) -> list[Violation]:
-    violations, _exemptions = _check_file_impl(path)
+    violations, _exemptions, _plan_contract_coverage = _check_file_impl(path)
     return violations
 
 
 def main() -> int:
     all_violations: list[Violation] = []
     all_exemptions: list[Exemption] = []
+    all_plan_contract_coverage: list[tuple[Path, int]] = []
     checked = 0
     try:
         for path in _iter_source_files():
             checked += 1
-            v, e = _check_file_impl(path)
+            v, e, pc = _check_file_impl(path)
             all_violations.extend(v)
             all_exemptions.extend(e)
+            all_plan_contract_coverage.extend(pc)
     except CitationError as exc:
         print(f"check-citations: FAIL (uncomputable) — {exc}", file=sys.stderr)
         return 1
@@ -1938,6 +2149,19 @@ def main() -> int:
         )
         for e in all_exemptions:
             print(f"  - EXEMPT: {e}")
+
+    if all_plan_contract_coverage:
+        # Module doc's "assert coverage" clause: a per-pinned-file count of
+        # citations CHECKED, printed unconditionally (pass or fail) so
+        # "checked" is never conflated with "checked clean" -- a reader (or
+        # a future regression) can see the count move.
+        print("check-citations: frozen-contract citation coverage:")
+        for cpath, count in all_plan_contract_coverage:
+            try:
+                rel = cpath.relative_to(REPO_ROOT)
+            except ValueError:
+                rel = cpath
+            print(f"  - {rel}: {count} citation(s) checked")
 
     if all_violations:
         print("check-citations: FAIL", file=sys.stderr)

@@ -55,15 +55,17 @@ residual). `residual = wall − front − busy` is launch/sync overhead, compute
 
 Measured by the same artifact's `realized_gains` array:
 
-- **C-LORA** (`lora_linear_fused`, D2 minus its tower's A1): CLIP-text +32.6 ms/step
-  (32.4 % of the A1 baseline wall), CLIP-vision +30.3 ms/step (26.4 %), HTSAT +82.9 ms/step
-  (5.4 %).
+<!-- profile-421-generated: realized-gains -->
+- **C-LORA** (`lora_linear_fused`, D2 minus its tower's A1): CLIP-text +32.6 ms/step (32.4
+  % of the A1 baseline wall), CLIP-vision +30.3 ms/step (26.4 %), HTSAT +82.9 ms/step (5.4
+  %).
 - **C-LN** (`layer_norm_fused`, D1 minus D2, isolating the LayerNorm kernel on top of the
   already-fused LoRA site): CLIP-text +15.6 ms/step (15.6 % of A1 baseline wall),
   CLIP-vision +20.8 ms/step (18.2 %).
 - **C-LN + C-GELU-HTSAT joint** (HTSAT's D1 disables `layer_norm_fused` AND
   `gelu_erf_fused` together, so its D1-minus-D2 delta is the two chains combined, not C-LN
   alone): +56.6 ms/step (3.6 % of the A1 baseline wall).
+<!-- /profile-421-generated -->
 
 These three chains get numbers, not ACTIVATE/DECLINE/UNRESOLVED verdicts — they are
 already fused on every tower whose domain predicate admits (`CONTRACT.md`'s scope facts),
@@ -72,12 +74,14 @@ them bought.
 
 ### Candidate-port decisions (verbatim from the artifact's `candidate_decisions`)
 
+<!-- profile-421-generated: decision-grade-note -->
 All four candidate ports the contract named are **UNRESOLVED** — decided on BOTH the F32
 (A1) and BF16 (A2) decision legs of each tower (the pass-4 census-key fix, below, makes
 both CLIP-tower A2 legs decision-grade for attribution — `htsat-A2` stays VALID but
 non-decision-grade, see the deviation below; HTSAT has no candidate port under this
 contract, so that never blocks a candidate-port decision — no candidate is F32-only by
 consequence):
+<!-- /profile-421-generated -->
 
 <!-- profile-421-generated: candidate-reasons -->
 - **`C-ATTN-clip-text`** — UNRESOLVED: "neither ACTIVATE (s_wall>=10% on any decision-grade
@@ -98,17 +102,19 @@ consequence):
   s_wall+U_wall=0.0319, s_busy+U_busy=0.0898"
 <!-- /profile-421-generated -->
 
+<!-- profile-421-generated: decline-band-summary -->
 **No port is licensed under #421.** No candidate clears ACTIVATE (`s_wall>=10%` on any
 decision-grade leg) or DECLINE (both `s_wall+U_wall<5%` AND `s_busy+U_busy<5%` on every
 decision-grade leg) — the per-leg numbers are quoted verbatim above. This is not uniform
-across candidates or axes: `C-MLP`'s own measured `s_wall` (no `U` term) is only
-3.95 %/3.11 % on CLIP-text (A1/A2) and 3.36 %/2.66 % on CLIP-vision — well under the 5 %
-DECLINE floor on the wall axis, combined or not (`s_wall+U_wall` above is 4.38 %/3.56 % and
-3.87 %/3.19 %, still under 5 %) — it is the combined *busy* share (`s_busy+U_busy`,
+across candidates or axes: `C-MLP`'s own measured `s_wall` (no `U` term) is only 3.95
+%/3.11 % on CLIP-text (A1/A2) and 3.36 %/2.66 % on CLIP-vision — well under the 5 %
+DECLINE floor on the wall axis, combined or not (`s_wall+U_wall` above is 4.38 %/3.56 %
+and 3.87 %/3.19 %, still under 5 %) — it is the combined *busy* share (`s_busy+U_busy`,
 7.24 %/8.29 % CLIP-text, 6.80 %/8.98 % CLIP-vision) that lands in the contract's 5–10 %
 band and is what keeps DECLINE from firing. The two-sided rule does exactly what it was
-pre-registered to do: it refuses to manufacture a verdict a 5–10 % share does not support,
-on either side.
+pre-registered to do: it refuses to manufacture a verdict a 5–10 % share does not
+support, on either side.
+<!-- /profile-421-generated -->
 
 ### Findings (verbatim text from the artifact's `findings`)
 
@@ -148,6 +154,7 @@ mechanism, only points at it.
   number (`gpu_kernel_us_per_step`, wall/front/busy per step) is unchanged; only the
   per-instantiation breakdown resplit. Both CLIP-tower A2 legs are decision-grade for
   attribution under the fix.
+<!-- profile-421-generated: htsat-a2-deviation -->
 - **`htsat-A2` (bf16) is VALID but not decision-grade for attribution**: its UNATTRIBUTED
   share of GPU busy is 5.66 %, over the contract's 5 % validity bound (window-partition
   copies and the audio front end's own activation are still undeclared chains at the
@@ -156,39 +163,51 @@ mechanism, only points at it.
   and is decision-grade. HTSAT has no candidate port under this contract in the first
   place, so `htsat-A2`'s own non-decision-grade status never blocks a candidate-port
   decision.
+<!-- /profile-421-generated -->
+<!-- profile-421-generated: corpus-pool-note -->
 - Both media corpus producers emit families × instances = 24 files at any `--rows`, so the
   M-leg's 4800 rows cycle 16 distinct train clips (a page-cached working set) — the
   HTSAT/vision front-end finding is a real per-item CPU decode/preprocess compute cost, not
   a realistic-corpus I/O cost.
+<!-- /profile-421-generated -->
+<!-- profile-421-generated: hermetic-test-count-note -->
 - **`CONTRACT.md`'s own §D5 "45 hermetic tests" figure was already stale at freeze.**
   `profile_421_merge.py`'s hermetic suite had grown to 55 tests by the freeze commit
   (`perf/421-profile-p1` @ aace002f) and stays at 55 at `c1b0b0ba` (`python3
   ci/scripts/perf/test_profile_421_merge.py` → "Ran 55 tests"); the count was true earlier
-  on `perf/421-profile-p1` but drifted before the freeze landed. Not corrected in the frozen
-  body (a pre-registration's text is never edited after freezing — see `CONTRACT.md`'s own
-  `citations-resolve-at` header note), recorded here instead: the count is descriptive prose
-  about the suite's size, not a method parameter any decision rule reads, so this staleness
-  never affected a verdict. `docs/maintainer/fine-tune-performance-guide.md` and
-  `CHANGELOG.md` both already avoid citing a bare, drifting count for this suite.
+  on `perf/421-profile-p1` but drifted before the freeze landed. Not corrected in the
+  frozen body (a pre-registration's text is never edited after freezing — see
+  `CONTRACT.md`'s own `citations-resolve-at` header note), recorded here instead: the count
+  is descriptive prose about the suite's size, not a method parameter any decision rule
+  reads, so this staleness never affected a verdict.
+  `docs/maintainer/fine-tune-performance-guide.md` and `CHANGELOG.md` both already avoid
+  citing a bare, drifting count for this suite.
+<!-- /profile-421-generated -->
+<!-- profile-421-generated: basename-ambiguity-note -->
 - **`CONTRACT.md`'s Scope-facts section carries three bare-basename citations that are
-  mechanically AMBIGUOUS at its own pinned epoch (`bff1fad6`), not stale — resolved through a
-  declared header map, never a frozen-body edit.** `check_citations.py`'s
-  `docs/plans/66-tower-profile`-scoped citation form resolves a bare `` `<basename>.rs:<line>` ``
-  by searching the pinned tree for a unique match; at `bff1fad6` this repo already has THREE
-  `layer_norm.rs` files (`crates/jammi-encoders/src/layer_norm.rs`,
-  `crates/jammi-kernels/src/cuda/layer_norm.rs`, `crates/jammi-kernels/src/ops/layer_norm.rs`) and
-  TEN `main.rs` files across crate/test binaries, so `` `layer_norm.rs:129, 552-583` `` (Scope
-  facts, para 1) and the two `` `main.rs:115-223` ``/`` `main.rs:1389-1400` `` citations (Scope
-  facts, para 5) each resolve to more than one candidate by basename alone. The frozen body is
-  never edited post-freeze (this same section's own `citations-resolve-at` header note) to spell
-  them out as full paths — instead `CONTRACT.md`'s HEADER ZONE (never frozen) carries a second
-  HTML comment, `<!-- citations-basename-map: layer_norm.rs=crates/jammi-encoders/src/layer_norm.rs;
+  mechanically AMBIGUOUS at its own pinned epoch (`bff1fad6`), not stale — resolved through
+  a declared header map, never a frozen-body edit.** `check_citations.py`'s
+  `docs/plans/66-tower-profile`-scoped citation form resolves a bare ``
+  `<basename>.rs:<line>` `` by searching the pinned tree for a unique match; at `bff1fad6`
+  this repo already has THREE `layer_norm.rs` files
+  (`crates/jammi-encoders/src/layer_norm.rs`,
+  `crates/jammi-kernels/src/cuda/layer_norm.rs`,
+  `crates/jammi-kernels/src/ops/layer_norm.rs`) and TEN `main.rs` files across crate/test
+  binaries, so `` `layer_norm.rs:129, 552-583` `` (Scope facts, para 1) and the two ``
+  `main.rs:115-223` ``/`` `main.rs:1389-1400` `` citations (Scope facts, para 5) each
+  resolve to more than one candidate by basename alone. The frozen body is never edited
+  post-freeze (this same section's own `citations-resolve-at` header note) to spell them
+  out as full paths — instead `CONTRACT.md`'s HEADER ZONE (never frozen) carries a second
+  HTML comment, `<!-- citations-basename-map:
+  layer_norm.rs=crates/jammi-encoders/src/layer_norm.rs;
   main.rs=crates/jammi-bench/src/main.rs -->`, naming the two intended targets.
-  `check_citations.py` resolves each mapped basename to its declared path, validated against the
-  pinned tree (the path must exist there and its own basename must match the map key) so the map
-  can only disambiguate a genuine ambiguity, never silently re-point a citation — see
-  `check_citations.py`'s own module doc for the full narrowing-not-asserting argument. An unmapped
-  ambiguous basename anywhere else still fails closed exactly as before.
+  `check_citations.py` resolves each mapped basename to its declared path, validated
+  against the pinned tree (the path must exist there and its own basename must match the
+  map key) so the map can only disambiguate a genuine ambiguity, never silently re-point a
+  citation — see `check_citations.py`'s own module doc for the full narrowing-not-asserting
+  argument. An unmapped ambiguous basename anywhere else still fails closed exactly as
+  before.
+<!-- /profile-421-generated -->
 - **`CONTRACT.md`'s §D6 item 1 (`CONTRACT.md:113`) names the wrong function for the
   checkpoint-content refusal — the frozen prose itself is not wrong, only stale on a name.**
   It attributes the refusal of a `$MODEL_DIR_CLIP` carrying `config.json`/`model.safetensors`

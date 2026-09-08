@@ -259,13 +259,26 @@ def _full_synthetic_artifact() -> dict:
             {"leg_id": "clip-text-A2", "verdict": "VALID", "decision_grade": True, "chains": chains(0.031, 0.041, 0.11, 0.011, 0.021, "clip-text")},
             {"leg_id": "clip-vision-A1", "verdict": "VALID", "decision_grade": True, "chains": chains(0.032, 0.042, 0.12, 0.012, 0.022, "clip-vision")},
             {"leg_id": "clip-vision-A2", "verdict": "VALID", "decision_grade": True, "chains": chains(0.033, 0.043, 0.13, 0.013, 0.023, "clip-vision")},
-            {"leg_id": "htsat-A2", "verdict": "VALID", "decision_grade": False, "chains": {"UNATTRIBUTED": {"share_wall": 0.0, "share_gpu_busy": 0.0566}}},
+            {
+                "leg_id": "htsat-A2",
+                "verdict": "VALID",
+                "decision_grade": False,
+                "decision_grade_reason": "UNATTRIBUTED share_gpu_busy=0.0566 > 0.05",
+                "chains": {"UNATTRIBUTED": {"share_wall": 0.0, "share_gpu_busy": 0.0566}},
+            },
+            {
+                "leg_id": "htsat-A1",
+                "verdict": "VALID",
+                "decision_grade": True,
+                "decision_grade_reason": None,
+                "chains": {"UNATTRIBUTED": {"share_wall": 0.0, "share_gpu_busy": 0.02}},
+            },
             *[
                 {"leg_id": f"{t}-{a}", "verdict": "VALID", "decision_grade": True, "chains": {}}
                 for t, a in (
                     ("clip-text", "D1"), ("clip-text", "D2"),
                     ("clip-vision", "D1"), ("clip-vision", "D2"),
-                    ("htsat", "A1"), ("htsat", "D1"), ("htsat", "D2"),
+                    ("htsat", "D1"), ("htsat", "D2"),
                 )
             ],
         ],
@@ -439,6 +452,52 @@ class NewBlockRenderTests(unittest.TestCase):
         self.assertIn("launch_bound", str(ctx.exception))
         self.assertIn("launch-bound", str(ctx.exception))
 
+    def test_magnitude_range_refuses_on_a_non_negative_value(self):
+        """`_magnitude_range` gates the 'cuts'/'drops' direction verbs on an
+        explicit, live sign check of the mapping it is handed -- a
+        non-negative value (BF16 did NOT decrease this tower's number) must
+        fail closed, never silently render a magnitude with the wrong
+        implied direction."""
+        with self.assertRaises(ValueError) as ctx:
+            r._magnitude_range({"clip-text": -30.0, "clip-vision": 5.0})
+        self.assertIn("not uniformly negative", str(ctx.exception))
+
+    def test_magnitude_range_accepts_uniformly_negative_values(self):
+        self.assertEqual(r._magnitude_range({"clip-text": -30.0, "clip-vision": -40.0}), "30–40")
+
+    def _sign_flip_launch_delta(self, key: str):
+        """A copy of `_full_synthetic_artifact()` where one tower's own
+        `clip-launch-bound-batch8` delta (`busy_delta_pct_bf16_vs_f32` or
+        `wall_delta_pct_bf16_vs_f32`) has flipped sign (BF16 GREW that
+        tower's number instead of shrinking it) -- the shape a run whose
+        own signed deltas no longer license the "cuts"/"drops" blanket verb
+        would actually produce."""
+        artifact = _full_synthetic_artifact()
+        for finding in artifact["findings"]:
+            if finding["id"] == "clip-launch-bound-batch8":
+                finding["evidence"][key]["clip-vision"] = abs(finding["evidence"][key]["clip-vision"])
+        return artifact
+
+    def test_findings_guide_refuses_when_a_busy_delta_is_not_negative(self):
+        artifact = self._sign_flip_launch_delta("busy_delta_pct_bf16_vs_f32")
+        with self.assertRaises(ValueError) as ctx:
+            r.render_findings_guide(artifact)
+        self.assertIn("not uniformly negative", str(ctx.exception))
+
+    def test_findings_guide_refuses_when_a_wall_delta_is_not_negative(self):
+        artifact = self._sign_flip_launch_delta("wall_delta_pct_bf16_vs_f32")
+        with self.assertRaises(ValueError) as ctx:
+            r.render_findings_guide(artifact)
+        self.assertIn("not uniformly negative", str(ctx.exception))
+
+    def test_changelog_refuses_when_a_busy_delta_is_not_negative(self):
+        artifact = self._sign_flip_launch_delta("busy_delta_pct_bf16_vs_f32")
+        for leg in artifact["attribution"]:
+            leg["verdict"] = "VALID"
+        with self.assertRaises(ValueError) as ctx:
+            r.render_changelog_421_entry(artifact)
+        self.assertIn("not uniformly negative", str(ctx.exception))
+
     def test_changelog_refuses_when_front_end_bound_is_withheld(self):
         artifact = self._withhold("htsat-front-end-bound", "front_end_bound")
         for leg in artifact["attribution"]:
@@ -482,6 +541,112 @@ class NewBlockRenderTests(unittest.TestCase):
         with self.assertRaises(ValueError) as ctx:
             r.render_htsat_a2_deviation(artifact)
         self.assertIn("merge_verdict", str(ctx.exception))
+
+    def test_htsat_a2_deviation_reads_over_and_the_bound_off_decision_grade_reason(self):
+        """The comparison word and the "N %" bound are PARSED off
+        `attribution[htsat-A2].decision_grade_reason`, never a hard-coded
+        "over" and never a live import of the module constant that produced
+        it -- this fixture's reason string ("> 0.05") must still render
+        "over the ... 5 % validity bound"."""
+        rendered = _norm(r.render_htsat_a2_deviation(self.artifact))
+        self.assertIn("over the contract's 5 % validity bound", rendered)
+
+    def test_htsat_a2_deviation_refuses_when_decision_grade_reason_is_not_the_expected_shape(self):
+        artifact = _full_synthetic_artifact()
+        for leg in artifact["attribution"]:
+            if leg["leg_id"] == "htsat-A2":
+                leg["decision_grade_reason"] = "UNATTRIBUTED share_gpu_busy is non-finite (nan)"
+        with self.assertRaises(ValueError) as ctx:
+            r.render_htsat_a2_deviation(artifact)
+        self.assertIn("decision_grade_reason", str(ctx.exception))
+
+    def test_htsat_a2_deviation_refuses_when_reason_share_disagrees_with_chains_share(self):
+        artifact = _full_synthetic_artifact()
+        for leg in artifact["attribution"]:
+            if leg["leg_id"] == "htsat-A2":
+                leg["decision_grade_reason"] = "UNATTRIBUTED share_gpu_busy=0.9000 > 0.05"
+        with self.assertRaises(ValueError) as ctx:
+            r.render_htsat_a2_deviation(artifact)
+        self.assertIn("disagrees", str(ctx.exception))
+
+    def test_htsat_a2_deviation_refuses_when_the_share_is_not_actually_over_the_bound(self):
+        """A `decision_grade_reason` claiming a "<" or "=" relationship (a
+        different failing rule than the "over the bound" one this bullet's
+        fixed prose asserts) must fail closed, never keep asserting "over"."""
+        artifact = _full_synthetic_artifact()
+        for leg in artifact["attribution"]:
+            if leg["leg_id"] == "htsat-A2":
+                leg["decision_grade_reason"] = "UNATTRIBUTED share_gpu_busy=0.0400 > 0.05"
+                leg["chains"]["UNATTRIBUTED"]["share_gpu_busy"] = 0.0400
+        with self.assertRaises(ValueError) as ctx:
+            r.render_htsat_a2_deviation(artifact)
+        self.assertIn("under its own bound", str(ctx.exception))
+
+    def test_htsat_a2_deviation_refuses_when_htsat_a1_does_not_actually_clear_the_bound(self):
+        artifact = _full_synthetic_artifact()
+        for leg in artifact["attribution"]:
+            if leg["leg_id"] == "htsat-A1":
+                leg["chains"]["UNATTRIBUTED"]["share_gpu_busy"] = 0.9
+        with self.assertRaises(ValueError) as ctx:
+            r.render_htsat_a2_deviation(artifact)
+        self.assertIn("does not actually clear", str(ctx.exception))
+
+    def test_htsat_a2_deviation_refuses_when_htsat_a1_decision_grade_is_false(self):
+        artifact = _full_synthetic_artifact()
+        for leg in artifact["attribution"]:
+            if leg["leg_id"] == "htsat-A1":
+                leg["decision_grade"] = False
+        with self.assertRaises(ValueError) as ctx:
+            r.render_htsat_a2_deviation(artifact)
+        self.assertIn("htsat-A1", str(ctx.exception))
+
+    def test_htsat_a2_deviation_refuses_when_suppressed_findings_contradicts_htsat_a1(self):
+        """`attribution[htsat-A1].decision_grade` says `True`, but this
+        artifact's own `suppressed_findings` names `htsat-A1` as not
+        decision-grade -- an artifact contradicting itself, never a case
+        this bullet may render around."""
+        artifact = _full_synthetic_artifact()
+        artifact["suppressed_findings"] = [
+            {
+                "id": "some-other-finding",
+                "legs": ["htsat-A1"],
+                "reason": "htsat-A1: attribution decision_grade is False, not True",
+            }
+        ]
+        with self.assertRaises(ValueError) as ctx:
+            r.render_htsat_a2_deviation(artifact)
+        self.assertIn("contradict", str(ctx.exception))
+
+
+class RealArtifactHtsatA2DeviationTests(unittest.TestCase):
+    """`render_htsat_a2_deviation` exercised directly against the REAL
+    committed close-out artifact and the REAL committed README bullet
+    (never the synthetic fixture) -- the refactor that made the comparison
+    word and the bound artifact-derived must not move this bullet's own
+    committed text by one byte, and a deliberately contradictory copy of
+    the SAME real artifact must still fail this renderer closed.
+    """
+
+    def setUp(self):
+        self.artifact = json.loads(r.ARTIFACT.read_text())
+
+    def test_matches_the_committed_real_block_byte_for_byte(self):
+        committed = r._current_block(r.README.read_text(), "htsat-a2-deviation", r.README)
+        rendered = r.render_htsat_a2_deviation(self.artifact)
+        self.assertEqual(rendered, committed)
+
+    def test_refuses_on_a_contradictory_copy_of_the_real_artifact(self):
+        artifact = json.loads(json.dumps(self.artifact))  # deep copy
+        artifact["suppressed_findings"] = list(artifact.get("suppressed_findings", [])) + [
+            {
+                "id": "some-other-finding",
+                "legs": ["htsat-A1"],
+                "reason": "htsat-A1: attribution decision_grade is False, not True",
+            }
+        ]
+        with self.assertRaises(ValueError) as ctx:
+            r.render_htsat_a2_deviation(artifact)
+        self.assertIn("contradict", str(ctx.exception))
 
 
 class LiveSourceTests(unittest.TestCase):

@@ -153,16 +153,16 @@ mechanism, only points at it.
   #469 (`fix/421-driver-corpus-stdout`, four rounds); this artifact is the full 12-leg
   re-run (run2) on the merged fix.
 <!-- profile-421-generated: census-key-root-cause -->
-- **The census-key root cause (pass-4, PR #470 `perf/421-attribution`).**
-  `kernel_census.py` keyed each GPU-kernel bucket on `shortName` alone; cutlass's
-  `Kernel2<...>` template wrapper gives every bf16 GEMM tile instantiation the same literal
-  `shortName`, so three distinct cutlass instantiations on `clip-text-A2` collapsed into
-  one anonymous row that tripped the attribution's 1 % known-kernel-name gate. Fixed by
-  keying on `COALESCE(demangledName, shortName)` instead — a strict, sum-preserving
-  refinement (a bucket can only split, never merge two old buckets into fewer new ones):
-  every top-line number (`gpu_kernel_us_per_step`, wall/front/busy per step) is unchanged;
-  only the per-instantiation breakdown resplit. Both CLIP-tower A2 legs are decision-grade
-  for attribution under the fix.
+- **The census-key root cause (pass-4, `perf/421-attribution`).** `kernel_census.py` keyed
+  each GPU-kernel bucket on `shortName` alone; cutlass's `Kernel2<...>` template wrapper
+  gives every bf16 GEMM tile instantiation the same literal `shortName`, so three distinct
+  cutlass instantiations on `clip-text-A2` collapsed into one anonymous row that tripped
+  the attribution's 1 % known-kernel-name gate. Fixed by keying on `COALESCE(demangledName,
+  shortName)` instead — a strict, sum-preserving refinement (a bucket can only split, never
+  merge two old buckets into fewer new ones): every top-line number
+  (`gpu_kernel_us_per_step`, wall/front/busy per step) is unchanged; only the
+  per-instantiation breakdown resplit. Both CLIP-tower A2 legs are decision-grade for
+  attribution under the fix.
 <!-- /profile-421-generated -->
 <!-- profile-421-generated: htsat-a2-deviation -->
 - **`htsat-A2` (bf16) is VALID but not decision-grade for attribution**: its UNATTRIBUTED

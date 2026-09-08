@@ -1679,6 +1679,26 @@ class PlanContractCitationTests(GitFixture):
         violations = cc.check_file(doc)
         self.assertEqual(violations, [], [str(v) for v in violations])
 
+    def test_contract_md_without_the_epoch_header_is_a_violation_never_a_silent_skip(self):
+        """Never-checked must never read as checked-clean: `CONTRACT.md`
+        itself (`_is_frozen_contract_file`'s FILENAME arm, restored in the
+        round-5 fold-in as a UNION alongside the marker arms below) with NO
+        `citations-resolve-at:` header, and carrying NEITHER declared
+        marker either, is itself a `Violation` -- a marker-ONLY definition
+        silently stopped catching this exact, un-decorated file the moment
+        neither marker happened to be present, mechanically indistinguishable
+        from "this was never a contract"; the old behaviour (silently skip
+        the whole plan-contract citation scan, report zero violations) was
+        equally indistinguishable from "every citation resolves".
+        """
+        self._write("crates/foo/trainer.rs", "line one\n")
+        self._commit("add trainer.rs")
+        doc = self._write("CONTRACT.md", "`trainer.rs:999`\n")
+        self._commit("add contract without a header")
+        violations = cc.check_file(doc)
+        self.assertEqual(len(violations), 1, [str(v) for v in violations])
+        self.assertIn("declares no 'citations-resolve-at:' header", violations[0].message)
+
     def test_frozen_marker_via_first_heading_without_the_epoch_header_is_a_violation(self):
         """Never-checked must never read as checked-clean: a `.md` file
         whose FIRST heading names it a contract (`_is_frozen_contract_
@@ -1744,6 +1764,40 @@ class PlanContractCitationTests(GitFixture):
         self._commit("add companion doc without a header")
         violations = cc.check_file(doc)
         self.assertEqual(violations, [], [str(v) for v in violations])
+
+    def test_a_heading_inside_a_fence_is_never_mistaken_for_the_first_heading(self):
+        """The first-heading scan is fence-aware: a heading-SHAPED line
+        quoted as an EXAMPLE inside a ``` fence (e.g. a doc showing readers
+        what a contract's own opening heading looks like), with no REAL
+        heading anywhere in the search window, must never be treated as
+        this document's own title -- the file is not recognized as frozen
+        at all, so it produces no violation (no header mandated, and the
+        frozen-only bare-basename citation form is the only thing that
+        would ever have looked at `trainer.rs:999` here in the first
+        place)."""
+        doc = self._write(
+            "NOTES.md",
+            "```\n# CONTRACT\n```\n\nSome prose.\n\n`trainer.rs:999`\n",
+        )
+        self._commit("add a doc whose only heading-shaped line is fenced")
+        violations = cc.check_file(doc)
+        self.assertEqual(violations, [], [str(v) for v in violations])
+
+    def test_a_heading_naming_contract_is_recognized_after_a_fence_closes(self):
+        """The inverse: a fence that opens and closes BEFORE the document's
+        real first heading must not swallow that real heading -- the
+        fence-aware scan still finds it once the fence toggles closed
+        again, inside the same search window."""
+        self._write("crates/foo/trainer.rs", "line one\n")
+        self._commit("add trainer.rs")
+        doc = self._write(
+            "PLAN.md",
+            "```\nexample text, no heading here\n```\n\n# CONTRACT\n\n`trainer.rs:999`\n",
+        )
+        self._commit("add a doc with a closed fence before its real heading")
+        violations = cc.check_file(doc)
+        self.assertEqual(len(violations), 1, [str(v) for v in violations])
+        self.assertIn("declares no 'citations-resolve-at:' header", violations[0].message)
 
     def test_a_later_heading_naming_contract_does_not_retroactively_mark_the_file_frozen(self):
         """Only the FIRST heading in the search window is consulted -- a

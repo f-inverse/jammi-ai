@@ -414,20 +414,26 @@ output for the live count.
 ## Never-checked must never read as checked-clean
 
 A frozen pre-registration (`_is_frozen_contract_file` -- a `_PLAN_CONTRACT_
-ROOTS` `.md` file whose first `_CITATIONS_EPOCH_HEADER_SEARCH_LINES` lines
-carry a FROZEN MARKER, the ONE file class the "frozen pre-registration's
-citations are pinned to their own epoch" section above describes)
-recognized by that DECLARED marker, never by the literal filename
-`CONTRACT.md`: either the `<!-- Frozen ledger ts: ... -->` HTML comment
-this contract group's own freeze convention opens every frozen file with,
-or a FIRST `#`-prefixed heading line in that same window whose text
-contains "CONTRACT" or "frozen" (case-insensitive) -- a LATER heading is
-never consulted, so recognition cannot be smuggled in by a deep section
-title that happens to use either word. A name-based check would silently
-stop firing the moment a frozen contract is renamed or versioned into its
-own title (`CONTRACT-v2.5.md`); a marker-based one keeps firing regardless,
-because it is the declared property, not the filename, that makes a file
-frozen. A recognized frozen file that does NOT carry a well-formed
+ROOTS` `.md` file that is EITHER named `CONTRACT.md` OR whose first
+`_CITATIONS_EPOCH_HEADER_SEARCH_LINES` lines carry a FROZEN MARKER, the ONE
+file class the "frozen pre-registration's citations are pinned to their
+own epoch" section above describes) recognized by the UNION of the literal
+filename and a DECLARED marker -- either arm is independently sufficient:
+`path.name == "CONTRACT.md"` (this plan group's real, un-renamed shape --
+a marker-ONLY definition silently stopped recognizing this exact file the
+moment neither marker happened to be present, which is mechanically
+indistinguishable from "this was never a contract"); or either the
+`<!-- Frozen ledger ts: ... -->` HTML comment this contract group's own
+freeze convention opens every frozen file with, or a FIRST `#`-prefixed
+heading line (fence-aware: a heading-shaped line quoted as an example
+inside a ``` / ~~~ fence is skipped, never mistaken for the document's own
+title) in that same window whose text contains "CONTRACT" or "frozen"
+(case-insensitive) -- a LATER heading is never consulted, so recognition
+cannot be smuggled in by a deep section title that happens to use either
+word. The marker arm is what still catches a frozen contract RENAMED or
+VERSIONED into its own title (`CONTRACT-v2.5.md`), which the filename arm
+alone would miss -- widening one arm can never narrow the other. A
+recognized frozen file that does NOT carry a well-formed
 `citations-resolve-at:` header in that SAME window -- whether the header is
 genuinely absent, or it landed past the search window (which reads
 byte-for-byte identically to absent) -- is itself a `Violation`, never a
@@ -1156,44 +1162,60 @@ def _plan_contract_scope(path: Path) -> bool:
 # -->`), or a FIRST heading whose text names it a contract/frozen document.
 _FROZEN_MARKER_COMMENT_RE = re.compile(r"<!--\s*Frozen\b", re.IGNORECASE)
 _FROZEN_HEADING_WORD_RE = re.compile(r"contract|frozen", re.IGNORECASE)
+_FENCE_RE = re.compile(r"^(?:```|~~~)")
 
 
 def _is_frozen_contract_file(path: Path, text: str) -> bool:
-    """Whether `path` (together with its OWN text, since recognition reads
-    the file's content, not its name) is a frozen pre-registration --
+    """Whether `path` (together with its OWN text, since recognition also
+    reads content, not just the name) is a frozen pre-registration --
     module doc's "A frozen pre-registration's citations are pinned to their
     own epoch" section -- the ONLY file class the "never-checked must never
     read as checked-clean" mandatory-header rule applies to.
 
-    Recognized by a DECLARED MARKER in the first
-    `_CITATIONS_EPOCH_HEADER_SEARCH_LINES` lines, never by the literal
-    filename `CONTRACT.md`: a filename check silently stops firing the
-    moment a frozen contract is renamed or versioned into its own title
-    (`CONTRACT-v2.5.md`) -- exactly the drift this rule exists to make
-    impossible to miss. Either marker shape is sufficient on its own:
+    Recognized by the UNION of the literal filename AND a declared marker
+    -- either is independently sufficient, so widening one arm can never
+    narrow the other:
 
-      - `_FROZEN_MARKER_COMMENT_RE` matches anywhere in the window (the
-        `<!-- Frozen ledger ts: ... -->` HTML comment this plan group's own
-        freeze convention opens every frozen file with); or
-      - the FIRST `#`-prefixed heading line in that same window, if its
-        text matches `_FROZEN_HEADING_WORD_RE` ("contract" or "frozen",
-        case-insensitive). A LATER heading is never consulted once the
-        first one is found -- whether or not it matches -- so a document
-        whose first heading is unrelated (a companion `README.md` titled
-        "66 — tower profile close-out") is never accidentally caught by
-        some deeper section heading that happens to mention either word.
+      - `path.name == "CONTRACT.md"` (this plan group's own real, un-renamed
+        shape -- a marker-ONLY definition would silently stop recognizing
+        the plain, un-decorated file the moment neither the freeze-ledger
+        comment nor a matching first heading happens to be present, which
+        is mechanically indistinguishable from "this file was never a
+        contract" -- exactly the "never-checked reads as checked-clean"
+        failure this whole function exists to rule out); OR
+      - a DECLARED MARKER in the first `_CITATIONS_EPOCH_HEADER_SEARCH_LINES`
+        lines -- this arm is what still catches a frozen contract RENAMED or
+        VERSIONED into its own title (`CONTRACT-v2.5.md`), which the
+        filename arm alone would miss. Either marker shape is sufficient on
+        its own:
+
+        - `_FROZEN_MARKER_COMMENT_RE` matches anywhere in the window (the
+          `<!-- Frozen ledger ts: ... -->` HTML comment this plan group's
+          own freeze convention opens every frozen file with); or
+        - the FIRST `#`-prefixed heading line in that same window OUTSIDE
+          a fenced code block (fence-aware: a ``` / ~~~ fence toggles a
+          skip-state, so a heading-shaped line quoted as an EXAMPLE inside
+          a fence is never mistaken for this document's own title), if its
+          text matches `_FROZEN_HEADING_WORD_RE` ("contract" or "frozen",
+          case-insensitive). A LATER heading is never consulted once the
+          first non-fenced one is found -- whether or not it matches -- so
+          a document whose first heading is unrelated (a companion
+          `README.md` titled "66 — tower profile close-out") is never
+          accidentally caught by some deeper section heading that happens
+          to mention either word.
 
     Deliberately NARROWER than `_plan_contract_scope`: a plan group's
     OTHER `.md` files (a close-out `README.md` discussing or quoting the
     frozen contract's own citations, for instance) live under the same
-    `_PLAN_CONTRACT_ROOTS` directory but carry NEITHER marker shape -- they
-    are not the frozen, single-epoch artifact this convention exists to
-    guard, and typically cite a MIX of the contract's own frozen-epoch
-    facts and the CURRENT (HEAD-relative) tree in the same paragraph -- a
-    single whole-file epoch pin cannot honestly cover both, so such a file
-    is never forced to declare one. Requiring a `citations-resolve-at:`
-    header from every `.md` file in the directory (not just the one that
-    actually carries a frozen marker) would either force those genuinely-
+    `_PLAN_CONTRACT_ROOTS` directory but are named something other than
+    `CONTRACT.md` and carry NEITHER marker shape -- they are not the
+    frozen, single-epoch artifact this convention exists to guard, and
+    typically cite a MIX of the contract's own frozen-epoch facts and the
+    CURRENT (HEAD-relative) tree in the same paragraph -- a single
+    whole-file epoch pin cannot honestly cover both, so such a file is
+    never forced to declare one. Requiring a `citations-resolve-at:` header
+    from every `.md` file in the directory (not just the one that actually
+    is/carries a frozen contract) would either force those genuinely-
     HEAD-relative citations to mis-resolve against a stale pinned tree, or
     force the companion doc to stop quoting the contract's own citation
     text altogether -- neither of which the "never-checked equals
@@ -1204,12 +1226,20 @@ def _is_frozen_contract_file(path: Path, text: str) -> bool:
     """
     if not _plan_contract_scope(path):
         return False
+    if path.name == "CONTRACT.md":
+        return True
     window = text.splitlines()[:_CITATIONS_EPOCH_HEADER_SEARCH_LINES]
     for line in window:
         if _FROZEN_MARKER_COMMENT_RE.search(line):
             return True
+    in_fence = False
     for line in window:
         stripped = line.lstrip()
+        if _FENCE_RE.match(stripped):
+            in_fence = not in_fence
+            continue
+        if in_fence:
+            continue
         if stripped.startswith("#"):
             return bool(_FROZEN_HEADING_WORD_RE.search(stripped.lstrip("#").strip()))
     return False

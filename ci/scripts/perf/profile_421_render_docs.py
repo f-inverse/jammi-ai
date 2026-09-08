@@ -65,8 +65,16 @@ marker pair, in `docs/plans/66-tower-profile/README.md` unless noted:
     UNATTRIBUTED share of GPU busy (`attribution["htsat-A2"].chains
     ["UNATTRIBUTED"].share_gpu_busy`), its "VALID"/"not decision-grade"
     words (`legs[htsat-A2].merge_verdict` / `attribution[htsat-A2].
-    decision_grade`) and its "N %" validity bound (`profile_421_attribute.
-    py`'s own `UNATTRIBUTED_DECISION_GRADE_LIMIT`).
+    decision_grade`), its comparison word and "N %" validity bound (both
+    PARSED off `attribution[htsat-A2].decision_grade_reason`'s own recorded
+    `"UNATTRIBUTED share_gpu_busy=<share> > <bound>"` string, cross-checked
+    against an actual `>` comparison of the two floats -- never a
+    hard-coded "over" or a live import of the module constant that produced
+    it), and its `htsat-A1` clause off `attribution["htsat-A1"]`
+    (`decision_grade` plus its own UNATTRIBUTED share, verified to actually
+    clear the same bound) -- refusing outright if the artifact's own
+    `suppressed_findings` names `htsat-A1` as not decision-grade while
+    `attribution["htsat-A1"].decision_grade` says otherwise.
   - `corpus-pool-note`: the Deviations bullet naming the media corpus pool
     size and the M-leg's train-clip cycle count -- sourced live from
     `profile_421_legs.sh`'s own `MEDIA_FAMILIES`/`MEDIA_HELDOUT_FAMILIES`/
@@ -120,13 +128,17 @@ REPO_ROOT = Path(__file__).resolve().parents[3]
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 import check_citations as _cc  # noqa: E402
 # `profile_421_artifact`'s own `_fmt_range` (the EXACT rounding/range-collapse
-# rule every finding's own text was rendered with) and `profile_421_
-# attribute`'s own validity-gate constants -- imported, never retyped, so a
-# renderer that needs a NUMBER these two modules already computed reads it
-# live off them (or off the artifact's own structured `evidence`), never a
-# second, independently-drifting hand-typed copy or a literal.
+# rule every finding's own text was rendered with) -- imported, never
+# retyped, so a renderer that needs a NUMBER this module already computed
+# reads it live off it (or off the artifact's own structured `evidence`),
+# never a second, independently-drifting hand-typed copy or a literal. Every
+# validity-gate NUMBER `profile_421_attribute.py` computes (e.g. the
+# UNATTRIBUTED bound) is read back off the ARTIFACT's own recorded evidence
+# (`decision_grade_reason`), never a live import of that module's constants
+# -- a module constant could since have moved independently of the run that
+# actually produced this artifact; the artifact's own recorded number is the
+# one this run was actually judged against.
 import profile_421_artifact as _pa  # noqa: E402
-import profile_421_attribute as _attribute_mod  # noqa: E402
 
 ARTIFACT = (
     REPO_ROOT
@@ -492,12 +504,37 @@ def _range_str(mapping: dict[str, float]) -> str:
 
 def _magnitude_range(mapping: dict[str, float]) -> str:
     """The SAME magnitude-range computation `compute_findings`'s own
-    uniform-negative branch used to build the "cuts GPU busy by X%" /
-    "wall drops by only Y%" clause (sorted by `abs`, then `_fmt_range` over
-    the two magnitude extremes, en-dash not hyphen -- same convention as
+    uniform-negative branch builds the "cuts GPU busy by X%" / "wall drops
+    by only Y%" clause from (sorted by `abs`, then `_fmt_range` over the
+    two magnitude extremes, en-dash not hyphen -- same convention as
     `_range_str`) -- reused here rather than re-derived, so a renderer can
     never drift from the exact numbers the finding's own text was built
-    from."""
+    from.
+
+    `compute_findings` only ever builds that blanket "cuts"/"drops" clause
+    when EVERY value in `mapping` is negative (its own uniform-negative
+    branch) -- a mixed-sign or non-negative `mapping` instead gets a
+    per-tower, sign-derived sentence (`_direction_clause`) that names each
+    tower's own direction individually, never a single blanket verb. This
+    producer-side branch choice is NOT itself recorded as a boolean in
+    `evidence` (only the resulting numbers are), so every caller of this
+    helper GATES the direction verbs on an explicit, live sign check of the
+    SAME signed deltas `evidence` carries -- taking `abs()` unconditionally
+    (as this helper used to) would silently keep asserting "cuts"/"drops"
+    even the moment a future run's own deltas stopped being uniformly
+    negative, which is exactly the "prose stops matching the sign the
+    artifact actually recorded" drift this gate exists to make impossible.
+    Refuses (`ValueError`, `--check` red) rather than render a directional
+    verb the run's own signed evidence does not license.
+    """
+    if not all(v < 0.0 for v in mapping.values()):
+        raise ValueError(
+            f"{mapping!r} is not uniformly negative -- the 'cuts'/'drops' direction verbs this "
+            "renderer's fixed prose asserts are only licensed when EVERY value in this evidence "
+            "mapping decreases; rewrite the renderer (and the prose) into a per-tower, "
+            "sign-derived sentence instead of a blanket magnitude range the run's own signed "
+            "deltas do not license"
+        )
     by_magnitude = sorted(mapping.values(), key=abs)
     return _pa._fmt_range(abs(by_magnitude[0]), abs(by_magnitude[-1])).replace("-", "–")
 
@@ -741,20 +778,60 @@ def render_changelog_421_entry(artifact: dict) -> str:
     )
 
 
+_DECISION_GRADE_REASON_RE = re.compile(
+    r"^UNATTRIBUTED share_gpu_busy=([0-9.eE+-]+) > ([0-9.eE+-]+)$"
+)
+
+
+def _htsat_a1_named_not_decision_grade(artifact: dict) -> list[dict]:
+    """Every `suppressed_findings[]` entry that names `htsat-A1` among its
+    `legs` AND whose own `reason` string is about `decision_grade` -- the
+    artifact's OWN record of a leg it built findings machinery around and
+    judged non-decision-grade. Read structurally (leg id membership + the
+    literal field name in the reason), never by re-deriving the judgment,
+    so this catches the artifact contradicting itself regardless of which
+    finding surfaced the contradiction."""
+    return [
+        s
+        for s in artifact.get("suppressed_findings", [])
+        if "htsat-A1" in s.get("legs", []) and "decision_grade" in s.get("reason", "")
+    ]
+
+
 def render_htsat_a2_deviation(artifact: dict) -> str:
     """The Deviations bullet naming `htsat-A2`'s own UNATTRIBUTED share of
     GPU busy. Every number AND word this bullet's fixed prose needs is read
-    live: the "VALID [at the merge level]" word from `legs[htsat-A2].
-    merge_verdict` (never assumed), the "not decision-grade" phrase from
-    `attribution[htsat-A2].decision_grade` itself (never a hard-coded
-    negation baked in ahead of the check), and the "N % validity bound"
-    from `profile_421_attribute.py`'s own `UNATTRIBUTED_DECISION_GRADE_
-    LIMIT` (the SAME constant `profile_421_artifact.py`'s own
-    `_identity_template_context` already quotes into `notes.
-    recorded_deviations` -- never a second, independently-drifting
-    literal). Fails closed (never silently re-labels the bullet) the
-    moment either boolean stops matching what this bullet's own prose
-    assumes.
+    live, off the artifact's OWN attribution/evidence, never a hard-coded
+    literal or a live import of a module constant that could since have
+    moved independently of the run that produced this artifact:
+
+    - the "VALID [at the merge level]" word from `legs[htsat-A2].
+      merge_verdict` (never assumed);
+    - the "not decision-grade" phrase from `attribution[htsat-A2].
+      decision_grade` itself (never a hard-coded negation baked in ahead of
+      the check);
+    - the comparison word ("over") and the "N % validity bound" by PARSING
+      `attribution[htsat-A2].decision_grade_reason` (`profile_421_attribute.
+      py`'s own `leg_decision_grade` writes this exact
+      `"UNATTRIBUTED share_gpu_busy=<share> > <bound>"` string into the
+      artifact at run time) -- cross-checked against the same leg's own
+      `chains.UNATTRIBUTED.share_gpu_busy` (the two must agree) and against
+      an ACTUAL `>` comparison of the two floats (never assumed "over"
+      because that is the only branch this bullet has ever seen); a `<`/`=`
+      artifact, or a `decision_grade_reason` that is not this exact shape
+      (e.g. a non-finite-share refusal), fails this renderer CLOSED rather
+      than silently keep saying "over";
+    - the `htsat-A1` clause off `attribution[htsat-A1]` itself
+      (`decision_grade` for the True/False branch, `chains.UNATTRIBUTED.
+      share_gpu_busy` to verify it ACTUALLY clears the same bound before
+      the bullet is allowed to say so) -- and refuses outright the moment
+      the artifact's own `suppressed_findings` names `htsat-A1` as not
+      decision-grade (`_htsat_a1_named_not_decision_grade`) while
+      `attribution[htsat-A1].decision_grade` is `True`: that is the
+      artifact contradicting itself, not a case this bullet may paper over.
+
+    Fails closed (never silently re-labels the bullet) the moment any of
+    these stop matching what this bullet's own fixed prose assumes.
     """
     merge_by_leg = {leg["leg_id"]: leg for leg in artifact["legs"]}
     htsat_a2_merge_verdict = merge_by_leg["htsat-A2"]["merge_verdict"]
@@ -765,24 +842,82 @@ def render_htsat_a2_deviation(artifact: dict) -> str:
             "merge-VALID; rewrite it if that changed"
         )
     by_leg = _attribution_by_leg(artifact)
-    decision_grade = by_leg["htsat-A2"]["decision_grade"]
+    a2 = by_leg["htsat-A2"]
+    decision_grade = a2["decision_grade"]
     if decision_grade is not False:
         raise ValueError(
             f"expected htsat-A2 decision_grade False, got {decision_grade!r} -- this bullet's "
             "own fixed prose explains WHY it is non-decision-grade; rewrite it (and the "
             "README section around it) if the artifact's own verdict changed"
         )
-    share_pct = by_leg["htsat-A2"]["chains"]["UNATTRIBUTED"]["share_gpu_busy"] * 100
-    bound_pct = _attribute_mod.UNATTRIBUTED_DECISION_GRADE_LIMIT * 100.0
+
+    a2_share = a2["chains"]["UNATTRIBUTED"]["share_gpu_busy"]
+    reason = a2.get("decision_grade_reason") or ""
+    match = _DECISION_GRADE_REASON_RE.match(reason)
+    if match is None:
+        raise ValueError(
+            f"htsat-A2 decision_grade_reason {reason!r} is not the "
+            "'UNATTRIBUTED share_gpu_busy=<share> > <bound>' shape this bullet's own "
+            "comparison and bound are parsed from -- rewrite this renderer (and the bullet) "
+            "if the failing rule (or its reason string) changed"
+        )
+    reason_share, bound = float(match.group(1)), float(match.group(2))
+    if round(reason_share, 4) != round(a2_share, 4):
+        raise ValueError(
+            f"htsat-A2 decision_grade_reason share ({reason_share!r}) disagrees with the same "
+            f"leg's own chains['UNATTRIBUTED']['share_gpu_busy'] ({a2_share!r}) -- these two "
+            "artifact fields must agree; refuse rather than silently pick one"
+        )
+    if a2_share > bound:
+        comparison_word = "over"
+    elif a2_share < bound:
+        comparison_word = "under"
+    else:
+        comparison_word = "at"
+    if comparison_word != "over":
+        raise ValueError(
+            f"htsat-A2 UNATTRIBUTED share is {comparison_word} its own bound "
+            f"({a2_share!r} vs {bound!r}) -- this bullet's own fixed prose ('not "
+            "decision-grade ... over the ... validity bound') assumes the share is OVER the "
+            "bound; rewrite it if the artifact's own direction changed"
+        )
+    share_pct = a2_share * 100
+    bound_pct = bound * 100.0
+
+    a1 = by_leg["htsat-A1"]
+    a1_decision_grade = a1["decision_grade"]
+    a1_contradictions = _htsat_a1_named_not_decision_grade(artifact)
+    if a1_contradictions and a1_decision_grade is True:
+        raise ValueError(
+            f"htsat-A1 attribution reports decision_grade=True but this artifact's own "
+            f"suppressed_findings {a1_contradictions!r} names htsat-A1 as not decision-grade "
+            "-- these two facts contradict each other in the SAME artifact; refuse rather "
+            "than render a claim about htsat-A1 the artifact itself disputes"
+        )
+    if a1_decision_grade is not True:
+        raise ValueError(
+            f"expected htsat-A1 decision_grade True, got {a1_decision_grade!r} -- this "
+            "bullet's own fixed prose ('clears the bound and is decision-grade') assumes "
+            "htsat-A1 IS decision-grade; rewrite it if that changed"
+        )
+    a1_share = a1["chains"]["UNATTRIBUTED"]["share_gpu_busy"]
+    if not a1_share < bound:
+        raise ValueError(
+            f"htsat-A1 UNATTRIBUTED share ({a1_share!r}) does not actually clear the "
+            f"{bound!r} bound htsat-A2 was judged against -- this bullet's own fixed prose "
+            "('clears the bound') assumes it does; rewrite it if that changed"
+        )
+
     body = (
         f"**`htsat-A2` (bf16) is {htsat_a2_merge_verdict} but not decision-grade for "
-        f"attribution**: its UNATTRIBUTED share of GPU busy is {share_pct:.2f} %, over the "
-        f"contract's {bound_pct:.0f} % validity bound (window-partition copies and the audio "
-        "front end's own activation are still undeclared chains at the identical element "
-        "count as a generic residual-stream permute/reshape copy — the attribution module "
-        "declares neither rather than guess). `htsat-A1` (f32) clears the bound and is "
-        "decision-grade. HTSAT has no candidate port under this contract in the first place, "
-        "so `htsat-A2`'s own non-decision-grade status never blocks a candidate-port decision."
+        f"attribution**: its UNATTRIBUTED share of GPU busy is {share_pct:.2f} %, "
+        f"{comparison_word} the contract's {bound_pct:.0f} % validity bound (window-partition "
+        "copies and the audio front end's own activation are still undeclared chains at the "
+        "identical element count as a generic residual-stream permute/reshape copy — the "
+        "attribution module declares neither rather than guess). `htsat-A1` (f32) clears the "
+        "bound and is decision-grade. HTSAT has no candidate port under this contract in the "
+        "first place, so `htsat-A2`'s own non-decision-grade status never blocks a "
+        "candidate-port decision."
     )
     return _bullet(body)
 
@@ -891,7 +1026,7 @@ def render_census_key_root_cause_note(artifact: dict) -> str:
         )
     gate_pct = gate_m.group(1)
     body = (
-        "**The census-key root cause (pass-4, PR #470 `perf/421-attribution`).** "
+        "**The census-key root cause (pass-4, `perf/421-attribution`).** "
         "`kernel_census.py` keyed each GPU-kernel bucket on `shortName` alone; cutlass's "
         "`Kernel2<...>` template wrapper gives every bf16 GEMM tile instantiation the same "
         f"literal `shortName`, so {split_count_word.lower()} distinct cutlass instantiations "

@@ -630,6 +630,30 @@ workspace ships every publishable crate at the same
   -guarded region, heredoc-aware so an embedded `python3 -c` payload's own dangling `if`s cannot
   fool the block-extent walk) or the existing preflight-refusal shape generalized off the `FAKE`
   name requirement.
+- **`load_context_predictor`'s corrupted-catalog-record refusals are typed `JammiError::Model`
+  naming the model id and the field, closing the same class esc-089 closed for the reload arm's
+  pointer/integrity/unpublished checks.** A missing or unparseable `config_json`, and a
+  parseable-but-incomplete config (missing `head`/`architecture`/`feature_dim`/`context_k`/
+  `hidden_dim`/`num_heads`/`num_layers`/`head_width`/`value_column`/`target_scaler`), previously
+  raised this surface's own `JammiError::Inference` — `Code::Internal` at the wire boundary,
+  wrong for a client-visible precondition failure. "No `config_json` recorded" and "`config_json`
+  unparseable: `<serde error>`" are now distinct messages, never collapsed into one "no parseable
+  config_json" claim. The `varmap.load` arm (a manifest-verified bundle missing
+  `model.safetensors`) now matches the resolver's peer refusal shape
+  (`CandleBackend::load`'s `"Failed to load safetensors: {e}"`) instead of its own
+  `JammiError::Inference`.
+- **`arrow_to_texts` refuses a binary content column by name instead of silently embedding empty
+  strings, and casts any other non-string column instead of dropping it.** `get_string_value`'s
+  catch-all treated any Arrow type that was not `Utf8`/`LargeUtf8`/`Utf8View` as absent, so a
+  `Binary`/`LargeBinary`/`BinaryView`/`FixedSizeBinary` content column (e.g. image or audio bytes
+  submitted under a text-embedding task) — or any other non-string type, e.g. `Int64` — read as
+  `""` for every row, with `row_status` all-ok and no error. `arrow_to_texts` now validates each
+  column's physical type up front, mirroring `fine_tune::worker::extract_string_column`'s policy
+  (the trainer already applied this rule) exactly: the string families pass through unchanged;
+  the binary families are refused outright with a typed `JammiError::Inference` naming the
+  column's data type; every other type is cast to `Utf8` via `arrow::compute::cast`, refused if
+  the cast introduces a null the source column did not have. A null value in an otherwise-text
+  column keeps its documented `""` reading (esc-091).
 
 ### Breaking
 - `jammi_ai::inference::{arrow_to_images, arrow_to_audio}` return one decode result per row

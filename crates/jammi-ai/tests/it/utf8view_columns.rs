@@ -16,8 +16,8 @@
 use std::path::PathBuf;
 use std::sync::Arc;
 
-use arrow::array::{ArrayRef, StringArray, StringViewArray};
-use jammi_ai::inference::{arrow_to_audio, arrow_to_images};
+use arrow::array::{ArrayRef, BinaryArray, Int64Array, StringArray, StringViewArray};
+use jammi_ai::inference::{arrow_to_audio, arrow_to_images, arrow_to_texts};
 use jammi_ai::session::InferenceSession;
 use jammi_db::source::{FileFormat, SourceConnection, SourceType};
 
@@ -408,4 +408,58 @@ async fn parquet_utf8_audio_path_column_scans_as_utf8view_and_embeds() {
     for v in &vectors {
         assert!(!v.is_empty(), "embedding vector should not be empty");
     }
+}
+
+// =============================================================================
+// F4 (review pass on esc-090/esc-091): `arrow_to_texts` must apply the SAME
+// column-type policy `fine_tune::worker::extract_string_column` already
+// applies on the training path — binary families refused outright, other
+// non-string types cast with a refusal on any introduced null, nulls keep
+// the documented "" reading. Pre-fix, `get_string_value`'s `_ => None` arm
+// let ANY non-string-like column (including raw image/audio bytes) silently
+// read as "" for every row, with no error — the server would embed empty
+// strings. RED without the fix.
+// =============================================================================
+
+/// A `Binary` column under a text-embedding call must refuse the WHOLE call
+/// with a typed error naming the column's data type — never silently embed
+/// the bytes as an empty string for every row.
+#[test]
+fn arrow_to_texts_binary_column_refuses_naming_the_type() {
+    let col: ArrayRef = Arc::new(BinaryArray::from(vec![
+        Some(b"\x89PNG\r\n\x1a\n".as_slice()),
+        Some(b"RIFF....WAVEfmt ".as_slice()),
+    ]));
+
+    let err = arrow_to_texts(&[col]).expect_err(
+        "a Binary column holds raw bytes, not text — this must be a typed refusal, never a \
+         silent per-row empty string",
+    );
+    let message = err.to_string();
+    assert!(
+        message.contains("Binary"),
+        "refusal must name the column's data type, got: {message}"
+    );
+}
+
+/// An `Int64` column is not string-like, but its digits ARE honestly
+/// readable as text via `arrow::compute::cast` — this must succeed and
+/// match a `Utf8` column carrying the same digits as strings, never refuse
+/// and never silently read as "".
+#[test]
+fn arrow_to_texts_int64_column_casts_and_matches_utf8_digits() {
+    let int_col: ArrayRef = Arc::new(Int64Array::from(vec![Some(42), None, Some(-7)]));
+    let str_col: ArrayRef = Arc::new(StringArray::from(vec![Some("42"), None, Some("-7")]));
+
+    let from_int =
+        arrow_to_texts(&[int_col]).expect("an Int64 column must cast to text, never refuse");
+    let from_str = arrow_to_texts(&[str_col]).expect("Utf8 column must embed as usual");
+
+    assert_eq!(
+        from_int, from_str,
+        "an Int64 column's cast-to-text reading must match the equivalent Utf8 column of the \
+         same digits, row for row"
+    );
+    // Null rows keep the documented "" reading on both sides.
+    assert_eq!(from_int[1], "", "a null row must read as the empty string");
 }

@@ -38,18 +38,70 @@ Both are deliberately mechanical (name/pattern presence), not a semantic
 understanding of the guard's control flow — the same "grep for the shape,
 not the meaning" stance `check_ci_guard_wiring.py`'s own module doc states.
 
-## Comment handling — a shared rule, applied uniformly across (A), (B), (C)
+## Comment handling — a bash-aware lexer, applied uniformly across (A), (B), (C)
 
-Every token/regex test in all three checks below runs against
-`_strip_comment(line)`, never the raw line: bash treats an unquoted,
-unescaped `#` as the start of a comment running to end of line, so a
-trailing `# ...` on an otherwise-real line of code must not be able to
-satisfy (B)'s `provenance`/`build_sha` cross-check, nor forge a guard
-shape (A)/(C) would otherwise accept. `_is_comment_line` (a full-line
-predicate — true only when `#` is the first non-blank character) still
-decides whether a whole line counts as a "use" of a variable at all;
-`_strip_comment` additionally trims any trailing comment off a line that
-IS counted, before that line's content is matched against anything.
+Every token/regex test in all three checks below runs against a LEXED
+reading of each line, never the raw line: bash treats an unquoted,
+unescaped, word-initial `#` as the start of a comment running to end of
+line, so a trailing `# ...` on an otherwise-real line of code must not be
+able to satisfy (B)'s `provenance`/`build_sha` cross-check, nor forge a
+guard shape (A)/(C) would otherwise accept. Conversely, a `#` that is not
+bash's comment marker at all (`$#`, `${#arr}`, `${var#pattern}`, a
+`$((10#$N))` base-literal, or any other `#` that is not the first
+character of a shell word) must never be mistaken for one — truncating
+real code as though it were a trailing comment.
+
+`_lex_stream` (below) is a single, complete state machine over an entire
+file's lines, threading single-/double-quote and `$(`/`$((`/`${` nesting
+state ACROSS line boundaries (never reset per line): a physical line that
+opens a quote or bracket construct it does not itself close is a genuine,
+common bash shape (a `python3 -c '...'` payload piped across several
+physical lines, a `"$(...)" ` capturing a multi-line command
+substitution), and getting this wrong in either direction is a real,
+exploitable gap — a bug this exact file's differential corpus scan (see
+`self_test`'s `--self-test` arm) found LIVE on two tracked lines
+(`pod_push_stamp.sh`, `test_pod_substrate.sh`: a line that legitimately
+CLOSES a quote OPENED several lines earlier was misread as OPENING a new
+one, so the line's own real trailing comment was never stripped — a
+fail-open that could let arbitrary prose satisfy a guard or a cross-check)
+and two more (`runpod_lib.sh`, `test_pod_substrate.sh`: a `#` inside
+`$((10#$VAR))` or `${var#pattern}` was misread as a comment marker,
+truncating real code — a false-strip that could hide a real guard from
+this scanner entirely).
+
+Two lines the lexer cannot fully resolve on their own are marked
+UNDECIDABLE rather than guessed at: a `#` that is not bash's comment
+marker AND not one of the recognized `#`-is-never-a-comment contexts
+(inside `$((...))` or `${...}`) — i.e. a `#` that is simply mid-word — and
+the terminal case of a file ending while a construct this lexer opened is
+still unresolved. Every consumer below reads an UNDECIDABLE line through
+ONE of two accessors, chosen by what that specific check is testing:
+
+  - `_trigger_text` (used for "does this line REFERENCE token X" —
+    finding a knob's use sites, finding a `jammi-bench` binary-path
+    assignment that pulls a script into (B)'s scope): an UNDECIDABLE line
+    reads as its RAW, unstripped text — the WIDEST possible scope, so a
+    real use this lexer could not fully parse is never silently dropped.
+  - `_guard_text` (used for "does this line SATISFY a guard/cross-check
+    shape" — (A)/(C)'s `!= "1"` + `exit` guard, (B)'s `provenance`/
+    `build_sha` tokens, the `if`/`fi` depth walks that bound a guard's own
+    block): an UNDECIDABLE line contributes NO text at all — a shape this
+    lexer could not fully resolve must never be able to forge a passing
+    guard or cross-check.
+
+A decidable line (the overwhelming majority) reads identically through
+either accessor: its comment (if any) is already excised, so there is
+nothing left for the trigger/guard distinction to change.
+
+`self_test`'s `--self-test` arm additionally runs a full corpus scan: every
+tracked `.sh` line under `ci/scripts/` is lexed by `_lex_stream` AND by a
+second, independently-written state machine (`_independent_lex_stream` —
+deliberately simpler: two plain quote booleans, no `$(`/`$((`/`${` frame
+typing at all), and the two are asserted to agree on every line. The five
+lines above are pinned as explicit fixture cases with their expected
+classification, alongside the general corpus-wide agreement check, so a
+future regression in either implementation shows up as a named,
+attributable failure rather than a silent corpus-wide disagreement.
 
 ## (C) `*_DRY_RUN_*` knob admissibility — a second knob shape beyond `*FAKE*`
 
@@ -88,7 +140,10 @@ own default up front) is never counted as a read site: it captures the
 ambient value (or a fallback) into a same-named local, with no
 consequence of its own — the knob's real effect is wherever that value is
 later dereferenced for real, which the containment/refusal check inspects
-independently.
+independently. This test is itself computed off `_guard_text` (never
+`_trigger_text`): an UNDECIDABLE line must never be granted the
+self-default EXEMPTION (which would let this scanner skip checking it
+entirely) — it is always treated as a real, uncovered read site instead.
 
 Block extent (both for the (C) containment check above and reused nowhere
 else) is computed HEREDOC-AWARE: a heredoc body between a `<<[-]TERM`
@@ -101,10 +156,19 @@ a `python3 -c '...'` payload whose OWN `if`/`else` statements never close
 with a bash `fi` at all (Python doesn't have one) — those bare `if` tokens
 would inflate the depth counter with nothing to bring it back down,
 so the walker would search past the real `fi` chasing python conditionals
-that can never satisfy it.
+that can never satisfy it. `_lex_stream` independently treats a heredoc
+body as opaque for its OWN comment-boundary purposes too (lexed line by
+line with fresh, throwaway quote state): the prose inside a heredoc-embedded
+script or comment routinely contains ordinary English contractions
+("gpu-dev.sh's own", "doesn't") whose apostrophes must never be read as
+REAL, cross-line-persisting bash quote characters that could otherwise
+corrupt every line of live code that follows the heredoc's closing
+terminator.
 
 Run: `python3 ci/scripts/perf/check_producer_provenance_gates.py`
-Self-test (RED cases for (A), (B) and (C), on throwaway fixture files):
+Self-test (RED cases for (A), (B) and (C), on throwaway fixture files, plus
+a full corpus scan cross-checking the lexer against a second, independent
+implementation):
 `python3 ci/scripts/perf/check_producer_provenance_gates.py --self-test`
 Hermetic: reads tracked files via `git ls-files` only (no network, no
 build, no GPU).
@@ -117,6 +181,7 @@ import subprocess
 import sys
 import tempfile
 from pathlib import Path
+from typing import NamedTuple
 
 REPO_ROOT = Path(__file__).resolve().parents[3]
 # Fail loud rather than scan-zero-silently: this file lives at
@@ -133,12 +198,11 @@ REPO_ROOT = Path(__file__).resolve().parents[3]
 # fail on the very first line of `main()`/`self_test()` that touches
 # `REPO_ROOT`, not silently downstream as an empty findings list that looks
 # identical to "everything is fine".
-# Unit-63 round-16 audit advisory 1: an explicit `if`/`raise`, never a bare
-# `assert` -- `assert` is stripped entirely under `python -O`, which would
-# silently disable this exact anti-vacuity guard (the one thing standing
-# between a wrong `parents[N]` and a scan-zero-silently PASS) in exactly the
-# deployment shape that removes the safety net without removing the code
-# path it protects.
+# An explicit `if`/`raise`, never a bare `assert` -- `assert` is stripped
+# entirely under `python -O`, which would silently disable this exact
+# anti-vacuity guard (the one thing standing between a wrong `parents[N]`
+# and a scan-zero-silently PASS) in exactly the deployment shape that
+# removes the safety net without removing the code path it protects.
 if not (REPO_ROOT / "Cargo.toml").is_file():
     raise AssertionError(
         f"REPO_ROOT resolved to {REPO_ROOT}, which has no Cargo.toml -- "
@@ -173,124 +237,470 @@ def _tracked_sh_under(repo_root: Path, prefix: str) -> list[Path]:
     )
 
 
-def _is_comment_line(line: str) -> bool:
-    return line.strip().startswith("#")
+# ---------------------------------------------------------------------------
+# The comment/quote lexer.
+# ---------------------------------------------------------------------------
 
+# A `<<[-]TERM` or `<<[-]'TERM'`/`<<[-]"TERM"` heredoc opener. Shared by the
+# lexer itself (a heredoc body is opaque to quote/comment tracking) and by
+# `_heredoc_aware_block_extent` below (a heredoc body is opaque to `if`/`fi`
+# depth tracking) — one definition of "what a heredoc opener looks like".
+_HEREDOC_OPEN_RE = re.compile(r"<<-?\s*['\"]?([A-Za-z_][A-Za-z0-9_]*)['\"]?")
 
-def _strip_comment(line: str) -> str:
-    """Return `line` with everything from the first UNQUOTED `#` to end of
-    line removed -- the shared abstraction every token/regex test in (A),
-    (B), and (C) below is run against, never the raw line.
-
-    `_is_comment_line` above is a FULL-LINE predicate: it only ever
-    recognizes a line as a comment when the `#` is the first non-blank
-    character. A line that carries real code followed by a trailing `#
-    ...` comment (`BIN="$TARGET_DIR/release/jammi-bench"  # provenance
-    build_sha`, `BIN_PROV_SHA="$SWEEP_FAKE_BIN_SHA"  # SWEEP_DRY_RUN !=
-    "1"; exit 2`) is correctly classified as CODE by `_is_comment_line`,
-    but every downstream check that then scans the RAW line for a token
-    or a regex match reads the trailing comment's text too -- letting a
-    comment alone forge a satisfied cross-check in (B), or forge a guard
-    that is not actually there in (A)/(C). `_strip_comment` closes that
-    hole at its source: apply it once, before any token/regex test, and
-    a trailing comment can no longer contribute a token this scanner
-    treats as code.
-
-    An unquoted `#` is bash's own comment marker; three shapes are NOT
-    comment markers and must survive: a `#` inside a single- or
-    double-quoted string (`echo "a#b"`, `echo 'a#b'`), `$#` (the
-    positional-parameter-count variable), and `${#name}` (bash's
-    string/array-length expansion) -- both of the latter two are
-    recognized by the character immediately preceding the `#` (`$` or
-    `{`)."""
-    in_single = False
-    in_double = False
-    i = 0
-    n = len(line)
-    while i < n:
-        c = line[i]
-        if in_single:
-            if c == "'":
-                in_single = False
-        elif in_double:
-            if c == "\\" and i + 1 < n:
-                i += 1  # an escaped character inside "..." never ends the quote
-            elif c == '"':
-                in_double = False
-        else:
-            if c == "'":
-                in_single = True
-            elif c == '"':
-                in_double = True
-            elif c == "#" and not (i > 0 and line[i - 1] in ("$", "{")):
-                return line[:i]
-        i += 1
-    return line
-
+# A `#` is bash's comment marker only when it is the first character of a
+# shell word: the start of the line, or immediately preceded by whitespace
+# or one of these token delimiters.
+_WORD_INITIAL_DELIMS = (" ", "\t", ";", "|", "&", "(")
 
 _IF_FI_TOKEN_RE = re.compile(r"\b(if|fi)\b")
 _GUARD_BLOCK_MAX_SCAN = 40
+_BLOCK_MAX_SCAN = 4000
 
 
-def _guard_block_lines(lines: list[str], start_idx: int) -> list[str]:
-    """The physical lines of the `if [...]; then ... fi` block whose OWN
-    condition line is `lines[start_idx]` — a `bash`-`if`/`fi` DEPTH walk
-    (nested `if`s inside the guard both increment and later decrement the
-    same counter, so a nested conditional inside the guard body does not
-    prematurely end the scan), not a fixed line count.
+class _Frame:
+    """One entry of `_lex_one_line`'s nesting stack. `kind` is one of `SQ`
+    (single-quoted), `DQ` (double-quoted), `CMD` (`$(...)`), `ARITH`
+    (`$((...))`), or `PARAM` (`${...}`). `paren_depth` tracks BARE `(`/`)`
+    nesting inside a `CMD`/`ARITH` frame (a subshell `(cmd)` inside a
+    command substitution, or ordinary grouping parens inside an arithmetic
+    expression) so that an inner paren pair does not prematurely close the
+    frame's own `)`/`))`."""
 
-    Round-N false positive this replaces: the ORIGINAL implementation
-    concatenated only `lines[start_idx]` and `lines[start_idx + 1]` — two
-    lines — before searching for `exit`. `stacked_sweep.sh`'s own real
-    `SWEEP_FAKE_BIN_SHA` guard (contract C5.2) is a legitimate THREE
-    physical-line shape: `if [ -n "$VAR" ] && [ "$DRY_RUN" != "1" ]; then`
-    / `echo "::error::..." >&2` / `exit 2` — the `exit` sits on the guard's
-    THIRD line, one line past what a 2-line window could ever see, so that
-    guard read as a false-positive FINDING ("does not `exit`") even though
-    it manifestly does. Bounded at `_GUARD_BLOCK_MAX_SCAN` lines so a
-    malformed/never-closed `if` cannot make this loop unbounded — an
-    unterminated block still returns everything up to the cap, which keeps
-    the caller's `"exit" not in guard_window` check fail-closed (a
-    guard whose `fi` never resolves within the cap is treated the same as
-    one with no `exit` at all, never silently credited). `if`/`fi` tokens
-    are counted off `_strip_comment(lines[i])`, never the raw line, so a
-    comment's own bare "if"/"fi" (this codebase's own prose uses both
-    constantly) cannot perturb the depth walk.
-    """
+    __slots__ = ("kind", "paren_depth")
+
+    def __init__(self, kind: str) -> None:
+        self.kind = kind
+        self.paren_depth = 0
+
+
+class _LineLex(NamedTuple):
+    """One physical line's lex result. `code` is the line's content up to
+    (never including) a recognized comment start, or the full line when no
+    comment was found. `undecidable` is True when this line's own
+    classification could not be fully resolved (see module doc) — every
+    consumer reads `code`/`undecidable` through `_trigger_text`/
+    `_guard_text`, never directly."""
+
+    code: str
+    undecidable: bool
+
+
+def _lex_one_line(line: str, stack: list[_Frame]) -> tuple[str, bool]:
+    """Advance `stack` (the CROSS-LINE nesting state -- mutated in place,
+    shared across every line of one file) through exactly one physical
+    line, returning `(code, undecidable)` for THIS line. See module doc for
+    the full rule set; in short:
+
+    - Backslash escapes the next character in every state (including
+      inside single quotes -- a deliberate simplification of real bash,
+      which treats `\\` as fully literal inside `'...'`; the "subset that
+      matters" here is never fooled by an escaped quote/hash, in exchange
+      for not perfectly modeling that one single-quote corner case).
+    - `'`/`"` open/close single-/double-quoted regions; `$(`, `$((`, `${`
+      open a nested `CMD`/`ARITH`/`PARAM` frame (from top level OR from
+      inside a double-quoted string OR from inside another such frame --
+      real, common bash nesting, e.g. a command substitution's OWN
+      argument being a double-quoted string). A bare `'`/`$(`/`$((`/`${`
+      has NO special meaning while the top of the stack is `SQ` or `DQ`
+      other than the specific close/nest cases each state recognizes below
+      (single quotes are 100% literal; double quotes recognize only their
+      own close and a nested substitution).
+    - `#` inside `ARITH` or `PARAM` is NEVER a comment marker (arithmetic's
+      `10#$N` base-literal syntax, parameter expansion's `#`/`##` prefix
+      operators) -- regardless of what precedes it.
+    - `#` anywhere else starts a comment only when word-initial (see
+      `_WORD_INITIAL_DELIMS`); a `#` that is mid-word and not otherwise
+      exempted returns UNDECIDABLE for the whole line rather than guessing.
+    - A line ending with the stack's TOP frame still `SQ` is ALSO
+      UNDECIDABLE: a single-quoted region spanning multiple physical
+      lines is always genuinely opaque, unparsed data from bash's own
+      perspective (an embedded `python3 -c '...'`/`bash -c '...'` script,
+      arbitrary prose) -- this scanner must never read that data's own
+      `#`/`exit`/`!=`/`"1"` substrings as though they were this file's own
+      top-level guard code. A multi-line DOUBLE-quoted or `$(...)`-nested
+      span is NOT flagged this way: `"$(...)"` spanning several physical
+      lines is this codebase's single most common multi-line shape (a
+      captured command's output), and it is ordinary, fully-tracked real
+      code, not opaque literal data."""
+    n = len(line)
+    i = 0
+    comment_at: int | None = None
+    undecidable = False
+    while i < n:
+        c = line[i]
+        if c == "\\":
+            if i + 1 < n:
+                i += 2
+                continue
+            # A trailing, unescaped backslash at end-of-line is an ordinary
+            # bash line-continuation (the newline is spliced away): every
+            # real occurrence in this codebase is `... token \` followed by
+            # an indented continuation, never a mid-word join, so this is
+            # treated as a plain character and the NEXT physical line's own
+            # word-initial check decides independently -- never an
+            # UNDECIDABLE bailout, which would blank every multi-line
+            # `if [ ... ] \` / `&& [ ... ]` guard's own text.
+            i += 1
+            continue
+        top = stack[-1].kind if stack else "TOP"
+        if top == "SQ":
+            if c == "'":
+                stack.pop()
+            i += 1
+            continue
+        if top == "DQ":
+            if c == '"':
+                stack.pop()
+                i += 1
+                continue
+            if c == "$" and i + 1 < n:
+                if line[i + 1 : i + 3] == "((":
+                    stack.append(_Frame("ARITH"))
+                    i += 3
+                    continue
+                if line[i + 1] == "(":
+                    stack.append(_Frame("CMD"))
+                    i += 2
+                    continue
+                if line[i + 1] == "{":
+                    stack.append(_Frame("PARAM"))
+                    i += 2
+                    continue
+            i += 1
+            continue
+        # TOP / CMD / ARITH / PARAM -- code-like contexts: real shell
+        # syntax, never opaque literal data.
+        if c == "'":
+            stack.append(_Frame("SQ"))
+            i += 1
+            continue
+        if c == '"':
+            stack.append(_Frame("DQ"))
+            i += 1
+            continue
+        if c == "$" and i + 1 < n:
+            if line[i + 1 : i + 3] == "((":
+                stack.append(_Frame("ARITH"))
+                i += 3
+                continue
+            if line[i + 1] == "(":
+                stack.append(_Frame("CMD"))
+                i += 2
+                continue
+            if line[i + 1] == "{":
+                stack.append(_Frame("PARAM"))
+                i += 2
+                continue
+        if top in ("CMD", "ARITH") and c == "(":
+            stack[-1].paren_depth += 1
+            i += 1
+            continue
+        if top in ("CMD", "ARITH") and c == ")":
+            frame = stack[-1]
+            if frame.paren_depth > 0:
+                frame.paren_depth -= 1
+                i += 1
+                continue
+            if top == "ARITH" and i + 1 < n and line[i + 1] == ")":
+                stack.pop()
+                i += 2
+                continue
+            stack.pop()
+            i += 1
+            continue
+        if top == "PARAM" and c == "}":
+            stack.pop()
+            i += 1
+            continue
+        if c == "#":
+            if top in ("ARITH", "PARAM"):
+                i += 1
+                continue
+            prev = line[i - 1] if i > 0 else None
+            if i == 0 or prev in _WORD_INITIAL_DELIMS:
+                comment_at = i
+                break
+            undecidable = True
+            break
+        i += 1
+    code = line[:comment_at] if comment_at is not None else line
+    if stack and stack[-1].kind == "SQ":
+        undecidable = True
+    return code, undecidable
+
+
+def _lex_stream(lines: list[str]) -> list[_LineLex]:
+    """`_lex_one_line`, threaded across every line of a file: the nesting
+    stack persists from one line to the next (never reset), so a construct
+    opened on one physical line and closed on a later one is tracked
+    correctly across the boundary. A heredoc body (`<<[-]TERM` opener up to
+    its bare-`TERM` terminator line) is the one exception: it is lexed with
+    a FRESH, throwaway stack per line (matching how `_heredoc_aware_block_
+    extent` already treats it as opaque data) so that prose inside an
+    embedded script or comment can never leak cross-line quote state into
+    the real code that follows the heredoc's close. The heredoc opener
+    itself is recognized off this line's own (already-lexed) `code`, and
+    only once this line's OWN nesting has fully settled back to top level
+    (a `<<EOF` appearing while still inside some OTHER open construct is
+    not this scanner's concern -- it is data of whatever that construct
+    is, not a fresh heredoc at top level). If the file ends with the
+    nesting stack still non-empty, the final line is marked UNDECIDABLE:
+    a construct that never resolves by end of file is a shape this lexer's
+    "subset that matters" does not fully model (unmatched, or a bash
+    feature outside its scope, e.g. backtick command substitution or
+    `$'...'` ANSI-C quoting), and it must never be silently trusted."""
+    stack: list[_Frame] = []
+    out: list[_LineLex] = []
+    heredoc_term: str | None = None
+    for line in lines:
+        if heredoc_term is not None:
+            if line.strip() == heredoc_term:
+                heredoc_term = None
+            code, undecidable = _lex_one_line(line, [])
+            out.append(_LineLex(code=code, undecidable=undecidable))
+            continue
+        code, undecidable = _lex_one_line(line, stack)
+        if not stack:
+            m = _HEREDOC_OPEN_RE.search(code)
+            if m:
+                heredoc_term = m.group(1)
+        out.append(_LineLex(code=code, undecidable=undecidable))
+    if stack and out:
+        out[-1] = _LineLex(code=out[-1].code, undecidable=True)
+    return out
+
+
+def _trigger_text(raw_line: str, lex: _LineLex) -> str:
+    """Widest-scope reading, for a "does this line REFERENCE token X" test
+    (a knob's use sites, a `jammi-bench` binary-path assignment): an
+    UNDECIDABLE line still counts its full RAW text, so a real use this
+    lexer could not fully resolve is never silently dropped."""
+    return raw_line if lex.undecidable else lex.code
+
+
+def _guard_text(lex: _LineLex) -> str:
+    """Narrowest-scope reading, for a "does this line SATISFY a guard or
+    cross-check shape" test: an UNDECIDABLE line contributes NO text at
+    all, so a shape this lexer could not fully resolve can never forge a
+    passing guard or cross-check."""
+    return "" if lex.undecidable else lex.code
+
+
+def _independent_lex_stream(lines: list[str]) -> list[_LineLex]:
+    """A second, independently-structured implementation of the SAME bash
+    rule `_lex_stream` implements, used ONLY by the corpus self-test below
+    to cross-check `_lex_stream`'s comment-boundary decision on every
+    tracked line. Deliberately simpler: two plain quote booleans threaded
+    across lines (no `$(`/`$((`/`${` frame typing, no `ARITH`/`PARAM`
+    `#`-is-never-a-comment special case at all) -- sufficient because every
+    real corpus line where `_lex_stream`'s `ARITH`/`PARAM` exemption fires
+    is ALSO mid-word under the plain word-initial rule alone (`$((10#$N))`'s
+    `#` is preceded by a digit; `${var#pattern}`'s by an identifier
+    character), so the two implementations agree on this corpus without
+    this one ever needing to model that exemption. Coded as a TOKEN-DRIVEN
+    scan (`_INDEPENDENT_TOKEN_RE.finditer`, jumping from match to match)
+    rather than the primary's character-by-character `while i < n` walk --
+    a genuinely different mechanism for finding the same handful of
+    special characters, sharing only the heredoc-opener regex and the
+    word-initial delimiter set with the primary (both are settled,
+    independently-obvious constants -- what a heredoc opener looks like,
+    what a shell-word delimiter is -- not part of the comment-decision
+    LOGIC under test)."""
+    stack: list[list] = []
+    out: list[_LineLex] = []
+    heredoc_term: str | None = None
+    for line in lines:
+        if heredoc_term is not None:
+            if line.strip() == heredoc_term:
+                heredoc_term = None
+            code, undecidable = _independent_lex_one_line(line, [])
+            out.append(_LineLex(code=code, undecidable=undecidable))
+            continue
+        code, undecidable = _independent_lex_one_line(line, stack)
+        if not stack:
+            m = _HEREDOC_OPEN_RE.search(code)
+            if m:
+                heredoc_term = m.group(1)
+        out.append(_LineLex(code=code, undecidable=undecidable))
+    if stack and out:
+        out[-1] = _LineLex(code=out[-1].code, undecidable=True)
+    return out
+
+
+# Every character this scanner treats specially, as ONE alternation instead
+# of the primary's per-character `if`/`elif` chain: an escape pair, a
+# quote, a bracket opener (`$((`, tried before the shorter `$(` so the
+# arithmetic form is never mis-tokenized as a command substitution plus a
+# stray `(`), a bare paren (nested grouping inside `$(...)`/`$((...))`), a
+# bracket closer, or a `#`. Everything between matches is ordinary text
+# this scanner does not need to look at at all.
+_INDEPENDENT_TOKEN_RE = re.compile(r"\\.|\\\Z|'|\"|\$\(\(|\$\(|\$\{|\(|\)|\}|#")
+
+
+def _independent_lex_one_line(line: str, stack: list[list]) -> tuple[str, bool]:
+    """`stack` holds a `[kind, paren_depth]` PAIR per open construct
+    (`kind` one of `S` single-quote, `D` double-quote, `B` `$(...)`
+    closing on `)`, `A` `$((...))` closing on `))`, `P` `${...}` closing
+    on `}`; `paren_depth` counts bare `(`/`)` nesting inside a `B`/`A`
+    frame so an inner grouping paren -- a subshell inside a command
+    substitution, a parenthesized arithmetic sub-expression -- does not
+    prematurely close it), threaded across lines exactly like the
+    primary's `_lex_one_line`."""
+    comment_at: int | None = None
+    undecidable = False
+    pos = 0
+    for m in _INDEPENDENT_TOKEN_RE.finditer(line):
+        if m.start() < pos:
+            continue  # inside a token already consumed (an escape pair)
+        tok = m.group(0)
+        frame = stack[-1] if stack else None
+        top = frame[0] if frame else None
+        if tok.startswith("\\"):
+            pos = m.end()
+            continue
+        if top == "S":
+            # A bare `'` is the ONLY character with any special meaning
+            # inside a single-quoted region -- not even `"`/`$(`/`${`.
+            if tok == "'":
+                stack.pop()
+            pos = m.end()
+            continue
+        if top == "D":
+            # Inside a double-quoted region, a bare `'` is ordinary,
+            # literal text (real bash: single quotes carry NO special
+            # meaning inside double quotes) -- only the closing `"` and a
+            # NESTED substitution/expansion opener matter.
+            if tok == '"':
+                stack.pop()
+            elif tok == "$((":
+                stack.append(["A", 0])
+            elif tok == "$(":
+                stack.append(["B", 0])
+            elif tok == "${":
+                stack.append(["P", 0])
+            pos = m.end()
+            continue
+        # TOP / B / A / P -- code-like contexts: every token is live.
+        if tok == "'":
+            stack.append(["S", 0])
+            pos = m.end()
+            continue
+        if tok == '"':
+            stack.append(["D", 0])
+            pos = m.end()
+            continue
+        if tok == "$((":
+            stack.append(["A", 0])
+            pos = m.end()
+            continue
+        if tok == "$(":
+            stack.append(["B", 0])
+            pos = m.end()
+            continue
+        if tok == "${":
+            stack.append(["P", 0])
+            pos = m.end()
+            continue
+        if tok == "(" and top in ("B", "A"):
+            frame[1] += 1
+            pos = m.end()
+            continue
+        if tok == ")" and top == "B":
+            if frame[1] > 0:
+                frame[1] -= 1
+            else:
+                stack.pop()
+            pos = m.end()
+            continue
+        if tok == ")" and top == "A":
+            if frame[1] > 0:
+                frame[1] -= 1
+                pos = m.end()
+                continue
+            # The FIRST of the closing `))`: only pop once two consecutive
+            # `)` tokens have been seen; a lone `)` at depth 0 with no
+            # second `)` right behind it is treated as the (malformed, not
+            # expected in this corpus) close anyway, same as the primary.
+            if line[m.end() : m.end() + 1] == ")":
+                stack.pop()
+                pos = m.end() + 1
+            else:
+                stack.pop()
+                pos = m.end()
+            continue
+        if tok == "}" and top == "P":
+            stack.pop()
+            pos = m.end()
+            continue
+        if tok == "#":
+            if top in ("A", "P"):
+                pos = m.end()
+                continue
+            prev = line[m.start() - 1] if m.start() > 0 else None
+            if m.start() == 0 or prev in _WORD_INITIAL_DELIMS:
+                comment_at = m.start()
+                break
+            undecidable = True
+            break
+        pos = m.end()
+    code = line[:comment_at] if comment_at is not None else line
+    if stack and stack[-1][0] == "S":
+        undecidable = True
+    return code, undecidable
+
+
+def _guard_block_lines(lines: list[str], lex: list[_LineLex], start_idx: int) -> tuple[int, int]:
+    """The inclusive `(start, end)` line-index range of the `if [...];
+    then ... fi` block whose OWN condition line is `lines[start_idx]` — a
+    `bash`-`if`/`fi` DEPTH walk (nested `if`s inside the guard both
+    increment and later decrement the same counter, so a nested
+    conditional inside the guard body does not prematurely end the scan),
+    not a fixed line count.
+
+    Bounded at `_GUARD_BLOCK_MAX_SCAN` lines so a malformed/never-closed
+    `if` cannot make this loop unbounded — an unterminated block still
+    returns everything up to the cap, which keeps the caller's `"exit" not
+    in guard_window` check fail-closed (a guard whose `fi` never resolves
+    within the cap is treated the same as one with no `exit` at all, never
+    silently credited). `if`/`fi` tokens are counted off `_guard_text(lex
+    [i])`, never the raw line: a comment's own bare "if"/"fi" (this
+    codebase's own prose uses both constantly) cannot perturb the depth
+    walk, and an UNDECIDABLE line contributes no tokens either (the same
+    fail-closed reading every guard/satisfaction test in this module
+    uses)."""
     depth = 0
     end = start_idx
     limit = min(len(lines), start_idx + _GUARD_BLOCK_MAX_SCAN)
     for i in range(start_idx, limit):
-        for tok in _IF_FI_TOKEN_RE.findall(_strip_comment(lines[i])):
+        for tok in _IF_FI_TOKEN_RE.findall(_guard_text(lex[i])):
             depth += 1 if tok == "if" else -1
         end = i
         if depth <= 0:
             break
-    return lines[start_idx : end + 1]
+    return start_idx, end
 
 
 def check_fake_knob_inertness(path: Path) -> list[str]:
-    """(A) — see module doc. Operates on the file's CODE lines only (comment
-    lines are skipped when looking for "uses", so a knob merely NAMED in a
-    module-doc comment above its real guard is not mistaken for an
-    unguarded use — the same comment-vs-code distinction
-    `check_ci_guard_wiring.py`'s `workflow_run_text()` already draws), and
-    every remaining token/regex test below runs against `_strip_comment`'d
-    text, so a trailing `# ...` on a code line cannot forge a guard shape
-    that is not actually there (see module doc, "Comment handling")."""
+    """(A) — see module doc. Operates on the file's CODE lines only (a
+    knob only ever named in a module-doc comment above its real guard is
+    never mistaken for an unguarded use), and every remaining token/regex
+    test below runs against `_trigger_text`/`_guard_text` (see module doc,
+    "Comment handling"), never the raw line."""
     text = path.read_text(encoding="utf-8", errors="replace")
     lines = text.splitlines()
-    stripped = [_strip_comment(line) for line in lines]
+    lex = _lex_stream(lines)
+    trigger = [_trigger_text(lines[i], lex[i]) for i in range(len(lines))]
+    guard = [_guard_text(lex[i]) for i in range(len(lines))]
     fake_vars = sorted(set(FAKE_VAR_RE.findall(text)))
     findings: list[str] = []
     for var in fake_vars:
-        code_use_idx = [i for i, line in enumerate(lines) if not _is_comment_line(line) and var in stripped[i]]
+        code_use_idx = [i for i in range(len(lines)) if var in trigger[i]]
         if not code_use_idx:
             continue  # only ever named in comments/docs — nothing live to guard
         guard_idx = [
             i
             for i in code_use_idx
-            if DRY_RUN_VAR_RE.search(stripped[i]) and "!=" in stripped[i] and '"1"' in stripped[i]
+            if DRY_RUN_VAR_RE.search(guard[i]) and "!=" in guard[i] and '"1"' in guard[i]
         ]
         if not guard_idx:
             findings.append(
@@ -300,7 +710,8 @@ def check_fake_knob_inertness(path: Path) -> list[str]:
             )
             continue
         first_guard = min(guard_idx)
-        guard_window = "\n".join(_strip_comment(l) for l in _guard_block_lines(lines, first_guard))
+        block_start, block_end = _guard_block_lines(lines, lex, first_guard)
+        guard_window = "\n".join(guard[i] for i in range(block_start, block_end + 1))
         if "exit" not in guard_window:
             findings.append(
                 f"{path}:{first_guard + 1}: `{var}`'s guard line does not `exit` — a guard that "
@@ -320,24 +731,21 @@ def check_producer_parity(path: Path) -> list[str]:
     jammi-bench BINARY PATH (`.../jammi-bench`, never the source-tree
     `crates/jammi-bench/...`) in CODE.
 
-    Both halves of this check are computed off CODE lines only, with every
-    trailing comment additionally stripped (`_strip_comment`, applied
-    after `_is_comment_line` drops every WHOLE-line comment first — the
-    same comment/code distinction (A) and (C) already draw): a comment
-    mentioning `.../jammi-bench` must never pull a script INTO scope (a
-    prose reference to another producer's binary path is not this script
-    invoking one), and a comment mentioning `provenance`/`build_sha` --
-    whether the comment is the whole line or trails real code on it --
-    must never satisfy the cross-check for a script that only names the
-    tokens in prose — either direction would let a comment forge or dodge
-    this gate's verdict without a single real line of code backing it."""
+    Scope inclusion (does this script name a binary path at all) is
+    computed off `_trigger_text` — the widest reading, so this scanner
+    never fails to notice a script that genuinely invokes the binary.
+    Cross-check satisfaction (`provenance`/`build_sha` present) is computed
+    off `_guard_text` — the narrowest reading, so a comment (whole-line or
+    trailing) can never forge or dodge this gate's verdict without a
+    single real line of code backing it."""
     text = path.read_text(encoding="utf-8", errors="replace")
-    code_text = "\n".join(
-        _strip_comment(line) for line in text.splitlines() if not _is_comment_line(line)
-    )
-    if not BIN_ASSIGN_RE.search(code_text):
+    lines = text.splitlines()
+    lex = _lex_stream(lines)
+    trigger_text = "\n".join(_trigger_text(lines[i], lex[i]) for i in range(len(lines)))
+    if not BIN_ASSIGN_RE.search(trigger_text):
         return []
-    missing = [tok for tok in ("provenance", "build_sha") if tok not in code_text]
+    guard_text = "\n".join(_guard_text(lex[i]) for i in range(len(lines)))
+    missing = [tok for tok in ("provenance", "build_sha") if tok not in guard_text]
     if missing:
         return [
             f"{path}: names a jammi-bench binary path but is missing {missing} in CODE (a "
@@ -366,11 +774,7 @@ def _is_self_default_assignment(line: str, var: str) -> bool:
     return bool(pattern.match(line))
 
 
-_HEREDOC_OPEN_RE = re.compile(r"<<-?\s*['\"]?([A-Za-z_][A-Za-z0-9_]*)['\"]?")
-_BLOCK_MAX_SCAN = 4000
-
-
-def _heredoc_aware_block_extent(lines: list[str], start_idx: int) -> tuple[int, int]:
+def _heredoc_aware_block_extent(lines: list[str], lex: list[_LineLex], start_idx: int) -> tuple[int, int]:
     """The `(start, end)` inclusive line-index range of the bash `if ...
     fi` block whose OPENING line is `lines[start_idx]`, treating every
     heredoc body between a `<<[-]TERM` opener and its bare-`TERM`
@@ -380,16 +784,10 @@ def _heredoc_aware_block_extent(lines: list[str], start_idx: int) -> tuple[int, 
     (their DRY_RUN stub heredocs embed a `python3 -c '...'` payload whose
     own `if`/`else` statements never close with a bash `fi`).
 
-    Comment lines (`_is_comment_line`) are never inspected for `if`/`fi`
-    tokens at all, and a CODE line's own trailing `# ...` is stripped
-    (`_strip_comment`) before its `if`/`fi` tokens are counted or its text
-    is checked for a heredoc opener -- this heavily-documented codebase's
-    own prose uses the bare English word "if" constantly (e.g. the very
-    sentence documenting `PROFILE_421_LEGS_DRY_RUN_TRUNCATE_CORPUS_VAR`'s
-    guard, one screen above its own real code, reads "... refuses loudly,
-    by name, before any leg runs, if it is ever set without DRY_RUN"), and
-    without the strip a comment's own "if" could inflate the depth counter
-    with nothing to bring it back down.
+    `if`/`fi` tokens and the heredoc opener itself are recognized off
+    `_guard_text(lex[i])`, never the raw line — a comment's own bare "if"
+    (this codebase's own prose uses the word constantly) cannot perturb
+    the depth walk, and an UNDECIDABLE line contributes nothing either.
 
     A DIFFERENT residual gap, disclosed rather than papered over with a
     refusal this scanner cannot actually back up: every regex in this
@@ -417,41 +815,37 @@ def _heredoc_aware_block_extent(lines: list[str], start_idx: int) -> tuple[int, 
     heredoc_term: str | None = None
     limit = min(len(lines), start_idx + _BLOCK_MAX_SCAN)
     for i in range(start_idx, limit):
-        line = lines[i]
         end = i
         if heredoc_term is not None:
-            if line.strip() == heredoc_term:
+            if lines[i].strip() == heredoc_term:
                 heredoc_term = None
             continue
-        if not _is_comment_line(line):
-            code = _strip_comment(line)
-            for tok in _IF_FI_TOKEN_RE.findall(code):
-                depth += 1 if tok == "if" else -1
-            m = _HEREDOC_OPEN_RE.search(code)
-            if m:
-                heredoc_term = m.group(1)
+        code = _guard_text(lex[i])
+        for tok in _IF_FI_TOKEN_RE.findall(code):
+            depth += 1 if tok == "if" else -1
+        m = _HEREDOC_OPEN_RE.search(code)
+        if m:
+            heredoc_term = m.group(1)
         if depth <= 0:
             break
     return start_idx, end
 
 
-def _dry_run_true_block_intervals(lines: list[str], governing: str) -> list[tuple[int, int]]:
+def _dry_run_true_block_intervals(lines: list[str], lex: list[_LineLex], governing: str) -> list[tuple[int, int]]:
     """Every `if [ "$<governing>" = "1" ]`-guarded region in `lines` (the
     guard may be one ANDed clause of a larger compound condition — e.g.
     `profile_421_legs.sh`'s `if [ "$leg_status" = "ok" ] && [
     "$PROFILE_421_LEGS_DRY_RUN" = "1" ] && [ -n "..." ]; then` — the
     equality test appearing ANYWHERE on the `if` line is what matters, not
-    that it is the line's only clause). Matched against `_strip_comment`'d
-    text, so a trailing comment that merely LOOKS like this guard shape
-    can never open a phantom "covered" interval that hides a genuinely
-    unguarded read site elsewhere in the file."""
+    that it is the line's only clause). Matched against `_guard_text`, so a
+    trailing comment that merely LOOKS like this guard shape (or an
+    UNDECIDABLE line) can never open a phantom "covered" interval that
+    hides a genuinely unguarded read site elsewhere in the file."""
     guard_re = re.compile(r'\bif\b.*\[\s*"\$' + re.escape(governing) + r'"\s*=\s*"1"\s*\]')
     intervals: list[tuple[int, int]] = []
-    for i, line in enumerate(lines):
-        if _is_comment_line(line):
-            continue
-        if guard_re.search(_strip_comment(line)):
-            intervals.append(_heredoc_aware_block_extent(lines, i))
+    for i, _line in enumerate(lines):
+        if guard_re.search(_guard_text(lex[i])):
+            intervals.append(_heredoc_aware_block_extent(lines, lex, i))
     return intervals
 
 
@@ -464,21 +858,24 @@ def check_dry_run_knob_containment(path: Path) -> list[str]:
     `<PREFIX>_DRY_RUN_<SUFFIX>` test knob, admissible by EITHER containment
     (every read site inside an `if [ "$<PREFIX>_DRY_RUN" = "1" ]`-guarded
     region) or (A)'s own preflight-refusal shape, generalized off the
-    `FAKE` name requirement. Every token/regex test below runs against
-    `_strip_comment`'d text (see module doc, "Comment handling")."""
+    `FAKE` name requirement. Read-site detection runs against
+    `_trigger_text` (the widest reading — a real use this lexer could not
+    fully parse is never dropped); guard-shape and self-default-exemption
+    checks run against `_guard_text` (the narrowest reading — see module
+    doc, "Comment handling")."""
     text = path.read_text(encoding="utf-8", errors="replace")
     lines = text.splitlines()
-    stripped = [_strip_comment(line) for line in lines]
+    lex = _lex_stream(lines)
+    trigger = [_trigger_text(lines[i], lex[i]) for i in range(len(lines))]
+    guard = [_guard_text(lex[i]) for i in range(len(lines))]
     knob_vars = sorted(set(DRY_RUN_KNOB_RE.findall(text)))
     findings: list[str] = []
     for var in knob_vars:
         governing = _governing_toggle(var)
         code_use_idx = [
             i
-            for i, line in enumerate(lines)
-            if not _is_comment_line(line)
-            and var in stripped[i]
-            and not _is_self_default_assignment(stripped[i], var)
+            for i in range(len(lines))
+            if var in trigger[i] and not _is_self_default_assignment(guard[i], var)
         ]
         if not code_use_idx:
             continue  # only ever named in comments/docs, or only ever self-defaulted
@@ -487,16 +884,17 @@ def check_dry_run_knob_containment(path: Path) -> list[str]:
         guard_idx = [
             i
             for i in code_use_idx
-            if governing_re.search(stripped[i]) and "!=" in stripped[i] and '"1"' in stripped[i]
+            if governing_re.search(guard[i]) and "!=" in guard[i] and '"1"' in guard[i]
         ]
         if guard_idx:
             first_guard = min(guard_idx)
-            guard_window = "\n".join(_strip_comment(l) for l in _guard_block_lines(lines, first_guard))
+            block_start, block_end = _guard_block_lines(lines, lex, first_guard)
+            guard_window = "\n".join(guard[i] for i in range(block_start, block_end + 1))
             earlier = [i for i in code_use_idx if i < first_guard]
             if "exit" in guard_window and not earlier:
                 continue  # admissible via preflight refusal (mode 2)
 
-        intervals = _dry_run_true_block_intervals(lines, governing)
+        intervals = _dry_run_true_block_intervals(lines, lex, governing)
         uncovered = [i for i in code_use_idx if not _line_in_any_interval(i, intervals)]
         if uncovered:
             findings.append(
@@ -523,38 +921,159 @@ def _scratch_git(args: list[str], cwd: Path) -> subprocess.CompletedProcess:
     return subprocess.run(["git", *_GIT_NO_BACKGROUND_MAINTENANCE, *args], cwd=cwd, check=True)
 
 
-def _self_test_strip_comment() -> list[str]:
-    """Direct, fixture-free assertions on `_strip_comment` itself -- the
-    shared primitive every arm's forged-GREEN self-test fixtures below
-    exercise only indirectly through a full `check_*` call. Returns a list
-    of failure descriptions (empty when everything passes)."""
+def _self_test_lexer() -> list[str]:
+    """Direct, fixture-free assertions on `_lex_one_line`/`_lex_stream`
+    themselves -- the shared primitive every arm's forged-GREEN self-test
+    fixtures below exercise only indirectly through a full `check_*` call.
+    Returns a list of failure descriptions (empty when everything
+    passes)."""
     failures: list[str] = []
 
-    def check(got: str, expected: str, label: str) -> None:
+    def lex_one(text: str) -> list[_LineLex]:
+        return _lex_stream(text.splitlines())
+
+    def check(got, expected, label: str) -> None:
         if got != expected:
-            failures.append(f"_strip_comment self-check FAILED ({label}): got {got!r}, expected {expected!r}")
+            failures.append(f"lexer self-check FAILED ({label}): got {got!r}, expected {expected!r}")
 
     # Trailing comment on an otherwise-real code line is stripped.
-    check(
-        _strip_comment('BIN="$X"  # provenance build_sha'),
-        'BIN="$X"  ',
-        "trailing comment on a code line",
-    )
+    check(lex_one('BIN="$X"  # provenance build_sha')[0], _LineLex('BIN="$X"  ', False), "trailing comment")
     # A whole-line comment strips to nothing but leading whitespace.
-    check(_strip_comment("# just a comment"), "", "whole-line comment")
-    check(_strip_comment("  # indented comment"), "  ", "indented whole-line comment")
+    check(lex_one("# just a comment")[0], _LineLex("", False), "whole-line comment")
+    check(lex_one("  # indented comment")[0], _LineLex("  ", False), "indented whole-line comment")
     # A `#` inside a double-quoted string is NOT a comment marker.
-    check(_strip_comment('echo "value#1"'), 'echo "value#1"', "# inside double quotes")
+    check(lex_one('echo "value#1"')[0], _LineLex('echo "value#1"', False), "# inside double quotes")
     # A `#` inside a single-quoted string is NOT a comment marker.
-    check(_strip_comment("echo 'a#b'"), "echo 'a#b'", "# inside single quotes")
+    check(lex_one("echo 'a#b'")[0], _LineLex("echo 'a#b'", False), "# inside single quotes")
     # `${#name}` (bash length expansion) is NOT a comment marker.
-    check(_strip_comment("n=${#myvar}"), "n=${#myvar}", "${#var} length expansion")
-    # `$#` (positional-parameter count) is NOT a comment marker.
-    check(_strip_comment("echo $# arguments"), "echo $# arguments", "$# positional count")
+    check(lex_one("n=${#myvar}")[0], _LineLex("n=${#myvar}", False), "${#var} length expansion")
+    # `$#` (positional-parameter count): `#` is preceded by `$`, never a
+    # delimiter, so it is mid-word -- UNDECIDABLE, not silently "not a
+    # comment, keep going": this lexer never guesses on a shape it has not
+    # been specifically taught to recognize.
+    check(lex_one("echo $# arguments")[0], _LineLex("echo $# arguments", True), "$# positional count")
     # A REAL comment following a closed quoted string is still stripped.
-    check(_strip_comment('echo "ok" # trailing'), 'echo "ok" ', "comment after a closed quote")
+    check(lex_one('echo "ok" # trailing')[0], _LineLex('echo "ok" ', False), "comment after a closed quote")
     # A line with no `#` at all is returned unchanged.
-    check(_strip_comment('echo "no hash here"'), 'echo "no hash here"', "no hash at all")
+    check(lex_one('echo "no hash here"')[0], _LineLex('echo "no hash here"', False), "no hash at all")
+    # `$((10#$N))`: the base-literal `#` sits inside ARITH -- never a
+    # comment, decidable, code unchanged (round-6 audit false-strip fix,
+    # `runpod_lib.sh:155`/`:173`'s real shape).
+    check(
+        lex_one("RP_SSH_WAIT_SECS=$((10#$RP_SSH_WAIT_SECS))")[0],
+        _LineLex("RP_SSH_WAIT_SECS=$((10#$RP_SSH_WAIT_SECS))", False),
+        "arithmetic base-literal # (runpod_lib.sh:155 shape)",
+    )
+    # `${var#pattern}`: the strip-operator `#` sits inside PARAM -- never a
+    # comment, decidable, code unchanged (round-6 audit false-strip fix,
+    # `test_pod_substrate.sh:1170`'s real shape).
+    check(
+        lex_one('rsync ${rsync_flags_line#rsync } "$X"')[0],
+        _LineLex('rsync ${rsync_flags_line#rsync } "$X"', False),
+        "parameter-expansion strip-operator # (test_pod_substrate.sh:1170 shape)",
+    )
+    # A single-quoted region genuinely spanning multiple physical lines: a
+    # line that CLOSES a quote opened several lines earlier, with real
+    # code and a real trailing comment after the close, must have that
+    # comment correctly stripped -- the round-6 audit fail-open fix
+    # (`pod_push_stamp.sh:353`'s real shape: `python3 -c '...'` piped
+    # across several lines, the closing line reading `' "$stamp"
+    # 2>/dev/null)" # trailing comment`).
+    multi = lex_one(
+        "x=\"$(python3 -c '\n"
+        "print(1)\n"
+        "' \"$y\" 2>/dev/null)\" # trailing comment\n"
+    )
+    check(multi[0].undecidable, True, "multiline SQ opener is undecidable (ends with open SQ)")
+    check(multi[1].undecidable, True, "multiline SQ body line is undecidable")
+    check(multi[2], _LineLex('\' "$y" 2>/dev/null)" ', False), "multiline SQ closing line strips its own comment")
+    # A double-quoted `"$(...)"` command substitution spanning multiple
+    # physical lines is ORDINARY, fully-tracked real code -- never flagged
+    # UNDECIDABLE just for spanning lines (the false-regression this
+    # design specifically avoids: `top == "SQ"` is the only "ends open"
+    # trigger, never a bare non-empty stack).
+    multiline_cmd = lex_one(
+        'x="$(FOO="a" \\\n'
+        '  BAR="b" \\\n'
+        '  cmd)" # trailing comment\n'
+    )
+    check(multiline_cmd[0].undecidable, False, "multiline $(...) opener is decidable")
+    check(multiline_cmd[2], _LineLex('  cmd)" ', False), "multiline $(...) closing line strips its own comment")
+    # A heredoc body's own prose apostrophes must never leak cross-line
+    # quote state into the real code that follows the heredoc's close.
+    heredoc = lex_one(
+        "cat > x <<'EOF'\n"
+        "# gpu-dev.sh's own doesn't-close-a-real-quote comment\n"
+        "EOF\n"
+        'BIN_PROV_SHA="$SWEEP_FAKE_BIN_SHA"  # SWEEP_DRY_RUN != "1"; exit 2\n'
+    )
+    check(heredoc[3], _LineLex('BIN_PROV_SHA="$SWEEP_FAKE_BIN_SHA"  ', False), "code after a heredoc lexes cleanly")
+    return failures
+
+
+def _self_test_corpus_lexer_agreement(repo_root: Path) -> list[str]:
+    """Runs `_lex_stream` and `_independent_lex_stream` (see their own
+    docs) over EVERY tracked `.sh` line under `ci/scripts/` and asserts
+    zero disagreements — a differential proof that the primary lexer's
+    comment-boundary decision is not merely tuned to this file's own
+    hand-picked fixtures, and a regression detector for either
+    implementation going forward. The five real lines the round-6 audit's
+    differential scan found disagreeing with the OLD (pre-this-file)
+    hand-rolled `_strip_comment` are pinned as explicit, named
+    expectations below, not just implicitly covered by the general scan."""
+    failures: list[str] = []
+    paths = _tracked_sh_under(repo_root, "ci/scripts/")
+    if not paths:
+        return ["corpus lexer agreement self-test FAILED: zero tracked .sh files under ci/scripts/ -- vacuous scan"]
+    disagreements = 0
+    for path in paths:
+        text = path.read_text(encoding="utf-8", errors="replace")
+        lines = text.splitlines()
+        primary = _lex_stream(lines)
+        independent = _independent_lex_stream(lines)
+        for i, (p, ind) in enumerate(zip(primary, independent, strict=True)):
+            if p.undecidable != ind.undecidable or (not p.undecidable and not ind.undecidable and p.code != ind.code):
+                disagreements += 1
+                if disagreements <= 20:
+                    failures.append(
+                        f"corpus lexer disagreement at {path}:{i + 1}: "
+                        f"primary={p!r} independent={ind!r} line={lines[i]!r}"
+                    )
+    if disagreements > 20:
+        failures.append(f"... and {disagreements - 20} more disagreements (truncated)")
+
+    # The five real lines pinned by name (round-6 audit differential scan):
+    # two live fail-opens (a closing quote misread as opening one, so a
+    # real trailing comment was never stripped) and three false-strips (a
+    # non-comment `#` misread as a comment marker, truncating real code).
+    named_cases = [
+        ("ci/scripts/pod_push_stamp.sh", 353, False, '\' "$stamp" 2>/dev/null)" '),
+        (
+            "ci/scripts/test_pod_substrate.sh",
+            1118,
+            False,
+            '  bsha_reverted_value="$(bash -c "${bsha_reverted_text}; printf \'%s\' \\"\\${JAMMI_BUILD_SHA:-}\\"" '
+            '2>/dev/null)" ',
+        ),
+        ("ci/scripts/runpod_lib.sh", 155, False, "RP_SSH_WAIT_SECS=$((10#$RP_SSH_WAIT_SECS))"),
+        ("ci/scripts/runpod_lib.sh", 173, False, "RP_INACTIVITY=$((10#$RP_INACTIVITY))"),
+        (
+            "ci/scripts/test_pod_substrate.sh",
+            1170,
+            False,
+            '  rsync ${rsync_flags_line#rsync } "${EXCLUDE_ARGS[@]}" "$SRC_REPO/" "$TREE_DEST/" > '
+            '"$SANDBOX/i_push.out" 2>&1',
+        ),
+    ]
+    for rel, lineno, expect_undecidable, expect_code in named_cases:
+        path = repo_root / rel
+        lines = path.read_text(encoding="utf-8", errors="replace").splitlines()
+        got = _lex_stream(lines)[lineno - 1]
+        if got.undecidable != expect_undecidable or got.code != expect_code:
+            failures.append(
+                f"named case FAILED: {rel}:{lineno} expected _LineLex(code={expect_code!r}, "
+                f"undecidable={expect_undecidable}), got {got!r}"
+            )
     return failures
 
 
@@ -570,7 +1089,7 @@ def run_gate(perf_dir: Path, repo_root: Path) -> list[str]:
 
 def self_test() -> int:
     failures: list[str] = []
-    failures += _self_test_strip_comment()
+    failures += _self_test_lexer()
 
     with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as tmp:
         repo = Path(tmp)
@@ -638,12 +1157,10 @@ def self_test() -> int:
             "does not `exit`",
         )
 
-        # (A) GREEN control (round-N false-positive fix): `stacked_sweep.sh`'s
-        # OWN real guard shape — a THREE physical-line `if`/`echo`/`exit`/`fi`
-        # block, `exit` on the guard's third line. The ORIGINAL 2-line window
-        # (`lines[first_guard]` + `lines[first_guard + 1]`) never reached the
-        # `exit` line at all and misreported this exact shape as "does not
-        # `exit`" — see `_guard_block_lines`'s own docstring.
+        # (A) GREEN control: `stacked_sweep.sh`'s OWN real guard shape — a
+        # THREE physical-line `if`/`echo`/`exit`/`fi` block, `exit` on the
+        # guard's third line — proves the block-extent walk reads the
+        # WHOLE enclosing block rather than a fixed short window.
         commit_and_check(
             "ci/scripts/perf/good_guard_three_line.sh",
             (
@@ -681,22 +1198,34 @@ def self_test() -> int:
             None,
         )
 
-        # (A) RED, round-5 audit B2's "trailing-comment trigger": a knob use
-        # whose ONLY guard-shaped text (`SWEEP_DRY_RUN`, `!=`, `"1"`, and
-        # `exit`) sits inside a TRAILING comment on the very same line as the
-        # use. Before `_strip_comment`, this single line satisfied `var in
-        # line`, `DRY_RUN_VAR_RE.search(line)`, `"!=" in line`, `'"1"' in
-        # line`, AND `"exit" in guard_window` all at once — the whole line
-        # counted as both its own "use" and its own "guard", so this knob
-        # forged a full GREEN (zero findings) despite having no real guard
-        # control flow at all. With comments stripped first, the use survives
-        # but the (fake) guard vanishes, correctly reporting "no refusal
-        # guard".
+        # (A) RED: a knob use whose ONLY guard-shaped text (`SWEEP_DRY_RUN`,
+        # `!=`, `"1"`, and `exit`) sits inside a TRAILING comment on the
+        # very same line as the use. A lexer that read the raw line here
+        # would see the whole line as both its own "use" and its own
+        # "guard" — a comment alone forging a full GREEN. With the comment
+        # correctly excluded from the guard text, the use survives but the
+        # (fake) guard vanishes, correctly reporting "no refusal guard".
         commit_and_check(
             "ci/scripts/perf/bad_fake_knob_guard_forged_by_trailing_comment.sh",
             (
                 '#!/usr/bin/env bash\n'
                 'BIN_PROV_SHA="$SWEEP_FAKE_BIN_SHA"  # SWEEP_DRY_RUN != "1"; exit 2 if triggered\n'
+            ),
+            check_fake_knob_inertness,
+            "no refusal guard",
+        )
+
+        # (A) RED, robustness control: the SAME trailing-comment forgery,
+        # with an ordinary, fully-balanced, unrelated `echo "ok"` statement
+        # inserted immediately before the comment on the same line — a
+        # hand-rolled comment lexer with incomplete quote/escape handling
+        # can be perturbed by nearby, unrelated real code; a complete
+        # state machine must reach the identical verdict regardless.
+        commit_and_check(
+            "ci/scripts/perf/bad_fake_knob_guard_forged_by_trailing_comment_with_echo_ok.sh",
+            (
+                '#!/usr/bin/env bash\n'
+                'BIN_PROV_SHA="$SWEEP_FAKE_BIN_SHA"; echo "ok"  # SWEEP_DRY_RUN != "1"; exit 2 if triggered\n'
             ),
             check_fake_knob_inertness,
             "no refusal guard",
@@ -765,19 +1294,32 @@ def self_test() -> int:
             "missing",
         )
 
-        # (B) RED, round-5 audit B2's "trailing-comment satisfaction": the
-        # binary-path line itself carries the ONLY mention of
+        # (B) RED: the binary-path line itself carries the ONLY mention of
         # `provenance`/`build_sha`, as a TRAILING comment on that very line
-        # (never a whole comment line `_is_comment_line` would already
-        # exclude). Before `_strip_comment`, `code_text` kept this line's
-        # RAW text (since `_is_comment_line` correctly calls it a code
-        # line), so the trailing comment's tokens satisfied the cross-check
-        # with no real code backing it — a comment alone forging GREEN.
+        # (never a whole comment line). A lexer that read the raw line
+        # here would let the trailing comment's tokens satisfy the
+        # cross-check with no real code backing it — a comment alone
+        # forging GREEN.
         commit_and_check(
             "ci/scripts/perf/bad_provenance_satisfied_only_by_trailing_comment.sh",
             (
                 '#!/usr/bin/env bash\n'
                 'BIN="$TARGET_DIR/release/jammi-bench"  # would check "$BIN" provenance build_sha but skipped\n'
+                '"$BIN" finetune-step --batch 1\n'
+            ),
+            check_producer_parity,
+            "missing",
+        )
+
+        # (B) RED, robustness control: the SAME trailing-comment forgery,
+        # with an unrelated, fully-balanced `echo "ok"` statement inserted
+        # on the binary-path line before the comment.
+        commit_and_check(
+            "ci/scripts/perf/bad_provenance_satisfied_only_by_trailing_comment_with_echo_ok.sh",
+            (
+                '#!/usr/bin/env bash\n'
+                'BIN="$TARGET_DIR/release/jammi-bench"; echo "ok"  '
+                '# would check "$BIN" provenance build_sha but skipped\n'
                 '"$BIN" finetune-step --batch 1\n'
             ),
             check_producer_parity,
@@ -831,24 +1373,31 @@ def self_test() -> int:
             "outside any",
         )
 
-        # (C) RED, round-5 audit B2's "trailing-comment trigger" for arm (C):
-        # the knob's use line carries NO real guard code of its own, but a
-        # TRAILING comment on that same line spells out the full preflight
-        # shape (`FOO_DRY_RUN`, `!=`, `"1"`, `exit`). Before `_strip_comment`
-        # this one line satisfied `governing_re.search`/`"!=" in`/`'"1"' in`
-        # AND `"exit" in guard_window` simultaneously (the guard-block walk
-        # off a line with no if/fi tokens returns just that one line), so
-        # the knob was admitted via preflight refusal (mode 2) with zero
-        # real guarding code — a forged GREEN. With comments stripped, no
-        # guard shape remains on the line and no `if [ "$FOO_DRY_RUN" = "1"
-        # ]`-guarded interval exists anywhere in the file either, so the use
-        # correctly reports "outside any".
+        # (C) RED: the knob's use line carries NO real guard code of its
+        # own, but a TRAILING comment on that same line spells out the full
+        # preflight shape (`FOO_DRY_RUN`, `!=`, `"1"`, `exit`). A lexer
+        # that read the raw line here would admit the knob via preflight
+        # refusal with zero real guarding code — a forged GREEN.
         commit_and_check(
             "ci/scripts/perf/bad_dry_run_knob_guard_forged_by_trailing_comment.sh",
             (
                 '#!/usr/bin/env bash\n'
                 'FOO_DRY_RUN="${FOO_DRY_RUN:-0}"\n'
                 'echo "${FOO_DRY_RUN_BAR:-}"  # FOO_DRY_RUN != "1"; exit 2 if triggered\n'
+            ),
+            check_dry_run_knob_containment,
+            "outside any",
+        )
+
+        # (C) RED, robustness control: the SAME trailing-comment forgery,
+        # with an unrelated, fully-balanced `echo "ok"` statement inserted
+        # on the use line before the comment.
+        commit_and_check(
+            "ci/scripts/perf/bad_dry_run_knob_guard_forged_by_trailing_comment_with_echo_ok.sh",
+            (
+                '#!/usr/bin/env bash\n'
+                'FOO_DRY_RUN="${FOO_DRY_RUN:-0}"\n'
+                'echo "${FOO_DRY_RUN_BAR:-}"; echo "ok"  # FOO_DRY_RUN != "1"; exit 2 if triggered\n'
             ),
             check_dry_run_knob_containment,
             "outside any",
@@ -933,6 +1482,11 @@ def self_test() -> int:
     if real_findings:
         failures.append(f"self-test FAILED: real tree is not clean: {real_findings}")
 
+    # The full corpus lexer-agreement scan (see its own doc): every
+    # tracked line, two independent implementations, zero disagreements —
+    # including the five real lines the round-6 differential scan named.
+    failures += _self_test_corpus_lexer_agreement(REPO_ROOT)
+
     if failures:
         for f in failures:
             print(f, file=sys.stderr)
@@ -940,13 +1494,18 @@ def self_test() -> int:
         return 1
     print(
         "check-producer-provenance-gates self-test: OK — (A) FAKE-knob inertness "
-        "(no-guard / use-before-guard / guard-without-exit all RED; a real guard, a "
-        "comment-only mention, both GREEN), (B) producer parity (a jammi-bench-binary "
-        "producer missing provenance/build_sha is RED; one carrying both, or one that never "
-        "names a binary path at all, is GREEN), and (C) *_DRY_RUN_* knob containment "
-        "(unguarded, and a knob past a heredoc-embedded unmatched-if block's real `fi`, "
-        "both RED; heredoc containment, preflight refusal, and comment/self-default-only, "
-        "all GREEN) all bite on throwaway fixtures; the real tree is clean."
+        "(no-guard / use-before-guard / guard-without-exit / trailing-comment-forgery, plain "
+        "and with an added echo \"ok\", all RED; a real guard, a comment-only mention, both "
+        "GREEN), (B) producer parity (a jammi-bench-binary producer missing provenance/"
+        "build_sha, including via a trailing-comment forgery plain and with an added echo "
+        "\"ok\", is RED; one carrying both, or one that never names a binary path at all, is "
+        "GREEN), and (C) *_DRY_RUN_* knob containment (unguarded, a knob past a "
+        "heredoc-embedded unmatched-if block's real `fi`, and a trailing-comment forgery plain "
+        "and with an added echo \"ok\", all RED; heredoc containment, preflight refusal, and "
+        "comment/self-default-only, all GREEN) all bite on throwaway fixtures; the real tree is "
+        "clean; and the lexer agrees with an independently-written second implementation on "
+        "every tracked ci/scripts/ line, including the five real lines a differential audit "
+        "scan found the pre-existing hand-rolled comment stripper misreading."
     )
     return 0
 

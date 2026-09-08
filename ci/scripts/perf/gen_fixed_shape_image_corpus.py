@@ -372,13 +372,53 @@ def _build_pool(
     return files
 
 
+# The ONLY five arguments `_build_pool` reads, in the ONE order every
+# consumer below iterates them in -- `_pool_cache_key`'s canonical string,
+# `_pool_marker_text`/`_parse_pool_marker`'s marker fields, and
+# `test_gen_fixed_shape_image_corpus.py::PoolCacheKeyDeterminantTests`'s own
+# test loop are all GENERATED from this one tuple rather than each
+# hand-copying the field list: a determinant added here without also being
+# threaded into `_pool_cache_key`'s call to `_pool_key_values` (or the
+# reverse) is refused BY NAME at the very next call (see `_pool_key_values`),
+# never silently under- or over-counted.
+POOL_KEY_DETERMINANTS: tuple[str, ...] = (
+    "families",
+    "instances_per_family",
+    "size",
+    "jitter",
+    "seed",
+)
+
+
+def _pool_key_values(**kwargs: int) -> dict[str, int]:
+    """Validates `kwargs`' key set against `POOL_KEY_DETERMINANTS` --
+    exactly, in BOTH directions -- before returning it unchanged: a
+    determinant `POOL_KEY_DETERMINANTS` names that `kwargs` does not
+    carry, or a `kwargs` entry `POOL_KEY_DETERMINANTS` does not name, is
+    refused BY NAME rather than silently under- or over-counted. Both
+    `_pool_cache_key` and `_pool_marker_text` route every call through
+    this one gate, so a producer signature that grows a new argument
+    without also adding it to `POOL_KEY_DETERMINANTS` (or vice versa) is
+    caught at the very next call, never left to a cache key that silently
+    ignores the new determinant."""
+    have = set(kwargs)
+    want = set(POOL_KEY_DETERMINANTS)
+    if have != want:
+        raise KeyError(
+            f"pool-cache determinant mismatch: caller supplied {sorted(have)}, "
+            f"POOL_KEY_DETERMINANTS names {sorted(want)} -- "
+            f"missing {sorted(want - have)}, unexpected {sorted(have - want)}"
+        )
+    return kwargs
+
+
 def _pool_cache_key(
     families: int, instances_per_family: int, size: int, jitter: int, seed: int
 ) -> str:
     """Filesystem-safe cache key: a sha256 of the producer MODULE'S OWN
     SOURCE BYTES (`Path(__file__).read_bytes()` -- the WHOLE file on disk)
-    folded together with every argument `_build_pool` actually reads and
-    the interpreter's `(major, minor)` version.
+    folded together with every `POOL_KEY_DETERMINANTS` argument and the
+    interpreter's `(major, minor)` version.
 
     Two module states on disk that differ by even one byte hash to two
     different keys, by construction: nothing about the file is walked,
@@ -390,27 +430,30 @@ def _pool_cache_key(
     cache).
 
     Scope of the "no false cache hit" guarantee: it covers this file's
-    bytes and the five arguments above, nothing else. A determinant of the
-    bytes `_build_pool` produces that lives OUTSIDE this file and these
-    arguments -- the zlib the interpreter links against, a different
-    CPython implementation entirely -- is not folded into this key. That
-    is safe only because `--pool-cache-dir` is per-process (the caller
-    allocates it via `tempfile.mkdtemp` and tears it down at process exit
-    -- see `test_profile_421_legs_dry_run.py`) and is refused outside
-    `DRY_RUN` (`profile_421_legs.sh`'s own `POOL_CACHE_ARGS` guard): one
-    invoking process, one interpreter, one platform, per cache directory,
-    so there is never a second environment sharing that directory to
-    collide against. `sys.version_info[:2]` is included anyway because
-    the interpreter that runs `_build_pool` is as much a part of "what
-    produced these bytes" as the source is, and it is the one such
-    determinant this module can read directly."""
-    module_bytes = Path(__file__).read_bytes()
-    canonical = (
-        f"module_sha256={hashlib.sha256(module_bytes).hexdigest()}|"
-        f"py={sys.version_info[0]}.{sys.version_info[1]}|"
-        f"families={families}|instances={instances_per_family}|size={size}|"
-        f"jitter={jitter}|seed={seed}"
+    bytes and the `POOL_KEY_DETERMINANTS` arguments above, nothing else. A
+    determinant of the bytes `_build_pool` produces that lives OUTSIDE this
+    file and these arguments -- the zlib the interpreter links against, a
+    different CPython implementation entirely -- is not folded into this
+    key. That is safe only because `--pool-cache-dir` is per-process (the
+    caller allocates it via `tempfile.mkdtemp` and tears it down at
+    process exit -- see `test_profile_421_legs_dry_run.py`) and is
+    refused outside `DRY_RUN` (`profile_421_legs.sh`'s own
+    `POOL_CACHE_ARGS` guard): one invoking process, one interpreter, one
+    platform, per cache directory, so there is never a second environment
+    sharing that directory to collide against. `sys.version_info[:2]` is
+    included anyway because the interpreter that runs `_build_pool` is as
+    much a part of "what produced these bytes" as the source is, and it is
+    the one such determinant this module can read directly."""
+    values = _pool_key_values(
+        families=families, instances_per_family=instances_per_family, size=size, jitter=jitter, seed=seed
     )
+    module_bytes = Path(__file__).read_bytes()
+    parts = [
+        f"module_sha256={hashlib.sha256(module_bytes).hexdigest()}",
+        f"py={sys.version_info[0]}.{sys.version_info[1]}",
+    ]
+    parts += [f"{name}={values[name]}" for name in POOL_KEY_DETERMINANTS]
+    canonical = "|".join(parts)
     return hashlib.sha256(canonical.encode("utf-8")).hexdigest()[:32]
 
 
@@ -421,8 +464,14 @@ def _pool_marker_text(families: int, instances_per_family: int, size: int, jitte
     """The `_DONE` marker's own recorded-shape line -- the single
     definition [`_load_or_build_pool`] both WRITES on a cache miss and
     PARSES (via [`_parse_pool_marker`]) on a cache hit, so the two can
-    never independently drift on the field set or the format."""
-    return f"families={families} instances={instances_per_family} size={size} jitter={jitter} seed={seed}\n"
+    never independently drift on the field set or the format. Built from
+    the SAME `POOL_KEY_DETERMINANTS` tuple `_pool_cache_key` iterates, via
+    the SAME `_pool_key_values` gate, so the marker's own field set can
+    never drift from the cache key's."""
+    values = _pool_key_values(
+        families=families, instances_per_family=instances_per_family, size=size, jitter=jitter, seed=seed
+    )
+    return " ".join(f"{name}={values[name]}" for name in POOL_KEY_DETERMINANTS) + "\n"
 
 
 def _parse_pool_marker(text: str) -> dict[str, int]:

@@ -19,6 +19,7 @@ Run: `python3 -m pytest ci/scripts/perf/test_gen_fixed_shape_image_corpus.py`
 from __future__ import annotations
 
 import importlib.util
+import inspect
 import json
 import os
 import shutil
@@ -421,12 +422,32 @@ class PoolCacheTests(unittest.TestCase):
             key_dir = cache_dir / key
             key_dir.mkdir(parents=True)
             (key_dir / gfi._POOL_CACHE_DONE_MARKER).write_text(
-                "families=4 instances=3 size=9 jitter=8 seed=1\n"
+                "families=4 instances_per_family=3 size=9 jitter=8 seed=1\n"
             )
             with self.assertRaises(ValueError) as ctx:
                 gfi._load_or_build_pool(cache_dir, *args)
             self.assertIn("'size': 9", str(ctx.exception))
             self.assertIn("'size': 10", str(ctx.exception))
+
+    def test_a_marker_recorded_with_a_missing_field_is_refused(self):
+        """A marker missing a WHOLE determinant field entirely (never
+        written, not merely wrong-valued) is refused the same way a
+        wrong-valued one is: `_parse_pool_marker` happily parses a
+        partial marker (it does not know which fields are "required"),
+        but the resulting dict then compares unequal (fewer keys) to the
+        fully-populated `requested` shape, so `_load_or_build_pool`'s
+        belt-and-braces check still refuses."""
+        with tempfile.TemporaryDirectory() as tmp:
+            cache_dir = Path(tmp) / "cache"
+            args = (4, 3, 10, 8, 1)
+            key = gfi._pool_cache_key(*args)
+            key_dir = cache_dir / key
+            key_dir.mkdir(parents=True)
+            (key_dir / gfi._POOL_CACHE_DONE_MARKER).write_text(
+                "families=4 instances_per_family=3 size=10 seed=1\n"  # jitter missing
+            )
+            with self.assertRaises(ValueError):
+                gfi._load_or_build_pool(cache_dir, *args)
 
     def test_marker_round_trips_through_write_and_parse(self):
         """[`gfi._pool_marker_text`]/[`gfi._parse_pool_marker`] are exact
@@ -437,40 +458,61 @@ class PoolCacheTests(unittest.TestCase):
         args = dict(families=6, instances_per_family=3, size=32, jitter=12, seed=9)
         text = gfi._pool_marker_text(**args)
         parsed = gfi._parse_pool_marker(text)
-        self.assertEqual(
-            parsed, {"families": 6, "instances": 3, "size": 32, "jitter": 12, "seed": 9}
-        )
+        self.assertEqual(parsed, args)
+
+
+class ParsePoolMarkerTests(unittest.TestCase):
+    """[`gfi._parse_pool_marker`]'s own error-handling arms -- malformed,
+    duplicate, and non-int tokens each refuse rather than guess, and an
+    empty marker parses to an empty dict rather than raising (the
+    documented, intentional "nothing recorded" shape a caller-level
+    dict-equality check against a fully-populated `requested` shape then
+    catches as a mismatch, exercised separately by
+    `PoolCacheTests.test_a_marker_recorded_with_a_missing_field_is_refused`
+    above)."""
+
+    def test_malformed_token_without_equals_raises(self):
+        with self.assertRaises(ValueError) as ctx:
+            gfi._parse_pool_marker("families=4 bogus")
+        self.assertIn("bogus", str(ctx.exception))
+
+    def test_duplicate_key_raises(self):
+        with self.assertRaises(ValueError) as ctx:
+            gfi._parse_pool_marker("families=4 families=5")
+        self.assertIn("families=5", str(ctx.exception))
+
+    def test_non_int_value_raises(self):
+        with self.assertRaises(ValueError):
+            gfi._parse_pool_marker("families=abc")
+
+    def test_empty_text_parses_to_empty_dict(self):
+        self.assertEqual(gfi._parse_pool_marker(""), {})
 
 
 class PoolCacheKeyDeterminantTests(unittest.TestCase):
-    """Round-5 audit B1(a): the numeric-arg half of `_pool_cache_key`'s
-    canonical string previously had exactly ONE tested oracle (`--seed`,
-    via `test_a_different_pool_shape_gets_a_different_cache_key`) --
-    drop-one-determinant mutants (delete `families=...|` from the
-    canonical f-string, or `instances=...|`, or `size=...|`, or
-    `jitter=...|`, or the `py=...|` interpreter segment) would each still
-    pass every test in this file, and a jitter-blind mutant would produce
-    a real false cache hit (two genuinely different pools sharing one
-    cache directory) undetected.
-
-    This is a LOOP over an explicit determinant list, not one hand-written
-    test per field, precisely so a determinant added to the canonical
-    string LATER but never added to `_BASE` below is a `KeyError` this
-    test raises immediately -- never a determinant that silently stops
-    being tested."""
+    """The determinant SET is generated from ONE source,
+    `gfi.POOL_KEY_DETERMINANTS`, never hand-copied into this test: it is
+    asserted equal to the set of keyword arguments `_pool_cache_key`
+    actually accepts (introspected via `inspect.signature`), and the loop
+    below iterates that SAME tuple -- so a determinant added to the
+    production tuple (and the function's signature) later is picked up by
+    this test automatically, never left untested until someone remembers
+    to update a parallel hand-written list here."""
 
     _BASE = dict(families=4, instances_per_family=3, size=10, jitter=8, seed=1)
+
+    def test_determinant_tuple_matches_the_pool_cache_key_signature(self):
+        sig_params = set(inspect.signature(gfi._pool_cache_key).parameters)
+        self.assertEqual(set(gfi.POOL_KEY_DETERMINANTS), sig_params)
 
     @staticmethod
     def _key(**overrides) -> str:
         kw = {**PoolCacheKeyDeterminantTests._BASE, **overrides}
-        return gfi._pool_cache_key(
-            kw["families"], kw["instances_per_family"], kw["size"], kw["jitter"], kw["seed"]
-        )
+        return gfi._pool_cache_key(**kw)
 
-    def test_each_numeric_determinant_moves_the_key_alone(self):
+    def test_each_determinant_moves_the_key_alone(self):
         baseline = self._key()
-        for determinant in ("families", "instances_per_family", "size", "jitter", "seed"):
+        for determinant in gfi.POOL_KEY_DETERMINANTS:
             with self.subTest(determinant=determinant):
                 bumped = self._key(**{determinant: self._BASE[determinant] + 1})
                 self.assertNotEqual(
@@ -487,6 +529,66 @@ class PoolCacheKeyDeterminantTests(unittest.TestCase):
         with unittest.mock.patch.object(gfi.sys, "version_info", (3, 1, 0, "final", 0)):
             other = self._key()
         self.assertNotEqual(baseline, other)
+
+    def test_marker_fields_equal_the_determinant_tuple(self):
+        """`_pool_marker_text`/`_parse_pool_marker` carry exactly the
+        `POOL_KEY_DETERMINANTS` field set -- generated from the same
+        tuple `_pool_cache_key` iterates, so the two can never drift on
+        which fields they cover."""
+        text = gfi._pool_marker_text(**self._BASE)
+        parsed = gfi._parse_pool_marker(text)
+        self.assertEqual(set(parsed), set(gfi.POOL_KEY_DETERMINANTS))
+        self.assertEqual(parsed, self._BASE)
+
+
+class PoolKeyDeterminantAddMutantTests(unittest.TestCase):
+    """An ADD-mutant proof that the determinant loop covers a NEW
+    determinant automatically once it is wired into all three of
+    `_pool_cache_key`'s signature, its own `_pool_key_values` call, and
+    `POOL_KEY_DETERMINANTS` -- and that wiring it into the first two
+    WITHOUT the third is refused at key-build time (`_pool_key_values`'s
+    own have/want set-equality check), never silently ignored."""
+
+    _SIG_OLD = "    families: int, instances_per_family: int, size: int, jitter: int, seed: int\n) -> str:"
+    _SIG_NEW = (
+        "    families: int, instances_per_family: int, size: int, jitter: int, seed: int, channels: int\n"
+        ") -> str:"
+    )
+    # Anchored on the text immediately AFTER the closing `)` (`_pool_cache_
+    # key`'s own next line) so this substitution targets ONLY its
+    # `_pool_key_values(...)` call, not `_pool_marker_text`'s identically
+    # worded one a few lines below.
+    _CALL_OLD = (
+        "        families=families, instances_per_family=instances_per_family, size=size, jitter=jitter, "
+        "seed=seed\n    )\n    module_bytes"
+    )
+    _CALL_NEW = (
+        "        families=families, instances_per_family=instances_per_family, size=size, jitter=jitter, "
+        "seed=seed, channels=channels\n    )\n    module_bytes"
+    )
+    _TUPLE_OLD = '    "jitter",\n    "seed",\n)'
+    _TUPLE_NEW = '    "jitter",\n    "seed",\n    "channels",\n)'
+
+    def test_new_determinant_wired_into_signature_call_and_tuple_moves_the_key(self):
+        variant = _load_variant_module(
+            [(self._SIG_OLD, self._SIG_NEW), (self._CALL_OLD, self._CALL_NEW), (self._TUPLE_OLD, self._TUPLE_NEW)],
+            "add_channels_wired",
+            self.addCleanup,
+        )
+        base = dict(families=4, instances_per_family=3, size=10, jitter=8, seed=1)
+        key_a = variant._pool_cache_key(**base, channels=1)
+        key_b = variant._pool_cache_key(**base, channels=2)
+        self.assertNotEqual(key_a, key_b, "a determinant wired into signature+call+tuple must move the key alone")
+
+    def test_new_determinant_wired_into_signature_and_call_but_not_tuple_is_refused(self):
+        variant = _load_variant_module(
+            [(self._SIG_OLD, self._SIG_NEW), (self._CALL_OLD, self._CALL_NEW)],
+            "add_channels_unwired",
+            self.addCleanup,
+        )
+        base = dict(families=4, instances_per_family=3, size=10, jitter=8, seed=1)
+        with self.assertRaises(KeyError):
+            variant._pool_cache_key(**base, channels=1)
 
 
 class RealSourceEditMovesTheKeyTests(unittest.TestCase):

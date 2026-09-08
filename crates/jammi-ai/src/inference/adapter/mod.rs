@@ -382,7 +382,16 @@ pub(crate) fn nullify_strings(
                 })
                 .collect())
         }
-        None => Ok(vec![None::<&str>; row_count].into_iter().collect()),
+        None => {
+            if row_status.len() != row_count {
+                return Err(JammiError::Inference(format!(
+                    "nullify_strings: row_status has {} entries, expected one per row \
+                     ({row_count})",
+                    row_status.len()
+                )));
+            }
+            Ok(vec![None::<&str>; row_count].into_iter().collect())
+        }
     }
 }
 
@@ -414,7 +423,16 @@ pub(crate) fn nullify_floats(
                 .map(|(i, &c)| if row_status[i] { Some(c) } else { None })
                 .collect())
         }
-        None => Ok(vec![None::<f32>; row_count].into_iter().collect()),
+        None => {
+            if row_status.len() != row_count {
+                return Err(JammiError::Inference(format!(
+                    "nullify_floats: row_status has {} entries, expected one per row \
+                     ({row_count})",
+                    row_status.len()
+                )));
+            }
+            Ok(vec![None::<f32>; row_count].into_iter().collect())
+        }
     }
 }
 
@@ -866,6 +884,24 @@ mod tests {
     }
 
     #[test]
+    fn nullify_strings_with_no_values_still_refuses_a_row_status_shorter_than_row_count() {
+        // Verified by deleting the `row_status.len() != row_count` guard in
+        // the `None` arm: this test goes RED — a 1-entry `row_status` against
+        // `row_count = 3` silently returns `Ok` with an all-null 3-entry
+        // column instead of the `Err` asserted below.
+        let row_status = vec![true]; // one entry; row_count is 3
+        let err = nullify_strings(None, &row_status, 3).expect_err(
+            "a row_status shorter than row_count must be a typed refusal even with no values",
+        );
+        let msg = err.to_string();
+        assert!(msg.contains("row_status"), "must name the field: {msg}");
+        assert!(
+            msg.contains('1') && msg.contains('3'),
+            "must name both the got (1) and expected (3) lengths: {msg}"
+        );
+    }
+
+    #[test]
     fn nullify_floats_refuses_a_row_status_shorter_than_row_count() {
         let values = vec![1.0_f32, 2.0, 3.0];
         let row_status = vec![true]; // one entry; row_count is 3
@@ -912,5 +948,23 @@ mod tests {
         assert_eq!(array.len(), 2);
         assert!(array.is_null(0));
         assert!(array.is_null(1));
+    }
+
+    #[test]
+    fn nullify_floats_with_no_values_still_refuses_a_row_status_shorter_than_row_count() {
+        // Verified by deleting the `row_status.len() != row_count` guard in
+        // the `None` arm: this test goes RED — a 1-entry `row_status` against
+        // `row_count = 3` silently returns `Ok` with an all-null 3-entry
+        // column instead of the `Err` asserted below.
+        let row_status = vec![true]; // one entry; row_count is 3
+        let err = nullify_floats(None, &row_status, 3).expect_err(
+            "a row_status shorter than row_count must be a typed refusal even with no values",
+        );
+        let msg = err.to_string();
+        assert!(msg.contains("row_status"), "must name the field: {msg}");
+        assert!(
+            msg.contains('1') && msg.contains('3'),
+            "must name both the got (1) and expected (3) lengths: {msg}"
+        );
     }
 }

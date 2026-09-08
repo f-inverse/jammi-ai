@@ -100,46 +100,92 @@ impl HttpBackend {
         // response would splice a later row's tail into an earlier row's
         // slice.
         //
-        // `validate_row_widths` runs to completion BEFORE any buffer is
+        // `row_widths::validate` must run to completion BEFORE any buffer is
         // allocated. A ragged response where row 0 is wide and every later
         // row is empty (e.g. n = 10^6, dim = 10^6) would otherwise size
         // `Vec::with_capacity(n * dim)` off row 0 alone, requesting an
         // arbitrarily large allocation before row 1 -- the row that proves
-        // the response is ragged -- is ever inspected. Validating first
-        // means the refusal fires on row 1's width, never on an allocation
-        // request.
-        validate_row_widths(&response.data, dim)?;
+        // the response is ragged -- is ever inspected. This is enforced at
+        // the TYPE level, not by call-site discipline: `row_widths::flatten`
+        // is the only way to build the buffer, and it takes a
+        // `row_widths::Validated`, whose fields are private to the
+        // `row_widths` submodule -- `forward_embeddings` (this function,
+        // outside that submodule) cannot construct one by field literal, only
+        // by calling `row_widths::validate`. A reorder that tried to flatten
+        // before validating is a compile error here, not a runtime property
+        // a test has to police.
+        let validated = row_widths::validate(&response.data, dim)?;
+        let flat = row_widths::flatten(validated, n)?;
+        BackendOutput::single_head(flat, n, dim, vec![true; n], vec![String::new(); n])
+    }
+}
+
+/// Row-width validation as a type: constructing a [`row_widths::Validated`]
+/// is the only way to obtain the proof [`row_widths::flatten`] requires, and
+/// [`row_widths::validate`] is the only function in the crate that can build
+/// one -- its fields are private to this submodule, so `http`'s own code
+/// (including `forward_embeddings`) cannot fabricate one by field literal.
+mod row_widths {
+    use super::EmbeddingData;
+    use jammi_db::error::{JammiError, Result};
+
+    /// Proof that every row in the wrapped slice has already been checked
+    /// against a common width by [`validate`] -- the only function that can
+    /// construct one, since its fields are private to this module.
+    /// [`flatten`] requires this type rather than a bare `&[EmbeddingData]`
+    /// so building the flat buffer without first validating row widths is a
+    /// compile error, not a call-order convention.
+    #[derive(Debug)]
+    pub(super) struct Validated<'a> {
+        data: &'a [EmbeddingData],
+        dim: usize,
+    }
+
+    /// Validate that every row in `data` has exactly `dim` elements (row 0's
+    /// own width), refusing by row index and both widths on the first
+    /// disagreement.
+    ///
+    /// Split out as its own allocation-free pass so callers can validate
+    /// BEFORE sizing a `rows * dim` buffer off `dim` alone: a ragged
+    /// response (row 0 wide, later rows short, empty, or long) must be
+    /// refused on the row that disagrees, never after an allocation request
+    /// sized by an unvalidated `dim`. Returns a [`Validated`] rather than
+    /// `()` so [`flatten`] can require proof of this check at the type
+    /// level.
+    pub(super) fn validate(data: &[EmbeddingData], dim: usize) -> Result<Validated<'_>> {
+        for (i, d) in data.iter().enumerate() {
+            if d.embedding.len() != dim {
+                return Err(JammiError::Backend(format!(
+                    "HTTP embedding response row {i} has width {}, expected {dim} (row 0's width)",
+                    d.embedding.len()
+                )));
+            }
+        }
+        Ok(Validated { data, dim })
+    }
+
+    /// Flatten already-validated rows into one row-major `[n, dim]` buffer.
+    ///
+    /// Takes a [`Validated`], which only [`validate`] can construct, so this
+    /// can never run ahead of validation -- there is no `&[EmbeddingData]`
+    /// overload to reorder into. `n` is the row count `dim` is checked
+    /// against (`response.data.len()`, validated separately against
+    /// `inputs.len()` by the caller); the two are threaded separately
+    /// because `Validated` proves per-row width agreement, not the row count
+    /// itself.
+    pub(super) fn flatten(validated: Validated<'_>, n: usize) -> Result<Vec<f32>> {
+        let dim = validated.dim;
         let capacity = n.checked_mul(dim).ok_or_else(|| {
             JammiError::Backend(format!(
                 "HTTP embedding response: rows*dim overflows (rows={n}, dim={dim})"
             ))
         })?;
         let mut flat = Vec::with_capacity(capacity);
-        for d in &response.data {
+        for d in validated.data {
             flat.extend_from_slice(&d.embedding);
         }
-        BackendOutput::single_head(flat, n, dim, vec![true; n], vec![String::new(); n])
+        Ok(flat)
     }
-}
-
-/// Validate that every row in `data` has exactly `dim` elements (row 0's own
-/// width), refusing by row index and both widths on the first disagreement.
-///
-/// Split out as its own allocation-free pass so callers can validate BEFORE
-/// sizing a `rows * dim` buffer off `dim` alone: a ragged response (row 0
-/// wide, later rows short, empty, or long) must be refused on the row that
-/// disagrees, never after an allocation request sized by an unvalidated
-/// `dim`.
-fn validate_row_widths(data: &[EmbeddingData], dim: usize) -> Result<()> {
-    for (i, d) in data.iter().enumerate() {
-        if d.embedding.len() != dim {
-            return Err(JammiError::Backend(format!(
-                "HTTP embedding response row {i} has width {}, expected {dim} (row 0's width)",
-                d.embedding.len()
-            )));
-        }
-    }
-    Ok(())
 }
 
 // ─── Request/Response types (OpenAI-compatible) ──────────────────────────────
@@ -155,7 +201,7 @@ struct EmbeddingResponse {
     data: Vec<EmbeddingData>,
 }
 
-#[derive(Deserialize)]
+#[derive(Debug, Deserialize)]
 struct EmbeddingData {
     embedding: Vec<f32>,
 }
@@ -167,15 +213,17 @@ mod tests {
     /// A ragged response where row 0 is wide (dim 1_000_000) and every
     /// subsequent row is empty implies an aggregate `n * dim` of 10^12
     /// elements (~4 TB of `f32`) if `dim` were trusted past row 0.
-    /// `validate_row_widths` is a pure, allocation-free pass: it must
+    /// `row_widths::validate` is a pure, allocation-free pass: it must
     /// refuse on row 1 -- the first row that disagrees with row 0's width
     /// -- without ever sizing a buffer off the unvalidated `dim`.
     ///
-    /// Verified by folding `validate_row_widths` back into a loop that calls
-    /// `Vec::with_capacity(n * dim)` before checking any row: this test's
-    /// caller in `forward_embeddings` would then request a ~4 TB allocation
-    /// before row 1 is ever inspected, aborting the process rather than
-    /// returning the `Err` asserted here.
+    /// Verified by deleting the width-mismatch check inside
+    /// `row_widths::validate` (having it return `Ok(..)` unconditionally):
+    /// this test's `unwrap_err()` then panics, since row 1 no longer
+    /// produces an `Err`. (This test calls `row_widths::validate` directly,
+    /// so a mutation confined to `forward_embeddings` -- e.g. how it uses
+    /// the result -- cannot be observed here; see the separate
+    /// `forward_embeddings_*` test below for that boundary.)
     #[test]
     fn validate_row_widths_refuses_a_ragged_row_before_any_large_allocation() {
         let dim = 1_000_000;
@@ -186,7 +234,7 @@ mod tests {
             embedding: Vec::new(),
         }));
 
-        let err = validate_row_widths(&data, dim).unwrap_err();
+        let err = row_widths::validate(&data, dim).unwrap_err();
         let msg = err.to_string();
         assert!(msg.contains("row 1"), "must name the offending row: {msg}");
         assert!(
@@ -205,32 +253,40 @@ mod tests {
                 embedding: vec![0.3, 0.4],
             },
         ];
-        assert!(validate_row_widths(&data, 2).is_ok());
+        assert!(row_widths::validate(&data, 2).is_ok());
     }
 
-    /// Caller-level ordering oracle: a SMALL ragged response (row 0 width 2,
-    /// row 1 width 1 — deliberately too small to ever panic or exhaust
-    /// memory on either code path) driven through the public
-    /// `forward_embeddings` entry point, not `validate_row_widths` directly.
+    /// End-to-end presence oracle: a SMALL ragged response (row 0 width 2,
+    /// row 1 width 1 -- deliberately too small to ever panic or exhaust
+    /// memory on either code path) driven through `forward_embeddings`
+    /// itself -- `HttpBackend`'s own private method, reached here via a
+    /// wiremock-backed HTTP round trip -- rather than by calling
+    /// `row_widths::validate` directly. This proves the check actually fires
+    /// on a real response body decoded off the wire, not only in
+    /// `row_widths::validate`'s own unit tests above.
     ///
-    /// `validate_row_widths`'s row/width message (`"row {i} has width {},
+    /// `row_widths::validate`'s row/width message (`"row {i} has width {},
     /// expected {dim}"`) is the ONLY place in `forward_embeddings` that can
     /// produce that exact text, so asserting it on `forward_embeddings`'s own
     /// `Err` proves validation ran and its result reached the caller
     /// unchanged — no output is produced either way, since this is an
     /// error path.
     ///
-    /// This also pins that `validate_row_widths` still runs BEFORE the flat
-    /// buffer is built: if `forward_embeddings` were reordered to build the
-    /// buffer first, this fixture's row 1 (width 1) would extend `flat` by
-    /// only its own 1 element, leaving `flat.len() == 3` against the
-    /// expected `rows(2) * dim(2) == 4` — `BackendOutput::single_head`
-    /// would then refuse with ITS length-mismatch message instead
-    /// ("flat buffer has 3 value(s), expected rows*dim (2*2)"), which
-    /// contains neither "row 1" nor "width 1", failing the assertions below.
-    /// Verified by reordering `forward_embeddings` to call
-    /// `validate_row_widths` after building `flat`: this test goes RED (the
-    /// error message no longer names "row 1"/"width 1").
+    /// Ordering (validate-before-flatten) is a separate property from
+    /// presence, and it is NOT this test's oracle: it is enforced at the
+    /// type level -- `row_widths::flatten` requires a `row_widths::Validated`,
+    /// whose fields are private to the `row_widths` submodule, so nothing
+    /// outside it (including `forward_embeddings`) can fabricate one without
+    /// calling `row_widths::validate`. There is no reachable reordering to
+    /// red this test against (a reorder attempt is a compile error, not a
+    /// runtime behavior a test can observe).
+    /// Verified by deleting the `row_widths::validate(...)?` line in
+    /// `forward_embeddings` and building `flat` directly from
+    /// `response.data` in its place (bypassing `row_widths` entirely, since
+    /// there is no other way to obtain a buffer without going through it):
+    /// this test goes RED. `single_head` then refuses on the AGGREGATE
+    /// mismatch instead ("flat buffer has 3 value(s), expected rows*dim
+    /// (2*2)"), which names neither "row 1" nor "width 1".
     #[tokio::test]
     async fn forward_embeddings_refuses_a_ragged_response_naming_row_and_widths() {
         let server = wiremock::MockServer::start().await;

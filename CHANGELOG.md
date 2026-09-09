@@ -460,7 +460,11 @@ workspace ships every publishable crate at the same
   `latest`/`sha-<sha>` tags via `docker buildx imagetools create`, asserting the merged index's
   platform set via `imagetools inspect`. `image.yml` requests both platforms; the CUDA base
   (`jammi-ai-ci-cuda`) is unchanged (amd64 only — CUDA has no arm64 leg). Apple-silicon devcontainers
-  now resolve `:latest` to a native arm64 image instead of an emulated amd64 one.
+  now resolve `:latest` to a native arm64 image instead of an emulated amd64 one. arm64 Linux builds
+  of this workspace require FEAT_FP16 (ARMv8.2-A) — Graviton2+, Ampere Altra, and Apple silicon
+  qualify; Raspberry Pi 4 (ARMv8.0) does not — pinned via `.cargo/config.toml`'s
+  `[target.aarch64-unknown-linux-gnu]` `rustflags` (`-C target-feature=+fp16`), working around
+  `gemm`'s aarch64 f16 kernel otherwise failing to compile outside release profile.
 
 ### Fixed
 - **`jammi-encoders`' unit-test binary now serializes every writer of EVERY process-wide fusible-seam

@@ -85,6 +85,50 @@ pub async fn save_sidecar(handle: &JammiObjectStore, index: &SidecarIndex) -> Re
     }
 }
 
+/// The sidecar extensions a `ready` row of kind `kind`, precision
+/// `precision`, and `row_count` rows is REQUIRED to carry right now — the
+/// subset of [`sidecar_extensions`] that is not merely optional-if-present
+/// but a completeness contract `reconcile`'s row→object arm verifies with a
+/// live `exists()` per extension before it will leave the row `ready`.
+///
+/// [`SidecarKind::Ann`] always requires `usearch`/`rowmap`/`manifest.json`
+/// once the table has ANY row (`row_count == 0` requires none of them — a
+/// zero-row embedding table never grew a segment, so nothing to require);
+/// the quantized-precision rescore companion
+/// (`crate::index::sidecar::RESCORE_COMPANION_EXTENSION`) is additionally
+/// required for a non-[`crate::config::StoragePrecision::F32`] non-[`crate::config::StoragePrecision::Binary`]
+/// graph, and the per-dimension threshold companion
+/// (`crate::index::sidecar::THRESHOLD_COMPANION_EXTENSION`) for a
+/// [`crate::config::StoragePrecision::Binary`] one — mirroring exactly which siblings
+/// [`save_sidecar`] actually writes for that precision.
+pub fn required_sidecar_extensions(
+    kind: SidecarKind,
+    precision: crate::config::StoragePrecision,
+    row_count: usize,
+) -> Vec<&'static str> {
+    use crate::config::StoragePrecision;
+    match kind {
+        SidecarKind::Ann => {
+            if row_count == 0 {
+                return Vec::new();
+            }
+            let mut exts = vec!["usearch", "rowmap", "manifest.json"];
+            match precision {
+                StoragePrecision::F32 => {}
+                StoragePrecision::Binary => {
+                    exts.push(crate::index::sidecar::THRESHOLD_COMPANION_EXTENSION)
+                }
+                StoragePrecision::F16 | StoragePrecision::Int8 => {
+                    exts.push(crate::index::sidecar::RESCORE_COMPANION_EXTENSION)
+                }
+            }
+            exts
+        }
+        SidecarKind::Lexical => vec!["tantivy"],
+        SidecarKind::None => Vec::new(),
+    }
+}
+
 /// Best-effort cleanup: delete every sidecar sibling a `kind` carries.
 pub async fn delete_sidecar(handle: &JammiObjectStore, kind: SidecarKind) -> Result<()> {
     for ext in sidecar_extensions(kind) {
@@ -177,5 +221,38 @@ mod tests {
     #[test]
     fn none_kind_carries_no_extensions() {
         assert!(sidecar_extensions(SidecarKind::None).is_empty());
+    }
+
+    #[test]
+    fn required_extensions_are_empty_for_a_zero_row_table() {
+        use crate::config::StoragePrecision;
+        assert!(required_sidecar_extensions(SidecarKind::Ann, StoragePrecision::F32, 0).is_empty());
+    }
+
+    #[test]
+    fn required_extensions_f32_never_needs_a_rescore_companion() {
+        use crate::config::StoragePrecision;
+        assert_eq!(
+            required_sidecar_extensions(SidecarKind::Ann, StoragePrecision::F32, 10),
+            ["usearch", "rowmap", "manifest.json"],
+        );
+    }
+
+    #[test]
+    fn required_extensions_quantized_needs_the_rescore_companion() {
+        use crate::config::StoragePrecision;
+        assert_eq!(
+            required_sidecar_extensions(SidecarKind::Ann, StoragePrecision::Int8, 10),
+            ["usearch", "rowmap", "manifest.json", "rawf32"],
+        );
+    }
+
+    #[test]
+    fn required_extensions_binary_needs_the_threshold_companion() {
+        use crate::config::StoragePrecision;
+        assert_eq!(
+            required_sidecar_extensions(SidecarKind::Ann, StoragePrecision::Binary, 10),
+            ["usearch", "rowmap", "manifest.json", "threshold"],
+        );
     }
 }

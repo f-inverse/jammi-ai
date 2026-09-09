@@ -2974,22 +2974,22 @@ id space, this defends the context-predictor id space, and each surface owns its
 rather than trusting the id's shape alone.
 
 The adapter-fetch error contract both reload surfaces share: `fetch_artifact`
-(`crates/jammi-db/src/store/artifact.rs:220`) raises two DISTINCT typed storage outcomes,
+(`crates/jammi-db/src/store/artifact.rs:228`) raises two DISTINCT typed storage outcomes,
 never folding them together. A manifest that is ABSENT entirely — nothing was ever
 published at that prefix, or a catalog pointer names the wrong one — reclassifies to
 `StorageError::NotPublished` (`reclassify_missing_manifest`,
-`crates/jammi-db/src/store/artifact.rs:484`; covered by
+`crates/jammi-db/src/store/artifact.rs:539`; covered by
 `missing_manifest_is_not_published_not_corruption`,
-`crates/jammi-db/src/store/artifact.rs:685`): no manifest is in hand, so there is nothing
+`crates/jammi-db/src/store/artifact.rs:742`): no manifest is in hand, so there is nothing
 to say is corrupt. A manifest that IS present but malformed, or that names a key which is
 missing or hash-mismatched on an otherwise-published bundle, is the genuine integrity
 failure, `StorageError::Layout` (`reclassify_missing_key`,
-`crates/jammi-db/src/store/artifact.rs:515`; `verify_sha256`,
-`crates/jammi-db/src/store/artifact.rs:530`). Any OTHER storage fault off `fetch_artifact`
+`crates/jammi-db/src/store/artifact.rs:570`; `verify_sha256`,
+`crates/jammi-db/src/store/artifact.rs:585`). Any OTHER storage fault off `fetch_artifact`
 — transport/IO, a disabled scheme, driver-init failure, or a permission-denied open on a
 present key (which stays `StorageError::Io`, never reclassified —
 `permission_fault_on_a_present_key_stays_a_transport_error`,
-`crates/jammi-db/src/store/artifact.rs:759`) — is left unchanged.
+`crates/jammi-db/src/store/artifact.rs:816`) — is left unchanged.
 
 Both reload surfaces match on these two variants explicitly and re-type BOTH into the SAME
 `JammiError::Model`, naming the model id with a distinct message per variant.

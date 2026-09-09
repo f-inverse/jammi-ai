@@ -5,12 +5,29 @@
 use std::sync::Arc;
 
 use bytes::Bytes;
+use chrono::{DateTime, Utc};
+use futures::TryStreamExt;
 use object_store::path::Path as ObjectPath;
 use object_store::ObjectStore;
 
 use super::builder::DynObjectStore;
 use super::error::StorageError;
 use super::url::{Scheme, StorageUrl};
+
+/// One object a `JammiObjectStore::list` enumeration found under a prefix —
+/// the engine's own shape (never `object_store::ObjectMeta` directly), so a
+/// caller (only [`crate::store::reconcile`] today — see the never-`LIST`
+/// hot-path rule below) depends on exactly the three fields reconcile needs,
+/// not the full upstream metadata surface.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ObjectMeta {
+    /// The object's full path, relative to the driver's own root.
+    pub path: ObjectPath,
+    /// Size in bytes.
+    pub size: u64,
+    /// Last-modified time, as reported by the backend.
+    pub last_modified: DateTime<Utc>,
+}
 
 /// A constructed object-store driver bound to the URL that produced it.
 ///
@@ -111,6 +128,38 @@ impl JammiObjectStore {
         }
     }
 
+    /// List every object under `prefix` (recursive — object stores have no
+    /// directory concept, so this is a flat enumeration of every key sharing
+    /// the prefix), sorted by path.
+    ///
+    /// `pub(crate)`: the ONLY caller is
+    /// [`crate::store::reconcile`](crate::store::reconcile). Every hot
+    /// read/write path in this engine resolves a key it already knows (a
+    /// catalog row's `parquet_path`, a manifest's listed entry) rather than
+    /// discovering keys by listing — object-store `LIST` is the operation
+    /// most backends serve slowest and least consistently (S3's `LIST` is
+    /// eventually consistent under some storage classes; GCS and Azure both
+    /// rate-limit it far more aggressively than `GET`/`HEAD`/`PUT`). Reconcile
+    /// is the one deliberately out-of-band maintenance pass that is allowed to
+    /// pay that cost; nothing else in the crate may call this method.
+    pub(crate) async fn list(&self, prefix: &ObjectPath) -> Result<Vec<ObjectMeta>, StorageError> {
+        let mut metas: Vec<ObjectMeta> = self
+            .driver
+            .list(Some(prefix))
+            .try_collect::<Vec<_>>()
+            .await
+            .map_err(|e| StorageError::io(prefix.to_string(), e))?
+            .into_iter()
+            .map(|m| ObjectMeta {
+                path: m.location,
+                size: m.size,
+                last_modified: m.last_modified,
+            })
+            .collect();
+        metas.sort_by(|a, b| a.path.cmp(&b.path));
+        Ok(metas)
+    }
+
     /// True if `path` exists in the underlying store.
     pub async fn exists(&self, path: &ObjectPath) -> Result<bool, StorageError> {
         match self.driver.head(path).await {
@@ -166,6 +215,30 @@ mod tests {
         let handle = JammiObjectStore::new(driver, url);
         let sibling = handle.sibling_path("usearch").unwrap();
         assert!(sibling.to_string().ends_with("data.usearch"));
+    }
+
+    #[tokio::test]
+    async fn list_enumerates_every_object_under_a_prefix_sorted() {
+        let registry = StorageRegistry::new();
+        let url = StorageUrl::memory("root");
+        let driver = registry.driver_for(&url, None).unwrap();
+        let handle = JammiObjectStore::new(driver, url);
+
+        for name in ["b/two.parquet", "a/one.parquet", "a/one.manifest.json"] {
+            let path = ObjectPath::parse(name).unwrap();
+            handle
+                .put_bytes(&path, Bytes::from_static(b"x"))
+                .await
+                .unwrap();
+        }
+        let listed = handle.list(&ObjectPath::parse("").unwrap()).await.unwrap();
+        let names: Vec<String> = listed.iter().map(|m| m.path.to_string()).collect();
+        assert_eq!(
+            names,
+            vec!["a/one.manifest.json", "a/one.parquet", "b/two.parquet"],
+            "list must be sorted and enumerate every key under the prefix"
+        );
+        assert!(listed.iter().all(|m| m.size == 1));
     }
 
     #[test]

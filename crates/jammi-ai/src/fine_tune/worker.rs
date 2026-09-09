@@ -48,6 +48,7 @@ use jammi_db::error::{JammiError, Result};
 use jammi_db::model_task::ModelTask;
 use jammi_db::sql::{quote_ident, source_relation};
 use jammi_db::store::ArtifactStore;
+use jammi_db::tenant::TenantId;
 
 use crate::fine_tune::data::TrainingDataLoader;
 use crate::fine_tune::graph_sampler::{
@@ -445,6 +446,7 @@ impl TrainingWorker {
                 // — never from an in-memory vec that does not exist here.
                 Self::gc_epoch_checkpoints(
                     &session.artifact_store(),
+                    catalog.current_tenant(),
                     &job_id,
                     &self.worker_id,
                     attempt,
@@ -461,6 +463,7 @@ impl TrainingWorker {
                 // failure — none of which ever produced a `TrainedArtifact`.
                 Self::gc_epoch_checkpoints(
                     &session.artifact_store(),
+                    catalog.current_tenant(),
                     &job_id,
                     &self.worker_id,
                     attempt,
@@ -510,6 +513,12 @@ impl TrainingWorker {
         artifact: TrainedArtifact,
     ) {
         let store = session.artifact_store();
+        // `catalog` is `pinned_to_tenant(record.tenant_id)` — its
+        // `current_tenant()` reliably reports the JOB's tenant regardless of
+        // any task-local scope, so every artifact key this function writes
+        // (or reclaims) lands under that same tenant segment
+        // (`TenantSegment::of`) a reconcile pass attributes it through.
+        let tenant = catalog.current_tenant();
         let epoch_checkpoint_bound = epoch_checkpointing.map(|(b, _)| b).unwrap_or(0);
         let TrainedArtifact {
             dir,
@@ -526,7 +535,9 @@ impl TrainingWorker {
         // loser's (or zombie's) register can never set the served pointer.
         let attempt_str = attempt.to_string();
         let prefix =
-            match publish_artifact(&store, job_id, &self.worker_id, &attempt_str, &dir).await {
+            match publish_artifact(&store, tenant, job_id, &self.worker_id, &attempt_str, &dir)
+                .await
+            {
                 Ok(p) => p,
                 Err(e) => {
                     record_failed(catalog, job_id, &self.worker_id, e.to_string()).await;
@@ -538,6 +549,7 @@ impl TrainingWorker {
                     // reclaim path for every terminating arm, unit 348 F1/F2).
                     Self::gc_epoch_checkpoints(
                         &store,
+                        tenant,
                         job_id,
                         &self.worker_id,
                         attempt,
@@ -554,6 +566,7 @@ impl TrainingWorker {
             store.delete_artifact_prefix(&prefix).await.ok();
             Self::gc_epoch_checkpoints(
                 &store,
+                tenant,
                 job_id,
                 &self.worker_id,
                 attempt,
@@ -631,7 +644,10 @@ impl TrainingWorker {
                 // resume checkpoint is dead. GC it (best-effort — a leftover
                 // resume prefix is harmless, never on the serving path, but the
                 // winner is the single point that reclaims it).
-                store.delete_resume_checkpoint(job_id).await.ok();
+                store
+                    .delete_resume_checkpoint(tenant.as_ref(), job_id)
+                    .await
+                    .ok();
                 // Unit 348 F2: the winner is also the single point that
                 // reclaims any STALE (over-the-cap, failed-to-prune-mid-run)
                 // epoch checkpoints — bytes a repeatedly-failing delete left
@@ -644,6 +660,7 @@ impl TrainingWorker {
                 if !epoch_checkpoints.is_empty() {
                     Self::gc_epoch_checkpoints_by_index(
                         &store,
+                        tenant,
                         job_id,
                         &self.worker_id,
                         attempt,
@@ -661,6 +678,7 @@ impl TrainingWorker {
                 store.delete_artifact_prefix(&prefix).await.ok();
                 Self::gc_epoch_checkpoints(
                     &store,
+                    tenant,
                     job_id,
                     &self.worker_id,
                     attempt,
@@ -677,6 +695,7 @@ impl TrainingWorker {
                 store.delete_artifact_prefix(&prefix).await.ok();
                 Self::gc_epoch_checkpoints(
                     &store,
+                    tenant,
                     job_id,
                     &self.worker_id,
                     attempt,
@@ -738,6 +757,7 @@ impl TrainingWorker {
     /// [`jammi_db::catalog::training_repo::EpochCheckpointRow`]).
     async fn gc_epoch_checkpoints(
         store: &ArtifactStore,
+        tenant: Option<TenantId>,
         job_id: &str,
         worker_id: &str,
         attempt: u32,
@@ -748,6 +768,7 @@ impl TrainingWorker {
         }
         Self::gc_epoch_checkpoints_by_index(
             store,
+            tenant,
             job_id,
             worker_id,
             attempt,
@@ -767,6 +788,7 @@ impl TrainingWorker {
     /// this attempt).
     async fn gc_epoch_checkpoints_by_index(
         store: &ArtifactStore,
+        tenant: Option<TenantId>,
         job_id: &str,
         worker_id: &str,
         attempt: u32,
@@ -778,7 +800,7 @@ impl TrainingWorker {
         for epoch in epochs {
             attempted += 1;
             if store
-                .delete_epoch_checkpoint(job_id, worker_id, &attempt_str, epoch)
+                .delete_epoch_checkpoint(tenant.as_ref(), job_id, worker_id, &attempt_str, epoch)
                 .await
                 .is_err()
             {
@@ -1380,6 +1402,7 @@ impl ModelRegistration {
 /// part of the served artifact).
 async fn publish_artifact(
     store: &ArtifactStore,
+    tenant: Option<TenantId>,
     job_id: &str,
     worker_id: &str,
     attempt: &str,
@@ -1396,7 +1419,7 @@ async fn publish_artifact(
         files.push((name, Bytes::from(bytes)));
     }
     store
-        .put_artifact(&[job_id, worker_id, attempt], &files)
+        .put_artifact(tenant.as_ref(), &[job_id, worker_id, attempt], &files)
         .await
 }
 
@@ -2385,7 +2408,13 @@ fn run_fine_tune_blocking(
     // continues from `last_completed + 1`; if none exists, it trains from scratch
     // as today. The discovery never perturbs the publish/serving path — the
     // resume prefix (`{job_id}/_resume/`) is a crash-recovery side channel.
-    let resume = discover_resume(&artifact_store, &job_id, &device)?;
+    // `catalog` is `pinned_to_tenant(record.tenant_id)` (the caller's
+    // tenant-scoped catalog) — its `current_tenant()` names the job's own
+    // tenant regardless of task-local scope, so both the resume-checkpoint
+    // read below and every checkpoint the trainer writes land under the
+    // SAME tenant segment.
+    let tenant = catalog.current_tenant();
+    let resume = discover_resume(&artifact_store, tenant, &job_id, &device)?;
 
     let mut builder = crate::fine_tune::trainer::TrainingLoopBuilder::new(target, varmap, config)
         .base_model(base_model_arc)
@@ -2400,6 +2429,7 @@ fn run_fine_tune_blocking(
         .artifact_dir(artifact_dir)
         .device(device.clone())
         .cancel(cancel)
+        .tenant(tenant)
         .artifact_store(Arc::clone(&artifact_store));
     if let Some(restored) = resume {
         builder = builder.resume(restored);
@@ -2414,11 +2444,12 @@ fn run_fine_tune_blocking(
 /// a hard error from the artifact store, not a silent from-scratch restart.
 fn discover_resume(
     store: &Arc<ArtifactStore>,
+    tenant: Option<TenantId>,
     job_id: &str,
     device: &candle_core::Device,
 ) -> Result<Option<crate::fine_tune::resume::RestoredCheckpoint>> {
-    let Some(local) =
-        tokio::runtime::Handle::current().block_on(store.fetch_resume_checkpoint(job_id))?
+    let Some(local) = tokio::runtime::Handle::current()
+        .block_on(store.fetch_resume_checkpoint(tenant.as_ref(), job_id))?
     else {
         return Ok(None);
     };

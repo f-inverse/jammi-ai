@@ -1,8 +1,10 @@
 pub mod artifact;
 pub mod building;
 pub mod freshness;
+pub mod layout;
 pub mod manifest;
 pub mod mutable;
+pub mod reconcile;
 pub mod result_schema;
 pub mod schema;
 pub mod vectors;
@@ -12,11 +14,13 @@ pub use building::BuildingTable;
 pub use freshness::{
     CacheOutcome, CachePolicy, CurrentAnchor, DerivesFromEdge, StaleReason, Staleness,
 };
+pub use layout::TenantSegment;
 pub use manifest::{
     AnchorKind, AnchorValue, ArtifactDigest, ComputeDevice, DefinitionHash, InputAnchor,
     ManifestError, MatchVerdict, Materialization, MaterializationEnv, MaterializationManifest,
     ModelContentDigest, ModelContentDigestUnavailableReason, ModelIdentity, ProducingDescriptor,
 };
+pub use reconcile::{ReconcileOptions, ReconcileReport};
 pub use result_schema::ResultTableSchemaProvider;
 
 use std::collections::BTreeMap;
@@ -171,6 +175,13 @@ pub struct ResultStore {
     /// (or recovery claims) is held under — the deployment's one
     /// [`crate::config::LeaseConfig`].
     lease: LeaseIntervals,
+    /// The model-artifact store rooted at `{root}/models`, sharing this
+    /// store's [`StorageRegistry`]. A single storage knob (`root`) serves
+    /// both result tables and trained models; `jammi-ai`'s session reads
+    /// this handle back through [`Self::artifact_store`] rather than
+    /// constructing its own, so the two can never disagree on where models
+    /// live relative to result tables.
+    artifact_store: Arc<ArtifactStore>,
 }
 
 /// Mint a fresh writer identity.
@@ -199,11 +210,28 @@ fn sanitize_model_id(model_id: &str) -> String {
         .collect()
 }
 
+/// `{root}/models` — the artifact store's root, derived from the result
+/// store's own root so one storage knob serves both.
+fn models_root(root: &StorageUrl) -> Result<StorageUrl> {
+    let root_str = root.as_str().trim_end_matches('/');
+    Ok(StorageUrl::parse(&format!("{root_str}/models"))?)
+}
+
 impl ResultStore {
     /// Construct a result-store rooted at a local artifact directory. The
-    /// directory is created if absent. Equivalent to
-    /// `ResultStore::with_root(StorageUrl::parse(artifact_dir.join("jammi_db"))?, …)`
-    /// with a default-constructed [`StorageRegistry`].
+    /// directory is created if absent. Roots result tables at
+    /// `{artifact_dir}/jammi_db/` (unchanged from the historical layout) with
+    /// the ANN segment cache and the artifact fetch cache relocated OUT of
+    /// that root, at `{artifact_dir}/cache/index` and
+    /// `{artifact_dir}/cache/artifact` respectively (A7): the caches are
+    /// content-addressed scratch state, not result-table data, so they no
+    /// longer sit inside the directory a `reconcile` or backup walks as the
+    /// table root. Equivalent to
+    /// `ResultStore::with_root(StorageUrl::parse(artifact_dir.join("jammi_db"))?, …, artifact_dir.join("cache"))`
+    /// with a default-constructed [`StorageRegistry`]. Old on-disk
+    /// `jammi_db/index_cache` / `jammi_db/artifact_cache` directories from
+    /// before this change are inert after upgrade — cold caches that
+    /// `reconcile` reports as `unattributed` (never deleted).
     pub fn new(artifact_dir: &Path, catalog: Arc<Catalog>, ann: AnnIndexConfig) -> Result<Self> {
         let jammi_db_dir = artifact_dir.join("jammi_db");
         std::fs::create_dir_all(&jammi_db_dir)?;
@@ -212,24 +240,13 @@ impl ResultStore {
                 .to_str()
                 .ok_or_else(|| JammiError::Config("Non-UTF8 artifact_dir".into()))?,
         )?;
-        let result_schema = Arc::new(ResultTableSchemaProvider::new(
-            catalog
-                .tenant_binding()
-                .unwrap_or_else(TenantBinding::unscoped),
-        ));
-        let registry = StorageRegistry::new();
-        let segment_cache =
-            SegmentIndexCache::new(registry.clone(), jammi_db_dir.join("index_cache"))?;
-        Ok(Self {
-            root: url,
-            registry,
+        Self::with_root(
+            url,
+            StorageRegistry::new(),
             catalog,
             ann,
-            result_schema,
-            segment_cache,
-            writer_id: new_writer_id(),
-            lease: LeaseIntervals::default(),
-        })
+            artifact_dir.join("cache"),
+        )
     }
 
     /// Construct a result-store rooted at an arbitrary [`StorageUrl`] —
@@ -237,16 +254,20 @@ impl ResultStore {
     /// result-table storage. The registry is shared with the engine
     /// session so callers register cloud credentials once.
     ///
-    /// `cache_root` is the **local** directory the ANN segment cache
-    /// materialises remote segment bundles under (a `file://` root loads its
-    /// segments in place, so it is unused there) — a local path even when
-    /// `root` is a cloud scheme, since USearch reads from the local filesystem.
+    /// `local_cache_dir` is the **parent** of the two local cache
+    /// directories this store derives: `{local_cache_dir}/index` (the ANN
+    /// segment cache — a `file://` root loads its segments in place, so it
+    /// is unused there) and `{local_cache_dir}/artifact` (the model-artifact
+    /// fetch cache the store's own [`ArtifactStore`], rooted at
+    /// `{root}/models`, materialises cloud bundles under). Both are local
+    /// paths even when `root` is a cloud scheme, since USearch and candle
+    /// both read from the local filesystem.
     pub fn with_root(
         root: StorageUrl,
         registry: StorageRegistry,
         catalog: Arc<Catalog>,
         ann: AnnIndexConfig,
-        cache_root: std::path::PathBuf,
+        local_cache_dir: std::path::PathBuf,
     ) -> Result<Self> {
         if root.scheme() == Scheme::File {
             // Ensure the directory exists so create_table doesn't fail on
@@ -260,7 +281,13 @@ impl ResultStore {
                 .tenant_binding()
                 .unwrap_or_else(TenantBinding::unscoped),
         ));
-        let segment_cache = SegmentIndexCache::new(registry.clone(), cache_root)?;
+        let segment_cache =
+            SegmentIndexCache::new(registry.clone(), local_cache_dir.join("index"))?;
+        let artifact_store = Arc::new(ArtifactStore::with_root(
+            models_root(&root)?,
+            registry.clone(),
+            local_cache_dir.join("artifact"),
+        )?);
         Ok(Self {
             root,
             registry,
@@ -270,7 +297,16 @@ impl ResultStore {
             segment_cache,
             writer_id: new_writer_id(),
             lease: LeaseIntervals::default(),
+            artifact_store,
         })
+    }
+
+    /// This store's model-artifact store, rooted at `{root}/models` and
+    /// sharing this store's [`StorageRegistry`]. `jammi-ai`'s session reads
+    /// this handle rather than constructing its own artifact store, so the
+    /// two never disagree on where models live relative to result tables.
+    pub fn artifact_store(&self) -> Arc<ArtifactStore> {
+        Arc::clone(&self.artifact_store)
     }
 
     /// Set the lease window / heartbeat every [`BuildingTable`] this store
@@ -394,8 +430,21 @@ impl ResultStore {
         let task_str = task.as_db_str();
         let table_name = format!("{source_id}__{task_str}__{sanitized}__{timestamp}_{suffix}");
 
-        let parquet_url = self.derive_url(&format!("{table_name}.parquet"))?;
+        // Read the tenant ONCE from the catalog binding in force and use the
+        // same segment for both the row's `tenant_id` and this key — a
+        // `TenantSegment::parse` of the key's second path component always
+        // agrees with the row it names.
         let tenant = self.catalog.current_tenant();
+        let seg = TenantSegment::of(tenant.as_ref());
+        let parquet_url = layout::result_table_url(&self.root, &seg, &table_name)?;
+        if self.root.scheme() == Scheme::File {
+            // The tenant-segment subdirectory is new territory: object_store's
+            // local-filesystem `put` creates parent directories for the
+            // Parquet write itself, but the ANN sidecar's writer is USearch's
+            // raw FFI file open (`SidecarIndex::save`), which does NOT create
+            // directories — it needs `{root}/{seg}/` to already exist.
+            std::fs::create_dir_all(std::path::Path::new(self.root.path()).join(&seg))?;
+        }
         let storage_precision = self.ann.storage_precision;
 
         self.catalog
@@ -1150,10 +1199,7 @@ impl ResultStore {
                 .max_index_segment_id(building.table_name())
                 .await?
                 .map_or(0, |m| m + 1);
-            let seg_url = sibling_url(
-                building.parquet_url(),
-                &format!("{}__seg{next}.idx", building.table_name()),
-            )?;
+            let seg_url = layout::segment_url(building.parquet_url(), next)?;
             if self
                 .catalog
                 .insert_index_segment(&cas, next, seg_url.as_str(), row_count)
@@ -1222,17 +1268,6 @@ impl ResultStore {
         let parquet_url = StorageUrl::parse(&table.parquet_path)?;
         let cas = ResultTableCas::expired(&table.table_name, &lease_now(), parse_owner(table)?);
         self.delete_objects_after_cas(&parquet_url, &cas).await
-    }
-
-    /// Derive a child URL under the result-store root for an artifact name.
-    fn derive_url(&self, name: &str) -> Result<StorageUrl> {
-        let root_str = self.root.as_str();
-        let joined = if root_str.ends_with('/') {
-            format!("{root_str}{name}")
-        } else {
-            format!("{root_str}/{name}")
-        };
-        Ok(StorageUrl::parse(&joined)?)
     }
 
     /// Rebuild a table's whole ANN index from its Parquet as a single fresh
@@ -1544,18 +1579,6 @@ fn content_digest(rows: &[(String, Vec<f32>)]) -> String {
 fn run_id() -> &'static str {
     static RUN_ID: std::sync::OnceLock<String> = std::sync::OnceLock::new();
     RUN_ID.get_or_init(|| uuid::Uuid::new_v4().simple().to_string())
-}
-
-/// A sibling URL of a result table's Parquet object: the same parent prefix,
-/// a different object name. Every sidecar and segment key derives from the
-/// row's own `parquet_path` this way — never from the store's current root —
-/// so a table's objects stay co-located however the root moves.
-fn sibling_url(parquet_url: &StorageUrl, name: &str) -> Result<StorageUrl> {
-    let s = parquet_url.as_str();
-    let (parent, _) = s.rsplit_once('/').ok_or_else(|| {
-        JammiError::Config(format!("result-table URL '{s}' has no parent prefix"))
-    })?;
-    Ok(StorageUrl::parse(&format!("{parent}/{name}"))?)
 }
 
 /// The tenant a `result_tables` row carries, parsed (`None` for GLOBAL).

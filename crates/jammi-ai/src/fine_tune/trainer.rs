@@ -11,6 +11,7 @@ use candle_core::{backprop::GradStore, DType, Device, Tensor, Var};
 use candle_nn::VarMap;
 use jammi_db::catalog::Catalog;
 use jammi_db::store::ArtifactStore;
+use jammi_db::tenant::TenantId;
 // `Digest::new`/`Digest::update`/`Digest::finalize` for
 // `evaluate_held_out`'s `batch_partition_sha256` (H1, unit 63) — the same
 // trait `model/backend/candle.rs`'s content-digest hashing imports.
@@ -383,6 +384,12 @@ pub struct TrainingLoop {
     /// run trains but leaves nothing to resume from (used by trainer-internal
     /// tests that drive the loop without a worker/store).
     artifact_store: Option<Arc<ArtifactStore>>,
+    /// The job's tenant (`record.tenant_id` in the production worker path) —
+    /// the first prefix segment (`jammi_db::store::layout::TenantSegment` via
+    /// [`ArtifactStore`]) every checkpoint this loop writes lands under.
+    /// `None` for a GLOBAL job, or a trainer-internal test that never calls
+    /// [`TrainingLoopBuilder::tenant`].
+    tenant: Option<TenantId>,
     /// A resume bundle this run restores from before the first epoch, or `None`
     /// for a from-scratch run. When present, training starts at
     /// `state.last_completed_epoch + 1` with weights, optimizer moments, scaler,
@@ -446,6 +453,8 @@ pub struct TrainingLoopBuilder {
     cancel: Arc<AtomicBool>,
     artifact_store: Option<Arc<ArtifactStore>>,
     resume: Option<RestoredCheckpoint>,
+    /// See [`TrainingLoop::tenant`]. Defaults to `None`.
+    tenant: Option<TenantId>,
 }
 
 impl TrainingLoopBuilder {
@@ -470,7 +479,19 @@ impl TrainingLoopBuilder {
             cancel: Arc::new(AtomicBool::new(false)),
             artifact_store: None,
             resume: None,
+            tenant: None,
         }
+    }
+
+    /// Set the job's tenant — the first prefix segment every checkpoint this
+    /// loop writes lands under (`ArtifactStore::put_resume_checkpoint` /
+    /// `put_epoch_checkpoint`). Omit it for a GLOBAL job or a
+    /// trainer-internal test; the production worker path always sets it from
+    /// the claimed job record's own tenant (via the tenant-pinned catalog's
+    /// `current_tenant()`).
+    pub fn tenant(mut self, tenant: Option<TenantId>) -> Self {
+        self.tenant = tenant;
+        self
     }
 
     /// Set the durable artifact store the epoch-boundary resume checkpoint is
@@ -596,6 +617,7 @@ impl TrainingLoopBuilder {
             cancel: self.cancel,
             artifact_store: self.artifact_store,
             resume: self.resume,
+            tenant: self.tenant,
             epoch_checkpoints: Vec::new(),
             media_front_end_wall: std::cell::Cell::new(std::time::Duration::ZERO),
             #[cfg(test)]
@@ -3591,8 +3613,11 @@ impl TrainingLoop {
         let scratch = checkpoint_dir.join("_resume_scratch");
         let bundle =
             self.capture_resume_bundle(&scratch, epoch, global_step, optimizer, optim_param_names)?;
-        tokio::runtime::Handle::current()
-            .block_on(store.put_resume_checkpoint(&self.job_id, &bundle))?;
+        tokio::runtime::Handle::current().block_on(store.put_resume_checkpoint(
+            self.tenant.as_ref(),
+            &self.job_id,
+            &bundle,
+        ))?;
         Ok(())
     }
 
@@ -3695,6 +3720,7 @@ impl TrainingLoop {
         let scratch = checkpoint_dir.join(Self::EPOCH_CHECKPOINT_SCRATCH);
         let files = self.checkpoint_adapter_files(&scratch)?;
         let prefix = tokio::runtime::Handle::current().block_on(store.put_epoch_checkpoint(
+            self.tenant.as_ref(),
             &self.job_id,
             &self.worker_id,
             &self.attempt,
@@ -3715,6 +3741,7 @@ impl TrainingLoop {
                 let (oldest_epoch, _) = self.epoch_checkpoints[0];
                 let deleted = tokio::runtime::Handle::current()
                     .block_on(store.delete_epoch_checkpoint(
+                        self.tenant.as_ref(),
                         &self.job_id,
                         &self.worker_id,
                         &self.attempt,
@@ -9509,7 +9536,10 @@ mod resume_invariant {
         let bundle = loop_
             .capture_resume_bundle(scratch, last_completed_epoch, global_step, opt, names)
             .unwrap();
-        store.put_resume_checkpoint(job, &bundle).await.unwrap();
+        store
+            .put_resume_checkpoint(None, job, &bundle)
+            .await
+            .unwrap();
     }
 
     /// The full three-run invariant, multi-thread (R6).
@@ -9558,7 +9588,7 @@ mod resume_invariant {
         .await;
         let s_ref_at_k = load_bundle(
             store
-                .fetch_resume_checkpoint("ref-job")
+                .fetch_resume_checkpoint(None, "ref-job")
                 .await
                 .unwrap()
                 .unwrap()
@@ -9594,7 +9624,7 @@ mod resume_invariant {
         .await;
         let s_crash = load_bundle(
             store
-                .fetch_resume_checkpoint("crash-job")
+                .fetch_resume_checkpoint(None, "crash-job")
                 .await
                 .unwrap()
                 .unwrap()
@@ -9656,7 +9686,7 @@ mod resume_invariant {
         let (mut resume_opt, resume_names) = build_opt(&resume_varmap, &resume_loop);
         let restored_bundle = load_bundle(
             store
-                .fetch_resume_checkpoint("crash-job")
+                .fetch_resume_checkpoint(None, "crash-job")
                 .await
                 .unwrap()
                 .unwrap()
@@ -9753,7 +9783,7 @@ mod resume_invariant {
         .await;
         let bundle = load_bundle(
             store
-                .fetch_resume_checkpoint("wo-ref-job")
+                .fetch_resume_checkpoint(None, "wo-ref-job")
                 .await
                 .unwrap()
                 .unwrap()
@@ -9889,7 +9919,7 @@ mod resume_invariant {
             safetensors_entry("optimizer.safetensors", &["w.m", "w.v"], &device),
         ];
         store
-            .put_resume_checkpoint(job, &winner_bundle)
+            .put_resume_checkpoint(None, job, &winner_bundle)
             .await
             .unwrap();
 
@@ -9972,7 +10002,7 @@ mod resume_invariant {
         // wrote nothing, so resume never regressed.
         let after = load_bundle(
             store
-                .fetch_resume_checkpoint(job)
+                .fetch_resume_checkpoint(None, job)
                 .await
                 .unwrap()
                 .unwrap()
@@ -10224,7 +10254,11 @@ mod epoch_checkpoint_retention_failure {
     }
 
     fn epoch0_local_dir(root_dir: &std::path::Path) -> std::path::PathBuf {
+        // `minimal_loop_with_store` never sets `.tenant(...)`, so every
+        // checkpoint this loop writes lands under the `_global` tenant
+        // segment (`TenantSegment::of(None)`).
         root_dir
+            .join("_global")
             .join("f2-retry-job")
             .join("f2-retry-worker")
             .join("0")

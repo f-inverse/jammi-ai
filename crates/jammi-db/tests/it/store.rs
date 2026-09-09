@@ -536,6 +536,13 @@ async fn result_store_create_table_generates_correct_paths() {
     // parquet_url is a StorageUrl pointing at a file://… path under the
     // jammi_db root we just created.
     assert!(info.parquet_url().as_str().contains("jammi_db"));
+    // A GLOBAL table (no tenant binding on this catalog) lands under the
+    // `_global` segment — the layout allowlist `reconcile` attributes by.
+    assert!(
+        info.parquet_url().as_str().contains("/_global/"),
+        "an untenanted table must land under the `_global` segment, got: {}",
+        info.parquet_url()
+    );
     // No ANN index is generated at table creation — the index materialises
     // lazily as segments, so a freshly created table has an empty segment set.
     assert!(

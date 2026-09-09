@@ -133,7 +133,7 @@ async fn artifact_written_on_host_a_is_loadable_on_host_b() {
         ),
     ];
     let prefix = store_a
-        .put_artifact(&["job-x", "worker-a", "0"], &files)
+        .put_artifact(None, &["job-x", "worker-a", "0"], &files)
         .await
         .unwrap();
 

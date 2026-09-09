@@ -378,17 +378,28 @@ fn is_registered(ctx: &SessionContext, name: &str) -> bool {
 
 /// `.parquet` objects physically present under the result root.
 fn parquet_files_on_disk(dir: &Path) -> Vec<std::path::PathBuf> {
+    // Tables now land one directory deeper, under their tenant segment
+    // (`{root}/_global/{table}.parquet` or `{root}/{tenant}/{table}.parquet`)
+    // — walk two levels so this helper still finds every table regardless
+    // of which segment it landed under.
     let root = dir.join("jammi_db");
     let mut out = Vec::new();
-    if let Ok(entries) = std::fs::read_dir(&root) {
-        for e in entries.flatten() {
-            let p = e.path();
-            if p.extension().and_then(|x| x.to_str()) == Some("parquet") {
-                out.push(p);
-            }
+    walk_parquet(&root, &mut out);
+    out
+}
+
+fn walk_parquet(dir: &Path, out: &mut Vec<std::path::PathBuf>) {
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return;
+    };
+    for e in entries.flatten() {
+        let p = e.path();
+        if p.is_dir() {
+            walk_parquet(&p, out);
+        } else if p.extension().and_then(|x| x.to_str()) == Some("parquet") {
+            out.push(p);
         }
     }
-    out
 }
 
 // =====================================================================

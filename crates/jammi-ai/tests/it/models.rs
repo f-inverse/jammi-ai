@@ -772,6 +772,7 @@ async fn fine_tuned_adapter_bundle_missing_file_refuses_as_typed_model_error() {
     );
     let prefix = store
         .put_artifact(
+            None,
             &["broken-bundle"],
             &[
                 (
@@ -1101,6 +1102,7 @@ async fn fine_tuned_adapter_bundle_permission_fault_is_not_a_typed_model_error()
     );
     let prefix = store
         .put_artifact(
+            None,
             &["permission-fault-bundle"],
             &[
                 (

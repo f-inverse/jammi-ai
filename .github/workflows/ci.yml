@@ -2114,15 +2114,56 @@ jobs:
   # build (a compile error) but fails OPEN silently in a release build (the
   # codegen path that needs the instruction is dead there) -- this job
   # exists so the drop is caught on every PR, on a real runner, not only in
-  # a release artifact nobody was testing for it. Seconds, not minutes: no
-  # crate build beyond `jammi-numerics` (nalgebra/rand/rand_distr/statrs --
-  # no candle, no gemm, no CUDA), and sccache's GHA cache backend
-  # (`setup-rust-ci`'s own default) makes every run after the first cheap.
+  # a release artifact nobody was testing for it. BOTH assertions below
+  # always run -- no conditional skip arm: a job whose oracle step can quietly
+  # no-op is exactly the unexecuted-oracle shape this job exists to close, so
+  # it may not itself have one.
+  #
+  # No `container:` (unlike `check`/`test`, which run inside the CI base
+  # image): that image's `:latest` tag only becomes the arm64-carrying
+  # multi-arch index on a push to `main` (`_ci-base-image.yml`'s own rule),
+  # so a `container:` pull here would fail on THIS PR's own pre-merge run --
+  # the exact platform-mismatch failure the deleted probe hit against the
+  # devcontainer, before this repo's own `latest` had moved. The toolchain is
+  # installed directly instead, the same mechanism `release-binaries.yml`'s
+  # macOS leg (also a bare, container-less runner) already uses:
+  # `rust_pin.sh` resolves `rust-toolchain.toml`'s pin into a step output,
+  # and `dtolnay/rust-toolchain` (SHA-pinned) installs exactly that channel,
+  # native to the runner's own arch, no cross-target request.
+  #
+  # Cost: cold (first run after this job lands, or after any cache eviction)
+  # is a real native-arm64 build of `jammi-numerics` and its dependency set
+  # (nalgebra/rand/rand_distr/statrs -- no candle, no gemm, no CUDA) --
+  # measured a couple of minutes end to end including the toolchain install.
+  # sccache-warm (`setup-rust-ci`'s own default GHA cache backend, every run
+  # after that) drops the compile itself to a few seconds; the toolchain
+  # install is the fixed per-run cost either way (GH-hosted runners are
+  # ephemeral, so rustup has no cross-run cache of its own). Never a
+  # full-workspace build.
   arm64-floor-oracle:
     name: arm64 floor oracle
     runs-on: ubuntu-24.04-arm
     steps:
       - uses: actions/checkout@v4
+
+      # Read the pin rather than restate it -- a second copy of the version
+      # here would drift from rust-toolchain.toml without anything noticing.
+      - name: Resolve the pinned Rust toolchain
+        id: rust-pin
+        shell: bash
+        run: |
+          set -euo pipefail
+          channel="$(bash ci/scripts/rust_pin.sh)"
+          echo "channel=$channel" >> "$GITHUB_OUTPUT"
+
+      # SHA-pinned, same pin release-binaries.yml's macOS leg uses; the
+      # branch name in the ref is inert -- the toolchain actually installed
+      # is the explicit `toolchain:` input above.
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@4360b52568e2003a75bf9bc1d59f33a8e3fc893c # stable
+        with:
+          toolchain: ${{ steps.rust-pin.outputs.channel }}
+
       - uses: ./.github/actions/setup-rust-ci
 
       - name: Assert RUSTFLAGS carries the aarch64 fp16 floor
@@ -2136,24 +2177,14 @@ jobs:
           echo "RUSTFLAGS carries the floor: $RUSTFLAGS"
 
       - name: Assert the floor reaches rustc itself, not only the env
-        # `ubuntu-24.04-arm`'s own runner image ships a generic Rust
-        # toolchain (actions/runner-images), so `cargo` is present even
-        # before rustup resolves this repo's own `rust-toolchain.toml`
-        # pin -- "if a toolchain is present" is a defensive skip, not the
-        # expected path.
+        # No `2>/dev/null` on the cargo invocation: a genuine compile
+        # failure here must be visible in the job log, never folded into
+        # "grep found nothing" as if it were merely a missing cfg flag.
         shell: bash
         run: |
           set -euo pipefail
-          if ! command -v cargo > /dev/null 2>&1; then
-            echo "no cargo/toolchain found on this runner -- skipping the rustc-level check (the RUSTFLAGS-level check above already passed)"
-            exit 0
-          fi
-          if cargo rustc -p jammi-numerics --lib -- --print cfg 2>/dev/null | grep -q 'target_feature="fp16"'; then
-            echo "rustc's own cfg set for jammi-numerics carries target_feature=\"fp16\""
-          else
-            echo "::error::cargo rustc -p jammi-numerics --lib -- --print cfg did not report target_feature=\"fp16\" -- the exported RUSTFLAGS is not reaching rustc" >&2
-            exit 1
-          fi
+          cargo rustc -p jammi-numerics --lib -- --print cfg | grep -q 'target_feature="fp16"'
+          echo "rustc's own cfg set for jammi-numerics carries target_feature=\"fp16\""
 
   # ── Single rolled-up gate ──────────────────────────────────────────────────
   # The ONE check a branch-protection ruleset should require, instead of listing

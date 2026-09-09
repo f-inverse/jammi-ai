@@ -630,8 +630,7 @@ pub(crate) fn softmax_apply_training(
     policy: FullyMaskedPolicy,
 ) -> Result<Tensor, EncoderError> {
     let (holds, predicate) = softmax_admission_predicate(scores, mask, scores_divisor);
-    #[cfg(test)]
-    crate::test_support::assert_seam_lock_held("attention_cascade::softmax_apply_training");
+    crate::seam_gate("attention_cascade::softmax_apply_training");
     let outcome = admit(
         admission_mode(),
         "softmax_last_dim_fused",
@@ -825,8 +824,7 @@ pub(crate) fn training_attention_cascade(
     // `admit_cascade` writes and then returns early would bypass a check
     // placed later in this function, so the check runs before the FIRST
     // write, not merely before the LAST one.
-    #[cfg(test)]
-    crate::test_support::assert_seam_lock_held("attention_cascade::training_attention_cascade");
+    crate::seam_gate("attention_cascade::training_attention_cascade");
     // Flash cascade: reported here for EVERY caller (contract shared
     // vocabulary — "never silent"), even one (BERT/DistilBERT) whose own
     // `flash` is always `Declined { CapabilityMiss, "flash_transport_not_wired" }`.

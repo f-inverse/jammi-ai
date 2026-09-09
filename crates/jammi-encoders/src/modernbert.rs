@@ -479,8 +479,7 @@ impl RotaryEmbedding {
 
         let (holds, predicate) =
             rope_admission_predicate(x_dtype, x.device(), &cos, &sin, head_dim);
-        #[cfg(test)]
-        crate::test_support::assert_seam_lock_held("modernbert::RotaryEmbedding::apply_training");
+        crate::seam_gate("modernbert::RotaryEmbedding::apply_training");
         let outcome = admit(
             admission_mode(),
             "rope_fused",
@@ -1101,10 +1100,7 @@ impl ModernBertAttention {
         // `ModernBert::forward_hidden_with_lengths` reaches directly (never
         // through that cascade), so it needs its own gate at entry to its
         // own single write below, not a call into the other function.
-        #[cfg(test)]
-        crate::test_support::assert_seam_lock_held(
-            "modernbert::ModernBertAttention::forward_padded_transport_attention",
-        );
+        crate::seam_gate("modernbert::ModernBertAttention::forward_padded_transport_attention");
         let flash_dispatch = admit_cascade(
             admission_mode(),
             "attention_block_flash",
@@ -1431,8 +1427,7 @@ fn geglu_admission_predicate(wi_out: &Tensor) -> (bool, &'static str) {
 /// (see `forward`'s `match`), so it has no bearing on eval's bit-identity.
 fn geglu_apply_training(wi_out: &Tensor) -> Result<Tensor, EncoderError> {
     let (holds, predicate) = geglu_admission_predicate(wi_out);
-    #[cfg(test)]
-    crate::test_support::assert_seam_lock_held("modernbert::geglu_apply_training");
+    crate::seam_gate("modernbert::geglu_apply_training");
     let outcome = admit(
         admission_mode(),
         "geglu_fused",

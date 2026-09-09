@@ -579,8 +579,7 @@ impl LayerNorm {
             Some(b) => Some(affine_needed_gate(b, "bias")?),
             None => None,
         };
-        #[cfg(test)]
-        crate::test_support::assert_seam_lock_held("layer_norm::forward_fused_or_fallback");
+        crate::seam_gate("layer_norm::forward_fused_or_fallback");
         let outcome = admit(
             admission_mode(),
             "layer_norm_fused",

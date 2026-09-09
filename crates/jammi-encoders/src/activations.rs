@@ -167,8 +167,7 @@ pub(crate) fn gelu_erf(x: &Tensor, training: bool) -> Result<Tensor, EncoderErro
         return Ok(x.gelu_erf()?);
     }
     let (holds, predicate) = gelu_admission_predicate(x);
-    #[cfg(test)]
-    crate::test_support::assert_seam_lock_held("activations::gelu_erf");
+    crate::seam_gate("activations::gelu_erf");
     let outcome = admit(
         admission_mode(),
         "gelu_erf_fused",

@@ -465,7 +465,10 @@ workspace ships every publishable crate at the same
   `admit_cascade()` call actually held one, so an unlocked writer's bump could land inside another
   test's before/after window and a census/delta oracle would misattribute it to the wrong tower.
   `crate::test_support::seam_counter_lock()` replaces both locks with exactly one, and
-  `crate::test_support::assert_seam_lock_held` is a `#[cfg(test)]`-only mechanical gate called from
+  `crate::test_support::assert_seam_lock_held` is a `#[cfg(test)]`-only mechanical gate, reached
+  through the plain call `crate::seam_gate(site)` (a `cfg(test)` / `cfg(not(test))` function pair in
+  the crate root, never a `#[cfg(test)]` attribute on the statement, because the disable-op-keys
+  suite discovers live `admit()` sites by excluding `#[cfg(test)]`-attributed items), called from
   seven guard call sites covering all eight registries — critically, for `attention_cascade::training_attention_cascade`
   (whose one guard call covers THREE of the eight registries across four early-return branches) and
   `modernbert::ModernBertAttention::forward_padded_transport_attention` (a second, separate

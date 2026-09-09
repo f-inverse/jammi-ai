@@ -11,16 +11,14 @@
 
 artifact_dir = "/var/lib/jammi"
 
-[catalog]
-kind = "postgres"
+[catalog.postgres]
 url = "${POSTGRES_URL}"
 pool_size = 16
 # Optional; PgBouncer / RDS-Proxy deployments cap connection lifetime so the
 # pool rotates onto fresh upstream connections instead of pinning one.
 max_lifetime_secs = 1800
 
-[broker]
-kind = "jet_stream"
+[broker.jet_stream]
 url = "nats://${NATS_HOST}:4222"
 # Default retention if a topic does not set `broker_metadata.retention_seconds`.
 retention_seconds = 604800

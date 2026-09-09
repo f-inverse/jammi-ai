@@ -388,16 +388,14 @@ artifact_dir = "{artifact_dir}"
 [gpu]
 device = -1
 
-[catalog]
-kind = "postgres"
+[catalog.postgres]
 url = "{pg_url}"
 pool_size = 8
 
 [storage]
 result_root = "{result_root}"
 
-[storage.cloud]
-kind = "s3"
+[storage.cloud.s3]
 region = "{region}"
 endpoint = "{s3_endpoint}"
 allow_http = {allow_http}

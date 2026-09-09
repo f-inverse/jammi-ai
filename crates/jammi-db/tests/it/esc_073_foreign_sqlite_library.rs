@@ -4,7 +4,7 @@
 //!
 //! Contract under test: a foreign in-process SQLite connection writing to
 //! `catalog.db` while an engine session's pool is live is OUT OF CONTRACT
-//! (`unix-excl`, docs/guide/src/catalog-and-broker.md:91 — the VFS clause
+//! (`unix-excl`, docs/guide/src/catalog-and-broker.md:86 — the VFS clause
 //! enforcing single-process / engine-owned catalog access) —
 //! but out-of-contract input must fail with a typed refusal or an
 //! `SQLITE_BUSY`-class error, never a process-fatal signal. No topology

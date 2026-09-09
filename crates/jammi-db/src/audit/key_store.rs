@@ -51,7 +51,7 @@ impl SigningKeyStore for EnvSigningKeyStore {
 /// container secret mount (`/run/secrets/…`) or a systemd credential hands
 /// a process.
 ///
-/// Selected by `[signing_key] kind = "file"` in the config
+/// Selected by `[signing_key.file]` in the config
 /// ([`crate::config::SigningKeyConfig::File`]). The file holds exactly what
 /// [`EnvSigningKeyStore`] expects in its variable: a 64-character hex string
 /// decoding to 32 bytes. It is read through the config's one file-secret

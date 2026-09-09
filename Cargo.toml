@@ -193,6 +193,11 @@ serde = { version = "1", features = ["derive"] }
 # (0.42201741678374155 -> 0.4220174167837415) and a minimal two-arm repro.
 serde_json = { version = "1", features = ["float_roundtrip"] }
 toml = "0.8"
+# Path-carrying deserialization errors for the jammi-db layered config
+# loader (esc-095): a `deny_unknown_fields` refusal or a type mismatch
+# reports the dotted struct path, which the env-namespace layer turns
+# into the offending `JAMMI_*` variable name(s).
+serde_path_to_error = "0.1"
 uuid = { version = "1", features = ["v4", "v7", "serde"] }
 chrono = { version = "0.4", features = ["serde"] }
 tracing = "0.1"

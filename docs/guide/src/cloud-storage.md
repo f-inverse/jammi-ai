@@ -185,34 +185,30 @@ A deployment usually does not hand-build the `ResultStore` — it sets a `[stora
 [storage]
 result_root = "r2://jammi-results/prod"
 
-[storage.cloud]
-kind = "r2"
+[storage.cloud.r2]
 account_id = "abc123def456"
 # access_key_id / secret_access_key are read from the environment — see below.
 ```
 
 Both fields are optional. With `result_root` unset, result tables stay on local disk under `{artifact_dir}/jammi_db/`. The catalog backend is independent of this setting (configure it under `[catalog]`); `[storage]` governs only result-table and source object storage.
 
-The `kind` selects the driver and the remaining keys mirror the matching `CloudConfig` variant:
+`[storage.cloud]` is an externally tagged section — the provider name (`s3`, `r2`, `gcs`, `azure`) is its own table, and the remaining keys mirror the matching config-side section:
 
 ```toml
 # AWS S3 (region in TOML, secrets from env)
-[storage.cloud]
-kind = "s3"
+[storage.cloud.s3]
 region = "us-east-1"
 ```
 
 ```toml
-# Google Cloud Storage
-[storage.cloud]
-kind = "gcs"
-service_account_path = "/etc/jammi/sa.json"
+# Google Cloud Storage — `service_account` accepts inline JSON or `{ file = "…" }`
+[storage.cloud.gcs]
+service_account = { file = "/etc/jammi/sa.json" }
 ```
 
 ```toml
 # Azure Blob
-[storage.cloud]
-kind = "azure"
+[storage.cloud.azure]
 account_name = "mystorage"
 ```
 

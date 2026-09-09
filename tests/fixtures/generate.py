@@ -219,25 +219,6 @@ def scores():
         w.writerows([(1, "alpha", 0.9), (2, "beta", 0.7), (3, "gamma", 0.5)])
 
 
-def config():
-    with open(os.path.join(OUT, "config_test.toml"), "w") as f:
-        f.write("""artifact_dir = "/tmp/jammi-test-artifacts"
-
-[engine]
-execution_threads = 2
-batch_size = 4096
-
-[gpu]
-device = -1
-
-[inference]
-batch_size = 8
-
-[logging]
-level = "debug"
-""")
-
-
 if __name__ == "__main__":
     patents()
     patents_with_nulls()
@@ -247,5 +228,4 @@ if __name__ == "__main__":
     training_pairs()
     training_triplets()
     scores()
-    config()
     print(f"Fixtures generated in {OUT}")

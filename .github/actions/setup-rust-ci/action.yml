@@ -1,43 +1,61 @@
 name: setup-rust-ci
 description: >
-  Shared per-job Rust CI setup: runs the sccache GHA-cache action and exports
-  SCCACHE_GHA_ENABLED + RUSTFLAGS via $GITHUB_ENV, so a job's cache backend and
-  its linker/warnings posture live in ONE definition instead of being repeated
-  in every workflow. Must run AFTER `actions/checkout@v4` — this is a
-  local-path composite (`./.github/actions/setup-rust-ci`), so the checkout
-  step has to have already materialized it. Bump the sccache-action pin HERE,
+  Shared per-job Rust CI setup: runs the sccache GHA-cache action and
+  optionally exports a `-D warnings` posture via per-target
+  `CARGO_TARGET_<TRIPLE>_RUSTFLAGS` variables, so a job's cache backend and
+  its warnings posture live in ONE definition instead of being repeated in
+  every workflow. This action NEVER exports a bare `RUSTFLAGS`: a bare
+  `RUSTFLAGS` env var REPLACES (never joins with) `.cargo/config.toml`'s
+  per-target `rustflags` array, which is where the mold linker flag and the
+  aarch64-linux ISA-floor `target-feature` flags live -- exporting one would
+  silently drop both. `CARGO_TARGET_<TRIPLE>_RUSTFLAGS`, by contrast, JOINS
+  with the config file's per-target `rustflags` for that SAME triple
+  (verified against a real cargo; this is cargo's own per-target-vs-global
+  precedence, not a per-target-vs-per-target one) -- so this action only
+  ever ADDS `-D warnings` on top of whatever `.cargo/config.toml` already
+  pins for the target actually being built, never replaces it. Must run
+  AFTER `actions/checkout@v4` — this is a local-path composite
+  (`./.github/actions/setup-rust-ci`), so the checkout step has to have
+  already materialized it, AND after the job's own Rust toolchain is on
+  PATH (this action reads `rustc -vV` to name the host's own
+  `CARGO_TARGET_*_RUSTFLAGS` variable). Bump the sccache-action pin HERE,
   not in each consuming workflow.
+  A caller must NEVER export a bare `RUSTFLAGS` of its own, at the job or
+  step level, after this action runs -- that replaces this action's
+  per-target variables (and config.toml) exactly the same way, from
+  cargo's perspective, whichever env var a workflow author happens to
+  spell.
 
 inputs:
-  rustflags:
+  deny-warnings:
     description: >
-      RUSTFLAGS to export for the rest of the job. Defaults to the shared
-      "-D warnings -C link-arg=-fuse-ld=mold" posture the hermetic Rust lanes
-      use. Pass an explicit override for a job whose real config genuinely
-      differs — e.g. "-C link-arg=-fuse-ld=mold" with no `-D warnings` for a
-      lane that must not fail on a warning outside its own crates, or ""
-      to leave RUSTFLAGS unset entirely (falling back to .cargo/config.toml's
-      per-target mold default). Never silently force a job onto a flag set it
-      didn't have -- EXCEPT the aarch64-linux ISA-floor target-feature flags
-      pinned in `.cargo/config.toml`'s `[target.aarch64-unknown-linux-gnu]`
-      stanza (see that file for which flags and why -- not repeated here on
-      purpose, so this description can never drift from the actual pin),
-      which THIS RUNNER'S CALLER cannot drop: on a Linux aarch64 runner,
-      whatever non-empty RUSTFLAGS this action ends up exporting (your override or the
-      default) always carries every `-C target-feature=…` entry
-      `ci/scripts/rust_target_features.sh aarch64-unknown-linux-gnu`
-      extracts from that config stanza appended, because an exported
-      RUSTFLAGS replaces (never merges with) config-file rustflags. Leaving
-      `rustflags` empty skips this export entirely and falls through to
-      `.cargo/config.toml` instead, which pins the same floor for local/
-      config-honoring builds — either path carries it. The floor follows
-      the RUNNER'S OWN arch (`uname -m`), not a `--target` flag: a
-      cross-build TO aarch64-unknown-linux-gnu FROM an amd64 runner is not
-      covered by this action at all -- no such cross-build lane exists in
-      this repo today (`release-binaries.yml`'s linux-aarch64 leg is still
-      deferred), so there is nothing yet for this gap to silently miss.
+      When "true" (the default), exports `CARGO_TARGET_<HOST_TRIPLE>_RUSTFLAGS
+      =-D warnings` for the runner's own host triple (`rustc -vV`'s `host:`
+      line, `-` -> `_`, uppercased -- cargo's own env-var naming rule for a
+      per-target rustflags variable), so the hermetic Rust lanes fail on any
+      warning. Set to "false" for a lane that must not fail on a warning
+      outside its own crates (e.g. a release/packaging build, or a
+      third-party-crate install step) -- this SKIPS the export entirely;
+      it never forces a job onto a flag set it didn't have. Mold (Linux)
+      and the aarch64-linux ISA floor (`+fp16`) are NEVER this input's
+      concern either way -- both live in `.cargo/config.toml`'s own
+      per-target `rustflags` and apply UNCONDITIONALLY, joined with (not
+      replaced by) whatever this action does or does not export.
     required: false
-    default: "-D warnings -C link-arg=-fuse-ld=mold"
+    default: "true"
+  target:
+    description: >
+      An additional target triple to also export
+      `CARGO_TARGET_<TRIPLE>_RUSTFLAGS=-D warnings` for, when `deny-warnings`
+      is "true" -- for a job that cross-compiles to a target other than the
+      runner's own host triple. No caller in this repo cross-compiles today
+      (release-binaries.yml's linux-aarch64 leg builds NATIVELY on an arm
+      runner, and its aarch64-apple-darwin leg builds natively on macOS);
+      this input exists for the first one that does, so that lane does not
+      have to reinvent the host-triple-naming logic this action already
+      carries.
+    required: false
+    default: ""
   no-sccache:
     description: >
       Set to "true" to skip the sccache-action step and the SCCACHE_GHA_ENABLED
@@ -55,51 +73,25 @@ runs:
 
     - shell: bash
       run: |
+        set -euo pipefail
         if [ "${{ inputs.no-sccache }}" != "true" ]; then
           echo "SCCACHE_GHA_ENABLED=true" >> "$GITHUB_ENV"
         fi
-        if [ -n "${{ inputs.rustflags }}" ]; then
-          flags="${{ inputs.rustflags }}"
-          # An exported RUSTFLAGS env var REPLACES (never merges with)
-          # .cargo/config.toml's per-target rustflags -- cargo's own,
-          # documented precedence rule (that file's own comment states it).
-          # Every caller of THIS action that passes a non-empty `rustflags`
-          # would therefore silently drop config.toml's aarch64-linux ISA
-          # floor. This is the ONE place that can see "am I about to export
-          # a RUSTFLAGS that would shadow config.toml, on a runner that
-          # needs the floor" and fix it, instead of trusting every present
-          # and future caller to remember. NO LITERAL FEATURE STRING LIVES
-          # HERE: `rust_target_features.sh` reads the actual flags back out
-          # of `.cargo/config.toml` itself, so this step and the config
-          # file can never drift apart -- appended, never prepended or
-          # exclusive, and only once per feature (idempotent against a
-          # caller who already spelled one out by hand).
-          if [ "$(uname -s)" = "Linux" ] && [ "$(uname -m)" = "aarch64" ]; then
-            # $GITHUB_WORKSPACE (absolute), never a bare relative path: some
-            # callers set a job-level `defaults.run.working-directory`
-            # (e.g. pypi.yml's `packaging/native`), which a composite step
-            # inherits -- a relative `ci/scripts/...` would silently resolve
-            # to the WRONG file there (or nothing at all) instead of failing
-            # loud. The extractor's own exit code is captured explicitly
-            # (never `< <(process substitution)`, which discards it): a
-            # missing script, an unreadable config file, or any grammar
-            # violation `rust_target_features.sh` itself rejects must abort
-            # this step, not silently export a floor-less RUSTFLAGS.
-            if ! features="$(bash "$GITHUB_WORKSPACE/ci/scripts/rust_target_features.sh" aarch64-unknown-linux-gnu)"; then
-              echo "::error::ci/scripts/rust_target_features.sh aarch64-unknown-linux-gnu failed -- refusing to export RUSTFLAGS without the arm64 ISA floor (see its own stderr above)" >&2
-              exit 1
-            fi
-            if [ -z "$features" ]; then
-              echo "::error::ci/scripts/rust_target_features.sh returned no target-feature entries for aarch64-unknown-linux-gnu -- check .cargo/config.toml's [target.aarch64-unknown-linux-gnu] rustflags stanza" >&2
-              exit 1
-            fi
-            while IFS= read -r feature; do
-              [ -n "$feature" ] || continue
-              case "$flags" in
-                *"target-feature=$feature"*) : ;;
-                *) flags="$flags -C target-feature=$feature" ;;
-              esac
-            done <<< "$features"
+
+        if [ "${{ inputs.deny-warnings }}" = "true" ]; then
+          # Cargo's own rule for the per-target env-var spelling of
+          # `target.<triple>.rustflags`: uppercase the triple, `-` -> `_`.
+          # This variable JOINS with (never replaces) whatever
+          # .cargo/config.toml pins for the SAME triple -- unlike a bare
+          # RUSTFLAGS, which would replace it (see this file's own module
+          # doc for the verified distinction).
+          host_triple="$(rustc -vV | sed -n 's/^host: //p')"
+          host_var="CARGO_TARGET_$(echo "$host_triple" | tr 'a-z-' 'A-Z_')_RUSTFLAGS"
+          echo "${host_var}=-D warnings" >> "$GITHUB_ENV"
+
+          target_triple="${{ inputs.target }}"
+          if [ -n "$target_triple" ]; then
+            target_var="CARGO_TARGET_$(echo "$target_triple" | tr 'a-z-' 'A-Z_')_RUSTFLAGS"
+            echo "${target_var}=-D warnings" >> "$GITHUB_ENV"
           fi
-          echo "RUSTFLAGS=$flags" >> "$GITHUB_ENV"
         fi

@@ -3,27 +3,32 @@
 rustc-wrapper = "sccache"
 
 # mold linker on Linux — available in the unified manylinux_2_28 CI/dev image.
-# In CI, RUSTFLAGS env var includes both -D warnings and -C link-arg=-fuse-ld=mold,
-# which overrides these config values. These apply to local dev only.
+# Applies everywhere, local dev AND CI alike: `setup-rust-ci` (the CI-side
+# `-D warnings` exporter) uses `CARGO_TARGET_<TRIPLE>_RUSTFLAGS`, which
+# JOINS with this per-target array rather than replacing it (verified
+# against a real cargo — a bare `RUSTFLAGS` env var would replace it
+# instead, which is exactly why this action never exports one).
 [target.x86_64-unknown-linux-gnu]
 rustflags = ["-C", "link-arg=-fuse-ld=mold"]
 
 [target.aarch64-unknown-linux-gnu]
-# `+fp16` (FEAT_FP16, ARMv8.2-A) is the ISA floor for arm64 Linux artifacts.
-# `gemm` 0.19.0's aarch64 f16 kernel (`gemm-common-0.19.0/src/simd.rs`)
-# hand-emits `fmla .8h` and fails to COMPILE without it
-# ("instruction requires: fullfp16") -- upstream gemm issue #31. Release
-# builds happen to pass because the codegen path that needs the instruction
-# is dead in that profile; `cargo test`/dev builds hit it directly. Apple
-# silicon (`aarch64-apple-darwin`) never needed this because Apple's own
-# baseline already implies FEAT_FP16, which is why this was invisible on
-# every macOS box that has ever built this workspace. Covers Graviton2+,
-# Ampere Altra, and Apple silicon; EXCLUDES Raspberry Pi 4 (ARMv8.0, no
-# FEAT_FP16) and any other sub-8.2 arm64 Linux host. In CI `setup-rust-ci`
-# re-applies this flag itself because an env RUSTFLAGS replaces (never
-# merges with) config rustflags — this stanza is what a local/config-
-# honoring build (no RUSTFLAGS env set) actually gets. THIS ARRAY IS THE
-# SINGLE SOURCE: `setup-rust-ci` reads its `target-feature=` entries back
-# via `ci/scripts/rust_target_features.sh aarch64-unknown-linux-gnu` rather
-# than carrying its own copy of `+fp16` — change it here only.
+# `+fp16` (FEAT_FP16, ARMv8.2-A) is a COMPILE BASELINE for aarch64-linux
+# artifacts of this workspace, not a runtime floor. `gemm` 0.19.0's
+# aarch64 f16 kernels are selected at RUNTIME
+# (`is_aarch64_feature_detected!("fp16")`, `gemm-common-0.19.0/src/
+# simd.rs:2088`, inside a `#[target_feature(enable="neon,fp16")]` caller at
+# `:2070`) — a release build WITHOUT this flag still dispatches to those
+# kernels on hardware that actually has FEAT_FP16; the flag exists ONLY
+# because the SAME code hand-emits `fmla .8h` in a form that fails to
+# COMPILE at opt-level 0 without it ("instruction requires: fullfp16",
+# upstream gemm issue #31) — so `cargo test`/dev builds need it just to
+# build at all. Apple silicon (`aarch64-apple-darwin`) never needed this
+# because Apple's own baseline already implies FEAT_FP16, which is why this
+# was invisible on every macOS box that has ever built this workspace. The
+# trade this baseline makes: Raspberry Pi 4 (ARMv8.0, no FEAT_FP16) and any
+# other sub-8.2 arm64 Linux host are not supported for aarch64-linux
+# artifacts of this workspace; Graviton2+, Ampere Altra, and Apple silicon
+# all qualify. Applies everywhere the same way the mold flag above does —
+# joined by `CARGO_TARGET_AARCH64_UNKNOWN_LINUX_GNU_RUSTFLAGS` in CI, never
+# replaced.
 rustflags = ["-C", "link-arg=-fuse-ld=mold", "-C", "target-feature=+fp16"]

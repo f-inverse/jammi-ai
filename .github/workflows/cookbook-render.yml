@@ -44,7 +44,9 @@ jobs:
           lfs: true
       - uses: ./.github/actions/setup-rust-ci
         with:
-          rustflags: "-C link-arg=-fuse-ld=mold"
+          # mold applies unconditionally from .cargo/config.toml; this lane
+          # never wanted -D warnings (a book-render lane, not the lint gate).
+          deny-warnings: false
 
       # The grpc:// / live-server chapters shell out to jammi-server; build it
       # (`build-server`) alongside the HEAD wheels. `jammi` is the pure-Python

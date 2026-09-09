@@ -82,7 +82,9 @@ jobs:
           fetch-depth: 0
       - uses: ./.github/actions/setup-rust-ci
         with:
-          rustflags: "-C link-arg=-fuse-ld=mold"
+          # mold applies unconditionally from .cargo/config.toml; this lane
+          # never wanted -D warnings (a book-render lane, not the lint gate).
+          deny-warnings: false
 
       # The selector's own house-guard self-test: RED-proves the misclassification
       # shapes named in its docstring (a live-compute call in an otherwise

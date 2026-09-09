@@ -1466,16 +1466,6 @@ jobs:
           # stdin, which only the real workflow run can produce.
           - name: merged index platforms self-test
             cmd: bash ci/scripts/check_merged_index_platforms.sh --self-test
-          # `setup-rust-ci`'s aarch64-linux RUSTFLAGS floor has exactly one
-          # oracle: this. `rust_target_features.sh` is not a `check_*`
-          # script (it extracts a value, asserting no repo invariant on its
-          # own), so `check_ci_guard_wiring.py` does not require this --
-          # wired anyway, because an ISA-floor extractor with no CI-run
-          # self-test is itself the drift this repo cannot silently regrow.
-          # No fixtures, no network: asserts against the REAL
-          # .cargo/config.toml plus five synthetic FAIL-shape fixtures.
-          - name: rust target features self-test
-            cmd: bash ci/scripts/rust_target_features.sh --self-test
           # The verdict CONSUMER's own suite: every esc-084 control (b)
           # degenerate record, the recency/revocation rule, and the wait
           # state machine, driven with a fake fetch/clock — no network.
@@ -2104,20 +2094,30 @@ jobs:
         continue-on-error: ${{ matrix.continue_on_error == 'true' }}
         run: ${{ matrix.cmd }}
 
-  # `setup-rust-ci`'s aarch64-linux `+fp16` floor (`.cargo/config.toml`'s
-  # `[target.aarch64-unknown-linux-gnu]` stanza, re-applied in CI because an
-  # exported RUSTFLAGS replaces config rustflags) had never actually
-  # EXECUTED on a real aarch64-linux runner anywhere in this tree before
-  # this job existed -- every other proof of it was a static check
-  # (`rust_target_features.sh --self-test`) or a throwaway probe already
-  # deleted. A silently-dropped floor fails CLOSED loudly in a dev/test
-  # build (a compile error) but fails OPEN silently in a release build (the
-  # codegen path that needs the instruction is dead there) -- this job
-  # exists so the drop is caught on every PR, on a real runner, not only in
-  # a release artifact nobody was testing for it. BOTH assertions below
-  # always run -- no conditional skip arm: a job whose oracle step can quietly
-  # no-op is exactly the unexecuted-oracle shape this job exists to close, so
-  # it may not itself have one.
+  # `.cargo/config.toml`'s `[target.aarch64-unknown-linux-gnu]` `+fp16`
+  # stanza is a COMPILE BASELINE, not a runtime floor: `gemm` 0.19's
+  # aarch64 f16 kernels are selected at RUNTIME
+  # (`is_aarch64_feature_detected!("fp16")`, `gemm-common-0.19.0/src/
+  # simd.rs:2088`, inside a `#[target_feature(enable="neon,fp16")]` caller
+  # at `:2070`) -- a release build WITHOUT `+fp16` still dispatches to them
+  # at runtime on hardware that has FEAT_FP16; the flag exists ONLY so
+  # `cargo test`/dev (opt-level 0) builds of that same code COMPILE at all.
+  # ARMv8.0 hosts (e.g. Raspberry Pi 4) are the trade this floor makes: not
+  # supported for aarch64-linux artifacts of this workspace.
+  #
+  # This job had never actually EXECUTED on a real aarch64-linux runner
+  # anywhere in this tree before it existed -- every other proof was a
+  # static check or a throwaway probe already deleted. Every assertion
+  # below always runs -- no conditional skip arm: a job whose oracle step
+  # can quietly no-op is exactly the unexecuted-oracle shape this job
+  # exists to close, so it may not itself have one. Two readers of the
+  # SAME stanza, proven separately: `CARGO_TARGET_AARCH64_UNKNOWN_LINUX_
+  # GNU_RUSTFLAGS` (this job's own composite-exported `-D warnings`,
+  # JOINED with config.toml -- what a normal CI job actually gets), and
+  # config.toml ALONE with that variable explicitly unset (what a bare
+  # `cargo build` outside any CI wrapper gets). Both must show the floor;
+  # neither this job nor any CI job may ever export a bare `RUSTFLAGS`
+  # (which would REPLACE, not join, config.toml) -- asserted directly.
   #
   # No `container:` (unlike `check`/`test`, which run inside the CI base
   # image): that image's `:latest` tag only becomes the arm64-carrying
@@ -2134,12 +2134,12 @@ jobs:
   # Cost: cold (first run after this job lands, or after any cache eviction)
   # is a real native-arm64 build of `jammi-numerics` and its dependency set
   # (nalgebra/rand/rand_distr/statrs -- no candle, no gemm, no CUDA) --
-  # measured a couple of minutes end to end including the toolchain install.
-  # sccache-warm (`setup-rust-ci`'s own default GHA cache backend, every run
-  # after that) drops the compile itself to a few seconds; the toolchain
-  # install is the fixed per-run cost either way (GH-hosted runners are
-  # ephemeral, so rustup has no cross-run cache of its own). Never a
-  # full-workspace build.
+  # measured a couple of minutes end to end including the toolchain install,
+  # TWICE over (readers 1 and 2 each compile once). sccache-warm
+  # (`setup-rust-ci`'s own default GHA cache backend, every run after that)
+  # drops each compile to a few seconds; the toolchain install is the fixed
+  # per-run cost either way (GH-hosted runners are ephemeral, so rustup has
+  # no cross-run cache of its own). Never a full-workspace build.
   arm64-floor-oracle:
     name: arm64 floor oracle
     runs-on: ubuntu-24.04-arm
@@ -2166,17 +2166,22 @@ jobs:
 
       - uses: ./.github/actions/setup-rust-ci
 
-      - name: Assert RUSTFLAGS carries the aarch64 fp16 floor
+      - name: Assert this job never exported a bare RUSTFLAGS
+        # The invariant the whole per-target-env-var design rests on: a
+        # bare RUSTFLAGS would REPLACE (never join) config.toml's per-target
+        # rustflags for every target, silently dropping mold AND the fp16
+        # floor alike. setup-rust-ci must never export one, and no later
+        # step in this job may either.
         shell: bash
         run: |
           set -euo pipefail
-          if [[ "$RUSTFLAGS" != *"target-feature=+fp16"* ]]; then
-            echo "::error::RUSTFLAGS does not carry the aarch64 fp16 floor. Full RUSTFLAGS: '$RUSTFLAGS'" >&2
+          if [ -n "${RUSTFLAGS+set}" ]; then
+            echo "::error::RUSTFLAGS is set ('$RUSTFLAGS') -- this job (or setup-rust-ci) exported a bare RUSTFLAGS, which replaces config.toml's per-target rustflags instead of joining it" >&2
             exit 1
           fi
-          echo "RUSTFLAGS carries the floor: $RUSTFLAGS"
+          echo "RUSTFLAGS is correctly unset in this job's environment"
 
-      - name: Assert the floor reaches rustc itself, not only the env
+      - name: Reader 2 -- config.toml joined with this job's own CARGO_TARGET_..._RUSTFLAGS
         # No `2>/dev/null` on the cargo invocation: a genuine compile
         # failure here must be visible in the job log, never folded into
         # "grep found nothing" as if it were merely a missing cfg flag.
@@ -2184,7 +2189,15 @@ jobs:
         run: |
           set -euo pipefail
           cargo rustc -p jammi-numerics --lib -- --print cfg | grep -q 'target_feature="fp16"'
-          echo "rustc's own cfg set for jammi-numerics carries target_feature=\"fp16\""
+          echo "rustc's own cfg set for jammi-numerics carries target_feature=\"fp16\" (config.toml joined with CARGO_TARGET_AARCH64_UNKNOWN_LINUX_GNU_RUSTFLAGS)"
+
+      - name: Reader 1 -- config.toml alone, with this job's own env var explicitly unset
+        shell: bash
+        run: |
+          set -euo pipefail
+          env -u CARGO_TARGET_AARCH64_UNKNOWN_LINUX_GNU_RUSTFLAGS \
+            cargo rustc -p jammi-numerics --lib -- --print cfg | grep -q 'target_feature="fp16"'
+          echo "rustc's own cfg set for jammi-numerics carries target_feature=\"fp16\" (.cargo/config.toml alone, no CI-side env var at all)"
 
   # ── Single rolled-up gate ──────────────────────────────────────────────────
   # The ONE check a branch-protection ruleset should require, instead of listing

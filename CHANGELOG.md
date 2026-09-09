@@ -464,14 +464,16 @@ workspace ships every publishable crate at the same
   requests both platforms; the CUDA base (`jammi-ai-ci-cuda`) is STILL amd64-only (no arm64 leg) —
   its tags are now a single-platform OCI index (same merge-and-verify path, one member) and its
   Dockerfile takes a `BASE_IMAGE` build-arg like the CPU base's. Apple-silicon devcontainers now
-  resolve `:latest` to a native arm64 image instead of an emulated amd64 one. arm64 Linux builds
-  of this workspace require FEAT_FP16 (ARMv8.2-A) — Graviton2+, Ampere Altra, and Apple silicon
-  qualify; Raspberry Pi 4 (ARMv8.0) does not — pinned in `.cargo/config.toml`'s
-  `[target.aarch64-unknown-linux-gnu]` `rustflags` (`-C target-feature=+fp16`) for local builds and
-  appended by `setup-rust-ci` in CI to whatever RUSTFLAGS it exports (a later step-level RUSTFLAGS
-  setter in the same job, e.g. `dep-dag.yml`'s amd64-side `RUSTFLAGS: ""`, replaces it same as any
-  other env write and would need the same re-append on an aarch64 runner), working around `gemm`'s
-  aarch64 f16 kernel otherwise failing to compile outside release profile.
+  resolve `:latest` to a native arm64 image instead of an emulated amd64 one. arm64 Linux builds of
+  this workspace pin a compile BASELINE, `-C target-feature=+fp16` (ARMv8.2-A FEAT_FP16), in
+  `.cargo/config.toml`'s `[target.aarch64-unknown-linux-gnu]` `rustflags` — `gemm`'s aarch64 f16
+  kernels dispatch at RUNTIME regardless of this flag, but the same code fails to COMPILE at
+  opt-level 0 without it. Graviton2+, Ampere Altra, and Apple silicon all qualify; Raspberry Pi 4
+  (ARMv8.0) is not a supported aarch64-linux host for this workspace's artifacts. `setup-rust-ci`
+  never exports a bare `RUSTFLAGS` (which would replace, not join, config-file rustflags for every
+  target) — its `deny-warnings` input exports a per-target `CARGO_TARGET_<TRIPLE>_RUSTFLAGS=
+  -D warnings` instead, which joins with `.cargo/config.toml`'s own per-target `rustflags` (mold and
+  the fp16 floor both apply unconditionally, everywhere, local dev and CI alike).
 
 ### Fixed
 - **`jammi-encoders`' unit-test binary now serializes every writer of EVERY process-wide fusible-seam

@@ -1347,7 +1347,12 @@ async fn cross_family_adapter_refuses_at_load() {
             .await
             .unwrap(),
     );
-    let resolver = ModelResolver::new(catalog, common::test_artifact_store()).unwrap();
+    let resolver = ModelResolver::new(
+        catalog,
+        common::test_artifact_store(),
+        common::test_hub_source(),
+    )
+    .unwrap();
     let mut resolved = resolver
         .resolve(
             &ModelSource::local(common::cookbook_fixture("tiny_bert")),

@@ -4112,6 +4112,7 @@ dependencies = [
  "candle-nn",
  "chrono",
  "datafusion",
+ "directories",
  "flate2",
  "futures",
  "hex",

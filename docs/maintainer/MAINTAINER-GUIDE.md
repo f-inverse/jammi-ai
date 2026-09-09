@@ -2948,16 +2948,16 @@ retry loop re-taking the write lock:
   lineage a terminal producer already committed.
 
 Resolver chain (`crates/jammi-ai/src/model/resolver.rs`, `ModelResolver::resolve`):
-`try_catalog_lookup` (`crates/jammi-ai/src/model/resolver.rs:97`) first (refuses `Retired`;
+`try_catalog_lookup` (`crates/jammi-ai/src/model/resolver.rs:122`) first (refuses `Retired`;
 resolves fine-tuned base recursively + fetches adapter), else `resolve_local`/`resolve_hf_hub`
 (locate config, pick backend, gather weights, discover tokenizer, sum file sizes into
 `estimated_memory`). Before any of that, an id carrying the reserved `jammi:fine-tuned:` prefix
-(`FINE_TUNED_ID_PREFIX`, `crates/jammi-ai/src/model/resolver.rs:118`) whose row's `model_type` is
+(`FINE_TUNED_ID_PREFIX`, `crates/jammi-ai/src/model/resolver.rs:43`) whose row's `model_type` is
 NOT `fine-tuned` is refused by name — the backstop for a catalog a pre-fix build already
 corrupted, since nothing else ever mints that prefix. A record whose `model_type`
 (`crates/jammi-ai/src/model/resolver.rs:159`) is `fine-tuned` and missing `base_model_id`
-(`crates/jammi-ai/src/model/resolver.rs:174`) or missing `artifact_path`
-(`crates/jammi-ai/src/model/resolver.rs:190`) is refused with a typed error naming the model
+(`crates/jammi-ai/src/model/resolver.rs:199`) or missing `artifact_path`
+(`crates/jammi-ai/src/model/resolver.rs:215`) is refused with a typed error naming the model
 id and the missing field, never silently resolved as an ordinary model or served as the
 unadapted base.
 
@@ -2993,10 +2993,10 @@ present key (which stays `StorageError::Io`, never reclassified —
 
 Both reload surfaces match on these two variants explicitly and re-type BOTH into the SAME
 `JammiError::Model`, naming the model id with a distinct message per variant.
-`try_catalog_lookup` (`crates/jammi-ai/src/model/resolver.rs:97`), `ModelResolver`'s
+`try_catalog_lookup` (`crates/jammi-ai/src/model/resolver.rs:122`), `ModelResolver`'s
 fine-tuned reload arm, matches `StorageError::NotPublished`
-(`crates/jammi-ai/src/model/resolver.rs:237`) and `StorageError::Layout`
-(`crates/jammi-ai/src/model/resolver.rs:248`) into `JammiError::Model`, and
+(`crates/jammi-ai/src/model/resolver.rs:262`) and `StorageError::Layout`
+(`crates/jammi-ai/src/model/resolver.rs:273`) into `JammiError::Model`, and
 `load_context_predictor` (`crates/jammi-ai/src/pipeline/context_predictor.rs:1110`) matches
 the identical pair — `StorageError::NotPublished`
 (`crates/jammi-ai/src/pipeline/context_predictor.rs:1314`) and `StorageError::Layout`
@@ -3007,7 +3007,7 @@ well, never its own `JammiError::Inference`. A catalog record that never recorde
 (`crates/jammi-ai/src/model/resolver.rs:263`), and so does the predictor's own
 `JammiError::Model` (`crates/jammi-ai/src/pipeline/context_predictor.rs:1277`). Any OTHER
 storage fault propagates unchanged past both surfaces' own catch-all —
-`Err(e) => return Err(e)` (`crates/jammi-ai/src/model/resolver.rs:258`) and the identical
+`Err(e) => return Err(e)` (`crates/jammi-ai/src/model/resolver.rs:283`) and the identical
 `Err(e) => return Err(e)` (`crates/jammi-ai/src/pipeline/context_predictor.rs:1333`).
 
 Every corrupted-catalog-record refusal EARLIER in this reload path — before `fetch_artifact` is

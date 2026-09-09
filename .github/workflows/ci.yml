@@ -435,6 +435,10 @@ jobs:
 
       - name: Run live tests
         env:
+          # esc-096: live, up through `HubSource`'s token fallback chain
+          # (`[models] hub_token` > `HF_TOKEN` > the cache's own `token`
+          # file) — hf-hub 0.5 itself never reads this variable, so before
+          # `HubSource` existed this line authenticated nothing.
           HF_TOKEN: ${{ secrets.HF_TOKEN }}
         # Same `jammi-python` exclusion as the hermetic lane: the cdylib
         # plus integration test need libpython on the linker path, which

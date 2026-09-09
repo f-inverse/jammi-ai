@@ -56,6 +56,7 @@ use crate::fine_tune::graph_sampler::{
 use crate::fine_tune::spec::{TrainingCommon, TrainingSpec};
 use crate::fine_tune::FineTuneConfig;
 use crate::model::backend::DeviceConfig;
+use crate::model::hub::HubSource;
 use crate::model::ModelSource;
 use crate::session::InferenceSession;
 
@@ -1095,6 +1096,7 @@ impl TrainingWorker {
             hidden_size,
             device_config: session.device_config().clone(),
             cancel: Arc::clone(cancel),
+            hub: session.hub().clone(),
         };
 
         // The blocking trainer runs on the blocking pool so it never starves the
@@ -2250,6 +2252,10 @@ struct RunFineTuneParams {
     hidden_size: usize,
     device_config: DeviceConfig,
     cancel: Arc<AtomicBool>,
+    /// The session's one shared [`crate::model::hub::HubSource`] (esc-096) —
+    /// `build_encoder_adapters`'s HF-fallback arm threads this through
+    /// rather than building its own `hf_hub::api::sync::Api`.
+    hub: HubSource,
 }
 
 /// Run LoRA fine-tuning in a blocking context, checking `cancel` at every epoch
@@ -2280,6 +2286,7 @@ fn run_fine_tune_blocking(
         hidden_size,
         device_config,
         cancel,
+        hub,
     } = params;
 
     let device = crate::model::backend::candle::select_device(&device_config)?;
@@ -2339,15 +2346,16 @@ fn run_fine_tune_blocking(
         );
         crate::fine_tune::target::TrainingTarget::ProjectionHead { head }
     } else {
-        let (mut encoder, adapter_cfg) = build_encoder_adapters(
-            &base_model,
-            &catalog,
-            &artifact_store,
-            &config,
+        let (mut encoder, adapter_cfg) = build_encoder_adapters(BuildEncoderAdaptersParams {
+            base_model_id: &base_model,
+            catalog: &catalog,
+            artifact_store: &artifact_store,
+            config: &config,
             task,
-            &varmap,
-            &device,
-        )?;
+            varmap: &varmap,
+            device: &device,
+            hub: &hub,
+        })?;
         // esc-075: right after `build_encoder_adapters` (which calls
         // `validate_backbone_precision` and materialises the real, dtype-typed
         // encoder) and BEFORE the training loop's first step — the earliest
@@ -3135,15 +3143,37 @@ fn compute_and_persist_acceleration_report(
 /// that check the job trains zero parameters, publishes an empty adapter and
 /// reports success — see the refusal's own comment for why nothing
 /// downstream catches it.
-fn build_encoder_adapters(
-    base_model_id: &str,
-    catalog: &Arc<Catalog>,
-    artifact_store: &Arc<ArtifactStore>,
-    config: &FineTuneConfig,
+/// [`build_encoder_adapters`]'s inputs, grouped so the call takes a single
+/// argument rather than a naturally-wide positional list (the same
+/// params-struct convention `RunFineTuneParams` above uses, preferred over
+/// `#[allow(clippy::too_many_arguments)]`).
+struct BuildEncoderAdaptersParams<'a> {
+    base_model_id: &'a str,
+    catalog: &'a Arc<Catalog>,
+    artifact_store: &'a Arc<ArtifactStore>,
+    config: &'a FineTuneConfig,
     task: ModelTask,
-    varmap: &candle_nn::VarMap,
-    device: &candle_core::Device,
+    varmap: &'a candle_nn::VarMap,
+    device: &'a candle_core::Device,
+    /// The session's one shared [`crate::model::hub::HubSource`] (esc-096) —
+    /// the HF-fallback arm threads this through rather than building its own
+    /// `hf_hub::api::sync::Api`.
+    hub: &'a HubSource,
+}
+
+fn build_encoder_adapters(
+    params: BuildEncoderAdaptersParams,
 ) -> Result<(jammi_encoders::AnyEncoder, jammi_lora::AdapterConfig)> {
+    let BuildEncoderAdaptersParams {
+        base_model_id,
+        catalog,
+        artifact_store,
+        config,
+        task,
+        varmap,
+        device,
+        hub,
+    } = params;
     use std::path::Path;
 
     use crate::model::arch::{self, EncoderFamily};
@@ -3193,9 +3223,11 @@ fn build_encoder_adapters(
         }
         _ => {
             if is_hf {
-                let api = hf_hub::api::sync::Api::new()
-                    .map_err(|e| JammiError::FineTune(format!("HF hub init: {e}")))?;
-                let repo = api.model(catalog_model_id.clone());
+                // Shared `HubSource` (esc-096) — the session's ONE Hub
+                // client, not a fresh `Api::new()` built here (which never
+                // read `HF_TOKEN`, ignored `[models]` entirely, and could
+                // panic outright when `HOME` was unset).
+                let repo = hub.api().model(catalog_model_id.clone());
                 let weights = repo.get("model.safetensors").map_err(|e| {
                     JammiError::FineTune(format!(
                         "Cannot locate '{catalog_model_id}' in HF hub cache: {e}"
@@ -4715,6 +4747,23 @@ mod tests {
         )
     }
 
+    /// A [`HubSource`] rooted at a fresh tempdir, for the `build_encoder_adapters`
+    /// fixtures below whose base model is always locally registered
+    /// (`artifact_path` set) — the `is_hf` HF-fallback arm this threads
+    /// through never runs for them, so no network/mock setup is needed, just
+    /// a value of the right type.
+    fn test_hub_source() -> HubSource {
+        let root = tempfile::tempdir().unwrap().keep();
+        HubSource::from_config(
+            &jammi_db::config::ModelsConfig {
+                hub_cache_dir: Some(root),
+                ..Default::default()
+            },
+            &|_: &str| None,
+        )
+        .unwrap()
+    }
+
     /// Register `model_id` in `catalog` with `artifact_path` pointing at
     /// `dir` (a `file://`-scheme local directory — `StorageUrl::parse`
     /// normalizes a bare absolute path to `file://...`), and return the
@@ -4771,6 +4820,7 @@ mod tests {
         let base_model_id = register_gguf_base_model(&catalog, &dir).await;
         let artifact_store = gguf_test_artifact_store();
 
+        let hub = test_hub_source();
         tokio::task::spawn_blocking(move || {
             let training_config = FineTuneConfig {
                 target_modules,
@@ -4778,15 +4828,16 @@ mod tests {
             };
             let varmap = candle_nn::VarMap::new();
             let device = candle_core::Device::Cpu;
-            build_encoder_adapters(
-                &base_model_id,
-                &catalog,
-                &artifact_store,
-                &training_config,
-                ModelTask::TextEmbedding,
-                &varmap,
-                &device,
-            )
+            build_encoder_adapters(BuildEncoderAdaptersParams {
+                base_model_id: &base_model_id,
+                catalog: &catalog,
+                artifact_store: &artifact_store,
+                config: &training_config,
+                task: ModelTask::TextEmbedding,
+                varmap: &varmap,
+                device: &device,
+                hub: &hub,
+            })
         })
         .await
         .unwrap()
@@ -4886,6 +4937,7 @@ mod tests {
         let catalog = Arc::new(Catalog::open(catalog_dir.path()).await.unwrap());
         let base_model_id = register_gguf_base_model(&catalog, dir).await;
         let artifact_store = gguf_test_artifact_store();
+        let hub = test_hub_source();
 
         tokio::task::spawn_blocking(move || {
             let training_config = FineTuneConfig {
@@ -4895,15 +4947,16 @@ mod tests {
             };
             let varmap = candle_nn::VarMap::new();
             let device = candle_core::Device::Cpu;
-            build_encoder_adapters(
-                &base_model_id,
-                &catalog,
-                &artifact_store,
-                &training_config,
-                ModelTask::TextEmbedding,
-                &varmap,
-                &device,
-            )
+            build_encoder_adapters(BuildEncoderAdaptersParams {
+                base_model_id: &base_model_id,
+                catalog: &catalog,
+                artifact_store: &artifact_store,
+                config: &training_config,
+                task: ModelTask::TextEmbedding,
+                varmap: &varmap,
+                device: &device,
+                hub: &hub,
+            })
         })
         .await
         .unwrap()

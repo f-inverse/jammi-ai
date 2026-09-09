@@ -247,7 +247,12 @@ async fn try_resolve(
 ) -> jammi_db::error::Result<jammi_ai::model::ResolvedModel> {
     let catalog_dir = tempdir().unwrap();
     let catalog = Arc::new(Catalog::open(catalog_dir.path()).await.unwrap());
-    let resolver = ModelResolver::new(catalog, crate::common::test_artifact_store()).unwrap();
+    let resolver = ModelResolver::new(
+        catalog,
+        crate::common::test_artifact_store(),
+        crate::common::test_hub_source(),
+    )
+    .unwrap();
     let source = ModelSource::local(dir);
     resolver
         .resolve(&source, ModelTask::TextEmbedding, backend_hint)
@@ -505,7 +510,12 @@ async fn warm_cache_reload_after_gguf_in_place_mutation_reports_a_fresh_digest()
 
     let catalog_dir = tempdir().unwrap();
     let catalog = Arc::new(Catalog::open(catalog_dir.path()).await.unwrap());
-    let resolver = ModelResolver::new(catalog, crate::common::test_artifact_store()).unwrap();
+    let resolver = ModelResolver::new(
+        catalog,
+        crate::common::test_artifact_store(),
+        crate::common::test_hub_source(),
+    )
+    .unwrap();
     let scheduler = Arc::new(GpuScheduler::new_unlimited());
     let cache = ModelCache::new(resolver, device_config(), scheduler);
     let source = ModelSource::local(&dir);

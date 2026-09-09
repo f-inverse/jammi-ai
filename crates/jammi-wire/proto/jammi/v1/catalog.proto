@@ -741,8 +741,31 @@ message ReconcileReport {
   repeated string pending = 5;
   // Listed keys whose own path does not parse through the tenant/artifact
   // allowlist at all — reported, never deleted at any grace or `apply`.
+  // Populated ONLY by an admin-scoped pass (`reconcile --all`); a
+  // tenant-scoped pass never lists another tenant's (or nobody's) stray
+  // keys.
   repeated string unattributed = 6;
   // Total bytes actually reclaimed (`orphans` deleted this pass; `0` when
   // `!applied`).
   uint64 bytes_reclaimed = 7;
+  // The true count of orphan candidates found this pass, independent of
+  // whether `orphans` was truncated to the report's list cap.
+  uint64 orphan_count = 8;
+  // The true count of pending candidates found this pass, independent of
+  // whether `pending` was truncated.
+  uint64 pending_count = 9;
+  // The true count of unattributed keys found this pass, independent of
+  // whether `unattributed` was truncated.
+  uint64 unattributed_count = 10;
+  // A prefix named by a `models` row whose `manifest.json` is absent — the
+  // row is still live, so this is never reclaimed at any grace or `apply`.
+  // Distinct from `orphans`, whose entries have no referencing row at all.
+  repeated string damaged = 11;
+  // The true count of damaged keys found this pass, independent of whether
+  // `damaged` was truncated.
+  uint64 damaged_count = 12;
+  // `true` iff any of `orphans` / `pending` / `unattributed` / `damaged` was
+  // cut to the report's list cap — the corresponding `*_count` field is
+  // still the true total either way.
+  bool truncated = 13;
 }

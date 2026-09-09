@@ -291,13 +291,17 @@ workspace ships every publishable crate at the same
   `is_live()`, `set_checkpoint`, `append_segment`, `finish`, `abort`, `abandon`) whose background
   heartbeat renews the lease every `heartbeat`; every transition on a building row is a
   compare-and-set through ONE predicate builder (`catalog::result_repo::ResultTableCas { table,
-  tenant_arm: Admin | Strict(tenant), owner: Writer(id) | ExpiredLease(now) }`) — `renew_lease`,
+  tenant_arm: Admin | Strict(tenant), owner: Writer(id) | ExpiredLease }`) — `renew_lease`,
   `set_checkpoint`, `fail_building_table` (the only `building → failed`),
   `promote_result_table_with_manifest`, `claim_expired_building_table`, `insert_index_segment`,
   `delete_index_segments` — and a zero-row match is classified status-first into exactly one of
   the new `JammiError::RowGone` / `TenantMismatch` / `CasFailed{status}` / `LeaseLost`, none of
-  which licenses a deletion (three deletion arms only: a writer's own `abort()` after its one-row
-  CAS, the reaper after its expiry CAS, reconcile). `ResultStore::finalize_with_manifest` is
+  which licenses a deletion (the actual deletion arms: a writer's own `abort()` after its one-row
+  CAS; the reaper's claim/fail CAS, run from BOTH `recover()`'s startup sweep and
+  `reconcile(apply=true)`'s expired-lease pass; and `delete_result_tables_for_source` /
+  `JammiSession::remove_source`'s atomic delete-with-live-guard, whose "CAS" is the atomic
+  `DELETE … WHERE NOT (status='building' AND lease live) … RETURNING` statement itself rather than
+  a per-row compare-and-set). `ResultStore::finalize_with_manifest` is
   replaced by `BuildingTable::finish` = renew → `ResultStore::write_attestation` (digest +
   manifest + sidecar) → promote CAS → `register_table`; a `CasFailed{ready}` there (recovery
   promoted the writer's own bytes after its lease expired) still registers and returns the
@@ -779,12 +783,20 @@ workspace ships every publishable crate at the same
   recognizes only `{seg}/{table}.parquet` and `models/{seg}/{job_id}/…` keys (`seg` a
   `TenantSegment`); an older flat key never round-trips through `TenantSegment::parse`
   and is reported as `unattributed` — permanently, at any `grace` — never deleted, but
-  also never reclaimed or migrated automatically. Existing catalog rows still resolve
-  those keys directly (their stored `parquet_path` is unaffected — only NEW tables and
-  artifacts write under the tenant-prefixed scheme), so this is a `reconcile`-reporting
-  change, not a read-path break; running `jammi reconcile` after upgrading a live
-  deployment will surface every pre-existing table's objects as `unattributed` until each
-  table is re-materialized under the new layout, which is expected and requires no action.
+  also never reclaimed or migrated automatically. Existing `result_tables` catalog rows
+  still resolve their own bytes directly (their stored `parquet_path` is unaffected —
+  only NEW tables write under the tenant-prefixed scheme), so a RESULT TABLE'S read path
+  is not broken by this change. **The derived artifact paths ARE a read-path break,
+  though:** `fetch_resume_checkpoint` / `delete_epoch_checkpoint` (`artifact.rs:329-408`)
+  derive a job's checkpoint prefix from the tenant-prefixed layout unconditionally — there
+  is no fallback to the pre-layout flat path. A fine-tune job already in flight across the
+  upgrade (its checkpoints written under the OLD flat scheme) cannot resume after
+  restarting into the new binary: the resume lookup misses, and its old `models/{job}`
+  bytes are reported by `reconcile` as `unattributed` (greenfield engine — no dual-read
+  compatibility shim is provided; restart the job fresh under the new layout). Running
+  `jammi reconcile` after upgrading a live deployment will surface every pre-existing
+  table's and in-flight job's objects as `unattributed` until each is re-materialized (or
+  restarted) under the new layout.
 - `jammi_ai::inference::{arrow_to_images, arrow_to_audio}` return one decode result per row
   (`Result<Vec<Option<Result<T>>>>`, previously `Result<Vec<Option<T>>>`) and
   `jammi_ai::inference::schema::build_prefix_columns` returns a `Result`: a row that fails to

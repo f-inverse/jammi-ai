@@ -95,7 +95,7 @@ async fn read_vectors_returns_input_rows_byte_for_byte(backend: BackendKind) {
         .catalog()
         .create_result_table(CreateResultTableParams {
             writer_id: None,
-            lease_expires_at: None,
+            lease: None,
             table_name,
             source_id: "src",
             model_id: "model",
@@ -173,7 +173,7 @@ async fn read_vectors_surfaces_typed_schema_error_on_wrong_column_shape(backend:
         .catalog()
         .create_result_table(CreateResultTableParams {
             writer_id: None,
-            lease_expires_at: None,
+            lease: None,
             table_name,
             source_id: "src",
             model_id: "model",

@@ -549,6 +549,12 @@ pub fn reconcile_report_to_proto(report: &ReconcileReport) -> pb::ReconcileRepor
         pending: report.pending.clone(),
         unattributed: report.unattributed.clone(),
         bytes_reclaimed: report.bytes_reclaimed,
+        orphan_count: report.orphan_count,
+        pending_count: report.pending_count,
+        unattributed_count: report.unattributed_count,
+        damaged: report.damaged.clone(),
+        damaged_count: report.damaged_count,
+        truncated: report.truncated,
     }
 }
 
@@ -562,8 +568,14 @@ pub fn reconcile_report_from_proto(report: pb::ReconcileReport) -> ReconcileRepo
         applied: report.applied,
         rows_failed: report.rows_failed,
         orphans: report.orphans,
+        orphan_count: report.orphan_count,
         pending: report.pending,
+        pending_count: report.pending_count,
         unattributed: report.unattributed,
+        unattributed_count: report.unattributed_count,
+        damaged: report.damaged,
+        damaged_count: report.damaged_count,
+        truncated: report.truncated,
         bytes_reclaimed: report.bytes_reclaimed,
     }
 }
@@ -653,7 +665,13 @@ mod tests {
                 "legacy_table.parquet".to_string(),
                 "models/not-a-uuid/manifest.json".to_string(),
             ],
+            unattributed_count: 2,
+            damaged: vec!["models/_global/beef-job/manifest.json".to_string()],
+            damaged_count: 1,
+            truncated: false,
             bytes_reclaimed: 12_345,
+            orphan_count: 2,
+            pending_count: 1,
         };
         let encoded = reconcile_report_to_proto(&report);
         let decoded = reconcile_report_from_proto(encoded);
@@ -661,8 +679,14 @@ mod tests {
         assert_eq!(decoded.applied, report.applied);
         assert_eq!(decoded.rows_failed, report.rows_failed);
         assert_eq!(decoded.orphans, report.orphans);
+        assert_eq!(decoded.orphan_count, report.orphan_count);
         assert_eq!(decoded.pending, report.pending);
+        assert_eq!(decoded.pending_count, report.pending_count);
         assert_eq!(decoded.unattributed, report.unattributed);
+        assert_eq!(decoded.unattributed_count, report.unattributed_count);
+        assert_eq!(decoded.damaged, report.damaged);
+        assert_eq!(decoded.damaged_count, report.damaged_count);
+        assert_eq!(decoded.truncated, report.truncated);
         assert_eq!(decoded.bytes_reclaimed, report.bytes_reclaimed);
     }
 

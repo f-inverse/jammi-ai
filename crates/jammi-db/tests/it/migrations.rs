@@ -1328,9 +1328,9 @@ async fn race_migrate<B: CatalogBackend + 'static>(
     )
 }
 
-/// Regression guard (S8 of the deploy-shapes plan), GREEN before the esc-093
-/// change: two `SqliteBackend` pools in one process race `migrate()` on one
-/// fresh `catalog.db`. SQLite's backend opens every write transaction
+/// Regression guard, GREEN before the esc-093 change: two `SqliteBackend`
+/// pools in one process race `migrate()` on one fresh `catalog.db`. SQLite's
+/// backend opens every write transaction
 /// `BEGIN IMMEDIATE` under a 5 s `busy_timeout`, so the second runner waits for
 /// the first's commit and then reads a complete ledger. Same assertions as the
 /// Postgres arm so the two stay comparable.

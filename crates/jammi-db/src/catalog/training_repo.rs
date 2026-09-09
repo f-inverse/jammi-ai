@@ -170,7 +170,7 @@ const ACCELERATION_REPORT_FINALIZED_WITHOUT_DETERMINATION: &str =
 /// The three-valued comparison is the point: a legacy SQL `NULL`
 /// (pre-migration-026 "unknown") is neither equal nor unequal to the marker, so
 /// `CASE WHEN NULL = '…'` is not true and the `ELSE` arm preserves the `NULL`.
-/// `CASE`/`WHEN`/`ELSE` is core SQL — identical on SQLite and Postgres (B4), so
+/// `CASE`/`WHEN`/`ELSE` is core SQL — identical on SQLite and Postgres, so
 /// no dialect branch is needed the way [`Catalog::claim_next_training_job`]'s
 /// `FOR UPDATE SKIP LOCKED` needs one.
 fn retire_pending_report_clause(pending_param: u8, terminal_param: u8) -> String {

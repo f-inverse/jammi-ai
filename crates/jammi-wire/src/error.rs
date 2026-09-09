@@ -320,10 +320,17 @@ impl From<pb::ChannelCatalogErrorDetail> for ChannelCatalogError {
 }
 
 /// Encode the engine-owned [`BackendError`] into its structured wire detail.
-/// Every variant but `Sqlx` reconstructs field-for-field; `Sqlx` wraps a raw
-/// `sqlx::Error` that cannot cross a process boundary, so it folds to its
-/// faithful `Display` string — the genuine fidelity limit, mirroring how the
-/// top-level detail folds its own foreign `#[from]` variants.
+/// Every variant but `Sqlx` and `Busy` reconstructs field-for-field. `Sqlx`
+/// wraps a raw `sqlx::Error` that cannot cross a process boundary, so it
+/// folds to its faithful `Display` string — the genuine fidelity limit,
+/// mirroring how the top-level detail folds its own foreign `#[from]`
+/// variants. `Busy` is a transaction-internal rollback sentinel
+/// (`jammi_db::catalog::backend::BackendError::Busy`'s own doc comment):
+/// every producer intercepts it before its `Result` ever leaves
+/// the catalog method that returned it (mapping it to a typed
+/// [`jammi_db::error::JammiError::SourceBusy`] or similar), so in practice
+/// it never reaches this encoder — folded to `Execution` for the same
+/// reason `Sqlx` is: exhaustiveness, not an expected wire path.
 impl From<&BackendError> for pb::BackendErrorDetail {
     fn from(err: &BackendError) -> Self {
         use pb::backend_error_detail::Variant;
@@ -354,6 +361,7 @@ impl From<&BackendError> for pb::BackendErrorDetail {
                 got: got.map(|t| t.to_string()).unwrap_or_default(),
             }),
             BackendError::Sqlx(e) => Variant::Sqlx(e.to_string()),
+            BackendError::Busy(m) => Variant::Execution(m.clone()),
         };
         pb::BackendErrorDetail {
             variant: Some(variant),

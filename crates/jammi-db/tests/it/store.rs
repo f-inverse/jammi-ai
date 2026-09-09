@@ -84,7 +84,7 @@ async fn result_table_crud_lifecycle() {
     catalog
         .create_result_table(CreateResultTableParams {
             writer_id: None,
-            lease_expires_at: None,
+            lease: None,
             table_name: "t1",
             source_id: "patents",
             model_id: "sentence-transformers/all-MiniLM-L6-v2",
@@ -119,7 +119,7 @@ async fn result_table_crud_lifecycle() {
     catalog
         .create_result_table(CreateResultTableParams {
             writer_id: None,
-            lease_expires_at: None,
+            lease: None,
             table_name: "t2",
             source_id: "patents",
             model_id: "m",
@@ -165,7 +165,7 @@ async fn find_result_tables_filters_by_source_and_task() {
         catalog
             .create_result_table(CreateResultTableParams {
                 writer_id: None,
-                lease_expires_at: None,
+                lease: None,
                 table_name: name,
                 source_id: source,
                 model_id: "model",
@@ -214,7 +214,7 @@ async fn resolve_embedding_table_latest_explicit_and_missing() {
         catalog
             .create_result_table(CreateResultTableParams {
                 writer_id: None,
-                lease_expires_at: None,
+                lease: None,
                 table_name: name,
                 source_id: "patents",
                 model_id: "model",
@@ -274,7 +274,7 @@ async fn resolve_embedding_table_accepts_every_embedding_variant() {
         catalog
             .create_result_table(CreateResultTableParams {
                 writer_id: None,
-                lease_expires_at: None,
+                lease: None,
                 table_name: &name,
                 source_id: "media",
                 model_id: "model",
@@ -365,7 +365,7 @@ async fn resolve_embedding_table_picks_newest_by_created_at_not_table_name(backe
     catalog
         .create_result_table(CreateResultTableParams {
             writer_id: None,
-            lease_expires_at: None,
+            lease: None,
             table_name: &older_table,
             source_id: &source_id,
             model_id: "zzz_model",
@@ -397,7 +397,7 @@ async fn resolve_embedding_table_picks_newest_by_created_at_not_table_name(backe
     catalog
         .create_result_table(CreateResultTableParams {
             writer_id: None,
-            lease_expires_at: None,
+            lease: None,
             table_name: &newer_table,
             source_id: &source_id,
             model_id: "aaa_model",
@@ -471,7 +471,7 @@ async fn recovery_skips_index_rebuild_for_non_embedding_task() {
     catalog
         .create_result_table(CreateResultTableParams {
             writer_id: None,
-            lease_expires_at: None,
+            lease: None,
             table_name: "classify_recover",
             source_id: "src",
             model_id: "model",
@@ -821,7 +821,7 @@ async fn recovery_marks_missing_parquet_as_failed() {
     catalog
         .create_result_table(CreateResultTableParams {
             writer_id: None,
-            lease_expires_at: None,
+            lease: None,
             table_name: "orphan",
             source_id: "src",
             model_id: "model",
@@ -868,7 +868,7 @@ async fn recovery_deletes_invalid_parquet_and_marks_failed() {
     catalog
         .create_result_table(CreateResultTableParams {
             writer_id: None,
-            lease_expires_at: None,
+            lease: None,
             table_name: "corrupt",
             source_id: "src",
             model_id: "model",
@@ -932,7 +932,7 @@ async fn recovery_promotes_valid_parquet_to_ready() {
     catalog
         .create_result_table(CreateResultTableParams {
             writer_id: None,
-            lease_expires_at: None,
+            lease: None,
             table_name: "stuck",
             source_id: "src",
             model_id: "model",
@@ -1016,7 +1016,7 @@ async fn result_table_none_dimensions_round_trips_as_null(backend: BackendKind) 
     catalog
         .create_result_table(CreateResultTableParams {
             writer_id: None,
-            lease_expires_at: None,
+            lease: None,
             table_name: &table_name,
             source_id: &source_id,
             model_id: "acme/sentiment-classifier",

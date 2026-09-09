@@ -931,8 +931,11 @@ impl PyDatabase {
     /// which the server gates behind a deployment-supplied admin authorizer.
     ///
     /// Returns the report as a dict tagged `{"scope", "applied", "rows_failed",
-    /// "orphans", "pending", "unattributed", "bytes_reclaimed"}` — the same
-    /// shape the remote client's `reconcile` returns.
+    /// "orphans", "orphan_count", "pending", "pending_count", "unattributed",
+    /// "unattributed_count", "damaged", "damaged_count", "truncated",
+    /// "bytes_reclaimed"}` — the same shape the remote client's `reconcile`
+    /// returns. Every `*_count` field is the true total independent of
+    /// whether its list was capped; `truncated` says whether any list was.
     ///
     /// [`ResultStore::reconcile`]: jammi_db::store::ResultStore::reconcile
     /// [`ResultStore::reconcile_all`]: jammi_db::store::ResultStore::reconcile_all

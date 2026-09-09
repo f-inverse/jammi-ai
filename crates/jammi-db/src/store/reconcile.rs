@@ -62,8 +62,15 @@ pub struct ReconcileOptions {
     pub grace: Duration,
 }
 
-/// The result of one reconciliation pass. Every list is sorted; `Serialize`
-/// so a wire/CLI mapping (a later commit) can hand this back verbatim.
+/// A single list inside a [`ReconcileReport`] gets truncated at this many
+/// entries so an unbounded object-store listing can never make the report
+/// itself unbounded; `*_count` on the report always carries the TRUE total,
+/// and `truncated` says whether any list was cut.
+pub const REPORT_LIST_CAP: usize = 10_000;
+
+/// The result of one reconciliation pass. Every list is sorted (and capped at
+/// [`REPORT_LIST_CAP`] entries; `*_count` fields always carry the true
+/// total); `Serialize` so a wire/CLI mapping can hand this back verbatim.
 #[derive(Debug, Clone, Default, Serialize)]
 pub struct ReconcileReport {
     /// `"_global"` (unbound), `"tenant:{uuid}"` (a tenant-scoped
@@ -76,15 +83,58 @@ pub struct ReconcileReport {
     /// object set was found for them).
     pub rows_failed: Vec<String>,
     /// Orphan candidates at least `grace` old — deleted when `applied`.
+    /// Capped at [`REPORT_LIST_CAP`]; see [`Self::orphan_count`].
     pub orphans: Vec<String>,
+    /// The true count of orphan candidates found this pass, independent of
+    /// whether [`Self::orphans`] was truncated.
+    pub orphan_count: u64,
     /// Orphan candidates younger than `grace` — never deleted this pass.
+    /// Capped at [`REPORT_LIST_CAP`]; see [`Self::pending_count`].
     pub pending: Vec<String>,
+    /// The true count of pending candidates found this pass, independent of
+    /// whether [`Self::pending`] was truncated.
+    pub pending_count: u64,
     /// Listed keys whose own path does not parse through the tenant/artifact
     /// allowlist at all — reported, never deleted at any grace or `apply`.
+    /// Reported ONLY by an admin-scoped pass ([`ResultStore::reconcile_all`]);
+    /// a tenant-scoped [`ResultStore::reconcile`] never lists another
+    /// tenant's (or nobody's) stray keys (block #4). Capped at
+    /// [`REPORT_LIST_CAP`]; see [`Self::unattributed_count`].
     pub unattributed: Vec<String>,
+    /// The true count of unattributed keys found this pass, independent of
+    /// whether [`Self::unattributed`] was truncated.
+    pub unattributed_count: u64,
+    /// A prefix named by a `models` row (a trained-model artifact bundle)
+    /// whose `manifest.json` is absent: the row says this bundle exists, but
+    /// its attestation does not — never reclaimed, at any grace or `apply`
+    /// (block #3), because the referencing row is still live. Distinct from
+    /// [`Self::orphans`], whose entries have NO referencing row at all.
+    /// Capped at [`REPORT_LIST_CAP`]; see [`Self::damaged_count`].
+    pub damaged: Vec<String>,
+    /// The true count of damaged keys found this pass, independent of
+    /// whether [`Self::damaged`] was truncated.
+    pub damaged_count: u64,
+    /// `true` iff any of [`Self::orphans`], [`Self::pending`],
+    /// [`Self::unattributed`], [`Self::damaged`] was cut to
+    /// [`REPORT_LIST_CAP`] entries — the corresponding `*_count` field is
+    /// still the true total either way.
+    pub truncated: bool,
     /// Total bytes actually reclaimed (`orphans` deleted this pass; `0` when
     /// `!applied`).
     pub bytes_reclaimed: u64,
+}
+
+/// Push `key` onto `list` unless it is already at [`REPORT_LIST_CAP`], always
+/// incrementing `*count` and setting `*truncated` on the first entry a list
+/// drops — the one helper every capped list in a [`ReconcileReport`] grows
+/// through, so the truncation rule cannot drift between lists.
+fn push_capped(list: &mut Vec<String>, count: &mut u64, truncated: &mut bool, key: String) {
+    *count += 1;
+    if list.len() < REPORT_LIST_CAP {
+        list.push(key);
+    } else {
+        *truncated = true;
+    }
 }
 
 /// One listed object, in the coordinates every comparison in this module
@@ -194,11 +244,12 @@ impl ResultStore {
 
     /// The pass shared by [`Self::reconcile`] and [`Self::reconcile_all`].
     /// `own_seg`, when `Some`, restricts the pass to objects whose own key
-    /// attributes to exactly that tenant segment (plus any key that fails
-    /// the allowlist outright, which is `unattributed` regardless of scope —
-    /// no tenant's scoped pass would ever otherwise report it); `None`
-    /// (only from [`Self::reconcile_all`], already under admin scope) covers
-    /// every tenant's prefix.
+    /// attributes to exactly that tenant segment — a key that fails the
+    /// allowlist outright (`Attribution::Unattributed`) is store-wide by
+    /// definition, so a `Some` (scoped) pass reports NONE of it (block #4):
+    /// only `None` (from [`Self::reconcile_all`], already under admin scope,
+    /// covering every tenant's prefix) ever populates
+    /// [`ReconcileReport::unattributed`].
     async fn reconcile_inner(
         &self,
         scope: String,
@@ -222,25 +273,39 @@ impl ResultStore {
             })
             .collect::<Vec<_>>();
 
+        // Block #1 (esc-094 follow-up): an expired-lease `building` row's
+        // objects are NEVER reaped through this pass's orphan arm below (no
+        // claim, no CAS) — they are reconciled through the SAME recovery arm
+        // `ResultStore::recover` uses: claim first (fencing whatever writer
+        // is or was alive), then promote-or-fail, then delete only after
+        // that CAS. Runs BEFORE this pass reads `ready` / live `building`
+        // rows, so a row this step promotes or fails is read back in its new
+        // terminal state below. Only under `apply` — `apply=false` mutates
+        // nothing (an expired row's objects are still reported, as an
+        // ordinary orphan candidate, exactly as before this fix); the SAME
+        // `list_expired_building_tables` call already respects the binding
+        // in force, so a tenant-scoped `reconcile()` reconciles only its own
+        // tenant's expired rows and the admin-scoped `reconcile_all()` (via
+        // `TenantBinding::admin_scope`) covers every tenant's.
+        if opts.apply {
+            for table in self.catalog.list_expired_building_tables().await? {
+                self.reconcile_expired_building_row(table).await?;
+            }
+        }
+
         // Rows are read AFTER the listing above (ordering rule): the row set
         // this pass checks against is a superset of every listed object's
-        // true referencer at listing time.
+        // true referencer at listing time. `list_live_building_tables`
+        // filters liveness entirely in SQL against the backend's own clock
+        // (never a bound application timestamp — `catalog::lease`'s module
+        // docs), so this pass never trusts a Rust-side string compare that a
+        // Postgres deployment's stored lease text would not even be shaped
+        // for after block #2's fix.
         let mut ready_rows = self
             .catalog
             .list_result_tables_by_status(ResultTableStatus::Ready)
             .await?;
-        let building_rows = self
-            .catalog
-            .list_result_tables_by_status(ResultTableStatus::Building)
-            .await?;
-        let now = crate::catalog::lease::lease_now();
-        let live_building: Vec<ResultTableRecord> = building_rows
-            .into_iter()
-            .filter(|t| match &t.lease_expires_at {
-                Some(exp) => exp.as_str() > now.as_str(),
-                None => false,
-            })
-            .collect();
+        let live_building = self.catalog.list_live_building_tables().await?;
 
         // row -> object: a `ready` row missing a required object is driven
         // to `failed` FIRST (ONLY when `apply`, matching "apply=false
@@ -308,8 +373,14 @@ impl ResultStore {
             .collect();
 
         let mut orphans = Vec::new();
+        let mut orphan_count = 0u64;
         let mut pending = Vec::new();
+        let mut pending_count = 0u64;
         let mut unattributed = Vec::new();
+        let mut unattributed_count = 0u64;
+        let mut damaged = Vec::new();
+        let mut damaged_count = 0u64;
+        let mut truncated = false;
         let mut bytes_reclaimed = 0u64;
         let cutoff =
             Utc::now() - chrono::Duration::from_std(opts.grace).unwrap_or(chrono::Duration::MAX);
@@ -317,8 +388,12 @@ impl ResultStore {
         for obj in &listed {
             let attribution = attribute(&obj.rel);
             let in_scope = match (&own_seg, &attribution) {
-                (None, _) => true,                            // admin pass: every tenant in scope
-                (Some(_), Attribution::Unattributed) => true, // garbage is always in scope
+                (None, _) => true, // admin pass: every tenant in scope
+                // Block #4: a tenant-scoped pass reports NOTHING it cannot
+                // attribute to its OWN prefix — an unattributed (stray) key
+                // is store-wide by definition, so only an admin-scoped pass
+                // (`own_seg = None`, from `reconcile_all`) may ever list it.
+                (Some(_), Attribution::Unattributed) => false,
                 (Some(seg), Attribution::ResultTable) => obj.rel.starts_with(&format!("{seg}/")),
                 (Some(seg), Attribution::Artifact { seg: obj_seg, .. }) => obj_seg == seg,
             };
@@ -328,7 +403,12 @@ impl ResultStore {
 
             match attribution {
                 Attribution::Unattributed => {
-                    unattributed.push(obj.rel.clone());
+                    push_capped(
+                        &mut unattributed,
+                        &mut unattributed_count,
+                        &mut truncated,
+                        obj.rel.clone(),
+                    );
                     continue;
                 }
                 Attribution::ResultTable => {
@@ -353,29 +433,45 @@ impl ResultStore {
                             "{}/{prefix_rel}",
                             self.root.as_str().trim_end_matches('/')
                         ))?;
-                        if let Some(expected) =
-                            self.artifact_store().expected_objects(&prefix_url).await?
-                        {
-                            // `expected` is already a set of driver-relative
-                            // `object_store::path::Path`s (the SAME
-                            // coordinate space `root_path`/`listed` use,
-                            // since the artifact store shares this store's
-                            // registry) — strip the root prefix to land in
-                            // this module's root-relative key space, exactly
-                            // like every listed object above.
-                            let expected_rel: BTreeSet<String> = expected
-                                .iter()
-                                .filter_map(|p| {
-                                    p.to_string().strip_prefix(&root_prefix).map(String::from)
-                                })
-                                .collect();
-                            if expected_rel.contains(&obj.rel) {
+                        match self.artifact_store().expected_objects(&prefix_url).await? {
+                            Some(expected) => {
+                                // `expected` is already a set of
+                                // driver-relative `object_store::path::Path`s
+                                // (the SAME coordinate space
+                                // `root_path`/`listed` use, since the
+                                // artifact store shares this store's
+                                // registry) — strip the root prefix to land
+                                // in this module's root-relative key space,
+                                // exactly like every listed object above.
+                                let expected_rel: BTreeSet<String> = expected
+                                    .iter()
+                                    .filter_map(|p| {
+                                        p.to_string().strip_prefix(&root_prefix).map(String::from)
+                                    })
+                                    .collect();
+                                if expected_rel.contains(&obj.rel) {
+                                    continue;
+                                }
+                                // A valid manifest exists but does not name
+                                // this key: outside block #3's scope, falls
+                                // through to the orphan-candidate arm below
+                                // (age-gated, never immediate).
+                            }
+                            None => {
+                                // Block #3: a `models` row names this prefix
+                                // but its `manifest.json` is absent — the row
+                                // is still live, so this is NEVER reclaimable
+                                // through the orphan arm at any grace or
+                                // `apply`. Reported as `damaged`, not orphan.
+                                push_capped(
+                                    &mut damaged,
+                                    &mut damaged_count,
+                                    &mut truncated,
+                                    obj.rel.clone(),
+                                );
                                 continue;
                             }
                         }
-                        // No manifest, or this key isn't among the manifest's
-                        // own entries: falls through to the orphan-candidate
-                        // arm below (age-gated, never immediate).
                     }
                 }
             }
@@ -386,14 +482,14 @@ impl ResultStore {
                 if opts.apply {
                     if let Err(e) = self.delete_relative(&key).await {
                         tracing::warn!(key, error = %e, "reconcile: orphan delete failed; left for the next pass");
-                        pending.push(key);
+                        push_capped(&mut pending, &mut pending_count, &mut truncated, key);
                         continue;
                     }
                     bytes_reclaimed += obj.size;
                 }
-                orphans.push(key);
+                push_capped(&mut orphans, &mut orphan_count, &mut truncated, key);
             } else {
-                pending.push(key);
+                push_capped(&mut pending, &mut pending_count, &mut truncated, key);
             }
         }
 
@@ -401,14 +497,21 @@ impl ResultStore {
         orphans.sort();
         pending.sort();
         unattributed.sort();
+        damaged.sort();
 
         Ok(ReconcileReport {
             scope,
             applied: opts.apply,
             rows_failed,
             orphans,
+            orphan_count,
             pending,
+            pending_count,
             unattributed,
+            unattributed_count,
+            damaged,
+            damaged_count,
+            truncated,
             bytes_reclaimed,
         })
     }
@@ -464,24 +567,32 @@ impl ResultStore {
     /// sidecar (referenced-if-present, regardless of `definition_hash` — more
     /// generous than [`Self::required_row_objects_present`] on purpose, since
     /// this side must never delete a legitimately-present object), and every
-    /// [`sidecar_extensions`] sibling of every CURRENT `index_segments` row
+    /// sidecar sibling of every CURRENT `index_segments` row — enumerated
+    /// over the FULL [`SidecarKind`] superset (`Ann` AND `Lexical`), not one
+    /// kind (block #7), since a segment's actual kind is not itself recorded
+    /// on the `index_segments` row and this side must never under-protect. A
+    /// directory-shaped sibling (`Lexical`'s `.tantivy`) is referenced by
+    /// PREFIX — every key under `{base}.tantivy/…`, not only a key that
+    /// equals `{base}.tantivy` exactly (A3) — while a plain-file sibling is
+    /// still matched exactly.
     /// (A21: segments are referenced by ROWS, not by filename pattern — a
     /// `{base}__segN.*` object with no row is an orphan candidate, e.g. the
-    /// late-landing sidecar of a purge a recoverer's claim already ran).
+    /// late-landing sidecar of a purge a recoverer's claim already ran.)
     async fn referenced_result_keys(
         &self,
         ready: &[ResultTableRecord],
         live_building: &[ResultTableRecord],
-    ) -> Result<BTreeSet<String>> {
-        let mut set = BTreeSet::new();
+    ) -> Result<ReferencedKeys> {
+        let mut exact = BTreeSet::new();
+        let mut dir_prefixes = BTreeSet::new();
         for table in ready.iter().chain(live_building.iter()) {
             let parquet_url = StorageUrl::parse(&table.parquet_path)?;
             if let Some(rel) = relative_to(&self.root, &parquet_url) {
-                set.insert(rel);
+                exact.insert(rel);
             }
             if let Ok(sidecar_url) = layout::sidecar_url(&parquet_url, "materialization.json") {
                 if let Some(rel) = relative_to(&self.root, &sidecar_url) {
-                    set.insert(rel);
+                    exact.insert(rel);
                 }
             }
             for seg in self.catalog.list_index_segments(&table.table_name).await? {
@@ -489,19 +600,60 @@ impl ResultStore {
                     continue;
                 };
                 if let Some(rel) = relative_to(&self.root, &seg_url) {
-                    set.insert(rel);
+                    exact.insert(rel);
                 }
-                for ext in sidecar_extensions(SidecarKind::Ann) {
-                    if let Ok(sib) = layout::sidecar_url(&seg_url, ext) {
-                        if let Some(rel) = relative_to(&self.root, &sib) {
-                            set.insert(rel);
+                for kind in [SidecarKind::Ann, SidecarKind::Lexical] {
+                    for ext in sidecar_extensions(kind) {
+                        let Ok(sib) = layout::sidecar_url(&seg_url, ext) else {
+                            continue;
+                        };
+                        let Some(rel) = relative_to(&self.root, &sib) else {
+                            continue;
+                        };
+                        // A directory-shaped sibling (only `tantivy` today)
+                        // is referenced by every key under it, not only a
+                        // key equal to the base name.
+                        if is_directory_sidecar_extension(ext) {
+                            dir_prefixes.insert(format!("{rel}/"));
+                        } else {
+                            exact.insert(rel);
                         }
                     }
                 }
             }
         }
-        Ok(set)
+        Ok(ReferencedKeys {
+            exact,
+            dir_prefixes,
+        })
     }
+}
+
+/// The referenced-object set [`ResultStore::referenced_result_keys`] builds:
+/// exact keys, plus directory-sibling prefixes (each carrying a trailing
+/// `/`) a listed object is referenced through if its own key starts with one.
+struct ReferencedKeys {
+    exact: BTreeSet<String>,
+    dir_prefixes: BTreeSet<String>,
+}
+
+impl ReferencedKeys {
+    fn contains(&self, rel: &str) -> bool {
+        self.exact.contains(rel)
+            || self
+                .dir_prefixes
+                .iter()
+                .any(|p| rel.starts_with(p.as_str()))
+    }
+}
+
+/// `true` iff `ext` names a sidecar sibling that is a DIRECTORY on disk
+/// (`SidecarKind::Lexical`'s `.tantivy` today — sidecar_layout.rs's own
+/// doc comment names it the one directory-shaped sibling) rather than a
+/// single file, so callers matching a listed object against it must match
+/// by PREFIX (`{base}.{ext}/…`), never by exact equality alone (A3).
+fn is_directory_sidecar_extension(ext: &str) -> bool {
+    ext == "tantivy"
 }
 
 #[cfg(test)]

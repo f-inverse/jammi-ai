@@ -20,7 +20,7 @@ use std::sync::Arc;
 use datafusion::prelude::SessionContext;
 use tracing::warn;
 
-use crate::catalog::lease::{lease_deadline, LeaseIntervals};
+use crate::catalog::lease::LeaseIntervals;
 use crate::catalog::result_repo::{ResultTableCas, ResultTableRecord};
 use crate::catalog::status::ResultTableStatus;
 use crate::config::StoragePrecision;
@@ -79,8 +79,9 @@ impl BuildingTable {
     /// the row's INSERT, and by recovery right after
     /// [`crate::catalog::Catalog::claim_expired_building_table`] stamped the
     /// recoverer's id on an expired-lease row. The lease the caller stamped
-    /// must have been `lease_deadline(intervals.lease())`, the same window the
-    /// heartbeat renews to.
+    /// must have been `intervals.lease()` FROM NOW (the catalog backend's own
+    /// clock on Postgres — [`crate::catalog::lease::lease_deadline_expr`]),
+    /// the same window the heartbeat renews to.
     pub(crate) fn adopt(
         store: ResultStore,
         table_name: String,
@@ -224,8 +225,10 @@ impl BuildingTable {
         }
         let cas = self.cas();
         let catalog = Arc::clone(self.store.catalog());
-        let until = lease_deadline(self.store.lease_intervals().lease());
-        if let Err(e) = catalog.renew_lease(&cas, &until).await {
+        if let Err(e) = catalog
+            .renew_lease(&cas, self.store.lease_intervals().lease())
+            .await
+        {
             self.done.store(true, Ordering::SeqCst);
             return Err(e);
         }
@@ -310,15 +313,17 @@ impl BuildingTable {
     /// so a recovery sweep run immediately afterwards treats the row as a dead
     /// writer's. Runs the lease rewrite as this writer's own CAS, so it fails
     /// loudly (rather than silently leaving a live lease) if the row is not
-    /// this writer's `building` row.
+    /// this writer's `building` row. The rewrite uses the catalog backend's
+    /// OWN clock ([`crate::catalog::Catalog::expire_lease_for_test`]), never
+    /// this process's — so the row is expired against exactly the clock
+    /// [`crate::catalog::lease::lease_expired_clause`] later compares it
+    /// with.
     #[cfg(feature = "test-hooks")]
     pub async fn into_abandoned(self) -> Result<()> {
         let cas = self.cas();
         let catalog = Arc::clone(self.store.catalog());
         self.abandon();
-        catalog
-            .renew_lease(&cas, "1970-01-01T00:00:00.000000Z")
-            .await
+        catalog.expire_lease_for_test(&cas).await
     }
 
     fn stop_heartbeat(&mut self) {
@@ -377,8 +382,7 @@ fn spawn_heartbeat(
                 return;
             }
             let cas = ResultTableCas::writer(&table_name, &writer_id, tenant);
-            let until = lease_deadline(intervals.lease());
-            match store.catalog().renew_lease(&cas, &until).await {
+            match store.catalog().renew_lease(&cas, intervals.lease()).await {
                 Ok(()) => {}
                 Err(
                     JammiError::RowGone { .. }

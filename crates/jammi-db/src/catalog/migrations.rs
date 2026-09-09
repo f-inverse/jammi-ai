@@ -110,12 +110,11 @@ CREATE TABLE IF NOT EXISTS applied_migrations (
 /// fresh replicas booting together both saw an empty ledger and the loser
 /// failed with SQLSTATE `42P07` (`relation "..." already exists`) or `23505`
 /// on the ledger primary key -- escape-ledger row
-/// `esc-093-postgres-migrations-race-without-cross-process-lock` (issue #479;
-/// the lead's contract names it esc-092, an id this branch already spends on
-/// the seam-counter row). `SELECT pg_advisory_xact_lock($1)` with this key is
-/// the runner's first statement on Postgres, so the ledger read happens after
-/// the lock by construction and the loser re-reads a complete ledger once the
-/// winner commits.
+/// `esc-093-postgres-migrations-race-without-cross-process-lock` (issue #479).
+/// `SELECT pg_advisory_xact_lock($1)` with this key is the runner's first
+/// statement on Postgres, so the ledger read happens after the lock by
+/// construction and the loser re-reads a complete ledger once the winner
+/// commits.
 ///
 /// Advisory locks are scoped to one database, so the key needs no database-name
 /// hashing; the `_xact_` flavour is released on commit **or** rollback, which

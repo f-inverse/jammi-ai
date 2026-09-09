@@ -1,7 +1,8 @@
 use std::str::FromStr;
+use std::time::Duration;
 
-use crate::catalog::backend::{BackendError, Row, SqlValue, Transaction, TxOptions};
-use crate::catalog::lease::lease_expired_clause;
+use crate::catalog::backend::{BackendError, BackendKind, Row, SqlValue, Transaction, TxOptions};
+use crate::catalog::lease::{lease_deadline_expr, lease_expired_clause};
 use crate::catalog::status::ResultTableStatus;
 use crate::catalog::Catalog;
 use crate::config::StoragePrecision;
@@ -98,10 +99,12 @@ pub struct CreateResultTableParams<'a> {
     /// with no writer (a test fixture, or a caller registering a table it does
     /// not build): recovery reads the absent lease as "no live writer".
     pub writer_id: Option<&'a str>,
-    /// The writer's initial lease deadline
-    /// ([`crate::catalog::lease::lease_deadline`]), renewed by its heartbeat.
-    /// `None` when `writer_id` is `None`.
-    pub lease_expires_at: Option<String>,
+    /// The writer's initial lease WINDOW (renewed by its heartbeat to the
+    /// same window every time) — a duration, not a timestamp: the deadline
+    /// this stamps is `now() + lease` evaluated by the catalog backend's OWN
+    /// clock on Postgres ([`lease_deadline_expr`]), never this process's
+    /// clock. `None` when `writer_id` is `None`.
+    pub lease: Option<Duration>,
 }
 
 /// A row from the `result_tables` catalog table.
@@ -250,10 +253,15 @@ pub enum Owner {
     /// The row's `writer_id` must equal this writer's id — the live writer's
     /// own transitions (renew, checkpoint, segment insert, promote, fail).
     Writer(String),
-    /// The row's lease must be absent or expired at this engine-clock instant
-    /// ([`crate::catalog::lease::lease_now`]) — recovery's arms, which may only
-    /// touch a row whose writer is dead.
-    ExpiredLease(String),
+    /// The row's lease must be absent or expired AT THE INSTANT THE
+    /// STATEMENT RUNS — recovery's arms, which may only touch a row whose
+    /// writer is dead. Carries no timestamp: the predicate
+    /// ([`lease_expired_clause`]) compares against the catalog backend's OWN
+    /// clock (`now()` on Postgres), never a value this process computed
+    /// ahead of time and bound in — that value could go stale by the time
+    /// the CAS actually runs, and on Postgres it would be this process's
+    /// clock rather than the database's regardless of freshness.
+    ExpiredLease,
 }
 
 /// The one predicate builder every transition on a `building` result table
@@ -282,30 +290,38 @@ impl ResultTableCas {
         }
     }
 
-    /// Recovery's CAS on a row whose lease is absent or expired at `now`,
-    /// under the binding in force (admin inside [`crate::store::ResultStore::recover`]).
-    pub fn expired(table: &str, now: &str, tenant: Option<TenantId>) -> Self {
+    /// Recovery's CAS on a row whose lease is absent or expired AT THE
+    /// INSTANT THE STATEMENT RUNS (the catalog backend's own clock — see
+    /// [`Owner::ExpiredLease`]), under the binding in force (admin inside
+    /// [`crate::store::ResultStore::recover`]).
+    pub fn expired(table: &str, tenant: Option<TenantId>) -> Self {
         Self {
             table: table.to_string(),
             tenant_arm: TenantArm::in_force(tenant),
-            owner: Owner::ExpiredLease(now.to_string()),
+            owner: Owner::ExpiredLease,
         }
     }
 
     /// Render the owner + tenant arms (no table / status arm) against column
-    /// prefix `col` (`""` or `"r."`), appending binds to `params`.
-    fn render_owner_and_tenant(&self, col: &str, params: &mut Vec<SqlValue<'static>>) -> String {
+    /// prefix `col` (`""` or `"r."`), appending binds to `params`. `kind`
+    /// selects the backend-appropriate lease-expiry SQL for
+    /// [`Owner::ExpiredLease`] — see `catalog::lease`'s module docs.
+    fn render_owner_and_tenant(
+        &self,
+        col: &str,
+        kind: BackendKind,
+        params: &mut Vec<SqlValue<'static>>,
+    ) -> String {
         let mut sql = String::new();
         match &self.owner {
             Owner::Writer(w) => {
                 params.push(SqlValue::TextOwned(w.clone()));
                 sql.push_str(&format!("{col}writer_id = ${}", params.len()));
             }
-            Owner::ExpiredLease(now) => {
-                params.push(SqlValue::TextOwned(now.clone()));
+            Owner::ExpiredLease => {
                 sql.push_str(&lease_expired_clause(
                     &format!("{col}lease_expires_at"),
-                    params.len(),
+                    kind,
                 ));
             }
         }
@@ -324,13 +340,13 @@ impl ResultTableCas {
 
     /// Render the full building-row predicate, appending its binds to
     /// `params` (whose existing entries are the statement's earlier binds).
-    fn render(&self, params: &mut Vec<SqlValue<'static>>) -> String {
+    fn render(&self, kind: BackendKind, params: &mut Vec<SqlValue<'static>>) -> String {
         params.push(SqlValue::TextOwned(self.table.clone()));
         let mut sql = format!(
             "table_name = ${} AND status = 'building' AND ",
             params.len()
         );
-        sql.push_str(&self.render_owner_and_tenant("", params));
+        sql.push_str(&self.render_owner_and_tenant("", kind, params));
         sql
     }
 
@@ -339,13 +355,17 @@ impl ResultTableCas {
     /// a purge follows a transition that already left `building` (the writer's
     /// own `failed`, or recovery's claim) and `writer_id` survives that
     /// transition as history.
-    pub(crate) fn render_owner_exists(&self, params: &mut Vec<SqlValue<'static>>) -> String {
+    pub(crate) fn render_owner_exists(
+        &self,
+        kind: BackendKind,
+        params: &mut Vec<SqlValue<'static>>,
+    ) -> String {
         params.push(SqlValue::TextOwned(self.table.clone()));
         let mut sql = format!(
             "EXISTS (SELECT 1 FROM result_tables r WHERE r.table_name = ${} AND ",
             params.len()
         );
-        sql.push_str(&self.render_owner_and_tenant("r.", params));
+        sql.push_str(&self.render_owner_and_tenant("r.", kind, params));
         sql.push(')');
         sql
     }
@@ -404,7 +424,8 @@ impl Catalog {
         let oversample = p.oversample;
         let created_at = p.created_at;
         let writer_id = p.writer_id.map(str::to_string);
-        let lease_expires_at = p.lease_expires_at;
+        let lease = p.lease;
+        let kind_backend = self.backend().backend_kind();
         let tenant = self.current_tenant();
 
         self.backend()
@@ -412,31 +433,44 @@ impl Catalog {
                 Box::pin(async move {
                     tx.set_tenant(tenant);
                     tx.assert_tenant_matches(tenant, "result_tables")?;
+                    let mut params: Vec<SqlValue<'static>> = vec![
+                        SqlValue::TextOwned(table_name),
+                        SqlValue::TextOwned(source_id),
+                        SqlValue::TextOwned(model_id),
+                        SqlValue::Text(task),
+                        SqlValue::Text(kind),
+                        SqlValue::from(derived_from),
+                        SqlValue::TextOwned(parquet_path),
+                        SqlValue::from(dimensions.map(|d| d as i64)),
+                        SqlValue::from(key_column),
+                        SqlValue::from(text_columns),
+                        SqlValue::from(tenant.map(|t| t.to_string())),
+                        SqlValue::TextOwned(storage_precision),
+                        SqlValue::from(oversample as i64),
+                        SqlValue::TextOwned(created_at),
+                        SqlValue::from(writer_id),
+                    ];
+                    // The lease deadline is computed by the DB clock on
+                    // Postgres (never this process's clock — see
+                    // `catalog::lease`'s module docs); `None` binds a typed
+                    // NULL rather than embedding an expression at all.
+                    let lease_expr = match lease {
+                        Some(window) => lease_deadline_expr(kind_backend, window, &mut params),
+                        None => {
+                            params.push(SqlValue::Null(crate::catalog::backend::SqlNullType::Text));
+                            format!("${}", params.len())
+                        }
+                    };
                     tx.execute(
-                        "INSERT INTO result_tables (table_name, source_id, model_id, task, kind, \
-                         derived_from, parquet_path, dimensions, key_column, \
-                         text_columns, tenant_id, storage_precision, oversample, created_at, \
-                         writer_id, lease_expires_at) \
-                         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, \
-                         $15, $16)",
-                        &[
-                            SqlValue::TextOwned(table_name),
-                            SqlValue::TextOwned(source_id),
-                            SqlValue::TextOwned(model_id),
-                            SqlValue::Text(task),
-                            SqlValue::Text(kind),
-                            SqlValue::from(derived_from),
-                            SqlValue::TextOwned(parquet_path),
-                            SqlValue::from(dimensions.map(|d| d as i64)),
-                            SqlValue::from(key_column),
-                            SqlValue::from(text_columns),
-                            SqlValue::from(tenant.map(|t| t.to_string())),
-                            SqlValue::TextOwned(storage_precision),
-                            SqlValue::from(oversample as i64),
-                            SqlValue::TextOwned(created_at),
-                            SqlValue::from(writer_id),
-                            SqlValue::from(lease_expires_at),
-                        ],
+                        &format!(
+                            "INSERT INTO result_tables (table_name, source_id, model_id, task, kind, \
+                             derived_from, parquet_path, dimensions, key_column, \
+                             text_columns, tenant_id, storage_precision, oversample, created_at, \
+                             writer_id, lease_expires_at) \
+                             VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, \
+                             $15, {lease_expr})"
+                        ),
+                        &params,
                     )
                     .await?;
                     Ok(())
@@ -615,6 +649,7 @@ impl Catalog {
         let cas_in_tx = cas.clone();
         let set_clause = set_clause.to_string();
         let tenant = self.current_tenant();
+        let kind = self.backend().backend_kind();
         let outcome = self
             .backend()
             .transaction(TxOptions::default(), |tx| {
@@ -622,7 +657,7 @@ impl Catalog {
                     let cas = cas_in_tx;
                     tx.set_tenant(tenant);
                     let mut params = set_params;
-                    let predicate = cas.render(&mut params);
+                    let predicate = cas.render(kind, &mut params);
                     let sql = format!("UPDATE result_tables SET {set_clause} WHERE {predicate}");
                     let affected = tx.execute(&sql, &params).await?;
                     if affected == 1 {
@@ -638,15 +673,17 @@ impl Catalog {
         }
     }
 
-    /// Renew the lease on the building row `cas` names to `until`
-    /// ([`crate::catalog::lease::lease_deadline`]). The writer's heartbeat.
-    pub async fn renew_lease(&self, cas: &ResultTableCas, until: &str) -> Result<()> {
-        self.building_row_cas(
-            cas,
-            "lease_expires_at = $1",
-            vec![SqlValue::TextOwned(until.to_string())],
-        )
-        .await
+    /// Renew the lease on the building row `cas` names to `lease` from NOW —
+    /// the catalog backend's OWN clock on Postgres, never this process's
+    /// (`catalog::lease`'s module docs); `lease` is the WINDOW, always the
+    /// deployment's configured duration, not a computed deadline. The
+    /// writer's heartbeat.
+    pub async fn renew_lease(&self, cas: &ResultTableCas, lease: Duration) -> Result<()> {
+        let kind = self.backend().backend_kind();
+        let mut params = Vec::new();
+        let expr = lease_deadline_expr(kind, lease, &mut params);
+        self.building_row_cas(cas, &format!("lease_expires_at = {expr}"), params)
+            .await
     }
 
     /// Persist a checkpoint (batch number) on the building row `cas` names.
@@ -674,9 +711,10 @@ impl Catalog {
 
     /// Recovery's claim on an expired-lease building row: a compare-and-set
     /// (`cas.owner` must be [`Owner::ExpiredLease`]) that stamps
-    /// `writer_id = new_writer_id` and a fresh lease `until`, so the recoverer
-    /// becomes the owner BEFORE it rebuilds, promotes, or deletes anything. A
-    /// returning writer's next heartbeat then misses its own CAS and reports
+    /// `writer_id = new_writer_id` and a fresh lease `lease` FROM THE
+    /// CATALOG'S OWN CLOCK on Postgres, so the recoverer becomes the owner
+    /// BEFORE it rebuilds, promotes, or deletes anything. A returning
+    /// writer's next heartbeat then misses its own CAS and reports
     /// [`JammiError::LeaseLost`]. Returns `Ok(false)` — never an error — when
     /// the claim matched zero rows (another recoverer or the writer got there
     /// first): the loser skips the row.
@@ -684,16 +722,16 @@ impl Catalog {
         &self,
         cas: &ResultTableCas,
         new_writer_id: &str,
-        until: &str,
+        lease: Duration,
     ) -> Result<bool> {
+        let kind = self.backend().backend_kind();
+        let mut params = vec![SqlValue::TextOwned(new_writer_id.to_string())];
+        let expr = lease_deadline_expr(kind, lease, &mut params);
         match self
             .building_row_cas(
                 cas,
-                "writer_id = $1, lease_expires_at = $2",
-                vec![
-                    SqlValue::TextOwned(new_writer_id.to_string()),
-                    SqlValue::TextOwned(until.to_string()),
-                ],
+                &format!("writer_id = $1, lease_expires_at = {expr}"),
+                params,
             )
             .await
         {
@@ -706,6 +744,24 @@ impl Catalog {
             ) => Ok(false),
             Err(e) => Err(e),
         }
+    }
+
+    /// Test-only: force the building row `cas` names into an already-expired
+    /// lease, using the catalog backend's OWN clock — a value strictly in the
+    /// past by the time any later statement reads `now()` — so a recovery
+    /// sweep run immediately afterwards treats the row as a dead writer's.
+    /// Runs as `cas`'s own CAS (typically [`Owner::Writer`]), so it fails
+    /// loudly rather than silently leaving a live lease if the row is not the
+    /// caller's own `building` row.
+    #[cfg(feature = "test-hooks")]
+    pub async fn expire_lease_for_test(&self, cas: &ResultTableCas) -> Result<()> {
+        let kind = self.backend().backend_kind();
+        let expr = match kind {
+            BackendKind::Postgres => "(now() - interval '1 second')::text".to_string(),
+            BackendKind::Sqlite => "datetime('now', '-1 second')".to_string(),
+        };
+        self.building_row_cas(cas, &format!("lease_expires_at = {expr}"), Vec::new())
+            .await
     }
 
     /// Flip the building row `cas` names `building -> ready` **and** persist
@@ -739,6 +795,7 @@ impl Catalog {
         let definition_hash = definition_hash.to_string();
         let input_anchors_json = input_anchors_json.to_string();
         let tenant = self.current_tenant();
+        let kind = self.backend().backend_kind();
 
         let outcome = self
             .backend()
@@ -752,7 +809,7 @@ impl Catalog {
                         SqlValue::TextOwned(definition_hash),
                         SqlValue::TextOwned(input_anchors_json),
                     ];
-                    let predicate = cas.render(&mut params);
+                    let predicate = cas.render(kind, &mut params);
                     let sql = format!(
                         "UPDATE result_tables SET status = 'ready', row_count = $1, \
                          completed_at = $2, definition_hash = $3, input_anchors_json = $4, \
@@ -781,11 +838,39 @@ impl Catalog {
     /// under a live lease belongs to a live writer and is never listed here.
     /// Inside an admin scope every tenant's rows are returned; outside it the
     /// enumeration is tenant-scoped like every other read on this table.
-    pub async fn list_expired_building_tables(&self, now: &str) -> Result<Vec<ResultTableRecord>> {
-        let now = now.to_string();
+    pub async fn list_expired_building_tables(&self) -> Result<Vec<ResultTableRecord>> {
+        let kind = self.backend().backend_kind();
+        self.building_tables_by_lease_liveness(&lease_expired_clause("lease_expires_at", kind))
+            .await
+    }
+
+    /// Every `building` row under a LIVE (unexpired) lease at the instant the
+    /// query runs — the rows a reconcile pass must never treat as an orphan
+    /// candidate (block #1: an expired-lease `building` row is recovery's to
+    /// claim-then-reap; only a row a live writer still owns is protected
+    /// here). Inside an admin scope every tenant's rows are returned; outside
+    /// it the enumeration is tenant-scoped like every other read on this
+    /// table.
+    pub async fn list_live_building_tables(&self) -> Result<Vec<ResultTableRecord>> {
+        let kind = self.backend().backend_kind();
+        let expired = lease_expired_clause("lease_expires_at", kind);
+        self.building_tables_by_lease_liveness(&format!("NOT {expired}"))
+            .await
+    }
+
+    /// Shared enumeration behind [`Self::list_expired_building_tables`] and
+    /// [`Self::list_live_building_tables`]: every `status = 'building'` row
+    /// additionally matching `lease_predicate` (a full boolean SQL
+    /// expression naming no bind of its own — both callers' predicates are
+    /// built entirely from the backend's own clock, per `catalog::lease`'s
+    /// module docs).
+    async fn building_tables_by_lease_liveness(
+        &self,
+        lease_predicate: &str,
+    ) -> Result<Vec<ResultTableRecord>> {
         let admin = TenantBinding::is_admin_scope();
         let tenant = self.current_tenant();
-        let expired = lease_expired_clause("lease_expires_at", 1);
+        let lease_predicate = lease_predicate.to_string();
         Ok(self
             .backend()
             .transaction(
@@ -799,9 +884,9 @@ impl Catalog {
                             tx.query(
                                 &format!(
                                     "SELECT * FROM result_tables WHERE status = 'building' \
-                                     AND {expired} ORDER BY created_at"
+                                     AND {lease_predicate} ORDER BY created_at"
                                 ),
-                                &[SqlValue::TextOwned(now)],
+                                &[],
                                 parse_row,
                             )
                             .await
@@ -809,14 +894,11 @@ impl Catalog {
                             tx.query(
                                 &format!(
                                     "SELECT * FROM result_tables WHERE status = 'building' \
-                                     AND {expired} \
-                                     AND (tenant_id = $2 OR tenant_id IS NULL) \
+                                     AND {lease_predicate} \
+                                     AND (tenant_id = $1 OR tenant_id IS NULL) \
                                      ORDER BY created_at"
                                 ),
-                                &[
-                                    SqlValue::TextOwned(now),
-                                    SqlValue::from(tenant.map(|t| t.to_string())),
-                                ],
+                                &[SqlValue::from(tenant.map(|t| t.to_string()))],
                                 parse_row,
                             )
                             .await
@@ -1072,62 +1154,89 @@ impl Catalog {
     /// so callers can clean up associated disk files. Scoped strictly to the
     /// session's tenant — a tenant deletes only its own result tables, never a
     /// shared GLOBAL (`tenant_id IS NULL`) table it did not create; only an
-    /// unscoped session manages GLOBAL rows. The SELECT carries the same STRICT
-    /// predicate as the DELETE so the returned record set (the disk-cleanup
-    /// set) is exactly the deleted set, never a superset.
+    /// unscoped session manages GLOBAL rows.
     ///
-    /// Refuses with [`JammiError::SourceBusy`] when a `building` row with a
-    /// live (unexpired) lease references the source: a writer is still
-    /// materialising over it, and deleting the row underneath would leave the
-    /// writer's promote to fail as [`JammiError::RowGone`] over live bytes.
-    /// An expired-lease `building` row is a dead writer's: it is deleted with
-    /// the rest and its objects are reaped by the caller's file cleanup.
+    /// ONE atomic statement, not a SELECT-then-DELETE: under READ COMMITTED
+    /// a SELECT and a later DELETE are two independent snapshots, so a
+    /// `building` row a concurrent writer commits between them would be
+    /// missed by the liveness check yet still deleted by the DELETE's own
+    /// (unconditional) `WHERE source_id = …`. Here the DELETE's `WHERE`
+    /// itself carries the liveness guard (`RETURNING` gives the disk-cleanup
+    /// set in the same round trip, so it is always exactly the deleted set),
+    /// and a second statement in the SAME transaction re-checks, under a
+    /// fresh READ COMMITTED snapshot, whether a live `building` row is now
+    /// present — either because it was excluded by the DELETE's guard, or
+    /// because a writer's `create_result_table` committed one in the window
+    /// between the two statements. Either way, finding one rolls back the
+    /// WHOLE transaction (nothing the DELETE already removed survives past
+    /// the rollback) and the caller sees [`JammiError::SourceBusy`] naming
+    /// it: a writer is still materialising over this source, and deleting
+    /// other rows underneath it while leaving that race unresolved is not
+    /// atomic enough to trust the returned cleanup set.
     pub async fn delete_result_tables_for_source(
         &self,
         source_id: &str,
     ) -> Result<Vec<ResultTableRecord>> {
         let sid = source_id.to_string();
         let tenant = self.current_tenant();
-        let now = crate::catalog::lease::lease_now();
+        let kind = self.backend().backend_kind();
         let outcome = self
             .backend()
             .transaction(TxOptions::default(), |tx| {
                 Box::pin(async move {
                     tx.set_tenant(tenant);
                     let tenant_param = SqlValue::from(tenant.map(|t| t.to_string()));
+                    let expired = lease_expired_clause("lease_expires_at", kind);
+                    // Delete every row for this source that is NOT a
+                    // live-lease `building` row (a terminal row, or a
+                    // `building` row whose lease is absent/expired — a dead
+                    // writer's, safely reaped with the rest).
                     let records = tx
                         .query(
-                            "SELECT * FROM result_tables WHERE source_id = $1 \
-                               AND (tenant_id = $2 OR (tenant_id IS NULL AND $2 IS NULL))",
+                            &format!(
+                                "DELETE FROM result_tables WHERE source_id = $1 \
+                                   AND (tenant_id = $2 OR (tenant_id IS NULL AND $2 IS NULL)) \
+                                   AND (status <> 'building' OR {expired}) \
+                                 RETURNING *"
+                            ),
                             &[SqlValue::TextOwned(sid.clone()), tenant_param.clone()],
                             parse_row,
                         )
                         .await?;
-                    let building = ResultTableStatus::Building.to_string();
-                    if let Some(live) = records.iter().find(|r| {
-                        r.status == building
-                            && r.lease_expires_at
-                                .as_deref()
-                                .is_some_and(|until| until >= now.as_str())
-                    }) {
-                        // Roll back by returning without the DELETE; the
-                        // caller maps this to `SourceBusy`.
-                        return Ok(Err(live.table_name.clone()));
+                    // Fresh statement-level snapshot: any live `building`
+                    // row for this source still (or now) present means the
+                    // delete above is not safe to keep. Returning a plain
+                    // `Ok` here (as the pre-atomic SELECT-then-DELETE shape
+                    // did, when it ran this check BEFORE any DELETE) would
+                    // COMMIT the DELETE that already ran above — `Busy` is a
+                    // real transaction error precisely so the backend's
+                    // `transaction()` rolls the whole thing back.
+                    let busy = tx
+                        .query_opt(
+                            &format!(
+                                "SELECT table_name FROM result_tables WHERE source_id = $1 \
+                                   AND (tenant_id = $2 OR (tenant_id IS NULL AND $2 IS NULL)) \
+                                   AND status = 'building' AND NOT {expired} LIMIT 1"
+                            ),
+                            &[SqlValue::TextOwned(sid), tenant_param],
+                            |row| row.get::<String>("table_name"),
+                        )
+                        .await?;
+                    if let Some(table) = busy {
+                        return Err(BackendError::Busy(table));
                     }
-                    tx.execute(
-                        "DELETE FROM result_tables WHERE source_id = $1 \
-                           AND (tenant_id = $2 OR (tenant_id IS NULL AND $2 IS NULL))",
-                        &[SqlValue::TextOwned(sid), tenant_param],
-                    )
-                    .await?;
-                    Ok(Ok(records))
+                    Ok(records)
                 })
             })
-            .await?;
-        outcome.map_err(|table| JammiError::SourceBusy {
-            source_id: source_id.to_string(),
-            table,
-        })
+            .await;
+        match outcome {
+            Ok(records) => Ok(records),
+            Err(BackendError::Busy(table)) => Err(JammiError::SourceBusy {
+                source_id: source_id.to_string(),
+                table,
+            }),
+            Err(e) => Err(e.into()),
+        }
     }
 
     /// Resolve which embedding table to use for a source. Tenant-filtered.

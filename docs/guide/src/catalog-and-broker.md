@@ -127,6 +127,19 @@ naming `(table_name, writer_id, status = 'building')`, so a stalled or
 crashed writer can never be mistaken for a live one: its lease simply
 expires, and only THEN is the row reclaimable.
 
+**Lease time is the catalog database's clock — replica clock skew does not
+matter.** On Postgres every lease stamp and comparison is rendered as SQL
+that reads and writes `now()`: a renew sets `lease_expires_at = (now() +
+make_interval(secs => $n))::text` (`$n` binds the lease WINDOW, never a
+precomputed deadline), and every expiry check compares
+`lease_expires_at::timestamptz < now()`. No replica ever binds its own
+wall-clock reading into a lease predicate, so two replicas whose system
+clocks disagree — even by minutes — can never reap each other's live writer
+or extend a lease past what the DATABASE considers "now" plus the
+configured window. (SQLite is a single embedded process — there is no peer
+replica to skew against — so it keeps the simpler application-clock stamp,
+through the one shared helper in `catalog::lease`.)
+
 **The advisory lock around migrations.** On Postgres, `catalog::migrations::run`
 takes a transaction-scoped advisory lock (`SELECT pg_advisory_xact_lock($1)`,
 keyed by `JAMMI_MIGRATION_LOCK_KEY`) as the very first statement, before it

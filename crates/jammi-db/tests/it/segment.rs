@@ -11,7 +11,6 @@ use datafusion::prelude::SessionContext;
 use jammi_db::catalog::backend::{BackendImpl, BackendKind};
 use jammi_db::catalog::backend_postgres::PostgresBackend;
 use jammi_db::catalog::backend_sqlite::SqliteBackend;
-use jammi_db::catalog::lease::lease_now;
 use jammi_db::catalog::result_repo::{
     CreateResultTableParams, Owner, ResultTableCas, ResultTableKind, ResultTableRecord, TenantArm,
 };
@@ -365,7 +364,7 @@ async fn seed_result_table(session: &jammi_db::session::JammiSession, table: &st
         .catalog()
         .create_result_table(CreateResultTableParams {
             writer_id: None,
-            lease_expires_at: None,
+            lease: None,
             table_name: table,
             source_id: "seg_src",
             model_id: "seg_model",
@@ -408,7 +407,7 @@ async fn session_lists_a_tables_segments_in_segment_id_order() {
                 &ResultTableCas {
                     table: "seg_table".to_string(),
                     tenant_arm: TenantArm::Strict(Some(tenant)),
-                    owner: Owner::ExpiredLease(lease_now()),
+                    owner: Owner::ExpiredLease,
                 },
                 id,
                 path,
@@ -470,7 +469,7 @@ async fn session_hides_another_tenants_segments_and_an_unknown_table_alike() {
             &ResultTableCas {
                 table: "a_only_table".to_string(),
                 tenant_arm: TenantArm::Strict(Some(tenant_a)),
-                owner: Owner::ExpiredLease(lease_now()),
+                owner: Owner::ExpiredLease,
             },
             0,
             "file:///idx/a-0",

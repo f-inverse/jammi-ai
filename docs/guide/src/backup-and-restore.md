@@ -57,9 +57,9 @@ returns is the on-disk image safe to copy:
 # 2. Copy the catalog file, its WAL, and the result-table root together —
 #    they must be from the SAME instant, since a result-table row and its
 #    bytes are two halves of one fact.
-cp catalog.db catalog.db-wal /backup/2026-09-09/          # -wal may be absent
-                                                            # if fully checkpointed
-cp -r jammi_db/ /backup/2026-09-09/jammi_db/               # exclude jammi_db/cache/
+cp catalog.db catalog.db-wal /backup/<date>/               # -wal may be absent
+                                                             # if fully checkpointed
+cp -r jammi_db/ /backup/<date>/jammi_db/                    # exclude jammi_db/cache/
 ```
 
 **Restoring** is the reverse: with no `jammi-server` process holding the
@@ -98,23 +98,37 @@ their own transaction/consistency models.
 
 ## Ordering rule
 
-**Restore storage first, then the catalog — or run `reconcile` after.** A
-catalog row is only meaningful if the bytes it names exist; restoring the
-catalog to a point *after* the storage snapshot can leave rows pointing at
-objects the storage restore does not have, and restoring the catalog to a
-point *before* the storage snapshot leaves storage objects with no
-referencing row (which `jammi reconcile` — see below — treats as orphans,
-never as data loss, since a row-less object was never queryable in the
-first place). Concretely:
+**Restore storage to a point no later than the catalog — and always review a
+`reconcile` dry run before `--apply`.** A catalog row is only meaningful if
+the bytes it names exist; restoring the catalog to a point *after* the
+storage snapshot can leave rows pointing at objects the storage restore does
+not have. The reverse ordering is NOT symmetrically safe: restoring the
+catalog to a point *before* the storage snapshot can leave storage objects
+with no referencing row in the restored catalog even though those objects
+WERE legitimately queryable data under the catalog state the storage
+snapshot was actually taken against (a table materialized, then the catalog
+rolled back past that materialization). `jammi reconcile` cannot tell "an
+object nothing ever referenced" from "an object a row referenced before the
+catalog was rolled back" — both look identical to it: row-less, and (past
+`grace`) an orphan candidate `--apply` reclaims. Treating that reclaim as
+harmless because "a row-less object was never queryable" is the wrong
+mental model; it can genuinely delete data a client read moments before the
+restore. Concretely:
 
 1. Restore (or roll storage forward/back to) the storage snapshot first.
-2. Restore the catalog to a snapshot from the **same or a later** instant.
+2. Restore the catalog to a snapshot from the **same or a later** instant —
+   never earlier — so every row the restored catalog carries is covered by
+   the storage snapshot, and the storage snapshot carries nothing the
+   catalog does not already know to be superseded.
 3. If the two snapshots cannot be instant-matched exactly (a Postgres PITR
    target a few seconds off a bucket versioning rollback point, say), run
-   `jammi reconcile` (`--apply` once you have reviewed a dry run) to
-   reconcile the two: it flips a `ready` row whose required objects are
-   missing to `failed`, and reports (or, on `--apply`, reclaims) any
-   storage object no live row references. See
+   `jammi reconcile` with `apply=false` FIRST and review the `orphans` /
+   `pending` / `rows_failed` lists by hand before ever passing `--apply` —
+   the dry run is free and mutates nothing; `--apply` is the step that can
+   turn a merely stale-looking object into a permanently deleted one. Once
+   reviewed, `--apply` flips a `ready` row whose required objects are
+   missing to `failed`, and reclaims any storage object no live row
+   references. See
    [Catalog Backend and Trigger Broker → Multi-writer safety](./catalog-and-broker.md#multi-writer-safety)
    for what `reconcile` checks and its deletion arms, and the maintainer
    guide (`docs/maintainer/MAINTAINER-GUIDE.md`) for the full allowlist and

@@ -546,12 +546,12 @@ async fn remote_reconcile_reports_like_local() {
             .any(|o| o.ends_with("stray.parquet")),
         "the divergence-prone fixture must actually plant an orphan: {remote_report:?}"
     );
+    // Block #4: a tenant-scoped pass reports NO unattributed entries at all —
+    // an unattributed key is store-wide by definition, so only the admin
+    // `all=true` arm below may ever list it.
     assert!(
-        remote_report
-            .unattributed
-            .iter()
-            .any(|u| u.ends_with("legacy_table.parquet")),
-        "the divergence-prone fixture must actually plant an unattributed key: {remote_report:?}"
+        remote_report.unattributed.is_empty(),
+        "a tenant-scoped pass must report no unattributed entries: {remote_report:?}"
     );
 
     // --- all = true: cross-tenant admin arm (AllowAllAdmin permits it) -----
@@ -571,6 +571,14 @@ async fn remote_reconcile_reports_like_local() {
         jammi_wire::reconcile_report_to_proto(&local_report_all).encode_to_vec(),
         "remote and local admin reconcile_all reports must be byte-identical: \
          {remote_report_all:?} vs {local_report_all:?}"
+    );
+    assert!(
+        remote_report_all
+            .unattributed
+            .iter()
+            .any(|u| u.ends_with("legacy_table.parquet")),
+        "the divergence-prone fixture's unattributed key must surface on the admin pass: \
+         {remote_report_all:?}"
     );
 
     let _ = server.shutdown.send(());

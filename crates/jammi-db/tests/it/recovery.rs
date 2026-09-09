@@ -59,7 +59,6 @@ use datafusion::prelude::SessionContext;
 use jammi_db::catalog::backend::{BackendImpl, BackendKind, SqlValue, TxOptions};
 use jammi_db::catalog::backend_postgres::PostgresBackend;
 use jammi_db::catalog::backend_sqlite::SqliteBackend;
-use jammi_db::catalog::lease::{lease_deadline, lease_now};
 use jammi_db::catalog::result_repo::{
     Owner, ResultTableCas, ResultTableKind, ResultTableRecord, TenantArm,
 };
@@ -996,10 +995,18 @@ async fn live_writer_survives_peer_recover_w2(kind: BackendKind) {
             .is_none(),
         "precondition: manifest absent"
     );
+    // Liveness is asserted through the catalog's own backend-correct
+    // predicate, not a Rust-side string compare against `row.lease_expires_at`
+    // — that stored value is a Postgres-clock expression's text rendering on
+    // Postgres (`(now() + make_interval(...))::text`), not the
+    // `lease_now()`-shaped string a naive `>` compare here would assume.
     assert!(
-        row.lease_expires_at
-            .as_deref()
-            .is_some_and(|u| u > lease_now().as_str()),
+        cat_a
+            .list_live_building_tables()
+            .await
+            .unwrap()
+            .iter()
+            .any(|t| t.table_name == table_name),
         "precondition: A's lease is live"
     );
     assert_eq!(
@@ -1037,6 +1044,187 @@ async fn live_writer_survives_peer_recover_w2(kind: BackendKind) {
     assert!(rec.definition_hash.is_some(), "the attestation landed");
     assert!(rec.lease_expires_at.is_none());
     assert_eq!(select_count(&ctx_a, &table_name).await, N);
+}
+
+/// U2 (block #1, phase-4 fix): the SAME two-writer shape as W2, but the peer
+/// runs `reconcile(apply=true)` instead of the startup `recover()` sweep — a
+/// live-lease `building` row's bytes must survive a reconcile pass exactly as
+/// they survive recovery. `own_seg` scoping means the peer must reconcile
+/// under A's OWN tenant (a cross-tenant `reconcile()` would not even list A's
+/// prefix at all, which would pass vacuously); the cross-tenant half of this
+/// contract is `reconcile_all`, covered by `tenant_isolation_oracle.rs`.
+#[cfg(feature = "test-hooks")]
+#[cfg_attr(test, test_case(BackendKind::Sqlite ; "sqlite"))]
+#[cfg_attr(
+    all(test, feature = "live-postgres-tests"),
+    test_case(BackendKind::Postgres ; "postgres")
+)]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn live_writer_survives_peer_reconcile_apply_u2(kind: BackendKind) {
+    use jammi_db::store::mutable::test_hook::{arm, MaterializationPoint};
+    use jammi_db::store::ReconcileOptions;
+
+    let dir = tempdir().unwrap();
+    let Some(backend) = open_backend(kind, dir.path()).await else {
+        eprintln!("skipping {kind:?}: JAMMI_TEST_PG_URL unset");
+        require_live_pg("live_writer_survives_peer_reconcile_apply_u2");
+        return;
+    };
+    let global = fresh_catalog(backend).await;
+    let cat_a = Arc::new(global.pinned_to_tenant(Some(tenant_a())));
+    let store_a = long_lease_store(dir.path(), Arc::clone(&cat_a));
+    // A peer SESSION over the SAME tenant, the shape a second replica process
+    // reconciling A's own prefix takes.
+    let peer = long_lease_store(dir.path(), Arc::clone(&cat_a));
+    const N: usize = 4;
+
+    let armed = arm(MaterializationPoint::Materialization, store_a.writer_id());
+    let ctx_a = SessionContext::new();
+    let writer = {
+        let store_a = store_a.clone();
+        let ctx_a = ctx_a.clone();
+        tokio::spawn(async move {
+            let building = create_building_embedding(&store_a).await;
+            write_closed_embedding_parquet(&store_a, &building, N).await;
+            building.append_segment(&built_index(N)).await.unwrap();
+            let (descriptor, env) = (descriptor(), env());
+            building
+                .finish(&ctx_a, N, Materialization::new(&descriptor, &env, inputs()))
+                .await
+        })
+    };
+    armed
+        .wait_parked()
+        .await
+        .expect("writer A must reach the materialization point");
+
+    let building_rows = cat_a
+        .list_result_tables_by_status(ResultTableStatus::Building)
+        .await
+        .unwrap();
+    assert_eq!(
+        building_rows.len(),
+        1,
+        "precondition: A's row is `building`"
+    );
+    let table_name = building_rows[0].table_name.clone();
+    let url = StorageUrl::parse(&building_rows[0].parquet_path).unwrap();
+
+    // The peer reconciles A's own prefix with `apply=true` — the lease
+    // duration `long_lease_store` uses (600s) sets the grace floor.
+    let report = peer
+        .reconcile(ReconcileOptions {
+            apply: true,
+            grace: std::time::Duration::from_secs(600),
+        })
+        .await
+        .unwrap();
+    assert!(
+        report.orphans.is_empty(),
+        "a live-lease building row's objects must never be reaped by reconcile: {report:?}"
+    );
+    assert!(
+        report
+            .orphans
+            .iter()
+            .chain(report.pending.iter())
+            .all(|k| !k.contains(&table_name)),
+        "no object of the live row may even be flagged: {report:?}"
+    );
+    assert!(parquet_exists(&store_a, &url).await, "bytes survive");
+    assert_eq!(
+        record_admin(&global, &table_name).await.status,
+        ResultTableStatus::Building.to_string(),
+        "a live writer's row survives a peer's reconcile(apply=true)"
+    );
+
+    armed.release();
+    let rec = writer.await.unwrap().expect("A's finish succeeds");
+    assert_eq!(rec.status, ResultTableStatus::Ready.to_string());
+    assert_eq!(rec.row_count, N);
+}
+
+/// U2b (block #1, phase-4 fix, RED first): an EXPIRED-lease `building` row is
+/// reconciled through the RECOVERY arm — claimed (its `writer_id` changes)
+/// BEFORE its bytes go — never through the orphan arm with no claim/CAS at
+/// all. Before this fix, `reconcile`'s orphan loop reaped such a row's
+/// Parquet/sidecar objects directly (no claim, no CAS), so a stalled original
+/// writer's later `renew`/`promote` would have raced a promote over deleted
+/// bytes; this pins that the row is claimed first (fencing the stale writer)
+/// and the stale writer's own subsequent CAS is refused.
+#[cfg(feature = "test-hooks")]
+#[cfg_attr(test, test_case(BackendKind::Sqlite ; "sqlite"))]
+#[cfg_attr(
+    all(test, feature = "live-postgres-tests"),
+    test_case(BackendKind::Postgres ; "postgres")
+)]
+#[tokio::test]
+async fn expired_lease_building_row_is_claimed_before_reconcile_reaps_it_u2b(kind: BackendKind) {
+    use jammi_db::store::ReconcileOptions;
+
+    let dir = tempdir().unwrap();
+    let Some(backend) = open_backend(kind, dir.path()).await else {
+        eprintln!("skipping {kind:?}: JAMMI_TEST_PG_URL unset");
+        require_live_pg("expired_lease_building_row_is_claimed_before_reconcile_reaps_it_u2b");
+        return;
+    };
+    let catalog = fresh_catalog(backend).await;
+    let store = long_lease_store(dir.path(), Arc::clone(&catalog));
+
+    let info = create_building_embedding(&store).await;
+    write_closed_embedding_parquet(&store, &info, 3).await;
+    info.append_segment(&built_index(3)).await.unwrap();
+    jammi_test_utils::write_manifest_sidecar_for(&store, info.parquet_url(), "src1", DIMS).await;
+    let writer_id = info.writer_id().to_string();
+    let url = info.parquet_url().clone();
+    let name = abandon_building(&catalog, info).await;
+
+    // A peer reconciles under the SAME tenant scope, `apply=true`, past the
+    // configured (long) lease's grace floor.
+    let peer = result_store(dir.path(), global_sibling(&catalog));
+    let report = peer
+        .reconcile(ReconcileOptions {
+            apply: true,
+            grace: std::time::Duration::from_secs(600),
+        })
+        .await
+        .unwrap();
+    assert!(
+        report.orphans.iter().all(|k| !k.contains(&name)),
+        "the expired row's bytes must be reconciled through the recovery arm, \
+         never orphan-reaped directly: {report:?}"
+    );
+
+    // The row was CLAIMED (a new writer_id) then promoted — never left
+    // `building`, and never simply deleted.
+    let after = record_admin(&catalog, &name).await;
+    assert_ne!(
+        after.writer_id.as_deref(),
+        Some(writer_id.as_str()),
+        "the row must be re-stamped with a NEW writer_id (fencing the stale one) \
+         before any byte touches it"
+    );
+    assert_eq!(
+        after.status,
+        ResultTableStatus::Ready.to_string(),
+        "a valid Parquet with a landed manifest self-heals to ready via the claim arm"
+    );
+    assert!(
+        parquet_exists(&store, &url).await,
+        "bytes survive the claim"
+    );
+
+    // The stale original writer's own CAS is now refused, never re-promotes.
+    let late = ResultTableCas::writer(&name, &writer_id, None);
+    let err = catalog
+        .promote_result_table_with_manifest(&late, 3, "deadbeef", "[]")
+        .await
+        .unwrap_err();
+    assert!(
+        matches!(&err, JammiError::CasFailed { table, status } if *table == name && status == "ready")
+            || matches!(&err, JammiError::LeaseLost { table } if *table == name),
+        "the fenced writer's late CAS must be refused, never re-promote: {err:?}"
+    );
 }
 
 /// W1 (esc-094): a live writer parked right after `create_table` — row
@@ -1348,9 +1536,9 @@ async fn zero_rows_claimed_row_is_lease_lost_and_deletes_nothing(kind: BackendKi
     expire_lease_by_hand(&catalog, &name).await;
     let claimed = catalog
         .claim_expired_building_table(
-            &ResultTableCas::expired(&name, &lease_now(), None),
+            &ResultTableCas::expired(&name, None),
             recoverer.writer_id(),
-            &lease_deadline(recoverer.lease_intervals().lease()),
+            recoverer.lease_intervals().lease(),
         )
         .await
         .unwrap();
@@ -1361,10 +1549,7 @@ async fn zero_rows_claimed_row_is_lease_lost_and_deletes_nothing(kind: BackendKi
     );
 
     let err = catalog
-        .renew_lease(
-            &info.cas(),
-            &lease_deadline(std::time::Duration::from_secs(30)),
-        )
+        .renew_lease(&info.cas(), std::time::Duration::from_secs(30))
         .await
         .unwrap_err();
     assert!(
@@ -1526,6 +1711,83 @@ async fn remove_source_refuses_live_building_row(kind: BackendKind) {
     assert_eq!(deleted.len(), 1);
     assert_eq!(deleted[0].table_name, name);
     assert!(catalog.get_result_table(&name).await.unwrap().is_none());
+}
+
+/// Block #6: `delete_result_tables_for_source` is ONE atomic statement, not a
+/// SELECT-then-DELETE — pinned by an interleaving this source has TWO rows
+/// for: a terminal (`ready`) row the DELETE's own `WHERE` would otherwise
+/// happily remove, and a live-lease `building` row it must refuse. A
+/// SELECT-then-DELETE bug would delete the `ready` row regardless of the
+/// `building` row's fate (they are independent rows, no shared predicate ties
+/// their deletion together in a naive implementation); the atomic rewrite
+/// makes `SourceBusy` roll back the WHOLE transaction, so the terminal row
+/// must survive exactly as the busy row does — the caller's returned
+/// cleanup set and the catalog's actual state can never diverge.
+#[cfg_attr(test, test_case(BackendKind::Sqlite ; "sqlite"))]
+#[cfg_attr(
+    all(test, feature = "live-postgres-tests"),
+    test_case(BackendKind::Postgres ; "postgres")
+)]
+#[tokio::test]
+async fn source_busy_rolls_back_the_whole_delete_not_only_the_busy_row(kind: BackendKind) {
+    let dir = tempdir().unwrap();
+    let Some(backend) = open_backend(kind, dir.path()).await else {
+        eprintln!("skipping {kind:?}: JAMMI_TEST_PG_URL unset");
+        require_live_pg("source_busy_rolls_back_the_whole_delete_not_only_the_busy_row");
+        return;
+    };
+    let catalog = fresh_catalog(backend).await;
+    let store = result_store(dir.path(), Arc::clone(&catalog));
+
+    // A terminal row for the SAME source — the naive SELECT-then-DELETE's
+    // own unconditional `WHERE source_id = $1` would remove this one
+    // regardless of the busy row's outcome.
+    let ready = create_building_embedding(&store).await;
+    let ready_name = ready.table_name().to_string();
+    write_closed_embedding_parquet(&store, &ready, 2).await;
+    let ctx = SessionContext::new();
+    let (descriptor, env) = (descriptor(), env());
+    ready
+        .finish(&ctx, 2, Materialization::new(&descriptor, &env, inputs()))
+        .await
+        .unwrap();
+    assert_eq!(
+        record(&catalog, &ready_name).await.status,
+        ResultTableStatus::Ready.to_string(),
+        "precondition: the sibling row is terminal"
+    );
+
+    // A live-lease `building` row, same source.
+    let building = create_building_embedding(&store).await;
+    let building_name = building.table_name().to_string();
+
+    let err = catalog
+        .delete_result_tables_for_source("src1")
+        .await
+        .unwrap_err();
+    assert!(
+        matches!(&err, JammiError::SourceBusy { source_id, table }
+            if source_id == "src1" && *table == building_name),
+        "got {err:?}"
+    );
+
+    // BOTH rows survive — the terminal one is not a partial casualty of a
+    // refusal that only concerned the busy row.
+    assert!(
+        catalog
+            .get_result_table(&ready_name)
+            .await
+            .unwrap()
+            .is_some(),
+        "SourceBusy must roll back the WHOLE transaction: the terminal sibling \
+         row must survive exactly as the busy row does"
+    );
+    assert!(catalog
+        .get_result_table(&building_name)
+        .await
+        .unwrap()
+        .is_some());
+    let _ = building; // keep the live lease held for the duration of the call above
 }
 
 /// Two recoverers racing on ONE expired-lease row (valid Parquet + sidecar):

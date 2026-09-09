@@ -31,9 +31,22 @@ pub async fn run(
     println!("scope:           {}", report.scope);
     println!("applied:         {}", report.applied);
     println!("rows_failed:     {}", join_or_dash(&report.rows_failed));
-    println!("orphans:         {}", join_or_dash(&report.orphans));
-    println!("pending:         {}", join_or_dash(&report.pending));
-    println!("unattributed:    {}", join_or_dash(&report.unattributed));
+    println!(
+        "orphans:         {}",
+        join_capped(&report.orphans, report.orphan_count)
+    );
+    println!(
+        "pending:         {}",
+        join_capped(&report.pending, report.pending_count)
+    );
+    println!(
+        "unattributed:    {}",
+        join_capped(&report.unattributed, report.unattributed_count)
+    );
+    println!(
+        "damaged:         {}",
+        join_capped(&report.damaged, report.damaged_count)
+    );
     println!("bytes_reclaimed: {}", report.bytes_reclaimed);
     Ok(())
 }
@@ -46,6 +59,19 @@ fn join_or_dash(values: &[String]) -> String {
     } else {
         values.join(", ")
     }
+}
+
+/// [`join_or_dash`], plus a trailing "… and N more" when the report's `true`
+/// count exceeds the (possibly capped) list actually printed — so a huge
+/// pass's output stays bounded on the terminal while still saying the whole
+/// truth about how much was found.
+fn join_capped(values: &[String], true_count: u64) -> String {
+    let shown = values.len() as u64;
+    let mut out = join_or_dash(values);
+    if true_count > shown {
+        out.push_str(&format!(" … and {} more", true_count - shown));
+    }
+    out
 }
 
 #[cfg(test)]

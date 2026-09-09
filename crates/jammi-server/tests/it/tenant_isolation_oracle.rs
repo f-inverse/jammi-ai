@@ -267,7 +267,7 @@ fn result_params<'a>(
 ) -> CreateResultTableParams<'a> {
     CreateResultTableParams {
         writer_id: None,
-        lease_expires_at: None,
+        lease: None,
         table_name: name,
         source_id: source,
         model_id: model,
@@ -1850,6 +1850,22 @@ async fn assert_reconcile_isolated() {
         .set_modified(backdated)
         .unwrap();
 
+    // Block #4, RED first: a genuinely UNATTRIBUTED key — its own first path
+    // segment does not even parse as a `TenantSegment` — planted directly at
+    // the store root (no tenant prefix at all), so it is store-wide by
+    // definition. Before the fix, tenant B's own SCOPED reconcile listed
+    // this anyway ("garbage is always in scope"); the fixed rule is that
+    // ONLY the admin `reconcile_all` pass may ever report it.
+    let root = dir.path().join("jammi_db");
+    let unattributed = root.join("pre_layout_table.parquet");
+    std::fs::write(&unattributed, b"pre-layout").unwrap();
+    std::fs::File::options()
+        .write(true)
+        .open(&unattributed)
+        .unwrap()
+        .set_modified(backdated)
+        .unwrap();
+
     // `test_config`'s default `[lease] duration_secs` is 30; `apply=true`
     // requires `grace >= ` it, so 30s is the shortest grace this fixture can
     // use without also shrinking the store's lease config.
@@ -1893,6 +1909,16 @@ async fn assert_reconcile_isolated() {
         "the admin pass must reap tenant A's stray object: {report_all:?}"
     );
     assert!(!stray.exists());
+    assert!(
+        report_all
+            .unattributed
+            .contains(&"pre_layout_table.parquet".to_string()),
+        "only the admin pass ever reports an unattributed key: {report_all:?}"
+    );
+    assert!(
+        unattributed.exists(),
+        "unattributed is reported but NEVER deleted, at any grace or apply"
+    );
 
     let row = engine
         .with_tenant_scoped(tenant_a(), |_scope| async {

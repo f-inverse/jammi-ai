@@ -36,7 +36,7 @@ use datafusion::execution::options::ReadOptions;
 use datafusion::prelude::SessionContext;
 use tracing::warn;
 
-use crate::catalog::lease::{lease_deadline, lease_now, LeaseIntervals};
+use crate::catalog::lease::LeaseIntervals;
 use crate::catalog::result_repo::{
     CreateResultTableParams, ResultTableCas, ResultTableKind, ResultTableRecord,
 };
@@ -472,7 +472,7 @@ impl ResultStore {
                 oversample: self.ann.effective_oversample_for(storage_precision),
                 created_at: crate::catalog::backend::now_sortable(),
                 writer_id: Some(&self.writer_id),
-                lease_expires_at: Some(lease_deadline(self.lease.lease())),
+                lease: Some(self.lease.lease()),
             })
             .await?;
 
@@ -755,119 +755,136 @@ impl ResultStore {
     /// admin scope so the catalog enumeration and the per-row status flips both
     /// see and write across every tenant's expired-lease `building` rows.
     async fn recover_inner(&self) -> Result<()> {
-        let now = lease_now();
-        let expired = self.catalog.list_expired_building_tables(&now).await?;
+        let expired = self.catalog.list_expired_building_tables().await?;
         for table in expired {
-            let tenant = parse_owner(&table)?;
-            let cas = ResultTableCas::expired(&table.table_name, &now, tenant);
-            let parquet_url = StorageUrl::parse(&table.parquet_path)?;
-            let parquet_handle = self.open_parquet(&parquet_url)?;
-            let parquet_path = parquet_handle.data_path()?;
-            let parquet_exists = parquet_handle.exists(&parquet_path).await?;
-            let parquet_valid =
-                parquet_exists && storage::reader::is_valid_parquet(&parquet_handle).await?;
-
-            if !parquet_exists {
-                warn!(
-                    table = table.table_name,
-                    "Recovery: Parquet missing, marking failed"
-                );
-                // No bytes to reap: the CAS is the whole arm. A miss means the
-                // writer renewed or a peer recoverer got here first — skip.
-                if let Err(e) = self.catalog.fail_building_table(&cas).await {
-                    if !is_cas_miss(&e) {
-                        return Err(e);
-                    }
-                    warn!(table = table.table_name, outcome = %e, "Recovery: row moved on; skipped");
-                }
-            } else if !parquet_valid {
-                warn!(
-                    table = table.table_name,
-                    "Recovery: invalid Parquet, marking failed and deleting"
-                );
-                self.reap_after_fail_cas(&cas, &parquet_url).await?;
-            } else if let Some(manifest) = self.read_materialization_manifest(&parquet_url).await? {
-                // The manifest sidecar is present (written before the flip), so
-                // its summary columns can be backfilled as part of the same
-                // promotion the live path performs. Claim the row FIRST — the
-                // recoverer becomes the writer, heartbeating a fresh lease —
-                // then rebuild and promote under that ownership.
-                let Some(recovered) = self.claim_expired(&cas, &table, tenant).await? else {
-                    warn!(table = table.table_name, "Recovery: claim lost; skipped");
-                    continue;
-                };
-                let row_count = storage::reader::count_parquet_rows(&parquet_handle).await?;
-                // Rebuild the ANN index as a fresh single segment if this is an
-                // embedding table (self-healing even if its segment set never
-                // landed, or landed torn). Renew before the destructive purge;
-                // a renew miss abandons this arm silently (no deletion).
-                if table.task.is_embedding() {
-                    let renew = self
-                        .catalog
-                        .renew_lease(&recovered.cas(), &lease_deadline(self.lease.lease()))
-                        .await;
-                    if let Err(e) = renew {
-                        if !is_cas_miss(&e) {
-                            return Err(e);
-                        }
-                        warn!(table = table.table_name, outcome = %e, "Recovery: claim lost before rebuild; skipped");
-                        recovered.abandon();
-                        continue;
-                    }
-                    if let Err(e) = self
-                        .rebuild_index_from_parquet(&recovered, &parquet_handle, &table)
-                        .await
-                    {
-                        if is_cas_miss(&e) {
-                            warn!(table = table.table_name, outcome = %e, "Recovery: claim lost during rebuild; skipped");
-                            recovered.abandon();
-                            continue;
-                        }
-                        warn!(
-                            table = table.table_name,
-                            error = %e,
-                            "Recovery: failed to rebuild index, proceeding without"
-                        );
-                    }
-                }
-                let anchors_json = serde_json::to_string(&manifest.input_anchors)
-                    .map_err(|e| JammiError::Other(format!("serialise input anchors: {e}")))?;
-                let promoted = self
-                    .catalog
-                    .promote_result_table_with_manifest(
-                        &recovered.cas(),
-                        row_count,
-                        manifest.definition_hash.as_str(),
-                        &anchors_json,
-                    )
-                    .await;
-                // The row is terminal (or lost) under this recoverer either
-                // way: detach the handle so Drop marks nothing.
-                recovered.abandon();
-                match promoted {
-                    Ok(_) => {}
-                    Err(e) if is_cas_miss(&e) => {
-                        warn!(table = table.table_name, outcome = %e, "Recovery: promote superseded; skipped");
-                    }
-                    Err(e) => return Err(e),
-                }
-            } else {
-                // Valid Parquet but NO manifest sidecar: the write was torn in
-                // the window between the Parquet landing and the manifest being
-                // written (before the `building -> ready` flip). The contract
-                // forbids promoting a table without an attestation, and the
-                // producing descriptor cannot be reconstructed here — so this
-                // row is reaped to `failed`, not promoted manifest-less.
-                warn!(
-                    table = table.table_name,
-                    "Recovery: valid Parquet but no materialization manifest \
-                     (torn write before manifest); marking failed and deleting"
-                );
-                self.reap_after_fail_cas(&cas, &parquet_url).await?;
-            }
+            self.reconcile_expired_building_row(table).await?;
         }
 
         self.reconcile_ready_manifests().await?;
+        Ok(())
+    }
+
+    /// The recovery arm for ONE expired-lease `building` row: claim it
+    /// (fencing whatever writer is or was alive), then drive it to exactly
+    /// one terminal state, deleting bytes only after the CAS that licenses
+    /// it. Shared by [`Self::recover_inner`] (the admin-scoped, cross-tenant
+    /// startup sweep) and [`crate::store::reconcile`]'s pass (block #1: an
+    /// expired-lease `building` row is reaped through THIS arm — claim, then
+    /// fail-CAS or promote, then delete — never through reconcile's orphan
+    /// arm, which performs no claim and no CAS at all). The binding in force
+    /// when this runs determines scope: admin-scoped from `recover_inner`,
+    /// or whatever scope the caller (a tenant-bound [`Self::reconcile`], or
+    /// admin-scoped [`Self::reconcile_all`]) is already running under —
+    /// [`crate::catalog::result_repo::ResultTableCas::expired`] renders the
+    /// matching tenant arm either way.
+    async fn reconcile_expired_building_row(&self, table: ResultTableRecord) -> Result<()> {
+        let tenant = parse_owner(&table)?;
+        let cas = ResultTableCas::expired(&table.table_name, tenant);
+        let parquet_url = StorageUrl::parse(&table.parquet_path)?;
+        let parquet_handle = self.open_parquet(&parquet_url)?;
+        let parquet_path = parquet_handle.data_path()?;
+        let parquet_exists = parquet_handle.exists(&parquet_path).await?;
+        let parquet_valid =
+            parquet_exists && storage::reader::is_valid_parquet(&parquet_handle).await?;
+
+        if !parquet_exists {
+            warn!(
+                table = table.table_name,
+                "Recovery: Parquet missing, marking failed"
+            );
+            // No bytes to reap: the CAS is the whole arm. A miss means the
+            // writer renewed or a peer recoverer got here first — skip.
+            if let Err(e) = self.catalog.fail_building_table(&cas).await {
+                if !is_cas_miss(&e) {
+                    return Err(e);
+                }
+                warn!(table = table.table_name, outcome = %e, "Recovery: row moved on; skipped");
+            }
+        } else if !parquet_valid {
+            warn!(
+                table = table.table_name,
+                "Recovery: invalid Parquet, marking failed and deleting"
+            );
+            self.reap_after_fail_cas(&cas, &parquet_url).await?;
+        } else if let Some(manifest) = self.read_materialization_manifest(&parquet_url).await? {
+            // The manifest sidecar is present (written before the flip), so
+            // its summary columns can be backfilled as part of the same
+            // promotion the live path performs. Claim the row FIRST — the
+            // recoverer becomes the writer, heartbeating a fresh lease —
+            // then rebuild and promote under that ownership.
+            let Some(recovered) = self.claim_expired(&cas, &table, tenant).await? else {
+                warn!(table = table.table_name, "Recovery: claim lost; skipped");
+                return Ok(());
+            };
+            let row_count = storage::reader::count_parquet_rows(&parquet_handle).await?;
+            // Rebuild the ANN index as a fresh single segment if this is an
+            // embedding table (self-healing even if its segment set never
+            // landed, or landed torn). Renew before the destructive purge;
+            // a renew miss abandons this arm silently (no deletion).
+            if table.task.is_embedding() {
+                let renew = self
+                    .catalog
+                    .renew_lease(&recovered.cas(), self.lease.lease())
+                    .await;
+                if let Err(e) = renew {
+                    if !is_cas_miss(&e) {
+                        return Err(e);
+                    }
+                    warn!(table = table.table_name, outcome = %e, "Recovery: claim lost before rebuild; skipped");
+                    recovered.abandon();
+                    return Ok(());
+                }
+                if let Err(e) = self
+                    .rebuild_index_from_parquet(&recovered, &parquet_handle, &table)
+                    .await
+                {
+                    if is_cas_miss(&e) {
+                        warn!(table = table.table_name, outcome = %e, "Recovery: claim lost during rebuild; skipped");
+                        recovered.abandon();
+                        return Ok(());
+                    }
+                    warn!(
+                        table = table.table_name,
+                        error = %e,
+                        "Recovery: failed to rebuild index, proceeding without"
+                    );
+                }
+            }
+            let anchors_json = serde_json::to_string(&manifest.input_anchors)
+                .map_err(|e| JammiError::Other(format!("serialise input anchors: {e}")))?;
+            let promoted = self
+                .catalog
+                .promote_result_table_with_manifest(
+                    &recovered.cas(),
+                    row_count,
+                    manifest.definition_hash.as_str(),
+                    &anchors_json,
+                )
+                .await;
+            // The row is terminal (or lost) under this recoverer either
+            // way: detach the handle so Drop marks nothing.
+            recovered.abandon();
+            match promoted {
+                Ok(_) => {}
+                Err(e) if is_cas_miss(&e) => {
+                    warn!(table = table.table_name, outcome = %e, "Recovery: promote superseded; skipped");
+                }
+                Err(e) => return Err(e),
+            }
+        } else {
+            // Valid Parquet but NO manifest sidecar: the write was torn in
+            // the window between the Parquet landing and the manifest being
+            // written (before the `building -> ready` flip). The contract
+            // forbids promoting a table without an attestation, and the
+            // producing descriptor cannot be reconstructed here — so this
+            // row is reaped to `failed`, not promoted manifest-less.
+            warn!(
+                table = table.table_name,
+                "Recovery: valid Parquet but no materialization manifest \
+                 (torn write before manifest); marking failed and deleting"
+            );
+            self.reap_after_fail_cas(&cas, &parquet_url).await?;
+        }
         Ok(())
     }
 
@@ -882,10 +899,9 @@ impl ResultStore {
         table: &ResultTableRecord,
         tenant: Option<TenantId>,
     ) -> Result<Option<BuildingTable>> {
-        let until = lease_deadline(self.lease.lease());
         if !self
             .catalog
-            .claim_expired_building_table(cas, &self.writer_id, &until)
+            .claim_expired_building_table(cas, &self.writer_id, self.lease.lease())
             .await?
         {
             return Ok(None);
@@ -979,8 +995,7 @@ impl ResultStore {
             }
             // A `ready` row carries no lease, so the expired-lease owner arm
             // names it for the segment purge.
-            let cas =
-                ResultTableCas::expired(&table.table_name, &lease_now(), parse_owner(&table)?);
+            let cas = ResultTableCas::expired(&table.table_name, parse_owner(&table)?);
             if let Err(e) = self.delete_objects_after_cas(&parquet_url, &cas).await {
                 warn!(
                     table = table.table_name,
@@ -1239,10 +1254,10 @@ impl ResultStore {
 
     /// Delete a result table's objects — the Parquet, its
     /// `.materialization.json` sidecar, and its whole ANN segment set (bundles
-    /// and catalog rows) — under the ownership `cas` names. One of the three
-    /// deletion arms' second half: the caller has ALREADY performed the
-    /// one-row CAS (a writer's own `abort`, or the reaper's fail CAS) that
-    /// licenses this deletion. 404 is not an error.
+    /// and catalog rows) — under the ownership `cas` names. The byte-deletion
+    /// half every deletion arm shares (`abort()`, recovery's claim/fail CAS,
+    /// `reconcile(apply=true)`): the caller has ALREADY performed the
+    /// one-row CAS that licenses this deletion. 404 is not an error.
     pub(crate) async fn delete_objects_after_cas(
         &self,
         parquet_url: &StorageUrl,
@@ -1255,19 +1270,6 @@ impl ResultStore {
         parquet_handle.delete_if_exists(&sidecar).await?;
         self.purge_segments(cas).await?;
         Ok(())
-    }
-
-    /// Best-effort delete of a terminal result-table's parquet object, its
-    /// manifest sidecar, and its whole ANN segment set (bundles and catalog
-    /// rows). 404 is not an error. Enumerates the segment set from the
-    /// catalog, so it must run *before* the table's `result_tables` row is
-    /// removed. The row must carry no live lease (a `ready` / `failed` row,
-    /// or a `building` row whose writer is dead) — a live writer's table is
-    /// never deleted from under it.
-    pub async fn delete_table_files(&self, table: &ResultTableRecord) -> Result<()> {
-        let parquet_url = StorageUrl::parse(&table.parquet_path)?;
-        let cas = ResultTableCas::expired(&table.table_name, &lease_now(), parse_owner(table)?);
-        self.delete_objects_after_cas(&parquet_url, &cas).await
     }
 
     /// Rebuild a table's whole ANN index from its Parquet as a single fresh
@@ -1383,7 +1385,7 @@ impl ResultStore {
             .await?;
 
         // The building row carries this table's persisted precision; the
-        // segment is built at THAT precision (B4), read back off the handle
+        // segment is built at THAT precision, read back off the handle
         // (which captured the stamped value) rather than re-derived from
         // `self.ann` — the uniform, drift-proof source `append_segment`'s own
         // guard checks against.

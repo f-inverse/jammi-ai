@@ -97,6 +97,7 @@ impl Catalog {
         let index_path = index_path.to_string();
         let created_at = crate::catalog::backend::now_sortable();
         let tenant = self.current_tenant();
+        let kind = self.backend().backend_kind();
         let outcome = self
             .backend()
             .transaction(TxOptions::default(), |tx| {
@@ -104,7 +105,7 @@ impl Catalog {
                     let cas = cas_in_tx;
                     tx.set_tenant(tenant);
                     let mut params: Vec<SqlValue<'static>> = Vec::new();
-                    let predicate = cas.render_owner_exists(&mut params);
+                    let predicate = cas.render_owner_exists(kind, &mut params);
                     // `render_owner_exists` carries no status arm; a segment
                     // may only be appended to a row still `building`.
                     let owner_tenant = tx
@@ -159,6 +160,7 @@ impl Catalog {
     pub async fn delete_index_segments(&self, cas: &ResultTableCas) -> Result<u64> {
         let cas = cas.clone();
         let tenant = self.current_tenant();
+        let kind = self.backend().backend_kind();
         Ok(self
             .backend()
             .transaction(TxOptions::default(), |tx| {
@@ -166,7 +168,7 @@ impl Catalog {
                     tx.set_tenant(tenant);
                     let mut params: Vec<SqlValue<'static>> =
                         vec![SqlValue::TextOwned(cas.table.clone())];
-                    let owner = cas.render_owner_exists(&mut params);
+                    let owner = cas.render_owner_exists(kind, &mut params);
                     tx.execute(
                         &format!("DELETE FROM index_segments WHERE table_name = $1 AND {owner}"),
                         &params,

@@ -295,11 +295,16 @@ pub async fn abandon_building(
         ResultTableStatus::Building.to_string(),
         "abandon_building: precondition — the row is still `building`"
     );
+    // The catalog's own backend-correct liveness predicate, not a Rust-side
+    // string compare against `lease_expires_at` — that stored value is a
+    // Postgres-clock expression's text rendering on Postgres, not a
+    // `lease_now()`-shaped string a naive `>` compare here would assume.
     assert!(
-        before
-            .lease_expires_at
-            .as_deref()
-            .is_some_and(|until| until > jammi_db::catalog::lease::lease_now().as_str()),
+        TenantBinding::admin_scope(catalog.list_live_building_tables())
+            .await
+            .unwrap()
+            .iter()
+            .any(|t| t.table_name == name),
         "abandon_building: precondition — the row carries a live lease, got {:?}",
         before.lease_expires_at
     );

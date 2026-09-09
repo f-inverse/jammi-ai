@@ -291,7 +291,10 @@ async fn young_orphan_is_pending_not_deleted() {
 
 // ─── an unattributed key survives even at the SHORTEST valid grace under
 //     `apply=true` (unattributed is skipped before the age gate at all,
-//     so this holds independent of the object's age) ─────────────────────
+//     so this holds independent of the object's age) — reported ONLY by
+//     the admin cross-tenant pass (block #4: a scoped pass, even an
+//     unscoped/GLOBAL one, reports NOTHING it cannot attribute to its own
+//     prefix; an unattributed key is store-wide by definition) ───────────
 
 #[tokio::test]
 async fn unattributed_key_never_deleted_regardless_of_grace() {
@@ -309,7 +312,7 @@ async fn unattributed_key_never_deleted_regardless_of_grace() {
     backdate_dir(&root, Duration::from_secs(3600));
 
     let report = store
-        .reconcile(ReconcileOptions {
+        .reconcile_all(ReconcileOptions {
             apply: true,
             grace: Duration::from_secs(3),
         })
@@ -321,7 +324,42 @@ async fn unattributed_key_never_deleted_regardless_of_grace() {
             .contains(&"pre_layout_table.parquet".to_string()),
         "{report:?}"
     );
+    assert_eq!(report.unattributed_count, 1);
     assert!(report.orphans.is_empty());
+    assert!(root.join("pre_layout_table.parquet").exists());
+}
+
+/// Block #4, RED first: the SAME stray key as above, but seen through the
+/// SCOPED arm (`ResultStore::reconcile`, even on an unscoped/GLOBAL store —
+/// scoped is scoped regardless of which tenant) — must report NOTHING for
+/// it. Before the fix this failed: a scoped pass listed every unattributed
+/// key store-wide.
+#[tokio::test]
+async fn scoped_reconcile_never_reports_unattributed_keys() {
+    let dir = tempdir().unwrap();
+    let catalog = Arc::new(Catalog::open(dir.path()).await.unwrap());
+    let store = ResultStore::new(dir.path(), Arc::clone(&catalog), AnnIndexConfig::default())
+        .unwrap()
+        .with_lease_intervals(short_lease());
+
+    let root = dir.path().join("jammi_db");
+    std::fs::create_dir_all(&root).unwrap();
+    std::fs::write(root.join("pre_layout_table.parquet"), b"ancient-bytes").unwrap();
+    backdate_dir(&root, Duration::from_secs(3600));
+
+    let report = store
+        .reconcile(ReconcileOptions {
+            apply: true,
+            grace: Duration::from_secs(3),
+        })
+        .await
+        .unwrap();
+    assert!(
+        report.unattributed.is_empty(),
+        "a scoped pass must report NO unattributed entries: {report:?}"
+    );
+    assert_eq!(report.unattributed_count, 0, "{report:?}");
+    // Never deleted either way — out of scope, not merely "not old enough".
     assert!(root.join("pre_layout_table.parquet").exists());
 }
 
@@ -531,4 +569,83 @@ async fn running_jobs_artifact_prefix_survives_and_is_never_unattributed() {
         .join("0")
         .join("adapter.safetensors")
         .exists());
+}
+
+// ─── block #3, RED first: a `models` row names a prefix whose `manifest.json`
+//     is absent — the row is still live, so the prefix is NEVER reclaimed
+//     through the orphan arm, at any grace or `apply`; it is reported as
+//     `damaged` instead (row present, manifest absent) ────────────────────
+
+#[tokio::test]
+async fn models_row_prefix_with_no_manifest_is_damaged_never_reclaimed() {
+    let dir = tempdir().unwrap();
+    let catalog = Arc::new(Catalog::open(dir.path()).await.unwrap());
+    let store = ResultStore::new(dir.path(), Arc::clone(&catalog), AnnIndexConfig::default())
+        .unwrap()
+        .with_lease_intervals(short_lease());
+
+    let job_id = Uuid::new_v4().to_string();
+    let bundle = vec![(
+        "adapter.safetensors".to_string(),
+        bytes::Bytes::from_static(b"weights"),
+    )];
+    let prefix_url = store
+        .artifact_store()
+        .put_artifact(None, &[&job_id], &bundle)
+        .await
+        .unwrap();
+
+    // A `models` row names exactly this prefix as its winning attempt.
+    catalog
+        .register_model(RegisterModelParams {
+            model_id: "damaged-model",
+            version: 1,
+            model_type: "embedding",
+            backend: "candle",
+            task: ModelTask::TextEmbedding,
+            base_model_id: None,
+            artifact_path: Some(prefix_url.as_str()),
+            config_json: None,
+        })
+        .await
+        .unwrap();
+
+    // Torn write / corrupted publish: the manifest is gone, the weights
+    // survive. Backdate everything so it is well past a short grace.
+    let prefix_dir = dir
+        .path()
+        .join("jammi_db")
+        .join("models")
+        .join("_global")
+        .join(&job_id);
+    std::fs::remove_file(prefix_dir.join("manifest.json")).unwrap();
+    backdate_dir(&prefix_dir, Duration::from_secs(3600));
+
+    let report = store
+        .reconcile(ReconcileOptions {
+            apply: true,
+            grace: Duration::from_secs(3),
+        })
+        .await
+        .unwrap();
+
+    assert!(
+        report
+            .damaged
+            .iter()
+            .any(|d| d.ends_with("adapter.safetensors")),
+        "a models-row-named prefix with no manifest must be reported damaged: {report:?}"
+    );
+    assert_eq!(report.damaged_count, 1, "{report:?}");
+    assert!(
+        report
+            .orphans
+            .iter()
+            .all(|o| !o.ends_with("adapter.safetensors")),
+        "damaged bytes must never fall through to the orphan arm: {report:?}"
+    );
+    assert!(
+        prefix_dir.join("adapter.safetensors").exists(),
+        "damaged bytes are never reclaimed, even past grace under apply=true"
+    );
 }

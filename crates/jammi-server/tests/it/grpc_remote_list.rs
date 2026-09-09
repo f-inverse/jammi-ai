@@ -24,7 +24,6 @@ use arrow_schema::{DataType, Field, Schema, SchemaRef};
 use jammi_ai::Session;
 use jammi_client::DataClient;
 use jammi_db::catalog::channel_repo::{ChannelColumn, ChannelColumnType, ChannelSpec};
-use jammi_db::catalog::lease::lease_now;
 use jammi_db::catalog::model_repo::RegisterModelParams;
 use jammi_db::catalog::result_repo::{
     CreateResultTableParams, Owner, ResultTableCas, ResultTableKind, TenantArm,
@@ -300,7 +299,7 @@ async fn seed_segmented_table(server: &EngineServer, table: &str, segments: &[(i
         .catalog()
         .create_result_table(CreateResultTableParams {
             writer_id: None,
-            lease_expires_at: None,
+            lease: None,
             table_name: table,
             source_id: "seg_src",
             model_id: "seg_model",
@@ -326,7 +325,7 @@ async fn seed_segmented_table(server: &EngineServer, table: &str, segments: &[(i
                     &ResultTableCas {
                         table: table.to_string(),
                         tenant_arm: TenantArm::Strict(None),
-                        owner: Owner::ExpiredLease(lease_now()),
+                        owner: Owner::ExpiredLease,
                     },
                     *id,
                     path,
@@ -465,7 +464,7 @@ async fn remote_list_index_segments_denies_a_peer_tenants_table() {
                 .catalog()
                 .create_result_table(CreateResultTableParams {
                     writer_id: None,
-                    lease_expires_at: None,
+                    lease: None,
                     table_name: "a_owned_rt",
                     source_id: "seg_src",
                     model_id: "seg_model",
@@ -492,7 +491,7 @@ async fn remote_list_index_segments_denies_a_peer_tenants_table() {
                 &ResultTableCas {
                     table: "a_owned_rt".to_string(),
                     tenant_arm: TenantArm::Strict(Some(owner)),
-                    owner: Owner::ExpiredLease(lease_now()),
+                    owner: Owner::ExpiredLease,
                 },
                 0,
                 "file:///idx/a-0",

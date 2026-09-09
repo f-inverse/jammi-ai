@@ -129,6 +129,36 @@ jobs:
     # proves the devcontainer Dockerfile's OWN layers (the pinned nightly
     # toolchain install, the build-graph cargo install, the yum packages),
     # not only that the base image resolves.
+    #
+    # `latest` itself is STILL the pre-this-branch amd64-only manifest --
+    # `_ci-base-image.yml` only moves `latest` on the default branch, and
+    # this is a feature-branch build, so `.devcontainer/Dockerfile`'s own
+    # `FROM ghcr.io/f-inverse/jammi-ai-ci:latest` resolves to the OLD image
+    # here, not this branch's index (first probe run: buildx pulled the
+    # amd64 manifest under `linux/arm64` anyway, warned
+    # `InvalidBaseImagePlatform`, and the job died with `exec format error`
+    # trying to run an amd64 shell on an arm64 kernel). `--build-context
+    # ghcr.io/f-inverse/jammi-ai-ci:latest=docker-image://ghcr.io/
+    # f-inverse/jammi-ai-ci:sha-e5aad8c782a2557ffe15734fabaa9cd2cec2f336`
+    # is buildx's documented named-build-context mechanism for substituting
+    # ANY image reference a Dockerfile's `FROM` names, without editing the
+    # Dockerfile itself -- verified locally (buildx v0.36.1) against a
+    # synthetic `FROM alpine:latest` + `--build-context alpine:latest=
+    # docker-image://alpine:3.18`: the resolved build genuinely pulled
+    # 3.18, not real `latest`. `actions/runner-images`' x86_64
+    # `ubuntu-24.04` README pins the SAME `Docker-Buildx 0.36.1`; the
+    # `actions/partner-runner-images` arm64 README lists buildx as
+    # installed but does not pin a version, so the exact arm64 runner
+    # version is assumed comparable (this mechanism has existed since
+    # buildx 0.10 / Docker 23, well below anything a 2026-era image ships)
+    # rather than independently confirmed -- if this step fails with an
+    # unrecognized-flag error, that assumption is what to revisit first.
+    #
+    # THIS IS PROBE-ONLY: `.devcontainer/Dockerfile` itself is untouched --
+    # overriding what it resolves to for one throwaway CI run is exactly
+    # what this flag is for, never a substitute for the real fix, which is
+    # simply time: after this branch merges, `latest` IS the multi-arch
+    # index and no override is needed anywhere, including here.
     runs-on: ubuntu-24.04-arm
     steps:
       - uses: actions/checkout@v4
@@ -137,4 +167,6 @@ jobs:
 
       - name: docker buildx build .devcontainer/Dockerfile (native arm64, no push)
         run: |
-          docker buildx build --platform linux/arm64 -f .devcontainer/Dockerfile .devcontainer
+          docker buildx build --platform linux/arm64 \
+            --build-context ghcr.io/f-inverse/jammi-ai-ci:latest=docker-image://ghcr.io/f-inverse/jammi-ai-ci:sha-e5aad8c782a2557ffe15734fabaa9cd2cec2f336 \
+            -f .devcontainer/Dockerfile .devcontainer

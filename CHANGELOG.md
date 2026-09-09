@@ -239,6 +239,48 @@ workspace ships every publishable crate at the same
   `docs/plans/66-tower-profile/README.md` and `CONTRACT.md` (the frozen v2.5 contract)
   for the full per-leg table and PR trail.
 <!-- /profile-421-generated -->
+- **Advisory-locked Postgres migrations (#479, esc-093).** `catalog::migrations::run`
+  takes a transaction-scoped Postgres advisory lock (`SELECT pg_advisory_xact_lock($1)`,
+  keyed by `JAMMI_MIGRATION_LOCK_KEY`) as its first statement, before it reads the
+  `applied_migrations` ledger or runs any schema DDL, closing a race where two fresh
+  replicas booting concurrently against one database could both see an empty ledger and
+  one loses with SQLSTATE `42P07`/`23505`. Released on commit or rollback (PgBouncer
+  transaction-pooling safe); SQLite is unaffected (`BEGIN IMMEDIATE` already serialises
+  the one process that may hold the file).
+- **Tenant-prefixed result-table and artifact layout (#484).** A new
+  `crates/jammi-db/src/store/layout.rs` owns the one key scheme every result-table and
+  artifact object now lives under: `TenantSegment::of`/`parse` (`_global` or a tenant's
+  canonical hyphenated lowercase UUID, exact inverses of each other — a non-canonical
+  UUID spelling in a listed key is `unattributed`, never coerced), `result_table_url` →
+  `{root}/{seg}/{table}.parquet`, and `segment_url`/`sidecar_url`, which derive a table's
+  siblings from its OWN `parquet_path` rather than the store's current root. Model
+  artifacts move to `models/{seg}/{job_id}/…` under the same segment scheme.
+- **`ResultStore::reconcile`/`reconcile_all`, a cross-check of the catalog against the
+  object store (#484).** The ONE place this engine performs an object-store `LIST`. Lists
+  first, reads rows second, so the row set is always a superset of every object's true
+  referencer at listing time. Checks both directions: a `ready` row's required objects
+  (Parquet, the manifest sidecar when `definition_hash` is set, every required ANN
+  sidecar) all present, else `ready → failed` by CAS; every other listed object either
+  referenced by a live row/job/model artifact or an orphan, aged against `grace` before
+  `--apply` reclaims it, or `unattributed` (a key that fails the tenant/artifact
+  allowlist outright — reported, never deleted at any grace). `reconcile` scopes to the
+  store's own tenant binding; `reconcile_all` wraps the whole pass in an admin scope and
+  covers every tenant. Wired end to end: `CatalogService.Reconcile` (gRPC, `all=true`
+  gated by the new `AdminAuthorizer` seam below), `jammi reconcile [--apply]
+  [--grace-secs N] [--all]` (CLI), and `Database.reconcile(apply, grace_secs, all)`
+  (`jammi-python`, embedded `all=True` = `reconcile_all`).
+- **`AdminAuthorizer`, a gRPC-only capability gate for `Reconcile`'s cross-tenant admin
+  pass (#484).** A synchronous `fn authorize(&self, metadata: &MetadataMap) ->
+  Result<(), Status>` a deployment supplies at `GrpcChain.admin_authorizer` (a new,
+  optional 4th parameter to `CatalogServer::new`); the shipped default is `None`, which
+  refuses EVERY `Reconcile { all: true }` request with `PERMISSION_DENIED` naming
+  `security.md`. A tenant-scoped `Reconcile` (`all = false`) never consults it. The gate
+  is gRPC-only by construction — `Reconcile` has no Flight SQL analogue — distinct from
+  the `TenantResolver` seam, which binds both transports from one grant.
+- **A Backup and Restore guide page (`docs/guide/src/backup-and-restore.md`).** The
+  close-first SQLite recipe, the Postgres `pg_dump`/PITR + object-store-snapshot recipe,
+  why `cache/` is always excludable, the storage-then-catalog restore ordering rule, and
+  when to run `jammi reconcile`.
 
 ### Changed
 - **One lease primitive; lease-owned `building` result tables (#479, esc-094).** A
@@ -288,6 +330,17 @@ workspace ships every publishable crate at the same
   `Armed::wait_parked` / `release`) for the same-process two-writer oracles; CI runs
   `cargo test -p jammi-db --features test-hooks --test it -- --test-threads=1` (and the
   Postgres form), which also runs the two SIGKILL crash harnesses in CI for the first time.
+- **`ResultStore::with_root` gains `local_cache_dir` as a 5th parameter, and both local
+  caches move out of the result-table root (#484).** `local_cache_dir` is the PARENT of
+  the two local caches the store derives: `{local_cache_dir}/index` (materialised remote
+  ANN segments) and `{local_cache_dir}/artifact` (the model-artifact fetch cache); both
+  are always local paths, even against a cloud-scheme root. The default embedded
+  `ResultStore::new(artifact_dir, …)` now roots them at `{artifact_dir}/cache/index` and
+  `{artifact_dir}/cache/artifact` instead of inside `jammi_db/` — a public API change,
+  announced. The old on-disk `jammi_db/index_cache`/`artifact_cache` directories are
+  inert after upgrade: cold caches the store no longer reads or writes, reported by
+  `reconcile` as `unattributed` and never deleted. See
+  `docs/guide/src/cloud-storage.md`.
 - **The media front end's per-item decode/preprocess runs across the batch in parallel on
   rayon's global pool (#421 follow-on).** `rayon` becomes a direct `jammi-ai` dependency (pinned
   to the version already unified across the resolved tree; no version bump). Two stages, signatures
@@ -500,6 +553,17 @@ workspace ships every publishable crate at the same
   completed attempt sitting behind an in-flight rerun still denies (F5).
 
 ### Fixed
+- **Two concurrent `migrate()` callers on a fresh Postgres database could both attempt the
+  schema DDL, one losing with SQLSTATE `42P07`/`23505` (#479, esc-093).** No cross-process
+  mutual exclusion guarded the read-ledger-then-run-DDL window on a backend the guide
+  already called multi-replica safe. Fixed by the advisory lock described above.
+- **Startup recovery could reap a `building` result table still owned by a live writer in
+  a different session or process, deleting its bytes out from under it (#479, esc-094).**
+  Recovery had no ownership predicate at all — it inferred "abandoned" from Parquet/manifest
+  state alone, so a second session opening the same catalog mid-materialization could
+  observe (and reap) another writer's in-progress row. Fixed by the lease-owned CAS
+  predicate described above: recovery now enumerates only rows whose lease is absent or
+  expired, and every deletion follows a one-row compare-and-set naming the new owner.
 - **`jammi-encoders`' unit-test binary now serializes every writer of EVERY process-wide fusible-seam
   dispatch counter through the SAME lock the exact-count census oracle's reader holds (esc-092 /
   #476).** The class is "every training-arm admission site this crate owns", not just the three
@@ -710,6 +774,17 @@ workspace ships every publishable crate at the same
   column keeps its documented `""` reading (esc-091).
 
 ### Breaking
+- **Existing result-table and artifact object keys predating the tenant-prefixed layout
+  are unattributed until the table is re-materialized (#484).** `reconcile`'s allowlist
+  recognizes only `{seg}/{table}.parquet` and `models/{seg}/{job_id}/…` keys (`seg` a
+  `TenantSegment`); an older flat key never round-trips through `TenantSegment::parse`
+  and is reported as `unattributed` — permanently, at any `grace` — never deleted, but
+  also never reclaimed or migrated automatically. Existing catalog rows still resolve
+  those keys directly (their stored `parquet_path` is unaffected — only NEW tables and
+  artifacts write under the tenant-prefixed scheme), so this is a `reconcile`-reporting
+  change, not a read-path break; running `jammi reconcile` after upgrading a live
+  deployment will surface every pre-existing table's objects as `unattributed` until each
+  table is re-materialized under the new layout, which is expected and requires no action.
 - `jammi_ai::inference::{arrow_to_images, arrow_to_audio}` return one decode result per row
   (`Result<Vec<Option<Result<T>>>>`, previously `Result<Vec<Option<T>>>`) and
   `jammi_ai::inference::schema::build_prefix_columns` returns a `Result`: a row that fails to

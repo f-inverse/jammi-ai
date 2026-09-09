@@ -88,7 +88,7 @@ A working copy of this file ships at
 | --- | --- | --- |
 | Operational footprint | One file under `artifact_dir`. No daemon. | Externally-managed Postgres cluster. |
 | Concurrent writers | One; WAL mode lets many readers run alongside one writer. | Many. |
-| Multi-process deployment | Single-process only, and enforced on unix: the catalog opens through SQLite's `unix-excl` VFS, which holds a process-scoped exclusive lock on the file. A second process opening the same `artifact_dir` is refused with a typed `backend unavailable` error naming this contract after the 5 s busy timeout — it never corrupts the WAL and never hangs. Handing the directory to another process is an awaited event (`Catalog::close().await` / `JammiSession::close().await`), not a drop. | Multi-replica safe. |
+| Multi-process deployment | Single-process only, and enforced on unix: the catalog opens through SQLite's `unix-excl` VFS, which holds a process-scoped exclusive lock on the file. A second process opening the same `artifact_dir` is refused with a typed `backend unavailable` error naming this contract after the 5 s busy timeout — it never corrupts the WAL and never hangs. Handing the directory to another process is an awaited event (`Catalog::close().await` / `JammiSession::close().await`), not a drop. | Multi-replica safe — see [Multi-writer safety](#multi-writer-safety) below. |
 | Failure recovery | File restore from backup. | Standard Postgres point-in-time-recovery. |
 | Pool tuning | None — opens one pool of 8 connections. | `pool_size` + `max_lifetime_secs` honour `sqlx::PgPool` knobs. |
 
@@ -109,6 +109,58 @@ the escape's oracle against it and observing the RED; engaging it logs a
 For laptop / single-tenant deployments, SQLite is the right answer; the
 trade-off table tilts to Postgres the moment a second `jammi-server`
 replica enters the picture.
+
+## Multi-writer safety
+
+Postgres's multi-replica safety rests on three mechanisms, all under one
+lease primitive (`crates/jammi-db/src/catalog/lease.rs`, `[lease]` in
+[Configuration](./configuration.md)):
+
+**Lease-owned building tables.** A result table under construction is not a
+bare row a crash can leave ambiguous — `ResultStore::create_table` stamps it
+with `writer_id = "writer-{uuid}"` (one per `ResultStore` instance, so two
+sessions in one process are distinct writers) and a `lease_expires_at`
+deadline, then returns a `BuildingTable` handle whose background heartbeat
+renews that lease every `heartbeat` seconds. Every transition on the row —
+checkpoint, segment insert, promote to `ready`, fail — is a compare-and-set
+naming `(table_name, writer_id, status = 'building')`, so a stalled or
+crashed writer can never be mistaken for a live one: its lease simply
+expires, and only THEN is the row reclaimable.
+
+**The advisory lock around migrations.** On Postgres, `catalog::migrations::run`
+takes a transaction-scoped advisory lock (`SELECT pg_advisory_xact_lock($1)`,
+keyed by `JAMMI_MIGRATION_LOCK_KEY`) as the very first statement, before it
+reads the `applied_migrations` ledger or runs any (non-idempotent) schema
+DDL. Two replicas booting against one fresh database serialise on this lock
+instead of racing the ledger read against each other's DDL; the lock is
+released on commit or rollback, so it stays correct under PgBouncer
+transaction pooling. SQLite needs no equivalent: its `BEGIN IMMEDIATE` write
+transaction already serialises the one process that may hold the file.
+
+**What recovery does at session construction.** Every session construction
+runs `ResultStore::recover()` under an **admin scope** — the one place a
+session bypasses its own tenant binding — because a dead writer's orphaned
+row can belong to any tenant, not only the one this session is bound to.
+Recovery enumerates ONLY `building` rows whose lease is absent or expired
+(`lease_expired_clause`); a row under a live lease belongs to a writer that
+is still working and is left completely alone, wherever it runs. For each
+expired-lease row, recovery deletes bytes only after a one-row
+compare-and-set names it the new owner (claiming a promotable row before it
+rebuilds the ANN sidecar and promotes it, or flipping a reapable row to
+`failed` before it deletes) — never a bare "looks abandoned" heuristic, and
+never before that CAS. This sweep runs across **every** tenant, even from a
+tenant-bound embedded session, and each reconciled row keeps its own
+`tenant_id`.
+
+**`jammi reconcile`.** The lease sweep above only ever looks at rows still
+carrying a live catalog entry; it says nothing about an object that was
+written but never got a row (or a row's objects that outlived the row). The
+`jammi reconcile [--apply] [--grace-secs N] [--all]` CLI (backed by
+`ResultStore::reconcile`/`reconcile_all`) cross-checks the catalog against a
+live object-store listing in both directions — see
+[Backup and Restore](./backup-and-restore.md) for when to run it, and the
+maintainer guide (`docs/maintainer/MAINTAINER-GUIDE.md`) for the allowlist
+and deletion-arm detail.
 
 ## In-memory vs JetStream broker
 

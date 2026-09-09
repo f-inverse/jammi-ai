@@ -193,22 +193,53 @@ which case the anchor is the read instant and the verdict says so.
 ## How recovery reconciles manifest sidecars
 
 `ResultStore::recover()` runs at startup and restores the crash-consistency
-invariant of the catalog↔storage boundary across **every** tenant (it runs under
-an admin scope). For the materialization contract it enforces two rules:
+invariant of the catalog↔storage boundary across **every** tenant (it runs
+under an admin scope — see
+[Catalog Backend and Trigger Broker → Multi-writer safety](./catalog-and-broker.md#multi-writer-safety)
+for the lease primitive this section assumes). Its domain is deliberately
+narrow: it enumerates **only** `building` rows whose lease is absent or
+expired (`Catalog::list_expired_building_tables`). A `building` row under a
+**live** lease belongs to a writer that is still producing it — recovery does
+not even look at its Parquet or manifest state, on any tenant, from any
+session. For each expired-lease row it finds, recovery first *claims* it by a
+one-row compare-and-set naming the recoverer the row's new owner (the
+recoverer becomes a writer, heartbeating a fresh lease of its own) — only
+after that claim succeeds does it inspect bytes or delete anything, so a
+writer that renews mid-sweep, or a peer recoverer that claims first, is never
+raced. For the materialization contract specifically, the claimed row's
+Parquet and manifest state decide the terminal CAS:
 
-- **A `building` orphan with valid Parquet but no manifest is reaped.** The write
+- **A claimed row with valid Parquet but no manifest is reaped.** The write
   was torn in the window between the Parquet landing and the manifest being
-  written — before the `building → ready` flip. The contract forbids promoting a
-  table without an attestation, and the producing descriptor cannot be
-  reconstructed after the fact, so the row is driven to `failed` and its bytes
-  reaped — never promoted manifest-less. (A `building` orphan that *does* have its
-  manifest is promoted, backfilling the summary columns the live path records.)
-- **A `ready` table whose manifest has since vanished is reaped.** A
-  *post-contract* row — one whose catalog `definition_hash` is set, so it was
-  promoted under the contract — whose `.materialization.json` is now absent is a
-  corruption: the attestation a verifier would read is gone. Such a row is driven
-  to `failed` and its bytes reaped, rather than left queryable with a silently
-  missing manifest.
+  written — before the `building → ready` flip. The contract forbids promoting
+  a table without an attestation, and the producing descriptor cannot be
+  reconstructed after the fact, so the row is driven to `failed` by CAS and
+  its bytes are deleted only after that CAS affects exactly one row — never
+  promoted manifest-less.
+- **A claimed row that *does* have its manifest is promoted**, backfilling the
+  summary columns (`definition_hash`, input anchors, the *true* Parquet
+  footer row count — never the count the writer intended before it crashed)
+  the live path records, and rebuilding the ANN sidecar from the Parquet for
+  an embedding table so it self-heals even if its segment set never landed.
+- **A `ready` table whose manifest has since vanished is reaped.** This is
+  `reconcile_ready_manifests`, which `recover()` also runs (across every
+  post-contract `ready` row — one whose catalog `definition_hash` is set, so
+  it was promoted under the contract): its `.materialization.json` being
+  absent is a corruption, since the attestation a verifier would read is
+  gone. Such a row is driven to `failed` by a status-guarded CAS and its
+  bytes reaped, rather than left queryable with a silently missing manifest.
+
+Every deletion in both reaping arms above follows its own one-row CAS — the row's *new*
+owner (the recoverer, having just claimed it) deletes what it now owns; a
+failed delete is logged and left for a later `jammi reconcile` pass, never
+silently swallowed. This is two of the engine's three deletion arms for a
+building row's bytes; the third is a writer's own `abort()` after its own
+CAS. See [Operability](./operability.md#failure-mode-matrix) for the full
+crash-mid-publish failure-mode entry, and
+[Backup and Restore](./backup-and-restore.md) for what a catalog/storage
+restore that lands *outside* this lease-driven window (an object whose row
+was never written at all, or vice versa) requires — `jammi reconcile`, not
+`recover()`.
 
 Pre-contract tables report honestly rather than being penalised. A row created
 before migration 021 carries `definition_hash IS NULL` in the catalog and

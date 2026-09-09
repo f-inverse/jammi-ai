@@ -57,8 +57,21 @@ pub struct ReconcileOptions {
     /// referencing row before a pass would otherwise reclaim them.
     /// `apply = true` REQUIRES `grace >= ` the deployment's configured lease
     /// duration ([`ReconcileOptions`] alone cannot express this — the check
-    /// is [`ResultStore::reconcile`]'s), so a lease that is merely running
-    /// long can never be raced by a reclaim.
+    /// is [`ResultStore::reconcile`]'s), which keeps a lease that is merely
+    /// running long from being raced by a reclaim UNDER SYNCHRONIZED CLOCKS.
+    ///
+    /// **The grace gate compares two DIFFERENT clocks, not one.** The age
+    /// check (`obj.last_modified <= now - grace`) reads `last_modified` off
+    /// the OBJECT STORE (its own clock, wherever the bytes physically live —
+    /// a cloud provider's, or the local filesystem's) and compares it
+    /// against THIS REPLICA's `Utc::now()` — never the catalog database's
+    /// clock the way a lease predicate does (`catalog::lease`'s module
+    /// docs). `grace >= lease.duration` is exact only when the object
+    /// store's clock and this replica's clock agree; ordinary NTP-level
+    /// skew (milliseconds to low seconds in a well-run fleet) erodes the
+    /// margin `grace` provides, it does not remove the mechanism — a `grace`
+    /// several multiples of the lease duration is the practical guard against
+    /// clock skew the same way it already is against slow writers.
     pub grace: Duration,
 }
 
@@ -80,8 +93,14 @@ pub struct ReconcileReport {
     /// [`ReconcileOptions::apply`]).
     pub applied: bool,
     /// Result tables flipped `ready -> failed` this pass (an incomplete
-    /// object set was found for them).
+    /// object set was found for them) — a row whose fail-CAS missed (someone
+    /// else already changed it) is never counted here; it stays `still_ready`
+    /// and protected. Capped at [`REPORT_LIST_CAP`]; see
+    /// [`Self::rows_failed_count`].
     pub rows_failed: Vec<String>,
+    /// The true count of rows flipped `ready -> failed` this pass,
+    /// independent of whether [`Self::rows_failed`] was truncated.
+    pub rows_failed_count: u64,
     /// Orphan candidates at least `grace` old — deleted when `applied`.
     /// Capped at [`REPORT_LIST_CAP`]; see [`Self::orphan_count`].
     pub orphans: Vec<String>,
@@ -114,9 +133,9 @@ pub struct ReconcileReport {
     /// The true count of damaged keys found this pass, independent of
     /// whether [`Self::damaged`] was truncated.
     pub damaged_count: u64,
-    /// `true` iff any of [`Self::orphans`], [`Self::pending`],
-    /// [`Self::unattributed`], [`Self::damaged`] was cut to
-    /// [`REPORT_LIST_CAP`] entries — the corresponding `*_count` field is
+    /// `true` iff any of [`Self::rows_failed`], [`Self::orphans`],
+    /// [`Self::pending`], [`Self::unattributed`], [`Self::damaged`] was cut
+    /// to [`REPORT_LIST_CAP`] entries — the corresponding `*_count` field is
     /// still the true total either way.
     pub truncated: bool,
     /// Total bytes actually reclaimed (`orphans` deleted this pass; `0` when
@@ -316,24 +335,47 @@ impl ResultStore {
         // in `still_ready` so its objects remain protected — nothing new
         // becomes reclaimable from a pass that changed nothing.
         let mut rows_failed = Vec::new();
+        let mut rows_failed_count = 0u64;
+        let mut truncated = false;
         let mut still_ready = Vec::with_capacity(ready_rows.len());
         for table in ready_rows.drain(..) {
             if self.required_row_objects_present(&table).await? {
                 still_ready.push(table);
                 continue;
             }
-            rows_failed.push(table.table_name.clone());
             if !opts.apply {
+                // Dry run: reported, but the row stays `still_ready` (never
+                // removed from the protected set) — "apply=false mutates
+                // nothing" extends to what a later step in THIS SAME pass
+                // considers reclaimable.
+                push_capped(
+                    &mut rows_failed,
+                    &mut rows_failed_count,
+                    &mut truncated,
+                    table.table_name.clone(),
+                );
                 still_ready.push(table);
                 continue;
             }
-            // A miss (row moved on already) is not this pass's problem —
-            // whoever else changed it owns reporting; the row is already
-            // excluded from `still_ready` either way.
-            let _ = self
+            if self
                 .catalog
                 .fail_ready_result_table(&table.table_name)
-                .await?;
+                .await?
+            {
+                push_capped(
+                    &mut rows_failed,
+                    &mut rows_failed_count,
+                    &mut truncated,
+                    table.table_name.clone(),
+                );
+            } else {
+                // The fail-CAS missed: someone else already changed this row
+                // (it may already be `ready` again with its objects restored,
+                // or reaped by a concurrent pass) — never counted as THIS
+                // pass's fail, and its objects stay in the referenced set
+                // (protected), not treated as newly reclaimable.
+                still_ready.push(table);
+            }
         }
         ready_rows = still_ready;
 
@@ -380,7 +422,8 @@ impl ResultStore {
         let mut unattributed_count = 0u64;
         let mut damaged = Vec::new();
         let mut damaged_count = 0u64;
-        let mut truncated = false;
+        // `truncated` is shared with the ready-row loop above: a cap hit on
+        // ANY list (including `rows_failed`) sets the one report-wide flag.
         let mut bytes_reclaimed = 0u64;
         let cutoff =
             Utc::now() - chrono::Duration::from_std(opts.grace).unwrap_or(chrono::Duration::MAX);
@@ -433,7 +476,33 @@ impl ResultStore {
                             "{}/{prefix_rel}",
                             self.root.as_str().trim_end_matches('/')
                         ))?;
-                        match self.artifact_store().expected_objects(&prefix_url).await? {
+                        // Advisory #8: a present-but-UNREADABLE manifest (a
+                        // genuine I/O or parse fault, not "no manifest at all"
+                        // — that's `Ok(None)`, handled below) must never abort
+                        // the WHOLE pass over one bad bundle. Route this one
+                        // prefix to `damaged` and keep going.
+                        let expected_objects = match self
+                            .artifact_store()
+                            .expected_objects(&prefix_url)
+                            .await
+                        {
+                            Ok(e) => e,
+                            Err(e) => {
+                                tracing::warn!(
+                                    prefix = %prefix_url,
+                                    error = %e,
+                                    "reconcile: manifest present but unreadable; reporting damaged"
+                                );
+                                push_capped(
+                                    &mut damaged,
+                                    &mut damaged_count,
+                                    &mut truncated,
+                                    obj.rel.clone(),
+                                );
+                                continue;
+                            }
+                        };
+                        match expected_objects {
                             Some(expected) => {
                                 // `expected` is already a set of
                                 // driver-relative `object_store::path::Path`s
@@ -503,6 +572,7 @@ impl ResultStore {
             scope,
             applied: opts.apply,
             rows_failed,
+            rows_failed_count,
             orphans,
             orphan_count,
             pending,

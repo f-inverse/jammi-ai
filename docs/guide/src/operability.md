@@ -157,6 +157,16 @@ worker crash leaves the row claimable again after the lease expires.
 
 - **`reconcile_ready_manifests`'s boot cost is one `exists()` per post-contract `ready` row** (`definition_hash IS NOT NULL`) — it checks only that row's `.materialization.json` sidecar is still present, never a full object-store `LIST`. A pre-contract row (`definition_hash IS NULL`) is skipped entirely; it legitimately has no sidecar to check.
 - **A key written before the tenant-prefixed layout landed is permanently `unattributed`.** `reconcile`'s row→object and object→row checks both key off `TenantSegment::parse`, which only recognizes `{seg}/{table}.parquet` and `models/{seg}/{job}/…` shapes; an older flat key never round-trips through that parser, so it is reported as `unattributed` and **never deleted at any `grace`** — the allowlist is a safety property, not a migration path. Such an object stays reachable only by direct URL, exactly as it was before the tenant-prefixed layout existed. `unattributed` is reported only by the admin cross-tenant pass (`reconcile --all`); a tenant-scoped pass never lists another tenant's — or nobody's — stray keys.
+- **`reconcile`'s `grace` gate compares two DIFFERENT clocks.** The age check
+  (is an orphan candidate old enough to reclaim?) reads `last_modified` off
+  the OBJECT STORE's own clock and compares it against the replica running
+  `reconcile`'s `Utc::now()` — never the catalog database's clock the way a
+  lease predicate does. `apply=true` requiring `grace >= ` the configured
+  lease duration is exact only when the object store's clock and the
+  replica's clock agree; ordinary NTP-level skew erodes the safety margin,
+  it does not remove the mechanism — set `grace` to several multiples of the
+  lease duration as the practical guard against both a slow writer and clock
+  skew together.
 - **`delete_model` deletes the catalog row only** — it never touches the artifact bytes at `models/{seg}/{job_id}/…`, and it refuses (`JammiError::ModelReferenced`) while another row still references it. A specific `{model_id}:epoch_N` checkpoint row is independent of the model's own row: deleting one leaves the other's row and bytes untouched. An artifact prefix no `models` row names any longer becomes a `reconcile` orphan candidate on the next pass, aged against `grace` like any other.
 
 ### Catalog durability under crash vs. power loss

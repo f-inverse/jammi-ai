@@ -28,13 +28,30 @@ use std::time::Duration;
 
 use crate::catalog::backend::{BackendKind, SqlValue};
 
-/// Format leases write into `lease_expires_at`. Lexicographic ordering of two
-/// timestamps in this fixed-width UTC form matches chronological ordering, so
-/// the SQL `lease_expires_at < $now` comparison is correct on both backends
-/// without dialect-specific interval arithmetic. Also a valid ISO-8601
-/// `timestamptz` literal, so Postgres can cast a stored value straight into
-/// its own clock's domain (`col::timestamptz`) without reparsing it through
-/// this format at all.
+/// Format SQLite's app-clock lease stamps write into `lease_expires_at`
+/// ([`lease_now`] / [`lease_deadline`], the SQLite arm's one helper).
+/// Lexicographic ordering of two timestamps in this fixed-width UTC form
+/// matches chronological ordering, so [`lease_expired_clause`]'s SQLite arm
+/// — [`lease_now`] bound as a parameter, compared with a plain string `<` —
+/// is exact at full microsecond precision. SQLite itself has no SQL-visible
+/// clock finer than milliseconds (`datetime('now')` truncates to whole
+/// seconds; `strftime('%f','now')` and `unixepoch('now','subsec')` cap out
+/// at milliseconds; `julianday('now')`'s double-precision day count loses
+/// sub-~100-microsecond resolution to floating-point rounding), so a
+/// no-bind comparison against any SQLite clock function silently fails to
+/// distinguish two stamps computed back-to-back with no real work between
+/// them — exactly the shape a test forging a near-zero-duration lease
+/// relies on, even though a real deployment's lease (tens of seconds,
+/// `heartbeat * 2 < lease`) would have tolerated any of those truncations.
+///
+/// **Postgres stores something else entirely for this column.** A Postgres
+/// lease stamp is `(now() + make_interval(secs => $n))::text`
+/// ([`lease_deadline_expr`]) — Postgres's OWN default `timestamptz` text
+/// rendering (space-separated, zone-suffixed), not this format, and every
+/// comparison casts back through `col::timestamptz` rather than comparing
+/// the stored strings lexicographically at all. `LEASE_TS_FORMAT` names the
+/// SQLite shape only; do not assume a `result_tables.lease_expires_at` value
+/// is in this format without checking which backend wrote it.
 pub const LEASE_TS_FORMAT: &str = "%Y-%m-%dT%H:%M:%S%.6fZ";
 
 /// `now`, formatted for a SQLite (single-process) lease comparison or stamp —
@@ -100,23 +117,43 @@ impl Default for LeaseIntervals {
 }
 
 /// The SQL fragment that is true for an absent or expired lease, comparing
-/// against the BACKEND's own clock — never a bound application timestamp
-/// (see the module docs). No bind parameter: the expression names no `$n`,
-/// so callers do not need to reserve a position for it.
+/// against the BACKEND's own clock — never a bound application timestamp on
+/// Postgres (see the module docs).
 ///
 /// - Postgres: `(col IS NULL OR col::timestamptz < now())` — the stored
 ///   [`LEASE_TS_FORMAT`] text is a valid `timestamptz` literal, so the cast
 ///   reads the same value the write in [`lease_deadline_expr`] produced,
-///   compared against the database's own `now()`.
-/// - SQLite (single process; the application clock IS the database's
-///   clock): `(col IS NULL OR datetime(col) < datetime('now'))` —
-///   `datetime()` normalizes both sides through SQLite's own clock function
-///   rather than a value this process computed and bound in, so the SQL text
-///   itself carries no timestamp literal either.
-pub fn lease_expired_clause(col: &str, kind: BackendKind) -> String {
+///   compared against the database's own `now()`. Appends NO bind: the
+///   expression names no `$n` at all on this backend.
+/// - SQLite (single process; the application clock IS the "database"
+///   clock — there is no peer replica to skew against): appends
+///   [`lease_now`] as ONE bind and compares `(col IS NULL OR col < $n)` —
+///   full [`LEASE_TS_FORMAT`] microsecond precision, lexicographically.
+///   Deliberately NOT a no-bind SQLite clock function: `datetime('now')`
+///   truncates to WHOLE SECONDS, `strftime('%f','now')` and
+///   `unixepoch('now','subsec')` both cap out at 3-digit MILLISECOND
+///   precision, and `julianday('now')`'s double-precision day count loses
+///   sub-~100-microsecond resolution to floating-point rounding — every one
+///   of those silently fails to distinguish two stamps computed
+///   back-to-back with no real work between them, exactly the shape a test
+///   forging a near-zero-duration lease relies on (and the shape
+///   `heartbeat * 2 < lease` guarantees never occurs in a real deployment,
+///   where truncation to whole seconds would be harmless). SQLite has no
+///   SQL-visible clock finer than milliseconds, so matching this format's
+///   microsecond precision requires evaluating [`lease_now`] in the
+///   application and binding it — the "keep the app clock through ONE
+///   helper" alternative for the single-process backend.
+pub fn lease_expired_clause(
+    col: &str,
+    kind: BackendKind,
+    params: &mut Vec<SqlValue<'static>>,
+) -> String {
     match kind {
         BackendKind::Postgres => format!("({col} IS NULL OR {col}::timestamptz < now())"),
-        BackendKind::Sqlite => format!("({col} IS NULL OR datetime({col}) < datetime('now'))"),
+        BackendKind::Sqlite => {
+            params.push(SqlValue::TextOwned(lease_now()));
+            format!("({col} IS NULL OR {col} < ${})", params.len())
+        }
     }
 }
 
@@ -161,15 +198,28 @@ mod tests {
     }
 
     #[test]
-    fn expired_clause_names_the_column_and_carries_no_bind() {
+    fn expired_clause_postgres_carries_no_bind_and_names_the_column() {
+        let mut params = Vec::new();
+        let clause = lease_expired_clause("lease_expires_at", BackendKind::Postgres, &mut params);
         assert_eq!(
-            lease_expired_clause("lease_expires_at", BackendKind::Postgres),
+            clause,
             "(lease_expires_at IS NULL OR lease_expires_at::timestamptz < now())"
         );
-        assert_eq!(
-            lease_expired_clause("lease_expires_at", BackendKind::Sqlite),
-            "(lease_expires_at IS NULL OR datetime(lease_expires_at) < datetime('now'))"
+        assert!(
+            params.is_empty(),
+            "Postgres's clause must bind no timestamp: {params:?}"
         );
+    }
+
+    #[test]
+    fn expired_clause_sqlite_binds_the_app_clock_now() {
+        let mut params = Vec::new();
+        let clause = lease_expired_clause("lease_expires_at", BackendKind::Sqlite, &mut params);
+        assert_eq!(
+            clause,
+            "(lease_expires_at IS NULL OR lease_expires_at < $1)"
+        );
+        assert_eq!(params.len(), 1, "one bind: lease_now(), the app clock");
     }
 
     #[test]

@@ -322,6 +322,7 @@ impl ResultTableCas {
                 sql.push_str(&lease_expired_clause(
                     &format!("{col}lease_expires_at"),
                     kind,
+                    params,
                 ));
             }
         }
@@ -404,6 +405,18 @@ pub(crate) async fn read_cas_target(
 pub(crate) enum CasOutcome<T> {
     Applied(T),
     Missed(Option<CasTarget>),
+}
+
+/// Whether [`Catalog::building_tables_by_lease_liveness`]'s non-admin arm
+/// drops a GLOBAL (`tenant_id IS NULL`) row entirely (block #2 — an
+/// enumeration that feeds a MUTATING pass must never hand a tenant-bound
+/// caller a `_global/` row) or reads it the same way every other read on
+/// this table does (`tenant_id = $t OR tenant_id IS NULL` — safe for a
+/// READ-ONLY protective set).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ExcludeGlobalUnderTenantScope {
+    Yes,
+    No,
 }
 
 impl Catalog {
@@ -833,14 +846,30 @@ impl Catalog {
         }
     }
 
-    /// Every `building` row whose lease is absent or expired at `now`
-    /// ([`crate::catalog::lease::lease_now`]) — recovery's enumeration. A row
-    /// under a live lease belongs to a live writer and is never listed here.
-    /// Inside an admin scope every tenant's rows are returned; outside it the
-    /// enumeration is tenant-scoped like every other read on this table.
+    /// Every `building` row whose lease is absent or expired AT THE INSTANT
+    /// THE STATEMENT RUNS — the backend's OWN clock
+    /// ([`crate::catalog::lease::lease_expired_clause`]; never a bound
+    /// application timestamp on Postgres) — the enumeration BOTH
+    /// `recover()`'s admin-scoped sweep and a tenant-scoped
+    /// [`crate::store::ResultStore::reconcile`]'s expired-building pre-pass
+    /// (block #1) claim/fail/delete against. A row under a live lease
+    /// belongs to a live writer and is never listed here.
+    ///
+    /// **Never includes a GLOBAL (`tenant_id IS NULL`) row under a
+    /// non-admin binding** (block #2) — unlike every other read on this
+    /// table, which treats GLOBAL as "visible to every tenant" because
+    /// reading a shared row leaks nothing. THIS enumeration feeds a MUTATING
+    /// pass (claim, then promote-or-fail, then delete): a tenant-bound
+    /// caller must never be able to reach a `_global/` row's bytes, and
+    /// [`ResultTableCas::expired`]'s `Strict` tenant arm renders against the
+    /// ROW's OWN tenant (so it cannot itself refuse a GLOBAL row for a
+    /// tenant-bound caller — the arm's whole point is recovery's admin bypass,
+    /// not a caller-identity check), so the exclusion has to happen HERE, at
+    /// the enumeration that decides which rows a tenant-scoped pass ever
+    /// touches. Inside an admin scope every tenant's (and GLOBAL's) rows are
+    /// still returned.
     pub async fn list_expired_building_tables(&self) -> Result<Vec<ResultTableRecord>> {
-        let kind = self.backend().backend_kind();
-        self.building_tables_by_lease_liveness(&lease_expired_clause("lease_expires_at", kind))
+        self.building_tables_by_lease_liveness(false, ExcludeGlobalUnderTenantScope::Yes)
             .await
     }
 
@@ -849,28 +878,36 @@ impl Catalog {
     /// candidate (block #1: an expired-lease `building` row is recovery's to
     /// claim-then-reap; only a row a live writer still owns is protected
     /// here). Inside an admin scope every tenant's rows are returned; outside
-    /// it the enumeration is tenant-scoped like every other read on this
-    /// table.
+    /// it the enumeration is tenant-scoped like every other READ on this
+    /// table (GLOBAL included) — this is a READ-ONLY protective set (it only
+    /// ever widens what a listed object is considered "referenced" by,
+    /// never licenses a mutation), so including a GLOBAL row here is
+    /// harmless: a tenant-scoped reconcile's own `in_scope` filter already
+    /// excludes every `_global/` object from that pass regardless.
     pub async fn list_live_building_tables(&self) -> Result<Vec<ResultTableRecord>> {
-        let kind = self.backend().backend_kind();
-        let expired = lease_expired_clause("lease_expires_at", kind);
-        self.building_tables_by_lease_liveness(&format!("NOT {expired}"))
+        self.building_tables_by_lease_liveness(true, ExcludeGlobalUnderTenantScope::No)
             .await
     }
 
     /// Shared enumeration behind [`Self::list_expired_building_tables`] and
     /// [`Self::list_live_building_tables`]: every `status = 'building'` row
     /// additionally matching `lease_predicate` (a full boolean SQL
-    /// expression naming no bind of its own — both callers' predicates are
-    /// built entirely from the backend's own clock, per `catalog::lease`'s
-    /// module docs).
+    /// expression, built entirely from the backend's own clock on Postgres
+    /// (a bound [`crate::catalog::lease::lease_now`] on SQLite, per
+    /// `catalog::lease`'s module docs) — its own bind, if any, is threaded
+    /// through so the tenant bind that follows numbers correctly regardless
+    /// of backend). `live` selects expired (`false`) vs. live (`true`);
+    /// `exclude_global` selects whether a non-admin binding's query drops
+    /// `tenant_id IS NULL` rows entirely (block #2) or reads them the same
+    /// way every other table read does.
     async fn building_tables_by_lease_liveness(
         &self,
-        lease_predicate: &str,
+        live: bool,
+        exclude_global: ExcludeGlobalUnderTenantScope,
     ) -> Result<Vec<ResultTableRecord>> {
+        let kind = self.backend().backend_kind();
         let admin = TenantBinding::is_admin_scope();
         let tenant = self.current_tenant();
-        let lease_predicate = lease_predicate.to_string();
         Ok(self
             .backend()
             .transaction(
@@ -880,25 +917,51 @@ impl Catalog {
                 },
                 |tx| {
                     Box::pin(async move {
+                        let mut params: Vec<SqlValue<'static>> = Vec::new();
+                        let expired = lease_expired_clause("lease_expires_at", kind, &mut params);
+                        let lease_predicate =
+                            if live { format!("NOT {expired}") } else { expired };
                         if admin {
                             tx.query(
                                 &format!(
                                     "SELECT * FROM result_tables WHERE status = 'building' \
                                      AND {lease_predicate} ORDER BY created_at"
                                 ),
-                                &[],
+                                &params,
                                 parse_row,
                             )
                             .await
-                        } else {
+                        } else if matches!(exclude_global, ExcludeGlobalUnderTenantScope::Yes) {
+                            // Exact-match, never "OR tenant_id IS NULL": a
+                            // GLOBAL caller (`tenant = None`) still sees its
+                            // OWN GLOBAL rows (`tenant_id IS NULL AND $n IS
+                            // NULL`), but a tenant-bound caller (`tenant =
+                            // Some(t)`) never matches a row whose
+                            // `tenant_id` differs, INCLUDING a GLOBAL one.
+                            params.push(SqlValue::from(tenant.map(|t| t.to_string())));
+                            let n = params.len();
                             tx.query(
                                 &format!(
                                     "SELECT * FROM result_tables WHERE status = 'building' \
                                      AND {lease_predicate} \
-                                     AND (tenant_id = $1 OR tenant_id IS NULL) \
+                                     AND (tenant_id = ${n} OR (tenant_id IS NULL AND ${n} IS NULL)) \
                                      ORDER BY created_at"
                                 ),
-                                &[SqlValue::from(tenant.map(|t| t.to_string()))],
+                                &params,
+                                parse_row,
+                            )
+                            .await
+                        } else {
+                            params.push(SqlValue::from(tenant.map(|t| t.to_string())));
+                            let n = params.len();
+                            tx.query(
+                                &format!(
+                                    "SELECT * FROM result_tables WHERE status = 'building' \
+                                     AND {lease_predicate} \
+                                     AND (tenant_id = ${n} OR tenant_id IS NULL) \
+                                     ORDER BY created_at"
+                                ),
+                                &params,
                                 parse_row,
                             )
                             .await
@@ -1186,11 +1249,17 @@ impl Catalog {
                 Box::pin(async move {
                     tx.set_tenant(tenant);
                     let tenant_param = SqlValue::from(tenant.map(|t| t.to_string()));
-                    let expired = lease_expired_clause("lease_expires_at", kind);
                     // Delete every row for this source that is NOT a
                     // live-lease `building` row (a terminal row, or a
                     // `building` row whose lease is absent/expired — a dead
-                    // writer's, safely reaped with the rest).
+                    // writer's, safely reaped with the rest). `expired`'s
+                    // bind (if any, on SQLite) is appended AFTER sid/tenant,
+                    // so it renders at whatever position it actually falls
+                    // in THIS statement's own numbering.
+                    let mut delete_params: Vec<SqlValue<'static>> =
+                        vec![SqlValue::TextOwned(sid.clone()), tenant_param.clone()];
+                    let expired =
+                        lease_expired_clause("lease_expires_at", kind, &mut delete_params);
                     let records = tx
                         .query(
                             &format!(
@@ -1199,7 +1268,7 @@ impl Catalog {
                                    AND (status <> 'building' OR {expired}) \
                                  RETURNING *"
                             ),
-                            &[SqlValue::TextOwned(sid.clone()), tenant_param.clone()],
+                            &delete_params,
                             parse_row,
                         )
                         .await?;
@@ -1210,7 +1279,13 @@ impl Catalog {
                     // did, when it ran this check BEFORE any DELETE) would
                     // COMMIT the DELETE that already ran above — `Busy` is a
                     // real transaction error precisely so the backend's
-                    // `transaction()` rolls the whole thing back.
+                    // `transaction()` rolls the whole thing back. A SEPARATE
+                    // statement needs its OWN `expired` (its own bind
+                    // position, if any — a fresh `Vec` numbered from this
+                    // statement's own $1).
+                    let mut busy_params: Vec<SqlValue<'static>> =
+                        vec![SqlValue::TextOwned(sid), tenant_param];
+                    let expired = lease_expired_clause("lease_expires_at", kind, &mut busy_params);
                     let busy = tx
                         .query_opt(
                             &format!(
@@ -1218,7 +1293,7 @@ impl Catalog {
                                    AND (tenant_id = $2 OR (tenant_id IS NULL AND $2 IS NULL)) \
                                    AND status = 'building' AND NOT {expired} LIMIT 1"
                             ),
-                            &[SqlValue::TextOwned(sid), tenant_param],
+                            &busy_params,
                             |row| row.get::<String>("table_name"),
                         )
                         .await?;

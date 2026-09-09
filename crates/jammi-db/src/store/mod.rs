@@ -899,9 +899,20 @@ impl ResultStore {
         table: &ResultTableRecord,
         tenant: Option<TenantId>,
     ) -> Result<Option<BuildingTable>> {
+        // Block #3 (phase-4 fix): a FRESH id per claim, never this process's
+        // OWN `self.writer_id` — if the row this claim targets happens to be
+        // THIS process's own lapsed writer, re-stamping the SAME id would
+        // leave the lapsed `BuildingTable` handle's `Owner::Writer(self.writer_id)`
+        // CAS still matching (no fence at all: the two handles would share
+        // one identity and race each other for the rest of the row's life —
+        // the rebuild below could purge segments the lapsed writer is still
+        // appending). A claim is always a distinct identity from every
+        // `ResultStore`'s own writer_id, so the CAS the lapsed writer's next
+        // renew/append/promote issues always misses.
+        let claim_writer_id = format!("{}/claim-{}", self.writer_id, uuid::Uuid::new_v4());
         if !self
             .catalog
-            .claim_expired_building_table(cas, &self.writer_id, self.lease.lease())
+            .claim_expired_building_table(cas, &claim_writer_id, self.lease.lease())
             .await?
         {
             return Ok(None);
@@ -912,7 +923,7 @@ impl ResultStore {
             table.table_name.clone(),
             parquet_url,
             tenant,
-            self.writer_id.to_string(),
+            claim_writer_id,
             table.storage_precision.unwrap_or_default(),
             self.lease,
         )))

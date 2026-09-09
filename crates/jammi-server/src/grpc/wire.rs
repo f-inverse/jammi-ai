@@ -183,6 +183,40 @@ pub fn map_engine_error(err: JammiError) -> Status {
         JammiError::ChannelAssembly(detail) => {
             (Code::Internal, format!("channel assembly: {detail}"))
         }
+        // The building-row CAS zero-row classification (`catalog::result_repo`'s
+        // `ResultTableCas` / esc-094): each of the four outcomes is a distinct
+        // caller condition, never a bare `Internal`. `RowGone` — the row was
+        // already deleted underneath the caller — is `NotFound`. `TenantMismatch`
+        // — the STRICT tenant arm refused the write — is `PermissionDenied`, the
+        // same code a forged-tenant read is refused with elsewhere. `LeaseLost`
+        // and `CasFailed` are both "the caller's view of the row was already
+        // stale by the time its CAS ran" — a transient, retryable conflict, not
+        // a permanent precondition failure — so both map to `Aborted` (gRPC's
+        // code for "the operation was aborted, typically due to a concurrency
+        // issue …; the client should retry").
+        JammiError::RowGone { table } => {
+            (Code::NotFound, format!("result table `{table}` is gone"))
+        }
+        JammiError::TenantMismatch { table } => (
+            Code::PermissionDenied,
+            format!("result table `{table}` belongs to another tenant"),
+        ),
+        JammiError::LeaseLost { table } => (
+            Code::Aborted,
+            format!("result table `{table}`: lease lost to another writer"),
+        ),
+        JammiError::CasFailed { table, status } => (
+            Code::Aborted,
+            format!("result table `{table}` is already `{status}`"),
+        ),
+        // `delete_result_tables_for_source`'s atomic guard refused: a live-lease
+        // `building` row still references the source. `FailedPrecondition` — a
+        // retry once the writer finishes or its lease expires, mirroring
+        // `ModelReferenced`'s delete-precondition mapping above.
+        JammiError::SourceBusy { source_id, table } => (
+            Code::FailedPrecondition,
+            format!("source `{source_id}` is busy: result table `{table}` is being built"),
+        ),
         other => (Code::Internal, other.to_string()),
     };
     attach_error_detail(code, message, &err)
@@ -261,6 +295,59 @@ mod tests {
             message: "invalid version".into(),
         });
         assert_eq!(bad.code(), Code::InvalidArgument);
+    }
+
+    /// The building-row CAS zero-row classification (block #4, phase-4 fix)
+    /// each maps to a DISTINCT gRPC code, never the generic `Internal` the
+    /// catch-all arm gave them before: `RowGone` → `NotFound`,
+    /// `TenantMismatch` → `PermissionDenied`, `LeaseLost` / `CasFailed` →
+    /// `Aborted` (a retryable conflict, not a permanent precondition
+    /// failure), `SourceBusy` → `FailedPrecondition` (mirroring
+    /// `ModelReferenced`'s delete-precondition mapping). Also proves the
+    /// wire round-trip: `error_from_status` reconstructs the exact variant
+    /// from the attached detail, not just the coarse code.
+    #[test]
+    fn building_row_cas_errors_map_to_distinct_grpc_codes() {
+        let row_gone = map_engine_error(JammiError::RowGone { table: "t1".into() });
+        assert_eq!(row_gone.code(), Code::NotFound);
+        assert!(matches!(
+            error_from_status(&row_gone),
+            JammiError::RowGone { table } if table == "t1"
+        ));
+
+        let tenant_mismatch = map_engine_error(JammiError::TenantMismatch { table: "t1".into() });
+        assert_eq!(tenant_mismatch.code(), Code::PermissionDenied);
+        assert!(matches!(
+            error_from_status(&tenant_mismatch),
+            JammiError::TenantMismatch { table } if table == "t1"
+        ));
+
+        let lease_lost = map_engine_error(JammiError::LeaseLost { table: "t1".into() });
+        assert_eq!(lease_lost.code(), Code::Aborted);
+        assert!(matches!(
+            error_from_status(&lease_lost),
+            JammiError::LeaseLost { table } if table == "t1"
+        ));
+
+        let cas_failed = map_engine_error(JammiError::CasFailed {
+            table: "t1".into(),
+            status: "ready".into(),
+        });
+        assert_eq!(cas_failed.code(), Code::Aborted);
+        assert!(matches!(
+            error_from_status(&cas_failed),
+            JammiError::CasFailed { table, status } if table == "t1" && status == "ready"
+        ));
+
+        let source_busy = map_engine_error(JammiError::SourceBusy {
+            source_id: "src1".into(),
+            table: "t1".into(),
+        });
+        assert_eq!(source_busy.code(), Code::FailedPrecondition);
+        assert!(matches!(
+            error_from_status(&source_busy),
+            JammiError::SourceBusy { source_id, table } if source_id == "src1" && table == "t1"
+        ));
     }
 
     /// esc-089: this wire test pins

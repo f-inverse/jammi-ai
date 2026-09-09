@@ -569,8 +569,13 @@ async fn building_with_valid_parquet_promotes_with_true_count(kind: BackendKind)
     // I5: promoted row_count is the TRUE footer count, not the writer's intent.
     assert_eq!(rec.row_count, 7, "I5: row_count == actual Parquet rows");
     // Recovery claimed the row before rebuilding and promoting: the recoverer
-    // is the writer of record, the dead writer's id is history.
-    assert_eq!(rec.writer_id.as_deref(), Some(peer.writer_id()));
+    // is the writer of record, the dead writer's id is history. Block #3
+    // (phase-4 fix): the claim mints a FRESH id, `"{peer.writer_id()}
+    // /claim-{uuid}"` — never `peer`'s raw process-wide id.
+    assert!(rec
+        .writer_id
+        .as_deref()
+        .is_some_and(|w| w.starts_with(&format!("{}/claim-", peer.writer_id()))));
     assert_ne!(rec.writer_id.as_deref(), Some(dead_writer.as_str()));
     assert!(rec.lease_expires_at.is_none(), "promote clears the lease");
 
@@ -1227,6 +1232,92 @@ async fn expired_lease_building_row_is_claimed_before_reconcile_reaps_it_u2b(kin
     );
 }
 
+/// Block #3 (phase-4 fix, RED first): `reconcile`'s claim of an expired-lease
+/// row must NEVER re-stamp the SAME `writer_id` a lapsed writer in THIS
+/// SAME session still holds — that would leave the lapsed writer's own
+/// `Owner::Writer(self.writer_id)` CAS still matching post-claim (no fence
+/// at all: two handles sharing one identity race each other for the rest of
+/// the row's life, and the rebuild below could purge segments the lapsed
+/// writer is still appending). A claim always mints a FRESH id distinct
+/// from every `ResultStore`'s own `writer_id`, so the lapsed writer's next
+/// operation on the row (any CAS through its own stale handle) misses and
+/// reports `LeaseLost`.
+#[cfg_attr(test, test_case(BackendKind::Sqlite ; "sqlite"))]
+#[cfg_attr(
+    all(test, feature = "live-postgres-tests"),
+    test_case(BackendKind::Postgres ; "postgres")
+)]
+#[tokio::test]
+async fn reconcile_claim_never_reuses_this_sessions_own_writer_id(kind: BackendKind) {
+    use jammi_db::store::ReconcileOptions;
+
+    let dir = tempdir().unwrap();
+    let Some(backend) = open_backend(kind, dir.path()).await else {
+        eprintln!("skipping {kind:?}: JAMMI_TEST_PG_URL unset");
+        require_live_pg("reconcile_claim_never_reuses_this_sessions_own_writer_id");
+        return;
+    };
+    let catalog = fresh_catalog(backend).await;
+    // ONE store: the writer that lapses AND the session that reconciles it
+    // are the SAME `ResultStore`, so a fix that only fences a DIFFERENT
+    // process's writer (not this session's own) would still pass a
+    // cross-process oracle but miss this one.
+    let store = long_lease_store(dir.path(), Arc::clone(&catalog));
+
+    let info = create_building_embedding(&store).await;
+    write_closed_embedding_parquet(&store, &info, 3).await;
+    info.append_segment(&built_index(3)).await.unwrap();
+    jammi_test_utils::write_manifest_sidecar_for(&store, info.parquet_url(), "src1", DIMS).await;
+    let name = info.table_name().to_string();
+    let this_sessions_writer_id = store.writer_id().to_string();
+    assert_eq!(
+        info.writer_id(),
+        this_sessions_writer_id,
+        "precondition: the live handle is stamped with THIS session's own writer_id"
+    );
+
+    // The writer lapses (its heartbeat would have kept renewing; forge the
+    // lease into the past by hand, same technique `expire_lease_by_hand`
+    // uses, so the handle stays "alive" from its own point of view — it
+    // simply has not tried a CAS since).
+    expire_lease_by_hand(&catalog, &name).await;
+
+    // Reconcile, in the SAME session, claims and self-heals the row.
+    let report = store
+        .reconcile(ReconcileOptions {
+            apply: true,
+            grace: std::time::Duration::from_secs(600),
+        })
+        .await
+        .unwrap();
+    assert!(
+        report.orphans.iter().all(|k| !k.contains(&name)),
+        "the claimed row's bytes must not be orphan-reaped directly: {report:?}"
+    );
+    let after = record(&catalog, &name).await;
+    assert_ne!(
+        after.writer_id.as_deref(),
+        Some(this_sessions_writer_id.as_str()),
+        "the claim must mint a FRESH id, never reuse THIS session's own writer_id \
+         (the exact collision that would leave the lapsed writer's own CAS still matching)"
+    );
+
+    // The lapsed writer's own handle (still holding the ORIGINAL writer_id)
+    // attempts its next operation on the row: it must miss, touching
+    // nothing. `LeaseLost` (still `building`, a different writer_id) if the
+    // stale CAS lands before the claim's promote commits; `CasFailed{ready}`
+    // (the standard "recovery already promoted it" outcome) if the claim's
+    // rebuild+promote — which `reconcile` drives to completion inside the
+    // one `reconcile(apply=true)` call above — has already landed. Either
+    // way the stale writer never re-promotes and never re-touches the row.
+    let err = info.append_segment(&built_index(3)).await.unwrap_err();
+    assert!(
+        matches!(&err, JammiError::LeaseLost { table } if *table == name)
+            || matches!(&err, JammiError::CasFailed { table, status } if *table == name && status == "ready"),
+        "the lapsed writer's next CAS must be refused, never succeed: {err:?}"
+    );
+}
+
 /// W1 (esc-094): a live writer parked right after `create_table` — row
 /// `building`, no bytes yet — survives a peer's `recover()` (which would
 /// otherwise take the missing-bytes arm and fail it); released, it completes.
@@ -1833,9 +1924,13 @@ async fn two_recoverers_race_on_one_expired_row(kind: BackendKind) {
         .writer_id
         .as_deref()
         .expect("the winner is the writer of record");
+    // Block #3 (phase-4 fix): a claim mints a FRESH id, `"{store.writer_id()}
+    // /claim-{uuid}"` — never the recoverer's raw process-wide id — so the
+    // winner's identity is checked by PREFIX.
     assert!(
-        owner == r1.writer_id() || owner == r2.writer_id(),
-        "owner {owner} must be one of the two recoverers"
+        owner.starts_with(&format!("{}/claim-", r1.writer_id()))
+            || owner.starts_with(&format!("{}/claim-", r2.writer_id())),
+        "owner {owner} must be a claim minted by one of the two recoverers"
     );
     let segs = catalog.list_index_segments(&name).await.unwrap();
     assert_eq!(segs.len(), 1, "exactly one rebuilt segment: {segs:?}");

@@ -545,6 +545,7 @@ pub fn reconcile_report_to_proto(report: &ReconcileReport) -> pb::ReconcileRepor
         scope: report.scope.clone(),
         applied: report.applied,
         rows_failed: report.rows_failed.clone(),
+        rows_failed_count: report.rows_failed_count,
         orphans: report.orphans.clone(),
         pending: report.pending.clone(),
         unattributed: report.unattributed.clone(),
@@ -567,6 +568,7 @@ pub fn reconcile_report_from_proto(report: pb::ReconcileReport) -> ReconcileRepo
         scope: report.scope,
         applied: report.applied,
         rows_failed: report.rows_failed,
+        rows_failed_count: report.rows_failed_count,
         orphans: report.orphans,
         orphan_count: report.orphan_count,
         pending: report.pending,
@@ -656,6 +658,7 @@ mod tests {
             scope: "tenant:01906c83-d4c8-7e10-9c4f-3b6f7c5a8e9a".to_string(),
             applied: true,
             rows_failed: vec!["table_a".to_string(), "table_b".to_string()],
+            rows_failed_count: 2,
             orphans: vec![
                 "_global/orphan_1.parquet".to_string(),
                 "_global/orphan_2.parquet".to_string(),
@@ -678,6 +681,7 @@ mod tests {
         assert_eq!(decoded.scope, report.scope);
         assert_eq!(decoded.applied, report.applied);
         assert_eq!(decoded.rows_failed, report.rows_failed);
+        assert_eq!(decoded.rows_failed_count, report.rows_failed_count);
         assert_eq!(decoded.orphans, report.orphans);
         assert_eq!(decoded.orphan_count, report.orphan_count);
         assert_eq!(decoded.pending, report.pending);

@@ -30,7 +30,10 @@ pub async fn run(
     let report = session.reconcile(apply, Some(grace_secs), all).await?;
     println!("scope:           {}", report.scope);
     println!("applied:         {}", report.applied);
-    println!("rows_failed:     {}", join_or_dash(&report.rows_failed));
+    println!(
+        "rows_failed:     {}",
+        join_capped(&report.rows_failed, report.rows_failed_count)
+    );
     println!(
         "orphans:         {}",
         join_capped(&report.orphans, report.orphan_count)

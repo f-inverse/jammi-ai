@@ -764,8 +764,11 @@ message ReconcileReport {
   // The true count of damaged keys found this pass, independent of whether
   // `damaged` was truncated.
   uint64 damaged_count = 12;
-  // `true` iff any of `orphans` / `pending` / `unattributed` / `damaged` was
-  // cut to the report's list cap — the corresponding `*_count` field is
-  // still the true total either way.
+  // `true` iff any of `rows_failed` / `orphans` / `pending` / `unattributed`
+  // / `damaged` was cut to the report's list cap — the corresponding
+  // `*_count` field is still the true total either way.
   bool truncated = 13;
+  // The true count of rows flipped `ready -> failed` this pass, independent
+  // of whether `rows_failed` was truncated.
+  uint64 rows_failed_count = 14;
 }

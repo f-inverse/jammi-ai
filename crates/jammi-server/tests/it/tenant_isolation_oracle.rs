@@ -1932,6 +1932,119 @@ async fn assert_reconcile_isolated() {
     );
 }
 
+/// Block #2, RED first: a GLOBAL (`tenant_id IS NULL`) `building` row whose
+/// lease has expired must NEVER be claimed/failed/deleted by a TENANT-scoped
+/// `reconcile(apply=true)` — only the admin `reconcile_all` pass may ever
+/// touch it. Before the fix, the expired-building pre-pass's enumeration
+/// included GLOBAL rows under a non-admin binding (the ordinary
+/// "`tenant_id = $t OR tenant_id IS NULL`" read-scoping convention, safe for
+/// a read but not for the mutating claim/fail/delete this pre-pass performs),
+/// and `ResultTableCas::expired`'s `Strict` tenant arm renders against the
+/// ROW's OWN tenant — a tautology that can never refuse a GLOBAL row for any
+/// caller — so a tenant-bound caller's reconcile pass would claim (re-stamp
+/// the writer_id), then drive the row to a terminal state and delete its
+/// bytes, entirely outside its own tenant.
+#[tokio::test]
+async fn tenant_scoped_reconcile_never_touches_a_global_expired_building_row() {
+    use jammi_db::catalog::backend::{SqlValue, TxOptions};
+    use jammi_db::catalog::result_repo::CreateResultTableParams;
+    use jammi_db::catalog::status::ResultTableStatus;
+    use jammi_db::config::StoragePrecision;
+    use jammi_db::store::ReconcileOptions;
+
+    let dir = tempdir().unwrap();
+    let engine = Arc::new(
+        InferenceSession::new(test_config(dir.path()))
+            .await
+            .unwrap(),
+    );
+
+    // A GLOBAL `building` row (created with NO tenant scope in force) with
+    // real bytes on disk and an already-expired lease — forged directly, the
+    // same shape `expire_lease_by_hand` uses in the engine's own test suite.
+    let root = dir.path().join("jammi_db").join("_global");
+    std::fs::create_dir_all(&root).unwrap();
+    let table_name = "global_building_table".to_string();
+    let bytes_path = root.join(format!("{table_name}.parquet"));
+    std::fs::write(&bytes_path, b"global-building-bytes").unwrap();
+    let parquet_url = format!("file://{}", bytes_path.display());
+
+    engine
+        .catalog()
+        .create_result_table(CreateResultTableParams {
+            table_name: &table_name,
+            source_id: "global-src",
+            model_id: "global-model",
+            task: jammi_db::ModelTask::TextEmbedding,
+            kind: ResultTableKind::Model,
+            derived_from: None,
+            parquet_path: &parquet_url,
+            dimensions: Some(4),
+            key_column: Some("id"),
+            text_columns: None,
+            storage_precision: StoragePrecision::F32,
+            oversample: 4,
+            created_at: jammi_db::catalog::backend::now_sortable(),
+            writer_id: Some("writer-global-dead"),
+            lease: Some(std::time::Duration::from_secs(600)),
+        })
+        .await
+        .unwrap();
+    // Force the lease into the past by hand.
+    let name_for_forge = table_name.clone();
+    engine
+        .catalog()
+        .backend_arc()
+        .transaction(TxOptions::default(), |tx| {
+            Box::pin(async move {
+                tx.execute(
+                    "UPDATE result_tables SET lease_expires_at = '1970-01-01T00:00:00.000000Z' \
+                     WHERE table_name = $1",
+                    &[SqlValue::TextOwned(name_for_forge)],
+                )
+                .await
+            })
+        })
+        .await
+        .unwrap();
+
+    // Tenant B's own reconcile — `test_config`'s default `[lease]
+    // duration_secs` is 30, so `apply=true` requires `grace >= 30`.
+    engine
+        .with_tenant_scoped(tenant_b(), |_scope| async {
+            engine
+                .result_store()
+                .reconcile(ReconcileOptions {
+                    apply: true,
+                    grace: std::time::Duration::from_secs(30),
+                })
+                .await
+        })
+        .await
+        .expect("tenant B's own reconcile must succeed");
+
+    let after = jammi_db::tenant_scope::TenantBinding::admin_scope(
+        engine.catalog().get_result_table(&table_name),
+    )
+    .await
+    .unwrap()
+    .expect("the GLOBAL row must survive a tenant-scoped reconcile untouched");
+    assert_eq!(
+        after.status,
+        ResultTableStatus::Building.to_string(),
+        "CROSS-TENANT MUTATION: a tenant-scoped reconcile must never claim/fail a GLOBAL row"
+    );
+    assert_eq!(
+        after.writer_id.as_deref(),
+        Some("writer-global-dead"),
+        "the GLOBAL row's writer_id must never be re-stamped by a tenant-scoped pass"
+    );
+    assert!(
+        bytes_path.exists(),
+        "the GLOBAL row's bytes must survive a tenant-scoped reconcile untouched"
+    );
+}
+
 /// `staleness` resolves its table through the tenant-filtered
 /// `get_result_table`, so a peer cannot sense a table it cannot resolve. Tenant
 /// A senses its own table (it carries no recorded definition change and a

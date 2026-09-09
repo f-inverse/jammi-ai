@@ -568,6 +568,30 @@ workspace ships every publishable crate at the same
   observe (and reap) another writer's in-progress row. Fixed by the lease-owned CAS
   predicate described above: recovery now enumerates only rows whose lease is absent or
   expired, and every deletion follows a one-row compare-and-set naming the new owner.
+- **Phase-4 audit of the above (#479, #484): a tenant-scoped `reconcile(apply=true)` could
+  claim/fail/delete a GLOBAL (`tenant_id IS NULL`) building row's bytes, a lease claim (both
+  recovery's and reconcile's) could re-stamp the SAME `writer_id` a lapsed writer in the
+  SAME process still held (no fence at all), `reconcile`'s orphan arm deleted an
+  expired-lease building row's bytes directly (no claim, no CAS), and training-job leases
+  (`claim_next_training_job`/`heartbeat_training_job`/`reclaim_expired_training_jobs`) still
+  bound the application clock on Postgres, contradicting the lease module's own "every lease
+  stamp and comparison" contract.** Fixed: `list_expired_building_tables` excludes GLOBAL
+  rows entirely under a non-admin binding; every claim (recovery and reconcile) mints a
+  fresh `"{writer_id}/claim-{uuid}"` identity, never the claiming `ResultStore`'s own id, so
+  a lapsed writer's next CAS always misses; `reconcile`'s expired-building pre-pass reaps
+  through the SAME claim-then-promote-or-fail arm `recover()` uses; training-job leases move
+  onto the same `lease_deadline_expr`/`lease_expired_clause` helpers (DB clock on Postgres,
+  a bound `lease_now()` on SQLite — SQLite's `now()` SQL functions cap out at millisecond
+  precision or coarser, insufficient to distinguish two back-to-back stamps, so the
+  single-process backend keeps the application clock through the one helper rather than a
+  no-bind comparison). The five zero-row CAS/busy variants (`RowGone`, `TenantMismatch`,
+  `LeaseLost`, `CasFailed`, `SourceBusy`) now cross the wire as explicit gRPC codes
+  (`NotFound`, `PermissionDenied`, `Aborted`, `Aborted`, `FailedPrecondition` respectively)
+  instead of folding to `Internal`. `ReconcileReport` gained `rows_failed_count`, matching
+  every other list's `*_count`/`truncated` accounting; a `ready` row whose fail-CAS missed
+  stays in the referenced set instead of being counted as this pass's fail; a
+  present-but-unreadable model-artifact manifest is reported `damaged` rather than aborting
+  the whole reconcile pass.
 - **`jammi-encoders`' unit-test binary now serializes every writer of EVERY process-wide fusible-seam
   dispatch counter through the SAME lock the exact-count census oracle's reader holds (esc-092 /
   #476).** The class is "every training-arm admission site this crate owns", not just the three

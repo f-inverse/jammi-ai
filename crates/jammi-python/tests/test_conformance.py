@@ -401,6 +401,7 @@ _RECONCILE_REPORT_DICT_KEYS = {
     "scope",
     "applied",
     "rows_failed",
+    "rows_failed_count",
     "orphans",
     "orphan_count",
     "pending",
@@ -452,7 +453,13 @@ def test_embed_reconcile_both_arms_return_the_report_shape(tmp_path):
             assert report["scope"] == expected_scope
             for key in ("rows_failed", "orphans", "pending", "unattributed", "damaged"):
                 assert report[key] == [], f"a freshly-opened engine reports nothing: {report}"
-            for key in ("orphan_count", "pending_count", "unattributed_count", "damaged_count"):
+            for key in (
+                "rows_failed_count",
+                "orphan_count",
+                "pending_count",
+                "unattributed_count",
+                "damaged_count",
+            ):
                 assert report[key] == 0, f"a freshly-opened engine reports nothing: {report}"
             assert report["truncated"] is False
     finally:

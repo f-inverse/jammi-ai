@@ -7,6 +7,7 @@ workspace ships every publishable crate at the same
 ## [Unreleased]
 
 ### Added
+- **Lead-gate relay proposal: probe the fix, not just the class (esc-097, `docs/plans/63-how-well/proposals/esc-097-probe-the-fix.md`).** A relay's `probe` array could satisfy the existing coverage/proactivity conjunction (esc-064) entirely within the ORIGINAL finding's neighbourhood, never once looking at what a re-dispatched fix actually changed — five consecutive adversarial-audit BLOCKs on `feat/deploy-shapes-E1-arm64-ci-base` each landed on the previous fix's own new surface. The proposal (human-applies; `.claude/hooks/**` stays agent-write-denied) adds R3: a lead-written `fix_head`, a hook-computed `fix_changed` window (`git diff --name-only <block> <fix_head>`, the module's one narrowly-scoped git subprocess, relay-arm-only, 5s timeout, fail-closed), and a requirement that at least one probed path be a real member of that window. `ci/scripts/check_lead_gate.py` ships the fixtures (G20-G28) RED against the current hook, self-test-guarded to report that arm SKIPPED until the patch lands.
 - **LoRA fine-tuning for the CLIP-text, OpenCLIP-vision and HTSAT-CLAP audio towers (#421).** All
   three carry LoRA sites on the same `jammi_lora::MaybeLoraLinear` seam the BERT family uses,
   reached through their own builders (`ClipText::builder`, `OpenClipVisionTransformer::builder`,

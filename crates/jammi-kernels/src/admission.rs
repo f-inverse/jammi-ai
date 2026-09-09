@@ -1815,8 +1815,8 @@ impl ProbedOp {
 /// the cited call site during this population, and excluded for a stated
 /// reason — an omission with no reason is how finding 2 happened):
 ///
-/// - `attention_block_flash` (`crates/jammi-encoders/src/modernbert.rs:1098`,
-///   `:1990`) — a real cascade, but the esc-075 report surfaces it through
+/// - `attention_block_flash` (`crates/jammi-encoders/src/modernbert.rs:1110`,
+///   `:2004`) — a real cascade, but the esc-075 report surfaces it through
 ///   its OWN dedicated top-level `flash` field (with the compiled/device
 ///   short-circuit reasons a plain `ops` entry cannot express), and
 ///   `ci/release-feature-manifest.json` declares it as `flash_compiled` +

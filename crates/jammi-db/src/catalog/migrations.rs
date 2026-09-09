@@ -86,6 +86,12 @@ const MIGRATIONS: &[(&str, &str)] = &[
         "026_acceleration_report",
         schema::MIGRATION_026_ACCELERATION_REPORT,
     ),
+    // 027 is PR-A's migration; it had not landed in this branch at cut time
+    // (see PLAN-F's lead amendment), so 028 is the next free number here.
+    (
+        "028_topics_next_offset",
+        schema::MIGRATION_028_TOPICS_NEXT_OFFSET,
+    ),
 ];
 
 const APPLIED_MIGRATIONS_DDL: &str = r#"

@@ -13,9 +13,10 @@ use std::fmt;
 use std::sync::Arc;
 
 use arrow::array::{
-    Array, BinaryArray, BooleanArray, Float32Array, Float64Array, Int32Array, Int64Array,
-    LargeBinaryArray, StringArray, TimestampMicrosecondArray, TimestampMillisecondArray,
-    TimestampNanosecondArray, TimestampSecondArray,
+    Array, BinaryArray, BooleanArray, Float32Array, Float64Array, Int16Array, Int32Array,
+    Int64Array, Int8Array, LargeBinaryArray, StringArray, TimestampMicrosecondArray,
+    TimestampMillisecondArray, TimestampNanosecondArray, TimestampSecondArray, UInt16Array,
+    UInt32Array, UInt64Array, UInt8Array,
 };
 use arrow::record_batch::RecordBatch;
 use arrow_schema::SchemaRef;
@@ -174,7 +175,7 @@ fn extract_value(
         // consistent SQL type across null and non-null rows.
         let null_type = match ty {
             Boolean => SqlNullType::Bool,
-            Int32 | Int64 => SqlNullType::Int,
+            Int8 | Int16 | Int32 | Int64 | UInt8 | UInt16 | UInt32 | UInt64 => SqlNullType::Int,
             Float32 | Float64 => SqlNullType::Float,
             Utf8 => SqlNullType::Text,
             Binary | LargeBinary => SqlNullType::Bytes,
@@ -192,6 +193,16 @@ fn extract_value(
             .downcast_ref::<BooleanArray>()
             .map(|a| SqlValue::Bool(a.value(idx)))
             .ok_or("expected BooleanArray"),
+        Int8 => arr
+            .as_any()
+            .downcast_ref::<Int8Array>()
+            .map(|a| SqlValue::Int(a.value(idx) as i64))
+            .ok_or("expected Int8Array"),
+        Int16 => arr
+            .as_any()
+            .downcast_ref::<Int16Array>()
+            .map(|a| SqlValue::Int(a.value(idx) as i64))
+            .ok_or("expected Int16Array"),
         Int32 => arr
             .as_any()
             .downcast_ref::<Int32Array>()
@@ -202,6 +213,35 @@ fn extract_value(
             .downcast_ref::<Int64Array>()
             .map(|a| SqlValue::Int(a.value(idx)))
             .ok_or("expected Int64Array"),
+        UInt8 => arr
+            .as_any()
+            .downcast_ref::<UInt8Array>()
+            .map(|a| SqlValue::Int(a.value(idx) as i64))
+            .ok_or("expected UInt8Array"),
+        UInt16 => arr
+            .as_any()
+            .downcast_ref::<UInt16Array>()
+            .map(|a| SqlValue::Int(a.value(idx) as i64))
+            .ok_or("expected UInt16Array"),
+        UInt32 => arr
+            .as_any()
+            .downcast_ref::<UInt32Array>()
+            .map(|a| SqlValue::Int(a.value(idx) as i64))
+            .ok_or("expected UInt32Array"),
+        // BIGINT is the storage type on both backends, so a UInt64 value
+        // above `i64::MAX` cannot round-trip; refused here at the publish
+        // edge rather than silently wrapped or truncated at write time.
+        UInt64 => {
+            let a = arr
+                .as_any()
+                .downcast_ref::<UInt64Array>()
+                .ok_or("expected UInt64Array")?;
+            let v = a.value(idx);
+            if v > i64::MAX as u64 {
+                return Err("UInt64 value exceeds i64::MAX (BIGINT storage range)");
+            }
+            Ok(SqlValue::Int(v as i64))
+        }
         Float32 => arr
             .as_any()
             .downcast_ref::<Float32Array>()

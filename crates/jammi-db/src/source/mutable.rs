@@ -349,6 +349,16 @@ fn map_mutable_err(e: MutableTableError) -> BackendError {
 
 /// Issue `scan_dml` with `order_column > $after AND (tenant_id = $t OR tenant_id IS NULL)`
 /// in a single read-only transaction; materialise rows into one `RecordBatch`.
+///
+/// `ORDER BY` carries `order_col` plus every `def.primary_key` column that is
+/// not itself `order_col`, as a tiebreak — the topic backing table's PK is
+/// `(_offset, _row_idx)` with `order_col = _offset`, so this emits
+/// `ORDER BY _offset, _row_idx` and makes intra-batch row order exact rather
+/// than whatever order Postgres happens to return same-`_offset` rows in.
+/// The builder rejects an empty primary key
+/// ([`crate::store::mutable::definition::MutableTableDefinitionBuilder::build`]),
+/// so this clause is always well-formed when non-empty; a table whose sole PK
+/// column equals `order_col` simply emits no extra tiebreak column.
 async fn fetch_scan_after_batch(
     backend: Arc<dyn MutableBackend>,
     def: MutableTableDefinition,
@@ -356,11 +366,8 @@ async fn fetch_scan_after_batch(
     after: i64,
     tenant: Option<TenantId>,
 ) -> Result<RecordBatch, MutableTableError> {
-    use arrow::array::{
-        ArrayRef, BooleanArray, Float32Array, Float64Array, Int64Array, StringArray,
-    };
+    use crate::store::mutable::provider::{build_arrays, decode_row, DecodedValue};
     use arrow_schema::DataType;
-    use std::sync::Arc as StdArc;
 
     // Build predicate: order_col > $after AND (tenant filter).
     let tenant_pred = match tenant {
@@ -383,11 +390,18 @@ async fn fetch_scan_after_batch(
     let base_sql = backend.scan_dml(&def, &col_names, Some(predicate.as_str()), None);
     // `scan_dml` does not emit ORDER BY; without it Postgres is free to return
     // rows in any sequence. `scan_after`'s ascending-order contract requires
-    // the sort, so wrap the rendered statement here.
-    let sql = format!(
-        "{base_sql} ORDER BY \"{}\" ASC",
-        order_col.replace('"', "\"\"")
-    );
+    // the sort, so wrap the rendered statement here — order_col first, then
+    // every other PK column as an intra-group tiebreak.
+    let tiebreak_cols: Vec<&String> = def
+        .primary_key
+        .iter()
+        .filter(|c| c.as_str() != order_col)
+        .collect();
+    let mut order_by = format!("\"{}\" ASC", order_col.replace('"', "\"\""));
+    for c in &tiebreak_cols {
+        order_by.push_str(&format!(", \"{}\" ASC", c.replace('"', "\"\"")));
+    }
+    let sql = format!("{base_sql} ORDER BY {order_by}");
 
     let columns: Vec<(String, DataType)> = def
         .schema
@@ -398,54 +412,7 @@ async fn fetch_scan_after_batch(
     let columns_for_closure = columns.clone();
     let owned_sql = sql;
 
-    #[derive(Clone)]
-    enum Decoded {
-        Null,
-        Bool(bool),
-        Int(i64),
-        Float(f64),
-        Text(String),
-    }
-
-    fn decode_row(
-        row: &crate::catalog::backend::Row<'_>,
-        columns: &[(String, DataType)],
-    ) -> Result<Vec<Decoded>, BackendError> {
-        columns
-            .iter()
-            .map(|(name, ty)| match ty {
-                DataType::Boolean => row
-                    .try_get::<bool>(name)?
-                    .map(Decoded::Bool)
-                    .map(Ok)
-                    .unwrap_or(Ok(Decoded::Null)),
-                DataType::Int8
-                | DataType::Int16
-                | DataType::Int32
-                | DataType::Int64
-                | DataType::UInt8
-                | DataType::UInt16
-                | DataType::UInt32
-                | DataType::UInt64 => row
-                    .try_get::<i64>(name)?
-                    .map(Decoded::Int)
-                    .map(Ok)
-                    .unwrap_or(Ok(Decoded::Null)),
-                DataType::Float16 | DataType::Float32 | DataType::Float64 => row
-                    .try_get::<f64>(name)?
-                    .map(Decoded::Float)
-                    .map(Ok)
-                    .unwrap_or(Ok(Decoded::Null)),
-                _ => row
-                    .try_get::<String>(name)?
-                    .map(Decoded::Text)
-                    .map(Ok)
-                    .unwrap_or(Ok(Decoded::Null)),
-            })
-            .collect()
-    }
-
-    let rows_per_col: Vec<Vec<Decoded>> = backend
+    let rows_per_col: Vec<Vec<DecodedValue>> = backend
         .catalog_backend()
         .transaction(
             TxOptions {
@@ -457,7 +424,7 @@ async fn fetch_scan_after_batch(
                     let raw = tx
                         .query(&owned_sql, &[], |row| decode_row(row, &columns_for_closure))
                         .await?;
-                    let mut transposed: Vec<Vec<Decoded>> = (0..columns_for_closure.len())
+                    let mut transposed: Vec<Vec<DecodedValue>> = (0..columns_for_closure.len())
                         .map(|_| Vec::with_capacity(raw.len()))
                         .collect();
                     for r in raw {
@@ -471,71 +438,8 @@ async fn fetch_scan_after_batch(
         )
         .await?;
 
-    let arrays: Vec<ArrayRef> = columns
-        .iter()
-        .zip(rows_per_col.into_iter())
-        .map(|((_, ty), values)| -> ArrayRef {
-            match ty {
-                DataType::Boolean => {
-                    let arr: BooleanArray = values
-                        .into_iter()
-                        .map(|v| match v {
-                            Decoded::Bool(b) => Some(b),
-                            _ => None,
-                        })
-                        .collect();
-                    StdArc::new(arr) as ArrayRef
-                }
-                DataType::Int8
-                | DataType::Int16
-                | DataType::Int32
-                | DataType::Int64
-                | DataType::UInt8
-                | DataType::UInt16
-                | DataType::UInt32
-                | DataType::UInt64 => {
-                    let arr: Int64Array = values
-                        .into_iter()
-                        .map(|v| match v {
-                            Decoded::Int(i) => Some(i),
-                            _ => None,
-                        })
-                        .collect();
-                    StdArc::new(arr) as ArrayRef
-                }
-                DataType::Float32 => {
-                    let arr: Float32Array = values
-                        .into_iter()
-                        .map(|v| match v {
-                            Decoded::Float(f) => Some(f as f32),
-                            _ => None,
-                        })
-                        .collect();
-                    StdArc::new(arr) as ArrayRef
-                }
-                DataType::Float64 => {
-                    let arr: Float64Array = values
-                        .into_iter()
-                        .map(|v| match v {
-                            Decoded::Float(f) => Some(f),
-                            _ => None,
-                        })
-                        .collect();
-                    StdArc::new(arr) as ArrayRef
-                }
-                _ => {
-                    let arr: StringArray = values
-                        .into_iter()
-                        .map(|v| match v {
-                            Decoded::Text(s) => Some(s),
-                            _ => None,
-                        })
-                        .collect();
-                    StdArc::new(arr) as ArrayRef
-                }
-            }
-        })
-        .collect();
+    let arrays = build_arrays(&columns, rows_per_col)
+        .map_err(|e| MutableTableError::Backend(BackendError::Execution(e.to_string())))?;
 
     RecordBatch::try_new(Arc::clone(&def.schema), arrays)
         .map_err(|e| MutableTableError::Backend(BackendError::Execution(e.to_string())))

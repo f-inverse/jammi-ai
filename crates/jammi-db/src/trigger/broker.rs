@@ -9,7 +9,7 @@ use crate::trigger::error::TriggerError;
 use crate::trigger::ids::TopicId;
 use crate::trigger::offset::Offset;
 use crate::trigger::predicate::Predicate;
-use crate::trigger::subscription::Subscription;
+use crate::trigger::subscription::LiveStream;
 use crate::trigger::topic::TopicDefinition;
 
 /// A pluggable pub/sub backend. Implementations are responsible only for
@@ -56,7 +56,7 @@ pub trait TriggerBroker: Send + Sync + 'static {
     /// Attach a subscriber to the live tail.
     ///
     /// `from_offset`, when set, is an **engine `_offset` lower bound**, not a
-    /// driver-native sequence. The broker MUST begin delivery at or before
+    /// driver-native sequence. The broker SHOULD begin delivery at or before
     /// that engine offset — delivering earlier events is permitted — so the
     /// caller is guaranteed never to miss an engine offset `>= from_offset`.
     /// It is the engine's subscribe seam ([`crate::trigger::Subscriber`]) that
@@ -72,10 +72,13 @@ pub trait TriggerBroker: Send + Sync + 'static {
     /// translate an engine offset into its own sequence MUST over-deliver
     /// (start from the earliest retained event) rather than guess a sequence.
     ///
-    /// If `from_offset.is_some()` and the offset is older than what the driver
-    /// retains, the broker returns [`TriggerError::OffsetEvicted`] — the
-    /// engine's subscribe path falls back to backing-table replay for the
-    /// missing prefix.
+    /// A driver that cannot start at or before `from_offset` — or whose
+    /// retention has already discarded events at or before it, or whose live
+    /// tail has just lagged a receiver — yields [`crate::trigger::LiveEvent::Wake`]
+    /// first (or in place of the lost events) rather than an error: the
+    /// engine's subscribe seam self-heals by replaying the missing prefix from
+    /// the backing table. There is no error variant for "history not
+    /// retained" — every driver is expected to route through `Wake` instead.
     ///
     /// This signature carries no tenant parameter: the broker delivers every
     /// event matching `predicate` regardless of which tenant published it.
@@ -87,7 +90,7 @@ pub trait TriggerBroker: Send + Sync + 'static {
         topic_id: TopicId,
         predicate: Predicate,
         from_offset: Option<Offset>,
-    ) -> Result<Subscription, TriggerError>;
+    ) -> Result<LiveStream, TriggerError>;
 
     /// Snapshot every consumer currently bound to `topic_id`. Returns one
     /// [`ConsumerOffsetSnapshot`] per consumer with the broker's

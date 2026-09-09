@@ -15,8 +15,22 @@ use arrow::array::{Array, Float64Array, Int64Array, RecordBatch, StringArray};
 use arrow_schema::{DataType, Field, Schema, SchemaRef};
 use futures::StreamExt;
 use jammi_db::trigger::{
-    JetStreamBroker, Offset, Predicate, TopicDefinition, TopicId, TriggerBroker, TriggerError,
+    DeliveredBatch, JetStreamBroker, LiveEvent, Offset, Predicate, TopicDefinition, TopicId,
+    TriggerBroker, TriggerError,
 };
+
+/// The JetStream driver carries the published bytes itself, so it only ever
+/// yields [`LiveEvent::Batch`] — never [`LiveEvent::Wake`] (that's a
+/// wake-up-transport-only driver's shape, see PLAN-F §0). Test call sites
+/// that talk to the driver directly (rather than through
+/// `Subscriber::subscribe_scoped`, whose engine-facing item stays the
+/// stable `DeliveredBatch`) unwrap through this helper.
+fn expect_batch(event: LiveEvent) -> DeliveredBatch {
+    match event {
+        LiveEvent::Batch(d) => d,
+        LiveEvent::Wake => panic!("the JetStream driver must never yield Wake"),
+    }
+}
 
 const ENV_VAR: &str = "JAMMI_TEST_NATS_URL";
 
@@ -96,11 +110,13 @@ async fn publish_subscribe_filter() {
 
     let mut matched = 0;
     while matched < 10 {
-        let delivered = tokio::time::timeout(Duration::from_secs(5), stream.next())
-            .await
-            .expect("subscribe stream timed out")
-            .expect("stream ended early")
-            .unwrap();
+        let delivered = expect_batch(
+            tokio::time::timeout(Duration::from_secs(5), stream.next())
+                .await
+                .expect("subscribe stream timed out")
+                .expect("stream ended early")
+                .unwrap(),
+        );
         let kinds = delivered
             .batch
             .column_by_name("kind")
@@ -175,16 +191,19 @@ async fn list_consumers_returns_jetstream_consumer_info() {
     );
     for snap in &snapshots {
         assert_eq!(snap.topic_id, topic.id);
-        // The first published offset is 0, so three batches advance the
-        // stream sequence to 3 (JetStream sequences are 1-based per
-        // message).
+        // `ConsumerOffsetSnapshot` fields are engine `_offset`s on every
+        // driver — the JetStream stream sequence is translated back via
+        // `get_raw_message`'s `HDR_OFFSET` header. The three published
+        // batches carry engine offsets 0, 1, 2, so the last delivered engine
+        // offset is 2 after draining all three.
         assert_eq!(
-            snap.last_delivered_stream_sequence, 3,
-            "consumer {} should be at stream sequence 3 after draining three batches",
+            snap.last_delivered_offset,
+            Some(2),
+            "consumer {} should be at engine offset 2 after draining three batches",
             snap.consumer_name
         );
         assert_eq!(
-            snap.last_ack_stream_sequence, snap.last_delivered_stream_sequence,
+            snap.last_acked_offset, snap.last_delivered_offset,
             "every delivered batch was acked in the drain loop above"
         );
     }
@@ -277,11 +296,13 @@ async fn consumer_recreate_resumes_engine_offsets_with_no_loss() {
             .await
             .unwrap();
         for _ in 0..K {
-            let delivered = tokio::time::timeout(Duration::from_secs(5), sub.next())
-                .await
-                .expect("first subscription timed out")
-                .expect("stream ended early")
-                .unwrap();
+            let delivered = expect_batch(
+                tokio::time::timeout(Duration::from_secs(5), sub.next())
+                    .await
+                    .expect("first subscription timed out")
+                    .expect("stream ended early")
+                    .unwrap(),
+            );
             last_seen = Some(delivered.offset.value());
         }
         // Drop the subscription — simulates a consumer-recreate / restart.
@@ -304,13 +325,15 @@ async fn consumer_recreate_resumes_engine_offsets_with_no_loss() {
     let expected: Vec<u64> = (resume_from..BASE + N).collect();
     let mut resumed: Vec<u64> = Vec::new();
     while resumed.len() < expected.len() {
-        let delivered = tokio::time::timeout(Duration::from_secs(5), sub.next())
-            .await
-            .expect(
-                "resumed subscription timed out — the engine offset was conflated with the JetStream stream sequence and the live tail started past the stream head (seam bug)",
-            )
-            .expect("stream ended early")
-            .unwrap();
+        let delivered = expect_batch(
+            tokio::time::timeout(Duration::from_secs(5), sub.next())
+                .await
+                .expect(
+                    "resumed subscription timed out — the engine offset was conflated with the JetStream stream sequence and the live tail started past the stream head (seam bug)",
+                )
+                .expect("stream ended early")
+                .unwrap(),
+        );
         let off = delivered.offset.value();
         if off >= resume_from {
             resumed.push(off);

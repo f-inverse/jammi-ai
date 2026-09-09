@@ -830,3 +830,22 @@ ALTER TABLE result_tables DROP COLUMN index_path;
 pub(super) const MIGRATION_026_ACCELERATION_REPORT: &str = r#"
 ALTER TABLE training_jobs ADD COLUMN acceleration_report TEXT;
 "#;
+
+/// Migration 028 — `topics.next_offset`: the cross-process monotone offset
+/// counter for the trigger-stream publish path (PLAN-F §3/F4/G5/H5).
+///
+/// `NULL` means "unseeded": a topic registered before this migration (or a
+/// freshly-registered one) has never had an offset assigned through this
+/// column. The publish-time locking statement
+/// (`Publisher::publish_scoped`) seeds it from `COALESCE(MAX("_offset"),
+/// -1) + 1` on the topic's own backing table the first time it is read,
+/// inside the same row-locked `UPDATE` that bumps it — so the seed-then-bump
+/// race is closed by the UPDATE's own row lock rather than an unlocked
+/// read-then-write window. A fresh topic (empty backing table) seeds to `0`.
+///
+/// Numbered 028: PR-A's migration 027 had not landed in this branch at cut
+/// time (see PLAN-F's lead amendment); 028 is the next free number here and
+/// is renumbered by the lead only if another PR claims 028 first.
+pub(super) const MIGRATION_028_TOPICS_NEXT_OFFSET: &str = r#"
+ALTER TABLE topics ADD COLUMN next_offset BIGINT;
+"#;

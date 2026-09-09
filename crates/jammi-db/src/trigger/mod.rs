@@ -28,5 +28,5 @@ pub use offset::Offset;
 pub use predicate::Predicate;
 pub use publisher::Publisher;
 pub use subscriber::Subscriber;
-pub use subscription::{DeliveredBatch, Subscription};
+pub use subscription::{DeliveredBatch, LiveEvent, LiveStream, Subscription};
 pub use topic::{TopicDefinition, OFFSET_COLUMN, PRODUCED_AT_COLUMN, ROW_INDEX_COLUMN};

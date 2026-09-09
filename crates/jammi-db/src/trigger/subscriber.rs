@@ -40,6 +40,7 @@ use async_stream::try_stream;
 use chrono::DateTime;
 use futures::StreamExt;
 
+use crate::catalog::backend::TxOptions;
 use crate::source::mutable::MutableTableRegistry;
 use crate::store::mutable::definition::MutableTableId;
 use crate::tenant::TenantId;
@@ -48,7 +49,7 @@ use crate::trigger::error::TriggerError;
 use crate::trigger::ids::SubscriptionId;
 use crate::trigger::offset::Offset;
 use crate::trigger::predicate::Predicate;
-use crate::trigger::subscription::{DeliveredBatch, Subscription};
+use crate::trigger::subscription::{DeliveredBatch, LiveEvent, Subscription};
 use crate::trigger::topic::{TopicDefinition, OFFSET_COLUMN, PRODUCED_AT_COLUMN, ROW_INDEX_COLUMN};
 
 pub struct Subscriber {
@@ -136,6 +137,20 @@ impl Subscriber {
             .await?;
         let last_replayed = replay_delivered.iter().map(|d| d.offset.value()).max();
 
+        // A live-only subscriber (`from_offset = None`) did no replay above,
+        // so seed the cursor with the current tenant-blind watermark (the
+        // highest committed `_offset` at subscribe time) rather than leaving
+        // it unset — otherwise the first `LiveEvent::Wake` this subscriber
+        // sees would replay the ENTIRE backing-table history instead of only
+        // what committed after this point. A publish racing this read is
+        // still delivered, either by this read observing it or by the very
+        // next live `Batch`/`Wake`.
+        let watermark = if from_offset.is_none() {
+            current_watermark(&self.mutable, topic).await?
+        } else {
+            None
+        };
+
         // The live tail subscribes at `from_offset` — the *same* engine
         // `_offset` lower bound the replay used — so it OVERLAPS the replayed
         // prefix rather than trying to resume strictly above it. Per the
@@ -145,39 +160,68 @@ impl Subscriber {
         // at the wrong position. The dedup below discards the overlap.
         let mut live = self
             .broker
-            .subscribe(topic.id, predicate, from_offset)
+            .subscribe(topic.id, predicate.clone(), from_offset)
             .await?;
+
+        let mutable = Arc::clone(&self.mutable);
+        let topic_owned = topic.clone();
 
         let stream = try_stream! {
             // Highest engine `_offset` already yielded. Seeded with the
-            // replay high-water mark so live events inside the overlap window
-            // are dropped; `None` (no replay) lets the first live event
-            // through.
-            let mut last_yielded = last_replayed;
+            // replay high-water mark (or, for a live-only subscribe, the
+            // watermark read above) so live events inside the overlap window
+            // — or a `Wake`-triggered replay — never re-deliver what this
+            // subscriber has already seen or was never asked for.
+            let mut last_yielded = last_replayed.or(watermark);
             for delivered in replay_delivered {
                 yield delivered;
             }
             while let Some(item) = live.next().await {
-                let delivered = item?;
-                // Tenant filter on the live tail: a globally-registered topic
-                // shares one `topic.id` across every tenant, so the broker's
-                // `subscribe` (tenant-blind by contract) delivers every
-                // tenant's events indiscriminately. Yield only what this
-                // subscriber is scoped to see — its own tenant's events plus
-                // globally-scoped ones (`delivered.tenant.is_none()`) —
-                // mirroring the replay's `tenant_id = $current OR tenant_id
-                // IS NULL` predicate.
-                if delivered.tenant != tenant && delivered.tenant.is_some() {
-                    continue;
-                }
-                // Dedup the replay/live overlap by engine `_offset`: only
-                // advance past what replay already covered. Equality is a
-                // duplicate from the seam overlap; anything lower is a stale
-                // over-delivery from a broker that could not translate the
-                // engine offset into its own sequence.
-                if last_yielded.is_none_or(|seen| delivered.offset.value() > seen) {
-                    last_yielded = Some(delivered.offset.value());
-                    yield delivered;
+                match item? {
+                    LiveEvent::Batch(delivered) => {
+                        // Tenant filter on the live tail: a globally-registered
+                        // topic shares one `topic.id` across every tenant, so
+                        // the broker's `subscribe` (tenant-blind by contract)
+                        // delivers every tenant's events indiscriminately.
+                        // Yield only what this subscriber is scoped to see —
+                        // its own tenant's events plus globally-scoped ones
+                        // (`delivered.tenant.is_none()`) — mirroring the
+                        // replay's `tenant_id = $current OR tenant_id IS
+                        // NULL` predicate.
+                        if delivered.tenant != tenant && delivered.tenant.is_some() {
+                            continue;
+                        }
+                        // Dedup the replay/live overlap by engine `_offset`:
+                        // only advance past what replay already covered.
+                        // Equality is a duplicate from the seam overlap;
+                        // anything lower is a stale over-delivery from a
+                        // broker that could not translate the engine offset
+                        // into its own sequence.
+                        if last_yielded.is_none_or(|seen| delivered.offset.value() > seen) {
+                            last_yielded = Some(delivered.offset.value());
+                            yield delivered;
+                        }
+                    }
+                    LiveEvent::Wake => {
+                        // Self-heal: the driver told us the backing table
+                        // MAY have advanced (a lagged in-process receiver, a
+                        // reconnect, or simply "check"). Replay everything
+                        // strictly after the last offset this subscriber has
+                        // seen, through the same tenant/predicate-scoped
+                        // query the initial replay used.
+                        let from = Some(Offset::new(
+                            last_yielded.map(|o| o + 1).unwrap_or(0),
+                            chrono::Utc::now(),
+                        ));
+                        let more = drain_replay(&mutable, &topic_owned, tenant, &predicate, from)
+                            .await?;
+                        for delivered in more {
+                            if last_yielded.is_none_or(|seen| delivered.offset.value() > seen) {
+                                last_yielded = Some(delivered.offset.value());
+                                yield delivered;
+                            }
+                        }
+                    }
                 }
             }
         };
@@ -223,6 +267,12 @@ impl Subscriber {
     /// when `None`, in which case the replay is empty). The `tenant`
     /// argument is baked into the backend SQL — no task-local lookup
     /// happens inside the underlying scan.
+    ///
+    /// Delegates to the free [`drain_replay`] function, which takes the
+    /// [`MutableTableRegistry`] handle by `Arc` reference rather than `&self`
+    /// so [`Self::subscribe_scoped`] can call it again from inside its
+    /// `'static` live-tail stream body (on a [`crate::trigger::LiveEvent::Wake`])
+    /// without borrowing `self`.
     async fn drain_replay(
         &self,
         topic: &TopicDefinition,
@@ -230,49 +280,94 @@ impl Subscriber {
         predicate: &Predicate,
         from_offset: Option<Offset>,
     ) -> Result<Vec<DeliveredBatch>, TriggerError> {
-        let backing_id = MutableTableId::new(topic.backing_table_name())
-            .map_err(|e| TriggerError::Catalog(e.to_string()))?;
-        let user_schema = Arc::clone(&topic.schema);
-
-        let replay_batches = match from_offset {
-            Some(off) => {
-                // `scan_after` is strictly greater than, so subtract one to
-                // include `off` itself in the replay window. Using `i64`
-                // arithmetic so `Offset(0)` produces `-1` (return every row).
-                let scan_after_value = (off.value() as i64).saturating_sub(1);
-                let mut stream = self
-                    .mutable
-                    .scan_after_for_tenant(&backing_id, scan_after_value, tenant)
-                    .await
-                    .map_err(TriggerError::BackingTable)?;
-                let mut batches: Vec<RecordBatch> = Vec::new();
-                while let Some(b) = stream.next().await {
-                    batches.push(b.map_err(TriggerError::BackingTable)?);
-                }
-                batches
-            }
-            None => Vec::new(),
-        };
-
-        let replay_events = group_replay_batches(&replay_batches, &user_schema)?;
-        let mut delivered: Vec<DeliveredBatch> = Vec::with_capacity(replay_events.len());
-        for event in replay_events {
-            if let Some(filtered) = predicate.evaluate(&event.batch)? {
-                delivered.push(DeliveredBatch {
-                    offset: event.offset,
-                    produced_at: event.produced_at,
-                    batch: filtered,
-                    // The replay path is already tenant-filtered by the
-                    // `scan_after_for_tenant` predicate above, so this tag
-                    // carries no further meaning here and is not authoritative
-                    // — unlike the live tail, which relies on it (see
-                    // `subscribe_scoped`'s live-branch filter).
-                    tenant: None,
-                });
-            }
-        }
-        Ok(delivered)
+        drain_replay(&self.mutable, topic, tenant, predicate, from_offset).await
     }
+}
+
+/// Read the current tenant-blind watermark (`MAX("_offset")`) on `topic`'s
+/// backing table, or `None` if the table has no rows yet. Used to seed a
+/// live-only subscriber's dedup cursor (see [`Subscriber::subscribe_scoped`])
+/// so a subsequent [`crate::trigger::LiveEvent::Wake`] replays only what
+/// committed after subscribe time, not the entire history.
+async fn current_watermark(
+    mutable: &Arc<MutableTableRegistry>,
+    topic: &TopicDefinition,
+) -> Result<Option<u64>, TriggerError> {
+    let backing = topic.backing_table_name();
+    let sql = format!(
+        "SELECT MAX(\"{OFFSET_COLUMN}\") AS m FROM \"{}\"",
+        backing.replace('"', "\"\"")
+    );
+    let backend = mutable.backend_arc();
+    let rows: Vec<Option<i64>> = backend
+        .catalog_backend()
+        .transaction(
+            TxOptions {
+                read_only: true,
+                ..Default::default()
+            },
+            move |tx| {
+                let sql = sql.clone();
+                Box::pin(async move { tx.query(&sql, &[], |row| row.try_get::<i64>("m")).await })
+            },
+        )
+        .await
+        .map_err(TriggerError::Backend)?;
+    Ok(rows.into_iter().next().flatten().map(|v| v as u64))
+}
+
+/// Free-function form of [`Subscriber::drain_replay`] — see its docs. Exists
+/// so [`Subscriber::subscribe_scoped`]'s live-tail stream body can replay
+/// again on a [`crate::trigger::LiveEvent::Wake`] without holding a `&self`
+/// borrow across the `'static` stream.
+async fn drain_replay(
+    mutable: &Arc<MutableTableRegistry>,
+    topic: &TopicDefinition,
+    tenant: Option<TenantId>,
+    predicate: &Predicate,
+    from_offset: Option<Offset>,
+) -> Result<Vec<DeliveredBatch>, TriggerError> {
+    let backing_id = MutableTableId::new(topic.backing_table_name())
+        .map_err(|e| TriggerError::Catalog(e.to_string()))?;
+    let user_schema = Arc::clone(&topic.schema);
+
+    let replay_batches = match from_offset {
+        Some(off) => {
+            // `scan_after` is strictly greater than, so subtract one to
+            // include `off` itself in the replay window. Using `i64`
+            // arithmetic so `Offset(0)` produces `-1` (return every row).
+            let scan_after_value = (off.value() as i64).saturating_sub(1);
+            let mut stream = mutable
+                .scan_after_for_tenant(&backing_id, scan_after_value, tenant)
+                .await
+                .map_err(TriggerError::BackingTable)?;
+            let mut batches: Vec<RecordBatch> = Vec::new();
+            while let Some(b) = stream.next().await {
+                batches.push(b.map_err(TriggerError::BackingTable)?);
+            }
+            batches
+        }
+        None => Vec::new(),
+    };
+
+    let replay_events = group_replay_batches(&replay_batches, &user_schema)?;
+    let mut delivered: Vec<DeliveredBatch> = Vec::with_capacity(replay_events.len());
+    for event in replay_events {
+        if let Some(filtered) = predicate.evaluate(&event.batch)? {
+            delivered.push(DeliveredBatch {
+                offset: event.offset,
+                produced_at: event.produced_at,
+                batch: filtered,
+                // The replay path is already tenant-filtered by the
+                // `scan_after_for_tenant` predicate above, so this tag
+                // carries no further meaning here and is not authoritative
+                // — unlike the live tail, which relies on it (see
+                // `subscribe_scoped`'s live-branch filter).
+                tenant: None,
+            });
+        }
+    }
+    Ok(delivered)
 }
 
 /// One reassembled publish from the backing-table replay path.

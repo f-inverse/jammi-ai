@@ -11,9 +11,10 @@ use std::fmt;
 use std::sync::Arc;
 
 use arrow::array::{
-    ArrayRef, BinaryArray, BooleanArray, Float32Array, Float64Array, Int64Array, LargeBinaryArray,
-    RecordBatch, StringArray, TimestampMicrosecondArray, TimestampMillisecondArray,
-    TimestampNanosecondArray, TimestampSecondArray,
+    ArrayRef, BinaryArray, BooleanArray, Float32Array, Float64Array, Int16Array, Int32Array,
+    Int64Array, Int8Array, LargeBinaryArray, RecordBatch, StringArray, TimestampMicrosecondArray,
+    TimestampMillisecondArray, TimestampNanosecondArray, TimestampSecondArray, UInt16Array,
+    UInt32Array, UInt64Array, UInt8Array,
 };
 use arrow_schema::{DataType, SchemaRef, TimeUnit};
 use async_trait::async_trait;
@@ -191,18 +192,29 @@ impl TableProvider for MutableTableProvider {
     }
 }
 
-/// One column value read from a backend row, after type-aware extraction.
+/// One column value read from a backend row, after **width-faithful**
+/// type-aware extraction: the decode width matches the storage type the
+/// mutable backends actually declare for each Arrow `DataType` (SMALLINT for
+/// Int8/Int16, INTEGER for Int32/UInt8/UInt16, BIGINT for
+/// Int64/UInt32/UInt64/Timestamp — see `store/mutable/postgres.rs::pg_type`)
+/// rather than folding every integer width into `i64` and every float width
+/// into `f64`. Postgres rejects an `i32`/`f64` bind against a narrower
+/// column (SMALLINT/REAL), so the fold silently broke replay for 8 of the 13
+/// topic-schema types this crate accepts (`topic_repo.rs`).
 #[derive(Debug, Clone)]
-enum DecodedValue {
+pub(crate) enum DecodedValue {
     Null,
     Bool(bool),
-    Int(i64),
-    Float(f64),
+    Int16(i16),
+    Int32(i32),
+    Int64(i64),
+    Float32(f32),
+    Float64(f64),
     Text(String),
     Bytes(Vec<u8>),
 }
 
-fn decode_row(
+pub(crate) fn decode_row(
     row: &Row<'_>,
     columns: &[(String, DataType)],
 ) -> Result<Vec<DecodedValue>, crate::catalog::backend::BackendError> {
@@ -213,20 +225,35 @@ fn decode_row(
                 .try_get::<bool>(name)?
                 .map(DecodedValue::Bool)
                 .unwrap_or(DecodedValue::Null)),
-            DataType::Int8
-            | DataType::Int16
-            | DataType::Int32
-            | DataType::Int64
-            | DataType::UInt8
-            | DataType::UInt16
-            | DataType::UInt32
-            | DataType::UInt64 => Ok(row
-                .try_get::<i64>(name)?
-                .map(DecodedValue::Int)
+            // SMALLINT/INT2 — a bind as `i32` is rejected by Postgres.
+            DataType::Int8 | DataType::Int16 => Ok(row
+                .try_get::<i16>(name)?
+                .map(DecodedValue::Int16)
                 .unwrap_or(DecodedValue::Null)),
-            DataType::Float16 | DataType::Float32 | DataType::Float64 => Ok(row
+            // INTEGER/INT4.
+            DataType::Int32 | DataType::UInt8 | DataType::UInt16 => Ok(row
+                .try_get::<i32>(name)?
+                .map(DecodedValue::Int32)
+                .unwrap_or(DecodedValue::Null)),
+            // BIGINT/INT8. The mutable-table DDL stores a timestamp column as
+            // its integer tick (see `sink.rs::extract_value`); the tick is
+            // decoded as a plain i64 here and reassembled into the typed
+            // Arrow Timestamp array in `build_arrays`, which knows the
+            // column's `TimeUnit`.
+            DataType::Int64 | DataType::UInt32 | DataType::UInt64 | DataType::Timestamp(_, _) => {
+                Ok(row
+                    .try_get::<i64>(name)?
+                    .map(DecodedValue::Int64)
+                    .unwrap_or(DecodedValue::Null))
+            }
+            // REAL/FLOAT4 — a bind as `f64` is rejected by Postgres.
+            DataType::Float16 | DataType::Float32 => Ok(row
+                .try_get::<f32>(name)?
+                .map(DecodedValue::Float32)
+                .unwrap_or(DecodedValue::Null)),
+            DataType::Float64 => Ok(row
                 .try_get::<f64>(name)?
-                .map(DecodedValue::Float)
+                .map(DecodedValue::Float64)
                 .unwrap_or(DecodedValue::Null)),
             DataType::Utf8 | DataType::LargeUtf8 => Ok(row
                 .try_get::<String>(name)?
@@ -236,14 +263,6 @@ fn decode_row(
                 .try_get::<Vec<u8>>(name)?
                 .map(DecodedValue::Bytes)
                 .unwrap_or(DecodedValue::Null)),
-            // The mutable-table DDL stores a timestamp column as its integer
-            // tick (see `sink.rs::extract_value`); the tick is decoded as a
-            // plain i64 here and reassembled into the typed Arrow Timestamp
-            // array in `build_arrays`, which knows the column's `TimeUnit`.
-            DataType::Timestamp(_, _) => Ok(row
-                .try_get::<i64>(name)?
-                .map(DecodedValue::Int)
-                .unwrap_or(DecodedValue::Null)),
             other => Err(crate::catalog::backend::BackendError::Execution(format!(
                 "mutable-table scan: column {name:?} has unsupported Arrow type {other:?}"
             ))),
@@ -251,7 +270,7 @@ fn decode_row(
         .collect()
 }
 
-fn build_arrays(
+pub(crate) fn build_arrays(
     columns: &[(String, DataType)],
     rows_per_col: Vec<Vec<DecodedValue>>,
 ) -> Result<Vec<ArrayRef>, DataFusionError> {
@@ -270,18 +289,81 @@ fn build_arrays(
                         .collect();
                     Ok(Arc::new(arr) as ArrayRef)
                 }
-                DataType::Int8
-                | DataType::Int16
-                | DataType::Int32
-                | DataType::Int64
-                | DataType::UInt8
-                | DataType::UInt16
-                | DataType::UInt32
-                | DataType::UInt64 => {
+                DataType::Int8 => {
+                    let arr: Int8Array = values
+                        .into_iter()
+                        .map(|v| match v {
+                            DecodedValue::Int16(i) => Some(i as i8),
+                            _ => None,
+                        })
+                        .collect();
+                    Ok(Arc::new(arr) as ArrayRef)
+                }
+                DataType::Int16 => {
+                    let arr: Int16Array = values
+                        .into_iter()
+                        .map(|v| match v {
+                            DecodedValue::Int16(i) => Some(i),
+                            _ => None,
+                        })
+                        .collect();
+                    Ok(Arc::new(arr) as ArrayRef)
+                }
+                DataType::Int32 => {
+                    let arr: Int32Array = values
+                        .into_iter()
+                        .map(|v| match v {
+                            DecodedValue::Int32(i) => Some(i),
+                            _ => None,
+                        })
+                        .collect();
+                    Ok(Arc::new(arr) as ArrayRef)
+                }
+                DataType::UInt8 => {
+                    let arr: UInt8Array = values
+                        .into_iter()
+                        .map(|v| match v {
+                            DecodedValue::Int32(i) => Some(i as u8),
+                            _ => None,
+                        })
+                        .collect();
+                    Ok(Arc::new(arr) as ArrayRef)
+                }
+                DataType::UInt16 => {
+                    let arr: UInt16Array = values
+                        .into_iter()
+                        .map(|v| match v {
+                            DecodedValue::Int32(i) => Some(i as u16),
+                            _ => None,
+                        })
+                        .collect();
+                    Ok(Arc::new(arr) as ArrayRef)
+                }
+                DataType::Int64 => {
                     let arr: Int64Array = values
                         .into_iter()
                         .map(|v| match v {
-                            DecodedValue::Int(i) => Some(i),
+                            DecodedValue::Int64(i) => Some(i),
+                            _ => None,
+                        })
+                        .collect();
+                    Ok(Arc::new(arr) as ArrayRef)
+                }
+                DataType::UInt32 => {
+                    let arr: UInt32Array = values
+                        .into_iter()
+                        .map(|v| match v {
+                            DecodedValue::Int64(i) => Some(i as u32),
+                            _ => None,
+                        })
+                        .collect();
+                    Ok(Arc::new(arr) as ArrayRef)
+                }
+                DataType::UInt64 => {
+                    let arr: UInt64Array = values
+                        .into_iter()
+                        .map(|v| match v {
+                            DecodedValue::Int64(i) => Some(i as u64),
                             _ => None,
                         })
                         .collect();
@@ -291,7 +373,7 @@ fn build_arrays(
                     let arr: Float32Array = values
                         .into_iter()
                         .map(|v| match v {
-                            DecodedValue::Float(f) => Some(f as f32),
+                            DecodedValue::Float32(f) => Some(f),
                             _ => None,
                         })
                         .collect();
@@ -301,7 +383,7 @@ fn build_arrays(
                     let arr: Float64Array = values
                         .into_iter()
                         .map(|v| match v {
-                            DecodedValue::Float(f) => Some(f),
+                            DecodedValue::Float64(f) => Some(f),
                             _ => None,
                         })
                         .collect();
@@ -351,7 +433,7 @@ fn build_arrays(
                     let ticks: Vec<Option<i64>> = values
                         .into_iter()
                         .map(|v| match v {
-                            DecodedValue::Int(i) => Some(i),
+                            DecodedValue::Int64(i) => Some(i),
                             _ => None,
                         })
                         .collect();

@@ -949,7 +949,7 @@ here: the trigger broker is the pluggable one; the catalog/mutable backend rides
 - **Publish/subscribe contract + error type.** Error type is `TriggerError`
   (`crates/jammi-db/src/trigger/error.rs`) — a `thiserror` enum: `TopicNotFound`,
   `SchemaConflict`, `UnsupportedSchemaType`, `BatchSchemaMismatch`,
-  `PublishTenantMismatch`, `PredicateParse`/`Eval`/`Unsupported`, `OffsetEvicted`,
+  `PublishTenantMismatch`, `PredicateParse`/`Eval`/`Unsupported`,
   `BackingTable(#[from] MutableTableError)`, `Backend(#[from] BackendError)`,
   `Driver`, `Catalog`. Note the **`#[from] MutableTableError`** edge: the trigger
   log *is* a mutable companion table, so the two primitives share an error path.

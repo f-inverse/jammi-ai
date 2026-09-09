@@ -172,8 +172,8 @@ async fn close_drops_tables_and_emits_closed_event(backend: BackendKind) {
         .unwrap()
         .expect("lifecycle topic registered on open");
     let mut sub = s
-        .trigger_broker()
-        .subscribe(topic.id, Predicate::match_all(), None)
+        .subscriber()
+        .subscribe(&topic, Predicate::match_all(), None)
         .await
         .unwrap();
 
@@ -236,8 +236,8 @@ async fn timeout_scanner_force_closes(backend: BackendKind) {
         .unwrap()
         .expect("lifecycle topic registered on open");
     let mut sub = s
-        .trigger_broker()
-        .subscribe(topic.id, Predicate::match_all(), None)
+        .subscriber()
+        .subscribe(&topic, Predicate::match_all(), None)
         .await
         .unwrap();
 

@@ -583,8 +583,15 @@ macro_rules! impl_from_sql_primitive {
 impl_from_sql_primitive!(String);
 impl_from_sql_primitive!(i64);
 impl_from_sql_primitive!(i32);
+// `i16` decodes SMALLINT/INT2 columns (Postgres rejects an `i32` bind
+// against INT2; sqlx's SQLite driver also has a native `i16` mapping).
+// Needed by the storage-typed replay decode path (Int8/Int16 columns).
+impl_from_sql_primitive!(i16);
 impl_from_sql_primitive!(bool);
 impl_from_sql_primitive!(f64);
+// `f32` decodes REAL/FLOAT4 columns — `f64` rejects them on Postgres.
+// Needed by the storage-typed replay decode path (Float32 columns).
+impl_from_sql_primitive!(f32);
 impl_from_sql_primitive!(Vec<u8>);
 
 impl FromSqlValue for uuid::Uuid {

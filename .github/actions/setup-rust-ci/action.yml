@@ -75,13 +75,31 @@ runs:
           # exclusive, and only once per feature (idempotent against a
           # caller who already spelled one out by hand).
           if [ "$(uname -s)" = "Linux" ] && [ "$(uname -m)" = "aarch64" ]; then
+            # $GITHUB_WORKSPACE (absolute), never a bare relative path: some
+            # callers set a job-level `defaults.run.working-directory`
+            # (e.g. pypi.yml's `packaging/native`), which a composite step
+            # inherits -- a relative `ci/scripts/...` would silently resolve
+            # to the WRONG file there (or nothing at all) instead of failing
+            # loud. The extractor's own exit code is captured explicitly
+            # (never `< <(process substitution)`, which discards it): a
+            # missing script, an unreadable config file, or any grammar
+            # violation `rust_target_features.sh` itself rejects must abort
+            # this step, not silently export a floor-less RUSTFLAGS.
+            if ! features="$(bash "$GITHUB_WORKSPACE/ci/scripts/rust_target_features.sh" aarch64-unknown-linux-gnu)"; then
+              echo "::error::ci/scripts/rust_target_features.sh aarch64-unknown-linux-gnu failed -- refusing to export RUSTFLAGS without the arm64 ISA floor (see its own stderr above)" >&2
+              exit 1
+            fi
+            if [ -z "$features" ]; then
+              echo "::error::ci/scripts/rust_target_features.sh returned no target-feature entries for aarch64-unknown-linux-gnu -- check .cargo/config.toml's [target.aarch64-unknown-linux-gnu] rustflags stanza" >&2
+              exit 1
+            fi
             while IFS= read -r feature; do
               [ -n "$feature" ] || continue
               case "$flags" in
                 *"target-feature=$feature"*) : ;;
                 *) flags="$flags -C target-feature=$feature" ;;
               esac
-            done < <(bash ci/scripts/rust_target_features.sh aarch64-unknown-linux-gnu)
+            done <<< "$features"
           fi
           echo "RUSTFLAGS=$flags" >> "$GITHUB_ENV"
         fi

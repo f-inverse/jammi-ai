@@ -1466,6 +1466,16 @@ jobs:
           # stdin, which only the real workflow run can produce.
           - name: merged index platforms self-test
             cmd: bash ci/scripts/check_merged_index_platforms.sh --self-test
+          # `setup-rust-ci`'s aarch64-linux RUSTFLAGS floor has exactly one
+          # oracle: this. `rust_target_features.sh` is not a `check_*`
+          # script (it extracts a value, asserting no repo invariant on its
+          # own), so `check_ci_guard_wiring.py` does not require this --
+          # wired anyway, because an ISA-floor extractor with no CI-run
+          # self-test is itself the drift this repo cannot silently regrow.
+          # No fixtures, no network: asserts against the REAL
+          # .cargo/config.toml plus five synthetic FAIL-shape fixtures.
+          - name: rust target features self-test
+            cmd: bash ci/scripts/rust_target_features.sh --self-test
           # The verdict CONSUMER's own suite: every esc-084 control (b)
           # degenerate record, the recency/revocation rule, and the wait
           # state machine, driven with a fake fetch/clock — no network.

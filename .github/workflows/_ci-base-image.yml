@@ -248,8 +248,19 @@ jobs:
           # `plan`'s matrix JSON is the single place the platform -> arch map
           # lives -- read the arch list back out of it instead of
           # re-deriving arch from `inputs.platforms` with a second case
-          # statement.
-          mapfile -t archs < <(jq -r '.include[].arch' <<< "$MATRIX_JSON")
+          # statement. `archs_json=$(...) || exit 1` (never `mapfile <
+          # <(...)`, which discards jq's own exit code into a subshell this
+          # step never checks) so a malformed MATRIX_JSON input fails this
+          # step loudly instead of silently producing zero sources below.
+          archs_json="$(jq -r '.include[].arch' <<< "$MATRIX_JSON")" || {
+            echo "::error::failed to read .include[].arch out of plan's matrix JSON" >&2
+            exit 1
+          }
+          mapfile -t archs <<< "$archs_json"
+          if [ "${#archs[@]}" -eq 0 ] || [ -z "${archs[0]}" ]; then
+            echo "::error::plan's matrix JSON yielded zero archs -- refusing to compute an empty source list" >&2
+            exit 1
+          fi
           : > /tmp/ci-base-image-sources.txt
           for arch in "${archs[@]}"; do
             echo "${IMAGE}:${SHA_TAG}-${arch}" >> /tmp/ci-base-image-sources.txt
@@ -308,7 +319,7 @@ jobs:
           inspect_stderr="$(cat /tmp/ci-base-image-inspect-stderr.txt)"
 
           if [ "$inspect_rc" -ne 0 ]; then
-            if [[ "$inspect_stderr" == *": not found"* ]]; then
+            if [[ "$inspect_stderr" == *"$first_tag: not found"* ]]; then
               echo "previous_digest=" >> "$GITHUB_OUTPUT"
               echo "pre-create digest read: $first_tag does not exist yet (first publish) -- nothing to restore to"
             else
@@ -340,13 +351,31 @@ jobs:
         run: |
           set -euo pipefail
           first_tag="$(head -n1 /tmp/ci-base-image-tags.txt)"
-          if ! docker buildx imagetools inspect "$first_tag" --format '{{json .Manifest}}' \
-            | bash ci/scripts/check_merged_index_platforms.sh "$PLATFORMS"; then
+
+          # Two DIFFERENT failures, two different messages: the re-inspect
+          # ITSELF failing (the push may or may not have actually landed --
+          # unknown, so a restore command here could overwrite a GOOD push
+          # with a stale digest) is never the same situation as a
+          # successful re-inspect whose CONTENT fails the assertion (the
+          # push definitely landed and definitely landed wrong -- a restore
+          # is exactly right there).
+          set +e
+          manifest="$(docker buildx imagetools inspect "$first_tag" --format '{{json .Manifest}}' 2>/tmp/ci-base-image-confirm-stderr.txt)"
+          confirm_inspect_rc=$?
+          set -e
+
+          if [ "$confirm_inspect_rc" -ne 0 ]; then
+            confirm_stderr="$(cat /tmp/ci-base-image-confirm-stderr.txt)"
+            echo "::error::could not re-read $first_tag after the promote step ($confirm_stderr) -- do NOT restore from PREVIOUS_DIGEST ($PREVIOUS_DIGEST): whether the push landed is unknown, so overwriting now could discard a GOOD push instead of a bad one; verify manually first" >&2
+            exit 1
+          fi
+
+          if ! echo "$manifest" | bash ci/scripts/check_merged_index_platforms.sh "$PLATFORMS"; then
             if [ -n "$PREVIOUS_DIGEST" ]; then
               restore_ref="${first_tag%:*}@${PREVIOUS_DIGEST}"
-              echo "::error::post-push confirm failed for $first_tag -- previous digest was $PREVIOUS_DIGEST; restore with: docker buildx imagetools create -t $first_tag $restore_ref" >&2
+              echo "::error::post-push confirm failed for $first_tag -- the re-read index itself is wrong; previous digest was $PREVIOUS_DIGEST; restore with: docker buildx imagetools create -t $first_tag $restore_ref" >&2
             else
-              echo "::error::post-push confirm failed for $first_tag -- this was the first publish of this tag, so there is no previous digest to restore to; investigate directly" >&2
+              echo "::error::post-push confirm failed for $first_tag -- the re-read index itself is wrong, and this was the first publish of this tag, so there is no previous digest to restore to; investigate directly" >&2
             fi
             exit 1
           fi

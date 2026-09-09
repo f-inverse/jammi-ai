@@ -1457,6 +1457,15 @@ jobs:
             cmd: python3 ci/scripts/check_gpu_prove_once.py
           - name: gpu prove once suite
             cmd: python3 ci/scripts/test_check_gpu_prove_once.py
+          # `_ci-base-image.yml`'s `merge-manifest` job's own gate: asserts a
+          # `docker buildx imagetools` manifest-list JSON carries exactly a
+          # requested platform set plus one `unknown/unknown` attestation
+          # entry per platform, run against both the dry-run (pre-push) and
+          # the post-push confirm call sites. Self-test only here (no
+          # docker, no network) — the script itself takes a live manifest on
+          # stdin, which only the real workflow run can produce.
+          - name: merged index platforms self-test
+            cmd: bash ci/scripts/check_merged_index_platforms.sh --self-test
           # The verdict CONSUMER's own suite: every esc-084 control (b)
           # degenerate record, the recency/revocation rule, and the wait
           # state machine, driven with a fake fetch/clock — no network.

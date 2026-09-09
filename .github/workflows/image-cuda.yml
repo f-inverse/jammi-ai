@@ -14,6 +14,7 @@ on:
       - ".docker/ci.Dockerfile"
       - ".docker/ci-cuda.Dockerfile"
       - "rust-toolchain.toml"
+      - ".github/workflows/_ci-base-image.yml"
   workflow_dispatch:
 
 # Serialize per ref, never cancel: an image push in flight must finish,
@@ -48,3 +49,10 @@ jobs:
     with:
       image_suffix: ci-cuda
       dockerfile: .docker/ci-cuda.Dockerfile
+      # ci-cuda.Dockerfile's FROM is `ghcr.io/f-inverse/jammi-ai-ci:latest`
+      # (the CPU base this image layers on), not a manylinux image -- the
+      # reusable's own default `base_image_amd64` is for the CPU base's
+      # FROM, so this caller overrides it explicitly. `base_image_arm64`
+      # stays at its default: unused, since this caller never requests
+      # `linux/arm64` in `platforms`.
+      base_image_amd64: ghcr.io/f-inverse/jammi-ai-ci:latest

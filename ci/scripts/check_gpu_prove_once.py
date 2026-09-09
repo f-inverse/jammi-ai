@@ -111,7 +111,9 @@ string):
      including an unquoted `true`, `'true'`, or any `${{ }}` expression —
      `./.github/actions/docker-publish` and its cross-repo form under the
      SAME push rule, `./.github/actions/release-upload` and its cross-repo
-     form, `ci/scripts/publish_crates.sh`) must be listed as SOME row's
+     form, `ci/scripts/publish_crates.sh`, `docker buildx imagetools create`
+     (never bare `imagetools` -- `imagetools inspect` is a read-only
+     assertion, not a promotion) must be listed as SOME row's
      `(workflow, promoting_job)` in `PROMOTION_TABLE`. RECURSIVE: a job that
      merely `uses:` a LOCAL reusable workflow (job-level `uses: ./.github/
      workflows/<X>.yml`) whose OWN jobs match a primitive is itself a
@@ -969,6 +971,13 @@ _SIMPLE_PRIMITIVE_PATTERNS: tuple[tuple[str, re.Pattern[str]], ...] = (
     ("pypa/gh-action-pypi-publish", re.compile(r"pypa/gh-action-pypi-publish")),
     ("softprops/action-gh-release", re.compile(r"softprops/action-gh-release")),
     ("ci/scripts/publish_crates.sh", re.compile(r"ci/scripts/publish_crates\.sh")),
+    # `docker buildx imagetools create` merges per-arch immutable sources into
+    # one multi-arch index under a REAL tag -- itself a promotion, distinct
+    # from `imagetools inspect` (read-only, used to assert the merged index's
+    # platform set). The pattern is anchored on the FULL three-word primitive
+    # (`create`, never bare `imagetools`) so an inspect-only job is never
+    # mistaken for one.
+    ("docker buildx imagetools create", re.compile(r"docker\s+buildx\s+imagetools\s+create\b")),
 )
 
 # `push:`-conditional primitives: matching the marker is not enough on its

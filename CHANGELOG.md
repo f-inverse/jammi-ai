@@ -451,6 +451,16 @@ workspace ships every publishable crate at the same
   window: when an arch's latest attempt is itself still in progress, it now falls back to that run's
   own most recent COMPLETED attempt for the arch (`filter=all`, lazy, cached per run) — a red
   completed attempt sitting behind an in-flight rerun still denies (F5).
+- **The CI base image (`jammi-ai-ci`) is now a multi-arch index: `linux/amd64` + `linux/arm64`.**
+  `_ci-base-image.yml`'s `build-and-push` is a matrix over the caller's `platforms` input, one
+  NATIVE runner per platform (`linux/amd64` on `ubuntu-latest`, `linux/arm64` on
+  `ubuntu-24.04-arm` — no QEMU); each leg pushes only its own immutable `sha-<sha>-<arch>` tag, and
+  a new `merge-manifest` job (running for every caller, including a one-platform caller like
+  `image-cuda.yml`, which stays `linux/amd64`-only) merges the per-arch sources into the real
+  `latest`/`sha-<sha>` tags via `docker buildx imagetools create`, asserting the merged index's
+  platform set via `imagetools inspect`. `image.yml` requests both platforms; the CUDA base
+  (`jammi-ai-ci-cuda`) is unchanged (amd64 only — CUDA has no arm64 leg). Apple-silicon devcontainers
+  now resolve `:latest` to a native arm64 image instead of an emulated amd64 one.
 
 ### Fixed
 - **`jammi-encoders`' unit-test binary now serializes every writer of EVERY process-wide fusible-seam

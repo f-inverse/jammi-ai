@@ -5,10 +5,27 @@ name: _ci-base-image
 # differing only in the image name and the Dockerfile. One reusable, two thin
 # callers (image.yml / image-cuda.yml), instead of two byte-identical workflows.
 #
+# Multi-arch shape: `build-and-push` is a matrix over the caller's `platforms`
+# input, one NATIVE runner per platform (`linux/amd64` -> `ubuntu-latest`,
+# `linux/arm64` -> `ubuntu-24.04-arm`; no QEMU — a QEMU-emulated Rust
+# toolchain build is an order of magnitude slower and has hung before). Each
+# leg pushes ONLY the immutable `sha-<sha>-<arch>` tag; a leg never pushes a
+# real (`latest`/bare `sha-<sha>`) tag on its own, so two concurrent runs can
+# never mix arches into one real tag. `merge-manifest` (`needs: [plan,
+# build-and-push]`, runs for every caller including a ONE-platform caller —
+# `image-cuda.yml` passes no `platforms` at all, i.e. the single-element
+# default) re-derives the SAME real tags this workflow has always published,
+# DRY-RUNS the merge and asserts the resulting index BEFORE promoting
+# anything, then merges the per-arch immutable sources into one multi-arch
+# index via `docker buildx imagetools create`, then re-inspects the pushed
+# tag once to confirm.
+#
 # Every consumer's `container:` field (and workflow-call `container_image`
 # input) resolves the image via a repo variable with a literal `:latest`
 # fallback: `${{ vars.JAMMI_CI_IMAGE || 'ghcr.io/f-inverse/jammi-ai-ci:latest' }}`
-# (resp. `JAMMI_CI_IMAGE_CUDA` for the CUDA base).
+# (resp. `JAMMI_CI_IMAGE_CUDA` for the CUDA base). Pulling `:latest` now
+# resolves to a multi-arch INDEX, so each puller's own container runtime
+# selects the manifest matching its own host arch automatically.
 #
 # Consumers track `:latest`, deliberately. This workflow does NOT rewrite those
 # variables to the sha tag it just pushed, and a step that tried to was removed:
@@ -17,10 +34,16 @@ name: _ci-base-image
 # grant it — repo variables need `administration: write`, which is not available
 # to GITHUB_TOKEN. Re-adding sha-pinning therefore means introducing a PAT, not
 # adjusting permissions. Do not "fix" the failure by making such a step
-# non-fatal; that converts a broken pin into a silent one.
+# non-fatal; that converts a broken pin into a silent one. A run that needs an
+# IMMUTABLE base (every release-artifact-producing workflow) instead resolves
+# `:latest` to its index digest ONCE per run (`docker buildx imagetools
+# inspect --format '{{.Manifest.Digest}}'`) and passes that resolved
+# `image@sha256:...` ref forward — still no PAT, still no repo-variable write,
+# just a read done once per run instead of once per repo-variable update.
 #
-# The `sha-<commit>` tag is still published, so a specific build can be pinned by
-# hand (set the repo variable to it) when a bisect or a reproduction needs it.
+# The `sha-<commit>-<arch>` tags are still published (now per-arch, merged
+# under `sha-<commit>` too), so a specific build can be pinned by hand (set
+# the repo variable to it) when a bisect or a reproduction needs it.
 
 on:
   workflow_call:
@@ -33,19 +56,92 @@ on:
         description: "Dockerfile to build (build context is .docker/)."
         type: string
         required: true
+      platforms:
+        description: >-
+          Comma-separated buildx platform list, e.g. "linux/amd64,linux/arm64".
+          Each entry builds NATIVELY on its own runner (no QEMU) -- see the
+          `plan` job below for the platform -> runner/arch/base-image map.
+        type: string
+        default: "linux/amd64"
+      base_image_amd64:
+        description: "BASE_IMAGE build-arg for the linux/amd64 leg."
+        type: string
+        default: "quay.io/pypa/manylinux_2_28_x86_64"
+      base_image_arm64:
+        description: "BASE_IMAGE build-arg for the linux/arm64 leg."
+        type: string
+        default: "quay.io/pypa/manylinux_2_28_aarch64"
 
 permissions:
   contents: read
   packages: write
 
 jobs:
-  build-and-push:
+  # Turns the comma-separated `platforms` input into a matrix `include:`
+  # list. A GitHub Actions matrix cannot be built from a raw string directly
+  # -- `fromJson` needs a real JSON array, so this job does the one bit of
+  # scripting the rest of the file stays declarative around. This is the
+  # SINGLE place the platform -> runner/arch/base-image map lives:
+  # `build-and-push` consumes it as its own `strategy.matrix`, and
+  # `merge-manifest` reads the arch list back out of this job's `matrix`
+  # output instead of re-deriving it.
+  plan:
     runs-on: ubuntu-latest
+    outputs:
+      matrix: ${{ steps.plan.outputs.matrix }}
+    steps:
+      - name: Derive the per-platform build matrix
+        id: plan
+        shell: bash
+        env:
+          PLATFORMS: ${{ inputs.platforms }}
+          BASE_IMAGE_AMD64: ${{ inputs.base_image_amd64 }}
+          BASE_IMAGE_ARM64: ${{ inputs.base_image_arm64 }}
+        run: |
+          set -euo pipefail
+          IFS=',' read -ra platforms <<< "$PLATFORMS"
+          entries=()
+          for platform in "${platforms[@]}"; do
+            case "$platform" in
+              linux/amd64)
+                runner=ubuntu-latest
+                arch=amd64
+                base_image="$BASE_IMAGE_AMD64"
+                ;;
+              linux/arm64)
+                runner=ubuntu-24.04-arm
+                arch=arm64
+                base_image="$BASE_IMAGE_ARM64"
+                ;;
+              *)
+                echo "unsupported platform: '$platform' (expected linux/amd64 or linux/arm64)" >&2
+                exit 1
+                ;;
+            esac
+            entries+=("{\"platform\":\"$platform\",\"runner\":\"$runner\",\"arch\":\"$arch\",\"base_image\":\"$base_image\"}")
+          done
+          matrix="{\"include\":[$(IFS=,; echo "${entries[*]}")]}"
+          echo "matrix=$matrix" >> "$GITHUB_OUTPUT"
+
+  build-and-push:
+    needs: [plan]
+    strategy:
+      matrix: ${{ fromJson(needs.plan.outputs.matrix) }}
+    runs-on: ${{ matrix.runner }}
     permissions:
       contents: read
       packages: write
     steps:
       - uses: actions/checkout@v4
+
+      # The buildx `docker-container` driver is required for the attestation
+      # manifest `merge-manifest`'s assertion below depends on: the default
+      # `docker` driver builds without buildx at all and emits a plain v2
+      # manifest with NO `unknown/unknown` provenance referrer, which would
+      # silently fail that assertion the first time `imagetools create`
+      # moves a real tag. Pinned to the same sha `docker-publish`'s own
+      # `Set up Docker Buildx` step uses. Load-bearing, not cosmetic.
+      - uses: docker/setup-buildx-action@8d2750c68a42422c14e847fe6c8ac0403b4cbd6f # v3.12.0
 
       - uses: docker/login-action@c94ce9fb468520275223c153574b00df6fe4bcc9 # v3.7.0
         with:
@@ -57,17 +153,14 @@ jobs:
         id: meta
         with:
           images: ghcr.io/${{ github.repository }}-${{ inputs.image_suffix }}
-          # `latest` is what every consumer's `vars.JAMMI_CI_IMAGE[_CUDA] ||
-          # 'ghcr.io/...:latest'` expression resolves to, and what the repo
-          # variables are set to — the toolchain layer the crates.io publish
-          # and the release lanes build inside. It therefore only moves from
-          # the DEFAULT branch (`enable={{is_default_branch}}`): a dispatch on
-          # a feature branch publishes the immutable `sha-<sha>` handle only,
-          # never repoints the channel every release lane consumes.
-          # `type=sha,format=long` is published alongside as an immutable
-          # handle for pinning a build by hand.
+          # Each leg pushes ONLY the immutable per-arch sha tag -- never
+          # `latest`, never a bare `sha-<sha>` -- so `merge-manifest` below is
+          # the ONLY job that ever moves a real (consumer-facing) tag, and two
+          # concurrent runs on different refs can never mix arches into one
+          # real tag by racing each other's per-leg pushes.
+          flavor: |
+            suffix=-${{ matrix.arch }},onlatest=true
           tags: |
-            type=raw,value=latest,enable={{is_default_branch}}
             type=sha,format=long
 
       # rust-toolchain.toml is the single source of truth for the pin. The build
@@ -89,8 +182,120 @@ jobs:
         with:
           context: .docker
           file: ${{ inputs.dockerfile }}
+          platforms: ${{ matrix.platform }}
           push: true
           build-args: |
+            BASE_IMAGE=${{ matrix.base_image }}
             RUST_VERSION=${{ steps.rust-pin.outputs.channel }}
           tags: ${{ steps.meta.outputs.tags }}
           labels: ${{ steps.meta.outputs.labels }}
+
+  # Runs UNCONDITIONALLY -- also for a one-platform caller (image-cuda.yml
+  # passes no `platforms` input at all, i.e. the single-element default) --
+  # because this is now the ONLY job that ever produces the real
+  # (`latest`/bare `sha-<sha>`) tags every consumer's `container:`/
+  # `JAMMI_CI_IMAGE[_CUDA]` expression resolves. A one-platform run still
+  # needs its single immutable source merged into a real tag; skipping this
+  # job for that case would leave `:latest` stale forever.
+  #
+  # Verify-then-promote: the merge is DRY-RUN first and its resulting index
+  # asserted against the requested platform set BEFORE anything is pushed --
+  # `imagetools create --dry-run` prints the same top-level index JSON
+  # `imagetools inspect --format '{{json .Manifest}}'` returns on a
+  # multi-platform tag (verified against a live registry), so the identical
+  # assertion script runs against both. A failed assertion here means
+  # nothing was pushed and `:latest`/`sha-<sha>` never moved. Only after
+  # that passes does the real (pushing) `imagetools create` run, followed by
+  # one cheap re-inspect of the actually-pushed tag to confirm the push
+  # matched what the dry run predicted.
+  merge-manifest:
+    needs: [plan, build-and-push]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: docker/login-action@c94ce9fb468520275223c153574b00df6fe4bcc9 # v3.7.0
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      # Re-run metadata-action with the ORIGINAL (unsuffixed) tag rules --
+      # the exact tag set this workflow published before the per-arch legs
+      # existed -- so `latest` still only moves on the default branch and
+      # `sha-<sha>` is still the immutable per-commit handle, now naming a
+      # multi-arch index instead of a single-arch image.
+      - uses: docker/metadata-action@c299e40c65443455700f0fdfc63efafe5b349051 # v5.10.0
+        id: meta
+        with:
+          images: ghcr.io/${{ github.repository }}-${{ inputs.image_suffix }}
+          tags: |
+            type=raw,value=latest,enable={{is_default_branch}}
+            type=sha,format=long
+
+      - name: Compute the immutable per-arch sources and the real tag list
+        shell: bash
+        env:
+          IMAGE: ghcr.io/${{ github.repository }}-${{ inputs.image_suffix }}
+          SHA_TAG: sha-${{ github.sha }}
+          TAGS: ${{ steps.meta.outputs.tags }}
+          MATRIX_JSON: ${{ needs.plan.outputs.matrix }}
+        run: |
+          set -euo pipefail
+          # `plan`'s matrix JSON is the single place the platform -> arch map
+          # lives -- read the arch list back out of it instead of
+          # re-deriving arch from `inputs.platforms` with a second case
+          # statement.
+          mapfile -t archs < <(jq -r '.include[].arch' <<< "$MATRIX_JSON")
+          : > /tmp/ci-base-image-sources.txt
+          for arch in "${archs[@]}"; do
+            echo "${IMAGE}:${SHA_TAG}-${arch}" >> /tmp/ci-base-image-sources.txt
+          done
+
+          : > /tmp/ci-base-image-tags.txt
+          while IFS= read -r tag; do
+            [ -n "$tag" ] || continue
+            echo "$tag" >> /tmp/ci-base-image-tags.txt
+          done <<< "$TAGS"
+
+      - name: Dry-run the merge and assert the resulting index BEFORE promoting anything
+        shell: bash
+        env:
+          PLATFORMS: ${{ inputs.platforms }}
+        run: |
+          set -euo pipefail
+          mapfile -t sources < /tmp/ci-base-image-sources.txt
+          mapfile -t tags < /tmp/ci-base-image-tags.txt
+          tag_args=()
+          for tag in "${tags[@]}"; do
+            tag_args+=(-t "$tag")
+          done
+
+          docker buildx imagetools create --dry-run "${tag_args[@]}" "${sources[@]}" \
+            | bash ci/scripts/check_merged_index_platforms.sh "$PLATFORMS"
+
+      - name: Promote -- create the real merged index
+        shell: bash
+        run: |
+          set -euo pipefail
+          mapfile -t sources < /tmp/ci-base-image-sources.txt
+          mapfile -t tags < /tmp/ci-base-image-tags.txt
+          tag_args=()
+          for tag in "${tags[@]}"; do
+            tag_args+=(-t "$tag")
+          done
+
+          docker buildx imagetools create "${tag_args[@]}" "${sources[@]}"
+
+      - name: Confirm the pushed index (cheap re-inspect of one tag)
+        shell: bash
+        env:
+          PLATFORMS: ${{ inputs.platforms }}
+        run: |
+          set -euo pipefail
+          first_tag="$(head -n1 /tmp/ci-base-image-tags.txt)"
+          docker buildx imagetools inspect "$first_tag" --format '{{json .Manifest}}' \
+            | bash ci/scripts/check_merged_index_platforms.sh "$PLATFORMS"

@@ -1,0 +1,125 @@
+name: _e1-arm-probe
+
+# THROWAWAY -- E1 dispatch probe only, `workflow_dispatch`-only, DELETED
+# before this branch merges (PLAN-E.md E4, contract change item 6). It exists
+# to prove three things on a real `ubuntu-24.04-arm` GitHub-hosted runner
+# BEFORE E-2's arm64 release lanes are built on top of the assumption:
+#
+#   1. `container:` resolves and runs the just-published `sha-<sha>`
+#      multi-arch index (T3) -- proves `container:` works on the arm runner
+#      at all (gap-E 4), and that the index's arm64 member is a real,
+#      working manylinux_2_28 userland.
+#   2. Every sys-crate this workspace links (usearch, zstd-sys, onig_sys,
+#      esaxx-rs, gemm, psm, ring; gap-E 6) and every RELEASE feature set
+#      E-2's arm legs will build (T3/U6/V7) actually builds and, where
+#      cheap, tests on aarch64-manylinux_2_28.
+#   3. The PUBLISHED index -- pulled explicitly on THIS runner, not merely
+#      the image GitHub Actions resolved for `container:` -- really serves
+#      an arm64 manifest (X3), so the probe covers the artifact a consumer
+#      actually pulls, not only what the job setup step happened to cache.
+#
+# `jammi-server probe` (X3's named check) is a PR-D subcommand not yet on
+# this branch (E-1 is cut independently of PR-D, per PLAN-E.md's own base
+# note) -- substituted below with `jammi-server --version` inside a
+# container started from the explicitly-pulled published image, which
+# proves the same thing X3 wants (the published arm64 member runs a real
+# process, not just `docker inspect`) without depending on an unmerged PR.
+# The lead re-points this at `jammi-server probe` once PR-D lands, or drops
+# the substitution note, before deleting this file.
+#
+# Run manually from this branch (`gh workflow run _e1-arm-probe.yml --ref
+# feat/deploy-shapes-E1-arm64-ci-base`) AFTER `image.yml`'s own dispatch has
+# published `sha-<sha>` for both arches. The lead removes this file in a
+# follow-up commit once the probe results are recorded in the ledger.
+
+on:
+  workflow_dispatch: {}
+
+permissions:
+  contents: read
+  packages: read
+
+jobs:
+  build-release-surface:
+    # T3/U6/V7: the exact release feature sets E-2's arm legs build, plus the
+    # cdylib and its link-configuration feature -- proves the toolchain layer
+    # (this commit's own CI base image) can actually produce every arm64
+    # release artifact, not just compile a hermetic hello-world.
+    runs-on: ubuntu-24.04-arm
+    container: ghcr.io/f-inverse/jammi-ai-ci:sha-${{ github.sha }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: cargo build -p jammi-server (release feature set)
+        run: |
+          cargo build --release -p jammi-server --bin jammi-server \
+            --features jetstream-broker,storage-cloud --locked
+
+      - name: cargo build -p jammi-cli (release)
+        run: |
+          cargo build --release -p jammi-cli --bin jammi --locked
+
+      - name: cargo build -p jammi-python (release cdylib, extension-module)
+        run: |
+          cargo build --release -p jammi-python --features extension-module --locked
+
+      - name: cargo test -p jammi-numerics -p jammi-encoders (every gap-E 6 sys-crate)
+        run: |
+          cargo test -p jammi-numerics -p jammi-encoders --locked
+
+      - name: Sanity -- the built binaries are really aarch64
+        run: |
+          set -euo pipefail
+          uname -m
+          file target/release/jammi-server target/release/jammi | tee /dev/stderr | grep -qi aarch64
+
+  probe-published-index:
+    # X3: explicitly `docker pull` the PUBLISHED tag on this arm runner
+    # (never relying on the `container:` job's own image resolution/caching)
+    # and start a container FROM it, proving the index a consumer pulls
+    # today really is a working arm64 manifest.
+    runs-on: ubuntu-24.04-arm
+    needs: [build-release-surface]
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Pull the published multi-arch index explicitly
+        run: |
+          set -euo pipefail
+          docker pull "ghcr.io/f-inverse/jammi-ai-ci:sha-${{ github.sha }}"
+          arch="$(docker inspect "ghcr.io/f-inverse/jammi-ai-ci:sha-${{ github.sha }}" --format '{{.Architecture}}')"
+          echo "resolved arch: $arch"
+          test "$arch" = "arm64"
+
+      - name: Start a container from the published image and probe it
+        # `jammi-server --version` substitutes for X3's named `jammi-server
+        # probe` (see the header note above) -- built and run INSIDE the
+        # explicitly-pulled container, so a working process is the proof,
+        # not just `docker inspect`'s metadata.
+        run: |
+          set -euo pipefail
+          docker run --rm -v "$PWD:/workspace" -w /workspace \
+            "ghcr.io/f-inverse/jammi-ai-ci:sha-${{ github.sha }}" bash -lc '
+              set -euo pipefail
+              uname -m
+              cargo build --release -p jammi-server --bin jammi-server --locked
+              ./target/release/jammi-server --version
+            '
+
+  build-devcontainer:
+    # The CHANGELOG advertises the Apple-silicon devcontainer flip
+    # (`.devcontainer/Dockerfile`'s bare `FROM ghcr.io/f-inverse/jammi-ai-ci
+    # :latest` now resolves to the arm64 member of the published index);
+    # nothing else in this probe exercises that file. Build only, no push --
+    # proves the devcontainer Dockerfile's OWN layers (the pinned nightly
+    # toolchain install, the build-graph cargo install, the yum packages),
+    # not only that the base image resolves.
+    runs-on: ubuntu-24.04-arm
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: docker/setup-buildx-action@8d2750c68a42422c14e847fe6c8ac0403b4cbd6f # v3.12.0
+
+      - name: docker buildx build .devcontainer/Dockerfile (native arm64, no push)
+        run: |
+          docker buildx build --platform linux/arm64 -f .devcontainer/Dockerfile .devcontainer

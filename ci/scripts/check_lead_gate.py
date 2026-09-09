@@ -83,6 +83,12 @@ Required fixtures (RED when the corresponding hook arm is removed):
   N7  wall time < 1s per invocation
   R10 wiring: SubagentStart/SubagentStop/PreToolUse(Agent|Task) present,
       scripts executable, permissions.deny covers the hook files
+  G20-G31 esc-097 (R3, "probe the fix" — proposal, docs/plans/63-how-well/
+      proposals/esc-097-probe-the-fix.md): exercised behind a `RELAY_R3`
+      version-marker guard on `.claude/hooks/lead-gate-lib.py` — reported
+      SKIPPED (exit 0 for that arm only) until a human applies the
+      proposal's patch files; run for real, and must all pass, the moment
+      the marker is present.
 
 Run: `python3 ci/scripts/check_lead_gate.py --self-test`
 """
@@ -112,7 +118,17 @@ class Failure(Exception):
 
 
 def _run(script: str, payload: dict | bytes, project_dir: Path,
-         env_overrides: dict | None = None) -> subprocess.CompletedProcess:
+         env_overrides: dict | None = None, cwd: Path | None = None) -> subprocess.CompletedProcess:
+    """esc-097 (HARD_BLOCK fix): `cwd` is NOT `project_dir` by default — a
+    mutant that reduces `repo_root()` to `Path.cwd()` (dropping the
+    `CLAUDE_PROJECT_DIR` env read entirely) previously passed all 45
+    fixtures here BECAUSE every one of them ran with `cwd == project_dir`,
+    so cwd-vs-env was never actually distinguished by anything. The default
+    `cwd` is now a single, shared, empty DECOY directory (`_DECOY_CWD`,
+    minted once at import time) that carries no `.jammi/gate-state` at all —
+    a fixture that needs the cwd FALLBACK exercised on purpose (only G26:
+    `CLAUDE_PROJECT_DIR` unset, relying on `repo_root()`'s OTHER, unrelated
+    cwd fallback for the non-R3 arms) passes `cwd=project_dir` explicitly."""
     env = dict(os.environ)
     env["CLAUDE_PROJECT_DIR"] = str(project_dir)
     if env_overrides:
@@ -134,12 +150,7 @@ def _run(script: str, payload: dict | bytes, project_dir: Path,
         input=data,
         capture_output=True,
         env=env,
-        # esc-097 (G26): the subprocess's OWN cwd is `project_dir` too, so
-        # `repo_root()`'s cwd fallback (used everywhere EXCEPT the git arm,
-        # which reads `CLAUDE_PROJECT_DIR` directly per V8) still resolves
-        # `.jammi/gate-state` correctly even when a fixture explicitly unsets
-        # the env var to exercise that one arm's own explicit requirement.
-        cwd=str(project_dir),
+        cwd=str(cwd if cwd is not None else _DECOY_CWD),
         timeout=10,
     )
     _WALL_TIMES.append(time.monotonic() - start)
@@ -150,6 +161,15 @@ def _run(script: str, payload: dict | bytes, project_dir: Path,
 
 def _fresh_root() -> Path:
     return Path(tempfile.mkdtemp(prefix="lead-gate-selftest-"))
+
+
+# esc-097 (HARD_BLOCK fix): a single, shared, empty directory — never a
+# fixture's own `project_dir` — used as `_run()`'s default `cwd`. It carries
+# no `.jammi/gate-state`, so a mutant that makes `repo_root()` prefer
+# `Path.cwd()` over `CLAUDE_PROJECT_DIR` fails almost every fixture (state
+# resolves to an empty decoy instead of the real fixture root), rather than
+# passing all of them by accident.
+_DECOY_CWD = Path(tempfile.mkdtemp(prefix="lead-gate-decoy-cwd-"))
 
 
 # --------------------------------------------------------------------------
@@ -1197,23 +1217,37 @@ def fixture_g21_fix_head_equals_block_sha_denies() -> None:
     _assert("re-roll" in p.stderr, "G21", f"deny reason must name the re-roll, got: {p.stderr!r}")
 
 
-def fixture_g22_fix_head_not_reachable_denies() -> None:
-    """`fix_head` resolves as a commit and even descends from `block_sha`,
-    but sits on a DIFFERENT branch never merged into the unit — V2's
-    reachability check (`merge-base --is-ancestor fix_head unit_branch`),
-    not block_sha ancestry (G25 covers that distinction)."""
+def fixture_g22_relay_named_branch_governs_reachability() -> None:
+    """esc-097 (adversarial B3 fix): reachability targets the RELAY's OWN
+    `unit_branch` field, no longer required to byte-equal the BLOCK row's
+    own recorded value. (a) a relay naming the REAL branch the fix landed
+    on is ALLOWED even though it differs from the row's own `unit_branch`;
+    (b) on the SAME `fix_head`, a relay naming a DIFFERENT branch that does
+    NOT contain it is DENIED with the same 'not reachable' reason (not
+    block_sha ancestry — G25 covers that distinct axis)."""
     root = _temp_repo("feat/g22")
     row = _write_block_row(root, "feat/g22", "a1", "adversarial-audit",
                             ["a.py:1", "b.py:2"], ["a.py:1"])
-    _git(root, "checkout", "-q", "-b", "other-branch")
-    other_head = _commit_fix(root, "d.py")
-    _git(root, "checkout", "-q", "feat/g22")
+    _git(root, "checkout", "-q", "-b", "feat/g22-other")
+    fix_head = _commit_fix(root, "d.py")
+    _git(root, "checkout", "-q", "-b", "feat/g22-unrelated", "feat/g22")
+
     _write_relay_exact(root, row, sites={"a.py:1": "fixed", "b.py:2": "fixed"},
-                        probe=["c.py:9", "d.py:4"], fix_head=other_head)
+                        probe=["c.py:9", "d.py:4"], fix_head=fix_head,
+                        override={"unit_branch": "feat/g22-other"})
     p = _run("lead-gate-pre.sh", {"tool_name": "Agent", "tool_input": {
         "subagent_type": "adversarial-audit", "prompt": "re-audit unit: feat/g22"}}, root)
-    _assert(p.returncode == 2, "G22", f"an unreachable fix_head must deny, got {p.returncode}: {p.stderr}")
-    _assert("not reachable" in p.stderr, "G22", f"deny reason must say not reachable: {p.stderr!r}")
+    _assert(p.returncode == 0, "G22a",
+            f"a relay naming the real branch the fix landed on must allow, got {p.returncode}: {p.stderr}")
+
+    _write_relay_exact(root, row, sites={"a.py:1": "fixed", "b.py:2": "fixed"},
+                        probe=["c.py:9", "d.py:4"], fix_head=fix_head,
+                        override={"unit_branch": "feat/g22-unrelated"})
+    p = _run("lead-gate-pre.sh", {"tool_name": "Agent", "tool_input": {
+        "subagent_type": "adversarial-audit", "prompt": "re-audit unit: feat/g22"}}, root)
+    _assert(p.returncode == 2, "G22b",
+            f"a relay naming a branch that does not contain fix_head must deny, got {p.returncode}: {p.stderr}")
+    _assert("not reachable" in p.stderr, "G22b", f"deny reason must say not reachable: {p.stderr!r}")
 
 
 def fixture_g23_no_probe_names_fix_changed_denies() -> None:
@@ -1278,7 +1312,7 @@ def fixture_g26_claude_project_dir_unset_denies() -> None:
                         probe=["c.py:9", "d.py:4"], fix_head=fix_head)
     p = _run("lead-gate-pre.sh", {"tool_name": "Agent", "tool_input": {
         "subagent_type": "adversarial-audit", "prompt": "re-audit unit: feat/g26"}}, root,
-        env_overrides={"CLAUDE_PROJECT_DIR": None})
+        env_overrides={"CLAUDE_PROJECT_DIR": None}, cwd=root)
     _assert(p.returncode == 2, "G26",
             f"an unset CLAUDE_PROJECT_DIR must deny in the relay arm, got {p.returncode}: {p.stderr}")
     _assert("CLAUDE_PROJECT_DIR" in p.stderr, "G26", f"deny reason must name CLAUDE_PROJECT_DIR: {p.stderr!r}")
@@ -1319,8 +1353,13 @@ def fixture_g27_git_timeout_denies() -> None:
 # audit.*.json`), copied verbatim (the round-5 relay already carries its own
 # real `fix_head`; rounds 1-4 predate that field, so this fixture supplies
 # the actual NEXT round's own recorded head_sha as fix_head, as the lead
-# would have written it). The `class_enumeration`/`finding_locations` used
-# to build each BLOCK row are the real ones too. The outcomes below are
+# would have written it). The `class_enumeration` used to build each BLOCK
+# row is a REAL 4-element TRUNCATION of that round's own recorded array (the
+# real rows carry anywhere from 4 to 20 entries) — outcome-neutral: R1/R2
+# only need >=1 matching entry and >=2 non-reactive probe sites respectively,
+# neither of which this fixture's outcome depends on the full count for; the
+# `finding_locations` used is the truncated array's own first element, also
+# outcome-neutral for the same reason. The outcomes below are
 # RECORDED BY RUNNING THE PATCHED CODE ONCE AND REVIEWING (V3/V5) — not
 # asserted in advance: round 3 is the ONLY one of the five whose real probe
 # names zero real fix-changed files; the other four ALSO name a real
@@ -1436,17 +1475,134 @@ def fixture_g28_real_e1_corpus() -> None:
                     f"probe also names a real fix-changed file), got {rc}: {reason!r}")
 
 
+def fixture_g29_first_dispatch_stays_git_free_with_hung_shim() -> None:
+    """esc-097 (adversarial B2 fix): R3's git arm is bound to REPEAT
+    dispatches only — never a first dispatch, and never through more units
+    than the ONE the dispatch itself targets. Three OTHER units in the SAME
+    state dir each carry an open BLOCK with an accepted (fully-relayed,
+    fix_head-carrying) relay artifact — a busy, realistic gate-state — but
+    the actual dispatch under test names NONE of them, so it is a genuine
+    first dispatch of a FOURTH unit. A `git` on PATH that would hang for 30s
+    if ever invoked must never be reached: the call returns in well under
+    1s, and the shim's own invocation log (it appends before hanging) stays
+    empty, proving zero git processes were spawned."""
+    root = _temp_repo("feat/g29-decoy1")
+    for i, branch in enumerate(["feat/g29-decoy1", "feat/g29-decoy2", "feat/g29-decoy3"]):
+        if i:
+            _git(root, "checkout", "-q", "-b", branch, "feat/g29-decoy1")
+        row = _write_block_row(root, branch, f"a{i}", "adversarial-audit",
+                                ["a.py:1", "b.py:2"], ["a.py:1"])
+        fix_head = _commit_fix(root, f"d{i}.py")
+        _write_relay_exact(root, row, sites={"a.py:1": "fixed", "b.py:2": "fixed"},
+                            probe=["c.py:9", f"d{i}.py"], fix_head=fix_head)
+    _git(root, "checkout", "-q", "feat/g29-decoy1")
+
+    shim_bin = root / "git-shim-bin"
+    shim_bin.mkdir()
+    fake_git = shim_bin / "git"
+    log_path = root / "git-invocations.log"
+    fake_git.write_text(
+        "#!/bin/sh\n"
+        f"echo invoked >> {log_path}\n"
+        "sleep 30\n"
+    )
+    fake_git.chmod(0o755)
+    real_path = os.environ.get("PATH", "")
+    start = time.monotonic()
+    p = _run("lead-gate-pre.sh", {"tool_name": "Agent", "tool_input": {
+        "subagent_type": "adversarial-audit",
+        "prompt": "unit: feat/g29-fresh\nFIRST audit of a brand-new unit, naming none of the decoys",
+    }}, root, env_overrides={"PATH": f"{shim_bin}:{real_path}"})
+    elapsed = time.monotonic() - start
+    _assert(p.returncode == 0, "G29", f"a genuine first dispatch must allow, got {p.returncode}: {p.stderr}")
+    _assert(elapsed < 1.0, "G29", f"a first dispatch must return in well under 1s, took {elapsed:.2f}s")
+    _assert(not log_path.exists(), "G29",
+            f"a first dispatch must spawn ZERO git processes, but the shim log exists: "
+            f"{log_path.read_text() if log_path.exists() else ''!r}")
+
+
+def fixture_g30_env_precedence_over_cwd() -> None:
+    """esc-097 (HARD_BLOCK fix): `CLAUDE_PROJECT_DIR` governs state-dir
+    resolution even when the subprocess's own `cwd` points at an entirely
+    DIFFERENT directory that itself looks like a plausible root (it has its
+    own `.jammi/gate-state`, just with no open BLOCK in it). A mutant that
+    reduced `repo_root()` to `Path.cwd()` would resolve state against the
+    WRONG (decoy) root here and find nothing to gate — this fixture ALLOWS
+    only under that mutant; the real code DENIES because it reads the real
+    root (named by the env var) and finds the open BLOCK there."""
+    root = _temp_repo("feat/g30")
+    row = _write_block_row(root, "feat/g30", "a1", "adversarial-audit",
+                            ["a.py:1", "b.py:2"], ["a.py:1"])
+    decoy_cwd = _fresh_root()
+    (decoy_cwd / ".jammi" / "gate-state").mkdir(parents=True)
+    p = _run("lead-gate-pre.sh", {"tool_name": "Agent", "tool_input": {
+        "subagent_type": "adversarial-audit",
+        "prompt": f"re-audit at {row['worktree']}",
+    }}, root, cwd=decoy_cwd)
+    _assert(p.returncode == 2, "G30",
+            f"CLAUDE_PROJECT_DIR must govern over a decoy cwd, got {p.returncode}: {p.stderr}")
+
+
+def fixture_g31_unbound_row_satisfied_by_relay_named_branch() -> None:
+    """esc-097 (adversarial B3 fix): a BLOCK row whose OWN `unit_branch` is
+    empty (the `UNBOUND` fallback bucket — no binding resolved at
+    verdict-write time) is still satisfiable by a relay that names the REAL
+    branch the fix landed on; the row's own empty value is never the
+    reachability target in this case (there is nothing there to target)."""
+    root = _temp_repo("feat/g31-real")
+    row = _write_block_row(root, "", "a1", "adversarial-audit",
+                            ["a.py:1", "b.py:2"], ["a.py:1"])
+    fix_head = _commit_fix(root, "d.py")
+    _write_relay_exact(root, row, sites={"a.py:1": "fixed", "b.py:2": "fixed"},
+                        probe=["c.py:9", "d.py:4"], fix_head=fix_head,
+                        override={"unit_branch": "feat/g31-real"})
+    p = _run("lead-gate-pre.sh", {"tool_name": "Agent", "tool_input": {
+        "subagent_type": "adversarial-audit", "prompt": f"re-audit commit {row['head_sha']}"}}, root)
+    _assert(p.returncode == 0, "G31",
+            f"a relay naming the real branch must satisfy R3 on an UNBOUND row, got {p.returncode}: {p.stderr}")
+
+
 _G20_28_FIXTURES = [
     ("G20", fixture_g20_no_fix_head_denies),
     ("G21", fixture_g21_fix_head_equals_block_sha_denies),
-    ("G22", fixture_g22_fix_head_not_reachable_denies),
+    ("G22", fixture_g22_relay_named_branch_governs_reachability),
     ("G23", fixture_g23_no_probe_names_fix_changed_denies),
     ("G24", fixture_g24_probe_names_fix_changed_finding_file_allows),
     ("G25", fixture_g25_amend_sibling_fix_allows),
     ("G26", fixture_g26_claude_project_dir_unset_denies),
     ("G27", fixture_g27_git_timeout_denies),
     ("G28", fixture_g28_real_e1_corpus),
+    ("G29", fixture_g29_first_dispatch_stays_git_free_with_hung_shim),
+    ("G30", fixture_g30_env_precedence_over_cwd),
+    ("G31", fixture_g31_unbound_row_satisfied_by_relay_named_branch),
 ]
+
+
+def _run_g20_28_fixture_list(fixtures: list[tuple[str, object]]) -> list[str]:
+    """The G20-31 arm's own execution+guard logic, factored out so the
+    `ran_any` guard can be exercised directly against a MUTATED (here:
+    emptied) fixture list, not merely restated in prose — proving the guard
+    is live, not dead code that can never observe a False (esc-097
+    advisory fix)."""
+    failures: list[str] = []
+    ran_any = False
+    for name, fn in fixtures:
+        ran_any = True
+        try:
+            fn()
+            print(f"check-lead-gate[{name}]: OK")
+        except Failure as e:
+            failures.append(f"{name}: {e}")
+            print(f"check-lead-gate[{name}]: FAIL — {e}", file=sys.stderr)
+        except Exception as e:  # noqa: BLE001
+            failures.append(f"{name}: unexpected exception: {e!r}")
+            print(f"check-lead-gate[{name}]: FAIL (unexpected exception) — {e!r}", file=sys.stderr)
+    if not ran_any:
+        # The guard's own self-check: the marker is present but the arm
+        # still didn't run any fixture — that is THIS GUARD failing, not a
+        # legitimate skip, and must not exit 0.
+        failures.append("G20-28 guard: RELAY_R3 marker present but the arm ran no fixtures — guard is broken")
+    return failures
 
 
 def _g20_28_arm() -> list[str]:
@@ -1460,28 +1616,22 @@ def _g20_28_arm() -> list[str]:
     (exit 1 territory) rather than silently green-washing a broken check."""
     mod = _lib_module()
     patched = hasattr(mod, "RELAY_R3")
-    failures: list[str] = []
     if not patched:
-        print("check-lead-gate[G20-28]: SKIPPED — hook patch esc-097 not applied "
+        print("check-lead-gate[G20-31]: SKIPPED — hook patch esc-097 not applied "
               "(.claude/hooks/lead-gate-lib.py carries no RELAY_R3 marker)")
-        return failures
-    ran_any = False
-    for name, fn in _G20_28_FIXTURES:
-        ran_any = True
-        try:
-            fn()
-            print(f"check-lead-gate[{name}]: OK")
-        except Failure as e:
-            failures.append(f"{name}: {e}")
-            print(f"check-lead-gate[{name}]: FAIL — {e}", file=sys.stderr)
-        except Exception as e:  # noqa: BLE001
-            failures.append(f"{name}: unexpected exception: {e!r}")
-            print(f"check-lead-gate[{name}]: FAIL (unexpected exception) — {e!r}", file=sys.stderr)
-    if patched and not ran_any:
-        # The guard's own self-check: the marker is present but the arm
-        # still didn't run any fixture — that is THIS GUARD failing, not a
-        # legitimate skip, and must not exit 0.
-        failures.append("G20-28 guard: RELAY_R3 marker present but the arm ran no fixtures — guard is broken")
+        return []
+    failures = _run_g20_28_fixture_list(_G20_28_FIXTURES)
+    # esc-097 (advisory fix): prove the `ran_any` guard above is LIVE — an
+    # EMPTY fixture list, run through the IDENTICAL code path, must trip the
+    # SAME "ran no fixtures" failure. This is a real mutation test on
+    # `_G20_28_FIXTURES` (an empty list), not a restatement of the guard's
+    # own logic.
+    empty_result = _run_g20_28_fixture_list([])
+    if not any("ran no fixtures" in f for f in empty_result):
+        failures.append("ran_any guard self-check: an empty fixture list must trip the "
+                         "'ran no fixtures' failure via _run_g20_28_fixture_list — it did not")
+    else:
+        print("check-lead-gate[G20-28 guard self-check]: OK (empty-list mutation correctly fails)")
     return failures
 
 

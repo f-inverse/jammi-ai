@@ -1,0 +1,76 @@
+--- a/.claude/hooks/README.md
++++ b/.claude/hooks/README.md
+@@ -49,8 +49,9 @@
+ 
+ **The relay artifact** (`.jammi/gate-state/<slug>.relay.<agent_type>.<block_ts>.json`)
+ is written by the LEAD directly (`Write` is not gated) — never scanned from message
+-prose. It names `unit_branch`/`agent_type`/`block_ts` (the verdict row's own `ts`) and must
+-satisfy BOTH requirements — a CONJUNCTION, never a choice of arms (esc-064).
++prose. It names `unit_branch`/`agent_type`/`block_ts` (the verdict row's own `ts`) and,
++per esc-097 below, `fix_head` — and must satisfy R1, R2, and R3, a CONJUNCTION, never
++a choice of arms (esc-064, esc-097).
+ **(1) Coverage** — whenever the BLOCK's `class_enumeration` is non-empty: a `sites`
+ object whose keys are an EXACT-STRING SUPERSET of it (no path parsing, no
+ normalization — the lead copies the verifier's own strings verbatim, so
+@@ -63,11 +64,56 @@
+ only shrink the adjacent set) and is therefore NOT the acceptance-easing
+ normalization the `sites` rule bans. The `enumeration_missing` field on a verdict
+ row is diagnostic only — no gate decision reads it; which requirement has content is
+-derived from the enumeration itself. HONEST LIMIT: the hook enforces that adjacent
+-probing is ASSERTED with named, citation-checkable sites — never that it occurred,
+-nor that the sites are semantically adjacent; it converts silent omission into an
+-explicit after-the-fact-checkable claim (citation-checker and the retrospective
+-judge the probes, not this hook).
++derived from the enumeration itself.
++**(3) Probe-the-fix — armed only on a REPEAT dispatch (esc-097).** R3 runs ONLY from
++`_decide_verifier_dispatch`'s own repeat-dispatch branch — never on a FIRST dispatch
++(no prior row exists to reach this arm at all) and never on the CROSS-type clearing
++path (`_adversarial_audit_cleared_by_verifier_pass` → `_relay_accepted`, which passes
++`check_fix=False` and so never touches git) — and, per decision, at most ONE targeted
++unit's R3 runs even when a prompt happens to name more than one open BLOCK. The relay
++names `fix_head` (the fix commit's full sha); the hook resolves `fix_changed = git diff
++--name-only -z <block_sha> <fix_head>` ITSELF (NUL-split, so a path with a space or
++non-ASCII byte is still named correctly — trusted, computed, never lead-supplied) and
++requires `fix_head` to resolve, differ from the BLOCK's own `head_sha` (else "no fix
++commit since the BLOCK; a second dispatch without a fix is a re-roll" — a re-roll, not
++a fix), and be reachable from the RELAY's OWN `unit_branch` field (`git merge-base
++--is-ancestor fix_head <relay's unit_branch, falling back to the BLOCK row's own
++unit_branch only when the relay omits it>` — NOT from `block_sha`, which an `--amend`
++sibling breaks; the relay's `unit_branch` is NO LONGER required to byte-equal the
++BLOCK row's own recorded value — the artifact's identity is already pinned by the
++filename (built from the row's own unit_slug/agent_type/block_ts) plus the
++`agent_type`/`block_ts` content checks, so a row whose `unit_branch` is the `UNBOUND`
++fallback bucket (empty at verdict-write time), or whose recorded branch was
++renamed/deleted since, is satisfiable by a relay that names the real branch the fix
++landed on — if you fixed elsewhere or rebased, name THAT branch). At least one `probe` entry's PATH (the first whitespace-delimited token,
++a surrounding backtick or parenthesis and trailing punctuation stripped, an optional
++trailing `:<n>[-<n>][,<n>]*` line spec stripped — an unparseable token counts for
++nothing, monotone toward DENY, never toward a false ALLOW) must be EXACTLY a member
++of `fix_changed` — probing the fix's own surface satisfies this even when that file is
++also a finding location; R2's ≥2-distinct-non-reactive requirement is unchanged and
++stays conjunctive with R3 (worst case, three probe entries: 2 adjacent + 1 fix-changed,
++though one entry can double as both when it qualifies for each). **§C5 — the ONE
++amendment to "no git subprocess anywhere":** git runs ONLY from the repeat-dispatch
++branch, NEVER on a first dispatch's hot path, NEVER on the cross-type clearing path,
++and ONLY in `$CLAUDE_PROJECT_DIR` — the documented hook environment contract: the
++harness always sets this variable for every hook invocation, so `repo_root()`'s cwd
++fallback is never needed by this arm and is deliberately not reused here — with a 5s
++timeout; any git failure (non-zero exit, timeout, an unresolvable sha — an amend can
++orphan one) DENIES, naming the failing command, and states that
++`rm .jammi/gate-state/<slug>.*` is the escape hatch but destroys the unit's evidence
++rather than fixing the underlying git problem.
++**Migration.** A relay written to disk before this patch lands (no `fix_head`) stops
++being acceptable the moment the patch IS applied — an in-flight relay must be
++rewritten with `fix_head`, or the unit must re-relay; there is no grandfathering.
++HONEST LIMIT (extended to R3): the hook enforces that adjacent probing AND fix-probing
++are each ASSERTED with a named, citation-checkable site that is ACTUALLY a member of
++the relevant set — never that either was semantically examined; a lead can satisfy R3
++by pasting a path out of its own diff without reading it. It converts silent
++neighbourhood-probing into fix-window-probing, on the record; it does not by itself
++close the class of "form-satisfied without substance" (esc-097) — the substantive rule
++(design-before-mechanism, one fix round per BLOCK) is a `.claude/agents/lead.md`
++discipline, not a hook (citation-checker and the retrospective judge the probes'
++substance, not this hook).
+ The hook only ever READS this file, fresh, on every gate call — it never writes an
+ "accepted" row itself, so a DENY can never leave a phantom acceptance behind.
+ 

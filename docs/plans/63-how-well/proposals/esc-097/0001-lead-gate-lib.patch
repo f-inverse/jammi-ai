@@ -1,0 +1,359 @@
+--- a/.claude/hooks/lead-gate-lib.py
++++ b/.claude/hooks/lead-gate-lib.py
+@@ -27,6 +27,46 @@
+   `enumeration_missing` flag — and adjacent probing (`probe`, >=2 distinct
+   sites outside enumeration+findings) is armed ALWAYS.
+ 
++esc-097 (R3, "PROBE THE FIX"): the relay arm gains ONE further requirement,
++armed ONLY on a REPEAT dispatch of the SAME verifier type after a BLOCK --
++never on the hot `pre` dispatch of a FIRST round (no prior row exists to
++match, so `_decide_verifier_dispatch` never reaches this arm), and never on
++the CROSS-type clearing path (`_adversarial_audit_cleared_by_verifier_pass`
++-> `_relay_accepted`, which calls with `check_fix=False` and so never runs
++git either). Per decision, R3's git-dependent check runs for AT MOST ONE
++targeted unit (the one named by the dispatch) even when a prompt happens to
++name more than one open BLOCK -- every OTHER targeted unit still clears R1/R2
++in-memory, just never pays for a second `git` round-trip in the same
++decision. The relay gains a lead-written `fix_head` (full sha). Arm order
++(V5): artifact-exists -> schema -> R1 (coverage) -> R2 (proactivity, always)
++-> CLAUDE_PROJECT_DIR is set -> `row.head_sha` (the BLOCK's own head,
++"block_sha") resolves -> `fix_head` resolves / != block_sha / is reachable
++from the RELAY's OWN `unit_branch` field (falling back to the BLOCK row's
++`unit_branch` only when the relay omits it -- the relay's `unit_branch` is
++NO LONGER required to byte-equal the row's own recorded value; the artifact's
++identity is already pinned by the filename itself plus the `agent_type`/
++`block_ts` content checks, so a row whose `unit_branch` is the `UNBOUND`
++fallback -- empty at verdict-write time -- OR whose recorded branch was
++renamed/deleted since is satisfiable by a relay that names the real branch
++the fix landed on; never from block_sha -- an `--amend` sibling breaks that ancestry, and this
++repo's fix discipline produces amend siblings) -> R3 (>=1 probe path names a
++file the fix actually changed). `fix_changed` is `git diff --name-only
++<block_sha> <fix_head>` -- TRUSTED and COMPUTED, never lead-supplied. git
++runs ONLY here, ONLY in `$CLAUDE_PROJECT_DIR` (required explicitly -- this
++is the documented hook environment contract: the harness always sets it for
++every hook invocation, so `repo_root()`'s cwd fallback is never needed by
++this arm and is deliberately not reused here), with a 5s timeout; any git
++failure DENIES, naming the failing command, and states that
++`rm .jammi/gate-state/<slug>.*` is the escape hatch but destroys the unit's
++evidence rather than fixing the underlying git problem. A relay written
++before this patch lands (no `fix_head`) stops being acceptable the moment
++the patch IS applied -- an in-flight relay must be rewritten with `fix_head`
++or the unit must re-relay. HONEST LIMIT: R3 cannot verify examination, only
++that a named path is a real member of the fix's own diff -- a lead can still
++satisfy it by pasting a path out of its own change; the substantive rule
++(design-before-mechanism, one fix round per BLOCK) is a `.claude/agents/
++lead.md` discipline, not a hook.
++
+ Explicitly OUT OF SCOPE by this cut (dropped entirely, not log-only):
+ `SendMessage` gating and all message-prose parsing; implementer-dispatch
+ binding; the Bash backstop (the mechanical control is `permissions.deny`
+@@ -67,7 +107,11 @@
+ allow; no `errors="replace"` fallback). `start`/`stop` are best-effort
+ writers that never block a subagent lifecycle event and always exit 0.
+ 
+-No git subprocess anywhere in this module (hot-path speed).
++No git subprocess ANYWHERE except the relay-validation arm added by esc-097
++(R3) -- never on the hot first-dispatch path, never on the cross-type
++clearing path, never outside `$CLAUDE_PROJECT_DIR`, and never more than once
++per decision (see the esc-097 paragraph above; §C5 amends the prior "no git
++subprocess anywhere" doctrine to this narrower, explicit exception).
+ """
+ 
+ from __future__ import annotations
+@@ -75,10 +119,18 @@
+ import json
+ import os
+ import re
++import signal
++import subprocess
+ import sys
+ from datetime import datetime, timezone
+ from pathlib import Path
+ 
++# esc-097 (R3, "probe the fix"): the version marker `check_lead_gate.py
++# --self-test`'s G20-G28 arm probes for via `hasattr` -- its presence is what
++# tells the fixture harness the hook patch below is actually applied, so the
++# arm runs for real instead of reporting SKIPPED.
++RELAY_R3 = True
++
+ # --------------------------------------------------------------------------
+ # Agent-type lattice (closed world, deny-unknown).
+ # --------------------------------------------------------------------------
+@@ -511,7 +563,161 @@
+     return cleaned.strip()
+ 
+ 
+-def _relay_rejection(sdir: Path, unit_slug: str, row: dict) -> str | None:
++# --------------------------------------------------------------------------
++# esc-097 (R3, "probe the fix"): the ONLY git subprocess in this module, run
++# ONLY from `_decide_verifier_dispatch`'s repeat-dispatch branch (never from
++# `_adversarial_audit_cleared_by_verifier_pass`, which passes
++# `check_fix=False` and never reaches any of this) — and never on a first
++# dispatch's hot path. `$CLAUDE_PROJECT_DIR` is REQUIRED explicitly here
++# (this arm never falls back to `repo_root()`'s cwd), with a 5s timeout; any
++# failure DENIES, naming the failing command.
++# --------------------------------------------------------------------------
++
++_GIT_TIMEOUT_S = 5.0
++_ESCAPE_HATCH_NOTE = (
++    "rm .jammi/gate-state/<slug>.* is the operator escape hatch, but it "
++    "destroys the unit's evidence rather than fixing the underlying git problem"
++)
++
++
++def _run_git(args: list[str], cwd: str) -> tuple[bool, str]:
++    """Runs `git -C <cwd> <args>` with a 5s timeout. `(True, stdout)` on
++    success; `(False, reason)` naming the failing command on any failure
++    (non-zero exit, timeout, or git/the cwd being unusable) — the caller
++    always turns a `False` into a DENY, never a silent allow.
++
++    Runs in its OWN process group and, on timeout, kills the WHOLE group —
++    not merely the direct child. A `git` that spawns a grandchild holding the
++    stdout/stderr pipes open (e.g. a hung network helper — or, in the
++    fixture's PATH-shimmed reproduction, a `sh -c 'sleep 30 & exec sleep 7'`
++    that leaves the backgrounded `sleep 30` as an orphan after the shim's own
++    `exec` returns) is not killed by `proc.kill()` alone — Python's own
++    post-timeout pipe-drain then blocks on that orphan's own file
++    descriptors. On POSIX, `subprocess.run`'s post-timeout `wait()` already
++    returns once the direct child is reaped (measured: ~5s, not unbounded,
++    for a childless timeout); `os.killpg`'s real, measured benefit is REAPING
++    the orphaned grandchild — leaving it running would otherwise hold the
++    process table entry and, in the pipe-holding case, keep the read end
++    open indefinitely. Both matter; killpg covers both in one call."""
++    cmd = ["git", "-C", cwd] + list(args)
++    printable = "git " + " ".join(args)
++    try:
++        proc = subprocess.Popen(
++            cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
++            start_new_session=True,  # its own process group, for the kill below
++        )
++    except OSError as exc:
++        return False, f"`{printable}` failed to run ({exc}) — {_ESCAPE_HATCH_NOTE}"
++    try:
++        out, _err = proc.communicate(timeout=_GIT_TIMEOUT_S)
++    except subprocess.TimeoutExpired:
++        try:
++            os.killpg(proc.pid, signal.SIGKILL)
++        except ProcessLookupError:
++            pass
++        proc.communicate()  # reap; the group is dead, this returns immediately
++        return False, f"`{printable}` timed out after {_GIT_TIMEOUT_S:g}s — {_ESCAPE_HATCH_NOTE}"
++    if proc.returncode != 0:
++        return False, f"`{printable}` exited {proc.returncode} — {_ESCAPE_HATCH_NOTE}"
++    return True, out.strip()
++
++
++# A probe entry's PATH is the first whitespace-delimited token, trailing
++# punctuation (including a surrounding backtick or parenthesis) stripped,
++# then an optional trailing `:<n>[-<n>][,<n>]*` line spec stripped (D3).
++# Unparseable -> None, which counts for nothing toward R3 (monotone toward
++# DENY, never toward a false ALLOW).
++_PROBE_LINESPEC_RE = re.compile(r":\d+(?:-\d+)?(?:,\d+)*$")
++
++
++def _probe_path(entry: str) -> str | None:
++    if not isinstance(entry, str):
++        return None
++    parts = entry.strip().split(None, 1)
++    if not parts:
++        return None
++    tok = parts[0].strip("`()").rstrip(",;:.)")
++    tok = tok.strip("`()")
++    tok = _PROBE_LINESPEC_RE.sub("", tok)
++    return tok or None
++
++
++def _fix_window(row: dict, fix_head: object, relay_unit_branch: object) -> tuple[list[str] | None, str | None]:
++    """Resolves the trusted, COMPUTED `fix_changed` set for the relay arm.
++    `(fix_changed, None)` on success; `(None, deny_reason)` otherwise. Never
++    called on a first dispatch, and never from the cross-type clearing path
++    — only from `_decide_verifier_dispatch`'s repeat-dispatch branch, once
++    R1/R2 have already passed.
++
++    The reachability check targets the RELAY's OWN `unit_branch` field,
++    falling back to the BLOCK row's `unit_branch` only when the relay omits
++    it — the two are no longer required to be byte-equal (the artifact's
++    identity is pinned by the filename plus the `agent_type`/`block_ts`
++    content checks upstream, not by this field): a row whose `unit_branch`
++    is the `UNBOUND` fallback bucket (empty at verdict-write time), or whose
++    recorded branch was renamed/deleted since, is satisfiable by a relay
++    that names the real branch the fix landed on."""
++    project_dir = os.environ.get("CLAUDE_PROJECT_DIR")
++    if not project_dir:
++        return None, "hook needs CLAUDE_PROJECT_DIR for the relay arm"
++
++    block_sha = row.get("head_sha")
++    if not isinstance(block_sha, str) or not block_sha:
++        return None, "BLOCK row's head_sha does not resolve"
++    ok, why = _run_git(["cat-file", "-e", f"{block_sha}^{{commit}}"], project_dir)
++    if not ok:
++        return None, f"BLOCK row's head_sha does not resolve (an amend can orphan it) — {why}"
++
++    if not isinstance(fix_head, str) or not fix_head:
++        return None, "relay carries no `fix_head` — the lead must write the fix commit's full sha"
++    ok, why = _run_git(["cat-file", "-e", f"{fix_head}^{{commit}}"], project_dir)
++    if not ok:
++        return None, f"relay `fix_head` does not resolve — {why}"
++
++    if fix_head == block_sha:
++        return None, "no fix commit since the BLOCK; a second dispatch without a fix is a re-roll"
++
++    target_branch = relay_unit_branch if isinstance(relay_unit_branch, str) and relay_unit_branch else row.get("unit_branch")
++    if not isinstance(target_branch, str) or not target_branch:
++        return None, "no unit_branch (relay or BLOCK row) to check fix_head's reachability against"
++    ok, _out = _run_git(["merge-base", "--is-ancestor", fix_head, target_branch], project_dir)
++    if not ok:
++        return None, (
++            f"relay `fix_head` {fix_head[:7]} is not reachable from `{target_branch}`'s tip — "
++            "name a fix actually committed to this unit (or that branch's own head, if you rebased "
++            "or fixed elsewhere)"
++        )
++
++    ok, out = _run_git(["diff", "--name-only", "-z", block_sha, fix_head], project_dir)
++    if not ok:
++        return None, f"could not compute the fix window: {out}"
++    return [seg for seg in out.split("\0") if seg], None
++
++
++# esc-097: `_relay_rejection` has TWO callers reachable from the codebase —
++# `_decide_verifier_dispatch`'s own repeat-dispatch check (which needs R3,
++# `check_fix=True`), and `_adversarial_audit_cleared_by_verifier_pass` (via
++# `_relay_accepted`, which needs ONLY R1/R2 — a fix-verifier/acceptance-
++# verifier PASS clearing an older adversarial-audit BLOCK has nothing to do
++# with THIS dispatch's own fix window, so it passes `check_fix=False` and
++# never runs git at all). One process-lifetime memo, keyed on the identity a
++# relay artifact is looked up by PLUS `check_fix` (a `check_fix=False` lookup
++# must never be served from a `check_fix=True` cache entry or vice versa),
++# bounds a hung `git` to costing at most 5s once per (unit, decision), not
++# once per caller.
++_relay_rejection_memo: dict[tuple[str, str, str, str, bool], str | None] = {}
++
++
++def _relay_rejection(sdir: Path, unit_slug: str, row: dict, check_fix: bool = True) -> str | None:
++    key = (str(sdir), unit_slug, str(row.get("agent_type")), str(row.get("ts")), check_fix)
++    if key in _relay_rejection_memo:
++        return _relay_rejection_memo[key]
++    result = _relay_rejection_uncached(sdir, unit_slug, row, check_fix=check_fix)
++    _relay_rejection_memo[key] = result
++    return result
++
++
++def _relay_rejection_uncached(sdir: Path, unit_slug: str, row: dict, check_fix: bool = True) -> str | None:
+     """`None` == accepted; otherwise the operator-facing REASON the relay is
+     missing or insufficient.
+ 
+@@ -521,7 +727,8 @@
+     every gated verifier type's relay. The recorded `enumeration_missing`
+     flag is diagnostic only and is never read here: a flag with a weak-arm
+     default let a legacy/hand-edited row take the fallback arm and drop a
+-    requirement entirely."""
++    requirement entirely. `check_fix=False` (the cross-type clearing path
++    ONLY) stops after R1/R2 and never touches R3 or git at all."""
+     agent_type = row.get("agent_type") or ""
+     block_ts = row.get("ts") or ""
+     unit_branch = row.get("unit_branch")
+@@ -536,8 +743,25 @@
+         return "relay artifact is not valid JSON"
+     if not isinstance(data, dict):
+         return "relay artifact is not a JSON object"
+-    if data.get("unit_branch") != unit_branch:
+-        return "relay `unit_branch` does not match the BLOCK row's"
++    # esc-097: the relay's `unit_branch` is no longer required to be
++    # BYTE-EQUAL to the BLOCK row's own recorded value — only non-empty. The
++    # ARTIFACT's identity (which BLOCK it was written for) is already pinned
++    # by the filename itself (built from the row's own unit_slug/agent_type/
++    # block_ts) and by the `agent_type`/`block_ts` content checks just below;
++    # the `unit_branch` field's only remaining job is naming R3's
++    # reachability target, and forcing it to equal a row's possibly-empty
++    # (`UNBOUND`) or possibly-stale (renamed/deleted) value would make that
++    # target useless in exactly the cases this fix exists for. This is the
++    # SAME trust boundary `fix_head` already crosses (the relay artifact is
++    # written by the LEAD directly — Write is not gated — and trusted for
++    # content; only GIT-VERIFIED facts, never lead-asserted ones, gate the
++    # decision): a lead who would misname `unit_branch` to game reachability
++    # could already misname `fix_head` today, so this does not open a new
++    # gap. Falls back to the BLOCK row's own `unit_branch` only when the
++    # relay omits the field entirely.
++    relay_ub = data.get("unit_branch")
++    if not (isinstance(relay_ub, str) and relay_ub) and not unit_branch:
++        return "relay carries no `unit_branch`, and the BLOCK row's own is empty (UNBOUND)"
+     if data.get("agent_type") != agent_type:
+         return "relay `agent_type` does not match the BLOCK row's"
+     if data.get("block_ts") != block_ts:
+@@ -570,11 +794,38 @@
+                 "own class_enumeration/findings (>=2 required) — restating the enumeration "
+                 "is reactive acknowledgment, not adjacent probing; name >=2 sites you "
+                 "EXAMINED and found clean (esc-064)")
++
++    if not check_fix:
++        return None
++
++    # R3 PROBE-THE-FIX (esc-097) — armed ONLY here, after R1/R2, on the ONE
++    # targeted unit `_decide_verifier_dispatch` picked for the git-dependent
++    # check this decision. The only git subprocess in this module; see the
++    # esc-097 module-doc paragraph for the arm order.
++    fix_head = data.get("fix_head")
++    fix_changed, why = _fix_window(row, fix_head, data.get("unit_branch"))
++    if why is not None:
++        return why
++    probe_paths = {p for p in (_probe_path(e) for e in probe) if p}
++    if not any(p in fix_changed for p in probe_paths):
++        n = len(fix_changed)
++        sample = ", ".join(fix_changed[:3])
++        block7 = (row.get("head_sha") or "")[:7]
++        fix7 = fix_head[:7] if isinstance(fix_head, str) else "?"
++        return (
++            f"relay `probe` names none of the {n} files the fix changed "
++            f"(block {block7}..fix {fix7}); probe the fix, not the neighbourhood — e.g. {sample}"
++        )
+     return None
+ 
+ 
+ def _relay_accepted(sdir: Path, unit_slug: str, row: dict) -> bool:
+-    return _relay_rejection(sdir, unit_slug, row) is None
++    # esc-097: this is the CROSS-type clearing path
++    # (`_adversarial_audit_cleared_by_verifier_pass`) — it needs only R1/R2
++    # (does the OLDER BLOCK's own relay cover its class and probe adjacent to
++    # it), never R3 (which is about THIS decision's own fix window). Passing
++    # `check_fix=False` means this call runs no git subprocess at all.
++    return _relay_rejection(sdir, unit_slug, row, check_fix=False) is None
+ 
+ 
+ def _diagnose_row(row: dict) -> str:
+@@ -662,7 +913,17 @@
+     of this type is structurally never gated (no prior row exists to
+     match). Residual: an unlabeled re-dispatch naming none of the three
+     anchors (DODGE-5) — allowed, visible; the tell is a verifier row whose
+-    `worktree` differs from every binding on record."""
++    `worktree` differs from every binding on record.
++
++    esc-097 (R3): this is the ONLY caller that ever passes `check_fix=True`
++    (git-dependent) to `_relay_rejection` — and even here, at most ONE
++    targeted unit pays for it per decision: a hung git already costs up to
++    5s once (the memo bounds a SINGLE unit to a single git round-trip), and
++    a prompt naming more than one open BLOCK of this type must not multiply
++    that cost per extra unit named. Every OTHER targeted unit still gets a
++    full R1/R2 in-memory check (`check_fix=False`) — it just never reaches
++    R3 in the same decision; a following dispatch that targets it alone
++    checks it."""
+     targeted = [
+         (unit_slug, row) for unit_slug, atype, row, idx in all_open_blocks(sdir)
+         if atype == subtype and _block_named_in_text(prompt, row)
+@@ -673,8 +934,15 @@
+             "dispatch — a first dispatch of this type, or an unlabeled re-dispatch "
+             "(the documented visible residual)"
+         )
+-    unresolved = [(u, r, why) for u, r in targeted
+-                  for why in [_relay_rejection(sdir, u, r)] if why is not None]
++    unresolved: list[tuple[str, dict, str]] = []
++    r3_spent = False
++    for u, r in targeted:
++        check_fix = not r3_spent
++        why = _relay_rejection(sdir, u, r, check_fix=check_fix)
++        if check_fix:
++            r3_spent = True
++        if why is not None:
++            unresolved.append((u, r, why))
+     if unresolved:
+         names = "; ".join(f"{u}/{r.get('agent_type')}{_diagnose_row(r)}: {why}"
+                            for u, r, why in unresolved)

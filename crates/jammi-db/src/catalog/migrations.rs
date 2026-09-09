@@ -2,7 +2,7 @@
 //! order, tracking which have been applied in an `applied_migrations` ledger.
 //! Backend-agnostic: works through [`CatalogBackend`].
 
-use super::backend::{BackendError, CatalogBackend, SqlValue, TxOptions};
+use super::backend::{BackendError, BackendKind, CatalogBackend, SqlValue, TxOptions};
 use super::schema;
 
 /// Ordered list of migrations. Each entry's first element is the name
@@ -95,11 +95,68 @@ CREATE TABLE IF NOT EXISTS applied_migrations (
 )
 "#;
 
-/// Apply all pending migrations. Idempotent.
+/// Key of the transaction-scoped Postgres advisory lock [`run`] takes before
+/// it touches the `applied_migrations` ledger (`0x6a61_6d6d_695f_6d69` is the
+/// ASCII bytes of `jammi_mi`).
+///
+/// Why it exists: the runner reads the ledger and then executes
+/// **non-idempotent** DDL (`CREATE TABLE result_tables`, no `IF NOT EXISTS`)
+/// inside one `READ COMMITTED` transaction. Postgres gives two transactions on
+/// one database no mutual exclusion across that read-then-DDL window, so two
+/// fresh replicas booting together both saw an empty ledger and the loser
+/// failed with SQLSTATE `42P07` (`relation "..." already exists`) or `23505`
+/// on the ledger primary key -- escape-ledger row
+/// `esc-093-postgres-migrations-race-without-cross-process-lock` (issue #479;
+/// the lead's contract names it esc-092, an id this branch already spends on
+/// the seam-counter row). `SELECT pg_advisory_xact_lock($1)` with this key is
+/// the runner's first statement on Postgres, so the ledger read happens after
+/// the lock by construction and the loser re-reads a complete ledger once the
+/// winner commits.
+///
+/// Advisory locks are scoped to one database, so the key needs no database-name
+/// hashing; the `_xact_` flavour is released on commit **or** rollback, which
+/// keeps it correct under PgBouncer transaction pooling (Postgres docs
+/// section 13.3.5 "Advisory Locks" and section 9.28.10). The DDL stays
+/// non-idempotent on purpose: the lock is the mechanism and
+/// `tests/it/migrations.rs::concurrent_migrate_on_fresh_postgres_is_safe`
+/// proves it; an `IF NOT EXISTS` sprinkle would hide a second racer's partial
+/// schema instead of serialising it.
+///
+/// SQLite needs nothing here: its backend opens every write transaction
+/// `BEGIN IMMEDIATE` under a 5 s `busy_timeout`, so the whole runner is already
+/// one serialised writer.
+pub(crate) const JAMMI_MIGRATION_LOCK_KEY: i64 = 0x6a61_6d6d_695f_6d69;
+
+/// Apply all pending migrations. Idempotent, and safe to run concurrently
+/// from several processes against one catalog.
+///
+/// One transaction does everything: on Postgres it first takes the
+/// transaction-scoped advisory lock keyed by [`JAMMI_MIGRATION_LOCK_KEY`]
+/// (see there for the race it closes), then creates the `applied_migrations`
+/// ledger if absent, reads it, and applies every entry of `MIGRATIONS` the
+/// ledger does not name, recording each as it goes. A concurrent caller on
+/// Postgres blocks on the advisory lock until the first commits or rolls
+/// back, then reads the ledger the winner left and applies nothing. On SQLite
+/// the backend's `BEGIN IMMEDIATE` write transaction is the same serialiser.
+///
+/// Under `feature = "test-hooks"` a rendezvous point sits between the ledger
+/// read and the first DDL statement
+/// (`store::mutable::test_hook::maybe_signal_migration_ledger_read`) so a test
+/// can pin the interleaving the lock must survive.
 pub(crate) async fn run<B: CatalogBackend + ?Sized>(backend: &B) -> Result<(), BackendError> {
+    let kind = backend.backend_kind();
     backend
-        .transaction(TxOptions::default(), |tx| {
+        .transaction(TxOptions::default(), move |tx| {
             Box::pin(async move {
+                if kind == BackendKind::Postgres {
+                    // Must be the first statement: everything below reads or
+                    // writes state a concurrent runner would race on.
+                    tx.execute(
+                        "SELECT pg_advisory_xact_lock($1)",
+                        &[SqlValue::Int(JAMMI_MIGRATION_LOCK_KEY)],
+                    )
+                    .await?;
+                }
                 tx.execute(APPLIED_MIGRATIONS_DDL, &[]).await?;
                 let applied: Vec<String> = tx
                     .query("SELECT name FROM applied_migrations", &[], |row| {
@@ -108,6 +165,11 @@ pub(crate) async fn run<B: CatalogBackend + ?Sized>(backend: &B) -> Result<(), B
                     .await?;
                 let applied_set: std::collections::HashSet<&str> =
                     applied.iter().map(String::as_str).collect();
+
+                // The ledger has been read and no DDL has run: the window a
+                // second runner must not be allowed to share.
+                #[cfg(feature = "test-hooks")]
+                crate::store::mutable::test_hook::maybe_signal_migration_ledger_read(kind).await;
 
                 for (name, ddl) in MIGRATIONS {
                     if applied_set.contains(name) {

@@ -23,9 +23,13 @@
 //! code path observes this module.
 
 use std::path::PathBuf;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::OnceLock;
+use std::time::Duration;
 
 use tokio::sync::Notify;
+
+use crate::catalog::backend::BackendKind;
 
 /// Path the child writes once a checkpoint fires. The parent polls
 /// `try_exists` on this path and `SIGKILL`s the child as soon as it appears.
@@ -133,4 +137,74 @@ pub async fn maybe_signal_materialization() {
         return;
     }
     signal_and_park(ready_file).await;
+}
+
+/// Arms the migration-runner rendezvous. Value `<backend>:<parties>` with
+/// `<backend>` one of `postgres` / `sqlite` and `<parties>` at least 2: the
+/// first `<parties>` runners on that backend are each held by
+/// [`maybe_signal_migration_ledger_read`] -- inside the open migration
+/// transaction, ledger read, no DDL issued yet -- until all have arrived or
+/// [`MIGRATION_LEDGER_BARRIER_TIMEOUT`] elapses, whichever is first. That pins
+/// the interleaving the Postgres advisory lock in `catalog::migrations::run`
+/// must make impossible: two runners that both read an empty ledger and both
+/// go on to `CREATE TABLE`.
+///
+/// The backend selector keeps the arming from leaking into a sibling test on
+/// the other dialect in the same process (a SQLite runner parked here would sit
+/// inside its `BEGIN IMMEDIATE` for the timeout, against a 5 s `busy_timeout`
+/// on the other pool). The wait is bounded rather than a strict barrier
+/// because in the fixed world the second runner never reaches this point while
+/// the first holds the lock (a strict barrier would deadlock the winner against
+/// the loser it blocks), and on a fresh database even the unfixed world parks
+/// the second runner on the ledger `CREATE TABLE`'s catalog lock. Either way
+/// the first caller proceeds after the timeout and the test's assertions
+/// decide.
+pub const MIGRATION_LEDGER_BARRIER_ENV: &str = "JAMMI_TEST_MIGRATION_LEDGER_BARRIER";
+
+/// Longest one party waits at the migration rendezvous for the others.
+pub const MIGRATION_LEDGER_BARRIER_TIMEOUT: Duration = Duration::from_secs(5);
+
+/// Arrivals at the migration rendezvous, process-wide. The rendezvous is
+/// one-shot: once `n` callers have arrived every later caller passes straight
+/// through, so a sibling test in the same binary can never be parked by a
+/// stale arming.
+static MIGRATION_LEDGER_ARRIVALS: AtomicUsize = AtomicUsize::new(0);
+
+/// Release notifier for the migration rendezvous; the `n`-th arrival fires it.
+static MIGRATION_LEDGER_RELEASE: OnceLock<Notify> = OnceLock::new();
+
+/// Bounded rendezvous inside `catalog::migrations::run`, after the
+/// `applied_migrations` ledger has been read and before the first migration
+/// DDL statement. A no-op unless [`MIGRATION_LEDGER_BARRIER_ENV`] names
+/// `kind` with a party count of at least two; see there for the interleaving
+/// it pins.
+pub async fn maybe_signal_migration_ledger_read(kind: BackendKind) {
+    let Some(armed) = std::env::var(MIGRATION_LEDGER_BARRIER_ENV).ok() else {
+        return;
+    };
+    let Some((backend, parties)) = armed.split_once(':') else {
+        return;
+    };
+    let selected = match kind {
+        BackendKind::Postgres => "postgres",
+        BackendKind::Sqlite => "sqlite",
+    };
+    let parties = match parties.parse::<usize>() {
+        Ok(n) if n >= 2 && backend == selected => n,
+        _ => return,
+    };
+    let release = MIGRATION_LEDGER_RELEASE.get_or_init(Notify::new);
+    // Register interest before counting the arrival so the releasing
+    // `notify_waiters` from a party that arrives between the two steps is
+    // not lost.
+    let notified = release.notified();
+    tokio::pin!(notified);
+    notified.as_mut().enable();
+    let arrived = MIGRATION_LEDGER_ARRIVALS.fetch_add(1, Ordering::SeqCst) + 1;
+    if arrived >= parties {
+        release.notify_waiters();
+        return;
+    }
+    // Timeout is the documented bound, not a failure: the caller proceeds.
+    let _ = tokio::time::timeout(MIGRATION_LEDGER_BARRIER_TIMEOUT, notified).await;
 }

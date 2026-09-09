@@ -176,6 +176,7 @@ fn jammi_config_debug_never_prints_a_secret() {
         "hf-inline-hubtoken-xyz",
         "s3-inline-secret-xyz",
         "s3-file-secret-xyz",
+        "s3-inline-sessiontoken-xyz",
         "r2-inline-secret-xyz",
         "gcs-file-secret-xyz",
         "azure-inline-accountkey-xyz",
@@ -198,9 +199,11 @@ fn jammi_config_debug_never_prints_a_secret() {
         hub_token = "hf-inline-hubtoken-xyz"
     "#;
 
-    // S3: secret_access_key via the `{ file = … }` form.
+    // S3: secret_access_key via the `{ file = … }` form, session_token
+    // inline — both secret-valued S3 fields covered in one document.
     let s3_src = format!(
-        "{base}\n[storage.cloud.s3]\nsecret_access_key = {{ file = {s3_secret_file:?} }}\n"
+        "{base}\n[storage.cloud.s3]\nsecret_access_key = {{ file = {s3_secret_file:?} }}\n\
+         session_token = \"s3-inline-sessiontoken-xyz\"\n"
     );
     // R2: secret_access_key inline.
     let r2_src = format!(
@@ -288,6 +291,39 @@ fn env_whole_value_type_mismatch_at_a_map_position_never_echoes_the_value() {
     .unwrap_err();
     match err {
         JammiError::Config(msg) => assert!(!msg.contains("hunter2-env-secret"), "msg = {msg}"),
+        other => panic!("expected JammiError::Config, got {other:?}"),
+    }
+}
+
+/// The missing arm: `Node::parse_as_toml`'s OWN error path (layers.rs's
+/// "env value is not valid TOML" branch) — genuinely malformed TOML syntax
+/// at a seq/map-position env leaf, as opposed to the sibling test above
+/// (valid TOML, wrong shape). Only the FILE arm of this same safe-rendering
+/// discipline was covered before this test (`describe_toml_error` is
+/// exercised by `file_parse_error_after_env_interpolation_never_echoes_the_expanded_secret`);
+/// this pins the ENV-leaf arm names the offending variable and never echoes
+/// the value.
+#[test]
+fn env_leaf_invalid_toml_syntax_never_echoes_the_value_and_names_the_variable() {
+    let err = JammiConfig::parse_from(
+        "",
+        vec![(
+            "JAMMI_INFERENCE__HTTP__HEADERS".to_string(),
+            // An unterminated string literal: not valid TOML at all, so this
+            // hits `Node::parse_as_toml`'s own parse-failure branch rather
+            // than a downstream `invalid_type` check.
+            "\"unterminated-hunter2-env-secret".to_string(),
+        )],
+    )
+    .unwrap_err();
+    match err {
+        JammiError::Config(msg) => {
+            assert!(!msg.contains("hunter2-env-secret"), "msg = {msg}");
+            assert!(
+                msg.contains("JAMMI_INFERENCE__HTTP__HEADERS"),
+                "msg = {msg}"
+            );
+        }
         other => panic!("expected JammiError::Config, got {other:?}"),
     }
 }
@@ -1163,7 +1199,7 @@ fn effective_oversample_for_none_on_binary_resolves_to_thirty_two() {
     assert_eq!(ann.effective_oversample_for(StoragePrecision::Binary), 32);
 }
 
-// ── esc-095: layered `JAMMI_*` env overrides (B2) ────────────────────────
+// ── esc-095: layered `JAMMI_*` env overrides ─────────────────────────────
 
 /// esc-095's oracle: an env-only selection of Postgres + JetStream must
 /// actually run Postgres + JetStream — before this fix, `apply_env_overrides`
@@ -1824,9 +1860,9 @@ fn parse_from_empty_is_the_defaults_control() {
     assert_eq!(cfg.models, ModelsConfig::default());
 }
 
-// ── H13's unknown-`credentials_path`-key oracle (B1 implementer's note) ──
+// ── unknown credentials_path key oracle ──────────────────────────────────
 
-/// The old `credentials_path` key (pre-B1) is no longer silently ignored:
+/// The retired `credentials_path` key (#483) is no longer silently ignored:
 /// `BrokerConfig::JetStream` has `deny_unknown_fields`, so a config that
 /// still spells the retired key is refused, naming it.
 #[test]

@@ -16,7 +16,7 @@ use serde::{Deserialize, Serialize};
 
 use super::error::StorageError;
 use super::url::Scheme;
-use crate::config::secret::serialize_exposed;
+use crate::config::secret::{deserialize_inline, serialize_exposed};
 use crate::config::Secret;
 
 /// AWS S3 (or any S3-compatible) connection details.
@@ -25,11 +25,14 @@ use crate::config::Secret;
 /// Field names mirror the canonical AWS SDK env var conventions so a
 /// caller can populate from `std::env::var` 1:1.
 ///
-/// `secret_access_key` is [`Secret`]-typed: `Debug` (derived) redacts it as
-/// `Secret(***)`, and it serializes as plaintext ONLY through
-/// [`serialize_exposed`] — the shape this struct persists as in a
-/// `sources.options` row is unchanged (still a plain JSON string at this
-/// key), but a `{:?}` of a config carrying an `S3Config` never prints it.
+/// `secret_access_key`/`session_token` are [`Secret`]-typed: `Debug`
+/// (derived) redacts them as `Secret(***)`, and each serializes as
+/// plaintext ONLY through [`serialize_exposed`] and deserializes a plain
+/// string ONLY through [`deserialize_inline`] (an object form is refused,
+/// never read as a file) — the shape this struct persists as in a
+/// `sources.options` row is unchanged in both directions (still a plain
+/// JSON string at each key), but a `{:?}` of a config carrying an
+/// `S3Config` never prints either.
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct S3Config {
     /// AWS region (e.g. `"us-east-1"`).
@@ -41,10 +44,20 @@ pub struct S3Config {
     pub access_key_id: Option<String>,
     /// Secret access key paired with [`Self::access_key_id`]. See the
     /// struct docs for the redaction/persistence split.
-    #[serde(serialize_with = "serialize_exposed")]
+    #[serde(
+        default,
+        serialize_with = "serialize_exposed",
+        deserialize_with = "deserialize_inline"
+    )]
     pub secret_access_key: Option<Secret>,
-    /// Optional session token for temporary credentials (STS, SSO).
-    pub session_token: Option<String>,
+    /// Optional session token for temporary credentials (STS, SSO). See the
+    /// struct docs for the redaction/persistence split.
+    #[serde(
+        default,
+        serialize_with = "serialize_exposed",
+        deserialize_with = "deserialize_inline"
+    )]
+    pub session_token: Option<Secret>,
     /// Whether to allow plain HTTP (only used against test endpoints).
     /// Defaults to `false` so production deployments fail closed.
     #[serde(default)]
@@ -61,7 +74,11 @@ pub struct GcsConfig {
     /// GCS driver falls back to Application Default Credentials
     /// (`GOOGLE_APPLICATION_CREDENTIALS`, Workload Identity, gcloud user
     /// creds).
-    #[serde(serialize_with = "serialize_exposed")]
+    #[serde(
+        default,
+        serialize_with = "serialize_exposed",
+        deserialize_with = "deserialize_inline"
+    )]
     pub service_account_json: Option<Secret>,
     /// Path to a service-account JSON file. Alternative to
     /// [`Self::service_account_json`] for callers who want to keep the file
@@ -79,17 +96,29 @@ pub struct AzureConfig {
     /// `myaccount.blob.core.windows.net`).
     pub account_name: Option<String>,
     /// Account access key. Mutually exclusive with [`Self::sas_token`].
-    #[serde(serialize_with = "serialize_exposed")]
+    #[serde(
+        default,
+        serialize_with = "serialize_exposed",
+        deserialize_with = "deserialize_inline"
+    )]
     pub account_key: Option<Secret>,
     /// Shared-access-signature token.
-    #[serde(serialize_with = "serialize_exposed")]
+    #[serde(
+        default,
+        serialize_with = "serialize_exposed",
+        deserialize_with = "deserialize_inline"
+    )]
     pub sas_token: Option<Secret>,
     /// Tenant id for OAuth / Managed Identity auth.
     pub tenant_id: Option<String>,
     /// Client id for OAuth.
     pub client_id: Option<String>,
     /// Client secret paired with [`Self::client_id`].
-    #[serde(serialize_with = "serialize_exposed")]
+    #[serde(
+        default,
+        serialize_with = "serialize_exposed",
+        deserialize_with = "deserialize_inline"
+    )]
     pub client_secret: Option<Secret>,
 }
 
@@ -116,7 +145,11 @@ pub struct R2Config {
     /// When unset, the S3 SDK's default credential chain applies.
     pub access_key_id: Option<String>,
     /// Secret access key paired with [`Self::access_key_id`].
-    #[serde(serialize_with = "serialize_exposed")]
+    #[serde(
+        default,
+        serialize_with = "serialize_exposed",
+        deserialize_with = "deserialize_inline"
+    )]
     pub secret_access_key: Option<Secret>,
     /// Allow plain HTTP — only for test endpoints. Defaults `false` (fail closed).
     #[serde(default)]
@@ -490,5 +523,187 @@ mod tests {
             ..Default::default()
         };
         assert!(good.validate().is_ok());
+    }
+
+    // ── #483: persisted credentials are inline-only on read ──────────────
+    //
+    // A persisted credential (a `sources.options` row) round-trips through
+    // `serde_json` byte-for-byte in BOTH directions, exactly as it did
+    // before `Secret` existed: (a)/(b) below pin the literal pre-existing
+    // JSON shape and that reloading it exposes the original plaintext; (c)
+    // pins that a credential whose text happens to read `{ file = "…" }` is
+    // an ordinary opaque string, never treated as a file directive; (d)
+    // pins that the object form itself is refused, at every one of the
+    // seven credential positions, without ever reading a file or echoing
+    // the attempted path; (e) pins the pre-existing unknown-top-level-key
+    // behavior (ignored — none of these four structs carries
+    // `deny_unknown_fields`).
+
+    #[test]
+    fn s3_config_persisted_json_round_trips_byte_for_byte_with_every_credential_set() {
+        let cfg = S3Config {
+            region: Some("us-east-1".into()),
+            endpoint: Some("https://s3.example.com".into()),
+            access_key_id: Some("AKIAEXAMPLE".into()),
+            secret_access_key: Some(Secret::new("s3-secret-key")),
+            session_token: Some(Secret::new("s3-session-token")),
+            allow_http: false,
+        };
+        let json = serde_json::to_string(&cfg).unwrap();
+        assert_eq!(
+            json,
+            r#"{"region":"us-east-1","endpoint":"https://s3.example.com","access_key_id":"AKIAEXAMPLE","secret_access_key":"s3-secret-key","session_token":"s3-session-token","allow_http":false}"#
+        );
+        let reloaded: S3Config = serde_json::from_str(&json).unwrap();
+        assert_eq!(
+            reloaded.secret_access_key.unwrap().expose(),
+            "s3-secret-key"
+        );
+        assert_eq!(reloaded.session_token.unwrap().expose(), "s3-session-token");
+    }
+
+    #[test]
+    fn gcs_config_persisted_json_round_trips_byte_for_byte_with_every_credential_set() {
+        let cfg = GcsConfig {
+            service_account_json: Some(Secret::new("gcs-service-account-json")),
+            service_account_path: Some("/etc/gcs/key.json".into()),
+        };
+        let json = serde_json::to_string(&cfg).unwrap();
+        assert_eq!(
+            json,
+            r#"{"service_account_json":"gcs-service-account-json","service_account_path":"/etc/gcs/key.json"}"#
+        );
+        let reloaded: GcsConfig = serde_json::from_str(&json).unwrap();
+        assert_eq!(
+            reloaded.service_account_json.unwrap().expose(),
+            "gcs-service-account-json"
+        );
+    }
+
+    #[test]
+    fn azure_config_persisted_json_round_trips_byte_for_byte_with_every_credential_set() {
+        let cfg = AzureConfig {
+            account_name: Some("myaccount".into()),
+            account_key: Some(Secret::new("azure-account-key")),
+            sas_token: Some(Secret::new("azure-sas-token")),
+            tenant_id: Some("tenant-1".into()),
+            client_id: Some("client-1".into()),
+            client_secret: Some(Secret::new("azure-client-secret")),
+        };
+        let json = serde_json::to_string(&cfg).unwrap();
+        assert_eq!(
+            json,
+            r#"{"account_name":"myaccount","account_key":"azure-account-key","sas_token":"azure-sas-token","tenant_id":"tenant-1","client_id":"client-1","client_secret":"azure-client-secret"}"#
+        );
+        let reloaded: AzureConfig = serde_json::from_str(&json).unwrap();
+        assert_eq!(reloaded.account_key.unwrap().expose(), "azure-account-key");
+        assert_eq!(reloaded.sas_token.unwrap().expose(), "azure-sas-token");
+        assert_eq!(
+            reloaded.client_secret.unwrap().expose(),
+            "azure-client-secret"
+        );
+    }
+
+    #[test]
+    fn r2_config_persisted_json_round_trips_byte_for_byte_with_every_credential_set() {
+        let cfg = R2Config {
+            account_id: Some("r2acct".into()),
+            endpoint: Some("https://r2.example.com".into()),
+            access_key_id: Some("R2KEY".into()),
+            secret_access_key: Some(Secret::new("r2-secret-key")),
+            allow_http: false,
+        };
+        let json = serde_json::to_string(&cfg).unwrap();
+        assert_eq!(
+            json,
+            r#"{"account_id":"r2acct","endpoint":"https://r2.example.com","access_key_id":"R2KEY","secret_access_key":"r2-secret-key","allow_http":false}"#
+        );
+        let reloaded: R2Config = serde_json::from_str(&json).unwrap();
+        assert_eq!(
+            reloaded.secret_access_key.unwrap().expose(),
+            "r2-secret-key"
+        );
+    }
+
+    /// (c) A persisted credential whose text IS the file-form spelling is an
+    /// ordinary opaque inline string — `deserialize_inline` never applies
+    /// `SecretSource`'s "quoted file table" refusal (that refusal is a
+    /// `JammiConfig` file/env-layer rule, not a persisted-row rule).
+    #[test]
+    fn literal_file_table_text_round_trips_as_an_opaque_string_at_every_position() {
+        let literal = r#"{ file = "/x" }"#;
+        let s3: S3Config =
+            serde_json::from_str(&format!(r#"{{"secret_access_key":{:?}}}"#, literal)).unwrap();
+        assert_eq!(s3.secret_access_key.unwrap().expose(), literal);
+
+        let gcs: GcsConfig =
+            serde_json::from_str(&format!(r#"{{"service_account_json":{:?}}}"#, literal)).unwrap();
+        assert_eq!(gcs.service_account_json.unwrap().expose(), literal);
+
+        let azure: AzureConfig =
+            serde_json::from_str(&format!(r#"{{"account_key":{:?}}}"#, literal)).unwrap();
+        assert_eq!(azure.account_key.unwrap().expose(), literal);
+
+        let r2: R2Config =
+            serde_json::from_str(&format!(r#"{{"secret_access_key":{:?}}}"#, literal)).unwrap();
+        assert_eq!(r2.secret_access_key.unwrap().expose(), literal);
+    }
+
+    /// (d) The object form `{"file": "…"}` is refused at every one of the
+    /// seven credential positions across all four cloud variants — an
+    /// `invalid_type` error naming the field (via `serde_path_to_error`,
+    /// which tracks the struct path correctly for these plain, non-tagged
+    /// structs), never a value/path echo, and — the load-bearing half of
+    /// this fix — NEVER a file read. `/etc/passwd` is a real, readable file
+    /// on every CI runner and dev machine; pre-fix, this exact JSON made
+    /// `Secret`'s `Deserialize` (via `SecretSource`) read it and expose its
+    /// contents as the "credential" (see the RED capture in this commit's
+    /// message).
+    #[test]
+    fn object_form_is_refused_at_every_credential_position_names_field_no_path_leak() {
+        fn assert_refused<T: serde::de::DeserializeOwned>(json: &str, field: &str) {
+            let mut de = serde_json::Deserializer::from_str(json);
+            let err = serde_path_to_error::deserialize::<_, T>(&mut de)
+                .err()
+                .unwrap_or_else(|| panic!("{field}: object form must be refused (json = {json})"));
+            let msg = err.to_string();
+            assert!(msg.contains(field), "{field}: msg = {msg}");
+            assert!(!msg.contains("/etc/passwd"), "{field}: msg = {msg}");
+        }
+
+        assert_refused::<S3Config>(
+            r#"{"secret_access_key":{"file":"/etc/passwd"}}"#,
+            "secret_access_key",
+        );
+        assert_refused::<S3Config>(
+            r#"{"session_token":{"file":"/etc/passwd"}}"#,
+            "session_token",
+        );
+        assert_refused::<GcsConfig>(
+            r#"{"service_account_json":{"file":"/etc/passwd"}}"#,
+            "service_account_json",
+        );
+        assert_refused::<AzureConfig>(r#"{"account_key":{"file":"/etc/passwd"}}"#, "account_key");
+        assert_refused::<AzureConfig>(r#"{"sas_token":{"file":"/etc/passwd"}}"#, "sas_token");
+        assert_refused::<AzureConfig>(
+            r#"{"client_secret":{"file":"/etc/passwd"}}"#,
+            "client_secret",
+        );
+        assert_refused::<R2Config>(
+            r#"{"secret_access_key":{"file":"/etc/passwd"}}"#,
+            "secret_access_key",
+        );
+    }
+
+    /// (e) Pin the pre-existing unknown-top-level-key behavior: none of
+    /// these four structs carries `#[serde(deny_unknown_fields)]` (unlike
+    /// `crate::config::JammiConfig`'s config-only `*Section` mirrors, which
+    /// do), so an old or forward-written row with an unrecognized key still
+    /// reloads rather than refusing outright.
+    #[test]
+    fn unknown_top_level_key_is_ignored_not_denied() {
+        let s3: S3Config =
+            serde_json::from_str(r#"{"region":"us-east-1","future_field":"whatever"}"#).unwrap();
+        assert_eq!(s3.region.as_deref(), Some("us-east-1"));
     }
 }

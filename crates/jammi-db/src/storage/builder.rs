@@ -80,7 +80,7 @@ fn build_s3(
             builder = builder.with_secret_access_key(secret.expose());
         }
         if let Some(token) = &s3.session_token {
-            builder = builder.with_token(token);
+            builder = builder.with_token(token.expose());
         }
         if s3.allow_http {
             builder = builder.with_allow_http(true);

@@ -18,13 +18,9 @@ workspace ships every publishable crate at the same
   `inference.http.headers` values, the cloud credential fields, `models.hub_token`)
   now accepts either the value inline or `{ file = "…" }` naming a file to read
   at load (env spelling: `JAMMI_<PATH>__FILE=/path`); a resolved secret renders
-  as `Secret(***)` everywhere, including `Debug` — including the
-  `storage.cloud.{s3,r2,gcs,azure}` credential fields, which are now
-  `Secret`-typed on the persisted `crate::storage::config` structs too
-  (`S3Config`/`R2Config`/`GcsConfig`/`AzureConfig`) and serialize in exposed
-  (plaintext) form ONLY through an explicit `serialize_with`, so a `{:?}` of
-  the whole config never prints one while `sources.options` persistence is
-  unchanged byte-for-byte. `signing_key.file` reads the
+  as `Secret(***)` everywhere, including `Debug` — see `### Changed` for the
+  `storage.cloud.{s3,r2,gcs,azure}` credential fields' retype.
+  `signing_key.file` reads the
   audit master key from a file (re-read on every signing request, so a rotated
   mount needs no restart) alongside the existing `signing_key = "env"`. The
   config-file resolution order gains a fourth step, `/etc/jammi/jammi.toml`,
@@ -268,6 +264,22 @@ workspace ships every publishable crate at the same
 <!-- /profile-421-generated -->
 
 ### Changed
+- **Persisted cloud credentials are `Secret`-typed and inline-only on read (breaking Rust
+  type change, #483).** The seven credential fields on the persisted `crate::storage::config`
+  structs — `S3Config::{secret_access_key,session_token}`, `GcsConfig::service_account_json`,
+  `AzureConfig::{account_key,sas_token,client_secret}`, `R2Config::secret_access_key` — change
+  Rust type from `Option<String>` to `Option<Secret>` (a source-breaking change for any
+  external crate constructing these structs directly; the one in-tree consumer,
+  `crates/jammi-ai/tests/distributed/harness.rs:103`, already builds `Secret` values). The
+  persisted `sources.options` JSON is unchanged byte-for-byte in BOTH directions: serialization
+  stays plaintext (via `serialize_with = "serialize_exposed"`, unchanged from the prior redaction
+  fix) and deserialization now reads a plain string ONLY (`deserialize_with =
+  "deserialize_inline"`, new) — the object form `{ "file": "…" }` that `Secret`'s ordinary
+  `Deserialize` (via `SecretSource`) would otherwise have accepted at a persisted-row credential
+  position is refused with an ordinary `invalid_type` error; a persisted row is never a place the
+  engine reads a file named by catalog-row content. A credential whose text literally reads
+  `{ file = "…" }` is an ordinary opaque string here (unlike a `JammiConfig` file/env secret,
+  which refuses that exact spelling).
 - **`interpolate_env_vars` takes an explicit lookup closure (#483).**
   `jammi_db::config::interpolate_env_vars(input, lookup: impl Fn(&str) ->
   Option<String>)` replaces the previous `std::env`-reading signature (no

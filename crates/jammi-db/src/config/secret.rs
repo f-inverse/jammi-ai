@@ -44,6 +44,16 @@
 //!   fails much later with an unrelated error. The refusal names the two
 //!   spellings that work (the unquoted TOML table, or the `__FILE` env
 //!   spelling).
+//! - The persisted `crate::storage::config` credential fields do **not**
+//!   read through `Secret`'s own `Deserialize` (which is `SecretSource`'s
+//!   `{ file = "…" }`-accepting shape) at all — they use [`deserialize_inline`],
+//!   which accepts a plain string ONLY. A `sources.options` row is never a
+//!   place the engine reads a file named by catalog-row content: the map
+//!   shape is refused outright (an ordinary `invalid_type` error), even the
+//!   otherwise-valid `{ file = "…" }` table. The one string this function
+//!   does NOT refuse is text that happens to read `{ file = "…" }` — that
+//!   is an ordinary opaque credential value in a persisted row, unlike in a
+//!   `JammiConfig` file/env secret.
 
 use std::collections::BTreeSet;
 use std::fmt;
@@ -175,6 +185,76 @@ pub fn serialize_exposed<S: Serializer>(
         Some(s) => serializer.serialize_str(s.expose()),
         None => serializer.serialize_none(),
     }
+}
+
+/// Deserialize a persisted `crate::storage::config` credential field back
+/// into an `Option<Secret>` — the inverse of [`serialize_exposed`], and the
+/// ONLY `deserialize_with` those six fields use.
+///
+/// A persisted credential is **inline-only in both directions**: this
+/// function accepts a plain string (`deserialize_string`, never
+/// `deserialize_any`) and wraps it in a [`Secret`] directly — it does
+/// **not** go through [`SecretSource`]'s map-shaped `{ file = "…" }` form
+/// (that shape is a `crate::config::JammiConfig` file/env spelling, not a
+/// `sources.options` row spelling) and does **not** apply the
+/// `is_quoted_file_table` refusal either — a persisted credential whose
+/// text happens to read `{ file = "…" }` is an ordinary opaque string here.
+/// A map, sequence, number, bool, or any other non-string shape falls
+/// through to serde's ordinary `invalid_type` error (naming only the
+/// expected shape — never the offending value), so a catalog row crafted
+/// with `{"secret_access_key": {"file": "/etc/passwd"}}` is refused rather
+/// than triggering a file read at load. `#[serde(default)]` (kept on every
+/// field that uses this) is what makes an absent key deserialize to `None`;
+/// this function's own `Option`-awareness (`deserialize_option`) handles an
+/// explicit JSON `null`, matching [`serialize_exposed`]'s `None ->
+/// serialize_none` half exactly.
+pub fn deserialize_inline<'de, D: Deserializer<'de>>(
+    deserializer: D,
+) -> std::result::Result<Option<Secret>, D::Error> {
+    struct InlineOption;
+
+    impl<'de> Visitor<'de> for InlineOption {
+        type Value = Option<Secret>;
+
+        fn expecting(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+            f.write_str("a string (the credential, inline) or null")
+        }
+
+        fn visit_none<E: de::Error>(self) -> std::result::Result<Self::Value, E> {
+            Ok(None)
+        }
+
+        fn visit_unit<E: de::Error>(self) -> std::result::Result<Self::Value, E> {
+            Ok(None)
+        }
+
+        fn visit_some<D2: Deserializer<'de>>(
+            self,
+            deserializer: D2,
+        ) -> std::result::Result<Self::Value, D2::Error> {
+            deserializer.deserialize_string(InlineValue).map(Some)
+        }
+    }
+
+    struct InlineValue;
+
+    impl<'de> Visitor<'de> for InlineValue {
+        type Value = Secret;
+
+        fn expecting(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+            f.write_str("a string (the credential, inline)")
+        }
+
+        fn visit_str<E: de::Error>(self, value: &str) -> std::result::Result<Self::Value, E> {
+            Ok(Secret(value.to_owned()))
+        }
+
+        fn visit_string<E: de::Error>(self, value: String) -> std::result::Result<Self::Value, E> {
+            Ok(Secret(value))
+        }
+    }
+
+    deserializer.deserialize_option(InlineOption)
 }
 
 impl fmt::Debug for Secret {

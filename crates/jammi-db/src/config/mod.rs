@@ -321,8 +321,7 @@ enum CloudSection {
 }
 
 /// Config-side mirror of [`crate::storage::S3Config`]. `secret_access_key`
-/// is [`Secret`]-typed (H9); `access_key_id`/`session_token` are not
-/// (mirroring the plan's exact secret-field list).
+/// and `session_token` are [`Secret`]-typed (H9); `access_key_id` is not.
 #[derive(Debug, Clone, Default, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 struct S3Section {
@@ -330,7 +329,7 @@ struct S3Section {
     endpoint: Option<String>,
     access_key_id: Option<String>,
     secret_access_key: Option<Secret>,
-    session_token: Option<String>,
+    session_token: Option<Secret>,
     #[serde(default)]
     allow_http: bool,
 }

@@ -247,11 +247,20 @@ pub(crate) fn describe_toml_error(source: &str, e: &toml::de::Error) -> String {
 
 /// 1-based (line, column) for a byte offset into `source`, scanning by
 /// `char` (never splitting a UTF-8 code point) up to `offset`.
+///
+/// `offset` comes from `toml::de::Error::span()`, a byte offset that is not
+/// guaranteed to land on a UTF-8 char boundary of `source` (the same
+/// document is not guaranteed to be the exact text the span was computed
+/// against, e.g. after `${VAR}` interpolation shifts byte offsets on a
+/// multi-byte-char source). `source.get(..bound)` returns `None` rather
+/// than panicking on a non-boundary offset; falling back to the whole
+/// `source` in that case still yields a (possibly imprecise) locator
+/// instead of crashing the load path on a malformed span.
 fn line_and_column(source: &str, offset: usize) -> (usize, usize) {
     let bound = offset.min(source.len());
     let mut line = 1usize;
     let mut column = 1usize;
-    for ch in source[..bound].chars() {
+    for ch in source.get(..bound).unwrap_or(source).chars() {
         if ch == '\n' {
             line += 1;
             column = 1;

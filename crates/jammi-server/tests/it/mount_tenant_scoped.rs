@@ -153,6 +153,7 @@ async fn probe_chain(addr: SocketAddr, resolver: Arc<dyn TenantResolver>) -> (Gr
         tiers: TierSet::resolve(std::iter::empty()).expect("core-only tier set resolves"),
         metrics: Arc::new(MetricsRegistry::new().unwrap()),
         tenant_resolver: resolver,
+        admin_authorizer: None,
     };
     (chain, dir)
 }

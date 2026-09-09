@@ -33,8 +33,8 @@ use jammi_wire::proto::catalog::{
     AddChannelColumnsRequest, AddSourceRequest, CreateMutableTableRequest, DeleteModelRequest,
     DescribeModelRequest, DescribeSourceRequest, DropMutableTableRequest, DropTopicRequest,
     ListChannelsRequest, ListIndexSegmentsRequest, ListModelsRequest, ListMutableTablesRequest,
-    ListSourcesRequest, ListTopicsRequest, RegisterChannelRequest, RegisterTopicRequest,
-    RemoveSourceRequest, SetTenantRequest, Tenant,
+    ListSourcesRequest, ListTopicsRequest, ReconcileRequest, RegisterChannelRequest,
+    RegisterTopicRequest, RemoveSourceRequest, SetTenantRequest, Tenant,
 };
 use jammi_wire::proto::training::training_service_client::TrainingServiceClient;
 use jammi_wire::proto::training::{
@@ -454,6 +454,43 @@ impl CatalogClient {
             .await
             .map_err(|s| trigger_error_from_status(&s))?;
         Ok(())
+    }
+
+    // --- reconcile ---------------------------------------------------------
+
+    /// Cross-check the catalog against the object store and report (or, when
+    /// `apply` is set, reclaim) what has drifted.
+    ///
+    /// `all = false` (the default a caller should reach for) runs
+    /// [`CatalogService.Reconcile`] under this session's resolved tenant scope
+    /// — the same tenant-scoped semantics every other verb on this client
+    /// carries. `all = true` requests the cross-tenant admin pass; the server
+    /// gates it behind a deployment-supplied admin authorizer, and a
+    /// deployment that never wires one refuses with `PermissionDenied` (the
+    /// engine's shipped default).
+    ///
+    /// `grace_secs = None` lets the server apply its own default; `apply =
+    /// true` with too short a `grace_secs` fails with `InvalidArgument`
+    /// naming both values ([`JammiError::Config`]).
+    ///
+    /// [`CatalogService.Reconcile`]: crate
+    pub async fn reconcile(
+        &self,
+        apply: bool,
+        grace_secs: Option<u64>,
+        all: bool,
+    ) -> Result<jammi_db::store::ReconcileReport> {
+        let resp = self
+            .client()
+            .reconcile(ReconcileRequest {
+                apply,
+                grace_secs,
+                all,
+            })
+            .await
+            .map_err(|s| error_from_status(&s))?
+            .into_inner();
+        Ok(jammi_wire::reconcile_report_from_proto(resp))
     }
 
     // --- tenant ----------------------------------------------------------

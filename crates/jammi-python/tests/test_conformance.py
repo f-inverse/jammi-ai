@@ -251,6 +251,20 @@ _SEGMENT_VERBS = {
 }
 
 
+# The catalog/object-store cross-check. It DOES hit the wire on the remote arm
+# (`CatalogService.Reconcile`) because the catalog and the object store both
+# live in the engine. The embedded `Database` runs it in the compiled engine
+# (`all=True` calling `ResultStore::reconcile_all` directly, no authorizer
+# gate — the in-process caller is trusted); the client's `RemoteDatabase`
+# drives it over gRPC, where the server gates `all=True` behind a
+# deployment-supplied admin authorizer. The call surface must still agree so a
+# caller swaps transports without changing the call — pinned here against the
+# embed `jammi.EmbeddedBackend`.
+_RECONCILE_VERBS = {
+    "reconcile",
+}
+
+
 def test_remote_surface_has_every_verb():
     """The client's `RemoteDatabase` exposes the full transport-agnostic verb
     set — the same vocabulary the embedded `Database` carries."""
@@ -265,6 +279,7 @@ def test_remote_surface_has_every_verb():
         | _MUTABLE_TOPIC_VERBS
         | _LIFECYCLE_VERBS
         | _SEGMENT_VERBS
+        | _RECONCILE_VERBS
     ):
         assert callable(getattr(jammi.RemoteDatabase, verb)), verb
 
@@ -285,6 +300,19 @@ def test_segment_verbs_have_identical_signatures_across_wheels():
     """The index-segment listing carries the SAME call surface on both
     transports — one positional `table_name`, no transport-shaped extra."""
     for verb in _SEGMENT_VERBS:
+        client = _call_surface(getattr(jammi.RemoteDatabase, verb))
+        embed = _call_surface(_embed_method(verb))
+        assert client == embed, f"{verb}: {embed} != {client}"
+
+
+def test_reconcile_verb_has_identical_signature_across_wheels():
+    """`reconcile` carries the SAME call surface on the client's
+    `RemoteDatabase` as on the embedded engine's `jammi.EmbeddedBackend` —
+    `apply` / `grace_secs` / `all`, same names, same kinds, same defaults —
+    even though `all=True` means something different on each transport (a
+    trusted in-process caller embedded, an authorizer-gated admin pass
+    remote)."""
+    for verb in _RECONCILE_VERBS:
         client = _call_surface(getattr(jammi.RemoteDatabase, verb))
         embed = _call_surface(_embed_method(verb))
         assert client == embed, f"{verb}: {embed} != {client}"
@@ -367,6 +395,59 @@ def test_embed_list_models_returns_the_projection_shape(tmp_path):
         assert set(m) == _MODEL_DICT_KEYS, (
             f"embed list_models entry keys {set(m)} != {_MODEL_DICT_KEYS}"
         )
+
+
+_RECONCILE_REPORT_DICT_KEYS = {
+    "scope",
+    "applied",
+    "rows_failed",
+    "orphans",
+    "pending",
+    "unattributed",
+    "bytes_reclaimed",
+}
+
+
+def test_reconcile_report_projection_is_the_whole_row_and_nothing_more():
+    """The wire `ReconcileReport` message — the single source of the
+    client-facing report shape — carries exactly the projected fields. Pinned
+    against the proto descriptor, so a field added to the engine's
+    `ReconcileReport` without a matching wire/projection update fails here.
+
+    Hermetic: reads the generated proto descriptor, never dialing a server."""
+    from jammi._generated.jammi.v1 import catalog_pb2
+
+    proto_fields = {f.name for f in catalog_pb2.ReconcileReport.DESCRIPTOR.fields}
+    assert proto_fields == _RECONCILE_REPORT_DICT_KEYS, (
+        f"wire ReconcileReport fields {proto_fields} != the client projection "
+        f"{_RECONCILE_REPORT_DICT_KEYS}"
+    )
+
+
+def test_embed_reconcile_both_arms_return_the_report_shape(tmp_path):
+    """The embedded `Database.reconcile` returns the same report dict shape on
+    BOTH the tenant-scoped pass (`all=False`, `ResultStore::reconcile`) and the
+    cross-tenant admin pass (`all=True`, `ResultStore::reconcile_all`) — the
+    embedded engine trusts its own caller, so `all=True` needs no wired
+    authorizer to exercise here, unlike the remote arm (gated server-side).
+    `apply=False` on an empty, freshly-opened engine reports (and mutates)
+    nothing on either arm.
+
+    Hermetic: opens a local engine (`file://`), contacts no server."""
+    db = jammi.connect(f"file://{tmp_path}")
+    try:
+        for all_tenants, expected_scope in ((False, "_global"), (True, "all")):
+            report = db.reconcile(apply=False, grace_secs=0, all=all_tenants)
+            assert set(report) == _RECONCILE_REPORT_DICT_KEYS, (
+                f"embed reconcile(all={all_tenants}) keys {set(report)} != "
+                f"{_RECONCILE_REPORT_DICT_KEYS}"
+            )
+            assert report["applied"] is False
+            assert report["scope"] == expected_scope
+            for key in ("rows_failed", "orphans", "pending", "unattributed"):
+                assert report[key] == [], f"a freshly-opened engine reports nothing: {report}"
+    finally:
+        db.close()
 
 
 def test_mutable_topic_verbs_have_identical_signatures_across_wheels():

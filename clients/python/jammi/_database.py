@@ -206,6 +206,26 @@ def _index_segment_to_dict(s: catalog_pb2.IndexSegment) -> Dict[str, Any]:
     }
 
 
+def _reconcile_report_to_dict(r: catalog_pb2.ReconcileReport) -> Dict[str, Any]:
+    """Project a wire `ReconcileReport` into the dict a caller reads.
+
+    The whole report and nothing else — `scope` / `applied` / `rows_failed` /
+    `orphans` / `pending` / `unattributed` / `bytes_reclaimed` — the same keys,
+    spelled the same way, the embedded `Database.reconcile` produces by
+    serializing the identical engine struct. Every list is already sorted by
+    the engine; this projection does not re-sort.
+    """
+    return {
+        "scope": r.scope,
+        "applied": r.applied,
+        "rows_failed": list(r.rows_failed),
+        "orphans": list(r.orphans),
+        "pending": list(r.pending),
+        "unattributed": list(r.unattributed),
+        "bytes_reclaimed": r.bytes_reclaimed,
+    }
+
+
 def _model_to_dict(m: catalog_pb2.Model) -> Dict[str, Any]:
     """Project a wire `Model` into the model dict a caller reads.
 
@@ -2351,6 +2371,38 @@ class RemoteDatabase:
         request = catalog_pb2.DerivesFromRequest(table=table)
         resp = self._call(self._catalog.DerivesFrom, request)
         return _derives_from_edges_to_list(resp)
+
+    def reconcile(
+        self, apply: bool = False, grace_secs: int = 3600, all: bool = False
+    ) -> Dict[str, Any]:
+        """Cross-check the catalog against the object store and report (or, when
+        ``apply`` is set, reclaim) what has drifted.
+
+        ``apply=False`` (the default) is read-only — it reports what a pass
+        WOULD do without mutating anything; ``apply=True`` reclaims orphans
+        past ``grace_secs`` and flips an incomplete ``ready`` row to
+        ``failed``, and requires ``grace_secs`` to be at least the
+        deployment's configured lease duration or raises the typed
+        ``INVALID_ARGUMENT`` :class:`~jammi.errors.BackendError` naming both
+        values.
+
+        ``all=False`` (the default) runs scoped to the currently bound tenant
+        (or the global prefix when unbound). ``all=True`` requests the
+        cross-tenant admin pass; the server gates it behind a
+        deployment-supplied admin authorizer and a deployment that never wires
+        one refuses with a ``PERMISSION_DENIED``
+        :class:`~jammi.errors.BackendError`.
+
+        Returns the same dict shape the embedded ``Database.reconcile``
+        produces, tagged ``{"scope", "applied", "rows_failed", "orphans",
+        "pending", "unattributed", "bytes_reclaimed"}``. Maps to
+        `CatalogService.Reconcile`.
+        """
+        request = catalog_pb2.ReconcileRequest(
+            apply=apply, grace_secs=grace_secs, all=all
+        )
+        resp = self._call(self._catalog.Reconcile, request)
+        return _reconcile_report_to_dict(resp)
 
     def training_job(self, job_id: str) -> RemoteTrainingJob:
         """Attach to an existing training job by id.

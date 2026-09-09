@@ -23,11 +23,13 @@
 
 use std::collections::BTreeMap;
 use std::str::FromStr;
+use std::time::Duration;
 
 use jammi_db::catalog::model_repo::ModelDescriptor;
 use jammi_db::catalog::segment_repo::IndexSegment;
 use jammi_db::catalog::source_repo::SourceDescriptor;
 use jammi_db::source::{FileFormat, SourceConnection, SourceType};
+use jammi_db::store::{ReconcileOptions, ReconcileReport};
 use jammi_db::trigger::ids::TopicId;
 use jammi_db::trigger::TopicDefinition;
 use jammi_db::TenantId;
@@ -507,6 +509,65 @@ pub fn index_segment_from_proto(segment: pb::IndexSegment) -> Result<IndexSegmen
     })
 }
 
+// === reconcile =============================================================
+
+/// The server-side default reconcile grace window when a `ReconcileRequest`'s
+/// `grace_secs` is unset on the wire (proto3 `optional uint64` — an older or
+/// hand-rolled client that never sets it): 3600 seconds. Shared by the
+/// server's `Reconcile` handler decode ([`reconcile_options_from_proto`]) and
+/// the `jammi` CLI's `--grace-secs` default, so every surface names the same
+/// number rather than two independently-maintained literals.
+pub const DEFAULT_RECONCILE_GRACE_SECS: u64 = 3600;
+
+/// Decode a `ReconcileRequest`'s `apply` + `grace_secs` fields into the
+/// engine's [`ReconcileOptions`], applying [`DEFAULT_RECONCILE_GRACE_SECS`]
+/// when `grace_secs` is unset. The request's `all` flag selects
+/// `ResultStore::reconcile` vs `reconcile_all` and the admin-authorizer gate —
+/// a wire-only concern the server's handler owns, so it is decoded separately
+/// rather than folded into [`ReconcileOptions`], which the embedded engine
+/// also constructs with no such field.
+pub fn reconcile_options_from_proto(req: &pb::ReconcileRequest) -> ReconcileOptions {
+    ReconcileOptions {
+        apply: req.apply,
+        grace: Duration::from_secs(req.grace_secs.unwrap_or(DEFAULT_RECONCILE_GRACE_SECS)),
+    }
+}
+
+/// Encode the engine's [`ReconcileReport`] onto the wire message — the single
+/// mapping both the server's `Reconcile` handler and the remote client's
+/// decode ([`reconcile_report_from_proto`]) share, so embedded/remote parity
+/// is by construction rather than two independently-maintained field lists
+/// that could silently diverge on a multi-chunk report. Every repeated field
+/// is already sorted by `ResultStore::reconcile`/`reconcile_all`; this encode
+/// does not re-sort.
+pub fn reconcile_report_to_proto(report: &ReconcileReport) -> pb::ReconcileReport {
+    pb::ReconcileReport {
+        scope: report.scope.clone(),
+        applied: report.applied,
+        rows_failed: report.rows_failed.clone(),
+        orphans: report.orphans.clone(),
+        pending: report.pending.clone(),
+        unattributed: report.unattributed.clone(),
+        bytes_reclaimed: report.bytes_reclaimed,
+    }
+}
+
+/// Reconstruct the engine's [`ReconcileReport`] from the wire message — the
+/// inverse of [`reconcile_report_to_proto`], for the remote client receive
+/// side. Total: every wire field maps straight onto the engine struct, no
+/// fallible decode.
+pub fn reconcile_report_from_proto(report: pb::ReconcileReport) -> ReconcileReport {
+    ReconcileReport {
+        scope: report.scope,
+        applied: report.applied,
+        rows_failed: report.rows_failed,
+        orphans: report.orphans,
+        pending: report.pending,
+        unattributed: report.unattributed,
+        bytes_reclaimed: report.bytes_reclaimed,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -569,5 +630,72 @@ mod tests {
             "error must name the unknown value: {}",
             err.message()
         );
+    }
+
+    /// A `ReconcileReport` with a multi-entry repeated field on every list (the
+    /// divergence-prone shape, never just the empty/one-entry happy path) must
+    /// round-trip through the wire encode/decode losslessly and field-for-field
+    /// — the property K4 parity relies on `reconcile_report_to_proto` /
+    /// `reconcile_report_from_proto` being the ONE mapping both the server and
+    /// the remote client drive.
+    #[test]
+    fn reconcile_report_round_trips_with_multiple_entries_per_list() {
+        let report = ReconcileReport {
+            scope: "tenant:01906c83-d4c8-7e10-9c4f-3b6f7c5a8e9a".to_string(),
+            applied: true,
+            rows_failed: vec!["table_a".to_string(), "table_b".to_string()],
+            orphans: vec![
+                "_global/orphan_1.parquet".to_string(),
+                "_global/orphan_2.parquet".to_string(),
+            ],
+            pending: vec!["_global/pending_1.parquet".to_string()],
+            unattributed: vec![
+                "legacy_table.parquet".to_string(),
+                "models/not-a-uuid/manifest.json".to_string(),
+            ],
+            bytes_reclaimed: 12_345,
+        };
+        let encoded = reconcile_report_to_proto(&report);
+        let decoded = reconcile_report_from_proto(encoded);
+        assert_eq!(decoded.scope, report.scope);
+        assert_eq!(decoded.applied, report.applied);
+        assert_eq!(decoded.rows_failed, report.rows_failed);
+        assert_eq!(decoded.orphans, report.orphans);
+        assert_eq!(decoded.pending, report.pending);
+        assert_eq!(decoded.unattributed, report.unattributed);
+        assert_eq!(decoded.bytes_reclaimed, report.bytes_reclaimed);
+    }
+
+    /// `grace_secs` unset on the wire (proto3 `optional uint64`, never sent —
+    /// the boundary an older/hand-rolled client hits) decodes to
+    /// [`DEFAULT_RECONCILE_GRACE_SECS`], never a silent zero (which would make
+    /// `apply=true` immediately reclaim everything past no grace at all).
+    #[test]
+    fn reconcile_options_apply_the_default_grace_when_unset() {
+        let req = pb::ReconcileRequest {
+            apply: true,
+            grace_secs: None,
+            all: false,
+        };
+        let opts = reconcile_options_from_proto(&req);
+        assert_eq!(
+            opts.grace,
+            Duration::from_secs(DEFAULT_RECONCILE_GRACE_SECS)
+        );
+        assert!(opts.apply);
+    }
+
+    /// An explicit `grace_secs` (including the K4 parity oracle's `0`) is
+    /// carried through verbatim, never silently replaced by the default.
+    #[test]
+    fn reconcile_options_honour_an_explicit_grace_secs() {
+        let req = pb::ReconcileRequest {
+            apply: false,
+            grace_secs: Some(0),
+            all: true,
+        };
+        let opts = reconcile_options_from_proto(&req);
+        assert_eq!(opts.grace, Duration::from_secs(0));
+        assert!(!opts.apply);
     }
 }

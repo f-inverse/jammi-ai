@@ -944,6 +944,18 @@ fn cases() -> Vec<IsolationCase> {
                 assert_list_index_segments_isolated().await;
             }
         ),
+        // --- reconcile (admin-gated cross-tenant sweep) -----------------------
+        // `reconcile` runs under the resolved tenant scope: a peer's own pass
+        // sees and can therefore only ever report/reclaim objects under its OWN
+        // `{seg}/` prefix, so it can neither report nor delete anything under
+        // another tenant's segment. `reconcile_all` — gated at the wire by an
+        // `AdminAuthorizer`, proven separately by
+        // `grpc_remote_session.rs`'s denied-by-default oracle — sees every
+        // tenant's prefix in one pass and reaps only genuine orphans, leaving
+        // every tenant's live objects byte-identical.
+        case!("CatalogService", "Reconcile", CaseKind::Hermetic, None, {
+            assert_reconcile_isolated().await;
+        }),
         // --- audit (tenant-scoped — NOT allowlisted) -------------------------
         case!("AuditService", "AuditLog", CaseKind::Hermetic, None, {
             assert_audit_isolated().await;
@@ -1810,6 +1822,87 @@ async fn assert_verify_materialization_isolated() {
     assert!(
         b_result.is_err(),
         "CROSS-TENANT LEAK: tenant B resolved and verified tenant A's materialization: {b_result:?}"
+    );
+}
+
+/// `reconcile` scopes to the caller's OWN tenant prefix; `reconcile_all`
+/// (the admin-gated cross-tenant pass — the wire-level `AdminAuthorizer` gate
+/// is proven separately, in `grpc_remote_session.rs`) sees every tenant's
+/// prefix in one pass. Reuses [`materialize_table_for_tenant_a`]'s real
+/// funnel-materialized table (parquet + one ANN segment, tenant A) and plants
+/// a stray, unreferenced object directly under tenant A's own segment —
+/// backdated well past the grace window this test uses, so it is an orphan
+/// candidate with no real-time sleep needed.
+async fn assert_reconcile_isolated() {
+    use jammi_db::store::ReconcileOptions;
+
+    let (engine, _session, table_name, dir) = materialize_table_for_tenant_a().await;
+
+    let stray_dir = dir.path().join("jammi_db").join(tenant_a().to_string());
+    std::fs::create_dir_all(&stray_dir).unwrap();
+    let stray = stray_dir.join("stray.parquet");
+    std::fs::write(&stray, b"stray").unwrap();
+    let backdated = std::time::SystemTime::now() - std::time::Duration::from_secs(3600);
+    std::fs::File::options()
+        .write(true)
+        .open(&stray)
+        .unwrap()
+        .set_modified(backdated)
+        .unwrap();
+
+    // `test_config`'s default `[lease] duration_secs` is 30; `apply=true`
+    // requires `grace >= ` it, so 30s is the shortest grace this fixture can
+    // use without also shrinking the store's lease config.
+    let grace = std::time::Duration::from_secs(30);
+
+    // Tenant B's own reconcile never sees A's table or A's stray object —
+    // both sit outside B's `{seg}/` prefix.
+    let report_b = engine
+        .with_tenant_scoped(tenant_b(), |_scope| async {
+            engine
+                .result_store()
+                .reconcile(ReconcileOptions { apply: true, grace })
+                .await
+        })
+        .await
+        .expect("tenant B's own reconcile must succeed");
+    assert!(report_b.rows_failed.is_empty(), "{report_b:?}");
+    assert!(
+        report_b.orphans.is_empty(),
+        "CROSS-TENANT DELETE: tenant B's own reconcile must never reap tenant A's stray \
+         object: {report_b:?}"
+    );
+    assert!(report_b.unattributed.is_empty(), "{report_b:?}");
+    assert!(
+        stray.exists(),
+        "tenant B's own reconcile must never touch tenant A's stray object"
+    );
+
+    // The admin pass reaps ONLY the stray and leaves A's live table intact.
+    let report_all = engine
+        .result_store()
+        .reconcile_all(ReconcileOptions { apply: true, grace })
+        .await
+        .expect("admin reconcile_all must succeed");
+    assert!(report_all.rows_failed.is_empty(), "{report_all:?}");
+    assert!(
+        report_all
+            .orphans
+            .iter()
+            .any(|o| o.ends_with("stray.parquet")),
+        "the admin pass must reap tenant A's stray object: {report_all:?}"
+    );
+    assert!(!stray.exists());
+
+    let row = engine
+        .with_tenant_scoped(tenant_a(), |_scope| async {
+            engine.catalog().get_result_table(&table_name).await
+        })
+        .await
+        .expect("row read");
+    assert!(
+        row.is_some(),
+        "tenant A's live table must survive the admin reconcile_all pass"
     );
 }
 

@@ -18,16 +18,24 @@ inputs:
       lane that must not fail on a warning outside its own crates, or ""
       to leave RUSTFLAGS unset entirely (falling back to .cargo/config.toml's
       per-target mold default). Never silently force a job onto a flag set it
-      didn't have -- EXCEPT the aarch64-linux `+fp16` floor below, which no
-      caller can drop: on a Linux aarch64 runner, whatever non-empty
-      RUSTFLAGS this action ends up exporting (your override or the
-      default) always carries `-C target-feature=+fp16` appended, because
-      an exported RUSTFLAGS replaces (never merges with)
-      `.cargo/config.toml`'s per-target rustflags, and gemm's aarch64 f16
-      kernel fails to COMPILE outside release profile without it. Leaving
+      didn't have -- EXCEPT the aarch64-linux ISA-floor target-feature flags
+      pinned in `.cargo/config.toml`'s `[target.aarch64-unknown-linux-gnu]`
+      stanza (see that file for which flags and why -- not repeated here on
+      purpose, so this description can never drift from the actual pin),
+      which THIS RUNNER'S CALLER cannot drop: on a Linux aarch64 runner,
+      whatever non-empty RUSTFLAGS this action ends up exporting (your override or the
+      default) always carries every `-C target-feature=…` entry
+      `ci/scripts/rust_target_features.sh aarch64-unknown-linux-gnu`
+      extracts from that config stanza appended, because an exported
+      RUSTFLAGS replaces (never merges with) config-file rustflags. Leaving
       `rustflags` empty skips this export entirely and falls through to
       `.cargo/config.toml` instead, which pins the same floor for local/
-      config-honoring builds — either path carries it.
+      config-honoring builds — either path carries it. The floor follows
+      the RUNNER'S OWN arch (`uname -m`), not a `--target` flag: a
+      cross-build TO aarch64-unknown-linux-gnu FROM an amd64 runner is not
+      covered by this action at all -- no such cross-build lane exists in
+      this repo today (`release-binaries.yml`'s linux-aarch64 leg is still
+      deferred), so there is nothing yet for this gap to silently miss.
     required: false
     default: "-D warnings -C link-arg=-fuse-ld=mold"
   no-sccache:
@@ -54,23 +62,26 @@ runs:
           flags="${{ inputs.rustflags }}"
           # An exported RUSTFLAGS env var REPLACES (never merges with)
           # .cargo/config.toml's per-target rustflags -- cargo's own,
-          # documented precedence rule (that file's own comment states it
-          # for the mold flag). config.toml's `[target.aarch64-unknown-
-          # linux-gnu]` stanza pins `-C target-feature=+fp16` (the
-          # ARMv8.2-A FEAT_FP16 floor gemm's aarch64 f16 kernel needs to
-          # even COMPILE outside release profile), and every caller of
-          # THIS action that passes a non-empty `rustflags` would silently
-          # override it. This is the ONE place that can see "am I about to
-          # export a RUSTFLAGS that would shadow config.toml, on a runner
-          # that needs the floor" and fix it, instead of trusting every
-          # present and future caller to remember -- appended, never
-          # prepended or exclusive, and only once (idempotent against a
-          # caller who already spelled it out by hand).
+          # documented precedence rule (that file's own comment states it).
+          # Every caller of THIS action that passes a non-empty `rustflags`
+          # would therefore silently drop config.toml's aarch64-linux ISA
+          # floor. This is the ONE place that can see "am I about to export
+          # a RUSTFLAGS that would shadow config.toml, on a runner that
+          # needs the floor" and fix it, instead of trusting every present
+          # and future caller to remember. NO LITERAL FEATURE STRING LIVES
+          # HERE: `rust_target_features.sh` reads the actual flags back out
+          # of `.cargo/config.toml` itself, so this step and the config
+          # file can never drift apart -- appended, never prepended or
+          # exclusive, and only once per feature (idempotent against a
+          # caller who already spelled one out by hand).
           if [ "$(uname -s)" = "Linux" ] && [ "$(uname -m)" = "aarch64" ]; then
-            case "$flags" in
-              *target-feature=+fp16*) : ;;
-              *) flags="$flags -C target-feature=+fp16" ;;
-            esac
+            while IFS= read -r feature; do
+              [ -n "$feature" ] || continue
+              case "$flags" in
+                *"target-feature=$feature"*) : ;;
+                *) flags="$flags -C target-feature=$feature" ;;
+              esac
+            done < <(bash ci/scripts/rust_target_features.sh aarch64-unknown-linux-gnu)
           fi
           echo "RUSTFLAGS=$flags" >> "$GITHUB_ENV"
         fi

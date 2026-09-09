@@ -286,13 +286,42 @@ jobs:
 
           # Capture the PRE-CREATE digest of the first tag BEFORE the real
           # (mutating) create below -- if the post-push confirm step fails,
-          # this is the exact digest it prints a restore command for. A
-          # brand-new image name/tag has no previous digest at all
-          # (`imagetools inspect` fails, not a problem this step should
-          # fail on) -- recorded as `<none>` rather than left empty, so the
-          # confirm step's message is never a blank field.
-          previous_digest="$(docker buildx imagetools inspect "$first_tag" --format '{{.Manifest.Digest}}' 2>/dev/null || echo '<none -- first publish>')"
-          echo "previous_digest=$previous_digest" >> "$GITHUB_OUTPUT"
+          # this is the exact digest it prints a restore command for.
+          #
+          # Distinguish "this tag has never been published" from ANY OTHER
+          # read failure (registry outage, auth, a malformed ref): only a
+          # genuine not-found result is a legitimate first-publish (nothing
+          # to restore to, not a problem this step should fail on). Every
+          # other non-zero exit means this step cannot even confirm what it
+          # would be overwriting -- refuse to promote rather than guess.
+          # The exact wording ("<ref>: not found") is buildx's own, verified
+          # against a real nonexistent tag on this registry
+          # (`docker buildx imagetools inspect
+          # ghcr.io/f-inverse/jammi-ai-ci:definitely-missing` -> `ERROR:
+          # ghcr.io/f-inverse/jammi-ai-ci:definitely-missing: not found`,
+          # exit 1) -- a malformed reference instead prints `ERROR: invalid
+          # reference format`, a DIFFERENT string this rule must not match.
+          set +e
+          previous_digest="$(docker buildx imagetools inspect "$first_tag" --format '{{.Manifest.Digest}}' 2>/tmp/ci-base-image-inspect-stderr.txt)"
+          inspect_rc=$?
+          set -e
+          inspect_stderr="$(cat /tmp/ci-base-image-inspect-stderr.txt)"
+
+          if [ "$inspect_rc" -ne 0 ]; then
+            if [[ "$inspect_stderr" == *": not found"* ]]; then
+              echo "previous_digest=" >> "$GITHUB_OUTPUT"
+              echo "pre-create digest read: $first_tag does not exist yet (first publish) -- nothing to restore to"
+            else
+              echo "::error::pre-create digest read for $first_tag failed with something other than a not-found result -- refusing to promote: $inspect_stderr" >&2
+              exit 1
+            fi
+          elif [[ "$previous_digest" =~ ^sha256:[0-9a-f]{64}$ ]]; then
+            echo "previous_digest=$previous_digest" >> "$GITHUB_OUTPUT"
+            echo "pre-create digest for $first_tag: $previous_digest"
+          else
+            echo "::error::pre-create digest read for $first_tag succeeded but returned an unexpected value ('$previous_digest', not a sha256 digest) -- refusing to promote" >&2
+            exit 1
+          fi
 
           mapfile -t sources < /tmp/ci-base-image-sources.txt
           mapfile -t tags < /tmp/ci-base-image-tags.txt
@@ -313,7 +342,11 @@ jobs:
           first_tag="$(head -n1 /tmp/ci-base-image-tags.txt)"
           if ! docker buildx imagetools inspect "$first_tag" --format '{{json .Manifest}}' \
             | bash ci/scripts/check_merged_index_platforms.sh "$PLATFORMS"; then
-            restore_ref="${first_tag%:*}@${PREVIOUS_DIGEST}"
-            echo "::error::post-push confirm failed for $first_tag -- previous digest was $PREVIOUS_DIGEST; restore with: docker buildx imagetools create -t $first_tag $restore_ref" >&2
+            if [ -n "$PREVIOUS_DIGEST" ]; then
+              restore_ref="${first_tag%:*}@${PREVIOUS_DIGEST}"
+              echo "::error::post-push confirm failed for $first_tag -- previous digest was $PREVIOUS_DIGEST; restore with: docker buildx imagetools create -t $first_tag $restore_ref" >&2
+            else
+              echo "::error::post-push confirm failed for $first_tag -- this was the first publish of this tag, so there is no previous digest to restore to; investigate directly" >&2
+            fi
             exit 1
           fi

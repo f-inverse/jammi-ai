@@ -85,12 +85,33 @@ runs:
           # .cargo/config.toml pins for the SAME triple -- unlike a bare
           # RUSTFLAGS, which would replace it (see this file's own module
           # doc for the verified distinction).
+          #
+          # Fail closed on an unresolvable triple: an empty or malformed
+          # `host:` line (a future rustc changing its `-vV` format, or any
+          # other reason `sed` finds nothing) would otherwise silently
+          # write `CARGO_TARGET__RUSTFLAGS=-D warnings` -- a variable name
+          # cargo never looks at, so the warnings gate is lost with no
+          # error at all. Shape-checked, not just non-empty: a triple is
+          # at minimum `<arch>-<rest>` (e.g. `aarch64-unknown-linux-gnu`,
+          # `x86_64-apple-darwin`).
           host_triple="$(rustc -vV | sed -n 's/^host: //p')"
+          if [ -z "$host_triple" ]; then
+            echo "::error::rustc -vV reported no host triple -- cannot export the -D warnings floor" >&2
+            exit 1
+          fi
+          if ! [[ "$host_triple" =~ ^[a-z0-9_]+-[a-z0-9_-]+$ ]]; then
+            echo "::error::rustc -vV reported a host triple in an unexpected shape: '$host_triple'" >&2
+            exit 1
+          fi
           host_var="CARGO_TARGET_$(echo "$host_triple" | tr 'a-z-' 'A-Z_')_RUSTFLAGS"
           echo "${host_var}=-D warnings" >> "$GITHUB_ENV"
 
           target_triple="${{ inputs.target }}"
           if [ -n "$target_triple" ]; then
+            if ! [[ "$target_triple" =~ ^[a-z0-9_]+-[a-z0-9_-]+$ ]]; then
+              echo "::error::the target input is in an unexpected shape: '$target_triple'" >&2
+              exit 1
+            fi
             target_var="CARGO_TARGET_$(echo "$target_triple" | tr 'a-z-' 'A-Z_')_RUSTFLAGS"
             echo "${target_var}=-D warnings" >> "$GITHUB_ENV"
           fi

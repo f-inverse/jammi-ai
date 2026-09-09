@@ -54,7 +54,7 @@ REPO_ROOT = Path(__file__).resolve().parents[2]
 GUIDE = REPO_ROOT / "docs" / "maintainer" / "MAINTAINER-GUIDE.md"
 MANIFEST = REPO_ROOT / "crates" / "jammi-db" / "src" / "store" / "manifest.rs"
 RECOMPUTE = REPO_ROOT / "crates" / "jammi-ai" / "src" / "pipeline" / "recompute.rs"
-CONFIG = REPO_ROOT / "crates" / "jammi-db" / "src" / "config.rs"
+CONFIG = REPO_ROOT / "crates" / "jammi-db" / "src" / "config" / "mod.rs"
 CUDA_KERNEL_GUIDE = REPO_ROOT / "docs" / "maintainer" / "cuda-kernel-guide.md"
 KERNEL_ORACLES_SCRIPT = REPO_ROOT / "ci" / "scripts" / "check_kernel_oracles.py"
 

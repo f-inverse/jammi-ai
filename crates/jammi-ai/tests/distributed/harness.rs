@@ -148,7 +148,7 @@ fn shared_config(backends: &Backends, result_root: &str, artifact_dir: &Path) ->
             ..Default::default()
         },
         catalog: CatalogConfig::Postgres {
-            url: backends.pg_url.clone(),
+            url: backends.pg_url.clone().into(),
             pool_size: 8,
             max_lifetime_secs: None,
         },

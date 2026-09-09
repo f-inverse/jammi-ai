@@ -24,7 +24,8 @@ kind = "jet_stream"
 url = "nats://${NATS_HOST}:4222"
 # Default retention if a topic does not set `broker_metadata.retention_seconds`.
 retention_seconds = 604800
-credentials_path = "/var/run/secrets/nats.creds"
+# The `.creds` file CONTENTS, read at load (or inline the text). Never printed.
+credentials = { file = "/var/run/secrets/nats.creds" }
 
 [engine]
 execution_threads = 8

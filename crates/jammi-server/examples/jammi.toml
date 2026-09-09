@@ -81,4 +81,4 @@ idle_poll_secs = 1
 # kind = "jet_stream"            # needs jammi-db's `jetstream-broker` feature
 # url = "nats://nats:4222"
 # retention_seconds = 604800     # per-stream default; default 7 days
-# credentials_path = "/var/run/secrets/nats.creds"   # optional; omitted connects anonymously
+# credentials = { file = "/var/run/secrets/nats.creds" }   # optional; the `.creds` contents (read at load); omitted connects anonymously

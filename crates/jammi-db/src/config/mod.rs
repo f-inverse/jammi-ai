@@ -1,3 +1,4 @@
+use std::collections::BTreeMap;
 use std::fmt;
 use std::path::{Path, PathBuf};
 use std::str::FromStr;
@@ -6,6 +7,10 @@ use serde::{Deserialize, Serialize};
 
 use crate::error::{JammiError, Result};
 use crate::storage::CloudConfig;
+
+pub mod secret;
+
+pub use secret::{Secret, SecretSource};
 
 // ─── Config-layer enums ─────────────────────────────────────────────────────
 
@@ -155,8 +160,16 @@ impl FromStr for LogFormat {
 /// kind = "jet_stream"
 /// url = "nats://${NATS_HOST}:4222"
 /// retention_seconds = 604800
-/// credentials_path = "/var/run/secrets/nats.creds"
+/// credentials = { file = "/var/run/secrets/nats.creds" }
 /// ```
+///
+/// # Secrets
+///
+/// Secret-valued fields (`catalog.url` for Postgres, `broker.credentials`,
+/// `inference.http.headers` values) are typed [`Secret`]: they accept either
+/// the value inline or `{ file = "…" }` naming a file that holds it, resolve
+/// at load, and render as `Secret(***)` in every `Debug` — so a `{:?}` of the
+/// whole config carries no secret. See [`secret`] for the rules.
 #[derive(Debug, Clone, Deserialize)]
 #[serde(default)]
 pub struct JammiConfig {
@@ -267,6 +280,12 @@ pub struct StorageConfig {
 /// pool_size = 16
 /// max_lifetime_secs = 1800
 /// ```
+///
+/// ```toml
+/// [catalog]
+/// kind = "postgres"
+/// url = { file = "/run/secrets/postgres-url" }
+/// ```
 #[derive(Debug, Clone, PartialEq, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum CatalogConfig {
@@ -281,7 +300,8 @@ pub enum CatalogConfig {
     /// self-hosted production.
     Postgres {
         /// Connection URL, e.g. `postgres://user:pass@host:5432/jammi`.
-        url: String,
+        /// A [`Secret`]: inline or `{ file = "…" }`; never printed.
+        url: Secret,
         /// `sqlx::PgPool` `max_connections`. Default: 8.
         #[serde(default = "default_pool_size")]
         pool_size: u32,
@@ -316,7 +336,7 @@ fn default_pool_size() -> u32 {
 /// kind = "jet_stream"
 /// url = "nats://${NATS_HOST}:4222"
 /// retention_seconds = 604800
-/// credentials_path = "/var/run/secrets/nats.creds"
+/// credentials = { file = "/var/run/secrets/nats.creds" }
 /// ```
 #[derive(Debug, Clone, PartialEq, Deserialize, Default)]
 #[serde(tag = "kind", rename_all = "snake_case")]
@@ -335,10 +355,12 @@ pub enum BrokerConfig {
         /// Default: 7 days (604 800).
         #[serde(default = "default_retention_secs")]
         retention_seconds: u64,
-        /// Optional path to a NATS `.creds` file. When unset the broker
-        /// connects anonymously.
+        /// Optional NATS credentials — the **contents** of a `.creds` file
+        /// (user JWT + NKEY seed), as a [`Secret`]: inline, or
+        /// `{ file = "/run/secrets/nats.creds" }` to read the file at load.
+        /// When unset the broker connects anonymously.
         #[serde(default)]
-        credentials_path: Option<PathBuf>,
+        credentials: Option<Secret>,
     },
 }
 
@@ -359,6 +381,12 @@ fn default_retention_secs() -> u64 {
 /// [signing_key]
 /// kind = "env"
 /// ```
+///
+/// ```toml
+/// [signing_key]
+/// kind = "file"
+/// path = "/run/secrets/jammi-audit-master-key"
+/// ```
 #[derive(Debug, Clone, PartialEq, Deserialize, Default)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum SigningKeyConfig {
@@ -366,6 +394,16 @@ pub enum SigningKeyConfig {
     /// [`crate::audit::EnvSigningKeyStore`]. The default.
     #[default]
     Env,
+    /// Read the master key from a file via
+    /// [`crate::audit::FileSigningKeyStore`]: the same 64-hex-character key
+    /// the env store expects, one trailing newline tolerated. The file is
+    /// read at each signing-key request, not at config load, so a rotated
+    /// mount is picked up without a restart — and a missing file is the same
+    /// `MasterKey` error an unset variable is.
+    File {
+        /// Path of the file holding the hex-encoded 32-byte master key.
+        path: PathBuf,
+    },
 }
 
 /// DataFusion query-engine settings.
@@ -425,8 +463,11 @@ pub struct InferenceConfig {
 pub struct HttpConfig {
     /// Request timeout in seconds. Default: 60.
     pub timeout_secs: u64,
-    /// Extra HTTP headers sent with every inference request.
-    pub headers: std::collections::HashMap<String, String>,
+    /// Extra HTTP headers sent with every inference request. Header values
+    /// are [`Secret`]s (an `Authorization` bearer token is the common case):
+    /// each accepts the value inline or `{ file = "…" }`, and none is ever
+    /// printed. Ordered so the request header set is deterministic.
+    pub headers: BTreeMap<String, Secret>,
 }
 
 /// The precision the ANN sidecar index quantizes its stored vectors to.
@@ -979,7 +1020,7 @@ impl Default for HttpConfig {
     fn default() -> Self {
         Self {
             timeout_secs: 60,
-            headers: std::collections::HashMap::new(),
+            headers: BTreeMap::new(),
         }
     }
 }
@@ -1445,7 +1486,7 @@ mod tests {
             kind = "jet_stream"
             url = "nats://nats.svc:4222"
             retention_seconds = 86400
-            credentials_path = "/run/secrets/nats.creds"
+            credentials = "-----BEGIN NATS USER JWT-----\nabc\n------END NATS USER JWT------"
         "#;
         let cfg: JammiConfig = toml::from_str(toml_src).unwrap();
         assert_eq!(
@@ -1453,9 +1494,42 @@ mod tests {
             BrokerConfig::JetStream {
                 url: "nats://nats.svc:4222".into(),
                 retention_seconds: 86400,
-                credentials_path: Some(PathBuf::from("/run/secrets/nats.creds")),
+                credentials: Some(Secret::from(
+                    "-----BEGIN NATS USER JWT-----\nabc\n------END NATS USER JWT------"
+                )),
             }
         );
+        assert!(!format!("{cfg:?}").contains("abc"));
+    }
+
+    /// `broker.credentials` carries what `async_nats::ConnectOptions::
+    /// with_credentials` takes — the `.creds` file CONTENTS — not a path. The
+    /// file form reads the file at load, so what reaches the session builder
+    /// is the JWT + seed text with its one trailing newline trimmed.
+    #[test]
+    fn jetstream_credentials_are_contents_not_a_path() {
+        let dir = tempfile::tempdir().unwrap();
+        let creds_path = dir.path().join("nats.creds");
+        let contents = "-----BEGIN NATS USER JWT-----\neyJ0.abc\n------END NATS USER JWT------\n\
+                        -----BEGIN USER NKEY SEED-----\nSUAB\n------END USER NKEY SEED------";
+        std::fs::write(&creds_path, format!("{contents}\n")).unwrap();
+        let toml_src = format!(
+            r#"
+            [broker]
+            kind = "jet_stream"
+            url = "nats://nats.svc:4222"
+            credentials = {{ file = {:?} }}
+        "#,
+            creds_path.to_str().unwrap()
+        );
+        let cfg: JammiConfig = toml::from_str(&toml_src).unwrap();
+        let BrokerConfig::JetStream { credentials, .. } = &cfg.broker else {
+            panic!("expected jet_stream, got {:?}", cfg.broker);
+        };
+        let resolved = credentials.as_ref().expect("credentials set");
+        assert_eq!(resolved.expose(), contents);
+        assert_ne!(resolved.expose(), creds_path.to_str().unwrap());
+        assert!(!format!("{cfg:?}").contains("SUAB"));
     }
 
     #[test]
@@ -1471,7 +1545,7 @@ mod tests {
             BrokerConfig::JetStream {
                 url: "nats://nats.svc:4222".into(),
                 retention_seconds: 7 * 24 * 60 * 60,
-                credentials_path: None,
+                credentials: None,
             }
         );
     }
@@ -1483,6 +1557,35 @@ mod tests {
         assert_eq!(cfg.broker, BrokerConfig::InMemory);
     }
 
+    /// The redaction oracle (H9 scope): a `Debug` render of the whole config —
+    /// the thing a startup log line or a panic message prints — must never
+    /// carry a secret. Covers the Postgres URL password and an HTTP header
+    /// value; the JetStream credentials and the signing key are exercised by
+    /// the `secret_*` tests beside them.
+    #[test]
+    fn jammi_config_debug_never_prints_a_secret() {
+        let toml_src = r#"
+            [catalog]
+            kind = "postgres"
+            url = "postgres://jammi:hunter2-pw@db.internal:5432/jammi"
+
+            [inference.http.headers]
+            Authorization = "Bearer tok-4f9a-secret"
+        "#;
+        let cfg: JammiConfig = toml::from_str(toml_src).unwrap();
+        let rendered = format!("{cfg:?}");
+        assert!(
+            !rendered.contains("hunter2-pw"),
+            "Debug leaked the Postgres password: {rendered}"
+        );
+        assert!(
+            !rendered.contains("tok-4f9a-secret"),
+            "Debug leaked the header value: {rendered}"
+        );
+        let pretty = format!("{cfg:#?}");
+        assert!(!pretty.contains("hunter2-pw") && !pretty.contains("tok-4f9a-secret"));
+    }
+
     #[test]
     fn signing_key_config_round_trip_env() {
         let toml_src = r#"
@@ -1491,6 +1594,46 @@ mod tests {
         "#;
         let cfg: JammiConfig = toml::from_str(toml_src).unwrap();
         assert_eq!(cfg.signing_key, SigningKeyConfig::Env);
+    }
+
+    #[test]
+    fn signing_key_config_round_trip_file() {
+        let toml_src = r#"
+            [signing_key]
+            kind = "file"
+            path = "/run/secrets/audit-master-key"
+        "#;
+        let cfg: JammiConfig = toml::from_str(toml_src).unwrap();
+        assert_eq!(
+            cfg.signing_key,
+            SigningKeyConfig::File {
+                path: PathBuf::from("/run/secrets/audit-master-key")
+            }
+        );
+    }
+
+    #[test]
+    fn http_headers_deserialise_inline_and_file_forms() {
+        let dir = tempfile::tempdir().unwrap();
+        let token_path = dir.path().join("hf-token");
+        std::fs::write(&token_path, "hf_filetoken\n").unwrap();
+        let toml_src = format!(
+            r#"
+            [inference.http.headers]
+            Authorization = "Bearer x"
+            X-Api-Key = {{ file = {:?} }}
+        "#,
+            token_path.to_str().unwrap()
+        );
+        let cfg: JammiConfig = toml::from_str(&toml_src).unwrap();
+        let headers = &cfg.inference.http.headers;
+        assert_eq!(headers.len(), 2);
+        assert_eq!(headers["Authorization"].expose(), "Bearer x");
+        assert_eq!(headers["X-Api-Key"].expose(), "hf_filetoken");
+        let rendered = format!("{cfg:?}");
+        assert!(!rendered.contains("Bearer x") && !rendered.contains("hf_filetoken"));
+        // Keys are still visible: the header NAME is not a secret.
+        assert!(rendered.contains("Authorization"));
     }
 
     #[test]

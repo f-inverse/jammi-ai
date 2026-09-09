@@ -241,6 +241,53 @@ workspace ships every publishable crate at the same
 <!-- /profile-421-generated -->
 
 ### Changed
+- **One lease primitive; lease-owned `building` result tables (#479, esc-094).** A
+  `building` result table now belongs to the `ResultStore` that created it: migration
+  `027_result_table_lease` adds `result_tables.writer_id` / `lease_expires_at` (+
+  `idx_result_tables_lease`), `ResultStore::create_table` stamps its `writer-{uuid}` and a lease
+  and returns a **`BuildingTable`** handle (`table_name()`, `parquet_url()`, `writer_id()`,
+  `is_live()`, `set_checkpoint`, `append_segment`, `finish`, `abort`, `abandon`) whose background
+  heartbeat renews the lease every `heartbeat`; every transition on a building row is a
+  compare-and-set through ONE predicate builder (`catalog::result_repo::ResultTableCas { table,
+  tenant_arm: Admin | Strict(tenant), owner: Writer(id) | ExpiredLease(now) }`) — `renew_lease`,
+  `set_checkpoint`, `fail_building_table` (the only `building → failed`),
+  `promote_result_table_with_manifest`, `claim_expired_building_table`, `insert_index_segment`,
+  `delete_index_segments` — and a zero-row match is classified status-first into exactly one of
+  the new `JammiError::RowGone` / `TenantMismatch` / `CasFailed{status}` / `LeaseLost`, none of
+  which licenses a deletion (three deletion arms only: a writer's own `abort()` after its one-row
+  CAS, the reaper after its expiry CAS, reconcile). `ResultStore::finalize_with_manifest` is
+  replaced by `BuildingTable::finish` = renew → `ResultStore::write_attestation` (digest +
+  manifest + sidecar) → promote CAS → `register_table`; a `CasFailed{ready}` there (recovery
+  promoted the writer's own bytes after its lease expired) still registers and returns the
+  catalog's record. `recover()` (still the one implicit-admin pass, now documented to delete
+  expired-lease bytes across every tenant) enumerates only rows whose lease is absent or expired
+  (`Catalog::list_expired_building_tables`), claims a promotable row FIRST (the recoverer becomes
+  the writer, heartbeating a fresh lease) and only then rebuilds and promotes, and fails a
+  reapable row BEFORE it deletes — `reconcile_ready_manifests` likewise flips `ready → failed` by
+  CAS (`Catalog::fail_ready_result_table`) before reaping; a failed delete is logged for
+  reconcile, never `.ok()`-swallowed. `delete_result_tables_for_source` refuses with the new
+  `JammiError::SourceBusy` while a live-lease building row references the source. The leaky
+  `OR tenant_id IS NULL` non-admin arms on `update_result_table_status` / `set_checkpoint` /
+  promote are gone (STRICT: `tenant_id = $t OR (tenant_id IS NULL AND $t IS NULL)`), and
+  `list_models`, `get_training_job`, `list_training_jobs`, `get_result_table` gain the same
+  `is_admin_scope` arm the other enumerations already had. Segment bundle keys derive from the
+  row's own `parquet_path` parent, never the store's current root. `ResultTableRecord` gains
+  `writer_id` / `lease_expires_at`; `CreateResultTableParams` gains the same two (optional)
+  fields; `ResultStore` is `Clone` (one writer identity per instance) with
+  `with_lease_intervals` / `lease_intervals()` / `writer_id()`; `ResultTableInfo` is removed.
+  **Config:** the lease timing moves to a new `[lease] duration_secs = 30, heartbeat_secs = 10`
+  section (`LeaseConfig::intervals() -> LeaseIntervals`, validating both non-zero and
+  `heartbeat * 2 < duration`) shared by the training worker and every result-table writer;
+  `[training]` keeps `run_worker` and `idle_poll_secs` and **refuses** the former
+  `lease_duration_secs` / `heartbeat_interval_secs` keys (no alias — an old TOML naming them is a
+  typed load error, never a silent default); `TrainingConfig::worker_intervals(lease)` takes the
+  validated lease. `training_repo`'s `LEASE_TS_FORMAT` / `lease_now` / `lease_deadline` live in
+  `catalog::lease` (re-exported). The `test-hooks` feature's result-table points are named
+  (`JAMMI_TEST_MATERIALIZATION_CHECKPOINT=table_created|materialization`, `1` meaning
+  `materialization`) and gain a writer-keyed in-process arm (`test_hook::arm(point, writer_id)` /
+  `Armed::wait_parked` / `release`) for the same-process two-writer oracles; CI runs
+  `cargo test -p jammi-db --features test-hooks --test it -- --test-threads=1` (and the
+  Postgres form), which also runs the two SIGKILL crash harnesses in CI for the first time.
 - **The media front end's per-item decode/preprocess runs across the batch in parallel on
   rayon's global pool (#421 follow-on).** `rayon` becomes a direct `jammi-ai` dependency (pinned
   to the version already unified across the resolved tree; no version bump). Two stages, signatures

@@ -950,7 +950,7 @@ impl InferenceSession {
 
         // Persist results to Parquet
         if !batches.is_empty() {
-            let table_info = self
+            let building = self
                 .result_store
                 .create_table(
                     source_id,
@@ -966,20 +966,21 @@ impl InferenceSession {
             let schema = batches[0].schema();
             let mut writer = self
                 .result_store
-                .open_writer(&table_info.parquet_url, schema)
+                .open_writer(building.parquet_url(), schema)
                 .await?;
             for batch in &batches {
                 writer.write_batch(batch).await?;
             }
             let row_count = writer.close().await?;
 
-            // Finalize with the contract built at the top (the same definition +
-            // anchors the cache probe keyed on).
-            self.result_store
-                .finalize_with_manifest(
+            // Finish with the contract built at the top (the same definition +
+            // anchors the cache probe keyed on). Every `?` above unwinds
+            // through the handle's Drop (a best-effort `building -> failed`
+            // CAS, no byte deletion); `finish` is the single `building ->
+            // ready` funnel, renewing the writer's lease before it attests.
+            building
+                .finish(
                     self.inner.context(),
-                    &table_info.table_name,
-                    &table_info.parquet_url,
                     row_count,
                     jammi_db::store::manifest::Materialization::new(&descriptor, &env, inputs),
                 )
@@ -1486,7 +1487,10 @@ fn build_result_store(
     catalog: Arc<jammi_db::catalog::Catalog>,
 ) -> Result<ResultStore> {
     let ann = inner.config().embedding.ann;
-    match inner.config().storage.result_root.as_deref() {
+    // The one lease timing every leased row shares: the store's building
+    // tables are held under the same `[lease]` the training worker uses.
+    let lease = inner.config().lease.intervals()?;
+    let store = match inner.config().storage.result_root.as_deref() {
         Some(root) => {
             let root = jammi_db::storage::StorageUrl::parse(root)?;
             // The ANN segment cache is always local (USearch reads the local
@@ -1500,7 +1504,8 @@ fn build_result_store(
             ResultStore::with_root(root, inner.storage_registry(), catalog, ann, cache_root)
         }
         None => ResultStore::new(inner.config().artifact_dir.as_path(), catalog, ann),
-    }
+    }?;
+    Ok(store.with_lease_intervals(lease))
 }
 
 /// Construct the session's [`ArtifactStore`], rooting model artifacts under the

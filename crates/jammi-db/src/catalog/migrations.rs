@@ -86,6 +86,10 @@ const MIGRATIONS: &[(&str, &str)] = &[
         "026_acceleration_report",
         schema::MIGRATION_026_ACCELERATION_REPORT,
     ),
+    (
+        "027_result_table_lease",
+        schema::MIGRATION_027_RESULT_TABLE_LEASE,
+    ),
 ];
 
 const APPLIED_MIGRATIONS_DDL: &str = r#"

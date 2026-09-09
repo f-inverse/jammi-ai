@@ -59,8 +59,9 @@ use crate::model::backend::DeviceConfig;
 use crate::model::ModelSource;
 use crate::session::InferenceSession;
 
-// Lease timing is configured per deployment via `[training]` in `JammiConfig`
-// and resolved to a [`WorkerIntervals`] (see
+// Lease timing is configured per deployment via `[lease]` in `JammiConfig` (the
+// one lease primitive every leased row shares), the idle poll via `[training]`,
+// and both resolve to a [`WorkerIntervals`] (see
 // [`jammi_db::config::TrainingConfig::worker_intervals`]). The lease is the
 // window a claimed job is exclusively owned; the heartbeat renews it well
 // inside that window so a single missed beat (a GC pause, a slow tick) does not
@@ -141,8 +142,9 @@ pub struct TrainingWorker {
 }
 
 impl TrainingWorker {
-    /// Build a worker over a session, reading its lease/heartbeat/poll timing
-    /// from the session's `[training]` configuration. The worker holds a
+    /// Build a worker over a session, reading its lease/heartbeat timing from
+    /// the session's `[lease]` configuration and its idle poll from
+    /// `[training]`. The worker holds a
     /// [`Weak`] so it never keeps the session alive; the caller owns the strong
     /// `Arc` and the worker stops when that drops.
     ///
@@ -151,7 +153,10 @@ impl TrainingWorker {
     /// the same check already ran at config load, so this only fires for a
     /// programmatically built config that bypassed `JammiConfig::load`.
     pub fn new(session: &Arc<InferenceSession>) -> Result<Self> {
-        let intervals = session.inner_config().training.worker_intervals()?;
+        let config = session.inner_config();
+        let intervals = config
+            .training
+            .worker_intervals(config.lease.intervals()?)?;
         Ok(Self::with_intervals(session, intervals))
     }
 

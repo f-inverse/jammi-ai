@@ -266,6 +266,8 @@ fn result_params<'a>(
     model: &'a str,
 ) -> CreateResultTableParams<'a> {
     CreateResultTableParams {
+        writer_id: None,
+        lease_expires_at: None,
         table_name: name,
         source_id: source,
         model_id: model,
@@ -1641,7 +1643,7 @@ async fn assert_source_resolver_isolated() {
 /// cannot even resolve the table to verify it.
 ///
 /// This drives the real wire path: tenant A materialises an embedding table
-/// through the single `finalize_with_manifest` funnel (the same funnel the
+/// through the single `BuildingTable::finish` funnel (the same funnel the
 /// production producers use), then `Session::verify_materialization` runs under
 /// each tenant's scope — exactly as the gRPC `VerifyMaterialization` handler
 /// wraps it in `scoped(engine, tenant, …)`. A's own verify returns
@@ -1716,9 +1718,29 @@ async fn materialize_table_for_tenant_a() -> (Arc<InferenceSession>, Session, St
                 ],
             )
             .unwrap();
-            let mut writer = store.open_writer(&info.parquet_url, schema).await.unwrap();
+            let mut writer = store.open_writer(info.parquet_url(), schema).await.unwrap();
             writer.write_batch(&batch).await.unwrap();
             let rows = writer.close().await.unwrap();
+
+            // One real ANN segment over the written rows, appended under the
+            // writer's lease while the row is still `building` — the only
+            // moment a segment can be registered (segment 0, stamped with A's
+            // tenant from the parent row).
+            {
+                use jammi_db::index::VectorIndex;
+                let mut index = jammi_db::index::sidecar::SidecarIndex::new(
+                    DIMS,
+                    store.ann_config(),
+                    info.storage_precision(),
+                )
+                .unwrap();
+                for i in 0..n {
+                    let v: Vec<f32> = (0..DIMS).map(|d| (i * DIMS + d) as f32).collect();
+                    index.add(&format!("row-{i}"), &v).unwrap();
+                }
+                index.build().unwrap();
+                info.append_segment(&index).await.unwrap();
+            }
 
             let descriptor = ProducingDescriptor::Embedding {
                 model_id: model_id.into(),
@@ -1739,21 +1761,19 @@ async fn materialize_table_for_tenant_a() -> (Arc<InferenceSession>, Session, St
                 }],
             );
             let ctx = SessionContext::new();
-            store
-                .finalize_with_manifest(
-                    &ctx,
-                    &info.table_name,
-                    &info.parquet_url,
-                    rows,
-                    Materialization::new(
-                        &descriptor,
-                        &env,
-                        vec![InputAnchor::mutable_version(source_id, 1)],
-                    ),
-                )
-                .await
-                .unwrap();
-            info.table_name
+            let table_name = info.table_name().to_string();
+            info.finish(
+                &ctx,
+                rows,
+                Materialization::new(
+                    &descriptor,
+                    &env,
+                    vec![InputAnchor::mutable_version(source_id, 1)],
+                ),
+            )
+            .await
+            .unwrap();
+            table_name
         })
         .await;
 
@@ -1872,16 +1892,8 @@ async fn assert_derives_from_isolated() {
 /// answer B gets is the gate working, not the fixture being empty.
 async fn assert_list_index_segments_isolated() {
     let (engine, session, table_name, _dir) = materialize_table_for_tenant_a().await;
-
-    // One segment on A's table, stamped with A's tenant (the parent's owner).
-    assert!(
-        engine
-            .catalog()
-            .insert_index_segment(&table_name, Some(tenant_a()), 0, "file:///idx/a-seg-0", 3,)
-            .await
-            .expect("insert index segment"),
-        "the segment row must land"
-    );
+    // The fixture appended one segment on A's table while it was `building`,
+    // stamped with A's tenant (the parent's owner).
 
     let a_seen = engine
         .with_tenant_scoped(tenant_a(), |_scope| {
@@ -2142,7 +2154,7 @@ async fn select_ids(session: &JammiSession, tenant: TenantId) -> Vec<i64> {
 /// another tenant's table scanned its full Parquet. This drives the fix end to
 /// end: two result tables of different verb kinds — an as-of-join spine+facts
 /// table and an embedding `_row_id`+vector table — are materialised under
-/// tenant A through the single `finalize_with_manifest` funnel, plus one GLOBAL
+/// tenant A through the single `BuildingTable::finish` funnel, plus one GLOBAL
 /// (unscoped) embedding table, then read back over `with_tenant_scoped(T, |s|
 /// s.sql("SELECT count(*) FROM \"jammi.<name>\""))` — the actual Flight `db.sql`
 /// path. The 3-arm control: A reads its own tables (N > 0); the GLOBAL table is
@@ -2236,7 +2248,7 @@ async fn assert_result_table_scan_isolated() {
 }
 
 /// Materialise an embedding (`_row_id` + `vector`) result table through the
-/// single `finalize_with_manifest` funnel into the engine's real (gated)
+/// single `BuildingTable::finish` funnel into the engine's real (gated)
 /// context, under whatever tenant scope is in effect at the call site. Returns
 /// its table name.
 async fn materialize_embedding_result_table(engine: &InferenceSession, source: &str) -> String {
@@ -2284,7 +2296,7 @@ async fn materialize_embedding_result_table(engine: &InferenceSession, source: &
         ],
     )
     .unwrap();
-    let mut writer = store.open_writer(&info.parquet_url, schema).await.unwrap();
+    let mut writer = store.open_writer(info.parquet_url(), schema).await.unwrap();
     writer.write_batch(&batch).await.unwrap();
     let rows = writer.close().await.unwrap();
 
@@ -2306,21 +2318,19 @@ async fn materialize_embedding_result_table(engine: &InferenceSession, source: &
             quantization: None,
         }],
     );
-    store
-        .finalize_with_manifest(
-            engine.context(),
-            &info.table_name,
-            &info.parquet_url,
-            rows,
-            Materialization::new(
-                &descriptor,
-                &env,
-                vec![InputAnchor::mutable_version(source, 1)],
-            ),
-        )
-        .await
-        .unwrap();
-    info.table_name
+    let table_name = info.table_name().to_string();
+    info.finish(
+        engine.context(),
+        rows,
+        Materialization::new(
+            &descriptor,
+            &env,
+            vec![InputAnchor::mutable_version(source, 1)],
+        ),
+    )
+    .await
+    .unwrap();
+    table_name
 }
 
 /// Materialise an as-of-join-shaped (spine + facts, no `tenant_id` column)
@@ -2368,7 +2378,7 @@ async fn materialize_asof_result_table(
         vec![Arc::new(symbol), Arc::new(ts), Arc::new(price)],
     )
     .unwrap();
-    let mut writer = store.open_writer(&info.parquet_url, schema).await.unwrap();
+    let mut writer = store.open_writer(info.parquet_url(), schema).await.unwrap();
     writer.write_batch(&batch).await.unwrap();
     let rows = writer.close().await.unwrap();
 
@@ -2387,24 +2397,22 @@ async fn materialize_asof_result_table(
     };
     let env = MaterializationEnv::new(ComputeDevice::Cpu, Vec::new());
     let now = chrono::Utc::now().to_rfc3339();
-    store
-        .finalize_with_manifest(
-            engine.context(),
-            &info.table_name,
-            &info.parquet_url,
-            rows,
-            Materialization::new(
-                &descriptor,
-                &env,
-                vec![
-                    InputAnchor::unpinned_at_instant(spine, now.clone()),
-                    InputAnchor::unpinned_at_instant(facts, now),
-                ],
-            ),
-        )
-        .await
-        .unwrap();
-    info.table_name
+    let table_name = info.table_name().to_string();
+    info.finish(
+        engine.context(),
+        rows,
+        Materialization::new(
+            &descriptor,
+            &env,
+            vec![
+                InputAnchor::unpinned_at_instant(spine, now.clone()),
+                InputAnchor::unpinned_at_instant(facts, now),
+            ],
+        ),
+    )
+    .await
+    .unwrap();
+    table_name
 }
 
 /// Scan `SELECT count(*) FROM "jammi.<table>"` under `tenant` through the real

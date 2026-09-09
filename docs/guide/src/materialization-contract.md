@@ -70,24 +70,31 @@ definition hash: the definition is *how* a table is produced, the anchors are
 *over what*. A consumer that wants a combined "code + data" identity composes the
 two itself.
 
-## `finalize_with_manifest` is the sole building→ready transition
+## `BuildingTable::finish` is the sole building→ready transition
 
-There is no manifest-free finalize. `ResultStore::finalize_with_manifest` is the
-single `building → ready` path every producer goes through, so no table reaches
+There is no manifest-free finalize. `ResultStore::create_table` returns a
+lease-owned `BuildingTable` handle, and its `finish` is the single
+`building → ready` path every producer goes through, so no table reaches
 `ready` without an attestation. It performs the steps in a crash-safe order:
 
-1. read the Parquet bytes and compute the artifact digest;
-2. compute the manifest from the descriptor, environment, and resolved inputs;
-3. write the `.materialization.json` sidecar;
-4. register the table and flip the catalog row `building → ready` (recording the
-   `definition_hash` and the input anchors as summary columns).
+1. renew the writer's lease by compare-and-set — a writer whose lease was
+   claimed by recovery learns it here, before it attests bytes it no longer
+   owns;
+2. `ResultStore::write_attestation`: read the Parquet bytes and compute the
+   artifact digest, compute the manifest from the descriptor, environment, and
+   resolved inputs, and write the `.materialization.json` sidecar;
+3. flip the catalog row `building → ready` by a compare-and-set naming the
+   writer (recording the `definition_hash` and the input anchors as summary
+   columns, and clearing the lease);
+4. register the table in DataFusion under the row's own catalog owner.
 
 Because the bytes and the sidecar are durable *before* the status flip, a crash
 in the window leaves a `building` row — never a queryable `ready` table missing
-its manifest. Every producer that materialises an embedding table — graph
-propagation and context-set pooling — routes through this funnel too:
-`ResultStore::materialize_embedding_table` writes the table and then calls
-`finalize_with_manifest` with the producer's `Materialization` (descriptor,
+its manifest — and the row's lease then expires, so the next recovery sweep
+promotes it from that very sidecar or reaps it. Every producer that materialises
+an embedding table — graph propagation and context-set pooling — routes through
+this funnel too: `ResultStore::materialize_embedding_table` writes the table and
+then calls `finish` with the producer's `Materialization` (descriptor,
 environment, and resolved input anchors).
 
 ## How to verify a table

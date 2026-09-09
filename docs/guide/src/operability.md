@@ -92,23 +92,30 @@ The engine enforces these limits. They are the only ones it enforces — there i
 **no configured gRPC message-size cap** and **no in-memory worker-queue-depth
 bound**; the work queue is durable, not buffered (see below).
 
-### Worker timing
+### Lease and worker timing
 
-The training worker drives its loop on three intervals, defaulting to 30 s lease
-/ 10 s heartbeat / 1 s idle-poll:
+One lease primitive (`[lease]`, `crates/jammi-db/src/catalog/lease.rs`) owns
+every leased catalog row — a claimed training job and a `building` result
+table alike — defaulting to a 30 s lease renewed every 10 s; the training
+worker adds a 1 s idle-poll (`[training]`):
 
-- **Lease (30 s default)** — how long a claimed job is exclusively owned before
-  it becomes reclaimable.
-- **Heartbeat (10 s default)** — renews the lease well inside the window.
+- **Lease (30 s default)** — how long a claimed job, or a result table being
+  written, is exclusively owned by its holder before it becomes reclaimable.
+- **Heartbeat (10 s default)** — renews the lease well inside the window: the
+  training worker's heartbeat task for a running job, and a `BuildingTable`'s
+  heartbeat task for a result table between `create_table` and `finish`.
 - **Idle-poll (1 s default)** — how often an idle worker checks for new work;
   reclaim runs on each idle tick, so a dead worker's job is recovered within
-  roughly one poll plus one lease.
+  roughly one poll plus one lease. A dead writer's `building` result table is
+  reclaimed by the next session's startup recovery sweep once its lease has
+  expired — never before, so a replica restarting beside a live writer leaves
+  that writer's table alone.
 
 The config layer enforces the invariant `heartbeat × 2 < lease` (and rejects a
-zero heartbeat or zero idle-poll). This guarantees a live worker renews at least
-twice per lease, so a single missed beat still leaves one in-window renewal that
-lands strictly before expiry — never coincident with it, which would race an
-idle-polling worker's reclaim. Bad values are rejected at config time, never
+zero lease, zero heartbeat, or zero idle-poll). This guarantees a live holder
+renews at least twice per lease, so a single missed beat still leaves one
+in-window renewal that lands strictly before expiry — never coincident with
+it, which would race a reclaim. Bad values are rejected at config time, never
 silently clamped.
 
 ### Job attempts cap
@@ -141,7 +148,8 @@ worker crash leaves the row claimable again after the lease expires.
 | **Worker dies** | The claimed job is reclaimed by a different worker after the lease expires and completes exactly once. | Lease expiry + idle-tick reclaim; the `FOR UPDATE SKIP LOCKED` claim guarantees a single new owner. | The finalized row's `claimed_by` is a different worker id; reclaim runs each idle tick (worker log). | **Proven** by `tests/distributed/kill9_reclaim.rs` (plus `exactly_one_claim.rs` for the N-worker claim race and `cross_tenant_isolation.rs` for tenant scope). |
 | **GPU dies** | — | Memory-budget admission releases the permit via RAII on the failing path, but in-flight GPU-fault recovery is not yet validated end-to-end. | — | **Honest gap: not yet proven (1.0-deferred).** The distributed lane is CPU-only, so no chaos test exercises a GPU fault. |
 | **Broker dies** | The trigger stream is a **separate subsystem** from the training worker fleet — claim and lease are pure Postgres, with no broker coupling — so a broker outage does not stall training. A broker fan-out failure is best-effort: the publisher has already committed the augmented event (with its engine `_offset`) to the durable backing table before fanning out, so the event is never lost — subscribers replay it from the backing table on reconnect. | **At-least-once + replay-completeness**: the backing table is the authoritative log; a subscriber attaches at an engine `_offset`, replays `[from..last_replayed]` from the table, then joins the live broker tail *with overlap* and dedups by engine `_offset` so no committed offset is ever skipped across the replay/live seam. The seam is keyed on the engine `_offset` alone — never on a broker-native sequence (JetStream's stream sequence is an independent counter that skews permanently after any post-commit fan-out failure). | Replayed offsets are contiguous from `from_offset`; the live tail resumes with no gap (broker integration test + in-mem property test). | **At-least-once + replay-completeness PROVEN.** In-memory + crash-mid-publish: `jammi-db/tests/it/trigger.rs` (`crash_mid_publish_replays_committed_offsets_with_no_loss`, `live_tail_resumes_with_no_loss_after_post_commit_fan_out_failure`, `at_least_once_no_skip_property_over_randomized_states`). Live JetStream consumer-recreate resume: `jammi-db/tests/it/trigger_jetstream.rs` (`consumer_recreate_resumes_engine_offsets_with_no_loss`, gated `live-broker-tests`). **Exactly-once is NOT provided by either backend** — dedup downstream by the `(_offset, _row_idx)` composite key. At-least-once is bounded by the backing log's durability (see below): process-crash-durable always; full on Postgres; on SQLite a host power-loss can lose the last committed backing-table row(s) since the previous checkpoint. |
-| **Crash mid-publish of a result table** | No half-written result table is ever queryable. On restart every table left `building` is reconciled to exactly one terminal state — `ready` if its Parquet is a fully-valid closed file (promoted with the *true* footer row count, and the ANN sidecar rebuilt from the Parquet so an embedding table self-heals), `failed` otherwise (missing or torn bytes, which are then reaped). | Crash-consistent eventual reconciliation: the bytes are written first, then a single catalog row flips `building → ready`; the startup sweep classifies each `building` orphan against the bytes on disk. The sweep runs cross-tenant (admin scan), so every tenant's orphan is reconciled and each keeps its own `tenant_id`. | `Recovery: …` `WARN` logs name each reconciled table and its disposition; no row remains `building`. | **Proven** by `jammi-db/tests/it/recovery.rs` — each torn state (missing bytes, truncated Parquet, valid-but-unfinalized Parquet, finalize-ordering window, ready-but-missing-bytes, two tenants' orphans) is constructed directly, then the real `recover()` + `load_existing_tables` asserts invariants I1–I6. |
+| **Crash mid-publish of a result table** | No half-written result table is ever queryable. On restart every table left `building` by a **dead** writer — its lease absent or expired — is reconciled to exactly one terminal state — `ready` if its Parquet is a fully-valid closed file whose manifest sidecar landed (promoted with the *true* footer row count, and the ANN sidecar rebuilt from the Parquet so an embedding table self-heals), `failed` otherwise (missing or torn bytes, or a valid Parquet with no manifest; the objects are reaped only after the row's `building → failed` compare-and-set). A `building` row under a **live** lease belongs to a writer that is still producing it and is left alone. | Crash-consistent eventual reconciliation over lease-owned rows: a writer's `BuildingTable` stamps its `writer_id` and heartbeats a lease; every transition on the row is a compare-and-set naming the owner; the startup sweep enumerates only expired-lease rows, claims a promotable row (becoming its writer) before it rebuilds, and fails a reapable row before it deletes. The sweep runs cross-tenant (the one implicit-admin pass) — it deletes expired-lease bytes across every tenant, even from a tenant-bound session — and each row keeps its own `tenant_id`. | `Recovery: …` `WARN` logs name each reconciled table and its disposition; no expired-lease row remains `building`. | **Proven** by `jammi-db/tests/it/recovery.rs` — each torn state (missing bytes, truncated Parquet, valid-but-unfinalized Parquet, finalize-ordering window, ready-but-missing-bytes, two tenants' orphans) is constructed directly as a dead writer's, then the real `recover()` + `load_existing_tables` asserts invariants I1–I6; the esc-094 two-writer oracles (`live_writer_survives_peer_recover_w1`/`_w2`, feature `test-hooks`) park a live writer while a peer session sweeps and prove its row, bytes, and segments survive and the table completes with the true count. |
+| **Replica restarts during another replica's materialization** | The restarting replica's recovery sweep skips the live writer's `building` row (its lease is live); the writer finishes normally. If the writer instead stalls past its lease, the sweep claims the row (the writer's next heartbeat reports `LeaseLost`, it stops and deletes nothing) and either promotes it from the writer's own sidecar or reaps it. | Lease ownership + compare-and-set on `(table_name, writer_id, status = 'building')`; three deletion arms only — a writer's own `abort()` after its one-row CAS, the reaper after its expiry CAS, and reconcile. | A writer that lost its lease surfaces `LeaseLost` / `CasFailed` typed errors; `Recovery: … skipped` `WARN` logs name a row a sweep declined. | **Proven** by `recovery.rs::live_writer_survives_peer_recover_*`, the zero-row outcome tests (`RowGone` / `TenantMismatch` / `CasFailed` / `LeaseLost`, none deletes), and `two_recoverers_race_on_one_expired_row` (exactly one recoverer promotes). |
 
 ### Catalog durability under crash vs. power loss
 

@@ -39,22 +39,29 @@ services = "all"
 level = "info"
 format = "json"
 
+# The one lease timing every leased catalog row shares — a claimed training
+# job and a `building` result table are both owned under a lease their holder
+# heartbeats, and both are reclaimed by a sweep once it expires. Defaults
+# reproduce the engine's built-in behaviour, so this section is optional. The
+# heartbeat must leave a real margin under the lease
+# (heartbeat_secs * 2 < duration_secs) so a live holder renews strictly before
+# the lease expires; a config that does not is rejected at startup, never
+# silently clamped.
+[lease]
+# How long a claim owns its row before it is reclaimable.
+duration_secs = 30
+# How often the holder renews the lease.
+heartbeat_secs = 10
+
 # Training-worker settings for the `train` tier: whether this process runs the
-# claim loop, and the lease/heartbeat/poll timing it runs it with.
-# Defaults reproduce the engine's built-in behaviour, so this section is optional.
-# The heartbeat must leave a real margin under the lease
-# (heartbeat_interval_secs * 2 < lease_duration_secs) so a live worker renews
-# strictly before the lease expires; a config that does not is rejected at
-# startup, never silently clamped. idle_poll_secs must be > 0.
+# claim loop, and how often an idle worker polls. idle_poll_secs must be > 0.
+# The former `lease_duration_secs` / `heartbeat_interval_secs` keys moved to
+# `[lease]`; naming them here is a startup error, never a silent default.
 [training]
 # Whether THIS process runs the claim loop. `false` still mounts and serves
 # TrainingService (submissions are accepted and stay `queued`); it only stops
 # this process from claiming, so another process configured `true` works them.
 run_worker = true
-# How long a claim leases a job before it is reclaimable.
-lease_duration_secs = 30
-# How often the worker renews the lease while a job runs.
-heartbeat_interval_secs = 10
 # How often an idle worker polls for a queued job (and reclaims expired leases).
 idle_poll_secs = 1
 

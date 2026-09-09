@@ -11,14 +11,17 @@ use datafusion::prelude::SessionContext;
 use jammi_db::catalog::backend::{BackendImpl, BackendKind};
 use jammi_db::catalog::backend_postgres::PostgresBackend;
 use jammi_db::catalog::backend_sqlite::SqliteBackend;
-use jammi_db::catalog::result_repo::{CreateResultTableParams, ResultTableKind, ResultTableRecord};
+use jammi_db::catalog::lease::lease_now;
+use jammi_db::catalog::result_repo::{
+    CreateResultTableParams, Owner, ResultTableCas, ResultTableKind, ResultTableRecord, TenantArm,
+};
 use jammi_db::catalog::segment_repo::IndexSegment;
 use jammi_db::catalog::Catalog;
 use jammi_db::config::{AnnIndexConfig, StoragePrecision};
 use jammi_db::index::sidecar::SidecarIndex;
 use jammi_db::index::VectorIndex;
 use jammi_db::model_task::ModelTask;
-use jammi_db::store::ResultStore;
+use jammi_db::store::{BuildingTable, ResultStore};
 use jammi_numerics::distance::cosine_distance;
 use tempfile::tempdir;
 use test_case::test_case;
@@ -80,9 +83,10 @@ fn store(dir: &std::path::Path, catalog: Arc<Catalog>, precision: StoragePrecisi
     ResultStore::new(dir, catalog, ann).unwrap()
 }
 
-/// Register a `building` embedding table and return its catalog record.
-async fn building_table(store: &ResultStore) -> ResultTableRecord {
-    let info = store
+/// Register a `building` embedding table and return the writer's handle (the
+/// lease-owned row every segment append is a CAS against).
+async fn building_table(store: &ResultStore) -> BuildingTable {
+    store
         .create_table(
             "src",
             ModelTask::TextEmbedding,
@@ -94,10 +98,14 @@ async fn building_table(store: &ResultStore) -> ResultTableRecord {
             None,
         )
         .await
-        .unwrap();
+        .unwrap()
+}
+
+/// The catalog record behind a building handle.
+async fn record_of(store: &ResultStore, building: &BuildingTable) -> ResultTableRecord {
     store
         .catalog()
-        .get_result_table(&info.table_name)
+        .get_result_table(building.table_name())
         .await
         .unwrap()
         .unwrap()
@@ -127,19 +135,19 @@ async fn append_does_not_rebuild_prior_segments() {
         &[("a", [1.0, 0.0, 0.0, 0.0]), ("b", [0.0, 1.0, 0.0, 0.0])],
         StoragePrecision::F32,
     );
-    let id0 = store.append_segment(&table, &seg0).await.unwrap();
+    let id0 = table.append_segment(&seg0).await.unwrap();
 
     // Snapshot segment 0's graph bytes and the dot-free discriminator naming.
     let segs = store
         .catalog()
-        .list_index_segments(&table.table_name)
+        .list_index_segments(table.table_name())
         .await
         .unwrap();
     assert_eq!(segs.len(), 1);
     assert!(
         segs[0]
             .index_path
-            .contains(&format!("{}__seg0.idx", table.table_name)),
+            .contains(&format!("{}__seg0.idx", table.table_name())),
         "segment 0 URL is the dot-free {{table}}__seg0.idx discriminator: {}",
         segs[0].index_path
     );
@@ -151,7 +159,7 @@ async fn append_does_not_rebuild_prior_segments() {
         &[("c", [0.0, 0.0, 1.0, 0.0]), ("d", [0.0, 0.0, 0.0, 1.0])],
         StoragePrecision::F32,
     );
-    let id1 = store.append_segment(&table, &seg1).await.unwrap();
+    let id1 = table.append_segment(&seg1).await.unwrap();
     assert_ne!(id0, id1, "the appended segment gets a fresh id");
 
     // Segment 0's bytes are unchanged — no rebuild.
@@ -162,7 +170,11 @@ async fn append_does_not_rebuild_prior_segments() {
     );
 
     // Both segments' rows are searchable through the merged index.
-    let index = store.resolve_search_mode(&table).await.unwrap().unwrap();
+    let index = store
+        .resolve_search_mode(&record_of(&store, &table).await)
+        .await
+        .unwrap()
+        .unwrap();
     assert_eq!(index.len(), 4);
     let hit_c = index.search_final(&[0.0, 0.0, 1.0, 0.0], 1, 4).unwrap();
     assert_eq!(hit_c.first().map(|(id, _)| id.as_str()), Some("c"));
@@ -192,21 +204,20 @@ async fn concurrent_append_never_collides_and_cascades(kind: BackendKind) {
         Arc::clone(&catalog),
         StoragePrecision::F32,
     ));
-    let table = building_table(&store).await;
+    let table = Arc::new(building_table(&store).await);
 
     // Fan out N concurrent appends; the allocator's read-max + insert +
     // PK-conflict retry must hand each a distinct id with no lost writes.
     const N: i64 = 8;
     let mut handles = Vec::new();
     for i in 0..N {
-        let store = Arc::clone(&store);
-        let table = table.clone();
+        let table = Arc::clone(&table);
         handles.push(tokio::spawn(async move {
             let idx = built_index(
                 &[(&format!("r{i}"), [i as f32, 1.0, 0.0, 0.0])],
                 StoragePrecision::F32,
             );
-            store.append_segment(&table, &idx).await.unwrap()
+            table.append_segment(&idx).await.unwrap()
         }));
     }
     let mut ids: Vec<i64> = Vec::new();
@@ -222,7 +233,7 @@ async fn concurrent_append_never_collides_and_cascades(kind: BackendKind) {
 
     // Round-trip: the catalog lists exactly the N segments in id order.
     let segs = catalog
-        .list_index_segments(&table.table_name)
+        .list_index_segments(table.table_name())
         .await
         .unwrap();
     assert_eq!(segs.len(), N as usize);
@@ -235,7 +246,7 @@ async fn concurrent_append_never_collides_and_cascades(kind: BackendKind) {
     catalog
         .backend_arc()
         .transaction(Default::default(), |tx| {
-            let name = table.table_name.clone();
+            let name = table.table_name().to_string();
             Box::pin(async move {
                 tx.execute(
                     "DELETE FROM result_tables WHERE table_name = $1",
@@ -248,7 +259,7 @@ async fn concurrent_append_never_collides_and_cascades(kind: BackendKind) {
         .unwrap();
     assert!(
         catalog
-            .list_index_segments(&table.table_name)
+            .list_index_segments(table.table_name())
             .await
             .unwrap()
             .is_empty(),
@@ -277,12 +288,12 @@ async fn search_vectors_over_two_int8_segments_equals_brute_force() {
         ("e", [0.1, 0.9, 0.0, 0.0]),
         ("f", [0.0, 0.1, 0.9, 0.0]),
     ];
-    store
-        .append_segment(&table, &built_index(&rows_left, StoragePrecision::Int8))
+    table
+        .append_segment(&built_index(&rows_left, StoragePrecision::Int8))
         .await
         .unwrap();
-    store
-        .append_segment(&table, &built_index(&rows_right, StoragePrecision::Int8))
+    table
+        .append_segment(&built_index(&rows_right, StoragePrecision::Int8))
         .await
         .unwrap();
 
@@ -290,7 +301,10 @@ async fn search_vectors_over_two_int8_segments_equals_brute_force() {
     let ctx = SessionContext::new();
     let k = 3;
     for (_, q) in &all {
-        let hits = store.search_vectors(&ctx, &table, q, k).await.unwrap();
+        let hits = store
+            .search_vectors(&ctx, &record_of(&store, &table).await, q, k)
+            .await
+            .unwrap();
         let got: Vec<String> = hits.into_iter().map(|(id, _)| id).collect();
 
         let mut truth: Vec<(String, f32)> = all
@@ -350,6 +364,8 @@ async fn seed_result_table(session: &jammi_db::session::JammiSession, table: &st
     session
         .catalog()
         .create_result_table(CreateResultTableParams {
+            writer_id: None,
+            lease_expires_at: None,
             table_name: table,
             source_id: "seg_src",
             model_id: "seg_model",
@@ -388,7 +404,16 @@ async fn session_lists_a_tables_segments_in_segment_id_order() {
     ] {
         assert!(session
             .catalog()
-            .insert_index_segment("seg_table", Some(tenant), id, path, rows)
+            .insert_index_segment(
+                &ResultTableCas {
+                    table: "seg_table".to_string(),
+                    tenant_arm: TenantArm::Strict(Some(tenant)),
+                    owner: Owner::ExpiredLease(lease_now()),
+                },
+                id,
+                path,
+                rows,
+            )
             .await
             .unwrap());
     }
@@ -441,7 +466,16 @@ async fn session_hides_another_tenants_segments_and_an_unknown_table_alike() {
     seed_result_table(&session, "a_only_table").await;
     assert!(session
         .catalog()
-        .insert_index_segment("a_only_table", Some(tenant_a), 0, "file:///idx/a-0", 5)
+        .insert_index_segment(
+            &ResultTableCas {
+                table: "a_only_table".to_string(),
+                tenant_arm: TenantArm::Strict(Some(tenant_a)),
+                owner: Owner::ExpiredLease(lease_now()),
+            },
+            0,
+            "file:///idx/a-0",
+            5,
+        )
         .await
         .unwrap());
 

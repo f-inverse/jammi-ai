@@ -7,6 +7,7 @@ use super::status::TrainingJobStatus;
 use super::Catalog;
 use crate::error::{JammiError, Result};
 use crate::tenant::TenantId;
+use crate::tenant_scope::TenantBinding;
 
 /// A row from the `training_jobs` catalog table.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -179,23 +180,11 @@ fn retire_pending_report_clause(pending_param: u8, terminal_param: u8) -> String
     )
 }
 
-/// Format leases write into `lease_expires_at`. Lexicographic ordering of two
-/// timestamps in this fixed-width UTC form matches chronological ordering, so
-/// the SQL `lease_expires_at < $now` comparison is correct on both backends
-/// without dialect-specific interval arithmetic.
-const LEASE_TS_FORMAT: &str = "%Y-%m-%dT%H:%M:%S%.6fZ";
-
-/// `now`, formatted for an engine-clock lease comparison or stamp.
-fn lease_now() -> String {
-    chrono::Utc::now().format(LEASE_TS_FORMAT).to_string()
-}
-
-/// `now + lease`, formatted as a lease deadline.
-fn lease_deadline(lease: Duration) -> String {
-    let expiry =
-        chrono::Utc::now() + chrono::Duration::from_std(lease).unwrap_or(chrono::Duration::MAX);
-    expiry.format(LEASE_TS_FORMAT).to_string()
-}
+// The lease timestamp format and clock helpers live in [`super::lease`] — the
+// one primitive every leased row family (training jobs, building result
+// tables) shares. Re-exported here so this repo's callers and tests keep the
+// names they had.
+pub use super::lease::{lease_deadline, lease_now, LEASE_TS_FORMAT};
 
 fn parse_row(row: &Row<'_>) -> std::result::Result<TrainingJobRecord, BackendError> {
     let metrics_raw: Option<String> = row.try_get("metrics")?;
@@ -422,12 +411,19 @@ impl Catalog {
         Ok(())
     }
 
-    /// Get a training job by ID. Tenant-filtered.
+    /// Get a training job by ID. Tenant-filtered; inside a
+    /// [`crate::session::JammiSession::with_admin_scope`] closure the tenant
+    /// predicate is dropped and the row resolves by its primary key alone.
     pub async fn get_training_job(&self, job_id: &str) -> Result<TrainingJobRecord> {
-        let sql = format!(
-            "SELECT {SELECT_COLS} FROM training_jobs WHERE job_id = $1 \
-               AND (tenant_id = $2 OR tenant_id IS NULL)"
-        );
+        let admin = TenantBinding::is_admin_scope();
+        let sql = if admin {
+            format!("SELECT {SELECT_COLS} FROM training_jobs WHERE job_id = $1")
+        } else {
+            format!(
+                "SELECT {SELECT_COLS} FROM training_jobs WHERE job_id = $1 \
+                   AND (tenant_id = $2 OR tenant_id IS NULL)"
+            )
+        };
         let id = job_id.to_string();
         let id_for_err = id.clone();
         let tenant = self.current_tenant();
@@ -440,15 +436,11 @@ impl Catalog {
                 },
                 |tx| {
                     Box::pin(async move {
-                        tx.query_opt(
-                            &sql,
-                            &[
-                                SqlValue::TextOwned(id),
-                                SqlValue::from(tenant.map(|t| t.to_string())),
-                            ],
-                            parse_row,
-                        )
-                        .await
+                        let mut params = vec![SqlValue::TextOwned(id)];
+                        if !admin {
+                            params.push(SqlValue::from(tenant.map(|t| t.to_string())));
+                        }
+                        tx.query_opt(&sql, &params, parse_row).await
                     })
                 },
             )
@@ -896,12 +888,19 @@ impl Catalog {
     }
 
     /// List training jobs visible to the session tenant, most recent first.
+    /// Inside a [`crate::session::JammiSession::with_admin_scope`] closure the
+    /// tenant predicate is dropped and every tenant's jobs are returned.
     pub async fn list_training_jobs(&self) -> Result<Vec<TrainingJobRecord>> {
-        let sql = format!(
-            "SELECT {SELECT_COLS} FROM training_jobs \
-             WHERE tenant_id = $1 OR tenant_id IS NULL \
-             ORDER BY created_at DESC"
-        );
+        let admin = TenantBinding::is_admin_scope();
+        let sql = if admin {
+            format!("SELECT {SELECT_COLS} FROM training_jobs ORDER BY created_at DESC")
+        } else {
+            format!(
+                "SELECT {SELECT_COLS} FROM training_jobs \
+                 WHERE tenant_id = $1 OR tenant_id IS NULL \
+                 ORDER BY created_at DESC"
+            )
+        };
         let tenant = self.current_tenant();
         Ok(self
             .backend()
@@ -912,12 +911,12 @@ impl Catalog {
                 },
                 |tx| {
                     Box::pin(async move {
-                        tx.query(
-                            &sql,
-                            &[SqlValue::from(tenant.map(|t| t.to_string()))],
-                            parse_row,
-                        )
-                        .await
+                        let params: Vec<SqlValue<'static>> = if admin {
+                            Vec::new()
+                        } else {
+                            vec![SqlValue::from(tenant.map(|t| t.to_string()))]
+                        };
+                        tx.query(&sql, &params, parse_row).await
                     })
                 },
             )

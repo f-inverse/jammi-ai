@@ -86,6 +86,7 @@ fn segment_siblings(precision: StoragePrecision) -> Vec<&'static str> {
 /// over the same [`StorageRegistry`] the result store uses. Constructed once at
 /// [`crate::store::ResultStore`] construction from the session artifact
 /// directory.
+#[derive(Clone)]
 pub struct SegmentIndexCache {
     registry: StorageRegistry,
     cache_root: PathBuf,

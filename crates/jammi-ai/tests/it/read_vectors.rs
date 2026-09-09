@@ -69,6 +69,8 @@ async fn inference_session_read_vectors_forwards_to_jammi_session() {
     session
         .catalog()
         .create_result_table(CreateResultTableParams {
+            writer_id: None,
+            lease_expires_at: None,
             table_name,
             source_id: "src",
             model_id: "model",

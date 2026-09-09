@@ -424,7 +424,7 @@ impl<'a> NeighborGraphPipeline<'a> {
         // The edge table is a derivation: its `task` rides the source's so the
         // NOT NULL column round-trips, but `kind = NeighborGraph` excludes it
         // from embedding resolution and `create_table` gives it no sidecar.
-        let table_info = self
+        let building = self
             .result_store
             .create_table(
                 &source_table.source_id,
@@ -444,34 +444,23 @@ impl<'a> NeighborGraphPipeline<'a> {
 
         let mut writer = self
             .result_store
-            .open_writer(&table_info.parquet_url, schema)
+            .open_writer(building.parquet_url(), schema)
             .await?;
         writer.write_batch(&batch).await?;
         writer.close().await?;
 
         // The materialization contract was built at the top of `run` (so the
         // cache probe keyed on the identical definition + anchors before any
-        // compute); the funnel records exactly those bytes here.
-        self.result_store
-            .finalize_with_manifest(
+        // compute); the funnel records exactly those bytes here. Every `?`
+        // above unwinds through the handle's Drop (a best-effort `building ->
+        // failed` CAS); `finish` returns the promoted catalog record.
+        building
+            .finish(
                 self.session.context(),
-                &table_info.table_name,
-                &table_info.parquet_url,
                 row_count,
                 jammi_db::store::manifest::Materialization::new(descriptor, env, inputs),
             )
-            .await?;
-
-        self.session
-            .catalog()
-            .get_result_table(&table_info.table_name)
-            .await?
-            .ok_or_else(|| {
-                JammiError::Catalog(format!(
-                    "Neighbor-graph table '{}' not found after finalization",
-                    table_info.table_name
-                ))
-            })
+            .await
     }
 }
 

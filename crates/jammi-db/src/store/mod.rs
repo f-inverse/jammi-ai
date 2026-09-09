@@ -1,4 +1,5 @@
 pub mod artifact;
+pub mod building;
 pub mod freshness;
 pub mod manifest;
 pub mod mutable;
@@ -7,6 +8,7 @@ pub mod schema;
 pub mod vectors;
 
 pub use artifact::{ArtifactStore, LocalArtifact};
+pub use building::BuildingTable;
 pub use freshness::{
     CacheOutcome, CachePolicy, CurrentAnchor, DerivesFromEdge, StaleReason, Staleness,
 };
@@ -30,7 +32,10 @@ use datafusion::execution::options::ReadOptions;
 use datafusion::prelude::SessionContext;
 use tracing::warn;
 
-use crate::catalog::result_repo::{CreateResultTableParams, ResultTableKind, ResultTableRecord};
+use crate::catalog::lease::{lease_deadline, lease_now, LeaseIntervals};
+use crate::catalog::result_repo::{
+    CreateResultTableParams, ResultTableCas, ResultTableKind, ResultTableRecord,
+};
 use crate::catalog::status::ResultTableStatus;
 use crate::catalog::Catalog;
 use crate::config::AnnIndexConfig;
@@ -126,22 +131,6 @@ pub struct ComputedEmbeddingProvenance {
     pub inputs: Vec<InputAnchor>,
 }
 
-/// Returned by [`ResultStore::create_table`] — the generated paths and name
-/// for a new result table, before any data has been written.
-///
-/// No index URL is generated here: a table's ANN index is a *set* of segments
-/// (migration 025), each with its own bundle URL derived when the segment is
-/// written through [`ResultStore::append_segment`], not a single sidecar named
-/// at table creation.
-#[derive(Debug)]
-pub struct ResultTableInfo {
-    /// Unique table identifier (schema-qualified by the engine when registering
-    /// with DataFusion).
-    pub table_name: String,
-    /// Storage URL for the Parquet object — open via [`ResultStore::open_parquet`].
-    pub parquet_url: StorageUrl,
-}
-
 /// Coordinates Parquet storage, ANN indexes, DataFusion registration,
 /// catalog metadata, and crash recovery for result tables.
 ///
@@ -149,6 +138,13 @@ pub struct ResultTableInfo {
 /// File scheme keeps the historical `{artifact_dir}/jammi_db/` layout;
 /// `s3://bucket/jammi_db/`, `gs://...`, `azure://...` work without code
 /// change because every read/write goes through [`StorageRegistry`].
+///
+/// One store instance is one **writer**: it mints a `writer-{uuid}` at
+/// construction and stamps it on every `building` row it creates, so two
+/// sessions in one process are distinct writers. `Clone` shares the same
+/// writer identity, catalog, registry, and caches — the handle a
+/// [`BuildingTable`] keeps to act on its row.
+#[derive(Clone)]
 pub struct ResultStore {
     root: StorageUrl,
     registry: StorageRegistry,
@@ -168,6 +164,18 @@ pub struct ResultStore {
     /// USearch can open, once per immutable segment; a `file://` bundle loads
     /// in place. Shares the store's [`StorageRegistry`].
     segment_cache: SegmentIndexCache,
+    /// This store's writer identity, stamped on every `building` row it
+    /// creates and named by every transition on that row.
+    writer_id: Arc<str>,
+    /// The lease window / heartbeat every [`BuildingTable`] this store creates
+    /// (or recovery claims) is held under — the deployment's one
+    /// [`crate::config::LeaseConfig`].
+    lease: LeaseIntervals,
+}
+
+/// Mint a fresh writer identity.
+fn new_writer_id() -> Arc<str> {
+    Arc::from(format!("writer-{}", uuid::Uuid::new_v4()).as_str())
 }
 
 /// Sanitize a model ID for use in file names.
@@ -219,6 +227,8 @@ impl ResultStore {
             ann,
             result_schema,
             segment_cache,
+            writer_id: new_writer_id(),
+            lease: LeaseIntervals::default(),
         })
     }
 
@@ -258,7 +268,28 @@ impl ResultStore {
             ann,
             result_schema,
             segment_cache,
+            writer_id: new_writer_id(),
+            lease: LeaseIntervals::default(),
         })
+    }
+
+    /// Set the lease window / heartbeat every [`BuildingTable`] this store
+    /// creates is held under (the deployment's
+    /// [`crate::config::LeaseConfig::intervals`]). Defaults to the engine's
+    /// built-in 30 s / 10 s pair.
+    pub fn with_lease_intervals(mut self, intervals: LeaseIntervals) -> Self {
+        self.lease = intervals;
+        self
+    }
+
+    /// The lease timing this store's building tables are held under.
+    pub fn lease_intervals(&self) -> LeaseIntervals {
+        self.lease
+    }
+
+    /// This store's writer identity (`writer-{uuid}`).
+    pub fn writer_id(&self) -> &str {
+        &self.writer_id
     }
 
     /// The catalog this store writes result-table rows through. Read accessor
@@ -326,14 +357,22 @@ impl ResultStore {
     }
 
     /// Generate URLs and register a new result table in the catalog with
-    /// status = 'building'.
+    /// status = 'building', lease-owned by this store's writer, and return the
+    /// [`BuildingTable`] handle whose heartbeat keeps that lease renewed until
+    /// [`BuildingTable::finish`] or [`BuildingTable::abort`].
     ///
     /// `kind` discriminates a direct model output from a derivation of another
     /// result table (e.g. a neighbor-graph edge relation); `derived_from` names
     /// the source result table a derivation was computed from (`None` for a
     /// `Model` table). No ANN index is created here for any `kind`: an embedding
     /// table's index materialises lazily as segments through
-    /// [`Self::append_segment`], and a derived table carries none at all.
+    /// [`BuildingTable::append_segment`], and a derived table carries none at
+    /// all.
+    ///
+    /// The row's tenant is read once from the catalog binding in force and
+    /// captured on the handle, so every later transition — including the
+    /// heartbeat's, which runs on a task with no task-local scope — names the
+    /// row's own tenant.
     #[allow(clippy::too_many_arguments)]
     pub async fn create_table(
         &self,
@@ -345,7 +384,7 @@ impl ResultStore {
         dimensions: Option<i32>,
         key_column: Option<&str>,
         text_columns: Option<&str>,
-    ) -> Result<ResultTableInfo> {
+    ) -> Result<BuildingTable> {
         let sanitized = sanitize_model_id(model_id);
         let timestamp = chrono::Utc::now().format("%Y%m%dT%H%M%S%9f");
         // Nanoseconds plus a short uuid suffix make table names unique even
@@ -356,6 +395,8 @@ impl ResultStore {
         let table_name = format!("{source_id}__{task_str}__{sanitized}__{timestamp}_{suffix}");
 
         let parquet_url = self.derive_url(&format!("{table_name}.parquet"))?;
+        let tenant = self.catalog.current_tenant();
+        let storage_precision = self.ann.storage_precision;
 
         self.catalog
             .create_result_table(CreateResultTableParams {
@@ -378,18 +419,30 @@ impl ResultStore {
                 // default (Binary's wider Hamming-coarse-stage oversample)
                 // when the deployment left `oversample` at its untouched
                 // shared default, while still honoring an explicit override.
-                storage_precision: self.ann.storage_precision,
-                oversample: self
-                    .ann
-                    .effective_oversample_for(self.ann.storage_precision),
+                storage_precision,
+                oversample: self.ann.effective_oversample_for(storage_precision),
                 created_at: crate::catalog::backend::now_sortable(),
+                writer_id: Some(&self.writer_id),
+                lease_expires_at: Some(lease_deadline(self.lease.lease())),
             })
             .await?;
 
-        Ok(ResultTableInfo {
+        let building = BuildingTable::adopt(
+            self.clone(),
             table_name,
             parquet_url,
-        })
+            tenant,
+            self.writer_id.to_string(),
+            storage_precision,
+            self.lease,
+        );
+
+        // The W1 window: the `building` row is committed and heartbeating,
+        // no bytes exist yet.
+        #[cfg(feature = "test-hooks")]
+        crate::store::mutable::test_hook::maybe_signal_table_created(&self.writer_id).await;
+
+        Ok(building)
     }
 
     /// Open an [`ObjectParquetWriter`] for the result-table Parquet URL.
@@ -428,48 +481,30 @@ impl ResultStore {
         Ok(())
     }
 
-    /// Finalize a result table behind its materialization contract: the single
-    /// `building -> ready` transition every producer routes through.
+    /// The attestation half of [`BuildingTable::finish`]: compute the artifact
+    /// digest over the durable Parquet bytes at `url`, build the
+    /// [`MaterializationManifest`] from the producer's [`ProducingDescriptor`],
+    /// the output-affecting [`MaterializationEnv`], and the resolved
+    /// [`InputAnchor`]s, and write the `.materialization.json` sidecar (a
+    /// sibling of the Parquet, distinct from the ANN `.manifest.json` index
+    /// sidecar). Returns the manifest and its input anchors as the canonical
+    /// JSON the promote CAS persists as the `input_anchors_json` summary
+    /// column.
     ///
-    /// Builds the [`MaterializationManifest`] from the producer's
-    /// [`ProducingDescriptor`], the output-affecting [`MaterializationEnv`], the
-    /// resolved [`InputAnchor`]s, and the written Parquet's freshly-computed
-    /// [`ArtifactDigest`], then performs the publish in this crash-safe order:
+    /// The sidecar lands *before* the status flip — the same boundary the ANN
+    /// sidecar uses — so a crash never leaves a `ready` table without a
+    /// manifest; a crash between the write and the flip leaves a `building`
+    /// row whose lease expires, which recovery then promotes from this very
+    /// sidecar with the footer's true row count.
     ///
-    /// 1. compute the artifact digest over the durable Parquet bytes;
-    /// 2. write the `.materialization.json` sidecar (a sibling of the Parquet,
-    ///    distinct from the ANN `.manifest.json` index sidecar);
-    /// 3. flip `building -> ready` **and** persist the catalog summary columns
-    ///    (`definition_hash`, `input_anchors_json`) in one transaction,
-    ///    returning the row's `tenant_id`; and
-    /// 4. register the table in DataFusion under that catalog owner, so its
-    ///    resolution is tenant-gated by the row's own owner.
-    ///
-    /// The sidecar is written *before* the status flip — the same boundary the
-    /// ANN sidecar uses — so a crash never leaves a `ready` table without a
-    /// manifest. Registration is in-memory session state (not a durability
-    /// boundary), so it follows the flip: a crash between the flip and
-    /// registration leaves a valid `ready` row that the restart's
-    /// [`Self::load_existing_tables`] re-registers. A crash between (1) and (2)
-    /// leaves a `building` row whose
-    /// Parquet is valid but whose manifest never landed; recovery reconciles
-    /// that to `failed` (the producing descriptor cannot be reconstructed),
-    /// never a manifest-less promotion.
-    ///
-    /// This is the sole `building -> ready` path: there is no manifest-free
-    /// finalize. Every result-table producer — inference, the embedding
-    /// pipeline, the neighbor-graph derivation, and the
-    /// [`Self::materialize_embedding_table`] producers (graph propagation,
-    /// context sets) — supplies a descriptor, an environment, and its inputs
-    /// here, so no table escapes without an attestation.
-    pub async fn finalize_with_manifest(
+    /// Only [`BuildingTable::finish`] calls this on the writer's path (after a
+    /// successful lease renew — K7); it is `pub` so a producer that composes
+    /// the funnel by hand in a test can reach the same bytes.
+    pub async fn write_attestation(
         &self,
-        ctx: &SessionContext,
-        name: &str,
         url: &StorageUrl,
-        rows: usize,
         materialization: Materialization<'_>,
-    ) -> Result<MaterializationManifest> {
+    ) -> Result<(MaterializationManifest, String)> {
         let parquet_handle = self.open_parquet(url)?;
         let parquet_path = parquet_handle.data_path()?;
         let bytes = parquet_handle.get_bytes(&parquet_path).await?;
@@ -485,30 +520,11 @@ impl ResultStore {
         )
         .map_err(manifest_to_jammi)?;
 
-        // Crash window the contract must survive: the Parquet is durable but the
-        // manifest is not yet written and the status flip has not committed.
-        #[cfg(feature = "test-hooks")]
-        crate::store::mutable::test_hook::maybe_signal_materialization().await;
-
         self.write_materialization_sidecar(url, &manifest).await?;
 
         let anchors_json = serde_json::to_string(&manifest.input_anchors)
             .map_err(|e| JammiError::Other(format!("serialise input anchors: {e}")))?;
-        // The flip returns the row's own `tenant_id` (the owner stamped at
-        // `create_table`) so registration gates the table on the catalog owner
-        // by construction, never on whatever scope happens to run finalize.
-        let owner = self
-            .catalog
-            .promote_result_table_with_manifest(
-                name,
-                rows,
-                manifest.definition_hash.as_str(),
-                &anchors_json,
-            )
-            .await?;
-
-        self.register_table(ctx, name, url, owner).await?;
-        Ok(manifest)
+        Ok((manifest, anchors_json))
     }
 
     /// Resolve the [`InputAnchor`] for an immutable result-table input: its
@@ -611,8 +627,9 @@ impl ResultStore {
         }
     }
 
-    /// Reconcile every result table left `building` by a crash, restoring the
-    /// crash-consistency invariant of the catalog↔result-storage boundary.
+    /// Reconcile every result table left `building` by a dead writer,
+    /// restoring the crash-consistency invariant of the catalog↔result-storage
+    /// boundary.
     ///
     /// # Guarantee
     ///
@@ -626,27 +643,46 @@ impl ResultStore {
     ///   loaded into DataFusion ([`Self::load_existing_tables`]); a `building`
     ///   or `failed` row is never registered, so a crash mid-write leaves
     ///   nothing addressable.
-    /// - **Reconciliation is terminal.** This sweep visits every `building` row
-    ///   and drives it to exactly one terminal state — `ready` if its bytes are
-    ///   a fully-valid closed Parquet (promoted with the *true* footer row
-    ///   count, and the ANN sidecar rebuilt from the Parquet so an embedding
-    ///   table self-heals even if its sidecar never landed), `failed` otherwise
-    ///   (missing bytes, or a torn/partial Parquet whose bytes are then reaped).
-    ///   No row is left `building`.
+    /// - **A live writer is never touched.** The sweep visits only `building`
+    ///   rows whose writer lease is **absent or expired**
+    ///   ([`Catalog::list_expired_building_tables`]); a row under a live lease
+    ///   belongs to a writer in this or another process that is still
+    ///   producing it, and every status flip below is a compare-and-set
+    ///   carrying the same expired-lease predicate, so a writer that comes
+    ///   back mid-sweep and renews wins the row. This is esc-094's fix: a peer
+    ///   replica's restart no longer reaps a table another replica is seconds
+    ///   from finishing.
+    /// - **Reconciliation is terminal for a dead writer's row.** Each such row
+    ///   is driven to exactly one terminal state — `ready` if its bytes are a
+    ///   fully-valid closed Parquet whose manifest sidecar landed (promoted
+    ///   with the *true* footer row count, the ANN sidecar rebuilt from the
+    ///   Parquet so an embedding table self-heals even if its segment set never
+    ///   landed), `failed` otherwise (missing bytes, a torn/partial Parquet, or
+    ///   a valid Parquet with no manifest — the descriptor cannot be
+    ///   reconstructed).
+    /// - **Every deletion follows a one-row CAS.** The reaper deletes a row's
+    ///   objects only after its own `building → failed` CAS affected exactly
+    ///   one row; the promote arm first *claims* the row
+    ///   ([`Catalog::claim_expired_building_table`] — the recoverer becomes the
+    ///   writer, heartbeating a fresh lease) and only then rebuilds and
+    ///   promotes under that ownership. A failed delete is logged and left for
+    ///   reconcile, never swallowed.
     /// - **A promoted row's `row_count` is the truth on disk**, read from the
     ///   Parquet footer — never the count the writer *intended* before it
     ///   crashed.
     ///
     /// The sweep is idempotent: re-running it after it has reconciled every
-    /// `building` row is a no-op.
+    /// expired-lease `building` row is a no-op.
     ///
     /// # Cross-tenant scope
     ///
-    /// Recovery runs under [`crate::session::JammiSession::with_admin_scope`] so
-    /// it enumerates and reconciles `building` orphans owned by **every**
-    /// tenant, not only the (unscoped, GLOBAL) startup session's own rows. Each
-    /// promoted/failed row keeps its own `tenant_id`; the bypass is confined to
-    /// this sweep and clears the instant it returns.
+    /// Recovery runs under [`crate::session::JammiSession::with_admin_scope`]
+    /// — the one named implicit-admin pass — so it enumerates, reconciles, and
+    /// **deletes the bytes of** expired-lease `building` rows owned by
+    /// **every** tenant, not only the (unscoped, GLOBAL) startup session's own
+    /// rows, and it does so even when the store is bound to one tenant. Each
+    /// promoted/failed row keeps its own `tenant_id`; the bypass is confined
+    /// to this sweep and clears the instant it returns.
     ///
     /// # Durability boundary
     ///
@@ -668,13 +704,13 @@ impl ResultStore {
 
     /// The cross-tenant reconciliation loop, run inside [`Self::recover`]'s
     /// admin scope so the catalog enumeration and the per-row status flips both
-    /// see and write across every tenant's `building` rows.
+    /// see and write across every tenant's expired-lease `building` rows.
     async fn recover_inner(&self) -> Result<()> {
-        let building = self
-            .catalog
-            .list_result_tables_by_status(ResultTableStatus::Building)
-            .await?;
-        for table in building {
+        let now = lease_now();
+        let expired = self.catalog.list_expired_building_tables(&now).await?;
+        for table in expired {
+            let tenant = parse_owner(&table)?;
+            let cas = ResultTableCas::expired(&table.table_name, &now, tenant);
             let parquet_url = StorageUrl::parse(&table.parquet_path)?;
             let parquet_handle = self.open_parquet(&parquet_url)?;
             let parquet_path = parquet_handle.data_path()?;
@@ -687,32 +723,57 @@ impl ResultStore {
                     table = table.table_name,
                     "Recovery: Parquet missing, marking failed"
                 );
-                self.catalog
-                    .update_result_table_status(&table.table_name, ResultTableStatus::Failed, 0)
-                    .await?;
+                // No bytes to reap: the CAS is the whole arm. A miss means the
+                // writer renewed or a peer recoverer got here first — skip.
+                if let Err(e) = self.catalog.fail_building_table(&cas).await {
+                    if !is_cas_miss(&e) {
+                        return Err(e);
+                    }
+                    warn!(table = table.table_name, outcome = %e, "Recovery: row moved on; skipped");
+                }
             } else if !parquet_valid {
                 warn!(
                     table = table.table_name,
-                    "Recovery: invalid Parquet, deleting and marking failed"
+                    "Recovery: invalid Parquet, marking failed and deleting"
                 );
-                parquet_handle.delete_if_exists(&parquet_path).await.ok();
-                self.purge_segments(&table.table_name).await.ok();
-                self.catalog
-                    .update_result_table_status(&table.table_name, ResultTableStatus::Failed, 0)
-                    .await?;
+                self.reap_after_fail_cas(&cas, &parquet_url).await?;
             } else if let Some(manifest) = self.read_materialization_manifest(&parquet_url).await? {
                 // The manifest sidecar is present (written before the flip), so
                 // its summary columns can be backfilled as part of the same
-                // promotion the live path performs.
+                // promotion the live path performs. Claim the row FIRST — the
+                // recoverer becomes the writer, heartbeating a fresh lease —
+                // then rebuild and promote under that ownership.
+                let Some(recovered) = self.claim_expired(&cas, &table, tenant).await? else {
+                    warn!(table = table.table_name, "Recovery: claim lost; skipped");
+                    continue;
+                };
                 let row_count = storage::reader::count_parquet_rows(&parquet_handle).await?;
                 // Rebuild the ANN index as a fresh single segment if this is an
                 // embedding table (self-healing even if its segment set never
-                // landed, or landed torn).
+                // landed, or landed torn). Renew before the destructive purge;
+                // a renew miss abandons this arm silently (no deletion).
                 if table.task.is_embedding() {
+                    let renew = self
+                        .catalog
+                        .renew_lease(&recovered.cas(), &lease_deadline(self.lease.lease()))
+                        .await;
+                    if let Err(e) = renew {
+                        if !is_cas_miss(&e) {
+                            return Err(e);
+                        }
+                        warn!(table = table.table_name, outcome = %e, "Recovery: claim lost before rebuild; skipped");
+                        recovered.abandon();
+                        continue;
+                    }
                     if let Err(e) = self
-                        .rebuild_index_from_parquet(&parquet_handle, &table)
+                        .rebuild_index_from_parquet(&recovered, &parquet_handle, &table)
                         .await
                     {
+                        if is_cas_miss(&e) {
+                            warn!(table = table.table_name, outcome = %e, "Recovery: claim lost during rebuild; skipped");
+                            recovered.abandon();
+                            continue;
+                        }
                         warn!(
                             table = table.table_name,
                             error = %e,
@@ -722,14 +783,25 @@ impl ResultStore {
                 }
                 let anchors_json = serde_json::to_string(&manifest.input_anchors)
                     .map_err(|e| JammiError::Other(format!("serialise input anchors: {e}")))?;
-                self.catalog
+                let promoted = self
+                    .catalog
                     .promote_result_table_with_manifest(
-                        &table.table_name,
+                        &recovered.cas(),
                         row_count,
                         manifest.definition_hash.as_str(),
                         &anchors_json,
                     )
-                    .await?;
+                    .await;
+                // The row is terminal (or lost) under this recoverer either
+                // way: detach the handle so Drop marks nothing.
+                recovered.abandon();
+                match promoted {
+                    Ok(_) => {}
+                    Err(e) if is_cas_miss(&e) => {
+                        warn!(table = table.table_name, outcome = %e, "Recovery: promote superseded; skipped");
+                    }
+                    Err(e) => return Err(e),
+                }
             } else {
                 // Valid Parquet but NO manifest sidecar: the write was torn in
                 // the window between the Parquet landing and the manifest being
@@ -740,13 +812,9 @@ impl ResultStore {
                 warn!(
                     table = table.table_name,
                     "Recovery: valid Parquet but no materialization manifest \
-                     (torn write before manifest); deleting and marking failed"
+                     (torn write before manifest); marking failed and deleting"
                 );
-                parquet_handle.delete_if_exists(&parquet_path).await.ok();
-                self.purge_segments(&table.table_name).await.ok();
-                self.catalog
-                    .update_result_table_status(&table.table_name, ResultTableStatus::Failed, 0)
-                    .await?;
+                self.reap_after_fail_cas(&cas, &parquet_url).await?;
             }
         }
 
@@ -754,12 +822,73 @@ impl ResultStore {
         Ok(())
     }
 
+    /// Claim the expired-lease row `cas` names for this store's writer and
+    /// return the [`BuildingTable`] the recoverer now holds (heartbeat
+    /// running), or `None` when the claim matched zero rows — the writer
+    /// renewed, or a peer recoverer claimed first — in which case nothing was
+    /// written.
+    async fn claim_expired(
+        &self,
+        cas: &ResultTableCas,
+        table: &ResultTableRecord,
+        tenant: Option<TenantId>,
+    ) -> Result<Option<BuildingTable>> {
+        let until = lease_deadline(self.lease.lease());
+        if !self
+            .catalog
+            .claim_expired_building_table(cas, &self.writer_id, &until)
+            .await?
+        {
+            return Ok(None);
+        }
+        let parquet_url = StorageUrl::parse(&table.parquet_path)?;
+        Ok(Some(BuildingTable::adopt(
+            self.clone(),
+            table.table_name.clone(),
+            parquet_url,
+            tenant,
+            self.writer_id.to_string(),
+            table.storage_precision.unwrap_or_default(),
+            self.lease,
+        )))
+    }
+
+    /// The reaper's fail arm: the `building -> failed` CAS under `cas` FIRST,
+    /// then — only if it affected exactly one row — the row's objects are
+    /// deleted. A CAS miss (the writer renewed, or a peer got here first)
+    /// deletes nothing and is skipped. A failed delete is logged, never
+    /// swallowed into success: reconcile reaps the object later.
+    async fn reap_after_fail_cas(
+        &self,
+        cas: &ResultTableCas,
+        parquet_url: &StorageUrl,
+    ) -> Result<()> {
+        match self.catalog.fail_building_table(cas).await {
+            Ok(()) => {}
+            Err(e) if is_cas_miss(&e) => {
+                warn!(table = cas.table, outcome = %e, "Recovery: row moved on; nothing deleted");
+                return Ok(());
+            }
+            Err(e) => return Err(e),
+        }
+        if let Err(e) = self.delete_objects_after_cas(parquet_url, cas).await {
+            warn!(
+                table = cas.table,
+                error = %e,
+                "Recovery: object delete after the fail CAS did not complete; reconcile reaps it"
+            );
+        }
+        Ok(())
+    }
+
     /// Reconcile already-`ready` result tables against the materialization
     /// contract: a post-contract row (one whose catalog `definition_hash` is
     /// set, so it was promoted under the contract) whose `.materialization.json`
     /// sidecar is now absent is a corruption — the attestation a verifier would
-    /// read is gone. Such a row is driven to `failed` and its bytes reaped,
-    /// rather than left queryable with a silently-missing manifest.
+    /// read is gone. Such a row is driven to `failed` by a `status = 'ready'`
+    /// compare-and-set and, only after that CAS affected one row, its bytes
+    /// are reaped — rather than left queryable with a silently-missing
+    /// manifest.
     ///
     /// A **pre-contract** row (catalog `definition_hash IS NULL`, created before
     /// migration 021) legitimately has no sidecar; it is left untouched and
@@ -786,14 +915,30 @@ impl ResultStore {
             warn!(
                 table = table.table_name,
                 "Recovery: post-contract ready table is missing its materialization \
-                 manifest sidecar; deleting and marking failed"
+                 manifest sidecar; marking failed and deleting"
             );
-            let data_path = handle.data_path()?;
-            handle.delete_if_exists(&data_path).await.ok();
-            self.purge_segments(&table.table_name).await.ok();
-            self.catalog
-                .update_result_table_status(&table.table_name, ResultTableStatus::Failed, 0)
-                .await?;
+            if !self
+                .catalog
+                .fail_ready_result_table(&table.table_name)
+                .await?
+            {
+                warn!(
+                    table = table.table_name,
+                    "Recovery: ready row moved on; nothing deleted"
+                );
+                continue;
+            }
+            // A `ready` row carries no lease, so the expired-lease owner arm
+            // names it for the segment purge.
+            let cas =
+                ResultTableCas::expired(&table.table_name, &lease_now(), parse_owner(&table)?);
+            if let Err(e) = self.delete_objects_after_cas(&parquet_url, &cas).await {
+                warn!(
+                    table = table.table_name,
+                    error = %e,
+                    "Recovery: object delete after the fail CAS did not complete; reconcile reaps it"
+                );
+            }
         }
         Ok(())
     }
@@ -959,59 +1104,59 @@ impl ResultStore {
     }
 
     /// Persist a fully-built [`SidecarIndex`] as a NEW immutable segment of
-    /// `table`'s ANN index and register it, returning the allocated
-    /// [`SegmentId`]. Existing segments are untouched — the index's row-set
-    /// grows without any graph rebuild.
+    /// `building`'s ANN index and register it under the writer's ownership,
+    /// returning the allocated [`SegmentId`]. Existing segments are untouched
+    /// — the index's row-set grows without any graph rebuild.
     ///
     /// The id is allocated by reading the current maximum and inserting at
     /// `max + 1` (or `0` for the first segment), retrying on the
     /// `(table_name, segment_id)` primary-key collision a concurrent appender
     /// racing to the same next id would cause — the segment bundle's URL
-    /// (`{table}__seg{N}.idx`) embeds the id, so allocation and URL derivation
-    /// share this loop rather than a single non-atomic `INSERT … SELECT MAX+1`.
-    /// The catalog row is inserted first (reserving the id) and the bundle saved
-    /// second, so a save failure leaves a segment row whose bundle is absent —
-    /// [`Self::resolve_search_mode`] then falls the whole table back to exact,
-    /// and recovery rebuilds the set — never a silently missing row.
+    /// (`{table}__seg{N}.idx`, a sibling of the row's Parquet) embeds the id,
+    /// so allocation and URL derivation share this loop rather than a single
+    /// non-atomic `INSERT … SELECT MAX+1`. The catalog row is inserted first
+    /// (reserving the id, in the same transaction as the writer's lease
+    /// check) and the bundle saved second, so a save failure leaves a segment
+    /// row whose bundle is absent — [`Self::resolve_search_mode`] then falls
+    /// the whole table back to exact, and recovery rebuilds the set — never a
+    /// silently missing row.
     ///
-    /// The index's own precision **must** equal `table`'s persisted
-    /// `storage_precision`: a segment built at the deployment default after that
-    /// default drifted from the table's promise would be caught only at load
-    /// time as a hard failure, so it is rejected here instead. The segment
-    /// inherits the table's owning tenant.
+    /// The index's own precision **must** equal the row's persisted
+    /// `storage_precision`: a segment built at the deployment default after
+    /// that default drifted from the table's promise would be caught only at
+    /// load time as a hard failure, so it is rejected here instead. The
+    /// segment inherits the table's owning tenant from the row.
     pub async fn append_segment(
         &self,
-        table: &ResultTableRecord,
+        building: &BuildingTable,
         index: &SidecarIndex,
     ) -> Result<SegmentId> {
-        let precision = table.storage_precision.unwrap_or_default();
+        let precision = building.storage_precision();
         if index.storage_precision() != precision {
             return Err(JammiError::Other(format!(
                 "append_segment: index built at {:?} but table '{}' is persisted at {:?} — \
                  a segment must match its table's precision",
                 index.storage_precision(),
-                table.table_name,
+                building.table_name(),
                 precision
             )));
         }
-        let tenant = table
-            .tenant_id
-            .as_deref()
-            .map(TenantId::from_str)
-            .transpose()
-            .map_err(|e| JammiError::Other(format!("append_segment: invalid tenant_id: {e}")))?;
         let row_count = index.len();
+        let cas = building.cas();
 
         loop {
             let next = self
                 .catalog
-                .max_index_segment_id(&table.table_name)
+                .max_index_segment_id(building.table_name())
                 .await?
                 .map_or(0, |m| m + 1);
-            let seg_url = self.derive_url(&format!("{}__seg{next}.idx", table.table_name))?;
+            let seg_url = sibling_url(
+                building.parquet_url(),
+                &format!("{}__seg{next}.idx", building.table_name()),
+            )?;
             if self
                 .catalog
-                .insert_index_segment(&table.table_name, tenant, next, seg_url.as_str(), row_count)
+                .insert_index_segment(&cas, next, seg_url.as_str(), row_count)
                 .await?
             {
                 self.save_sidecar(&seg_url, index).await?;
@@ -1030,32 +1175,53 @@ impl ResultStore {
     }
 
     /// Best-effort delete of every segment bundle in a table's ANN index set
-    /// **and** the segment catalog rows. 404 is not an error — the caller may be
-    /// paving over already-cleaned state. Enumerates the set from the catalog,
-    /// so it must run *before* the `result_tables` row is deleted (the
-    /// `ON DELETE CASCADE` on `index_segments` would otherwise reap the rows
-    /// first and hide the bundle URLs).
-    async fn purge_segments(&self, table_name: &str) -> Result<()> {
-        for seg in self.catalog.list_index_segments(table_name).await? {
+    /// **and** the segment catalog rows, under the ownership `cas` names. 404
+    /// is not an error — the caller may be paving over already-cleaned state.
+    /// Enumerates the set from the catalog, so it must run *before* the
+    /// `result_tables` row is deleted (the `ON DELETE CASCADE` on
+    /// `index_segments` would otherwise reap the rows first and hide the
+    /// bundle URLs).
+    async fn purge_segments(&self, cas: &ResultTableCas) -> Result<()> {
+        for seg in self.catalog.list_index_segments(&cas.table).await? {
             let url = StorageUrl::parse(&seg.index_path)?;
             let handle = self.open_index(&url)?;
             storage::sidecar_layout::delete_sidecar(&handle, SidecarKind::Ann).await?;
         }
-        self.catalog.delete_index_segments(table_name).await?;
+        self.catalog.delete_index_segments(cas).await?;
         Ok(())
     }
 
-    /// Best-effort delete of a result-table's parquet object + its whole ANN
-    /// segment set (bundles and catalog rows). 404 is not an error. Enumerates
-    /// the segment set from the catalog, so it must run *before* the table's
-    /// `result_tables` row is removed.
-    pub async fn delete_table_files(&self, table: &ResultTableRecord) -> Result<()> {
-        let parquet_url = StorageUrl::parse(&table.parquet_path)?;
-        let parquet_handle = self.open_parquet(&parquet_url)?;
+    /// Delete a result table's objects — the Parquet, its
+    /// `.materialization.json` sidecar, and its whole ANN segment set (bundles
+    /// and catalog rows) — under the ownership `cas` names. One of the three
+    /// deletion arms' second half: the caller has ALREADY performed the
+    /// one-row CAS (a writer's own `abort`, or the reaper's fail CAS) that
+    /// licenses this deletion. 404 is not an error.
+    pub(crate) async fn delete_objects_after_cas(
+        &self,
+        parquet_url: &StorageUrl,
+        cas: &ResultTableCas,
+    ) -> Result<()> {
+        let parquet_handle = self.open_parquet(parquet_url)?;
         let path = parquet_handle.data_path()?;
         parquet_handle.delete_if_exists(&path).await?;
-        self.purge_segments(&table.table_name).await?;
+        let sidecar = materialization_sidecar_path(&parquet_handle)?;
+        parquet_handle.delete_if_exists(&sidecar).await?;
+        self.purge_segments(cas).await?;
         Ok(())
+    }
+
+    /// Best-effort delete of a terminal result-table's parquet object, its
+    /// manifest sidecar, and its whole ANN segment set (bundles and catalog
+    /// rows). 404 is not an error. Enumerates the segment set from the
+    /// catalog, so it must run *before* the table's `result_tables` row is
+    /// removed. The row must carry no live lease (a `ready` / `failed` row,
+    /// or a `building` row whose writer is dead) — a live writer's table is
+    /// never deleted from under it.
+    pub async fn delete_table_files(&self, table: &ResultTableRecord) -> Result<()> {
+        let parquet_url = StorageUrl::parse(&table.parquet_path)?;
+        let cas = ResultTableCas::expired(&table.table_name, &lease_now(), parse_owner(table)?);
+        self.delete_objects_after_cas(&parquet_url, &cas).await
     }
 
     /// Derive a child URL under the result-store root for an artifact name.
@@ -1070,11 +1236,12 @@ impl ResultStore {
     }
 
     /// Rebuild a table's whole ANN index from its Parquet as a single fresh
-    /// segment. Used by the recovery path: it discards any stale segment set the
-    /// crashed attempt left (bundles and catalog rows) and writes one
-    /// authoritative segment `0` over every Parquet row, so a recovered table's
-    /// index exactly covers its data regardless of how many segments the
-    /// interrupted write had produced.
+    /// segment, under the recoverer's ownership of the row (`recovered`). Used
+    /// by the recovery path: it discards any stale segment set the crashed
+    /// attempt left (bundles and catalog rows) and writes one authoritative
+    /// segment `0` over every Parquet row, so a recovered table's index exactly
+    /// covers its data regardless of how many segments the interrupted write
+    /// had produced.
     ///
     /// The precision is the table's own persisted
     /// `ResultTableRecord::storage_precision` — **never** today's deployment
@@ -1083,6 +1250,7 @@ impl ResultStore {
     /// recall (a graph a caller believes is `Int8` reopened as `F32`).
     async fn rebuild_index_from_parquet(
         &self,
+        recovered: &BuildingTable,
         parquet_handle: &JammiObjectStore,
         table: &ResultTableRecord,
     ) -> Result<()> {
@@ -1091,8 +1259,9 @@ impl ResultStore {
             return Ok(());
         }
 
-        // Replace any stale segment set from the interrupted attempt.
-        self.purge_segments(&table.table_name).await?;
+        // Replace any stale segment set from the interrupted attempt — a
+        // deletion, so it runs under the claim the recoverer just took.
+        self.purge_segments(&recovered.cas()).await?;
 
         let precision = table.storage_precision.unwrap_or_default();
         let batches = storage::reader::read_all_record_batches(parquet_handle).await?;
@@ -1122,7 +1291,7 @@ impl ResultStore {
 
         if index.len() > 0 {
             index.build()?;
-            self.append_segment(table, &index).await?;
+            recovered.append_segment(&index).await?;
         }
         Ok(())
     }
@@ -1165,7 +1334,7 @@ impl ResultStore {
         // task is the embedding task that drives the sidecar-index sidecar URL.
         // The physical key stays `_row_id` (the output schema is invariant);
         // `key_column` / `text_columns` are the caller's source-side provenance.
-        let table_info = self
+        let building = self
             .create_table(
                 source_id,
                 ModelTask::TextEmbedding,
@@ -1178,27 +1347,17 @@ impl ResultStore {
             )
             .await?;
 
-        // The building row now carries this table's persisted precision; the
-        // segment is built at THAT precision (B4), read back off the row rather
-        // than re-derived from `self.ann` — for a fresh table the two agree, but
-        // reading the row is the uniform, drift-proof source `append_segment`'s
-        // own guard checks against.
-        let record = self
-            .catalog
-            .get_result_table(&table_info.table_name)
-            .await?
-            .ok_or_else(|| {
-                JammiError::Catalog(format!(
-                    "Result table '{}' not found after creation",
-                    table_info.table_name
-                ))
-            })?;
-        let precision = record.storage_precision.unwrap_or_default();
+        // The building row carries this table's persisted precision; the
+        // segment is built at THAT precision (B4), read back off the handle
+        // (which captured the stamped value) rather than re-derived from
+        // `self.ann` — the uniform, drift-proof source `append_segment`'s own
+        // guard checks against.
+        let precision = building.storage_precision();
 
         let schema = crate::store::schema::embedding_table_schema(dimensions);
         let batch = embedding_batch(&schema, source_id, model_id, rows, dimensions)?;
 
-        let mut writer = self.open_writer(&table_info.parquet_url, schema).await?;
+        let mut writer = self.open_writer(building.parquet_url(), schema).await?;
         let mut index = SidecarIndex::new(dimensions, &self.ann, precision)?;
         if !rows.is_empty() {
             writer.write_batch(&batch).await?;
@@ -1210,27 +1369,13 @@ impl ResultStore {
 
         if index.len() > 0 {
             index.build()?;
-            self.append_segment(&record, &index).await?;
+            building.append_segment(&index).await?;
         }
 
-        self.finalize_with_manifest(
-            ctx,
-            &table_info.table_name,
-            &table_info.parquet_url,
-            row_count,
-            materialization,
-        )
-        .await?;
-
-        self.catalog
-            .get_result_table(&table_info.table_name)
-            .await?
-            .ok_or_else(|| {
-                JammiError::Catalog(format!(
-                    "Result table '{}' not found after materialisation",
-                    table_info.table_name
-                ))
-            })
+        // Every `?` above unwinds through `BuildingTable`'s Drop (a best-effort
+        // `building -> failed` CAS, no byte deletion); `finish` is the single
+        // `building -> ready` funnel.
+        building.finish(ctx, row_count, materialization).await
     }
 
     /// Materialize consumer-computed, in-memory vectors as a ready, searchable
@@ -1399,6 +1544,46 @@ fn content_digest(rows: &[(String, Vec<f32>)]) -> String {
 fn run_id() -> &'static str {
     static RUN_ID: std::sync::OnceLock<String> = std::sync::OnceLock::new();
     RUN_ID.get_or_init(|| uuid::Uuid::new_v4().simple().to_string())
+}
+
+/// A sibling URL of a result table's Parquet object: the same parent prefix,
+/// a different object name. Every sidecar and segment key derives from the
+/// row's own `parquet_path` this way — never from the store's current root —
+/// so a table's objects stay co-located however the root moves.
+fn sibling_url(parquet_url: &StorageUrl, name: &str) -> Result<StorageUrl> {
+    let s = parquet_url.as_str();
+    let (parent, _) = s.rsplit_once('/').ok_or_else(|| {
+        JammiError::Config(format!("result-table URL '{s}' has no parent prefix"))
+    })?;
+    Ok(StorageUrl::parse(&format!("{parent}/{name}"))?)
+}
+
+/// The tenant a `result_tables` row carries, parsed (`None` for GLOBAL).
+fn parse_owner(table: &ResultTableRecord) -> Result<Option<TenantId>> {
+    table
+        .tenant_id
+        .as_deref()
+        .map(TenantId::from_str)
+        .transpose()
+        .map_err(|e| {
+            JammiError::Other(format!(
+                "result table '{}': invalid tenant_id: {e}",
+                table.table_name
+            ))
+        })
+}
+
+/// Whether `e` is one of the four typed outcomes of a building-row CAS that
+/// matched zero rows — the signal a recovery arm skips on (it never deletes
+/// after a miss) rather than propagates.
+fn is_cas_miss(e: &JammiError) -> bool {
+    matches!(
+        e,
+        JammiError::RowGone { .. }
+            | JammiError::TenantMismatch { .. }
+            | JammiError::LeaseLost { .. }
+            | JammiError::CasFailed { .. }
+    )
 }
 
 /// The `.materialization.json` sidecar path beside a result table's Parquet

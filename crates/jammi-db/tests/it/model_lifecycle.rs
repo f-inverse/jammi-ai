@@ -165,6 +165,8 @@ async fn delete_blocked_by_result_table_name_edge(backend: BackendKind) {
     register_source(&cat, "src").await;
     // result_tables.model_id stores the model NAME.
     cat.create_result_table(CreateResultTableParams {
+        writer_id: None,
+        lease_expires_at: None,
         table_name: "acme_embeddings",
         source_id: "src",
         model_id: "acme/embed-mini",
@@ -384,6 +386,8 @@ async fn delete_blocked_under_volume(backend: BackendKind) {
         // An unrelated result table per model, exercising the no-FK name edge at
         // volume without referencing the target.
         cat.create_result_table(CreateResultTableParams {
+            writer_id: None,
+            lease_expires_at: None,
             table_name: &format!("acme_rt_{i}"),
             source_id: "src",
             model_id: &base_name,
@@ -408,6 +412,8 @@ async fn delete_blocked_under_volume(backend: BackendKind) {
         .await
         .unwrap();
     cat.create_result_table(CreateResultTableParams {
+        writer_id: None,
+        lease_expires_at: None,
         table_name: "acme_target_rt",
         source_id: "src",
         model_id: "acme/target",

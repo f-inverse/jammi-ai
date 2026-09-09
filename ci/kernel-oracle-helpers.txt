@@ -57,6 +57,7 @@ crates/jammi-db/tests/it/catalog_ping.rs::require_live_pg
 crates/jammi-db/tests/it/eval_per_query.rs::require_live_pg
 crates/jammi-db/tests/it/materialization_crash_recovery.rs::crash_recovery_child_dispatch_require_gate
 crates/jammi-db/tests/it/mutable_crash_recovery.rs::crash_recovery_child_dispatch_require_gate
+crates/jammi-db/tests/it/migrations.rs::require_live_pg
 crates/jammi-db/tests/it/mutable_federation.rs::require_live_pg
 crates/jammi-db/tests/it/recovery.rs::require_live_pg
 crates/jammi-db/tests/it/segment.rs::require_live_pg

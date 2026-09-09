@@ -494,7 +494,7 @@ Every trait/enum/base surface a maintainer extends, with anchors and invariants.
   `true` (default `true`); **not** the unconditional `with_embedded_worker`
   form. This is the SAME key the server `train` tier and the Python embedded
   arm read before deciding whether THEIR process claims —
-  `training.run_worker` (`crates/jammi-server/src/runtime.rs:1020`) and
+  `training.run_worker` (`crates/jammi-server/src/runtime.rs:1024`) and
   `training.run_worker` (`crates/jammi-python/src/database.rs:98`) — so a wire
   deployment and an in-process one answer "does THIS process claim?"
   identically rather than by three private conventions. `Target`
@@ -1200,7 +1200,7 @@ governance decides coverage.
 `spine`/`facts` to physical scans (`scan_relation`) → `SortExec` each by `(by…,
 time[, tie-break])` ascending (`sort_for_merge`) → plan `AsofJoinExec`
 (`crates/jammi-ai/src/pipeline/asof/exec.rs`) → single-pointer sort-merge
-(`crates/jammi-ai/src/pipeline/asof/merge.rs`) → `finalize_with_manifest` with a
+(`crates/jammi-ai/src/pipeline/asof/merge.rs`) → `BuildingTable::finish` with a
 typed `ProducingDescriptor::AsofJoin` + an input anchor for **both** relations
 (`crates/jammi-ai/src/pipeline/asof/verb.rs`). Left rows are always preserved;
 unmatched fact columns are null. The result `model_id` is a sentinel `"asof-join"`
@@ -1237,7 +1237,7 @@ temporal join.
 tenant-scoped via the catalog resolution at the gRPC seam): read the named table's
 recorded `ProducingDescriptor` (`recompute_one`/`replay_descriptor`), reconstruct the
 producing verb call from its typed parameters, and replay it through the **unmodified
-`finalize_with_manifest` funnel** with `CachePolicy::Bypass` (a recompute that reused
+`BuildingTable::finish` funnel** with `CachePolicy::Bypass` (a recompute that reused
 a cache would be a no-op). Byte-identical when inputs haven't moved (the descriptor
 records every output-affecting determinant). A pre-contract table with no descriptor
 is the typed `JammiError::NotRecomputable` — a loud refusal, never a re-run guessed
@@ -1354,7 +1354,7 @@ This is the engine's point-in-time-correctness primitive, and it is LIVE on ever
 surface. Unlike the dormant conformal wrap of §2.4c, `asof_join` reaches code from
 gRPC, the Python binding, *and* the recompute replay path; and it is the first compute
 verb that writes through the **materialization contract** funnel
-(`finalize_with_manifest`) — every result table carries a verifiable
+(`BuildingTable::finish`) — every result table carries a verifiable
 `.materialization.json` attestation, and `asof_join` is the worked example the
 cookbook documents (`cookbook/book/chapters/19-point-in-time/point-in-time.qmd`). The
 two ship together: `asof_join` produces a leakage-free table, `verify_materialization`
@@ -1471,8 +1471,8 @@ attest:
    the neighbor-graph sentinel — the join invokes no model but the column is NOT NULL).
    `derived_from` is `None`: the inputs are registered *sources*, not result tables, so
    FK-lineage rides the manifest's input anchors instead.
-5. **Attest** through `finalize_with_manifest`
-   (`crates/jammi-ai/src/pipeline/asof/verb.rs` → `crates/jammi-db/src/store/mod.rs`) —
+5. **Attest** through `BuildingTable::finish`
+   (`crates/jammi-ai/src/pipeline/asof/verb.rs` → `crates/jammi-db/src/store/building.rs`) —
    the single materialization funnel. The contract: a typed
    `ProducingDescriptor::AsofJoin` (`descriptor_for`, mapping the AI-crate enums to the
    transport-neutral manifest mirrors), a `MaterializationEnv` with an **empty model
@@ -1575,7 +1575,7 @@ as committed golden contracts.
   (`crates/jammi-ai/src/wire/pipeline.rs`). The knob must move the definition hash —
   `asof_join_each_knob_moves_the_hash` (`crates/jammi-db/src/store/manifest.rs`) is the
   guard test.
-- **New materialized producer (any verb):** write through `finalize_with_manifest` with a
+- **New materialized producer (any verb):** write through `BuildingTable::finish` with a
   new `ProducingDescriptor` variant (`crates/jammi-db/src/store/manifest.rs`) carrying
   every output-affecting parameter, and honest `InputAnchor`s for every input read. Bump
   `MANIFEST_VERSION` (`crates/jammi-db/src/store/manifest.rs`) if the descriptor's
@@ -1794,7 +1794,7 @@ variant (`crates/jammi-db/src/store/manifest.rs`) with **every** output-affectin
 determinant (floats by bit pattern); (2) probing at the top of the verb (`if cache ==
 CachePolicy::Use { … probe_cache_record(&def_hash, &inputs) … return Reused }`, the
 `EmbeddingPipeline::run` shape, `crates/jammi-ai/src/pipeline/embedding.rs`) and returning
-`(record, CacheOutcome)`; (3) writing through `finalize_with_manifest` with the *same*
+`(record, CacheOutcome)`; (3) writing through `BuildingTable::finish` with the *same*
 `(descriptor, env, inputs)` the probe keyed on; (4) adding a `replay_descriptor` arm that
 calls the producer with `CachePolicy::Bypass` and the matching `*_from_manifest`
 reverse-mappers. Anchor immutable result-table inputs as `ResultDigest` (cacheable) and raw

@@ -167,6 +167,18 @@ jobs:
           # machine or a pod — never for this heterogeneous hosted lane.
         run: cargo test --workspace --exclude jammi-python
 
+      # The `test-hooks` lane: the named result-table lifecycle points
+      # (`store/mutable/test_hook.rs`) are compiled only under this feature, so
+      # the esc-094 two-writer oracles (`tests/it/recovery.rs::
+      # live_writer_survives_peer_recover_*`, a live writer parked at a point
+      # while a peer session's `recover()` sweeps beside it) and the two SIGKILL
+      # crash harnesses (`materialization_crash_recovery.rs`,
+      # `mutable_crash_recovery.rs`) run only here. Not a self dev-dependency:
+      # that would unify the feature into every workspace test build.
+      # `--test-threads=1` because the SIGKILL harnesses respawn this binary.
+      - name: Run tests (test-hooks lane)
+        run: cargo test -p jammi-db --features test-hooks --test it -- --test-threads=1
+
       # The chmod fault-injection probes above ran as root (this container's
       # default user, per `.docker/ci.Dockerfile`'s missing `USER`), where
       # `JAMMI_REQUIRE_POSIX_PERMS` is deliberately unset: root bypasses
@@ -1094,6 +1106,9 @@ jobs:
         # `--test-threads=1` keeps that contract; the suite is small.
         run: |
           cargo test -p jammi-db --features live-postgres-tests --test it -- --test-threads=1
+          # The same suite with the test-hooks points compiled in: the esc-094
+          # two-writer oracles' Postgres arms and the SIGKILL crash harnesses.
+          cargo test -p jammi-db --features live-postgres-tests,test-hooks --test it -- --test-threads=1
 
   # Hermetic script-guard class: every leg here is the same shape (plain
   # ubuntu, checkout, run one hermetic script — no toolchain, no container,

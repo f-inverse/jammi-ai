@@ -161,12 +161,16 @@ impl OssServer {
             .server
             .validate()
             .map_err(|e| ServerError::Config(e.to_string()))?;
-        // Reject training timing that violates the worker invariants (heartbeat
-        // margin / non-zero poll) at construction, before the train tier spawns
-        // its worker.
+        // Reject lease timing that violates the heartbeat margin, or a
+        // training poll that is a busy-loop, at construction — before the
+        // train tier spawns its worker or a result table is leased.
+        let lease = config
+            .lease
+            .intervals()
+            .map_err(|e| ServerError::Config(e.to_string()))?;
         config
             .training
-            .worker_intervals()
+            .worker_intervals(lease)
             .map_err(|e| ServerError::Config(e.to_string()))?;
 
         let flight_addr: SocketAddr = config.server.flight_listen.parse()?;

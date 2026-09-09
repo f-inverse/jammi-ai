@@ -4,6 +4,7 @@ use std::str::FromStr;
 
 use serde::{Deserialize, Serialize};
 
+pub use crate::catalog::lease::LeaseIntervals;
 use crate::error::{JammiError, Result};
 use crate::storage::CloudConfig;
 
@@ -173,8 +174,12 @@ pub struct JammiConfig {
     pub embedding: EmbeddingConfig,
     /// Fine-tuning hyperparameter defaults.
     pub fine_tuning: FineTuningConfig,
+    /// The one lease timing every leased catalog row shares: how long a claim
+    /// (a training job, a building result table) is owned before it is
+    /// reclaimable, and how often its holder renews it.
+    pub lease: LeaseConfig,
     /// Training-worker settings: whether this process runs the claim loop, and
-    /// the lease/heartbeat/poll timing it runs it with.
+    /// how often an idle worker polls for work.
     pub training: TrainingConfig,
     /// Cache layer settings (ANN cache, embedding cache).
     pub cache: CacheConfig,
@@ -656,27 +661,116 @@ pub struct FineTuningConfig {
     pub checkpoint_fraction: f64,
 }
 
-/// Training-worker settings: whether this process runs the claim loop at all,
-/// and — when it does — how long a claim leases a job, how often the worker
-/// renews that lease, and how often an idle worker polls for new work.
+/// The one lease timing every leased catalog row shares — a claimed training
+/// job and a `building` result table are both owned under a lease their holder
+/// heartbeats, and both are reclaimed by a sweep once it expires.
 ///
-/// The three timings are seconds. Defaults reproduce the engine's built-in
-/// timing (30 s lease, 10 s heartbeat, 1 s idle poll) with the claim loop on,
-/// so a config without a `[training]` section behaves identically to one that
-/// omits it. Short values let a deployment (or a test) drive lease-expiry and
-/// reclaim quickly.
+/// Both values are seconds. Defaults reproduce the engine's built-in timing
+/// (30 s lease, 10 s heartbeat), so a config without a `[lease]` section behaves
+/// identically to one that omits it. Short values let a deployment (or a test)
+/// drive lease-expiry and reclaim quickly.
+///
+/// # TOML
+///
+/// ```toml
+/// [lease]
+/// duration_secs = 30
+/// heartbeat_secs = 10
+/// ```
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct LeaseConfig {
+    /// How long a claim owns its row before it is considered orphaned and
+    /// reclaimable. Default: 30.
+    pub duration_secs: u64,
+    /// How often the holder renews the lease. Must leave a real margin under
+    /// `duration_secs` (see [`Self::intervals`]) so a single missed beat does
+    /// not drop a live holder's lease. Default: 10.
+    pub heartbeat_secs: u64,
+}
+
+impl Default for LeaseConfig {
+    fn default() -> Self {
+        Self {
+            duration_secs: 30,
+            heartbeat_secs: 10,
+        }
+    }
+}
+
+impl LeaseConfig {
+    /// Resolve the typed [`LeaseIntervals`] this timing implies, enforcing the
+    /// lease invariants:
+    ///
+    /// - both values non-zero;
+    /// - `heartbeat_secs * 2 < duration_secs` — the heartbeat must leave a real
+    ///   margin under the lease (a live holder beats at least twice within one
+    ///   lease, so a single missed beat still leaves one in-window renewal that
+    ///   lands strictly before the lease expires — never coincident with
+    ///   expiry, which would race a reclaim).
+    ///
+    /// Returns [`JammiError::Config`] with a clear message on a violation. The
+    /// engine never silently clamps a bad value, and no operator-supplied `u64`
+    /// can overflow the margin check — an absurd heartbeat is rejected, not
+    /// wrapped.
+    pub fn intervals(&self) -> Result<LeaseIntervals> {
+        use std::time::Duration;
+
+        if self.heartbeat_secs == 0 {
+            return Err(JammiError::Config(
+                "lease.heartbeat_secs must be > 0".into(),
+            ));
+        }
+        if self.duration_secs == 0 {
+            return Err(JammiError::Config("lease.duration_secs must be > 0".into()));
+        }
+        // Overflow-safe strict margin: `heartbeat * 2 < lease`. The doubled
+        // heartbeat overflowing `u64` is itself a rejection (any such value
+        // dwarfs any finite lease), so the multiply never wraps or panics.
+        if self
+            .heartbeat_secs
+            .checked_mul(2)
+            .is_none_or(|hb2| hb2 >= self.duration_secs)
+        {
+            return Err(JammiError::Config(format!(
+                "lease.heartbeat_secs ({}) must be strictly under half of \
+                 lease.duration_secs ({}): the heartbeat must leave a real margin \
+                 under the lease so a live holder renews strictly before the lease expires, \
+                 or its claim is spuriously reclaimed mid-flight",
+                self.heartbeat_secs, self.duration_secs
+            )));
+        }
+        Ok(LeaseIntervals::new_validated(
+            Duration::from_secs(self.duration_secs),
+            Duration::from_secs(self.heartbeat_secs),
+        ))
+    }
+}
+
+/// Training-worker settings: whether this process runs the claim loop at all,
+/// and — when it does — how often an idle worker polls for new work. The lease
+/// a claim is held under and the heartbeat that renews it are the deployment's
+/// one [`LeaseConfig`], shared with every other leased row.
+///
+/// Defaults reproduce the engine's built-in timing (1 s idle poll) with the
+/// claim loop on, so a config without a `[training]` section behaves
+/// identically to one that omits it.
+///
+/// The section rejects unknown keys. In particular the former
+/// `lease_duration_secs` / `heartbeat_interval_secs` keys moved to `[lease]`
+/// as `duration_secs` / `heartbeat_secs`; a TOML still naming them under
+/// `[training]` is a hard load error, never a silent fall-back to the default
+/// timing.
 ///
 /// # TOML
 ///
 /// ```toml
 /// [training]
 /// run_worker = true
-/// lease_duration_secs = 30
-/// heartbeat_interval_secs = 10
 /// idle_poll_secs = 1
 /// ```
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
-#[serde(default)]
+#[serde(default, deny_unknown_fields)]
 pub struct TrainingConfig {
     /// Whether THIS process runs the training claim loop at all. Default: `true`.
     ///
@@ -697,17 +791,10 @@ pub struct TrainingConfig {
     /// in-process answer the question identically. Turning it off never
     /// removes the submission surface — only the claiming.
     ///
-    /// The timings below describe the loop this flag gates; they are validated
-    /// by [`Self::worker_intervals`] regardless of `run_worker`, so a config
-    /// that switches the loop on later cannot smuggle in bad timing.
+    /// The poll below describes the loop this flag gates; it is validated by
+    /// [`Self::worker_intervals`] regardless of `run_worker`, so a config that
+    /// switches the loop on later cannot smuggle in bad timing.
     pub run_worker: bool,
-    /// How long a claim leases a job before it is considered orphaned and
-    /// reclaimable. Default: 30.
-    pub lease_duration_secs: u64,
-    /// How often the worker renews the lease while a job runs. Must leave a real
-    /// margin under `lease_duration_secs` (see [`Self::worker_intervals`]) so a
-    /// single missed beat does not drop a live worker's lease. Default: 10.
-    pub heartbeat_interval_secs: u64,
     /// How often an idle worker polls for a queued job (and reclaims expired
     /// leases). Must be non-zero — a zero poll is a busy-loop. Default: 1.
     pub idle_poll_secs: u64,
@@ -719,8 +806,6 @@ impl Default for TrainingConfig {
             // Default on: an unconfigured deployment is a whole one — it both
             // accepts jobs and works them. Opting out is the explicit act.
             run_worker: true,
-            lease_duration_secs: 30,
-            heartbeat_interval_secs: 10,
             idle_poll_secs: 1,
         }
     }
@@ -728,9 +813,9 @@ impl Default for TrainingConfig {
 
 /// The validated, typed training-worker timing the worker drives its loop with.
 ///
-/// `lease` is the single source of truth for the lease window: the worker passes
-/// the same value to both its claim and its heartbeat, so the renew always
-/// targets the same deadline the reclaim path compares against. The constructor
+/// `lease` and `heartbeat` are the deployment's [`LeaseIntervals`] — the single
+/// source of truth for the lease window, so the worker's renew always targets
+/// the same deadline the reclaim path compares against. The constructor
 /// [`TrainingConfig::worker_intervals`] is the only way to build one, so the
 /// margin and non-zero-poll invariants hold by construction.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -744,55 +829,24 @@ pub struct WorkerIntervals {
 }
 
 impl TrainingConfig {
-    /// Resolve the typed [`WorkerIntervals`] this timing implies, enforcing the
-    /// two worker invariants:
-    ///
-    /// - `heartbeat_interval_secs * 2 < lease_duration_secs` — the heartbeat
-    ///   must leave a real margin under the lease (a live worker beats at least
-    ///   twice within one lease, so a single missed beat still leaves one
-    ///   in-window renewal that lands strictly before the lease expires — never
-    ///   coincident with expiry, which would race an idle-polling worker's
-    ///   reclaim). A zero heartbeat is rejected here too (it never clears the
-    ///   margin against any finite lease).
-    /// - `idle_poll_secs >= 1` — a zero idle poll is a busy-loop.
+    /// Resolve the typed [`WorkerIntervals`] this timing implies over the
+    /// deployment's validated `lease`, enforcing the worker's own invariant:
+    /// `idle_poll_secs >= 1` — a zero idle poll is a busy-loop. The lease
+    /// margin was already enforced by [`LeaseConfig::intervals`].
     ///
     /// Returns [`JammiError::Config`] with a clear message on a violation. The
-    /// engine never silently clamps a bad value, and no operator-supplied `u64`
-    /// can overflow the margin check — an absurd heartbeat is rejected, not
-    /// wrapped.
-    pub fn worker_intervals(&self) -> Result<WorkerIntervals> {
+    /// engine never silently clamps a bad value.
+    pub fn worker_intervals(&self, lease: LeaseIntervals) -> Result<WorkerIntervals> {
         use std::time::Duration;
 
-        if self.heartbeat_interval_secs == 0 {
-            return Err(JammiError::Config(
-                "training.heartbeat_interval_secs must be > 0".into(),
-            ));
-        }
         if self.idle_poll_secs == 0 {
             return Err(JammiError::Config(
                 "training.idle_poll_secs must be > 0 (a zero poll is a busy-loop)".into(),
             ));
         }
-        // Overflow-safe strict margin: `heartbeat * 2 < lease`. The doubled
-        // heartbeat overflowing `u64` is itself a rejection (any such value
-        // dwarfs any finite lease), so the multiply never wraps or panics.
-        if self
-            .heartbeat_interval_secs
-            .checked_mul(2)
-            .is_none_or(|hb2| hb2 >= self.lease_duration_secs)
-        {
-            return Err(JammiError::Config(format!(
-                "training.heartbeat_interval_secs ({}) must be strictly under half of \
-                 training.lease_duration_secs ({}): the heartbeat must leave a real margin \
-                 under the lease so a live worker renews strictly before the lease expires, \
-                 or its job is spuriously reclaimed mid-flight",
-                self.heartbeat_interval_secs, self.lease_duration_secs
-            )));
-        }
-
         Ok(WorkerIntervals {
-            lease: Duration::from_secs(self.lease_duration_secs),
-            heartbeat: Duration::from_secs(self.heartbeat_interval_secs),
+            lease: lease.lease(),
+            heartbeat: lease.heartbeat(),
             idle_poll: Duration::from_secs(self.idle_poll_secs),
         })
     }
@@ -929,6 +983,7 @@ impl Default for JammiConfig {
             inference: InferenceConfig::default(),
             embedding: EmbeddingConfig::default(),
             fine_tuning: FineTuningConfig::default(),
+            lease: LeaseConfig::default(),
             training: TrainingConfig::default(),
             cache: CacheConfig::default(),
             server: ServerConfig::default(),
@@ -1072,10 +1127,11 @@ impl JammiConfig {
         if let Some(cloud) = &config.storage.cloud {
             cloud.validate()?;
         }
-        // Reject a training timing that violates the heartbeat-margin or
-        // non-zero-poll invariants at load time rather than at worker spawn,
-        // deep in a server startup.
-        config.training.worker_intervals()?;
+        // Reject a lease timing that violates the heartbeat margin, or a
+        // training poll that is a busy-loop, at load time rather than at
+        // worker spawn, deep in a server startup.
+        let lease = config.lease.intervals()?;
+        config.training.worker_intervals(lease)?;
         Ok(config)
     }
 
@@ -1592,17 +1648,30 @@ mod tests {
     }
 
     #[test]
+    fn lease_config_defaults_match_engine_constants() {
+        // The defaults must reproduce the engine's built-in lease timing so a
+        // config without a `[lease]` section behaves identically. These two
+        // values are the contract; every lease holder derives its `Duration`s
+        // from them.
+        let l = LeaseConfig::default();
+        assert_eq!(l.duration_secs, 30);
+        assert_eq!(l.heartbeat_secs, 10);
+        let intervals = l.intervals().unwrap();
+        assert_eq!(intervals.lease(), std::time::Duration::from_secs(30));
+        assert_eq!(intervals.heartbeat(), std::time::Duration::from_secs(10));
+        assert_eq!(intervals, LeaseIntervals::default());
+    }
+
+    #[test]
     fn training_config_defaults_match_engine_constants() {
-        // The defaults must reproduce the engine's built-in worker timing so a
-        // config without a `[training]` section behaves identically. These three
-        // values are the contract; the worker derives its `Duration`s from them.
+        // The worker's own default (1 s idle poll) plus the shared lease.
         let t = TrainingConfig::default();
         assert!(t.run_worker);
-        assert_eq!(t.lease_duration_secs, 30);
-        assert_eq!(t.heartbeat_interval_secs, 10);
         assert_eq!(t.idle_poll_secs, 1);
 
-        let intervals = t.worker_intervals().unwrap();
+        let intervals = t
+            .worker_intervals(LeaseConfig::default().intervals().unwrap())
+            .unwrap();
         assert_eq!(intervals.lease, std::time::Duration::from_secs(30));
         assert_eq!(intervals.heartbeat, std::time::Duration::from_secs(10));
         assert_eq!(intervals.idle_poll, std::time::Duration::from_secs(1));
@@ -1610,34 +1679,68 @@ mod tests {
 
     #[test]
     fn training_config_absent_defaults() {
-        // A config without `[training]` parses to the engine defaults.
+        // A config without `[training]` / `[lease]` parses to the engine defaults.
         let cfg: JammiConfig = toml::from_str("artifact_dir = \"/tmp/jammi\"").unwrap();
         assert_eq!(cfg.training, TrainingConfig::default());
+        assert_eq!(cfg.lease, LeaseConfig::default());
     }
 
     #[test]
-    fn training_config_round_trip() {
+    fn lease_and_training_config_round_trip() {
         let toml_src = r#"
+            [lease]
+            duration_secs = 8
+            heartbeat_secs = 2
+
             [training]
-            lease_duration_secs = 8
-            heartbeat_interval_secs = 2
             idle_poll_secs = 1
         "#;
         let cfg: JammiConfig = toml::from_str(toml_src).unwrap();
+        assert_eq!(
+            cfg.lease,
+            LeaseConfig {
+                duration_secs: 8,
+                heartbeat_secs: 2,
+            }
+        );
         assert_eq!(
             cfg.training,
             TrainingConfig {
                 // Not spelled in the TOML above: the container-level
                 // `#[serde(default)]` must fill it from `Default`, on.
                 run_worker: true,
-                lease_duration_secs: 8,
-                heartbeat_interval_secs: 2,
                 idle_poll_secs: 1,
             }
         );
-        let intervals = cfg.training.worker_intervals().unwrap();
+        let intervals = cfg
+            .training
+            .worker_intervals(cfg.lease.intervals().unwrap())
+            .unwrap();
         assert_eq!(intervals.lease, std::time::Duration::from_secs(8));
         assert_eq!(intervals.heartbeat, std::time::Duration::from_secs(2));
+    }
+
+    #[test]
+    fn old_training_lease_keys_are_refused() {
+        // The lease keys moved to `[lease]`; a TOML still naming them under
+        // `[training]` is a typed parse error (fail-closed), never a silent
+        // fall-back to the default 30 s / 10 s timing.
+        let toml_src = r#"
+            [training]
+            lease_duration_secs = 8
+            heartbeat_interval_secs = 2
+        "#;
+        let err = toml::from_str::<JammiConfig>(toml_src).unwrap_err();
+        assert!(
+            err.to_string().contains("lease_duration_secs"),
+            "the error must name the refused key, got: {err}"
+        );
+        // And an unknown key under `[lease]` is refused the same way.
+        let err = toml::from_str::<JammiConfig>("[lease]\nlease_duration_secs = 8\n").unwrap_err();
+        assert!(
+            err.to_string().contains("lease_duration_secs"),
+            "got: {err}"
+        );
     }
 
     // ── `run_worker`: whether THIS process runs the claim loop ──────────────
@@ -1655,8 +1758,6 @@ mod tests {
         // already-deployed config file has — still parses, and parses to on.
         let toml_src = r#"
             [training]
-            lease_duration_secs = 30
-            heartbeat_interval_secs = 10
             idle_poll_secs = 1
         "#;
         let cfg: JammiConfig = toml::from_str(toml_src).unwrap();
@@ -1676,13 +1777,14 @@ mod tests {
         "#;
         let cfg: JammiConfig = toml::from_str(toml_src).unwrap();
         assert!(!cfg.training.run_worker);
-        // Switching the loop off leaves the timings at their defaults — and
-        // they are still validated, so a config that switches the loop back on
-        // later cannot smuggle in timing that was never checked.
-        assert_eq!(cfg.training.lease_duration_secs, 30);
-        assert_eq!(cfg.training.heartbeat_interval_secs, 10);
+        // Switching the loop off leaves the timing at its default — and it is
+        // still validated, so a config that switches the loop back on later
+        // cannot smuggle in timing that was never checked.
         assert_eq!(cfg.training.idle_poll_secs, 1);
-        assert!(cfg.training.worker_intervals().is_ok());
+        assert!(cfg
+            .training
+            .worker_intervals(cfg.lease.intervals().unwrap())
+            .is_ok());
     }
 
     #[test]
@@ -1834,81 +1936,63 @@ mod tests {
     }
 
     #[test]
-    fn training_config_rejects_heartbeat_without_margin() {
-        // heartbeat == lease (no margin) — a live worker's lease would expire
+    fn lease_config_rejects_heartbeat_without_margin() {
+        // heartbeat == lease (no margin) — a live holder's lease would expire
         // between beats. Must be rejected, not clamped.
-        let equal = TrainingConfig {
-            lease_duration_secs: 10,
-            heartbeat_interval_secs: 10,
-            idle_poll_secs: 1,
-            ..Default::default()
+        let equal = LeaseConfig {
+            duration_secs: 10,
+            heartbeat_secs: 10,
         };
-        let err = equal.worker_intervals().unwrap_err();
+        let err = equal.intervals().unwrap_err();
         assert!(
-            matches!(&err, JammiError::Config(m) if m.contains("heartbeat_interval_secs")),
+            matches!(&err, JammiError::Config(m) if m.contains("heartbeat_secs")),
             "expected a Config error naming the heartbeat field, got {err:?}"
         );
 
         // heartbeat * 2 just over lease (margin not cleared) — also rejected.
-        let too_close = TrainingConfig {
-            lease_duration_secs: 19,
-            heartbeat_interval_secs: 10,
-            idle_poll_secs: 1,
-            ..Default::default()
+        let too_close = LeaseConfig {
+            duration_secs: 19,
+            heartbeat_secs: 10,
         };
-        assert!(matches!(
-            too_close.worker_intervals(),
-            Err(JammiError::Config(_))
-        ));
+        assert!(matches!(too_close.intervals(), Err(JammiError::Config(_))));
 
         // heartbeat > lease — clearly rejected.
-        let inverted = TrainingConfig {
-            lease_duration_secs: 5,
-            heartbeat_interval_secs: 30,
-            idle_poll_secs: 1,
-            ..Default::default()
+        let inverted = LeaseConfig {
+            duration_secs: 5,
+            heartbeat_secs: 30,
         };
-        assert!(matches!(
-            inverted.worker_intervals(),
-            Err(JammiError::Config(_))
-        ));
+        assert!(matches!(inverted.intervals(), Err(JammiError::Config(_))));
 
-        // The exact 2× boundary (heartbeat * 2 == lease) is now REJECTED: a
-        // renewal coincident with expiry races an idle-polling worker's reclaim.
-        let exact = TrainingConfig {
-            lease_duration_secs: 20,
-            heartbeat_interval_secs: 10,
-            idle_poll_secs: 1,
-            ..Default::default()
+        // The exact 2× boundary (heartbeat * 2 == lease) is REJECTED: a
+        // renewal coincident with expiry races a reclaim.
+        let exact = LeaseConfig {
+            duration_secs: 20,
+            heartbeat_secs: 10,
         };
         assert!(
-            matches!(exact.worker_intervals(), Err(JammiError::Config(_))),
+            matches!(exact.intervals(), Err(JammiError::Config(_))),
             "heartbeat * 2 == lease must be rejected under the strict margin"
         );
 
         // Strictly under half (heartbeat * 2 < lease) is accepted.
-        let strict = TrainingConfig {
-            lease_duration_secs: 21,
-            heartbeat_interval_secs: 10,
-            idle_poll_secs: 1,
-            ..Default::default()
+        let strict = LeaseConfig {
+            duration_secs: 21,
+            heartbeat_secs: 10,
         };
-        assert!(strict.worker_intervals().is_ok());
+        assert!(strict.intervals().is_ok());
     }
 
     #[test]
-    fn training_config_margin_check_is_overflow_safe() {
+    fn lease_config_margin_check_is_overflow_safe() {
         // An operator-controlled heartbeat whose doubling overflows `u64` must
         // be rejected with a Config error — never a debug-build panic, never a
         // release-build silent wrap-to-zero that accepts bogus timing.
-        let absurd = TrainingConfig {
-            lease_duration_secs: 30,
-            heartbeat_interval_secs: u64::MAX / 2 + 1,
-            idle_poll_secs: 1,
-            ..Default::default()
+        let absurd = LeaseConfig {
+            duration_secs: 30,
+            heartbeat_secs: u64::MAX / 2 + 1,
         };
         assert!(
-            matches!(absurd.worker_intervals(), Err(JammiError::Config(_))),
+            matches!(absurd.intervals(), Err(JammiError::Config(_))),
             "a heartbeat whose doubling overflows u64 must be a Config error"
         );
     }
@@ -1916,12 +2000,12 @@ mod tests {
     #[test]
     fn training_config_rejects_zero_idle_poll() {
         let cfg = TrainingConfig {
-            lease_duration_secs: 30,
-            heartbeat_interval_secs: 10,
             idle_poll_secs: 0,
             ..Default::default()
         };
-        let err = cfg.worker_intervals().unwrap_err();
+        let err = cfg
+            .worker_intervals(LeaseConfig::default().intervals().unwrap())
+            .unwrap_err();
         assert!(
             matches!(&err, JammiError::Config(m) if m.contains("idle_poll_secs")),
             "expected a Config error naming the idle-poll field, got {err:?}"
@@ -1929,14 +2013,18 @@ mod tests {
     }
 
     #[test]
-    fn training_config_rejects_zero_heartbeat() {
-        let cfg = TrainingConfig {
-            lease_duration_secs: 30,
-            heartbeat_interval_secs: 0,
-            idle_poll_secs: 1,
-            ..Default::default()
+    fn lease_config_rejects_zero_heartbeat_and_zero_duration() {
+        let zero_hb = LeaseConfig {
+            duration_secs: 30,
+            heartbeat_secs: 0,
         };
-        assert!(matches!(cfg.worker_intervals(), Err(JammiError::Config(_))));
+        assert!(matches!(zero_hb.intervals(), Err(JammiError::Config(_))));
+        let zero_lease = LeaseConfig {
+            duration_secs: 0,
+            heartbeat_secs: 0,
+        };
+        let err = zero_lease.intervals().unwrap_err();
+        assert!(matches!(&err, JammiError::Config(m) if m.contains("must be > 0")));
     }
 
     #[test]
@@ -1949,9 +2037,11 @@ mod tests {
         std::fs::write(
             &path,
             r#"
+                [lease]
+                duration_secs = 5
+                heartbeat_secs = 5
+
                 [training]
-                lease_duration_secs = 5
-                heartbeat_interval_secs = 5
                 idle_poll_secs = 1
             "#,
         )

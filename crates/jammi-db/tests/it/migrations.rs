@@ -18,7 +18,7 @@ use tempfile::tempdir;
 use tokio::sync::Barrier;
 
 /// Every migration name, in ledger order. Mirrors `catalog::migrations::MIGRATIONS`
-/// (K5: append-only, currently ending at 026) -- a new migration is added here
+/// (K5: append-only, currently ending at 027) -- a new migration is added here
 /// in the same change.
 const EXPECTED_MIGRATION_NAMES: &[&str] = &[
     "001_core_tables",
@@ -47,6 +47,7 @@ const EXPECTED_MIGRATION_NAMES: &[&str] = &[
     "024_claim_policy",
     "025_index_segments",
     "026_acceleration_report",
+    "027_result_table_lease",
 ];
 
 async fn open_sqlite_backend(path: &std::path::Path) -> std::sync::Arc<SqliteBackend> {
@@ -1532,4 +1533,73 @@ async fn concurrent_migrate_on_fresh_postgres_is_safe() {
             Err(join) => panic!("{TEST_NAME}: body task failed without panicking: {join}"),
         }
     }
+}
+
+/// Migration 027 adds the writer-lease columns to `result_tables` (esc-094):
+/// `writer_id` and `lease_expires_at`, both nullable so a row born before the
+/// migration reads back as "no writer, no lease" — the absent-lease state
+/// recovery reconciles exactly as it always did — plus the
+/// `(status, lease_expires_at)` index recovery's expired-lease scan uses.
+#[tokio::test]
+async fn migration_027_adds_result_table_lease_columns_nullable() {
+    let dir = tempfile::tempdir().unwrap();
+    let backend = open_sqlite_backend(&dir.path().join("catalog.db")).await;
+    backend.migrate().await.unwrap();
+
+    let columns: Vec<String> = backend
+        .transaction(
+            TxOptions {
+                read_only: true,
+                ..Default::default()
+            },
+            |tx| {
+                Box::pin(async move {
+                    tx.query(
+                        "SELECT name, \"notnull\" FROM pragma_table_info('result_tables')",
+                        &[],
+                        |row| {
+                            let name: String = row.get("name")?;
+                            let notnull: i32 = row.get("notnull")?;
+                            Ok(format!("{name}:{notnull}"))
+                        },
+                    )
+                    .await
+                })
+            },
+        )
+        .await
+        .unwrap();
+    assert!(
+        columns.iter().any(|c| c == "writer_id:0"),
+        "result_tables must have a nullable 'writer_id' after migration 027; got {columns:?}"
+    );
+    assert!(
+        columns.iter().any(|c| c == "lease_expires_at:0"),
+        "result_tables must have a nullable 'lease_expires_at' after migration 027; got {columns:?}"
+    );
+
+    let indexes: Vec<String> = backend
+        .transaction(
+            TxOptions {
+                read_only: true,
+                ..Default::default()
+            },
+            |tx| {
+                Box::pin(async move {
+                    tx.query(
+                        "SELECT name FROM sqlite_master WHERE type = 'index' \
+                         AND tbl_name = 'result_tables'",
+                        &[],
+                        |row| row.get("name"),
+                    )
+                    .await
+                })
+            },
+        )
+        .await
+        .unwrap();
+    assert!(
+        indexes.iter().any(|i| i == "idx_result_tables_lease"),
+        "migration 027 must create idx_result_tables_lease; got {indexes:?}"
+    );
 }

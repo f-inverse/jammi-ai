@@ -30,7 +30,7 @@ use jammi_db::store::manifest::{
     ProducingDescriptor,
 };
 use jammi_db::store::schema::embedding_table_schema;
-use jammi_db::store::{ResultStore, ResultTableInfo, StaleReason, Staleness};
+use jammi_db::store::{BuildingTable, ResultStore, StaleReason, Staleness};
 use tempfile::tempdir;
 use test_case::test_case;
 
@@ -101,7 +101,7 @@ fn store(dir: &std::path::Path, catalog: Arc<Catalog>) -> ResultStore {
     ResultStore::new(dir, catalog, AnnIndexConfig::default()).unwrap()
 }
 
-async fn create_building(store: &ResultStore) -> ResultTableInfo {
+async fn create_building(store: &ResultStore) -> BuildingTable {
     store
         .create_table(
             "docs",
@@ -117,7 +117,7 @@ async fn create_building(store: &ResultStore) -> ResultTableInfo {
         .unwrap()
 }
 
-async fn write_embedding_parquet(store: &ResultStore, info: &ResultTableInfo, n: usize) -> usize {
+async fn write_embedding_parquet(store: &ResultStore, info: &BuildingTable, n: usize) -> usize {
     let schema = embedding_table_schema(DIMS);
     let row_ids: Vec<String> = (0..n).map(|i| format!("row-{i}")).collect();
     let row_id_arr = StringArray::from_iter_values(row_ids.iter().map(|s| s.as_str()));
@@ -144,7 +144,7 @@ async fn write_embedding_parquet(store: &ResultStore, info: &ResultTableInfo, n:
         ],
     )
     .unwrap();
-    let mut writer = store.open_writer(&info.parquet_url, schema).await.unwrap();
+    let mut writer = store.open_writer(info.parquet_url(), schema).await.unwrap();
     writer.write_batch(&batch).await.unwrap();
     writer.close().await.unwrap()
 }
@@ -182,22 +182,21 @@ async fn materialize(
 ) -> (ResultTableRecord, DefinitionHash) {
     let info = create_building(store).await;
     let rows = write_embedding_parquet(store, &info, 3).await;
-    let manifest = store
-        .finalize_with_manifest(
+    let record = info
+        .finish(
             ctx,
-            &info.table_name,
-            &info.parquet_url,
             rows,
             Materialization::new(&descriptor(), &env(), inputs),
         )
         .await
         .unwrap();
-    let record = store
-        .catalog()
-        .get_result_table(&info.table_name)
+    let manifest = store
+        .read_materialization_manifest(
+            &jammi_db::storage::StorageUrl::parse(&record.parquet_path).unwrap(),
+        )
         .await
         .unwrap()
-        .expect("record after materialize");
+        .expect("the funnel wrote the attestation sidecar");
     (record, manifest.definition_hash)
 }
 
@@ -342,11 +341,11 @@ async fn missing_manifest_for_a_pre_contract_table(backend: BackendKind) {
     let info = create_building(&store).await;
     let rows = write_embedding_parquet(&store, &info, 3).await;
     catalog
-        .update_result_table_status(&info.table_name, ResultTableStatus::Ready, rows)
+        .update_result_table_status(info.table_name(), ResultTableStatus::Ready, rows)
         .await
         .unwrap();
     let record = catalog
-        .get_result_table(&info.table_name)
+        .get_result_table(info.table_name())
         .await
         .unwrap()
         .unwrap();

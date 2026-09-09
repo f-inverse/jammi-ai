@@ -19,7 +19,7 @@ use std::time::{Duration, Instant};
 use jammi_ai::fine_tune::{FineTuneConfig, FineTuneMethod};
 use jammi_ai::model::ModelTask;
 use jammi_ai::session::InferenceSession;
-use jammi_db::config::{CatalogConfig, JammiConfig, StorageConfig, TrainingConfig};
+use jammi_db::config::{CatalogConfig, JammiConfig, LeaseConfig, StorageConfig, TrainingConfig};
 use jammi_db::source::{FileFormat, SourceConnection, SourceType};
 use jammi_db::storage::{CloudConfig, S3Config};
 use tempfile::TempDir;
@@ -156,9 +156,11 @@ fn shared_config(backends: &Backends, result_root: &str, artifact_dir: &Path) ->
             result_root: Some(result_root.to_string()),
             cloud: Some(backends.cloud()),
         },
+        lease: LeaseConfig {
+            duration_secs: LEASE_SECS,
+            heartbeat_secs: HEARTBEAT_SECS,
+        },
         training: TrainingConfig {
-            lease_duration_secs: LEASE_SECS,
-            heartbeat_interval_secs: HEARTBEAT_SECS,
             idle_poll_secs: IDLE_POLL_SECS,
             // These processes are the workers under test — claim loop on.
             ..Default::default()
@@ -402,9 +404,11 @@ region = "{region}"
 endpoint = "{s3_endpoint}"
 allow_http = {allow_http}
 
+[lease]
+duration_secs = {LEASE_SECS}
+heartbeat_secs = {HEARTBEAT_SECS}
+
 [training]
-lease_duration_secs = {LEASE_SECS}
-heartbeat_interval_secs = {HEARTBEAT_SECS}
 idle_poll_secs = {IDLE_POLL_SECS}
 
 [server]

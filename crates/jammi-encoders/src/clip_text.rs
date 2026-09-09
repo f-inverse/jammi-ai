@@ -877,10 +877,8 @@ mod tests {
         // mode) — a counter bumper on `crate::layer_norm::LN_DISPATCH_COUNTERS`
         // even though this test never reads that counter itself. Same lock
         // discipline as `clip_text_training_ln_dispatch_is_now_counted` below
-        // (see `crate::layer_norm::DISPATCH_COUNTER_TEST_LOCK`'s doc).
-        let _guard = crate::layer_norm::DISPATCH_COUNTER_TEST_LOCK
-            .lock()
-            .unwrap_or_else(|e| e.into_inner());
+        // (see `crate::test_support::seam_counter_lock`'s doc).
+        let _lock = crate::test_support::seam_counter_lock();
         let cfg = tiny_config();
         let device = Device::Cpu;
         let varmap = VarMap::new();
@@ -971,9 +969,7 @@ mod tests {
         // even though this test never reads it — same lock discipline as
         // `training_true_backward_gives_nonzero_grad_to_q_k_and_v_slices`
         // above.
-        let _guard = crate::layer_norm::DISPATCH_COUNTER_TEST_LOCK
-            .lock()
-            .unwrap_or_else(|e| e.into_inner());
+        let _lock = crate::test_support::seam_counter_lock();
         let cfg = tiny_config();
         let device = Device::Cpu;
         let varmap = VarMap::new();
@@ -1092,9 +1088,7 @@ mod tests {
             // `crate::layer_norm::LN_DISPATCH_COUNTERS` even though this
             // closure never reads it — same lock discipline as the other
             // training-forward tests in this module.
-            let _guard = crate::layer_norm::DISPATCH_COUNTER_TEST_LOCK
-                .lock()
-                .unwrap_or_else(|e| e.into_inner());
+            let _lock = crate::test_support::seam_counter_lock();
             let (input_ids, mask) = fixed_batch(&cfg, &device);
             let out = model.forward(&input_ids, &mask).unwrap();
             let loss = nonuniform_loss(&out, cfg.embed_dim, &device);
@@ -1152,9 +1146,7 @@ mod tests {
     /// correctness claim).
     #[test]
     fn clip_text_training_ln_dispatch_is_now_counted() {
-        let _guard = crate::layer_norm::DISPATCH_COUNTER_TEST_LOCK
-            .lock()
-            .unwrap_or_else(|e| e.into_inner());
+        let _lock = crate::test_support::seam_counter_lock();
         let cfg = tiny_config();
         let device = Device::Cpu;
         let varmap = VarMap::new();
@@ -1220,14 +1212,7 @@ mod tests {
     /// forward must leave `gelu_erf_fused` untouched.
     #[test]
     fn fusible_site_census_is_the_exact_per_forward_seam_call_count() {
-        // Lock order: attention_cascade THEN layer_norm — see
-        // `crate::htsat_audio`'s own multi-lock test doc.
-        let _attn_guard = crate::attention_cascade::ATTENTION_BLOCK_COUNTER_TEST_LOCK
-            .lock()
-            .unwrap_or_else(|e| e.into_inner());
-        let _ln_guard = crate::layer_norm::DISPATCH_COUNTER_TEST_LOCK
-            .lock()
-            .unwrap_or_else(|e| e.into_inner());
+        let _lock = crate::test_support::seam_counter_lock();
 
         let device = Device::Cpu;
         let dir = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
@@ -1249,6 +1234,7 @@ mod tests {
             &mut any,
             &device,
             "clip_text/all-linear",
+            &_lock,
         );
 
         let layers = config.layers;
@@ -1272,6 +1258,7 @@ mod tests {
             &mut any_frozen,
             &device,
             "clip_text/frozen",
+            &_lock,
         );
         assert_eq!(
             frozen_census.lora_sites_wrapped, 0,

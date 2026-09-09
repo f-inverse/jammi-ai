@@ -403,25 +403,6 @@ pub(crate) static ATTENTION_BLOCK_DISPATCH_COUNTERS: LazyLock<&'static DispatchC
 pub(crate) static SOFTMAX_DISPATCH_COUNTERS: LazyLock<&'static DispatchCounters> =
     LazyLock::new(|| counters_for("softmax_last_dim_fused"));
 
-/// Test-only serialization for two-sided (`fused` advanced AND `eager`
-/// unchanged) assertions against the process-wide dispatch/cascade counter
-/// registry this module's functions read (`ATTENTION_BLOCK_DISPATCH_COUNTERS`,
-/// `SOFTMAX_DISPATCH_COUNTERS`, and the `attention_block_flash`/
-/// `mem_efficient_attention` cascade counters `cascade_counters_for`
-/// resolves): promoted here from `crate::modernbert`'s own (module-private)
-/// `mod tests::ATTENTION_BLOCK_COUNTER_TEST_LOCK` (issue #462, R2') so
-/// `crate::bert`'s and `crate::distilbert`'s own unit tests — which read the
-/// SAME process-wide counters through this crate-shared cascade, in the
-/// SAME `cargo test --lib` binary — can serialize against ModernBERT's
-/// counter tests too, mirroring `crate::layer_norm::DISPATCH_COUNTER_TEST_LOCK`'s
-/// identical crate-visible-promotion shape. `crate::modernbert`'s own `mod
-/// tests` re-imports this exact static under its original bare name, so
-/// every one of its 30+ existing `ATTENTION_BLOCK_COUNTER_TEST_LOCK.lock()`
-/// call sites keeps compiling and passing unmodified — a path-only change.
-#[cfg(test)]
-pub(crate) static ATTENTION_BLOCK_COUNTER_TEST_LOCK: std::sync::Mutex<()> =
-    std::sync::Mutex::new(());
-
 /// The fused whole-attention-block kernel's domain, checked at the call
 /// site (family D / K2) — moved verbatim from
 /// `crate::modernbert::attention_block_admission_predicate`: `qkv`'s device
@@ -649,6 +630,7 @@ pub(crate) fn softmax_apply_training(
     policy: FullyMaskedPolicy,
 ) -> Result<Tensor, EncoderError> {
     let (holds, predicate) = softmax_admission_predicate(scores, mask, scores_divisor);
+    crate::seam_gate("attention_cascade::softmax_apply_training");
     let outcome = admit(
         admission_mode(),
         "softmax_last_dim_fused",
@@ -834,6 +816,15 @@ pub(crate) fn training_attention_cascade(
     policy: FullyMaskedPolicy,
     on_flash_fused: impl FnOnce(&CompactedBatch) -> Result<Tensor, EncoderError>,
 ) -> Result<Tensor, EncoderError> {
+    // The gate sits at ENTRY, before ANY of this cascade's three writes
+    // (`attention_block_flash`, `mem_efficient_attention`, `attention_block_fused`).
+    // Four early returns sit between entry and the final `attention_block_fused`
+    // admit() below (the flash-fused return, the memeff-fused return, and two
+    // typed-refusal returns); a caller that takes any of the earlier
+    // `admit_cascade` writes and then returns early would bypass a check
+    // placed later in this function, so the check runs before the FIRST
+    // write, not merely before the LAST one.
+    crate::seam_gate("attention_cascade::training_attention_cascade");
     // Flash cascade: reported here for EVERY caller (contract shared
     // vocabulary — "never silent"), even one (BERT/DistilBERT) whose own
     // `flash` is always `Declined { CapabilityMiss, "flash_transport_not_wired" }`.

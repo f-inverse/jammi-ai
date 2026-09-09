@@ -2472,10 +2472,8 @@ mod tests {
         // `layernorm_after` (biased, training mode) — a counter bumper on
         // `crate::layer_norm::LN_DISPATCH_COUNTERS` even though this test
         // never reads that counter itself (see
-        // `crate::layer_norm::DISPATCH_COUNTER_TEST_LOCK`'s doc).
-        let _guard = crate::layer_norm::DISPATCH_COUNTER_TEST_LOCK
-            .lock()
-            .unwrap_or_else(|e| e.into_inner());
+        // `crate::test_support::seam_counter_lock`'s doc).
+        let _lock = crate::test_support::seam_counter_lock();
         let device = Device::Cpu;
         let varmap = VarMap::new();
         let mut stage = build_tiny_stage(&varmap, &device);
@@ -2611,11 +2609,9 @@ mod tests {
         // `layernorm_before`/`layernorm_after`/`PatchMerging::norm`, and the
         // encoder's final norm at `training=true` bumps
         // `crate::layer_norm::LN_DISPATCH_COUNTERS` even though this test
-        // never reads it (see `crate::layer_norm::DISPATCH_COUNTER_TEST_LOCK`'s
+        // never reads it (see `crate::test_support::seam_counter_lock`'s
         // doc).
-        let _guard = crate::layer_norm::DISPATCH_COUNTER_TEST_LOCK
-            .lock()
-            .unwrap_or_else(|e| e.into_inner());
+        let _lock = crate::test_support::seam_counter_lock();
         let device = Device::Cpu;
         let varmap = VarMap::new();
         let (mut tower, cfg, input) = build_full_tower_and_input(&varmap, &device, 101);
@@ -2824,9 +2820,7 @@ mod tests {
                 // `crate::layer_norm::LN_DISPATCH_COUNTERS` even though this
                 // block never reads it — same lock discipline as the other
                 // training-forward tests in this module.
-                let _guard = crate::layer_norm::DISPATCH_COUNTER_TEST_LOCK
-                    .lock()
-                    .unwrap_or_else(|e| e.into_inner());
+                let _lock = crate::test_support::seam_counter_lock();
                 let varmap = VarMap::new();
                 let (mut tower, cfg, input) = build_full_tower_and_input(&varmap, &device, 303);
                 tower.set_training(true);
@@ -2886,10 +2880,8 @@ mod tests {
         // (biased, training mode) — a counter bumper on
         // `crate::layer_norm::LN_DISPATCH_COUNTERS` even though this test
         // never reads that counter itself (see
-        // `crate::layer_norm::DISPATCH_COUNTER_TEST_LOCK`'s doc).
-        let _guard = crate::layer_norm::DISPATCH_COUNTER_TEST_LOCK
-            .lock()
-            .unwrap_or_else(|e| e.into_inner());
+        // `crate::test_support::seam_counter_lock`'s doc).
+        let _lock = crate::test_support::seam_counter_lock();
         let device = Device::Cpu;
         let varmap = VarMap::new();
         let (mut tower, cfg, input) = build_full_tower_and_input(&varmap, &device, 202);
@@ -3327,6 +3319,13 @@ mod tests {
     /// the same computation on this fixture).
     #[test]
     fn batch_norm_stays_on_eval_statistics_under_set_training() {
+        // The `set_training(true)` forward below runs `patch_embed.forward`'s
+        // `self.norm.forward` (biased, training mode) — a counter bumper on
+        // `crate::layer_norm::LN_DISPATCH_COUNTERS` even though this test
+        // never reads it (esc-092 / issue #476: this was the ORIGINAL
+        // unlocked writer that motivated the mechanical gate
+        // `crate::test_support::assert_seam_lock_held` now enforces).
+        let _lock = crate::test_support::seam_counter_lock();
         let device = Device::Cpu;
         let varmap = VarMap::new();
         let (mut tower, _cfg, input) = build_full_tower_and_input(&varmap, &device, 31);
@@ -3525,40 +3524,21 @@ mod tests {
     /// asserted — a one-sided "fused went up" check would pass even if half
     /// the sites had fallen back.
     ///
-    /// # Why two locks, in THIS order
+    /// # Why one lock, and no acquisition order to get wrong
     ///
-    /// This test needs both crate-shared counter locks: the full forward
-    /// bumps `crate::layer_norm::LN_DISPATCH_COUNTERS` and the softmax
-    /// cascade counters as well as the `gelu_erf_fused` counters it reads
-    /// exactly, and every OTHER test that can bump `gelu_erf_fused` holds
-    /// one of the two (this module's own training-mode forwards hold the
-    /// `layer_norm` one; `crate::activations`/`crate::bert`/
-    /// `crate::distilbert`'s GELU counter tests hold the
-    /// `attention_cascade` one).
-    ///
-    /// The ORDER is not free: `crate::modernbert`'s own tests already
-    /// acquire both, `attention_cascade` FIRST and `layer_norm` second
-    /// (e.g. `modernbert::tests::
-    /// forward_hidden_with_lengths_none_is_bit_identical_to_forward_hidden`,
-    /// which takes `ATTENTION_BLOCK_COUNTER_TEST_LOCK` and then, a few lines
-    /// later, `crate::layer_norm::DISPATCH_COUNTER_TEST_LOCK`). Acquiring
-    /// them the other way round here is a lock-order INVERSION against those
-    /// tests, and the default parallel test runner deadlocks the whole
-    /// `cargo test --lib` binary on it — observed, not hypothesized, while
-    /// writing this test (every htsat/layer_norm/modernbert thread parked in
-    /// `__psynch_mutexwait` forever). Every multi-lock test in this crate
-    /// therefore takes `attention_cascade` before `layer_norm`, and any new
-    /// one must too.
+    /// This test's full forward bumps `crate::layer_norm::LN_DISPATCH_COUNTERS`,
+    /// the softmax/RoPE/GeGLU cascade counters, and the `gelu_erf_fused`
+    /// counters it reads exactly. All of these are guarded by the SAME
+    /// `crate::test_support::seam_counter_lock()` — see that function's own
+    /// module doc for the full registry table — so this test (and every
+    /// other test in this crate whose forward can bump more than one of
+    /// them) acquires it exactly ONCE and holds it for the whole window.
+    /// `std::sync::Mutex` is not reentrant, so a second acquisition attempt
+    /// on the same thread while already holding it would deadlock; there is
+    /// nothing to sequence here because there is only one lock to take.
     #[test]
     fn training_true_full_forward_dispatches_the_gelu_seam_once_per_swin_block() {
-        // Lock order: attention_cascade THEN layer_norm -- see this test's
-        // own doc.
-        let _attn_guard = crate::attention_cascade::ATTENTION_BLOCK_COUNTER_TEST_LOCK
-            .lock()
-            .unwrap_or_else(|e| e.into_inner());
-        let _ln_guard = crate::layer_norm::DISPATCH_COUNTER_TEST_LOCK
-            .lock()
-            .unwrap_or_else(|e| e.into_inner());
+        let _lock = crate::test_support::seam_counter_lock();
         let device = Device::Cpu;
         let varmap = VarMap::new();
         let (mut tower, cfg, input) = build_full_tower_and_input(&varmap, &device, 101);
@@ -3576,9 +3556,9 @@ mod tests {
         assert_eq!(expected, 8, "sum(depths) for htsat_clap_tiny");
 
         tower.set_training(true);
-        let before = crate::activations::GELU_DISPATCH_COUNTERS.snapshot();
+        let before = crate::activations::gelu_snapshot_locked(&_lock);
         let out = tower.forward(&input, &[true]).unwrap();
-        let after = crate::activations::GELU_DISPATCH_COUNTERS.snapshot();
+        let after = crate::activations::gelu_snapshot_locked(&_lock);
 
         // Non-vacuity: the forward really produced a descriptor.
         assert_eq!(out.dims(), &[1, cfg.projection_dim]);
@@ -3606,23 +3586,16 @@ mod tests {
     /// eval bytes on any device/dtype where fused and eager differ.
     #[test]
     fn eval_forward_takes_no_gelu_admission_decision_at_all() {
-        // Lock order: attention_cascade THEN layer_norm -- see this test's
-        // own doc.
-        let _attn_guard = crate::attention_cascade::ATTENTION_BLOCK_COUNTER_TEST_LOCK
-            .lock()
-            .unwrap_or_else(|e| e.into_inner());
-        let _ln_guard = crate::layer_norm::DISPATCH_COUNTER_TEST_LOCK
-            .lock()
-            .unwrap_or_else(|e| e.into_inner());
+        let _lock = crate::test_support::seam_counter_lock();
         let device = Device::Cpu;
         let varmap = VarMap::new();
         let (tower, cfg, input) = build_full_tower_and_input(&varmap, &device, 101);
         // `training` defaults to false; no `set_training` call at all.
         assert!(!tower.is_training());
 
-        let before = crate::activations::GELU_DISPATCH_COUNTERS.snapshot();
+        let before = crate::activations::gelu_snapshot_locked(&_lock);
         let out = tower.forward(&input, &[true]).unwrap();
-        let after = crate::activations::GELU_DISPATCH_COUNTERS.snapshot();
+        let after = crate::activations::gelu_snapshot_locked(&_lock);
 
         assert_eq!(out.dims(), &[1, cfg.projection_dim]);
         assert_eq!(
@@ -3644,14 +3617,7 @@ mod tests {
     /// hypothesis.
     #[test]
     fn training_true_full_forward_with_a_gelu_projection_dispatches_sum_depths_plus_one() {
-        // Lock order: attention_cascade THEN layer_norm -- see this test's
-        // own doc.
-        let _attn_guard = crate::attention_cascade::ATTENTION_BLOCK_COUNTER_TEST_LOCK
-            .lock()
-            .unwrap_or_else(|e| e.into_inner());
-        let _ln_guard = crate::layer_norm::DISPATCH_COUNTER_TEST_LOCK
-            .lock()
-            .unwrap_or_else(|e| e.into_inner());
+        let _lock = crate::test_support::seam_counter_lock();
         let device = Device::Cpu;
         let mut cfg = HtsatAudioConfig::from_hf_clap_config(&fixture_config()).unwrap();
         cfg.projection_hidden_act = "gelu".to_string();
@@ -3671,9 +3637,9 @@ mod tests {
         );
 
         tower.set_training(true);
-        let before = crate::activations::GELU_DISPATCH_COUNTERS.snapshot();
+        let before = crate::activations::gelu_snapshot_locked(&_lock);
         let out = tower.forward(&input, &[true]).unwrap();
-        let after = crate::activations::GELU_DISPATCH_COUNTERS.snapshot();
+        let after = crate::activations::gelu_snapshot_locked(&_lock);
 
         assert_eq!(out.dims(), &[1, cfg.projection_dim]);
         assert_eq!(
@@ -3718,23 +3684,16 @@ mod tests {
     /// this is a genuine numeric equality, not merely a counter equality.
     #[test]
     fn projection_gelu_arm_dispatches_the_seam_exactly_once() {
-        // Lock order: attention_cascade THEN layer_norm -- see this test's
-        // own doc.
-        let _attn_guard = crate::attention_cascade::ATTENTION_BLOCK_COUNTER_TEST_LOCK
-            .lock()
-            .unwrap_or_else(|e| e.into_inner());
-        let _ln_guard = crate::layer_norm::DISPATCH_COUNTER_TEST_LOCK
-            .lock()
-            .unwrap_or_else(|e| e.into_inner());
+        let _lock = crate::test_support::seam_counter_lock();
         let device = Device::Cpu;
         let varmap = VarMap::new();
         let (proj, x) = build_projection(&varmap, &device, "gelu");
 
         // Eval arm, through the flag-less public convenience: no admission
         // decision at all.
-        let before_eval = crate::activations::GELU_DISPATCH_COUNTERS.snapshot();
+        let before_eval = crate::activations::gelu_snapshot_locked(&_lock);
         let eval_out = proj.forward_unnormalized(&x).unwrap();
-        let after_eval = crate::activations::GELU_DISPATCH_COUNTERS.snapshot();
+        let after_eval = crate::activations::gelu_snapshot_locked(&_lock);
         assert_eq!(
             (after_eval.fused, after_eval.eager),
             (before_eval.fused, before_eval.eager),
@@ -3742,9 +3701,9 @@ mod tests {
         );
 
         // Training arm: exactly one fused dispatch, no eager fallback.
-        let before = crate::activations::GELU_DISPATCH_COUNTERS.snapshot();
+        let before = crate::activations::gelu_snapshot_locked(&_lock);
         let train_out = proj.forward_unnormalized_with_training(&x, true).unwrap();
-        let after = crate::activations::GELU_DISPATCH_COUNTERS.snapshot();
+        let after = crate::activations::gelu_snapshot_locked(&_lock);
         assert_eq!(
             after.fused - before.fused,
             1,
@@ -3775,21 +3734,14 @@ mod tests {
     /// machinery to a ReLU network.
     #[test]
     fn projection_relu_arm_never_touches_the_gelu_seam() {
-        // Lock order: attention_cascade THEN layer_norm -- see this test's
-        // own doc.
-        let _attn_guard = crate::attention_cascade::ATTENTION_BLOCK_COUNTER_TEST_LOCK
-            .lock()
-            .unwrap_or_else(|e| e.into_inner());
-        let _ln_guard = crate::layer_norm::DISPATCH_COUNTER_TEST_LOCK
-            .lock()
-            .unwrap_or_else(|e| e.into_inner());
+        let _lock = crate::test_support::seam_counter_lock();
         let device = Device::Cpu;
         let varmap = VarMap::new();
         let (proj, x) = build_projection(&varmap, &device, "relu");
 
-        let before = crate::activations::GELU_DISPATCH_COUNTERS.snapshot();
+        let before = crate::activations::gelu_snapshot_locked(&_lock);
         let out = proj.forward_unnormalized_with_training(&x, true).unwrap();
-        let after = crate::activations::GELU_DISPATCH_COUNTERS.snapshot();
+        let after = crate::activations::gelu_snapshot_locked(&_lock);
 
         assert_eq!(out.dims(), &[1, 8]);
         assert_eq!(
@@ -4062,14 +4014,7 @@ mod tests {
     ///   assertion rather than by coincidence.
     #[test]
     fn fusible_site_census_is_the_exact_per_forward_seam_call_count() {
-        // Lock order: attention_cascade THEN layer_norm — see this module's
-        // own multi-lock test doc.
-        let _attn_guard = crate::attention_cascade::ATTENTION_BLOCK_COUNTER_TEST_LOCK
-            .lock()
-            .unwrap_or_else(|e| e.into_inner());
-        let _ln_guard = crate::layer_norm::DISPATCH_COUNTER_TEST_LOCK
-            .lock()
-            .unwrap_or_else(|e| e.into_inner());
+        let _lock = crate::test_support::seam_counter_lock();
 
         let device = Device::Cpu;
         let dir = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
@@ -4089,6 +4034,7 @@ mod tests {
             &mut any,
             &device,
             "htsat/all-linear/relu",
+            &_lock,
         );
 
         // Re-derived from the geometry this tower was built from: six sites
@@ -4122,6 +4068,7 @@ mod tests {
             &mut any_gelu,
             &device,
             "htsat/all-linear/gelu",
+            &_lock,
         );
         assert_eq!(
             gelu_census.gelu_seam_calls_per_forward,
@@ -4141,6 +4088,7 @@ mod tests {
             &mut any_frozen,
             &device,
             "htsat/frozen",
+            &_lock,
         );
         assert_eq!(
             frozen_census.lora_sites_wrapped, 0,

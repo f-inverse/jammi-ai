@@ -128,17 +128,18 @@ use crate::error::EncoderError;
 pub static LN_DISPATCH_COUNTERS: LazyLock<&'static DispatchCounters> =
     LazyLock::new(|| counters_for("layer_norm_fused"));
 
-/// Test-only serialization for two-sided (`fused` advanced AND `eager`
-/// unchanged) assertions against [`LN_DISPATCH_COUNTERS`]: it is one
-/// process-wide static shared by every `#[test]` in this crate's unit-test
-/// binary (`src/layer_norm.rs`'s own `mod tests` and `src/clip_text.rs`'s),
-/// so an exact-equality read of its `eager` half is racy under the default
-/// parallel test runner unless the read is exclusive. Mirrors
-/// `crate::modernbert::DISPATCH_COUNTER_TEST_LOCK`'s SAME rationale for the
-/// SEPARATE `tests/it` integration binary — that lock lives in a different
-/// process and cannot serialize this one.
+/// Test-only guarded read of [`LN_DISPATCH_COUNTERS`]: takes
+/// `&SeamCounterGuard` (esc-092 / issue #476, see that type's own doc for
+/// exactly what holding a reference to it proves) — the single-key sibling
+/// of `crate::test_support::seam_dispatch_totals` for this module's own
+/// tests, which read `LN_DISPATCH_COUNTERS` alone rather than the summed
+/// three-seam tuple.
 #[cfg(test)]
-pub(crate) static DISPATCH_COUNTER_TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+pub(crate) fn ln_snapshot_locked(
+    _lock: &crate::test_support::SeamCounterGuard<'_>,
+) -> jammi_kernels::admission::DispatchSnapshot {
+    LN_DISPATCH_COUNTERS.snapshot()
+}
 
 /// The fused kernel's domain, checked at the call site (family D / K2):
 /// `x` and `weight` live on a device [`device_is_supported`] accepts,
@@ -578,6 +579,7 @@ impl LayerNorm {
             Some(b) => Some(affine_needed_gate(b, "bias")?),
             None => None,
         };
+        crate::seam_gate("layer_norm::forward_fused_or_fallback");
         let outcome = admit(
             admission_mode(),
             "layer_norm_fused",
@@ -971,9 +973,7 @@ mod tests {
     /// assertion is built to catch.
     #[test]
     fn tracked_non_var_gamma_through_forward_is_a_typed_refusal_with_counters_untouched() {
-        let _guard = DISPATCH_COUNTER_TEST_LOCK
-            .lock()
-            .unwrap_or_else(|e| e.into_inner());
+        let _lock = crate::test_support::seam_counter_lock();
         let device = Device::Cpu;
         let hidden = 8;
         let gv: Vec<bf16> = (0..hidden)
@@ -1012,11 +1012,11 @@ mod tests {
         };
         ln.set_training(true);
 
-        let before = LN_DISPATCH_COUNTERS.snapshot();
+        let before = ln_snapshot_locked(&_lock);
         let err = ln
             .forward(&x)
             .expect_err("a tracked non-Var gamma must be a typed refusal, not a silent dispatch");
-        let after = LN_DISPATCH_COUNTERS.snapshot();
+        let after = ln_snapshot_locked(&_lock);
         assert!(matches!(err, EncoderError::Config(_)));
         assert_eq!(
             (after.fused, after.eager),
@@ -1032,9 +1032,7 @@ mod tests {
     /// bias-free path uses.
     #[test]
     fn biased_training_with_a_var_bias_counts_fused_and_populates_dbeta() {
-        let _guard = DISPATCH_COUNTER_TEST_LOCK
-            .lock()
-            .unwrap_or_else(|e| e.into_inner());
+        let _lock = crate::test_support::seam_counter_lock();
         let device = Device::Cpu;
         let hidden = 4;
         let rows = 2;
@@ -1055,9 +1053,9 @@ mod tests {
             eps: 1e-5,
             training: true,
         };
-        let before = LN_DISPATCH_COUNTERS.snapshot();
+        let before = ln_snapshot_locked(&_lock);
         let out = ln.forward(x.as_tensor()).unwrap();
-        let after = LN_DISPATCH_COUNTERS.snapshot();
+        let after = ln_snapshot_locked(&_lock);
         assert!(
             after.fused > before.fused && after.eager == before.eager,
             "a Var bias must not prevent the fused biased dispatch, and must never fall back \
@@ -1119,10 +1117,8 @@ mod tests {
         // arm" further down) bumps `LN_DISPATCH_COUNTERS` even though this
         // test never reads it — same lock discipline as every other
         // training-forward test in this module (see
-        // `DISPATCH_COUNTER_TEST_LOCK`'s own doc).
-        let _guard = DISPATCH_COUNTER_TEST_LOCK
-            .lock()
-            .unwrap_or_else(|e| e.into_inner());
+        // `crate::test_support::seam_counter_lock`'s own doc).
+        let _lock = crate::test_support::seam_counter_lock();
         let device = Device::Cpu;
         let hidden = 8;
         let xv: Vec<bf16> = (0..hidden)
@@ -1185,9 +1181,7 @@ mod tests {
     /// tolerance.
     #[test]
     fn biased_layer_norm_training_now_dispatches_fused_eval_is_unaffected() {
-        let _guard = DISPATCH_COUNTER_TEST_LOCK
-            .lock()
-            .unwrap_or_else(|e| e.into_inner());
+        let _lock = crate::test_support::seam_counter_lock();
         let device = Device::Cpu;
         let hidden = 8;
         let weight = Tensor::from_slice(&[1.3f32; 8], (hidden,), &device).unwrap();
@@ -1211,7 +1205,7 @@ mod tests {
             "fixture must satisfy the biased fused domain: {predicate}"
         );
 
-        let before = LN_DISPATCH_COUNTERS.snapshot();
+        let before = ln_snapshot_locked(&_lock);
         let out_training: Vec<f32> = ln
             .forward(&x)
             .unwrap()
@@ -1219,7 +1213,7 @@ mod tests {
             .unwrap()
             .to_vec1()
             .unwrap();
-        let after = LN_DISPATCH_COUNTERS.snapshot();
+        let after = ln_snapshot_locked(&_lock);
         assert!(
             after.fused > before.fused && after.eager == before.eager,
             "biased training must dispatch the fused kernel, and never fall back to eager \
@@ -1319,17 +1313,23 @@ mod tests {
         let (holds, predicate) = fused_admission_predicate(x_fused.as_tensor(), &ln_fused.weight);
         assert!(holds, "fixture must be fused-eligible: {predicate}");
         // `LN_DISPATCH_COUNTERS` is one process-wide static shared with
-        // every other test in this binary — under parallel test
-        // execution an exact before+1 delta would be racy, so this only
-        // asserts monotonic increase (other concurrent tests can only
-        // add to it, never subtract).
-        let before = LN_DISPATCH_COUNTERS.snapshot();
+        // every other test in this binary (esc-092 / issue #476): this test
+        // holds `crate::test_support::seam_counter_lock()` for the whole
+        // before/after window, so it asserts the EXACT `+1` delta a single
+        // training forward through one LayerNorm must produce.
+        let _lock = crate::test_support::seam_counter_lock();
+        let before = ln_snapshot_locked(&_lock);
         let out_fused = ln_fused.forward(&x_fused).unwrap();
-        let after = LN_DISPATCH_COUNTERS.snapshot();
-        assert!(
-            after.fused > before.fused,
-            "this fixture must actually dispatch the fused kernel, not fall back \
-             (before={before:?}, after={after:?})"
+        let after = ln_snapshot_locked(&_lock);
+        assert_eq!(
+            after.fused,
+            before.fused + 1,
+            "this fixture must dispatch the fused kernel EXACTLY once, not fall back and not \
+             be joined by another test's dispatch (before={before:?}, after={after:?})"
+        );
+        assert_eq!(
+            after.eager, before.eager,
+            "a fused-eligible fixture must not also bump the eager count"
         );
 
         let x_eager =
@@ -2510,6 +2510,12 @@ mod tests {
         // the child process above is then simply a no-op assertion-free
         // pass, never a false RED).
         if std::env::var_os("LN_FORWARD_STRICT_CHILD").is_some() {
+            // The sole test running in this spawned child process (no real
+            // contention), but the assertion at `forward_fused_or_fallback`'s
+            // own `admit()` call site is unconditional (esc-092) — it does
+            // not know this process holds no other test, only whether this
+            // thread holds the lock.
+            let _lock = crate::test_support::seam_counter_lock();
             let device = Device::Cpu;
             let hidden = 8;
             let x = Tensor::from_slice(&[0.1f32; 8], (1, hidden), &device).unwrap();

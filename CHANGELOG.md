@@ -453,6 +453,37 @@ workspace ships every publishable crate at the same
   completed attempt sitting behind an in-flight rerun still denies (F5).
 
 ### Fixed
+- **`jammi-encoders`' unit-test binary now serializes every writer of EVERY process-wide fusible-seam
+  dispatch counter through the SAME lock the exact-count census oracle's reader holds (esc-092 /
+  #476).** The class is "every training-arm admission site this crate owns", not just the three
+  registries `FusibleSiteCensus` sums: `layer_norm_fused`, `gelu_erf_fused`, `attention_block_fused`,
+  `attention_block_flash`, `mem_efficient_attention`, `softmax_last_dim_fused`, `rope_fused`, and
+  `geglu_fused` are all gated. The prior scheme's two separate locks
+  (`layer_norm::DISPATCH_COUNTER_TEST_LOCK`, `attention_cascade::ATTENTION_BLOCK_COUNTER_TEST_LOCK`,
+  both deleted, not aliased) enforced reader-exclusivity only by convention at each writer; nothing
+  enumerated or checked that every training-mode forward reaching one of these seams' `admit()`/
+  `admit_cascade()` call actually held one, so an unlocked writer's bump could land inside another
+  test's before/after window and a census/delta oracle would misattribute it to the wrong tower.
+  `crate::test_support::seam_counter_lock()` replaces both locks with exactly one, and
+  `crate::test_support::assert_seam_lock_held` is a `#[cfg(test)]`-only mechanical gate, reached
+  through the plain call `crate::seam_gate(site)` (a `cfg(test)` / `cfg(not(test))` function pair in
+  the crate root, never a `#[cfg(test)]` attribute on the statement, because the disable-op-keys
+  suite discovers live `admit()` sites by excluding `#[cfg(test)]`-attributed items), called from
+  seven guard call sites covering all eight registries — critically, for `attention_cascade::training_attention_cascade`
+  (whose one guard call covers THREE of the eight registries across four early-return branches) and
+  `modernbert::ModernBertAttention::forward_padded_transport_attention` (a second, separate
+  `attention_block_flash` writer), the gate sits at each function's ENTRY, before its first write,
+  not merely before its last — a first-round placement immediately before the LAST write left every
+  earlier-returning branch bypassable, which a follow-up audit caught and this fix corrects.
+  `seam_dispatch_totals`/`assert_fusible_site_census_is_exact` take `&SeamCounterGuard` by parameter
+  for the three exact-delta registries (`layer_norm_fused`/`gelu_erf_fused`/`attention_block_fused`,
+  each with a guard-taking snapshot accessor); the other five are read one-sided (`>`/exact-delta
+  assertions ad hoc per test, no guard-taking accessor) — holding `&SeamCounterGuard` proves a guard
+  exists, not that the calling thread is the one that acquired it (`MutexGuard<()>` is `Sync`), so
+  the per-thread flag `assert_seam_lock_held` checks is the real enforcement. `lora_linear_fused`
+  stays convention-only: it is admitted inside `jammi_lora::lora_linear`, a normal (non-`cfg(test)`)
+  dependency this crate cannot instrument from the outside without moving `jammi-bench`'s own shipped
+  read of the same process-wide counter.
 - **BERT-family loader accepts the original Google LayerNorm tensor names (`…LayerNorm.gamma`/
   `…LayerNorm.beta`) the stock `bert-base-uncased` checkpoint carries (#423).** `LayerNorm::new`
   (`crates/jammi-encoders/src/layer_norm.rs`) now aliases `gamma`->`weight` and `beta`->`bias` at

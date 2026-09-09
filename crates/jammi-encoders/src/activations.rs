@@ -30,6 +30,20 @@ pub(crate) fn quick_gelu(xs: &Tensor) -> Result<Tensor, EncoderError> {
 pub(crate) static GELU_DISPATCH_COUNTERS: LazyLock<&'static DispatchCounters> =
     LazyLock::new(|| counters_for("gelu_erf_fused"));
 
+/// Test-only guarded read of [`GELU_DISPATCH_COUNTERS`]: takes
+/// `&SeamCounterGuard` (esc-092 / issue #476, see that type's own doc for
+/// exactly what holding a reference to it proves) — mirrors
+/// `crate::layer_norm::ln_snapshot_locked` exactly, for the tests in this
+/// module and `crate::htsat_audio` that read `GELU_DISPATCH_COUNTERS` alone
+/// rather than the summed three-seam tuple
+/// `crate::test_support::seam_dispatch_totals` returns.
+#[cfg(test)]
+pub(crate) fn gelu_snapshot_locked(
+    _lock: &crate::test_support::SeamCounterGuard<'_>,
+) -> jammi_kernels::admission::DispatchSnapshot {
+    GELU_DISPATCH_COUNTERS.snapshot()
+}
+
 /// The fused GELU-erf kernel's domain, checked at the call site (family D /
 /// K2): `x`'s device is one [`device_is_supported`] accepts, its dtype is
 /// `F32` on either device or additionally `BF16`/`F16` on CUDA (matching
@@ -153,6 +167,7 @@ pub(crate) fn gelu_erf(x: &Tensor, training: bool) -> Result<Tensor, EncoderErro
         return Ok(x.gelu_erf()?);
     }
     let (holds, predicate) = gelu_admission_predicate(x);
+    crate::seam_gate("activations::gelu_erf");
     let outcome = admit(
         admission_mode(),
         "gelu_erf_fused",
@@ -262,12 +277,17 @@ mod tests {
     #[test]
     #[ignore]
     fn strict_mode_child_process_body() {
+        // The sole test running in this spawned child process (no real
+        // contention), but the assertion at `gelu_erf`'s own `admit()` call
+        // site is unconditional (esc-092) — it does not know this process
+        // holds no other test, only whether this thread holds the lock.
+        let _lock = crate::test_support::seam_counter_lock();
         let device = Device::Cpu;
         let x = Tensor::zeros((2, 4), DType::BF16, &device).unwrap();
-        let before = GELU_DISPATCH_COUNTERS.snapshot();
+        let before = gelu_snapshot_locked(&_lock);
         let err = gelu_erf(&x, true)
             .expect_err("CPU BF16 under Strict must be a typed refusal, not a silent eager");
-        let after = GELU_DISPATCH_COUNTERS.snapshot();
+        let after = gelu_snapshot_locked(&_lock);
         let msg = err.to_string();
         assert!(
             msg.contains("gelu_erf_fused") && msg.contains("dtype_f32_only_on_cpu"),
@@ -292,14 +312,12 @@ mod tests {
         // registry every other GELU/attention counter test in this crate
         // reads, so it must serialize against them the same way
         // `bert`/`distilbert`/`modernbert`'s own counter tests do.
-        let _guard = crate::attention_cascade::ATTENTION_BLOCK_COUNTER_TEST_LOCK
-            .lock()
-            .unwrap_or_else(|e| e.into_inner());
+        let _lock = crate::test_support::seam_counter_lock();
         let device = Device::Cpu;
         let x = Tensor::from_slice(&[-2.0f32, -0.5, 0.0, 0.5, 2.0], (5,), &device).unwrap();
-        let before = GELU_DISPATCH_COUNTERS.snapshot();
+        let before = gelu_snapshot_locked(&_lock);
         let got = gelu_erf(&x, true).unwrap().to_vec1::<f32>().unwrap();
-        let after = GELU_DISPATCH_COUNTERS.snapshot();
+        let after = gelu_snapshot_locked(&_lock);
         let want = x.gelu_erf().unwrap().to_vec1::<f32>().unwrap();
         assert_eq!(got, want);
         assert!(
@@ -330,9 +348,7 @@ mod tests {
     /// counter lock (audit round item 8).
     #[test]
     fn gelu_erf_training_fused_forward_is_bit_identical_to_eager_on_head64_fixture() {
-        let _guard = crate::attention_cascade::ATTENTION_BLOCK_COUNTER_TEST_LOCK
-            .lock()
-            .unwrap_or_else(|e| e.into_inner());
+        let _lock = crate::test_support::seam_counter_lock();
         let device = Device::Cpu;
         // head64-shaped fixture: b=2, s=5, h=2, d=64 attention output width
         // (hd=128), fed through a 4x FFN blow-up (intermediate=512) — the
@@ -351,14 +367,14 @@ mod tests {
             .collect();
         let x = Tensor::from_slice(&v, (b, s, intermediate), &device).unwrap();
 
-        let before = GELU_DISPATCH_COUNTERS.snapshot();
+        let before = gelu_snapshot_locked(&_lock);
         let fused_out: Vec<f32> = gelu_erf(&x, true)
             .unwrap()
             .flatten_all()
             .unwrap()
             .to_vec1()
             .unwrap();
-        let after = GELU_DISPATCH_COUNTERS.snapshot();
+        let after = gelu_snapshot_locked(&_lock);
         assert!(
             after.fused > before.fused,
             "a supported F32/contiguous/non-empty CPU tensor must dispatch fused"
@@ -457,9 +473,7 @@ mod tests {
 
         // Two-sided under the crate-shared counter lock (audit round item
         // 8) — same rationale as the sibling tests above.
-        let _guard = crate::attention_cascade::ATTENTION_BLOCK_COUNTER_TEST_LOCK
-            .lock()
-            .unwrap_or_else(|e| e.into_inner());
+        let _lock = crate::test_support::seam_counter_lock();
         let device = Device::Cpu;
         let hd = 6usize; // "intermediate.dense"/"lin1" out_features stand-in.
         let varmap = VarMap::new();
@@ -496,9 +510,9 @@ mod tests {
         let b_val: Vec<f32> = b_var.flatten_all().unwrap().to_vec1::<f32>().unwrap();
 
         // Fused arm: through the real seam, admission included.
-        let before = GELU_DISPATCH_COUNTERS.snapshot();
+        let before = gelu_snapshot_locked(&_lock);
         let out_fused = gelu_erf(&hidden, true).unwrap();
-        let after = GELU_DISPATCH_COUNTERS.snapshot();
+        let after = gelu_snapshot_locked(&_lock);
         assert!(
             after.fused > before.fused,
             "must dispatch fused at this shape"

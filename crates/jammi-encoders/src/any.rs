@@ -825,10 +825,8 @@ mod tests {
         // the SAME lock the asserting tests in `clip_text.rs`/`layer_norm.rs`
         // hold, or its bump can land inside one of those tests' own
         // before/after window under parallel `cargo test` (see
-        // `crate::layer_norm::DISPATCH_COUNTER_TEST_LOCK`'s doc).
-        let _guard = crate::layer_norm::DISPATCH_COUNTER_TEST_LOCK
-            .lock()
-            .unwrap_or_else(|e| e.into_inner());
+        // `crate::test_support::seam_counter_lock`'s doc).
+        let _lock = crate::test_support::seam_counter_lock();
         let (input_ids, mask) = fixed_batch(&cfg, &device);
         let out = any.forward(&input_ids, &mask).unwrap();
         let loss = nonuniform_loss(&out, cfg.embed_dim, &device);
@@ -1057,26 +1055,20 @@ mod tests {
         let mut encoder = AnyEncoder::ClipText(ClipText::load(vb, &cfg).unwrap());
         deterministic_fill_varmap(&varmap, &device);
 
-        // Lock order: attention_cascade THEN layer_norm — see
-        // `crate::htsat_audio`'s own multi-lock test doc. Held even though
-        // this test drives no forward: it reads the process-wide counters
-        // for an exact-equality assertion, so a concurrent training forward
-        // in another test would otherwise land inside the window.
-        let _attn_guard = crate::attention_cascade::ATTENTION_BLOCK_COUNTER_TEST_LOCK
-            .lock()
-            .unwrap_or_else(|e| e.into_inner());
-        let _ln_guard = crate::layer_norm::DISPATCH_COUNTER_TEST_LOCK
-            .lock()
-            .unwrap_or_else(|e| e.into_inner());
+        // Held even though this test drives no forward: it reads the
+        // process-wide counters for an exact-equality assertion, so a
+        // concurrent training forward in another test would otherwise land
+        // inside the window.
+        let _lock = crate::test_support::seam_counter_lock();
 
         // Read in BOTH modes: the census is a structural property, so the
         // training flag must not change it either.
-        let before = crate::test_support::seam_dispatch_totals();
+        let before = crate::test_support::seam_dispatch_totals(&_lock);
         encoder.set_training(true);
         let training_read = encoder.fusible_site_census();
         encoder.set_training(false);
         let eval_read = encoder.fusible_site_census();
-        let after = crate::test_support::seam_dispatch_totals();
+        let after = crate::test_support::seam_dispatch_totals(&_lock);
 
         assert_eq!(
             after, before,

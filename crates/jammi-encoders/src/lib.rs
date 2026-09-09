@@ -62,6 +62,35 @@ mod pooling;
 #[cfg(test)]
 mod test_support;
 
+/// The seam-lock witness every training-arm admission site in this crate
+/// calls immediately before its `admit()` / `admit_cascade()` write
+/// (`layer_norm::forward_fused_or_fallback`, `activations::gelu_erf`,
+/// `attention_cascade::training_attention_cascade` at its entry,
+/// `attention_cascade::softmax_apply_training`,
+/// `modernbert::RotaryEmbedding::apply_training`,
+/// `modernbert::ModernBertAttention::forward_padded_transport_attention`,
+/// `modernbert::geglu_apply_training`). In the unit-test binary it is
+/// `test_support::assert_seam_lock_held`: the calling thread must hold
+/// `test_support::seam_counter_lock()` or the call panics by site name, so a
+/// training-mode forward can never bump a process-global dispatch counter
+/// inside another test's exact-count window (esc-092). Outside `cfg(test)` it
+/// is an empty inline function -- the shipped dispatch path carries no check.
+///
+/// It is a plain function call at the call sites, never a `#[cfg(test)]`
+/// attribute on the statement: `ci/scripts/perf/test_finetune_ab_disable_op_keys.py`
+/// discovers the live standalone `admit()` sites mechanically and excludes
+/// `#[cfg(test)]`-attributed ITEMS by the brace-balanced span after the
+/// attribute, so an attribute on a bare statement would swallow the very
+/// `admit()` call it precedes.
+#[cfg(test)]
+#[inline]
+pub(crate) fn seam_gate(site: &'static str) {
+    test_support::assert_seam_lock_held(site);
+}
+#[cfg(not(test))]
+#[inline(always)]
+pub(crate) fn seam_gate(_site: &'static str) {}
+
 pub use aggregate::{segment_aggregate, SegmentReduce};
 // There is deliberately NO second, audio-only dispatcher or trait beside
 // `AnyEncoder`: audio is a first-class `AnyEncoder` variant carrying the same

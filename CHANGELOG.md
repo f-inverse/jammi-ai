@@ -451,6 +451,29 @@ workspace ships every publishable crate at the same
   window: when an arch's latest attempt is itself still in progress, it now falls back to that run's
   own most recent COMPLETED attempt for the arch (`filter=all`, lazy, cached per run) — a red
   completed attempt sitting behind an in-flight rerun still denies (F5).
+- **The CI base image (`jammi-ai-ci`) is now a multi-arch index: `linux/amd64` + `linux/arm64`.**
+  `_ci-base-image.yml`'s `build-and-push` is a matrix over the caller's `platforms` input, one
+  NATIVE runner per platform (`linux/amd64` on `ubuntu-latest`, `linux/arm64` on
+  `ubuntu-24.04-arm` — no QEMU); each leg pushes only its own immutable `sha-<sha>-<arch>` tag, and
+  a new `merge-manifest` job (running for every caller, including a one-platform caller like
+  `image-cuda.yml`, which stays `linux/amd64`-only) merges the per-arch sources into the real
+  `latest`/`sha-<sha>` tags via `docker buildx imagetools create`, verifying the resulting index's
+  platform set (and one `unknown/unknown` provenance entry per platform) BEFORE promoting anything —
+  a `create --dry-run` against the same tags/sources first, asserted, only then the real (pushing)
+  create — and re-inspecting the pushed tag once after to confirm the push matched. `image.yml`
+  requests both platforms; the CUDA base (`jammi-ai-ci-cuda`) is STILL amd64-only (no arm64 leg) —
+  its tags are now a single-platform OCI index (same merge-and-verify path, one member) and its
+  Dockerfile takes a `BASE_IMAGE` build-arg like the CPU base's. Apple-silicon devcontainers now
+  resolve `:latest` to a native arm64 image instead of an emulated amd64 one. arm64 Linux builds of
+  this workspace pin a compile BASELINE, `-C target-feature=+fp16` (ARMv8.2-A FEAT_FP16), in
+  `.cargo/config.toml`'s `[target.aarch64-unknown-linux-gnu]` `rustflags` — `gemm`'s aarch64 f16
+  kernels dispatch at RUNTIME regardless of this flag, but the same code fails to COMPILE at
+  opt-level 0 without it. Graviton2+, Ampere Altra, and Apple silicon all qualify; Raspberry Pi 4
+  (ARMv8.0) is not a supported aarch64-linux host for this workspace's artifacts. `setup-rust-ci`
+  never exports a bare `RUSTFLAGS` (which would replace, not join, config-file rustflags for every
+  target) — its `deny-warnings` input exports a per-target `CARGO_TARGET_<TRIPLE>_RUSTFLAGS=
+  -D warnings` instead, which joins with `.cargo/config.toml`'s own per-target `rustflags` (mold and
+  the fp16 floor both apply unconditionally, everywhere, local dev and CI alike).
 
 ### Fixed
 - **`jammi-encoders`' unit-test binary now serializes every writer of EVERY process-wide fusible-seam

@@ -1,4 +1,13 @@
-FROM ghcr.io/f-inverse/jammi-ai-ci:latest
+# BASE_IMAGE has no default ON PURPOSE, the same fail-closed doctrine
+# ci.Dockerfile's own BASE_IMAGE/RUST_VERSION ARGs are held to: the workflow
+# passes it explicitly (image-cuda.yml's own `base_image_amd64` input,
+# defaulting to `ghcr.io/f-inverse/jammi-ai-ci:latest`).
+#
+# The CUDA base is amd64-only: image-cuda.yml passes no `platforms`, so this
+# FROM pins the platform explicitly and an arm64 caller fails loudly at the
+# base-image resolution step instead of silently emulating.
+ARG BASE_IMAGE
+FROM --platform=linux/amd64 ${BASE_IMAGE}
 
 # GCC 13: CUDA 12.6 supports GCC ≤ 13.2; manylinux_2_28 ships GCC 14.2.
 # Install gcc-toolset-13 and put it on PATH so nvcc (which ignores CC/CXX

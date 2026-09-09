@@ -198,6 +198,12 @@ jobs:
       - uses: docker/build-push-action@10e90e3645eae34f1e60eeb005ba3a3d33f178e8
         with:
           push: true
+  merge-manifest:
+    needs: [build-and-push]
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - run: docker buildx imagetools create -t ghcr.io/f-inverse/jammi-ai-ci:latest a b
 """
 
 
@@ -1220,6 +1226,27 @@ class PrimitivePatternShapesTest(unittest.TestCase):
         findings = cgo.check_p6_discovery({**_positive_texts(), "rogue.yml": rogue})
         self.assertTrue(any("sneak" in f for f in findings), findings)
 
+    def test_imagetools_create_unlisted_fails(self):
+        # An untabled `docker buildx imagetools create` merge job is a
+        # promotion (it moves a real, consumer-facing tag) and must be caught
+        # by name -- the same doctrine every other primitive above gets.
+        findings = cgo.check_p6_discovery(
+            self._rogue("docker buildx imagetools create -t ghcr.io/f-inverse/rogue:latest a b")
+        )
+        self.assertTrue(any("sneak" in f for f in findings), findings)
+
+    def test_imagetools_inspect_only_is_not_a_promotion(self):
+        # `imagetools inspect` is read-only (used to assert a merged index's
+        # platform set) -- never bare `imagetools`, and never flagged as a
+        # promotion on its own.
+        clean = (
+            "name: clean\n\non:\n  push:\n    tags: [\"v*\"]\n\njobs:\n"
+            "  inspect-only:\n    runs-on: ubuntu-latest\n    steps:\n"
+            "      - run: docker buildx imagetools inspect ghcr.io/f-inverse/rogue:latest\n"
+        )
+        findings = cgo.check_p6_discovery({**_positive_texts(), "clean.yml": clean})
+        self.assertEqual(findings, [], findings)
+
 
 class RecursiveLocalReusableDiscoveryTest(unittest.TestCase):
     """F1 audit fix: a job that merely `uses:` a LOCAL reusable workflow
@@ -1245,12 +1272,17 @@ class RecursiveLocalReusableDiscoveryTest(unittest.TestCase):
         )
 
     def test_reusable_only_workflow_itself_is_never_double_tabled(self):
-        # _ci-base-image.yml's OWN `build-and-push` job (workflow_call-only
-        # file) must never itself be required as a table row -- only its
-        # caller's job is.
+        # _ci-base-image.yml's OWN `build-and-push` AND `merge-manifest` jobs
+        # (workflow_call-only file) must never themselves be required as
+        # table rows -- only their caller's job is: the caller's
+        # already-tabled row covers a SECOND promoting job in the same
+        # reusable too -- no new PROMOTION_TABLE row for the merge job.
         findings = cgo.check_p6_discovery(_positive_texts())
         self.assertFalse(
             any("_ci-base-image.yml" in f and "build-and-push" in f for f in findings), findings
+        )
+        self.assertFalse(
+            any("_ci-base-image.yml" in f and "merge-manifest" in f for f in findings), findings
         )
 
 

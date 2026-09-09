@@ -790,13 +790,18 @@ jobs:
   # green"; both claims were false on this runner and are corrected by
   # this comment and the removal of those two steps.
   #
-  # No `./.github/actions/setup-rust-ci`: that composite's DEFAULT
-  # `rustflags` hardcodes `-C link-arg=-fuse-ld=mold` — a Linux-only linker
-  # this runner does not have (`.cargo/config.toml`'s own mold pin is
-  # scoped to the `x86_64`/`aarch64`-unknown-linux-gnu targets only, never
-  # `aarch64-apple-darwin`) — and this job otherwise has no need for the
-  # sccache-GHA-cache half either (a macOS runner has its own toolchain
-  # cache, not this repo's Linux container image's warm sccache server).
+  # No `./.github/actions/setup-rust-ci`: that composite has no `rustflags`
+  # of its own at all (mold and the aarch64 `+fp16` floor live entirely in
+  # `.cargo/config.toml`'s per-target `rustflags`, scoped to the
+  # `x86_64`/`aarch64`-unknown-linux-gnu targets only, never
+  # `aarch64-apple-darwin` — this job never touches either flag either
+  # way) — this job needs neither half of what the composite actually
+  # offers: not the sccache-GHA-cache backend (this job installs its own
+  # sccache fresh, cold-cache, below, since a macOS runner has no
+  # preinstalled binary and this repo's Linux CI image's warm sccache
+  # server is unreachable from here), and not a per-target `-D warnings`
+  # export (each `cargo clippy` step below already passes `-- -D warnings`
+  # directly on its own command line).
   # Deliberately no RUSTFLAGS/RUSTC_WRAPPER override of any kind here: GH's
   # `macos-14` image ships `rustup` + a working `cc`/linker already, and
   # `rust-toolchain.toml` (channel 1.94.0, components rustfmt+clippy) is
@@ -1457,6 +1462,15 @@ jobs:
             cmd: python3 ci/scripts/check_gpu_prove_once.py
           - name: gpu prove once suite
             cmd: python3 ci/scripts/test_check_gpu_prove_once.py
+          # `_ci-base-image.yml`'s `merge-manifest` job's own gate: asserts a
+          # `docker buildx imagetools` manifest-list JSON carries exactly a
+          # requested platform set plus one `unknown/unknown` attestation
+          # entry per platform, run against both the dry-run (pre-push) and
+          # the post-push confirm call sites. Self-test only here (no
+          # docker, no network) — the script itself takes a live manifest on
+          # stdin, which only the real workflow run can produce.
+          - name: merged index platforms self-test
+            cmd: bash ci/scripts/check_merged_index_platforms.sh --self-test
           # The verdict CONSUMER's own suite: every esc-084 control (b)
           # degenerate record, the recency/revocation rule, and the wait
           # state machine, driven with a fake fetch/clock — no network.
@@ -2085,6 +2099,158 @@ jobs:
         continue-on-error: ${{ matrix.continue_on_error == 'true' }}
         run: ${{ matrix.cmd }}
 
+  # `.cargo/config.toml`'s `[target.aarch64-unknown-linux-gnu]` `+fp16`
+  # stanza is a COMPILE BASELINE, not a runtime floor: `gemm` 0.19's
+  # aarch64 f16 kernels are selected at RUNTIME
+  # (`is_aarch64_feature_detected!("fp16")`, `gemm-common-0.19.0/src/
+  # simd.rs:2088`, inside a `#[target_feature(enable="neon,fp16")]` caller
+  # at `:2071`) -- a release build WITHOUT `+fp16` still dispatches to them
+  # at runtime on hardware that has FEAT_FP16; the flag exists ONLY so
+  # `cargo test`/dev (opt-level 0) builds of that same code COMPILE at all.
+  # ARMv8.0 hosts (e.g. Raspberry Pi 4) are the trade this floor makes: not
+  # supported for aarch64-linux artifacts of this workspace.
+  #
+  # This job had never actually EXECUTED on a real aarch64-linux runner
+  # anywhere in this tree before it existed -- every other proof was a
+  # static check or a throwaway probe already deleted. Every assertion
+  # below always runs -- no conditional skip arm: a job whose oracle step
+  # can quietly no-op is exactly the unexecuted-oracle shape this job
+  # exists to close, so it may not itself have one. Two readers of the
+  # SAME stanza, proven separately: `CARGO_TARGET_AARCH64_UNKNOWN_LINUX_
+  # GNU_RUSTFLAGS` (this job's own composite-exported `-D warnings`,
+  # JOINED with config.toml -- what a normal CI job actually gets), and
+  # config.toml ALONE with that variable explicitly unset (what a bare
+  # `cargo build` outside any CI wrapper gets). Both must show the floor;
+  # neither this job nor any CI job may ever export a bare `RUSTFLAGS`
+  # (which would REPLACE, not join, config.toml) -- asserted directly.
+  #
+  # No `container:` (unlike `check`/`test`, which run inside the CI base
+  # image): that image's `:latest` tag only becomes the arm64-carrying
+  # multi-arch index on a push to `main` (`_ci-base-image.yml`'s own rule),
+  # so a `container:` pull here would fail on THIS PR's own pre-merge run --
+  # the exact platform-mismatch failure the deleted probe hit against the
+  # devcontainer, before this repo's own `latest` had moved. The toolchain is
+  # installed directly instead, the same mechanism `release-binaries.yml`'s
+  # macOS leg (also a bare, container-less runner) already uses:
+  # `rust_pin.sh` resolves `rust-toolchain.toml`'s pin into a step output,
+  # and `dtolnay/rust-toolchain` (SHA-pinned) installs exactly that channel,
+  # native to the runner's own arch, no cross-target request.
+  #
+  # Cost: cold (first run after this job lands, or after any cache eviction)
+  # is a real native-arm64 build of `jammi-numerics` and its dependency set
+  # (nalgebra/rand/rand_distr/statrs -- no candle, no gemm, no CUDA) --
+  # measured a couple of minutes end to end including the toolchain install,
+  # TWICE over (readers 1 and 2 each compile once). sccache-warm
+  # (`setup-rust-ci`'s own default GHA cache backend, every run after that)
+  # drops each compile to a few seconds; the toolchain install is the fixed
+  # per-run cost either way (GH-hosted runners are ephemeral, so rustup has
+  # no cross-run cache of its own). Never a full-workspace build.
+  arm64-floor-oracle:
+    name: arm64 floor oracle
+    runs-on: ubuntu-24.04-arm
+    steps:
+      - uses: actions/checkout@v4
+
+      # This job runs BARE (no `container:`) on purpose: the CI image's
+      # `:latest` tag carries no arm64 entry in its manifest INDEX until
+      # THIS PR's `image.yml` run actually publishes one (the multi-arch
+      # index this PR introduces) -- there is no arm64 container image for
+      # it to run inside yet. That makes mold a HARD REQUIREMENT of this
+      # job, not an optimization: the two readers below exist to prove that
+      # `.cargo/config.toml`'s `[target.aarch64-unknown-linux-gnu]`
+      # `rustflags` (mold linker + the `+fp16` compile floor) reaches a
+      # HOST (non-cross, native-arm64) build -- exactly the stanza every
+      # container-based job already exercises for free because the CI
+      # image bakes mold in. Without mold on PATH here, both readers die at
+      # `cc: cannot find 'ld.mold'` before their `grep` ever runs, since
+      # `jammi-numerics` links two proc-macro cdylibs (`serde_derive`,
+      # `thiserror-impl`) even for a plain `--lib` build -- so the linker
+      # always runs, on every crate in this workspace (none is
+      # dependency-free; every one pulls a proc-macro).
+      #
+      # Two alternatives rejected: dropping the mold link-arg for this job
+      # alone (env-unset, or a job-scoped config override) would gut Reader
+      # 1, whose whole point is that `.cargo/config.toml` ALONE (no CI-side
+      # env var) still carries mold -- there would be nothing left in the
+      # config file for it to read. And there is no dependency-free crate
+      # in this workspace to build instead, for the same proc-macro reason
+      # above.
+      #
+      # Same release tarball `.docker/ci.Dockerfile` pins for the CI
+      # image's own arm64 leg -- read the version from there rather than
+      # restate it (the same "read the pin, never copy it" rule the very
+      # next step already applies to `rust-toolchain.toml`), failing closed
+      # if that pin line is missing or empty.
+      - name: Install mold (bare arm64 runner, no CI-image container here)
+        shell: bash
+        run: |
+          set -euo pipefail
+          mold_version="$(sed -n 's/^ARG MOLD_VERSION=//p' .docker/ci.Dockerfile)"
+          if [ -z "$mold_version" ]; then
+            echo "::error::.docker/ci.Dockerfile has no (or an empty) 'ARG MOLD_VERSION=' line -- cannot resolve which mold release to install" >&2
+            exit 1
+          fi
+          curl -fsSL "https://github.com/rui314/mold/releases/download/v${mold_version}/mold-${mold_version}-aarch64-linux.tar.gz" \
+            | sudo tar -xz --strip-components=1 -C /usr/local
+          if ! command -v ld.mold >/dev/null 2>&1; then
+            echo "::error::ld.mold not on PATH after extracting mold v${mold_version} (aarch64-linux tarball) into /usr/local" >&2
+            exit 1
+          fi
+          echo "ld.mold on PATH: $(command -v ld.mold) (installed from ci.Dockerfile's pinned v${mold_version})"
+
+      # Read the pin rather than restate it -- a second copy of the version
+      # here would drift from rust-toolchain.toml without anything noticing.
+      - name: Resolve the pinned Rust toolchain
+        id: rust-pin
+        shell: bash
+        run: |
+          set -euo pipefail
+          channel="$(bash ci/scripts/rust_pin.sh)"
+          echo "channel=$channel" >> "$GITHUB_OUTPUT"
+
+      # SHA-pinned, same pin release-binaries.yml's macOS leg uses; the
+      # branch name in the ref is inert -- the toolchain actually installed
+      # is the explicit `toolchain:` input above.
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@4360b52568e2003a75bf9bc1d59f33a8e3fc893c # stable
+        with:
+          toolchain: ${{ steps.rust-pin.outputs.channel }}
+
+      - uses: ./.github/actions/setup-rust-ci
+
+      - name: Assert this job never exported a bare RUSTFLAGS
+        # The invariant the whole per-target-env-var design rests on: a
+        # bare RUSTFLAGS would REPLACE (never join) config.toml's per-target
+        # rustflags for every target, silently dropping mold AND the fp16
+        # floor alike. setup-rust-ci must never export one, and no later
+        # step in this job may either.
+        shell: bash
+        run: |
+          set -euo pipefail
+          if [ -n "${RUSTFLAGS+set}" ]; then
+            echo "::error::RUSTFLAGS is set ('$RUSTFLAGS') -- this job (or setup-rust-ci) exported a bare RUSTFLAGS, which replaces config.toml's per-target rustflags instead of joining it" >&2
+            exit 1
+          fi
+          echo "RUSTFLAGS is correctly unset in this job's environment"
+
+      - name: Reader 2 -- config.toml joined with this job's own CARGO_TARGET_..._RUSTFLAGS
+        # No `2>/dev/null` on the cargo invocation: a genuine compile
+        # failure here must be visible in the job log, never folded into
+        # "grep found nothing" as if it were merely a missing cfg flag.
+        shell: bash
+        run: |
+          set -euo pipefail
+          cargo rustc -p jammi-numerics --lib -- --print cfg | grep -q 'target_feature="fp16"'
+          echo "rustc's own cfg set for jammi-numerics carries target_feature=\"fp16\" (config.toml joined with CARGO_TARGET_AARCH64_UNKNOWN_LINUX_GNU_RUSTFLAGS)"
+
+      - name: Reader 1 -- config.toml alone, with this job's own env var explicitly unset
+        shell: bash
+        run: |
+          set -euo pipefail
+          env -u CARGO_TARGET_AARCH64_UNKNOWN_LINUX_GNU_RUSTFLAGS \
+            cargo rustc -p jammi-numerics --lib -- --print cfg | grep -q 'target_feature="fp16"'
+          echo "rustc's own cfg set for jammi-numerics carries target_feature=\"fp16\" (.cargo/config.toml alone, no CI-side env var at all)"
+
   # ── Single rolled-up gate ──────────────────────────────────────────────────
   # The ONE check a branch-protection ruleset should require, instead of listing
   # every job as a separate context. It fails if any job above failed/cancelled;
@@ -2099,6 +2265,7 @@ jobs:
       - compile-check-gated
       - test-clients
       - guard
+      - arm64-floor-oracle
       - dep-direction
       - flash-attn-closure
       - lint-surface-closure

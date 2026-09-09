@@ -33,14 +33,14 @@ on:
         description: "Comma-separated cargo features for the jammi-server binary build."
         type: string
         required: true
-      rustflags:
+      deny_warnings:
         description: >
-          RUSTFLAGS for the binary build, passed through to setup-rust-ci.
-          Both legs currently leave RUSTFLAGS unset upstream (falling back to
-          .cargo/config.toml's per-target mold default), hence the default.
+          Passed through to setup-rust-ci's `deny-warnings` input. Both legs
+          currently want mold (which applies unconditionally from
+          .cargo/config.toml) with no -D warnings, hence the default.
         type: string
         required: false
-        default: "-C link-arg=-fuse-ld=mold"
+        default: "false"
       package_dir:
         description: "The wheel package directory (e.g. packaging/server-cpu, packaging/server-cu12)."
         type: string
@@ -108,7 +108,7 @@ jobs:
 
       - uses: ./.github/actions/setup-rust-ci
         with:
-          rustflags: ${{ inputs.rustflags }}
+          deny-warnings: ${{ inputs.deny_warnings }}
 
       - name: Build jammi-server (release)
         run: cargo build --release -p jammi-server --bin jammi-server --features ${{ inputs.cargo_features }}

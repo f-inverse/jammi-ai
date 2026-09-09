@@ -3749,9 +3749,26 @@ auto-available to every encoder.)
 source of truth — the CI image build reads it and receives the channel as the `RUST_VERSION`
 build-arg, so the image can never bake a version the repo has moved off. `.cargo/config.toml` sets
 `rustc-wrapper = "sccache"` globally (sccache disables incremental by design — if sccache is missing,
-cargo fails) and `-fuse-ld=mold` for the two linux-gnu targets *only in local dev* (in CI the
-`RUSTFLAGS` env var wins). One CI/dev/release base image: `quay.io/pypa/manylinux_2_28_x86_64` →
-`.docker/ci.Dockerfile` (= `jammi-ai-ci`); the CUDA image extends it.
+cargo fails) and, per Linux target, a `rustflags` list: mold (`-fuse-ld=mold`) on both
+`x86_64-unknown-linux-gnu` and `aarch64-unknown-linux-gnu`, plus `-C target-feature=+fp16` on the
+latter — a COMPILE BASELINE (ARMv8.2-A FEAT_FP16), not a runtime floor: `gemm`'s aarch64 f16 kernels
+dispatch at RUNTIME via `is_aarch64_feature_detected!`, so a release build without the flag still
+uses them on hardware that has FEAT_FP16; the flag exists only because that same code fails to
+COMPILE at opt-level 0 without it. The trade: Raspberry Pi 4 (ARMv8.0) is not a supported
+aarch64-linux host for this workspace's artifacts.
+
+Config `rustflags` apply everywhere, local dev AND CI alike — `./.github/actions/setup-rust-ci`
+never exports a bare `RUSTFLAGS` (which would REPLACE config `rustflags` for every target, silently
+dropping mold and the fp16 floor both); its `deny-warnings` input instead exports
+`CARGO_TARGET_<TRIPLE>_RUSTFLAGS=-D warnings` for the runner's own host triple, which JOINS with
+(never replaces) config `rustflags` for that same triple — verified against a real cargo. A caller
+must never export a bare `RUSTFLAGS` of its own either, at job or step level — that replaces
+everything the same way, regardless of which mechanism set it (`dep-dag.yml`'s "clear -D warnings
+for one third-party install step" override targets the SAME per-target env var `setup-rust-ci` used,
+not a bare `RUSTFLAGS`, for exactly this reason). CI/dev/release
+base image: `.docker/ci.Dockerfile` (= `jammi-ai-ci`), a multi-arch index (`linux/amd64` +
+`linux/arm64`, one native leg per platform, merged by `_ci-base-image.yml`); the CUDA image extends
+it and stays `linux/amd64`-only.
 
 **Run before pushing (the local gate, mirrors `check`):**
 - `cargo fmt --all -- --check`

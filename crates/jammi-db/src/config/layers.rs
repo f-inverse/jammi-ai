@@ -46,6 +46,35 @@
 //! variant's bare name, with an empty payload for a struct or newtype
 //! variant (X4) — never a panic, a `missing field` error surfaces exactly as
 //! it would for a file table missing the same key.
+//!
+//! # No error ever echoes a VALUE (phase-4 audit)
+//!
+//! An error derived from an env or file VALUE never includes that value —
+//! only the struct path, the `JAMMI_*` variable name, the expected
+//! type/variant list, and, for a TOML syntax error, a line:column locator.
+//! This is enforced by two shared helpers rather than left to each
+//! `deserialize_*` arm to get right independently: [`describe_toml_error`]
+//! renders a `toml::de::Error` via `message()` + a line:column computed from
+//! `span()`, never `Display` (which renders a code frame quoting the
+//! offending source line verbatim — the exact shape that would print an
+//! env-interpolated secret or a malformed env leaf's raw text); and every
+//! `Node::File`/parsed-`Node::Env` arm that forwards a `toml::Value`
+//! deserialize failure routes it through [`safe_type_error`], which keeps
+//! only a fixed "expected `<shape>`" phrase for serde's `invalid_type`
+//! shape (the one shape that bakes the OFFENDING VALUE into the message
+//! text with no way to strip it after the fact:
+//! `invalid type: string "…", expected …`) and passes every OTHER shape
+//! (`missing field …`, `unknown field …`, a nested `Secret`'s own
+//! file-read error) through unchanged — those only ever name a field/key
+//! NAME or a file PATH, never an arbitrary value, so redacting them would
+//! throw away real diagnostic value for no safety gain. An enum position's
+//! "unknown variant" error names the variable and the expected variant
+//! list — never the value a bare env override supplied when that value
+//! does not itself name a variant (`deserialize_enum`'s `Node::Env` arm,
+//! and the `Node::Override` enum-lowering arm, which used to synthesize a
+//! table keyed by the raw value and let the generic multi-key path re-echo
+//! it — see [`Node::deserialize_enum`]'s Override arm for why membership is
+//! now checked before that table is ever built, not after).
 
 use std::collections::BTreeMap;
 use std::fmt;
@@ -182,13 +211,80 @@ impl Node {
     /// pre-quoted text.
     fn parse_as_toml(raw: &str) -> Result<toml::Value, NodeError> {
         let doc = format!("v = {raw}");
-        let parsed: toml::Value = doc
-            .parse()
-            .map_err(|e| NodeError(format!("env value is not valid TOML: {e}")))?;
+        let parsed: toml::Value = doc.parse().map_err(|e: toml::de::Error| {
+            NodeError(format!(
+                "env value is not valid TOML: {}",
+                describe_toml_error(&doc, &e)
+            ))
+        })?;
         Ok(parsed
             .get("v")
             .cloned()
             .expect("the wrapper document always has key `v`"))
+    }
+}
+
+/// Render a `toml::de::Error` SAFELY: `message()` (the "what went wrong"
+/// text alone) plus a 1-based line:column locator computed from `span()`'s
+/// start offset against `source` — NEVER `Display`/`to_string()`, which
+/// renders a code frame quoting the offending source line verbatim. For a
+/// file parse, that source line is the file text AFTER `${VAR}`
+/// interpolation — an unquoted `url = ${POSTGRES_URL}` would otherwise
+/// print the expanded secret; for an env leaf parsed as a standalone
+/// document ([`Node::parse_as_toml`]), that source line IS the (possibly
+/// secret-bearing) env value. `source` is whatever text was actually
+/// handed to `.parse()` — the caller's job is only to pass the SAME text,
+/// so the byte offset lines up.
+pub(crate) fn describe_toml_error(source: &str, e: &toml::de::Error) -> String {
+    match e.span() {
+        Some(span) => {
+            let (line, column) = line_and_column(source, span.start);
+            format!("{} (line {line}, column {column})", e.message())
+        }
+        None => e.message().to_string(),
+    }
+}
+
+/// 1-based (line, column) for a byte offset into `source`, scanning by
+/// `char` (never splitting a UTF-8 code point) up to `offset`.
+fn line_and_column(source: &str, offset: usize) -> (usize, usize) {
+    let bound = offset.min(source.len());
+    let mut line = 1usize;
+    let mut column = 1usize;
+    for ch in source[..bound].chars() {
+        if ch == '\n' {
+            line += 1;
+            column = 1;
+        } else {
+            column += 1;
+        }
+    }
+    (line, column)
+}
+
+/// Keep only a fixed "expected `<shape>`" phrase for serde's `invalid_type`
+/// error shape — the one shape that bakes the OFFENDING VALUE into the
+/// message text with no way to strip it after the fact (`invalid type:
+/// string "Bearer hunter2-secret", expected a map`) — and pass every OTHER
+/// shape through (`missing field …`, `unknown field …`, a nested `Secret`'s
+/// own file-read error: each names only a field/key NAME or a file PATH,
+/// never an arbitrary value, so redacting them would throw away real
+/// diagnostic value for no safety gain). `source` is the exact text that
+/// was parsed to produce the value this error came from, when the caller
+/// has one to give (an env leaf parsed via [`Node::parse_as_toml`]) — used
+/// to compute a safe line:column locator via [`describe_toml_error`] for
+/// the passed-through shapes; a `Node::File` arm has no single source text
+/// of its own to hand back (the whole file was already parsed once, higher
+/// up), so it passes `None` and gets `message()` alone, with no locator —
+/// still safe, just less precise.
+fn safe_type_error(source: Option<&str>, e: toml::de::Error, expected: &str) -> NodeError {
+    if e.message().starts_with("invalid type: ") {
+        NodeError(format!("expected {expected}"))
+    } else {
+        match source {
+            Some(src) => NodeError(describe_toml_error(src, &e)),
+            None => NodeError(e.message().to_string()),
+        }
     }
 }
 
@@ -244,7 +340,9 @@ macro_rules! scalar {
                         .map_err(|e| NodeError(format!("{var}: {e}")))?;
                     visitor.$visit(value)
                 }
-                Node::File(v) => v.$method(visitor).map_err(|e| NodeError(e.to_string())),
+                Node::File(v) => v.$method(visitor).map_err(|e| {
+                    safe_type_error(None, e, concat!("a `", stringify!($ty), "` value"))
+                }),
                 Node::Table { .. } => Err(NodeError(format!(
                     "expected a scalar value for `{}`, found a table",
                     stringify!($method)
@@ -276,16 +374,20 @@ impl<'de> Deserializer<'de> for Node {
     fn deserialize_bool<V: Visitor<'de>>(self, visitor: V) -> Result<V::Value, NodeError> {
         match self {
             Node::Env { ref var, ref raw } => {
+                // Names the variable only — never the value: a bool-typed
+                // field can sit at the same path shape a header/credential
+                // map does in a differently-typed sibling, and this error
+                // must stay safe to paste into a startup log regardless.
                 let value = parse_lenient_bool(raw).ok_or_else(|| {
                     NodeError(format!(
-                        "Invalid boolean '{raw}' for {var}. Expected: true, false, 1, 0"
+                        "{var}: invalid boolean value; expected one of true, false, 1, 0"
                     ))
                 })?;
                 visitor.visit_bool(value)
             }
             Node::File(v) => v
                 .deserialize_bool(visitor)
-                .map_err(|e| NodeError(e.to_string())),
+                .map_err(|e| safe_type_error(None, e, "a boolean value")),
             Node::Table { .. } => Err(NodeError(
                 "expected a scalar value for `deserialize_bool`, found a table".into(),
             )),
@@ -310,7 +412,7 @@ impl<'de> Deserializer<'de> for Node {
             Node::Env { ref raw, .. } => visitor.visit_str(raw),
             Node::File(v) => v
                 .deserialize_any(visitor)
-                .map_err(|e| NodeError(e.to_string())),
+                .map_err(|e| safe_type_error(None, e, "a value valid for this field")),
             Node::Table { entries, .. } => visitor.visit_map(TableMap {
                 iter: entries.into_iter(),
                 value: None,
@@ -324,7 +426,7 @@ impl<'de> Deserializer<'de> for Node {
             Node::Env { ref raw, .. } => visitor.visit_str(raw),
             Node::File(v) => v
                 .deserialize_str(visitor)
-                .map_err(|e| NodeError(e.to_string())),
+                .map_err(|e| safe_type_error(None, e, "a string")),
             Node::Table { .. } => Err(NodeError("expected a string, found a table".into())),
             Node::Override { upper, .. } => upper.deserialize_str(visitor),
         }
@@ -365,13 +467,14 @@ impl<'de> Deserializer<'de> for Node {
     fn deserialize_seq<V: Visitor<'de>>(self, visitor: V) -> Result<V::Value, NodeError> {
         match self {
             Node::Env { ref raw, .. } => {
+                let doc = format!("v = {raw}");
                 let v = Node::parse_as_toml(raw)?;
                 v.deserialize_seq(visitor)
-                    .map_err(|e| NodeError(e.to_string()))
+                    .map_err(|e| safe_type_error(Some(&doc), e, "a sequence (TOML array)"))
             }
             Node::File(v) => v
                 .deserialize_seq(visitor)
-                .map_err(|e| NodeError(e.to_string())),
+                .map_err(|e| safe_type_error(None, e, "a sequence (TOML array)")),
             Node::Table { .. } => Err(NodeError("expected a sequence, found a table".into())),
             // H14: a seq position takes the whole upper value — a file
             // array is wholly replaced by an env array, never merged.
@@ -393,13 +496,14 @@ impl<'de> Deserializer<'de> for Node {
     fn deserialize_map<V: Visitor<'de>>(self, visitor: V) -> Result<V::Value, NodeError> {
         match self {
             Node::Env { ref raw, .. } => {
+                let doc = format!("v = {raw}");
                 let v = Node::parse_as_toml(raw)?;
                 v.deserialize_map(visitor)
-                    .map_err(|e| NodeError(e.to_string()))
+                    .map_err(|e| safe_type_error(Some(&doc), e, "a map (TOML inline table)"))
             }
             Node::File(v) => v
                 .deserialize_map(visitor)
-                .map_err(|e| NodeError(e.to_string())),
+                .map_err(|e| safe_type_error(None, e, "a map (TOML inline table)")),
             Node::Table { entries, .. } => visitor.visit_map(TableMap {
                 iter: entries.into_iter(),
                 value: None,
@@ -418,15 +522,25 @@ impl<'de> Deserializer<'de> for Node {
         _fields: &'static [&'static str],
         visitor: V,
     ) -> Result<V::Value, NodeError> {
+        // H14: a struct position cannot take a whole-value env override — a
+        // struct is set field-by-field from env, never in one variable.
+        // This refusal is identical whether or not a lower (file) layer is
+        // present at this path: with a file layer the merge records
+        // `Node::Override { upper: Env, .. }`; with NO file layer at all
+        // (nothing to merge against) the env leaf reaches this function
+        // directly as a bare `Node::Env` — that bare case must refuse too,
+        // or a whole-struct env value silently resets every sibling field
+        // to its default with no file layer to blame it on.
+        fn struct_position_env_refusal(var: &str) -> NodeError {
+            NodeError(format!(
+                "{var}: this is a struct, set field-by-field from env \
+                 (e.g. `{var}__FIELD=...`), not as a whole value"
+            ))
+        }
         match self {
+            Node::Env { ref var, .. } => Err(struct_position_env_refusal(var)),
             Node::Override { upper, .. } => match *upper {
-                // H14: a struct position cannot take a whole-value env
-                // override — a struct is set field-by-field from env,
-                // never in one variable.
-                Node::Env { var, .. } => Err(NodeError(format!(
-                    "{var}: this is a struct, set field-by-field from env \
-                     (e.g. `{var}__FIELD=...`), not as a whole value"
-                ))),
+                Node::Env { ref var, .. } => Err(struct_position_env_refusal(var)),
                 other => other.deserialize_map(visitor),
             },
             other => other.deserialize_map(visitor),
@@ -494,17 +608,22 @@ impl<'de> Deserializer<'de> for Node {
                 key: s.trim().to_string(),
                 value: None,
             }),
-            Node::File(v) => v
-                .deserialize_enum(name, variants, visitor)
-                .map_err(|e| NodeError(e.to_string())),
+            Node::File(v) => v.deserialize_enum(name, variants, visitor).map_err(|e| {
+                safe_type_error(None, e, &format!("a string or table (one of {variants:?})"))
+            }),
             Node::Env { ref var, ref raw } => {
                 let key = raw.trim().to_string();
                 if !variants.contains(&key.as_str()) {
                     // H13 pinned oracle: a bare env selection naming an
                     // unknown variant, with no file layer to blame,
-                    // errors naming the VARIABLE.
+                    // errors naming the VARIABLE — never `key`/`raw`: a bare
+                    // enum-position env override that ISN'T a real variant
+                    // name is exactly the shape a whole-value payload like
+                    // `JAMMI_CATALOG='{ postgres = { url = "…secret…" } }'`
+                    // takes, and `key` there is that entire blob, secret
+                    // included.
                     return Err(NodeError(format!(
-                        "{name}: unknown variant `{key}` (from {var}); expected one of {variants:?}"
+                        "{name}: {var} does not name a known variant; expected one of {variants:?}"
                     )));
                 }
                 visitor.visit_enum(NodeEnum { key, value: None })
@@ -522,9 +641,28 @@ impl<'de> Deserializer<'de> for Node {
                         Node::Table {
                             entries: mut base, ..
                         },
-                        Node::Env { raw, .. },
+                        Node::Env { var, raw },
                     ) => {
                         let key = raw.trim().to_string();
+                        if !variants.contains(&key.as_str()) {
+                            // Same rule as the bare-`Node::Env` arm above,
+                            // checked HERE (before `key` ever becomes a
+                            // table entry) rather than left to the generic
+                            // `Node::Table` arm's per-key membership check:
+                            // that check is safe for a genuine file-authored
+                            // section name, but `key` here can be an entire
+                            // env VALUE (e.g. a whole-value payload with a
+                            // secret in it) that merely failed to name a
+                            // variant — inserting it as a synthesized table
+                            // key and letting the generic path re-discover
+                            // "unknown variant" would echo that value, and
+                            // would misattribute it to "the config file"
+                            // (an empty synthesized table has no env var of
+                            // its own for `.origin()` to find).
+                            return Err(NodeError(format!(
+                                "{name}: {var} does not name a known variant; expected one of {variants:?}"
+                            )));
+                        }
                         let sub = match base.remove(&key) {
                             Some(Node::Table { entries, .. }) => Node::Table {
                                 entries,
@@ -541,8 +679,10 @@ impl<'de> Deserializer<'de> for Node {
                     }
                     // A bare file-string selection under a nested env
                     // table: the env table wins, but the FILE's bare
-                    // spelling is still membership-checked (so a typo'd
-                    // file selection is still named, per B5).
+                    // spelling is still membership-checked below (via the
+                    // synthesized entry inserted under `base`), so a
+                    // typo'd file selection is still named in the error
+                    // rather than silently discarded.
                     (Node::File(toml::Value::String(s)), Node::Table { entries: over, .. }) => {
                         let mut base: BTreeMap<String, Node> = BTreeMap::new();
                         base.insert(s.trim().to_string(), Node::empty_table());

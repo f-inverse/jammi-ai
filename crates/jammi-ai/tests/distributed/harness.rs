@@ -100,7 +100,7 @@ impl Backends {
             region: Some(self.region.clone()),
             endpoint: Some(self.s3_endpoint.clone()),
             access_key_id: Some(self.access_key_id.clone()),
-            secret_access_key: Some(self.secret_access_key.clone()),
+            secret_access_key: Some(self.secret_access_key.clone().into()),
             session_token: None,
             allow_http: self.s3_endpoint.starts_with("http://"),
         })

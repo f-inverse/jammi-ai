@@ -52,14 +52,19 @@
 //!
 //! # The `offline` promise is Hub-only
 //!
-//! `ModelsConfig::offline` refuses every *Hub network* fetch — see
-//! `ModelResolver::resolve`'s `HuggingFace` arm, which checks it after the
-//! catalog lookup and refuses by name when no catalog row resolved the
-//! model (a warm Hub cache directory with no catalog row is still a miss:
-//! the catalog, not the on-disk cache, is offline's source of truth). It does
-//! **not** reach the fine-tune worker's adapter fetch for an already-trained
-//! model: that path always reads the adapter bundle through the artifact
-//! store (object storage), never the Hub, offline or not.
+//! `ModelsConfig::offline` refuses every *Hub network* fetch — every call
+//! site that reaches `self.api()` checks it first. That is two call sites,
+//! both after their own catalog lookup and both refusing by name when no
+//! catalog row resolved the model (a warm Hub cache directory with no
+//! catalog row is still a miss: the catalog, not the on-disk cache, is
+//! offline's source of truth): `ModelResolver::resolve`'s `HuggingFace`
+//! arm, and the fine-tune worker's `build_encoder_adapters` HF fallback
+//! (reached when a fine-tune job's BASE model has a catalog row but no
+//! `artifact_path` yet — i.e. it has never been resolved before). It does
+//! **not** reach the fine-tune worker's ADAPTER fetch for an
+//! already-trained model: that path always reads the adapter bundle
+//! through the artifact store (object storage), never the Hub, offline or
+//! not.
 use std::path::PathBuf;
 
 use hf_hub::api::sync::{Api, ApiBuilder};
@@ -70,10 +75,26 @@ use jammi_db::error::{JammiError, Result};
 /// A Hugging Face Hub client built once from `[models]`, shared by every
 /// jammi-ai call site that talks to the Hub. See the module docs for the
 /// precedence chain and the `offline` promise.
-#[derive(Clone, Debug)]
+///
+/// `Debug` is hand-written, NOT derived: `hf_hub::api::sync::Api`'s own
+/// (derived) `Debug` walks down into its header map, which holds the
+/// resolved bearer token as a plaintext `Authorization` header value once
+/// [`HubSource::from_config`] has set one — the same class of leak
+/// `jammi_db::config::secret::Secret` exists to prevent everywhere else in
+/// this config. A `{:?}` of a `HubSource` must never reach it.
+#[derive(Clone)]
 pub struct HubSource {
     api: Api,
     offline: bool,
+}
+
+impl std::fmt::Debug for HubSource {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("HubSource")
+            .field("api", &"<redacted: may hold a Hub bearer token>")
+            .field("offline", &self.offline)
+            .finish()
+    }
 }
 
 impl HubSource {
@@ -326,6 +347,33 @@ mod tests {
         let cache = Cache::new(dir.path().join("hub"));
         let config = ModelsConfig::default();
         assert_eq!(resolve_token(&config, &no_env, &cache).unwrap(), None);
+    }
+
+    // --- Debug never prints the Hub token ---
+
+    /// `hf_hub::api::sync::Api`'s derived `Debug` walks its header map,
+    /// which carries the resolved bearer token in plaintext once a token
+    /// resolves. `HubSource`'s own hand-written `Debug` must redact the
+    /// whole `api` field rather than let that leak through.
+    #[test]
+    fn debug_never_prints_the_resolved_hub_token() {
+        let dir = tempfile::tempdir().unwrap();
+        let config = ModelsConfig {
+            hub_cache_dir: Some(dir.path().to_path_buf()),
+            hub_token: Some(SecretSource::Inline("secret-hub-token-xyz".into())),
+            ..Default::default()
+        };
+        let hub = HubSource::from_config(&config, &no_env).unwrap();
+        let rendered = format!("{hub:?}");
+        assert!(
+            !rendered.contains("secret-hub-token-xyz"),
+            "HubSource::Debug leaked the Hub token: {rendered}"
+        );
+        let pretty = format!("{hub:#?}");
+        assert!(
+            !pretty.contains("secret-hub-token-xyz"),
+            "HubSource::Debug (pretty) leaked the Hub token: {pretty}"
+        );
     }
 
     // --- never a panic: unresolvable root is a typed error ---

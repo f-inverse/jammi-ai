@@ -16,12 +16,20 @@ use serde::{Deserialize, Serialize};
 
 use super::error::StorageError;
 use super::url::Scheme;
+use crate::config::secret::serialize_exposed;
+use crate::config::Secret;
 
 /// AWS S3 (or any S3-compatible) connection details.
 ///
 /// Used to build the S3 driver via [`crate::storage::builder::build_object_store`].
 /// Field names mirror the canonical AWS SDK env var conventions so a
 /// caller can populate from `std::env::var` 1:1.
+///
+/// `secret_access_key` is [`Secret`]-typed: `Debug` (derived) redacts it as
+/// `Secret(***)`, and it serializes as plaintext ONLY through
+/// [`serialize_exposed`] — the shape this struct persists as in a
+/// `sources.options` row is unchanged (still a plain JSON string at this
+/// key), but a `{:?}` of a config carrying an `S3Config` never prints it.
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct S3Config {
     /// AWS region (e.g. `"us-east-1"`).
@@ -31,8 +39,10 @@ pub struct S3Config {
     /// Access key ID. When unset, the SDK's default credential chain is used
     /// (env vars, instance profile, EKS IRSA token, etc).
     pub access_key_id: Option<String>,
-    /// Secret access key paired with [`Self::access_key_id`].
-    pub secret_access_key: Option<String>,
+    /// Secret access key paired with [`Self::access_key_id`]. See the
+    /// struct docs for the redaction/persistence split.
+    #[serde(serialize_with = "serialize_exposed")]
+    pub secret_access_key: Option<Secret>,
     /// Optional session token for temporary credentials (STS, SSO).
     pub session_token: Option<String>,
     /// Whether to allow plain HTTP (only used against test endpoints).
@@ -42,34 +52,45 @@ pub struct S3Config {
 }
 
 /// Google Cloud Storage connection details.
+///
+/// `service_account_json` is [`Secret`]-typed — see [`S3Config`]'s docs for
+/// the redaction/persistence split this mirrors.
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct GcsConfig {
-    /// Inline service-account JSON. When unset, the GCS driver falls back
-    /// to Application Default Credentials (`GOOGLE_APPLICATION_CREDENTIALS`,
-    /// Workload Identity, gcloud user creds).
-    pub service_account_json: Option<String>,
+    /// Inline service-account JSON (holds a private key). When unset, the
+    /// GCS driver falls back to Application Default Credentials
+    /// (`GOOGLE_APPLICATION_CREDENTIALS`, Workload Identity, gcloud user
+    /// creds).
+    #[serde(serialize_with = "serialize_exposed")]
+    pub service_account_json: Option<Secret>,
     /// Path to a service-account JSON file. Alternative to
     /// [`Self::service_account_json`] for callers who want to keep the file
-    /// out of the catalog row.
+    /// out of the catalog row. A path is not itself a secret.
     pub service_account_path: Option<String>,
 }
 
 /// Azure Blob Storage connection details.
+///
+/// `account_key`/`sas_token`/`client_secret` are [`Secret`]-typed — see
+/// [`S3Config`]'s docs for the redaction/persistence split this mirrors.
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct AzureConfig {
     /// Storage account name (e.g. `"myaccount"` for
     /// `myaccount.blob.core.windows.net`).
     pub account_name: Option<String>,
     /// Account access key. Mutually exclusive with [`Self::sas_token`].
-    pub account_key: Option<String>,
+    #[serde(serialize_with = "serialize_exposed")]
+    pub account_key: Option<Secret>,
     /// Shared-access-signature token.
-    pub sas_token: Option<String>,
+    #[serde(serialize_with = "serialize_exposed")]
+    pub sas_token: Option<Secret>,
     /// Tenant id for OAuth / Managed Identity auth.
     pub tenant_id: Option<String>,
     /// Client id for OAuth.
     pub client_id: Option<String>,
     /// Client secret paired with [`Self::client_id`].
-    pub client_secret: Option<String>,
+    #[serde(serialize_with = "serialize_exposed")]
+    pub client_secret: Option<Secret>,
 }
 
 /// Cloudflare R2 connection details.
@@ -79,6 +100,9 @@ pub struct AzureConfig {
 /// engine derives the two S3 quirks R2 imposes — an account-scoped endpoint
 /// and `region = "auto"` — rather than the deployer hand-rolling an
 /// [`S3Config`] and risking either one.
+///
+/// `secret_access_key` is [`Secret`]-typed — see [`S3Config`]'s docs for the
+/// redaction/persistence split this mirrors.
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct R2Config {
     /// Cloudflare account id. The endpoint is derived as
@@ -92,7 +116,8 @@ pub struct R2Config {
     /// When unset, the S3 SDK's default credential chain applies.
     pub access_key_id: Option<String>,
     /// Secret access key paired with [`Self::access_key_id`].
-    pub secret_access_key: Option<String>,
+    #[serde(serialize_with = "serialize_exposed")]
+    pub secret_access_key: Option<Secret>,
     /// Allow plain HTTP — only for test endpoints. Defaults `false` (fail closed).
     #[serde(default)]
     pub allow_http: bool,
@@ -137,7 +162,7 @@ impl S3Config {
     pub fn validate(&self) -> Result<(), StorageError> {
         match (
             self.access_key_id.as_deref(),
-            self.secret_access_key.as_deref(),
+            self.secret_access_key.as_ref(),
         ) {
             (Some(_), None) => Err(StorageError::DriverInit {
                 scheme: Scheme::S3,
@@ -241,7 +266,7 @@ impl R2Config {
         }
         match (
             self.access_key_id.as_deref(),
-            self.secret_access_key.as_deref(),
+            self.secret_access_key.as_ref(),
         ) {
             (Some(_), None) => Err(StorageError::DriverInit {
                 scheme: Scheme::R2,

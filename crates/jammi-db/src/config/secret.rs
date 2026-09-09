@@ -26,10 +26,17 @@
 //!
 //! # What never happens
 //!
-//! - A `Secret` never renders: `Debug` and `Display` print `Secret(***)`, and
-//!   there is no `Serialize` impl, so a `Debug` of the whole config, a tracing
-//!   span, a panic payload, or a re-serialised config carries no secret. The
-//!   only way out is the explicit [`Secret::expose`].
+//! - A `Secret` never renders through `Debug`/`Display`: both print
+//!   `Secret(***)`, so a `Debug` of the whole config, a tracing span, or a
+//!   panic payload carries no secret. `Secret` itself has no blanket
+//!   `Serialize` impl — the only way a `Secret` becomes plaintext again is
+//!   [`Secret::expose`] or the standalone [`serialize_exposed`] function,
+//!   and the latter is reachable only through an explicit
+//!   `#[serde(serialize_with = "…")]` a field opts into by name (the
+//!   persisted `crate::storage::config` credential fields, whose whole
+//!   point is to round-trip through the catalog's `sources.options` JSON) —
+//!   never by deriving `Serialize` on a struct that merely contains a
+//!   `Secret`.
 //! - A secret string that is *itself* the text `{ file = "…" }` is refused
 //!   rather than passed along as an inline value: that is what an operator
 //!   gets by quoting the file form in TOML or pasting it into a plain env
@@ -43,6 +50,7 @@ use std::fmt;
 use std::path::{Path, PathBuf};
 
 use serde::de::{self, Deserialize, Deserializer, IgnoredAny, MapAccess, Visitor};
+use serde::Serializer;
 
 use crate::error::{JammiError, Result};
 
@@ -123,9 +131,12 @@ fn trim_one_trailing_newline(mut value: String) -> String {
 /// A resolved secret. Renders as `Secret(***)`; read it with [`Secret::expose`].
 ///
 /// Deliberately **not** `Serialize`: a secret that has entered the config
-/// never leaves it as text. Deserialises from the same shapes as
-/// [`SecretSource`], resolving the file form at parse time (see the module
-/// docs for why).
+/// never leaves it as text through an ordinary derive. Deserialises from
+/// the same shapes as [`SecretSource`], resolving the file form at parse
+/// time (see the module docs for why). The one sanctioned exit is
+/// [`serialize_exposed`], used solely by the persisted
+/// `crate::storage::config` credential fields via
+/// `#[serde(serialize_with = "…")]`.
 #[derive(Clone, PartialEq, Eq)]
 pub struct Secret(String);
 
@@ -140,6 +151,29 @@ impl Secret {
     /// request header), never a log line.
     pub fn expose(&self) -> &str {
         &self.0
+    }
+}
+
+/// Serialize `secret` in exposed (plaintext) form — the one sanctioned exit
+/// a `Secret` has to text, used ONLY as the `serialize_with` for the
+/// persisted `crate::storage::config` credential fields
+/// (`S3Config::secret_access_key`, `R2Config::secret_access_key`,
+/// `GcsConfig::service_account_json`, `AzureConfig::{account_key,
+/// sas_token, client_secret}`), whose whole point is to round-trip through
+/// the catalog's `sources.options` JSON exactly as before this type
+/// existed. Every other place a `Secret` sits in the config has no
+/// `serialize_with` at all — a container can leak a `Secret` field only by
+/// naming this function explicitly, field by field, never by deriving
+/// `Serialize` over a struct that happens to contain one. Never call this
+/// from a `Debug`/logging path; `Secret`'s own `Debug` stays redacted
+/// regardless.
+pub fn serialize_exposed<S: Serializer>(
+    secret: &Option<Secret>,
+    serializer: S,
+) -> std::result::Result<S::Ok, S::Error> {
+    match secret {
+        Some(s) => serializer.serialize_str(s.expose()),
+        None => serializer.serialize_none(),
     }
 }
 
@@ -359,6 +393,29 @@ mod tests {
             let err = toml::from_str::<Holder>(src).unwrap_err().to_string();
             assert!(err.contains("`file`"), "{src}: {err}");
         }
+    }
+
+    /// `serialize_exposed` is the one sanctioned way a `Secret` becomes
+    /// plaintext again: only through an explicit `serialize_with` a field
+    /// names, and only for the persisted-storage-config use it exists for.
+    #[test]
+    fn serialize_exposed_round_trips_the_plaintext_for_persistence() {
+        #[derive(serde::Serialize, serde::Deserialize)]
+        struct Holder {
+            #[serde(serialize_with = "serialize_exposed")]
+            secret: Option<Secret>,
+        }
+        let holder = Holder {
+            secret: Some(Secret::new("hunter2")),
+        };
+        let json = serde_json::to_string(&holder).unwrap();
+        assert!(json.contains("hunter2"), "{json}");
+        let round_tripped: Holder = serde_json::from_str(&json).unwrap();
+        assert_eq!(round_tripped.secret.unwrap().expose(), "hunter2");
+
+        let none_holder = Holder { secret: None };
+        let json_none = serde_json::to_string(&none_holder).unwrap();
+        assert_eq!(json_none, r#"{"secret":null}"#);
     }
 
     #[test]

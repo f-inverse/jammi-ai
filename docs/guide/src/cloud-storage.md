@@ -109,7 +109,7 @@ let conn = SourceConnection {
     format: Some(FileFormat::Parquet),
     cloud: Some(CloudConfig::Azure(AzureConfig {
         account_name: Some("mystorage".into()),
-        sas_token: Some(std::env::var("AZURE_SAS_TOKEN")?),
+        sas_token: Some(std::env::var("AZURE_SAS_TOKEN")?.into()),
         ..Default::default()
     })),
     ..Default::default()
@@ -133,7 +133,7 @@ let conn = SourceConnection {
     cloud: Some(CloudConfig::R2(R2Config {
         account_id: Some(std::env::var("R2_ACCOUNT_ID")?),
         access_key_id: Some(std::env::var("R2_ACCESS_KEY_ID")?),
-        secret_access_key: Some(std::env::var("R2_SECRET_ACCESS_KEY")?),
+        secret_access_key: Some(std::env::var("R2_SECRET_ACCESS_KEY")?.into()),
         ..Default::default()
     })),
     ..Default::default()

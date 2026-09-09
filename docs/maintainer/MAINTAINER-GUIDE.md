@@ -3004,7 +3004,7 @@ the identical pair — `StorageError::NotPublished`
 well, never its own `JammiError::Inference`. A catalog record that never recorded an
 `artifact_path` at all is a separate, earlier refusal on each surface that never reaches
 `fetch_artifact` — the resolver's arm also raises `JammiError::Model`
-(`crates/jammi-ai/src/model/resolver.rs:263`), and so does the predictor's own
+(`crates/jammi-ai/src/model/resolver.rs:288`), and so does the predictor's own
 `JammiError::Model` (`crates/jammi-ai/src/pipeline/context_predictor.rs:1277`). Any OTHER
 storage fault propagates unchanged past both surfaces' own catch-all —
 `Err(e) => return Err(e)` (`crates/jammi-ai/src/model/resolver.rs:283`) and the identical

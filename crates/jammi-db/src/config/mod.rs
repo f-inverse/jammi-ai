@@ -179,8 +179,9 @@ impl FromStr for LogFormat {
 ///
 /// # Secrets
 ///
-/// Secret-valued fields (`catalog.postgres.url`, `broker.jet_stream.credentials`,
-/// `inference.http.headers` values, `storage.cloud.*`'s credential fields) are
+/// Secret-valued fields (`catalog.postgres.url`, `broker.jet_stream.url`,
+/// `broker.jet_stream.credentials`, `inference.http.headers` values,
+/// `storage.cloud.*`'s credential fields) are
 /// typed [`Secret`]: they accept either the value inline or `{ file = "…" }`
 /// naming a file that holds it, resolve at load, and render as `Secret(***)`
 /// in every `Debug` — so a `{:?}` of the whole config carries no secret. See
@@ -377,7 +378,7 @@ impl From<CloudSection> for CloudConfig {
                 region: c.region,
                 endpoint: c.endpoint,
                 access_key_id: c.access_key_id,
-                secret_access_key: c.secret_access_key.map(|s| s.expose().to_string()),
+                secret_access_key: c.secret_access_key,
                 session_token: c.session_token,
                 allow_http: c.allow_http,
             }),
@@ -385,20 +386,20 @@ impl From<CloudSection> for CloudConfig {
                 account_id: c.account_id,
                 endpoint: c.endpoint,
                 access_key_id: c.access_key_id,
-                secret_access_key: c.secret_access_key.map(|s| s.expose().to_string()),
+                secret_access_key: c.secret_access_key,
                 allow_http: c.allow_http,
             }),
             CloudSection::Gcs(c) => CloudConfig::Gcs(GcsConfig {
-                service_account_json: c.service_account.map(|s| s.expose().to_string()),
+                service_account_json: c.service_account,
                 service_account_path: None,
             }),
             CloudSection::Azure(c) => CloudConfig::Azure(AzureConfig {
                 account_name: c.account_name,
-                account_key: c.account_key.map(|s| s.expose().to_string()),
-                sas_token: c.sas_token.map(|s| s.expose().to_string()),
+                account_key: c.account_key,
+                sas_token: c.sas_token,
                 tenant_id: c.tenant_id,
                 client_id: c.client_id,
-                client_secret: c.client_secret.map(|s| s.expose().to_string()),
+                client_secret: c.client_secret,
             }),
         }
     }
@@ -514,8 +515,11 @@ pub enum BrokerConfig {
     /// `jammi-db`; building a session whose config selects `JetStream`
     /// without the feature returns [`crate::error::JammiError::Config`].
     JetStream {
-        /// NATS server URL, e.g. `nats://nats.svc:4222`.
-        url: String,
+        /// NATS server URL, e.g. `nats://nats.svc:4222`. A [`Secret`]: NATS
+        /// URLs carry userinfo/token auth inline (`nats://user:pass@host`),
+        /// the same class of leak `catalog.postgres.url` guards against —
+        /// inline or `{ file = "…" }`; never printed.
+        url: Secret,
         /// Default per-stream retention in seconds. Per-topic
         /// `broker_metadata.retention_seconds` overrides this value.
         /// Default: 7 days (604 800).
@@ -1101,7 +1105,13 @@ impl<'de> Deserialize<'de> for ServiceSelection {
                 self,
                 value: &str,
             ) -> std::result::Result<Self::Value, E> {
-                // H7: case-sensitive, like every other value in this config.
+                // Trim surrounding whitespace before anything else: a
+                // trailing newline from a secrets file or a heredoc-sourced
+                // env var is not part of the value, the same way every other
+                // env/file-backed value in this config tolerates it. H7:
+                // case-sensitive otherwise, like every other value in this
+                // config — `"ALL"` is NOT the sentinel.
+                let value = value.trim();
                 if value == "all" {
                     return Ok(ServiceSelection::All(AllSentinel::All));
                 }
@@ -1126,9 +1136,17 @@ impl<'de> Deserialize<'de> for ServiceSelection {
                 self,
                 mut seq: A,
             ) -> std::result::Result<Self::Value, A::Error> {
+                // Same rule as `visit_str`'s comma-list arm: trim each
+                // token and filter empties, so an array token sourced from
+                // a templated value (a trailing/leading newline or blank
+                // entry) is treated the same way a comma-list spelling of
+                // the identical intent already is.
                 let mut tokens = Vec::new();
                 while let Some(token) = seq.next_element::<String>()? {
-                    tokens.push(token);
+                    let token = token.trim();
+                    if !token.is_empty() {
+                        tokens.push(token.to_string());
+                    }
                 }
                 Ok(ServiceSelection::Only(tokens))
             }
@@ -1480,7 +1498,7 @@ impl JammiConfig {
         Ok(config)
     }
 
-    /// The parse-only core (the Addendum): interpolate `${VAR}` from `env`,
+    /// The parse-only core: interpolate `${VAR}` from `env`,
     /// parse the TOML file layer, build the `JAMMI_*` env layer from the
     /// SAME `env` map (T5's namespace rule — `env_map::build_env_layer`),
     /// deep-merge the two (`layers::merge` — H1), and deserialize the
@@ -1496,9 +1514,18 @@ impl JammiConfig {
     ) -> Result<Self> {
         let env_map: BTreeMap<String, String> = env.into_iter().collect();
         let interpolated = interpolate_env_vars(toml_src, |name| env_map.get(name).cloned())?;
-        let file_value: toml::Value = interpolated
-            .parse()
-            .map_err(|e| JammiError::Config(format!("invalid TOML: {e}")))?;
+        // `interpolated` is the file text AFTER `${VAR}` expansion — an
+        // unquoted `url = ${POSTGRES_URL}` puts the secret straight into
+        // this text, so a parse error here must never render via
+        // `Display`/`to_string()` (which quotes a code frame of the
+        // offending source line verbatim). `layers::describe_toml_error`
+        // renders `message()` plus a safe line:column locator instead.
+        let file_value: toml::Value = interpolated.parse().map_err(|e: toml::de::Error| {
+            JammiError::Config(format!(
+                "invalid TOML: {}",
+                layers::describe_toml_error(&interpolated, &e)
+            ))
+        })?;
         let file_node = Node::from_toml(file_value);
         let env_node =
             env_map::build_env_layer(env_map.iter().map(|(k, v)| (k.clone(), v.clone())))

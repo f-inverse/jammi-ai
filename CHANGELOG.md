@@ -18,7 +18,13 @@ workspace ships every publishable crate at the same
   `inference.http.headers` values, the cloud credential fields, `models.hub_token`)
   now accepts either the value inline or `{ file = "…" }` naming a file to read
   at load (env spelling: `JAMMI_<PATH>__FILE=/path`); a resolved secret renders
-  as `Secret(***)` everywhere, including `Debug`. `signing_key.file` reads the
+  as `Secret(***)` everywhere, including `Debug` — including the
+  `storage.cloud.{s3,r2,gcs,azure}` credential fields, which are now
+  `Secret`-typed on the persisted `crate::storage::config` structs too
+  (`S3Config`/`R2Config`/`GcsConfig`/`AzureConfig`) and serialize in exposed
+  (plaintext) form ONLY through an explicit `serialize_with`, so a `{:?}` of
+  the whole config never prints one while `sources.options` persistence is
+  unchanged byte-for-byte. `signing_key.file` reads the
   audit master key from a file (re-read on every signing request, so a rotated
   mount needs no restart) alongside the existing `signing_key = "env"`. The
   config-file resolution order gains a fourth step, `/etc/jammi/jammi.toml`,
@@ -483,6 +489,23 @@ workspace ships every publishable crate at the same
   completed attempt sitting behind an in-flight rerun still denies (F5).
 
 ### Fixed
+- **Config phase-4 hardening: no bare-env whole-struct override without a file layer, `[models]`
+  offline honored in the fine-tune worker's HF fallback, and no env value echoed into a config
+  error (#483, #481).** `JammiConfig`'s hand-written `Deserialize` refused a bare `JAMMI_<X>='{
+  ... }'` whole-struct env override only when a file layer was ALSO present at that path (the
+  merge's `Node::Override`); with no file layer at all — `JAMMI_SERVER='{ health_listen = "…" }'`
+  on an otherwise-empty config — the same override was silently accepted and reset every sibling
+  field of that struct to its default. `Node::deserialize_struct` now refuses a bare `Node::Env` at
+  a struct position identically to the `Override` case. Separately, `build_encoder_adapters`'s
+  Hugging Face fallback (used when a fine-tune base model's catalog row carries no
+  `artifact_path`) reached the Hub without consulting `[models] offline`, while every other Hub
+  call site refused under it — it now returns the same typed `JammiError::Model("offline: …")`
+  refusal the resolver's `HuggingFace` arm does. And a malformed env value at a seq/map/struct
+  position (e.g. an unterminated `JAMMI_INFERENCE__HTTP__HEADERS='{ Authorization = "Bearer
+  TOKEN" '`) used to embed the raw value in the TOML parser's rendered error (a source-line code
+  frame), and an invalid boolean env value quoted the raw value too — both now name only the
+  offending `JAMMI_*` variable, never the value, so a header/credential typo cannot leak into a
+  startup log.
 - **`jammi-encoders`' unit-test binary now serializes every writer of EVERY process-wide fusible-seam
   dispatch counter through the SAME lock the exact-count census oracle's reader holds (esc-092 /
   #476).** The class is "every training-arm admission site this crate owns", not just the three
@@ -710,6 +733,12 @@ workspace ships every publishable crate at the same
   `GcsConfig`) is unchanged and still reloads unmodified rows. Migration: move
   a `kind =` selector into the TOML table name, rename `credentials_path` to
   `credentials`, and collapse the two GCS keys into `service_account`.
+  `services = ALL`/`Services=all` and other differently-cased spellings of
+  the `"all"` sentinel are no longer accepted; write `all` (lowercase, like
+  every other value in this config — `services` remains the one field whose
+  grammar is `all|tier,tier` rather than TOML syntax). Surrounding
+  whitespace (a trailing newline from a secrets file or a heredoc-sourced
+  env var) IS still trimmed before that case-sensitive check.
 - `jammi-cli`/`jammi` drop `grpcs://` and `https://` as accepted `--target`
   schemes (#480) — TLS termination is the consumer's runtime, not the CLI's;
   put a TLS-terminating proxy in front and point `--target` at it in

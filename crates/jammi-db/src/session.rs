@@ -1070,9 +1070,11 @@ async fn build_broker_from_config(config: &JammiConfig) -> Result<Arc<dyn Trigge
             credentials,
         } => {
             // `credentials` is the `.creds` CONTENTS (a resolved `Secret`),
-            // handed to the broker as the text async-nats parses.
+            // handed to the broker as the text async-nats parses. `url` is
+            // a `Secret` too (K2): a NATS URL can carry userinfo/token auth
+            // inline (`nats://user:pass@host`).
             let creds = credentials.as_ref().map(crate::config::Secret::expose);
-            build_jetstream_broker(url, *retention_seconds, creds).await
+            build_jetstream_broker(url.expose(), *retention_seconds, creds).await
         }
     }
 }
@@ -1104,8 +1106,7 @@ async fn build_jetstream_broker(
     _credentials: Option<&str>,
 ) -> Result<Arc<dyn TriggerBroker>> {
     Err(JammiError::Config(
-        "broker.kind = \"jet_stream\" requires the `jetstream-broker` cargo feature on jammi-db"
-            .into(),
+        "[broker.jet_stream] requires the `jetstream-broker` cargo feature on jammi-db".into(),
     ))
 }
 

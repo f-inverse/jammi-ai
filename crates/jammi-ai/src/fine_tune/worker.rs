@@ -3223,6 +3223,23 @@ fn build_encoder_adapters(
         }
         _ => {
             if is_hf {
+                // `[models] offline` (esc-096): the resolver's `HuggingFace`
+                // arm refuses a Hub fetch identically once no catalog row
+                // resolved the model — see `super::super::model::resolver`
+                // and `crate::model::hub`'s module docs for why the promise
+                // is Hub-only. This arm reaches the Hub exactly the same way
+                // (`hub.api().model(..).get(..)`), so it must refuse
+                // identically rather than silently falling through to a
+                // live network fetch offline was supposed to forbid.
+                if hub.offline() {
+                    return Err(JammiError::Model {
+                        model_id: catalog_model_id.clone(),
+                        message: format!(
+                            "offline: `{catalog_model_id}` was never resolved online on \
+                             this catalog"
+                        ),
+                    });
+                }
                 // Shared `HubSource` (esc-096) — the session's ONE Hub
                 // client, not a fresh `Api::new()` built here (which never
                 // read `HF_TOKEN`, ignored `[models]` entirely, and could
@@ -4762,6 +4779,81 @@ mod tests {
             &|_: &str| None,
         )
         .unwrap()
+    }
+
+    /// esc-096/offline: `build_encoder_adapters`'s HF-fallback arm (reached
+    /// when a fine-tune base model's catalog row carries no
+    /// `artifact_path`) calls `hub.api().model(..).get(..)` exactly like
+    /// the resolver's own `HuggingFace` arm, so `[models] offline = true`
+    /// must refuse it identically — never fall through to a live network
+    /// fetch offline was supposed to forbid. RED before this fix: no mock
+    /// server is configured here at all, so the pre-fix code would attempt
+    /// a real Hub network call and fail with a connection/DNS error
+    /// (the wrong failure mode), not this typed offline refusal.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn build_encoder_adapters_hf_fallback_refuses_when_offline() {
+        let catalog_dir = tempfile::tempdir().unwrap();
+        let catalog = Arc::new(Catalog::open(catalog_dir.path()).await.unwrap());
+        let base_model_id = "acme/never-resolved-base";
+        catalog
+            .register_model(jammi_db::catalog::model_repo::RegisterModelParams {
+                model_id: base_model_id,
+                version: 1,
+                model_type: "embedding",
+                backend: "candle",
+                task: ModelTask::TextEmbedding,
+                base_model_id: None,
+                artifact_path: None,
+                config_json: None,
+            })
+            .await
+            .unwrap();
+        let artifact_store = gguf_test_artifact_store();
+
+        let root = tempfile::tempdir().unwrap().keep();
+        let offline_hub = HubSource::from_config(
+            &jammi_db::config::ModelsConfig {
+                hub_cache_dir: Some(root),
+                offline: true,
+                ..Default::default()
+            },
+            &|_: &str| None,
+        )
+        .unwrap();
+
+        let owned_base_model_id = base_model_id.to_string();
+        let result = tokio::task::spawn_blocking(move || {
+            let training_config = FineTuneConfig::default();
+            let varmap = candle_nn::VarMap::new();
+            let device = candle_core::Device::Cpu;
+            build_encoder_adapters(BuildEncoderAdaptersParams {
+                base_model_id: &owned_base_model_id,
+                catalog: &catalog,
+                artifact_store: &artifact_store,
+                config: &training_config,
+                task: ModelTask::TextEmbedding,
+                varmap: &varmap,
+                device: &device,
+                hub: &offline_hub,
+            })
+        })
+        .await
+        .unwrap();
+        let err = match result {
+            Ok(_) => panic!("offline must refuse the HF fallback, not attempt a network fetch"),
+            Err(e) => e,
+        };
+
+        match err {
+            JammiError::Model { model_id, message } => {
+                assert_eq!(model_id, base_model_id);
+                assert!(
+                    message.contains("offline") && message.contains(base_model_id),
+                    "expected the offline refusal to name the repo id, got: {message}"
+                );
+            }
+            other => panic!("expected JammiError::Model, got {other:?}"),
+        }
     }
 
     /// Register `model_id` in `catalog` with `artifact_path` pointing at

@@ -1,6 +1,6 @@
-//! `docs_toml_fences_parse_under_the_real_loader` (PLAN-B-v2 §6 / Addendum,
-//! amended by PLAN-D G1/F4): every ```toml fence under `docs/guide/src`
-//! whose first non-blank, non-comment line names a top-level `JammiConfig`
+//! `docs_toml_fences_parse_under_the_real_loader`: every ```toml fence under
+//! `docs/guide/src` whose first non-blank, non-comment line names a
+//! top-level `JammiConfig`
 //! field parses under the REAL loader (`JammiConfig::parse_from`), not a
 //! hand-copied fixture. A guide example that stops matching the config
 //! shape it documents fails here, naming `file:line`, instead of silently
@@ -19,8 +19,8 @@
 //!
 //! # `${NAME}` and `{ file = "…" }`
 //!
-//! Every `${NAME}` in a selected fence is resolved from a placeholder env map
-//! (`NAME` -> `"x"`), mirroring the Addendum. A `{ file = "…" }` secret form
+//! Every `${NAME}` in a selected fence is resolved from a placeholder env
+//! map (`NAME` -> `"x"`). A `{ file = "…" }` secret form
 //! is real at deserialization time — `Secret::deserialize` reads the named
 //! file eagerly (see `crate::config::secret`), which a guide's illustrative
 //! path (`/run/secrets/pg-url`, `/etc/jammi/sa.json`, …) never resolves on a
@@ -167,7 +167,7 @@ fn neutralize_secret_files(body: &str, placeholder: &str) -> String {
     out
 }
 
-/// Build the placeholder env map the Addendum describes: every `${NAME}` in
+/// Build the placeholder env map the module docs describe: every `${NAME}` in
 /// `body` maps to `"x"`.
 fn placeholder_env(body: &str) -> BTreeMap<String, String> {
     let mut env = BTreeMap::new();
@@ -221,10 +221,17 @@ fn docs_toml_fences_parse_under_the_real_loader() {
         }
     }
 
-    assert!(
-        selected > 0,
-        "no config fences were selected under {} -- the selection rule likely drifted \
-         from what the guide actually writes",
+    // Pinned, not just `> 0`: a silent DROP in the selected count (the
+    // selection rule drifting away from what the guide actually writes) is
+    // just as much a coverage regression as selecting zero fences, and
+    // `> 0` alone would stay green through it. Bump this number in the same
+    // commit that adds (or removes) a `JammiConfig`-shaped ```toml fence
+    // under `docs/guide/src`.
+    assert_eq!(
+        selected,
+        24,
+        "selected {selected} config fence(s) under {} -- expected exactly 24; if you \
+         added or removed a JammiConfig-shaped ```toml fence, update this pinned count",
         guide_root().display()
     );
     assert!(

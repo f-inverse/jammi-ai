@@ -144,32 +144,257 @@ fn jammi_config_default_uses_sqlite_and_in_memory() {
     assert_eq!(cfg.broker, BrokerConfig::InMemory);
 }
 
-/// The redaction oracle (H9 scope): a `Debug` render of the whole config —
-/// the thing a startup log line or a panic message prints — must never
-/// carry a secret. Covers the Postgres URL password and an HTTP header
-/// value; the JetStream credentials and the signing key are exercised by
-/// the `secret_*` tests beside them.
+/// The redaction oracle (H9 scope, extended per the phase-4 audit): a
+/// `Debug` render of the whole config — the thing a startup log line or a
+/// panic message prints — must never carry a secret, at ANY secret
+/// position the config has: the catalog URL, broker credentials, an HTTP
+/// header, `models.hub_token`, and every `storage.cloud.*` credential field
+/// across all four cloud variants, in both the inline AND the `{ file = … }`
+/// spelling. Each cloud variant gets its own document (the field is a
+/// singular `Option<CloudConfig>`, so only one variant can be active at
+/// once), sharing one `base` fragment for the non-cloud positions.
 #[test]
 fn jammi_config_debug_never_prints_a_secret() {
-    let toml_src = r#"
+    let dir = tempfile::tempdir().unwrap();
+    let write_secret = |name: &str, contents: &str| -> String {
+        let path = dir.path().join(name);
+        std::fs::write(&path, contents).unwrap();
+        path.to_str().unwrap().to_string()
+    };
+    let s3_secret_file = write_secret("s3-secret", "s3-file-secret-xyz");
+    let gcs_sa_file = write_secret(
+        "gcs-sa",
+        "{\"type\":\"service_account\",\"key\":\"gcs-file-secret-xyz\"}",
+    );
+    let azure_secret_file = write_secret("azure-secret", "azure-file-clientsecret-xyz");
+
+    let plaintexts = [
+        "hunter2-pw",
+        "Bearer tok-4f9a-secret",
+        "nats-jwt-secret-abc",
+        "nats-url-token-secret",
+        "hf-inline-hubtoken-xyz",
+        "s3-inline-secret-xyz",
+        "s3-file-secret-xyz",
+        "r2-inline-secret-xyz",
+        "gcs-file-secret-xyz",
+        "azure-inline-accountkey-xyz",
+        "azure-inline-sastoken-xyz",
+        "azure-file-clientsecret-xyz",
+    ];
+
+    let base = r#"
         [catalog.postgres]
         url = "postgres://jammi:hunter2-pw@db.internal:5432/jammi"
 
+        [broker.jet_stream]
+        url = "nats://nats-user:nats-url-token-secret@nats.svc:4222"
+        credentials = "nats-jwt-secret-abc"
+
         [inference.http.headers]
         Authorization = "Bearer tok-4f9a-secret"
+
+        [models]
+        hub_token = "hf-inline-hubtoken-xyz"
+    "#;
+
+    // S3: secret_access_key via the `{ file = … }` form.
+    let s3_src = format!(
+        "{base}\n[storage.cloud.s3]\nsecret_access_key = {{ file = {s3_secret_file:?} }}\n"
+    );
+    // R2: secret_access_key inline.
+    let r2_src = format!(
+        "{base}\n[storage.cloud.r2]\naccount_id = \"acct\"\n\
+         secret_access_key = \"r2-inline-secret-xyz\"\n"
+    );
+    // GCS: service_account via the `{ file = … }` form.
+    let gcs_src =
+        format!("{base}\n[storage.cloud.gcs]\nservice_account = {{ file = {gcs_sa_file:?} }}\n");
+    // Azure: account_key inline, client_secret via the `{ file = … }` form —
+    // both spellings in one document.
+    let azure_src = format!(
+        "{base}\n[storage.cloud.azure]\naccount_name = \"acct\"\n\
+         account_key = \"azure-inline-accountkey-xyz\"\n\
+         client_secret = {{ file = {azure_secret_file:?} }}\n\
+         tenant_id = \"t\"\nclient_id = \"c\"\n"
+    );
+    // Azure `sas_token`, inline, in its own document (mutually exclusive
+    // with `account_key` per `AzureConfig::validate` — untested here since
+    // this test never calls `validate()`, but kept separate for clarity).
+    let azure_sas_src = format!(
+        "{base}\n[storage.cloud.azure]\naccount_name = \"acct\"\n\
+         sas_token = \"azure-inline-sastoken-xyz\"\n"
+    );
+
+    for src in [s3_src, r2_src, gcs_src, azure_src, azure_sas_src] {
+        let cfg: JammiConfig = toml::from_str(&src).unwrap_or_else(|e| panic!("{src}\n{e}"));
+        let rendered = format!("{cfg:?}");
+        let pretty = format!("{cfg:#?}");
+        for secret in plaintexts {
+            assert!(
+                !rendered.contains(secret),
+                "Debug leaked {secret:?} (src:\n{src}):\n{rendered}"
+            );
+            assert!(
+                !pretty.contains(secret),
+                "Debug (pretty) leaked {secret:?} (src:\n{src}):\n{pretty}"
+            );
+        }
+    }
+}
+
+/// Phase-4 audit item 1 (HIGH): the file layer is parsed AFTER `${VAR}`
+/// interpolation, so a TOML syntax error on the interpolated text must
+/// never render via `Display` (which quotes a code frame of the offending
+/// source line verbatim — the exact source line an unquoted `url =
+/// ${POSTGRES_URL}` expansion turns into the secret itself). An unquoted
+/// expansion is exactly this: `postgres://u:hunter2-file-secret@h/db` is
+/// not valid bare TOML syntax, so this is a genuine parse error, not a
+/// contrived one.
+#[test]
+fn file_parse_error_after_env_interpolation_never_echoes_the_expanded_secret() {
+    let env = vec![(
+        "PG".to_string(),
+        "postgres://u:hunter2-file-secret@h/db".to_string(),
+    )];
+    let toml_src = "[catalog.postgres]\nurl = ${PG}\n";
+    let err = JammiConfig::parse_from(toml_src, env).unwrap_err();
+    match err {
+        JammiError::Config(msg) => {
+            assert!(!msg.contains("hunter2-file-secret"), "msg = {msg}");
+            assert!(
+                msg.contains("line") && msg.contains("column"),
+                "expected a line:column locator, msg = {msg}"
+            );
+        }
+        other => panic!("expected JammiError::Config, got {other:?}"),
+    }
+}
+
+/// Phase-4 audit item 2 (MEDIUM): a whole-value env override at a seq/map
+/// position that fails serde's `invalid_type` check must not echo the
+/// value — `invalid type: string "…", expected …` bakes the value into the
+/// message text with no way to strip it after the fact, so the whole
+/// message is replaced with a fixed "expected <shape>" phrase instead.
+#[test]
+fn env_whole_value_type_mismatch_at_a_map_position_never_echoes_the_value() {
+    let err = JammiConfig::parse_from(
+        "",
+        vec![(
+            "JAMMI_INFERENCE__HTTP__HEADERS".to_string(),
+            "\"Bearer hunter2-env-secret\"".to_string(),
+        )],
+    )
+    .unwrap_err();
+    match err {
+        JammiError::Config(msg) => assert!(!msg.contains("hunter2-env-secret"), "msg = {msg}"),
+        other => panic!("expected JammiError::Config, got {other:?}"),
+    }
+}
+
+/// Phase-4 audit item 2's FILE-arm half: a file value can itself be a
+/// `${VAR}` expansion, so the same `invalid_type` leak is reachable with NO
+/// env override at all — `[inference.http] headers = "${TOKEN}"` expands to
+/// a bare string at a map position.
+#[test]
+fn file_value_type_mismatch_at_a_map_position_never_echoes_an_expanded_secret() {
+    let env = vec![(
+        "TOKEN".to_string(),
+        "Bearer hunter2-file-value-secret".to_string(),
+    )];
+    let toml_src = "[inference.http]\nheaders = \"${TOKEN}\"\n";
+    let err = JammiConfig::parse_from(toml_src, env).unwrap_err();
+    match err {
+        JammiError::Config(msg) => {
+            assert!(!msg.contains("hunter2-file-value-secret"), "msg = {msg}")
+        }
+        other => panic!("expected JammiError::Config, got {other:?}"),
+    }
+}
+
+/// Phase-4 audit item 3 (MEDIUM), the direct bare-env case: an env
+/// whole-value at an ENUM position that does not itself name a variant
+/// must not be echoed as the "unknown variant" — the message names only
+/// the variable and the expected variant list.
+#[test]
+fn env_whole_value_at_an_enum_position_never_echoes_the_value() {
+    let err = JammiConfig::parse_from(
+        "",
+        vec![(
+            "JAMMI_CATALOG".to_string(),
+            "{ postgres = { url = \"postgres://u:hunter2-enum-secret@h/db\" } }".to_string(),
+        )],
+    )
+    .unwrap_err();
+    match err {
+        JammiError::Config(msg) => {
+            assert!(!msg.contains("hunter2-enum-secret"), "msg = {msg}");
+            assert!(msg.contains("JAMMI_CATALOG"), "msg = {msg}");
+        }
+        other => panic!("expected JammiError::Config, got {other:?}"),
+    }
+}
+
+/// Phase-4 audit item 3, the `Node::Override` enum-lowering path: the SAME
+/// leak, but reached with a file layer present (forcing the merge to
+/// record `Node::Override` instead of a bare `Node::Env`) — the lowering
+/// arm used to synthesize a table keyed by the raw value before checking
+/// variant membership, letting the generic multi-key path re-echo it (and
+/// misattribute the origin to "the config file").
+#[test]
+fn env_whole_value_at_an_enum_position_via_override_never_echoes_the_value() {
+    let err = JammiConfig::parse_from(
+        "[catalog.sqlite]\n",
+        vec![(
+            "JAMMI_CATALOG".to_string(),
+            "{ postgres = { url = \"postgres://u:hunter2-override-secret@h/db\" } }".to_string(),
+        )],
+    )
+    .unwrap_err();
+    match err {
+        JammiError::Config(msg) => {
+            assert!(!msg.contains("hunter2-override-secret"), "msg = {msg}");
+            assert!(msg.contains("JAMMI_CATALOG"), "msg = {msg}");
+        }
+        other => panic!("expected JammiError::Config, got {other:?}"),
+    }
+}
+
+/// Phase-4 audit item 4 (LOW): `broker.jet_stream.url` is `Secret`-typed —
+/// a NATS URL can carry userinfo/token auth inline
+/// (`nats://user:pass@host`), the same class of leak `catalog.postgres.url`
+/// guards against.
+#[test]
+fn broker_jetstream_url_is_redacted_like_catalog_postgres_url() {
+    let toml_src = r#"
+        [broker.jet_stream]
+        url = "nats://nats-user:hunter2-nats-url-secret@nats.svc:4222"
     "#;
     let cfg: JammiConfig = toml::from_str(toml_src).unwrap();
-    let rendered = format!("{cfg:?}");
-    assert!(
-        !rendered.contains("hunter2-pw"),
-        "Debug leaked the Postgres password: {rendered}"
+    let BrokerConfig::JetStream { url, .. } = &cfg.broker else {
+        panic!("expected jet_stream, got {:?}", cfg.broker);
+    };
+    assert_eq!(
+        url.expose(),
+        "nats://nats-user:hunter2-nats-url-secret@nats.svc:4222"
     );
-    assert!(
-        !rendered.contains("tok-4f9a-secret"),
-        "Debug leaked the header value: {rendered}"
+    assert!(!format!("{cfg:?}").contains("hunter2-nats-url-secret"));
+}
+
+/// Phase-4 audit item 5 (LOW): `ServiceSelection`'s array form trims and
+/// filters empties exactly like its comma-list string form — a trailing
+/// newline or blank token from a templated array value is not a value.
+#[test]
+fn services_array_form_trims_and_filters_empties_like_the_comma_list_form() {
+    #[derive(Debug, serde::Deserialize)]
+    struct Holder {
+        services: ServiceSelection,
+    }
+    let padded: Holder = toml::from_str(r#"services = [" event ", "", "eval"]"#).unwrap();
+    assert_eq!(
+        padded.services,
+        ServiceSelection::Only(vec!["event".into(), "eval".into()])
     );
-    let pretty = format!("{cfg:#?}");
-    assert!(!pretty.contains("hunter2-pw") && !pretty.contains("tok-4f9a-secret"));
 }
 
 #[test]
@@ -556,7 +781,11 @@ fn env_override_run_worker_unparsable_is_a_typed_load_error() {
     match err {
         JammiError::Config(msg) => {
             assert!(msg.contains("JAMMI_TRAINING__RUN_WORKER"), "msg = {msg}");
-            assert!(msg.contains("maybe"), "msg = {msg}");
+            // Names the variable only, never the value (a bool-typed env
+            // leaf sits at the same position shape a secret-typed sibling
+            // does elsewhere in this config, so this error must stay safe
+            // to paste into a startup log regardless of which field it is).
+            assert!(!msg.contains("maybe"), "msg = {msg}");
         }
         other => panic!("expected JammiError::Config, got {other:?}"),
     }
@@ -1176,6 +1405,15 @@ fn two_file_variants_errors_naming_both() {
     }
 }
 
+/// End-to-end smoke check only: both source orderings still refuse through
+/// the public `parse_from` entry point. This is NOT an order-independence
+/// oracle — `parse_from` collects its `env` iterator into a `BTreeMap`
+/// before the env layer is ever built (mod.rs's `load_from`/`parse_from`),
+/// so both `Vec` literals below collapse onto the identical sorted input by
+/// the time anything order-sensitive runs. See
+/// `env_layer_leaf_table_collision_is_order_independent_and_names_each_role`
+/// below for the actual order oracle, driven directly against
+/// `env_map::build_env_layer` (which iterates whatever order it is given).
 #[test]
 fn env_bare_selection_plus_nested_key_collision_both_orders() {
     for env in [
@@ -1202,6 +1440,39 @@ fn env_bare_selection_plus_nested_key_collision_both_orders() {
             other => panic!("env = {env:?}: expected JammiError::Config, got {other:?}"),
         }
     }
+}
+
+/// T6's real order oracle: driven directly against `env_map::build_env_layer`
+/// (which — unlike `parse_from` — iterates its input in exactly the order
+/// given, never through a `BTreeMap` first), so the two orderings are
+/// genuinely different inputs. The collision is refused either way, but
+/// which variable plays "already placed" versus "the one that collides"
+/// flips with insertion order, and each arm names its own role's variable(s)
+/// explicitly — pinned here so that role assignment cannot silently drift.
+#[test]
+fn env_layer_leaf_table_collision_is_order_independent_and_names_each_role() {
+    let leaf = ("JAMMI_CATALOG".to_string(), "sqlite".to_string());
+    let nested = (
+        "JAMMI_CATALOG__POSTGRES__URL".to_string(),
+        "postgres://u:p@h/db".to_string(),
+    );
+
+    // Leaf first: the SECOND (nested) variable is refused as nesting under
+    // a path the FIRST (leaf) variable already set as a value.
+    let leaf_first_err =
+        super::env_map::build_env_layer(vec![leaf.clone(), nested.clone()]).unwrap_err();
+    assert_eq!(
+        leaf_first_err.0,
+        "JAMMI_CATALOG__POSTGRES__URL nests under a path JAMMI_CATALOG already sets as a value"
+    );
+
+    // Nested first: the SECOND (leaf) variable is refused as setting a
+    // value at a path the FIRST (nested) variable already nests under.
+    let nested_first_err = super::env_map::build_env_layer(vec![nested, leaf]).unwrap_err();
+    assert_eq!(
+        nested_first_err.0,
+        "JAMMI_CATALOG sets a value at a path that [\"JAMMI_CATALOG__POSTGRES__URL\"] also nests under"
+    );
 }
 
 #[test]
@@ -1241,6 +1512,42 @@ fn env_whole_value_override_of_a_struct_position_is_refused() {
     .unwrap_err();
     match err {
         JammiError::Config(msg) => assert!(msg.contains("JAMMI_CATALOG__POSTGRES"), "msg = {msg}"),
+        other => panic!("expected JammiError::Config, got {other:?}"),
+    }
+}
+
+/// H14's struct-position rule, the BARE-env case: with NO file layer at
+/// all, `Node::merge` never has a lower (file) node to disagree with, so
+/// the env leaf reaches `deserialize_struct` directly as a bare
+/// `Node::Env`, never wrapped in `Node::Override`. That case must refuse
+/// identically to the with-file-layer case above — the auditor's exact
+/// reproduction: `JAMMI_MODELS='{ offline = true }'` and
+/// `JAMMI_SERVER='{ health_listen = "1.2.3.4:1" }'` against an otherwise
+/// empty config, each of which (pre-fix) was silently ACCEPTED as a
+/// whole-struct value and reset every sibling field of that struct to its
+/// default.
+#[test]
+fn env_whole_value_struct_position_is_refused_even_with_no_file_layer() {
+    let err = JammiConfig::parse_from(
+        "",
+        vec![("JAMMI_MODELS".to_string(), "{ offline = true }".to_string())],
+    )
+    .unwrap_err();
+    match err {
+        JammiError::Config(msg) => assert!(msg.contains("JAMMI_MODELS"), "msg = {msg}"),
+        other => panic!("expected JammiError::Config, got {other:?}"),
+    }
+
+    let err = JammiConfig::parse_from(
+        "",
+        vec![(
+            "JAMMI_SERVER".to_string(),
+            "{ health_listen = \"1.2.3.4:1\" }".to_string(),
+        )],
+    )
+    .unwrap_err();
+    match err {
+        JammiError::Config(msg) => assert!(msg.contains("JAMMI_SERVER"), "msg = {msg}"),
         other => panic!("expected JammiError::Config, got {other:?}"),
     }
 }
@@ -1325,6 +1632,35 @@ fn services_grammar_all_forms() {
     );
 }
 
+/// H7 stays case-sensitive; a trailing newline (what a secrets file or a
+/// heredoc-sourced env var actually carries) is trimmed before both the
+/// case-sensitive `"all"` check and the comma split — it is not part of the
+/// value.
+#[test]
+fn services_all_trims_whitespace_but_stays_case_sensitive() {
+    #[derive(Debug, serde::Deserialize)]
+    struct Holder {
+        services: ServiceSelection,
+    }
+    let trimmed: Holder = toml::from_str("services = \"all\\n\"").unwrap();
+    assert_eq!(trimmed.services, ServiceSelection::All(AllSentinel::All));
+
+    let padded = JammiConfig::parse_from(
+        "",
+        vec![("JAMMI_SERVER__SERVICES".to_string(), "  all  ".to_string())],
+    )
+    .unwrap();
+    assert_eq!(
+        padded.server.services,
+        ServiceSelection::All(AllSentinel::All)
+    );
+
+    // Trimming never loosens H7's case sensitivity: padded "ALL" is still a
+    // one-token tier list, not the sentinel.
+    let shout: Holder = toml::from_str("services = \" ALL \"").unwrap();
+    assert_eq!(shout.services, ServiceSelection::Only(vec!["ALL".into()]));
+}
+
 #[test]
 fn env_services_all_and_comma_list() {
     let all = JammiConfig::parse_from(
@@ -1374,7 +1710,7 @@ fn gcs_service_account_maps_onto_service_account_json() {
     match cfg.storage.cloud {
         Some(CloudConfig::Gcs(gcs)) => {
             assert_eq!(
-                gcs.service_account_json.as_deref(),
+                gcs.service_account_json.as_ref().map(Secret::expose),
                 Some("{ \"type\": \"service_account\" }")
             );
             assert!(gcs.service_account_path.is_none());
@@ -1475,8 +1811,8 @@ fn resolve_config_path_in_honors_the_documented_order() {
     );
 }
 
-/// `parse_from("", [])` is the documented "defaults" control the Addendum
-/// describes: no file, no env, exactly `JammiConfig::default()`.
+/// `parse_from("", [])` is the documented "defaults" control: no file, no
+/// env, exactly `JammiConfig::default()`.
 #[test]
 fn parse_from_empty_is_the_defaults_control() {
     let cfg = JammiConfig::parse_from("", std::iter::empty()).unwrap();

@@ -468,9 +468,10 @@ workspace ships every publishable crate at the same
   of this workspace require FEAT_FP16 (ARMv8.2-A) — Graviton2+, Ampere Altra, and Apple silicon
   qualify; Raspberry Pi 4 (ARMv8.0) does not — pinned in `.cargo/config.toml`'s
   `[target.aarch64-unknown-linux-gnu]` `rustflags` (`-C target-feature=+fp16`) for local builds and
-  appended by `setup-rust-ci` in CI (an exported `RUSTFLAGS` replaces, never merges with, config
-  `rustflags`), working around `gemm`'s aarch64 f16 kernel otherwise failing to compile outside
-  release profile.
+  appended by `setup-rust-ci` in CI to whatever RUSTFLAGS it exports (a later step-level RUSTFLAGS
+  setter in the same job, e.g. `dep-dag.yml`'s amd64-side `RUSTFLAGS: ""`, replaces it same as any
+  other env write and would need the same re-append on an aarch64 runner), working around `gemm`'s
+  aarch64 f16 kernel otherwise failing to compile outside release profile.
 
 ### Fixed
 - **`jammi-encoders`' unit-test binary now serializes every writer of EVERY process-wide fusible-seam

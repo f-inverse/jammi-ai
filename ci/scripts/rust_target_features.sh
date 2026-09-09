@@ -18,7 +18,10 @@
 # in CI is exactly the class this repo's own `check_ci_guard_wiring.py`
 # exists to catch for `check_*`-named scripts; wiring a non-`check_*`
 # script's self-test by name is a stricter choice than that gate requires,
-# not a violation of it.
+# not a violation of it. `.github/workflows/ci.yml`'s `arm64-floor-oracle`
+# job additionally proves the floor on a REAL `ubuntu-24.04-arm` runner
+# (this file only proves the config file parses; that job proves the parsed
+# flag actually reaches `RUSTFLAGS` and then `rustc` itself).
 #
 # THIS SCRIPT PINS A NARROW, STRICT GRAMMAR — it is not a general TOML
 # parser, and does not try to be one:
@@ -29,13 +32,24 @@
 #   - `rustflags` must be a bracketed ARRAY on ONE line, e.g.
 #     `rustflags = ["-C", "link-arg=-fuse-ld=mold", "-C",
 #     "target-feature=+fp16"]` (the exact shape this repo's config file
-#     uses today) — never a bare string value, never a multi-line array;
-#   - every array element must be its own plain double-quoted string;
+#     uses today) — never a bare string value, never a multi-line array,
+#     never a trailing `# comment` after the closing `]` (the line must
+#     literally END with `]`);
+#   - every array element must be its own plain double-quoted string, with
+#     no trailing comma before the closing `]` (a trailing comma leaves the
+#     array's own closing quote missing, which this script rejects the same
+#     way as any other malformed boundary);
 #   - a target-feature flag must be spelled as TWO separate, paired
 #     elements — a standalone `"-C"` immediately followed by
 #     `"target-feature=<value>"` — never combined into one element
 #     (`"-C target-feature=+fp16"`) and never spelled `"-Ctarget-feature=
-#     ..."` with no separating space.
+#     ..."` with no separating space;
+#   - a COMMA INSIDE ONE VALUE is accepted, not rejected: elements are
+#     split on the literal `", "` (quote-comma-space) boundary BETWEEN
+#     quoted strings, not on every bare comma, so
+#     `"target-feature=+fp16,+dotprod"` — Rust's own canonical
+#     multi-feature spelling, and the likely next edit to this stanza — is
+#     ONE value, `+fp16,+dotprod`, not a parse error.
 #
 # ANY shape outside that grammar is a HARD FAILURE (exit 2, message to
 # stderr) — including a well-formed stanza that simply has NO
@@ -54,9 +68,12 @@
 #     or on a well-formed-but-empty result (message to stderr either way).
 #   rust_target_features.sh --self-test
 #     Asserts against the REAL `.cargo/config.toml` this repo ships (the
-#     positive case) plus five synthetic fixtures reproducing every FAIL
-#     shape above, driven against ephemeral temp files, never this repo's
-#     own file otherwise. No network, no python.
+#     positive case) plus eight synthetic fixtures, each reproducing ONE
+#     FAIL shape above, driven against ephemeral temp files (a COPY of the
+#     real file, in the fixtures that need real content to mutate --
+#     never the real file's own path passed to a fixture that expects a
+#     different answer than the real file would give). No network, no
+#     python.
 #
 # Implemented in awk (POSIX-portable constructs only: gsub/index/split/
 # substr/length) plus plain bash string handling — no python/tomllib
@@ -126,21 +143,36 @@ _extract() {
         exit 2
       }
       if (substr(rustflags_line, length(rustflags_line), 1) != "]") {
-        print "[target." triple "] rustflags array does not close on the same line (unsupported shape) in " config_path > "/dev/stderr"
+        print "[target." triple "] rustflags array does not close on the same line (a multi-line array or a trailing comment after the closing ] are both unsupported shapes) in " config_path > "/dev/stderr"
         exit 2
       }
       inner = substr(rustflags_line, 2, length(rustflags_line) - 2)
-      n = split(inner, raw, ",")
-      m = 0
+      if (length(inner) == 0) {
+        print "[target." triple "] rustflags array is empty in " config_path > "/dev/stderr"
+        exit 2
+      }
+      if (substr(inner, 1, 1) != "\"" || substr(inner, length(inner), 1) != "\"") {
+        print "[target." triple "] rustflags array elements must each be a plain double-quoted string (a trailing comma before ] is one way to land here) in " config_path > "/dev/stderr"
+        exit 2
+      }
+      # Split on the literal boundary BETWEEN quoted elements ("\", \"" --
+      # quote, comma, space), never on every bare comma: a comma INSIDE one
+      # value (e.g. "target-feature=+fp16,+dotprod", Rust'\''s own
+      # multi-feature spelling) has no following space and so is never
+      # mistaken for an element boundary. The two outer quotes (the
+      # array'\''s own first and last) are stripped first so every piece
+      # `split` returns is already a bare, dequoted value.
+      body = substr(inner, 2, length(inner) - 2)
+      n = split(body, raw, /", "/)
       for (i = 1; i <= n; i++) {
-        el = trim(raw[i])
-        if (length(el) < 2 || substr(el, 1, 1) != "\"" || substr(el, length(el), 1) != "\"") {
-          print "[target." triple "] rustflags array element " i " (\"" el "\") is not a plain double-quoted string in " config_path > "/dev/stderr"
+        val = raw[i]
+        if (index(val, "\"") > 0) {
+          print "[target." triple "] rustflags array element " i " (\"" val "\") is not a plain double-quoted string in " config_path > "/dev/stderr"
           exit 2
         }
-        m++
-        elements[m] = substr(el, 2, length(el) - 2)
+        elements[i] = val
       }
+      m = n
 
       found_feature = 0
       for (i = 1; i <= m; i++) {
@@ -177,7 +209,9 @@ _self_test() {
   # shellcheck disable=SC2064
   trap "rm -rf '$tmpdir'" RETURN
 
-  # 1. Positive: the REAL config file this repo ships.
+  # 1. Positive: the REAL config file this repo ships -- the one fixture
+  # that reads it directly, since it is the only one asserting the answer
+  # the real file is SUPPOSED to give.
   set +e
   got="$(_extract aarch64-unknown-linux-gnu "$DEFAULT_CONFIG_TOML" 2>/dev/null)"
   rc=$?
@@ -238,9 +272,12 @@ EOF
     failures=$((failures + 1))
   fi
 
-  # 5. Unknown triple: no [target.<x>] stanza at all in the real file.
+  # 5. Unknown triple: no [target.<x>] stanza at all -- against a COPY of
+  # the real file (never the real file's own path passed to a fixture
+  # expecting an answer the real file does NOT give).
+  cp "$DEFAULT_CONFIG_TOML" "$tmpdir/unknown-triple.toml"
   set +e
-  got="$(_extract totally-unknown-target-triple "$DEFAULT_CONFIG_TOML" 2>/dev/null)"
+  got="$(_extract totally-unknown-target-triple "$tmpdir/unknown-triple.toml" 2>/dev/null)"
   rc=$?
   set -e
   if [ "$rc" -eq 2 ]; then
@@ -264,11 +301,66 @@ EOF
     failures=$((failures + 1))
   fi
 
+  # 7. Missing rustflags key entirely: the stanza exists, but never
+  # declares rustflags at all -- a DIFFERENT shape than #2 (which has a
+  # well-formed empty-of-features array); this one has no array at all.
+  cat > "$tmpdir/no-rustflags-key.toml" << 'EOF'
+[target.aarch64-unknown-linux-gnu]
+some-other-key = "irrelevant"
+EOF
+  set +e
+  got="$(_extract aarch64-unknown-linux-gnu "$tmpdir/no-rustflags-key.toml" 2>/dev/null)"
+  rc=$?
+  set -e
+  if [ "$rc" -eq 2 ]; then
+    echo "self-test[missing rustflags key -> exit 2]: OK"
+  else
+    echo "self-test[missing rustflags key -> exit 2]: FAIL (rc=$rc, got='$got')" >&2
+    failures=$((failures + 1))
+  fi
+
+  # 8. Multi-line array: the closing ] is not on the same line as
+  # `rustflags =` -- an unsupported shape this script refuses rather than
+  # silently truncates.
+  cat > "$tmpdir/multiline.toml" << 'EOF'
+[target.aarch64-unknown-linux-gnu]
+rustflags = [
+  "-C", "target-feature=+fp16"
+]
+EOF
+  set +e
+  got="$(_extract aarch64-unknown-linux-gnu "$tmpdir/multiline.toml" 2>/dev/null)"
+  rc=$?
+  set -e
+  if [ "$rc" -eq 2 ]; then
+    echo "self-test[multi-line array -> exit 2]: OK"
+  else
+    echo "self-test[multi-line array -> exit 2]: FAIL (rc=$rc, got='$got')" >&2
+    failures=$((failures + 1))
+  fi
+
+  # 9. Unpaired target-feature=: a bare target-feature element with no
+  # preceding standalone "-C" element at all.
+  cat > "$tmpdir/unpaired.toml" << 'EOF'
+[target.aarch64-unknown-linux-gnu]
+rustflags = ["target-feature=+fp16"]
+EOF
+  set +e
+  got="$(_extract aarch64-unknown-linux-gnu "$tmpdir/unpaired.toml" 2>/dev/null)"
+  rc=$?
+  set -e
+  if [ "$rc" -eq 2 ]; then
+    echo "self-test[unpaired target-feature= -> exit 2]: OK"
+  else
+    echo "self-test[unpaired target-feature= -> exit 2]: FAIL (rc=$rc, got='$got')" >&2
+    failures=$((failures + 1))
+  fi
+
   if [ "$failures" -gt 0 ]; then
     echo "rust_target_features.sh --self-test: $failures fixture(s) FAILED" >&2
     return 1
   fi
-  echo "rust_target_features.sh --self-test: all 6 fixture(s) passed."
+  echo "rust_target_features.sh --self-test: all 9 fixture(s) passed."
   return 0
 }
 

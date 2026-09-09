@@ -2104,6 +2104,57 @@ jobs:
         continue-on-error: ${{ matrix.continue_on_error == 'true' }}
         run: ${{ matrix.cmd }}
 
+  # `setup-rust-ci`'s aarch64-linux `+fp16` floor (`.cargo/config.toml`'s
+  # `[target.aarch64-unknown-linux-gnu]` stanza, re-applied in CI because an
+  # exported RUSTFLAGS replaces config rustflags) had never actually
+  # EXECUTED on a real aarch64-linux runner anywhere in this tree before
+  # this job existed -- every other proof of it was a static check
+  # (`rust_target_features.sh --self-test`) or a throwaway probe already
+  # deleted. A silently-dropped floor fails CLOSED loudly in a dev/test
+  # build (a compile error) but fails OPEN silently in a release build (the
+  # codegen path that needs the instruction is dead there) -- this job
+  # exists so the drop is caught on every PR, on a real runner, not only in
+  # a release artifact nobody was testing for it. Seconds, not minutes: no
+  # crate build beyond `jammi-numerics` (nalgebra/rand/rand_distr/statrs --
+  # no candle, no gemm, no CUDA), and sccache's GHA cache backend
+  # (`setup-rust-ci`'s own default) makes every run after the first cheap.
+  arm64-floor-oracle:
+    name: arm64 floor oracle
+    runs-on: ubuntu-24.04-arm
+    steps:
+      - uses: actions/checkout@v4
+      - uses: ./.github/actions/setup-rust-ci
+
+      - name: Assert RUSTFLAGS carries the aarch64 fp16 floor
+        shell: bash
+        run: |
+          set -euo pipefail
+          if [[ "$RUSTFLAGS" != *"target-feature=+fp16"* ]]; then
+            echo "::error::RUSTFLAGS does not carry the aarch64 fp16 floor. Full RUSTFLAGS: '$RUSTFLAGS'" >&2
+            exit 1
+          fi
+          echo "RUSTFLAGS carries the floor: $RUSTFLAGS"
+
+      - name: Assert the floor reaches rustc itself, not only the env
+        # `ubuntu-24.04-arm`'s own runner image ships a generic Rust
+        # toolchain (actions/runner-images), so `cargo` is present even
+        # before rustup resolves this repo's own `rust-toolchain.toml`
+        # pin -- "if a toolchain is present" is a defensive skip, not the
+        # expected path.
+        shell: bash
+        run: |
+          set -euo pipefail
+          if ! command -v cargo > /dev/null 2>&1; then
+            echo "no cargo/toolchain found on this runner -- skipping the rustc-level check (the RUSTFLAGS-level check above already passed)"
+            exit 0
+          fi
+          if cargo rustc -p jammi-numerics --lib -- --print cfg 2>/dev/null | grep -q 'target_feature="fp16"'; then
+            echo "rustc's own cfg set for jammi-numerics carries target_feature=\"fp16\""
+          else
+            echo "::error::cargo rustc -p jammi-numerics --lib -- --print cfg did not report target_feature=\"fp16\" -- the exported RUSTFLAGS is not reaching rustc" >&2
+            exit 1
+          fi
+
   # ── Single rolled-up gate ──────────────────────────────────────────────────
   # The ONE check a branch-protection ruleset should require, instead of listing
   # every job as a separate context. It fails if any job above failed/cancelled;
@@ -2118,6 +2169,7 @@ jobs:
       - compile-check-gated
       - test-clients
       - guard
+      - arm64-floor-oracle
       - dep-direction
       - flash-attn-closure
       - lint-surface-closure

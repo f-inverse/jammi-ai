@@ -3755,7 +3755,10 @@ outside release profile). Config `rustflags` are honored on any build that leave
 var unset (local dev). In CI, `./.github/actions/setup-rust-ci` exports `RUSTFLAGS` itself (an env
 var REPLACES, never merges with, config `rustflags`), so it re-appends the aarch64 `+fp16` floor to
 whatever it exports — the one place that can see "am I about to shadow config.toml on a runner that
-needs this floor" and fix it, rather than trusting every future CI job to remember. CI/dev/release
+needs this floor" and fix it, rather than trusting every future CI job to remember. This covers the
+RUSTFLAGS `setup-rust-ci` itself exports; a LATER step-level RUSTFLAGS setter in the same job
+(`dep-dag.yml:64`'s `RUSTFLAGS: ""` is the amd64-side example of the pattern) still replaces it same
+as any other env write, and would need the same re-append if it ever ran on an aarch64 runner. CI/dev/release
 base image: `.docker/ci.Dockerfile` (= `jammi-ai-ci`), a multi-arch index (`linux/amd64` +
 `linux/arm64`, one native leg per platform, merged by `_ci-base-image.yml`); the CUDA image extends
 it and stays `linux/amd64`-only.

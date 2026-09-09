@@ -653,7 +653,7 @@ Every trait/enum/base surface a maintainer extends, with anchors and invariants.
   struct): USearch HNSW + Jammi-owned rowmap (`ROWMAP_VERSION=1`) + JSON manifest
   (`ANN_MANIFEST_VERSION=3`). Metric hardcoded `Cos`; quantization is
   `StoragePrecision`-driven (`F32`/`F16`/`Int8`/`Binary`,
-  `crates/jammi-db/src/config.rs`), passed as an explicit `precision` argument to
+  `crates/jammi-db/src/config/mod.rs`), passed as an explicit `precision` argument to
   `SidecarIndex::new`/`load` — never read off `self.ann` internally, so a
   rebuild/load always uses the caller's resolved precision (the catalog row's
   persisted value), not today's deployment default. `SidecarIndex::index_options`
@@ -674,7 +674,7 @@ Every trait/enum/base surface a maintainer extends, with anchors and invariants.
   `IncompatibleFormat`, mirroring the `backend_version` strict-compare (no
   reject-newer ordering; a config drift since the table was built must never
   silently reopen the wrong-precision graph). The precisions, kept in parity
-  with `StoragePrecision` (`crates/jammi-db/src/config.rs`) by
+  with `StoragePrecision` (`crates/jammi-db/src/config/mod.rs`) by
   `ci/scripts/check_doc_parity.py`:
 
   <!-- BEGIN STORAGE-PRECISION-VARIANTS -->
@@ -706,7 +706,7 @@ Every trait/enum/base surface a maintainer extends, with anchors and invariants.
   `SegmentIndexCache` (`crates/jammi-db/src/storage/index_cache.rs`, keyed on the
   segment manifest bytes); **any** segment load failure falls the whole table
   back to exact search, never a `SegmentedIndex` over the surviving subset.
-- **`AnnIndexConfig`** — `crates/jammi-db/src/config.rs` (the `AnnIndexConfig`
+- **`AnnIndexConfig`** — `crates/jammi-db/src/config/mod.rs` (the `AnnIndexConfig`
   struct): `connectivity` (HNSW M, build-time), `build_expansion`
   (ef_construction, build-time), `search_expansion` (ef_search, query-time,
   mutable) — **`0` = backend default** for these three. `storage_precision`
@@ -2493,7 +2493,7 @@ note below.
   `ModelCache::preload` is a thin `get_or_load`-then-`drop` warmer taking an *explicit*
   `(source, task, backend_hint)` — it does **not** read any config list, and it is called
   only from a test (`crates/jammi-ai/tests/it/models.rs`). `config.preload_models`
-  (`crates/jammi-db/src/config.rs`) is **dormant**: documented as "preload at server
+  (`crates/jammi-db/src/config/mod.rs`) is **dormant**: documented as "preload at server
   startup" but has no reader anywhere in the engine (defaults empty; no `jammi-server`
   startup wiring consumes it).
 - **`ModelSource` / `ModelId`** — `crates/jammi-ai/src/model/mod.rs` (`ModelId` and
@@ -3471,11 +3471,11 @@ and "published" are two different exclusion sets.
    `Option<Box<dyn VectorIndex>>` (or an enum) and update the two call sites:
    `AnnSearchExec::execute` and `ResultStore::search_vectors`. This is the only place the
    abstraction currently leaks the concrete type [§7].
-4. Selection key: wire `EmbeddingConfig::default_index_type` (`crates/jammi-db/src/config.rs`)
+4. Selection key: wire `EmbeddingConfig::default_index_type` (`crates/jammi-db/src/config/mod.rs`)
    — currently dead — through the build site (`crates/jammi-ai/src/pipeline/embedding.rs`).
 
 (Cheapest variant — a **query-time knob** like `search_expansion`: add a field to
-`AnnIndexConfig` (`crates/jammi-db/src/config.rs`), map it in `SidecarIndex::index_options`
+`AnnIndexConfig` (`crates/jammi-db/src/config/mod.rs`), map it in `SidecarIndex::index_options`
 (`crates/jammi-db/src/index/sidecar.rs`), re-apply on load if query-time-mutable, pin its
 default in `crates/jammi-db/src/index/sidecar.rs`.)
 

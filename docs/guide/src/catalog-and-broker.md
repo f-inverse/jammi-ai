@@ -1,7 +1,5 @@
 # Catalog Backend and Trigger Broker
 
-> Coordinator to relocate to the docs site (C3) when scaffold lands.
-
 Jammi's catalog (models, sources, eval runs, mutable companion tables) and
 trigger broker (provenance channels, evidence streams) are selected through
 two fields on `JammiConfig`: `catalog` and `broker`. The dev-laptop default
@@ -20,10 +18,17 @@ TOML table (or a bare string for a variant with no required fields):
 
 ```toml
 [catalog.postgres]
-url = "postgres://user:pass@host:5432/jammi"
+url = "postgres://user:pass@host:5432/jammi?sslmode=verify-full&sslrootcert=/etc/ssl/certs/ca-certificates.crt"
 pool_size = 16
 max_lifetime_secs = 1800
 ```
+
+`url` should carry `?sslmode=verify-full` for any connection that leaves a
+trusted network: `sslmode=require` upgrades the connection to TLS but never
+verifies the server's certificate (it defeats a MITM only when the network
+path is already trusted), and `sqlx` verifies against the **webpki** root
+store rather than the OS trust store, so a private CA needs its own
+`sslrootcert=` path even on a host that already trusts it system-wide.
 
 The broker stanza follows the same shape:
 
@@ -45,9 +50,12 @@ on `jammi-db`; selecting it without the feature returns
 ## Environment variable interpolation
 
 `JammiConfig::load` substitutes `${NAME}` patterns from the process
-environment before TOML parsing. The rules:
+environment before TOML parsing (`load_from`/`parse_from` take the same
+lookup as an explicit map instead — see [Configuration](./configuration.md)
+— so a test never touches real process env). The rules:
 
-- `${NAME}` is replaced by the value of `std::env::var("NAME")`.
+- `${NAME}` is replaced by the looked-up value of `NAME` (`load`: the
+  process environment via `std::env::var`).
 - A missing variable is an error. The loader never silently substitutes an
   empty string — that is a common source of "deployed config has an empty
   Postgres URL" outages.
@@ -64,7 +72,7 @@ Combined with the externally tagged shape:
 artifact_dir = "/var/lib/jammi"
 
 [catalog.postgres]
-url = "${POSTGRES_URL}"
+url = "${POSTGRES_URL}?sslmode=verify-full&sslrootcert=/etc/ssl/certs/ca-certificates.crt"
 pool_size = 16
 max_lifetime_secs = 1800
 

@@ -157,7 +157,7 @@ impl FromStr for LogFormat {
 /// artifact_dir = "/var/lib/jammi"
 ///
 /// [catalog.postgres]
-/// url = "${POSTGRES_URL}"
+/// url = "${POSTGRES_URL}?sslmode=verify-full&sslrootcert=/etc/ssl/certs/ca-certificates.crt"
 /// pool_size = 16
 /// max_lifetime_secs = 1800
 ///
@@ -166,6 +166,16 @@ impl FromStr for LogFormat {
 /// retention_seconds = 604800
 /// credentials = { file = "/var/run/secrets/nats.creds" }
 /// ```
+///
+/// `catalog.postgres.url` should carry `?sslmode=verify-full` (plus
+/// `sslrootcert=` naming a CA bundle, unless the server's certificate chains
+/// to a public root) rather than the sslx default `prefer` — `sqlx` verifies
+/// against the **webpki** root store, not the OS trust store, so a private CA
+/// needs `sslrootcert=` even on a host that otherwise trusts it system-wide.
+/// `sslmode=require` upgrades the connection to TLS but never verifies the
+/// server's certificate — it defeats a MITM only when the network path is
+/// already trusted, which is not the assumption behind reaching outside the
+/// process. See the guide's "Catalog Backend and Trigger Broker" page.
 ///
 /// # Secrets
 ///
@@ -423,7 +433,7 @@ fn cloud_via_section<'de, D: Deserializer<'de>>(
 ///
 /// ```toml
 /// [catalog.postgres]
-/// url = "${POSTGRES_URL}"
+/// url = "${POSTGRES_URL}?sslmode=verify-full&sslrootcert=/etc/ssl/certs/ca-certificates.crt"
 /// pool_size = 16
 /// max_lifetime_secs = 1800
 /// ```
@@ -432,6 +442,12 @@ fn cloud_via_section<'de, D: Deserializer<'de>>(
 /// [catalog.postgres]
 /// url = { file = "/run/secrets/postgres-url" }
 /// ```
+///
+/// `url` carries the `sslmode`/`sslrootcert` query parameters like any other
+/// part of the connection string — see [`JammiConfig`]'s "Catalog and broker
+/// selection" section for why `verify-full` (not the sqlx default `prefer`,
+/// and not the encrypted-but-unverified `require`) is the right value for a
+/// deployment that leaves its own trusted network.
 ///
 /// A bare string also selects a variant with no required fields:
 /// `catalog = "sqlite"`.
@@ -448,7 +464,8 @@ pub enum CatalogConfig {
     /// Postgres (or compatible) catalog. Used for SaaS deployments and
     /// self-hosted production.
     Postgres {
-        /// Connection URL, e.g. `postgres://user:pass@host:5432/jammi`.
+        /// Connection URL, e.g.
+        /// `postgres://user:pass@host:5432/jammi?sslmode=verify-full&sslrootcert=/etc/ssl/certs/ca-certificates.crt`.
         /// A [`Secret`]: inline or `{ file = "…" }`; never printed.
         url: Secret,
         /// `sqlx::PgPool` `max_connections`. Default: 8.

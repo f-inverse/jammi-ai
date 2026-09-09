@@ -104,3 +104,35 @@ Model **registration** — a durable catalog entry with an id, stage
 transitions, and evidence — is a platform concern and lives outside the OSS
 engine; the engine consumes local checkpoints directly through the reference
 forms above.
+
+## Configuring the Hub cache, endpoint, and token
+
+Every other spelling (a bare repo id, `hf://owner/repo`) resolves against the
+Hugging Face Hub through one client built once from `[models]`:
+
+```toml
+[models]
+hub_endpoint = "https://huggingface.co"
+hub_cache_dir = "/var/cache/jammi/hub"
+hub_token = { file = "/run/secrets/hf-token" }
+offline = false
+```
+
+| Field | Precedence |
+|---|---|
+| Cache root (a `hub/` subdirectory is appended) | `hub_cache_dir` → `HF_HOME` → the platform home directory's `.cache/huggingface` |
+| Endpoint | `hub_endpoint` → `HF_ENDPOINT` → the Hub's own default |
+| Token | `hub_token` → `HF_TOKEN` → the cache's own `token` file (`huggingface-cli login`'s file) |
+
+No home directory, no `HF_HOME`, and no `hub_cache_dir` is a typed
+`JammiError::Config` at session construction — never a panic. A token that
+resolves from none of the three sends no `Authorization` header, the same as
+an anonymous `huggingface-cli` session.
+
+`offline = true` refuses every Hub *network* fetch: a `HuggingFace`-sourced
+model loads only when it resolves against `local:` or an already-populated
+catalog row — a warm, on-disk Hub cache directory with no matching catalog
+row is still a miss, because the catalog (not the cache) is offline's source
+of truth. It does not reach the fine-tune worker's adapter fetch for an
+already-trained model, which always reads the adapter bundle from the
+artifact store, offline or not.

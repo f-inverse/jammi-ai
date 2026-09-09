@@ -7,6 +7,27 @@ workspace ships every publishable crate at the same
 ## [Unreleased]
 
 ### Added
+- **`[models]`, file-backed secrets, `signing_key.file`, and a fourth config-file
+  location (#483, #481, esc-095, esc-096).** `JammiConfig` gains a `[models]`
+  section (`hub_endpoint`, `hub_cache_dir`, `hub_token`, `offline`) built
+  once into a `jammi_ai::model::hub::HubSource` at the session choke point,
+  shared by every Hugging Face Hub call site (the resolver, the fine-tune
+  worker's HF fallback) — replacing the old per-call-site `Api::new()`,
+  which never read `HF_TOKEN` and panicked when `HOME` was unset. Every
+  secret-valued field (`catalog.postgres.url`, `broker.jet_stream.credentials`,
+  `inference.http.headers` values, the cloud credential fields, `models.hub_token`)
+  now accepts either the value inline or `{ file = "…" }` naming a file to read
+  at load (env spelling: `JAMMI_<PATH>__FILE=/path`); a resolved secret renders
+  as `Secret(***)` everywhere, including `Debug`. `signing_key.file` reads the
+  audit master key from a file (re-read on every signing request, so a rotated
+  mount needs no restart) alongside the existing `signing_key = "env"`. The
+  config-file resolution order gains a fourth step, `/etc/jammi/jammi.toml`,
+  between `./jammi.toml` and the platform per-user config directory. New
+  `JammiConfig::parse_from`/`load_from` entry points take an explicit env map
+  instead of reading `std::env` directly, so every config test in the
+  workspace — and the new `docs_toml_fences_parse_under_the_real_loader`
+  guide-fence test — is hermetic and process-env-free. `ci.yml`'s `HF_TOKEN`
+  is live (previously set but unused by any Hub call site).
 - **LoRA fine-tuning for the CLIP-text, OpenCLIP-vision and HTSAT-CLAP audio towers (#421).** All
   three carry LoRA sites on the same `jammi_lora::MaybeLoraLinear` seam the BERT family uses,
   reached through their own builders (`ClipText::builder`, `OpenClipVisionTransformer::builder`,
@@ -241,6 +262,15 @@ workspace ships every publishable crate at the same
 <!-- /profile-421-generated -->
 
 ### Changed
+- **`interpolate_env_vars` takes an explicit lookup closure (#483).**
+  `jammi_db::config::interpolate_env_vars(input, lookup: impl Fn(&str) ->
+  Option<String>)` replaces the previous `std::env`-reading signature (no
+  external callers); production passes `|k| std::env::var(k).ok()`, and every
+  test passes a placeholder map — the loader's own env-reading is now a
+  single, explicit seam. `HF_HOME` is set in every runtime stage of the
+  Dockerfile (`ENV HF_HOME=/var/lib/jammi/hf`), so the Hub cache lands on the
+  same persisted volume as the catalog and model weights rather than an
+  ephemeral container-local default.
 - **The media front end's per-item decode/preprocess runs across the batch in parallel on
   rayon's global pool (#421 follow-on).** `rayon` becomes a direct `jammi-ai` dependency (pinned
   to the version already unified across the resolved tree; no version bump). Two stages, signatures
@@ -663,6 +693,29 @@ workspace ships every publishable crate at the same
   column keeps its documented `""` reading (esc-091).
 
 ### Breaking
+- **Config sections are externally tagged, unknown keys/vars refuse, and two
+  cloud secret shapes are renamed (#483, #481, #480).** `[catalog]`,
+  `[broker]`, `[signing_key]`, and `[storage.cloud]` select their variant by
+  TOML table name (`[catalog.postgres]`) rather than a `kind =` key inside
+  one shared table; every config struct and every config-side section payload
+  carries `deny_unknown_fields`, and an unrecognised `JAMMI_*` config
+  variable, section, or value is now a load-time `JammiError::Config` naming
+  it, rather than a silent no-op (esc-095: `JAMMI_CATALOG__KIND=postgres`
+  used to run SQLite with no explanation). `broker.jet_stream.credentials_path`
+  is renamed `credentials` and now holds the `.creds` file contents (inline or
+  `{ file = "…" }`) rather than a bare path.
+  `storage.cloud.gcs.{service_account_json,service_account_path}` collapse to
+  one `service_account` field (inline JSON or `{ file = "…" }`) in the
+  config-file shape; the persisted `sources.options` shape (`CloudConfig`/
+  `GcsConfig`) is unchanged and still reloads unmodified rows. Migration: move
+  a `kind =` selector into the TOML table name, rename `credentials_path` to
+  `credentials`, and collapse the two GCS keys into `service_account`.
+- `jammi-cli`/`jammi` drop `grpcs://` and `https://` as accepted `--target`
+  schemes (#480) — TLS termination is the consumer's runtime, not the CLI's;
+  put a TLS-terminating proxy in front and point `--target` at it in
+  plaintext (`grpc://`/`http://`). The Python client is unaffected: it has
+  its own, independent scheme table and legitimately reaches a
+  TLS-terminating proxy.
 - `jammi_ai::inference::{arrow_to_images, arrow_to_audio}` return one decode result per row
   (`Result<Vec<Option<Result<T>>>>`, previously `Result<Vec<Option<T>>>`) and
   `jammi_ai::inference::schema::build_prefix_columns` returns a `Result`: a row that fails to

@@ -457,14 +457,20 @@ workspace ships every publishable crate at the same
   `ubuntu-24.04-arm` — no QEMU); each leg pushes only its own immutable `sha-<sha>-<arch>` tag, and
   a new `merge-manifest` job (running for every caller, including a one-platform caller like
   `image-cuda.yml`, which stays `linux/amd64`-only) merges the per-arch sources into the real
-  `latest`/`sha-<sha>` tags via `docker buildx imagetools create`, asserting the merged index's
-  platform set via `imagetools inspect`. `image.yml` requests both platforms; the CUDA base
-  (`jammi-ai-ci-cuda`) is unchanged (amd64 only — CUDA has no arm64 leg). Apple-silicon devcontainers
-  now resolve `:latest` to a native arm64 image instead of an emulated amd64 one. arm64 Linux builds
+  `latest`/`sha-<sha>` tags via `docker buildx imagetools create`, verifying the resulting index's
+  platform set (and one `unknown/unknown` provenance entry per platform) BEFORE promoting anything —
+  a `create --dry-run` against the same tags/sources first, asserted, only then the real (pushing)
+  create — and re-inspecting the pushed tag once after to confirm the push matched. `image.yml`
+  requests both platforms; the CUDA base (`jammi-ai-ci-cuda`) is STILL amd64-only (no arm64 leg) —
+  its tags are now a single-platform OCI index (same merge-and-verify path, one member) and its
+  Dockerfile takes a `BASE_IMAGE` build-arg like the CPU base's. Apple-silicon devcontainers now
+  resolve `:latest` to a native arm64 image instead of an emulated amd64 one. arm64 Linux builds
   of this workspace require FEAT_FP16 (ARMv8.2-A) — Graviton2+, Ampere Altra, and Apple silicon
-  qualify; Raspberry Pi 4 (ARMv8.0) does not — pinned via `.cargo/config.toml`'s
-  `[target.aarch64-unknown-linux-gnu]` `rustflags` (`-C target-feature=+fp16`), working around
-  `gemm`'s aarch64 f16 kernel otherwise failing to compile outside release profile.
+  qualify; Raspberry Pi 4 (ARMv8.0) does not — pinned in `.cargo/config.toml`'s
+  `[target.aarch64-unknown-linux-gnu]` `rustflags` (`-C target-feature=+fp16`) for local builds and
+  appended by `setup-rust-ci` in CI (an exported `RUSTFLAGS` replaces, never merges with, config
+  `rustflags`), working around `gemm`'s aarch64 f16 kernel otherwise failing to compile outside
+  release profile.
 
 ### Fixed
 - **`jammi-encoders`' unit-test binary now serializes every writer of EVERY process-wide fusible-seam

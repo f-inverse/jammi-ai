@@ -278,9 +278,22 @@ jobs:
             | bash ci/scripts/check_merged_index_platforms.sh "$PLATFORMS"
 
       - name: Promote -- create the real merged index
+        id: promote
         shell: bash
         run: |
           set -euo pipefail
+          first_tag="$(head -n1 /tmp/ci-base-image-tags.txt)"
+
+          # Capture the PRE-CREATE digest of the first tag BEFORE the real
+          # (mutating) create below -- if the post-push confirm step fails,
+          # this is the exact digest it prints a restore command for. A
+          # brand-new image name/tag has no previous digest at all
+          # (`imagetools inspect` fails, not a problem this step should
+          # fail on) -- recorded as `<none>` rather than left empty, so the
+          # confirm step's message is never a blank field.
+          previous_digest="$(docker buildx imagetools inspect "$first_tag" --format '{{.Manifest.Digest}}' 2>/dev/null || echo '<none -- first publish>')"
+          echo "previous_digest=$previous_digest" >> "$GITHUB_OUTPUT"
+
           mapfile -t sources < /tmp/ci-base-image-sources.txt
           mapfile -t tags < /tmp/ci-base-image-tags.txt
           tag_args=()
@@ -294,8 +307,13 @@ jobs:
         shell: bash
         env:
           PLATFORMS: ${{ inputs.platforms }}
+          PREVIOUS_DIGEST: ${{ steps.promote.outputs.previous_digest }}
         run: |
           set -euo pipefail
           first_tag="$(head -n1 /tmp/ci-base-image-tags.txt)"
-          docker buildx imagetools inspect "$first_tag" --format '{{json .Manifest}}' \
-            | bash ci/scripts/check_merged_index_platforms.sh "$PLATFORMS"
+          if ! docker buildx imagetools inspect "$first_tag" --format '{{json .Manifest}}' \
+            | bash ci/scripts/check_merged_index_platforms.sh "$PLATFORMS"; then
+            restore_ref="${first_tag%:*}@${PREVIOUS_DIGEST}"
+            echo "::error::post-push confirm failed for $first_tag -- previous digest was $PREVIOUS_DIGEST; restore with: docker buildx imagetools create -t $first_tag $restore_ref" >&2
+            exit 1
+          fi

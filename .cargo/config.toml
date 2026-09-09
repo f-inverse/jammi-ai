@@ -19,5 +19,8 @@ rustflags = ["-C", "link-arg=-fuse-ld=mold"]
 # baseline already implies FEAT_FP16, which is why this was invisible on
 # every macOS box that has ever built this workspace. Covers Graviton2+,
 # Ampere Altra, and Apple silicon; EXCLUDES Raspberry Pi 4 (ARMv8.0, no
-# FEAT_FP16) and any other sub-8.2 arm64 Linux host.
+# FEAT_FP16) and any other sub-8.2 arm64 Linux host. In CI `setup-rust-ci`
+# re-applies this flag itself because an env RUSTFLAGS replaces (never
+# merges with) config rustflags — this stanza is what a local/config-
+# honoring build (no RUSTFLAGS env set) actually gets.
 rustflags = ["-C", "link-arg=-fuse-ld=mold", "-C", "target-feature=+fp16"]

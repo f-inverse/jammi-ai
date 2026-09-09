@@ -3749,9 +3749,16 @@ auto-available to every encoder.)
 source of truth — the CI image build reads it and receives the channel as the `RUST_VERSION`
 build-arg, so the image can never bake a version the repo has moved off. `.cargo/config.toml` sets
 `rustc-wrapper = "sccache"` globally (sccache disables incremental by design — if sccache is missing,
-cargo fails) and `-fuse-ld=mold` for the two linux-gnu targets *only in local dev* (in CI the
-`RUSTFLAGS` env var wins). One CI/dev/release base image: `quay.io/pypa/manylinux_2_28_x86_64` →
-`.docker/ci.Dockerfile` (= `jammi-ai-ci`); the CUDA image extends it.
+cargo fails) and, per Linux target, a `rustflags` list (`-fuse-ld=mold` on both; aarch64 also carries
+`-C target-feature=+fp16`, the ARMv8.2-A FEAT_FP16 floor `gemm`'s aarch64 f16 kernel needs to compile
+outside release profile). Config `rustflags` are honored on any build that leaves the `RUSTFLAGS` env
+var unset (local dev). In CI, `./.github/actions/setup-rust-ci` exports `RUSTFLAGS` itself (an env
+var REPLACES, never merges with, config `rustflags`), so it re-appends the aarch64 `+fp16` floor to
+whatever it exports — the one place that can see "am I about to shadow config.toml on a runner that
+needs this floor" and fix it, rather than trusting every future CI job to remember. CI/dev/release
+base image: `.docker/ci.Dockerfile` (= `jammi-ai-ci`), a multi-arch index (`linux/amd64` +
+`linux/arm64`, one native leg per platform, merged by `_ci-base-image.yml`); the CUDA image extends
+it and stays `linux/amd64`-only.
 
 **Run before pushing (the local gate, mirrors `check`):**
 - `cargo fmt --all -- --check`

@@ -18,7 +18,16 @@ inputs:
       lane that must not fail on a warning outside its own crates, or ""
       to leave RUSTFLAGS unset entirely (falling back to .cargo/config.toml's
       per-target mold default). Never silently force a job onto a flag set it
-      didn't have.
+      didn't have -- EXCEPT the aarch64-linux `+fp16` floor below, which no
+      caller can drop: on a Linux aarch64 runner, whatever non-empty
+      RUSTFLAGS this action ends up exporting (your override or the
+      default) always carries `-C target-feature=+fp16` appended, because
+      an exported RUSTFLAGS replaces (never merges with)
+      `.cargo/config.toml`'s per-target rustflags, and gemm's aarch64 f16
+      kernel fails to COMPILE outside release profile without it. Leaving
+      `rustflags` empty skips this export entirely and falls through to
+      `.cargo/config.toml` instead, which pins the same floor for local/
+      config-honoring builds — either path carries it.
     required: false
     default: "-D warnings -C link-arg=-fuse-ld=mold"
   no-sccache:
@@ -42,5 +51,26 @@ runs:
           echo "SCCACHE_GHA_ENABLED=true" >> "$GITHUB_ENV"
         fi
         if [ -n "${{ inputs.rustflags }}" ]; then
-          echo "RUSTFLAGS=${{ inputs.rustflags }}" >> "$GITHUB_ENV"
+          flags="${{ inputs.rustflags }}"
+          # An exported RUSTFLAGS env var REPLACES (never merges with)
+          # .cargo/config.toml's per-target rustflags -- cargo's own,
+          # documented precedence rule (that file's own comment states it
+          # for the mold flag). config.toml's `[target.aarch64-unknown-
+          # linux-gnu]` stanza pins `-C target-feature=+fp16` (the
+          # ARMv8.2-A FEAT_FP16 floor gemm's aarch64 f16 kernel needs to
+          # even COMPILE outside release profile), and every caller of
+          # THIS action that passes a non-empty `rustflags` would silently
+          # override it. This is the ONE place that can see "am I about to
+          # export a RUSTFLAGS that would shadow config.toml, on a runner
+          # that needs the floor" and fix it, instead of trusting every
+          # present and future caller to remember -- appended, never
+          # prepended or exclusive, and only once (idempotent against a
+          # caller who already spelled it out by hand).
+          if [ "$(uname -s)" = "Linux" ] && [ "$(uname -m)" = "aarch64" ]; then
+            case "$flags" in
+              *target-feature=+fp16*) : ;;
+              *) flags="$flags -C target-feature=+fp16" ;;
+            esac
+          fi
+          echo "RUSTFLAGS=$flags" >> "$GITHUB_ENV"
         fi

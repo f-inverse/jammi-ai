@@ -15,6 +15,7 @@ on:
       - ".docker/ci-cuda.Dockerfile"
       - "rust-toolchain.toml"
       - ".github/workflows/_ci-base-image.yml"
+      - "ci/scripts/check_merged_index_platforms.sh"
   workflow_dispatch:
 
 # Serialize per ref, never cancel: an image push in flight must finish,

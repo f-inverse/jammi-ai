@@ -9,9 +9,23 @@ name: _ci-base-image
 # input, one NATIVE runner per platform (`linux/amd64` -> `ubuntu-latest`,
 # `linux/arm64` -> `ubuntu-24.04-arm`; no QEMU — a QEMU-emulated Rust
 # toolchain build is an order of magnitude slower and has hung before). Each
-# leg pushes ONLY the immutable `sha-<sha>-<arch>` tag; a leg never pushes a
-# real (`latest`/bare `sha-<sha>`) tag on its own, so two concurrent runs can
-# never mix arches into one real tag. `merge-manifest` (`needs: [plan,
+# leg pushes ONLY the `sha-<sha>-<arch>` tag; a leg never pushes a real
+# (`latest`/bare `sha-<sha>`) tag on its own. That per-arch tag NAME is
+# COMMIT-scoped, not run-scoped -- two DIFFERENT commits always get two
+# DIFFERENT tag names, which never collide -- but the tag is NOT immutable
+# within one commit: two runs BUILDING THE SAME COMMIT (e.g. a main push
+# and a tag push of that same commit, different concurrency groups) each
+# rebuild and re-push it, and each run's `merge-manifest` below reads back
+# whatever the tag points at when IT runs -- there is no cross-run mutex on
+# the per-arch tag itself.
+# This is harmless here: rebuilding the SAME commit through the SAME
+# Dockerfile is deterministic up to the base image an unrelated republish
+# could have moved between the two runs, and this reusable workflow IS that
+# base image, so for it the two builds' outputs are equivalent regardless
+# of which one a given merge happens to read. The pre-create dry-run
+# assertion (below) still guarantees every promoted index carries the
+# EXACT requested platform set no matter which run's tag it merged.
+# `merge-manifest` (`needs: [plan,
 # build-and-push]`, runs for every caller including a ONE-platform caller —
 # `image-cuda.yml` passes no `platforms` at all, i.e. the single-element
 # default) re-derives the SAME real tags this workflow has always published,
@@ -34,12 +48,17 @@ name: _ci-base-image
 # grant it — repo variables need `administration: write`, which is not available
 # to GITHUB_TOKEN. Re-adding sha-pinning therefore means introducing a PAT, not
 # adjusting permissions. Do not "fix" the failure by making such a step
-# non-fatal; that converts a broken pin into a silent one. A run that needs an
-# IMMUTABLE base (every release-artifact-producing workflow) instead resolves
-# `:latest` to its index digest ONCE per run (`docker buildx imagetools
-# inspect --format '{{.Manifest.Digest}}'`) and passes that resolved
-# `image@sha256:...` ref forward — still no PAT, still no repo-variable write,
-# just a read done once per run instead of once per repo-variable update.
+# non-fatal; that converts a broken pin into a silent one. Every consumer
+# today instead pulls `:latest` directly (now a multi-arch index, so each
+# puller's own runtime picks the manifest matching its own host arch --
+# see the paragraph above). Nothing in this tree resolves `:latest` to a
+# digest and pins it per run YET; a release-artifact-producing workflow
+# that wants an IMMUTABLE base across its own several legs could do exactly
+# that (`docker buildx imagetools inspect --format
+# '{{.Manifest.Digest}}'` once per run, then pass `image@sha256:...`
+# forward to every leg) -- still no PAT, still no repo-variable write, just
+# a read -- but that is a RECOMMENDATION for a future workflow to adopt,
+# not a mechanism this file or any current consumer implements.
 #
 # The `sha-<commit>-<arch>` tags are still published (now per-arch, merged
 # under `sha-<commit>` too), so a specific build can be pinned by hand (set
@@ -153,11 +172,14 @@ jobs:
         id: meta
         with:
           images: ghcr.io/${{ github.repository }}-${{ inputs.image_suffix }}
-          # Each leg pushes ONLY the immutable per-arch sha tag -- never
-          # `latest`, never a bare `sha-<sha>` -- so `merge-manifest` below is
-          # the ONLY job that ever moves a real (consumer-facing) tag, and two
-          # concurrent runs on different refs can never mix arches into one
-          # real tag by racing each other's per-leg pushes.
+          # Each leg pushes ONLY the per-arch sha tag -- never `latest`,
+          # never a bare `sha-<sha>` -- so `merge-manifest` below is the
+          # ONLY job that ever moves a real (consumer-facing) tag. The
+          # per-arch tag is commit-scoped and immutable ACROSS commits;
+          # two runs building the SAME commit (e.g. main-push +
+          # tag-push) each rebuild and re-push it, and each run's own
+          # merge reads back whatever it points at when that merge runs --
+          # see this file's own header for why that race is harmless here.
           flavor: |
             suffix=-${{ matrix.arch }},onlatest=true
           tags: |

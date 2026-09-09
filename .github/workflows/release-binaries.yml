@@ -101,9 +101,10 @@ jobs:
             runs-on: macos-14
             container: ""
             rustflags: ""
-          # linux-aarch64 is deferred: there is no arm Linux runner and no
-          # multi-arch CI base image to build it portably. Add a target row
-          # here once an arm runner / arm CI base is available.
+          # linux-aarch64 is deferred here (not blocked): the arm Linux
+          # runner and the multi-arch CI base image both exist now (#482).
+          # The aarch64 release rows land together with the rest of the
+          # arm64 release lanes, in the unit that adds them.
 
     runs-on: ${{ matrix.runs-on }}
     container: ${{ matrix.container }}

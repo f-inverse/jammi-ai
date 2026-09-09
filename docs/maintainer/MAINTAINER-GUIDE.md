@@ -3162,7 +3162,7 @@ At the gRPC edge, `map_engine_error` (`crates/jammi-server/src/grpc/wire.rs:109`
 maps `JammiError::Inference` (`crates/jammi-server/src/grpc/wire.rs:138`) to
 `Code::Internal`, and lets every unmatched variant — including the propagated
 `JammiError::Storage` transport fault — fall through its own catch-all to `Code::Internal`
-(`crates/jammi-server/src/grpc/wire.rs:186`). Because both reload surfaces raise the same
+(`crates/jammi-server/src/grpc/wire.rs:220`). Because both reload surfaces raise the same
 `JammiError::Model` for the same class of outcome, an unpublished OR a corrupted adapter
 bundle reads as the SAME `InvalidArgument` whether it is `ModelResolver` or
 `load_context_predictor` that hit it, and a genuine transient object-store outage on either

@@ -17,7 +17,7 @@ rustflags = ["-C", "link-arg=-fuse-ld=mold"]
 # aarch64 f16 kernels are selected at RUNTIME
 # (`is_aarch64_feature_detected!("fp16")`, `gemm-common-0.19.0/src/
 # simd.rs:2088`, inside a `#[target_feature(enable="neon,fp16")]` caller at
-# `:2070`) — a release build WITHOUT this flag still dispatches to those
+# `:2071`) — a release build WITHOUT this flag still dispatches to those
 # kernels on hardware that actually has FEAT_FP16; the flag exists ONLY
 # because the SAME code hand-emits `fmla .8h` in a form that fails to
 # COMPILE at opt-level 0 without it ("instruction requires: fullfp16",

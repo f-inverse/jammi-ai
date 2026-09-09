@@ -790,13 +790,18 @@ jobs:
   # green"; both claims were false on this runner and are corrected by
   # this comment and the removal of those two steps.
   #
-  # No `./.github/actions/setup-rust-ci`: that composite's DEFAULT
-  # `rustflags` hardcodes `-C link-arg=-fuse-ld=mold` — a Linux-only linker
-  # this runner does not have (`.cargo/config.toml`'s own mold pin is
-  # scoped to the `x86_64`/`aarch64`-unknown-linux-gnu targets only, never
-  # `aarch64-apple-darwin`) — and this job otherwise has no need for the
-  # sccache-GHA-cache half either (a macOS runner has its own toolchain
-  # cache, not this repo's Linux container image's warm sccache server).
+  # No `./.github/actions/setup-rust-ci`: that composite has no `rustflags`
+  # of its own at all (mold and the aarch64 `+fp16` floor live entirely in
+  # `.cargo/config.toml`'s per-target `rustflags`, scoped to the
+  # `x86_64`/`aarch64`-unknown-linux-gnu targets only, never
+  # `aarch64-apple-darwin` — this job never touches either flag either
+  # way) — this job needs neither half of what the composite actually
+  # offers: not the sccache-GHA-cache backend (this job installs its own
+  # sccache fresh, cold-cache, below, since a macOS runner has no
+  # preinstalled binary and this repo's Linux CI image's warm sccache
+  # server is unreachable from here), and not a per-target `-D warnings`
+  # export (each `cargo clippy` step below already passes `-- -D warnings`
+  # directly on its own command line).
   # Deliberately no RUSTFLAGS/RUSTC_WRAPPER override of any kind here: GH's
   # `macos-14` image ships `rustup` + a working `cc`/linker already, and
   # `rust-toolchain.toml` (channel 1.94.0, components rustfmt+clippy) is
@@ -2099,7 +2104,7 @@ jobs:
   # aarch64 f16 kernels are selected at RUNTIME
   # (`is_aarch64_feature_detected!("fp16")`, `gemm-common-0.19.0/src/
   # simd.rs:2088`, inside a `#[target_feature(enable="neon,fp16")]` caller
-  # at `:2070`) -- a release build WITHOUT `+fp16` still dispatches to them
+  # at `:2071`) -- a release build WITHOUT `+fp16` still dispatches to them
   # at runtime on hardware that has FEAT_FP16; the flag exists ONLY so
   # `cargo test`/dev (opt-level 0) builds of that same code COMPILE at all.
   # ARMv8.0 hosts (e.g. Raspberry Pi 4) are the trade this floor makes: not
@@ -2145,6 +2150,53 @@ jobs:
     runs-on: ubuntu-24.04-arm
     steps:
       - uses: actions/checkout@v4
+
+      # This job runs BARE (no `container:`) on purpose: the CI image's
+      # `:latest` tag carries no arm64 entry in its manifest INDEX until
+      # THIS PR's `image.yml` run actually publishes one (the multi-arch
+      # index this PR introduces) -- there is no arm64 container image for
+      # it to run inside yet. That makes mold a HARD REQUIREMENT of this
+      # job, not an optimization: the two readers below exist to prove that
+      # `.cargo/config.toml`'s `[target.aarch64-unknown-linux-gnu]`
+      # `rustflags` (mold linker + the `+fp16` compile floor) reaches a
+      # HOST (non-cross, native-arm64) build -- exactly the stanza every
+      # container-based job already exercises for free because the CI
+      # image bakes mold in. Without mold on PATH here, both readers die at
+      # `cc: cannot find 'ld.mold'` before their `grep` ever runs, since
+      # `jammi-numerics` links two proc-macro cdylibs (`serde_derive`,
+      # `thiserror-impl`) even for a plain `--lib` build -- so the linker
+      # always runs, on every crate in this workspace (none is
+      # dependency-free; every one pulls a proc-macro).
+      #
+      # Two alternatives rejected: dropping the mold link-arg for this job
+      # alone (env-unset, or a job-scoped config override) would gut Reader
+      # 1, whose whole point is that `.cargo/config.toml` ALONE (no CI-side
+      # env var) still carries mold -- there would be nothing left in the
+      # config file for it to read. And there is no dependency-free crate
+      # in this workspace to build instead, for the same proc-macro reason
+      # above.
+      #
+      # Same release tarball `.docker/ci.Dockerfile` pins for the CI
+      # image's own arm64 leg -- read the version from there rather than
+      # restate it (the same "read the pin, never copy it" rule the very
+      # next step already applies to `rust-toolchain.toml`), failing closed
+      # if that pin line is missing or empty.
+      - name: Install mold (bare arm64 runner, no CI-image container here)
+        shell: bash
+        run: |
+          set -euo pipefail
+          mold_version="$(sed -n 's/^ARG MOLD_VERSION=//p' .docker/ci.Dockerfile)"
+          if [ -z "$mold_version" ]; then
+            echo "::error::.docker/ci.Dockerfile has no (or an empty) 'ARG MOLD_VERSION=' line -- cannot resolve which mold release to install" >&2
+            exit 1
+          fi
+          curl -fsSL "https://github.com/rui314/mold/releases/download/v${mold_version}/mold-${mold_version}-aarch64-linux.tar.gz" \
+            | sudo tar -xz --strip-components=1 -C /usr/local
+          if ! command -v ld.mold >/dev/null 2>&1; then
+            echo "::error::ld.mold not on PATH after extracting mold v${mold_version} (aarch64-linux tarball) into /usr/local" >&2
+            exit 1
+          fi
+          echo "ld.mold on PATH: $(command -v ld.mold) (installed from ci.Dockerfile's pinned v${mold_version})"
 
       # Read the pin rather than restate it -- a second copy of the version
       # here would drift from rust-toolchain.toml without anything noticing.

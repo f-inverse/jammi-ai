@@ -258,6 +258,19 @@ jobs:
             type=raw,value=latest,enable={{is_default_branch}}
             type=sha,format=long
 
+      # The next step's own `SHA_TAG: sha-${{ github.sha }}` agrees with
+      # metadata-action's `type=sha,format=long` output above ONLY because
+      # both this workflow's callers (`image.yml`, `image-cuda.yml`) trigger
+      # on push-to-main + `workflow_dispatch` and never on `pull_request` --
+      # on a `pull_request` trigger, metadata-action's `type=sha` resolves
+      # the PR's HEAD sha, which need not equal `github.sha` (a merge-commit
+      # sha in that event). Nothing here re-derives the tag from
+      # metadata-action's own output to enforce this by construction; a
+      # future caller that added a `pull_request` trigger would silently
+      # diverge the two — but the divergence still fails closed, at the
+      # pre-promote assertion below (`imagetools create --dry-run` against
+      # a source tag this step computed from a `sha-<sha>` that does not
+      # match what was actually pushed).
       - name: Compute the immutable per-arch sources and the real tag list
         shell: bash
         env:

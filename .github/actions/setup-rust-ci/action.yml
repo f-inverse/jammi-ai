@@ -29,11 +29,13 @@ description: >
 inputs:
   deny-warnings:
     description: >
-      When "true" (the default), exports `CARGO_TARGET_<HOST_TRIPLE>_RUSTFLAGS
-      =-D warnings` for the runner's own host triple (`rustc -vV`'s `host:`
+      Accepts exactly "true" or "false" -- any other value is rejected with
+      an `::error::` naming it, before either branch below runs. "true"
+      (the default) exports `CARGO_TARGET_<HOST_TRIPLE>_RUSTFLAGS=-D
+      warnings` for the runner's own host triple (`rustc -vV`'s `host:`
       line, `-` -> `_`, uppercased -- cargo's own env-var naming rule for a
       per-target rustflags variable), so the hermetic Rust lanes fail on any
-      warning. Set to "false" for a lane that must not fail on a warning
+      warning. "false" is for a lane that must not fail on a warning
       outside its own crates (e.g. a release/packaging build, or a
       third-party-crate install step) -- this SKIPS the export entirely;
       it never forces a job onto a flag set it didn't have. Mold (Linux)
@@ -76,6 +78,18 @@ runs:
         set -euo pipefail
         if [ "${{ inputs.no-sccache }}" != "true" ]; then
           echo "SCCACHE_GHA_ENABLED=true" >> "$GITHUB_ENV"
+        fi
+
+        # Fail closed on anything other than the two literal values this
+        # input accepts -- a typo'd or expression-derived value that is
+        # neither "true" nor "false" would otherwise silently fall through
+        # the `= "true"` check below as if it meant "false" (skip the
+        # export), which is exactly backwards for a caller who meant to
+        # turn the warnings gate ON and mis-typed it.
+        deny_warnings="${{ inputs.deny-warnings }}"
+        if [ "$deny_warnings" != "true" ] && [ "$deny_warnings" != "false" ]; then
+          echo "::error::deny-warnings must be exactly 'true' or 'false', got: '$deny_warnings'" >&2
+          exit 1
         fi
 
         if [ "${{ inputs.deny-warnings }}" = "true" ]; then

@@ -118,4 +118,8 @@ Optional:
 - **HuggingFace Hub access** for downloading models (first run downloads ~90MB for MiniLM, cached thereafter)
 - **PostgreSQL / MySQL client libraries** if using federated database sources
 
-Set `HF_TOKEN` for gated models, or `HF_HOME` to control the cache location.
+Set `HF_TOKEN` for gated models, or `HF_HOME` to control the cache location —
+both are read as fallbacks when the config's own `[models]` section (see
+[Configuration](./configuration.md#catalog-broker-signing-key-storage-and-model-source))
+leaves `hub_token`/`hub_cache_dir` unset; a config value always wins over the
+environment variable.

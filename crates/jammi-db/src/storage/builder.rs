@@ -77,10 +77,10 @@ fn build_s3(
             builder = builder.with_access_key_id(key);
         }
         if let Some(secret) = &s3.secret_access_key {
-            builder = builder.with_secret_access_key(secret);
+            builder = builder.with_secret_access_key(secret.expose());
         }
         if let Some(token) = &s3.session_token {
-            builder = builder.with_token(token);
+            builder = builder.with_token(token.expose());
         }
         if s3.allow_http {
             builder = builder.with_allow_http(true);
@@ -122,7 +122,7 @@ fn build_gcs(
 
     if let Some(CloudConfig::Gcs(gcs)) = config {
         if let Some(json) = &gcs.service_account_json {
-            builder = builder.with_service_account_key(json);
+            builder = builder.with_service_account_key(json.expose());
         }
         if let Some(path) = &gcs.service_account_path {
             builder = builder.with_service_account_path(path);
@@ -169,7 +169,7 @@ fn build_azure(
             builder = builder.with_account(name);
         }
         if let Some(key) = &azure.account_key {
-            builder = builder.with_access_key(key);
+            builder = builder.with_access_key(key.expose());
         }
         if let Some(tenant) = &azure.tenant_id {
             builder = builder.with_tenant_id(tenant);
@@ -178,11 +178,12 @@ fn build_azure(
             builder = builder.with_client_id(client);
         }
         if let Some(secret) = &azure.client_secret {
-            builder = builder.with_client_secret(secret);
+            builder = builder.with_client_secret(secret.expose());
         }
         if let Some(sas) = &azure.sas_token {
             // SAS tokens are query-string params; let the SDK parse them.
             let pairs: Vec<(String, String)> = sas
+                .expose()
                 .trim_start_matches('?')
                 .split('&')
                 .filter_map(|kv| {
@@ -258,7 +259,7 @@ fn build_r2(
         builder = builder.with_access_key_id(key);
     }
     if let Some(secret) = &r2.secret_access_key {
-        builder = builder.with_secret_access_key(secret);
+        builder = builder.with_secret_access_key(secret.expose());
     }
     if r2.allow_http {
         builder = builder.with_allow_http(true);

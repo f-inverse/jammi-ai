@@ -267,8 +267,12 @@ mod live {
 
         let dir = tempdir().unwrap();
         let catalog = Arc::new(jammi_db::catalog::Catalog::open(dir.path()).await.unwrap());
-        let resolver =
-            ModelResolver::new(Arc::clone(&catalog), crate::common::test_artifact_store()).unwrap();
+        let resolver = ModelResolver::new(
+            Arc::clone(&catalog),
+            crate::common::test_artifact_store(),
+            crate::common::test_hub_source(),
+        )
+        .unwrap();
         let device_config = DeviceConfig {
             gpu_device: -1,
             memory_fraction: 1.0,
@@ -376,8 +380,12 @@ mod live {
 
         let dir = tempdir().unwrap();
         let catalog = Arc::new(jammi_db::catalog::Catalog::open(dir.path()).await.unwrap());
-        let resolver =
-            ModelResolver::new(Arc::clone(&catalog), crate::common::test_artifact_store()).unwrap();
+        let resolver = ModelResolver::new(
+            Arc::clone(&catalog),
+            crate::common::test_artifact_store(),
+            crate::common::test_hub_source(),
+        )
+        .unwrap();
         let device_config = DeviceConfig {
             gpu_device: -1,
             memory_fraction: 1.0,

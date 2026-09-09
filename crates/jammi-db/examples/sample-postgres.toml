@@ -11,20 +11,24 @@
 
 artifact_dir = "/var/lib/jammi"
 
-[catalog]
-kind = "postgres"
-url = "${POSTGRES_URL}"
+[catalog.postgres]
+# `sslmode=verify-full` (not sqlx's default `prefer`, and not `require` --
+# `require` upgrades the connection to TLS but never verifies the server's
+# certificate) plus `sslrootcert=` naming a CA bundle: sqlx verifies against
+# the webpki root store, not the OS trust store, so a private CA needs
+# `sslrootcert=` even on a host that trusts it system-wide.
+url = "${POSTGRES_URL}?sslmode=verify-full&sslrootcert=/etc/ssl/certs/ca-certificates.crt"
 pool_size = 16
 # Optional; PgBouncer / RDS-Proxy deployments cap connection lifetime so the
 # pool rotates onto fresh upstream connections instead of pinning one.
 max_lifetime_secs = 1800
 
-[broker]
-kind = "jet_stream"
+[broker.jet_stream]
 url = "nats://${NATS_HOST}:4222"
 # Default retention if a topic does not set `broker_metadata.retention_seconds`.
 retention_seconds = 604800
-credentials_path = "/var/run/secrets/nats.creds"
+# The `.creds` file CONTENTS, read at load (or inline the text). Never printed.
+credentials = { file = "/var/run/secrets/nats.creds" }
 
 [engine]
 execution_threads = 8

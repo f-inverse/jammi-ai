@@ -40,6 +40,16 @@ candle-nn = { workspace = true, optional = true }
 # the embedded engine's candle-backed fine-tune path.
 jammi-kernels = { workspace = true, optional = true }
 hf-hub = { workspace = true, optional = true }
+# `HubSource`'s cache-root fallback (`model/hub.rs`, esc-096): when neither
+# `[models] hub_cache_dir` nor `HF_HOME` is set, the platform home directory
+# stands in for hf-hub's own `Cache::default()` — but resolved through
+# `directories::BaseDirs` (a typed refusal when no home dir is found) rather
+# than `Cache::default()`'s own `dirs::home_dir().expect(..)`, which panics
+# in that situation. `jammi-db` already carries this dependency (its own
+# `ProjectDirs`-based config-path resolution) at the same pinned version, so
+# this is zero new transitive deps. Only the embedded engine resolves a Hub
+# cache root, so it rides `local` like `dep:hf-hub`.
+directories = { workspace = true, optional = true }
 tokenizers = { workspace = true, optional = true }
 # Lexical (BM25) retrieval sidecar — the tantivy inverted index, peer of the
 # USearch ANN sidecar. Embedded-engine-only, so it rides `local`.
@@ -146,6 +156,7 @@ local = [
     "dep:candle-nn",
     "dep:jammi-kernels",
     "dep:hf-hub",
+    "dep:directories",
     "dep:tokenizers",
     "dep:tantivy",
     "dep:image",

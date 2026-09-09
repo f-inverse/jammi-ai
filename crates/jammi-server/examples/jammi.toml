@@ -62,23 +62,20 @@ idle_poll_secs = 1
 #
 # Both are first-class config. Omitted, they default to a SQLite catalog
 # under artifact_dir and the in-process trigger broker — the laptop / dev
-# shape. `kind` selects the variant; the remaining keys belong to it.
+# shape. Each is an externally tagged section: the variant name is its own
+# TOML table (or a bare string for a variant with no required fields).
 #
-# [catalog]
-# kind = "sqlite"                # default; path defaults to {artifact_dir}/catalog.db
+# [catalog.sqlite]                # default; path defaults to {artifact_dir}/catalog.db
 # path = "/var/lib/jammi/catalog.db"
 #
-# [catalog]
-# kind = "postgres"
+# [catalog.postgres]
 # url = "postgres://jammi:secret@postgres:5432/jammi"
 # pool_size = 16                 # sqlx max_connections; default 8
 # max_lifetime_secs = 1800       # optional; omitted leaves the pool default
 #
-# [broker]
-# kind = "in_memory"             # default; the in-process broker
+# broker = "in_memory"           # default; the in-process broker
 #
-# [broker]
-# kind = "jet_stream"            # needs jammi-db's `jetstream-broker` feature
+# [broker.jet_stream]            # needs jammi-db's `jetstream-broker` feature
 # url = "nats://nats:4222"
 # retention_seconds = 604800     # per-stream default; default 7 days
-# credentials_path = "/var/run/secrets/nats.creds"   # optional; omitted connects anonymously
+# credentials = { file = "/var/run/secrets/nats.creds" }   # optional; the `.creds` contents (read at load); omitted connects anonymously

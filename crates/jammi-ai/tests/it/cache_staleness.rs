@@ -47,7 +47,12 @@ const TEXT: &str = "the quick brown fox jumps over the lazy dog";
 const DIVERGENCE_TOL: f32 = 1e-4;
 
 fn new_cache(catalog: Arc<Catalog>) -> ModelCache {
-    let resolver = ModelResolver::new(catalog, crate::common::test_artifact_store()).unwrap();
+    let resolver = ModelResolver::new(
+        catalog,
+        crate::common::test_artifact_store(),
+        crate::common::test_hub_source(),
+    )
+    .unwrap();
     let device_config = DeviceConfig {
         gpu_device: -1,
         memory_fraction: 1.0,
@@ -542,8 +547,12 @@ async fn stale_eviction_never_double_books_gpu_memory_while_guard_held() {
         .len() as usize;
 
     let scheduler = Arc::new(GpuScheduler::new(2 * weights_len, 0.0));
-    let resolver =
-        ModelResolver::new(Arc::clone(&catalog), crate::common::test_artifact_store()).unwrap();
+    let resolver = ModelResolver::new(
+        Arc::clone(&catalog),
+        crate::common::test_artifact_store(),
+        crate::common::test_hub_source(),
+    )
+    .unwrap();
     let device_config = DeviceConfig {
         gpu_device: -1,
         memory_fraction: 1.0,
@@ -683,8 +692,12 @@ async fn stale_reload_while_guard_live_waits_for_release_under_a_realistic_budge
     // Realistic budget: exactly ONE resident copy, no slack for a second,
     // transient one.
     let scheduler = Arc::new(GpuScheduler::new(weights_len, 0.0));
-    let resolver =
-        ModelResolver::new(Arc::clone(&catalog), crate::common::test_artifact_store()).unwrap();
+    let resolver = ModelResolver::new(
+        Arc::clone(&catalog),
+        crate::common::test_artifact_store(),
+        crate::common::test_hub_source(),
+    )
+    .unwrap();
     let device_config = DeviceConfig {
         gpu_device: -1,
         memory_fraction: 1.0,

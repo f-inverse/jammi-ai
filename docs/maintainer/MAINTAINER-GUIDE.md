@@ -653,7 +653,7 @@ Every trait/enum/base surface a maintainer extends, with anchors and invariants.
   struct): USearch HNSW + Jammi-owned rowmap (`ROWMAP_VERSION=1`) + JSON manifest
   (`ANN_MANIFEST_VERSION=3`). Metric hardcoded `Cos`; quantization is
   `StoragePrecision`-driven (`F32`/`F16`/`Int8`/`Binary`,
-  `crates/jammi-db/src/config.rs`), passed as an explicit `precision` argument to
+  `crates/jammi-db/src/config/mod.rs`), passed as an explicit `precision` argument to
   `SidecarIndex::new`/`load` — never read off `self.ann` internally, so a
   rebuild/load always uses the caller's resolved precision (the catalog row's
   persisted value), not today's deployment default. `SidecarIndex::index_options`
@@ -674,7 +674,7 @@ Every trait/enum/base surface a maintainer extends, with anchors and invariants.
   `IncompatibleFormat`, mirroring the `backend_version` strict-compare (no
   reject-newer ordering; a config drift since the table was built must never
   silently reopen the wrong-precision graph). The precisions, kept in parity
-  with `StoragePrecision` (`crates/jammi-db/src/config.rs`) by
+  with `StoragePrecision` (`crates/jammi-db/src/config/mod.rs`) by
   `ci/scripts/check_doc_parity.py`:
 
   <!-- BEGIN STORAGE-PRECISION-VARIANTS -->
@@ -706,7 +706,7 @@ Every trait/enum/base surface a maintainer extends, with anchors and invariants.
   `SegmentIndexCache` (`crates/jammi-db/src/storage/index_cache.rs`, keyed on the
   segment manifest bytes); **any** segment load failure falls the whole table
   back to exact search, never a `SegmentedIndex` over the surviving subset.
-- **`AnnIndexConfig`** — `crates/jammi-db/src/config.rs` (the `AnnIndexConfig`
+- **`AnnIndexConfig`** — `crates/jammi-db/src/config/mod.rs` (the `AnnIndexConfig`
   struct): `connectivity` (HNSW M, build-time), `build_expansion`
   (ef_construction, build-time), `search_expansion` (ef_search, query-time,
   mutable) — **`0` = backend default** for these three. `storage_precision`
@@ -2493,7 +2493,7 @@ note below.
   `ModelCache::preload` is a thin `get_or_load`-then-`drop` warmer taking an *explicit*
   `(source, task, backend_hint)` — it does **not** read any config list, and it is called
   only from a test (`crates/jammi-ai/tests/it/models.rs`). `config.preload_models`
-  (`crates/jammi-db/src/config.rs`) is **dormant**: documented as "preload at server
+  (`crates/jammi-db/src/config/mod.rs`) is **dormant**: documented as "preload at server
   startup" but has no reader anywhere in the engine (defaults empty; no `jammi-server`
   startup wiring consumes it).
 - **`ModelSource` / `ModelId`** — `crates/jammi-ai/src/model/mod.rs` (`ModelId` and
@@ -2948,16 +2948,16 @@ retry loop re-taking the write lock:
   lineage a terminal producer already committed.
 
 Resolver chain (`crates/jammi-ai/src/model/resolver.rs`, `ModelResolver::resolve`):
-`try_catalog_lookup` (`crates/jammi-ai/src/model/resolver.rs:97`) first (refuses `Retired`;
+`try_catalog_lookup` (`crates/jammi-ai/src/model/resolver.rs:122`) first (refuses `Retired`;
 resolves fine-tuned base recursively + fetches adapter), else `resolve_local`/`resolve_hf_hub`
 (locate config, pick backend, gather weights, discover tokenizer, sum file sizes into
 `estimated_memory`). Before any of that, an id carrying the reserved `jammi:fine-tuned:` prefix
-(`FINE_TUNED_ID_PREFIX`, `crates/jammi-ai/src/model/resolver.rs:118`) whose row's `model_type` is
+(`FINE_TUNED_ID_PREFIX`, `crates/jammi-ai/src/model/resolver.rs:43`) whose row's `model_type` is
 NOT `fine-tuned` is refused by name — the backstop for a catalog a pre-fix build already
 corrupted, since nothing else ever mints that prefix. A record whose `model_type`
 (`crates/jammi-ai/src/model/resolver.rs:159`) is `fine-tuned` and missing `base_model_id`
-(`crates/jammi-ai/src/model/resolver.rs:174`) or missing `artifact_path`
-(`crates/jammi-ai/src/model/resolver.rs:190`) is refused with a typed error naming the model
+(`crates/jammi-ai/src/model/resolver.rs:199`) or missing `artifact_path`
+(`crates/jammi-ai/src/model/resolver.rs:215`) is refused with a typed error naming the model
 id and the missing field, never silently resolved as an ordinary model or served as the
 unadapted base.
 
@@ -2993,10 +2993,10 @@ present key (which stays `StorageError::Io`, never reclassified —
 
 Both reload surfaces match on these two variants explicitly and re-type BOTH into the SAME
 `JammiError::Model`, naming the model id with a distinct message per variant.
-`try_catalog_lookup` (`crates/jammi-ai/src/model/resolver.rs:97`), `ModelResolver`'s
+`try_catalog_lookup` (`crates/jammi-ai/src/model/resolver.rs:122`), `ModelResolver`'s
 fine-tuned reload arm, matches `StorageError::NotPublished`
-(`crates/jammi-ai/src/model/resolver.rs:237`) and `StorageError::Layout`
-(`crates/jammi-ai/src/model/resolver.rs:248`) into `JammiError::Model`, and
+(`crates/jammi-ai/src/model/resolver.rs:262`) and `StorageError::Layout`
+(`crates/jammi-ai/src/model/resolver.rs:273`) into `JammiError::Model`, and
 `load_context_predictor` (`crates/jammi-ai/src/pipeline/context_predictor.rs:1110`) matches
 the identical pair — `StorageError::NotPublished`
 (`crates/jammi-ai/src/pipeline/context_predictor.rs:1314`) and `StorageError::Layout`
@@ -3004,10 +3004,10 @@ the identical pair — `StorageError::NotPublished`
 well, never its own `JammiError::Inference`. A catalog record that never recorded an
 `artifact_path` at all is a separate, earlier refusal on each surface that never reaches
 `fetch_artifact` — the resolver's arm also raises `JammiError::Model`
-(`crates/jammi-ai/src/model/resolver.rs:263`), and so does the predictor's own
+(`crates/jammi-ai/src/model/resolver.rs:288`), and so does the predictor's own
 `JammiError::Model` (`crates/jammi-ai/src/pipeline/context_predictor.rs:1277`). Any OTHER
 storage fault propagates unchanged past both surfaces' own catch-all —
-`Err(e) => return Err(e)` (`crates/jammi-ai/src/model/resolver.rs:258`) and the identical
+`Err(e) => return Err(e)` (`crates/jammi-ai/src/model/resolver.rs:283`) and the identical
 `Err(e) => return Err(e)` (`crates/jammi-ai/src/pipeline/context_predictor.rs:1333`).
 
 Every corrupted-catalog-record refusal EARLIER in this reload path — before `fetch_artifact` is
@@ -3471,11 +3471,11 @@ and "published" are two different exclusion sets.
    `Option<Box<dyn VectorIndex>>` (or an enum) and update the two call sites:
    `AnnSearchExec::execute` and `ResultStore::search_vectors`. This is the only place the
    abstraction currently leaks the concrete type [§7].
-4. Selection key: wire `EmbeddingConfig::default_index_type` (`crates/jammi-db/src/config.rs`)
+4. Selection key: wire `EmbeddingConfig::default_index_type` (`crates/jammi-db/src/config/mod.rs`)
    — currently dead — through the build site (`crates/jammi-ai/src/pipeline/embedding.rs`).
 
 (Cheapest variant — a **query-time knob** like `search_expansion`: add a field to
-`AnnIndexConfig` (`crates/jammi-db/src/config.rs`), map it in `SidecarIndex::index_options`
+`AnnIndexConfig` (`crates/jammi-db/src/config/mod.rs`), map it in `SidecarIndex::index_options`
 (`crates/jammi-db/src/index/sidecar.rs`), re-apply on load if query-time-mutable, pin its
 default in `crates/jammi-db/src/index/sidecar.rs`.)
 

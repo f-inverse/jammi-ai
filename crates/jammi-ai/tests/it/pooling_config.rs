@@ -133,7 +133,12 @@ pub(crate) fn with_length_marker(mut cfg: serde_json::Value) -> serde_json::Valu
 pub(crate) async fn resolve_and_load(dir: &Path) -> LoadedModel {
     let catalog_dir = tempdir().unwrap();
     let catalog = Arc::new(Catalog::open(catalog_dir.path()).await.unwrap());
-    let resolver = ModelResolver::new(catalog, crate::common::test_artifact_store()).unwrap();
+    let resolver = ModelResolver::new(
+        catalog,
+        crate::common::test_artifact_store(),
+        crate::common::test_hub_source(),
+    )
+    .unwrap();
     let source = ModelSource::local(dir);
     let resolved = resolver
         .resolve(&source, ModelTask::TextEmbedding, None)
@@ -278,7 +283,12 @@ async fn corrupt_pooling_config_json_is_a_hard_error_at_resolve() {
 
     let catalog_dir = tempdir().unwrap();
     let catalog = Arc::new(Catalog::open(catalog_dir.path()).await.unwrap());
-    let resolver = ModelResolver::new(catalog, crate::common::test_artifact_store()).unwrap();
+    let resolver = ModelResolver::new(
+        catalog,
+        crate::common::test_artifact_store(),
+        crate::common::test_hub_source(),
+    )
+    .unwrap();
     let source = ModelSource::local(&dir);
     let result = resolver
         .resolve(&source, ModelTask::TextEmbedding, None)
@@ -306,7 +316,12 @@ async fn unsupported_pooling_mode_fails_model_load() {
 
     let catalog_dir = tempdir().unwrap();
     let catalog = Arc::new(Catalog::open(catalog_dir.path()).await.unwrap());
-    let resolver = ModelResolver::new(catalog, crate::common::test_artifact_store()).unwrap();
+    let resolver = ModelResolver::new(
+        catalog,
+        crate::common::test_artifact_store(),
+        crate::common::test_hub_source(),
+    )
+    .unwrap();
     let source = ModelSource::local(&dir);
     let resolved = resolver
         .resolve(&source, ModelTask::TextEmbedding, None)

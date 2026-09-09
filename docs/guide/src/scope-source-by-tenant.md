@@ -158,6 +158,4 @@ auth middleware). The engine itself does not authenticate; ADR-00 §
 - [Scope a Session to a Tenant](./multi-tenant.md) — the broader
   session-binding recipe this one extends.
 - [Register a Mutable Companion Table](./register-mutable-table.md) —
-  for sources Jammi owns, the `tenant_id` column comes from
-  [ADR-00](https://github.com/f-inverse/jammi-ai/blob/main/docs/plans/cp9-substrate-primitives/ADR-00-tenant-identifier.md)
-  by default.
+  for sources Jammi owns, the `tenant_id` column is emitted by default.

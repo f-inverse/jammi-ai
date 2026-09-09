@@ -120,9 +120,10 @@ def connect(
     / `embedding.ann.oversample`, among every other deployment default) through
     the public front door rather than only the lower-level native handle.
     ``None`` does not mean "no configuration": the engine resolves one exactly
-    as the server binary does — ``JAMMI_CONFIG``, else ``./jammi.toml``, else the
-    platform config dir, with the ``JAMMI_*`` environment overrides layered on
-    top — and falls back to the built-in defaults only when none of those exist.
+    as the server binary does — ``JAMMI_CONFIG``, else ``./jammi.toml``, else
+    ``/etc/jammi/jammi.toml``, else the platform config dir, with the
+    ``JAMMI_*`` environment overrides layered on top — and falls back to the
+    built-in defaults only when none of those exist.
     Meaningless against a REMOTE target — a deployment's own config is the
     server's concern, never a client-side passthrough — so a remote target
     opened *with* `config` is a caller error, rejected as an

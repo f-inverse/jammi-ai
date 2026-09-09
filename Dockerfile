@@ -131,10 +131,11 @@ CMD []
 # — and mount a volume / bind mount at `/var/lib/jammi`.
 FROM runtime-base AS runtime-generic
 
-# Persistent state: catalog DB, model weights, indices. Zero-config `jammi-server`
-# writes its SQLite catalog here via JAMMI_ARTIFACT_DIR (set below), so the
-# directory must be writable by the nonroot user (uid 65532) even when no volume
-# is mounted — `--chown` makes the baked directory writable; a mounted named
+# Persistent state: catalog DB, model weights, indices, and the Hugging Face
+# Hub cache (`HF_HOME`, set below). Zero-config `jammi-server` writes its
+# SQLite catalog here via JAMMI_ARTIFACT_DIR (set below), so the directory
+# must be writable by the nonroot user (uid 65532) even when no volume is
+# mounted — `--chown` makes the baked directory writable; a mounted named
 # volume inherits its ownership, and a bind mount must be `chown 65532:65532`.
 COPY --from=builder --chown=65532:65532 /tmp/jammi-data /var/lib/jammi
 VOLUME ["/var/lib/jammi"]
@@ -143,6 +144,15 @@ VOLUME ["/var/lib/jammi"]
 # XDG data dir (which is unwritable for uid 65532 on this base). An operator
 # config's `artifact_dir` still wins when passed via `--config`.
 ENV JAMMI_ARTIFACT_DIR=/var/lib/jammi
+
+# esc-096: `HubSource`'s cache-root fallback (`[models] hub_cache_dir` >
+# `HF_HOME` > the platform home directory) would otherwise fall through to
+# the home-directory arm here, and this distroless nonroot user has no
+# writable (indeed no) `HOME` (see the CUDA stage's `CUDA_CACHE_PATH` comment
+# below for the same fact) — resolving to a typed config error rather than a
+# panic, but still not a usable cache. Point the Hub cache at the same
+# persistent volume so a model pulled once survives a restart.
+ENV HF_HOME=/var/lib/jammi/hf
 
 USER nonroot:nonroot
 
@@ -161,6 +171,17 @@ FROM runtime-base AS runtime-selfcontained
 
 COPY deploy/jammi.selfcontained.toml /etc/jammi/jammi.toml
 COPY cookbook/fixtures/htsat_clap_tiny /opt/jammi/models/htsat_clap_tiny
+
+# This stage never fetches from the Hub (the baked config's own doc: "no
+# network fetch, no Hub credentials" — its one encoder is the baked
+# `local:` fixture above) and, like `runtime-generic`, provides no `HOME`
+# for the nonroot user. Still set for the same reason every other stage
+# sets it: a future non-`local:` `model_id` request against this image gets
+# `HubSource`'s typed config error resolved against a real, writable path
+# under `/tmp` (this stage's only writable root, matching its baked
+# `artifact_dir = "/tmp/jammi"`) rather than either a panic or an
+# unwritable `/var/lib/jammi` this stage never provisions.
+ENV HF_HOME=/tmp/jammi/hf
 
 USER nonroot:nonroot
 
@@ -199,13 +220,21 @@ RUN groupadd --gid 65532 nonroot \
     && mkdir -p /var/lib/jammi /var/lib/jammi/.nv-cache \
     && chown -R 65532:65532 /var/lib/jammi
 
-# Persistent state: catalog DB, model weights, indices.
+# Persistent state: catalog DB, model weights, indices, and the Hugging Face
+# Hub cache (`HF_HOME`, below).
 VOLUME ["/var/lib/jammi"]
 USER 65532:65532
 
 # Point zero-config `jammi-server` at the declared volume rather than the user's
 # XDG data dir. An operator config's `artifact_dir` still wins via `--config`.
 ENV JAMMI_ARTIFACT_DIR=/var/lib/jammi
+
+# esc-096: same reasoning as `CUDA_CACHE_PATH` right below — `HOME` is unset
+# at runtime for uid 65532 here despite `useradd --create-home` having
+# provisioned one at image-build time, so `HubSource`'s `directories::BaseDirs`
+# fallback would resolve nothing. Point the Hub cache at the same persistent
+# volume so a model pulled once survives a restart.
+ENV HF_HOME=/var/lib/jammi/hf
 
 # Persist the CUDA JIT (PTX→SASS) compute cache on the data volume. The image
 # ships single-arch PTX at CUDA_COMPUTE_CAP=80, so on an sm_80 device it loads

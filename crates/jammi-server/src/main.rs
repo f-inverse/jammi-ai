@@ -27,9 +27,10 @@ use jammi_server::telemetry::init_tracing;
 )]
 struct Cli {
     /// Path to the configuration file. Falls back to `JAMMI_CONFIG`,
-    /// `./jammi.toml`, and the platform-default config directory in
-    /// that order. When no file is found the workspace defaults are
-    /// used (SQLite catalog + in-memory broker under `.jammi/`).
+    /// `./jammi.toml`, `/etc/jammi/jammi.toml`, and the platform-default
+    /// config directory, in that order. When no file is found the
+    /// workspace defaults are used (SQLite catalog + in-memory broker
+    /// under `.jammi/`).
     #[arg(long)]
     config: Option<PathBuf>,
 }

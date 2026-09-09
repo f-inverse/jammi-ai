@@ -5,7 +5,9 @@ use std::path::Path;
 use std::pin::Pin;
 use std::sync::Arc;
 
+use jammi_ai::model::hub::HubSource;
 use jammi_ai::session::InferenceSession;
+use jammi_db::config::ModelsConfig;
 use jammi_db::error::{JammiError, Result as JammiResult};
 use jammi_db::store::ArtifactStore;
 use jammi_numerics::retrieval::AggregateMetrics;
@@ -56,6 +58,26 @@ pub fn test_artifact_store() -> Arc<ArtifactStore> {
         )
         .unwrap(),
     )
+}
+
+/// Build a [`HubSource`] rooted at a fresh tempdir with no configured
+/// endpoint/token — for resolver-level integration tests that construct a
+/// `ModelResolver` directly rather than through a full `InferenceSession`.
+/// Never touches the real network or process environment: no test in this
+/// suite that needs a live Hub round-trip uses this fixture (see
+/// `hub_source.rs`, which builds its own `HubSource` per test against a
+/// wiremock server). The cache dir leaks for the test binary's lifetime —
+/// acceptable in a test, same as [`test_artifact_store`].
+pub fn test_hub_source() -> HubSource {
+    let root = tempfile::tempdir().unwrap().keep();
+    HubSource::from_config(
+        &ModelsConfig {
+            hub_cache_dir: Some(root),
+            ..Default::default()
+        },
+        &|_: &str| None,
+    )
+    .unwrap()
 }
 
 /// Return the four aggregate retrieval metrics paired with their wire-format

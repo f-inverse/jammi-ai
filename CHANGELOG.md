@@ -730,6 +730,30 @@ workspace ships every publishable crate at the same
   failure to `Ok(())`. A `Promote`-classified row whose manifest sidecar vanishes between classify
   and perform (a race with a concurrent pass) now re-classifies as `Reap` instead of aborting the
   whole reconcile pass.
+- **Design revision on the above (#484): a promotion is not a reclaim.** The previous round's
+  `keeps`/`reclaims` prediction was itself a recurring defect surface — the `Err` arm's credit
+  subtracted a counterfactual `keeps` from what the rebuild actually purged, an ERROR-level
+  mismatch oracle existed only to notice when that prediction and the rebuild's actual deletion
+  diverged (rather than removing the redundant prediction), and the fused Parquet reader
+  `classify_expired_row` used could turn a benign listing-to-read vanish race into a whole-pass
+  abort. Removed the mirror rather than repairing it again: `ExpiredRowOutcome::Promote` now
+  carries only the row's FULL currently-referenced key set (`keeps` + `dir_prefixes`) — protected
+  wholesale in both modes, predicting NOTHING about what the rebuild will purge and not rewrite.
+  Apply's rebuild still purges stale segments exactly as before (a promotion legitimately needs to
+  clear them), but the keys it actually deletes are now recorded into a per-pass
+  `promoted_purged: BTreeSet<key>` and EXCLUDED from that pass's whole accounting — never
+  `orphans`, `orphan_count`, `bytes_reclaimed`, nor `pending` — because they were consumed by the
+  promotion, not reclaimed by the ordinary orphan mechanism; `ReconcileReport::bytes_reclaimed`'s
+  contract is now explicit that it counts orphan and reap deletions only. A key `purge_segments`
+  itself FAILS to delete (a real I/O error, never a mere 404) is never excluded — it survives on
+  disk, unreferenced, and a LATER pass reclaims it normally once past grace (pinned by a dedicated
+  reproducer: an unwritable table directory fails the rebuild after the purge has run, and a
+  second pass, permissions restored, reclaims the surviving sidecar). Separately,
+  `validate_and_count_parquet_rows` now restores the pre-fusion vanish semantics: a Parquet that
+  disappears between `classify_expired_row`'s own `exists()` check and its single read classifies
+  as an invalid Parquet (`Reap`), never an `Err` that aborts the whole reconcile pass — pinned by a
+  new park-hook test that manufactures the exact classify-window race. The mismatch counter and its
+  test-hook are deleted along with the prediction they audited.
 - **Config phase-4 hardening: no bare-env whole-struct override without a file layer, `[models]`
   offline honored in the fine-tune worker's HF fallback, and no env value echoed into a config
   error (#483, #481).** `JammiConfig`'s hand-written `Deserialize` refused a bare `JAMMI_<X>='{

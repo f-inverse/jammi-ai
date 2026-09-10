@@ -335,21 +335,24 @@ fn segment_sidecar_files(
     out
 }
 
-// ─── esc-484 (LEAD design item 3): the promote arm's rebuild purges the
-//     row's CURRENT segment set and rewrites, at most, a single fresh
-//     segment 0 — a stale sibling the rebuild deletes and does not rewrite
-//     is a REAL reclaim both modes must report identically. ────────────────
+// ─── #484 design revision: a promotion is not a reclaim. The promote arm's
+//     rebuild still purges the row's CURRENT segment set and rewrites, at
+//     most, a single fresh segment 0 — but a stale sibling the rebuild
+//     deletes and does not rewrite is now reported NOWHERE this pass, in
+//     EITHER mode: it is the promotion's own bookkeeping, never a reclaim
+//     this pass credits or previews. A LATER pass, once such bytes truly
+//     survive on disk unreferenced and past grace (the rebuild-fails-after-
+//     the-purge case, pinned separately below), reclaims them normally. ────
 
 /// Two segments (ids 0 and 1) already appended before the crash: the
-/// rebuild purges both and rewrites exactly one fresh segment 0, so segment
-/// 1's sidecars are a genuine reclaim. RED against 161bcc91: the dry-run
-/// protected the row's WHOLE existing key set (segment 1 included) and
-/// reported nothing, while apply silently discarded `purge_segments`'s
-/// returned key set (`store/mod.rs:1502`) and credited nothing either —
-/// `dry.orphans == [] == apply.orphans` even though apply really deleted
-/// segment 1's sidecar files.
+/// rebuild purges both and rewrites exactly one fresh segment 0. Segment 1's
+/// sidecars are real deletions but NOT a reclaim this pass reports — dry-run
+/// protects the row's WHOLE existing key set wholesale (predicting nothing
+/// about what the rebuild will purge); apply excludes what its own rebuild
+/// actually purged from every accounting field. Both report NOTHING for this
+/// row's segments in this pass.
 #[tokio::test]
-async fn dry_run_previews_promote_arm_reclaim_of_a_stale_second_segment() {
+async fn promote_of_a_stale_second_segment_reports_nothing_this_pass() {
     let dir = tempdir().unwrap();
     let catalog = Arc::new(Catalog::open(dir.path()).await.unwrap());
     let store = ResultStore::new(dir.path(), Arc::clone(&catalog), AnnIndexConfig::default())
@@ -379,10 +382,6 @@ async fn dry_run_previews_promote_arm_reclaim_of_a_stale_second_segment() {
 
     backdate_dir(&table_dir, Duration::from_secs(3600));
 
-    #[cfg(feature = "test-hooks")]
-    let mismatch_before =
-        jammi_db::store::reconcile_test_hooks::promote_arm_reclaim_mismatch_count();
-
     let dry = store
         .reconcile(ReconcileOptions {
             apply: false,
@@ -391,27 +390,20 @@ async fn dry_run_previews_promote_arm_reclaim_of_a_stale_second_segment() {
         .await
         .unwrap();
 
-    for (name, _) in &seg1_files {
-        assert!(
-            dry.orphans.iter().any(|o| o.ends_with(name.as_str())),
-            "a dry-run must preview segment 1's stale sidecar '{name}' as reclaimed: {dry:?}"
-        );
-    }
-    for (name, _) in &seg0_files {
+    for (name, _) in seg1_files.iter().chain(seg0_files.iter()) {
         assert!(
             !dry.orphans.iter().any(|o| o.ends_with(name.as_str())),
-            "segment 0's sidecar '{name}' survives the rebuild — never previewed as an orphan: \
-             {dry:?}"
+            "a promotion is not a reclaim: a dry-run must report NOTHING for a promoted row's \
+             segment sidecars, stale or surviving: {dry:?}"
         );
         assert!(
             !dry.pending.iter().any(|o| o.ends_with(name.as_str())),
             "{dry:?}"
         );
     }
-    let expected_bytes: u64 = seg1_files.iter().map(|(_, size)| size).sum();
     assert_eq!(
-        dry.bytes_reclaimed, expected_bytes,
-        "dry-run must preview segment 1's TRUE combined size: {dry:?}"
+        dry.bytes_reclaimed, 0,
+        "a dry-run must never predict a promotion's own rebuild as a reclaim: {dry:?}"
     );
     for (name, _) in seg1_files.iter().chain(seg0_files.iter()) {
         assert!(
@@ -442,7 +434,8 @@ async fn dry_run_previews_promote_arm_reclaim_of_a_stale_second_segment() {
     for (name, _) in &seg1_files {
         assert!(
             !table_dir.join(name).exists(),
-            "apply must actually delete segment 1's stale sidecar '{name}'"
+            "apply must actually delete segment 1's stale sidecar '{name}' — the promotion's \
+             rebuild still purges it for real, even though this pass reports nothing for it"
         );
     }
     for (name, _) in &seg0_files {
@@ -458,37 +451,178 @@ async fn dry_run_previews_promote_arm_reclaim_of_a_stale_second_segment() {
         .unwrap();
     assert_eq!(segs.len(), 1, "exactly one rebuilt segment: {segs:?}");
 
+    for (name, _) in seg1_files.iter().chain(seg0_files.iter()) {
+        assert!(
+            !apply.orphans.iter().any(|o| o.ends_with(name.as_str())),
+            "a promotion is not a reclaim: apply must report NOTHING for this row's segment \
+             sidecars, in this pass, even though segment 1's bytes are truly gone: {apply:?}"
+        );
+    }
+    assert_eq!(
+        apply.bytes_reclaimed, 0,
+        "apply must never credit a promotion's own rebuild as a reclaim: {apply:?}"
+    );
+
     assert_eq!(dry.orphans, apply.orphans, "{dry:?} vs {apply:?}");
     assert_eq!(dry.orphan_count, apply.orphan_count, "{dry:?} vs {apply:?}");
     assert_eq!(
         dry.bytes_reclaimed, apply.bytes_reclaimed,
         "{dry:?} vs {apply:?}"
     );
+}
 
-    // esc-484 (#484 follow-up): `classify_expired_row`'s prediction and the
-    // rebuild's ACTUAL deletion must agree on this reproducer — the
-    // ERROR-level "promote-arm reclaim mismatch" branch must never fire.
-    // Before the fix, `keeps`/`reclaims` were diffed against
-    // `referenced_result_keys`'s protect-side superset (which also carries
-    // each segment's phantom base `index_path` key), so this branch fired on
-    // EVERY promote-with-reclaim case despite the dry-run/apply parity
-    // asserted above staying green.
-    #[cfg(feature = "test-hooks")]
+/// #484 design revision, second half: when a promotion's rebuild fails
+/// AFTER `purge_segments` has run, the purged keys are excluded from THIS
+/// pass's accounting the same way a successful promotion's are — but a key
+/// `purge_segments` itself FAILS to delete (manufactured here with an
+/// unwritable table directory, exactly like `abort_aggregates_a_real_delete_
+/// failure_into_one_error`) survives on disk and is picked up normally by
+/// the ordinary age-gated arm once it is genuinely unreferenced: `pending`
+/// while the directory is still unwritable (a real delete failure, never
+/// silently swallowed), then `orphans` — with its TRUE size — once a LATER
+/// pass runs with the directory writable again.
+///
+/// `append_segment`'s own catalog insert (unconditional) precedes its
+/// physical sidecar write, so `write_fresh_segment_zero`'s failed write
+/// under the SAME permission denial leaves a dangling `index_segments` row
+/// for a fresh segment `0` — at the SAME `index_path` the ORIGINAL segment
+/// `0` used, so the ORIGINAL (unwritten-over, since the write also failed)
+/// segment `0` bytes stay legitimately referenced/protected forever after,
+/// an existing `append_segment` non-atomicity this fix neither causes nor
+/// remedies. Segment `1`'s catalog row has no such replacement — it is
+/// genuinely unreferenced once its row is purged — so it, alone, is what a
+/// later pass reclaims.
+#[tokio::test]
+async fn rebuild_failure_after_the_purge_defers_seg1_reclaim_to_a_later_pass() {
+    let dir = tempdir().unwrap();
+    let catalog = Arc::new(Catalog::open(dir.path()).await.unwrap());
+    let store = ResultStore::new(dir.path(), Arc::clone(&catalog), AnnIndexConfig::default())
+        .unwrap()
+        .with_lease_intervals(short_lease());
+
+    let info = create_building_embedding_with_parquet(&store, "docs-rebuild-fail", 5).await;
+    info.append_segment(&built_segment_index(2)).await.unwrap();
+    info.append_segment(&built_segment_index(3)).await.unwrap();
+    jammi_test_utils::write_manifest_sidecar_for(
+        &store,
+        info.parquet_url(),
+        "docs-rebuild-fail",
+        DIMS,
+    )
+    .await;
+    let parquet_local = info
+        .parquet_url()
+        .as_str()
+        .trim_start_matches("file://")
+        .to_string();
+    let table_dir = std::path::Path::new(&parquet_local)
+        .parent()
+        .unwrap()
+        .to_path_buf();
+    let table_name = jammi_test_utils::abandon_building(&catalog, info).await;
+
+    let seg0_files = segment_sidecar_files(&table_dir, &table_name, 0);
+    let seg1_files = segment_sidecar_files(&table_dir, &table_name, 1);
+
+    backdate_dir(&table_dir, Duration::from_secs(3600));
+
+    // Deleting (and writing) a file requires WRITE permission on its
+    // containing directory (POSIX semantics) — strip it so `purge_segments`'
+    // own deletes AND `write_fresh_segment_zero`'s write both fail with a
+    // real I/O error, never a mere 404: the rebuild fails after the purge
+    // ATTEMPTED (and failed) to clear the stale segment set.
+    use std::os::unix::fs::PermissionsExt;
+    std::fs::set_permissions(&table_dir, std::fs::Permissions::from_mode(0o555)).unwrap();
+
+    let first = store
+        .reconcile(ReconcileOptions {
+            apply: true,
+            grace: Duration::from_secs(3),
+        })
+        .await
+        .unwrap();
+
+    // Restore write permission unconditionally before any assertion can
+    // panic, so the tempdir's own Drop can clean up either way.
+    std::fs::set_permissions(&table_dir, std::fs::Permissions::from_mode(0o755)).unwrap();
+
+    let promoted = store
+        .catalog()
+        .get_result_table(&table_name)
+        .await
+        .unwrap()
+        .unwrap();
     assert_eq!(
-        jammi_db::store::reconcile_test_hooks::promote_arm_reclaim_mismatch_count(),
-        mismatch_before,
-        "classify_expired_row's prediction must match the rebuild's actual deletion"
+        promoted.status,
+        jammi_db::catalog::status::ResultTableStatus::Ready.to_string(),
+        "the row still promotes even though its rebuild failed: {first:?}"
     );
+    // The bytes physically survive — the permission denial blocked the
+    // unlink, not merely the report.
+    for (name, _) in seg0_files.iter().chain(seg1_files.iter()) {
+        assert!(
+            table_dir.join(name).exists(),
+            "a real delete failure must leave '{name}' in place for a later pass to retry"
+        );
+    }
+    // This pass never credits them as reclaimed (a real delete failure is
+    // never silently swallowed into a false credit).
+    for (name, _) in seg0_files.iter().chain(seg1_files.iter()) {
+        assert!(
+            !first.orphans.iter().any(|o| o.ends_with(name.as_str())),
+            "a failed delete must never be credited as reclaimed: {first:?}"
+        );
+    }
+
+    // A LATER pass, with the directory writable again, reclaims segment 1's
+    // surviving bytes normally — genuinely unreferenced (its catalog row was
+    // purged with no replacement) and already well past grace.
+    let second = store
+        .reconcile(ReconcileOptions {
+            apply: true,
+            grace: Duration::from_secs(3),
+        })
+        .await
+        .unwrap();
+
+    for (name, _) in &seg1_files {
+        assert!(
+            second.orphans.iter().any(|o| o.ends_with(name.as_str())),
+            "a later pass must reclaim the surviving sidecar '{name}' as an ordinary orphan: \
+             {second:?}"
+        );
+        assert!(
+            !table_dir.join(name).exists(),
+            "the later pass must actually delete '{name}'"
+        );
+    }
+    let expected_bytes: u64 = seg1_files.iter().map(|(_, size)| size).sum();
+    assert_eq!(
+        second.bytes_reclaimed, expected_bytes,
+        "the later pass must report segment 1's TRUE combined size: {second:?}"
+    );
+    // Segment 0's ORIGINAL bytes remain protected — `append_segment`'s
+    // dangling re-insert at the SAME `index_path` (its physical write itself
+    // failed under the same permission denial) means the catalog still
+    // names this key as a current segment.
+    for (name, _) in &seg0_files {
+        assert!(
+            table_dir.join(name).exists(),
+            "segment 0's original bytes are untouched by this whole reproducer: '{name}' missing"
+        );
+    }
 }
 
 /// One segment already appended, but the row's CURRENT Parquet carries ZERO
 /// rows: the rebuild purges the stale segment and, because
-/// `index.len() == 0`, rewrites NOTHING — the whole segment is a genuine
-/// reclaim, at every one of its sidecar keys. RED against 161bcc91 for the
-/// same reason as the two-segment sibling above: `dry.orphans == []` while
-/// apply actually deleted every `__seg0.*` sidecar and credited nothing.
+/// `index.len() == 0`, rewrites NOTHING. Segment 0's sidecars are real
+/// deletions but NOT a reclaim this pass reports — same rule as the
+/// two-segment sibling above. A later, SEPARATE reconcile pass (this time,
+/// past a real delete failure — an unwritable table directory, exactly like
+/// `rebuild_failure_after_the_purge_defers_seg1_reclaim_to_a_later_pass`)
+/// still reclaims the surviving bytes as an ordinary orphan.
 #[tokio::test]
-async fn dry_run_previews_promote_arm_reclaim_of_a_stale_segment_over_a_zero_row_parquet() {
+async fn promote_over_a_zero_row_parquet_reports_nothing_this_pass() {
     let dir = tempdir().unwrap();
     let catalog = Arc::new(Catalog::open(dir.path()).await.unwrap());
     let store = ResultStore::new(dir.path(), Arc::clone(&catalog), AnnIndexConfig::default())
@@ -516,10 +650,6 @@ async fn dry_run_previews_promote_arm_reclaim_of_a_stale_segment_over_a_zero_row
 
     backdate_dir(&table_dir, Duration::from_secs(3600));
 
-    #[cfg(feature = "test-hooks")]
-    let mismatch_before =
-        jammi_db::store::reconcile_test_hooks::promote_arm_reclaim_mismatch_count();
-
     let dry = store
         .reconcile(ReconcileOptions {
             apply: false,
@@ -530,16 +660,16 @@ async fn dry_run_previews_promote_arm_reclaim_of_a_stale_segment_over_a_zero_row
 
     for (name, _) in &seg0_files {
         assert!(
-            dry.orphans.iter().any(|o| o.ends_with(name.as_str())),
-            "a dry-run must preview the zero-row row's stale segment 0 sidecar '{name}' as \
-             reclaimed: {dry:?}"
+            !dry.orphans.iter().any(|o| o.ends_with(name.as_str())),
+            "a promotion is not a reclaim: a dry-run must report NOTHING for the zero-row row's \
+             stale segment 0 sidecar '{name}': {dry:?}"
+        );
+        assert!(
+            !dry.pending.iter().any(|o| o.ends_with(name.as_str())),
+            "{dry:?}"
         );
     }
-    let expected_bytes: u64 = seg0_files.iter().map(|(_, size)| size).sum();
-    assert_eq!(
-        dry.bytes_reclaimed, expected_bytes,
-        "dry-run must preview segment 0's TRUE combined size: {dry:?}"
-    );
+    assert_eq!(dry.bytes_reclaimed, 0, "{dry:?}");
     for (name, _) in &seg0_files {
         assert!(
             table_dir.join(name).exists(),
@@ -573,6 +703,11 @@ async fn dry_run_previews_promote_arm_reclaim_of_a_stale_segment_over_a_zero_row
             "apply must actually delete the stale segment 0 sidecar '{name}': it is never \
              rewritten over a zero-row Parquet"
         );
+        assert!(
+            !apply.orphans.iter().any(|o| o.ends_with(name.as_str())),
+            "a promotion is not a reclaim: apply must report NOTHING for this row's segment 0 \
+             sidecars, in this pass, even though the bytes are truly gone: {apply:?}"
+        );
     }
     let segs = store
         .catalog()
@@ -589,16 +724,6 @@ async fn dry_run_previews_promote_arm_reclaim_of_a_stale_segment_over_a_zero_row
     assert_eq!(
         dry.bytes_reclaimed, apply.bytes_reclaimed,
         "{dry:?} vs {apply:?}"
-    );
-
-    // esc-484 (#484 follow-up): same oracle as the two-segment sibling above
-    // — the classify/perform mismatch branch must never fire on this
-    // zero-row reproducer either.
-    #[cfg(feature = "test-hooks")]
-    assert_eq!(
-        jammi_db::store::reconcile_test_hooks::promote_arm_reclaim_mismatch_count(),
-        mismatch_before,
-        "classify_expired_row's prediction must match the rebuild's actual deletion"
     );
 }
 
@@ -658,10 +783,6 @@ async fn dimensions_zero_row_is_untouched_for_reclaim_in_both_modes() {
     let seg1_files = segment_sidecar_files(&table_dir, &table_name, 1);
 
     backdate_dir(&table_dir, Duration::from_secs(3600));
-
-    #[cfg(feature = "test-hooks")]
-    let mismatch_before =
-        jammi_db::store::reconcile_test_hooks::promote_arm_reclaim_mismatch_count();
 
     let dry = store
         .reconcile(ReconcileOptions {
@@ -724,12 +845,6 @@ async fn dimensions_zero_row_is_untouched_for_reclaim_in_both_modes() {
     assert_eq!(
         dry.bytes_reclaimed, apply.bytes_reclaimed,
         "{dry:?} vs {apply:?}"
-    );
-    #[cfg(feature = "test-hooks")]
-    assert_eq!(
-        jammi_db::store::reconcile_test_hooks::promote_arm_reclaim_mismatch_count(),
-        mismatch_before,
-        "classify_expired_row's prediction must match the rebuild's actual (non-)deletion"
     );
 }
 
@@ -920,6 +1035,69 @@ async fn manifest_vanished_between_classify_and_perform_re_classifies_to_reap() 
     assert!(
         !std::path::Path::new(&parquet_local).exists(),
         "the re-classified Reap arm must actually delete the Parquet"
+    );
+}
+
+/// #484 design revision item 3: a Parquet that vanishes in the window
+/// between `classify_expired_row`'s own `exists()` check and its single read
+/// of the Parquet's bytes (`storage::reader::validate_and_count_parquet_rows`)
+/// must re-classify to `Reap` — the identical outcome a torn/invalid Parquet
+/// already gets — never propagate an object-store error that aborts the
+/// WHOLE reconcile pass over one row's benign race. Pinned directly via the
+/// `reconcile_test_hooks` rendezvous (never merely inferred): the Parquet
+/// truly exists when `classify_expired_row`'s `exists()` check runs, and is
+/// deleted only once the pass has parked at the documented re-read point.
+#[cfg(feature = "test-hooks")]
+#[tokio::test]
+async fn parquet_vanished_during_the_classify_window_reaps_never_aborts_the_pass() {
+    let dir = tempdir().unwrap();
+    let catalog = Arc::new(Catalog::open(dir.path()).await.unwrap());
+    let store = ResultStore::new(dir.path(), Arc::clone(&catalog), AnnIndexConfig::default())
+        .unwrap()
+        .with_lease_intervals(short_lease());
+
+    // A promotable fixture (valid Parquet AND manifest sidecar) so the
+    // outcome the vanish forces (`Reap`) is unambiguously due to the race,
+    // never a coincidental "no manifest" classification the row would have
+    // reached anyway.
+    let (table_name, parquet_local) =
+        promotable_building_row_fixture(&store, &catalog, "docs-parquet-race").await;
+
+    let race = jammi_db::store::reconcile_test_hooks::arm_parquet_vanish_race(&table_name);
+    let store_clone = store.clone();
+    let handle = tokio::spawn(async move {
+        store_clone
+            .reconcile(ReconcileOptions {
+                apply: true,
+                grace: Duration::from_secs(3),
+            })
+            .await
+    });
+
+    race.wait_parked().await;
+    assert!(
+        race.is_parked(),
+        "the reconcile pass never reached the documented classify-window re-read point"
+    );
+    std::fs::remove_file(&parquet_local).unwrap();
+    race.release();
+
+    let report = handle
+        .await
+        .unwrap()
+        .expect("the pass must complete, never abort, over a benign classify-window vanish");
+
+    let row = store
+        .catalog()
+        .get_result_table(&table_name)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        row.status,
+        jammi_db::catalog::status::ResultTableStatus::Failed.to_string(),
+        "a Parquet that vanished during the classify window must reap, never abort the pass or \
+         yield a manifest-less promotion: {report:?}"
     );
 }
 

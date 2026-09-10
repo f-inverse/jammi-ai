@@ -37,6 +37,27 @@
 //! nothing, but performs the identical read-only classification and reports
 //! the SAME objects and sizes `apply=true` would reclaim (see
 //! [`ReconcileOptions::apply`]'s pinned dry-run/apply parity invariant).
+//!
+//! **A promotion is not a reclaim (#484 design revision).** An expired
+//! `building` row with a valid Parquet and its manifest sidecar present is
+//! PROMOTED, not reaped — an internal `ExpiredRowOutcome::Promote`
+//! classification. Promoting an embedding row's rebuild
+//! (`ResultStore::rebuild_index_from_parquet`) purges the row's entire
+//! CURRENT segment set and rewrites, at most, a
+//! single fresh segment `0` at the same key: a stale second segment (an
+//! interrupted multi-segment build), or segment `0` itself over a zero-row
+//! Parquet, is deleted and never rewritten. Those bytes are real deletions —
+//! `purge_segments` truly removes them — but they are the promotion's OWN
+//! internal bookkeeping, never a reclaim this pass reports: both dry-run
+//! (which protects the row's WHOLE current key set wholesale, predicting
+//! nothing about what the rebuild will purge) and apply (which records
+//! exactly what its own `purge_segments` call deleted into a per-pass
+//! `promoted_purged` exclusion set, rather than crediting it) report NOTHING
+//! for a promoted row's stale segment sidecars in THIS pass. A key
+//! `purge_segments` FAILS to delete (a real I/O error, never a mere 404)
+//! survives on disk, unreferenced, and is never excluded — it falls through
+//! to the ordinary age-gated object→row arm below to be reclaimed normally,
+//! in this pass or a later one, exactly like any other orphan candidate.
 
 use std::collections::{BTreeSet, HashMap};
 use std::str::FromStr;
@@ -54,7 +75,7 @@ use crate::storage::sidecar_layout::{
 };
 use crate::storage::StorageUrl;
 use crate::store::layout::{self, TenantSegment};
-use crate::store::{ExpiredRowOutcome, ResultStore};
+use crate::store::{ExpiredRowDeletion, ExpiredRowOutcome, ResultStore};
 use crate::tenant_scope::TenantBinding;
 
 /// One reconciliation pass's parameters.
@@ -154,6 +175,11 @@ pub struct ReconcileReport {
     ///   HEALTHY writer's lease may run, not how this route ages its
     ///   candidates.
     ///
+    /// NEVER a `Promote` row's own segment sidecars, even a stale one its
+    /// rebuild purges and does not rewrite: a promotion is not a reclaim (see
+    /// this module's own doc comment) — those keys are excluded from this
+    /// pass's accounting entirely, not admitted through either route above.
+    ///
     /// Capped at [`REPORT_LIST_CAP`]; see [`Self::orphan_count`].
     pub orphans: Vec<String>,
     /// The true count of orphan candidates found this pass, independent of
@@ -196,7 +222,12 @@ pub struct ReconcileReport {
     /// matching `apply=true` pass, on the identical state, WOULD delete (see
     /// the pinned dry-run/apply parity invariant on
     /// [`ReconcileOptions::apply`]). Never `0` merely because `!applied` —
-    /// only because nothing was reclaimable.
+    /// only because nothing was reclaimable. Counts orphan and reap
+    /// deletions ONLY — a promotion's internal rebuild (its `purge_segments`
+    /// call clearing a stale segment sibling to make way for a fresh one) is
+    /// never counted here, at any grace or `apply`: it is the promotion's own
+    /// bookkeeping, not a reclaim this pass performed (see this module's own
+    /// doc comment, "a promotion is not a reclaim").
     pub bytes_reclaimed: u64,
 }
 
@@ -410,19 +441,21 @@ impl ResultStore {
         //
         // Runs AFTER the object listing above, like every other row read
         // this pass performs — `reaped` (built here) records every key this
-        // arm accounts for (with the TRUE size the listing snapshot already
-        // captured, before any delete), and the object→row loop further down
-        // skips any key already in `reaped` OR `protected`: a key can never
-        // be counted twice, by construction, regardless of which arm ran
-        // first. [`ExpiredRowOutcome`] (esc-484) is the ONE classification
-        // BOTH modes branch on: `apply=true` calls
-        // [`ResultStore::reconcile_expired_building_row`], which classifies
-        // FIRST and then performs exactly the outcome licenses (its returned
-        // key set is non-empty for a `Reap` whose delete actually succeeded,
-        // AND for a `Promote` whose rebuild purged a stale segment sibling it
-        // did not rewrite at the same key — the dry-run/apply parity
-        // invariant, and the "accounting set == deletion set" invariant, both
-        // pinned on [`ReconcileOptions::apply`]); `apply=false` calls
+        // arm CREDITS (with the TRUE size the listing snapshot already
+        // captured, before any delete); `promoted_purged` (also built here)
+        // records every key a `Promote` row's rebuild ACTUALLY purged, but
+        // EXCLUDED from all accounting (never credited, never reported) —
+        // a promotion is not a reclaim (this module's own doc comment). The
+        // object→row loop further down skips any key already in `reaped`,
+        // `promoted_purged`, OR `protected`: a key can never be counted
+        // twice, and a promotion's internal purge can never be double-
+        // reported against the listing snapshot taken before it ran, by
+        // construction, regardless of which arm ran first.
+        // [`ExpiredRowOutcome`] is the ONE classification BOTH modes branch
+        // on: `apply=true` calls [`ResultStore::reconcile_expired_building_row`],
+        // which classifies FIRST and then performs exactly the outcome
+        // licenses, returning an [`crate::store::ExpiredRowDeletion`] that
+        // tells this loop which accumulator to grow; `apply=false` calls
         // [`ResultStore::classify_expired_row`] alone and only classifies:
         //
         // - `Reap`: this row's candidate keys ([`ResultStore::reap_candidate_keys`]
@@ -430,21 +463,16 @@ impl ResultStore {
         //   orphans, at their TRUE listed size, regardless of the object's
         //   own age — a CAS-licensed reap is never grace-gated (see
         //   [`ReconcileReport::orphans`]'s two admission routes).
-        // - `Promote { keeps, reclaims, dir_prefixes }`: `keeps` (the
-        //   Parquet, the manifest sidecar, and — only when the rebuild will
-        //   actually write one — a fresh segment 0's own sidecars) and
-        //   `dir_prefixes` are PROTECTED — added to `protected`, never
-        //   `reaped` — so a promoted-but-not-yet-`ready` row's SURVIVING
-        //   objects can never fall through to the general age-gated arm
-        //   below. `reclaims` — every OTHER key this row currently
-        //   references, which the rebuild's destructive purge deletes and
-        //   does NOT rewrite at the same key (e.g. a stale second segment
-        //   from an interrupted multi-segment build, or segment 0 itself
-        //   when the Parquet turns out to carry zero rows) — is credited
-        //   through the SAME `credit_reaped` helper the `Reap` arm uses, so
-        //   apply's `reconcile_expired_building_row` and this dry-run
-        //   preview can never disagree on what a promotion's rebuild
-        //   actually reclaims.
+        // - `Promote { keeps, dir_prefixes }`: the row's FULL current key set
+        //   is PROTECTED — added to `protected`, never `reaped` — so a
+        //   promoted-but-not-yet-`ready` row's objects can never fall
+        //   through to the general age-gated arm below. Nothing is
+        //   predicted or credited about what the rebuild will purge and not
+        //   rewrite: apply's own rebuild records that (whatever it actually
+        //   deletes) into `promoted_purged` instead, once it runs — a
+        //   dry-run never runs the rebuild, so it has nothing to exclude,
+        //   which is exactly why protecting the WHOLE current key set is
+        //   the correct (and only) thing a preview can do here.
         // - `Untouched`: nothing to account or protect.
         //
         // `orphans`/`orphan_count`/`bytes_reclaimed`/`truncated` are declared
@@ -456,6 +484,7 @@ impl ResultStore {
         let mut bytes_reclaimed = 0u64;
         let mut truncated = false;
         let mut reaped: BTreeSet<String> = BTreeSet::new();
+        let mut promoted_purged: BTreeSet<String> = BTreeSet::new();
         let mut protected = ReferencedKeys {
             exact: BTreeSet::new(),
             dir_prefixes: BTreeSet::new(),
@@ -469,16 +498,27 @@ impl ResultStore {
 
         for table in self.catalog.list_expired_building_tables().await? {
             if opts.apply {
-                let deleted = self.reconcile_expired_building_row(table).await?;
-                credit_reaped(
-                    deleted,
-                    &listed_sizes,
-                    &mut reaped,
-                    &mut orphans,
-                    &mut orphan_count,
-                    &mut truncated,
-                    &mut bytes_reclaimed,
-                );
+                match self.reconcile_expired_building_row(table).await? {
+                    ExpiredRowDeletion::Untouched => {}
+                    ExpiredRowDeletion::Reaped(deleted) => {
+                        credit_reaped(
+                            deleted,
+                            &listed_sizes,
+                            &mut reaped,
+                            &mut orphans,
+                            &mut orphan_count,
+                            &mut truncated,
+                            &mut bytes_reclaimed,
+                        );
+                    }
+                    ExpiredRowDeletion::PromotedPurged(purged) => {
+                        // Real deletions, but a promotion's own bookkeeping,
+                        // never a reclaim: excluded from every accounting
+                        // field this pass, not credited through
+                        // `credit_reaped`.
+                        promoted_purged.extend(purged);
+                    }
+                }
                 continue;
             }
             match self.classify_expired_row(&table).await? {
@@ -499,28 +539,15 @@ impl ResultStore {
                 }
                 ExpiredRowOutcome::Promote {
                     keeps,
-                    reclaims,
                     dir_prefixes,
                 } => {
-                    // `keeps` survives the rebuild at the SAME key (protected,
-                    // like `still_ready`'s rows further down); `reclaims` is
-                    // every OTHER key this row currently references — the
-                    // rebuild's `purge_segments` call deletes it and never
-                    // rewrites it (esc-484: apply credits the identical set
-                    // via `reconcile_expired_building_row`'s own return
-                    // value, computed from THIS SAME `classify_expired_row`
-                    // call's `Promote` payload).
+                    // The row's WHOLE current key set is protected wholesale
+                    // — a dry-run never runs the rebuild, so it predicts
+                    // nothing about which of these keys the rebuild will
+                    // purge and not rewrite; see this module's own doc
+                    // comment ("a promotion is not a reclaim").
                     protected.exact.extend(keeps);
                     protected.dir_prefixes.extend(dir_prefixes);
-                    credit_reaped(
-                        reclaims,
-                        &listed_sizes,
-                        &mut reaped,
-                        &mut orphans,
-                        &mut orphan_count,
-                        &mut truncated,
-                        &mut bytes_reclaimed,
-                    );
                 }
                 ExpiredRowOutcome::Untouched => {}
             }
@@ -656,8 +683,8 @@ impl ResultStore {
         // `orphans`/`orphan_count`/`bytes_reclaimed`/`truncated` are shared
         // with the expired-building pre-pass above: a cap hit on ANY list
         // (including `rows_failed`) sets the one report-wide flag, and a key
-        // that pass already accounted for (`reaped`) or protected
-        // (`protected`) is skipped below.
+        // that pass already accounted for (`reaped`), excluded
+        // (`promoted_purged`), or protected (`protected`) is skipped below.
         let cutoff =
             Utc::now() - chrono::Duration::from_std(opts.grace).unwrap_or(chrono::Duration::MAX);
 
@@ -667,6 +694,17 @@ impl ResultStore {
                 // above (reaped under `apply`, or previewed under a
                 // dry-run) — never re-classified here, so it can never be
                 // counted a second time no matter which arm ran first.
+                continue;
+            }
+            if promoted_purged.contains(&obj.rel) {
+                // A `Promote` row's rebuild ACTUALLY purged this key this
+                // pass (apply only) — real bytes are gone, but a promotion
+                // is not a reclaim: excluded here so this listing snapshot
+                // (taken before the purge ran) never re-reports it as an
+                // ordinary orphan/pending candidate. Never populated under a
+                // dry-run (which never runs a rebuild), and never populated
+                // for a key `purge_segments` itself FAILED to delete — that
+                // key survives on disk and falls through normally, below.
                 continue;
             }
             if protected.contains(&obj.rel) {
@@ -906,9 +944,9 @@ impl ResultStore {
     /// late-landing sidecar of a purge a recoverer's claim already ran.
     ///
     /// `pub(super)`: [`ResultStore::classify_expired_row`] (`store::mod`)
-    /// calls this too, to compute a [`ExpiredRowOutcome::Promote`] row's
-    /// `keeps`/`reclaims` split (esc-484) from the SAME currently-referenced
-    /// key set this pass's own pre-pass and object→row arms both read.
+    /// calls this too, to build a [`ExpiredRowOutcome::Promote`] row's
+    /// `keeps` payload from the SAME currently-referenced key set this
+    /// pass's own pre-pass and object→row arms both read.
     pub(super) async fn referenced_result_keys(
         &self,
         ready: &[ResultTableRecord],
@@ -965,8 +1003,8 @@ impl ResultStore {
 /// `/`) a listed object is referenced through if its own key starts with one.
 ///
 /// `pub(super)` (fields included): [`ResultStore::classify_expired_row`]
-/// (`store::mod`) reads both fields directly to split a `Promote` row's
-/// current key set into `keeps` / `reclaims` (esc-484).
+/// (`store::mod`) reads both fields directly to build a `Promote` row's
+/// `keeps` payload from its current key set.
 pub(super) struct ReferencedKeys {
     pub(super) exact: BTreeSet<String>,
     pub(super) dir_prefixes: BTreeSet<String>,

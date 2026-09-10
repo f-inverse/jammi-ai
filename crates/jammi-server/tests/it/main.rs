@@ -30,6 +30,7 @@ mod grpc_trigger;
 mod grpc_web;
 mod health;
 mod mount_tenant_scoped;
+mod probe;
 mod serve_bind_race;
 mod serve_e2e;
 mod server;

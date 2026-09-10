@@ -7,6 +7,43 @@ workspace ships every publishable crate at the same
 ## [Unreleased]
 
 ### Added
+- **A tested Shape B Compose stack, `jammi-server probe`, `jammi-server serve` as the
+  default subcommand, a reference-topologies guide page, and supply-chain
+  attestations on the published images (#482).** `deploy/docker-compose.yml`
+  (moved from the now-`Removed` `examples/docker-compose/`) brings up
+  `jammi-server` against a `postgres:16` catalog and a `nats:2.10-alpine
+  -js` broker, entirely through the existing `JAMMI_<PATH>` env-override
+  layer (`JAMMI_CATALOG__POSTGRES__URL`, `JAMMI_BROKER__JET_STREAM__URL`,
+  `JAMMI_SERVER__SERVICES`, `JAMMI_AUDIT_MASTER_KEY` from a git-ignored
+  `deploy/.env`, documented by the new `deploy/.env.example`); a CI-only
+  override (`deploy/docker-compose.ci.yml`) bind-mounts the bundled tiny
+  fixtures and pins the image to the one the workflow just built. The new
+  `.github/workflows/compose-smoke.yml` builds the CPU image, brings the
+  stack up, drives it with a remote Python client
+  (`tests/compose/shape_b_remote.py`) — add a source, generate embeddings,
+  search for a stored vector's own nearest neighbor, restart the server
+  container, and assert identical result ids/scores plus an unchanged
+  `list_index_segments` — and runs on every push to `main`, nightly, and on
+  demand (not on every PR: a cold CPU image build is ~30 minutes). `jammi-server`
+  gains a `probe [--url] [--config] [--timeout-secs]` subcommand — a
+  generic readiness check (GET `/readyz` once, exit `0` on HTTP `200`, `1`
+  otherwise, never following a redirect) in the same shape as Postgres's
+  `pg_isready`, backing the Compose healthcheck on the shell-less distroless
+  image — and `serve` (today's boot behaviour) becomes an explicit
+  subcommand that also doubles as the implicit default: a bare
+  `jammi-server` and `jammi-server --config X` both serve, identically to
+  `jammi-server serve` / `jammi-server serve --config X`.
+  `docs/guide/src/reference-topologies.md`
+  (linked from "Deploy as a Server") catalogs the four canonical shapes —
+  embedded crate/wheel, the tested Compose stack, a multi-replica Postgres
+  topology (the exact TOML and its env-only equivalent, the concurrency
+  guarantee, a Kubernetes sketch), and a disaggregated GPU compute tier
+  sketch. Every image `server-image.yml` pushes now carries a
+  `docker/build-push-action` SPDX SBOM, `mode=max` build provenance, and a
+  Sigstore-signed `actions/attest-build-provenance` attestation on the
+  pushed digest, asserted in the same job
+  (`ci/scripts/assert_image_attestations.sh`) and on the release-binaries
+  promote legs.
 - **`[models]`, file-backed secrets, `signing_key.file`, and a fourth config-file
   location (#483, #481, esc-095, esc-096).** `JammiConfig` gains a `[models]`
   section (`hub_endpoint`, `hub_cache_dir`, `hub_token`, `offline`) built
@@ -333,6 +370,20 @@ workspace ships every publishable crate at the same
   changes).
 
 ### Changed
+- **The published server images no longer pass `--config`; the Compose
+  healthcheck is `jammi-server probe` (#482).** Every runtime stage's `CMD`
+  is now `["serve"]`, resolved through the config chain `serve` always
+  walks (`--config`, `JAMMI_CONFIG`, `./jammi.toml`, `/etc/jammi/jammi.toml`,
+  the platform config dir, finally the built-in defaults); the
+  self-contained image, which previously ran `CMD ["--config",
+  "/etc/jammi/jammi.toml"]` explicitly, now relies on that same chain
+  finding its baked config at the fourth step. `docker run <image>
+  --config /etc/jammi/jammi.toml` still overrides the default `CMD`
+  unchanged (`--config` is a top-level flag `serve` accepts with no
+  subcommand keyword required). The tested Compose stack's healthcheck is
+  exec-form `["jammi-server", "probe"]`, replacing the old example's
+  `jammi-server --help` (which proved only that the binary existed, never
+  that the server was ready).
 - **One lease primitive; lease-owned `building` result tables (#479, esc-094).** A
   `building` result table now belongs to the `ResultStore` that created it: migration
   `027_result_table_lease` adds `result_tables.writer_id` / `lease_expires_at` (+
@@ -1024,6 +1075,12 @@ workspace ships every publishable crate at the same
   column's data type; every other type is cast to `Utf8` via `arrow::compute::cast`, refused if
   the cast introduces a null the source column did not have. A null value in an otherwise-text
   column keeps its documented `""` reading (esc-091).
+
+### Removed
+- **`examples/docker-compose/` (#482).** Moved to `deploy/docker-compose.yml`
+  and `deploy/docker-compose.ci.yml`, the single source of truth, now
+  exercised end to end by `compose-smoke`; see the reference-topologies
+  guide page's Shape B section.
 
 ### Breaking
 - **Existing result-table and artifact object keys predating the tenant-prefixed layout

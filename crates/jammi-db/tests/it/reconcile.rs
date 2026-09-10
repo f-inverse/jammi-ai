@@ -1158,6 +1158,11 @@ async fn parquet_vanished_after_claim_before_post_claim_row_count_re_classifies_
 
     let (table_name, parquet_local) =
         promotable_building_row_fixture(&store, &catalog, "docs-post-claim-race").await;
+    let manifest_local = parquet_local.replace(".parquet", ".materialization.json");
+    // Measured BEFORE the pass ever touches either object — the manifest is
+    // untouched until after the race releases, so this is its true on-disk
+    // size, never a size inferred after the fact.
+    let manifest_size = std::fs::metadata(&manifest_local).unwrap().len();
 
     let race =
         jammi_db::store::reconcile_test_hooks::arm_post_claim_parquet_vanish_race(&table_name);
@@ -1195,6 +1200,29 @@ async fn parquet_vanished_after_claim_before_post_claim_row_count_re_classifies_
         jammi_db::catalog::status::ResultTableStatus::Failed.to_string(),
         "a Parquet that vanished after claim, before the post-claim row-count read, must reap, \
          never abort the pass or yield a row-count-less promotion: {report:?}"
+    );
+
+    // esc-484 (round-8 audit), same accounting the classify-window sibling
+    // pins above: the Parquet vanished before `delete_if_exists` ever ran
+    // against it, so this call removed NOTHING and must appear in NO report
+    // field (never `orphans`, never counted into `bytes_reclaimed`), while
+    // the manifest sidecar (still genuinely present at delete time) is a
+    // REAL deletion this pass performed and must be the ONLY thing credited.
+    assert!(
+        !report.orphans.iter().any(|k| k.ends_with(".parquet")),
+        "a Parquet this pass never actually deleted must never appear in `orphans`: {report:?}"
+    );
+    assert!(
+        report
+            .orphans
+            .iter()
+            .any(|k| k.ends_with(".materialization.json")),
+        "the manifest sidecar this pass DID actually delete must be credited: {report:?}"
+    );
+    assert_eq!(
+        report.bytes_reclaimed, manifest_size,
+        "bytes_reclaimed must equal exactly the bytes this pass truly freed (the manifest \
+         sidecar alone) — never the vanished Parquet's listing-snapshot size on top: {report:?}"
     );
 }
 

@@ -22,12 +22,26 @@ use super::url::{Scheme, StorageUrl};
 /// never one that was already gone when the delete ran — see esc-484's
 /// vanish-window defect, where collapsing the two let a race credit bytes
 /// that were never freed by the pass reporting them).
+///
+/// Both variants are **driver-reported**, not independently verified: they
+/// reflect only what the underlying `object_store` driver's `delete` call
+/// returned, never a fresh existence check. Drivers whose delete is
+/// idempotent never distinguish the two — the AWS driver used for both
+/// `s3://` and `r2://` roots issues a bare `DELETE` and returns success on a
+/// 204, which S3 answers for a key that does not exist, so `Absent` is
+/// unreachable on those roots and an already-gone key is reported `Deleted`
+/// (open as esc-103 in `.jammi/escapes.jsonl`).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum DeleteOutcome {
-    /// The underlying driver's `delete` actually removed an object.
+    /// The driver's `delete` call returned success. On a driver whose
+    /// delete is idempotent (`s3://`/`r2://`) this does NOT prove an object
+    /// was actually removed — a key that was already absent is reported
+    /// `Deleted` too (esc-103).
     Deleted,
-    /// The object was already absent (a 404) — nothing was removed by this
-    /// call, whether it never existed or vanished before this call ran.
+    /// The driver's `delete` call surfaced a not-found error. Only drivers
+    /// that report deletes of missing keys as an error reach this variant
+    /// (the local filesystem driver does); the `s3://`/`r2://` AWS driver
+    /// never does, so `Absent` is unreachable there (esc-103).
     Absent,
 }
 
@@ -137,11 +151,13 @@ impl JammiObjectStore {
 
     /// Convenience: delete `path` if it exists (404 is *not* an error —
     /// matches the engine's "best-effort cleanup" contract). Returns which
-    /// of the two actually happened ([`DeleteOutcome`]) rather than
+    /// of the two the driver reported ([`DeleteOutcome`]) rather than
     /// collapsing both into a bare success: a caller that credits bytes or
     /// keys against this deletion (`store::reconcile`'s accounting) must be
     /// able to tell "this call removed the object" from "it was already
-    /// gone" — see [`DeleteOutcome`]'s own doc comment.
+    /// gone" — see [`DeleteOutcome`]'s own doc comment for why that
+    /// distinction is only as good as the driver underneath (unreachable
+    /// `Absent` on `s3://`/`r2://`, esc-103).
     pub async fn delete_if_exists(&self, path: &ObjectPath) -> Result<DeleteOutcome, StorageError> {
         match self.driver.delete(path).await {
             Ok(()) => Ok(DeleteOutcome::Deleted),

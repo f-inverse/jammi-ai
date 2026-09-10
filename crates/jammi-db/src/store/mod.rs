@@ -397,14 +397,20 @@ pub mod reconcile_test_hooks {
             released: Arc::clone(&state.released),
         };
         let mut guard = slot.lock().expect("reconcile test-hook arm lock");
-        // An occupied slot means an earlier `RaceHandle` for THIS race point
+        // Only `maybe_park` clears this slot, and only when the parked
+        // pass's table name matches the armed one — `RaceHandle::release`
+        // and its `Drop` never touch the slot. So an occupied slot means
+        // one of two things: an earlier `RaceHandle` for THIS race point
         // was never released (or was leaked past its test) before a new
-        // test tried to arm the same point again — silently overwriting it
-        // would strand whatever pass is (or later becomes) parked against
-        // the stale `RaceState` with no `RaceHandle` left able to release
-        // it, hanging that pass out to its own 30s park timeout. Panicking
-        // here (test-hooks only; no production path ever calls `arm`) turns
-        // that into an immediate, attributable test failure instead.
+        // test tried to arm the same point again, OR the earlier pass never
+        // reached this race point for the armed table (no `maybe_park` call
+        // matched it, so nothing ever consumed the slot). Either way,
+        // silently overwriting it would strand whatever pass is (or later
+        // becomes) parked against the stale `RaceState` with no
+        // `RaceHandle` left able to release it, hanging that pass out to
+        // its own 30s park timeout. Panicking here (test-hooks only; no
+        // production path ever calls `arm`) turns that into an immediate,
+        // attributable test failure instead.
         assert!(
             guard.is_none(),
             "reconcile test-hook: race already armed for table '{}' when arming '{table_name}' \
@@ -479,8 +485,8 @@ pub mod reconcile_test_hooks {
     /// reaches [`maybe_park_before_manifest_reread`] for THIS table, it parks
     /// (bounded to 30s) until [`RaceHandle::release`] — the window in which a
     /// test can delete the row's manifest sidecar out from under it, pinning
-    /// the exact TOCTOU the production re-read guards against. Replaces any
-    /// previous arm on this same race point.
+    /// the exact TOCTOU the production re-read guards against. Panics if
+    /// this race point is already armed — see `arm`.
     pub fn arm_manifest_vanish_race(table_name: &str) -> RaceHandle {
         arm(&MANIFEST_ARM, table_name)
     }
@@ -507,7 +513,7 @@ pub mod reconcile_test_hooks {
     /// test can delete the row's Parquet out from under it, pinning that this
     /// vanish reclassifies the row to [`super::ExpiredRowOutcome::Reap`]
     /// rather than aborting the whole reconcile pass with an object-store
-    /// error. Replaces any previous arm on this same race point.
+    /// error. Panics if this race point is already armed — see `arm`.
     pub fn arm_parquet_vanish_race(table_name: &str) -> RaceHandle {
         arm(&PARQUET_ARM, table_name)
     }
@@ -532,7 +538,8 @@ pub mod reconcile_test_hooks {
     /// the row's Parquet out from under an already-claimed recoverer, pinning
     /// that this vanish reclassifies the row to a reap (under the CLAIM's own
     /// CAS) rather than aborting the whole reconcile pass with an
-    /// object-store error. Replaces any previous arm on this same race point.
+    /// object-store error. Panics if this race point is already armed —
+    /// see `arm`.
     pub fn arm_post_claim_parquet_vanish_race(table_name: &str) -> RaceHandle {
         arm(&POST_CLAIM_PARQUET_ARM, table_name)
     }

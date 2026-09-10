@@ -123,6 +123,13 @@ pub struct ReconcileOptions {
     /// previews the object as an ordinary orphan at its listed size; the two
     /// modes diverge on that one key rather than the parity invariant itself
     /// being violated.
+    ///
+    /// The vanish case holds only on a driver that reports the vanished
+    /// delete as [`crate::storage::DeleteOutcome::Absent`]. On a driver
+    /// whose delete is idempotent (`s3://`/`r2://`) a vanished key is
+    /// reported [`crate::storage::DeleteOutcome::Deleted`] instead, so it is
+    /// credited into `bytes_reclaimed` at its listed size exactly like a
+    /// real reclaim — the over-credit esc-103 tracks.
     pub apply: bool,
     /// An orphan candidate younger than this is `pending`, never deleted —
     /// the window a concurrent writer's just-landed bytes have to grow a
@@ -866,6 +873,13 @@ impl ResultStore {
                         // call freed nothing, so it is neither an orphan
                         // this pass reclaimed nor a failure to retry — esp.
                         // never credited (esc-484's vanish-window defect).
+                        // Reached only on a driver that surfaces the vanish
+                        // as `NotFound` (the local filesystem driver). The
+                        // `s3://`/`r2://` AWS driver's delete is idempotent
+                        // and never returns `NotFound`, so on those roots
+                        // this arm is never taken and the vanished key falls
+                        // into the `Deleted` arm above instead, over-crediting
+                        // `bytes_reclaimed` (esc-103).
                         Ok(DeleteOutcome::Absent) => {
                             tracing::warn!(
                                 key,

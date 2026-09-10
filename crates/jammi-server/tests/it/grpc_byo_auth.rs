@@ -435,6 +435,7 @@ async fn resolver_seam_binds_the_engine_and_rejects_missing_credential() {
         // The consumer's authenticating resolver, plugged into the engine seam.
         tenant_resolver: Arc::new(HmacBearerResolver),
         admin_authorizer: None,
+        limits: jammi_db::config::LimitsConfig::default(),
     };
     let (shutdown_tx, shutdown_rx) = oneshot::channel::<()>();
     let (addr, handle) = super::common::grpc::spawn_bound_chain(chain, shutdown_rx).await;

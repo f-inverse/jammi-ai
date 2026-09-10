@@ -1212,6 +1212,9 @@ pub struct ServerConfig {
     /// is a startup error surfaced by the server. Whether this process runs
     /// jobs is `[worker] enabled`, not a tier.
     pub services: ServiceSelection,
+    /// Request-bounds and refusal-policy limits for the combined gRPC +
+    /// Flight SQL surface. See [`LimitsConfig`].
+    pub limits: LimitsConfig,
 }
 
 /// The optional service-tier selection for a server deployment. `All` (the
@@ -1328,6 +1331,130 @@ impl<'de> Deserialize<'de> for ServiceSelection {
     }
 }
 
+/// Request-bounds and refusal-policy limits for the combined gRPC + Flight
+/// SQL surface: inbound message size, in-flight request concurrency (global
+/// and per TCP connection), an optional per-unary-request timeout, and the
+/// two long-lived-stream budgets (`TriggerService.Subscribe`,
+/// `JobService.WaitJob`). A request that would exceed any of these is
+/// refused at the edge — before a tenant-scoped catalog read ever runs, so a
+/// refusal leaks nothing about cross-tenant existence — with a typed gRPC
+/// status and a `jammi_grpc_refused_total{reason}` counter increment. See
+/// `jammi_server::limits` (the crate that owns the tower layer stack
+/// enforcing this) for the wire contract.
+///
+/// # TOML
+///
+/// ```toml
+/// [server.limits]
+/// max_message_bytes = 67108864
+/// max_in_flight = 256
+/// max_in_flight_per_connection = 64
+/// request_timeout_secs = 30
+/// wait_timeout_secs = 300
+/// max_subscriptions = 256
+/// max_job_waits = 1024
+/// ```
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct LimitsConfig {
+    /// Maximum size, in bytes, of a single INBOUND gRPC/Flight message this
+    /// server will decode — enforced per mounted service via tonic's own
+    /// `max_decoding_message_size`. There is no outbound cap: a large result
+    /// set is never truncated. Must be `> 0`. Default: 64 MiB (67108864).
+    pub max_message_bytes: u64,
+    /// Global cap on the number of unary requests this process serves
+    /// concurrently, across every connection. `0` means unbounded — not
+    /// "refuse everything". Default: 256.
+    pub max_in_flight: usize,
+    /// Cap on the number of unary requests a SINGLE TCP connection may have
+    /// in flight concurrently. `0` means unbounded. When both this and
+    /// `max_in_flight` are non-zero (bounded), this must be `<=
+    /// max_in_flight` — a single connection is never permitted a larger
+    /// budget than the process-wide one. Default: 64.
+    pub max_in_flight_per_connection: usize,
+    /// Maximum wall-clock duration a unary request may run before this
+    /// server cancels it and returns `DEADLINE_EXCEEDED`. `None` (the
+    /// default — the key absent or explicitly unset) means no
+    /// server-imposed timeout. Unary methods only: the two server-streaming
+    /// RPCs (`TriggerService.Subscribe`, `JobService.WaitJob`) are governed
+    /// by `wait_timeout_secs` and the stream budgets below instead, never
+    /// this key. `Some(0)` is rejected at load — a zero timeout would refuse
+    /// every request instantly, never the intent of setting this key.
+    pub request_timeout_secs: Option<u64>,
+    /// Maximum `grpc-timeout` a CLIENT may request on
+    /// `TriggerService.Subscribe` or `JobService.WaitJob`. A client asking
+    /// for a longer deadline than this (or an unbounded one, over HTTP/2's
+    /// own no-deadline default) is refused at the edge — before the stream
+    /// opens — with `DEADLINE_EXCEEDED`, rather than being allowed to hold a
+    /// connection open past the operator's budget. `None` (the default)
+    /// means no cap: any client-requested deadline, or none at all, is
+    /// accepted. `Some(0)` is rejected at load, for the same reason as
+    /// `request_timeout_secs`.
+    pub wait_timeout_secs: Option<u64>,
+    /// Cap on the number of concurrently open `TriggerService.Subscribe`
+    /// streams this process serves. `0` means unbounded. Default: 256.
+    pub max_subscriptions: usize,
+    /// Cap on the number of concurrently open `JobService.WaitJob` streams
+    /// this process serves. `0` means unbounded. Default: 1024.
+    pub max_job_waits: usize,
+}
+
+impl Default for LimitsConfig {
+    fn default() -> Self {
+        Self {
+            max_message_bytes: 64 * 1024 * 1024,
+            max_in_flight: 256,
+            max_in_flight_per_connection: 64,
+            request_timeout_secs: None,
+            wait_timeout_secs: None,
+            max_subscriptions: 256,
+            max_job_waits: 1024,
+        }
+    }
+}
+
+impl LimitsConfig {
+    /// Validate the domain of every knob, naming the offending key in the
+    /// error. `0` is a valid, meaningful value for the four concurrency/
+    /// budget knobs (`max_in_flight`, `max_in_flight_per_connection`,
+    /// `max_subscriptions`, `max_job_waits`) — it means unbounded — so only
+    /// the CROSS-knob relation (`max_in_flight_per_connection <=
+    /// max_in_flight`, when both are bounded) and the two knobs where `0`
+    /// (or an explicit zero timeout) has no sane reading
+    /// (`max_message_bytes`, `request_timeout_secs`, `wait_timeout_secs`)
+    /// are rejected. Negative values and TOML integers that overflow the
+    /// unsigned field types are already refused by `serde`/`toml` below this
+    /// call, naming the same key, before this method ever runs.
+    pub fn validate(&self) -> Result<()> {
+        if self.max_message_bytes == 0 {
+            return Err(JammiError::Config(
+                "server.limits.max_message_bytes must be > 0".into(),
+            ));
+        }
+        if self.max_in_flight_per_connection != 0
+            && self.max_in_flight != 0
+            && self.max_in_flight_per_connection > self.max_in_flight
+        {
+            return Err(JammiError::Config(format!(
+                "server.limits.max_in_flight_per_connection ({}) must be <= \
+                 server.limits.max_in_flight ({}) when both are bounded",
+                self.max_in_flight_per_connection, self.max_in_flight
+            )));
+        }
+        if self.request_timeout_secs == Some(0) {
+            return Err(JammiError::Config(
+                "server.limits.request_timeout_secs must be > 0 when set".into(),
+            ));
+        }
+        if self.wait_timeout_secs == Some(0) {
+            return Err(JammiError::Config(
+                "server.limits.wait_timeout_secs must be > 0 when set".into(),
+            ));
+        }
+        Ok(())
+    }
+}
+
 impl ServerConfig {
     /// Validate server configuration.
     pub fn validate(&self) -> Result<()> {
@@ -1354,6 +1481,7 @@ impl ServerConfig {
                 "health_listen and flight_listen must be different addresses".into(),
             ));
         }
+        self.limits.validate()?;
         Ok(())
     }
 }
@@ -1521,6 +1649,7 @@ impl Default for ServerConfig {
             flight_listen: "0.0.0.0:8081".into(),
             preload_models: Vec::new(),
             services: ServiceSelection::default(),
+            limits: LimitsConfig::default(),
         }
     }
 }
@@ -1670,6 +1799,11 @@ impl JammiConfig {
         // worker spawn, deep in a server startup.
         let lease = config.lease.intervals()?;
         config.worker.worker_intervals(lease)?;
+        // Reject an out-of-domain `[server.limits]` knob (a zero
+        // `max_message_bytes`, a per-connection budget over the global one, a
+        // zero timeout) at load time, naming the offending key, rather than
+        // at server startup deep inside `OssServer::new`.
+        config.server.limits.validate()?;
         Ok(config)
     }
 

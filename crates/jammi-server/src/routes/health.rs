@@ -18,7 +18,9 @@ use axum::extract::State;
 use axum::http::{header, StatusCode};
 use axum::response::{IntoResponse, Response};
 use axum::Json;
-use prometheus::{Encoder, Histogram, HistogramOpts, IntCounter, Registry, TextEncoder};
+use prometheus::{
+    Encoder, Histogram, HistogramOpts, IntCounter, IntCounterVec, Opts, Registry, TextEncoder,
+};
 use serde_json::{json, Value};
 
 use crate::runtime::ReadinessProbe;
@@ -94,6 +96,11 @@ pub struct MetricsRegistry {
     pub flight_queries: IntCounter,
     pub eval_invocations: IntCounter,
     pub search_latency: Histogram,
+    /// Requests refused at the [`crate::limits`] edge (`[server.limits]`),
+    /// labelled by `reason` — one of `message_size`, `in_flight`,
+    /// `in_flight_per_connection`, `subscriptions`, `job_waits`, `timeout`.
+    /// See [`Self::record_refusal`].
+    pub grpc_refused: IntCounterVec,
 }
 
 impl MetricsRegistry {
@@ -133,12 +140,23 @@ impl MetricsRegistry {
         )?;
         inner.register(Box::new(search_latency.clone()))?;
 
+        let grpc_refused = IntCounterVec::new(
+            Opts::new(
+                "jammi_grpc_refused_total",
+                "Total number of gRPC/Flight requests refused at the [server.limits] edge, \
+                 labelled by refusal reason.",
+            ),
+            &["reason"],
+        )?;
+        inner.register(Box::new(grpc_refused.clone()))?;
+
         Ok(Self {
             inner,
             grpc_requests,
             flight_queries,
             eval_invocations,
             search_latency,
+            grpc_refused,
         })
     }
 
@@ -146,5 +164,13 @@ impl MetricsRegistry {
     /// scrape metrics directly use this to call `.gather()`.
     pub fn inner(&self) -> &Registry {
         &self.inner
+    }
+
+    /// Increment `jammi_grpc_refused_total{reason}` by one. The single call
+    /// site every [`crate::limits`] refusal path uses, so the label set
+    /// (`RefusedBound::label`) and the counter's own labels cannot drift
+    /// apart.
+    pub fn record_refusal(&self, reason: &str) {
+        self.grpc_refused.with_label_values(&[reason]).inc();
     }
 }

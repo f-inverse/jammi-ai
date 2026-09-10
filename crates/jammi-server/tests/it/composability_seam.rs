@@ -140,6 +140,7 @@ async fn transport_only_chain(addr: SocketAddr) -> (GrpcChain, TempDir, Arc<Jamm
             jammi_server::grpc::session::SessionStore::new(),
         ),
         admin_authorizer: None,
+        limits: jammi_db::config::LimitsConfig::default(),
     };
     (chain, dir, session)
 }
@@ -509,6 +510,7 @@ async fn into_layered_axum_router_serves_directly_with_grpc_web_trailer_repair()
             jammi_server::grpc::session::SessionStore::new(),
         ),
         admin_authorizer: None,
+        limits: jammi_db::config::LimitsConfig::default(),
     };
 
     let assembled = assemble_grpc_chain(chain)
@@ -835,6 +837,7 @@ async fn resolver_seam_scopes_both_transports_and_rejects_missing_credential() {
         // the one tenant-binding mechanism.
         tenant_resolver: Arc::new(BearerTenantResolver),
         admin_authorizer: None,
+        limits: jammi_db::config::LimitsConfig::default(),
     };
 
     let assembled = assemble_grpc_chain(chain).expect("assemble");

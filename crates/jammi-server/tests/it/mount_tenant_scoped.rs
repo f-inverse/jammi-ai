@@ -154,6 +154,7 @@ async fn probe_chain(addr: SocketAddr, resolver: Arc<dyn TenantResolver>) -> (Gr
         metrics: Arc::new(MetricsRegistry::new().unwrap()),
         tenant_resolver: resolver,
         admin_authorizer: None,
+        limits: jammi_db::config::LimitsConfig::default(),
     };
     (chain, dir)
 }

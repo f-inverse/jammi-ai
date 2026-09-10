@@ -109,6 +109,7 @@ async fn start_flight_test_server() -> (SocketAddr, TempDir, tokio::task::JoinHa
         metrics: Arc::new(jammi_server::routes::health::MetricsRegistry::new().unwrap()),
         tenant_resolver: jammi_server::grpc::session::SessionIdTenantResolver::arc(store),
         admin_authorizer: None,
+        limits: jammi_db::config::LimitsConfig::default(),
     };
     let bound = jammi_server::runtime::assemble_grpc_chain(chain)
         .expect("assemble")

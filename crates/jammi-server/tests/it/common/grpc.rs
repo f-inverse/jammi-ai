@@ -143,6 +143,11 @@ pub struct EngineServer {
     /// over the wire returns identical results / errors against the *same*
     /// engine.
     pub engine: Arc<InferenceSession>,
+    /// The SAME metrics registry the server's `MetricsLayer` / `crate::limits`
+    /// refusal stack drive — a test asserts `jammi_grpc_refused_total{reason}`
+    /// against this handle rather than scraping an HTTP `/metrics` route (this
+    /// fixture runs no health side-channel).
+    pub metrics: Arc<jammi_server::routes::health::MetricsRegistry>,
 }
 
 impl EngineServer {
@@ -202,6 +207,7 @@ pub async fn start_engine_server_with_tiers(tiers: jammi_server::tiers::TierSet)
     // the port is held from bind through serve, so `addr` names a port no
     // concurrent test process can have stolen.
     let (chain, engine, dir) = engine_chain_at(ephemeral_addr(), tiers).await;
+    let metrics = Arc::clone(&chain.metrics);
     let (shutdown_tx, shutdown_rx) = oneshot::channel::<()>();
     let (addr, handle) = spawn_bound_chain(chain, shutdown_rx).await;
 
@@ -211,6 +217,7 @@ pub async fn start_engine_server_with_tiers(tiers: jammi_server::tiers::TierSet)
         _dir: dir,
         handle: AbortOnDropHandle(handle),
         engine,
+        metrics,
     }
 }
 
@@ -239,6 +246,7 @@ pub async fn start_engine_server_with_admin(
 ) -> EngineServer {
     let (chain, engine, dir) =
         engine_chain_at_with_admin(ephemeral_addr(), tiers, admin_authorizer).await;
+    let metrics = Arc::clone(&chain.metrics);
     let (shutdown_tx, shutdown_rx) = oneshot::channel::<()>();
     let (addr, handle) = spawn_bound_chain(chain, shutdown_rx).await;
 
@@ -248,6 +256,7 @@ pub async fn start_engine_server_with_admin(
         _dir: dir,
         handle: AbortOnDropHandle(handle),
         engine,
+        metrics,
     }
 }
 
@@ -319,6 +328,11 @@ async fn engine_chain_from_config(
         });
 
     let engine = Arc::clone(&session);
+    // Same source production reads (`OssServer::build_grpc_chain`): the
+    // config the session was actually opened with, so a test that varies
+    // `[server.limits]` through `test_config`/its own override sees that
+    // value reach the wire, not a hardcoded default.
+    let limits = session.inner_config().server.limits;
     let chain = jammi_server::runtime::GrpcChain {
         addr,
         flight_ctx: session.context().clone(),
@@ -330,6 +344,7 @@ async fn engine_chain_from_config(
         metrics: Arc::new(jammi_server::routes::health::MetricsRegistry::new().unwrap()),
         tenant_resolver: jammi_server::grpc::session::SessionIdTenantResolver::arc(store),
         admin_authorizer,
+        limits,
     };
     (chain, engine)
 }
@@ -371,6 +386,7 @@ pub async fn start_engine_server_worker_quiesced() -> EngineServer {
     let addr = listener.local_addr().expect("local_addr");
 
     let (chain, engine, dir) = engine_chain_at(addr, non_event_tiers()).await;
+    let metrics = Arc::clone(&chain.metrics);
     // `into_layered_axum_router` is the SAFE-DEFAULT split: the returned router
     // already carries the engine's canonical transport stack (metrics +
     // gRPC-web trailer repair + gRPC-web framing), so what this fixture serves
@@ -403,6 +419,7 @@ pub async fn start_engine_server_worker_quiesced() -> EngineServer {
         _dir: dir,
         handle: AbortOnDropHandle(handle),
         engine,
+        metrics,
     }
 }
 
@@ -496,6 +513,7 @@ pub async fn start_engine_server_with_worker_enabled(enabled: bool) -> EngineSer
 
     let (chain, engine) =
         engine_chain_from_config(ephemeral_addr(), non_event_tiers(), cfg, None).await;
+    let metrics = Arc::clone(&chain.metrics);
     let (shutdown_tx, shutdown_rx) = oneshot::channel::<()>();
     let (addr, handle) = spawn_bound_chain(chain, shutdown_rx).await;
 
@@ -505,6 +523,7 @@ pub async fn start_engine_server_with_worker_enabled(enabled: bool) -> EngineSer
         _dir: dir,
         handle: AbortOnDropHandle(handle),
         engine,
+        metrics,
     }
 }
 
@@ -523,6 +542,7 @@ pub async fn start_engine_server_with_broker(
     cfg.broker = broker;
     let (chain, engine) =
         engine_chain_from_config(ephemeral_addr(), non_event_tiers(), cfg, None).await;
+    let metrics = Arc::clone(&chain.metrics);
     let (shutdown_tx, shutdown_rx) = oneshot::channel::<()>();
     let (addr, handle) = spawn_bound_chain(chain, shutdown_rx).await;
 
@@ -532,5 +552,38 @@ pub async fn start_engine_server_with_broker(
         _dir: dir,
         handle: AbortOnDropHandle(handle),
         engine,
+        metrics,
+    }
+}
+
+/// Spin up the SAME engine-backed server [`start_engine_server`] does
+/// (identical tier set, identical chain, identical eager bind), but with
+/// `[server.limits]` overridden to `limits` instead of the config default,
+/// and `[worker] enabled = false` -- the fixture the `limits` it-suite
+/// (`grpc_limits.rs`) builds its oversize-message / timeout / stream-budget
+/// refusal cases on. The worker is disabled unconditionally: those cases
+/// need a submitted job to stay `queued` forever (no claimant), so a
+/// `WaitJob` stream stays genuinely open across the whole test rather than
+/// racing an embedded worker to completion.
+pub async fn start_engine_server_with_limits(
+    limits: jammi_db::config::LimitsConfig,
+) -> EngineServer {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let mut cfg = test_config(dir.path());
+    cfg.server.limits = limits;
+    cfg.worker.enabled = false;
+    let (chain, engine) =
+        engine_chain_from_config(ephemeral_addr(), non_event_tiers(), cfg, None).await;
+    let metrics = Arc::clone(&chain.metrics);
+    let (shutdown_tx, shutdown_rx) = oneshot::channel::<()>();
+    let (addr, handle) = spawn_bound_chain(chain, shutdown_rx).await;
+
+    EngineServer {
+        addr,
+        shutdown: shutdown_tx,
+        _dir: dir,
+        handle: AbortOnDropHandle(handle),
+        engine,
+        metrics,
     }
 }

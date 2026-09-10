@@ -404,6 +404,42 @@ workspace ships every publishable crate at the same
   (`crates/jammi-db/src/catalog/backend.rs`), completing the narrower integer/float widths the
   trigger-stream tail replay's row decoding needs; additive only (no existing impl or caller
   changes).
+- **`[server.limits]`: message-size, in-flight concurrency, per-request
+  timeout, and stream budgets, refused at the edge with a typed status and a
+  counted reason (#485, PLAN-C §5).** A request that would exceed any bound
+  is refused BEFORE any tenant-scoped catalog read runs, so a refusal leaks
+  nothing about cross-tenant existence — see `docs/guide/src/operability.md`
+  §"Request bounds" for the full table and `docs/guide/src/configuration.md`
+  for the TOML reference. `max_message_bytes` (default 64 MiB; `OUT_OF_RANGE`
+  — tonic's own per-service `max_decoding_message_size` codec rejection,
+  verified against the vendored tonic 0.14.5 source, NOT
+  `RESOURCE_EXHAUSTED`; applied identically to the combined gRPC + Flight SQL
+  listener, so an oversize Flight SQL query is refused the same way an
+  oversize gRPC message is); `max_in_flight` / `max_in_flight_per_connection`
+  (defaults 256 / 64; `RESOURCE_EXHAUSTED`; unary methods only; `0` =
+  unbounded); `request_timeout_secs` (default unset; `DEADLINE_EXCEEDED`;
+  unary only); `wait_timeout_secs` (default unset; `DEADLINE_EXCEEDED`;
+  refuses a `TriggerService.Subscribe` / `JobService.WaitJob` call whose
+  client-requested `grpc-timeout` exceeds the budget, before the stream
+  opens); `max_subscriptions` / `max_job_waits` (defaults 256 / 1024;
+  `RESOURCE_EXHAUSTED`; the concurrent-stream budget for each of those two
+  RPCs, released when the stream ends or the client disconnects; `0` =
+  unbounded). Every knob is validated at config load
+  (`jammi_db::config::LimitsConfig::validate`, a typed `JammiError::Config`
+  naming the offending key) and env-overridable via the existing
+  `JAMMI_SERVER__LIMITS__<FIELD>` layered loader. `jammi_grpc_refused_total{reason}`
+  (`reason` ∈ `message_size`/`in_flight`/`in_flight_per_connection`/
+  `subscriptions`/`job_waits`/`timeout`) is the new Prometheus counter. New
+  `crates/jammi-server/src/limits.rs`: `RefusalStatusLayer` (the single
+  counting site), `GlobalConcurrencyLimitLayer`, `PerConnectionLimitLayer`
+  (keyed on tonic's own connect-info request extension — deliberately NOT
+  tonic's builder-level `concurrency_limit_per_connection`/`load_shed`
+  knobs, which sit outside every user `.layer()` call and would be both
+  uncounted and un-gRPC-web-framed; see the module's N4 rustdoc), and
+  `MethodClassLayer` (the unary timeout plus both stream budgets), applied
+  on the combined listener between the existing gRPC-web framing layers and
+  the mounted services. No wire/`.proto` change — mechanism-only, applies to
+  every existing RPC uniformly.
 
 ### Changed
 - **The published server images no longer pass `--config`; the Compose

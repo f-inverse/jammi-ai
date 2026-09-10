@@ -33,22 +33,30 @@ Proven in a THROWAWAY copy of the tree (`cp -R`, outside any git worktree of the
 after use — never `git worktree add`, so the copy carries no live link back to this repo's object
 store or refs): `git apply --check` is silent for all SIX (the round-3 closure below adds a sixth
 patch file, `0006-lead-gate-pre.patch`), `git apply` applies all six cleanly, and `python3
-ci/scripts/check_lead_gate.py --self-test` then runs the G20–G38 arm for real (not SKIPPED) and
-passes all 19 of it (64 self-test fixtures total), plus every pre-existing fixture
-(G1–G19/T/L/V/E/S/D/N6/R10) and N7's wall-time check. Two mutants were re-run against this bigger
+ci/scripts/check_lead_gate.py --self-test` then runs the G20–G40 arm for real (not SKIPPED) and
+passes all 21 of it (66 self-test fixtures total), plus every pre-existing fixture
+(G1–G19/T/L/V/E/S/D/N6/R10) and N7's wall-time check. Three mutants were re-run against this bigger
 arm: (1) deleting the WHOLE R3 mechanism (`_relay_rejection`'s R3 block reduced to `return None`,
-`_fix_window` never called, `RELAY_R3` kept so the arm still runs) turns 14 of the 19 RED — G20,
+`_fix_window` never called, `RELAY_R3` kept so the arm still runs) turns 16 of the 21 RED — G20,
 G21, G22 (its "b" half), G23, G25 (its "b" half), G26, G27, G28 (its round-3 assertion), G31, G32,
-G35, G36, G37, G38 — while the remaining 5 (G24, G29, G30, G33, G34) stay green by design: each
-asserts an ALLOW or a check R3's own deletion cannot affect (G24 is R3 allow-side; G29/G30 are the
-git-free-first-dispatch and env-precedence witnesses; G33/G34 are V11's one-unit-per-dispatch
-check, which runs and denies BEFORE `_relay_rejection` — and therefore R3 — is ever reached). (2)
-deleting ONLY V18's round-3-closure addition (the `unit_branch` ref-resolution and `merge-base
---is-ancestor` calls in `_fix_window`, reverting to V16's slug-equality-only reachability, `_fix_
-window`'s other checks and R3's probe-match otherwise intact) turns exactly 4 of the 19 RED — G25
-(its "b" half), G36, G37, G38 — the round-3 adversarial reproducers this closure adds, and nothing
-else regresses. This is a real re-run against the round-2 corrections below (V10–V17) and the
-round-3 closure decisions further below (V18–V20), not a restatement of earlier numbers.
+G35, G36, G37, G38, G39, G40 — while the remaining 5 (G24, G29, G30, G33, G34) stay green by
+design: each asserts an ALLOW or a check R3's own deletion cannot affect (G24 is R3 allow-side;
+G29/G30 are the git-free-first-dispatch and env-precedence witnesses; G33/G34 are V11's
+one-unit-per-dispatch check, which runs and denies BEFORE `_relay_rejection` — and therefore R3 —
+is ever reached). (2) deleting ONLY V18's round-3-closure addition (the `unit_branch`
+`refs/heads/`-resolution and `merge-base --is-ancestor` calls in `_fix_window`, reverting to V16's
+slug-equality-only reachability; round-4's OWN, independent `block_sha`/`fix_head`
+resolve-and-prefix-check below is left INTACT) turns exactly 4 of the 21 RED — G25 (its "b" half),
+G36, G37, G39 — NOT G38 or G40, which round-4's own sha resolve-and-prefix-check now catches
+independently of V18's ancestor check (a real, measured change from the round-3 text: G38 used to
+be one of V18's four, and is now caught one layer earlier, by round-4's own mechanism — see below).
+(3) reverting ONLY round-4 (the `unit_branch` `refs/heads/`-scoping and the `block_sha`/`fix_head`
+resolve-and-prefix-check, i.e. exactly the `7ed0db7d` patch as committed) turns exactly 3 of the 21
+RED — **G38**, **G39**, **G40** — and nothing else regresses: this is the precise mutant this
+commit's own round-4 closure is responsible for, isolated from V18's and R3's other checks. This is
+a real re-run against the round-2 corrections below (V10–V17), the round-3 closure decisions
+(V18–V20), and the round-4 closure note added to the Round-3 closure decisions section below, not
+a restatement of earlier numbers.
 
 ## Round-2 corrections (V10–V17) — three reproduced defects, fixed structurally
 
@@ -150,8 +158,10 @@ reverted, only extended.
   (module doc, `_fix_window` docstring, this doc's own V16 bullet and "Bugs found and fixed" #4,
   `CHANGELOG.md`) now describes the two-part V18 design (NAME + POSITION), not V16's NAME-only
   design. `_run_git` now reads `err_f` AFTER `wait()` returns and appends its text to the deny
-  reason (**G38** proves the git subprocess's own stderr — e.g. "Not a valid object name …" —
-  appears in the deny reason for an unresolvable sha, not merely a bare exit code). The UNBOUND
+  reason (**G38** proves the git subprocess's own stderr — as of round-4, `rev-parse --verify`'s
+  "fatal: Needed a single revision" for a wholly unresolvable hex, a different subcommand and a
+  different message than the "Not a valid object name …" this text originally cited — appears in
+  the deny reason for an unresolvable sha, not merely a bare exit code). The UNBOUND
   remedy text, everywhere it appears (code, README, this doc, fixture docstrings, the escape row),
   says to hand-remove the stale row from `UNBOUND.jsonl` — never `rm` the shared file, which holds
   every other unit's rows too. A sixth patch file, `0006-lead-gate-pre.patch`, updates
@@ -168,15 +178,27 @@ reverted, only extended.
   mechanism change here is one restored call under an already-passed witness; discipline's items
   (V19) are all prose, verified by the citation pass on the same prose.
 
+**Round-4 closure note.** V18's own resolution calls were themselves two ref-shadowing gaps: a bare
+`unit_branch^{commit}` lookup lets a same-named TAG win git's refs/tags-before-refs/heads
+disambiguation (**G39**), and neither `block_sha` nor `fix_head` checked that its resolved object
+actually STARTS WITH the hex given, so a same-named branch could shadow the abbreviated sha
+(**G40**). Both are closed by resolving `unit_branch` under `refs/heads/` only and by requiring
+`block_sha`/`fix_head` to resolve via `git rev-parse --verify` with a startswith check on the
+result — never a bare name/hex lookup for either.
+
 **Proven** (throwaway `cp -R` copy, deleted after use): all SIX patch files `git apply --check` and
 `git apply` cleanly on a pristine copy of `main` `065b72fc`'s `.claude`/`ci`; `check_lead_gate.py
---self-test` then runs the G20–G38 arm for real and passes all 19 of it (64 self-test fixtures
-total). Two mutants confirm the arm actually depends on what it claims to: deleting the WHOLE R3
-mechanism (`_relay_rejection`'s R3 block reduced to `return None`, `RELAY_R3` kept) turns 14 of the
-19 RED; deleting ONLY V18's addition (reverting `_fix_window` to V16's slug-equality-only
-reachability) turns exactly 4 of the 19 RED — **G25**'s "b" half, **G36**, **G37**, **G38** — and
-nothing else regresses, confirming those four are the ones V18 (not V16, not R3's other checks)
-is actually responsible for.
+--self-test` then runs the G20–G40 arm for real and passes all 21 of it (66 self-test fixtures
+total). Three mutants confirm the arm actually depends on what it claims to: deleting the WHOLE R3
+mechanism (`_relay_rejection`'s R3 block reduced to `return None`, `RELAY_R3` kept) turns 16 of the
+21 RED (the round-2/round-3 fourteen plus **G39**/**G40**); deleting ONLY V18's addition (the
+`unit_branch` `refs/heads/`-resolution and `merge-base --is-ancestor` calls, round-4's own
+`block_sha`/`fix_head` resolve-and-prefix-check left intact) turns exactly 4 of the 21 RED —
+**G25**'s "b" half, **G36**, **G37**, **G39** — NOT **G38** or **G40**, which round-4's own
+resolve-and-prefix-check now catches one layer earlier, independent of V18's ancestor check;
+reverting ONLY round-4 (exactly the `7ed0db7d` patch as committed) turns exactly 3 of the 21 RED —
+**G38**, **G39**, **G40** — and nothing else regresses, confirming those three (not V16's, not
+V18's own ancestor check) are what round-4 alone is responsible for.
 
 ## The escape and the one real round it would have caught
 
@@ -305,8 +327,9 @@ plain, non-git `_fresh_root()`. `_write_relay_exact` gains `fix_head`. The exist
 fixtures (G6, G8's ALLOW half, G13's ALLOW half, G17) gain a repo + `fix_head` so they stay ALLOWED
 once this patch lands — every DENY-reaching existing fixture (G1-G5, G7, G9-G16, G18-G19, T1-T4,
 L1-L3, V1-V10, E1-E4, S1-S3, D1, N6) is untouched, since a DENY short-circuits before ever reaching
-R3. New fixtures **G20-G38** (below; G32-G35 are the round-2 pressure-test reproducers, V10-V17;
-G36-G38 are the round-3 closure reproducers, V18-V19), gated behind a version-marker guard
+R3. New fixtures **G20-G40** (below; G32-G35 are the round-2 pressure-test reproducers, V10-V17;
+G36-G38 are the round-3 closure reproducers, V18-V19; G39-G40 are the round-4 closure
+reproducers), gated behind a version-marker guard
 (`RELAY_R3`) so `--self-test` exits 0 in THIS tree today,
 reporting that arm SKIPPED, and runs the fixtures for real the moment a human applies this doc's
 patches.
@@ -376,9 +399,22 @@ which only holds if the code reads the env var, not `cwd`.
   - **G37 (V18, round-3 adversarial reproducer)** a `fix_head` that is a REAL, ref-reachable
     commit — just on an UNRELATED branch, not this unit's own → DENY, naming the ancestry
     failure. Same RED/GREEN split as G36.
-  - **G38 (V19)** a `fix_head` that is sha-shaped but resolves to no real object at all → DENY,
-    and the deny reason includes `git`'s OWN stderr text ("Not a valid object name …"), not merely
-    a bare exit code — proves `_run_git` reads `err_f` after `wait()` returns.
+  - **G38 (V19; text updated round-4)** a `fix_head` that is sha-shaped but resolves to no real
+    object at all → DENY, and the deny reason includes `git`'s OWN stderr text (as of round-4,
+    `rev-parse --verify`'s "fatal: Needed a single revision" — not `cat-file -e`'s original "Not a
+    valid object name …", a different subcommand and a different message), not merely a bare exit
+    code — proves `_run_git` reads `err_f` after `wait()` returns.
+  - **G39 (round-4 adversarial reproducer)** a TAG literally named like the relay's `unit_branch`,
+    pointing at another branch's commit, would otherwise win gitrevisions(7)'s own
+    refs/tags-before-refs/heads disambiguation and shadow the real branch's tip → DENY, naming the
+    ancestry failure against the REAL branch, not the tag's target. RED against the `7ed0db7d`
+    patch (bare `<name>^{commit}` resolution let the tag win and ALLOWED); GREEN once
+    `unit_branch` resolves under `refs/heads/` only.
+  - **G40 (round-4 adversarial reproducer)** a BRANCH literally named like `fix_head`'s own hex
+    prefix, pointing at an unrelated commit, would otherwise shadow the abbreviated object → DENY,
+    naming the shadow. RED against the `7ed0db7d` patch (no check that a resolved sha STARTS WITH
+    the hex given); GREEN once `block_sha`/`fix_head` are resolved via `git rev-parse --verify`
+    with that startswith check.
 
 **Docs.** `.claude/hooks/README.md` — the relay schema (`fix_head`), R3's full arm order, §C5, and
 the HONEST LIMIT paragraph extended to R3 (below). `.claude/agents/lead.md` — the relay template
@@ -463,7 +499,7 @@ carry the rest of the weight.
 
 ## Bugs found and fixed while building this proposal (found by execution, not asserted)
 
-Building and running G20-G38 against a THROWAWAY, `cp -R` copy of the tree (outside any git
+Building and running G20-G40 against a THROWAWAY, `cp -R` copy of the tree (outside any git
 worktree, deleted after — this is a change from an earlier draft, which used `git worktree add
 --detach`; a plain `cp -R` copy needs no `.git` link back to this repo at all, and is what "outside
 any git worktree of the repo" now means literally) surfaced real defects, both this round and in
@@ -549,11 +585,35 @@ the FIRST draft of the R3 patch, all fixed in the patch files, not merely in the
    phrasings a lead might use) parsed to a token that never matched a bare `fix_changed` entry —
    monotone toward a false DENY, not a false ALLOW, but still a real defect; fixed by stripping
    both before the trailing-punctuation and line-spec passes.
+6. **A round-4 adversarial pass found V18's OWN resolution calls still trusted a bare name/hex
+   lookup, which git itself disambiguates in the WRONG order for this purpose.** `unit_branch` was
+   resolved as `<name>^{commit}` with no scope — gitrevisions(7) tries `refs/tags/<name>` BEFORE
+   `refs/heads/<name>`, so a TAG literally named like the unit branch, pointing at a DIFFERENT
+   branch's commit, silently won the lookup and the ancestry check then ran against the TAG's
+   target instead of the real branch's own tip (measured: `git rev-parse --verify
+   feat/g39^{commit}` against a repo carrying both prints `warning: refname 'feat/g39' is
+   ambiguous.` to stderr and resolves to the tag anyway, exit 0 — reproducer **G39**). Separately,
+   `block_sha`/`fix_head` were resolved via `cat-file -e` (an existence check only, never comparing
+   the resolved value to anything), so a BRANCH literally named like one of their own hex values —
+   or a short prefix of one — could shadow the object it abbreviates the identical way (measured:
+   a branch named `da137e40f501` pointing at an unrelated commit makes `git rev-parse --verify
+   da137e40f501^{commit}` resolve to the branch's tip, not the abbreviated object, same ambiguous
+   warning, exit 0 — reproducer **G40**). Fixed structurally, not by special-casing either shim:
+   `unit_branch` now resolves under `refs/heads/<name>^{commit}` explicitly (nothing but a real
+   branch of that name is ever consulted — the documented cost is that a unit whose worktree is on
+   a DETACHED HEAD has no `refs/heads/` entry to bind to and can never be relayed this way), and
+   `block_sha`/`fix_head` are resolved via `git rev-parse --verify` with a check that the resolved,
+   FULL 40-hex object STARTS WITH the caller-supplied hex — never merely that it resolves to SOME
+   commit — with the resolved, full value used at every later git-argv site instead of the
+   caller-supplied, possibly-abbreviated one. On the accept path, any call that still wrote to
+   stderr despite succeeding (a shadow that happened to resolve to a correct, prefix-matching
+   object anyway) has that text appended to the operator-facing ALLOW reason, so shadowing stays
+   visible even when it did not change the outcome.
 
 ## Ledger lifecycle
 
 `esc-097-relay-form-satisfied-without-probing-the-fix` stays `open` (its `eval_ref` names
-G20-G38, currently SKIPPED) until a human applies this doc's patches and the self-test's G20-G38
+G20-G40, currently SKIPPED) until a human applies this doc's patches and the self-test's G20-G40
 arm goes green on main — at that point the row moves to `eval_added`, matching the precedent
 (`esc-064-relay-conjunction.md`'s own lifecycle note).
 

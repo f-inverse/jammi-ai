@@ -12,7 +12,7 @@
  **(1) Coverage** — whenever the BLOCK's `class_enumeration` is non-empty: a `sites`
  object whose keys are an EXACT-STRING SUPERSET of it (no path parsing, no
  normalization — the lead copies the verifier's own strings verbatim, so
-@@ -63,21 +64,99 @@
+@@ -63,21 +64,122 @@
  only shrink the adjacent set) and is therefore NOT the acceptance-easing
  normalization the `sites` rule bans. The `enumeration_missing` field on a verdict
  row is diagnostic only — no gate decision reads it; which requirement has content is
@@ -40,15 +40,33 @@
 +this way (no real branch slugifies to the literal string `UNBOUND` — re-dispatch
 +naming the unit, then hand-remove the stale row for this block from `UNBOUND.jsonl`,
 +never `rm` the shared file, which holds every other unit's rows too). SECOND, that
-+same `unit_branch` is resolved as a REAL ref (`git rev-parse --verify`; a name that
-+only slugifies right but names no ref fails here too, closing the slugify-collision
-+advisory) and `fix_head` must `git merge-base --is-ancestor` that resolved tip — this
-+binds `fix_head`'s POSITION on the unit's own history, which the NAME check alone
-+does not: an amended-away orphan sha, or a sha that is a real commit on some
-+UNRELATED branch, both slugify-match the right unit's name while never being
-+reachable from its tip. An amended commit IS on the tip and allows; only a STALE
-+relay naming the pre-amend sha is denied — "fix_head <sha> is not on <unit_branch>;
-+if the fix was amended, name the amended sha". At least one `probe` entry's PATH (the
++same `unit_branch` is resolved UNDER `refs/heads/` ONLY (`git rev-parse --verify
++--end-of-options refs/heads/<name>^{commit}`, never a bare `<name>^{commit}` — a TAG
++(or any other `refs/<kind>/<name>`) literally named like the branch otherwise wins
++gitrevisions(7)'s own refs/tags-before-refs/heads disambiguation and resolves to the
++TAG's target instead of the real branch's own tip; a name that only slugifies right
++but names no real branch fails here too, closing the slugify-collision advisory) and
++`fix_head` must `git merge-base --is-ancestor` that resolved tip — this binds
++`fix_head`'s POSITION on the unit's own history, which the NAME check alone does not:
++an amended-away orphan sha, or a sha that is a real commit on some UNRELATED branch,
++both slugify-match the right unit's name while never being reachable from its tip.
++`block_sha` and `fix_head` are themselves resolved via `git rev-parse --verify
++--end-of-options <hex>^{commit}` (never `cat-file -e`, so the RESOLVED value can be
++checked), and the resolved, full 40-hex object must START WITH the caller-supplied
++hex — a ref (branch or tag) literally NAMED like a sha, or a short prefix of one, can
++shadow the object it abbreviates the same way a same-named tag can shadow a branch;
++the resolved, full sha is what every later git argv (`merge-base`, `diff`) actually
++uses. An amended commit IS on the tip and allows; only a STALE relay naming the
++pre-amend sha is denied — "fix_head <sha> is not on <unit_branch>; if the fix was
++amended, name the amended sha; if it was committed on a child branch, commit or merge
++it onto <unit_branch>". A unit whose worktree is on a DETACHED HEAD has no
++`refs/heads/` entry to bind to and can never be relayed this way — name the unit's own
++branch, or commit/merge the fix onto one, before dispatching the second round. On the
++ACCEPT path, any of these calls that still wrote to stderr despite succeeding (e.g.
++git's own `warning: refname '...' is ambiguous.` when a shadow happened to resolve to
++a prefix-matching, correct object anyway) has that text appended to the
++operator-facing ALLOW reason and its `hook.log` row, so a shadow stays visible even
++when it did not change the outcome. At least one `probe` entry's PATH (the
 +first whitespace-delimited token — never a quote- or backtick-span rule; a fix
 +touching only a space-containing path is a documented limit — a surrounding backtick
 +or parenthesis and trailing punctuation stripped, an optional trailing
@@ -64,16 +82,18 @@
 +branch, NEVER on a first dispatch's hot path, and ONLY in `$CLAUDE_PROJECT_DIR` — the
 +documented hook environment contract: the harness always sets this variable for
 +every hook invocation, so `repo_root()`'s cwd fallback is never needed by this arm
-+and is deliberately not reused here — with FOUR git calls per decision (`cat-file -e`
-+block_sha, `rev-parse --verify` unit_branch, `merge-base --is-ancestor`, `diff
++and is deliberately not reused here — with FIVE git calls per decision (`rev-parse
++--verify` block_sha, `rev-parse --verify` fix_head, `rev-parse --verify
++--end-of-options refs/heads/...` unit_branch, `merge-base --is-ancestor`, `diff
 +--name-only`), all sharing ONE per-decision monotonic deadline (`_GIT_BUDGET_S =
 +5.0`, an absolute `time.monotonic()` value threaded through every call, never a
-+fresh 5s per call — the whole arm is bounded by 5s total, not 4x5s) (git >= 2.24
++fresh 5s per call — the whole arm is bounded by 5s total, not 5x5s) (git >= 2.24
 +required: every invocation carries `--end-of-options` immediately before its
 +revision arguments, so a value shaped like an option — e.g. `--output=/tmp/x` — can
 +never be read as one; a pre-2.24 git fails that unrecognized-option check and
 +DENIES). Any git failure (non-zero exit, timeout, budget exhaustion, an
-+unresolvable/malformed sha — an amend can orphan one) DENIES, naming the failing
++unresolvable/malformed sha — an amend can orphan one — or a resolved sha that does
++not start with the hex the relay gave, a ref shadowing it) DENIES, naming the failing
 +command AND its stderr (read back from the same `tempfile.TemporaryFile()` the
 +command's output was captured to, after `wait()` returns — never left unread), and
 +states that `rm .jammi/gate-state/<slug>.*` is the escape hatch but destroys the
@@ -96,7 +116,10 @@
 +`fix_head` today. A PRE-EXISTING wrinkle, not introduced by R3: `_PASS_LIKE` is
 +checked globally when classifying a raw verdict value, so an adversarial-audit row
 +whose OWN verdict text merely contains a pass-like token ("verified"/"PROCEED") also
-+closes a BLOCK, independent of R3 entirely — out of scope for this proposal.
++closes a BLOCK, independent of R3 entirely — out of scope for this proposal. A
++further, honest limit: a unit whose worktree is on a DETACHED HEAD cannot be relayed
++— `unit_branch` resolution is scoped to `refs/heads/` only (round-4), and a detached
++HEAD has no `refs/heads` entry to bind to.
  The hook only ever READS this file, fresh, on every gate call — it never writes an
  "accepted" row itself, so a DENY can never leave a phantom acceptance behind.
  

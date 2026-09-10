@@ -1,10 +1,9 @@
 --- a/.claude/hooks/lead-gate-lib.py
 +++ b/.claude/hooks/lead-gate-lib.py
-@@ -26,6 +26,85 @@
-   armed by a non-empty `class_enumeration` — the data, never the recorded
+@@ -27,6 +27,117 @@
    `enumeration_missing` flag — and adjacent probing (`probe`, >=2 distinct
    sites outside enumeration+findings) is armed ALWAYS.
-+
+ 
 +esc-097 (R3, "PROBE THE FIX"): the relay gains ONE further requirement,
 +`fix_head` (a full sha, `re.fullmatch(r"[0-9a-f]{7,40}")`) plus a `probe`
 +entry naming a file the fix actually changed. Armed ONLY from
@@ -29,51 +28,83 @@
 +`unit_slug` this BLOCK's own state file is already filed under — the
 +identity the dispatch itself resolved, never an arbitrary branch the relay
 +merely asserts (this binds the NAME); THEN that same `unit_branch` is
-+resolved as a real ref (`git rev-parse --verify --end-of-options
-+<name>^{commit}`; a name that merely slugifies to the right string but
-+names no real ref fails here too, closing the slugify-collision advisory),
-+and `fix_head` must `git merge-base --is-ancestor --end-of-options
-+fix_head <resolved tip>` (this binds `fix_head`'s POSITION on that same
-+history — the NAME check alone does not: an amended-away, orphaned sha, or
-+a sha that is a real commit on some OTHER branch, both slugify-match a
-+unit_branch that names the right unit while never being reachable from its
-+tip). An amended commit IS on the tip and allows; only a STALE relay naming
-+the pre-amend sha is denied — "fix_head <sha> is not on <unit_branch>; if
-+the fix was amended, name the amended sha". A BLOCK row filed under the
-+`UNBOUND` fallback bucket can never be satisfied by any relay (no real
-+branch name slugifies to the literal string `UNBOUND`); the remedy is to
-+re-dispatch naming the unit so the verdict lands on the unit's own file,
-+then hand-remove the stale row for this block from `UNBOUND.jsonl` (never
-+`rm` the shared file — it holds every other unit's UNBOUND rows too). Arm
-+order: artifact-exists -> schema -> R1 (coverage) -> R2 (proactivity,
++resolved UNDER `refs/heads/` ONLY (`git rev-parse --verify --end-of-options
++refs/heads/<name>^{commit}`; a name that merely slugifies to the right
++string but names no real branch fails here too, closing the
++slugify-collision advisory), and `fix_head` must `git merge-base
++--is-ancestor --end-of-options fix_head <resolved tip>` (this binds
++`fix_head`'s POSITION on that same history — the NAME check alone does
++not: an amended-away, orphaned sha, or a sha that is a real commit on some
++OTHER branch, both slugify-match a unit_branch that names the right unit
++while never being reachable from its tip). An amended commit IS on the tip
++and allows; only a STALE relay naming the pre-amend sha is denied —
++"fix_head <sha> is not on <unit_branch>; if the fix was amended, name the
++amended sha; if it was committed on a child branch, commit or merge it
++onto <unit_branch>". A BLOCK row filed under the `UNBOUND` fallback bucket
++can never be satisfied by any relay (no real branch name slugifies to the
++literal string `UNBOUND`); the remedy is to re-dispatch naming the unit so
++the verdict lands on the unit's own file, then hand-remove the stale row
++for this block from `UNBOUND.jsonl` (never `rm` the shared file — it holds
++every other unit's UNBOUND rows too).
++
++ROUND-4 (two adversarial reproducers, both closed structurally): (1)
++resolving `unit_branch` as a BARE `<name>^{commit}` — rather than
++explicitly under `refs/heads/` — lets a TAG (or any other
++`refs/<kind>/<name>`) literally named like the branch win
++gitrevisions(7)'s own refs/tags-before-refs/heads disambiguation and
++shadow the real branch's tip with the tag's own target (G39); the fix
++resolves `refs/heads/<name>^{commit}` explicitly, so nothing but a real
++branch of that name is ever consulted — the documented cost is that a unit
++whose worktree is on a DETACHED HEAD has no `refs/heads/` entry to bind to
++and can never be relayed this way. (2) `block_sha` and `fix_head` are
++sha-shaped, not branch names, so a ref (branch or tag) literally NAMED
++like one of them — or like a short PREFIX of one — can shadow the object
++it abbreviates the identical way (G40); both are now resolved via `git
++rev-parse --verify --end-of-options <hex>^{commit}` and the resolved,
++FULL 40-hex object is required to START WITH the caller-supplied hex,
++never merely to resolve to SOME commit — the RESOLVED, full sha is what
++every later git argv (`merge-base`, `diff`) actually uses. Either check
++failing DENIES, naming which hex resolved to what, and that a ref named
++like a sha shadows it. On the ACCEPT path, if any of these calls still
++wrote to stderr despite succeeding (e.g. git's own `warning: refname
++'...' is ambiguous.` when a shadow happened to resolve to a
++prefix-matching, correct object anyway), that text is appended to the
++operator-facing ALLOW reason (and the `hook.log` row it is written into),
++so shadowing stays visible even when it did not change the outcome.
++
++Arm order: artifact-exists -> schema -> R1 (coverage) -> R2 (proactivity,
 +always) -> CLAUDE_PROJECT_DIR is set -> `row.head_sha` ("block_sha")
-+matches the sha shape and resolves -> relay `unit_branch` slugifies to
-+this BLOCK's own `unit_slug` -> that `unit_branch` resolves as a ref ->
-+`fix_head` matches the sha shape and differs from block_sha -> `fix_head`
++matches the sha shape and resolves (STARTS WITH the given hex) -> `fix_head`
++matches the sha shape, differs from block_sha, and resolves (STARTS WITH
++the given hex) -> relay `unit_branch` slugifies to this BLOCK's own
++`unit_slug` -> that `unit_branch` resolves under `refs/heads/` -> `fix_head`
 +is an ancestor of `unit_branch`'s resolved tip -> R3 (>=1 probe path names
 +a file the fix actually changed, per `git diff --name-only -z block_sha
 +fix_head` — TRUSTED and COMPUTED, never lead-supplied). git runs ONLY
-+here, ONLY in `$CLAUDE_PROJECT_DIR` (required explicitly), FOUR calls
-+total per decision (`cat-file -e` block_sha, `rev-parse --verify`
++here, ONLY in `$CLAUDE_PROJECT_DIR` (required explicitly), FIVE calls
++total per decision (`rev-parse --verify` block_sha, `rev-parse --verify`
++fix_head, `rev-parse --verify --end-of-options refs/heads/...`
 +unit_branch, `merge-base --is-ancestor`, `diff --name-only`), every
 +invocation carrying `--end-of-options` immediately before its revision
 +arguments (git >= 2.24) so a value shaped like an option (e.g.
-+`--output=/tmp/x`) can never be read as one, ALL FOUR sharing ONE
++`--output=/tmp/x`) can never be read as one, ALL FIVE sharing ONE
 +per-decision monotonic deadline (`_GIT_BUDGET_S = 5.0`, an absolute
 +`time.monotonic()` value threaded through every `_run_git` call, never a
-+fresh 5s per call — the whole arm is bounded by 5s total, not 4x5s)
++fresh 5s per call — the whole arm is bounded by 5s total, not 5x5s)
 +(`Popen` into its own process group, `Popen.wait(timeout=<time left on the
 +shared deadline>)` — never `.communicate()`, never `with Popen(...)` —
 +stdout/stderr captured to `tempfile.TemporaryFile()`s, BOTH read back only
 +after `wait()` returns, so a failing call's stderr text is appended to the
-+deny reason; on timeout, `os.killpg` the WHOLE group, then a bounded
-+second `wait(timeout=1)` — this reap tail is a flat 1s, NOT drawn from the
-+shared budget — then close the files and `.kill()` if even that does not
-+return); any git failure (non-zero exit, timeout, budget exhaustion, an
-+unresolvable/malformed sha) DENIES, naming the failing command and its
-+stderr, and states that `rm .jammi/gate-state/<slug>.*` is the escape
-+hatch but destroys the unit's evidence rather than fixing the underlying
-+git problem. HONEST LIMIT: R3 cannot verify examination, only that a named
++deny reason, and a SUCCEEDING call's stderr text — round-4, above — is
++appended to the accept-side reason instead; on timeout, `os.killpg` the
++WHOLE group, then a bounded second `wait(timeout=1)` — this reap tail is a
++flat 1s, NOT drawn from the shared budget — then close the files and
++`.kill()` if even that does not return); any git failure (non-zero exit,
++timeout, budget exhaustion, an unresolvable/malformed sha, or a resolved
++sha that does not start with the hex given) DENIES, naming the failing
++command and its stderr, and states that `rm .jammi/gate-state/<slug>.*` is
++the escape hatch but destroys the unit's evidence rather than fixing the
++underlying git problem. HONEST LIMIT: R3 cannot verify examination, only that a named
 +path is a real member of the fix's own diff — a lead can still satisfy it
 +by pasting a path out of its own change; the substantive rule
 +(design-before-mechanism, one fix round per BLOCK) is a
@@ -83,10 +114,11 @@
 +verdict text merely CONTAINS a pass-like token ("verified"/"PROCEED") also
 +closes a BLOCK — independent of R3 entirely; out of scope for this
 +proposal.
- 
++
  Explicitly OUT OF SCOPE by this cut (dropped entirely, not log-only):
  `SendMessage` gating and all message-prose parsing; implementer-dispatch
-@@ -67,7 +146,11 @@
+ binding; the Bash backstop (the mechanical control is `permissions.deny`
+@@ -67,7 +178,11 @@
  allow; no `errors="replace"` fallback). `start`/`stop` are best-effort
  writers that never block a subagent lifecycle event and always exit 0.
  
@@ -99,7 +131,7 @@
  """
  
  from __future__ import annotations
-@@ -75,9 +158,19 @@
+@@ -75,10 +190,20 @@
  import json
  import os
  import re
@@ -110,21 +142,20 @@
 +import time
  from datetime import datetime, timezone
  from pathlib import Path
-+
+ 
 +# esc-097 (R3, "probe the fix"): the version marker `check_lead_gate.py
 +# --self-test`'s guarded arm probes for via `hasattr` — its presence tells
 +# the fixture harness this patch is applied, so the arm runs for real
 +# instead of reporting SKIPPED.
 +RELAY_R3 = True
- 
++
  # --------------------------------------------------------------------------
  # Agent-type lattice (closed world, deny-unknown).
-@@ -417,40 +510,26 @@
-         if "verdict" in r:
-             latest[r.get("agent_type") or ""] = (r, i)
+ # --------------------------------------------------------------------------
+@@ -419,38 +544,24 @@
      return latest
--
--
+ 
+ 
 -def _adversarial_audit_cleared_by_verifier_pass(sdir: Path, unit_slug: str, aa_row: dict,
 -                                                  aa_idx: int, by_type: dict) -> bool:
 -    """A fix-verifier/acceptance-verifier PASS ALSO clears an older
@@ -143,8 +174,8 @@
 -        if vrow.get("verdict") == "PASS" and vidx > aa_idx:
 -            return True
 -    return False
- 
- 
+-
+-
  def open_blocks_for_unit(sdir: Path, unit_slug: str) -> list[tuple[str, dict, int]]:
      """`[(agent_type, row, idx), …]` for every agent_type whose LATEST row
 -    on this unit is BLOCK-equivalent (and, for `adversarial-audit`, not
@@ -171,10 +202,11 @@
          out.append((atype, row, idx))
      return out
  
-@@ -511,9 +590,261 @@
+@@ -511,9 +622,353 @@
      return cleaned.strip()
  
  
+-def _relay_rejection(sdir: Path, unit_slug: str, row: dict) -> str | None:
 +# --------------------------------------------------------------------------
 +# esc-097 (R3, "probe the fix"): the ONLY git subprocess in this module, run
 +# ONLY from `_relay_rejection` (in turn reachable ONLY from
@@ -200,17 +232,19 @@
 +def _new_git_deadline() -> float:
 +    """One `_GIT_BUDGET_S`-wide monotonic deadline, minted ONCE per decision
 +    (by `_fix_window`) and threaded through every `_run_git` call it makes —
-+    a decision that runs four git calls is bounded by `_GIT_BUDGET_S` total,
-+    never `4 * _GIT_BUDGET_S` (V18)."""
++    a decision that runs five git calls (round-4: `fix_head` gained its own
++    `rev-parse --verify` resolution alongside `block_sha`'s) is bounded by
++    `_GIT_BUDGET_S` total, never `5 * _GIT_BUDGET_S`."""
 +    return time.monotonic() + _GIT_BUDGET_S
 +
 +
-+def _run_git(args: list[str], cwd: str, deadline: float) -> tuple[bool, str, int | None]:
++def _run_git(args: list[str], cwd: str, deadline: float,
++             warnings: list[str] | None = None) -> tuple[bool, str, int | None]:
 +    """Runs `git -C <cwd> <args>`, bounded by the TIME LEFT on the shared,
 +    per-decision `deadline` (an absolute `time.monotonic()` value minted
 +    once by `_new_git_deadline()`, never a fresh timeout per call) — a
-+    decision that makes four such calls is bounded by `_GIT_BUDGET_S`
-+    total, not `4 * _GIT_BUDGET_S` (V18). Returns `(True, stdout, rc)` on
++    decision that makes five such calls is bounded by `_GIT_BUDGET_S`
++    total, not `5 * _GIT_BUDGET_S`. Returns `(True, stdout, rc)` on
 +    success (`rc == 0`); `(False, reason, rc)` on any failure — `rc` is
 +    git's own exit code when the process ran to completion (so a caller
 +    that must distinguish, e.g., `git merge-base --is-ancestor`'s `rc == 1`
@@ -218,6 +252,15 @@
 +    process ever produced one (budget already exhausted, failed to spawn,
 +    or timed out). The caller always turns a `False` into a DENY, never a
 +    silent allow.
++
++    `warnings`, when given, is a caller-owned list this call APPENDS to
++    (never replaces) whenever the process still SUCCEEDED (`rc == 0`) but
++    wrote to stderr anyway — e.g. git's own `warning: refname '...' is
++    ambiguous.` when a ref shadows a sha or another ref of the same literal
++    name and still resolves to a prefix-matching, correct object (round-4).
++    A failing call's stderr is never routed here — it is already folded
++    into that call's own `(False, reason, rc)` return value, read back the
++    same way, below.
 +
 +    Never `with Popen(...)`, never `subprocess.run` (V12): `Popen` is
 +    opened into its OWN process group (`start_new_session=True`) with
@@ -308,6 +351,8 @@
 +    if rc != 0:
 +        detail = f" ({err})" if err else ""
 +        return False, f"`{printable}` exited {rc}{detail} — {_ESCAPE_HATCH_NOTE}", rc
++    if err and warnings is not None:
++        warnings.append(f"`{printable}` wrote to stderr on a call that still succeeded: {err}")
 +    return True, out.strip(), rc
 +
 +
@@ -332,15 +377,51 @@
 +    return tok or None
 +
 +
-+def _fix_window(row: dict, unit_slug: str, data: dict) -> tuple[list[str] | None, str | None]:
-+    """Resolves the trusted, COMPUTED `fix_changed` set for the relay arm.
-+    `(fix_changed, None)` on success; `(None, deny_reason)` otherwise. Only
-+    ever called from `_relay_rejection`'s own repeat-dispatch caller, once
-+    R1/R2 have already passed.
++def _resolve_sha_exact(hexstr: str, label: str, cwd: str, deadline: float,
++                        warnings: list[str]) -> tuple[str | None, str | None]:
++    """Resolves a sha-shaped value (`block_sha`/`fix_head` — already
++    `_SHA_RE`-validated by the caller, so 7-40 hex chars) via `git rev-parse
++    --verify --end-of-options <hexstr>^{commit}` and requires the resolved,
++    FULL 40-hex object name to START WITH the given `hexstr` — never merely
++    that it resolves to SOME commit. `--end-of-options` alone does not stop
++    a REF literally NAMED like a hex string from shadowing the object it
++    abbreviates: measured, a branch literally named `da137e40f501` pointing
++    at an unrelated commit makes `git rev-parse --verify
++    da137e40f501^{commit}` resolve to the BRANCH's tip (not the abbreviated
++    object), printing `warning: refname '...' is ambiguous.` to stderr
++    while still exiting 0 — silently wrong, not merely noisy (round-4
++    adversarial reproducer G40). Returns `(resolved_full_sha, None)` on
++    success — the CALLER uses this resolved, full value at every later
++    git-argv site (`merge-base`, `diff`), never the caller-supplied,
++    possibly-abbreviated form again — or `(None, deny_reason)` otherwise.
++    Any stderr text on a call that still resolved a prefix-matching object
++    is appended to `warnings` (by `_run_git` itself) so a shadow that
++    happens to resolve safely is still visible on the accept-side
++    reason/log, not only on a DENY."""
++    ok, resolved, _rc = _run_git(
++        ["rev-parse", "--verify", "--end-of-options", f"{hexstr}^{{commit}}"], cwd, deadline, warnings)
++    if not ok:
++        return None, f"{label} {hexstr} does not resolve (an amend can orphan it) — {resolved}"
++    if not resolved.startswith(hexstr):
++        return None, (
++            f"{hexstr} resolves to {resolved}, which is not that object — a ref named like "
++            "a sha shadows it"
++        )
++    return resolved, None
 +
-+    esc-097 V18 (round-3 closure; supersedes V16's docstring, not its
-+    check): reachability binds TWO things, not one. First, git-free: the
-+    relay's own `unit_branch` must `slugify()` to EXACTLY this BLOCK's own
++
++def _fix_window(row: dict, unit_slug: str, data: dict) -> tuple[list[str] | None, str | None, list[str]]:
++    """Resolves the trusted, COMPUTED `fix_changed` set for the relay arm.
++    `(fix_changed, None, warnings)` on success; `(None, deny_reason,
++    warnings)` otherwise — `warnings` carries any accept-side git stderr
++    text noticed along the way (round-4: surfaced by the caller even when
++    it did not change the outcome). Only ever called from
++    `_relay_rejection`'s own repeat-dispatch caller, once R1/R2 have
++    already passed.
++
++    esc-097 V18 (round-3 closure) plus the round-4 closure below:
++    reachability binds TWO things, not one. First, git-free: the relay's
++    own `unit_branch` must `slugify()` to EXACTLY this BLOCK's own
 +    `unit_slug` (the identity the dispatch already resolved) — this binds
 +    the unit's NAME, never an arbitrary branch the relay merely asserts. A
 +    row filed under the `UNBOUND` fallback bucket can never be satisfied —
@@ -349,80 +430,123 @@
 +    OWN history must also hold, or a relay could name the right unit's
 +    branch while citing a `fix_head` that an amend orphaned, or that landed
 +    on some unrelated branch — both slugify-match while never being
-+    reachable from the named branch's tip. So `unit_branch` is resolved as
-+    a real ref (`git rev-parse --verify`; a name that only slugifies right
-+    but names no ref fails here too, closing the slugify-collision
-+    advisory) and `fix_head` must `git merge-base --is-ancestor` that
-+    resolved tip. Four git calls total, each sharing ONE per-decision
-+    deadline (`_new_git_deadline()` — `_GIT_BUDGET_S` total, not `4 *
++    reachable from the named branch's tip. So `unit_branch` is resolved
++    UNDER `refs/heads/` ONLY (`git rev-parse --verify --end-of-options
++    refs/heads/<name>^{commit}`, never a bare `<name>^{commit}`) and
++    `fix_head` must `git merge-base --is-ancestor` that resolved tip.
++
++    Round-4 (two adversarial reproducers, both closed structurally, not by
++    patching a symptom): (1) a bare `<name>^{commit}` lookup for
++    `unit_branch` is resolved per gitrevisions(7)'s own disambiguation
++    order, which tries `refs/tags/<name>` BEFORE `refs/heads/<name>` — a
++    TAG literally named like the unit branch, pointing at a DIFFERENT
++    branch's commit, silently wins and the ancestry check then runs
++    against the TAG's target instead of the real branch's own tip (G39).
++    Fixed by resolving `refs/heads/<name>^{commit}` explicitly — a tag (or
++    any other `refs/<kind>/<name>`) sharing the branch's literal name no
++    longer participates in the lookup at all. A side effect, stated
++    honestly: a unit whose worktree is on a DETACHED HEAD has no
++    `refs/heads/` entry to bind to and can never be relayed this way. (2)
++    `block_sha`/`fix_head` are sha-shaped, not branch names, so they are
++    resolved through `_resolve_sha_exact` instead, which requires the
++    resolved FULL 40-hex object to START WITH the caller-supplied hex — a
++    branch (or tag) literally NAMED like a sha, or a short prefix of one,
++    can shadow the object it abbreviates the exact same way `unit_branch`
++    could (G40); `_resolve_sha_exact`'s prefix check catches it regardless
++    of which of the two git happened to pick. The RESOLVED, full sha is
++    what every later git argv (`merge-base`, `diff`) actually uses, never
++    the original, possibly-abbreviated caller-supplied value — so a
++    `fix_head` given as a short prefix that resolves to the SAME commit as
++    `block_sha` is caught as a re-roll even when the two strings differed
++    before resolution. FIVE git calls total (`rev-parse --verify` for
++    block_sha, `rev-parse --verify` for fix_head, `rev-parse --verify
++    --end-of-options refs/heads/...` for unit_branch, `merge-base
++    --is-ancestor`, `diff --name-only`), each sharing ONE per-decision
++    deadline (`_new_git_deadline()` — `_GIT_BUDGET_S` total, not `5 *
 +    _GIT_BUDGET_S`)."""
 +    project_dir = os.environ.get("CLAUDE_PROJECT_DIR")
 +    if not project_dir:
-+        return None, "hook needs CLAUDE_PROJECT_DIR for the relay arm"
++        return None, "hook needs CLAUDE_PROJECT_DIR for the relay arm", []
 +
 +    deadline = _new_git_deadline()
++    warnings: list[str] = []
 +
 +    block_sha = row.get("head_sha")
 +    if not (isinstance(block_sha, str) and _SHA_RE.fullmatch(block_sha)):
-+        return None, "BLOCK row's head_sha is not a valid sha"
-+    ok, why, _rc = _run_git(
-+        ["cat-file", "-e", "--end-of-options", f"{block_sha}^{{commit}}"], project_dir, deadline)
-+    if not ok:
-+        return None, f"BLOCK row's head_sha does not resolve (an amend can orphan it) — {why}"
++        return None, "BLOCK row's head_sha is not a valid sha", warnings
++    block_sha, why = _resolve_sha_exact(
++        block_sha, "BLOCK row's head_sha", project_dir, deadline, warnings)
++    if why is not None:
++        return None, why, warnings
 +
 +    fix_head = data.get("fix_head")
 +    if not (isinstance(fix_head, str) and _SHA_RE.fullmatch(fix_head)):
-+        return None, "relay carries no valid `fix_head` — the lead must write the fix commit's full sha"
++        return None, "relay carries no valid `fix_head` — the lead must write the fix commit's full sha", warnings
 +
 +    if fix_head == block_sha:
-+        return None, "no fix commit since the BLOCK; a second dispatch without a fix is a re-roll"
++        return None, "no fix commit since the BLOCK; a second dispatch without a fix is a re-roll", warnings
++
++    fix_head, why = _resolve_sha_exact(fix_head, "relay `fix_head`", project_dir, deadline, warnings)
++    if why is not None:
++        return None, why, warnings
++    if fix_head == block_sha:
++        # Round-4: a fix_head given as a SHORT prefix can resolve to the
++        # SAME full commit as block_sha even when the two caller-supplied
++        # strings differed — still a re-roll, only visible after both are
++        # resolved to their full form.
++        return None, "no fix commit since the BLOCK; a second dispatch without a fix is a re-roll", warnings
 +
 +    relay_ub = data.get("unit_branch")
 +    if not (isinstance(relay_ub, str) and relay_ub.strip()):
-+        return None, "relay carries no `unit_branch` naming the unit this fix landed on"
++        return None, "relay carries no `unit_branch` naming the unit this fix landed on", warnings
 +    if unit_slug == "UNBOUND":
 +        return None, (
 +            "this BLOCK was recorded without a unit binding (the UNBOUND fallback bucket) — "
 +            "re-dispatch naming the unit so the verdict lands on the unit's own file, then "
 +            "hand-remove the stale row for this block from UNBOUND.jsonl (never `rm` the "
 +            "shared file — it holds every other unit's UNBOUND rows too)"
-+        )
++        ), warnings
 +    if slugify(relay_ub) != unit_slug:
 +        return None, (
 +            f"relay `unit_branch` {relay_ub!r} does not name this BLOCK's own unit "
 +            f"(recorded under slug {unit_slug!r}) — reachability is bound to the file this "
 +            "BLOCK is filed under, not an arbitrary branch the relay names"
-+        )
++        ), warnings
 +
-+    # V18: the slug equality above binds the NAME; fix_head must also be
-+    # bound to that same name's own HISTORY, or a relay could name the
-+    # right unit while citing a fix_head an amend orphaned, or one that
-+    # landed on some unrelated branch.
++    # V18 + round-4: the slug equality above binds the NAME; fix_head must
++    # also be bound to that same name's own HISTORY. `unit_branch` is
++    # resolved under refs/heads/ ONLY — a bare `<name>^{commit}` lookup lets
++    # a same-named tag (or any other refs/<kind>/<name>) win the
++    # disambiguation and shadow the real branch (G39).
 +    ok, tip, _rc = _run_git(
-+        ["rev-parse", "--verify", "--end-of-options", f"{relay_ub}^{{commit}}"], project_dir, deadline)
++        ["rev-parse", "--verify", "--end-of-options", f"refs/heads/{relay_ub}^{{commit}}"],
++        project_dir, deadline, warnings)
 +    if not ok:
 +        return None, (
 +            f"relay `unit_branch` {relay_ub!r} slugifies to this BLOCK's own unit but does not "
-+            f"resolve as a real ref — {tip}"
-+        )
++            f"resolve under refs/heads/ — {tip} (a unit whose worktree is on a detached HEAD "
++            "cannot be relayed this way — there is no refs/heads entry to bind to)"
++        ), warnings
 +    ok, why, rc = _run_git(
-+        ["merge-base", "--is-ancestor", "--end-of-options", fix_head, tip], project_dir, deadline)
++        ["merge-base", "--is-ancestor", "--end-of-options", fix_head, tip], project_dir, deadline, warnings)
 +    if not ok:
 +        if rc == 1:
 +            return None, (
 +                f"fix_head {fix_head} is not on {relay_ub!r}; if the fix was amended, name "
-+                "the amended sha"
-+            )
-+        return None, f"could not check whether fix_head is on {relay_ub!r} — {why}"
++                "the amended sha; if it was committed on a child branch, commit or merge it "
++                f"onto {relay_ub!r}"
++            ), warnings
++        return None, f"could not check whether fix_head is on {relay_ub!r} — {why}", warnings
 +
 +    ok, out, _rc = _run_git(
-+        ["diff", "--name-only", "-z", "--end-of-options", block_sha, fix_head], project_dir, deadline)
++        ["diff", "--name-only", "-z", "--end-of-options", block_sha, fix_head], project_dir, deadline, warnings)
 +    if not ok:
-+        return None, f"could not compute the fix window: {out}"
-+    return [seg for seg in out.split("\0") if seg], None
++        return None, f"could not compute the fix window: {out}", warnings
++    return [seg for seg in out.split("\0") if seg], None, warnings
 +
 +
- def _relay_rejection(sdir: Path, unit_slug: str, row: dict) -> str | None:
++def _relay_rejection(sdir: Path, unit_slug: str, row: dict,
++                      warnings: list[str] | None = None) -> str | None:
      """`None` == accepted; otherwise the operator-facing REASON the relay is
 -    missing or insufficient.
 +    missing or insufficient. ONE predicate, ONE reachable caller
@@ -434,15 +558,25 @@
  
      The relay's requirements are a CONJUNCTION, never a two-arm disjunction
      (esc-064): R1 (coverage) is armed by the DATA — a non-empty
-@@ -524,7 +855,6 @@
-     requirement entirely."""
+@@ -521,10 +976,15 @@
+     every gated verifier type's relay. The recorded `enumeration_missing`
+     flag is diagnostic only and is never read here: a flag with a weak-arm
+     default let a legacy/hand-edited row take the fallback arm and drop a
+-    requirement entirely."""
++    requirement entirely.
++
++    `warnings`, when given, is a caller-owned list this call EXTENDS (never
++    replaces) with any accept-side git stderr text `_fix_window` observed
++    (round-4) — the ONLY caller, `_decide_verifier_dispatch`, folds it into
++    the operator-facing ALLOW reason so a ref that shadowed a sha or a
++    branch name, even one that still resolved correctly, stays visible."""
      agent_type = row.get("agent_type") or ""
      block_ts = row.get("ts") or ""
 -    unit_branch = row.get("unit_branch")
      if not block_ts or not agent_type:
          return "BLOCK row carries no ts/agent_type to match a relay against"
      path = relay_artifact_path(sdir, unit_slug, agent_type, block_ts)
-@@ -536,8 +866,6 @@
+@@ -536,8 +996,6 @@
          return "relay artifact is not valid JSON"
      if not isinstance(data, dict):
          return "relay artifact is not a JSON object"
@@ -451,7 +585,7 @@
      if data.get("agent_type") != agent_type:
          return "relay `agent_type` does not match the BLOCK row's"
      if data.get("block_ts") != block_ts:
-@@ -570,11 +898,30 @@
+@@ -570,11 +1028,32 @@
                  "own class_enumeration/findings (>=2 required) — restating the enumeration "
                  "is reactive acknowledgment, not adjacent probing; name >=2 sites you "
                  "EXAMINED and found clean (esc-064)")
@@ -462,7 +596,9 @@
 -    return _relay_rejection(sdir, unit_slug, row) is None
 +    # R3 PROBE-THE-FIX (esc-097) — the only git subprocess in this module;
 +    # see its own module-doc paragraph for the arm order.
-+    fix_changed, why = _fix_window(row, unit_slug, data)
++    fix_changed, why, fix_warnings = _fix_window(row, unit_slug, data)
++    if warnings is not None:
++        warnings.extend(fix_warnings)
 +    if why is not None:
 +        return why
 +    probe_paths = {p for p in (_probe_path(e) for e in probe) if p}
@@ -486,7 +622,7 @@
  
  
  def _diagnose_row(row: dict) -> str:
-@@ -662,7 +1009,17 @@
+@@ -662,7 +1141,17 @@
      of this type is structurally never gated (no prior row exists to
      match). Residual: an unlabeled re-dispatch naming none of the three
      anchors (DODGE-5) — allowed, visible; the tell is a verifier row whose
@@ -505,16 +641,35 @@
      targeted = [
          (unit_slug, row) for unit_slug, atype, row, idx in all_open_blocks(sdir)
          if atype == subtype and _block_named_in_text(prompt, row)
-@@ -672,6 +1029,12 @@
-             f"no open {subtype} BLOCK named (worktree/head_sha/unit_branch) in this "
+@@ -673,8 +1162,15 @@
              "dispatch — a first dispatch of this type, or an unlabeled re-dispatch "
              "(the documented visible residual)"
-+        )
+         )
 +    if len(targeted) > 1:
 +        names = ", ".join(u for u, _r in targeted)
 +        return False, (
 +            f"R3 is evaluated for one unit per dispatch; this prompt names {names} — "
 +            "dispatch them separately (a scratchpad path under a sibling worktree also names it)"
-         )
++        )
++    relay_warnings: list[str] = []
      unresolved = [(u, r, why) for u, r in targeted
-                   for why in [_relay_rejection(sdir, u, r)] if why is not None]
+-                  for why in [_relay_rejection(sdir, u, r)] if why is not None]
++                  for why in [_relay_rejection(sdir, u, r, relay_warnings)] if why is not None]
+     if unresolved:
+         names = "; ".join(f"{u}/{r.get('agent_type')}{_diagnose_row(r)}: {why}"
+                            for u, r, why in unresolved)
+@@ -682,7 +1178,13 @@
+             f"a second {subtype} dispatch naming {names} is denied — the relay artifact "
+             "for that (unit, agent_type, block_ts) is missing or insufficient"
+         )
+-    return True, f"every named {subtype} BLOCK has an accepted relay artifact — allowed"
++    allowed_reason = f"every named {subtype} BLOCK has an accepted relay artifact — allowed"
++    if relay_warnings:
++        # Round-4: a ref shadowed a sha or a branch name and still resolved
++        # to a correct, prefix-matching object — the ALLOW stands, but the
++        # shadow is surfaced here rather than silently discarded.
++        allowed_reason += " [git stderr on an otherwise-successful call: " + "; ".join(relay_warnings) + "]"
++    return True, allowed_reason
+ 
+ 
+ # The dispatch payload's agent-type field, by every name it is known to (or

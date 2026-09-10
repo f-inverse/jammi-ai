@@ -88,7 +88,7 @@ Required fixtures (RED when the corresponding hook arm is removed):
   N7  wall time < 1s per invocation
   R10 wiring: SubagentStart/SubagentStop/PreToolUse(Agent|Task) present,
       scripts executable, permissions.deny covers the hook files
-  G20-G38 esc-097 (R3, "probe the fix" — proposal, docs/plans/63-how-well/
+  G20-G40 esc-097 (R3, "probe the fix" — proposal, docs/plans/63-how-well/
       proposals/esc-097-probe-the-fix.md): exercised behind a `RELAY_R3`
       version-marker guard on `.claude/hooks/lead-gate-lib.py` — reported
       SKIPPED (exit 0 for that arm only) until a human applies the
@@ -109,7 +109,19 @@ Required fixtures (RED when the corresponding hook arm is removed):
       `unit_branch` NAME alone and never checked `fix_head`'s POSITION)
       and GREEN once V18's `git merge-base --is-ancestor` check lands. G38
       proves the git subprocess's own stderr text is read and appended to
-      the deny reason, not merely a bare exit code.
+      the deny reason, not merely a bare exit code. G39/G40 are the
+      round-4 adversarial reproducers: G39 DENIES a TAG literally named
+      like `unit_branch`, pointing at another branch's commit, that would
+      otherwise shadow the real branch's tip via gitrevisions(7)'s own
+      refs/tags-before-refs/heads disambiguation (RED against 7ed0db7d's
+      patch, which resolved `unit_branch` as a bare `<name>^{commit}` and
+      ALLOWED this exact shape); G40 DENIES a BRANCH literally named like
+      `fix_head`'s own hex prefix, pointing elsewhere, that would otherwise
+      shadow the abbreviated object (RED against 7ed0db7d's patch, which
+      never checked that a resolved sha STARTS WITH the hex given). Both
+      are GREEN once `unit_branch` resolves under `refs/heads/` only and
+      `block_sha`/`fix_head` are resolved via `git rev-parse --verify` with
+      a startswith check on the result.
 
 Run: `python3 ci/scripts/check_lead_gate.py --self-test`
 """
@@ -1231,9 +1243,9 @@ def fixture_g19_coverage_arm_selected_by_data_not_flag() -> None:
 
 
 # ==========================================================================
-# G20-G38 — esc-097 (R3, "probe the fix"; G32-G35 are the round-2 and
-# G36-G38 the round-3 pressure-test reproducers). NOT added to FIXTURES: the
-# hook patch these
+# G20-G40 — esc-097 (R3, "probe the fix"; G32-G35 are the round-2, G36-G38
+# the round-3, and G39-G40 the round-4 pressure-test reproducers). NOT
+# added to FIXTURES: the hook patch these
 # exercise is a PROPOSAL (`.claude/hooks/**` is agent-write-denied), so it
 # is not applied in THIS tree. `_g20_28_arm()` (called from `self_test()`,
 # mirroring how N7 already runs outside the FIXTURES loop) detects whether
@@ -1826,8 +1838,13 @@ def fixture_g38_unresolvable_fix_head_deny_reason_includes_git_stderr() -> None:
     """esc-097 V19: `_run_git` reads `err_f` AFTER `wait()` returns and
     appends its text to the deny reason — proven with a `fix_head` that is
     SHA-SHAPED (passes the `re.fullmatch` check) but names no real object
-    at all; `git merge-base`'s own stderr ("Not a valid object name ...")
-    must appear in the hook's deny reason, not merely a bare "exited 128"."""
+    at all. Round-4: `fix_head` is now resolved via `git rev-parse --verify`
+    (not `cat-file -e`, so its OWN resolved value can be checked against the
+    given hex — see G40), whose stderr for a wholly unresolvable hex is
+    "fatal: Needed a single revision" (measured directly, `git 2.50.1`; NOT
+    `cat-file -e`'s "Not a valid object name ..." — a different subcommand,
+    a different message) — that exact text must appear in the hook's deny
+    reason, not merely a bare "exited 128"."""
     root = _temp_repo("feat/g38")
     row = _write_block_row(root, "feat/g38", "a1", "adversarial-audit",
                             ["a.py:1", "b.py:2"], ["a.py:1"])
@@ -1837,8 +1854,80 @@ def fixture_g38_unresolvable_fix_head_deny_reason_includes_git_stderr() -> None:
     p = _run("lead-gate-pre.sh", {"tool_name": "Agent", "tool_input": {
         "subagent_type": "adversarial-audit", "prompt": "re-audit unit: feat/g38"}}, root)
     _assert(p.returncode == 2, "G38", f"an unresolvable fix_head must deny, got {p.returncode}: {p.stderr}")
-    _assert("not a valid" in p.stderr.lower(), "G38",
+    _assert("needed a single revision" in p.stderr.lower(), "G38",
             f"deny reason must include git's own stderr text, not just the exit code: {p.stderr!r}")
+
+
+def fixture_g39_tag_shadowing_unit_branch_denies() -> None:
+    """Round-4 adversarial reproducer: a TAG literally named EXACTLY like
+    the relay's `unit_branch`, pointing at ANOTHER branch's commit that DOES
+    contain `fix_head` as an ancestor, must not let a bare `<name>^{commit}`
+    lookup (gitrevisions(7): `refs/tags/<name>` is disambiguated BEFORE
+    `refs/heads/<name>`) resolve `unit_branch` to the TAG's target instead
+    of the real branch's own tip, from which `fix_head` is NOT actually
+    reachable. Measured directly (git 2.50.1): with both a branch and a tag
+    named `feat/g39` in the same repo, `git rev-parse --verify
+    feat/g39^{commit}` prints `warning: refname 'feat/g39' is ambiguous.` to
+    stderr and resolves to the TAG's target anyway, exit 0 — silently a
+    DIFFERENT commit than the real branch's tip. RED against 7ed0db7d's
+    patch (bare resolution let the tag win and ALLOWED this exact shape);
+    GREEN once `unit_branch` resolves under `refs/heads/` only."""
+    root = _temp_repo("feat/g39")
+    row = _write_block_row(root, "feat/g39", "a1", "adversarial-audit",
+                            ["a.py:1", "b.py:2"], ["a.py:1"])
+    # feat/g39's own tip never advances past the BLOCK -- fix_head is NOT
+    # reachable from it. The "fix" instead lands on an unrelated sibling
+    # branch, forked from the same BLOCK commit.
+    _git(root, "checkout", "-q", "-b", "feat/g39-other")
+    other_fix = _commit_fix(root, "d.py")
+    _git(root, "checkout", "-q", "feat/g39")
+    p_ancestor = subprocess.run(["git", "-C", str(root), "merge-base", "--is-ancestor",
+                                  other_fix, "feat/g39"])
+    _assert(p_ancestor.returncode != 0, "G39 setup",
+            "the other branch's fix must NOT be an ancestor of feat/g39's own tip")
+    # A TAG literally named like the unit branch, pointing at the OTHER
+    # branch's tip (where fix_head DOES live) -- the shadow.
+    _git(root, "tag", "feat/g39", other_fix)
+    _write_relay_exact(root, row, sites={"a.py:1": "fixed", "b.py:2": "fixed"},
+                        probe=["c.py:9", "d.py:4"], fix_head=other_fix)
+    p = _run("lead-gate-pre.sh", {"tool_name": "Agent", "tool_input": {
+        "subagent_type": "adversarial-audit", "prompt": "re-audit unit: feat/g39"}}, root)
+    _assert(p.returncode == 2, "G39",
+            f"a tag shadowing the unit branch's name must not satisfy ancestry, got "
+            f"{p.returncode}: {p.stderr}")
+    _assert("is not on" in p.stderr, "G39",
+            f"deny reason must name the ancestry failure against the REAL branch, not the "
+            f"tag's target: {p.stderr!r}")
+
+
+def fixture_g40_branch_shadowing_fix_head_prefix_denies() -> None:
+    """Round-4 adversarial reproducer: a BRANCH literally named like
+    `fix_head`'s own hex prefix, pointing at an UNRELATED commit, must not
+    let a bare `<hex>^{commit}` lookup resolve to the BRANCH's tip instead
+    of the short-sha object it names. Measured directly (git 2.50.1): with
+    a branch literally named the same 12-hex prefix as a real commit's own
+    sha, `git rev-parse --verify <prefix>^{commit}` prints `warning: refname
+    '<prefix>' is ambiguous.` to stderr and resolves to the BRANCH's tip
+    (not the abbreviated object), exit 0 — silently a DIFFERENT commit than
+    the one named. RED against 7ed0db7d's patch (no check that the resolved
+    sha actually STARTS WITH the given hex); GREEN once that startswith
+    check lands."""
+    root = _temp_repo("feat/g40")
+    row = _write_block_row(root, "feat/g40", "a1", "adversarial-audit",
+                            ["a.py:1", "b.py:2"], ["a.py:1"])
+    fix_head = _commit_fix(root, "d.py")
+    prefix = fix_head[:12]
+    # A branch literally named like fix_head's own hex prefix, pointing at
+    # an entirely unrelated commit (the BLOCK row's own head_sha).
+    _git(root, "branch", prefix, row["head_sha"])
+    _write_relay_exact(root, row, sites={"a.py:1": "fixed", "b.py:2": "fixed"},
+                        probe=["c.py:9", "d.py:4"], fix_head=prefix)
+    p = _run("lead-gate-pre.sh", {"tool_name": "Agent", "tool_input": {
+        "subagent_type": "adversarial-audit", "prompt": "re-audit unit: feat/g40"}}, root)
+    _assert(p.returncode == 2, "G40",
+            f"a branch shadowing fix_head's own hex prefix must deny, got {p.returncode}: {p.stderr}")
+    _assert("shadow" in p.stderr, "G40",
+            f"deny reason must name the shadow, not merely a generic ancestry failure: {p.stderr!r}")
 
 
 _G20_28_FIXTURES = [
@@ -1861,11 +1950,13 @@ _G20_28_FIXTURES = [
     ("G36", fixture_g36_orphaned_sha_reachable_from_no_ref_denies),
     ("G37", fixture_g37_sha_on_unrelated_branch_denies),
     ("G38", fixture_g38_unresolvable_fix_head_deny_reason_includes_git_stderr),
+    ("G39", fixture_g39_tag_shadowing_unit_branch_denies),
+    ("G40", fixture_g40_branch_shadowing_fix_head_prefix_denies),
 ]
 
 
 def _run_g20_28_fixture_list(fixtures: list[tuple[str, object]]) -> list[str]:
-    """The G20-35 arm's own execution+guard logic, factored out so the
+    """The G20-40 arm's own execution+guard logic, factored out so the
     `ran_any` guard can be exercised directly against a MUTATED (here:
     emptied) fixture list, not merely restated in prose — proving the guard
     is live, not dead code that can never observe a False (esc-097
@@ -1887,7 +1978,7 @@ def _run_g20_28_fixture_list(fixtures: list[tuple[str, object]]) -> list[str]:
         # The guard's own self-check: the marker is present but the arm
         # still didn't run any fixture — that is THIS GUARD failing, not a
         # legitimate skip, and must not exit 0.
-        failures.append("G20-35 guard: RELAY_R3 marker present but the arm ran no fixtures — guard is broken")
+        failures.append("G20-40 guard: RELAY_R3 marker present but the arm ran no fixtures — guard is broken")
     return failures
 
 
@@ -1895,7 +1986,7 @@ def _g20_28_arm() -> tuple[list[str], int]:
     """Returns `(failures, ran_count)` — `ran_count` is 0 when SKIPPED, else
     `len(_G20_28_FIXTURES)`, so `self_test()`'s own final tally counts this
     arm's fixtures when (and only when) it actually ran them, rather than a
-    hardcoded `+1` that silently ignores whether G20-35 ran at all.
+    hardcoded `+1` that silently ignores whether G20-40 ran at all.
 
     esc-097's own fixtures are RED against the current (unpatched) lib —
     the patch lives only in the tracked patch files under
@@ -1910,7 +2001,7 @@ def _g20_28_arm() -> tuple[list[str], int]:
     mod = _lib_module()
     patched = hasattr(mod, "RELAY_R3")
     if not patched:
-        print("check-lead-gate[G20-35]: SKIPPED — hook patch esc-097 not applied "
+        print("check-lead-gate[G20-40]: SKIPPED — hook patch esc-097 not applied "
               "(.claude/hooks/lead-gate-lib.py carries no RELAY_R3 marker)")
         return [], 0
     failures = _run_g20_28_fixture_list(_G20_28_FIXTURES)
@@ -1924,7 +2015,7 @@ def _g20_28_arm() -> tuple[list[str], int]:
         failures.append("ran_any guard self-check: an empty fixture list must trip the "
                          "'ran no fixtures' failure via _run_g20_28_fixture_list — it did not")
     else:
-        print("check-lead-gate[G20-35 guard self-check]: OK (empty-list mutation correctly fails)")
+        print("check-lead-gate[G20-40 guard self-check]: OK (empty-list mutation correctly fails)")
     return failures, len(_G20_28_FIXTURES)
 
 
@@ -2014,7 +2105,7 @@ def self_test() -> int:
         for f in failures:
             print(f"  - {f}", file=sys.stderr)
         return 1
-    # +1 is N7 (wall-time); the G20-35 arm's own count is 0 when SKIPPED so
+    # +1 is N7 (wall-time); the G20-40 arm's own count is 0 when SKIPPED so
     # this total is honest either way (D5: "counts the G arm when it runs").
     print(f"check-lead-gate: all {len(FIXTURES) + 1 + g20_35_ran} self-test fixture(s) passed.")
     return 0

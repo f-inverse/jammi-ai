@@ -49,8 +49,9 @@ hook at all — they pass straight through.
 
 **The relay artifact** (`.jammi/gate-state/<slug>.relay.<agent_type>.<block_ts>.json`)
 is written by the LEAD directly (`Write` is not gated) — never scanned from message
-prose. It names `unit_branch`/`agent_type`/`block_ts` (the verdict row's own `ts`) and must
-satisfy BOTH requirements — a CONJUNCTION, never a choice of arms (esc-064).
+prose. It names `unit_branch`/`agent_type`/`block_ts` (the verdict row's own `ts`) and,
+per esc-097 below, `fix_head` — and must satisfy R1, R2, and R3, a CONJUNCTION, never
+a choice of arms (esc-064, esc-097).
 **(1) Coverage** — whenever the BLOCK's `class_enumeration` is non-empty: a `sites`
 object whose keys are an EXACT-STRING SUPERSET of it (no path parsing, no
 normalization — the lead copies the verifier's own strings verbatim, so
@@ -63,21 +64,122 @@ surrounding whitespace stripped, on BOTH sides: this is monotone-toward-DENY (it
 only shrink the adjacent set) and is therefore NOT the acceptance-easing
 normalization the `sites` rule bans. The `enumeration_missing` field on a verdict
 row is diagnostic only — no gate decision reads it; which requirement has content is
-derived from the enumeration itself. HONEST LIMIT: the hook enforces that adjacent
-probing is ASSERTED with named, citation-checkable sites — never that it occurred,
-nor that the sites are semantically adjacent; it converts silent omission into an
-explicit after-the-fact-checkable claim (citation-checker and the retrospective
-judge the probes, not this hook).
+derived from the enumeration itself.
+**(3) Probe-the-fix — required on a REPEAT dispatch (esc-097).** R3 runs ONLY from
+`_decide_verifier_dispatch`'s own repeat-dispatch branch — never on a FIRST dispatch
+(no prior row exists to reach this arm at all) — and, per decision, for AT MOST ONE
+targeted unit even when a prompt names more than one open BLOCK of this type (naming
+more than one is denied outright — see "One unit per dispatch" below). The relay
+names `fix_head` (the fix commit's full sha, `re.fullmatch(r"[0-9a-f]{7,40}")`); the
+hook resolves `fix_changed = git diff --name-only -z <block_sha> <fix_head>` ITSELF
+(NUL-split, so a path with a space or non-ASCII byte is still named correctly —
+trusted, computed, never lead-supplied) and requires `fix_head` to resolve, differ
+from the BLOCK's own `head_sha` (else "no fix commit since the BLOCK; a second
+dispatch without a fix is a re-roll"). Reachability binds TWO things (V18, round-3
+closure — supersedes the earlier "git-free only" design): FIRST, git-free, the
+relay's OWN `unit_branch` field must `slugify()` to EXACTLY this BLOCK's own
+`unit_slug` — this binds the unit's NAME, never an arbitrary branch the relay merely
+asserts; a BLOCK row filed under the `UNBOUND` fallback bucket can never be satisfied
+this way (no real branch slugifies to the literal string `UNBOUND` — re-dispatch
+naming the unit, then hand-remove the stale row for this block from `UNBOUND.jsonl`,
+never `rm` the shared file, which holds every other unit's rows too). SECOND, that
+same `unit_branch` is resolved UNDER `refs/heads/` ONLY (`git rev-parse --verify
+--end-of-options refs/heads/<name>^{commit}`, never a bare `<name>^{commit}` — a TAG
+(or any other `refs/<kind>/<name>`) literally named like the branch otherwise wins
+gitrevisions(7)'s own refs/tags-before-refs/heads disambiguation and resolves to the
+TAG's target instead of the real branch's own tip; a name that only slugifies right
+but names no real branch fails here too, closing the slugify-collision advisory) and
+`fix_head` must `git merge-base --is-ancestor` that resolved tip — this binds
+`fix_head`'s POSITION on the unit's own history, which the NAME check alone does not:
+an amended-away orphan sha, or a sha that is a real commit on some UNRELATED branch,
+both slugify-match the right unit's name while never being reachable from its tip.
+`block_sha` and `fix_head` are themselves resolved via `git rev-parse --verify
+--end-of-options <hex>^{commit}` (never `cat-file -e`, so the RESOLVED value can be
+checked), and the resolved, full 40-hex object must START WITH the caller-supplied
+hex — a ref (branch or tag) literally NAMED like a sha, or a short prefix of one, can
+shadow the object it abbreviates the same way a same-named tag can shadow a branch;
+the resolved, full sha is what every later git argv (`merge-base`, `diff`) actually
+uses. An amended commit IS on the tip and allows; only a STALE relay naming the
+pre-amend sha is denied — "fix_head <sha> is not on <unit_branch>; if the fix was
+amended, name the amended sha; if it was committed on a child branch, commit or merge
+it onto <unit_branch>". A unit whose worktree is on a DETACHED HEAD has no
+`refs/heads/` entry to bind to and can never be relayed this way — name the unit's own
+branch, or commit/merge the fix onto one, before dispatching the second round. On the
+ACCEPT path, any of these calls that still wrote to stderr despite succeeding (e.g.
+git's own `warning: refname '...' is ambiguous.` when a shadow happened to resolve to
+a prefix-matching, correct object anyway) has that text appended to the
+operator-facing ALLOW reason and its `hook.log` row, so a shadow stays visible even
+when it did not change the outcome. At least one `probe` entry's PATH (the
+first whitespace-delimited token — never a quote- or backtick-span rule; a fix
+touching only a space-containing path is a documented limit — a surrounding backtick
+or parenthesis and trailing punctuation stripped, an optional trailing
+`:<n>[-<n>][,<n>]*` line spec stripped) must be EXACTLY a member of `fix_changed` —
+probing the fix's own surface satisfies this even when that file is also a finding
+location; R2's ≥2-distinct-non-reactive requirement is unchanged and stays
+conjunctive with R3 (worst case, three probe entries: 2 adjacent + 1 fix-changed,
+though one entry can double as both when it qualifies for each). **One unit per
+dispatch.** If the prompt whole-token-names MORE THAN ONE open BLOCK of the same
+type, the dispatch is denied outright, naming every targeted unit — R3 never
+silently skips the others; dispatch each named unit separately. **§C5 — the ONE
+amendment to "no git subprocess anywhere":** git runs ONLY from the repeat-dispatch
+branch, NEVER on a first dispatch's hot path, and ONLY in `$CLAUDE_PROJECT_DIR` — the
+documented hook environment contract: the harness always sets this variable for
+every hook invocation, so `repo_root()`'s cwd fallback is never needed by this arm
+and is deliberately not reused here — with FIVE git calls per decision (`rev-parse
+--verify` block_sha, `rev-parse --verify` fix_head, `rev-parse --verify
+--end-of-options refs/heads/...` unit_branch, `merge-base --is-ancestor`, `diff
+--name-only`), all sharing ONE per-decision monotonic deadline (`_GIT_BUDGET_S =
+5.0`, an absolute `time.monotonic()` value threaded through every call, never a
+fresh 5s per call — the whole arm is bounded by 5s total, not 5x5s) (git >= 2.24
+required: every invocation carries `--end-of-options` immediately before its
+revision arguments, so a value shaped like an option — e.g. `--output=/tmp/x` — can
+never be read as one; a pre-2.24 git fails that unrecognized-option check and
+DENIES). Any git failure (non-zero exit, timeout, budget exhaustion, an
+unresolvable/malformed sha — an amend can orphan one — or a resolved sha that does
+not start with the hex the relay gave, a ref shadowing it) DENIES, naming the failing
+command AND its stderr (read back from the same `tempfile.TemporaryFile()` the
+command's output was captured to, after `wait()` returns — never left unread), and
+states that `rm .jammi/gate-state/<slug>.*` is the escape hatch but destroys the
+unit's evidence rather than fixing the underlying git problem.
+**Migration.** A relay written to disk before this patch lands (no `fix_head`) stops
+being acceptable the moment the patch IS applied — an in-flight relay must be
+rewritten with `fix_head`, or the unit must re-relay; there is no grandfathering.
+HONEST LIMIT (extended to R3): the hook enforces that adjacent probing AND fix-probing
+are each ASSERTED with a named, citation-checkable site that is ACTUALLY a member of
+the relevant set — never that either was semantically examined; a lead can satisfy R3
+by pasting a path out of its own diff without reading it. It converts silent
+neighbourhood-probing into fix-window-probing, on the record; it does not by itself
+close the class of "form-satisfied without substance" (esc-097) — the substantive rule
+(design-before-mechanism, one fix round per BLOCK) is a `.claude/agents/lead.md`
+discipline, not a hook (citation-checker and the retrospective judge the probes'
+substance, not this hook). A further residual: `unit_branch` is CONSTRAINED (bound to
+the unit's own NAME and, as of V18, `fix_head`'s POSITION on it) but the branch name
+itself is still lead-asserted, the same trust boundary `fix_head` already carries — a
+lead who would misname `unit_branch` to game reachability could already misname
+`fix_head` today. A PRE-EXISTING wrinkle, not introduced by R3: `_PASS_LIKE` is
+checked globally when classifying a raw verdict value, so an adversarial-audit row
+whose OWN verdict text merely contains a pass-like token ("verified"/"PROCEED") also
+closes a BLOCK, independent of R3 entirely — out of scope for this proposal. A
+further, honest limit: a unit whose worktree is on a DETACHED HEAD cannot be relayed
+— `unit_branch` resolution is scoped to `refs/heads/` only (round-4), and a detached
+HEAD has no `refs/heads` entry to bind to.
 The hook only ever READS this file, fresh, on every gate call — it never writes an
 "accepted" row itself, so a DENY can never leave a phantom acceptance behind.
 
-**Clearing.** A same-`agent_type` PASS clears its own BLOCK. A `fix-verifier`/
-`acceptance-verifier` PASS ALSO clears an older `adversarial-audit` BLOCK on the same
-unit, but ONLY when that BLOCK's own relay artifact was accepted — the normal
-workflow's resolution path (fix, verify, done — the audit need not always re-run).
+**Clearing.** A same-`agent_type` PASS clears its own BLOCK — this is the ONLY way an
+adversarial-audit BLOCK closes (that same-type PASS itself requires a relay that
+passed R1+R2+R3 on the direct repeat-dispatch path above). esc-097 (V10) DELETES the
+earlier cross-type clearing arm (a `fix-verifier`/`acceptance-verifier` PASS clearing
+an older `adversarial-audit` BLOCK on the same unit whenever that BLOCK's own relay
+was "accepted") — that arm's own acceptance check never ran R3, so a relay lacking
+`fix_head` entirely could still clear a BLOCK it never probed the fix for. There is
+now exactly ONE predicate (`_relay_rejection`) and exactly ONE reachable caller (the
+repeat-dispatch branch): fix, verify, THEN re-dispatch the SAME verifier type once
+more — the closing audit always re-runs, on the record.
 **Operator escape hatch:** `rm .jammi/gate-state/<slug>.*` clears ALL state (rows and
 relay artifacts) for a unit — the recovery for a stale BLOCK on a reused branch name,
-or any other state you need to force-reset by hand.
+or any other state you need to force-reset by hand; it does NOT excuse writing
+`fix_head` or probing the fix — it destroys the unit's evidence, it does not supply it.
 
 **Verdict parsing.** `lead-gate-stop.sh` (`SubagentStop`) takes the LAST fenced
 ` ```json ` block of the verifier's final message whose object has `"kind": "verdict"`

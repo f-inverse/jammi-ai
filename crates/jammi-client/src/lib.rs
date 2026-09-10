@@ -55,11 +55,12 @@ use jammi_wire::proto::eval as eval_pb;
 use jammi_wire::proto::eval::eval_service_client::EvalServiceClient;
 use jammi_wire::proto::inference::inference_service_client::InferenceServiceClient;
 use jammi_wire::proto::inference::InferRequest;
-use jammi_wire::proto::training::training_service_client::TrainingServiceClient;
-use jammi_wire::proto::training::{
-    start_training_request::Spec as ProtoTrainingSpec, FineTuneSpec, StartTrainingRequest,
-    TrainingStatusRequest,
+use jammi_wire::proto::job::job_service_client::JobServiceClient;
+use jammi_wire::proto::job::{
+    submit_job_request::Spec as ProtoTrainingSpec, CancelJobRequest as JobCancelJobRequest,
+    JobStatusRequest, JobStatusResponse, ListJobsRequest, SubmitJobRequest,
 };
+use jammi_wire::proto::training::FineTuneSpec;
 use jammi_wire::proto::trigger::trigger_service_client::TriggerServiceClient;
 use jammi_wire::proto::trigger::{PublishRequest, SubscribeRequest, TopicName};
 use jammi_wire::request::{FineTuneJobId, Modality, QueryInput, SearchQuery, SearchRequest};
@@ -122,9 +123,8 @@ impl DataClient {
         self.transport.service(EvalServiceClient::with_interceptor)
     }
 
-    fn training_client(&self) -> TrainingServiceClient<SessionChannel> {
-        self.transport
-            .service(TrainingServiceClient::with_interceptor)
+    fn job_client(&self) -> JobServiceClient<SessionChannel> {
+        self.transport.service(JobServiceClient::with_interceptor)
     }
 
     fn trigger_client(&self) -> TriggerServiceClient<SessionChannel> {
@@ -320,10 +320,10 @@ impl DataClient {
         Ok((batches, outcome))
     }
 
-    // --- fine-tune -------------------------------------------------------
+    // --- fine-tune (submits through JobService.SubmitJob) -----------------
 
     /// Start a fine-tuning job and return its id. Poll completion with
-    /// [`Self::fine_tune_status`].
+    /// [`Self::fine_tune_status`], or [`Self::wait_job`] for a resumable wait.
     pub async fn fine_tune(
         &self,
         source: &str,
@@ -333,13 +333,13 @@ impl DataClient {
         task: ModelTask,
         config: Option<FineTuneConfig>,
     ) -> Result<FineTuneJobId> {
-        // The column-source fine-tune is the `FineTuneSpec` arm of the spec
-        // oneof; built inline from the transport-neutral config vocabulary so the
-        // data client (which carries no engine `TrainingSpec`) can still submit
-        // it.
+        // The column-source fine-tune is the `FineTuneSpec` arm of the
+        // `SubmitJob` spec oneof; built inline from the transport-neutral
+        // config vocabulary so the data client (which carries no engine
+        // `TrainingSpec`) can still submit it.
         let resp = self
-            .training_client()
-            .start_training(StartTrainingRequest {
+            .job_client()
+            .submit_job(SubmitJobRequest {
                 spec: Some(ProtoTrainingSpec::FineTune(FineTuneSpec {
                     source: source.to_string(),
                     columns: columns.to_vec(),
@@ -348,6 +348,7 @@ impl DataClient {
                 })),
                 base_model: base_model.to_string(),
                 config: config.as_ref().map(config_to_proto),
+                idempotency_key: String::new(),
             })
             .await
             .map_err(|s| error_from_status(&s))?
@@ -357,37 +358,27 @@ impl DataClient {
 
     /// Current status string for a fine-tune job, looked up by id.
     pub async fn fine_tune_status(&self, id: &FineTuneJobId) -> Result<String> {
-        let resp = self
-            .training_client()
-            .training_status(TrainingStatusRequest {
-                job_id: id.0.clone(),
-            })
-            .await
-            .map_err(|s| error_from_status(&s))?
-            .into_inner();
-        Ok(resp.status)
+        Ok(self.job_status_response(&id.0).await?.status)
     }
 
-    /// Run metrics recorded for a fine-tune job, as the raw JSON blob text the
-    /// catalog's `training_jobs.metrics` column carries (issue #441) — the same
-    /// blob the embedded `TrainingJob`'s catalog-backed metrics read returns.
-    /// `None` for a job that has not yet recorded any metrics (still queued or
-    /// running before its first stamp); this crate carries no `serde_json`
-    /// dependency, so the caller decodes the returned text.
+    /// Run metrics recorded for a fine-tune job, as the raw JSON blob text
+    /// nested inside the wire's terminal `JobStatus.model.metrics_json`
+    /// (issue #441) — the same blob the embedded `TrainingJob`'s
+    /// catalog-backed metrics read returns. `None` for a job that has not
+    /// yet recorded any metrics (still queued or running before its first
+    /// stamp); this crate carries no `serde_json` dependency, so the caller
+    /// decodes the returned text.
     pub async fn fine_tune_metrics(&self, id: &FineTuneJobId) -> Result<Option<String>> {
-        let resp = self
-            .training_client()
-            .training_status(TrainingStatusRequest {
-                job_id: id.0.clone(),
-            })
-            .await
-            .map_err(|s| error_from_status(&s))?
-            .into_inner();
-        Ok(resp.metrics_json)
+        use jammi_wire::proto::job::job_status_response::Result as WireResult;
+        let resp = self.job_status_response(&id.0).await?;
+        Ok(match resp.result {
+            Some(WireResult::Model(m)) => m.metrics_json,
+            _ => None,
+        })
     }
 
     /// GPU-acceleration determination for a fine-tune job, as the raw,
-    /// self-describing JSON blob text the catalog's `training_jobs.
+    /// self-describing JSON blob text the catalog's `jobs.
     /// acceleration_report` column carries (esc-075) — the same blob the
     /// embedded catalog-backed record read returns. `None` for a legacy row
     /// predating the column (SQL `NULL`); otherwise a `"state"`-keyed object
@@ -399,15 +390,85 @@ impl DataClient {
         &self,
         id: &FineTuneJobId,
     ) -> Result<Option<String>> {
-        let resp = self
-            .training_client()
-            .training_status(TrainingStatusRequest {
-                job_id: id.0.clone(),
+        Ok(self
+            .job_status_response(&id.0)
+            .await?
+            .acceleration_report_json)
+    }
+
+    // --- jobs (JobService; generic across every job kind) -----------------
+
+    async fn job_status_response(&self, job_id: &str) -> Result<JobStatusResponse> {
+        Ok(self
+            .job_client()
+            .job_status(JobStatusRequest {
+                job_id: job_id.to_string(),
+            })
+            .await
+            .map_err(|s| error_from_status(&s))?
+            .into_inner())
+    }
+
+    /// Read a job's current status by id: status, kind, and the resolved
+    /// output model id (training kinds only; empty for a compute kind).
+    pub async fn job_status(&self, job_id: &str) -> Result<JobStatusResponse> {
+        self.job_status_response(job_id).await
+    }
+
+    /// Stream status updates for a job until it reaches a terminal state.
+    /// Reconnecting with the same job id resumes the wait — an already
+    /// terminal job's stream carries only its terminal `done` frame.
+    pub async fn wait_job(
+        &self,
+        job_id: &str,
+    ) -> Result<Pin<Box<dyn Stream<Item = Result<JobStatusResponse>> + Send>>> {
+        use jammi_wire::proto::job::{job_event::Event, JobHandle};
+        let stream = self
+            .job_client()
+            .wait_job(JobHandle {
+                job_id: job_id.to_string(),
             })
             .await
             .map_err(|s| error_from_status(&s))?
             .into_inner();
-        Ok(resp.acceleration_report_json)
+        let mapped = stream.filter_map(|item| async move {
+            match item {
+                Ok(event) => match event.event {
+                    Some(Event::Done(done)) => Some(Ok(done)),
+                    // Progress frames carry no terminal payload for this
+                    // simplified surface; a caller that needs progress reads
+                    // `JobStatus.progress` directly.
+                    Some(Event::Progress(_)) | None => None,
+                },
+                Err(s) => Some(Err(error_from_status(&s))),
+            }
+        });
+        Ok(Box::pin(mapped))
+    }
+
+    /// Request cancellation of a job by id. `false` when the request had no
+    /// effect (the job was already terminal or absent).
+    pub async fn cancel_job(&self, job_id: &str) -> Result<bool> {
+        let resp = self
+            .job_client()
+            .cancel_job(JobCancelJobRequest {
+                job_id: job_id.to_string(),
+            })
+            .await
+            .map_err(|s| error_from_status(&s))?
+            .into_inner();
+        Ok(resp.cancelled)
+    }
+
+    /// List jobs visible to the session tenant, most recent first.
+    pub async fn list_jobs(&self) -> Result<Vec<jammi_wire::proto::job::JobSummary>> {
+        let resp = self
+            .job_client()
+            .list_jobs(ListJobsRequest {})
+            .await
+            .map_err(|s| error_from_status(&s))?
+            .into_inner();
+        Ok(resp.jobs)
     }
 
     // --- eval ------------------------------------------------------------

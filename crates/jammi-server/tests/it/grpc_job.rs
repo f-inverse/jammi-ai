@@ -1,16 +1,18 @@
-//! `TrainingService` end-to-end over the wire.
+//! `JobService` end-to-end over the wire (PLAN-C §3; replaces `TrainingService`).
 //!
-//! An in-process Tonic server hosts the gRPC chain including the
-//! `TrainingService`. A client registers the shipped `training_pairs.csv`
-//! fixture as a source (through the embedding service's `AddSource`, which backs
-//! onto the same engine session), starts a minimal LoRA fine-tune over its
-//! contrastive `(text_a, text_b, score)` columns with the local `tiny_bert`
-//! cookbook encoder via the `FineTuneSpec` arm of `StartTraining`, then polls
-//! `TrainingStatus` until a terminal state and asserts the job completed with the
-//! output model id `StartTraining` returned. This pins the wire adapter's
-//! contract: `StartTraining` returns a `job_id` + a deterministic `model_id`,
-//! `TrainingStatus` is poll-based (no progress stream) and carries the output
-//! model id + the failure error.
+//! An in-process Tonic server hosts the gRPC chain including `JobService`. A
+//! client registers the shipped `training_pairs.csv` fixture as a source
+//! (through the embedding service's `AddSource`, which backs onto the same
+//! engine session), starts a minimal LoRA fine-tune over its contrastive
+//! `(text_a, text_b, score)` columns with the local `tiny_bert` cookbook
+//! encoder via the `FineTuneSpec` arm of `SubmitJob`, then polls `JobStatus`
+//! until a terminal state and asserts the job completed with the output
+//! model id `SubmitJob` returned. This pins the wire adapter's contract:
+//! `SubmitJob` returns a `job_id` + a deterministic `output_model_id`,
+//! `JobStatus` is poll-based (`WaitJob` is the streaming peer) and carries
+//! the output model id + the failure error. The idempotency-key dedupe,
+//! `WaitJob`'s streaming terminal frame, and the cross-tenant `NOT_FOUND`
+//! contract are pinned separately, near the end of this file.
 //!
 //! Hermetic: the encoder is a local fixture (no network, no download), the
 //! training corpus is the shipped CSV, and the run is a 1-epoch projection-head
@@ -26,13 +28,15 @@
 use std::time::Duration;
 
 use jammi_server::grpc::proto::inference::ModelTask;
-use jammi_server::grpc::proto::training::start_training_request::Spec;
-use jammi_server::grpc::proto::training::training_service_client::TrainingServiceClient;
+use jammi_server::grpc::proto::job::job_service_client::JobServiceClient;
+use jammi_server::grpc::proto::job::submit_job_request::Spec;
+use jammi_server::grpc::proto::job::{
+    JobStatusRequest, JobStatusResponse, ListJobsRequest, SubmitJobRequest,
+};
 use jammi_server::grpc::proto::training::{
     ContextArchitecture, ContextPredictorSpec, ContextPredictorTrainConfig, EdgeProvenance,
     FineTuneMethod, FineTuneSpec, GaussianObjective, GraphFineTuneSources, GraphFineTuneSpec,
-    GraphSampleConfig, ListTrainingJobsRequest, PredictiveHead, StartTrainingRequest,
-    TrainingStatusRequest,
+    GraphSampleConfig, PredictiveHead,
 };
 use jammi_test_utils::{cookbook_fixture, fixture_url};
 use tonic::transport::Channel;
@@ -40,7 +44,7 @@ use tonic::transport::Channel;
 use super::common::grpc::start_engine_server_with_worker_enabled;
 use super::common::grpc::start_engine_server_worker_quiesced;
 use super::common::grpc::{
-    channel, start_engine_server, tenant_a, with_session, EngineServer, TENANT_A,
+    channel, start_engine_server, tenant_a, with_session, EngineServer, TENANT_A, TENANT_B,
 };
 
 fn tiny_bert_model_id() -> String {
@@ -94,8 +98,8 @@ async fn add_training_source(
 /// A `StartTraining` request carrying the `FineTuneSpec` arm for a minimal
 /// projection-head LoRA over the training source: an absent `config` keeps the
 /// engine defaults; the small fixture + tiny model keep the run short.
-fn start_request() -> StartTrainingRequest {
-    StartTrainingRequest {
+fn start_request() -> SubmitJobRequest {
+    SubmitJobRequest {
         spec: Some(Spec::FineTune(FineTuneSpec {
             source: "training".into(),
             columns: training_columns(),
@@ -107,6 +111,7 @@ fn start_request() -> StartTrainingRequest {
         // fixture + 32-dim model keep this within the engine's own fine-tune
         // test runtime.
         config: None,
+        idempotency_key: String::new(),
     }
 }
 
@@ -115,10 +120,7 @@ fn start_request() -> StartTrainingRequest {
 /// fails the test instead of hanging. Generic over the client's transport so the
 /// plain and tenant-intercepted clients (distinct concrete types) share one
 /// poller.
-async fn poll_until_terminal<T>(
-    client: &mut TrainingServiceClient<T>,
-    job_id: &str,
-) -> jammi_server::grpc::proto::training::TrainingStatusResponse
+async fn poll_until_terminal<T>(client: &mut JobServiceClient<T>, job_id: &str) -> JobStatusResponse
 where
     T: tonic::client::GrpcService<tonic::body::Body>,
     T::Error: Into<tonic::codegen::StdError>,
@@ -129,7 +131,7 @@ where
 {
     for _ in 0..600 {
         let resp = client
-            .training_status(TrainingStatusRequest {
+            .job_status(JobStatusRequest {
                 job_id: job_id.to_string(),
             })
             .await
@@ -152,16 +154,16 @@ async fn start_training_runs_to_completion_over_the_wire() {
     )
     .await;
 
-    let mut client = TrainingServiceClient::new(channel(server.addr).await);
+    let mut client = JobServiceClient::new(channel(server.addr).await);
 
     let start = client
-        .start_training(start_request())
+        .submit_job(start_request())
         .await
         .expect("start_training")
         .into_inner();
     assert!(!start.job_id.is_empty(), "StartTraining returns a job id");
     assert!(
-        !start.model_id.is_empty(),
+        !start.output_model_id.is_empty(),
         "StartTraining returns the deterministic output model id"
     );
 
@@ -174,7 +176,7 @@ async fn start_training_runs_to_completion_over_the_wire() {
     // On completion the status response carries the output model id (the catalog
     // `output_model_id`), and no error.
     assert!(
-        !resp.model_id.is_empty(),
+        !resp.output_model_id.is_empty(),
         "a completed job's status carries the output model id"
     );
     assert!(resp.error.is_empty(), "a completed job carries no error");
@@ -209,11 +211,10 @@ async fn training_under_a_tenant_scope_succeeds_over_the_wire() {
 
     add_training_source(channel(server.addr).await, Some(session_iface.clone())).await;
 
-    let mut client =
-        TrainingServiceClient::with_interceptor(channel(server.addr).await, session_iface);
+    let mut client = JobServiceClient::with_interceptor(channel(server.addr).await, session_iface);
 
     let start = client
-        .start_training(start_request())
+        .submit_job(start_request())
         .await
         .expect("start_training under tenant scope")
         .into_inner();
@@ -248,9 +249,9 @@ async fn list_training_jobs_is_tenant_scoped_and_carries_the_status_projection()
         None::<fn(tonic::Request<()>) -> Result<tonic::Request<()>, tonic::Status>>,
     )
     .await;
-    let mut unscoped = TrainingServiceClient::new(channel(server.addr).await);
+    let mut unscoped = JobServiceClient::new(channel(server.addr).await);
     let unscoped_job = unscoped
-        .start_training(start_request())
+        .submit_job(start_request())
         .await
         .expect("start_training unscoped")
         .into_inner();
@@ -273,10 +274,9 @@ async fn list_training_jobs_is_tenant_scoped_and_carries_the_status_projection()
     // session too (the same `tenant OR unscoped` visibility the job listing
     // asserts below), so no second registration is needed — registering the
     // same source id twice on one server is a conflict.
-    let mut scoped =
-        TrainingServiceClient::with_interceptor(channel(server.addr).await, session_iface);
+    let mut scoped = JobServiceClient::with_interceptor(channel(server.addr).await, session_iface);
     let scoped_job = scoped
-        .start_training(start_request())
+        .submit_job(start_request())
         .await
         .expect("start_training under tenant scope")
         .into_inner();
@@ -285,7 +285,7 @@ async fn list_training_jobs_is_tenant_scoped_and_carries_the_status_projection()
     // The unscoped listing carries the unscoped job — with the full status
     // projection — and never the tenant's job.
     let listed = unscoped
-        .list_training_jobs(ListTrainingJobsRequest {})
+        .list_jobs(ListJobsRequest {})
         .await
         .expect("list_training_jobs unscoped")
         .into_inner()
@@ -305,7 +305,7 @@ async fn list_training_jobs_is_tenant_scoped_and_carries_the_status_projection()
         row.base_model_id
     );
     assert_eq!(
-        row.output_model_id, unscoped_job.model_id,
+        row.output_model_id, unscoped_job.output_model_id,
         "a completed row carries the output model id StartTraining returned"
     );
     assert!(!row.created_at.is_empty(), "created_at is recorded");
@@ -318,7 +318,7 @@ async fn list_training_jobs_is_tenant_scoped_and_carries_the_status_projection()
     // The tenant-bound listing carries its own job AND the unscoped one (the
     // `tenant_id = $tenant OR tenant_id IS NULL` visibility), most recent first.
     let listed_a = scoped
-        .list_training_jobs(ListTrainingJobsRequest {})
+        .list_jobs(ListJobsRequest {})
         .await
         .expect("list_training_jobs under tenant scope")
         .into_inner()
@@ -465,8 +465,8 @@ async fn seed_predictor_dataset_under_tenant_a(server: &EngineServer) {
 /// A `StartTraining` request carrying the `ContextPredictorSpec` arm over the
 /// `fns` source — a small CNP with a Gaussian/CRPS head, the same shape the
 /// in-process predictor integration test trains.
-fn predictor_start_request() -> StartTrainingRequest {
-    StartTrainingRequest {
+fn predictor_start_request() -> SubmitJobRequest {
+    SubmitJobRequest {
         spec: Some(Spec::ContextPredictor(ContextPredictorSpec {
             source: "fns".into(),
             predictor_spec: Some(ContextPredictorTrainConfig {
@@ -504,6 +504,7 @@ fn predictor_start_request() -> StartTrainingRequest {
         // model / LoRA config applies.
         base_model: String::new(),
         config: None,
+        idempotency_key: String::new(),
     }
 }
 
@@ -536,17 +537,16 @@ async fn context_predictor_under_a_tenant_scope_completes_over_the_wire() {
         .await
         .expect("set_tenant");
 
-    let mut client =
-        TrainingServiceClient::with_interceptor(channel(server.addr).await, session_iface);
+    let mut client = JobServiceClient::with_interceptor(channel(server.addr).await, session_iface);
 
     let start = client
-        .start_training(predictor_start_request())
+        .submit_job(predictor_start_request())
         .await
         .expect("start_training(context_predictor) under tenant scope")
         .into_inner();
     assert!(!start.job_id.is_empty(), "StartTraining returns a job id");
     assert_eq!(
-        start.model_id, "ctx-predictor-wire",
+        start.output_model_id, "ctx-predictor-wire",
         "the predictor's deterministic model id is returned"
     );
 
@@ -558,7 +558,7 @@ async fn context_predictor_under_a_tenant_scope_completes_over_the_wire() {
         resp.status, resp.error
     );
     assert_eq!(
-        resp.model_id, "ctx-predictor-wire",
+        resp.output_model_id, "ctx-predictor-wire",
         "a completed predictor job carries its registered model id"
     );
 
@@ -658,10 +658,9 @@ async fn graph_fine_tune_under_a_tenant_scope_completes_over_the_wire() {
         .await
         .expect("set_tenant");
 
-    let mut client =
-        TrainingServiceClient::with_interceptor(channel(server.addr).await, session_iface);
+    let mut client = JobServiceClient::with_interceptor(channel(server.addr).await, session_iface);
 
-    let request = StartTrainingRequest {
+    let request = SubmitJobRequest {
         spec: Some(Spec::GraphFineTune(GraphFineTuneSpec {
             sources: Some(GraphFineTuneSources {
                 node_source: "nodes".into(),
@@ -685,10 +684,11 @@ async fn graph_fine_tune_under_a_tenant_scope_completes_over_the_wire() {
         })),
         base_model: tiny_bert_model_id(),
         config: None,
+        idempotency_key: String::new(),
     };
 
     let start = client
-        .start_training(request)
+        .submit_job(request)
         .await
         .expect("start_training(graph_fine_tune) under tenant scope")
         .into_inner();
@@ -708,10 +708,10 @@ async fn graph_fine_tune_under_a_tenant_scope_completes_over_the_wire() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn start_training_rejects_unspecified_method() {
     let server = start_engine_server().await;
-    let mut client = TrainingServiceClient::new(channel(server.addr).await);
+    let mut client = JobServiceClient::new(channel(server.addr).await);
 
     let err = client
-        .start_training(StartTrainingRequest {
+        .submit_job(SubmitJobRequest {
             spec: Some(Spec::FineTune(FineTuneSpec {
                 method: FineTuneMethod::Unspecified as i32,
                 source: "training".into(),
@@ -720,6 +720,7 @@ async fn start_training_rejects_unspecified_method() {
             })),
             base_model: tiny_bert_model_id(),
             config: None,
+            idempotency_key: String::new(),
         })
         .await
         .expect_err("unspecified method must be rejected");
@@ -732,10 +733,10 @@ async fn start_training_rejects_unspecified_method() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn start_training_rejects_missing_columns() {
     let server = start_engine_server().await;
-    let mut client = TrainingServiceClient::new(channel(server.addr).await);
+    let mut client = JobServiceClient::new(channel(server.addr).await);
 
     let err = client
-        .start_training(StartTrainingRequest {
+        .submit_job(SubmitJobRequest {
             spec: Some(Spec::FineTune(FineTuneSpec {
                 columns: Vec::new(),
                 source: "training".into(),
@@ -744,6 +745,7 @@ async fn start_training_rejects_missing_columns() {
             })),
             base_model: tiny_bert_model_id(),
             config: None,
+            idempotency_key: String::new(),
         })
         .await
         .expect_err("missing columns must be rejected");
@@ -758,7 +760,7 @@ async fn start_training_rejects_missing_columns() {
 //
 // The tri-state esc-075 marker (`NULL` legacy-unknown / `{"state":"pending"}`
 // / `{"state":"determined",...}`) rides the wire on
-// `TrainingStatusResponse.acceleration_report_json`, appended after
+// `JobStatusResponse.acceleration_report_json`, appended after
 // `metrics_json` (field 5) with the identical presence contract: field
 // presence — never the empty string — distinguishes "no column value" from an
 // already-recorded blob, mirroring the catalog's `NULL`/`NOT NULL`. The
@@ -880,10 +882,10 @@ async fn training_status_acceleration_report_pending_state_matches_the_catalog_r
         None::<fn(tonic::Request<()>) -> Result<tonic::Request<()>, tonic::Status>>,
     )
     .await;
-    let mut client = TrainingServiceClient::new(channel(server.addr).await);
+    let mut client = JobServiceClient::new(channel(server.addr).await);
 
     let start = client
-        .start_training(start_request())
+        .submit_job(start_request())
         .await
         .expect("start_training")
         .into_inner();
@@ -893,7 +895,7 @@ async fn training_status_acceleration_report_pending_state_matches_the_catalog_r
     // claimant can exist either. The wire field and the embedded catalog read
     // must carry the identical pending marker.
     let resp = client
-        .training_status(TrainingStatusRequest {
+        .job_status(JobStatusRequest {
             job_id: start.job_id.clone(),
         })
         .await
@@ -945,7 +947,7 @@ async fn training_status_acceleration_report_pending_state_matches_the_catalog_r
         .await
         .expect("stop the released training worker");
     let after = client
-        .training_status(TrainingStatusRequest {
+        .job_status(JobStatusRequest {
             job_id: start.job_id.clone(),
         })
         .await
@@ -997,10 +999,10 @@ async fn an_eagerly_running_worker_moves_the_acceleration_marker_off_pending() {
         None::<fn(tonic::Request<()>) -> Result<tonic::Request<()>, tonic::Status>>,
     )
     .await;
-    let mut client = TrainingServiceClient::new(channel(server.addr).await);
+    let mut client = JobServiceClient::new(channel(server.addr).await);
 
     let start = client
-        .start_training(start_request())
+        .submit_job(start_request())
         .await
         .expect("start_training")
         .into_inner();
@@ -1102,11 +1104,11 @@ async fn training_status_acceleration_report_determined_and_legacy_states_match_
     )
     .await;
 
-    let mut client = TrainingServiceClient::new(channel(server.addr).await);
+    let mut client = JobServiceClient::new(channel(server.addr).await);
 
     for (job_id, expect_absent) in [("acc-determined", false), ("acc-legacy", true)] {
         let resp = client
-            .training_status(TrainingStatusRequest {
+            .job_status(JobStatusRequest {
                 job_id: job_id.to_string(),
             })
             .await
@@ -1138,7 +1140,7 @@ async fn training_status_acceleration_report_determined_and_legacy_states_match_
 }
 
 /// esc-075 remote-visibility control: a REMOTE caller — reading nothing but
-/// `TrainingStatusResponse.acceleration_report_json` — can distinguish all
+/// `JobStatusResponse.acceleration_report_json` — can distinguish all
 /// three tri-state values (legacy-unknown / pending / determined) purely from
 /// the response. This is `esc-075-f16-silent-eager-no-per-job-signal`'s
 /// closure proof: the tri-state marker must survive the wire round-trip
@@ -1215,10 +1217,10 @@ async fn remote_caller_distinguishes_acceleration_report_tri_state_purely_from_t
         "the seeded row's lease/attempt must match the write guard"
     );
 
-    let mut client = TrainingServiceClient::new(channel(server.addr).await);
-    async fn read(client: &mut TrainingServiceClient<Channel>, job_id: &str) -> Option<String> {
+    let mut client = JobServiceClient::new(channel(server.addr).await);
+    async fn read(client: &mut JobServiceClient<Channel>, job_id: &str) -> Option<String> {
         client
-            .training_status(TrainingStatusRequest {
+            .job_status(JobStatusRequest {
                 job_id: job_id.to_string(),
             })
             .await
@@ -1261,15 +1263,12 @@ async fn remote_caller_distinguishes_acceleration_report_tri_state_purely_from_t
 /// surface reports for the acceleration marker must byte-equal the embedded
 /// read of the identical row.
 async fn wire_and_embedded(
-    client: &mut TrainingServiceClient<Channel>,
+    client: &mut JobServiceClient<Channel>,
     server: &EngineServer,
     job_id: &str,
-) -> (
-    jammi_server::grpc::proto::training::TrainingStatusResponse,
-    jammi_db::catalog::jobs_repo::JobRecord,
-) {
+) -> (JobStatusResponse, jammi_db::catalog::jobs_repo::JobRecord) {
     let wire = client
-        .training_status(TrainingStatusRequest {
+        .job_status(JobStatusRequest {
             job_id: job_id.to_string(),
         })
         .await
@@ -1316,12 +1315,12 @@ async fn worker_disabled_leaves_the_job_queued_and_pending_stable() {
         None::<fn(tonic::Request<()>) -> Result<tonic::Request<()>, tonic::Status>>,
     )
     .await;
-    let mut client = TrainingServiceClient::new(channel(server.addr).await);
+    let mut client = JobServiceClient::new(channel(server.addr).await);
 
     // The submission surface is unaffected by the key: `TrainingService` is
     // mounted and `StartTraining` succeeds exactly as it does with a worker.
     let start = client
-        .start_training(start_request())
+        .submit_job(start_request())
         .await
         .expect(
             "start_training must succeed with [worker] enabled = false — \
@@ -1408,10 +1407,10 @@ async fn worker_enabled_lets_the_submitted_job_leave_queued() {
         None::<fn(tonic::Request<()>) -> Result<tonic::Request<()>, tonic::Status>>,
     )
     .await;
-    let mut client = TrainingServiceClient::new(channel(server.addr).await);
+    let mut client = JobServiceClient::new(channel(server.addr).await);
 
     let start = client
-        .start_training(start_request())
+        .submit_job(start_request())
         .await
         .expect("start_training")
         .into_inner();
@@ -1422,7 +1421,7 @@ async fn worker_enabled_lets_the_submitted_job_leave_queued() {
     let mut left_queued = None;
     for _ in 0..600 {
         let wire = client
-            .training_status(TrainingStatusRequest {
+            .job_status(JobStatusRequest {
                 job_id: start.job_id.clone(),
             })
             .await
@@ -1499,10 +1498,10 @@ async fn worker_disabled_shutdown_does_not_await_a_worker_that_never_started() {
         None::<fn(tonic::Request<()>) -> Result<tonic::Request<()>, tonic::Status>>,
     )
     .await;
-    let mut client = TrainingServiceClient::new(channel(server.addr).await);
+    let mut client = JobServiceClient::new(channel(server.addr).await);
 
     let start = client
-        .start_training(start_request())
+        .submit_job(start_request())
         .await
         .expect("start_training")
         .into_inner();
@@ -1585,15 +1584,15 @@ async fn training_status_model_id_matches_the_embedded_derived_id_before_complet
         None::<fn(tonic::Request<()>) -> Result<tonic::Request<()>, tonic::Status>>,
     )
     .await;
-    let mut client = TrainingServiceClient::new(channel(server.addr).await);
+    let mut client = JobServiceClient::new(channel(server.addr).await);
 
     let start = client
-        .start_training(start_request())
+        .submit_job(start_request())
         .await
         .expect("start_training")
         .into_inner();
     assert!(
-        !start.model_id.is_empty(),
+        !start.output_model_id.is_empty(),
         "StartTraining returns the deterministic output model id — the value the \
          embedded submit handle carries"
     );
@@ -1607,7 +1606,7 @@ async fn training_status_model_id_matches_the_embedded_derived_id_before_complet
     );
     assert_eq!(
         embedded.output_model_id.as_deref(),
-        Some(start.model_id.as_str()),
+        Some(start.output_model_id.as_str()),
         "the generalised `jobs` schema stamps output_model_id at SUBMIT time \
          (`SubmitJobParams::output_model_id`, C1b/N8), not at finish — so the row \
          already carries the deterministic id `StartTraining` returned, even \
@@ -1616,13 +1615,13 @@ async fn training_status_model_id_matches_the_embedded_derived_id_before_complet
          must still byte-equal the embedded attach handle's independently-derived id"
     );
     assert_eq!(
-        wire.model_id,
+        wire.output_model_id,
         embedded_attach_model_id(&server, &start.job_id).await,
         "K4: TrainingStatus.model_id must BYTE-EQUAL the id the embedded attach \
          handle derives for the same job at the same pre-completion state"
     );
     assert_eq!(
-        wire.model_id, start.model_id,
+        wire.output_model_id, start.output_model_id,
         "the pre-completion wire id is the SAME deterministic id StartTraining \
          returned at submit time"
     );
@@ -1644,16 +1643,16 @@ async fn training_status_model_id_matches_the_embedded_derived_id_before_complet
     let (after, embedded_after) = wire_and_embedded(&mut client, &server, &start.job_id).await;
     assert_eq!(
         embedded_after.output_model_id.as_deref(),
-        Some(after.model_id.as_str()),
+        Some(after.output_model_id.as_str()),
         "at completion the wire id is the catalog's stamped output_model_id"
     );
     assert_eq!(
-        after.model_id, start.model_id,
+        after.output_model_id, start.output_model_id,
         "a completed job's wire id is still the submit-time id — the terminal \
          parity is unchanged by the pre-completion fix"
     );
     assert_eq!(
-        after.model_id,
+        after.output_model_id,
         embedded_attach_model_id(&server, &start.job_id).await,
         "K4 at the terminal state: the wire id and the embedded attach id agree"
     );
@@ -1701,14 +1700,14 @@ async fn training_status_model_id_is_derived_for_running_and_failed_rows() {
     )
     .await;
 
-    let mut client = TrainingServiceClient::new(channel(server.addr).await);
+    let mut client = JobServiceClient::new(channel(server.addr).await);
 
     for (job_id, status) in [
         ("model-id-running", "running"),
         ("model-id-failed", "failed"),
     ] {
         let resp = client
-            .training_status(TrainingStatusRequest {
+            .job_status(JobStatusRequest {
                 job_id: job_id.to_string(),
             })
             .await
@@ -1725,13 +1724,13 @@ async fn training_status_model_id_is_derived_for_running_and_failed_rows() {
              a derivation, not a relay"
         );
         assert_eq!(
-            resp.model_id,
+            resp.output_model_id,
             embedded_attach_model_id(&server, job_id).await,
             "K4: a '{status}' job's TrainingStatus.model_id must BYTE-EQUAL the \
              embedded attach handle's derived id"
         );
         assert!(
-            !resp.model_id.is_empty(),
+            !resp.output_model_id.is_empty(),
             "a '{status}' job names the model it produces (or would have \
              produced); the empty string was the divergence"
         );
@@ -1769,21 +1768,20 @@ async fn training_status_model_id_decodes_the_predictor_spec_before_completion()
         })
         .await
         .expect("set_tenant");
-    let mut client =
-        TrainingServiceClient::with_interceptor(channel(server.addr).await, session_iface);
+    let mut client = JobServiceClient::with_interceptor(channel(server.addr).await, session_iface);
 
     let start = client
-        .start_training(predictor_start_request())
+        .submit_job(predictor_start_request())
         .await
         .expect("start_training(context_predictor) under tenant scope")
         .into_inner();
     assert_eq!(
-        start.model_id, "ctx-predictor-wire",
+        start.output_model_id, "ctx-predictor-wire",
         "the predictor's model id is the caller-chosen id inside its spec"
     );
 
     let resp = client
-        .training_status(TrainingStatusRequest {
+        .job_status(JobStatusRequest {
             job_id: start.job_id.clone(),
         })
         .await
@@ -1820,15 +1818,203 @@ async fn training_status_model_id_decodes_the_predictor_spec_before_completion()
          pre-completion, not just re-derivable from the persisted spec"
     );
     assert_eq!(
-        resp.model_id, embedded_model_id,
+        resp.output_model_id, embedded_model_id,
         "K4: the predictor job's wire model_id must BYTE-EQUAL the id the \
          embedded attach handle resolves for the same job"
     );
     assert_eq!(
-        resp.model_id, "ctx-predictor-wire",
+        resp.output_model_id, "ctx-predictor-wire",
         "and that id is the caller-chosen one, never a jammi:fine-tuned: id \
          derived from the job id"
     );
+
+    let _ = server.shutdown.send(());
+    let _ = server.handle.await;
+}
+
+// ─── PLAN-C §3 acceptance: idempotency, WaitJob, cross-tenant NOT_FOUND ──────
+
+/// A second `SubmitJob` carrying the same non-empty `idempotency_key` as a
+/// still-known prior submission returns THAT job's handle unchanged — never a
+/// second, independent job row. Two DISTINCT keys still each mint their own
+/// job, proving the dedupe is keyed on the value, not a blanket "second call
+/// always echoes the first" bug.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn submit_job_with_the_same_idempotency_key_returns_the_same_handle() {
+    let server = start_engine_server().await;
+    add_training_source(
+        channel(server.addr).await,
+        None::<fn(tonic::Request<()>) -> Result<tonic::Request<()>, tonic::Status>>,
+    )
+    .await;
+    let mut client = JobServiceClient::new(channel(server.addr).await);
+
+    let mut first_request = start_request();
+    first_request.idempotency_key = "idem-key-a".to_string();
+    let first = client
+        .submit_job(first_request.clone())
+        .await
+        .expect("first submit_job")
+        .into_inner();
+    assert!(!first.job_id.is_empty());
+
+    let second = client
+        .submit_job(first_request)
+        .await
+        .expect("second submit_job with the same idempotency_key")
+        .into_inner();
+    assert_eq!(
+        second.job_id, first.job_id,
+        "a second SubmitJob carrying the same idempotency_key must return the \
+         SAME job handle, not submit a duplicate job"
+    );
+    assert_eq!(second.kind, first.kind);
+    assert_eq!(second.output_model_id, first.output_model_id);
+
+    // A DIFFERENT key still mints its own, independent job.
+    let mut third_request = start_request();
+    third_request.idempotency_key = "idem-key-b".to_string();
+    let third = client
+        .submit_job(third_request)
+        .await
+        .expect("submit_job with a distinct idempotency_key")
+        .into_inner();
+    assert_ne!(
+        third.job_id, first.job_id,
+        "a DIFFERENT idempotency_key must mint its own job, not collide with \
+         the first key's"
+    );
+
+    let _ = server.shutdown.send(());
+    let _ = server.handle.await;
+}
+
+/// `WaitJob` streams progress frames and ends the stream with exactly one
+/// terminal `Done` frame once the job completes — never hanging past the
+/// terminal state, never emitting a second frame after `Done`.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn wait_job_streams_to_exactly_one_terminal_frame() {
+    use jammi_server::grpc::proto::job::{job_event::Event, JobHandle};
+
+    let server = start_engine_server().await;
+    add_training_source(
+        channel(server.addr).await,
+        None::<fn(tonic::Request<()>) -> Result<tonic::Request<()>, tonic::Status>>,
+    )
+    .await;
+    let mut client = JobServiceClient::new(channel(server.addr).await);
+
+    let start = client
+        .submit_job(start_request())
+        .await
+        .expect("submit_job")
+        .into_inner();
+
+    let mut stream = client
+        .wait_job(JobHandle {
+            job_id: start.job_id.clone(),
+        })
+        .await
+        .expect("wait_job")
+        .into_inner();
+
+    let mut done_frames = 0usize;
+    let mut terminal_status = None;
+    // Bounded so a wedged stream fails the test instead of hanging forever.
+    for _ in 0..600 {
+        let Some(frame) = tokio::time::timeout(Duration::from_millis(500), stream.message())
+            .await
+            .expect("wait_job stream produced a frame within the timeout")
+            .expect("wait_job stream frame")
+        else {
+            break; // stream closed
+        };
+        match frame.event {
+            Some(Event::Done(done)) => {
+                done_frames += 1;
+                terminal_status = Some(done.status);
+            }
+            Some(Event::Progress(_)) => {}
+            None => panic!("WaitJob frame carries neither progress nor done"),
+        }
+    }
+    assert_eq!(
+        done_frames, 1,
+        "WaitJob must end with exactly one terminal Done frame"
+    );
+    assert_eq!(terminal_status.as_deref(), Some("completed"));
+
+    let _ = server.shutdown.send(());
+    let _ = server.handle.await;
+}
+
+/// `JobStatus` for a job submitted under tenant A, read back under tenant B's
+/// scope, is `NOT_FOUND` — never `PERMISSION_DENIED` (the row's existence is
+/// not leaked to a peer tenant), matching every other tenant-scoped read in
+/// this codebase (`tenant_isolation_oracle.rs`'s convention).
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn job_status_across_tenants_is_not_found_not_permission_denied() {
+    use jammi_server::grpc::proto::catalog::catalog_service_client::CatalogServiceClient;
+    use jammi_server::grpc::proto::catalog::{SetTenantRequest, Tenant};
+
+    let server = start_engine_server().await;
+
+    let session_a = with_session("cross-tenant-job-status-a");
+    let mut session_a_catalog =
+        CatalogServiceClient::with_interceptor(channel(server.addr).await, session_a.clone());
+    session_a_catalog
+        .set_tenant(SetTenantRequest {
+            tenant: Some(Tenant {
+                id: TENANT_A.into(),
+            }),
+        })
+        .await
+        .expect("set_tenant A");
+    add_training_source(channel(server.addr).await, Some(session_a.clone())).await;
+
+    let mut client_a = JobServiceClient::with_interceptor(channel(server.addr).await, session_a);
+    let start = client_a
+        .submit_job(start_request())
+        .await
+        .expect("submit_job under tenant A")
+        .into_inner();
+
+    let session_b = with_session("cross-tenant-job-status-b");
+    let mut session_b_catalog =
+        CatalogServiceClient::with_interceptor(channel(server.addr).await, session_b.clone());
+    session_b_catalog
+        .set_tenant(SetTenantRequest {
+            tenant: Some(Tenant {
+                id: TENANT_B.into(),
+            }),
+        })
+        .await
+        .expect("set_tenant B");
+
+    let mut client_b = JobServiceClient::with_interceptor(channel(server.addr).await, session_b);
+    let err = client_b
+        .job_status(JobStatusRequest {
+            job_id: start.job_id.clone(),
+        })
+        .await
+        .expect_err("tenant B must not read tenant A's job status");
+    assert_eq!(
+        err.code(),
+        tonic::Code::NotFound,
+        "cross-tenant JobStatus must be NOT_FOUND, never PERMISSION_DENIED \
+         (the row's existence must not be leaked to a peer tenant); got {:?}",
+        err.code()
+    );
+
+    // The owning tenant reads it fine.
+    let own = client_a
+        .job_status(JobStatusRequest {
+            job_id: start.job_id.clone(),
+        })
+        .await
+        .expect("tenant A reads its own job status")
+        .into_inner();
+    assert!(!own.status.is_empty());
 
     let _ = server.shutdown.send(());
     let _ = server.handle.await;

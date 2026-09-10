@@ -14,15 +14,26 @@
 # ignored. Order does not matter (the test compares as sets); kept sorted for a
 # readable diff.
 
-# --- the ten jammi.v1.* wire packages (the wire contract) ---
+# --- the eleven jammi.v1.* wire packages (the wire contract) ---
 PACKAGE jammi.v1.audit
 PACKAGE jammi.v1.catalog
 PACKAGE jammi.v1.embedding
 PACKAGE jammi.v1.error
 PACKAGE jammi.v1.eval
 PACKAGE jammi.v1.inference
+# ADDED (additive, minor-compatible, PLAN-C §3): the durable job queue's own
+# envelope package (SubmitJob/JobStatus/WaitJob/ListJobs/CancelJob/
+# ListWorkers/PruneJobs). Imports the surviving `jammi.v1.training` spec
+# vocabulary (FineTuneSpec/GraphFineTuneSpec/ContextPredictorSpec/
+# FineTuneConfig) rather than duplicating it.
+PACKAGE jammi.v1.job
 PACKAGE jammi.v1.lifecycle
 PACKAGE jammi.v1.pipeline
+# The `TrainingService` rpc paths below are REMOVED (folded into
+# `jammi.v1.job.JobService` — see api-stability.md's amendment) but this
+# package name survives: it still carries the training spec message
+# vocabulary (`FineTuneSpec`/`GraphFineTuneSpec`/`ContextPredictorSpec`/
+# `FineTuneConfig`/…) `JobService.SubmitJob`'s oneof imports.
 PACKAGE jammi.v1.training
 PACKAGE jammi.v1.trigger
 
@@ -73,6 +84,18 @@ RPC EvalService/EvalInference
 RPC EvalService/EvalPerQuery
 RPC InferenceService/Infer
 RPC InferenceService/Predict
+# ADDED (additive, minor-compatible, PLAN-C §3): JobService replaces
+# TrainingService — StartTraining folds into SubmitJob, TrainingStatus into
+# JobStatus, ListTrainingJobs into ListJobs. WaitJob (resumable server-stream
+# wait), CancelJob, ListWorkers, and PruneJobs are new (Breaking: see
+# CHANGELOG and api-stability.md's amendment).
+RPC JobService/CancelJob
+RPC JobService/JobStatus
+RPC JobService/ListJobs
+RPC JobService/ListWorkers
+RPC JobService/PruneJobs
+RPC JobService/SubmitJob
+RPC JobService/WaitJob
 RPC LifecycleService/ApplyLicense
 RPC LifecycleService/Bootstrap
 RPC LifecycleService/Login
@@ -82,8 +105,5 @@ RPC PipelineService/AssembleContext
 RPC PipelineService/BuildNeighborGraph
 RPC PipelineService/PropagateEmbeddings
 RPC PipelineService/Recompute
-RPC TrainingService/ListTrainingJobs
-RPC TrainingService/StartTraining
-RPC TrainingService/TrainingStatus
 RPC TriggerService/Publish
 RPC TriggerService/Subscribe

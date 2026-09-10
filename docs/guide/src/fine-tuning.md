@@ -459,6 +459,6 @@ cheapest to try:
   `batch_size`, or trade batch size for `gradient_accumulation_steps`. (2) A
   smaller `max_seq_length`.
 
-For a fine-tune job whose failure was classified this way, `jammi train
+For a fine-tune job whose failure was classified this way, `jammi jobs
 status` (and the Python `job.status()`) surfaces the rewritten message
 directly, so you don't need to read raw driver output to find the fix.

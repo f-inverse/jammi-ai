@@ -1,7 +1,7 @@
 //! Server-receive helpers shared by the engine-backed gRPC services: the
 //! control-plane `CatalogService` (sources / models / channels / mutable tables
 //! / topic admin) and the data-plane `EmbeddingService`, `InferenceService`,
-//! `EvalService`, `TrainingService`, `AuditService`, and `TriggerService`
+//! `EvalService`, `JobService`, `AuditService`, and `TriggerService`
 //! publish/subscribe verbs.
 //!
 //! These are transport concerns that belong on the receive side, not wire

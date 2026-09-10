@@ -85,7 +85,7 @@ async fn open_local_yields_a_working_embedded_session() {
 // embedded binding, and the Rust SDK front door all decide "does THIS process
 // claim training jobs?" by reading the SAME configuration key — not by three
 // private conventions. The server arm is proven in
-// `crates/jammi-server/tests/it/grpc_training.rs`
+// `crates/jammi-server/tests/it/grpc_job.rs`
 // (`worker_{disabled,enabled}_*`) and the Python arm in
 // `crates/jammi-python`; these are the Rust SDK arm's peers, driven through the
 // SAME `jammi.toml` -> `JammiConfig::load` path a real embedding binary takes,

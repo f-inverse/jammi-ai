@@ -1708,7 +1708,7 @@ enum WorkerJobError {
 /// `poll_until_terminal` (`jammi-python/src/job.rs`) — so those two surfaces
 /// each apply the prefix exactly once, on read. Two OTHER surfaces read the
 /// same durable `error_message` unprefixed and never re-wrap it: the gRPC
-/// `TrainingStatus.error` field (`jammi-server/src/grpc/training.rs`) and
+/// `JobStatus.error` field (`jammi-server/src/grpc/job.rs`) and
 /// the Python `Database.list_training_jobs`/`get_training_job` `error` entry
 /// (`jammi-python/src/database.rs`) both relay the raw column verbatim.
 /// Storing `e.to_string()` unconditionally for a `FineTune`-typed source

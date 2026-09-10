@@ -5,7 +5,7 @@
 //! * A **serve-only** deployment (core tier only) advertises `services =
 //!   ["core"]` and mounts no eval verbs; reaching `EvalService` is a truthful
 //!   `Unimplemented`, never a misleading success. Job submission is core, so
-//!   the same serve-only deployment DOES answer `TrainingService` — whether
+//!   the same serve-only deployment DOES answer `JobService` — whether
 //!   it also runs those jobs is `[worker] enabled`, not a tier.
 //! * A **core + eval** deployment advertises both and the same eval verb is
 //!   reachable (it fails on its *arguments*, not because the service is
@@ -26,9 +26,9 @@ use jammi_server::grpc::proto::catalog::catalog_service_client::CatalogServiceCl
 use jammi_server::grpc::proto::eval::eval_service_client::EvalServiceClient;
 use jammi_server::grpc::proto::eval::EvalPerQueryRequest;
 use jammi_server::grpc::proto::inference::ModelTask;
-use jammi_server::grpc::proto::training::start_training_request::Spec;
-use jammi_server::grpc::proto::training::training_service_client::TrainingServiceClient;
-use jammi_server::grpc::proto::training::{FineTuneMethod, FineTuneSpec, StartTrainingRequest};
+use jammi_server::grpc::proto::job::job_service_client::JobServiceClient;
+use jammi_server::grpc::proto::job::{submit_job_request::Spec, SubmitJobRequest};
+use jammi_server::grpc::proto::training::{FineTuneMethod, FineTuneSpec};
 use jammi_server::tiers::{ServiceTier, TierSet};
 
 use super::common::grpc::{channel, start_engine_server_with_tiers};
@@ -44,11 +44,11 @@ fn eval_probe_request() -> EvalPerQueryRequest {
     }
 }
 
-/// A StartTraining request the *engine* rejects on its arguments (unspecified
-/// method). `TrainingService` is core, so this returns `InvalidArgument` on
+/// A SubmitJob request the *engine* rejects on its arguments (unspecified
+/// method). `JobService` is core, so this returns `InvalidArgument` on
 /// EVERY deployment — the verb ran — never `Unimplemented`.
-fn training_probe_request() -> StartTrainingRequest {
-    StartTrainingRequest {
+fn training_probe_request() -> SubmitJobRequest {
+    SubmitJobRequest {
         spec: Some(Spec::FineTune(FineTuneSpec {
             source: "training".into(),
             columns: vec!["text_a".into(), "text_b".into(), "score".into()],
@@ -57,6 +57,7 @@ fn training_probe_request() -> StartTrainingRequest {
         })),
         base_model: "local:does-not-matter".into(),
         config: None,
+        idempotency_key: String::new(),
     }
 }
 
@@ -99,22 +100,22 @@ async fn serve_only_advertises_core_and_rejects_eval_verb_as_unimplemented() {
 }
 
 /// Job submission is core: a serve-only deployment (no optional tiers) still
-/// mounts `TrainingService`, so the same probe is rejected on its ARGUMENTS
+/// mounts `JobService`, so the same probe is rejected on its ARGUMENTS
 /// here — the verb ran. Whether this process runs the job it accepted is the
-/// `[worker] enabled` key (`grpc_training.rs` proves that knob), not a tier.
+/// `[worker] enabled` key (`grpc_job.rs` proves that knob), not a tier.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn serve_only_still_mounts_the_job_submission_verb() {
     let server = start_engine_server_with_tiers(TierSet::resolve(std::iter::empty())).await;
 
-    let mut client = TrainingServiceClient::new(channel(server.addr).await);
+    let mut client = JobServiceClient::new(channel(server.addr).await);
     let err = client
-        .start_training(training_probe_request())
+        .submit_job(training_probe_request())
         .await
         .expect_err("the engine rejects the unspecified method");
     assert_eq!(
         err.code(),
         tonic::Code::InvalidArgument,
-        "TrainingService is core: the error is the engine's argument check on \
+        "JobService is core: the error is the engine's argument check on \
          every deployment, never an unmounted-service Unimplemented"
     );
 

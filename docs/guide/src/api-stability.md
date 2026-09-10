@@ -47,7 +47,7 @@ would carry elsewhere.
 
 ### 2. The wire contract — `package jammi.v1.*`
 
-The gRPC/Flight SQL wire surface is the ten `jammi.v1.*` proto packages (nine
+The gRPC/Flight SQL wire surface is the eleven `jammi.v1.*` proto packages (ten
 served by the OSS engine; `jammi.v1.lifecycle` is a **contract-only** surface —
 defined in the wire descriptor so the candle-free client can call a platform
 server that implements it, but answered by no OSS handler):
@@ -60,9 +60,10 @@ server that implements it, but answered by no OSS handler):
 | `jammi.v1.error` | the typed wire-error message (no rpcs) |
 | `jammi.v1.eval` | the evaluation rpcs |
 | `jammi.v1.inference` | bulk inference + predict |
+| `jammi.v1.job` | the durable job queue: submit / status / wait / list / cancel / list-workers / prune (`JobService`, PLAN-C §3) |
 | `jammi.v1.lifecycle` | license apply / bootstrap / status / login — **contract-only**, answered by a platform server (the OSS engine returns `UNIMPLEMENTED`) |
 | `jammi.v1.pipeline` | graph / context / as-of / recompute / materialization rpcs |
-| `jammi.v1.training` | training submit + status |
+| `jammi.v1.training` | the training spec message vocabulary `JobService.SubmitJob`'s oneof carries (`FineTuneSpec`/`GraphFineTuneSpec`/`ContextPredictorSpec`/`FineTuneConfig`/…) — no rpcs of its own since `TrainingService` folded into `JobService` |
 | `jammi.v1.trigger` | topic publish + subscribe |
 
 The contract is the full set of `(Service, Method)` rpc paths these packages
@@ -112,6 +113,23 @@ Concretely:
 - A persisted-format version is bumped only when the layout changes; the
   reject-newer guard then makes an old reader fail loud rather than misparse, and
   the recovery is to re-emit (see [Format Stability](./format-stability.md)).
+
+**Pre-1.0 amendment (PLAN-C §3).** Until the 1.0 release, the `jammi.v1` wire
+contract may still change — including a genuinely breaking rpc rename or
+removal — when BOTH of the following hold in the same PR: the frozen baseline
+(`crates/jammi-server/tests/it/api_freeze_baseline.txt`) is updated to match
+the new live surface, and the CHANGELOG carries an explicit **Breaking**
+entry describing the change and its migration. The freeze-guard test still
+enforces that the live surface and the committed baseline agree exactly — the
+amendment relaxes only WHICH edits to the baseline are allowed pre-1.0 (an
+announced breaking edit, not a silent one), never the mechanism that catches
+an *unannounced* divergence. The following release then bumps the **minor**
+version rather than the major — the terminal-0.x window is itself the
+"stabilizing" period the eventual 1.0 major bump closes. `TrainingService`
+folding into `JobService` (`StartTraining`→`SubmitJob`,
+`TrainingStatus`→`JobStatus`, `ListTrainingJobs`→`ListJobs`, plus new
+`WaitJob`/`CancelJob`/`ListWorkers`/`PruneJobs`) is the first change to ship
+under this amendment.
 
 ## Experimental surfaces
 

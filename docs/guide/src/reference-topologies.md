@@ -241,7 +241,7 @@ training claim loop onto its own replica uses the existing service-tier
 mechanism (see [Service tiers](./deploy-server.md#service-tiers)) — narrow
 every query-tier replica's `[server] services` to exclude `train`, and give
 the GPU-node Deployment `services = ["train"]` (`JAMMI_SERVER__SERVICES=train`)
-so only it runs `TrainingService`'s claim loop against the shared catalog.
+so only it runs the job worker's claim loop (`[worker] enabled`) against the shared catalog.
 
 ```yaml
 # sketch: a second Deployment, GPU variant, GPU-node-scheduled -- the compute

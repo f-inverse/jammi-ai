@@ -1,0 +1,260 @@
+syntax = "proto3";
+
+package jammi.v1.job;
+
+import "jammi/v1/training.proto";
+
+// JobService — the wire surface over the engine's durable job queue
+// (`jobs`/`instances`/`workers`, migration 029; `jammi_ai::jobs`).
+//
+// `SubmitJob`, `JobStatus`, `WaitJob`, `ListJobs`, `CancelJob`, and
+// `ListWorkers` are imperative session methods, not SQL queries, so they live
+// as typed gRPC RPCs alongside CatalogService / EmbeddingService /
+// InferenceService / PipelineService / EvalService rather than on the Flight
+// SQL surface (which carries query/result only, per ADR-01 §3.2).
+//
+// `JobService` replaces `TrainingService` (PLAN-C §3): `StartTraining` folds
+// into `SubmitJob`, `TrainingStatus` into `JobStatus`, `ListTrainingJobs` into
+// `ListJobs`. It generalises the training-only queue into a kind-agnostic
+// durable job abstraction every compute verb submits through — `SubmitJob`
+// itself still carries only the three training-kind spec variants (the
+// `oneof`), since every other compute verb keeps its own dedicated request
+// message on its own service and returns a `SubmitJobResponse` in place of its
+// former synchronous result (K4: the terminal payload a caller reads back via
+// `JobStatus`/`WaitJob` is byte-identical to what the embedded, synchronous
+// `run_now` path returns for the same spec). The service reimplements no
+// training, LoRA, sampling, scan, or compute-verb logic; it is purely a wire
+// adapter over `jammi_ai::jobs`.
+//
+// Tenant scope is read from the request's `SessionTenant` extension, set by
+// the single async tenant-binding layer driven by the engine's
+// `TenantResolver` (default: the `jammi-session-id` header → shared session
+// store) — the one mechanism every gRPC service and Flight SQL bind through.
+// A job row carries the submitting tenant; a peer names an unresolvable job
+// id — `JobStatus`/`WaitJob`/`CancelJob` answer `NOT_FOUND`, never
+// `PERMISSION_DENIED` (matching every other tenant-scoped read in this
+// codebase — a wrong tenant learns nothing about whether the id exists at
+// all). `ListWorkers` reports process/fleet liveness, not a tenant-owned
+// resource, so it carries no per-tenant filter (control-plane allowlisted in
+// `tenant_isolation_oracle.rs`, alongside `GetServerInfo`).
+service JobService {
+  // Submit a training job (`fine_tune` / `graph_fine_tune` /
+  // `context_predictor`) and return its durable handle. The job is always
+  // accepted and stays `queued` until a worker claims it (or, embedded-side,
+  // until `run_now` claims and executes it inline) — there is no `NoWorker`
+  // refusal. `output_model_id` is populated via the same `resolve_model_id`
+  // rule the embedded `TrainingJob` handle uses, so a remote caller reads the
+  // byte-identical deterministic id at submit time. A second `SubmitJob` call
+  // carrying the same `idempotency_key` (when non-empty) returns the handle
+  // of the job that key first created rather than submitting a duplicate.
+  rpc SubmitJob(SubmitJobRequest) returns (SubmitJobResponse);
+
+  // Read a job's current status by id: lifecycle status, kind, progress,
+  // failure message, and — once terminal — the tagged result and (for a
+  // training kind) the acceleration-report blob. Peer of reading back the
+  // embedded `JobHandle`.
+  rpc JobStatus(JobStatusRequest) returns (JobStatusResponse);
+
+  // Stream status updates for one job until it reaches a terminal state, then
+  // end the stream after emitting the terminal frame. Polls the job row every
+  // 100ms server-side; a client disconnect ends only that wait (the job keeps
+  // running) — reconnecting with the same job id resumes the wait and, if the
+  // job has already gone terminal, immediately receives the same terminal
+  // frame `JobStatus` would report.
+  rpc WaitJob(JobHandle) returns (stream JobEvent);
+
+  // List jobs visible to the session tenant, most recent first. Each row is
+  // the same lifecycle projection `JobStatus` reads (status, kind, output
+  // model id, failure error) plus the submit-time identity (base model,
+  // creation time) — a listing of `JobStatus` answers, not a progress
+  // surface.
+  rpc ListJobs(ListJobsRequest) returns (ListJobsResponse);
+
+  // Request cancellation of a job by id. Idempotent: cancelling an
+  // already-terminal or already-cancel-requested job still returns
+  // successfully (`cancelled = false` when the request had no effect — the
+  // job was already terminal). The executor checks the flag at its next
+  // checkpoint; cancellation is therefore cooperative, not immediate.
+  rpc CancelJob(CancelJobRequest) returns (CancelJobResponse);
+
+  // List the engine processes currently running the claim loop
+  // (`[worker] enabled = true`), most recently seen first. Fleet/liveness
+  // metadata, not a tenant-owned resource — see the service doc.
+  rpc ListWorkers(ListWorkersRequest) returns (ListWorkersResponse);
+
+  // Eagerly delete terminal (`completed`/`failed`) job rows older than the
+  // deployment's `[jobs] retention_days` — the same sweep the construction
+  // sweep and the worker loop already run in the background (PLAN-C §1);
+  // this RPC only makes that sweep runnable on demand (e.g. `jammi jobs
+  // prune`). A global maintenance action over the deployment's own retention
+  // window, not a tenant-owned resource — see the service doc.
+  rpc PruneJobs(PruneJobsRequest) returns (PruneJobsResponse);
+}
+
+// The training-kind spec `oneof` `SubmitJob` accepts, plus the client-supplied
+// dedupe key. Mirrors the engine's `TrainingSpec` enum variant-for-variant,
+// field-for-field: a decoded request reconstructs the identical engine spec,
+// so a remote-submitted job is byte-identical to one submitted in-process.
+message SubmitJobRequest {
+  oneof spec {
+    jammi.v1.training.FineTuneSpec fine_tune = 1;
+    jammi.v1.training.GraphFineTuneSpec graph_fine_tune = 2;
+    jammi.v1.training.ContextPredictorSpec context_predictor = 3;
+  }
+  // Base encoder to adapt for the two LoRA fine-tune kinds (`local:<path>`, an
+  // HF repo id, or a fine-tuned id). Unused by the context-predictor kind (it
+  // names its source's embedding model implicitly), so it is empty there.
+  string base_model = 4;
+  // Optional fine-tune hyperparameters for the two LoRA fine-tune kinds; unset
+  // applies the engine's defaults. Unused by the context-predictor kind (its
+  // budget rides inside `predictor_spec`).
+  optional jammi.v1.training.FineTuneConfig config = 5;
+  // Optional caller-supplied dedupe key, scoped to the session tenant. A
+  // second `SubmitJob` carrying the same non-empty key as a still-known prior
+  // submission returns that prior job's handle unchanged rather than
+  // submitting a duplicate row. Empty (the default) submits unconditionally,
+  // matching every pre-existing caller. The dedupe window is this server
+  // process's lifetime, not a durable catalog guarantee — a process restart
+  // forgets prior keys, so a caller that needs a cross-restart guarantee must
+  // still reconcile by listing/reading back before retrying.
+  string idempotency_key = 6;
+}
+
+message SubmitJobResponse {
+  // Server-assigned job id. Read status with `JobStatus`/`WaitJob`.
+  string job_id = 1;
+  // The `jobs.kind` tag this job submitted under (e.g. `"fine_tune"`).
+  string kind = 2;
+  // The deterministic output model id the trained artifact registers under —
+  // resolved via the same rule the embedded `TrainingJob::model_id` uses.
+  // Empty for a compute kind (no training kinds ever compute this).
+  string output_model_id = 3;
+}
+
+// A job's identity, for `WaitJob` and `CancelJob`.
+message JobHandle {
+  string job_id = 1;
+}
+
+message JobStatusRequest {
+  string job_id = 1;
+}
+
+// A job's progress, updated at producer checkpoint boundaries. Field presence
+// distinguishes "no progress recorded yet" from a legal `0`.
+message JobProgress {
+  optional uint64 rows_done = 1;
+  optional uint64 rows_total = 2;
+  string phase = 3;
+}
+
+// A training kind's terminal model result.
+message ModelResult {
+  string model_id = 1;
+  string artifact_path = 2;
+  // Run-metrics JSON, present once the run recorded any (issue #441).
+  optional string metrics_json = 3;
+}
+
+// A compute kind's terminal result-table result.
+message TableResult {
+  string table = 1;
+  // `"computed"`, or `"reused:{table}"` for an exact cache hit.
+  string cache_outcome = 2;
+}
+
+message JobStatusResponse {
+  // Current lifecycle status: "queued", "running", "completed", or "failed".
+  string status = 1;
+  // The `jobs.kind` tag this job submitted under.
+  string kind = 2;
+  JobProgress progress = 3;
+  // The failure message when `status` is "failed"; empty otherwise.
+  string error = 4;
+  // The output model id the trained artifact registers under, resolved the
+  // same way `SubmitJobResponse.output_model_id` is; empty for a compute
+  // kind (never populated).
+  string output_model_id = 5;
+  // The tagged terminal result. Unset until `status` is "completed".
+  oneof result {
+    ModelResult model = 6;
+    TableResult table = 7;
+  }
+  // GPU-acceleration determination for this job, as an opaque, self-describing
+  // JSON object — the SAME blob the catalog's `jobs.acceleration_report`
+  // column carries (esc-075). Field presence (not the empty string)
+  // distinguishes "no column value" from an already-recorded blob.
+  optional string acceleration_report_json = 8;
+}
+
+// One frame of a `WaitJob` stream: either an in-flight progress update or the
+// terminal `JobStatusResponse` — after which the stream ends.
+message JobEvent {
+  oneof event {
+    JobProgress progress = 1;
+    JobStatusResponse done = 2;
+  }
+}
+
+message ListJobsRequest {}
+
+message ListJobsResponse {
+  repeated JobSummary jobs = 1;
+}
+
+// One job's lifecycle summary: the `JobStatus` projection plus the
+// submit-time identity fields a listing needs to tell jobs apart.
+message JobSummary {
+  string job_id = 1;
+  // The `jobs.kind` tag this job submitted under.
+  string kind = 2;
+  string status = 3;
+  // The base model a training kind trains from — the catalog's registered
+  // model id (PK-keyed). Empty for a compute kind.
+  string base_model_id = 4;
+  // The output model id the trained artifact registers under; empty until a
+  // training kind completes, and always empty for a compute kind.
+  string output_model_id = 5;
+  // Job creation time, as recorded by the catalog (UTC text timestamp).
+  string created_at = 6;
+  string error = 7;
+}
+
+message CancelJobRequest {
+  string job_id = 1;
+}
+
+message CancelJobResponse {
+  // `false` when the job was already terminal or absent — cancellation had
+  // no effect.
+  bool cancelled = 1;
+}
+
+message ListWorkersRequest {}
+
+message ListWorkersResponse {
+  repeated WorkerSummary workers = 1;
+}
+
+// One process currently running the claim loop, joined from `instances` +
+// `workers` (migration 029).
+message WorkerSummary {
+  // The process's minted-at-construction uuid.
+  string instance_id = 1;
+  // `JAMMI_WORKER_ID`, non-unique — an operator-chosen label, empty when
+  // unset.
+  string label = 2;
+  string host = 3;
+  // The `[worker] kinds` configuration this process claims: `"all"` or a
+  // comma-joined kind list.
+  string kinds = 4;
+  string started_at = 5;
+  string last_seen_at = 6;
+}
+
+message PruneJobsRequest {}
+
+message PruneJobsResponse {
+  // Count of terminal job rows deleted by this call.
+  uint64 jobs_deleted = 1;
+}

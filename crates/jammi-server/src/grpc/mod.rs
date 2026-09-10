@@ -5,7 +5,7 @@
 //! compute/stream services. The control plane is [`catalog::CatalogServer`] —
 //! one `CatalogService` holding every catalog / metadata / lifecycle /
 //! observability verb, including the tenant trio. The data plane is the
-//! per-capability services (embedding / inference / training / eval / pipeline /
+//! per-capability services (embedding / inference / job / eval / pipeline /
 //! trigger / audit). Both Flight SQL and the gRPC services share a
 //! [`session::SessionStore`] via the async tenant-binding layer
 //! ([`crate::tenant_resolver_layer`]) so a tenant
@@ -23,9 +23,9 @@ pub mod catalog;
 pub mod embedding;
 pub mod eval;
 pub mod inference;
+pub mod job;
 pub mod pipeline;
 pub mod session;
-pub mod training;
 pub mod trigger;
 pub mod wire;
 

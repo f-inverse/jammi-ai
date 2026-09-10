@@ -262,6 +262,26 @@ impl InferenceSession {
             .worker_intervals(self.inner.config().lease.intervals()?)
     }
 
+    /// Row-scoped on-read reclaim (PLAN-C §2): a caller that just read `record`
+    /// (e.g. `JobService`'s `JobStatus`/`WaitJob`/`ListJobs`) offers it here so
+    /// an expired lease is reaped inline with the read, without waiting for the
+    /// worker loop's or the construction sweep's next pass. Returns the
+    /// reclaimed row when this call performed a requeue-or-fail transition;
+    /// `None` when `record` needed no reclaim (not `running`, or a live
+    /// lease) — the caller keeps using its own `record` in that case. Shares
+    /// `crate::fine_tune::worker::MAX_ATTEMPTS` with the worker loop's own
+    /// `reclaim_expired_jobs` call so both reclaim paths apply the identical
+    /// attempts cap.
+    pub async fn reclaim_job_on_read(
+        &self,
+        record: &jammi_db::catalog::jobs_repo::JobRecord,
+    ) -> Result<Option<jammi_db::catalog::jobs_repo::JobRecord>> {
+        let lease = self.worker_intervals()?.lease;
+        self.catalog()
+            .reclaim_job_on_read(record, lease, crate::fine_tune::worker::MAX_ATTEMPTS)
+            .await
+    }
+
     /// Register the engine's compound-query SQL functions on this session's
     /// `SessionContext`, so SQL — in-process (`sql`) and over the Flight SQL
     /// lane alike — can call them.

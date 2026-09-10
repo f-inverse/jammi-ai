@@ -1160,9 +1160,9 @@ workspace ships every publishable crate at the same
   behavior-preserving rename for callers that never passed a job link).
   `Catalog::delete_model` gains a `retention_days: i64` parameter.
 - **The `train` cargo feature and the `train` service tier are removed (#485).**
-  `jammi-server` declares no `default` feature any more; `TrainingService`
-  (job submission and status) is core and mounts on every engine-backed
-  deployment, and `ServiceTier` is `Core` / `Event` / `Eval`. Whether a
+  `jammi-server` declares no `default` feature any more; the durable job
+  service (job submission and status) is core and mounts on every
+  engine-backed deployment, and `ServiceTier` is `Core` / `Event` / `Eval`. Whether a
   process *runs* the jobs it accepts is the `[worker] enabled` runtime key,
   not a tier and not a build feature: a request node runs `[worker] enabled
   = false`, a compute node runs `services = []` with `[worker] enabled =
@@ -1172,6 +1172,43 @@ workspace ships every publishable crate at the same
   `TierSet::all_compiled` is `TierSet::all`, `ServiceTier::compiled_in` and
   `TierError::FeatureNotCompiled` are gone, and `ChainParts::train_worker`
   is `ChainParts::worker`.
+- **`TrainingService` is replaced by `JobService` on the wire; compute-verb
+  clients gain a job-verb surface (#485, #486, PLAN-C §3; pre-1.0
+  amendment — see `docs/guide/src/api-stability.md`).**
+  `StartTraining`→`SubmitJob`, `TrainingStatus`→`JobStatus`,
+  `ListTrainingJobs`→`ListJobs`; `SubmitJob`'s oneof carries the same three
+  training-kind spec variants (`FineTuneSpec`/`GraphFineTuneSpec`/
+  `ContextPredictorSpec`, still defined in `jammi.v1.training`) plus a new
+  optional `idempotency_key` — a second `SubmitJob` carrying an
+  already-known non-empty key returns the SAME job handle rather than
+  submitting a duplicate (deduped for this server process's lifetime, not a
+  durable catalog guarantee). New rpcs: `WaitJob` (a resumable
+  server-streaming wait — server-side 100ms poll, ends at the terminal
+  frame, a client disconnect ends only the wait) and `CancelJob`,
+  `ListWorkers` (fleet/liveness over `instances`/`workers`), and
+  `PruneJobs` (the `[jobs] retention_days` sweep, runnable on demand).
+  `JobStatusResponse`/`JobSummary`/`JobEvent` generalise the former
+  `TrainingStatusResponse`/`TrainingJobSummary` shape across every job kind
+  (`kind`, `progress`, a `oneof result { ModelResult | TableResult }`
+  in place of the flat `model_id`/`metrics_json` fields — a training
+  kind's metrics now nest inside `result.model.metrics_json`); a
+  cross-tenant `JobStatus`/`WaitJob`/`CancelJob` is `NOT_FOUND`, never
+  `PERMISSION_DENIED` (the row's existence is not leaked). `jammi-admin`'s
+  `CatalogClient::{training_status, list_training_jobs}` are
+  `{job_status, list_jobs}` (plus new `cancel_job`/`list_workers`/
+  `prune_jobs`); `TrainingStatusInfo`/`TrainingJobSummary` are
+  `JobStatusInfo`/`JobSummary` (+ new `WorkerSummary`). `jammi-client`'s
+  `fine_tune`/`fine_tune_status`/`fine_tune_metrics`/
+  `fine_tune_acceleration_report` keep their signatures (now backed by
+  `JobService`) and gain `job_status`/`wait_job`/`cancel_job`/`list_jobs`.
+  `jammi train list/status` is `jammi jobs list/status/cancel/prune` +
+  `jammi workers list`. **Out of this unit's scope, tracked as a follow-up:**
+  the seven materializing compute verbs (`GenerateEmbeddings`,
+  `ImportEmbeddings`, `BuildNeighborGraph`, `PropagateEmbeddings`,
+  `AsofJoin`, `Recompute`, `Infer`) still return their existing per-verb
+  response synchronously rather than a `SubmitJobResponse` handle, and the
+  `[server.limits]` request-bounds/refusal-layer surface (§5) is not yet
+  implemented — see the escape row filed against this PR.
 - **Existing result-table and artifact object keys predating the tenant-prefixed layout
   are unattributed until the table is re-materialized (#484).** `reconcile`'s allowlist
   recognizes only `{seg}/{table}.parquet` and `models/{seg}/{job_id}/…` keys (`seg` a

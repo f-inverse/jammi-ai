@@ -271,7 +271,7 @@ vector built alongside each `add_service`.
 | `PipelineService` | when `engine.is_some()` (Core) |
 | `AuditService` | when `engine.is_some()` (Core) |
 | `EvalService` | engine + `ServiceTier::Eval` |
-| `TrainingService` | when `engine.is_some()` (Core — job submission; the embedded worker is spawned beside it iff `[worker] enabled`) |
+| `JobService` | when `engine.is_some()` (Core — durable job submission/status/wait; the embedded worker is spawned beside it iff `[worker] enabled`) |
 
 The `mounted` `Vec` itself is only a `tracing::info!` log line
 (`crates/jammi-server/src/runtime.rs`), not the wire advertisement. The handshake
@@ -313,7 +313,7 @@ RPCs (it also covers module functions `open_local`/`connect`, the pure-Python
 | `PipelineService` | `Recompute` | `grpc/pipeline.rs` (`PipelineService::recompute`) |
 | `AuditService` | `AuditLog`/`AuditFetchByQueryId`/`AuditFetchRecent` | `grpc/audit.rs` |
 | `EvalService` | `EvalEmbeddings`/`EvalPerQuery`/`EvalInference`/`EvalCompare`/`EvalCalibration` | `grpc/eval.rs` |
-| `TrainingService` | `StartTraining`/`TrainingStatus` | `grpc/training.rs` |
+| `JobService` | `SubmitJob`/`JobStatus`/`WaitJob`/`ListJobs`/`CancelJob`/`ListWorkers`/`PruneJobs` | `grpc/job.rs` |
 | `TriggerService` | `Publish`/`Subscribe` (server-stream) | `grpc/trigger.rs` |
 
 The point-in-time / materialization-contract surface (`VerifyMaterialization` on
@@ -495,7 +495,7 @@ Every trait/enum/base surface a maintainer extends, with anchors and invariants.
   `true` (default `true`); **not** the unconditional `with_embedded_worker`
   form. This is the SAME key the server's chain assembly and the Python embedded
   arm read before deciding whether THEIR process claims —
-  `worker.enabled` (`crates/jammi-server/src/runtime.rs:1153`) and
+  `worker.enabled` (`crates/jammi-server/src/runtime.rs:1154`) and
   `worker.enabled` (`crates/jammi-python/src/database.rs:98`) — so a wire
   deployment and an in-process one answer "does THIS process claim?"
   identically rather than by three private conventions. `Target`
@@ -3461,8 +3461,9 @@ proto→engine map lives **once** in Rust (`jammi_ai::wire`). The PyO3 layer is 
    façade), delegating to `InferenceSession`. Server handlers and the embedded binding both
    call `Session`/`InferenceSession`, **never** a hand-rolled path. (Training is special: a
    *single* dispatch `InferenceSession::run_training_spec`
-   (`crates/jammi-ai/src/session.rs`) is shared by the gRPC `StartTraining` handler and the
-   embedded binding — add new `TrainingSpec` handling there, not in two places.)
+   (`crates/jammi-ai/src/session.rs`) is shared by the gRPC `JobService::submit_job`
+   handler and the embedded binding — add new `TrainingSpec` handling there, not in two
+   places.)
 
 4. **Server handler.** `crates/jammi-server/src/grpc/<svc>.rs`, fixed shape — copy
    `InferenceServer::infer` (`crates/jammi-server/src/grpc/inference.rs`):

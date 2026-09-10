@@ -10,8 +10,8 @@
 //!   `CatalogService` (the tenant trio + the `GetServerInfo` handshake, plus the
 //!   sources / models / channels / mutable-tables / topic-admin catalog verbs),
 //!   `EmbeddingService`, `InferenceService`, `PipelineService`, `AuditService`,
-//!   and `TrainingService` — the job submission surface (`StartTraining` /
-//!   `TrainingStatus`). These are the serve-path primitives every deployment
+//!   and `JobService` — the durable job submission/status/wait surface
+//!   (`SubmitJob` / `JobStatus` / `WaitJob`). These are the serve-path primitives every deployment
 //!   needs: bind a tenant, embed, infer, read result/mutable tables, observe
 //!   channel state, read audit records, submit a job and read its status.
 //!   There is no useful Jammi server without them.

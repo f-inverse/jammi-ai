@@ -22,11 +22,11 @@ mod grpc_remote_session;
 // grpc_remote_session.rs's CPU bitwise remote-vs-local assertion. Same gating
 // as grpc_embedding_gpu above: compiled only under `live-gpu-tests`, skips
 // cleanly without a visible GPU.
+mod grpc_job;
 #[cfg(feature = "live-gpu-tests")]
 mod grpc_remote_session_gpu;
 mod grpc_session;
 mod grpc_tracing_span;
-mod grpc_training;
 mod grpc_trigger;
 mod grpc_web;
 mod health;

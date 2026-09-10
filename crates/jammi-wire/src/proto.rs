@@ -30,6 +30,9 @@ pub mod pipeline {
 pub mod training {
     tonic::include_proto!("jammi.v1.training");
 }
+pub mod job {
+    tonic::include_proto!("jammi.v1.job");
+}
 pub mod audit {
     tonic::include_proto!("jammi.v1.audit");
 }

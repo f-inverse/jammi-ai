@@ -285,7 +285,7 @@ async fn remote_eval_reconstructs_the_exact_error_variant() {
 /// (deferred-error) contract: submit returns `Ok` from either transport, and
 /// the worker drives the job to `failed` whichever transport submitted it.
 ///
-/// `TrainingStatus` now carries the worker's failure `error` (and the output
+/// `JobStatus` now carries the worker's failure `error` (and the output
 /// `model_id`) alongside the status string, so a remote `wait()` can surface the
 /// failure reason — see the pure-Python `RemoteTrainingJob.wait`, which raises
 /// `TrainingError` with that wire message, and the verb-parity coverage in
@@ -422,7 +422,7 @@ async fn remote_fine_tune_status_reconstructs_the_exact_error_variant() {
 }
 
 /// The contrastive columns the engine detects as `(text_a, text_b, score)`
-/// training data (mirrors `grpc_training.rs`'s fixture).
+/// training data (mirrors `grpc_job.rs`'s fixture).
 fn training_pairs_columns() -> Vec<String> {
     vec!["text_a".into(), "text_b".into(), "score".into()]
 }
@@ -447,12 +447,12 @@ async fn add_training_pairs(session: &Session) {
 /// embedded surface reads the catalog's `training_jobs.metrics` column
 /// directly (the same read `jammi-python`'s `TrainingJob.metrics()`
 /// performs); the remote surface reads it back through the NEW
-/// `TrainingStatus.metrics_json` wire field.
+/// `JobStatus`'s result.model.metrics_json wire field.
 ///
 /// THE byte-equality parity oracle is the SAME-JOB comparison: this test
 /// submits `remote_job` once and reads its metrics back through two
 /// independent paths — the data-plane `DataClient::fine_tune_metrics` and the
-/// control-plane `CatalogClient::training_status` — and asserts those two
+/// control-plane `CatalogClient::job_status` — and asserts those two
 /// reads decode byte-identical `metrics_json`. Any divergence there is
 /// unambiguously the wire adapter's fault, not the engine's, because both
 /// reads observe the one job's one stored blob.
@@ -583,7 +583,7 @@ async fn remote_fine_tune_metrics_round_trips_like_local() {
         })
     };
 
-    // Remote read: the new `TrainingStatus.metrics_json` wire field.
+    // Remote read: the new `JobStatus`'s result.model.metrics_json wire field.
     let remote_metrics_json = remote
         .fine_tune_metrics(&remote_job)
         .await
@@ -592,19 +592,19 @@ async fn remote_fine_tune_metrics_round_trips_like_local() {
     let remote_metrics: serde_json::Value =
         serde_json::from_str(&remote_metrics_json).expect("remote metrics_json is valid JSON");
 
-    // The control-plane read (`CatalogClient::training_status`, composed on
+    // The control-plane read (`CatalogClient::job_status`, composed on
     // `DataClient`) must not silently lag the data-plane read of the SAME
     // wire field (family M lockstep): both decode the identical
-    // `TrainingStatusResponse.metrics_json`.
+    // the terminal result's metrics_json.
     let admin_status = remote
         .catalog()
-        .training_status(&remote_job.0)
+        .job_status(&remote_job.0)
         .await
-        .expect("catalog training_status");
+        .expect("catalog job_status");
     assert_eq!(
         admin_status.metrics_json.as_deref(),
         Some(remote_metrics_json.as_str()),
-        "CatalogClient::training_status's metrics_json must match \
+        "CatalogClient::job_status's metrics_json must match \
          DataClient::fine_tune_metrics's — both decode the same wire field"
     );
 

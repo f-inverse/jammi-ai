@@ -1,8 +1,8 @@
-//! CLI integration tests for `jammi train`.
+//! CLI integration tests for `jammi jobs`.
 //!
-//! `jammi train` is read-only (submission is SDK-only), so these tests can't
-//! drive a job into existence through the CLI itself. They seed a
-//! `training_jobs` row directly with a [`jammi_db::catalog::Catalog`] — and
+//! `jammi jobs list/status` is read-only (submission is SDK-only), so these
+//! tests can't drive a job into existence through the CLI itself. They seed a
+//! `jobs` row directly with a [`jammi_db::catalog::Catalog`] — and
 //! they do it strictly BEFORE the server exists.
 //!
 //! The catalog is single-process (`docs/guide/src/catalog-and-broker.md`), and
@@ -98,14 +98,13 @@ async fn register_model(catalog: &Catalog, model_id: &str) {
         .expect("register test model");
 }
 
-/// Directly seed a `jobs` row in a terminal (`completed`) status. Mirrors
-/// `jammi-server`'s `grpc_training.rs::seed_training_job_row`. The generalised
-/// `jobs` schema (migration 029, C1b) has no dedicated `metrics` column — the
-/// raw metrics JSON is nested inside the tagged `result` payload
-/// (`jammi_ai::jobs::JobResult::Model.metrics`), the same shape
-/// `TrainingServer::training_status`'s `extract_model_metrics_json` reads
-/// back, so this seed writes it there rather than to a column that no
-/// longer exists.
+/// Directly seed a `jobs` row in a terminal (`completed`) status. The
+/// generalised `jobs` schema (migration 029) has no dedicated `metrics`
+/// column — the raw metrics JSON is nested inside the tagged `result`
+/// payload (`jammi_ai::jobs::JobResult::Model.metrics`), the same shape
+/// `JobServer`'s `job_status_response_from_record` decodes back through
+/// `JobStatusResponse.result`'s `Model` arm, so this seed writes it there
+/// rather than to a column that no longer exists.
 async fn seed_completed_job(catalog: &Catalog, fixture: &JobFixture<'_>, base_model_id: &str) {
     let job_id = fixture.job_id.to_string();
     let base_model_id = base_model_id.to_string();
@@ -181,7 +180,7 @@ async fn cli_train_sees_rows_seeded_before_the_server_spawned() {
 
     let out = server
         .cli()
-        .args(["train", "list"])
+        .args(["jobs", "list"])
         .output()
         .expect("run train list");
     assert!(out.status.success());
@@ -196,7 +195,7 @@ async fn cli_train_sees_rows_seeded_before_the_server_spawned() {
 
     let missing = server
         .cli()
-        .args(["train", "status", "cli-seed-order-never-seeded"])
+        .args(["jobs", "status", "cli-seed-order-never-seeded"])
         .output()
         .expect("run train status for an unseeded id");
     assert!(
@@ -292,7 +291,7 @@ async fn cli_train_status_shows_acceleration_report_when_present() {
 
     let out = server
         .cli()
-        .args(["train", "status", "cli-acc-present"])
+        .args(["jobs", "status", "cli-acc-present"])
         .output()
         .expect("run train status");
     assert!(out.status.success());
@@ -325,7 +324,7 @@ async fn cli_train_status_omits_acceleration_report_when_absent() {
 
     let out = server
         .cli()
-        .args(["train", "status", "cli-acc-legacy"])
+        .args(["jobs", "status", "cli-acc-legacy"])
         .output()
         .expect("run train status");
     assert!(out.status.success());

@@ -1,8 +1,9 @@
 pub mod channels;
+pub mod jobs;
 pub mod models;
 pub mod mutable;
 pub mod reconcile;
 pub mod sources;
 pub mod status;
-pub mod train;
 pub mod trigger;
+pub mod workers;

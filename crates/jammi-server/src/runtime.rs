@@ -44,17 +44,17 @@ use crate::grpc::catalog::{AdminAuthorizer, CatalogServer};
 use crate::grpc::embedding::EmbeddingServer;
 use crate::grpc::eval::EvalServer;
 use crate::grpc::inference::InferenceServer;
+use crate::grpc::job::JobServer;
 use crate::grpc::pipeline::PipelineServer;
 use crate::grpc::proto::audit::audit_service_server::AuditServiceServer;
 use crate::grpc::proto::catalog::catalog_service_server::CatalogServiceServer;
 use crate::grpc::proto::embedding::embedding_service_server::EmbeddingServiceServer;
 use crate::grpc::proto::eval::eval_service_server::EvalServiceServer;
 use crate::grpc::proto::inference::inference_service_server::InferenceServiceServer;
+use crate::grpc::proto::job::job_service_server::JobServiceServer;
 use crate::grpc::proto::pipeline::pipeline_service_server::PipelineServiceServer;
-use crate::grpc::proto::training::training_service_server::TrainingServiceServer;
 use crate::grpc::proto::trigger::trigger_service_server::TriggerServiceServer;
 use crate::grpc::session::{SessionIdTenantResolver, SessionStore, TenantResolver};
-use crate::grpc::training::TrainingServer;
 use crate::grpc::trigger::TriggerServer;
 use crate::grpc_web_trailers::GrpcWebTrailersLayer;
 use crate::metrics_layer::MetricsLayer;
@@ -647,7 +647,7 @@ pub struct ChainParts {
     /// jobs stop running.
     ///
     /// `None` when this process runs no claim loop — `[worker] enabled =
-    /// false`, the submit-without-claiming configuration: `TrainingService`
+    /// false`, the submit-without-claiming configuration: `JobService`
     /// still serves (it is core), this process just never claims. There is
     /// then nothing for the downstream to hold and nothing for its shutdown to
     /// await.
@@ -984,13 +984,13 @@ impl BoundChain {
 /// lifecycle verbs are backed by `engine` when present). When `engine` is
 /// `Some`, the core data-plane services also mount: `EmbeddingService`,
 /// `InferenceService`, `PipelineService`, `AuditService`, and
-/// `TrainingService` (the job submission surface). These are the serve-path
+/// `JobService` (the job submission surface). These are the serve-path
 /// primitives every deployment needs.
 ///
 /// An engine-backed chain also spawns the embedded job worker, unless
 /// `chain.engine`'s `[worker] enabled` is `false`: that key decides whether
 /// THIS process claims queued jobs, and it does NOT change what is mounted or
-/// advertised (`TrainingService` serves either way, so an `enabled = false`
+/// advertised (`JobService` serves either way, so an `enabled = false`
 /// deployment still accepts submissions and just leaves them `queued` for
 /// whichever process does claim).
 ///
@@ -1140,21 +1140,22 @@ pub fn assemble_grpc_chain(chain: GrpcChain) -> Result<AssembledChain, ServerErr
             );
         }
 
-        // Core: TrainingService — the job submission surface (all three training
-        // kinds — fine-tune, graph fine-tune, context-predictor). Submission is
-        // always mounted; whether THIS process also runs the claim loop is
-        // configuration, not a tier and not a build feature: `[worker] enabled`
-        // (default `true`). The surface and what `GetServerInfo.services`
-        // advertises are the same either way, because the service IS mounted —
-        // so a `worker.enabled = false` deployment still accepts submissions; it
-        // just never claims them. The embedded arm reads the same key off the
-        // same config, so a wire deployment and an in-process one answer the
-        // question identically.
+        // Core: JobService — the durable job submission/status/wait surface
+        // (PLAN-C §3; replaces TrainingService). `SubmitJob` carries all three
+        // training kinds — fine-tune, graph fine-tune, context-predictor.
+        // Submission is always mounted; whether THIS process also runs the
+        // claim loop is configuration, not a tier and not a build feature:
+        // `[worker] enabled` (default `true`). The surface and what
+        // `GetServerInfo.services` advertises are the same either way, because
+        // the service IS mounted — so a `worker.enabled = false` deployment
+        // still accepts submissions; it just never claims them. The embedded
+        // arm reads the same key off the same config, so a wire deployment and
+        // an in-process one answer the question identically.
         if session.inner_config().worker.enabled {
             // Start the worker that runs submitted jobs of every compiled kind:
             // a "GPU worker pool" is just N processes claiming from the shared
             // catalog, and this server runs one of them. `spawn` borrows
-            // `session` before it is moved into `TrainingServer::new`; the
+            // `session` before it is moved into `JobServer::new`; the
             // worker is stored in `AssembledChain` so it stops when the serve
             // future resolves.
             worker = Some(jammi_ai::fine_tune::worker::EmbeddedWorker::spawn(
@@ -1162,21 +1163,21 @@ pub fn assemble_grpc_chain(chain: GrpcChain) -> Result<AssembledChain, ServerErr
             )?);
             tracing::info!(
                 worker_enabled = true,
-                "TrainingService mounted; this process claims queued jobs"
+                "JobService mounted; this process claims queued jobs"
             );
         } else {
             // No worker exists to stop, so shutdown has nothing extra to await:
             // `AssembledChain::_worker` stays `None` and its drop is a no-op.
             tracing::info!(
                 worker_enabled = false,
-                "TrainingService mounted; this process does not claim jobs"
+                "JobService mounted; this process does not claim jobs"
             );
         }
         mount_engine!(
             routes,
             mounted,
-            "TrainingService",
-            TrainingServiceServer::new(TrainingServer::new(session))
+            "JobService",
+            JobServiceServer::new(JobServer::new(session))
         );
     }
 

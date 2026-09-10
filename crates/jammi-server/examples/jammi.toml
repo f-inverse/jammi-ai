@@ -15,7 +15,7 @@ artifact_dir = "/var/lib/jammi"
 # HTTP side-channel: `/healthz`, `/readyz`, `/metrics`.
 health_listen = "0.0.0.0:8080"
 # gRPC + Flight SQL surface. The core tier (CatalogService, EmbeddingService,
-# InferenceService, PipelineService, AuditService, TrainingService — the job
+# InferenceService, PipelineService, AuditService, JobService — the durable job
 # submission surface) and Flight SQL are always mounted; the optional tiers
 # below are runtime-selectable.
 flight_listen = "0.0.0.0:8081"
@@ -61,7 +61,7 @@ heartbeat_secs = 10
 # to `[lease]`; naming them here is a startup error, never a silent default.
 [worker]
 # Whether THIS process runs the claim loop. `false` still mounts and serves
-# TrainingService (submissions are accepted and stay `queued`); it only stops
+# JobService (submissions are accepted and stay `queued`); it only stops
 # this process from claiming, so another process configured `true` works them.
 # Overridable per process with `JAMMI_WORKER__ENABLED`.
 enabled = true

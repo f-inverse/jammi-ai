@@ -114,6 +114,16 @@ const CONTROL_PLANE_ALLOWLIST: &[(&str, &str)] = &[
     // Handshake metadata — reports the server's mounted service tiers and
     // version. Tenant-independent.
     ("CatalogService", "GetServerInfo"),
+    // Fleet/liveness metadata (migration 029 `instances`/`workers`) — reports
+    // which processes run the claim loop. Not a tenant-owned resource, same
+    // rationale as `GetServerInfo` above.
+    ("JobService", "ListWorkers"),
+    // A global maintenance sweep over the deployment's own `[jobs]
+    // retention_days` window (the same sweep the construction/worker-loop
+    // background pass already runs); it deletes only rows already destined
+    // for deletion by that config-driven age predicate, across every tenant,
+    // so it names no single tenant's row to isolate.
+    ("JobService", "PruneJobs"),
     // Lifecycle/auth contract — defined in the shared `jammi.v1` wire
     // descriptor so the candle-free `jammi-admin` / CLI client can call a
     // PLATFORM server that implements them, but NOT served by the OSS engine:
@@ -1101,39 +1111,44 @@ fn cases() -> Vec<IsolationCase> {
             assert_recompute_isolated().await;
         }),
         case!(
-            "TrainingService",
-            "StartTraining",
+            "JobService",
+            "SubmitJob",
             CaseKind::ComputeResolver,
             Some(E2E_ISOLATION_TEST),
             {
                 assert_training_create_isolated().await;
             }
         ),
-        case!(
-            "TrainingService",
-            "TrainingStatus",
-            CaseKind::Hermetic,
-            None,
-            {
-                // TrainingStatus reads the job row via the tenant-filtered
-                // `get_job` (NOT by an "unguessable" id) — a peer cannot
-                // read another tenant's job status. The shared helper creates a
-                // job under A and asserts that exact read isolation.
-                assert_training_create_isolated().await;
-            }
-        ),
-        case!(
-            "TrainingService",
-            "ListTrainingJobs",
-            CaseKind::Hermetic,
-            None,
-            {
-                // ListTrainingJobs reads via the tenant-filtered
-                // `list_training_jobs` (`tenant_id = $t OR tenant_id IS NULL`)
-                // — a peer's listing never carries another tenant's job.
-                assert_training_list_isolated().await;
-            }
-        ),
+        case!("JobService", "JobStatus", CaseKind::Hermetic, None, {
+            // JobStatus reads the job row via the tenant-filtered `get_job`
+            // (NOT by an "unguessable" id) — a peer cannot read another
+            // tenant's job status; it gets NOT_FOUND, never
+            // PERMISSION_DENIED (the row's existence itself is not leaked).
+            // The shared helper creates a job under A and asserts that exact
+            // read isolation.
+            assert_training_create_isolated().await;
+        }),
+        case!("JobService", "WaitJob", CaseKind::Hermetic, None, {
+            // `WaitJob` reads the SAME tenant-filtered `get_job` `JobStatus`
+            // does (row-scoped, on every poll tick) — a peer's wait resolves
+            // no row for another tenant's job id, so it can observe nothing.
+            assert_training_create_isolated().await;
+        }),
+        case!("JobService", "ListJobs", CaseKind::Hermetic, None, {
+            // ListJobs reads via the tenant-filtered `list_jobs`
+            // (`tenant_id = $t OR tenant_id IS NULL`) — a peer's listing
+            // never carries another tenant's job.
+            assert_training_list_isolated().await;
+        }),
+        case!("JobService", "CancelJob", CaseKind::Hermetic, None, {
+            // `cancel_request`'s SQL carries the same tenant predicate as
+            // every other job write (`WHERE job_id = $1 ... AND (tenant_id =
+            // $t OR (tenant_id IS NULL AND $t IS NULL))`) — a peer's cancel
+            // matches zero rows against another tenant's job, exactly the
+            // "no leak, no effect" contract every other cross-tenant write
+            // in this codebase gets.
+            assert_cancel_job_isolated().await;
+        }),
         // --- Flight SQL (off-descriptor; explicit case) ----------------------
         case!(
             "arrow.flight.FlightService",
@@ -2315,6 +2330,42 @@ async fn assert_training_list_isolated() {
     assert!(
         listed_b.iter().all(|r| r.job_id != "job_a"),
         "CROSS-TENANT LIST LEAK: tenant B's listing carries tenant A's training job"
+    );
+}
+
+/// `CancelJob`: tenant B's cancel of tenant A's job matches zero rows (the
+/// job stays `queued`, `cancel_requested` unset) while tenant A's own cancel
+/// of the same job succeeds — the attempt has no effect across tenants and
+/// no effect is silently reported as success on the wrong row.
+async fn assert_cancel_job_isolated() {
+    let (_dir, cat_a, cat_b, _g) = ab_catalogs().await;
+    cat_a
+        .submit_job(SubmitJobParams {
+            job_id: "job_cancel_a",
+            kind: "fine_tune",
+            execution: JobExecution::Queued,
+            spec: "{}",
+            model_ref: None,
+            output_model_id: None,
+            model_source: None,
+            priority: 0,
+        })
+        .await
+        .unwrap();
+    let cross_tenant_cancelled = cat_b.cancel_request("job_cancel_a").await.unwrap();
+    assert!(
+        !cross_tenant_cancelled,
+        "CROSS-TENANT CANCEL: tenant B cancelled tenant A's job"
+    );
+    let record = cat_a.get_job("job_cancel_a").await.unwrap();
+    assert!(
+        !record.cancel_requested,
+        "tenant B's cross-tenant cancel must not have set cancel_requested"
+    );
+    let same_tenant_cancelled = cat_a.cancel_request("job_cancel_a").await.unwrap();
+    assert!(
+        same_tenant_cancelled,
+        "tenant A must be able to cancel its own job"
     );
 }
 

@@ -100,7 +100,7 @@ impl Backends {
             region: Some(self.region.clone()),
             endpoint: Some(self.s3_endpoint.clone()),
             access_key_id: Some(self.access_key_id.clone()),
-            secret_access_key: Some(self.secret_access_key.clone()),
+            secret_access_key: Some(self.secret_access_key.clone().into()),
             session_token: None,
             allow_http: self.s3_endpoint.starts_with("http://"),
         })
@@ -148,7 +148,7 @@ fn shared_config(backends: &Backends, result_root: &str, artifact_dir: &Path) ->
             ..Default::default()
         },
         catalog: CatalogConfig::Postgres {
-            url: backends.pg_url.clone(),
+            url: backends.pg_url.clone().into(),
             pool_size: 8,
             max_lifetime_secs: None,
         },
@@ -390,16 +390,14 @@ artifact_dir = "{artifact_dir}"
 [gpu]
 device = -1
 
-[catalog]
-kind = "postgres"
+[catalog.postgres]
 url = "{pg_url}"
 pool_size = 8
 
 [storage]
 result_root = "{result_root}"
 
-[storage.cloud]
-kind = "s3"
+[storage.cloud.s3]
 region = "{region}"
 endpoint = "{s3_endpoint}"
 allow_http = {allow_http}

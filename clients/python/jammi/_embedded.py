@@ -1297,10 +1297,11 @@ def _open_embedded(artifact_dir: str, *, config: Optional[str] = None) -> Embedd
     session later creates (`generate_embeddings` / `import_embeddings`) is
     stamped with whatever `storage_precision` was in effect at the moment of
     its creation. ``None`` leaves the engine to resolve a config the way the
-    server binary does (``JAMMI_CONFIG`` / ``./jammi.toml`` / the platform config
-    dir, then the ``JAMMI_*`` environment overrides), falling back to the
-    built-in defaults when there is none — the `artifact_dir` passed here is
-    applied after that load and always wins.
+    server binary does (``JAMMI_CONFIG`` / ``./jammi.toml`` /
+    ``/etc/jammi/jammi.toml`` / the platform config dir, then the
+    ``JAMMI_*`` environment overrides), falling back to the built-in defaults
+    when there is none — the `artifact_dir` passed here is applied after that
+    load and always wins.
 
     One key that resolution carries is `training.run_worker`
     (``JAMMI_TRAINING__RUN_WORKER``): with it `false`, this session accepts

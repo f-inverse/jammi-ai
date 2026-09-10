@@ -30,7 +30,7 @@ mod signature;
 mod table;
 
 pub use error::AuditError;
-pub use key_store::{EnvSigningKeyStore, SigningKeyStore, MASTER_KEY_ENV};
+pub use key_store::{EnvSigningKeyStore, FileSigningKeyStore, SigningKeyStore, MASTER_KEY_ENV};
 pub use log::{log_records, max_lineage_bytes, DEFAULT_MAX_LINEAGE_BYTES, MAX_LINEAGE_BYTES_ENV};
 pub use query::{fetch_by_query_id, fetch_recent};
 pub use record::{canonical_serialize, PerQueryAudit};

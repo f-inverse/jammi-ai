@@ -7,8 +7,20 @@ use tempfile::tempdir;
 use jammi_ai::concurrency::GpuScheduler;
 #[cfg(feature = "live-hub-tests")]
 use jammi_ai::model::{
-    backend::DeviceConfig, cache::ModelCache, tokenizer::TokenizerWrapper, ModelId,
+    backend::DeviceConfig, cache::ModelCache, hub::HubSource, tokenizer::TokenizerWrapper, ModelId,
 };
+
+/// A [`HubSource`] built exactly the way the session choke point builds one
+/// (H3/H4) — `[models]` defaults plus the real process environment — for the
+/// two live tests below that talk to the tokenizer endpoint directly rather
+/// than through a `ModelResolver`.
+#[cfg(feature = "live-hub-tests")]
+fn live_hub_source() -> HubSource {
+    HubSource::from_config(&jammi_db::config::ModelsConfig::default(), &|k: &str| {
+        std::env::var(k).ok()
+    })
+    .unwrap()
+}
 
 // --- HF Hub resolution (live only) ---
 
@@ -17,7 +29,12 @@ use jammi_ai::model::{
 async fn resolve_hf_hub_sentence_transformer() {
     let dir = tempdir().unwrap();
     let catalog = Arc::new(Catalog::open(dir.path()).await.unwrap());
-    let resolver = ModelResolver::new(catalog, crate::common::test_artifact_store()).unwrap();
+    let resolver = ModelResolver::new(
+        catalog,
+        crate::common::test_artifact_store(),
+        crate::common::test_hub_source(),
+    )
+    .unwrap();
 
     let source = ModelSource::hf("sentence-transformers/all-MiniLM-L6-v2");
     let resolved = resolver
@@ -50,7 +67,12 @@ async fn resolve_hf_hub_sentence_transformer() {
 async fn resolve_hf_hub_selects_candle_for_safetensors_model() {
     let dir = tempdir().unwrap();
     let catalog = Arc::new(Catalog::open(dir.path()).await.unwrap());
-    let resolver = ModelResolver::new(catalog, crate::common::test_artifact_store()).unwrap();
+    let resolver = ModelResolver::new(
+        catalog,
+        crate::common::test_artifact_store(),
+        crate::common::test_hub_source(),
+    )
+    .unwrap();
 
     let source = ModelSource::hf("sentence-transformers/all-MiniLM-L6-v2");
     let resolved = resolver
@@ -92,7 +114,12 @@ async fn resolve_local_path_with_safetensors() {
     std::fs::write(model_dir.join("tokenizer.json"), r#"{"version":"1.0"}"#).unwrap();
 
     let catalog = Arc::new(Catalog::open(dir.path()).await.unwrap());
-    let resolver = ModelResolver::new(catalog, crate::common::test_artifact_store()).unwrap();
+    let resolver = ModelResolver::new(
+        catalog,
+        crate::common::test_artifact_store(),
+        crate::common::test_hub_source(),
+    )
+    .unwrap();
 
     let source = ModelSource::local(&model_dir);
     let resolved = resolver
@@ -117,7 +144,12 @@ async fn resolve_local_path_with_onnx() {
     std::fs::write(model_dir.join("model.onnx"), b"fake-onnx").unwrap();
 
     let catalog = Arc::new(Catalog::open(dir.path()).await.unwrap());
-    let resolver = ModelResolver::new(catalog, crate::common::test_artifact_store()).unwrap();
+    let resolver = ModelResolver::new(
+        catalog,
+        crate::common::test_artifact_store(),
+        crate::common::test_hub_source(),
+    )
+    .unwrap();
 
     let source = ModelSource::local(&model_dir);
     let resolved = resolver
@@ -150,7 +182,12 @@ async fn resolve_local_prefers_onnx_once_it_appears_alongside_existing_safetenso
     write_minimal_safetensors(&model_dir.join("model.safetensors"));
 
     let catalog = Arc::new(Catalog::open(dir.path()).await.unwrap());
-    let resolver = ModelResolver::new(catalog, crate::common::test_artifact_store()).unwrap();
+    let resolver = ModelResolver::new(
+        catalog,
+        crate::common::test_artifact_store(),
+        crate::common::test_hub_source(),
+    )
+    .unwrap();
     let source = ModelSource::local(&model_dir);
 
     // Before model.onnx exists: Candle, via model.safetensors.
@@ -197,7 +234,12 @@ async fn backend_hint_overrides_heuristic() {
     std::fs::write(model_dir.join("model.onnx"), b"fake-onnx").unwrap();
 
     let catalog = Arc::new(Catalog::open(dir.path()).await.unwrap());
-    let resolver = ModelResolver::new(catalog, crate::common::test_artifact_store()).unwrap();
+    let resolver = ModelResolver::new(
+        catalog,
+        crate::common::test_artifact_store(),
+        crate::common::test_hub_source(),
+    )
+    .unwrap();
 
     let source = ModelSource::local(&model_dir);
     let resolved = resolver
@@ -217,8 +259,10 @@ async fn backend_hint_overrides_heuristic() {
 #[cfg(feature = "live-hub-tests")]
 #[tokio::test]
 async fn tokenizer_encode_batch_produces_padded_output() {
-    let hf_api = hf_hub::api::sync::Api::new().unwrap();
-    let repo = hf_api.model("sentence-transformers/all-MiniLM-L6-v2".into());
+    let hf_api = live_hub_source();
+    let repo = hf_api
+        .api()
+        .model("sentence-transformers/all-MiniLM-L6-v2".into());
     let tokenizer_path = repo.get("tokenizer.json").unwrap();
 
     let tokenizer = TokenizerWrapper::from_file(&tokenizer_path).unwrap();
@@ -251,8 +295,10 @@ async fn tokenizer_encode_batch_produces_padded_output() {
 #[cfg(feature = "live-hub-tests")]
 #[tokio::test]
 async fn tokenizer_encode_batch_with_truncation() {
-    let hf_api = hf_hub::api::sync::Api::new().unwrap();
-    let repo = hf_api.model("sentence-transformers/all-MiniLM-L6-v2".into());
+    let hf_api = live_hub_source();
+    let repo = hf_api
+        .api()
+        .model("sentence-transformers/all-MiniLM-L6-v2".into());
     let tokenizer_path = repo.get("tokenizer.json").unwrap();
 
     let tokenizer = TokenizerWrapper::from_file(&tokenizer_path).unwrap();
@@ -273,8 +319,12 @@ async fn tokenizer_encode_batch_with_truncation() {
 async fn cache_get_or_load_returns_guard_with_ref_count() {
     let dir = tempdir().unwrap();
     let catalog = Arc::new(Catalog::open(dir.path()).await.unwrap());
-    let resolver =
-        ModelResolver::new(Arc::clone(&catalog), crate::common::test_artifact_store()).unwrap();
+    let resolver = ModelResolver::new(
+        Arc::clone(&catalog),
+        crate::common::test_artifact_store(),
+        crate::common::test_hub_source(),
+    )
+    .unwrap();
     let device_config = DeviceConfig {
         gpu_device: -1,
         memory_fraction: 1.0,
@@ -312,8 +362,12 @@ async fn cache_get_or_load_returns_guard_with_ref_count() {
 async fn cache_ref_count_decrements_on_guard_drop() {
     let dir = tempdir().unwrap();
     let catalog = Arc::new(Catalog::open(dir.path()).await.unwrap());
-    let resolver =
-        ModelResolver::new(Arc::clone(&catalog), crate::common::test_artifact_store()).unwrap();
+    let resolver = ModelResolver::new(
+        Arc::clone(&catalog),
+        crate::common::test_artifact_store(),
+        crate::common::test_hub_source(),
+    )
+    .unwrap();
     let device_config = DeviceConfig {
         gpu_device: -1,
         memory_fraction: 1.0,
@@ -393,8 +447,12 @@ fn activation_memory_scaling() {
 async fn preload_loads_model_into_cache_without_returning_guard() {
     let dir = tempdir().unwrap();
     let catalog = Arc::new(Catalog::open(dir.path()).await.unwrap());
-    let resolver =
-        ModelResolver::new(Arc::clone(&catalog), crate::common::test_artifact_store()).unwrap();
+    let resolver = ModelResolver::new(
+        Arc::clone(&catalog),
+        crate::common::test_artifact_store(),
+        crate::common::test_hub_source(),
+    )
+    .unwrap();
     let device_config = DeviceConfig {
         gpu_device: -1,
         memory_fraction: 1.0,
@@ -432,8 +490,12 @@ async fn preload_loads_model_into_cache_without_returning_guard() {
 async fn single_flight_concurrent_loads_coalesce() {
     let dir = tempdir().unwrap();
     let catalog = Arc::new(Catalog::open(dir.path()).await.unwrap());
-    let resolver =
-        ModelResolver::new(Arc::clone(&catalog), crate::common::test_artifact_store()).unwrap();
+    let resolver = ModelResolver::new(
+        Arc::clone(&catalog),
+        crate::common::test_artifact_store(),
+        crate::common::test_hub_source(),
+    )
+    .unwrap();
     let device_config = DeviceConfig {
         gpu_device: -1,
         memory_fraction: 1.0,
@@ -479,8 +541,12 @@ async fn single_flight_concurrent_loads_coalesce() {
 async fn eviction_skips_model_with_active_guard() {
     let dir = tempdir().unwrap();
     let catalog = Arc::new(Catalog::open(dir.path()).await.unwrap());
-    let resolver =
-        ModelResolver::new(Arc::clone(&catalog), crate::common::test_artifact_store()).unwrap();
+    let resolver = ModelResolver::new(
+        Arc::clone(&catalog),
+        crate::common::test_artifact_store(),
+        crate::common::test_hub_source(),
+    )
+    .unwrap();
     let device_config = DeviceConfig {
         gpu_device: -1,
         memory_fraction: 1.0,
@@ -513,7 +579,12 @@ async fn resolve_local_missing_config_returns_error() {
     std::fs::write(model_dir.join("model.safetensors"), b"fake-weights").unwrap();
 
     let catalog = Arc::new(Catalog::open(dir.path()).await.unwrap());
-    let resolver = ModelResolver::new(catalog, crate::common::test_artifact_store()).unwrap();
+    let resolver = ModelResolver::new(
+        catalog,
+        crate::common::test_artifact_store(),
+        crate::common::test_hub_source(),
+    )
+    .unwrap();
 
     let source = ModelSource::local(&model_dir);
     let result = resolver
@@ -532,7 +603,12 @@ async fn resolve_local_empty_directory_returns_error() {
     std::fs::create_dir_all(&model_dir).unwrap();
 
     let catalog = Arc::new(Catalog::open(dir.path()).await.unwrap());
-    let resolver = ModelResolver::new(catalog, crate::common::test_artifact_store()).unwrap();
+    let resolver = ModelResolver::new(
+        catalog,
+        crate::common::test_artifact_store(),
+        crate::common::test_hub_source(),
+    )
+    .unwrap();
 
     let source = ModelSource::local(&model_dir);
     let result = resolver
@@ -545,7 +621,12 @@ async fn resolve_local_empty_directory_returns_error() {
 async fn resolve_nonexistent_local_path_returns_error() {
     let dir = tempdir().unwrap();
     let catalog = Arc::new(Catalog::open(dir.path()).await.unwrap());
-    let resolver = ModelResolver::new(catalog, crate::common::test_artifact_store()).unwrap();
+    let resolver = ModelResolver::new(
+        catalog,
+        crate::common::test_artifact_store(),
+        crate::common::test_hub_source(),
+    )
+    .unwrap();
 
     let source = ModelSource::local("/nonexistent/path/to/model");
     let result = resolver
@@ -559,8 +640,12 @@ async fn resolve_nonexistent_local_path_returns_error() {
 async fn cache_load_failure_clears_in_flight_state() {
     let dir = tempdir().unwrap();
     let catalog = Arc::new(Catalog::open(dir.path()).await.unwrap());
-    let resolver =
-        ModelResolver::new(Arc::clone(&catalog), crate::common::test_artifact_store()).unwrap();
+    let resolver = ModelResolver::new(
+        Arc::clone(&catalog),
+        crate::common::test_artifact_store(),
+        crate::common::test_hub_source(),
+    )
+    .unwrap();
     let device_config = DeviceConfig {
         gpu_device: -1,
         memory_fraction: 1.0,
@@ -662,7 +747,12 @@ async fn fine_tuned_record_without_artifact_path_refuses_to_resolve() {
         .await
         .unwrap();
 
-    let resolver = ModelResolver::new(catalog, crate::common::test_artifact_store()).unwrap();
+    let resolver = ModelResolver::new(
+        catalog,
+        crate::common::test_artifact_store(),
+        crate::common::test_hub_source(),
+    )
+    .unwrap();
     let source = ModelSource::hf("jammi:fine-tuned:broken-artifact-path");
     let result = resolver
         .resolve(&source, ModelTask::TextEmbedding, None)
@@ -711,7 +801,12 @@ async fn fine_tuned_record_without_base_model_id_refuses_to_resolve() {
         .await
         .unwrap();
 
-    let resolver = ModelResolver::new(catalog, crate::common::test_artifact_store()).unwrap();
+    let resolver = ModelResolver::new(
+        catalog,
+        crate::common::test_artifact_store(),
+        crate::common::test_hub_source(),
+    )
+    .unwrap();
     let source = ModelSource::hf("jammi:fine-tuned:broken-base-id");
     let result = resolver
         .resolve(&source, ModelTask::TextEmbedding, None)
@@ -804,7 +899,7 @@ async fn fine_tuned_adapter_bundle_missing_file_refuses_as_typed_model_error() {
         .await
         .unwrap();
 
-    let resolver = ModelResolver::new(catalog, store).unwrap();
+    let resolver = ModelResolver::new(catalog, store, crate::common::test_hub_source()).unwrap();
     let source = ModelSource::hf("jammi:fine-tuned:missing-adapter-file");
     let result = resolver
         .resolve(&source, ModelTask::TextEmbedding, None)
@@ -879,7 +974,7 @@ async fn fine_tuned_adapter_bundle_unpublished_refuses_as_typed_model_error() {
         .await
         .unwrap();
 
-    let resolver = ModelResolver::new(catalog, store).unwrap();
+    let resolver = ModelResolver::new(catalog, store, crate::common::test_hub_source()).unwrap();
     let source = ModelSource::hf("jammi:fine-tuned:unpublished-bundle");
     let result = resolver
         .resolve(&source, ModelTask::TextEmbedding, None)
@@ -941,7 +1036,12 @@ async fn fine_tuned_prefix_with_wrong_model_type_refuses_to_resolve() {
         .await
         .unwrap();
 
-    let resolver = ModelResolver::new(catalog, crate::common::test_artifact_store()).unwrap();
+    let resolver = ModelResolver::new(
+        catalog,
+        crate::common::test_artifact_store(),
+        crate::common::test_hub_source(),
+    )
+    .unwrap();
     let source = ModelSource::hf("jammi:fine-tuned:corrupted-by-old-build");
     let result = resolver
         .resolve(&source, ModelTask::TextEmbedding, None)
@@ -994,7 +1094,12 @@ async fn fine_tuned_adapter_bundle_corrupted_pointer_refuses_as_typed_model_erro
         .await
         .unwrap();
 
-    let resolver = ModelResolver::new(catalog, crate::common::test_artifact_store()).unwrap();
+    let resolver = ModelResolver::new(
+        catalog,
+        crate::common::test_artifact_store(),
+        crate::common::test_hub_source(),
+    )
+    .unwrap();
     let source = ModelSource::hf("jammi:fine-tuned:corrupted-pointer");
     let result = resolver
         .resolve(&source, ModelTask::TextEmbedding, None)
@@ -1148,7 +1253,7 @@ async fn fine_tuned_adapter_bundle_permission_fault_is_not_a_typed_model_error()
         .await
         .unwrap();
 
-    let resolver = ModelResolver::new(catalog, store).unwrap();
+    let resolver = ModelResolver::new(catalog, store, crate::common::test_hub_source()).unwrap();
     let source = ModelSource::hf("jammi:fine-tuned:permission-fault-bundle");
     let result = resolver
         .resolve(&source, ModelTask::TextEmbedding, None)

@@ -52,9 +52,11 @@ jammi --target <ENDPOINT> <command>   # Server endpoint (default grpc://127.0.0.
 jammi --tenant <UUID> <command>       # Bind a tenant scope for the session
 ```
 
-`--target` accepts `grpc://host:port` (plaintext), `grpcs://host:port` (TLS),
-`http(s)://host:port`, or a bare `host:port`. `--tenant` binds a tenant scope
-before any verb runs, so every read and write is scoped to that tenant.
+`--target` accepts `grpc://host:port`, `http://host:port`, or a bare
+`host:port` — all plaintext h2. TLS termination is the consumer's runtime,
+not the CLI's: put a TLS-terminating proxy in front and point `--target` at
+it in plaintext. `--tenant` binds a tenant scope before any verb runs, so
+every read and write is scoped to that tenant.
 
 ## Next steps
 

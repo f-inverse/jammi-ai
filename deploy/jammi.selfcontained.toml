@@ -34,13 +34,11 @@ flight_listen = "0.0.0.0:8081"
 # `local:` model id pointing at the baked fixture.
 preload_models = []
 
-[catalog]
 # SQLite under `artifact_dir`. Single-instance, ephemeral, no external DB.
-kind = "sqlite"
+catalog = "sqlite"
 
-[broker]
 # In-process broker — no NATS/JetStream sidecar to reach.
-kind = "in_memory"
+broker = "in_memory"
 
 [logging]
 level = "info"

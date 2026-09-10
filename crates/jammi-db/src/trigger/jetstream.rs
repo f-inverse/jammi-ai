@@ -10,7 +10,6 @@
 //! subscribe seam dedups the overlap by engine `_offset` (the JetStream stream
 //! sequence is an independent counter and must not be conflated with it).
 
-use std::path::Path;
 use std::str::FromStr;
 use std::sync::Arc;
 use std::time::Duration;
@@ -74,17 +73,18 @@ impl JetStreamBroker {
         Ok(Self::from_client(client, retention_seconds))
     }
 
-    /// Open a broker authenticated with a NATS `.creds` file. Use this
-    /// constructor for SaaS deployments where the broker rejects anonymous
+    /// Open a broker authenticated with NATS credentials — the **contents**
+    /// of a `.creds` file (decorated user JWT + NKEY seed), not its path.
+    /// The config layer resolves `broker.credentials` (inline or
+    /// `{ file = … }`) into that text; this constructor only parses it. Use
+    /// it for SaaS deployments where the broker rejects anonymous
     /// connections.
     pub async fn connect_with_credentials(
         url: &str,
         retention_seconds: u64,
-        credentials_path: &Path,
+        credentials: &str,
     ) -> Result<Self, TriggerError> {
-        let client = async_nats::ConnectOptions::with_credentials_file(credentials_path)
-            .await
-            .map_err(|e| TriggerError::Driver(format!("nats creds: {e}")))?
+        let client = credential_options(credentials)?
             .connect(url)
             .await
             .map_err(|e| TriggerError::Driver(format!("nats connect: {e}")))?;
@@ -119,6 +119,15 @@ impl JetStreamBroker {
             .map(Duration::from_secs)
             .unwrap_or(self.retention)
     }
+}
+
+/// Build the `ConnectOptions` for a credentials string: the seam between the
+/// config's resolved secret and async-nats. Takes the `.creds` text itself
+/// (`ConnectOptions::with_credentials`), so a path handed here is a parse
+/// error, never a silently anonymous connection.
+fn credential_options(credentials: &str) -> Result<async_nats::ConnectOptions, TriggerError> {
+    async_nats::ConnectOptions::with_credentials(credentials)
+        .map_err(|e| TriggerError::Driver(format!("nats creds: {e}")))
 }
 
 #[async_trait]
@@ -392,5 +401,33 @@ mod tests {
         }
         // No replay point requested → only future events.
         assert!(matches!(deliver_policy_for(None), DeliverPolicy::New));
+    }
+
+    /// A syntactically complete `.creds` body: the JWT is opaque to the
+    /// parser, the seed is the example user seed from async-nats's own
+    /// `ConnectOptions::credentials` docs (a valid NKEY seed, never a live
+    /// account).
+    const CREDS: &str = "-----BEGIN NATS USER JWT-----
+eyJ0eXAiOiJqd3QiLCJhbGciOiJlZDI1NTE5In0.e30.sig
+------END NATS USER JWT------
+
+-----BEGIN USER NKEY SEED-----
+SUAIO3FHUX5PNV2LQIIP7TZ3N4L7TX3W53MQGEIVYFIGA635OZCKEYHFLM
+------END USER NKEY SEED------
+";
+
+    /// The builder seam takes the `.creds` CONTENTS: the text parses, and
+    /// the same text's *path* (what the old `credentials_path` field carried)
+    /// is refused as unparsable rather than accepted as anything.
+    #[test]
+    fn jetstream_credentials_are_contents_not_a_path() {
+        credential_options(CREDS).expect("creds contents parse");
+
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("nats.creds");
+        std::fs::write(&path, CREDS).unwrap();
+        let err = credential_options(path.to_str().unwrap()).unwrap_err();
+        assert!(matches!(err, TriggerError::Driver(_)), "{err}");
+        assert!(err.to_string().contains("nats creds"), "{err}");
     }
 }

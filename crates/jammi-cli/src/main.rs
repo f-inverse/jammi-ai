@@ -20,10 +20,12 @@ const DEFAULT_TARGET: &str = "grpc://127.0.0.1:8081";
 #[derive(Parser)]
 #[command(name = "jammi", version, about = "Jammi AI — gRPC client CLI")]
 struct Cli {
-    /// Server endpoint. Accepts `grpc://host:port` (plaintext h2),
-    /// `grpcs://host:port` (TLS), `http(s)://host:port`, or a bare `host:port`
-    /// (treated as plaintext). The CLI is a strict client — every verb runs on
-    /// the server reached here, never in-process.
+    /// Server endpoint. Accepts `grpc://host:port` or a bare `host:port`
+    /// (both plaintext h2 — a bare value is treated as plaintext). TLS
+    /// termination is the consumer's runtime, not the CLI's: put a
+    /// TLS-terminating proxy in front and point `--target` at it in
+    /// plaintext. The CLI is a strict client — every verb runs on the server
+    /// reached here, never in-process.
     #[arg(long, global = true, default_value = DEFAULT_TARGET)]
     target: String,
 
@@ -157,21 +159,24 @@ async fn dispatch(
 
 /// Translate a `--target` value into a [`tonic::transport::Endpoint`].
 ///
-/// `grpc://` and a bare `host:port` are plaintext h2 (`http://`); `grpcs://` is
-/// TLS (`https://`); `http://` / `https://` pass through. An unrecognised scheme
-/// is rejected with a typed error rather than silently coerced — a misspelled
-/// scheme should fail loudly, not connect somewhere unexpected.
+/// `grpc://` and a bare `host:port` are plaintext h2 (`http://`); `http://`
+/// passes through. Those are the only two accepted forms: TLS termination is
+/// the consumer's runtime, not the engine's (see `philosophy.md`), so a
+/// `grpcs://` or `https://` target is refused rather than silently trusted —
+/// terminate TLS in a proxy in front of the server and point `--target` at it
+/// in plaintext. An unrecognised scheme is rejected with a typed error rather
+/// than silently coerced — a misspelled scheme should fail loudly, not
+/// connect somewhere unexpected.
 fn endpoint_from_target(
     target: &str,
 ) -> Result<tonic::transport::Endpoint, Box<dyn std::error::Error>> {
     let url = match target.split_once("://") {
         Some(("grpc", rest)) => format!("http://{rest}"),
-        Some(("grpcs", rest)) => format!("https://{rest}"),
-        Some(("http", _)) | Some(("https", _)) => target.to_string(),
+        Some(("http", _)) => target.to_string(),
         Some((scheme, _)) => {
             return Err(format!(
-                "unsupported --target scheme '{scheme}://'; use grpc://, grpcs://, \
-                 http://, https://, or a bare host:port"
+                "unsupported --target scheme '{scheme}://'; use grpc://, \
+                 http://, or a bare host:port"
             )
             .into());
         }
@@ -194,9 +199,16 @@ mod tests {
     }
 
     #[test]
-    fn endpoint_grpcs_becomes_https() {
-        let ep = endpoint_from_target("grpcs://host.example:443").unwrap();
-        assert_eq!(ep.uri().scheme_str(), Some("https"));
+    fn refuses_tls_schemes_naming_the_supported_ones() {
+        for target in ["grpcs://h:1", "https://h:1"] {
+            let err = endpoint_from_target(target).unwrap_err();
+            let msg = err.to_string();
+            assert!(msg.contains("grpc://"), "{msg}");
+            assert!(msg.contains("http://"), "{msg}");
+        }
+        // Control: the two supported schemes still parse.
+        assert!(endpoint_from_target("grpc://h:1").is_ok());
+        assert!(endpoint_from_target("http://h:1").is_ok());
     }
 
     #[test]

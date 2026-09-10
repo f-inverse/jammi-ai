@@ -11104,6 +11104,7 @@ mod media_front_end_wall_tests {
 
     use crate::model::backend::candle::CandleBackend;
     use crate::model::backend::{DeviceConfig, ModelBackend};
+    use crate::model::hub::HubSource;
     use crate::model::resolver::ModelResolver;
     use crate::model::{LoadedModel, ModelSource, ModelTask};
 
@@ -11163,7 +11164,16 @@ mod media_front_end_wall_tests {
             )
             .unwrap(),
         );
-        let resolver = ModelResolver::new(catalog, store).unwrap();
+        let hub_root = tempfile::tempdir().unwrap().keep();
+        let hub = HubSource::from_config(
+            &jammi_db::config::ModelsConfig {
+                hub_cache_dir: Some(hub_root),
+                ..Default::default()
+            },
+            &|_: &str| None,
+        )
+        .unwrap();
+        let resolver = ModelResolver::new(catalog, store, hub).unwrap();
         let resolved = resolver
             .resolve(
                 &ModelSource::local(htsat_clap_tiny_dir()),

@@ -48,7 +48,12 @@ async fn resolve_and_load(
 ) -> LoadedModel {
     let catalog_dir = TempDir::new().unwrap();
     let catalog = Arc::new(Catalog::open(catalog_dir.path()).await.unwrap());
-    let resolver = ModelResolver::new(catalog, common::test_artifact_store()).unwrap();
+    let resolver = ModelResolver::new(
+        catalog,
+        common::test_artifact_store(),
+        common::test_hub_source(),
+    )
+    .unwrap();
     let resolved = resolver.resolve(source, task, None).await.unwrap();
 
     let backend = CandleBackend;
@@ -396,7 +401,12 @@ async fn ner_at_f16_produces_valid_entity_spans() {
 async fn bf16_inference_request_is_rejected_loudly() {
     let catalog_dir = TempDir::new().unwrap();
     let catalog = Arc::new(Catalog::open(catalog_dir.path()).await.unwrap());
-    let resolver = ModelResolver::new(catalog, common::test_artifact_store()).unwrap();
+    let resolver = ModelResolver::new(
+        catalog,
+        common::test_artifact_store(),
+        common::test_hub_source(),
+    )
+    .unwrap();
     let source = tiny_bert_source();
     let resolved = resolver
         .resolve(&source, ModelTask::TextEmbedding, None)

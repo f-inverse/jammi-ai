@@ -843,6 +843,18 @@ fn ephemeral_artifact_store() -> Arc<ArtifactStore> {
     )
 }
 
+fn ephemeral_hub_source() -> jammi_ai::model::hub::HubSource {
+    let root = tempfile::tempdir().unwrap().keep();
+    jammi_ai::model::hub::HubSource::from_config(
+        &jammi_db::config::ModelsConfig {
+            hub_cache_dir: Some(root),
+            ..Default::default()
+        },
+        &|_: &str| None,
+    )
+    .unwrap()
+}
+
 /// Two-phase measurement (phase-4 audit finding 1's fix). What this oracle
 /// CAN isolate: the device-memory delta specifically attributable to
 /// resolving+loading THIS GGUF checkpoint, on an already-settled CUDA
@@ -900,7 +912,8 @@ async fn gguf_gpu_load_admission_estimate_is_truthful_against_measured_device_me
 
     let catalog_dir = TempDir::new().unwrap();
     let catalog = Arc::new(Catalog::open(catalog_dir.path()).await.unwrap());
-    let resolver = ModelResolver::new(catalog, ephemeral_artifact_store()).unwrap();
+    let resolver =
+        ModelResolver::new(catalog, ephemeral_artifact_store(), ephemeral_hub_source()).unwrap();
     let source = ModelSource::local(gguf_dir.as_path());
     let resolved = resolver
         .resolve(&source, ModelTask::TextEmbedding, Some(BackendType::Candle))

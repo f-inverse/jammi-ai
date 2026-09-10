@@ -869,6 +869,8 @@ mod f3_prime_tests {
     use jammi_db::storage::{StorageRegistry, StorageUrl};
     use jammi_db::store::ArtifactStore;
 
+    use crate::model::hub::HubSource;
+
     fn device_config() -> DeviceConfig {
         DeviceConfig {
             gpu_device: -1,
@@ -888,6 +890,18 @@ mod f3_prime_tests {
             )
             .unwrap(),
         )
+    }
+
+    fn test_hub_source() -> HubSource {
+        let root = tempfile::tempdir().unwrap().keep();
+        HubSource::from_config(
+            &jammi_db::config::ModelsConfig {
+                hub_cache_dir: Some(root),
+                ..Default::default()
+            },
+            &|_: &str| None,
+        )
+        .unwrap()
     }
 
     /// Copy the hermetic `tiny_bert` fixture into a fresh directory under
@@ -940,7 +954,12 @@ mod f3_prime_tests {
         let tmp = tempfile::tempdir().unwrap();
         let catalog_dir = tempfile::tempdir().unwrap();
         let catalog = Arc::new(Catalog::open(catalog_dir.path()).await.unwrap());
-        let resolver = ModelResolver::new(Arc::clone(&catalog), test_artifact_store()).unwrap();
+        let resolver = ModelResolver::new(
+            Arc::clone(&catalog),
+            test_artifact_store(),
+            test_hub_source(),
+        )
+        .unwrap();
 
         let (source_a, weights_len) = tiny_bert_source(tmp.path(), "model_a");
         let (source_b, weights_len_b) = tiny_bert_source(tmp.path(), "model_b");
@@ -1066,7 +1085,12 @@ mod f3_prime_tests {
         let tmp = tempfile::tempdir().unwrap();
         let catalog_dir = tempfile::tempdir().unwrap();
         let catalog = Arc::new(Catalog::open(catalog_dir.path()).await.unwrap());
-        let resolver = ModelResolver::new(Arc::clone(&catalog), test_artifact_store()).unwrap();
+        let resolver = ModelResolver::new(
+            Arc::clone(&catalog),
+            test_artifact_store(),
+            test_hub_source(),
+        )
+        .unwrap();
         let (source, weights_len) = tiny_bert_source(tmp.path(), "model_x");
 
         // A real, loaded `Arc<LoadedModel>` — only used as a valid handle
@@ -1233,6 +1257,18 @@ mod single_flight_advisory_tests {
         )
     }
 
+    fn test_hub_source() -> crate::model::hub::HubSource {
+        let root = tempfile::tempdir().unwrap().keep();
+        crate::model::hub::HubSource::from_config(
+            &jammi_db::config::ModelsConfig {
+                hub_cache_dir: Some(root),
+                ..Default::default()
+            },
+            &|_: &str| None,
+        )
+        .unwrap()
+    }
+
     fn tiny_bert_source(root: &std::path::Path, name: &str) -> ModelSource {
         let dir = root.join(name);
         std::fs::create_dir_all(&dir).unwrap();
@@ -1261,7 +1297,12 @@ mod single_flight_advisory_tests {
         let tmp = tempfile::tempdir().unwrap();
         let catalog_dir = tempfile::tempdir().unwrap();
         let catalog = Arc::new(Catalog::open(catalog_dir.path()).await.unwrap());
-        let resolver = ModelResolver::new(Arc::clone(&catalog), test_artifact_store()).unwrap();
+        let resolver = ModelResolver::new(
+            Arc::clone(&catalog),
+            test_artifact_store(),
+            test_hub_source(),
+        )
+        .unwrap();
         let scheduler = Arc::new(GpuScheduler::new_unlimited());
         let cache = Arc::new(ModelCache::new(resolver, device_config(), scheduler));
 
@@ -1352,6 +1393,18 @@ mod r5_f1_tokenizer_tests {
         )
     }
 
+    fn test_hub_source() -> crate::model::hub::HubSource {
+        let root = tempfile::tempdir().unwrap().keep();
+        crate::model::hub::HubSource::from_config(
+            &jammi_db::config::ModelsConfig {
+                hub_cache_dir: Some(root),
+                ..Default::default()
+            },
+            &|_: &str| None,
+        )
+        .unwrap()
+    }
+
     fn tiny_bert_source(root: &std::path::Path, name: &str) -> ModelSource {
         let dir = root.join(name);
         std::fs::create_dir_all(&dir).unwrap();
@@ -1389,7 +1442,12 @@ mod r5_f1_tokenizer_tests {
         let tmp = tempfile::tempdir().unwrap();
         let catalog_dir = tempfile::tempdir().unwrap();
         let catalog = Arc::new(Catalog::open(catalog_dir.path()).await.unwrap());
-        let resolver = ModelResolver::new(Arc::clone(&catalog), test_artifact_store()).unwrap();
+        let resolver = ModelResolver::new(
+            Arc::clone(&catalog),
+            test_artifact_store(),
+            test_hub_source(),
+        )
+        .unwrap();
         let scheduler = Arc::new(GpuScheduler::new_unlimited());
         let cache = ModelCache::new(resolver, device_config(), scheduler);
 
@@ -1480,7 +1538,12 @@ mod r5_f1_tokenizer_tests {
         let tmp = tempfile::tempdir().unwrap();
         let catalog_dir = tempfile::tempdir().unwrap();
         let catalog = Arc::new(Catalog::open(catalog_dir.path()).await.unwrap());
-        let resolver = ModelResolver::new(Arc::clone(&catalog), test_artifact_store()).unwrap();
+        let resolver = ModelResolver::new(
+            Arc::clone(&catalog),
+            test_artifact_store(),
+            test_hub_source(),
+        )
+        .unwrap();
         let scheduler = Arc::new(GpuScheduler::new_unlimited());
         let cache = ModelCache::new(resolver, device_config(), scheduler);
 
@@ -1605,6 +1668,18 @@ mod admission_wake_tests {
         )
     }
 
+    fn test_hub_source() -> crate::model::hub::HubSource {
+        let root = tempfile::tempdir().unwrap().keep();
+        crate::model::hub::HubSource::from_config(
+            &jammi_db::config::ModelsConfig {
+                hub_cache_dir: Some(root),
+                ..Default::default()
+            },
+            &|_: &str| None,
+        )
+        .unwrap()
+    }
+
     /// Copy the hermetic `tiny_bert` fixture into a fresh directory under
     /// `root/name` and return a `ModelSource::local` pointing at it, plus
     /// the weights file's byte length (the scheduler budget unit this
@@ -1660,7 +1735,12 @@ mod admission_wake_tests {
         let tmp = tempfile::tempdir().unwrap();
         let catalog_dir = tempfile::tempdir().unwrap();
         let catalog = Arc::new(Catalog::open(catalog_dir.path()).await.unwrap());
-        let resolver = ModelResolver::new(Arc::clone(&catalog), test_artifact_store()).unwrap();
+        let resolver = ModelResolver::new(
+            Arc::clone(&catalog),
+            test_artifact_store(),
+            test_hub_source(),
+        )
+        .unwrap();
 
         let (source_a, weights_len) = tiny_bert_source(tmp.path(), "admission_wake_model_a");
         let (source_b, weights_len_b) = tiny_bert_source(tmp.path(), "admission_wake_model_b");
@@ -1798,6 +1878,18 @@ mod esc_089_bookkeeping_tests {
         )
     }
 
+    fn test_hub_source() -> crate::model::hub::HubSource {
+        let root = tempfile::tempdir().unwrap().keep();
+        crate::model::hub::HubSource::from_config(
+            &jammi_db::config::ModelsConfig {
+                hub_cache_dir: Some(root),
+                ..Default::default()
+            },
+            &|_: &str| None,
+        )
+        .unwrap()
+    }
+
     /// A minimal, fabricated `ResolvedModel` — `complete_generic_registration`
     /// only reads `resolved.backend` and `resolved.weights_paths`, so this
     /// never needs a real resolve/load to drive its mechanism directly.
@@ -1820,7 +1912,8 @@ mod esc_089_bookkeeping_tests {
     }
 
     fn new_cache(catalog: Arc<Catalog>) -> ModelCache {
-        let resolver = ModelResolver::new(catalog, test_artifact_store()).unwrap();
+        let resolver =
+            ModelResolver::new(catalog, test_artifact_store(), test_hub_source()).unwrap();
         ModelCache::new(
             resolver,
             device_config(),

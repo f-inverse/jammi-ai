@@ -5,7 +5,7 @@ use datafusion::execution::session_state::SessionStateBuilder;
 use datafusion::prelude::{SessionConfig, SessionContext};
 use datafusion_federation::{FederatedQueryPlanner, FederationOptimizerRule};
 
-use crate::audit::{EnvSigningKeyStore, SigningKeyStore};
+use crate::audit::{EnvSigningKeyStore, FileSigningKeyStore, SigningKeyStore};
 use crate::catalog::backend::BackendImpl;
 use crate::catalog::segment_repo::IndexSegment;
 use crate::catalog::topic_repo::TopicRepo;
@@ -1053,14 +1053,15 @@ impl JammiSession {
     }
 }
 
-/// Resolve the signing-key store selected by `config.signing_key`. The single
-/// variant today resolves to [`EnvSigningKeyStore`]; callers that need a
-/// different store inject it through
-/// [`JammiSession::with_backend_broker_and_signing_key`] rather than extending
-/// this match.
+/// Resolve the signing-key store selected by `config.signing_key`:
+/// [`EnvSigningKeyStore`] for `env`, [`FileSigningKeyStore`] for `file`.
+/// Callers that need a store this config cannot name (a KMS adapter) inject
+/// it through [`JammiSession::with_backend_broker_and_signing_key`] rather
+/// than extending this match.
 fn signing_key_store_from_config(config: &JammiConfig) -> Arc<dyn SigningKeyStore> {
-    match config.signing_key {
+    match &config.signing_key {
         SigningKeyConfig::Env => Arc::new(EnvSigningKeyStore),
+        SigningKeyConfig::File { path } => Arc::new(FileSigningKeyStore::new(path.clone())),
     }
 }
 
@@ -1082,7 +1083,9 @@ async fn build_backend_from_config(config: &JammiConfig) -> Result<BackendImpl> 
             url,
             pool_size,
             max_lifetime_secs,
-        } => Ok(BackendImpl::postgres_from_url(url, *pool_size, *max_lifetime_secs).await?),
+        } => Ok(
+            BackendImpl::postgres_from_url(url.expose(), *pool_size, *max_lifetime_secs).await?,
+        ),
     }
 }
 
@@ -1095,8 +1098,15 @@ async fn build_broker_from_config(config: &JammiConfig) -> Result<Arc<dyn Trigge
         BrokerConfig::JetStream {
             url,
             retention_seconds,
-            credentials_path,
-        } => build_jetstream_broker(url, *retention_seconds, credentials_path.as_deref()).await,
+            credentials,
+        } => {
+            // `credentials` is the `.creds` CONTENTS (a resolved `Secret`),
+            // handed to the broker as the text async-nats parses. `url` is
+            // a `Secret` too (K2): a NATS URL can carry userinfo/token auth
+            // inline (`nats://user:pass@host`).
+            let creds = credentials.as_ref().map(crate::config::Secret::expose);
+            build_jetstream_broker(url.expose(), *retention_seconds, creds).await
+        }
     }
 }
 
@@ -1104,14 +1114,14 @@ async fn build_broker_from_config(config: &JammiConfig) -> Result<Arc<dyn Trigge
 async fn build_jetstream_broker(
     url: &str,
     retention_seconds: u64,
-    credentials_path: Option<&std::path::Path>,
+    credentials: Option<&str>,
 ) -> Result<Arc<dyn TriggerBroker>> {
-    let js = match credentials_path {
-        Some(p) => {
+    let js = match credentials {
+        Some(creds) => {
             crate::trigger::jetstream::JetStreamBroker::connect_with_credentials(
                 url,
                 retention_seconds,
-                p,
+                creds,
             )
             .await?
         }
@@ -1124,11 +1134,10 @@ async fn build_jetstream_broker(
 async fn build_jetstream_broker(
     _url: &str,
     _retention_seconds: u64,
-    _credentials_path: Option<&std::path::Path>,
+    _credentials: Option<&str>,
 ) -> Result<Arc<dyn TriggerBroker>> {
     Err(JammiError::Config(
-        "broker.kind = \"jet_stream\" requires the `jetstream-broker` cargo feature on jammi-db"
-            .into(),
+        "[broker.jet_stream] requires the `jetstream-broker` cargo feature on jammi-db".into(),
     ))
 }
 

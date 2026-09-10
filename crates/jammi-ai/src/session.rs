@@ -19,6 +19,7 @@ use crate::inference::adapter::BackendOutput;
 use crate::inference::observer::InferenceObserver;
 use crate::model::backend::DeviceConfig;
 use crate::model::cache::ModelCache;
+use crate::model::hub::HubSource;
 use crate::model::resolver::ModelResolver;
 use crate::model::{ModelSource, ModelTask};
 use crate::operator::inference_exec::InferenceExecBuilder;
@@ -36,6 +37,9 @@ pub struct InferenceSession {
     observer: Option<Arc<dyn InferenceObserver>>,
     ann_cache: Arc<AnnCache>,
     device_config: DeviceConfig,
+    /// The one Hugging Face Hub client this session's resolver and fine-tune
+    /// worker share (esc-096) — built once, below, from `[models]`.
+    hub: HubSource,
     /// Registry of open ephemeral sessions, shared with the timeout scanner.
     ephemeral_sessions: jammi_db::ephemeral::ActiveSessions,
 }
@@ -116,7 +120,17 @@ impl InferenceSession {
         // serves on another.
         let result_store = Arc::new(build_result_store(&inner, Arc::clone(&catalog))?);
         let artifact_store = result_store.artifact_store();
-        let resolver = ModelResolver::new(catalog.clone(), Arc::clone(&artifact_store))?;
+        // The K4 choke point (esc-096): `[models]` -> `HubSource`, exactly
+        // once per session. Every downstream Hub call (the resolver's
+        // HuggingFace arm, the fine-tune worker's HF fallback) shares this
+        // one client rather than each re-deriving its own from
+        // `hf_hub::api::sync::Api::new()`/`ApiBuilder::from_env()`. Process
+        // env is read HERE (the `HF_HOME`/`HF_ENDPOINT`/`HF_TOKEN`
+        // fallbacks) — never inside `JammiConfig::load_from`, which stays
+        // process-env-free.
+        let hub = HubSource::from_config(&inner.config().models, &|k: &str| std::env::var(k).ok())?;
+        let resolver =
+            ModelResolver::new(catalog.clone(), Arc::clone(&artifact_store), hub.clone())?;
         let device_config = DeviceConfig::from_config(inner.config());
         let scheduler = Arc::new(GpuScheduler::for_device(
             device_config.gpu_device,
@@ -142,6 +156,7 @@ impl InferenceSession {
             observer,
             ann_cache,
             device_config,
+            hub,
             ephemeral_sessions: jammi_db::ephemeral::ActiveSessions::new(),
         })
     }
@@ -402,6 +417,13 @@ impl InferenceSession {
     /// reloaded through, so a cross-host worker fleet shares trained models.
     pub fn artifact_store(&self) -> Arc<ArtifactStore> {
         Arc::clone(&self.artifact_store)
+    }
+
+    /// The one Hugging Face Hub client this session's resolver was built
+    /// with (esc-096) — the fine-tune worker's HF fallback path threads this
+    /// through `RunFineTuneParams` rather than building its own.
+    pub(crate) fn hub(&self) -> &HubSource {
+        &self.hub
     }
 
     /// The device configuration the session resolves candle tensors onto — the

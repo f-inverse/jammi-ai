@@ -1,7 +1,5 @@
 # Catalog Backend and Trigger Broker
 
-> Coordinator to relocate to the docs site (C3) when scaffold lands.
-
 Jammi's catalog (models, sources, eval runs, mutable companion tables) and
 trigger broker (provenance channels, evidence streams) are selected through
 two fields on `JammiConfig`: `catalog` and `broker`. The dev-laptop default
@@ -10,47 +8,54 @@ for Postgres + JetStream.
 
 ## TOML schema
 
-The catalog stanza is a tagged enum keyed by `kind`:
+The catalog stanza is an externally tagged enum: the variant name is its own
+TOML table (or a bare string for a variant with no required fields):
 
 ```toml
-[catalog]
-kind = "sqlite"
+[catalog.sqlite]
 # path = "/var/lib/jammi/catalog.db"   # optional; defaults to {artifact_dir}/catalog.db
 ```
 
 ```toml
-[catalog]
-kind = "postgres"
-url = "postgres://user:pass@host:5432/jammi"
+[catalog.postgres]
+url = "postgres://user:pass@host:5432/jammi?sslmode=verify-full&sslrootcert=/etc/ssl/certs/ca-certificates.crt"
 pool_size = 16
 max_lifetime_secs = 1800
 ```
 
+`url` should carry `?sslmode=verify-full` for any connection that leaves a
+trusted network: `sslmode=require` upgrades the connection to TLS but never
+verifies the server's certificate (it defeats a MITM only when the network
+path is already trusted), and `sqlx` verifies against the **webpki** root
+store rather than the OS trust store, so a private CA needs its own
+`sslrootcert=` path even on a host that already trusts it system-wide.
+
 The broker stanza follows the same shape:
 
 ```toml
-[broker]
-kind = "in_memory"
+broker = "in_memory"
 ```
 
 ```toml
-[broker]
-kind = "jet_stream"
+[broker.jet_stream]
 url = "nats://nats.svc:4222"
 retention_seconds = 604800
-credentials_path = "/var/run/secrets/nats.creds"
+credentials = { file = "/var/run/secrets/nats.creds" }
 ```
 
-`broker.kind = "jet_stream"` requires the `jetstream-broker` cargo feature
+`[broker.jet_stream]` requires the `jetstream-broker` cargo feature
 on `jammi-db`; selecting it without the feature returns
 `JammiError::Config` rather than panicking at session construction time.
 
 ## Environment variable interpolation
 
 `JammiConfig::load` substitutes `${NAME}` patterns from the process
-environment before TOML parsing. The rules:
+environment before TOML parsing (`load_from`/`parse_from` take the same
+lookup as an explicit map instead — see [Configuration](./configuration.md)
+— so a test never touches real process env). The rules:
 
-- `${NAME}` is replaced by the value of `std::env::var("NAME")`.
+- `${NAME}` is replaced by the looked-up value of `NAME` (`load`: the
+  process environment via `std::env::var`).
 - A missing variable is an error. The loader never silently substitutes an
   empty string — that is a common source of "deployed config has an empty
   Postgres URL" outages.
@@ -61,22 +66,20 @@ environment before TOML parsing. The rules:
 - Interpolation is one-pass and not recursive: `${X}`'s value is not
   re-scanned.
 
-Combined with the tagged-enum shape:
+Combined with the externally tagged shape:
 
 ```toml
 artifact_dir = "/var/lib/jammi"
 
-[catalog]
-kind = "postgres"
-url = "${POSTGRES_URL}"
+[catalog.postgres]
+url = "${POSTGRES_URL}?sslmode=verify-full&sslrootcert=/etc/ssl/certs/ca-certificates.crt"
 pool_size = 16
 max_lifetime_secs = 1800
 
-[broker]
-kind = "jet_stream"
+[broker.jet_stream]
 url = "nats://${NATS_HOST}:4222"
 retention_seconds = 604800
-credentials_path = "/var/run/secrets/nats.creds"
+credentials = { file = "/var/run/secrets/nats.creds" }
 ```
 
 A working copy of this file ships at
@@ -181,7 +184,7 @@ and deletion-arm detail.
 | --- | --- | --- |
 | Persistence | In-process only; lost on restart. | NATS server retains streams per `retention_seconds`. |
 | Cross-process delivery | None — a publish in process A is invisible to a subscriber in process B. | All subscribers (any process, any host) see every published batch within the retention window. |
-| Auth | None. | Anonymous or NATS `.creds` file via `credentials_path`. |
+| Auth | None. | Anonymous or NATS `.creds` file contents via `credentials`. |
 | Operational footprint | None. | One NATS server (or cluster). |
 
 In-memory is fine for tests, local development, and single-process server

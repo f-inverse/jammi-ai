@@ -338,7 +338,12 @@ fn write_projection_adapter(dir: &Path, marker_value: f32) {
 async fn resolve_and_load_with_adapter(dir: &Path, adapter_dir: &Path) -> LoadedModel {
     let catalog_dir = tempdir().unwrap();
     let catalog = Arc::new(Catalog::open(catalog_dir.path()).await.unwrap());
-    let resolver = ModelResolver::new(catalog, crate::common::test_artifact_store()).unwrap();
+    let resolver = ModelResolver::new(
+        catalog,
+        crate::common::test_artifact_store(),
+        crate::common::test_hub_source(),
+    )
+    .unwrap();
     let source = ModelSource::local(dir);
     let mut resolved = resolver
         .resolve(&source, ModelTask::TextEmbedding, None)
@@ -402,7 +407,12 @@ async fn missing_adapter_files_under_some_adapter_path_refuses_to_load() {
 
     let catalog_dir = tempdir().unwrap();
     let catalog = Arc::new(Catalog::open(catalog_dir.path()).await.unwrap());
-    let resolver = ModelResolver::new(catalog, crate::common::test_artifact_store()).unwrap();
+    let resolver = ModelResolver::new(
+        catalog,
+        crate::common::test_artifact_store(),
+        crate::common::test_hub_source(),
+    )
+    .unwrap();
     let source = ModelSource::local(&dir);
     let mut resolved = resolver
         .resolve(&source, ModelTask::TextEmbedding, None)
@@ -469,7 +479,12 @@ const HTSAT_CLAP_TINY_DIGEST: &str =
 async fn resolve_and_load_for_task(dir: &Path, task: ModelTask) -> LoadedModel {
     let catalog_dir = tempdir().unwrap();
     let catalog = Arc::new(Catalog::open(catalog_dir.path()).await.unwrap());
-    let resolver = ModelResolver::new(catalog, crate::common::test_artifact_store()).unwrap();
+    let resolver = ModelResolver::new(
+        catalog,
+        crate::common::test_artifact_store(),
+        crate::common::test_hub_source(),
+    )
+    .unwrap();
     let resolved = resolver
         .resolve(&ModelSource::local(dir), task, None)
         .await

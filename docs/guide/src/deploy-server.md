@@ -153,13 +153,65 @@ Set `gpu.device = -1` for CPU-only deployment. On a GPU build, an unavailable de
 
 ## Environment variable overrides
 
-Every config field can be overridden with environment variables, useful for containerized deployments:
+Every config field can be overridden with environment variables, useful for
+containerized deployments: `JAMMI_<PATH>`, path segments joined by `__`, works
+for every field in the tree — not a hand-picked subset — and a bare
+`JAMMI_<FIELD>` (no `__`) works for a top-level one. See
+[Configuration](./configuration.md#environment-variable-overrides) for the
+full rule.
 
 ```bash
 JAMMI_SERVER__FLIGHT_LISTEN=0.0.0.0:9081 \
 JAMMI_GPU__DEVICE=-1 \
 JAMMI_LOGGING__FORMAT=json \
 jammi-server
+```
+
+### A production shape, entirely from the environment
+
+A Postgres catalog, a JetStream broker, an S3 result root, and a file-backed
+audit signing key — Shape C's stack — need no TOML file at all: every field
+resolves from `JAMMI_*` variables through the same layered loader.
+
+```bash
+export JAMMI_CATALOG__POSTGRES__URL="postgres://jammi:${POSTGRES_PASSWORD}@postgres.internal:5432/jammi?sslmode=verify-full&sslrootcert=/etc/ssl/certs/ca-certificates.crt"
+export JAMMI_CATALOG__POSTGRES__POOL_SIZE=16
+export JAMMI_BROKER__JET_STREAM__URL="nats://nats.internal:4222"
+export JAMMI_BROKER__JET_STREAM__CREDENTIALS__FILE=/run/secrets/nats.creds
+export JAMMI_STORAGE__RESULT_ROOT="s3://jammi-results/prod"
+export JAMMI_STORAGE__CLOUD__S3__REGION=us-east-1
+export JAMMI_SIGNING_KEY__FILE__PATH=/run/secrets/jammi-audit-master-key
+export JAMMI_MODELS__HUB_TOKEN__FILE=/run/secrets/hf-token
+export JAMMI_SERVER__SERVICES=all
+jammi-server
+```
+
+The equivalent TOML file — the two are interchangeable, and either one
+overrides the other's fields when both are present:
+
+```toml
+[catalog.postgres]
+url = "postgres://jammi:${POSTGRES_PASSWORD}@postgres.internal:5432/jammi?sslmode=verify-full&sslrootcert=/etc/ssl/certs/ca-certificates.crt"
+pool_size = 16
+
+[broker.jet_stream]
+url = "nats://nats.internal:4222"
+credentials = { file = "/run/secrets/nats.creds" }
+
+[storage]
+result_root = "s3://jammi-results/prod"
+
+[storage.cloud.s3]
+region = "us-east-1"
+
+[signing_key.file]
+path = "/run/secrets/jammi-audit-master-key"
+
+[models]
+hub_token = { file = "/run/secrets/hf-token" }
+
+[server]
+services = "all"
 ```
 
 ## Health, readiness, and metrics
@@ -211,31 +263,26 @@ The typed gRPC surface is what an edge runtime speaks (it has no HTTP/2 client f
 
 The server drains active connections on SIGTERM / Ctrl+C before exiting. In-flight queries complete; long-running operations started via the library are unaffected.
 
-## Security posture: trusted-network
+## The identity seam
 
-The server performs **no authentication**. There is no token, bearer, or
-credential check on the gRPC or Flight SQL surfaces, and `SetTenant` binds
-whatever tenant a caller asks for — so **any client that can reach the
-endpoint can claim any tenant and invoke any mounted verb**. Tenant scope is an
-isolation boundary *within* a trusted caller's traffic (it keeps one tenant's
-rows out of another's results), **not** an access-control boundary against an
-untrusted one. This holds for both surfaces equally: the `jammi` admin CLI
-(control plane) and the SDK data plane.
+The server performs **no authentication** on its own — treat it as
+**trusted-network** and put access control in front of it, or supply your own
+`TenantResolver` at the seam the engine ships for exactly this. This page does
+not duplicate that contract a second time; see:
 
-Treat the server as **trusted-network**: run it where only trusted clients can
-reach it, and supply access control with your own infrastructure —
+- [Security Posture](./security.md) for the full threat model — what the
+  engine defends, what it explicitly does not, and the trusted-network
+  assumption every deployment inherits; and
+- [Bring your own auth](./multi-tenant.md#bring-your-own-auth) for the
+  `TenantResolver` seam itself: one resolver, plugged into
+  `assemble_grpc_chain` once, authenticates both the gRPC control plane and
+  the Flight `db.sql` lane.
 
-- a private network / VPC with the gRPC + health ports (`8081` / `8080`) closed
-  to the public internet;
-- network policy, security groups, or a firewall restricting who may connect;
-- or an authenticating reverse proxy / gateway in front (e.g. mTLS, or a proxy
-  that validates identity and injects the tenant), terminating untrusted traffic
-  before it reaches the engine.
-
-Do not expose the endpoint directly to an untrusted network. The engine does
-not invent or verify identities — that is a deployment concern layered above it
-([ADR-00](https://github.com/f-inverse/jammi-ai/blob/main/docs/plans/cp9-substrate-primitives/ADR-00-tenant-identifier.md),
-*Engine does not invent tenants*).
+Run the server where only trusted clients can reach it (a private network /
+VPC with the gRPC + health ports, `8081` / `8080`, closed to the public
+internet; network policy or a firewall; or an authenticating reverse proxy) —
+or wire an authenticating `TenantResolver` in front — before exposing it
+beyond a trusted caller.
 
 ## Deploying as a container
 
@@ -273,7 +320,7 @@ docker compose -f oss-server.yml up
 
 ### Persistence
 
-`/var/lib/jammi` holds the catalog DB, model weights, and indices. Zero-config `jammi-server` writes its SQLite catalog there (the image sets `JAMMI_ARTIFACT_DIR=/var/lib/jammi`). On the `jammi-ai-server-cu12` image the same volume also holds the CUDA PTX-JIT compute cache at `/var/lib/jammi/.nv-cache` (see [GPU serving](#gpu-serving)) — mounting the volume is what makes that cache durable across container restarts. The Dockerfile declares `/var/lib/jammi` as a `VOLUME` owned by uid `65532` — a named Docker volume or no mount at all just works; a bind mount must have the host directory writable by uid `65532`:
+`/var/lib/jammi` holds the catalog DB, model weights, and indices. Zero-config `jammi-server` writes its SQLite catalog there (the image sets `JAMMI_ARTIFACT_DIR=/var/lib/jammi`) and its Hugging Face Hub cache at `/var/lib/jammi/hf` (the image sets `HF_HOME=/var/lib/jammi/hf`, the fallback [`[models] hub_cache_dir`](./configuration.md#catalog-broker-signing-key-storage-and-model-source) reads when unset). On the `jammi-ai-server-cu12` image the same volume also holds the CUDA PTX-JIT compute cache at `/var/lib/jammi/.nv-cache` (see [GPU serving](#gpu-serving)) — mounting the volume is what makes both caches durable across container restarts. The Dockerfile declares `/var/lib/jammi` as a `VOLUME` owned by uid `65532` — a named Docker volume or no mount at all just works; a bind mount must have the host directory writable by uid `65532`:
 
 ```bash
 # Bind mount on the host.
@@ -329,14 +376,14 @@ docker run --rm --gpus all \
   ghcr.io/f-inverse/jammi-ai-server-cu12:latest
 ```
 
-With no TOML the server selects GPU device `0` by default. To override the device or any other knob, pass a config to `serve`:
+With no TOML the server selects GPU device `0` by default. To override the device or any other knob, pass a config with `--config` (or bind-mount it straight at `/etc/jammi/jammi.toml`, one of the resolution order's own default locations — see [Configuration](./configuration.md) — and drop the flag entirely):
 
 ```bash
 docker run --rm --gpus all \
   -p 8080:8080 -p 8081:8081 \
   -v jammi_data:/var/lib/jammi \
   -v $(pwd)/jammi.toml:/etc/jammi/jammi.toml:ro \
-  ghcr.io/f-inverse/jammi-ai-server-cu12:latest serve --config /etc/jammi/jammi.toml
+  ghcr.io/f-inverse/jammi-ai-server-cu12:latest --config /etc/jammi/jammi.toml
 ```
 
 Set `gpu.device = 0` in `jammi.toml` (or `JAMMI_GPU__DEVICE=0`) to select the CUDA device; see [GPU configuration](#gpu-configuration). The image is compiled for compute capability `8.0` (Ampere) and runs on `8.0` and every newer datacenter GPU — A10/A6000 (`8.6`), L40S (`8.9`), H100 (`9.0`) — via PTX forward-compatibility. Turing GPUs (e.g. Tesla T4, `7.5`) are not supported.

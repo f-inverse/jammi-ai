@@ -23,6 +23,7 @@ mod gguf_qlora;
 mod graph_context;
 mod graph_finetune;
 mod graph_propagation;
+mod hub_source;
 mod import_pipeline;
 mod inference;
 mod jammi;

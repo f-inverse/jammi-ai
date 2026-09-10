@@ -9,6 +9,7 @@ use jammi_db::store::ArtifactStore;
 use super::arch;
 use super::backend::gguf::estimate_gguf_residency;
 use super::backend::safetensors_residency::estimate_safetensors_residency;
+use super::hub::HubSource;
 use super::{
     BackendType, ModelId, ModelSource, ModelTask, ResolvedModel, TokenizerSource, WeightsFormat,
 };
@@ -48,19 +49,22 @@ pub struct ModelResolver {
     /// object-store prefix the training worker wrote, fetched into a local cache
     /// dir candle loads from — so a cross-host worker fleet shares adapters.
     artifact_store: Arc<ArtifactStore>,
-    hf_api: hf_hub::api::sync::Api,
+    hub: HubSource,
 }
 
 impl ModelResolver {
     /// Create a resolver backed by the given catalog, artifact store, and
-    /// HuggingFace Hub API.
-    pub fn new(catalog: Arc<Catalog>, artifact_store: Arc<ArtifactStore>) -> Result<Self> {
-        let hf_api = hf_hub::api::sync::Api::new()
-            .map_err(|e| JammiError::Config(format!("HF Hub init failed: {e}")))?;
+    /// shared [`HubSource`] (built once at the session choke point —
+    /// `crate::session::InferenceSession::wrap` — never re-derived here).
+    pub fn new(
+        catalog: Arc<Catalog>,
+        artifact_store: Arc<ArtifactStore>,
+        hub: HubSource,
+    ) -> Result<Self> {
         Ok(Self {
             catalog,
             artifact_store,
-            hf_api,
+            hub,
         })
     }
 
@@ -87,6 +91,27 @@ impl ModelResolver {
         match source {
             ModelSource::Local(path) => self.resolve_local(path, source, task, backend_hint),
             ModelSource::HuggingFace(repo_id) => {
+                // `[models] offline` (esc-096): the catalog lookup above is
+                // offline's entire source of truth — reaching this arm means
+                // no catalog row resolved this model (or its row's
+                // artifact_path no longer exists on disk), so a warm Hub
+                // cache directory sitting on disk for this exact repo does
+                // NOT make it a hit. Checked here, after the lookup, so a
+                // model that WAS previously resolved online (and so has a
+                // catalog row) keeps loading offline exactly as before —
+                // only a never-resolved repo id is refused. See
+                // `super::hub`'s module docs for why this promise is
+                // Hub-only: the fine-tuned arm above already returned before
+                // reaching this match, and its adapter fetch never touches
+                // the Hub at all.
+                if self.hub.offline() {
+                    return Err(JammiError::Model {
+                        model_id: source.to_string(),
+                        message: format!(
+                            "offline: `{repo_id}` was never resolved online on this catalog"
+                        ),
+                    });
+                }
                 self.resolve_hf_hub(repo_id, source, task, backend_hint)
             }
         }
@@ -523,7 +548,7 @@ impl ModelResolver {
         task: ModelTask,
         backend_hint: Option<BackendType>,
     ) -> Result<ResolvedModel> {
-        let repo = self.hf_api.model(repo_id.to_string());
+        let repo = self.hub.api().model(repo_id.to_string());
 
         // NETWORK order, not disk order: a hub repo cannot be stat-ed, so
         // this stays a `repo.get` chain. The NAMES and their order come from

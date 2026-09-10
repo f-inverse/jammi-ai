@@ -2,6 +2,11 @@ pub mod arch;
 pub mod backend;
 pub mod cache;
 pub mod clip_bpe;
+/// The single Hugging Face Hub client (esc-096): `[models]` -> `HubSource`,
+/// built once at the `jammi-ai` session choke point and shared by every
+/// resolver/worker call site. See [`hub`]'s module docs for the precedence
+/// chain and the `offline` promise.
+pub mod hub;
 /// The shared "is this error message OOM-shaped" home. Neutral ground
 /// between `inference` (the batch-halving retry) and `fine_tune` (the
 /// training OOM guidance classifier) — neither reaches into the other's

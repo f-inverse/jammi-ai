@@ -1,8 +1,9 @@
 name: Image (CI base, CPU)
 
-# Builds the CPU CI base image (jammi-ai-ci) that the CPU workflows run inside.
-# Thin caller of the shared _ci-base-image reusable. Rebuilds on a change to its
-# own Dockerfile or the pinned toolchain (narrowed from `.docker/**` so a
+# Builds the CPU CI base image (jammi-ai-ci) -- now a linux/amd64 + linux/arm64
+# multi-arch index -- that the CPU workflows run inside. Thin caller of the
+# shared _ci-base-image reusable. Rebuilds on a change to its own Dockerfile,
+# the pinned toolchain, or the reusable itself (narrowed from `.docker/**` so a
 # CUDA-only Dockerfile change no longer needlessly rebuilds the CPU base).
 
 on:
@@ -11,6 +12,8 @@ on:
     paths:
       - ".docker/ci.Dockerfile"
       - "rust-toolchain.toml"
+      - ".github/workflows/_ci-base-image.yml"
+      - "ci/scripts/check_merged_index_platforms.sh"
   workflow_dispatch:
 
 # Serialize per ref, never cancel: an image push in flight must finish,
@@ -45,3 +48,4 @@ jobs:
     with:
       image_suffix: ci
       dockerfile: .docker/ci.Dockerfile
+      platforms: linux/amd64,linux/arm64

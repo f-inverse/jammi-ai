@@ -1,26 +1,63 @@
 name: setup-rust-ci
 description: >
-  Shared per-job Rust CI setup: runs the sccache GHA-cache action and exports
-  SCCACHE_GHA_ENABLED + RUSTFLAGS via $GITHUB_ENV, so a job's cache backend and
-  its linker/warnings posture live in ONE definition instead of being repeated
-  in every workflow. Must run AFTER `actions/checkout@v4` — this is a
-  local-path composite (`./.github/actions/setup-rust-ci`), so the checkout
-  step has to have already materialized it. Bump the sccache-action pin HERE,
+  Shared per-job Rust CI setup: runs the sccache GHA-cache action and
+  optionally exports a `-D warnings` posture via per-target
+  `CARGO_TARGET_<TRIPLE>_RUSTFLAGS` variables, so a job's cache backend and
+  its warnings posture live in ONE definition instead of being repeated in
+  every workflow. This action NEVER exports a bare `RUSTFLAGS`: a bare
+  `RUSTFLAGS` env var REPLACES (never joins with) `.cargo/config.toml`'s
+  per-target `rustflags` array, which is where the mold linker flag and the
+  aarch64-linux ISA-floor `target-feature` flags live -- exporting one would
+  silently drop both. `CARGO_TARGET_<TRIPLE>_RUSTFLAGS`, by contrast, JOINS
+  with the config file's per-target `rustflags` for that SAME triple
+  (verified against a real cargo; this is cargo's own per-target-vs-global
+  precedence, not a per-target-vs-per-target one) -- so this action only
+  ever ADDS `-D warnings` on top of whatever `.cargo/config.toml` already
+  pins for the target actually being built, never replaces it. Must run
+  AFTER `actions/checkout@v4` — this is a local-path composite
+  (`./.github/actions/setup-rust-ci`), so the checkout step has to have
+  already materialized it, AND after the job's own Rust toolchain is on
+  PATH (this action reads `rustc -vV` to name the host's own
+  `CARGO_TARGET_*_RUSTFLAGS` variable). Bump the sccache-action pin HERE,
   not in each consuming workflow.
+  A caller must NEVER export a bare `RUSTFLAGS` of its own, at the job or
+  step level, after this action runs -- that replaces this action's
+  per-target variables (and config.toml) exactly the same way, from
+  cargo's perspective, whichever env var a workflow author happens to
+  spell.
 
 inputs:
-  rustflags:
+  deny-warnings:
     description: >
-      RUSTFLAGS to export for the rest of the job. Defaults to the shared
-      "-D warnings -C link-arg=-fuse-ld=mold" posture the hermetic Rust lanes
-      use. Pass an explicit override for a job whose real config genuinely
-      differs — e.g. "-C link-arg=-fuse-ld=mold" with no `-D warnings` for a
-      lane that must not fail on a warning outside its own crates, or ""
-      to leave RUSTFLAGS unset entirely (falling back to .cargo/config.toml's
-      per-target mold default). Never silently force a job onto a flag set it
-      didn't have.
+      Accepts exactly "true" or "false" -- any other value is rejected with
+      an `::error::` naming it, before either branch below runs. "true"
+      (the default) exports `CARGO_TARGET_<HOST_TRIPLE>_RUSTFLAGS=-D
+      warnings` for the runner's own host triple (`rustc -vV`'s `host:`
+      line, `-` -> `_`, uppercased -- cargo's own env-var naming rule for a
+      per-target rustflags variable), so the hermetic Rust lanes fail on any
+      warning. "false" is for a lane that must not fail on a warning
+      outside its own crates (e.g. a release/packaging build, or a
+      third-party-crate install step) -- this SKIPS the export entirely;
+      it never forces a job onto a flag set it didn't have. Mold (Linux)
+      and the aarch64-linux ISA floor (`+fp16`) are NEVER this input's
+      concern either way -- both live in `.cargo/config.toml`'s own
+      per-target `rustflags` and apply UNCONDITIONALLY, joined with (not
+      replaced by) whatever this action does or does not export.
     required: false
-    default: "-D warnings -C link-arg=-fuse-ld=mold"
+    default: "true"
+  target:
+    description: >
+      An additional target triple to also export
+      `CARGO_TARGET_<TRIPLE>_RUSTFLAGS=-D warnings` for, when `deny-warnings`
+      is "true" -- for a job that cross-compiles to a target other than the
+      runner's own host triple. No caller in this repo cross-compiles today
+      (release-binaries.yml's linux-aarch64 leg builds NATIVELY on an arm
+      runner, and its aarch64-apple-darwin leg builds natively on macOS);
+      this input exists for the first one that does, so that lane does not
+      have to reinvent the host-triple-naming logic this action already
+      carries.
+    required: false
+    default: ""
   no-sccache:
     description: >
       Set to "true" to skip the sccache-action step and the SCCACHE_GHA_ENABLED
@@ -38,9 +75,58 @@ runs:
 
     - shell: bash
       run: |
+        set -euo pipefail
         if [ "${{ inputs.no-sccache }}" != "true" ]; then
           echo "SCCACHE_GHA_ENABLED=true" >> "$GITHUB_ENV"
         fi
-        if [ -n "${{ inputs.rustflags }}" ]; then
-          echo "RUSTFLAGS=${{ inputs.rustflags }}" >> "$GITHUB_ENV"
+
+        # Fail closed on anything other than the two literal values this
+        # input accepts -- a typo'd or expression-derived value that is
+        # neither "true" nor "false" would otherwise silently fall through
+        # the `= "true"` check below as if it meant "false" (skip the
+        # export), which is exactly backwards for a caller who meant to
+        # turn the warnings gate ON and mis-typed it.
+        deny_warnings="${{ inputs.deny-warnings }}"
+        if [ "$deny_warnings" != "true" ] && [ "$deny_warnings" != "false" ]; then
+          echo "::error::deny-warnings must be exactly 'true' or 'false', got: '$deny_warnings'" >&2
+          exit 1
+        fi
+
+        if [ "${{ inputs.deny-warnings }}" = "true" ]; then
+          # Cargo's own rule for the per-target env-var spelling of
+          # `target.<triple>.rustflags`: uppercase the triple, `-` -> `_`.
+          # This variable JOINS with (never replaces) whatever
+          # .cargo/config.toml pins for the SAME triple -- unlike a bare
+          # RUSTFLAGS, which would replace it (see this file's own module
+          # doc for the verified distinction).
+          #
+          # Fail closed on an unresolvable triple: an empty or malformed
+          # `host:` line (a future rustc changing its `-vV` format, or any
+          # other reason `sed` finds nothing) would otherwise silently
+          # write `CARGO_TARGET__RUSTFLAGS=-D warnings` -- a variable name
+          # cargo never looks at, so the warnings gate is lost with no
+          # error at all. Shape-checked, not just non-empty: a triple is
+          # at minimum `<arch>-<rest>` (e.g. `aarch64-unknown-linux-gnu`,
+          # `x86_64-apple-darwin`).
+          host_triple="$(rustc -vV | sed -n 's/^host: //p')"
+          if [ -z "$host_triple" ]; then
+            echo "::error::rustc -vV reported no host triple -- cannot export the -D warnings floor" >&2
+            exit 1
+          fi
+          if ! [[ "$host_triple" =~ ^[a-z0-9_]+-[a-z0-9_-]+$ ]]; then
+            echo "::error::rustc -vV reported a host triple in an unexpected shape: '$host_triple'" >&2
+            exit 1
+          fi
+          host_var="CARGO_TARGET_$(echo "$host_triple" | tr 'a-z-' 'A-Z_')_RUSTFLAGS"
+          echo "${host_var}=-D warnings" >> "$GITHUB_ENV"
+
+          target_triple="${{ inputs.target }}"
+          if [ -n "$target_triple" ]; then
+            if ! [[ "$target_triple" =~ ^[a-z0-9_]+-[a-z0-9_-]+$ ]]; then
+              echo "::error::the target input is in an unexpected shape: '$target_triple'" >&2
+              exit 1
+            fi
+            target_var="CARGO_TARGET_$(echo "$target_triple" | tr 'a-z-' 'A-Z_')_RUSTFLAGS"
+            echo "${target_var}=-D warnings" >> "$GITHUB_ENV"
+          fi
         fi

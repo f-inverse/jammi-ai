@@ -1,11 +1,22 @@
+use std::collections::BTreeMap;
 use std::fmt;
 use std::path::{Path, PathBuf};
 use std::str::FromStr;
 
-use serde::{Deserialize, Serialize};
+use serde::{Deserialize, Deserializer, Serialize};
 
 use crate::error::{JammiError, Result};
-use crate::storage::CloudConfig;
+use crate::storage::{AzureConfig, CloudConfig, GcsConfig, R2Config, S3Config};
+
+mod env_map;
+mod layers;
+pub mod secret;
+#[cfg(test)]
+mod tests;
+
+pub use secret::{Secret, SecretSource};
+
+use layers::Node;
 
 // ─── Config-layer enums ─────────────────────────────────────────────────────
 
@@ -145,20 +156,51 @@ impl FromStr for LogFormat {
 /// ```toml
 /// artifact_dir = "/var/lib/jammi"
 ///
-/// [catalog]
-/// kind = "postgres"
-/// url = "${POSTGRES_URL}"
+/// [catalog.postgres]
+/// url = "${POSTGRES_URL}?sslmode=verify-full&sslrootcert=/etc/ssl/certs/ca-certificates.crt"
 /// pool_size = 16
 /// max_lifetime_secs = 1800
 ///
-/// [broker]
-/// kind = "jet_stream"
+/// [broker.jet_stream]
 /// url = "nats://${NATS_HOST}:4222"
 /// retention_seconds = 604800
-/// credentials_path = "/var/run/secrets/nats.creds"
+/// credentials = { file = "/var/run/secrets/nats.creds" }
 /// ```
+///
+/// `catalog.postgres.url` should carry `?sslmode=verify-full` (plus
+/// `sslrootcert=` naming a CA bundle, unless the server's certificate chains
+/// to a public root) rather than the sslx default `prefer` — `sqlx` verifies
+/// against the **webpki** root store, not the OS trust store, so a private CA
+/// needs `sslrootcert=` even on a host that otherwise trusts it system-wide.
+/// `sslmode=require` upgrades the connection to TLS but never verifies the
+/// server's certificate — it defeats a MITM only when the network path is
+/// already trusted, which is not the assumption behind reaching outside the
+/// process. See the guide's "Catalog Backend and Trigger Broker" page.
+///
+/// # Secrets
+///
+/// Secret-valued fields (`catalog.postgres.url`, `broker.jet_stream.url`,
+/// `broker.jet_stream.credentials`, `inference.http.headers` values,
+/// `storage.cloud.*`'s credential fields) are
+/// typed [`Secret`]: they accept either the value inline or `{ file = "…" }`
+/// naming a file that holds it, resolve at load, and render as `Secret(***)`
+/// in every `Debug` — so a `{:?}` of the whole config carries no secret. See
+/// [`secret`] for the rules.
+///
+/// # Environment variable overrides
+///
+/// Every field above is overridable: `JAMMI_<PATH>` (segments joined by
+/// `__`, e.g. `JAMMI_CATALOG__POSTGRES__URL`) always resolves as config, and
+/// a bare `JAMMI_<FIELD>` (no `__`) resolves as config iff `FIELD` exactly
+/// names one of `JammiConfig`'s own top-level fields — every other
+/// `JAMMI_*` name is a runtime knob outside this layer and is left alone. An
+/// unknown section, an unknown key, or a value outside a field's domain is a
+/// load-time error naming the offending variable — never a silent drop.
+/// [`JammiConfig::load_from`] is the layering entry point;
+/// [`JammiConfig::load`] is `load_from` against the real process
+/// environment.
 #[derive(Debug, Clone, Deserialize)]
-#[serde(default)]
+#[serde(default, deny_unknown_fields)]
 pub struct JammiConfig {
     /// Root directory for all persisted artifacts (catalog DB, model weights, indices).
     /// Default: platform-specific data directory, or `.jammi` as fallback.
@@ -194,6 +236,10 @@ pub struct JammiConfig {
     /// `r2://`/`s3://`/`gs://`/`azure://` sources resolve via the SDK's
     /// default credential chain.
     pub storage: StorageConfig,
+    /// Model source (Hugging Face Hub cache root, endpoint, token, offline
+    /// mode). Built once into a `HubSource` at the `jammi-ai` session
+    /// choke point; `jammi-db` only carries the raw, typed selection.
+    pub models: ModelsConfig,
 }
 
 /// Object-storage configuration for Jammi-owned result tables and for
@@ -220,8 +266,7 @@ pub struct JammiConfig {
 /// [storage]
 /// result_root = "r2://jammi-results/prod"
 ///
-/// [storage.cloud]
-/// kind = "r2"
+/// [storage.cloud.r2]
 /// account_id = "abc123def456"
 /// # access_key_id / secret_access_key come from the environment:
 /// #   AWS_ACCESS_KEY_ID, AWS_SECRET_ACCESS_KEY
@@ -233,12 +278,16 @@ pub struct JammiConfig {
 /// [storage]
 /// result_root = "s3://jammi-results/prod"
 ///
-/// [storage.cloud]
-/// kind = "s3"
+/// [storage.cloud.s3]
 /// region = "us-east-1"
 /// ```
+///
+/// `[storage.cloud]` is externally tagged by cloud provider — `s3`, `r2`,
+/// `gcs`, or `azure` — rather than a `kind` key inside one shared table
+/// (H2/H16); a bare `storage.cloud = "s3"` also selects a variant with its
+/// per-field defaults.
 #[derive(Debug, Clone, Default, Deserialize)]
-#[serde(default)]
+#[serde(default, deny_unknown_fields)]
 pub struct StorageConfig {
     /// Storage URL the session roots result tables under. `None` → local
     /// `{artifact_dir}/jammi_db/`.
@@ -246,29 +295,164 @@ pub struct StorageConfig {
     /// Default per-cloud driver credentials. Threaded to every driver the
     /// session builds for the result root and for cloud sources. `None` → the
     /// SDK default credential chain (env vars, instance profile, …).
+    ///
+    /// Deserializes through the config-only, externally-tagged
+    /// `CloudSection` wrapper (never [`CloudConfig`]'s own internally
+    /// tagged, non-`deny_unknown_fields` shape — that shape stays exactly as
+    /// persisted in `sources.options` rows) and converts; see
+    /// `cloud_via_section`.
+    #[serde(deserialize_with = "cloud_via_section")]
     pub cloud: Option<CloudConfig>,
+}
+
+/// Config-only, externally tagged mirror of [`CloudConfig`]'s four
+/// variants, used solely to deserialize `[storage.cloud]` — see
+/// [`StorageConfig::cloud`] and [`cloud_via_section`]. `CloudConfig` itself
+/// (the shape persisted in a `sources.options` row) is untouched and stays
+/// without `deny_unknown_fields`, so an old row with an unknown future key
+/// still reloads (H2/H17).
+#[derive(Debug, Clone, Deserialize)]
+#[serde(rename_all = "snake_case", deny_unknown_fields)]
+enum CloudSection {
+    S3(S3Section),
+    R2(R2Section),
+    Gcs(GcsSection),
+    Azure(AzureSection),
+}
+
+/// Config-side mirror of [`crate::storage::S3Config`]. `secret_access_key`
+/// and `session_token` are [`Secret`]-typed (H9); `access_key_id` is not.
+#[derive(Debug, Clone, Default, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+struct S3Section {
+    region: Option<String>,
+    endpoint: Option<String>,
+    access_key_id: Option<String>,
+    secret_access_key: Option<Secret>,
+    session_token: Option<Secret>,
+    #[serde(default)]
+    allow_http: bool,
+}
+
+/// Config-side mirror of [`crate::storage::R2Config`].
+#[derive(Debug, Clone, Default, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+struct R2Section {
+    account_id: Option<String>,
+    endpoint: Option<String>,
+    access_key_id: Option<String>,
+    secret_access_key: Option<Secret>,
+    #[serde(default)]
+    allow_http: bool,
+}
+
+/// Config-side mirror of [`crate::storage::GcsConfig`], collapsed to a
+/// single `service_account` field (inline JSON, or `{ file = "…" }`
+/// naming a service-account JSON file) that replaces the persisted shape's
+/// separate `service_account_json`/`service_account_path` — see
+/// [`cloud_via_section`] for how it maps onto them.
+#[derive(Debug, Clone, Default, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+struct GcsSection {
+    service_account: Option<Secret>,
+}
+
+/// Config-side mirror of [`crate::storage::AzureConfig`].
+/// `account_key`/`sas_token`/`client_secret` are [`Secret`]-typed (H9).
+#[derive(Debug, Clone, Default, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+struct AzureSection {
+    account_name: Option<String>,
+    account_key: Option<Secret>,
+    sas_token: Option<Secret>,
+    tenant_id: Option<String>,
+    client_id: Option<String>,
+    client_secret: Option<Secret>,
+}
+
+impl From<CloudSection> for CloudConfig {
+    fn from(section: CloudSection) -> Self {
+        match section {
+            CloudSection::S3(c) => CloudConfig::S3(S3Config {
+                region: c.region,
+                endpoint: c.endpoint,
+                access_key_id: c.access_key_id,
+                secret_access_key: c.secret_access_key,
+                session_token: c.session_token,
+                allow_http: c.allow_http,
+            }),
+            CloudSection::R2(c) => CloudConfig::R2(R2Config {
+                account_id: c.account_id,
+                endpoint: c.endpoint,
+                access_key_id: c.access_key_id,
+                secret_access_key: c.secret_access_key,
+                allow_http: c.allow_http,
+            }),
+            CloudSection::Gcs(c) => CloudConfig::Gcs(GcsConfig {
+                service_account_json: c.service_account,
+                service_account_path: None,
+            }),
+            CloudSection::Azure(c) => CloudConfig::Azure(AzureConfig {
+                account_name: c.account_name,
+                account_key: c.account_key,
+                sas_token: c.sas_token,
+                tenant_id: c.tenant_id,
+                client_id: c.client_id,
+                client_secret: c.client_secret,
+            }),
+        }
+    }
+}
+
+/// `StorageConfig::cloud`'s `deserialize_with`: deserialize an
+/// `Option<CloudSection>` (the config-only, externally-tagged,
+/// `deny_unknown_fields` shape) and convert to `Option<CloudConfig>` (H2).
+/// There is no separate "wire struct" — `StorageConfig`'s derived
+/// `Deserialize` is the sole config-layer path for `cloud`, so a `kind =`
+/// path can never drift from this one.
+fn cloud_via_section<'de, D: Deserializer<'de>>(
+    deserializer: D,
+) -> std::result::Result<Option<CloudConfig>, D::Error> {
+    Ok(Option::<CloudSection>::deserialize(deserializer)?.map(CloudConfig::from))
 }
 
 /// Catalog backend selection. The catalog and the mutable companion tables
 /// share this backend.
 ///
+/// Externally tagged: the variant name is a TOML table (or a bare string for
+/// a variant with no required fields), never a `kind` key inside one shared
+/// `[catalog]` table — so `[catalog.postgres]` and `[catalog.sqlite]` cannot
+/// both be present without naming that conflict.
+///
 /// # TOML
 ///
 /// ```toml
-/// [catalog]
-/// kind = "sqlite"
+/// [catalog.sqlite]
 /// # path = "/var/lib/jammi/catalog.db"   # optional override
 /// ```
 ///
 /// ```toml
-/// [catalog]
-/// kind = "postgres"
-/// url = "${POSTGRES_URL}"
+/// [catalog.postgres]
+/// url = "${POSTGRES_URL}?sslmode=verify-full&sslrootcert=/etc/ssl/certs/ca-certificates.crt"
 /// pool_size = 16
 /// max_lifetime_secs = 1800
 /// ```
+///
+/// ```toml
+/// [catalog.postgres]
+/// url = { file = "/run/secrets/postgres-url" }
+/// ```
+///
+/// `url` carries the `sslmode`/`sslrootcert` query parameters like any other
+/// part of the connection string — see [`JammiConfig`]'s "Catalog and broker
+/// selection" section for why `verify-full` (not the sqlx default `prefer`,
+/// and not the encrypted-but-unverified `require`) is the right value for a
+/// deployment that leaves its own trusted network.
+///
+/// A bare string also selects a variant with no required fields:
+/// `catalog = "sqlite"`.
 #[derive(Debug, Clone, PartialEq, Deserialize)]
-#[serde(tag = "kind", rename_all = "snake_case")]
+#[serde(rename_all = "snake_case", deny_unknown_fields)]
 pub enum CatalogConfig {
     /// SQLite under `artifact_dir`. The laptop / dev default.
     Sqlite {
@@ -280,8 +464,10 @@ pub enum CatalogConfig {
     /// Postgres (or compatible) catalog. Used for SaaS deployments and
     /// self-hosted production.
     Postgres {
-        /// Connection URL, e.g. `postgres://user:pass@host:5432/jammi`.
-        url: String,
+        /// Connection URL, e.g.
+        /// `postgres://user:pass@host:5432/jammi?sslmode=verify-full&sslrootcert=/etc/ssl/certs/ca-certificates.crt`.
+        /// A [`Secret`]: inline or `{ file = "…" }`; never printed.
+        url: Secret,
         /// `sqlx::PgPool` `max_connections`. Default: 8.
         #[serde(default = "default_pool_size")]
         pool_size: u32,
@@ -304,22 +490,22 @@ fn default_pool_size() -> u32 {
 
 /// Trigger broker selection.
 ///
+/// Externally tagged, like [`CatalogConfig`].
+///
 /// # TOML
 ///
 /// ```toml
-/// [broker]
-/// kind = "in_memory"
+/// broker = "in_memory"
 /// ```
 ///
 /// ```toml
-/// [broker]
-/// kind = "jet_stream"
+/// [broker.jet_stream]
 /// url = "nats://${NATS_HOST}:4222"
 /// retention_seconds = 604800
-/// credentials_path = "/var/run/secrets/nats.creds"
+/// credentials = { file = "/var/run/secrets/nats.creds" }
 /// ```
 #[derive(Debug, Clone, PartialEq, Deserialize, Default)]
-#[serde(tag = "kind", rename_all = "snake_case")]
+#[serde(rename_all = "snake_case", deny_unknown_fields)]
 pub enum BrokerConfig {
     /// In-process broker. Default; matches the laptop / dev workflow.
     #[default]
@@ -328,17 +514,22 @@ pub enum BrokerConfig {
     /// `jammi-db`; building a session whose config selects `JetStream`
     /// without the feature returns [`crate::error::JammiError::Config`].
     JetStream {
-        /// NATS server URL, e.g. `nats://nats.svc:4222`.
-        url: String,
+        /// NATS server URL, e.g. `nats://nats.svc:4222`. A [`Secret`]: NATS
+        /// URLs carry userinfo/token auth inline (`nats://user:pass@host`),
+        /// the same class of leak `catalog.postgres.url` guards against —
+        /// inline or `{ file = "…" }`; never printed.
+        url: Secret,
         /// Default per-stream retention in seconds. Per-topic
         /// `broker_metadata.retention_seconds` overrides this value.
         /// Default: 7 days (604 800).
         #[serde(default = "default_retention_secs")]
         retention_seconds: u64,
-        /// Optional path to a NATS `.creds` file. When unset the broker
-        /// connects anonymously.
+        /// Optional NATS credentials — the **contents** of a `.creds` file
+        /// (user JWT + NKEY seed), as a [`Secret`]: inline, or
+        /// `{ file = "/run/secrets/nats.creds" }` to read the file at load.
+        /// When unset the broker connects anonymously.
         #[serde(default)]
-        credentials_path: Option<PathBuf>,
+        credentials: Option<Secret>,
     },
 }
 
@@ -356,21 +547,35 @@ fn default_retention_secs() -> u64 {
 /// # TOML
 ///
 /// ```toml
-/// [signing_key]
-/// kind = "env"
+/// signing_key = "env"
+/// ```
+///
+/// ```toml
+/// [signing_key.file]
+/// path = "/run/secrets/jammi-audit-master-key"
 /// ```
 #[derive(Debug, Clone, PartialEq, Deserialize, Default)]
-#[serde(tag = "kind", rename_all = "snake_case")]
+#[serde(rename_all = "snake_case", deny_unknown_fields)]
 pub enum SigningKeyConfig {
     /// Read the master key from `JAMMI_AUDIT_MASTER_KEY` via
     /// [`crate::audit::EnvSigningKeyStore`]. The default.
     #[default]
     Env,
+    /// Read the master key from a file via
+    /// [`crate::audit::FileSigningKeyStore`]: the same 64-hex-character key
+    /// the env store expects, one trailing newline tolerated. The file is
+    /// read at each signing-key request, not at config load, so a rotated
+    /// mount is picked up without a restart — and a missing file is the same
+    /// `MasterKey` error an unset variable is.
+    File {
+        /// Path of the file holding the hex-encoded 32-byte master key.
+        path: PathBuf,
+    },
 }
 
 /// DataFusion query-engine settings.
 #[derive(Debug, Clone, Deserialize)]
-#[serde(default)]
+#[serde(default, deny_unknown_fields)]
 pub struct EngineConfig {
     /// Number of DataFusion execution threads. Default: available CPU count.
     pub execution_threads: usize,
@@ -382,7 +587,7 @@ pub struct EngineConfig {
 
 /// GPU device and memory settings.
 #[derive(Debug, Clone, Deserialize)]
-#[serde(default)]
+#[serde(default, deny_unknown_fields)]
 pub struct GpuConfig {
     /// CUDA device ordinal. Default: 0.
     pub device: i32,
@@ -405,7 +610,7 @@ pub struct GpuConfig {
 
 /// Model inference defaults.
 #[derive(Debug, Clone, Deserialize)]
-#[serde(default)]
+#[serde(default, deny_unknown_fields)]
 pub struct InferenceConfig {
     /// Backend selection strategy. Default: `Auto`.
     pub default_backend: BackendSelection,
@@ -421,12 +626,15 @@ pub struct InferenceConfig {
 
 /// HTTP backend configuration for remote inference endpoints.
 #[derive(Debug, Clone, Deserialize)]
-#[serde(default)]
+#[serde(default, deny_unknown_fields)]
 pub struct HttpConfig {
     /// Request timeout in seconds. Default: 60.
     pub timeout_secs: u64,
-    /// Extra HTTP headers sent with every inference request.
-    pub headers: std::collections::HashMap<String, String>,
+    /// Extra HTTP headers sent with every inference request. Header values
+    /// are [`Secret`]s (an `Authorization` bearer token is the common case):
+    /// each accepts the value inline or `{ file = "…" }`, and none is ever
+    /// printed. Ordered so the request header set is deterministic.
+    pub headers: BTreeMap<String, Secret>,
 }
 
 /// The precision the ANN sidecar index quantizes its stored vectors to.
@@ -551,7 +759,7 @@ const DEFAULT_OVERSAMPLE: usize = 4;
 /// table's catalog row is stamped with at creation — see
 /// [`crate::catalog::result_repo::ResultTableRecord::storage_precision`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Deserialize)]
-#[serde(default)]
+#[serde(default, deny_unknown_fields)]
 pub struct AnnIndexConfig {
     /// Maximum connections per graph node (HNSW *M*). Higher trades a larger
     /// index and slower build for better recall. `0` = backend default.
@@ -628,7 +836,7 @@ impl AnnIndexConfig {
 
 /// Embedding index defaults.
 #[derive(Debug, Clone, Deserialize)]
-#[serde(default)]
+#[serde(default, deny_unknown_fields)]
 pub struct EmbeddingConfig {
     /// Distance metric for ANN indices. Default: `Cosine`.
     pub default_distance_metric: DistanceMetric,
@@ -642,7 +850,7 @@ pub struct EmbeddingConfig {
 
 /// Fine-tuning hyperparameter defaults.
 #[derive(Debug, Clone, Deserialize)]
-#[serde(default)]
+#[serde(default, deny_unknown_fields)]
 pub struct FineTuningConfig {
     /// LoRA adapter rank. Default: 8.
     pub default_lora_rank: usize,
@@ -676,7 +884,7 @@ pub struct FineTuningConfig {
 /// idle_poll_secs = 1
 /// ```
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
-#[serde(default)]
+#[serde(default, deny_unknown_fields)]
 pub struct TrainingConfig {
     /// Whether THIS process runs the training claim loop at all. Default: `true`.
     ///
@@ -800,7 +1008,7 @@ impl TrainingConfig {
 
 /// Cache layer settings.
 #[derive(Debug, Clone, Deserialize)]
-#[serde(default)]
+#[serde(default, deny_unknown_fields)]
 pub struct CacheConfig {
     /// Enable the ANN query result cache. Default: true.
     pub ann_cache_enabled: bool,
@@ -814,7 +1022,7 @@ pub struct CacheConfig {
 
 /// Arrow Flight SQL and health-probe server bind addresses.
 #[derive(Debug, Clone, Deserialize)]
-#[serde(default)]
+#[serde(default, deny_unknown_fields)]
 pub struct ServerConfig {
     /// Health probe listen address. Default: `"0.0.0.0:8080"`.
     pub health_listen: String,
@@ -839,29 +1047,36 @@ pub struct ServerConfig {
 /// not depend on `jammi-server`'s tier vocabulary — the server resolves and
 /// validates them.
 ///
-/// Untagged so the two natural TOML forms both parse:
+/// Hand-written [`Deserialize`] (not `#[serde(untagged)]`) so the three
+/// natural TOML/env forms all parse with one shared, case-sensitive grammar
+/// (H7) — `services` is the one field in this config whose env spelling is
+/// `all|tier,tier` rather than TOML syntax:
 ///
 /// ```toml
 /// services = "all"             # all-in-one (the default)
+/// services = "event,eval"      # comma list (also accepted in TOML)
 /// services = ["event", "eval"] # core + these optional tiers
 /// services = []                # serve-only (core only)
 /// ```
-#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
-#[serde(untagged)]
+///
+/// `JAMMI_SERVER__SERVICES=all` or `JAMMI_SERVER__SERVICES=event,eval` use
+/// the same comma-list grammar. Exactly `"all"` (case-sensitive — `"ALL"` is
+/// a one-token tier list, rejected by the server as an unknown tier name)
+/// selects [`AllSentinel::All`]; empty tokens in a comma list are filtered,
+/// so `""` and `","` both mean serve-only.
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ServiceSelection {
     /// The `"all"` sentinel: mount core plus every optional tier compiled into
-    /// this binary (all-in-one). The default deployment shape. Any other bare
-    /// string is rejected at resolution time by the server.
+    /// this binary (all-in-one). The default deployment shape.
     All(AllSentinel),
     /// Mount core plus exactly these optional tiers (e.g. `["event"]` for an
     /// event box, or `[]` for serve-only).
     Only(Vec<String>),
 }
 
-/// The `"all"` literal, as its own one-variant enum so serde accepts exactly
-/// that string and nothing else in the sentinel position.
-#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
-#[serde(rename_all = "snake_case")]
+/// The `"all"` literal, as its own one-variant marker type so
+/// [`ServiceSelection::All`] cannot be constructed with anything else.
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum AllSentinel {
     All,
 }
@@ -869,6 +1084,74 @@ pub enum AllSentinel {
 impl Default for ServiceSelection {
     fn default() -> Self {
         ServiceSelection::All(AllSentinel::All)
+    }
+}
+
+impl<'de> Deserialize<'de> for ServiceSelection {
+    fn deserialize<D: Deserializer<'de>>(deserializer: D) -> std::result::Result<Self, D::Error> {
+        struct ServiceSelectionVisitor;
+
+        impl<'de> serde::de::Visitor<'de> for ServiceSelectionVisitor {
+            type Value = ServiceSelection;
+
+            fn expecting(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+                f.write_str(
+                    "\"all\", a comma-separated tier list (e.g. \"event,eval\"), or an array of tier tokens",
+                )
+            }
+
+            fn visit_str<E: serde::de::Error>(
+                self,
+                value: &str,
+            ) -> std::result::Result<Self::Value, E> {
+                // Trim surrounding whitespace before anything else: a
+                // trailing newline from a secrets file or a heredoc-sourced
+                // env var is not part of the value, the same way every other
+                // env/file-backed value in this config tolerates it. H7:
+                // case-sensitive otherwise, like every other value in this
+                // config — `"ALL"` is NOT the sentinel.
+                let value = value.trim();
+                if value == "all" {
+                    return Ok(ServiceSelection::All(AllSentinel::All));
+                }
+                Ok(ServiceSelection::Only(
+                    value
+                        .split(',')
+                        .map(str::trim)
+                        .filter(|t| !t.is_empty())
+                        .map(str::to_string)
+                        .collect(),
+                ))
+            }
+
+            fn visit_string<E: serde::de::Error>(
+                self,
+                value: String,
+            ) -> std::result::Result<Self::Value, E> {
+                self.visit_str(&value)
+            }
+
+            fn visit_seq<A: serde::de::SeqAccess<'de>>(
+                self,
+                mut seq: A,
+            ) -> std::result::Result<Self::Value, A::Error> {
+                // Same rule as `visit_str`'s comma-list arm: trim each
+                // token and filter empties, so an array token sourced from
+                // a templated value (a trailing/leading newline or blank
+                // entry) is treated the same way a comma-list spelling of
+                // the identical intent already is.
+                let mut tokens = Vec::new();
+                while let Some(token) = seq.next_element::<String>()? {
+                    let token = token.trim();
+                    if !token.is_empty() {
+                        tokens.push(token.to_string());
+                    }
+                }
+                Ok(ServiceSelection::Only(tokens))
+            }
+        }
+
+        deserializer.deserialize_any(ServiceSelectionVisitor)
     }
 }
 
@@ -904,12 +1187,49 @@ impl ServerConfig {
 
 /// Tracing/logging configuration.
 #[derive(Debug, Clone, Deserialize)]
-#[serde(default)]
+#[serde(default, deny_unknown_fields)]
 pub struct LoggingConfig {
     /// Log level filter (e.g., `"info"`, `"debug"`, `"warn"`). Default: `"info"`.
     pub level: String,
     /// Output format. Default: `Text`.
     pub format: LogFormat,
+}
+
+/// Model source: where the Hugging Face Hub cache lives, which endpoint and
+/// token it talks to, and whether the process may reach the network at all.
+///
+/// `jammi-db` only carries this raw, typed selection — the `jammi-ai`
+/// session choke point builds it into one `HubSource` (root resolution,
+/// `ApiBuilder::from_cache`, endpoint/token fallback chain) exactly once per
+/// session.
+///
+/// # TOML
+///
+/// ```toml
+/// [models]
+/// hub_endpoint = "https://huggingface.co"
+/// hub_cache_dir = "/var/cache/jammi/hub"
+/// hub_token = { file = "/run/secrets/hf-token" }
+/// offline = false
+/// ```
+#[derive(Debug, Clone, Default, PartialEq, Eq, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct ModelsConfig {
+    /// Hub API endpoint. `None` → config default, then `HF_ENDPOINT`, then
+    /// the Hub's own default.
+    pub hub_endpoint: Option<String>,
+    /// Root directory the Hub cache lives under (a `hub/` subdirectory is
+    /// appended). `None` → `HF_HOME`, then
+    /// `directories::BaseDirs::home_dir()/.cache/huggingface`.
+    pub hub_cache_dir: Option<PathBuf>,
+    /// Hub bearer token. Kept as an unresolved [`SecretSource`] — not
+    /// eagerly resolved into a [`Secret`] at config load — because the
+    /// fallback chain (`HF_TOKEN`, then the cache's own `token` file) is
+    /// read at the `jammi-ai` session choke point, not here (H4).
+    pub hub_token: Option<SecretSource>,
+    /// Refuse every network fetch: a model loads only from `local:` or an
+    /// already-resolved catalog row. Default: `false`.
+    pub offline: bool,
 }
 
 // --- Defaults ---
@@ -937,6 +1257,7 @@ impl Default for JammiConfig {
             broker: BrokerConfig::default(),
             signing_key: SigningKeyConfig::default(),
             storage: StorageConfig::default(),
+            models: ModelsConfig::default(),
         }
     }
 }
@@ -979,7 +1300,7 @@ impl Default for HttpConfig {
     fn default() -> Self {
         Self {
             timeout_secs: 60,
-            headers: std::collections::HashMap::new(),
+            headers: BTreeMap::new(),
         }
     }
 }
@@ -1046,26 +1367,123 @@ fn num_cpus() -> usize {
 
 // --- Loading ---
 
+/// The filesystem roots [`resolve_config_path_in`] probes, injected so a test
+/// can point every step at a tempdir instead of the real `/etc` or platform
+/// config directory (H15).
+pub(crate) struct ConfigRoots {
+    /// The "current directory" root — production passes `.`.
+    pub cwd: PathBuf,
+    /// The system-wide config directory — production passes `/etc/jammi`.
+    pub etc_dir: PathBuf,
+    /// The platform per-user config directory
+    /// (`directories::ProjectDirs::config_dir()`), when the platform exposes
+    /// one.
+    pub platform_dir: Option<PathBuf>,
+}
+
+impl ConfigRoots {
+    fn production() -> Self {
+        Self {
+            cwd: PathBuf::from("."),
+            etc_dir: PathBuf::from("/etc/jammi"),
+            platform_dir: directories::ProjectDirs::from("ai", "jammi", "jammi")
+                .map(|d| d.config_dir().to_path_buf()),
+        }
+    }
+}
+
+/// Resolve the config file path (H6 order): an explicit path that exists,
+/// then `env["JAMMI_CONFIG"]`, then `{roots.cwd}/jammi.toml`, then
+/// `{roots.etc_dir}/jammi.toml`, then `{roots.platform_dir}/config.toml`.
+/// `env` is the same map [`JammiConfig::load_from`]/[`JammiConfig::parse_from`]
+/// were handed — this function reads no process env of its own.
+pub(crate) fn resolve_config_path_in(
+    explicit: Option<&Path>,
+    roots: &ConfigRoots,
+    env: &BTreeMap<String, String>,
+) -> Option<PathBuf> {
+    if let Some(p) = explicit {
+        if p.exists() {
+            return Some(p.to_path_buf());
+        }
+    }
+    if let Some(env_path) = env.get("JAMMI_CONFIG") {
+        let p = PathBuf::from(env_path);
+        if p.exists() {
+            return Some(p);
+        }
+    }
+    let cwd = roots.cwd.join("jammi.toml");
+    if cwd.exists() {
+        return Some(cwd);
+    }
+    let etc = roots.etc_dir.join("jammi.toml");
+    if etc.exists() {
+        return Some(etc);
+    }
+    if let Some(dir) = &roots.platform_dir {
+        let p = dir.join("config.toml");
+        if p.exists() {
+            return Some(p);
+        }
+    }
+    None
+}
+
+/// Turn a `serde_path_to_error` failure over the [`Node`] tree into a
+/// [`JammiError::Config`] that names both the offending struct path (R7) and
+/// every `JAMMI_*` variable whose path has that same prefix — the
+/// provenance rule: the variable(s) named come from the merged tree itself,
+/// never guessed independently of it.
+fn describe_deserialize_error(
+    err: serde_path_to_error::Error<layers::NodeError>,
+    env_vars_present: &[String],
+) -> JammiError {
+    let path = err.path().to_string();
+    let inner = err.into_inner().0;
+    if path.is_empty() || path == "." {
+        return JammiError::Config(inner);
+    }
+    let env_prefix = format!("JAMMI_{}", path.replace('.', "__").to_uppercase());
+    let named: Vec<&str> = env_vars_present
+        .iter()
+        .map(String::as_str)
+        .filter(|v| v.starts_with(&env_prefix) || env_prefix.starts_with(v))
+        .collect();
+    if named.is_empty() {
+        JammiError::Config(format!("{path}: {inner}"))
+    } else {
+        JammiError::Config(format!("{path}: {inner} (env: {})", named.join(", ")))
+    }
+}
+
 impl JammiConfig {
-    /// Load configuration from a TOML file (resolved via explicit path, `JAMMI_CONFIG` env,
-    /// `./jammi.toml`, or platform config dir) and apply environment variable overrides.
-    ///
-    /// Before TOML parsing the loader runs [`interpolate_env_vars`] on the
-    /// raw file contents: `${NAME}` is substituted with the value of
-    /// `std::env::var("NAME")`, `$$` escapes a literal `$`, and a missing
-    /// variable is a hard error (no silent empty substitution). See
-    /// [`interpolate_env_vars`] for the full rules.
+    /// Load configuration the production way: resolve the file (explicit
+    /// path, `JAMMI_CONFIG`, `./jammi.toml`, `/etc/jammi/jammi.toml`, the
+    /// platform config dir — `resolve_config_path_in`) against the real
+    /// process environment and filesystem roots, then [`Self::load_from`].
     pub fn load(path: Option<&Path>) -> Result<Self> {
-        let config_path = Self::resolve_config_path(path);
-        let mut config: Self = match config_path {
-            Some(p) => {
-                let contents = std::fs::read_to_string(&p)?;
-                let interpolated = interpolate_env_vars(&contents)?;
-                toml::from_str(&interpolated)?
-            }
-            None => Self::default(),
+        Self::load_from(path, std::env::vars())
+    }
+
+    /// The real implementation: resolve `file` against the production
+    /// filesystem roots using `env` (never `std::env` directly — `env` is
+    /// the single source both `JAMMI_CONFIG` resolution and every `JAMMI_*`
+    /// override read from), read it if found, [`Self::parse_from`] it, then
+    /// run post-load validation (`storage.cloud.validate()`, the training
+    /// worker-interval invariants).
+    pub fn load_from(
+        file: Option<&Path>,
+        env: impl IntoIterator<Item = (String, String)>,
+    ) -> Result<Self> {
+        let env_map: BTreeMap<String, String> = env.into_iter().collect();
+        let roots = ConfigRoots::production();
+        let path = resolve_config_path_in(file, &roots, &env_map);
+        let contents = match &path {
+            Some(p) => std::fs::read_to_string(p)?,
+            None => String::new(),
         };
-        config.apply_env_overrides()?;
+        let config = Self::parse_from(&contents, env_map)?;
         // Catch a partial cloud-credential set (e.g. an R2 `access_key_id`
         // without its `secret_access_key`) at load time rather than deep
         // inside the first object-store request.
@@ -1079,192 +1497,67 @@ impl JammiConfig {
         Ok(config)
     }
 
-    fn resolve_config_path(explicit: Option<&Path>) -> Option<PathBuf> {
-        if let Some(p) = explicit {
-            if p.exists() {
-                return Some(p.to_path_buf());
-            }
-        }
-
-        if let Ok(env_path) = std::env::var("JAMMI_CONFIG") {
-            let p = PathBuf::from(env_path);
-            if p.exists() {
-                return Some(p);
-            }
-        }
-
-        let cwd = PathBuf::from("jammi.toml");
-        if cwd.exists() {
-            return Some(cwd);
-        }
-
-        let home = directories::ProjectDirs::from("ai", "jammi", "jammi")
-            .map(|d| d.config_dir().join("config.toml"));
-        if let Some(p) = home {
-            if p.exists() {
-                return Some(p);
-            }
-        }
-
-        None
-    }
-
-    /// Layer `JAMMI_*` environment overrides onto the parsed file.
-    ///
-    /// Most arms are lenient: an unparsable numeric or enum value is dropped
-    /// (with a warning for the enums) and the file's value survives, because a
-    /// bad batch size degrades throughput at worst. The `run_worker` arm is
-    /// not: it decides whether this process takes work at all, so an
-    /// unparsable value is a hard [`JammiError::Config`] rather than a silent
-    /// fall-back to the opposite of what the operator asked for.
-    fn apply_env_overrides(&mut self) -> Result<()> {
-        if let Ok(v) = std::env::var("JAMMI_ARTIFACT_DIR") {
-            self.artifact_dir = PathBuf::from(v);
-        }
-
-        // Engine
-        if let Ok(v) = std::env::var("JAMMI_ENGINE__EXECUTION_THREADS") {
-            if let Ok(n) = v.parse() {
-                self.engine.execution_threads = n;
-            }
-        }
-        if let Ok(v) = std::env::var("JAMMI_ENGINE__BATCH_SIZE") {
-            if let Ok(n) = v.parse() {
-                self.engine.batch_size = n;
-            }
-        }
-        if let Ok(v) = std::env::var("JAMMI_ENGINE__MEMORY_LIMIT") {
-            self.engine.memory_limit = v;
-        }
-
-        // GPU
-        if let Ok(v) = std::env::var("JAMMI_GPU__DEVICE") {
-            if let Ok(n) = v.parse() {
-                self.gpu.device = n;
-            }
-        }
-        if let Ok(v) = std::env::var("JAMMI_GPU__MEMORY_LIMIT") {
-            self.gpu.memory_limit = v;
-        }
-        if let Ok(v) = std::env::var("JAMMI_GPU__MEMORY_FRACTION") {
-            if let Ok(n) = v.parse() {
-                self.gpu.memory_fraction = n;
-            }
-        }
-        if let Ok(v) = std::env::var("JAMMI_GPU__REQUIRE_GPU") {
-            if let Ok(b) = v.parse() {
-                self.gpu.require_gpu = b;
-            }
-        }
-
-        // Inference
-        if let Ok(v) = std::env::var("JAMMI_INFERENCE__DEFAULT_BACKEND") {
-            match v.parse() {
-                Ok(b) => self.inference.default_backend = b,
-                Err(e) => tracing::warn!("Ignoring invalid JAMMI_INFERENCE__DEFAULT_BACKEND: {e}"),
-            }
-        }
-        if let Ok(v) = std::env::var("JAMMI_INFERENCE__BATCH_SIZE") {
-            if let Ok(n) = v.parse() {
-                self.inference.batch_size = n;
-            }
-        }
-        if let Ok(v) = std::env::var("JAMMI_INFERENCE__BATCH_TIMEOUT_SECS") {
-            if let Ok(n) = v.parse() {
-                self.inference.batch_timeout_secs = n;
-            }
-        }
-        if let Ok(v) = std::env::var("JAMMI_INFERENCE__MAX_LOADED_MODELS") {
-            if let Ok(n) = v.parse() {
-                self.inference.max_loaded_models = n;
-            }
-        }
-
-        // Training
-        if let Ok(v) = std::env::var("JAMMI_TRAINING__RUN_WORKER") {
-            self.training.run_worker = parse_env_bool("JAMMI_TRAINING__RUN_WORKER", &v)?;
-        }
-
-        // Logging
-        if let Ok(v) = std::env::var("JAMMI_LOGGING__LEVEL") {
-            self.logging.level = v;
-        }
-        if let Ok(v) = std::env::var("JAMMI_LOGGING__FORMAT") {
-            match v.parse() {
-                Ok(f) => self.logging.format = f,
-                Err(e) => tracing::warn!("Ignoring invalid JAMMI_LOGGING__FORMAT: {e}"),
-            }
-        }
-
-        // Server
-        if let Ok(v) = std::env::var("JAMMI_SERVER__HEALTH_LISTEN") {
-            self.server.health_listen = v;
-        }
-        if let Ok(v) = std::env::var("JAMMI_SERVER__FLIGHT_LISTEN") {
-            self.server.flight_listen = v;
-        }
-        if let Ok(v) = std::env::var("JAMMI_SERVER__SERVICES") {
-            // `all` selects every compiled-in tier; otherwise a comma-separated
-            // list of optional tier tokens (empty string → serve-only/core).
-            // The server resolves and validates the tokens; this layer only
-            // carries the selection.
-            self.server.services = if v.trim().eq_ignore_ascii_case("all") {
-                ServiceSelection::All(AllSentinel::All)
-            } else {
-                ServiceSelection::Only(
-                    v.split(',')
-                        .map(str::trim)
-                        .filter(|s| !s.is_empty())
-                        .map(str::to_string)
-                        .collect(),
-                )
-            };
-        }
-
-        Ok(())
+    /// The parse-only core: interpolate `${VAR}` from `env`,
+    /// parse the TOML file layer, build the `JAMMI_*` env layer from the
+    /// SAME `env` map (T5's namespace rule — `env_map::build_env_layer`),
+    /// deep-merge the two (`layers::merge` — H1), and deserialize the
+    /// whole typed [`JammiConfig`] from the merged tree in one pass via
+    /// `serde_path_to_error` (R7: every error names the struct path and the
+    /// variable(s) at it). No post-load validation — that is
+    /// [`Self::load_from`]'s job, so a content oracle can call this directly
+    /// without also pinning `storage.cloud.validate()`/worker-interval
+    /// behaviour.
+    pub fn parse_from(
+        toml_src: &str,
+        env: impl IntoIterator<Item = (String, String)>,
+    ) -> Result<Self> {
+        let env_map: BTreeMap<String, String> = env.into_iter().collect();
+        let interpolated = interpolate_env_vars(toml_src, |name| env_map.get(name).cloned())?;
+        // `interpolated` is the file text AFTER `${VAR}` expansion — an
+        // unquoted `url = ${POSTGRES_URL}` puts the secret straight into
+        // this text, so a parse error here must never render via
+        // `Display`/`to_string()` (which quotes a code frame of the
+        // offending source line verbatim). `layers::describe_toml_error`
+        // renders `message()` plus a safe line:column locator instead.
+        let file_value: toml::Value = interpolated.parse().map_err(|e: toml::de::Error| {
+            JammiError::Config(format!(
+                "invalid TOML: {}",
+                layers::describe_toml_error(&interpolated, &e)
+            ))
+        })?;
+        let file_node = Node::from_toml(file_value);
+        let env_node =
+            env_map::build_env_layer(env_map.iter().map(|(k, v)| (k.clone(), v.clone())))
+                .map_err(|e| JammiError::Config(e.0))?;
+        let mut env_vars_present = Vec::new();
+        env_node.vars(&mut env_vars_present);
+        let merged = layers::merge(file_node, env_node);
+        serde_path_to_error::deserialize(merged)
+            .map_err(|e| describe_deserialize_error(e, &env_vars_present))
     }
 }
 
-/// Parse a boolean environment-variable override.
-///
-/// Accepts `true`/`false` and the numeric spellings `1`/`0`, case-insensitively
-/// and with surrounding whitespace trimmed — the four spellings a shell,
-/// a container manifest, or an orchestrator template actually emits.
-///
-/// Everything else is a [`JammiError::Config`] naming the variable, the
-/// rejected value, and the accepted set. A boolean override answers a
-/// yes/no question about what the process will do, and there is no safe
-/// direction to guess in: dropping the value silently would leave the process
-/// doing the opposite of what the operator wrote, with nothing in the config
-/// file to explain it. `env_var=maybe` is outside the domain, so nothing is
-/// computed from it.
-fn parse_env_bool(var: &str, raw: &str) -> Result<bool> {
-    match raw.trim().to_ascii_lowercase().as_str() {
-        "true" | "1" => Ok(true),
-        "false" | "0" => Ok(false),
-        // Report the operator's literal string, not the normalized one, so a
-        // stray quote or trailing character is visible in the message.
-        _ => Err(JammiError::Config(format!(
-            "Invalid boolean '{raw}' for {var}. Expected: true, false, 1, 0"
-        ))),
-    }
-}
-
-/// Substitute `${VAR}` patterns in `input` from the process environment.
+/// Substitute `${VAR}` patterns in `input`, resolved through `lookup` (H8) —
+/// never `std::env` directly, so the loader's env-reading is a single,
+/// explicit seam.
 ///
 /// Rules:
-/// - `${NAME}` is replaced by the value of `std::env::var("NAME")`. A name
-///   must start with `[A-Za-z_]` and continue with `[A-Za-z0-9_]`.
-/// - A missing variable returns [`JammiError::Config`]. The loader does
-///   **not** silently substitute an empty string — that is a common source of
-///   "deployed config has empty Postgres URL" outages.
+/// - `${NAME}` is replaced by `lookup(NAME)`. A name must start with
+///   `[A-Za-z_]` and continue with `[A-Za-z0-9_]`.
+/// - A missing variable (`lookup` returns `None`) returns
+///   [`JammiError::Config`]. The loader does **not** silently substitute an
+///   empty string — that is a common source of "deployed config has empty
+///   Postgres URL" outages.
 /// - `$$` escapes a literal `$`.
 /// - A bare `$` not followed by `$` or `{` is preserved verbatim (lets the
 ///   raw `$` in a TOML password slip through unchanged).
 /// - An unterminated `${` returns [`JammiError::Config`].
 /// - Interpolation is one-pass and not recursive: the value of `${X}` is not
 ///   re-scanned.
-pub fn interpolate_env_vars(input: &str) -> Result<String> {
+pub fn interpolate_env_vars(
+    input: &str,
+    lookup: impl Fn(&str) -> Option<String>,
+) -> Result<String> {
     let mut out = String::with_capacity(input.len());
     let bytes = input.as_bytes();
     let mut i = 0;
@@ -1316,7 +1609,7 @@ pub fn interpolate_env_vars(input: &str) -> Result<String> {
                          names must match [A-Za-z_][A-Za-z0-9_]*"
                     )));
                 }
-                let value = std::env::var(name).map_err(|_| {
+                let value = lookup(name).ok_or_else(|| {
                     JammiError::Config(format!("Env var `{name}` referenced by config is not set"))
                 })?;
                 out.push_str(&value);
@@ -1343,855 +1636,18 @@ fn is_valid_env_name(name: &str) -> bool {
     chars.all(|c| c.is_ascii_alphanumeric() || c == '_')
 }
 
+/// Parse a boolean environment-variable override. Accepts `true`/`false` and
+/// the numeric spellings `1`/`0`, case-insensitively and with surrounding
+/// whitespace trimmed — the four spellings a shell, a container manifest, or
+/// an orchestrator template actually emits. Kept for the pinned unit tests
+/// below; the production path (any `bool`-typed field, e.g.
+/// `training.run_worker`) reaches the identical rule through
+/// [`layers::parse_lenient_bool`], which this wraps.
 #[cfg(test)]
-mod tests {
-    use super::*;
-
-    /// `JAMMI_TRAINING__RUN_WORKER` has a fixed name, so the tests that set it
-    /// cannot dodge each other with per-test names the way the interpolation
-    /// tests do — and `JammiConfig::load` reads it, so a parallel `load` test
-    /// would otherwise see whatever a neighbour left behind. Every test that
-    /// mutates that variable, and every test that calls `load`, takes this lock.
-    static ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
-
-    /// Take [`ENV_LOCK`], ignoring poisoning: a panicking test leaves the guard
-    /// poisoned, but the env it touched is still the env the next test must
-    /// serialize against, so refusing the lock would turn one failure into a
-    /// cascade of unrelated ones.
-    fn env_lock() -> std::sync::MutexGuard<'static, ()> {
-        ENV_LOCK
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner())
-    }
-
-    #[test]
-    fn catalog_config_round_trip_sqlite_default() {
-        let toml_src = r#"
-            [catalog]
-            kind = "sqlite"
-        "#;
-        let cfg: JammiConfig = toml::from_str(toml_src).unwrap();
-        assert_eq!(cfg.catalog, CatalogConfig::Sqlite { path: None });
-    }
-
-    #[test]
-    fn catalog_config_round_trip_sqlite_with_path() {
-        let toml_src = r#"
-            [catalog]
-            kind = "sqlite"
-            path = "/srv/jammi/catalog.db"
-        "#;
-        let cfg: JammiConfig = toml::from_str(toml_src).unwrap();
-        assert_eq!(
-            cfg.catalog,
-            CatalogConfig::Sqlite {
-                path: Some(PathBuf::from("/srv/jammi/catalog.db"))
-            }
-        );
-    }
-
-    #[test]
-    fn catalog_config_round_trip_postgres() {
-        let toml_src = r#"
-            [catalog]
-            kind = "postgres"
-            url = "postgres://u:p@h/db"
-            pool_size = 16
-            max_lifetime_secs = 1800
-        "#;
-        let cfg: JammiConfig = toml::from_str(toml_src).unwrap();
-        assert_eq!(
-            cfg.catalog,
-            CatalogConfig::Postgres {
-                url: "postgres://u:p@h/db".into(),
-                pool_size: 16,
-                max_lifetime_secs: Some(1800),
-            }
-        );
-    }
-
-    #[test]
-    fn catalog_config_postgres_defaults() {
-        let toml_src = r#"
-            [catalog]
-            kind = "postgres"
-            url = "postgres://u:p@h/db"
-        "#;
-        let cfg: JammiConfig = toml::from_str(toml_src).unwrap();
-        assert_eq!(
-            cfg.catalog,
-            CatalogConfig::Postgres {
-                url: "postgres://u:p@h/db".into(),
-                pool_size: 8,
-                max_lifetime_secs: None,
-            }
-        );
-    }
-
-    #[test]
-    fn broker_config_round_trip_in_memory() {
-        let toml_src = r#"
-            [broker]
-            kind = "in_memory"
-        "#;
-        let cfg: JammiConfig = toml::from_str(toml_src).unwrap();
-        assert_eq!(cfg.broker, BrokerConfig::InMemory);
-    }
-
-    #[test]
-    fn broker_config_round_trip_jetstream() {
-        let toml_src = r#"
-            [broker]
-            kind = "jet_stream"
-            url = "nats://nats.svc:4222"
-            retention_seconds = 86400
-            credentials_path = "/run/secrets/nats.creds"
-        "#;
-        let cfg: JammiConfig = toml::from_str(toml_src).unwrap();
-        assert_eq!(
-            cfg.broker,
-            BrokerConfig::JetStream {
-                url: "nats://nats.svc:4222".into(),
-                retention_seconds: 86400,
-                credentials_path: Some(PathBuf::from("/run/secrets/nats.creds")),
-            }
-        );
-    }
-
-    #[test]
-    fn broker_config_jetstream_defaults() {
-        let toml_src = r#"
-            [broker]
-            kind = "jet_stream"
-            url = "nats://nats.svc:4222"
-        "#;
-        let cfg: JammiConfig = toml::from_str(toml_src).unwrap();
-        assert_eq!(
-            cfg.broker,
-            BrokerConfig::JetStream {
-                url: "nats://nats.svc:4222".into(),
-                retention_seconds: 7 * 24 * 60 * 60,
-                credentials_path: None,
-            }
-        );
-    }
-
-    #[test]
-    fn jammi_config_default_uses_sqlite_and_in_memory() {
-        let cfg = JammiConfig::default();
-        assert_eq!(cfg.catalog, CatalogConfig::Sqlite { path: None });
-        assert_eq!(cfg.broker, BrokerConfig::InMemory);
-    }
-
-    #[test]
-    fn signing_key_config_round_trip_env() {
-        let toml_src = r#"
-            [signing_key]
-            kind = "env"
-        "#;
-        let cfg: JammiConfig = toml::from_str(toml_src).unwrap();
-        assert_eq!(cfg.signing_key, SigningKeyConfig::Env);
-    }
-
-    #[test]
-    fn jammi_config_default_signing_key_is_env() {
-        assert_eq!(JammiConfig::default().signing_key, SigningKeyConfig::Env);
-    }
-
-    #[test]
-    fn signing_key_absent_defaults_to_env() {
-        // `JammiConfig` is `#[serde(default)]`, so TOML without `[signing_key]`
-        // parses to the env-backed default.
-        let cfg: JammiConfig = toml::from_str("artifact_dir = \"/tmp/jammi\"").unwrap();
-        assert_eq!(cfg.signing_key, SigningKeyConfig::Env);
-    }
-
-    #[test]
-    fn storage_config_default_is_local() {
-        let cfg = JammiConfig::default();
-        assert!(cfg.storage.result_root.is_none());
-        assert!(cfg.storage.cloud.is_none());
-    }
-
-    #[test]
-    fn storage_config_round_trip_r2() {
-        // Secrets (access_key_id / secret_access_key) are deliberately absent:
-        // they come from the container's AWS_* env vars at driver-build time.
-        let toml_src = r#"
-            [storage]
-            result_root = "r2://jammi-results/prod"
-
-            [storage.cloud]
-            kind = "r2"
-            account_id = "abc123def456"
-        "#;
-        let cfg: JammiConfig = toml::from_str(toml_src).unwrap();
-        assert_eq!(
-            cfg.storage.result_root.as_deref(),
-            Some("r2://jammi-results/prod")
-        );
-        match cfg.storage.cloud {
-            Some(CloudConfig::R2(r2)) => {
-                assert_eq!(r2.account_id.as_deref(), Some("abc123def456"));
-                assert!(r2.access_key_id.is_none());
-                assert!(r2.secret_access_key.is_none());
-            }
-            other => panic!("expected R2 cloud config, got {other:?}"),
-        }
-    }
-
-    #[test]
-    fn storage_config_round_trip_s3() {
-        let toml_src = r#"
-            [storage]
-            result_root = "s3://jammi-results/prod"
-
-            [storage.cloud]
-            kind = "s3"
-            region = "us-east-1"
-        "#;
-        let cfg: JammiConfig = toml::from_str(toml_src).unwrap();
-        assert_eq!(
-            cfg.storage.result_root.as_deref(),
-            Some("s3://jammi-results/prod")
-        );
-        match cfg.storage.cloud {
-            Some(CloudConfig::S3(s3)) => {
-                assert_eq!(s3.region.as_deref(), Some("us-east-1"));
-                assert!(s3.access_key_id.is_none());
-            }
-            other => panic!("expected S3 cloud config, got {other:?}"),
-        }
-    }
-
-    #[test]
-    fn load_rejects_partial_r2_credentials() {
-        let _guard = env_lock();
-        // account_id + access_key_id but no secret — the fail-closed
-        // CloudConfig::validate must reject this at load time.
-        let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("jammi.toml");
-        std::fs::write(
-            &path,
-            r#"
-                [storage]
-                result_root = "r2://bucket/prefix"
-
-                [storage.cloud]
-                kind = "r2"
-                account_id = "abc"
-                access_key_id = "only-the-key"
-            "#,
-        )
-        .unwrap();
-        let err = JammiConfig::load(Some(&path)).unwrap_err();
-        assert!(
-            matches!(err, JammiError::Storage(_)),
-            "expected a Storage validation error, got {err:?}"
-        );
-    }
-
-    #[test]
-    fn training_config_defaults_match_engine_constants() {
-        // The defaults must reproduce the engine's built-in worker timing so a
-        // config without a `[training]` section behaves identically. These three
-        // values are the contract; the worker derives its `Duration`s from them.
-        let t = TrainingConfig::default();
-        assert!(t.run_worker);
-        assert_eq!(t.lease_duration_secs, 30);
-        assert_eq!(t.heartbeat_interval_secs, 10);
-        assert_eq!(t.idle_poll_secs, 1);
-
-        let intervals = t.worker_intervals().unwrap();
-        assert_eq!(intervals.lease, std::time::Duration::from_secs(30));
-        assert_eq!(intervals.heartbeat, std::time::Duration::from_secs(10));
-        assert_eq!(intervals.idle_poll, std::time::Duration::from_secs(1));
-    }
-
-    #[test]
-    fn training_config_absent_defaults() {
-        // A config without `[training]` parses to the engine defaults.
-        let cfg: JammiConfig = toml::from_str("artifact_dir = \"/tmp/jammi\"").unwrap();
-        assert_eq!(cfg.training, TrainingConfig::default());
-    }
-
-    #[test]
-    fn training_config_round_trip() {
-        let toml_src = r#"
-            [training]
-            lease_duration_secs = 8
-            heartbeat_interval_secs = 2
-            idle_poll_secs = 1
-        "#;
-        let cfg: JammiConfig = toml::from_str(toml_src).unwrap();
-        assert_eq!(
-            cfg.training,
-            TrainingConfig {
-                // Not spelled in the TOML above: the container-level
-                // `#[serde(default)]` must fill it from `Default`, on.
-                run_worker: true,
-                lease_duration_secs: 8,
-                heartbeat_interval_secs: 2,
-                idle_poll_secs: 1,
-            }
-        );
-        let intervals = cfg.training.worker_intervals().unwrap();
-        assert_eq!(intervals.lease, std::time::Duration::from_secs(8));
-        assert_eq!(intervals.heartbeat, std::time::Duration::from_secs(2));
-    }
-
-    // ── `run_worker`: whether THIS process runs the claim loop ──────────────
-
-    #[test]
-    fn training_config_default_runs_the_worker() {
-        // An unconfigured deployment is a whole one: it accepts jobs AND works
-        // them. Opting out has to be an explicit act, so the default is on.
-        assert!(TrainingConfig::default().run_worker);
-    }
-
-    #[test]
-    fn training_config_toml_without_run_worker_defaults_to_true() {
-        // A `[training]` section that predates the key — the shape every
-        // already-deployed config file has — still parses, and parses to on.
-        let toml_src = r#"
-            [training]
-            lease_duration_secs = 30
-            heartbeat_interval_secs = 10
-            idle_poll_secs = 1
-        "#;
-        let cfg: JammiConfig = toml::from_str(toml_src).unwrap();
-        assert!(cfg.training.run_worker);
-        assert_eq!(cfg.training, TrainingConfig::default());
-
-        // And a file with no `[training]` section at all.
-        let bare: JammiConfig = toml::from_str("artifact_dir = \"/tmp/jammi\"").unwrap();
-        assert!(bare.training.run_worker);
-    }
-
-    #[test]
-    fn training_config_toml_run_worker_false_parses_to_false() {
-        let toml_src = r#"
-            [training]
-            run_worker = false
-        "#;
-        let cfg: JammiConfig = toml::from_str(toml_src).unwrap();
-        assert!(!cfg.training.run_worker);
-        // Switching the loop off leaves the timings at their defaults — and
-        // they are still validated, so a config that switches the loop back on
-        // later cannot smuggle in timing that was never checked.
-        assert_eq!(cfg.training.lease_duration_secs, 30);
-        assert_eq!(cfg.training.heartbeat_interval_secs, 10);
-        assert_eq!(cfg.training.idle_poll_secs, 1);
-        assert!(cfg.training.worker_intervals().is_ok());
-    }
-
-    #[test]
-    fn training_config_equality_distinguishes_run_worker() {
-        // The derived `PartialEq`/`Eq` must actually see the new field: two
-        // configs identical but for `run_worker` are NOT equal. Without this,
-        // the `assert_eq!(cfg.training, ...)` assertions above would hold
-        // vacuously for a field equality ignored.
-        let on = TrainingConfig::default();
-        let off = TrainingConfig {
-            run_worker: false,
-            ..TrainingConfig::default()
-        };
-        assert_ne!(on, off);
-        assert_eq!(off, off.clone());
-        assert_eq!(on, TrainingConfig::default());
-    }
-
-    #[test]
-    fn parse_env_bool_accepts_the_four_spellings() {
-        // Every spelling a shell, a container manifest, or an orchestrator
-        // template actually emits — case-insensitive, whitespace-trimmed.
-        for raw in ["true", "TRUE", "True", "1", " true ", "\ttrue\n"] {
-            assert!(
-                parse_env_bool("JAMMI_TEST__BOOL", raw).unwrap(),
-                "raw = {raw:?}"
-            );
-        }
-        for raw in ["false", "FALSE", "False", "0", " false ", "\tfalse\n"] {
-            assert!(
-                !parse_env_bool("JAMMI_TEST__BOOL", raw).unwrap(),
-                "raw = {raw:?}"
-            );
-        }
-    }
-
-    #[test]
-    fn parse_env_bool_rejects_everything_outside_the_domain() {
-        // The control: each of these is a real thing an operator types, and
-        // every one must be a typed error rather than a silent guess. The empty
-        // and whitespace-only cases matter most — `export VAR=` is the classic
-        // accidental "unset", and reading it as `false` would stop a process
-        // claiming work with nothing in the config file to explain it.
-        for raw in [
-            "",
-            " ",
-            "\t",
-            "yes",
-            "no",
-            "on",
-            "off",
-            "y",
-            "n",
-            "2",
-            "-1",
-            "0.0",
-            "01",
-            "truee",
-            "true false",
-            "null",
-            "none",
-            "\"true\"",
-        ] {
-            let err = parse_env_bool("JAMMI_TRAINING__RUN_WORKER", raw).unwrap_err();
-            match err {
-                JammiError::Config(msg) => {
-                    assert!(
-                        msg.contains("JAMMI_TRAINING__RUN_WORKER"),
-                        "message must name the variable; raw = {raw:?}, msg = {msg}"
-                    );
-                    assert!(
-                        msg.contains("true, false, 1, 0"),
-                        "message must name the accepted set; raw = {raw:?}, msg = {msg}"
-                    );
-                }
-                other => panic!("expected JammiError::Config for {raw:?}, got {other:?}"),
-            }
-        }
-    }
-
-    #[test]
-    fn env_override_run_worker_flips_the_file_in_both_directions() {
-        let _guard = env_lock();
-
-        let dir = tempfile::tempdir().unwrap();
-        let on_path = dir.path().join("on.toml");
-        std::fs::write(&on_path, "[training]\nrun_worker = true\n").unwrap();
-        let off_path = dir.path().join("off.toml");
-        std::fs::write(&off_path, "[training]\nrun_worker = false\n").unwrap();
-
-        // true in the file, false in the env → the env wins.
-        std::env::set_var("JAMMI_TRAINING__RUN_WORKER", "false");
-        let cfg = JammiConfig::load(Some(&on_path)).unwrap();
-        assert!(
-            !cfg.training.run_worker,
-            "env `false` must override file `true`"
-        );
-
-        // false in the file, true in the env → the env wins the other way.
-        // Spelled `1` so the numeric form is proven through `load`, not only in
-        // the parser's own unit test.
-        std::env::set_var("JAMMI_TRAINING__RUN_WORKER", "1");
-        let cfg = JammiConfig::load(Some(&off_path)).unwrap();
-        assert!(
-            cfg.training.run_worker,
-            "env `1` must override file `false`"
-        );
-
-        // Unset → the file's value stands, in both directions. Without this
-        // leg an arm that unconditionally wrote `true` would still pass above.
-        std::env::remove_var("JAMMI_TRAINING__RUN_WORKER");
-        assert!(
-            !JammiConfig::load(Some(&off_path))
-                .unwrap()
-                .training
-                .run_worker
-        );
-        assert!(
-            JammiConfig::load(Some(&on_path))
-                .unwrap()
-                .training
-                .run_worker
-        );
-    }
-
-    #[test]
-    fn env_override_run_worker_unparsable_is_a_typed_load_error() {
-        let _guard = env_lock();
-
-        let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("jammi.toml");
-        std::fs::write(&path, "[training]\nrun_worker = false\n").unwrap();
-
-        std::env::set_var("JAMMI_TRAINING__RUN_WORKER", "maybe");
-        let err = JammiConfig::load(Some(&path)).unwrap_err();
-        std::env::remove_var("JAMMI_TRAINING__RUN_WORKER");
-
-        match err {
-            JammiError::Config(msg) => {
-                assert!(msg.contains("JAMMI_TRAINING__RUN_WORKER"), "msg = {msg}");
-                assert!(msg.contains("maybe"), "msg = {msg}");
-            }
-            other => panic!("expected JammiError::Config, got {other:?}"),
-        }
-
-        // With the variable removed the same file loads cleanly — the error
-        // came from the override, not from the file.
-        assert!(!JammiConfig::load(Some(&path)).unwrap().training.run_worker);
-    }
-
-    #[test]
-    fn training_config_rejects_heartbeat_without_margin() {
-        // heartbeat == lease (no margin) — a live worker's lease would expire
-        // between beats. Must be rejected, not clamped.
-        let equal = TrainingConfig {
-            lease_duration_secs: 10,
-            heartbeat_interval_secs: 10,
-            idle_poll_secs: 1,
-            ..Default::default()
-        };
-        let err = equal.worker_intervals().unwrap_err();
-        assert!(
-            matches!(&err, JammiError::Config(m) if m.contains("heartbeat_interval_secs")),
-            "expected a Config error naming the heartbeat field, got {err:?}"
-        );
-
-        // heartbeat * 2 just over lease (margin not cleared) — also rejected.
-        let too_close = TrainingConfig {
-            lease_duration_secs: 19,
-            heartbeat_interval_secs: 10,
-            idle_poll_secs: 1,
-            ..Default::default()
-        };
-        assert!(matches!(
-            too_close.worker_intervals(),
-            Err(JammiError::Config(_))
-        ));
-
-        // heartbeat > lease — clearly rejected.
-        let inverted = TrainingConfig {
-            lease_duration_secs: 5,
-            heartbeat_interval_secs: 30,
-            idle_poll_secs: 1,
-            ..Default::default()
-        };
-        assert!(matches!(
-            inverted.worker_intervals(),
-            Err(JammiError::Config(_))
-        ));
-
-        // The exact 2× boundary (heartbeat * 2 == lease) is now REJECTED: a
-        // renewal coincident with expiry races an idle-polling worker's reclaim.
-        let exact = TrainingConfig {
-            lease_duration_secs: 20,
-            heartbeat_interval_secs: 10,
-            idle_poll_secs: 1,
-            ..Default::default()
-        };
-        assert!(
-            matches!(exact.worker_intervals(), Err(JammiError::Config(_))),
-            "heartbeat * 2 == lease must be rejected under the strict margin"
-        );
-
-        // Strictly under half (heartbeat * 2 < lease) is accepted.
-        let strict = TrainingConfig {
-            lease_duration_secs: 21,
-            heartbeat_interval_secs: 10,
-            idle_poll_secs: 1,
-            ..Default::default()
-        };
-        assert!(strict.worker_intervals().is_ok());
-    }
-
-    #[test]
-    fn training_config_margin_check_is_overflow_safe() {
-        // An operator-controlled heartbeat whose doubling overflows `u64` must
-        // be rejected with a Config error — never a debug-build panic, never a
-        // release-build silent wrap-to-zero that accepts bogus timing.
-        let absurd = TrainingConfig {
-            lease_duration_secs: 30,
-            heartbeat_interval_secs: u64::MAX / 2 + 1,
-            idle_poll_secs: 1,
-            ..Default::default()
-        };
-        assert!(
-            matches!(absurd.worker_intervals(), Err(JammiError::Config(_))),
-            "a heartbeat whose doubling overflows u64 must be a Config error"
-        );
-    }
-
-    #[test]
-    fn training_config_rejects_zero_idle_poll() {
-        let cfg = TrainingConfig {
-            lease_duration_secs: 30,
-            heartbeat_interval_secs: 10,
-            idle_poll_secs: 0,
-            ..Default::default()
-        };
-        let err = cfg.worker_intervals().unwrap_err();
-        assert!(
-            matches!(&err, JammiError::Config(m) if m.contains("idle_poll_secs")),
-            "expected a Config error naming the idle-poll field, got {err:?}"
-        );
-    }
-
-    #[test]
-    fn training_config_rejects_zero_heartbeat() {
-        let cfg = TrainingConfig {
-            lease_duration_secs: 30,
-            heartbeat_interval_secs: 0,
-            idle_poll_secs: 1,
-            ..Default::default()
-        };
-        assert!(matches!(cfg.worker_intervals(), Err(JammiError::Config(_))));
-    }
-
-    #[test]
-    fn load_rejects_invalid_training_timing() {
-        let _guard = env_lock();
-        // The load path enforces the invariant: a heartbeat with no margin in
-        // the TOML is a hard load error.
-        let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("jammi.toml");
-        std::fs::write(
-            &path,
-            r#"
-                [training]
-                lease_duration_secs = 5
-                heartbeat_interval_secs = 5
-                idle_poll_secs = 1
-            "#,
-        )
-        .unwrap();
-        let err = JammiConfig::load(Some(&path)).unwrap_err();
-        assert!(matches!(err, JammiError::Config(_)), "got {err:?}");
-    }
-
-    #[test]
-    fn interpolate_env_vars_happy_path() {
-        // Parallel tests would collide on a shared env var; the test name is
-        // baked into the var name to keep each test's view independent.
-        std::env::set_var("JAMMI_TEST_INTERP_HAPPY", "from-env");
-        let out = interpolate_env_vars("url = \"${JAMMI_TEST_INTERP_HAPPY}\"").unwrap();
-        assert_eq!(out, "url = \"from-env\"");
-        std::env::remove_var("JAMMI_TEST_INTERP_HAPPY");
-    }
-
-    #[test]
-    fn interpolate_env_vars_missing_is_typed_error() {
-        // Use a unique name to dodge a parallel-test race that sets it.
-        std::env::remove_var("JAMMI_TEST_INTERP_DEFINITELY_NOT_SET");
-        let err =
-            interpolate_env_vars("url = \"${JAMMI_TEST_INTERP_DEFINITELY_NOT_SET}\"").unwrap_err();
-        match err {
-            JammiError::Config(msg) => {
-                assert!(
-                    msg.contains("JAMMI_TEST_INTERP_DEFINITELY_NOT_SET"),
-                    "msg = {msg}"
-                );
-            }
-            other => panic!("expected JammiError::Config, got {other:?}"),
-        }
-    }
-
-    #[test]
-    fn interpolate_env_vars_escape_double_dollar() {
-        let out = interpolate_env_vars("password = \"$$secret$$\"").unwrap();
-        assert_eq!(out, "password = \"$secret$\"");
-    }
-
-    #[test]
-    fn interpolate_env_vars_unterminated_brace_errors() {
-        let err = interpolate_env_vars("url = \"${UNCLOSED\"").unwrap_err();
-        assert!(matches!(err, JammiError::Config(_)), "{err:?}");
-    }
-
-    #[test]
-    fn interpolate_env_vars_bare_dollar_preserved() {
-        let out = interpolate_env_vars("hint = \"price is $5\"").unwrap();
-        assert_eq!(out, "hint = \"price is $5\"");
-    }
-
-    #[test]
-    fn interpolate_env_vars_invalid_name_errors() {
-        let err = interpolate_env_vars("url = \"${1bad}\"").unwrap_err();
-        match err {
-            JammiError::Config(msg) => assert!(msg.contains("Invalid env-var name"), "{msg}"),
-            other => panic!("expected JammiError::Config, got {other:?}"),
-        }
-    }
-
-    #[test]
-    fn load_interpolates_before_parse() {
-        let _guard = env_lock();
-        std::env::set_var("JAMMI_TEST_LOAD_URL", "postgres://u:p@h/db");
-        let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("jammi.toml");
-        std::fs::write(
-            &path,
-            r#"
-                [catalog]
-                kind = "postgres"
-                url = "${JAMMI_TEST_LOAD_URL}"
-                pool_size = 4
-            "#,
-        )
-        .unwrap();
-        let cfg = JammiConfig::load(Some(&path)).unwrap();
-        assert_eq!(
-            cfg.catalog,
-            CatalogConfig::Postgres {
-                url: "postgres://u:p@h/db".into(),
-                pool_size: 4,
-                max_lifetime_secs: None,
-            }
-        );
-        std::env::remove_var("JAMMI_TEST_LOAD_URL");
-    }
-
-    #[test]
-    fn storage_precision_default_is_f32() {
-        assert_eq!(StoragePrecision::default(), StoragePrecision::F32);
-    }
-
-    #[test]
-    fn storage_precision_display_and_from_str_round_trip() {
-        for precision in [
-            StoragePrecision::F32,
-            StoragePrecision::F16,
-            StoragePrecision::Int8,
-            StoragePrecision::Binary,
-        ] {
-            let s = precision.to_string();
-            assert_eq!(s.parse::<StoragePrecision>().unwrap(), precision);
-        }
-    }
-
-    #[test]
-    fn storage_precision_from_str_rejects_unknown_value() {
-        assert!("fp8".parse::<StoragePrecision>().is_err());
-    }
-
-    #[test]
-    fn storage_precision_maps_onto_usearch_scalar_kind() {
-        assert_eq!(
-            StoragePrecision::F32.to_scalar_kind(),
-            usearch::ScalarKind::F32
-        );
-        assert_eq!(
-            StoragePrecision::F16.to_scalar_kind(),
-            usearch::ScalarKind::F16
-        );
-        assert_eq!(
-            StoragePrecision::Int8.to_scalar_kind(),
-            usearch::ScalarKind::I8
-        );
-        assert_eq!(
-            StoragePrecision::Binary.to_scalar_kind(),
-            usearch::ScalarKind::B1
-        );
-    }
-
-    #[test]
-    fn only_f32_skips_rescore() {
-        assert!(!StoragePrecision::F32.needs_rescore());
-        assert!(StoragePrecision::F16.needs_rescore());
-        assert!(StoragePrecision::Int8.needs_rescore());
-        assert!(StoragePrecision::Binary.needs_rescore());
-    }
-
-    #[test]
-    fn ann_index_config_default_oversample_is_unset() {
-        assert_eq!(AnnIndexConfig::default().oversample, None);
-        assert_eq!(AnnIndexConfig::default().effective_oversample(), 4);
-    }
-
-    #[test]
-    fn effective_oversample_clamps_a_misconfigured_zero_to_one() {
-        let ann = AnnIndexConfig {
-            oversample: Some(0),
-            ..AnnIndexConfig::default()
-        };
-        assert_eq!(ann.effective_oversample(), 1);
-    }
-
-    #[test]
-    fn resolve_oversample_prefers_request_then_table_then_config() {
-        let ann = AnnIndexConfig {
-            oversample: Some(4),
-            ..AnnIndexConfig::default()
-        };
-        // A per-request override wins over both.
-        assert_eq!(ann.resolve_oversample(Some(9), Some(6)), 9);
-        // No request → the table's own stamped default drives it, not the
-        // deployment config default.
-        assert_eq!(ann.resolve_oversample(None, Some(6)), 6);
-        // Neither → the deployment's effective oversample (pre-migration-023
-        // fallback).
-        assert_eq!(ann.resolve_oversample(None, None), 4);
-    }
-
-    #[test]
-    fn resolve_oversample_clamps_a_zero_override_or_default_to_one() {
-        let ann = AnnIndexConfig {
-            oversample: Some(4),
-            ..AnnIndexConfig::default()
-        };
-        // A 0 override must never shrink the candidate set below k.
-        assert_eq!(ann.resolve_oversample(Some(0), Some(6)), 1);
-        let misconfigured = AnnIndexConfig {
-            oversample: Some(0),
-            ..AnnIndexConfig::default()
-        };
-        assert_eq!(misconfigured.resolve_oversample(None, None), 1);
-    }
-
-    #[test]
-    fn storage_precision_default_oversample_is_precision_specific() {
-        assert_eq!(StoragePrecision::F32.default_oversample(), 4);
-        assert_eq!(StoragePrecision::F16.default_oversample(), 4);
-        assert_eq!(StoragePrecision::Int8.default_oversample(), 4);
-        assert_eq!(StoragePrecision::Binary.default_oversample(), 32);
-    }
-
-    #[test]
-    fn effective_oversample_for_uses_precision_default_when_unset() {
-        // An untouched (`None`) deployment config defers to the precision's
-        // own default: Binary widens to 32, the other three stay at 4.
-        let ann = AnnIndexConfig::default();
-        assert_eq!(ann.effective_oversample_for(StoragePrecision::Binary), 32);
-        assert_eq!(ann.effective_oversample_for(StoragePrecision::F32), 4);
-        assert_eq!(ann.effective_oversample_for(StoragePrecision::Int8), 4);
-    }
-
-    #[test]
-    fn effective_oversample_for_honors_an_explicit_deployment_override() {
-        // An explicit `Some` deployment override wins over the
-        // precision-specific default, even for Binary — an operator's
-        // explicit config is never silently widened.
-        let ann = AnnIndexConfig {
-            oversample: Some(8),
-            ..AnnIndexConfig::default()
-        };
-        assert_eq!(ann.effective_oversample_for(StoragePrecision::Binary), 8);
-        assert_eq!(ann.effective_oversample_for(StoragePrecision::F32), 8);
-    }
-
-    #[test]
-    fn effective_oversample_for_honors_an_explicit_four_on_binary_not_widened_to_thirty_two() {
-        // The exact case the adversarial audit flagged: a deployment that has
-        // EXPLICITLY configured `oversample = 4` on a `Binary` table must be
-        // honored verbatim as 4, never silently widened to Binary's own
-        // per-precision default of 32.
-        let ann = AnnIndexConfig {
-            oversample: Some(4),
-            ..AnnIndexConfig::default()
-        };
-        assert_eq!(ann.effective_oversample_for(StoragePrecision::Binary), 4);
-    }
-
-    #[test]
-    fn effective_oversample_for_none_on_binary_resolves_to_thirty_two() {
-        // The unset (`None`) counterpart: with no explicit deployment
-        // override, a Binary table still stamps the wider per-precision
-        // default of 32.
-        let ann = AnnIndexConfig {
-            oversample: None,
-            ..AnnIndexConfig::default()
-        };
-        assert_eq!(ann.effective_oversample_for(StoragePrecision::Binary), 32);
-    }
+fn parse_env_bool(var: &str, raw: &str) -> Result<bool> {
+    layers::parse_lenient_bool(raw).ok_or_else(|| {
+        JammiError::Config(format!(
+            "Invalid boolean '{raw}' for {var}. Expected: true, false, 1, 0"
+        ))
+    })
 }

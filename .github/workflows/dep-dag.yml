@@ -58,10 +58,15 @@ jobs:
       # The CI image does not ship cargo-build-graph; install it (pinned, so the
       # rendered graph matches the committed block). Clear -D warnings for this
       # step only — it compiles a third-party crate and its deps, where a single
-      # upstream warning would otherwise fail the build.
+      # upstream warning would otherwise fail the build. Overriding the SAME
+      # per-target var `setup-rust-ci` set (never a bare RUSTFLAGS, which would
+      # also silently drop the mold flag `.cargo/config.toml` still supplies for
+      # this runner's target — an empty CARGO_TARGET_..._RUSTFLAGS joins with
+      # config.toml the same as a non-empty one, contributing nothing extra
+      # while leaving mold in place).
       - name: Install build-graph (the dep-DAG generator's source of truth)
         env:
-          RUSTFLAGS: ""
+          CARGO_TARGET_X86_64_UNKNOWN_LINUX_GNU_RUSTFLAGS: ""
         run: cargo install build-graph --version 0.1.0 --locked
 
       # The maintainer guide's crate-dependency DAG is generated from

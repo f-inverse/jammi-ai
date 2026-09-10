@@ -43,7 +43,9 @@ jobs:
       - uses: actions/checkout@v4
       - uses: ./.github/actions/setup-rust-ci
         with:
-          rustflags: "-C link-arg=-fuse-ld=mold"
+          # mold applies unconditionally from .cargo/config.toml; this lane
+          # never wanted -D warnings (a wheel-build lane, not the lint gate).
+          deny-warnings: false
 
       - name: Build native wheel
         run: maturin build --release --out dist

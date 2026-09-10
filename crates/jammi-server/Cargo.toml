@@ -55,10 +55,9 @@ uuid.workspace = true
 async-trait.workspace = true
 # The `probe` subcommand's HTTP client (a generic readiness check against
 # `/readyz` for a supervisor's exit-code-driven healthcheck — Compose,
-# systemd `ExecStartPost=`, Nomad). `rustls-tls`, no default features:
-# already compiled transitively via `jammi-ai`'s default `local` feature, so
-# promoting it from dev-only to a real dependency adds no new TLS stack or
-# supply-chain edge.
+# systemd `ExecStartPost=`, Nomad). `rustls-tls`, no default features: the
+# same TLS stack `jammi-ai`'s default `local` feature already compiles
+# transitively, so this adds no new TLS stack or supply-chain edge.
 reqwest.workspace = true
 
 [features]

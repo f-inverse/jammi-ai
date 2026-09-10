@@ -63,16 +63,27 @@ struct ServeArgs {
 
 #[derive(Args, Debug)]
 struct ProbeArgs {
+    /// Path to the configuration file, consulted only when `--url` is
+    /// absent. Falls back to `JAMMI_CONFIG`, `./jammi.toml`,
+    /// `/etc/jammi/jammi.toml`, and the platform-default config directory,
+    /// in that order — byte-for-byte the same resolution `serve`'s
+    /// `--config` runs.
+    #[arg(long)]
+    config: Option<PathBuf>,
     /// URL to GET. Defaults to `http://<host>:<port>/readyz`, derived from
     /// the resolved `[server] health_listen` (the SAME config resolution
-    /// `serve` uses — `JAMMI_CONFIG`, `./jammi.toml`,
+    /// `serve` uses — `--config`, `JAMMI_CONFIG`, `./jammi.toml`,
     /// `/etc/jammi/jammi.toml`, the platform config directory), with a
     /// wildcard bind host (`0.0.0.0`, `::`) rewritten to its loopback
     /// equivalent.
     #[arg(long)]
     url: Option<String>,
-    /// Request timeout, in seconds.
-    #[arg(long, default_value_t = jammi_server::probe::DEFAULT_TIMEOUT_SECS)]
+    /// Request timeout, in seconds. Must be at least 1.
+    #[arg(
+        long,
+        default_value_t = jammi_server::probe::DEFAULT_TIMEOUT_SECS,
+        value_parser = clap::value_parser!(u64).range(1..)
+    )]
     timeout_secs: u64,
 }
 
@@ -137,17 +148,24 @@ async fn probe(args: ProbeArgs) -> ExitCode {
     let url = match args.url {
         Some(url) => url,
         None => {
-            // Same config resolution `serve` uses: no explicit path, so
+            // Same config resolution `serve` runs — `JammiConfig::load`
+            // with the same optional explicit path, falling back through
             // `JAMMI_CONFIG` / `./jammi.toml` / `/etc/jammi/jammi.toml` /
-            // the platform config dir are consulted in that order.
-            let config = match JammiConfig::load(None) {
+            // the platform config dir in that order.
+            let config = match JammiConfig::load(args.config.as_deref()) {
                 Ok(cfg) => cfg,
                 Err(e) => {
                     eprintln!("jammi-server probe: failed to load config: {e}");
                     return ExitCode::FAILURE;
                 }
             };
-            jammi_server::probe::default_url(&config.server)
+            match jammi_server::probe::default_url(&config.server) {
+                Ok(url) => url,
+                Err(e) => {
+                    eprintln!("jammi-server probe: {e}");
+                    return ExitCode::FAILURE;
+                }
+            }
         }
     };
     match jammi_server::probe::check(&url, timeout).await {
@@ -192,6 +210,24 @@ mod tests {
             }
             other => panic!("expected Some(Command::Probe(_)), got {}", describe(&other)),
         }
+
+        // Explicit `probe --config`, same shape as `serve --config`.
+        let cli = Cli::try_parse_from(["jammi-server", "probe", "--config", "x.toml"])
+            .expect("probe --config parses");
+        match cli.command {
+            Some(Command::Probe(args)) => {
+                assert_eq!(args.config, Some(PathBuf::from("x.toml")));
+                assert_eq!(args.url, None);
+            }
+            other => panic!("expected Some(Command::Probe(_)), got {}", describe(&other)),
+        }
+    }
+
+    #[test]
+    fn probe_timeout_secs_rejects_zero() {
+        let err = Cli::try_parse_from(["jammi-server", "probe", "--timeout-secs", "0"])
+            .expect_err("--timeout-secs 0 must be rejected at the CLI boundary");
+        assert_eq!(err.kind(), clap::error::ErrorKind::ValueValidation);
     }
 
     #[test]

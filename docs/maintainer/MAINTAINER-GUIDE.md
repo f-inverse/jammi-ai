@@ -495,7 +495,7 @@ Every trait/enum/base surface a maintainer extends, with anchors and invariants.
   `true` (default `true`); **not** the unconditional `with_embedded_worker`
   form. This is the SAME key the server `train` tier and the Python embedded
   arm read before deciding whether THEIR process claims —
-  `training.run_worker` (`crates/jammi-server/src/runtime.rs:1043`) and
+  `training.run_worker` (`crates/jammi-server/src/runtime.rs:1167`) and
   `training.run_worker` (`crates/jammi-python/src/database.rs:98`) — so a wire
   deployment and an in-process one answer "does THIS process claim?"
   identically rather than by three private conventions. `Target`
@@ -2959,9 +2959,9 @@ describing a removed surface.
   Result<(), Status>`, unlike the `async_trait` `TenantResolver`): a local
   metadata check, not an I/O round-trip. `CatalogServer::new`'s 4th parameter,
   threaded from `GrpcChain.admin_authorizer: Option<Arc<dyn AdminAuthorizer>>`
-  (`runtime.rs:290`'s `build_grpc_chain` — the OSS binary's shipped default,
-  `None` — and `:897`'s `assemble_grpc_chain` exhaustive destructure;
-  `flight.rs:77`'s `serve_flight_with_catalog_service` passes `None`). Shipped
+  (`runtime.rs:414`'s `build_grpc_chain` — the OSS binary's shipped default,
+  `None` — and `:1020`'s `assemble_grpc_chain` exhaustive destructure;
+  `flight.rs:56`'s `serve_flight_with_catalog_service` passes `None`). Shipped
   default `None` refuses EVERY `all = true` request with `PERMISSION_DENIED`
   naming `security.md`; `all = false` never consults it. **Gated verb only —
   gRPC-only by construction** (`Reconcile` has no Flight SQL analogue), unlike
@@ -4064,7 +4064,9 @@ here can retroactively un-push a tag. Then tag both `v*` and `py-v*`
   chains off `publish`) + `.github/workflows/npm.yml` (build+test unconditional; the `Publish` step
   itself is prove-gated) + `.github/workflows/server-image.yml` (the manual `:latest` CPU refresh via
   `workflow_dispatch` on `main` is intentionally ungated — `build-and-push-main`; `server-image.yml`
-  carries no `push: branches:` trigger, so this never fires on a mere merge; the CPU and CUDA TAG
+  carries no `push: branches:` trigger, so this never fires on a mere merge; both `:latest` tags are
+  separately re-pointed by every `v*` release tag itself, via `docker/metadata-action`'s default
+  `flavor: latest=auto`, so the CPU `:latest` is never main-only; the CPU and CUDA TAG
   promotions — `build-and-push` and `build-and-push-cu12` — are both prove-gated) +
   `.github/workflows/release-binaries.yml` (every asset family — the CLI matrix, the CPU tarball, the
   CUDA tarball — is split into an ungated build leg that always runs and a prove-gated promote leg

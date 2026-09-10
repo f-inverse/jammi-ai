@@ -291,7 +291,7 @@ The OSS server ships as two public Docker images on GHCR:
 - `ghcr.io/f-inverse/jammi-ai-server` — **CPU**, built from a distroless base.
 - `ghcr.io/f-inverse/jammi-ai-server-cu12` — **CUDA**, for GPU-accelerated inference (see [GPU serving](#gpu-serving)).
 
-Both run as the nonroot user (uid `65532`), expose the same `8080` / `8081` ports the local binary listens on, and share the same tag scheme (`:latest`, `:vX.Y.Z`, `:vX.Y`). The image entrypoint is `jammi-server`, so `docker run <image>` brings up the server with **zero config** — a local SQLite catalog, the in-memory broker, and every service tier, no TOML required. The `jammi` admin CLI also ships in the image for running verbs against the server. The examples below use the CPU image.
+Both run as the nonroot user (uid `65532`), expose the same `8080` / `8081` ports the local binary listens on, and share the same tag scheme (`:latest`, `:vX.Y.Z`, `:vX.Y`). Both `:latest` tags are re-pointed by every `v*` release tag (never by a prerelease); the CPU `:latest` can additionally be re-pointed to the current `main` by a manual `build-and-push-main` dispatch. The image entrypoint is `jammi-server`, so `docker run <image>` brings up the server with **zero config** — a local SQLite catalog, the in-memory broker, and every service tier, no TOML required. The `jammi` admin CLI also ships in the image for running verbs against the server. The examples below use the CPU image.
 
 ```bash
 # Turnkey: zero config, no TOML.
@@ -311,12 +311,11 @@ docker run --rm \
   ghcr.io/f-inverse/jammi-ai-server:latest --config /etc/jammi/jammi.toml
 ```
 
-A minimal compose file lives in the workspace at `examples/docker-compose/oss-server.yml`:
-
-```bash
-cd examples/docker-compose
-docker compose -f oss-server.yml up
-```
+A tested Compose stack (server + Postgres catalog + JetStream broker) lives
+at `deploy/docker-compose.yml`, exercised end to end by the `compose-smoke`
+workflow — see [Reference Topologies: Shape
+B](./reference-topologies.md#shape-b--single-tenant-server) for the full
+file, its environment variables, and what the smoke proves.
 
 ### Persistence
 
@@ -332,41 +331,20 @@ A named Docker volume (the compose default) sidesteps that step because Docker p
 
 ### Configuration
 
-The image needs no config — it boots zero-config. To override defaults, bind-mount a TOML and point the `jammi-server` entrypoint at it with a `command:`. The `[gpu]`, `[server]`, and `services` knobs documented above (and `JAMMI_*` env overrides) all apply:
-
-```yaml
-# oss-server.yml
-services:
-  jammi-server:
-    image: ghcr.io/f-inverse/jammi-ai-server:latest
-    command: ["--config", "/etc/jammi/jammi.toml"]
-    volumes:
-      - ./jammi.toml:/etc/jammi/jammi.toml:ro
-      - jammi_data:/var/lib/jammi
-    ports:
-      - "8080:8080"
-      - "8081:8081"
-```
-
-Or skip the TOML entirely and tune via environment variables:
-
-```yaml
-services:
-  jammi-server:
-    image: ghcr.io/f-inverse/jammi-ai-server:latest
-    environment:
-      JAMMI_SERVER__SERVICES: "event"      # serve + event tier only
-      JAMMI_LOGGING__FORMAT: "json"
-    volumes:
-      - jammi_data:/var/lib/jammi
-    ports:
-      - "8080:8080"
-      - "8081:8081"
-```
+The image needs no config — it boots zero-config, running `jammi-server
+serve` (the implicit default subcommand) via the entrypoint. To override
+defaults under `docker run`, pass `--config` as shown above, or set
+`JAMMI_*` env vars — the `[gpu]`, `[server]`, and `services` knobs documented
+above all apply. Under Compose, the same two options carry over unchanged
+(`command:` appends to the entrypoint the same way `docker run <image>
+--config ...` does; `environment:` sets the same `JAMMI_*` vars) — see
+[Reference Topologies: Shape B](./reference-topologies.md#shape-b--single-tenant-server)
+for a complete, tested Compose file doing exactly this against a Postgres
+catalog and JetStream broker.
 
 ### GPU serving
 
-The `jammi-ai-server-cu12` image builds with candle's CUDA backend on an NVIDIA CUDA 12.6 runtime base, so `libcudart` and the rest of the CUDA runtime libraries are present in the image. It carries the same turnkey `jammi` CLI as the CPU image. Run it on a host with the [NVIDIA Container Toolkit](https://docs.nvidia.com/datacenter/cloud-native/container-toolkit/) and pass `--gpus all`:
+The `jammi-ai-server-cu12` image builds with candle's CUDA backend on an NVIDIA CUDA 12.6 runtime base, so `libcudart` and the rest of the CUDA runtime libraries are present in the image. It carries the same turnkey `jammi` CLI as the CPU image. Run it on a host with the [NVIDIA Container Toolkit](https://docs.nvidia.com/datacenter/cloud-native/container-toolkit/) and pass `--gpus all`. Both `:latest` tags are re-pointed by every `v*` release tag (never by a prerelease); the CPU `:latest` can additionally be re-pointed to the current `main` by a manual `build-and-push-main` dispatch — pin an exact `:vX.Y.Z` tag for a reproducible GPU-node deploy:
 
 ```bash
 # Turnkey: zero config, GPU inference.
@@ -408,3 +386,32 @@ DOCKER_BUILDKIT=1 docker build -t jammi-ai-server-cu12:dev \
 ```
 
 Cold builds take ~30 minutes (the workspace is large); warm builds with cache hits land at ~3 minutes. The CUDA build additionally compiles candle's CUDA kernels, so its cold build is longer.
+
+### Supply chain: SBOM, provenance, attestations
+
+Every image `server-image.yml` pushes to GHCR — the CPU `:latest` / `:vX.Y.Z`
+tags, the CUDA `-cu12` tags, and the dispatch-only `:selfcontained` build —
+carries a `docker/build-push-action` SPDX SBOM and `mode=max` build
+provenance attached to the image manifest, plus a Sigstore-signed
+[`actions/attest-build-provenance`](https://github.com/actions/attest-build-provenance)
+attestation published to the repository's attestation store for the exact
+digest that job pushed — never a mutable tag, which a concurrent run could
+re-point. Verify an image you pulled against that digest:
+
+```bash
+gh attestation verify oci://ghcr.io/f-inverse/jammi-ai-server@sha256:<digest> \
+  --repo f-inverse/jammi-ai
+```
+
+CI checks both of these, in two separate steps, on every push job:
+`ci/scripts/assert_image_attestations.sh` asserts (via `docker buildx
+imagetools inspect`) that the pushed digest's own OCI index carries BOTH a
+non-empty SBOM and a non-empty provenance attestation manifest; a positively
+empty accessor fails the job immediately rather than falling back to a
+looser check. A separate `gh attestation verify oci://... --bundle-from-oci`
+step then verifies the Sigstore-signed bundle `attest-build-provenance`
+published as an OCI referrer — the check above never touches that bundle.
+The `compose-smoke` workflow's own build (`load: true`, loaded into the
+runner's daemon, never pushed) carries neither: `sbom` and `provenance` are
+explicitly `false` there, since the stock Docker exporter a `load` build
+uses cannot carry attestations.

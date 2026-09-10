@@ -188,6 +188,11 @@ jobs:
     permissions:
       # `gh release create` / `gh release upload` (the release-upload action).
       contents: write
+      # Sigstore-signed provenance attestation on the released tarball, same
+      # rationale as server-image.yml's push jobs -- only a leg that actually
+      # attaches an asset to a release gets these.
+      id-token: write
+      attestations: write
     steps:
       - uses: actions/checkout@v4
 
@@ -207,6 +212,13 @@ jobs:
           set -euo pipefail
           asset="$(ls "jammi-"*"-${{ matrix.target }}.tar.gz")"
           echo "asset=$asset" >> "$GITHUB_OUTPUT"
+
+      # Before the upload: the attestation's subject is the exact tarball
+      # bytes about to be attached to the release.
+      - name: Attest build provenance
+        uses: actions/attest-build-provenance@4d101475d8b20a2381f78447822ac1eab6504dd8 # v4.2.2
+        with:
+          subject-path: ${{ steps.locate.outputs.asset }}
 
       - uses: ./.github/actions/release-upload
         with:
@@ -264,12 +276,22 @@ jobs:
     permissions:
       # `gh release create` / `gh release upload` (the release-upload action).
       contents: write
+      # See `promote-binaries`'s identical comment.
+      id-token: write
+      attestations: write
     steps:
       - uses: actions/checkout@v4
 
       - uses: actions/download-artifact@v4
         with:
           name: jammi-server-cpu-tarball
+
+      # Before the upload: the attestation's subject is the exact tarball
+      # bytes about to be attached to the release.
+      - name: Attest build provenance
+        uses: actions/attest-build-provenance@4d101475d8b20a2381f78447822ac1eab6504dd8 # v4.2.2
+        with:
+          subject-path: ${{ needs.server-cpu.outputs.asset }}
 
       - uses: ./.github/actions/release-upload
         with:
@@ -437,12 +459,22 @@ jobs:
     permissions:
       # `gh release create` / `gh release upload` (the release-upload action).
       contents: write
+      # See `promote-binaries`'s identical comment.
+      id-token: write
+      attestations: write
     steps:
       - uses: actions/checkout@v4
 
       - uses: actions/download-artifact@v4
         with:
           name: jammi-server-cu12-tarball
+
+      # Before the upload: the attestation's subject is the exact tarball
+      # bytes about to be attached to the release.
+      - name: Attest build provenance
+        uses: actions/attest-build-provenance@4d101475d8b20a2381f78447822ac1eab6504dd8 # v4.2.2
+        with:
+          subject-path: ${{ needs.server-cu12-build.outputs.asset }}
 
       # Release attach (any `v*` tag ref) or workflow-artifact upload (branch
       # dispatch) — the shared release-upload action decides which, and owns

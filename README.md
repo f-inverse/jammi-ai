@@ -119,7 +119,7 @@ curl http://localhost:8080/healthz
 # {"status":"ok","version":"0.8.0"}
 ```
 
-For GPU-accelerated inference, pull the CUDA variant `ghcr.io/f-inverse/jammi-ai-server-cu12:latest` and run it with `--gpus all` on a host with the NVIDIA Container Toolkit.
+For GPU-accelerated inference, pull the CUDA variant `ghcr.io/f-inverse/jammi-ai-server-cu12:latest` and run it with `--gpus all` on a host with the NVIDIA Container Toolkit — both `:latest` tags are re-pointed by every `v*` release tag (never by a prerelease); the CPU `:latest` can additionally be re-pointed to the current `main` by a manual `build-and-push-main` dispatch.
 
 The OSS server is single-tenant — the deployer's network is the auth boundary. See [Deploy as a Server](https://f-inverse.github.io/jammi-ai/deploy-server.html) for the full guide.
 

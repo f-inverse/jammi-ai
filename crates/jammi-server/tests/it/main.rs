@@ -1,4 +1,5 @@
 mod api_freeze;
+mod audit_master_key;
 mod common;
 mod composability_seam;
 mod flight_annotate;
@@ -30,6 +31,7 @@ mod grpc_trigger;
 mod grpc_web;
 mod health;
 mod mount_tenant_scoped;
+mod probe;
 mod serve_bind_race;
 mod serve_e2e;
 mod server;

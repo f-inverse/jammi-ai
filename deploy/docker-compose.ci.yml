@@ -1,0 +1,25 @@
+# CI-only override for the `compose-smoke` workflow (`.github/workflows/
+# compose-smoke.yml`): bind-mounts the bundled tiny fixtures the smoke's
+# remote script (`tests/compose/shape_b_remote.py`) reads, and pins
+# `jammi-server` to the image the workflow already built + `docker load`ed
+# via `JAMMI_IMAGE` — never a fresh build, never a registry pull. No
+# `build:` block here: the composite build step is the sole producer of the
+# image this override runs.
+#
+# Usage: `docker compose -f deploy/docker-compose.yml -f deploy/docker-compose.ci.yml up --wait`.
+
+services:
+  jammi-server:
+    # Explicitly closes the base file's `build:` block rather than merely
+    # leaving it unmentioned — the compose merge model otherwise keeps a
+    # base-only key, so a future `docker compose ... up` on this override
+    # could silently rebuild instead of running the image `pull_policy: never`
+    # + `JAMMI_IMAGE` pin below name. `!reset` drops the key entirely; verify
+    # with `docker compose -f deploy/docker-compose.yml -f
+    # deploy/docker-compose.ci.yml config` that no `build:` block remains in
+    # the merged model.
+    build: !reset null
+    pull_policy: never
+    volumes:
+      - ../cookbook/fixtures/tiny_bert:/fixtures/tiny_bert:ro
+      - ../tests/fixtures/patents.parquet:/fixtures/patents.parquet:ro

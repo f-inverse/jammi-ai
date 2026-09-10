@@ -27,7 +27,8 @@ use axum::Router;
 use datafusion::execution::context::SessionContext;
 use datafusion_flight_sql_server::service::FlightSqlService;
 use jammi_ai::session::InferenceSession;
-use jammi_db::config::JammiConfig;
+use jammi_db::audit::{ensure_master_key_present, EnvSigningKeyStore, FileSigningKeyStore};
+use jammi_db::config::{JammiConfig, SigningKeyConfig};
 use tokio::net::TcpListener;
 use tokio::signal;
 use tokio::sync::broadcast;
@@ -80,6 +81,129 @@ pub enum ServerError {
     Io(#[from] std::io::Error),
     #[error("addr parse: {0}")]
     AddrParse(#[from] std::net::AddrParseError),
+    #[error("{0}")]
+    AuditMasterKey(String),
+}
+
+/// Fail-closed startup check for the audit signing key.
+///
+/// Classifies the configured source into a four-state lattice — **unset**
+/// (`JAMMI_AUDIT_MASTER_KEY` absent for [`SigningKeyConfig::Env`], or ENOENT
+/// for [`SigningKeyConfig::File`]'s mounted path), **set-empty** (present but
+/// empty, or all-whitespace, after trimming — what `deploy/.env.example`
+/// ships as its `JAMMI_AUDIT_MASTER_KEY=` placeholder, and what an unfilled
+/// Kubernetes Secret key produces whichever source reads it), **set-malformed**
+/// (present, non-empty, but does not decode to 32 bytes of hex), and
+/// **set-valid**. Unset and set-empty are BOTH treated as absent — audit
+/// signing simply stays unusable until the first `AuditService` write,
+/// exactly as before this check existed; this function does not tighten
+/// that policy for either state. What this closes is set-malformed: that
+/// used to let `jammi-server serve` boot successfully with audit signing
+/// silently dead, discovered only on the first signing attempt deep inside a
+/// request. A set-malformed key now refuses to start.
+///
+/// For [`SigningKeyConfig::File`], "present" additionally fails CLOSED on
+/// every read error OTHER than the path not existing at all — an
+/// existing-but-unreadable mount (wrong owner, `0o000`) is `present`, not
+/// silently read as absent, so such a mount refuses startup instead of
+/// booting with signing dead.
+///
+/// The refusal message names only the SHAPE of the failure ("not valid hex",
+/// or the character count against the expected 64) — never a character of
+/// the configured value. This function derives that shape itself, from the
+/// raw value it already read to classify presence, rather than through
+/// [`jammi_db::audit::AuditError::MasterKey`]'s `Display`: that type wraps
+/// `hex::FromHexError::InvalidHexCharacter`, whose own `Display` names the
+/// offending character, and letting that string reach this function's
+/// caller (ultimately `stderr`, per `main.rs`) would leak it. The actual
+/// pass/fail DECISION (is this key usable) still delegates entirely to
+/// [`jammi_db::audit::ensure_master_key_present`] (in turn
+/// [`jammi_db::audit::SigningKeyStore::master_key`]) — this function
+/// re-derives only the failure's shape, never the decode logic that decides
+/// pass/fail.
+pub fn validate_audit_master_key(config: &JammiConfig) -> Result<(), ServerError> {
+    let raw = match read_configured_key_source(config) {
+        Ok(raw) => raw,
+        Err(msg) => return Err(ServerError::AuditMasterKey(msg)),
+    };
+    let trimmed = raw.as_deref().map(str::trim).unwrap_or("");
+    if trimmed.is_empty() {
+        // Unset or set-empty: both absent for this check.
+        return Ok(());
+    }
+
+    let result = match &config.signing_key {
+        SigningKeyConfig::Env => ensure_master_key_present(&EnvSigningKeyStore),
+        SigningKeyConfig::File { path } => {
+            ensure_master_key_present(&FileSigningKeyStore::new(path.clone()))
+        }
+    };
+    result.map_err(|_| ServerError::AuditMasterKey(key_shape_error(config, trimmed)))
+}
+
+/// Read the configured signing-key source's raw value.
+///
+/// `Ok(Some(value))` when a value was read (untrimmed — the caller,
+/// [`validate_audit_master_key`], trims once, uniformly, for both sources).
+/// `Ok(None)` when the source is unset: `JAMMI_AUDIT_MASTER_KEY` absent for
+/// [`SigningKeyConfig::Env`], or ENOENT for [`SigningKeyConfig::File`]'s
+/// path. `Err` when the source could not be read for a reason OTHER than
+/// being unset — a mounted-but-unreadable file — and the error message names
+/// only the path, never file content, so it is safe to surface directly as
+/// this check's refusal text.
+fn read_configured_key_source(config: &JammiConfig) -> Result<Option<String>, String> {
+    match &config.signing_key {
+        SigningKeyConfig::Env => Ok(std::env::var(jammi_db::audit::MASTER_KEY_ENV).ok()),
+        SigningKeyConfig::File { path } => match std::fs::metadata(path) {
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
+            Err(e) => Err(format!(
+                "audit master key file `{}` could not be read: {e}",
+                path.display()
+            )),
+            Ok(_) => std::fs::read_to_string(path).map(Some).map_err(|e| {
+                format!(
+                    "audit master key file `{}` could not be read: {e}",
+                    path.display()
+                )
+            }),
+        },
+    }
+}
+
+/// Build a refusal message describing ONLY the shape of a present, non-empty,
+/// but invalid key — never a character of `trimmed` itself. Mirrors the
+/// wording [`jammi_db::audit::AuditError::MasterKey`]'s `Display` uses
+/// ("audit master key not configured or invalid — … 32 bytes of hex (64 hex
+/// chars): …") so the observable message is unchanged in shape, with only the
+/// leaky tail replaced.
+fn key_shape_error(config: &JammiConfig, trimmed: &str) -> String {
+    let source = match &config.signing_key {
+        SigningKeyConfig::Env => format!("set {} to", jammi_db::audit::MASTER_KEY_ENV),
+        SigningKeyConfig::File { path } => {
+            format!("the file at `{}` must contain", path.display())
+        }
+    };
+    let shape = if is_hex_decodable(trimmed) {
+        format!("got {} characters", trimmed.chars().count())
+    } else {
+        "not valid hex".to_string()
+    };
+    format!(
+        "audit master key not configured or invalid — {source} 32 bytes of hex \
+         (64 hex chars): {shape}"
+    )
+}
+
+/// Would `trimmed` decode as hex at all — an even count of ASCII hex digits?
+/// A local re-derivation of exactly what [`hex::decode`] would accept
+/// (`jammi-server` carries no non-dev `hex` dependency — a regular
+/// dependency addition is a `Cargo.toml` change, the lead/`docs-ci` shared
+/// class this crate's own code does not touch on its own), used ONLY to pick
+/// which safe wording [`key_shape_error`] prints. The actual pass/fail
+/// decision is still [`jammi_db::audit::ensure_master_key_present`]'s, not
+/// this function's — see [`validate_audit_master_key`]'s doc.
+fn is_hex_decodable(trimmed: &str) -> bool {
+    trimmed.len().is_multiple_of(2) && trimmed.chars().all(|c| c.is_ascii_hexdigit())
 }
 
 /// A readiness probe: pings whatever resource readiness depends on. The
@@ -1136,4 +1260,208 @@ async fn shutdown_signal() {
     }
 
     tracing::info!("Shutdown signal received, draining connections...");
+}
+
+#[cfg(test)]
+mod audit_master_key_tests {
+    use std::sync::{Mutex, OnceLock};
+
+    use super::*;
+
+    /// Serializes every test below that mutates the process-global
+    /// `JAMMI_AUDIT_MASTER_KEY` — a second, independently-declared lock
+    /// elsewhere in this binary would race this one, which is exactly the
+    /// failure mode `jammi_db::audit::key_store::test_env` (this crate has
+    /// no visibility into that `pub(crate)` module, so it declares its own,
+    /// same as `tests/it/grpc_mutable_topic_audit.rs::env_lock`) exists to
+    /// name.
+    fn env_lock() -> &'static Mutex<()> {
+        static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
+        LOCK.get_or_init(|| Mutex::new(()))
+    }
+
+    /// RED at base: nothing decoded the key at boot, so a malformed value
+    /// was silently accepted and audit signing died until the first write.
+    /// This is the control this test now pins GREEN.
+    #[test]
+    fn malformed_key_refuses_startup() {
+        let _guard = env_lock().lock().unwrap_or_else(|p| p.into_inner());
+        std::env::set_var(jammi_db::audit::MASTER_KEY_ENV, "not-hex");
+        let err = validate_audit_master_key(&JammiConfig::default())
+            .expect_err("a present-but-malformed key must refuse to start");
+        let msg = err.to_string();
+        assert!(
+            msg.contains(jammi_db::audit::MASTER_KEY_ENV),
+            "error must name the offending env var, got: {msg}"
+        );
+        assert!(
+            !msg.contains("not-hex"),
+            "error must never echo the value, got: {msg}"
+        );
+        std::env::remove_var(jammi_db::audit::MASTER_KEY_ENV);
+    }
+
+    /// Absence is unchanged: the check does not tighten what was already
+    /// allowed to start.
+    #[test]
+    fn absent_key_is_still_allowed_at_startup() {
+        let _guard = env_lock().lock().unwrap_or_else(|p| p.into_inner());
+        std::env::remove_var(jammi_db::audit::MASTER_KEY_ENV);
+        assert!(validate_audit_master_key(&JammiConfig::default()).is_ok());
+    }
+
+    /// A well-formed key (64 hex chars, the `openssl rand -hex 32` shape)
+    /// passes the check.
+    #[test]
+    fn valid_key_passes_startup() {
+        let _guard = env_lock().lock().unwrap_or_else(|p| p.into_inner());
+        std::env::set_var(jammi_db::audit::MASTER_KEY_ENV, "ab".repeat(32));
+        assert!(validate_audit_master_key(&JammiConfig::default()).is_ok());
+        std::env::remove_var(jammi_db::audit::MASTER_KEY_ENV);
+    }
+
+    /// The DECISION this round pins: `JAMMI_AUDIT_MASTER_KEY=""` (exactly what
+    /// `deploy/.env.example` ships as its placeholder, and what an unfilled
+    /// Kubernetes Secret key produces) is set-EMPTY, not set-malformed — it
+    /// must be treated exactly like the variable being unset, not refuse
+    /// startup as a 0-byte key.
+    #[test]
+    fn empty_env_key_is_treated_as_absent() {
+        let _guard = env_lock().lock().unwrap_or_else(|p| p.into_inner());
+        std::env::set_var(jammi_db::audit::MASTER_KEY_ENV, "");
+        assert!(validate_audit_master_key(&JammiConfig::default()).is_ok());
+        // All-whitespace is the same "set-empty" arm, not a distinct shape.
+        std::env::set_var(jammi_db::audit::MASTER_KEY_ENV, "   ");
+        assert!(validate_audit_master_key(&JammiConfig::default()).is_ok());
+        std::env::remove_var(jammi_db::audit::MASTER_KEY_ENV);
+    }
+
+    fn file_config(path: &std::path::Path) -> JammiConfig {
+        JammiConfig {
+            signing_key: SigningKeyConfig::File {
+                path: path.to_path_buf(),
+            },
+            ..JammiConfig::default()
+        }
+    }
+
+    /// `SigningKeyConfig::File`, absent path (ENOENT): allowed to start,
+    /// unchanged from today's "absence is fine" policy — the File-source
+    /// analogue of `absent_key_is_still_allowed_at_startup`.
+    #[test]
+    fn file_source_absent_path_is_allowed_at_startup() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let missing = dir.path().join("does-not-exist");
+        assert!(validate_audit_master_key(&file_config(&missing)).is_ok());
+    }
+
+    /// `SigningKeyConfig::File`, an existing but empty (or all-whitespace)
+    /// file: the File-source analogue of `empty_env_key_is_treated_as_absent`
+    /// — an unfilled Kubernetes Secret key mounts as a zero-byte file, and it
+    /// must be treated as absent too.
+    #[test]
+    fn file_source_empty_file_is_treated_as_absent() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("audit-master-key");
+        std::fs::write(&path, "").expect("write empty file");
+        assert!(validate_audit_master_key(&file_config(&path)).is_ok());
+
+        std::fs::write(&path, "\n").expect("write whitespace-only file");
+        assert!(validate_audit_master_key(&file_config(&path)).is_ok());
+    }
+
+    /// `SigningKeyConfig::File`, a readable file holding a well-formed key:
+    /// passes, exactly like the env source's `valid_key_passes_startup`.
+    #[test]
+    fn file_source_valid_key_passes_startup() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("audit-master-key");
+        std::fs::write(&path, "ab".repeat(32)).expect("write valid key");
+        assert!(validate_audit_master_key(&file_config(&path)).is_ok());
+    }
+
+    /// `SigningKeyConfig::File`, a readable file holding a malformed key:
+    /// refuses to start, and the refusal never echoes a character of the
+    /// file's content.
+    #[test]
+    fn file_source_malformed_key_refuses_startup() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("audit-master-key");
+        std::fs::write(&path, "zzzz-not-hex-zzzz").expect("write malformed key");
+        let err = validate_audit_master_key(&file_config(&path))
+            .expect_err("a present-but-malformed file key must refuse to start");
+        let msg = err.to_string();
+        assert!(
+            msg.contains("hex"),
+            "error must describe the format, got: {msg}"
+        );
+        assert!(
+            !msg.contains("zzzz"),
+            "error must never echo the value, got: {msg}"
+        );
+        assert!(
+            !msg.contains("not-hex"),
+            "error must never echo the value, got: {msg}"
+        );
+    }
+
+    /// The require-gate polarity every `chmod` permission-fault probe in the
+    /// workspace's test suites shares (esc-089 F1): `probe` performs the
+    /// fault-injection premise check itself and returns `true` if the fault
+    /// was BYPASSED (root, or a mode-ignoring filesystem). A bypass is
+    /// normally a loud, `eprintln`'d skip; under `JAMMI_REQUIRE_POSIX_PERMS=1`
+    /// (the CI lane that is SUPPOSED to run unprivileged with real POSIX
+    /// permission enforcement) a bypass is instead a hard `panic!` — never a
+    /// silent `return`. Each probe file carries its own copy of this wrapper
+    /// in the canonical shape the kernel-oracle registry
+    /// (`ci/kernel-oracle-helpers.txt`) verifies per file.
+    fn chmod_bypassed(test_name: &str, probe: impl FnOnce() -> bool) -> bool {
+        let bypassed = probe();
+        if bypassed {
+            if std::env::var_os("JAMMI_REQUIRE_POSIX_PERMS").is_some() {
+                panic!(
+                    "JAMMI_REQUIRE_POSIX_PERMS is set but '{test_name}' could not inject its \
+                     permission fault (root, or a mode-ignoring filesystem) — the \
+                     fault-injection premise this test needs does not hold; a silent skip is \
+                     not acceptable here"
+                );
+            }
+            eprintln!("{test_name}: chmod bypassed (root?) — skipping");
+        }
+        bypassed
+    }
+
+    /// `SigningKeyConfig::File`, an existing but UNREADABLE file (`0o000`):
+    /// this is the case advisory 2 closes — `std::fs::metadata` still sees
+    /// the path (so this is NOT read as absent), and the subsequent read
+    /// fails, so the check fails CLOSED (refuses startup) rather than
+    /// silently booting with signing dead.
+    #[test]
+    fn file_source_unreadable_file_refuses_startup() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("audit-master-key");
+        std::fs::write(&path, "ab".repeat(32)).expect("write valid key");
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o000)).expect("chmod 000");
+
+        let bypassed = chmod_bypassed("file_source_unreadable_file_refuses_startup", || {
+            std::fs::read_to_string(&path).is_ok()
+        });
+        if bypassed {
+            std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o644))
+                .expect("restore permissions");
+            return;
+        }
+
+        let err = validate_audit_master_key(&file_config(&path))
+            .expect_err("an unreadable file key must refuse to start, not boot with signing dead");
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o644))
+            .expect("restore permissions");
+        let msg = err.to_string();
+        assert!(
+            msg.contains(path.to_str().unwrap()),
+            "error must name the unreadable path, got: {msg}"
+        );
+    }
 }

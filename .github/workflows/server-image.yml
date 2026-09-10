@@ -76,17 +76,39 @@ jobs:
     permissions:
       contents: read
       packages: write
+      # Sigstore-signed provenance/SBOM attestation for the digest this job
+      # pushes: `id-token: write` mints the OIDC token attest-build-
+      # provenance exchanges for a Sigstore signing cert; `attestations:
+      # write` lets it publish the attestation to the repo's attestation
+      # store and (push-to-registry) to GHCR alongside the image. Only a
+      # job that actually pushes gets these -- never `build-cuda-pr` below.
+      id-token: write
+      attestations: write
 
     steps:
       - uses: actions/checkout@v4
 
       - uses: ./.github/actions/docker-publish
+        id: publish
         with:
           images: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}
           tags-spec: |
             type=raw,value=latest,enable={{is_default_branch}}
             type=sha,format=long
           push: "true"
+
+      - name: Attest build provenance
+        uses: actions/attest-build-provenance@4d101475d8b20a2381f78447822ac1eab6504dd8 # v4.2.2
+        with:
+          subject-name: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}
+          subject-digest: ${{ steps.publish.outputs.digest }}
+          push-to-registry: true
+
+      - name: Assert provenance + SBOM attestations are attached
+        shell: bash
+        env:
+          REF: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}@${{ steps.publish.outputs.digest }}
+        run: bash ci/scripts/assert_image_attestations.sh
 
   # CPU image, tag arm: pushed from `v*` tag refs (semver tags) only — a tag
   # push, or a recovery dispatch run on the tag — behind the shared
@@ -102,11 +124,15 @@ jobs:
     permissions:
       contents: read
       packages: write
+      # See build-and-push-main's identical comment: only a pushing job gets these.
+      id-token: write
+      attestations: write
 
     steps:
       - uses: actions/checkout@v4
 
       - uses: ./.github/actions/docker-publish
+        id: publish
         with:
           images: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}
           tags-spec: |
@@ -114,6 +140,19 @@ jobs:
             type=semver,pattern={{major}}.{{minor}}
             type=sha,format=long
           push: "true"
+
+      - name: Attest build provenance
+        uses: actions/attest-build-provenance@4d101475d8b20a2381f78447822ac1eab6504dd8 # v4.2.2
+        with:
+          subject-name: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}
+          subject-digest: ${{ steps.publish.outputs.digest }}
+          push-to-registry: true
+
+      - name: Assert provenance + SBOM attestations are attached
+        shell: bash
+        env:
+          REF: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}@${{ steps.publish.outputs.digest }}
+        run: bash ci/scripts/assert_image_attestations.sh
 
   # Self-contained variant: opt-in, dispatch-only. Builds the
   # `runtime-selfcontained` stage (baked config + encoder) from the
@@ -136,11 +175,15 @@ jobs:
     permissions:
       contents: read
       packages: write
+      # See build-and-push-main's identical comment: only a pushing job gets these.
+      id-token: write
+      attestations: write
 
     steps:
       - uses: actions/checkout@v4
 
       - uses: ./.github/actions/docker-publish
+        id: publish
         with:
           images: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}
           tags-spec: |
@@ -149,6 +192,19 @@ jobs:
           build-args: |
             RUNTIME_VARIANT=runtime-selfcontained
           push: "true"
+
+      - name: Attest build provenance
+        uses: actions/attest-build-provenance@4d101475d8b20a2381f78447822ac1eab6504dd8 # v4.2.2
+        with:
+          subject-name: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}
+          subject-digest: ${{ steps.publish.outputs.digest }}
+          push-to-registry: true
+
+      - name: Assert provenance + SBOM attestations are attached
+        shell: bash
+        env:
+          REF: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}@${{ steps.publish.outputs.digest }}
+        run: bash ci/scripts/assert_image_attestations.sh
 
   # CUDA image `jammi-ai-server-cu12`: pushed from `v*` tag refs only (tag
   # push, or a recovery dispatch run on the tag), always behind the shared
@@ -189,6 +245,9 @@ jobs:
     permissions:
       contents: read
       packages: write
+      # See build-and-push-main's identical comment: only a pushing job gets these.
+      id-token: write
+      attestations: write
 
     steps:
       - uses: actions/checkout@v4
@@ -223,6 +282,7 @@ jobs:
         run: git submodule update --init --depth 1 crates/jammi-kernels/third_party/cutlass
 
       - uses: ./.github/actions/docker-publish
+        id: publish
         with:
           images: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME_CU12 }}
           tags-spec: |
@@ -235,6 +295,19 @@ jobs:
             CARGO_FEATURES=${{ steps.manifest.outputs.cargo_features }}
           push: "true"
           cache-scope: cu12
+
+      - name: Attest build provenance
+        uses: actions/attest-build-provenance@4d101475d8b20a2381f78447822ac1eab6504dd8 # v4.2.2
+        with:
+          subject-name: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME_CU12 }}
+          subject-digest: ${{ steps.publish.outputs.digest }}
+          push-to-registry: true
+
+      - name: Assert provenance + SBOM attestations are attached
+        shell: bash
+        env:
+          REF: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME_CU12 }}@${{ steps.publish.outputs.digest }}
+        run: bash ci/scripts/assert_image_attestations.sh
 
   # Build-only verification for the CUDA image on pull requests that touch the
   # Dockerfile or this workflow. GPU runtime can't be exercised in CI (no GPU on

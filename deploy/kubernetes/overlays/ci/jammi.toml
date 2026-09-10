@@ -1,0 +1,16 @@
+# env wins over this file (the JAMMI_<PATH> layer resolves after it); secrets
+# never here -- see base/jammi.toml's header. No [storage] block: results
+# land under artifact_dir, the scratch emptyDir -- the kind smoke asserts no
+# durability across a restart.
+
+[lease]
+duration_secs = 30
+heartbeat_secs = 10
+
+[server]
+services = ["core", "event", "eval"]
+
+# GenerateEmbeddings runs inline through the session's own embedding call, so
+# the smoke needs no claim loop; the worker stays off here too.
+[worker]
+enabled = false

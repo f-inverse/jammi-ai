@@ -1,0 +1,22 @@
+# env wins over this file (the JAMMI_<PATH> layer resolves after it); secrets
+# never here -- see base/jammi.toml's header.
+
+[storage]
+result_root = "s3://jammi-results/prod"
+
+[storage.cloud.s3]
+region = "us-east-1"
+
+[lease]
+duration_secs = 30
+heartbeat_secs = 10
+
+# Pure compute node: mounts no query-tier gRPC service, only claims and runs
+# queued jobs.
+[server]
+services = []
+
+[worker]
+enabled = true
+# The training kinds; "all" would also claim every other compiled kind.
+kinds = ["fine_tune", "graph_fine_tune", "context_predictor"]

@@ -574,7 +574,8 @@ def part_a_regression_conformal(db, papers: str, cite: str, ids: list[str],
         means, stds, obs = [], [], []
         for i in idx:
             key = ids[i]
-            out = db.predict_with_context_predictor(job.output_model_id, source=papers, target_key=key)
+            out = db.predict_with_context_predictor(
+                job.output_model_id, source=papers, target_key=key)
             means.append(float(out["mean"]))
             stds.append(float(out["std"]))
             obs.append(year[key])

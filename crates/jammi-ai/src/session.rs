@@ -42,16 +42,18 @@ pub struct InferenceSession {
     hub: HubSource,
     /// Registry of open ephemeral sessions, shared with the timeout scanner.
     ephemeral_sessions: jammi_db::ephemeral::ActiveSessions,
-    /// This process's stable identity in the `instances`/`jobs.claimed_by`
-    /// vocabulary (N3/item 5): minted once at construction from
-    /// `JAMMI_WORKER_ID` when set and non-empty, else a fresh
-    /// `worker-{uuid}` — the same resolution rule
-    /// [`crate::fine_tune::worker::resolve_worker_id`] historically applied
-    /// per-worker, now promoted to the SESSION so every claimant on this
+    /// This process's identity in the `instances`/`jobs.claimed_by`
+    /// vocabulary (N3): a UUID minted once at construction
+    /// ([`crate::fine_tune::worker::mint_instance_id`]) and never taken
+    /// from the environment — `JAMMI_WORKER_ID` is only the row's `label`
+    /// ([`crate::fine_tune::worker::worker_label`]), so two processes
+    /// sharing an operator label (a restart, a sibling replica) are two
+    /// `instances` rows and a dead one's inline jobs are reclaimed rather
+    /// than kept alive by its namesake's heartbeat. Every claimant on this
     /// process (a [`crate::fine_tune::worker::JobWorker`]'s poll loop, a
-    /// [`Self::run_now`] inline claim) shares one `claimed_by` identity, and
-    /// so `catalog::lease_keeper::LeaseTarget::Instance` registers the SAME
-    /// id `jobs.claimed_by` carries.
+    /// [`Self::run_now`] inline claim) shares this one `claimed_by`
+    /// identity, and `catalog::lease_keeper::LeaseTarget::Instance`
+    /// registers the SAME id `jobs.claimed_by` carries.
     instance_id: String,
     /// The process's one lease-renewal thread (N3) — every claimed lease
     /// this session (or a job/table it owns) holds is held open here instead
@@ -61,6 +63,15 @@ pub struct InferenceSession {
     /// This session's `instances` row hold — held for its `Drop` (releases
     /// the keeper renewal when the session drops), never read.
     _instance_hold: jammi_db::catalog::lease_keeper::LeaseHold,
+}
+
+/// The model-side links a training kind's `jobs` row is submitted with —
+/// see [`InferenceSession::training_job_links`].
+pub(crate) struct TrainingJobLinks {
+    /// `jobs.model_ref`: the base model's catalog PK.
+    pub(crate) model_ref: String,
+    /// `jobs.output_model_id`: the NAME the finished model registers under.
+    pub(crate) output_model_id: String,
 }
 
 impl InferenceSession {
@@ -140,13 +151,18 @@ impl InferenceSession {
         // never starve the renewal (see `lease_keeper`'s module docs).
         let lease_intervals = inner.config().lease.intervals()?;
         let config_for_keeper = inner.config().clone();
+        // `start` is fallible: it returns only once the keeper thread has
+        // connected and completed its first renewal pass, so no hold this
+        // session later registers can read "live" against a keeper that
+        // never ran (a typed `Catalog`/`Config` error surfaces here instead).
         let lease_keeper = jammi_db::catalog::lease_keeper::LeaseKeeper::start(
             move || {
                 let config = config_for_keeper.clone();
                 Box::pin(async move { jammi_db::session::open_catalog_from_config(&config).await })
             },
             lease_intervals,
-        );
+        )
+        .await?;
 
         // The result store is built first: it owns the session's
         // `ArtifactStore` internally (rooted at `{result_store_root}/models`,
@@ -197,22 +213,26 @@ impl InferenceSession {
                 crate::fine_tune::worker::MAX_ATTEMPTS,
             )
             .await?;
-        let retention =
-            std::time::Duration::from_secs(inner.config().jobs.retention_days as u64 * 86_400);
-        catalog.prune_instances(retention).await?;
-        catalog.prune_jobs(retention).await?;
+        // Two windows, two knobs: an `instances` row is stale once it has
+        // missed the same `2 × lease` liveness margin the inline-job
+        // reclaim arm judges it by (a process that has not heartbeated for
+        // two lease windows is dead to every reader), while terminal job
+        // rows live for `[jobs] retention_days` — the retention knob never
+        // decides process liveness.
+        catalog
+            .prune_instances(lease_intervals.lease().saturating_mul(2))
+            .await?;
+        catalog.prune_jobs(inner.config().jobs.retention()).await?;
 
         // This process's `instances` row + keeper hold — every
         // session upserts and heartbeats one, whether or not it runs a
         // claim loop (only `workers` membership is gated on `[worker]
-        // enabled`, upserted by `EmbeddedWorker::spawn`/`JobWorker`).
-        let instance_id = crate::fine_tune::worker::resolve_worker_id();
+        // enabled`, upserted by `EmbeddedWorker::spawn`/`JobWorker`). The
+        // id is minted here; `JAMMI_WORKER_ID` only labels the row.
+        let instance_id = crate::fine_tune::worker::mint_instance_id();
+        let label = crate::fine_tune::worker::worker_label();
         catalog
-            .upsert_instance(
-                &instance_id,
-                std::env::var("JAMMI_WORKER_ID").ok().as_deref(),
-                None,
-            )
+            .upsert_instance(&instance_id, label.as_deref(), None)
             .await?;
         let instance_hold = lease_keeper.hold(
             jammi_db::catalog::lease_keeper::LeaseTarget::Instance(instance_id.clone()),
@@ -237,8 +257,9 @@ impl InferenceSession {
         })
     }
 
-    /// This process's stable `instances`/`jobs.claimed_by` identity (N3).
-    /// Shared by every claimant on this session — a
+    /// This process's `instances`/`jobs.claimed_by` identity (N3): a UUID
+    /// minted at construction, never `JAMMI_WORKER_ID` (which is only the
+    /// row's label). Shared by every claimant on this session — a
     /// [`crate::fine_tune::worker::JobWorker`]'s poll loop and
     /// [`Self::run_now`]'s inline claim alike.
     pub fn instance_id(&self) -> &str {
@@ -1536,30 +1557,91 @@ impl InferenceSession {
                 config: config.clone(),
             },
         };
-        self.submit_fine_tune_spec(base_model, task, spec).await
+        self.submit_fine_tune_spec(spec).await
     }
 
     /// Submit a job carrying one of the two LoRA fine-tune specs. Shared by the
     /// column-source [`Self::fine_tune`] and the graph [`Self::fine_tune_graph`]
     /// paths — the only thing that differs upstream is which spec variant is
     /// built. No data is read and no model is loaded here; the worker does both
-    /// from the persisted spec.
-    async fn submit_fine_tune_spec(
-        &self,
-        base_model: &str,
-        task: ModelTask,
-        spec: TrainingSpec,
-    ) -> Result<TrainingJob> {
+    /// from the persisted spec. The row's `model_ref`/`output_model_id` come
+    /// from [`Self::training_job_links`], the one derivation `enqueue` and
+    /// the context-predictor submit share.
+    async fn submit_fine_tune_spec(&self, spec: TrainingSpec) -> Result<TrainingJob> {
         let job_id = uuid::Uuid::new_v4().to_string();
-        let output_model_id = fine_tuned_model_id(&job_id);
+        let links = self.training_job_links(&spec, &job_id).await?;
+        let spec_json = serde_json::to_string(&spec)?;
+        self.inner
+            .catalog()
+            .submit_job(jammi_db::catalog::jobs_repo::SubmitJobParams {
+                job_id: &job_id,
+                kind: spec.kind(),
+                execution: jammi_db::catalog::status::JobExecution::Queued,
+                spec: &spec_json,
+                model_ref: Some(&links.model_ref),
+                output_model_id: Some(&links.output_model_id),
+                model_source: None,
+                priority: 0,
+            })
+            .await?;
 
+        Ok(TrainingJob::new(
+            job_id,
+            "queued".into(),
+            links.output_model_id,
+            Arc::clone(self.inner.catalog()),
+        ))
+    }
+
+    /// The two model-side links every training kind's `jobs` row carries,
+    /// derived ONCE for every submitter — the dedicated entry points
+    /// ([`Self::fine_tune`], [`Self::fine_tune_graph`],
+    /// [`Self::train_context_predictor`]) and the generic
+    /// [`Self::enqueue`] alike — so a row cannot be linked differently
+    /// depending on which door it came through. `model_ref` is the base
+    /// model's catalog PK (the row is registered first when absent);
+    /// `output_model_id` is the NAME the finish CAS mints the output under
+    /// (`fine_tuned_model_id(job_id)` for the two LoRA kinds, the spec's
+    /// own `model_id` for a context predictor).
+    pub(crate) async fn training_job_links(
+        &self,
+        spec: &TrainingSpec,
+        job_id: &str,
+    ) -> Result<TrainingJobLinks> {
+        match spec {
+            TrainingSpec::FineTune { task, common, .. } => Ok(TrainingJobLinks {
+                model_ref: self.ensure_base_model_pk(&common.base_model, *task).await?,
+                output_model_id: fine_tuned_model_id(job_id),
+            }),
+            // A graph fine-tune trains a text-embedding metric over the node
+            // source's text; the edges only supervise the pairing.
+            TrainingSpec::GraphFineTune { common, .. } => Ok(TrainingJobLinks {
+                model_ref: self
+                    .ensure_base_model_pk(&common.base_model, ModelTask::TextEmbedding)
+                    .await?,
+                output_model_id: fine_tuned_model_id(job_id),
+            }),
+            TrainingSpec::ContextPredictor {
+                source,
+                predictor_spec,
+            } => Ok(TrainingJobLinks {
+                model_ref: self.context_predictor_base_model_pk(source).await?,
+                output_model_id: predictor_spec.model_id.clone(),
+            }),
+        }
+    }
+
+    /// Resolve `base_model` to its catalog PK, registering the row first
+    /// when the catalog has none (the worker resolves the same row when it
+    /// loads weights). The `jobs.model_ref` FK must bind to the RESOLVED
+    /// row's PK, not a reconstructed `name::version`: a tenant fine-tuning
+    /// a global base model references the global (unqualified) PK, and one
+    /// fine-tuning its own model references its tenant-qualified PK — the
+    /// resolved record's `catalog_pk` carries whichever applies.
+    async fn ensure_base_model_pk(&self, base_model: &str, task: ModelTask) -> Result<String> {
         // Parse model source to get the canonical name (what ModelCache uses for
         // registration).
-        let model_source = ModelSource::parse(base_model);
-        let canonical_name = model_source.to_string();
-
-        // Ensure the base model is registered in the catalog (FK constraint on
-        // training_jobs). The worker resolves the same row when it loads weights.
+        let canonical_name = ModelSource::parse(base_model).to_string();
         if self.catalog().get_model(&canonical_name).await?.is_none() {
             if let Err(e) = self
                 .catalog()
@@ -1578,13 +1660,7 @@ impl InferenceSession {
                 tracing::error!(model_id = %canonical_name, error = %e, "Failed to register base model in catalog");
             }
         }
-
-        // The base-model FK must bind to the resolved row's catalog PK, not a
-        // reconstructed `name::version`: a tenant fine-tuning a global base model
-        // references the global (unqualified) PK, and one fine-tuning its own
-        // model references its tenant-qualified PK — the resolved record's
-        // `catalog_pk` carries whichever applies.
-        let base_model_pk = self
+        Ok(self
             .catalog()
             .get_model(&canonical_name)
             .await?
@@ -1593,28 +1669,7 @@ impl InferenceSession {
                     "Base model '{canonical_name}' not registered in catalog"
                 ))
             })?
-            .catalog_pk;
-        let spec_json = serde_json::to_string(&spec)?;
-        self.inner
-            .catalog()
-            .submit_job(jammi_db::catalog::jobs_repo::SubmitJobParams {
-                job_id: &job_id,
-                kind: spec.kind(),
-                execution: jammi_db::catalog::status::JobExecution::Queued,
-                spec: &spec_json,
-                model_ref: Some(&base_model_pk),
-                output_model_id: Some(&output_model_id),
-                model_source: None,
-                priority: 0,
-            })
-            .await?;
-
-        Ok(TrainingJob::new(
-            job_id,
-            "queued".into(),
-            output_model_id,
-            Arc::clone(self.inner.catalog()),
-        ))
+            .catalog_pk)
     }
 
     /// Graph-supervised fine-tune (S11): learn an embedding metric that encodes
@@ -1650,7 +1705,6 @@ impl InferenceSession {
         // The graph is read and re-sampled by the worker from the persisted
         // sources + seeded sample_config (deterministic), never from in-memory
         // batches carried across the submit boundary.
-        let task = ModelTask::TextEmbedding;
         let spec = TrainingSpec::GraphFineTune {
             sources: sources.clone(),
             sample_config,
@@ -1659,7 +1713,7 @@ impl InferenceSession {
                 config: config.clone(),
             },
         };
-        self.submit_fine_tune_spec(base_model, task, spec).await
+        self.submit_fine_tune_spec(spec).await
     }
 
     /// Run a decoded [`TrainingSpec`] on this session, dispatching each variant

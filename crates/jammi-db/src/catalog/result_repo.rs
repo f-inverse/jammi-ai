@@ -121,7 +121,7 @@ pub struct CreateResultTableParams<'a> {
     /// row and no bytes are ever committed for a superseded attempt.
     ///
     /// Bundled as one [`JobAttempt`] rather than three parallel `Option`
-    /// fields (esc-105): a `job_id`-only guard is unsound on its own — see
+    /// fields (esc-107): a `job_id`-only guard is unsound on its own — see
     /// [`Catalog::create_result_table`]'s doc for the exact race a
     /// `job_id`-only CAS admits. Reshaping the type so `job_id` cannot be
     /// supplied without the attempt identity the CAS needs makes that
@@ -499,7 +499,7 @@ impl Catalog {
     /// This CAS carries the full `(job_id, claimed_by, attempts)` guard every
     /// other lease-guarded write on `jobs` carries (the same one
     /// [`Catalog::record_partial_result`], `crate::catalog::jobs_repo`,
-    /// uses) — esc-105: an earlier `job_id`-only predicate (`status =
+    /// uses) — esc-107: an earlier `job_id`-only predicate (`status =
     /// 'running' AND partial_result IS NULL`, no `claimed_by`/`attempts`
     /// check) was UNSOUND, not merely narrower. A zombie of a REQUEUED and
     /// RE-CLAIMED attempt — its own lease expired, the job went

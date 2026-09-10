@@ -777,7 +777,7 @@ impl ResultStore {
     /// heartbeat's, which runs on a task with no task-local scope — names the
     /// row's own tenant.
     ///
-    /// `job_attempt` (N11, esc-105) is threaded straight to
+    /// `job_attempt` (N11, esc-107) is threaded straight to
     /// [`crate::catalog::result_repo::CreateResultTableParams::job_attempt`]
     /// — see there for the `jobs.partial_result` compare-and-set this
     /// performs in the SAME transaction as the row's own INSERT, and for why
@@ -2119,7 +2119,7 @@ impl ResultStore {
     /// pooling from a source's *raw* rows (no single source result table) passes
     /// `None`.
     ///
-    /// `job_attempt` (N11, esc-105) is threaded straight to
+    /// `job_attempt` (N11, esc-107) is threaded straight to
     /// [`Self::create_table`] — see there for the `jobs.partial_result`
     /// compare-and-set this performs. `None` for a table created outside the
     /// job machinery (a test fixture, a recompute replay, or a caller that

@@ -46,6 +46,7 @@ Each `RecordBatch` has prefix columns plus classification-specific columns:
 | Column | Type | Description |
 |--------|------|-------------|
 | `_row_id` | Utf8 | Key column value |
+| `_ordinal` | UInt64 | Stream-scoped row counter (0-based, in model emission order); rows read back ordered by `_row_id, _ordinal` |
 | `_source` | Utf8 | Source identifier |
 | `_model` | Utf8 | Model identifier |
 | `_status` | Utf8 | `"ok"` or `"error"` |

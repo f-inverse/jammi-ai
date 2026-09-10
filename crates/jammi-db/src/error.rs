@@ -252,6 +252,17 @@ pub enum JammiError {
         job_id: String,
     },
 
+    /// A job's executor observed `jobs.cancel_requested` at a checkpoint
+    /// boundary and stopped: the job is recorded `failed` with this message
+    /// and no result is returned. Raised by `InferenceSession::run_now` for
+    /// an inline job and by the worker's claimed-compute path; the request
+    /// itself is `Catalog::cancel_request`.
+    #[error("job `{job_id}`: cancelled at the executor's request checkpoint")]
+    JobCancelled {
+        /// The job whose cancel request was honoured.
+        job_id: String,
+    },
+
     /// A source cannot be deleted while a live writer is still materialising a
     /// result table over it: a `building` row with an unexpired lease
     /// references the source. Retry once the writer finishes or its lease

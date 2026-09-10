@@ -2,6 +2,7 @@ use std::collections::BTreeMap;
 use std::fmt;
 use std::path::{Path, PathBuf};
 use std::str::FromStr;
+use std::time::Duration;
 
 use serde::{Deserialize, Deserializer, Serialize};
 
@@ -1179,6 +1180,37 @@ impl Default for JobsConfig {
     }
 }
 
+impl JobsConfig {
+    /// The largest `retention_days` accepted at load: ten years. Above it
+    /// the value is almost certainly a units mistake (seconds or hours
+    /// typed into a days field), and it is also where `days * 86_400` as a
+    /// timestamp offset stops being a duration any catalog backend can
+    /// subtract from `now` without overflow.
+    pub const MAX_RETENTION_DAYS: u32 = 3650;
+
+    /// Validate the retention window: `0` is allowed (a terminal job is
+    /// prunable, and stops blocking `delete_model`, as soon as it is
+    /// terminal); anything above [`Self::MAX_RETENTION_DAYS`] is a typed
+    /// [`JammiError::Config`] naming the field, refused at load rather than
+    /// surfacing as a clock overflow in the first retention sweep.
+    pub fn validate(&self) -> Result<()> {
+        if self.retention_days > Self::MAX_RETENTION_DAYS {
+            return Err(JammiError::Config(format!(
+                "[jobs] retention_days = {} exceeds the {}-day cap",
+                self.retention_days,
+                Self::MAX_RETENTION_DAYS
+            )));
+        }
+        Ok(())
+    }
+
+    /// The retention window as a [`Duration`] — the one conversion every
+    /// sweep and reference scan shares.
+    pub fn retention(&self) -> Duration {
+        Duration::from_secs(u64::from(self.retention_days) * 86_400)
+    }
+}
+
 /// Cache layer settings.
 #[derive(Debug, Clone, Deserialize)]
 #[serde(default, deny_unknown_fields)]
@@ -1670,6 +1702,9 @@ impl JammiConfig {
         // worker spawn, deep in a server startup.
         let lease = config.lease.intervals()?;
         config.worker.worker_intervals(lease)?;
+        // Reject a retention window past the cap at load, not in the first
+        // sweep's timestamp arithmetic.
+        config.jobs.validate()?;
         Ok(config)
     }
 

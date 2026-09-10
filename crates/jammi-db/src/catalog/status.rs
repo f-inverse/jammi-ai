@@ -70,6 +70,36 @@ impl JobStatus {
     pub fn is_terminal(&self) -> bool {
         matches!(self, Self::Completed | Self::Failed)
     }
+
+    /// Every status, in lifecycle order — the one list the SQL-side
+    /// helpers below derive their literals from, so a status added here
+    /// is reflected in every `status IN (...)` predicate without a second
+    /// hand-typed vocabulary.
+    pub const ALL: [JobStatus; 4] = [Self::Queued, Self::Running, Self::Completed, Self::Failed];
+
+    /// The comma-joined, single-quoted SQL literal list of every TERMINAL
+    /// status (`'completed', 'failed'`), for a `status IN (...)` predicate —
+    /// rendered from [`Self::ALL`] and [`Self::is_terminal`], never typed
+    /// by hand at a query site.
+    pub fn terminal_sql_list() -> String {
+        Self::sql_list(|s| s.is_terminal())
+    }
+
+    /// The comma-joined, single-quoted SQL literal list of every
+    /// NON-terminal status (`'queued', 'running'`) — the rows a cancel
+    /// request can still reach.
+    pub fn non_terminal_sql_list() -> String {
+        Self::sql_list(|s| !s.is_terminal())
+    }
+
+    fn sql_list(keep: impl Fn(&JobStatus) -> bool) -> String {
+        Self::ALL
+            .iter()
+            .filter(|s| keep(s))
+            .map(|s| format!("'{s}'"))
+            .collect::<Vec<_>>()
+            .join(", ")
+    }
 }
 
 impl fmt::Display for JobStatus {

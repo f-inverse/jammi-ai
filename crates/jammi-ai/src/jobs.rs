@@ -19,6 +19,30 @@
 //! the SAME dispatcher a [`crate::fine_tune::worker::JobWorker`] calls for a
 //! claimed compute job, so an embedded synchronous call and a queued-and-
 //! claimed compute job of the same kind run identical code.
+//!
+//! **Kinds that are deliberately NOT jobs.** `import_embeddings` is not a
+//! [`crate::jobs::ComputeSpec`] variant: it is a GPU-free promotion of caller-supplied
+//! vectors into a result table (`jammi_db::store`'s `import_embeddings`
+//! materialises with no job of record for the same reason), not a compute
+//! this crate dispatches, so it has no claim/lease/reclaim lifecycle to
+//! generalise. `recompute` is not a variant either: it stays an inline,
+//! synchronous pipeline verb over an already-materialised table's
+//! provenance, and every producer it re-runs is one of the compute kinds
+//! below — each of which IS a job when it runs — so a recompute never
+//! needs a job row of its own. [`crate::jobs::JobResult`] therefore has exactly the two
+//! payload shapes the compiled kinds produce: a `Model` (every training
+//! kind) and a `Table` (every compute kind).
+//!
+//! **Cancellation.** `Catalog::cancel_request` sets `jobs.cancel_requested`;
+//! the executor observes it at three checkpoint boundaries — after the
+//! claim ([`crate::session::InferenceSession::run_now`],
+//! `JobWorker::run_claimed_compute_job`) and before dispatch
+//! ([`crate::jobs::execute_compute`]) — through [`crate::jobs::check_cancel`],
+//! failing the row with [`jammi_db::error::JammiError::JobCancelled`]'s message. Every compute producer is a
+//! single-shot write with no mid-table checkpoint, so a request that lands
+//! after the producer has started is honoured only in the sense that it
+//! stays recorded on the row: the run completes and the row finishes
+//! `completed`.
 
 use std::sync::Arc;
 
@@ -94,6 +118,37 @@ pub enum ComputeSpec {
 }
 
 impl ComputeSpec {
+    /// The `jobs.model_source` value this spec submits with: the canonical
+    /// `ModelSource` string of the model a kind with a model input
+    /// (`embedding`, `infer`) resolves against — the same vocabulary
+    /// `result_tables.model_id` carries, so the row is a reference edge
+    /// `Catalog::delete_model` guards while the job is non-terminal. `None`
+    /// for the kinds that take no model.
+    pub fn model_source(&self) -> Option<String> {
+        match self {
+            ComputeSpec::Embedding { model_id, .. } | ComputeSpec::Infer { model_id, .. } => {
+                Some(crate::model::ModelSource::parse(model_id).to_string())
+            }
+            ComputeSpec::NeighborGraph { .. }
+            | ComputeSpec::Propagate { .. }
+            | ComputeSpec::AsofJoin { .. } => None,
+        }
+    }
+
+    /// The source-side name a test rendezvous is keyed by (see
+    /// [`compute_test_hooks`]): a test arms the hook for a source it alone
+    /// registered, so parallel tests of the same kind never park each other.
+    #[cfg(feature = "test-hooks")]
+    pub fn rendezvous_key(&self) -> &str {
+        match self {
+            ComputeSpec::NeighborGraph { source_id, .. }
+            | ComputeSpec::Embedding { source_id, .. }
+            | ComputeSpec::Infer { source_id, .. } => source_id,
+            ComputeSpec::Propagate { request, .. } => &request.source_id,
+            ComputeSpec::AsofJoin { spine, .. } => spine,
+        }
+    }
+
     /// The `jobs.kind` tag this variant submits under — spelled out
     /// explicitly (rather than round-tripped through the serializer) so the
     /// mapping stays greppable, and so `crate::fine_tune::worker::is_compute_kind`
@@ -269,12 +324,17 @@ pub(crate) async fn dispatch_partial_result(
 }
 
 /// Execute one [`ComputeSpec`] to a terminal [`JobResult`], with NO catalog
-/// job-row bookkeeping of its own — the caller
+/// job-row bookkeeping of its own beyond one read — the caller
 /// ([`InferenceSession::run_now`] for an inline job, or
 /// [`crate::fine_tune::worker::JobWorker`] for a queued one) owns the
 /// claim/lease/finish around this call, and threads `job_attempt` (the
 /// claim's own identity) into every producer so the result table's
-/// `partial_result` CAS lands under the correct attempt (N1, N11/esc-105).
+/// `partial_result` CAS lands under the correct attempt (N1, N11/esc-107).
+/// `catalog` is the handle scoped to the job's tenant (the worker's
+/// tenant-pinned handle; `run_now`'s caller-scoped one): the one read this
+/// function performs is the pre-dispatch cancel checkpoint
+/// ([`check_cancel`]), which must resolve the job row under the tenant that
+/// submitted it.
 ///
 /// Dispatches to each verb's `*_materialize` method DIRECTLY, never to the
 /// public `InferenceSession::build_neighbor_graph` /
@@ -292,9 +352,17 @@ pub(crate) async fn dispatch_partial_result(
 /// policy is never silently overridden here.
 pub async fn execute_compute(
     session: &Arc<InferenceSession>,
+    catalog: &Catalog,
     spec: &ComputeSpec,
     job_attempt: jammi_db::catalog::result_repo::JobAttempt<'_>,
 ) -> Result<JobResult> {
+    #[cfg(feature = "test-hooks")]
+    compute_test_hooks::maybe_park(
+        spec.rendezvous_key(),
+        compute_test_hooks::ParkPoint::BeforeDispatch,
+    )
+    .await;
+    check_cancel(catalog, job_attempt.job_id).await?;
     match spec {
         ComputeSpec::NeighborGraph {
             source_id,
@@ -410,6 +478,18 @@ pub async fn execute_compute(
     }
 }
 
+/// The cancel checkpoint every executor path shares: read the job row and
+/// stop with [`JammiError::JobCancelled`] when `cancel_requested` is set.
+/// `catalog` must be scoped to the job's tenant (see [`execute_compute`]).
+pub async fn check_cancel(catalog: &Catalog, job_id: &str) -> Result<()> {
+    if catalog.get_job(job_id).await?.cancel_requested {
+        return Err(JammiError::JobCancelled {
+            job_id: job_id.to_string(),
+        });
+    }
+    Ok(())
+}
+
 fn table_result(record: ResultTableRecord, outcome: CacheOutcome) -> JobResult {
     let cache_outcome = match outcome {
         CacheOutcome::Computed => "computed".to_string(),
@@ -483,8 +563,12 @@ impl JobHandle {
         }
     }
 
-    /// Request cancellation. `false` when the job is already terminal or
-    /// absent.
+    /// Request cancellation. `true` means the request is recorded on a
+    /// still non-terminal row and the executor will honour it at its next
+    /// checkpoint boundary (see the module docs' cancellation section):
+    /// the job then lands `failed` with [`JammiError::JobCancelled`]'s
+    /// message, and [`Self::wait`] surfaces that message. `false` when the
+    /// job is already terminal or absent.
     pub async fn cancel(&self) -> Result<bool> {
         self.catalog.cancel_request(&self.job_id).await
     }
@@ -497,19 +581,36 @@ impl InferenceSession {
     /// ([`crate::fine_tune::worker::JobWorker`]) claims it later; `priority`
     /// is the claim-ordering tie-break before `created_at` (`0` reproduces
     /// FIFO — migration 024).
+    ///
+    /// The row's model-side links are derived here exactly as the dedicated
+    /// training entry points derive them (one rule, [`InferenceSession::
+    /// training_job_links`]): a training kind carries `model_ref` (the base
+    /// model's catalog PK, registered first when absent) and
+    /// `output_model_id`; a compute kind with a model input carries
+    /// `model_source` ([`ComputeSpec::model_source`]). A `SubmitJob` that
+    /// lands here therefore produces a row `delete_model`'s referential
+    /// scan and `JobStatus`'s `output_model_id` resolution both see as
+    /// fully linked.
     pub async fn enqueue(self: &Arc<Self>, spec: JobSpec, priority: i32) -> Result<JobHandle> {
         let job_id = uuid::Uuid::new_v4().to_string();
         let kind = spec.kind();
         let spec_json = serde_json::to_string(&spec)?;
+        let (model_ref, output_model_id, model_source) = match &spec {
+            JobSpec::Training(training) => {
+                let links = self.training_job_links(training, &job_id).await?;
+                (Some(links.model_ref), Some(links.output_model_id), None)
+            }
+            JobSpec::Compute(compute) => (None, None, compute.model_source()),
+        };
         self.catalog()
             .submit_job(SubmitJobParams {
                 job_id: &job_id,
                 kind,
                 execution: JobExecution::Queued,
                 spec: &spec_json,
-                model_ref: None,
-                output_model_id: None,
-                model_source: None,
+                model_ref: model_ref.as_deref(),
+                output_model_id: output_model_id.as_deref(),
+                model_source: model_source.as_deref(),
                 priority,
             })
             .await?;
@@ -533,10 +634,20 @@ impl InferenceSession {
     /// path, so a `run_now` call and a queued-and-claimed compute job of the
     /// same kind execute byte-identical code and their terminal payloads
     /// match (K4).
+    ///
+    /// The returned `Ok` is exactly "the row is `completed` with this
+    /// result": the finish is the same attempt-guarded compare-and-set the
+    /// worker path performs, and a miss — the row went terminal or changed
+    /// hands underneath this call (a peer's reclaim, an operator's write)
+    /// — is [`JammiError::JobAttemptSuperseded`], never an `Ok` the row
+    /// contradicts. A cancel request observed at the post-claim checkpoint
+    /// or at [`execute_compute`]'s pre-dispatch checkpoint fails the row and
+    /// returns [`JammiError::JobCancelled`].
     pub async fn run_now(self: &Arc<Self>, spec: ComputeSpec) -> Result<JobResult> {
         let job_id = uuid::Uuid::new_v4().to_string();
         let kind = spec.kind();
         let spec_json = serde_json::to_string(&spec)?;
+        let model_source = spec.model_source();
         self.catalog()
             .submit_job(SubmitJobParams {
                 job_id: &job_id,
@@ -545,7 +656,7 @@ impl InferenceSession {
                 spec: &spec_json,
                 model_ref: None,
                 output_model_id: None,
-                model_source: None,
+                model_source: model_source.as_deref(),
                 priority: 0,
             })
             .await?;
@@ -579,12 +690,24 @@ impl InferenceSession {
             instance_id: &instance_id,
             attempts: claimed.attempts,
         };
-        let outcome = execute_compute(self, &spec, job_attempt).await;
+        // Post-claim checkpoint: a cancel that landed between submit and
+        // claim is honoured before any producer runs.
+        let outcome = match check_cancel(self.catalog(), &job_id).await {
+            Ok(()) => execute_compute(self, self.catalog(), &spec, job_attempt).await,
+            Err(e) => Err(e),
+        };
         drop(hold);
         match outcome {
             Ok(job_result) => {
                 let result_json = serde_json::to_string(&job_result)?;
-                self.catalog()
+                #[cfg(feature = "test-hooks")]
+                compute_test_hooks::maybe_park(
+                    spec.rendezvous_key(),
+                    compute_test_hooks::ParkPoint::BeforeFinish,
+                )
+                .await;
+                let finished = self
+                    .catalog()
                     .finish_job(FinishJobParams {
                         job_id: &job_id,
                         instance_id: &instance_id,
@@ -592,6 +715,9 @@ impl InferenceSession {
                         result: &result_json,
                     })
                     .await?;
+                if !finished {
+                    return Err(JammiError::JobAttemptSuperseded { job_id });
+                }
                 Ok(job_result)
             }
             Err(e) => {
@@ -601,6 +727,118 @@ impl InferenceSession {
                     .ok();
                 Err(e)
             }
+        }
+    }
+}
+
+/// Test-only rendezvous inside the compute executor: a test arms a park
+/// point for the source name it alone registered, then the next run of a
+/// spec over that source parks there until the test releases it — so a
+/// cancel request, a peer's reclaim, or an operator's write can be
+/// manufactured at a documented checkpoint rather than raced against a
+/// real producer. Compiled only under `feature = "test-hooks"` (this
+/// crate's own test targets enable it through a self dev-dependency); no
+/// production path observes anything here beyond the `maybe_park` calls
+/// themselves, which return immediately when nothing is armed.
+#[cfg(feature = "test-hooks")]
+pub mod compute_test_hooks {
+    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::sync::{Arc, Mutex, OnceLock, PoisonError};
+
+    use tokio::sync::Notify;
+
+    /// Where a run parks.
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    pub enum ParkPoint {
+        /// Inside `execute_compute`, before the cancel checkpoint and the
+        /// producer dispatch — "the run is claimed and about to produce".
+        BeforeDispatch,
+        /// Inside `run_now`, after the producer returned and before the
+        /// finish compare-and-set — "the run produced and is about to
+        /// finish".
+        BeforeFinish,
+    }
+
+    struct Armed {
+        key: String,
+        point: ParkPoint,
+        parked: Arc<AtomicBool>,
+        parked_notify: Arc<Notify>,
+        released: Arc<AtomicBool>,
+        release_notify: Arc<Notify>,
+    }
+
+    fn armed() -> &'static Mutex<Vec<Armed>> {
+        static ARMED: OnceLock<Mutex<Vec<Armed>>> = OnceLock::new();
+        ARMED.get_or_init(|| Mutex::new(Vec::new()))
+    }
+
+    /// The test's side of one armed park: wait for the run to arrive, then
+    /// let it continue. Dropping the handle without releasing leaves the
+    /// run parked — release it explicitly.
+    pub struct ParkHandle {
+        parked: Arc<AtomicBool>,
+        parked_notify: Arc<Notify>,
+        released: Arc<AtomicBool>,
+        release_notify: Arc<Notify>,
+    }
+
+    impl ParkHandle {
+        /// Resolve once the run has reached the park point.
+        pub async fn wait_parked(&self) {
+            while !self.parked.load(Ordering::SeqCst) {
+                self.parked_notify.notified().await;
+            }
+        }
+
+        /// Let the parked run continue.
+        pub fn release(&self) {
+            self.released.store(true, Ordering::SeqCst);
+            self.release_notify.notify_one();
+        }
+    }
+
+    /// Arm one park for the next run whose spec's rendezvous key is `key`
+    /// (see `ComputeSpec::rendezvous_key`) at `point`. One-shot: the park
+    /// disarms as soon as a run takes it.
+    pub fn arm(key: &str, point: ParkPoint) -> ParkHandle {
+        let parked = Arc::new(AtomicBool::new(false));
+        let parked_notify = Arc::new(Notify::new());
+        let released = Arc::new(AtomicBool::new(false));
+        let release_notify = Arc::new(Notify::new());
+        armed()
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .push(Armed {
+                key: key.to_string(),
+                point,
+                parked: Arc::clone(&parked),
+                parked_notify: Arc::clone(&parked_notify),
+                released: Arc::clone(&released),
+                release_notify: Arc::clone(&release_notify),
+            });
+        ParkHandle {
+            parked,
+            parked_notify,
+            released,
+            release_notify,
+        }
+    }
+
+    pub(super) async fn maybe_park(key: &str, point: ParkPoint) {
+        let taken = {
+            let mut list = armed().lock().unwrap_or_else(PoisonError::into_inner);
+            list.iter()
+                .position(|a| a.key == key && a.point == point)
+                .map(|i| list.remove(i))
+        };
+        let Some(armed) = taken else {
+            return;
+        };
+        armed.parked.store(true, Ordering::SeqCst);
+        armed.parked_notify.notify_one();
+        while !armed.released.load(Ordering::SeqCst) {
+            armed.release_notify.notified().await;
         }
     }
 }

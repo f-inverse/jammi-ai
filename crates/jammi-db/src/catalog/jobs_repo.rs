@@ -410,12 +410,16 @@ impl Catalog {
                 Box::pin(async move {
                     tx.set_tenant(tenant);
                     tx.assert_tenant_matches(tenant, "jobs")?;
-                    tx.execute(
+                    let sql = format!(
                         "INSERT INTO jobs \
                          (job_id, kind, tenant_id, status, execution, spec, model_ref, \
                           output_model_id, model_source, priority, acceleration_report, \
                           created_at, updated_at) \
-                         VALUES ($1, $2, $3, 'queued', $4, $5, $6, $7, $8, $9, $10, $11, $11)",
+                         VALUES ($1, $2, $3, '{queued}', $4, $5, $6, $7, $8, $9, $10, $11, $11)",
+                        queued = JobStatus::Queued
+                    );
+                    tx.execute(
+                        &sql,
                         &[
                             SqlValue::TextOwned(job_id),
                             SqlValue::TextOwned(kind),
@@ -685,9 +689,6 @@ impl Catalog {
         let attempts = p.attempts as i64;
         let result = p.result.to_string();
         let now = now_sortable();
-        // Placeholders stay in ascending order of first appearance in the SQL
-        // text — SQLite assigns `$N` indices by first appearance, so an
-        // out-of-order literal would bind the wrong value.
         let retire = retire_pending_report_clause(3, 4);
         let sql = format!(
             "UPDATE jobs SET status = $1, result = $2, {retire}, lease_expires_at = NULL, \
@@ -794,8 +795,6 @@ impl Catalog {
         let artifact_path = artifact_path.to_string();
         let now = now_sortable();
         let tenant = self.current_tenant();
-        // Placeholders stay in ascending order of first appearance — see
-        // `finish_job`'s identical note.
         let retire = retire_pending_report_clause(3, 4);
         let job_sql = format!(
             "UPDATE jobs SET status = $1, result = $2, {retire}, lease_expires_at = NULL, \
@@ -839,6 +838,12 @@ impl Catalog {
                             ],
                         )
                         .await?;
+                    // The gate every model-side write below hangs off: only
+                    // the attempt that won the job-row CAS commits the
+                    // served path and the epoch rows — pinned by
+                    // `jobs_queue.rs::finish_job_with_model_is_an_attempt_guarded_compare_and_set`,
+                    // the finish-side sibling of esc-107's `create_result_table`
+                    // control.
                     if job_updated == 1 {
                         tx.assert_tenant_matches(tenant, "models")?;
                         let tenant_val = SqlValue::from(tenant.map(|t| t.to_string()));
@@ -931,8 +936,6 @@ impl Catalog {
         let attempts = attempts as i64;
         let error = error.to_string();
         let now = now_sortable();
-        // Placeholders stay in ascending order of first appearance — see
-        // `finish_job`'s identical note.
         let retire = retire_pending_report_clause(3, 4);
         let sql = format!(
             "UPDATE jobs SET status = $1, error = $2, {retire}, lease_expires_at = NULL, \
@@ -1123,15 +1126,18 @@ impl Catalog {
         let job_id_s = job_id.to_string();
         let tenant = self.current_tenant();
         let now = now_sortable();
+        let non_terminal = JobStatus::non_terminal_sql_list();
         let sql = if admin {
-            "UPDATE jobs SET cancel_requested = TRUE, updated_at = $1 \
-             WHERE job_id = $2 AND status IN ('queued', 'running')"
-                .to_string()
+            format!(
+                "UPDATE jobs SET cancel_requested = TRUE, updated_at = $1 \
+                 WHERE job_id = $2 AND status IN ({non_terminal})"
+            )
         } else {
-            "UPDATE jobs SET cancel_requested = TRUE, updated_at = $1 \
-             WHERE job_id = $2 AND status IN ('queued', 'running') \
-               AND (tenant_id = $3 OR (tenant_id IS NULL AND $3 IS NULL))"
-                .to_string()
+            format!(
+                "UPDATE jobs SET cancel_requested = TRUE, updated_at = $1 \
+                 WHERE job_id = $2 AND status IN ({non_terminal}) \
+                   AND (tenant_id = $3 OR (tenant_id IS NULL AND $3 IS NULL))"
+            )
         };
         let updated = self
             .backend()
@@ -1433,6 +1439,30 @@ impl Catalog {
         Ok(())
     }
 
+    /// Delete this process's `workers` row — the claim loop has stopped, so
+    /// the process must no longer advertise itself as a claimant (a
+    /// `ListWorkers` read after an `EmbeddedWorker` drop shows no row for
+    /// it, rather than a row that lingers until its `instances` row goes
+    /// stale and cascades). The `instances` row itself is untouched: the
+    /// process is still alive and may still hold inline jobs. `false` when
+    /// no row existed.
+    pub async fn delete_worker(&self, instance_id: &str) -> Result<bool> {
+        let instance_id = instance_id.to_string();
+        let deleted = self
+            .backend()
+            .transaction(TxOptions::default(), |tx| {
+                Box::pin(async move {
+                    tx.execute(
+                        "DELETE FROM workers WHERE instance_id = $1",
+                        &[SqlValue::TextOwned(instance_id)],
+                    )
+                    .await
+                })
+            })
+            .await?;
+        Ok(deleted == 1)
+    }
+
     /// List every worker, joined with its owning `instances` row (N12).
     pub async fn list_workers(&self) -> Result<Vec<WorkerRecord>> {
         Ok(self
@@ -1483,7 +1513,8 @@ impl Catalog {
         let kind = self.backend().backend_kind();
         let mut params: Vec<SqlValue<'static>> = Vec::new();
         let stale = stale_before_clause("updated_at", kind, retention, &mut params);
-        let sql = format!("DELETE FROM jobs WHERE status IN ('completed', 'failed') AND {stale}");
+        let terminal = JobStatus::terminal_sql_list();
+        let sql = format!("DELETE FROM jobs WHERE status IN ({terminal}) AND {stale}");
         let deleted = self
             .backend()
             .transaction(TxOptions::default(), |tx| {

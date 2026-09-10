@@ -236,12 +236,16 @@ ConfigMap.
 second Deployment on GPU nodes running the SAME image family, scheduled
 separately.
 
-Today's branch has no dedicated worker-process driver: isolating the
-training claim loop onto its own replica uses the existing service-tier
-mechanism (see [Service tiers](./deploy-server.md#service-tiers)) — narrow
-every query-tier replica's `[server] services` to exclude `train`, and give
-the GPU-node Deployment `services = ["train"]` (`JAMMI_SERVER__SERVICES=train`)
-so only it runs the job worker's claim loop (`[worker] enabled`) against the shared catalog.
+Running jobs is not a service tier (see [Service
+tiers](./deploy-server.md#service-tiers)): whether a process *claims and
+executes* the jobs it accepted is `[worker] enabled`. Every query-tier
+replica runs `[worker] enabled = false` (`JAMMI_WORKER__ENABLED=false`) —
+it still mounts `core`/`event`/`eval` and accepts every submission — and the
+GPU-node Deployment runs `[worker] enabled = true` (`JAMMI_WORKER__ENABLED=true`,
+optionally `JAMMI_WORKER__KINDS='["fine_tune", "graph_fine_tune", "context_predictor"]'`
+to claim only the training kinds) so only it runs the job worker's claim
+loop against the shared catalog. Its `[server] services` is whatever the
+compute node should also serve — `services = []` for a pure compute node.
 
 ```yaml
 # sketch: a second Deployment, GPU variant, GPU-node-scheduled -- the compute
@@ -275,7 +279,8 @@ spec:
           envFrom:
             - secretRef: { name: jammi-server-secrets } # same catalog/broker as the query tier
           env:
-            - { name: JAMMI_SERVER__SERVICES, value: "train" }
+            - { name: JAMMI_WORKER__ENABLED, value: "true" }
+            - { name: JAMMI_SERVER__SERVICES, value: "[]" }
           volumeMounts:
             - { name: config, mountPath: /etc/jammi, readOnly: true }
       volumes:

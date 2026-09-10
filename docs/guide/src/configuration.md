@@ -321,8 +321,17 @@ running SQLite with nothing to explain why). A bare `JAMMI_<X>` with **no**
 (`JAMMI_ARTIFACT_DIR`, `JAMMI_CATALOG=sqlite`, …); every other `JAMMI_*` name
 is a runtime knob outside this layer's namespace and is silently ignored here
 — `JAMMI_AUDIT_MASTER_KEY`, `JAMMI_CONFIG` (which names the config *file* to
-load, not a field override), `JAMMI_TEST_PG_URL`, and similar single-purpose
-variables all pass through untouched.
+load, not a field override), `JAMMI_WORKER_ID` (below), `JAMMI_TEST_PG_URL`,
+and similar single-purpose variables all pass through untouched.
+
+**`JAMMI_WORKER_ID` is a label.** Every process mints its own
+`instances.instance_id` (a UUID) at session construction — that id is what
+`jobs.claimed_by` records and what the lease/liveness machinery keys on.
+`JAMMI_WORKER_ID`, when set and non-empty (trimmed), is only the
+`instances.label` shown beside that id by `ListWorkers` / `jammi workers` and
+in logs: an operator-chosen, non-unique name (a node, a replica slot). Two
+processes given the same label are two instances, so a replacement process
+never inherits — or keeps alive — a dead namesake's claims.
 
 **Path segments and TOML syntax.** Everything after the first segment is
 lowercased on the way in, matching every config struct's `snake_case` field

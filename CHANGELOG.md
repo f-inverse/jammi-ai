@@ -1138,6 +1138,29 @@ workspace ships every publishable crate at the same
   guide page's Shape B section.
 
 ### Breaking
+- **`annotate()`'s SQL-visible columns gain `_ordinal`, and `infer` rows come
+  back ordered by `(_row_id, _ordinal)` (#485).** Every inference result —
+  the `RecordBatch`es `InferenceSession::infer` returns, the result table it
+  registers, and the relation the `annotate(...)` table function exposes to
+  SQL — now carries a `_ordinal UInt64` prefix column directly after
+  `_row_id`: a stream-scoped, 0-based row counter assigned in the order the
+  model emitted the rows, so a source that keys several rows under one id
+  still reads back in one deterministic order. A `SELECT *` over an
+  inference table or an `annotate(...)` relation therefore has one more
+  column than before; a query that enumerates its prefix columns by name
+  (`_row_id, _source, _model, _status, _error, _latency_ms`) is unchanged.
+  Embedding tables (`generate_embeddings`) carry no `_ordinal` — their
+  `_row_id` is unique by construction.
+- **`JAMMI_WORKER_ID` is a label, not the process identity (#485).** A
+  process's `instances.instance_id` / `jobs.claimed_by` is a UUID minted at
+  session construction; `JAMMI_WORKER_ID` (trimmed, non-empty) is only the
+  `instances.label` that `ListWorkers` / `jammi workers` shows beside that
+  id, and it is non-unique by design. Two processes given the same value —
+  a restart, a sibling replica — are two instances, so a dead process's
+  inline jobs are failed by the liveness reclaim instead of being kept
+  alive by its namesake's heartbeat. Anything that matched `claimed_by`
+  against a seeded `JAMMI_WORKER_ID` must resolve the id to its label
+  through `ListWorkers` first.
 - **`[training]` is removed; `training_jobs` and its ten `training_repo`
   catalog methods are gone with no shim (#485).** `[worker] { enabled, kinds,
   idle_poll_secs }` and `[jobs] { retention_days }` replace it —

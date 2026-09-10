@@ -4118,6 +4118,7 @@ dependencies = [
  "hex",
  "hf-hub",
  "image",
+ "jammi-ai",
  "jammi-db",
  "jammi-encoders",
  "jammi-kernels",

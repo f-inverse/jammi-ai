@@ -522,11 +522,44 @@ impl InferenceSession {
     ) -> Result<crate::fine_tune::training_job::TrainingJob> {
         spec.validate()?;
 
-        // The predictor registers under its own model id; the base-model FK on
-        // the job points at the source's embedding model so the row is valid.
-        // The table records the model's bare name; ensure a catalog row exists
-        // for it (an embedding table can be materialised without registering a
-        // model row) and use its PK (`name::version`) for the FK.
+        let job_id = uuid::Uuid::new_v4().to_string();
+        let training_spec = TrainingSpec::ContextPredictor {
+            source: source_id.to_string(),
+            predictor_spec: spec.clone(),
+        };
+        // `model_ref`/`output_model_id` come from the one derivation every
+        // training submitter shares (`InferenceSession::training_job_links`):
+        // the source's embedding model's PK, and the predictor's own id.
+        let links = self.training_job_links(&training_spec, &job_id).await?;
+        let spec_json = serde_json::to_string(&training_spec)?;
+        self.catalog()
+            .submit_job(jammi_db::catalog::jobs_repo::SubmitJobParams {
+                job_id: &job_id,
+                kind: training_spec.kind(),
+                execution: jammi_db::catalog::status::JobExecution::Queued,
+                spec: &spec_json,
+                model_ref: Some(&links.model_ref),
+                output_model_id: Some(&links.output_model_id),
+                model_source: None,
+                priority: 0,
+            })
+            .await?;
+
+        Ok(crate::fine_tune::training_job::TrainingJob::new(
+            job_id,
+            "queued".into(),
+            links.output_model_id,
+            Arc::clone(self.catalog_arc()),
+        ))
+    }
+
+    /// The base-model PK a context-predictor job's `model_ref` binds to: the
+    /// predictor registers under its own model id, so the FK points at the
+    /// SOURCE's embedding model, keeping the row valid. The embedding table
+    /// records that model's bare name; a catalog row is registered for it
+    /// when absent (an embedding table can be materialised without one) and
+    /// its PK (`name::version`) is returned.
+    pub(crate) async fn context_predictor_base_model_pk(&self, source_id: &str) -> Result<String> {
         let table = self
             .catalog()
             .resolve_embedding_table(source_id, None)
@@ -558,31 +591,7 @@ impl InferenceSession {
                     .catalog_pk
             }
         };
-        let job_id = uuid::Uuid::new_v4().to_string();
-        let training_spec = TrainingSpec::ContextPredictor {
-            source: source_id.to_string(),
-            predictor_spec: spec.clone(),
-        };
-        let spec_json = serde_json::to_string(&training_spec)?;
-        self.catalog()
-            .submit_job(jammi_db::catalog::jobs_repo::SubmitJobParams {
-                job_id: &job_id,
-                kind: training_spec.kind(),
-                execution: jammi_db::catalog::status::JobExecution::Queued,
-                spec: &spec_json,
-                model_ref: Some(&base_model_pk),
-                output_model_id: Some(&spec.model_id),
-                model_source: None,
-                priority: 0,
-            })
-            .await?;
-
-        Ok(crate::fine_tune::training_job::TrainingJob::new(
-            job_id,
-            "queued".into(),
-            spec.model_id.clone(),
-            Arc::clone(self.catalog_arc()),
-        ))
+        Ok(base_model_pk)
     }
 
     /// Run an in-context-predictor meta-training to completion: sample the

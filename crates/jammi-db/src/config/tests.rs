@@ -776,6 +776,63 @@ fn jobs_config_toml_round_trips_retention_days() {
     assert_eq!(cfg.jobs.retention_days, 7);
 }
 
+/// `retention_days` is bounded at load: the cap itself and `0` pass, one
+/// past the cap is a typed `Config` error naming the field — refused by
+/// `load_from` (the production path), not only by a direct `validate`.
+#[test]
+fn jobs_config_retention_days_above_the_cap_is_refused_at_load() {
+    let cap = JobsConfig::MAX_RETENTION_DAYS;
+    assert!(JobsConfig {
+        retention_days: cap
+    }
+    .validate()
+    .is_ok());
+    assert!(JobsConfig { retention_days: 0 }.validate().is_ok());
+
+    let err = JobsConfig {
+        retention_days: cap + 1,
+    }
+    .validate()
+    .unwrap_err();
+    assert!(
+        matches!(&err, JammiError::Config(m) if m.contains("retention_days") && m.contains("3650")),
+        "expected a typed Config error naming the field and the cap, got {err:?}"
+    );
+
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("jammi.toml");
+    std::fs::write(&path, format!("[jobs]\nretention_days = {}\n", cap + 1)).unwrap();
+    let err = JammiConfig::load_from(Some(&path), std::iter::empty()).unwrap_err();
+    assert!(
+        matches!(&err, JammiError::Config(m) if m.contains("retention_days")),
+        "load_from must refuse an over-cap retention, got {err:?}"
+    );
+    let env = [(
+        "JAMMI_JOBS__RETENTION_DAYS".to_string(),
+        "99999".to_string(),
+    )];
+    let err = JammiConfig::load_from(None, env).unwrap_err();
+    assert!(
+        matches!(&err, JammiError::Config(m) if m.contains("retention_days")),
+        "an env override past the cap is refused by the same rule, got {err:?}"
+    );
+}
+
+/// `retention()` is the single days-to-`Duration` conversion every sweep
+/// shares; at the cap it is still a finite, exact number of seconds.
+#[test]
+fn jobs_config_retention_duration_is_exact_days() {
+    let cfg = JobsConfig { retention_days: 7 };
+    assert_eq!(cfg.retention(), std::time::Duration::from_secs(7 * 86_400));
+    let at_cap = JobsConfig {
+        retention_days: JobsConfig::MAX_RETENTION_DAYS,
+    };
+    assert_eq!(
+        at_cap.retention(),
+        std::time::Duration::from_secs(3650 * 86_400)
+    );
+}
+
 #[test]
 fn jobs_config_rejects_unknown_key() {
     let err = toml::from_str::<JammiConfig>("[jobs]\nbogus = 1\n").unwrap_err();

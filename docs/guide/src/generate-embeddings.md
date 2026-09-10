@@ -279,7 +279,7 @@ results = db.infer(
 )
 ```
 
-Each `RecordBatch` has prefix columns (`_row_id`, `_source`, `_model`, `_status`, `_error`, `_latency_ms`) plus task-specific columns (e.g., `vector` for embeddings).
+Each `RecordBatch` has prefix columns (`_row_id`, `_ordinal`, `_source`, `_model`, `_status`, `_error`, `_latency_ms`) plus task-specific columns (e.g., `vector` for embeddings). `_ordinal` is a stream-scoped, 0-based row counter in model emission order; `infer` rows read back ordered by `_row_id, _ordinal`. The materialised embedding table `generate_embeddings` registers keeps only `_row_id, _source_id, _model_id, vector` — no `_ordinal`, since its `_row_id` is unique by construction.
 
 ## Error handling
 

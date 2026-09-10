@@ -120,7 +120,9 @@ async fn embedding_run_now_and_a_claimed_job_are_byte_identical() {
         instance_id: &instance_id,
         attempts,
     };
-    let result_b = execute_compute(&session, &spec, job_attempt).await.unwrap();
+    let result_b = execute_compute(&session, session.catalog(), &spec, job_attempt)
+        .await
+        .unwrap();
     let table_b = match result_b {
         JobResult::Table { table, .. } => table,
         JobResult::Model { .. } => panic!("expected a Table result"),
@@ -150,6 +152,95 @@ async fn embedding_run_now_and_a_claimed_job_are_byte_identical() {
         vectors_a, vectors_b,
         "run_now and a claimed queued job of the same spec must embed byte-identical vectors"
     );
+
+    // Beyond the vectors: the two tables read back with the identical
+    // schema and identical bytes in every column, row for row.
+    let rows_a = session
+        .sql(&format!(
+            "SELECT * FROM \"jammi.{}\" ORDER BY _row_id",
+            record_a.table_name
+        ))
+        .await
+        .unwrap();
+    let rows_b = session
+        .sql(&format!(
+            "SELECT * FROM \"jammi.{}\" ORDER BY _row_id",
+            record_b.table_name
+        ))
+        .await
+        .unwrap();
+    assert_batches_byte_identical(&rows_a, &rows_b, &[]);
+}
+
+/// Every column of `a` and `b` — schema (names and types, after the
+/// `Utf8View`→`Utf8` normalization a registered-table scan needs) and the
+/// bytes of every row — must agree, except the columns named in `skip`
+/// (per-row wall-clock latency legitimately differs between two runs).
+fn assert_batches_byte_identical(
+    a: &[arrow::record_batch::RecordBatch],
+    b: &[arrow::record_batch::RecordBatch],
+    skip: &[&str],
+) {
+    let a = normalized_single_batch(a);
+    let b = normalized_single_batch(b);
+    assert_eq!(
+        a.schema().fields(),
+        b.schema().fields(),
+        "both arms must read back the identical schema"
+    );
+    assert!(
+        a.num_rows() > 0,
+        "the fixture must produce at least one row"
+    );
+    assert_eq!(a.num_rows(), b.num_rows());
+    for (field, (col_a, col_b)) in a
+        .schema()
+        .fields()
+        .iter()
+        .zip(a.columns().iter().zip(b.columns()))
+    {
+        if skip.contains(&field.name().as_str()) {
+            continue;
+        }
+        assert_eq!(
+            col_a.to_data(),
+            col_b.to_data(),
+            "column `{}` must be byte-identical across the two arms",
+            field.name()
+        );
+    }
+}
+
+/// Concatenate `batches` into one and cast every `Utf8View`/`BinaryView`
+/// column to its plain encoding, so a batch straight off `infer` and a raw
+/// `SELECT *` over the registered table compare on content, not on the
+/// encoding the scan happened to choose.
+fn normalized_single_batch(
+    batches: &[arrow::record_batch::RecordBatch],
+) -> arrow::record_batch::RecordBatch {
+    use arrow::datatypes::{DataType, Field, Schema};
+    let first = batches.first().expect("at least one batch");
+    let batch = arrow::compute::concat_batches(&first.schema(), batches).unwrap();
+    let mut fields = Vec::new();
+    let mut columns = Vec::new();
+    for (field, col) in batch.schema().fields().iter().zip(batch.columns()) {
+        let target = match field.data_type() {
+            DataType::Utf8View => Some(DataType::Utf8),
+            DataType::BinaryView => Some(DataType::Binary),
+            _ => None,
+        };
+        match target {
+            Some(ty) => {
+                columns.push(arrow::compute::cast(col, &ty).unwrap());
+                fields.push(Arc::new(Field::new(field.name(), ty, field.is_nullable())));
+            }
+            None => {
+                columns.push(Arc::clone(col));
+                fields.push(Arc::clone(field));
+            }
+        }
+    }
+    arrow::record_batch::RecordBatch::try_new(Arc::new(Schema::new(fields)), columns).unwrap()
 }
 
 /// item 3/K4, the `infer` verb: `run_now`'s wrapper and a claimed `infer`
@@ -186,7 +277,9 @@ async fn infer_run_now_and_a_claimed_job_are_byte_identical() {
         instance_id: &instance_id,
         attempts,
     };
-    let result_b = execute_compute(&session, &spec, job_attempt).await.unwrap();
+    let result_b = execute_compute(&session, session.catalog(), &spec, job_attempt)
+        .await
+        .unwrap();
     let table_b = match result_b {
         JobResult::Table { table, .. } => table,
         JobResult::Model { .. } => panic!("expected a Table result"),
@@ -209,6 +302,14 @@ async fn infer_run_now_and_a_claimed_job_are_byte_identical() {
         !ids_a.is_empty(),
         "the fixture must produce at least one row"
     );
+    // The full parity: schema (with `_ordinal` present and typed alike),
+    // `_ordinal` values, and every column's bytes — only the per-row
+    // latency is allowed to differ between two runs.
+    assert!(
+        batches_a[0].schema().column_with_name("_ordinal").is_some(),
+        "an infer result carries `_ordinal`"
+    );
+    assert_batches_byte_identical(&batches_a, &batches_b, &["_latency_ms"]);
 }
 
 /// `_row_id` as `Utf8` (a batch straight off `InferenceSession::infer`'s
@@ -294,7 +395,7 @@ async fn n1_reclaimed_attempt_adopts_the_ready_partial_result_table() {
         instance_id: &worker_a_id,
         attempts: claimed1.attempts,
     };
-    let result1 = execute_compute(&session, &spec, job_attempt1)
+    let result1 = execute_compute(&session, session.catalog(), &spec, job_attempt1)
         .await
         .unwrap();
     let table1 = match result1 {

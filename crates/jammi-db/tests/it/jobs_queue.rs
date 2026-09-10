@@ -80,6 +80,17 @@ fn inline_job_params(job_id: &str) -> SubmitJobParams<'_> {
     }
 }
 
+/// A per-run unique suffix for a test's row ids. The Postgres lane shares
+/// one catalog across runs, and `reset_queue` clears `jobs`/`instances`/
+/// `workers` but NOT `models`/`result_tables` — so a fixed model or table
+/// name (`jammi:fine-tuned:fz`, `rt-1-zombie-table`) would collide with
+/// the previous run's leftover row on the second run against the same
+/// database. Every test that registers a model or a result table names it
+/// through this.
+fn run_suffix() -> String {
+    uuid::Uuid::new_v4().simple().to_string()[..8].to_string()
+}
+
 /// Register the FK target model `q-base` once per test catalog.
 async fn register_base_model(catalog: &Catalog) {
     catalog
@@ -939,6 +950,74 @@ async fn inline_job_untouched_when_owning_instance_is_live(backend: BackendKind)
     assert_eq!(row.status, JobStatus::Running.to_string());
 }
 
+/// Two processes sharing one operator LABEL are still two instances: the
+/// `instances` row is keyed by the per-process id, never by the label, so
+/// a dead process's inline job is failed by the inline-liveness reclaim
+/// arm while a live peer carrying the SAME label (a fleet's stable
+/// `JAMMI_WORKER_ID` across restarts — the replacement process, or a
+/// sibling replica) keeps its own inline job untouched. The session-level
+/// half of this contract — two sessions given one `JAMMI_WORKER_ID` mint
+/// two ids and share the label — is pinned in `jammi-ai`'s
+/// `instance_identity` suite; this is the catalog consequence.
+#[test_case(BackendKind::Sqlite ; "sqlite")]
+#[cfg_attr(
+    feature = "live-postgres-tests",
+    test_case(BackendKind::Postgres ; "postgres")
+)]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn dead_instances_inline_job_is_failed_while_a_live_peer_with_the_same_label_keeps_its_own(
+    backend: BackendKind,
+) {
+    let dir = tempdir().unwrap();
+    let (_session, catalog) = queue_catalog!(backend, dir.path());
+    let lease = Duration::from_secs(3600);
+    let label = "gpu-node-7";
+
+    catalog
+        .submit_job(inline_job_params("label-dead-job"))
+        .await
+        .unwrap();
+    catalog
+        .submit_job(inline_job_params("label-live-job"))
+        .await
+        .unwrap();
+    catalog
+        .claim_by_id("label-dead-job", "instance-dead-uuid", lease)
+        .await
+        .unwrap()
+        .expect("the dead process's inline job was claimed while it lived");
+    catalog
+        .claim_by_id("label-live-job", "instance-live-uuid", lease)
+        .await
+        .unwrap()
+        .expect("the live peer's inline job is claimed");
+    catalog
+        .upsert_instance("instance-dead-uuid", Some(label), None)
+        .await
+        .unwrap();
+    catalog
+        .upsert_instance("instance-live-uuid", Some(label), None)
+        .await
+        .unwrap();
+    force_stale_instance(&catalog, "instance-dead-uuid", 3650).await;
+
+    let actioned = catalog.reclaim_expired_jobs(lease, 5).await.unwrap();
+    assert_eq!(
+        actioned, 1,
+        "exactly the dead instance's inline job is actioned; the label it shares with a \
+         live peer must not keep it alive"
+    );
+    let dead = catalog.get_job("label-dead-job").await.unwrap();
+    assert_eq!(dead.status, JobStatus::Failed.to_string());
+    assert_eq!(dead.error.as_deref(), Some("inline executor died"));
+    let live = catalog.get_job("label-live-job").await.unwrap();
+    assert_eq!(
+        live.status,
+        JobStatus::Running.to_string(),
+        "the live peer's own inline job is untouched"
+    );
+}
+
 // ─── retention sweep ─────────────────────────────────────────────────────
 
 /// `prune_jobs` deletes only TERMINAL rows past the retention window — a
@@ -1037,9 +1116,13 @@ fn job_params_with_output<'a>(job_id: &'a str, output_model_id: &'a str) -> Subm
 async fn finish_job_with_model_is_an_attempt_guarded_compare_and_set(backend: BackendKind) {
     let dir = tempdir().unwrap();
     let (_session, catalog) = queue_catalog!(backend, dir.path());
+    let job_id = format!("fz-{}", run_suffix());
+    let model = format!("jammi:fine-tuned:{job_id}");
+    let epoch_0 = format!("{model}:epoch_0");
+    let epoch_1 = format!("{model}:epoch_1");
 
     catalog
-        .submit_job(job_params_with_output("fz", "jammi:fine-tuned:fz"))
+        .submit_job(job_params_with_output(&job_id, &model))
         .await
         .unwrap();
     // Register the output model row with no served path: the served
@@ -1047,7 +1130,7 @@ async fn finish_job_with_model_is_an_attempt_guarded_compare_and_set(backend: Ba
     // it starts NULL and only the live owner's finish sets it.
     catalog
         .register_model(RegisterModelParams {
-            model_id: "jammi:fine-tuned:fz",
+            model_id: &model,
             version: 1,
             model_type: "fine-tuned",
             backend: "candle",
@@ -1087,14 +1170,14 @@ async fn finish_job_with_model_is_an_attempt_guarded_compare_and_set(backend: Ba
     // winner call below uses.
     let loser_epoch_rows = [
         EpochCheckpointRow {
-            model_id: "jammi:fine-tuned:fz:epoch_0",
+            model_id: &epoch_0,
             model_type: "fine-tuned",
             task: ModelTask::TextEmbedding,
             base_model_id: Some("q-base"),
             artifact_path: "file:///artifacts/fz/worker-a/1/checkpoints/epoch_0",
         },
         EpochCheckpointRow {
-            model_id: "jammi:fine-tuned:fz:epoch_1",
+            model_id: &epoch_1,
             model_type: "fine-tuned",
             task: ModelTask::TextEmbedding,
             base_model_id: Some("q-base"),
@@ -1103,11 +1186,11 @@ async fn finish_job_with_model_is_an_attempt_guarded_compare_and_set(backend: Ba
     ];
     let a_finished = catalog
         .finish_job_with_model(FinishJobWithModelParams {
-            job_id: "fz",
+            job_id: &job_id,
             instance_id: "worker-a",
             attempts: 1,
             result: r#"{"k":1}"#,
-            output_model_id: "jammi:fine-tuned:fz",
+            output_model_id: &model,
             output_model_version: 1,
             artifact_path: "file:///artifacts/fz/worker-a/1",
             epoch_checkpoints: &loser_epoch_rows,
@@ -1118,14 +1201,14 @@ async fn finish_job_with_model_is_an_attempt_guarded_compare_and_set(backend: Ba
         !a_finished,
         "a worker whose stale attempt lost the race must not finish the job"
     );
-    let after_a = catalog.get_job("fz").await.unwrap();
+    let after_a = catalog.get_job(&job_id).await.unwrap();
     assert_eq!(
         after_a.status,
         JobStatus::Running.to_string(),
         "the stale attempt's CAS leaves the job running"
     );
     let model_after_a = catalog
-        .get_model("jammi:fine-tuned:fz")
+        .get_model(&model)
         .await
         .unwrap()
         .expect("the output model row exists");
@@ -1134,7 +1217,7 @@ async fn finish_job_with_model_is_an_attempt_guarded_compare_and_set(backend: Ba
         "the stale attempt's failed CAS commits no served path; it stays NULL, got {:?}",
         model_after_a.artifact_path
     );
-    for epoch_name in ["jammi:fine-tuned:fz:epoch_0", "jammi:fine-tuned:fz:epoch_1"] {
+    for epoch_name in [&epoch_0, &epoch_1] {
         assert!(
             catalog.get_model(epoch_name).await.unwrap().is_none(),
             "a lease-lost attempt must never register an epoch-checkpoint row \
@@ -1146,11 +1229,11 @@ async fn finish_job_with_model_is_an_attempt_guarded_compare_and_set(backend: Ba
     // job completes with the served path committed atomically.
     let b_finished = catalog
         .finish_job_with_model(FinishJobWithModelParams {
-            job_id: "fz",
+            job_id: &job_id,
             instance_id: "worker-b",
             attempts: 2,
             result: r#"{"completed_at":"2026-01-01T00:00:00Z"}"#,
-            output_model_id: "jammi:fine-tuned:fz",
+            output_model_id: &model,
             output_model_version: 1,
             artifact_path: "file:///artifacts/fz/worker-b/2",
             epoch_checkpoints: &[],
@@ -1158,10 +1241,10 @@ async fn finish_job_with_model_is_an_attempt_guarded_compare_and_set(backend: Ba
         .await
         .unwrap();
     assert!(b_finished, "the current attempt's owner finishes the job");
-    let after_b = catalog.get_job("fz").await.unwrap();
+    let after_b = catalog.get_job(&job_id).await.unwrap();
     assert_eq!(after_b.status, JobStatus::Completed.to_string());
     let model_after_b = catalog
-        .get_model("jammi:fine-tuned:fz")
+        .get_model(&model)
         .await
         .unwrap()
         .expect("the output model row exists");
@@ -1177,11 +1260,11 @@ async fn finish_job_with_model_is_an_attempt_guarded_compare_and_set(backend: Ba
     // terminal.
     let again = catalog
         .finish_job_with_model(FinishJobWithModelParams {
-            job_id: "fz",
+            job_id: &job_id,
             instance_id: "worker-b",
             attempts: 2,
             result: "{}",
-            output_model_id: "jammi:fine-tuned:fz",
+            output_model_id: &model,
             output_model_version: 1,
             artifact_path: "file:///artifacts/fz/worker-b/2",
             epoch_checkpoints: &[],
@@ -2027,7 +2110,7 @@ async fn inline_liveness_reclaim_rewrites_a_pending_report_to_undetermined(backe
 }
 
 // ---------------------------------------------------------------------------
-// esc-105 — `Catalog::create_result_table`'s `jobs.partial_result` CAS must
+// esc-107 — `Catalog::create_result_table`'s `jobs.partial_result` CAS must
 // carry the full `(job_id, claimed_by, attempts)` attempt guard, not
 // `job_id` alone: a `job_id`-only predicate lets a zombie of a REQUEUED and
 // RE-CLAIMED attempt still win the CAS, because the job genuinely IS
@@ -2077,8 +2160,11 @@ async fn create_result_table_cas_rejects_a_zombies_stale_attempt_across_a_reclai
 ) {
     let dir = tempdir().unwrap();
     let (_session, catalog) = queue_catalog!(backend, dir.path());
+    let job_id = format!("rt-1-{}", run_suffix());
+    let zombie_table = format!("{job_id}-zombie-table");
+    let live_table = format!("{job_id}-live-table");
 
-    catalog.submit_job(job_params("rt-1")).await.unwrap();
+    catalog.submit_job(job_params(&job_id)).await.unwrap();
     let claimed_a = catalog
         .claim_next("worker-a", KINDS, Duration::from_secs(0))
         .await
@@ -2107,9 +2193,9 @@ async fn create_result_table_cas_rejects_a_zombies_stale_attempt_across_a_reclai
     // let this land; the full attempt guard must reject it.
     let zombie_result = catalog
         .create_result_table(result_table_params(
-            "rt-1-zombie-table",
+            &zombie_table,
             JobAttempt {
-                job_id: "rt-1",
+                job_id: &job_id,
                 instance_id: "worker-a",
                 attempts: 1,
             },
@@ -2122,30 +2208,39 @@ async fn create_result_table_cas_rejects_a_zombies_stale_attempt_across_a_reclai
         ),
         "a zombie's stale attempt must be rejected as superseded, got {zombie_result:?}"
     );
-    let after_zombie = catalog.get_job("rt-1").await.unwrap();
+    let after_zombie = catalog.get_job(&job_id).await.unwrap();
     assert_eq!(
         after_zombie.partial_result, None,
         "the zombie's rejected CAS must not record ANY partial_result — the row it tried \
          to insert must also be rolled back, not just left unlinked"
+    );
+    assert!(
+        catalog
+            .get_result_table(&zombie_table)
+            .await
+            .unwrap()
+            .is_none(),
+        "the zombie's `result_tables` row must have been rolled back with its CAS — \
+         no orphan `{zombie_table}` row may survive the rejected transaction"
     );
 
     // The live, current attempt (worker-b, attempt=2) records its own table
     // successfully.
     catalog
         .create_result_table(result_table_params(
-            "rt-1-live-table",
+            &live_table,
             JobAttempt {
-                job_id: "rt-1",
+                job_id: &job_id,
                 instance_id: "worker-b",
                 attempts: 2,
             },
         ))
         .await
         .unwrap();
-    let after_live = catalog.get_job("rt-1").await.unwrap();
+    let after_live = catalog.get_job(&job_id).await.unwrap();
     assert_eq!(
         after_live.partial_result.as_deref(),
-        Some("rt-1-live-table"),
+        Some(live_table.as_str()),
         "the live attempt's own table is the one recorded as partial_result"
     );
 }

@@ -66,7 +66,11 @@ async fn one_job_n_workers_exactly_one_wins() {
 
     // Spawn a fleet of 4 workers that all race to claim the single job.
     let mut fleet = Fleet::spawn(&backends, &result_root, 4);
-    let worker_ids: Vec<String> = fleet.worker_ids().into_iter().map(str::to_string).collect();
+    let worker_labels: Vec<String> = fleet
+        .worker_labels()
+        .into_iter()
+        .map(str::to_string)
+        .collect();
 
     // Poll for the terminal `completed` state. Only the lease-guarded finalize
     // CAS by the sole claimer flips the job to `completed`; a worker that did not
@@ -88,9 +92,11 @@ async fn one_job_n_workers_exactly_one_wins() {
         .claimed_by
         .as_deref()
         .expect("a completed job records its claimer");
+    let claimer_label = harness::label_of(&session, claimed_by).await;
     assert!(
-        worker_ids.iter().any(|w| w == claimed_by),
-        "claimed_by {claimed_by:?} must be one of the spawned workers {worker_ids:?}"
+        worker_labels.iter().any(|w| *w == claimer_label),
+        "claimed_by {claimed_by:?} (label {claimer_label:?}) must be one of the spawned \
+         workers {worker_labels:?}"
     );
 
     // Exactly one output model id, matching the deterministic id the submit minted.

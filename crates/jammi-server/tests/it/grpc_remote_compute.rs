@@ -166,6 +166,17 @@ async fn remote_infer_round_trips_like_local() {
         row_ids(&local_rows),
         "remote and local infer return the same row keys"
     );
+    // K4 byte-parity beyond the keys: the identical schema (with
+    // `_ordinal`), the identical `_ordinal` values, and every column's bytes
+    // — only the per-row latency may differ between the two runs.
+    assert!(
+        remote_rows[0]
+            .schema()
+            .column_with_name("_ordinal")
+            .is_some(),
+        "the remote infer result carries `_ordinal`"
+    );
+    assert_batches_byte_identical(&remote_rows, &local_rows, &["_latency_ms"]);
 
     let _ = server.shutdown.send(());
     let _ = server.handle.await;
@@ -923,4 +934,75 @@ async fn remote_register_and_add_channel_columns_round_trips_like_local() {
 
     let _ = server.shutdown.send(());
     let _ = server.handle.await;
+}
+
+/// Every column of `a` and `b` — schema (names and types, after the
+/// `Utf8View`→`Utf8` normalization a registered-table scan needs) and the
+/// bytes of every row — must agree, except the columns named in `skip`.
+fn assert_batches_byte_identical(
+    a: &[arrow::record_batch::RecordBatch],
+    b: &[arrow::record_batch::RecordBatch],
+    skip: &[&str],
+) {
+    let a = normalized_single_batch(a);
+    let b = normalized_single_batch(b);
+    assert_eq!(
+        a.schema().fields(),
+        b.schema().fields(),
+        "remote and local must read back the identical schema"
+    );
+    assert_eq!(a.num_rows(), b.num_rows());
+    for (field, (col_a, col_b)) in a
+        .schema()
+        .fields()
+        .iter()
+        .zip(a.columns().iter().zip(b.columns()))
+    {
+        if skip.contains(&field.name().as_str()) {
+            continue;
+        }
+        assert_eq!(
+            col_a.to_data(),
+            col_b.to_data(),
+            "column `{}` must be byte-identical remote vs local",
+            field.name()
+        );
+    }
+}
+
+/// Concatenate `batches` into one and cast every `Utf8View`/`BinaryView`
+/// column to its plain encoding, so the Flight-decoded remote batch and the
+/// local read-back compare on content, not on the encoding either side
+/// happened to choose.
+fn normalized_single_batch(
+    batches: &[arrow::record_batch::RecordBatch],
+) -> arrow::record_batch::RecordBatch {
+    use arrow::datatypes::{DataType, Field, Schema};
+    let first = batches.first().expect("at least one batch");
+    let batch = arrow::compute::concat_batches(&first.schema(), batches).unwrap();
+    let mut fields = Vec::new();
+    let mut columns = Vec::new();
+    for (field, col) in batch.schema().fields().iter().zip(batch.columns()) {
+        let target = match field.data_type() {
+            DataType::Utf8View => Some(DataType::Utf8),
+            DataType::BinaryView => Some(DataType::Binary),
+            _ => None,
+        };
+        match target {
+            Some(ty) => {
+                columns.push(arrow::compute::cast(col, &ty).unwrap());
+                fields.push(std::sync::Arc::new(Field::new(
+                    field.name(),
+                    ty,
+                    field.is_nullable(),
+                )));
+            }
+            None => {
+                columns.push(std::sync::Arc::clone(col));
+                fields.push(std::sync::Arc::clone(field));
+            }
+        }
+    }
+    arrow::record_batch::RecordBatch::try_new(std::sync::Arc::new(Schema::new(fields)), columns)
+        .unwrap()
 }

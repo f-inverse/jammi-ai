@@ -318,6 +318,57 @@ async fn delete_blocked_by_job_model_ref_pk_edge(backend: BackendKind) {
     }
 }
 
+/// A compute job's `jobs.model_source` (the NAME-keyed, FK-free
+/// `ModelSource` string an `embedding`/`infer` kind resolves its model
+/// against) is a blocking edge like `result_tables.model_id`: a running
+/// job still reading the model blocks its delete via the typed scan, and
+/// the same N9 age gate lifts the block once the job is terminal and past
+/// the retention window.
+#[test_case(BackendKind::Sqlite ; "sqlite")]
+#[cfg_attr(feature = "live-postgres-tests", test_case(BackendKind::Postgres ; "postgres"))]
+#[tokio::test]
+async fn delete_blocked_by_job_model_source_name_edge_until_terminal_and_aged(
+    backend: BackendKind,
+) {
+    let dir = tempdir().unwrap();
+    let (_session, base) = lifecycle_catalog!(backend, dir.path());
+    let cat = base.pinned_to_tenant(Some(tenant_a()));
+
+    cat.register_model(register_params("acme/embed-src"))
+        .await
+        .unwrap();
+    cat.submit_job(SubmitJobParams {
+        job_id: "job-model-source",
+        kind: "infer",
+        execution: JobExecution::Inline,
+        spec: "{}",
+        model_ref: None,
+        output_model_id: None,
+        model_source: Some("acme/embed-src"),
+        priority: 0,
+    })
+    .await
+    .unwrap();
+
+    let err = cat
+        .delete_model("acme/embed-src", None, false, 30)
+        .await
+        .expect_err("a non-terminal compute job naming the model as its source must block");
+    match err {
+        JammiError::ModelReferenced { referenced_by, .. } => assert_eq!(
+            referenced_by,
+            vec!["jobs.model_source".to_string()],
+            "the blocking edge is reported as jobs.model_source and nothing else"
+        ),
+        other => panic!("expected ModelReferenced, got {other:?}"),
+    }
+
+    force_job_age(&cat, "job-model-source", "completed", 31).await;
+    cat.delete_model("acme/embed-src", None, false, 30)
+        .await
+        .expect("a terminal model_source job past the retention window must not block");
+}
+
 /// N9: a TERMINAL `jobs` row past `retention_days` no longer blocks — the
 /// referential predicate is age-gated, not sweep-dependent (`prune_jobs`
 /// never has to run first for the delete to succeed).

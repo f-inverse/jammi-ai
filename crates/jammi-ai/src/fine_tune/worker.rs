@@ -87,23 +87,30 @@ use crate::session::InferenceSession;
 /// Attempts cap before `reclaim_expired_jobs` fails a job for good.
 pub(crate) const MAX_ATTEMPTS: u32 = 3;
 
-/// Environment override for the worker's stable `claimed_by` identity. When set
-/// (and non-empty), a worker adopts this exact id instead of minting a random
-/// per-process uuid. A fleet operator uses it for stable identity in logs and
-/// lease ownership across restarts; a multi-process test harness uses it to
-/// assert which worker ran a given job. Unset (or empty) → the random-uuid
-/// default, so a plain single-process deployment is byte-unchanged.
-const WORKER_ID_ENV: &str = "JAMMI_WORKER_ID";
+/// Environment LABEL for this process's `instances` row — an operator's
+/// human-readable name for the process (a node name, a replica slot) that
+/// `ListWorkers` and logs show beside the process's minted id. It is NEVER
+/// the process's identity: `instances.instance_id`/`jobs.claimed_by` are a
+/// per-process UUID ([`mint_instance_id`]), so two processes sharing one
+/// label (a restart, a sibling replica) are two instances and a dead one's
+/// inline jobs are failed by the liveness reclaim rather than kept alive
+/// by its namesake's heartbeat. Non-unique by design.
+const WORKER_LABEL_ENV: &str = "JAMMI_WORKER_ID";
 
-/// Resolve the worker's stable id: the trimmed `JAMMI_WORKER_ID` when set and
-/// non-empty, otherwise a fresh `worker-{uuid}`. An all-whitespace value is
-/// treated as unset — it would be a useless `claimed_by` and silently break
-/// ownership assertions, so it falls back rather than seeding a blank id.
-pub(crate) fn resolve_worker_id() -> String {
-    match std::env::var(WORKER_ID_ENV) {
-        Ok(v) if !v.trim().is_empty() => v.trim().to_string(),
-        _ => format!("worker-{}", uuid::Uuid::new_v4()),
+/// The trimmed `JAMMI_WORKER_ID` when set and non-empty, else `None` — an
+/// all-whitespace value is treated as unset (a blank label labels nothing).
+pub(crate) fn worker_label() -> Option<String> {
+    match std::env::var(WORKER_LABEL_ENV) {
+        Ok(v) if !v.trim().is_empty() => Some(v.trim().to_string()),
+        _ => None,
     }
+}
+
+/// Mint this process's `instances`/`jobs.claimed_by` identity: a fresh
+/// UUID, read from nothing in the environment. Called once per session
+/// construction (`InferenceSession::instance_id`).
+pub(crate) fn mint_instance_id() -> String {
+    uuid::Uuid::new_v4().to_string()
 }
 
 /// Whether epoch checkpointing is enabled for this spec, and if so, its
@@ -984,6 +991,14 @@ impl JobWorker {
             }
         };
 
+        // Post-claim checkpoint: a cancel requested while the job sat
+        // `queued` is honoured before any prior-attempt dispatch or
+        // producer runs (`execute_compute` re-checks before dispatch).
+        if let Err(e) = crate::jobs::check_cancel(catalog, job_id).await {
+            record_failed(catalog, job_id, &self.worker_id, attempt, e.to_string()).await;
+            return;
+        }
+
         match crate::jobs::dispatch_partial_result(
             session,
             catalog,
@@ -1055,7 +1070,7 @@ impl JobWorker {
             instance_id: &self.worker_id,
             attempts: attempt,
         };
-        let outcome = crate::jobs::execute_compute(session, &spec, job_attempt).await;
+        let outcome = crate::jobs::execute_compute(session, catalog, &spec, job_attempt).await;
         drop(hold);
 
         match outcome {
@@ -1454,6 +1469,12 @@ pub struct EmbeddedWorker {
     /// `Drop` must still run at the connection's own end of life).
     handle: std::sync::Mutex<Option<tokio::task::JoinHandle<()>>>,
     stop: Arc<AtomicBool>,
+    /// The catalog the `workers` row was upserted into, and the id it is
+    /// keyed by — so stopping the loop (graceful or `Drop`) can delete the
+    /// row rather than leave a claimant advertised until its `instances`
+    /// row goes stale and cascades.
+    catalog: Arc<Catalog>,
+    instance_id: String,
 }
 
 impl EmbeddedWorker {
@@ -1498,6 +1519,8 @@ impl EmbeddedWorker {
         Ok(Self {
             handle: std::sync::Mutex::new(Some(handle)),
             stop,
+            catalog: Arc::clone(session.catalog_arc()),
+            instance_id: session.instance_id().to_string(),
         })
     }
 
@@ -1524,6 +1547,10 @@ impl EmbeddedWorker {
     /// consuming — the caller keeps the guard (and its `Drop`) alive; `Drop`
     /// checks the same `Mutex` and no-ops the abort once this has already taken
     /// the handle.
+    ///
+    /// Once the loop has returned, this process's `workers` row is deleted:
+    /// it no longer claims, so `ListWorkers` must stop showing it as a
+    /// claimant (the `instances` row stays — the process itself is alive).
     pub async fn stop_and_join(&self) -> Result<()> {
         self.stop.store(true, Ordering::Relaxed);
         let taken = self
@@ -1540,7 +1567,9 @@ impl EmbeddedWorker {
         // either is a genuine defect worth surfacing, not swallowing.
         handle
             .await
-            .map_err(|e| JammiError::FineTune(format!("training worker task join error: {e}")))
+            .map_err(|e| JammiError::FineTune(format!("training worker task join error: {e}")))?;
+        self.catalog.delete_worker(&self.instance_id).await?;
+        Ok(())
     }
 }
 
@@ -1563,6 +1592,20 @@ impl Drop for EmbeddedWorker {
             .take()
         {
             handle.abort();
+            // The loop is gone, so the claimant row must go too. `Drop` is
+            // synchronous: the delete rides a detached task on the current
+            // runtime when there is one (the embedded engine's own runtime
+            // is still up at this point); with no runtime to spawn onto the
+            // row is left to the `instances` staleness cascade.
+            if let Ok(rt) = tokio::runtime::Handle::try_current() {
+                let catalog = Arc::clone(&self.catalog);
+                let instance_id = self.instance_id.clone();
+                rt.spawn(async move {
+                    if let Err(e) = catalog.delete_worker(&instance_id).await {
+                        tracing::warn!(error = %e, "failed to delete this process's `workers` row on worker drop");
+                    }
+                });
+            }
         }
     }
 }
@@ -4547,33 +4590,36 @@ mod tests {
         assert_eq!(panic_message(other.as_ref()), "<unknown panic payload>");
     }
 
-    /// `resolve_worker_id` honours a set, non-empty `JAMMI_WORKER_ID` verbatim
-    /// (trimmed) and otherwise mints a fresh random `worker-{uuid}`. An empty /
-    /// all-whitespace value falls back rather than seeding a blank `claimed_by`.
+    /// `JAMMI_WORKER_ID` is a LABEL: `worker_label` reads it trimmed when
+    /// set and non-empty and `None` otherwise, while `mint_instance_id`
+    /// never reads it — two mints differ from each other and from the
+    /// label even while the variable is set.
     ///
-    /// `JAMMI_WORKER_ID` is process-global, so the three cases run in one test
-    /// (parallel tests must not race the same env var) and the var is removed at
-    /// the end to leave the environment clean for the rest of the suite.
+    /// `JAMMI_WORKER_ID` is process-global, so the cases run in one test
+    /// (parallel tests must not race the same env var) and the var is removed
+    /// at the end to leave the environment clean for the rest of the suite.
     #[test]
-    fn resolve_worker_id_honours_seed_else_random() {
-        // Set + non-empty → adopted verbatim (after trimming).
-        std::env::set_var(WORKER_ID_ENV, "  worker-7  ");
-        assert_eq!(resolve_worker_id(), "worker-7");
-
-        // Empty / all-whitespace → treated as unset (a blank claimed_by is useless).
-        std::env::set_var(WORKER_ID_ENV, "   ");
-        let blank_fallback = resolve_worker_id();
+    fn worker_id_env_is_a_label_never_the_minted_identity() {
+        std::env::set_var(WORKER_LABEL_ENV, "  gpu-node-7  ");
+        assert_eq!(worker_label().as_deref(), Some("gpu-node-7"));
+        let a = mint_instance_id();
+        let b = mint_instance_id();
+        assert_ne!(a, b, "each mint is a fresh id");
+        assert_ne!(a, "gpu-node-7", "the label must never become the identity");
         assert!(
-            blank_fallback.starts_with("worker-") && blank_fallback.len() > "worker-".len(),
-            "an all-whitespace seed must fall back to a random id, got {blank_fallback:?}"
+            uuid::Uuid::parse_str(&a).is_ok(),
+            "the identity is a UUID (the `instances` schema's promise), got {a:?}"
         );
 
-        // Unset → a fresh random uuid id, and two calls differ.
-        std::env::remove_var(WORKER_ID_ENV);
-        let a = resolve_worker_id();
-        let b = resolve_worker_id();
-        assert!(a.starts_with("worker-"), "default id is worker-prefixed");
-        assert_ne!(a, b, "the random default mints a distinct id per call");
+        std::env::set_var(WORKER_LABEL_ENV, "   ");
+        assert_eq!(
+            worker_label(),
+            None,
+            "an all-whitespace label labels nothing"
+        );
+
+        std::env::remove_var(WORKER_LABEL_ENV);
+        assert_eq!(worker_label(), None);
     }
 
     // ─── Regression detector (W5-PR4 public on-ramp) ─────────────────────────

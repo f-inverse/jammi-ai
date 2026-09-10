@@ -209,6 +209,20 @@ pub fn map_engine_error(err: JammiError) -> Status {
             Code::Aborted,
             format!("result table `{table}` is already `{status}`"),
         ),
+        // A job-row attempt guard missed under the caller: a peer's reclaim
+        // superseded this attempt mid-run. `Aborted` — the same "lost the
+        // race, retry from a fresh claim" mapping `LeaseLost`/`CasFailed`
+        // carry for a result-table lease.
+        JammiError::JobAttemptSuperseded { job_id } => (
+            Code::Aborted,
+            format!("job `{job_id}`: this attempt was superseded"),
+        ),
+        // The executor honoured a `cancel_request` at a checkpoint: the
+        // caller asked for exactly this outcome, so it is `Cancelled`, not a
+        // fault.
+        JammiError::JobCancelled { job_id } => {
+            (Code::Cancelled, format!("job `{job_id}` was cancelled"))
+        }
         // `delete_result_tables_for_source`'s atomic guard refused: a live-lease
         // `building` row still references the source. `FailedPrecondition` — a
         // retry once the writer finishes or its lease expires, mirroring

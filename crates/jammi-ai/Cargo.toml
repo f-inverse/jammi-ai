@@ -119,6 +119,11 @@ tonic = { workspace = true, optional = true }
 prost = { workspace = true, optional = true }
 
 [dev-dependencies]
+# This crate's own test targets run with `test-hooks` on (the rendezvous
+# inside `jammi_ai::jobs::execute_compute`); a self dev-dependency is how a
+# package turns a feature on for its tests without a `--features` flag on
+# every `cargo test` invocation. Consumers never see the feature.
+jammi-ai = { path = ".", features = ["test-hooks"] }
 tempfile = "3"
 tokio.workspace = true
 parquet.workspace = true
@@ -174,6 +179,13 @@ local = [
     "jammi-lora/candle",
 ]
 live-hub-tests = []
+# Test-only rendezvous hooks inside `jammi_ai::jobs::execute_compute` /
+# `InferenceSession::run_now` (`jammi_ai::jobs::compute_test_hooks`): a test
+# parks a compute job at a documented checkpoint and manufactures a cancel
+# request or a peer's write there. The `jammi-db` crate's `test-hooks` peer.
+# On for this crate's own tests via the self dev-dependency above; off for
+# every consumer.
+test-hooks = []
 # A gated, multi-process distributed-validation lane: spawns N `jammi-server`
 # worker processes against a shared Postgres catalog + shared object store
 # (MinIO) and asserts the durable-worker fleet-safety properties (exactly-one

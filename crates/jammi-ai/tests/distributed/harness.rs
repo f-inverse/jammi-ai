@@ -170,6 +170,24 @@ fn shared_config(backends: &Backends, result_root: &str, artifact_dir: &Path) ->
     }
 }
 
+/// The `JAMMI_WORKER_ID` label of the fleet member whose minted instance id
+/// is `instance_id` — read from the shared catalog's `workers` rows (each
+/// spawned `[worker] enabled` process upserts one, carrying its label).
+/// Panics when no such claimant is listed: a `claimed_by` that is not a
+/// fleet member is exactly the defect the properties exist to catch.
+pub async fn label_of(session: &InferenceSession, instance_id: &str) -> String {
+    let workers = session.catalog().list_workers().await.unwrap();
+    workers
+        .iter()
+        .find(|w| w.instance_id == instance_id)
+        .and_then(|w| w.label.clone())
+        .unwrap_or_else(|| {
+            panic!(
+                "claimed_by {instance_id:?} is not a labelled fleet member; workers = {workers:?}"
+            )
+        })
+}
+
 /// One spawned `jammi-server` worker process and the scratch dir backing its
 /// config + log. Killed on drop via the owning [`Fleet`].
 struct WorkerProc {
@@ -211,15 +229,18 @@ impl Fleet {
         Self { workers }
     }
 
-    /// The seeded ids of the spawned workers, in spawn order — `worker-1`..`-n`.
-    /// Property assertions match `claimed_by` against these.
-    pub fn worker_ids(&self) -> Vec<&str> {
+    /// The seeded LABELS of the spawned workers, in spawn order —
+    /// `worker-1`..`-n`. A process's `jobs.claimed_by` is its minted
+    /// per-process id, never this label, so a property resolves a
+    /// `claimed_by` to its label through [`label_of`] before matching here.
+    pub fn worker_labels(&self) -> Vec<&str> {
         self.workers.iter().map(|w| w.worker_id.as_str()).collect()
     }
 
-    /// SIGKILL exactly one worker by its seeded id, returning whether it was
-    /// found and signalled. Used by the kill-9 reclaim and artifact-crash-window
-    /// properties to crash a *specific* claimer mid-job.
+    /// SIGKILL exactly one worker by its seeded LABEL, returning whether it
+    /// was found and signalled. Used by the kill-9 reclaim and
+    /// artifact-crash-window properties to crash a *specific* claimer mid-job
+    /// (resolve a `claimed_by` id to its label with [`label_of`] first).
     pub fn kill9(&mut self, worker_id: &str) -> bool {
         let Some(w) = self.workers.iter_mut().find(|w| w.worker_id == worker_id) else {
             return false;

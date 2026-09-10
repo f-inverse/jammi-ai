@@ -2877,10 +2877,11 @@ them.
   (`ModelRepo::delete_model`). **Hard delete** (removes the row outright — there is no
   soft-delete/retire). Resolves the row (`get_model_version` if a version is given, else
   `get_model`), then in **one `Serializable` transaction** runs `scan_model_references`
-  before the `DELETE`. The four reference edges (`REFERENCE_EDGES`) are
-  `result_tables.model_id`, `training_jobs.output_model_id` (both keyed by model NAME, no
-  FK), `training_jobs.base_model_id`, `eval_runs.model_id` (both keyed by catalog PK,
-  FK-backed). A non-empty scan returns `DeleteOutcome::Referenced`, raising the typed
+  before the `DELETE`. The five reference edges (the two static `REFERENCE_EDGES` plus the
+  three age-gated `jobs` edges) are `result_tables.model_id`, `jobs.output_model_id`,
+  `jobs.model_source` (all keyed by model NAME, no FK), `jobs.model_ref`, `eval_runs.model_id`
+  (both keyed by catalog PK, FK-backed); a `jobs` row counts only while non-terminal or
+  younger than `[jobs] retention_days`. A non-empty scan returns `DeleteOutcome::Referenced`, raising the typed
   `JammiError::ModelReferenced` (`crates/jammi-db/src/error.rs` → gRPC
   `FailedPrecondition`) — the DB FK is deliberately *never* the rejecter, so a reference
   never leaks as an opaque backend error. Delete is **strict tenant-scoped** (`tenant_id =
@@ -3175,7 +3176,7 @@ id and the missing field, never silently resolved as an ordinary model or served
 unadapted base.
 
 `load_context_predictor`'s own id-shape backstop
-(`record.model_type`, `crates/jammi-ai/src/pipeline/context_predictor.rs:1127`)
+(`record.model_type`, `crates/jammi-ai/src/pipeline/context_predictor.rs:1136`)
 mirrors the resolver's `FINE_TUNED_ID_PREFIX` cross-check, but a context-predictor id is
 caller-chosen — it carries no reserved prefix a fresh reload can cross-check by shape the way
 `try_catalog_lookup` does — so this surface asserts its own row-shape invariant directly,
@@ -3210,29 +3211,29 @@ Both reload surfaces match on these two variants explicitly and re-type BOTH int
 fine-tuned reload arm, matches `StorageError::NotPublished`
 (`crates/jammi-ai/src/model/resolver.rs:262`) and `StorageError::Layout`
 (`crates/jammi-ai/src/model/resolver.rs:273`) into `JammiError::Model`, and
-`load_context_predictor` (`crates/jammi-ai/src/pipeline/context_predictor.rs:1108`) matches
+`load_context_predictor` (`crates/jammi-ai/src/pipeline/context_predictor.rs:1117`) matches
 the identical pair — `StorageError::NotPublished`
-(`crates/jammi-ai/src/pipeline/context_predictor.rs:1312`) and `StorageError::Layout`
-(`crates/jammi-ai/src/pipeline/context_predictor.rs:1322`) — into `JammiError::Model` as
+(`crates/jammi-ai/src/pipeline/context_predictor.rs:1321`) and `StorageError::Layout`
+(`crates/jammi-ai/src/pipeline/context_predictor.rs:1331`) — into `JammiError::Model` as
 well, never its own `JammiError::Inference`. A catalog record that never recorded an
 `artifact_path` at all is a separate, earlier refusal on each surface that never reaches
 `fetch_artifact` — the resolver's arm also raises `JammiError::Model`
 (`crates/jammi-ai/src/model/resolver.rs:288`), and so does the predictor's own
-`JammiError::Model` (`crates/jammi-ai/src/pipeline/context_predictor.rs:1275`). Any OTHER
+`JammiError::Model` (`crates/jammi-ai/src/pipeline/context_predictor.rs:1278`). Any OTHER
 storage fault propagates unchanged past both surfaces' own catch-all —
 `Err(e) => return Err(e)` (`crates/jammi-ai/src/model/resolver.rs:283`) and the identical
-`Err(e) => return Err(e)` (`crates/jammi-ai/src/pipeline/context_predictor.rs:1331`).
+`Err(e) => return Err(e)` (`crates/jammi-ai/src/pipeline/context_predictor.rs:1340`).
 
 Every corrupted-catalog-record refusal EARLIER in this reload path — before `fetch_artifact` is
 even reached — is the SAME `JammiError::Model` variant too: an
 absent `config_json`
-(`crates/jammi-ai/src/pipeline/context_predictor.rs:1153`), an unparseable `config_json`
+(`crates/jammi-ai/src/pipeline/context_predictor.rs:1156`), an unparseable `config_json`
 (`crates/jammi-ai/src/pipeline/context_predictor.rs:1158`, a DISTINCT message from "absent",
 never collapsed), and a parseable-but-incomplete config (missing `head`/`architecture`/
 `feature_dim`/`context_k`/`hidden_dim`/`num_heads`/`num_layers`/`head_width`/`value_column`/
 `target_scaler`) each name the model id and the specific field. The `varmap.load` arm — a
 manifest-verified bundle missing `model.safetensors`
-(`crates/jammi-ai/src/pipeline/context_predictor.rs:1340`) — matches `CandleBackend::load`'s
+(`crates/jammi-ai/src/pipeline/context_predictor.rs:1342`) — matches `CandleBackend::load`'s
 peer refusal for a fine-tuned model's weights file, `"Failed to load safetensors: {e}"`
 (`crates/jammi-ai/src/model/backend/candle.rs:2762`), instead of its own
 `JammiError::Inference`.
@@ -3242,7 +3243,7 @@ At the gRPC edge, `map_engine_error` (`crates/jammi-server/src/grpc/wire.rs:109`
 maps `JammiError::Inference` (`crates/jammi-server/src/grpc/wire.rs:138`) to
 `Code::Internal`, and lets every unmatched variant — including the propagated
 `JammiError::Storage` transport fault — fall through its own catch-all to `Code::Internal`
-(`crates/jammi-server/src/grpc/wire.rs:220`). Because both reload surfaces raise the same
+(`crates/jammi-server/src/grpc/wire.rs:234`). Because both reload surfaces raise the same
 `JammiError::Model` for the same class of outcome, an unpublished OR a corrupted adapter
 bundle reads as the SAME `InvalidArgument` whether it is `ModelResolver` or
 `load_context_predictor` that hit it, and a genuine transient object-store outage on either

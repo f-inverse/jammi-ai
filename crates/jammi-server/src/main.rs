@@ -14,7 +14,7 @@ use std::time::Duration;
 
 use clap::{Args, Parser, Subcommand};
 use jammi_db::config::JammiConfig;
-use jammi_server::runtime::OssServer;
+use jammi_server::runtime::{validate_audit_master_key, OssServer};
 use jammi_server::telemetry::init_tracing;
 
 /// CLI for the OSS `jammi-server`.
@@ -104,6 +104,19 @@ async fn serve(args: ServeArgs) -> ExitCode {
             return ExitCode::FAILURE;
         }
     };
+
+    // Fail closed before tracing (and everything else) initializes: a
+    // configured-but-undecodable audit master key must never let the
+    // process reach a listening state with audit signing silently dead.
+    // Checked here — pre-tracing, like the config-load failure above — so
+    // the failure prints via `eprintln!` to stderr rather than through the
+    // tracing subscriber, which writes to stdout (see
+    // `telemetry::init_tracing`). Absence of a configured key is left
+    // exactly as it was: this only closes the malformed case.
+    if let Err(e) = validate_audit_master_key(&config) {
+        eprintln!("jammi-server: {e}");
+        return ExitCode::FAILURE;
+    }
 
     init_tracing(&config);
 

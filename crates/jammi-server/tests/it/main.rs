@@ -1,4 +1,5 @@
 mod api_freeze;
+mod audit_master_key;
 mod common;
 mod composability_seam;
 mod flight_annotate;

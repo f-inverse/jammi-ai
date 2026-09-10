@@ -39,8 +39,14 @@ const READYZ_PATH: &str = "/readyz";
 
 /// The most a failure body is read and echoed to stderr — a misbehaving or
 /// hostile endpoint must not let a probe invocation buffer an unbounded
-/// response.
-const MAX_BODY_BYTES: usize = 4 * 1024;
+/// response. This bounds RESIDENT MEMORY, not just the echoed string: the
+/// body is read in chunks via [`reqwest::Response::chunk`] and reading stops
+/// the instant this many bytes have accumulated, so the probe never holds
+/// more than `MAX_BODY_BYTES` of a slow or oversized response — see
+/// `read_bounded_body`. `pub` for the it-suite's streaming-cap oracle
+/// (`tests/it/probe.rs`), which has no other way to pin the exact bound from
+/// outside this crate.
+pub const MAX_BODY_BYTES: usize = 4 * 1024;
 
 /// GET `url` once with `timeout` and classify the outcome: `Ok(())` iff the
 /// response status is exactly `200`; `Err(message)` for every other status
@@ -60,7 +66,7 @@ pub async fn check(url: &str, timeout: Duration) -> Result<(), String> {
         .redirect(reqwest::redirect::Policy::none())
         .build()
         .map_err(|e| format!("failed to build HTTP client: {e}"))?;
-    let response = client
+    let mut response = client
         .get(url)
         .send()
         .await
@@ -69,24 +75,53 @@ pub async fn check(url: &str, timeout: Duration) -> Result<(), String> {
     if status.as_u16() == 200 {
         return Ok(());
     }
-    let body = match response.bytes().await {
-        Ok(bytes) => truncated_body(&bytes),
-        Err(e) => format!("<failed to read response body: {e}>"),
-    };
+    let body = read_bounded_body(&mut response).await;
     Err(format!("{url} returned {status}: {body}"))
 }
 
-/// Decode `bytes` as UTF-8 (lossily — a probe target's failure body is
-/// diagnostic text, not a contract), bounded to [`MAX_BODY_BYTES`] with a
-/// truncation marker appended when the body exceeds it.
-fn truncated_body(bytes: &[u8]) -> String {
-    if bytes.len() <= MAX_BODY_BYTES {
-        String::from_utf8_lossy(bytes).into_owned()
-    } else {
-        let mut text = String::from_utf8_lossy(&bytes[..MAX_BODY_BYTES]).into_owned();
-        text.push_str("... [truncated]");
-        text
+/// Read `response`'s body a chunk at a time, stopping as soon as
+/// [`MAX_BODY_BYTES`] have accumulated — NEVER buffering the whole response
+/// first. `Response::bytes()` reads and holds the entire body in memory
+/// before any truncation is applied, which defeats the cap's purpose
+/// against a misbehaving or hostile `/readyz` that streams a slow or
+/// unbounded response: resident memory would be bounded only by whatever
+/// the endpoint chose to send, not by this constant. Streaming via
+/// [`reqwest::Response::chunk`] and breaking out the moment the cap is
+/// reached bounds BOTH the echoed string and the memory held while reading
+/// it, and the probe returns as soon as the cap is hit rather than waiting
+/// for the sender to finish (the request `timeout` still applies to
+/// whichever comes first).
+///
+/// Decodes the accumulated bytes as UTF-8 (lossily — a probe target's
+/// failure body is diagnostic text, not a contract), appending a truncation
+/// marker when the cap was reached before the body ended.
+async fn read_bounded_body(response: &mut reqwest::Response) -> String {
+    let mut buf: Vec<u8> = Vec::with_capacity(MAX_BODY_BYTES.min(4096));
+    let mut truncated = false;
+    loop {
+        let remaining = MAX_BODY_BYTES - buf.len();
+        if remaining == 0 {
+            truncated = true;
+            break;
+        }
+        match response.chunk().await {
+            Ok(Some(chunk)) => {
+                if chunk.len() > remaining {
+                    buf.extend_from_slice(&chunk[..remaining]);
+                    truncated = true;
+                    break;
+                }
+                buf.extend_from_slice(&chunk);
+            }
+            Ok(None) => break,
+            Err(e) => return format!("<failed to read response body: {e}>"),
+        }
     }
+    let mut text = String::from_utf8_lossy(&buf).into_owned();
+    if truncated {
+        text.push_str("... [truncated]");
+    }
+    text
 }
 
 /// Build the default probe URL from a resolved [`ServerConfig`]'s
@@ -181,14 +216,10 @@ mod tests {
         );
     }
 
-    #[test]
-    fn truncated_body_marks_truncation_past_the_bound() {
-        let short = b"ready check failed";
-        assert_eq!(truncated_body(short), "ready check failed");
-
-        let long = vec![b'x'; MAX_BODY_BYTES + 100];
-        let out = truncated_body(&long);
-        assert!(out.ends_with("... [truncated]"));
-        assert!(out.len() < long.len());
-    }
+    // `read_bounded_body`'s cap and truncation-marker behavior is proven
+    // against a real streaming response in `tests/it/probe.rs`
+    // (`probe_caps_a_slow_oversized_body_without_buffering_the_whole_thing`
+    // / `check_truncates_a_large_failure_body`) — it takes a live
+    // `reqwest::Response`, which this module has no lightweight way to
+    // construct without a real HTTP round trip.
 }

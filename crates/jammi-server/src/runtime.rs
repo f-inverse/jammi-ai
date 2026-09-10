@@ -27,7 +27,8 @@ use axum::Router;
 use datafusion::execution::context::SessionContext;
 use datafusion_flight_sql_server::service::FlightSqlService;
 use jammi_ai::session::InferenceSession;
-use jammi_db::config::JammiConfig;
+use jammi_db::audit::{ensure_master_key_present, EnvSigningKeyStore, FileSigningKeyStore};
+use jammi_db::config::{JammiConfig, SigningKeyConfig};
 use tokio::net::TcpListener;
 use tokio::signal;
 use tokio::sync::broadcast;
@@ -80,6 +81,46 @@ pub enum ServerError {
     Io(#[from] std::io::Error),
     #[error("addr parse: {0}")]
     AddrParse(#[from] std::net::AddrParseError),
+    #[error("{0}")]
+    AuditMasterKey(String),
+}
+
+/// Fail-closed startup check for the audit signing key.
+///
+/// A deployment that has never configured a key (`JAMMI_AUDIT_MASTER_KEY`
+/// unset for [`SigningKeyConfig::Env`], or the mounted file absent for
+/// [`SigningKeyConfig::File`]) still starts unchanged — audit signing simply
+/// stays unusable until the first `AuditService` write, exactly as before
+/// this check existed. What this closes is the case where a key IS
+/// configured but does not decode (wrong length, non-hex): that used to let
+/// `jammi-server serve` boot successfully with audit signing silently dead,
+/// discovered only on the first signing attempt deep inside a request. A
+/// present-but-malformed key now refuses to start, with a typed error naming
+/// the configured source and the expected format — never the value itself
+/// (the error text is [`jammi_db::audit::AuditError::MasterKey`]'s, which
+/// carries only the failure shape: "not valid hex", or the decoded byte
+/// count, never the input).
+///
+/// Delegates the actual decode/length validation to
+/// [`jammi_db::audit::ensure_master_key_present`] (in turn
+/// [`jammi_db::audit::SigningKeyStore::master_key`]) rather than
+/// re-implementing hex decoding here — this function's only job is the
+/// presence pre-check that preserves today's "absence is fine" policy.
+pub fn validate_audit_master_key(config: &JammiConfig) -> Result<(), ServerError> {
+    let present = match &config.signing_key {
+        SigningKeyConfig::Env => std::env::var(jammi_db::audit::MASTER_KEY_ENV).is_ok(),
+        SigningKeyConfig::File { path } => path.exists(),
+    };
+    if !present {
+        return Ok(());
+    }
+    let result = match &config.signing_key {
+        SigningKeyConfig::Env => ensure_master_key_present(&EnvSigningKeyStore),
+        SigningKeyConfig::File { path } => {
+            ensure_master_key_present(&FileSigningKeyStore::new(path.clone()))
+        }
+    };
+    result.map_err(|e| ServerError::AuditMasterKey(e.to_string()))
 }
 
 /// A readiness probe: pings whatever resource readiness depends on. The
@@ -1136,4 +1177,63 @@ async fn shutdown_signal() {
     }
 
     tracing::info!("Shutdown signal received, draining connections...");
+}
+
+#[cfg(test)]
+mod audit_master_key_tests {
+    use std::sync::{Mutex, OnceLock};
+
+    use super::*;
+
+    /// Serializes every test below that mutates the process-global
+    /// `JAMMI_AUDIT_MASTER_KEY` — a second, independently-declared lock
+    /// elsewhere in this binary would race this one, which is exactly the
+    /// failure mode `jammi_db::audit::key_store::test_env` (this crate has
+    /// no visibility into that `pub(crate)` module, so it declares its own,
+    /// same as `tests/it/grpc_mutable_topic_audit.rs::env_lock`) exists to
+    /// name.
+    fn env_lock() -> &'static Mutex<()> {
+        static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
+        LOCK.get_or_init(|| Mutex::new(()))
+    }
+
+    /// RED at base: nothing decoded the key at boot, so a malformed value
+    /// was silently accepted and audit signing died until the first write.
+    /// This is the control this test now pins GREEN.
+    #[test]
+    fn malformed_key_refuses_startup() {
+        let _guard = env_lock().lock().unwrap_or_else(|p| p.into_inner());
+        std::env::set_var(jammi_db::audit::MASTER_KEY_ENV, "not-hex");
+        let err = validate_audit_master_key(&JammiConfig::default())
+            .expect_err("a present-but-malformed key must refuse to start");
+        let msg = err.to_string();
+        assert!(
+            msg.contains(jammi_db::audit::MASTER_KEY_ENV),
+            "error must name the offending env var, got: {msg}"
+        );
+        assert!(
+            !msg.contains("not-hex"),
+            "error must never echo the value, got: {msg}"
+        );
+        std::env::remove_var(jammi_db::audit::MASTER_KEY_ENV);
+    }
+
+    /// Absence is unchanged: the check does not tighten what was already
+    /// allowed to start.
+    #[test]
+    fn absent_key_is_still_allowed_at_startup() {
+        let _guard = env_lock().lock().unwrap_or_else(|p| p.into_inner());
+        std::env::remove_var(jammi_db::audit::MASTER_KEY_ENV);
+        assert!(validate_audit_master_key(&JammiConfig::default()).is_ok());
+    }
+
+    /// A well-formed key (64 hex chars, the `openssl rand -hex 32` shape)
+    /// passes the check.
+    #[test]
+    fn valid_key_passes_startup() {
+        let _guard = env_lock().lock().unwrap_or_else(|p| p.into_inner());
+        std::env::set_var(jammi_db::audit::MASTER_KEY_ENV, "ab".repeat(32));
+        assert!(validate_audit_master_key(&JammiConfig::default()).is_ok());
+        std::env::remove_var(jammi_db::audit::MASTER_KEY_ENV);
+    }
 }

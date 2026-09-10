@@ -100,7 +100,7 @@ class NoEmbeddedEngineError(NotSupportedOnBackend):
         """An embedded-only attribute (`jammi.<symbol>`) was accessed with no engine.
 
         The value-types the in-process engine exports (`PerQueryAudit`,
-        `TrainingJob`, …) are surfaced lazily on `jammi`; reaching one without the
+        `Job`, …) are surfaced lazily on `jammi`; reaching one without the
         `[embedded]` extra is this error, naming the attribute and the extra rather
         than a bare `AttributeError`. Alternate constructor: it bypasses the
         target-shaped ``__init__`` (there is no `artifact_dir` here) and leaves
@@ -139,10 +139,10 @@ class PlatformNotInstalledError(JammiError):
 
 
 class TrainingError(JammiError, RuntimeError):
-    """A training job reached a ``failed`` terminal state.
+    """A job reached a ``failed`` terminal state.
 
-    Carries the worker's failure message — read off ``TrainingStatus.error`` on
-    the remote transport, surfaced from the engine's `TrainingJob.wait` on the
+    Carries the executor's failure message — read off ``JobStatus.error`` on
+    the remote transport, surfaced from the engine's `Job.wait` on the
     embedded one — so a job fails for the same cause with the same message
     regardless of where it ran. Refines :class:`RuntimeError`.
     """

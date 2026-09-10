@@ -28,7 +28,8 @@ import {
   CalibrationShape,
   type ResultTable,
   type AssembleContextResponse,
-  type StartTrainingResponse,
+  type SubmitJobResponse,
+  type JobStatusResponse,
   type CreateMutableTableResponse,
   type RegisterTopicResponse,
   type SubscribedBatch,
@@ -44,7 +45,7 @@ describe("connect()", () => {
     expect(client.inference).toBeDefined();
     expect(client.eval).toBeDefined();
     expect(client.pipeline).toBeDefined();
-    expect(client.training).toBeDefined();
+    expect(client.job).toBeDefined();
     expect(client.trigger).toBeDefined();
     expect(client.audit).toBeDefined();
   });
@@ -167,15 +168,23 @@ async function verbSurface(c: JammiClient): Promise<void> {
     });
     expectTypeOf(ctx.contextSize).toEqualTypeOf<bigint>();
 
-    // ── TrainingService: start (the spec oneof) + status ──────────────────
-    const ft: StartTrainingResponse = await c.training.startTraining({
-      baseModel: "local:/m",
+    // ── JobService: submit (the spec oneof) + status + the durable-job verbs ──
+    const ft: SubmitJobResponse = await c.job.submitJob({
       spec: {
         case: "fineTune",
         value: { source: "s1", columns: ["text"] },
       },
+      baseModel: "local:/m",
     });
-    await c.training.trainingStatus({ jobId: ft.jobId });
+    const status: JobStatusResponse = await c.job.jobStatus({ jobId: ft.jobId });
+    expectTypeOf(status.status).toBeString();
+    for await (const event of c.job.waitJob({ jobId: ft.jobId })) {
+      expectTypeOf(event.event.case).toEqualTypeOf<"progress" | "done" | undefined>();
+    }
+    await c.job.cancelJob({ jobId: ft.jobId });
+    await c.job.listJobs({});
+    await c.job.listWorkers({});
+    await c.job.pruneJobs({});
 
     // ── TriggerService: publish + server-streaming subscribe ──────────────
     await c.trigger.publish({ topic: { name: "default.events" } });

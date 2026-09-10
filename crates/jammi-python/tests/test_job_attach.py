@@ -1,26 +1,25 @@
-"""A training-job handle outlives the connection that submitted it.
+"""A job handle outlives the connection that submitted it.
 
 `fine_tune` hands back a handle, but until now that handle was the ONLY way to
 reach the job from Python: it died with its connection (on the remote arm, with
 the channel), and no public verb re-attached to a job by id. The acceleration
-chapter hit this directly and had to build a `jammi.RemoteTrainingJob` out of
-`RemoteDatabase._training` / `._metadata` — private access it named as a gap.
-`TrainingService.ListTrainingJobs` was likewise served by the engine and exposed
-on neither arm, while the native `_NativeDatabase.training_job(job_id)` attach
+chapter hit this directly and had to build a `jammi.RemoteJob` out of
+`RemoteDatabase._job` / `._metadata` — private access it named as a gap.
+`JobService.ListJobs` was likewise served by the engine and exposed
+on neither arm, while the native `_NativeDatabase.job(job_id)` attach
 existed but was reachable through no client verb — the K4 asymmetry its own doc
 claims to close, still open one layer up.
 
 This module pins both verbs on the arm that needs no server:
 
-* `training_job(job_id)` — attach by id on a connection that never submitted the
-  job, with every read verb (`status`, `metrics`, `acceleration_report`, `wait`)
-  working on it;
-* `list_training_jobs()` — the wire's `TrainingJobSummary` field set, tenant
-  scoped;
+* `job(job_id)` — attach by id on a connection that never submitted the
+  job, with every read verb (`status`, `progress`, `metrics`,
+  `acceleration_report`, `cancel`, `wait`) working on it;
+* `list_jobs()` — the wire's `JobSummary` field set, tenant scoped;
 * the typed not-found, which must be one CLASS across both arms.
 
 The cross-transport value parity of the same three lives in
-`clients/python/tests/test_remote_training_job_live.py` (it needs a real
+`clients/python/tests/test_remote_job_live.py` (it needs a real
 `jammi-server`).
 
 The submit-then-attach split is driven through `worker.enabled`: the
@@ -52,8 +51,8 @@ pytestmark = pytest.mark.skipif(
 
 _RUN_WORKER_ENV = "JAMMI_WORKER__ENABLED"
 
-# The `TrainingJobSummary` field set, verbatim from `jammi/v1/training.proto`.
-# The embedded listing must carry exactly these keys, so a caller reads one
+# The `JobSummary` field set, verbatim from `jammi/v1/job.proto`. The
+# embedded listing must carry exactly these keys, so a caller reads one
 # vocabulary regardless of transport.
 _SUMMARY_KEYS = {
     "job_id",
@@ -86,7 +85,7 @@ def _connect_with_source(tmp_path: Path, *, source: str = "training"):
     return db
 
 
-def test_training_job_attaches_on_a_connection_that_never_submitted_it(
+def test_job_attaches_on_a_connection_that_never_submitted_it(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     """Submit on one connection, close it, attach on a fresh one — and every
@@ -104,7 +103,7 @@ def test_training_job_attaches_on_a_connection_that_never_submitted_it(
     submitter = _connect_with_source(tmp_path)
     submitted = _submit(submitter)
     job_id = submitted.job_id
-    submitted_model_id = submitted.model_id
+    submitted_output_model_id = submitted.output_model_id
     assert submitted.status() == "queued"
     submitter.close()
     del submitted, submitter
@@ -112,28 +111,34 @@ def test_training_job_attaches_on_a_connection_that_never_submitted_it(
     monkeypatch.delenv(_RUN_WORKER_ENV, raising=False)
     successor = jammi.connect(f"file://{tmp_path}")
     try:
-        attached = successor.training_job(job_id)
+        attached = successor.job(job_id)
 
-        # Identity: the same job, and the same deterministic output model id the
-        # submit call handed back — re-derived from the catalog row, never
-        # invented here.
+        # Identity: the same job, the same kind, and the same deterministic
+        # output model id the submit call handed back — re-derived from the
+        # catalog row, never invented here.
         assert attached.job_id == job_id
-        assert attached.model_id == submitted_model_id
+        assert attached.kind == "fine_tune"
+        assert attached.output_model_id == submitted_output_model_id
 
         # Every read verb works on a job this connection did not submit.
         assert attached.status() in {"queued", "running", "completed"}
         assert attached.acceleration_report()["state"] in {"pending", "determined"}
         assert isinstance(attached.metrics(), dict)
+        progress = attached.progress()
+        assert set(progress) == {"rows_done", "rows_total", "phase"}
 
-        attached.wait()
+        result = attached.wait()
         assert attached.status() == "completed"
         assert attached.acceleration_report()["state"] == "determined"
         assert attached.metrics()["total_steps"] > 0
+        # `wait()`'s terminal result is the tagged model payload.
+        assert result["kind"] == "model"
+        assert result["model_id"] == submitted_output_model_id
     finally:
         successor.close()
 
 
-def test_training_job_not_found_raises_the_typed_error(tmp_path: Path) -> None:
+def test_job_not_found_raises_the_typed_error(tmp_path: Path) -> None:
     """An id with no matching row raises the typed `BackendError` — the SAME
     class the remote arm raises for the same miss (the live parity module pins
     the two against each other), never `None` and never a handle that fails
@@ -143,18 +148,20 @@ def test_training_job_not_found_raises_the_typed_error(tmp_path: Path) -> None:
     db = jammi.connect(f"file://{tmp_path}")
     try:
         with pytest.raises(BackendError):
-            db.training_job("no-such-job-id")
+            db.job("no-such-job-id")
     finally:
         db.close()
 
 
-def test_list_training_jobs_carries_the_wire_field_set(
+def test_list_jobs_carries_the_wire_field_set(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """`list_training_jobs()` lists this tenant's jobs with exactly the wire's
-    `TrainingJobSummary` field set, and the same empty-string conventions the
-    server relays (`output_model_id` empty until completion, `error` empty
-    unless failed).
+    """`list_jobs()` lists this tenant's jobs with exactly the wire's
+    `JobSummary` field set, and the same conventions the server relays: the
+    two LoRA fine-tune kinds stamp the DETERMINISTIC `output_model_id`
+    (`jammi:fine-tuned:{job_id}`) at submission time — before any worker has
+    claimed the row — because it depends only on `job_id`, never on the
+    run's outcome (`error` stays empty until a job fails).
 
     Two jobs are submitted so the listing is a real listing; they are compared
     as a SET of ids, because `created_at` is a text timestamp two submissions in
@@ -167,7 +174,7 @@ def test_list_training_jobs_carries_the_wire_field_set(
         first = _submit(db).job_id
         second = _submit(db).job_id
 
-        jobs = db.list_training_jobs()
+        jobs = db.list_jobs()
         assert isinstance(jobs, list)
         assert {j["job_id"] for j in jobs} == {first, second}
         for entry in jobs:
@@ -176,15 +183,16 @@ def test_list_training_jobs_carries_the_wire_field_set(
             assert entry["status"] == "queued"
             assert entry["base_model_id"]
             assert entry["created_at"]
-            # Queued: no output model yet, and no failure — both are the empty
-            # string, never `None`, matching the wire's own convention.
-            assert entry["output_model_id"] == ""
+            # The deterministic output id is stamped at submit time (it
+            # depends only on job_id) — never the empty string for this kind,
+            # queued or not; `error` is empty unless the job failed.
+            assert entry["output_model_id"] == f"jammi:fine-tuned:{entry['job_id']}"
             assert entry["error"] == ""
     finally:
         db.close()
 
 
-def test_list_training_jobs_is_tenant_scoped(
+def test_list_jobs_is_tenant_scoped(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     """A peer tenant's job is invisible in the listing — the same row predicate
@@ -199,18 +207,34 @@ def test_list_training_jobs_is_tenant_scoped(
         db.set_tenant(tenant_a)
         db.add_source("training", url=str(_TRAINING_PAIRS), format="csv")
         job_id = _submit(db).job_id
-        assert [j["job_id"] for j in db.list_training_jobs()] == [job_id]
+        assert [j["job_id"] for j in db.list_jobs()] == [job_id]
 
         db.set_tenant(tenant_b)
-        assert db.list_training_jobs() == []
+        assert db.list_jobs() == []
         # And B cannot attach to it by id either — the same predicate, on the
         # same row, through the other verb.
         from jammi.errors import BackendError
 
         with pytest.raises(BackendError):
-            db.training_job(job_id)
+            db.job(job_id)
 
         db.set_tenant(tenant_a)
-        assert [j["job_id"] for j in db.list_training_jobs()] == [job_id]
+        assert [j["job_id"] for j in db.list_jobs()] == [job_id]
+    finally:
+        db.close()
+
+
+def test_cancel_job_returns_false_once_terminal(tmp_path: Path) -> None:
+    """`cancel_job` returns `False` for an already-terminal row (idempotent, no
+    effect) and `list_workers`/`prune_jobs` are reachable on the same
+    connection, matching the wire's `JobService` verb set."""
+    db = _connect_with_source(tmp_path)
+    try:
+        job = _submit(db)
+        job.wait()
+        assert job.status() == "completed"
+        assert db.cancel_job(job.job_id) is False
+        assert isinstance(db.list_workers(), list)
+        assert isinstance(db.prune_jobs(), int)
     finally:
         db.close()

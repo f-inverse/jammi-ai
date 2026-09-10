@@ -233,11 +233,11 @@ def fine_tune_regression(db, *, loss: str, train_src: str, test_src: str,
     job.wait()
     if job.status() != "completed":
         raise RuntimeError(f"{loss} fine-tune did not complete: status={job.status()}")
-    print(f"  model_id: {job.model_id}", flush=True)
-    out = db.infer(source=test_src, model=job.model_id, columns=["text"],
+    print(f"  model_id: {job.output_model_id}", flush=True)
+    out = db.infer(source=test_src, model=job.output_model_id, columns=["text"],
                    task="regression", key="paper_id")
     metrics = (quantile_metrics if loss == "pinball" else gaussian_metrics)(out, true_years)
-    metrics.update({"loss": loss, "model_id": job.model_id,
+    metrics.update({"loss": loss, "model_id": job.output_model_id,
                     "head": "quantile" if loss == "pinball" else "gaussian",
                     "predictions": _dump_predictions(out, true_years, loss)})
     print(f"  rmse_years {metrics['rmse_years']}  mae {metrics['mae_years']}  "

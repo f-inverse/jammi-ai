@@ -76,10 +76,14 @@ REQUIRED: dict[str, list[str]] = {
         "base_model",
         "edge_provenance",
     ],
-    # attach-by-id + the tenant-scoped listing (campaign #446): a job handle
-    # outlives the connection that submitted it, on both arms.
-    "training_job": ["job_id"],
-    "list_training_jobs": [],
+    # attach-by-id + the tenant-scoped listing (campaign #446, generalised to
+    # every job kind by PLAN-C §4): a job handle outlives the connection
+    # that submitted it, on both arms.
+    "job": ["job_id"],
+    "list_jobs": [],
+    "cancel_job": ["job_id"],
+    "list_workers": [],
+    "prune_jobs": [],
     "eval_embeddings": ["source", "golden_source"],
     "eval_compare": ["embedding_tables", "source", "golden_source"],
     "eval_inference": ["model", "source", "columns", "task", "golden_source", "label_column"],

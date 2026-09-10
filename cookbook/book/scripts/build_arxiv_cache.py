@@ -280,7 +280,7 @@ def emit(db) -> None:
                                 epochs=FT_EPOCHS, batch_size=32, walks_per_node=2,
                                 walk_length=4, sample_seed=determinism.SEED)
         ft.wait()
-        model_id = ft.model_id
+        model_id = ft.output_model_id
         print(f"  ft model_id: {model_id}", flush=True)
         # `fine_tune_graph` trains a model, not an embedding table — this fresh
         # embed pass over the just-trained checkpoint is what turns it into one.
@@ -568,13 +568,13 @@ def part_a_regression_conformal(db, papers: str, cite: str, ids: list[str],
         architecture="attncnp", output="gaussian", objective="crps",
         epochs=PREDICTOR_EPOCHS, seed=determinism.SEED)
     job.wait()
-    print(f"  context predictor: {job.model_id}", flush=True)
+    print(f"  context predictor: {job.output_model_id}", flush=True)
 
     def predict_means(idx: np.ndarray) -> tuple[list[float], list[float], list[int]]:
         means, stds, obs = [], [], []
         for i in idx:
             key = ids[i]
-            out = db.predict_with_context_predictor(job.model_id, source=papers, target_key=key)
+            out = db.predict_with_context_predictor(job.output_model_id, source=papers, target_key=key)
             means.append(float(out["mean"]))
             stds.append(float(out["std"]))
             obs.append(year[key])
@@ -673,14 +673,14 @@ def part_a_regression_conformal(db, papers: str, cite: str, ids: list[str],
     # exercise the provenance rail: a few graph-conditioned predictions.
     for key in [ids[i] for i in test[:3]]:
         out = db.predict_with_context_predictor(
-            job.model_id, source=papers, target_key=key,
+            job.output_model_id, source=papers, target_key=key,
             edge_source=cite, edge_src_column="src", edge_dst_column="dst",
             edge_direction="out", edge_hops=2)
         ref = out.get("context_ref")
         n_ctx = len(ref) if isinstance(ref, (list, tuple)) else ref
         print(f"    graph-conditioned predict {key}: source={out.get('source')!r}  "
               f"context_ref={n_ctx}", flush=True)
-    return job.model_id
+    return job.output_model_id
 
 
 def weighted_residual_coverage(*, cal_resid: np.ndarray, test_resid: np.ndarray,
@@ -865,7 +865,7 @@ def _control_fine_tune(db, papers: str, *, edge_source: str, edge_provenance: st
                             epochs=CONTROL_EPOCHS, batch_size=32, walks_per_node=2,
                             walk_length=4, sample_seed=determinism.SEED)
     ft.wait()
-    emb = db.generate_embeddings(source=papers, model=ft.model_id,
+    emb = db.generate_embeddings(source=papers, model=ft.output_model_id,
                                  columns=["title", "abstract"], key="paper_id")
     return recall_at_k(db, emb_table=emb, golden_rows=golden_rows, queries=queries, k=RECALL_K)
 

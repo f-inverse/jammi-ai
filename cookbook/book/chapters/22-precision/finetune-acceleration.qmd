@@ -313,7 +313,7 @@ job_a = remote_a.fine_tune(
     backbone_dtype="f16",
     target_modules=TARGET_MODULES,
 )
-JOB_A_ID, JOB_A_MODEL_ID = job_a.job_id, job_a.model_id
+JOB_A_ID, JOB_A_MODEL_ID = job_a.job_id, job_a.output_model_id
 print(f"submitted job {JOB_A_ID} to a server that does not claim")
 
 # `TrainingConfig`'s own default idle poll — the interval a CLAIMING process
@@ -384,24 +384,25 @@ remote = jammi.connect(f"grpc://127.0.0.1:{server_b.port}")
 print(f"server B (default run_worker) up at grpc://127.0.0.1:{server_b.port}, same artifact dir")
 ```
 
-A job handle is **re-attachable across connections**, on both arms: `db.training_job(job_id)`
+A job handle is **re-attachable across connections**, on both arms: `db.job(job_id)`
 hands back a handle to a job this session never submitted — the same
-`jammi.RemoteTrainingJob` here that `fine_tune` returns, and the embedded arm's own
-`TrainingJob` there. That is what makes the sequence below expressible through the public
+`jammi.RemoteJob` here that `fine_tune` returns, and the embedded arm's own
+`Job` there. That is what makes the sequence below expressible through the public
 surface at all: server A's handle died with server A's channel, and the id is the only thing
-that crosses. Existence is resolved at attach time, by one `TrainingStatus` call, rather
+that crosses. Existence is resolved at attach time, by one `JobStatus` call, rather
 than left for the first read to discover: a job id with no row visible to this session's
 tenant raises the typed `jammi.errors.BackendError` — the same class on both transports —
 instead of handing back a handle that fails later.
 
-`TrainingStatusResponse.model_id` reads the same on both arms at every lifecycle state —
-queued, running, completed, failed — not only once the job completes: the server resolves
-it via `resolve_model_id` (`crates/jammi-server/src/grpc/training.rs:110`) into that field
-(`crates/jammi-wire/proto/jammi/v1/training.proto:433-444`), and the embedded attach calls
-the SAME engine function, so this client duplicates no naming rule of its own. (What DOES
-stay empty until completion, on both arms, is a different column: `list_training_jobs()`'s
-`output_model_id` relays `training_jobs.output_model_id` verbatim — "has the output row
-landed" — where `model_id` answers "what will this model be called".) Nothing about server
+`JobStatusResponse.output_model_id` reads the same on both arms at every lifecycle state —
+queued, running, completed, failed — not only once the job completes: for a LoRA fine-tune
+it is the DETERMINISTIC `jammi:fine-tuned:{job_id}` id, stamped at SUBMISSION time (it
+depends only on `job_id`, never the run's outcome). The server resolves
+it via `resolve_model_id` (`crates/jammi-ai/src/fine_tune/training_job.rs`) into that field
+(`crates/jammi-wire/proto/jammi/v1/job.proto`), and the embedded attach calls
+the SAME engine function, so this client duplicates no naming rule of its own —
+`list_jobs()`'s `output_model_id` relays the SAME catalog column verbatim, so the two
+reads agree from submission onward, not only after completion. Nothing about server
 B's claim loop is asserted at attach time here regardless — whether it has already finished
 this job by then is a race, and a race is exactly what this chapter refuses to assert into.
 The re-attach *after* `wait()` in the cell below is the deterministic read once the job is
@@ -411,7 +412,7 @@ a process that never accepted the submission.
 ```{python}
 # Job A, over server B's connection, through the public verb. Same job id —
 # nothing is resubmitted.
-job_f16 = remote.training_job(JOB_A_ID)
+job_f16 = remote.job(JOB_A_ID)
 assert job_f16.job_id == JOB_A_ID
 
 # The queue outlived the process that accepted it: a job server B never saw
@@ -419,10 +420,10 @@ assert job_f16.job_id == JOB_A_ID
 job_f16.wait()
 assert job_f16.status() == "completed", job_f16.status()
 
-# A second attach, now that the job is terminal — the deterministic `model_id`
-# read. Server B recovers the exact output id server A was handed at submit,
-# from the catalog alone.
-assert remote.training_job(JOB_A_ID).model_id == JOB_A_MODEL_ID
+# A second attach, now that the job is terminal — the deterministic
+# `output_model_id` read. Server B recovers the exact output id server A was
+# handed at submit, from the catalog alone.
+assert remote.job(JOB_A_ID).output_model_id == JOB_A_MODEL_ID
 
 report_f16 = job_f16.acceleration_report()
 print(json.dumps(report_f16, indent=2, sort_keys=True))
@@ -575,20 +576,20 @@ print("\nbf16 fine-tuning was refused loud, with the typed remedy message pointi
       "never a silent downgrade, never a silently-eager bf16 run.")
 ```
 
-## Both outcomes, from the catalog — `list_training_jobs`
+## Both outcomes, from the catalog — `list_jobs`
 
 Two jobs have now run through this artifact directory, submitted by two different processes over
 two different connections: the `f16` one server A accepted and server B claimed and completed,
-and the `bf16` one server B refused. Neither handle is needed to see them. `db.list_training_jobs()`
-is the tenant-scoped listing peer of `training_job(job_id)` — the same `TrainingJobSummary` field
+and the `bf16` one server B claimed and failed. Neither handle is needed to see them. `db.list_jobs()`
+is the tenant-scoped listing peer of `job(job_id)` — the same `JobSummary` field
 set on both arms (`job_id`, `kind`, `status`, `base_model_id`, `output_model_id`, `created_at`,
-`error`), most recent first, with `output_model_id` empty until a job completes and `error` empty
-unless it failed. Neither arm maps either onto `None`, so a caller branches on one thing on both
-transports. There is no progress surface here by construction: the engine records run metrics only
-at finalization, so a listing shows terminal facts, not a percentage.
+`error`), most recent first, with `error` empty unless a job failed. Neither arm maps `error`
+onto `None`, so a caller branches on one thing on both transports. There is no progress surface
+here by construction: a listing shows terminal facts, not a percentage — read
+`job(job_id).progress()` on the individual handle for that.
 
 ```{python}
-jobs = remote.list_training_jobs()
+jobs = remote.list_jobs()
 for j in jobs:
     print(f"  {j['job_id']}  status={j['status']:<10s} "
           f"output_model_id={j['output_model_id']!r} error={j['error'][:40]!r}")
@@ -598,14 +599,19 @@ assert set(by_id) == {JOB_A_ID, JOB_BF16_ID}, sorted(by_id)
 # Most recent first — the bf16 submission is the later of the two.
 assert jobs[0]["job_id"] == JOB_BF16_ID, jobs[0]["job_id"]
 
-# The completed job carries its output id; the refused one carries its error —
-# and each carries the empty string, not `None`, where the other carries a value.
+# Both are LoRA fine-tunes, so BOTH carry their deterministic output id from
+# submission — it depends only on job_id, never the run's outcome. `error` is
+# what distinguishes them: empty for the completed job, populated for the
+# failed one — never `None` on either.
 done, refused = by_id[JOB_A_ID], by_id[JOB_BF16_ID]
 assert done["status"] == "completed", done["status"]
 assert done["output_model_id"] == JOB_A_MODEL_ID, done["output_model_id"]
 assert done["error"] == "", repr(done["error"])
 assert refused["status"] == "failed", refused["status"]
-assert refused["output_model_id"] == "", repr(refused["output_model_id"])
+assert refused["output_model_id"] == f"jammi:fine-tuned:{JOB_BF16_ID}", (
+    refused["output_model_id"]
+)
+assert refused["error"] != "", "a failed job must record its error message"
 assert "bf16" in refused["error"], refused["error"]
 
 # The field set is the wire's, exactly — no arm adds or drops a key.

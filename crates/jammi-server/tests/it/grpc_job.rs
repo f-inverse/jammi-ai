@@ -774,7 +774,7 @@ async fn start_training_rejects_missing_columns() {
 /// [`jammi_db::catalog::Catalog::submit_job`] (which always lands
 /// `status = 'queued'`). The row this writes never passes through `'queued'`,
 /// so it is race-free against the server's own background `JobWorker` —
-/// mounted alongside `TrainingService` by every `start_engine_server*` fixture
+/// mounted alongside `JobService` by every `start_engine_server*` fixture
 /// — which claims exclusively `WHERE status = 'queued'` and would otherwise
 /// compete for a freshly-queued row nondeterministically. The generalised
 /// `jobs` schema (migration 029, C1b) has no dedicated `base_model_id`/
@@ -1250,7 +1250,7 @@ async fn remote_caller_distinguishes_acceleration_report_tri_state_purely_from_t
 // ---------------------------------------------------------------------------
 // GAP-A-2 (#446): `[worker] enabled` — whether THIS process claims.
 //
-// `TrainingService` is core and mounts unconditionally; whether the same
+// `JobService` is core and mounts unconditionally; whether the same
 // process ALSO runs the claim loop is a configuration key, not a tier, not a
 // second code path and not a build feature. The three tests below drive that
 // key through the real `jammi.toml` → `JammiConfig::load` path the binary uses
@@ -1259,7 +1259,7 @@ async fn remote_caller_distinguishes_acceleration_report_tri_state_purely_from_t
 // that stopping a worker stops it.
 // ---------------------------------------------------------------------------
 
-/// Read `TrainingStatus` over the wire and the SAME job's catalog record in
+/// Read `JobStatus` over the wire and the SAME job's catalog record in
 /// process, returning both. The K4 cross-transport pair: whatever the remote
 /// surface reports for the acceleration marker must byte-equal the embedded
 /// read of the identical row.
@@ -1286,7 +1286,7 @@ async fn wire_and_embedded(
 
 /// THE BINDING ORACLE for `[worker] enabled = false`: a server built from a
 /// `jammi.toml` carrying `[worker] enabled = false` accepts a submission over
-/// `TrainingService` (core — always mounted) and then never claims it — the job's
+/// `JobService` (core — always mounted) and then never claims it — the job's
 /// `queued` status and its byte-exact `{"state":"pending"}` acceleration marker
 /// are STABLE, not merely observed once.
 ///
@@ -1318,19 +1318,19 @@ async fn worker_disabled_leaves_the_job_queued_and_pending_stable() {
     .await;
     let mut client = JobServiceClient::new(channel(server.addr).await);
 
-    // The submission surface is unaffected by the key: `TrainingService` is
-    // mounted and `StartTraining` succeeds exactly as it does with a worker.
+    // The submission surface is unaffected by the key: `JobService` is
+    // mounted and `SubmitJob` succeeds exactly as it does with a worker.
     let start = client
         .submit_job(start_request())
         .await
         .expect(
-            "start_training must succeed with [worker] enabled = false — \
-                 TrainingService is core and still MOUNTS; only claiming is off",
+            "submit_job must succeed with [worker] enabled = false — \
+                 JobService is core and still MOUNTS; only claiming is off",
         )
         .into_inner();
     assert!(
         !start.job_id.is_empty(),
-        "StartTraining returns a job id regardless of [worker] enabled"
+        "SubmitJob returns a job id regardless of [worker] enabled"
     );
 
     // Span strictly more than one idle poll interval, read off the server's OWN

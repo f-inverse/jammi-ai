@@ -36,14 +36,15 @@ halves are needed: a wrapper that dropped the call on the floor is invisible to
 every low-level oracle.
 
 The two pre-existing close-before-inject tests
-(`test_conformance.py::test_remote_and_embedded_training_job_metrics_agree_on_all_three_states`
-and `test_embedded_training.py::test_embedded_training_job_acceleration_report_covers_all_four_states`)
+(`test_conformance.py::test_remote_and_embedded_job_metrics_agree_on_all_three_states`
+and `test_embedded_training.py::test_embedded_fine_tune_acceleration_report_four_states`)
 are the only sanctioned raw-`sqlite3` touch points on an engine catalog, and
 they depend on exactly this contract.
 """
 
 from __future__ import annotations
 
+import json
 import sqlite3
 import subprocess
 import sys
@@ -58,11 +59,11 @@ import jammi_native
 from jammi._assembly import build_fine_tune_request
 from jammi.errors import BackendError
 
-# A base model directory that does not exist. `create_training_job` runs at
+# A base model directory that does not exist. `Catalog::submit_job` runs at
 # SUBMIT time and reads nothing but the catalog, so this commits a real
-# training-job row in milliseconds — no model load, no fixture, no training.
+# job row in milliseconds — no model load, no fixture, no training.
 # The worker then fails the job; the columns asserted below (`job_id`,
-# `training_source`) are the ones no later write touches.
+# `spec`'s `source`) are the ones no later write touches.
 _ABSENT_MODEL = "/nonexistent/jammi/close-release-oracle/model"
 
 _CYCLES = 20
@@ -90,7 +91,7 @@ _SUCCESSOR = textwrap.dedent(
 
 
 def _submit_job_row(db, training_source: str) -> str:
-    """Commit one real `training_jobs` row through the engine and return its id."""
+    """Commit one real `jobs` row through the engine and return its id."""
     request = build_fine_tune_request(
         source=training_source,
         base_model=f"local:{_ABSENT_MODEL}",
@@ -108,16 +109,18 @@ def _submit_job_row(db, training_source: str) -> str:
     return job_id
 
 
-def _raw_training_jobs(catalog_db: Path) -> list[tuple[str, str]]:
-    """`(job_id, training_source)` for every row, read through CPython's OWN
+def _raw_jobs(catalog_db: Path) -> list[tuple[str, str]]:
+    """`(job_id, source)` for every row, read through CPython's OWN
     SQLite library instance — the foreign reader whose view must agree with the
-    engine's once the engine has released the file."""
+    engine's once the engine has released the file. `source` is decoded out of
+    the generalised `jobs.spec` tagged JSON (there is no dedicated column for
+    it any more, migration 029) rather than a column of its own."""
     conn = sqlite3.connect(str(catalog_db))
     try:
         return [
-            (row[0], row[1])
-            for row in conn.execute(
-                "SELECT job_id, training_source FROM training_jobs ORDER BY rowid"
+            (job_id, json.loads(spec)["source"])
+            for job_id, spec in conn.execute(
+                "SELECT job_id, spec FROM jobs ORDER BY rowid"
             )
         ]
     finally:
@@ -148,7 +151,7 @@ def test_close_releases_the_catalog_to_a_raw_sqlite3_reader(tmp_path):
         SQLite's own evidence that the engine let go — the release point the
         `unix-excl` seam makes load-bearing. The handle is still alive here, so
         this proves `close()`, not the drop.
-      * the foreign reader's view of `training_jobs` is byte-equal to the set of
+      * the foreign reader's view of `jobs` is byte-equal to the set of
         rows the engine committed (each id as the engine minted it, in
         insertion order) — not merely "returns something". While an engine
         connection is open, the two library instances are deterministically
@@ -176,7 +179,7 @@ def test_close_releases_the_catalog_to_a_raw_sqlite3_reader(tmp_path):
             "library instance reads a divergent image of it"
         )
 
-        observed = _raw_training_jobs(catalog_db)
+        observed = _raw_jobs(catalog_db)
         assert observed == expected, (
             f"cycle {cycle}: the raw sqlite3 reader disagrees with the engine's "
             f"committed rows after close() — expected {expected}, saw {observed}"
@@ -241,7 +244,7 @@ def test_close_hands_the_catalog_directory_to_a_successor_process(tmp_path):
 
     # The row the first engine committed survives the handoff: releasing the
     # file is a clean shutdown, not an abandonment.
-    assert [j for j, _ in _raw_training_jobs(tmp_path / "catalog.db")] == [job_id]
+    assert [j for j, _ in _raw_jobs(tmp_path / "catalog.db")] == [job_id]
 
 
 def test_use_after_close_raises_the_typed_error_and_close_is_idempotent(tmp_path):
@@ -264,7 +267,7 @@ def test_use_after_close_raises_the_typed_error_and_close_is_idempotent(tmp_path
     with pytest.raises(BackendError, match="closed"):
         db.list_sources()
     with pytest.raises(BackendError, match="closed"):
-        db.training_job("no-such-job")
+        db.job("no-such-job")
     with pytest.raises(BackendError, match="closed"):
         db.get_server_info()
     with pytest.raises(BackendError, match="closed"):
@@ -395,7 +398,7 @@ def test_public_close_hands_the_catalog_directory_to_a_successor_process(tmp_pat
     )
 
     # The row this session committed survives the handoff.
-    assert [j for j, _ in _raw_training_jobs(tmp_path / "catalog.db")] == [job_id]
+    assert [j for j, _ in _raw_jobs(tmp_path / "catalog.db")] == [job_id]
 
 
 def test_public_close_releases_the_catalog_to_a_raw_sqlite3_reader(tmp_path):
@@ -423,7 +426,7 @@ def test_public_close_releases_the_catalog_to_a_raw_sqlite3_reader(tmp_path):
             f"cycle {cycle}: the public close() returned with {wal.name} still "
             "present — the wrapper did not reach the engine's release"
         )
-        assert _raw_training_jobs(catalog_db) == expected, (
+        assert _raw_jobs(catalog_db) == expected, (
             f"cycle {cycle}: the raw sqlite3 reader disagrees with the rows the "
             "engine committed after the public close()"
         )

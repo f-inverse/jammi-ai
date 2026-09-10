@@ -1282,8 +1282,8 @@ workspace ships every publishable crate at the same
   `ContextPredictorSpec`, still defined in `jammi.v1.training`) plus a new
   optional `idempotency_key` — a second `SubmitJob` carrying an
   already-known non-empty key returns the SAME job handle rather than
-  submitting a duplicate (deduped for this server process's lifetime, not a
-  durable catalog guarantee). New rpcs: `WaitJob` (a resumable
+  submitting a duplicate (a DURABLE per-tenant dedupe, migration 030's
+  `jobs.idempotency_key` + unique index — see below). New rpcs: `WaitJob` (a resumable
   server-streaming wait — server-side 100ms poll, ends at the terminal
   frame, a client disconnect ends only the wait) and `CancelJob`,
   `ListWorkers` (fleet/liveness over `instances`/`workers`), and

@@ -1,4 +1,4 @@
-"""`training_job(id)` and `list_training_jobs()` read IDENTICALLY on both transports.
+"""`job(id)` and `list_jobs()` read IDENTICALLY on both transports.
 
 Stands up a real CPU `jammi-server` over an artifact directory an EMBEDDED
 engine seeded and released first, so both arms answer about ONE catalog row.
@@ -35,9 +35,9 @@ pytestmark = pytest.mark.skipif(
     reason="needs JAMMI_SERVER_BIN and the [embedded] extra (the seeder is the in-process engine)",
 )
 
-# A base model directory that does not exist. `create_training_job` runs at
+# A base model directory that does not exist. `Catalog::submit_job` runs at
 # SUBMIT time and reads nothing but the catalog, so this commits a real
-# training-job row in milliseconds — no model load, no fixture, no training. The
+# job row in milliseconds — no model load, no fixture, no training. The
 # job is never claimed by anything here, so it never fails either: it stays
 # exactly `queued`, which is the state under comparison.
 _ABSENT_MODEL = "/nonexistent/jammi/attach-parity/model"
@@ -81,10 +81,10 @@ def _seed(artifact_dir: Path, monkeypatch) -> tuple[str, dict, dict, str]:
         ).job_id
 
         # The attach path itself, on the arm that owns the catalog.
-        attached = db.training_job(job_id)
+        attached = db.job(job_id)
         status = attached.status()
         report = attached.acceleration_report()
-        summaries = db.list_training_jobs()
+        summaries = db.list_jobs()
     finally:
         db.close()
     monkeypatch.delenv("JAMMI_WORKER__ENABLED", raising=False)
@@ -95,7 +95,7 @@ def _seed(artifact_dir: Path, monkeypatch) -> tuple[str, dict, dict, str]:
 
 
 def test_remote_and_embedded_attach_and_list_agree(tmp_path, monkeypatch, live_server_on):
-    """The remote arm's `training_job(id)` reads and `list_training_jobs()`
+    """The remote arm's `job(id)` reads and `list_jobs()`
     entries equal the embedded arm's, on the same row — plus the not-found error
     is one CLASS on both.
 
@@ -112,20 +112,20 @@ def test_remote_and_embedded_attach_and_list_agree(tmp_path, monkeypatch, live_s
     with live_server_on(artifact_dir, env_overrides=_NO_CLAIM) as endpoint:
         remote = jammi.connect(endpoint)
         try:
-            handle = remote.training_job(job_id)
+            handle = remote.job(job_id)
             assert handle.job_id == job_id
             assert handle.status() == embedded_status
             assert handle.acceleration_report() == embedded_report
             assert handle.metrics() == {}
 
-            assert remote.list_training_jobs() == [embedded_summary]
+            assert remote.list_jobs() == [embedded_summary]
 
             # The not-found error is the same CLASS on both arms. The embedded
             # half of this pair is asserted in
-            # `crates/jammi-python/tests/test_training_job_attach.py`; here the
+            # `crates/jammi-python/tests/test_job_attach.py`; here the
             # remote half is pinned against the same class object.
             with pytest.raises(BackendError):
-                remote.training_job("no-such-job-id")
+                remote.job("no-such-job-id")
         finally:
             remote.close()
 
@@ -133,24 +133,26 @@ def test_remote_and_embedded_attach_and_list_agree(tmp_path, monkeypatch, live_s
     assert embedded_summary["job_id"] == job_id
     assert set(embedded_summary.keys()) == _SUMMARY_KEYS
     assert embedded_summary["status"] == "queued"
-    assert embedded_summary["output_model_id"] == ""
+    # The deterministic output id is stamped at submit time (it depends only
+    # on job_id, never on the run's outcome) — never empty for this kind.
+    assert embedded_summary["output_model_id"] == f"jammi:fine-tuned:{job_id}"
     assert embedded_summary["error"] == ""
     assert embedded_report == {"state": "pending"}
 
 
-def test_remote_and_embedded_attach_model_id_agree_before_completion(
+def test_remote_and_embedded_attach_output_model_id_agree_before_completion(
     tmp_path, monkeypatch, live_server_on
 ):
-    """`model_id` on an attach to a NOT-YET-COMPLETED job is byte-identical on
-    both arms — the divergence this module once recorded as a stated difference
-    is closed, and this is the equality that keeps it closed.
+    """`output_model_id` on an attach to a NOT-YET-COMPLETED job is byte-identical
+    on both arms — the divergence this module once recorded as a stated
+    difference is closed, and this is the equality that keeps it closed.
 
-    Pre-completion is the whole point: `training_jobs.output_model_id` is
+    Pre-completion is the whole point: `jobs.output_model_id` is
     stamped only at finalization, so a queued row has no column to relay. Both
     arms therefore report a DERIVED id, and they report the same one because
     they make the same call — `jammi_ai::fine_tune::training_job::
     resolve_model_id`, which the embedded attach binding and the server's
-    `TrainingStatus` handler each delegate to rather than re-spelling the
+    `JobStatus` handler each delegate to rather than re-spelling the
     naming rule. An equality that held only after completion would prove
     nothing here: it would just be two relays of one stamped column.
 
@@ -164,7 +166,7 @@ def test_remote_and_embedded_attach_model_id_agree_before_completion(
     monkeypatch.setenv("JAMMI_WORKER__ENABLED", "false")
     embedded = jammi.connect(f"file://{artifact_dir}")
     try:
-        embedded_model_id = embedded.training_job(job_id).model_id
+        embedded_output_model_id = embedded.job(job_id).output_model_id
     finally:
         embedded.close()
     monkeypatch.delenv("JAMMI_WORKER__ENABLED", raising=False)
@@ -172,8 +174,8 @@ def test_remote_and_embedded_attach_model_id_agree_before_completion(
     with live_server_on(artifact_dir, env_overrides=_NO_CLAIM) as endpoint:
         remote = jammi.connect(endpoint)
         try:
-            assert remote.training_job(job_id).model_id == embedded_model_id
+            assert remote.job(job_id).output_model_id == embedded_output_model_id
         finally:
             remote.close()
 
-    assert embedded_model_id == f"jammi:fine-tuned:{job_id}"
+    assert embedded_output_model_id == f"jammi:fine-tuned:{job_id}"

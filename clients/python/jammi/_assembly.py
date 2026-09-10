@@ -3,7 +3,7 @@
 This is the pure-Python request-construction shared above the wire: the enum maps
 that translate a verb's snake-case vocabulary into the generated proto enums, the
 small builder helpers that shape oneof/nested messages, and the per-verb request
-builders that assemble a whole `StartTrainingRequest` from flat kwargs. It is
+builders that assemble a whole `SubmitJobRequest` from flat kwargs. It is
 protobuf-only — no ML dependency, no transport — so both the pure gRPC client and
 the embedded wheel's remote binding construct identical requests from one place.
 
@@ -21,6 +21,7 @@ from ._generated.jammi.v1 import catalog_pb2
 from ._generated.jammi.v1 import embedding_pb2
 from ._generated.jammi.v1 import eval_pb2
 from ._generated.jammi.v1 import inference_pb2
+from ._generated.jammi.v1 import job_pb2
 from ._generated.jammi.v1 import pipeline_pb2
 from ._generated.jammi.v1 import training_pb2
 
@@ -534,13 +535,17 @@ def build_fine_tune_request(
     regression_beta: Optional[float] = None,
     quantile_levels: Optional[List[float]] = None,
     keep_last_n_checkpoints: Optional[int] = None,
-) -> training_pb2.StartTrainingRequest:
-    """Assemble the `StartTrainingRequest` for a LoRA fine-tune (the `FineTuneSpec`
+    idempotency_key: str = "",
+) -> job_pb2.SubmitJobRequest:
+    """Assemble the `SubmitJobRequest` for a LoRA fine-tune (the `FineTuneSpec`
     arm) from the embed binding's flat kwargs.
 
     Validates the `method` vocabulary, defaults `task` to text-embedding, builds
     the `FineTuneConfig` from the config kwargs, and wraps both in the request —
-    the same shape the embed binding's `fine_tune` submits.
+    the same shape the embed binding's `fine_tune` submits. `idempotency_key`
+    (empty by default) rides straight onto `SubmitJobRequest.idempotency_key` —
+    a non-empty key dedupes the submission per `JobService.SubmitJob`'s
+    durable per-tenant contract (migration 030).
     """
     try:
         wire_method = _FINE_TUNE_METHOD[method]
@@ -582,7 +587,7 @@ def build_fine_tune_request(
         quantile_levels=quantile_levels,
         keep_last_n_checkpoints=keep_last_n_checkpoints,
     )
-    return training_pb2.StartTrainingRequest(
+    return job_pb2.SubmitJobRequest(
         fine_tune=training_pb2.FineTuneSpec(
             source=source,
             columns=list(columns),
@@ -591,6 +596,7 @@ def build_fine_tune_request(
         ),
         base_model=base_model,
         config=config,
+        idempotency_key=idempotency_key,
     )
 
 
@@ -621,8 +627,9 @@ def build_fine_tune_graph_request(
     matryoshka_dims: Optional[List[int]] = None,
     seed: Optional[int] = None,
     keep_last_n_checkpoints: Optional[int] = None,
-) -> training_pb2.StartTrainingRequest:
-    """Assemble the `StartTrainingRequest` for a graph-supervised fine-tune (S11,
+    idempotency_key: str = "",
+) -> job_pb2.SubmitJobRequest:
+    """Assemble the `SubmitJobRequest` for a graph-supervised fine-tune (S11,
     the `GraphFineTuneSpec` arm) from the embed binding's flat kwargs.
 
     Validates the `edge_provenance` vocabulary, fills the `GraphSampleConfig`
@@ -691,7 +698,7 @@ def build_fine_tune_graph_request(
     if keep_last_n_checkpoints is not None:
         config.keep_last_n_checkpoints = keep_last_n_checkpoints
 
-    return training_pb2.StartTrainingRequest(
+    return job_pb2.SubmitJobRequest(
         graph_fine_tune=training_pb2.GraphFineTuneSpec(
             sources=training_pb2.GraphFineTuneSources(
                 node_source=node_source,
@@ -706,6 +713,7 @@ def build_fine_tune_graph_request(
         ),
         base_model=base_model,
         config=config,
+        idempotency_key=idempotency_key,
     )
 
 
@@ -731,8 +739,9 @@ def build_context_predictor_request(
     min_task_count: int = 4,
     seed: int = 0,
     model_id: Optional[str] = None,
-) -> training_pb2.StartTrainingRequest:
-    """Assemble the `StartTrainingRequest` for an amortized in-context predictor
+    idempotency_key: str = "",
+) -> job_pb2.SubmitJobRequest:
+    """Assemble the `SubmitJobRequest` for an amortized in-context predictor
     (S19, the `ContextPredictorSpec` arm) from the embed binding's flat kwargs.
 
     Validates the `architecture` vocabulary, builds the gaussian/quantile
@@ -803,11 +812,12 @@ def build_context_predictor_request(
         min_task_count=min_task_count,
         seed=seed,
     )
-    return training_pb2.StartTrainingRequest(
+    return job_pb2.SubmitJobRequest(
         context_predictor=training_pb2.ContextPredictorSpec(
             source=source,
             predictor_spec=spec,
-        )
+        ),
+        idempotency_key=idempotency_key,
     )
 
 

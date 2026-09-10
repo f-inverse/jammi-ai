@@ -228,9 +228,11 @@ jobs:
           set -euo pipefail
           sources=("${IMAGE}:${SHA_TAG}-amd64" "${IMAGE}:${SHA_TAG}-arm64")
           tag_args=()
+          tags=()
           while IFS= read -r tag; do
             [ -n "$tag" ] || continue
             tag_args+=(-t "$tag")
+            tags+=("$tag")
           done <<< "$TAGS"
 
           docker buildx imagetools create --dry-run "${tag_args[@]}" "${sources[@]}" \
@@ -269,14 +271,46 @@ jobs:
           # attestation checks below verify, must be the one the merge
           # itself just wrote, not whatever a later push re-points a
           # mutable tag to.
-          if ! digest="$(docker buildx imagetools inspect "${IMAGE}:${SHA_TAG}" --format '{{.Manifest.Digest}}')" \
-              || ! docker buildx imagetools inspect "${IMAGE}:${SHA_TAG}" --format '{{json .Manifest}}' \
-                | bash ci/scripts/check_merged_index_platforms.sh "linux/amd64,linux/arm64"; then
+          #
+          # Two DIFFERENT failures, two different messages -- same split as
+          # `_ci-base-image.yml`'s "Confirm the pushed index" step
+          # (:381-406): the re-inspect ITSELF failing (or returning
+          # something that does not even shape-match a digest) means
+          # whether the merge landed is UNKNOWN, so a restore command
+          # printed there could overwrite a GOOD merge with a stale
+          # digest -- that arm never prints one. Only a re-inspect that
+          # SUCCEEDS, with a shape-valid digest, whose CONTENT then fails
+          # the platform check is a confirmed-landed-wrong result, and
+          # only THAT arm prints a restore command -- naming every tag
+          # this merge wrote ($TAGS via `tags`), not only the immutable
+          # sha tag, since `imagetools create` above moved all of them.
+          set +e
+          digest="$(docker buildx imagetools inspect "${IMAGE}:${SHA_TAG}" --format '{{.Manifest.Digest}}' 2>/tmp/merge-cpu-main-confirm-stderr.txt)"
+          confirm_inspect_rc=$?
+          set -e
+          confirm_stderr="$(cat /tmp/merge-cpu-main-confirm-stderr.txt)"
+
+          if [ "$confirm_inspect_rc" -ne 0 ]; then
+            echo "::error::post-push re-read of ${IMAGE}:${SHA_TAG} failed ($confirm_stderr) -- whether the merge landed is unknown, so do NOT restore: a restore now could overwrite a GOOD merge with a stale digest; verify manually first" >&2
+            exit 1
+          fi
+
+          if [[ ! "$digest" =~ ^sha256:[0-9a-f]{64}$ ]]; then
+            echo "::error::post-push re-read of ${IMAGE}:${SHA_TAG} succeeded but returned an unexpected value ('$digest', not a sha256 digest) -- whether the merge landed is unknown, so do NOT restore: verify manually first" >&2
+            exit 1
+          fi
+
+          if ! docker buildx imagetools inspect "${IMAGE}:${SHA_TAG}" --format '{{json .Manifest}}' \
+              | bash ci/scripts/check_merged_index_platforms.sh "linux/amd64,linux/arm64"; then
             if [ -n "$previous_digest" ]; then
-              restore_ref="${IMAGE}@${previous_digest}"
-              echo "::error::post-push confirm failed for ${IMAGE}:${SHA_TAG} -- the re-read merged index is missing or wrong; previous digest was $previous_digest; restore with: docker buildx imagetools create -t ${IMAGE}:${SHA_TAG} $restore_ref" >&2
+              restore_cmd="docker buildx imagetools create"
+              for restore_tag in "${tags[@]}"; do
+                restore_cmd="${restore_cmd} -t ${restore_tag}"
+              done
+              restore_cmd="${restore_cmd} ${IMAGE}@${previous_digest}"
+              echo "::error::post-push confirm failed for ${IMAGE}:${SHA_TAG} -- the re-read merged index landed but is wrong; previous digest was $previous_digest; restore every tag this merge wrote with: $restore_cmd" >&2
             else
-              echo "::error::post-push confirm failed for ${IMAGE}:${SHA_TAG} -- the re-read merged index is missing or wrong, and this was the first publish of this tag, so there is no previous digest to restore to; investigate directly" >&2
+              echo "::error::post-push confirm failed for ${IMAGE}:${SHA_TAG} -- the re-read merged index landed but is wrong, and this was the first publish of this tag, so there is no previous digest to restore to; investigate directly" >&2
             fi
             exit 1
           fi
@@ -424,9 +458,11 @@ jobs:
           set -euo pipefail
           sources=("${IMAGE}:${SHA_TAG}-amd64" "${IMAGE}:${SHA_TAG}-arm64")
           tag_args=()
+          tags=()
           while IFS= read -r tag; do
             [ -n "$tag" ] || continue
             tag_args+=(-t "$tag")
+            tags+=("$tag")
           done <<< "$TAGS"
 
           docker buildx imagetools create --dry-run "${tag_args[@]}" "${sources[@]}" \
@@ -465,14 +501,46 @@ jobs:
           # attestation checks below verify, must be the one the merge
           # itself just wrote, not whatever a later push re-points a
           # mutable tag to.
-          if ! digest="$(docker buildx imagetools inspect "${IMAGE}:${SHA_TAG}" --format '{{.Manifest.Digest}}')" \
-              || ! docker buildx imagetools inspect "${IMAGE}:${SHA_TAG}" --format '{{json .Manifest}}' \
-                | bash ci/scripts/check_merged_index_platforms.sh "linux/amd64,linux/arm64"; then
+          #
+          # Two DIFFERENT failures, two different messages -- same split as
+          # `_ci-base-image.yml`'s "Confirm the pushed index" step
+          # (:381-406): the re-inspect ITSELF failing (or returning
+          # something that does not even shape-match a digest) means
+          # whether the merge landed is UNKNOWN, so a restore command
+          # printed there could overwrite a GOOD merge with a stale
+          # digest -- that arm never prints one. Only a re-inspect that
+          # SUCCEEDS, with a shape-valid digest, whose CONTENT then fails
+          # the platform check is a confirmed-landed-wrong result, and
+          # only THAT arm prints a restore command -- naming every tag
+          # this merge wrote ($TAGS via `tags`), not only the immutable
+          # sha tag, since `imagetools create` above moved all of them.
+          set +e
+          digest="$(docker buildx imagetools inspect "${IMAGE}:${SHA_TAG}" --format '{{.Manifest.Digest}}' 2>/tmp/merge-cpu-tag-confirm-stderr.txt)"
+          confirm_inspect_rc=$?
+          set -e
+          confirm_stderr="$(cat /tmp/merge-cpu-tag-confirm-stderr.txt)"
+
+          if [ "$confirm_inspect_rc" -ne 0 ]; then
+            echo "::error::post-push re-read of ${IMAGE}:${SHA_TAG} failed ($confirm_stderr) -- whether the merge landed is unknown, so do NOT restore: a restore now could overwrite a GOOD merge with a stale digest; verify manually first" >&2
+            exit 1
+          fi
+
+          if [[ ! "$digest" =~ ^sha256:[0-9a-f]{64}$ ]]; then
+            echo "::error::post-push re-read of ${IMAGE}:${SHA_TAG} succeeded but returned an unexpected value ('$digest', not a sha256 digest) -- whether the merge landed is unknown, so do NOT restore: verify manually first" >&2
+            exit 1
+          fi
+
+          if ! docker buildx imagetools inspect "${IMAGE}:${SHA_TAG}" --format '{{json .Manifest}}' \
+              | bash ci/scripts/check_merged_index_platforms.sh "linux/amd64,linux/arm64"; then
             if [ -n "$previous_digest" ]; then
-              restore_ref="${IMAGE}@${previous_digest}"
-              echo "::error::post-push confirm failed for ${IMAGE}:${SHA_TAG} -- the re-read merged index is missing or wrong; previous digest was $previous_digest; restore with: docker buildx imagetools create -t ${IMAGE}:${SHA_TAG} $restore_ref" >&2
+              restore_cmd="docker buildx imagetools create"
+              for restore_tag in "${tags[@]}"; do
+                restore_cmd="${restore_cmd} -t ${restore_tag}"
+              done
+              restore_cmd="${restore_cmd} ${IMAGE}@${previous_digest}"
+              echo "::error::post-push confirm failed for ${IMAGE}:${SHA_TAG} -- the re-read merged index landed but is wrong; previous digest was $previous_digest; restore every tag this merge wrote with: $restore_cmd" >&2
             else
-              echo "::error::post-push confirm failed for ${IMAGE}:${SHA_TAG} -- the re-read merged index is missing or wrong, and this was the first publish of this tag, so there is no previous digest to restore to; investigate directly" >&2
+              echo "::error::post-push confirm failed for ${IMAGE}:${SHA_TAG} -- the re-read merged index landed but is wrong, and this was the first publish of this tag, so there is no previous digest to restore to; investigate directly" >&2
             fi
             exit 1
           fi

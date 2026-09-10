@@ -1,6 +1,8 @@
 #!/usr/bin/env bash
 # Asserts a pushed image digest carries both a provenance attestation and an
-# SBOM attestation. Shared by every push job in server-image.yml so the
+# SBOM attestation, and -- when the index is multi-platform -- that BOTH
+# attestations actually cover every platform the index carries, not just
+# some of them. Shared by every push job in server-image.yml so the
 # assertion logic lives in exactly one place instead of four copies drifting
 # independently.
 #
@@ -20,32 +22,232 @@
 # directly, and BOTH an spdx SBOM predicate and a SLSA provenance predicate
 # must be found among the attestation manifests -- checking only the SBOM
 # predicate previously let a provenance-less image pass the fallback arm.
+#
+# Per-platform coverage (primary-accessor path only): a multi-platform
+# `.Provenance`/`.SBOM` value is an object keyed by "os/arch[/variant]", one
+# entry per platform BuildKit attested. `is_platform_map` recognizes that
+# shape; when it does, this script separately reads the index's OWN
+# platform set (`imagetools inspect --raw`'s `.manifests[]`, excluding
+# attestation-manifest entries) and requires the attestation's key set to be
+# EXACTLY that set. A merge that lands an attested arm64 leg alongside an
+# unattested amd64 leg previously passed here: the arm64 leg's non-empty
+# provenance/SBOM satisfied the old "is there SOMETHING" test with no check
+# that every index platform had its OWN entry. `--self-test` drives this
+# comparison (and `is_platform_map`) against synthetic JSON, no docker, no
+# registry, no network required.
+#
+# Usage:
+#   REF=<registry>/<image>@sha256:<digest> assert_image_attestations.sh
+#   assert_image_attestations.sh --self-test
 set -euo pipefail
+
+# Recognizes a per-platform attestation map: a non-empty object all of whose
+# values are themselves non-empty objects (keyed "os/arch[/variant]"). Fails
+# on ANY non-object or empty-object value, so a malformed or partially
+# missing per-platform map cannot slip past as if it were a flat
+# single-platform attestation. Single definition -- `non_empty_attestation`
+# below composes with this rather than re-deriving the predicate, and the
+# platform-set comparison further down calls it directly to decide whether
+# a per-platform comparison even applies.
+is_platform_map() {
+  jq -e '
+    (type == "object") and (length > 0) and
+      (to_entries | all(.value | (type == "object") and (length > 0)))
+  ' > /dev/null 2>&1
+}
+
+# `--format {{json .Provenance}}` / `{{json .SBOM}}` print the JSON literal
+# `{}` when the attestation is absent, so presence must be a shape test, not
+# a non-emptiness test on the printed string. A platform-keyed map passes via
+# `is_platform_map`; otherwise a flat single-platform attestation must be a
+# non-empty object.
+non_empty_attestation() {
+  local input
+  input="$(cat)"
+  if printf '%s' "$input" | is_platform_map; then
+    return 0
+  fi
+  printf '%s' "$input" | jq -e '(type == "object") and (length > 0)' > /dev/null 2>&1
+}
+
+# Parses a raw OCI index (`imagetools inspect --raw`'s stdout, on stdin)
+# into the index's OWN platform set: one "os/arch[/variant]" string per
+# line, sorted and de-duplicated, EXCLUDING attestation-manifest entries
+# (those carry a synthetic "unknown/unknown" platform, never a real leg).
+# Pure jq, no docker -- separated from `index_platform_set` below so
+# --self-test can drive it with a synthetic raw index, no registry
+# required.
+parse_index_platforms() {
+  jq -r '
+    .manifests[]?
+    | select((.annotations["vnd.docker.reference.type"] // "") != "attestation-manifest")
+    | .platform
+    | select(. != null)
+    | if ((.variant // "") != "") then "\(.os)/\(.architecture)/\(.variant)" else "\(.os)/\(.architecture)" end
+  ' | sort -u
+}
+
+# The real (network-touching) read: `$1` is the same `<repo>@sha256:<digest>`
+# ref the caller inspects for provenance/SBOM.
+index_platform_set() {
+  docker buildx imagetools inspect "$1" --raw | parse_index_platforms
+}
+
+# Given a platform-map attestation JSON (`$1`, already confirmed non-empty
+# via `is_platform_map`) and the index's own platform set (`$2`, one
+# "os/arch[/variant]" per line) and a label (`$3`, for the error message),
+# fails if the map's key set is not EXACTLY the index's platform set --
+# printing every platform missing from the map and every platform the map
+# names that the index does not have. Pure jq/comm, no docker -- so
+# --self-test can drive it with synthetic fixtures, including the exact
+# partial-map shape (an attested arm64 leg, an unattested amd64 leg) that
+# previously passed silently.
+platform_keys_match() {
+  local map_json="$1" index_platforms="$2" label="$3"
+  local map_keys missing extra
+  map_keys="$(printf '%s' "$map_json" | jq -r 'keys[]' | sort -u)"
+  missing="$(comm -23 <(printf '%s\n' "$index_platforms") <(printf '%s\n' "$map_keys"))"
+  extra="$(comm -13 <(printf '%s\n' "$index_platforms") <(printf '%s\n' "$map_keys"))"
+  if [ -n "$missing" ] || [ -n "$extra" ]; then
+    if [ -n "$missing" ]; then
+      echo "::error::${label} attestation is missing platform(s) the index carries: $(printf '%s' "$missing" | tr '\n' ' ')" >&2
+    fi
+    if [ -n "$extra" ]; then
+      echo "::error::${label} attestation names platform(s) the index does not carry: $(printf '%s' "$extra" | tr '\n' ' ')" >&2
+    fi
+    return 1
+  fi
+  return 0
+}
+
+_self_test() {
+  local failures=0
+
+  if printf '%s' '{"linux/amd64":{"a":1},"linux/arm64":{"b":2}}' | is_platform_map; then
+    echo "self-test[is-platform-map-true]: OK"
+  else
+    echo "self-test[is-platform-map-true]: FAIL" >&2
+    failures=$((failures + 1))
+  fi
+
+  if printf '%s' '{"predicateType":"x"}' | is_platform_map; then
+    echo "self-test[is-platform-map-flat-rejected]: FAIL (flat object accepted as a platform map)" >&2
+    failures=$((failures + 1))
+  else
+    echo "self-test[is-platform-map-flat-rejected]: OK"
+  fi
+
+  if printf '%s' '{}' | is_platform_map; then
+    echo "self-test[is-platform-map-empty-rejected]: FAIL" >&2
+    failures=$((failures + 1))
+  else
+    echo "self-test[is-platform-map-empty-rejected]: OK"
+  fi
+
+  if printf '%s' '{"linux/amd64":{},"linux/arm64":{"b":1}}' | is_platform_map; then
+    echo "self-test[is-platform-map-empty-value-rejected]: FAIL (a platform key with an empty value must not count as attested)" >&2
+    failures=$((failures + 1))
+  else
+    echo "self-test[is-platform-map-empty-value-rejected]: OK"
+  fi
+
+  if printf '%s' '{"predicateType":"x","y":1}' | non_empty_attestation; then
+    echo "self-test[non-empty-attestation-flat]: OK"
+  else
+    echo "self-test[non-empty-attestation-flat]: FAIL" >&2
+    failures=$((failures + 1))
+  fi
+
+  if printf '%s' '{}' | non_empty_attestation; then
+    echo "self-test[non-empty-attestation-empty-rejected]: FAIL" >&2
+    failures=$((failures + 1))
+  else
+    echo "self-test[non-empty-attestation-empty-rejected]: OK"
+  fi
+
+  # A raw index carrying two real legs and one attestation-manifest entry
+  # (synthetic "unknown/unknown" platform): the attestation-manifest entry
+  # must be excluded from the parsed platform set.
+  local raw_two_leg parsed
+  raw_two_leg='{"manifests":[
+    {"platform":{"os":"linux","architecture":"amd64"}},
+    {"platform":{"os":"linux","architecture":"arm64"}},
+    {"annotations":{"vnd.docker.reference.type":"attestation-manifest"},"platform":{"os":"unknown","architecture":"unknown"}}
+  ]}'
+  parsed="$(printf '%s' "$raw_two_leg" | parse_index_platforms)"
+  if [ "$parsed" = "$(printf 'linux/amd64\nlinux/arm64')" ]; then
+    echo "self-test[parse-index-platforms-excludes-attestation-manifest]: OK"
+  else
+    echo "self-test[parse-index-platforms-excludes-attestation-manifest]: FAIL (got: $parsed)" >&2
+    failures=$((failures + 1))
+  fi
+
+  # A variant-bearing platform (e.g. linux/arm/v7) must render with its
+  # variant suffix, not collapse to "linux/arm".
+  local raw_variant parsed_variant
+  raw_variant='{"manifests":[{"platform":{"os":"linux","architecture":"arm","variant":"v7"}}]}'
+  parsed_variant="$(printf '%s' "$raw_variant" | parse_index_platforms)"
+  if [ "$parsed_variant" = "linux/arm/v7" ]; then
+    echo "self-test[parse-index-platforms-variant]: OK"
+  else
+    echo "self-test[parse-index-platforms-variant]: FAIL (got: $parsed_variant)" >&2
+    failures=$((failures + 1))
+  fi
+
+  local index_two full_map partial_map out rc
+
+  index_two="$(printf 'linux/amd64\nlinux/arm64')"
+  full_map='{"linux/amd64":{"a":1},"linux/arm64":{"b":2}}'
+  if platform_keys_match "$full_map" "$index_two" "provenance" > /dev/null 2>&1; then
+    echo "self-test[platform-keys-match-full-coverage]: OK"
+  else
+    echo "self-test[platform-keys-match-full-coverage]: FAIL" >&2
+    failures=$((failures + 1))
+  fi
+
+  # The exact bug this closes: an attestation map covering only ONE of the
+  # index's two legs (the attested-arm64/unattested-amd64 shape a live
+  # merge produced) must fail, naming the missing platform.
+  partial_map='{"linux/arm64":{"b":2}}'
+  rc=0
+  out="$(platform_keys_match "$partial_map" "$index_two" "provenance" 2>&1)" || rc=$?
+  if [ "$rc" -eq 1 ] && printf '%s' "$out" | grep -q 'linux/amd64'; then
+    echo "self-test[platform-keys-match-partial-names-missing]: OK"
+  else
+    echo "self-test[platform-keys-match-partial-names-missing]: FAIL (rc=$rc, out=$out)" >&2
+    failures=$((failures + 1))
+  fi
+
+  # An attestation map naming a platform the index does NOT carry must also
+  # fail (strict set equality, not "index is a subset of the map").
+  local extra_map
+  extra_map='{"linux/amd64":{"a":1},"linux/arm64":{"b":2},"linux/riscv64":{"c":3}}'
+  rc=0
+  out="$(platform_keys_match "$extra_map" "$index_two" "SBOM" 2>&1)" || rc=$?
+  if [ "$rc" -eq 1 ] && printf '%s' "$out" | grep -q 'linux/riscv64'; then
+    echo "self-test[platform-keys-match-extra-names-unexpected]: OK"
+  else
+    echo "self-test[platform-keys-match-extra-names-unexpected]: FAIL (rc=$rc, out=$out)" >&2
+    failures=$((failures + 1))
+  fi
+
+  if [ "$failures" -ne 0 ]; then
+    echo "assert-image-attestations --self-test: $failures fixture(s) FAILED" >&2
+    return 1
+  fi
+  echo "assert-image-attestations --self-test: all 11 fixture(s) passed."
+  return 0
+}
+
+if [ "${1:-}" = "--self-test" ]; then
+  _self_test
+  exit $?
+fi
 
 if [ -z "${REF:-}" ]; then
   echo "::error::REF is unset -- nothing to inspect" >&2
   exit 1
 fi
-
-# `--format {{json .Provenance}}` / `{{json .SBOM}}` print the JSON literal
-# `{}` when the attestation is absent, so presence must be a shape test, not
-# a non-emptiness test on the printed string. A multi-platform attestation is
-# keyed by "os/arch" (each value itself a non-empty object); a
-# single-platform attestation is a flat non-empty object. `is_platform_map`
-# is the single source of truth for "looks like a per-platform map": it
-# fails on ANY non-object or empty-object value, so a malformed or partially
-# missing per-platform map cannot slip past as if it were a flat attestation.
-non_empty_attestation() {
-  jq -e '
-    def is_platform_map: (type == "object") and (length > 0) and
-      (to_entries | all(.value | (type == "object") and (length > 0)));
-    if is_platform_map then
-      true
-    else
-      (type == "object") and (length > 0)
-    end
-  ' >/dev/null 2>&1
-}
 
 provenance=""
 provenance_rc=0
@@ -61,16 +263,38 @@ if [ "$provenance_rc" -eq 0 ] && [ "$sbom_rc" -eq 0 ]; then
   printf '%s' "$provenance" | non_empty_attestation && provenance_ok=1
   printf '%s' "$sbom" | non_empty_attestation && sbom_ok=1
 
-  if [ "$provenance_ok" -eq 1 ] && [ "$sbom_ok" -eq 1 ]; then
+  if [ "$provenance_ok" -ne 1 ] || [ "$sbom_ok" -ne 1 ]; then
+    # Both accessors ran and answered -- a positively empty `{}` is a real
+    # finding, not an "accessor unavailable" signal, so this fails closed
+    # immediately instead of falling through to the --raw fallback below.
+    [ "$provenance_ok" -eq 1 ] || echo "::error::provenance attestation missing via imagetools .Provenance accessor for $REF" >&2
+    [ "$sbom_ok" -eq 1 ] || echo "::error::SBOM attestation missing via imagetools .SBOM accessor for $REF" >&2
+    exit 1
+  fi
+
+  # Both attestations are non-empty. If either is a per-platform map, the
+  # index's own platform set is the ground truth every such map must equal
+  # -- an attested arm64 leg beside an unattested amd64 leg is non-empty
+  # (passes the check above) but covers only half the index.
+  platform_ok=1
+  if printf '%s' "$provenance" | is_platform_map || printf '%s' "$sbom" | is_platform_map; then
+    index_platforms="$(index_platform_set "$REF")"
+    if [ -z "$index_platforms" ]; then
+      echo "::error::could not read $REF's own platform set from the raw index -- refusing to confirm per-platform attestation coverage" >&2
+      exit 1
+    fi
+    if printf '%s' "$provenance" | is_platform_map; then
+      platform_keys_match "$provenance" "$index_platforms" "provenance" || platform_ok=0
+    fi
+    if printf '%s' "$sbom" | is_platform_map; then
+      platform_keys_match "$sbom" "$index_platforms" "SBOM" || platform_ok=0
+    fi
+  fi
+
+  if [ "$platform_ok" -eq 1 ]; then
     echo "provenance and SBOM confirmed via imagetools .Provenance/.SBOM accessors for $REF"
     exit 0
   fi
-
-  # Both accessors ran and answered -- a positively empty `{}` is a real
-  # finding, not an "accessor unavailable" signal, so this fails closed
-  # immediately instead of falling through to the --raw fallback below.
-  [ "$provenance_ok" -eq 1 ] || echo "::error::provenance attestation missing via imagetools .Provenance accessor for $REF" >&2
-  [ "$sbom_ok" -eq 1 ] || echo "::error::SBOM attestation missing via imagetools .SBOM accessor for $REF" >&2
   exit 1
 fi
 

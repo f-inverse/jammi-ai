@@ -135,9 +135,11 @@ jobs:
           - runner: macos-14
             target: aarch64-apple-darwin
             artifact: wheels-native-macos-arm64
+            assert_arch: aarch64
           - runner: macos-15-intel
             target: x86_64-apple-darwin
             artifact: wheels-native-macos-x86_64
+            assert_arch: x86_64
     steps:
       - uses: actions/checkout@v4
 
@@ -163,6 +165,25 @@ jobs:
           args: --release --out dist
         env:
           RUSTC_WRAPPER: ""
+
+      # Class closure (#482): the Linux legs above assert their wheel's .so
+      # ELF machine matches matrix.arch (BLOCK 1); this leg stamped a
+      # platform tag (`macosx_*_arm64`/`macosx_*_x86_64`, maturin-derived
+      # from `matrix.target`) with nothing checking the built `.so`'s
+      # actual Mach-O machine before it shipped under that tag. Same shared
+      # `assert_elf_machine.sh` every other arch-stamping leg calls.
+      - name: Assert the wheel's .so Mach-O machine matches matrix.target
+        run: |
+          set -euo pipefail
+          wheel="$(ls dist/*.whl)"
+          workdir="$(mktemp -d)"
+          python3 -m zipfile -e "$wheel" "$workdir"
+          so="$(find "$workdir" -name '*.so' -print -quit)"
+          if [ -z "$so" ]; then
+            echo "::error::no .so found inside $wheel -- cannot assert its Mach-O machine" >&2
+            exit 1
+          fi
+          bash ../../ci/scripts/assert_elf_machine.sh "$so" ${{ matrix.assert_arch }}
 
       - uses: actions/upload-artifact@v4
         with:

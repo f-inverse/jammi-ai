@@ -474,6 +474,16 @@ jobs:
           esac
           asset="jammi-server-cu12-${version}-x86_64-unknown-linux-gnu.tar.gz"
 
+          # Class closure (#482): this tarball's own name asserts
+          # x86_64-unknown-linux-gnu; nothing checked that the just-built
+          # binary's own ELF machine actually is x86_64 before it shipped
+          # under that name. The CPU server leg above gets this for free
+          # via `package_release_bin.sh`'s S4 assert -- this leg is bespoke
+          # (CUDA lib bundling + launcher assembly) and never went through
+          # that script, so it calls the same shared `assert_elf_machine.sh`
+          # directly.
+          bash ci/scripts/assert_elf_machine.sh target/release/jammi-server x86_64
+
           stage="jammi-server-cu12"
           mkdir -p "${stage}/lib"
           strip target/release/jammi-server

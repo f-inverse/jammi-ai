@@ -61,9 +61,16 @@ _is_static_elf_dump() {
 }
 
 # The real comparison: given a newline-separated list of GLIBC_x.y version
-# strings (already extracted, no "GLIBC_" prefix) on stdin and a floor as
-# $1, returns (not exits, so --self-test can call this without killing its
-# own shell under `set -e`) 0 if every version is <= floor, 1 otherwise.
+# strings (already extracted, no "GLIBC_" prefix) on stdin, a floor as $1,
+# and (optional) the tool that produced those versions as $2, returns (not
+# exits, so --self-test can call this without killing its own shell under
+# `set -e`) 0 if every version is <= floor, 1 otherwise. `$2` defaults to a
+# generic label when omitted (every --self-test fixture below calls this
+# with a floor only, driving the comparison logic with no real tool in the
+# loop) -- the real invocation at the bottom of this file always passes its
+# own `$tool_desc`, so an operator reading a pass/fail line always sees
+# which of objdump/readelf actually produced the versions being judged,
+# never a message that is silent about which tool ran.
 #
 # Empty input is a FAILURE here, not a pass: the caller only reaches this
 # function after `_is_static_elf_dump` has already ruled out "genuinely
@@ -73,11 +80,12 @@ _is_static_elf_dump() {
 # against and must not silently wave through.
 _assert_versions() {
   local floor="$1"
+  local tool_desc="${2:-the symbol-version tool}"
   local versions
   versions="$(cat)"
 
   if [ -z "$versions" ]; then
-    echo "assert-glibc-floor: no GLIBC_x.y symbol versions extracted from a dynamically-linked binary -- cannot assert the floor (the static-binary case is ruled out separately, by 'readelf -d', before this is called)" >&2
+    echo "assert-glibc-floor: ${tool_desc} extracted no GLIBC_x.y symbol versions from a dynamically-linked binary -- cannot assert the floor (the static-binary case is ruled out separately, by 'readelf -d', before this is called)" >&2
     return 1
   fi
 
@@ -89,11 +97,11 @@ _assert_versions() {
   local winner
   winner="$(printf '%s\n%s\n' "$highest" "$floor" | sort -V | tail -1)"
   if [ "$winner" != "$floor" ]; then
-    echo "assert-glibc-floor: highest linked GLIBC version is $highest, exceeds the floor $floor" >&2
+    echo "assert-glibc-floor: highest linked GLIBC version is $highest (per ${tool_desc}), exceeds the floor $floor" >&2
     return 1
   fi
 
-  echo "assert-glibc-floor: OK -- highest linked GLIBC version $highest <= floor $floor"
+  echo "assert-glibc-floor: OK -- highest linked GLIBC version $highest (per ${tool_desc}) <= floor $floor"
   return 0
 }
 
@@ -278,4 +286,4 @@ fi
 # extracted (the binary is dynamic and the tool worked, so an empty result
 # here is unexplained, not a pass).
 versions="$(printf '%s\n' "$dump_output" | _extract_versions)"
-printf '%s\n' "$versions" | _assert_versions "$floor"
+printf '%s\n' "$versions" | _assert_versions "$floor" "$tool_desc"

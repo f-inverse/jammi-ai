@@ -20,8 +20,12 @@
 #     caller's OS) and which substring that tool prints for the expected
 #     arch (`readelf` says "X86-64"/"AArch64"; `file` says "x86_64"/"arm64"
 #     for Apple Silicon -- the two tools disagree on the AArch64 name, so
-#     the substring map is picked per tool, never a shared one). Exits 0 on
-#     a match, 1 otherwise, naming both the binary and the expected arch.
+#     the substring map is picked per tool, never a shared one). A Mach-O
+#     "universal" (fat) binary is refused outright, never substring-matched
+#     -- its description carries every bundled arch's substring at once, so
+#     a plain substring test would satisfy whichever arch was expected.
+#     Exits 0 on a match, 1 otherwise, naming both the binary and the
+#     expected arch.
 #   assert_elf_machine.sh --self-test
 #     Drives the substring-match and arch-mapping logic against synthetic
 #     tool output, no ELF tooling, no network; exits 0 iff every fixture
@@ -68,6 +72,22 @@ _match_machine() {
   esac
 }
 
+# Refuses a Mach-O "universal" (fat) binary outright. `file -b`'s single-line
+# description of a fat binary contains EVERY bundled arch's substring in one
+# string (e.g. both "x86_64" and "arm64"), so `_match_machine` above -- a
+# plain substring test -- would report a match for WHICHEVER arch the
+# caller expected, regardless of which one this leg is actually stamping. A
+# release leg promises a single-arch binary under its triple's tag; a fat
+# binary satisfies that promise for every arch at once, which is exactly the
+# "any arch via substring" gap this closes. Factored so --self-test can
+# drive it with synthetic `file -b` output, no Mach-O tooling required.
+_is_macho_universal() {
+  case "$1" in
+    *'universal binary'*) return 0 ;;
+    *) return 1 ;;
+  esac
+}
+
 _self_test() {
   local failures=0
   local rc
@@ -110,11 +130,23 @@ _self_test() {
   _macho_machine_substr "riscv64" > /dev/null 2>&1 || rc=$?
   if [ "$rc" -eq 1 ]; then echo "self-test[macho-map-unknown-arch-fails]: OK"; else echo "self-test[macho-map-unknown-arch-fails]: FAIL (rc=$rc)" >&2; failures=$((failures + 1)); fi
 
+  # The exact substring-satisfies-any-arch shape this round closes: a fat
+  # binary's `file -b` description carries every bundled arch's substring at
+  # once, so it must be flagged BEFORE any substring match is attempted --
+  # never treated as a match for whichever arch happened to be expected.
+  rc=0
+  if _is_macho_universal "Mach-O universal binary with 2 architectures: [x86_64:Mach-O 64-bit executable x86_64] [arm64:Mach-O 64-bit executable arm64]"; then rc=0; else rc=1; fi
+  if [ "$rc" -eq 0 ]; then echo "self-test[macho-universal-detected]: OK"; else echo "self-test[macho-universal-detected]: FAIL" >&2; failures=$((failures + 1)); fi
+
+  rc=0
+  if _is_macho_universal "Mach-O 64-bit executable arm64"; then rc=0; else rc=1; fi
+  if [ "$rc" -eq 1 ]; then echo "self-test[macho-single-arch-not-flagged-universal]: OK"; else echo "self-test[macho-single-arch-not-flagged-universal]: FAIL" >&2; failures=$((failures + 1)); fi
+
   if [ "$failures" -gt 0 ]; then
     echo "assert-elf-machine --self-test: $failures fixture(s) FAILED" >&2
     return 1
   fi
-  echo "assert-elf-machine --self-test: all 9 fixture(s) passed."
+  echo "assert-elf-machine --self-test: all 11 fixture(s) passed."
   return 0
 }
 
@@ -139,6 +171,10 @@ file_desc="$(file -b "$binary" 2> /dev/null || true)"
 
 case "$file_desc" in
   *Mach-O*)
+    if _is_macho_universal "$file_desc"; then
+      echo "::error::assert_elf_machine.sh: ${binary} is a Mach-O universal (fat) binary ('${file_desc}') -- refusing: a release leg must stamp a single-arch binary under arch ${expected_arch}, and a fat binary's description substring-matches every arch it bundles, not just the one being asserted" >&2
+      exit 1
+    fi
     expected_substr="$(_macho_machine_substr "$expected_arch")"
     got="$file_desc"
     tool_desc="file -b"

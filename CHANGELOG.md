@@ -377,7 +377,7 @@ workspace ships every publishable crate at the same
   `8081` (gRPC + Flight SQL) and `8080` (the HTTP side-channel) now publish
   as `127.0.0.1:8081:8081` / `127.0.0.1:8080:8080` rather than
   `0.0.0.0`-equivalent bare `8081:8081` / `8080:8080` — the deployer
-  publishes them deliberately for a TLS-terminating proxy on the same host
+  publishes them for a TLS-terminating proxy on the same host
   to reach, never for direct exposure to an untrusted network. The compose
   smoke workflow is unaffected: `tests/compose/shape_b_remote.py` already
   targets `127.0.0.1`.

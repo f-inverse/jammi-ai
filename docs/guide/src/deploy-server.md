@@ -314,7 +314,7 @@ impl TenantResolver for ProxyHeaderResolver {
 }
 ```
 
-That is the whole contract: the proxy authenticates and sets one header the
+That is the whole pattern: the proxy authenticates and sets one header the
 client cannot forge (metadata stripped from the inbound request and
 re-added by the proxy itself); the resolver trusts only its own header and
 fails closed when it is missing.

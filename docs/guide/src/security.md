@@ -73,9 +73,10 @@ them supplies them above the engine.
 
 ## Transport encryption is the deployer's runtime, not the engine's
 
-The engine speaks plaintext gRPC and Flight SQL and ships no TLS code path,
-by design, not by omission. It follows from the same primitives this page
-and the [Design Philosophy](./philosophy.md) already state:
+The engine speaks plaintext gRPC and Flight SQL and ships no TLS code
+path; transport encryption is the deployer's runtime. It follows from the
+same primitives this page and the [Design Philosophy](./philosophy.md)
+already state:
 
 - **B4 ("one binary, every topology") constrains what the *engine* forks
   on, not what fronts it.** Terminating TLS is supplied by the runtime the
@@ -94,15 +95,15 @@ and the [Design Philosophy](./philosophy.md) already state:
   engine, because the table asks a second question the discipline test does
   not — does owning this turn the engine into infrastructure it isn't. TLS
   termination answers yes.
-- **There is no silent plaintext fallback.** `ServerConfig` — what `[server]`
+- **A `[server] tls` key, in the file or the environment, is a typed
+  refusal, not a silent no-op.** `ServerConfig` — what `[server]`
   deserializes into — is a `#[serde(default, deny_unknown_fields)]` struct
   (`crates/jammi-db/src/config/mod.rs:1123`), the same discipline
   `JammiConfig` itself carries at its top level
   (`crates/jammi-db/src/config/mod.rs:204`). A `[server] tls = …` stanza in
-  a config file is not silently ignored — it is a typed `JammiError::Config`
-  startup refusal, naming the unrecognised key. There is no code path where
-  a deployer believes TLS is configured and the server quietly serves
-  plaintext.
+  a config file, and `JAMMI_SERVER__TLS` in the environment, are not
+  silently ignored — each is a typed `JammiError::Config` startup refusal,
+  naming the unrecognised key.
 - **There is no engine-side certificate to hand the `TenantResolver` seam.**
   Because termination happens outside the engine, the engine never sees a
   peer certificate to map onto a tenant — that mapping, if a deployment
@@ -146,10 +147,10 @@ health.jammi.example.com {
 
 The reference [`deploy/docker-compose.yml`](https://github.com/f-inverse/jammi-ai/blob/main/deploy/docker-compose.yml)
 binds its published ports to `127.0.0.1` for exactly this shape: the
-compose stack publishes the engine's ports deliberately, for a terminator
-running on the same host to reach, not for direct exposure to an untrusted
-network. A terminator running as a container on the same Compose network
-instead reaches the engine by its service name rather than `127.0.0.1` —
+compose stack publishes the engine's ports for a terminator running on the
+same host to reach, not for direct exposure to an untrusted network. A
+terminator running as a container on the same Compose network instead
+reaches the engine by its service name rather than `127.0.0.1` —
 `reverse_proxy h2c://jammi-server:8081` — since two containers on the same
 Compose network share that network, not the host's loopback interface.
 

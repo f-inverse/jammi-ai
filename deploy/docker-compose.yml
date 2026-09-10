@@ -32,7 +32,7 @@ services:
       JAMMI_SERVER__SERVICES: all
       JAMMI_AUDIT_MASTER_KEY: ${JAMMI_AUDIT_MASTER_KEY:?set it in .env}
     ports:
-      # Loopback-bound deliberately: the deployer publishes these for a
+      # Loopback-bound: the deployer publishes these for a
       # TLS-terminating proxy running on the same host to reach (see
       # `docs/guide/src/security.md`'s transport-encryption section), never
       # for direct exposure to an untrusted network. TLS termination is the

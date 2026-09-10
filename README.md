@@ -120,7 +120,7 @@ curl http://localhost:8080/healthz
 ```
 
 Both ports bind to `127.0.0.1`: the server performs no authentication of
-its own (see [Deploying as a container](https://f-inverse.github.io/jammi-ai/deploy-server.html#the-identity-seam)),
+its own (see [The identity seam](https://f-inverse.github.io/jammi-ai/deploy-server.html#the-identity-seam)),
 so a loopback bind keeps the unauthenticated admin surface off the host's
 public network until a terminator or reverse proxy is put in front of it.
 

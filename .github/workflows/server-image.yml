@@ -274,14 +274,6 @@ jobs:
             fi
           done
 
-          {
-            echo "previous_digests<<PREVIOUS_DIGESTS_EOF"
-            for t in "${tags[@]}"; do
-              echo "$t ${previous_digests[$t]}"
-            done
-            echo "PREVIOUS_DIGESTS_EOF"
-          } >> "$GITHUB_OUTPUT"
-
           docker buildx imagetools create "${tag_args[@]}" "${sources[@]}"
 
           # V4: re-read the IMMUTABLE `sha-<sha>` tag, not a mutable tag off
@@ -520,14 +512,6 @@ jobs:
               previous_digests["$t"]="$prev_digest"
             fi
           done
-
-          {
-            echo "previous_digests<<PREVIOUS_DIGESTS_EOF"
-            for t in "${tags[@]}"; do
-              echo "$t ${previous_digests[$t]}"
-            done
-            echo "PREVIOUS_DIGESTS_EOF"
-          } >> "$GITHUB_OUTPUT"
 
           docker buildx imagetools create "${tag_args[@]}" "${sources[@]}"
 

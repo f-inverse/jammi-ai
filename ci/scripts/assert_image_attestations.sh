@@ -146,13 +146,23 @@ platform_keys_match() {
 #   `platform_keys_match` requires the key set to be EXACTLY the index's
 #   platform set.
 #
-#   0 or 1 index platforms (a single-platform push, or a ref that isn't an
-#   index at all): the FLAT predicate object real buildx emits is
-#   required -- a non-empty object, full stop. The one thing it must NOT
-#   be is the per-platform map mistakenly applied to a single-platform
-#   index: if the attestation's own key set is exactly the index's (one
-#   entry) platform set, that IS the per-platform shape, wrongly handed to
-#   a flat single-platform image, and is rejected by name.
+#   1 index platform (a single-platform push): the FLAT predicate object
+#   real buildx emits is required -- a non-empty object, full stop. The one
+#   thing it must NOT be is the per-platform map mistakenly applied to a
+#   single-platform index: if the attestation's own key set is exactly the
+#   index's (one entry) platform set, that IS the per-platform shape,
+#   wrongly handed to a flat single-platform image, and is rejected by
+#   name.
+#
+#   0 index platforms: same flat-object requirement, reached by NOT taking
+#   the `>=2` branch above (the `[ -n "$index_platforms" ]` guard a few
+#   lines below then skips the key-set comparison, since there is no index
+#   platform set to compare against). This is fail-closed defence in
+#   depth, not reachable code: the sole call site (this script's
+#   post-accessor block) already exits at "could not read $REF's own
+#   platform set" before ever calling this function with an empty
+#   `$index_platforms`, so `platform_count` is always >= 1 here in
+#   practice.
 assert_attestation_shape() {
   local attestation="$1" index_platforms="$2" label="$3"
   local platform_count
@@ -193,11 +203,18 @@ _self_test() {
     failures=$((failures + 1))
   fi
 
+  # NOT a test of the real flat single-platform shape -- `{"SLSA":{...}}`
+  # (a real predicate object) PASSES `is_platform_map` (see
+  # `self-test[non-empty-attestation-flat]` below), which is the whole
+  # reason shape-correctness needs `assert_attestation_shape`'s separate,
+  # platform-count-driven decision. This fixture's value ("x") is a scalar,
+  # not an object, so it tests the narrower claim: a scalar-valued object is
+  # rejected by `is_platform_map`'s per-value object check.
   if printf '%s' '{"predicateType":"x"}' | is_platform_map; then
-    echo "self-test[is-platform-map-flat-rejected]: FAIL (flat object accepted as a platform map)" >&2
+    echo "self-test[is-platform-map-scalar-value-rejected]: FAIL (scalar-valued object accepted as a platform map)" >&2
     failures=$((failures + 1))
   else
-    echo "self-test[is-platform-map-flat-rejected]: OK"
+    echo "self-test[is-platform-map-scalar-value-rejected]: OK"
   fi
 
   if printf '%s' '{}' | is_platform_map; then

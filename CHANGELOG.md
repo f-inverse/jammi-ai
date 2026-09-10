@@ -678,12 +678,34 @@ workspace ships every publishable crate at the same
   is visible only to `reconcile_all`; `remove_source`'s FK-conflict classify arm and its
   `SourceBusy { table: "<created after ...>" }` placeholder are removed (the still-open
   create-between-passes race is ledgered as a new `.jammi/escapes.jsonl` row, not fixed here); the
-  orphan/`bytes_reclaimed` accounting excludes keys the expired-building pre-pass already claimed.
+  orphan/`bytes_reclaimed` accounting INCLUDES every key the expired-building pre-pass reaps (or, under
+  a dry-run, would reap) EXACTLY ONCE, at its TRUE listed size, in BOTH `apply=false` and `apply=true`
+  — the general object→row loop further down SKIPS only a key this pre-pass has already accounted
+  for, it never omits the pre-pass's own reaps from the report (an earlier revision of this fix moved
+  the pre-pass before the object listing so a key it deleted could never appear there at all, which
+  silently dropped it from every field instead of merely avoiding a double count; see the final
+  round below).
   **Disclosed and pinned separately: `reclaim_expired_training_jobs` reclaiming a `running` row with
   an ABSENT lease is deliberate, the same one-primitive rule ("absent or expired is reclaimable")
   `Owner::ExpiredLease` already documents on the result-table side — every claim path stamps a
   non-NULL lease, so a running row with no lease can never arise through this engine's own claim
   path, and restoring an `IS NOT NULL` guard would strand such a row `running` forever.**
+- **Final adversarial round on the above (#484): an expired-lease `building` row with a valid
+  Parquet AND its manifest sidecar present is PROMOTED to `ready` by the apply pre-pass — but
+  `reconcile`'s dry-run preview had no matching "would-promote" branch, so it protected nothing for
+  that row and its objects fell through to the ordinary age-gated orphan arm, over-reporting keys
+  `apply` never touches (an operator following the dry-run-then-apply recipe could be led to expect
+  bytes reclaimed that recovery itself keeps). Fixed by replacing the hand-copied dry-run mirror with
+  one `ExpiredRowOutcome { Reap, Promote, Untouched }` classification both modes branch on:
+  `apply` classifies and then performs the outcome; the dry-run classifies alone. A `Promote` row's
+  objects are referenced (protected) in BOTH modes; a `Reap` row's objects are credited in BOTH
+  modes, at the SAME key set the real deleter computes (`ResultStore::reap_candidate_keys` /
+  `delete_objects_after_cas`) — Parquet, manifest sidecar, and each segment's `Ann`-only siblings,
+  never the `Lexical` superset `referenced_result_keys` protects with; a partial delete failure
+  (`delete_objects_after_cas`, `purge_segments`) credits only the keys that actually deleted, leaving
+  a failed one for the orphan arm or a later pass to retry, rather than crediting the whole
+  candidate set on a fail-CAS hit regardless of what the delete itself did. The candidate listing is
+  now indexed once (key → size) instead of rescanned per expired row.
 - **Config phase-4 hardening: no bare-env whole-struct override without a file layer, `[models]`
   offline honored in the fine-tune worker's HF fallback, and no env value echoed into a config
   error (#483, #481).** `JammiConfig`'s hand-written `Deserialize` refused a bare `JAMMI_<X>='{

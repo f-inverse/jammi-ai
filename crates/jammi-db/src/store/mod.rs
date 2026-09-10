@@ -23,7 +23,7 @@ pub use manifest::{
 pub use reconcile::{ReconcileOptions, ReconcileReport};
 pub use result_schema::ResultTableSchemaProvider;
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::path::Path;
 use std::str::FromStr;
 use std::sync::Arc;
@@ -215,6 +215,37 @@ fn sanitize_model_id(model_id: &str) -> String {
 fn models_root(root: &StorageUrl) -> Result<StorageUrl> {
     let root_str = root.as_str().trim_end_matches('/');
     Ok(StorageUrl::parse(&format!("{root_str}/models"))?)
+}
+
+/// The three terminal-or-untouched outcomes an expired-lease `building` row
+/// can classify to. [`ResultStore::classify_expired_row`] is the ONE function
+/// that computes this — apply calls it and then performs the outcome
+/// ([`ResultStore::reconcile_expired_building_row`]); `reconcile`'s
+/// `apply=false` preview calls it ALONE and performs nothing. Before this
+/// (esc-484), the dry-run preview was a hand-maintained second copy of the
+/// branch logic (`expired_row_would_reap`) that could — and did — silently
+/// drift from what apply actually does: an expired row with a valid Parquet
+/// AND its manifest sidecar present is promoted by apply (protected, in
+/// `ready_rows`, by the time this pass's object→row arm runs) but the old
+/// dry-run mirror reported nothing special for it, so its objects fell
+/// through to the ordinary age-gated orphan arm and were over-reported as
+/// reclaimable.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum ExpiredRowOutcome {
+    /// Torn/invalid Parquet, or a valid Parquet with no manifest sidecar:
+    /// reaped to `failed`, its objects deleted (apply) or previewed as
+    /// reclaimable (dry-run) — accounted in `orphans`/`bytes_reclaimed` in
+    /// BOTH modes, and NEVER age-gated against `grace` (see
+    /// [`ReconcileReport::orphans`]'s two admission routes).
+    Reap,
+    /// A valid Parquet with its manifest sidecar present: promoted to
+    /// `ready` (apply) or previewed as such (dry-run) — its objects are
+    /// REFERENCED in both modes, never orphan candidates, regardless of
+    /// object age.
+    Promote,
+    /// The Parquet itself is absent: nothing to reap, promote, or protect —
+    /// only the `building -> failed` CAS runs (apply).
+    Untouched,
 }
 
 impl ResultStore {
@@ -778,152 +809,159 @@ impl ResultStore {
     /// [`crate::catalog::result_repo::ResultTableCas::expired`] renders the
     /// matching tenant arm either way.
     ///
-    /// Returns `true` iff this row's objects were actually deleted (the
-    /// fail-CAS + delete arm ran and its CAS hit) — `false` for every other
-    /// outcome (promoted to `ready`, the claim/CAS was lost to a concurrent
-    /// recoverer, or there were no bytes to reap at all). `reconcile`'s
-    /// pre-pass uses this to decide whether THIS row's candidate objects
-    /// belong in `orphans`/`bytes_reclaimed`; [`Self::recover_inner`]
-    /// ignores it (a background sweep has no report to account into).
-    async fn reconcile_expired_building_row(&self, table: ResultTableRecord) -> Result<bool> {
-        let tenant = parse_owner(&table)?;
-        let cas = ResultTableCas::expired(&table.table_name, tenant);
-        let parquet_url = StorageUrl::parse(&table.parquet_path)?;
-        let parquet_handle = self.open_parquet(&parquet_url)?;
-        let parquet_path = parquet_handle.data_path()?;
-        let parquet_exists = parquet_handle.exists(&parquet_path).await?;
-        let parquet_valid =
-            parquet_exists && storage::reader::is_valid_parquet(&parquet_handle).await?;
-
-        if !parquet_exists {
-            warn!(
-                table = table.table_name,
-                "Recovery: Parquet missing, marking failed"
-            );
-            // No bytes to reap: the CAS is the whole arm. A miss means the
-            // writer renewed or a peer recoverer got here first — skip.
-            if let Err(e) = self.catalog.fail_building_table(&cas).await {
-                if !is_cas_miss(&e) {
-                    return Err(e);
-                }
-                warn!(table = table.table_name, outcome = %e, "Recovery: row moved on; skipped");
-            }
-            Ok(false)
-        } else if !parquet_valid {
-            warn!(
-                table = table.table_name,
-                "Recovery: invalid Parquet, marking failed and deleting"
-            );
-            self.reap_after_fail_cas(&cas, &parquet_url).await
-        } else if let Some(manifest) = self.read_materialization_manifest(&parquet_url).await? {
-            // The manifest sidecar is present (written before the flip), so
-            // its summary columns can be backfilled as part of the same
-            // promotion the live path performs. Claim the row FIRST — the
-            // recoverer becomes the writer, heartbeating a fresh lease —
-            // then rebuild and promote under that ownership. This whole arm
-            // either promotes the row to `ready` or abandons the claim —
-            // it never deletes this row's own objects, so it always returns
-            // `false` (nothing for a reconcile pass to add to `orphans`).
-            let Some(recovered) = self.claim_expired(&cas, &table, tenant).await? else {
-                warn!(table = table.table_name, "Recovery: claim lost; skipped");
-                return Ok(false);
-            };
-            let row_count = storage::reader::count_parquet_rows(&parquet_handle).await?;
-            // Rebuild the ANN index as a fresh single segment if this is an
-            // embedding table (self-healing even if its segment set never
-            // landed, or landed torn). Renew before the destructive purge;
-            // a renew miss abandons this arm silently (no deletion).
-            if table.task.is_embedding() {
-                let renew = self
-                    .catalog
-                    .renew_lease(&recovered.cas(), self.lease.lease())
-                    .await;
-                if let Err(e) = renew {
-                    if !is_cas_miss(&e) {
-                        return Err(e);
-                    }
-                    warn!(table = table.table_name, outcome = %e, "Recovery: claim lost before rebuild; skipped");
-                    recovered.abandon();
-                    return Ok(false);
-                }
-                if let Err(e) = self
-                    .rebuild_index_from_parquet(&recovered, &parquet_handle, &table)
-                    .await
-                {
-                    if is_cas_miss(&e) {
-                        warn!(table = table.table_name, outcome = %e, "Recovery: claim lost during rebuild; skipped");
-                        recovered.abandon();
-                        return Ok(false);
-                    }
-                    warn!(
-                        table = table.table_name,
-                        error = %e,
-                        "Recovery: failed to rebuild index, proceeding without"
-                    );
-                }
-            }
-            let anchors_json = serde_json::to_string(&manifest.input_anchors)
-                .map_err(|e| JammiError::Other(format!("serialise input anchors: {e}")))?;
-            let promoted = self
-                .catalog
-                .promote_result_table_with_manifest(
-                    &recovered.cas(),
-                    row_count,
-                    manifest.definition_hash.as_str(),
-                    &anchors_json,
-                )
-                .await;
-            // The row is terminal (or lost) under this recoverer either
-            // way: detach the handle so Drop marks nothing.
-            recovered.abandon();
-            match promoted {
-                Ok(_) => {}
-                Err(e) if is_cas_miss(&e) => {
-                    warn!(table = table.table_name, outcome = %e, "Recovery: promote superseded; skipped");
-                }
-                Err(e) => return Err(e),
-            }
-            Ok(false)
-        } else {
-            // Valid Parquet but NO manifest sidecar: the write was torn in
-            // the window between the Parquet landing and the manifest being
-            // written (before the `building -> ready` flip). The contract
-            // forbids promoting a table without an attestation, and the
-            // producing descriptor cannot be reconstructed here — so this
-            // row is reaped to `failed`, not promoted manifest-less.
-            warn!(
-                table = table.table_name,
-                "Recovery: valid Parquet but no materialization manifest \
-                 (torn write before manifest); marking failed and deleting"
-            );
-            self.reap_after_fail_cas(&cas, &parquet_url).await
-        }
-    }
-
-    /// Read-only mirror of [`Self::reconcile_expired_building_row`]'s
-    /// branch decision, for `reconcile`'s `apply=false` preview: performs the
-    /// IDENTICAL existence/validity/manifest-presence checks, claims and
-    /// deletes nothing, and returns whether the row WOULD be reaped (the
-    /// `!parquet_valid` or "valid Parquet, no manifest" branch) as opposed to
-    /// promoted (manifest present) or left with nothing to reap (Parquet
-    /// missing outright). A dry-run cannot predict a concurrent claim race,
-    /// so this reports what would happen ABSENT interference — the same
-    /// caveat every other preview in this pass carries.
-    async fn expired_row_would_reap(&self, table: &ResultTableRecord) -> Result<bool> {
+    /// The read-only classification [`ExpiredRowOutcome`] documents: performs
+    /// the existence/validity/manifest-presence checks against the object
+    /// store and claims or deletes NOTHING. The single source of truth both
+    /// [`Self::reconcile_expired_building_row`] (apply) and `reconcile`'s
+    /// dry-run preview branch on. A dry-run cannot predict a concurrent claim
+    /// race, so this reports what would happen ABSENT interference — the
+    /// same caveat every other preview in `reconcile` carries.
+    async fn classify_expired_row(&self, table: &ResultTableRecord) -> Result<ExpiredRowOutcome> {
         let parquet_url = StorageUrl::parse(&table.parquet_path)?;
         let parquet_handle = self.open_parquet(&parquet_url)?;
         let parquet_path = parquet_handle.data_path()?;
         if !parquet_handle.exists(&parquet_path).await? {
-            // Fail-only arm: no bytes to reap.
-            return Ok(false);
+            return Ok(ExpiredRowOutcome::Untouched);
         }
         if !storage::reader::is_valid_parquet(&parquet_handle).await? {
-            return Ok(true);
+            return Ok(ExpiredRowOutcome::Reap);
         }
-        Ok(self
-            .read_materialization_manifest(&parquet_url)
-            .await?
-            .is_none())
+        Ok(
+            if self
+                .read_materialization_manifest(&parquet_url)
+                .await?
+                .is_some()
+            {
+                ExpiredRowOutcome::Promote
+            } else {
+                ExpiredRowOutcome::Reap
+            },
+        )
+    }
+
+    /// Returns the root-relative keys this row's objects were ACTUALLY
+    /// deleted under (empty for [`ExpiredRowOutcome::Promote`] and
+    /// [`ExpiredRowOutcome::Untouched`], and for a [`ExpiredRowOutcome::Reap`]
+    /// whose delete partially or wholly failed — see
+    /// [`Self::delete_objects_after_cas`]). `reconcile`'s pre-pass unions this
+    /// directly into its `orphans`/`bytes_reclaimed` accounting;
+    /// [`Self::recover_inner`] ignores it (a background sweep has no report
+    /// to account into).
+    async fn reconcile_expired_building_row(
+        &self,
+        table: ResultTableRecord,
+    ) -> Result<BTreeSet<String>> {
+        let tenant = parse_owner(&table)?;
+        let cas = ResultTableCas::expired(&table.table_name, tenant);
+        let parquet_url = StorageUrl::parse(&table.parquet_path)?;
+
+        match self.classify_expired_row(&table).await? {
+            ExpiredRowOutcome::Untouched => {
+                warn!(
+                    table = table.table_name,
+                    "Recovery: Parquet missing, marking failed"
+                );
+                // No bytes to reap: the CAS is the whole arm. A miss means
+                // the writer renewed or a peer recoverer got here first —
+                // skip.
+                if let Err(e) = self.catalog.fail_building_table(&cas).await {
+                    if !is_cas_miss(&e) {
+                        return Err(e);
+                    }
+                    warn!(table = table.table_name, outcome = %e, "Recovery: row moved on; skipped");
+                }
+                Ok(BTreeSet::new())
+            }
+            ExpiredRowOutcome::Reap => {
+                warn!(
+                    table = table.table_name,
+                    "Recovery: torn or invalid building row, marking failed and deleting"
+                );
+                self.reap_after_fail_cas(&cas, &parquet_url).await
+            }
+            ExpiredRowOutcome::Promote => {
+                let parquet_handle = self.open_parquet(&parquet_url)?;
+                // The manifest sidecar is present (written before the flip),
+                // so its summary columns can be backfilled as part of the
+                // same promotion the live path performs. Claim the row FIRST
+                // — the recoverer becomes the writer, heartbeating a fresh
+                // lease — then rebuild and promote under that ownership.
+                // This whole arm either promotes the row to `ready` or
+                // abandons the claim — it never deletes this row's own
+                // objects, so it always returns an empty set (nothing for a
+                // reconcile pass to add to `orphans`).
+                let manifest = self
+                    .read_materialization_manifest(&parquet_url)
+                    .await?
+                    .ok_or_else(|| {
+                        JammiError::Other(format!(
+                            "recover: '{}' classified Promote but its manifest sidecar vanished",
+                            table.table_name
+                        ))
+                    })?;
+                let Some(recovered) = self.claim_expired(&cas, &table, tenant).await? else {
+                    warn!(table = table.table_name, "Recovery: claim lost; skipped");
+                    return Ok(BTreeSet::new());
+                };
+                let row_count = storage::reader::count_parquet_rows(&parquet_handle).await?;
+                // Rebuild the ANN index as a fresh single segment if this is
+                // an embedding table (self-healing even if its segment set
+                // never landed, or landed torn). Renew before the
+                // destructive purge; a renew miss abandons this arm silently
+                // (no deletion).
+                if table.task.is_embedding() {
+                    let renew = self
+                        .catalog
+                        .renew_lease(&recovered.cas(), self.lease.lease())
+                        .await;
+                    if let Err(e) = renew {
+                        if !is_cas_miss(&e) {
+                            return Err(e);
+                        }
+                        warn!(table = table.table_name, outcome = %e, "Recovery: claim lost before rebuild; skipped");
+                        recovered.abandon();
+                        return Ok(BTreeSet::new());
+                    }
+                    if let Err(e) = self
+                        .rebuild_index_from_parquet(&recovered, &parquet_handle, &table)
+                        .await
+                    {
+                        if is_cas_miss(&e) {
+                            warn!(table = table.table_name, outcome = %e, "Recovery: claim lost during rebuild; skipped");
+                            recovered.abandon();
+                            return Ok(BTreeSet::new());
+                        }
+                        warn!(
+                            table = table.table_name,
+                            error = %e,
+                            "Recovery: failed to rebuild index, proceeding without"
+                        );
+                    }
+                }
+                let anchors_json = serde_json::to_string(&manifest.input_anchors)
+                    .map_err(|e| JammiError::Other(format!("serialise input anchors: {e}")))?;
+                let promoted = self
+                    .catalog
+                    .promote_result_table_with_manifest(
+                        &recovered.cas(),
+                        row_count,
+                        manifest.definition_hash.as_str(),
+                        &anchors_json,
+                    )
+                    .await;
+                // The row is terminal (or lost) under this recoverer either
+                // way: detach the handle so Drop marks nothing.
+                recovered.abandon();
+                match promoted {
+                    Ok(_) => {}
+                    Err(e) if is_cas_miss(&e) => {
+                        warn!(table = table.table_name, outcome = %e, "Recovery: promote superseded; skipped");
+                    }
+                    Err(e) => return Err(e),
+                }
+                Ok(BTreeSet::new())
+            }
+        }
     }
 
     /// Claim the expired-lease row `cas` names for this store's writer and
@@ -970,33 +1008,37 @@ impl ResultStore {
     /// The reaper's fail arm: the `building -> failed` CAS under `cas` FIRST,
     /// then — only if it affected exactly one row — the row's objects are
     /// deleted. A CAS miss (the writer renewed, or a peer got here first)
-    /// deletes nothing and is skipped, returning `false`. Returns `true` iff
-    /// the CAS hit (an attempt to delete the row's objects was made — a
-    /// per-object delete failure is logged, never swallowed into `false`:
-    /// reconcile reaps the object later, but this row's own bytes are
-    /// considered reaped for THIS pass's report either way, since the fail
-    /// CAS — the irreversible half of this arm — did commit).
+    /// deletes nothing and returns an empty set. Otherwise returns EXACTLY
+    /// the root-relative keys [`Self::delete_objects_after_cas`] actually
+    /// deleted — a key whose delete failed is left OUT (logged, never
+    /// swallowed into a false credit): `reconcile`'s pre-pass unions only
+    /// this returned set into `bytes_reclaimed`, so a partial failure here
+    /// never over-reports what this pass reclaimed; the un-deleted key falls
+    /// to the ordinary orphan arm (or a later reconcile pass) to retry.
     async fn reap_after_fail_cas(
         &self,
         cas: &ResultTableCas,
         parquet_url: &StorageUrl,
-    ) -> Result<bool> {
+    ) -> Result<BTreeSet<String>> {
         match self.catalog.fail_building_table(cas).await {
             Ok(()) => {}
             Err(e) if is_cas_miss(&e) => {
                 warn!(table = cas.table, outcome = %e, "Recovery: row moved on; nothing deleted");
-                return Ok(false);
+                return Ok(BTreeSet::new());
             }
             Err(e) => return Err(e),
         }
-        if let Err(e) = self.delete_objects_after_cas(parquet_url, cas).await {
-            warn!(
-                table = cas.table,
-                error = %e,
-                "Recovery: object delete after the fail CAS did not complete; reconcile reaps it"
-            );
+        match self.delete_objects_after_cas(parquet_url, cas).await {
+            Ok(deleted) => Ok(deleted),
+            Err(e) => {
+                warn!(
+                    table = cas.table,
+                    error = %e,
+                    "Recovery: object delete after the fail CAS did not complete; reconcile reaps it"
+                );
+                Ok(BTreeSet::new())
+            }
         }
-        Ok(true)
     }
 
     /// Reconcile already-`ready` result tables against the materialization
@@ -1295,14 +1337,47 @@ impl ResultStore {
     /// `result_tables` row is deleted (the `ON DELETE CASCADE` on
     /// `index_segments` would otherwise reap the rows first and hide the
     /// bundle URLs).
-    async fn purge_segments(&self, cas: &ResultTableCas) -> Result<()> {
+    ///
+    /// Deletes `SidecarKind::Ann` siblings ONLY — a `Lexical` `.tantivy`
+    /// directory beside a segment (if one ever exists) is never touched here
+    /// (index segments this store appends are ANN-only; see
+    /// [`Self::append_segment`]). Returns the root-relative keys actually
+    /// deleted, per extension, tried independently of one another so a
+    /// single failed delete never hides whether its siblings succeeded — the
+    /// exact set `reconcile`'s accounting must credit, never a superset.
+    async fn purge_segments(&self, cas: &ResultTableCas) -> Result<BTreeSet<String>> {
+        let mut deleted = BTreeSet::new();
         for seg in self.catalog.list_index_segments(&cas.table).await? {
-            let url = StorageUrl::parse(&seg.index_path)?;
-            let handle = self.open_index(&url)?;
-            storage::sidecar_layout::delete_sidecar(&handle, SidecarKind::Ann).await?;
+            let Ok(url) = StorageUrl::parse(&seg.index_path) else {
+                continue;
+            };
+            let Ok(handle) = self.open_index(&url) else {
+                continue;
+            };
+            for ext in storage::sidecar_layout::sidecar_extensions(SidecarKind::Ann) {
+                let Ok(path) = handle.sibling_path(ext) else {
+                    continue;
+                };
+                match handle.delete_if_exists(&path).await {
+                    Ok(()) => {
+                        if let Ok(sib) = layout::sidecar_url(&url, ext) {
+                            if let Some(rel) = reconcile::relative_to(&self.root, &sib) {
+                                deleted.insert(rel);
+                            }
+                        }
+                    }
+                    Err(e) => warn!(
+                        table = cas.table,
+                        segment = seg.segment_id,
+                        extension = ext,
+                        error = %e,
+                        "purge_segments: sidecar delete failed; left for reconcile to retry"
+                    ),
+                }
+            }
         }
         self.catalog.delete_index_segments(cas).await?;
-        Ok(())
+        Ok(deleted)
     }
 
     /// Delete a result table's objects — the Parquet, its
@@ -1311,18 +1386,91 @@ impl ResultStore {
     /// half every deletion arm shares (`abort()`, recovery's claim/fail CAS,
     /// `reconcile(apply=true)`): the caller has ALREADY performed the
     /// one-row CAS that licenses this deletion. 404 is not an error.
+    ///
+    /// Returns EXACTLY the root-relative keys actually deleted — never a key
+    /// whose `delete_if_exists` errored. Each of the three deletions (Parquet,
+    /// manifest sidecar, segment set) is attempted independently, so one
+    /// failure never suppresses an attempt at the others; `reconcile`'s
+    /// pre-pass accounting credits only what this function reports here,
+    /// which is why the accounting set can never exceed the deletion set.
     pub(crate) async fn delete_objects_after_cas(
         &self,
         parquet_url: &StorageUrl,
         cas: &ResultTableCas,
-    ) -> Result<()> {
+    ) -> Result<BTreeSet<String>> {
+        let mut deleted = BTreeSet::new();
         let parquet_handle = self.open_parquet(parquet_url)?;
         let path = parquet_handle.data_path()?;
-        parquet_handle.delete_if_exists(&path).await?;
+        match parquet_handle.delete_if_exists(&path).await {
+            Ok(()) => {
+                if let Some(rel) = reconcile::relative_to(&self.root, parquet_url) {
+                    deleted.insert(rel);
+                }
+            }
+            Err(e) => warn!(
+                table = cas.table,
+                error = %e,
+                "delete_objects_after_cas: Parquet delete failed; left for reconcile to retry"
+            ),
+        }
         let sidecar = materialization_sidecar_path(&parquet_handle)?;
-        parquet_handle.delete_if_exists(&sidecar).await?;
-        self.purge_segments(cas).await?;
-        Ok(())
+        match parquet_handle.delete_if_exists(&sidecar).await {
+            Ok(()) => {
+                if let Ok(sidecar_url) = layout::sidecar_url(parquet_url, "materialization.json") {
+                    if let Some(rel) = reconcile::relative_to(&self.root, &sidecar_url) {
+                        deleted.insert(rel);
+                    }
+                }
+            }
+            Err(e) => warn!(
+                table = cas.table,
+                error = %e,
+                "delete_objects_after_cas: manifest sidecar delete failed; left for reconcile to retry"
+            ),
+        }
+        deleted.extend(self.purge_segments(cas).await?);
+        Ok(deleted)
+    }
+
+    /// The dry-run twin of [`Self::delete_objects_after_cas`] (via
+    /// [`Self::purge_segments`]): the exact root-relative key set that
+    /// function deletes for `table_name`'s Parquet at `parquet_url` — the
+    /// Parquet itself, its `.materialization.json` sidecar, and every CURRENT
+    /// `index_segments` row's ANN-ONLY sidecar siblings (never `Lexical` —
+    /// see [`Self::purge_segments`]). Derived through the SAME building
+    /// blocks the actual deleter uses (`layout::sidecar_url`,
+    /// [`crate::storage::sidecar_layout::sidecar_extensions`] at
+    /// `SidecarKind::Ann`, [`crate::store::reconcile::relative_to`]) — never
+    /// its own hand-copied enumeration — so `reconcile`'s dry-run preview can
+    /// never name a key the real deleter would not also delete (or vice
+    /// versa): the "accounting set == deletion set" invariant.
+    pub(crate) async fn reap_candidate_keys(
+        &self,
+        parquet_url: &StorageUrl,
+        table_name: &str,
+    ) -> Result<BTreeSet<String>> {
+        let mut keys = BTreeSet::new();
+        if let Some(rel) = reconcile::relative_to(&self.root, parquet_url) {
+            keys.insert(rel);
+        }
+        if let Ok(sidecar_url) = layout::sidecar_url(parquet_url, "materialization.json") {
+            if let Some(rel) = reconcile::relative_to(&self.root, &sidecar_url) {
+                keys.insert(rel);
+            }
+        }
+        for seg in self.catalog.list_index_segments(table_name).await? {
+            let Ok(seg_url) = StorageUrl::parse(&seg.index_path) else {
+                continue;
+            };
+            for ext in storage::sidecar_layout::sidecar_extensions(SidecarKind::Ann) {
+                if let Ok(sib) = layout::sidecar_url(&seg_url, ext) {
+                    if let Some(rel) = reconcile::relative_to(&self.root, &sib) {
+                        keys.insert(rel);
+                    }
+                }
+            }
+        }
+        Ok(keys)
     }
 
     /// Rebuild a table's whole ANN index from its Parquet as a single fresh

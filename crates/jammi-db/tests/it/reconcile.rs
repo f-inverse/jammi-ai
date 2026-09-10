@@ -219,6 +219,55 @@ async fn torn_building_row_fixture(
     (table_name, parquet_local)
 }
 
+/// Same construction as [`torn_building_row_fixture`] — an expired-lease
+/// `building` row with a valid Parquet and no manifest sidecar — but WITHOUT
+/// backdating: the bytes are as fresh as `Utc::now()`, well inside any
+/// `grace` this suite uses. Isolates the pre-pass's CAS-licensed reap (never
+/// age-gated) from the general object→row arm's `grace` age-gate: a torn row
+/// this young must still be an orphan candidate, never `pending`, because the
+/// pre-pass consults the row's expired LEASE, never the object's age.
+async fn torn_building_row_fixture_young(
+    store: &ResultStore,
+    catalog: &Catalog,
+    source_id: &str,
+) -> (String, String) {
+    let info = create_building_embedding_with_parquet(store, source_id, 5).await;
+    let parquet_local = info
+        .parquet_url()
+        .as_str()
+        .trim_start_matches("file://")
+        .to_string();
+    let table_name = jammi_test_utils::abandon_building(catalog, info).await;
+    (table_name, parquet_local)
+}
+
+/// Build an expired-lease `building` row with a valid, closed Parquet AND its
+/// `.materialization.json` manifest sidecar already on disk — the exact
+/// PROMOTE state [`ResultStore::recover`]'s expired-building arm claims and
+/// promotes to `ready` (never reaps). Backdated past grace so the ONLY reason
+/// its objects are absent from `orphans` is the pre-pass's `Promote`
+/// classification protecting them, never merely a fresh-object age-gate pass
+/// (which a non-backdated fixture would satisfy trivially, masking the very
+/// bug this state exists to catch). Returns the table name and the Parquet's
+/// local filesystem path.
+async fn promotable_building_row_fixture(
+    store: &ResultStore,
+    catalog: &Catalog,
+    source_id: &str,
+) -> (String, String) {
+    let info = create_building_embedding_with_parquet(store, source_id, 5).await;
+    jammi_test_utils::write_manifest_sidecar_for(store, info.parquet_url(), source_id, DIMS).await;
+    let parquet_local = info
+        .parquet_url()
+        .as_str()
+        .trim_start_matches("file://")
+        .to_string();
+    let table_name = jammi_test_utils::abandon_building(catalog, info).await;
+    let table_dir = std::path::Path::new(&parquet_local).parent().unwrap();
+    backdate_dir(table_dir, Duration::from_secs(3600));
+    (table_name, parquet_local)
+}
+
 #[tokio::test]
 async fn pre_pass_deleted_table_is_not_double_counted() {
     let dir = tempdir().unwrap();
@@ -361,6 +410,35 @@ async fn dry_run_previews_exactly_what_apply_reclaims() {
     std::fs::write(root.join("pre_layout.parquet"), b"stray-pre-layout").unwrap();
     backdate_dir(&root, Duration::from_secs(3600));
 
+    // (5) An expired-lease `building` row with a valid Parquet AND its
+    // manifest sidecar present — the PROMOTE state. Never reaped in EITHER
+    // mode: recovery promotes it (apply); dry-run previews the same
+    // classification and protects its objects. Backdated past grace, so the
+    // fix under test — not a coincidental age match — is what keeps it out
+    // of `orphans`.
+    let (promote_table, promote_parquet) =
+        promotable_building_row_fixture(&store, &catalog, "docs-promote").await;
+    let promote_key = std::path::Path::new(&promote_parquet)
+        .file_name()
+        .unwrap()
+        .to_str()
+        .unwrap()
+        .to_string();
+
+    // (6) A torn `building` row (valid Parquet, no manifest) whose LEASE has
+    // expired but whose bytes are YOUNGER than `grace` — the pre-pass's
+    // CAS-licensed reap ignores object age entirely (only the general
+    // object→row arm below consults `grace`), so this key must be an orphan
+    // (never `pending`) in both modes.
+    let (_young_torn_table, young_torn_parquet) =
+        torn_building_row_fixture_young(&store, &catalog, "docs-young-torn").await;
+    let young_torn_key = std::path::Path::new(&young_torn_parquet)
+        .file_name()
+        .unwrap()
+        .to_str()
+        .unwrap()
+        .to_string();
+
     // Dry-run FIRST — mutates nothing.
     let dry = store
         .reconcile_all(ReconcileOptions {
@@ -386,9 +464,36 @@ async fn dry_run_previews_exactly_what_apply_reclaims() {
         "{dry:?}"
     );
 
+    // The promote state: RED-first against be106f0c — before this fix, a
+    // dry-run's pre-pass reported nothing special for a would-be-promoted
+    // row (no protection), so its backdated Parquet fell through to the
+    // ordinary age-gated orphan arm and was reported here. The honest
+    // oracle: it must never appear, in either list.
+    assert!(
+        !dry.orphans.iter().any(|o| o.ends_with(&promote_key)),
+        "a would-be-promoted row's Parquet must never be previewed as an orphan: {dry:?}"
+    );
+    assert!(
+        !dry.pending.iter().any(|o| o.ends_with(&promote_key)),
+        "a would-be-promoted row's Parquet must never be previewed as pending either: {dry:?}"
+    );
+    // The young-torn state: the pre-pass's CAS-licensed reap has no age
+    // gate, so this key must be an orphan (never merely `pending`) even
+    // though its bytes are fresher than `grace`.
+    assert!(
+        dry.orphans.iter().any(|o| o.ends_with(&young_torn_key)),
+        "a CAS-licensed reap must report its key regardless of object age: {dry:?}"
+    );
+    assert!(
+        !dry.pending.iter().any(|o| o.ends_with(&young_torn_key)),
+        "the young torn row's key must never be `pending` — the pre-pass has no age gate: {dry:?}"
+    );
+
     // Nothing was actually touched by the dry-run.
     assert!(std::path::Path::new(&torn_parquet).exists());
     assert!(std::path::Path::new(&mm_parquet_local).exists());
+    assert!(std::path::Path::new(&promote_parquet).exists());
+    assert!(std::path::Path::new(&young_torn_parquet).exists());
     assert!(root.join("pre_layout.parquet").exists());
     let healthy_still_ready = store
         .catalog()
@@ -461,6 +566,39 @@ async fn dry_run_previews_exactly_what_apply_reclaims() {
     assert_eq!(
         healthy_after.status,
         jammi_db::catalog::status::ResultTableStatus::Ready.to_string()
+    );
+
+    // The promote state: apply actually promoted the row (never reaped it),
+    // and its Parquet — never deleted — is still on disk.
+    let promote_after = store
+        .catalog()
+        .get_result_table(&promote_table)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        promote_after.status,
+        jammi_db::catalog::status::ResultTableStatus::Ready.to_string(),
+        "recovery must promote a valid Parquet with its manifest present, not fail it"
+    );
+    assert!(
+        std::path::Path::new(&promote_parquet).exists(),
+        "a promoted row's Parquet must survive apply"
+    );
+    assert!(
+        !apply.orphans.iter().any(|o| o.ends_with(&promote_key)),
+        "apply must never report a promoted row's Parquet as an orphan: {apply:?}"
+    );
+
+    // The young-torn state: apply actually reaped it (its lease was expired,
+    // regardless of its bytes' age).
+    assert!(
+        !std::path::Path::new(&young_torn_parquet).exists(),
+        "apply must reap an expired-lease torn row regardless of its object age"
+    );
+    assert!(
+        apply.orphans.iter().any(|o| o.ends_with(&young_torn_key)),
+        "apply must report the young torn row's key as reclaimed: {apply:?}"
     );
 }
 

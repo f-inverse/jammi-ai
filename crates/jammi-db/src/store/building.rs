@@ -297,6 +297,7 @@ impl BuildingTable {
         self.store
             .delete_objects_after_cas(&self.parquet_url, &cas)
             .await
+            .map(|_deleted_keys| ())
     }
 
     /// Detach the handle from its row with no catalog transition — the state

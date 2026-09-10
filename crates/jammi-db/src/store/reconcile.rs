@@ -38,7 +38,7 @@
 //! the SAME objects and sizes `apply=true` would reclaim (see
 //! [`ReconcileOptions::apply`]'s pinned dry-run/apply parity invariant).
 
-use std::collections::BTreeSet;
+use std::collections::{BTreeSet, HashMap};
 use std::str::FromStr;
 use std::time::Duration;
 
@@ -54,7 +54,7 @@ use crate::storage::sidecar_layout::{
 };
 use crate::storage::StorageUrl;
 use crate::store::layout::{self, TenantSegment};
-use crate::store::ResultStore;
+use crate::store::{ExpiredRowOutcome, ResultStore};
 use crate::tenant_scope::TenantBinding;
 
 /// One reconciliation pass's parameters.
@@ -64,6 +64,17 @@ pub struct ReconcileOptions {
     /// incomplete `ready` row to `failed`); `false` (the default a caller
     /// should reach for first) reports everything a pass WOULD do without
     /// mutating anything.
+    ///
+    /// **Precondition: `grace >= ` this store's configured lease duration.**
+    /// `apply=true` REFUSES below it ([`ResultStore::reconcile`]'s
+    /// `check_apply_grace`, called unconditionally by every mode this store
+    /// exposes) — a reclaim window shorter than a live writer's lease may
+    /// legitimately run under would race a healthy in-progress
+    /// materialization. `apply=false` merely PREVIEWS under whatever `grace`
+    /// the caller passed, including one below the floor: a dry-run mutates
+    /// nothing, so a too-short `grace` is not yet the hazard it becomes the
+    /// moment `apply=true` would act on it — but the invariant below still
+    /// holds at whatever `grace` both calls share, refused or not.
     ///
     /// **Pinned invariant**: for the same catalog+object-store state and the
     /// same [`ReconcileOptions::grace`], `apply=false` and `apply=true`
@@ -125,7 +136,24 @@ pub struct ReconcileReport {
     /// The true count of rows flipped `ready -> failed` this pass,
     /// independent of whether [`Self::rows_failed`] was truncated.
     pub rows_failed_count: u64,
-    /// Orphan candidates at least `grace` old — deleted when `applied`.
+    /// Every key this pass reclaims (or, under a dry-run, would reclaim),
+    /// admitted through ONE of TWO independent routes:
+    ///
+    /// - **Age-gated candidates**: an unreferenced listed object whose
+    ///   `last_modified` is at least `grace` old (the ordinary object→row
+    ///   arm, further down this pass).
+    /// - **CAS-licensed reaps**: an expired-lease `building` row's objects,
+    ///   admitted by `ExpiredRowOutcome::Reap` — the pre-pass's claim-then-
+    ///   fail-CAS licenses the reap regardless of the object's own age; a
+    ///   torn row's bytes freshly written a second ago are just as reapable
+    ///   as one a week stale, because the lease (not the object's mtime) is
+    ///   what proves the writer is gone. See [`ResultStore::reconcile`]'s
+    ///   `check_apply_grace`, which is why `apply=true` still requires
+    ///   `grace >= ` the configured lease duration even though this second
+    ///   route never consults `grace` itself: the floor bounds how long a
+    ///   HEALTHY writer's lease may run, not how this route ages its
+    ///   candidates.
+    ///
     /// Capped at [`REPORT_LIST_CAP`]; see [`Self::orphan_count`].
     pub orphans: Vec<String>,
     /// The true count of orphan candidates found this pass, independent of
@@ -185,6 +213,41 @@ fn push_capped(list: &mut Vec<String>, count: &mut u64, truncated: &mut bool, ke
     }
 }
 
+/// Credit exactly the keys in `keys` that are present in `listed_sizes` (the
+/// listing snapshot taken before this pass touched anything) into `reaped`
+/// and `orphans`/`bytes_reclaimed` — the ONE place the expired-building
+/// pre-pass grows those fields, in EITHER mode.
+///
+/// A key `reaped` already contains (credited by an earlier iteration of the
+/// pre-pass loop, or already present in `keys` itself — a `BTreeSet` cannot
+/// duplicate, but a defensive re-check costs nothing) is skipped: a key can
+/// never be double-counted. A key ABSENT from `keys` — because
+/// [`ResultStore::delete_objects_after_cas`] (apply) or
+/// [`ResultStore::reap_candidate_keys`] (dry-run) never named it, most
+/// commonly because ITS OWN delete failed — is never credited here: this is
+/// the "accounting set == deletion set" invariant made concrete. A key
+/// present in `keys` but absent from `listed_sizes` (never actually on disk
+/// at listing time) is silently skipped too, never credited a phantom size.
+fn credit_reaped(
+    keys: BTreeSet<String>,
+    listed_sizes: &HashMap<&str, u64>,
+    reaped: &mut BTreeSet<String>,
+    orphans: &mut Vec<String>,
+    orphan_count: &mut u64,
+    truncated: &mut bool,
+    bytes_reclaimed: &mut u64,
+) {
+    for key in keys {
+        let Some(&size) = listed_sizes.get(key.as_str()) else {
+            continue;
+        };
+        if reaped.insert(key.clone()) {
+            push_capped(orphans, orphan_count, truncated, key);
+            *bytes_reclaimed += size;
+        }
+    }
+}
+
 /// One listed object, in the coordinates every comparison in this module
 /// uses: its key RELATIVE to the store's root (no leading `/`), its size,
 /// and its last-modified time (the grace clock).
@@ -240,8 +303,12 @@ fn is_canonical_v4_uuid(s: &str) -> bool {
 }
 
 /// `url`'s key relative to `root` (no leading `/`), or `None` if `url` does
-/// not share `root`'s prefix at all.
-fn relative_to(root: &StorageUrl, url: &StorageUrl) -> Option<String> {
+/// not share `root`'s prefix at all. `pub(super)`: [`ResultStore::delete_objects_after_cas`],
+/// [`ResultStore::purge_segments`], and [`ResultStore::reap_candidate_keys`]
+/// (all in `store::mod`) share this SAME coordinate-space helper so the
+/// actual deleter and `reconcile`'s accounting can never compute a key in two
+/// different ways.
+pub(super) fn relative_to(root: &StorageUrl, url: &StorageUrl) -> Option<String> {
     let root_str = root.as_str().trim_end_matches('/');
     url.as_str()
         .strip_prefix(root_str)
@@ -345,14 +412,29 @@ impl ResultStore {
         // this pass performs — `reaped` (built here) records every key this
         // arm accounts for (with the TRUE size the listing snapshot already
         // captured, before any delete), and the object→row loop further down
-        // skips any key already in `reaped`: a key can never be counted
-        // twice, by construction, regardless of which arm ran first. Under
-        // `apply=true` a row's candidate objects are counted iff the row was
-        // ACTUALLY reaped (the fail-CAS + delete arm ran); under
-        // `apply=false` nothing is claimed or deleted, but the identical
-        // read-only classification (`Self::expired_row_would_reap`) decides
-        // whether this row's objects are previewed — the dry-run/apply
-        // parity invariant pinned on [`ReconcileOptions::apply`].
+        // skips any key already in `reaped` OR `protected`: a key can never
+        // be counted twice, by construction, regardless of which arm ran
+        // first. [`ExpiredRowOutcome`] (esc-484) is the ONE classification
+        // BOTH modes branch on: `apply=true` calls
+        // [`ResultStore::reconcile_expired_building_row`], which classifies
+        // FIRST and then performs exactly the outcome licenses (its returned
+        // key set is only ever non-empty for a `Reap` whose delete actually
+        // succeeded — the dry-run/apply parity invariant, and the
+        // "accounting set == deletion set" invariant, both pinned on
+        // [`ReconcileOptions::apply`]); `apply=false` calls
+        // [`ResultStore::classify_expired_row`] alone and only classifies:
+        //
+        // - `Reap`: this row's candidate keys ([`ResultStore::reap_candidate_keys`]
+        //   — the SAME set the real deleter computes) are previewed as
+        //   orphans, at their TRUE listed size, regardless of the object's
+        //   own age — a CAS-licensed reap is never grace-gated (see
+        //   [`ReconcileReport::orphans`]'s two admission routes).
+        // - `Promote`: this row's full referenced-key set (Parquet, manifest
+        //   sidecar, every current segment sibling) is PROTECTED — added to
+        //   `protected`, never `reaped` — so a promoted-but-not-yet-`ready`
+        //   row's objects can never fall through to the general age-gated
+        //   arm below and be mis-reported as an orphan.
+        // - `Untouched`: nothing to account or protect.
         //
         // `orphans`/`orphan_count`/`bytes_reclaimed`/`truncated` are declared
         // HERE (rather than beside `pending`/`unattributed`/`damaged` further
@@ -363,29 +445,55 @@ impl ResultStore {
         let mut bytes_reclaimed = 0u64;
         let mut truncated = false;
         let mut reaped: BTreeSet<String> = BTreeSet::new();
+        let mut protected = ReferencedKeys {
+            exact: BTreeSet::new(),
+            dir_prefixes: BTreeSet::new(),
+        };
+        // Looked up by root-relative key, built ONCE from the listing
+        // snapshot above — every candidate key this pre-pass credits is
+        // looked up here rather than re-scanning the whole `listed` vector
+        // per expired row.
+        let listed_sizes: HashMap<&str, u64> =
+            listed.iter().map(|o| (o.rel.as_str(), o.size)).collect();
+
         for table in self.catalog.list_expired_building_tables().await? {
-            let candidate_keys = self
-                .referenced_result_keys(std::slice::from_ref(&table), &[])
-                .await?;
-            let candidates: Vec<(String, u64)> = listed
-                .iter()
-                .filter(|o| candidate_keys.contains(&o.rel))
-                .map(|o| (o.rel.clone(), o.size))
-                .collect();
-
-            let was_or_would_be_reaped = if opts.apply {
-                self.reconcile_expired_building_row(table).await?
-            } else {
-                self.expired_row_would_reap(&table).await?
-            };
-
-            if was_or_would_be_reaped {
-                for (key, size) in candidates {
-                    if reaped.insert(key.clone()) {
-                        push_capped(&mut orphans, &mut orphan_count, &mut truncated, key);
-                        bytes_reclaimed += size;
-                    }
+            if opts.apply {
+                let deleted = self.reconcile_expired_building_row(table).await?;
+                credit_reaped(
+                    deleted,
+                    &listed_sizes,
+                    &mut reaped,
+                    &mut orphans,
+                    &mut orphan_count,
+                    &mut truncated,
+                    &mut bytes_reclaimed,
+                );
+                continue;
+            }
+            match self.classify_expired_row(&table).await? {
+                ExpiredRowOutcome::Reap => {
+                    let parquet_url = StorageUrl::parse(&table.parquet_path)?;
+                    let candidates = self
+                        .reap_candidate_keys(&parquet_url, &table.table_name)
+                        .await?;
+                    credit_reaped(
+                        candidates,
+                        &listed_sizes,
+                        &mut reaped,
+                        &mut orphans,
+                        &mut orphan_count,
+                        &mut truncated,
+                        &mut bytes_reclaimed,
+                    );
                 }
+                ExpiredRowOutcome::Promote => {
+                    let keys = self
+                        .referenced_result_keys(std::slice::from_ref(&table), &[])
+                        .await?;
+                    protected.exact.extend(keys.exact);
+                    protected.dir_prefixes.extend(keys.dir_prefixes);
+                }
+                ExpiredRowOutcome::Untouched => {}
             }
         }
 
@@ -519,7 +627,8 @@ impl ResultStore {
         // `orphans`/`orphan_count`/`bytes_reclaimed`/`truncated` are shared
         // with the expired-building pre-pass above: a cap hit on ANY list
         // (including `rows_failed`) sets the one report-wide flag, and a key
-        // that pass already accounted for is skipped below (`reaped`).
+        // that pass already accounted for (`reaped`) or protected
+        // (`protected`) is skipped below.
         let cutoff =
             Utc::now() - chrono::Duration::from_std(opts.grace).unwrap_or(chrono::Duration::MAX);
 
@@ -529,6 +638,14 @@ impl ResultStore {
                 // above (reaped under `apply`, or previewed under a
                 // dry-run) — never re-classified here, so it can never be
                 // counted a second time no matter which arm ran first.
+                continue;
+            }
+            if protected.contains(&obj.rel) {
+                // A row the pre-pass classified `Promote` (apply promotes it
+                // to `ready`; dry-run only previews the promotion) —
+                // referenced in BOTH modes, so this key is never even a
+                // candidate for the age-gated orphan arm below, regardless
+                // of how old the object is.
                 continue;
             }
             let attribution = attribute(&obj.rel);
@@ -877,5 +994,144 @@ mod attribution_tests {
     fn canonical_v4_uuid_check_rejects_braced_form() {
         let job = Uuid::new_v4().to_string();
         assert!(!is_canonical_v4_uuid(&format!("{{{job}}}")));
+    }
+}
+
+#[cfg(test)]
+mod credit_reaped_tests {
+    use super::*;
+
+    /// The precondition every case below shares: two candidate keys the
+    /// reaper NAMED (either [`ResultStore::reap_candidate_keys`]'s dry-run
+    /// preview, or the actual deleted-key set
+    /// [`ResultStore::delete_objects_after_cas`] returns), both present in
+    /// the listing snapshot at the given sizes.
+    fn listed_sizes() -> HashMap<&'static str, u64> {
+        HashMap::from([
+            ("table.parquet", 100u64),
+            ("table.materialization.json", 7u64),
+        ])
+    }
+
+    /// A delete that fully succeeded credits every key it named, at its
+    /// listed size.
+    #[test]
+    fn full_success_credits_every_key_at_its_listed_size() {
+        let mut reaped = BTreeSet::new();
+        let mut orphans = Vec::new();
+        let mut orphan_count = 0u64;
+        let mut truncated = false;
+        let mut bytes_reclaimed = 0u64;
+        let keys: BTreeSet<String> = ["table.parquet", "table.materialization.json"]
+            .into_iter()
+            .map(String::from)
+            .collect();
+
+        credit_reaped(
+            keys,
+            &listed_sizes(),
+            &mut reaped,
+            &mut orphans,
+            &mut orphan_count,
+            &mut truncated,
+            &mut bytes_reclaimed,
+        );
+
+        assert_eq!(orphan_count, 2);
+        assert_eq!(bytes_reclaimed, 107);
+        assert_eq!(
+            orphans,
+            vec![
+                "table.materialization.json".to_string(),
+                "table.parquet".to_string()
+            ]
+        );
+    }
+
+    /// esc-484 item 2: a PARTIAL delete failure — the deleter's returned key
+    /// set omits the key whose `delete_if_exists` errored — must credit ONLY
+    /// the keys that actually succeeded, never the one left out. This is the
+    /// oracle for "`reap_after_fail_cas` credits only bytes whose delete
+    /// succeeded": the failed key is simply never passed to this helper, so
+    /// it can never inflate `bytes_reclaimed` or appear in `orphans`.
+    #[test]
+    fn partial_failure_credits_only_the_keys_that_actually_deleted() {
+        let mut reaped = BTreeSet::new();
+        let mut orphans = Vec::new();
+        let mut orphan_count = 0u64;
+        let mut truncated = false;
+        let mut bytes_reclaimed = 0u64;
+        // Only the Parquet delete succeeded; the manifest sidecar's delete
+        // errored, so the caller never included it here.
+        let only_succeeded: BTreeSet<String> =
+            ["table.parquet"].into_iter().map(String::from).collect();
+
+        credit_reaped(
+            only_succeeded,
+            &listed_sizes(),
+            &mut reaped,
+            &mut orphans,
+            &mut orphan_count,
+            &mut truncated,
+            &mut bytes_reclaimed,
+        );
+
+        assert_eq!(orphan_count, 1, "the failed key must never be credited");
+        assert_eq!(
+            bytes_reclaimed, 100,
+            "only the Parquet's true size, never the manifest's"
+        );
+        assert!(!orphans.contains(&"table.materialization.json".to_string()));
+    }
+
+    /// A key already `reaped` (some earlier arm already credited it) is
+    /// never double-counted, even if handed to this helper again.
+    #[test]
+    fn a_key_already_reaped_is_never_double_counted() {
+        let mut reaped: BTreeSet<String> = ["table.parquet".to_string()].into_iter().collect();
+        let mut orphans = Vec::new();
+        let mut orphan_count = 0u64;
+        let mut truncated = false;
+        let mut bytes_reclaimed = 0u64;
+        let keys: BTreeSet<String> = ["table.parquet"].into_iter().map(String::from).collect();
+
+        credit_reaped(
+            keys,
+            &listed_sizes(),
+            &mut reaped,
+            &mut orphans,
+            &mut orphan_count,
+            &mut truncated,
+            &mut bytes_reclaimed,
+        );
+
+        assert_eq!(orphan_count, 0);
+        assert_eq!(bytes_reclaimed, 0);
+    }
+
+    /// A key the deleter named but that was never actually present in the
+    /// listing snapshot (never really on disk at listing time) is silently
+    /// skipped — never credited a phantom size.
+    #[test]
+    fn a_key_absent_from_the_listing_snapshot_is_never_credited() {
+        let mut reaped = BTreeSet::new();
+        let mut orphans = Vec::new();
+        let mut orphan_count = 0u64;
+        let mut truncated = false;
+        let mut bytes_reclaimed = 0u64;
+        let keys: BTreeSet<String> = ["table.usearch"].into_iter().map(String::from).collect();
+
+        credit_reaped(
+            keys,
+            &listed_sizes(),
+            &mut reaped,
+            &mut orphans,
+            &mut orphan_count,
+            &mut truncated,
+            &mut bytes_reclaimed,
+        );
+
+        assert_eq!(orphan_count, 0);
+        assert_eq!(bytes_reclaimed, 0);
     }
 }

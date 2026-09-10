@@ -70,6 +70,11 @@ through the same `JAMMI_<PATH>` layer every deployment shape uses:
   fails at the first audit write; a present-but-malformed key instead makes
   `jammi-server` refuse to start.
 
+The published ports (`8081`, `8080`) are bound to `127.0.0.1`, not
+`0.0.0.0`: the compose file publishes them for a TLS-terminating proxy
+running on the same host to reach, never for direct exposure to an
+untrusted network (see [Security Posture](./security.md#transport-encryption-is-the-deployers-runtime-not-the-engines)).
+
 The healthcheck is exec-form `jammi-server probe` (see [`jammi-server
 probe`](#the-jammi-server-probe-subcommand) below) — the runtime image is
 distroless and ships no shell, so a `curl`/`wget`-based `HEALTHCHECK` is not
@@ -203,6 +208,9 @@ kind: Service
 metadata:
   name: jammi-server
 spec:
+  # No `type:` -> ClusterIP (the default): cluster-internal only, reachable
+  # from other pods/Services on this cluster, not from outside it -- pair
+  # with an Ingress/Gateway and a TLS terminator to reach it externally.
   selector: { app: jammi-server }
   ports:
     - { name: flight, port: 8081, targetPort: 8081 }

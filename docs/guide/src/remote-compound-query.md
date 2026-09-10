@@ -29,7 +29,7 @@ source on `_row_id` to place inference columns alongside source columns.
 ```python
 import jammi
 
-db = jammi.connect("grpc://engine.internal:8081")
+db = jammi.connect("grpc://engine.internal:8081")  # behind your TLS terminator or on a trusted network
 
 # Compound retrieval + inference in one Flight SQL round-trip:
 table = db.sql("""

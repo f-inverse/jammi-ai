@@ -4272,6 +4272,7 @@ dependencies = [
  "candle-core",
  "candle-nn",
  "candle-transformers",
+ "dirs",
  "half",
  "hf-hub",
  "jammi-kernels",

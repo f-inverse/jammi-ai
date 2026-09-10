@@ -65,6 +65,19 @@ environment field. Two runs of the same producer, with the same parameters, over
 the same inputs, in the same environment, hash identically; any output-affecting
 change to any of the three changes the hash.
 
+The hash folds every *declared* parameter of the descriptor and the
+environment — it does not fold the producing host's CPU microarchitecture.
+Two CPU hosts of a different ISA (or even two same-ISA hosts with different
+runtime vector-dispatch decisions) can produce the same `definition_hash` for
+tables whose last float bits differ, because a CPU float reduction is a
+same-box guarantee only (measured directly: `bits_snapshot.rs` pins CPU-float
+bit output per box, not per `(target_arch, target_os)`). A `definition_hash`
+match therefore asserts *which definition produced the table*, not that its
+bytes are reproducible byte-for-byte on a different CPU host — identity across
+hosts is the catalog row plus the `definition_hash`, never the raw bytes. This
+CPU-variant gap in the hash is a known, open limitation, not a defect this
+contract claims to close.
+
 The input anchors are recorded but are deliberately **not** part of the
 definition hash: the definition is *how* a table is produced, the anchors are
 *over what*. A consumer that wants a combined "code + data" identity composes the

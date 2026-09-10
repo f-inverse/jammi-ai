@@ -1663,28 +1663,64 @@ impl ObservabilityConfig {
 /// ```toml
 /// [models]
 /// hub_endpoint = "https://huggingface.co"
-/// hub_cache_dir = "/var/cache/jammi/hub"
+/// hub_cache_dir = "/var/cache/jammi"
 /// hub_token = { file = "/run/secrets/hf-token" }
 /// offline = false
 /// ```
 #[derive(Debug, Clone, Default, PartialEq, Eq, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct ModelsConfig {
-    /// Hub API endpoint. `None` → config default, then `HF_ENDPOINT`, then
-    /// the Hub's own default.
+    /// Hub API endpoint. `None` → config default, then a non-empty,
+    /// TRIMMED `HF_ENDPOINT` (a present-but-empty `HF_ENDPOINT` is treated
+    /// the same as unset — see `jammi-ai`'s `model::hub` module docs,
+    /// "empty values are absent, and every value is trimmed"), then the
+    /// Hub's own default.
     pub hub_endpoint: Option<String>,
     /// Root directory the Hub cache lives under (a `hub/` subdirectory is
-    /// appended). `None` → `HF_HOME`, then
-    /// `directories::BaseDirs::home_dir()/.cache/huggingface`.
+    /// appended). `None` → a non-empty `HF_HUB_CACHE` (used AS the cache
+    /// root directly, nothing appended, matching `huggingface_hub`'s own
+    /// convention), then a non-empty `HF_HOME` (`hub/` appended), then
+    /// `directories::BaseDirs::home_dir()/.cache/huggingface` (`hub/`
+    /// appended). A present-but-empty `HF_HUB_CACHE`/`HF_HOME` is treated
+    /// the same as unset, never as a literal empty/CWD-relative root.
     pub hub_cache_dir: Option<PathBuf>,
     /// Hub bearer token. Kept as an unresolved [`SecretSource`] — not
     /// eagerly resolved into a [`Secret`] at config load — because the
-    /// fallback chain (`HF_TOKEN`, then the cache's own `token` file) is
-    /// read at the `jammi-ai` session choke point, not here (H4).
+    /// fallback chain (a non-empty `HF_TOKEN`, then a non-empty
+    /// `HUGGING_FACE_HUB_TOKEN` — `huggingface_hub`'s own live legacy alias,
+    /// `utils/_auth.py:145-147` — then the token file) is read at the
+    /// `jammi-ai` session choke point, not here (H4). The token FILE is
+    /// `HF_TOKEN_PATH`, when non-empty, naming the file directly (matching
+    /// `huggingface_hub`'s own `HF_TOKEN_PATH`, `constants.py:247-254`);
+    /// otherwise `<HF_HOME>/token` — `HF_HOME` resolved on its own,
+    /// independently of whichever tier won `hub_cache_dir`'s own precedence
+    /// above — never derived from the cache root itself (a
+    /// `HF_HUB_CACHE`-driven cache root has no `hub` path component to pop
+    /// the way a `<HF_HOME>/hub`-shaped root does).
     pub hub_token: Option<SecretSource>,
     /// Refuse every network fetch: a model loads only from `local:` or an
-    /// already-resolved catalog row. Default: `false`.
-    pub offline: bool,
+    /// already-resolved catalog row. `Some(_)` wins outright over the
+    /// `HF_HUB_OFFLINE`/`TRANSFORMERS_OFFLINE` environment variables — set
+    /// `Some(false)` explicitly (a literal `offline = false` in the TOML) to
+    /// force online even when one of them is set in the process
+    /// environment; an OMITTED field (`None`, the `#[serde(default)]`
+    /// value) falls back to a non-empty `HF_HUB_OFFLINE`, then — only when
+    /// `HF_HUB_OFFLINE` is itself unset OR present-but-empty (treated
+    /// identically — see `jammi-ai`'s `model::hub` module docs, "empty
+    /// values are absent, and every value is trimmed"; a WHITESPACE-only
+    /// `HF_HUB_OFFLINE` is one case where this crate's own reading
+    /// disclosably diverges from `huggingface_hub`'s, in the safe
+    /// direction — see that same section) — to `TRANSFORMERS_OFFLINE` (`huggingface_hub`'s
+    /// own alias for this variable), then to `false`. `Option<bool>`, not a
+    /// plain `bool`, is what makes "explicitly set to false" distinguishable
+    /// from "never mentioned" — the same reason the other three fields
+    /// above are already `Option`-typed. See `jammi-ai`'s
+    /// `model::hub::HubSource::from_config` (a downstream crate — not
+    /// linkable from here) for the resolution this drives and the accepted
+    /// `HF_HUB_OFFLINE`/`TRANSFORMERS_OFFLINE` truthy values
+    /// (`huggingface_hub`'s own `ENV_VARS_TRUE_VALUES`: `"1"`, `"on"`,
+    /// `"yes"`, `"true"`, case-insensitively).
+    pub offline: Option<bool>,
 }
 
 // --- Defaults ---

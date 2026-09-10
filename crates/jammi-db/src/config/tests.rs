@@ -2134,7 +2134,7 @@ fn models_config_round_trips_and_defaults() {
         r#"
         [models]
         hub_endpoint = "https://huggingface.co"
-        hub_cache_dir = "/var/cache/jammi/hub"
+        hub_cache_dir = "/var/cache/jammi"
         hub_token = "hf_inline"
         offline = true
     "#,
@@ -2147,18 +2147,33 @@ fn models_config_round_trips_and_defaults() {
     );
     assert_eq!(
         cfg.models.hub_cache_dir,
-        Some(PathBuf::from("/var/cache/jammi/hub"))
+        Some(PathBuf::from("/var/cache/jammi"))
     );
     assert!(matches!(
         cfg.models.hub_token,
         Some(SecretSource::Inline(ref s)) if s == "hf_inline"
     ));
-    assert!(cfg.models.offline);
+    assert_eq!(cfg.models.offline, Some(true));
 
     let default_cfg = JammiConfig::parse_from("", std::iter::empty()).unwrap();
     assert_eq!(default_cfg.models, ModelsConfig::default());
-    assert!(!default_cfg.models.offline);
+    assert_eq!(
+        default_cfg.models.offline, None,
+        "an omitted `offline` key must round-trip as None, not a bare `false` -- \
+         jammi-ai's HubSource::from_config's HF_HUB_OFFLINE fallback only applies when \
+         this is None"
+    );
     assert!(default_cfg.models.hub_token.is_none());
+}
+
+/// A literal `offline = false` must round-trip as `Some(false)`, distinct
+/// from the omitted-field `None` above -- the `Option<bool>` is what lets
+/// `HubSource::from_config`'s `HF_HUB_OFFLINE` fallback tell "the operator
+/// explicitly forced online" apart from "the operator never said".
+#[test]
+fn models_config_explicit_offline_false_is_some_not_none() {
+    let cfg = JammiConfig::parse_from("[models]\noffline = false\n", std::iter::empty()).unwrap();
+    assert_eq!(cfg.models.offline, Some(false));
 }
 
 #[test]
@@ -2166,6 +2181,30 @@ fn models_config_unknown_key_is_refused() {
     let err = JammiConfig::parse_from("[models]\nbogus = 1\n", std::iter::empty()).unwrap_err();
     match err {
         JammiError::Config(msg) => assert!(msg.contains("bogus"), "msg = {msg}"),
+        other => panic!("expected JammiError::Config, got {other:?}"),
+    }
+}
+
+#[test]
+fn unknown_server_key_such_as_tls_is_a_typed_load_error() {
+    // `ServerConfig` carries no TLS knob at all — the engine has no
+    // certificate/key/termination config of its own (security.md's
+    // "no silent plaintext fallback" claim). `#[serde(deny_unknown_fields)]`
+    // on `ServerConfig` is the oracle backing that claim: a `[server] tls`
+    // stanza must fail closed at load time, naming the offending path,
+    // never silently drop the unrecognised section and boot plaintext.
+    let toml_src = r#"
+        [server]
+        tls = { cert_path = "x" }
+    "#;
+    let err = JammiConfig::parse_from(toml_src, std::iter::empty()).unwrap_err();
+    match err {
+        JammiError::Config(msg) => {
+            assert!(
+                msg.contains("server.tls"),
+                "expected the error to name `server.tls`, got: {msg}"
+            );
+        }
         other => panic!("expected JammiError::Config, got {other:?}"),
     }
 }

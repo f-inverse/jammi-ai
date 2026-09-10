@@ -2098,6 +2098,20 @@ jobs:
           # no network, no `/root` path ever touched.
           - name: fa2_ab.sh shape
             cmd: python3 ci/scripts/perf/test_fa2_ab_sh.py
+          # Class closure (#482): `assert_elf_machine.sh`, `assert_glibc_floor.sh`,
+          # and `assert_image_attestations.sh` each ship a `--self-test`
+          # (synthetic fixtures, no ELF/Mach-O tooling, no docker, no
+          # network) but none of the three is a `check_*`/`test_*` name, so
+          # `check_ci_guard_wiring.py`'s scan is structurally blind to them
+          # (see that script's own `gate_scripts()` doc) -- wiring them here
+          # is what actually keeps the fixtures from rotting silently, even
+          # though the wiring checker itself would stay green either way.
+          - name: assert_elf_machine.sh self-test
+            cmd: bash ci/scripts/assert_elf_machine.sh --self-test
+          - name: assert_glibc_floor.sh self-test
+            cmd: bash ci/scripts/assert_glibc_floor.sh --self-test
+          - name: assert_image_attestations.sh self-test
+            cmd: bash ci/scripts/assert_image_attestations.sh --self-test
     steps:
       - uses: actions/checkout@v4
         with:

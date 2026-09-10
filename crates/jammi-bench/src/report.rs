@@ -329,9 +329,12 @@ pub struct Tiers {
     /// The CPU-hermetic propagation tier: the engine's `propagate_embeddings`
     /// (APPNP/SGC decoupled-GNN forward pass) over a committed synthetic
     /// graph+embedding fixture. Gated on the DETERMINISM contract — a committed
-    /// digest of the propagated output vectors that any box re-derives — with
-    /// propagation wall-time at named graph sizes riding along as an un-gated,
-    /// machine-dependent reference. Populated by `propagate-scale`.
+    /// digest of the propagated output vectors that is byte-identical across
+    /// `target_partitions` ON THE SAME BOX (`f32` reduction order is not
+    /// bit-identical across CPUs; this is a same-machine, not any-box,
+    /// guarantee) — with propagation wall-time at named graph sizes riding
+    /// along as an un-gated, machine-dependent reference. Populated by
+    /// `propagate-scale`.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub propagate: Option<PropagateTier>,
     /// The CPU-hermetic graph fine-tune tier: the engine's biased-walk graph

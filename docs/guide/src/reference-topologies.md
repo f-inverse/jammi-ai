@@ -70,6 +70,11 @@ through the same `JAMMI_<PATH>` layer every deployment shape uses:
   fails at the first audit write; a present-but-malformed key instead makes
   `jammi-server` refuse to start.
 
+The published ports (`8081`, `8080`) are bound to `127.0.0.1`, not
+`0.0.0.0`: the compose file publishes them for a TLS-terminating proxy
+running on the same host to reach, never for direct exposure to an
+untrusted network (see [Security Posture](./security.md#transport-encryption-is-the-deployers-runtime-not-the-engines)).
+
 The healthcheck is exec-form `jammi-server probe` (see [`jammi-server
 probe`](#the-jammi-server-probe-subcommand) below) — the runtime image is
 distroless and ships no shell, so a `curl`/`wget`-based `HEALTHCHECK` is not
@@ -203,6 +208,9 @@ kind: Service
 metadata:
   name: jammi-server
 spec:
+  # No `type:` -> ClusterIP (the default): cluster-internal only, reachable
+  # from other pods/Services on this cluster, not from outside it -- pair
+  # with an Ingress/Gateway and a TLS terminator to reach it externally.
   selector: { app: jammi-server }
   ports:
     - { name: flight, port: 8081, targetPort: 8081 }
@@ -337,3 +345,14 @@ into the published image. It would appear in `features` as `"postgres"`
 only on a custom build that opts into it explicitly; do not read this
 image's Postgres-catalog support as evidence that source federation is
 available.
+
+**Node architecture.** The CPU image's generic tags (`ghcr.io/f-inverse/jammi-ai-server:latest`/`:vX.Y.Z`/`:vX.Y`
+and their `sha-<sha>` equivalents) are a multi-arch index — `linux/amd64` and
+`linux/arm64` — so Shapes B/C's query tier and Shape D's disaggregated query
+tier can schedule onto either an amd64 or an arm64 node pool without a
+per-arch tag; `docker pull`/Kubernetes resolve the right member
+automatically. Shape D's GPU compute tier is unaffected by this: the CUDA
+image (`-cu12`) is `linux/amd64` only, so the GPU node pool stays amd64. The
+same CPU image name's self-contained tags (`:selfcontained`,
+`:selfcontained-sha-<sha>`) are also `linux/amd64` only — never schedule
+those onto an arm64 node pool.

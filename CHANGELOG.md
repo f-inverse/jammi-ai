@@ -40,6 +40,77 @@ workspace ships every publishable crate at the same
   terminal write retires a still-`{"state":"pending"}` acceleration-report
   marker (esc-075) in its own update, generalised from the training-only
   queue onto every job kind.
+- **`HubSource`'s four `[models]` Hub resolution chains — cache root, offline, token, and
+  endpoint — are each config-first and env-overridable through `JAMMI_MODELS__HUB_*`/
+  `JAMMI_MODELS__OFFLINE` (#481).** **Cache root:** `[models] hub_cache_dir` (a `hub/`
+  subdirectory is appended) > `HF_HUB_CACHE` (used AS the cache root directly, nothing
+  appended, matching `huggingface_hub`'s own `HF_HUB_CACHE` convention) > `HF_HOME` (`hub/`
+  appended) > the platform home directory's `.cache/huggingface` (`hub/` appended). **Offline:**
+  `[models] offline` (`Option<bool>`; `Some(_)` wins outright, in either direction, over the
+  environment) > `HF_HUB_OFFLINE` > `TRANSFORMERS_OFFLINE` (consulted only when `HF_HUB_OFFLINE`
+  is itself absent), with truthy values for either variable being `huggingface_hub`'s own
+  `ENV_VARS_TRUE_VALUES` set — `1`, `on`, `yes`, `true` — matched case-insensitively with
+  surrounding whitespace trimmed. **Token:** `[models] hub_token` > `HF_TOKEN` (non-empty,
+  trimmed) > `HUGGING_FACE_HUB_TOKEN` (`huggingface_hub`'s own live legacy alias for `HF_TOKEN`,
+  not deprecated) > the token file (`HF_TOKEN_PATH` naming the file directly, else
+  `<HF_HOME>/token`, contents trimmed) — resolved independently of whichever tier won the
+  cache-root precedence, never through `hf_hub::Cache::token`/`token_path` (which derives the
+  token file by popping the cache root's last path component, an arithmetic only correct when
+  the root was actually built as `<HF_HOME>/hub`; with `HF_HUB_CACHE` set it silently derives
+  `parent(HF_HUB_CACHE)/token` instead). **Endpoint:** `[models] hub_endpoint` > `HF_ENDPOINT` >
+  the client default.
+
+  A value that is present but empty — or, for `HF_HOME`/`HF_ENDPOINT`, whitespace-only after
+  trimming — is treated as absent everywhere in `HubSource`, through one helper (`env_nonempty`)
+  shared by all eight env reads (`HF_HUB_OFFLINE`, `TRANSFORMERS_OFFLINE`, `HF_HUB_CACHE`,
+  `HF_HOME`, `HF_ENDPOINT`, `HF_TOKEN`, `HUGGING_FACE_HUB_TOKEN`, `HF_TOKEN_PATH`), which also
+  returns the trimmed value rather than the raw one, so `HF_HOME=" /data/hf"` resolves to the
+  cache root `/data/hf/hub`, never a leading-space path that would silently root the cache (and
+  the token file) under the current working directory instead. Every empty-value fallback fails
+  toward the safe default — the home cache, the default endpoint, no token, offline resolved
+  from the non-empty variable only — never toward the network and never toward a nonsense
+  relative path. One divergence from `huggingface_hub` is disclosed rather than closed, and it
+  fails in opposite directions: a whitespace-only `HF_HUB_OFFLINE=" "` is present-but-blank
+  after trimming here and falls through to `TRANSFORMERS_OFFLINE` (failing toward offline, the
+  safe direction for an air-gap knob), whereas `huggingface_hub`'s own
+  `os.environ.get("HF_HUB_OFFLINE") or os.environ.get("TRANSFORMERS_OFFLINE")` treats a
+  whitespace-only string as truthy in Python and stops at the first variable, resolving online
+  regardless of the second.
+
+  `crates/jammi-ai/tests/it/hub_source.rs` mounts a `MockServer` for every chain: the four
+  "refuses by name" integration tests assert `received_requests()` comes back empty, every
+  empty-value edge for all eight variables is covered,
+  `hf_home_env_drives_the_cache_root_end_to_end` and
+  `hf_hub_cache_env_drives_the_cache_root_directly_no_hub_subdir_appended` drive `HF_HOME`/
+  `HF_HUB_CACHE` through `HubSource::from_config`'s injected `env` closure (never
+  `std::env::set_var`) and assert the fetched file lands under `{HF_HOME}/hub/…` or directly
+  under `{HF_HUB_CACHE}/models--…` with no `hub/` subdirectory, and two oracles assert a
+  resolved token reaches the mock server as the literal `Authorization: Bearer <token>` header,
+  not merely that `resolve_token` returns the right `String`.
+  `warm_cache_across_a_second_hub_source_issues_no_requests` builds a second `HubSource` over
+  the same `hub_cache_dir`, in the same process, and asserts it issues zero new requests against
+  the mock server — this stands in for a process restart with a mounted cache volume because
+  `HubSource` holds nothing process-global (no static/thread-local state; every field is
+  constructed fresh from `[models]`+`env` in `from_config`), so two independently-constructed
+  `HubSource`s in one process and two `HubSource`s across a real restart take the identical code
+  path.
+
+  `crates/jammi-encoders/tests/live_real_clap.rs`'s `fetch_real_model` is a separate,
+  jammi-encoders-local implementation (jammi-encoders cannot depend on jammi-ai) that resolves
+  `HF_HUB_CACHE` > `HF_HOME`/`hub` > a checked `dirs::home_dir()`, failing with a named-variable
+  test failure rather than a panic when none resolve, and carries the identical
+  `HF_TOKEN_PATH`/`HUGGING_FACE_HUB_TOKEN`/trimming token chain and `env_nonempty` rule by
+  construction — the same rule written twice, not a measured cross-implementation parity result,
+  since this harness runs only behind the `live-hub-tests` feature and never inside CI's default
+  `cargo test`. It disclosably diverges from `HubSource` in one remaining way: its cache-root
+  fallback is hand-written rather than sharing `HubSource`'s own tested code path.
+
+  Docs (`docs/guide/src/local-models.md`, `docs/guide/src/configuration.md`) state the
+  `JAMMI_MODELS__HUB_*` env-override tier, the `HF_HUB_CACHE` precedence step, and the exact
+  `HF_HUB_OFFLINE`/`TRANSFORMERS_OFFLINE` truthy set and alias. The `hub_cache_dir` examples
+  (here, `configuration.md`, and `crates/jammi-db/src/config/mod.rs`'s own doc comment) name a
+  root one level above the `hub/` subdirectory `HubSource` appends, so
+  `hub_cache_dir = "/var/cache/jammi/hub"` resolves models under `/var/cache/jammi/hub/hub`.
 - **A tested Shape B Compose stack, `jammi-server probe`, `jammi-server serve` as the
   default subcommand, a reference-topologies guide page, and supply-chain
   attestations on the published images (#482).** `deploy/docker-compose.yml`
@@ -478,8 +549,43 @@ workspace ships every publishable crate at the same
   no `traceparent` header starts a fresh, unparented trace exactly as before.
   See `docs/guide/src/operability.md`'s new "OTLP trace export" subsection
   and `docs/guide/src/configuration.md`'s `[observability]` reference.
+- **linux/arm64 server image, CLI/server release tarballs, and manylinux aarch64 wheels
+  (#482).** The published `jammi-ai-server` CPU image (`:latest`, semver tags) is now a
+  multi-arch index (`linux/amd64` + `linux/arm64`), built as two NATIVE per-arch legs
+  (`ubuntu-latest` / `ubuntu-24.04-arm`, no QEMU) each pushing only its own immutable
+  `sha-<sha>-<arch>` tag, merged into the real tags by a verify-then-promote
+  `docker buildx imagetools create` job that dry-runs the merge and asserts the resulting
+  index's platform set BEFORE pushing anything (the self-contained image and the CUDA image
+  stay amd64-only, explicitly). `release-binaries.yml` gains an `aarch64-unknown-linux-gnu`
+  `jammi` CLI leg and a second `jammi-server` tarball leg (two-leg matrix); `pypi-server.yml`
+  publishes both `manylinux_2_28_x86_64` and `manylinux_2_28_aarch64` wheels for
+  `jammi-server` in one release; `pypi.yml`'s native engine wheel gains the same aarch64 Linux
+  leg. Every Linux release binary/wheel is built inside the CI base image resolved to a
+  digest ONCE per workflow run (`resolve-base`, read-only, no repo-variable write) so every
+  leg of one release shares one toolchain, and the `jammi`/`jammi-server` tarball legs
+  (`ci/scripts/package_release_bin.sh`) and the `pypi-server`/`pypi` wheel legs
+  (`_pypi-server.yml`, `pypi.yml`) assert every `*-linux-gnu` artifact they produce against
+  the manylinux_2_28 GLIBC symbol-version floor (`ci/scripts/assert_glibc_floor.sh`) in
+  addition to an ELF/Mach-O machine-field assert — building inside the manylinux container
+  is necessary but not sufficient. The CUDA tarball (`server-cu12-build`) is the one
+  `*-linux-gnu` exception: that lane never calls `assert_glibc_floor.sh`, only
+  `assert_elf_machine.sh` — machine-asserted, not floor-asserted. It builds with
+  `gcc-toolset-13` because CUDA 12.6 caps at GCC ≤ 13.2 while manylinux_2_28 ships GCC 14.2
+  (never the reverse); the GLIBC floor itself derives from the base image's own glibc 2.28,
+  identical across the CUDA and non-CUDA CI base images and unaffected by which gcc-toolset
+  is layered on top. `compose-smoke.yml` gains a native
+  `ubuntu-24.04-arm` leg (its own within-leg parity assertions only, no cross-arch byte
+  comparison).
 
 ### Changed
+- **`deploy/docker-compose.yml`'s published ports are loopback-bound (#480).**
+  `8081` (gRPC + Flight SQL) and `8080` (the HTTP side-channel) now publish
+  as `127.0.0.1:8081:8081` / `127.0.0.1:8080:8080` rather than
+  `0.0.0.0`-equivalent bare `8081:8081` / `8080:8080` — the deployer
+  publishes them for a TLS-terminating proxy on the same host
+  to reach, never for direct exposure to an untrusted network. The compose
+  smoke workflow is unaffected: `tests/compose/shape_b_remote.py` already
+  targets `127.0.0.1`.
 - **The published server images no longer pass `--config`; the Compose
   healthcheck is `jammi-server probe` (#482).** Every runtime stage's `CMD`
   is now `["serve"]`, resolved through the config chain `serve` always
@@ -826,6 +932,32 @@ workspace ships every publishable crate at the same
   for every driver, not only Postgres: a driver-delivered batch is fanned out only when it is
   exactly the tail's cursor + 1, and any gap or regression triggers a replay instead, because
   post-commit fan-out across replicas is unordered regardless of transport.
+
+### Docs
+- **Transport encryption is the deployer's runtime, not the engine's (#480).**
+  `security.md` gains a normative section closing out engine-side TLS: B4
+  constrains what the engine forks on, not what fronts it; the boundary
+  table is the second gate past the discipline test; `[server] tls` is
+  already a typed `deny_unknown_fields` startup refusal, never a silent
+  plaintext fallback; and a Caddy example terminates TLS in front of
+  the loopback-bound reference Compose listeners. `deploy-server.md` and
+  `reference-topologies.md` point at the decision from the identity seam
+  and the Compose section respectively.
+- **The identity seam gains a proxy-injection sketch; every commented
+  broker Postgres URL and the managed-provider `sslrootcert` story are
+  documented (#487).** `deploy-server.md`'s "The identity seam" shows the
+  ~10-line shape of a proxy that authenticates a caller and injects one
+  header the `TenantResolver` reads and fails closed on when absent.
+  `configuration.md` and `catalog-and-broker.md`'s commented
+  `[broker.postgres] url` examples now carry
+  `?sslmode=verify-full&sslrootcert=…`, matching the catalog examples;
+  `catalog-and-broker.md` gains a paragraph on obtaining `sslrootcert` for
+  Cloud SQL, RDS, and Fly Postgres, plus the rule that the engine hands the
+  catalog URL to the driver unchanged and the driver's URL parser overrides
+  only the keys the URL names — a `sslmode`/`sslrootcert` the URL omits
+  still falls back to the process's `PGSSLMODE`/`PGSSLROOTCERT`, so naming
+  `sslmode=verify-full` explicitly in the URL is what makes a connection
+  immune to a stray `PGSSLMODE=disable` left in the environment.
 
 ### Fixed
 - **`JobService.PruneJobs` swept every tenant's terminal rows, not just the

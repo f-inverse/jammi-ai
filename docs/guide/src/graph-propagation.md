@@ -170,8 +170,9 @@ adds signal.
 
 Propagation is deterministic: every fold, teleport, and weighted sum runs in
 `f64` over a fixed `(node, neighbour)` order, so the output is **byte-identical**
-regardless of how many threads the engine runs. It is the reproducible point on
-the structure-aware spectrum — fixed averaging, no learned parameters.
+regardless of how many threads the engine runs, on a machine. It is the
+reproducible point on the structure-aware spectrum — fixed averaging, no
+learned parameters.
 
 ## Bounds
 

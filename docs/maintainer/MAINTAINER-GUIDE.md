@@ -1437,8 +1437,12 @@ tenant-scoped via the catalog resolution at the gRPC seam): read the named table
 recorded `ProducingDescriptor` (`recompute_one`/`replay_descriptor`), reconstruct the
 producing verb call from its typed parameters, and replay it through the **unmodified
 `BuildingTable::finish` funnel** with `CachePolicy::Bypass` (a recompute that reused
-a cache would be a no-op). Byte-identical when inputs haven't moved (the descriptor
-records every output-affecting determinant). A pre-contract table with no descriptor
+a cache would be a no-op). Byte-identical when inputs haven't moved, **on the
+producing host** (the descriptor records every output-affecting determinant,
+but not the CPU microarchitecture that ran the fold); on a different host the
+replay is value-equivalent up to float-ULP rounding, and the `definition_hash`
++ catalog row — not the raw bytes — is what a recompute-vs-original comparison
+is over. A pre-contract table with no descriptor
 is the typed `JammiError::NotRecomputable` — a loud refusal, never a re-run guessed
 from columns.
 
@@ -1952,8 +1956,13 @@ on `cascade`:
 `recompute_one` → `replay_descriptor` (`crates/jammi-ai/src/pipeline/recompute.rs`)
 dispatches on the descriptor variant and **always calls the producer with
 `CachePolicy::Bypass`** — a recompute that reused a cache would be a no-op, not a recompute.
-The replay is **byte-identical when inputs have not moved**, because the descriptor records
-every output-affecting determinant. Per-variant subtleties:
+The replay is **byte-identical when inputs have not moved, on the producing
+host** — the descriptor records every output-affecting determinant, but the
+producing host's CPU microarchitecture is not one of them, so a replay on a
+different CPU host is value-equivalent, not asserted byte-identical (identity
+is the catalog row + `definition_hash`; see
+`docs/guide/src/materialization-contract.md`).
+Per-variant subtleties:
 - The many `*_from_manifest` helpers are the reverse of the descriptor-recording `*_for`
   functions — mapping each manifest enum mirror back onto its AI-crate type.
 - The intricate case is **`ContextSet`**: its real producer is the
@@ -3955,7 +3964,8 @@ auto-available to every encoder.)
 - **Determinism is name-keyed, not order-keyed.** Every LoRA A/B draw and dropout mask is a pure
   function of `(seed, fully-qualified-param-name)` via `seed_for_param`
   (`crates/jammi-lora/src/seeded.rs`) — never candle's global RNG, never VarMap/HashMap order. On
-  CPU the same `(seed, rows, config)` → byte-identical adapters. The qualified name must match
+  one CPU host the same `(seed, rows, config)` → byte-identical adapters; this is a same-box
+  guarantee, not a cross-host one (see the numerics note below). The qualified name must match
   candle's `VarBuilder::path` join.
 - **In-place Var overwrite is load-bearing** — seeded init and resume restore write into the
   *registered* Var's storage; replacing the field with a fresh clone severs the optimizer binding
@@ -3992,10 +4002,15 @@ auto-available to every encoder.)
 
 **Numerics**
 
-- **Single-architecture determinism only** — f32/f64 summation order is fixed *per binary* but
-  **not bit-equivalent across x86_64/aarch64**. Do not add parallel reduction (rayon, non-fixed-lane
-  SIMD) — it breaks even the single-arch guarantee. Cross-arch reproducibility is an explicit
-  non-goal.
+- **Same-box determinism only** — f32/f64 summation order is fixed *per binary* on the box that
+  ran it, but is **not bit-equivalent across x86_64/aarch64, nor across two hosts of the same
+  architecture** (candle's vector paths are compile-time `#[cfg(target_feature)]`, and
+  `gemm`/`pulp` dispatch the actual SIMD/FMA kernel at runtime off the host's detected features —
+  two same-arch boxes with different detected feature sets can pick a different kernel and differ
+  in the last bits; measured directly by `bits_snapshot.rs`, which pins per-box, not per
+  `(target_arch, target_os)`). Do not add parallel reduction (rayon, non-fixed-lane SIMD) — it
+  breaks even the single-box guarantee. Cross-arch reproducibility AND cross-box same-arch
+  reproducibility are both explicit non-goals.
 - **f32 vs f64 reduction asymmetry is intentional** — `cosine_distance`/`cosine_similarity` in f32,
   `vector_norm`/`cosine_f64` in f64; not interchangeable (shifts last-bit results and can flip a
   tie-break).
@@ -4032,6 +4047,20 @@ not a bare `RUSTFLAGS`, for exactly this reason). CI/dev/release
 base image: `.docker/ci.Dockerfile` (= `jammi-ai-ci`), a multi-arch index (`linux/amd64` +
 `linux/arm64`, one native leg per platform, merged by `_ci-base-image.yml`); the CUDA image extends
 it and stays `linux/amd64`-only.
+
+Every multi-arch image this workspace publishes (the CI base image above, and the CPU
+`jammi-ai-server` image) is built the same two-leg-plus-merge way, never a single `docker buildx
+build --platform linux/amd64,linux/arm64` (which would need QEMU emulation for the non-native
+arch): one job per arch, on that arch's own NATIVE runner (`ubuntu-latest` / `ubuntu-24.04-arm`, no
+QEMU), each pushing ONLY its own immutable per-arch tag (`sha-<sha>-<arch>`) — never a real,
+consumer-facing tag. A separate merge job then combines those two immutable per-arch sources into
+the real tags with `docker buildx imagetools create`, dry-running the merge first and asserting the
+resulting index's platform set BEFORE the real (pushing) `imagetools create` runs — verify-then-
+promote, not promote-then-hope. That merge job is the ONLY job that ever moves a real tag; the two
+per-arch build legs never do. `server-image.yml`'s CPU image runs this pattern twice — once
+ungated (`build-and-push-main` → `merge-cpu-main`, `main`-dispatch only, `:latest`/`sha-<sha>`) and
+once prove-gated (`build-and-push` → `merge-cpu-tag`, `v*` tags only, semver/`:latest`/`sha-<sha>`)
+— mirroring `_ci-base-image.yml`'s own single merge job for the CI base image itself.
 
 **Run before pushing (the local gate, mirrors `check`):**
 - `cargo fmt --all -- --check`
@@ -4113,11 +4142,18 @@ here can retroactively un-push a tag. Then tag both `v*` and `py-v*`
   topological order, skip already-published, block on sparse-index propagation; `github-release`
   chains off `publish`) + `.github/workflows/npm.yml` (build+test unconditional; the `Publish` step
   itself is prove-gated) + `.github/workflows/server-image.yml` (the manual `:latest` CPU refresh via
-  `workflow_dispatch` on `main` is intentionally ungated — `build-and-push-main`; `server-image.yml`
-  carries no `push: branches:` trigger, so this never fires on a mere merge; both `:latest` tags are
+  `workflow_dispatch` on `main` is intentionally ungated — `build-and-push-main` pushes each arch's
+  own immutable `sha-<sha>-<arch>` leg, `merge-cpu-main` merges them into the real `:latest`/`sha-<sha>`
+  tags via `docker buildx imagetools create`, `gate_kind` "none"; `server-image.yml` carries no
+  `push: branches:` trigger, so this arm never fires on a mere merge; both `:latest` tags are
   separately re-pointed by every `v*` release tag itself, via `docker/metadata-action`'s default
-  `flavor: latest=auto`, so the CPU `:latest` is never main-only; the CPU and CUDA TAG
-  promotions — `build-and-push` and `build-and-push-cu12` — are both prove-gated) +
+  `flavor: latest=auto`, so the CPU `:latest` is never main-only. Publishing an image under a `v*`
+  tag is a two-leg + merge pattern (CPU only — the CUDA image builds and pushes in one amd64-only
+  job, no merge needed): `build-and-push` pushes ONLY each arch's own immutable
+  `sha-<sha>-<arch>` leg (never a real tag), then `merge-cpu-tag` — gated on `build-and-push`'s own
+  success — is the ONLY job that ever moves the real semver/`:latest`/`sha-<sha>` tags this arm
+  publishes, via the same dry-run-then-`imagetools create` shape as `merge-cpu-main`. The prove-gated
+  tag promotions are `build-and-push`, `merge-cpu-tag`, and `build-and-push-cu12`) +
   `.github/workflows/release-binaries.yml` (every asset family — the CLI matrix, the CPU tarball, the
   CUDA tarball — is split into an ungated build leg that always runs and a prove-gated promote leg
   that only attaches to the release on a tag).

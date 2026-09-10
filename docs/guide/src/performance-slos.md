@@ -2,9 +2,9 @@
 
 Jammi's performance contract is **throughput and coverage, gated against
 committed baselines** — not latency. Each scale-relevant engine verb commits a
-measured rate (or, for the recall tier, a portable recall fraction) on a named
-reference box, and a regression gate fails when a fresh run falls more than a
-fixed fraction below it. This page is the operator's reference for every gated
+measured rate (or, for the recall tier, a recall fraction gated against a
+committed floor) on a named reference box, and a regression gate fails when a
+fresh run falls more than a fixed fraction below it. This page is the operator's reference for every gated
 target: the verb, the named scale it is measured at, the committed baseline, the
 relative-drop threshold, and the box the baseline was emitted on.
 
@@ -37,7 +37,9 @@ code — a regression exits non-zero — which is what the CI lanes assert.
 ## The gated targets
 
 Each row is one gated verb at one named scale. The rates are **same-box
-throughputs**; the recall row is a **portable fraction**. Every committed number
+throughputs**; the recall row is a **fraction gated by an inequality** — the
+`measured >= floor` check is meaningful on any box, but the fraction itself is
+bit-for-bit only on the same box (see the same-box caveat). Every committed number
 is a real, re-derivable fold — a `rebuild-*` bench subcommand reproduces it on
 the emit box.
 
@@ -45,10 +47,10 @@ the emit box.
 |------|-----------|-------------|--------------------|-----------|----------------|
 | `fine_tune` | `train-scale` | 1 536 in-batch-negative pairs, one GradCache backward + AdamW step, `Device::Cpu` | 180.0 pairs/s | 30% rel. drop | throughput (pairs/s) |
 | `fine_tune_graph` | `graph-train-scale` | 8 communities × 64 nodes, biased-walk sampler (walk length 4, 4 walks/node) | 6 418.1 pairs/s | 30% rel. drop | sampled-pairs/s throughput (+ a portable determinism digest) |
-| `train_context_predictor` | `context-predictor-scale` | CNP over 8 tasks × 18 rows, 30 epochs | 21.29 episode-steps/s | 30% rel. drop | meta-training throughput (+ a portable predict digest) |
-| `generate_embeddings` | `model-inference-scale` | 16 rows over a tiny 32-dim 1-layer BERT bundle, `Device::Cpu` | 333.6 rows/s | 30% rel. drop | coarse serving throughput (+ a portable embed digest) |
-| `infer` (classification) | `model-inference-scale` | 16 rows over a tiny 32-dim 1-layer ModernBERT classifier bundle, `Device::Cpu` | 207.0 rows/s | 30% rel. drop | coarse serving throughput (+ a portable infer digest) |
-| `search` + `build_neighbor_graph` | `arxiv` | 2 000-row corpus slice, 100 held-out 768-dim queries (frozen sidecar) | recall@{1,10,100} = {1.0, 1.0, 0.997} | floor = measured − 0.04 (absolute margin) | **portable recall fraction** (not a rate) — `measured >= floor` |
+| `train_context_predictor` | `context-predictor-scale` | CNP over 8 tasks × 18 rows, 30 epochs | 21.29 episode-steps/s | 30% rel. drop | meta-training throughput (+ a same-box predict digest) |
+| `generate_embeddings` | `model-inference-scale` | 16 rows over a tiny 32-dim 1-layer BERT bundle, `Device::Cpu` | 333.6 rows/s | 30% rel. drop | coarse serving throughput (+ a same-box embed digest) |
+| `infer` (classification) | `model-inference-scale` | 16 rows over a tiny 32-dim 1-layer ModernBERT classifier bundle, `Device::Cpu` | 207.0 rows/s | 30% rel. drop | coarse serving throughput (+ a same-box infer digest) |
+| `search` + `build_neighbor_graph` | `arxiv` | 2 000-row corpus slice, 100 held-out 768-dim queries (frozen sidecar) | recall@{1,10,100} = {1.0, 1.0, 0.997} | floor = measured − 0.04 (absolute margin) | **recall fraction** (not a rate) — `measured >= floor`, an inequality gate whose absolute margin absorbs cross-box float drift; the fraction is bit-for-bit only on the same box |
 
 ### The reference box
 
@@ -77,9 +79,26 @@ own definition:
 > changes, not a number a different machine can re-derive.
 
 What stays portable is the *shape* of the gate (a measured rate must not fall
-more than a fixed fraction below the committed baseline) and the **determinism
-digests** and the **recall fraction**, which any box re-derives bit-for-bit. So
-the rate rows above are meaningful only against the reference box; do not read
+more than a fixed fraction below the committed baseline; a measured recall must
+not fall below the committed floor) — that is the sense of "portable" in the
+quote above: the floor travels to another box, not the bits. Of the digests
+above, only the `fine_tune_graph` sampled-pair-set checksum is portable
+bit-for-bit: the pair selection is a seeded integer stream (its scalar `f64`
+roulette arithmetic is neither contracted nor reordered by Rust) and the
+checksum is an FNV-1a fold over the selected node-text bytes, so any box
+re-derives it exactly. The **recall fraction** is not in that class — it is
+scoped like the float digests. Recall-set membership is decided by an `f32`
+cosine reduction (the exact oracle's `cosine_distance`, a sequential `f32`
+accumulation over the dot product and norms), so the fraction is bit-for-bit
+only on the same box; across boxes or architectures a near-tie can move a
+neighbour in or out of the top-k, and the recall SLO is an inequality gate
+(`measured >= floor`) whose absolute margin (0.04) absorbs that small float
+drift — never a bit-for-bit equality. The predict/embed/infer digests fold an
+`f32` forward, and an `f32` reduction is NOT bit-identical across CPUs
+(SIMD/FMA contraction and BLAS reduction order differ by machine), so those
+three are a same-box property: each is re-derived on the box that ran it, not
+asserted equal across boxes. So the
+rate rows above are meaningful only against the reference box; do not read
 them as a throughput your hardware must hit. The release-tag gate is the
 authoritative reading because it runs on a same-box-ish runner; the nightly lane
 is early-warning, not a portable promise.

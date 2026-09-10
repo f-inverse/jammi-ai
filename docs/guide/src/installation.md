@@ -49,9 +49,14 @@ carries the `jammi` admin CLI; it is turnkey:
 
 ```bash
 docker run --gpus all \
-  -p 8080:8080 -p 8081:8081 \
+  -p 127.0.0.1:8080:8080 -p 127.0.0.1:8081:8081 \
   ghcr.io/f-inverse/jammi-ai-server-cu12:latest
 ```
+
+Both ports bind to `127.0.0.1`: the server performs no authentication of
+its own (see [The identity seam](./deploy-server.md#the-identity-seam)),
+so a loopback bind keeps the unauthenticated admin surface off the host's
+public network until a terminator or reverse proxy is put in front of it.
 
 Both `:latest` tags are re-pointed by every `v*` release tag (never by a
 prerelease); the CPU `:latest` can additionally be re-pointed to the current

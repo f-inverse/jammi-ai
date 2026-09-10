@@ -31,7 +31,7 @@ The gRPC chain and Flight SQL share one Tonic server so a client binding a tenan
 
 ```bash
 docker run --rm \
-  -p 8080:8080 -p 8081:8081 \
+  -p 127.0.0.1:8080:8080 -p 127.0.0.1:8081:8081 \
   -v jammi_data:/var/lib/jammi \
   ghcr.io/f-inverse/jammi-ai-server:latest
 
@@ -57,6 +57,11 @@ info = client.get_flight_info(FlightDescriptor.for_command(b"SELECT 1 AS one"))
 print(client.do_get(info.endpoints[0].ticket).read_all())
 '
 ```
+
+Both ports bind to `127.0.0.1`: the server performs no authentication of
+its own (see [Deploying as a container](https://f-inverse.github.io/jammi-ai/deploy-server.html#the-identity-seam)),
+so a loopback bind keeps the unauthenticated admin surface off the host's
+public network until a terminator or reverse proxy is put in front of it.
 
 ## Quickstart (from source)
 

@@ -111,13 +111,18 @@ For deployments that need a long-running Flight SQL + gRPC service rather than a
 
 ```bash
 docker run --rm \
-  -p 8080:8080 -p 8081:8081 \
+  -p 127.0.0.1:8080:8080 -p 127.0.0.1:8081:8081 \
   -v jammi_data:/var/lib/jammi \
   ghcr.io/f-inverse/jammi-ai-server:latest
 
 curl http://localhost:8080/healthz
 # {"status":"ok","version":"0.8.0"}
 ```
+
+Both ports bind to `127.0.0.1`: the server performs no authentication of
+its own (see [Deploying as a container](https://f-inverse.github.io/jammi-ai/deploy-server.html#the-identity-seam)),
+so a loopback bind keeps the unauthenticated admin surface off the host's
+public network until a terminator or reverse proxy is put in front of it.
 
 For GPU-accelerated inference, pull the CUDA variant `ghcr.io/f-inverse/jammi-ai-server-cu12:latest` and run it with `--gpus all` on a host with the NVIDIA Container Toolkit — both `:latest` tags are re-pointed by every `v*` release tag (never by a prerelease); the CPU `:latest` can additionally be re-pointed to the current `main` by a manual `build-and-push-main` dispatch.
 

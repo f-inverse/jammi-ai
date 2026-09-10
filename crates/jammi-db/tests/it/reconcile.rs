@@ -109,6 +109,33 @@ fn backdate_dir(dir: &std::path::Path, by: Duration) {
     }
 }
 
+/// The require-gate polarity every `chmod` permission-fault probe in the
+/// workspace's test suites shares (esc-089 F1;
+/// `crates/jammi-db/src/store/artifact.rs::chmod_bypassed` is the canonical
+/// copy this one mirrors byte-for-byte in polarity and message): `probe`
+/// performs the fault-injection premise check itself and returns `true` if
+/// the fault was BYPASSED (root, or a mode-ignoring filesystem). A bypass is
+/// normally a loud, `eprintln`'d skip; under `JAMMI_REQUIRE_POSIX_PERMS=1`
+/// (the CI lane that is SUPPOSED to run unprivileged with real POSIX
+/// permission enforcement) a bypass is instead a hard `panic!` — never a
+/// silent `return`. Each probe file carries its own copy of this wrapper in
+/// the canonical shape the kernel-oracle registry
+/// (`ci/kernel-oracle-helpers.txt`) verifies per file.
+fn chmod_bypassed(test_name: &str, probe: impl FnOnce() -> bool) -> bool {
+    let bypassed = probe();
+    if bypassed {
+        if std::env::var_os("JAMMI_REQUIRE_POSIX_PERMS").is_some() {
+            panic!(
+                "JAMMI_REQUIRE_POSIX_PERMS is set but '{test_name}' could not inject its \
+                 permission fault (root, or a mode-ignoring filesystem) — the fault-injection \
+                 premise this test needs does not hold; a silent skip is not acceptable here"
+            );
+        }
+        eprintln!("{test_name}: chmod bypassed (root?) — skipping");
+    }
+    bypassed
+}
+
 /// The lease-duration floor `apply=true` must respect. This test never
 /// actually waits for expiry — it only checks the synchronous config
 /// guard — so a short-but-valid whole-second pair
@@ -537,7 +564,26 @@ async fn rebuild_failure_after_the_purge_defers_seg1_reclaim_to_a_later_pass() {
     // real I/O error, never a mere 404: the rebuild fails after the purge
     // ATTEMPTED (and failed) to clear the stale segment set.
     use std::os::unix::fs::PermissionsExt;
+    // Written BEFORE the chmod below (needs a writable dir) and deliberately
+    // NOT backdated — its own `last_modified` stays "now", so even if it is
+    // never removed it can only ever classify as a pending (not orphan)
+    // candidate at this test's 3s grace, never polluting either pass'
+    // accounting.
+    let probe_path = table_dir.join(".chmod-probe");
+    std::fs::write(&probe_path, b"probe").unwrap();
     std::fs::set_permissions(&table_dir, std::fs::Permissions::from_mode(0o555)).unwrap();
+
+    // PROBE: root (and a mode-ignoring filesystem) bypasses chmod — under
+    // which the real-delete-failure premise this test needs never holds
+    // (every delete below would silently succeed instead of hitting EACCES).
+    let bypassed = chmod_bypassed(
+        "rebuild_failure_after_the_purge_defers_seg1_reclaim_to_a_later_pass",
+        || std::fs::remove_file(&probe_path).is_ok(),
+    );
+    if bypassed {
+        let _ = std::fs::set_permissions(&table_dir, std::fs::Permissions::from_mode(0o755));
+        return;
+    }
 
     let first = store
         .reconcile(ReconcileOptions {
@@ -550,6 +596,7 @@ async fn rebuild_failure_after_the_purge_defers_seg1_reclaim_to_a_later_pass() {
     // Restore write permission unconditionally before any assertion can
     // panic, so the tempdir's own Drop can clean up either way.
     std::fs::set_permissions(&table_dir, std::fs::Permissions::from_mode(0o755)).unwrap();
+    let _ = std::fs::remove_file(&probe_path);
 
     let promoted = store
         .catalog()
@@ -1302,13 +1349,31 @@ async fn abort_aggregates_a_real_delete_failure_into_one_error() {
     // `delete_if_exists` underneath fails with a real I/O error, never a
     // 404.
     use std::os::unix::fs::PermissionsExt;
+    // Written BEFORE the chmod below (needs a writable dir); removed again
+    // right after permissions are restored, so it never lingers into either
+    // assertion below.
+    let probe_path = table_dir.join(".chmod-probe");
+    std::fs::write(&probe_path, b"probe").unwrap();
     std::fs::set_permissions(&table_dir, std::fs::Permissions::from_mode(0o555)).unwrap();
+
+    // PROBE: root (and a mode-ignoring filesystem) bypasses chmod — under
+    // which `abort`'s byte cleanup would silently succeed instead of hitting
+    // the real EACCES this test's premise needs.
+    let bypassed = chmod_bypassed(
+        "abort_aggregates_a_real_delete_failure_into_one_error",
+        || std::fs::remove_file(&probe_path).is_ok(),
+    );
+    if bypassed {
+        let _ = std::fs::set_permissions(&table_dir, std::fs::Permissions::from_mode(0o755));
+        return;
+    }
 
     let result = info.abort().await;
 
     // Restore write permission unconditionally (before any assertion can
     // panic) so the tempdir's own Drop can clean up.
     std::fs::set_permissions(&table_dir, std::fs::Permissions::from_mode(0o755)).unwrap();
+    let _ = std::fs::remove_file(&probe_path);
 
     let err = result.unwrap_err();
     let message = err.to_string();

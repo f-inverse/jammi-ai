@@ -38,6 +38,7 @@ async fn clip_text_generate_embeddings_cpu_gpu_parity() {
             &["abstract".to_string()],
             "id",
             CachePolicy::Bypass,
+            None,
         )
         .await
         .unwrap();
@@ -53,6 +54,7 @@ async fn clip_text_generate_embeddings_cpu_gpu_parity() {
             &["abstract".to_string()],
             "id",
             CachePolicy::Bypass,
+            None,
         )
         .await
         .unwrap();

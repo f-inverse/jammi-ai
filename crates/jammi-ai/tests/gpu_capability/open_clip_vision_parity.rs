@@ -107,7 +107,14 @@ async fn open_clip_vision_generate_embeddings_cpu_gpu_parity() {
     let cpu = harness::cpu_session(cpu_dir.path()).await;
     add_image_corpus(&cpu, &cpu_corpus).await;
     let (cpu_table, _) = cpu
-        .generate_image_embeddings("figures", &model, "image", "figure_id", CachePolicy::Bypass)
+        .generate_image_embeddings(
+            "figures",
+            &model,
+            "image",
+            "figure_id",
+            CachePolicy::Bypass,
+            None,
+        )
         .await
         .unwrap();
     let cpu_vecs = harness::keyed_result_vectors(&cpu, &cpu_table).await;
@@ -117,7 +124,14 @@ async fn open_clip_vision_generate_embeddings_cpu_gpu_parity() {
     let gpu = harness::gpu_session(gpu_dir.path()).await;
     add_image_corpus(&gpu, &gpu_corpus).await;
     let (gpu_table, _) = gpu
-        .generate_image_embeddings("figures", &model, "image", "figure_id", CachePolicy::Bypass)
+        .generate_image_embeddings(
+            "figures",
+            &model,
+            "image",
+            "figure_id",
+            CachePolicy::Bypass,
+            None,
+        )
         .await
         .unwrap();
     let gpu_vecs = harness::keyed_result_vectors(&gpu, &gpu_table).await;

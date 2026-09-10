@@ -9,7 +9,11 @@
 //! unmodified `BuildingTable::finish` funnel. The replay always recomputes
 //! ([`CachePolicy::Bypass`]) — a recompute that reused a cache would be a no-op,
 //! not a recompute — and is byte-identical when the inputs have not moved
-//! (because the descriptor records every output-affecting determinant).
+//! (because the descriptor records every output-affecting determinant). That
+//! byte identity holds on the producing host (same host and architecture) —
+//! the descriptor does not record the CPU microarchitecture that ran the fold,
+//! so across hosts a replay is value-equivalent up to float rounding and the
+//! identity is the catalog row plus `definition_hash`, not the raw bytes.
 //!
 //! # The two bounded actions, and the line the engine does not cross
 //!

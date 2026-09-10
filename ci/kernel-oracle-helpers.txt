@@ -53,7 +53,10 @@ crates/jammi-server/tests/it/grpc_embedding_gpu.rs::start_gpu_embedding_server
 crates/jammi-server/tests/it/grpc_remote_session_gpu.rs::start_gpu_engine_server
 crates/jammi-bench/src/finetune_step.rs::vram_off_gpu_arm_require_gate
 crates/jammi-bench/src/finetune_step.rs::vram_on_gpu_arm_require_gate
+crates/jammi-db/tests/it/broker_parity.rs::require_live_nats
+crates/jammi-db/tests/it/broker_parity.rs::require_live_pg
 crates/jammi-db/tests/it/catalog_ping.rs::require_live_pg
+crates/jammi-db/tests/it/esc_f3_intra_batch_row_order.rs::require_live_pg
 crates/jammi-db/tests/it/eval_per_query.rs::require_live_pg
 crates/jammi-db/tests/it/materialization_crash_recovery.rs::crash_recovery_child_dispatch_require_gate
 crates/jammi-db/tests/it/mutable_crash_recovery.rs::crash_recovery_child_dispatch_require_gate

@@ -29,7 +29,7 @@ workspace ships every publishable crate at the same
   claimed job/table lease is a registration with one dedicated
   lease-renewal OS thread (`LeaseKeeper`, its own runtime, its own catalog
   connection) instead of a per-lease `tokio::spawn` heartbeat task, so a
-  CPU-bound inline compute job on the main runtime can no longer starve its
+  CPU-bound inline compute job on the main runtime cannot starve its
   own lease renewal. `[worker] { enabled, kinds, idle_poll_secs }` and
   `[jobs] { retention_days }` (default 30; a terminal job stops blocking
   `delete_model` once past the window, a non-terminal job blocks
@@ -418,12 +418,17 @@ workspace ships every publishable crate at the same
   oversize gRPC message is); `max_in_flight` / `max_in_flight_per_connection`
   (defaults 256 / 64; `RESOURCE_EXHAUSTED`; unary methods only; `0` =
   unbounded); `request_timeout_secs` (default unset; `DEADLINE_EXCEEDED`;
-  unary only); `wait_timeout_secs` (default unset; `DEADLINE_EXCEEDED`;
-  refuses a `TriggerService.Subscribe` / `JobService.WaitJob` call whose
-  client-requested `grpc-timeout` exceeds the budget OR carries no
-  `grpc-timeout` at all — an unbounded request is refused exactly like an
-  over-budget one, before the stream opens; `jammi-client`'s `wait_job`/
-  `subscribe` always declare a bounded deadline for this reason);
+  unary only); `wait_timeout_secs` (default unset; `DEADLINE_EXCEEDED`) bounds
+  a `TriggerService.Subscribe` / `JobService.WaitJob` stream one of three
+  ways, depending on the caller's `grpc-timeout` header: a header ABOVE the
+  budget is refused at the edge, before the stream opens; a header WITHIN
+  the budget is ENFORCED by the server, which closes the stream at the
+  caller's own declared deadline; NO header at all is NOT refused — the
+  configured budget itself becomes the stream's deadline, so a request that
+  declares nothing still ends at the budget rather than running unbounded.
+  `jammi-client`'s `wait_job`/`subscribe` send no `grpc-timeout` of their
+  own, relying on the server's budget; `wait_job_with_timeout`/
+  `subscribe_with_timeout` send an explicit one);
   `max_subscriptions` / `max_job_waits` (defaults 256 / 1024;
   `RESOURCE_EXHAUSTED`; the concurrent-stream budget for each of those two
   RPCs, released when the stream ends or the client disconnects; `0` =
@@ -824,7 +829,7 @@ workspace ships every publishable crate at the same
 
 ### Fixed
 - **`JobService.PruneJobs` swept every tenant's terminal rows, not just the
-  caller's (#485, round-2 adversarial audit).** The RPC handler bypassed
+  caller's (#485).** The RPC handler bypassed
   `scoped(...)` (the tenant-binding path every other `JobService` RPC uses)
   and `Catalog::prune_jobs` had no tenant predicate at all; the
   `tenant_isolation_oracle.rs` allowlist entry and `job.proto`'s "global
@@ -854,14 +859,15 @@ workspace ships every publishable crate at the same
   until it is triaged as owned-shape (round-trips faithfully) or a genuine
   foreign fold.
 - **`WaitJob`/`Subscribe` requests carrying NO `grpc-timeout` header at all
-  were let through unbounded whenever `[server.limits] wait_timeout_secs` was
-  configured, contradicting that key's own doc (which already promised an
-  unbounded request is refused exactly like an over-budget one).**
-  `MethodClassLayer` now refuses an absent header the same way it refuses an
-  over-budget one; `jammi-client`'s `wait_job`/`subscribe` always declare a
-  bounded default `grpc-timeout` (with `wait_job_with_timeout` /
-  `subscribe`'s own budget for a caller that wants a different one) so this
-  fix does not regress the shipped client.
+  ran unbounded whenever `[server.limits] wait_timeout_secs` was
+  configured — a header-less stream had no ceiling at all.**
+  `MethodClassLayer` now bounds an absent header by the configured budget
+  itself: the stream opens (never refused for lacking a header) and
+  `PermitBody::Deadlined` closes it once `wait_timeout_secs` elapses, the
+  same mechanism a within-budget header's own deadline uses. `jammi-client`'s
+  `wait_job`/`subscribe` send no `grpc-timeout` of their own, relying on
+  this server-side budget; `wait_job_with_timeout`/`subscribe_with_timeout`
+  send an explicit one, refused at the edge if it exceeds the budget.
 - **`create_result_table`'s `partial_result` compare-and-set could be won by a
   zombie of a requeued-and-re-claimed attempt (#485, esc-107).** A
   `job_id`-only predicate (`WHERE job_id = $1 AND status = 'running' AND
@@ -1333,18 +1339,17 @@ workspace ships every publishable crate at the same
   `fine_tune_acceleration_report` keep their signatures (now backed by
   `JobService`) and gain `job_status`/`wait_job`/`cancel_job`/`list_jobs`.
   `jammi train list/status` is `jammi jobs list/status/cancel/prune` +
-  `jammi workers list`. **Out of this unit's scope, tracked as a follow-up:**
-  the seven materializing compute verbs (`GenerateEmbeddings`,
-  `ImportEmbeddings`, `BuildNeighborGraph`, `PropagateEmbeddings`,
-  `AsofJoin`, `Recompute`, `Infer`) still return their existing per-verb
-  response synchronously rather than a `SubmitJobResponse` handle. The
-  `[server.limits]` request-bounds/refusal-layer surface (§5) — message-size,
-  in-flight, per-connection, request/wait-timeout, and stream-budget bounds,
-  refused at the edge with a typed status — SHIPPED in a follow-up unit (see
-  this changelog's own `[server.limits]` entry, `crates/jammi-server/src/
-  limits.rs`); no escape row was left open for it. `SubmitJob`'s
-  `idempotency_key` is likewise now a DURABLE per-tenant dedupe (migration
-  030's `jobs.idempotency_key` + unique index), not merely process-lifetime.
+  `jammi workers list`. The seven materializing compute verbs
+  (`GenerateEmbeddings`, `ImportEmbeddings`, `BuildNeighborGraph`,
+  `PropagateEmbeddings`, `AsofJoin`, `Recompute`, `Infer`) still return their
+  existing per-verb response synchronously rather than a `SubmitJobResponse`
+  handle. The `[server.limits]` request-bounds/refusal-layer surface (§5) —
+  message-size, in-flight, per-connection, request/wait-timeout, and
+  stream-budget bounds, refused at the edge with a typed status (see this
+  changelog's own `[server.limits]` entry, `crates/jammi-server/src/
+  limits.rs`) — and `SubmitJob`'s `idempotency_key`, a DURABLE per-tenant
+  dedupe (migration 030's `jobs.idempotency_key` + unique index), apply
+  uniformly across every `JobService` RPC regardless of this scope boundary.
 - **Existing result-table and artifact object keys predating the tenant-prefixed layout
   are unattributed until the table is re-materialized (#484).** `reconcile`'s allowlist
   recognizes only `{seg}/{table}.parquet` and `models/{seg}/{job_id}/…` keys (`seg` a

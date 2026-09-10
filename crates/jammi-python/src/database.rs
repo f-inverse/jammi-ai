@@ -313,10 +313,10 @@ impl PyDatabase {
                 // `InferenceSession::close` shuts the session's lease
                 // keeper (N3) down and joins its dedicated thread — closing
                 // its OWN catalog connection — before closing the shared
-                // pool. Closing only the shared pool (as this used to)
-                // left the keeper's connection open, and for the SQLite
-                // backend that connection alone is enough to keep the
-                // `unix-excl` VFS's process-exclusive lock held.
+                // pool. Closing only the shared pool without this step
+                // would leave the keeper's connection open, and for the
+                // SQLite backend that connection alone is enough to keep
+                // the `unix-excl` VFS's process-exclusive lock held.
                 self.session.close().await;
                 stopped
             })
@@ -1216,8 +1216,8 @@ impl PyDatabase {
     /// [`TrainingSpec`], which the shared
     /// [`InferenceSession::run_training_spec_deduped`] dispatch runs
     /// in-process; the embedded worker this connection owns executes it.
-    /// Returns the same `Job` handle the per-verb embedded submits used to
-    /// return. A malformed or invalid body raises `ValueError`.
+    /// Returns the same `Job` handle the per-verb embedded submits return.
+    /// A malformed or invalid body raises `ValueError`.
     ///
     /// `idempotency_key`, when non-empty, dedupes the same way the wire's
     /// `SubmitJob.idempotency_key` does (migration 030's durable per-tenant

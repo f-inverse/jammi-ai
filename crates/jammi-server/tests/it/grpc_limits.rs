@@ -249,21 +249,18 @@ async fn wait_job_with_a_timeout_above_the_configured_budget_is_refused_at_the_e
 /// itself enforced by the server: the stream ends with `DEADLINE_EXCEEDED`
 /// at the CALLER's own declared deadline, never left open past it.
 ///
-/// RED before the fix (#485 round 4): the `grpc-timeout` match's within-
-/// budget arm used to be `Some(_) => {}` — a within-budget header was
-/// "honoured as-is", meaning nothing server-side ever bounded the body, and
-/// tonic's own `GrpcTimeout` never enforces a `grpc-timeout` on a streaming
-/// response body already returned (races only the service future --
-/// `tonic-0.14.5/src/transport/service/grpc_timeout.rs:79-92`). A client
-/// that declared a deadline under the (here, far wider) budget and then
-/// ignored it — never dropping the stream itself — would hold its
-/// `max_job_waits` permit for as long as the connection stayed open, past
-/// its own declared 2s deadline, with nothing to end it before the 60s
-/// budget. GREEN after: the server itself ends the stream at the caller's
-/// declared 2s deadline, well before the 60s budget -- renamed from
-/// `wait_job_with_a_timeout_within_the_configured_budget_opens_normally`
-/// (its old name asserted only that the stream OPENED, never that it also
-/// correctly ENDS -- the gap this reshape closes).
+/// The `grpc-timeout` match's within-budget arm must set a `Some` deadline
+/// enforced server-side rather than merely let a within-budget header be
+/// "honoured as-is": tonic's own `GrpcTimeout` never enforces a
+/// `grpc-timeout` on a streaming response body already returned (races only
+/// the service future -- `tonic-0.14.5/src/transport/service/grpc_timeout.
+/// rs:79-92`), so without this arm's own enforcement a client that declared
+/// a deadline under the (here, far wider) budget and then ignored it —
+/// never dropping the stream itself — would hold its `max_job_waits` permit
+/// for as long as the connection stayed open, past its own declared 2s
+/// deadline, with nothing to end it before the 60s budget. Instead the
+/// server itself ends the stream at the caller's declared 2s deadline, well
+/// before the 60s budget.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn wait_job_with_a_timeout_within_the_configured_budget_opens_normally_and_ends_at_the_declared_deadline(
 ) {
@@ -327,17 +324,14 @@ async fn wait_job_with_a_timeout_within_the_configured_budget_opens_normally_and
     );
 }
 
-/// RED before the fix: a `WaitJob` call carrying NO `grpc-timeout` header at
-/// all (HTTP/2's own no-deadline default -- the shape a header-less client,
-/// e.g. a Python-shaped one with no explicit timeout, sends) used to be
-/// refused AT THE EDGE whenever `wait_timeout_secs` was configured. The
-/// reshape (#485 round 4): the SERVER budget bounds the stream; the client
-/// imposes no deadline of its own. GREEN after: the stream opens normally
-/// (never refused at open), stays genuinely live past several heartbeat
-/// ticks, then ends with `DEADLINE_EXCEEDED` once the budget elapses -- not
-/// before it, and not indefinitely past it. Renamed from
-/// `wait_job_with_no_timeout_header_is_refused_when_a_budget_is_configured`
-/// (its old name asserted the now-superseded edge-refusal behaviour).
+/// A `WaitJob` call carrying NO `grpc-timeout` header at all (HTTP/2's own
+/// no-deadline default -- the shape a header-less client, e.g. a
+/// Python-shaped one with no explicit timeout, sends) must NOT be refused at
+/// the edge when `wait_timeout_secs` is configured: the SERVER budget bounds
+/// the stream instead; the client imposes no deadline of its own. The stream
+/// opens normally (never refused at open), stays genuinely live past
+/// several heartbeat ticks, then ends with `DEADLINE_EXCEEDED` once the
+/// budget elapses -- not before it, and not indefinitely past it.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn wait_job_with_no_timeout_header_is_bounded_by_the_configured_budget_as_the_stream_deadline(
 ) {

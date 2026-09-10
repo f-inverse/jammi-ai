@@ -64,7 +64,7 @@ use crate::tenant::TenantId;
 /// (no byte deletion — reconcile reaps the objects later); with no runtime
 /// the lease simply expires and recovery reaps the row. After
 /// `finish`/`abort`/`detach` the drop is a no-op by construction: the
-/// `status = 'building'` predicate no longer matches, or (`detach`) the
+/// `status = 'building'` predicate does not match, or (`detach`) the
 /// hold is already gone and no CAS is issued at all.
 pub struct BuildingTable {
     store: ResultStore,
@@ -359,10 +359,10 @@ impl BuildingTable {
     ///
     /// Distinct from [`Self::abort`] (a CAS-fail-and-delete, the OWNER's own
     /// decision that its output should never exist) — `detach` is for the
-    /// caller that is no longer sure it IS the owner (lease lost, attempts
+    /// caller that is not sure it IS the owner (lease lost, attempts
     /// mismatch) and so must not act as one: no CAS, because a CAS run by a
     /// non-owner risks nothing structurally, but issuing ANY write here would
-    /// contradict the premise that this caller no longer has standing to
+    /// contradict the premise that this caller has no standing to
     /// decide the row's fate.
     pub fn detach(mut self) {
         self.done.store(true, Ordering::SeqCst);

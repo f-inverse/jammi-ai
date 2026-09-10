@@ -553,7 +553,7 @@ async fn heartbeat_renews_for_owner_only(backend: BackendKind) {
         .unwrap();
     assert!(
         !post_complete,
-        "a job that is no longer running cannot be heartbeat"
+        "a job that is not running cannot be heartbeat"
     );
 }
 
@@ -1217,14 +1217,13 @@ async fn submit_job_deduped_different_tenants_may_reuse_a_key(backend: BackendKi
     );
 }
 
-/// RED before the bound (#485 round 4): with no `MAX_IDEMPOTENCY_KEY_BYTES`
-/// assertion, a 257-byte `idempotency_key` was accepted verbatim by SQLite
-/// (which has no index-row-size ceiling) but produced a real live failure on
-/// Postgres -- `index row size 5136 exceeds btree version 4 maximum 2704` --
-/// so the SAME input diverged silently across backends. GREEN after:
-/// `submit_job_deduped` refuses a key one byte over the bound identically on
-/// BOTH backends, with a typed `JammiError::Config` naming the bound (never
-/// the key's own value).
+/// Pins `MAX_IDEMPOTENCY_KEY_BYTES`: an unbounded `idempotency_key` would be
+/// accepted verbatim by SQLite (which has no index-row-size ceiling) but
+/// fail on Postgres -- `index row size 5136 exceeds btree version 4 maximum
+/// 2704` -- so the SAME input would diverge silently across backends absent
+/// this bound. `submit_job_deduped` refuses a key one byte over the bound
+/// identically on BOTH backends, with a typed `JammiError::Config` naming
+/// the bound (never the key's own value).
 #[test_case(BackendKind::Sqlite ; "sqlite")]
 #[cfg_attr(
     feature = "live-postgres-tests",
@@ -1479,8 +1478,8 @@ async fn finish_job_with_model_is_an_attempt_guarded_compare_and_set(backend: Ba
          the sole writer of the committed pointer"
     );
 
-    // A second finish by the same owner, same attempt is now a no-op (status
-    // is no longer running), so finish-with-model is not re-runnable once
+    // A second finish by the same owner, same attempt is a no-op (status
+    // is not running), so finish-with-model is not re-runnable once
     // terminal.
     let again = catalog
         .finish_job_with_model(FinishJobWithModelParams {
@@ -1638,7 +1637,7 @@ async fn finish_job_with_model_update_is_scoped_by_version_and_tenant(backend: B
     );
 }
 
-/// F4 (unit 348 audit), ported: a checkpoint row's catalog NAME occupied by
+/// A checkpoint row's catalog NAME occupied by
 /// an unrelated, pre-existing model row must be skipped (never clobbered,
 /// never shadow-inserted) while every OTHER retained epoch row registers
 /// normally and the job still finishes successfully — checkpoints are

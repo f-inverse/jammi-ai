@@ -104,7 +104,7 @@ async fn register_model(catalog: &Catalog, model_id: &str) {
 /// payload (`jammi_ai::jobs::JobResult::Model.metrics`), the same shape
 /// `JobServer`'s `job_status_response_from_record` decodes back through
 /// `JobStatusResponse.result`'s `Model` arm, so this seed writes it there
-/// rather than to a column that no longer exists.
+/// rather than to a dedicated metrics column, which this schema has none of.
 async fn seed_completed_job(catalog: &Catalog, fixture: &JobFixture<'_>, base_model_id: &str) {
     let job_id = fixture.job_id.to_string();
     let base_model_id = base_model_id.to_string();

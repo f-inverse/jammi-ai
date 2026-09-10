@@ -68,7 +68,7 @@ async fn migration_005_adds_tenant_id_to_every_table() {
     let backend = BackendImpl::Sqlite(backend);
     // `training_jobs` carried a `tenant_id` column too (migration 005), but
     // migration 029 later drops the table entirely — its post-005 shape is
-    // no longer observable after a full open, so it is not in this list; see
+    // not observable after a full open, so it is not in this list; see
     // `migration_029_creates_jobs_instances_workers_and_drops_training_jobs`
     // for the current-schema equivalent (`jobs` also carries `tenant_id`).
     for table in [
@@ -885,7 +885,7 @@ async fn migration_029_copies_training_jobs_rows_into_jobs_as_queued() {
         .await
         .unwrap();
 
-    // The reopen re-runs migration 029 for real (the ledger no longer names
+    // The reopen re-runs migration 029 for real (the ledger does not name
     // it) against the manufactured pre-029 state above.
     let reopened = Catalog::open(dir.path()).await.unwrap();
     let job = reopened.get_job("legacy-1").await.unwrap();

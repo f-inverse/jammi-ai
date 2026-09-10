@@ -1007,16 +1007,14 @@ mod tests {
         }
     }
 
-    /// RED before the fix (B5, #485 round 4): a decodable
-    /// `pb::JammiErrorDetail` whose `variant` oneof is unset -- the shape a
-    /// NEWER peer's payload produces when it sets a oneof tag this build's
-    /// codegen does not know (built here with a synthetic field number no
-    /// `JammiErrorDetail` variant ever uses, so prost's decoder skips it
-    /// rather than erroring, leaving `variant: None` exactly like a real
-    /// cross-version drift would) -- used to reconstruct as
-    /// `JammiError::Other(String::new())`, discarding the enclosing
-    /// `Status`'s own message entirely. GREEN after: the reconstructed error
-    /// carries that message verbatim.
+    /// A decodable `pb::JammiErrorDetail` whose `variant` oneof is unset --
+    /// the shape a NEWER peer's payload produces when it sets a oneof tag
+    /// this build's codegen does not know (built here with a synthetic
+    /// field number no `JammiErrorDetail` variant ever uses, so prost's
+    /// decoder skips it rather than erroring, leaving `variant: None`
+    /// exactly like a real cross-version drift would) -- must reconstruct
+    /// as `JammiError::Other` carrying the enclosing `Status`'s own message
+    /// verbatim, never `Other(String::new())` discarding it.
     #[test]
     fn unknown_oneof_variant_reconstructs_other_carrying_the_status_message_not_empty() {
         /// A shadow message sharing NO field number with `pb::JammiErrorDetail`'s
@@ -1083,14 +1081,12 @@ mod tests {
         detail
     }
 
-    /// RED before the fix (#485 round 4): an unknown `BackendErrorDetail`
-    /// oneof nested under `MutableTableError::Backend` (a NEWER peer's
-    /// `BackendErrorDetail` variant this build's codegen does not know) used
-    /// to reconstruct as `BackendError::Execution(String::new())` via the
-    /// removed `From<pb::BackendErrorDetail> for BackendError` impl, silently
-    /// discarding the enclosing `Status`'s own message. GREEN after: it
-    /// reconstructs as `BackendError::Execution` carrying that message
-    /// verbatim, via `backend_error_from_detail`.
+    /// An unknown `BackendErrorDetail` oneof nested under
+    /// `MutableTableError::Backend` (a NEWER peer's `BackendErrorDetail`
+    /// variant this build's codegen does not know) must reconstruct as
+    /// `BackendError::Execution` carrying the enclosing `Status`'s own
+    /// message verbatim, via `backend_error_from_detail` -- never
+    /// `Execution(String::new())` silently discarding it.
     #[test]
     fn unknown_backend_variant_nested_in_mutable_table_carries_the_status_message() {
         use pb::mutable_table_error_detail::Variant;

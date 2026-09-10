@@ -115,7 +115,7 @@ pub struct LeaseHold {
 }
 
 impl LeaseHold {
-    /// `true` once this hold can no longer be trusted to own its row, on any
+    /// `true` once this hold cannot be trusted to own its row, on any
     /// of three arms: a renew for this hold matched zero rows (the row was
     /// claimed by a peer, or went terminal, underneath this holder); the
     /// keeper thread has exited (a panic, a failed reconnect, shutdown) so
@@ -123,7 +123,7 @@ impl LeaseHold {
     /// renewal is older than the lease window (the keeper is alive but has
     /// not managed to renew this row within the time a peer's reclaim needs
     /// to take it). A holder observing `true` must treat its claim as gone:
-    /// it no longer owns the row and must not act as though it does.
+    /// it does not own the row and must not act as though it does.
     pub fn lost(&self) -> bool {
         self.lost.load(Ordering::SeqCst)
             || !self.liveness.alive.load(Ordering::SeqCst)

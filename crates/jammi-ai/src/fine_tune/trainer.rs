@@ -584,11 +584,10 @@ impl TrainingLoopBuilder {
             JammiError::FineTune("TrainingLoopBuilder: worker_id required".into())
         })?;
         // Presence-validated (matching every other required builder field)
-        // but no longer stored on `TrainingLoop` itself: `mark_training_running`
-        // — the only reader of a catalog handle inside the run — is gone
-        // with `training_repo` (the generalised `jobs` schema's claim
-        // already stamps `running`; there is no separate mid-run catalog
-        // write for `TrainingLoop::run` to make). Kept as a required
+        // but not stored on `TrainingLoop` itself: the generalised `jobs`
+        // schema's claim already stamps `running`, so there is no separate
+        // mid-run catalog write for `TrainingLoop::run` to make and no
+        // reader of a catalog handle inside the run. Kept as a required
         // builder input anyway so every call site still threads a real,
         // claimed catalog through construction — the same "the caller
         // proves it claimed the job before training starts" shape as

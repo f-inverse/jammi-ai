@@ -21,6 +21,7 @@ let (record, _outcome) = session.generate_text_embeddings(
     &["abstract".to_string()],
     "id",
     CachePolicy::Bypass,
+    None,
 ).await?;
 
 println!("Embedded {} rows, {} dimensions", record.row_count, record.dimensions.unwrap());
@@ -106,6 +107,7 @@ session.generate_text_embeddings(
     &["title".to_string(), "abstract".to_string()],
     "doi",
     CachePolicy::Bypass,
+    None,
 ).await?;
 # Ok(()) }
 ```
@@ -133,8 +135,8 @@ Each call creates a new table. Multiple tables can coexist for the same source (
 # use jammi_ai::session::InferenceSession;
 # use jammi_db::store::CachePolicy;
 # async fn ex(session: &InferenceSession) -> jammi_db::error::Result<()> {
-session.generate_text_embeddings("patents", "all-MiniLM-L6-v2", &["abstract".into()], "id", CachePolicy::Bypass).await?;
-session.generate_text_embeddings("patents", "bge-small-en-v1.5", &["title".into()], "id", CachePolicy::Bypass).await?;
+session.generate_text_embeddings("patents", "all-MiniLM-L6-v2", &["abstract".into()], "id", CachePolicy::Bypass, None).await?;
+session.generate_text_embeddings("patents", "bge-small-en-v1.5", &["title".into()], "id", CachePolicy::Bypass, None).await?;
 # Ok(()) }
 ```
 
@@ -257,9 +259,10 @@ To get embeddings as `RecordBatch` without writing to disk:
 # extern crate jammi_db;
 # extern crate jammi_ai;
 # extern crate tokio;
+# use std::sync::Arc;
 # use jammi_ai::session::InferenceSession;
 # use jammi_db::store::CachePolicy;
-# async fn ex(session: &InferenceSession) -> jammi_db::error::Result<()> {
+# async fn ex(session: &Arc<InferenceSession>) -> jammi_db::error::Result<()> {
 use jammi_ai::model::{ModelSource, ModelTask};
 
 let model = ModelSource::hf("sentence-transformers/all-MiniLM-L6-v2");

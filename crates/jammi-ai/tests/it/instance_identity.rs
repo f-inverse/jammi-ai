@@ -48,7 +48,7 @@ async fn await_workers(
 /// their ids differ, neither id IS the label, and each process's `workers`
 /// row (once it runs a claim loop) shows the shared label beside its own
 /// id. A stop (graceful) and a drop (abort) each remove the process's
-/// `workers` row, so a stopped claimant is no longer listed.
+/// `workers` row, so a stopped claimant is absent from the listing.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn two_sessions_given_one_worker_id_mint_distinct_ids_and_share_the_label() {
     std::env::set_var("JAMMI_WORKER_ID", LABEL);

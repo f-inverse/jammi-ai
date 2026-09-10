@@ -293,7 +293,7 @@ impl Catalog {
     /// reference only while it is non-terminal OR younger than
     /// `retention_days`** — an age PREDICATE evaluated fresh on every scan,
     /// never a sweep-dependent flag. A terminal `jobs` row (`completed` /
-    /// `failed`) past the window no longer blocks; a non-terminal row blocks
+    /// `failed`) past the window does not block; a non-terminal row blocks
     /// indefinitely regardless of age; a young terminal row still blocks. The
     /// predicate is evaluated fresh on every scan, exactly like every other
     /// tenant/admin-scope decision on this table — no separate reaper needs to

@@ -184,7 +184,7 @@ pub struct ResultStore {
     artifact_store: Arc<ArtifactStore>,
     /// The process's lease-renewal thread (N3) every [`BuildingTable`] this
     /// store creates or recovery adopts holds its row with, in place of
-    /// the per-table `tokio::spawn` heartbeat task earlier revisions ran.
+    /// a per-table `tokio::spawn` heartbeat task.
     /// `None` — the default — means a table this store hands out is renewed
     /// by NOTHING beyond its initial lease window: correct but non-renewing,
     /// acceptable for a short-lived test fixture, never for a production

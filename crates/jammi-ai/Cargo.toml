@@ -230,7 +230,7 @@ telemetry-otlp = [
 # `InferenceSession::run_now` (`jammi_ai::jobs::compute_test_hooks`): a test
 # parks a compute job at a documented checkpoint and manufactures a cancel
 # request or a peer's write there. Forwards to the `jammi-db` crate's own
-# `test-hooks` peer (unit #485 round-3: `LeaseKeeper::kill_thread_for_test`
+# `test-hooks` peer (#485: `LeaseKeeper::kill_thread_for_test`
 # is the only way to observe a genuine lease-renewal miss on the SAME hold
 # without a second worker's claim/reclaim ever touching the row, which a
 # claimed-job cancel-vs-lease-loss test needs and no in-crate seam can

@@ -145,7 +145,7 @@ message SourceBusyError {
 
 // `JammiError::JobAttemptSuperseded { job_id }`. A `create_result_table`
 // call's `jobs.partial_result` compare-and-set matched zero rows: the job is
-// either no longer `running` (a peer reclaimed it) or another attempt already
+// either not `running` (a peer reclaimed it) or another attempt already
 // recorded a `partial_result` for it first. Maps to `Aborted` (the same
 // retryable-conflict family as `LeaseLost`/`CasFailed` — the caller's view of
 // the job's attempt was stale).

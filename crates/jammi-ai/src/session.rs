@@ -309,11 +309,11 @@ impl InferenceSession {
     /// opens its OWN connection on its own dedicated OS thread ([`Self::new`]
     /// wires it before anything else can hold a lease), entirely
     /// independent of the shared pool `JammiSession::close` releases.
-    /// Closing only that shared pool while the keeper's thread stayed up
-    /// used to leave the SQLite `unix-excl` VFS's process-scoped exclusive
-    /// lock held — the keeper's own connection was still open — so a
-    /// successor process opening the same directory was refused within the
-    /// busy timeout even after every OTHER handle had let go.
+    /// Closing only that shared pool while the keeper's thread stays up
+    /// leaves the SQLite `unix-excl` VFS's process-scoped exclusive
+    /// lock held — the keeper's own connection is still open — so a
+    /// successor process opening the same directory is refused within the
+    /// busy timeout even after every OTHER handle has let go.
     ///
     /// Order: shut the keeper down and wait — bounded, see
     /// [`jammi_db::catalog::lease_keeper::LeaseKeeper::shutdown_and_join`] —
@@ -327,7 +327,7 @@ impl InferenceSession {
     /// caller's own release call taking that long in the genuinely rare
     /// case the keeper's thread is slow to exit is far smaller than the
     /// cost of giving up early and handing back a directory a successor
-    /// process is then refused to open.
+    /// process cannot then open.
     ///
     /// Idempotent: [`jammi_db::session::JammiSession::close`] is
     /// idempotent, and shutting down an already-stopped keeper finds no
@@ -1981,7 +1981,7 @@ fn infer_ordered_read_back_sql(table: &str) -> String {
 }
 
 /// Normalize every `Utf8View`/`BinaryView` column of `batches` back to the
-/// plain `Utf8`/`Binary` arrow-rs used to build them before this write —
+/// plain `Utf8`/`Binary` arrow-rs types they were built from —
 /// the registered result-table scan
 /// ([`jammi_db::store::ResultStore::register_table`]'s doc: "the resolved
 /// Arrow schema (Utf8View under the Arrow parquet-reader default) matches")

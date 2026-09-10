@@ -72,7 +72,7 @@ use jammi_db::store::CachePolicy;
 
 // Embed the corpus first (any embedding model).
 session
-    .generate_text_embeddings("patents", model_id, &["abstract".into()], "id", CachePolicy::Bypass)
+    .generate_text_embeddings("patents", model_id, &["abstract".into()], "id", CachePolicy::Bypass, None)
     .await?;
 
 // Materialize the kNN graph, keeping only strong, reciprocal edges.

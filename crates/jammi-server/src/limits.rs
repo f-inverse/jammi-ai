@@ -666,8 +666,8 @@ where
             //     itself, at the caller's own declared deadline — tonic's own
             //     GrpcTimeout races only the service future, never a
             //     streaming response body already returned, so a caller that
-            //     ignores its own deadline used to hold this stream's permit
-            //     forever (`deadline`, applied below via
+            //     ignores its own deadline would otherwise hold this stream's
+            //     permit forever without the enforcement below (`deadline`, via
             //     `PermitBody::Deadlined`, same as the header-less arm);
             //   * NO header at all is NOT refused — the budget itself becomes
             //     this stream's deadline (`deadline`, applied below via
@@ -1277,13 +1277,13 @@ mod tests {
         assert_not_refused(&resp);
     }
 
-    /// RED before the reshape (#485 round 4): `mk_req` sends no `grpc-timeout`
-    /// header at all (a header-less request, the shape a Python-shaped client
-    /// with no explicit timeout sends); this used to be refused at the edge
-    /// exactly like an over-budget header. The reshape: the SERVER budget
-    /// bounds the stream instead -- this arm must NOT be refused at open, and
-    /// the returned body must synthesize its own `DEADLINE_EXCEEDED` trailer
-    /// once the budget elapses, never before it and never left open past it.
+    /// `mk_req` sends no `grpc-timeout` header at all (a header-less
+    /// request, the shape a Python-shaped client with no explicit timeout
+    /// sends): this arm must NOT be refused at the edge exactly like an
+    /// over-budget header would be. Instead the SERVER budget bounds the
+    /// stream -- the request is accepted at open, and the returned body
+    /// must synthesize its own `DEADLINE_EXCEEDED` trailer once the budget
+    /// elapses, never before it and never left open past it.
     #[tokio::test]
     async fn method_class_wait_timeout_with_no_header_is_not_refused_but_bounds_the_stream_as_a_deadline(
     ) {
@@ -1329,17 +1329,17 @@ mod tests {
         );
     }
 
-    /// RED before the fix (#485 round 4): the `grpc-timeout` match's within-
-    /// budget arm used to be `Some(_) => {}`, leaving `deadline = None` — the
-    /// stream then ran forever once opened, since tonic's own `GrpcTimeout`
-    /// never bounds a streaming response body already returned (N4), so a
-    /// caller that declared a deadline under the budget and then simply
-    /// ignored it (never dropping the stream) held its `max_job_waits`/
-    /// `max_subscriptions` permit forever. GREEN after: the server itself
-    /// enforces the caller's OWN declared deadline via the same
+    /// The `grpc-timeout` match's within-budget arm must set a `Some`
+    /// `deadline`, not leave it `None`: since tonic's own `GrpcTimeout`
+    /// never bounds a streaming response body already returned (N4), a
+    /// `deadline` of `None` would let a caller that declared a deadline
+    /// under the budget and then simply ignored it (never dropping the
+    /// stream) hold its `max_job_waits`/`max_subscriptions` permit forever.
+    /// Instead the server itself enforces the caller's OWN declared deadline
+    /// via the same
     /// `PermitBody::Deadlined` path the header-less arm uses — ending the
     /// stream with `DEADLINE_EXCEEDED` at the REQUESTED duration (which is
-    /// strictly shorter than the configured budget here, proving the fix
+    /// strictly shorter than the configured budget here, proving this
     /// keys off the header, not the wider budget) — and releasing the held
     /// permit once it fires, exactly like every other `Deadlined` body.
     #[tokio::test]

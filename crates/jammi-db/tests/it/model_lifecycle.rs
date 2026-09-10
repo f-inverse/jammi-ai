@@ -369,7 +369,7 @@ async fn delete_blocked_by_job_model_source_name_edge_until_terminal_and_aged(
         .expect("a terminal model_source job past the retention window must not block");
 }
 
-/// N9: a TERMINAL `jobs` row past `retention_days` no longer blocks — the
+/// N9: a TERMINAL `jobs` row past `retention_days` does not block — the
 /// referential predicate is age-gated, not sweep-dependent (`prune_jobs`
 /// never has to run first for the delete to succeed).
 #[test_case(BackendKind::Sqlite ; "sqlite")]

@@ -158,7 +158,7 @@ let model_id = job.model_id();
 
 let embedding = session.encode_text_query(model_id, "quantum computing").await?;
 println!("query embedding has {} dims", embedding.len());
-session.generate_text_embeddings("patents", model_id, &["abstract".into()], "id", CachePolicy::Bypass).await?;
+session.generate_text_embeddings("patents", model_id, &["abstract".into()], "id", CachePolicy::Bypass, None).await?;
 # Ok(()) }
 ```
 

@@ -258,7 +258,7 @@ async fn run_now_reports_superseded_when_its_row_went_terminal_before_the_finish
     );
     assert!(
         row.result.is_none(),
-        "no result lands on a row the run no longer owns"
+        "no result lands on a row this run does not own"
     );
 }
 
@@ -367,12 +367,11 @@ async fn enqueue_derives_the_model_links_like_the_dedicated_entry_points() {
     assert_eq!(row.model_source, None);
 }
 
-/// unit #485 (round-2 adversarial BLOCK F1): before this unit, a training
-/// kind's branch of `JobWorker::run_claimed_job` threaded only the
-/// lease-lost flag into `run_spec` — `jobs.cancel_requested` was never read
-/// anywhere on that branch, so `CancelJob`/`JobHandle::cancel` on a real
-/// training job was recorded on the row and then silently ignored: the run
-/// trained to completion regardless. This drives a REAL, tiny LoRA fine-tune
+/// #485: a training kind's branch of `JobWorker::run_claimed_job` must
+/// thread `jobs.cancel_requested` into `run_spec` alongside the lease-lost
+/// flag, so `CancelJob`/`JobHandle::cancel` on a real training job stops the
+/// run rather than being recorded on the row while the run trains to
+/// completion regardless. This drives a REAL, tiny LoRA fine-tune
 /// (few epochs is not enough to guarantee the run is still in flight when
 /// the cancel lands — `epochs` is deliberately large, mirroring
 /// `fine_tune.rs`'s `cancelled_run_reclaims_epoch_checkpoints_that_actually_
@@ -507,12 +506,13 @@ async fn a_claimed_training_jobs_cancel_request_is_honoured_at_the_next_epoch_bo
     );
 }
 
-/// #485 BLOCK B1 (adversarial round 3): a bare `JoinHandle` for the
-/// cancel-request watcher only DETACHES its task when dropped — it does not
-/// stop it — so `EmbeddedWorker::drop` aborting the loop task while a
-/// training job's `run_claimed_job` future is still in flight used to leak
-/// the watcher forever, polling `catalog.get_job` on an `Arc<Catalog>`
-/// clone that can outlive `Catalog::close`.
+/// #485: a bare `JoinHandle` for the cancel-request watcher only DETACHES
+/// its task when dropped — it does not stop it — so `EmbeddedWorker::drop`
+/// must abort the watcher explicitly (`CancelWatcherGuard`'s abort-on-drop):
+/// without that, aborting the loop task while a training job's
+/// `run_claimed_job` future is still in flight would leak the watcher
+/// forever, polling `catalog.get_job` on an `Arc<Catalog>` clone that can
+/// outlive `Catalog::close`.
 ///
 /// This reproduces exactly that action — abort the task holding
 /// `run_claimed_job`'s future while it is still running, dropping the
@@ -668,7 +668,7 @@ async fn a_dropped_run_claimed_jobs_future_leaves_no_leaked_cancel_watcher_or_ca
     }
 }
 
-/// unit #485 (round-3 fix-verifier gap): `run_claimed_job`'s shared `cancel`
+/// #485: `run_claimed_job`'s shared `cancel`
 /// flag has two writers — the lease keeper's own renewal (a genuine lease
 /// loss) and `spawn_cancel_request_watcher` observing `jobs.cancel_requested`
 /// (an operator's `CancelJob`) — and the `Cancelled` arm tells them apart

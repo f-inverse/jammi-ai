@@ -570,8 +570,8 @@ async fn remote_fine_tune_metrics_round_trips_like_local() {
     let local_metrics: serde_json::Value = {
         // The generalised `jobs.result` tagged payload
         // (`jammi_ai::jobs::JobResult::Model`) nests the raw metrics JSON as
-        // a STRING field — `training_jobs.metrics` no longer exists as its
-        // own column (C1b/N8).
+        // a STRING field — the generalised `jobs` schema has no dedicated
+        // metrics column of its own (C1b/N8).
         let result_raw = local_record
             .result
             .as_deref()

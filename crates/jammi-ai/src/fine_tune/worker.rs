@@ -549,9 +549,9 @@ impl JobWorker {
         // #485: `cancel` (the lease-lost flag above) is not the ONLY source
         // that must be able to trip the training loop's epoch-boundary
         // check — a `CancelJob`/`JobHandle::cancel` request sets
-        // `jobs.cancel_requested`, which nothing on this branch previously
-        // read at all (only the compute path's `check_cancel` did). This
-        // watcher polls that column at the SAME cadence the lease keeper
+        // `jobs.cancel_requested`, which only the compute path's
+        // `check_cancel` reads; the training loop needs the same signal.
+        // This watcher polls that column at the SAME cadence the lease keeper
         // renews at (`self.intervals.heartbeat` — never per-step, staying
         // out of the hot loop) and, on an observed request, flips the
         // identical `cancel` flag so the trainer's existing epoch-boundary
@@ -847,10 +847,10 @@ impl JobWorker {
             })
             .collect();
 
-        // The tagged terminal payload `jobs.result` carries — the model
-        // metrics blob that used to live in its own `training_jobs.metrics`
-        // column now folds into it (the generalised `jobs` schema has no
-        // dedicated metrics column; see `crate::jobs::JobResult::Model`).
+        // The tagged terminal payload `jobs.result` carries the model
+        // metrics blob: the generalised `jobs` schema has no dedicated
+        // metrics column, so it folds into `result` instead (see
+        // `crate::jobs::JobResult::Model`).
         let job_result = crate::jobs::JobResult::Model {
             model_id: model_id.clone(),
             artifact_path: prefix.to_string(),
@@ -1679,8 +1679,8 @@ impl EmbeddedWorker {
     /// the handle.
     ///
     /// Once the loop has returned, this process's `workers` row is deleted:
-    /// it no longer claims, so `ListWorkers` must stop showing it as a
-    /// claimant (the `instances` row stays — the process itself is alive).
+    /// a process that has stopped claiming must not show up in `ListWorkers`
+    /// as a claimant (the `instances` row stays — the process itself is alive).
     pub async fn stop_and_join(&self) -> Result<()> {
         self.stop.store(true, Ordering::Relaxed);
         let taken = self

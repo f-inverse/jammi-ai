@@ -118,11 +118,9 @@ const CONTROL_PLANE_ALLOWLIST: &[(&str, &str)] = &[
     // which processes run the claim loop. Not a tenant-owned resource, same
     // rationale as `GetServerInfo` above.
     ("JobService", "ListWorkers"),
-    // `PruneJobs` is NOT exempt (round-2 adversarial audit): it used to rest on
-    // a false premise — "the same sweep the construction/worker-loop
-    // background pass already runs" — but there is no periodic background
-    // sweep, only the one-shot construction-time pass, which is not an RPC.
-    // `PruneJobs` is now tenant-scoped exactly like every other job RPC and is
+    // `PruneJobs` is NOT exempt: there is no periodic background sweep,
+    // only the one-shot construction-time pass, which is not an RPC.
+    // `PruneJobs` is tenant-scoped exactly like every other job RPC and is
     // covered by a case below, not allowlisted.
     // Lifecycle/auth contract — defined in the shared `jammi.v1` wire
     // descriptor so the candle-free `jammi-admin` / CLI client can call a
@@ -1150,8 +1148,8 @@ fn cases() -> Vec<IsolationCase> {
             assert_cancel_job_isolated().await;
         }),
         case!("JobService", "PruneJobs", CaseKind::Hermetic, None, {
-            // `prune_jobs` now carries the same STRICT tenant predicate
-            // `cancel_request` uses (F2, round-2 adversarial audit) — a
+            // `prune_jobs` carries the same STRICT tenant predicate
+            // `cancel_request` uses — a
             // peer's prune deletes zero rows against another tenant's
             // terminal job, however old; the caller's own terminal rows are
             // still pruned normally.
@@ -2379,10 +2377,8 @@ async fn assert_cancel_job_isolated() {
 
 /// `PruneJobs`: tenant B's prune must not delete tenant A's terminal
 /// (`completed`) job, however old, while tenant A's own prune deletes it
-/// normally — the exact cross-tenant-denial case the round-2 adversarial
-/// audit found missing (F2): `Catalog::prune_jobs` previously carried NO
-/// tenant predicate at all, so a peer's prune swept every tenant's terminal
-/// rows.
+/// normally — `Catalog::prune_jobs` carries a STRICT tenant predicate so a
+/// peer's prune cannot sweep another tenant's terminal rows.
 async fn assert_prune_jobs_isolated() {
     use jammi_db::catalog::backend::{SqlValue, TxOptions};
     use std::time::Duration;

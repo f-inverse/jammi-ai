@@ -603,17 +603,18 @@ Every trait/enum/base surface a maintainer extends, with anchors and invariants.
   adds `result_tables.writer_id` / `lease_expires_at` + `idx_result_tables_lease`
   for the lease module below.
 - **Typed status enums** — `crates/jammi-db/src/catalog/status.rs`:
-  `ResultTableStatus`, `TrainingJobStatus`, `EvalRunStatus`, `ModelStatus`. Each
+  `ResultTableStatus`, `JobStatus`, `EvalRunStatus`, `ModelStatus`. Each
   impls `Display`+`FromStr`. **Contract: the DB value set is total over the enum**
   (round-trip test in `status.rs`). `ResultTableKind` (Model/NeighborGraph,
   `crates/jammi-db/src/catalog/result_repo.rs`) is a *separate* discriminator from
   `ModelTask`.
 - **The lease module** — `crates/jammi-db/src/catalog/lease.rs`: the ONE lease
-  primitive a claimed `training_jobs` row and a `building` `result_tables` row
-  both share — `LEASE_TS_FORMAT` (a fixed-width UTC format whose lexicographic
+  primitive a claimed `jobs` row (training AND compute kinds share this one
+  table, migration 029) and a `building` `result_tables` row both share —
+  `LEASE_TS_FORMAT` (a fixed-width UTC format whose lexicographic
   order matches chronological order, so `lease_expires_at < $now` needs no
-  dialect-specific interval arithmetic), `lease_now()`/`lease_deadline(lease)`
-  (moved out of `training_repo.rs`, re-exported there), `LeaseIntervals { lease,
+  dialect-specific interval arithmetic), `lease_now()`/`lease_deadline(lease)`,
+  `LeaseIntervals { lease,
   heartbeat }` (only buildable through `config::LeaseConfig::intervals()` or
   `Default`, enforcing `heartbeat * 2 < lease` and both non-zero at
   construction), `lease_expired_clause(col, bind) -> "(col IS NULL OR col <
@@ -2376,9 +2377,14 @@ staleness→recompute loop — that is the platform's, not the engine's
   (`FineTuneConfig::validate`): the gate (rank>0, alpha>0, dropout∈[0,1), pinball
   ascending levels, …). `seed` defaults to `DEFAULT_FINE_TUNE_SEED = 42` — a constant,
   never entropy.
-- **`TrainingWorker` / `TrainingJob`** — `crates/jammi-ai/src/fine_tune/worker.rs` (the
-  `TrainingWorker` struct), `crates/jammi-ai/src/fine_tune/training_job.rs` (the
-  `TrainingJob` struct): the lifecycle owner and the poll/wait handle.
+- **`JobWorker` / `TrainingJob`** — `crates/jammi-ai/src/fine_tune/worker.rs` (the
+  `JobWorker` struct, renamed from `TrainingWorker`: it dispatches every compiled job
+  kind, training and compute alike, not only the three training kinds),
+  `crates/jammi-ai/src/fine_tune/training_job.rs` (the `TrainingJob` struct): the claim
+  loop that owns a training kind's lifecycle and the poll/wait handle a training verb
+  returns. See §3.5 for the full submit → claim → train → finalize path and
+  §2.7/`docs/guide/src/operability.md` for the `jobs`/`instances`/`workers` schema
+  (migration 029) and lease keeper every job kind now shares.
 
 ### 2.6a Fused training kernels (`jammi-kernels`)
 
@@ -2863,7 +2869,7 @@ them.
   `status = 'registered'` literally; `ON CONFLICT(model_id) DO UPDATE` refreshes
   metadata/backend/task but `artifact_path = COALESCE(excluded, existing)` — a re-register
   can *set* but never *clear* a committed served-path; the finalized served path is written
-  solely by the lease-guarded `finalize_training_job` CAS, never by a worker's
+  solely by the lease-guarded `Catalog::finish_job_with_model` CAS, never by a worker's
   `register_model`. PK is tenant-qualified via `model_pk`: global = `"{name}::{version}"`,
   tenant-scoped = `"{t}::{name}::{version}"`.
 - **`get_model`** — `crates/jammi-db/src/catalog/model_repo.rs`
@@ -2933,17 +2939,26 @@ describing a removed surface.
 ### 2.8 Server edge (`jammi-server`)
 
 - **`ServiceTier` / `TierSet`** — `crates/jammi-server/src/tiers.rs` (the `ServiceTier`
-  enum and `TierSet` struct). `Core` always mounted; `OPTIONAL = [Eval, Event, Train]`
-  (only `Train` is `#[cfg]`-gated). `TierSet::resolve` rejects a requested-but-not-compiled
-  tier (`TierError::FeatureNotCompiled`, not a silent drop). `TierSet::as_wire` is **sorted
-  alphabetically** — the `ServerInfo.services` handshake. **Invariant: advertised
-  (`as_wire`) == mounted.**
+  enum and `TierSet` struct). `Core` (always mounted — session/embedding/inference/
+  pipeline + mutable-table/channel/audit + job submission + `GetServerInfo`; this is
+  where durable job submission/status live now, not a `Train` tier), `Event`
+  (`TriggerService`), `Eval` (`EvalService`) — `OPTIONAL = [Eval, Event]`; the `train`
+  cargo feature and `Train` tier are removed with no shim (#485): `services =
+  ["train"]` is a startup error naming the unknown tier. `TierSet::resolve` is
+  infallible (`ServiceTier::compiled_in` and `TierError::FeatureNotCompiled` are gone —
+  every tier is core-compiled, so there is nothing left to reject); `TierSet::all` (was
+  `all_compiled`) is `Self::resolve(ServiceTier::OPTIONAL)`. `TierSet::as_wire` is
+  **sorted alphabetically** — the `ServerInfo.services` handshake. **Invariant:
+  advertised (`as_wire`) == mounted.** Whether a process *runs* the job claim loop it
+  accepts is the separate `[worker] enabled` runtime key (§3.5,
+  `docs/guide/src/operability.md`), never a tier and never a build feature.
 - **`OssServer` / `serve_grpc_chain`** — `crates/jammi-server/src/runtime.rs` (the
   `OssServer` struct and `serve_grpc_chain` fn). Single Tonic chain shared by production
-  and tests. Mounts Flight SQL + `CatalogService` always; engine-backed services when
-  `engine.is_some()`; tier-gated `Eval`/`Train`/`Trigger`. **`OssServer::new` calls
-  `InferenceSession::open` (not `new`)** so the `annotate` UDTF is registered for Flight
-  SQL.
+  and tests. Mounts Flight SQL + `CatalogService` + `JobService` always; engine-backed
+  services when `engine.is_some()`; tier-gated `Eval`/`Trigger`. `ChainParts::worker`
+  (renamed from `ChainParts::train_worker`) spawns the embedded `JobWorker` claim loop
+  iff `[worker] enabled`. **`OssServer::new` calls `InferenceSession::open` (not
+  `new`)** so the `annotate` UDTF is registered for Flight SQL.
 - **Session/tenant boundary** — `crates/jammi-server/src/grpc/session.rs`:
   `SESSION_HEADER`, `SessionStore` (in-process `HashMap<SessionId, Option<TenantId>>`),
   `TenantResolver` (the async resolver trait, `&MetadataMap` → `Result<TenantScope, Status>`),
@@ -3092,15 +3107,24 @@ shared with `QueryBuilder::annotate`.
 **Submit (fast, no compute):** `InferenceSession::fine_tune`
 (`crates/jammi-ai/src/session.rs`) validates config, builds `TrainingSpec::FineTune`,
 `submit_fine_tune_spec` ensures the base model is registered (FK), serializes the spec to
-JSON, and `catalog.create_training_job` into a **`queued`** row. Returns a `TrainingJob`
-handle. **No in-memory state crosses submit→claim — the spec is the only carrier.**
+JSON, and `Catalog::submit_job`/`submit_job_deduped` inserts it into the kind-agnostic
+`jobs` table (migration 029) as a **`queued`**, `execution = 'queued'` row — the same
+table every training AND compute kind shares. Returns a `TrainingJob` handle (training's
+own handle type; a compute verb submitted through `InferenceSession::enqueue` gets the
+generalised `jammi_ai::jobs::JobHandle` instead — both name a row in the same table).
+**No in-memory state crosses submit→claim — the spec is the only carrier.**
 
-**Worker pickup:** `TrainingWorker::run_until` (`crates/jammi-ai/src/fine_tune/worker.rs`)
-each tick: `reclaim_expired_training_jobs` → `claim_next_training_job` (takes a lease) →
-`run_claimed_job`: deserialize spec, pin catalog to the job's tenant, spawn heartbeat
-(renews lease, sets `cancel` on loss), run under tenant scope, then `publish_and_finalize`.
+**Worker pickup:** `JobWorker::run_until` (`crates/jammi-ai/src/fine_tune/worker.rs`,
+renamed from `TrainingWorker`) each tick: `Catalog::reclaim_expired_jobs` → `Catalog::
+claim_next` (takes a lease over `[worker] kinds`, `FOR UPDATE SKIP LOCKED` on Postgres) →
+`run_claimed_job`: deserialize spec, pin catalog to the job's tenant, register the claim
+with the process's shared `LeaseKeeper` (one dedicated OS thread, its own runtime and
+catalog connection — not a per-lease `tokio::spawn` heartbeat), run under tenant scope,
+then `publish_and_finalize`. A `CancelJob`/`JobHandle::cancel` request folds into the
+SAME `cancel` flag a lease loss trips, via a watcher that polls `jobs.cancel_requested`
+at the keeper's own heartbeat cadence.
 
-**Train:** `TrainingWorker::run_spec` → FineTune arm → `read_source_columns` (`SELECT …
+**Train:** `JobWorker::run_spec` → FineTune arm → `read_source_columns` (`SELECT …
 ORDER BY <full tuple>` for deterministic order) → `build_training_data_loader` →
 `train_fine_tune` → `run_fine_tune_blocking` (on the blocking pool, `catch_unwind`-wrapped):
 builds the `TrainingTarget` (empty `target_modules` → projection head; non-empty →
@@ -3117,16 +3141,18 @@ happens, `crates/jammi-encoders/src/lora_site.rs` and each tower's in-file site
 helper**), then
 `TrainingLoop::run` (`crates/jammi-ai/src/fine_tune/trainer.rs`). The loop snapshots
 `varmap.all_vars()` once, builds AdamW, runs epochs with grad-accum, cooperative
-cancellation at epoch boundaries, durable resume checkpoints, early stopping, saves `best`,
-builds `SavedAdapter`, calls `jammi_lora::save_adapter`. **The loop never writes terminal
-status / registers the model / publishes.**
+cancellation at epoch boundaries (the SAME `cancel` flag the lease-loss watcher and the
+cancel-request watcher above both write), durable resume checkpoints, early stopping,
+saves `best`, builds `SavedAdapter`, calls `jammi_lora::save_adapter`. **The loop never
+writes terminal status / registers the model / publishes.**
 
 **Finalize (worker, lease-guarded):** `publish_and_finalize`
 (`crates/jammi-ai/src/fine_tune/worker.rs`) writes files to a unique per-attempt prefix
-`{job_id}/{worker_id}/{attempt}`, `register_model`, `finalize_training_job` **CAS** flips
-to `completed` + commits the served path only while `claimed_by==worker AND
-status==running`. On CAS win, GC the resume checkpoint. **Finalization is the worker's sole
-authority.**
+`{job_id}/{worker_id}/{attempt}`, `register_model`, `Catalog::finish_job_with_model`
+**CAS** flips to `completed` + commits the served path, every retained epoch-checkpoint
+row, and the job's terminal status together — only while `job_id AND claimed_by AND
+status == 'running' AND attempts` all still match the caller's own attempt. On CAS win,
+GC the resume checkpoint. **Finalization is the worker's sole authority.**
 
 ### 3.6 get_or_load (model lifecycle, end to end)
 
@@ -4053,7 +4079,7 @@ callers by that literal name, so their SQL is exercised only indirectly (if at a
 `test-pg` matrix above: `delete_result_tables_for_source`, `get_mutable_table_for_tenant`,
 `list_source_descriptors`, `describe_source`, `find_ready_result_tables_anchored_on`,
 `delete_artifact_prefix`, `delete_table_files`, `list_all_mutable_tables`, `get_model_version`,
-`list_eval_runs`, `latest_eval_run`, `list_training_jobs`, `mark_training_running`, the
+`list_eval_runs`, `latest_eval_run`, the
 training-worker checkpoint surface (`put_artifact`/`fetch_artifact`/`put_resume_checkpoint`/
 `fetch_resume_checkpoint`/`get_checkpoint`/`set_checkpoint`/`delete_resume_checkpoint`),
 `register_table`, `promote_result_table_with_manifest`, `save_sidecar`, `read_keyed_vectors_f32`.

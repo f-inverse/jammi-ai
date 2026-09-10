@@ -297,6 +297,12 @@ Very high scale, specialized GPU pools, and a split compliance posture
 (query tier vs. training tier on separate node pools / network policies)
 are the shapes this topology serves.
 
+This single-node-per-replica compute tier is a provisional primitive: it
+claims and runs one job per attempt on the replica that claimed it, with no
+notion of a multi-replica gang for one job. Whether a future multi-node
+training job spans several compute replicas — and what shape that gang
+coordination takes — is #500's to decide, not this topology's.
+
 ## The `jammi-server probe` subcommand
 
 Every shape above that runs `jammi-server` — B, C, D — uses the same

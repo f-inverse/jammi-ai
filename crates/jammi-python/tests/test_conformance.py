@@ -1081,9 +1081,9 @@ _METRICS_TEST_TRAINING_PAIRS = (
 def test_remote_and_embedded_job_metrics_agree_on_all_three_states(tmp_path):
     """`RemoteJob.metrics()` and the embedded `Job.metrics()` agree on the
     SAME three states the catalog's `jobs.result` payload's nested `metrics`
-    field can carry (issue #441 / adversarial-audit r3 BLOCK 4, generalised
-    to the `jobs` schema by PLAN-C §1) — proven against a REAL embedded
-    engine + catalog on one arm, not a stub of both:
+    field can carry (issue #441, generalised to the `jobs` schema by
+    PLAN-C §1) — proven against a REAL embedded engine + catalog on one arm,
+    not a stub of both:
 
       * absent (`jobs.result` NULL, or `metrics` unset within it) -> `{}` on
         both.
@@ -1099,23 +1099,16 @@ def test_remote_and_embedded_job_metrics_agree_on_all_three_states(tmp_path):
     bottom of this docstring) — so this proves the built artifact's `close()`
     and `job()` (attach-by-id), not a mock of either.
 
-    History this shape fixes (`esc-073`): `jammi_python::PyTrainingJob` (now
-    `PyJob`) used to expose no way to obtain a handle for a job a session did
-    not itself submit (unlike `RemoteJob`, built here straight from a stub
-    gRPC channel), so an earlier version of this test opened a FRESH
-    `Database`/live worker PER STATE and seeded its value through a raw
-    `sqlite3` connection while that state's OWN worker was still live on the
-    same catalog file. That reproduced a hard interpreter crash (`Fatal
-    Python error: Bus error`, SIGBUS inside SQLite's own WAL commit path)
-    roughly every other full-suite run: the raw `sqlite3` seed write and the
-    live worker's pooled `sqlx` connection committed to the same
-    `-wal`/`-shm` files at the same instant — two independent SQLite library
+    A raw `sqlite3` seed write must never coexist with a live engine
+    connection on the same catalog file: two independent SQLite library
     instances (Python's stdlib `sqlite3` vs. Rust's vendored `sqlx-sqlite`)
-    are not always safe to coexist on one WAL file. `esc-073` tracks the
-    underlying engine-side behavior (a crash instead of a typed refusal for
-    an unsupported topology) as a `jammi-db`-scope defect, out of this
-    crate's reach; THIS test's exposure to it is what the shape below
-    structurally excludes, not merely makes rare.
+    committing to the same `-wal`/`-shm` files at the same instant is not
+    always safe, and can crash the interpreter (`Fatal Python error: Bus
+    error`, SIGBUS inside SQLite's own WAL commit path). `esc-073` tracks
+    the underlying engine-side behavior (a crash instead of a typed refusal
+    for an unsupported topology) as a `jammi-db`-scope defect, out of this
+    crate's reach; the shape below structurally excludes this test's
+    exposure to it, rather than merely making it rare.
 
     `Database.close()` (deterministic worker stop + session release) +
     `Database.job(job_id)` (attach-by-id, the embedded peer of

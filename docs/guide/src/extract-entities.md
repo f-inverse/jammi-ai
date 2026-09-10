@@ -10,9 +10,10 @@ Run a Named Entity Recognition model over text columns to extract person names, 
 # extern crate jammi_db;
 # extern crate jammi_ai;
 # extern crate tokio;
+# use std::sync::Arc;
 # use jammi_ai::session::InferenceSession;
 # use jammi_db::store::CachePolicy;
-# async fn ex(session: &InferenceSession) -> jammi_db::error::Result<()> {
+# async fn ex(session: &Arc<InferenceSession>) -> jammi_db::error::Result<()> {
 use jammi_ai::model::{ModelSource, ModelTask};
 
 let model = ModelSource::hf("dslim/bert-base-NER");

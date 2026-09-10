@@ -89,7 +89,7 @@ use jammi_db::store::CachePolicy;
 
 // Embed the documents first (any embedding model).
 session
-    .generate_text_embeddings("papers", model_id, &["abstract".into()], "id", CachePolicy::Bypass)
+    .generate_text_embeddings("papers", model_id, &["abstract".into()], "id", CachePolicy::Bypass, None)
     .await?;
 
 // Propagate over a declared citation edge source (src/dst are the paper ids,

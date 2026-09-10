@@ -128,7 +128,7 @@ message SubmitJobRequest {
   // SAME key — the loser's insert is refused by the same compare-and-set
   // that creates the row, never a separate lookup-then-insert window. A
   // pruned row's key is gone with it (nothing resurrects an identity for a
-  // key whose row no longer exists); different tenants may reuse the same
+  // key whose row has been deleted); different tenants may reuse the same
   // key freely. Bounded to MAX_IDEMPOTENCY_KEY_BYTES (256 bytes,
   // `jammi_db::catalog::jobs_repo::MAX_IDEMPOTENCY_KEY_BYTES`); a longer key
   // is refused with `INVALID_ARGUMENT` naming the bound, never the key's own

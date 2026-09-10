@@ -943,7 +943,7 @@ ALTER TABLE topics ADD COLUMN next_offset BIGINT;
 ///     scan's OWN age predicate, not the database FK, decides whether the
 ///     DELETE is allowed to run at all; once it IS allowed to run, the FK
 ///     action is what keeps the surviving (necessarily exempted, by the same
-///     scan) job rows from pointing at a row that no longer exists, without
+///     scan) job rows from pointing at a row that has been deleted, without
 ///     the DELETE itself needing to touch `jobs`.
 ///   * `output_model_id` — the NAME-keyed model a training kind registers on
 ///     finish (`training_jobs.output_model_id`, unchanged; still FK-free —

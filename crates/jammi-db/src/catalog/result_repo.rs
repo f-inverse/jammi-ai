@@ -115,7 +115,7 @@ pub struct CreateResultTableParams<'a> {
     /// status = 'running' AND attempts = $3 AND partial_result IS NULL` —
     /// inside the SAME transaction as this row's own INSERT, so the two
     /// either land together or neither lands at all. A zero-row CAS (the
-    /// caller's attempt is no longer the current lease holder, or a peer
+    /// caller's attempt is not the current lease holder, or a peer
     /// already recorded a `partial_result`) rolls the whole transaction back
     /// and returns [`JammiError::JobAttemptSuperseded`] — no `result_tables`
     /// row and no bytes are ever committed for a superseded attempt.
@@ -488,7 +488,7 @@ impl Catalog {
     /// together or neither does — there is no window where a `result_tables`
     /// row exists with no job pointing at it, or a job's `partial_result`
     /// names a table whose INSERT never landed. A zero-row CAS means the
-    /// caller's `(instance_id, attempts)` is no longer the job's current
+    /// caller's `(instance_id, attempts)` is not the job's current
     /// lease holder (a peer reclaimed and re-claimed it: this attempt is
     /// superseded) or a peer's attempt already recorded a `partial_result`
     /// first (also superseded — first writer of record wins) — either way

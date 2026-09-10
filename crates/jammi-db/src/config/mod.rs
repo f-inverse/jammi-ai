@@ -1013,8 +1013,8 @@ impl LeaseConfig {
 /// renews it are the deployment's one [`LeaseConfig`], shared with every
 /// other leased row.
 ///
-/// Replaces the former `[training] run_worker`/`idle_poll_secs` (PR-C): the
-/// claim loop is no longer training-specific — a process opts into claiming
+/// Replaces the former `[training] run_worker`/`idle_poll_secs`: the
+/// claim loop is not training-specific — a process opts into claiming
 /// any kind-agnostic `jobs` row, training or compute, and `kinds` selects
 /// which. Every key `[training]` carried was worker-related, so the section
 /// is gone entirely rather than left holding nothing.

@@ -361,17 +361,17 @@ mod tests {
         ));
     }
 
-    /// K4 (F4, round-2 adversarial audit): `JobAttemptSuperseded`/
-    /// `JobCancelled` used to fold into the lossy `JammiError::Other` at the
-    /// wire boundary — `map_engine_error` already classified them with the
-    /// right gRPC `Code` (`Aborted`/`Cancelled`), but `attach_error_detail`'s
-    /// `pb::JammiErrorDetail::from(&JammiError)` had no arm for either, so a
-    /// remote client's `error_from_status` reconstructed `Other` carrying
-    /// only the `Display` string, never the typed variant with its `job_id`.
+    /// `JobAttemptSuperseded`/`JobCancelled` must round-trip as their typed
+    /// variant across the wire, never fold into the lossy
+    /// `JammiError::Other`: `map_engine_error` classifies them with the
+    /// right gRPC `Code` (`Aborted`/`Cancelled`), and `attach_error_detail`'s
+    /// `pb::JammiErrorDetail::from(&JammiError)` carries a dedicated arm for
+    /// each, so a remote client's `error_from_status` reconstructs the typed
+    /// variant with its `job_id`, never just the `Display` string.
     /// This exercises the SAME `attach_error_detail` → real `tonic::Status`
     /// (genuine `grpc-status-details-bin` metadata bytes) → `error_from_status`
-    /// round trip a live gRPC call uses — the client-facing seam this bug
-    /// actually broke, not merely the in-memory `From` impl.
+    /// round trip a live gRPC call uses — the client-facing seam this
+    /// invariant protects, not merely the in-memory `From` impl.
     #[test]
     fn job_attempt_superseded_and_job_cancelled_round_trip_as_their_typed_variant_not_other() {
         let superseded = map_engine_error(JammiError::JobAttemptSuperseded {

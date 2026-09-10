@@ -4,7 +4,8 @@ package jammi.v1.training;
 
 import "jammi/v1/inference.proto";
 
-// Training spec vocabulary — no longer a service of its own.
+// Training spec vocabulary shared by `JobService`'s training kinds — not a
+// service of its own.
 //
 // `TrainingService` was folded into `JobService` (`jammi/v1/job.proto`):
 // `StartTraining`/`TrainingStatus`/`ListTrainingJobs` are superseded by

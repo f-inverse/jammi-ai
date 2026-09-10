@@ -767,7 +767,7 @@ impl Catalog {
     }
 
     /// Renew the lease on a running job the caller still owns. `false` when
-    /// the guard misses: the lease was lost, the job is no longer running, or
+    /// the guard misses: the lease was lost, the job is not running, or
     /// `attempts` is stale (a successor already claimed this job).
     pub async fn heartbeat_job(
         &self,
@@ -868,7 +868,7 @@ impl Catalog {
     /// row is still `running`, `claimed_by == instance_id`, and `attempts ==
     /// attempts`. Returns `true` when the caller held the lease and is the
     /// sole finisher, `false` when it was not (the lease was lost, the row
-    /// is no longer `running`, or `attempts` is stale — a successor already
+    /// is not `running`, or `attempts` is stale — a successor already
     /// claimed this job). A `false` return means the caller must not act as
     /// the finisher; the job is left for [`Self::reclaim_expired_jobs`] and
     /// whichever instance re-claims it.
@@ -1206,7 +1206,7 @@ impl Catalog {
     /// attempt.
     ///
     /// Returns `true` when the write landed (the guard matched) and `false`
-    /// when it did not — the lease was lost, the job is no longer running, or
+    /// when it did not — the lease was lost, the job is not running, or
     /// the caller's `attempt` is stale. Not tenant-scoped, matching the other
     /// lease-identity operations ([`Self::heartbeat_job`],
     /// [`Self::progress_job`], [`Self::finish_job`], [`Self::fail_job`]).
@@ -1324,8 +1324,8 @@ impl Catalog {
     /// already read (by [`Self::get_job`]/[`Self::list_jobs`] or a wire
     /// `JobStatus`/`WaitJob` call), reclaim it in place if — and only if — it
     /// currently qualifies under either arm. `Ok(None)` when the row does not
-    /// qualify (including: it is no longer `running` by the time this runs,
-    /// or `record.job_id` no longer exists) — the steady-state case, which
+    /// qualify (including: it is not `running` by the time this runs,
+    /// or `record.job_id` does not exist) — the steady-state case, which
     /// issues the SAME `UPDATE … WHERE …` predicate as the bulk sweep scoped
     /// by `job_id`, so a non-qualifying row costs one no-op statement, never
     /// an unconditional write.
@@ -1572,7 +1572,7 @@ impl Catalog {
     }
 
     /// Delete this process's `workers` row — the claim loop has stopped, so
-    /// the process must no longer advertise itself as a claimant (a
+    /// the process must not advertise itself as a claimant (a
     /// `ListWorkers` read after an `EmbeddedWorker` drop shows no row for
     /// it, rather than a row that lingers until its `instances` row goes
     /// stale and cascades). The `instances` row itself is untouched: the

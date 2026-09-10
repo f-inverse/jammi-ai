@@ -866,7 +866,7 @@ fn hits_to_batch(resp: SearchResponse, select: &[String]) -> Result<Vec<RecordBa
     Ok(vec![batch])
 }
 
-/// #485 round-4 fix-verifier gap: `wait_job`/`subscribe` must send NO
+/// #485: `wait_job`/`subscribe` must send NO
 /// `grpc-timeout` header at all (the server's `[server.limits]
 /// wait_timeout_secs` budget bounds the stream instead — see
 /// `jammi_server::limits`'s module doc's "Streaming-path exemption" section);
@@ -1074,12 +1074,9 @@ mod grpc_timeout_header_tests {
             .expect("data client connect")
     }
 
-    /// RED before the #485 round-4 fix (re-confirmed by the fix-verifier):
-    /// if `wait_job`/`wait_job_with_timeout` ever collapsed onto the same
-    /// request-construction path with a default deadline applied regardless
-    /// of caller intent, this would fail — either `wait_job` would gain a
-    /// header it must never send, or `wait_job_with_timeout` would lose the
-    /// one it must always send. GREEN: `wait_job` sends no `grpc-timeout` at
+    /// Guards `wait_job`/`wait_job_with_timeout` against collapsing onto the
+    /// same request-construction path with a default deadline applied
+    /// regardless of caller intent: `wait_job` sends no `grpc-timeout` at
     /// all (the server-side budget bounds the stream instead — see this
     /// crate's `wait_job` doc); `wait_job_with_timeout` sends one every time.
     #[tokio::test]

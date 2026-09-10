@@ -240,7 +240,7 @@ pub enum JammiError {
     },
 
     /// A `create_result_table` call's `jobs.partial_result` compare-and-set
-    /// matched zero rows: the job is either no longer `running` (a peer
+    /// matched zero rows: the job is either not `running` (a peer
     /// reclaimed it, the caller's attempt has been superseded) or another
     /// attempt already recorded a `partial_result` for it first. Either way
     /// this attempt is not the one of record. The transaction this CAS ran

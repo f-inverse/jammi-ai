@@ -1075,6 +1075,14 @@ workspace ships every publishable crate at the same
   column's data type; every other type is cast to `Utf8` via `arrow::compute::cast`, refused if
   the cast introduces a null the source column did not have. A null value in an otherwise-text
   column keeps its documented `""` reading (esc-091).
+- **`jammi-server serve` refuses to start when the configured audit master key is present but
+  undecodable, instead of booting with audit signing silently dead (#482, esc-104).** A key
+  configured via `JAMMI_AUDIT_MASTER_KEY` (the default `signing_key = "env"`) or via
+  `signing_key.file`'s mounted file must decode as 32 bytes of hex (64 hex characters); an
+  absent key still starts unchanged — audit signing simply stays unusable until the first
+  `AuditService` write, exactly as before this check existed. The check runs before tracing
+  initializes, so a malformed key's failure prints to stderr and exits nonzero without ever
+  echoing the configured value.
 
 ### Removed
 - **`examples/docker-compose/` (#482).** Moved to `deploy/docker-compose.yml`

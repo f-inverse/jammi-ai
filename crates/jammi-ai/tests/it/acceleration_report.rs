@@ -36,7 +36,8 @@ use jammi_ai::fine_tune::worker::EmbeddedWorker;
 use jammi_ai::fine_tune::{ComputePrecision, FineTuneConfig, FineTuneMethod, LrSchedule};
 use jammi_ai::model::ModelTask;
 use jammi_ai::session::InferenceSession;
-use jammi_db::catalog::training_repo::{CreateTrainingJobParams, FinalizeTrainingJobParams};
+use jammi_db::catalog::jobs_repo::{FinishJobWithModelParams, SubmitJobParams};
+use jammi_db::catalog::status::JobExecution;
 use jammi_db::source::{FileFormat, SourceConnection, SourceType};
 
 use crate::common;
@@ -103,13 +104,10 @@ fn encoder_adapters_config(backbone_dtype: ComputePrecision) -> FineTuneConfig {
 async fn wait_for_terminal(
     catalog: &jammi_db::catalog::Catalog,
     job_id: &str,
-) -> jammi_db::catalog::training_repo::TrainingJobRecord {
+) -> jammi_db::catalog::jobs_repo::JobRecord {
     let record = wait_for_any_terminal(catalog, job_id).await;
     if record.status != "completed" {
-        panic!(
-            "job {job_id} failed unexpectedly: {:?}",
-            record.error_message
-        );
+        panic!("job {job_id} failed unexpectedly: {:?}", record.error);
     }
     record
 }
@@ -132,9 +130,9 @@ async fn wait_for_terminal(
 async fn wait_for_any_terminal(
     catalog: &jammi_db::catalog::Catalog,
     job_id: &str,
-) -> jammi_db::catalog::training_repo::TrainingJobRecord {
+) -> jammi_db::catalog::jobs_repo::JobRecord {
     loop {
-        let record = catalog.get_training_job(job_id).await.unwrap();
+        let record = catalog.get_job(job_id).await.unwrap();
         match record.status.as_str() {
             "completed" | "failed" => {
                 assert_terminal_report_is_not_pending(&record, job_id);
@@ -155,8 +153,8 @@ async fn terminal_record(
     catalog: &jammi_db::catalog::Catalog,
     job_id: &str,
     label: &str,
-) -> jammi_db::catalog::training_repo::TrainingJobRecord {
-    let record = catalog.get_training_job(job_id).await.unwrap();
+) -> jammi_db::catalog::jobs_repo::JobRecord {
+    let record = catalog.get_job(job_id).await.unwrap();
     assert!(
         matches!(record.status.as_str(), "completed" | "failed"),
         "{label}: expected an already-terminal row, got status {:?}",
@@ -411,7 +409,7 @@ async fn f32_positive_control_reports_ops_holds() {
     );
 }
 
-/// The three-state contract in the payload: `create_training_job` writes the
+/// The three-state contract in the payload: `submit_job` writes the
 /// explicit `{"state":"pending"}` marker at submission (before any claimant
 /// exists), and the claiming worker overwrites it with a `"determined"`
 /// report — asserted here as a state TRANSITION, not just the end state.
@@ -440,14 +438,10 @@ async fn submission_writes_pending_then_claim_overwrites_with_determined() {
         )
         .await
         .unwrap();
-    let pre_claim = session
-        .catalog()
-        .get_training_job(&job.job_id)
-        .await
-        .unwrap();
+    let pre_claim = session.catalog().get_job(&job.job_id).await.unwrap();
     let pre_claim_report: serde_json::Value =
         serde_json::from_str(pre_claim.acceleration_report.as_deref().expect(
-            "create_training_job must write the explicit pending marker, not leave the column \
+            "submit_job must write the explicit pending marker, not leave the column \
              NULL, for a fresh submission",
         ))
         .unwrap();
@@ -478,7 +472,7 @@ async fn submission_writes_pending_then_claim_overwrites_with_determined() {
 /// K4: "one record, two transports". Transport A is the embedded SDK path
 /// (`session.fine_tune`, `session.rs:1131`); transport B is a raw catalog
 /// write mirroring what a non-embedded (e.g. remote/gRPC) submission path
-/// does at its substrate — `create_training_job` directly, with a
+/// does at its substrate — `submit_job` directly, with a
 /// hand-assembled [`TrainingSpec`] — then relies on the SAME already-running
 /// [`EmbeddedWorker`] loop to claim and run it (there is only one claim→run
 /// code path regardless of how a job was submitted). Both jobs use the
@@ -523,7 +517,10 @@ async fn embedded_and_raw_transports_produce_the_same_report_shape() {
     // Transport B: a raw catalog write — job A already registered the base
     // model under its resolved catalog PK, so transport B reuses it rather
     // than re-deriving `ModelSource` resolution logic in this test.
-    let base_model_pk = record_a.base_model_id.clone();
+    let base_model_pk = record_a
+        .model_ref
+        .clone()
+        .expect("job A's row records the base model it fine-tuned from");
     let spec = TrainingSpec::FineTune {
         source: "training".to_string(),
         columns: training_columns(),
@@ -535,18 +532,18 @@ async fn embedded_and_raw_transports_produce_the_same_report_shape() {
         },
     };
     let spec_json = serde_json::to_string(&spec).unwrap();
-    let hyperparams = serde_json::to_string(&config).unwrap();
     let job_b_id = "esc075-raw-transport-job".to_string();
     session
         .catalog()
-        .create_training_job(CreateTrainingJobParams {
+        .submit_job(SubmitJobParams {
             job_id: &job_b_id,
-            base_model_id: &base_model_pk,
-            training_source: "training",
-            loss_type: "cosent",
-            hyperparams: &hyperparams,
             kind: spec.kind(),
-            training_spec: &spec_json,
+            execution: JobExecution::Queued,
+            spec: &spec_json,
+            model_ref: Some(&base_model_pk),
+            output_model_id: None,
+            model_source: None,
+            priority: 0,
         })
         .await
         .unwrap();
@@ -1250,16 +1247,21 @@ async fn pre_device_resolution_failure_reports_undetermined_acceleration() {
     // (and therefore the device resolution + measuring probe) are ever
     // reached.
     let job_id = "esc075-pre-device-resolution-failure".to_string();
+    let seed_model_ref = seed_record
+        .model_ref
+        .clone()
+        .expect("the seed job's row records the base model it fine-tuned from");
     session
         .catalog()
-        .create_training_job(CreateTrainingJobParams {
+        .submit_job(SubmitJobParams {
             job_id: &job_id,
-            base_model_id: &seed_record.base_model_id,
-            training_source: "training",
-            loss_type: "cosent",
-            hyperparams: "{}",
             kind: "fine_tune",
-            training_spec: "this is not valid JSON at all {{{",
+            execution: JobExecution::Queued,
+            spec: "this is not valid JSON at all {{{",
+            model_ref: Some(&seed_model_ref),
+            output_model_id: None,
+            model_source: None,
+            priority: 0,
         })
         .await
         .unwrap();
@@ -1318,7 +1320,7 @@ const TERMINAL_REPORT_STATES: [&str; 3] = ["determined", "not_applicable", "unde
 /// more; [`assert_terminal_report_is_undetermined`] is the stricter wrapper
 /// for a path whose exact marker is known.
 fn assert_terminal_report_is_not_pending(
-    record: &jammi_db::catalog::training_repo::TrainingJobRecord,
+    record: &jammi_db::catalog::jobs_repo::JobRecord,
     label: &str,
 ) -> serde_json::Value {
     assert!(
@@ -1355,7 +1357,7 @@ fn assert_terminal_report_is_not_pending(
 /// self-describing marker a known pre-probe path must carry: `undetermined`
 /// with a reason that names WHERE it stopped.
 fn assert_terminal_report_is_undetermined(
-    record: &jammi_db::catalog::training_repo::TrainingJobRecord,
+    record: &jammi_db::catalog::jobs_repo::JobRecord,
     expected_reason: &str,
     label: &str,
 ) -> serde_json::Value {
@@ -1380,7 +1382,7 @@ fn assert_terminal_report_is_undetermined(
 /// CPU-only, in-process suite can actually force.
 ///
 /// The catalog-edge mechanism this leans on is jammi-db's
-/// (`Catalog::fail_training_job` retires a still-`pending` report to
+/// (`Catalog::fail_job` retires a still-`pending` report to
 /// `{"state":"undetermined","reason":"failed_before_probe"}` in the SAME
 /// lease-guarded UPDATE). What is asserted HERE is the worker's half: that
 /// each of these paths genuinely reaches `record_failed`, so the catalog-edge
@@ -1479,17 +1481,22 @@ async fn every_pre_probe_failure_path_leaves_a_terminal_non_pending_report() {
         ),
     ];
 
+    let seed_model_ref = seed_record
+        .model_ref
+        .clone()
+        .expect("the seed job's row records the base model it fine-tuned from");
     for (job_id, spec_json, label) in cases {
         session
             .catalog()
-            .create_training_job(CreateTrainingJobParams {
+            .submit_job(SubmitJobParams {
                 job_id,
-                base_model_id: &seed_record.base_model_id,
-                training_source: "training",
-                loss_type: "cosent",
-                hyperparams: "{}",
                 kind: "fine_tune",
-                training_spec: &spec_json,
+                execution: JobExecution::Queued,
+                spec: &spec_json,
+                model_ref: Some(&seed_model_ref),
+                output_model_id: None,
+                model_source: None,
+                priority: 0,
             })
             .await
             .unwrap();
@@ -1499,10 +1506,10 @@ async fn every_pre_probe_failure_path_leaves_a_terminal_non_pending_report() {
             record.status, "failed",
             "{label}: the job must land terminal `failed`, never wedged `running` — got {} \
              (error: {:?})",
-            record.status, record.error_message
+            record.status, record.error
         );
         assert!(
-            record.error_message.is_some(),
+            record.error.is_some(),
             "{label}: record_failed must have surfaced the cause on the row"
         );
         assert_terminal_report_is_undetermined(&record, "failed_before_probe", label);
@@ -1532,7 +1539,7 @@ async fn every_pre_probe_failure_path_leaves_a_terminal_non_pending_report() {
 ///   differ from what the running worker holds. Both are threaded from the
 ///   very record that worker claimed (`run_claimed_job`'s `let attempt =
 ///   record.attempts`), and the only public mechanism that moves either one
-///   under a running worker is lease expiry + `reclaim_expired_training_jobs`
+///   under a running worker is lease expiry + `reclaim_expired_jobs`
 ///   — which also cancels that worker's run (`WorkerJobError::Cancelled`),
 ///   and the cancelled arm deliberately writes NO terminal status at all. So
 ///   the shape "this worker's report write missed AND this worker's finalize
@@ -1548,14 +1555,14 @@ async fn every_pre_probe_failure_path_leaves_a_terminal_non_pending_report() {
 /// `running` and still owned by this worker — after which the ordinary
 /// lease-guarded finalize runs and the job completes. That is the real
 /// mechanism (the `attempts = $6` clause of the report write's guard, which
-/// `finalize_training_job`'s CAS deliberately does not carry), not a
+/// `finish_job_with_model`'s CAS deliberately does not carry), not a
 /// simulation of its effect.
 ///
 /// # The controls
 ///
 /// - **The ordinary completed job keeps `determined`** (leg 1): a real
 ///   `session.fine_tune` job that reaches the probe. Without it, a
-///   `finalize_training_job` that stamped `undetermined` over EVERY report
+///   `finish_job_with_model` that stamped `undetermined` over EVERY report
 ///   would pass leg 2.
 /// - **The mechanism is traced, not asserted** (leg 3): a second raw job,
 ///   identical in every way except that the report write carries the CORRECT
@@ -1631,24 +1638,29 @@ async fn completed_job_with_a_swallowed_report_write_is_never_left_pending() {
     // The claim is what makes the row `running` + owned, which is the state
     // both the report write's guard and the finalize CAS are checked against.
     let catalog = session.catalog();
+    let seed_model_ref = seed_record
+        .model_ref
+        .clone()
+        .expect("the seed job's row records the base model it fine-tuned from");
     let claim = |job_id: &'static str| {
-        let base_model_id = seed_record.base_model_id.clone();
+        let model_ref = seed_model_ref.clone();
         let spec_json = spec_json.clone();
         async move {
             catalog
-                .create_training_job(CreateTrainingJobParams {
+                .submit_job(SubmitJobParams {
                     job_id,
-                    base_model_id: &base_model_id,
-                    training_source: "training",
-                    loss_type: "cosent",
-                    hyperparams: "{}",
                     kind: "fine_tune",
-                    training_spec: &spec_json,
+                    execution: JobExecution::Queued,
+                    spec: &spec_json,
+                    model_ref: Some(&model_ref),
+                    output_model_id: None,
+                    model_source: None,
+                    priority: 0,
                 })
                 .await
                 .unwrap();
             let claimed = catalog
-                .claim_next_training_job(WORKER, Duration::from_secs(300))
+                .claim_next(WORKER, &["fine_tune"], Duration::from_secs(300))
                 .await
                 .unwrap()
                 .expect("the worker is stopped, so this row is the only claimable one");
@@ -1666,20 +1678,23 @@ async fn completed_job_with_a_swallowed_report_write_is_never_left_pending() {
         }
     };
 
-    // `finalize_training_job` with an output model NAME that matches no
+    // `finish_job_with_model` with an output model NAME that matches no
     // `models` row: the model-row UPDATE inside the same transaction then
     // touches zero rows (not an error), which keeps this leg from clobbering
-    // leg 1's real output model. The `training_jobs` CAS — the only thing
-    // under test — is unaffected.
-    let finalize = |job_id: &'static str| async move {
+    // leg 1's real output model. The `jobs` CAS — the only thing under
+    // test — is unaffected. `attempts` is always 1 here (asserted on the
+    // claim above), so it is threaded through rather than hardcoded, to keep
+    // this an honest attempt-guarded CAS rather than a guard-free stand-in.
+    let finalize = |job_id: &'static str, attempts: u32| async move {
         catalog
-            .finalize_training_job(FinalizeTrainingJobParams {
+            .finish_job_with_model(FinishJobWithModelParams {
                 job_id,
-                worker_id: WORKER,
+                instance_id: WORKER,
+                attempts,
+                result: r#"{"kind":"model","model_id":"esc446-f1-no-such-output-model","artifact_path":"esc446-f1/unused/","metrics":null}"#,
                 output_model_id: "esc446-f1-no-such-output-model",
                 output_model_version: 1,
                 artifact_path: "esc446-f1/unused/",
-                metrics: None,
                 epoch_checkpoints: &[],
             })
             .await
@@ -1703,7 +1718,7 @@ async fn completed_job_with_a_swallowed_report_write_is_never_left_pending() {
          landed, this leg is not reproducing the swallowed-write branch at all and everything \
          below it is vacuous"
     );
-    let mid_run = session.catalog().get_training_job(swallowed).await.unwrap();
+    let mid_run = session.catalog().get_job(swallowed).await.unwrap();
     assert_eq!(
         mid_run.status, "running",
         "the missed write must leave the row RUNNING and claimable-by-nobody-else — the \
@@ -1717,10 +1732,10 @@ async fn completed_job_with_a_swallowed_report_write_is_never_left_pending() {
          this is the state the finalize below must not let survive"
     );
     assert!(
-        finalize(swallowed).await,
-        "the finalize CAS is guarded on claimed_by + status only (NOT on attempts), so this \
-         worker still finalizes the job it could not report on — that asymmetry is the whole \
-         defect"
+        finalize(swallowed, claimed.attempts).await,
+        "the finalize CAS is guarded on claimed_by + status + attempts, and this worker still \
+         holds the same attempt it claimed under (only the report write's own guard missed) — \
+         so it still finalizes the job it could not report on, that asymmetry is the whole defect"
     );
     let record = terminal_record(
         session.catalog(),
@@ -1751,7 +1766,7 @@ async fn completed_job_with_a_swallowed_report_write_is_never_left_pending() {
         "removing the ONE difference (the stale attempt) must make the same write LAND — \
          otherwise leg 2's miss is explained by a broken fixture, not by the guard"
     );
-    assert!(finalize(landed_ok).await);
+    assert!(finalize(landed_ok, claimed.attempts).await);
     let record = terminal_record(
         session.catalog(),
         landed_ok,

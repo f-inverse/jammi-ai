@@ -95,15 +95,15 @@ bound**; the work queue is durable, not buffered (see below).
 ### Lease and worker timing
 
 One lease primitive (`[lease]`, `crates/jammi-db/src/catalog/lease.rs`) owns
-every leased catalog row — a claimed training job and a `building` result
-table alike — defaulting to a 30 s lease renewed every 10 s; the training
-worker adds a 1 s idle-poll (`[training]`):
+every leased catalog row — a claimed job and a `building` result table
+alike — defaulting to a 30 s lease renewed every 10 s; the job worker adds a
+1 s idle-poll (`[worker]`):
 
 - **Lease (30 s default)** — how long a claimed job, or a result table being
   written, is exclusively owned by its holder before it becomes reclaimable.
-- **Heartbeat (10 s default)** — renews the lease well inside the window: the
-  training worker's heartbeat task for a running job, and a `BuildingTable`'s
-  heartbeat task for a result table between `create_table` and `finish`.
+- **Heartbeat (10 s default)** — renews the lease well inside the window,
+  from the process's shared lease-keeper thread: one registration per running
+  job and one per `BuildingTable` between `create_table` and `finish`.
 - **Idle-poll (1 s default)** — how often an idle worker checks for new work;
   reclaim runs on each idle tick, so a dead worker's job is recovered within
   roughly one poll plus one lease. A dead writer's `building` result table is

@@ -169,7 +169,7 @@ impl OssServer {
             .intervals()
             .map_err(|e| ServerError::Config(e.to_string()))?;
         config
-            .training
+            .worker
             .worker_intervals(lease)
             .map_err(|e| ServerError::Config(e.to_string()))?;
 
@@ -526,7 +526,7 @@ pub struct ChainParts {
     /// jobs stop running.
     ///
     /// `None` when this process runs no claim loop: either the `train` tier is
-    /// not mounted at all, or it is mounted with `[training] run_worker = false`
+    /// not mounted at all, or it is mounted with `[worker] enabled = false`
     /// (the mount-without-claiming configuration — `TrainingService` still
     /// serves, this process just never claims). In both cases there is nothing
     /// for the downstream to hold and nothing for its shutdown to await.
@@ -875,9 +875,9 @@ impl BoundChain {
 /// - `TrainingService` ← [`ServiceTier::Train`] (and only when the `train`
 ///   feature is compiled in — the mount code itself is `#[cfg]`-gated). The
 ///   tier also spawns the embedded training worker, unless `chain.engine`'s
-///   `[training] run_worker` is `false`: that key decides whether THIS process
+///   `[worker] enabled` is `false`: that key decides whether THIS process
 ///   claims queued jobs, and it does NOT change what is mounted or advertised
-///   (`TrainingService` serves either way, so a `run_worker = false` deployment
+///   (`TrainingService` serves either way, so a `enabled = false` deployment
 ///   still accepts submissions and just leaves them `queued` for whichever
 ///   process does claim).
 /// - `TriggerService` ← [`ServiceTier::Event`], driven by `trigger` being
@@ -1033,14 +1033,14 @@ pub fn assemble_grpc_chain(chain: GrpcChain) -> Result<AssembledChain, ServerErr
         #[cfg(feature = "train")]
         if tiers.contains(ServiceTier::Train) {
             // Whether THIS process also runs the claim loop is configuration, not
-            // a second code path: `[training] run_worker` (default `true`). The
+            // a second code path: `[worker] enabled` (default `true`). The
             // tier still mounts `TrainingService` either way — the surface and
             // what `GetServerInfo.services` advertises are unchanged, because the
-            // service IS mounted — so a `run_worker = false` deployment still
+            // service IS mounted — so a `worker.enabled = false` deployment still
             // accepts submissions; it just never claims them. The embedded arm
             // reads the same key off the same config, so a wire deployment and an
             // in-process one answer the question identically.
-            if session.inner_config().training.run_worker {
+            if session.inner_config().worker.enabled {
                 // Start the worker that runs submitted jobs: a "GPU worker pool"
                 // is just N processes claiming from the shared catalog, and the
                 // server `train` tier runs one of them. `spawn` borrows `session`

@@ -185,7 +185,7 @@ impl ModelResolver {
             // esc-089: a `model_type == "fine-tuned"` record MUST carry a
             // resolvable adapter pointer. `artifact_path` is committed
             // exactly once, by the lease-guarded finalize CAS
-            // (`Catalog::finalize_training_job`) — a `None` here means the
+            // (`Catalog::finish_job_with_model`) — a `None` here means the
             // pointer was never written (or was clobbered after the fact,
             // as `ModelCache::get_or_load`'s post-load catalog bookkeeping
             // used to do for a fine-tuned id — see that call site's own

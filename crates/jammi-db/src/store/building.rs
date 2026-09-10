@@ -9,10 +9,18 @@
 //! `building` row, and the writer's unguarded promote then flipped the reaped
 //! row to `ready` over deleted bytes (esc-094, issue #479). This handle is the
 //! writer's side of the fix: it owns the row's `writer_id`, keeps the lease
-//! renewed from a background heartbeat, and routes every transition on the
-//! row through the [`ResultTableCas`] predicate naming that writer, so a peer's
-//! recovery (which touches only rows whose lease is absent or expired) and a
-//! live writer can never both act on one row.
+//! renewed by registering with the process's [`crate::catalog::lease_keeper::LeaseKeeper`] (N3), and routes
+//! every transition on the row through the [`ResultTableCas`] predicate naming
+//! that writer, so a peer's recovery (which touches only rows whose lease is
+//! absent or expired) and a live writer can never both act on one row.
+//!
+//! Renewal moved off a per-table `tokio::spawn` heartbeat task onto the
+//! shared keeper thread because a heartbeat task competes for the same main
+//! runtime worker threads an inline compute job's CPU-bound work occupies —
+//! N+1 such jobs on an N-thread runtime can starve the heartbeat task for the
+//! whole duration of the blocking work, letting a live writer's lease expire
+//! and be reclaimed out from under it. The keeper's dedicated thread and
+//! dedicated connection cannot be starved by that contention.
 
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
@@ -20,7 +28,7 @@ use std::sync::Arc;
 use datafusion::prelude::SessionContext;
 use tracing::warn;
 
-use crate::catalog::lease::LeaseIntervals;
+use crate::catalog::lease_keeper::{LeaseTarget, Registration};
 use crate::catalog::result_repo::{ResultTableCas, ResultTableRecord};
 use crate::catalog::status::ResultTableStatus;
 use crate::config::StoragePrecision;
@@ -32,22 +40,32 @@ use crate::store::manifest::Materialization;
 use crate::store::ResultStore;
 use crate::tenant::TenantId;
 
-/// A `building` result table owned by this process under a heartbeated lease.
+/// A `building` result table owned by this process under a leased row.
 ///
 /// Every catalog transition the handle performs is a compare-and-set on
 /// `(table_name, writer_id, status = 'building')` with the tenant arm the
-/// binding in force selects ([`crate::catalog::result_repo::TenantArm`]). The
-/// heartbeat renews the lease every `heartbeat`; a renew that matches zero
-/// rows (recovery claimed the row after the lease expired, or the row went
-/// terminal underneath the writer) flips [`Self::is_live`] to `false` and
-/// stops beating — a writer checks it at each batch boundary and aborts.
+/// binding in force selects ([`crate::catalog::result_repo::TenantArm`]).
+/// When [`ResultStore`] carries a [`crate::catalog::lease_keeper::LeaseKeeper`] handle, this table's row is
+/// one of that keeper's registrations: a renew that matches zero rows
+/// (recovery claimed the row after the lease expired, or the row went
+/// terminal underneath the writer) flips [`Self::is_live`] to `false` — a
+/// writer checks it at each batch boundary and aborts. With no keeper
+/// attached (a test fixture; see [`ResultStore::with_lease_keeper`]'s doc)
+/// nothing renews the row proactively and [`Self::is_live`] reports `true`
+/// until [`Self::finish`]/[`Self::abort`]/drop — every CAS this handle issues
+/// still fails loudly (`JammiError::CasFailed`/`RowGone`/`LeaseLost`) if the
+/// row's lease has genuinely expired underneath it, so correctness never
+/// depends on proactive detection, only the "abort early, before more work"
+/// optimisation does.
 ///
-/// Dropping the handle without [`Self::finish`] or [`Self::abort`] aborts the
-/// heartbeat and, when a tokio runtime is current, spawns a best-effort
-/// `building -> failed` CAS (no byte deletion — reconcile reaps the objects
-/// later); with no runtime the lease simply expires and recovery reaps the
-/// row. After `finish` / `abort` the drop is a no-op by construction: the
-/// `status = 'building'` predicate no longer matches.
+/// Dropping the handle without [`Self::finish`], [`Self::abort`], or
+/// [`Self::detach`] unregisters the keeper registration (if any) and, when a
+/// tokio runtime is current, spawns a best-effort `building -> failed` CAS
+/// (no byte deletion — reconcile reaps the objects later); with no runtime
+/// the lease simply expires and recovery reaps the row. After
+/// `finish`/`abort`/`detach` the drop is a no-op by construction: the
+/// `status = 'building'` predicate no longer matches, or (`detach`) the
+/// registration is already gone and no CAS is issued at all.
 pub struct BuildingTable {
     store: ResultStore,
     table_name: String,
@@ -56,8 +74,7 @@ pub struct BuildingTable {
     writer_id: String,
     storage_precision: StoragePrecision,
     done: Arc<AtomicBool>,
-    lost: Arc<AtomicBool>,
-    heartbeat: Option<tokio::task::JoinHandle<()>>,
+    registration: Option<Registration>,
 }
 
 impl std::fmt::Debug for BuildingTable {
@@ -68,20 +85,22 @@ impl std::fmt::Debug for BuildingTable {
             .field("tenant", &self.tenant)
             .field("writer_id", &self.writer_id)
             .field("done", &self.done.load(Ordering::SeqCst))
-            .field("lost", &self.lost.load(Ordering::SeqCst))
+            .field("lost", &self.registration.as_ref().map(Registration::lost))
             .finish()
     }
 }
 
 impl BuildingTable {
-    /// Take ownership of the `building` row `table_name` for `writer_id` and
-    /// start its heartbeat. Called by [`ResultStore::create_table`] right after
-    /// the row's INSERT, and by recovery right after
+    /// Take ownership of the `building` row `table_name` for `writer_id` and,
+    /// when `store` carries a [`crate::catalog::lease_keeper::LeaseKeeper`], register it for renewal.
+    /// Called by [`ResultStore::create_table`] right after the row's INSERT,
+    /// and by recovery right after
     /// [`crate::catalog::Catalog::claim_expired_building_table`] stamped the
     /// recoverer's id on an expired-lease row. The lease the caller stamped
-    /// must have been `intervals.lease()` FROM NOW (the catalog backend's own
-    /// clock on Postgres — [`crate::catalog::lease::lease_deadline_expr`]),
-    /// the same window the heartbeat renews to.
+    /// must have been `store.lease_intervals().lease()` FROM NOW (the
+    /// catalog backend's own clock on Postgres —
+    /// [`crate::catalog::lease::lease_deadline_expr`]), the same window the
+    /// keeper renews to.
     pub(crate) fn adopt(
         store: ResultStore,
         table_name: String,
@@ -89,19 +108,13 @@ impl BuildingTable {
         tenant: Option<TenantId>,
         writer_id: String,
         storage_precision: StoragePrecision,
-        intervals: LeaseIntervals,
     ) -> Self {
-        let done = Arc::new(AtomicBool::new(false));
-        let lost = Arc::new(AtomicBool::new(false));
-        let heartbeat = Some(spawn_heartbeat(
-            store.clone(),
-            table_name.clone(),
-            tenant,
-            writer_id.clone(),
-            intervals,
-            Arc::clone(&done),
-            Arc::clone(&lost),
-        ));
+        let registration = store.lease_keeper().map(|keeper| {
+            keeper.register(LeaseTarget::ResultTable {
+                table: table_name.clone(),
+                writer_id: writer_id.clone(),
+            })
+        });
         Self {
             store,
             table_name,
@@ -109,9 +122,8 @@ impl BuildingTable {
             tenant,
             writer_id,
             storage_precision,
-            done,
-            lost,
-            heartbeat,
+            done: Arc::new(AtomicBool::new(false)),
+            registration,
         }
     }
 
@@ -145,13 +157,23 @@ impl BuildingTable {
         self.storage_precision
     }
 
-    /// `true` while the heartbeat still owns the lease. Flips to `false` the
-    /// first time a renew matches zero rows (the row was claimed by recovery
-    /// or went terminal underneath the writer). A writer checks this at each
-    /// batch boundary and aborts with [`JammiError::LeaseLost`] when it is
-    /// false, rather than streaming bytes into a table it no longer owns.
+    /// `true` while the keeper registration (if any) still owns the lease and
+    /// the handle has not finished/aborted/detached. Flips to `false` the
+    /// first time the keeper's renew matches zero rows (the row was claimed
+    /// by recovery or went terminal underneath the writer). A writer checks
+    /// this at each batch boundary and aborts with [`JammiError::LeaseLost`]
+    /// when it is false, rather than streaming bytes into a table it no
+    /// longer owns. With no keeper attached this is `true` until
+    /// finish/abort/detach — see the struct doc's trade-off.
     pub fn is_live(&self) -> bool {
-        !self.lost.load(Ordering::SeqCst) && !self.done.load(Ordering::SeqCst)
+        if self.done.load(Ordering::SeqCst) {
+            return false;
+        }
+        !self
+            .registration
+            .as_ref()
+            .map(Registration::lost)
+            .unwrap_or(false)
     }
 
     /// The compare-and-set predicate for this writer's row under the tenant
@@ -253,9 +275,9 @@ impl BuildingTable {
             )
             .await;
         // Whatever the promote said, this handle's row is no longer `building`
-        // under this writer: stop the heartbeat and make Drop a no-op.
+        // under this writer: unregister from the keeper and make Drop a no-op.
         self.done.store(true, Ordering::SeqCst);
-        self.stop_heartbeat();
+        self.unregister();
         let owner = match promoted {
             Ok(owner) => owner,
             Err(JammiError::CasFailed { status, .. })
@@ -310,7 +332,7 @@ impl BuildingTable {
     /// retry.
     pub async fn abort(mut self) -> Result<()> {
         self.done.store(true, Ordering::SeqCst);
-        self.stop_heartbeat();
+        self.unregister();
         let cas = self.cas();
         self.store.catalog().fail_building_table(&cas).await?;
         let outcome = self
@@ -329,17 +351,29 @@ impl BuildingTable {
         }
     }
 
-    /// Detach the handle from its row with no catalog transition — the state
-    /// a `SIGKILL` leaves: the heartbeat stops, the row stays `building` under
-    /// this writer's id with a lease that then simply expires. Drop marks
-    /// nothing. A recovery sweep after the lease expires reconciles the row
-    /// exactly as it would a dead writer's.
-    pub fn abandon(mut self) {
+    /// Detach the handle from its row with NO catalog transition (N2): stop
+    /// renewing (unregister from the keeper), mark the handle done, issue no
+    /// CAS, delete nothing. The state a job that lost its lease — or whose
+    /// attempt was superseded by a reclaim — leaves behind: the row stays
+    /// `building` under this writer's id with a lease that then simply
+    /// expires (or, if already expired, is immediately reclaimable). Drop
+    /// marks nothing further. A recovery sweep after the lease expires
+    /// reconciles the row exactly as it would a dead writer's; the successor
+    /// attempt that reclaims it adopts or fails it (N1).
+    ///
+    /// Distinct from [`Self::abort`] (a CAS-fail-and-delete, the OWNER's own
+    /// decision that its output should never exist) — `detach` is for the
+    /// caller that is no longer sure it IS the owner (lease lost, attempts
+    /// mismatch) and so must not act as one: no CAS, because a CAS run by a
+    /// non-owner risks nothing structurally, but issuing ANY write here would
+    /// contradict the premise that this caller no longer has standing to
+    /// decide the row's fate.
+    pub fn detach(mut self) {
         self.done.store(true, Ordering::SeqCst);
-        self.stop_heartbeat();
+        self.unregister();
     }
 
-    /// Test-only: abandon the handle AND force the row's lease into the past,
+    /// Test-only: detach the handle AND force the row's lease into the past,
     /// so a recovery sweep run immediately afterwards treats the row as a dead
     /// writer's. Runs the lease rewrite as this writer's own CAS, so it fails
     /// loudly (rather than silently leaving a live lease) if the row is not
@@ -349,24 +383,30 @@ impl BuildingTable {
     /// [`crate::catalog::lease::lease_expired_clause`] later compares it
     /// with.
     #[cfg(feature = "test-hooks")]
-    pub async fn into_abandoned(self) -> Result<()> {
+    pub async fn into_detached(self) -> Result<()> {
         let cas = self.cas();
         let catalog = Arc::clone(self.store.catalog());
-        self.abandon();
+        self.detach();
         catalog.expire_lease_for_test(&cas).await
     }
 
-    fn stop_heartbeat(&mut self) {
-        if let Some(handle) = self.heartbeat.take() {
-            handle.abort();
-        }
+    /// Drop the keeper registration (if any), stopping renewal. Mirrors the
+    /// old `stop_heartbeat`'s name at every call site above; the mechanism is
+    /// now "drop the `Registration`" rather than "abort a `JoinHandle`".
+    fn unregister(&mut self) {
+        self.registration.take();
     }
 }
 
 impl Drop for BuildingTable {
     fn drop(&mut self) {
-        self.stop_heartbeat();
-        if self.done.load(Ordering::SeqCst) || self.lost.load(Ordering::SeqCst) {
+        let already_lost = self
+            .registration
+            .as_ref()
+            .map(Registration::lost)
+            .unwrap_or(false);
+        self.unregister();
+        if self.done.load(Ordering::SeqCst) || already_lost {
             return;
         }
         // Dropped without finish/abort — an error path unwound through `?`.
@@ -389,44 +429,4 @@ impl Drop for BuildingTable {
             }
         });
     }
-}
-
-/// Spawn the lease-renewing heartbeat task (the shape of the training
-/// worker's). It renews by CAS on the configured interval; the first miss
-/// sets `lost` and stops; a backend error is logged and the task keeps
-/// beating (the lease may still be renewed before it expires). Stops when
-/// `done` is set.
-fn spawn_heartbeat(
-    store: ResultStore,
-    table_name: String,
-    tenant: Option<TenantId>,
-    writer_id: String,
-    intervals: LeaseIntervals,
-    done: Arc<AtomicBool>,
-    lost: Arc<AtomicBool>,
-) -> tokio::task::JoinHandle<()> {
-    tokio::spawn(async move {
-        loop {
-            tokio::time::sleep(intervals.heartbeat()).await;
-            if done.load(Ordering::SeqCst) {
-                return;
-            }
-            let cas = ResultTableCas::writer(&table_name, &writer_id, tenant);
-            match store.catalog().renew_lease(&cas, intervals.lease()).await {
-                Ok(()) => {}
-                Err(
-                    JammiError::RowGone { .. }
-                    | JammiError::TenantMismatch { .. }
-                    | JammiError::LeaseLost { .. }
-                    | JammiError::CasFailed { .. },
-                ) => {
-                    lost.store(true, Ordering::SeqCst);
-                    return;
-                }
-                Err(e) => {
-                    tracing::error!(table = table_name, error = %e, "result-table heartbeat failed");
-                }
-            }
-        }
-    })
 }

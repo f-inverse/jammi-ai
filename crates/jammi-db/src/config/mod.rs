@@ -220,9 +220,11 @@ pub struct JammiConfig {
     /// (a training job, a building result table) is owned before it is
     /// reclaimable, and how often its holder renews it.
     pub lease: LeaseConfig,
-    /// Training-worker settings: whether this process runs the claim loop, and
-    /// how often an idle worker polls for work.
-    pub training: TrainingConfig,
+    /// Worker-loop settings: whether this process claims `jobs` rows at all,
+    /// which kinds it claims, and how often an idle worker polls for work.
+    pub worker: WorkerConfig,
+    /// Job retention: how long a terminal `jobs` row survives the sweep.
+    pub jobs: JobsConfig,
     /// Cache layer settings (ANN cache, embedding cache).
     pub cache: CacheConfig,
     /// HTTP and Arrow Flight server bind addresses.
@@ -999,40 +1001,47 @@ impl LeaseConfig {
     }
 }
 
-/// Training-worker settings: whether this process runs the claim loop at all,
-/// and — when it does — how often an idle worker polls for new work. The lease
-/// a claim is held under and the heartbeat that renews it are the deployment's
-/// one [`LeaseConfig`], shared with every other leased row.
+/// Worker-loop settings: whether this process runs the claim loop at all,
+/// which job kinds it claims, and — when it does — how often an idle worker
+/// polls for new work. The lease a claim is held under and the heartbeat that
+/// renews it are the deployment's one [`LeaseConfig`], shared with every
+/// other leased row.
+///
+/// Replaces the former `[training] run_worker`/`idle_poll_secs` (PR-C): the
+/// claim loop is no longer training-specific — a process opts into claiming
+/// any kind-agnostic `jobs` row, training or compute, and `kinds` selects
+/// which. Every key `[training]` carried was worker-related, so the section
+/// is gone entirely rather than left holding nothing.
 ///
 /// Defaults reproduce the engine's built-in timing (1 s idle poll) with the
-/// claim loop on, so a config without a `[training]` section behaves
-/// identically to one that omits it.
+/// claim loop on and every kind claimed, so a config without a `[worker]`
+/// section behaves identically to one that omits it.
 ///
-/// The section rejects unknown keys. In particular the former
-/// `lease_duration_secs` / `heartbeat_interval_secs` keys moved to `[lease]`
-/// as `duration_secs` / `heartbeat_secs`; a TOML still naming them under
-/// `[training]` is a hard load error, never a silent fall-back to the default
-/// timing.
+/// The section rejects unknown keys. In particular the lease keys live only
+/// under `[lease]` (`duration_secs` / `heartbeat_secs`); a TOML naming them
+/// under `[worker]` is a hard load error, never a silent fall-back to the
+/// default timing.
 ///
 /// # TOML
 ///
 /// ```toml
-/// [training]
-/// run_worker = true
+/// [worker]
+/// enabled = true
+/// kinds = "all"
 /// idle_poll_secs = 1
 /// ```
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
 #[serde(default, deny_unknown_fields)]
-pub struct TrainingConfig {
-    /// Whether THIS process runs the training claim loop at all. Default: `true`.
+pub struct WorkerConfig {
+    /// Whether THIS process runs the claim loop at all. Default: `true`.
     ///
     /// `true` — the process opens the catalog and drives the loop: it claims
-    /// queued jobs, renews the lease while they run, and reclaims leases that
-    /// expired under a dead claimant.
+    /// queued jobs of `kinds`, renews the lease while they run, and reclaims
+    /// leases that expired under a dead claimant.
     ///
-    /// `false` — the process still mounts and serves the training surface and
-    /// still accepts submissions, but never claims. Submitted jobs stay
-    /// `queued` until some process configured with `run_worker = true` opens
+    /// `false` — the process still mounts and serves the submission surface
+    /// and still accepts submissions, but never claims. Submitted jobs stay
+    /// `queued` until some process configured with `enabled = true` opens
     /// the catalog. On a single-process catalog (SQLite) that means this
     /// process must close the catalog first; a multi-process catalog
     /// (Postgres) can run both concurrently.
@@ -1044,31 +1053,71 @@ pub struct TrainingConfig {
     /// removes the submission surface — only the claiming.
     ///
     /// The poll below describes the loop this flag gates; it is validated by
-    /// [`Self::worker_intervals`] regardless of `run_worker`, so a config that
+    /// [`Self::worker_intervals`] regardless of `enabled`, so a config that
     /// switches the loop on later cannot smuggle in bad timing.
-    pub run_worker: bool,
+    pub enabled: bool,
+    /// Which job kinds this worker claims. `"all"` (the default) claims every
+    /// kind compiled into the binary; an explicit list claims only those
+    /// named. This layer carries the raw selection only — `jammi-ai` owns
+    /// the kind vocabulary and validates it against the compiled set at
+    /// startup, the same "raw tokens here, validated downstream" split
+    /// [`ServiceSelection`] uses for `[server].services`.
+    pub kinds: WorkerKinds,
     /// How often an idle worker polls for a queued job (and reclaims expired
     /// leases). Must be non-zero — a zero poll is a busy-loop. Default: 1.
     pub idle_poll_secs: u64,
 }
 
-impl Default for TrainingConfig {
+impl Default for WorkerConfig {
     fn default() -> Self {
         Self {
             // Default on: an unconfigured deployment is a whole one — it both
             // accepts jobs and works them. Opting out is the explicit act.
-            run_worker: true,
+            enabled: true,
+            kinds: WorkerKinds::default(),
             idle_poll_secs: 1,
         }
     }
 }
 
-/// The validated, typed training-worker timing the worker drives its loop with.
+/// The worker's job-kind selection: `All` (the default) claims every kind
+/// compiled into this binary; `Only` claims exactly the named kinds (e.g.
+/// `[]` for a claim loop that runs but claims nothing — equivalent to
+/// `enabled = false` for the poll loop's own effect, but distinguishable in
+/// `ListWorkers`). Deserializes through the identical hand-written grammar
+/// [`ServiceSelection`] uses (H7: `"all"`, a comma-separated list, or a TOML
+/// array) — mapped 1:1 rather than duplicating the visitor, since the two
+/// selections share exactly the same shape and differ only in vocabulary
+/// (service tiers vs. job kinds, each validated by its own owning layer).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum WorkerKinds {
+    /// Every kind compiled into this binary.
+    All(AllSentinel),
+    /// Exactly these kinds.
+    Only(Vec<String>),
+}
+
+impl Default for WorkerKinds {
+    fn default() -> Self {
+        WorkerKinds::All(AllSentinel::All)
+    }
+}
+
+impl<'de> Deserialize<'de> for WorkerKinds {
+    fn deserialize<D: Deserializer<'de>>(deserializer: D) -> std::result::Result<Self, D::Error> {
+        Ok(match ServiceSelection::deserialize(deserializer)? {
+            ServiceSelection::All(sentinel) => WorkerKinds::All(sentinel),
+            ServiceSelection::Only(tokens) => WorkerKinds::Only(tokens),
+        })
+    }
+}
+
+/// The validated, typed worker timing the claim loop drives itself with.
 ///
 /// `lease` and `heartbeat` are the deployment's [`LeaseIntervals`] — the single
 /// source of truth for the lease window, so the worker's renew always targets
 /// the same deadline the reclaim path compares against. The constructor
-/// [`TrainingConfig::worker_intervals`] is the only way to build one, so the
+/// [`WorkerConfig::worker_intervals`] is the only way to build one, so the
 /// margin and non-zero-poll invariants hold by construction.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct WorkerIntervals {
@@ -1080,7 +1129,7 @@ pub struct WorkerIntervals {
     pub idle_poll: std::time::Duration,
 }
 
-impl TrainingConfig {
+impl WorkerConfig {
     /// Resolve the typed [`WorkerIntervals`] this timing implies over the
     /// deployment's validated `lease`, enforcing the worker's own invariant:
     /// `idle_poll_secs >= 1` — a zero idle poll is a busy-loop. The lease
@@ -1093,7 +1142,7 @@ impl TrainingConfig {
 
         if self.idle_poll_secs == 0 {
             return Err(JammiError::Config(
-                "training.idle_poll_secs must be > 0 (a zero poll is a busy-loop)".into(),
+                "worker.idle_poll_secs must be > 0 (a zero poll is a busy-loop)".into(),
             ));
         }
         Ok(WorkerIntervals {
@@ -1101,6 +1150,32 @@ impl TrainingConfig {
             heartbeat: lease.heartbeat(),
             idle_poll: Duration::from_secs(self.idle_poll_secs),
         })
+    }
+}
+
+/// Job retention (N9): how long a TERMINAL `jobs` row (`completed` /
+/// `failed`) keeps blocking `delete_model` and survives the retention sweep
+/// (`prune_jobs`) before it is eligible for deletion. A non-terminal job
+/// blocks `delete_model` indefinitely and is never pruned, regardless of age.
+///
+/// # TOML
+///
+/// ```toml
+/// [jobs]
+/// retention_days = 30
+/// ```
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct JobsConfig {
+    /// How many days a terminal job row survives before the sweep may delete
+    /// it (and before `delete_model`'s referential scan stops counting it as
+    /// a blocking reference). Default: 30.
+    pub retention_days: u32,
+}
+
+impl Default for JobsConfig {
+    fn default() -> Self {
+        Self { retention_days: 30 }
     }
 }
 
@@ -1348,7 +1423,8 @@ impl Default for JammiConfig {
             embedding: EmbeddingConfig::default(),
             fine_tuning: FineTuningConfig::default(),
             lease: LeaseConfig::default(),
-            training: TrainingConfig::default(),
+            worker: WorkerConfig::default(),
+            jobs: JobsConfig::default(),
             cache: CacheConfig::default(),
             server: ServerConfig::default(),
             logging: LoggingConfig::default(),
@@ -1590,10 +1666,10 @@ impl JammiConfig {
             cloud.validate()?;
         }
         // Reject a lease timing that violates the heartbeat margin, or a
-        // training poll that is a busy-loop, at load time rather than at
+        // worker poll that is a busy-loop, at load time rather than at
         // worker spawn, deep in a server startup.
         let lease = config.lease.intervals()?;
-        config.training.worker_intervals(lease)?;
+        config.worker.worker_intervals(lease)?;
         Ok(config)
     }
 

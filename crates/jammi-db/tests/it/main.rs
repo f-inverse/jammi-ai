@@ -17,10 +17,11 @@ mod esc_100_lossy_replay_types;
 mod esc_101_intra_batch_row_order;
 mod eval_per_query;
 mod exact_search;
-mod fine_tune_queue;
 mod foundation;
 mod freshness;
 mod index;
+mod jobs_queue;
+mod lease_keeper;
 mod materialization;
 #[cfg(feature = "test-hooks")]
 mod materialization_crash_recovery;

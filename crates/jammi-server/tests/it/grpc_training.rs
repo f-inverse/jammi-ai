@@ -768,13 +768,16 @@ async fn start_training_rejects_missing_columns() {
 // driving a real claim-time determination.
 // ---------------------------------------------------------------------------
 
-/// Directly seed a `training_jobs` row, bypassing
-/// [`jammi_db::catalog::Catalog::create_training_job`] (which always lands
+/// Directly seed a `jobs` row, bypassing
+/// [`jammi_db::catalog::Catalog::submit_job`] (which always lands
 /// `status = 'queued'`). The row this writes never passes through `'queued'`,
-/// so it is race-free against the server's own background `TrainingWorker` —
+/// so it is race-free against the server's own background `JobWorker` —
 /// mounted alongside `TrainingService` by every `start_engine_server*` fixture
 /// — which claims exclusively `WHERE status = 'queued'` and would otherwise
-/// compete for a freshly-queued row nondeterministically.
+/// compete for a freshly-queued row nondeterministically. The generalised
+/// `jobs` schema (migration 029, C1b) has no dedicated `base_model_id`/
+/// `training_source`/`loss_type`/`hyperparams`/`training_spec` columns — this
+/// seeds `model_ref` (the FK-keyed base model) and an empty `spec`.
 async fn seed_training_job_row(
     catalog: &jammi_db::catalog::Catalog,
     job_id: &str,
@@ -791,41 +794,42 @@ async fn seed_training_job_row(
     let status = status.to_string();
     let claimed_by = claimed_by.map(str::to_string);
     let acceleration_report = acceleration_report.map(str::to_string);
-    // Far enough in the future that `reclaim_expired_training_jobs`'s
+    // Far enough in the future that `reclaim_expired_jobs`'s
     // `lease_expires_at < now` sweep (run on every worker tick) never reclaims
     // this row mid-test.
     let lease_expires_at = claimed_by
         .is_some()
         .then(|| "9999-12-31T23:59:59.000000Z".to_string());
+    let now = jammi_db::catalog::backend::now_sortable();
 
     catalog
         .backend_arc()
         .transaction(TxOptions::default(), move |tx| {
             Box::pin(async move {
                 tx.execute(
-                    "INSERT INTO training_jobs \
-                     (job_id, base_model_id, training_source, loss_type, hyperparams, status, \
-                      kind, training_spec, tenant_id, acceleration_report, claimed_by, attempts, \
-                      lease_expires_at) \
-                     VALUES ($1, $2, 'seed.csv', 'contrastive', '{}', $3, 'fine_tune', $4, $5, \
-                             $6, $7, $8, $9)",
+                    "INSERT INTO jobs \
+                     (job_id, kind, tenant_id, status, execution, spec, model_ref, \
+                      acceleration_report, claimed_by, attempts, lease_expires_at, \
+                      created_at, updated_at) \
+                     VALUES ($1, 'fine_tune', $2, $3, 'queued', '{}', $4, \
+                             $5, $6, $7, $8, $9, $9)",
                     &[
                         SqlValue::TextOwned(job_id),
-                        SqlValue::TextOwned(base_model_id),
+                        SqlValue::Null(SqlNullType::Text),
                         SqlValue::TextOwned(status),
-                        SqlValue::Null(SqlNullType::Text),
-                        SqlValue::Null(SqlNullType::Text),
+                        SqlValue::TextOwned(base_model_id),
                         SqlValue::from(acceleration_report),
                         SqlValue::from(claimed_by),
                         SqlValue::Int(attempts),
                         SqlValue::from(lease_expires_at),
+                        SqlValue::TextOwned(now),
                     ],
                 )
                 .await
             })
         })
         .await
-        .expect("seed training_jobs row");
+        .expect("seed jobs row");
 }
 
 /// Register the FK target model every seeded row's `base_model_id` points at.
@@ -900,9 +904,9 @@ async fn training_status_acceleration_report_pending_state_matches_the_catalog_r
     let embedded = server
         .engine
         .catalog()
-        .get_training_job(&start.job_id)
+        .get_job(&start.job_id)
         .await
-        .expect("get_training_job");
+        .expect("get_job");
     // The fixture's quiescence is itself asserted, so this test can never pass
     // vacuously against a job that was already claimed: a claimed row's status
     // is `running`/terminal, never `queued`.
@@ -952,9 +956,9 @@ async fn training_status_acceleration_report_pending_state_matches_the_catalog_r
     let embedded_after = server
         .engine
         .catalog()
-        .get_training_job(&start.job_id)
+        .get_job(&start.job_id)
         .await
-        .expect("get_training_job");
+        .expect("get_job");
     assert_eq!(
         after.acceleration_report_json, embedded_after.acceleration_report,
         "at the job's terminal state the wire acceleration_report_json must \
@@ -1110,10 +1114,7 @@ async fn training_status_acceleration_report_determined_and_legacy_states_match_
             .await
             .expect("training_status")
             .into_inner();
-        let embedded = catalog
-            .get_training_job(job_id)
-            .await
-            .expect("get_training_job");
+        let embedded = catalog.get_job(job_id).await.expect("get_job");
         assert_eq!(
             resp.acceleration_report_json, embedded.acceleration_report,
             "TrainingStatus.acceleration_report_json for '{job_id}' must BYTE-EQUAL \
@@ -1268,7 +1269,7 @@ async fn wire_and_embedded(
     job_id: &str,
 ) -> (
     jammi_server::grpc::proto::training::TrainingStatusResponse,
-    jammi_db::catalog::training_repo::TrainingJobRecord,
+    jammi_db::catalog::jobs_repo::JobRecord,
 ) {
     let wire = client
         .training_status(TrainingStatusRequest {
@@ -1280,9 +1281,9 @@ async fn wire_and_embedded(
     let embedded = server
         .engine
         .catalog()
-        .get_training_job(job_id)
+        .get_job(job_id)
         .await
-        .expect("get_training_job");
+        .expect("get_job");
     (wire, embedded)
 }
 
@@ -1338,8 +1339,7 @@ async fn train_tier_with_run_worker_false_leaves_the_job_queued_and_pending_stab
 
     // Span strictly more than one idle poll interval, read off the server's OWN
     // config so the window follows the knob's timing rather than a magic number.
-    let idle_poll =
-        Duration::from_secs(server.engine.inner_config().training.idle_poll_secs.max(1));
+    let idle_poll = Duration::from_secs(server.engine.inner_config().worker.idle_poll_secs.max(1));
     const POLLS: u32 = 6;
     let step = (idle_poll * 2) / POLLS;
     let began = std::time::Instant::now();
@@ -1462,9 +1462,9 @@ async fn train_tier_with_run_worker_true_lets_the_submitted_job_leave_queued() {
     let embedded = server
         .engine
         .catalog()
-        .get_training_job(&start.job_id)
+        .get_job(&start.job_id)
         .await
-        .expect("get_training_job");
+        .expect("get_job");
     assert_eq!(
         terminal.status, embedded.status,
         "K4: at the terminal state the remote status and the embedded catalog \
@@ -1557,9 +1557,9 @@ async fn embedded_attach_model_id(server: &EngineServer, job_id: &str) -> String
     let record = server
         .engine
         .catalog()
-        .get_training_job(job_id)
+        .get_job(job_id)
         .await
-        .expect("get_training_job");
+        .expect("get_job");
     jammi_ai::fine_tune::training_job::resolve_model_id(job_id, &record)
         .expect("the embedded arm resolves this job's model id")
 }
@@ -1613,10 +1613,14 @@ async fn training_status_model_id_matches_the_embedded_derived_id_before_complet
          status means this is no longer a pre-completion read"
     );
     assert_eq!(
-        embedded.output_model_id, None,
-        "the catalog has NOT stamped output_model_id before completion — without \
-         this the wire value below could be a plain column relay and the test \
-         would prove nothing"
+        embedded.output_model_id.as_deref(),
+        Some(start.model_id.as_str()),
+        "the generalised `jobs` schema stamps output_model_id at SUBMIT time \
+         (`SubmitJobParams::output_model_id`, C1b/N8), not at finish — so the row \
+         already carries the deterministic id `StartTraining` returned, even \
+         pre-completion. `resolve_model_id` reads it back directly rather than \
+         re-deriving it, so this is not a plain column relay: the wire value below \
+         must still byte-equal the embedded attach handle's independently-derived id"
     );
     assert_eq!(
         wire.model_id,
@@ -1717,10 +1721,7 @@ async fn training_status_model_id_is_derived_for_running_and_failed_rows() {
             .await
             .expect("training_status")
             .into_inner();
-        let embedded = catalog
-            .get_training_job(job_id)
-            .await
-            .expect("get_training_job");
+        let embedded = catalog.get_job(job_id).await.expect("get_job");
         assert_eq!(
             resp.status, status,
             "the seeded row must be read back in the state it was seeded in"
@@ -1810,9 +1811,9 @@ async fn training_status_model_id_decodes_the_predictor_spec_before_completion()
             let record = server
                 .engine
                 .catalog()
-                .get_training_job(&start.job_id)
+                .get_job(&start.job_id)
                 .await
-                .expect("get_training_job under tenant A");
+                .expect("get_job under tenant A");
             let model_id =
                 jammi_ai::fine_tune::training_job::resolve_model_id(&start.job_id, &record)
                     .expect("the embedded arm resolves the predictor job's model id");
@@ -1820,13 +1821,16 @@ async fn training_status_model_id_decodes_the_predictor_spec_before_completion()
         })
         .await;
     assert_eq!(
-        embedded_record.output_model_id, None,
-        "the predictor row has not stamped output_model_id before completion"
+        embedded_record.output_model_id.as_deref(),
+        Some("ctx-predictor-wire"),
+        "the generalised `jobs` schema stamps output_model_id at SUBMIT time \
+         (C1b/N8) — the predictor's caller-chosen id is already on the row \
+         pre-completion, not just re-derivable from the persisted spec"
     );
     assert_eq!(
         resp.model_id, embedded_model_id,
         "K4: the predictor job's wire model_id must BYTE-EQUAL the id the \
-         embedded attach handle decodes out of the persisted training_spec"
+         embedded attach handle resolves for the same job"
     );
     assert_eq!(
         resp.model_id, "ctx-predictor-wire",

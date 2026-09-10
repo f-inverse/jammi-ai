@@ -19,7 +19,7 @@ use std::time::{Duration, Instant};
 use jammi_ai::fine_tune::{FineTuneConfig, FineTuneMethod};
 use jammi_ai::model::ModelTask;
 use jammi_ai::session::InferenceSession;
-use jammi_db::config::{CatalogConfig, JammiConfig, LeaseConfig, StorageConfig, TrainingConfig};
+use jammi_db::config::{CatalogConfig, JammiConfig, LeaseConfig, StorageConfig, WorkerConfig};
 use jammi_db::source::{FileFormat, SourceConnection, SourceType};
 use jammi_db::storage::{CloudConfig, S3Config};
 use tempfile::TempDir;
@@ -160,7 +160,7 @@ fn shared_config(backends: &Backends, result_root: &str, artifact_dir: &Path) ->
             duration_secs: LEASE_SECS,
             heartbeat_secs: HEARTBEAT_SECS,
         },
-        training: TrainingConfig {
+        worker: WorkerConfig {
             idle_poll_secs: IDLE_POLL_SECS,
             // These processes are the workers under test — claim loop on.
             ..Default::default()
@@ -481,12 +481,12 @@ pub async fn await_job(
     job_id: &str,
     tenant: Option<jammi_db::TenantId>,
     label: &str,
-    mut want: impl FnMut(&jammi_db::catalog::training_repo::TrainingJobRecord) -> bool,
-) -> jammi_db::catalog::training_repo::TrainingJobRecord {
+    mut want: impl FnMut(&jammi_db::catalog::jobs_repo::JobRecord) -> bool,
+) -> jammi_db::catalog::jobs_repo::JobRecord {
     let catalog = session.catalog().pinned_to_tenant(tenant);
     let deadline = Instant::now() + TERMINAL_TIMEOUT;
     loop {
-        if let Ok(record) = catalog.get_training_job(job_id).await {
+        if let Ok(record) = catalog.get_job(job_id).await {
             if want(&record) {
                 return record;
             }
@@ -533,19 +533,19 @@ async fn dump_final_job_row(
     match session
         .catalog()
         .pinned_to_tenant(tenant)
-        .get_training_job(job_id)
+        .get_job(job_id)
         .await
     {
         Ok(r) => eprintln!(
             "status={:?} claimed_by={:?} attempts={} output_model_id={:?} \
-             tenant_id={:?} lease_expires_at={:?} error_message={:?}",
+             tenant_id={:?} lease_expires_at={:?} error={:?}",
             r.status,
             r.claimed_by,
             r.attempts,
             r.output_model_id,
             r.tenant_id,
             r.lease_expires_at,
-            r.error_message,
+            r.error,
         ),
         Err(e) => eprintln!("<job row unreadable: {e}>"),
     }

@@ -508,7 +508,7 @@ impl InferenceSession {
     ///
     /// Like the fine-tune verbs, this persists a self-describing
     /// [`TrainingSpec::ContextPredictor`] into a `queued` catalog job and
-    /// returns; a [`crate::fine_tune::worker::TrainingWorker`] later claims it,
+    /// returns; a [`crate::fine_tune::worker::JobWorker`] later claims it,
     /// re-samples the episodic meta-dataset from the persisted spec
     /// (deterministic task split via the seed), drives the predictor train loop
     /// while heartbeating, and registers the trained predictor. Call
@@ -558,9 +558,6 @@ impl InferenceSession {
                     .catalog_pk
             }
         };
-        let loss_type = format!("{:?}", spec.head);
-        let hyperparams = serde_json::to_string(spec)?;
-
         let job_id = uuid::Uuid::new_v4().to_string();
         let training_spec = TrainingSpec::ContextPredictor {
             source: source_id.to_string(),
@@ -568,14 +565,15 @@ impl InferenceSession {
         };
         let spec_json = serde_json::to_string(&training_spec)?;
         self.catalog()
-            .create_training_job(jammi_db::catalog::training_repo::CreateTrainingJobParams {
+            .submit_job(jammi_db::catalog::jobs_repo::SubmitJobParams {
                 job_id: &job_id,
-                base_model_id: &base_model_pk,
-                training_source: source_id,
-                loss_type: &loss_type,
-                hyperparams: &hyperparams,
                 kind: training_spec.kind(),
-                training_spec: &spec_json,
+                execution: jammi_db::catalog::status::JobExecution::Queued,
+                spec: &spec_json,
+                model_ref: Some(&base_model_pk),
+                output_model_id: Some(&spec.model_id),
+                model_source: None,
+                priority: 0,
             })
             .await?;
 

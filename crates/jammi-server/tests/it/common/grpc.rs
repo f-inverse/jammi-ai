@@ -437,7 +437,7 @@ pub fn with_session(
 
 /// Spin up the SAME engine-backed server [`start_engine_server`] does (identical
 /// tier set — the `train` tier included — identical chain, identical eager
-/// bind), with `[training] run_worker` set to `run_worker` **through a real
+/// bind), with `[worker] enabled` set to `run_worker` **through a real
 /// `jammi.toml` loaded by `JammiConfig::load`** — the exact path the
 /// `jammi-server` binary takes to its config.
 ///
@@ -451,7 +451,7 @@ pub fn with_session(
 ///
 /// The loaded config is asserted to actually carry the requested value before
 /// the session opens: `JammiConfig::load` applies `JAMMI_*` environment
-/// overrides, so an ambient `JAMMI_TRAINING__RUN_WORKER` in the test runner's
+/// overrides, so an ambient `JAMMI_WORKER__ENABLED` in the test runner's
 /// environment would otherwise silently invert the oracle. It fails loud here
 /// instead.
 ///
@@ -476,8 +476,8 @@ pub async fn start_engine_server_with_run_worker(run_worker: bool) -> EngineServ
              [logging]\n\
              level = \"debug\"\n\
              \n\
-             [training]\n\
-             run_worker = {run_worker}\n",
+             [worker]\n\
+             enabled = {run_worker}\n",
             artifact_dir = dir.path().display(),
         ),
     )
@@ -486,9 +486,9 @@ pub async fn start_engine_server_with_run_worker(run_worker: bool) -> EngineServ
     let cfg = jammi_db::config::JammiConfig::load(Some(&config_path))
         .expect("the fixture's jammi.toml loads");
     assert_eq!(
-        cfg.training.run_worker, run_worker,
+        cfg.worker.enabled, run_worker,
         "the loaded config must carry the run_worker this fixture asked for — a \
-         mismatch means an ambient JAMMI_TRAINING__RUN_WORKER override is \
+         mismatch means an ambient JAMMI_WORKER__ENABLED override is \
          inverting the oracle"
     );
     assert_eq!(

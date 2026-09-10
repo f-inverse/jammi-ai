@@ -65,7 +65,7 @@ fn jammi_native(m: &Bound<'_, PyModule>) -> PyResult<()> {
 /// platform config dir, and then the `JAMMI_*` environment overrides layered on
 /// top (and the load-time validation of the training timing that comes with
 /// it). An embedded process therefore answers every deployment key — notably
-/// `training.run_worker` (`JAMMI_TRAINING__RUN_WORKER`), which decides whether
+/// `worker.enabled` (`JAMMI_WORKER__ENABLED`), which decides whether
 /// THIS process runs the training claim loop — exactly the way a server process
 /// does. A key only one arm honoured would be a server-only feature, i.e. a
 /// deployment-shaped divergence rather than a setting.

@@ -7,6 +7,39 @@ workspace ships every publishable crate at the same
 ## [Unreleased]
 
 ### Added
+- **`jobs`/`instances`/`workers`: a generalised, kind-agnostic durable-job
+  queue replaces the training-only queue; a per-process lease keeper (#485).**
+  Migration 029 drops `training_jobs` and adds `jobs` (training AND compute
+  kinds share one claim/lease/reclaim table: `execution` distinguishes a
+  `queued` row a `[worker]` claim loop may pick up from an `inline` row
+  claimed once, by id, in the submitting call itself), `instances` (every
+  process upserts and heartbeats its own row), and `workers` (upserted only
+  by a process actually running the claim loop, naming the kinds it claims).
+  `jammi_ai::jobs::{ComputeSpec, JobSpec, JobResult, JobHandle}` and
+  `InferenceSession::{enqueue, run_now}` are the new entry points:
+  `enqueue` always accepts and returns a handle immediately; `run_now`
+  submits, claims, and executes an inline job in the caller's own task under
+  the same lease/finish machinery a queued job's worker uses, so an embedded
+  synchronous compute call and a claimed queued job of the same kind run
+  identical code. `crate::fine_tune::worker::JobWorker` (renamed from
+  `TrainingWorker`) dispatches every compiled kind — the three training
+  kinds unchanged, plus `neighbor_graph`/`propagate`/`asof_join` through
+  `jammi_ai::jobs::execute_compute` — and validates `[worker] kinds` against
+  the compiled set at startup. Every process's `instances` row and every
+  claimed job/table lease is a registration with one dedicated
+  lease-renewal OS thread (`LeaseKeeper`, its own runtime, its own catalog
+  connection) instead of a per-lease `tokio::spawn` heartbeat task, so a
+  CPU-bound inline compute job on the main runtime can no longer starve its
+  own lease renewal. `[worker] { enabled, kinds, idle_poll_secs }` and
+  `[jobs] { retention_days }` (default 30; a terminal job stops blocking
+  `delete_model` once past the window, a non-terminal job blocks
+  indefinitely) replace `[training]`. `Catalog::finish_job_with_model` is a
+  single attempt-guarded (`job_id AND claimed_by AND status AND attempts`)
+  transaction committing the output model's served path, every retained
+  epoch-checkpoint row, and the job's `completed` status together; every
+  terminal write retires a still-`{"state":"pending"}` acceleration-report
+  marker (esc-075) in its own update, generalised from the training-only
+  queue onto every job kind.
 - **`[models]`, file-backed secrets, `signing_key.file`, and a fourth config-file
   location (#483, #481, esc-095, esc-096).** `JammiConfig` gains a `[models]`
   section (`hub_endpoint`, `hub_cache_dir`, `hub_token`, `offline`) built
@@ -667,6 +700,17 @@ workspace ships every publishable crate at the same
   post-commit fan-out across replicas is unordered regardless of transport.
 
 ### Fixed
+- **`create_result_table`'s `partial_result` compare-and-set could be won by a
+  zombie of a requeued-and-re-claimed attempt (#485, esc-107).** A
+  `job_id`-only predicate (`WHERE job_id = $1 AND status = 'running' AND
+  partial_result IS NULL`) is satisfiable by a dead attempt whose own lease
+  expired: the job genuinely IS `running` again, just under a LATER attempt
+  the zombie never learned about, so it could still record its own table as
+  the job's served `partial_result` out from under the live, current
+  attempt. `CreateResultTableParams.job_id: Option<&str>` is now
+  `job_attempt: Option<JobAttempt<'a>>` (`{ job_id, instance_id, attempts }`)
+  and the CAS carries the full attempt guard every other `jobs`-table write
+  uses, surfacing a loser as the typed `JammiError::JobAttemptSuperseded`.
 - **Two concurrent `migrate()` callers on a fresh Postgres database could both attempt the
   schema DDL, one losing with SQLSTATE `42P07`/`23505` (#479, esc-093).** No cross-process
   mutual exclusion guarded the read-ledger-then-run-DDL window on a backend the guide
@@ -1026,6 +1070,27 @@ workspace ships every publishable crate at the same
   column keeps its documented `""` reading (esc-091).
 
 ### Breaking
+- **`[training]` is removed; `training_jobs` and its ten `training_repo`
+  catalog methods are gone with no shim (#485).** `[worker] { enabled, kinds,
+  idle_poll_secs }` and `[jobs] { retention_days }` replace it —
+  `JAMMI_TRAINING__RUN_WORKER` is now a typed `JammiError::Config` load
+  error under the existing namespace rule; the new spelling is
+  `JAMMI_WORKER__ENABLED`. `create_training_job`, `get_training_job`,
+  `finalize_training_job`, `fail_training_job`, `mark_training_running`,
+  `record_acceleration_report`, `list_training_jobs`,
+  `claim_next_training_job`, `heartbeat_training_job`, and
+  `reclaim_expired_training_jobs` are replaced by the generalised
+  `Catalog::{submit_job, get_job, finish_job_with_model, fail_job,
+  record_acceleration_report, list_jobs, claim_next, claim_by_id,
+  reclaim_expired_jobs}` (`jammi_db::catalog::jobs_repo`); `TrainingJobRecord`
+  is `JobRecord` (`base_model_id` → `model_ref`, `error_message` → `error`, no
+  separate `metrics` column — folded into the tagged `result` payload's
+  `JobResult::Model.metrics`). `crate::fine_tune::worker::TrainingWorker` is
+  renamed `JobWorker`. `ResultStore::create_table` and
+  `CreateResultTableParams` gain a trailing `job_attempt:
+  Option<JobAttempt<'_>>` parameter (`None` for every existing call site — a
+  behavior-preserving rename for callers that never passed a job link).
+  `Catalog::delete_model` gains a `retention_days: i64` parameter.
 - **Existing result-table and artifact object keys predating the tenant-prefixed layout
   are unattributed until the table is re-materialized (#484).** `reconcile`'s allowlist
   recognizes only `{seg}/{table}.parquet` and `models/{seg}/{job_id}/…` keys (`seg` a

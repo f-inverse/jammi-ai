@@ -119,7 +119,7 @@ pub const DEFAULT_PROPAGATE_MAX_ROWS: usize = 2_000_000;
 /// the symmetric `Â = D̃^{-1/2}(A+I)D̃^{-1/2}` of SGC/APPNP, paired with the
 /// `α`-teleport restart — the PageRank-decay form that keeps propagation
 /// anchored against over-smoothing.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, serde::Serialize, serde::Deserialize)]
 pub enum PropagationWeighting {
     /// Random-walk normalisation `D̃^{-1}Ã`: each node's new vector is the plain
     /// mean of itself and its neighbours. No degree fold needed — the hop is a
@@ -144,7 +144,7 @@ pub enum PropagationWeighting {
 /// [`JumpingKnowledge`](PropagationOutput::JumpingKnowledge) changes the output
 /// dimensionality — concatenating the per-hop blocks yields `(K+1)·d` columns in
 /// their own vector space, a same-space hazard a `bool` would hide.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, serde::Serialize, serde::Deserialize)]
 pub enum PropagationOutput {
     /// Emit only the final `X⁽ᴷ⁾` — a `d`-dimensional embedding table in the
     /// input's vector space.
@@ -160,7 +160,7 @@ pub enum PropagationOutput {
 /// Which declared edge relation to propagate over and how the walk reads it. The
 /// edge source and direction reuse the shared graph-neighbourhood config types;
 /// the loader here is propagation's own bounded, tenant-scoped scan.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct PropagateRequest {
     /// The source whose embedding table holds `X⁽⁰⁾`.
     pub source_id: String,

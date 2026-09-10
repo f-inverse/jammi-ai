@@ -68,7 +68,7 @@ use serde::Serialize;
 use uuid::Uuid;
 
 use crate::catalog::result_repo::ResultTableRecord;
-use crate::catalog::status::{ResultTableStatus, TrainingJobStatus};
+use crate::catalog::status::{JobStatus, ResultTableStatus};
 use crate::error::{JammiError, Result};
 use crate::storage::sidecar_layout::{
     required_sidecar_extensions, sidecar_extensions, SidecarKind,
@@ -666,11 +666,16 @@ impl ResultStore {
             .referenced_result_keys(&ready_rows, &live_building)
             .await?;
 
-        let training_jobs = self.catalog.list_training_jobs().await?;
+        // The former `training_jobs` read now walks the kind-agnostic `jobs`
+        // table (migration 029, G7): `running` rows are fully referenced,
+        // `queued` rows protect only their `_resume/**` prefix. Compute kinds
+        // write nothing under `models/` at all, so they simply never
+        // contribute a prefix here — no separate filter is needed for them.
+        let jobs = self.catalog.list_jobs().await?;
         let models = self.catalog.list_models().await?;
-        let running_prefixes: BTreeSet<String> = training_jobs
+        let running_prefixes: BTreeSet<String> = jobs
             .iter()
-            .filter(|j| j.status == TrainingJobStatus::Running.to_string())
+            .filter(|j| j.status == JobStatus::Running.to_string())
             .map(|j| {
                 format!(
                     "models/{}/{}",
@@ -679,9 +684,9 @@ impl ResultStore {
                 )
             })
             .collect();
-        let queued_resume_prefixes: BTreeSet<String> = training_jobs
+        let queued_resume_prefixes: BTreeSet<String> = jobs
             .iter()
-            .filter(|j| j.status == TrainingJobStatus::Queued.to_string())
+            .filter(|j| j.status == JobStatus::Queued.to_string())
             .map(|j| {
                 format!(
                     "models/{}/{}/_resume",

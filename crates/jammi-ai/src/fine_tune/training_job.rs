@@ -3,7 +3,7 @@
 use std::sync::Arc;
 use std::time::Duration;
 
-use jammi_db::catalog::status::TrainingJobStatus;
+use jammi_db::catalog::status::JobStatus;
 use jammi_db::catalog::Catalog;
 use jammi_db::error::{JammiError, Result};
 
@@ -47,15 +47,15 @@ impl TrainingJob {
     /// Block until the job reaches a terminal state (completed or failed).
     pub async fn wait(&self) -> Result<()> {
         loop {
-            let record = self.catalog.get_training_job(&self.job_id).await?;
-            let status: TrainingJobStatus = record
+            let record = self.catalog.get_job(&self.job_id).await?;
+            let status: JobStatus = record
                 .status
                 .parse()
                 .map_err(|e| JammiError::FineTune(format!("{e}")))?;
             match status {
-                TrainingJobStatus::Completed => return Ok(()),
-                TrainingJobStatus::Failed => {
-                    let msg = record.error_message.unwrap_or_else(|| "Job failed".into());
+                JobStatus::Completed => return Ok(()),
+                JobStatus::Failed => {
+                    let msg = record.error.unwrap_or_else(|| "Job failed".into());
                     return Err(JammiError::FineTune(msg));
                 }
                 _ => tokio::time::sleep(Duration::from_millis(100)).await,
@@ -65,7 +65,7 @@ impl TrainingJob {
 
     /// Get the current status from the catalog.
     pub async fn status(&self) -> Result<String> {
-        let record = self.catalog.get_training_job(&self.job_id).await?;
+        let record = self.catalog.get_job(&self.job_id).await?;
         Ok(record.status)
     }
 
@@ -116,7 +116,7 @@ pub fn fine_tuned_model_id(job_id: &str) -> String {
 /// the engine owns.
 pub fn resolve_model_id(
     job_id: &str,
-    record: &jammi_db::catalog::training_repo::TrainingJobRecord,
+    record: &jammi_db::catalog::jobs_repo::JobRecord,
 ) -> Result<String> {
     use crate::fine_tune::spec::TrainingSpec;
 
@@ -126,12 +126,7 @@ pub fn resolve_model_id(
     match record.kind.as_str() {
         "fine_tune" | "graph_fine_tune" => Ok(fine_tuned_model_id(job_id)),
         "context_predictor" => {
-            let raw = record.training_spec.as_deref().ok_or_else(|| {
-                JammiError::Catalog(format!(
-                    "training job {job_id}: missing persisted training_spec; \
-                     cannot resolve model_id before completion"
-                ))
-            })?;
+            let raw = record.spec.as_str();
             let spec: TrainingSpec = serde_json::from_str(raw).map_err(|parse_err| {
                 JammiError::Catalog(format!(
                     "training job {job_id}: training_spec failed to parse as JSON: {parse_err}"

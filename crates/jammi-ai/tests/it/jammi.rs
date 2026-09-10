@@ -79,7 +79,7 @@ async fn open_local_yields_a_working_embedded_session() {
 }
 
 // ---------------------------------------------------------------------------
-// GAP-A-5 (#446): `[training] run_worker` on the RUST SDK arm.
+// GAP-A-5 (#446): `[worker] enabled` on the RUST SDK arm.
 //
 // The design's one-binary symmetry claim (B4/K4) is that the server, the Python
 // embedded binding, and the Rust SDK front door all decide "does THIS process
@@ -95,12 +95,12 @@ async fn open_local_yields_a_working_embedded_session() {
 
 /// Build the front door's config the way a real embedded binary does: a
 /// `jammi.toml` written into `dir` and read back through `JammiConfig::load`,
-/// with `[training] run_worker` either set to `run_worker` or (when `None`) the
+/// with `[worker] enabled` either set to `run_worker` or (when `None`) the
 /// section omitted entirely so the default direction is what is under test.
 ///
 /// `expected` is asserted on the LOADED config before it is handed to the front
 /// door: `JammiConfig::load` applies `JAMMI_*` environment overrides, so an
-/// ambient `JAMMI_TRAINING__RUN_WORKER` in the test runner's environment would
+/// ambient `JAMMI_WORKER__ENABLED` in the test runner's environment would
 /// otherwise silently invert the oracle. It fails loud here instead.
 ///
 /// The rest mirrors `jammi_test_utils::test_config` (CPU device, small batch,
@@ -111,8 +111,8 @@ fn front_door_config(
     run_worker: Option<bool>,
     expected: bool,
 ) -> JammiConfig {
-    let training = match run_worker {
-        Some(v) => format!("\n[training]\nrun_worker = {v}\n"),
+    let worker = match run_worker {
+        Some(v) => format!("\n[worker]\nenabled = {v}\n"),
         None => String::new(),
     };
     let config_path = dir.join("jammi.toml");
@@ -129,7 +129,7 @@ fn front_door_config(
              \n\
              [logging]\n\
              level = \"debug\"\n\
-             {training}",
+             {worker}",
             artifact_dir = dir.display(),
         ),
     )
@@ -137,9 +137,9 @@ fn front_door_config(
 
     let config = JammiConfig::load(Some(&config_path)).expect("the fixture's jammi.toml loads");
     assert_eq!(
-        config.training.run_worker, expected,
+        config.worker.enabled, expected,
         "the loaded config must carry the run_worker this fixture asked for — a mismatch \
-         means an ambient JAMMI_TRAINING__RUN_WORKER override is inverting the oracle"
+         means an ambient JAMMI_WORKER__ENABLED override is inverting the oracle"
     );
     assert_eq!(
         config.artifact_dir.as_path(),
@@ -241,12 +241,7 @@ async fn front_door_with_run_worker_false_leaves_the_job_queued_and_pending_stab
     // Span strictly more than one idle poll interval, read off the session's OWN
     // config so the window follows the knob's timing rather than a magic number.
     let idle_poll = std::time::Duration::from_secs(
-        session
-            .engine()
-            .inner_config()
-            .training
-            .idle_poll_secs
-            .max(1),
+        session.engine().inner_config().worker.idle_poll_secs.max(1),
     );
     const POLLS: u32 = 6;
     let step = (idle_poll * 2) / POLLS;
@@ -265,9 +260,9 @@ async fn front_door_with_run_worker_false_leaves_the_job_queued_and_pending_stab
         let record = session
             .engine()
             .catalog()
-            .get_training_job(&job_id.0)
+            .get_job(&job_id.0)
             .await
-            .expect("get_training_job");
+            .expect("get_job");
         assert_eq!(
             record.claimed_by, None,
             "poll {poll}: an unclaimed job carries no claimant — a `claimed_by` here means \

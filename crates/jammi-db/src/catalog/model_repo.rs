@@ -1,6 +1,7 @@
 use crate::catalog::backend::{
-    BackendError, IsolationLevel, Row, SqlValue, Transaction, TxOptions,
+    BackendError, BackendKind, IsolationLevel, Row, SqlValue, Transaction, TxOptions,
 };
+use crate::catalog::lease::stale_before_clause;
 use crate::error::{JammiError, Result};
 use crate::model_task::ModelTask;
 use crate::tenant::TenantId;
@@ -130,9 +131,10 @@ impl Catalog {
     /// leaves whatever is already committed in place. So this call can *set*
     /// the path (a directly-registered base model) but can never *clear* nor
     /// overwrite a committed path to `NULL` — the path a finalized training
-    /// job serves is written solely by the lease-guarded
-    /// [`Self::finalize_training_job`] CAS, never by a worker's pre-finalize
-    /// (or a zombie's late) `register_model`.
+    /// job serves is meant to be written by the lease-guarded finalize
+    /// write's own CAS (its caller's own transaction, composed on top of the
+    /// `jobs`/`models` primitives this crate exposes), never by a worker's
+    /// pre-finalize or a zombie's late `register_model`.
     pub async fn register_model(&self, params: RegisterModelParams<'_>) -> Result<()> {
         let tenant = self.current_tenant();
         let pk = model_pk(tenant, params.model_id, params.version as i64);
@@ -268,18 +270,32 @@ impl Catalog {
     /// Hard-delete a model row, removing it entirely — so it is refused while
     /// any reference still points at the model, to avoid orphaning those edges.
     ///
-    /// The referential scan covers all four edges that target a model, each
+    /// The referential scan covers all five edges that target a model, each
     /// matched on the key that edge actually stores:
     ///
     /// - `result_tables.model_id` — the model NAME (no FK).
-    /// - `training_jobs.output_model_id` — the model NAME (no FK).
-    /// - `training_jobs.base_model_id` — the catalog PK (FK to `models`).
+    /// - `jobs.output_model_id` — the model NAME (no FK).
+    /// - `jobs.model_ref` — the catalog PK (FK to `models`).
     /// - `eval_runs.model_id` — the catalog PK (FK to `models`).
+    /// - (`jobs.model_source` is FK-free and NAME-keyed like
+    ///   `result_tables.model_id`/`jobs.output_model_id`, but it names a
+    ///   compute verb's *input* source, not a model this catalog registers by
+    ///   that name, so it is not a blocking edge here.)
     ///
     /// The two FK-backed edges are scanned in the engine and surface the typed
     /// [`JammiError::ModelReferenced`] just like the no-FK edges — the database
     /// FK is never the thing that rejects the DELETE, because a raw constraint
     /// violation would leak as an opaque backend error.
+    ///
+    /// **The two `jobs` edges are age-gated (N9): a row counts as a blocking
+    /// reference only while it is non-terminal OR younger than
+    /// `retention_days`** — an age PREDICATE evaluated fresh on every scan,
+    /// never a sweep-dependent flag. A terminal `jobs` row (`completed` /
+    /// `failed`) past the window no longer blocks; a non-terminal row blocks
+    /// indefinitely regardless of age; a young terminal row still blocks. The
+    /// predicate is evaluated fresh on every scan, exactly like every other
+    /// tenant/admin-scope decision on this table — no separate reaper needs to
+    /// run first for a delete to succeed.
     ///
     /// Tenant scope is strict — a session deletes only a row whose owner equals
     /// its OWN tenant (`tenant_id = $t OR (tenant_id IS NULL AND $t IS NULL)`),
@@ -294,6 +310,7 @@ impl Catalog {
         model_id: &str,
         version: Option<i32>,
         if_exists: bool,
+        retention_days: i64,
     ) -> Result<()> {
         let record = match version {
             Some(v) => self.get_model_version(model_id, v).await?,
@@ -311,6 +328,7 @@ impl Catalog {
         let pk = record.catalog_pk;
         let name = record.model_id;
         let tenant = self.current_tenant();
+        let backend_kind = self.backend().backend_kind();
 
         // The scan and the DELETE share one `Serializable` transaction. A
         // discovered reference is carried OUT through the success value (not a
@@ -334,8 +352,15 @@ impl Catalog {
                         // (NAME for the two no-FK edges, PK for the two FK-backed
                         // ones), tenant-scoped with the same strict predicate as
                         // the delete below.
-                        let referenced_by =
-                            scan_model_references(tx, &name, &pk, &tenant_val).await?;
+                        let referenced_by = scan_model_references(
+                            tx,
+                            &name,
+                            &pk,
+                            &tenant_val,
+                            backend_kind,
+                            retention_days,
+                        )
+                        .await?;
                         if !referenced_by.is_empty() {
                             return Ok(DeleteOutcome::Referenced(referenced_by));
                         }
@@ -421,7 +446,7 @@ enum DeleteOutcome {
 /// edge stores — the model NAME for the no-FK edges, the catalog PK for the
 /// FK-backed ones.
 struct ReferenceEdge {
-    /// Generic edge name (e.g. `result_tables`, `training_jobs.output_model_id`).
+    /// Generic edge name (e.g. `result_tables`, `jobs.output_model_id`).
     name: &'static str,
     /// The `COUNT(*)` query, tenant-scoped with the strict predicate.
     sql: &'static str,
@@ -430,31 +455,19 @@ struct ReferenceEdge {
     keyed_by_pk: bool,
 }
 
-/// The four edges that reference a model, each with the key it actually stores.
-/// `result_tables.model_id` and `training_jobs.output_model_id` hold the model
-/// NAME and have no FK; `training_jobs.base_model_id` and `eval_runs.model_id`
-/// hold the catalog PK and are FK-backed. Each count is tenant-scoped with the
-/// same strict predicate the DELETE uses, so a reference owned by another tenant
-/// never blocks (or unblocks) this tenant's delete.
-const REFERENCE_EDGES: [ReferenceEdge; 4] = [
+/// The two non-job edges that reference a model, tenant-scoped with the same
+/// strict predicate the DELETE uses. `result_tables.model_id` holds the model
+/// NAME and has no FK; `eval_runs.model_id` holds the catalog PK and is
+/// FK-backed. The two `jobs` edges (`model_ref`, `output_model_id`) are scanned
+/// separately by [`scan_model_references`] — they need one more bind
+/// (`retention_days`) and a backend-specific age clause (N9) neither of these
+/// static templates carries.
+const REFERENCE_EDGES: [ReferenceEdge; 2] = [
     ReferenceEdge {
         name: "result_tables",
         sql: "SELECT COUNT(*) AS n FROM result_tables \
               WHERE model_id = $1 AND (tenant_id = $2 OR (tenant_id IS NULL AND $2 IS NULL))",
         keyed_by_pk: false,
-    },
-    ReferenceEdge {
-        name: "training_jobs.output_model_id",
-        sql:
-            "SELECT COUNT(*) AS n FROM training_jobs \
-              WHERE output_model_id = $1 AND (tenant_id = $2 OR (tenant_id IS NULL AND $2 IS NULL))",
-        keyed_by_pk: false,
-    },
-    ReferenceEdge {
-        name: "training_jobs.base_model_id",
-        sql: "SELECT COUNT(*) AS n FROM training_jobs \
-              WHERE base_model_id = $1 AND (tenant_id = $2 OR (tenant_id IS NULL AND $2 IS NULL))",
-        keyed_by_pk: true,
     },
     ReferenceEdge {
         name: "eval_runs",
@@ -465,15 +478,23 @@ const REFERENCE_EDGES: [ReferenceEdge; 4] = [
 ];
 
 /// Count every reference edge that still points at the model and return the
-/// generic names of the non-empty ones. The FK-backed edges are scanned here
-/// (rather than left to the database FK) so they raise the same typed
-/// [`JammiError::ModelReferenced`] as the no-FK edges instead of leaking a raw
-/// constraint violation. `tenant_val` is bound as `$2` to every count.
+/// generic names of the non-empty ones — the two static [`REFERENCE_EDGES`]
+/// plus the two `jobs` edges (`model_ref`, PK-keyed; `output_model_id`,
+/// NAME-keyed), each age-gated (N9): a `jobs` row counts as blocking only
+/// while `status NOT IN ('completed', 'failed')` OR it is younger than
+/// `retention_days` — evaluated with [`stale_before_clause`] on
+/// `jobs.updated_at`, negated (a row counts when it is NOT stale-and-terminal).
+/// The FK-backed edges are scanned here (rather than left to the database FK)
+/// so they raise the same typed [`JammiError::ModelReferenced`] as the no-FK
+/// edges instead of leaking a raw constraint violation. `tenant_val` is bound
+/// to every count.
 async fn scan_model_references(
     tx: &mut Transaction<'_>,
     name: &str,
     pk: &str,
-    tenant_val: &SqlValue<'_>,
+    tenant_val: &SqlValue<'static>,
+    kind: BackendKind,
+    retention_days: i64,
 ) -> std::result::Result<Vec<String>, BackendError> {
     let mut referenced_by = Vec::new();
     for edge in &REFERENCE_EDGES {
@@ -488,6 +509,30 @@ async fn scan_model_references(
             .unwrap_or(0);
         if count > 0 {
             referenced_by.push(edge.name.to_string());
+        }
+    }
+
+    let retention = std::time::Duration::from_secs((retention_days.max(0) as u64) * 86_400);
+    for (edge_name, column, key) in [
+        ("jobs.model_ref", "model_ref", pk),
+        ("jobs.output_model_id", "output_model_id", name),
+    ] {
+        // `$1`/`$2` (key, tenant) bind first; the retention clause appends its
+        // own bind(s) after, so both fragments share one params vector built
+        // in one pass — never two separately-numbered queries.
+        let mut params = vec![SqlValue::TextOwned(key.to_string()), tenant_val.clone()];
+        let stale = stale_before_clause("updated_at", kind, retention, &mut params);
+        let sql = format!(
+            "SELECT COUNT(*) AS n FROM jobs \
+             WHERE {column} = $1 AND (tenant_id = $2 OR (tenant_id IS NULL AND $2 IS NULL)) \
+               AND NOT (status IN ('completed', 'failed') AND {stale})"
+        );
+        let count = tx
+            .query_opt(&sql, &params, |row| row.get::<i64>("n"))
+            .await?
+            .unwrap_or(0);
+        if count > 0 {
+            referenced_by.push(edge_name.to_string());
         }
     }
     Ok(referenced_by)

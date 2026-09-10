@@ -878,3 +878,171 @@ CREATE INDEX idx_result_tables_lease ON result_tables(status, lease_expires_at);
 pub(super) const MIGRATION_028_TOPICS_NEXT_OFFSET: &str = r#"
 ALTER TABLE topics ADD COLUMN next_offset BIGINT;
 "#;
+
+/// Migration 029 — the kind-agnostic `jobs` table, replacing `training_jobs`,
+/// plus the process-liveness `instances` table and the claim-loop-membership
+/// `workers` table.
+///
+/// `training_jobs` named exactly one kind of durable work; `jobs` generalises
+/// the same claim/lease/reclaim machinery
+/// ([`crate::catalog::jobs_repo`]) to every kind-agnostic unit of work a
+/// worker can claim — training AND the compute verbs that opt into the queue.
+/// Every column `training_jobs` carried survives under the same name except
+/// `training_spec`, which becomes `spec` (still an opaque, producer-owned
+/// tagged JSON payload — the rename only drops the "training" qualifier now
+/// that the column serves every job kind), and `base_model_id`, which becomes
+/// `model_ref` (unchanged meaning: the PK-keyed base model a training kind
+/// fine-tunes from).
+///
+///   * `execution` — `'queued'` (claimed by the poll loop, `claim_next`) or
+///     `'inline'` (claimed once, by id, in the submitting call itself —
+///     `claim_by_id`; never selected by the poll loop's
+///     `WHERE execution = 'queued'` predicate). Every legacy `training_jobs`
+///     row copied below is `'queued'` — training was always poll-claimed.
+///   * `spec` — the self-contained, producer-owned tagged JSON specification
+///     a worker reconstructs the run from on a fresh process. `NOT NULL`
+///     (every job, of every kind, carries one); a legacy row with no
+///     `training_spec` backfills to `'{}'` rather than leaving a `NULL` a
+///     `NOT NULL` column can never actually hold.
+///   * `partial_result` — the name of the `result_tables` row this attempt is
+///     (or already has) materialising into, written inside the SAME
+///     transaction as that row's own INSERT
+///     ([`crate::catalog::Catalog::create_result_table`]'s job-CAS) so a
+///     reclaimed later attempt can find and adopt a predecessor's in-flight or
+///     finished table instead of starting over. `NULL` until a producer that
+///     stages through a result table sets it — a training kind, which
+///     publishes a model artifact instead, leaves it `NULL` for the row's
+///     whole lifetime.
+///   * `result` — the tagged JSON terminal payload a successful attempt
+///     writes at finish. Distinct from `partial_result` (an intermediate
+///     dedupe key, a table name) and from the legacy `metrics` column (free
+///     text); `NULL` until the job finishes.
+///   * `error` — the terminal failure message, `NULL` until the job fails.
+///     Replaces `training_jobs.metrics`' overloaded free-text blob (which
+///     carried run-start metrics, the error message, AND `started_at`/
+///     `completed_at`, disambiguated only by JSON-shape sniffing in
+///     [`crate::catalog::jobs_repo`]'s row parser) with one column per
+///     concern; a legacy row's `metrics` blob is not carried forward by this
+///     migration — reclaim/fail bookkeeping starts fresh under the new
+///     columns, `metrics`' history stays queryable only via
+///     `applied_migrations`-gated raw SQL against a pre-migration backup.
+///   * `progress_rows_done` / `progress_rows_total` / `progress_phase` — the
+///     one checkpoint-progress vocabulary every job kind reports through,
+///     `NULL` until the first checkpoint.
+///   * `cancel_requested` — set by `CancelJob`; the executor observes it at a
+///     checkpoint boundary. `NOT NULL DEFAULT FALSE`, never `NULL` — the
+///     three-state need (never/requested/observed) is carried by this flag
+///     plus the terminal `status`, not by a nullable tri-state column.
+///   * `model_ref` — the PK-keyed base model a training kind fine-tunes from
+///     (`training_jobs.base_model_id`, renamed; same `REFERENCES
+///     models(model_id)`, now `ON DELETE SET NULL`). `NULL` for every compute
+///     kind, which has no base model. The `ON DELETE SET NULL` arm exists
+///     because [`crate::catalog::model_repo`]'s referential scan (N9) lets a
+///     `delete_model` proceed past a `jobs.model_ref` edge once every
+///     referencing row is terminal and past `[jobs] retention_days` — the
+///     scan's OWN age predicate, not the database FK, decides whether the
+///     DELETE is allowed to run at all; once it IS allowed to run, the FK
+///     action is what keeps the surviving (necessarily exempted, by the same
+///     scan) job rows from pointing at a row that no longer exists, without
+///     the DELETE itself needing to touch `jobs`.
+///   * `output_model_id` — the NAME-keyed model a training kind registers on
+///     finish (`training_jobs.output_model_id`, unchanged; still FK-free —
+///     the name is minted by the finalize CAS, not resolved against an
+///     existing row).
+///   * `model_source` — the NAME-keyed, FK-free `ModelSource` string a
+///     compute verb resolves its model against (the exact vocabulary
+///     `result_tables.model_id` already carries — no new resolution rule).
+///     `NULL` for a training kind, which has no such source.
+///
+/// `priority` / `claimable` (migration 024's temporary operator hold) and
+/// `acceleration_report` (migration 026) carry over unchanged in both name
+/// and contract.
+///
+/// Indexes: `idx_jobs_claim(status, execution, claimable, priority DESC,
+/// created_at)` is the claim predicate's own index (replacing
+/// `idx_training_jobs_claim_policy`; the poll loop's `WHERE status = 'queued'
+/// AND execution = 'queued' AND claimable ORDER BY priority DESC,
+/// created_at`, one composite covering both the filter and the order, is
+/// exactly what `idx_training_jobs_claim` and `idx_training_jobs_claim_policy`
+/// jointly served before). `idx_jobs_lease(status, lease_expires_at)` serves
+/// the expired-lease reclaim scan (replacing `idx_training_jobs_claim`,
+/// migration 016's name for the same predicate over the renamed table).
+///
+/// `instances` is the process-liveness table: every process upserts its row
+/// at construction and heartbeats `last_seen_at`; `instance_id` is a UUID
+/// minted per process, `label` the (non-unique) `JAMMI_WORKER_ID` value.
+/// `idx_instances_seen(last_seen_at)` serves the staleness scan an inline-job
+/// reclaim and a construction sweep both run. `workers` is the
+/// claim-loop-membership table: exactly the processes actually running the
+/// claim loop get a row (`instance_id REFERENCES instances(instance_id) ON
+/// DELETE CASCADE` — a worker row is dependent bookkeeping on its instance
+/// row, never independently meaningful once the instance is gone), naming the
+/// `kinds` it claims.
+///
+/// The copy below carries every `training_jobs` row forward as a `'queued'`
+/// job (`kind` already discriminates `'fine_tune'` from any other training
+/// kind the table ever held); `training_jobs` is then dropped — no shim, no
+/// compatibility view. `REFERENCE_EDGES`
+/// ([`crate::catalog::model_repo`]) and the artifact-reconcile read
+/// ([`crate::store::reconcile`]) are updated in the SAME change to read
+/// `jobs`, so no window exists where a live reader still expects
+/// `training_jobs`.
+pub(super) const MIGRATION_029_JOBS_INSTANCES_WORKERS: &str = r#"
+CREATE TABLE jobs (
+    job_id               TEXT PRIMARY KEY,
+    kind                 TEXT NOT NULL,
+    tenant_id            TEXT,
+    status                TEXT NOT NULL DEFAULT 'queued',
+    execution            TEXT NOT NULL CHECK (execution IN ('queued', 'inline')),
+    spec                 TEXT NOT NULL,
+    partial_result       TEXT,
+    result                TEXT,
+    error                 TEXT,
+    progress_rows_done    BIGINT,
+    progress_rows_total   BIGINT,
+    progress_phase        TEXT,
+    cancel_requested      BOOLEAN NOT NULL DEFAULT FALSE,
+    model_ref             TEXT REFERENCES models(model_id) ON DELETE SET NULL,
+    output_model_id       TEXT,
+    model_source          TEXT,
+    claimed_by            TEXT,
+    attempts              INTEGER NOT NULL DEFAULT 0,
+    lease_expires_at      TEXT,
+    priority              INTEGER NOT NULL DEFAULT 0,
+    claimable             BOOLEAN NOT NULL DEFAULT TRUE,
+    acceleration_report   TEXT,
+    created_at            TEXT NOT NULL,
+    updated_at            TEXT NOT NULL
+);
+CREATE INDEX idx_jobs_claim ON jobs(status, execution, claimable, priority DESC, created_at);
+CREATE INDEX idx_jobs_lease ON jobs(status, lease_expires_at);
+
+CREATE TABLE instances (
+    instance_id  TEXT PRIMARY KEY,
+    label        TEXT,
+    host         TEXT,
+    started_at   TEXT NOT NULL,
+    last_seen_at TEXT NOT NULL
+);
+CREATE INDEX idx_instances_seen ON instances(last_seen_at);
+
+CREATE TABLE workers (
+    instance_id TEXT PRIMARY KEY REFERENCES instances(instance_id) ON DELETE CASCADE,
+    kinds       TEXT NOT NULL
+);
+
+INSERT INTO jobs (
+    job_id, kind, tenant_id, status, execution, spec, partial_result, result, error,
+    progress_rows_done, progress_rows_total, progress_phase, cancel_requested,
+    model_ref, output_model_id, model_source, claimed_by, attempts, lease_expires_at,
+    priority, claimable, acceleration_report, created_at, updated_at
+)
+SELECT
+    job_id, kind, tenant_id, status, 'queued', COALESCE(training_spec, '{}'), NULL, NULL, NULL,
+    NULL, NULL, NULL, FALSE,
+    base_model_id, output_model_id, NULL, claimed_by, attempts, lease_expires_at,
+    priority, claimable, acceleration_report, created_at, updated_at
+FROM training_jobs;
+
+DROP TABLE training_jobs;
+"#;

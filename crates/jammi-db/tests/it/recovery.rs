@@ -172,6 +172,7 @@ async fn create_building_embedding(store: &ResultStore) -> BuildingTable {
             Some(DIMS as i32),
             Some("_row_id"),
             None,
+            None,
         )
         .await
         .unwrap()

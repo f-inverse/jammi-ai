@@ -591,13 +591,14 @@ fn lease_config_defaults_match_engine_constants() {
 }
 
 #[test]
-fn training_config_defaults_match_engine_constants() {
-    // The worker's own default (1 s idle poll) plus the shared lease.
-    let t = TrainingConfig::default();
-    assert!(t.run_worker);
-    assert_eq!(t.idle_poll_secs, 1);
+fn worker_config_defaults_match_engine_constants() {
+    // The worker's own default (1 s idle poll, every kind) plus the shared lease.
+    let w = WorkerConfig::default();
+    assert!(w.enabled);
+    assert_eq!(w.kinds, WorkerKinds::All(AllSentinel::All));
+    assert_eq!(w.idle_poll_secs, 1);
 
-    let intervals = t
+    let intervals = w
         .worker_intervals(LeaseConfig::default().intervals().unwrap())
         .unwrap();
     assert_eq!(intervals.lease, std::time::Duration::from_secs(30));
@@ -606,21 +607,23 @@ fn training_config_defaults_match_engine_constants() {
 }
 
 #[test]
-fn training_config_absent_defaults() {
-    // A config without `[training]` / `[lease]` parses to the engine defaults.
+fn worker_and_jobs_config_absent_defaults() {
+    // A config without `[worker]` / `[jobs]` / `[lease]` parses to the
+    // engine defaults.
     let cfg: JammiConfig = toml::from_str("artifact_dir = \"/tmp/jammi\"").unwrap();
-    assert_eq!(cfg.training, TrainingConfig::default());
+    assert_eq!(cfg.worker, WorkerConfig::default());
+    assert_eq!(cfg.jobs, JobsConfig::default());
     assert_eq!(cfg.lease, LeaseConfig::default());
 }
 
 #[test]
-fn lease_and_training_config_round_trip() {
+fn lease_and_worker_config_round_trip() {
     let toml_src = r#"
         [lease]
         duration_secs = 8
         heartbeat_secs = 2
 
-        [training]
+        [worker]
         idle_poll_secs = 1
     "#;
     let cfg: JammiConfig = toml::from_str(toml_src).unwrap();
@@ -632,16 +635,17 @@ fn lease_and_training_config_round_trip() {
         }
     );
     assert_eq!(
-        cfg.training,
-        TrainingConfig {
+        cfg.worker,
+        WorkerConfig {
             // Not spelled in the TOML above: the container-level
             // `#[serde(default)]` must fill it from `Default`, on.
-            run_worker: true,
+            enabled: true,
+            kinds: WorkerKinds::All(AllSentinel::All),
             idle_poll_secs: 1,
         }
     );
     let intervals = cfg
-        .training
+        .worker
         .worker_intervals(cfg.lease.intervals().unwrap())
         .unwrap();
     assert_eq!(intervals.lease, std::time::Duration::from_secs(8));
@@ -650,11 +654,11 @@ fn lease_and_training_config_round_trip() {
 
 #[test]
 fn old_training_lease_keys_are_refused() {
-    // The lease keys moved to `[lease]`; a TOML still naming them under
-    // `[training]` is a typed parse error (fail-closed), never a silent
+    // The lease keys have always lived under `[lease]`; a TOML naming them
+    // under `[worker]` is a typed parse error (fail-closed), never a silent
     // fall-back to the default 30 s / 10 s timing.
     let toml_src = r#"
-        [training]
+        [worker]
         lease_duration_secs = 8
         heartbeat_interval_secs = 2
     "#;
@@ -671,64 +675,139 @@ fn old_training_lease_keys_are_refused() {
     );
 }
 
-// ── `run_worker`: whether THIS process runs the claim loop ──────────────
+// ── `enabled`: whether THIS process runs the claim loop ─────────────────
 
 #[test]
-fn training_config_default_runs_the_worker() {
+fn worker_config_default_runs_the_worker() {
     // An unconfigured deployment is a whole one: it accepts jobs AND works
     // them. Opting out has to be an explicit act, so the default is on.
-    assert!(TrainingConfig::default().run_worker);
+    assert!(WorkerConfig::default().enabled);
 }
 
 #[test]
-fn training_config_toml_without_run_worker_defaults_to_true() {
-    // A `[training]` section that predates the key — the shape every
-    // already-deployed config file has — still parses, and parses to on.
+fn worker_config_toml_without_enabled_defaults_to_true() {
     let toml_src = r#"
-        [training]
+        [worker]
         idle_poll_secs = 1
     "#;
     let cfg: JammiConfig = toml::from_str(toml_src).unwrap();
-    assert!(cfg.training.run_worker);
-    assert_eq!(cfg.training, TrainingConfig::default());
+    assert!(cfg.worker.enabled);
+    assert_eq!(cfg.worker, WorkerConfig::default());
 
-    // And a file with no `[training]` section at all.
+    // And a file with no `[worker]` section at all.
     let bare: JammiConfig = toml::from_str("artifact_dir = \"/tmp/jammi\"").unwrap();
-    assert!(bare.training.run_worker);
+    assert!(bare.worker.enabled);
 }
 
 #[test]
-fn training_config_toml_run_worker_false_parses_to_false() {
+fn worker_config_toml_enabled_false_parses_to_false() {
     let toml_src = r#"
-        [training]
-        run_worker = false
+        [worker]
+        enabled = false
     "#;
     let cfg: JammiConfig = toml::from_str(toml_src).unwrap();
-    assert!(!cfg.training.run_worker);
+    assert!(!cfg.worker.enabled);
     // Switching the loop off leaves the timing at its default — and it is
     // still validated, so a config that switches the loop back on later
     // cannot smuggle in timing that was never checked.
-    assert_eq!(cfg.training.idle_poll_secs, 1);
+    assert_eq!(cfg.worker.idle_poll_secs, 1);
     assert!(cfg
-        .training
+        .worker
         .worker_intervals(cfg.lease.intervals().unwrap())
         .is_ok());
 }
 
 #[test]
-fn training_config_equality_distinguishes_run_worker() {
+fn worker_config_equality_distinguishes_enabled() {
     // The derived `PartialEq`/`Eq` must actually see the new field: two
-    // configs identical but for `run_worker` are NOT equal. Without this,
-    // the `assert_eq!(cfg.training, ...)` assertions above would hold
+    // configs identical but for `enabled` are NOT equal. Without this,
+    // the `assert_eq!(cfg.worker, ...)` assertions above would hold
     // vacuously for a field equality ignored.
-    let on = TrainingConfig::default();
-    let off = TrainingConfig {
-        run_worker: false,
-        ..TrainingConfig::default()
+    let on = WorkerConfig::default();
+    let off = WorkerConfig {
+        enabled: false,
+        ..WorkerConfig::default()
     };
     assert_ne!(on, off);
     assert_eq!(off, off.clone());
-    assert_eq!(on, TrainingConfig::default());
+    assert_eq!(on, WorkerConfig::default());
+}
+
+// ── `kinds`: which job kinds this worker claims ──────────────────────────
+
+#[test]
+fn worker_kinds_default_is_all() {
+    assert_eq!(WorkerKinds::default(), WorkerKinds::All(AllSentinel::All));
+}
+
+#[test]
+fn worker_kinds_toml_all_forms_parse_like_services() {
+    // `kinds` shares `services`' exact grammar (H7) — the same three forms.
+    let sentinel: JammiConfig = toml::from_str("[worker]\nkinds = \"all\"\n").unwrap();
+    assert_eq!(sentinel.worker.kinds, WorkerKinds::All(AllSentinel::All));
+
+    let comma: JammiConfig = toml::from_str("[worker]\nkinds = \"fine_tune,embedding\"\n").unwrap();
+    assert_eq!(
+        comma.worker.kinds,
+        WorkerKinds::Only(vec!["fine_tune".to_string(), "embedding".to_string()])
+    );
+
+    let array: JammiConfig =
+        toml::from_str("[worker]\nkinds = [\"fine_tune\", \"embedding\"]\n").unwrap();
+    assert_eq!(
+        array.worker.kinds,
+        WorkerKinds::Only(vec!["fine_tune".to_string(), "embedding".to_string()])
+    );
+
+    let empty: JammiConfig = toml::from_str("[worker]\nkinds = []\n").unwrap();
+    assert_eq!(empty.worker.kinds, WorkerKinds::Only(Vec::new()));
+}
+
+// ── `[jobs] retention_days` ───────────────────────────────────────────────
+
+#[test]
+fn jobs_config_default_retention_is_thirty_days() {
+    assert_eq!(JobsConfig::default().retention_days, 30);
+}
+
+#[test]
+fn jobs_config_toml_round_trips_retention_days() {
+    let cfg: JammiConfig = toml::from_str("[jobs]\nretention_days = 7\n").unwrap();
+    assert_eq!(cfg.jobs.retention_days, 7);
+}
+
+#[test]
+fn jobs_config_rejects_unknown_key() {
+    let err = toml::from_str::<JammiConfig>("[jobs]\nbogus = 1\n").unwrap_err();
+    assert!(err.to_string().contains("bogus"), "got: {err}");
+}
+
+// ── N7: the stale `[training]` env name is a typed load error ────────────
+
+#[test]
+fn stale_jammi_training_run_worker_env_name_is_a_typed_load_error() {
+    // `[training]` is gone entirely (PR-C); `JAMMI_TRAINING__RUN_WORKER` no
+    // longer names a top-level section at all, so it is refused by the SAME
+    // namespace rule `esc-095`'s `JAMMI_CATALOG__KIND` typo case exercises —
+    // never silently ignored as a stray runtime knob, and never silently
+    // reinterpreted as `[worker].enabled`.
+    let err = JammiConfig::parse_from(
+        "",
+        vec![(
+            "JAMMI_TRAINING__RUN_WORKER".to_string(),
+            "false".to_string(),
+        )],
+    )
+    .unwrap_err();
+    match err {
+        JammiError::Config(msg) => {
+            assert!(
+                msg.contains("training"),
+                "the error must name the stale section, got: {msg}"
+            );
+        }
+        other => panic!("expected JammiError::Config, got {other:?}"),
+    }
 }
 
 #[test]
@@ -794,39 +873,30 @@ fn parse_env_bool_rejects_everything_outside_the_domain() {
 }
 
 #[test]
-fn env_override_run_worker_flips_the_file_in_both_directions() {
+fn env_override_worker_enabled_flips_the_file_in_both_directions() {
     let dir = tempfile::tempdir().unwrap();
     let on_path = dir.path().join("on.toml");
-    std::fs::write(&on_path, "[training]\nrun_worker = true\n").unwrap();
+    std::fs::write(&on_path, "[worker]\nenabled = true\n").unwrap();
     let off_path = dir.path().join("off.toml");
-    std::fs::write(&off_path, "[training]\nrun_worker = false\n").unwrap();
+    std::fs::write(&off_path, "[worker]\nenabled = false\n").unwrap();
 
     // true in the file, false in the env → the env wins.
     let cfg = JammiConfig::load_from(
         Some(&on_path),
-        vec![(
-            "JAMMI_TRAINING__RUN_WORKER".to_string(),
-            "false".to_string(),
-        )],
+        vec![("JAMMI_WORKER__ENABLED".to_string(), "false".to_string())],
     )
     .unwrap();
-    assert!(
-        !cfg.training.run_worker,
-        "env `false` must override file `true`"
-    );
+    assert!(!cfg.worker.enabled, "env `false` must override file `true`");
 
     // false in the file, true in the env → the env wins the other way.
     // Spelled `1` so the numeric form is proven through `load_from`, not
     // only in the parser's own unit test.
     let cfg = JammiConfig::load_from(
         Some(&off_path),
-        vec![("JAMMI_TRAINING__RUN_WORKER".to_string(), "1".to_string())],
+        vec![("JAMMI_WORKER__ENABLED".to_string(), "1".to_string())],
     )
     .unwrap();
-    assert!(
-        cfg.training.run_worker,
-        "env `1` must override file `false`"
-    );
+    assert!(cfg.worker.enabled, "env `1` must override file `false`");
 
     // No override → the file's value stands, in both directions. Without
     // this leg an arm that unconditionally wrote `true` would still pass
@@ -834,35 +904,32 @@ fn env_override_run_worker_flips_the_file_in_both_directions() {
     assert!(
         !JammiConfig::load_from(Some(&off_path), std::iter::empty())
             .unwrap()
-            .training
-            .run_worker
+            .worker
+            .enabled
     );
     assert!(
         JammiConfig::load_from(Some(&on_path), std::iter::empty())
             .unwrap()
-            .training
-            .run_worker
+            .worker
+            .enabled
     );
 }
 
 #[test]
-fn env_override_run_worker_unparsable_is_a_typed_load_error() {
+fn env_override_worker_enabled_unparsable_is_a_typed_load_error() {
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().join("jammi.toml");
-    std::fs::write(&path, "[training]\nrun_worker = false\n").unwrap();
+    std::fs::write(&path, "[worker]\nenabled = false\n").unwrap();
 
     let err = JammiConfig::load_from(
         Some(&path),
-        vec![(
-            "JAMMI_TRAINING__RUN_WORKER".to_string(),
-            "maybe".to_string(),
-        )],
+        vec![("JAMMI_WORKER__ENABLED".to_string(), "maybe".to_string())],
     )
     .unwrap_err();
 
     match err {
         JammiError::Config(msg) => {
-            assert!(msg.contains("JAMMI_TRAINING__RUN_WORKER"), "msg = {msg}");
+            assert!(msg.contains("JAMMI_WORKER__ENABLED"), "msg = {msg}");
             // Names the variable only, never the value (a bool-typed env
             // leaf sits at the same position shape a secret-typed sibling
             // does elsewhere in this config, so this error must stay safe
@@ -877,8 +944,8 @@ fn env_override_run_worker_unparsable_is_a_typed_load_error() {
     assert!(
         !JammiConfig::load_from(Some(&path), std::iter::empty())
             .unwrap()
-            .training
-            .run_worker
+            .worker
+            .enabled
     );
 }
 
@@ -1034,8 +1101,8 @@ fn lease_config_margin_check_is_overflow_safe() {
 }
 
 #[test]
-fn training_config_rejects_zero_idle_poll() {
-    let cfg = TrainingConfig {
+fn worker_config_rejects_zero_idle_poll() {
+    let cfg = WorkerConfig {
         idle_poll_secs: 0,
         ..Default::default()
     };
@@ -1064,7 +1131,7 @@ fn lease_config_rejects_zero_heartbeat_and_zero_duration() {
 }
 
 #[test]
-fn load_rejects_invalid_training_timing() {
+fn load_rejects_invalid_worker_timing() {
     // The load path enforces the invariant: a heartbeat with no margin in
     // the TOML is a hard load error.
     let dir = tempfile::tempdir().unwrap();
@@ -1076,7 +1143,7 @@ fn load_rejects_invalid_training_timing() {
             duration_secs = 5
             heartbeat_secs = 5
 
-            [training]
+            [worker]
             idle_poll_secs = 1
         "#,
     )
@@ -1456,7 +1523,8 @@ fn env_kernels_disable_and_other_runtime_knobs_are_ignored() {
     assert_eq!(cfg.catalog, baseline.catalog);
     assert_eq!(cfg.broker, baseline.broker);
     assert_eq!(cfg.artifact_dir, baseline.artifact_dir);
-    assert_eq!(cfg.training, baseline.training);
+    assert_eq!(cfg.worker, baseline.worker);
+    assert_eq!(cfg.jobs, baseline.jobs);
 }
 
 #[test]
@@ -2060,7 +2128,8 @@ fn top_level_fields_matches_jammi_config() {
         "embedding",
         "fine_tuning",
         "lease",
-        "training",
+        "worker",
+        "jobs",
         "cache",
         "server",
         "logging",

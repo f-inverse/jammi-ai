@@ -130,6 +130,7 @@ impl<'a> EmbeddingPipeline<'a> {
                 Some(embedding_dim as i32),
                 Some(key_column),
                 Some(&col_list),
+                None,
             )
             .await?;
 

@@ -38,7 +38,7 @@ use tracing::warn;
 
 use crate::catalog::lease::LeaseIntervals;
 use crate::catalog::result_repo::{
-    CreateResultTableParams, ResultTableCas, ResultTableKind, ResultTableRecord,
+    CreateResultTableParams, JobAttempt, ResultTableCas, ResultTableKind, ResultTableRecord,
 };
 use crate::catalog::status::ResultTableStatus;
 use crate::catalog::Catalog;
@@ -182,6 +182,16 @@ pub struct ResultStore {
     /// constructing its own, so the two can never disagree on where models
     /// live relative to result tables.
     artifact_store: Arc<ArtifactStore>,
+    /// The process's lease-renewal thread (N3) every [`BuildingTable`] this
+    /// store creates or recovery adopts registers its row with, in place of
+    /// the per-table `tokio::spawn` heartbeat task earlier revisions ran.
+    /// `None` — the default — means a table this store hands out is renewed
+    /// by NOTHING beyond its initial lease window: correct but non-renewing,
+    /// acceptable for a short-lived test fixture, never for a production
+    /// deployment (the session choke point attaches one via
+    /// [`Self::with_lease_keeper`] before serving). `Clone`d cheaply — an
+    /// `Arc`, shared by every clone of this store.
+    keeper: Option<Arc<crate::catalog::lease_keeper::LeaseKeeper>>,
 }
 
 /// Mint a fresh writer identity.
@@ -634,7 +644,21 @@ impl ResultStore {
             writer_id: new_writer_id(),
             lease: LeaseIntervals::default(),
             artifact_store,
+            keeper: None,
         })
+    }
+
+    /// Attach the process's lease-renewal thread (N3): every
+    /// [`BuildingTable`] this store creates or recovery adopts from this
+    /// point on registers its row with `keeper` instead of running its own
+    /// heartbeat task. The session choke point calls this once, right after
+    /// constructing both, before the store serves any `create_table` call.
+    pub fn with_lease_keeper(
+        mut self,
+        keeper: Arc<crate::catalog::lease_keeper::LeaseKeeper>,
+    ) -> Self {
+        self.keeper = Some(keeper);
+        self
     }
 
     /// This store's model-artifact store, rooted at `{root}/models` and
@@ -657,6 +681,13 @@ impl ResultStore {
     /// The lease timing this store's building tables are held under.
     pub fn lease_intervals(&self) -> LeaseIntervals {
         self.lease
+    }
+
+    /// The process's lease-renewal keeper this store's `building` tables
+    /// register with, if one has been attached via
+    /// [`Self::with_lease_keeper`].
+    pub(crate) fn lease_keeper(&self) -> Option<Arc<crate::catalog::lease_keeper::LeaseKeeper>> {
+        self.keeper.clone()
     }
 
     /// This store's writer identity (`writer-{uuid}`).
@@ -745,6 +776,15 @@ impl ResultStore {
     /// captured on the handle, so every later transition — including the
     /// heartbeat's, which runs on a task with no task-local scope — names the
     /// row's own tenant.
+    ///
+    /// `job_attempt` (N11, esc-105) is threaded straight to
+    /// [`crate::catalog::result_repo::CreateResultTableParams::job_attempt`]
+    /// — see there for the `jobs.partial_result` compare-and-set this
+    /// performs in the SAME transaction as the row's own INSERT, and for why
+    /// the CAS needs the full `(job_id, instance_id, attempts)` identity, not
+    /// `job_id` alone. `None` for a table created outside the job machinery
+    /// (a test fixture, or a caller that materialises with no job of
+    /// record).
     #[allow(clippy::too_many_arguments)]
     pub async fn create_table(
         &self,
@@ -756,6 +796,7 @@ impl ResultStore {
         dimensions: Option<i32>,
         key_column: Option<&str>,
         text_columns: Option<&str>,
+        job_attempt: Option<JobAttempt<'_>>,
     ) -> Result<BuildingTable> {
         let sanitized = sanitize_model_id(model_id);
         let timestamp = chrono::Utc::now().format("%Y%m%dT%H%M%S%9f");
@@ -809,6 +850,7 @@ impl ResultStore {
                 created_at: crate::catalog::backend::now_sortable(),
                 writer_id: Some(&self.writer_id),
                 lease: Some(self.lease.lease()),
+                job_attempt,
             })
             .await?;
 
@@ -819,7 +861,6 @@ impl ResultStore {
             tenant,
             self.writer_id.to_string(),
             storage_precision,
-            self.lease,
         );
 
         // The W1 window: the `building` row is committed and heartbeating,
@@ -1301,7 +1342,7 @@ impl ResultStore {
                         let reaped = self
                             .reap_after_fail_cas(&recovered.cas(), &parquet_url)
                             .await?;
-                        recovered.abandon();
+                        recovered.detach();
                         return Ok(ExpiredRowDeletion::Reaped(reaped));
                     }
                     Err(e) => return Err(e.into()),
@@ -1322,7 +1363,7 @@ impl ResultStore {
                             return Err(e);
                         }
                         warn!(table = table.table_name, outcome = %e, "Recovery: claim lost before rebuild; skipped");
-                        recovered.abandon();
+                        recovered.detach();
                         return Ok(ExpiredRowDeletion::Untouched);
                     }
                     match self
@@ -1344,7 +1385,7 @@ impl ResultStore {
                         Err(RebuildFailure { error: e, purged }) => {
                             if is_cas_miss(&e) {
                                 warn!(table = table.table_name, outcome = %e, "Recovery: claim lost during rebuild; skipped");
-                                recovered.abandon();
+                                recovered.detach();
                                 return Ok(ExpiredRowDeletion::Untouched);
                             }
                             warn!(
@@ -1384,7 +1425,7 @@ impl ResultStore {
                     .await;
                 // The row is terminal (or lost) under this recoverer either
                 // way: detach the handle so Drop marks nothing.
-                recovered.abandon();
+                recovered.detach();
                 match promoted {
                     Ok(_) => {}
                     Err(e) if is_cas_miss(&e) => {
@@ -1434,7 +1475,6 @@ impl ResultStore {
             tenant,
             claim_writer_id,
             table.storage_precision.unwrap_or_default(),
-            self.lease,
         )))
     }
 
@@ -2108,6 +2148,8 @@ impl ResultStore {
                 Some(dimensions as i32),
                 key_column,
                 text_columns,
+                // No job of record for this pooling/derivation wrapper today.
+                None,
             )
             .await?;
 

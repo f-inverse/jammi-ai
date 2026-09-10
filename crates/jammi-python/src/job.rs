@@ -5,8 +5,8 @@ use pyo3::prelude::*;
 
 use jammi_ai::fine_tune::training_job::TrainingJob;
 use jammi_ai::session::InferenceSession;
-use jammi_db::catalog::status::TrainingJobStatus;
-use jammi_db::catalog::training_repo::TrainingJobRecord;
+use jammi_db::catalog::jobs_repo::JobRecord;
+use jammi_db::catalog::status::JobStatus;
 use jammi_db::error::JammiError;
 
 use crate::convert::serializable_to_pydict;
@@ -27,7 +27,7 @@ use crate::error::to_pyerr;
 /// to construct a `jammi-ai` `TrainingJob` at all; it carries exactly the
 /// `job_id` + resolved `model_id` this binding needs and drives `status()`
 /// `wait()` / `metrics()` straight off the catalog record, through the same
-/// public `Catalog::get_training_job` read [`PyTrainingJob::metrics`] already
+/// public `Catalog::get_job` read [`PyTrainingJob::metrics`] already
 /// used for both arms before this split existed.
 enum JobState {
     Submitted(TrainingJob),
@@ -67,7 +67,7 @@ impl PyTrainingJob {
     /// peer of the remote client always-attach-by-id `RemoteTrainingJob`).
     ///
     /// A nonexistent `job_id` raises the SAME typed not-found the catalog read
-    /// (`Catalog::get_training_job`) itself produces — there is no separate
+    /// (`Catalog::get_job`) itself produces — there is no separate
     /// existence check to drift from it.
     ///
     /// `model_id` is resolved eagerly here (once, synchronously) rather than
@@ -83,7 +83,7 @@ impl PyTrainingJob {
         session: Arc<InferenceSession>,
     ) -> PyResult<Self> {
         let record = runtime
-            .block_on(session.catalog().get_training_job(&job_id))
+            .block_on(session.catalog().get_job(&job_id))
             .map_err(to_pyerr)?;
         let model_id = resolve_attach_model_id(&job_id, &record)?;
         Ok(Self {
@@ -125,7 +125,7 @@ impl PyTrainingJob {
             JobState::Attached { job_id, .. } => {
                 let record = self
                     .runtime
-                    .block_on(self.session.catalog().get_training_job(job_id))
+                    .block_on(self.session.catalog().get_job(job_id))
                     .map_err(to_pyerr)?;
                 Ok(record.status)
             }
@@ -166,9 +166,21 @@ impl PyTrainingJob {
     fn metrics(&self, py: Python<'_>) -> PyResult<Py<PyAny>> {
         let record = self
             .runtime
-            .block_on(self.session.catalog().get_training_job(self.job_id_str()))
+            .block_on(self.session.catalog().get_job(self.job_id_str()))
             .map_err(to_pyerr)?;
-        let value: serde_json::Value = match record.metrics.as_deref() {
+        // The generalised `jobs` schema (migration 029, C1b) has no dedicated
+        // `metrics` column — the raw metrics JSON is nested inside the tagged
+        // `result` payload (`jammi_ai::jobs::JobResult::Model.metrics`).
+        let metrics_raw = record
+            .result
+            .as_deref()
+            .and_then(|raw| serde_json::from_str::<serde_json::Value>(raw).ok())
+            .and_then(|v| {
+                v.get("metrics")
+                    .and_then(|m| m.as_str())
+                    .map(str::to_string)
+            });
+        let value: serde_json::Value = match metrics_raw.as_deref() {
             // Absent — the job has not yet recorded any metrics. `{}`.
             None => serde_json::json!({}),
             // Present — must parse. A present-but-unparseable blob is a catalog
@@ -217,7 +229,7 @@ impl PyTrainingJob {
     fn acceleration_report(&self, py: Python<'_>) -> PyResult<Py<PyAny>> {
         let record = self
             .runtime
-            .block_on(self.session.catalog().get_training_job(self.job_id_str()))
+            .block_on(self.session.catalog().get_job(self.job_id_str()))
             .map_err(to_pyerr)?;
         match record.acceleration_report.as_deref() {
             // NULL — honest absence, never coerced into a state claim.
@@ -240,7 +252,7 @@ impl PyTrainingJob {
     }
 }
 
-/// Poll `catalog.get_training_job(job_id)` until it reaches a terminal state,
+/// Poll `catalog.get_job(job_id)` until it reaches a terminal state,
 /// mirroring `jammi_ai::fine_tune::training_job::TrainingJob::wait` exactly
 /// (same 100ms cadence, same terminal classification) — reimplemented here
 /// rather than called because that method lives on a type this binding cannot
@@ -250,15 +262,15 @@ async fn poll_until_terminal(
     job_id: &str,
 ) -> jammi_db::error::Result<()> {
     loop {
-        let record = session.catalog().get_training_job(job_id).await?;
-        let status: TrainingJobStatus = record
+        let record = session.catalog().get_job(job_id).await?;
+        let status: JobStatus = record
             .status
             .parse()
             .map_err(|e| JammiError::FineTune(format!("{e}")))?;
         match status {
-            TrainingJobStatus::Completed => return Ok(()),
-            TrainingJobStatus::Failed => {
-                let msg = record.error_message.unwrap_or_else(|| "Job failed".into());
+            JobStatus::Completed => return Ok(()),
+            JobStatus::Failed => {
+                let msg = record.error.unwrap_or_else(|| "Job failed".into());
                 return Err(JammiError::FineTune(msg));
             }
             _ => tokio::time::sleep(Duration::from_millis(100)).await,
@@ -284,6 +296,6 @@ async fn poll_until_terminal(
 /// `EmbeddedBackend.training_job(id).model_id` and
 /// `RemoteDatabase.training_job(id).model_id` equal at every lifecycle state —
 /// equal by construction, not by two implementations that happen to agree.
-fn resolve_attach_model_id(job_id: &str, record: &TrainingJobRecord) -> PyResult<String> {
+fn resolve_attach_model_id(job_id: &str, record: &JobRecord) -> PyResult<String> {
     jammi_ai::fine_tune::training_job::resolve_model_id(job_id, record).map_err(to_pyerr)
 }

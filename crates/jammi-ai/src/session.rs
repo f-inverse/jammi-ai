@@ -42,6 +42,25 @@ pub struct InferenceSession {
     hub: HubSource,
     /// Registry of open ephemeral sessions, shared with the timeout scanner.
     ephemeral_sessions: jammi_db::ephemeral::ActiveSessions,
+    /// This process's stable identity in the `instances`/`jobs.claimed_by`
+    /// vocabulary (N3/item 5): minted once at construction from
+    /// `JAMMI_WORKER_ID` when set and non-empty, else a fresh
+    /// `worker-{uuid}` — the same resolution rule
+    /// [`crate::fine_tune::worker::resolve_worker_id`] historically applied
+    /// per-worker, now promoted to the SESSION so every claimant on this
+    /// process (a [`crate::fine_tune::worker::JobWorker`]'s poll loop, a
+    /// [`Self::run_now`] inline claim) shares one `claimed_by` identity, and
+    /// so `catalog::lease_keeper::LeaseTarget::Instance` registers the SAME
+    /// id `jobs.claimed_by` carries.
+    instance_id: String,
+    /// The process's one lease-renewal thread (N3) — every claimed lease
+    /// this session (or a job/table it owns) holds registers here instead of
+    /// spawning its own `tokio::spawn` heartbeat task, so a CPU-bound inline
+    /// compute job on the main runtime can never starve a renewal.
+    lease_keeper: Arc<jammi_db::catalog::lease_keeper::LeaseKeeper>,
+    /// This session's `instances` row registration — held for its `Drop`
+    /// (unregisters the keeper renewal when the session drops), never read.
+    _instance_registration: jammi_db::catalog::lease_keeper::Registration,
 }
 
 impl InferenceSession {
@@ -110,6 +129,25 @@ impl InferenceSession {
     ) -> Result<Self> {
         let inner = Arc::new(inner);
         let catalog = Arc::clone(inner.catalog());
+
+        // N3: one lease-renewal thread per process, started before anything
+        // that registers a lease with it (the result store's `BuildingTable`
+        // adoptions below, this session's own `instances` row, and every
+        // job/table lease a `JobWorker`/`run_now` claim registers later).
+        // `catalog_connect` opens a FRESH backend connection from inside the
+        // keeper's own dedicated runtime — never this session's `catalog`
+        // handle — so a CPU-bound inline job saturating the main runtime can
+        // never starve the renewal (see `lease_keeper`'s module docs).
+        let lease_intervals = inner.config().lease.intervals()?;
+        let config_for_keeper = inner.config().clone();
+        let lease_keeper = jammi_db::catalog::lease_keeper::LeaseKeeper::start(
+            move || {
+                let config = config_for_keeper.clone();
+                Box::pin(async move { jammi_db::session::open_catalog_from_config(&config).await })
+            },
+            lease_intervals,
+        );
+
         // The result store is built first: it owns the session's
         // `ArtifactStore` internally (rooted at `{result_store_root}/models`,
         // one storage knob serving both), so the resolver reads that SAME
@@ -117,8 +155,12 @@ impl InferenceSession {
         // root that could disagree with it. A fine-tuned model's catalog
         // `artifact_path` is an object-store prefix, fetched into a local
         // cache before candle loads it, so an adapter trained on one host
-        // serves on another.
-        let result_store = Arc::new(build_result_store(&inner, Arc::clone(&catalog))?);
+        // serves on another. It registers every `BuildingTable` it adopts
+        // with the keeper above rather than spawning its own heartbeat task.
+        let result_store = Arc::new(
+            build_result_store(&inner, Arc::clone(&catalog))?
+                .with_lease_keeper(Arc::clone(&lease_keeper)),
+        );
         let artifact_store = result_store.artifact_store();
         // The K4 choke point (esc-096): `[models]` -> `HubSource`, exactly
         // once per session. Every downstream Hub call (the resolver's
@@ -145,6 +187,37 @@ impl InferenceSession {
         result_store.recover().await?;
         result_store.load_existing_tables(inner.context()).await?;
 
+        // Item 5's construction sweep: `recover()` (PR-A, above) plus the
+        // jobs-side reclaim and the two retention prunes, unconditionally —
+        // a process that never claims still benefits from reclaiming a dead
+        // peer's expired leases and does no harm running the sweep.
+        catalog
+            .reclaim_expired_jobs(
+                lease_intervals.lease(),
+                crate::fine_tune::worker::MAX_ATTEMPTS,
+            )
+            .await?;
+        let retention =
+            std::time::Duration::from_secs(inner.config().jobs.retention_days as u64 * 86_400);
+        catalog.prune_instances(retention).await?;
+        catalog.prune_jobs(retention).await?;
+
+        // This process's `instances` row + keeper registration — every
+        // session upserts and heartbeats one, whether or not it runs a
+        // claim loop (only `workers` membership is gated on `[worker]
+        // enabled`, upserted by `EmbeddedWorker::spawn`/`JobWorker`).
+        let instance_id = crate::fine_tune::worker::resolve_worker_id();
+        catalog
+            .upsert_instance(
+                &instance_id,
+                std::env::var("JAMMI_WORKER_ID").ok().as_deref(),
+                None,
+            )
+            .await?;
+        let instance_registration = lease_keeper.register(
+            jammi_db::catalog::lease_keeper::LeaseTarget::Instance(instance_id.clone()),
+        );
+
         let ann_cache_size = inner.config().cache.ann_cache_max_entries as u64;
         let ann_cache = Arc::new(AnnCache::new(ann_cache_size));
 
@@ -158,7 +231,35 @@ impl InferenceSession {
             device_config,
             hub,
             ephemeral_sessions: jammi_db::ephemeral::ActiveSessions::new(),
+            instance_id,
+            lease_keeper,
+            _instance_registration: instance_registration,
         })
+    }
+
+    /// This process's stable `instances`/`jobs.claimed_by` identity (N3).
+    /// Shared by every claimant on this session — a
+    /// [`crate::fine_tune::worker::JobWorker`]'s poll loop and
+    /// [`Self::run_now`]'s inline claim alike.
+    pub fn instance_id(&self) -> &str {
+        &self.instance_id
+    }
+
+    /// This process's one lease-renewal thread (N3). A
+    /// [`crate::fine_tune::worker::JobWorker`] and [`Self::run_now`] both
+    /// register their claimed job leases here rather than spawning their own
+    /// heartbeat task.
+    pub fn lease_keeper(&self) -> &Arc<jammi_db::catalog::lease_keeper::LeaseKeeper> {
+        &self.lease_keeper
+    }
+
+    /// The validated lease/heartbeat/idle-poll timing this session's
+    /// `[lease]`/`[worker]` configuration resolves to.
+    pub fn worker_intervals(&self) -> Result<jammi_db::config::WorkerIntervals> {
+        self.inner
+            .config()
+            .worker
+            .worker_intervals(self.inner.config().lease.intervals()?)
     }
 
     /// Register the engine's compound-query SQL functions on this session's
@@ -986,6 +1087,7 @@ impl InferenceSession {
                     None,
                     None,
                     None,
+                    None,
                 )
                 .await?;
             let schema = batches[0].schema();
@@ -1146,7 +1248,7 @@ impl InferenceSession {
     ///
     /// Persists a self-describing [`TrainingSpec::FineTune`] into a `queued`
     /// catalog job and returns a [`TrainingJob`] handle immediately — the
-    /// training runs later under a [`crate::fine_tune::worker::TrainingWorker`]
+    /// training runs later under a [`crate::fine_tune::worker::JobWorker`]
     /// that claims the job under a lease, reconstructs the data loader from the
     /// persisted source + columns, and trains while heartbeating. Call
     /// `job.wait().await` to block until a worker drives the job to a terminal
@@ -1163,7 +1265,6 @@ impl InferenceSession {
         let config = config.unwrap_or_default();
         config.validate()?;
 
-        let loss_type = fine_tune_loss_type(&config, task);
         let spec = TrainingSpec::FineTune {
             source: source.to_string(),
             columns: columns.to_vec(),
@@ -1174,8 +1275,7 @@ impl InferenceSession {
                 config: config.clone(),
             },
         };
-        self.submit_fine_tune_spec(source, base_model, task, &config, &loss_type, spec)
-            .await
+        self.submit_fine_tune_spec(base_model, task, spec).await
     }
 
     /// Submit a job carrying one of the two LoRA fine-tune specs. Shared by the
@@ -1185,11 +1285,8 @@ impl InferenceSession {
     /// from the persisted spec.
     async fn submit_fine_tune_spec(
         &self,
-        training_source: &str,
         base_model: &str,
         task: ModelTask,
-        config: &FineTuneConfig,
-        loss_type: &str,
         spec: TrainingSpec,
     ) -> Result<TrainingJob> {
         let job_id = uuid::Uuid::new_v4().to_string();
@@ -1221,7 +1318,6 @@ impl InferenceSession {
             }
         }
 
-        let hyperparams = serde_json::to_string(config)?;
         // The base-model FK must bind to the resolved row's catalog PK, not a
         // reconstructed `name::version`: a tenant fine-tuning a global base model
         // references the global (unqualified) PK, and one fine-tuning its own
@@ -1240,14 +1336,15 @@ impl InferenceSession {
         let spec_json = serde_json::to_string(&spec)?;
         self.inner
             .catalog()
-            .create_training_job(jammi_db::catalog::training_repo::CreateTrainingJobParams {
+            .submit_job(jammi_db::catalog::jobs_repo::SubmitJobParams {
                 job_id: &job_id,
-                base_model_id: &base_model_pk,
-                training_source,
-                loss_type,
-                hyperparams: &hyperparams,
                 kind: spec.kind(),
-                training_spec: &spec_json,
+                execution: jammi_db::catalog::status::JobExecution::Queued,
+                spec: &spec_json,
+                model_ref: Some(&base_model_pk),
+                output_model_id: Some(&output_model_id),
+                model_source: None,
+                priority: 0,
             })
             .await?;
 
@@ -1293,7 +1390,6 @@ impl InferenceSession {
         // sources + seeded sample_config (deterministic), never from in-memory
         // batches carried across the submit boundary.
         let task = ModelTask::TextEmbedding;
-        let loss_type = fine_tune_loss_type(&config, task);
         let spec = TrainingSpec::GraphFineTune {
             sources: sources.clone(),
             sample_config,
@@ -1302,15 +1398,7 @@ impl InferenceSession {
                 config: config.clone(),
             },
         };
-        self.submit_fine_tune_spec(
-            &sources.node_source,
-            base_model,
-            task,
-            &config,
-            &loss_type,
-            spec,
-        )
-        .await
+        self.submit_fine_tune_spec(base_model, task, spec).await
     }
 
     /// Run a decoded [`TrainingSpec`] on this session, dispatching each variant
@@ -1539,26 +1627,6 @@ fn build_result_store(
         None => ResultStore::new(inner.config().artifact_dir.as_path(), catalog, ann),
     }?;
     Ok(store.with_lease_intervals(lease))
-}
-
-/// The `loss_type` string persisted on a fine-tune job — a human-readable tag of
-/// the objective selected by the task + config, recorded in the catalog
-/// alongside the spec. The task selects the family (classification / regression /
-/// embedding) and the config its specific loss.
-fn fine_tune_loss_type(config: &FineTuneConfig, task: ModelTask) -> String {
-    if task == ModelTask::Classification {
-        config
-            .classification_loss
-            .map(|l| format!("{l:?}"))
-            .unwrap_or_else(|| "CrossEntropy".into())
-    } else if task == ModelTask::Regression {
-        format!("{:?}", config.regression_loss.unwrap_or_default())
-    } else {
-        config
-            .embedding_loss
-            .map(|l| format!("{l:?}"))
-            .unwrap_or_else(|| "auto".into())
-    }
 }
 
 #[cfg(test)]

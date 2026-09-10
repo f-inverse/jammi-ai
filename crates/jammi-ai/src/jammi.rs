@@ -38,14 +38,14 @@ impl Jammi {
     /// [`Target::Local`] builds an in-process [`InferenceSession`] from the
     /// config and wraps it as an embedded [`Session`].
     ///
-    /// # `training.run_worker` — whether this process claims
+    /// # `worker.enabled` — whether this process claims
     ///
-    /// The front-door embedded session owns the training worker (RAII) **when
+    /// The front-door embedded session owns the job worker (RAII) **when
     /// the config asks this process to claim**. That is one key,
-    /// [`jammi_db::config::TrainingConfig::run_worker`] (default `true`), read
+    /// [`jammi_db::config::WorkerConfig::enabled`] (default `true`), read
     /// off the `JammiConfig` the caller passed in — the SAME key the server
-    /// binary's `train` tier and the Python `Database` read, so a deployment
-    /// setting `JAMMI_TRAINING__RUN_WORKER=false` (or the `[training]` TOML key)
+    /// binary's worker tier and the Python `Database` read, so a deployment
+    /// setting `JAMMI_WORKER__ENABLED=false` (or the `[worker]` TOML key)
     /// reaches the Rust SDK arm exactly as it reaches the other two:
     ///
     /// * `true` (the default) — the session both submits training jobs and runs

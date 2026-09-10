@@ -92,8 +92,12 @@ impl TrainingService for TrainingServer {
         let req = request.into_inner();
         require_nonempty(&req.job_id, "job_id")?;
 
+        // TODO(C2): this surface is replaced by `JobService` (PLAN-C §3);
+        // re-pointed here to the generalised `jobs_repo` primitives only far
+        // enough to keep this crate compiling and its existing tests green
+        // (C1b scope).
         let record = scoped(&self.session, tenant, || {
-            self.session.catalog().get_training_job(&req.job_id)
+            self.session.catalog().get_job(&req.job_id)
         })
         .await
         .map_err(map_engine_error)?;
@@ -115,13 +119,17 @@ impl TrainingService for TrainingServer {
             // The failure message is surfaced only on a failed job; empty
             // otherwise so a remote `wait()` reads it exactly when status is
             // "failed".
-            error: record.error_message.unwrap_or_default(),
-            // The catalog's `training_jobs.metrics` column, relayed verbatim —
-            // the SAME raw JSON blob the embedded `TrainingJob.metrics()` reads
-            // off this record, with the same absent-until-recorded semantics
-            // (`None` here maps to `optional` unset, matching field presence
-            // rather than an empty string).
-            metrics_json: record.metrics,
+            error: record.error.unwrap_or_default(),
+            // The metrics blob nested inside the generalised `jobs.result`
+            // column's tagged terminal payload
+            // (`jammi_ai::jobs::JobResult::Model.metrics`) —
+            // `training_jobs.metrics` no longer exists as its own column
+            // (C1b/N8), so this extracts the same raw metrics JSON string
+            // from its new home rather than relaying the whole tagged
+            // envelope. `None` when the job never completed as a training
+            // kind (no `Model` result), matching field presence rather than
+            // an empty string.
+            metrics_json: extract_model_metrics_json(record.result.as_deref()),
             // The catalog's `training_jobs.acceleration_report` column, relayed
             // verbatim — the SAME opaque, self-describing JSON blob the
             // embedded surface's catalog record read returns off this row
@@ -141,20 +149,24 @@ impl TrainingService for TrainingServer {
     ) -> Result<Response<pb::ListTrainingJobsResponse>, Status> {
         let tenant = session_tenant_traced(&request);
 
-        let records = scoped(&self.session, tenant, || {
-            self.session.catalog().list_training_jobs()
-        })
-        .await
-        .map_err(map_engine_error)?;
+        let records = scoped(&self.session, tenant, || self.session.catalog().list_jobs())
+            .await
+            .map_err(map_engine_error)?;
 
         Ok(Response::new(pb::ListTrainingJobsResponse {
             jobs: records
                 .into_iter()
+                .filter(|record| {
+                    matches!(
+                        record.kind.as_str(),
+                        "fine_tune" | "graph_fine_tune" | "context_predictor"
+                    )
+                })
                 .map(|record| pb::TrainingJobSummary {
                     job_id: record.job_id,
                     kind: record.kind,
                     status: record.status,
-                    base_model_id: record.base_model_id,
+                    base_model_id: record.model_ref.unwrap_or_default(),
                     // The catalog column verbatim: empty until the job
                     // completes and stamps it. Deliberately NOT
                     // `TrainingStatus.model_id`'s contract, which resolves the
@@ -166,9 +178,20 @@ impl TrainingService for TrainingServer {
                     created_at: record.created_at,
                     // Non-empty exactly when status is "failed", matching
                     // `TrainingStatus`.
-                    error: record.error_message.unwrap_or_default(),
+                    error: record.error.unwrap_or_default(),
                 })
                 .collect(),
         }))
     }
+}
+
+/// Extract the raw metrics JSON string nested inside a training kind's
+/// tagged `jobs.result` payload
+/// (`{"kind":"model","model_id":...,"artifact_path":...,"metrics":"..."}`,
+/// `jammi_ai::jobs::JobResult::Model`). `None` for an absent/non-`model`
+/// result or a `metrics` field that is itself absent — never a fabricated
+/// `Some("null")` or `Some("{}")`.
+fn extract_model_metrics_json(result: Option<&str>) -> Option<String> {
+    let value: serde_json::Value = serde_json::from_str(result?).ok()?;
+    value.get("metrics")?.as_str().map(str::to_string)
 }

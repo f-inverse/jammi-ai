@@ -553,14 +553,26 @@ async fn remote_fine_tune_metrics_round_trips_like_local() {
     let local_record = server
         .engine
         .catalog()
-        .get_training_job(&local_job.0)
+        .get_job(&local_job.0)
         .await
-        .expect("local get_training_job");
+        .expect("local get_job");
     let local_metrics: serde_json::Value = {
-        let raw = local_record
-            .metrics
+        // The generalised `jobs.result` tagged payload
+        // (`jammi_ai::jobs::JobResult::Model`) nests the raw metrics JSON as
+        // a STRING field — `training_jobs.metrics` no longer exists as its
+        // own column (C1b/N8).
+        let result_raw = local_record
+            .result
             .as_deref()
-            .expect("a completed local job carries a metrics blob");
+            .expect("a completed local job carries a result");
+        let result_value: serde_json::Value =
+            serde_json::from_str(result_raw).unwrap_or_else(|e| {
+                panic!("local job's result is not valid JSON: {e} (raw={result_raw:?})")
+            });
+        let raw = result_value
+            .get("metrics")
+            .and_then(|m| m.as_str())
+            .expect("a completed local job's result carries a metrics blob");
         // Distinct from the absence check above: a metrics blob that IS
         // present but fails to parse as JSON must be its own loud failure,
         // never folded into "no blob" — the `.ok()` swallow this leg used to

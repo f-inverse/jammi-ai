@@ -439,7 +439,7 @@ pub struct FineTuneConfig {
     ///   suffix — an earlier, superseded attempt's epoch checkpoints are
     ///   never registered even if the bytes are still durable (the same
     ///   "durable but unregistered" residual bucket documented on
-    ///   [`jammi_db::catalog::training_repo::EpochCheckpointRow`]).
+    ///   `jammi_db::catalog::jobs_repo::EpochCheckpointRow`).
     #[serde(default)]
     pub keep_last_n_checkpoints: Option<u32>,
 }

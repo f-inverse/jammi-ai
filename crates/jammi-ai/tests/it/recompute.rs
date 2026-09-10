@@ -671,6 +671,7 @@ async fn a_pre_contract_table_is_not_recomputable() {
             Some(DIM as i32),
             Some("_row_id"),
             Some("body"),
+            None,
         )
         .await
         .unwrap();

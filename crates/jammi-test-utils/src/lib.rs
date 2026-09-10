@@ -308,7 +308,7 @@ pub async fn abandon_building(
         "abandon_building: precondition — the row carries a live lease, got {:?}",
         before.lease_expires_at
     );
-    building.abandon();
+    building.detach();
     let stamped = name.clone();
     catalog
         .backend_arc()

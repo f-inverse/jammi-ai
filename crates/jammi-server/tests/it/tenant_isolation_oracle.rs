@@ -39,9 +39,10 @@ use jammi_ai::Session;
 use jammi_db::catalog::backend_sqlite::SqliteBackend;
 use jammi_db::catalog::channel_repo::{ChannelColumn, ChannelColumnType, ChannelSpec};
 use jammi_db::catalog::eval_repo::EvalRunRecord;
+use jammi_db::catalog::jobs_repo::SubmitJobParams;
 use jammi_db::catalog::model_repo::RegisterModelParams;
 use jammi_db::catalog::result_repo::{CreateResultTableParams, ResultTableKind};
-use jammi_db::catalog::training_repo::CreateTrainingJobParams;
+use jammi_db::catalog::status::JobExecution;
 use jammi_db::catalog::Catalog;
 use jammi_db::session::JammiSession;
 use jammi_db::source::{FileFormat, SourceConnection, SourceType};
@@ -281,6 +282,7 @@ fn result_params<'a>(
         storage_precision: jammi_db::config::StoragePrecision::F32,
         oversample: 4,
         created_at: jammi_db::catalog::backend::now_sortable(),
+        job_attempt: None,
     }
 }
 
@@ -542,7 +544,7 @@ fn cases() -> Vec<IsolationCase> {
                 .await
                 .unwrap();
             assert!(
-                cat_b.delete_model("m_a", None, false).await.is_err(),
+                cat_b.delete_model("m_a", None, false, 30).await.is_err(),
                 "tenant B must not delete tenant A's model"
             );
             assert!(
@@ -1114,7 +1116,7 @@ fn cases() -> Vec<IsolationCase> {
             None,
             {
                 // TrainingStatus reads the job row via the tenant-filtered
-                // `get_training_job` (NOT by an "unguessable" id) — a peer cannot
+                // `get_job` (NOT by an "unguessable" id) — a peer cannot
                 // read another tenant's job status. The shared helper creates a
                 // job under A and asserts that exact read isolation.
                 assert_training_create_isolated().await;
@@ -1698,6 +1700,7 @@ async fn materialize_table_for_tenant_a() -> (Arc<InferenceSession>, Session, St
                     Some(DIMS as i32),
                     Some("_row_id"),
                     Some("body"),
+                    None,
                 )
                 .await
                 .unwrap();
@@ -1987,6 +1990,7 @@ async fn tenant_scoped_reconcile_never_touches_a_global_expired_building_row() {
             created_at: jammi_db::catalog::backend::now_sortable(),
             writer_id: Some("writer-global-dead"),
             lease: Some(std::time::Duration::from_secs(600)),
+            job_attempt: None,
         })
         .await
         .unwrap();
@@ -2248,7 +2252,7 @@ async fn assert_model_resolver_isolated() {
 
 /// StartTraining writes a job row under the session tenant; the create path is
 /// the tenant gate. A peer cannot read the resulting job row (tenant-filtered
-/// `get_training_job`), and the base-model FK resolves only the creating
+/// `get_job`), and the base-model FK resolves only the creating
 /// tenant's model.
 async fn assert_training_create_isolated() {
     let (_dir, cat_a, cat_b, _g) = ab_catalogs().await;
@@ -2258,23 +2262,24 @@ async fn assert_training_create_isolated() {
         .unwrap();
     let base_pk = cat_a.get_model("m_a").await.unwrap().unwrap().catalog_pk;
     cat_a
-        .create_training_job(CreateTrainingJobParams {
+        .submit_job(SubmitJobParams {
             job_id: "job_a",
-            base_model_id: &base_pk,
-            training_source: "src_a",
-            loss_type: "triplet",
-            hyperparams: "{}",
             kind: "fine_tune",
-            training_spec: "{}",
+            execution: JobExecution::Queued,
+            spec: "{}",
+            model_ref: Some(&base_pk),
+            output_model_id: None,
+            model_source: None,
+            priority: 0,
         })
         .await
         .unwrap();
     assert!(
-        cat_a.get_training_job("job_a").await.is_ok(),
+        cat_a.get_job("job_a").await.is_ok(),
         "tenant A must read its own training job"
     );
     assert!(
-        cat_b.get_training_job("job_a").await.is_err(),
+        cat_b.get_job("job_a").await.is_err(),
         "CROSS-TENANT READ LEAK: tenant B reads tenant A's training job"
     );
 }
@@ -2289,23 +2294,24 @@ async fn assert_training_list_isolated() {
         .unwrap();
     let base_pk = cat_a.get_model("m_a").await.unwrap().unwrap().catalog_pk;
     cat_a
-        .create_training_job(CreateTrainingJobParams {
+        .submit_job(SubmitJobParams {
             job_id: "job_a",
-            base_model_id: &base_pk,
-            training_source: "src_a",
-            loss_type: "triplet",
-            hyperparams: "{}",
             kind: "fine_tune",
-            training_spec: "{}",
+            execution: JobExecution::Queued,
+            spec: "{}",
+            model_ref: Some(&base_pk),
+            output_model_id: None,
+            model_source: None,
+            priority: 0,
         })
         .await
         .unwrap();
-    let listed_a = cat_a.list_training_jobs().await.unwrap();
+    let listed_a = cat_a.list_jobs().await.unwrap();
     assert!(
         listed_a.iter().any(|r| r.job_id == "job_a"),
         "tenant A must list its own training job"
     );
-    let listed_b = cat_b.list_training_jobs().await.unwrap();
+    let listed_b = cat_b.list_jobs().await.unwrap();
     assert!(
         listed_b.iter().all(|r| r.job_id != "job_a"),
         "CROSS-TENANT LIST LEAK: tenant B's listing carries tenant A's training job"
@@ -2502,6 +2508,7 @@ async fn materialize_embedding_result_table(engine: &InferenceSession, source: &
             Some(DIMS as i32),
             Some("_row_id"),
             Some("body"),
+            None,
         )
         .await
         .unwrap();
@@ -2587,6 +2594,7 @@ async fn materialize_asof_result_table(
             ResultTableKind::AsofJoin,
             None,
             "asof-model",
+            None,
             None,
             None,
             None,

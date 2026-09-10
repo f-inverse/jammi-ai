@@ -1,16 +1,21 @@
-//! The training worker: claims durable [`crate::fine_tune::spec::TrainingSpec`]
-//! jobs under a lease, reconstructs each from its persisted spec, trains it
-//! while heartbeating the lease, and records the terminal outcome.
+//! The job worker: claims durable jobs — training AND compute — under a
+//! lease, reconstructs each from its persisted spec, executes it while
+//! renewing the lease, and records the terminal outcome.
 //!
-//! One worker drives every training verb. A [`TrainingWorker::run`] tick first
-//! reclaims expired leases (re-queuing a dead worker's job, or failing it past
-//! the attempts cap), then atomically claims the oldest queued job. On a claim
-//! it deserialises the spec, re-scopes the catalog to the job's tenant, and
-//! dispatches by kind to a *from-scratch* reconstruction — re-running the source
-//! SQL, re-reading and re-sampling the graph (seeded, deterministic), or
-//! re-sampling the episodic meta-dataset. No in-memory state crosses the
-//! submit→claim boundary, so a worker can run a job submitted by a now-gone
-//! session on a fresh process.
+//! One worker drives every job kind (item 2 — [`COMPILED_KINDS`]). A
+//! [`JobWorker::run`] tick first reclaims expired leases (re-queuing a dead
+//! worker's job, or failing it past the attempts cap), then atomically
+//! claims the oldest queued job of one of its configured kinds
+//! (`execution = 'queued'` only — an `inline` row is never selected by the
+//! poll loop). On a claim it deserialises the spec and dispatches: a
+//! training kind (`fine_tune`/`graph_fine_tune`/`context_predictor`)
+//! re-scopes the catalog to the job's tenant and runs a *from-scratch*
+//! reconstruction — re-running the source SQL, re-reading and re-sampling
+//! the graph (seeded, deterministic), or re-sampling the episodic
+//! meta-dataset; a compute kind (`neighbor_graph`/`propagate`/`asof_join`)
+//! dispatches through [`crate::jobs::execute_compute`]. No in-memory state
+//! crosses the submit→claim boundary, so a worker can run a job submitted by
+//! a now-gone session on a fresh process.
 //!
 //! The worker holds a [`Weak`] reference to the [`InferenceSession`]: the
 //! predictor reconstruction needs an `Arc<InferenceSession>` (its sampler methods
@@ -22,15 +27,19 @@
 //! ## Cooperative cancellation
 //!
 //! A `spawn_blocking` training thread cannot be force-aborted, so cancellation
-//! is cooperative: a heartbeat task renews the lease on an interval; when
-//! `heartbeat_training_job` returns `false` (the lease was lost — reclaimed by
-//! another worker, or expired) it sets a shared cancel flag the training loop
-//! checks at every epoch boundary. The loop then bails, leaving the job
-//! `running` for the next `reclaim_expired_training_jobs` to re-queue.
+//! is cooperative: the job's lease is a registration with the session's
+//! [`jammi_db::catalog::lease_keeper::LeaseKeeper`] (N3) — a dedicated OS
+//! thread renews it, immune to this runtime being starved by the training
+//! itself — and the registration's own `lost` flag (via
+//! [`jammi_db::catalog::lease_keeper::Registration::lost_flag`]) doubles as
+//! the shared cancel flag the training loop checks at every epoch boundary
+//! (no separate `tokio::spawn` heartbeat task anywhere in this crate). The
+//! loop then bails, leaving the job `running` for the next
+//! `reclaim_expired_jobs` to re-queue.
 //!
 //! Cancellation is checked only at epoch boundaries, so a worker can still lose
 //! its lease in the window between the last check and finalization. The terminal
-//! write is therefore a compare-and-set: [`Catalog::finalize_training_job`]
+//! write is therefore a compare-and-set: [`Catalog::finish_job_with_model`]
 //! writes the output model + flips the job to `completed` only while
 //! `claimed_by` is still this worker and the status is still `running`. A worker
 //! that lost its lease matches zero rows and does not finalize, so two workers
@@ -74,8 +83,8 @@ use crate::session::InferenceSession;
 // one poll + lease. The defaults reproduce the historical 30 s / 10 s / 1 s
 // timing; a short config drives lease-expiry and reclaim quickly.
 
-/// Attempts cap before `reclaim_expired_training_jobs` fails a job for good.
-const MAX_ATTEMPTS: u32 = 3;
+/// Attempts cap before `reclaim_expired_jobs` fails a job for good.
+pub(crate) const MAX_ATTEMPTS: u32 = 3;
 
 /// Environment override for the worker's stable `claimed_by` identity. When set
 /// (and non-empty), a worker adopts this exact id instead of minting a random
@@ -89,7 +98,7 @@ const WORKER_ID_ENV: &str = "JAMMI_WORKER_ID";
 /// non-empty, otherwise a fresh `worker-{uuid}`. An all-whitespace value is
 /// treated as unset — it would be a useless `claimed_by` and silently break
 /// ownership assertions, so it falls back rather than seeding a blank id.
-fn resolve_worker_id() -> String {
+pub(crate) fn resolve_worker_id() -> String {
     match std::env::var(WORKER_ID_ENV) {
         Ok(v) if !v.trim().is_empty() => v.trim().to_string(),
         _ => format!("worker-{}", uuid::Uuid::new_v4()),
@@ -123,58 +132,120 @@ fn epoch_checkpointing(spec: &TrainingSpec) -> Option<(usize, u32)> {
     }
 }
 
-/// A training worker bound to a session. Claims and runs durable training jobs
-/// from the shared catalog under a lease. Construct one per process (or N for a
-/// pool); [`Self::run`] is the long-lived loop the embedded engine and the
-/// server `train` tier both drive.
-pub struct TrainingWorker {
+/// Every job kind this binary can execute — the vocabulary
+/// `resolve_kinds` validates `[worker] kinds` against at startup (item 2).
+/// The three training kinds dispatch through `JobWorker::run_spec`
+/// (unchanged from the removed `TrainingWorker`, renamed `JobWorker`); the
+/// three compute kinds dispatch through [`crate::jobs::execute_compute`].
+pub const COMPILED_KINDS: &[&str] = &[
+    "fine_tune",
+    "graph_fine_tune",
+    "context_predictor",
+    "neighbor_graph",
+    "propagate",
+    "asof_join",
+];
+
+/// Whether `kind` is one of [`crate::jobs::ComputeSpec`]'s variants (dispatched
+/// through [`crate::jobs::execute_compute`]) rather than a [`TrainingSpec`]
+/// variant (dispatched through [`JobWorker::run_spec`]).
+pub(crate) fn is_compute_kind(kind: &str) -> bool {
+    matches!(kind, "neighbor_graph" | "propagate" | "asof_join")
+}
+
+/// Resolve `[worker] kinds` against [`COMPILED_KINDS`] (item 2: "`[worker]
+/// kinds` validated at startup"). `WorkerKinds::All` claims every compiled
+/// kind; `WorkerKinds::Only` is validated member-by-member and returned
+/// as-is — an unknown name is a typed [`JammiError::Config`], never a
+/// silently-ignored token.
+fn resolve_kinds(kinds: &jammi_db::config::WorkerKinds) -> Result<Vec<String>> {
+    use jammi_db::config::WorkerKinds;
+    match kinds {
+        WorkerKinds::All(_) => Ok(COMPILED_KINDS.iter().map(|s| s.to_string()).collect()),
+        WorkerKinds::Only(list) => {
+            for k in list {
+                if !COMPILED_KINDS.contains(&k.as_str()) {
+                    return Err(JammiError::Config(format!(
+                        "[worker] kinds names unknown job kind '{k}' -- compiled kinds are: {}",
+                        COMPILED_KINDS.join(", ")
+                    )));
+                }
+            }
+            Ok(list.clone())
+        }
+    }
+}
+
+/// A job worker bound to a session. Claims and runs durable jobs — training
+/// AND compute — from the shared catalog under a lease. Construct one per
+/// process (or N for a pool); [`Self::run`] is the long-lived loop the
+/// embedded engine and the server's worker tier both drive.
+pub struct JobWorker {
     /// Weak back-reference to the session — upgraded each tick. `None` means the
     /// session dropped, which is the loop's exit condition (no refcycle keeps
     /// the session alive).
     session: Weak<InferenceSession>,
-    /// Stable id stamped into `claimed_by` so a heartbeat / reclaim can tell
-    /// this worker's leases from another's. Seeded from `JAMMI_WORKER_ID` when
-    /// set, else a fresh random `worker-{uuid}` (see [`resolve_worker_id`]).
+    /// Stable id stamped into `claimed_by` — the session's own
+    /// [`InferenceSession::instance_id`], so a job this worker claims and the
+    /// `instances` row the same process heartbeats share one identity.
     worker_id: String,
     /// The validated lease/heartbeat/poll timing this worker drives its loop
     /// with. `intervals.lease` is the single source of truth threaded to both
-    /// the claim and the heartbeat, so the renew always targets the same
-    /// deadline the reclaim path compares against.
+    /// the claim and the reclaim path.
     intervals: WorkerIntervals,
+    /// The job kinds this worker claims (`[worker] kinds`, validated against
+    /// [`COMPILED_KINDS`] by [`resolve_kinds`] at construction).
+    kinds: Vec<String>,
 }
 
-impl TrainingWorker {
+impl JobWorker {
     /// Build a worker over a session, reading its lease/heartbeat timing from
-    /// the session's `[lease]` configuration and its idle poll from
-    /// `[training]`. The worker holds a
+    /// the session's `[lease]` configuration and its idle poll + kind
+    /// selection from `[worker]`. The worker holds a
     /// [`Weak`] so it never keeps the session alive; the caller owns the strong
     /// `Arc` and the worker stops when that drops.
     ///
     /// Returns [`JammiError::Config`] if the configured timing violates the
-    /// worker invariants (heartbeat margin / non-zero poll). In the normal flow
-    /// the same check already ran at config load, so this only fires for a
-    /// programmatically built config that bypassed `JammiConfig::load`.
+    /// worker invariants (heartbeat margin / non-zero poll), or if `[worker]
+    /// kinds` names a kind this binary does not compile. In the normal flow
+    /// the timing check already ran at config load, so that half only fires
+    /// for a programmatically built config that bypassed `JammiConfig::load`.
     pub fn new(session: &Arc<InferenceSession>) -> Result<Self> {
         let config = session.inner_config();
-        let intervals = config
-            .training
-            .worker_intervals(config.lease.intervals()?)?;
-        Ok(Self::with_intervals(session, intervals))
+        let intervals = config.worker.worker_intervals(config.lease.intervals()?)?;
+        let kinds = resolve_kinds(&config.worker.kinds)?;
+        Ok(Self::with_intervals_and_kinds(session, intervals, kinds))
     }
 
-    /// Build a worker over a session with explicit, already-validated timing.
-    /// The [`WorkerIntervals`] type can only be produced by
-    /// [`jammi_db::config::TrainingConfig::worker_intervals`], so its invariants
-    /// hold by construction.
+    /// Build a worker over a session with explicit, already-validated timing
+    /// and kind selection.
     ///
-    /// The worker's `claimed_by` identity is seeded from `JAMMI_WORKER_ID` when
-    /// that env var is set and non-empty, else a fresh random `worker-{uuid}`.
-    pub fn with_intervals(session: &Arc<InferenceSession>, intervals: WorkerIntervals) -> Self {
+    /// The worker's `claimed_by` identity is the session's own
+    /// [`InferenceSession::instance_id`] — never independently re-derived —
+    /// so the same process's `instances` row and every job it claims agree on
+    /// one id.
+    pub fn with_intervals_and_kinds(
+        session: &Arc<InferenceSession>,
+        intervals: WorkerIntervals,
+        kinds: Vec<String>,
+    ) -> Self {
         Self {
             session: Arc::downgrade(session),
-            worker_id: resolve_worker_id(),
+            worker_id: session.instance_id().to_string(),
             intervals,
+            kinds,
         }
+    }
+
+    /// Build a worker over a session with explicit, already-validated timing
+    /// and every compiled kind. Kept for callers that do not need to select a
+    /// kind subset (most tests; a single-process deployment).
+    pub fn with_intervals(session: &Arc<InferenceSession>, intervals: WorkerIntervals) -> Self {
+        Self::with_intervals_and_kinds(
+            session,
+            intervals,
+            COMPILED_KINDS.iter().map(|s| s.to_string()).collect(),
+        )
     }
 
     /// The worker's stable id (`claimed_by` value). Exposed for tests that assert
@@ -212,17 +283,21 @@ impl TrainingWorker {
             };
             let catalog = session.catalog();
 
-            if let Err(e) = catalog.reclaim_expired_training_jobs(MAX_ATTEMPTS).await {
-                tracing::error!(worker = %self.worker_id, error = %e, "reclaim_expired_training_jobs failed");
+            if let Err(e) = catalog
+                .reclaim_expired_jobs(self.intervals.lease, MAX_ATTEMPTS)
+                .await
+            {
+                tracing::error!(worker = %self.worker_id, error = %e, "reclaim_expired_jobs failed");
             }
 
+            let kind_refs: Vec<&str> = self.kinds.iter().map(String::as_str).collect();
             let claimed = match catalog
-                .claim_next_training_job(&self.worker_id, self.intervals.lease)
+                .claim_next(&self.worker_id, &kind_refs, self.intervals.lease)
                 .await
             {
                 Ok(c) => c,
                 Err(e) => {
-                    tracing::error!(worker = %self.worker_id, error = %e, "claim_next_training_job failed");
+                    tracing::error!(worker = %self.worker_id, error = %e, "claim_next failed");
                     None
                 }
             };
@@ -259,7 +334,7 @@ impl TrainingWorker {
     ///
     /// The esc-075 tri-state contract's `{"state":"pending"}` marker means "no
     /// claimant has computed a determination YET", so it must not survive onto
-    /// a row that has gone terminal. `Catalog::fail_training_job` retires a
+    /// a row that has gone terminal. `Catalog::fail_job` retires a
     /// still-`pending` report to
     /// `{"state":"undetermined","reason":"failed_before_probe"}` in the SAME
     /// lease-guarded UPDATE (see its own doc) — which covers this function's
@@ -286,14 +361,14 @@ impl TrainingWorker {
     /// `classify`): this writes NO terminal status, because a different
     /// worker now owns the job. Its `pending` marker is retired by the OTHER
     /// half of the same catalog-edge rule —
-    /// `Catalog::reclaim_expired_training_jobs`' exhausted arm writes
+    /// `Catalog::reclaim_expired_jobs`' exhausted arm writes
     /// `{"state":"undetermined","reason":"lease_expired_attempts_exhausted"}`,
     /// and its requeue arm RESETS the column to `pending` for the fresh
     /// attempt that will re-probe. Adding a `record_failed` here would be
     /// wrong twice over: it would stamp `failed` over a job the re-claiming
     /// worker is running, and its lease guard would not match anyway.
     ///
-    /// `Self::publish_and_finalize`'s own `finalize_training_job`
+    /// `Self::publish_and_finalize`'s own `finish_job_with_model`
     /// `Ok(false)`/`Err` arms likewise leave the job `running` for reclaim, so
     /// no terminal status is written on them either and the same reclaim half
     /// of the catalog-edge rule applies.
@@ -309,7 +384,7 @@ impl TrainingWorker {
     /// successfully reaches `completed` with the submission-time `pending`
     /// marker still on the row, which is the SAME forbidden state the failure
     /// paths above avoid, by a success path. It is covered at the same ONE
-    /// catalog edge: `Catalog::finalize_training_job` retires a still-`pending`
+    /// catalog edge: `Catalog::finish_job_with_model` retires a still-`pending`
     /// report to `{"state":"undetermined","reason":
     /// "finalized_without_determination"}` in the SAME CAS that stamps
     /// `completed`, and preserves any already-`determined` payload
@@ -327,7 +402,7 @@ impl TrainingWorker {
     pub async fn run_claimed_job(
         &self,
         session: &Arc<InferenceSession>,
-        record: jammi_db::catalog::training_repo::TrainingJobRecord,
+        record: jammi_db::catalog::jobs_repo::JobRecord,
     ) {
         let job_id = record.job_id.clone();
         // The attempt counter makes the artifact prefix unique per (job, worker,
@@ -337,9 +412,15 @@ impl TrainingWorker {
         let attempt = record.attempts;
         let catalog = Arc::new(session.catalog().pinned_to_tenant(record.tenant_id));
 
-        let spec_json = match record.training_spec.as_deref() {
-            Some(s) => s,
-            None => {
+        if is_compute_kind(&record.kind) {
+            self.run_claimed_compute_job(session, &catalog, &job_id, &record.spec, attempt)
+                .await;
+            return;
+        }
+
+        let spec: TrainingSpec = match serde_json::from_str(&record.spec) {
+            Ok(s) => s,
+            Err(e) => {
                 // esc-075 (Phase-4 audit finding 4): this fails BEFORE the
                 // device is ever resolved, so `run_fine_tune_blocking`'s
                 // measuring probe never runs — write the honest terminal
@@ -351,22 +432,7 @@ impl TrainingWorker {
                     &catalog,
                     &job_id,
                     &self.worker_id,
-                    "job carries no training_spec".into(),
-                )
-                .await;
-                return;
-            }
-        };
-        let spec: TrainingSpec = match serde_json::from_str(spec_json) {
-            Ok(s) => s,
-            Err(e) => {
-                // esc-075 (Phase-4 audit finding 4): same reasoning as the
-                // missing-`training_spec` arm above.
-                mark_acceleration_undetermined(&catalog, &job_id, &self.worker_id, attempt).await;
-                record_failed(
-                    &catalog,
-                    &job_id,
-                    &self.worker_id,
+                    attempt,
                     format!("undeserialisable training_spec: {e}"),
                 )
                 .await;
@@ -386,12 +452,23 @@ impl TrainingWorker {
         let epoch_checkpointing = epoch_checkpointing(&spec);
         let epoch_checkpoint_bound = epoch_checkpointing.map(|(b, _)| b).unwrap_or(0);
 
-        // The heartbeat renews the lease while training runs and sets `cancel`
-        // when the lease is lost. The cancel flag threads into both training
-        // paths' epoch-boundary checks.
-        let cancel = Arc::new(AtomicBool::new(false));
-        let heartbeat =
-            self.spawn_heartbeat(Arc::clone(&catalog), job_id.clone(), Arc::clone(&cancel));
+        // N3: the job's lease is a keeper registration, not a `tokio::spawn`
+        // heartbeat task — the dedicated keeper thread renews it, immune to
+        // this runtime being starved by CPU-bound training. `cancel` IS the
+        // registration's own `lost` flag (identity, not a poll copy): the
+        // keeper flips it directly on the next renewal that misses, and both
+        // training paths' epoch-boundary checks read it exactly as they read
+        // the old heartbeat-task-set flag. `registration` must outlive the
+        // run (held below) — dropping it early would stop renewal.
+        let registration =
+            session
+                .lease_keeper()
+                .register(jammi_db::catalog::lease_keeper::LeaseTarget::Job {
+                    job_id: job_id.clone(),
+                    instance_id: self.worker_id.clone(),
+                    attempts: attempt,
+                });
+        let cancel = registration.lost_flag();
 
         // Run the whole job in its own tenant scope. The claim is intentionally
         // unscoped (one worker drains every tenant's queue), so inside the run
@@ -422,8 +499,10 @@ impl TrainingWorker {
             }
         };
 
-        // Stop the heartbeat regardless of outcome.
-        heartbeat.abort();
+        // Stop renewing this attempt's lease regardless of outcome — the
+        // job is about to reach a terminal write (or be left for reclaim),
+        // so no further renewal is wanted either way.
+        drop(registration);
 
         match outcome {
             Ok(artifact) => {
@@ -458,7 +537,7 @@ impl TrainingWorker {
             }
             Err(WorkerJobError::Failed(msg)) => {
                 tracing::error!(job_id = %job_id, error = %msg, "training job failed");
-                record_failed(&catalog, &job_id, &self.worker_id, msg).await;
+                record_failed(&catalog, &job_id, &self.worker_id, attempt, msg).await;
                 // Same reasoning as the `Cancelled` arm above: covers a panic,
                 // a `spawn_blocking` join error, and any typed training
                 // failure — none of which ever produced a `TrainedArtifact`.
@@ -541,7 +620,7 @@ impl TrainingWorker {
             {
                 Ok(p) => p,
                 Err(e) => {
-                    record_failed(catalog, job_id, &self.worker_id, e.to_string()).await;
+                    record_failed(catalog, job_id, &self.worker_id, attempt, e.to_string()).await;
                     // The training loop DID complete and DID write epoch
                     // checkpoints (we have a `TrainedArtifact`) — but the
                     // FINAL artifact publish failed, so this attempt never
@@ -574,7 +653,7 @@ impl TrainingWorker {
                 epoch_checkpoint_bound,
             )
             .await;
-            record_failed(catalog, job_id, &self.worker_id, e.to_string()).await;
+            record_failed(catalog, job_id, &self.worker_id, attempt, e.to_string()).await;
             return;
         }
 
@@ -606,17 +685,17 @@ impl TrainingWorker {
         // Distinct-name catalog rows for every RETAINED epoch checkpoint
         // (unit 348, CONTRACT item 4): never an additional VERSION of the
         // output model's name. Built here (owned `String`s outliving the
-        // `finalize_training_job` call) so the `EpochCheckpointRow` borrows
+        // `finish_job_with_model` call) so the `EpochCheckpointRow` borrows
         // are valid for the whole call.
         let epoch_model_ids: Vec<String> = retained
             .iter()
             .map(|(epoch, _)| format!("{model_id}:epoch_{epoch}"))
             .collect();
-        let epoch_rows: Vec<jammi_db::catalog::training_repo::EpochCheckpointRow<'_>> = retained
+        let epoch_rows: Vec<jammi_db::catalog::jobs_repo::EpochCheckpointRow<'_>> = retained
             .iter()
             .zip(epoch_model_ids.iter())
             .map(|((_epoch, path), epoch_model_id)| {
-                jammi_db::catalog::training_repo::EpochCheckpointRow {
+                jammi_db::catalog::jobs_repo::EpochCheckpointRow {
                     model_id: epoch_model_id,
                     model_type: register.model_type,
                     task: register.task,
@@ -626,18 +705,51 @@ impl TrainingWorker {
             })
             .collect();
 
-        match catalog
-            .finalize_training_job(
-                jammi_db::catalog::training_repo::FinalizeTrainingJobParams {
+        // The tagged terminal payload `jobs.result` carries — the model
+        // metrics blob that used to live in its own `training_jobs.metrics`
+        // column now folds into it (the generalised `jobs` schema has no
+        // dedicated metrics column; see `crate::jobs::JobResult::Model`).
+        let job_result = crate::jobs::JobResult::Model {
+            model_id: model_id.clone(),
+            artifact_path: prefix.to_string(),
+            metrics: metrics.clone(),
+        };
+        let result_json = match serde_json::to_string(&job_result) {
+            Ok(j) => j,
+            Err(e) => {
+                store.delete_artifact_prefix(&prefix).await.ok();
+                Self::gc_epoch_checkpoints(
+                    &store,
+                    tenant,
                     job_id,
-                    worker_id: &self.worker_id,
-                    output_model_id: &model_id,
-                    output_model_version: register.version,
-                    artifact_path: prefix.as_str(),
-                    metrics: metrics.as_deref(),
-                    epoch_checkpoints: &epoch_rows,
-                },
-            )
+                    &self.worker_id,
+                    attempt,
+                    epoch_checkpoint_bound,
+                )
+                .await;
+                record_failed(
+                    catalog,
+                    job_id,
+                    &self.worker_id,
+                    attempt,
+                    format!("job result serialisation failed: {e}"),
+                )
+                .await;
+                return;
+            }
+        };
+
+        match catalog
+            .finish_job_with_model(jammi_db::catalog::jobs_repo::FinishJobWithModelParams {
+                job_id,
+                instance_id: &self.worker_id,
+                attempts: attempt,
+                result: &result_json,
+                output_model_id: &model_id,
+                output_model_version: register.version,
+                artifact_path: prefix.as_str(),
+                epoch_checkpoints: &epoch_rows,
+            })
             .await
         {
             Ok(true) => {
@@ -703,7 +815,7 @@ impl TrainingWorker {
                     epoch_checkpoint_bound,
                 )
                 .await;
-                tracing::error!(job_id = %job_id, error = %e, "finalize_training_job failed");
+                tracing::error!(job_id = %job_id, error = %e, "finish_job_with_model failed");
             }
         }
     }
@@ -755,7 +867,7 @@ impl TrainingWorker {
     /// all is the one residual case nothing here (or the pre-existing
     /// top-level artifact-prefix GC) reaches — durable-but-permanently-
     /// unregistered, the expected residual (documented on
-    /// [`jammi_db::catalog::training_repo::EpochCheckpointRow`]).
+    /// [`jammi_db::catalog::jobs_repo::EpochCheckpointRow`]).
     async fn gc_epoch_checkpoints(
         store: &ArtifactStore,
         tenant: Option<TenantId>,
@@ -821,39 +933,81 @@ impl TrainingWorker {
         }
     }
 
-    /// Spawn the lease-renewing heartbeat task. It renews on the configured
-    /// heartbeat interval and, the first time `heartbeat_training_job` reports
-    /// the lease lost, sets `cancel` and stops. The renewed lease window is the
-    /// same `intervals.lease` the claim used, so the heartbeat and the reclaim
-    /// path share one source of truth for the deadline.
-    fn spawn_heartbeat(
+    /// Run a claimed compute-kind job (`neighbor_graph`/`propagate`/
+    /// `asof_join`) to a terminal state: registers the job's lease with the
+    /// session's keeper (N3 — no heartbeat task), dispatches through
+    /// [`crate::jobs::execute_compute`], and performs the single lease-guarded
+    /// terminal write. A worker that lost its lease during the compute does
+    /// not finalize (`finish_job`/`fail_job` match zero rows); the job is
+    /// left for [`Catalog::reclaim_expired_jobs`].
+    async fn run_claimed_compute_job(
         &self,
-        catalog: Arc<Catalog>,
-        job_id: String,
-        cancel: Arc<AtomicBool>,
-    ) -> tokio::task::JoinHandle<()> {
-        let worker_id = self.worker_id.clone();
-        let heartbeat = self.intervals.heartbeat;
-        let lease = self.intervals.lease;
-        tokio::spawn(async move {
-            loop {
-                tokio::time::sleep(heartbeat).await;
-                match catalog
-                    .heartbeat_training_job(&job_id, &worker_id, lease)
-                    .await
-                {
-                    Ok(true) => {}
-                    Ok(false) => {
-                        // Lease lost — signal the training loop to bail.
-                        cancel.store(true, Ordering::Relaxed);
-                        return;
-                    }
-                    Err(e) => {
-                        tracing::error!(job_id = %job_id, error = %e, "heartbeat failed");
+        session: &Arc<InferenceSession>,
+        catalog: &Arc<Catalog>,
+        job_id: &str,
+        spec_json: &str,
+        attempt: u32,
+    ) {
+        let spec: crate::jobs::ComputeSpec = match serde_json::from_str(spec_json) {
+            Ok(s) => s,
+            Err(e) => {
+                record_failed(
+                    catalog,
+                    job_id,
+                    &self.worker_id,
+                    attempt,
+                    format!("undeserialisable compute spec: {e}"),
+                )
+                .await;
+                return;
+            }
+        };
+        let registration =
+            session
+                .lease_keeper()
+                .register(jammi_db::catalog::lease_keeper::LeaseTarget::Job {
+                    job_id: job_id.to_string(),
+                    instance_id: self.worker_id.clone(),
+                    attempts: attempt,
+                });
+        let outcome = crate::jobs::execute_compute(session, &spec).await;
+        drop(registration);
+
+        match outcome {
+            Ok(result) => match serde_json::to_string(&result) {
+                Ok(result_json) => {
+                    match catalog
+                        .finish_job(jammi_db::catalog::jobs_repo::FinishJobParams {
+                            job_id,
+                            instance_id: &self.worker_id,
+                            attempts: attempt,
+                            result: &result_json,
+                        })
+                        .await
+                    {
+                        Ok(true) => {}
+                        Ok(false) => tracing::debug!(
+                            job_id, worker = %self.worker_id,
+                            "lost lease before finish; left for reclaim"
+                        ),
+                        Err(e) => tracing::error!(job_id, error = %e, "finish_job failed"),
                     }
                 }
+                Err(e) => {
+                    record_failed(
+                        catalog,
+                        job_id,
+                        &self.worker_id,
+                        attempt,
+                        format!("result serialisation failed: {e}"),
+                    )
+                    .await;
+                }
+            },
+            Err(e) => {
+                record_failed(catalog, job_id, &self.worker_id, attempt, e.to_string()).await;
             }
-        })
+        }
     }
 
     /// Dispatch a claimed spec to its kind's from-scratch reconstruction and
@@ -1194,7 +1348,7 @@ impl TrainingWorker {
     }
 }
 
-/// An RAII guard owning an embedded [`TrainingWorker`]'s background task. On
+/// An RAII guard owning an embedded [`JobWorker`]'s background task. On
 /// drop it sets the stop flag and aborts the task, so the worker stops claiming
 /// new jobs when its owner (the embedded `Session` or the Python
 /// `Database`) drops.
@@ -1222,12 +1376,37 @@ impl EmbeddedWorker {
     /// guard that owns its task. The worker holds a [`Weak`] to the session, so
     /// it never keeps `session` alive; this guard stops it when the owner drops.
     ///
-    /// Reads the lease/heartbeat/poll timing from the session's `[training]`
-    /// configuration. Returns [`JammiError::Config`] if that timing violates the
-    /// worker invariants — in the normal flow `JammiConfig::load` already
-    /// validated it, so this only surfaces for a hand-built config.
+    /// Reads the lease/heartbeat/poll timing and kind selection from the
+    /// session's `[worker]` configuration. Returns [`JammiError::Config`] if
+    /// that timing (or `kinds`) violates the worker invariants — in the
+    /// normal flow `JammiConfig::load` already validated the timing, so that
+    /// half only surfaces for a hand-built config.
+    ///
+    /// Upserts this process's `workers` row (item 5: "workers upsert before
+    /// serving when `[worker] enabled`") before the poll loop starts, so a
+    /// `ListWorkers` read observes this process from the moment it can claim.
     pub fn spawn(session: &Arc<InferenceSession>) -> Result<Self> {
-        let worker = TrainingWorker::new(session)?;
+        let worker = JobWorker::new(session)?;
+        Self::spawn_worker(session, worker)
+    }
+
+    /// Spawn an already-built worker (used by [`Self::spawn`] and any test
+    /// harness that needs explicit timing/kinds via
+    /// [`JobWorker::with_intervals_and_kinds`]).
+    pub fn spawn_worker(session: &Arc<InferenceSession>, worker: JobWorker) -> Result<Self> {
+        let catalog = Arc::clone(session.catalog_arc());
+        let instance_id = session.instance_id().to_string();
+        let kinds = worker.kinds.join(",");
+        // Best-effort, synchronous-from-the-caller's-perspective upsert: a
+        // fresh `tokio::spawn`'d task issues it before the loop's first
+        // claim attempt, so the ordering "workers row exists before this
+        // process can appear to have claimed anything" holds without
+        // blocking `spawn` itself on catalog I/O.
+        tokio::spawn(async move {
+            if let Err(e) = catalog.upsert_worker(&instance_id, &kinds).await {
+                tracing::error!(error = %e, "failed to upsert this process's `workers` row");
+            }
+        });
         let stop = Arc::new(AtomicBool::new(false));
         let stop_for_task = Arc::clone(&stop);
         let handle = tokio::spawn(async move { worker.run_until(stop_for_task).await });
@@ -1246,7 +1425,7 @@ impl EmbeddedWorker {
     /// task rather than aborting it, so a caller blocking on this observes the
     /// worker's actual quiescence, not merely "the signal was sent".
     ///
-    /// **Bound on how long this takes to return**, because [`TrainingWorker::
+    /// **Bound on how long this takes to return**, because [`JobWorker::
     /// run_until`]'s loop only re-checks `stop` between claim attempts (see its
     /// doc): immediate if the worker is between claim attempts (asleep for at
     /// most `intervals.idle_poll`, default 1s), or the remaining duration of a
@@ -1305,7 +1484,7 @@ impl Drop for EmbeddedWorker {
 
 /// The reconstructed inputs for a LoRA fine-tune run — the per-kind data
 /// loader plus the task and base-model/config common bits. Bundled so the
-/// shared [`TrainingWorker::train_fine_tune`] tail takes one job-shaped argument
+/// shared [`JobWorker::train_fine_tune`] tail takes one job-shaped argument
 /// rather than a long positional list.
 struct FineTuneRun {
     task: ModelTask,
@@ -1360,8 +1539,8 @@ pub struct ModelRegistration {
     pub model_id: String,
     /// Catalog version this row registers under. Every training kind
     /// registers its output at `1` today — carried as a field (rather than
-    /// hardcoded in [`Self::as_params`]) so `TrainingWorker::publish_and_finalize`
-    /// can pass the SAME version into `finalize_training_job`'s version
+    /// hardcoded in [`Self::as_params`]) so `JobWorker::publish_and_finalize`
+    /// can pass the SAME version into `finish_job_with_model`'s version
     /// predicate that `register_model` used to create the row, closing the
     /// bare-`name` CAS-clobber gap (B5, unit 348).
     pub version: i32,
@@ -2095,21 +2274,24 @@ fn panic_message(payload: &(dyn std::any::Any + Send)) -> String {
     }
 }
 
-/// Record a terminal `Failed` status for a training job this worker owns,
-/// surfacing the cause via the catalog metrics blob so a `TrainingJob::wait()`
-/// observer sees the failure instead of an indefinite `running` state.
+/// Record a terminal `Failed` status for a job this worker owns, surfacing
+/// the cause on `jobs.error` so a [`crate::fine_tune::training_job::TrainingJob::wait`]
+/// (or [`crate::jobs::JobHandle::wait`]) observer sees the failure instead of
+/// an indefinite `running` state.
 ///
 /// The write is lease-guarded (the failure peer of the finalize CAS): it lands
 /// only while this worker still holds the lease (`claimed_by = worker_id AND
-/// status = 'running'`). A worker that lost its lease before failing does not
-/// stamp `failed` over a job the re-claiming worker is running — that case is
-/// left for the new owner (logged at debug).
-async fn record_failed(catalog: &Arc<Catalog>, job_id: &str, worker_id: &str, msg: String) {
-    let metrics = serde_json::json!({ "error_message": msg }).to_string();
-    match catalog
-        .fail_training_job(job_id, worker_id, Some(&metrics))
-        .await
-    {
+/// status = 'running' AND attempts = attempt`). A worker that lost its lease
+/// before failing does not stamp `failed` over a job the re-claiming worker is
+/// running — that case is left for the new owner (logged at debug).
+async fn record_failed(
+    catalog: &Arc<Catalog>,
+    job_id: &str,
+    worker_id: &str,
+    attempt: u32,
+    msg: String,
+) {
+    match catalog.fail_job(job_id, worker_id, attempt, &msg).await {
         Ok(true) => {}
         Ok(false) => {
             tracing::debug!(
@@ -2138,7 +2320,7 @@ async fn record_failed(catalog: &Arc<Catalog>, job_id: &str, worker_id: &str, ms
 /// training. The consequence — a job that goes on to complete with its
 /// submission-time `{"state":"pending"}` marker never overwritten — is
 /// retired at the catalog's terminal edge, not compensated for here; see
-/// [`TrainingWorker::run_claimed_job`]'s "The SUCCESS path is not exempt"
+/// [`JobWorker::run_claimed_job`]'s "The SUCCESS path is not exempt"
 /// section.
 async fn persist_acceleration_report(
     catalog: &Arc<Catalog>,
@@ -2218,7 +2400,7 @@ async fn mark_acceleration_not_applicable(
 /// it; `record_failed` flips the row to `failed` immediately after).
 ///
 /// Campaign #446 finding 1 made this pre-mark REDUNDANT-but-preferred rather
-/// than load-bearing: `Catalog::fail_training_job` now retires ANY
+/// than load-bearing: `Catalog::fail_job` now retires ANY
 /// still-`pending` report to
 /// `{"state":"undetermined","reason":"failed_before_probe"}` at the catalog
 /// edge, so this path is covered even without the pre-mark. It is kept
@@ -3851,7 +4033,7 @@ mod tests {
     /// catalog row the worker writes.
     #[tokio::test(flavor = "multi_thread")]
     async fn panicking_training_job_lands_failed_with_recorded_error() {
-        use jammi_db::catalog::status::TrainingJobStatus;
+        use jammi_db::catalog::status::JobStatus;
 
         let dir = tempfile::tempdir().unwrap();
         let catalog = Arc::new(jammi_db::catalog::Catalog::open(dir.path()).await.unwrap());
@@ -3869,22 +4051,23 @@ mod tests {
             .await
             .unwrap();
         catalog
-            .create_training_job(jammi_db::catalog::training_repo::CreateTrainingJobParams {
+            .submit_job(jammi_db::catalog::jobs_repo::SubmitJobParams {
                 job_id: "panic-job",
-                base_model_id: "panic-base::1",
-                training_source: "src",
-                loss_type: "cosent",
-                hyperparams: "{}",
                 kind: "fine_tune",
-                training_spec: "{}",
+                execution: jammi_db::catalog::status::JobExecution::Queued,
+                spec: "{}",
+                model_ref: Some("panic-base::1"),
+                output_model_id: None,
+                model_source: None,
+                priority: 0,
             })
             .await
             .unwrap();
 
         // The worker claims the job (running, leased to it) before running it —
         // the state in which a genuine failure is recorded under the lease guard.
-        catalog
-            .claim_next_training_job("worker-x", Duration::from_secs(60))
+        let claimed = catalog
+            .claim_next("worker-x", &["fine_tune"], Duration::from_secs(60))
             .await
             .unwrap()
             .expect("the queued job is claimable");
@@ -3920,20 +4103,20 @@ mod tests {
 
         // The worker records the failure as the job's terminal status, under the
         // lease guard (it still owns the job).
-        record_failed(&catalog, "panic-job", "worker-x", msg).await;
+        record_failed(&catalog, "panic-job", "worker-x", claimed.attempts, msg).await;
 
-        let job = catalog.get_training_job("panic-job").await.unwrap();
+        let job = catalog.get_job("panic-job").await.unwrap();
         assert_eq!(
             job.status,
-            TrainingJobStatus::Failed.to_string(),
+            JobStatus::Failed.to_string(),
             "a panicking job lands `failed`, never wedged `running`"
         );
         assert!(
-            job.error_message
+            job.error
                 .as_deref()
                 .is_some_and(|m| m.contains("simulated candle kernel fault")),
             "the panic cause is recorded on the job, got {:?}",
-            job.error_message
+            job.error
         );
     }
 
@@ -4164,7 +4347,7 @@ mod tests {
     /// `train_fine_tune` makes on this arm.
     #[tokio::test(flavor = "multi_thread")]
     async fn oom_training_job_lands_failed_with_classified_guidance() {
-        use jammi_db::catalog::status::TrainingJobStatus;
+        use jammi_db::catalog::status::JobStatus;
 
         let dir = tempfile::tempdir().unwrap();
         let catalog = Arc::new(jammi_db::catalog::Catalog::open(dir.path()).await.unwrap());
@@ -4182,22 +4365,23 @@ mod tests {
             .await
             .unwrap();
         catalog
-            .create_training_job(jammi_db::catalog::training_repo::CreateTrainingJobParams {
+            .submit_job(jammi_db::catalog::jobs_repo::SubmitJobParams {
                 job_id: "oom-job",
-                base_model_id: "oom-base::1",
-                training_source: "src",
-                loss_type: "cosent",
-                hyperparams: "{}",
                 kind: "fine_tune",
-                training_spec: "{}",
+                execution: jammi_db::catalog::status::JobExecution::Queued,
+                spec: "{}",
+                model_ref: Some("oom-base::1"),
+                output_model_id: None,
+                model_source: None,
+                priority: 0,
             })
             .await
             .unwrap();
 
         // The worker claims the job (running, leased to it) before running it —
         // the state in which a genuine failure is recorded under the lease guard.
-        catalog
-            .claim_next_training_job("worker-x", Duration::from_secs(60))
+        let claimed = catalog
+            .claim_next("worker-x", &["fine_tune"], Duration::from_secs(60))
             .await
             .unwrap()
             .expect("the queued job is claimable");
@@ -4243,22 +4427,22 @@ mod tests {
 
         // The worker records the failure as the job's terminal status, under the
         // lease guard (it still owns the job).
-        record_failed(&catalog, "oom-job", "worker-x", msg).await;
+        record_failed(&catalog, "oom-job", "worker-x", claimed.attempts, msg).await;
 
-        let job = catalog.get_training_job("oom-job").await.unwrap();
+        let job = catalog.get_job("oom-job").await.unwrap();
         assert_eq!(
             job.status,
-            TrainingJobStatus::Failed.to_string(),
+            JobStatus::Failed.to_string(),
             "an OOM'd job lands `failed`, never wedged `running`"
         );
         assert!(
-            job.error_message
+            job.error
                 .as_deref()
                 .is_some_and(|m| m.contains("batch_size=8")
                     && m.contains("backbone_dtype does not apply to projection-head runs")),
             "`jammi train status` / job.status() must surface the classified OOM \
-             guidance from the catalog's error_message, got {:?}",
-            job.error_message
+             guidance from the catalog's error, got {:?}",
+            job.error
         );
     }
 

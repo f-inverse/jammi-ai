@@ -23,6 +23,12 @@ pub mod index;
 pub mod inference;
 #[cfg(feature = "local")]
 pub mod jammi;
+/// The durable-job entry points (`jobs`/`instances`/`workers`, migration
+/// 029): [`jobs::JobSpec`]/[`jobs::JobResult`]/[`jobs::JobHandle`], and
+/// [`jobs::execute_compute`] — the compute-kind dispatcher a claimed job and
+/// an [`session::InferenceSession::run_now`] inline call both drive.
+#[cfg(feature = "local")]
+pub mod jobs;
 #[cfg(feature = "local")]
 pub mod local_session;
 #[cfg(feature = "local")]

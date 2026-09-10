@@ -55,7 +55,8 @@ use crate::session::InferenceSession;
 pub const DEFAULT_EXACT_MAX_ROWS: usize = 50_000;
 
 /// Parameters for [`InferenceSession::build_neighbor_graph`].
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+#[serde(default)]
 pub struct BuildNeighborGraph {
     /// Number of nearest neighbours per node (required, `>= 1`).
     pub k: usize,
@@ -432,6 +433,7 @@ impl<'a> NeighborGraphPipeline<'a> {
                 ResultTableKind::NeighborGraph,
                 Some(&source_table.table_name),
                 NEIGHBOR_GRAPH_MODEL_ID,
+                None,
                 None,
                 None,
                 None,

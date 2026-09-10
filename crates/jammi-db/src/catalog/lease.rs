@@ -185,6 +185,44 @@ pub fn lease_deadline_expr(
     }
 }
 
+/// The SQL predicate for "`col` is at least `margin` in the past" —
+/// `now() - margin > col`, on the backend's own clock on Postgres and the
+/// application clock (one bound parameter, this module's [`LEASE_TS_FORMAT`])
+/// on SQLite — the general form of [`lease_expired_clause`]'s fixed
+/// `margin = 0` comparison, minus that function's `col IS NULL` arm: every
+/// caller here (`instances.last_seen_at`, `jobs.updated_at`) requires the
+/// column non-null by construction, so there is no absent-lease case to admit.
+///
+/// Used by the job-worker liveness reclaim (a `2 * lease.duration` margin
+/// against `instances.last_seen_at`), the instance-staleness sweep, and the
+/// job-retention sweep/predicate (a `retention_days` margin against
+/// `jobs.updated_at`) — one shared clock-arithmetic primitive for every
+/// "how long ago" comparison outside the lease-deadline family above.
+pub fn stale_before_clause(
+    col: &str,
+    kind: BackendKind,
+    margin: Duration,
+    params: &mut Vec<SqlValue<'static>>,
+) -> String {
+    match kind {
+        BackendKind::Postgres => {
+            params.push(SqlValue::Float(margin.as_secs_f64()));
+            format!(
+                "{col}::timestamptz < (now() - make_interval(secs => ${}))",
+                params.len()
+            )
+        }
+        BackendKind::Sqlite => {
+            let cutoff = (chrono::Utc::now()
+                - chrono::Duration::from_std(margin).unwrap_or(chrono::Duration::MAX))
+            .format(LEASE_TS_FORMAT)
+            .to_string();
+            params.push(SqlValue::TextOwned(cutoff));
+            format!("{col} < ${}", params.len())
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -248,5 +286,39 @@ mod tests {
         let d = LeaseIntervals::default();
         assert_eq!(d.lease(), Duration::from_secs(30));
         assert_eq!(d.heartbeat(), Duration::from_secs(10));
+    }
+
+    #[test]
+    fn stale_before_clause_postgres_binds_only_the_margin_seconds() {
+        let mut params = Vec::new();
+        let clause = stale_before_clause(
+            "last_seen_at",
+            BackendKind::Postgres,
+            Duration::from_secs(60),
+            &mut params,
+        );
+        assert_eq!(
+            clause,
+            "last_seen_at::timestamptz < (now() - make_interval(secs => $1))"
+        );
+        assert_eq!(params.len(), 1);
+        assert!(matches!(params[0], SqlValue::Float(secs) if secs == 60.0));
+    }
+
+    #[test]
+    fn stale_before_clause_sqlite_binds_the_app_clock_cutoff() {
+        let mut params = Vec::new();
+        let clause = stale_before_clause(
+            "updated_at",
+            BackendKind::Sqlite,
+            Duration::from_secs(60),
+            &mut params,
+        );
+        assert_eq!(clause, "updated_at < $1");
+        assert_eq!(params.len(), 1);
+        match &params[0] {
+            SqlValue::TextOwned(s) => assert_eq!(s.len(), lease_now().len(), "fixed-width form"),
+            other => panic!("expected a TextOwned cutoff bind, got {other:?}"),
+        }
     }
 }

@@ -46,7 +46,7 @@ pub struct PyDatabase {
     /// gracefully and deterministically on `close()` via
     /// `EmbeddedWorker::stop_and_join`.
     ///
-    /// `None` when `training.run_worker` is `false`: this connection still
+    /// `None` when `worker.enabled` is `false`: this connection still
     /// mounts the whole training surface and still accepts submissions, it just
     /// never claims. The absence is represented by the `Option` rather than by a
     /// spawned-but-idle worker, so "no claim loop exists" is a state the type
@@ -68,14 +68,14 @@ impl PyDatabase {
     /// the resulting database shares the tokio runtime that drives every
     /// `InferenceSession` future.
     ///
-    /// # `training.run_worker` — whether this process claims
+    /// # `worker.enabled` — whether this process claims
     ///
     /// The embedded engine both accepts training submissions and runs them, so
     /// it is the arm that has to be able to stop running them. `config`'s
-    /// [`jammi_db::config::TrainingConfig::run_worker`] decides, and it is read
+    /// [`jammi_db::config::WorkerConfig::enabled`] decides, and it is read
     /// here from the SAME configuration the server binary reads (the
     /// `#[pyfunction] open_local` wrapper builds it with `JammiConfig::load`, so
-    /// `JAMMI_TRAINING__RUN_WORKER=false` reaches an embedded process exactly as
+    /// `JAMMI_WORKER__ENABLED=false` reaches an embedded process exactly as
     /// it reaches a server process):
     ///
     /// * `true` (the default) — the claim loop runs here, on the shared runtime.
@@ -95,7 +95,7 @@ impl PyDatabase {
         // process is configured to run one. The spawn must happen inside the
         // runtime context; the worker holds a `Weak` to the session so it never
         // keeps it alive, and the guard stops it on drop.
-        let worker = if session.inner_config().training.run_worker {
+        let worker = if session.inner_config().worker.enabled {
             let _enter = runtime.enter();
             Some(jammi_ai::fine_tune::worker::EmbeddedWorker::spawn(
                 &session,
@@ -197,7 +197,7 @@ impl PyDatabase {
     /// release is never made conditional on it, and the join error is
     /// propagated afterwards.
     ///
-    /// # With `training.run_worker = false`
+    /// # With `worker.enabled = false`
     ///
     /// Step 1 has nothing to do — no claim loop was ever started (see
     /// [`PyDatabase::open`]) — so it is skipped rather than joining a worker
@@ -281,7 +281,7 @@ impl PyDatabase {
             self.runtime.block_on(async {
                 let stopped = match &self._worker {
                     Some(worker) => worker.stop_and_join().await,
-                    // `training.run_worker = false`: there is no claim loop to
+                    // `worker.enabled = false`: there is no claim loop to
                     // stop. The pool close below still runs — the catalog
                     // release is what a caller closes for, and it must not
                     // depend on this connection having happened to own a worker.
@@ -331,13 +331,20 @@ impl PyDatabase {
     ///
     /// Tenant-scoped by the catalog read itself
     /// (`WHERE tenant_id = $1 OR tenant_id IS NULL`), which is the same call —
-    /// `Catalog::list_training_jobs` — the server's own handler makes, so the
+    /// `Catalog::list_jobs` — the server's own handler makes, so the
     /// two arms cannot drift on which rows are visible.
+    // NOTE (C1b, not a Python Session Protocol redesign — that is C4's job):
+    // this pyo3-exposed method name is kept as `list_training_jobs` (the
+    // existing Python-facing surface); only its INTERNAL catalog call is
+    // re-pointed to the generalised `jobs_repo` primitives so this crate
+    // keeps compiling. `record.base_model_id`/`record.error_message` no
+    // longer exist on the generalised `JobRecord` — mapped to their nearest
+    // new-schema equivalents (`model_ref`, `error`) below.
     fn list_training_jobs(&self, py: Python<'_>) -> PyResult<Py<PyAny>> {
         self.check_open()?;
         let records = self
             .runtime
-            .block_on(self.session.catalog().list_training_jobs())
+            .block_on(self.session.catalog().list_jobs())
             .map_err(to_pyerr)?;
         let list = PyList::empty(py);
         for record in &records {
@@ -345,13 +352,13 @@ impl PyDatabase {
             entry.set_item("job_id", &record.job_id)?;
             entry.set_item("kind", &record.kind)?;
             entry.set_item("status", &record.status)?;
-            entry.set_item("base_model_id", &record.base_model_id)?;
+            entry.set_item("base_model_id", record.model_ref.as_deref().unwrap_or(""))?;
             entry.set_item(
                 "output_model_id",
                 record.output_model_id.as_deref().unwrap_or(""),
             )?;
             entry.set_item("created_at", &record.created_at)?;
-            entry.set_item("error", record.error_message.as_deref().unwrap_or(""))?;
+            entry.set_item("error", record.error.as_deref().unwrap_or(""))?;
             list.append(entry)?;
         }
         Ok(list.into_any().unbind())

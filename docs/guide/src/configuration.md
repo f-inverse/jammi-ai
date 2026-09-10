@@ -32,8 +32,8 @@ by every hermetic config test in the workspace — and by the doc example
 below — so nothing here ever touches a real environment variable).
 `JammiConfig::parse_from(toml_src, env)` is the parse-only core underneath
 both: it runs `${VAR}` interpolation, the layering, and deserialization, but
-skips the post-load validation (`storage.cloud.validate()`, the training
-worker-interval invariants) `load_from` runs afterward.
+skips the post-load validation (`storage.cloud.validate()`, the worker
+timing invariants) `load_from` runs afterward.
 
 ## Full reference
 
@@ -114,23 +114,34 @@ duration_secs = 30
 # not drop a live holder's lease. Default: 10.
 heartbeat_secs = 10
 
-[training]
-# Whether THIS process runs the training claim loop. Default: true.
-# true  - the process claims queued jobs, renews the lease while they run,
-#         and reclaims leases that expired under a dead claimant.
-# false - the process still mounts and serves the training surface and still
-#         accepts submissions, but never claims. Submitted jobs stay queued
-#         until some process with run_worker = true opens the catalog. The
-#         SQLite catalog is single-process, so this process must close the
-#         catalog before that one can open it; a Postgres catalog is
+[worker]
+# Whether THIS process runs the job claim loop. Default: true.
+# true  - the process claims queued jobs (of `kinds`, below), renews the
+#         lease while they run, and reclaims leases that expired under a
+#         dead claimant.
+# false - the process still mounts and serves the submission surface and
+#         still accepts submissions, but never claims. Submitted jobs stay
+#         queued until some process with enabled = true opens the catalog.
+#         The SQLite catalog is single-process, so this process must close
+#         the catalog before that one can open it; a Postgres catalog is
 #         multi-process and can run both at once.
-run_worker = true
+enabled = true
+# Which job kinds this worker claims. "all" (the default) claims every kind
+# compiled into the binary; a comma list or array claims only those named.
+kinds = "all"
 # How often an idle worker polls for a queued job (and reclaims expired
 # leases). Must be > 0 - a zero poll is a busy-loop. Default: 1.
-# The lease a claim is held under is `[lease]` above; a `[training]` section
-# still naming the former `lease_duration_secs` / `heartbeat_interval_secs`
+# The lease a claim is held under is `[lease]` above; a `[worker]` section
+# naming the former `lease_duration_secs` / `heartbeat_interval_secs`
 # keys is refused at load (no alias), never silently defaulted.
 idle_poll_secs = 1
+
+[jobs]
+# How many days a terminal (completed/failed) job row survives before the
+# retention sweep may delete it, and before it stops blocking `delete_model`
+# on the model(s) it references. A non-terminal job blocks indefinitely,
+# regardless of age. Default: 30.
+retention_days = 30
 
 [cache]
 # Enable ANN query cache. Default: true.

@@ -2112,6 +2112,12 @@ jobs:
             cmd: bash ci/scripts/assert_glibc_floor.sh --self-test
           - name: assert_image_attestations.sh self-test
             cmd: bash ci/scripts/assert_image_attestations.sh --self-test
+          # #482 item 2 (Kubernetes reference): the shared remote-smoke
+          # oracle's own suite (`check_ci_guard_wiring.py` tracks every
+          # tracked `tests/**/test_*.py`, so this suite must be wired in
+          # the same commit it lands) -- stdlib-only, no Docker/kubectl.
+          - name: remote smoke oracle suite
+            cmd: python3 tests/compose/test_remote_smoke.py
     steps:
       - uses: actions/checkout@v4
         with:

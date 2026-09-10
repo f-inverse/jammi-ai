@@ -235,9 +235,11 @@ impl MutableTableRegistry {
     /// registered without an `order_column`.
     ///
     /// Resolves tenant from the registry's binding (session sticky value or
-    /// `with_tenant_scoped` task-local override). For paths that must bind
-    /// tenant explicitly — e.g. a subscriber stream whose lifetime extends
-    /// past the binding's task-local — use [`Self::scan_after_for_tenant`].
+    /// `with_tenant_scoped` task-local override). For a caller that must bind
+    /// tenant explicitly instead of consulting that binding, use
+    /// [`Self::scan_after_for_tenant`] — NOT the trigger-stream replay path
+    /// any more, which is `Self::tail_replay` (chunked, permit-bounded, used
+    /// by [`crate::trigger::Subscriber`] and the trigger tail).
     ///
     /// Implementation note: the closure-passing
     /// [`crate::catalog::backend::CatalogBackend::transaction`] API closes
@@ -320,26 +322,47 @@ impl MutableTableRegistry {
             .ok_or_else(|| MutableTableError::NotFound(table.clone()))
     }
 
-    /// One tail-replay round: read the tenant-blind head `MAX(order_col)`
-    /// FIRST, then chunk-fetch tenant-scoped rows in
-    /// `order_col > cursor_before AND order_col <= head` order, in
-    /// `chunk_size`-row groups that never split an `order_col` group across
-    /// chunks — all inside ONE read-only transaction. Returns the matching
-    /// rows (already reassembled into whole-group batches) and the new head;
-    /// the caller advances its cursor to the returned head only once every
-    /// row through it has been fetched (a full drain).
+    /// One tail-replay STEP: read the tenant-blind head `MAX(order_col)`
+    /// FIRST, then fetch ONE `chunk_size`-row-bounded group of tenant-scoped
+    /// rows in `order_col > cursor_before AND order_col <= head` order — a
+    /// group that straddles the `chunk_size` boundary is fetched whole rather
+    /// than split — all inside ONE read-only transaction. Returns that one
+    /// step's rows (already reassembled into whole-group batches), the new
+    /// cursor after this step, and whether the step reached `head` (`true`) or
+    /// more remains (`false`, in which case the caller loops, passing the
+    /// returned cursor back in as the next call's `cursor_before`).
+    ///
+    /// This is a SINGLE STEP, never a whole-backlog drain: resident memory
+    /// across a full catch-up from a low `cursor_before` to a far `head` is
+    /// bounded by one step's rows (`chunk_size`, or one group's width if wider)
+    /// at a time, not the total backlog — the caller (`replay_and_fan_out`'s
+    /// own retry loop, a subscriber's own lagging-catch-up loop, or
+    /// `Subscriber::drain_replay`'s finite accumulation) hands each step's
+    /// batches off (fan-out send, or `yield`) before this method is called
+    /// again for the next step. A caller that instead accumulated every
+    /// step's `Vec<RecordBatch>` into one growing buffer before consuming any
+    /// of it would defeat this bound and materialise the whole catch-up
+    /// anyway — see each caller's own doc for how it avoids that.
     ///
     /// `def` and `order_col` are resolved by the caller ONCE via
     /// [`Self::definition_for_tenant`], before this call, so a tail never
     /// holds two connections.
     ///
     /// Acquires a permit from [`Self::replay_permits`] BEFORE opening the
-    /// transaction below and holds it for the transaction's full duration —
-    /// this is the ONE place every trigger-stream replay path (the tail's
-    /// own driver-triggered replay, a lagging subscriber's own replay, and a
+    /// transaction below and holds it for this one step's duration — this is
+    /// the ONE place every trigger-stream replay path (the tail's own
+    /// driver-triggered replay, a lagging subscriber's own replay, and a
     /// fresh subscriber's subscribe-time backing-table drain) is bounded, so
     /// no caller of this method can bypass the bound by calling some other,
-    /// unbounded entry point.
+    /// unbounded entry point. Releasing the permit between steps (rather than
+    /// holding it for an entire multi-step catch-up) also means a long catch-up
+    /// no longer monopolises one pool connection for its full duration.
+    ///
+    /// If [`Self::replay_permits`] is ever closed (never done in this
+    /// registry's own lifetime today — see the field doc), this degrades
+    /// rather than panics: it logs a warning and returns `(vec![],
+    /// cursor_before, true)`, i.e. "no progress, nothing more to try" — never
+    /// a panic inside a long-lived tail task.
     pub(crate) async fn tail_replay(
         &self,
         def: &MutableTableDefinition,
@@ -347,12 +370,16 @@ impl MutableTableRegistry {
         tenant: Option<TenantId>,
         cursor_before: i64,
         chunk_size: usize,
-    ) -> Result<(Vec<RecordBatch>, i64), MutableTableError> {
-        let _permit = self
-            .replay_permits
-            .acquire()
-            .await
-            .expect("replay semaphore is never closed: `MutableTableRegistry` owns it for its own lifetime and never calls `Semaphore::close`");
+    ) -> Result<(Vec<RecordBatch>, i64, bool), MutableTableError> {
+        let _permit = match self.replay_permits.acquire().await {
+            Ok(permit) => permit,
+            Err(_) => {
+                tracing::warn!(
+                    "trigger tail: replay semaphore closed unexpectedly; cursor left unchanged"
+                );
+                return Ok((Vec::new(), cursor_before, true));
+            }
+        };
         let backend = Arc::clone(&self.backend);
         let def = def.clone();
         let order_col = order_col.to_string();
@@ -604,6 +631,15 @@ fn order_value_of(
 /// function (rather than a method) so it can run entirely inside the
 /// `catalog_backend().transaction` closure without borrowing `&self` across
 /// the closure's `'tx` lifetime.
+///
+/// A SINGLE STEP (never an internal loop to `head`): fetches at most one
+/// `chunk_size`-row-bounded group of rows (wider only if a single `order_col`
+/// group itself is wider than `chunk_size` — a group is never split), returns
+/// them plus the new cursor and whether `head` was reached. Bounding this to
+/// one step is what keeps `MutableTableRegistry::tail_replay`'s resident
+/// memory to one step's rows regardless of how far `cursor_before` trails
+/// `head` — see that method's doc for the caller-side contract this depends
+/// on.
 async fn tail_replay_in_tx(
     tx: &mut Transaction<'_>,
     backend: &dyn MutableBackend,
@@ -612,14 +648,14 @@ async fn tail_replay_in_tx(
     tenant: Option<TenantId>,
     cursor_before: i64,
     chunk_size: usize,
-) -> Result<(Vec<RecordBatch>, i64), MutableTableError> {
+) -> Result<(Vec<RecordBatch>, i64, bool), MutableTableError> {
     use crate::store::mutable::provider::{build_arrays, decode_row};
     use arrow_schema::DataType;
 
     // Head FIRST, tenant-blind: everything committed at or below
     // this value is visible to every replica under READ COMMITTED (the
     // offset-assigning UPDATE holds its row lock until commit), so bounding
-    // the chunk loop by it is non-lossy; anything committing after this read
+    // this step by it is non-lossy; anything committing after this read
     // is handled by the next `Wake`/`Batch`.
     let head_sql = format!(
         "SELECT MAX(\"{}\") AS m FROM \"{}\"",
@@ -634,12 +670,12 @@ async fn tail_replay_in_tx(
         .flatten();
     let Some(head) = head else {
         // Table has no rows at all yet.
-        return Ok((Vec::new(), cursor_before));
+        return Ok((Vec::new(), cursor_before, true));
     };
     if head <= cursor_before {
         // Nothing committed above the cursor (a driver `Wake` that raced an
         // already-observed commit, or a regression — never negative work).
-        return Ok((Vec::new(), cursor_before));
+        return Ok((Vec::new(), cursor_before, true));
     }
 
     let col_names: Vec<&str> = def
@@ -665,99 +701,97 @@ async fn tail_replay_in_tx(
     }
     let tenant_pred = tenant_predicate_clause(tenant);
 
-    let mut batches: Vec<RecordBatch> = Vec::new();
-    let mut read_from = cursor_before;
-    while read_from < head {
-        let predicate = format!(
-            "\"{oc}\" > {from} AND \"{oc}\" <= {head} AND {tp}",
-            oc = order_col.replace('"', "\"\""),
-            from = read_from,
-            tp = tenant_pred,
-        );
-        let base_sql = backend.scan_dml(def, &col_names, Some(predicate.as_str()), None);
-        // `scan_dml`'s own `limit` param renders LIMIT immediately after the
-        // WHERE clause, before any ORDER BY this call appends — so the probe
-        // limit is appended by hand, after ORDER BY, rather than threaded
-        // through `scan_dml`.
-        let sql = format!("{base_sql} ORDER BY {order_by} LIMIT {}", chunk_size + 1);
-        let raw = tx.query(&sql, &[], |row| decode_row(row, &columns)).await?;
-        if raw.is_empty() {
-            break;
+    let predicate = format!(
+        "\"{oc}\" > {from} AND \"{oc}\" <= {head} AND {tp}",
+        oc = order_col.replace('"', "\"\""),
+        from = cursor_before,
+        tp = tenant_pred,
+    );
+    let base_sql = backend.scan_dml(def, &col_names, Some(predicate.as_str()), None);
+    // `scan_dml`'s own `limit` param renders LIMIT immediately after the
+    // WHERE clause, before any ORDER BY this call appends — so the probe
+    // limit is appended by hand, after ORDER BY, rather than threaded
+    // through `scan_dml`.
+    let sql = format!("{base_sql} ORDER BY {order_by} LIMIT {}", chunk_size + 1);
+    let raw = tx.query(&sql, &[], |row| decode_row(row, &columns)).await?;
+    if raw.is_empty() {
+        // No tenant-visible rows remain between `cursor_before` and `head`:
+        // fully drained even though the head-to-head gap is nonzero.
+        return Ok((Vec::new(), head, true));
+    }
+    let got = raw.len();
+    if got <= chunk_size {
+        // Bounded by `head` and within one step's LIMIT, so this is provably
+        // the last step: every row up to `head` is present, whole groups
+        // included.
+        let arrays = build_arrays(&columns, transpose_rows(raw, columns.len()))
+            .map_err(|e| MutableTableError::Backend(BackendError::Execution(e.to_string())))?;
+        let batch = RecordBatch::try_new(Arc::clone(&def.schema), arrays)
+            .map_err(|e| MutableTableError::Backend(BackendError::Execution(e.to_string())))?;
+        return Ok((vec![batch], head, true));
+    }
+    // `got == chunk_size + 1`: the last row is a probe. If it shares
+    // `order_col` with the row we intend to keep as the tail of this
+    // step, that group spans the step boundary — fetch the WHOLE
+    // group by exact match instead of taking a truncated slice, WITHOUT
+    // discarding the earlier, already-complete groups this same fetch
+    // returned (every row with a smaller `order_col` value sorts before
+    // every row of the boundary group, so if this fetch reached the
+    // boundary group at all, every row of every smaller group is
+    // already present here).
+    let last_kept = order_value_of(&raw[chunk_size - 1], &columns, order_col)?;
+    let probe = order_value_of(&raw[chunk_size], &columns, order_col)?;
+    if probe == last_kept {
+        let mut raw = raw;
+        let mut boundary_start = chunk_size - 1;
+        while boundary_start > 0
+            && order_value_of(&raw[boundary_start - 1], &columns, order_col)? == last_kept
+        {
+            boundary_start -= 1;
         }
-        let got = raw.len();
-        if got <= chunk_size {
-            // Bounded by `head`, so this is provably the last chunk: every
-            // row up to `head` is present, whole groups included.
+        // Keep only the prior, definitely-complete groups; the boundary
+        // group itself (and the discarded probe row) is re-fetched whole
+        // below rather than trusted from this LIMIT-bounded slice.
+        raw.truncate(boundary_start);
+        let mut batches: Vec<RecordBatch> = Vec::new();
+        if !raw.is_empty() {
             let arrays = build_arrays(&columns, transpose_rows(raw, columns.len()))
                 .map_err(|e| MutableTableError::Backend(BackendError::Execution(e.to_string())))?;
             let batch = RecordBatch::try_new(Arc::clone(&def.schema), arrays)
                 .map_err(|e| MutableTableError::Backend(BackendError::Execution(e.to_string())))?;
             batches.push(batch);
-            break;
         }
-        // `got == chunk_size + 1`: the last row is a probe. If it shares
-        // `order_col` with the row we intend to keep as the tail of this
-        // chunk, that group spans the chunk boundary — fetch the WHOLE
-        // group by exact match instead of taking a truncated slice, WITHOUT
-        // discarding the earlier, already-complete groups this same fetch
-        // returned (every row with a smaller `order_col` value sorts before
-        // every row of the boundary group, so if this fetch reached the
-        // boundary group at all, every row of every smaller group is
-        // already present here).
-        let last_kept = order_value_of(&raw[chunk_size - 1], &columns, order_col)?;
-        let probe = order_value_of(&raw[chunk_size], &columns, order_col)?;
-        if probe == last_kept {
-            let mut raw = raw;
-            let mut boundary_start = chunk_size - 1;
-            while boundary_start > 0
-                && order_value_of(&raw[boundary_start - 1], &columns, order_col)? == last_kept
-            {
-                boundary_start -= 1;
-            }
-            // Keep only the prior, definitely-complete groups; the boundary
-            // group itself (and the discarded probe row) is re-fetched whole
-            // below rather than trusted from this LIMIT-bounded slice.
-            raw.truncate(boundary_start);
-            if !raw.is_empty() {
-                let arrays =
-                    build_arrays(&columns, transpose_rows(raw, columns.len())).map_err(|e| {
-                        MutableTableError::Backend(BackendError::Execution(e.to_string()))
-                    })?;
-                let batch = RecordBatch::try_new(Arc::clone(&def.schema), arrays).map_err(|e| {
-                    MutableTableError::Backend(BackendError::Execution(e.to_string()))
-                })?;
-                batches.push(batch);
-            }
 
-            let exact_predicate = format!(
-                "\"{oc}\" = {v} AND {tp}",
-                oc = order_col.replace('"', "\"\""),
-                v = last_kept,
-                tp = tenant_pred,
-            );
-            let exact_sql = format!(
-                "{} ORDER BY {}",
-                backend.scan_dml(def, &col_names, Some(exact_predicate.as_str()), None),
-                order_by
-            );
-            let exact_raw = tx
-                .query(&exact_sql, &[], |row| decode_row(row, &columns))
-                .await?;
-            let arrays = build_arrays(&columns, transpose_rows(exact_raw, columns.len()))
-                .map_err(|e| MutableTableError::Backend(BackendError::Execution(e.to_string())))?;
-            let batch = RecordBatch::try_new(Arc::clone(&def.schema), arrays)
-                .map_err(|e| MutableTableError::Backend(BackendError::Execution(e.to_string())))?;
-            batches.push(batch);
-            read_from = last_kept;
-            continue;
-        }
-        let kept: Vec<_> = raw.into_iter().take(chunk_size).collect();
-        let arrays = build_arrays(&columns, transpose_rows(kept, columns.len()))
+        let exact_predicate = format!(
+            "\"{oc}\" = {v} AND {tp}",
+            oc = order_col.replace('"', "\"\""),
+            v = last_kept,
+            tp = tenant_pred,
+        );
+        let exact_sql = format!(
+            "{} ORDER BY {}",
+            backend.scan_dml(def, &col_names, Some(exact_predicate.as_str()), None),
+            order_by
+        );
+        let exact_raw = tx
+            .query(&exact_sql, &[], |row| decode_row(row, &columns))
+            .await?;
+        let arrays = build_arrays(&columns, transpose_rows(exact_raw, columns.len()))
             .map_err(|e| MutableTableError::Backend(BackendError::Execution(e.to_string())))?;
         let batch = RecordBatch::try_new(Arc::clone(&def.schema), arrays)
             .map_err(|e| MutableTableError::Backend(BackendError::Execution(e.to_string())))?;
         batches.push(batch);
-        read_from = last_kept;
+        // Conservatively `false` (more work may remain): `last_kept` can, in
+        // the rare case where the boundary group's own value is `head`
+        // itself, already equal `head` — the next call's own `head <=
+        // cursor_before` check (above) catches that and returns `(vec![],
+        // head, true)` in one cheap extra step, never mis-skipping rows.
+        return Ok((batches, last_kept, false));
     }
-    Ok((batches, head))
+    let kept: Vec<_> = raw.into_iter().take(chunk_size).collect();
+    let arrays = build_arrays(&columns, transpose_rows(kept, columns.len()))
+        .map_err(|e| MutableTableError::Backend(BackendError::Execution(e.to_string())))?;
+    let batch = RecordBatch::try_new(Arc::clone(&def.schema), arrays)
+        .map_err(|e| MutableTableError::Backend(BackendError::Execution(e.to_string())))?;
+    Ok((vec![batch], last_kept, false))
 }

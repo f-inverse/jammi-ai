@@ -1296,3 +1296,147 @@ async fn postgres_suppressed_notify_recovers_via_idle_tick() {
         "a suppressed NOTIFY must still be delivered within idle_poll via the idle tick"
     );
 }
+
+/// `from_offset` is a LOWER BOUND, never a mere replay-window cursor: a
+/// `subscribe(from_offset = Some(N))` whose replay window is EMPTY at
+/// subscribe time (this client has already consumed every row below `N`)
+/// must still never deliver an engine offset below `N`, even after this
+/// subscriber's own broadcast receiver lags and self-heals via its own
+/// chunked replay. Regression for #490: `last_yielded` used to seed as
+/// `None` whenever the replay window was empty (`from_offset` was only
+/// consulted to compute the replay window itself, never carried forward as
+/// a floor), so a lag taken before this subscriber ever yielded anything
+/// reseeded its own lag-replay cursor from `-1` — the ENTIRE backing table
+/// — and the live-recv admission check (`last_yielded.is_none_or(...)`)
+/// admitted any offset at all once that reseed replayed past `N`.
+#[test_case(Arm::InMemory ; "in_memory")]
+#[test_case(Arm::Postgres ; "postgres")]
+#[cfg_attr(feature = "jetstream-broker", test_case(Arm::JetStream ; "jetstream"))]
+#[tokio::test]
+async fn from_offset_lower_bound_holds_after_lag_replay(arm: Arm) {
+    let broker = broker_or_skip!(arm, "from_offset_lower_bound_holds_after_lag_replay");
+    let h = build_harness(broker).await;
+    let topic = topic_def("parity.from_offset_lower_bound_lag");
+    h.broker.register_topic(&topic).await.unwrap();
+    h.topic_repo.register_topic(&topic).await.unwrap();
+
+    // History this client has ALREADY consumed: offsets 0..=9.
+    for i in 0..10i64 {
+        h.publisher
+            .publish_scoped(&topic, None, batch_of(&[i]))
+            .await
+            .unwrap();
+    }
+
+    // Resume strictly after it: "deliver me offset >= 10". The replay
+    // window for this call is empty (nothing at or above offset 10 exists
+    // yet), so `last_yielded` has nothing to seed from except the floor
+    // this fix introduces.
+    let mut sub = h
+        .subscriber
+        .subscribe(
+            &topic,
+            Predicate::match_all(),
+            Some(Offset::new(10, chrono::Utc::now())),
+        )
+        .await
+        .unwrap();
+
+    // Fan out more than the tail's broadcast capacity (256) WITHOUT polling
+    // `sub`, so its own receiver overflows and its next `recv()` observes
+    // `RecvError::Lagged`, forcing this subscriber's own lag-replay path —
+    // the SAME path that used to reseed from `-1` when `last_yielded` was
+    // `None`.
+    for i in 100..500i64 {
+        h.publisher
+            .publish_scoped(&topic, None, batch_of(&[i]))
+            .await
+            .unwrap();
+    }
+    tokio::time::sleep(Duration::from_millis(750)).await;
+
+    let mut first: Vec<u64> = Vec::new();
+    for _ in 0..5 {
+        let d = next_with_timeout(&mut sub)
+            .await
+            .expect("stream ended early")
+            .unwrap();
+        first.push(d.offset.value());
+    }
+    assert!(
+        first.iter().all(|o| *o >= 10),
+        "subscribe(from_offset = 10) must never deliver an offset below 10 even after this \
+         subscriber's own lag replay; first delivered offsets = {first:?}"
+    );
+}
+
+/// Second member of the same class, with NO lag involved: when the
+/// subscribe-time replay window is empty, the FIRST live event delivered
+/// must still respect `from_offset` as a lower bound — every live publish
+/// below it (e.g. a resume point read from a checkpoint written by a replica
+/// ahead of this one) is silently swallowed, never delivered, and the first
+/// delivery is exactly `from_offset` itself, never anything above OR below
+/// it.
+#[test_case(Arm::InMemory ; "in_memory")]
+#[test_case(Arm::Postgres ; "postgres")]
+#[cfg_attr(feature = "jetstream-broker", test_case(Arm::JetStream ; "jetstream"))]
+#[tokio::test]
+async fn from_offset_lower_bound_holds_on_first_live_event_with_empty_replay_window(arm: Arm) {
+    let broker = broker_or_skip!(
+        arm,
+        "from_offset_lower_bound_holds_on_first_live_event_with_empty_replay_window"
+    );
+    let h = build_harness(broker).await;
+    let topic = topic_def("parity.from_offset_lower_bound_live");
+    h.broker.register_topic(&topic).await.unwrap();
+    h.topic_repo.register_topic(&topic).await.unwrap();
+
+    for i in 0..10i64 {
+        h.publisher
+            .publish_scoped(&topic, None, batch_of(&[i]))
+            .await
+            .unwrap();
+    }
+
+    // A resume point the client has not reached yet: the next five live
+    // publishes will land engine offsets 10..=14, all strictly below it.
+    let mut sub = h
+        .subscriber
+        .subscribe(
+            &topic,
+            Predicate::match_all(),
+            Some(Offset::new(15, chrono::Utc::now())),
+        )
+        .await
+        .unwrap();
+
+    for i in 0..5i64 {
+        h.publisher
+            .publish_scoped(&topic, None, batch_of(&[900 + i]))
+            .await
+            .unwrap();
+        let premature = tokio::time::timeout(Duration::from_millis(200), sub.next()).await;
+        assert!(
+            premature.is_err(),
+            "engine offset {} is below from_offset = 15 (an empty-replay-window subscribe) and \
+             must never be delivered, even live; got {premature:?}",
+            10 + i
+        );
+    }
+
+    // This publish lands engine offset 15 -- exactly `from_offset`, the
+    // first one `subscribe` actually asked for.
+    h.publisher
+        .publish_scoped(&topic, None, batch_of(&[777]))
+        .await
+        .unwrap();
+    let d = next_with_timeout(&mut sub)
+        .await
+        .expect("stream ended early")
+        .unwrap();
+    assert_eq!(
+        d.offset.value(),
+        15,
+        "the first delivered offset must be exactly `from_offset`, never anything below it"
+    );
+}

@@ -155,6 +155,19 @@ impl Subscriber {
             .attach_or_create(&self.broker, &self.mutable, topic, tenant)
             .await?;
 
+        // The caller's requested lower bound, expressed as "the last offset
+        // NOT wanted" (one below `from_offset`) rather than `from_offset`
+        // itself, so it composes with `last_yielded`'s own "highest offset
+        // already yielded" meaning via a single `>` comparison everywhere
+        // below. `checked_sub` (never `saturating_sub`): engine offsets are
+        // assigned from `-1 + 1 = 0` (`Publisher`'s `next_offset` seed), so
+        // `from_offset = Some(0)` means "everything, no lower bound at all"
+        // — `0 - 1` has no representable `u64` floor, and `checked_sub`
+        // yields `None` for exactly that case, correctly imposing NO floor
+        // rather than saturating to `0` and then wrongly excluding the very
+        // first live offset when the replay window was empty.
+        let floor: Option<u64> = from_offset.and_then(|o| o.value().checked_sub(1));
+
         let replay_delivered = self
             .drain_replay(topic, tenant, &predicate, from_offset)
             .await?;
@@ -180,12 +193,20 @@ impl Subscriber {
 
         let stream = try_stream! {
             let _tail_guard = tail_guard;
-            // Highest engine `_offset` already yielded. Seeded with the
-            // replay high-water mark (or, for a live-only subscribe, the
-            // watermark read above) so live events inside the overlap window
-            // — or this subscriber's own lag replay — never re-deliver what
-            // it has already seen or was never asked for.
-            let mut last_yielded = last_replayed.or(watermark);
+            // Highest engine `_offset` already yielded, OR the floor above
+            // when the replay window was empty (an explicit `from_offset`
+            // this table had no rows at or below yet) — `last_yielded` is
+            // NEVER `None` while `floor` is `Some`, so the ADMISSION CHECKS
+            // below (the live-recv arm's `is_none_or`, both `lag_replay`
+            // arms') enforce `from_offset` as a genuine lower bound even
+            // when nothing was replayed: `from_offset(N)` with an empty
+            // window can only admit an offset `> floor == N - 1`, i.e.
+            // `>= N`, never anything below it (the bug this seeding closes —
+            // previously `last_replayed.or(watermark)` alone left this
+            // `None` for exactly that case, so the FIRST live event was
+            // admitted regardless of `from_offset`, and a subsequent lag
+            // reseeded lag-replay from `-1`, the entire backing table).
+            let mut last_yielded = last_replayed.or(floor).or(watermark);
             for delivered in replay_delivered {
                 yield delivered;
             }
@@ -201,7 +222,8 @@ impl Subscriber {
                         // so predicate filtering is this subscriber's
                         // job, applied in-process, and must not be confused
                         // with the dedup cursor (a row this predicate
-                        // rejects has still been "seen").
+                        // rejects has still been "seen"). This same check is
+                        // what enforces `floor` on the live path (see above).
                         if last_yielded.is_none_or(|seen| delivered.offset.value() > seen) {
                             last_yielded = Some(delivered.offset.value());
                             if let Some(filtered) = predicate.evaluate(&delivered.batch)? {
@@ -210,20 +232,39 @@ impl Subscriber {
                         }
                     }
                     Err(broadcast::error::RecvError::Lagged(_n)) => {
-                        // This subscriber's OWN chunked, group-
+                        // This subscriber's OWN one-step-at-a-time, group-
                         // completing replay from its own `last_yielded` —
                         // never `drain_replay`'s whole-suffix materialisation
                         // and never the tail's shared cursor (a lag here is
                         // this receiver's own backlog, not the tail's).
-                        let from = last_yielded.map(|o| o as i64).unwrap_or(-1);
-                        let more = crate::trigger::tail::lag_replay(&mutable, &topic_owned, tenant, from)
-                            .await?;
-                        for delivered in more {
-                            if last_yielded.is_none_or(|seen| delivered.offset.value() > seen) {
-                                last_yielded = Some(delivered.offset.value());
-                                if let Some(filtered) = predicate.evaluate(&delivered.batch)? {
-                                    yield DeliveredBatch { batch: filtered, ..delivered };
+                        // Clamped to `floor` in addition to `last_yielded`
+                        // (belt-and-suspenders: `last_yielded` is already
+                        // seeded from `floor` and only ever increases, so
+                        // this `max` is never actually exercised in normal
+                        // flow, but keeps the invariant explicit rather than
+                        // relying solely on the seed).
+                        let mut from = {
+                            let base = last_yielded.map(|o| o as i64).unwrap_or(-1);
+                            match floor {
+                                Some(f) => base.max(f as i64),
+                                None => base,
+                            }
+                        };
+                        loop {
+                            let (more, new_from, drained) =
+                                crate::trigger::tail::lag_replay(&mutable, &topic_owned, tenant, from)
+                                    .await?;
+                            for delivered in more {
+                                if last_yielded.is_none_or(|seen| delivered.offset.value() > seen) {
+                                    last_yielded = Some(delivered.offset.value());
+                                    if let Some(filtered) = predicate.evaluate(&delivered.batch)? {
+                                        yield DeliveredBatch { batch: filtered, ..delivered };
+                                    }
                                 }
+                            }
+                            from = new_from;
+                            if drained {
+                                break;
                             }
                         }
                     }
@@ -331,10 +372,14 @@ async fn current_watermark(
 /// `crate::trigger::tail`'s job (the tail's own driver-triggered replay, or
 /// a subscriber's own `crate::trigger::tail::lag_replay`). All three replay
 /// paths — this subscribe-time drain, the tail's own replay, and a lagging
-/// subscriber's replay — now share the SAME chunked, group-completing,
-/// permit-bounded primitive, `MutableTableRegistry::tail_replay`, so no
-/// replay caller can start an unbounded number of concurrent replays against
-/// the backend's connection pool.
+/// subscriber's replay — now share the SAME one-step-at-a-time,
+/// group-completing, permit-bounded primitive, `MutableTableRegistry::tail_replay`
+/// (looped here to a full drain, since this caller's contract — a finite
+/// `Vec<DeliveredBatch>` for a CLI drain or a subscribe-time replay window —
+/// wants the whole window materialised, unlike the live catch-up paths, which
+/// hand each step off immediately instead of accumulating), so no replay
+/// caller can start an unbounded number of concurrent replays against the
+/// backend's connection pool.
 async fn drain_replay(
     mutable: &Arc<MutableTableRegistry>,
     topic: &TopicDefinition,
@@ -353,14 +398,20 @@ async fn drain_replay(
             // arithmetic so `Offset(0)` produces `-1` (return every row).
             //
             // Routed through `MutableTableRegistry::tail_replay` — the SAME
-            // chunked primitive the tail's own driver-triggered replay
-            // (`crate::trigger::tail::replay_and_fan_out`) and a lagging
-            // subscriber's own replay (`crate::trigger::tail::lag_replay`)
+            // one-step-at-a-time primitive the tail's own driver-triggered
+            // replay (`crate::trigger::tail::replay_and_fan_out`) and a
+            // lagging subscriber's own replay (`crate::trigger::tail::lag_replay`)
             // use — rather than a second, permit-UNBOUNDED whole-suffix
-            // query. Every trigger-stream replay path is bounded by the
-            // same pool-sized semaphore this way, with no path that can
-            // start an unbounded number of concurrent replays against the
-            // backend's connection pool.
+            // query. Every trigger-stream replay path is bounded by the same
+            // pool-sized semaphore this way, with no path that can start an
+            // unbounded number of concurrent replays against the backend's
+            // connection pool. Looped here (rather than in `tail_replay`
+            // itself) to a full drain because this caller wants everything
+            // in the window at once; each step's `Vec<RecordBatch>` is
+            // extended into `all_raw` and dropped, so residency across the
+            // loop is this window's total rows plus at most one extra step —
+            // never more than one step ahead of what has already been
+            // accumulated.
             let scan_after_value = (off.value() as i64).saturating_sub(1);
             let def = mutable
                 .definition_for_tenant(&backing_id, tenant)
@@ -372,17 +423,26 @@ async fn drain_replay(
                     topic.name
                 ))
             })?;
-            let (raw, _new_head) = mutable
-                .tail_replay(
-                    &def,
-                    &order_col,
-                    tenant,
-                    scan_after_value,
-                    crate::trigger::tail::REPLAY_CHUNK_SIZE,
-                )
-                .await
-                .map_err(TriggerError::BackingTable)?;
-            raw
+            let mut all_raw: Vec<RecordBatch> = Vec::new();
+            let mut cursor = scan_after_value;
+            loop {
+                let (raw, new_cursor, drained) = mutable
+                    .tail_replay(
+                        &def,
+                        &order_col,
+                        tenant,
+                        cursor,
+                        crate::trigger::tail::REPLAY_CHUNK_SIZE,
+                    )
+                    .await
+                    .map_err(TriggerError::BackingTable)?;
+                all_raw.extend(raw);
+                cursor = new_cursor;
+                if drained {
+                    break;
+                }
+            }
+            all_raw
         }
         None => Vec::new(),
     };
@@ -396,10 +456,11 @@ async fn drain_replay(
                 produced_at: event.produced_at,
                 batch: filtered,
                 // The replay path is already tenant-filtered by the
-                // `scan_after_for_tenant` predicate above, so this tag
-                // carries no further meaning here and is not authoritative
-                // — unlike the live tail, which relies on it (see
-                // `subscribe_scoped`'s live-branch filter).
+                // `tenant_predicate_clause` predicate baked into
+                // `tail_replay`'s SQL above, so this tag carries no further
+                // meaning here and is not authoritative — unlike the live
+                // tail, which relies on it (see `subscribe_scoped`'s
+                // live-branch filter).
                 tenant: None,
             });
         }

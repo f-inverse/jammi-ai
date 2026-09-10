@@ -325,8 +325,19 @@ impl TriggerBroker for PostgresBroker {
                 match rx.recv().await {
                     Ok(offset) => {
                         if let Some(o) = offset {
+                            // `fetch_max` stays `Relaxed` (it is
+                            // sequenced-before the store below in this same
+                            // thread, which is all a release sequence needs),
+                            // but the presence bit itself is `Release`: paired
+                            // with `list_consumers`'s `Acquire` load below, this
+                            // establishes a happens-before edge so a reader that
+                            // observes `has_seen_offset == true` is guaranteed to
+                            // observe THIS store's `last_seen_offset` value or a
+                            // later one -- never a stale value reordered ahead of
+                            // it, which two independent `Relaxed` atomics do not
+                            // rule out on their own.
                             tracker.last_seen_offset.fetch_max(o, Ordering::Relaxed);
-                            tracker.has_seen_offset.store(true, Ordering::Relaxed);
+                            tracker.has_seen_offset.store(true, Ordering::Release);
                         }
                         yield LiveEvent::Wake;
                     }
@@ -363,10 +374,14 @@ impl TriggerBroker for PostgresBroker {
                 // `None` until a NOTIFY payload carrying an offset has
                 // actually been seen — never a fabricated `0` for a
                 // never-woken consumer (`ConsumerOffsetSnapshot`'s own
-                // doc contract, mirrored by every other driver).
+                // doc contract, mirrored by every other driver). `Acquire`
+                // pairs with the `Release` store above: observing `true`
+                // here happens-after that store's `last_seen_offset` write,
+                // so the `Relaxed` load just below is guaranteed to see that
+                // value or a later one, never a stale reorder.
                 let last = tracker
                     .has_seen_offset
-                    .load(Ordering::Relaxed)
+                    .load(Ordering::Acquire)
                     .then(|| tracker.last_seen_offset.load(Ordering::Relaxed));
                 snapshots.push(ConsumerOffsetSnapshot {
                     consumer_name: tracker.consumer_name.clone(),

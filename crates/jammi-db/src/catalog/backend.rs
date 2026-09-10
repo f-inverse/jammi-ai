@@ -91,10 +91,11 @@ pub trait CatalogBackend: Send + Sync {
     fn backend_kind(&self) -> BackendKind;
 
     /// The connection pool's `max_connections`. Used to size the concurrent
-    /// tail-replay semaphore (`crate::trigger::tail`) — sized `pool_size - 2`
-    /// (min 1) — so tail replays can never starve publishers of pool
-    /// connections on either backend (SQLite's pool is a hardcoded 8, see
-    /// `backend_sqlite.rs`'s `open`).
+    /// tail-replay semaphore owned by
+    /// [`crate::source::mutable::MutableTableRegistry`] (its `replay_permits`
+    /// field) — sized `pool_size - 2` (min 1) — so tail replays can never
+    /// starve publishers of pool connections on either backend (SQLite's pool
+    /// is a hardcoded 8, see `backend_sqlite.rs`'s `open`).
     fn pool_size(&self) -> u32;
 }
 

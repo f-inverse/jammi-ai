@@ -28,23 +28,32 @@
 //!
 //! ## Replay
 //!
-//! A replay opens ONE read-only transaction, reads the tenant-blind head
-//! `MAX(_offset)` = `H` FIRST, then chunk-fetches tenant-scoped rows
-//! `_offset > cursor AND _offset <= H` in groups that never split an
-//! `_offset` publish across chunks, and on a full drain advances the cursor
-//! to `H` (see [`crate::source::mutable::MutableTableRegistry::tail_replay`]
-//! for the SQL). `tail_replay` itself acquires a permit from a semaphore
-//! owned by the [`MutableTableRegistry`] — sized `pool_size - 2` (min 1) —
-//! before opening its transaction, so every replay caller against that
-//! backend's pool (a tail's own driver-triggered replay, a lagging
-//! subscriber's own replay via [`lag_replay`], and `Subscriber`'s
-//! subscribe-time backing-table drain) is bounded through the SAME permit
-//! pool and none of them can starve publishers of pool connections.
+//! A replay is one or more STEPS of
+//! [`crate::source::mutable::MutableTableRegistry::tail_replay`], each its
+//! own read-only transaction: a step reads the tenant-blind head `MAX(_offset)`
+//! = `H` FIRST, then fetches ONE `chunk_size`-row-bounded group of
+//! tenant-scoped rows `_offset > cursor AND _offset <= H` (a group that
+//! straddles the chunk boundary is fetched whole, never split), and reports
+//! whether `H` was reached. [`replay_and_fan_out`] loops calling `tail_replay`
+//! — fanning out each step's rows immediately — until a step reports `H`
+//! reached, then advances the cursor to `H`; a lagging subscriber's own catch
+//! up ([`lag_replay`]) is the SAME one-step primitive, looped the same way by
+//! its caller (`crate::trigger::subscriber`'s `subscribe_scoped`). Two
+//! things are bounded, not one: CONCURRENCY (every replay call — a tail's own
+//! driver-triggered replay, a lagging subscriber's own replay, and
+//! `Subscriber`'s subscribe-time backing-table drain — acquires a permit from
+//! the semaphore owned by [`MutableTableRegistry`], sized `pool_size - 2`
+//! (min 1), before opening its transaction, so replays collectively can never
+//! starve publishers of pool connections) and PER-STEP RESIDENCY (each
+//! `tail_replay` call materialises at most one step's rows, never the whole
+//! gap between `cursor` and `H` — a catch-up from a far-behind cursor to a
+//! busy topic's head resides in memory one step at a time, never the entire
+//! backlog at once).
 //!
 //! ## Tenant scope
 //!
 //! A tail is keyed on `(topic_id, tenant)`, not on topic alone: there is no
-//! all-tenants replay query (`scan_after_for_tenant(tenant = None)` renders
+//! all-tenants replay query (`tail_replay(tenant = None)` renders
 //! `tenant_id IS NULL`, i.e. *global rows only*), so each tail's OWN replay
 //! is scoped to its own tenant (tenant rows + global rows) — exactly
 //! `Subscriber::subscribe_scoped`'s existing semantics, now shared across
@@ -335,12 +344,15 @@ async fn run_tail_loop(
     }
 }
 
-/// Run one [`MutableTableRegistry::tail_replay`] round — which itself
-/// acquires this backend's replay permit before opening its transaction, see
-/// that method's docs — reassemble the rows into whole-publish
-/// [`DeliveredBatch`]es, fan them out, and return the new cursor. On any
-/// replay error the cursor is left unchanged (never advanced past rows that
-/// were never actually delivered) — the next `Wake` or gap retries.
+/// Drive [`MutableTableRegistry::tail_replay`] to completion — looping over
+/// its one-step-at-a-time contract, fanning out each step's rows BEFORE
+/// fetching the next one — and return the final cursor. Bounds resident
+/// memory to one step's rows at a time (`tail_replay`'s own doc), never the
+/// whole gap between `cursor_before` and the topic's head, however wide a
+/// backlog a `Wake` or gap is catching up from. On any replay error the
+/// cursor is left at wherever the last successful step advanced it (never
+/// past rows that were never actually delivered) — the next `Wake` or gap
+/// retries from there.
 #[allow(clippy::too_many_arguments)]
 async fn replay_and_fan_out(
     mutable: &Arc<MutableTableRegistry>,
@@ -351,62 +363,75 @@ async fn replay_and_fan_out(
     user_schema: &SchemaRef,
     sender: &broadcast::Sender<DeliveredBatch>,
 ) -> i64 {
-    match mutable
-        .tail_replay(def, order_col, tenant, cursor_before, REPLAY_CHUNK_SIZE)
-        .await
-    {
-        Ok((raw_batches, new_cursor)) => {
-            match group_replay_batches(&raw_batches, user_schema) {
-                Ok(events) => {
-                    for event in events {
-                        let delivered = DeliveredBatch {
-                            offset: event.offset,
-                            produced_at: event.produced_at,
-                            batch: event.batch,
-                            // The replay query is already tenant-scoped —
-                            // this tag is informational only, matching
-                            // `Subscriber::drain_replay`'s own replay path.
-                            tenant: None,
-                        };
-                        let _ = sender.send(delivered);
+    let mut cursor = cursor_before;
+    loop {
+        match mutable
+            .tail_replay(def, order_col, tenant, cursor, REPLAY_CHUNK_SIZE)
+            .await
+        {
+            Ok((raw_batches, new_cursor, drained)) => {
+                match group_replay_batches(&raw_batches, user_schema) {
+                    Ok(events) => {
+                        for event in events {
+                            let delivered = DeliveredBatch {
+                                offset: event.offset,
+                                produced_at: event.produced_at,
+                                batch: event.batch,
+                                // The replay query is already tenant-scoped —
+                                // this tag is informational only, matching
+                                // `Subscriber::drain_replay`'s own replay path.
+                                tenant: None,
+                            };
+                            let _ = sender.send(delivered);
+                        }
+                        cursor = new_cursor;
+                        if drained {
+                            return cursor;
+                        }
                     }
-                    new_cursor
-                }
-                Err(err) => {
-                    tracing::warn!(error = %err, "trigger tail: replay group reassembly failed");
-                    cursor_before
+                    Err(err) => {
+                        tracing::warn!(error = %err, "trigger tail: replay group reassembly failed");
+                        return cursor;
+                    }
                 }
             }
-        }
-        Err(err) => {
-            let err: TriggerError = match err {
-                MutableTableError::Backend(b) => TriggerError::Backend(b),
-                other => TriggerError::BackingTable(other),
-            };
-            tracing::warn!(error = %err, "trigger tail: replay failed; cursor unchanged");
-            cursor_before
+            Err(err) => {
+                let err: TriggerError = match err {
+                    MutableTableError::Backend(b) => TriggerError::Backend(b),
+                    other => TriggerError::BackingTable(other),
+                };
+                tracing::warn!(error = %err, "trigger tail: replay failed; cursor unchanged");
+                return cursor;
+            }
         }
     }
 }
 
-/// A single subscriber's own lag recovery: when a subscriber's
-/// broadcast receiver observes `RecvError::Lagged`, it replays from its OWN
-/// `last_yielded` rather than erroring or falling back to
-/// `Subscriber::drain_replay`'s whole-suffix materialisation. This reuses
-/// the SAME chunked, group-completing replay primitive the tail itself uses
-/// for a driver-level `Wake` — never a second, less-bounded code path.
+/// A single subscriber's own lag recovery, ONE STEP at a time: when a
+/// subscriber's broadcast receiver observes `RecvError::Lagged`, it replays
+/// from its OWN `last_yielded`/floor rather than erroring or falling back to
+/// `Subscriber::drain_replay`'s whole-suffix materialisation. This reuses the
+/// SAME one-step, group-completing replay primitive the tail itself loops
+/// over for a driver-level `Wake` (`replay_and_fan_out`) — never a second,
+/// less-bounded code path.
 ///
-/// Returns tenant-scoped (already-filtered by the backing query) but NOT
-/// predicate-filtered rows — the caller (`Subscriber::subscribe_scoped`)
-/// applies the predicate uniformly across every source (live relay and lag
-/// replay alike), matching the rule that predicate and dedup are per
-/// subscriber, in-process.
+/// Returns ONE step's tenant-scoped (already-filtered by the backing query)
+/// but NOT predicate-filtered events, the new cursor
+/// (`from_offset_exclusive`'s replacement for the caller's next call), and
+/// whether the topic's head was reached. The caller
+/// (`crate::trigger::subscriber`'s `subscribe_scoped`) loops calling this
+/// again with the returned cursor until `drained`, consuming (dedup-checking,
+/// predicate-filtering, and `yield`ing) each step's events before the next
+/// call — so a catch-up from a far-behind cursor never resides in memory
+/// as more than one step's events at a time, and applies the predicate
+/// uniformly across every source (live relay and lag replay alike), matching
+/// the rule that predicate and dedup are per subscriber, in-process.
 pub(crate) async fn lag_replay(
     mutable: &Arc<MutableTableRegistry>,
     topic: &TopicDefinition,
     tenant: Option<TenantId>,
     from_offset_exclusive: i64,
-) -> Result<Vec<DeliveredBatch>, TriggerError> {
+) -> Result<(Vec<DeliveredBatch>, i64, bool), TriggerError> {
     let backing_id =
         crate::store::mutable::definition::MutableTableId::new(topic.backing_table_name())
             .map_err(|e| TriggerError::Catalog(e.to_string()))?;
@@ -417,7 +442,7 @@ pub(crate) async fn lag_replay(
             topic.name
         ))
     })?;
-    let (raw_batches, _new_head) = mutable
+    let (raw_batches, new_cursor, drained) = mutable
         .tail_replay(
             &def,
             &order_col,
@@ -431,7 +456,7 @@ pub(crate) async fn lag_replay(
             other => TriggerError::BackingTable(other),
         })?;
     let events = group_replay_batches(&raw_batches, &topic.schema)?;
-    Ok(events
+    let delivered = events
         .into_iter()
         .map(|event| DeliveredBatch {
             offset: event.offset,
@@ -439,5 +464,6 @@ pub(crate) async fn lag_replay(
             batch: event.batch,
             tenant: None,
         })
-        .collect())
+        .collect();
+    Ok((delivered, new_cursor, drained))
 }

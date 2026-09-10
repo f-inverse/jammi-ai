@@ -495,7 +495,7 @@ Every trait/enum/base surface a maintainer extends, with anchors and invariants.
   `true` (default `true`); **not** the unconditional `with_embedded_worker`
   form. This is the SAME key the server `train` tier and the Python embedded
   arm read before deciding whether THEIR process claims —
-  `training.run_worker` (`crates/jammi-server/src/runtime.rs:1084`) and
+  `training.run_worker` (`crates/jammi-server/src/runtime.rs:1167`) and
   `training.run_worker` (`crates/jammi-python/src/database.rs:98`) — so a wire
   deployment and an in-process one answer "does THIS process claim?"
   identically rather than by three private conventions. `Target`
@@ -2959,8 +2959,8 @@ describing a removed surface.
   Result<(), Status>`, unlike the `async_trait` `TenantResolver`): a local
   metadata check, not an I/O round-trip. `CatalogServer::new`'s 4th parameter,
   threaded from `GrpcChain.admin_authorizer: Option<Arc<dyn AdminAuthorizer>>`
-  (`runtime.rs:331`'s `build_grpc_chain` — the OSS binary's shipped default,
-  `None` — and `:937`'s `assemble_grpc_chain` exhaustive destructure;
+  (`runtime.rs:414`'s `build_grpc_chain` — the OSS binary's shipped default,
+  `None` — and `:1020`'s `assemble_grpc_chain` exhaustive destructure;
   `flight.rs:56`'s `serve_flight_with_catalog_service` passes `None`). Shipped
   default `None` refuses EVERY `all = true` request with `PERMISSION_DENIED`
   naming `security.md`; `all = false` never consults it. **Gated verb only —

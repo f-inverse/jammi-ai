@@ -18,7 +18,7 @@
 //! the native sequence skew permanently. The tail never hands an engine
 //! offset to a driver as if it were a native start-sequence; instead its own
 //! driver subscription is always `(Predicate::match_all(), from_offset =
-//! None)` (H3), and every gap or `Wake` self-heals through a replay of the
+//! None)`, and every gap or `Wake` self-heals through a replay of the
 //! backing table (`crate::trigger::tail`'s module docs).
 //!
 //! `subscribe_scoped` yields the replay prefix (covering `[from_offset ..=
@@ -26,7 +26,7 @@
 //! events, deduping by engine `_offset` (only advancing past what replay
 //! already covered) so the replay/live overlap never re-delivers what this
 //! subscriber has already seen. Predicate filtering happens here, in-process,
-//! per subscriber (H3) — the tail itself is predicate-blind.
+//! per subscriber — the tail itself is predicate-blind.
 
 use std::sync::Arc;
 
@@ -54,7 +54,7 @@ pub struct Subscriber {
     broker: Arc<dyn TriggerBroker>,
     mutable: Arc<MutableTableRegistry>,
     /// One live tail per `(topic, tenant)` this process has ever served a
-    /// subscriber for (PLAN-F H1/H6/K1) — see `crate::trigger::tail`.
+    /// subscriber for — see `crate::trigger::tail`.
     tails: TailRegistry,
 }
 
@@ -157,13 +157,13 @@ impl Subscriber {
             None
         };
 
-        // G3: attach to the tail's broadcast BEFORE reading any watermark —
+        // Attach to the tail's broadcast BEFORE reading any watermark —
         // rows fanned out before this attach have offset <= the watermark
         // (read just above) and are suppressed by dedup below; rows
         // committing after the attach are fanned out after it, so nothing
         // is missed. `_tail_guard` keeps the tail's `Arc` (and therefore its
         // task and driver subscription) alive for exactly as long as this
-        // subscription is polled (H6).
+        // subscription is polled.
         let (tail_guard, mut rx) = self
             .tails
             .attach_or_create(&self.broker, &self.mutable, topic, tenant)
@@ -187,12 +187,12 @@ impl Subscriber {
                 match rx.recv().await {
                     Ok(delivered) => {
                         // The tail is keyed on `(topic, tenant)` and already
-                        // scopes its fan-out to exactly this tenant (H1) —
+                        // scopes its fan-out to exactly this tenant —
                         // no further tenant filter needed here. Dedup by
                         // engine `_offset` ALWAYS advances on a higher
                         // offset, independent of the predicate: the tail's
-                        // own driver subscription is `Predicate::match_all`
-                        // (H3), so predicate filtering is this subscriber's
+                        // own driver subscription is `Predicate::match_all`,
+                        // so predicate filtering is this subscriber's
                         // job, applied in-process, and must not be confused
                         // with the dedup cursor (a row this predicate
                         // rejects has still been "seen").
@@ -204,7 +204,7 @@ impl Subscriber {
                         }
                     }
                     Err(broadcast::error::RecvError::Lagged(_n)) => {
-                        // G4/K2: this subscriber's OWN chunked, group-
+                        // This subscriber's OWN chunked, group-
                         // completing replay from its own `last_yielded` —
                         // never `drain_replay`'s whole-suffix materialisation
                         // and never the tail's shared cursor (a lag here is

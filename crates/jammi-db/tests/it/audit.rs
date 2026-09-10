@@ -317,7 +317,7 @@ async fn published_to_trigger_topic(backend: BackendKind) {
     // Subscribe for live fan-out, then log a second record. Goes through
     // `Subscriber` (the engine-facing seam, stable `DeliveredBatch` item)
     // rather than the driver directly (`TriggerBroker::subscribe` returns a
-    // driver-level `LiveStream` of `LiveEvent`s — see PLAN-F F3).
+    // driver-level `LiveStream` of `LiveEvent`s).
     let mut sub = s
         .subscriber()
         .subscribe(&topic, Predicate::match_all(), None)

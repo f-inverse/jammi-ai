@@ -1,7 +1,7 @@
-//! Cross-driver parity suite (PLAN-F §5/J6/K6, contract item 2).
+//! Cross-driver parity suite (contract item 2).
 //!
 //! Parameterised over [`Arm::InMemory`] (always), [`Arm::Postgres`]
-//! (`JAMMI_TEST_PG_URL`; runs in the `test-pg` job, no cargo feature — F2 §4),
+//! (`JAMMI_TEST_PG_URL`; runs in the `test-pg` job, no cargo feature),
 //! and [`Arm::JetStream`] (`live-broker-tests`, requiring
 //! `JAMMI_TEST_NATS_URL`; `JAMMI_REQUIRE_NATS` turns an unset URL into a hard
 //! failure rather than a silent skip — the same require-gate shape
@@ -11,7 +11,7 @@
 //! seam behaves identically regardless of which driver sits underneath it —
 //! the Postgres arm's backing table stays on SQLite; only the broker (a
 //! wake-up transport, never the log) is real Postgres `LISTEN`/`NOTIFY`. The
-//! offset-order == commit-order oracle (K5/G6) runs against a real Postgres
+//! offset-order == commit-order oracle runs against a real Postgres
 //! catalog instead (two sessions sharing one database), gated by
 //! `live-postgres-tests`.
 //!
@@ -19,8 +19,7 @@
 //! they need the CONCRETE `PostgresBroker` type (a test-only hook /
 //! `pg_terminate_backend`), not the `Arc<dyn TriggerBroker>` trait object
 //! `broker_for` returns: `postgres_listener_killed_recovers_via_replay`
-//! (F5/PLAN-F §5(d)) and `postgres_suppressed_notify_recovers_via_idle_tick`
-//! (G9/PLAN-F §5(g)).
+//! and `postgres_suppressed_notify_recovers_via_idle_tick`.
 
 use std::collections::BTreeMap;
 use std::str::FromStr;
@@ -226,7 +225,7 @@ where
         .expect("stream item timed out")
 }
 
-/// (a) Live tail after subscribe delivers every published offset exactly
+/// Live tail after subscribe delivers every published offset exactly
 /// once, in ascending order.
 #[test_case(Arm::InMemory ; "in_memory")]
 #[test_case(Arm::Postgres ; "postgres")]
@@ -268,8 +267,8 @@ async fn live_tail_delivers_every_offset_exactly_once_in_order(arm: Arm) {
     );
 }
 
-/// (a) two-publisher arm + (e) I1: two independent `Publisher`s over ONE
-/// broker/topic in one process publish interleaved; post-commit fan-out
+/// Two independent `Publisher`s over ONE broker/topic in one process
+/// publish interleaved; post-commit fan-out
 /// across two writers is unordered, so it is the tail's contiguity check
 /// (never delivery order) that must still deliver a gap-free, in-order,
 /// exactly-once stream.
@@ -342,7 +341,7 @@ async fn two_publishers_over_one_broker_deliver_gap_free_in_order(arm: Arm) {
     );
 }
 
-/// (b) `from_offset` in the past: the replay prefix and the live tail
+/// `from_offset` in the past: the replay prefix and the live tail
 /// overlap, and the seam must dedup that overlap so no offset is delivered
 /// twice.
 #[test_case(Arm::InMemory ; "in_memory")]
@@ -400,7 +399,7 @@ async fn from_offset_in_past_replay_and_live_overlap_no_duplicates(arm: Arm) {
     );
 }
 
-/// (c) A tenant-scoped subscriber never sees another tenant's rows, even
+/// A tenant-scoped subscriber never sees another tenant's rows, even
 /// though the driver is tenant-blind and the topic is globally registered
 /// (`TopicDefinition::tenant == None`), so one `topic.id` is shared across
 /// tenants.
@@ -460,10 +459,10 @@ async fn tenant_scoped_subscriber_never_sees_another_tenants_rows(arm: Arm) {
     );
 }
 
-/// (d) + H2/K2: a subscriber whose OWN broadcast receiver lags (never the
+/// A subscriber whose OWN broadcast receiver lags (never the
 /// tail's shared cursor) self-heals via its own chunked, group-completing
 /// replay -- no error, no loss -- and that replay correctly reassembles a
-/// publish wider than one replay chunk (H2's group-completion probe) back
+/// publish wider than one replay chunk (via the group-completion probe) back
 /// into ONE `DeliveredBatch` in original row order.
 #[test_case(Arm::InMemory ; "in_memory")]
 #[test_case(Arm::Postgres ; "postgres")]
@@ -551,7 +550,7 @@ async fn subscriber_lag_self_heals_via_chunked_group_completing_replay(arm: Arm)
     );
 }
 
-/// H3/H1: two subscribers with DIFFERENT predicates, on one `Subscriber`,
+/// Two subscribers with DIFFERENT predicates, on one `Subscriber`,
 /// on the SAME `(topic, tenant)` share exactly one driver-level
 /// subscription -- proven via `list_consumers`, which enumerates driver
 /// consumers directly, never the number of `Subscriber`-level subscriptions
@@ -618,7 +617,7 @@ async fn two_predicate_subscribers_share_one_driver_subscription(arm: Arm) {
     );
 }
 
-/// (f)/K6: every accepted topic column type round-trips through a LIVE
+/// Every accepted topic column type round-trips through a LIVE
 /// subscribe (not just replay), registered through `TopicRepo::register_topic`
 /// so the oracle pins the persisted type-name table.
 #[test_case(Arm::InMemory ; "in_memory")]
@@ -705,7 +704,7 @@ async fn every_accepted_type_round_trips_through_live_subscribe(arm: Arm) {
     assert_eq!(bytes_col.value(1), b"\x00\x01\xff");
 }
 
-/// (k)/G6/K5: offset order == commit order. Two independent `Publisher`
+/// Offset order == commit order. Two independent `Publisher`
 /// "sessions" share ONE Postgres database; interleaved publishes still
 /// yield a replay whose `_offset` order equals the true commit order,
 /// because the offset-assigning `UPDATE`'s row lock holds until commit.
@@ -822,7 +821,7 @@ const LISTENER_APPLICATION_NAME: &str = "jammi-trigger-listener";
 /// (never this connection's own backend) — simulates a `PostgresBroker`'s
 /// dedicated listener connection dying out from under it, so the next
 /// `try_recv()` observes a connection-reset error and self-heals via sqlx's
-/// own eager-reconnect contract (F5).
+/// own eager-reconnect contract.
 async fn kill_broker_listener_backends(url: &str) {
     let pool = sqlx::postgres::PgPoolOptions::new()
         .max_connections(1)
@@ -839,7 +838,7 @@ async fn kill_broker_listener_backends(url: &str) {
     .expect("pg_terminate_backend query");
 }
 
-/// (d)/F5: killing the broker's dedicated listener backend loses whatever
+/// Killing the broker's dedicated listener backend loses whatever
 /// NOTIFYs arrive during the reconnect window, but every offset still arrives
 /// -- via `Ok(None)`'s wake-every-topic fallback (and, as a second net, the
 /// idle tick) driving the engine's own replay.
@@ -900,7 +899,7 @@ async fn postgres_listener_killed_recovers_via_replay() {
     );
 }
 
-/// (g)/G9: a NOTIFY the broker itself never sends (simulating one Postgres
+/// A NOTIFY the broker itself never sends (simulating one Postgres
 /// silently drops) is still covered within `idle_poll` by the idle tick — no
 /// error, no permanent loss.
 #[tokio::test]

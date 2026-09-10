@@ -21,7 +21,7 @@ use jammi_db::trigger::{
 
 /// The JetStream driver carries the published bytes itself, so it only ever
 /// yields [`LiveEvent::Batch`] — never [`LiveEvent::Wake`] (that's a
-/// wake-up-transport-only driver's shape, see PLAN-F §0). Test call sites
+/// wake-up-transport-only driver's shape). Test call sites
 /// that talk to the driver directly (rather than through
 /// `Subscriber::subscribe_scoped`, whose engine-facing item stays the
 /// stable `DeliveredBatch`) unwrap through this helper.

@@ -1,6 +1,5 @@
-//! Escape row esc-F3 (issue-triage symptom_spec; PLAN-F F1/F11/G2/H8/I7,
-//! `<eval-verdict>` F15(iii)): **replayed batches reorder rows within a
-//! publish**.
+//! Escape row esc-101-trigger-replay-reorders-intra-batch-rows:
+//! **replayed batches reorder rows within a publish**.
 //!
 //! Symptom: every row of one `publish_scoped` call shares the same
 //! `_offset` (see `topic.rs`'s doc on `OFFSET_COLUMN`); before this fix
@@ -107,7 +106,7 @@ async fn intra_batch_row_order_survives_replay(backend: BackendKind) {
 
     let topic = TopicDefinition {
         id: TopicId::new(),
-        name: format!("esc_f3.row_order.{}", jammi_test_utils::unique_suffix()),
+        name: format!("esc_101.row_order.{}", jammi_test_utils::unique_suffix()),
         schema: topic_schema(),
         tenant: None,
         broker_metadata: BTreeMap::new(),
@@ -177,7 +176,7 @@ async fn intra_batch_row_order_survives_replay(backend: BackendKind) {
 /// thread id, a run-specific value, elided):
 ///
 /// ```text
-/// thread 'esc_f3_intra_batch_row_order::intra_batch_row_order_survives_update_churn_on_an_early_row_postgres' panicked at `.batch`, crates/jammi-db/tests/it/esc_f3_intra_batch_row_order.rs:300:5:
+/// thread 'esc_101_intra_batch_row_order::intra_batch_row_order_survives_update_churn_on_an_early_row_postgres' panicked at `assert_eq!`, crates/jammi-db/tests/it/esc_101_intra_batch_row_order.rs:306:5:
 /// assertion `left == right` failed: intra-batch row order must survive an UPDATE that
 /// physically reorders a row on Postgres's heap -- the ORDER BY _offset, _row_idx tiebreak
 /// must pin logical order regardless of physical row placement
@@ -238,7 +237,7 @@ async fn intra_batch_row_order_survives_update_churn_on_an_early_row_postgres() 
 
     let topic = TopicDefinition {
         id: TopicId::new(),
-        name: format!("esc_f3.update_churn.{}", jammi_test_utils::unique_suffix()),
+        name: format!("esc_101.update_churn.{}", jammi_test_utils::unique_suffix()),
         schema: topic_schema(),
         tenant: None,
         broker_metadata: BTreeMap::new(),

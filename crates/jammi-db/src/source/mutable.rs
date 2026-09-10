@@ -293,7 +293,7 @@ impl MutableTableRegistry {
     /// Resolve `table`'s definition scoped to `tenant`, without opening any
     /// transaction. Used by the trigger-stream `TopicTail` actor to cache a
     /// topic's backing-table definition ONCE, before its replay transaction
-    /// opens (PLAN-F K3: a tail must never hold two connections at once).
+    /// opens: a tail must never hold two connections at once.
     pub async fn definition_for_tenant(
         &self,
         table: &MutableTableId,
@@ -305,8 +305,8 @@ impl MutableTableRegistry {
             .ok_or_else(|| MutableTableError::NotFound(table.clone()))
     }
 
-    /// One tail-replay round (PLAN-F H2/I2/J1/K1/K3): read the tenant-blind
-    /// head `MAX(order_col)` FIRST, then chunk-fetch tenant-scoped rows in
+    /// One tail-replay round: read the tenant-blind head `MAX(order_col)`
+    /// FIRST, then chunk-fetch tenant-scoped rows in
     /// `order_col > cursor_before AND order_col <= head` order, in
     /// `chunk_size`-row groups that never split an `order_col` group across
     /// chunks — all inside ONE read-only transaction. Returns the matching
@@ -588,8 +588,8 @@ async fn tail_replay_in_tx(
     use crate::store::mutable::provider::{build_arrays, decode_row};
     use arrow_schema::DataType;
 
-    // Head FIRST (I2/J1), tenant-blind: everything committed at or below
-    // this value is visible to every replica under READ COMMITTED (G6 — the
+    // Head FIRST, tenant-blind: everything committed at or below
+    // this value is visible to every replica under READ COMMITTED (the
     // offset-assigning UPDATE holds its row lock until commit), so bounding
     // the chunk loop by it is non-lossy; anything committing after this read
     // is handled by the next `Wake`/`Batch`.
@@ -669,7 +669,7 @@ async fn tail_replay_in_tx(
         }
         // `got == chunk_size + 1`: the last row is a probe. If it shares
         // `order_col` with the row we intend to keep as the tail of this
-        // chunk, that group spans the chunk boundary (H2) — fetch the WHOLE
+        // chunk, that group spans the chunk boundary — fetch the WHOLE
         // group by exact match instead of taking a truncated slice, WITHOUT
         // discarding the earlier, already-complete groups this same fetch
         // returned (every row with a smaller `order_col` value sorts before

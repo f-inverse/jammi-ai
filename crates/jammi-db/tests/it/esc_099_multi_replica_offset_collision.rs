@@ -1,5 +1,5 @@
-//! Escape row esc-F1 (issue-triage symptom_spec; PLAN-F §3/F4/G5/H5,
-//! `<eval-verdict>` F15(i)): **multi-replica offset collision**.
+//! Escape row esc-099-multi-replica-trigger-offset-collision:
+//! **multi-replica offset collision**.
 //!
 //! Symptom: two engine replicas (or, in-process, two independent
 //! [`Publisher`] instances wired to the SAME catalog backend and topic --
@@ -110,7 +110,7 @@ async fn two_replica_publishers_assign_gap_free_offsets() {
 
     let topic = TopicDefinition {
         id: TopicId::new(),
-        name: "esc_f1.multi_replica".to_string(),
+        name: "esc_099.multi_replica".to_string(),
         schema: topic_schema(),
         tenant: None,
         broker_metadata: BTreeMap::new(),

@@ -7,25 +7,24 @@
 //! carries no bytes and no offset payload past the wire message itself — it
 //! only tells a subscriber "topic T may have advanced; go check" via
 //! [`crate::trigger::LiveEvent::Wake`], the same signal every driver's lag
-//! path already emits. `register_topic`/`drop_topic` are no-ops (F14): there
+//! path already emits. `register_topic`/`drop_topic` are no-ops: there
 //! is nothing for this driver to own per topic beyond the in-process wake
 //! fan-out `subscribe` lazily creates.
 //!
-//! # Connections (I6)
+//! # Connections
 //!
 //! Up to THREE Postgres connections per process, all dedicated to this
 //! broker and never shared with the catalog backend's own pool (the catalog
-//! backend is constructed first and is a private pool, `backend_postgres.rs`;
-//! F9):
+//! backend is constructed first and is a private pool, `backend_postgres.rs`):
 //!
 //! - **one** dedicated connection for [`sqlx::postgres::PgListener`], which
 //!   `LISTEN`s on the single channel `jammi_trigger` for the process's
 //!   lifetime;
 //! - **up to two** in a small pool used only to `SELECT pg_notify(...)` from
-//!   the coalescing wake task (G9) — never from the publish path itself,
+//!   the coalescing wake task — never from the publish path itself,
 //!   so `publish` enqueues and returns without waiting on a NOTIFY round-trip.
 //!
-//! # Same-database rule (G12)
+//! # Same-database rule
 //!
 //! Every replica's `[broker.postgres] url` MUST point at the SAME database:
 //! `NOTIFY` is scoped to one Postgres instance, and a replica listening on a
@@ -34,7 +33,7 @@
 //! table — but live delivery latency degrades to the poll interval with no
 //! error surfaced, because there is nothing to detect from either side).
 //!
-//! # Listener mechanics (F5/I5)
+//! # Listener mechanics
 //!
 //! The listener task never exits. It drives [`PgListener::try_recv`]
 //! concurrently with an idle-tick timer (`tokio::select!`):
@@ -47,16 +46,16 @@
 //! every topic every `idle_poll` regardless, bounding how long a lost NOTIFY
 //! (a notify-queue overflow, a missed reconnect window) can go undetected.
 //!
-//! # Pool budget (J8)
+//! # Pool budget
 //!
 //! Each `TopicTail` replay (`crate::trigger::tail`) holds one CATALOG-pool
 //! connection for its chunked replay — never one of this broker's own
 //! connections. With one tail per `(topic, tenant)` per process, the
 //! concurrent-replay bound is the catalog pool size (see
-//! `crate::trigger::tail::TailRegistry::new`'s semaphore, K1); size
-//! `[catalog.postgres].pool_size` for the expected number of concurrent
-//! tenant tails plus writers, independent of this broker's own three-
-//! connection budget.
+//! `crate::trigger::tail::TailRegistry::new`'s semaphore, sized
+//! `pool_size - 2` (min 1)); size `[catalog.postgres].pool_size` for the
+//! expected number of concurrent tenant tails plus writers, independent of
+//! this broker's own three-connection budget.
 
 use std::collections::HashMap;
 use std::str::FromStr;
@@ -85,11 +84,11 @@ use crate::trigger::topic::TopicDefinition;
 
 /// The single NOTIFY channel every replica LISTENs on and NOTIFYs into.
 const NOTIFY_CHANNEL: &str = "jammi_trigger";
-/// Depth of the coalescing wake queue (G9): bounded so a publish storm can
+/// Depth of the coalescing wake queue: bounded so a publish storm can
 /// never make `publish` block on the NOTIFY path. An overflow simply drops —
-/// the idle tick (I5) is the net that catches it.
+/// the idle tick is the net that catches it.
 const WAKE_QUEUE_CAPACITY: usize = 1024;
-/// Per-topic Wake fan-out capacity. `Wake` carries no state to lose (F7), so
+/// Per-topic Wake fan-out capacity. `Wake` carries no state to lose, so
 /// a lagged receiver here just means "check again" — this only needs to
 /// absorb bursts between a subscriber's own `poll_next` calls.
 const WAKE_BROADCAST_CAPACITY: usize = 64;
@@ -153,7 +152,7 @@ impl PostgresBroker {
     /// connection string) with the given idle-tick interval. `idle_poll` must
     /// be non-zero — the bound that caps how long a lost NOTIFY can go
     /// undetected; a zero interval would busy-loop. The config layer's
-    /// `[broker.postgres] idle_poll_secs: u64` (K2: `>= 1`) is the only
+    /// `[broker.postgres] idle_poll_secs: u64` (validated `>= 1`) is the only
     /// production path into this constructor and always produces a
     /// whole-second, non-zero `Duration` once validated; this constructor
     /// itself accepts any non-zero `Duration` (including sub-second) for
@@ -224,8 +223,8 @@ impl PostgresBroker {
     /// arms the broker so the very next [`TriggerBroker::publish`] call skips
     /// enqueueing its wake — simulating a NOTIFY Postgres itself silently
     /// dropped (its own notify queue overflowed; a listener mid-reconnect) —
-    /// so the idle-tick fallback (PLAN-F §5(g)) is exercised deterministically
-    /// rather than depending on actually losing a real NOTIFY.
+    /// so the idle-tick fallback is exercised deterministically rather than
+    /// depending on actually losing a real NOTIFY.
     pub fn suppress_next_notify_for_testing(&self) {
         self.suppress_next_notify.store(true, Ordering::SeqCst);
     }
@@ -244,7 +243,7 @@ impl Drop for PostgresBroker {
 #[async_trait]
 impl TriggerBroker for PostgresBroker {
     async fn register_topic(&self, _topic: &TopicDefinition) -> Result<(), TriggerError> {
-        // No-op (F14): this driver owns no per-topic state until `subscribe`
+        // No-op: this driver owns no per-topic state until `subscribe`
         // lazily creates the topic's wake fan-out. Schema conflict detection
         // is the engine's job (`TopicRepo::register_topic`).
         Ok(())
@@ -271,7 +270,7 @@ impl TriggerBroker for PostgresBroker {
         if self.suppress_next_notify.swap(false, Ordering::SeqCst) {
             return Ok(Offset::new(offset, produced_at));
         }
-        // Best-effort enqueue (G9): a full queue means many topics already
+        // Best-effort enqueue: a full queue means many topics already
         // have a pending NOTIFY in flight; the idle tick covers the drop.
         let _ = self.wake_tx.try_send((topic_id, offset));
         Ok(Offset::new(offset, produced_at))
@@ -287,7 +286,7 @@ impl TriggerBroker for PostgresBroker {
         // consulted (broker.rs's trait doc): filtering happens in the
         // engine's replay, and this driver never refuses a start point — it
         // always yields `Wake` first and lets the engine's replay honour
-        // `from_offset` (F2/G3).
+        // `from_offset`.
         let subscription_id = SubscriptionId::new();
         let tracker = Arc::new(ConsumerTracker {
             consumer_name: subscription_id.to_string(),
@@ -322,7 +321,7 @@ impl TriggerBroker for PostgresBroker {
                         }
                         yield LiveEvent::Wake;
                     }
-                    // Wake carries no state to lose (F7) -- a lagged
+                    // Wake carries no state to lose -- a lagged
                     // receiver here still just means "check again".
                     Err(broadcast::error::RecvError::Lagged(_)) => {
                         yield LiveEvent::Wake;
@@ -374,7 +373,7 @@ impl TriggerBroker for PostgresBroker {
 
 /// Drains the wake queue, coalescing repeated wakes for the same topic
 /// (last-offset-wins) so a publish burst issues one `pg_notify` per topic per
-/// drain rather than one per publish (G9). Never exits — a `pg_notify`
+/// drain rather than one per publish. Never exits — a `pg_notify`
 /// failure is logged and the idle tick covers it (the next drain retries
 /// naturally on the next enqueued wake).
 async fn coalesce_loop(notify_pool: PgPool, mut rx: mpsc::Receiver<(TopicId, u64)>) {
@@ -403,7 +402,7 @@ async fn coalesce_loop(notify_pool: PgPool, mut rx: mpsc::Receiver<(TopicId, u64
 }
 
 /// Drives `PgListener::try_recv` concurrently with an idle-tick timer. Never
-/// exits (I5) — see the module docs for the full state table.
+/// exits — see the module docs for the full state table.
 async fn listener_loop(mut listener: PgListener, topics: Topics, idle_poll: Duration) {
     let mut idle_ticker = tokio::time::interval(idle_poll);
     idle_ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
@@ -495,7 +494,7 @@ mod tests {
         assert!(parse_payload(&format!("{topic_id}")).is_none());
     }
 
-    /// K2 edge: `idle_poll_secs` must be `>= 1`. Fails before any network
+    /// Validation edge: `idle_poll_secs` must be `>= 1`. Fails before any network
     /// call, so this needs no live Postgres.
     #[tokio::test]
     async fn connect_rejects_zero_idle_poll() {
@@ -511,7 +510,7 @@ mod tests {
         }
     }
 
-    /// K2 edge: `url` must be a `postgres://`/`postgresql://` URL. Fails
+    /// Validation edge: `url` must be a `postgres://`/`postgresql://` URL. Fails
     /// before any network call, so this needs no live Postgres.
     #[tokio::test]
     async fn connect_rejects_non_postgres_url() {

@@ -1,4 +1,4 @@
-//! `[broker.postgres]` config resolution (PLAN-F §4/K2/G5, contract item 2).
+//! `[broker.postgres]` config resolution (contract item 2).
 //!
 //! Hermetic: every test here fails (or defaults) before any network call —
 //! `PostgresBroker::connect` validates `idle_poll_secs`/`url` shape before
@@ -60,7 +60,7 @@ fn broker_postgres_bogus_key_refuses_naming_it() {
     assert!(msg.contains("bogus"), "{msg}");
 }
 
-/// K2 + PLAN-F §4: `[broker.postgres]` with no `url`, over a SQLite catalog,
+/// `[broker.postgres]` with no `url`, over a SQLite catalog,
 /// is a typed config error naming BOTH keys — there is no default to fall
 /// back to. Never touches the network: the check runs before
 /// `PostgresBroker::connect`.
@@ -81,7 +81,7 @@ async fn sqlite_catalog_and_no_broker_url_names_both_keys() {
     assert!(msg.contains("catalog.postgres"), "{msg}");
 }
 
-/// K2 edge: `idle_poll_secs = 0` is a typed config error. Never touches the
+/// Validation edge: `idle_poll_secs = 0` is a typed config error. Never touches the
 /// network: `PostgresBroker::connect` validates this before dialing.
 #[tokio::test]
 async fn idle_poll_secs_zero_is_a_typed_config_error() {
@@ -99,7 +99,7 @@ async fn idle_poll_secs_zero_is_a_typed_config_error() {
     assert!(msg.contains(">= 1"), "{msg}");
 }
 
-/// K2 edge: a non-`postgres://` `url` is a typed config error. Never touches
+/// Validation edge: a non-`postgres://` `url` is a typed config error. Never touches
 /// the network: `PostgresBroker::connect` validates the scheme before
 /// dialing.
 #[tokio::test]

@@ -1,6 +1,5 @@
-//! Escape row esc-F2 (issue-triage symptom_spec; PLAN-F F1/G1/H4,
-//! `<eval-verdict>` F15(ii)): **`register_topic` accepts column types
-//! publish/replay cannot handle**.
+//! Escape row esc-100-trigger-replay-folds-declared-column-types:
+//! **`register_topic` accepts column types publish/replay cannot handle**.
 //!
 //! Symptom: `topic_repo.rs` accepts 13 Arrow column types (Boolean,
 //! Int8/16/32/64, UInt8/16/32/64, Float32/64, Utf8, Binary), but before this
@@ -83,12 +82,12 @@ async fn every_accepted_type_round_trips_through_replay() {
     );
     let subscriber = Subscriber::new(Arc::clone(&broker), Arc::clone(&registry));
 
-    // K6: register through `TopicRepo::register_topic` -- the persisted
+    // Register through `TopicRepo::register_topic` -- the persisted
     // type-name table, not an in-process `TopicDefinition` -- so the oracle
     // pins the actual catalog round-trip, not just the in-memory shape.
     let topic = TopicDefinition {
         id: TopicId::new(),
-        name: "esc_f2.every_type".to_string(),
+        name: "esc_100.every_type".to_string(),
         schema: topic_schema(),
         tenant: None,
         broker_metadata: BTreeMap::new(),
@@ -215,7 +214,7 @@ async fn uint64_above_i64_max_is_refused_at_publish() {
     )]));
     let topic = TopicDefinition {
         id: TopicId::new(),
-        name: "esc_f2.uint64_overflow".to_string(),
+        name: "esc_100.uint64_overflow".to_string(),
         schema: Arc::clone(&schema),
         tenant: None,
         broker_metadata: BTreeMap::new(),

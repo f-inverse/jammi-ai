@@ -238,10 +238,10 @@ message SchemaError {
 // `BackendErrorDetail` — the same faithful taxonomies `JammiErrorDetail` reuses.
 // No `TriggerError` variant degrades to a lossy string.
 message TriggerErrorDetail {
-  // `TriggerError::OffsetEvicted` is removed (PLAN-F F8/§1): no driver
-  // surfaces an eviction error any more — a driver that cannot start at or
-  // before the requested offset (or a lagging receiver) self-heals via
-  // `LiveEvent::Wake` instead. Field 9 retired, not reused.
+  // `TriggerError::OffsetEvicted` is removed: no driver surfaces an eviction
+  // error any more — a driver that cannot start at or before the requested
+  // offset (or a lagging receiver) self-heals via `LiveEvent::Wake` instead.
+  // Field 9 retired, not reused.
   reserved 9;
   reserved "offset_evicted";
   oneof variant {

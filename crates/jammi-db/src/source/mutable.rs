@@ -6,6 +6,7 @@ use std::sync::Arc;
 use arrow::array::RecordBatch;
 use datafusion::catalog::TableProvider;
 use futures::Stream;
+use tokio::sync::Semaphore;
 
 use crate::catalog::backend::{BackendError, Transaction, TxOptions};
 use crate::catalog::mutable_repo::{delete_mutable_table_rows, MutableRowPayload};
@@ -25,6 +26,17 @@ pub struct MutableTableRegistry {
     catalog: Arc<Catalog>,
     backend: Arc<dyn MutableBackend>,
     tenant: TenantBinding,
+    /// Bounds concurrent trigger-stream replays against this backend's
+    /// connection pool — sized `pool_size - 2` (min 1), leaving headroom for
+    /// the write path's own connection use. Acquired inside [`Self::tail_replay`]
+    /// (never at each call site), so every replay caller against this pool —
+    /// the trigger tail's own driver-triggered replay
+    /// (`crate::trigger::tail::replay_and_fan_out`), a lagging subscriber's
+    /// own replay (`crate::trigger::tail::lag_replay`), and `Subscriber`'s
+    /// subscribe-time backing-table drain — is bounded through the SAME
+    /// permit pool and none of them can start an unbounded number of
+    /// concurrent replays that would starve publishers of pool connections.
+    replay_permits: Arc<Semaphore>,
 }
 
 impl MutableTableRegistry {
@@ -33,10 +45,13 @@ impl MutableTableRegistry {
         backend: Arc<dyn MutableBackend>,
         tenant: TenantBinding,
     ) -> Self {
+        let pool_size = backend.catalog_backend().pool_size();
+        let permits = pool_size.saturating_sub(2).max(1) as usize;
         Self {
             catalog,
             backend,
             tenant,
+            replay_permits: Arc::new(Semaphore::new(permits)),
         }
     }
 
@@ -317,6 +332,14 @@ impl MutableTableRegistry {
     /// `def` and `order_col` are resolved by the caller ONCE via
     /// [`Self::definition_for_tenant`], before this call, so a tail never
     /// holds two connections.
+    ///
+    /// Acquires a permit from [`Self::replay_permits`] BEFORE opening the
+    /// transaction below and holds it for the transaction's full duration —
+    /// this is the ONE place every trigger-stream replay path (the tail's
+    /// own driver-triggered replay, a lagging subscriber's own replay, and a
+    /// fresh subscriber's subscribe-time backing-table drain) is bounded, so
+    /// no caller of this method can bypass the bound by calling some other,
+    /// unbounded entry point.
     pub(crate) async fn tail_replay(
         &self,
         def: &MutableTableDefinition,
@@ -325,6 +348,11 @@ impl MutableTableRegistry {
         cursor_before: i64,
         chunk_size: usize,
     ) -> Result<(Vec<RecordBatch>, i64), MutableTableError> {
+        let _permit = self
+            .replay_permits
+            .acquire()
+            .await
+            .expect("replay semaphore is never closed: `MutableTableRegistry` owns it for its own lifetime and never calls `Semaphore::close`");
         let backend = Arc::clone(&self.backend);
         let def = def.clone();
         let order_col = order_col.to_string();

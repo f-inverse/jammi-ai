@@ -33,9 +33,13 @@
 //! `_offset > cursor AND _offset <= H` in groups that never split an
 //! `_offset` publish across chunks, and on a full drain advances the cursor
 //! to `H` (see [`crate::source::mutable::MutableTableRegistry::tail_replay`]
-//! for the SQL). Concurrent tail replays across the process are bounded by a
-//! semaphore sized `pool_size - 2` (min 1) so they can never starve
-//! publishers of pool connections.
+//! for the SQL). `tail_replay` itself acquires a permit from a semaphore
+//! owned by the [`MutableTableRegistry`] — sized `pool_size - 2` (min 1) —
+//! before opening its transaction, so every replay caller against that
+//! backend's pool (a tail's own driver-triggered replay, a lagging
+//! subscriber's own replay via [`lag_replay`], and `Subscriber`'s
+//! subscribe-time backing-table drain) is bounded through the SAME permit
+//! pool and none of them can starve publishers of pool connections.
 //!
 //! ## Tenant scope
 //!
@@ -56,7 +60,7 @@ use std::sync::{Arc, Weak};
 
 use arrow_schema::SchemaRef;
 use futures::StreamExt;
-use tokio::sync::{broadcast, Mutex as AsyncMutex, Semaphore};
+use tokio::sync::{broadcast, Mutex as AsyncMutex};
 use tokio::task::JoinHandle;
 
 use crate::source::mutable::MutableTableRegistry;
@@ -114,21 +118,12 @@ type TailKey = (TopicId, Option<TenantId>);
 /// [`crate::trigger::Subscriber`].
 pub(crate) struct TailRegistry {
     tails: AsyncMutex<HashMap<TailKey, Weak<TopicTail>>>,
-    /// Bounds concurrent tail replays — sized `pool_size - 2` (min 1) — so
-    /// they can never starve publishers of pool connections on either
-    /// backend.
-    replay_permits: Arc<Semaphore>,
 }
 
 impl TailRegistry {
-    /// `pool_size` is the catalog backend's `max_connections`; the replay
-    /// semaphore is sized `pool_size - 2` (min 1), leaving headroom
-    /// for the write path's own connection use.
-    pub(crate) fn new(pool_size: u32) -> Self {
-        let permits = pool_size.saturating_sub(2).max(1) as usize;
+    pub(crate) fn new() -> Self {
         Self {
             tails: AsyncMutex::new(HashMap::new()),
-            replay_permits: Arc::new(Semaphore::new(permits)),
         }
     }
 
@@ -158,14 +153,7 @@ impl TailRegistry {
             let rx = existing.attach();
             return Ok((existing, rx));
         }
-        let created = spawn_tail(
-            broker,
-            mutable,
-            topic,
-            tenant,
-            Arc::clone(&self.replay_permits),
-        )
-        .await?;
+        let created = spawn_tail(broker, mutable, topic, tenant).await?;
         let rx = created.attach();
         tails.insert(key, Arc::downgrade(&created));
         Ok((created, rx))
@@ -183,7 +171,6 @@ async fn spawn_tail(
     mutable: &Arc<MutableTableRegistry>,
     topic: &TopicDefinition,
     tenant: Option<TenantId>,
-    replay_permits: Arc<Semaphore>,
 ) -> Result<Arc<TopicTail>, TriggerError> {
     let driver = broker
         .subscribe(topic.id, Predicate::match_all(), None)
@@ -218,7 +205,6 @@ async fn spawn_tail(
         tenant,
         user_schema,
         initial_cursor,
-        replay_permits,
     ));
 
     Ok(Arc::new(TopicTail { sender, task }))
@@ -281,7 +267,6 @@ async fn run_tail_loop(
     tenant: Option<TenantId>,
     user_schema: SchemaRef,
     initial_cursor: i64,
-    replay_permits: Arc<Semaphore>,
 ) {
     let mut cursor = initial_cursor;
     loop {
@@ -310,7 +295,6 @@ async fn run_tail_loop(
                         cursor,
                         &user_schema,
                         &sender,
-                        &replay_permits,
                     )
                     .await;
                 }
@@ -325,7 +309,6 @@ async fn run_tail_loop(
                     cursor,
                     &user_schema,
                     &sender,
-                    &replay_permits,
                 )
                 .await;
             }
@@ -345,7 +328,6 @@ async fn run_tail_loop(
                     cursor,
                     &user_schema,
                     &sender,
-                    &replay_permits,
                 )
                 .await;
             }
@@ -353,11 +335,12 @@ async fn run_tail_loop(
     }
 }
 
-/// Acquire a replay permit, run one [`MutableTableRegistry::tail_replay`]
-/// round, reassemble the rows into whole-publish [`DeliveredBatch`]es, fan
-/// them out, and return the new cursor. On any replay error the cursor is
-/// left unchanged (never advanced past rows that were never actually
-/// delivered) — the next `Wake` or gap retries.
+/// Run one [`MutableTableRegistry::tail_replay`] round — which itself
+/// acquires this backend's replay permit before opening its transaction, see
+/// that method's docs — reassemble the rows into whole-publish
+/// [`DeliveredBatch`]es, fan them out, and return the new cursor. On any
+/// replay error the cursor is left unchanged (never advanced past rows that
+/// were never actually delivered) — the next `Wake` or gap retries.
 #[allow(clippy::too_many_arguments)]
 async fn replay_and_fan_out(
     mutable: &Arc<MutableTableRegistry>,
@@ -367,12 +350,7 @@ async fn replay_and_fan_out(
     cursor_before: i64,
     user_schema: &SchemaRef,
     sender: &broadcast::Sender<DeliveredBatch>,
-    replay_permits: &Arc<Semaphore>,
 ) -> i64 {
-    let _permit = match replay_permits.acquire().await {
-        Ok(p) => p,
-        Err(_) => return cursor_before, // semaphore closed only if the registry itself is gone.
-    };
     match mutable
         .tail_replay(def, order_col, tenant, cursor_before, REPLAY_CHUNK_SIZE)
         .await

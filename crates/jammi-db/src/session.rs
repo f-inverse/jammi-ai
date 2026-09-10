@@ -1084,6 +1084,22 @@ async fn build_broker_from_config(config: &JammiConfig) -> Result<Arc<dyn Trigge
             url,
             idle_poll_secs,
         } => {
+            // Validated at THIS config seam, before `PostgresBroker::connect`
+            // is ever reached, so both edges surface as a typed
+            // `JammiError::Config` (matching the no-`url`-over-SQLite-catalog
+            // case just below) rather than `PostgresBroker::connect`'s own
+            // `TriggerError::Driver`, which `?` would otherwise wrap in
+            // `JammiError::Trigger` — a different variant whose `Display`
+            // text happens to overlap but which a caller matching on the
+            // variant (rather than substring-matching the message) would
+            // never see as `Config`.
+            if *idle_poll_secs == 0 {
+                return Err(JammiError::Config(
+                    "[broker.postgres] idle_poll_secs must be >= 1 (a zero interval is a \
+                     busy-loop)"
+                        .into(),
+                ));
+            }
             let resolved_url = match url {
                 Some(u) => u.expose().to_string(),
                 None => match &config.catalog {
@@ -1100,6 +1116,13 @@ async fn build_broker_from_config(config: &JammiConfig) -> Result<Arc<dyn Trigge
                     }
                 },
             };
+            if !(resolved_url.starts_with("postgres://")
+                || resolved_url.starts_with("postgresql://"))
+            {
+                return Err(JammiError::Config(
+                    "[broker.postgres] url must be a postgres:// (or postgresql://) URL".into(),
+                ));
+            }
             let broker =
                 PostgresBroker::connect(&resolved_url, Duration::from_secs(*idle_poll_secs))
                     .await?;

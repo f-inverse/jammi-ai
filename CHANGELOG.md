@@ -274,7 +274,12 @@ workspace ships every publishable crate at the same
   a replay regardless — never data loss. `ServerInfo` gains `string broker = 5`
   (`crates/jammi-wire/proto/jammi/v1/catalog.proto`): the RUNTIME driver kind
   (`in_memory`/`jet_stream`/`postgres`) every deployment now reports, identically for an
-  embedded and a remote client built from the same config.
+  embedded and a remote client built from the same config. Additive public surface this
+  lands alongside the broker: `MutableTableRegistry::definition_for_tenant`
+  (`crates/jammi-db/src/source/mutable.rs`), `Subscription::id`/`SubscriptionId`
+  (`crates/jammi-db/src/trigger/{subscription,ids}.rs`), `PostgresBroker`
+  (`crates/jammi-db/src/trigger/postgres.rs`), and the test-only
+  `PostgresBroker::suppress_next_notify_for_testing` hook.
 
 ### Changed
 - **Persisted cloud credentials are `Secret`-typed and inline-only on read (breaking Rust
@@ -871,10 +876,16 @@ workspace ships every publishable crate at the same
   hold the engine `_offset`, not a driver-native sequence, on every driver including JetStream (it
   now decodes the engine offset from the delivered message's header rather than reporting its own
   stream sequence) — a native sequence is meaningless across drivers and cannot prime a restored
-  broker's `subscribe(from_offset = …)` correctly. `list_consumers` also changes CARDINALITY: it
-  now enumerates one consumer per `(topic, tenant)` this process has ever served a subscriber for
-  (one `TopicTail`), not one per individual caller-level subscription — `N` engine subscribers of
-  the same topic/tenant share one driver-level consumer.
+  broker's `subscribe(from_offset = …)` correctly. Both fields also change Rust type from `u64` to
+  `Option<u64>`: `None` names a driver that could not resolve an engine offset for a consumer (a
+  message aged out of retention before the translation ran, or — for `PostgresBroker`, whose
+  fan-out is a bare wake-up signal with no delivered offset — a consumer that has never yet
+  observed a NOTIFY payload carrying one) — never a fabricated `0`, which the never-woken case
+  would otherwise be indistinguishable from `_offset = 0` (a real, first-published row).
+  `list_consumers` also changes CARDINALITY: it now enumerates one consumer per `(topic, tenant)`
+  this process has ever served a subscriber for (one `TopicTail`), not one per individual
+  caller-level subscription — `N` engine subscribers of the same topic/tenant share one
+  driver-level consumer.
 - **`BrokerKind` gains a `Postgres` variant** (`crates/jammi-db/src/trigger/broker.rs`). The enum
   is not `#[non_exhaustive]`, so an exhaustive out-of-tree `match` over it must add the arm.
 - **`Publisher::publish_scoped` rejects an empty batch** (`crates/jammi-db/src/trigger/publisher.rs`)

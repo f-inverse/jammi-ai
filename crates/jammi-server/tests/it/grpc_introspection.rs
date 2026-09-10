@@ -31,10 +31,10 @@ use jammi_ai::{Modality, ServerInfo, Session, SourceDescriptor};
 use jammi_db::catalog::result_repo::ResultTableKind;
 use jammi_db::source::{FileFormat, SourceConnection, SourceType};
 use jammi_db::store::CachePolicy;
-use jammi_test_utils::{cookbook_fixture, fixture};
+use jammi_test_utils::{cookbook_fixture, fixture, pg_url_for_tests};
 use tonic::transport::Endpoint;
 
-use super::common::grpc::{start_engine_server, EngineServer};
+use super::common::grpc::{start_engine_server, start_engine_server_with_broker, EngineServer};
 
 fn tiny_bert_model_id() -> String {
     format!("local:{}", cookbook_fixture("tiny_bert").display())
@@ -327,6 +327,52 @@ async fn remote_server_info_like_local() {
     assert_eq!(
         local_info.broker, "in_memory",
         "this fixture's config selects the default in-process broker"
+    );
+
+    let _ = server.shutdown.send(());
+    let _ = server.handle.await;
+}
+
+/// K4, non-default arm: `remote_server_info_like_local` above only exercises
+/// this fixture's config DEFAULT (`in_memory`) -- a bug that special-cased
+/// the default kind (or a `ServerInfo.broker` wiring that silently ignored
+/// the config and always reported `in_memory`) would still pass it. Here the
+/// embedded session and the remote server are built from the SAME
+/// `[broker.postgres]` config, over a real Postgres database, and both must
+/// report `"postgres"` — proving the runtime broker fact actually reflects
+/// the config on a kind other than the default. Live: requires
+/// `JAMMI_TEST_PG_URL`; skips (never `#[ignore]`) otherwise, matching every
+/// other pg-gated oracle in the workspace.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn remote_server_info_reports_postgres_broker_kind() {
+    let Some(url) = pg_url_for_tests() else {
+        eprintln!(
+            "skipping remote_server_info_reports_postgres_broker_kind: JAMMI_TEST_PG_URL unset"
+        );
+        return;
+    };
+    let broker = jammi_db::config::BrokerConfig::Postgres {
+        url: Some(jammi_db::config::Secret::from(url)),
+        idle_poll_secs: 5,
+    };
+    let server = start_engine_server_with_broker(broker).await;
+    let remote = remote(&server).await;
+    let local = local(&server);
+
+    let remote_info = remote.server_info().await.expect("remote server_info");
+    let local_info = local.server_info().await.expect("local server_info");
+
+    assert_eq!(
+        local_info.broker, "postgres",
+        "the embedded session must report the runtime postgres broker kind"
+    );
+    assert_eq!(
+        remote_info.broker, "postgres",
+        "the remote server must report the same runtime broker kind as the embedded session"
+    );
+    assert_eq!(
+        local_info.broker, remote_info.broker,
+        "embedded and remote must agree on the runtime broker kind for a non-default config"
     );
 
     let _ = server.shutdown.send(());

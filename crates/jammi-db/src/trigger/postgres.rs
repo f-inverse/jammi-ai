@@ -113,8 +113,15 @@ struct ConsumerTracker {
     /// whose `last_delivered`/`last_acked` are authoritative because they
     /// carry the batch — this value can lag or skip (a coalesced or dropped
     /// NOTIFY, an idle-tick wake) and must never be read as "the last engine
-    /// offset this consumer has replayed".
+    /// offset this consumer has replayed". `0` is a legitimate engine
+    /// offset (the very first published row), so it can never double as
+    /// "never seen one" — [`Self::has_seen_offset`] is the actual presence
+    /// bit; see [`TriggerBroker::list_consumers`]'s `None` contract.
     last_seen_offset: AtomicU64,
+    /// Whether a NOTIFY payload carrying an offset has ever been observed —
+    /// the presence bit `last_seen_offset` alone cannot provide (its `0`
+    /// initial value is indistinguishable from a real offset `0`).
+    has_seen_offset: AtomicBool,
 }
 
 /// One topic's in-process Wake fan-out plus the consumers currently attached
@@ -292,6 +299,7 @@ impl TriggerBroker for PostgresBroker {
             consumer_name: subscription_id.to_string(),
             topic_id,
             last_seen_offset: AtomicU64::new(0),
+            has_seen_offset: AtomicBool::new(false),
         });
 
         let mut rx = {
@@ -318,6 +326,7 @@ impl TriggerBroker for PostgresBroker {
                     Ok(offset) => {
                         if let Some(o) = offset {
                             tracker.last_seen_offset.fetch_max(o, Ordering::Relaxed);
+                            tracker.has_seen_offset.store(true, Ordering::Relaxed);
                         }
                         yield LiveEvent::Wake;
                     }
@@ -351,12 +360,19 @@ impl TriggerBroker for PostgresBroker {
         let mut snapshots = Vec::with_capacity(state.consumers.len());
         state.consumers.retain(|w| {
             if let Some(tracker) = w.upgrade() {
-                let last = tracker.last_seen_offset.load(Ordering::Relaxed);
+                // `None` until a NOTIFY payload carrying an offset has
+                // actually been seen — never a fabricated `0` for a
+                // never-woken consumer (`ConsumerOffsetSnapshot`'s own
+                // doc contract, mirrored by every other driver).
+                let last = tracker
+                    .has_seen_offset
+                    .load(Ordering::Relaxed)
+                    .then(|| tracker.last_seen_offset.load(Ordering::Relaxed));
                 snapshots.push(ConsumerOffsetSnapshot {
                     consumer_name: tracker.consumer_name.clone(),
                     topic_id: tracker.topic_id,
-                    last_delivered_offset: Some(last),
-                    last_acked_offset: Some(last),
+                    last_delivered_offset: last,
+                    last_acked_offset: last,
                 });
                 true
             } else {

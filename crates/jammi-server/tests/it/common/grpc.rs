@@ -415,3 +415,29 @@ pub async fn start_engine_server_with_run_worker(run_worker: bool) -> EngineServ
         engine,
     }
 }
+
+/// Spin up the SAME engine-backed server [`start_engine_server`] does
+/// (identical tier set, identical chain, identical eager bind), but with
+/// `[broker]` overridden to `broker` instead of the config default
+/// (in-process). Used by the K4 oracle that exercises a NON-DEFAULT runtime
+/// broker kind end to end — both the embedded session and the remote server
+/// built from the SAME config must report the identical runtime broker
+/// (`grpc_introspection.rs`).
+pub async fn start_engine_server_with_broker(
+    broker: jammi_db::config::BrokerConfig,
+) -> EngineServer {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let mut cfg = test_config(dir.path());
+    cfg.broker = broker;
+    let (chain, engine) = engine_chain_from_config(ephemeral_addr(), non_event_tiers(), cfg).await;
+    let (shutdown_tx, shutdown_rx) = oneshot::channel::<()>();
+    let (addr, handle) = spawn_bound_chain(chain, shutdown_rx).await;
+
+    EngineServer {
+        addr,
+        shutdown: shutdown_tx,
+        _dir: dir,
+        handle,
+        engine,
+    }
+}

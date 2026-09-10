@@ -27,7 +27,9 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use arrow::array::{
-    Array, BinaryArray, Float32Array, Int32Array, Int64Array, RecordBatch, UInt16Array, UInt64Array,
+    Array, BinaryArray, BooleanArray, Float32Array, Float64Array, Int16Array, Int32Array,
+    Int64Array, Int8Array, RecordBatch, StringArray, UInt16Array, UInt32Array, UInt64Array,
+    UInt8Array,
 };
 use arrow_schema::{DataType, Field, Schema, SchemaRef};
 use futures::StreamExt;
@@ -45,8 +47,8 @@ use jammi_db::tenant_scope::TenantBinding;
 #[cfg(feature = "jetstream-broker")]
 use jammi_db::trigger::JetStreamBroker;
 use jammi_db::trigger::{
-    InMemoryBroker, Offset, PostgresBroker, Predicate, Publisher, Subscriber, TopicDefinition,
-    TopicId, TriggerBroker,
+    InMemoryBroker, LiveEvent, Offset, PostgresBroker, Predicate, Publisher, Subscriber,
+    TopicDefinition, TopicId, TriggerBroker,
 };
 use test_case::test_case;
 
@@ -396,6 +398,91 @@ async fn from_offset_in_past_replay_and_live_overlap_no_duplicates(arm: Arm) {
     assert_eq!(
         seen, expected,
         "replay prefix + live overlap must yield every offset exactly once, no duplicates, no gaps"
+    );
+}
+
+/// Adversarial regression: a publish committing WHILE `subscribe` is
+/// between its replay/watermark reads and its tail attach must still reach
+/// this subscriber live, never be silently dropped. Distinct from
+/// [`from_offset_in_past_replay_and_live_overlap_no_duplicates`] above,
+/// whose writer publishes strictly BEFORE `subscribe` returns: here the
+/// writer races the `subscribe` call itself, concurrently, for its entire
+/// duration. A wide pre-existing history (`HISTORY`) widens the window
+/// `drain_replay`'s materialise/decode/group work takes, giving the
+/// concurrent writer a real chance to land a commit inside it.
+#[test_case(Arm::InMemory ; "in_memory")]
+#[test_case(Arm::Postgres ; "postgres")]
+#[cfg_attr(feature = "jetstream-broker", test_case(Arm::JetStream ; "jetstream"))]
+#[tokio::test]
+async fn publish_racing_subscribe_is_never_lost(arm: Arm) {
+    use std::sync::atomic::{AtomicBool, Ordering};
+
+    let broker = broker_or_skip!(arm, "publish_racing_subscribe_is_never_lost");
+    let h = Arc::new(build_harness(broker).await);
+    let topic = topic_def("parity.subscribe_race");
+    h.broker.register_topic(&topic).await.unwrap();
+    h.topic_repo.register_topic(&topic).await.unwrap();
+
+    const HISTORY: i64 = 1500;
+    for i in 0..HISTORY {
+        h.publisher
+            .publish_scoped(&topic, None, batch_of(&[i]))
+            .await
+            .unwrap();
+    }
+
+    let stop = Arc::new(AtomicBool::new(false));
+    let stop_w = Arc::clone(&stop);
+    let h_w = Arc::clone(&h);
+    let topic_w = topic.clone();
+    let writer = tokio::spawn(async move {
+        let mut i = 10_000i64;
+        while !stop_w.load(Ordering::Relaxed) {
+            h_w.publisher
+                .publish_scoped(&topic_w, None, batch_of(&[i]))
+                .await
+                .unwrap();
+            i += 1;
+            tokio::task::yield_now().await;
+        }
+    });
+
+    // Races the concurrent writer above: `subscribe` itself, not merely a
+    // publish before or after it.
+    let mut sub = h
+        .subscriber
+        .subscribe(
+            &topic,
+            Predicate::match_all(),
+            Some(Offset::new(0, chrono::Utc::now())),
+        )
+        .await
+        .unwrap();
+
+    const WANT: usize = HISTORY as usize + 40;
+    let mut seen: Vec<u64> = Vec::new();
+    while seen.len() < WANT {
+        let delivered = next_with_timeout(&mut sub)
+            .await
+            .expect("stream ended early")
+            .unwrap();
+        seen.push(delivered.offset.value());
+    }
+    stop.store(true, Ordering::Relaxed);
+    let _ = writer.await;
+
+    let expected: Vec<u64> = (0..WANT as u64).collect();
+    let gaps: Vec<u64> = expected
+        .iter()
+        .copied()
+        .filter(|o| !seen.contains(o))
+        .collect();
+    assert!(
+        gaps.is_empty(),
+        "subscribe(from_offset = 0) must skip no engine offset; missing {gaps:?}; \
+         first delivered = {:?}, delivered count = {}",
+        seen.first(),
+        seen.len()
     );
 }
 
@@ -785,9 +872,20 @@ async fn offset_order_equals_commit_order_two_sessions_one_postgres() {
         publish_and_log(&session_b, &topic, 2, N, &commit_log),
     );
 
-    let mut commit_order = commit_log.lock().await.clone();
-    commit_order.sort_by_key(|(off, _)| *off);
-    let offsets: Vec<u64> = commit_order.iter().map(|(off, _)| *off).collect();
+    // `commit_order` is the log in TRUE commit order (append order, under
+    // the shared lock in `publish_and_log`) — kept UNSORTED and untouched
+    // from here on, so the replay-order assertion below actually compares
+    // against real commit order rather than against itself re-derived from
+    // a sorted copy. `sorted_by_offset` is a SEPARATE clone (the pattern
+    // `two_publishers_over_one_broker_deliver_gap_free_in_order` above uses
+    // for `seen`/`sorted`): sorting it in place would otherwise silently
+    // launder a reversed or reordered log into "already sorted", since
+    // `expected_seq` below would then be re-derived from the sorted copy
+    // instead of the true commit order.
+    let commit_order = commit_log.lock().await.clone();
+    let mut sorted_by_offset = commit_order.clone();
+    sorted_by_offset.sort_by_key(|(off, _)| *off);
+    let offsets: Vec<u64> = sorted_by_offset.iter().map(|(off, _)| *off).collect();
     let expected: Vec<u64> = (0..(2 * N) as u64).collect();
     assert_eq!(
         offsets, expected,
@@ -804,12 +902,188 @@ async fn offset_order_equals_commit_order_two_sessions_one_postgres() {
         .await
         .unwrap();
     let replay_seq: Vec<i64> = drained.iter().flat_map(|d| seq_column(&d.batch)).collect();
+    // Derived from the UNSORTED `commit_order` — the true, as-recorded
+    // commit sequence — not `sorted_by_offset`: a replay that merely
+    // reproduced offset order (even if that order diverged from real
+    // commit order) would pass against a sorted expectation but must fail
+    // here.
     let expected_seq: Vec<i64> = commit_order.iter().map(|(_, marker)| *marker).collect();
     assert_eq!(
         replay_seq, expected_seq,
         "replay order (by `_offset`) must equal the true commit order recorded by the shared \
          commit log -- this is the invariant the offset-assigning UPDATE's row lock provides"
     );
+}
+
+/// Every accepted topic column type round-trips through publish/replay with
+/// the BACKING TABLE ITSELF on Postgres (`PostgresBackend` +
+/// `PostgresMutableBackend`) -- unlike every other Postgres-arm test in this
+/// suite, whose backing table stays on SQLite (module docs) and whose broker
+/// is the only real-Postgres component. A Postgres-specific decode bug in
+/// `store/mutable/postgres.rs` (column encode/decode) or
+/// `catalog/backend_postgres.rs` (DDL/DML rendering) would pass every other
+/// test in this file; this oracle was missing.
+#[tokio::test]
+async fn every_accepted_type_round_trips_through_postgres_backing_table() {
+    let Some(url) = jammi_test_utils::pg_url_for_tests() else {
+        eprintln!(
+            "skipping every_accepted_type_round_trips_through_postgres_backing_table: \
+             JAMMI_TEST_PG_URL unset"
+        );
+        require_live_pg("every_accepted_type_round_trips_through_postgres_backing_table");
+        return;
+    };
+    let pg = PostgresBackend::open_with_options(&url, 4, None)
+        .await
+        .unwrap();
+    let backend_impl = BackendImpl::Postgres(pg);
+    backend_impl.migrate().await.unwrap();
+    let tenant_binding = TenantBinding::unscoped();
+    let catalog = Arc::new(Catalog::from_backend_with_tenant(
+        backend_impl,
+        Some(tenant_binding.clone()),
+    ));
+    let backend_arc = catalog.backend_arc();
+    let mutable_backend: Arc<dyn MutableBackend> =
+        Arc::new(PostgresMutableBackend::new(Arc::clone(&backend_arc)));
+    let registry = Arc::new(MutableTableRegistry::new(
+        Arc::clone(&catalog),
+        mutable_backend,
+        tenant_binding,
+    ));
+    let broker: Arc<dyn TriggerBroker> = Arc::new(InMemoryBroker::new());
+    let topic_repo = TopicRepo::new(Arc::clone(&catalog), Arc::clone(&registry));
+    let publisher = Publisher::new(
+        Arc::clone(&broker),
+        Arc::clone(&backend_arc),
+        Arc::clone(&registry),
+    );
+    let subscriber = Subscriber::new(Arc::clone(&broker), Arc::clone(&registry));
+
+    // Every type `register_topic` accepts (`topic_repo.rs`'s type-name
+    // table): Boolean, every signed/unsigned integer width, both float
+    // widths, Utf8, Binary.
+    let schema: SchemaRef = Arc::new(Schema::new(vec![
+        Field::new("bool_col", DataType::Boolean, false),
+        Field::new("i8_col", DataType::Int8, false),
+        Field::new("i16_col", DataType::Int16, false),
+        Field::new("i32_col", DataType::Int32, false),
+        Field::new("i64_col", DataType::Int64, false),
+        Field::new("u8_col", DataType::UInt8, false),
+        Field::new("u16_col", DataType::UInt16, false),
+        Field::new("u32_col", DataType::UInt32, false),
+        Field::new("u64_col", DataType::UInt64, false),
+        Field::new("f32_col", DataType::Float32, false),
+        Field::new("f64_col", DataType::Float64, false),
+        Field::new("utf8_col", DataType::Utf8, false),
+        Field::new("bytes_col", DataType::Binary, false),
+    ]));
+    let topic = TopicDefinition {
+        id: TopicId::new(),
+        name: format!(
+            "parity.pg_backing_every_type.{}",
+            jammi_test_utils::unique_suffix()
+        ),
+        schema: Arc::clone(&schema),
+        tenant: None,
+        broker_metadata: BTreeMap::new(),
+    };
+    broker.register_topic(&topic).await.unwrap();
+    topic_repo.register_topic(&topic).await.unwrap();
+    let loaded = topic_repo
+        .lookup_by_name(&topic.name, None)
+        .await
+        .unwrap()
+        .expect("topic persisted");
+
+    let batch = RecordBatch::try_new(
+        Arc::clone(&loaded.schema),
+        vec![
+            Arc::new(BooleanArray::from(vec![true, false])),
+            Arc::new(Int8Array::from(vec![-7i8, 42])),
+            Arc::new(Int16Array::from(vec![-700i16, 4200])),
+            Arc::new(Int32Array::from(vec![-70000i32, 420000])),
+            Arc::new(Int64Array::from(vec![-7_000_000_000i64, 42])),
+            Arc::new(UInt8Array::from(vec![1u8, 255])),
+            Arc::new(UInt16Array::from(vec![1u16, 65535])),
+            Arc::new(UInt32Array::from(vec![1u32, u32::MAX])),
+            Arc::new(UInt64Array::from(vec![0u64, i64::MAX as u64])),
+            Arc::new(Float32Array::from(vec![1.5f32, -2.25])),
+            Arc::new(Float64Array::from(vec![1.5f64, -2.25])),
+            Arc::new(StringArray::from(vec!["hello", ""])),
+            Arc::new(BinaryArray::from(vec![
+                b"hello".as_ref(),
+                b"\x00\x01\xff".as_ref(),
+            ])),
+        ],
+    )
+    .unwrap();
+
+    publisher
+        .publish_scoped(&loaded, None, batch)
+        .await
+        .expect("publish accepts every declared column type over the Postgres backing table");
+
+    let from = Offset::new(0, chrono::Utc::now());
+    let drained = subscriber
+        .replay_only(&loaded, Predicate::match_all(), Some(from))
+        .await
+        .expect("replay must reconstruct the batch against the declared schema over Postgres");
+    assert_eq!(drained.len(), 1);
+    let replayed = &drained[0].batch;
+    assert_eq!(
+        replayed.schema().as_ref(),
+        loaded.schema.as_ref(),
+        "replayed batch schema must equal the declared topic schema exactly over Postgres"
+    );
+
+    macro_rules! assert_col {
+        ($name:expr, $arr_ty:ty, $expected:expr) => {
+            let col = replayed
+                .column_by_name($name)
+                .unwrap()
+                .as_any()
+                .downcast_ref::<$arr_ty>()
+                .unwrap_or_else(|| panic!("{} must decode as {}", $name, stringify!($arr_ty)));
+            assert_eq!(col.values(), $expected, "{} round-trip mismatch", $name);
+        };
+    }
+    let bool_col = replayed
+        .column_by_name("bool_col")
+        .unwrap()
+        .as_any()
+        .downcast_ref::<BooleanArray>()
+        .expect("bool_col must decode as BooleanArray");
+    assert!(bool_col.value(0), "bool_col[0] round-trip mismatch");
+    assert!(!bool_col.value(1), "bool_col[1] round-trip mismatch");
+    assert_col!("i8_col", Int8Array, &[-7i8, 42]);
+    assert_col!("i16_col", Int16Array, &[-700i16, 4200]);
+    assert_col!("i32_col", Int32Array, &[-70000i32, 420000]);
+    assert_col!("i64_col", Int64Array, &[-7_000_000_000i64, 42]);
+    assert_col!("u8_col", UInt8Array, &[1u8, 255]);
+    assert_col!("u16_col", UInt16Array, &[1u16, 65535]);
+    assert_col!("u32_col", UInt32Array, &[1u32, u32::MAX]);
+    assert_col!("u64_col", UInt64Array, &[0u64, i64::MAX as u64]);
+    assert_col!("f32_col", Float32Array, &[1.5f32, -2.25]);
+    assert_col!("f64_col", Float64Array, &[1.5f64, -2.25]);
+
+    let utf8_col = replayed
+        .column_by_name("utf8_col")
+        .unwrap()
+        .as_any()
+        .downcast_ref::<StringArray>()
+        .expect("utf8_col must decode as StringArray");
+    assert_eq!(utf8_col.value(0), "hello");
+    assert_eq!(utf8_col.value(1), "");
+
+    let bytes_col = replayed
+        .column_by_name("bytes_col")
+        .unwrap()
+        .as_any()
+        .downcast_ref::<BinaryArray>()
+        .expect("bytes_col must decode as BinaryArray");
+    assert_eq!(bytes_col.value(0), b"hello");
+    assert_eq!(bytes_col.value(1), b"\x00\x01\xff");
 }
 
 /// `application_name` `PostgresBroker`'s dedicated listener connection tags
@@ -897,6 +1171,82 @@ async fn postgres_listener_killed_recovers_via_replay() {
         vec![1, 2, 3, 4, 5],
         "every offset must arrive via replay after the listener's own backend is killed"
     );
+}
+
+/// `ConsumerOffsetSnapshot` reports `None` for a consumer that has never
+/// observed a NOTIFY payload carrying an offset -- never a fabricated `0`,
+/// which would be indistinguishable from a real `_offset = 0` (the first
+/// published row). Observable immediately after subscribing: the driver's
+/// own subscribe stream always yields an unconditional first `Wake` that
+/// carries no offset (`TriggerBroker::subscribe`'s own doc contract), so a
+/// consumer can be enumerated before any publish has happened at all. Uses
+/// the CONCRETE `PostgresBroker` type directly (its own `TriggerBroker`
+/// methods, not `Publisher`/`Subscriber`) because only this driver's
+/// `ConsumerOffsetSnapshot` is best-effort/informational in this way — the
+/// in-memory and JetStream drivers carry the delivered batch itself, so
+/// their consumer's last-delivered offset is authoritative from the first
+/// event.
+#[tokio::test]
+async fn postgres_list_consumers_reports_none_until_a_notify_is_seen() {
+    let Some(url) = jammi_test_utils::pg_url_for_tests() else {
+        eprintln!(
+            "skipping postgres_list_consumers_reports_none_until_a_notify_is_seen: \
+             JAMMI_TEST_PG_URL unset"
+        );
+        require_live_pg("postgres_list_consumers_reports_none_until_a_notify_is_seen");
+        return;
+    };
+    let broker = PostgresBroker::connect(&url, TEST_IDLE_POLL)
+        .await
+        .expect("connect to Postgres broker");
+    let topic = topic_def(&format!(
+        "parity.pg_never_woken.{}",
+        jammi_test_utils::unique_suffix()
+    ));
+    broker.register_topic(&topic).await.unwrap();
+
+    let mut driver_stream = broker
+        .subscribe(topic.id, Predicate::match_all(), None)
+        .await
+        .unwrap();
+    // Drain the unconditional first `Wake` -- it carries no offset.
+    let first = next_with_timeout(&mut driver_stream)
+        .await
+        .expect("stream ended early")
+        .unwrap();
+    assert!(
+        matches!(first, LiveEvent::Wake),
+        "the driver-level subscribe always yields Wake first"
+    );
+
+    let before = broker.list_consumers(topic.id).await.unwrap();
+    assert_eq!(before.len(), 1, "exactly one consumer is attached");
+    assert_eq!(
+        before[0].last_delivered_offset, None,
+        "a consumer that has never seen a NOTIFY payload carrying an offset must report None, \
+         never a fabricated 0"
+    );
+    assert_eq!(before[0].last_acked_offset, None);
+
+    // Publish -- carries a real engine offset through the NOTIFY payload --
+    // and wait for the resulting Wake before re-checking.
+    broker
+        .publish(topic.id, batch_of(&[1]), chrono::Utc::now(), 7, None)
+        .await
+        .unwrap();
+    let _woken = next_with_timeout(&mut driver_stream)
+        .await
+        .expect("stream ended early")
+        .unwrap();
+
+    let after = broker.list_consumers(topic.id).await.unwrap();
+    assert_eq!(after.len(), 1);
+    assert_eq!(
+        after[0].last_delivered_offset,
+        Some(7),
+        "once a NOTIFY payload carrying an offset has been seen, it must be reported"
+    );
+    assert_eq!(after[0].last_acked_offset, Some(7));
 }
 
 /// A NOTIFY the broker itself never sends (simulating one Postgres

@@ -34,7 +34,6 @@ use arrow::array::{ArrayRef, Int64Array, RecordBatch};
 use arrow_schema::SchemaRef;
 use async_stream::try_stream;
 use chrono::DateTime;
-use futures::StreamExt;
 use tokio::sync::broadcast;
 
 use crate::catalog::backend::TxOptions;
@@ -60,11 +59,10 @@ pub struct Subscriber {
 
 impl Subscriber {
     pub fn new(broker: Arc<dyn TriggerBroker>, mutable: Arc<MutableTableRegistry>) -> Self {
-        let pool_size = mutable.backend_arc().catalog_backend().pool_size();
         Self {
             broker,
             mutable,
-            tails: TailRegistry::new(pool_size),
+            tails: TailRegistry::new(),
         }
     }
 
@@ -138,6 +136,25 @@ impl Subscriber {
         predicate: Predicate,
         from_offset: Option<Offset>,
     ) -> Result<Subscription, TriggerError> {
+        // Attach to the tail's broadcast FIRST — before reading any
+        // watermark or taking the replay snapshot below. The receiver this
+        // creates exists from this point on, so any publish that commits
+        // from here onward is fanned out to it (buffered in its channel if
+        // this call has not started polling yet) and later deduped against
+        // whatever the replay/watermark reads below end up covering.
+        // Attaching AFTER those reads is the unsafe order: a publish
+        // committing in the window between the replay snapshot and the
+        // attach is fanned out to a broadcast this call has not subscribed
+        // to yet, and to nobody else waiting on it — it is silently lost,
+        // never covered by the replay snapshot (already taken) or the live
+        // tail (not yet attached). `_tail_guard` keeps the tail's `Arc` (and
+        // therefore its task and driver subscription) alive for exactly as
+        // long as this subscription is polled.
+        let (tail_guard, mut rx) = self
+            .tails
+            .attach_or_create(&self.broker, &self.mutable, topic, tenant)
+            .await?;
+
         let replay_delivered = self
             .drain_replay(topic, tenant, &predicate, from_offset)
             .await?;
@@ -148,26 +165,15 @@ impl Subscriber {
         // highest committed `_offset` at subscribe time) rather than leaving
         // it unset — otherwise the first `LiveEvent::Wake` this subscriber
         // sees would replay the ENTIRE backing-table history instead of only
-        // what committed after this point. A publish racing this read is
-        // still delivered, either by this read observing it or by the very
-        // next live `Batch`/`Wake`.
+        // what committed after this point. Read AFTER the attach above, so a
+        // publish racing this read is still delivered live regardless of
+        // which side of the watermark it lands on — the tail's own
+        // contiguity check (never this read) is what makes that safe.
         let watermark = if from_offset.is_none() {
             current_watermark(&self.mutable, topic).await?
         } else {
             None
         };
-
-        // Attach to the tail's broadcast BEFORE reading any watermark —
-        // rows fanned out before this attach have offset <= the watermark
-        // (read just above) and are suppressed by dedup below; rows
-        // committing after the attach are fanned out after it, so nothing
-        // is missed. `_tail_guard` keeps the tail's `Arc` (and therefore its
-        // task and driver subscription) alive for exactly as long as this
-        // subscription is polled.
-        let (tail_guard, mut rx) = self
-            .tails
-            .attach_or_create(&self.broker, &self.mutable, topic, tenant)
-            .await?;
 
         let mutable = Arc::clone(&self.mutable);
         let topic_owned = topic.clone();
@@ -323,9 +329,12 @@ async fn current_watermark(
 /// across the stream. The live portion no longer calls back into this
 /// function on a lag/gap/wake — that self-healing replay is
 /// `crate::trigger::tail`'s job (the tail's own driver-triggered replay, or
-/// a subscriber's own `crate::trigger::tail::lag_replay`), both of which
-/// reuse `MutableTableRegistry::tail_replay`'s chunked, group-completing
-/// query instead of this function's whole-suffix materialisation.
+/// a subscriber's own `crate::trigger::tail::lag_replay`). All three replay
+/// paths — this subscribe-time drain, the tail's own replay, and a lagging
+/// subscriber's replay — now share the SAME chunked, group-completing,
+/// permit-bounded primitive, `MutableTableRegistry::tail_replay`, so no
+/// replay caller can start an unbounded number of concurrent replays against
+/// the backend's connection pool.
 async fn drain_replay(
     mutable: &Arc<MutableTableRegistry>,
     topic: &TopicDefinition,
@@ -339,19 +348,41 @@ async fn drain_replay(
 
     let replay_batches = match from_offset {
         Some(off) => {
-            // `scan_after` is strictly greater than, so subtract one to
+            // Strictly-greater-than cursor semantics, so subtract one to
             // include `off` itself in the replay window. Using `i64`
             // arithmetic so `Offset(0)` produces `-1` (return every row).
+            //
+            // Routed through `MutableTableRegistry::tail_replay` — the SAME
+            // chunked primitive the tail's own driver-triggered replay
+            // (`crate::trigger::tail::replay_and_fan_out`) and a lagging
+            // subscriber's own replay (`crate::trigger::tail::lag_replay`)
+            // use — rather than a second, permit-UNBOUNDED whole-suffix
+            // query. Every trigger-stream replay path is bounded by the
+            // same pool-sized semaphore this way, with no path that can
+            // start an unbounded number of concurrent replays against the
+            // backend's connection pool.
             let scan_after_value = (off.value() as i64).saturating_sub(1);
-            let mut stream = mutable
-                .scan_after_for_tenant(&backing_id, scan_after_value, tenant)
+            let def = mutable
+                .definition_for_tenant(&backing_id, tenant)
                 .await
                 .map_err(TriggerError::BackingTable)?;
-            let mut batches: Vec<RecordBatch> = Vec::new();
-            while let Some(b) = stream.next().await {
-                batches.push(b.map_err(TriggerError::BackingTable)?);
-            }
-            batches
+            let order_col = def.order_column.clone().ok_or_else(|| {
+                TriggerError::Catalog(format!(
+                    "topic '{}' backing table has no order_column",
+                    topic.name
+                ))
+            })?;
+            let (raw, _new_head) = mutable
+                .tail_replay(
+                    &def,
+                    &order_col,
+                    tenant,
+                    scan_after_value,
+                    crate::trigger::tail::REPLAY_CHUNK_SIZE,
+                )
+                .await
+                .map_err(TriggerError::BackingTable)?;
+            raw
         }
         None => Vec::new(),
     };

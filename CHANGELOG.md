@@ -690,22 +690,45 @@ workspace ships every publishable crate at the same
   `Owner::ExpiredLease` already documents on the result-table side — every claim path stamps a
   non-NULL lease, so a running row with no lease can never arise through this engine's own claim
   path, and restoring an `IS NOT NULL` guard would strand such a row `running` forever.**
-- **Final adversarial round on the above (#484): an expired-lease `building` row with a valid
-  Parquet AND its manifest sidecar present is PROMOTED to `ready` by the apply pre-pass — but
-  `reconcile`'s dry-run preview had no matching "would-promote" branch, so it protected nothing for
-  that row and its objects fell through to the ordinary age-gated orphan arm, over-reporting keys
-  `apply` never touches (an operator following the dry-run-then-apply recipe could be led to expect
-  bytes reclaimed that recovery itself keeps). Fixed by replacing the hand-copied dry-run mirror with
-  one `ExpiredRowOutcome { Reap, Promote, Untouched }` classification both modes branch on:
-  `apply` classifies and then performs the outcome; the dry-run classifies alone. A `Promote` row's
-  objects are referenced (protected) in BOTH modes; a `Reap` row's objects are credited in BOTH
-  modes, at the SAME key set the real deleter computes (`ResultStore::reap_candidate_keys` /
-  `delete_objects_after_cas`) — Parquet, manifest sidecar, and each segment's `Ann`-only siblings,
-  never the `Lexical` superset `referenced_result_keys` protects with; a partial delete failure
-  (`delete_objects_after_cas`, `purge_segments`) credits only the keys that actually deleted, leaving
-  a failed one for the orphan arm or a later pass to retry, rather than crediting the whole
-  candidate set on a fail-CAS hit regardless of what the delete itself did. The candidate listing is
-  now indexed once (key → size) instead of rescanned per expired row.
+- **Adversarial round on the above (#484): an expired-lease `building` row with a valid Parquet
+  AND its manifest sidecar present is PROMOTED to `ready` by the apply pre-pass — but `reconcile`'s
+  dry-run preview had no matching "would-promote" branch, so it protected nothing for that row and
+  its objects fell through to the ordinary age-gated orphan arm, over-reporting keys `apply` never
+  touches (an operator following the dry-run-then-apply recipe could be led to expect bytes
+  reclaimed that recovery itself keeps). Fixed by replacing the hand-copied dry-run mirror with one
+  `ExpiredRowOutcome { Reap, Promote, Untouched }` classification both modes branch on: `apply`
+  classifies and then performs the outcome; the dry-run classifies alone. A `Reap` row's objects are
+  credited in BOTH modes, at the SAME key set the real deleter computes
+  (`ResultStore::reap_candidate_keys` / `delete_objects_after_cas`) — Parquet, manifest sidecar, and
+  each segment's `Ann`-only siblings, never the `Lexical` superset `referenced_result_keys` protects
+  with; a partial delete failure (`delete_objects_after_cas`, `purge_segments`) credits only the keys
+  that actually deleted, leaving a failed one for the orphan arm or a later pass to retry, rather
+  than crediting the whole candidate set on a fail-CAS hit regardless of what the delete itself did.
+  The candidate listing is now indexed once (key → size) instead of rescanned per expired row.
+- **Final round on the above (#484): the `Promote` arm's own reclaim was still one-directional.**
+  A `Promote` row's objects were protected WHOLESALE in both modes, but apply's actual promotion of
+  an embedding row calls `rebuild_index_from_parquet`, which PURGES the row's entire current segment
+  set and rewrites, at most, a single fresh segment `0` — a stale second segment from an interrupted
+  multi-segment build, or segment `0` itself when the Parquet turns out to carry zero rows (the
+  rebuild then writes nothing at all), is deleted and never rewritten. The dry-run over-protected
+  exactly the keys the rebuild actually reclaims (reporting them nowhere) while apply discarded
+  `purge_segments`'s own returned key set and credited them nowhere either — both directions of the
+  dry-run/apply parity invariant broke on the SAME state at once, silently. `ExpiredRowOutcome::Promote`
+  now carries `keeps` / `reclaims` (plus `dir_prefixes`, always kept), computed ONCE by
+  `classify_expired_row` from the SAME row-count oracle the rebuild itself branches on
+  (`count_parquet_rows`, never assumed): `keeps` — the Parquet, the manifest sidecar, and a fresh
+  segment `0`'s sidecars when-and-only-when the rebuild will actually write one — is protected in
+  both modes; `reclaims` — every other key the row currently references — is credited into
+  `orphans`/`bytes_reclaimed` through the SAME `credit_reaped` helper the `Reap` arm uses, in BOTH
+  modes. Apply's own rebuild now returns the keys `purge_segments` actually deleted and CHECKS the
+  union against the classifier's prediction, crediting the true deletion (never a stale prediction)
+  and logging any discrepancy loudly rather than silently. Two more loud-corruption fixes rode
+  along: `purge_segments` now returns an error (rather than `continue`-ing past) an `index_segments`
+  row whose `index_path` does not parse, and `BuildingTable::abort` now attempts every object delete
+  and returns an aggregated error naming whichever keys truly failed, rather than mapping a partial
+  failure to `Ok(())`. A `Promote`-classified row whose manifest sidecar vanishes between classify
+  and perform (a race with a concurrent pass) now re-classifies as `Reap` instead of aborting the
+  whole reconcile pass.
 - **Config phase-4 hardening: no bare-env whole-struct override without a file layer, `[models]`
   offline honored in the fine-tune worker's HF fallback, and no env value echoed into a config
   error (#483, #481).** `JammiConfig`'s hand-written `Deserialize` refused a bare `JAMMI_<X>='{

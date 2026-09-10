@@ -418,10 +418,11 @@ impl ResultStore {
         // BOTH modes branch on: `apply=true` calls
         // [`ResultStore::reconcile_expired_building_row`], which classifies
         // FIRST and then performs exactly the outcome licenses (its returned
-        // key set is only ever non-empty for a `Reap` whose delete actually
-        // succeeded — the dry-run/apply parity invariant, and the
-        // "accounting set == deletion set" invariant, both pinned on
-        // [`ReconcileOptions::apply`]); `apply=false` calls
+        // key set is non-empty for a `Reap` whose delete actually succeeded,
+        // AND for a `Promote` whose rebuild purged a stale segment sibling it
+        // did not rewrite at the same key — the dry-run/apply parity
+        // invariant, and the "accounting set == deletion set" invariant, both
+        // pinned on [`ReconcileOptions::apply`]); `apply=false` calls
         // [`ResultStore::classify_expired_row`] alone and only classifies:
         //
         // - `Reap`: this row's candidate keys ([`ResultStore::reap_candidate_keys`]
@@ -429,11 +430,21 @@ impl ResultStore {
         //   orphans, at their TRUE listed size, regardless of the object's
         //   own age — a CAS-licensed reap is never grace-gated (see
         //   [`ReconcileReport::orphans`]'s two admission routes).
-        // - `Promote`: this row's full referenced-key set (Parquet, manifest
-        //   sidecar, every current segment sibling) is PROTECTED — added to
-        //   `protected`, never `reaped` — so a promoted-but-not-yet-`ready`
-        //   row's objects can never fall through to the general age-gated
-        //   arm below and be mis-reported as an orphan.
+        // - `Promote { keeps, reclaims, dir_prefixes }`: `keeps` (the
+        //   Parquet, the manifest sidecar, and — only when the rebuild will
+        //   actually write one — a fresh segment 0's own sidecars) and
+        //   `dir_prefixes` are PROTECTED — added to `protected`, never
+        //   `reaped` — so a promoted-but-not-yet-`ready` row's SURVIVING
+        //   objects can never fall through to the general age-gated arm
+        //   below. `reclaims` — every OTHER key this row currently
+        //   references, which the rebuild's destructive purge deletes and
+        //   does NOT rewrite at the same key (e.g. a stale second segment
+        //   from an interrupted multi-segment build, or segment 0 itself
+        //   when the Parquet turns out to carry zero rows) — is credited
+        //   through the SAME `credit_reaped` helper the `Reap` arm uses, so
+        //   apply's `reconcile_expired_building_row` and this dry-run
+        //   preview can never disagree on what a promotion's rebuild
+        //   actually reclaims.
         // - `Untouched`: nothing to account or protect.
         //
         // `orphans`/`orphan_count`/`bytes_reclaimed`/`truncated` are declared
@@ -486,12 +497,30 @@ impl ResultStore {
                         &mut bytes_reclaimed,
                     );
                 }
-                ExpiredRowOutcome::Promote => {
-                    let keys = self
-                        .referenced_result_keys(std::slice::from_ref(&table), &[])
-                        .await?;
-                    protected.exact.extend(keys.exact);
-                    protected.dir_prefixes.extend(keys.dir_prefixes);
+                ExpiredRowOutcome::Promote {
+                    keeps,
+                    reclaims,
+                    dir_prefixes,
+                } => {
+                    // `keeps` survives the rebuild at the SAME key (protected,
+                    // like `still_ready`'s rows further down); `reclaims` is
+                    // every OTHER key this row currently references — the
+                    // rebuild's `purge_segments` call deletes it and never
+                    // rewrites it (esc-484: apply credits the identical set
+                    // via `reconcile_expired_building_row`'s own return
+                    // value, computed from THIS SAME `classify_expired_row`
+                    // call's `Promote` payload).
+                    protected.exact.extend(keeps);
+                    protected.dir_prefixes.extend(dir_prefixes);
+                    credit_reaped(
+                        reclaims,
+                        &listed_sizes,
+                        &mut reaped,
+                        &mut orphans,
+                        &mut orphan_count,
+                        &mut truncated,
+                        &mut bytes_reclaimed,
+                    );
                 }
                 ExpiredRowOutcome::Untouched => {}
             }
@@ -875,7 +904,12 @@ impl ResultStore {
     /// Segments are referenced by ROWS, not by filename pattern — a
     /// `{base}__segN.*` object with no row is an orphan candidate, e.g. the
     /// late-landing sidecar of a purge a recoverer's claim already ran.
-    async fn referenced_result_keys(
+    ///
+    /// `pub(super)`: [`ResultStore::classify_expired_row`] (`store::mod`)
+    /// calls this too, to compute a [`ExpiredRowOutcome::Promote`] row's
+    /// `keeps`/`reclaims` split (esc-484) from the SAME currently-referenced
+    /// key set this pass's own pre-pass and object→row arms both read.
+    pub(super) async fn referenced_result_keys(
         &self,
         ready: &[ResultTableRecord],
         live_building: &[ResultTableRecord],
@@ -929,9 +963,13 @@ impl ResultStore {
 /// The referenced-object set [`ResultStore::referenced_result_keys`] builds:
 /// exact keys, plus directory-sibling prefixes (each carrying a trailing
 /// `/`) a listed object is referenced through if its own key starts with one.
-struct ReferencedKeys {
-    exact: BTreeSet<String>,
-    dir_prefixes: BTreeSet<String>,
+///
+/// `pub(super)` (fields included): [`ResultStore::classify_expired_row`]
+/// (`store::mod`) reads both fields directly to split a `Promote` row's
+/// current key set into `keeps` / `reclaims` (esc-484).
+pub(super) struct ReferencedKeys {
+    pub(super) exact: BTreeSet<String>,
+    pub(super) dir_prefixes: BTreeSet<String>,
 }
 
 impl ReferencedKeys {

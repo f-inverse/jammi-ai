@@ -289,15 +289,44 @@ impl BuildingTable {
     /// bundle plus their catalog rows. A miss is returned as its typed error
     /// and deletes nothing: the row's new owner (recovery), or reconcile, is
     /// responsible for the bytes.
+    ///
+    /// Every object is attempted independently
+    /// (`ResultStore::delete_objects_after_cas` never lets one failure
+    /// suppress an attempt at the others), but a PARTIAL failure is never
+    /// silently turned into `Ok`: this reads the row's full expected key set
+    /// (`ResultStore::reap_candidate_keys`, the SAME computation
+    /// `reconcile`'s dry-run preview uses) BEFORE the delete — the delete's
+    /// own destructive `purge_segments` step removes the `index_segments`
+    /// rows that name them, so the expected set must be captured first — and
+    /// diffs it against what actually deleted; any key left over (a real
+    /// `delete_if_exists` I/O failure, never a mere 404) fails this call with
+    /// an aggregated error naming every such key, so this doc comment's
+    /// "delete the Parquet ... every ANN segment bundle" is CHECKED, not
+    /// merely asserted. The row itself is still `failed` either way — only
+    /// the byte cleanup is incomplete, left for `reconcile` to retry.
     pub async fn abort(mut self) -> Result<()> {
         self.done.store(true, Ordering::SeqCst);
         self.stop_heartbeat();
         let cas = self.cas();
         self.store.catalog().fail_building_table(&cas).await?;
-        self.store
+        let expected = self
+            .store
+            .reap_candidate_keys(&self.parquet_url, &self.table_name)
+            .await?;
+        let deleted = self
+            .store
             .delete_objects_after_cas(&self.parquet_url, &cas)
-            .await
-            .map(|_deleted_keys| ())
+            .await?;
+        let failed: std::collections::BTreeSet<&String> = expected.difference(&deleted).collect();
+        if failed.is_empty() {
+            Ok(())
+        } else {
+            Err(JammiError::Other(format!(
+                "abort: {} object delete(s) failed for '{}': {failed:?}",
+                failed.len(),
+                self.table_name
+            )))
+        }
     }
 
     /// Detach the handle from its row with no catalog transition — the state

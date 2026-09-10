@@ -13,6 +13,8 @@ use jammi_db::catalog::result_repo::ResultTableKind;
 use jammi_db::catalog::training_repo::CreateTrainingJobParams;
 use jammi_db::catalog::Catalog;
 use jammi_db::config::AnnIndexConfig;
+use jammi_db::index::sidecar::SidecarIndex;
+use jammi_db::index::VectorIndex;
 use jammi_db::model_task::ModelTask;
 use jammi_db::store::manifest::{
     ComputeDevice, ComputePrecision, MaterializationEnv, ModelContentDigest, ModelIdentity,
@@ -266,6 +268,412 @@ async fn promotable_building_row_fixture(
     let table_dir = std::path::Path::new(&parquet_local).parent().unwrap();
     backdate_dir(table_dir, Duration::from_secs(3600));
     (table_name, parquet_local)
+}
+
+/// A built one-segment index over `n` synthetic rows, at the store's default
+/// precision — the shape [`BuildingTable::append_segment`] persists. Rows are
+/// independent of [`sample_rows`]'s own ids/vectors: a stale-segment fixture
+/// only needs real bytes on disk, never rows that match the table's current
+/// Parquet.
+fn built_segment_index(n: usize) -> SidecarIndex {
+    let mut idx = SidecarIndex::new(
+        DIMS,
+        &AnnIndexConfig::default(),
+        AnnIndexConfig::default().storage_precision,
+    )
+    .unwrap();
+    for i in 0..n {
+        let v: Vec<f32> = (0..DIMS).map(|d| (i * DIMS + d) as f32).collect();
+        idx.add(&format!("seg-row-{i}"), &v).unwrap();
+    }
+    idx.build().unwrap();
+    idx
+}
+
+/// Every sidecar file segment `seg` of `table_name` actually wrote under
+/// `table_dir`, paired with its true on-disk size — read directly off the
+/// filesystem (never assumed from
+/// [`jammi_db::storage::sidecar_layout::sidecar_extensions`]'s full,
+/// precision-gated extension list) so a test's expected-key set can never
+/// drift from what really landed.
+fn segment_sidecar_files(
+    table_dir: &std::path::Path,
+    table_name: &str,
+    seg: i64,
+) -> Vec<(String, u64)> {
+    let prefix = format!("{table_name}__seg{seg}.");
+    let mut out = Vec::new();
+    for entry in std::fs::read_dir(table_dir).unwrap() {
+        let entry = entry.unwrap();
+        let name = entry.file_name().to_string_lossy().to_string();
+        if name.starts_with(&prefix) {
+            out.push((name, entry.metadata().unwrap().len()));
+        }
+    }
+    assert!(
+        !out.is_empty(),
+        "fixture sanity: segment {seg} of '{table_name}' must have written real sidecar files \
+         under {table_dir:?}"
+    );
+    out
+}
+
+// ─── esc-484 (LEAD design item 3): the promote arm's rebuild purges the
+//     row's CURRENT segment set and rewrites, at most, a single fresh
+//     segment 0 — a stale sibling the rebuild deletes and does not rewrite
+//     is a REAL reclaim both modes must report identically. ────────────────
+
+/// Two segments (ids 0 and 1) already appended before the crash: the
+/// rebuild purges both and rewrites exactly one fresh segment 0, so segment
+/// 1's sidecars are a genuine reclaim. RED against 161bcc91: the dry-run
+/// protected the row's WHOLE existing key set (segment 1 included) and
+/// reported nothing, while apply silently discarded `purge_segments`'s
+/// returned key set (`store/mod.rs:1502`) and credited nothing either —
+/// `dry.orphans == [] == apply.orphans` even though apply really deleted
+/// segment 1's sidecar files.
+#[tokio::test]
+async fn dry_run_previews_promote_arm_reclaim_of_a_stale_second_segment() {
+    let dir = tempdir().unwrap();
+    let catalog = Arc::new(Catalog::open(dir.path()).await.unwrap());
+    let store = ResultStore::new(dir.path(), Arc::clone(&catalog), AnnIndexConfig::default())
+        .unwrap()
+        .with_lease_intervals(short_lease());
+
+    let info = create_building_embedding_with_parquet(&store, "docs-two-seg", 5).await;
+    info.append_segment(&built_segment_index(2)).await.unwrap();
+    info.append_segment(&built_segment_index(3)).await.unwrap();
+    jammi_test_utils::write_manifest_sidecar_for(&store, info.parquet_url(), "docs-two-seg", DIMS)
+        .await;
+    let parquet_local = info
+        .parquet_url()
+        .as_str()
+        .trim_start_matches("file://")
+        .to_string();
+    let table_dir = std::path::Path::new(&parquet_local)
+        .parent()
+        .unwrap()
+        .to_path_buf();
+    let table_name = jammi_test_utils::abandon_building(&catalog, info).await;
+
+    // Read the real sidecar files off disk BEFORE either pass runs — these
+    // are the exact keys this test asserts on.
+    let seg1_files = segment_sidecar_files(&table_dir, &table_name, 1);
+    let seg0_files = segment_sidecar_files(&table_dir, &table_name, 0);
+
+    backdate_dir(&table_dir, Duration::from_secs(3600));
+
+    let dry = store
+        .reconcile(ReconcileOptions {
+            apply: false,
+            grace: Duration::from_secs(3),
+        })
+        .await
+        .unwrap();
+
+    for (name, _) in &seg1_files {
+        assert!(
+            dry.orphans.iter().any(|o| o.ends_with(name.as_str())),
+            "a dry-run must preview segment 1's stale sidecar '{name}' as reclaimed: {dry:?}"
+        );
+    }
+    for (name, _) in &seg0_files {
+        assert!(
+            !dry.orphans.iter().any(|o| o.ends_with(name.as_str())),
+            "segment 0's sidecar '{name}' survives the rebuild — never previewed as an orphan: \
+             {dry:?}"
+        );
+        assert!(
+            !dry.pending.iter().any(|o| o.ends_with(name.as_str())),
+            "{dry:?}"
+        );
+    }
+    let expected_bytes: u64 = seg1_files.iter().map(|(_, size)| size).sum();
+    assert_eq!(
+        dry.bytes_reclaimed, expected_bytes,
+        "dry-run must preview segment 1's TRUE combined size: {dry:?}"
+    );
+    for (name, _) in seg1_files.iter().chain(seg0_files.iter()) {
+        assert!(
+            table_dir.join(name).exists(),
+            "a dry-run must never delete anything: '{name}' missing"
+        );
+    }
+
+    let apply = store
+        .reconcile(ReconcileOptions {
+            apply: true,
+            grace: Duration::from_secs(3),
+        })
+        .await
+        .unwrap();
+
+    let promoted = store
+        .catalog()
+        .get_result_table(&table_name)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        promoted.status,
+        jammi_db::catalog::status::ResultTableStatus::Ready.to_string(),
+        "the row must be promoted, not reaped: {apply:?}"
+    );
+    for (name, _) in &seg1_files {
+        assert!(
+            !table_dir.join(name).exists(),
+            "apply must actually delete segment 1's stale sidecar '{name}'"
+        );
+    }
+    for (name, _) in &seg0_files {
+        assert!(
+            table_dir.join(name).exists(),
+            "segment 0's sidecar '{name}' must survive apply (rewritten at the same key)"
+        );
+    }
+    let segs = store
+        .catalog()
+        .list_index_segments(&table_name)
+        .await
+        .unwrap();
+    assert_eq!(segs.len(), 1, "exactly one rebuilt segment: {segs:?}");
+
+    assert_eq!(dry.orphans, apply.orphans, "{dry:?} vs {apply:?}");
+    assert_eq!(dry.orphan_count, apply.orphan_count, "{dry:?} vs {apply:?}");
+    assert_eq!(
+        dry.bytes_reclaimed, apply.bytes_reclaimed,
+        "{dry:?} vs {apply:?}"
+    );
+}
+
+/// One segment already appended, but the row's CURRENT Parquet carries ZERO
+/// rows: the rebuild purges the stale segment and, because
+/// `index.len() == 0`, rewrites NOTHING — the whole segment is a genuine
+/// reclaim, at every one of its sidecar keys. RED against 161bcc91 for the
+/// same reason as the two-segment sibling above: `dry.orphans == []` while
+/// apply actually deleted every `__seg0.*` sidecar and credited nothing.
+#[tokio::test]
+async fn dry_run_previews_promote_arm_reclaim_of_a_stale_segment_over_a_zero_row_parquet() {
+    let dir = tempdir().unwrap();
+    let catalog = Arc::new(Catalog::open(dir.path()).await.unwrap());
+    let store = ResultStore::new(dir.path(), Arc::clone(&catalog), AnnIndexConfig::default())
+        .unwrap()
+        .with_lease_intervals(short_lease());
+
+    // Zero rows in the Parquet itself; a stale segment appended anyway (the
+    // shape a truncated-then-rewritten-empty crash could leave).
+    let info = create_building_embedding_with_parquet(&store, "docs-zero-row", 0).await;
+    info.append_segment(&built_segment_index(2)).await.unwrap();
+    jammi_test_utils::write_manifest_sidecar_for(&store, info.parquet_url(), "docs-zero-row", DIMS)
+        .await;
+    let parquet_local = info
+        .parquet_url()
+        .as_str()
+        .trim_start_matches("file://")
+        .to_string();
+    let table_dir = std::path::Path::new(&parquet_local)
+        .parent()
+        .unwrap()
+        .to_path_buf();
+    let table_name = jammi_test_utils::abandon_building(&catalog, info).await;
+
+    let seg0_files = segment_sidecar_files(&table_dir, &table_name, 0);
+
+    backdate_dir(&table_dir, Duration::from_secs(3600));
+
+    let dry = store
+        .reconcile(ReconcileOptions {
+            apply: false,
+            grace: Duration::from_secs(3),
+        })
+        .await
+        .unwrap();
+
+    for (name, _) in &seg0_files {
+        assert!(
+            dry.orphans.iter().any(|o| o.ends_with(name.as_str())),
+            "a dry-run must preview the zero-row row's stale segment 0 sidecar '{name}' as \
+             reclaimed: {dry:?}"
+        );
+    }
+    let expected_bytes: u64 = seg0_files.iter().map(|(_, size)| size).sum();
+    assert_eq!(
+        dry.bytes_reclaimed, expected_bytes,
+        "dry-run must preview segment 0's TRUE combined size: {dry:?}"
+    );
+    for (name, _) in &seg0_files {
+        assert!(
+            table_dir.join(name).exists(),
+            "a dry-run must never delete anything: '{name}' missing"
+        );
+    }
+
+    let apply = store
+        .reconcile(ReconcileOptions {
+            apply: true,
+            grace: Duration::from_secs(3),
+        })
+        .await
+        .unwrap();
+
+    let promoted = store
+        .catalog()
+        .get_result_table(&table_name)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        promoted.status,
+        jammi_db::catalog::status::ResultTableStatus::Ready.to_string(),
+        "a zero-row Parquet with its manifest present is still promoted, never reaped: {apply:?}"
+    );
+    assert_eq!(promoted.row_count, 0, "{apply:?}");
+    for (name, _) in &seg0_files {
+        assert!(
+            !table_dir.join(name).exists(),
+            "apply must actually delete the stale segment 0 sidecar '{name}': it is never \
+             rewritten over a zero-row Parquet"
+        );
+    }
+    let segs = store
+        .catalog()
+        .list_index_segments(&table_name)
+        .await
+        .unwrap();
+    assert!(
+        segs.is_empty(),
+        "a zero-row Parquet's rebuild writes no segment at all: {segs:?}"
+    );
+
+    assert_eq!(dry.orphans, apply.orphans, "{dry:?} vs {apply:?}");
+    assert_eq!(dry.orphan_count, apply.orphan_count, "{dry:?} vs {apply:?}");
+    assert_eq!(
+        dry.bytes_reclaimed, apply.bytes_reclaimed,
+        "{dry:?} vs {apply:?}"
+    );
+}
+
+// ─── classifier oracle: the three [`jammi_db::store::ExpiredRowOutcome`]
+//     shapes (Reap / Promote / Untouched) must never collapse into one
+//     another — a mutation that made `classify_expired_row` always return
+//     ONE outcome (e.g. `Untouched`) must go RED here, not merely be
+//     inferred from a single-fixture test. ─────────────────────────────────
+
+/// Three expired-lease `building` rows, each in a DIFFERENT classification
+/// state, reconciled in the SAME admin pass: a torn row with no manifest
+/// (`Reap`), a valid promotable row (`Promote`), and a row whose Parquet was
+/// never even written (`Untouched`). Each must land in its own distinct
+/// terminal shape — a classifier defect that collapsed any two of these
+/// outcomes together is caught here directly, distinguishing it from a
+/// pre-pass accounting bug the sibling tests above already cover.
+#[tokio::test]
+async fn classify_expired_row_never_collapses_reap_promote_and_untouched() {
+    let dir = tempdir().unwrap();
+    let catalog = Arc::new(Catalog::open(dir.path()).await.unwrap());
+    let store = ResultStore::new(dir.path(), Arc::clone(&catalog), AnnIndexConfig::default())
+        .unwrap()
+        .with_lease_intervals(short_lease());
+
+    // Reap: valid Parquet, no manifest sidecar.
+    let (reap_table, reap_parquet) =
+        torn_building_row_fixture(&store, &catalog, "docs-classify-reap").await;
+
+    // Promote: valid Parquet AND manifest sidecar.
+    let (promote_table, promote_parquet) =
+        promotable_building_row_fixture(&store, &catalog, "docs-classify-promote").await;
+
+    // Untouched: a `building` row whose Parquet was never written at all —
+    // the writer crashed before the very first byte landed.
+    let untouched_info = store
+        .create_table(
+            "docs-classify-untouched",
+            ModelTask::TextEmbedding,
+            ResultTableKind::Model,
+            None,
+            "test-model",
+            Some(DIMS as i32),
+            Some("_row_id"),
+            None,
+        )
+        .await
+        .unwrap();
+    let untouched_table = jammi_test_utils::abandon_building(&catalog, untouched_info).await;
+    // Force the lease into the past directly (no bytes/table-dir exist yet
+    // to backdate — `abandon_building` already left the lease expired).
+
+    let apply = store
+        .reconcile_all(ReconcileOptions {
+            apply: true,
+            grace: Duration::from_secs(3),
+        })
+        .await
+        .unwrap();
+
+    let reap_row = store
+        .catalog()
+        .get_result_table(&reap_table)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        reap_row.status,
+        jammi_db::catalog::status::ResultTableStatus::Failed.to_string(),
+        "Reap: {apply:?}"
+    );
+    assert!(
+        !std::path::Path::new(&reap_parquet).exists(),
+        "Reap must delete the torn row's Parquet"
+    );
+
+    let promote_row = store
+        .catalog()
+        .get_result_table(&promote_table)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        promote_row.status,
+        jammi_db::catalog::status::ResultTableStatus::Ready.to_string(),
+        "Promote must never collapse to Reap or Untouched: {apply:?}"
+    );
+    assert!(
+        std::path::Path::new(&promote_parquet).exists(),
+        "Promote must never delete the row's Parquet"
+    );
+
+    let untouched_row = store
+        .catalog()
+        .get_result_table(&untouched_table)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        untouched_row.status,
+        jammi_db::catalog::status::ResultTableStatus::Failed.to_string(),
+        "Untouched: {apply:?}"
+    );
+
+    // The three rows are distinguishable by more than status alone: only
+    // the `Reap` and `Promote` rows ever had bytes to account for.
+    assert!(
+        apply.orphans.iter().any(|o| o.ends_with(
+            std::path::Path::new(&reap_parquet)
+                .file_name()
+                .unwrap()
+                .to_str()
+                .unwrap()
+        )),
+        "the Reap row's Parquet must be credited as reclaimed: {apply:?}"
+    );
+    assert!(
+        !apply.orphans.iter().any(|o| o.ends_with(
+            std::path::Path::new(&promote_parquet)
+                .file_name()
+                .unwrap()
+                .to_str()
+                .unwrap()
+        )),
+        "the Promote row's Parquet must never be credited as reclaimed: {apply:?}"
+    );
 }
 
 #[tokio::test]

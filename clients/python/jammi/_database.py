@@ -206,6 +206,37 @@ def _index_segment_to_dict(s: catalog_pb2.IndexSegment) -> Dict[str, Any]:
     }
 
 
+def _reconcile_report_to_dict(r: catalog_pb2.ReconcileReport) -> Dict[str, Any]:
+    """Project a wire `ReconcileReport` into the dict a caller reads.
+
+    The whole report and nothing else — all 14 fields, the same keys, spelled
+    the same way, the embedded `Database.reconcile` produces by serializing
+    the identical engine struct: `scope`, `applied`, `rows_failed`,
+    `rows_failed_count`, `orphans`, `orphan_count`, `pending`, `pending_count`,
+    `unattributed`, `unattributed_count`, `damaged`, `damaged_count`,
+    `truncated`, `bytes_reclaimed`. Every list is already sorted by the
+    engine; this projection does not re-sort. Every `*_count` field is the
+    true total independent of whether its list was capped; `truncated` says
+    whether any list was.
+    """
+    return {
+        "scope": r.scope,
+        "applied": r.applied,
+        "rows_failed": list(r.rows_failed),
+        "rows_failed_count": r.rows_failed_count,
+        "orphans": list(r.orphans),
+        "orphan_count": r.orphan_count,
+        "pending": list(r.pending),
+        "pending_count": r.pending_count,
+        "unattributed": list(r.unattributed),
+        "unattributed_count": r.unattributed_count,
+        "damaged": list(r.damaged),
+        "damaged_count": r.damaged_count,
+        "truncated": r.truncated,
+        "bytes_reclaimed": r.bytes_reclaimed,
+    }
+
+
 def _model_to_dict(m: catalog_pb2.Model) -> Dict[str, Any]:
     """Project a wire `Model` into the model dict a caller reads.
 
@@ -2356,6 +2387,41 @@ class RemoteDatabase:
         request = catalog_pb2.DerivesFromRequest(table=table)
         resp = self._call(self._catalog.DerivesFrom, request)
         return _derives_from_edges_to_list(resp)
+
+    def reconcile(
+        self, apply: bool = False, grace_secs: int = 3600, all: bool = False
+    ) -> Dict[str, Any]:
+        """Cross-check the catalog against the object store and report (or, when
+        ``apply`` is set, reclaim) what has drifted.
+
+        ``apply=False`` (the default) is read-only — it reports what a pass
+        WOULD do without mutating anything; ``apply=True`` reclaims orphans
+        past ``grace_secs`` and flips an incomplete ``ready`` row to
+        ``failed``, and requires ``grace_secs`` to be at least the
+        deployment's configured lease duration or raises the typed
+        ``INVALID_ARGUMENT`` :class:`~jammi.errors.BackendError` naming both
+        values.
+
+        ``all=False`` (the default) runs scoped to the currently bound tenant
+        (or the global prefix when unbound). ``all=True`` requests the
+        cross-tenant admin pass; the server gates it behind a
+        deployment-supplied admin authorizer and a deployment that never wires
+        one refuses with a ``PERMISSION_DENIED``
+        :class:`~jammi.errors.BackendError`.
+
+        Returns the same dict shape the embedded ``Database.reconcile``
+        produces, tagged ``{"scope", "applied", "rows_failed",
+        "rows_failed_count", "orphans", "orphan_count", "pending",
+        "pending_count", "unattributed", "unattributed_count", "damaged",
+        "damaged_count", "truncated", "bytes_reclaimed"}`` — all 14 fields of
+        the engine's ``ReconcileReport``, byte-for-byte the same key set the
+        embedded PyO3 arm projects. Maps to `CatalogService.Reconcile`.
+        """
+        request = catalog_pb2.ReconcileRequest(
+            apply=apply, grace_secs=grace_secs, all=all
+        )
+        resp = self._call(self._catalog.Reconcile, request)
+        return _reconcile_report_to_dict(resp)
 
     def training_job(self, job_id: str) -> RemoteTrainingJob:
         """Attach to an existing training job by id.

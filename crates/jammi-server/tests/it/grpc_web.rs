@@ -55,6 +55,7 @@ async fn start_session_only_server() -> (
         tenant_resolver: jammi_server::grpc::session::SessionIdTenantResolver::arc(
             store_for_server,
         ),
+        admin_authorizer: None,
     };
     let (addr, handle) = super::common::grpc::spawn_bound_chain(chain, shutdown_rx).await;
 

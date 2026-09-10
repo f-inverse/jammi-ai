@@ -208,5 +208,9 @@ pub fn result_table_from_proto(table: pb::ResultTable) -> Result<ResultTableReco
         // directly, so it has no use for these here.
         storage_precision: None,
         oversample: None,
+        // The writer lease is server-side bookkeeping on a `building` row;
+        // a wire result is a `ready` table, so neither field is carried.
+        writer_id: None,
+        lease_expires_at: None,
     })
 }

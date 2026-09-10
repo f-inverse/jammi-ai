@@ -465,11 +465,11 @@ fn read_gguf_header(path: &Path, model_id: &str) -> Result<gguf_file::Content> {
 /// (`jammi_numerics::precision.rs:38-41`) but by `GpuConfig`'s manual `impl
 /// Default` hardcoding
 /// `compute_precision: jammi_numerics::ComputePrecision::F32`,
-/// `jammi-db/src/config/mod.rs:1326` — reached via `device_config.compute_precision`
+/// `jammi-db/src/config/mod.rs:1381` — reached via `device_config.compute_precision`
 /// (`DeviceConfig::from_config`, `backend/mod.rs:45`) ← `config.gpu.compute_precision`
 /// (the mapping itself, `backend/mod.rs:50`),
 /// whose missing-field fallback is routed by `GpuConfig`'s container-level
-/// `#[serde(default, deny_unknown_fields)]`, `jammi-db/src/config/mod.rs:634`, to
+/// `#[serde(default, deny_unknown_fields)]`, `jammi-db/src/config/mod.rs:639`, to
 /// `GpuConfig::default()`, never to `ComputePrecision::default()`, making
 /// it a second hand-written `F32` default independent of `precision.rs:40`
 /// and thus able to drift from it).

@@ -161,21 +161,26 @@ let root = StorageUrl::parse("s3://benchmarks/jammi_db")?;
 let registry = StorageRegistry::new();
 // `AnnIndexConfig` tunes the HNSW sidecar index every embedding table carries;
 // the default reproduces the index backend's built-in defaults. The last
-// argument is the LOCAL cache directory each remote ANN segment is materialised
-// into before USearch opens it (a `file://` root loads its segments in place,
-// so it is unused there).
-let cache_root = std::path::PathBuf::from("/var/lib/jammi/index_cache");
+// argument, `local_cache_dir`, is the PARENT of the two LOCAL caches the store
+// derives: `{local_cache_dir}/index` (each remote ANN segment materialised
+// before USearch opens it — a `file://` root loads its segments in place, so
+// it is unused there) and `{local_cache_dir}/artifact` (the model-artifact
+// fetch cache the store's own internal `ArtifactStore`, rooted at
+// `{root}/models`, uses). Both are always local paths, even when `root` is a
+// cloud scheme, since USearch and the model loader both read the local
+// filesystem.
+let local_cache_dir = std::path::PathBuf::from("/var/lib/jammi/cache");
 let result_store = Arc::new(ResultStore::with_root(
     root,
     registry,
     catalog,
     AnnIndexConfig::default(),
-    cache_root,
+    local_cache_dir,
 )?);
 # Ok(()) }
 ```
 
-Every result table the session creates writes its Parquet and sidecar ANN index to that prefix; `delete_table_files` and the crash-recovery pass operate against the same backend.
+Every result table the session creates writes its Parquet and sidecar ANN index under a tenant-attributed prefix of that root (`{root}/_global/{table}.parquet` for a GLOBAL table, `{root}/{tenant-uuid}/{table}.parquet` for a tenant's); `delete_table_files` and the crash-recovery pass operate against the same backend. Model artifacts (`ResultStore::artifact_store`) share the root's `models/` sub-prefix, attributed the same way (`models/{seg}/{job_id}/…`) — one storage knob serves both result tables and trained models.
 
 ## Config-driven result storage
 

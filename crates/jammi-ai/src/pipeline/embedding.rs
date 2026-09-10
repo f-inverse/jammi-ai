@@ -115,9 +115,11 @@ impl<'a> EmbeddingPipeline<'a> {
             }
         }
 
-        // Create result table in catalog
+        // Create the lease-owned building table in the catalog. Every `?`
+        // between here and `finish` unwinds through the handle's Drop (a
+        // best-effort `building -> failed` CAS, no byte deletion).
         let col_list = columns.join(",");
-        let table_info = self
+        let building = self
             .result_store
             .create_table(
                 source_id,
@@ -167,7 +169,7 @@ impl<'a> EmbeddingPipeline<'a> {
         let embedding_schema = jammi_db::store::schema::embedding_table_schema(embedding_dim);
         let writer = self
             .result_store
-            .open_writer(&table_info.parquet_url, embedding_schema)
+            .open_writer(building.parquet_url(), embedding_schema)
             .await?;
         // Fresh creation — `create_table` above just stamped this table's
         // catalog row with today's deployment default, so the same default
@@ -176,13 +178,7 @@ impl<'a> EmbeddingPipeline<'a> {
         let ann_config = &self.session.inner_config().embedding.ann;
         let sidecar = SidecarIndex::new(embedding_dim, ann_config, ann_config.storage_precision)?;
         let checkpoint_interval = self.session.inner_config().embedding.checkpoint_interval;
-        let mut sink = ResultSink::for_embeddings(
-            writer,
-            sidecar,
-            self.session.catalog(),
-            table_info.table_name.clone(),
-            checkpoint_interval,
-        );
+        let mut sink = ResultSink::for_embeddings(writer, sidecar, &building, checkpoint_interval);
 
         // Execute and stream results through sink
         let task_ctx = self.session.context().task_ctx();
@@ -234,54 +230,42 @@ impl<'a> EmbeddingPipeline<'a> {
         }
 
         for batch in &batches {
+            if !building.is_live() {
+                // The lease was claimed by recovery (a peer decided this
+                // writer was dead): stop streaming bytes into a table this
+                // writer no longer owns. `abort` runs the writer's own CAS,
+                // which misses against the claimed row and deletes nothing —
+                // the claimant owns the bytes now.
+                drop(sink);
+                let table = building.table_name().to_string();
+                return Err(match building.abort().await {
+                    Ok(()) => JammiError::LeaseLost { table },
+                    Err(e) => e,
+                });
+            }
             sink.write_batch(batch).await?;
         }
 
         let (row_count, index) = sink.finalize().await?;
 
-        // Persist the built index as this table's first ANN segment (segment 0).
-        // The `building` catalog row carries the table's persisted precision,
-        // which `append_segment` checks the built index against (B4).
+        // Persist the built index as this table's first ANN segment (segment 0)
+        // under the writer's lease. The handle carries the table's persisted
+        // precision, which `append_segment` checks the built index against (B4).
         if let Some(ref idx) = index {
-            let building = self
-                .session
-                .catalog()
-                .get_result_table(&table_info.table_name)
-                .await?
-                .ok_or_else(|| {
-                    JammiError::Catalog(format!(
-                        "Result table '{}' not found while persisting its index segment",
-                        table_info.table_name
-                    ))
-                })?;
-            self.result_store.append_segment(&building, idx).await?;
+            building.append_segment(idx).await?;
         }
 
-        // Finalize with the contract built at the top (the same definition +
-        // anchors the cache probe keyed on), write the manifest sidecar, register
-        // in DataFusion, and flip the catalog row `building -> ready`.
-        self.result_store
-            .finalize_with_manifest(
+        // Finish with the contract built at the top (the same definition +
+        // anchors the cache probe keyed on): renew the lease, write the
+        // manifest sidecar, flip the catalog row `building -> ready` by CAS,
+        // and register in DataFusion.
+        let record = building
+            .finish(
                 self.session.context(),
-                &table_info.table_name,
-                &table_info.parquet_url,
                 row_count,
                 jammi_db::store::manifest::Materialization::new(&descriptor, &env, inputs),
             )
             .await?;
-
-        // Return the updated record
-        let record = self
-            .session
-            .catalog()
-            .get_result_table(&table_info.table_name)
-            .await?
-            .ok_or_else(|| {
-                JammiError::Catalog(format!(
-                    "Result table '{}' not found after finalization",
-                    table_info.table_name
-                ))
-            })?;
         Ok((record, CacheOutcome::Computed))
     }
 }

@@ -215,6 +215,43 @@ pub async fn start_engine_server_with_tiers(tiers: jammi_server::tiers::TierSet)
     }
 }
 
+/// An [`jammi_server::grpc::catalog::AdminAuthorizer`] that permits every
+/// `all = true` [`Reconcile`](jammi_server::grpc::proto::catalog::ReconcileRequest)
+/// pass unconditionally — the test double the K4 embedded/remote parity
+/// oracle and the denied-by-default oracle's positive arm wire onto a chain
+/// via [`start_engine_server_with_admin`]. Never reached in production: the
+/// shipped default is `None`, which every OTHER fixture in this module gets.
+pub struct AllowAllAdmin;
+
+impl jammi_server::grpc::catalog::AdminAuthorizer for AllowAllAdmin {
+    fn authorize(&self, _metadata: &tonic::metadata::MetadataMap) -> Result<(), tonic::Status> {
+        Ok(())
+    }
+}
+
+/// Like [`start_engine_server_with_tiers`], but with an explicit
+/// [`jammi_server::grpc::catalog::AdminAuthorizer`] wired onto the chain, so a
+/// test can exercise `Reconcile`'s `all = true` cross-tenant admin pass (or
+/// its refusal) without every other fixture in this module having to carry
+/// the same seam.
+pub async fn start_engine_server_with_admin(
+    tiers: jammi_server::tiers::TierSet,
+    admin_authorizer: Option<Arc<dyn jammi_server::grpc::catalog::AdminAuthorizer>>,
+) -> EngineServer {
+    let (chain, engine, dir) =
+        engine_chain_at_with_admin(ephemeral_addr(), tiers, admin_authorizer).await;
+    let (shutdown_tx, shutdown_rx) = oneshot::channel::<()>();
+    let (addr, handle) = spawn_bound_chain(chain, shutdown_rx).await;
+
+    EngineServer {
+        addr,
+        shutdown: shutdown_tx,
+        _dir: dir,
+        handle: AbortOnDropHandle(handle),
+        engine,
+    }
+}
+
 /// Build the engine-backed [`jammi_server::runtime::GrpcChain`] the fixtures
 /// above and below assemble: a fresh engine session over a temp artifact dir,
 /// mounting exactly `tiers`, addressed at `addr`. Returns the chain plus the
@@ -232,9 +269,27 @@ async fn engine_chain_at(
     Arc<InferenceSession>,
     TempDir,
 ) {
+    engine_chain_at_with_admin(addr, tiers, None).await
+}
+
+/// Like [`engine_chain_at`], but with an explicit
+/// [`jammi_server::grpc::catalog::AdminAuthorizer`] wired onto the chain —
+/// the seam `Reconcile`'s `all = true` cross-tenant admin pass gates on. The
+/// shipped default every other fixture gets is `None` (refuses `all = true`);
+/// tests exercising the admin pass (the K4 parity oracle, the denied-by-default
+/// oracle) pass `Some(Arc::new(AllowAllAdmin))` here.
+async fn engine_chain_at_with_admin(
+    addr: SocketAddr,
+    tiers: jammi_server::tiers::TierSet,
+    admin_authorizer: Option<Arc<dyn jammi_server::grpc::catalog::AdminAuthorizer>>,
+) -> (
+    jammi_server::runtime::GrpcChain,
+    Arc<InferenceSession>,
+    TempDir,
+) {
     let dir = tempfile::tempdir().expect("tempdir");
     let cfg = test_config(dir.path());
-    let (chain, engine) = engine_chain_from_config(addr, tiers, cfg).await;
+    let (chain, engine) = engine_chain_from_config(addr, tiers, cfg, admin_authorizer).await;
     (chain, engine, dir)
 }
 
@@ -247,6 +302,7 @@ async fn engine_chain_from_config(
     addr: SocketAddr,
     tiers: jammi_server::tiers::TierSet,
     cfg: jammi_db::config::JammiConfig,
+    admin_authorizer: Option<Arc<dyn jammi_server::grpc::catalog::AdminAuthorizer>>,
 ) -> (jammi_server::runtime::GrpcChain, Arc<InferenceSession>) {
     // `open` (not `new`) so the engine-backed server registers the compound
     // query SQL functions (`annotate`, …) on its context — the same shape the
@@ -274,6 +330,7 @@ async fn engine_chain_from_config(
         tiers,
         metrics: Arc::new(jammi_server::routes::health::MetricsRegistry::new().unwrap()),
         tenant_resolver: jammi_server::grpc::session::SessionIdTenantResolver::arc(store),
+        admin_authorizer,
     };
     (chain, engine)
 }
@@ -440,7 +497,8 @@ pub async fn start_engine_server_with_run_worker(run_worker: bool) -> EngineServ
         "the loaded config must root its artifacts in this fixture's temp dir"
     );
 
-    let (chain, engine) = engine_chain_from_config(ephemeral_addr(), non_event_tiers(), cfg).await;
+    let (chain, engine) =
+        engine_chain_from_config(ephemeral_addr(), non_event_tiers(), cfg, None).await;
     let (shutdown_tx, shutdown_rx) = oneshot::channel::<()>();
     let (addr, handle) = spawn_bound_chain(chain, shutdown_rx).await;
 
@@ -466,7 +524,8 @@ pub async fn start_engine_server_with_broker(
     let dir = tempfile::tempdir().expect("tempdir");
     let mut cfg = test_config(dir.path());
     cfg.broker = broker;
-    let (chain, engine) = engine_chain_from_config(ephemeral_addr(), non_event_tiers(), cfg).await;
+    let (chain, engine) =
+        engine_chain_from_config(ephemeral_addr(), non_event_tiers(), cfg, None).await;
     let (shutdown_tx, shutdown_rx) = oneshot::channel::<()>();
     let (addr, handle) = spawn_bound_chain(chain, shutdown_rx).await;
 

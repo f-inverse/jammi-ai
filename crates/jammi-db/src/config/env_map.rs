@@ -39,6 +39,7 @@ pub(crate) const TOP_LEVEL_FIELDS: &[&str] = &[
     "inference",
     "embedding",
     "fine_tuning",
+    "lease",
     "training",
     "cache",
     "server",

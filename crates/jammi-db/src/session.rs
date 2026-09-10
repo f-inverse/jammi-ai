@@ -602,6 +602,20 @@ impl JammiSession {
     /// disk files (Parquet + index), ANN cache, and DataFusion registration.
     ///
     /// Eval runs are preserved as immutable historical records.
+    ///
+    /// **The byte deletion below (step 2) is routed through the CAS-guarded
+    /// arm, not an independent judgment call.** Step 1's
+    /// [`crate::catalog::Catalog::delete_result_tables_for_source`] is the
+    /// deletion arm itself — one atomic `DELETE … RETURNING` guarded by the
+    /// same live-lease predicate every other building-row transition uses,
+    /// under a same-transaction recheck that rolls back the WHOLE delete
+    /// (refusing with [`crate::error::JammiError::SourceBusy`]) if any
+    /// `building` row with a live lease references the source. Step 2's loop
+    /// iterates ONLY `result_tables`, step 1's returned set — so bytes are
+    /// deleted for exactly the rows the atomic guard actually committed to
+    /// deleting, never a row this call merely intended to delete. When step 1
+    /// errors (`SourceBusy` or otherwise), step 2 never runs at all: no bytes
+    /// are touched, and neither is the source row at step 3.
     pub async fn remove_source(&self, source_id: &str) -> Result<()> {
         // 0. Capture each result table's ANN segment bundle URLs BEFORE the
         //    catalog delete: `delete_result_tables_for_source` cascades to
@@ -609,6 +623,14 @@ impl JammiSession {
         //    while those rows still exist. The enumeration is a superset of the
         //    delete set (its tenant predicate is wider), so every deleted
         //    table's segments are covered; extra entries are simply unused.
+        //
+        //    Window: a segment APPENDED to one of these tables between this
+        //    read and step 1's delete is not in `segment_paths` and its bytes
+        //    are not cleaned up here — never a safety issue (the row itself
+        //    still gets deleted or refuses via `SourceBusy` exactly as it
+        //    would otherwise), only a completeness gap: the orphaned segment
+        //    bundle is left for a later `reconcile` pass to reclaim, the same
+        //    as any other object whose row went away underneath it.
         let doomed = self
             .catalog
             .find_result_tables(source_id, None, None)
@@ -686,7 +708,16 @@ impl JammiSession {
             }
         }
 
-        // 3. Delete the source row from the catalog.
+        // 3. Delete the source row from the catalog. `result_tables.source_id`
+        // carries no foreign key back to `sources` (the only FK that ever
+        // referenced this table lived on the long-dropped `embedding_sets`,
+        // removed by migration 004), so this statement cannot itself observe
+        // — let alone refuse — a table CREATED for this source in the window
+        // between step 1's atomic delete and this statement. That race is
+        // still open and is tracked as an escape (`.jammi/escapes.jsonl`),
+        // not fixed here: the still-live consequence is an orphan
+        // `result_tables` row whose source is gone, left for a `reconcile`
+        // pass to eventually reap by the ordinary orphan-object rule.
         self.catalog.remove_source(source_id).await?;
 
         // 4. Deregister the source's result tables from the tenant-gating

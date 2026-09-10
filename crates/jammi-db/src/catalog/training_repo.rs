@@ -3,10 +3,12 @@ use std::time::Duration;
 use serde::{Deserialize, Serialize};
 
 use super::backend::{BackendError, Row, SqlValue, TxOptions};
+use super::lease::{lease_deadline_expr, lease_expired_clause};
 use super::status::TrainingJobStatus;
 use super::Catalog;
 use crate::error::{JammiError, Result};
 use crate::tenant::TenantId;
+use crate::tenant_scope::TenantBinding;
 
 /// A row from the `training_jobs` catalog table.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -169,7 +171,7 @@ const ACCELERATION_REPORT_FINALIZED_WITHOUT_DETERMINATION: &str =
 /// The three-valued comparison is the point: a legacy SQL `NULL`
 /// (pre-migration-026 "unknown") is neither equal nor unequal to the marker, so
 /// `CASE WHEN NULL = '…'` is not true and the `ELSE` arm preserves the `NULL`.
-/// `CASE`/`WHEN`/`ELSE` is core SQL — identical on SQLite and Postgres (B4), so
+/// `CASE`/`WHEN`/`ELSE` is core SQL — identical on SQLite and Postgres, so
 /// no dialect branch is needed the way [`Catalog::claim_next_training_job`]'s
 /// `FOR UPDATE SKIP LOCKED` needs one.
 fn retire_pending_report_clause(pending_param: u8, terminal_param: u8) -> String {
@@ -179,23 +181,11 @@ fn retire_pending_report_clause(pending_param: u8, terminal_param: u8) -> String
     )
 }
 
-/// Format leases write into `lease_expires_at`. Lexicographic ordering of two
-/// timestamps in this fixed-width UTC form matches chronological ordering, so
-/// the SQL `lease_expires_at < $now` comparison is correct on both backends
-/// without dialect-specific interval arithmetic.
-const LEASE_TS_FORMAT: &str = "%Y-%m-%dT%H:%M:%S%.6fZ";
-
-/// `now`, formatted for an engine-clock lease comparison or stamp.
-fn lease_now() -> String {
-    chrono::Utc::now().format(LEASE_TS_FORMAT).to_string()
-}
-
-/// `now + lease`, formatted as a lease deadline.
-fn lease_deadline(lease: Duration) -> String {
-    let expiry =
-        chrono::Utc::now() + chrono::Duration::from_std(lease).unwrap_or(chrono::Duration::MAX);
-    expiry.format(LEASE_TS_FORMAT).to_string()
-}
+// The lease timestamp format and clock helpers live in [`super::lease`] — the
+// one primitive every leased row family (training jobs, building result
+// tables) shares. Re-exported here so this repo's callers and tests keep the
+// names they had.
+pub use super::lease::{lease_deadline, lease_now, LEASE_TS_FORMAT};
 
 fn parse_row(row: &Row<'_>) -> std::result::Result<TrainingJobRecord, BackendError> {
     let metrics_raw: Option<String> = row.try_get("metrics")?;
@@ -422,12 +412,19 @@ impl Catalog {
         Ok(())
     }
 
-    /// Get a training job by ID. Tenant-filtered.
+    /// Get a training job by ID. Tenant-filtered; inside a
+    /// [`crate::session::JammiSession::with_admin_scope`] closure the tenant
+    /// predicate is dropped and the row resolves by its primary key alone.
     pub async fn get_training_job(&self, job_id: &str) -> Result<TrainingJobRecord> {
-        let sql = format!(
-            "SELECT {SELECT_COLS} FROM training_jobs WHERE job_id = $1 \
-               AND (tenant_id = $2 OR tenant_id IS NULL)"
-        );
+        let admin = TenantBinding::is_admin_scope();
+        let sql = if admin {
+            format!("SELECT {SELECT_COLS} FROM training_jobs WHERE job_id = $1")
+        } else {
+            format!(
+                "SELECT {SELECT_COLS} FROM training_jobs WHERE job_id = $1 \
+                   AND (tenant_id = $2 OR tenant_id IS NULL)"
+            )
+        };
         let id = job_id.to_string();
         let id_for_err = id.clone();
         let tenant = self.current_tenant();
@@ -440,15 +437,11 @@ impl Catalog {
                 },
                 |tx| {
                     Box::pin(async move {
-                        tx.query_opt(
-                            &sql,
-                            &[
-                                SqlValue::TextOwned(id),
-                                SqlValue::from(tenant.map(|t| t.to_string())),
-                            ],
-                            parse_row,
-                        )
-                        .await
+                        let mut params = vec![SqlValue::TextOwned(id)];
+                        if !admin {
+                            params.push(SqlValue::from(tenant.map(|t| t.to_string())));
+                        }
+                        tx.query_opt(&sql, &params, parse_row).await
                     })
                 },
             )
@@ -896,12 +889,19 @@ impl Catalog {
     }
 
     /// List training jobs visible to the session tenant, most recent first.
+    /// Inside a [`crate::session::JammiSession::with_admin_scope`] closure the
+    /// tenant predicate is dropped and every tenant's jobs are returned.
     pub async fn list_training_jobs(&self) -> Result<Vec<TrainingJobRecord>> {
-        let sql = format!(
-            "SELECT {SELECT_COLS} FROM training_jobs \
-             WHERE tenant_id = $1 OR tenant_id IS NULL \
-             ORDER BY created_at DESC"
-        );
+        let admin = TenantBinding::is_admin_scope();
+        let sql = if admin {
+            format!("SELECT {SELECT_COLS} FROM training_jobs ORDER BY created_at DESC")
+        } else {
+            format!(
+                "SELECT {SELECT_COLS} FROM training_jobs \
+                 WHERE tenant_id = $1 OR tenant_id IS NULL \
+                 ORDER BY created_at DESC"
+            )
+        };
         let tenant = self.current_tenant();
         Ok(self
             .backend()
@@ -912,12 +912,12 @@ impl Catalog {
                 },
                 |tx| {
                     Box::pin(async move {
-                        tx.query(
-                            &sql,
-                            &[SqlValue::from(tenant.map(|t| t.to_string()))],
-                            parse_row,
-                        )
-                        .await
+                        let params: Vec<SqlValue<'static>> = if admin {
+                            Vec::new()
+                        } else {
+                            vec![SqlValue::from(tenant.map(|t| t.to_string()))]
+                        };
+                        tx.query(&sql, &params, parse_row).await
                     })
                 },
             )
@@ -957,9 +957,9 @@ impl Catalog {
         let running = TrainingJobStatus::Running.to_string();
         let worker_id = worker_id.to_string();
         let now = lease_now();
-        let deadline = lease_deadline(lease);
+        let kind = self.backend().backend_kind();
 
-        let candidate = match self.backend().backend_kind() {
+        let candidate = match kind {
             super::backend::BackendKind::Postgres => {
                 "(SELECT job_id FROM training_jobs WHERE status = $3 AND claimable \
                   ORDER BY priority DESC, created_at LIMIT 1 FOR UPDATE SKIP LOCKED)"
@@ -969,30 +969,28 @@ impl Catalog {
                   ORDER BY priority DESC, created_at LIMIT 1)"
             }
         };
+        let mut params: Vec<SqlValue<'static>> = vec![
+            SqlValue::TextOwned(running),
+            SqlValue::TextOwned(worker_id),
+            SqlValue::TextOwned(queued),
+        ];
+        // The lease deadline is the DATABASE's own clock on Postgres (never
+        // this process's — `catalog::lease`'s module docs): $4 is the lease
+        // WINDOW in seconds, not a precomputed timestamp.
+        let deadline_expr = lease_deadline_expr(kind, lease, &mut params);
+        params.push(SqlValue::TextOwned(now));
+        let updated_at_bind = params.len();
         let sql = format!(
             "UPDATE training_jobs \
-             SET status = $1, claimed_by = $2, lease_expires_at = $4, \
-                 attempts = attempts + 1, updated_at = $5 \
+             SET status = $1, claimed_by = $2, lease_expires_at = {deadline_expr}, \
+                 attempts = attempts + 1, updated_at = ${updated_at_bind} \
              WHERE job_id = {candidate} AND status = $3 \
              RETURNING {SELECT_COLS}"
         );
 
         self.backend()
             .transaction(TxOptions::default(), |tx| {
-                Box::pin(async move {
-                    tx.query_opt(
-                        &sql,
-                        &[
-                            SqlValue::TextOwned(running),
-                            SqlValue::TextOwned(worker_id),
-                            SqlValue::TextOwned(queued),
-                            SqlValue::TextOwned(deadline),
-                            SqlValue::TextOwned(now),
-                        ],
-                        parse_row,
-                    )
-                    .await
-                })
+                Box::pin(async move { tx.query_opt(&sql, &params, parse_row).await })
             })
             .await
             .map_err(Into::into)
@@ -1013,37 +1011,52 @@ impl Catalog {
         let job_id = job_id.to_string();
         let worker_id = worker_id.to_string();
         let now = lease_now();
-        let deadline = lease_deadline(lease);
+        let kind = self.backend().backend_kind();
+        let mut params: Vec<SqlValue<'static>> = Vec::new();
+        // DB-clock deadline (`$1`) — see `catalog::lease`'s module docs.
+        let deadline_expr = lease_deadline_expr(kind, lease, &mut params);
+        params.push(SqlValue::TextOwned(now));
+        params.push(SqlValue::TextOwned(job_id));
+        params.push(SqlValue::TextOwned(running));
+        params.push(SqlValue::TextOwned(worker_id));
+        let sql = format!(
+            "UPDATE training_jobs \
+             SET lease_expires_at = {deadline_expr}, updated_at = $2 \
+             WHERE job_id = $3 AND status = $4 AND claimed_by = $5"
+        );
 
         let updated = self
             .backend()
             .transaction(TxOptions::default(), |tx| {
-                Box::pin(async move {
-                    tx.execute(
-                        "UPDATE training_jobs \
-                         SET lease_expires_at = $1, updated_at = $2 \
-                         WHERE job_id = $3 AND status = $4 AND claimed_by = $5",
-                        &[
-                            SqlValue::TextOwned(deadline),
-                            SqlValue::TextOwned(now),
-                            SqlValue::TextOwned(job_id),
-                            SqlValue::TextOwned(running),
-                            SqlValue::TextOwned(worker_id),
-                        ],
-                    )
-                    .await
-                })
+                Box::pin(async move { tx.execute(&sql, &params).await })
             })
             .await?;
         Ok(updated == 1)
     }
 
-    /// Reclaim running jobs whose lease has expired. For each `running` job
-    /// with `lease_expires_at < now`: re-queue it (clearing `claimed_by` and
-    /// `lease_expires_at`) when `attempts < max_attempts`, otherwise mark it
-    /// `failed` and record the lease-exhaustion reason in `metrics`. Returns
-    /// the number of jobs actioned across both branches. Not tenant-scoped —
-    /// it sweeps every tenant's expired leases.
+    /// Reclaim running jobs whose lease is ABSENT OR EXPIRED
+    /// ([`lease_expired_clause`]'s `col IS NULL OR col < now()` — one
+    /// predicate, not two cases). For each such `running` job: re-queue it
+    /// (clearing `claimed_by` and `lease_expires_at`) when
+    /// `attempts < max_attempts`, otherwise mark it `failed` and record the
+    /// lease-exhaustion reason in `metrics`. Returns the number of jobs
+    /// actioned across both branches. Not tenant-scoped — it sweeps every
+    /// tenant's expired leases.
+    ///
+    /// **A `running` job with a NULL lease is reclaimable, the same as an
+    /// expired one.** This is deliberate, not a missing `lease_expires_at IS
+    /// NOT NULL` guard: [`Self::claim_next_training_job`] ALWAYS stamps
+    /// `lease_expires_at` on the row it hands back `running`, so a `running`
+    /// row with no lease can never arise through this engine's own claim
+    /// path — the only way to observe one is a hand-authored row or a schema
+    /// migration that leaves a legacy `running` row lease-less. Either way,
+    /// "no lease" can never mean "a live writer holds this without a
+    /// deadline"; it can only mean "no live writer is actually enforcing
+    /// one", which is exactly the state
+    /// [`Owner::ExpiredLease`](super::result_repo::Owner::ExpiredLease)'s
+    /// contract already treats as reclaimable on the result-table side of
+    /// this same catalog. Restoring an `IS NOT NULL` guard here would strand
+    /// such a row `running` forever.
     ///
     /// Both arms also move `acceleration_report`, in their OWN `UPDATE` (never
     /// a read-then-write): the claimant whose report this column describes is
@@ -1078,6 +1091,7 @@ impl Catalog {
         let failed = TrainingJobStatus::Failed.to_string();
         let max_attempts = max_attempts as i64;
         let now = lease_now();
+        let kind = self.backend().backend_kind();
         let failure_metrics = serde_json::json!({
             "error_message": "training job lease expired after exhausting max attempts"
         })
@@ -1085,50 +1099,55 @@ impl Catalog {
         // Placeholders stay in ascending order of first appearance in the SQL
         // text (SQLite assigns `$N` indices by first appearance).
         let exhausted_retire = retire_pending_report_clause(3, 4);
+
+        // The expiry comparison is against the catalog backend's OWN clock
+        // on Postgres — no bind of its own there; on SQLite it binds
+        // `lease_now()` (`catalog::lease`'s module docs). `updated_at` stays
+        // an ordinary app-clock bookkeeping stamp, bound separately. Each
+        // statement below builds its OWN params (a SEPARATE bind numbering),
+        // so `expired`'s bind — present or not — lands at whatever position
+        // it actually falls in THAT statement's text.
+        let mut requeued_params: Vec<SqlValue<'static>> = vec![
+            SqlValue::TextOwned(queued),
+            SqlValue::Text(ACCELERATION_REPORT_PENDING),
+            SqlValue::TextOwned(now.clone()),
+            SqlValue::TextOwned(running.clone()),
+        ];
+        let requeued_expired = lease_expired_clause("lease_expires_at", kind, &mut requeued_params);
+        requeued_params.push(SqlValue::Int(max_attempts));
+        let requeued_max_bind = requeued_params.len();
+        let requeued_sql = format!(
+            "UPDATE training_jobs \
+             SET status = $1, claimed_by = NULL, lease_expires_at = NULL, \
+                 acceleration_report = $2, updated_at = $3 \
+             WHERE status = $4 AND {requeued_expired} AND attempts < ${requeued_max_bind}"
+        );
+
+        let mut exhausted_params: Vec<SqlValue<'static>> = vec![
+            SqlValue::TextOwned(failed),
+            SqlValue::TextOwned(failure_metrics),
+            SqlValue::Text(ACCELERATION_REPORT_PENDING),
+            SqlValue::Text(ACCELERATION_REPORT_LEASE_EXPIRED_EXHAUSTED),
+            SqlValue::TextOwned(now),
+            SqlValue::TextOwned(running),
+        ];
+        let exhausted_expired =
+            lease_expired_clause("lease_expires_at", kind, &mut exhausted_params);
+        exhausted_params.push(SqlValue::Int(max_attempts));
+        let exhausted_max_bind = exhausted_params.len();
         let exhausted_sql = format!(
             "UPDATE training_jobs \
              SET status = $1, metrics = $2, {exhausted_retire}, lease_expires_at = NULL, \
                  updated_at = $5 \
-             WHERE status = $6 AND lease_expires_at IS NOT NULL \
-               AND lease_expires_at < $7 AND attempts >= $8"
+             WHERE status = $6 AND {exhausted_expired} AND attempts >= ${exhausted_max_bind}"
         );
 
         let actioned = self
             .backend()
             .transaction(TxOptions::default(), |tx| {
                 Box::pin(async move {
-                    let requeued = tx
-                        .execute(
-                            "UPDATE training_jobs \
-                             SET status = $1, claimed_by = NULL, lease_expires_at = NULL, \
-                                 acceleration_report = $2, updated_at = $3 \
-                             WHERE status = $4 AND lease_expires_at IS NOT NULL \
-                               AND lease_expires_at < $5 AND attempts < $6",
-                            &[
-                                SqlValue::TextOwned(queued),
-                                SqlValue::Text(ACCELERATION_REPORT_PENDING),
-                                SqlValue::TextOwned(now.clone()),
-                                SqlValue::TextOwned(running.clone()),
-                                SqlValue::TextOwned(now.clone()),
-                                SqlValue::Int(max_attempts),
-                            ],
-                        )
-                        .await?;
-                    let exhausted = tx
-                        .execute(
-                            &exhausted_sql,
-                            &[
-                                SqlValue::TextOwned(failed),
-                                SqlValue::TextOwned(failure_metrics),
-                                SqlValue::Text(ACCELERATION_REPORT_PENDING),
-                                SqlValue::Text(ACCELERATION_REPORT_LEASE_EXPIRED_EXHAUSTED),
-                                SqlValue::TextOwned(now.clone()),
-                                SqlValue::TextOwned(running),
-                                SqlValue::TextOwned(now),
-                                SqlValue::Int(max_attempts),
-                            ],
-                        )
-                        .await?;
+                    let requeued = tx.execute(&requeued_sql, &requeued_params).await?;
+                    let exhausted = tx.execute(&exhausted_sql, &exhausted_params).await?;
                     Ok(requeued + exhausted)
                 })
             })

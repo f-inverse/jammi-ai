@@ -760,7 +760,7 @@ impl ProducingDescriptor {
 /// The materialization contract a producer supplies for one result table — the
 /// producing description, the output-affecting environment, and the resolved
 /// input anchors, grouped so the single funnel
-/// ([`crate::store::ResultStore::finalize_with_manifest`]) takes one value
+/// ([`crate::store::BuildingTable::finish`]) takes one value
 /// rather than three positional arguments. Borrows the descriptor and
 /// environment (the producer owns them for the call's duration) and owns the
 /// anchors (resolved per-write).

@@ -99,6 +99,7 @@ async fn start_fixture() -> Fixture {
         tiers: jammi_server::tiers::TierSet::all_compiled(),
         metrics: Arc::new(jammi_server::routes::health::MetricsRegistry::new().unwrap()),
         tenant_resolver: jammi_server::grpc::session::SessionIdTenantResolver::arc(store),
+        admin_authorizer: None,
     };
     let (addr, handle) = super::common::grpc::spawn_bound_chain(chain, shutdown_rx).await;
 

@@ -3,6 +3,7 @@ pub mod backend_postgres;
 pub mod backend_sqlite;
 pub mod channel_repo;
 pub mod eval_repo;
+pub mod lease;
 pub mod migrations;
 pub mod model_repo;
 pub mod mutable_repo;

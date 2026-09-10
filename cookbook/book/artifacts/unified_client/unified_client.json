@@ -106,6 +106,7 @@
       "propagate_embeddings",
       "publish_topic",
       "recompute",
+      "reconcile",
       "register_channel",
       "register_topic",
       "rrf_fuse",
@@ -121,7 +122,7 @@
       "training_job",
       "verify_materialization"
     ],
-    "verb_count": 53
+    "verb_count": 54
   },
   "taxonomy": {
     "embedded_bad_arg": {

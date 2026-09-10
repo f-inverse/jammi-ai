@@ -89,6 +89,28 @@ async fn reset_queue(catalog: &Catalog) {
         .unwrap();
 }
 
+/// Force `lease_expires_at = NULL` on one row via raw SQL — the state a
+/// `running` row can never actually reach through this engine's own claim
+/// path ([`claim_next_training_job`] always stamps a lease), but a fixture
+/// must still be able to MANUFACTURE it directly to pin the reclaim
+/// contract against the state rather than against how a row got there.
+async fn force_null_lease(catalog: &Catalog, job_id: &str) {
+    let job_id = job_id.to_string();
+    catalog
+        .backend_arc()
+        .transaction(TxOptions::default(), |tx| {
+            Box::pin(async move {
+                tx.execute(
+                    "UPDATE training_jobs SET lease_expires_at = NULL WHERE job_id = $1",
+                    &[SqlValue::TextOwned(job_id)],
+                )
+                .await
+            })
+        })
+        .await
+        .unwrap();
+}
+
 /// Set `priority`/`claimable` on one row via raw SQL, mirroring [`reset_queue`]
 /// — the claim-policy columns are catalog data, so the fixture writes them as
 /// data rather than through any typed setter (there is none; the engine only
@@ -1239,6 +1261,97 @@ async fn reclaim_leaves_live_leases_untouched(backend: BackendKind) {
     assert_eq!(actioned, 0, "a live lease is not reclaimed");
     let still_running = catalog.get_training_job("live").await.unwrap();
     assert_eq!(still_running.status, TrainingJobStatus::Running.to_string());
+}
+
+/// PINS the claim side of the one-primitive reclaim rule ("absent or expired
+/// is reclaimable" — [`jammi_db::catalog::training_repo::Owner::ExpiredLease`]'s
+/// contract): [`Catalog::claim_next_training_job`] ALWAYS stamps
+/// `lease_expires_at` on the row it hands back `running` — a `running` row
+/// with a NULL lease can never arise from this engine's own claim path, which
+/// is exactly why [`Catalog::reclaim_expired_training_jobs`] is entitled to
+/// treat "no lease" as "reclaimable" rather than "not yet leased".
+#[test_case(BackendKind::Sqlite ; "sqlite")]
+#[cfg_attr(
+    feature = "live-postgres-tests",
+    test_case(BackendKind::Postgres ; "postgres")
+)]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn claim_always_stamps_a_non_null_lease(backend: BackendKind) {
+    let dir = tempdir().unwrap();
+    let (_session, catalog) = queue_catalog!(backend, dir.path());
+
+    catalog
+        .create_training_job(job_params("stamped"))
+        .await
+        .unwrap();
+    let claimed = catalog
+        .claim_next_training_job("worker", Duration::from_secs(3600))
+        .await
+        .unwrap()
+        .expect("job claimed");
+    assert_eq!(claimed.status, TrainingJobStatus::Running.to_string());
+    assert!(
+        claimed.lease_expires_at.is_some(),
+        "every claim must stamp a non-NULL lease on the row it returns running"
+    );
+
+    // The row read back from the catalog agrees.
+    let row = catalog.get_training_job("stamped").await.unwrap();
+    assert_eq!(row.status, TrainingJobStatus::Running.to_string());
+    assert!(
+        row.lease_expires_at.is_some(),
+        "the persisted row must carry the same non-NULL lease the claim returned"
+    );
+}
+
+/// PINS the reclaim side of the same one-primitive rule: a `running` row
+/// whose `lease_expires_at` is NULL — a state the claim path itself can
+/// never produce (see [`claim_always_stamps_a_non_null_lease`]), manufactured
+/// here directly via [`force_null_lease`] — IS reclaimed, exactly like an
+/// expired (non-NULL, past) lease. `lease_expired_clause`'s `col IS NULL OR
+/// col < now()` is intentional, not a missing `IS NOT NULL` guard: "absent"
+/// and "expired" are the SAME reclaimable state, never distinguished.
+#[test_case(BackendKind::Sqlite ; "sqlite")]
+#[cfg_attr(
+    feature = "live-postgres-tests",
+    test_case(BackendKind::Postgres ; "postgres")
+)]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_running_row_with_a_null_lease_is_reclaimed(backend: BackendKind) {
+    let dir = tempdir().unwrap();
+    let (_session, catalog) = queue_catalog!(backend, dir.path());
+
+    catalog
+        .create_training_job(job_params("null-lease"))
+        .await
+        .unwrap();
+    catalog
+        .claim_next_training_job("worker", Duration::from_secs(3600))
+        .await
+        .unwrap()
+        .expect("job claimed");
+    force_null_lease(&catalog, "null-lease").await;
+
+    let before = catalog.get_training_job("null-lease").await.unwrap();
+    assert_eq!(before.status, TrainingJobStatus::Running.to_string());
+    assert!(
+        before.lease_expires_at.is_none(),
+        "fixture must actually null the lease"
+    );
+
+    let actioned = catalog.reclaim_expired_training_jobs(5).await.unwrap();
+    assert_eq!(
+        actioned, 1,
+        "a running row with an absent lease must be reclaimed exactly like an expired one"
+    );
+    let after = catalog.get_training_job("null-lease").await.unwrap();
+    assert_eq!(
+        after.status,
+        TrainingJobStatus::Queued.to_string(),
+        "reclaim re-queues a NULL-lease running row under attempts < max_attempts"
+    );
+    assert!(after.claimed_by.is_none());
+    assert!(after.lease_expires_at.is_none());
 }
 
 /// [`Catalog::create_training_job`] writes the explicit `{"state":"pending"}`

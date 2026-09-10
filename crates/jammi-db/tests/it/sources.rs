@@ -3,6 +3,11 @@ use crate::common;
 use jammi_db::catalog::backend::{BackendImpl, BackendKind};
 use jammi_db::catalog::backend_postgres::PostgresBackend;
 use jammi_db::catalog::backend_sqlite::SqliteBackend;
+use jammi_db::catalog::result_repo::{CreateResultTableParams, ResultTableKind};
+use jammi_db::catalog::status::ResultTableStatus;
+use jammi_db::config::StoragePrecision;
+use jammi_db::error::JammiError;
+use jammi_db::model_task::ModelTask;
 use jammi_db::{
     session::JammiSession,
     source::{FileFormat, SourceConnection, SourceType},
@@ -256,6 +261,157 @@ async fn source_crud_list_and_remove(backend: BackendKind) {
         .await
         .unwrap();
     assert!(!rows.is_empty());
+}
+
+/// `remove_source`'s byte deletion routes through
+/// `Catalog::delete_result_tables_for_source`'s atomic CAS-guarded arm — the
+/// SAME atomic `DELETE … RETURNING` + live-lease recheck the catalog test
+/// (`recovery.rs::source_busy_rolls_back_the_whole_delete_not_only_the_busy_row`)
+/// proves. A source with one terminal (`ready`) result table AND one
+/// live-lease `building` result table must refuse the WHOLE removal with
+/// `SourceBusy` and touch NEITHER table's bytes: `remove_source`'s catalog
+/// call (`delete_result_tables_for_source`) either returns the exact set of
+/// rows it deleted (so the byte-deletion loop only ever touches bytes for
+/// rows the CAS-guarded arm actually returned) or errors before deleting
+/// anything at all — there is no path where `remove_source` deletes bytes
+/// for a row the catalog refused to delete.
+#[test_case(BackendKind::Sqlite ; "sqlite")]
+#[cfg_attr(feature = "live-postgres-tests", test_case(BackendKind::Postgres ; "postgres"))]
+#[tokio::test]
+async fn remove_source_refuses_and_touches_nothing_with_a_live_building_table(
+    backend: BackendKind,
+) {
+    let dir = tempdir().unwrap();
+    let session = session_or_skip!(backend, dir);
+
+    let suffix = unique_suffix();
+    let source_id = format!("busy_src_{suffix}");
+    let ready_name = format!("ready_table_{suffix}");
+    let building_name = format!("building_table_{suffix}");
+
+    session
+        .add_source(
+            &source_id,
+            SourceType::File,
+            SourceConnection {
+                url: Some(common::fixture_url("patents.parquet")),
+                format: Some(FileFormat::Parquet),
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+
+    let root = dir.path().join("jammi_db").join("_global");
+    std::fs::create_dir_all(&root).unwrap();
+    let ready_path = root.join(format!("{ready_name}.parquet"));
+    let building_path = root.join(format!("{building_name}.parquet"));
+    std::fs::write(&ready_path, b"ready-bytes").unwrap();
+    std::fs::write(&building_path, b"building-bytes").unwrap();
+
+    let ready_url = format!("file://{}", ready_path.display());
+    let building_url = format!("file://{}", building_path.display());
+    let created_at_ready = jammi_db::catalog::backend::now_sortable();
+    let created_at_building = jammi_db::catalog::backend::now_sortable();
+
+    // A terminal row: created `building` then flipped `ready` (no lease to
+    // clear — `update_result_table_status` is the non-building-CAS arm every
+    // other terminal-row test in this suite uses).
+    session
+        .catalog()
+        .create_result_table(CreateResultTableParams {
+            table_name: &ready_name,
+            source_id: &source_id,
+            model_id: "busy-model",
+            task: ModelTask::TextEmbedding,
+            kind: ResultTableKind::Model,
+            derived_from: None,
+            parquet_path: &ready_url,
+            dimensions: Some(4),
+            key_column: Some("id"),
+            text_columns: None,
+            storage_precision: StoragePrecision::F32,
+            oversample: 4,
+            created_at: created_at_ready,
+            writer_id: None,
+            lease: None,
+        })
+        .await
+        .unwrap();
+    session
+        .catalog()
+        .update_result_table_status(&ready_name, ResultTableStatus::Ready, 3)
+        .await
+        .unwrap();
+
+    // A live-lease `building` row for the SAME source — 600s out, far past
+    // this test's runtime.
+    session
+        .catalog()
+        .create_result_table(CreateResultTableParams {
+            table_name: &building_name,
+            source_id: &source_id,
+            model_id: "busy-model",
+            task: ModelTask::TextEmbedding,
+            kind: ResultTableKind::Model,
+            derived_from: None,
+            parquet_path: &building_url,
+            dimensions: Some(4),
+            key_column: Some("id"),
+            text_columns: None,
+            storage_precision: StoragePrecision::F32,
+            oversample: 4,
+            created_at: created_at_building,
+            writer_id: Some("writer-test-busy"),
+            lease: Some(std::time::Duration::from_secs(600)),
+        })
+        .await
+        .unwrap();
+
+    let err = session
+        .remove_source(&source_id)
+        .await
+        .expect_err("a live-lease building row must refuse the whole removal");
+    assert!(
+        matches!(&err, JammiError::SourceBusy { source_id: sid, table }
+            if sid == &source_id && table == &building_name),
+        "got {err:?}"
+    );
+
+    // NEITHER table's bytes were touched.
+    assert!(ready_path.exists(), "the ready table's bytes must survive");
+    assert!(
+        building_path.exists(),
+        "the live-building table's bytes must survive"
+    );
+
+    // NEITHER catalog row was touched.
+    assert!(
+        session
+            .catalog()
+            .get_result_table(&ready_name)
+            .await
+            .unwrap()
+            .is_some(),
+        "the ready row must survive a refused remove_source"
+    );
+    assert!(
+        session
+            .catalog()
+            .get_result_table(&building_name)
+            .await
+            .unwrap()
+            .is_some(),
+        "the building row must survive a refused remove_source"
+    );
+
+    // The source row itself is untouched too (remove_source never reached
+    // step 3, the source-row delete, because step 1's catalog call errored).
+    let sources = session.catalog().list_sources().await.unwrap();
+    assert!(
+        sources.iter().any(|s| s.source_id == source_id),
+        "the source row must survive a refused remove_source"
+    );
 }
 
 #[test_case(BackendKind::Sqlite ; "sqlite")]

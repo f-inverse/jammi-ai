@@ -333,6 +333,14 @@ class EmbeddedBackend:
         """The one-hop reverse-dependency edges of a result table."""
         return self._native.derives_from(table)
 
+    def reconcile(
+        self, apply: bool = False, grace_secs: int = 3600, all: bool = False
+    ) -> Dict[str, Any]:
+        """Cross-check the catalog against the object store; ``apply=True`` reclaims
+        drift, ``all=True`` runs the cross-tenant admin pass (embedded: no
+        authorizer gate — the in-process caller is trusted)."""
+        return self._native.reconcile(apply=apply, grace_secs=grace_secs, all=all)
+
     def predict_with_context_predictor(
         self,
         model_id: str,

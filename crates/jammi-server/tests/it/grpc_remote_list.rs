@@ -25,7 +25,9 @@ use jammi_ai::Session;
 use jammi_client::DataClient;
 use jammi_db::catalog::channel_repo::{ChannelColumn, ChannelColumnType, ChannelSpec};
 use jammi_db::catalog::model_repo::RegisterModelParams;
-use jammi_db::catalog::result_repo::{CreateResultTableParams, ResultTableKind};
+use jammi_db::catalog::result_repo::{
+    CreateResultTableParams, Owner, ResultTableCas, ResultTableKind, TenantArm,
+};
 use jammi_db::catalog::segment_repo::IndexSegment;
 use jammi_db::source::{FileFormat, SourceConnection, SourceType};
 use jammi_db::store::mutable::MutableTableDefinitionBuilder;
@@ -296,6 +298,8 @@ async fn seed_segmented_table(server: &EngineServer, table: &str, segments: &[(i
         .engine
         .catalog()
         .create_result_table(CreateResultTableParams {
+            writer_id: None,
+            lease: None,
             table_name: table,
             source_id: "seg_src",
             model_id: "seg_model",
@@ -317,7 +321,16 @@ async fn seed_segmented_table(server: &EngineServer, table: &str, segments: &[(i
             server
                 .engine
                 .catalog()
-                .insert_index_segment(table, None, *id, path, *rows)
+                .insert_index_segment(
+                    &ResultTableCas {
+                        table: table.to_string(),
+                        tenant_arm: TenantArm::Strict(None),
+                        owner: Owner::ExpiredLease,
+                    },
+                    *id,
+                    path,
+                    *rows,
+                )
                 .await
                 .expect("insert segment"),
             "segment {id} must land"
@@ -450,6 +463,8 @@ async fn remote_list_index_segments_denies_a_peer_tenants_table() {
             scope
                 .catalog()
                 .create_result_table(CreateResultTableParams {
+                    writer_id: None,
+                    lease: None,
                     table_name: "a_owned_rt",
                     source_id: "seg_src",
                     model_id: "seg_model",
@@ -472,7 +487,16 @@ async fn remote_list_index_segments_denies_a_peer_tenants_table() {
         server
             .engine
             .catalog()
-            .insert_index_segment("a_owned_rt", Some(owner), 0, "file:///idx/a-0", 5)
+            .insert_index_segment(
+                &ResultTableCas {
+                    table: "a_owned_rt".to_string(),
+                    tenant_arm: TenantArm::Strict(Some(owner)),
+                    owner: Owner::ExpiredLease,
+                },
+                0,
+                "file:///idx/a-0",
+                5,
+            )
             .await
             .expect("insert segment"),
         "tenant A's segment must land"

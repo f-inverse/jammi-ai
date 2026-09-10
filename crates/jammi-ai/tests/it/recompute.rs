@@ -659,7 +659,7 @@ async fn a_pre_contract_table_is_not_recomputable() {
     // Forge a pre-contract table: a `ready` result table with a real Parquet but
     // NO `.materialization.json` sidecar — exactly a table created before the
     // contract landed. `create_table` + a direct write + a ready flip, bypassing
-    // `finalize_with_manifest` (the only path that writes a sidecar).
+    // `BuildingTable::finish` (the only path that writes a sidecar).
     let store = session.result_store();
     let info = store
         .create_table(
@@ -700,13 +700,13 @@ async fn a_pre_contract_table_is_not_recomputable() {
         ],
     )
     .unwrap();
-    let mut writer = store.open_writer(&info.parquet_url, schema).await.unwrap();
+    let mut writer = store.open_writer(info.parquet_url(), schema).await.unwrap();
     writer.write_batch(&batch).await.unwrap();
     let rows = writer.close().await.unwrap();
     session
         .catalog()
         .update_result_table_status(
-            &info.table_name,
+            info.table_name(),
             jammi_db::catalog::status::ResultTableStatus::Ready,
             rows,
         )
@@ -714,11 +714,11 @@ async fn a_pre_contract_table_is_not_recomputable() {
         .unwrap();
 
     let err = svc
-        .recompute(&info.table_name, Cascade::ReportOnly)
+        .recompute(info.table_name(), Cascade::ReportOnly)
         .await
         .expect_err("a pre-contract table must not be recomputable");
     assert!(
-        matches!(err, JammiError::NotRecomputable { ref table } if *table == info.table_name),
+        matches!(err, JammiError::NotRecomputable { ref table } if *table == info.table_name()),
         "expected NotRecomputable, got {err:?}"
     );
 }

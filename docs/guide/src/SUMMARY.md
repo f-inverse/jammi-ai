@@ -52,6 +52,7 @@
 - [Connect to PostgreSQL / MySQL](./external-sources.md)
 - [Store Sources and Results in Cloud Object Storage](./cloud-storage.md)
 - [Deploy as a Server](./deploy-server.md)
+- [Backup and Restore](./backup-and-restore.md)
 - [Monitor Inference](./monitor-inference.md)
 - [Operability: Health, Metrics, and Failure Modes](./operability.md)
 

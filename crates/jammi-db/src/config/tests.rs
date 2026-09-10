@@ -576,17 +576,30 @@ fn load_rejects_partial_r2_credentials() {
 }
 
 #[test]
+fn lease_config_defaults_match_engine_constants() {
+    // The defaults must reproduce the engine's built-in lease timing so a
+    // config without a `[lease]` section behaves identically. These two
+    // values are the contract; every lease holder derives its `Duration`s
+    // from them.
+    let l = LeaseConfig::default();
+    assert_eq!(l.duration_secs, 30);
+    assert_eq!(l.heartbeat_secs, 10);
+    let intervals = l.intervals().unwrap();
+    assert_eq!(intervals.lease(), std::time::Duration::from_secs(30));
+    assert_eq!(intervals.heartbeat(), std::time::Duration::from_secs(10));
+    assert_eq!(intervals, LeaseIntervals::default());
+}
+
+#[test]
 fn training_config_defaults_match_engine_constants() {
-    // The defaults must reproduce the engine's built-in worker timing so a
-    // config without a `[training]` section behaves identically. These three
-    // values are the contract; the worker derives its `Duration`s from them.
+    // The worker's own default (1 s idle poll) plus the shared lease.
     let t = TrainingConfig::default();
     assert!(t.run_worker);
-    assert_eq!(t.lease_duration_secs, 30);
-    assert_eq!(t.heartbeat_interval_secs, 10);
     assert_eq!(t.idle_poll_secs, 1);
 
-    let intervals = t.worker_intervals().unwrap();
+    let intervals = t
+        .worker_intervals(LeaseConfig::default().intervals().unwrap())
+        .unwrap();
     assert_eq!(intervals.lease, std::time::Duration::from_secs(30));
     assert_eq!(intervals.heartbeat, std::time::Duration::from_secs(10));
     assert_eq!(intervals.idle_poll, std::time::Duration::from_secs(1));
@@ -594,34 +607,68 @@ fn training_config_defaults_match_engine_constants() {
 
 #[test]
 fn training_config_absent_defaults() {
-    // A config without `[training]` parses to the engine defaults.
+    // A config without `[training]` / `[lease]` parses to the engine defaults.
     let cfg: JammiConfig = toml::from_str("artifact_dir = \"/tmp/jammi\"").unwrap();
     assert_eq!(cfg.training, TrainingConfig::default());
+    assert_eq!(cfg.lease, LeaseConfig::default());
 }
 
 #[test]
-fn training_config_round_trip() {
+fn lease_and_training_config_round_trip() {
     let toml_src = r#"
+        [lease]
+        duration_secs = 8
+        heartbeat_secs = 2
+
         [training]
-        lease_duration_secs = 8
-        heartbeat_interval_secs = 2
         idle_poll_secs = 1
     "#;
     let cfg: JammiConfig = toml::from_str(toml_src).unwrap();
+    assert_eq!(
+        cfg.lease,
+        LeaseConfig {
+            duration_secs: 8,
+            heartbeat_secs: 2,
+        }
+    );
     assert_eq!(
         cfg.training,
         TrainingConfig {
             // Not spelled in the TOML above: the container-level
             // `#[serde(default)]` must fill it from `Default`, on.
             run_worker: true,
-            lease_duration_secs: 8,
-            heartbeat_interval_secs: 2,
             idle_poll_secs: 1,
         }
     );
-    let intervals = cfg.training.worker_intervals().unwrap();
+    let intervals = cfg
+        .training
+        .worker_intervals(cfg.lease.intervals().unwrap())
+        .unwrap();
     assert_eq!(intervals.lease, std::time::Duration::from_secs(8));
     assert_eq!(intervals.heartbeat, std::time::Duration::from_secs(2));
+}
+
+#[test]
+fn old_training_lease_keys_are_refused() {
+    // The lease keys moved to `[lease]`; a TOML still naming them under
+    // `[training]` is a typed parse error (fail-closed), never a silent
+    // fall-back to the default 30 s / 10 s timing.
+    let toml_src = r#"
+        [training]
+        lease_duration_secs = 8
+        heartbeat_interval_secs = 2
+    "#;
+    let err = toml::from_str::<JammiConfig>(toml_src).unwrap_err();
+    assert!(
+        err.to_string().contains("lease_duration_secs"),
+        "the error must name the refused key, got: {err}"
+    );
+    // And an unknown key under `[lease]` is refused the same way.
+    let err = toml::from_str::<JammiConfig>("[lease]\nlease_duration_secs = 8\n").unwrap_err();
+    assert!(
+        err.to_string().contains("lease_duration_secs"),
+        "got: {err}"
+    );
 }
 
 // ── `run_worker`: whether THIS process runs the claim loop ──────────────
@@ -639,8 +686,6 @@ fn training_config_toml_without_run_worker_defaults_to_true() {
     // already-deployed config file has — still parses, and parses to on.
     let toml_src = r#"
         [training]
-        lease_duration_secs = 30
-        heartbeat_interval_secs = 10
         idle_poll_secs = 1
     "#;
     let cfg: JammiConfig = toml::from_str(toml_src).unwrap();
@@ -660,13 +705,14 @@ fn training_config_toml_run_worker_false_parses_to_false() {
     "#;
     let cfg: JammiConfig = toml::from_str(toml_src).unwrap();
     assert!(!cfg.training.run_worker);
-    // Switching the loop off leaves the timings at their defaults — and
-    // they are still validated, so a config that switches the loop back on
-    // later cannot smuggle in timing that was never checked.
-    assert_eq!(cfg.training.lease_duration_secs, 30);
-    assert_eq!(cfg.training.heartbeat_interval_secs, 10);
+    // Switching the loop off leaves the timing at its default — and it is
+    // still validated, so a config that switches the loop back on later
+    // cannot smuggle in timing that was never checked.
     assert_eq!(cfg.training.idle_poll_secs, 1);
-    assert!(cfg.training.worker_intervals().is_ok());
+    assert!(cfg
+        .training
+        .worker_intervals(cfg.lease.intervals().unwrap())
+        .is_ok());
 }
 
 #[test]
@@ -837,81 +883,152 @@ fn env_override_run_worker_unparsable_is_a_typed_load_error() {
 }
 
 #[test]
-fn training_config_rejects_heartbeat_without_margin() {
-    // heartbeat == lease (no margin) — a live worker's lease would expire
-    // between beats. Must be rejected, not clamped.
-    let equal = TrainingConfig {
-        lease_duration_secs: 10,
-        heartbeat_interval_secs: 10,
-        idle_poll_secs: 1,
-        ..Default::default()
-    };
-    let err = equal.worker_intervals().unwrap_err();
+fn env_override_lease_lands_through_the_struct_derived_layer() {
+    // `[lease]` is an ordinary top-level section: `JAMMI_LEASE__<FIELD>`
+    // reaches `LeaseConfig` through the same struct-derived env layer every
+    // other section uses, overriding the file per-field and leaving the
+    // sibling field at the file's value.
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("jammi.toml");
+    std::fs::write(&path, "[lease]\nduration_secs = 30\nheartbeat_secs = 10\n").unwrap();
+
+    let cfg = JammiConfig::load_from(
+        Some(&path),
+        vec![("JAMMI_LEASE__DURATION_SECS".to_string(), "90".to_string())],
+    )
+    .unwrap();
+    assert_eq!(
+        cfg.lease,
+        LeaseConfig {
+            duration_secs: 90,
+            heartbeat_secs: 10,
+        }
+    );
+
+    // Both fields from env, over an empty file layer.
+    let cfg = JammiConfig::parse_from(
+        "",
+        vec![
+            ("JAMMI_LEASE__DURATION_SECS".to_string(), "8".to_string()),
+            ("JAMMI_LEASE__HEARTBEAT_SECS".to_string(), "2".to_string()),
+        ],
+    )
+    .unwrap();
+    assert_eq!(
+        cfg.lease.intervals().unwrap().lease(),
+        std::time::Duration::from_secs(8)
+    );
+    assert_eq!(
+        cfg.lease.intervals().unwrap().heartbeat(),
+        std::time::Duration::from_secs(2)
+    );
+
+    // No override -> the file's value stands.
+    assert_eq!(
+        JammiConfig::load_from(Some(&path), std::iter::empty())
+            .unwrap()
+            .lease,
+        LeaseConfig::default()
+    );
+}
+
+#[test]
+fn env_override_lease_violating_margin_is_a_typed_load_error() {
+    // The env layer feeds the SAME post-load validation the file does
+    // (`load_from`, not the parse-only `parse_from`): an env-supplied
+    // heartbeat with no margin under the lease is refused at load, not at
+    // the first heartbeat.
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("jammi.toml");
+    std::fs::write(&path, "").unwrap();
+    let err = JammiConfig::load_from(
+        Some(&path),
+        vec![("JAMMI_LEASE__HEARTBEAT_SECS".to_string(), "15".to_string())],
+    )
+    .unwrap_err();
     assert!(
-        matches!(&err, JammiError::Config(m) if m.contains("heartbeat_interval_secs")),
+        matches!(&err, JammiError::Config(m) if m.contains("heartbeat_secs")),
+        "got {err:?}"
+    );
+}
+
+#[test]
+fn env_override_lease_unknown_field_refuses() {
+    // `deny_unknown_fields` holds through the env layer too: the former
+    // `[training]` spelling of the lease keys is not an alias under
+    // `[lease]` either.
+    let err = JammiConfig::parse_from(
+        "",
+        vec![(
+            "JAMMI_LEASE__LEASE_DURATION_SECS".to_string(),
+            "8".to_string(),
+        )],
+    )
+    .unwrap_err();
+    assert!(
+        matches!(&err, JammiError::Config(m) if m.contains("lease_duration_secs")),
+        "the error must name the refused key, got {err:?}"
+    );
+}
+
+#[test]
+fn lease_config_rejects_heartbeat_without_margin() {
+    // heartbeat == lease (no margin) — a live holder's lease would expire
+    // between beats. Must be rejected, not clamped.
+    let equal = LeaseConfig {
+        duration_secs: 10,
+        heartbeat_secs: 10,
+    };
+    let err = equal.intervals().unwrap_err();
+    assert!(
+        matches!(&err, JammiError::Config(m) if m.contains("heartbeat_secs")),
         "expected a Config error naming the heartbeat field, got {err:?}"
     );
 
     // heartbeat * 2 just over lease (margin not cleared) — also rejected.
-    let too_close = TrainingConfig {
-        lease_duration_secs: 19,
-        heartbeat_interval_secs: 10,
-        idle_poll_secs: 1,
-        ..Default::default()
+    let too_close = LeaseConfig {
+        duration_secs: 19,
+        heartbeat_secs: 10,
     };
-    assert!(matches!(
-        too_close.worker_intervals(),
-        Err(JammiError::Config(_))
-    ));
+    assert!(matches!(too_close.intervals(), Err(JammiError::Config(_))));
 
     // heartbeat > lease — clearly rejected.
-    let inverted = TrainingConfig {
-        lease_duration_secs: 5,
-        heartbeat_interval_secs: 30,
-        idle_poll_secs: 1,
-        ..Default::default()
+    let inverted = LeaseConfig {
+        duration_secs: 5,
+        heartbeat_secs: 30,
     };
-    assert!(matches!(
-        inverted.worker_intervals(),
-        Err(JammiError::Config(_))
-    ));
+    assert!(matches!(inverted.intervals(), Err(JammiError::Config(_))));
 
-    // The exact 2× boundary (heartbeat * 2 == lease) is now REJECTED: a
-    // renewal coincident with expiry races an idle-polling worker's reclaim.
-    let exact = TrainingConfig {
-        lease_duration_secs: 20,
-        heartbeat_interval_secs: 10,
-        idle_poll_secs: 1,
-        ..Default::default()
+    // The exact 2× boundary (heartbeat * 2 == lease) is REJECTED: a
+    // renewal coincident with expiry races a reclaim.
+    let exact = LeaseConfig {
+        duration_secs: 20,
+        heartbeat_secs: 10,
     };
     assert!(
-        matches!(exact.worker_intervals(), Err(JammiError::Config(_))),
+        matches!(exact.intervals(), Err(JammiError::Config(_))),
         "heartbeat * 2 == lease must be rejected under the strict margin"
     );
 
     // Strictly under half (heartbeat * 2 < lease) is accepted.
-    let strict = TrainingConfig {
-        lease_duration_secs: 21,
-        heartbeat_interval_secs: 10,
-        idle_poll_secs: 1,
-        ..Default::default()
+    let strict = LeaseConfig {
+        duration_secs: 21,
+        heartbeat_secs: 10,
     };
-    assert!(strict.worker_intervals().is_ok());
+    assert!(strict.intervals().is_ok());
 }
 
 #[test]
-fn training_config_margin_check_is_overflow_safe() {
+fn lease_config_margin_check_is_overflow_safe() {
     // An operator-controlled heartbeat whose doubling overflows `u64` must
     // be rejected with a Config error — never a debug-build panic, never a
     // release-build silent wrap-to-zero that accepts bogus timing.
-    let absurd = TrainingConfig {
-        lease_duration_secs: 30,
-        heartbeat_interval_secs: u64::MAX / 2 + 1,
-        idle_poll_secs: 1,
-        ..Default::default()
+    let absurd = LeaseConfig {
+        duration_secs: 30,
+        heartbeat_secs: u64::MAX / 2 + 1,
     };
     assert!(
-        matches!(absurd.worker_intervals(), Err(JammiError::Config(_))),
+        matches!(absurd.intervals(), Err(JammiError::Config(_))),
         "a heartbeat whose doubling overflows u64 must be a Config error"
     );
 }
@@ -919,12 +1036,12 @@ fn training_config_margin_check_is_overflow_safe() {
 #[test]
 fn training_config_rejects_zero_idle_poll() {
     let cfg = TrainingConfig {
-        lease_duration_secs: 30,
-        heartbeat_interval_secs: 10,
         idle_poll_secs: 0,
         ..Default::default()
     };
-    let err = cfg.worker_intervals().unwrap_err();
+    let err = cfg
+        .worker_intervals(LeaseConfig::default().intervals().unwrap())
+        .unwrap_err();
     assert!(
         matches!(&err, JammiError::Config(m) if m.contains("idle_poll_secs")),
         "expected a Config error naming the idle-poll field, got {err:?}"
@@ -932,14 +1049,18 @@ fn training_config_rejects_zero_idle_poll() {
 }
 
 #[test]
-fn training_config_rejects_zero_heartbeat() {
-    let cfg = TrainingConfig {
-        lease_duration_secs: 30,
-        heartbeat_interval_secs: 0,
-        idle_poll_secs: 1,
-        ..Default::default()
+fn lease_config_rejects_zero_heartbeat_and_zero_duration() {
+    let zero_hb = LeaseConfig {
+        duration_secs: 30,
+        heartbeat_secs: 0,
     };
-    assert!(matches!(cfg.worker_intervals(), Err(JammiError::Config(_))));
+    assert!(matches!(zero_hb.intervals(), Err(JammiError::Config(_))));
+    let zero_lease = LeaseConfig {
+        duration_secs: 0,
+        heartbeat_secs: 0,
+    };
+    let err = zero_lease.intervals().unwrap_err();
+    assert!(matches!(&err, JammiError::Config(m) if m.contains("must be > 0")));
 }
 
 #[test]
@@ -951,9 +1072,11 @@ fn load_rejects_invalid_training_timing() {
     std::fs::write(
         &path,
         r#"
+            [lease]
+            duration_secs = 5
+            heartbeat_secs = 5
+
             [training]
-            lease_duration_secs = 5
-            heartbeat_interval_secs = 5
             idle_poll_secs = 1
         "#,
     )
@@ -1936,6 +2059,7 @@ fn top_level_fields_matches_jammi_config() {
         "inference",
         "embedding",
         "fine_tuning",
+        "lease",
         "training",
         "cache",
         "server",

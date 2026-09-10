@@ -185,6 +185,7 @@ async fn start_auth_server() -> AuthServer {
         store,
         jammi_server::tiers::TierSet::resolve([]).expect("core tier resolves"),
         Some(Arc::clone(&session)),
+        None,
     );
     let catalog_svc = CatalogServiceServer::with_interceptor(catalog, BearerAuthInterceptor);
 
@@ -433,6 +434,7 @@ async fn resolver_seam_binds_the_engine_and_rejects_missing_credential() {
         metrics: Arc::new(jammi_server::routes::health::MetricsRegistry::new().unwrap()),
         // The consumer's authenticating resolver, plugged into the engine seam.
         tenant_resolver: Arc::new(HmacBearerResolver),
+        admin_authorizer: None,
     };
     let (shutdown_tx, shutdown_rx) = oneshot::channel::<()>();
     let (addr, handle) = super::common::grpc::spawn_bound_chain(chain, shutdown_rx).await;

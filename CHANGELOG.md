@@ -263,6 +263,48 @@ workspace ships every publishable crate at the same
   `docs/plans/66-tower-profile/README.md` and `CONTRACT.md` (the frozen v2.5 contract)
   for the full per-leg table and PR trail.
 <!-- /profile-421-generated -->
+- **Advisory-locked Postgres migrations (#479, esc-093).** `catalog::migrations::run`
+  takes a transaction-scoped Postgres advisory lock (`SELECT pg_advisory_xact_lock($1)`,
+  keyed by `JAMMI_MIGRATION_LOCK_KEY`) as its first statement, before it reads the
+  `applied_migrations` ledger or runs any schema DDL, closing a race where two fresh
+  replicas booting concurrently against one database could both see an empty ledger and
+  one loses with SQLSTATE `42P07`/`23505`. Released on commit or rollback (PgBouncer
+  transaction-pooling safe); SQLite is unaffected (`BEGIN IMMEDIATE` already serialises
+  the one process that may hold the file).
+- **Tenant-prefixed result-table and artifact layout (#484).** A new
+  `crates/jammi-db/src/store/layout.rs` owns the one key scheme every result-table and
+  artifact object now lives under: `TenantSegment::of`/`parse` (`_global` or a tenant's
+  canonical hyphenated lowercase UUID, exact inverses of each other — a non-canonical
+  UUID spelling in a listed key is `unattributed`, never coerced), `result_table_url` →
+  `{root}/{seg}/{table}.parquet`, and `segment_url`/`sidecar_url`, which derive a table's
+  siblings from its OWN `parquet_path` rather than the store's current root. Model
+  artifacts move to `models/{seg}/{job_id}/…` under the same segment scheme.
+- **`ResultStore::reconcile`/`reconcile_all`, a cross-check of the catalog against the
+  object store (#484).** The ONE place this engine performs an object-store `LIST`. Lists
+  first, reads rows second, so the row set is always a superset of every object's true
+  referencer at listing time. Checks both directions: a `ready` row's required objects
+  (Parquet, the manifest sidecar when `definition_hash` is set, every required ANN
+  sidecar) all present, else `ready → failed` by CAS; every other listed object either
+  referenced by a live row/job/model artifact or an orphan, aged against `grace` before
+  `--apply` reclaims it, or `unattributed` (a key that fails the tenant/artifact
+  allowlist outright — reported, never deleted at any grace). `reconcile` scopes to the
+  store's own tenant binding; `reconcile_all` wraps the whole pass in an admin scope and
+  covers every tenant. Wired end to end: `CatalogService.Reconcile` (gRPC, `all=true`
+  gated by the new `AdminAuthorizer` seam below), `jammi reconcile [--apply]
+  [--grace-secs N] [--all]` (CLI), and `Database.reconcile(apply, grace_secs, all)`
+  (`jammi-python`, embedded `all=True` = `reconcile_all`).
+- **`AdminAuthorizer`, a gRPC-only capability gate for `Reconcile`'s cross-tenant admin
+  pass (#484).** A synchronous `fn authorize(&self, metadata: &MetadataMap) ->
+  Result<(), Status>` a deployment supplies at `GrpcChain.admin_authorizer` (a new,
+  optional 4th parameter to `CatalogServer::new`); the shipped default is `None`, which
+  refuses EVERY `Reconcile { all: true }` request with `PERMISSION_DENIED` naming
+  `security.md`. A tenant-scoped `Reconcile` (`all = false`) never consults it. The gate
+  is gRPC-only by construction — `Reconcile` has no Flight SQL analogue — distinct from
+  the `TenantResolver` seam, which binds both transports from one grant.
+- **A Backup and Restore guide page (`docs/guide/src/backup-and-restore.md`).** The
+  close-first SQLite recipe, the Postgres `pg_dump`/PITR + object-store-snapshot recipe,
+  why `cache/` is always excludable, the storage-then-catalog restore ordering rule, and
+  when to run `jammi reconcile`.
 - **A Postgres wake-up trigger broker: `[broker.postgres]`, `ServerInfo.broker` (#490).**
   `crates/jammi-db/src/trigger/postgres.rs` adds a third `TriggerBroker` driver over
   `LISTEN`/`NOTIFY` — a transport-only wake-up signal, never a second log: the topic's
@@ -291,6 +333,70 @@ workspace ships every publishable crate at the same
   changes).
 
 ### Changed
+- **One lease primitive; lease-owned `building` result tables (#479, esc-094).** A
+  `building` result table now belongs to the `ResultStore` that created it: migration
+  `027_result_table_lease` adds `result_tables.writer_id` / `lease_expires_at` (+
+  `idx_result_tables_lease`), `ResultStore::create_table` stamps its `writer-{uuid}` and a lease
+  and returns a **`BuildingTable`** handle (`table_name()`, `parquet_url()`, `writer_id()`,
+  `is_live()`, `set_checkpoint`, `append_segment`, `finish`, `abort`, `abandon`) whose background
+  heartbeat renews the lease every `heartbeat`; every transition on a building row is a
+  compare-and-set through ONE predicate builder (`catalog::result_repo::ResultTableCas { table,
+  tenant_arm: Admin | Strict(tenant), owner: Writer(id) | ExpiredLease }`) — `renew_lease`,
+  `set_checkpoint`, `fail_building_table` (the only `building → failed`),
+  `promote_result_table_with_manifest`, `claim_expired_building_table`, `insert_index_segment`,
+  `delete_index_segments` — and a zero-row match is classified status-first into exactly one of
+  the new `JammiError::RowGone` / `TenantMismatch` / `CasFailed{status}` / `LeaseLost`, none of
+  which licenses a deletion (the actual deletion arms: a writer's own `abort()` after its one-row
+  CAS; the reaper's claim/fail CAS, run from BOTH `recover()`'s startup sweep and
+  `reconcile(apply=true)`'s expired-lease pass; and `delete_result_tables_for_source` /
+  `JammiSession::remove_source`'s atomic delete-with-live-guard, whose "CAS" is the atomic
+  `DELETE … WHERE NOT (status='building' AND lease live) … RETURNING` statement itself rather than
+  a per-row compare-and-set). `ResultStore::finalize_with_manifest` is
+  replaced by `BuildingTable::finish` = renew → `ResultStore::write_attestation` (digest +
+  manifest + sidecar) → promote CAS → `register_table`; a `CasFailed{ready}` there (recovery
+  promoted the writer's own bytes after its lease expired) still registers and returns the
+  catalog's record. `recover()` (still the one implicit-admin pass, now documented to delete
+  expired-lease bytes across every tenant) enumerates only rows whose lease is absent or expired
+  (`Catalog::list_expired_building_tables`), claims a promotable row FIRST (the recoverer becomes
+  the writer, heartbeating a fresh lease) and only then rebuilds and promotes, and fails a
+  reapable row BEFORE it deletes — `reconcile_ready_manifests` likewise flips `ready → failed` by
+  CAS (`Catalog::fail_ready_result_table`) before reaping; a failed delete is logged for
+  reconcile, never `.ok()`-swallowed. `delete_result_tables_for_source` refuses with the new
+  `JammiError::SourceBusy` while a live-lease building row references the source. The leaky
+  `OR tenant_id IS NULL` non-admin arms on `update_result_table_status` / `set_checkpoint` /
+  promote are gone (STRICT: `tenant_id = $t OR (tenant_id IS NULL AND $t IS NULL)`), and
+  `list_models`, `get_training_job`, `list_training_jobs`, `get_result_table` gain the same
+  `is_admin_scope` arm the other enumerations already had. Segment bundle keys derive from the
+  row's own `parquet_path` parent, never the store's current root. `ResultTableRecord` gains
+  `writer_id` / `lease_expires_at`; `CreateResultTableParams` gains the same two (optional)
+  fields; `ResultStore` is `Clone` (one writer identity per instance) with
+  `with_lease_intervals` / `lease_intervals()` / `writer_id()`; `ResultTableInfo` is removed.
+  **Config:** the lease timing moves to a new `[lease] duration_secs = 30, heartbeat_secs = 10`
+  section (`LeaseConfig::intervals() -> LeaseIntervals`, validating both non-zero and
+  `heartbeat * 2 < duration`) shared by the training worker and every result-table writer,
+  an ordinary externally-tagged section of the layered loader (per-field env reach as
+  `JAMMI_LEASE__DURATION_SECS` / `JAMMI_LEASE__HEARTBEAT_SECS`, unknown keys refused);
+  `[training]` keeps `run_worker` and `idle_poll_secs` and **refuses** the former
+  `lease_duration_secs` / `heartbeat_interval_secs` keys (no alias — an old TOML naming them is a
+  typed load error, never a silent default); `TrainingConfig::worker_intervals(lease)` takes the
+  validated lease. `training_repo`'s `LEASE_TS_FORMAT` / `lease_now` / `lease_deadline` live in
+  `catalog::lease` (re-exported). The `test-hooks` feature's result-table points are named
+  (`JAMMI_TEST_MATERIALIZATION_CHECKPOINT=table_created|materialization`, `1` meaning
+  `materialization`) and gain a writer-keyed in-process arm (`test_hook::arm(point, writer_id)` /
+  `Armed::wait_parked` / `release`) for the same-process two-writer oracles; CI runs
+  `cargo test -p jammi-db --features test-hooks --test it -- --test-threads=1` (and the
+  Postgres form), which also runs the two SIGKILL crash harnesses in CI for the first time.
+- **`ResultStore::with_root` gains `local_cache_dir` as a 5th parameter, and both local
+  caches move out of the result-table root (#484).** `local_cache_dir` is the PARENT of
+  the two local caches the store derives: `{local_cache_dir}/index` (materialised remote
+  ANN segments) and `{local_cache_dir}/artifact` (the model-artifact fetch cache); both
+  are always local paths, even against a cloud-scheme root. The default embedded
+  `ResultStore::new(artifact_dir, …)` now roots them at `{artifact_dir}/cache/index` and
+  `{artifact_dir}/cache/artifact` instead of inside `jammi_db/` — a public API change,
+  announced. The old on-disk `jammi_db/index_cache`/`artifact_cache` directories are
+  inert after upgrade: cold caches the store no longer reads or writes, reported by
+  `reconcile` as `unattributed` and never deleted. See
+  `docs/guide/src/cloud-storage.md`.
 - **Persisted cloud credentials are `Secret`-typed and inline-only on read (breaking Rust
   type change, #483).** The seven credential fields on the persisted `crate::storage::config`
   structs — `S3Config::{secret_access_key,session_token}`, `GcsConfig::service_account_json`,
@@ -561,6 +667,129 @@ workspace ships every publishable crate at the same
   post-commit fan-out across replicas is unordered regardless of transport.
 
 ### Fixed
+- **Two concurrent `migrate()` callers on a fresh Postgres database could both attempt the
+  schema DDL, one losing with SQLSTATE `42P07`/`23505` (#479, esc-093).** No cross-process
+  mutual exclusion guarded the read-ledger-then-run-DDL window on a backend the guide
+  already called multi-replica safe. Fixed by the advisory lock described above.
+- **Startup recovery could reap a `building` result table still owned by a live writer in
+  a different session or process, deleting its bytes out from under it (#479, esc-094).**
+  Recovery had no ownership predicate at all — it inferred "abandoned" from Parquet/manifest
+  state alone, so a second session opening the same catalog mid-materialization could
+  observe (and reap) another writer's in-progress row. Fixed by the lease-owned CAS
+  predicate described above: recovery now enumerates only rows whose lease is absent or
+  expired, and every deletion follows a one-row compare-and-set naming the new owner.
+- **Phase-4 audit of the above (#479, #484): a tenant-scoped `reconcile(apply=true)` could
+  claim/fail/delete a GLOBAL (`tenant_id IS NULL`) building row's bytes, a lease claim (both
+  recovery's and reconcile's) could re-stamp the SAME `writer_id` a lapsed writer in the
+  SAME process still held (no fence at all), `reconcile`'s orphan arm deleted an
+  expired-lease building row's bytes directly (no claim, no CAS), and training-job leases
+  (`claim_next_training_job`/`heartbeat_training_job`/`reclaim_expired_training_jobs`) still
+  bound the application clock on Postgres, contradicting the lease module's own "every lease
+  stamp and comparison" contract.** Fixed: `list_expired_building_tables` excludes GLOBAL
+  rows entirely under a non-admin binding; every claim (recovery and reconcile) mints a
+  fresh `"{writer_id}/claim-{uuid}"` identity, never the claiming `ResultStore`'s own id, so
+  a lapsed writer's next CAS always misses; `reconcile`'s expired-building pre-pass reaps
+  through the SAME claim-then-promote-or-fail arm `recover()` uses; training-job leases move
+  onto the same `lease_deadline_expr`/`lease_expired_clause` helpers (DB clock on Postgres,
+  a bound `lease_now()` on SQLite — SQLite's `now()` SQL functions cap out at millisecond
+  precision or coarser, insufficient to distinguish two back-to-back stamps, so the
+  single-process backend keeps the application clock through the one helper rather than a
+  no-bind comparison). The five zero-row CAS/busy variants (`RowGone`, `TenantMismatch`,
+  `LeaseLost`, `CasFailed`, `SourceBusy`) now cross the wire as explicit gRPC codes
+  (`NotFound`, `PermissionDenied`, `Aborted`, `Aborted`, `FailedPrecondition` respectively)
+  instead of folding to `Internal`. `ReconcileReport` gained `rows_failed_count`, matching
+  every other list's `*_count`/`truncated` accounting; a `ready` row whose fail-CAS missed
+  stays in the referenced set instead of being counted as this pass's fail; a
+  present-but-unreadable model-artifact manifest is reported `damaged` rather than aborting
+  the whole reconcile pass.
+- **Closing round on the above (#479, #484): the remote `Database.reconcile` projection carried
+  only 7 of `ReconcileReport`'s 14 fields, a tenant-scoped `reconcile(apply=false)` could report a
+  GLOBAL ready row's fail in `rows_failed` that the matching `apply=true` pass silently could not
+  act on, `remove_source`'s dead FK-conflict arm (no foreign key has referenced `sources` since
+  migration 004) left a stale `SourceBusy` classification live, and the reconcile object listing
+  double-counted a key its own expired-building pre-pass had already deleted.** Fixed:
+  `clients/python/jammi/_database.py::_reconcile_report_to_dict` now projects all 14 fields, byte-
+  for-byte matching the embedded PyO3 arm's key set; `ResultStore::reconcile`'s ready-row
+  enumeration is filtered to the binding's own tenant segment before either the dry-run report or
+  the apply CAS, so a scoped pass's dry-run and apply agree on the identical state and a GLOBAL row
+  is visible only to `reconcile_all`; `remove_source`'s FK-conflict classify arm and its
+  `SourceBusy { table: "<created after ...>" }` placeholder are removed (the still-open
+  create-between-passes race is ledgered as a new `.jammi/escapes.jsonl` row, not fixed here); the
+  orphan/`bytes_reclaimed` accounting INCLUDES every key the expired-building pre-pass reaps (or, under
+  a dry-run, would reap) EXACTLY ONCE, at its TRUE listed size, in BOTH `apply=false` and `apply=true`
+  — the general object→row loop further down SKIPS only a key this pre-pass has already accounted
+  for, it never omits the pre-pass's own reaps from the report (an earlier revision of this fix moved
+  the pre-pass before the object listing so a key it deleted could never appear there at all, which
+  silently dropped it from every field instead of merely avoiding a double count; see the final
+  round below).
+  **Disclosed and pinned separately: `reclaim_expired_training_jobs` reclaiming a `running` row with
+  an ABSENT lease is deliberate, the same one-primitive rule ("absent or expired is reclaimable")
+  `Owner::ExpiredLease` already documents on the result-table side — every claim path stamps a
+  non-NULL lease, so a running row with no lease can never arise through this engine's own claim
+  path, and restoring an `IS NOT NULL` guard would strand such a row `running` forever.**
+- **Adversarial round on the above (#484): an expired-lease `building` row with a valid Parquet
+  AND its manifest sidecar present is PROMOTED to `ready` by the apply pre-pass — but `reconcile`'s
+  dry-run preview had no matching "would-promote" branch, so it protected nothing for that row and
+  its objects fell through to the ordinary age-gated orphan arm, over-reporting keys `apply` never
+  touches (an operator following the dry-run-then-apply recipe could be led to expect bytes
+  reclaimed that recovery itself keeps). Fixed by replacing the hand-copied dry-run mirror with one
+  `ExpiredRowOutcome { Reap, Promote, Untouched }` classification both modes branch on: `apply`
+  classifies and then performs the outcome; the dry-run classifies alone. A `Reap` row's objects are
+  credited in BOTH modes, at the SAME key set the real deleter computes
+  (`ResultStore::reap_candidate_keys` / `delete_objects_after_cas`) — Parquet, manifest sidecar, and
+  each segment's `Ann`-only siblings, never the `Lexical` superset `referenced_result_keys` protects
+  with; a partial delete failure (`delete_objects_after_cas`, `purge_segments`) credits only the keys
+  that actually deleted, leaving a failed one for the orphan arm or a later pass to retry, rather
+  than crediting the whole candidate set on a fail-CAS hit regardless of what the delete itself did.
+  The candidate listing is now indexed once (key → size) instead of rescanned per expired row.
+- **Final round on the above (#484): the `Promote` arm's own reclaim was still one-directional.**
+  A `Promote` row's objects were protected WHOLESALE in both modes, but apply's actual promotion of
+  an embedding row calls `rebuild_index_from_parquet`, which PURGES the row's entire current segment
+  set and rewrites, at most, a single fresh segment `0` — a stale second segment from an interrupted
+  multi-segment build, or segment `0` itself when the Parquet turns out to carry zero rows (the
+  rebuild then writes nothing at all), is deleted and never rewritten. The dry-run over-protected
+  exactly the keys the rebuild actually reclaims (reporting them nowhere) while apply discarded
+  `purge_segments`'s own returned key set and credited them nowhere either — both directions of the
+  dry-run/apply parity invariant broke on the SAME state at once, silently. `ExpiredRowOutcome::Promote`
+  now carries `keeps` / `reclaims` (plus `dir_prefixes`, always kept), computed ONCE by
+  `classify_expired_row` from the SAME row-count oracle the rebuild itself branches on
+  (`count_parquet_rows`, never assumed): `keeps` — the Parquet, the manifest sidecar, and a fresh
+  segment `0`'s sidecars when-and-only-when the rebuild will actually write one — is protected in
+  both modes; `reclaims` — every other key the row currently references — is credited into
+  `orphans`/`bytes_reclaimed` through the SAME `credit_reaped` helper the `Reap` arm uses, in BOTH
+  modes. Apply's own rebuild now returns the keys `purge_segments` actually deleted and CHECKS the
+  union against the classifier's prediction, crediting the true deletion (never a stale prediction)
+  and logging any discrepancy loudly rather than silently. Two more loud-corruption fixes rode
+  along: `purge_segments` now returns an error (rather than `continue`-ing past) an `index_segments`
+  row whose `index_path` does not parse, and `BuildingTable::abort` now attempts every object delete
+  and returns an aggregated error naming whichever keys truly failed, rather than mapping a partial
+  failure to `Ok(())`. A `Promote`-classified row whose manifest sidecar vanishes between classify
+  and perform (a race with a concurrent pass) now re-classifies as `Reap` instead of aborting the
+  whole reconcile pass.
+- **Design revision on the above (#484): a promotion is not a reclaim.** The previous round's
+  `keeps`/`reclaims` prediction was itself a recurring defect surface — the `Err` arm's credit
+  subtracted a counterfactual `keeps` from what the rebuild actually purged, an ERROR-level
+  mismatch oracle existed only to notice when that prediction and the rebuild's actual deletion
+  diverged (rather than removing the redundant prediction), and the fused Parquet reader
+  `classify_expired_row` used could turn a benign listing-to-read vanish race into a whole-pass
+  abort. Removed the mirror rather than repairing it again: `ExpiredRowOutcome::Promote` now
+  carries only the row's FULL currently-referenced key set (`keeps` + `dir_prefixes`) — protected
+  wholesale in both modes, predicting NOTHING about what the rebuild will purge and not rewrite.
+  Apply's rebuild still purges stale segments exactly as before (a promotion legitimately needs to
+  clear them), but the keys it actually deletes are now recorded into a per-pass
+  `promoted_purged: BTreeSet<key>` and EXCLUDED from that pass's whole accounting — never
+  `orphans`, `orphan_count`, `bytes_reclaimed`, nor `pending` — because they were consumed by the
+  promotion, not reclaimed by the ordinary orphan mechanism; `ReconcileReport::bytes_reclaimed`'s
+  contract is now explicit that it counts orphan and reap deletions only. A key `purge_segments`
+  itself FAILS to delete (a real I/O error, never a mere 404) is never excluded — it survives on
+  disk, unreferenced, and a LATER pass reclaims it normally once past grace (pinned by a dedicated
+  reproducer: an unwritable table directory fails the rebuild after the purge has run, and a
+  second pass, permissions restored, reclaims the surviving sidecar). Separately,
+  `validate_and_count_parquet_rows` now restores the pre-fusion vanish semantics: a Parquet that
+  disappears between `classify_expired_row`'s own `exists()` check and its single read classifies
+  as an invalid Parquet (`Reap`), never an `Err` that aborts the whole reconcile pass — pinned by a
+  new park-hook test that manufactures the exact classify-window race. The mismatch counter and its
+  test-hook are deleted along with the prediction they audited.
 - **Trigger-stream replay is type-faithful and intra-batch row order is exact (#490).** Replay
   (`crates/jammi-db/src/source/mutable.rs`) and the mutable-table provider
   (`crates/jammi-db/src/store/mutable/provider.rs`) previously folded every accepted column type
@@ -797,6 +1026,25 @@ workspace ships every publishable crate at the same
   column keeps its documented `""` reading (esc-091).
 
 ### Breaking
+- **Existing result-table and artifact object keys predating the tenant-prefixed layout
+  are unattributed until the table is re-materialized (#484).** `reconcile`'s allowlist
+  recognizes only `{seg}/{table}.parquet` and `models/{seg}/{job_id}/…` keys (`seg` a
+  `TenantSegment`); an older flat key never round-trips through `TenantSegment::parse`
+  and is reported as `unattributed` — permanently, at any `grace` — never deleted, but
+  also never reclaimed or migrated automatically. Existing `result_tables` catalog rows
+  still resolve their own bytes directly (their stored `parquet_path` is unaffected —
+  only NEW tables write under the tenant-prefixed scheme), so a RESULT TABLE'S read path
+  is not broken by this change. **The derived artifact paths ARE a read-path break,
+  though:** `fetch_resume_checkpoint` / `delete_epoch_checkpoint` (`artifact.rs:329-408`)
+  derive a job's checkpoint prefix from the tenant-prefixed layout unconditionally — there
+  is no fallback to the pre-layout flat path. A fine-tune job already in flight across the
+  upgrade (its checkpoints written under the OLD flat scheme) cannot resume after
+  restarting into the new binary: the resume lookup misses, and its old `models/{job}`
+  bytes are reported by `reconcile` as `unattributed` (greenfield engine — no dual-read
+  compatibility shim is provided; restart the job fresh under the new layout). Running
+  `jammi reconcile` after upgrading a live deployment will surface every pre-existing
+  table's and in-flight job's objects as `unattributed` until each is re-materialized (or
+  restarted) under the new layout.
 - **Config sections are externally tagged, unknown keys/vars refuse, and two
   cloud secret shapes are renamed (#483, #481, #480).** `[catalog]`,
   `[broker]`, `[signing_key]`, and `[storage.cloud]` select their variant by

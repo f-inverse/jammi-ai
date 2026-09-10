@@ -269,3 +269,60 @@ pub async fn write_manifest_sidecar_for(
         .await
         .unwrap();
 }
+
+/// Detach a writer's [`jammi_db::store::BuildingTable`] handle WITHOUT any catalog transition
+/// and force the row's lease into the past — the state a dead writer leaves
+/// behind once its lease has run out. The torn-state fixtures every recovery
+/// test constructs by hand need this: a live handle heartbeats its lease, so
+/// a `recover()` run beside it would (correctly) skip the row. Returns the
+/// table name. Asserts the row was `building` under a live lease first, so a
+/// fixture that never held the lease cannot pass vacuously.
+pub async fn abandon_building(
+    catalog: &jammi_db::catalog::Catalog,
+    building: jammi_db::store::BuildingTable,
+) -> String {
+    use jammi_db::catalog::backend::{SqlValue, TxOptions};
+    use jammi_db::catalog::status::ResultTableStatus;
+    use jammi_db::tenant_scope::TenantBinding;
+
+    let name = building.table_name().to_string();
+    let before = TenantBinding::admin_scope(catalog.get_result_table(&name))
+        .await
+        .unwrap()
+        .expect("the building row exists");
+    assert_eq!(
+        before.status,
+        ResultTableStatus::Building.to_string(),
+        "abandon_building: precondition — the row is still `building`"
+    );
+    // The catalog's own backend-correct liveness predicate, not a Rust-side
+    // string compare against `lease_expires_at` — that stored value is a
+    // Postgres-clock expression's text rendering on Postgres, not a
+    // `lease_now()`-shaped string a naive `>` compare here would assume.
+    assert!(
+        TenantBinding::admin_scope(catalog.list_live_building_tables())
+            .await
+            .unwrap()
+            .iter()
+            .any(|t| t.table_name == name),
+        "abandon_building: precondition — the row carries a live lease, got {:?}",
+        before.lease_expires_at
+    );
+    building.abandon();
+    let stamped = name.clone();
+    catalog
+        .backend_arc()
+        .transaction(TxOptions::default(), |tx| {
+            Box::pin(async move {
+                tx.execute(
+                    "UPDATE result_tables SET lease_expires_at = '1970-01-01T00:00:00.000000Z' \
+                     WHERE table_name = $1",
+                    &[SqlValue::TextOwned(stamped)],
+                )
+                .await
+            })
+        })
+        .await
+        .unwrap();
+    name
+}

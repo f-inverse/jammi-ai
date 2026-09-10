@@ -38,7 +38,8 @@ use jammi_test_utils::{cookbook_fixture, fixture, test_config};
 use tonic::transport::Endpoint;
 
 use super::common::grpc::{
-    start_engine_server, start_engine_server_with_trigger, tenant_a, EngineServer, TENANT_A,
+    start_engine_server, start_engine_server_with_admin, start_engine_server_with_trigger,
+    tenant_a, AllowAllAdmin, EngineServer, TENANT_A,
 };
 
 /// 32-byte hex master key for the audit HMAC. Deterministic so signature
@@ -471,6 +472,148 @@ async fn remote_binds_and_reads_tenant_over_the_wire() {
         None,
         "after unbind the tenant is cleared"
     );
+
+    let _ = server.shutdown.send(());
+    let _ = server.handle.await;
+}
+
+/// K4 parity: the remote `CatalogService.Reconcile` and a local
+/// `ResultStore::reconcile` / `reconcile_all` over the SAME engine report the
+/// IDENTICAL `ReconcileReport`, byte-for-byte on the wire encoding — proven on
+/// the divergence-prone shape (multiple non-empty repeated fields landing at
+/// once: an orphan candidate AND an unattributed key), never only the trivial
+/// empty-engine happy path. `all = false` runs under a tenant session bound
+/// over the wire (`SetTenant`); `all = true` runs the cross-tenant admin pass
+/// via [`AllowAllAdmin`] (proving the admin-gated arm agrees once authorized —
+/// the refusal itself is `remote_reconcile_all_is_denied_by_default_without_an_authorizer`).
+/// Both arms run `apply = false, grace_secs = 0`: a dry run, so the fixture's
+/// files survive both comparisons.
+#[tokio::test]
+async fn remote_reconcile_reports_like_local() {
+    use jammi_server::grpc::catalog::AdminAuthorizer;
+    use prost::Message;
+
+    let server = start_engine_server_with_admin(
+        jammi_server::tiers::TierSet::resolve(std::iter::empty())
+            .expect("core-only tier set resolves"),
+        Some(Arc::new(AllowAllAdmin) as Arc<dyn AdminAuthorizer>),
+    )
+    .await;
+    let remote = remote(&server).await;
+
+    // Bind the remote client's session to tenant A; the local comparison
+    // scopes to the identical tenant via `with_tenant_scoped` below.
+    remote.bind_tenant(tenant_a()).await.expect("bind tenant");
+
+    // Plant an orphan candidate under tenant A's own segment (attributed,
+    // unreferenced by any row) and an unattributed pre-layout key at the
+    // object-store root — two DIFFERENT non-empty list fields at once, the
+    // divergence-prone shape a single-happy-path fixture would never catch.
+    let root = server._dir.path().join("jammi_db");
+    let seg_dir = root.join(tenant_a().to_string());
+    std::fs::create_dir_all(&seg_dir).expect("mkdir tenant segment");
+    std::fs::write(seg_dir.join("stray.parquet"), b"stray").expect("write stray orphan");
+    std::fs::write(root.join("legacy_table.parquet"), b"legacy").expect("write unattributed key");
+
+    let opts = jammi_db::store::ReconcileOptions {
+        apply: false,
+        grace: std::time::Duration::from_secs(0),
+    };
+
+    // --- all = false: tenant-scoped arm -------------------------------------
+    let remote_report = remote
+        .catalog()
+        .reconcile(false, Some(0), false)
+        .await
+        .expect("remote tenant-scoped reconcile");
+    let local_report = server
+        .engine
+        .with_tenant_scoped(tenant_a(), |_scope| async {
+            server.engine.result_store().reconcile(opts).await
+        })
+        .await
+        .expect("local tenant-scoped reconcile");
+    assert_eq!(
+        jammi_wire::reconcile_report_to_proto(&remote_report).encode_to_vec(),
+        jammi_wire::reconcile_report_to_proto(&local_report).encode_to_vec(),
+        "remote and local tenant-scoped reconcile reports must be byte-identical: \
+         {remote_report:?} vs {local_report:?}"
+    );
+    assert!(
+        remote_report
+            .orphans
+            .iter()
+            .any(|o| o.ends_with("stray.parquet")),
+        "the divergence-prone fixture must actually plant an orphan: {remote_report:?}"
+    );
+    // A tenant-scoped pass reports NO unattributed entries at all —
+    // an unattributed key is store-wide by definition, so only the admin
+    // `all=true` arm below may ever list it.
+    assert!(
+        remote_report.unattributed.is_empty(),
+        "a tenant-scoped pass must report no unattributed entries: {remote_report:?}"
+    );
+
+    // --- all = true: cross-tenant admin arm (AllowAllAdmin permits it) -----
+    let remote_report_all = remote
+        .catalog()
+        .reconcile(false, Some(0), true)
+        .await
+        .expect("remote admin reconcile_all (AllowAllAdmin permits it)");
+    let local_report_all = server
+        .engine
+        .result_store()
+        .reconcile_all(opts)
+        .await
+        .expect("local reconcile_all");
+    assert_eq!(
+        jammi_wire::reconcile_report_to_proto(&remote_report_all).encode_to_vec(),
+        jammi_wire::reconcile_report_to_proto(&local_report_all).encode_to_vec(),
+        "remote and local admin reconcile_all reports must be byte-identical: \
+         {remote_report_all:?} vs {local_report_all:?}"
+    );
+    assert!(
+        remote_report_all
+            .unattributed
+            .iter()
+            .any(|u| u.ends_with("legacy_table.parquet")),
+        "the divergence-prone fixture's unattributed key must surface on the admin pass: \
+         {remote_report_all:?}"
+    );
+
+    let _ = server.shutdown.send(());
+    let _ = server.handle.await;
+}
+
+/// The denied-by-default oracle: a server that never wires an
+/// [`AdminAuthorizer`](jammi_server::grpc::catalog::AdminAuthorizer) (the
+/// shipped `GrpcChain` default, `admin_authorizer: None`) refuses EVERY
+/// `Reconcile { all: true }` request with `PERMISSION_DENIED`, regardless of
+/// tenant binding — a deployment that never wires one cannot accidentally
+/// expose the cross-tenant admin pass. `all = false` on the SAME server is
+/// unaffected (the gate is `all = true`-only).
+#[tokio::test]
+async fn remote_reconcile_all_is_denied_by_default_without_an_authorizer() {
+    let server = start_engine_server().await;
+    let remote = remote(&server).await;
+
+    let denied = remote
+        .catalog()
+        .reconcile(false, Some(0), true)
+        .await
+        .expect_err("all=true must be refused when no admin authorizer is wired");
+    assert!(
+        denied.to_string().contains("admin authorizer"),
+        "the refusal must name the missing seam: {denied}"
+    );
+
+    // The tenant-scoped arm on the SAME server is unaffected by the missing
+    // authorizer — the gate is `all = true`-only.
+    remote
+        .catalog()
+        .reconcile(false, Some(0), false)
+        .await
+        .expect("all=false never consults the admin authorizer");
 
     let _ = server.shutdown.send(());
     let _ = server.handle.await;

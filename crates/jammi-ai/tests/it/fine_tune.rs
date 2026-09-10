@@ -2200,9 +2200,9 @@ fn worker_run_span_carries_job_and_tenant() {
 //
 // The prerequisite for the distributed-validation lane: a short configured
 // lease must actually expire and be reclaimed. This builds a session whose
-// `[training]` timing carries a 1 s lease, claims a real job under the exact
+// `[lease]` timing carries a short lease, claims a real job under the exact
 // lease the worker derives from that config (the single source of truth —
-// `TrainingConfig::worker_intervals`), then stops heartbeating. After the lease
+// `LeaseConfig::intervals`), then stops heartbeating. After the lease
 // elapses, `reclaim_expired_training_jobs` re-queues the job — proving the
 // configured lease, not the historical 30 s constant, drives reclaim. A second
 // claim under the same short lease succeeds, confirming the job is back in the
@@ -2216,9 +2216,11 @@ async fn configured_short_lease_drives_reclaim() {
     // A short lease (6 s) with a real heartbeat margin (2 s heartbeat, so
     // heartbeat * 2 < lease — strictly under half) and a 1 s poll — the kind of
     // timing the distributed-validation lane uses to exercise expiry quickly.
+    config.lease = jammi_db::config::LeaseConfig {
+        duration_secs: 6,
+        heartbeat_secs: 2,
+    };
     config.training = jammi_db::config::TrainingConfig {
-        lease_duration_secs: 6,
-        heartbeat_interval_secs: 2,
         idle_poll_secs: 1,
         ..Default::default()
     };
@@ -2261,16 +2263,11 @@ async fn configured_short_lease_drives_reclaim() {
         .await
         .unwrap();
 
-    // The worker reads its lease from the session's `[training]` config. Build
+    // The worker reads its lease from the session's `[lease]` config. Build
     // it the production way so the test exercises the configured value, then
     // claim under that exact lease (the value the worker's loop would pass).
     let worker = TrainingWorker::new(&session).expect("short timing clears the margin");
-    let lease = session
-        .inner_config()
-        .training
-        .worker_intervals()
-        .unwrap()
-        .lease;
+    let lease = session.inner_config().lease.intervals().unwrap().lease();
     let claimed = session
         .catalog()
         .claim_next_training_job(worker.worker_id(), lease)
@@ -2474,9 +2471,11 @@ async fn cancelled_run_reclaims_epoch_checkpoints_that_actually_existed() {
     // enough that a real heartbeat tick reliably detects the forced lease
     // loss within about a second, matching `configured_short_lease_drives_
     // reclaim`'s precedent for exercising real timing quickly.
+    config.lease = jammi_db::config::LeaseConfig {
+        duration_secs: 3,
+        heartbeat_secs: 1,
+    };
     config.training = jammi_db::config::TrainingConfig {
-        lease_duration_secs: 3,
-        heartbeat_interval_secs: 1,
         idle_poll_secs: 1,
         ..Default::default()
     };
@@ -2530,12 +2529,7 @@ async fn cancelled_run_reclaims_epoch_checkpoints_that_actually_existed() {
         .unwrap();
 
     let worker_a = TrainingWorker::new(&session).expect("short timing clears the margin");
-    let lease = session
-        .inner_config()
-        .training
-        .worker_intervals()
-        .unwrap()
-        .lease;
+    let lease = session.inner_config().lease.intervals().unwrap().lease();
     let claimed = session
         .catalog()
         .claim_next_training_job(worker_a.worker_id(), lease)
@@ -2563,6 +2557,7 @@ async fn cancelled_run_reclaims_epoch_checkpoints_that_actually_existed() {
         .path()
         .join("jammi_db")
         .join("models")
+        .join("_global")
         .join(&job_id)
         .join(&worker_a_id)
         .join(attempt.to_string())
@@ -2820,6 +2815,7 @@ async fn finalize_reclaims_a_persistently_failed_prune_and_warns() {
         dir.path()
             .join("jammi_db")
             .join("models")
+            .join("_global")
             .join(&job_id)
             .join(&worker_id)
             .join(attempt.to_string())

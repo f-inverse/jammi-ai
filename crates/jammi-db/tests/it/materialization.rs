@@ -2,7 +2,7 @@
 //! surface, the single-funnel guarantee, and recovery's manifest awareness.
 //!
 //! Every result table is published through the one `building -> ready` boundary
-//! [`ResultStore::finalize_with_manifest`], which writes a `.materialization.json`
+//! [`jammi_db::store::BuildingTable::finish`], which writes a `.materialization.json`
 //! attestation (definition hash over the producing descriptor + the
 //! output-affecting environment, plus the as-of input anchors) *before* the
 //! status flip. `verify_materialization` recomputes the Parquet digest and
@@ -31,7 +31,7 @@ use jammi_db::store::manifest::{
     MaterializationEnv, ModelContentDigest, ModelIdentity, ProducingDescriptor,
 };
 use jammi_db::store::schema::embedding_table_schema;
-use jammi_db::store::{ResultStore, ResultTableInfo};
+use jammi_db::store::{BuildingTable, ResultStore};
 use tempfile::tempdir;
 use test_case::test_case;
 
@@ -76,7 +76,7 @@ fn store(dir: &std::path::Path, catalog: Arc<Catalog>) -> ResultStore {
     ResultStore::new(dir, catalog, AnnIndexConfig::default()).unwrap()
 }
 
-async fn create_building(store: &ResultStore) -> ResultTableInfo {
+async fn create_building(store: &ResultStore) -> BuildingTable {
     store
         .create_table(
             "docs",
@@ -92,7 +92,7 @@ async fn create_building(store: &ResultStore) -> ResultTableInfo {
         .unwrap()
 }
 
-async fn write_embedding_parquet(store: &ResultStore, info: &ResultTableInfo, n: usize) -> usize {
+async fn write_embedding_parquet(store: &ResultStore, info: &BuildingTable, n: usize) -> usize {
     let schema = embedding_table_schema(DIMS);
     let row_ids: Vec<String> = (0..n).map(|i| format!("row-{i}")).collect();
     let row_id_arr = StringArray::from_iter_values(row_ids.iter().map(|s| s.as_str()));
@@ -119,7 +119,7 @@ async fn write_embedding_parquet(store: &ResultStore, info: &ResultTableInfo, n:
         ],
     )
     .unwrap();
-    let mut writer = store.open_writer(&info.parquet_url, schema).await.unwrap();
+    let mut writer = store.open_writer(info.parquet_url(), schema).await.unwrap();
     writer.write_batch(&batch).await.unwrap();
     writer.close().await.unwrap()
 }
@@ -157,23 +157,23 @@ async fn materialize(
 ) -> (ResultTableRecord, DefinitionHash) {
     let info = create_building(store).await;
     let rows = write_embedding_parquet(store, &info, 3).await;
-    let manifest = store
-        .finalize_with_manifest(
+    // `finish` = renew the lease → write the attestation → promote by CAS →
+    // register; it returns the promoted catalog record.
+    let record = info
+        .finish(
             ctx,
-            &info.table_name,
-            &info.parquet_url,
             rows,
             jammi_db::store::manifest::Materialization::new(&descriptor(), &env(), inputs),
         )
         .await
         .unwrap();
-    let record = store
-        .catalog()
-        .get_result_table(&info.table_name)
-        .await
-        .unwrap()
-        .expect("record after materialize");
-    (record, manifest.definition_hash)
+    let definition_hash = DefinitionHash(
+        record
+            .definition_hash
+            .clone()
+            .expect("the funnel persists the definition hash"),
+    );
+    (record, definition_hash)
 }
 
 #[test_case(BackendKind::Sqlite ; "sqlite")]
@@ -299,12 +299,12 @@ async fn verdict_missing_manifest_for_a_pre_contract_table(backend: BackendKind)
     let info = create_building(&store).await;
     let rows = write_embedding_parquet(&store, &info, 3).await;
     catalog
-        .update_result_table_status(&info.table_name, ResultTableStatus::Ready, rows)
+        .update_result_table_status(info.table_name(), ResultTableStatus::Ready, rows)
         .await
         .unwrap();
     let record = store
         .catalog()
-        .get_result_table(&info.table_name)
+        .get_result_table(info.table_name())
         .await
         .unwrap()
         .unwrap();
@@ -365,7 +365,7 @@ async fn recovery_reaps_a_torn_manifestless_building_row(backend: BackendKind) {
     // status still `building`).
     let info = create_building(&store).await;
     write_embedding_parquet(&store, &info, 3).await;
-    let url = jammi_db::storage::StorageUrl::parse(&info.parquet_url.to_string()).unwrap();
+    let url = jammi_db::storage::StorageUrl::parse(&info.parquet_url().to_string()).unwrap();
     assert!(
         store
             .read_materialization_manifest(&url)
@@ -374,6 +374,9 @@ async fn recovery_reaps_a_torn_manifestless_building_row(backend: BackendKind) {
             .is_none(),
         "the torn state has no manifest"
     );
+    // The writer is dead and its lease has run out (asserted `building` under
+    // a live lease first, so the transition below is observed, not assumed).
+    let table_name = jammi_test_utils::abandon_building(&catalog, info).await;
 
     store.recover().await.unwrap();
 
@@ -381,12 +384,16 @@ async fn recovery_reaps_a_torn_manifestless_building_row(backend: BackendKind) {
     // valid Parquet is reaped to `failed`, never promoted manifest-less.
     let record = store
         .catalog()
-        .get_result_table(&info.table_name)
+        .get_result_table(&table_name)
         .await
         .unwrap()
         .unwrap();
     assert_eq!(record.status, "failed");
-    let handle = store.open_parquet(&info.parquet_url).unwrap();
+    assert!(
+        record.lease_expires_at.is_none(),
+        "a terminal row carries no lease"
+    );
+    let handle = store.open_parquet(&url).unwrap();
     let path = handle.data_path().unwrap();
     assert!(
         !handle.exists(&path).await.unwrap(),
@@ -418,16 +425,27 @@ async fn recovery_promotes_a_building_row_whose_manifest_landed(backend: Backend
     )
     .unwrap();
     write_sidecar(&store, &info, &manifest).await;
+    let table_name = jammi_test_utils::abandon_building(&catalog, info).await;
 
     store.recover().await.unwrap();
 
     let record = store
         .catalog()
-        .get_result_table(&info.table_name)
+        .get_result_table(&table_name)
         .await
         .unwrap()
         .unwrap();
     assert_eq!(record.status, "ready");
+    // A claim mints a FRESH id, `"{store.writer_id()}
+    // /claim-{uuid}"` — never the store's raw process-wide id.
+    assert!(
+        record
+            .writer_id
+            .as_deref()
+            .is_some_and(|w| w.starts_with(&format!("{}/claim-", store.writer_id()))),
+        "recovery claimed the row before promoting: the recoverer is the writer of record, got {:?}",
+        record.writer_id
+    );
     assert_eq!(record.row_count, rows);
     assert_eq!(
         record.definition_hash.as_deref(),
@@ -480,9 +498,9 @@ async fn recovery_reaps_a_post_contract_ready_table_whose_sidecar_vanished(backe
 
 async fn store_artifact_digest(
     store: &ResultStore,
-    info: &ResultTableInfo,
+    info: &BuildingTable,
 ) -> jammi_db::store::manifest::ArtifactDigest {
-    let handle = store.open_parquet(&info.parquet_url).unwrap();
+    let handle = store.open_parquet(info.parquet_url()).unwrap();
     let path = handle.data_path().unwrap();
     let bytes = handle.get_bytes(&path).await.unwrap();
     jammi_db::store::manifest::ArtifactDigest::of_bytes(&bytes)
@@ -490,10 +508,10 @@ async fn store_artifact_digest(
 
 async fn write_sidecar(
     store: &ResultStore,
-    info: &ResultTableInfo,
+    info: &BuildingTable,
     manifest: &jammi_db::store::manifest::MaterializationManifest,
 ) {
-    let handle = store.open_parquet(&info.parquet_url).unwrap();
+    let handle = store.open_parquet(info.parquet_url()).unwrap();
     let sidecar = handle.sibling_path("materialization.json").unwrap();
     handle
         .put_bytes(&sidecar, manifest.to_json_bytes().unwrap().into())

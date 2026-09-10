@@ -226,6 +226,7 @@ async fn start_grpc_test_server(seeds: &[TopicSeed]) -> ServerFixture {
         tenant_resolver: jammi_server::grpc::session::SessionIdTenantResolver::arc(
             store_for_server,
         ),
+        admin_authorizer: None,
     };
     let (addr, handle) = super::common::grpc::spawn_bound_chain(chain, shutdown_rx).await;
 

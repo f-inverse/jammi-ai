@@ -83,6 +83,8 @@ async fn result_table_crud_lifecycle() {
 
     catalog
         .create_result_table(CreateResultTableParams {
+            writer_id: None,
+            lease: None,
             table_name: "t1",
             source_id: "patents",
             model_id: "sentence-transformers/all-MiniLM-L6-v2",
@@ -116,6 +118,8 @@ async fn result_table_crud_lifecycle() {
 
     catalog
         .create_result_table(CreateResultTableParams {
+            writer_id: None,
+            lease: None,
             table_name: "t2",
             source_id: "patents",
             model_id: "m",
@@ -160,6 +164,8 @@ async fn find_result_tables_filters_by_source_and_task() {
     ] {
         catalog
             .create_result_table(CreateResultTableParams {
+                writer_id: None,
+                lease: None,
                 table_name: name,
                 source_id: source,
                 model_id: "model",
@@ -207,6 +213,8 @@ async fn resolve_embedding_table_latest_explicit_and_missing() {
     for (seq, name) in ["old", "new"].into_iter().enumerate() {
         catalog
             .create_result_table(CreateResultTableParams {
+                writer_id: None,
+                lease: None,
                 table_name: name,
                 source_id: "patents",
                 model_id: "model",
@@ -265,6 +273,8 @@ async fn resolve_embedding_table_accepts_every_embedding_variant() {
         let name = format!("row_{}", task.as_db_str());
         catalog
             .create_result_table(CreateResultTableParams {
+                writer_id: None,
+                lease: None,
                 table_name: &name,
                 source_id: "media",
                 model_id: "model",
@@ -354,6 +364,8 @@ async fn resolve_embedding_table_picks_newest_by_created_at_not_table_name(backe
     // First (older) table: model name sorts alphabetically LAST.
     catalog
         .create_result_table(CreateResultTableParams {
+            writer_id: None,
+            lease: None,
             table_name: &older_table,
             source_id: &source_id,
             model_id: "zzz_model",
@@ -384,6 +396,8 @@ async fn resolve_embedding_table_picks_newest_by_created_at_not_table_name(backe
     // `table_name DESC` tiebreak would wrongly return `older_table` above.
     catalog
         .create_result_table(CreateResultTableParams {
+            writer_id: None,
+            lease: None,
             table_name: &newer_table,
             source_id: &source_id,
             model_id: "aaa_model",
@@ -456,6 +470,8 @@ async fn recovery_skips_index_rebuild_for_non_embedding_task() {
 
     catalog
         .create_result_table(CreateResultTableParams {
+            writer_id: None,
+            lease: None,
             table_name: "classify_recover",
             source_id: "src",
             model_id: "model",
@@ -515,17 +531,24 @@ async fn result_store_create_table_generates_correct_paths() {
         .unwrap();
 
     assert!(info
-        .table_name
+        .table_name()
         .starts_with("patents__text_embedding__sentence-transformers_all-MiniLM-L6-v2__"));
     // parquet_url is a StorageUrl pointing at a file://… path under the
     // jammi_db root we just created.
-    assert!(info.parquet_url.as_str().contains("jammi_db"));
+    assert!(info.parquet_url().as_str().contains("jammi_db"));
+    // A GLOBAL table (no tenant binding on this catalog) lands under the
+    // `_global` segment — the layout allowlist `reconcile` attributes by.
+    assert!(
+        info.parquet_url().as_str().contains("/_global/"),
+        "an untenanted table must land under the `_global` segment, got: {}",
+        info.parquet_url()
+    );
     // No ANN index is generated at table creation — the index materialises
     // lazily as segments, so a freshly created table has an empty segment set.
     assert!(
         store
             .catalog()
-            .list_index_segments(&info.table_name)
+            .list_index_segments(info.table_name())
             .await
             .unwrap()
             .is_empty(),
@@ -565,7 +588,7 @@ async fn binary_precision_table_stamps_precision_specific_oversample() {
         .unwrap();
 
     let record = catalog
-        .get_result_table(&info.table_name)
+        .get_result_table(info.table_name())
         .await
         .unwrap()
         .unwrap();
@@ -609,7 +632,7 @@ async fn binary_precision_table_honors_explicit_oversample_override() {
         .unwrap();
 
     let record = catalog
-        .get_result_table(&info.table_name)
+        .get_result_table(info.table_name())
         .await
         .unwrap()
         .unwrap();
@@ -651,7 +674,7 @@ async fn binary_precision_table_honors_an_explicit_four_not_widened_to_thirty_tw
         .unwrap();
 
     let record = catalog
-        .get_result_table(&info.table_name)
+        .get_result_table(info.table_name())
         .await
         .unwrap()
         .unwrap();
@@ -703,7 +726,7 @@ async fn create_table_couples_rescoring_precision_to_a_present_oversample() {
             .unwrap();
 
         let record = catalog
-            .get_result_table(&info.table_name)
+            .get_result_table(info.table_name())
             .await
             .unwrap()
             .unwrap();
@@ -759,11 +782,11 @@ async fn result_store_with_memory_root_roots_and_roundtrips() {
         .unwrap();
     // The table's parquet URL is rooted at the memory root, not local disk.
     assert!(
-        info.parquet_url
+        info.parquet_url()
             .as_str()
             .starts_with("memory:///jammi_results/"),
         "parquet_url not under memory root: {}",
-        info.parquet_url
+        info.parquet_url()
     );
 
     let schema = Arc::new(Schema::new(vec![Field::new("id", DataType::Utf8, false)]));
@@ -773,7 +796,7 @@ async fn result_store_with_memory_root_roots_and_roundtrips() {
     )
     .unwrap();
     let mut writer = store
-        .open_writer(&info.parquet_url, Arc::clone(&schema))
+        .open_writer(info.parquet_url(), Arc::clone(&schema))
         .await
         .unwrap();
     writer.write_batch(&batch).await.unwrap();
@@ -781,7 +804,7 @@ async fn result_store_with_memory_root_roots_and_roundtrips() {
     assert_eq!(rows, 3);
 
     // Read back through the same registry-cached in-memory driver.
-    let handle = store.open_parquet(&info.parquet_url).unwrap();
+    let handle = store.open_parquet(info.parquet_url()).unwrap();
     assert!(is_valid_parquet(&handle).await.unwrap());
     assert_eq!(count_parquet_rows(&handle).await.unwrap(), 3);
 }
@@ -797,6 +820,8 @@ async fn recovery_marks_missing_parquet_as_failed() {
         StorageUrl::parse(dir.path().join("nonexistent.parquet").to_str().unwrap()).unwrap();
     catalog
         .create_result_table(CreateResultTableParams {
+            writer_id: None,
+            lease: None,
             table_name: "orphan",
             source_id: "src",
             model_id: "model",
@@ -842,6 +867,8 @@ async fn recovery_deletes_invalid_parquet_and_marks_failed() {
 
     catalog
         .create_result_table(CreateResultTableParams {
+            writer_id: None,
+            lease: None,
             table_name: "corrupt",
             source_id: "src",
             model_id: "model",
@@ -904,6 +931,8 @@ async fn recovery_promotes_valid_parquet_to_ready() {
 
     catalog
         .create_result_table(CreateResultTableParams {
+            writer_id: None,
+            lease: None,
             table_name: "stuck",
             source_id: "src",
             model_id: "model",
@@ -986,6 +1015,8 @@ async fn result_table_none_dimensions_round_trips_as_null(backend: BackendKind) 
 
     catalog
         .create_result_table(CreateResultTableParams {
+            writer_id: None,
+            lease: None,
             table_name: &table_name,
             source_id: &source_id,
             model_id: "acme/sentiment-classifier",

@@ -2,19 +2,19 @@ use arrow::array::{
     Array, FixedSizeListArray, Float32Array, RecordBatch, StringArray, UInt32Array,
 };
 
-use jammi_db::catalog::Catalog;
 use jammi_db::error::{JammiError, Result};
 use jammi_db::index::sidecar::SidecarIndex;
 use jammi_db::index::VectorIndex;
 use jammi_db::storage::ObjectParquetWriter;
+use jammi_db::store::BuildingTable;
 
 /// Streams InferenceExec output to Parquet + optional ANN index,
-/// filtering failed rows for embedding tables.
+/// filtering failed rows for embedding tables. Checkpoints land on the
+/// writer's [`BuildingTable`], so each carries the writer's lease CAS.
 pub struct ResultSink<'a> {
     writer: ObjectParquetWriter,
     index: Option<SidecarIndex>,
-    catalog: &'a Catalog,
-    table_name: String,
+    building: &'a BuildingTable,
     is_embedding: bool,
     checkpoint_interval: usize,
     batch_num: usize,
@@ -25,15 +25,13 @@ impl<'a> ResultSink<'a> {
     pub fn for_embeddings(
         writer: ObjectParquetWriter,
         index: SidecarIndex,
-        catalog: &'a Catalog,
-        table_name: String,
+        building: &'a BuildingTable,
         checkpoint_interval: usize,
     ) -> Self {
         Self {
             writer,
             index: Some(index),
-            catalog,
-            table_name,
+            building,
             is_embedding: true,
             checkpoint_interval,
             batch_num: 0,
@@ -41,16 +39,11 @@ impl<'a> ResultSink<'a> {
     }
 
     /// Create a sink for inference results (writes all rows, no index).
-    pub fn for_inference(
-        writer: ObjectParquetWriter,
-        catalog: &'a Catalog,
-        table_name: String,
-    ) -> Self {
+    pub fn for_inference(writer: ObjectParquetWriter, building: &'a BuildingTable) -> Self {
         Self {
             writer,
             index: None,
-            catalog,
-            table_name,
+            building,
             is_embedding: false,
             checkpoint_interval: 0,
             batch_num: 0,
@@ -74,9 +67,7 @@ impl<'a> ResultSink<'a> {
             self.writer.write_batch(batch).await?;
         }
         if self.checkpoint_interval > 0 && self.batch_num.is_multiple_of(self.checkpoint_interval) {
-            self.catalog
-                .set_checkpoint(&self.table_name, self.batch_num)
-                .await?;
+            self.building.set_checkpoint(self.batch_num).await?;
         }
         Ok(())
     }

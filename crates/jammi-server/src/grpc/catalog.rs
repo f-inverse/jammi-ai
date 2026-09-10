@@ -47,6 +47,30 @@ use crate::grpc::wire::{
 };
 use crate::tiers::TierSet;
 
+/// Authorizes an `all = true` [`Reconcile`](pb::ReconcileRequest) admin pass —
+/// the ONE wire-only gate this crate adds. A tenant-scoped `Reconcile`
+/// (`all = false`) never consults this; it always runs under the caller's own
+/// resolved tenant scope, like every other verb on this service.
+///
+/// This is mechanism, not policy: a deployment supplies its own authorizer at
+/// the [`crate::runtime::GrpcChain`] composability seam to decide WHO may run
+/// the cross-tenant sweep (a signed capability, an mTLS peer identity the
+/// transport already verified, …) — the seam names no consumer, scheme, or
+/// identity provider, mirroring [`crate::grpc::session::TenantResolver`]. The
+/// engine's shipped default (`admin_authorizer: None`) refuses EVERY
+/// `all = true` request outright, so a deployment that never wires one cannot
+/// accidentally expose the cross-tenant admin pass.
+///
+/// Synchronous (unlike the `async_trait` [`TenantResolver`](crate::grpc::session::TenantResolver)):
+/// an authorization decision here is a local check over the request's
+/// metadata, not an I/O round-trip.
+pub trait AdminAuthorizer: Send + Sync {
+    /// `Ok(())` permits the pass; `Err(status)` is returned to the caller
+    /// verbatim, so the authorizer controls its own error code and message
+    /// (typically `PERMISSION_DENIED` or `UNAUTHENTICATED`).
+    fn authorize(&self, metadata: &tonic::metadata::MetadataMap) -> Result<(), Status>;
+}
+
 /// Server-side handler for the control-plane gRPC surface.
 ///
 /// Holds the in-process [`SessionStore`] + mounted [`TierSet`] that back the
@@ -54,10 +78,14 @@ use crate::tiers::TierSet;
 /// shared engine session that backs the catalog / lifecycle verbs. The engine
 /// is `None` on an engine-light deployment (one that mounts the control plane
 /// but no data-plane engine); those verbs then report a truthful `Unavailable`.
+///
+/// `admin_authorizer` gates `Reconcile`'s `all = true` cross-tenant admin
+/// pass only; see [`AdminAuthorizer`].
 pub struct CatalogServer {
     store: SessionStore,
     tiers: TierSet,
     session: Option<Arc<InferenceSession>>,
+    admin_authorizer: Option<Arc<dyn AdminAuthorizer>>,
 }
 
 impl CatalogServer {
@@ -65,11 +93,13 @@ impl CatalogServer {
         store: SessionStore,
         tiers: TierSet,
         session: Option<Arc<InferenceSession>>,
+        admin_authorizer: Option<Arc<dyn AdminAuthorizer>>,
     ) -> Self {
         Self {
             store,
             tiers,
             session,
+            admin_authorizer,
         }
     }
 
@@ -589,6 +619,60 @@ impl CatalogService for CatalogServer {
             // means "this is the complete result set."
             next_page_token: String::new(),
         }))
+    }
+
+    // --- reconcile -----------------------------------------------------------
+
+    /// `all = false` (the default) runs [`ResultStore::reconcile`] under the
+    /// caller's resolved tenant scope, exactly like every other tenant-scoped
+    /// verb here. `all = true` consults `self.admin_authorizer` FIRST: `None`
+    /// (the shipped default) refuses with `PERMISSION_DENIED` naming where the
+    /// policy lives; `Err(status)` is returned verbatim (the authorizer's own
+    /// code/message); only `Ok(())` runs the cross-tenant
+    /// [`ResultStore::reconcile_all`]. `apply = true` with too short a
+    /// `grace_secs` surfaces as the typed `Config` refusal
+    /// ([`map_engine_error`] renders it `INVALID_ARGUMENT`, naming both values)
+    /// — that check lives on [`ResultStore`] itself, not duplicated here.
+    ///
+    /// [`ResultStore`]: jammi_db::store::ResultStore
+    /// [`ResultStore::reconcile`]: jammi_db::store::ResultStore::reconcile
+    /// [`ResultStore::reconcile_all`]: jammi_db::store::ResultStore::reconcile_all
+    #[tracing::instrument(skip(self, request), fields(tenant_id = tracing::field::Empty))]
+    async fn reconcile(
+        &self,
+        request: Request<pb::ReconcileRequest>,
+    ) -> Result<Response<pb::ReconcileReport>, Status> {
+        let tenant = session_tenant_traced(&request);
+        let metadata = request.metadata().clone();
+        let req = request.into_inner();
+        let opts = jammi_wire::reconcile_options_from_proto(&req);
+        let engine = self.engine()?;
+
+        let report = if req.all {
+            match &self.admin_authorizer {
+                None => {
+                    return Err(Status::permission_denied(
+                        "reconcile --all requires an admin authorizer; see security.md",
+                    ));
+                }
+                Some(authorizer) => authorizer.authorize(&metadata)?,
+            }
+            engine
+                .result_store()
+                .reconcile_all(opts)
+                .await
+                .map_err(map_engine_error)?
+        } else {
+            scoped(engine, tenant, move || async move {
+                engine.result_store().reconcile(opts).await
+            })
+            .await
+            .map_err(map_engine_error)?
+        };
+
+        Ok(Response::new(jammi_wire::reconcile_report_to_proto(
+            &report,
+        )))
     }
 }
 

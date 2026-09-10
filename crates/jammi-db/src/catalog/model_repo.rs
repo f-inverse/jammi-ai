@@ -4,6 +4,7 @@ use crate::catalog::backend::{
 use crate::error::{JammiError, Result};
 use crate::model_task::ModelTask;
 use crate::tenant::TenantId;
+use crate::tenant_scope::TenantBinding;
 
 use super::Catalog;
 
@@ -367,12 +368,21 @@ impl Catalog {
     /// List the models visible to the session's tenant — the peer of
     /// `list_sources`. A reference resolver that binds a single model by name
     /// (provenance, a base-model FK) uses [`Self::get_model`] instead.
+    ///
+    /// Inside a [`crate::session::JammiSession::with_admin_scope`] closure the
+    /// per-row tenant filter is dropped and every tenant's models are returned
+    /// — the same admin arm every other catalog enumeration carries.
     pub async fn list_models(&self) -> Result<Vec<ModelRecord>> {
-        let sql = format!(
-            "SELECT {SELECT_COLS} FROM models \
-             WHERE (tenant_id = $1 OR tenant_id IS NULL) \
-             ORDER BY created_at"
-        );
+        let admin = TenantBinding::is_admin_scope();
+        let sql = if admin {
+            format!("SELECT {SELECT_COLS} FROM models ORDER BY created_at")
+        } else {
+            format!(
+                "SELECT {SELECT_COLS} FROM models \
+                 WHERE (tenant_id = $1 OR tenant_id IS NULL) \
+                 ORDER BY created_at"
+            )
+        };
         let tenant = self.current_tenant();
         Ok(self
             .backend()
@@ -383,12 +393,12 @@ impl Catalog {
                 },
                 |tx| {
                     Box::pin(async move {
-                        tx.query(
-                            &sql,
-                            &[SqlValue::from(tenant.map(|t| t.to_string()))],
-                            parse_model_row,
-                        )
-                        .await
+                        let params: Vec<SqlValue<'static>> = if admin {
+                            Vec::new()
+                        } else {
+                            vec![SqlValue::from(tenant.map(|t| t.to_string()))]
+                        };
+                        tx.query(&sql, &params, parse_model_row).await
                     })
                 },
             )

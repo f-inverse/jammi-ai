@@ -39,7 +39,7 @@ use tower::Layer;
 use crate::error::fallback_handler;
 use crate::flight::TenantBoundProvider;
 use crate::grpc::audit::AuditServer;
-use crate::grpc::catalog::CatalogServer;
+use crate::grpc::catalog::{AdminAuthorizer, CatalogServer};
 use crate::grpc::embedding::EmbeddingServer;
 use crate::grpc::eval::EvalServer;
 use crate::grpc::inference::InferenceServer;
@@ -161,12 +161,16 @@ impl OssServer {
             .server
             .validate()
             .map_err(|e| ServerError::Config(e.to_string()))?;
-        // Reject training timing that violates the worker invariants (heartbeat
-        // margin / non-zero poll) at construction, before the train tier spawns
-        // its worker.
+        // Reject lease timing that violates the heartbeat margin, or a
+        // training poll that is a busy-loop, at construction — before the
+        // train tier spawns its worker or a result table is leased.
+        let lease = config
+            .lease
+            .intervals()
+            .map_err(|e| ServerError::Config(e.to_string()))?;
         config
             .training
-            .worker_intervals()
+            .worker_intervals(lease)
             .map_err(|e| ServerError::Config(e.to_string()))?;
 
         let flight_addr: SocketAddr = config.server.flight_listen.parse()?;
@@ -308,6 +312,12 @@ impl OssServer {
             // behavior, now a first-class resolver rather than an implicit
             // interceptor.
             tenant_resolver: SessionIdTenantResolver::arc(self.session_store.clone()),
+            // The shipped default: no admin authorizer wired, so `Reconcile`'s
+            // `all = true` cross-tenant admin pass is refused outright. A
+            // downstream that needs it supplies its own `AdminAuthorizer` by
+            // constructing `GrpcChain` directly (this OSS binary's own
+            // orchestration path has no seam to configure one yet).
+            admin_authorizer: None,
         }
     }
 }
@@ -450,6 +460,13 @@ pub struct GrpcChain {
     /// services `assemble_grpc_chain` itself builds are bound by it — downstream
     /// services later [`AssembledChain::mount`]ed are NOT wrapped.
     pub tenant_resolver: Arc<dyn TenantResolver>,
+    /// Gates `CatalogService.Reconcile`'s `all = true` cross-tenant admin pass
+    /// ONLY — every other verb on this service, including `Reconcile` with
+    /// `all = false`, is unaffected. The shipped default is `None`, which
+    /// refuses every `all = true` request; a downstream that needs the
+    /// cross-tenant pass supplies its own [`AdminAuthorizer`] here. See that
+    /// trait's doc for the seam's mechanism-not-policy rationale.
+    pub admin_authorizer: Option<Arc<dyn AdminAuthorizer>>,
 }
 
 /// The engine's fully-assembled gRPC chain, ready for a downstream to mount
@@ -887,6 +904,7 @@ pub fn assemble_grpc_chain(chain: GrpcChain) -> Result<AssembledChain, ServerErr
         tiers,
         metrics,
         tenant_resolver,
+        admin_authorizer,
     } = chain;
 
     // Flight SQL — MUST-FIX 2: cover the `db.sql` lane through the SAME resolver
@@ -941,7 +959,12 @@ pub fn assemble_grpc_chain(chain: GrpcChain) -> Result<AssembledChain, ServerErr
         routes,
         mounted,
         "CatalogService",
-        CatalogServiceServer::new(CatalogServer::new(store, tiers.clone(), engine.clone()))
+        CatalogServiceServer::new(CatalogServer::new(
+            store,
+            tiers.clone(),
+            engine.clone(),
+            admin_authorizer,
+        ))
     );
 
     // Event tier: TriggerService. Driven by the caller having supplied handles

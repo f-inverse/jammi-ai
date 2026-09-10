@@ -223,6 +223,54 @@ resolves, closing the cross-transport gap where a boundary authenticated the
 gRPC plane but Flight still bound from the unauthenticated
 `jammi-session-id` header.
 
+### Gating the cross-tenant admin pass: `AdminAuthorizer`
+
+`TenantResolver` above binds *which* tenant an ordinary request acts as. A
+separate, narrower seam gates a different question: whether a caller may run
+`CatalogService.Reconcile`'s cross-tenant `all = true` admin pass at all — the
+one verb that deliberately crosses every tenant's data in a single call. This
+is `AdminAuthorizer`, a synchronous capability check (`&MetadataMap ->
+Result<(), Status>`) supplied at `GrpcChain.admin_authorizer`:
+
+```rust,ignore
+use jammi_server::grpc::catalog::AdminAuthorizer;
+use tonic::{Status, metadata::MetadataMap};
+
+/// A consumer's admin-capability check — a signed capability header, an
+/// mTLS peer identity the transport already verified, or any other
+/// consumer-owned policy. `Ok(())` permits the `all = true` pass; `Err`
+/// is returned to the caller verbatim, so this decides its own status code.
+struct AdminHeaderCheck;
+
+impl AdminAuthorizer for AdminHeaderCheck {
+    fn authorize(&self, metadata: &MetadataMap) -> Result<(), Status> {
+        match metadata.get("x-admin-capability") {
+            Some(v) if v == "granted" => Ok(()),
+            _ => Err(Status::permission_denied("admin capability required")),
+        }
+    }
+}
+```
+
+```rust,ignore
+use std::sync::Arc;
+use jammi_server::runtime::{assemble_grpc_chain, GrpcChain};
+
+let chain = GrpcChain {
+    admin_authorizer: Some(Arc::new(AdminHeaderCheck)),
+    ..chain_defaults
+};
+```
+
+The shipped default is `admin_authorizer: None`, which refuses EVERY
+`all = true` request with `PERMISSION_DENIED` — a deployment that never wires
+one cannot accidentally expose the cross-tenant sweep. A tenant-scoped
+`Reconcile` (`all = false`) never consults this seam at all; it runs under
+the caller's own `TenantResolver`-resolved scope like every other verb. The
+seam is **gRPC-only by construction** (`Reconcile` has no Flight SQL
+analogue), unlike `TenantResolver`, which binds both transports from one
+grant — see [Security Posture](./security.md) for the full comparison.
+
 ## Disjoint views — what to expect
 
 Two sessions on the same process, bound to different tenants, will:

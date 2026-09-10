@@ -119,6 +119,27 @@ impl From<&JammiError> for pb::JammiErrorDetail {
                 message: message.clone(),
             }),
             JammiError::MutableTable(e) => Variant::MutableTable(e.into()),
+            JammiError::RowGone { table } => Variant::RowGone(pb::RowGoneError {
+                table: table.clone(),
+            }),
+            JammiError::TenantMismatch { table } => {
+                Variant::TenantMismatch(pb::TenantMismatchError {
+                    table: table.clone(),
+                })
+            }
+            JammiError::LeaseLost { table } => Variant::LeaseLost(pb::LeaseLostError {
+                table: table.clone(),
+            }),
+            JammiError::CasFailed { table, status } => Variant::CasFailed(pb::CasFailedError {
+                table: table.clone(),
+                status: status.clone(),
+            }),
+            JammiError::SourceBusy { source_id, table } => {
+                Variant::SourceBusy(pb::SourceBusyError {
+                    source_id: source_id.clone(),
+                    table: table.clone(),
+                })
+            }
             // The fold reaches ONLY the genuinely-foreign `#[from]` variants
             // (`Io`, `BackendDriver`, `Toml`, `Json`, `DataFusion`, `Trigger`,
             // `Storage`) and the existing `Other`: every owned-shape variant —
@@ -176,6 +197,17 @@ impl From<pb::JammiErrorDetail> for JammiError {
             Some(Variant::ChannelCatalog(e)) => JammiError::ChannelCatalog(e.into()),
             Some(Variant::ChannelAssembly(e)) => JammiError::ChannelAssembly(e.message),
             Some(Variant::MutableTable(e)) => JammiError::MutableTable(e.into()),
+            Some(Variant::RowGone(e)) => JammiError::RowGone { table: e.table },
+            Some(Variant::TenantMismatch(e)) => JammiError::TenantMismatch { table: e.table },
+            Some(Variant::LeaseLost(e)) => JammiError::LeaseLost { table: e.table },
+            Some(Variant::CasFailed(e)) => JammiError::CasFailed {
+                table: e.table,
+                status: e.status,
+            },
+            Some(Variant::SourceBusy(e)) => JammiError::SourceBusy {
+                source_id: e.source_id,
+                table: e.table,
+            },
             Some(Variant::Other(e)) => JammiError::Other(e.message),
             None => JammiError::Other(String::new()),
         }
@@ -320,10 +352,17 @@ impl From<pb::ChannelCatalogErrorDetail> for ChannelCatalogError {
 }
 
 /// Encode the engine-owned [`BackendError`] into its structured wire detail.
-/// Every variant but `Sqlx` reconstructs field-for-field; `Sqlx` wraps a raw
-/// `sqlx::Error` that cannot cross a process boundary, so it folds to its
-/// faithful `Display` string — the genuine fidelity limit, mirroring how the
-/// top-level detail folds its own foreign `#[from]` variants.
+/// Every variant but `Sqlx` and `Busy` reconstructs field-for-field. `Sqlx`
+/// wraps a raw `sqlx::Error` that cannot cross a process boundary, so it
+/// folds to its faithful `Display` string — the genuine fidelity limit,
+/// mirroring how the top-level detail folds its own foreign `#[from]`
+/// variants. `Busy` is a transaction-internal rollback sentinel
+/// (`jammi_db::catalog::backend::BackendError::Busy`'s own doc comment):
+/// every producer intercepts it before its `Result` ever leaves
+/// the catalog method that returned it (mapping it to a typed
+/// [`jammi_db::error::JammiError::SourceBusy`] or similar), so in practice
+/// it never reaches this encoder — folded to `Execution` for the same
+/// reason `Sqlx` is: exhaustiveness, not an expected wire path.
 impl From<&BackendError> for pb::BackendErrorDetail {
     fn from(err: &BackendError) -> Self {
         use pb::backend_error_detail::Variant;
@@ -354,6 +393,7 @@ impl From<&BackendError> for pb::BackendErrorDetail {
                 got: got.map(|t| t.to_string()).unwrap_or_default(),
             }),
             BackendError::Sqlx(e) => Variant::Sqlx(e.to_string()),
+            BackendError::Busy(m) => Variant::Execution(m.clone()),
         };
         pb::BackendErrorDetail {
             variant: Some(variant),
@@ -755,6 +795,23 @@ mod tests {
                 column: "vector".into(),
                 expected: "FixedSizeList<Float32>".into(),
                 actual: "missing".into(),
+            },
+            JammiError::RowGone {
+                table: "src1__text_embedding__m__20260101T000000_deadbeef".into(),
+            },
+            JammiError::TenantMismatch {
+                table: "src1__text_embedding__m__20260101T000000_deadbeef".into(),
+            },
+            JammiError::LeaseLost {
+                table: "src1__text_embedding__m__20260101T000000_deadbeef".into(),
+            },
+            JammiError::CasFailed {
+                table: "src1__text_embedding__m__20260101T000000_deadbeef".into(),
+                status: "ready".into(),
+            },
+            JammiError::SourceBusy {
+                source_id: "src1".into(),
+                table: "src1__text_embedding__m__20260101T000000_deadbeef".into(),
             },
             JammiError::Other("an error with no more specific shape".into()),
         ];

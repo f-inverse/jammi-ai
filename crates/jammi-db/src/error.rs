@@ -196,6 +196,63 @@ pub enum JammiError {
         table: String,
     },
 
+    /// A building-row compare-and-set matched no row because the row is gone:
+    /// the `result_tables` row the writer (or the reaper) addressed no longer
+    /// exists — deleted underneath it (a source removal, a manual purge).
+    /// Nothing is deleted on this outcome; the caller stops.
+    #[error("result table `{table}` is gone: no catalog row to transition")]
+    RowGone {
+        /// The table whose row is absent.
+        table: String,
+    },
+
+    /// A building-row compare-and-set matched no row because the row belongs
+    /// to a different tenant than the binding in force (only possible under a
+    /// non-admin binding — the STRICT tenant arm refused the write). Never a
+    /// licence to delete anything.
+    #[error("result table `{table}` belongs to another tenant; the transition was refused")]
+    TenantMismatch {
+        /// The table whose row is owned elsewhere.
+        table: String,
+    },
+
+    /// A building-row compare-and-set matched no row because the row is still
+    /// `building` but its `writer_id` is no longer the caller's: the lease
+    /// expired and recovery claimed the row, so the claimant now owns the row
+    /// AND its bytes. The caller returns this error and deletes nothing.
+    #[error("result table `{table}`: lease lost to another writer")]
+    LeaseLost {
+        /// The table whose lease was lost.
+        table: String,
+    },
+
+    /// A building-row compare-and-set matched no row because the row has
+    /// already left `building` — `status` names where it went (`ready` when
+    /// recovery promoted an expired-lease row whose sidecar had landed;
+    /// `failed` when it was reaped). The caller returns this error, never
+    /// re-promotes, and deletes nothing.
+    #[error("result table `{table}` is already `{status}`; the transition was superseded")]
+    CasFailed {
+        /// The table whose row moved on.
+        table: String,
+        /// The row's current status.
+        status: String,
+    },
+
+    /// A source cannot be deleted while a live writer is still materialising a
+    /// result table over it: a `building` row with an unexpired lease
+    /// references the source. Retry once the writer finishes or its lease
+    /// expires. Maps to a precondition failure, not a bad argument.
+    #[error(
+        "source `{source_id}` is busy: result table `{table}` is being built under a live lease"
+    )]
+    SourceBusy {
+        /// The source the delete targeted.
+        source_id: String,
+        /// The building table holding the live lease.
+        table: String,
+    },
+
     /// Catch-all for errors that don't fit another variant.
     #[error("{0}")]
     Other(String),

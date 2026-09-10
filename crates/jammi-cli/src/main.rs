@@ -74,6 +74,25 @@ enum Commands {
         #[command(subcommand)]
         action: commands::train::TrainAction,
     },
+    /// Cross-check the catalog against the object store and report (or
+    /// reclaim) drift.
+    Reconcile {
+        /// Actually reclaim drift past `--grace-secs` (and flip an incomplete
+        /// `ready` row to `failed`). Omit for a dry run that reports without
+        /// mutating anything.
+        #[arg(long)]
+        apply: bool,
+        /// An orphan candidate younger than this (seconds) is never reclaimed
+        /// this pass. `--apply` requires this to be at least the server's
+        /// configured lease duration or the call fails naming both values.
+        #[arg(long, default_value_t = commands::reconcile::DEFAULT_GRACE_SECS)]
+        grace_secs: u64,
+        /// Run the cross-tenant admin pass instead of this session's own
+        /// tenant scope. The server refuses this with `PERMISSION_DENIED`
+        /// unless a deployment-supplied admin authorizer is wired.
+        #[arg(long)]
+        all: bool,
+    },
 }
 
 #[tokio::main]
@@ -130,6 +149,11 @@ async fn dispatch(
         Commands::Channels { action } => commands::channels::run(client, action).await,
         Commands::Mutable { action } => commands::mutable::run(client, action).await,
         Commands::Train { action } => commands::train::run(client, action).await,
+        Commands::Reconcile {
+            apply,
+            grace_secs,
+            all,
+        } => commands::reconcile::run(client, apply, grace_secs, all).await,
     }
 }
 

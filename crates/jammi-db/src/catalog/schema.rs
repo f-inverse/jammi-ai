@@ -831,6 +831,39 @@ pub(super) const MIGRATION_026_ACCELERATION_REPORT: &str = r#"
 ALTER TABLE training_jobs ADD COLUMN acceleration_report TEXT;
 "#;
 
+/// Migration 027 — the writer lease on a `building` result table (esc-094,
+/// issue #479).
+///
+/// A result table is published in two steps — bytes first, then a single
+/// catalog row flip `building -> ready` — and until this migration nothing on
+/// the row said *who* was producing it or *whether they were still alive*.
+/// Startup recovery therefore reaped every `building` row it saw, including
+/// one a live writer in another process was seconds from finishing, and the
+/// writer's unguarded promote then flipped the reaped row to `ready` over
+/// deleted bytes. The two columns make the row lease-owned, on the same
+/// primitive `training_jobs` already uses ([`crate::catalog::lease`]):
+///
+///   * `writer_id` — the `ResultStore` instance that created the row
+///     (`writer-{uuid}`); every transition on a `building` row is a
+///     compare-and-set that names it. Promote and fail leave it in place as
+///     history (they clear only the lease), so a later reader can still tell
+///     which writer produced or abandoned the table.
+///   * `lease_expires_at` — the writer's lease deadline, renewed by its
+///     heartbeat; the same engine-clock `%Y-%m-%dT%H:%M:%S%.6fZ` text form as
+///     `training_jobs.lease_expires_at`, so `lease_expires_at < $now` is a
+///     correct comparison on both backends. `NULL` once the row is terminal —
+///     and `NULL` on a `building` row created before this migration, which
+///     recovery reads as "absent lease" and reconciles exactly as before.
+///
+/// Two `ALTER TABLE` statements rather than one: SQLite accepts a single
+/// `ADD COLUMN` per statement. `idx_result_tables_lease` on
+/// `(status, lease_expires_at)` serves recovery's expired-lease scan.
+pub(super) const MIGRATION_027_RESULT_TABLE_LEASE: &str = r#"
+ALTER TABLE result_tables ADD COLUMN writer_id TEXT;
+ALTER TABLE result_tables ADD COLUMN lease_expires_at TEXT;
+CREATE INDEX idx_result_tables_lease ON result_tables(status, lease_expires_at);
+"#;
+
 /// Migration 028 — `topics.next_offset`: the cross-process monotone offset
 /// counter for the trigger-stream publish path.
 ///
@@ -842,8 +875,6 @@ ALTER TABLE training_jobs ADD COLUMN acceleration_report TEXT;
 /// inside the same row-locked `UPDATE` that bumps it — so the seed-then-bump
 /// race is closed by the UPDATE's own row lock rather than an unlocked
 /// read-then-write window. A fresh topic (empty backing table) seeds to `0`.
-///
-/// 027 is reserved by the lease migration; 028 adds `topics.next_offset`.
 pub(super) const MIGRATION_028_TOPICS_NEXT_OFFSET: &str = r#"
 ALTER TABLE topics ADD COLUMN next_offset BIGINT;
 "#;

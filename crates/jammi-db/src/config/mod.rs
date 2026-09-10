@@ -5,6 +5,7 @@ use std::str::FromStr;
 
 use serde::{Deserialize, Deserializer, Serialize};
 
+pub use crate::catalog::lease::LeaseIntervals;
 use crate::error::{JammiError, Result};
 use crate::storage::{AzureConfig, CloudConfig, GcsConfig, R2Config, S3Config};
 
@@ -215,8 +216,12 @@ pub struct JammiConfig {
     pub embedding: EmbeddingConfig,
     /// Fine-tuning hyperparameter defaults.
     pub fine_tuning: FineTuningConfig,
+    /// The one lease timing every leased catalog row shares: how long a claim
+    /// (a training job, a building result table) is owned before it is
+    /// reclaimable, and how often its holder renews it.
+    pub lease: LeaseConfig,
     /// Training-worker settings: whether this process runs the claim loop, and
-    /// the lease/heartbeat/poll timing it runs it with.
+    /// how often an idle worker polls for work.
     pub training: TrainingConfig,
     /// Cache layer settings (ANN cache, embedding cache).
     pub cache: CacheConfig,
@@ -908,23 +913,112 @@ pub struct FineTuningConfig {
     pub checkpoint_fraction: f64,
 }
 
-/// Training-worker settings: whether this process runs the claim loop at all,
-/// and — when it does — how long a claim leases a job, how often the worker
-/// renews that lease, and how often an idle worker polls for new work.
+/// The one lease timing every leased catalog row shares — a claimed training
+/// job and a `building` result table are both owned under a lease their holder
+/// heartbeats, and both are reclaimed by a sweep once it expires.
 ///
-/// The three timings are seconds. Defaults reproduce the engine's built-in
-/// timing (30 s lease, 10 s heartbeat, 1 s idle poll) with the claim loop on,
-/// so a config without a `[training]` section behaves identically to one that
-/// omits it. Short values let a deployment (or a test) drive lease-expiry and
-/// reclaim quickly.
+/// Both values are seconds. Defaults reproduce the engine's built-in timing
+/// (30 s lease, 10 s heartbeat), so a config without a `[lease]` section behaves
+/// identically to one that omits it. Short values let a deployment (or a test)
+/// drive lease-expiry and reclaim quickly.
+///
+/// # TOML
+///
+/// ```toml
+/// [lease]
+/// duration_secs = 30
+/// heartbeat_secs = 10
+/// ```
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct LeaseConfig {
+    /// How long a claim owns its row before it is considered orphaned and
+    /// reclaimable. Default: 30.
+    pub duration_secs: u64,
+    /// How often the holder renews the lease. Must leave a real margin under
+    /// `duration_secs` (see [`Self::intervals`]) so a single missed beat does
+    /// not drop a live holder's lease. Default: 10.
+    pub heartbeat_secs: u64,
+}
+
+impl Default for LeaseConfig {
+    fn default() -> Self {
+        Self {
+            duration_secs: 30,
+            heartbeat_secs: 10,
+        }
+    }
+}
+
+impl LeaseConfig {
+    /// Resolve the typed [`LeaseIntervals`] this timing implies, enforcing the
+    /// lease invariants:
+    ///
+    /// - both values non-zero;
+    /// - `heartbeat_secs * 2 < duration_secs` — the heartbeat must leave a real
+    ///   margin under the lease (a live holder beats at least twice within one
+    ///   lease, so a single missed beat still leaves one in-window renewal that
+    ///   lands strictly before the lease expires — never coincident with
+    ///   expiry, which would race a reclaim).
+    ///
+    /// Returns [`JammiError::Config`] with a clear message on a violation. The
+    /// engine never silently clamps a bad value, and no operator-supplied `u64`
+    /// can overflow the margin check — an absurd heartbeat is rejected, not
+    /// wrapped.
+    pub fn intervals(&self) -> Result<LeaseIntervals> {
+        use std::time::Duration;
+
+        if self.heartbeat_secs == 0 {
+            return Err(JammiError::Config(
+                "lease.heartbeat_secs must be > 0".into(),
+            ));
+        }
+        if self.duration_secs == 0 {
+            return Err(JammiError::Config("lease.duration_secs must be > 0".into()));
+        }
+        // Overflow-safe strict margin: `heartbeat * 2 < lease`. The doubled
+        // heartbeat overflowing `u64` is itself a rejection (any such value
+        // dwarfs any finite lease), so the multiply never wraps or panics.
+        if self
+            .heartbeat_secs
+            .checked_mul(2)
+            .is_none_or(|hb2| hb2 >= self.duration_secs)
+        {
+            return Err(JammiError::Config(format!(
+                "lease.heartbeat_secs ({}) must be strictly under half of \
+                 lease.duration_secs ({}): the heartbeat must leave a real margin \
+                 under the lease so a live holder renews strictly before the lease expires, \
+                 or its claim is spuriously reclaimed mid-flight",
+                self.heartbeat_secs, self.duration_secs
+            )));
+        }
+        Ok(LeaseIntervals::new_validated(
+            Duration::from_secs(self.duration_secs),
+            Duration::from_secs(self.heartbeat_secs),
+        ))
+    }
+}
+
+/// Training-worker settings: whether this process runs the claim loop at all,
+/// and — when it does — how often an idle worker polls for new work. The lease
+/// a claim is held under and the heartbeat that renews it are the deployment's
+/// one [`LeaseConfig`], shared with every other leased row.
+///
+/// Defaults reproduce the engine's built-in timing (1 s idle poll) with the
+/// claim loop on, so a config without a `[training]` section behaves
+/// identically to one that omits it.
+///
+/// The section rejects unknown keys. In particular the former
+/// `lease_duration_secs` / `heartbeat_interval_secs` keys moved to `[lease]`
+/// as `duration_secs` / `heartbeat_secs`; a TOML still naming them under
+/// `[training]` is a hard load error, never a silent fall-back to the default
+/// timing.
 ///
 /// # TOML
 ///
 /// ```toml
 /// [training]
 /// run_worker = true
-/// lease_duration_secs = 30
-/// heartbeat_interval_secs = 10
 /// idle_poll_secs = 1
 /// ```
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
@@ -949,17 +1043,10 @@ pub struct TrainingConfig {
     /// in-process answer the question identically. Turning it off never
     /// removes the submission surface — only the claiming.
     ///
-    /// The timings below describe the loop this flag gates; they are validated
-    /// by [`Self::worker_intervals`] regardless of `run_worker`, so a config
-    /// that switches the loop on later cannot smuggle in bad timing.
+    /// The poll below describes the loop this flag gates; it is validated by
+    /// [`Self::worker_intervals`] regardless of `run_worker`, so a config that
+    /// switches the loop on later cannot smuggle in bad timing.
     pub run_worker: bool,
-    /// How long a claim leases a job before it is considered orphaned and
-    /// reclaimable. Default: 30.
-    pub lease_duration_secs: u64,
-    /// How often the worker renews the lease while a job runs. Must leave a real
-    /// margin under `lease_duration_secs` (see [`Self::worker_intervals`]) so a
-    /// single missed beat does not drop a live worker's lease. Default: 10.
-    pub heartbeat_interval_secs: u64,
     /// How often an idle worker polls for a queued job (and reclaims expired
     /// leases). Must be non-zero — a zero poll is a busy-loop. Default: 1.
     pub idle_poll_secs: u64,
@@ -971,8 +1058,6 @@ impl Default for TrainingConfig {
             // Default on: an unconfigured deployment is a whole one — it both
             // accepts jobs and works them. Opting out is the explicit act.
             run_worker: true,
-            lease_duration_secs: 30,
-            heartbeat_interval_secs: 10,
             idle_poll_secs: 1,
         }
     }
@@ -980,9 +1065,9 @@ impl Default for TrainingConfig {
 
 /// The validated, typed training-worker timing the worker drives its loop with.
 ///
-/// `lease` is the single source of truth for the lease window: the worker passes
-/// the same value to both its claim and its heartbeat, so the renew always
-/// targets the same deadline the reclaim path compares against. The constructor
+/// `lease` and `heartbeat` are the deployment's [`LeaseIntervals`] — the single
+/// source of truth for the lease window, so the worker's renew always targets
+/// the same deadline the reclaim path compares against. The constructor
 /// [`TrainingConfig::worker_intervals`] is the only way to build one, so the
 /// margin and non-zero-poll invariants hold by construction.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -996,55 +1081,24 @@ pub struct WorkerIntervals {
 }
 
 impl TrainingConfig {
-    /// Resolve the typed [`WorkerIntervals`] this timing implies, enforcing the
-    /// two worker invariants:
-    ///
-    /// - `heartbeat_interval_secs * 2 < lease_duration_secs` — the heartbeat
-    ///   must leave a real margin under the lease (a live worker beats at least
-    ///   twice within one lease, so a single missed beat still leaves one
-    ///   in-window renewal that lands strictly before the lease expires — never
-    ///   coincident with expiry, which would race an idle-polling worker's
-    ///   reclaim). A zero heartbeat is rejected here too (it never clears the
-    ///   margin against any finite lease).
-    /// - `idle_poll_secs >= 1` — a zero idle poll is a busy-loop.
+    /// Resolve the typed [`WorkerIntervals`] this timing implies over the
+    /// deployment's validated `lease`, enforcing the worker's own invariant:
+    /// `idle_poll_secs >= 1` — a zero idle poll is a busy-loop. The lease
+    /// margin was already enforced by [`LeaseConfig::intervals`].
     ///
     /// Returns [`JammiError::Config`] with a clear message on a violation. The
-    /// engine never silently clamps a bad value, and no operator-supplied `u64`
-    /// can overflow the margin check — an absurd heartbeat is rejected, not
-    /// wrapped.
-    pub fn worker_intervals(&self) -> Result<WorkerIntervals> {
+    /// engine never silently clamps a bad value.
+    pub fn worker_intervals(&self, lease: LeaseIntervals) -> Result<WorkerIntervals> {
         use std::time::Duration;
 
-        if self.heartbeat_interval_secs == 0 {
-            return Err(JammiError::Config(
-                "training.heartbeat_interval_secs must be > 0".into(),
-            ));
-        }
         if self.idle_poll_secs == 0 {
             return Err(JammiError::Config(
                 "training.idle_poll_secs must be > 0 (a zero poll is a busy-loop)".into(),
             ));
         }
-        // Overflow-safe strict margin: `heartbeat * 2 < lease`. The doubled
-        // heartbeat overflowing `u64` is itself a rejection (any such value
-        // dwarfs any finite lease), so the multiply never wraps or panics.
-        if self
-            .heartbeat_interval_secs
-            .checked_mul(2)
-            .is_none_or(|hb2| hb2 >= self.lease_duration_secs)
-        {
-            return Err(JammiError::Config(format!(
-                "training.heartbeat_interval_secs ({}) must be strictly under half of \
-                 training.lease_duration_secs ({}): the heartbeat must leave a real margin \
-                 under the lease so a live worker renews strictly before the lease expires, \
-                 or its job is spuriously reclaimed mid-flight",
-                self.heartbeat_interval_secs, self.lease_duration_secs
-            )));
-        }
-
         Ok(WorkerIntervals {
-            lease: Duration::from_secs(self.lease_duration_secs),
-            heartbeat: Duration::from_secs(self.heartbeat_interval_secs),
+            lease: lease.lease(),
+            heartbeat: lease.heartbeat(),
             idle_poll: Duration::from_secs(self.idle_poll_secs),
         })
     }
@@ -1293,6 +1347,7 @@ impl Default for JammiConfig {
             inference: InferenceConfig::default(),
             embedding: EmbeddingConfig::default(),
             fine_tuning: FineTuningConfig::default(),
+            lease: LeaseConfig::default(),
             training: TrainingConfig::default(),
             cache: CacheConfig::default(),
             server: ServerConfig::default(),
@@ -1534,10 +1589,11 @@ impl JammiConfig {
         if let Some(cloud) = &config.storage.cloud {
             cloud.validate()?;
         }
-        // Reject a training timing that violates the heartbeat-margin or
-        // non-zero-poll invariants at load time rather than at worker spawn,
-        // deep in a server startup.
-        config.training.worker_intervals()?;
+        // Reject a lease timing that violates the heartbeat margin, or a
+        // training poll that is a busy-loop, at load time rather than at
+        // worker spawn, deep in a server startup.
+        let lease = config.lease.intervals()?;
+        config.training.worker_intervals(lease)?;
         Ok(config)
     }
 

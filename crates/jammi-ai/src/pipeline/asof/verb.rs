@@ -4,7 +4,7 @@
 //!
 //! The verb owns the *lifecycle* (resolve → plan → run → write → attest); the
 //! operator owns the *algorithm*. It writes through
-//! [`ResultStore::finalize_with_manifest`](jammi_db::store::ResultStore), so an
+//! [`BuildingTable::finish`](jammi_db::store::BuildingTable), so an
 //! as-of result table carries the same verifiable manifest every other producer
 //! does: a typed [`ProducingDescriptor::AsofJoin`] over the join's parameters,
 //! and an input anchor for BOTH relations.
@@ -72,7 +72,7 @@ pub async fn run(
     // FK-lineage anchor naming a source *result table*; the as-of inputs are
     // registered sources (not result tables), so it is `None` and the
     // reproducibility lineage rides the manifest's input anchors instead.
-    let table_info = session
+    let building = session
         .result_store()
         .create_table(
             spine,
@@ -89,7 +89,7 @@ pub async fn run(
     let out_schema = exec.schema();
     let mut writer = session
         .result_store()
-        .open_writer(&table_info.parquet_url, Arc::clone(&out_schema))
+        .open_writer(building.parquet_url(), Arc::clone(&out_schema))
         .await?;
     for batch in &batches {
         writer.write_batch(batch).await?;
@@ -108,27 +108,16 @@ pub async fn run(
         InputAnchor::unpinned_at_instant(spine, now.clone()),
         InputAnchor::unpinned_at_instant(facts, now),
     ];
-    session
-        .result_store()
-        .finalize_with_manifest(
+    // Every `?` above unwinds through the handle's Drop (a best-effort
+    // `building -> failed` CAS); `finish` is the single `building -> ready`
+    // funnel and returns the promoted catalog record.
+    building
+        .finish(
             session.context(),
-            &table_info.table_name,
-            &table_info.parquet_url,
             row_count,
             Materialization::new(&descriptor, &env, inputs),
         )
-        .await?;
-
-    session
-        .catalog()
-        .get_result_table(&table_info.table_name)
-        .await?
-        .ok_or_else(|| {
-            JammiError::Catalog(format!(
-                "as-of join table '{}' not found after finalization",
-                table_info.table_name
-            ))
-        })
+        .await
 }
 
 /// The tie-break secondary column, when the policy names one.

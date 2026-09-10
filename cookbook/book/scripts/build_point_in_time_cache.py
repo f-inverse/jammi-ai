@@ -80,6 +80,20 @@ from jammi_cookbook import contracts
 
 ARTIFACTS = Path(__file__).resolve().parent.parent / "artifacts" / "point_in_time"
 
+# Every result table (and its sidecars) lands under a scope segment beneath
+# jammi_db/ — `_global` for the untenanted `jammi.connect(...)` binding this
+# script uses, a tenant's own UUID otherwise
+# (`crates/jammi-db/src/store/layout.rs::TenantSegment`, documented at
+# `docs/guide/src/cloud-storage.md:183`: "{root}/_global/{table}.parquet" for
+# a GLOBAL table). The manifest sidecar shares the table's own stem and
+# parent prefix (`layout.rs::sidecar_url`).
+_SCOPE_SEGMENT = "_global"
+
+
+def _manifest_sidecar_path(root: str, table: str) -> Path:
+    return Path(root) / "jammi_db" / _SCOPE_SEGMENT / f"{table}.materialization.json"
+
+
 # The label horizon: a paper's one-year-citation label is observed at year + 1.
 _HORIZON = 1
 # The downstream conformal nominal coverage.
@@ -319,7 +333,7 @@ def verdict_matrix(work: str) -> dict:
     v_match = db.verify_materialization(ng)
 
     # Read the definition hash off the Match-case manifest sidecar.
-    sidecar = Path(catalog) / "jammi_db" / f"{ng}.materialization.json"
+    sidecar = _manifest_sidecar_path(catalog, ng)
     manifest = json.loads(sidecar.read_text())
     definition_hash = manifest["definition_hash"]
     input_anchors = manifest["input_anchors"]

@@ -1,4 +1,5 @@
 mod audit;
+mod backup_recipe;
 mod broker_parity;
 mod broker_postgres_config;
 mod caching;
@@ -30,6 +31,7 @@ mod mutable_crash_recovery;
 mod mutable_federation;
 mod mutable_tables;
 mod read_vectors;
+mod reconcile;
 mod recovery;
 mod register_computed_embedding;
 mod segment;

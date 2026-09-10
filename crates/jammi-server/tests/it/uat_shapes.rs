@@ -179,6 +179,7 @@ async fn shape_c_multi_tenant_server_isolates_two_tenants_across_primitives() {
             .expect("event tier resolves"),
         metrics: Arc::new(jammi_server::routes::health::MetricsRegistry::new().unwrap()),
         tenant_resolver: jammi_server::grpc::session::SessionIdTenantResolver::arc(store),
+        admin_authorizer: None,
     };
     let (_grpc_addr, grpc_handle) =
         super::common::grpc::spawn_bound_chain(chain, shutdown_rx).await;

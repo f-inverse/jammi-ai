@@ -16,7 +16,7 @@ import "jammi/v1/embedding.proto";
 //
 // Each verb delegates 1:1 to the consumer-facing `Session`
 // abstraction; the service reimplements no catalog or lifecycle logic. The
-// service spans five control concerns. Session: `SetTenant` / `GetTenant` /
+// service spans six control concerns. Session: `SetTenant` / `GetTenant` /
 // `ClearTenant` bind, read, and clear the calling session's tenant, and
 // `GetServerInfo` is the capability handshake — the tenant trio is stateless
 // w.r.t. the engine (it updates an in-process session table the engine's
@@ -32,7 +32,15 @@ import "jammi/v1/embedding.proto";
 // `DropMutableTable` / `ListMutableTables` register and introspect mutable
 // companion tables. Topics: `RegisterTopic` / `DropTopic` / `ListTopics`
 // register and introspect trigger-stream topics (the publish / subscribe
-// compute verbs stay on TriggerService).
+// compute verbs stay on TriggerService). Reconcile: `Reconcile` cross-checks
+// the catalog against the object store and (optionally) reclaims drift.
+// `all = false` (the default) runs under the caller's own resolved tenant
+// scope, like every other verb here; `all = true` requests the cross-tenant
+// admin pass and is gated at this wire boundary ONLY by a deployment-supplied
+// admin authorizer — the engine's shipped default refuses every `all = true`
+// request, so an OSS deployment that wires nothing cannot accidentally expose
+// it. That authorizer decision is mechanism, not policy: it decides WHO may
+// run the pass, never what the pass does.
 //
 // Tenant scope is read from the request's `SessionTenant` extension, set by
 // the single async tenant-binding layer driven by the engine's
@@ -183,6 +191,30 @@ service CatalogService {
 
   // List topics registered in the catalog. Pagination follows AIP-132.
   rpc ListTopics(ListTopicsRequest) returns (ListTopicsResponse);
+
+  // --- reconcile -----------------------------------------------------------
+
+  // Cross-check the catalog against the object store and report (or, when
+  // `apply` is set, reclaim) what has drifted. Peer of the abstraction's
+  // `ResultStore::reconcile` / `reconcile_all`.
+  //
+  // Scope: `all = false` (the default) runs under the caller's resolved
+  // tenant scope — a tenant session sees and can only ever touch its own
+  // prefix, an unbound session only the global prefix. `all = true` requests
+  // the cross-tenant admin pass (`ResultStore::reconcile_all`), which is
+  // gated at THIS wire boundary only: the server consults a deployment-
+  // supplied admin authorizer before running it, and the engine's shipped
+  // default refuses every `all = true` request with `PERMISSION_DENIED` — a
+  // deployment that never wires an authorizer cannot accidentally expose the
+  // cross-tenant sweep. `all = false` never consults the authorizer.
+  //
+  // `apply = false` (the default) is read-only: the report lists what a pass
+  // WOULD do without mutating anything. `apply = true` requires `grace_secs`
+  // to be at least the deployment's configured lease duration or the call
+  // fails `INVALID_ARGUMENT` naming both values — a shorter grace could
+  // reclaim a live writer's still-in-progress bytes. `grace_secs` unset lets
+  // the server apply its own default.
+  rpc Reconcile(ReconcileRequest) returns (ReconcileReport);
 }
 
 // === session ==============================================================
@@ -675,4 +707,74 @@ message Topic {
 message ListTopicsResponse {
   repeated Topic topics = 1;
   string next_page_token = 2;
+}
+
+// === reconcile =============================================================
+
+message ReconcileRequest {
+  // Actually reclaim orphans past `grace_secs` (and flip an incomplete
+  // `ready` row to `failed`). `false` (the default) reports everything a pass
+  // WOULD do without mutating anything.
+  bool apply = 1;
+  // An orphan candidate younger than this is `pending`, never deleted. Unset
+  // lets the server apply its own default. `apply = true` requires this to be
+  // at least the deployment's configured lease duration, or the call is
+  // refused `INVALID_ARGUMENT` naming both values.
+  optional uint64 grace_secs = 2;
+  // Run the cross-tenant admin pass (`ResultStore::reconcile_all`) instead of
+  // the caller's own tenant-scoped pass. Gated at this wire boundary by a
+  // deployment-supplied admin authorizer; the engine's shipped default
+  // refuses every `all = true` request with `PERMISSION_DENIED`.
+  bool all = 3;
+}
+
+// The result of one reconciliation pass. Peer of the abstraction's
+// `ReconcileReport`; every repeated field is already sorted by the engine, so
+// this wire message carries the identical bytes an embedded caller reads.
+message ReconcileReport {
+  // `"_global"` (unbound), `"tenant:{uuid}"` (a tenant-scoped pass), or
+  // `"all"` (the admin cross-tenant pass).
+  string scope = 1;
+  // Whether this pass actually deleted anything (mirrors the request's
+  // `apply`).
+  bool applied = 2;
+  // Result tables flipped `ready -> failed` this pass (an incomplete object
+  // set was found for them).
+  repeated string rows_failed = 3;
+  // Orphan candidates at least `grace_secs` old — deleted when `applied`.
+  repeated string orphans = 4;
+  // Orphan candidates younger than `grace_secs` — never deleted this pass.
+  repeated string pending = 5;
+  // Listed keys whose own path does not parse through the tenant/artifact
+  // allowlist at all — reported, never deleted at any grace or `apply`.
+  // Populated ONLY by an admin-scoped pass (`reconcile --all`); a
+  // tenant-scoped pass never lists another tenant's (or nobody's) stray
+  // keys.
+  repeated string unattributed = 6;
+  // Total bytes actually reclaimed (`orphans` deleted this pass; `0` when
+  // `!applied`).
+  uint64 bytes_reclaimed = 7;
+  // The true count of orphan candidates found this pass, independent of
+  // whether `orphans` was truncated to the report's list cap.
+  uint64 orphan_count = 8;
+  // The true count of pending candidates found this pass, independent of
+  // whether `pending` was truncated.
+  uint64 pending_count = 9;
+  // The true count of unattributed keys found this pass, independent of
+  // whether `unattributed` was truncated.
+  uint64 unattributed_count = 10;
+  // A prefix named by a `models` row whose `manifest.json` is absent — the
+  // row is still live, so this is never reclaimed at any grace or `apply`.
+  // Distinct from `orphans`, whose entries have no referencing row at all.
+  repeated string damaged = 11;
+  // The true count of damaged keys found this pass, independent of whether
+  // `damaged` was truncated.
+  uint64 damaged_count = 12;
+  // `true` iff any of `rows_failed` / `orphans` / `pending` / `unattributed`
+  // / `damaged` was cut to the report's list cap — the corresponding
+  // `*_count` field is still the true total either way.
+  bool truncated = 13;
+  // The true count of rows flipped `ready -> failed` this pass, independent
+  // of whether `rows_failed` was truncated.
+  uint64 rows_failed_count = 14;
 }

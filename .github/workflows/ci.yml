@@ -167,27 +167,42 @@ jobs:
           # machine or a pod — never for this heterogeneous hosted lane.
         run: cargo test --workspace --exclude jammi-python
 
+      # The `test-hooks` lane: the named result-table lifecycle points
+      # (`store/mutable/test_hook.rs`) are compiled only under this feature, so
+      # the esc-094 two-writer oracles (`tests/it/recovery.rs::
+      # live_writer_survives_peer_recover_*`, a live writer parked at a point
+      # while a peer session's `recover()` sweeps beside it) and the two SIGKILL
+      # crash harnesses (`materialization_crash_recovery.rs`,
+      # `mutable_crash_recovery.rs`) run only here. Not a self dev-dependency:
+      # that would unify the feature into every workspace test build.
+      # `--test-threads=1` because the SIGKILL harnesses respawn this binary.
+      - name: Run tests (test-hooks lane)
+        run: cargo test -p jammi-db --features test-hooks --test it -- --test-threads=1
+
       # The chmod fault-injection probes above ran as root (this container's
       # default user, per `.docker/ci.Dockerfile`'s missing `USER`), where
       # `JAMMI_REQUIRE_POSIX_PERMS` is deliberately unset: root bypasses
       # every POSIX permission bit, so arming the require gate on that run
       # would turn an UNCONDITIONAL bypass into an unconditional panic —
       # never a real signal about a permission regression. This step gives
-      # the SAME five probes (`crates/jammi-ai/tests/it/{models,
+      # the SAME seven probes (`crates/jammi-ai/tests/it/{models,
       # context_predictor,fine_tune}.rs`'s
       # `fine_tuned_adapter_bundle_permission_fault_is_not_a_typed_model_error`
       # / `context_predictor_reload_permission_fault_is_not_a_typed_model_error`
       # / `finalize_reclaims_a_persistently_failed_prune_and_warns`,
       # `crates/jammi-db/src/store/artifact.rs`'s
-      # `permission_fault_on_a_present_key_stays_a_transport_error`, and
+      # `permission_fault_on_a_present_key_stays_a_transport_error`,
       # `crates/jammi-ai/src/fine_tune/trainer.rs`'s
-      # `failed_prune_stays_tracked_and_catches_up_once_unblocked`) a REAL
-      # execution: build the three test binaries as root (this build reuses
-      # this SAME job's already-populated target dir from "Run tests"
+      # `failed_prune_stays_tracked_and_catches_up_once_unblocked`, and
+      # `crates/jammi-db/tests/it/reconcile.rs`'s
+      # `abort_aggregates_a_real_delete_failure_into_one_error` /
+      # `rebuild_failure_after_the_purge_defers_seg1_reclaim_to_a_later_pass`)
+      # a REAL execution: build the four test binaries as root (this build
+      # reuses this SAME job's already-populated target dir from "Run tests"
       # above — same filesystem, same job, no clean rebuild — so it only
-      # links the three `--no-run` test binaries rather than recompiling the
+      # links the four `--no-run` test binaries rather than recompiling the
       # workspace), open the checkout to a fresh unprivileged account, then run
-      # ONLY those five tests as that account with
+      # ONLY those seven tests as that account with
       # `JAMMI_REQUIRE_POSIX_PERMS=1` armed. The probes read fixtures from
       # BOTH `cookbook/fixtures/` and `tests/fixtures/` at the workspace
       # root (`jammi_test_utils::{cookbook_fixture,fixture}`, resolved via
@@ -246,12 +261,15 @@ jobs:
           AI_IT_BIN="$(cargo test -p jammi-ai --test it --no-run --message-format=json | extract_test_binary | tail -n1)"
           AI_LIB_BIN="$(cargo test -p jammi-ai --lib --no-run --message-format=json | extract_test_binary | tail -n1)"
           DB_LIB_BIN="$(cargo test -p jammi-db --lib --no-run --message-format=json | extract_test_binary | tail -n1)"
+          DB_IT_BIN="$(cargo test -p jammi-db --test it --no-run --message-format=json | extract_test_binary | tail -n1)"
           test -x "$AI_IT_BIN"
           test -x "$AI_LIB_BIN"
           test -x "$DB_LIB_BIN"
+          test -x "$DB_IT_BIN"
           echo "jammi-ai it binary:  $AI_IT_BIN"
           echo "jammi-ai lib binary: $AI_LIB_BIN"
           echo "jammi-db lib binary: $DB_LIB_BIN"
+          echo "jammi-db it binary:  $DB_IT_BIN"
 
           # Read + traverse only (`X`, never `w`) across the whole checkout --
           # covers the target dir (default `$GITHUB_WORKSPACE/target` unless
@@ -296,6 +314,8 @@ jobs:
           run_probe "$AI_IT_BIN" fine_tune::finalize_reclaims_a_persistently_failed_prune_and_warns
           run_probe "$AI_LIB_BIN" fine_tune::trainer::epoch_checkpoint_retention_failure::failed_prune_stays_tracked_and_catches_up_once_unblocked
           run_probe "$DB_LIB_BIN" store::artifact::tests::permission_fault_on_a_present_key_stays_a_transport_error
+          run_probe "$DB_IT_BIN" reconcile::abort_aggregates_a_real_delete_failure_into_one_error
+          run_probe "$DB_IT_BIN" reconcile::rebuild_failure_after_the_purge_defers_seg1_reclaim_to_a_later_pass
       # golden-parity is opt-in (`crates/jammi-encoders/Cargo.toml`) so the
       # default workspace test run above never compiles it, but it is fully
       # hermetic: the oracle is a committed PyTorch dump
@@ -1108,6 +1128,9 @@ jobs:
         # `--test-threads=1` keeps that contract; the suite is small.
         run: |
           cargo test -p jammi-db --features live-postgres-tests --test it -- --test-threads=1
+          # The same suite with the test-hooks points compiled in: the esc-094
+          # two-writer oracles' Postgres arms and the SIGKILL crash harnesses.
+          cargo test -p jammi-db --features live-postgres-tests,test-hooks --test it -- --test-threads=1
 
       - name: Run Postgres-gated jammi-server introspection tests
         env:

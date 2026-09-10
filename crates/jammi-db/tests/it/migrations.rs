@@ -1,10 +1,55 @@
 //! End-to-end migration tests. Asserts via the new `applied_migrations`
 //! ledger and direct sqlx queries against the on-disk catalog.
+//!
+//! The two `concurrent_migrate_on_fresh_*_is_safe` tests race two independent
+//! backends' `migrate()` on one FRESH catalog (escape-ledger row
+//! `esc-093-postgres-migrations-race-without-cross-process-lock`, issue #479):
+//! the SQLite arm is a regression guard that was green before the fix (the
+//! backend's `BEGIN IMMEDIATE` already serialises it); the Postgres arm is the
+//! RED-then-GREEN oracle for the advisory lock `catalog::migrations::run` takes.
 
-use jammi_db::catalog::backend::{BackendImpl, TxOptions};
+use std::collections::BTreeSet;
+use std::sync::Arc;
+
+use jammi_db::catalog::backend::{BackendError, BackendImpl, CatalogBackend, TxOptions};
 use jammi_db::catalog::backend_sqlite::SqliteBackend;
 use jammi_db::catalog::Catalog;
 use tempfile::tempdir;
+use tokio::sync::Barrier;
+
+/// Every migration name, in ledger order. Mirrors `catalog::migrations::MIGRATIONS`
+/// (K5: append-only, currently ending at 028) -- a new migration is added here
+/// in the same change.
+const EXPECTED_MIGRATION_NAMES: &[&str] = &[
+    "001_core_tables",
+    "002_result_tables",
+    "003_eval_columns",
+    "004_drop_embedding_sets",
+    "005_tenant_scope",
+    "006_channel_columns",
+    "007_mutable_tables",
+    "008_mutable_order_column",
+    "009_topics",
+    "010_rename_source_type_local_to_file",
+    "011_eval_per_query",
+    "012_topics_tenant_unique",
+    "013_result_table_kind",
+    "014_bm25_channel",
+    "015_fine_tune_job_queue",
+    "016_rename_training_jobs",
+    "017_model_artifact_path_column",
+    "018_eval_runs_model_id_nullable",
+    "019_normalize_model_status",
+    "020_channel_tenant_scope",
+    "021_materialization_contract",
+    "022_definition_hash_index",
+    "023_storage_precision",
+    "024_claim_policy",
+    "025_index_segments",
+    "026_acceleration_report",
+    "027_result_table_lease",
+    "028_topics_next_offset",
+];
 
 async fn open_sqlite_backend(path: &std::path::Path) -> std::sync::Arc<SqliteBackend> {
     SqliteBackend::open(path)
@@ -157,38 +202,7 @@ async fn applied_migrations_ledger_records_all_migrations() {
         )
         .await
         .unwrap();
-    assert_eq!(
-        names,
-        vec![
-            "001_core_tables",
-            "002_result_tables",
-            "003_eval_columns",
-            "004_drop_embedding_sets",
-            "005_tenant_scope",
-            "006_channel_columns",
-            "007_mutable_tables",
-            "008_mutable_order_column",
-            "009_topics",
-            "010_rename_source_type_local_to_file",
-            "011_eval_per_query",
-            "012_topics_tenant_unique",
-            "013_result_table_kind",
-            "014_bm25_channel",
-            "015_fine_tune_job_queue",
-            "016_rename_training_jobs",
-            "017_model_artifact_path_column",
-            "018_eval_runs_model_id_nullable",
-            "019_normalize_model_status",
-            "020_channel_tenant_scope",
-            "021_materialization_contract",
-            "022_definition_hash_index",
-            "023_storage_precision",
-            "024_claim_policy",
-            "025_index_segments",
-            "026_acceleration_report",
-            "028_topics_next_offset",
-        ]
-    );
+    assert_eq!(names, EXPECTED_MIGRATION_NAMES);
 }
 
 /// Migration 019 normalizes a stray `models.status = 'available'` (the frozen
@@ -1246,5 +1260,347 @@ async fn migration_026_adds_acceleration_report_column_with_tristate_backfill() 
     assert_eq!(
         legacy_after_second_reopen.acceleration_report, None,
         "a second, genuinely idempotent reopen must not disturb the backfilled NULL"
+    );
+}
+
+/// Names in the `applied_migrations` ledger, sorted, read through `backend`.
+async fn ledger_names<B: CatalogBackend + ?Sized>(backend: &B) -> Vec<String> {
+    backend
+        .transaction(
+            TxOptions {
+                read_only: true,
+                ..Default::default()
+            },
+            |tx| {
+                Box::pin(async move {
+                    tx.query::<_, String>(
+                        "SELECT name FROM applied_migrations ORDER BY name",
+                        &[],
+                        |row| row.get("name"),
+                    )
+                    .await
+                })
+            },
+        )
+        .await
+        .expect("read applied_migrations ledger")
+}
+
+/// The post-race ledger oracle: exactly `MIGRATIONS.len()` rows, no name
+/// twice, and the set is the full migration list -- so two no-op callers on an
+/// already-migrated catalog cannot pass vacuously (the freshness assertion in
+/// each test is the other half of that control).
+fn assert_ledger_complete(names: &[String]) {
+    assert_eq!(
+        names.len(),
+        EXPECTED_MIGRATION_NAMES.len(),
+        "applied_migrations must hold exactly one row per migration; got {names:?}"
+    );
+    let unique: BTreeSet<&str> = names.iter().map(String::as_str).collect();
+    assert_eq!(
+        unique.len(),
+        names.len(),
+        "a migration name appears twice in applied_migrations: {names:?}"
+    );
+    assert_eq!(
+        names, EXPECTED_MIGRATION_NAMES,
+        "applied_migrations must name every migration exactly once"
+    );
+}
+
+/// Release two backends' `migrate()` from one barrier and return BOTH results
+/// -- a caller asserts on each; nothing here swallows an `Err`.
+async fn race_migrate<B: CatalogBackend + 'static>(
+    a: Arc<B>,
+    b: Arc<B>,
+) -> (Result<(), BackendError>, Result<(), BackendError>) {
+    let barrier = Arc::new(Barrier::new(2));
+    let spawn = |backend: Arc<B>, barrier: Arc<Barrier>| {
+        tokio::spawn(async move {
+            barrier.wait().await;
+            backend.migrate().await
+        })
+    };
+    let task_a = spawn(a, Arc::clone(&barrier));
+    let task_b = spawn(b, barrier);
+    (
+        task_a.await.expect("migrate task A panicked"),
+        task_b.await.expect("migrate task B panicked"),
+    )
+}
+
+/// Regression guard, GREEN before the esc-093 change: two `SqliteBackend`
+/// pools in one process race `migrate()` on one fresh `catalog.db`. SQLite's
+/// backend opens every write transaction
+/// `BEGIN IMMEDIATE` under a 5 s `busy_timeout`, so the second runner waits for
+/// the first's commit and then reads a complete ledger. Same assertions as the
+/// Postgres arm so the two stay comparable.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn concurrent_migrate_on_fresh_sqlite_is_safe() {
+    let dir = tempdir().unwrap();
+    let path = dir.path().join("catalog.db");
+    let a = open_sqlite_backend(&path).await;
+    let b = open_sqlite_backend(&path).await;
+
+    // Freshness: `open` does not migrate, so the ledger table must be absent.
+    let ledger_tables = a
+        .transaction(
+            TxOptions {
+                read_only: true,
+                ..Default::default()
+            },
+            |tx| {
+                Box::pin(async move {
+                    tx.query::<_, String>(
+                        "SELECT name FROM sqlite_master \
+                         WHERE type = 'table' AND name = 'applied_migrations'",
+                        &[],
+                        |row| row.get("name"),
+                    )
+                    .await
+                })
+            },
+        )
+        .await
+        .expect("query sqlite_master");
+    assert!(
+        ledger_tables.is_empty(),
+        "the catalog must be fresh before the race; found {ledger_tables:?}"
+    );
+
+    let (result_a, result_b) = race_migrate(Arc::clone(&a), Arc::clone(&b)).await;
+    assert!(
+        result_a.is_ok() && result_b.is_ok(),
+        "both concurrent migrate() calls must return Ok on SQLite; \
+         A = {result_a:?}, B = {result_b:?}"
+    );
+
+    let names = ledger_names(a.as_ref()).await;
+    assert_ledger_complete(&names);
+
+    a.close().await;
+    b.close().await;
+}
+
+/// Require-gate (KO-7) mirroring `recovery.rs`: an unset `JAMMI_TEST_PG_URL`
+/// silently skips the Postgres arm by default, but a lane that sets
+/// `JAMMI_REQUIRE_PG` must run it, so the skip becomes a loud failure there.
+#[cfg(feature = "live-postgres-tests")]
+fn require_live_pg(test_name: &str) {
+    if std::env::var_os("JAMMI_REQUIRE_PG").is_some() {
+        panic!(
+            "{test_name}: JAMMI_REQUIRE_PG is set but JAMMI_TEST_PG_URL is unset -- this lane \
+             must run the real Postgres arm, not skip it"
+        );
+    }
+}
+
+/// Env var that arms the migration runner's ledger-read rendezvous; the
+/// runner's hook reads the same name (`test_hook::MIGRATION_LEDGER_BARRIER_ENV`).
+#[cfg(all(feature = "live-postgres-tests", feature = "test-hooks"))]
+use jammi_db::store::mutable::test_hook::MIGRATION_LEDGER_BARRIER_ENV as LEDGER_BARRIER_ENV;
+/// Without `test-hooks` the hook does not exist; the variable is set anyway so
+/// the test body is one shape, and the race is then whatever the barrier
+/// release and two pools produce.
+#[cfg(all(feature = "live-postgres-tests", not(feature = "test-hooks")))]
+const LEDGER_BARRIER_ENV: &str = "JAMMI_TEST_MIGRATION_LEDGER_BARRIER";
+
+/// Arms the rendezvous for the lifetime of the Postgres test and disarms it
+/// on every exit path (the hook is one-shot as well; belt and braces so the
+/// SQLite arm in the same binary can never be parked).
+#[cfg(feature = "live-postgres-tests")]
+struct LedgerBarrierArmed;
+
+#[cfg(feature = "live-postgres-tests")]
+impl LedgerBarrierArmed {
+    /// Arms `parties` Postgres runners; the selector keeps a SQLite sibling in
+    /// the same binary (the arm above) out of the rendezvous.
+    fn arm(parties: usize) -> Self {
+        std::env::set_var(LEDGER_BARRIER_ENV, format!("postgres:{parties}"));
+        Self
+    }
+}
+
+#[cfg(feature = "live-postgres-tests")]
+impl Drop for LedgerBarrierArmed {
+    fn drop(&mut self) {
+        std::env::remove_var(LEDGER_BARRIER_ENV);
+    }
+}
+
+/// `url` with its database path replaced by `db`.
+#[cfg(feature = "live-postgres-tests")]
+fn with_database(url: &str, db: &str) -> String {
+    let mut parsed = url::Url::parse(url).expect("JAMMI_TEST_PG_URL parses as a URL");
+    parsed.set_path(&format!("/{db}"));
+    parsed.to_string()
+}
+
+/// esc-093 oracle: two independent `PostgresBackend`s (separate pools) race
+/// `migrate()` on a FRESH database created for this test alone. Both must
+/// return `Ok` and the ledger must name every migration exactly once. Before
+/// the advisory lock in `catalog::migrations::run` the loser failed with
+/// SQLSTATE 42P07 (`relation already exists`) or 23505 on the ledger PK.
+///
+/// With `feature = "test-hooks"` the runner's ledger-read rendezvous is armed
+/// so both runners are held between the ledger read and the first DDL for as
+/// long as the lock lets them both get there (in the fixed world it lets only
+/// one; the other blocks on the lock and passes through afterwards).
+#[cfg(feature = "live-postgres-tests")]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn concurrent_migrate_on_fresh_postgres_is_safe() {
+    use jammi_db::catalog::backend_postgres::PostgresBackend;
+    use jammi_test_utils::pg_url_for_tests;
+
+    const TEST_NAME: &str = "concurrent_migrate_on_fresh_postgres_is_safe";
+    let Some(admin_url) = pg_url_for_tests() else {
+        require_live_pg(TEST_NAME);
+        return;
+    };
+
+    let admin = sqlx::PgPool::connect(&admin_url)
+        .await
+        .expect("connect to JAMMI_TEST_PG_URL");
+    let db_name = format!("jammi_esc093_{}", uuid::Uuid::new_v4().simple());
+    sqlx::query(&format!("CREATE DATABASE \"{db_name}\""))
+        .execute(&admin)
+        .await
+        .expect("CREATE DATABASE for the fresh-catalog race");
+    let fresh_url = with_database(&admin_url, &db_name);
+
+    // The body runs on its own task so the database is dropped whether it
+    // passes or panics; the panic is re-raised afterwards, payload intact.
+    let outcome = tokio::spawn(async move {
+        let _armed = LedgerBarrierArmed::arm(2);
+
+        let a = PostgresBackend::open_with_options(&fresh_url, 4, None)
+            .await
+            .expect("open PostgresBackend A");
+        let b = PostgresBackend::open_with_options(&fresh_url, 4, None)
+            .await
+            .expect("open PostgresBackend B");
+
+        // Freshness: no ledger table yet.
+        let ledger_tables = a
+            .transaction(
+                TxOptions {
+                    read_only: true,
+                    ..Default::default()
+                },
+                |tx| {
+                    Box::pin(async move {
+                        tx.query::<_, i64>(
+                            "SELECT count(*) AS n FROM information_schema.tables \
+                             WHERE table_schema = 'public' AND table_name = 'applied_migrations'",
+                            &[],
+                            |row| row.get("n"),
+                        )
+                        .await
+                    })
+                },
+            )
+            .await
+            .expect("query information_schema.tables");
+        assert_eq!(
+            ledger_tables,
+            vec![0],
+            "the database must be fresh before the race (no applied_migrations table)"
+        );
+
+        let (result_a, result_b) = race_migrate(Arc::clone(&a), Arc::clone(&b)).await;
+        assert!(
+            result_a.is_ok() && result_b.is_ok(),
+            "both concurrent migrate() calls must return Ok on a fresh Postgres; \
+             A = {result_a:?}, B = {result_b:?}"
+        );
+
+        let names = ledger_names(a.as_ref()).await;
+        assert_ledger_complete(&names);
+
+        a.close().await;
+        b.close().await;
+    })
+    .await;
+
+    sqlx::query(&format!("DROP DATABASE \"{db_name}\" WITH (FORCE)"))
+        .execute(&admin)
+        .await
+        .expect("DROP DATABASE after the race");
+    admin.close().await;
+
+    if let Err(join) = outcome {
+        match join.try_into_panic() {
+            Ok(payload) => std::panic::resume_unwind(payload),
+            Err(join) => panic!("{TEST_NAME}: body task failed without panicking: {join}"),
+        }
+    }
+}
+
+/// Migration 027 adds the writer-lease columns to `result_tables` (esc-094):
+/// `writer_id` and `lease_expires_at`, both nullable so a row born before the
+/// migration reads back as "no writer, no lease" — the absent-lease state
+/// recovery reconciles exactly as it always did — plus the
+/// `(status, lease_expires_at)` index recovery's expired-lease scan uses.
+#[tokio::test]
+async fn migration_027_adds_result_table_lease_columns_nullable() {
+    let dir = tempfile::tempdir().unwrap();
+    let backend = open_sqlite_backend(&dir.path().join("catalog.db")).await;
+    backend.migrate().await.unwrap();
+
+    let columns: Vec<String> = backend
+        .transaction(
+            TxOptions {
+                read_only: true,
+                ..Default::default()
+            },
+            |tx| {
+                Box::pin(async move {
+                    tx.query(
+                        "SELECT name, \"notnull\" FROM pragma_table_info('result_tables')",
+                        &[],
+                        |row| {
+                            let name: String = row.get("name")?;
+                            let notnull: i32 = row.get("notnull")?;
+                            Ok(format!("{name}:{notnull}"))
+                        },
+                    )
+                    .await
+                })
+            },
+        )
+        .await
+        .unwrap();
+    assert!(
+        columns.iter().any(|c| c == "writer_id:0"),
+        "result_tables must have a nullable 'writer_id' after migration 027; got {columns:?}"
+    );
+    assert!(
+        columns.iter().any(|c| c == "lease_expires_at:0"),
+        "result_tables must have a nullable 'lease_expires_at' after migration 027; got {columns:?}"
+    );
+
+    let indexes: Vec<String> = backend
+        .transaction(
+            TxOptions {
+                read_only: true,
+                ..Default::default()
+            },
+            |tx| {
+                Box::pin(async move {
+                    tx.query(
+                        "SELECT name FROM sqlite_master WHERE type = 'index' \
+                         AND tbl_name = 'result_tables'",
+                        &[],
+                        |row| row.get("name"),
+                    )
+                    .await
+                })
+            },
+        )
+        .await
+        .unwrap();
+    assert!(
+        indexes.iter().any(|i| i == "idx_result_tables_lease"),
+        "migration 027 must create idx_result_tables_lease; got {indexes:?}"
     );
 }

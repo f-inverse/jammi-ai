@@ -305,6 +305,7 @@ RPCs (it also covers module functions `open_local`/`connect`, the pure-Python
 | `CatalogService` | `Staleness`/`DerivesFrom`/`ListIndexSegments` | `grpc/catalog.rs` |
 | `CatalogService` | `CreateMutableTable`/`DropMutableTable`/`ListMutableTables` | `grpc/catalog.rs` |
 | `CatalogService` | `RegisterTopic`/`DropTopic`/`ListTopics` | `grpc/catalog.rs` |
+| `CatalogService` | `Reconcile` | `grpc/catalog.rs` (`CatalogService::reconcile`; `all = true` gated by `AdminAuthorizer` [§2.8]) |
 | `EmbeddingService` | `GenerateEmbeddings`/`EncodeQuery`/`Search` | `grpc/embedding.rs` |
 | `InferenceService` | `Infer`/`Predict` | `grpc/inference.rs` |
 | `PipelineService` | `BuildNeighborGraph`/`PropagateEmbeddings`/`AssembleContext` | `grpc/pipeline.rs` |
@@ -494,7 +495,7 @@ Every trait/enum/base surface a maintainer extends, with anchors and invariants.
   `true` (default `true`); **not** the unconditional `with_embedded_worker`
   form. This is the SAME key the server `train` tier and the Python embedded
   arm read before deciding whether THEIR process claims —
-  `training.run_worker` (`crates/jammi-server/src/runtime.rs:1020`) and
+  `training.run_worker` (`crates/jammi-server/src/runtime.rs:1043`) and
   `training.run_worker` (`crates/jammi-python/src/database.rs:98`) — so a wire
   deployment and an in-process one answer "does THIS process claim?"
   identically rather than by three private conventions. `Target`
@@ -590,17 +591,145 @@ Every trait/enum/base surface a maintainer extends, with anchors and invariants.
   cancelled caller can't leak a connection mid-transaction.
 - **Migration runner** — `crates/jammi-db/src/catalog/migrations.rs`. `MIGRATIONS:
   &[(name, SQL)]`, **append-only**: never rename/reorder; run all-in-one-transaction.
-  Trust the array order, not the `schema.rs` constant order.
+  Trust the array order, not the `schema.rs` constant order. On Postgres, `run`
+  takes a transaction-scoped advisory lock (`SELECT pg_advisory_xact_lock($1)`,
+  keyed by `JAMMI_MIGRATION_LOCK_KEY`) as its FIRST statement, before it reads
+  the `applied_migrations` ledger or runs any DDL — closing a race where two
+  fresh replicas booting together both saw an empty ledger and one lost with
+  SQLSTATE `42P07`/`23505` (esc-093, #479); the lock is released on commit or
+  rollback (PgBouncer transaction-pooling safe). SQLite needs no equivalent —
+  its `BEGIN IMMEDIATE` write transaction already serialises the one process
+  that may hold the file. Migration `027_result_table_lease` (the most recent)
+  adds `result_tables.writer_id` / `lease_expires_at` + `idx_result_tables_lease`
+  for the lease module below.
 - **Typed status enums** — `crates/jammi-db/src/catalog/status.rs`:
   `ResultTableStatus`, `TrainingJobStatus`, `EvalRunStatus`, `ModelStatus`. Each
   impls `Display`+`FromStr`. **Contract: the DB value set is total over the enum**
   (round-trip test in `status.rs`). `ResultTableKind` (Model/NeighborGraph,
   `crates/jammi-db/src/catalog/result_repo.rs`) is a *separate* discriminator from
   `ModelTask`.
+- **The lease module** — `crates/jammi-db/src/catalog/lease.rs`: the ONE lease
+  primitive a claimed `training_jobs` row and a `building` `result_tables` row
+  both share — `LEASE_TS_FORMAT` (a fixed-width UTC format whose lexicographic
+  order matches chronological order, so `lease_expires_at < $now` needs no
+  dialect-specific interval arithmetic), `lease_now()`/`lease_deadline(lease)`
+  (moved out of `training_repo.rs`, re-exported there), `LeaseIntervals { lease,
+  heartbeat }` (only buildable through `config::LeaseConfig::intervals()` or
+  `Default`, enforcing `heartbeat * 2 < lease` and both non-zero at
+  construction), `lease_expired_clause(col, bind) -> "(col IS NULL OR col <
+  $bind)"` — the one SQL fragment every expiry-scoped enumeration and CAS
+  shares. Config: `[lease] duration_secs = 30, heartbeat_secs = 10`
+  (`config::LeaseConfig`, `#[serde(deny_unknown_fields)]`); `[training]` keeps
+  `run_worker`/`idle_poll_secs` and refuses (no alias) the former
+  `lease_duration_secs`/`heartbeat_interval_secs` keys.
+- **Lease-owned building result tables** — `ResultStore` mints
+  `writer_id = "writer-{uuid}"` per instance; `create_table` stamps it plus a
+  lease on the row and returns a `BuildingTable` handle (`table_name()`,
+  `parquet_url()`, `writer_id()`, `is_live()`, `set_checkpoint`,
+  `append_segment`, `finish`, `abort`, `abandon`) whose background heartbeat
+  renews the lease. Every transition on a `building` row is a compare-and-set
+  through ONE predicate builder, `catalog::result_repo::ResultTableCas { table,
+  tenant_arm: Admin | Strict(tenant), owner: Writer(id) | ExpiredLease(now) }`
+  — `renew_lease`, `set_checkpoint`, `fail_building_table` (the only
+  `building → failed`), `promote_result_table_with_manifest`,
+  `claim_expired_building_table`, `insert_index_segment`,
+  `delete_index_segments`. A zero-row CAS match classifies status-first into
+  exactly one `JammiError` variant — `RowGone` (row absent), `TenantMismatch`
+  (non-admin binding, row's tenant differs), `CasFailed{status}` (status is not
+  `building` — e.g. recovery already promoted it), `LeaseLost` (`status ==
+  'building' && writer_id != ours`) — and only `LeaseLost` licenses the WRITER
+  to delete its own bytes. **Exactly three deletion arms, ever:** a writer's
+  own `abort()` after its one-row CAS; recovery's reaper after its one-row
+  expiry CAS (having first *claimed* a promotable row, becoming its writer,
+  before it rebuilds and promotes — `claim_expired_building_table`); and
+  `reconcile` (below). `BuildingTable::finish` = renew the lease by CAS →
+  `ResultStore::write_attestation` (digest + manifest + sidecar) → promote CAS
+  → `register_table`; on `CasFailed{status: ready}` (recovery promoted the
+  writer's own bytes after its lease expired) `finish` still calls
+  `register_table` and returns the catalog's record. `recover()`
+  (`crates/jammi-db/src/store/mod.rs`, run at session construction under
+  `TenantBinding::admin_scope` — the one named implicit-admin pass) enumerates
+  ONLY rows whose lease is absent or expired
+  (`Catalog::list_expired_building_tables`) — a live-lease row is left alone,
+  from any tenant, from any session — and reconciles each to `ready` or
+  `failed` per the materialization-contract rules [§2.4d]; it deletes
+  expired-lease bytes across EVERY tenant even from a tenant-bound session.
+- **The layout module** — `crates/jammi-db/src/store/layout.rs`: the
+  tenant-prefixed key scheme every result-table and sidecar object lives
+  under. `TenantSegment::of(Option<&TenantId>) -> String` (`_global` or the
+  tenant's canonical hyphenated lowercase UUID) and
+  `TenantSegment::parse(&str) -> Option<Option<TenantId>>` are EXACT inverses
+  on every value `of` can produce — `parse` additionally rejects every
+  non-canonical UUID spelling (braced, `urn:uuid:`, unhyphenated "simple")
+  `of` would never emit, so a raw listed key in one of those forms is
+  `unattributed`, never silently coerced. `result_table_url(root, seg, table)
+  -> {root}/{seg}/{table}.parquet`; `segment_url`/`sidecar_url` derive a
+  table's siblings from ITS OWN `parquet_path`, never the store's current
+  root, so a table created under yesterday's root still resolves correctly if
+  the root configuration later moves. Artifacts: `models/{seg}/{job_id}/…`
+  (`ArtifactStore`, rooted at `{result_store_root}/models`); job ids are
+  canonical `Uuid::new_v4().to_string()`. `ResultStore::with_root(root,
+  registry, catalog, ann, local_cache_dir)` — `local_cache_dir` is the PARENT
+  of the two local caches the store derives, `{local_cache_dir}/index` and
+  `{local_cache_dir}/artifact` (relocated OUT of the result root; the default
+  embedded `ResultStore::new(artifact_dir, …)` roots them at
+  `{artifact_dir}/cache/{index,artifact}` instead of inside `jammi_db/`) —
+  see `docs/guide/src/cloud-storage.md`.
+- **Reconcile** — `crates/jammi-db/src/store/reconcile.rs`
+  (`ResultStore::reconcile`/`reconcile_all`): the ONE place this engine
+  performs an object-store `LIST` (`JammiObjectStore::list`, `pub(crate)`,
+  used only here — the never-LIST-on-the-hot-path rule stands everywhere
+  else). Lists FIRST, reads rows SECOND, so the row set is guaranteed a
+  superset of every object's true referencer at listing time (a table
+  materialising concurrently with a pass is always visible by the time rows
+  are read, since the row is written before any byte the check looks for).
+  **Allowlist** (`attribute(rel) -> Attribution`): first segment parses via
+  `TenantSegment::parse` → a result-table key; first segment `models`, second
+  parses via `TenantSegment::parse`, third is a canonical v4 UUID → an
+  artifact key; anything else → `Unattributed` — reported, **never deleted at
+  any grace**. **Row → object** (completeness, a live `exists()` per object):
+  `required_row_objects_present(table)` checks Parquet present + (the
+  `.materialization.json` sidecar present iff `definition_hash IS NOT NULL`) +
+  per-segment `required_sidecar_extensions(kind, precision, row_count)`
+  (`crates/jammi-db/src/storage/sidecar_layout.rs`); missing → `ready →
+  failed` CAS, reported. **Object → row** (attribution):
+  `referenced_result_keys(ready, live_building)` unions the full
+  `sidecar_extensions(kind)` superset (referenced-if-present, deliberately
+  more generous than the required-side check, since this side must never
+  delete a legitimately-present object) of every `ready` row and every
+  live-lease `building` row's CURRENT `index_segments` rows (segments are
+  referenced by rows, never by filename pattern — a `{base}__segN.*` object
+  with no row is an orphan candidate); a `running` job's checkpoints and every
+  `models.artifact_path`-named prefix (via `ArtifactStore::expected_objects`)
+  are referenced too; a present-but-unreadable `models.artifact_path` manifest
+  is reported `damaged`, never orphaned, and never aborts the whole pass;
+  else an orphan candidate, aged against `grace` (`apply=true` requires
+  `grace >=` the configured lease duration — a typed refusal otherwise)
+  before deletion, `pending` if younger. A tenant-scoped pass filters its own
+  `ready`-row enumeration to its own tenant BEFORE either the dry-run report
+  or the apply CAS, so it never reports (dry-run) or acts on (apply) a GLOBAL
+  row it cannot touch — only `reconcile_all` ever does. The expired-building
+  pre-pass runs BEFORE the object listing (not after, unlike every other row
+  read here) so a key it deletes can never be double-counted by this same
+  pass's own orphan accounting. `ReconcileReport { scope, applied,
+  rows_failed, rows_failed_count, orphans, orphan_count, pending,
+  pending_count, unattributed, unattributed_count, damaged, damaged_count,
+  truncated, bytes_reclaimed }`, every list sorted and capped at
+  `REPORT_LIST_CAP` (10,000 entries; `truncated` says whether any list hit the
+  cap, `*_count` is always the true total). `reconcile` runs under the
+  store's own binding (tenant-bound → its `{seg}/`; unbound → `_global`
+  only); `reconcile_all` wraps the WHOLE pass in
+  `TenantBinding::admin_scope` and covers every tenant. Wire: `CatalogService.
+  Reconcile` [§1.4 RPC table]; CLI: `jammi reconcile [--apply] [--grace-secs
+  N] [--all]` (`crates/jammi-cli/src/commands/reconcile.rs`); Python:
+  `Database.reconcile(apply, grace_secs, all)`
+  (`crates/jammi-python/src/database.rs`, embedded `all=True` = `reconcile_all`
+  — there is no wire-level `AdminAuthorizer` gate to consult in-process).
 - **`ResultStore`** — `crates/jammi-db/src/store/mod.rs` (the `ResultStore`
   struct): result-table storage coordinator (`root: StorageUrl`, `StorageRegistry`,
   `Arc<Catalog>`, `AnnIndexConfig`). Key methods: `ResultStore::create_table`,
-  `finalize`, `recover`, `materialize_embedding_table`, `resolve_search_mode`.
+  `finalize`, `recover`, `materialize_embedding_table`, `resolve_search_mode`,
+  `reconcile`/`reconcile_all` (see the reconcile bullet above).
 - **`SidecarKind` / `sidecar_extensions`** —
   `crates/jammi-db/src/storage/sidecar_layout.rs`: the single registry the writer,
   reader, and cleanup all consult. Ann →
@@ -1269,7 +1398,7 @@ governance decides coverage.
 `spine`/`facts` to physical scans (`scan_relation`) → `SortExec` each by `(by…,
 time[, tie-break])` ascending (`sort_for_merge`) → plan `AsofJoinExec`
 (`crates/jammi-ai/src/pipeline/asof/exec.rs`) → single-pointer sort-merge
-(`crates/jammi-ai/src/pipeline/asof/merge.rs`) → `finalize_with_manifest` with a
+(`crates/jammi-ai/src/pipeline/asof/merge.rs`) → `BuildingTable::finish` with a
 typed `ProducingDescriptor::AsofJoin` + an input anchor for **both** relations
 (`crates/jammi-ai/src/pipeline/asof/verb.rs`). Left rows are always preserved;
 unmatched fact columns are null. The result `model_id` is a sentinel `"asof-join"`
@@ -1306,7 +1435,7 @@ temporal join.
 tenant-scoped via the catalog resolution at the gRPC seam): read the named table's
 recorded `ProducingDescriptor` (`recompute_one`/`replay_descriptor`), reconstruct the
 producing verb call from its typed parameters, and replay it through the **unmodified
-`finalize_with_manifest` funnel** with `CachePolicy::Bypass` (a recompute that reused
+`BuildingTable::finish` funnel** with `CachePolicy::Bypass` (a recompute that reused
 a cache would be a no-op). Byte-identical when inputs haven't moved (the descriptor
 records every output-affecting determinant). A pre-contract table with no descriptor
 is the typed `JammiError::NotRecomputable` — a loud refusal, never a re-run guessed
@@ -1423,7 +1552,7 @@ This is the engine's point-in-time-correctness primitive, and it is LIVE on ever
 surface. Unlike the dormant conformal wrap of §2.4c, `asof_join` reaches code from
 gRPC, the Python binding, *and* the recompute replay path; and it is the first compute
 verb that writes through the **materialization contract** funnel
-(`finalize_with_manifest`) — every result table carries a verifiable
+(`BuildingTable::finish`) — every result table carries a verifiable
 `.materialization.json` attestation, and `asof_join` is the worked example the
 cookbook documents (`cookbook/book/chapters/19-point-in-time/point-in-time.qmd`). The
 two ship together: `asof_join` produces a leakage-free table, `verify_materialization`
@@ -1540,8 +1669,8 @@ attest:
    the neighbor-graph sentinel — the join invokes no model but the column is NOT NULL).
    `derived_from` is `None`: the inputs are registered *sources*, not result tables, so
    FK-lineage rides the manifest's input anchors instead.
-5. **Attest** through `finalize_with_manifest`
-   (`crates/jammi-ai/src/pipeline/asof/verb.rs` → `crates/jammi-db/src/store/mod.rs`) —
+5. **Attest** through `BuildingTable::finish`
+   (`crates/jammi-ai/src/pipeline/asof/verb.rs` → `crates/jammi-db/src/store/building.rs`) —
    the single materialization funnel. The contract: a typed
    `ProducingDescriptor::AsofJoin` (`descriptor_for`, mapping the AI-crate enums to the
    transport-neutral manifest mirrors), a `MaterializationEnv` with an **empty model
@@ -1644,7 +1773,7 @@ as committed golden contracts.
   (`crates/jammi-ai/src/wire/pipeline.rs`). The knob must move the definition hash —
   `asof_join_each_knob_moves_the_hash` (`crates/jammi-db/src/store/manifest.rs`) is the
   guard test.
-- **New materialized producer (any verb):** write through `finalize_with_manifest` with a
+- **New materialized producer (any verb):** write through `BuildingTable::finish` with a
   new `ProducingDescriptor` variant (`crates/jammi-db/src/store/manifest.rs`) carrying
   every output-affecting parameter, and honest `InputAnchor`s for every input read. Bump
   `MANIFEST_VERSION` (`crates/jammi-db/src/store/manifest.rs`) if the descriptor's
@@ -1863,7 +1992,7 @@ variant (`crates/jammi-db/src/store/manifest.rs`) with **every** output-affectin
 determinant (floats by bit pattern); (2) probing at the top of the verb (`if cache ==
 CachePolicy::Use { … probe_cache_record(&def_hash, &inputs) … return Reused }`, the
 `EmbeddingPipeline::run` shape, `crates/jammi-ai/src/pipeline/embedding.rs`) and returning
-`(record, CacheOutcome)`; (3) writing through `finalize_with_manifest` with the *same*
+`(record, CacheOutcome)`; (3) writing through `BuildingTable::finish` with the *same*
 `(descriptor, env, inputs)` the probe keyed on; (4) adding a `replay_descriptor` arm that
 calls the producer with `CachePolicy::Bypass` and the matching `*_from_manifest`
 reverse-mappers. Anchor immutable result-table inputs as `ResultDigest` (cacheable) and raw
@@ -2823,6 +2952,21 @@ describing a removed surface.
   `TenantResolverLayer`, in `crates/jammi-server/src/tenant_resolver_layer.rs`. **Invariant:
   a request with no/unknown session header runs unscoped (all-tenants — the explicit
   `Global` scope), never an error** — the load-bearing gotcha behind "bind first" [§5].
+- **`AdminAuthorizer`** — `crates/jammi-server/src/grpc/catalog.rs`: a SEPARATE,
+  narrower seam from `TenantResolver` above — it gates only `CatalogService.
+  Reconcile`'s cross-tenant `all = true` admin pass, never an ordinary verb's
+  tenant binding. Synchronous (`fn authorize(&self, metadata: &MetadataMap) ->
+  Result<(), Status>`, unlike the `async_trait` `TenantResolver`): a local
+  metadata check, not an I/O round-trip. `CatalogServer::new`'s 4th parameter,
+  threaded from `GrpcChain.admin_authorizer: Option<Arc<dyn AdminAuthorizer>>`
+  (`runtime.rs:290`'s `build_grpc_chain` — the OSS binary's shipped default,
+  `None` — and `:897`'s `assemble_grpc_chain` exhaustive destructure;
+  `flight.rs:77`'s `serve_flight_with_catalog_service` passes `None`). Shipped
+  default `None` refuses EVERY `all = true` request with `PERMISSION_DENIED`
+  naming `security.md`; `all = false` never consults it. **Gated verb only —
+  gRPC-only by construction** (`Reconcile` has no Flight SQL analogue), unlike
+  `TenantResolver`'s one-grant-both-transports shape. Test double:
+  `tests/it/common/grpc.rs::AllowAllAdmin`.
 - **Per-handler helpers** — `crates/jammi-server/src/grpc/wire.rs`: `session_tenant`,
   **`scoped`** (the concurrency-safe per-task-local tenant scope — handlers must use this,
   never sticky `bind_tenant`), `require_nonempty`, `map_engine_error`/`map_trigger_error`.
@@ -3043,22 +3187,22 @@ id space, this defends the context-predictor id space, and each surface owns its
 rather than trusting the id's shape alone.
 
 The adapter-fetch error contract both reload surfaces share: `fetch_artifact`
-(`crates/jammi-db/src/store/artifact.rs:220`) raises two DISTINCT typed storage outcomes,
+(`crates/jammi-db/src/store/artifact.rs:228`) raises two DISTINCT typed storage outcomes,
 never folding them together. A manifest that is ABSENT entirely — nothing was ever
 published at that prefix, or a catalog pointer names the wrong one — reclassifies to
 `StorageError::NotPublished` (`reclassify_missing_manifest`,
-`crates/jammi-db/src/store/artifact.rs:484`; covered by
+`crates/jammi-db/src/store/artifact.rs:539`; covered by
 `missing_manifest_is_not_published_not_corruption`,
-`crates/jammi-db/src/store/artifact.rs:685`): no manifest is in hand, so there is nothing
+`crates/jammi-db/src/store/artifact.rs:742`): no manifest is in hand, so there is nothing
 to say is corrupt. A manifest that IS present but malformed, or that names a key which is
 missing or hash-mismatched on an otherwise-published bundle, is the genuine integrity
 failure, `StorageError::Layout` (`reclassify_missing_key`,
-`crates/jammi-db/src/store/artifact.rs:515`; `verify_sha256`,
-`crates/jammi-db/src/store/artifact.rs:530`). Any OTHER storage fault off `fetch_artifact`
+`crates/jammi-db/src/store/artifact.rs:570`; `verify_sha256`,
+`crates/jammi-db/src/store/artifact.rs:585`). Any OTHER storage fault off `fetch_artifact`
 — transport/IO, a disabled scheme, driver-init failure, or a permission-denied open on a
 present key (which stays `StorageError::Io`, never reclassified —
 `permission_fault_on_a_present_key_stays_a_transport_error`,
-`crates/jammi-db/src/store/artifact.rs:759`) — is left unchanged.
+`crates/jammi-db/src/store/artifact.rs:816`) — is left unchanged.
 
 Both reload surfaces match on these two variants explicitly and re-type BOTH into the SAME
 `JammiError::Model`, naming the model id with a distinct message per variant.
@@ -3098,7 +3242,7 @@ At the gRPC edge, `map_engine_error` (`crates/jammi-server/src/grpc/wire.rs:109`
 maps `JammiError::Inference` (`crates/jammi-server/src/grpc/wire.rs:138`) to
 `Code::Internal`, and lets every unmatched variant — including the propagated
 `JammiError::Storage` transport fault — fall through its own catch-all to `Code::Internal`
-(`crates/jammi-server/src/grpc/wire.rs:186`). Because both reload surfaces raise the same
+(`crates/jammi-server/src/grpc/wire.rs:220`). Because both reload surfaces raise the same
 `JammiError::Model` for the same class of outcome, an unpublished OR a corrupted adapter
 bundle reads as the SAME `InvalidArgument` whether it is `ModelResolver` or
 `load_context_predictor` that hit it, and a genuine transient object-store outage on either

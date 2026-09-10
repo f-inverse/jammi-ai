@@ -54,6 +54,8 @@ use crate::error::{JammiError, Result};
 use crate::storage::{
     sha256_hex, JammiObjectStore, Scheme, StorageError, StorageRegistry, StorageUrl,
 };
+use crate::store::layout::TenantSegment;
+use crate::tenant::TenantId;
 
 /// The file every artifact prefix carries last, naming the bundle's exact keys
 /// and per-file digests. Written after every data file so its presence proves
@@ -166,18 +168,24 @@ impl ArtifactStore {
     /// Write an artifact bundle under a unique per-attempt prefix and return that
     /// prefix as the [`StorageUrl`] the catalog records.
     ///
-    /// `prefix_segments` are joined under the store root to form the prefix
-    /// (the caller passes attempt-unique segments such as
-    /// `[job_id, worker_id, attempt]`, so no two attempts ever target the same
-    /// prefix and no object is overwritten). Each `(name, bytes)` is PUT under
-    /// the prefix, then `manifest.json` is PUT **last** — its presence proves
-    /// the bundle is complete. Returns the prefix `StorageUrl`.
+    /// `tenant` is the owning row's tenant (the job's, or the model's) — it
+    /// becomes the FIRST prefix segment (`models/{seg}/…`), via the same
+    /// [`TenantSegment`] a result table's key is attributed through, so a
+    /// listing pass (`reconcile`) can attribute every artifact key to a
+    /// tenant exactly like a result-table key. `prefix_segments` are then
+    /// joined under `{root}/{seg}` (the caller passes attempt-unique segments
+    /// such as `[job_id, worker_id, attempt]`, so no two attempts ever target
+    /// the same prefix and no object is overwritten). Each `(name, bytes)` is
+    /// PUT under the prefix, then `manifest.json` is PUT **last** — its
+    /// presence proves the bundle is complete. Returns the prefix
+    /// [`StorageUrl`].
     pub async fn put_artifact(
         &self,
+        tenant: Option<&TenantId>,
         prefix_segments: &[&str],
         files: &[(String, Bytes)],
     ) -> Result<StorageUrl> {
-        let prefix = self.prefix_url(prefix_segments)?;
+        let prefix = self.prefix_url(tenant, prefix_segments)?;
         let handle = self.handle(&prefix)?;
 
         // Sort entries by name so the manifest order — and thus the combined
@@ -305,10 +313,12 @@ impl ArtifactStore {
     /// regress the checkpoint to a stale epoch.
     pub async fn put_resume_checkpoint(
         &self,
+        tenant: Option<&TenantId>,
         job_id: &str,
         files: &[(String, Bytes)],
     ) -> Result<StorageUrl> {
-        self.put_artifact(&[job_id, RESUME_SEGMENT], files).await
+        self.put_artifact(tenant, &[job_id, RESUME_SEGMENT], files)
+            .await
     }
 
     /// Fetch a job's durable resume checkpoint, or `None` if no manifest exists
@@ -319,8 +329,12 @@ impl ArtifactStore {
     /// hard error from [`Self::fetch_artifact`], not a silent `None`: a torn resume
     /// checkpoint must fail loudly rather than restart training from scratch and
     /// mask the corruption.
-    pub async fn fetch_resume_checkpoint(&self, job_id: &str) -> Result<Option<LocalArtifact>> {
-        let prefix = self.prefix_url(&[job_id, RESUME_SEGMENT])?;
+    pub async fn fetch_resume_checkpoint(
+        &self,
+        tenant: Option<&TenantId>,
+        job_id: &str,
+    ) -> Result<Option<LocalArtifact>> {
+        let prefix = self.prefix_url(tenant, &[job_id, RESUME_SEGMENT])?;
         let handle = self.handle(&prefix)?;
         let manifest_path = self.child(&prefix, MANIFEST_NAME)?;
         if !handle.exists(&manifest_path).await? {
@@ -333,8 +347,12 @@ impl ArtifactStore {
     /// the finalize-CAS winner only: the resume state is dead the moment the job
     /// is `completed`, and the prefix is bounded to one bundle per job
     /// (overwrite-in-place), so this is the single point that reclaims it.
-    pub async fn delete_resume_checkpoint(&self, job_id: &str) -> Result<()> {
-        let prefix = self.prefix_url(&[job_id, RESUME_SEGMENT])?;
+    pub async fn delete_resume_checkpoint(
+        &self,
+        tenant: Option<&TenantId>,
+        job_id: &str,
+    ) -> Result<()> {
+        let prefix = self.prefix_url(tenant, &[job_id, RESUME_SEGMENT])?;
         self.delete_artifact_prefix(&prefix).await
     }
 
@@ -350,6 +368,7 @@ impl ArtifactStore {
     /// resume-bundle shape.
     pub async fn put_epoch_checkpoint(
         &self,
+        tenant: Option<&TenantId>,
         job_id: &str,
         worker_id: &str,
         attempt: &str,
@@ -358,6 +377,7 @@ impl ArtifactStore {
     ) -> Result<StorageUrl> {
         let segment = epoch_segment(epoch);
         self.put_artifact(
+            tenant,
             &[job_id, worker_id, attempt, CHECKPOINTS_SEGMENT, &segment],
             files,
         )
@@ -373,14 +393,17 @@ impl ArtifactStore {
     /// got: indices past the run's real progress are simply no-ops.
     pub async fn delete_epoch_checkpoint(
         &self,
+        tenant: Option<&TenantId>,
         job_id: &str,
         worker_id: &str,
         attempt: &str,
         epoch: usize,
     ) -> Result<()> {
         let segment = epoch_segment(epoch);
-        let prefix =
-            self.prefix_url(&[job_id, worker_id, attempt, CHECKPOINTS_SEGMENT, &segment])?;
+        let prefix = self.prefix_url(
+            tenant,
+            &[job_id, worker_id, attempt, CHECKPOINTS_SEGMENT, &segment],
+        )?;
         self.delete_artifact_prefix(&prefix).await
     }
 
@@ -450,17 +473,49 @@ impl ArtifactStore {
             .map_err(|e| JammiError::Storage(StorageError::layout(&key, e.to_string())))
     }
 
-    /// Join attempt-unique segments under the store root to form the artifact
-    /// prefix URL. Each segment is sanitized so a `job_id`/`worker_id` carrying a
-    /// `/` cannot escape the prefix or collide across attempts.
-    fn prefix_url(&self, segments: &[&str]) -> Result<StorageUrl> {
+    /// Join the tenant segment plus attempt-unique segments under the store
+    /// root to form the artifact prefix URL:
+    /// `{root}/{TenantSegment::of(tenant)}/{segments…}`. Each segment is
+    /// sanitized so a `job_id`/`worker_id` carrying a `/` cannot escape the
+    /// prefix or collide across attempts.
+    fn prefix_url(&self, tenant: Option<&TenantId>, segments: &[&str]) -> Result<StorageUrl> {
         let root = self.root.as_str().trim_end_matches('/');
         let mut joined = String::from(root);
+        joined.push('/');
+        joined.push_str(&TenantSegment::of(tenant));
         for seg in segments {
             joined.push('/');
             joined.push_str(&sanitize_segment(seg));
         }
         StorageUrl::parse(&joined).map_err(JammiError::from)
+    }
+
+    /// The full set of object keys a published bundle at `prefix` is
+    /// expected to carry, read from its `manifest.json`: `None` when no
+    /// manifest exists at all (nothing was ever published there — an absent
+    /// manifest is not an error, see `reclassify_missing_manifest`);
+    /// `Some(keys)` — the manifest itself plus every entry it lists — when
+    /// one does. A read error OTHER than "no manifest" propagates: this
+    /// method never silently treats a transport fault as "nothing to
+    /// expect".
+    ///
+    /// The sole caller is `reconcile`'s artifact arm: a prefix any
+    /// `models.artifact_path` names is checked against this set rather than
+    /// deleted as an orphan candidate outright — a manifest with a
+    /// still-unpublished object is a torn write in progress, not garbage.
+    pub async fn expected_objects(&self, prefix: &StorageUrl) -> Result<Option<Vec<ObjectPath>>> {
+        let handle = self.handle(prefix)?;
+        let manifest = match self.read_manifest(&handle, prefix).await {
+            Ok(m) => m,
+            Err(JammiError::Storage(StorageError::NotPublished { .. })) => return Ok(None),
+            Err(e) => return Err(e),
+        };
+        let mut paths = Vec::with_capacity(manifest.files.len() + 1);
+        paths.push(self.child(prefix, MANIFEST_NAME)?);
+        for entry in &manifest.files {
+            paths.push(self.child(prefix, &entry.name)?);
+        }
+        Ok(Some(paths))
     }
 }
 
@@ -614,10 +669,12 @@ mod tests {
         let files = sample_files();
 
         let prefix = store
-            .put_artifact(&["job-1", "worker-a", "0"], &files)
+            .put_artifact(None, &["job-1", "worker-a", "0"], &files)
             .await
             .unwrap();
-        assert!(prefix.as_str().ends_with("artifacts/job-1/worker-a/0"));
+        assert!(prefix
+            .as_str()
+            .ends_with("artifacts/_global/job-1/worker-a/0"));
 
         let fetched = store.fetch_artifact(&prefix).await.unwrap();
         for (name, bytes) in &files {
@@ -637,7 +694,7 @@ mod tests {
         let files = sample_files();
 
         let prefix = store
-            .put_artifact(&["job-2", "worker-b", "1"], &files)
+            .put_artifact(None, &["job-2", "worker-b", "1"], &files)
             .await
             .unwrap();
         let fetched = store.fetch_artifact(&prefix).await.unwrap();
@@ -661,7 +718,7 @@ mod tests {
             cache.path().to_path_buf(),
         );
         let prefix = store
-            .put_artifact(&["job-3", "worker-c", "0"], &sample_files())
+            .put_artifact(None, &["job-3", "worker-c", "0"], &sample_files())
             .await
             .unwrap();
 
@@ -689,7 +746,7 @@ mod tests {
             cache.path().to_path_buf(),
         );
         // A prefix that was never written — no manifest exists.
-        let prefix = store.prefix_url(&["ghost", "worker", "0"]).unwrap();
+        let prefix = store.prefix_url(None, &["ghost", "worker", "0"]).unwrap();
         let err = store.fetch_artifact(&prefix).await.unwrap_err();
         // The manifest GET 404s before any data file is even named. No
         // manifest is in hand, so there is nothing to say the bundle's
@@ -723,7 +780,7 @@ mod tests {
             cache.path().to_path_buf(),
         );
         let prefix = store
-            .put_artifact(&["job-4", "worker-d", "0"], &sample_files())
+            .put_artifact(None, &["job-4", "worker-d", "0"], &sample_files())
             .await
             .unwrap();
         let handle = store.handle(&prefix).unwrap();
@@ -764,7 +821,7 @@ mod tests {
         let root = StorageUrl::parse(root_dir.path().to_str().unwrap()).unwrap();
         let store = store_with_root(root, cache.path().to_path_buf());
         let prefix = store
-            .put_artifact(&["job-5", "worker-e", "0"], &sample_files())
+            .put_artifact(None, &["job-5", "worker-e", "0"], &sample_files())
             .await
             .unwrap();
         let weights_path = std::path::PathBuf::from(prefix.path()).join("adapter.safetensors");
@@ -802,7 +859,7 @@ mod tests {
             cache.path().to_path_buf(),
         );
         let prefix = store
-            .put_artifact(&["job-4", "worker-d", "0"], &sample_files())
+            .put_artifact(None, &["job-4", "worker-d", "0"], &sample_files())
             .await
             .unwrap();
 
@@ -825,7 +882,7 @@ mod tests {
         ));
         let files = sample_files();
         let prefix = store
-            .put_artifact(&["job-5", "worker-e", "0"], &files)
+            .put_artifact(None, &["job-5", "worker-e", "0"], &files)
             .await
             .unwrap();
 
@@ -854,7 +911,7 @@ mod tests {
             cache.path().to_path_buf(),
         );
         let prefix = store
-            .put_artifact(&["job-6", "worker-f", "0"], &sample_files())
+            .put_artifact(None, &["job-6", "worker-f", "0"], &sample_files())
             .await
             .unwrap();
 
@@ -875,7 +932,7 @@ mod tests {
 
         // No checkpoint written yet → None (start from scratch).
         assert!(store
-            .fetch_resume_checkpoint("job-r")
+            .fetch_resume_checkpoint(None, "job-r")
             .await
             .unwrap()
             .is_none());
@@ -887,15 +944,21 @@ mod tests {
             "resume_state.json".to_string(),
             Bytes::from_static(b"{\"epoch\":0}"),
         )];
-        store.put_resume_checkpoint("job-r", &epoch0).await.unwrap();
+        store
+            .put_resume_checkpoint(None, "job-r", &epoch0)
+            .await
+            .unwrap();
         let epoch1 = vec![(
             "resume_state.json".to_string(),
             Bytes::from_static(b"{\"epoch\":1}"),
         )];
-        store.put_resume_checkpoint("job-r", &epoch1).await.unwrap();
+        store
+            .put_resume_checkpoint(None, "job-r", &epoch1)
+            .await
+            .unwrap();
 
         let fetched = store
-            .fetch_resume_checkpoint("job-r")
+            .fetch_resume_checkpoint(None, "job-r")
             .await
             .unwrap()
             .expect("a written checkpoint is fetchable");
@@ -907,14 +970,14 @@ mod tests {
         );
 
         // GC by the finalize winner: the next fetch is None again.
-        store.delete_resume_checkpoint("job-r").await.unwrap();
+        store.delete_resume_checkpoint(None, "job-r").await.unwrap();
         assert!(store
-            .fetch_resume_checkpoint("job-r")
+            .fetch_resume_checkpoint(None, "job-r")
             .await
             .unwrap()
             .is_none());
         // Deleting again (already-clean) is a no-op.
-        store.delete_resume_checkpoint("job-r").await.unwrap();
+        store.delete_resume_checkpoint(None, "job-r").await.unwrap();
     }
 
     #[tokio::test]
@@ -928,11 +991,12 @@ mod tests {
         // same job; neither read sees the other's bytes — the resume side channel
         // never perturbs the served path.
         let published = store
-            .put_artifact(&["job-d", "worker-a", "0"], &sample_files())
+            .put_artifact(None, &["job-d", "worker-a", "0"], &sample_files())
             .await
             .unwrap();
         store
             .put_resume_checkpoint(
+                None,
                 "job-d",
                 &[(
                     "resume_state.json".to_string(),
@@ -950,9 +1014,81 @@ mod tests {
         assert!(!served.dir().join("resume_state.json").exists());
 
         // GCing the resume checkpoint leaves the served artifact untouched.
-        store.delete_resume_checkpoint("job-d").await.unwrap();
+        store.delete_resume_checkpoint(None, "job-d").await.unwrap();
         let served_again = store.fetch_artifact(&published).await.unwrap();
         assert!(served_again.dir().join("adapter.safetensors").exists());
+    }
+
+    #[tokio::test]
+    async fn put_artifact_lands_under_the_global_segment_when_untenanted() {
+        let cache = tempfile::tempdir().unwrap();
+        let store = store_with_root(
+            StorageUrl::memory("artifacts-seg"),
+            cache.path().to_path_buf(),
+        );
+        let prefix = store
+            .put_artifact(None, &["job-g", "worker-a", "0"], &sample_files())
+            .await
+            .unwrap();
+        assert!(
+            prefix
+                .as_str()
+                .ends_with("artifacts-seg/_global/job-g/worker-a/0"),
+            "an untenanted artifact must land under the `_global` segment, got: {prefix}"
+        );
+    }
+
+    #[tokio::test]
+    async fn put_artifact_lands_under_the_tenant_segment() {
+        let cache = tempfile::tempdir().unwrap();
+        let store = store_with_root(
+            StorageUrl::memory("artifacts-tenant"),
+            cache.path().to_path_buf(),
+        );
+        let tenant = TenantId::from_uuid(uuid::Builder::from_bytes([42; 16]).into_uuid()).unwrap();
+        let prefix = store
+            .put_artifact(Some(&tenant), &["job-t", "worker-a", "0"], &sample_files())
+            .await
+            .unwrap();
+        assert!(
+            prefix
+                .as_str()
+                .ends_with(&format!("artifacts-tenant/{tenant}/job-t/worker-a/0")),
+            "a tenant's artifact must land under its own tenant segment, got: {prefix}"
+        );
+    }
+
+    #[tokio::test]
+    async fn expected_objects_is_none_for_an_unpublished_prefix() {
+        let cache = tempfile::tempdir().unwrap();
+        let store = store_with_root(
+            StorageUrl::memory("artifacts-expected-none"),
+            cache.path().to_path_buf(),
+        );
+        let prefix = store.prefix_url(None, &["ghost", "worker", "0"]).unwrap();
+        assert!(store.expected_objects(&prefix).await.unwrap().is_none());
+    }
+
+    #[tokio::test]
+    async fn expected_objects_lists_the_manifest_and_every_entry() {
+        let cache = tempfile::tempdir().unwrap();
+        let store = store_with_root(
+            StorageUrl::memory("artifacts-expected-some"),
+            cache.path().to_path_buf(),
+        );
+        let prefix = store
+            .put_artifact(None, &["job-e", "worker-a", "0"], &sample_files())
+            .await
+            .unwrap();
+        let objects = store.expected_objects(&prefix).await.unwrap().unwrap();
+        let names: Vec<String> = objects.iter().map(|p| p.to_string()).collect();
+        assert!(names.iter().any(|n| n.ends_with(MANIFEST_NAME)));
+        for (name, _) in sample_files() {
+            assert!(
+                names.iter().any(|n| n.ends_with(&name)),
+                "expected_objects must list every manifest entry, missing '{name}' in {names:?}"
+            );
+        }
     }
 
     #[test]

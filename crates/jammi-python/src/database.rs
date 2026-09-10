@@ -923,6 +923,56 @@ impl PyDatabase {
         serializable_to_pydict(py, &edges)
     }
 
+    /// Cross-check the catalog against the object store and report (or, when
+    /// `apply` is set, reclaim) what has drifted. `apply=False` (the default)
+    /// is read-only — it reports what a pass WOULD do without mutating
+    /// anything; `apply=True` reclaims orphans past `grace_secs` and flips an
+    /// incomplete `ready` row to `failed`, and requires `grace_secs` to be at
+    /// least the deployment's configured lease duration or raises the typed
+    /// `Config` refusal naming both values.
+    ///
+    /// `all=False` (the default) runs scoped to whatever tenant is currently
+    /// bound (or the `_global` prefix when unbound) — [`ResultStore::reconcile`].
+    /// `all=True` runs the cross-tenant admin pass —
+    /// [`ResultStore::reconcile_all`] — covering every tenant's prefix in one
+    /// pass. There is no authorizer gate here: the embedded engine trusts its
+    /// caller (the trusted-network / in-process consumer model this whole
+    /// crate is built on), unlike the remote `jammi.reconcile(..., all=True)`,
+    /// which the server gates behind a deployment-supplied admin authorizer.
+    ///
+    /// Returns the report as a dict tagged `{"scope", "applied", "rows_failed",
+    /// "rows_failed_count", "orphans", "orphan_count", "pending",
+    /// "pending_count", "unattributed", "unattributed_count", "damaged",
+    /// "damaged_count", "truncated", "bytes_reclaimed"}` — the same shape the
+    /// remote client's `reconcile` returns. Every `*_count` field is the true
+    /// total independent of whether its list was capped; `truncated` says
+    /// whether any list was.
+    ///
+    /// [`ResultStore::reconcile`]: jammi_db::store::ResultStore::reconcile
+    /// [`ResultStore::reconcile_all`]: jammi_db::store::ResultStore::reconcile_all
+    #[pyo3(signature = (apply=false, grace_secs=3600, all=false))]
+    fn reconcile(
+        &self,
+        py: Python<'_>,
+        apply: bool,
+        grace_secs: u64,
+        all: bool,
+    ) -> PyResult<Py<PyAny>> {
+        self.check_open()?;
+        let opts = jammi_db::store::ReconcileOptions {
+            apply,
+            grace: std::time::Duration::from_secs(grace_secs),
+        };
+        let store = self.session.result_store();
+        let report = if all {
+            self.runtime.block_on(store.reconcile_all(opts))
+        } else {
+            self.runtime.block_on(store.reconcile(opts))
+        }
+        .map_err(to_pyerr)?;
+        serializable_to_pydict(py, &report)
+    }
+
     /// Register a mutable companion table from a serialized
     /// `CreateMutableTableRequest` body. The thin Python `Database` wrapper builds
     /// this request with the same pure-Python assembly the remote client uses

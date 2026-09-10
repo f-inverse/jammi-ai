@@ -266,6 +266,8 @@ fn result_params<'a>(
     model: &'a str,
 ) -> CreateResultTableParams<'a> {
     CreateResultTableParams {
+        writer_id: None,
+        lease: None,
         table_name: name,
         source_id: source,
         model_id: model,
@@ -942,6 +944,18 @@ fn cases() -> Vec<IsolationCase> {
                 assert_list_index_segments_isolated().await;
             }
         ),
+        // --- reconcile (admin-gated cross-tenant sweep) -----------------------
+        // `reconcile` runs under the resolved tenant scope: a peer's own pass
+        // sees and can therefore only ever report/reclaim objects under its OWN
+        // `{seg}/` prefix, so it can neither report nor delete anything under
+        // another tenant's segment. `reconcile_all` — gated at the wire by an
+        // `AdminAuthorizer`, proven separately by
+        // `grpc_remote_session.rs`'s denied-by-default oracle — sees every
+        // tenant's prefix in one pass and reaps only genuine orphans, leaving
+        // every tenant's live objects byte-identical.
+        case!("CatalogService", "Reconcile", CaseKind::Hermetic, None, {
+            assert_reconcile_isolated().await;
+        }),
         // --- audit (tenant-scoped — NOT allowlisted) -------------------------
         case!("AuditService", "AuditLog", CaseKind::Hermetic, None, {
             assert_audit_isolated().await;
@@ -1641,7 +1655,7 @@ async fn assert_source_resolver_isolated() {
 /// cannot even resolve the table to verify it.
 ///
 /// This drives the real wire path: tenant A materialises an embedding table
-/// through the single `finalize_with_manifest` funnel (the same funnel the
+/// through the single `BuildingTable::finish` funnel (the same funnel the
 /// production producers use), then `Session::verify_materialization` runs under
 /// each tenant's scope — exactly as the gRPC `VerifyMaterialization` handler
 /// wraps it in `scoped(engine, tenant, …)`. A's own verify returns
@@ -1716,9 +1730,29 @@ async fn materialize_table_for_tenant_a() -> (Arc<InferenceSession>, Session, St
                 ],
             )
             .unwrap();
-            let mut writer = store.open_writer(&info.parquet_url, schema).await.unwrap();
+            let mut writer = store.open_writer(info.parquet_url(), schema).await.unwrap();
             writer.write_batch(&batch).await.unwrap();
             let rows = writer.close().await.unwrap();
+
+            // One real ANN segment over the written rows, appended under the
+            // writer's lease while the row is still `building` — the only
+            // moment a segment can be registered (segment 0, stamped with A's
+            // tenant from the parent row).
+            {
+                use jammi_db::index::VectorIndex;
+                let mut index = jammi_db::index::sidecar::SidecarIndex::new(
+                    DIMS,
+                    store.ann_config(),
+                    info.storage_precision(),
+                )
+                .unwrap();
+                for i in 0..n {
+                    let v: Vec<f32> = (0..DIMS).map(|d| (i * DIMS + d) as f32).collect();
+                    index.add(&format!("row-{i}"), &v).unwrap();
+                }
+                index.build().unwrap();
+                info.append_segment(&index).await.unwrap();
+            }
 
             let descriptor = ProducingDescriptor::Embedding {
                 model_id: model_id.into(),
@@ -1739,21 +1773,19 @@ async fn materialize_table_for_tenant_a() -> (Arc<InferenceSession>, Session, St
                 }],
             );
             let ctx = SessionContext::new();
-            store
-                .finalize_with_manifest(
-                    &ctx,
-                    &info.table_name,
-                    &info.parquet_url,
-                    rows,
-                    Materialization::new(
-                        &descriptor,
-                        &env,
-                        vec![InputAnchor::mutable_version(source_id, 1)],
-                    ),
-                )
-                .await
-                .unwrap();
-            info.table_name
+            let table_name = info.table_name().to_string();
+            info.finish(
+                &ctx,
+                rows,
+                Materialization::new(
+                    &descriptor,
+                    &env,
+                    vec![InputAnchor::mutable_version(source_id, 1)],
+                ),
+            )
+            .await
+            .unwrap();
+            table_name
         })
         .await;
 
@@ -1790,6 +1822,226 @@ async fn assert_verify_materialization_isolated() {
     assert!(
         b_result.is_err(),
         "CROSS-TENANT LEAK: tenant B resolved and verified tenant A's materialization: {b_result:?}"
+    );
+}
+
+/// `reconcile` scopes to the caller's OWN tenant prefix; `reconcile_all`
+/// (the admin-gated cross-tenant pass — the wire-level `AdminAuthorizer` gate
+/// is proven separately, in `grpc_remote_session.rs`) sees every tenant's
+/// prefix in one pass. Reuses [`materialize_table_for_tenant_a`]'s real
+/// funnel-materialized table (parquet + one ANN segment, tenant A) and plants
+/// a stray, unreferenced object directly under tenant A's own segment —
+/// backdated well past the grace window this test uses, so it is an orphan
+/// candidate with no real-time sleep needed.
+async fn assert_reconcile_isolated() {
+    use jammi_db::store::ReconcileOptions;
+
+    let (engine, _session, table_name, dir) = materialize_table_for_tenant_a().await;
+
+    let stray_dir = dir.path().join("jammi_db").join(tenant_a().to_string());
+    std::fs::create_dir_all(&stray_dir).unwrap();
+    let stray = stray_dir.join("stray.parquet");
+    std::fs::write(&stray, b"stray").unwrap();
+    let backdated = std::time::SystemTime::now() - std::time::Duration::from_secs(3600);
+    std::fs::File::options()
+        .write(true)
+        .open(&stray)
+        .unwrap()
+        .set_modified(backdated)
+        .unwrap();
+
+    // RED first: a genuinely UNATTRIBUTED key — its own first path
+    // segment does not even parse as a `TenantSegment` — planted directly at
+    // the store root (no tenant prefix at all), so it is store-wide by
+    // definition. Before the fix, tenant B's own SCOPED reconcile listed
+    // this anyway ("garbage is always in scope"); the fixed rule is that
+    // ONLY the admin `reconcile_all` pass may ever report it.
+    let root = dir.path().join("jammi_db");
+    let unattributed = root.join("pre_layout_table.parquet");
+    std::fs::write(&unattributed, b"pre-layout").unwrap();
+    std::fs::File::options()
+        .write(true)
+        .open(&unattributed)
+        .unwrap()
+        .set_modified(backdated)
+        .unwrap();
+
+    // `test_config`'s default `[lease] duration_secs` is 30; `apply=true`
+    // requires `grace >= ` it, so 30s is the shortest grace this fixture can
+    // use without also shrinking the store's lease config.
+    let grace = std::time::Duration::from_secs(30);
+
+    // Tenant B's own reconcile never sees A's table or A's stray object —
+    // both sit outside B's `{seg}/` prefix.
+    let report_b = engine
+        .with_tenant_scoped(tenant_b(), |_scope| async {
+            engine
+                .result_store()
+                .reconcile(ReconcileOptions { apply: true, grace })
+                .await
+        })
+        .await
+        .expect("tenant B's own reconcile must succeed");
+    assert!(report_b.rows_failed.is_empty(), "{report_b:?}");
+    assert!(
+        report_b.orphans.is_empty(),
+        "CROSS-TENANT DELETE: tenant B's own reconcile must never reap tenant A's stray \
+         object: {report_b:?}"
+    );
+    assert!(report_b.unattributed.is_empty(), "{report_b:?}");
+    assert!(
+        stray.exists(),
+        "tenant B's own reconcile must never touch tenant A's stray object"
+    );
+
+    // The admin pass reaps ONLY the stray and leaves A's live table intact.
+    let report_all = engine
+        .result_store()
+        .reconcile_all(ReconcileOptions { apply: true, grace })
+        .await
+        .expect("admin reconcile_all must succeed");
+    assert!(report_all.rows_failed.is_empty(), "{report_all:?}");
+    assert!(
+        report_all
+            .orphans
+            .iter()
+            .any(|o| o.ends_with("stray.parquet")),
+        "the admin pass must reap tenant A's stray object: {report_all:?}"
+    );
+    assert!(!stray.exists());
+    assert!(
+        report_all
+            .unattributed
+            .contains(&"pre_layout_table.parquet".to_string()),
+        "only the admin pass ever reports an unattributed key: {report_all:?}"
+    );
+    assert!(
+        unattributed.exists(),
+        "unattributed is reported but NEVER deleted, at any grace or apply"
+    );
+
+    let row = engine
+        .with_tenant_scoped(tenant_a(), |_scope| async {
+            engine.catalog().get_result_table(&table_name).await
+        })
+        .await
+        .expect("row read");
+    assert!(
+        row.is_some(),
+        "tenant A's live table must survive the admin reconcile_all pass"
+    );
+}
+
+/// RED first (esc-094 follow-up): a GLOBAL (`tenant_id IS NULL`) `building` row whose
+/// lease has expired must NEVER be claimed/failed/deleted by a TENANT-scoped
+/// `reconcile(apply=true)` — only the admin `reconcile_all` pass may ever
+/// touch it. Before the fix, the expired-building pre-pass's enumeration
+/// included GLOBAL rows under a non-admin binding (the ordinary
+/// "`tenant_id = $t OR tenant_id IS NULL`" read-scoping convention, safe for
+/// a read but not for the mutating claim/fail/delete this pre-pass performs),
+/// and `ResultTableCas::expired`'s `Strict` tenant arm renders against the
+/// ROW's OWN tenant — a tautology that can never refuse a GLOBAL row for any
+/// caller — so a tenant-bound caller's reconcile pass would claim (re-stamp
+/// the writer_id), then drive the row to a terminal state and delete its
+/// bytes, entirely outside its own tenant.
+#[tokio::test]
+async fn tenant_scoped_reconcile_never_touches_a_global_expired_building_row() {
+    use jammi_db::catalog::backend::{SqlValue, TxOptions};
+    use jammi_db::catalog::result_repo::CreateResultTableParams;
+    use jammi_db::catalog::status::ResultTableStatus;
+    use jammi_db::config::StoragePrecision;
+    use jammi_db::store::ReconcileOptions;
+
+    let dir = tempdir().unwrap();
+    let engine = Arc::new(
+        InferenceSession::new(test_config(dir.path()))
+            .await
+            .unwrap(),
+    );
+
+    // A GLOBAL `building` row (created with NO tenant scope in force) with
+    // real bytes on disk and an already-expired lease — forged directly, the
+    // same shape `expire_lease_by_hand` uses in the engine's own test suite.
+    let root = dir.path().join("jammi_db").join("_global");
+    std::fs::create_dir_all(&root).unwrap();
+    let table_name = "global_building_table".to_string();
+    let bytes_path = root.join(format!("{table_name}.parquet"));
+    std::fs::write(&bytes_path, b"global-building-bytes").unwrap();
+    let parquet_url = format!("file://{}", bytes_path.display());
+
+    engine
+        .catalog()
+        .create_result_table(CreateResultTableParams {
+            table_name: &table_name,
+            source_id: "global-src",
+            model_id: "global-model",
+            task: jammi_db::ModelTask::TextEmbedding,
+            kind: ResultTableKind::Model,
+            derived_from: None,
+            parquet_path: &parquet_url,
+            dimensions: Some(4),
+            key_column: Some("id"),
+            text_columns: None,
+            storage_precision: StoragePrecision::F32,
+            oversample: 4,
+            created_at: jammi_db::catalog::backend::now_sortable(),
+            writer_id: Some("writer-global-dead"),
+            lease: Some(std::time::Duration::from_secs(600)),
+        })
+        .await
+        .unwrap();
+    // Force the lease into the past by hand.
+    let name_for_forge = table_name.clone();
+    engine
+        .catalog()
+        .backend_arc()
+        .transaction(TxOptions::default(), |tx| {
+            Box::pin(async move {
+                tx.execute(
+                    "UPDATE result_tables SET lease_expires_at = '1970-01-01T00:00:00.000000Z' \
+                     WHERE table_name = $1",
+                    &[SqlValue::TextOwned(name_for_forge)],
+                )
+                .await
+            })
+        })
+        .await
+        .unwrap();
+
+    // Tenant B's own reconcile — `test_config`'s default `[lease]
+    // duration_secs` is 30, so `apply=true` requires `grace >= 30`.
+    engine
+        .with_tenant_scoped(tenant_b(), |_scope| async {
+            engine
+                .result_store()
+                .reconcile(ReconcileOptions {
+                    apply: true,
+                    grace: std::time::Duration::from_secs(30),
+                })
+                .await
+        })
+        .await
+        .expect("tenant B's own reconcile must succeed");
+
+    let after = jammi_db::tenant_scope::TenantBinding::admin_scope(
+        engine.catalog().get_result_table(&table_name),
+    )
+    .await
+    .unwrap()
+    .expect("the GLOBAL row must survive a tenant-scoped reconcile untouched");
+    assert_eq!(
+        after.status,
+        ResultTableStatus::Building.to_string(),
+        "CROSS-TENANT MUTATION: a tenant-scoped reconcile must never claim/fail a GLOBAL row"
+    );
+    assert_eq!(
+        after.writer_id.as_deref(),
+        Some("writer-global-dead"),
+        "the GLOBAL row's writer_id must never be re-stamped by a tenant-scoped pass"
+    );
+    assert!(
+        bytes_path.exists(),
+        "the GLOBAL row's bytes must survive a tenant-scoped reconcile untouched"
     );
 }
 
@@ -1872,16 +2124,8 @@ async fn assert_derives_from_isolated() {
 /// answer B gets is the gate working, not the fixture being empty.
 async fn assert_list_index_segments_isolated() {
     let (engine, session, table_name, _dir) = materialize_table_for_tenant_a().await;
-
-    // One segment on A's table, stamped with A's tenant (the parent's owner).
-    assert!(
-        engine
-            .catalog()
-            .insert_index_segment(&table_name, Some(tenant_a()), 0, "file:///idx/a-seg-0", 3,)
-            .await
-            .expect("insert index segment"),
-        "the segment row must land"
-    );
+    // The fixture appended one segment on A's table while it was `building`,
+    // stamped with A's tenant (the parent's owner).
 
     let a_seen = engine
         .with_tenant_scoped(tenant_a(), |_scope| {
@@ -2142,7 +2386,7 @@ async fn select_ids(session: &JammiSession, tenant: TenantId) -> Vec<i64> {
 /// another tenant's table scanned its full Parquet. This drives the fix end to
 /// end: two result tables of different verb kinds — an as-of-join spine+facts
 /// table and an embedding `_row_id`+vector table — are materialised under
-/// tenant A through the single `finalize_with_manifest` funnel, plus one GLOBAL
+/// tenant A through the single `BuildingTable::finish` funnel, plus one GLOBAL
 /// (unscoped) embedding table, then read back over `with_tenant_scoped(T, |s|
 /// s.sql("SELECT count(*) FROM \"jammi.<name>\""))` — the actual Flight `db.sql`
 /// path. The 3-arm control: A reads its own tables (N > 0); the GLOBAL table is
@@ -2236,7 +2480,7 @@ async fn assert_result_table_scan_isolated() {
 }
 
 /// Materialise an embedding (`_row_id` + `vector`) result table through the
-/// single `finalize_with_manifest` funnel into the engine's real (gated)
+/// single `BuildingTable::finish` funnel into the engine's real (gated)
 /// context, under whatever tenant scope is in effect at the call site. Returns
 /// its table name.
 async fn materialize_embedding_result_table(engine: &InferenceSession, source: &str) -> String {
@@ -2284,7 +2528,7 @@ async fn materialize_embedding_result_table(engine: &InferenceSession, source: &
         ],
     )
     .unwrap();
-    let mut writer = store.open_writer(&info.parquet_url, schema).await.unwrap();
+    let mut writer = store.open_writer(info.parquet_url(), schema).await.unwrap();
     writer.write_batch(&batch).await.unwrap();
     let rows = writer.close().await.unwrap();
 
@@ -2306,21 +2550,19 @@ async fn materialize_embedding_result_table(engine: &InferenceSession, source: &
             quantization: None,
         }],
     );
-    store
-        .finalize_with_manifest(
-            engine.context(),
-            &info.table_name,
-            &info.parquet_url,
-            rows,
-            Materialization::new(
-                &descriptor,
-                &env,
-                vec![InputAnchor::mutable_version(source, 1)],
-            ),
-        )
-        .await
-        .unwrap();
-    info.table_name
+    let table_name = info.table_name().to_string();
+    info.finish(
+        engine.context(),
+        rows,
+        Materialization::new(
+            &descriptor,
+            &env,
+            vec![InputAnchor::mutable_version(source, 1)],
+        ),
+    )
+    .await
+    .unwrap();
+    table_name
 }
 
 /// Materialise an as-of-join-shaped (spine + facts, no `tenant_id` column)
@@ -2368,7 +2610,7 @@ async fn materialize_asof_result_table(
         vec![Arc::new(symbol), Arc::new(ts), Arc::new(price)],
     )
     .unwrap();
-    let mut writer = store.open_writer(&info.parquet_url, schema).await.unwrap();
+    let mut writer = store.open_writer(info.parquet_url(), schema).await.unwrap();
     writer.write_batch(&batch).await.unwrap();
     let rows = writer.close().await.unwrap();
 
@@ -2387,24 +2629,22 @@ async fn materialize_asof_result_table(
     };
     let env = MaterializationEnv::new(ComputeDevice::Cpu, Vec::new());
     let now = chrono::Utc::now().to_rfc3339();
-    store
-        .finalize_with_manifest(
-            engine.context(),
-            &info.table_name,
-            &info.parquet_url,
-            rows,
-            Materialization::new(
-                &descriptor,
-                &env,
-                vec![
-                    InputAnchor::unpinned_at_instant(spine, now.clone()),
-                    InputAnchor::unpinned_at_instant(facts, now),
-                ],
-            ),
-        )
-        .await
-        .unwrap();
-    info.table_name
+    let table_name = info.table_name().to_string();
+    info.finish(
+        engine.context(),
+        rows,
+        Materialization::new(
+            &descriptor,
+            &env,
+            vec![
+                InputAnchor::unpinned_at_instant(spine, now.clone()),
+                InputAnchor::unpinned_at_instant(facts, now),
+            ],
+        ),
+    )
+    .await
+    .unwrap();
+    table_name
 }
 
 /// Scan `SELECT count(*) FROM "jammi.<table>"` under `tenant` through the real

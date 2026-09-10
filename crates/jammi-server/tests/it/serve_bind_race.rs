@@ -49,6 +49,7 @@ async fn transport_only_chain() -> (GrpcChain, TempDir) {
         tiers: TierSet::resolve(std::iter::empty()).expect("core-only tier set resolves"),
         metrics: Arc::new(MetricsRegistry::new().unwrap()),
         tenant_resolver: SessionIdTenantResolver::arc(store),
+        admin_authorizer: None,
     };
     (chain, dir)
 }

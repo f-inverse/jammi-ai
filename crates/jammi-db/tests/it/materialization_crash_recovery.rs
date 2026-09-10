@@ -3,7 +3,7 @@
 //! but its `.materialization.json` manifest has not yet been written and the
 //! `building -> ready` flip has not committed.
 //!
-//! [`ResultStore::finalize_with_manifest`] is the single `building -> ready`
+//! [`jammi_db::store::BuildingTable::finish`] is the single `building -> ready`
 //! boundary. It writes the manifest sidecar BEFORE the status flip (the same
 //! ordering the ANN sidecar uses), so a crash never leaves a `ready` table
 //! without a manifest. The hardest window is *before* the sidecar lands: a valid
@@ -13,7 +13,7 @@
 //!
 //! Mechanics mirror `mutable_crash_recovery.rs`: the parent respawns the test
 //! binary with `JAMMI_TEST_MATERIALIZATION_CHECKPOINT` set; the child drives
-//! `finalize_with_manifest`, whose test-hook fires after the Parquet is durable
+//! `finish`, whose test-hook fires after the lease renew and the Parquet is durable
 //! and before the manifest write, writes the ready file, and parks. The parent
 //! `SIGKILL`s, restarts on the same dir, runs `recover()`, and asserts the row
 //! is `failed` and the bytes reaped.
@@ -39,6 +39,17 @@ use jammi_db::store::ResultStore;
 use crate::common;
 
 const CHILD_MARKER_ENV: &str = "JAMMI_TEST_CRASH_CHILD";
+
+/// The lease the child's store holds its building row under: short, so the
+/// parent's recovery after the SIGKILL reclaims it within seconds.
+fn short_lease() -> jammi_db::catalog::lease::LeaseIntervals {
+    jammi_db::config::LeaseConfig {
+        duration_secs: 3,
+        heartbeat_secs: 1,
+    }
+    .intervals()
+    .unwrap()
+}
 const ARTIFACT_DIR_ENV: &str = "JAMMI_TEST_ARTIFACT_DIR";
 const TABLE_SOURCE: &str = "crash_docs";
 const DIMS: usize = 4;
@@ -79,12 +90,15 @@ async fn child_workload() {
         .await
         .expect("child session");
 
+    // A short lease so the parent's post-kill recovery sees the dead writer's
+    // row as reclaimable within seconds rather than the 30 s default.
     let store = ResultStore::new(
         &dir,
         Arc::clone(session.catalog()),
         AnnIndexConfig::default(),
     )
-    .unwrap();
+    .unwrap()
+    .with_lease_intervals(short_lease());
 
     let info = store
         .create_table(
@@ -124,7 +138,7 @@ async fn child_workload() {
         ],
     )
     .unwrap();
-    let mut writer = store.open_writer(&info.parquet_url, schema).await.unwrap();
+    let mut writer = store.open_writer(info.parquet_url(), schema).await.unwrap();
     writer.write_batch(&batch).await.unwrap();
     let rows = writer.close().await.unwrap();
 
@@ -142,18 +156,16 @@ async fn child_workload() {
         "1970-01-01T00:00:00Z",
     )];
 
-    // The hook fires inside finalize_with_manifest AFTER the Parquet is durable
-    // and BEFORE the manifest sidecar is written; it parks the child here.
-    store
-        .finalize_with_manifest(
-            session.context(),
-            &info.table_name,
-            &info.parquet_url,
-            rows,
-            jammi_db::store::manifest::Materialization::new(&descriptor, &env, inputs),
-        )
-        .await
-        .unwrap();
+    // The hook fires inside `finish` AFTER the lease renew and the Parquet
+    // bytes are durable and BEFORE the manifest sidecar is written; it parks
+    // the child here.
+    info.finish(
+        session.context(),
+        rows,
+        jammi_db::store::manifest::Materialization::new(&descriptor, &env, inputs),
+    )
+    .await
+    .unwrap();
 
     unreachable!("hook parks the child; SIGKILL is the only exit");
 }
@@ -214,8 +226,11 @@ async fn manifestless_parquet_is_reaped_under_sigkill() {
     );
     let _ = child.wait().await;
 
-    // Restart on the same dir and run the real recovery sweep. The torn row has
-    // a valid Parquet but no manifest, so recovery reaps it to `failed`.
+    // Restart on the same dir. The dead child's row is `building` under a
+    // lease that is still live for a few seconds: recovery must leave it
+    // alone until the lease expires (a live-lease row may belong to a writer
+    // that is merely slow), then reap it — a valid Parquet with no manifest
+    // goes to `failed`.
     let restart = JammiSession::new(common::test_config(dir.path()))
         .await
         .expect("restart session");
@@ -225,18 +240,37 @@ async fn manifestless_parquet_is_reaped_under_sigkill() {
         AnnIndexConfig::default(),
     )
     .unwrap();
-    store.recover().await.expect("recover after crash");
-
-    // Find the (single) crash-target row and assert it failed with no live bytes.
-    let building = restart
+    let building_before = restart
         .catalog()
         .list_result_tables_by_status(jammi_db::catalog::status::ResultTableStatus::Building)
         .await
         .unwrap();
-    assert!(
-        building.is_empty(),
-        "recovery left no row `building` — reconciliation is terminal"
+    assert_eq!(
+        building_before.len(),
+        1,
+        "precondition: the killed child left exactly one `building` row"
     );
+    assert!(
+        building_before[0].lease_expires_at.is_some(),
+        "precondition: the row carries the dead writer's lease"
+    );
+    let reap_deadline = Instant::now() + Duration::from_secs(20);
+    loop {
+        store.recover().await.expect("recover after crash");
+        let building = restart
+            .catalog()
+            .list_result_tables_by_status(jammi_db::catalog::status::ResultTableStatus::Building)
+            .await
+            .unwrap();
+        if building.is_empty() {
+            break;
+        }
+        assert!(
+            Instant::now() < reap_deadline,
+            "recovery never reaped the dead writer's row once its lease expired"
+        );
+        tokio::time::sleep(Duration::from_millis(250)).await;
+    }
     let failed = restart
         .catalog()
         .list_result_tables_by_status(jammi_db::catalog::status::ResultTableStatus::Failed)

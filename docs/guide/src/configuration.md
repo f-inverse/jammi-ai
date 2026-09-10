@@ -103,6 +103,17 @@ default_batch_size = 8
 # Checkpoint every N fraction of training. Default: 0.1.
 checkpoint_fraction = 0.1
 
+[lease]
+# The one lease timing every leased catalog row shares: a claimed training
+# job and a `building` result table are both owned under a lease their holder
+# heartbeats, and both are reclaimed by a sweep once it expires.
+# How long a claim owns its row before it is reclaimable. Default: 30.
+duration_secs = 30
+# How often the holder renews the lease. Must leave a real margin under the
+# lease (heartbeat_secs * 2 < duration_secs), so a single missed beat does
+# not drop a live holder's lease. Default: 10.
+heartbeat_secs = 10
+
 [training]
 # Whether THIS process runs the training claim loop. Default: true.
 # true  - the process claims queued jobs, renews the lease while they run,
@@ -114,14 +125,11 @@ checkpoint_fraction = 0.1
 #         catalog before that one can open it; a Postgres catalog is
 #         multi-process and can run both at once.
 run_worker = true
-# How long a claim leases a job before it is reclaimable. Default: 30.
-lease_duration_secs = 30
-# How often the worker renews the lease while a job runs. Must leave a real
-# margin under the lease (heartbeat_interval_secs * 2 < lease_duration_secs),
-# so a single missed beat does not drop a live worker's lease. Default: 10.
-heartbeat_interval_secs = 10
 # How often an idle worker polls for a queued job (and reclaims expired
 # leases). Must be > 0 - a zero poll is a busy-loop. Default: 1.
+# The lease a claim is held under is `[lease]` above; a `[training]` section
+# still naming the former `lease_duration_secs` / `heartbeat_interval_secs`
+# keys is refused at load (no alias), never silently defaulted.
 idle_poll_secs = 1
 
 [cache]

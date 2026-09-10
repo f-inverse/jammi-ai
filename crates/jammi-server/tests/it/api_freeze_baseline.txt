@@ -51,6 +51,11 @@ RPC CatalogService/ListModels
 RPC CatalogService/ListMutableTables
 RPC CatalogService/ListSources
 RPC CatalogService/ListTopics
+# ADDED (additive, minor-compatible): the catalog↔object-store cross-check
+# (dry-run reporting by default; `apply=true` reclaims drift). `all=true`'s
+# cross-tenant admin pass is gated wire-side by a deployment-supplied
+# AdminAuthorizer (refused by the shipped default).
+RPC CatalogService/Reconcile
 RPC CatalogService/RegisterChannel
 RPC CatalogService/RegisterTopic
 RPC CatalogService/RemoveSource

@@ -76,12 +76,56 @@ message JammiErrorDetail {
     StringError channel_assembly = 16;
     ModelReferencedError model_referenced = 17;
     ModelNotFoundError model_not_found = 18;
+    RowGoneError row_gone = 19;
+    TenantMismatchError tenant_mismatch = 20;
+    LeaseLostError lease_lost = 21;
+    CasFailedError cas_failed = 22;
+    SourceBusyError source_busy = 23;
   }
   // Tag 15 / `model_retired` are reserved: the wire surface must never reuse a
   // retired field number or name, so a peer built against either contract reads
   // an unknown field rather than a silently-reinterpreted one.
   reserved 15;
   reserved "model_retired";
+}
+
+// `JammiError::RowGone { table }`. A building-row compare-and-set matched no
+// row because the row is gone; deletes nothing. Maps to `NotFound`.
+message RowGoneError {
+  string table = 1;
+}
+
+// `JammiError::TenantMismatch { table }`. A building-row compare-and-set
+// matched no row because the row belongs to another tenant (only possible
+// under a non-admin binding); never deletes. Maps to `PermissionDenied`.
+message TenantMismatchError {
+  string table = 1;
+}
+
+// `JammiError::LeaseLost { table }`. A building-row compare-and-set matched
+// no row because the row's lease was claimed by another writer; the caller
+// deletes nothing. Maps to `Aborted` (a retryable conflict, not a permanent
+// precondition failure).
+message LeaseLostError {
+  string table = 1;
+}
+
+// `JammiError::CasFailed { table, status }`. A building-row compare-and-set
+// matched no row because the row already left `building`; never re-promotes,
+// never deletes. Maps to `Aborted` (the same retryable-conflict family as
+// `LeaseLost` — the caller's view of the row was stale).
+message CasFailedError {
+  string table = 1;
+  string status = 2;
+}
+
+// `JammiError::SourceBusy { source_id, table }`. A source delete was refused
+// because a live-lease `building` row still references it. Maps to
+// `FailedPrecondition` — a retry once the writer finishes or its lease
+// expires.
+message SourceBusyError {
+  string source_id = 1;
+  string table = 2;
 }
 
 // `JammiError::ChannelCatalog(ChannelCatalogError)`. The inner taxonomy is

@@ -110,12 +110,16 @@ impl InferenceSession {
     ) -> Result<Self> {
         let inner = Arc::new(inner);
         let catalog = Arc::clone(inner.catalog());
-        // The artifact store is built first so the resolver can reload
-        // fine-tuned adapters through it: a fine-tuned model's catalog
-        // `artifact_path` is an object-store prefix, fetched into a local cache
-        // before candle loads it, so an adapter trained on one host serves on
-        // another.
-        let artifact_store = Arc::new(build_artifact_store(&inner)?);
+        // The result store is built first: it owns the session's
+        // `ArtifactStore` internally (rooted at `{result_store_root}/models`,
+        // one storage knob serving both), so the resolver reads that SAME
+        // handle rather than a second store independently constructed at a
+        // root that could disagree with it. A fine-tuned model's catalog
+        // `artifact_path` is an object-store prefix, fetched into a local
+        // cache before candle loads it, so an adapter trained on one host
+        // serves on another.
+        let result_store = Arc::new(build_result_store(&inner, Arc::clone(&catalog))?);
+        let artifact_store = result_store.artifact_store();
         // The K4 choke point (esc-096): `[models]` -> `HubSource`, exactly
         // once per session. Every downstream Hub call (the resolver's
         // HuggingFace arm, the fine-tune worker's HF fallback) shares this
@@ -133,7 +137,6 @@ impl InferenceSession {
             device_config.memory_fraction,
         ));
         let model_cache = Arc::new(ModelCache::new(resolver, device_config.clone(), scheduler));
-        let result_store = Arc::new(build_result_store(&inner, Arc::clone(&catalog))?);
         // Install the tenant-gating result-table schema as the context's
         // default schema before any table is loaded, so bare `jammi.{name}`
         // resolutions honour the catalog owner on every read lane and source
@@ -972,7 +975,7 @@ impl InferenceSession {
 
         // Persist results to Parquet
         if !batches.is_empty() {
-            let table_info = self
+            let building = self
                 .result_store
                 .create_table(
                     source_id,
@@ -988,20 +991,21 @@ impl InferenceSession {
             let schema = batches[0].schema();
             let mut writer = self
                 .result_store
-                .open_writer(&table_info.parquet_url, schema)
+                .open_writer(building.parquet_url(), schema)
                 .await?;
             for batch in &batches {
                 writer.write_batch(batch).await?;
             }
             let row_count = writer.close().await?;
 
-            // Finalize with the contract built at the top (the same definition +
-            // anchors the cache probe keyed on).
-            self.result_store
-                .finalize_with_manifest(
+            // Finish with the contract built at the top (the same definition +
+            // anchors the cache probe keyed on). Every `?` above unwinds
+            // through the handle's Drop (a best-effort `building -> failed`
+            // CAS, no byte deletion); `finish` is the single `building ->
+            // ready` funnel, renewing the writer's lease before it attests.
+            building
+                .finish(
                     self.inner.context(),
-                    &table_info.table_name,
-                    &table_info.parquet_url,
                     row_count,
                     jammi_db::store::manifest::Materialization::new(&descriptor, &env, inputs),
                 )
@@ -1508,54 +1512,33 @@ fn build_result_store(
     catalog: Arc<jammi_db::catalog::Catalog>,
 ) -> Result<ResultStore> {
     let ann = inner.config().embedding.ann;
-    match inner.config().storage.result_root.as_deref() {
+    // The one lease timing every leased row shares: the store's building
+    // tables are held under the same `[lease]` the training worker uses.
+    let lease = inner.config().lease.intervals()?;
+    let store = match inner.config().storage.result_root.as_deref() {
         Some(root) => {
             let root = jammi_db::storage::StorageUrl::parse(root)?;
-            // The ANN segment cache is always local (USearch reads the local
-            // filesystem) even when the result root is a cloud scheme — rooted
-            // beside the model-artifact cache under the local artifact dir.
-            let cache_root = inner
-                .config()
-                .artifact_dir
-                .join("jammi_db")
-                .join("index_cache");
-            ResultStore::with_root(root, inner.storage_registry(), catalog, ann, cache_root)
+            // `local_cache_dir` is the PARENT of the two local caches
+            // `ResultStore::with_root` derives (`{local_cache_dir}/index` —
+            // the ANN segment cache, always local since USearch reads the
+            // local filesystem even when `root` is a cloud scheme — and
+            // `{local_cache_dir}/artifact`, the model-artifact fetch cache
+            // its own internal `ArtifactStore` uses). Rooted under the local
+            // artifact dir's `cache/` sub-prefix: relocated OUT of the
+            // `jammi_db/` result-table root so a `reconcile`/backup pass over
+            // that root never walks scratch cache state.
+            let local_cache_dir = inner.config().artifact_dir.join("cache");
+            ResultStore::with_root(
+                root,
+                inner.storage_registry(),
+                catalog,
+                ann,
+                local_cache_dir,
+            )
         }
         None => ResultStore::new(inner.config().artifact_dir.as_path(), catalog, ann),
-    }
-}
-
-/// Construct the session's [`ArtifactStore`], rooting model artifacts under the
-/// same storage as result tables.
-///
-/// Model artifacts live under a `models/` sub-prefix of the configured
-/// `storage.result_root` — one storage knob serves both result tables and
-/// trained models, so an `s3://` / `r2://` root gives a worker fleet a shared
-/// place to write and reload models across hosts. When `result_root` is unset,
-/// artifacts root at `{artifact_dir}/jammi_db/models/`, mirroring the result
-/// store's local fallback. The registry is shared with the session so cloud
-/// credentials are registered once. The local fetch cache (where cloud
-/// artifacts are materialised for candle to mmap) lives under
-/// `{artifact_dir}/jammi_db/artifact_cache`.
-fn build_artifact_store(inner: &JammiSession) -> Result<ArtifactStore> {
-    let models_root = match inner.config().storage.result_root.as_deref() {
-        Some(root) => {
-            let trimmed = root.trim_end_matches('/');
-            jammi_db::storage::StorageUrl::parse(&format!("{trimmed}/models"))?
-        }
-        None => {
-            let local = inner.config().artifact_dir.join("jammi_db").join("models");
-            jammi_db::storage::StorageUrl::parse(local.to_str().ok_or_else(|| {
-                JammiError::Config("Non-UTF8 artifact_dir for artifact store".into())
-            })?)?
-        }
-    };
-    let cache_root = inner
-        .config()
-        .artifact_dir
-        .join("jammi_db")
-        .join("artifact_cache");
-    ArtifactStore::with_root(models_root, inner.storage_registry(), cache_root)
+    }?;
+    Ok(store.with_lease_intervals(lease))
 }
 
 /// The `loss_type` string persisted on a fine-tune job — a human-readable tag of

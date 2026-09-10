@@ -732,6 +732,17 @@ pub enum BackendError {
         expected: Option<TenantId>,
         got: Option<TenantId>,
     },
+    /// A transaction-internal refusal sentinel: return this from a
+    /// [`CatalogBackend::transaction`] closure to force a ROLLBACK of every
+    /// write the closure already issued, naming the row that made the whole
+    /// batch unsafe to commit. `.await?`-ing the transaction call would
+    /// otherwise fold this into the generic [`crate::error::JammiError::BackendDriver`]
+    /// arm; a caller that needs the typed refusal (e.g.
+    /// [`crate::catalog::Catalog::delete_result_tables_for_source`]'s
+    /// `SourceBusy`) matches on `Err(BackendError::Busy(_))` BEFORE applying
+    /// `?`/`.into()` to the transaction's result.
+    #[error("busy: {0}")]
+    Busy(String),
     #[error("sqlx backend error: {0}")]
     Sqlx(#[from] sqlx::Error),
 }

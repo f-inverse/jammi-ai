@@ -78,6 +78,7 @@ pub async fn serve_flight_with_catalog_service(
             store,
             crate::tiers::TierSet::resolve(std::iter::empty())?,
             None,
+            None,
         )));
 
     tracing::info!(

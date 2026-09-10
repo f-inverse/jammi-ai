@@ -50,11 +50,11 @@ async fn inference_session_roots_result_tables_at_configured_memory_root() {
         .await
         .unwrap();
     assert!(
-        info.parquet_url
+        info.parquet_url()
             .as_str()
             .starts_with("memory:///jammi_results/"),
         "result table not rooted at the configured memory root: {}",
-        info.parquet_url
+        info.parquet_url()
     );
 
     let schema = Arc::new(Schema::new(vec![Field::new("id", DataType::Utf8, false)]));
@@ -64,7 +64,7 @@ async fn inference_session_roots_result_tables_at_configured_memory_root() {
     )
     .unwrap();
     let mut writer = store
-        .open_writer(&info.parquet_url, Arc::clone(&schema))
+        .open_writer(info.parquet_url(), Arc::clone(&schema))
         .await
         .unwrap();
     writer.write_batch(&batch).await.unwrap();
@@ -133,7 +133,7 @@ async fn artifact_written_on_host_a_is_loadable_on_host_b() {
         ),
     ];
     let prefix = store_a
-        .put_artifact(&["job-x", "worker-a", "0"], &files)
+        .put_artifact(None, &["job-x", "worker-a", "0"], &files)
         .await
         .unwrap();
 

@@ -20,7 +20,8 @@
 # which Claude Code treats as non-blocking and would silently make this a
 # norm again, not a gate).
 #
-# POSIX sh. No git subprocess (hot-path speed, §C5).
+# POSIX sh. git only in the R3 relay arm, bounded (§C5 amended by esc-097) —
+# never on this wrapper's own hot path; see lead-gate-lib.py's module doc.
 
 set -u
 

@@ -71,6 +71,89 @@ them supplies them above the engine.
   line the [Design Philosophy](./philosophy.md) draws around load balancing,
   ingress, and orchestration.
 
+## Transport encryption is the deployer's runtime, not the engine's
+
+The engine speaks plaintext gRPC and Flight SQL and ships no TLS code
+path; transport encryption is the deployer's runtime. It follows from the
+same primitives this page and the [Design Philosophy](./philosophy.md)
+already state:
+
+- **B4 ("one binary, every topology") constrains what the *engine* forks
+  on, not what fronts it.** Terminating TLS is supplied by the runtime the
+  engine deploys into — a proxy, a mesh sidecar, a load balancer — and that
+  termination is not a topology-specific code path the engine would need to
+  special-case per shape. A `tls` cargo feature would itself be the kind of
+  server-only gate B4 refuses: a build-time fork between "the engine" and
+  "the engine, but for a server."
+- **Passing the discipline test is necessary, not sufficient.** A user who
+  has never heard of any consumer does want the wire encrypted — TLS passes
+  the [discipline test](./philosophy.md#the-discipline-test) on its own. But
+  the boundary table and the paragraph that follows it
+  (`docs/guide/src/philosophy.md:116-125`) are the second gate: TLS,
+  secrets, IAM, ingress, and load balancing all pass the
+  discipline test and are *still* placed in the consumer's runtime, not the
+  engine, because the table asks a second question the discipline test does
+  not — does owning this turn the engine into infrastructure it isn't. TLS
+  termination answers yes.
+- **A `[server] tls` key, in the file or the environment, is a typed
+  refusal, not a silent no-op.** `ServerConfig` — what `[server]`
+  deserializes into — is a `#[serde(default, deny_unknown_fields)]` struct
+  (`crates/jammi-db/src/config/mod.rs:1123`), the same discipline
+  `JammiConfig` itself carries at its top level
+  (`crates/jammi-db/src/config/mod.rs:204`). A `[server] tls = …` stanza in
+  a config file, and `JAMMI_SERVER__TLS` in the environment, are not
+  silently ignored — each is a typed `JammiError::Config` startup refusal,
+  naming the unrecognised key.
+- **There is no engine-side certificate to hand the `TenantResolver` seam.**
+  Because termination happens outside the engine, the engine never sees a
+  peer certificate to map onto a tenant — that mapping, if a deployment
+  wants one, lives in the terminator or the proxy in front, not at the
+  seam described under [The identity seam](./deploy-server.md#the-identity-seam).
+  The CLI's `--target` refuses `grpcs://` and `https://` with a typed error
+  naming the accepted schemes (`crates/jammi-cli/src/main.rs:170-187`; the
+  CHANGELOG's "drop `grpcs://` and `https://` as accepted `--target`
+  schemes" entry (#480), commit `616bb6d4`) rather than advertising a
+  transport it cannot speak
+  — put a TLS-terminating proxy in front and point `--target` at it in
+  plaintext (`grpc://`/`http://`). This is an asymmetry between the two
+  clients: the Python SDK's `RemoteTarget` legitimately keeps
+  `grpcs://`/`https://` in its own scheme table
+  (`clients/python/jammi/_target.py:51-54`) because it is a general client
+  library reaching whatever endpoint a deployment publishes (including a
+  TLS-terminating proxy), while the CLI is the engine's own admin surface
+  and names only the schemes the engine itself speaks.
+
+**Shape B with no mesh** — an on-prem single-tenant deployment that has no
+ingress or mesh to terminate TLS for it — still gets encryption: put a
+terminator in front of the engine's plaintext listeners. A minimal,
+consumer-neutral example with Caddy:
+
+```text
+# Caddyfile — terminates TLS and forwards plaintext to the engine's
+# loopback-bound listeners (see docker-compose.yml).
+#
+# `tls internal` issues Caddy's own locally-trusted certificate: a private
+# DNS name (no public record) has no ACME challenge path to a public CA,
+# so automatic Let's Encrypt/ZeroSSL issuance is not an option here.
+jammi.example.com {
+    tls internal
+    reverse_proxy h2c://127.0.0.1:8081  # gRPC + Flight SQL
+}
+health.jammi.example.com {
+    tls internal
+    reverse_proxy 127.0.0.1:8080        # /healthz, /readyz, /metrics
+}
+```
+
+The reference [`deploy/docker-compose.yml`](https://github.com/f-inverse/jammi-ai/blob/main/deploy/docker-compose.yml)
+binds its published ports to `127.0.0.1` for exactly this shape: the
+compose stack publishes the engine's ports for a terminator running on the
+same host to reach, not for direct exposure to an untrusted network. A
+terminator running as a container on the same Compose network instead
+reaches the engine by its service name rather than `127.0.0.1` —
+`reverse_proxy h2c://jammi-server:8081` — since two containers on the same
+Compose network share that network, not the host's loopback interface.
+
 ## The trusted-network assumption
 
 Every Jammi deployment that uses the default `SessionIdTenantResolver` assumes a

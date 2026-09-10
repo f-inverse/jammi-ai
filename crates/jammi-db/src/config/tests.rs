@@ -2045,6 +2045,30 @@ fn models_config_unknown_key_is_refused() {
     }
 }
 
+#[test]
+fn unknown_server_key_such_as_tls_is_a_typed_load_error() {
+    // `ServerConfig` carries no TLS knob at all — the engine has no
+    // certificate/key/termination config of its own (security.md's
+    // "no silent plaintext fallback" claim). `#[serde(deny_unknown_fields)]`
+    // on `ServerConfig` is the oracle backing that claim: a `[server] tls`
+    // stanza must fail closed at load time, naming the offending path,
+    // never silently drop the unrecognised section and boot plaintext.
+    let toml_src = r#"
+        [server]
+        tls = { cert_path = "x" }
+    "#;
+    let err = JammiConfig::parse_from(toml_src, std::iter::empty()).unwrap_err();
+    match err {
+        JammiError::Config(msg) => {
+            assert!(
+                msg.contains("server.tls"),
+                "expected the error to name `server.tls`, got: {msg}"
+            );
+        }
+        other => panic!("expected JammiError::Config, got {other:?}"),
+    }
+}
+
 // ── Top-level field namespace (T5) ────────────────────────────────────────
 
 #[test]

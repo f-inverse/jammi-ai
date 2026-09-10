@@ -1,195 +1,206 @@
-# UNITS — per-unit phase-2 contracts (#500)
+# UNITS — per-unit phase-2 contracts (#500), v2
 
-Each unit: `files_in_scope` (write-owner in parentheses), `invariants_to_preserve` (constitution
-IDs), `acceptance` (the feature RED oracle: RED at the base commit, GREEN on the branch, asserts
-the criterion not an implementation detail), `lane`, `depends_on`, `size` (S/M/L/XL by blast
-radius, not calendar). Full CI gate for every commit: the verbatim step list of `ci.yml`
-(hermetic + clippy gated-surface matrix) with per-step `$?`, never a subset. Naming per
-README ruling 19.
-
----
+Each unit: `files_in_scope` (write-owner), `invariants_to_preserve`, `acceptance` (RED at the
+base commit, GREEN on the branch, asserting a criterion), `lane`, `depends_on`, `size` (S/M/L/XL
+by blast radius). Full CI gate for every commit: the verbatim step list of `ci.yml` with
+per-step `$?`. Naming per README ruling 23.
 
 ## U1 — DataFusion 54 line upgrade (PR-A, alone)
 
-- **files_in_scope** (docs-ci for the shared manifests; db, ai-core, wire-server, python, cli,
-  bench for compile fixes in their crates): `Cargo.toml` (workspace pins: `datafusion 54`,
+- **files_in_scope**: (docs-ci) `Cargo.toml` workspace pins — `datafusion 54`,
   `arrow`/`arrow-array`/`arrow-schema`/`arrow-ipc`/`arrow-flight`/`parquet 58`, `object_store
-  0.13`, `datafusion-federation 0.5.5`, `datafusion-flight-sql-server 0.4.18`,
-  `datafusion-table-providers 0.13`, `pyo3-arrow` to the arrow-58 line), `Cargo.lock`, every
-  `crates/*/src/**` site the API bump breaks, `deny.toml` if licenses move.
-- **invariants_to_preserve**: B6 (one PR, workspace-atomic), K6 (lockstep version bump), K4
-  (`crates/jammi-server/tests/it/grpc_remote_session.rs` stays green), B5
-  (`TenantScopeAnalyzerRule` semantics unchanged under the new analyzer API), K1 (replay arms
-  compile unchanged).
-- **acceptance**: a test asserting `datafusion::DATAFUSION_VERSION` begins with `54` (RED at
-  base); cookbook 6.5 re-emit shows zero golden divergence; the gated-surface clippy matrix is
-  green; `cargo tree -d` shows one `arrow` and one `datafusion` line.
-- **lane**: hermetic + cookbook; `distributed.yml` dispatched manually once before merge.
-- **depends_on**: —. **size**: L (touches every crate; mechanical).
-- **risk**: `pyo3-arrow` may lag arrow 58 — if so, pin the newest compatible and record it in
-  the unit's ledger; `datafusion-federation` analyzer trait changes at 0.5.x.
+  0.13`, `datafusion-federation 0.5.5`, `datafusion-flight-sql-server 0.4.18`, `pyo3-arrow` to the
+  arrow-58 line; `Cargo.lock`; `deny.toml`; `.github/workflows/ci.yml` — a NEW step
+  `cargo clippy -p jammi-db --features postgres,mysql --all-targets -- -D warnings` registered
+  with `ci/scripts/check_lint_surface_closure.py`. (db) `crates/jammi-db/Cargo.toml:55`
+  `datafusion-table-providers` 0.10.1 → 0.13 and its compat surface: `PostgresTableFactory`,
+  `PostgresConnectionPool` (`source/postgres.rs:10-11`), `MySQLTableFactory`,
+  `MySQLConnectionPool` (`source/mysql.rs:10-11`); `tenant_scope.rs` analyzer API. (ai-core,
+  wire-server, python, cli, bench) compile fixes in their crates.
+- **invariants_to_preserve**: B6, K6, K4 (`grpc_remote_session.rs` green), B5, K1.
+- **acceptance**: workspace gate green including the new db-features clippy step (RED at
+  base: the step does not exist and the features do not compile on 54); cookbook 6.5 zero
+  divergence; `cargo tree -d` shows one `arrow` and one `datafusion` line; a
+  `DATAFUSION_VERSION` guard test (guard, not the oracle).
+- **lane**: hermetic + cookbook; `distributed.yml` dispatched manually before merge.
+- **depends_on**: S3 (sizes it). **size**: L if S3 compiles with local fixes only; XL otherwise.
 
-## U2 — Training set as a producer; streaming loader; partition rule (PR-B commit 1)
-
-- **files_in_scope** (db): `crates/jammi-db/src/store/manifest.rs` (`ProducingDescriptor::
-  TrainingSet`, `canonical_bytes`), `crates/jammi-db/src/catalog/result_repo.rs`
-  (`ResultTableKind::TrainingSet`), `crates/jammi-db/src/store/mod.rs` (writer row-group
-  sizing), tests. (ai-core): `crates/jammi-ai/src/fine_tune/{data.rs, worker.rs, trainer.rs,
-  graph_sampler.rs}` (materialize → stream; per-batch converters; `PartitionSpec {rank, world,
-  batch, rule}`; row-count-driven `batches_per_epoch`), `crates/jammi-ai/src/pipeline/recompute.rs`
-  (replay arm: re-materialize), `crates/jammi-ai/src/fine_tune/regression_loss.rs`
-  (`TargetScaler` from the manifest), tests + the cookbook fixture golden.
-- **invariants_to_preserve**: K1 (new variant → replay arm), K7 (descriptor completeness:
-  source anchors, columns, task, format, order rule), K3 (scaler persisted in data space), K2
-  (typed refusal on an empty training set, a partition with zero rows, `world > rows/batch`),
-  B1/B2 (naming), B6.
-- **acceptance**: (a) `fine_tune` on the cookbook fixture creates a `TrainingSet` result table
-  with a definition hash and attestation (RED at base: no such kind exists); (b) the trainer's
-  resident-row high-water mark during an epoch ≤ `batch × prefetch` on a fixture larger than
-  that bound (RED at base: the whole set is resident); (c) refactor parity — adapter bytes
-  identical to the base commit's on the fixture (cookbook golden); (d) partition-rule test: for
-  W ∈ {1,2,4}, the multiset of rows over ranks at each global step t equals the W=1 batch t.
-- **lane**: hermetic + cookbook. **depends_on**: U1. **size**: XL (every head constructor).
-
-## U3 — Model as a producer; migration 029; cache reuse (PR-B commit 2, concurrent with U4)
-
-- **files_in_scope** (db): `crates/jammi-db/src/store/manifest.rs` (`ProducingDescriptor::
-  FineTune`, `MaterializationEnv` kernel-profile field), `crates/jammi-db/src/catalog/{schema.rs,
-  migrations.rs}` (029 `model_materialization`), `crates/jammi-db/src/catalog/model_repo.rs`
-  (columns; `probe_model_by_definition`), `crates/jammi-db/src/store/artifact.rs` (manifest
-  written last), `crates/jammi-db/tests/it/migrations.rs`. (ai-core): `crates/jammi-ai/src/fine_tune/
-  worker.rs` (`publish_and_finalize` writes the materialization; `CachePolicy::Use` probe before
-  training), `crates/jammi-ai/src/pipeline/recompute.rs` (arm = retrain), `crates/jammi-ai/src/
-  model/resolver.rs` (unchanged handle; manifest surfaced on `ModelRecord`).
-- **invariants_to_preserve**: K5 (029 appended, names unique), K7 (the DESIGN §3 table is a
-  test: every field flips the hash), K1, B6, B1 (no `register_*` pub items).
-- **acceptance**: (a) submitting the same spec twice against the same training-set digest with
-  `CachePolicy::Use` runs the trainer once and returns the existing model (RED at base: no
-  probe exists); (b) per-field completeness test over the DESIGN §3 table (RED at base: no
-  descriptor); (c) `migrations.rs` append-only test admits 029.
-- **lane**: hermetic. **depends_on**: U2 (training-set digest is an anchor). **size**: M.
-
-## U4 — `Collective` trait; device-plural session; single-node gang (PR-B commit 3)
-
-- **files_in_scope** (ai-core): new `crates/jammi-ai/src/fine_tune/collective/{mod.rs, noop.rs,
-  local.rs, nccl.rs}`, `crates/jammi-ai/src/fine_tune/{trainer.rs (RankContext, reduce at step
-  boundary, rank-0-only checkpoint/publish), optimizer.rs (count-weighted mean), worker.rs
-  (spawn W local ranks), spec.rs (`TrainingCommon.world_size`)}`, `crates/jammi-ai/src/model/
-  {cache.rs (key gains device), backend/mod.rs (DeviceConfig plural)}`, `crates/jammi-ai/src/
-  concurrency/gpu_scheduler.rs` (per-device), `crates/jammi-ai/src/session.rs` (device-plural),
-  `crates/jammi-ai/Cargo.toml` (`cuda` feature adds `candle-core/nccl`, `candle-nn` unchanged).
-  (db): `crates/jammi-db/src/config/mod.rs` (`[gpu] devices`, `[training] world_size /
-  collective`), config tests. (numerics, read-only consult): reduction-order determinism note.
-- **invariants_to_preserve**: B4 (one trainer, no cfg fork; W=1 through `Noop`), K7 (world size,
-  rule version, collective backend in the hash — lands with U3), K2 (world > devices refused;
-  `nccl` requested without CUDA refused with a typed error), K4 (unchanged remote parity suite),
-  B6.
-- **acceptance** (hermetic, CPU, `Local`): (a) W=2 twice → identical adapter bytes (RED at base:
-  no W); (b) W=2 × B versus W=1 × 2B → per-step loss within ε on the fixture, ε pre-registered
-  from the fixture's measured fp spread (RED at base); (c) W=1 through `Noop` byte-identical to
-  U2's golden. (gpu-gang pod leg, `Nccl`, 2×A100): (a) and (b) again, plus a committed artifact
-  passing `check_cuda_run_artifacts.py`.
-- **lane**: hermetic + gpu-gang pod leg (U7a). **depends_on**: U2 (partition rule), S1.
-  **size**: L.
-
-## U5 — `GangService`; coordinator; multi-node gang; chaos (PR-C commit 1)
-
-- **files_in_scope** (wire-server): `crates/jammi-wire/proto/jammi/v1/gang.proto`
-  (`GangService { RunRank(RankAssignment) returns (stream RankEvent); FetchPartition(PartitionRequest)
-  returns (stream ArrowIpc); }`), `crates/jammi-wire/src/{lib.rs, gang.rs}` (typed conversions),
-  `crates/jammi-server/src/grpc/gang.rs` (service impl; tenant-scoped mount in
-  `crates/jammi-server/src/runtime.rs` via `mount_tenant_scoped`; request bounds per #485),
-  `crates/jammi-server/tests/it/gang_remote_parity.rs`. (ai-core): `crates/jammi-ai/src/fine_tune/
-  collective/peer.rs`, `crates/jammi-ai/src/fine_tune/{worker.rs (coordinator: peer resolution,
-  NCCL id mint, dispatch, watchdog, attempt abort), trainer.rs (heartbeat hook)}`, `crates/jammi-ai/
-  tests/distributed/{harness.rs (peer TOML, `[training] peers`), gang_deterministic.rs,
-  gang_chaos.rs}`, `.github/workflows/distributed.yml` (two new test names in the matrix).
-  (db): `crates/jammi-db/src/config/mod.rs` (`peers`, `rank_timeout_secs`).
-- **invariants_to_preserve**: K4 (real: W=1 via the gang path == embedded bytes), B5
-  (tenant-scoped mount; a peer serves only the job's tenant), B4 (the library can run a gang
-  in-process with `Local`; the server adds a transport, not a capability), K2 (typed refusal
-  when `peers.len() + 1 < world_size`, on timeout), B1 (no `stage`/`register` stems), B6.
-- **acceptance**: (a) server it-suite: W=1 coordinator dispatching to itself produces bytes
-  identical to the in-process trainer (RED at base: no service); (b) distributed deterministic
-  leg: 2 processes, W=2, `Peer` collective → bytes identical to the single-process W=2 `Local`
-  run (RED at base); (c) chaos leg: SIGKILL a peer mid-epoch → job requeued with `attempts+1`,
-  completed by a new gang resuming from the checkpoint, `list_models` shows exactly one model,
-  no orphan attempt prefix promoted (RED at base); SIGKILL the coordinator → same via lease
-  expiry; (d) gpu-gang cluster leg: 2 pods × 2 GPUs, W=4, `Nccl` with `Comm::from_rank` →
-  reproducibility (two runs identical) + committed artifact.
-- **lane**: hermetic (unit tests) + distributed nightly (deterministic leg required green before
-  merge; chaos advisory as today) + gpu-gang cluster leg (U7b). **depends_on**: U4. **size**: XL.
-
-## U6 — Partition-aware inference operator; distributed frozen forward (PR-C commit 2, concurrent with U5)
-
-- **files_in_scope** (ai-core): `crates/jammi-ai/src/operator/inference_exec.rs`
-  (`properties()` inherits input partitioning; `benefits_from_input_partitioning`),
-  `crates/jammi-ai/src/operator/runner.rs` (model guard per partition, one load per process),
-  `crates/jammi-ai/src/pipeline/embedding.rs` (stream into `ResultSink`, no `collect`; optional
-  fan-out through `FetchPartition`), `crates/jammi-ai/src/fine_tune/worker.rs` (head target:
-  features from the embedding table over the training set), tests incl. a multi-partition
-  byte-parity test. (db): `crates/jammi-db/src/store/result_sink.rs` (partition-ordered append).
-- **invariants_to_preserve**: K4 (multi-partition table == single-partition table, bytes; row
-  order by partition index then row), K1 (no descriptor change), B3 (features consumed by the
-  head via the SQL surface, no vector verb), B6.
-- **acceptance**: (a) an embedding table produced with 4 input partitions is byte-identical to
-  the 1-partition table on the fixture (RED at base: `UnknownPartitioning(1)` makes the 4-partition
-  plan degenerate); (b) resident batches during production ≤ a bound (RED at base: `collect`);
-  (c) distributed leg: 2 workers each compute a disjoint half via `FetchPartition` and the
-  merged table equals the single-worker table.
-- **lane**: hermetic + distributed. **depends_on**: U2, U5 (`FetchPartition`). **size**: M.
-
-## U7a / U7b — `gpu-gang.yml` pod leg; cluster leg (PR-B commit 4; PR-C commit 3)
+## U7a — `gpu-gang.yml` pod leg (PR-B commit 1)
 
 - **files_in_scope** (docs-ci): `.github/workflows/gpu-gang.yml` (label `run-gang`, nightly,
-  manual; never `push`/`workflow_call`; concurrency lesson from `gpu-prove.yml`),
-  `ci/scripts/runpod_gpu_gang.sh` (pod leg: one pod, `gpuCount 2`, A100-SXM4-80GB; cluster leg:
-  `create-cluster` type TRAINING, 2 pods × 2 GPUs, deadline + reap), `ci/scripts/check_cuda_run_
-  artifacts.py` (a `gang` artifact kind: world, collective, per-rank device, reproducibility
-  digest pair, W-invariance ε), `.github/workflows/gpu-reap.yml` (clusters reaped too),
-  `docs/maintainer/dev-gpu.md` (cost and cadence).
-- **invariants_to_preserve**: the gate-script rules `check_gpu_prove_once.py` pins (no
-  auto-start); K6 untouched; B2 (no consumer names in workflow inputs).
-- **acceptance**: workflow `act`-style dry run or `workflow_dispatch` with `--dry-run` proving
-  the script provisions, runs, reaps; the artifact schema test RED at base; the first real
-  artifacts land with U4 (pod) and U5 (cluster).
-- **lane**: workflow dry-run; real runs by label. **depends_on**: U7a → U7b. **size**: M + M.
-- **cost ceiling** (stated, human-approved before first run): pod leg ≤ 1 h × 2 GPU ×
-  $1.59 ≈ $3.2 per run; cluster leg ≤ 1 h × 4 GPU × $1.59 ≈ $6.4 per run; nightly only after a
-  flake-free streak, label-only before.
+  manual; never `push`/`workflow_call`), `ci/scripts/runpod_lib.sh` (`gpuCount` becomes a
+  parameter of the shared deploy payload, default 1 — three-lane blast radius: gpu-prove,
+  gpu-perf-ab, gpu-dev), `ci/scripts/runpod_gpu_gang.sh` (pod leg: 1 pod × 2 GPU
+  A100-SXM4-80GB), `ci/scripts/check_cuda_run_artifacts.py` (a `gang` artifact kind: world,
+  collective, per-rank device, digest pair, per-step loss delta, ε), `docs/maintainer/dev-gpu.md`.
+- **invariants_to_preserve**: `check_gpu_prove_once.py` P1 rules; `check_ci_guard_wiring.py`; B2.
+- **acceptance**: the gang artifact-schema test (RED at base); `check_gpu_prove_once.py`
+  applied to the new workflow's `on:` block; `check_ci_guard_wiring.py` green; every existing
+  lane still deploys `gpuCount: 1`. Provisioning proof is spike S4, not an acceptance.
+- **lane**: gate scripts. **depends_on**: S4. **size**: L.
+- **cost ceiling** (human-approved before first run): ≤ 1 h × 2 GPU × $1.59 ≈ $3.2 per run.
+
+## U2a — `TrainingSet` producer (PR-B commit 2)
+
+- **files_in_scope**: (db) `store/manifest.rs` (`ProducingDescriptor::TrainingSet`,
+  `canonical_bytes`), `catalog/result_repo.rs` (`ResultTableKind::TrainingSet`), tests.
+  (ai-core) `fine_tune/worker.rs::run_spec` (materialize-or-reuse, then read the table into
+  today's loader — a compiling intermediate), `fine_tune/graph_sampler.rs` (pairs → table),
+  `pipeline/recompute.rs` (arm = re-materialize), the cookbook fixture golden.
+- **invariants_to_preserve**: K1, K7 (descriptor: source anchors, columns, task, format,
+  order rule — no topology, no split), K2 (empty training set refused), B1/B2 naming, B6.
+- **acceptance**: (a) `fine_tune` creates a `TrainingSet` result table with a definition hash
+  and attestation (RED at base); (b) two jobs over the same source/columns/task reuse one table
+  (RED at base); (c) refactor parity: adapter bytes identical to base on every cookbook
+  fine-tune fixture.
+- **lane**: hermetic + cookbook. **depends_on**: U1. **size**: M.
+
+## U4a — `Collective` trait; device-plural session; `CacheKey`; config refusals (PR-B commit 3)
+
+- **files_in_scope**: (ai-core) new `fine_tune/collective/{mod.rs, noop.rs, local.rs, nccl.rs}`,
+  `model/cache.rs` (`CacheKey { model_id, device, task: Option, backend: Option }` — shared
+  shape with plan 65, recorded in both ledgers), `model/backend/mod.rs` (`DeviceConfig` plural),
+  `concurrency/gpu_scheduler.rs` (per device), `session.rs`, `jammi-ai/Cargo.toml` (`cuda`
+  adds `candle-core/nccl`). (db) `config/mod.rs` (`[gpu] devices`, `[training] world_size`,
+  `collective`), tests.
+- **invariants_to_preserve**: B4 (topology is configuration), K2 (`world_size > devices`,
+  `nccl` without CUDA, `world_size > 1` with `cached` or `hard_negatives.refresh_every > 0`
+  refused with typed errors), K4 (remote parity suite unchanged), B6.
+- **acceptance** (hermetic): (a) `Local` over 2 ranks: `all_gather` layout and rank-ordered
+  `all_reduce_sum` are deterministic and equal a serial reference bit-for-bit (RED at base);
+  (b) each refusal above (RED at base); (c) two devices in one session hold two cache entries
+  for one model id (RED at base: keyed by id alone). (pod leg smoke) `Nccl` over 2 devices
+  reduces a known vector.
+- **lane**: hermetic (+ pod leg smoke). **depends_on**: S1. **size**: L. No loader contact.
+
+## U2b — Streaming loader; partition rule; scaler; whole-set arms (PR-B commit 4)
+
+- **files_in_scope** (ai-core): `fine_tune/data.rs` (stream + per-batch converters for every
+  format), `fine_tune/trainer.rs` (epoch loop over the stream; `batches_per_epoch` from
+  `train_count`), `fine_tune/worker.rs::run_spec` (`PartitionSpec { rank, world, batch, rule }`),
+  `fine_tune/regression_loss.rs` (scaler from the streamed train prefix),
+  `fine_tune/hard_negative_miner.rs` and `fine_tune/gradcache.rs` (stream-sourced, W=1-only),
+  `fine_tune/batch_bucket.rs` (rung pinning option), tests. (db) `store/mod.rs` reader slicing.
+- **invariants_to_preserve**: K3 (scaler over the train prefix, bit-identical), K2, B6.
+- **acceptance**: (a) resident-row high-water mark ≤ `batch × prefetch` on a fixture larger
+  than the bound, on every non-whole-set arm (RED at base); (b) partition rule: for W ∈
+  {1,2,4} the multiset of rows over ranks at each global step equals the W=1 batch (RED at
+  base); (c) refactor parity holds on every cookbook fixture including regression; (d)
+  mining/GradCache runs at W=1 produce bytes identical to base.
+- **lane**: hermetic + cookbook. **depends_on**: U2a. **size**: XL.
+
+## U3 — `FineTune` producer; migration 029; cache reuse (PR-B commit 5, concurrent with U2b)
+
+- **files_in_scope**: (db) `store/manifest.rs` (`ProducingDescriptor::FineTune`;
+  `MaterializationEnv` kernel-profile), `catalog/{schema.rs, migrations.rs}` (029, nullable
+  columns), `catalog/model_repo.rs` (`probe_model_by_definition`, NULL never matches),
+  `store/artifact.rs` (manifest last), `store/reconcile.rs` (prefix reaped only when
+  unreferenced), `tests/it/migrations.rs`. (ai-core) `fine_tune/worker.rs::publish_and_finalize`
+  (materialization; probe before training; own name → reused prefix), `pipeline/recompute.rs`
+  (arm = retrain), `model/resolver.rs` (manifest on `ModelRecord`).
+- **invariants_to_preserve**: K5, K7 (exhaustive destructuring of `FineTuneConfig` and
+  `TrainingCommon`, fields existing at this commit), K1, B6, B1 (no `register_*`).
+- **acceptance**: (a) same spec on the same training-set digest with `CachePolicy::Use` trains
+  once, two model rows share one prefix, deleting one leaves the prefix (RED at base); (b) the
+  exhaustive-destructuring completeness test (RED at base); (c) 029 append-only test.
+- **lane**: hermetic. **depends_on**: U2a. **size**: M. Co-ownership: `manifest.rs` with U4b.
+
+## U4b — Rank context; gather rule; lockstep; single-node gang (PR-B commit 6)
+
+- **files_in_scope** (ai-core): `fine_tune/trainer.rs` (`RankContext`; gather-then-global-loss;
+  local-slot gather backward; canonical-order reduce; lockstep flags; rank-0-only checkpoint),
+  `fine_tune/optimizer.rs` (zero-filled reduce set), `fine_tune/worker.rs::run_spec` (spawn W
+  local ranks), `fine_tune/spec.rs` (`TrainingCommon.world_size`), `store/manifest.rs` (topology
+  fields; extends U3's completeness test), tests.
+- **invariants_to_preserve**: B4, K7, K2, K4, B6.
+- **acceptance** (hermetic, `Local`): (a) W=2 twice → identical bytes (RED at base); (b)
+  gather exactness for CoSENT/AnglE/MNRL bit-for-bit vs W=1 on the same rows (RED at base);
+  (c) W=2 × B vs W=1 × 2B within pre-registered ε at `lora_dropout=0`, rung pinned (RED at
+  base); (d) lockstep: forced divergence on one rank; a Var absent from one rank's `GradStore`
+  — the gang completes (RED at base); (e) W=1 via `Noop` byte-identical to U2b's golden.
+  (pod leg, `Nccl`, 2×A100): (a) as a digest pair + per-step delta, (c) with GPU-measured ε;
+  artifact committed as PR-B commit 7.
+- **lane**: hermetic + gpu-gang pod leg. **depends_on**: U2b, U3, U4a. **size**: L.
+
+## U7b — cluster leg + cluster reap (PR-C commit 1)
+
+- **files_in_scope** (docs-ci): `ci/scripts/runpod_lib.sh` (cluster create/teardown primitive
+  with deadline), `ci/scripts/runpod_gpu_gang.sh` (cluster leg: TRAINING cluster, 2 pods × 2
+  GPUs), `.github/workflows/gpu-reap.yml` (clusters enumerated and reaped), `gpu-gang.yml`.
+- **acceptance**: reap enumerates clusters (RED at base: pods only); P1 rules; guard wiring.
+- **lane**: gate scripts. **depends_on**: U7a, S4. **size**: M.
+- **cost ceiling**: ≤ 1 h × 4 GPU × $1.59 ≈ $6.4 per run; label-only until a flake-free streak.
+
+## U5a — `gang.proto`; `GangService`; `FetchPartition`; authorization (PR-C commit 2)
+
+- **files_in_scope**: (wire-server) `crates/jammi-wire/proto/jammi/v1/gang.proto`
+  (`RunRank(RankAssignment) returns (stream RankEvent)`; `FetchPartition(PartitionRequest)
+  returns (stream ArrowIpc)`), `crates/jammi-wire/src/{lib.rs, gang.rs}`,
+  `crates/jammi-server/src/grpc/gang.rs` (tenant-scoped mount via `mount_tenant_scoped`; the
+  job/lease/claimed_by verification; ids resolved through the catalog; #485 bounds),
+  `crates/jammi-server/src/runtime.rs`, `crates/jammi-server/tests/it/{gang_partition.rs,
+  gang_authz.rs}`. (db) `config/mod.rs` (`peers`, `rank_timeout_secs`).
+- **invariants_to_preserve**: B5, K2, B1 (no `stage`/`register` stems), B6.
+- **acceptance**: (a) the streamed bytes of partition r equal the local read of partition r
+  (RED at base); (b) `RunRank` for a job that is not running / not claimed by the named worker
+  / lease expired is refused with a typed status (RED at base); (c) a lesser-or-equal attempt is
+  refused, a greater one supersedes (RED at base).
+- **lane**: hermetic + server it-suite. **depends_on**: U4a. **size**: L.
+
+## U6 — Partition-aware inference operator; distributed frozen forward (PR-C commit 3)
+
+- **files_in_scope** (ai-core): `operator/inference_exec.rs` (inherit input partitioning),
+  `operator/runner.rs` (one load per process), `pipeline/embedding.rs` (stream into the sink;
+  fan-out through `FetchPartition`), `fine_tune/worker.rs::run_fine_tune_blocking` head-target
+  arm (`worker.rs:2375`), tests. (db) `store/result_sink.rs` (partition-ordered append).
+- **invariants_to_preserve**: K4 (4-partition table == 1-partition table, bytes), K1, B3, B6.
+- **acceptance**: (a) byte parity across partition counts (RED at base); (b) resident batches
+  ≤ a bound (RED at base: `collect`); (c) distributed: 2 workers compute disjoint halves via
+  `FetchPartition`, merged table equals single-worker.
+- **lane**: hermetic + distributed. **depends_on**: U2b, U5a. **size**: M.
+
+## U5b — Coordinator; `Peer` collective; attempt fence; chaos (PR-C commit 4)
+
+- **files_in_scope** (ai-core): `fine_tune/collective/peer.rs`, `fine_tune/worker.rs`
+  (coordinator: peer resolution, id mint, dispatch, watchdog, attempt abort),
+  `tests/distributed/{harness.rs (peer TOML, `[training] peers`), gang_deterministic.rs,
+  gang_chaos.rs}`, `.github/workflows/distributed.yml` (three new test names). (wire-server)
+  `grpc/gang.rs` peer-side rank runner and attempt fence.
+- **invariants_to_preserve**: K4 real (W=1 via the gang path == embedded bytes), B4, K2, B6.
+- **acceptance**: (a) server it-suite: W=1 coordinator dispatching to itself → bytes identical
+  to the in-process trainer (RED at base); (b) distributed deterministic leg: 2 processes, W=2,
+  `Peer` → bytes identical to the single-process W=2 `Local` run (RED at base); (c) chaos:
+  SIGKILL a peer → requeued with `attempts+1`, completed by a new gang from the checkpoint,
+  exactly one model, no orphan prefix promoted; SIGKILL the coordinator → same via lease; split
+  brain: attempt N+1 dispatched while N is live → N aborted, N+1 completes (RED at base); (d)
+  cluster leg: 2 pods × 2 GPUs, W=4, `Nccl` `from_rank` → digest pair + deltas; artifact as
+  PR-C commit 5.
+- **lane**: hermetic + distributed (dispatched manually; deterministic leg green before merge;
+  chaos advisory as today) + gpu-gang cluster leg. **depends_on**: U4b, U5a. **size**: XL.
 
 ## U8 — Ballista scheduler/executor roles + extension codec (PR-D commit 1; mandatory, last)
 
-- **files_in_scope** (wire-server): `crates/jammi-server/Cargo.toml` (`ballista` feature:
-  `ballista-core`, `ballista-scheduler`, `ballista-executor` 54.x, `datafusion-proto 54`),
-  `crates/jammi-server/src/{runtime.rs (roles `scheduler` / `executor` via `[server] services`
-  and `ServiceTier`), ballista/{codec.rs, roles.rs}}` (a `PhysicalExtensionCodec` mapping
-  `InferenceExec`, `AnnSearchExec`, `AsofJoinExec`, and a `GangExec` wrapper to and from the U5
-  descriptor messages; scheduler config with task retry attempts = 0 for gang jobs),
-  `crates/jammi-server/tests/it/ballista_parity.rs`. (ai-core): `crates/jammi-ai/src/operator/
-  gang_exec.rs` (a single-partition operator whose `execute` runs the U5 coordinator; under
-  Ballista the gang stays a jammi mechanism scheduled as one task), tests. (docs-ci):
-  `.github/workflows/ci.yml` gated-surface clippy for the `ballista` feature.
-- **invariants_to_preserve**: B4 (roles are `[server] services` values in the one binary),
-  K4 (bytes through Ballista == bytes through the peer path), B6, K6 (feature-gated deps still
-  lockstep), B1 (the codec and roles name no consumer).
-- **acceptance**: with the `ballista` feature, the jammi binary runs as one scheduler + two
-  executors (three processes, same binary); (a) an embedding job submitted via
-  `submit_physical_plan` executes across both executors and yields a table byte-identical to
-  U6's peer path (RED at base: no feature, no codec); (b) a W=2 gang job submitted through the
-  scheduler completes with bytes identical to U5's and is never retried at task level (RED at
-  base); (c) killing an executor mid-gang fails the job (no task retry) and the job requeues
-  through jammi's lease path.
-- **lane**: hermetic (`ballista` feature in the gated-surface matrix) + distributed.
-  **depends_on**: U1, U5, U6, S2. **size**: L.
+- **files_in_scope**: (wire-server) `crates/jammi-server/Cargo.toml` (`ballista` feature:
+  `ballista-core`/`-scheduler`/`-executor` 54.x, `datafusion-proto 54`), `runtime.rs` (roles
+  `scheduler`/`executor` via `[server] services` and `ServiceTier`), `ballista/{codec.rs,
+  roles.rs}` (codec for `InferenceExec`, `AnnSearchExec`, `AsofJoinExec`, `GangExec` ↔ U5
+  descriptor messages; task retry attempts = 0 for gang jobs), `tests/it/ballista_codec.rs`.
+  (ai-core) `operator/gang_exec.rs` (single-partition operator whose `execute` runs the U5b
+  coordinator), `tests/distributed/{harness.rs (scheduler/executor TOML), ballista_parity.rs}`.
+  (docs-ci) `ci.yml` gated-surface clippy for `ballista`.
+- **invariants_to_preserve**: B4, K4, B6, K6, B1.
+- **acceptance**: hermetic: codec round-trip for every operator (RED at base). Distributed
+  (three processes, one binary): (a) an embedding job via `submit_physical_plan` across two
+  executors → bytes identical to U6's peer path (RED at base); (b) a W=2 gang job through the
+  scheduler → bytes identical to U5b's, never task-retried (RED at base); (c) killing an
+  executor mid-gang fails the job and it requeues through jammi's lease path.
+- **lane**: hermetic codec arm + distributed three-process arm. **depends_on**: U1, U5b, U6,
+  S2. **size**: L.
 
 ## U9 — Docs (PR-D commit 2)
 
-- **files_in_scope** (docs-ci / doc-updater): `docs/guide/src/{philosophy.md (deployment shapes:
-  a gang is a configuration; no sixth backend), reference-topologies.md (#482 consequence:
-  StatefulSet/indexed Job, `peers`), fine-tune pages}`, `docs/maintainer/MAINTAINER-GUIDE.md`
-  (ProducingDescriptor enumeration — `check_doc_parity.py` binding), `CHANGELOG.md`, `deploy/`
-  overlay note. Docs reflect current state; no journey markers.
-- **invariants_to_preserve**: doc parity gate (ProducingDescriptor ⇄ guide), B2.
-- **acceptance**: `ci/scripts/check_doc_parity.py` green with the two new variants; docs gates.
+- **files_in_scope** (docs-ci / doc-updater): `docs/guide/src/{philosophy.md,
+  reference-topologies.md, fine-tune pages}`, `docs/maintainer/MAINTAINER-GUIDE.md`
+  (ProducingDescriptor enumeration — `check_doc_parity.py`), `CHANGELOG.md`, `deploy/` note.
+- **acceptance**: `check_doc_parity.py` green with the two new variants; docs gates.
 - **lane**: docs. **depends_on**: all. **size**: S.

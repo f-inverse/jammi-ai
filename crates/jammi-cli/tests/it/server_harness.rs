@@ -74,6 +74,13 @@ const BANNER_TIMEOUT: Duration = Duration::from_secs(30);
 /// How long to wait for `/readyz` to return 200 once the ports are known.
 const READY_TIMEOUT: Duration = Duration::from_secs(30);
 
+/// The audit master key every spawned server is given. `jammi-server` decodes
+/// it at startup (`runtime.rs::validate_audit_master_key`) and refuses to start
+/// unless it is exactly 32 bytes of hex (64 hex chars); a deterministic test
+/// constant, never a real secret.
+const TEST_AUDIT_MASTER_KEY: &str =
+    "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
+
 /// A running `jammi-server` the CLI tests target over `--target`.
 pub struct TestServer {
     child: Child,
@@ -147,7 +154,7 @@ impl TestServer {
             .env("JAMMI_SERVER__HEALTH_LISTEN", "127.0.0.1:0")
             // A fixed audit master key keeps the server's audit signer happy
             // without a per-test secret.
-            .env("JAMMI_AUDIT_MASTER_KEY", "cli-it-test-key")
+            .env("JAMMI_AUDIT_MASTER_KEY", TEST_AUDIT_MASTER_KEY)
             .env_remove("JAMMI_CONFIG")
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())

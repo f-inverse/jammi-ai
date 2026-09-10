@@ -71,9 +71,10 @@ use crate::model::ModelSource;
 use crate::session::InferenceSession;
 
 // Lease timing is configured per deployment via `[lease]` in `JammiConfig` (the
-// one lease primitive every leased row shares), the idle poll via `[training]`,
-// and both resolve to a [`WorkerIntervals`] (see
-// [`jammi_db::config::TrainingConfig::worker_intervals`]). The lease is the
+// one lease primitive every leased row shares), the idle poll via `[worker]`
+// (`idle_poll_secs`; the loop itself is gated by `[worker] enabled`), and both
+// resolve to a [`WorkerIntervals`] (see
+// [`jammi_db::config::WorkerConfig::worker_intervals`]). The lease is the
 // window a claimed job is exclusively owned; the heartbeat renews it well
 // inside that window so a single missed beat (a GC pause, a slow tick) does not
 // drop the lease — the config layer enforces a ≥2× margin between the lease and

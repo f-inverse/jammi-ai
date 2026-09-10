@@ -53,6 +53,12 @@ tracing.workspace = true
 tracing-subscriber.workspace = true
 uuid.workspace = true
 async-trait.workspace = true
+# The `probe` subcommand's HTTP client (a generic readiness check against
+# `/readyz` for a supervisor's exit-code-driven healthcheck — Compose,
+# systemd `ExecStartPost=`, Nomad). `rustls-tls`, no default features: the
+# same TLS stack `jammi-ai`'s default `local` feature already compiles
+# transitively, so this adds no new TLS stack or supply-chain edge.
+reqwest.workspace = true
 
 [features]
 # No feature gates a gRPC service tier: every tier (`core`, `event` =
@@ -93,7 +99,6 @@ storage-cloud = ["jammi-db/storage-cloud"]
 
 [dev-dependencies]
 tokio.workspace = true
-reqwest.workspace = true
 jammi-test-utils.workspace = true
 # The end-to-end client tests drive the in-process server through the real
 # client crates — `DataClient` (data verbs) and `CatalogClient` (control verbs)

@@ -1,0 +1,85 @@
+# Shape B: `jammi-server` against Postgres (catalog) + JetStream (broker) —
+# a worked example of a *configuration* change, not orchestration policy
+# (orchestration is the deployer's runtime; see `docs/guide/src/philosophy.md`).
+# Every knob below is one this compose file only sets, never invents: the
+# image's env-only configuration layer (`crates/jammi-db/src/config/`)
+# resolves `JAMMI_CATALOG__POSTGRES__URL`, `JAMMI_BROKER__JET_STREAM__URL`,
+# and `JAMMI_SERVER__SERVICES` exactly as documented in
+# `docs/guide/src/reference-topologies.md`.
+#
+# `jammi-server`'s healthcheck is exec-form `jammi-server probe` — the
+# runtime image is distroless (no shell, no curl/wget), so the readiness
+# probe is a generic CLI subcommand the binary itself ships (see
+# `crates/jammi-server/src/probe.rs`), the same shape as Postgres's own
+# `pg_isready`.
+#
+# `secrets` live in a git-ignored `.env` file next to this compose file;
+# `deploy/.env.example` documents the one required key.
+
+services:
+  jammi-server:
+    image: ${JAMMI_IMAGE:-ghcr.io/f-inverse/jammi-ai-server:latest}
+    # For local developers only: `docker compose build` compiles this repo's
+    # own Dockerfile (CPU variant) instead of pulling the published image.
+    # The CI smoke override (`docker-compose.ci.yml`) drops this block and
+    # points `JAMMI_IMAGE` at the image it already built + loaded.
+    build:
+      context: ..
+      dockerfile: Dockerfile
+    environment:
+      JAMMI_CATALOG__POSTGRES__URL: postgres://jammi:jammi@postgres:5432/jammi
+      JAMMI_BROKER__JET_STREAM__URL: nats://nats:4222
+      JAMMI_SERVER__SERVICES: all
+      JAMMI_AUDIT_MASTER_KEY: ${JAMMI_AUDIT_MASTER_KEY:?set it in .env}
+    ports:
+      - "8081:8081" # gRPC + Flight SQL
+      - "8080:8080" # HTTP side-channel (/healthz, /readyz, /metrics)
+    volumes:
+      # Artifacts (indices, materialized Parquet, `index_cache`) and the
+      # Hugging Face Hub cache (`HF_HOME`, set by the image) — a named
+      # volume so docker provisions ownership for distroless's nonroot
+      # uid (65532); a bind mount would need host-side `chown` first.
+      - jammi-data:/var/lib/jammi
+    depends_on:
+      postgres:
+        condition: service_healthy
+      nats:
+        condition: service_healthy
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "/usr/local/bin/jammi-server", "probe"]
+      interval: 10s
+      timeout: 5s
+      retries: 12
+      start_period: 10s
+
+  postgres:
+    image: postgres:16
+    environment:
+      POSTGRES_USER: jammi
+      POSTGRES_PASSWORD: jammi
+      POSTGRES_DB: jammi
+    volumes:
+      - postgres-data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD", "pg_isready", "-U", "jammi"]
+      interval: 5s
+      timeout: 5s
+      retries: 12
+
+  nats:
+    image: nats:2.10-alpine
+    command: ["-js", "-m", "8222"]
+    healthcheck:
+      # The image ships no shell — `wget` is the one HTTP-capable binary
+      # nats:2.10-alpine's base carries; `nats-server --help` (no shell
+      # dependency either) would prove only that the binary exists, not
+      # that JetStream came up.
+      test: ["CMD", "wget", "--spider", "-q", "http://127.0.0.1:8222/healthz"]
+      interval: 5s
+      timeout: 5s
+      retries: 12
+
+volumes:
+  jammi-data:
+  postgres-data:

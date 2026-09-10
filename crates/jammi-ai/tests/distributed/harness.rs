@@ -305,6 +305,13 @@ fn sigkill(child: &mut Child) {
     }
 }
 
+/// The audit master key every spawned worker is given. `jammi-server` decodes
+/// it at startup (`runtime.rs::validate_audit_master_key`) and refuses to start
+/// unless it is exactly 32 bytes of hex (64 hex chars); a deterministic test
+/// constant, never a real secret.
+const TEST_AUDIT_MASTER_KEY: &str =
+    "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
+
 /// Spawn one worker process. The worker is configured entirely through a
 /// per-process `jammi.toml` (catalog, storage, worker timing, `[worker]
 /// enabled` and its distinct ports) plus the `JAMMI_WORKER_ID` seed and the `AWS_*`
@@ -354,7 +361,7 @@ fn spawn_worker(
         .env("AWS_REGION", &backends.region)
         // An audit master key is required for the engine's audit sign path; a
         // fixed test key keeps every worker's signer consistent.
-        .env("JAMMI_AUDIT_MASTER_KEY", "distributed-lane-test-key")
+        .env("JAMMI_AUDIT_MASTER_KEY", TEST_AUDIT_MASTER_KEY)
         .stdout(log)
         .stderr(log_err)
         // Own process group so a stray signal to the harness never propagates to

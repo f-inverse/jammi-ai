@@ -53,6 +53,11 @@ docker run --gpus all \
   ghcr.io/f-inverse/jammi-ai-server-cu12:latest
 ```
 
+Both `:latest` tags are re-pointed by every `v*` release tag (never by a
+prerelease); the CPU `:latest` can additionally be re-pointed to the current
+`main` by a manual `build-and-push-main` dispatch. Pin an exact `:vX.Y.Z`
+tag for a reproducible pull.
+
 That runs `jammi-server` with zero config. See
 [Deploy as a Server](./deploy-server.md#gpu-serving) for GPU configuration and
 persistence.

@@ -116,3 +116,7 @@ cookbook/fixtures/finetune_heldout/train_pairs.jsonl
 # convention) and the A/B sweep's merged report + table it writes.
 .venv-torch-ref/
 .ab-report/
+
+# Local secrets for `docker compose -f deploy/docker-compose.yml up` (the
+# audit master key; see `deploy/.env.example`) — never committed.
+deploy/.env

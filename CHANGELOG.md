@@ -30,9 +30,10 @@ workspace ships every publishable crate at the same
   `ENV_VARS_TRUE_VALUES` set — `"1"`, `"on"`, `"yes"`, `"true"`, case-insensitively, whitespace
   trimmed — not the narrower `"1"`/case-insensitive-`"true"` this landed with first, which
   rejected `huggingface_hub`-valid spellings like `HF_HUB_OFFLINE=ON` and fell open to a live
-  fetch; `TRANSFORMERS_OFFLINE` is consulted only when `HF_HUB_OFFLINE` is itself unset from the
-  environment, mirroring `huggingface_hub`'s own alias — hf-hub 0.5, the Rust crate, does not
-  read either variable at all), and only an omitted `offline` key falls back to them. The cache
+  fetch; `TRANSFORMERS_OFFLINE` is consulted only when `HF_HUB_OFFLINE` is itself unset OR
+  present-but-empty from the environment (the round-3 fix below), mirroring `huggingface_hub`'s
+  own alias — hf-hub 0.5, the Rust crate, does not read either variable at all), and only an
+  omitted `offline` key falls back to them. The cache
   root chain gains an `HF_HUB_CACHE` tier between `hub_cache_dir` and `HF_HOME`
   (`hub_cache_dir` (config, `hub/` appended) → `HF_HUB_CACHE` (used AS the cache root directly,
   nothing appended, matching `huggingface_hub`'s own `HF_HUB_CACHE` convention) → `HF_HOME`
@@ -46,15 +47,56 @@ workspace ships every publishable crate at the same
   it now resolves `HF_HUB_CACHE` → `HF_HOME`/`hub` → a checked `dirs::home_dir()` itself, failing
   with a named-variable test failure instead of a panic when none resolves. This is a SEPARATE
   jammi-encoders-local implementation, not a shared mirror of `HubSource`'s chain (jammi-encoders
-  cannot depend on jammi-ai), and it disclosably diverges from `HubSource` in two ways: its
-  cache-root fallback is hand-written rather than sharing `HubSource`'s own tested code path, and
-  its token fallback stops at `HF_TOKEN` with no cache-`token`-file tier. Docs
+  cannot depend on jammi-ai), and it disclosably diverges from `HubSource` in one remaining way:
+  its cache-root fallback is hand-written rather than sharing `HubSource`'s own tested code path
+  (its token fallback now agrees with `HubSource` exactly — see the round-3 entry below). Docs
   (`docs/guide/src/local-models.md`, `docs/guide/src/configuration.md`) gain the
   `JAMMI_MODELS__HUB_*` env-override tier, the `HF_HUB_CACHE` precedence step, the exact
   `HF_HUB_OFFLINE`/`TRANSFORMERS_OFFLINE` truthy set and alias, and fix the
   `hub_cache_dir = "/var/cache/jammi/hub"` examples (here, `configuration.md`, and
   `crates/jammi-db/src/config/mod.rs`'s own doc comment) that resolved to
   `/var/cache/jammi/hub/hub` once the `hub/` subdirectory `HubSource` appends is accounted for.
+- **Empty `HF_*` env values are treated as absent, and the Hub token file is
+  `<HF_HOME>/token` regardless of `HF_HUB_CACHE` (#481, fix round 3).** Two BLOCKs found by
+  adversarial review of the round-2 fix above. BLOCK 1: `resolve_offline`'s
+  `env("HF_HUB_OFFLINE").or_else(|| env("TRANSFORMERS_OFFLINE"))` treated a *present-but-empty*
+  `HF_HUB_OFFLINE` (`Some("")` — exactly what the production closure
+  `&|k: &str| std::env::var(k).ok()` yields for `HF_HUB_OFFLINE=` in a Compose/Kubernetes env
+  block) as a real value, so `Option::or_else` never even tried `TRANSFORMERS_OFFLINE` —
+  `huggingface_hub` itself resolves this exact shape offline (`os.environ.get("HF_HUB_OFFLINE")
+  or os.environ.get("TRANSFORMERS_OFFLINE")`, `constants.py:192`, where Python's `or` skips a
+  `""` left side), so this was a real fail-open divergence from upstream on the air-gap knob, not
+  a stricter reading of it. BLOCK 2: the `HF_HUB_CACHE` tier (`hub.rs`) returns a cache root with
+  no `hub/` path component, and `resolve_token`'s cache-file tier relied on hf-hub 0.5's
+  `Cache::token_path`, which derives the token file by POPPING the cache root's last path
+  component (hf-hub `lib.rs:59-65`, comment "Remove `\"hub\"`") — a transformation that is only a
+  correct recovery of `HF_HOME` when the cache root was actually built as `<HF_HOME>/hub`; with
+  `HF_HUB_CACHE` set instead, `token_path` silently derived `parent(HF_HUB_CACHE)/token`, so a
+  user with `HF_HOME` set (and a `huggingface-cli login` token there) who also set `HF_HUB_CACHE`
+  silently lost authentication (a gated repo → 401) — `huggingface_hub` keeps the token at
+  `HF_HOME/token` regardless of `HF_HUB_CACHE` (`utils/_auth.py:152`,
+  `HF_TOKEN_PATH`). Both are one root cause read as one rule rather than two patches: every
+  `HubSource` env read (`HF_HUB_OFFLINE`, `TRANSFORMERS_OFFLINE`, `HF_HUB_CACHE`, `HF_HOME`,
+  `HF_ENDPOINT`, `HF_TOKEN`) now goes through one helper, `env_nonempty`, that treats a
+  present-but-empty value (after trimming) as absent — a strict superset of `huggingface_hub`'s
+  own handling (upstream's `_is_true` alias and `_clean_token` already treat `""` as absent too;
+  its `HF_HOME`/`HF_ENDPOINT` `os.environ.get(KEY, default)` reads do not, so this module
+  deliberately reads those two MORE safely than upstream rather than replicate the inconsistency).
+  The token file is now resolved as `<HF_HOME>/token` directly — `HF_HOME` read independently of
+  whichever tier won the cache-root precedence, never through `Cache::token`/`token_path` — with
+  precedence unchanged (`hub_token` config > non-empty `HF_TOKEN` > the file). New oracles in
+  `crates/jammi-ai/src/model/hub.rs`'s unit tests and `crates/jammi-ai/tests/it/hub_source.rs`
+  cover both BLOCKs directly (`offline_empty_hf_hub_offline_falls_through_to_transformers_offline`,
+  `hf_hub_offline_empty_falls_through_to_transformers_offline_refuses_by_name`,
+  `token_file_resolves_from_hf_home_independent_of_hf_hub_cache`,
+  `hf_home_token_file_used_with_hf_hub_cache_set_file_lands_under_hf_hub_cache`,
+  `empty_hf_token_falls_through_to_home_token_file`) plus every empty-value edge for the
+  remaining four variables, and the four existing "refuses by name" integration tests now mount a
+  `MockServer` and assert `received_requests()` comes back empty — a refusal-before-request is now
+  MEASURED, not implied by the error message's wording. `crates/jammi-encoders/tests/live_real_clap.rs`'s
+  `fetch_real_model` gains the identical `env_nonempty` rule and now falls back to
+  `<HF_HOME>/token` when `HF_TOKEN` is absent, so the two independent Hub-client implementations
+  agree end to end rather than merely on cache-root precedence.
 - **A tested Shape B Compose stack, `jammi-server probe`, `jammi-server serve` as the
   default subcommand, a reference-topologies guide page, and supply-chain
   attestations on the published images (#482).** `deploy/docker-compose.yml`

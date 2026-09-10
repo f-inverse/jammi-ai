@@ -38,9 +38,21 @@
 //! `huggingface-cli` session):
 //! 1. `[models] hub_token` (a [`jammi_db::config::SecretSource`] — inline or
 //!    file-backed)
-//! 2. the `HF_TOKEN` environment variable
-//! 3. the cache's own `token` file (`{root}/token`, `huggingface-cli login`'s
-//!    file — [`hf_hub::Cache::token`])
+//! 2. the `HF_TOKEN` environment variable, when non-empty (see "empty
+//!    values are absent" below)
+//! 3. `<HF_HOME>/token`, read directly and trimmed — `HF_HOME` here is
+//!    resolved on its own (non-empty env value, else the platform home
+//!    directory's `.cache/huggingface`), **independently of whichever tier
+//!    won the cache-root precedence above**. This is deliberately NOT
+//!    `hf_hub::Cache::token`/`token_path`, which derives the token file by
+//!    popping the CACHE ROOT's last path component (hf-hub 0.5's own
+//!    comment: "Remove `\"hub\"`") — an arithmetic that only recovers
+//!    `HF_HOME` when the cache root actually was built as `<HF_HOME>/hub`.
+//!    With `HF_HUB_CACHE` set, the cache root has no `hub` component to pop
+//!    at all, so `Cache::token_path` would silently look in
+//!    `parent(HF_HUB_CACHE)/token` instead — this module never makes that
+//!    mistake, matching `huggingface_hub`'s own `HF_TOKEN_PATH`
+//!    (`utils/_auth.py`), which never varies with `HF_HUB_CACHE` either.
 //!
 //! **Offline** (whether `HubSource::offline` refuses a Hub fetch — see
 //! "the `offline` promise is Hub-only" below for exactly what this refuses):
@@ -50,21 +62,52 @@
 //!    environment, exactly as a literal `offline = true` forces offline even
 //!    when neither is set
 //! 2. the `HF_HUB_OFFLINE` environment variable, when `[models] offline` is
-//!    omitted (`None`); if `HF_HUB_OFFLINE` is itself unset, the
-//!    `TRANSFORMERS_OFFLINE` environment variable, under the identical
-//!    truthy rule — `huggingface_hub` reads `TRANSFORMERS_OFFLINE` as an
-//!    alias precisely when `HF_HUB_OFFLINE` is unset, and this module
-//!    mirrors that. Accepted truthy values, for either variable, are
-//!    `huggingface_hub`'s own `ENV_VARS_TRUE_VALUES` set — `{"1", "ON",
-//!    "YES", "TRUE"}`, matched case-insensitively with surrounding
-//!    whitespace trimmed first (trimming is a strict superset of
-//!    `huggingface_hub`'s own exact-string match, so it can only ever push
-//!    an edge case TOWARD offline, never away from it — see
+//!    omitted (`None`) AND `HF_HUB_OFFLINE` is non-empty; if `HF_HUB_OFFLINE`
+//!    is itself unset OR present-but-empty, the `TRANSFORMERS_OFFLINE`
+//!    environment variable, under the identical truthy rule —
+//!    `huggingface_hub` reads `TRANSFORMERS_OFFLINE` as an alias precisely
+//!    when `HF_HUB_OFFLINE` is unset (Python's `os.environ.get("HF_HUB_OFFLINE")
+//!    or os.environ.get("TRANSFORMERS_OFFLINE")`, `constants.py:192`, where
+//!    `or` also skips a `""` left side), and this module mirrors that.
+//!    Accepted truthy values, for either variable, are `huggingface_hub`'s
+//!    own `ENV_VARS_TRUE_VALUES` set — `{"1", "ON", "YES", "TRUE"}`, matched
+//!    case-insensitively with surrounding whitespace trimmed first (trimming
+//!    is a strict superset of `huggingface_hub`'s own exact-string match, so
+//!    it can only ever push an edge case TOWARD offline, never away from it
+//!    — see
 //!    <https://huggingface.co/docs/huggingface_hub/en/package_reference/environment_variables#hfhuboffline>;
 //!    hf-hub, the Rust crate this module wraps, does not read either
 //!    variable at all — see this module's private `resolve_offline`/
 //!    `is_hf_hub_offline_truthy`)
 //! 3. `false`
+//!
+//! # Empty values are absent
+//!
+//! Every one of this module's six env reads (`HF_HUB_OFFLINE`,
+//! `TRANSFORMERS_OFFLINE`, `HF_HUB_CACHE`, `HF_HOME`, `HF_ENDPOINT`,
+//! `HF_TOKEN`) goes through one helper, `env_nonempty`: a value that is
+//! *present but empty* (after trimming ASCII whitespace) is treated exactly
+//! like an ABSENT variable, never like a real value that happens to be
+//! `""`. A Compose/K8s env block naming a variable with no value
+//! (`HF_HUB_OFFLINE:`) or an operator's shell `export HF_TOKEN=` both
+//! produce exactly this shape — the production closure
+//! (`&|k: &str| std::env::var(k).ok()`) yields `Some("")`, not `None`, for
+//! either, and every tier downstream of `env_nonempty` falls back exactly
+//! as if the variable had never been set at all.
+//!
+//! This is a strict SUPERSET of `huggingface_hub`'s own handling for two of
+//! the six: the offline alias's `os.environ.get(A) or os.environ.get(B)`
+//! and `HF_TOKEN`'s own `_clean_token` (`huggingface_hub/utils/_auth.py`,
+//! which maps `""` to `None`) already treat an empty value as absent, same
+//! as here. For `HF_HOME`/`HF_ENDPOINT`, upstream's own `os.environ.get(KEY,
+//! default)` does NOT — an empty string is present there, so it wins over
+//! the default, and upstream itself would resolve a CWD-relative cache root
+//! or an empty-string endpoint in that case. This module chooses the safer
+//! reading everywhere instead of replicating that upstream inconsistency:
+//! every one of the six variables falls back to its safe default when empty
+//! (home cache, default endpoint, no token, offline resolved from the
+//! non-empty variable only) — never toward the network, and never toward a
+//! nonsense relative path.
 //!
 //! The `HF_HOME`/`HF_HUB_CACHE`/`HF_ENDPOINT`/`HF_TOKEN`/`HF_HUB_OFFLINE`/
 //! `TRANSFORMERS_OFFLINE` fallbacks read the process environment **here**,
@@ -150,7 +193,7 @@ impl HubSource {
         if let Some(endpoint) = resolve_endpoint(config, env) {
             builder = builder.with_endpoint(endpoint);
         }
-        if let Some(token) = resolve_token(config, env, &cache)? {
+        if let Some(token) = resolve_token(config, env)? {
             builder = builder.with_token(Some(token));
         }
 
@@ -216,10 +259,10 @@ fn resolve_root_with(
     if let Some(dir) = &config.hub_cache_dir {
         return Ok(dir.join("hub"));
     }
-    if let Some(cache_dir) = env("HF_HUB_CACHE") {
+    if let Some(cache_dir) = env_nonempty(env, "HF_HUB_CACHE") {
         return Ok(PathBuf::from(cache_dir));
     }
-    if let Some(home) = env("HF_HOME") {
+    if let Some(home) = env_nonempty(env, "HF_HOME") {
         return Ok(PathBuf::from(home).join("hub"));
     }
     home_dir()
@@ -237,27 +280,82 @@ fn resolve_root_with(
 }
 
 /// Resolve the endpoint per the module docs' precedence: `hub_endpoint` >
-/// `HF_ENDPOINT` > `None` (hf-hub's own default, `https://huggingface.co`,
-/// applies when the builder is never told otherwise).
+/// `HF_ENDPOINT` (non-empty) > `None` (hf-hub's own default,
+/// `https://huggingface.co`, applies when the builder is never told
+/// otherwise).
 fn resolve_endpoint(config: &ModelsConfig, env: &dyn Fn(&str) -> Option<String>) -> Option<String> {
-    config.hub_endpoint.clone().or_else(|| env("HF_ENDPOINT"))
+    config
+        .hub_endpoint
+        .clone()
+        .or_else(|| env_nonempty(env, "HF_ENDPOINT"))
 }
 
 /// Resolve the bearer token per the module docs' precedence: `hub_token` >
-/// `HF_TOKEN` > the cache's own `token` file. `Ok(None)` means "send no
+/// `HF_TOKEN` (non-empty) > `<HF_HOME>/token`. `Ok(None)` means "send no
 /// `Authorization` header", not a failure.
+///
+/// The token FILE is resolved independently of the Hub cache root — see
+/// [`token_file_path`]'s doc for why this must never go through
+/// `hf_hub::Cache::token`/`token_path`.
 fn resolve_token(
     config: &ModelsConfig,
     env: &dyn Fn(&str) -> Option<String>,
-    cache: &Cache,
+) -> Result<Option<String>> {
+    resolve_token_with(config, env, default_home_dir)
+}
+
+/// [`resolve_token`]'s implementation, parameterized over the home-directory
+/// lookup for the same reason [`resolve_root_with`] is — so a unit test can
+/// force the "no config, no `HF_HOME`, no platform home directory" branch
+/// deterministically.
+fn resolve_token_with(
+    config: &ModelsConfig,
+    env: &dyn Fn(&str) -> Option<String>,
+    home_dir: impl FnOnce() -> Option<PathBuf>,
 ) -> Result<Option<String>> {
     if let Some(source) = &config.hub_token {
         return Ok(Some(source.resolve()?.expose().to_string()));
     }
-    if let Some(token) = env("HF_TOKEN") {
+    if let Some(token) = env_nonempty(env, "HF_TOKEN") {
         return Ok(Some(token));
     }
-    Ok(cache.token())
+    Ok(token_file_path(env, home_dir).and_then(|path| read_token_file(&path)))
+}
+
+/// `<HF_HOME>/token` — matching `huggingface_hub`'s own `HF_TOKEN_PATH`
+/// (`utils/_auth.py`) — where `HF_HOME` is resolved on its own: a non-empty
+/// `HF_HOME` env value, else the platform home directory's
+/// `.cache/huggingface`. Deliberately computed WITHOUT reference to the Hub
+/// cache root [`resolve_root`] resolved: `hf_hub::Cache::token_path` derives
+/// the token file by popping the CACHE ROOT's last path component (hf-hub
+/// 0.5's own comment: "Remove `\"hub\"`"), which is only a correct recovery
+/// of `HF_HOME` when the cache root was actually built as `<HF_HOME>/hub`.
+/// When `HF_HUB_CACHE` wins the cache-root precedence instead, the cache
+/// root has no `hub` component to pop at all, so `Cache::token_path` would
+/// silently look in `parent(HF_HUB_CACHE)/token` — a user with `HF_HOME` set
+/// (and a `huggingface-cli login` token there) who ALSO sets `HF_HUB_CACHE`
+/// would then silently lose authentication. This function never takes that
+/// path: it reads `HF_HOME` itself, independently of whichever tier won the
+/// cache-root precedence.
+fn token_file_path(
+    env: &dyn Fn(&str) -> Option<String>,
+    home_dir: impl FnOnce() -> Option<PathBuf>,
+) -> Option<PathBuf> {
+    if let Some(home) = env_nonempty(env, "HF_HOME") {
+        return Some(PathBuf::from(home).join("token"));
+    }
+    home_dir().map(|home| home.join(".cache").join("huggingface").join("token"))
+}
+
+/// Reads a Hub token file (`huggingface-cli login`'s file, or
+/// `<HF_HOME>/token`), trimming surrounding whitespace. An unreadable file,
+/// or one that is empty after trimming, resolves to `None` rather than an
+/// empty bearer token — matching `hf_hub::Cache::token`'s own convention for
+/// the same file shape.
+fn read_token_file(path: &std::path::Path) -> Option<String> {
+    let contents = std::fs::read_to_string(path).ok()?;
+    let trimmed = contents.trim();
+    (!trimmed.is_empty()).then(|| trimmed.to_string())
 }
 
 /// Resolve `[models] offline` per the module docs' "Offline" precedence:
@@ -265,19 +363,31 @@ fn resolve_token(
 /// never OR'd with the environment, so a literal `offline = false` silences
 /// `HF_HUB_OFFLINE`/`TRANSFORMERS_OFFLINE` exactly as a literal `offline =
 /// true` forces it on regardless of the environment. Only an OMITTED config
-/// value (`None`) falls back to `HF_HUB_OFFLINE`; if THAT is itself unset
-/// (not merely falsy — `Option::or_else` only tries `TRANSFORMERS_OFFLINE`
-/// when `HF_HUB_OFFLINE` is absent from the environment entirely), it falls
-/// back to `TRANSFORMERS_OFFLINE` under the identical truthy rule, matching
+/// value (`None`) falls back to `HF_HUB_OFFLINE`; if THAT is itself unset OR
+/// present-but-empty (see the module docs' "empty values are absent" —
+/// `env_nonempty` treats the two identically, matching Python's `or` in
+/// `huggingface_hub`'s own `os.environ.get("HF_HUB_OFFLINE") or
+/// os.environ.get("TRANSFORMERS_OFFLINE")`), it falls back to
+/// `TRANSFORMERS_OFFLINE` under the identical truthy rule, matching
 /// `huggingface_hub`'s own alias; then to `false`.
 fn resolve_offline(config: &ModelsConfig, env: &dyn Fn(&str) -> Option<String>) -> bool {
     if let Some(offline) = config.offline {
         return offline;
     }
-    env("HF_HUB_OFFLINE")
-        .or_else(|| env("TRANSFORMERS_OFFLINE"))
+    env_nonempty(env, "HF_HUB_OFFLINE")
+        .or_else(|| env_nonempty(env, "TRANSFORMERS_OFFLINE"))
         .map(|value| is_hf_hub_offline_truthy(&value))
         .unwrap_or(false)
+}
+
+/// Every `HubSource` env read (`HF_HUB_OFFLINE`, `TRANSFORMERS_OFFLINE`,
+/// `HF_HUB_CACHE`, `HF_HOME`, `HF_ENDPOINT`, `HF_TOKEN`) goes through this
+/// one helper — see the module docs' "empty values are absent" section for
+/// why and for the exact upstream comparison. A present-but-empty value
+/// (after trimming ASCII whitespace) is treated as ABSENT, not as a real
+/// value that happens to be `""`.
+fn env_nonempty(env: &dyn Fn(&str) -> Option<String>, key: &str) -> Option<String> {
+    env(key).filter(|value| !value.trim().is_empty())
 }
 
 /// `true` for any of `huggingface_hub`'s own `ENV_VARS_TRUE_VALUES` —
@@ -314,6 +424,30 @@ mod tests {
 
     fn no_env(_: &str) -> Option<String> {
         None
+    }
+
+    // --- env_nonempty: present-but-empty is absent (#481 fix round 3) ---
+
+    #[test]
+    fn env_nonempty_treats_present_but_empty_as_absent() {
+        let env = |k: &str| match k {
+            "EMPTY" => Some(String::new()),
+            "WHITESPACE" => Some("   ".to_string()),
+            "VALUE" => Some("v".to_string()),
+            _ => None,
+        };
+        assert_eq!(
+            env_nonempty(&env, "EMPTY"),
+            None,
+            "a present-but-empty value must resolve to None"
+        );
+        assert_eq!(
+            env_nonempty(&env, "WHITESPACE"),
+            None,
+            "a whitespace-only value must resolve to None"
+        );
+        assert_eq!(env_nonempty(&env, "MISSING"), None);
+        assert_eq!(env_nonempty(&env, "VALUE"), Some("v".to_string()));
     }
 
     // --- precedence: cache root (config > HF_HUB_CACHE > HF_HOME > default) ---
@@ -376,6 +510,39 @@ mod tests {
         );
     }
 
+    /// #481 fix round 3: a present-but-empty `HF_HUB_CACHE` must fall
+    /// through to `HF_HOME`, not be used as a literal empty/CWD-relative
+    /// cache root.
+    #[test]
+    fn root_empty_hf_hub_cache_falls_through_to_hf_home() {
+        let config = ModelsConfig::default();
+        let env = |k: &str| match k {
+            "HF_HUB_CACHE" => Some(String::new()),
+            "HF_HOME" => Some("/env/root".to_string()),
+            _ => None,
+        };
+        assert_eq!(
+            resolve_root(&config, &env).unwrap(),
+            PathBuf::from("/env/root/hub"),
+            "an empty HF_HUB_CACHE must be treated as unset, falling through to HF_HOME"
+        );
+    }
+
+    /// #481 fix round 3: a present-but-empty `HF_HOME`, with `HF_HUB_CACHE`
+    /// also absent, must fall through to the platform home-dir default
+    /// rather than resolving to a `""`/CWD-relative root.
+    #[test]
+    fn root_empty_hf_home_falls_through_to_platform_home_dir() {
+        let config = ModelsConfig::default();
+        let env = |k: &str| (k == "HF_HOME").then(String::new);
+        let resolved = resolve_root(&config, &env).unwrap();
+        assert!(
+            resolved.ends_with(".cache/huggingface/hub"),
+            "an empty HF_HOME must be treated as unset, falling through to the platform \
+             home-dir default, got {resolved:?}"
+        );
+    }
+
     // --- precedence: endpoint (config > env > hf-hub default) ---
 
     #[test]
@@ -407,55 +574,135 @@ mod tests {
         assert_eq!(resolve_endpoint(&config, &no_env), None);
     }
 
-    // --- precedence: token (config > env > cache token file) ---
+    /// #481 fix round 3: a present-but-empty `HF_ENDPOINT` must resolve to
+    /// `None` (hf-hub's own default), never to a `""` endpoint URL.
+    #[test]
+    fn endpoint_empty_env_falls_back_to_none() {
+        let config = ModelsConfig::default();
+        let env = |k: &str| (k == "HF_ENDPOINT").then(String::new);
+        assert_eq!(resolve_endpoint(&config, &env), None);
+    }
+
+    // --- precedence: token (config > env > <HF_HOME>/token file) ---
 
     #[test]
     fn token_prefers_config_over_env_and_file() {
-        let dir = tempfile::tempdir().unwrap();
-        std::fs::write(dir.path().join("token"), "file-token\n").unwrap();
-        let cache = Cache::new(dir.path().join("hub"));
+        let home = tempfile::tempdir().unwrap();
+        std::fs::write(home.path().join("token"), "file-token\n").unwrap();
+        let home_path = home.path().to_str().unwrap().to_string();
         let config = ModelsConfig {
             hub_token: Some(SecretSource::Inline("config-token".into())),
             ..Default::default()
         };
-        let env = |k: &str| (k == "HF_TOKEN").then(|| "env-token".to_string());
+        let env = move |k: &str| match k {
+            "HF_TOKEN" => Some("env-token".to_string()),
+            "HF_HOME" => Some(home_path.clone()),
+            _ => None,
+        };
         assert_eq!(
-            resolve_token(&config, &env, &cache).unwrap(),
+            resolve_token(&config, &env).unwrap(),
             Some("config-token".into())
         );
     }
 
     #[test]
     fn token_falls_back_to_env_over_file() {
-        let dir = tempfile::tempdir().unwrap();
-        std::fs::write(dir.path().join("token"), "file-token\n").unwrap();
-        let cache = Cache::new(dir.path().join("hub"));
+        let home = tempfile::tempdir().unwrap();
+        std::fs::write(home.path().join("token"), "file-token\n").unwrap();
+        let home_path = home.path().to_str().unwrap().to_string();
         let config = ModelsConfig::default();
-        let env = |k: &str| (k == "HF_TOKEN").then(|| "env-token".to_string());
+        let env = move |k: &str| match k {
+            "HF_TOKEN" => Some("env-token".to_string()),
+            "HF_HOME" => Some(home_path.clone()),
+            _ => None,
+        };
         assert_eq!(
-            resolve_token(&config, &env, &cache).unwrap(),
+            resolve_token(&config, &env).unwrap(),
             Some("env-token".into())
         );
     }
 
     #[test]
-    fn token_falls_back_to_cache_file_when_config_and_env_absent() {
-        let dir = tempfile::tempdir().unwrap();
-        std::fs::write(dir.path().join("token"), "file-token\n").unwrap();
-        let cache = Cache::new(dir.path().join("hub"));
+    fn token_falls_back_to_home_file_when_config_and_env_absent() {
+        let home = tempfile::tempdir().unwrap();
+        std::fs::write(home.path().join("token"), "file-token\n").unwrap();
+        let home_path = home.path().to_str().unwrap().to_string();
         let config = ModelsConfig::default();
+        let env = move |k: &str| (k == "HF_HOME").then(|| home_path.clone());
         assert_eq!(
-            resolve_token(&config, &no_env, &cache).unwrap(),
+            resolve_token(&config, &env).unwrap(),
             Some("file-token".into())
         );
     }
 
     #[test]
     fn token_none_when_nothing_resolves() {
-        let dir = tempfile::tempdir().unwrap();
-        let cache = Cache::new(dir.path().join("hub"));
+        let home = tempfile::tempdir().unwrap();
+        let home_path = home.path().to_str().unwrap().to_string();
         let config = ModelsConfig::default();
-        assert_eq!(resolve_token(&config, &no_env, &cache).unwrap(), None);
+        let env = move |k: &str| (k == "HF_HOME").then(|| home_path.clone());
+        assert_eq!(resolve_token(&config, &env).unwrap(), None);
+    }
+
+    /// #481 fix round 3, BLOCK 2: the token file resolves from `<HF_HOME>/token`
+    /// -- completely INDEPENDENT of whichever tier won the cache-root
+    /// precedence. `HF_HUB_CACHE` here names a wholly different directory
+    /// holding no token file at all; `hf_hub::Cache::token_path`'s own "pop
+    /// the cache root's last path component" arithmetic (hf-hub 0.5's
+    /// comment: "Remove `\"hub\"`") would derive `parent(HF_HUB_CACHE)/token`
+    /// instead and silently miss the real file -- a user with `HF_HOME` +
+    /// a `huggingface-cli login` token who also sets `HF_HUB_CACHE` must
+    /// still authenticate.
+    #[test]
+    fn token_file_resolves_from_hf_home_independent_of_hf_hub_cache() {
+        let home = tempfile::tempdir().unwrap();
+        std::fs::write(home.path().join("token"), "home-token\n").unwrap();
+        let hub_cache = tempfile::tempdir().unwrap();
+        let config = ModelsConfig::default();
+        let home_path = home.path().to_str().unwrap().to_string();
+        let hub_cache_path = hub_cache.path().to_str().unwrap().to_string();
+        let env = move |k: &str| match k {
+            "HF_HOME" => Some(home_path.clone()),
+            "HF_HUB_CACHE" => Some(hub_cache_path.clone()),
+            _ => None,
+        };
+        assert_eq!(
+            resolve_token(&config, &env).unwrap(),
+            Some("home-token".into()),
+            "the token file must resolve from HF_HOME/token even when HF_HUB_CACHE names an \
+             unrelated directory with no hub/ suffix to pop"
+        );
+    }
+
+    /// #481 fix round 3, BLOCK 1 (advisory: `HF_TOKEN` mirror): a
+    /// present-but-empty `HF_TOKEN` must fall through to the token file,
+    /// never resolve to an empty bearer token.
+    #[test]
+    fn token_empty_hf_token_falls_through_to_home_file() {
+        let home = tempfile::tempdir().unwrap();
+        std::fs::write(home.path().join("token"), "file-token\n").unwrap();
+        let home_path = home.path().to_str().unwrap().to_string();
+        let config = ModelsConfig::default();
+        let env = move |k: &str| match k {
+            "HF_TOKEN" => Some(String::new()),
+            "HF_HOME" => Some(home_path.clone()),
+            _ => None,
+        };
+        assert_eq!(
+            resolve_token(&config, &env).unwrap(),
+            Some("file-token".into()),
+            "an empty HF_TOKEN must be treated as absent, falling through to the token file"
+        );
+    }
+
+    #[test]
+    fn token_file_path_empty_hf_home_falls_back_to_injected_home_dir() {
+        let env = |k: &str| (k == "HF_HOME").then(String::new);
+        let path = token_file_path(&env, || Some(PathBuf::from("/injected/home")));
+        assert_eq!(
+            path,
+            Some(PathBuf::from("/injected/home/.cache/huggingface/token"))
+        );
     }
 
     // --- Debug never prints the Hub token ---
@@ -606,6 +853,36 @@ mod tests {
             !resolve_offline(&config, &env),
             "HF_HUB_OFFLINE, even falsy, must win over TRANSFORMERS_OFFLINE -- the alias is \
              consulted only when HF_HUB_OFFLINE is absent from the environment entirely"
+        );
+    }
+
+    /// #481 fix round 3, BLOCK 1: a present-but-empty `HF_HUB_OFFLINE`
+    /// (`Some("")`, exactly what `std::env::var("HF_HUB_OFFLINE").ok()`
+    /// yields for `HF_HUB_OFFLINE=` in a Compose/K8s env block) must NOT
+    /// shadow the `TRANSFORMERS_OFFLINE` alias the way `Some("0")` correctly
+    /// does above -- `huggingface_hub` itself resolves this exact shape
+    /// offline (`os.environ.get("HF_HUB_OFFLINE") or
+    /// os.environ.get("TRANSFORMERS_OFFLINE")`, where Python's `or` skips a
+    /// `""` left side), so jammi fail-open here was a real divergence from
+    /// upstream, not merely a stricter reading of it.
+    ///
+    /// RED at 7c581c89 (pre-`env_nonempty`): `env("HF_HUB_OFFLINE")` yields
+    /// `Some(String::new())`, `Option::or_else` never fires because the
+    /// `Option` is already `Some`, and `is_hf_hub_offline_truthy("")` is
+    /// `false` -- `resolve_offline` returns `false` (online) instead of the
+    /// `true` a present `TRANSFORMERS_OFFLINE=1` demands.
+    #[test]
+    fn offline_empty_hf_hub_offline_falls_through_to_transformers_offline() {
+        let config = ModelsConfig::default();
+        let env = |k: &str| match k {
+            "HF_HUB_OFFLINE" => Some(String::new()),
+            "TRANSFORMERS_OFFLINE" => Some("1".to_string()),
+            _ => None,
+        };
+        assert!(
+            resolve_offline(&config, &env),
+            "an empty HF_HUB_OFFLINE must be treated as unset, falling through to \
+             TRANSFORMERS_OFFLINE=1"
         );
     }
 

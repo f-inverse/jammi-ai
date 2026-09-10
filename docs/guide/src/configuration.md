@@ -271,12 +271,18 @@ every provider's fields, the credential precedence, and the segment layout on
 disk.
 
 **`models`** — the Hugging Face Hub cache root, endpoint, token, and offline
-switch. Default: every field unset (cache root falls back to `HF_HUB_CACHE`
-— used directly as the cache root, nothing appended — then `HF_HOME`, then
-the platform home directory; endpoint falls back to `HF_ENDPOINT`, then the
-Hub's own default; token falls back to `HF_TOKEN`, then the cache's own
-`token` file; offline falls back to `HF_HUB_OFFLINE`, then `TRANSFORMERS_OFFLINE`
-when `HF_HUB_OFFLINE` is itself unset, then `false`).
+switch. Default: every field unset (cache root falls back to a non-empty
+`HF_HUB_CACHE` — used directly as the cache root, nothing appended — then a
+non-empty `HF_HOME`, then the platform home directory; endpoint falls back
+to a non-empty `HF_ENDPOINT`, then the Hub's own default; token falls back
+to a non-empty `HF_TOKEN`, then the `<HF_HOME>/token` file — resolved
+independently of whichever tier won the cache-root fallback, never derived
+from the cache root itself; offline falls back to a non-empty
+`HF_HUB_OFFLINE`, then `TRANSFORMERS_OFFLINE` when `HF_HUB_OFFLINE` is
+itself unset or present-but-empty, then `false`). A present-but-empty `HF_*`
+value — the shape a Compose/Kubernetes env block or a shell `export FOO=`
+produces — is treated identically to an unset one at every one of these
+tiers, never as a literal empty value.
 
 ```toml
 [models]

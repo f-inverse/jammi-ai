@@ -216,12 +216,24 @@ async fn warm_cache_across_a_second_hub_source_issues_no_requests() {
 /// injected env with NO `[models] offline` override at all — the SAME
 /// "offline refusal by name" as `offline_miss_refuses_by_name_with_no_catalog_row`
 /// above, but driven entirely from the environment fallback.
-#[tokio::test]
+///
+/// A `MockServer` is mounted and wired in as `hub_endpoint` (never actually
+/// hit if the refusal is real) so this is a MEASURED refusal-before-request,
+/// not merely an error message that happens to say "offline" for the wrong
+/// reason: `received_requests()` must come back empty.
+#[tokio::test(flavor = "multi_thread")]
 async fn hf_hub_offline_env_refuses_by_name_with_no_config_override() {
+    let server = MockServer::start().await;
+    mount_repo_file(&server, "acme/env-only-offline", "config.json", BODY).await;
+
     let dir = tempfile::tempdir().unwrap();
     let catalog = Arc::new(Catalog::open(dir.path()).await.unwrap());
     let env = |k: &str| (k == "HF_HUB_OFFLINE").then(|| "1".to_string());
-    let offline_hub = HubSource::from_config(&offline_test_models_config(), &env).unwrap();
+    let config = ModelsConfig {
+        hub_endpoint: Some(server.uri()),
+        ..offline_test_models_config()
+    };
+    let offline_hub = HubSource::from_config(&config, &env).unwrap();
     assert!(
         offline_hub.offline(),
         "HF_HUB_OFFLINE=1 must be honoured when [models] offline is unset"
@@ -250,6 +262,10 @@ async fn hf_hub_offline_env_refuses_by_name_with_no_config_override() {
         }
         other => panic!("expected JammiError::Model, got {other:?}"),
     }
+    assert!(
+        server.received_requests().await.unwrap().is_empty(),
+        "an offline refusal must never reach the network -- the mock received a request"
+    );
 }
 
 /// #481 fix round 2, BLOCK reproducer: `HF_HUB_OFFLINE=ON` — a truthy value
@@ -266,12 +282,19 @@ async fn hf_hub_offline_env_refuses_by_name_with_no_config_override() {
 /// thread '...::hf_hub_offline_on_refuses_by_name_with_no_config_override' panicked at crates/jammi-ai/tests/it/hub_source.rs:...:
 /// HF_HUB_OFFLINE=ON must be honoured when [models] offline is unset -- widen is_hf_hub_offline_truthy to accept huggingface_hub's ENV_VARS_TRUE_VALUES
 /// ```
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread")]
 async fn hf_hub_offline_on_refuses_by_name_with_no_config_override() {
+    let server = MockServer::start().await;
+    mount_repo_file(&server, "acme/env-only-offline-on", "config.json", BODY).await;
+
     let dir = tempfile::tempdir().unwrap();
     let catalog = Arc::new(Catalog::open(dir.path()).await.unwrap());
     let env = |k: &str| (k == "HF_HUB_OFFLINE").then(|| "ON".to_string());
-    let offline_hub = HubSource::from_config(&offline_test_models_config(), &env).unwrap();
+    let config = ModelsConfig {
+        hub_endpoint: Some(server.uri()),
+        ..offline_test_models_config()
+    };
+    let offline_hub = HubSource::from_config(&config, &env).unwrap();
     assert!(
         offline_hub.offline(),
         "HF_HUB_OFFLINE=ON must be honoured when [models] offline is unset -- widen \
@@ -301,17 +324,34 @@ async fn hf_hub_offline_on_refuses_by_name_with_no_config_override() {
         }
         other => panic!("expected JammiError::Model, got {other:?}"),
     }
+    assert!(
+        server.received_requests().await.unwrap().is_empty(),
+        "an offline refusal must never reach the network -- the mock received a request"
+    );
 }
 
 /// #481 fix round 2: `TRANSFORMERS_OFFLINE=1`, with `HF_HUB_OFFLINE` and
 /// `[models] offline` both unset, must be honoured as the same fallback
 /// `huggingface_hub` itself applies for this variable.
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread")]
 async fn transformers_offline_env_refuses_by_name_with_no_config_override() {
+    let server = MockServer::start().await;
+    mount_repo_file(
+        &server,
+        "acme/transformers-offline-only",
+        "config.json",
+        BODY,
+    )
+    .await;
+
     let dir = tempfile::tempdir().unwrap();
     let catalog = Arc::new(Catalog::open(dir.path()).await.unwrap());
     let env = |k: &str| (k == "TRANSFORMERS_OFFLINE").then(|| "1".to_string());
-    let offline_hub = HubSource::from_config(&offline_test_models_config(), &env).unwrap();
+    let config = ModelsConfig {
+        hub_endpoint: Some(server.uri()),
+        ..offline_test_models_config()
+    };
+    let offline_hub = HubSource::from_config(&config, &env).unwrap();
     assert!(
         offline_hub.offline(),
         "TRANSFORMERS_OFFLINE=1 must be honoured when HF_HUB_OFFLINE and [models] offline \
@@ -341,6 +381,68 @@ async fn transformers_offline_env_refuses_by_name_with_no_config_override() {
         }
         other => panic!("expected JammiError::Model, got {other:?}"),
     }
+    assert!(
+        server.received_requests().await.unwrap().is_empty(),
+        "an offline refusal must never reach the network -- the mock received a request"
+    );
+}
+
+/// #481 fix round 3, BLOCK 1 reproducer (t1): a present-but-empty
+/// `HF_HUB_OFFLINE` (`HF_HUB_OFFLINE=` in a Compose/K8s env block, which the
+/// production closure `std::env::var(k).ok()` — `crate::session` —
+/// resolves to `Some("")`) must not shadow `TRANSFORMERS_OFFLINE=1`: the
+/// alias must still be honoured, offline by name, with the mock never
+/// touched.
+#[tokio::test(flavor = "multi_thread")]
+async fn hf_hub_offline_empty_falls_through_to_transformers_offline_refuses_by_name() {
+    let server = MockServer::start().await;
+    mount_repo_file(&server, "acme/empty-offline-alias", "config.json", BODY).await;
+
+    let dir = tempfile::tempdir().unwrap();
+    let catalog = Arc::new(Catalog::open(dir.path()).await.unwrap());
+    let env = |k: &str| match k {
+        "HF_HUB_OFFLINE" => Some(String::new()),
+        "TRANSFORMERS_OFFLINE" => Some("1".to_string()),
+        _ => None,
+    };
+    let config = ModelsConfig {
+        hub_endpoint: Some(server.uri()),
+        ..offline_test_models_config()
+    };
+    let offline_hub = HubSource::from_config(&config, &env).unwrap();
+    assert!(
+        offline_hub.offline(),
+        "an empty HF_HUB_OFFLINE must be treated as unset, falling through to \
+         TRANSFORMERS_OFFLINE=1"
+    );
+    let resolver =
+        ModelResolver::new(catalog, crate::common::test_artifact_store(), offline_hub).unwrap();
+
+    let err = match resolver
+        .resolve(
+            &ModelSource::hf("acme/empty-offline-alias"),
+            ModelTask::TextEmbedding,
+            None,
+        )
+        .await
+    {
+        Ok(_) => panic!("expected an offline refusal, got a resolved model"),
+        Err(e) => e,
+    };
+    match err {
+        JammiError::Model { model_id, message } => {
+            assert_eq!(model_id, "acme/empty-offline-alias");
+            assert!(
+                message.contains("offline") && message.contains("acme/empty-offline-alias"),
+                "expected the offline refusal to name the repo id, got: {message}"
+            );
+        }
+        other => panic!("expected JammiError::Model, got {other:?}"),
+    }
+    assert!(
+        server.received_requests().await.unwrap().is_empty(),
+        "an offline refusal must never reach the network -- the mock received a request"
+    );
 }
 
 /// #481 fix round 2, advisory A4: a fetch driven entirely by `HF_HUB_CACHE`
@@ -524,6 +626,109 @@ async fn no_token_no_authorization_header() {
     }
 }
 
+/// #481 fix round 3, BLOCK 2 reproducer (t2): a user with `HF_HOME` set
+/// (and a `huggingface-cli login` token file there) who ALSO sets
+/// `HF_HUB_CACHE` -- a DIFFERENT directory with no `hub` component to pop
+/// -- must still authenticate: the token comes from `<HF_HOME>/token`,
+/// independent of the cache root, while the downloaded artifact still lands
+/// under the `HF_HUB_CACHE` root the cache-root precedence actually
+/// resolved.
+#[tokio::test(flavor = "multi_thread")]
+async fn hf_home_token_file_used_with_hf_hub_cache_set_file_lands_under_hf_hub_cache() {
+    let server = MockServer::start().await;
+    mount_repo_file(&server, REPO_ID, FILENAME, BODY).await;
+
+    let hf_home = tempfile::tempdir().unwrap();
+    std::fs::write(hf_home.path().join("token"), "home-token\n").unwrap();
+    let hf_hub_cache = tempfile::tempdir().unwrap();
+
+    let config = ModelsConfig {
+        hub_endpoint: Some(server.uri()),
+        hub_cache_dir: None,
+        hub_token: None,
+        offline: None,
+    };
+    let hf_home_path = hf_home.path().to_str().unwrap().to_string();
+    let hf_hub_cache_path = hf_hub_cache.path().to_str().unwrap().to_string();
+    let env = move |k: &str| match k {
+        "HF_HOME" => Some(hf_home_path.clone()),
+        "HF_HUB_CACHE" => Some(hf_hub_cache_path.clone()),
+        _ => None,
+    };
+    let hub = HubSource::from_config(&config, &env).unwrap();
+
+    let downloaded = tokio::task::spawn_blocking({
+        let hub = hub.clone();
+        move || hub.api().model(REPO_ID.to_string()).get(FILENAME).unwrap()
+    })
+    .await
+    .unwrap();
+
+    assert!(
+        downloaded.starts_with(hf_hub_cache.path()),
+        "expected the downloaded file to land under {{HF_HUB_CACHE}}, got {downloaded:?}"
+    );
+    assert_eq!(std::fs::read(&downloaded).unwrap(), BODY);
+
+    let requests = server.received_requests().await.unwrap();
+    assert!(!requests.is_empty(), "the mock never received a request");
+    for req in &requests {
+        assert_eq!(
+            req.headers
+                .get("authorization")
+                .map(|v| v.to_str().unwrap()),
+            Some("Bearer home-token"),
+            "the token must come from <HF_HOME>/token even though HF_HUB_CACHE is also set"
+        );
+    }
+}
+
+/// #481 fix round 3 (t4): a present-but-empty `HF_TOKEN` must fall through
+/// to the `<HF_HOME>/token` file rather than resolving to an empty bearer
+/// token (or none at all).
+#[tokio::test(flavor = "multi_thread")]
+async fn empty_hf_token_falls_through_to_home_token_file() {
+    let server = MockServer::start().await;
+    mount_repo_file(&server, REPO_ID, FILENAME, BODY).await;
+
+    let hf_home = tempfile::tempdir().unwrap();
+    std::fs::write(hf_home.path().join("token"), "home-token\n").unwrap();
+    let root = tempfile::tempdir().unwrap();
+
+    let config = ModelsConfig {
+        hub_endpoint: Some(server.uri()),
+        hub_cache_dir: Some(root.path().to_path_buf()),
+        hub_token: None,
+        offline: Some(false),
+    };
+    let hf_home_path = hf_home.path().to_str().unwrap().to_string();
+    let env = move |k: &str| match k {
+        "HF_TOKEN" => Some(String::new()),
+        "HF_HOME" => Some(hf_home_path.clone()),
+        _ => None,
+    };
+    let hub = HubSource::from_config(&config, &env).unwrap();
+
+    tokio::task::spawn_blocking({
+        let hub = hub.clone();
+        move || hub.api().model(REPO_ID.to_string()).get(FILENAME).unwrap()
+    })
+    .await
+    .unwrap();
+
+    let requests = server.received_requests().await.unwrap();
+    assert!(!requests.is_empty());
+    for req in &requests {
+        assert_eq!(
+            req.headers
+                .get("authorization")
+                .map(|v| v.to_str().unwrap()),
+            Some("Bearer home-token"),
+            "an empty HF_TOKEN must be treated as absent, falling through to the token file"
+        );
+    }
+}
+
 // --- offline: hit / miss / warm-cache-miss, decided by the catalog alone ---
 
 /// Hit: a `HuggingFace`-shaped model id whose catalog row already carries a
@@ -580,14 +785,21 @@ async fn offline_hit_serves_from_catalog_without_hub_access() {
 }
 
 /// Miss: no catalog row at all for this repo id -> `offline = true` refuses
-/// by name, never attempting a Hub network call.
-#[tokio::test]
+/// by name, never attempting a Hub network call. A mounted `MockServer`
+/// wired in as `hub_endpoint` turns "never attempting" into a MEASURED
+/// property (`received_requests()` empty), not an implication from the
+/// error message's wording alone.
+#[tokio::test(flavor = "multi_thread")]
 async fn offline_miss_refuses_by_name_with_no_catalog_row() {
+    let server = MockServer::start().await;
+    mount_repo_file(&server, "acme/never-resolved", "config.json", BODY).await;
+
     let dir = tempfile::tempdir().unwrap();
     let catalog = Arc::new(Catalog::open(dir.path()).await.unwrap());
     let offline_hub = HubSource::from_config(
         &ModelsConfig {
             offline: Some(true),
+            hub_endpoint: Some(server.uri()),
             ..offline_test_models_config()
         },
         &|_: &str| None,
@@ -617,6 +829,10 @@ async fn offline_miss_refuses_by_name_with_no_catalog_row() {
         }
         other => panic!("expected JammiError::Model, got {other:?}"),
     }
+    assert!(
+        server.received_requests().await.unwrap().is_empty(),
+        "an offline refusal must never reach the network -- the mock received a request"
+    );
 }
 
 /// Warm-cache-miss: the Hub cache directory holds real, previously-downloaded

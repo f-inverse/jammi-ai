@@ -129,13 +129,26 @@ precedence step above `HF_HUB_CACHE`/`HF_HOME`/`HF_ENDPOINT`/`HF_TOKEN`/
 |---|---|
 | Cache root | `hub_cache_dir` (`hub/` appended) → `HF_HUB_CACHE` (used AS the cache root directly, nothing appended, matching `huggingface_hub`'s own convention) → `HF_HOME` (`hub/` appended) → the platform home directory's `.cache/huggingface` (`hub/` appended) |
 | Endpoint | `hub_endpoint` → `HF_ENDPOINT` → the Hub's own default |
-| Token | `hub_token` → `HF_TOKEN` → the cache's own `token` file (`huggingface-cli login`'s file) |
-| Offline | `offline`, when explicitly set → `HF_HUB_OFFLINE` → `TRANSFORMERS_OFFLINE` (only when `HF_HUB_OFFLINE` is itself unset — `huggingface_hub`'s own alias) → `false`; truthy for any of `"1"`, `"on"`, `"yes"`, `"true"` (case-insensitive, whitespace trimmed — `huggingface_hub`'s own `ENV_VARS_TRUE_VALUES`) |
+| Token | `hub_token` → `HF_TOKEN` → `<HF_HOME>/token` (`huggingface-cli login`'s file — resolved independently of whichever tier won the cache-root precedence above, never derived from the cache root itself) |
+| Offline | `offline`, when explicitly set → `HF_HUB_OFFLINE` → `TRANSFORMERS_OFFLINE` (only when `HF_HUB_OFFLINE` is itself unset or present-but-empty — `huggingface_hub`'s own alias) → `false`; truthy for any of `"1"`, `"on"`, `"yes"`, `"true"` (case-insensitive, whitespace trimmed — `huggingface_hub`'s own `ENV_VARS_TRUE_VALUES`) |
+
+**Empty values are absent:** every `HF_*` environment variable above
+(`HF_HUB_CACHE`, `HF_HOME`, `HF_ENDPOINT`, `HF_TOKEN`, `HF_HUB_OFFLINE`,
+`TRANSFORMERS_OFFLINE`) is treated as unset when it is *present but empty*
+(after trimming whitespace) — the shape a Compose/Kubernetes env block
+produces for a variable named with no value (`HF_HUB_OFFLINE:`), or a shell
+`export HF_TOKEN=`. This closes a fail-open gap where an empty
+`HF_HUB_OFFLINE` used to shadow the `TRANSFORMERS_OFFLINE` alias and silently
+resolve online.
 
 No home directory, no `HF_HUB_CACHE`, no `HF_HOME`, and no `hub_cache_dir` is
 a typed `JammiError::Config` at session construction — never a panic. A token
 that resolves from none of the three sends no `Authorization` header, the
-same as an anonymous `huggingface-cli` session.
+same as an anonymous `huggingface-cli` session. The token FILE is always
+`<HF_HOME>/token`, even when `HF_HUB_CACHE` wins the cache-root precedence
+above — `HF_HUB_CACHE` names the cache directory directly, with no `hub`
+path component to derive `HF_HOME` back out of, so the token lookup reads
+`HF_HOME` on its own rather than working backwards from the cache root.
 
 `offline = true` refuses every Hub *network* fetch: a `HuggingFace`-sourced
 model loads only when it resolves against `local:` or an already-populated

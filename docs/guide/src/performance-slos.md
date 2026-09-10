@@ -45,9 +45,9 @@ the emit box.
 |------|-----------|-------------|--------------------|-----------|----------------|
 | `fine_tune` | `train-scale` | 1 536 in-batch-negative pairs, one GradCache backward + AdamW step, `Device::Cpu` | 180.0 pairs/s | 30% rel. drop | throughput (pairs/s) |
 | `fine_tune_graph` | `graph-train-scale` | 8 communities × 64 nodes, biased-walk sampler (walk length 4, 4 walks/node) | 6 418.1 pairs/s | 30% rel. drop | sampled-pairs/s throughput (+ a portable determinism digest) |
-| `train_context_predictor` | `context-predictor-scale` | CNP over 8 tasks × 18 rows, 30 epochs | 21.29 episode-steps/s | 30% rel. drop | meta-training throughput (+ a portable predict digest) |
-| `generate_embeddings` | `model-inference-scale` | 16 rows over a tiny 32-dim 1-layer BERT bundle, `Device::Cpu` | 333.6 rows/s | 30% rel. drop | coarse serving throughput (+ a portable embed digest) |
-| `infer` (classification) | `model-inference-scale` | 16 rows over a tiny 32-dim 1-layer ModernBERT classifier bundle, `Device::Cpu` | 207.0 rows/s | 30% rel. drop | coarse serving throughput (+ a portable infer digest) |
+| `train_context_predictor` | `context-predictor-scale` | CNP over 8 tasks × 18 rows, 30 epochs | 21.29 episode-steps/s | 30% rel. drop | meta-training throughput (+ a same-box predict digest) |
+| `generate_embeddings` | `model-inference-scale` | 16 rows over a tiny 32-dim 1-layer BERT bundle, `Device::Cpu` | 333.6 rows/s | 30% rel. drop | coarse serving throughput (+ a same-box embed digest) |
+| `infer` (classification) | `model-inference-scale` | 16 rows over a tiny 32-dim 1-layer ModernBERT classifier bundle, `Device::Cpu` | 207.0 rows/s | 30% rel. drop | coarse serving throughput (+ a same-box infer digest) |
 | `search` + `build_neighbor_graph` | `arxiv` | 2 000-row corpus slice, 100 held-out 768-dim queries (frozen sidecar) | recall@{1,10,100} = {1.0, 1.0, 0.997} | floor = measured − 0.04 (absolute margin) | **portable recall fraction** (not a rate) — `measured >= floor` |
 
 ### The reference box
@@ -77,9 +77,15 @@ own definition:
 > changes, not a number a different machine can re-derive.
 
 What stays portable is the *shape* of the gate (a measured rate must not fall
-more than a fixed fraction below the committed baseline) and the **determinism
-digests** and the **recall fraction**, which any box re-derives bit-for-bit. So
-the rate rows above are meaningful only against the reference box; do not read
+more than a fixed fraction below the committed baseline). Of the digests
+above, only the `fine_tune_graph` sampled-pair-set checksum and the **recall
+fraction** are portable — both fold over integer/ordering data (a seeded pair
+selection, a recall count), so any box re-derives them bit-for-bit. The
+predict/embed/infer digests fold an `f32` forward, and an `f32` reduction is
+NOT bit-identical across CPUs (SIMD/FMA contraction and BLAS reduction order
+differ by machine), so those three are a same-box property: each is
+re-derived on the box that ran it, not asserted equal across boxes. So the
+rate rows above are meaningful only against the reference box; do not read
 them as a throughput your hardware must hit. The release-tag gate is the
 authoritative reading because it runs on a same-box-ish runner; the nightly lane
 is early-warning, not a portable promise.

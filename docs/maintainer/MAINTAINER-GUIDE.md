@@ -1436,8 +1436,12 @@ tenant-scoped via the catalog resolution at the gRPC seam): read the named table
 recorded `ProducingDescriptor` (`recompute_one`/`replay_descriptor`), reconstruct the
 producing verb call from its typed parameters, and replay it through the **unmodified
 `BuildingTable::finish` funnel** with `CachePolicy::Bypass` (a recompute that reused
-a cache would be a no-op). Byte-identical when inputs haven't moved (the descriptor
-records every output-affecting determinant). A pre-contract table with no descriptor
+a cache would be a no-op). Byte-identical when inputs haven't moved, **on the
+producing host** (the descriptor records every output-affecting determinant,
+but not the CPU microarchitecture that ran the fold); on a different host the
+replay is value-equivalent up to float-ULP rounding, and the `definition_hash`
++ catalog row — not the raw bytes — is what a recompute-vs-original comparison
+is over. A pre-contract table with no descriptor
 is the typed `JammiError::NotRecomputable` — a loud refusal, never a re-run guessed
 from columns.
 
@@ -1951,8 +1955,13 @@ on `cascade`:
 `recompute_one` → `replay_descriptor` (`crates/jammi-ai/src/pipeline/recompute.rs`)
 dispatches on the descriptor variant and **always calls the producer with
 `CachePolicy::Bypass`** — a recompute that reused a cache would be a no-op, not a recompute.
-The replay is **byte-identical when inputs have not moved**, because the descriptor records
-every output-affecting determinant. Per-variant subtleties:
+The replay is **byte-identical when inputs have not moved, on the producing
+host** — the descriptor records every output-affecting determinant, but the
+producing host's CPU microarchitecture is not one of them, so a replay on a
+different CPU host is value-equivalent, not asserted byte-identical (identity
+is the catalog row + `definition_hash`; see
+`docs/guide/src/materialization-contract.md`).
+Per-variant subtleties:
 - The many `*_from_manifest` helpers are the reverse of the descriptor-recording `*_for`
   functions — mapping each manifest enum mirror back onto its AI-crate type.
 - The intricate case is **`ContextSet`**: its real producer is the
@@ -3905,7 +3914,8 @@ auto-available to every encoder.)
 - **Determinism is name-keyed, not order-keyed.** Every LoRA A/B draw and dropout mask is a pure
   function of `(seed, fully-qualified-param-name)` via `seed_for_param`
   (`crates/jammi-lora/src/seeded.rs`) — never candle's global RNG, never VarMap/HashMap order. On
-  CPU the same `(seed, rows, config)` → byte-identical adapters. The qualified name must match
+  one CPU host the same `(seed, rows, config)` → byte-identical adapters; this is a same-box
+  guarantee, not a cross-host one (see the numerics note below). The qualified name must match
   candle's `VarBuilder::path` join.
 - **In-place Var overwrite is load-bearing** — seeded init and resume restore write into the
   *registered* Var's storage; replacing the field with a fresh clone severs the optimizer binding
@@ -3942,10 +3952,15 @@ auto-available to every encoder.)
 
 **Numerics**
 
-- **Single-architecture determinism only** — f32/f64 summation order is fixed *per binary* but
-  **not bit-equivalent across x86_64/aarch64**. Do not add parallel reduction (rayon, non-fixed-lane
-  SIMD) — it breaks even the single-arch guarantee. Cross-arch reproducibility is an explicit
-  non-goal.
+- **Same-box determinism only** — f32/f64 summation order is fixed *per binary* on the box that
+  ran it, but is **not bit-equivalent across x86_64/aarch64, nor across two hosts of the same
+  architecture** (candle's vector paths are compile-time `#[cfg(target_feature)]`, and
+  `gemm`/`pulp` dispatch the actual SIMD/FMA kernel at runtime off the host's detected features —
+  two same-arch boxes with different detected feature sets can pick a different kernel and differ
+  in the last bits; measured directly by `bits_snapshot.rs`, which pins per-box, not per
+  `(target_arch, target_os)`). Do not add parallel reduction (rayon, non-fixed-lane SIMD) — it
+  breaks even the single-box guarantee. Cross-arch reproducibility AND cross-box same-arch
+  reproducibility are both explicit non-goals.
 - **f32 vs f64 reduction asymmetry is intentional** — `cosine_distance`/`cosine_similarity` in f32,
   `vector_norm`/`cosine_f64` in f64; not interchangeable (shifts last-bit results and can flip a
   tie-break).

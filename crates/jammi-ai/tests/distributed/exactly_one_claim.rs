@@ -94,7 +94,7 @@ async fn one_job_n_workers_exactly_one_wins() {
         .expect("a completed job records its claimer");
     let claimer_label = harness::label_of(&session, claimed_by).await;
     assert!(
-        worker_labels.iter().any(|w| *w == claimer_label),
+        worker_labels.contains(&claimer_label),
         "claimed_by {claimed_by:?} (label {claimer_label:?}) must be one of the spawned \
          workers {worker_labels:?}"
     );

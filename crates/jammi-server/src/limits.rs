@@ -88,9 +88,21 @@
 //! * a `grpc-timeout` header ABOVE the budget is refused at the edge, before
 //!   the stream ever opens (`DEADLINE_EXCEEDED`, [`RefusedBound::Timeout`]) —
 //!   the caller asked for more than the deployment allows.
-//! * a `grpc-timeout` header WITHIN the budget is honoured as-is: no
-//!   additional server-side deadline is layered on top of the caller's own
-//!   declared one.
+//! * a `grpc-timeout` header WITHIN the budget is ENFORCED by the server: the
+//!   stream opens normally, but [`PermitBody::Deadlined`] races the response
+//!   body against a timer armed for the caller's OWN declared deadline, and
+//!   once it elapses with the stream still open, closes it with a
+//!   `DEADLINE_EXCEEDED` trailer — the same mechanism the header-less arm
+//!   below uses, just armed for the caller's declared duration instead of the
+//!   budget. This is deliberate, not merely "honoured as-is": tonic's own
+//!   `GrpcTimeout` middleware (`Server::builder()`'s `.timeout()`) races only
+//!   the service future, never a streaming response body once it has already
+//!   been returned (`tonic-0.14.5/src/transport/service/grpc_timeout.rs:79-92`)
+//!   — so without this, a `WaitJob`/`Subscribe` caller that declared a
+//!   deadline under the budget and then simply ignored it (never dropping the
+//!   stream itself) would hold its `max_job_waits`/`max_subscriptions` permit
+//!   forever, past its own declared deadline, for as long as the connection
+//!   stayed up.
 //! * NO `grpc-timeout` header at all (HTTP/2's own no-deadline default — the
 //!   shape a header-less client, e.g. a Python-shaped one with no explicit
 //!   timeout, sends) is NOT refused. Instead the configured budget itself
@@ -206,13 +218,38 @@ fn limits_status(code: Code, message: String) -> Status {
 /// `server.limits.wait_timeout_secs` elapses — mirrors the edge-refusal
 /// message's wording (`server.limits.wait_timeout_secs (Ns)`) so a client sees
 /// the same budget cited whether it was refused up front (an over-budget
-/// header) or timed out mid-stream (no header at all).
+/// header) or timed out mid-stream (no header at all). Used ONLY for the
+/// header-less arm — see [`declared_deadline_message`] for the
+/// within-budget-header arm, which closes for a different reason and must
+/// not claim "no grpc-timeout header" when one was in fact present.
 fn deadline_message(cap: Duration) -> String {
     format!(
         "server.limits.wait_timeout_secs ({}s) elapsed with no grpc-timeout \
          header bounding this stream — the configured budget became this \
          stream's deadline",
         cap.as_secs()
+    )
+}
+
+/// The message [`PermitBody::Deadlined`] closes a stream with once a
+/// caller's OWN `grpc-timeout` header (already checked to be within
+/// `server.limits.wait_timeout_secs` — an over-budget header is refused at
+/// the edge before the stream ever opens) elapses. Distinct wording from
+/// [`deadline_message`]'s header-less arm: this stream WAS bounded by a
+/// declared header, so the trailer must say so, not claim none was present.
+/// The server enforcing this deadline itself (rather than leaving it to the
+/// caller) is load-bearing: tonic's own `GrpcTimeout` middleware races only
+/// the service future, never a streaming response body already returned
+/// (`tonic-0.14.5/src/transport/service/grpc_timeout.rs:79-92`), so a caller
+/// that ignores its own declared deadline would otherwise hold this stream's
+/// `max_job_waits`/`max_subscriptions` permit forever.
+fn declared_deadline_message(requested: Duration) -> String {
+    format!(
+        "the caller's own declared grpc-timeout ({}s) elapsed with this stream \
+         still open — the server enforces a declared deadline on a streaming \
+         response body itself, since tonic's own GrpcTimeout never bounds one \
+         once returned",
+        requested.as_secs()
     )
 }
 
@@ -625,12 +662,17 @@ where
             // deadline of its own by default. Three arms — see the module
             // docs' "Streaming-path exemption" section:
             //   * a header ABOVE the budget is refused at the edge (unchanged);
-            //   * a header WITHIN the budget is honoured as-is (no extra
-            //     server-side deadline layered on top);
+            //   * a header WITHIN the budget is now ENFORCED by the server
+            //     itself, at the caller's own declared deadline — tonic's own
+            //     GrpcTimeout races only the service future, never a
+            //     streaming response body already returned, so a caller that
+            //     ignores its own deadline used to hold this stream's permit
+            //     forever (`deadline`, applied below via
+            //     `PermitBody::Deadlined`, same as the header-less arm);
             //   * NO header at all is NOT refused — the budget itself becomes
             //     this stream's deadline (`deadline`, applied below via
             //     `PermitBody::Deadlined`).
-            let mut deadline: Option<Duration> = None;
+            let mut deadline: Option<(Duration, String)> = None;
             if let Some(cap) = self.layer.wait_timeout {
                 match parse_grpc_timeout(req.headers()) {
                     Some(requested) if requested > cap => {
@@ -647,8 +689,10 @@ where
                             .map(PermitBody::Passthrough))
                         });
                     }
-                    Some(_) => {}
-                    None => deadline = Some(cap),
+                    Some(requested) => {
+                        deadline = Some((requested, declared_deadline_message(requested)))
+                    }
+                    None => deadline = Some((cap, deadline_message(cap))),
                 }
             }
 
@@ -726,13 +770,16 @@ where
 ///   `max_job_waits` stream-budget permit) released when the body reaches its
 ///   end frame OR is dropped (a client disconnect mid-stream, or the
 ///   connection dropping) — whichever happens first.
-/// * `Deadlined` — the same permit release as `Permitted`, PLUS a
-///   `server.limits.wait_timeout_secs` timer racing the inner body: if the
-///   inner body has not reached its end frame once the timer fires, this body
-///   synthesizes a `DEADLINE_EXCEEDED` trailer frame and ends the stream there
-///   — the header-less-request arm of the module docs' "Streaming-path
-///   exemption" section. Once fired, every subsequent poll returns `None`
-///   (`fired`) — a body must not emit a frame after its trailers.
+/// * `Deadlined` — the same permit release as `Permitted`, PLUS a timer
+///   racing the inner body: if the inner body has not reached its end frame
+///   once the timer fires, this body synthesizes a `DEADLINE_EXCEEDED`
+///   trailer frame and ends the stream there — either the header-less-request
+///   arm (the timer is `server.limits.wait_timeout_secs`) OR the
+///   within-budget-header arm (the timer is the caller's own declared
+///   deadline) of the module docs' "Streaming-path exemption" section; `message`
+///   carries the arm-appropriate wording (see `deadline_message` /
+///   `declared_deadline_message`). Once fired, every subsequent poll returns
+///   `None` (`fired`) — a body must not emit a frame after its trailers.
 #[pin_project(project = PermitBodyProj)]
 pub enum PermitBody<B> {
     Passthrough(#[pin] B),
@@ -755,15 +802,21 @@ pub enum PermitBody<B> {
 impl<B> PermitBody<B> {
     /// Build the right variant for a streaming response: no permit and no
     /// deadline is a bare passthrough; a `deadline` (the header-less-request
-    /// arm) always produces `Deadlined`, with or without a permit; otherwise
-    /// (`permit` alone) `Permitted`, matching the pre-existing shape.
-    fn new(inner: B, permit: Option<OwnedSemaphorePermit>, deadline: Option<Duration>) -> Self {
+    /// arm, OR the within-budget-header arm — either way a `(duration,
+    /// arm-appropriate message)` pair) always produces `Deadlined`, with or
+    /// without a permit; otherwise (`permit` alone) `Permitted`, matching the
+    /// pre-existing shape.
+    fn new(
+        inner: B,
+        permit: Option<OwnedSemaphorePermit>,
+        deadline: Option<(Duration, String)>,
+    ) -> Self {
         match deadline {
-            Some(cap) => PermitBody::Deadlined {
+            Some((cap, message)) => PermitBody::Deadlined {
                 inner,
                 permit,
                 sleep: tokio::time::sleep(cap),
-                message: deadline_message(cap),
+                message,
                 fired: false,
             },
             None => match permit {
@@ -836,11 +889,19 @@ where
                     *fired = true;
                     let status = limits_status(Code::DeadlineExceeded, message.clone());
                     let mut headers = HeaderMap::new();
-                    // The message is a fixed, ASCII format string (see
-                    // `deadline_message`) — encoding it as a gRPC trailer
-                    // cannot fail; an empty header map on the (unreachable)
-                    // error path still ends the stream, just without the
-                    // typed detail.
+                    // The message is a fixed, ASCII format string built by
+                    // this module (`deadline_message` / `declared_deadline_message`)
+                    // — encoding it as a gRPC trailer cannot fail in practice, so
+                    // this path is unreachable. The `let _ =` is not "degrades
+                    // gracefully": an empty `HeaderMap` here would carry NO
+                    // `grpc-status` at all (not merely a status without the
+                    // typed detail) — the stream would end with no decodable
+                    // terminal code, a real client-visible fault, not a lesser
+                    // but still-honest one. Kept infallible-by-construction on
+                    // purpose rather than a `.expect(...)`: a panic inside
+                    // `poll_frame` would abort the whole connection, a strictly
+                    // worse failure mode than the (unreachable) missing-trailer
+                    // shape this comment now names honestly.
                     let _ = status.add_header(&mut headers);
                     return Poll::Ready(Some(Ok(Frame::trailers(headers))));
                 }
@@ -1265,6 +1326,81 @@ mod tests {
         assert!(
             started.elapsed() >= budget,
             "the deadline must not fire before the budget elapses"
+        );
+    }
+
+    /// RED before the fix (#485 round 4): the `grpc-timeout` match's within-
+    /// budget arm used to be `Some(_) => {}`, leaving `deadline = None` — the
+    /// stream then ran forever once opened, since tonic's own `GrpcTimeout`
+    /// never bounds a streaming response body already returned (N4), so a
+    /// caller that declared a deadline under the budget and then simply
+    /// ignored it (never dropping the stream) held its `max_job_waits`/
+    /// `max_subscriptions` permit forever. GREEN after: the server itself
+    /// enforces the caller's OWN declared deadline via the same
+    /// `PermitBody::Deadlined` path the header-less arm uses — ending the
+    /// stream with `DEADLINE_EXCEEDED` at the REQUESTED duration (which is
+    /// strictly shorter than the configured budget here, proving the fix
+    /// keys off the header, not the wider budget) — and releasing the held
+    /// permit once it fires, exactly like every other `Deadlined` body.
+    #[tokio::test]
+    async fn method_class_wait_timeout_within_budget_header_ends_the_stream_at_the_declared_deadline_and_releases_the_permit(
+    ) {
+        // The configured budget is far wider than the declared header below,
+        // so a stream that ended at the BUDGET rather than the header would
+        // still be open when this test's own assertions run — the oracle
+        // that proves the fix keys off the caller's declared deadline, not
+        // merely reusing the budget's timer under a new name.
+        let budget = Duration::from_secs(60);
+        let declared = Duration::from_millis(60);
+        let job_waits = Arc::new(Semaphore::new(1));
+        let mut svc = MethodClassLayer {
+            request_timeout: None,
+            wait_timeout: Some(budget),
+            subscriptions: None,
+            job_waits: Some(Arc::clone(&job_waits)),
+        }
+        .layer(NeverEnding);
+
+        let started = std::time::Instant::now();
+        let resp = svc
+            .call(mk_req_with_grpc_timeout(WAIT_JOB_PATH, "60m"))
+            .await
+            .unwrap();
+        // NOT refused at open: within-budget headers open normally.
+        assert_not_refused(&resp);
+        assert_eq!(
+            job_waits.available_permits(),
+            0,
+            "the stream must hold its job_waits permit while open"
+        );
+
+        // `NeverEndingBody` never emits a frame on its own -- the ONLY frame
+        // this body can ever produce is the deadline's synthesized trailer.
+        let frames = drain_frames(resp.into_body()).await;
+        assert_eq!(
+            frames.len(),
+            1,
+            "exactly one synthesized DEADLINE_EXCEEDED trailer frame, then the stream ends"
+        );
+        let trailers = frames[0]
+            .trailers_ref()
+            .expect("the synthesized frame must be a trailers frame");
+        let status = tonic::Status::from_header_map(trailers)
+            .expect("the trailer frame must carry a decodable grpc-status");
+        assert_eq!(status.code(), Code::DeadlineExceeded);
+        assert!(
+            started.elapsed() >= declared,
+            "the deadline must not fire before the caller's own declared duration elapses"
+        );
+        assert!(
+            started.elapsed() < budget,
+            "the stream must end at the caller's declared deadline, not wait out the far \
+             wider configured budget"
+        );
+        assert_eq!(
+            job_waits.available_permits(),
+            1,
+            "the permit must be released once the synthesized deadline trailer ends the stream"
         );
     }
 

@@ -245,10 +245,28 @@ async fn wait_job_with_a_timeout_above_the_configured_budget_is_refused_at_the_e
     );
 }
 
-/// A `WaitJob` deadline WITHIN the configured budget is unaffected --
-/// the stream opens normally.
-#[tokio::test]
-async fn wait_job_with_a_timeout_within_the_configured_budget_opens_normally() {
+/// A `WaitJob` deadline WITHIN the configured budget opens normally AND is
+/// itself enforced by the server: the stream ends with `DEADLINE_EXCEEDED`
+/// at the CALLER's own declared deadline, never left open past it.
+///
+/// RED before the fix (#485 round 4): the `grpc-timeout` match's within-
+/// budget arm used to be `Some(_) => {}` — a within-budget header was
+/// "honoured as-is", meaning nothing server-side ever bounded the body, and
+/// tonic's own `GrpcTimeout` never enforces a `grpc-timeout` on a streaming
+/// response body already returned (races only the service future --
+/// `tonic-0.14.5/src/transport/service/grpc_timeout.rs:79-92`). A client
+/// that declared a deadline under the (here, far wider) budget and then
+/// ignored it — never dropping the stream itself — would hold its
+/// `max_job_waits` permit for as long as the connection stayed open, past
+/// its own declared 2s deadline, with nothing to end it before the 60s
+/// budget. GREEN after: the server itself ends the stream at the caller's
+/// declared 2s deadline, well before the 60s budget -- renamed from
+/// `wait_job_with_a_timeout_within_the_configured_budget_opens_normally`
+/// (its old name asserted only that the stream OPENED, never that it also
+/// correctly ENDS -- the gap this reshape closes).
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn wait_job_with_a_timeout_within_the_configured_budget_opens_normally_and_ends_at_the_declared_deadline(
+) {
     let server = start_engine_server_with_limits(LimitsConfig {
         wait_timeout_secs: Some(60),
         ..LimitsConfig::default()
@@ -265,16 +283,48 @@ async fn wait_job_with_a_timeout_within_the_configured_budget_opens_normally() {
     let mut request = tonic::Request::new(JobHandle {
         job_id: job.job_id.clone(),
     });
-    request.set_timeout(Duration::from_secs(5));
+    // Far below the 60s budget -- if the server mistakenly keyed the
+    // deadline off the wider BUDGET instead of this declared header, this
+    // test's own bounded drain loop below would time out waiting for a
+    // trailer that never arrives before it.
+    request.set_timeout(Duration::from_secs(2));
+    let started = std::time::Instant::now();
     let mut stream = client
         .wait_job(request)
         .await
         .expect("a within-budget WaitJob deadline must open normally")
         .into_inner();
-    tokio::time::timeout(Duration::from_secs(5), stream.message())
-        .await
-        .expect("the stream must emit a live progress frame")
-        .expect("wait_job frame");
+
+    // The job never goes terminal (no worker claims it), so drain live
+    // progress frames until the stream itself ends -- the ONLY way it can
+    // end is the caller's own declared deadline.
+    let mut saw_a_live_frame = false;
+    let terminal_status = loop {
+        match tokio::time::timeout(Duration::from_secs(5), stream.message()).await {
+            Ok(Ok(Some(_))) => saw_a_live_frame = true,
+            Ok(Ok(None)) => {
+                panic!("the stream ended cleanly with no error -- expected DEADLINE_EXCEEDED")
+            }
+            Ok(Err(status)) => break status,
+            Err(_) => panic!("the stream must end at the declared deadline, not hang past it"),
+        }
+    };
+    assert!(
+        saw_a_live_frame,
+        "the stream must be genuinely live before the deadline closes it, not refused at open"
+    );
+    assert_eq!(terminal_status.code(), Code::DeadlineExceeded);
+    assert!(
+        started.elapsed() >= Duration::from_secs(2),
+        "the stream must stay open for the full declared duration, not end early: {:?}",
+        started.elapsed()
+    );
+    assert!(
+        started.elapsed() < Duration::from_secs(10),
+        "the stream must end at the CALLER's declared deadline (2s), not wait out the far \
+         wider configured budget (60s): {:?}",
+        started.elapsed()
+    );
 }
 
 /// RED before the fix: a `WaitJob` call carrying NO `grpc-timeout` header at

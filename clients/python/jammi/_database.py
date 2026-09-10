@@ -1464,6 +1464,21 @@ class RemoteDatabase:
         breaks) rather than leaking. `predicate` is an optional SQL filter applied
         server-side; `from_offset` starts the replay at an offset (unset == live
         tail only). Maps to `TriggerService.Subscribe`.
+
+        This call sends no `grpc-timeout` header of its own (the header-less
+        shape a deployment's `[server.limits] wait_timeout_secs` budget is
+        meant to bound, per that key's own doc). When a deployment configures
+        that budget, the server itself ends the stream with
+        `DEADLINE_EXCEEDED` once it elapses, wherever the collect then
+        stands — and this method RAISES the mapped :class:`JammiError` at
+        that point (via `_rpc_to_jammi`); it does NOT return whatever batches
+        were collected so far. Those already-collected batches are simply
+        lost — this method has no side channel to hand them back once the
+        exception path is taken, so a caller that needs a partial result on a
+        budget-driven cutoff cannot get one from `subscribe_collect`; use a
+        `max_batches` the budget is known to satisfy, or drive the stream
+        manually instead. With no such budget configured, this genuinely
+        waits until `max_batches` is reached.
         """
         # The streaming lane opens its call directly rather than through `_call`,
         # so the closed-session guard is applied here explicitly.

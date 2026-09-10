@@ -11,13 +11,21 @@
 //!   wraps it in the canonical gRPC rich-error envelope ([`pb::RpcStatus`], the
 //!   `google.rpc.Status` shape) so the `grpc-status-details-bin` trailer is
 //!   spec-compliant and a gRPC-web client reads the real `code` + typed detail.
-//! * decode — [`From<pb::JammiErrorDetail> for JammiError`]; a remote client
-//!   reads the detail back off a [`Status`] via [`error_from_status`], which
-//!   unwraps the envelope's `Any`, and reconstructs the precise variant.
+//! * decode — [`jammi_error_from_detail`] (a free fn, not a `From` impl: an
+//!   unknown-oneof detail needs the enclosing `Status`'s own `message`
+//!   threaded in to reconstruct faithfully, and a `From` impl has nowhere to
+//!   take that second argument); a remote client reads the detail back off a
+//!   [`Status`] via [`error_from_status`], which unwraps the envelope's
+//!   `Any` and calls it to reconstruct the precise variant. The same shape —
+//!   a free fn taking `(detail, message)` — is used for every nested
+//!   engine-owned detail this file decodes ([`mutable_table_error_from_detail`],
+//!   `backend_error_from_detail`, [`channel_catalog_error_from_detail`],
+//!   [`trigger_error_from_detail`], `audit_error_from_detail`), for the same
+//!   reason.
 //!
-//! Both impls are orphan-rule-clean: `pb::JammiErrorDetail` is a local
-//! generated type, so `From` to/from the foreign `JammiError` is allowed
-//! without a newtype.
+//! The encode impl is orphan-rule-clean: `pb::JammiErrorDetail` is a local
+//! generated type, so `From<&JammiError>` for it is allowed without a
+//! newtype.
 //!
 //! The contract's fidelity boundary is precise, and faithfulness is a property
 //! of the error type — not of any one verb surface — so the mapping is complete
@@ -327,7 +335,9 @@ fn mutable_table_error_from_detail(
         Some(Variant::NotFound(s)) => reconstruct_id(s, MutableTableError::NotFound),
         Some(Variant::AlreadyExists(s)) => reconstruct_id(s, MutableTableError::AlreadyExists),
         Some(Variant::NoOrderColumn(_)) => MutableTableError::NoOrderColumn,
-        Some(Variant::Backend(e)) => MutableTableError::Backend(e.into()),
+        Some(Variant::Backend(e)) => {
+            MutableTableError::Backend(backend_error_from_detail(e, message))
+        }
         None => MutableTableError::Schema(message.to_string()),
     }
 }
@@ -467,45 +477,50 @@ impl From<&BackendError> for pb::BackendErrorDetail {
 }
 
 /// Reconstruct the [`BackendError`] from its wire detail — the inverse of the
-/// encode above. The `tenant_mismatch` arm re-parses the UUID strings (empty ==
-/// `None`); a non-empty string that fails to parse reconstructs as `None`, the
-/// only total option for a forged payload, since the variant's faithful path
-/// always carries a valid UUID. `Sqlx` reconstructs as `Execution` carrying the
-/// original `Display` string — the raw `sqlx::Error` cannot be rebuilt, so the
-/// faithful message lands in the nearest backend-owned string arm rather than
-/// escaping the taxonomy. A missing variant reconstructs as an empty
-/// `Execution`.
-impl From<pb::BackendErrorDetail> for BackendError {
-    fn from(detail: pb::BackendErrorDetail) -> Self {
-        use pb::backend_error_detail::Variant;
-        let parse_tenant = |s: String| -> Option<TenantId> {
-            if s.is_empty() {
-                None
-            } else {
-                s.parse().ok()
-            }
-        };
-        match detail.variant {
-            Some(Variant::Execution(m)) => BackendError::Execution(m),
-            Some(Variant::Constraint(c)) => BackendError::Constraint {
-                table: c.table,
-                detail: c.detail,
-            },
-            Some(Variant::Unavailable(m)) => BackendError::Unavailable(m),
-            Some(Variant::Retry(m)) => BackendError::Retry(m),
-            Some(Variant::Migration(m)) => BackendError::Migration(m),
-            Some(Variant::TypeConversion(t)) => BackendError::TypeConversion {
-                column: t.column,
-                detail: t.detail,
-            },
-            Some(Variant::TenantMismatch(t)) => BackendError::TenantMismatch {
-                table: t.table,
-                expected: parse_tenant(t.expected),
-                got: parse_tenant(t.got),
-            },
-            Some(Variant::Sqlx(m)) => BackendError::Execution(m),
-            None => BackendError::Execution(String::new()),
+/// encode above. A free fn, not a `From` impl: `message` is the enclosing
+/// `Status`'s own text (threaded through by both nesting callers,
+/// [`mutable_table_error_from_detail`] and [`trigger_error_from_detail`]),
+/// so a detail whose `variant` oneof is unset (an unknown oneof — a peer
+/// built against a newer contract that added a `BackendErrorDetail` variant
+/// this build's codegen does not know) reconstructs as
+/// `BackendError::Execution(message)` carrying that faithful text, never the
+/// empty string a bare `String::new()` would silently substitute. The
+/// `tenant_mismatch` arm re-parses the UUID strings (empty == `None`); a
+/// non-empty string that fails to parse reconstructs as `None`, the only
+/// total option for a forged payload, since the variant's faithful path
+/// always carries a valid UUID. `Sqlx` reconstructs as `Execution` carrying
+/// the original `Display` string — the raw `sqlx::Error` cannot be rebuilt,
+/// so the faithful message lands in the nearest backend-owned string arm
+/// rather than escaping the taxonomy.
+fn backend_error_from_detail(detail: pb::BackendErrorDetail, message: &str) -> BackendError {
+    use pb::backend_error_detail::Variant;
+    let parse_tenant = |s: String| -> Option<TenantId> {
+        if s.is_empty() {
+            None
+        } else {
+            s.parse().ok()
         }
+    };
+    match detail.variant {
+        Some(Variant::Execution(m)) => BackendError::Execution(m),
+        Some(Variant::Constraint(c)) => BackendError::Constraint {
+            table: c.table,
+            detail: c.detail,
+        },
+        Some(Variant::Unavailable(m)) => BackendError::Unavailable(m),
+        Some(Variant::Retry(m)) => BackendError::Retry(m),
+        Some(Variant::Migration(m)) => BackendError::Migration(m),
+        Some(Variant::TypeConversion(t)) => BackendError::TypeConversion {
+            column: t.column,
+            detail: t.detail,
+        },
+        Some(Variant::TenantMismatch(t)) => BackendError::TenantMismatch {
+            table: t.table,
+            expected: parse_tenant(t.expected),
+            got: parse_tenant(t.got),
+        },
+        Some(Variant::Sqlx(m)) => BackendError::Execution(m),
+        None => BackendError::Execution(message.to_string()),
     }
 }
 
@@ -581,12 +596,13 @@ impl From<&TriggerError> for pb::TriggerErrorDetail {
 /// Reconstruct the [`TriggerError`] from its wire detail — the inverse of the
 /// encode above. The nested engine-owned `backing_table` reconstructs through
 /// [`mutable_table_error_from_detail`] (also threaded `message`); `backend`
-/// reconstructs through its own `From<pb>` impl (out of this bind's scope —
-/// see the module doc's fidelity-limit note). `message` is the enclosing
-/// `Status`'s own text: a detail with no variant set (an unknown oneof)
-/// reconstructs as `TriggerError::Catalog(message)` — kept inside the trigger
-/// taxonomy rather than escaping, carrying the real fault text instead of a
-/// fabricated empty string.
+/// reconstructs through `backend_error_from_detail`, also threaded
+/// `message` — so an unknown `BackendErrorDetail` oneof nested under
+/// `TriggerError::Backend` carries the real fault text too, not an empty
+/// string. `message` is the enclosing `Status`'s own text: a detail with no
+/// variant set (an unknown oneof) reconstructs as `TriggerError::Catalog(message)`
+/// — kept inside the trigger taxonomy rather than escaping, carrying the real
+/// fault text instead of a fabricated empty string.
 fn trigger_error_from_detail(detail: pb::TriggerErrorDetail, message: &str) -> TriggerError {
     use pb::trigger_error_detail::Variant;
     match detail.variant {
@@ -611,7 +627,7 @@ fn trigger_error_from_detail(detail: pb::TriggerErrorDetail, message: &str) -> T
         Some(Variant::BackingTable(e)) => {
             TriggerError::BackingTable(mutable_table_error_from_detail(e, message))
         }
-        Some(Variant::Backend(e)) => TriggerError::Backend(e.into()),
+        Some(Variant::Backend(e)) => TriggerError::Backend(backend_error_from_detail(e, message)),
         Some(Variant::Driver(m)) => TriggerError::Driver(m),
         Some(Variant::Catalog(m)) => TriggerError::Catalog(m),
         None => TriggerError::Catalog(message.to_string()),
@@ -1034,6 +1050,91 @@ mod tests {
                  Status's own message, never an empty string"
             ),
             other => panic!("expected JammiError::Other, got {other:?}"),
+        }
+    }
+
+    /// A shadow message sharing NO field number with `pb::BackendErrorDetail`'s
+    /// oneof (1-8) -- decoding its bytes AS a `BackendErrorDetail` therefore
+    /// always leaves `variant` unset, the same shape prost produces for a
+    /// genuinely newer, unrecognized oneof tag on that nested detail.
+    #[derive(Clone, PartialEq, ::prost::Message)]
+    struct ShadowBackendDetailFromANewerPeer {
+        #[prost(string, tag = "9001")]
+        a_variant_this_build_does_not_know: String,
+    }
+
+    /// Build a decodable `pb::BackendErrorDetail` whose `variant` oneof is
+    /// unset, via the same shadow-message trick
+    /// [`unknown_oneof_variant_reconstructs_other_carrying_the_status_message_not_empty`]
+    /// uses at the top level -- proves this is genuinely what decode produces
+    /// from an unrecognized `BackendErrorDetail` variant, not a hand-built
+    /// `None` no real peer could ever send.
+    fn unknown_backend_detail() -> pb::BackendErrorDetail {
+        let shadow = ShadowBackendDetailFromANewerPeer {
+            a_variant_this_build_does_not_know: "payload only a newer peer understands".into(),
+        };
+        let bytes = shadow.encode_to_vec();
+        let detail = pb::BackendErrorDetail::decode(bytes.as_slice())
+            .expect("an unrecognized field number is skipped, not a decode error");
+        assert!(
+            detail.variant.is_none(),
+            "field 9001 is outside BackendErrorDetail's oneof, so decode must leave variant unset"
+        );
+        detail
+    }
+
+    /// RED before the fix (#485 round 4): an unknown `BackendErrorDetail`
+    /// oneof nested under `MutableTableError::Backend` (a NEWER peer's
+    /// `BackendErrorDetail` variant this build's codegen does not know) used
+    /// to reconstruct as `BackendError::Execution(String::new())` via the
+    /// removed `From<pb::BackendErrorDetail> for BackendError` impl, silently
+    /// discarding the enclosing `Status`'s own message. GREEN after: it
+    /// reconstructs as `BackendError::Execution` carrying that message
+    /// verbatim, via `backend_error_from_detail`.
+    #[test]
+    fn unknown_backend_variant_nested_in_mutable_table_carries_the_status_message() {
+        use pb::mutable_table_error_detail::Variant;
+
+        let mt_detail = pb::MutableTableErrorDetail {
+            variant: Some(Variant::Backend(unknown_backend_detail())),
+        };
+        let peer_message = "the real fault text a newer peer attached";
+        match mutable_table_error_from_detail(mt_detail, peer_message) {
+            MutableTableError::Backend(BackendError::Execution(message)) => assert_eq!(
+                message, peer_message,
+                "an unknown BackendErrorDetail variant nested under MutableTableError::Backend \
+                 must reconstruct BackendError::Execution carrying the Status's own message, \
+                 never an empty string"
+            ),
+            other => panic!(
+                "expected MutableTableError::Backend(BackendError::Execution(_)), got {other:?}"
+            ),
+        }
+    }
+
+    /// The `TriggerError::Backend` analogue of
+    /// [`unknown_backend_variant_nested_in_mutable_table_carries_the_status_message`]:
+    /// an unknown `BackendErrorDetail` oneof nested under `TriggerError::Backend`
+    /// must also carry the enclosing `Status`'s own message, never an empty
+    /// string.
+    #[test]
+    fn unknown_backend_variant_nested_in_trigger_carries_the_status_message() {
+        use pb::trigger_error_detail::Variant;
+
+        let trigger_detail = pb::TriggerErrorDetail {
+            variant: Some(Variant::Backend(unknown_backend_detail())),
+        };
+        let peer_message = "the real fault text a newer peer attached";
+        match trigger_error_from_detail(trigger_detail, peer_message) {
+            TriggerError::Backend(BackendError::Execution(message)) => assert_eq!(
+                message, peer_message,
+                "an unknown BackendErrorDetail variant nested under TriggerError::Backend must \
+                 reconstruct BackendError::Execution carrying the Status's own message, never an \
+                 empty string"
+            ),
+            other => {
+                panic!("expected TriggerError::Backend(BackendError::Execution(_)), got {other:?}")
+            }
         }
     }
 

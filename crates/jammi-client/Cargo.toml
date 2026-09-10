@@ -20,3 +20,12 @@ tonic.workspace = true
 futures.workspace = true
 tokio-stream.workspace = true
 uuid.workspace = true
+
+[dev-dependencies]
+# Test-only: the `grpc_timeout_header_tests` module in `src/lib.rs` spins up
+# a real loopback `tonic::transport::Server` double to prove `wait_job`/
+# `subscribe` send no `grpc-timeout` header while their `_with_timeout`
+# siblings do -- request construction and the RPC call are not separable in
+# those functions, so this needs a genuine server-side handler, not a
+# hand-built `tonic::Request` inspected without ever sending it.
+tokio.workspace = true

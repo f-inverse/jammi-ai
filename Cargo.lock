@@ -4205,6 +4205,7 @@ dependencies = [
  "jammi-admin",
  "jammi-db",
  "jammi-wire",
+ "tokio",
  "tokio-stream",
  "tonic",
  "uuid",

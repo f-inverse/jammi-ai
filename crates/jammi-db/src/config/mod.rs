@@ -1420,14 +1420,20 @@ pub struct LimitsConfig {
     ///
     /// * a `grpc-timeout` header ABOVE this budget is refused at the edge —
     ///   before the stream ever opens — with `DEADLINE_EXCEEDED`.
+    /// * a `grpc-timeout` header WITHIN this budget is ENFORCED by the
+    ///   server itself, at the caller's own declared deadline: the stream
+    ///   ends with `DEADLINE_EXCEEDED` once that (shorter) duration elapses,
+    ///   never the wider budget (`jammi_server::limits::PermitBody::Deadlined`).
+    ///   This is deliberate, not merely "honoured as-is": tonic's own
+    ///   `GrpcTimeout` middleware races only the service future, never a
+    ///   streaming response body already returned, so a caller that declared
+    ///   a deadline and then ignored it would otherwise hold this stream's
+    ///   permit forever.
     /// * NO `grpc-timeout` header at all (HTTP/2's own no-deadline default —
     ///   the shape a header-less, e.g. Python-shaped, client sends) is NOT
     ///   refused: this budget itself becomes the stream's deadline, ending
     ///   it with `DEADLINE_EXCEEDED` once it elapses, wherever the stream
     ///   then stands (`jammi_server::limits::PermitBody::Deadlined`).
-    /// * a header WITHIN this budget is honoured as-is — no additional
-    ///   server-side deadline is layered on top of the caller's own declared
-    ///   one.
     ///
     /// `None` (the default) means no cap: a stream runs until terminal
     /// (`WaitJob`) or indefinitely (`Subscribe`), regardless of what a caller

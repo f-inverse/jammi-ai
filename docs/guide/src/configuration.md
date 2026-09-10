@@ -185,16 +185,22 @@ max_in_flight_per_connection = 64
 # Bounds a TriggerService.Subscribe or JobService.WaitJob stream. The
 # server budget bounds the stream; the client imposes no deadline of its
 # own by default (jammi-client's wait_job/subscribe send no grpc-timeout
-# header). Two arms:
+# header). Three arms:
 #   * a grpc-timeout header ABOVE this budget is refused at the edge,
 #     before the stream ever opens (DEADLINE_EXCEEDED).
+#   * a grpc-timeout header WITHIN this budget is ENFORCED by the server
+#     itself, at the caller's own declared deadline -- the stream ends
+#     with DEADLINE_EXCEEDED once that (shorter) duration elapses, not
+#     the wider budget. This is deliberate: nothing else bounds a
+#     streaming response body already returned, so a caller that declares
+#     a deadline and then ignores it would otherwise hold the stream open
+#     (and its permit held) past its own declared timeout.
 #   * NO grpc-timeout header at all (the default for jammi-client, and for
 #     any header-less caller) is NOT refused -- this budget itself becomes
 #     the stream's own deadline, ending it with DEADLINE_EXCEEDED once it
 #     elapses, wherever the stream then stands.
-# A header WITHIN the budget is honoured as-is, with no additional
-# server-side deadline layered on top. Unset (the default) means no cap --
-# a stream runs until terminal (WaitJob) or indefinitely (Subscribe).
+# Unset (the default) means no cap -- a stream runs until terminal
+# (WaitJob) or indefinitely (Subscribe).
 # wait_timeout_secs = 300
 # Cap on concurrently open TriggerService.Subscribe streams. 0 = unbounded.
 # Default: 256.

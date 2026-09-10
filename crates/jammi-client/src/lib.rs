@@ -428,7 +428,10 @@ impl DataClient {
     /// deployment with no such budget configured genuinely waits until
     /// terminal. Use [`Self::wait_job_with_timeout`] to declare an explicit
     /// deadline of your own instead — one at or below the deployment's
-    /// budget, when known, is honoured as-is.
+    /// budget, when known, is ENFORCED by the server: the stream ends with
+    /// `DEADLINE_EXCEEDED` at that declared deadline, never the wider
+    /// budget; a value above the budget is refused at the edge before the
+    /// stream opens.
     pub async fn wait_job(
         &self,
         job_id: &str,
@@ -661,8 +664,10 @@ impl DataClient {
 
     /// [`Self::subscribe`], with an explicit `grpc-timeout` rather than none.
     /// A value at or below the deployment's own `wait_timeout_secs` budget,
-    /// when known, is honoured as-is; a value above it is refused at the
-    /// edge before the stream opens.
+    /// when known, is ENFORCED by the server: the stream ends with
+    /// `DEADLINE_EXCEEDED` at that declared deadline, never the wider
+    /// budget; a value above the budget is refused at the edge before the
+    /// stream opens.
     pub async fn subscribe_with_timeout(
         &self,
         topic: &TopicDefinition,
@@ -859,4 +864,285 @@ fn hits_to_batch(resp: SearchResponse, select: &[String]) -> Result<Vec<RecordBa
     let batch = RecordBatch::try_new(schema, arrays)
         .map_err(|e| JammiError::Other(format!("rebuild search batch: {e}")))?;
     Ok(vec![batch])
+}
+
+/// #485 round-4 fix-verifier gap: `wait_job`/`subscribe` must send NO
+/// `grpc-timeout` header at all (the server's `[server.limits]
+/// wait_timeout_secs` budget bounds the stream instead — see
+/// `jammi_server::limits`'s module doc's "Streaming-path exemption" section);
+/// `wait_job_with_timeout`/`subscribe_with_timeout` MUST send one, carrying
+/// the caller's declared duration. Proven against the SAME code path
+/// production uses (`wait_job_inner`/`subscribe_inner`, reached only through
+/// the four public entry points above) over a REAL loopback gRPC connection:
+/// request construction and the RPC call are not separable into two steps in
+/// those functions (the request is built and sent in one async fn against a
+/// live channel), so a hand-built `tonic::Request` inspected without ever
+/// sending it would not exercise this code path — this fixture instead reads
+/// the header a genuine server-side handler actually received.
+#[cfg(test)]
+mod grpc_timeout_header_tests {
+    use std::net::SocketAddr;
+    use std::pin::Pin;
+    use std::sync::{Arc, Mutex};
+    use std::task::{Context, Poll};
+    use std::time::Duration;
+
+    use arrow_schema::Schema;
+    use futures::Stream;
+    use tokio::net::{TcpListener, TcpStream};
+    use tonic::transport::{Endpoint, Server};
+    use tonic::{Request, Response, Status};
+
+    use jammi_db::trigger::{Predicate, TopicDefinition, TopicId};
+    use jammi_wire::proto::job::job_service_server::{JobService, JobServiceServer};
+    use jammi_wire::proto::job::{
+        CancelJobRequest, CancelJobResponse, JobEvent, JobHandle, JobStatusRequest,
+        JobStatusResponse, ListJobsRequest, ListJobsResponse, ListWorkersRequest,
+        ListWorkersResponse, PruneJobsRequest, PruneJobsResponse, SubmitJobRequest,
+        SubmitJobResponse,
+    };
+    use jammi_wire::proto::trigger::trigger_service_server::{
+        TriggerService, TriggerServiceServer,
+    };
+    use jammi_wire::proto::trigger::{
+        PublishRequest, PublishResponse, SubscribeRequest, SubscribedBatch,
+    };
+
+    use super::DataClient;
+
+    /// `None` while unset; `Some(header value or None)` once the one request
+    /// this fixture's test drives has landed — a single-request-per-call
+    /// fixture, so one cell suffices without a queue.
+    type Captured = Arc<Mutex<Option<Option<String>>>>;
+
+    /// Read the raw `grpc-timeout` metadata value off an inbound request, if
+    /// present — the ONLY oracle this fixture needs: presence/absence and the
+    /// value, not a parsed `Duration` (that parsing is `limits.rs`'s own
+    /// `parse_grpc_timeout`, exercised elsewhere).
+    fn read_grpc_timeout<T>(request: &Request<T>) -> Option<String> {
+        request
+            .metadata()
+            .get("grpc-timeout")
+            .map(|v| v.to_str().expect("grpc-timeout is ASCII").to_string())
+    }
+
+    /// A minimal [`futures::Stream`] over [`TcpListener::poll_accept`] — lets
+    /// this fixture hand `tonic::transport::Server` a real accepted-connection
+    /// stream without depending on `tokio-stream`'s `net` feature (not enabled
+    /// workspace-wide) for a one-off test-only server.
+    struct AcceptStream(TcpListener);
+
+    impl Stream for AcceptStream {
+        type Item = std::io::Result<TcpStream>;
+
+        fn poll_next(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
+            match self.0.poll_accept(cx) {
+                Poll::Ready(Ok((stream, _peer))) => Poll::Ready(Some(Ok(stream))),
+                Poll::Ready(Err(e)) => Poll::Ready(Some(Err(e))),
+                Poll::Pending => Poll::Pending,
+            }
+        }
+    }
+
+    /// A `JobService` double whose only LIVE method is `wait_job`; every other
+    /// method is unreachable from either test built on this fixture, so a
+    /// wiring mistake panics loudly rather than returning a plausible-looking
+    /// placeholder response.
+    struct HeaderCapturingJobService {
+        wait_job_header: Captured,
+    }
+
+    #[tonic::async_trait]
+    impl JobService for HeaderCapturingJobService {
+        type WaitJobStream = Pin<Box<dyn Stream<Item = Result<JobEvent, Status>> + Send + 'static>>;
+
+        async fn submit_job(
+            &self,
+            _request: Request<SubmitJobRequest>,
+        ) -> Result<Response<SubmitJobResponse>, Status> {
+            unreachable!("not exercised by this fixture")
+        }
+
+        async fn job_status(
+            &self,
+            _request: Request<JobStatusRequest>,
+        ) -> Result<Response<JobStatusResponse>, Status> {
+            unreachable!("not exercised by this fixture")
+        }
+
+        async fn wait_job(
+            &self,
+            request: Request<JobHandle>,
+        ) -> Result<Response<Self::WaitJobStream>, Status> {
+            *self.wait_job_header.lock().unwrap() = Some(read_grpc_timeout(&request));
+            Ok(Response::new(
+                Box::pin(futures::stream::empty()) as Self::WaitJobStream
+            ))
+        }
+
+        async fn list_jobs(
+            &self,
+            _request: Request<ListJobsRequest>,
+        ) -> Result<Response<ListJobsResponse>, Status> {
+            unreachable!("not exercised by this fixture")
+        }
+
+        async fn cancel_job(
+            &self,
+            _request: Request<CancelJobRequest>,
+        ) -> Result<Response<CancelJobResponse>, Status> {
+            unreachable!("not exercised by this fixture")
+        }
+
+        async fn list_workers(
+            &self,
+            _request: Request<ListWorkersRequest>,
+        ) -> Result<Response<ListWorkersResponse>, Status> {
+            unreachable!("not exercised by this fixture")
+        }
+
+        async fn prune_jobs(
+            &self,
+            _request: Request<PruneJobsRequest>,
+        ) -> Result<Response<PruneJobsResponse>, Status> {
+            unreachable!("not exercised by this fixture")
+        }
+    }
+
+    /// A `TriggerService` double whose only LIVE method is `subscribe`.
+    struct HeaderCapturingTriggerService {
+        subscribe_header: Captured,
+    }
+
+    #[tonic::async_trait]
+    impl TriggerService for HeaderCapturingTriggerService {
+        type SubscribeStream =
+            Pin<Box<dyn Stream<Item = Result<SubscribedBatch, Status>> + Send + 'static>>;
+
+        async fn publish(
+            &self,
+            _request: Request<PublishRequest>,
+        ) -> Result<Response<PublishResponse>, Status> {
+            unreachable!("not exercised by this fixture")
+        }
+
+        async fn subscribe(
+            &self,
+            request: Request<SubscribeRequest>,
+        ) -> Result<Response<Self::SubscribeStream>, Status> {
+            *self.subscribe_header.lock().unwrap() = Some(read_grpc_timeout(&request));
+            Ok(Response::new(
+                Box::pin(futures::stream::empty()) as Self::SubscribeStream
+            ))
+        }
+    }
+
+    /// Spin up a loopback tonic server hosting only the two header-capturing
+    /// doubles above (every other `jammi.v1` service `DataClient` composes is
+    /// never dialled by the two calls under test), returning the bound address
+    /// and the two capture cells. The serve task is detached (not joined):
+    /// nothing here needs graceful shutdown, since each test's own process
+    /// teardown reclaims the port.
+    async fn start_capturing_server() -> (SocketAddr, Captured, Captured) {
+        let listener = TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind loopback");
+        let addr = listener.local_addr().expect("local_addr");
+        let wait_job_header: Captured = Arc::new(Mutex::new(None));
+        let subscribe_header: Captured = Arc::new(Mutex::new(None));
+        let job_svc = JobServiceServer::new(HeaderCapturingJobService {
+            wait_job_header: Arc::clone(&wait_job_header),
+        });
+        let trigger_svc = TriggerServiceServer::new(HeaderCapturingTriggerService {
+            subscribe_header: Arc::clone(&subscribe_header),
+        });
+        tokio::spawn(async move {
+            Server::builder()
+                .add_service(job_svc)
+                .add_service(trigger_svc)
+                .serve_with_incoming(AcceptStream(listener))
+                .await
+                .expect("capturing server");
+        });
+        (addr, wait_job_header, subscribe_header)
+    }
+
+    async fn connect(addr: SocketAddr) -> DataClient {
+        let endpoint = Endpoint::from_shared(format!("http://{addr}")).expect("endpoint");
+        DataClient::connect(endpoint)
+            .await
+            .expect("data client connect")
+    }
+
+    /// RED before the #485 round-4 fix (re-confirmed by the fix-verifier):
+    /// if `wait_job`/`wait_job_with_timeout` ever collapsed onto the same
+    /// request-construction path with a default deadline applied regardless
+    /// of caller intent, this would fail — either `wait_job` would gain a
+    /// header it must never send, or `wait_job_with_timeout` would lose the
+    /// one it must always send. GREEN: `wait_job` sends no `grpc-timeout` at
+    /// all (the server-side budget bounds the stream instead — see this
+    /// crate's `wait_job` doc); `wait_job_with_timeout` sends one every time.
+    #[tokio::test]
+    async fn wait_job_sends_no_grpc_timeout_header_but_wait_job_with_timeout_does() {
+        let (addr, wait_job_header, _subscribe_header) = start_capturing_server().await;
+        let client = connect(addr).await;
+
+        let _ = client.wait_job("does-not-matter").await;
+        assert_eq!(
+            wait_job_header.lock().unwrap().take(),
+            Some(None),
+            "wait_job must send NO grpc-timeout header -- the server budget bounds the \
+             stream, never a client-declared deadline"
+        );
+
+        let _ = client
+            .wait_job_with_timeout("does-not-matter", Duration::from_secs(5))
+            .await;
+        let captured = wait_job_header.lock().unwrap().take();
+        assert!(
+            matches!(captured, Some(Some(_))),
+            "wait_job_with_timeout must send a grpc-timeout header, got {captured:?}"
+        );
+    }
+
+    /// The `subscribe`/`subscribe_with_timeout` analogue of
+    /// [`wait_job_sends_no_grpc_timeout_header_but_wait_job_with_timeout_does`].
+    #[tokio::test]
+    async fn subscribe_sends_no_grpc_timeout_header_but_subscribe_with_timeout_does() {
+        let (addr, _wait_job_header, subscribe_header) = start_capturing_server().await;
+        let client = connect(addr).await;
+
+        let topic = TopicDefinition {
+            id: TopicId::new(),
+            name: "does-not-matter".into(),
+            schema: Arc::new(Schema::empty()),
+            tenant: None,
+            broker_metadata: Default::default(),
+        };
+
+        let _ = client
+            .subscribe(&topic, Predicate::match_all(), None, false)
+            .await;
+        assert_eq!(
+            subscribe_header.lock().unwrap().take(),
+            Some(None),
+            "subscribe must send NO grpc-timeout header -- the server budget bounds the \
+             stream, never a client-declared deadline"
+        );
+
+        let _ = client
+            .subscribe_with_timeout(
+                &topic,
+                Predicate::match_all(),
+                None,
+                false,
+                Duration::from_secs(5),
+            )
+            .await;
+        let captured = subscribe_header.lock().unwrap().take();
+        assert!(
+            matches!(captured, Some(Some(_))),
+            "subscribe_with_timeout must send a grpc-timeout header, got {captured:?}"
+        );
+    }
 }

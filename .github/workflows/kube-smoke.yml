@@ -1,0 +1,242 @@
+name: Kubernetes smoke (kind)
+
+# Builds the CPU `jammi-ai-server` image from THIS commit's Dockerfile, spins
+# up a `kind` cluster, applies `deploy/kubernetes/overlays/ci` (kustomize
+# build | kubectl apply), and drives it with a remote Python client
+# (`tests/compose/shape_c_kube_remote.py`) through a `kubectl rollout
+# restart` — proving the ci overlay's manifests, the image's file-then-env
+# config resolution (ConfigMap baked file, env layer on top), and that a
+# rollout restart's new pod still shares the OLD pod's Postgres catalog and
+# JetStream broker, together, not any one of them in isolation. It does NOT
+# assert result durability across the restart -- the overlay's Deployment
+# mounts `emptyDir`, so a new pod starts with an empty local index; see
+# `tests/compose/shape_c_kube_remote.py`'s own module doc for the exact
+# boundary. It reports to no `ci-summary` job, same as `compose-smoke.yml` --
+# that job gates the PR merge path, and this workflow deliberately does not
+# run there.
+#
+# No GHCR credentials are ever touched by the image build below: the
+# composite runs with `push: "false"` -- a `docker load` into the runner's
+# own daemon, then a `kind load docker-image` into the cluster's node, never
+# a registry write -- so this workflow needs no `packages: write` permission
+# and is not a promotion primitive (`check_gpu_prove_once.py`'s P6 rule reads
+# `push:` values other than a literal `false` as a promotion candidate; this
+# workflow's literal `"false"` is deliberately exempt).
+#
+# Unlike `compose-smoke.yml`, this workflow also carries a `pull_request`
+# trigger (path-filtered, below): a brand-new workflow file cannot be
+# `workflow_dispatch`ed against its own PR branch before it exists on the
+# default branch, so the pre-merge proof for THIS file is the PR's own
+# `pull_request`-triggered run. The filter is kept after merge too -- a
+# manifest, driver, or Dockerfile change is exactly the class of change this
+# workflow exists to catch, so it keeps running on every PR that touches
+# them, not only on push to main.
+#
+# One amd64 leg only, no arm64 matrix: the pinned kustomize and kubeconform
+# release tarballs are linux-amd64-only, and `helm/kind-action`'s own kind
+# binary is amd64 on `ubuntu-latest`; the arm64 build of the server image is
+# already proven by `compose-smoke.yml`'s arm64 leg.
+
+on:
+  push:
+    branches: [main]
+  schedule:
+    # 03:00 UTC nightly.
+    - cron: "0 3 * * *"
+  workflow_dispatch:
+  pull_request:
+    paths:
+      - deploy/kubernetes/**
+      - tests/compose/**
+      - .github/workflows/kube-smoke.yml
+      - Dockerfile
+
+permissions:
+  contents: read
+
+jobs:
+  # Resolves the mutable CI base-image tag to its index digest ONCE per
+  # workflow run (`.github/actions/resolve-ci-image`), same as
+  # `compose-smoke.yml`, so the build below is reproducible even if
+  # `:latest` is republished mid-run.
+  resolve-base:
+    name: Resolve CI base image
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    outputs:
+      image: ${{ steps.resolve.outputs.image }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: docker/setup-buildx-action@8d2750c68a42422c14e847fe6c8ac0403b4cbd6f # v3.12.0
+      - uses: docker/login-action@c94ce9fb468520275223c153574b00df6fe4bcc9 # v3.7.0
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ github.token }}
+      - id: resolve
+        uses: ./.github/actions/resolve-ci-image
+        with:
+          ref: ${{ vars.JAMMI_CI_IMAGE || 'ghcr.io/f-inverse/jammi-ai-ci:latest' }}
+
+  kube-smoke:
+    name: Kubernetes smoke (kind, amd64)
+    needs: [resolve-base]
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Generate the ephemeral cluster secrets (job-wide)
+        run: |
+          set -euo pipefail
+          # A synthetic key for this ephemeral, throwaway kind cluster --
+          # never a real deployment secret.
+          key="$(openssl rand -hex 32)"
+          echo "::add-mask::${key}"
+          echo "JAMMI_AUDIT_MASTER_KEY=${key}" >> "$GITHUB_ENV"
+          echo "JAMMI_IMAGE=jammi-ai-server:pr" >> "$GITHUB_ENV"
+
+      - name: Build the CPU image (load, no push)
+        uses: ./.github/actions/docker-publish
+        with:
+          push: "false"
+          load: "true"
+          local-tag: jammi-ai-server:pr
+          build-args: |
+            BASE_IMAGE=${{ needs.resolve-base.outputs.image }}
+          # No `platforms` input -- native (amd64, this job's own runner).
+          # The docker exporter (what `load: true` uses) cannot carry
+          # attestations on a stock daemon -- `sbom: false` is the one that
+          # actually matters here, same as compose-smoke.yml's amd64 leg.
+          sbom: "false"
+          provenance: "false"
+          # Same cache scope as compose-smoke.yml's amd64 leg -- an amd64
+          # image build from the same Dockerfile shares the layer cache.
+          cache-scope: cpu-amd64
+
+      - name: Fetch and verify kustomize
+        run: |
+          set -euo pipefail
+          curl -fsSL -o kustomize.tar.gz \
+            "https://github.com/kubernetes-sigs/kustomize/releases/download/kustomize%2Fv5.8.1/kustomize_v5.8.1_linux_amd64.tar.gz"
+          echo "029a7f0f4e1932c52a0476cf02a0fd855c0bb85694b82c338fc648dcb53a819d  kustomize.tar.gz" | sha256sum -c -
+          tar -xzf kustomize.tar.gz kustomize
+          sudo mv kustomize /usr/local/bin/kustomize
+          kustomize version
+
+      - name: Fetch and verify kubeconform
+        run: |
+          set -euo pipefail
+          curl -fsSL -o kubeconform.tar.gz \
+            "https://github.com/yannh/kubeconform/releases/download/v0.8.0/kubeconform-linux-amd64.tar.gz"
+          echo "9bc2bffbf71f261128533edaf912153948b7ff238f9a531ae6d34466ec287883  kubeconform.tar.gz" | sha256sum -c -
+          tar -xzf kubeconform.tar.gz kubeconform
+          sudo mv kubeconform /usr/local/bin/kubeconform
+          kubeconform -v
+
+      - name: Cache kubeconform's downloaded schemas
+        uses: actions/cache@v4
+        with:
+          path: ${{ runner.temp }}/kubeconform-cache
+          key: kubeconform-schemas-b582a12a09aa9b5d1edad577a964c504130214fc-1.34.11
+
+      - name: Render the kind cluster config (envsubst GITHUB_WORKSPACE)
+        run: envsubst < deploy/kubernetes/overlays/ci/kind-config.yaml.in > "$RUNNER_TEMP/kind-config.yaml"
+
+      - name: Create the kind cluster
+        uses: helm/kind-action@06c1ae10762d3b9c1644e7fe69596ae519e015a2 # v1.15.0
+        with:
+          node_image: kindest/node:v1.34.11@sha256:44e222ee2132dab25ff87301682f89eb82c7880ea3a1bf543bfe9708fd08d67d
+          # The action's own default (v1.37.0) is three minors over the
+          # v1.34.11 node -- set explicitly to match the server.
+          kubectl_version: v1.34.11
+          cluster_name: kind
+          config: ${{ runner.temp }}/kind-config.yaml
+
+      - name: Pull and load the sidecar images and the built server image into kind
+        run: |
+          set -euo pipefail
+          docker pull postgres:16
+          docker pull nats:2.10-alpine
+          kind load docker-image jammi-ai-server:pr postgres:16 nats:2.10-alpine --name kind
+
+      - name: Create the namespace and the Secret
+        run: |
+          set -euo pipefail
+          kubectl create namespace jammi-ci
+          kubectl -n jammi-ci create secret generic jammi-server-secrets \
+            --from-literal=JAMMI_AUDIT_MASTER_KEY="$JAMMI_AUDIT_MASTER_KEY" \
+            --from-literal=JAMMI_CATALOG__POSTGRES__URL=postgres://jammi:jammi@postgres:5432/jammi \
+            --from-literal=JAMMI_BROKER__JET_STREAM__URL=nats://nats:4222
+
+      - name: Validate the ci overlay against the pinned schema (kubeconform --strict, before apply)
+        run: |
+          set -euo pipefail
+          kustomize build deploy/kubernetes/overlays/ci | kubeconform --strict --summary --kubernetes-version 1.34.11 \
+            -schema-location "https://raw.githubusercontent.com/yannh/kubernetes-json-schema/b582a12a09aa9b5d1edad577a964c504130214fc/{{.NormalizedKubernetesVersion}}-standalone{{.StrictSuffix}}/{{.ResourceKind}}{{.KindSuffix}}.json" \
+            -cache "$RUNNER_TEMP/kubeconform-cache" -
+
+      - name: Apply the ci overlay
+        run: kustomize build deploy/kubernetes/overlays/ci | kubectl apply -f -
+
+      - name: Wait for postgres, nats, and jammi-server to roll out
+        run: |
+          set -euo pipefail
+          kubectl -n jammi-ci rollout status statefulset/postgres --timeout=300s
+          kubectl -n jammi-ci rollout status statefulset/nats --timeout=300s
+          kubectl -n jammi-ci rollout status deploy/jammi-server --timeout=300s
+
+      - name: Assert one-hop image identity (kind-loaded image vs kubelet-reported imageID)
+        run: |
+          set -euo pipefail
+          # `kind load docker-image` registers only a tag ref -- containerd's
+          # repoDigests is empty and kubelet reports the bare config digest,
+          # so the equality arm below is the expected one; `imagePullPolicy:
+          # Never` (patch-deployment.yaml) is a comment, not the mechanism.
+          built="sha256:$(docker image inspect --format '{{.Id}}' "$JAMMI_IMAGE" | sed 's/^sha256://')"
+          digests="$(docker exec kind-control-plane crictl inspecti -o json docker.io/library/jammi-ai-server:pr | jq -r '.status.repoDigests[]')"
+          for id in $(kubectl -n jammi-ci get pod -l app=jammi-server -o jsonpath='{.items[*].status.containerStatuses[*].imageID}'); do
+            if [ "$id" = "$built" ] || grep -qx "$id" <<<"$digests"; then
+              echo "pod imageID $id matches the built image ($built) or a crictl repoDigest"
+            else
+              echo "::error::pod imageID $id matches neither the built image ($built) nor any crictl repoDigest ($digests) -- a stale or pulled image would fail this the same way" >&2
+              exit 1
+            fi
+          done
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      # `grpcio-tools` (needed to regenerate the proto stubs) lives in the
+      # `dev` extra, mirroring compose-smoke.yml's own step.
+      - name: Install clients/python (dev extra) + generate stubs
+        run: |
+          set -euo pipefail
+          python -m pip install --upgrade pip
+          pip install -e 'clients/python[dev]'
+          make -C clients/python generate
+
+      - name: Run the remote Kubernetes smoke script (port-forward + rollout restart)
+        run: python3 tests/compose/shape_c_kube_remote.py
+
+      - name: Assert the Postgres catalog was exercised at runtime
+        run: |
+          set -euo pipefail
+          count="$(kubectl -n jammi-ci exec statefulset/postgres -- psql -U jammi -d jammi -tAc 'select count(*) from sources')"
+          echo "postgres catalog sources row count: ${count}"
+          if [ "${count}" -lt 1 ]; then
+            echo "::error::expected at least 1 row in the Postgres 'sources' table after shape_c_kube_remote.py's add_source call, got ${count} -- the ci overlay's JAMMI_CATALOG__POSTGRES__URL is not actually backing the catalog" >&2
+            exit 1
+          fi
+
+      - name: Dump pod state and logs on failure
+        if: failure()
+        run: |
+          kubectl -n jammi-ci get pods -o wide
+          kubectl -n jammi-ci describe pod -l app=jammi-server
+          kubectl -n jammi-ci logs -l app=jammi-server --tail=-1 --all-containers
+
+      - name: Delete the kind cluster
+        if: always()
+        run: kind delete cluster --name kind

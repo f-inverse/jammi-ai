@@ -31,12 +31,71 @@ one of the agent-write-denied paths:
 Proven in a THROWAWAY copy of the tree (`cp -R`, outside any git worktree of the repo, deleted
 after use — never `git worktree add`, so the copy carries no live link back to this repo's object
 store or refs): `git apply --check` is silent for all five, `git apply` applies all five cleanly,
-and `python3 ci/scripts/check_lead_gate.py --self-test` then runs the G20–G31 arm for real (not
-SKIPPED) and passes all of it, plus every pre-existing fixture (G1–G19/T/L/V/E/S/D/N6/R10) and N7's
-wall-time check. Deleting just the R3 mechanism from the applied copy's `lead-gate-lib.py` (keeping
-the `RELAY_R3` marker so the arm still runs, never falls back to SKIPPED) turns G20, G21, G22b,
-G23, G26, G27, and G28's round-3 assertion RED — proving the fixture suite is not vacuous. Both
-proofs were re-run for this round of fixes; see "Proof, re-run" below for the exact counts.
+and `python3 ci/scripts/check_lead_gate.py --self-test` then runs the G20–G35 arm for real (not
+SKIPPED) and passes all 16 of it (61 self-test fixtures total), plus every pre-existing fixture
+(G1–G19/T/L/V/E/S/D/N6/R10) and N7's wall-time check. Deleting just the R3 mechanism from the
+applied copy's `lead-gate-lib.py` (keeping the `RELAY_R3` marker so the arm still runs, never falls
+back to SKIPPED) turns 10 of the 16 RED — G20, G21, G22 (its "b" half), G23, G26, G27, G28 (its
+round-3 assertion), G31, G32, G35 — while the remaining 6 (G24, G25, G29, G30, G33, G34) stay green
+by design: each asserts an ALLOW or a check R3's own deletion cannot affect (G24/G25 are R3
+allow-side; G29/G30 are the git-free-first-dispatch and env-precedence witnesses; G33/G34 are V11's
+one-unit-per-dispatch check, which runs and denies BEFORE `_relay_rejection` — and therefore R3— is
+ever reached). This is a real re-run against the round-2 corrections below (V10–V17), not a
+restatement of the round-1 numbers.
+
+## Round-2 corrections (V10–V17) — three reproduced defects, fixed structurally
+
+A pressure-test round against the round-1 patch (applied to a throwaway copy) reproduced three
+live defects, each fixed by deleting or bounding a mechanism, not by patching a symptom:
+
+- **V10 (deleted the cross-type clearing arm).** The round-1 patch's cross-type clearing path
+  (`_adversarial_audit_cleared_by_verifier_pass` → `_relay_accepted`, `check_fix=False`) let a
+  fix-verifier/acceptance-verifier PASS clear an older adversarial-audit BLOCK from a relay that
+  never ran R3 at all — a relay lacking `fix_head` entirely still cleared. Reproducer: a relay with
+  no `fix_head`, plus BOTH a fix-verifier and an acceptance-verifier PASS on record, allowed a
+  repeat adversarial-audit dispatch (round-1 shape). Fixed by deleting the arm outright: there is
+  now ONE predicate (`_relay_rejection`, no `check_fix` parameter) and ONE reachable caller (the
+  direct repeat-dispatch path); an adversarial-audit BLOCK closes only via a later adversarial-audit
+  PASS (itself gated by R1+R2+R3) or the documented `rm`. Fixture: **G32** (this same reproducer
+  shape) now denies (rc 2).
+- **V11 (one unit per dispatch, not "one gets R3, others skip it").** The round-1 patch let a
+  prompt naming two open BLOCKs of the same type run R3 for ONE (memoized) and R1/R2-only for the
+  other — silently weaker for every unit past the first. Fixed by denying the WHOLE dispatch when
+  more than one open BLOCK of the same type is named, listing every one, regardless of which
+  anchor the prompt mentions first. Fixtures: **G33**/**G34** (both name orders).
+- **V12–V14 (`_run_git` unbounded-drain hazard, corrected account).** The round-1 draft's
+  `subprocess.run(cmd, timeout=5)` is, on POSIX, actually bounded for a CHILDLESS timeout (its own
+  post-timeout `wait()` reaps the direct child); what is genuinely unbounded is a `git` that leaves
+  a GRANDCHILD alive holding the output pipes open after the direct child exits — measured against
+  a shim that backgrounds `python3 -c "import os,time;os.setsid();time.sleep(30)"` before `exec
+  sleep 7`: the un-timed-drain shape (`Popen(..., stdout=PIPE) ... proc.communicate()` with no
+  `killpg`) took **~30s** (RED against a 5s+2s budget); the fixed shape — `Popen` into its own
+  process group, `stdout`/`stderr` to real `tempfile.TemporaryFile()`s (never `PIPE`), bounded by
+  `Popen.wait(timeout=5)` (never `.communicate()`, never `with Popen(...)`), `os.killpg` on timeout,
+  then a second bounded `wait(timeout=1)` — returns in **~1.0s** against the same shim (measured
+  separately: a childless timeout alone returns in ~1.0s; a 540 KB `diff --name-only` payload
+  round-trips through the temp files in ~0.01s). Fixture: **G27**, rewritten to this escaped-
+  grandchild shape, asserts DENY within T+2s (7s).
+- **V15 (argv boundary).** `fix_head` and the BLOCK row's own `head_sha` must
+  `re.fullmatch(r"[0-9a-f]{7,40}")` BEFORE either is ever placed in a git argv, and every git
+  invocation carries `--end-of-options` immediately before its revision arguments (git ≥ 2.24) —
+  belt AND suspenders against a value shaped like an option (e.g. `--output=/tmp/x`). Fixture:
+  **G35** — a `head_sha` of `--output=<path>` denies, and the named path is never written.
+- **V16 (reachability target reverted to bound, git-free).** The round-1 patch's reachability
+  check (`git merge-base --is-ancestor fix_head <relay's own unit_branch>`) trusted an ARBITRARY
+  branch the relay named, which is strictly weaker than the base mechanism's original byte-equality
+  check it replaced. Reverted: the relay's own `unit_branch` must `slugify()` to EXACTLY this
+  BLOCK's own `unit_slug` — the identity the dispatch already resolved from the state-file it read,
+  never a lead-asserted branch trusted via git ancestry. A `BLOCK` row filed under the `UNBOUND`
+  fallback bucket can never be satisfied by any relay (no real branch slugifies to the literal
+  string `UNBOUND`) — the remedy is to re-dispatch naming the unit correctly, then `rm` the stale
+  row. Fixtures: **G22** (rewritten: (a) a relay naming the unit's own branch allows; (b) a
+  DIFFERENT branch denies) and **G31** (rewritten: an UNBOUND row now always denies, previously
+  always allowed — a deliberate reversal of the round-1 "B3" widening).
+- **V17 (`_probe_path` grammar, unchanged).** The round-1 patch's first-whitespace-token grammar
+  (a surrounding backtick/parenthesis and trailing punctuation stripped) is kept as-is; a proposed
+  quote-span rule (to let a probe entry name a path containing a space) is deliberately NOT added —
+  it is a documented limit, not a tracked gap (no such path exists in this repo today).
 
 ## The escape and the one real round it would have caught
 
@@ -67,38 +126,36 @@ text), and the follow-up adversarial-audit PASSed — this is the real control t
 against: a relay that DOES probe the fix's own surface converges; one that doesn't relays into
 more rounds.
 
-## Decisions (V2/V3/V5/V8 from `scratchpad/plans/PLAN-G.md`, further narrowed by this round's fix-review)
+## Decisions (V2/V3/V5/V8 from `scratchpad/plans/PLAN-G.md`; ROUND-1 text below, corrected by
+## V10–V17 in "Round-2 corrections" above where the two conflict — read that section FIRST)
 
 **R3 "probe the fix."** The relay gains a lead-written `fix_head` (the fix commit's full sha).
 Armed ONLY on a REPEAT dispatch of the SAME verifier type after a BLOCK — never on a first
-dispatch (structurally unreachable: no prior row exists for `_decide_verifier_dispatch` to match),
-and never on the CROSS-type clearing path a `fix-verifier`/`acceptance-verifier` PASS takes to
-clear an older `adversarial-audit` BLOCK (`_adversarial_audit_cleared_by_verifier_pass` →
-`_relay_accepted`, which now passes `check_fix=False` and so never touches git at all — this
-closes an adversarial finding against an earlier draft, which ran the same `_relay_rejection`
-function from BOTH call sites unconditionally). Per decision, at most ONE targeted unit's R3 runs
-even when a single prompt happens to whole-token-name more than one open BLOCK of the same type —
-every other targeted unit still gets a full, in-memory R1/R2 check, it just never pays for a second
-git round-trip in the same decision. In `$CLAUDE_PROJECT_DIR` ONLY (required explicitly — this is
-the documented hook environment contract: the harness always sets this variable for every hook
-invocation, so `repo_root()`'s cwd fallback is never needed by this arm and is deliberately not
-reused here), with a 5s timeout:
+dispatch (structurally unreachable: no prior row exists for `_decide_verifier_dispatch` to match).
+**V10 supersedes this paragraph's original cross-type-clearing carve-out**: there is no cross-type
+clearing path left to carve out at all — `_adversarial_audit_cleared_by_verifier_pass` and
+`_relay_accepted` are deleted, not merely made to pass `check_fix=False`. **V11 supersedes** the
+original "at most ONE targeted unit's R3 runs, every other gets R1/R2-only" behavior: a prompt
+naming MORE THAN ONE open BLOCK of the same type is now denied outright, naming every one — R3
+runs for exactly one unit only because exactly one unit may ever be targeted per dispatch. In
+`$CLAUDE_PROJECT_DIR` ONLY (required explicitly — this is the documented hook environment contract:
+the harness always sets this variable for every hook invocation, so `repo_root()`'s cwd fallback is
+never needed by this arm and is deliberately not reused here), with a 5s timeout:
 
-1. the BLOCK row's own `head_sha` ("block_sha") resolves as a commit;
-2. `fix_head` resolves, and differs from `block_sha` (else: "no fix commit since the BLOCK; a
-   second dispatch without a fix is a re-roll" — a re-roll, not a fix);
-3. `fix_head` is reachable from the RELAY's OWN `unit_branch` field (`git merge-base
-   --is-ancestor fix_head <relay's unit_branch>`), falling back to the BLOCK row's own recorded
-   `unit_branch` only when the relay omits the field — the two are NO LONGER required to be
-   byte-equal (an earlier draft of this arm forced them equal, which meant a BLOCK row landed in
-   the `UNBOUND` fallback bucket, or whose recorded branch was later renamed or deleted, could
-   never be satisfied by any relay at all; the artifact's identity is already pinned by the
-   filename — built from the row's own unit_slug/agent_type/block_ts — plus the still-enforced
-   `agent_type`/`block_ts` content checks, so the `unit_branch` field's only remaining job is
-   naming R3's reachability target). Deliberately NOT reachable-from-`block_sha`: an `--amend`
-   sibling (this repo's fix discipline produces them) breaks ancestry from `block_sha` but not
-   reachability from the named branch's own tip; if the lead fixed on another branch or rebased,
-   it names that branch's own head;
+1. the BLOCK row's own `head_sha` ("block_sha") matches the sha shape
+   (`re.fullmatch(r"[0-9a-f]{7,40}")`, **V15**) and resolves as a commit;
+2. `fix_head` matches the same shape, resolves, and differs from `block_sha` (else: "no fix commit
+   since the BLOCK; a second dispatch without a fix is a re-roll" — a re-roll, not a fix);
+3. **(V16 supersedes this step entirely — reachability is BOUND and git-free, not `git merge-base
+   --is-ancestor`):** the relay's OWN `unit_branch` field must `slugify()` to EXACTLY this BLOCK's
+   own `unit_slug` — the identity the dispatch already resolved from the state file it read, never
+   an arbitrary branch the relay merely asserts. The round-1 text below described trusting `git
+   merge-base --is-ancestor fix_head <relay's unit_branch>` with a fallback to the BLOCK row's own
+   recorded value; that design is REVERTED (V16, "the B3 widening reverted") because it let a relay
+   claim reachability from ANY branch it cared to name — strictly weaker than the base mechanism's
+   original byte-equality check it had replaced. A row filed under the `UNBOUND` fallback bucket
+   can never be satisfied this way (no real branch name slugifies to the literal string `UNBOUND`);
+   the remedy is to re-dispatch naming the unit correctly, then `rm` the stale row;
 4. `fix_changed = git diff --name-only -z block_sha fix_head` — TRUSTED, COMPUTED, never
    lead-supplied, NUL-delimited so a changed path carrying a space or non-ASCII byte is still
    named correctly (an earlier draft split on newlines, which is unsound in general even though no
@@ -112,11 +169,14 @@ reused here), with a 5s timeout:
    so the worst case is **three** probe entries (two adjacent + one fix-changed), though one entry
    can double as both when it happens to qualify for each.
 
-Any git failure (non-zero exit, timeout, an unresolvable sha) DENIES, naming the failing command,
-and states that the escape hatch (`rm .jammi/gate-state/<slug>.*`) destroys the unit's evidence
-rather than fixing the underlying git problem. **§C5** amends `lead-gate-pre.sh`'s prior "no git
-subprocess anywhere" doctrine to this ONE narrow, explicit exception (repeat-dispatch branch only,
-never the cross-type clearing path, project-dir only, 5s bound, at most one unit per decision).
+Any git failure (non-zero exit, timeout, an unresolvable/malformed sha) DENIES, naming the failing
+command, and states that the escape hatch (`rm .jammi/gate-state/<slug>.*`) destroys the unit's
+evidence rather than fixing the underlying git problem. Every git invocation carries
+`--end-of-options` immediately before its revision arguments (git ≥ 2.24 required, **V15**), belt
+and suspenders alongside the sha-shape check in steps 1-2 above. **§C5** amends
+`lead-gate-pre.sh`'s prior "no git subprocess anywhere" doctrine to this ONE narrow, explicit
+exception (repeat-dispatch branch only, project-dir only, 5s bound, at most one unit per decision —
+enforced by denying outright, **V11**, not by silently skipping R3 for extras, **V10/V11**).
 
 **Migration.** A relay written to disk BEFORE this patch lands carries no `fix_head` and stops
 being acceptable the moment the patch IS applied — there is no grandfathering. A unit with an
@@ -150,9 +210,10 @@ plain, non-git `_fresh_root()`. `_write_relay_exact` gains `fix_head`. The exist
 fixtures (G6, G8's ALLOW half, G13's ALLOW half, G17) gain a repo + `fix_head` so they stay ALLOWED
 once this patch lands — every DENY-reaching existing fixture (G1-G5, G7, G9-G16, G18-G19, T1-T4,
 L1-L3, V1-V10, E1-E4, S1-S3, D1, N6) is untouched, since a DENY short-circuits before ever reaching
-R3. New fixtures **G20-G31** (below), gated behind a version-marker guard (`RELAY_R3`) so
-`--self-test` exits 0 in THIS tree today, reporting that arm SKIPPED, and runs the fixtures for
-real the moment a human applies this doc's patches.
+R3. New fixtures **G20-G35** (below; G32-G35 are the round-2 pressure-test reproducers, V10-V17),
+gated behind a version-marker guard (`RELAY_R3`) so `--self-test` exits 0 in THIS tree today,
+reporting that arm SKIPPED, and runs the fixtures for real the moment a human applies this doc's
+patches.
 
 `_run()`'s subprocess `cwd` is a shared, empty DECOY directory by default (`_DECOY_CWD`, minted
 once, never any fixture's own `project_dir`) — an adversarial/oracle finding against the prior
@@ -168,10 +229,9 @@ which only holds if the code reads the env var, not `cwd`.
 
   - **G20** no `fix_head` at all → DENY, reason names `fix_head`.
   - **G21** `fix_head == block_sha` → DENY, reason names the re-roll.
-  - **G22** (a) a relay naming the REAL branch the fix landed on is ALLOWED even though that branch
-    differs from the BLOCK row's own recorded `unit_branch`; (b) on the SAME `fix_head`, a relay
-    naming a DIFFERENT branch that does NOT contain it is DENIED, reason says "not reachable" (not
-    `block_sha` ancestry — G25 covers that distinct axis).
+  - **G22 (V16 semantics)** (a) a relay naming the UNIT'S OWN branch (`slugify()` matching this
+    BLOCK's own `unit_slug`) is ALLOWED; (b) on the SAME `fix_head`, a relay naming a DIFFERENT
+    branch is DENIED, reason says the relay does not name this BLOCK's own unit.
   - **G23** a real repo + fix commit, but no probe names a fix-changed file → DENY (R3), reason
     redirects to "probe the fix."
   - **G24** a probe names a fix-changed file that is ALSO a finding location → ALLOW (probing
@@ -192,8 +252,18 @@ which only holds if the code reads the env var, not `cwd`.
     well under 1s, and spawns ZERO git processes — proven by a PATH-shimmed `git` that logs its own
     invocation before hanging for 30s; the log file never gets created.
   - **G30** env precedence over a decoy `cwd` (above).
-  - **G31** a BLOCK row whose OWN `unit_branch` is empty (the `UNBOUND` fallback bucket) is still
-    satisfiable by a relay that names the real branch the fix landed on.
+  - **G31 (V16 semantics)** a BLOCK row whose OWN `unit_branch` is empty (the `UNBOUND` fallback
+    bucket) can NEVER be satisfied by R3 — no real branch name slugifies to the literal string
+    `UNBOUND` — regardless of what branch the relay names; the deny reason states the remedy
+    (re-dispatch naming the unit, then `rm` the stale row).
+  - **G32 (V10, the round-2 reproducer)** a relay with NO `fix_head`, plus BOTH a fix-verifier AND
+    an acceptance-verifier PASS on record, still denies a repeat adversarial-audit dispatch — the
+    deleted cross-type clearing arm used to allow this exact shape.
+  - **G33/G34 (V11, both name orders)** a prompt whole-token-naming MORE THAN ONE open BLOCK of the
+    same type denies outright, naming both, regardless of which unit's anchor the prompt mentions
+    first.
+  - **G35 (V15, the argv-boundary PoC)** a BLOCK row's `head_sha` shaped like a git option
+    (`--output=<path>`) denies via the sha-shape check, and the named path is never written.
 
 **Docs.** `.claude/hooks/README.md` — the relay schema (`fix_head`), R3's full arm order, §C5, and
 the HONEST LIMIT paragraph extended to R3 (below). `.claude/agents/lead.md` — the relay template
@@ -270,7 +340,7 @@ carry the rest of the weight.
 
 ## Bugs found and fixed while building this proposal (found by execution, not asserted)
 
-Building and running G20-G31 against a THROWAWAY, `cp -R` copy of the tree (outside any git
+Building and running G20-G35 against a THROWAWAY, `cp -R` copy of the tree (outside any git
 worktree, deleted after — this is a change from an earlier draft, which used `git worktree add
 --detach`; a plain `cp -R` copy needs no `.git` link back to this repo at all, and is what "outside
 any git worktree of the repo" now means literally) surfaced real defects, both this round and in
@@ -285,26 +355,38 @@ the FIRST draft of the R3 patch, all fixed in the patch files, not merely in the
    `_relay_rejection` directly with the in-memory row, which still computed the correct DENY).
    Fixed by gitignoring `.jammi/` in every fixture repo, matching the real repo's own convention.
 2. **A grandchild-holding-the-pipes trap in `_run_git`, and a corrected account of what actually
-   bounds a hang.** The first draft used a bare `subprocess.run(cmd, timeout=5)`. On POSIX, that
-   call's own post-timeout `wait()` already returns once the DIRECT child is reaped — a timeout on
-   a childless `git` does not, in fact, hang unboundedly; measured, it returns at ~5s. What actually
-   IS unbounded is a `git` that leaves a GRANDCHILD alive holding the stdout/stderr pipes open after
-   the direct child exits (the realistic production analogue is a hung credential helper or network
-   transport `git` spawned and detached from; the fixture reproduces it with a PATH shim shaped like
-   `sh -c 'sleep 30 & exec sleep 7'`, which discriminates a `killpg`-based implementation from a
-   plain `proc.kill()` one specifically because the backgrounded `sleep 30` survives the shim's own
-   `exec`). `killpg`'s real, measured benefit is REAPING that orphaned grandchild — without it, the
-   orphan keeps running (and, in the pipe-holding shape, keeps a read end open) well past the
-   declared timeout. Fixed by running `git` in its own process group (`start_new_session=True`) and
-   killing the WHOLE group (`os.killpg`) on timeout. A related, compounding issue from the first
-   draft — `_relay_rejection` had two callers reachable from a single `pre` decision (the
-   repeat-dispatch check, and the cross-type clearing path via `_adversarial_audit_cleared_by_verifier_pass`)
-   with BOTH capable of running R3's git arm — is now closed structurally, not just cached: the
-   clearing path calls with `check_fix=False` and never reaches the git arm at all, so there is
-   nothing left to memoize away. A one-process-lifetime memo (keyed additionally on `check_fix`, so
-   a `check_fix=False` lookup can never be served from a `check_fix=True` cache entry or vice versa)
-   remains for the OTHER real multiplier: a single prompt naming more than one open BLOCK of the
-   same type, bounded to at most one unit's R3 per decision (see the R3 decision above).
+   bounds a hang (V12-V14).** A bare `subprocess.run(cmd, stdout=PIPE, stderr=PIPE, timeout=5)`
+   against a hung `git` is, empirically, already BOUNDED at ~5s even for a grandchild holding the
+   pipes open — `subprocess.run`'s own `TimeoutExpired` branch on POSIX is `process.kill();
+   process.wait()`, with no second drain, and `Popen.__exit__` closes the pipe file objects (which
+   does not block) before its own `wait()`. The round-1 PATCH AS COMMITTED (42765820) used a
+   DIFFERENT, subtly worse shape: a manual `Popen(..., stdout=PIPE, stderr=PIPE).communicate
+   (timeout=5)`, and on `TimeoutExpired`, `os.killpg(...)` followed by a SECOND, UN-timed
+   `proc.communicate()` call "to reap." Measured against a portable escaped-grandchild shim
+   (`python3 -c "import os,time;os.setsid();time.sleep(30)" &` backgrounded, then `exec sleep 7` —
+   the grandchild's own `os.setsid()` moves it into a BRAND NEW session/process group, which
+   `os.killpg(proc.pid, ...)` targeting the ORIGINAL group can never reach): this shape took
+   **~30.03s** (RED against a 5s+2s budget) — `killpg` reaping the original group does nothing for
+   a grandchild that already left it, and the second, un-timed `communicate()` blocks until EVERY
+   pipe writer closes, including the escaped one. Fixed (**V12**) by removing the pipe entirely:
+   `Popen` into its own process group (`start_new_session=True`), stdout/stderr captured to real
+   `tempfile.TemporaryFile()`s — never `subprocess.PIPE` — bounded by `Popen.wait(timeout=5)`
+   (never `.communicate()`, never `with Popen(...)`), `os.killpg` the WHOLE group on timeout (a
+   real, complementary benefit for the COMMON case — a hung child that never escaped the group is
+   reaped rather than left running — but not what bounds THIS shim), then a second, independently
+   bounded `wait(timeout=1)`; if even that does not return, close the temp files and `.kill()`
+   before giving up. Measured against the SAME escaped-grandchild shim (**V13**): the fixed shape
+   returns in **~1.0s** — bounded regardless of whether the grandchild is reachable at all, because
+   nothing is ever read from a pipe; a 540 KB `diff --name-only` payload round-trips through the
+   temp files in ~0.01s. A related,
+   compounding issue from the first draft — `_relay_rejection` had TWO callers reachable from a
+   single `pre` decision (the repeat-dispatch check, and the cross-type clearing path via
+   `_adversarial_audit_cleared_by_verifier_pass`), with a `check_fix`-keyed memo bounding the
+   multiplier — is now moot, not merely closed: **V10** deletes the cross-type clearing path (and
+   `check_fix`) outright, and **V11** replaces the "memoize one unit's R3 per decision" approach
+   with an outright DENY the moment more than one open BLOCK of the same type is named — there is
+   exactly one caller of `_relay_rejection` left, and it is reached at most once per decision by
+   construction, so no memo is needed at all.
 3. **The fixture harness's own `cwd`-vs-env vacuity.** `_run()` set the hook subprocess's `cwd` to
    `project_dir` unconditionally on every call — so a mutant that reduces `repo_root()` to
    `Path.cwd()` (never reading `CLAUDE_PROJECT_DIR` at all) passed every one of the 45 pre-existing
@@ -315,14 +397,22 @@ the FIRST draft of the R3 patch, all fixed in the patch files, not merely in the
    harness (up from 0 of 45); the control lib (which reads the env var, falling back to `cwd`
    only when it is unset) still passes all 45.
 4. **A reachability target that could never resolve for an `UNBOUND` or renamed/deleted-branch
-   row.** The first draft of R3 required the relay's `unit_branch` to byte-equal the BLOCK row's
-   own recorded value and then used THAT (necessarily identical) value as the reachability target —
-   which meant a row that landed in the `UNBOUND` fallback bucket (empty `unit_branch` at
-   verdict-write time), or whose recorded branch was since renamed or deleted, could never be
-   satisfied by ANY relay: the target itself never resolved. Fixed by dropping the byte-equality
-   requirement (the artifact's identity is already pinned by the filename and the
-   `agent_type`/`block_ts` content checks) and targeting the relay's OWN `unit_branch` field,
-   falling back to the row's only when the relay omits it — see **G22**, **G31**.
+   row — and the fix for it (round 1) was ITSELF the round-2 "B3" defect, now reverted (V16).** The
+   first draft of R3 required the relay's `unit_branch` to byte-equal the BLOCK row's own recorded
+   value and then used THAT (necessarily identical) value as the reachability target — which meant
+   a row that landed in the `UNBOUND` fallback bucket (empty `unit_branch` at verdict-write time),
+   or whose recorded branch was since renamed or deleted, could never be satisfied by ANY relay: the
+   target itself never resolved. Round 1's fix dropped the byte-equality requirement entirely and
+   trusted `git merge-base --is-ancestor` against WHATEVER branch the relay's own `unit_branch`
+   field named — but that is strictly WEAKER than the byte-equality check it replaced: a relay can
+   name any branch it likes, and `--is-ancestor` will happily confirm reachability from one that has
+   nothing to do with this BLOCK's own unit. Round 2 (**V16**) reverts this: reachability is now
+   BOUND and git-free — `slugify(relay's unit_branch) == unit_slug` (this BLOCK's own state-file
+   identity, already resolved by the dispatch) — which fixes the ORIGINAL problem (a renamed/stale
+   `unit_branch` value on the ROW is no longer the target; the RELAY's own field is) without
+   reopening the trust gap the round-1 fix introduced. An `UNBOUND` row is now, correctly, NEVER
+   satisfiable (there is no real unit to bind it to) — see **G22**, **G31**, rewritten to these
+   semantics.
 5. **`_probe_path` did not strip a surrounding backtick or parenthesis**, so a probe entry written
    as `` `ci/scripts/foo.sh` `` or `(ci/scripts/foo.sh)` (both realistic Markdown-flavoured
    phrasings a lead might use) parsed to a token that never matched a bare `fix_changed` entry —
@@ -332,7 +422,7 @@ the FIRST draft of the R3 patch, all fixed in the patch files, not merely in the
 ## Ledger lifecycle
 
 `esc-097-relay-form-satisfied-without-probing-the-fix` stays `open` (its `eval_ref` names
-G20-G31, currently SKIPPED) until a human applies this doc's patches and the self-test's G20-G31
+G20-G35, currently SKIPPED) until a human applies this doc's patches and the self-test's G20-G35
 arm goes green on main — at that point the row moves to `eval_added`, matching the precedent
 (`esc-064-relay-conjunction.md`'s own lifecycle note).
 

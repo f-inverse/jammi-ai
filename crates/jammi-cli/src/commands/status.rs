@@ -1,9 +1,10 @@
 //! `jammi status` subcommand.
 //!
 //! Reports the server's capabilities handshake — version, compiled feature
-//! flags, addressable storage backends, and mounted gRPC service tiers — by
-//! reading [`CatalogClient::server_info`]. Reachability is implicit: the RPC
-//! succeeding means the server answered, so there is no separate ping.
+//! flags, addressable storage backends, mounted gRPC service tiers, and the
+//! runtime trigger-broker driver — by reading [`CatalogClient::server_info`].
+//! Reachability is implicit: the RPC succeeding means the server answered, so
+//! there is no separate ping.
 
 use jammi_admin::CatalogClient;
 
@@ -13,6 +14,14 @@ pub async fn run(session: &CatalogClient) -> Result<(), Box<dyn std::error::Erro
     println!("features:         {}", join_or_dash(&info.features));
     println!("storage_backends: {}", join_or_dash(&info.storage_backends));
     println!("services:         {}", join_or_dash(&info.services));
+    println!(
+        "broker:           {}",
+        if info.broker.is_empty() {
+            "—"
+        } else {
+            &info.broker
+        }
+    );
     Ok(())
 }
 

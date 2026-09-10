@@ -42,6 +42,21 @@ pub struct ServerInfo {
     /// embedded engine (it serves no gRPC); the server layer fills it with the
     /// runtime-resolved tier set. See `jammi-server`'s service-tier mechanism.
     pub services: Vec<String>,
+    /// The RUNTIME trigger-broker driver this session is actually running:
+    /// `"in_memory"` | `"jet_stream"` | `"postgres"` (see
+    /// [`crate::trigger::BrokerKind::as_str`]). Unlike the first three
+    /// fields this is not a compile-time fact — [`ServerInfo::current`]
+    /// leaves it empty (the same way it leaves `services` empty, since it
+    /// has no live session to ask) — but UNLIKE `services`, this field does
+    /// not legitimately differ between an embedded session and a remote
+    /// server built from the same config: every `JammiSession` holds a real
+    /// broker whether or not it also serves gRPC, so both the embedded
+    /// `Session::server_info` (`jammi-ai`) and `jammi-server`'s
+    /// `GetServerInfo` handler fill this in from the SAME
+    /// `TriggerBroker::driver_kind()` call and therefore report the
+    /// identical value — the operator-visible fact a topology's smoke test
+    /// asserts (e.g. `broker == "postgres"`).
+    pub broker: String,
 }
 
 impl ServerInfo {
@@ -92,6 +107,7 @@ impl ServerInfo {
             features,
             storage_backends,
             services: Vec::new(),
+            broker: String::new(),
         }
     }
 }
@@ -120,5 +136,8 @@ mod tests {
         // The embedded engine mounts no gRPC services; the runtime tier set is
         // the server layer's to fill.
         assert!(info.services.is_empty());
+        // `current()` has no live session to ask, so `broker` is left empty —
+        // the caller that holds a real `TriggerBroker` fills it in.
+        assert!(info.broker.is_empty());
     }
 }

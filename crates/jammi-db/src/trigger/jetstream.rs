@@ -36,7 +36,7 @@ use crate::trigger::error::TriggerError;
 use crate::trigger::ids::{SubscriptionId, TopicId};
 use crate::trigger::offset::Offset;
 use crate::trigger::predicate::Predicate;
-use crate::trigger::subscription::{DeliveredBatch, Subscription};
+use crate::trigger::subscription::{DeliveredBatch, LiveEvent, LiveStream};
 use crate::trigger::topic::TopicDefinition;
 
 /// Headers attached to every published JetStream message. Receivers read
@@ -198,7 +198,7 @@ impl TriggerBroker for JetStreamBroker {
         topic_id: TopicId,
         predicate: Predicate,
         from_offset: Option<Offset>,
-    ) -> Result<Subscription, TriggerError> {
+    ) -> Result<LiveStream, TriggerError> {
         let schema = self
             .schemas
             .read()
@@ -239,16 +239,16 @@ impl TriggerBroker for JetStreamBroker {
                     .await
                     .map_err(|e| TriggerError::Driver(format!("ack: {e}")))?;
                 if let Some(filtered) = predicate.evaluate(&delivered.batch)? {
-                    yield DeliveredBatch {
+                    yield LiveEvent::Batch(DeliveredBatch {
                         offset: delivered.offset,
                         produced_at: delivered.produced_at,
                         batch: filtered,
                         tenant: delivered.tenant,
-                    };
+                    });
                 }
             }
         };
-        Ok(Subscription::new(SubscriptionId::new(), Box::pin(inner)))
+        Ok(LiveStream::new(SubscriptionId::new(), Box::pin(inner)))
     }
 
     async fn list_consumers(
@@ -277,11 +277,38 @@ impl TriggerBroker for JetStreamBroker {
             .await
             .map_err(|e| TriggerError::Driver(format!("list consumers {stream_name}: {e}")))?
         {
+            // `Info.delivered.stream_sequence` / `Info.ack_floor.stream_sequence`
+            // are JetStream's own stream sequence, a counter independent of
+            // the engine `_offset` (they skew apart after any post-commit
+            // fan-out failure — the same reason `subscribe`'s `from_offset`
+            // is never handed to JetStream as a native start sequence). We
+            // translate each into an engine offset by reading the message at
+            // that sequence back and decoding its `HDR_OFFSET` header, the
+            // same header every published message carries.
+            //
+            // `list_consumers` never fails on retention: a translation that
+            // cannot find its message (aged out under `max_age`) omits that
+            // side of the snapshot as `None` rather than failing the whole
+            // call, and a consumer neither of whose sequences translates is
+            // dropped from the listing entirely with a `warn`.
+            let last_delivered_offset =
+                translate_stream_sequence(&stream, info.delivered.stream_sequence).await;
+            let last_acked_offset =
+                translate_stream_sequence(&stream, info.ack_floor.stream_sequence).await;
+            if last_delivered_offset.is_none() && last_acked_offset.is_none() {
+                tracing::warn!(
+                    consumer = %info.name,
+                    stream = %stream_name,
+                    "list_consumers: neither delivered nor ack-floor sequence translated to an \
+                     engine offset (likely aged out under retention); omitting consumer"
+                );
+                continue;
+            }
             snapshots.push(ConsumerOffsetSnapshot {
                 consumer_name: info.name,
                 topic_id,
-                last_delivered_stream_sequence: info.delivered.stream_sequence,
-                last_ack_stream_sequence: info.ack_floor.stream_sequence,
+                last_delivered_offset,
+                last_acked_offset,
             });
         }
         Ok(snapshots)
@@ -290,6 +317,26 @@ impl TriggerBroker for JetStreamBroker {
     fn driver_kind(&self) -> BrokerKind {
         BrokerKind::JetStream
     }
+}
+
+/// Translate a JetStream stream sequence into the engine `_offset` carried
+/// in that message's `HDR_OFFSET` header. `0` is JetStream's own
+/// placeholder for "no message yet" (a freshly-created consumer with
+/// nothing delivered/acked) and is never a valid stream sequence, so it
+/// short-circuits to `None` without a round-trip. Any lookup failure (most
+/// commonly the message aged out of the stream's `max_age`) also yields
+/// `None` — `list_consumers` never fails on retention.
+async fn translate_stream_sequence(
+    stream: &async_nats::jetstream::stream::Stream,
+    stream_sequence: u64,
+) -> Option<u64> {
+    if stream_sequence == 0 {
+        return None;
+    }
+    let raw = stream.get_raw_message(stream_sequence).await.ok()?;
+    raw.headers
+        .get(HDR_OFFSET)
+        .and_then(|v| v.as_str().parse::<u64>().ok())
 }
 
 fn encode_batch_ipc(schema: &SchemaRef, batch: &RecordBatch) -> Result<Vec<u8>, TriggerError> {

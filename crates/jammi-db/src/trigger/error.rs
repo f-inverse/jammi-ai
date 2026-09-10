@@ -38,9 +38,6 @@ pub enum TriggerError {
     #[error("predicate uses an unsupported construct: {0}")]
     PredicateUnsupported(String),
 
-    #[error("offset {0} is older than broker retention")]
-    OffsetEvicted(u64),
-
     #[error("backing table unavailable: {0}")]
     BackingTable(#[from] MutableTableError),
 

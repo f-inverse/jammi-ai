@@ -462,7 +462,6 @@ impl From<&TriggerError> for pb::TriggerErrorDetail {
             TriggerError::PredicateParse(m) => Variant::PredicateParse(m.clone()),
             TriggerError::PredicateEval(m) => Variant::PredicateEval(m.clone()),
             TriggerError::PredicateUnsupported(m) => Variant::PredicateUnsupported(m.clone()),
-            TriggerError::OffsetEvicted(n) => Variant::OffsetEvicted(*n),
             TriggerError::BackingTable(e) => Variant::BackingTable(e.into()),
             TriggerError::Backend(e) => Variant::Backend(e.into()),
             TriggerError::Driver(m) => Variant::Driver(m.clone()),
@@ -501,7 +500,6 @@ impl From<pb::TriggerErrorDetail> for TriggerError {
             Some(Variant::PredicateParse(m)) => TriggerError::PredicateParse(m),
             Some(Variant::PredicateEval(m)) => TriggerError::PredicateEval(m),
             Some(Variant::PredicateUnsupported(m)) => TriggerError::PredicateUnsupported(m),
-            Some(Variant::OffsetEvicted(n)) => TriggerError::OffsetEvicted(n),
             Some(Variant::BackingTable(e)) => TriggerError::BackingTable(e.into()),
             Some(Variant::Backend(e)) => TriggerError::Backend(e.into()),
             Some(Variant::Driver(m)) => TriggerError::Driver(m),
@@ -942,7 +940,6 @@ mod tests {
             TriggerError::PredicateParse("unexpected token at column 4".into()),
             TriggerError::PredicateEval("predicate did not produce Boolean array".into()),
             TriggerError::PredicateUnsupported("aggregate functions are not allowed".into()),
-            TriggerError::OffsetEvicted(42),
             TriggerError::BackingTable(MutableTableError::AlreadyExists(
                 MutableTableId::new("__topic_abc").expect("valid id"),
             )),

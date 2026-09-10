@@ -1029,8 +1029,8 @@ async fn list_consumers_returns_each_subscribers_last_delivered_offset(backend: 
     // Test: register a topic, attach two subscribers, publish three batches,
     // drive both subscriber streams until they observe every batch, then call
     // `list_consumers` and verify both names plus a matching last-delivered
-    // offset come back. The in-memory broker has no ack model, so
-    // `last_ack_stream_sequence == last_delivered_stream_sequence` by design.
+    // engine offset come back. The in-memory broker has no ack model, so
+    // `last_acked_offset == last_delivered_offset` by design.
     let h = harness_or_skip!(build_harness(backend));
     let topic = topic_def(&unique_topic("events.list_consumers"), None);
     h.broker.register_topic(&topic).await.unwrap();
@@ -1058,18 +1058,22 @@ async fn list_consumers_returns_each_subscribers_last_delivered_offset(backend: 
     }
 
     // Drain three batches per subscriber so each tracker observes
-    // offset = 2 (the last published value).
+    // offset = 2 (the last published value). `TriggerBroker::subscribe`
+    // yields driver-level `LiveEvent`s; the in-memory broker only ever
+    // yields `Batch` (it carries the published bytes), never `Wake`.
     for _ in 0..3 {
-        let _ = tokio::time::timeout(Duration::from_secs(2), sub_a.next())
+        let item = tokio::time::timeout(Duration::from_secs(2), sub_a.next())
             .await
             .expect("sub_a timed out")
             .expect("sub_a stream ended early")
             .unwrap();
-        let _ = tokio::time::timeout(Duration::from_secs(2), sub_b.next())
+        assert!(matches!(item, jammi_db::trigger::LiveEvent::Batch(_)));
+        let item = tokio::time::timeout(Duration::from_secs(2), sub_b.next())
             .await
             .expect("sub_b timed out")
             .expect("sub_b stream ended early")
             .unwrap();
+        assert!(matches!(item, jammi_db::trigger::LiveEvent::Batch(_)));
     }
 
     let mut snapshots = h.broker.list_consumers(topic.id).await.unwrap();
@@ -1088,12 +1092,13 @@ async fn list_consumers_returns_each_subscribers_last_delivered_offset(backend: 
     for snap in &snapshots {
         assert_eq!(snap.topic_id, topic.id, "snapshot topic_id mismatch");
         assert_eq!(
-            snap.last_delivered_stream_sequence, 2,
+            snap.last_delivered_offset,
+            Some(2),
             "subscriber {} should be at offset 2 after draining three batches",
             snap.consumer_name
         );
         assert_eq!(
-            snap.last_ack_stream_sequence, snap.last_delivered_stream_sequence,
+            snap.last_acked_offset, snap.last_delivered_offset,
             "in-memory broker has no ack model; ack floor must equal delivered"
         );
     }

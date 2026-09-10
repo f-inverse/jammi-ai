@@ -531,10 +531,54 @@ pub enum BrokerConfig {
         #[serde(default)]
         credentials: Option<Secret>,
     },
+    /// Postgres `LISTEN`/`NOTIFY` wake-up transport
+    /// ([`crate::trigger::PostgresBroker`]) — a topology change, not a
+    /// cargo feature: `sqlx`'s `postgres` feature is unconditional in the
+    /// workspace, so this variant always compiles in.
+    ///
+    /// This driver carries no data of its own — the topic's mutable backing
+    /// table is the authoritative log, and every replica's `url` MUST point
+    /// at the SAME Postgres database (`NOTIFY` is scoped to one instance; a
+    /// replica listening on a different database silently degrades to
+    /// `idle_poll`-only delivery, never data loss — see
+    /// `crate::trigger::postgres`'s module docs for the full connection-cost
+    /// and pool-budget accounting).
+    ///
+    /// # TOML
+    ///
+    /// ```toml
+    /// [broker.postgres]
+    /// # url = "postgres://user:pass@host:5432/jammi"   # optional; defaults
+    /// #                                                 # to `catalog.postgres.url`
+    /// idle_poll_secs = 5
+    /// ```
+    Postgres {
+        /// Connection URL. Defaults to `[catalog.postgres].url` when unset
+        /// AND the catalog itself is Postgres; a SQLite catalog with no
+        /// explicit `url` here is a typed [`crate::error::JammiError::Config`]
+        /// naming both keys (there is no default to fall back to). A
+        /// [`Secret`]: inline or `{ file = "…" }`; never printed. An
+        /// explicit `url` pointing at a Postgres database other than the
+        /// catalog's is allowed — this driver carries no data, so only the
+        /// NOTIFY channel needs to be shared across replicas.
+        #[serde(default)]
+        url: Option<Secret>,
+        /// Idle-tick interval: how often every topic is woken regardless of
+        /// NOTIFY traffic, bounding how long a lost notification (a listener
+        /// reconnect window, a notify-queue overflow) can go undetected.
+        /// Must be `>= 1`; `0` is a typed [`crate::error::JammiError::Config`].
+        /// Default: 5.
+        #[serde(default = "default_idle_poll_secs")]
+        idle_poll_secs: u64,
+    },
 }
 
 fn default_retention_secs() -> u64 {
     7 * 24 * 60 * 60
+}
+
+fn default_idle_poll_secs() -> u64 {
+    5
 }
 
 /// Audit signing-key source selection.

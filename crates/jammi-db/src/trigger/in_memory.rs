@@ -1,9 +1,9 @@
 //! In-memory `TriggerBroker` backed by `tokio::sync::broadcast`.
 //!
-//! Default broker for unit tests and single-process deployments. Lagged
-//! receivers are surfaced as [`TriggerError::OffsetEvicted`] so the
-//! engine's subscribe path can route the missing prefix through
-//! backing-table replay.
+//! Default broker for unit tests and single-process deployments. A lagged
+//! receiver yields [`crate::trigger::LiveEvent::Wake`] (never an error) so
+//! the engine's subscribe path self-heals by replaying the missing prefix
+//! from the backing table.
 
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -24,7 +24,7 @@ use crate::trigger::error::TriggerError;
 use crate::trigger::ids::{SubscriptionId, TopicId};
 use crate::trigger::offset::Offset;
 use crate::trigger::predicate::Predicate;
-use crate::trigger::subscription::{DeliveredBatch, Subscription};
+use crate::trigger::subscription::{DeliveredBatch, LiveEvent, LiveStream};
 use crate::trigger::topic::TopicDefinition;
 
 /// Per-subscription bookkeeping the broker hands back through
@@ -157,7 +157,7 @@ impl TriggerBroker for InMemoryBroker {
         topic_id: TopicId,
         predicate: Predicate,
         from_offset: Option<Offset>,
-    ) -> Result<Subscription, TriggerError> {
+    ) -> Result<LiveStream, TriggerError> {
         let subscription_id = SubscriptionId::new();
         let tracker = Arc::new(ConsumerTracker {
             consumer_name: subscription_id.to_string(),
@@ -196,22 +196,26 @@ impl TriggerBroker for InMemoryBroker {
                             .last_delivered
                             .store(d.offset.value(), Ordering::Relaxed);
                         if let Some(filtered) = predicate.evaluate(&d.batch)? {
-                            yield DeliveredBatch {
+                            yield LiveEvent::Batch(DeliveredBatch {
                                 offset: d.offset,
                                 produced_at: d.produced_at,
                                 batch: filtered,
                                 tenant: d.tenant,
-                            };
+                            });
                         }
                     }
-                    Err(broadcast::error::RecvError::Lagged(n)) => {
-                        Err(TriggerError::OffsetEvicted(n))?;
+                    // A lagged receiver dropped `n` events off the broadcast
+                    // channel — self-heal via `Wake` rather than failing the
+                    // stream; the engine's subscribe seam replays the missing
+                    // prefix from the backing table.
+                    Err(broadcast::error::RecvError::Lagged(_n)) => {
+                        yield LiveEvent::Wake;
                     }
                     Err(broadcast::error::RecvError::Closed) => break,
                 }
             }
         };
-        Ok(Subscription::new(subscription_id, Box::pin(stream)))
+        Ok(LiveStream::new(subscription_id, Box::pin(stream)))
     }
 
     async fn list_consumers(
@@ -229,15 +233,15 @@ impl TriggerBroker for InMemoryBroker {
                 snapshots.push(ConsumerOffsetSnapshot {
                     consumer_name: tracker.consumer_name.clone(),
                     topic_id: tracker.topic_id,
-                    last_delivered_stream_sequence: last_delivered,
+                    last_delivered_offset: Some(last_delivered),
                     // The in-memory broker delivers via `tokio::broadcast`,
                     // which has no explicit-ack model; every received batch
                     // is implicitly acknowledged the moment the subscriber
                     // observes it. Surfacing the same value for both fields
                     // keeps the round-trip stable through the backup-restore
-                    // path (`last_ack` is the field a restore would use to
-                    // resume).
-                    last_ack_stream_sequence: last_delivered,
+                    // path (`last_acked_offset` is the field a restore would
+                    // use to resume).
+                    last_acked_offset: Some(last_delivered),
                 });
                 true
             } else {

@@ -11,10 +11,12 @@ pub mod in_memory;
 #[cfg(feature = "jetstream-broker")]
 pub mod jetstream;
 pub mod offset;
+pub mod postgres;
 pub mod predicate;
 pub mod publisher;
 pub mod subscriber;
 pub mod subscription;
+pub(crate) mod tail;
 pub mod topic;
 
 pub use broker::{BrokerKind, TriggerBroker};
@@ -25,8 +27,9 @@ pub use in_memory::InMemoryBroker;
 #[cfg(feature = "jetstream-broker")]
 pub use jetstream::JetStreamBroker;
 pub use offset::Offset;
+pub use postgres::PostgresBroker;
 pub use predicate::Predicate;
 pub use publisher::Publisher;
 pub use subscriber::Subscriber;
-pub use subscription::{DeliveredBatch, Subscription};
+pub use subscription::{DeliveredBatch, LiveEvent, LiveStream, Subscription};
 pub use topic::{TopicDefinition, OFFSET_COLUMN, PRODUCED_AT_COLUMN, ROW_INDEX_COLUMN};

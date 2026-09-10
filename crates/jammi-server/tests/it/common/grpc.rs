@@ -91,6 +91,43 @@ pub async fn spawn_bound_chain(
     (addr, handle)
 }
 
+/// A [`tokio::task::JoinHandle`] that ABORTS its task on drop rather than
+/// merely detaching it (`JoinHandle::drop`'s own documented behaviour). A
+/// `Future` in its own right (delegates `poll` to the inner handle), so it
+/// slots into `handle.await` and `tokio::time::timeout(dur, handle)`
+/// call sites unchanged — only construction (wrapping the raw
+/// `JoinHandle`) differs from those call sites' point of view.
+///
+/// Exists because `shutdown`'s own drop (a field ahead of `handle` in
+/// [`EngineServer`]'s declaration order, dropped first) only REQUESTS
+/// `serve_with_shutdown` wind down gracefully — it does not guarantee the
+/// spawned chain task is gone by the time a caller that never reaches its own
+/// explicit `handle.await` (e.g. a test that panics first) moves on. For a
+/// broker backed by a live external connection (e.g.
+/// `start_engine_server_with_broker`'s `[broker.postgres]`, held via
+/// `PostgresBroker`'s own LISTEN connection), that gap leaks a live
+/// connection past the guard's scope. Aborting on drop is unconditional and
+/// safe either way: a handle that already finished (the explicit-shutdown
+/// path every passing test takes) makes `abort` a documented no-op.
+pub struct AbortOnDropHandle<T>(tokio::task::JoinHandle<T>);
+
+impl<T> Drop for AbortOnDropHandle<T> {
+    fn drop(&mut self) {
+        self.0.abort();
+    }
+}
+
+impl<T> std::future::Future for AbortOnDropHandle<T> {
+    type Output = Result<T, tokio::task::JoinError>;
+
+    fn poll(
+        mut self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<Self::Output> {
+        std::pin::Pin::new(&mut self.0).poll(cx)
+    }
+}
+
 /// Guards that keep an in-process engine-backed gRPC server (and its catalog)
 /// alive for the duration of a test. Dropping `shutdown` or letting it fall out
 /// of scope tears the server down; `_dir` roots the engine's temp artifact dir.
@@ -100,7 +137,7 @@ pub struct EngineServer {
     /// RAII guard: roots the engine's temp artifact dir for the server's
     /// lifetime and deletes it on drop. Held, never read.
     pub _dir: TempDir,
-    pub handle: tokio::task::JoinHandle<()>,
+    pub handle: AbortOnDropHandle<()>,
     /// The same `Arc<InferenceSession>` the server task drives. Shared so a
     /// test can wrap it in a local `Session` and assert the data-plane client
     /// over the wire returns identical results / errors against the *same*
@@ -173,7 +210,7 @@ pub async fn start_engine_server_with_tiers(tiers: jammi_server::tiers::TierSet)
         addr,
         shutdown: shutdown_tx,
         _dir: dir,
-        handle,
+        handle: AbortOnDropHandle(handle),
         engine,
     }
 }
@@ -309,7 +346,7 @@ pub async fn start_engine_server_worker_quiesced() -> EngineServer {
         addr,
         shutdown: shutdown_tx,
         _dir: dir,
-        handle,
+        handle: AbortOnDropHandle(handle),
         engine,
     }
 }
@@ -411,7 +448,33 @@ pub async fn start_engine_server_with_run_worker(run_worker: bool) -> EngineServ
         addr,
         shutdown: shutdown_tx,
         _dir: dir,
-        handle,
+        handle: AbortOnDropHandle(handle),
+        engine,
+    }
+}
+
+/// Spin up the SAME engine-backed server [`start_engine_server`] does
+/// (identical tier set, identical chain, identical eager bind), but with
+/// `[broker]` overridden to `broker` instead of the config default
+/// (in-process). Used by the K4 oracle that exercises a NON-DEFAULT runtime
+/// broker kind end to end — both the embedded session and the remote server
+/// built from the SAME config must report the identical runtime broker
+/// (`grpc_introspection.rs`).
+pub async fn start_engine_server_with_broker(
+    broker: jammi_db::config::BrokerConfig,
+) -> EngineServer {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let mut cfg = test_config(dir.path());
+    cfg.broker = broker;
+    let (chain, engine) = engine_chain_from_config(ephemeral_addr(), non_event_tiers(), cfg).await;
+    let (shutdown_tx, shutdown_rx) = oneshot::channel::<()>();
+    let (addr, handle) = spawn_bound_chain(chain, shutdown_rx).await;
+
+    EngineServer {
+        addr,
+        shutdown: shutdown_tx,
+        _dir: dir,
+        handle: AbortOnDropHandle(handle),
         engine,
     }
 }

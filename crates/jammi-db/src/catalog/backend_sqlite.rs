@@ -490,4 +490,11 @@ impl CatalogBackend for SqliteBackend {
     fn backend_kind(&self) -> BackendKind {
         BackendKind::Sqlite
     }
+
+    fn pool_size(&self) -> u32 {
+        // Matches `open`'s `SqlitePoolOptions::new().max_connections(8)`
+        // above. Not read off `self.pool` because `sqlx::Pool` exposes live
+        // connection counts, not the configured ceiling.
+        8
+    }
 }

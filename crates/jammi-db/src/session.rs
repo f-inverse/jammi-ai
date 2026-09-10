@@ -1,4 +1,5 @@
 use std::sync::Arc;
+use std::time::Duration;
 
 use arrow::array::RecordBatch;
 use datafusion::execution::session_state::SessionStateBuilder;
@@ -22,7 +23,7 @@ use crate::store::mutable::sqlite::SqliteMutableBackend;
 use crate::store::mutable::MutableBackend;
 use crate::tenant::{TenantContext, TenantId};
 use crate::tenant_scope::{SourceTenantColumns, TenantBinding, TenantScopeAnalyzerRule};
-use crate::trigger::{InMemoryBroker, Publisher, Subscriber, TriggerBroker};
+use crate::trigger::{InMemoryBroker, PostgresBroker, Publisher, Subscriber, TriggerBroker};
 
 /// A source's DataFusion table providers, keyed by table name — the shape
 /// [`JammiSession::register_source_tables`] builds per source type and
@@ -1060,7 +1061,10 @@ async fn build_backend_from_config(config: &JammiConfig) -> Result<BackendImpl> 
 
 /// Build a trigger broker from `config.broker`. JetStream requires the
 /// `jetstream-broker` cargo feature; selecting it without the feature
-/// returns a typed [`JammiError::Config`] rather than panicking.
+/// returns a typed [`JammiError::Config`] rather than panicking. Postgres has
+/// no cargo feature (sqlx's `postgres` feature is unconditional in the
+/// workspace) and defaults its `url` from `config.catalog` when the catalog
+/// itself is Postgres.
 async fn build_broker_from_config(config: &JammiConfig) -> Result<Arc<dyn TriggerBroker>> {
     match &config.broker {
         BrokerConfig::InMemory => Ok(Arc::new(InMemoryBroker::new())),
@@ -1075,6 +1079,54 @@ async fn build_broker_from_config(config: &JammiConfig) -> Result<Arc<dyn Trigge
             // inline (`nats://user:pass@host`).
             let creds = credentials.as_ref().map(crate::config::Secret::expose);
             build_jetstream_broker(url.expose(), *retention_seconds, creds).await
+        }
+        BrokerConfig::Postgres {
+            url,
+            idle_poll_secs,
+        } => {
+            // Validated at THIS config seam, before `PostgresBroker::connect`
+            // is ever reached, so both edges surface as a typed
+            // `JammiError::Config` (matching the no-`url`-over-SQLite-catalog
+            // case just below) rather than `PostgresBroker::connect`'s own
+            // `TriggerError::Driver`, which `?` would otherwise wrap in
+            // `JammiError::Trigger` — a different variant whose `Display`
+            // text happens to overlap but which a caller matching on the
+            // variant (rather than substring-matching the message) would
+            // never see as `Config`.
+            if *idle_poll_secs == 0 {
+                return Err(JammiError::Config(
+                    "[broker.postgres] idle_poll_secs must be >= 1 (a zero interval is a \
+                     busy-loop)"
+                        .into(),
+                ));
+            }
+            let resolved_url = match url {
+                Some(u) => u.expose().to_string(),
+                None => match &config.catalog {
+                    CatalogConfig::Postgres {
+                        url: catalog_url, ..
+                    } => catalog_url.expose().to_string(),
+                    CatalogConfig::Sqlite { .. } => {
+                        return Err(JammiError::Config(
+                            "[broker.postgres] has no `url` and `[catalog]` is not `postgres` -- \
+                             set `broker.postgres.url` explicitly, or `catalog.postgres.url` for \
+                             `[broker.postgres]` to default from it"
+                                .into(),
+                        ));
+                    }
+                },
+            };
+            if !(resolved_url.starts_with("postgres://")
+                || resolved_url.starts_with("postgresql://"))
+            {
+                return Err(JammiError::Config(
+                    "[broker.postgres] url must be a postgres:// (or postgresql://) URL".into(),
+                ));
+            }
+            let broker =
+                PostgresBroker::connect(&resolved_url, Duration::from_secs(*idle_poll_secs))
+                    .await?;
+            Ok(Arc::new(broker))
         }
     }
 }

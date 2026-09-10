@@ -1099,10 +1099,27 @@ jobs:
           # Service container is reachable at `postgres` from the job container
           # (same Docker network); the catalog connects via sqlx::PgPool.
           JAMMI_TEST_PG_URL: postgres://jammi:jammi@postgres:5432/jammi_test
+          # This job's service container always resolves the URL above; set
+          # so any live-Postgres oracle that skips on an unset URL instead
+          # panics here (the require-gate shape `require_live_pg` uses) —
+          # a real regression in this lane fails loudly, never silently.
+          JAMMI_REQUIRE_PG: "1"
         # Tests share one catalog DB and serialise migrate() ledger writes.
         # `--test-threads=1` keeps that contract; the suite is small.
         run: |
           cargo test -p jammi-db --features live-postgres-tests --test it -- --test-threads=1
+
+      - name: Run Postgres-gated jammi-server introspection tests
+        env:
+          JAMMI_TEST_PG_URL: postgres://jammi:jammi@postgres:5432/jammi_test
+          JAMMI_REQUIRE_PG: "1"
+        # K4: `remote_server_info_reports_postgres_broker_kind` proves the
+        # non-default `[broker.postgres]` config round-trips through
+        # `ServerInfo.broker` over the wire — the only lane that exercises it.
+        # Same shared-catalog contract as the jammi-db step above: one DB,
+        # serialised migrate() ledger writes, so `--test-threads=1`.
+        run: |
+          cargo test -p jammi-server --test it -- introspection --test-threads=1
 
   # Hermetic script-guard class: every leg here is the same shape (plain
   # ubuntu, checkout, run one hermetic script — no toolchain, no container,

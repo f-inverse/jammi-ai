@@ -186,6 +186,7 @@ async fn applied_migrations_ledger_records_all_migrations() {
             "024_claim_policy",
             "025_index_segments",
             "026_acceleration_report",
+            "028_topics_next_offset",
         ]
     );
 }

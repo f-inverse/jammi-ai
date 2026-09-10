@@ -228,9 +228,6 @@ pub fn map_trigger_error(err: TriggerError) -> Status {
             (Code::InvalidArgument, format!("predicate: {detail}"))
         }
         TriggerError::PredicateEval(detail) => (Code::Internal, format!("predicate: {detail}")),
-        TriggerError::OffsetEvicted(n) => {
-            (Code::FailedPrecondition, format!("offset {n} evicted"))
-        }
         TriggerError::BackingTable(e) => (Code::Internal, format!("backing table: {e}")),
         TriggerError::Backend(e) => (Code::Internal, format!("backend: {e}")),
         TriggerError::Driver(detail) => (Code::Unavailable, format!("broker: {detail}")),

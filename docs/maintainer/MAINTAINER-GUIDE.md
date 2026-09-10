@@ -926,43 +926,89 @@ here: the trigger broker is the pluggable one; the catalog/mutable backend rides
   `crates/jammi-db/src/trigger/predicate.rs`), `DeliveredBatch`
   (`crates/jammi-db/src/trigger/subscription.rs`), `TriggerError`
   (`crates/jammi-db/src/trigger/error.rs`).
-- **The broker IS a pluggable backend** — `TriggerBroker` trait
-  (`crates/jammi-db/src/trigger/broker.rs`, `Send + Sync + 'static`,
-  `#[async_trait]`): `register_topic`/`drop_topic`/`publish`/`subscribe`/
-  `list_consumers`/`driver_kind`. **Contract: the broker is transport-only — it MUST
-  NOT persist** (`crates/jammi-db/src/trigger/broker.rs`, the trait doc); the
-  engine's mutable backing table is the authoritative log, and the broker never sees
-  `tenant_id` (tenant scope is enforced upstream by catalog lookup + predicate
-  injection). Two impls behind `Arc<dyn TriggerBroker>`: `InMemoryBroker`
-  (`crates/jammi-db/src/trigger/in_memory.rs`, `BrokerKind::InMemory`, the
-  **default**) and `JetStreamBroker` (`crates/jammi-db/src/trigger/jetstream.rs`,
-  `BrokerKind::JetStream`) — the latter is gated behind the **`jetstream-broker`
-  cargo feature** (`crates/jammi-db/Cargo.toml`; re-exported only under that cfg,
+- **The broker IS a pluggable backend, but it is transport-only** —
+  `TriggerBroker` trait (`crates/jammi-db/src/trigger/broker.rs`,
+  `Send + Sync + 'static`, `#[async_trait]`):
+  `register_topic`/`drop_topic`/`publish`/`subscribe`/`list_consumers`/
+  `driver_kind`. **Contract: a driver MUST NOT persist**
+  (`crates/jammi-db/src/trigger/broker.rs`, the trait doc); the engine's
+  mutable backing table is the authoritative log, and the broker never sees
+  `tenant_id` (tenant scope is enforced upstream by catalog lookup +
+  predicate injection). A driver's `subscribe` returns a driver-level
+  `LiveStream` (`crates/jammi-db/src/trigger/subscription.rs`, item
+  `Result<LiveEvent, TriggerError>`): `LiveEvent::Batch(DeliveredBatch)` when
+  the driver carries the published bytes itself, or `LiveEvent::Wake` — carrying
+  no payload — for a driver that carries no bytes at all. There is no error
+  variant for "history not retained" or "receiver lagged": every driver
+  routes both into `Wake`, and the engine's subscribe seam self-heals by
+  replaying the backing table. Three impls behind `Arc<dyn TriggerBroker>`:
+  `InMemoryBroker` (`crates/jammi-db/src/trigger/in_memory.rs`,
+  `BrokerKind::InMemory`, the **default**, yields `Batch`), `PostgresBroker`
+  (`crates/jammi-db/src/trigger/postgres.rs`, `BrokerKind::Postgres`, yields
+  only `Wake` over `LISTEN`/`NOTIFY` — **no cargo feature**, `sqlx`'s
+  `postgres` feature is unconditional in the workspace), and `JetStreamBroker`
+  (`crates/jammi-db/src/trigger/jetstream.rs`, `BrokerKind::JetStream`, yields
+  `Batch`) — the latter is gated behind the **`jetstream-broker` cargo
+  feature** (`crates/jammi-db/Cargo.toml`; re-exported only under that cfg,
   `crates/jammi-db/src/trigger/mod.rs`; `jammi-server` re-exposes it as
   `jetstream-broker`, `crates/jammi-server/Cargo.toml`). Selection is
   **config-driven**, `build_broker_from_config`
   (`crates/jammi-db/src/session.rs`): `BrokerConfig::InMemory` →
-  `InMemoryBroker::new()`; `BrokerConfig::JetStream{…}` → connect; choosing
-  JetStream **without** the feature returns a typed `JammiError::Config`, not a
-  panic (the `#[cfg(not(feature = "jetstream-broker"))]` `build_jetstream_broker`,
+  `InMemoryBroker::new()`; `BrokerConfig::Postgres{…}` → connect (`url`
+  defaults from `catalog.postgres.url` when the catalog is Postgres, else a
+  typed `JammiError::Config` naming both keys); `BrokerConfig::JetStream{…}` →
+  connect; choosing JetStream **without** the feature returns a typed
+  `JammiError::Config`, not a panic (the
+  `#[cfg(not(feature = "jetstream-broker"))]` `build_jetstream_broker`,
   `crates/jammi-db/src/session.rs`).
+- **The engine-facing type never changes with the driver.** `Subscriber`
+  (`crates/jammi-db/src/trigger/subscriber.rs`) resolves every driver's
+  `LiveStream` into the transport-neutral `Subscription`
+  (`crates/jammi-db/src/trigger/subscription.rs`, item
+  `Result<DeliveredBatch, TriggerError>`) — a driver `Batch` is fanned out
+  when contiguous, and a gap or a `Wake` triggers a replay of the backing
+  table, so a caller two layers up never sees which driver is underneath.
+  The mediator is `TopicTail` (`crates/jammi-db/src/trigger/tail.rs`): one per
+  `(topic_id, tenant)` this process has ever served a subscriber for, holding
+  the SINGLE driver-level `LiveStream` for that scope and fanning out to
+  every subscriber of that pair through one `tokio::sync::broadcast` — `N`
+  subscribers of the same topic/tenant cost one driver subscription and one
+  replay per wake, not `N`. The tail keeps a cursor (the last engine
+  `_offset` delivered or replayed, tenant-blind); a driver `Batch` is fanned
+  out directly only when it is exactly `cursor + 1` — any gap or regression
+  drops it and triggers a replay instead — which is what makes multi-replica
+  publish correct for every driver, not only Postgres (post-commit fan-out
+  across replicas is unordered). A tail's own driver subscription is always
+  `(Predicate::match_all(), from_offset = None)`; per-subscriber predicate
+  and tenant filtering happen in-process, never in the driver.
 - **Publish/subscribe contract + error type.** Error type is `TriggerError`
   (`crates/jammi-db/src/trigger/error.rs`) — a `thiserror` enum: `TopicNotFound`,
   `SchemaConflict`, `UnsupportedSchemaType`, `BatchSchemaMismatch`,
-  `PublishTenantMismatch`, `PredicateParse`/`Eval`/`Unsupported`, `OffsetEvicted`,
+  `PublishTenantMismatch`, `PredicateParse`/`Eval`/`Unsupported`,
   `BackingTable(#[from] MutableTableError)`, `Backend(#[from] BackendError)`,
   `Driver`, `Catalog`. Note the **`#[from] MutableTableError`** edge: the trigger
   log *is* a mutable companion table, so the two primitives share an error path.
+  There is no `OffsetEvicted` variant: a driver that cannot start at or before a
+  requested offset, or a receiver that lagged, yields `LiveEvent::Wake` instead
+  of failing the stream.
 - **Session verbs** (`crates/jammi-ai/src/local_session.rs`): all return
   `Result<…, TriggerError>`:
   - `Session::register_topic` — registers with **both** the broker driver *and* the
     catalog (`topic_repo`), in that order, because a `publish` resolves the topic
     against the broker; a catalog-only registration would make publish fail with
-    `TopicNotFound`.
+    `TopicNotFound`. `register_topic` is the engine's own responsibility for
+    schema-conflict detection (`TopicRepo::register_topic`); a driver MAY treat
+    its own `register_topic`/`drop_topic` as a no-op (Postgres does — there is
+    nothing for a wake-up transport to own per topic).
   - `Session::publish(topic, batch) -> Offset` →
     `Publisher::publish_scoped(topic, tenant, batch)`
     (`crates/jammi-db/src/trigger/publisher.rs`). Tenant comes from the session, not
-    the caller.
+    the caller. Offset assignment is transactional — one locking
+    `UPDATE topics SET next_offset = … RETURNING` inside the same transaction
+    that inserts the augmented batch — so two engine replicas publishing
+    against the same Postgres catalog never collide on the backing table's
+    `(_offset, _row_idx)` composite key; an empty batch is rejected rather than
+    burning a gap-free offset for zero rows.
   - `Session::subscribe(topic, predicate, from_offset, replay_only)` → a
     transport-neutral `Stream<Item = Result<DeliveredBatch, TriggerError>>`.
     `replay_only=true` selects the **finite-drain primitive**
@@ -1043,12 +1089,35 @@ here: the trigger broker is the pluggable one; the catalog/mutable backend rides
   (`crates/jammi-db/src/catalog/channel_repo.rs`) — the from-arms are total over the
   enum.
 - **Add a broker backend.** Implement `TriggerBroker` (transport-only, never
-  persist), add a `BrokerKind` variant (`crates/jammi-db/src/trigger/broker.rs`) and
-  a `BrokerConfig` arm, wire it in `build_broker_from_config`
-  (`crates/jammi-db/src/session.rs`); gate any new dependency behind a cargo feature
-  like `jetstream-broker` and return `JammiError::Config` when selected without it.
-  No `search()` or result-table code changes — the broker plugs in at the
-  session-construction seam.
+  persist): `register_topic`/`drop_topic` may be no-ops (the engine owns
+  schema-conflict detection), `publish` returns the engine-assigned offset
+  without inspecting the tenant tag, and `subscribe` returns a `LiveStream`
+  (`crates/jammi-db/src/trigger/subscription.rs`) whose item is
+  `Result<LiveEvent, TriggerError>` — yield `LiveEvent::Batch(DeliveredBatch)`
+  when the driver carries the published bytes itself, or `LiveEvent::Wake`
+  (no payload) when it does not; a driver that cannot start at or before the
+  requested offset, or whose receiver lagged, yields `Wake` — there is no
+  error variant for either case. `PostgresBroker`
+  (`crates/jammi-db/src/trigger/postgres.rs`) is the reference for a
+  bytes-free driver: it carries no data of its own, because the topic's own
+  mutable backing table is already the durable, authoritative log every
+  driver replays through — a driver that persisted its own copy would be a
+  second, unreconciled log, which the trait forbids. Whatever a driver
+  yields, the engine-facing type never changes: `Subscriber`'s `TopicTail`
+  (`crates/jammi-db/src/trigger/tail.rs`) holds the ONE driver-level
+  `LiveStream` per `(topic, tenant)` and resolves it into the transport-
+  neutral `Subscription` (item `DeliveredBatch`) every caller — embedded or
+  remote — actually observes, so a new driver never touches
+  `Subscriber`/`Publisher`/the wire encoders. Add a `BrokerKind` variant
+  (`crates/jammi-db/src/trigger/broker.rs`) and a `BrokerConfig` arm, wire it
+  in `build_broker_from_config` (`crates/jammi-db/src/session.rs`); gate a
+  new dependency behind a cargo feature like `jetstream-broker` and return
+  `JammiError::Config` when selected without it — **only when the dependency
+  is genuinely optional**: `PostgresBroker` needs no feature at all, because
+  `sqlx`'s `postgres` feature is already unconditional in the workspace (the
+  catalog backend depends on it), so gating it would be a feature flag
+  guarding nothing. No `search()` or result-table code changes — the broker
+  plugs in at the session-construction seam.
 - **Add a topic / mutable table at runtime** is data, not code: `register_topic` /
   `create_mutable_table`. No migration needed (the backing table is created by the
   renderer DDL).

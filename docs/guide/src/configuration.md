@@ -191,7 +191,36 @@ credentials = { file = "/var/run/secrets/nats.creds" }
 
 `[broker.jet_stream]` requires the `jetstream-broker` cargo feature on
 `jammi-db`; selecting it without the feature is a load-time
-`JammiError::Config`, never a panic at session construction. See
+`JammiError::Config`, never a panic at session construction.
+
+```toml
+[broker.postgres]
+# url = "postgres://user:pass@host:5432/jammi"   # optional; defaults to
+#                                                 # `catalog.postgres.url`
+idle_poll_secs = 5
+```
+
+`[broker.postgres]` is a `LISTEN`/`NOTIFY` wake-up transport over the topic's
+own mutable backing table — it carries no cargo feature, no bytes, and no
+separate log: `url` defaults to `catalog.postgres.url` and MUST name the SAME
+Postgres database on every replica (`NOTIFY` is scoped to one instance; a
+replica pointed elsewhere silently degrades to `idle_poll`-only delivery,
+never data loss). A SQLite catalog with no explicit `url` here is a load-time
+`JammiError::Config` naming both keys. `idle_poll_secs` (default 5, must be
+`>= 1`) bounds how long a lost `NOTIFY` can go undetected before the next
+poll wakes every topic. The broker itself opens up to three dedicated
+Postgres connections (one `PgListener`, up to two for `NOTIFY`) — never the
+catalog's own pool — but every trigger-stream replay (a tail's own
+driver-triggered replay, a lagging subscriber's own catch-up, and a fresh
+subscriber's subscribe-time drain) runs one STEP at a time, and each step
+borrows one CATALOG-pool connection only for its own duration: the permit is
+released between steps, so a long multi-step catch-up never monopolises a
+connection. Concurrent replay STEPS across the process are bounded at
+`pool_size − 2` (minimum 1), one connection per step, leaving two
+connections for publishers; size `catalog.postgres.pool_size` for the
+number of `(topic, tenant)` tails you expect to be replaying at the same
+moment plus ordinary writers, independent of this broker's fixed
+three-connection budget. See
 [Catalog Backend and Trigger Broker](./catalog-and-broker.md) for the full
 trade-off discussion, the health probe, and the SQLite single-process
 contract.
@@ -302,7 +331,8 @@ rejected as an unknown tier name) selects all-in-one; a comma-separated list
 exactly those tiers. See [Service tiers](./deploy-server.md#service-tiers).
 
 **Secrets.** A `Secret`-typed field (`catalog.postgres.url`,
-`broker.jet_stream.credentials`, `inference.http.headers` values, the cloud
+`broker.jet_stream.credentials`, `broker.postgres.url`,
+`inference.http.headers` values, the cloud
 credential fields, `models.hub_token`) takes the value inline
 (`JAMMI_CATALOG__POSTGRES__URL=…`)
 or as a file reference via the `__FILE` suffix

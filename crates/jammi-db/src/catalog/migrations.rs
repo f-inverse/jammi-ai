@@ -86,6 +86,11 @@ const MIGRATIONS: &[(&str, &str)] = &[
         "026_acceleration_report",
         schema::MIGRATION_026_ACCELERATION_REPORT,
     ),
+    // 027 is reserved by the lease migration; 028 adds topics.next_offset.
+    (
+        "028_topics_next_offset",
+        schema::MIGRATION_028_TOPICS_NEXT_OFFSET,
+    ),
 ];
 
 const APPLIED_MIGRATIONS_DDL: &str = r#"

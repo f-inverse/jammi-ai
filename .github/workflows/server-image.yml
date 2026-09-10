@@ -238,31 +238,49 @@ jobs:
           docker buildx imagetools create --dry-run "${tag_args[@]}" "${sources[@]}" \
             | bash ci/scripts/check_merged_index_platforms.sh "linux/amd64,linux/arm64"
 
-          # Capture the PRE-CREATE digest of the immutable `sha-<sha>` tag
-          # BEFORE the real (mutating) create below -- if the post-push
-          # confirm fails, this is the exact digest to restore to. Same
-          # not-found-vs-any-other-failure split as `_ci-base-image.yml`'s
-          # `promote` step (:345-378): a genuine first publish has nothing
-          # to restore to; any other read failure means this step cannot
-          # even confirm what it would be overwriting.
-          set +e
-          previous_digest="$(docker buildx imagetools inspect "${IMAGE}:${SHA_TAG}" --format '{{.Manifest.Digest}}' 2>/tmp/merge-cpu-main-inspect-stderr.txt)"
-          inspect_rc=$?
-          set -e
-          inspect_stderr="$(cat /tmp/merge-cpu-main-inspect-stderr.txt)"
-          if [ "$inspect_rc" -ne 0 ]; then
-            if [[ "$inspect_stderr" == *"${IMAGE}:${SHA_TAG}: not found"* ]]; then
-              previous_digest=""
-              echo "pre-create digest read: ${IMAGE}:${SHA_TAG} does not exist yet (first publish) -- nothing to restore to"
-            else
-              echo "::error::pre-create digest read for ${IMAGE}:${SHA_TAG} failed with something other than a not-found result -- refusing to promote: $inspect_stderr" >&2
+          # Capture the PRE-CREATE digest of EVERY tag this merge is about
+          # to move -- not only the immutable `sha-<sha>` tag -- because if
+          # the post-push confirm fails, a correct restore needs each
+          # tag's OWN previous digest: `latest` / `{{version}}` /
+          # `{{major}}.{{minor}}` are never guaranteed to have shared one
+          # digest with the sha tag before this merge landed, so restoring
+          # every tag to the sha tag's old digest would re-point tags onto
+          # a digest that was never theirs. Same not-found-vs-any-other-
+          # failure split as `_ci-base-image.yml`'s `promote` step
+          # (:345-378), applied to EACH tag independently: a genuine first
+          # publish of that one tag has nothing to restore to; any other
+          # read failure for any one tag means this step cannot even
+          # confirm what it would be overwriting.
+          declare -A previous_digests
+          for t in "${tags[@]}"; do
+            set +e
+            prev_digest="$(docker buildx imagetools inspect "$t" --format '{{.Manifest.Digest}}' 2>/tmp/merge-cpu-main-inspect-stderr.txt)"
+            inspect_rc=$?
+            set -e
+            inspect_stderr="$(cat /tmp/merge-cpu-main-inspect-stderr.txt)"
+            if [ "$inspect_rc" -ne 0 ]; then
+              if [[ "$inspect_stderr" == *"${t}: not found"* ]]; then
+                previous_digests["$t"]=""
+                echo "pre-create digest read: ${t} does not exist yet (first publish) -- nothing to restore to"
+              else
+                echo "::error::pre-create digest read for ${t} failed with something other than a not-found result -- refusing to promote: $inspect_stderr" >&2
+                exit 1
+              fi
+            elif [[ ! "$prev_digest" =~ ^sha256:[0-9a-f]{64}$ ]]; then
+              echo "::error::pre-create digest read for ${t} succeeded but returned an unexpected value ('$prev_digest', not a sha256 digest) -- refusing to promote" >&2
               exit 1
+            else
+              previous_digests["$t"]="$prev_digest"
             fi
-          elif [[ ! "$previous_digest" =~ ^sha256:[0-9a-f]{64}$ ]]; then
-            echo "::error::pre-create digest read for ${IMAGE}:${SHA_TAG} succeeded but returned an unexpected value ('$previous_digest', not a sha256 digest) -- refusing to promote" >&2
-            exit 1
-          fi
-          echo "previous_digest=$previous_digest" >> "$GITHUB_OUTPUT"
+          done
+
+          {
+            echo "previous_digests<<PREVIOUS_DIGESTS_EOF"
+            for t in "${tags[@]}"; do
+              echo "$t ${previous_digests[$t]}"
+            done
+            echo "PREVIOUS_DIGESTS_EOF"
+          } >> "$GITHUB_OUTPUT"
 
           docker buildx imagetools create "${tag_args[@]}" "${sources[@]}"
 
@@ -302,16 +320,15 @@ jobs:
 
           if ! docker buildx imagetools inspect "${IMAGE}:${SHA_TAG}" --format '{{json .Manifest}}' \
               | bash ci/scripts/check_merged_index_platforms.sh "linux/amd64,linux/arm64"; then
-            if [ -n "$previous_digest" ]; then
-              restore_cmd="docker buildx imagetools create"
-              for restore_tag in "${tags[@]}"; do
-                restore_cmd="${restore_cmd} -t ${restore_tag}"
-              done
-              restore_cmd="${restore_cmd} ${IMAGE}@${previous_digest}"
-              echo "::error::post-push confirm failed for ${IMAGE}:${SHA_TAG} -- the re-read merged index landed but is wrong; previous digest was $previous_digest; restore every tag this merge wrote with: $restore_cmd" >&2
-            else
-              echo "::error::post-push confirm failed for ${IMAGE}:${SHA_TAG} -- the re-read merged index landed but is wrong, and this was the first publish of this tag, so there is no previous digest to restore to; investigate directly" >&2
-            fi
+            echo "::error::post-push confirm failed for ${IMAGE}:${SHA_TAG} -- the re-read merged index landed but is wrong; restoring each tag requires its OWN previous digest, never the sha tag's, since this merge moved them independently:" >&2
+            for restore_tag in "${tags[@]}"; do
+              restore_digest="${previous_digests[$restore_tag]}"
+              if [ -n "$restore_digest" ]; then
+                echo "::error::  restore ${restore_tag}: docker buildx imagetools create -t ${restore_tag} ${IMAGE}@${restore_digest}" >&2
+              else
+                echo "::error::  first publish of ${restore_tag}: nothing to restore" >&2
+              fi
+            done
             exit 1
           fi
           echo "digest=$digest" >> "$GITHUB_OUTPUT"
@@ -468,31 +485,49 @@ jobs:
           docker buildx imagetools create --dry-run "${tag_args[@]}" "${sources[@]}" \
             | bash ci/scripts/check_merged_index_platforms.sh "linux/amd64,linux/arm64"
 
-          # Capture the PRE-CREATE digest of the immutable `sha-<sha>` tag
-          # BEFORE the real (mutating) create below -- if the post-push
-          # confirm fails, this is the exact digest to restore to. Same
-          # not-found-vs-any-other-failure split as `_ci-base-image.yml`'s
-          # `promote` step (:345-378): a genuine first publish has nothing
-          # to restore to; any other read failure means this step cannot
-          # even confirm what it would be overwriting.
-          set +e
-          previous_digest="$(docker buildx imagetools inspect "${IMAGE}:${SHA_TAG}" --format '{{.Manifest.Digest}}' 2>/tmp/merge-cpu-tag-inspect-stderr.txt)"
-          inspect_rc=$?
-          set -e
-          inspect_stderr="$(cat /tmp/merge-cpu-tag-inspect-stderr.txt)"
-          if [ "$inspect_rc" -ne 0 ]; then
-            if [[ "$inspect_stderr" == *"${IMAGE}:${SHA_TAG}: not found"* ]]; then
-              previous_digest=""
-              echo "pre-create digest read: ${IMAGE}:${SHA_TAG} does not exist yet (first publish) -- nothing to restore to"
-            else
-              echo "::error::pre-create digest read for ${IMAGE}:${SHA_TAG} failed with something other than a not-found result -- refusing to promote: $inspect_stderr" >&2
+          # Capture the PRE-CREATE digest of EVERY tag this merge is about
+          # to move -- not only the immutable `sha-<sha>` tag -- because if
+          # the post-push confirm fails, a correct restore needs each
+          # tag's OWN previous digest: `{{version}}` / `{{major}}.{{minor}}`
+          # / the sha tag are never guaranteed to have shared one digest
+          # before this merge landed, so restoring every tag to the sha
+          # tag's old digest would re-point tags onto a digest that was
+          # never theirs. Same not-found-vs-any-other-failure split as
+          # `_ci-base-image.yml`'s `promote` step (:345-378), applied to
+          # EACH tag independently: a genuine first publish of that one
+          # tag has nothing to restore to; any other read failure for any
+          # one tag means this step cannot even confirm what it would be
+          # overwriting.
+          declare -A previous_digests
+          for t in "${tags[@]}"; do
+            set +e
+            prev_digest="$(docker buildx imagetools inspect "$t" --format '{{.Manifest.Digest}}' 2>/tmp/merge-cpu-tag-inspect-stderr.txt)"
+            inspect_rc=$?
+            set -e
+            inspect_stderr="$(cat /tmp/merge-cpu-tag-inspect-stderr.txt)"
+            if [ "$inspect_rc" -ne 0 ]; then
+              if [[ "$inspect_stderr" == *"${t}: not found"* ]]; then
+                previous_digests["$t"]=""
+                echo "pre-create digest read: ${t} does not exist yet (first publish) -- nothing to restore to"
+              else
+                echo "::error::pre-create digest read for ${t} failed with something other than a not-found result -- refusing to promote: $inspect_stderr" >&2
+                exit 1
+              fi
+            elif [[ ! "$prev_digest" =~ ^sha256:[0-9a-f]{64}$ ]]; then
+              echo "::error::pre-create digest read for ${t} succeeded but returned an unexpected value ('$prev_digest', not a sha256 digest) -- refusing to promote" >&2
               exit 1
+            else
+              previous_digests["$t"]="$prev_digest"
             fi
-          elif [[ ! "$previous_digest" =~ ^sha256:[0-9a-f]{64}$ ]]; then
-            echo "::error::pre-create digest read for ${IMAGE}:${SHA_TAG} succeeded but returned an unexpected value ('$previous_digest', not a sha256 digest) -- refusing to promote" >&2
-            exit 1
-          fi
-          echo "previous_digest=$previous_digest" >> "$GITHUB_OUTPUT"
+          done
+
+          {
+            echo "previous_digests<<PREVIOUS_DIGESTS_EOF"
+            for t in "${tags[@]}"; do
+              echo "$t ${previous_digests[$t]}"
+            done
+            echo "PREVIOUS_DIGESTS_EOF"
+          } >> "$GITHUB_OUTPUT"
 
           docker buildx imagetools create "${tag_args[@]}" "${sources[@]}"
 
@@ -532,16 +567,15 @@ jobs:
 
           if ! docker buildx imagetools inspect "${IMAGE}:${SHA_TAG}" --format '{{json .Manifest}}' \
               | bash ci/scripts/check_merged_index_platforms.sh "linux/amd64,linux/arm64"; then
-            if [ -n "$previous_digest" ]; then
-              restore_cmd="docker buildx imagetools create"
-              for restore_tag in "${tags[@]}"; do
-                restore_cmd="${restore_cmd} -t ${restore_tag}"
-              done
-              restore_cmd="${restore_cmd} ${IMAGE}@${previous_digest}"
-              echo "::error::post-push confirm failed for ${IMAGE}:${SHA_TAG} -- the re-read merged index landed but is wrong; previous digest was $previous_digest; restore every tag this merge wrote with: $restore_cmd" >&2
-            else
-              echo "::error::post-push confirm failed for ${IMAGE}:${SHA_TAG} -- the re-read merged index landed but is wrong, and this was the first publish of this tag, so there is no previous digest to restore to; investigate directly" >&2
-            fi
+            echo "::error::post-push confirm failed for ${IMAGE}:${SHA_TAG} -- the re-read merged index landed but is wrong; restoring each tag requires its OWN previous digest, never the sha tag's, since this merge moved them independently:" >&2
+            for restore_tag in "${tags[@]}"; do
+              restore_digest="${previous_digests[$restore_tag]}"
+              if [ -n "$restore_digest" ]; then
+                echo "::error::  restore ${restore_tag}: docker buildx imagetools create -t ${restore_tag} ${IMAGE}@${restore_digest}" >&2
+              else
+                echo "::error::  first publish of ${restore_tag}: nothing to restore" >&2
+              fi
+            done
             exit 1
           fi
           echo "digest=$digest" >> "$GITHUB_OUTPUT"

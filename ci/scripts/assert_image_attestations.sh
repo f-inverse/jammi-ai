@@ -23,32 +23,48 @@
 # must be found among the attestation manifests -- checking only the SBOM
 # predicate previously let a provenance-less image pass the fallback arm.
 #
-# Per-platform coverage (primary-accessor path only): a multi-platform
-# `.Provenance`/`.SBOM` value is an object keyed by "os/arch[/variant]", one
-# entry per platform BuildKit attested. `is_platform_map` recognizes that
-# shape; when it does, this script separately reads the index's OWN
-# platform set (`imagetools inspect --raw`'s `.manifests[]`, excluding
-# attestation-manifest entries) and requires the attestation's key set to be
-# EXACTLY that set. A merge that lands an attested arm64 leg alongside an
-# unattested amd64 leg previously passed here: the arm64 leg's non-empty
-# provenance/SBOM satisfied the old "is there SOMETHING" test with no check
-# that every index platform had its OWN entry. `--self-test` drives this
-# comparison (and `is_platform_map`) against synthetic JSON, no docker, no
-# registry, no network required.
+# Expected shape (primary-accessor path only): the two possible shapes --
+# a multi-platform per-platform map keyed "os/arch[/variant]" (one entry
+# per platform BuildKit attested) versus the FLAT single-platform predicate
+# object real buildx emits, e.g. `{"SLSA":{...}}` / `{"SPDX":{...}}` -- are
+# structurally indistinguishable by key inspection alone: both are "a
+# non-empty object whose values are themselves non-empty objects"
+# (`is_platform_map`'s test). A single-platform push's flat `{"SLSA":{...}}`
+# passes that structural test exactly as a genuine per-platform map does, so
+# `is_platform_map` on its own cannot decide which shape an attestation OWES.
+# The decision instead comes from the index's OWN platform count, read once
+# via `imagetools inspect --raw`'s `.manifests[]` (excluding
+# attestation-manifest entries): >=2 platforms means the index is genuinely
+# multi-platform and the per-platform map is required, checked for EXACT
+# key-set equality against the index's platform set; 0 or 1 platforms means
+# the flat predicate object is required, and a would-be per-platform map
+# whose key set happens to equal that single platform (the shape mistakenly
+# handed to a single-platform index) is rejected. A merge that lands an
+# attested arm64 leg alongside an unattested amd64 leg previously passed
+# here: the arm64 leg's non-empty provenance/SBOM satisfied the old "is
+# there SOMETHING" test with no check that every index platform had its OWN
+# entry. `--self-test` drives both the shape decision and the key-set
+# comparison against synthetic JSON, no docker, no registry, no network
+# required.
 #
 # Usage:
 #   REF=<registry>/<image>@sha256:<digest> assert_image_attestations.sh
 #   assert_image_attestations.sh --self-test
 set -euo pipefail
 
-# Recognizes a per-platform attestation map: a non-empty object all of whose
-# values are themselves non-empty objects (keyed "os/arch[/variant]"). Fails
-# on ANY non-object or empty-object value, so a malformed or partially
-# missing per-platform map cannot slip past as if it were a flat
-# single-platform attestation. Single definition -- `non_empty_attestation`
-# below composes with this rather than re-deriving the predicate, and the
-# platform-set comparison further down calls it directly to decide whether
-# a per-platform comparison even applies.
+# Structural test ONLY: a non-empty object all of whose values are
+# themselves non-empty objects. This shape is worn by BOTH a genuine
+# per-platform map (keyed "os/arch[/variant]") AND the real flat
+# single-platform predicate object (e.g. `{"SLSA":{...}}`) -- the two are
+# indistinguishable by structure alone, which is exactly why
+# `assert_attestation_shape` below never uses this function to decide
+# WHICH shape is owed; it uses it only to confirm a value already known
+# (from the index's own platform count) to owe the per-platform map
+# actually has that structure. Fails on ANY non-object or empty-object
+# value, so a malformed or partially missing per-platform map cannot slip
+# past. `non_empty_attestation` below composes with this for a pure
+# presence check (rejects only the literal `{}` buildx prints for an
+# absent attestation), not a shape-correctness check.
 is_platform_map() {
   jq -e '
     (type == "object") and (length > 0) and
@@ -120,6 +136,53 @@ platform_keys_match() {
   return 0
 }
 
+# Decides WHICH shape a single attestation ($1) owes and enforces it,
+# using the index's OWN platform set ($2, one "os/arch[/variant]" per
+# line -- the same ground truth `platform_keys_match` compares against) as
+# the determinant, never the attestation's own key spelling:
+#
+#   >=2 index platforms (genuinely multi-platform): the per-platform map
+#   is required. `is_platform_map` confirms the structure, then
+#   `platform_keys_match` requires the key set to be EXACTLY the index's
+#   platform set.
+#
+#   0 or 1 index platforms (a single-platform push, or a ref that isn't an
+#   index at all): the FLAT predicate object real buildx emits is
+#   required -- a non-empty object, full stop. The one thing it must NOT
+#   be is the per-platform map mistakenly applied to a single-platform
+#   index: if the attestation's own key set is exactly the index's (one
+#   entry) platform set, that IS the per-platform shape, wrongly handed to
+#   a flat single-platform image, and is rejected by name.
+assert_attestation_shape() {
+  local attestation="$1" index_platforms="$2" label="$3"
+  local platform_count
+  platform_count="$(printf '%s\n' "$index_platforms" | sed '/^$/d' | wc -l | tr -d ' ')"
+
+  if [ "$platform_count" -ge 2 ]; then
+    if ! printf '%s' "$attestation" | is_platform_map; then
+      echo "::error::${label} attestation is missing platform(s) the index carries: $(printf '%s' "$index_platforms" | tr '\n' ' ')" >&2
+      return 1
+    fi
+    platform_keys_match "$attestation" "$index_platforms" "$label"
+    return $?
+  fi
+
+  if ! printf '%s' "$attestation" | jq -e '(type == "object") and (length > 0)' > /dev/null 2>&1; then
+    echo "::error::${label} attestation is not a non-empty flat predicate object for a single-platform image" >&2
+    return 1
+  fi
+
+  if [ -n "$index_platforms" ]; then
+    local att_keys
+    att_keys="$(printf '%s' "$attestation" | jq -r 'keys[]' | sort -u)"
+    if [ "$att_keys" = "$(printf '%s\n' "$index_platforms" | sort -u)" ]; then
+      echo "::error::${label} attestation for a single-platform image is shaped as a per-platform map (keyed \"$(printf '%s' "$att_keys" | tr '\n' ' ')\") instead of a flat predicate object" >&2
+      return 1
+    fi
+  fi
+  return 0
+}
+
 _self_test() {
   local failures=0
 
@@ -151,7 +214,15 @@ _self_test() {
     echo "self-test[is-platform-map-empty-value-rejected]: OK"
   fi
 
-  if printf '%s' '{"predicateType":"x","y":1}' | non_empty_attestation; then
+  # The REAL flat shape buildx emits for a single-platform attestation --
+  # `{"SLSA":{...}}` -- not a fixture with scalar values the producer never
+  # emits. This is structurally identical to a per-platform map
+  # (`is_platform_map` returns true for it too), which is exactly why
+  # presence and shape-correctness are two separate checks: this fixture
+  # only proves buildx's real output is recognized as PRESENT.
+  local real_flat_provenance
+  real_flat_provenance='{"SLSA":{"predicateType":"https://slsa.dev/provenance/v1","predicate":{"buildDefinition":{"buildType":"https://mobyproject.org/buildkit@v1"}}}}'
+  if printf '%s' "$real_flat_provenance" | non_empty_attestation; then
     echo "self-test[non-empty-attestation-flat]: OK"
   else
     echo "self-test[non-empty-attestation-flat]: FAIL" >&2
@@ -231,11 +302,82 @@ _self_test() {
     failures=$((failures + 1))
   fi
 
+  # assert_attestation_shape: the index's OWN platform count -- not the
+  # attestation's key spelling -- decides which shape is owed. All six
+  # combinations below drive the actual function the script calls, not
+  # just its building blocks.
+
+  local index_one
+  index_one="linux/amd64"
+
+  # single-platform flat -> pass: the real `{"SLSA":{...}}` shape is
+  # exactly what a single-platform image owes.
+  if assert_attestation_shape "$real_flat_provenance" "$index_one" "provenance" > /dev/null 2>&1; then
+    echo "self-test[assert-shape-single-platform-flat-pass]: OK"
+  else
+    echo "self-test[assert-shape-single-platform-flat-pass]: FAIL" >&2
+    failures=$((failures + 1))
+  fi
+
+  # single-platform given a map -> fail: an attestation keyed EXACTLY by
+  # the index's one real platform is the per-platform shape, wrongly
+  # applied where a flat predicate object belongs.
+  local single_given_map
+  single_given_map='{"linux/amd64":{"a":1}}'
+  rc=0
+  out="$(assert_attestation_shape "$single_given_map" "$index_one" "provenance" 2>&1)" || rc=$?
+  if [ "$rc" -eq 1 ]; then
+    echo "self-test[assert-shape-single-platform-given-map-fail]: OK"
+  else
+    echo "self-test[assert-shape-single-platform-given-map-fail]: FAIL (rc=$rc, out=$out)" >&2
+    failures=$((failures + 1))
+  fi
+
+  # multi-platform flat -> fail: the exact bug this closes -- the real
+  # flat `{"SLSA":{...}}` shape handed to a genuinely multi-platform index
+  # must fail, naming every platform it doesn't cover.
+  rc=0
+  out="$(assert_attestation_shape "$real_flat_provenance" "$index_two" "provenance" 2>&1)" || rc=$?
+  if [ "$rc" -eq 1 ] && printf '%s' "$out" | grep -q 'linux/amd64' && printf '%s' "$out" | grep -q 'linux/arm64'; then
+    echo "self-test[assert-shape-multi-platform-flat-fail]: OK"
+  else
+    echo "self-test[assert-shape-multi-platform-flat-fail]: FAIL (rc=$rc, out=$out)" >&2
+    failures=$((failures + 1))
+  fi
+
+  # multi-platform map exact -> pass.
+  if assert_attestation_shape "$full_map" "$index_two" "provenance" > /dev/null 2>&1; then
+    echo "self-test[assert-shape-multi-platform-map-exact-pass]: OK"
+  else
+    echo "self-test[assert-shape-multi-platform-map-exact-pass]: FAIL" >&2
+    failures=$((failures + 1))
+  fi
+
+  # multi-platform map missing one -> fail, naming it.
+  rc=0
+  out="$(assert_attestation_shape "$partial_map" "$index_two" "provenance" 2>&1)" || rc=$?
+  if [ "$rc" -eq 1 ] && printf '%s' "$out" | grep -q 'linux/amd64'; then
+    echo "self-test[assert-shape-multi-platform-map-missing-fail]: OK"
+  else
+    echo "self-test[assert-shape-multi-platform-map-missing-fail]: FAIL (rc=$rc, out=$out)" >&2
+    failures=$((failures + 1))
+  fi
+
+  # multi-platform map with an extra platform -> fail, naming it.
+  rc=0
+  out="$(assert_attestation_shape "$extra_map" "$index_two" "SBOM" 2>&1)" || rc=$?
+  if [ "$rc" -eq 1 ] && printf '%s' "$out" | grep -q 'linux/riscv64'; then
+    echo "self-test[assert-shape-multi-platform-map-extra-fail]: OK"
+  else
+    echo "self-test[assert-shape-multi-platform-map-extra-fail]: FAIL (rc=$rc, out=$out)" >&2
+    failures=$((failures + 1))
+  fi
+
   if [ "$failures" -ne 0 ]; then
     echo "assert-image-attestations --self-test: $failures fixture(s) FAILED" >&2
     return 1
   fi
-  echo "assert-image-attestations --self-test: all 11 fixture(s) passed."
+  echo "assert-image-attestations --self-test: all 17 fixture(s) passed."
   return 0
 }
 
@@ -272,24 +414,24 @@ if [ "$provenance_rc" -eq 0 ] && [ "$sbom_rc" -eq 0 ]; then
     exit 1
   fi
 
-  # Both attestations are non-empty. If either is a per-platform map, the
-  # index's own platform set is the ground truth every such map must equal
-  # -- an attested arm64 leg beside an unattested amd64 leg is non-empty
-  # (passes the check above) but covers only half the index.
-  platform_ok=1
-  if printf '%s' "$provenance" | is_platform_map || printf '%s' "$sbom" | is_platform_map; then
-    index_platforms="$(index_platform_set "$REF")"
-    if [ -z "$index_platforms" ]; then
-      echo "::error::could not read $REF's own platform set from the raw index -- refusing to confirm per-platform attestation coverage" >&2
-      exit 1
-    fi
-    if printf '%s' "$provenance" | is_platform_map; then
-      platform_keys_match "$provenance" "$index_platforms" "provenance" || platform_ok=0
-    fi
-    if printf '%s' "$sbom" | is_platform_map; then
-      platform_keys_match "$sbom" "$index_platforms" "SBOM" || platform_ok=0
-    fi
+  # Both attestations are non-empty (a literal `{}` was already rejected
+  # above). Which SHAPE each one owes -- the per-platform map or the flat
+  # single-platform predicate object -- is decided by the index's OWN
+  # platform count, read once here and never by either attestation's key
+  # spelling: an attested arm64 leg beside an unattested amd64 leg is
+  # non-empty (passes the check above) but covers only half a genuinely
+  # multi-platform index; a real single-platform push's flat
+  # `{"SLSA":{...}}` must not be forced through the per-platform key-set
+  # check its structure superficially resembles.
+  index_platforms="$(index_platform_set "$REF")"
+  if [ -z "$index_platforms" ]; then
+    echo "::error::could not read $REF's own platform set from the raw index -- refusing to confirm attestation coverage" >&2
+    exit 1
   fi
+
+  platform_ok=1
+  assert_attestation_shape "$provenance" "$index_platforms" "provenance" || platform_ok=0
+  assert_attestation_shape "$sbom" "$index_platforms" "SBOM" || platform_ok=0
 
   if [ "$platform_ok" -eq 1 ]; then
     echo "provenance and SBOM confirmed via imagetools .Provenance/.SBOM accessors for $REF"

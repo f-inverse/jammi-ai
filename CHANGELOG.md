@@ -384,10 +384,14 @@ workspace ships every publishable crate at the same
   `jammi-server` in one release; `pypi.yml`'s native engine wheel gains the same aarch64 Linux
   leg. Every Linux release binary/wheel is built inside the CI base image resolved to a
   digest ONCE per workflow run (`resolve-base`, read-only, no repo-variable write) so every
-  leg of one release shares one toolchain, and every `*-linux-gnu` artifact is asserted
-  against the manylinux_2_28 GLIBC symbol-version floor (`ci/scripts/assert_glibc_floor.sh`)
-  in addition to an ELF/Mach-O machine-field assert — building inside the manylinux
-  container is necessary but not sufficient. `compose-smoke.yml` gains a native
+  leg of one release shares one toolchain, and every `*-linux-gnu` artifact built inside a
+  bare manylinux_2_28 base is asserted against the manylinux_2_28 GLIBC symbol-version floor
+  (`ci/scripts/assert_glibc_floor.sh`) in addition to an ELF/Mach-O machine-field assert —
+  building inside the manylinux container is necessary but not sufficient. The CUDA tarball
+  (`server-cu12-build`) is the one `*-linux-gnu` exception: it builds with `gcc-toolset-13`
+  (CUDA 12.6 caps at GCC ≤ 13.2, newer than the manylinux_2_28 base's own GCC) inside the CUDA
+  CI base image layered on that same manylinux_2_28 base, so it is asserted only via
+  `assert_elf_machine.sh`, never the GLIBC floor. `compose-smoke.yml` gains a native
   `ubuntu-24.04-arm` leg (its own within-leg parity assertions only, no cross-arch byte
   comparison).
 

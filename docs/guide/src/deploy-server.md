@@ -416,16 +416,23 @@ CI checks both of these, in two separate steps, on every push job:
 imagetools inspect`) that the pushed digest's own OCI index carries BOTH a
 non-empty SBOM and a non-empty provenance attestation manifest; a positively
 empty accessor fails the job immediately rather than falling back to a
-looser check. For a multi-platform index (the merged CPU manifest list,
-`linux/amd64` + `linux/arm64`), "non-empty" is not sufficient on its own:
-the script additionally reads the index's own platform set off the raw OCI
-index and requires the SBOM and provenance maps' key sets to equal it
-exactly, so an attestation covering only one of the merged legs — the
-other landed unattested — fails the job by name, rather than passing
-because *some* platform was attested. A separate `gh attestation verify
-oci://... --bundle-from-oci` step then verifies the Sigstore-signed bundle
-`attest-build-provenance` published as an OCI referrer — the check above
-never touches that bundle.
+looser check. Which SHAPE each attestation must then match is decided by
+the index's own platform count, read off the raw OCI index, never by the
+attestation's own key spelling: a multi-platform index (the merged CPU
+manifest list, `linux/amd64` + `linux/arm64`) requires the per-platform map,
+its key set checked for exact equality against the index's platform set, so
+an attestation covering only one of the merged legs — the other landed
+unattested — fails the job by name, rather than passing because *some*
+platform was attested. A single-platform push (the CUDA `-cu12` tags, the
+dispatch-only `:selfcontained` build, and each per-arch `sha-<sha>-<arch>`
+leg before it is merged) instead requires the FLAT predicate object buildx
+actually emits for a single platform — `{"SLSA":{...}}` / `{"SPDX":{...}}`
+— since that flat object and the per-platform map are structurally
+indistinguishable by key inspection alone (both are "a non-empty object of
+non-empty objects"); the index's platform count is what breaks the tie. A
+separate `gh attestation verify oci://... --bundle-from-oci` step then
+verifies the Sigstore-signed bundle `attest-build-provenance` published as
+an OCI referrer — the check above never touches that bundle.
 The `compose-smoke` workflow's own build (`load: true`, loaded into the
 runner's daemon, never pushed) carries neither: `sbom` and `provenance` are
 explicitly `false` there, since the stock Docker exporter a `load` build

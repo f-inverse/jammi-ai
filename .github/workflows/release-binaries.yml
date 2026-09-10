@@ -472,7 +472,13 @@ jobs:
             [0-9]*.[0-9]*.[0-9]*) ;;
             *) echo "::error::could not parse a semver workspace version out of Cargo.toml (got: '${version}')" >&2; exit 1 ;;
           esac
-          asset="jammi-server-cu12-${version}-x86_64-unknown-linux-gnu.tar.gz"
+          # ONE variable for both the asset name's triple and the
+          # assert's expected arch -- a second hardcoded `x86_64` here
+          # previously could drift from the asset name's triple with no
+          # gate to catch it.
+          triple=x86_64-unknown-linux-gnu
+          arch=${triple%%-*}
+          asset="jammi-server-cu12-${version}-${triple}.tar.gz"
 
           # Class closure (#482): this tarball's own name asserts
           # x86_64-unknown-linux-gnu; nothing checked that the just-built
@@ -482,7 +488,7 @@ jobs:
           # (CUDA lib bundling + launcher assembly) and never went through
           # that script, so it calls the same shared `assert_elf_machine.sh`
           # directly.
-          bash ci/scripts/assert_elf_machine.sh target/release/jammi-server x86_64
+          bash ci/scripts/assert_elf_machine.sh target/release/jammi-server "$arch"
 
           stage="jammi-server-cu12"
           mkdir -p "${stage}/lib"

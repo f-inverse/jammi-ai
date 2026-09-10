@@ -738,6 +738,19 @@ workspace ships every publishable crate at the same
   the loopback-bound reference Compose listeners. `deploy-server.md` and
   `reference-topologies.md` point at the decision from the identity seam
   and the Compose section respectively.
+- **The identity seam gains a proxy-injection sketch; every commented
+  broker Postgres URL and the managed-provider `sslrootcert` story are
+  documented (#487).** `deploy-server.md`'s "The identity seam" shows the
+  ~10-line shape of a proxy that authenticates a caller and injects one
+  header the `TenantResolver` reads and fails closed on when absent.
+  `configuration.md` and `catalog-and-broker.md`'s commented
+  `[broker.postgres] url` examples now carry
+  `?sslmode=verify-full&sslrootcert=…`, matching the catalog examples;
+  `catalog-and-broker.md` gains a paragraph on obtaining `sslrootcert` for
+  Cloud SQL, RDS, and Fly Postgres, plus the sentence that the engine hands
+  the catalog URL to the driver unchanged, so `sslmode`/`sslrootcert` come
+  only from the URL and `libpq` environment variables like `PGSSLMODE` are
+  never consulted.
 
 ### Fixed
 - **Two concurrent `migrate()` callers on a fresh Postgres database could both attempt the

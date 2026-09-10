@@ -278,6 +278,30 @@ not duplicate that contract a second time; see:
   `assemble_grpc_chain` once, authenticates both the gRPC control plane and
   the Flight `db.sql` lane.
 
+**Sketch: an authenticating proxy in front.** The engine does not invent
+tenants (the one rule everything else follows from —
+[Design Philosophy](./philosophy.md#the-one-rule-everything-else-follows-from));
+a proxy that already verified the caller injects the fact, and the resolver
+only reads it:
+
+```rust,ignore
+// The proxy verified the caller upstream and sets this header itself —
+// never a client-controlled one. The resolver reads ONLY the proxy-set
+// value and rejects when it is absent: no header, no fallback tenant.
+async fn resolve(&self, metadata: &MetadataMap) -> Result<TenantScope, Status> {
+    let raw = metadata
+        .get("x-jammi-verified-tenant")
+        .ok_or_else(|| Status::unauthenticated("no verified tenant"))?;
+    let uuid = Uuid::parse_str(raw.to_str()?).map_err(|_| Status::unauthenticated("bad tenant"))?;
+    Ok(TenantScope::Tenant(TenantId::from_uuid(uuid)?))
+}
+```
+
+That is the whole contract: the proxy authenticates and sets one header the
+client cannot forge (metadata stripped from the inbound request and
+re-added by the proxy itself); the resolver trusts only its own header and
+fails closed when it is missing.
+
 Transport encryption is a separate decision from the identity seam above —
 see [Security
 Posture](./security.md#transport-encryption-is-the-deployers-runtime-not-the-engines)

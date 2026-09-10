@@ -30,6 +30,35 @@ path is already trusted), and `sqlx` verifies against the **webpki** root
 store rather than the OS trust store, so a private CA needs its own
 `sslrootcert=` path even on a host that already trusts it system-wide.
 
+The engine hands this URL to the Postgres driver unchanged
+(`crates/jammi-db/src/catalog/backend_postgres.rs:34`) — `sslmode` and
+`sslrootcert` come only from the URL string itself, never from `libpq`
+environment variables. Setting `PGSSLMODE` (or any other `PGSSL*` variable)
+in the process environment has no effect; the query string is the only
+place to say it.
+
+**Where `sslrootcert` comes from for a managed provider.** Each of the three
+managed Postgres offerings this engine's own deployment shapes target
+documents its own root:
+
+- **Google Cloud SQL** — the instance's server CA certificate is on the
+  instance's "Connect using SSL" page in the Cloud SQL Instances Overview,
+  or via `gcloud sql instances describe`; see Cloud SQL's ["Configure SSL/TLS
+  certificates"](https://cloud.google.com/sql/docs/postgres/configure-ssl-instance) docs.
+- **Amazon RDS** — one fixed global bundle covers every region and instance,
+  at [`https://truststore.pki.rds.amazonaws.com/global/global-bundle.pem`](https://truststore.pki.rds.amazonaws.com/global/global-bundle.pem);
+  see the RDS User Guide's ["Using SSL/TLS to encrypt a connection to a DB
+  instance"](https://docs.aws.amazon.com/AmazonRDS/latest/UserGuide/UsingWithRDS.SSL.html) page.
+- **Fly Postgres** — an app reached over Fly's private 6PN WireGuard network
+  needs no `sslrootcert` at all; the network path itself is the trust
+  boundary (see Fly's ["Connecting to
+  Postgres"](https://fly.io/docs/postgres/connecting/) docs). A Fly Postgres
+  instance fronted by a public proxy supplies its own certificate the same
+  way any self-managed instance does.
+
+Download the certificate once, mount it read-only into the container, and
+point `sslrootcert=` at that path.
+
 The broker stanza follows the same shape:
 
 ```toml
@@ -49,7 +78,8 @@ on `jammi-db`; selecting it without the feature returns
 
 ```toml
 [broker.postgres]
-# url = "postgres://user:pass@host:5432/jammi"   # optional; defaults to
+# url = "postgres://user:pass@host:5432/jammi?sslmode=verify-full&sslrootcert=/etc/ssl/certs/ca-certificates.crt"
+#                                                 # optional; defaults to
 #                                                 # `catalog.postgres.url`
 idle_poll_secs = 5
 ```

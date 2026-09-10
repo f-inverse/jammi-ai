@@ -1,7 +1,7 @@
 //! esc-071 RED oracle (`closes_escape: esc-071`) — cross-session catalog read
 //! visibility on ONE SQLite catalog file.
 //!
-//! Contract under test (`many readers run alongside one writer`, docs/guide/src/catalog-and-broker.md:113;
+//! Contract under test (`many readers run alongside one writer`, docs/guide/src/catalog-and-broker.md:143;
 //! two-sessions-per-process supported per `two sessions on the same process see disjoint rows`, docs/guide/src/multi-tenant.md:17,228):
 //! on one SQLite catalog file in one
 //! process, a catalog read through ANY engine session must observe every write

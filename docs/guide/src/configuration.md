@@ -203,7 +203,8 @@ credentials = { file = "/var/run/secrets/nats.creds" }
 
 ```toml
 [broker.postgres]
-# url = "postgres://user:pass@host:5432/jammi"   # optional; defaults to
+# url = "postgres://user:pass@host:5432/jammi?sslmode=verify-full&sslrootcert=/etc/ssl/certs/ca-certificates.crt"
+#                                                 # optional; defaults to
 #                                                 # `catalog.postgres.url`
 idle_poll_secs = 5
 ```

@@ -1313,10 +1313,11 @@ pub struct LoggingConfig {
 #[derive(Debug, Clone, Default, PartialEq, Eq, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct ModelsConfig {
-    /// Hub API endpoint. `None` → config default, then a non-empty
-    /// `HF_ENDPOINT` (a present-but-empty `HF_ENDPOINT` is treated the same
-    /// as unset — see `jammi-ai`'s `model::hub` module docs, "empty values
-    /// are absent"), then the Hub's own default.
+    /// Hub API endpoint. `None` → config default, then a non-empty,
+    /// TRIMMED `HF_ENDPOINT` (a present-but-empty `HF_ENDPOINT` is treated
+    /// the same as unset — see `jammi-ai`'s `model::hub` module docs,
+    /// "empty values are absent, and every value is trimmed"), then the
+    /// Hub's own default.
     pub hub_endpoint: Option<String>,
     /// Root directory the Hub cache lives under (a `hub/` subdirectory is
     /// appended). `None` → a non-empty `HF_HUB_CACHE` (used AS the cache
@@ -1328,11 +1329,15 @@ pub struct ModelsConfig {
     pub hub_cache_dir: Option<PathBuf>,
     /// Hub bearer token. Kept as an unresolved [`SecretSource`] — not
     /// eagerly resolved into a [`Secret`] at config load — because the
-    /// fallback chain (a non-empty `HF_TOKEN`, then the `<HF_HOME>/token`
-    /// file) is read at the `jammi-ai` session choke point, not here (H4).
-    /// The token FILE is always `<HF_HOME>/token` — `HF_HOME` resolved on
-    /// its own, independently of whichever tier won `hub_cache_dir`'s own
-    /// precedence above — never derived from the cache root itself (a
+    /// fallback chain (a non-empty `HF_TOKEN`, then a non-empty
+    /// `HUGGING_FACE_HUB_TOKEN` — `huggingface_hub`'s own live legacy alias,
+    /// `utils/_auth.py:145-147` — then the token file) is read at the
+    /// `jammi-ai` session choke point, not here (H4). The token FILE is
+    /// `HF_TOKEN_PATH`, when non-empty, naming the file directly (matching
+    /// `huggingface_hub`'s own `HF_TOKEN_PATH`, `constants.py:247-254`);
+    /// otherwise `<HF_HOME>/token` — `HF_HOME` resolved on its own,
+    /// independently of whichever tier won `hub_cache_dir`'s own precedence
+    /// above — never derived from the cache root itself (a
     /// `HF_HUB_CACHE`-driven cache root has no `hub` path component to pop
     /// the way a `<HF_HOME>/hub`-shaped root does).
     pub hub_token: Option<SecretSource>,
@@ -1345,7 +1350,10 @@ pub struct ModelsConfig {
     /// value) falls back to a non-empty `HF_HUB_OFFLINE`, then — only when
     /// `HF_HUB_OFFLINE` is itself unset OR present-but-empty (treated
     /// identically — see `jammi-ai`'s `model::hub` module docs, "empty
-    /// values are absent") — to `TRANSFORMERS_OFFLINE` (`huggingface_hub`'s
+    /// values are absent, and every value is trimmed"; a WHITESPACE-only
+    /// `HF_HUB_OFFLINE` is one case where this crate's own reading
+    /// disclosably diverges from `huggingface_hub`'s, in the safe
+    /// direction — see that same section) — to `TRANSFORMERS_OFFLINE` (`huggingface_hub`'s
     /// own alias for this variable), then to `false`. `Option<bool>`, not a
     /// plain `bool`, is what makes "explicitly set to false" distinguishable
     /// from "never mentioned" — the same reason the other three fields

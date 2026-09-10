@@ -75,7 +75,10 @@ workspace ships every publishable crate at the same
   user with `HF_HOME` set (and a `huggingface-cli login` token there) who also set `HF_HUB_CACHE`
   silently lost authentication (a gated repo → 401) — `huggingface_hub` keeps the token at
   `HF_HOME/token` regardless of `HF_HUB_CACHE` (`utils/_auth.py:152`,
-  `HF_TOKEN_PATH`). Both are one root cause read as one rule rather than two patches: every
+  `HF_TOKEN_PATH`). (This round cited `HF_TOKEN_PATH` only as upstream's name for the *default*
+  file location it kept fixed against `HF_HUB_CACHE` — it did not yet honour `HF_TOKEN_PATH` as
+  an OVERRIDE naming a different file; that remained a real divergence, fixed in the #481 fix
+  round 4 entry below.) Both are one root cause read as one rule rather than two patches: every
   `HubSource` env read (`HF_HUB_OFFLINE`, `TRANSFORMERS_OFFLINE`, `HF_HUB_CACHE`, `HF_HOME`,
   `HF_ENDPOINT`, `HF_TOKEN`) now goes through one helper, `env_nonempty`, that treats a
   present-but-empty value (after trimming) as absent — a strict superset of `huggingface_hub`'s
@@ -95,8 +98,54 @@ workspace ships every publishable crate at the same
   `MockServer` and assert `received_requests()` comes back empty — a refusal-before-request is now
   MEASURED, not implied by the error message's wording. `crates/jammi-encoders/tests/live_real_clap.rs`'s
   `fetch_real_model` gains the identical `env_nonempty` rule and now falls back to
-  `<HF_HOME>/token` when `HF_TOKEN` is absent, so the two independent Hub-client implementations
-  agree end to end rather than merely on cache-root precedence.
+  `<HF_HOME>/token` when `HF_TOKEN` is absent, so the two independent Hub-client implementations'
+  token fallback now MIRRORS `HubSource`'s own by construction (the same rule, written twice) —
+  not a measured cross-implementation parity claim: this harness has no oracle that runs
+  `HubSource`'s own resolver against the same env and diffs the two outputs, and it is gated
+  behind `live-hub-tests`, so CI's default `cargo test` never even compiles its assertions
+  against a live network call.
+- **The Hub token chain honours `HF_TOKEN_PATH` and `HUGGING_FACE_HUB_TOKEN`, and every env value
+  feeding `HubSource` is trimmed, not just checked for emptiness (#481, fix round 4).** Two BLOCKs
+  found by adversarial review of the round-3 fix above, both against `huggingface_hub`'s own
+  COMPLETE determinant set for "which token is sent" (`utils/_auth.py`, `constants.py:247-254`):
+  env `HF_TOKEN`, else the live legacy alias `HUGGING_FACE_HUB_TOKEN` (`utils/_auth.py:145-147`,
+  not deprecated-and-ignored — upstream still reads it today), each passed through
+  `_clean_token` (strips `\r`/`\n`/spaces, maps empty to `None`); else the token file at
+  `HF_TOKEN_PATH` when set, else `<HF_HOME>/token`. BLOCK 1: `token_file_path` (hub.rs:340)
+  ignored `HF_TOKEN_PATH` entirely, always reading `<HF_HOME>/token` — with `HF_TOKEN_PATH` set
+  and no token under `HF_HOME`, jammi sent no `Authorization` header where `huggingface_hub`
+  authenticates: a silent 401 on a gated repo. BLOCK 2: `resolve_token_with`'s env tier
+  (hub.rs:319) read only `HF_TOKEN`, ignoring the live `HUGGING_FACE_HUB_TOKEN` alias entirely.
+  The token chain is now config `hub_token` > `HF_TOKEN` (non-empty, trimmed) >
+  `HUGGING_FACE_HUB_TOKEN` (non-empty, trimmed) > the token file (`HF_TOKEN_PATH`, naming the
+  file directly, else `<HF_HOME>/token`, contents trimmed) — `huggingface_hub`'s own complete
+  set, not a jammi-specific subset of it. Advisory fixed in the same commit: `env_nonempty`
+  (hub.rs) filtered on `value.trim()` but returned the untouched RAW value — every downstream
+  tier (`HF_HOME`, `HF_HUB_CACHE`, `HF_ENDPOINT`, `HF_TOKEN`, `HUGGING_FACE_HUB_TOKEN`,
+  `HF_TOKEN_PATH`) now receives the TRIMMED value instead, closing a real gap: an untrimmed
+  `HF_HOME=" /data/hf"` fails `Path::is_absolute` on its leading space and would have silently
+  rooted the whole Hub cache (and the token file) under the current working directory. A second
+  divergence is disclosed, not fixed (no jammi behaviour is wrong, the two implementations simply
+  read the alias's blank-string edge case in opposite directions): a *whitespace-only*
+  `HF_HUB_OFFLINE=" "` is present-but-blank after trimming here, so it falls through to
+  `TRANSFORMERS_OFFLINE` (failing toward offline, the safe direction), whereas
+  `huggingface_hub`'s own `os.environ.get(A) or os.environ.get(B)` treats a whitespace-only string
+  as truthy in Python and stops at `A`, resolving online regardless of `B`. New oracles: unit
+  tests in `crates/jammi-ai/src/model/hub.rs`
+  (`token_resolves_from_hf_token_path_even_with_token_file_less_hf_home`,
+  `token_file_path_hf_token_path_wins_over_hf_home_token_file`,
+  `token_falls_back_to_legacy_hugging_face_hub_token_env`,
+  `token_hf_token_wins_over_legacy_hugging_face_hub_token`, `token_hf_token_env_is_trimmed`,
+  `root_hf_home_env_is_trimmed_never_cwd_relative`,
+  `env_nonempty_returns_the_trimmed_value_not_the_raw_one`) plus two `crates/jammi-ai/tests/it/hub_source.rs`
+  wiremock integration oracles (`hf_token_path_env_used_when_hf_home_has_no_token_file`,
+  `legacy_hugging_face_hub_token_env_used_when_hf_token_absent`) asserting the resolved token
+  reaches the mock server as the literal `Authorization: Bearer <token>` header, not merely that
+  `resolve_token` returns the right `String`. `crates/jammi-encoders/tests/live_real_clap.rs`'s
+  `fetch_real_model` gains the identical `HF_TOKEN_PATH`/`HUGGING_FACE_HUB_TOKEN` tiers and
+  trimming, mirroring `HubSource`'s chain by construction — a claim about the shared SOURCE, not
+  a measured cross-implementation parity result (this harness is exercised only under
+  `live-hub-tests`, never in CI's default `cargo test`).
 - **A tested Shape B Compose stack, `jammi-server probe`, `jammi-server serve` as the
   default subcommand, a reference-topologies guide page, and supply-chain
   attestations on the published images (#482).** `deploy/docker-compose.yml`

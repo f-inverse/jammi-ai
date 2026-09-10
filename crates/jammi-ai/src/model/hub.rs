@@ -35,15 +35,25 @@
 //!
 //! **Token** (only set on the client when one resolves — an absent token
 //! means no `Authorization` header, exactly like an anonymous
-//! `huggingface-cli` session):
+//! `huggingface-cli` session). This is `huggingface_hub`'s own COMPLETE
+//! determinant set for "which token is sent" (`utils/_auth.py`,
+//! `constants.py:247-254`), not a jammi-specific subset of it:
 //! 1. `[models] hub_token` (a [`jammi_db::config::SecretSource`] — inline or
 //!    file-backed)
 //! 2. the `HF_TOKEN` environment variable, when non-empty (see "empty
 //!    values are absent" below)
-//! 3. `<HF_HOME>/token`, read directly and trimmed — `HF_HOME` here is
-//!    resolved on its own (non-empty env value, else the platform home
-//!    directory's `.cache/huggingface`), **independently of whichever tier
-//!    won the cache-root precedence above**. This is deliberately NOT
+//! 3. the `HUGGING_FACE_HUB_TOKEN` environment variable, when non-empty and
+//!    `HF_TOKEN` is itself absent — `huggingface_hub`'s own LIVE legacy
+//!    alias for `HF_TOKEN` (`utils/_auth.py:145-147`; not deprecated-and-
+//!    ignored, upstream still reads it today), which hf-hub 0.5, the Rust
+//!    crate this module wraps, does not read at all
+//! 4. the token FILE: the `HF_TOKEN_PATH` environment variable, when
+//!    non-empty, names the file DIRECTLY (matching `huggingface_hub`'s own
+//!    `HF_TOKEN_PATH`, `constants.py:247-254`); otherwise `<HF_HOME>/token`,
+//!    read directly and trimmed — `HF_HOME` here is resolved on its own
+//!    (non-empty env value, else the platform home directory's
+//!    `.cache/huggingface`), **independently of whichever tier won the
+//!    cache-root precedence above**. This is deliberately NOT
 //!    `hf_hub::Cache::token`/`token_path`, which derives the token file by
 //!    popping the CACHE ROOT's last path component (hf-hub 0.5's own
 //!    comment: "Remove `\"hub\"`") — an arithmetic that only recovers
@@ -51,8 +61,13 @@
 //!    With `HF_HUB_CACHE` set, the cache root has no `hub` component to pop
 //!    at all, so `Cache::token_path` would silently look in
 //!    `parent(HF_HUB_CACHE)/token` instead — this module never makes that
-//!    mistake, matching `huggingface_hub`'s own `HF_TOKEN_PATH`
+//!    mistake, matching `huggingface_hub`'s own `HF_TOKEN_PATH` precedence
 //!    (`utils/_auth.py`), which never varies with `HF_HUB_CACHE` either.
+//!    (An earlier revision of this module ignored `HF_TOKEN_PATH` entirely
+//!    and always read `<HF_HOME>/token` — a real divergence, not a
+//!    stricter reading of upstream: with `HF_TOKEN_PATH` set and no token
+//!    under `HF_HOME`, that revision sent no `Authorization` header where
+//!    `huggingface_hub` authenticates, a silent 401 on a gated repo.)
 //!
 //! **Offline** (whether `HubSource::offline` refuses a Hub fetch — see
 //! "the `offline` promise is Hub-only" below for exactly what this refuses):
@@ -81,35 +96,63 @@
 //!    `is_hf_hub_offline_truthy`)
 //! 3. `false`
 //!
-//! # Empty values are absent
+//! # Empty values are absent, and every value is trimmed
 //!
-//! Every one of this module's six env reads (`HF_HUB_OFFLINE`,
+//! Every one of this module's eight env reads (`HF_HUB_OFFLINE`,
 //! `TRANSFORMERS_OFFLINE`, `HF_HUB_CACHE`, `HF_HOME`, `HF_ENDPOINT`,
-//! `HF_TOKEN`) goes through one helper, `env_nonempty`: a value that is
-//! *present but empty* (after trimming ASCII whitespace) is treated exactly
-//! like an ABSENT variable, never like a real value that happens to be
-//! `""`. A Compose/K8s env block naming a variable with no value
-//! (`HF_HUB_OFFLINE:`) or an operator's shell `export HF_TOKEN=` both
-//! produce exactly this shape — the production closure
-//! (`&|k: &str| std::env::var(k).ok()`) yields `Some("")`, not `None`, for
-//! either, and every tier downstream of `env_nonempty` falls back exactly
-//! as if the variable had never been set at all.
+//! `HF_TOKEN`, `HUGGING_FACE_HUB_TOKEN`, `HF_TOKEN_PATH`) goes through one
+//! helper, `env_nonempty`: a value that is *present but empty* (after
+//! trimming ASCII whitespace) is treated exactly like an ABSENT variable,
+//! never like a real value that happens to be `""`. A Compose/K8s env block
+//! naming a variable with no value (`HF_HUB_OFFLINE:`) or an operator's
+//! shell `export HF_TOKEN=` both produce exactly this shape — the
+//! production closure (`&|k: &str| std::env::var(k).ok()`) yields
+//! `Some("")`, not `None`, for either, and every tier downstream of
+//! `env_nonempty` falls back exactly as if the variable had never been set
+//! at all. `env_nonempty` also returns the TRIMMED value, not the raw one —
+//! `HF_HOME=" /data/hf"` resolves to the cache root `/data/hf/hub`, never
+//! the untrimmed `" /data/hf/hub"`, whose leading space would make
+//! [`std::path::Path::is_absolute`] false and silently root the whole cache
+//! (and, independently, the token file) under the current working directory
+//! instead. The same trimming reaches `HF_TOKEN`/`HUGGING_FACE_HUB_TOKEN`
+//! (a padded bearer token would otherwise fail the Hub's own header
+//! validation) and `HF_ENDPOINT`/`HF_TOKEN_PATH` identically — one helper,
+//! not a per-tier judgment call about which env var "needs" trimming.
 //!
-//! This is a strict SUPERSET of `huggingface_hub`'s own handling for two of
-//! the six: the offline alias's `os.environ.get(A) or os.environ.get(B)`
+//! This is a strict SUPERSET of `huggingface_hub`'s own handling for most of
+//! the eight: the offline alias's `os.environ.get(A) or os.environ.get(B)`
 //! and `HF_TOKEN`'s own `_clean_token` (`huggingface_hub/utils/_auth.py`,
-//! which maps `""` to `None`) already treat an empty value as absent, same
-//! as here. For `HF_HOME`/`HF_ENDPOINT`, upstream's own `os.environ.get(KEY,
-//! default)` does NOT — an empty string is present there, so it wins over
-//! the default, and upstream itself would resolve a CWD-relative cache root
-//! or an empty-string endpoint in that case. This module chooses the safer
+//! which strips `\r`/`\n`/spaces — a narrower set than this module's
+//! `str::trim`, itself a superset — and maps the emptied result to `None`)
+//! already treat an empty value as absent, same as here. For
+//! `HF_HOME`/`HF_ENDPOINT`, upstream's own `os.environ.get(KEY, default)`
+//! does NOT — an empty string is present there, so it wins over the
+//! default, and upstream itself would resolve a CWD-relative cache root or
+//! an empty-string endpoint in that case. This module chooses the safer
 //! reading everywhere instead of replicating that upstream inconsistency:
-//! every one of the six variables falls back to its safe default when empty
-//! (home cache, default endpoint, no token, offline resolved from the
+//! every one of the eight variables falls back to its safe default when
+//! empty (home cache, default endpoint, no token, offline resolved from the
 //! non-empty variable only) — never toward the network, and never toward a
 //! nonsense relative path.
 //!
-//! The `HF_HOME`/`HF_HUB_CACHE`/`HF_ENDPOINT`/`HF_TOKEN`/`HF_HUB_OFFLINE`/
+//! One case is a genuine DIVERGENCE, not merely a stricter superset, and it
+//! fails in OPPOSITE directions: a *whitespace-only* (not empty) value —
+//! `HF_HUB_OFFLINE=" "` — is present-but-blank after trimming, so this
+//! module's `env_nonempty` treats it as absent and falls through to
+//! `TRANSFORMERS_OFFLINE`. Upstream's `os.environ.get("HF_HUB_OFFLINE") or
+//! os.environ.get("TRANSFORMERS_OFFLINE")` does not: Python's `bool(" ")` is
+//! `True` (a whitespace-only string is non-empty, so `or` never evaluates
+//! its right side at all), so upstream STOPS at `" "`, and `_is_true(" ")`
+//! is `False` — upstream resolves ONLINE regardless of whatever
+//! `TRANSFORMERS_OFFLINE` says. This module's arm fails TOWARD offline (the
+//! safe direction for an air-gap knob — see `is_hf_hub_offline_truthy`'s own
+//! doc for the identical direction argument about its trimming);
+//! upstream's arm fails TOWARD online. Neither reading is a bug in
+//! isolation — this module simply never reproduces upstream's specific
+//! blank-string exception to its own alias rule.
+//!
+//! The `HF_HOME`/`HF_HUB_CACHE`/`HF_ENDPOINT`/`HF_TOKEN`/
+//! `HUGGING_FACE_HUB_TOKEN`/`HF_TOKEN_PATH`/`HF_HUB_OFFLINE`/
 //! `TRANSFORMERS_OFFLINE` fallbacks read the process environment **here**,
 //! through the `env` closure the caller passes — never inside
 //! `jammi_db::config::JammiConfig::load_from` (which stays process-env-free
@@ -290,9 +333,15 @@ fn resolve_endpoint(config: &ModelsConfig, env: &dyn Fn(&str) -> Option<String>)
         .or_else(|| env_nonempty(env, "HF_ENDPOINT"))
 }
 
-/// Resolve the bearer token per the module docs' precedence: `hub_token` >
-/// `HF_TOKEN` (non-empty) > `<HF_HOME>/token`. `Ok(None)` means "send no
-/// `Authorization` header", not a failure.
+/// Resolve the bearer token per the module docs' precedence — `hub_token` >
+/// `HF_TOKEN` (non-empty, trimmed) > `HUGGING_FACE_HUB_TOKEN` (non-empty,
+/// trimmed, only when `HF_TOKEN` is itself absent — `huggingface_hub`'s own
+/// live legacy alias, `utils/_auth.py:145-147`) > the token FILE
+/// ([`token_file_path`]: `HF_TOKEN_PATH` when set, else `<HF_HOME>/token`).
+/// `Ok(None)` means "send no `Authorization` header", not a failure. This is
+/// `huggingface_hub`'s own complete determinant set for "which token is
+/// sent" (see the module docs' "Precedence" section for the citation), not
+/// a jammi-specific subset of it.
 ///
 /// The token FILE is resolved independently of the Hub cache root — see
 /// [`token_file_path`]'s doc for why this must never go through
@@ -319,28 +368,41 @@ fn resolve_token_with(
     if let Some(token) = env_nonempty(env, "HF_TOKEN") {
         return Ok(Some(token));
     }
+    if let Some(token) = env_nonempty(env, "HUGGING_FACE_HUB_TOKEN") {
+        return Ok(Some(token));
+    }
     Ok(token_file_path(env, home_dir).and_then(|path| read_token_file(&path)))
 }
 
-/// `<HF_HOME>/token` — matching `huggingface_hub`'s own `HF_TOKEN_PATH`
-/// (`utils/_auth.py`) — where `HF_HOME` is resolved on its own: a non-empty
-/// `HF_HOME` env value, else the platform home directory's
-/// `.cache/huggingface`. Deliberately computed WITHOUT reference to the Hub
-/// cache root [`resolve_root`] resolved: `hf_hub::Cache::token_path` derives
-/// the token file by popping the CACHE ROOT's last path component (hf-hub
-/// 0.5's own comment: "Remove `\"hub\"`"), which is only a correct recovery
-/// of `HF_HOME` when the cache root was actually built as `<HF_HOME>/hub`.
+/// The Hub token FILE: the `HF_TOKEN_PATH` environment variable, when
+/// non-empty, names the file DIRECTLY — matching `huggingface_hub`'s own
+/// `HF_TOKEN_PATH` (`constants.py:247-254`); otherwise `<HF_HOME>/token`,
+/// where `HF_HOME` is resolved on its own: a non-empty `HF_HOME` env value,
+/// else the platform home directory's `.cache/huggingface`. Both tiers are
+/// deliberately computed WITHOUT reference to the Hub cache root
+/// [`resolve_root`] resolved: `hf_hub::Cache::token_path` derives the token
+/// file by popping the CACHE ROOT's last path component (hf-hub 0.5's own
+/// comment: "Remove `\"hub\"`"), which is only a correct recovery of
+/// `HF_HOME` when the cache root was actually built as `<HF_HOME>/hub`.
 /// When `HF_HUB_CACHE` wins the cache-root precedence instead, the cache
 /// root has no `hub` component to pop at all, so `Cache::token_path` would
 /// silently look in `parent(HF_HUB_CACHE)/token` — a user with `HF_HOME` set
 /// (and a `huggingface-cli login` token there) who ALSO sets `HF_HUB_CACHE`
 /// would then silently lose authentication. This function never takes that
-/// path: it reads `HF_HOME` itself, independently of whichever tier won the
-/// cache-root precedence.
+/// path: it reads `HF_TOKEN_PATH`/`HF_HOME` itself, independently of
+/// whichever tier won the cache-root precedence. Ignoring `HF_TOKEN_PATH`
+/// entirely (an earlier revision of this function did) is the identical
+/// class of bug in a second home: a user who points `HF_TOKEN_PATH` at a
+/// token file outside `HF_HOME` (or with no `HF_HOME`/`hub_cache_dir`
+/// token file at all) would silently authenticate with `huggingface_hub`
+/// but not with `jammi-ai` — a silent 401 on a gated repo, not a loud one.
 fn token_file_path(
     env: &dyn Fn(&str) -> Option<String>,
     home_dir: impl FnOnce() -> Option<PathBuf>,
 ) -> Option<PathBuf> {
+    if let Some(path) = env_nonempty(env, "HF_TOKEN_PATH") {
+        return Some(PathBuf::from(path));
+    }
     if let Some(home) = env_nonempty(env, "HF_HOME") {
         return Some(PathBuf::from(home).join("token"));
     }
@@ -381,13 +443,21 @@ fn resolve_offline(config: &ModelsConfig, env: &dyn Fn(&str) -> Option<String>) 
 }
 
 /// Every `HubSource` env read (`HF_HUB_OFFLINE`, `TRANSFORMERS_OFFLINE`,
-/// `HF_HUB_CACHE`, `HF_HOME`, `HF_ENDPOINT`, `HF_TOKEN`) goes through this
-/// one helper — see the module docs' "empty values are absent" section for
-/// why and for the exact upstream comparison. A present-but-empty value
-/// (after trimming ASCII whitespace) is treated as ABSENT, not as a real
-/// value that happens to be `""`.
+/// `HF_HUB_CACHE`, `HF_HOME`, `HF_ENDPOINT`, `HF_TOKEN`,
+/// `HUGGING_FACE_HUB_TOKEN`, `HF_TOKEN_PATH`) goes through this one helper —
+/// see the module docs' "empty values are absent, and every value is
+/// trimmed" section for why and for the exact upstream comparison. A
+/// present-but-empty value (after trimming ASCII whitespace) is treated as
+/// ABSENT, not as a real value that happens to be `""`. The returned value
+/// is the TRIMMED string, not the raw one — `HF_HOME=" /data/hf"` resolves
+/// the cache root to `/data/hf/hub`, never the untrimmed
+/// `" /data/hf/hub"`, whose leading space would fail
+/// [`std::path::Path::is_absolute`] and silently root the cache (and the
+/// token file) under the current working directory instead.
 fn env_nonempty(env: &dyn Fn(&str) -> Option<String>, key: &str) -> Option<String> {
-    env(key).filter(|value| !value.trim().is_empty())
+    env(key)
+        .map(|value| value.trim().to_string())
+        .filter(|value| !value.is_empty())
 }
 
 /// `true` for any of `huggingface_hub`'s own `ENV_VARS_TRUE_VALUES` —
@@ -702,6 +772,150 @@ mod tests {
         assert_eq!(
             path,
             Some(PathBuf::from("/injected/home/.cache/huggingface/token"))
+        );
+    }
+
+    // --- #481 fix round 4: HF_TOKEN_PATH / HUGGING_FACE_HUB_TOKEN / trimming ---
+
+    /// BLOCK 1 (hub.rs:340 pre-fix, `token_file_path` ignored `HF_TOKEN_PATH`
+    /// entirely): a token resolves from the file `HF_TOKEN_PATH` names
+    /// directly, even though `HF_HOME` here resolves to a dir with NO
+    /// `token` file inside it at all -- `huggingface_hub` authenticates in
+    /// this exact shape (`constants.py:247-254`); the pre-fix revision sent
+    /// no `Authorization` header, a silent 401 on a gated repo.
+    ///
+    /// RED at 8816fb5b: `token_file_path` never reads `HF_TOKEN_PATH`, so
+    /// `resolve_token` falls through past the (token-file-less) `HF_HOME`
+    /// dir to `token_file_path`'s home-dir fallback (or `None`), never the
+    /// path-named file -- this assertion fails with `None`, not
+    /// `Some("path-token")`.
+    #[test]
+    fn token_resolves_from_hf_token_path_even_with_token_file_less_hf_home() {
+        let hf_home = tempfile::tempdir().unwrap(); // deliberately no `token` file inside
+        let token_file = tempfile::NamedTempFile::new().unwrap();
+        std::fs::write(token_file.path(), "path-token\n").unwrap();
+        let config = ModelsConfig::default();
+        let hf_home_path = hf_home.path().to_str().unwrap().to_string();
+        let token_path = token_file.path().to_str().unwrap().to_string();
+        let env = move |k: &str| match k {
+            "HF_HOME" => Some(hf_home_path.clone()),
+            "HF_TOKEN_PATH" => Some(token_path.clone()),
+            _ => None,
+        };
+        assert_eq!(
+            resolve_token(&config, &env).unwrap(),
+            Some("path-token".into()),
+            "HF_TOKEN_PATH must name the token file directly, independent of HF_HOME"
+        );
+    }
+
+    /// `HF_TOKEN_PATH` wins over `<HF_HOME>/token` even when the latter ALSO
+    /// carries a (different) token -- `HF_TOKEN_PATH` is the higher tier in
+    /// the file-resolution precedence, not merely a fallback for when
+    /// `HF_HOME` has nothing.
+    #[test]
+    fn token_file_path_hf_token_path_wins_over_hf_home_token_file() {
+        let hf_home = tempfile::tempdir().unwrap();
+        std::fs::write(hf_home.path().join("token"), "home-token\n").unwrap();
+        let token_file = tempfile::NamedTempFile::new().unwrap();
+        std::fs::write(token_file.path(), "path-token\n").unwrap();
+        let hf_home_path = hf_home.path().to_str().unwrap().to_string();
+        let token_path = token_file.path().to_str().unwrap().to_string();
+        let env = move |k: &str| match k {
+            "HF_HOME" => Some(hf_home_path.clone()),
+            "HF_TOKEN_PATH" => Some(token_path.clone()),
+            _ => None,
+        };
+        assert_eq!(
+            token_file_path(&env, || None),
+            Some(token_file.path().to_path_buf())
+        );
+    }
+
+    /// An empty `HF_TOKEN_PATH` is absent, same as every other env read here
+    /// -- falls through to `<HF_HOME>/token`, never a literal empty path.
+    #[test]
+    fn token_file_path_empty_hf_token_path_falls_through_to_hf_home() {
+        let env = |k: &str| match k {
+            "HF_TOKEN_PATH" => Some(String::new()),
+            "HF_HOME" => Some("/env/home".to_string()),
+            _ => None,
+        };
+        assert_eq!(
+            token_file_path(&env, || None),
+            Some(PathBuf::from("/env/home/token"))
+        );
+    }
+
+    /// BLOCK 2 (hub.rs:319 pre-fix, `resolve_token_with`'s env tier read
+    /// only `HF_TOKEN`): `HUGGING_FACE_HUB_TOKEN` -- `huggingface_hub`'s own
+    /// LIVE legacy alias (`utils/_auth.py:145-147`, not deprecated-and-
+    /// ignored) -- is honoured when `HF_TOKEN` is absent.
+    ///
+    /// RED at 8816fb5b: `resolve_token_with` never reads
+    /// `HUGGING_FACE_HUB_TOKEN` at all -- this assertion fails with `None`.
+    #[test]
+    fn token_falls_back_to_legacy_hugging_face_hub_token_env() {
+        let config = ModelsConfig::default();
+        let env = |k: &str| (k == "HUGGING_FACE_HUB_TOKEN").then(|| "legacy".to_string());
+        assert_eq!(resolve_token(&config, &env).unwrap(), Some("legacy".into()));
+    }
+
+    /// `HF_TOKEN` wins over `HUGGING_FACE_HUB_TOKEN` when both are set --
+    /// the legacy alias is consulted only when the current name is absent.
+    #[test]
+    fn token_hf_token_wins_over_legacy_hugging_face_hub_token() {
+        let config = ModelsConfig::default();
+        let env = |k: &str| match k {
+            "HF_TOKEN" => Some("current".to_string()),
+            "HUGGING_FACE_HUB_TOKEN" => Some("legacy".to_string()),
+            _ => None,
+        };
+        assert_eq!(
+            resolve_token(&config, &env).unwrap(),
+            Some("current".into())
+        );
+    }
+
+    /// Advisory (a): `env_nonempty` must return the TRIMMED value, not the
+    /// raw one -- a padded `HF_TOKEN` must resolve to the bearer the Hub
+    /// actually expects, never a value with leading/trailing whitespace or
+    /// a trailing newline baked in.
+    ///
+    /// RED before this fix: `env_nonempty` filtered on `value.trim()` but
+    /// returned the untouched `value` -- this assertion would have observed
+    /// `Some("  padded\n")`, not `Some("padded")`.
+    #[test]
+    fn token_hf_token_env_is_trimmed() {
+        let config = ModelsConfig::default();
+        let env = |k: &str| (k == "HF_TOKEN").then(|| "  padded\n".to_string());
+        assert_eq!(resolve_token(&config, &env).unwrap(), Some("padded".into()));
+    }
+
+    /// Advisory (a): a padded `HF_HOME` must resolve to a TRIMMED, absolute
+    /// cache root -- the untrimmed raw value's leading space would fail
+    /// `Path::is_absolute` and silently root the cache under the current
+    /// working directory instead.
+    #[test]
+    fn root_hf_home_env_is_trimmed_never_cwd_relative() {
+        let config = ModelsConfig::default();
+        let env = |k: &str| (k == "HF_HOME").then(|| " /data/hf".to_string());
+        let resolved = resolve_root(&config, &env).unwrap();
+        assert_eq!(resolved, PathBuf::from("/data/hf/hub"));
+        assert!(
+            resolved.is_absolute(),
+            "a padded HF_HOME must not resolve to a CWD-relative root, got {resolved:?}"
+        );
+    }
+
+    /// `env_nonempty` itself: the unit-level oracle for the trimming
+    /// property every tier above relies on.
+    #[test]
+    fn env_nonempty_returns_the_trimmed_value_not_the_raw_one() {
+        let env = |k: &str| (k == "PADDED").then(|| "  padded-value  \n".to_string());
+        assert_eq!(
+            env_nonempty(&env, "PADDED"),
+            Some("padded-value".to_string())
         );
     }
 

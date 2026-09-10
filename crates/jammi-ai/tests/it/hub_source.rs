@@ -729,6 +729,102 @@ async fn empty_hf_token_falls_through_to_home_token_file() {
     }
 }
 
+/// #481 fix round 4, BLOCK 1: `HF_TOKEN_PATH` names the token file DIRECTLY
+/// -- independent of `HF_HOME`, which here resolves to a directory with NO
+/// `token` file inside it at all. Matches `huggingface_hub`'s own
+/// `HF_TOKEN_PATH` (`constants.py:247-254`); the pre-fix revision (hub.rs
+/// `token_file_path` at 8816fb5b) never read `HF_TOKEN_PATH` at all, so this
+/// request would have carried no `Authorization` header -- a silent 401 on
+/// a gated repo where `huggingface_hub` itself authenticates.
+///
+/// RED at 8816fb5b: `req.headers.get("authorization")` is `None`, not
+/// `Some("Bearer path-token")`.
+#[tokio::test(flavor = "multi_thread")]
+async fn hf_token_path_env_used_when_hf_home_has_no_token_file() {
+    let server = MockServer::start().await;
+    mount_repo_file(&server, REPO_ID, FILENAME, BODY).await;
+
+    let root = tempfile::tempdir().unwrap();
+    let hf_home = tempfile::tempdir().unwrap(); // deliberately no `token` file inside
+    let token_file = tempfile::NamedTempFile::new().unwrap();
+    std::fs::write(token_file.path(), "path-token\n").unwrap();
+
+    let config = ModelsConfig {
+        hub_endpoint: Some(server.uri()),
+        hub_cache_dir: Some(root.path().to_path_buf()),
+        hub_token: None,
+        offline: Some(false),
+    };
+    let hf_home_path = hf_home.path().to_str().unwrap().to_string();
+    let token_path = token_file.path().to_str().unwrap().to_string();
+    let env = move |k: &str| match k {
+        "HF_HOME" => Some(hf_home_path.clone()),
+        "HF_TOKEN_PATH" => Some(token_path.clone()),
+        _ => None,
+    };
+    let hub = HubSource::from_config(&config, &env).unwrap();
+
+    tokio::task::spawn_blocking({
+        let hub = hub.clone();
+        move || hub.api().model(REPO_ID.to_string()).get(FILENAME).unwrap()
+    })
+    .await
+    .unwrap();
+
+    let requests = server.received_requests().await.unwrap();
+    assert!(!requests.is_empty(), "the mock never received a request");
+    for req in &requests {
+        assert_eq!(
+            req.headers
+                .get("authorization")
+                .map(|v| v.to_str().unwrap()),
+            Some("Bearer path-token"),
+            "HF_TOKEN_PATH must be used directly as the token file, independent of HF_HOME"
+        );
+    }
+}
+
+/// #481 fix round 4, BLOCK 2: `HUGGING_FACE_HUB_TOKEN` -- `huggingface_hub`'s
+/// own LIVE legacy alias for `HF_TOKEN` (`utils/_auth.py:145-147`, not
+/// deprecated-and-ignored) -- is honoured when `HF_TOKEN` itself is absent.
+///
+/// RED at 8816fb5b: `resolve_token_with`'s env tier read only `HF_TOKEN`, so
+/// `req.headers.get("authorization")` is `None`, not
+/// `Some("Bearer legacy-tok")`.
+#[tokio::test(flavor = "multi_thread")]
+async fn legacy_hugging_face_hub_token_env_used_when_hf_token_absent() {
+    let server = MockServer::start().await;
+    mount_repo_file(&server, REPO_ID, FILENAME, BODY).await;
+
+    let root = tempfile::tempdir().unwrap();
+    let config = ModelsConfig {
+        hub_endpoint: Some(server.uri()),
+        hub_cache_dir: Some(root.path().to_path_buf()),
+        hub_token: None,
+        offline: Some(false),
+    };
+    let env = |k: &str| (k == "HUGGING_FACE_HUB_TOKEN").then(|| "legacy-tok".to_string());
+    let hub = HubSource::from_config(&config, &env).unwrap();
+
+    tokio::task::spawn_blocking({
+        let hub = hub.clone();
+        move || hub.api().model(REPO_ID.to_string()).get(FILENAME).unwrap()
+    })
+    .await
+    .unwrap();
+
+    let requests = server.received_requests().await.unwrap();
+    assert!(!requests.is_empty(), "the mock never received a request");
+    for req in &requests {
+        assert_eq!(
+            req.headers
+                .get("authorization")
+                .map(|v| v.to_str().unwrap()),
+            Some("Bearer legacy-tok")
+        );
+    }
+}
+
 // --- offline: hit / miss / warm-cache-miss, decided by the catalog alone ---
 
 /// Hit: a `HuggingFace`-shaped model id whose catalog row already carries a

@@ -32,8 +32,14 @@
 //! thread renews it, immune to this runtime being starved by the training
 //! itself — and the hold's own `lost` flag (via
 //! [`jammi_db::catalog::lease_keeper::LeaseHold::lost_flag`]) is the shared
-//! cancel flag the training loop checks at every epoch boundary (no separate
-//! `tokio::spawn` heartbeat task anywhere in this crate).
+//! cancel flag the training loop checks at every epoch boundary. That
+//! sentence is scoped to LEASE RENEWAL specifically: renewal itself has no
+//! separate `tokio::spawn` heartbeat task anywhere in this crate (N3's
+//! dedicated OS thread is the sole renewer). `spawn_cancel_request_watcher`
+//! below IS a `tokio::spawn`'d task at that same heartbeat cadence — its
+//! starvation (an unlikely, but not impossible, saturated runtime) only
+//! delays *observing* a cancel request, never lease renewal, which the
+//! dedicated OS thread keeps doing regardless.
 //!
 //! That flag has TWO writers (unit #485), not one: the lease keeper flips it
 //! directly on a missed renewal (a genuine lease loss), and
@@ -60,6 +66,19 @@
 //! that lost its lease matches zero rows and does not finalize, so two workers
 //! never both finalize the same job — the re-claiming worker is the sole
 //! finalizer.
+//!
+//! **A cancel observed after the last epoch boundary lands `completed`.**
+//! [`JobWorker::run_claimed_job`]'s `Ok(artifact)` arm never consults
+//! `cancel_requested_seen` — once the training loop has returned an
+//! artifact, `spawn_cancel_request_watcher` may since have flipped the
+//! shared flag (a request landed after the final epoch's check, in the
+//! window before that watcher was aborted), but the run already has a
+//! finished result and nothing left to check it against. This is the same
+//! convention [`crate::jobs`]'s compute path documents for its own
+//! single-shot producers: a request that lands after the producer has
+//! started is honoured only in the sense that it stays recorded on the
+//! row (`jobs.cancel_requested` remains `true`) — the run completes and the
+//! row finishes `completed`, never retroactively `failed`.
 
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Weak};
@@ -388,6 +407,16 @@ impl JobWorker {
     /// | 11 | `register_model` failure | `record_failed` |
     /// | 12 (#485) | `Err(Cancelled)` where `spawn_cancel_request_watcher` set `cancel_requested_seen` (a `CancelJob`/`JobHandle::cancel` request, not a lease loss) | `Err(Cancelled)` + `cancel_requested_seen` → `record_failed` with [`jammi_db::error::JammiError::JobCancelled`]'s message |
     ///
+    /// Row 12's window has an edge `Ok(artifact)` never closes: a request
+    /// observed only AFTER the training loop's last epoch-boundary check
+    /// (the run already has a finished artifact by the time the watcher
+    /// flips `cancel_requested_seen`) lands `completed`, not `failed` — the
+    /// `Ok(artifact)` arm below does not consult that flag at all. See the
+    /// module doc's "cancel observed after the last epoch boundary" note;
+    /// this is the same single-shot-producer convention [`crate::jobs`]
+    /// documents for the compute path, not a bug this table's `record_failed`
+    /// column implies row 12 always wins.
+    ///
     /// The deliberate exception is `Err(WorkerJobError::Cancelled)` on a
     /// genuine lease loss (row 12 above is the OTHER half — #485 gave
     /// `Cancelled` two distinguishable causes, not two terminal-write rules):
@@ -532,13 +561,23 @@ impl JobWorker {
         // because of a request" apart from "the flag tripped because the
         // lease was lost" and land the right terminal write for each.
         let cancel_requested_seen = Arc::new(AtomicBool::new(false));
+        // #485 BLOCK B1: `true` for the whole attempt, flipped `false` by
+        // `CancelWatcherGuard::drop` — the watcher's own belt-and-braces
+        // check, independent of `abort()`'s cooperative cancellation (which
+        // only takes effect at the watcher's own next `.await` point). See
+        // `CancelWatcherGuard`'s doc for why a bare `JoinHandle` is not
+        // enough here.
+        let attempt_alive = Arc::new(AtomicBool::new(true));
         let cancel_watcher = spawn_cancel_request_watcher(
             Arc::clone(&catalog),
             job_id.clone(),
             Arc::clone(&cancel),
             Arc::clone(&cancel_requested_seen),
+            attempt_alive,
             self.intervals.heartbeat,
         );
+        #[cfg(feature = "test-hooks")]
+        training_test_hooks::record_watcher(&job_id, cancel_watcher.abort_handle(), &catalog);
 
         // Run the whole job in its own tenant scope. The claim is intentionally
         // unscoped (one worker drains every tenant's queue), so inside the run
@@ -572,11 +611,15 @@ impl JobWorker {
         // Stop renewing this attempt's lease regardless of outcome — the
         // job is about to reach a terminal write (or be left for reclaim),
         // so no further renewal is wanted either way. The watcher is stopped
-        // alongside it: aborting an already-finished task is a harmless
-        // no-op, and there is nothing left for it to watch once the run has
-        // returned.
+        // alongside it: `CancelWatcherGuard::drop` aborting an
+        // already-finished task is a harmless no-op, and there is nothing
+        // left for it to watch once the run has returned. This explicit
+        // drop is the ordinary exit's path through the SAME `Drop` impl
+        // that also covers the extraordinary ones (a panic unwinding through
+        // this scope, or this whole `.await` being dropped out from under
+        // it by a caller aborting the task — #485 BLOCK B1).
         drop(hold);
-        cancel_watcher.abort();
+        drop(cancel_watcher);
 
         match outcome {
             Ok(artifact) => {
@@ -1431,6 +1474,16 @@ impl JobWorker {
             WorkerJobError::Failed("Base model does not support embeddings".into())
         })?;
         drop(guard);
+
+        // #485 BLOCK B1 test hook: a no-op in production (the whole call
+        // compiles away without `test-hooks`). Parks here, with the job's
+        // lease hold and cancel-request watcher already live and no other
+        // `Arc<Catalog>` clone constructed yet (in particular, before
+        // `RunFineTuneParams`'s own clone below), when a test has armed
+        // `training_test_hooks::arm_pause_before_spawn_blocking` — see that
+        // function's doc.
+        #[cfg(feature = "test-hooks")]
+        training_test_hooks::checkpoint_before_spawn_blocking().await;
 
         let base_model = common.base_model.clone();
         let cancel_for_classify = Arc::clone(cancel);
@@ -2494,25 +2547,44 @@ fn panic_message(payload: &(dyn std::any::Any + Send)) -> String {
 ///
 /// One-shot: the task returns as soon as it has flipped the flag itself, or
 /// as soon as it observes `cancel` already `true` for any other reason (a
-/// lease loss — nothing left here to watch for). The caller aborts this
-/// task once the run it watches has returned, so it never outlives the job
-/// attempt it was spawned for. A transient `get_job` error is logged and
-/// retried at the next tick rather than treated as an observed request or a
-/// reason to stop watching — a catalog hiccup must not silently disable
-/// cancellation for the rest of the run.
+/// lease loss — nothing left here to watch for), or as soon as it observes
+/// `attempt_alive` gone `false` (#485 BLOCK B1's belt-and-braces: the SAME
+/// signal [`CancelWatcherGuard::drop`] flips right before it also
+/// `abort()`s this task — a caller must never need this second read to
+/// reclaim the task, `abort()` alone already guarantees that, but a check
+/// the loop makes of its own accord costs nothing and does not depend on
+/// `abort()`'s cooperative cancellation actually landing before this tick's
+/// `get_job` round-trip starts). The caller holds this behind
+/// [`CancelWatcherGuard`] so it never outlives the job attempt it was
+/// spawned for — see that type's doc for why a bare `JoinHandle` is not
+/// enough. A transient `get_job` error is logged and retried at the next
+/// tick rather than treated as an observed request or a reason to stop
+/// watching — a catalog hiccup must not silently disable cancellation for
+/// the rest of the run.
 fn spawn_cancel_request_watcher(
     catalog: Arc<Catalog>,
     job_id: String,
     cancel: Arc<AtomicBool>,
     cancel_requested_seen: Arc<AtomicBool>,
+    attempt_alive: Arc<AtomicBool>,
     poll_interval: Duration,
-) -> tokio::task::JoinHandle<()> {
-    tokio::spawn(async move {
+) -> CancelWatcherGuard {
+    let attempt_alive_for_task = Arc::clone(&attempt_alive);
+    let handle = tokio::spawn(async move {
         loop {
             tokio::time::sleep(poll_interval).await;
             if cancel.load(Ordering::SeqCst) {
                 // Already tripped by some other path (a lease loss) — nothing
                 // left for this watcher to contribute.
+                return;
+            }
+            if !attempt_alive_for_task.load(Ordering::SeqCst) {
+                // Belt-and-braces (#485 BLOCK B1): the attempt that spawned
+                // this watcher is gone — `CancelWatcherGuard::drop` has
+                // already called (or is concurrently calling) `abort()` on
+                // this very task, but this read means the loop stops of its
+                // own accord even in the narrow window before that
+                // cooperative cancellation lands.
                 return;
             }
             match catalog.get_job(&job_id).await {
@@ -2531,7 +2603,185 @@ fn spawn_cancel_request_watcher(
                 }
             }
         }
-    })
+    });
+    CancelWatcherGuard {
+        handle,
+        attempt_alive,
+    }
+}
+
+/// Abort-on-drop guard around the cancel-request watcher's
+/// [`tokio::task::JoinHandle`] (#485 BLOCK B1).
+///
+/// A bare `JoinHandle` DETACHES its task when dropped — it does not stop it
+/// (`tokio::task::JoinHandle`'s own documented behaviour) — so the explicit
+/// `cancel_watcher.abort()` call this replaced, reached only on every
+/// ORDINARY exit of [`JobWorker::run_claimed_job`] (`Ok`, both `Err` arms),
+/// left exactly one path uncovered: that whole `.await` being dropped out
+/// from under the function without any of its own code ever running again —
+/// exactly what [`EmbeddedWorker::drop`] does to the loop task that owns it
+/// (see that type's doc: an in-flight run is not aborted, but the LOOP TASK
+/// itself is, at its next `.await` point, which is squarely inside this
+/// function whenever a job is claimed). A dropped `JoinHandle` in that case
+/// only detaches the watcher — never stops it — leaving it polling
+/// `catalog.get_job` forever on an `Arc<Catalog>` clone that can outlive
+/// [`Catalog::close`].
+///
+/// Wrapping the handle in this guard and holding it for the whole attempt
+/// closes every exit arm at once, because Rust always runs a live local's
+/// `Drop` on every one of them: the ordinary `Ok`/`Err` returns (via the
+/// explicit `drop(cancel_watcher)` in [`JobWorker::run_claimed_job`]), a
+/// panic unwinding through that scope, AND the future simply being
+/// dropped — the one case a reachable `.abort()` call can never cover,
+/// because no code gets to run to make it.
+struct CancelWatcherGuard {
+    handle: tokio::task::JoinHandle<()>,
+    /// The write side of the watcher's belt-and-braces flag — see
+    /// [`spawn_cancel_request_watcher`]'s doc for the read side.
+    attempt_alive: Arc<AtomicBool>,
+}
+
+impl CancelWatcherGuard {
+    /// The watcher's [`tokio::task::AbortHandle`] — `Clone`, so a test can
+    /// hold one independently of this guard (which owns the only
+    /// `JoinHandle`) and observe `is_finished()` after the guard drops,
+    /// without racing a join.
+    #[cfg(feature = "test-hooks")]
+    fn abort_handle(&self) -> tokio::task::AbortHandle {
+        self.handle.abort_handle()
+    }
+}
+
+impl Drop for CancelWatcherGuard {
+    fn drop(&mut self) {
+        self.attempt_alive.store(false, Ordering::SeqCst);
+        self.handle.abort();
+    }
+}
+
+/// Test-only rendezvous for #485 BLOCK B1's own regression coverage:
+/// mirrors `crate::jobs::compute_test_hooks`'s pattern (a park point a test
+/// arms, then waits for) but for the training path, plus a small
+/// job-id-keyed registry that hands out the primitives needed to observe
+/// [`CancelWatcherGuard`] actually releasing its task and its `Arc<Catalog>`
+/// clone from OUTSIDE this module — [`JobWorker::run_claimed_job`]'s own
+/// `catalog` and `cancel_watcher` locals are private to that function, so a
+/// test cannot reach either one directly. Compiled only under
+/// `feature = "test-hooks"` (this crate's own test targets enable it
+/// through a self dev-dependency); no production path observes anything
+/// here.
+#[cfg(feature = "test-hooks")]
+pub mod training_test_hooks {
+    use std::sync::{Arc, Mutex, OnceLock, PoisonError, Weak};
+
+    use jammi_db::catalog::Catalog;
+    use tokio::sync::oneshot;
+
+    /// One-shot pause slot: `Some` once armed, taken (and thereby disarmed)
+    /// the first time [`checkpoint_before_spawn_blocking`] runs after that.
+    fn pause_slot() -> &'static Mutex<Option<oneshot::Sender<()>>> {
+        static SLOT: OnceLock<Mutex<Option<oneshot::Sender<()>>>> = OnceLock::new();
+        SLOT.get_or_init(|| Mutex::new(None))
+    }
+
+    /// Arm a one-shot pause just before the NEXT `train_fine_tune` call
+    /// dispatches its training loop to `spawn_blocking`. The returned
+    /// receiver resolves once the run has actually reached that checkpoint —
+    /// with the job's lease hold and cancel-request watcher already
+    /// constructed and live, and no training thread spawned yet — so a test
+    /// can force `run_claimed_job`'s future to be dropped (or its owning
+    /// task aborted, reproducing `EmbeddedWorker::drop`'s exact action)
+    /// right there, with no `spawn_blocking` training thread in the picture
+    /// to hold its own independent `Arc<Catalog>` clone and confound the
+    /// release check this hook exists for.
+    pub fn arm_pause_before_spawn_blocking() -> oneshot::Receiver<()> {
+        let (tx, rx) = oneshot::channel();
+        *pause_slot().lock().unwrap_or_else(PoisonError::into_inner) = Some(tx);
+        rx
+    }
+
+    /// Called from inside `train_fine_tune`, immediately before it
+    /// dispatches to `spawn_blocking`. A no-op unless a pause is armed; when
+    /// one is, this signals arrival on the armed receiver and then parks
+    /// forever (never resolves on its own) — the test that armed the pause
+    /// is expected to abort the task holding this `.await` (or otherwise
+    /// drop the future) rather than release it, so nothing here needs a
+    /// resume path.
+    pub(crate) async fn checkpoint_before_spawn_blocking() {
+        let armed = pause_slot()
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .take();
+        if let Some(tx) = armed {
+            let _ = tx.send(());
+            std::future::pending::<()>().await;
+        }
+    }
+
+    /// One recorded watcher, keyed by the job it was spawned for. A `Vec`
+    /// rather than a `HashMap` because a reclaimed/retried job can spawn a
+    /// new watcher under the SAME `job_id` at a higher attempt — callers
+    /// look up the most recently recorded entry.
+    struct WatcherProbe {
+        job_id: String,
+        watcher: tokio::task::AbortHandle,
+        catalog: Weak<Catalog>,
+    }
+
+    fn probes() -> &'static Mutex<Vec<WatcherProbe>> {
+        static PROBES: OnceLock<Mutex<Vec<WatcherProbe>>> = OnceLock::new();
+        PROBES.get_or_init(|| Mutex::new(Vec::new()))
+    }
+
+    /// Record this attempt's cancel-request watcher and its per-attempt
+    /// `Arc<Catalog>` — via a [`Weak`], so recording the probe never itself
+    /// keeps the attempt's catalog handle alive, and the count
+    /// [`catalog_strong_count`] reports is exactly the run's own remaining
+    /// holders.
+    pub(crate) fn record_watcher(
+        job_id: &str,
+        watcher: tokio::task::AbortHandle,
+        catalog: &Arc<Catalog>,
+    ) {
+        probes()
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .push(WatcherProbe {
+                job_id: job_id.to_string(),
+                watcher,
+                catalog: Arc::downgrade(catalog),
+            });
+    }
+
+    /// Whether the most recently recorded cancel-request watcher for
+    /// `job_id` has finished — [`tokio::task::AbortHandle::is_finished`],
+    /// the same primitive a `JoinHandle` exposes, reachable here because the
+    /// watcher's actual `JoinHandle` is private to [`CancelWatcherGuard`],
+    /// which consumes it. `None` if no watcher was ever recorded for this
+    /// job id.
+    pub fn watcher_is_finished(job_id: &str) -> Option<bool> {
+        probes()
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .iter()
+            .rev()
+            .find(|p| p.job_id == job_id)
+            .map(|p| p.watcher.is_finished())
+    }
+
+    /// The live strong-reference count on the per-attempt `Arc<Catalog>`
+    /// [`JobWorker::run_claimed_job`] built for `job_id`'s most recently
+    /// recorded attempt. `None` if no watcher was ever recorded for this
+    /// job id.
+    pub fn catalog_strong_count(job_id: &str) -> Option<usize> {
+        probes()
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .iter()
+            .rev()
+            .find(|p| p.job_id == job_id)
+            .map(|p| p.catalog.strong_count())
+    }
 }
 
 /// Record a terminal `Failed` status for a job this worker owns, surfacing

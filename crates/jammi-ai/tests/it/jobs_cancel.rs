@@ -9,7 +9,7 @@ use std::time::Duration;
 
 use jammi_ai::fine_tune::spec::{TrainingCommon, TrainingSpec};
 use jammi_ai::fine_tune::training_job::fine_tuned_model_id;
-use jammi_ai::fine_tune::worker::{EmbeddedWorker, JobWorker};
+use jammi_ai::fine_tune::worker::{training_test_hooks, EmbeddedWorker, JobWorker};
 use jammi_ai::fine_tune::{FineTuneConfig, FineTuneMethod};
 use jammi_ai::jobs::compute_test_hooks::{arm, ParkPoint};
 use jammi_ai::jobs::{ComputeSpec, JobSpec};
@@ -505,4 +505,165 @@ async fn a_claimed_training_jobs_cancel_request_is_honoured_at_the_next_epoch_bo
         row.cancel_requested,
         "the request stays recorded on the row"
     );
+}
+
+/// #485 BLOCK B1 (adversarial round 3): a bare `JoinHandle` for the
+/// cancel-request watcher only DETACHES its task when dropped — it does not
+/// stop it — so `EmbeddedWorker::drop` aborting the loop task while a
+/// training job's `run_claimed_job` future is still in flight used to leak
+/// the watcher forever, polling `catalog.get_job` on an `Arc<Catalog>`
+/// clone that can outlive `Catalog::close`.
+///
+/// This reproduces exactly that action — abort the task holding
+/// `run_claimed_job`'s future while it is still running, dropping the
+/// future without any of its own code (the explicit
+/// `drop(hold); drop(cancel_watcher);` included) ever running again — at a
+/// checkpoint chosen so the reproduction is deterministic rather than a
+/// wall-clock race: `training_test_hooks::arm_pause_before_spawn_blocking`
+/// parks the run right after the lease hold and cancel-request watcher are
+/// both live, and BEFORE any training thread (or its own `Arc<Catalog>`
+/// clone) exists, so the only two holders of the per-attempt catalog handle
+/// at that point are `run_claimed_job`'s own local and the watcher's clone.
+///
+/// Asserts the watcher (behind `CancelWatcherGuard`'s abort-on-drop) is
+/// finished within about one poll interval of the abort, and that the
+/// per-attempt catalog handle's strong count returns all the way to zero —
+/// its pre-attempt value, since nothing outside this attempt ever held a
+/// clone of it. Before the fix, the watcher's own clone pins that count at
+/// (at least) one forever and `AbortHandle::is_finished()` never becomes
+/// `true`.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_dropped_run_claimed_jobs_future_leaves_no_leaked_cancel_watcher_or_catalog_handle() {
+    let dir = tempfile::TempDir::new().unwrap();
+    let mut config = common::test_config(dir.path());
+    // Short heartbeat (matching the sibling cancel test above): bounds how
+    // long the watcher-finished poll below needs to wait even if the fix
+    // relied on the watcher's own next tick rather than `abort()` alone.
+    config.lease = jammi_db::config::LeaseConfig {
+        duration_secs: 30,
+        heartbeat_secs: 1,
+    };
+    config.worker = jammi_db::config::WorkerConfig {
+        idle_poll_secs: 1,
+        ..Default::default()
+    };
+    let session = Arc::new(InferenceSession::new(config).await.unwrap());
+    session
+        .add_source(
+            "training",
+            SourceType::File,
+            SourceConnection {
+                url: Some(common::fixture_url("training_pairs.csv")),
+                format: Some(FileFormat::Csv),
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+
+    let handle = session
+        .enqueue(
+            TrainingSpec::FineTune {
+                source: "training".to_string(),
+                columns: vec![
+                    "text_a".to_string(),
+                    "text_b".to_string(),
+                    "score".to_string(),
+                ],
+                method: FineTuneMethod::Lora,
+                task: ModelTask::TextEmbedding,
+                common: TrainingCommon {
+                    base_model: tiny_bert_model(),
+                    config: FineTuneConfig {
+                        epochs: 1,
+                        batch_size: 8,
+                        lora_rank: 4,
+                        warmup_steps: 0,
+                        ..Default::default()
+                    },
+                },
+            }
+            .into(),
+            0,
+        )
+        .await
+        .unwrap();
+    let job_id = handle.job_id.clone();
+
+    let worker = JobWorker::new(&session).expect("this config clears the worker margin");
+    let claimed = session
+        .catalog()
+        .claim_next(worker.worker_id(), &["fine_tune"], Duration::from_secs(30))
+        .await
+        .unwrap()
+        .expect("the queued job is claimable");
+
+    // Arm the one-shot pause BEFORE the run starts, so it is guaranteed to
+    // be the one this specific attempt takes.
+    let parked = training_test_hooks::arm_pause_before_spawn_blocking();
+
+    let session_for_task = Arc::clone(&session);
+    let run = tokio::spawn(async move {
+        worker.run_claimed_job(&session_for_task, claimed).await;
+    });
+
+    // Wait for the run to actually reach the checkpoint — deterministic,
+    // not a wall-clock race: by construction, the lease hold and
+    // cancel-request watcher are live and no training thread exists yet.
+    tokio::time::timeout(Duration::from_secs(30), parked)
+        .await
+        .expect("run_claimed_job never reached the pre-spawn_blocking checkpoint")
+        .expect("the checkpoint's arrival sender was dropped without firing");
+
+    assert!(
+        !run.is_finished(),
+        "the run must still be parked at the checkpoint, not finished"
+    );
+    assert_eq!(
+        training_test_hooks::catalog_strong_count(&job_id),
+        Some(2),
+        "at the checkpoint the only holders of the per-attempt catalog handle must be \
+         `run_claimed_job`'s own local and the cancel-request watcher's clone"
+    );
+
+    // Reproduce `EmbeddedWorker::drop`'s exact action: abort the task that
+    // owns `run_claimed_job`'s future while it is parked mid-run.
+    run.abort();
+    let joined = run.await;
+    assert!(
+        joined.unwrap_err().is_cancelled(),
+        "the task must have been cancelled by the abort, not have panicked or completed"
+    );
+
+    // The watcher must be gone within about one poll interval of the abort
+    // — bounded and polled, never a fixed sleep.
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+    loop {
+        if training_test_hooks::watcher_is_finished(&job_id) == Some(true) {
+            break;
+        }
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "the cancel-request watcher was not aborted within 5s of its owning future being \
+             dropped -- BLOCK B1: `CancelWatcherGuard::drop` must abort it unconditionally"
+        );
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+
+    // And the per-attempt catalog handle's strong count must return all the
+    // way to zero — the pre-attempt value, since nothing outside this
+    // attempt ever held one; a leaked watcher would hold it at (at least)
+    // one forever.
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+    loop {
+        if training_test_hooks::catalog_strong_count(&job_id) == Some(0) {
+            break;
+        }
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "the per-attempt `Arc<Catalog>` never returned to its pre-attempt strong count of \
+             zero -- something is still holding a clone past the dropped future's teardown"
+        );
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
 }

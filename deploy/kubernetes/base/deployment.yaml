@@ -1,5 +1,5 @@
-# Shape C's query tier: the guide's Kubernetes sketch
-# (docs/guide/src/reference-topologies.md) lifted into a real manifest. See
+# Shape C's query tier -- the artifact the guide's Kubernetes section
+# (docs/guide/src/reference-topologies.md) includes directly. See
 # `deploy/kubernetes/README.md` for the boundary this file does and does not
 # cover.
 apiVersion: apps/v1

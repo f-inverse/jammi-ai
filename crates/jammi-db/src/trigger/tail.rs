@@ -85,8 +85,9 @@ use crate::trigger::subscription::{DeliveredBatch, LiveEvent};
 use crate::trigger::topic::TopicDefinition;
 
 /// Broadcast capacity for a tail's fan-out channel. A subscriber that lags
-/// behind this self-heals via its OWN chunked replay from its last-yielded
-/// offset rather than erroring, so this only needs to absorb short
+/// behind this self-heals via its OWN one-step-at-a-time replay
+/// (`lag_replay`) from its last-yielded offset rather than erroring, so
+/// this only needs to absorb short
 /// bursts between a subscriber's `poll_next` calls.
 const TAIL_BROADCAST_CAPACITY: usize = 256;
 
@@ -410,7 +411,7 @@ async fn replay_and_fan_out(
 /// A single subscriber's own lag recovery, ONE STEP at a time: when a
 /// subscriber's broadcast receiver observes `RecvError::Lagged`, it replays
 /// from its OWN `last_yielded`/floor rather than erroring or falling back to
-/// `Subscriber::drain_replay`'s whole-suffix materialisation. This reuses the
+/// `Subscriber::drain_replay`'s whole-window accumulation. This reuses the
 /// SAME one-step, group-completing replay primitive the tail itself loops
 /// over for a driver-level `Wake` (`replay_and_fan_out`) — never a second,
 /// less-bounded code path.

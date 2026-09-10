@@ -238,8 +238,8 @@ impl MutableTableRegistry {
     /// `with_tenant_scoped` task-local override). For a caller that must bind
     /// tenant explicitly instead of consulting that binding, use
     /// [`Self::scan_after_for_tenant`] — NOT the trigger-stream replay path
-    /// any more, which is `Self::tail_replay` (chunked, permit-bounded, used
-    /// by [`crate::trigger::Subscriber`] and the trigger tail).
+    /// any more, which is `Self::tail_replay` (one permit-bounded step per
+    /// call, used by [`crate::trigger::Subscriber`] and the trigger tail).
     ///
     /// Implementation note: the closure-passing
     /// [`crate::catalog::backend::CatalogBackend::transaction`] API closes
@@ -332,17 +332,19 @@ impl MutableTableRegistry {
     /// more remains (`false`, in which case the caller loops, passing the
     /// returned cursor back in as the next call's `cursor_before`).
     ///
-    /// This is a SINGLE STEP, never a whole-backlog drain: resident memory
-    /// across a full catch-up from a low `cursor_before` to a far `head` is
-    /// bounded by one step's rows (`chunk_size`, or one group's width if wider)
-    /// at a time, not the total backlog — the caller (`replay_and_fan_out`'s
-    /// own retry loop, a subscriber's own lagging-catch-up loop, or
-    /// `Subscriber::drain_replay`'s finite accumulation) hands each step's
-    /// batches off (fan-out send, or `yield`) before this method is called
-    /// again for the next step. A caller that instead accumulated every
-    /// step's `Vec<RecordBatch>` into one growing buffer before consuming any
-    /// of it would defeat this bound and materialise the whole catch-up
-    /// anyway — see each caller's own doc for how it avoids that.
+    /// This is a SINGLE STEP, never a whole-backlog drain. Two of its three
+    /// callers — `replay_and_fan_out`'s own retry loop and a lagging
+    /// subscriber's own catch-up loop — hand each step's batches off
+    /// (fan-out send, or `yield`) before calling again, so their resident
+    /// memory across a full catch-up from a low `cursor_before` to a far
+    /// `head` is one step's rows (`chunk_size`, or one group's width if
+    /// wider) at a time, never the total backlog. The third,
+    /// `Subscriber::drain_replay`, deliberately accumulates every step into
+    /// one `Vec` — its contract is a finite, fully materialised window — so
+    /// its residency is that window's total rows, bounded by the head as it
+    /// MOVES (each step re-reads `MAX(order_col)`, so the window is not
+    /// pinned at call time), plus at most one step ahead of what it has
+    /// already accumulated.
     ///
     /// `def` and `order_col` are resolved by the caller ONCE via
     /// [`Self::definition_for_tenant`], before this call, so a tail never

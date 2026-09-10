@@ -1440,3 +1440,149 @@ async fn from_offset_lower_bound_holds_on_first_live_event_with_empty_replay_win
         "the first delivered offset must be exactly `from_offset`, never anything below it"
     );
 }
+
+/// Cross-surface parity for the one-step `tail_replay` over a REAL Postgres
+/// BACKING table. Every other multi-step / boundary-group oracle in this
+/// suite runs over a SQLite backing table (`build_harness` is SQLite-only;
+/// the `Arm::Postgres` arm swaps only the broker), so the Postgres-dialect
+/// half of the step query (`ORDER BY … LIMIT chunk_size + 1`, the exact
+/// boundary-group re-fetch) had no oracle of its own. Shape: 150 single-row
+/// publishes, ONE 1200-row publish (a single `_offset` group far wider than
+/// `REPLAY_CHUNK_SIZE = 500`, so it straddles a step boundary and must be
+/// fetched whole rather than split), then 150 more — and two drains:
+/// `replay_only(Some(0))` must yield all 301 offsets exactly once, in order,
+/// with the wide group intact and in original row order; and
+/// `replay_only(Some(150))` — a mid-window inclusive lower bound, exercising
+/// `cursor_before > 0` — must yield exactly the 151 offsets from the wide
+/// group onward.
+///
+/// Skips (or, under `JAMMI_REQUIRE_PG`, panics) without `JAMMI_TEST_PG_URL`,
+/// the `require_live_pg` shape.
+#[tokio::test]
+async fn postgres_backing_multistep_replay_keeps_boundary_group_whole() {
+    let Some(url) = jammi_test_utils::pg_url_for_tests() else {
+        eprintln!(
+            "skipping postgres_backing_multistep_replay_keeps_boundary_group_whole: \
+             JAMMI_TEST_PG_URL unset"
+        );
+        require_live_pg("postgres_backing_multistep_replay_keeps_boundary_group_whole");
+        return;
+    };
+    let pg = PostgresBackend::open_with_options(&url, 8, None)
+        .await
+        .unwrap();
+    let backend_impl = BackendImpl::Postgres(pg);
+    backend_impl.migrate().await.unwrap();
+    let tenant_binding = TenantBinding::unscoped();
+    let catalog = Arc::new(Catalog::from_backend_with_tenant(
+        backend_impl,
+        Some(tenant_binding.clone()),
+    ));
+    let backend_arc = catalog.backend_arc();
+    let mutable_backend: Arc<dyn MutableBackend> =
+        Arc::new(PostgresMutableBackend::new(Arc::clone(&backend_arc)));
+    let registry = Arc::new(MutableTableRegistry::new(
+        Arc::clone(&catalog),
+        mutable_backend,
+        tenant_binding,
+    ));
+    let broker: Arc<dyn TriggerBroker> = Arc::new(InMemoryBroker::new());
+    let topic_repo = TopicRepo::new(Arc::clone(&catalog), Arc::clone(&registry));
+    let publisher = Publisher::new(
+        Arc::clone(&broker),
+        Arc::clone(&backend_arc),
+        Arc::clone(&registry),
+    );
+    let subscriber = Subscriber::new(Arc::clone(&broker), Arc::clone(&registry));
+    let topic = topic_def(&format!(
+        "parity.pg_backing_multistep.{}",
+        jammi_test_utils::unique_suffix()
+    ));
+    broker.register_topic(&topic).await.unwrap();
+    topic_repo.register_topic(&topic).await.unwrap();
+
+    const BEFORE: i64 = 150;
+    const WIDE: usize = 1200;
+    const AFTER: i64 = 150;
+    for i in 0..BEFORE {
+        publisher
+            .publish_scoped(&topic, None, batch_of(&[i]))
+            .await
+            .unwrap();
+    }
+    let wide_seq: Vec<i64> = (0..WIDE as i64).map(|i| 1_000_000 + i).collect();
+    let wide_batch = RecordBatch::try_new(
+        topic_schema(),
+        vec![Arc::new(Int64Array::from(wide_seq.clone()))],
+    )
+    .unwrap();
+    publisher
+        .publish_scoped(&topic, None, wide_batch)
+        .await
+        .unwrap();
+    for i in 0..AFTER {
+        publisher
+            .publish_scoped(&topic, None, batch_of(&[2_000_000 + i]))
+            .await
+            .unwrap();
+    }
+
+    let total = (BEFORE + 1 + AFTER) as u64;
+    let out = subscriber
+        .replay_only(
+            &topic,
+            Predicate::match_all(),
+            Some(Offset::new(0, chrono::Utc::now())),
+        )
+        .await
+        .unwrap();
+    let offsets: Vec<u64> = out.iter().map(|d| d.offset.value()).collect();
+    assert_eq!(
+        offsets,
+        (0..total).collect::<Vec<_>>(),
+        "a multi-step drain over a Postgres backing table must deliver every offset exactly \
+         once, in order"
+    );
+    assert_eq!(
+        seq_column(&out[BEFORE as usize].batch),
+        wide_seq,
+        "a 1200-row group must survive the 500-row step boundary whole, in original row order, \
+         over a Postgres backing table"
+    );
+    for (i, d) in out.iter().enumerate().take(BEFORE as usize) {
+        assert_eq!(seq_column(&d.batch), vec![i as i64], "pre-group offset {i}");
+    }
+    for (j, d) in out.iter().skip(BEFORE as usize + 1).enumerate() {
+        assert_eq!(
+            seq_column(&d.batch),
+            vec![2_000_000 + j as i64],
+            "post-group offset {}",
+            BEFORE as usize + 1 + j
+        );
+    }
+
+    // The same over a mid-window inclusive lower bound (`cursor_before > 0`):
+    // the wide group is the FIRST event of this window, so the boundary
+    // re-fetch is exercised from a non-zero cursor too.
+    let out2 = subscriber
+        .replay_only(
+            &topic,
+            Predicate::match_all(),
+            Some(Offset::new(BEFORE as u64, chrono::Utc::now())),
+        )
+        .await
+        .unwrap();
+    let offsets2: Vec<u64> = out2.iter().map(|d| d.offset.value()).collect();
+    assert_eq!(
+        offsets2,
+        (BEFORE as u64..total).collect::<Vec<_>>(),
+        "`from_offset` must be an inclusive lower bound on the Postgres-backing drain too: \
+         exactly {} offsets from {BEFORE} onward",
+        total - BEFORE as u64
+    );
+    assert_eq!(
+        seq_column(&out2[0].batch),
+        wide_seq,
+        "the wide group must be whole when it is the first group of the window"
+    );
+}

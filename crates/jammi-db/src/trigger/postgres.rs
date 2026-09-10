@@ -48,14 +48,16 @@
 //!
 //! # Pool budget
 //!
-//! Each `TopicTail` replay (`crate::trigger::tail`) holds one CATALOG-pool
-//! connection for its chunked replay — never one of this broker's own
-//! connections. With one tail per `(topic, tenant)` per process, the
-//! concurrent-replay bound is the catalog pool size (see
-//! `crate::trigger::tail::TailRegistry::new`'s semaphore, sized
-//! `pool_size - 2` (min 1)); size `[catalog.postgres].pool_size` for the
-//! expected number of concurrent tenant tails plus writers, independent of
-//! this broker's own three-connection budget.
+//! Each trigger-stream replay STEP (`crate::trigger::tail`, routed through
+//! `crate::source::mutable::MutableTableRegistry::tail_replay`) holds one
+//! CATALOG-pool connection for that one step's duration — never one of
+//! this broker's own connections — and releases its permit between steps,
+//! so a long multi-step catch-up never monopolises a connection. With one
+//! tail per `(topic, tenant)` per process, the concurrent-replay-step bound
+//! is `MutableTableRegistry::new`'s semaphore, sized `pool_size - 2`
+//! (min 1); size `[catalog.postgres].pool_size` for the expected number of
+//! concurrently replaying tenant tails plus writers, independent of this
+//! broker's own three-connection budget.
 
 use std::collections::HashMap;
 use std::str::FromStr;

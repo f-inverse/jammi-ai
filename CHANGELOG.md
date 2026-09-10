@@ -281,6 +281,14 @@ workspace ships every publishable crate at the same
   (`crates/jammi-db/src/trigger/{subscription,ids}.rs`), `PostgresBroker`
   (`crates/jammi-db/src/trigger/postgres.rs`), and the test-only
   `PostgresBroker::suppress_next_notify_for_testing` hook.
+- **`BrokerKind` gains `as_str`** (`crates/jammi-db/src/trigger/broker.rs`), the stable
+  lower-case wire/telemetry spelling (`"in_memory"`/`"jet_stream"`/`"postgres"`) `ServerInfo.broker`
+  and the config-parity oracles round-trip through. Additive: an inherent method on an existing
+  enum, no trait or match surface changes.
+- **`FromSqlValue` gains impls for `i16` and `f32`**
+  (`crates/jammi-db/src/catalog/backend.rs`), completing the narrower integer/float widths the
+  trigger-stream tail replay's row decoding needs; additive only (no existing impl or caller
+  changes).
 
 ### Changed
 - **Persisted cloud credentials are `Secret`-typed and inline-only on read (breaking Rust
@@ -889,19 +897,12 @@ workspace ships every publishable crate at the same
   driver-level consumer.
 - **`BrokerKind` gains a `Postgres` variant** (`crates/jammi-db/src/trigger/broker.rs`). The enum
   is not `#[non_exhaustive]`, so an exhaustive out-of-tree `match` over it must add the arm.
-- **`BrokerKind` gains `as_str`** (`crates/jammi-db/src/trigger/broker.rs`), the stable
-  lower-case wire/telemetry spelling (`"in_memory"`/`"jet_stream"`/`"postgres"`) `ServerInfo.broker`
-  and the config-parity oracles round-trip through.
 - **`CatalogBackend` gains a required trait method `pool_size(&self) -> u32`**
   (`crates/jammi-db/src/catalog/backend.rs`). Every in-tree backend (SQLite, Postgres) implements
   it; an out-of-tree `CatalogBackend` impl must add it — it reports the connection pool's
   `max_connections`, used to size the trigger-stream replay semaphore
   (`crate::source::mutable::MutableTableRegistry`) so tail replays can never starve publishers of
   pool connections.
-- **`FromSqlValue` gains impls for `i16` and `f32`**
-  (`crates/jammi-db/src/catalog/backend.rs`), completing the narrower integer/float widths the
-  trigger-stream tail replay's row decoding needs; this is additive only (no existing impl or
-  caller changes).
 - **`Publisher::publish_scoped` rejects an empty batch** (`crates/jammi-db/src/trigger/publisher.rs`)
   with `TriggerError::BatchSchemaMismatch` rather than minting and burning an offset for zero rows
   — "every offset has at least one row" is now an invariant callers can rely on.

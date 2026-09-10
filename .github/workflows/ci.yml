@@ -1116,8 +1116,10 @@ jobs:
         # K4: `remote_server_info_reports_postgres_broker_kind` proves the
         # non-default `[broker.postgres]` config round-trips through
         # `ServerInfo.broker` over the wire — the only lane that exercises it.
+        # Same shared-catalog contract as the jammi-db step above: one DB,
+        # serialised migrate() ledger writes, so `--test-threads=1`.
         run: |
-          cargo test -p jammi-server --test it -- introspection
+          cargo test -p jammi-server --test it -- introspection --test-threads=1
 
   # Hermetic script-guard class: every leg here is the same shape (plain
   # ubuntu, checkout, run one hermetic script — no toolchain, no container,

@@ -234,15 +234,16 @@ impl Subscriber {
                     Err(broadcast::error::RecvError::Lagged(_n)) => {
                         // This subscriber's OWN one-step-at-a-time, group-
                         // completing replay from its own `last_yielded` —
-                        // never `drain_replay`'s whole-suffix materialisation
+                        // never `drain_replay`'s whole-window accumulation
                         // and never the tail's shared cursor (a lag here is
                         // this receiver's own backlog, not the tail's).
-                        // Clamped to `floor` in addition to `last_yielded`
-                        // (belt-and-suspenders: `last_yielded` is already
-                        // seeded from `floor` and only ever increases, so
-                        // this `max` is never actually exercised in normal
-                        // flow, but keeps the invariant explicit rather than
-                        // relying solely on the seed).
+                        // Clamped to `floor` in addition to `last_yielded`:
+                        // `last_yielded` is seeded from `floor` and only
+                        // ever increases, so the `max` is a no-op while that
+                        // seed holds — but it is the LIVE guard for this arm
+                        // if the seed ever regresses (`from_offset` must stay
+                        // an inclusive lower bound after a lag replay too),
+                        // not a decoration.
                         let mut from = {
                             let base = last_yielded.map(|o| o as i64).unwrap_or(-1);
                             match floor {
@@ -401,13 +402,17 @@ async fn drain_replay(
             // one-step-at-a-time primitive the tail's own driver-triggered
             // replay (`crate::trigger::tail::replay_and_fan_out`) and a
             // lagging subscriber's own replay (`crate::trigger::tail::lag_replay`)
-            // use — rather than a second, permit-UNBOUNDED whole-suffix
+            // use — rather than a second, permit-UNBOUNDED whole-window
             // query. Every trigger-stream replay path is bounded by the same
             // pool-sized semaphore this way, with no path that can start an
             // unbounded number of concurrent replays against the backend's
             // connection pool. Looped here (rather than in `tail_replay`
             // itself) to a full drain because this caller wants everything
-            // in the window at once; each step's `Vec<RecordBatch>` is
+            // in the window at once. The window is bounded by the head as it
+            // MOVES, not the head at call time: each step re-reads
+            // `MAX(_offset)`, so a publisher committing mid-drain extends
+            // what this drain returns, and the loop ends when a step reaches
+            // the head as it then stands. Each step's `Vec<RecordBatch>` is
             // extended into `all_raw` and dropped, so residency across the
             // loop is this window's total rows plus at most one extra step —
             // never more than one step ahead of what has already been
@@ -478,8 +483,8 @@ pub(crate) struct ReplayEvent {
 /// Walk the scan_after results — already in ascending `_offset` order — and
 /// reassemble each publish into one `RecordBatch` matching the topic schema.
 ///
-/// `pub(crate)`: also used by [`crate::trigger::tail::TopicTail`]'s chunked
-/// replay, which reassembles rows fetched via
+/// `pub(crate)`: also used by [`crate::trigger::tail::TopicTail`]'s
+/// one-step-at-a-time replay, which reassembles rows fetched via
 /// [`crate::source::mutable::MutableTableRegistry::tail_replay`] the same
 /// way this subscribe-time replay does.
 pub(crate) fn group_replay_batches(

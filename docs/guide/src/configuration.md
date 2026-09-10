@@ -210,11 +210,17 @@ never data loss). A SQLite catalog with no explicit `url` here is a load-time
 `>= 1`) bounds how long a lost `NOTIFY` can go undetected before the next
 poll wakes every topic. The broker itself opens up to three dedicated
 Postgres connections (one `PgListener`, up to two for `NOTIFY`) — never the
-catalog's own pool — but every live subscriber's replay borrows one
-CATALOG-pool connection for the duration of its chunked replay, so size
-`catalog.postgres.pool_size` for the expected number of concurrent
-`(topic, tenant)` tails plus ordinary writers, independent of this broker's
-fixed three-connection budget. See
+catalog's own pool — but every trigger-stream replay (a tail's own
+driver-triggered replay, a lagging subscriber's own catch-up, and a fresh
+subscriber's subscribe-time drain) runs one STEP at a time, and each step
+borrows one CATALOG-pool connection only for its own duration: the permit is
+released between steps, so a long multi-step catch-up never monopolises a
+connection. Concurrent replay STEPS across the process are bounded at
+`pool_size − 2` (minimum 1), one connection per step, leaving two
+connections for publishers; size `catalog.postgres.pool_size` for the
+number of `(topic, tenant)` tails you expect to be replaying at the same
+moment plus ordinary writers, independent of this broker's fixed
+three-connection budget. See
 [Catalog Backend and Trigger Broker](./catalog-and-broker.md) for the full
 trade-off discussion, the health probe, and the SQLite single-process
 contract.

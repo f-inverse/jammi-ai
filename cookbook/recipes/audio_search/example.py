@@ -247,7 +247,7 @@ def main() -> int:
             early_stopping_metric="train_loss",
         )
         job.wait()
-        tuned_model = job.model_id
+        tuned_model = job.output_model_id
         assert tuned_model.startswith("jammi:fine-tuned:"), (
             f"unexpected fine-tuned model_id: {tuned_model}"
         )
@@ -325,7 +325,7 @@ def main() -> int:
             early_stopping_metric="train_loss",
         )
         tower_job.wait()
-        tower_model = tower_job.model_id
+        tower_model = tower_job.output_model_id
         assert tower_model.startswith("jammi:fine-tuned:"), (
             f"unexpected fine-tuned model_id: {tower_model}"
         )

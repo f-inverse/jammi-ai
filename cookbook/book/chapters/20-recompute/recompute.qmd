@@ -234,6 +234,57 @@ contracts.assert_close("recompute.recompute.derives_from_all_result_digest", 1.0
 print("\nlineage is one-hop RESULT_DIGEST edges — the relation the sweep walks")
 ```
 
+## The generalised job queue underneath (`list_jobs` / `job`)
+
+PLAN-C generalises the training-only queue into a kind-agnostic durable job
+abstraction: every compute verb above — `generate_embeddings`,
+`build_neighbor_graph`, `propagate_embeddings` — now submits through the SAME
+engine seam (`InferenceSession::run_now`) a `fine_tune` submission does, and
+records an ordinary row in the generalised `jobs` table (`execution='inline'`
+for a synchronous embedded call, claimed and run in the caller's own task —
+no worker needed). `list_jobs()` / `job(job_id)` are therefore live, generic
+verbs over an everyday recompute chain, not something that needs a training
+run to exercise. `asof_join` is one of those compute kinds too, and — unlike
+the embedding chain above — needs no base model, so it is the cheapest live
+demonstration of the queue: a fresh engine, a two-row join, and a read-back of
+the job it left behind.
+
+```{python}
+import tempfile
+
+import pyarrow as pa
+import pyarrow.parquet as pq
+
+with tempfile.TemporaryDirectory() as _jobs_dir:
+    jobs_db = jammi.connect(f"file://{_jobs_dir}")
+    spine_path = f"{_jobs_dir}/spine.parquet"
+    facts_path = f"{_jobs_dir}/facts.parquet"
+    pq.write_table(pa.table({"entity": ["e"], "as_of": [10]}), spine_path)
+    pq.write_table(pa.table({"entity": ["e"], "t": [5], "v": [1.0]}), facts_path)
+    jobs_db.add_source("jobs_spine", url=f"file://{spine_path}", format="parquet")
+    jobs_db.add_source("jobs_facts", url=f"file://{facts_path}", format="parquet")
+    jobs_db.asof_join(
+        "jobs_spine", "jobs_facts",
+        spine_by=["entity"], spine_time="as_of",
+        facts_by=["entity"], facts_time="t",
+    )
+
+    jobs = jobs_db.list_jobs()
+    print(f"jobs recorded by one asof_join call: {len(jobs)}  kinds: "
+          f"{sorted({j['kind'] for j in jobs})}")
+    assert len(jobs) == 1
+    asof_job = jobs[0]
+    assert asof_job["kind"] == "asof_join"
+
+    # `job(job_id)` re-fetches the SAME row through the attach-by-id handle —
+    # the peer of a submitted job's own handle, for a job this connection
+    # already knows the id of.
+    handle = jobs_db.job(asof_job["job_id"])
+    print(f"job({asof_job['job_id']}).status() = {handle.status()!r}")
+    assert handle.status() == "completed" == asof_job["status"]
+    jobs_db.close()
+```
+
 ## The boundary — mechanism, not the loop
 
 The engine ships the bounded **mechanism**: one cache probe per producer call,

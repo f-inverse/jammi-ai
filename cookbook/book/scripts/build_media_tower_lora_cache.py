@@ -439,7 +439,7 @@ def train_and_probe_change(
     job.wait()
     if job.status() != "completed":
         raise RuntimeError(f"{tag} fine-tune did not complete: status={job.status()}")
-    tuned_model = job.model_id
+    tuned_model = job.output_model_id
     if not tuned_model.startswith("jammi:fine-tuned:"):
         raise RuntimeError(f"unexpected fine-tuned model_id: {tuned_model}")
     print(f"  [{tag}] model_id: {tuned_model}", flush=True)

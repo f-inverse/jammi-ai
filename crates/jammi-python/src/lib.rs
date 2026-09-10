@@ -12,7 +12,7 @@ use tracing_subscriber::EnvFilter;
 use jammi_db::config::JammiConfig;
 
 use crate::error::to_pyerr;
-use crate::job::PyTrainingJob;
+use crate::job::PyJob;
 use crate::model_task::PyModelTask;
 
 /// The `_NativeDatabase` pyclass: the low-level embedded engine handle. The
@@ -42,7 +42,7 @@ fn jammi_native(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(open_local, m)?)?;
     m.add_class::<PyDatabase>()?;
     m.add_class::<crate::database::PyTenantScope>()?;
-    m.add_class::<PyTrainingJob>()?;
+    m.add_class::<PyJob>()?;
     m.add_class::<PyModelTask>()?;
     m.add_class::<crate::audit::PyPerQueryAudit>()?;
     m.add_class::<crate::audit::PyAuditHandle>()?;

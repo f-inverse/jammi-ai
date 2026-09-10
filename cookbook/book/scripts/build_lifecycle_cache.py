@@ -171,7 +171,7 @@ def _train_one(db, corpus_path: str, base_model: str, tag: str) -> str:
         seed=0,
     )
     job.wait()
-    return job.model_id
+    return job.output_model_id
 
 
 def run_catalog(db, corpus_path: str, base_model: str, tag: str) -> dict:

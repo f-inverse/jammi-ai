@@ -14,9 +14,9 @@ The re-export is explicit — a bare ``import *`` would drop the underscore-name
 from .jammi_native import (
     AuditHandle,
     EphemeralSession,
+    Job,
     ModelTask,
     PerQueryAudit,
-    TrainingJob,
     _NativeDatabase,
     open_local,
 )
@@ -24,9 +24,9 @@ from .jammi_native import (
 __all__ = [
     "AuditHandle",
     "EphemeralSession",
+    "Job",
     "ModelTask",
     "PerQueryAudit",
-    "TrainingJob",
     "_NativeDatabase",
     "open_local",
 ]

@@ -44,7 +44,7 @@ def main() -> int:
         job.wait()
 
         # 4. Newly-registered model_id follows the jammi:fine-tuned:* shape.
-        model_id = job.model_id
+        model_id = job.output_model_id
         assert model_id.startswith("jammi:fine-tuned:"), (
             f"unexpected model_id: {model_id}"
         )

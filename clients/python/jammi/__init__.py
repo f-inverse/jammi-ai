@@ -24,10 +24,10 @@ from importlib.metadata import version
 from typing import Optional, Union
 
 from . import errors
-from ._backend import Backend, Session, TrainingJobHandle
+from ._backend import Backend, JobHandle, Session
 from ._capability import Capability
 from ._credentials import BearerCredentials, ChannelCredentials
-from ._database import RemoteDatabase, RemoteTrainingJob
+from ._database import RemoteDatabase, RemoteJob
 # `_embedded` is native-free at import (it imports `jammi_native` lazily, inside
 # `_open_embedded`), so naming `EmbeddedBackend` here keeps `import jammi`
 # native-free — the client-import guard the positive conformance test pins.
@@ -50,11 +50,11 @@ __all__ = [
     # Protocols — the transport-agnostic surface a caller writes against.
     "Session",
     "Backend",
-    "TrainingJobHandle",
+    "JobHandle",
     "Capability",
     # Concrete remote transport.
     "RemoteDatabase",
-    "RemoteTrainingJob",
+    "RemoteJob",
     # Concrete embedded transport (the compiled in-process engine). Named here,
     # but its module (`_embedded`) imports `jammi_native` lazily, so referencing
     # the name does not pull the engine — only opening a `file://` target does.
@@ -188,9 +188,9 @@ def connect(
 _EMBEDDED_ONLY = (
     "AuditHandle",
     "EphemeralSession",
+    "Job",
     "ModelTask",
     "PerQueryAudit",
-    "TrainingJob",
 )
 
 # The generic extension slot. An out-of-package plug-in registers an entry point

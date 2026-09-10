@@ -24,8 +24,8 @@ model rather than a re-distributed full checkpoint.
 ## API surface exercised
 
 - `Database.fine_tune(*, source, base_model, columns, method, task=..., ...)`
-- `TrainingJob.wait()`
-- `TrainingJob.job_id`, `TrainingJob.model_id`
+- `Job.wait()`
+- `Job.job_id`, `Job.output_model_id`
 - `Database.encode_query(*, model, query, modality="text")`
 
 The full keyword list on `fine_tune` covers LoRA rank/alpha/dropout,

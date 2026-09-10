@@ -734,7 +734,7 @@ workspace ships every publishable crate at the same
   constrains what the engine forks on, not what fronts it; the boundary
   table is the second gate past the discipline test; `[server] tls` is
   already a typed `deny_unknown_fields` startup refusal, never a silent
-  plaintext fallback; and a Caddy/nginx example terminates TLS in front of
+  plaintext fallback; and a Caddy example terminates TLS in front of
   the loopback-bound reference Compose listeners. `deploy-server.md` and
   `reference-topologies.md` point at the decision from the identity seam
   and the Compose section respectively.
@@ -747,10 +747,12 @@ workspace ships every publishable crate at the same
   `[broker.postgres] url` examples now carry
   `?sslmode=verify-full&sslrootcert=…`, matching the catalog examples;
   `catalog-and-broker.md` gains a paragraph on obtaining `sslrootcert` for
-  Cloud SQL, RDS, and Fly Postgres, plus the sentence that the engine hands
-  the catalog URL to the driver unchanged, so `sslmode`/`sslrootcert` come
-  only from the URL and `libpq` environment variables like `PGSSLMODE` are
-  never consulted.
+  Cloud SQL, RDS, and Fly Postgres, plus the rule that the engine hands the
+  catalog URL to the driver unchanged and the driver's URL parser overrides
+  only the keys the URL names — a `sslmode`/`sslrootcert` the URL omits
+  still falls back to the process's `PGSSLMODE`/`PGSSLROOTCERT`, so naming
+  `sslmode=verify-full` explicitly in the URL is what makes a connection
+  immune to a stray `PGSSLMODE=disable` left in the environment.
 
 ### Fixed
 - **Two concurrent `migrate()` callers on a fresh Postgres database could both attempt the

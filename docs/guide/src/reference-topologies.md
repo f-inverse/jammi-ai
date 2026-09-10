@@ -208,6 +208,9 @@ kind: Service
 metadata:
   name: jammi-server
 spec:
+  # No `type:` -> ClusterIP (the default): cluster-internal only, reachable
+  # from other pods/Services on this cluster, not from outside it -- pair
+  # with an Ingress/Gateway and a TLS terminator to reach it externally.
   selector: { app: jammi-server }
   ports:
     - { name: flight, port: 8081, targetPort: 8081 }

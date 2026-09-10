@@ -31,30 +31,45 @@ store rather than the OS trust store, so a private CA needs its own
 `sslrootcert=` path even on a host that already trusts it system-wide.
 
 The engine hands this URL to the Postgres driver unchanged
-(`crates/jammi-db/src/catalog/backend_postgres.rs:34`) — `sslmode` and
-`sslrootcert` come only from the URL string itself, never from `libpq`
-environment variables. Setting `PGSSLMODE` (or any other `PGSSL*` variable)
-in the process environment has no effect; the query string is the only
-place to say it.
+(`backend_postgres.rs::open_with_options`) — but "unchanged" only means the
+driver's own URL parser sees every key you wrote. `sqlx`'s parser
+(`PgConnectOptions::parse_from_url`) starts from options already populated
+from the process environment (`PGSSLMODE`, `PGSSLROOTCERT`, and the rest of
+the `PGSSL*`/`PGPASSWORD`/… family) and then overrides *only the keys the
+URL names*. A URL that omits `sslmode` still inherits whatever `PGSSLMODE`
+is set in the environment — including a stray `PGSSLMODE=disable` left over
+from a shell profile or a shared base image. Naming `sslmode=verify-full`
+explicitly in the URL, as the example above does, is what makes the
+connection immune to that: an override the URL states always wins over the
+environment default, but a key the URL is silent on does not. The broker's
+own Postgres pool (`postgres.rs::connect`, in `src/trigger/`) parses its
+`url` through the same `PgConnectOptions` path, so the same rule — name
+`sslmode` (and `sslrootcert`, for a private CA) in the URL, don't rely on
+`PGSSL*` being unset — applies to `[broker.postgres] url` below too.
 
-**Where `sslrootcert` comes from for a managed provider.** Each of the three
-managed Postgres offerings this engine's own deployment shapes target
-documents its own root:
+**Where `sslrootcert` comes from for a managed provider.** Each of three
+common managed Postgres offerings documents its own root differently:
 
-- **Google Cloud SQL** — the instance's server CA certificate is on the
-  instance's "Connect using SSL" page in the Cloud SQL Instances Overview,
-  or via `gcloud sql instances describe`; see Cloud SQL's ["Configure SSL/TLS
-  certificates"](https://cloud.google.com/sql/docs/postgres/configure-ssl-instance) docs.
+- **Google Cloud SQL** — in the console: Cloud SQL Instances → the
+  instance's Overview → **Connections** → **Security** tab. From the CLI,
+  a per-instance CA:
+  `gcloud sql ssl server-ca-certs list --format="value(cert)" --instance=INSTANCE > server-ca.pem`;
+  an instance on the shared-CA model instead uses
+  `gcloud sql ssl server-certs list --format="value(ca_cert.cert)" --instance=INSTANCE > server-ca.pem`.
+  See Cloud SQL's ["Configure SSL/TLS
+  certificates"](https://cloud.google.com/sql/docs/postgres/configure-ssl-instance) docs for which model an instance uses.
 - **Amazon RDS** — one fixed global bundle covers every region and instance,
   at [`https://truststore.pki.rds.amazonaws.com/global/global-bundle.pem`](https://truststore.pki.rds.amazonaws.com/global/global-bundle.pem);
   see the RDS User Guide's ["Using SSL/TLS to encrypt a connection to a DB
   instance"](https://docs.aws.amazon.com/AmazonRDS/latest/UserGuide/UsingWithRDS.SSL.html) page.
-- **Fly Postgres** — an app reached over Fly's private 6PN WireGuard network
-  needs no `sslrootcert` at all; the network path itself is the trust
-  boundary (see Fly's ["Connecting to
-  Postgres"](https://fly.io/docs/postgres/connecting/) docs). A Fly Postgres
-  instance fronted by a public proxy supplies its own certificate the same
-  way any self-managed instance does.
+- **Fly Postgres** — the connection docs give only the private-network URL
+  form (`postgres://user:pass@host.flycast:5432/db`) and publish no
+  downloadable server CA. Confirm with the operator which product is in
+  front — Fly's Managed Postgres and an unmanaged Postgres app on Fly carry
+  different TLS postures — before choosing `verify-full` for it; either
+  way, the URL must still name `sslmode` explicitly (per the rule above), so
+  a `PGSSLMODE` left set in the environment cannot downgrade a connection
+  that is otherwise reached only over Fly's private network.
 
 Download the certificate once, mount it read-only into the container, and
 point `sslrootcert=` at that path.

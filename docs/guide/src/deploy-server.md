@@ -267,8 +267,9 @@ The server drains active connections on SIGTERM / Ctrl+C before exiting. In-flig
 
 The server performs **no authentication** on its own — treat it as
 **trusted-network** and put access control in front of it, or supply your own
-`TenantResolver` at the seam the engine ships for exactly this. This page does
-not duplicate that contract a second time; see:
+`TenantResolver` at the seam the engine ships for exactly this. The contract
+of record for that seam is on the security page; the sketch below is only
+the minimal shape a caller wires in. See:
 
 - [Security Posture](./security.md) for the full threat model — what the
   engine defends, what it explicitly does not, and the trusted-network
@@ -284,16 +285,32 @@ tenants (the one rule everything else follows from —
 a proxy that already verified the caller injects the fact, and the resolver
 only reads it:
 
-```rust,ignore
-// The proxy verified the caller upstream and sets this header itself —
-// never a client-controlled one. The resolver reads ONLY the proxy-set
-// value and rejects when it is absent: no header, no fallback tenant.
-async fn resolve(&self, metadata: &MetadataMap) -> Result<TenantScope, Status> {
-    let raw = metadata
-        .get("x-jammi-verified-tenant")
-        .ok_or_else(|| Status::unauthenticated("no verified tenant"))?;
-    let uuid = Uuid::parse_str(raw.to_str()?).map_err(|_| Status::unauthenticated("bad tenant"))?;
-    Ok(TenantScope::Tenant(TenantId::from_uuid(uuid)?))
+```rust,no_run
+# extern crate jammi_db;
+# extern crate jammi_server;
+# extern crate tonic;
+# extern crate uuid;
+use jammi_db::TenantId;
+use jammi_server::grpc::session::{TenantResolver, TenantScope};
+use tonic::{metadata::MetadataMap, Status};
+use uuid::Uuid;
+
+struct ProxyHeaderResolver;
+
+#[tonic::async_trait]
+impl TenantResolver for ProxyHeaderResolver {
+    // The proxy verified the caller upstream and sets this header itself —
+    // never a client-controlled one. Read ONLY the proxy-set value and
+    // reject when it is absent: no header, no fallback tenant.
+    async fn resolve(&self, metadata: &MetadataMap) -> Result<TenantScope, Status> {
+        let raw = metadata
+            .get("x-jammi-verified-tenant")
+            .and_then(|v| v.to_str().ok())
+            .ok_or_else(|| Status::unauthenticated("no verified tenant"))?;
+        let uuid = Uuid::parse_str(raw).map_err(|_| Status::unauthenticated("bad tenant"))?;
+        let tenant = TenantId::from_uuid(uuid).map_err(|_| Status::unauthenticated("bad tenant"))?;
+        Ok(TenantScope::Tenant(tenant))
+    }
 }
 ```
 
@@ -321,12 +338,12 @@ The OSS server ships as two public Docker images on GHCR:
 - `ghcr.io/f-inverse/jammi-ai-server` — **CPU**, built from a distroless base.
 - `ghcr.io/f-inverse/jammi-ai-server-cu12` — **CUDA**, for GPU-accelerated inference (see [GPU serving](#gpu-serving)).
 
-Both run as the nonroot user (uid `65532`), expose the same `8080` / `8081` ports the local binary listens on, and share the same tag scheme (`:latest`, `:vX.Y.Z`, `:vX.Y`). Both `:latest` tags are re-pointed by every `v*` release tag (never by a prerelease); the CPU `:latest` can additionally be re-pointed to the current `main` by a manual `build-and-push-main` dispatch. The image entrypoint is `jammi-server`, so `docker run <image>` brings up the server with **zero config** — a local SQLite catalog, the in-memory broker, and every service tier, no TOML required. The `jammi` admin CLI also ships in the image for running verbs against the server. The examples below use the CPU image.
+Both run as the nonroot user (uid `65532`), expose the same `8080` / `8081` ports the local binary listens on, and share the same tag scheme (`:latest`, `:vX.Y.Z`, `:vX.Y`). Both `:latest` tags are re-pointed by every `v*` release tag (never by a prerelease); the CPU `:latest` can additionally be re-pointed to the current `main` by a manual `build-and-push-main` dispatch. The image entrypoint is `jammi-server`, so `docker run <image>` brings up the server with **zero config** — a local SQLite catalog, the in-memory broker, and every service tier, no TOML required. The `jammi` admin CLI also ships in the image for running verbs against the server. The examples below use the CPU image, and bind both published ports to `127.0.0.1`: the server itself performs no authentication (see [The identity seam](#the-identity-seam)), so publishing to every interface would expose an unauthenticated admin surface to the host's whole network — a terminator or reverse proxy that itself binds a public interface is what a deployment fronts these loopback-bound ports with.
 
 ```bash
 # Turnkey: zero config, no TOML.
 docker run --rm \
-  -p 8080:8080 -p 8081:8081 \
+  -p 127.0.0.1:8080:8080 -p 127.0.0.1:8081:8081 \
   -v jammi_data:/var/lib/jammi \
   ghcr.io/f-inverse/jammi-ai-server:latest
 ```
@@ -335,7 +352,7 @@ To supply your own config, pass `--config` to the `jammi-server` entrypoint:
 
 ```bash
 docker run --rm \
-  -p 8080:8080 -p 8081:8081 \
+  -p 127.0.0.1:8080:8080 -p 127.0.0.1:8081:8081 \
   -v jammi_data:/var/lib/jammi \
   -v $(pwd)/jammi.toml:/etc/jammi/jammi.toml:ro \
   ghcr.io/f-inverse/jammi-ai-server:latest --config /etc/jammi/jammi.toml
@@ -379,7 +396,7 @@ The `jammi-ai-server-cu12` image builds with candle's CUDA backend on an NVIDIA 
 ```bash
 # Turnkey: zero config, GPU inference.
 docker run --rm --gpus all \
-  -p 8080:8080 -p 8081:8081 \
+  -p 127.0.0.1:8080:8080 -p 127.0.0.1:8081:8081 \
   -v jammi_data:/var/lib/jammi \
   ghcr.io/f-inverse/jammi-ai-server-cu12:latest
 ```
@@ -388,7 +405,7 @@ With no TOML the server selects GPU device `0` by default. To override the devic
 
 ```bash
 docker run --rm --gpus all \
-  -p 8080:8080 -p 8081:8081 \
+  -p 127.0.0.1:8080:8080 -p 127.0.0.1:8081:8081 \
   -v jammi_data:/var/lib/jammi \
   -v $(pwd)/jammi.toml:/etc/jammi/jammi.toml:ro \
   ghcr.io/f-inverse/jammi-ai-server-cu12:latest --config /etc/jammi/jammi.toml

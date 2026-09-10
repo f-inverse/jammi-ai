@@ -87,8 +87,9 @@ and the [Design Philosophy](./philosophy.md) already state:
 - **Passing the discipline test is necessary, not sufficient.** A user who
   has never heard of any consumer does want the wire encrypted — TLS passes
   the [discipline test](./philosophy.md#the-discipline-test) on its own. But
-  the boundary table (`docs/guide/src/philosophy.md:124-125`) is the second
-  gate: TLS, secrets, IAM, ingress, and load balancing all pass the
+  the boundary table and the paragraph that follows it
+  (`docs/guide/src/philosophy.md:116-125`) are the second gate: TLS,
+  secrets, IAM, ingress, and load balancing all pass the
   discipline test and are *still* placed in the consumer's runtime, not the
   engine, because the table asks a second question the discipline test does
   not — does owning this turn the engine into infrastructure it isn't. TLS
@@ -109,29 +110,34 @@ and the [Design Philosophy](./philosophy.md) already state:
   seam described under [The identity seam](./deploy-server.md#the-identity-seam).
   The CLI's `--target` refuses `grpcs://` and `https://` with a typed error
   naming the accepted schemes (`crates/jammi-cli/src/main.rs:170-187`;
-  `CHANGELOG.md:1139`) rather than advertising a transport it cannot speak
+  `CHANGELOG.md:1171`) rather than advertising a transport it cannot speak
   — put a TLS-terminating proxy in front and point `--target` at it in
-  plaintext (`grpc://`/`http://`). This is a deliberate asymmetry, not an
-  oversight: the Python SDK's `RemoteTarget` legitimately keeps
+  plaintext (`grpc://`/`http://`). This is an asymmetry between the two
+  clients: the Python SDK's `RemoteTarget` legitimately keeps
   `grpcs://`/`https://` in its own scheme table
   (`clients/python/jammi/_target.py:51-54`) because it is a general client
   library reaching whatever endpoint a deployment publishes (including a
   TLS-terminating proxy), while the CLI is the engine's own admin surface
   and names only the schemes the engine itself speaks.
 
-**Shape B with no mesh** — the case this decision leans on hardest, since an
-on-prem single-tenant deployment may have no ingress or mesh to terminate
-TLS for it — still gets encryption: put a terminator in front of the
-engine's plaintext listeners. A minimal, consumer-neutral example with
-Caddy:
+**Shape B with no mesh** — an on-prem single-tenant deployment that has no
+ingress or mesh to terminate TLS for it — still gets encryption: put a
+terminator in front of the engine's plaintext listeners. A minimal,
+consumer-neutral example with Caddy:
 
-```
+```text
 # Caddyfile — terminates TLS and forwards plaintext to the engine's
 # loopback-bound listeners (see docker-compose.yml).
+#
+# `tls internal` issues Caddy's own locally-trusted certificate: a private
+# DNS name (no public record) has no ACME challenge path to a public CA,
+# so automatic Let's Encrypt/ZeroSSL issuance is not an option here.
 jammi.example.com {
+    tls internal
     reverse_proxy h2c://127.0.0.1:8081  # gRPC + Flight SQL
 }
 health.jammi.example.com {
+    tls internal
     reverse_proxy 127.0.0.1:8080        # /healthz, /readyz, /metrics
 }
 ```
@@ -140,7 +146,10 @@ The reference [`deploy/docker-compose.yml`](https://github.com/f-inverse/jammi-a
 binds its published ports to `127.0.0.1` for exactly this shape: the
 compose stack publishes the engine's ports deliberately, for a terminator
 running on the same host to reach, not for direct exposure to an untrusted
-network.
+network. A terminator running as a container on the same Compose network
+instead reaches the engine by its service name rather than `127.0.0.1` —
+`reverse_proxy h2c://jammi-server:8081` — since two containers on the same
+Compose network share that network, not the host's loopback interface.
 
 ## The trusted-network assumption
 

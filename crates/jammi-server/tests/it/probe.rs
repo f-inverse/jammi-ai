@@ -45,11 +45,15 @@ const TIMEOUT: Duration = Duration::from_secs(5);
 /// integration tests when the crate has a `[[bin]]` target.
 const BIN: &str = env!("CARGO_BIN_EXE_jammi-server");
 
-/// A loopback address nothing in this suite — or any non-root process on
-/// either CI platform this suite runs on (GitHub Actions' Linux and macOS
-/// runners are both non-root) — can ever be listening on: binding TCP port 1
-/// requires root / `CAP_NET_BIND_SERVICE`, so a connection attempt here
-/// refuses deterministically.
+/// A loopback address nothing in THIS workspace ever binds: no test, probe
+/// target, or server fixture anywhere in this suite listens on port 1 (that
+/// would need root / `CAP_NET_BIND_SERVICE` to bind at all, and nothing here
+/// even tries), so a connection attempt here is refused deterministically —
+/// this does NOT rely on the process being unprivileged. (The `Run tests`
+/// step of this crate's CI lane in fact runs as root inside the CI
+/// container, per `.github/workflows/ci.yml`'s `JAMMI_REQUIRE_POSIX_PERMS`
+/// comment — a privileged process COULD bind port 1 if something asked it
+/// to; nothing here ever does.)
 ///
 /// This replaces a bind-`127.0.0.1:0`-then-drop pattern, which resolves an
 /// ephemeral port, releases it, and dials the now-bare address — a window
@@ -256,8 +260,11 @@ async fn probe_caps_a_slow_oversized_body_without_buffering_the_whole_thing() {
          ~80s a full drain would take"
     );
     assert!(
-        err.contains("[truncated]"),
-        "a capped body must carry the truncation marker, got: {err}"
+        err.contains(&format!(
+            "[capped at {} bytes]",
+            jammi_server::probe::MAX_BODY_BYTES
+        )),
+        "a capped body must carry the cap marker, got: {err}"
     );
     let echoed_x_count = err.matches('x').count();
     assert!(
@@ -285,13 +292,61 @@ async fn check_truncates_a_large_failure_body() {
         .await
         .expect_err("a 503 must check Err");
     assert!(
-        err.contains("[truncated]"),
-        "an oversized body must be truncated with the marker, got: {err}"
+        err.contains(&format!(
+            "[capped at {} bytes]",
+            jammi_server::probe::MAX_BODY_BYTES
+        )),
+        "an oversized body must be capped with the marker, got: {err}"
     );
     let echoed_x_count = err.matches('x').count();
     assert!(
         echoed_x_count <= jammi_server::probe::MAX_BODY_BYTES,
         "echoed body must never exceed the cap, got {echoed_x_count}"
+    );
+}
+
+/// Boundary case: a failure body of EXACTLY [`jammi_server::probe::MAX_BODY_BYTES`]
+/// bytes — nothing dropped — still hits the same early-break cap logic
+/// `check_truncates_a_large_failure_body` exercises for an oversized body, so
+/// the marker must never claim truncation when none happened: the whole body
+/// is echoed AND the cap marker is still appended (reading legitimately
+/// stopped exactly at the cap; `check` cannot tell, from where it stops,
+/// whether the body would have ended there anyway or kept going — see
+/// `probe.rs::read_bounded_body`'s doc), so the wording must stay true either
+/// way.
+#[tokio::test]
+async fn check_body_at_exactly_the_cap_never_claims_truncation() {
+    let body = "x".repeat(jammi_server::probe::MAX_BODY_BYTES);
+    let addr = spawn_readyz(
+        StatusCode::SERVICE_UNAVAILABLE,
+        Box::leak(body.into_boxed_str()),
+    )
+    .await;
+    let url = format!("http://{addr}/readyz");
+
+    let err = jammi_server::probe::check(&url, TIMEOUT)
+        .await
+        .expect_err("a 503 must check Err");
+    assert!(
+        !err.contains("[truncated]"),
+        "a body of exactly the cap must never claim truncation, got: {err}"
+    );
+    // The early-break cap logic still fires at exactly the cap (it cannot
+    // cheaply tell "ended here" from "more was coming"), so the marker is
+    // still appended — the fix is the WORDING, which must stay true either
+    // way: "capped", never "truncated".
+    assert!(
+        err.contains(&format!(
+            "[capped at {} bytes]",
+            jammi_server::probe::MAX_BODY_BYTES
+        )),
+        "a body of exactly the cap still hits the cap logic and carries the marker, got: {err}"
+    );
+    let echoed_x_count = err.matches('x').count();
+    assert_eq!(
+        echoed_x_count,
+        jammi_server::probe::MAX_BODY_BYTES,
+        "a body of exactly the cap must be echoed in full, got: {err}"
     );
 }
 

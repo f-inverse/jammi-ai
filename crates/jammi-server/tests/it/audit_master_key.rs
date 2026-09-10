@@ -63,9 +63,14 @@ async fn subprocess_serve_refuses_to_start_with_an_undecodable_audit_master_key(
     let config_path = dir.path().join("jammi.toml");
     std::fs::write(&config_path, minimal_config(dir.path())).expect("write config");
 
+    // A distinctive malformed value (not a substring of any fixed wording
+    // this check itself ever prints) so the tightened assertion below can
+    // prove NO fragment of the configured value reaches stderr, not merely
+    // that one specific known substring is absent.
+    let malformed = "zzzz-not-hex-zzzz";
     let output = tokio::time::timeout(
         TIMEOUT,
-        serve_command(&config_path, Some("not-hex")).output(),
+        serve_command(&config_path, Some(malformed)).output(),
     )
     .await
     .expect("jammi-server serve must exit within the timeout, not hang")
@@ -87,9 +92,25 @@ async fn subprocess_serve_refuses_to_start_with_an_undecodable_audit_master_key(
         stderr.contains("hex"),
         "stderr must describe the expected format, got: {stderr}"
     );
+    // Tightened: `hex::FromHexError`'s `Display` names the single offending
+    // character (`jammi_db::audit::AuditError::MasterKey` inherits that leak
+    // when it wraps a decode failure), so a check that only asserted the
+    // FULL value was absent would miss a lone leaked character. `malformed`
+    // is deliberately built from two distinct multi-character fragments
+    // ("zzzz" and "not-hex") repeated/joined so that no length->=2 substring
+    // of it coincides with this check's own fixed wording ("hex", "not
+    // configured", "invalid", "bytes", …) — asserting both fragments are
+    // absent from stderr is therefore also a check that no length->=2
+    // fragment of the input leaked, without the sliding-window scan
+    // spuriously tripping on ordinary words the fixed message shares with
+    // the input (e.g. the literal word "hex" this check's own wording uses).
+    assert!(
+        !stderr.contains("zzzz"),
+        "stderr must never echo any fragment of the configured value, got: {stderr}"
+    );
     assert!(
         !stderr.contains("not-hex"),
-        "stderr must never echo the configured key value, got: {stderr}"
+        "stderr must never echo any fragment of the configured value, got: {stderr}"
     );
 }
 

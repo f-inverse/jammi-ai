@@ -93,22 +93,31 @@ pub async fn check(url: &str, timeout: Duration) -> Result<(), String> {
 /// whichever comes first).
 ///
 /// Decodes the accumulated bytes as UTF-8 (lossily — a probe target's
-/// failure body is diagnostic text, not a contract), appending a truncation
-/// marker when the cap was reached before the body ended.
+/// failure body is diagnostic text, not a contract), appending a cap marker
+/// when reading stopped at [`MAX_BODY_BYTES`].
+///
+/// The marker reads "[capped at N bytes]", never "[truncated]": reading
+/// stops the INSTANT the cap is reached (the `remaining == 0` early break,
+/// below, is what bounds resident memory against a slow/unbounded stream —
+/// see the fn-level doc), which fires identically whether the underlying
+/// body had more bytes beyond the cap or ended EXACTLY at it. A body of
+/// exactly `MAX_BODY_BYTES` bytes — nothing dropped — would hit that same
+/// early break, so a marker claiming truncation would be false in that case;
+/// "capped at N bytes" is true in both.
 async fn read_bounded_body(response: &mut reqwest::Response) -> String {
     let mut buf: Vec<u8> = Vec::with_capacity(MAX_BODY_BYTES.min(4096));
-    let mut truncated = false;
+    let mut capped = false;
     loop {
         let remaining = MAX_BODY_BYTES - buf.len();
         if remaining == 0 {
-            truncated = true;
+            capped = true;
             break;
         }
         match response.chunk().await {
             Ok(Some(chunk)) => {
                 if chunk.len() > remaining {
                     buf.extend_from_slice(&chunk[..remaining]);
-                    truncated = true;
+                    capped = true;
                     break;
                 }
                 buf.extend_from_slice(&chunk);
@@ -118,8 +127,8 @@ async fn read_bounded_body(response: &mut reqwest::Response) -> String {
         }
     }
     let mut text = String::from_utf8_lossy(&buf).into_owned();
-    if truncated {
-        text.push_str("... [truncated]");
+    if capped {
+        text.push_str(&format!("... [capped at {MAX_BODY_BYTES} bytes]"));
     }
     text
 }

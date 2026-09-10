@@ -41,6 +41,14 @@ const REPO_ID: &str = "acme/tiny-hub-model";
 const FILENAME: &str = "config.json";
 const BODY: &[u8] = b"{\"hidden_size\":4,\"model_type\":\"bert\"}";
 
+/// A minimal, valid safetensors file: an 8-byte little-endian header length
+/// (`2`, for the two bytes that follow) then the empty JSON header `{}` — no
+/// tensors. `estimate_safetensors_residency` accepts this shape; it is the
+/// exact byte layout `write_minimal_safetensors` below writes to disk for
+/// the catalog-hit tests, reused here as a mock response body so a full
+/// `ModelResolver::resolve_hf_hub` can reach `Ok` over the wire.
+const MINIMAL_SAFETENSORS: &[u8] = &[2, 0, 0, 0, 0, 0, 0, 0, b'{', b'}'];
+
 /// Mount ONE mock matching every `GET` to `{repo_id}/resolve/main/{filename}`
 /// — hf-hub 0.5's sync API issues exactly two such requests per fresh
 /// download (`Api::metadata`'s `Range: bytes=0-0` HEAD-shaped probe, then the
@@ -247,15 +255,32 @@ async fn hf_hub_offline_env_refuses_by_name_with_no_config_override() {
 /// #481 acceptance bullet 3, second control (the direction): `[models]
 /// offline = false` EXPLICIT wins over `HF_HUB_OFFLINE=1` in the environment
 /// — config wins, matching `resolve_root`/`resolve_endpoint`/`resolve_token`'s
-/// own "config beats env" precedence. Proven by NOT taking the offline
-/// early-return in `ModelResolver::resolve`: no catalog row, and no mock
-/// mounted on the server (a bare `MockServer::start()` 404s every request),
-/// so a genuine online attempt surfaces as a download failure — never the
-/// "offline: … was never resolved online" refusal the previous test proved
-/// `HF_HUB_OFFLINE=1` alone produces.
+/// own "config beats env" precedence.
+///
+/// Proven by an OBSERVED completed network fetch, not by an error's shape.
+/// An acceptance-verifier BLOCK on the prior version of this test found that
+/// oracle vacuous: at the true pre-esc-096 base, `HF_HUB_OFFLINE` was never
+/// read at all, so "the error message doesn't say offline" passed for the
+/// wrong reason — it cannot distinguish "config correctly overrode the env"
+/// from "the env is simply unimplemented and this genuinely 404s for an
+/// unrelated reason". This version mounts the repo's `config.json` and
+/// `model.safetensors` on the wiremock server exactly like the passing
+/// fetch tests above (`mount_repo_file`, the file's shared mounting
+/// helper), so a real config-wins outcome is observable two ways that a
+/// vacuous "env unimplemented" run cannot fake: (i) `resolve` returns `Ok`
+/// (an unmounted 404 or an actual offline refusal both return `Err`), and
+/// (ii) the mock's `received_requests` is non-empty (the resolve did not
+/// short-circuit before ever reaching the network — the offline refusal
+/// path in `ModelResolver::resolve` returns before building the Hub repo
+/// client at all). The `!hub.offline()` unit-level assertion stays, so this
+/// test still pins the `HubSource`-level precedence directly, not only its
+/// downstream effect.
 #[tokio::test(flavor = "multi_thread")]
 async fn config_offline_false_wins_over_hf_hub_offline_env() {
     let server = MockServer::start().await;
+    let repo_id = "acme/config-wins-repo";
+    mount_repo_file(&server, repo_id, "config.json", BODY).await;
+    mount_repo_file(&server, repo_id, "model.safetensors", MINIMAL_SAFETENSORS).await;
 
     let root = tempfile::tempdir().unwrap();
     let config = ModelsConfig {
@@ -275,24 +300,21 @@ async fn config_offline_false_wins_over_hf_hub_offline_env() {
     let catalog = Arc::new(Catalog::open(dir.path()).await.unwrap());
     let resolver = ModelResolver::new(catalog, crate::common::test_artifact_store(), hub).unwrap();
 
-    let err = match resolver
-        .resolve(
-            &ModelSource::hf("acme/config-wins-repo"),
-            ModelTask::TextEmbedding,
-            None,
-        )
+    let resolved = resolver
+        .resolve(&ModelSource::hf(repo_id), ModelTask::TextEmbedding, None)
         .await
-    {
-        Ok(_) => panic!(
-            "expected a network-shaped failure against the unmounted mock, not a resolved model"
-        ),
-        Err(e) => e,
-    };
-    let message = err.to_string();
+        .expect(
+            "config `offline = false` must win over HF_HUB_OFFLINE=1 -- expected the \
+             resolve to reach the mocked Hub and succeed, not refuse offline",
+        );
+    assert_eq!(resolved.model_id.0, repo_id);
+
+    let requests = server.received_requests().await.unwrap();
     assert!(
-        !message.contains("offline"),
-        "config `offline = false` must win over HF_HUB_OFFLINE=1 -- expected a network \
-         failure from actually attempting the Hub, not the offline refusal: {message}"
+        !requests.is_empty(),
+        "config `offline = false` must win over HF_HUB_OFFLINE=1 -- the mock never \
+         received a request, so this run cannot distinguish \"config correctly \
+         overrode the env\" from \"HF_HUB_OFFLINE is simply unimplemented\""
     );
 }
 

@@ -14,6 +14,23 @@ use super::builder::DynObjectStore;
 use super::error::StorageError;
 use super::url::{Scheme, StorageUrl};
 
+/// The two states a [`JammiObjectStore::delete_if_exists`] call can end in —
+/// deliberately NOT collapsed into a bare `Result<(), StorageError>`, because
+/// a 404 and an actual removal are different facts a caller may need to act
+/// on differently (most sharply: `store::reconcile`'s byte-accounting, which
+/// must credit `bytes_reclaimed` only for a key THIS call actually removed,
+/// never one that was already gone when the delete ran — see esc-484's
+/// vanish-window defect, where collapsing the two let a race credit bytes
+/// that were never freed by the pass reporting them).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DeleteOutcome {
+    /// The underlying driver's `delete` actually removed an object.
+    Deleted,
+    /// The object was already absent (a 404) — nothing was removed by this
+    /// call, whether it never existed or vanished before this call ran.
+    Absent,
+}
+
 /// One object a `JammiObjectStore::list` enumeration found under a prefix —
 /// the engine's own shape (never `object_store::ObjectMeta` directly), so a
 /// caller (only [`crate::store::reconcile`] today — see the never-`LIST`
@@ -119,11 +136,16 @@ impl JammiObjectStore {
     }
 
     /// Convenience: delete `path` if it exists (404 is *not* an error —
-    /// matches the engine's "best-effort cleanup" contract).
-    pub async fn delete_if_exists(&self, path: &ObjectPath) -> Result<(), StorageError> {
+    /// matches the engine's "best-effort cleanup" contract). Returns which
+    /// of the two actually happened ([`DeleteOutcome`]) rather than
+    /// collapsing both into a bare success: a caller that credits bytes or
+    /// keys against this deletion (`store::reconcile`'s accounting) must be
+    /// able to tell "this call removed the object" from "it was already
+    /// gone" — see [`DeleteOutcome`]'s own doc comment.
+    pub async fn delete_if_exists(&self, path: &ObjectPath) -> Result<DeleteOutcome, StorageError> {
         match self.driver.delete(path).await {
-            Ok(()) => Ok(()),
-            Err(object_store::Error::NotFound { .. }) => Ok(()),
+            Ok(()) => Ok(DeleteOutcome::Deleted),
+            Err(object_store::Error::NotFound { .. }) => Ok(DeleteOutcome::Absent),
             Err(e) => Err(StorageError::io(path.to_string(), e)),
         }
     }

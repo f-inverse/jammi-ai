@@ -73,7 +73,7 @@ use crate::error::{JammiError, Result};
 use crate::storage::sidecar_layout::{
     required_sidecar_extensions, sidecar_extensions, SidecarKind,
 };
-use crate::storage::StorageUrl;
+use crate::storage::{DeleteOutcome, StorageUrl};
 use crate::store::layout::{self, TenantSegment};
 use crate::store::{ExpiredRowDeletion, ExpiredRowOutcome, ResultStore};
 use crate::tenant_scope::TenantBinding;
@@ -97,16 +97,32 @@ pub struct ReconcileOptions {
     /// moment `apply=true` would act on it — but the invariant below still
     /// holds at whatever `grace` both calls share, refused or not.
     ///
-    /// **Pinned invariant**: for the same catalog+object-store state and the
-    /// same [`ReconcileOptions::grace`], `apply=false` and `apply=true`
-    /// report the identical [`ReconcileReport::rows_failed`],
-    /// [`ReconcileReport::orphans`], every `*_count` field, and
-    /// [`ReconcileReport::bytes_reclaimed`] — `apply=true`'s numbers are what
-    /// it actually did; `apply=false`'s are what it would have done. Only
-    /// [`ReconcileReport::applied`] itself, and whatever the catalog/object
-    /// store actually look like afterward, differ between the two. A dry-run
-    /// that under-reports what the matching `apply` pass would reclaim is a
-    /// bug in the dry-run arm, not a looser contract for it.
+    /// **Pinned invariant, narrowed to the no-real-delete-failure case**: for
+    /// the same catalog+object-store state and the same
+    /// [`ReconcileOptions::grace`], `apply=false` and `apply=true` report the
+    /// identical [`ReconcileReport::rows_failed`], [`ReconcileReport::orphans`],
+    /// every `*_count` field, and [`ReconcileReport::bytes_reclaimed`] —
+    /// `apply=true`'s numbers are what it actually did; `apply=false`'s are
+    /// what it would have done. Only [`ReconcileReport::applied`] itself, and
+    /// whatever the catalog/object store actually look like afterward, differ
+    /// between the two. A dry-run that under-reports what the matching
+    /// `apply` pass would reclaim is a bug in the dry-run arm, not a looser
+    /// contract for it.
+    ///
+    /// This equality holds only when `apply=true`'s own deletes all
+    /// succeed as [`crate::storage::DeleteOutcome::Deleted`] — a dry-run
+    /// cannot foresee either a REAL delete failure (a permissions error, a
+    /// backend outage) or a key that VANISHES between the listing this pass
+    /// took and the moment `apply=true` tries to delete it (a peer pass, or
+    /// this same pass's own expired-building pre-pass, winning the race).
+    /// Under `apply=true` a real failure moves that key from `orphans` to
+    /// `pending` (left for the next pass to retry) and a vanish drops it from
+    /// every field (nothing was reclaimed, so nothing is credited or
+    /// retried) — either way `apply=true` never OVER-reports what it actually
+    /// freed. `apply=false` has no way to predict either race, so it still
+    /// previews the object as an ordinary orphan at its listed size; the two
+    /// modes diverge on that one key rather than the parity invariant itself
+    /// being violated.
     pub apply: bool,
     /// An orphan candidate younger than this is `pending`, never deleted —
     /// the window a concurrent writer's just-landed bytes have to grow a
@@ -842,10 +858,26 @@ impl ResultStore {
             let key = obj.rel.clone();
             if obj.last_modified <= cutoff {
                 if opts.apply {
-                    if let Err(e) = self.delete_relative(&key).await {
-                        tracing::warn!(key, error = %e, "reconcile: orphan delete failed; left for the next pass");
-                        push_capped(&mut pending, &mut pending_count, &mut truncated, key);
-                        continue;
+                    match self.delete_relative(&key).await {
+                        Ok(DeleteOutcome::Deleted) => {}
+                        // Listed a moment ago, gone now (a peer reconcile
+                        // pass, or the same pass's own expired-building
+                        // pre-pass, won the race and deleted it first): this
+                        // call freed nothing, so it is neither an orphan
+                        // this pass reclaimed nor a failure to retry — esp.
+                        // never credited (esc-484's vanish-window defect).
+                        Ok(DeleteOutcome::Absent) => {
+                            tracing::warn!(
+                                key,
+                                "reconcile: orphan vanished before delete; nothing reclaimed, not credited"
+                            );
+                            continue;
+                        }
+                        Err(e) => {
+                            tracing::warn!(key, error = %e, "reconcile: orphan delete failed; left for the next pass");
+                            push_capped(&mut pending, &mut pending_count, &mut truncated, key);
+                            continue;
+                        }
                     }
                 }
                 bytes_reclaimed += obj.size;
@@ -880,16 +912,18 @@ impl ResultStore {
     }
 
     /// Delete the object at root-relative key `rel` (best-effort; 404 is not
-    /// an error).
-    async fn delete_relative(&self, rel: &str) -> Result<()> {
+    /// an error) and report which of the two actually happened — the caller
+    /// must credit `bytes_reclaimed` only for [`DeleteOutcome::Deleted`],
+    /// never for a key that was already [`DeleteOutcome::Absent`] by the
+    /// time this ran.
+    async fn delete_relative(&self, rel: &str) -> Result<DeleteOutcome> {
         let url = StorageUrl::parse(&format!(
             "{}/{rel}",
             self.root.as_str().trim_end_matches('/')
         ))?;
         let handle = self.open_index(&url)?;
         let path = handle.data_path()?;
-        handle.delete_if_exists(&path).await?;
-        Ok(())
+        Ok(handle.delete_if_exists(&path).await?)
     }
 
     /// Whether EVERY object a `ready` row's materialization contract requires

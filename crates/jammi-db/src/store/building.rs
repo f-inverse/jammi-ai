@@ -293,38 +293,38 @@ impl BuildingTable {
     /// Every object is attempted independently
     /// (`ResultStore::delete_objects_after_cas` never lets one failure
     /// suppress an attempt at the others), but a PARTIAL failure is never
-    /// silently turned into `Ok`: this reads the row's full expected key set
-    /// (`ResultStore::reap_candidate_keys`, the SAME computation
-    /// `reconcile`'s dry-run preview uses) BEFORE the delete — the delete's
-    /// own destructive `purge_segments` step removes the `index_segments`
-    /// rows that name them, so the expected set must be captured first — and
-    /// diffs it against what actually deleted; any key left over (a real
-    /// `delete_if_exists` I/O failure, never a mere 404) fails this call with
-    /// an aggregated error naming every such key, so this doc comment's
-    /// "delete the Parquet ... every ANN segment bundle" is CHECKED, not
-    /// merely asserted. The row itself is still `failed` either way — only
-    /// the byte cleanup is incomplete, left for `reconcile` to retry.
+    /// silently turned into `Ok`: this fails loudly whenever the delete's own
+    /// `DeletionOutcome::errored` is non-empty — a REAL
+    /// `delete_if_exists` I/O failure, never a mere 404 — naming every such
+    /// key, so this doc comment's "delete the Parquet ... every ANN segment
+    /// bundle" is CHECKED, not merely asserted. This deliberately does NOT
+    /// diff against `ResultStore::reap_candidate_keys`'s full candidate
+    /// superset: that superset intentionally enumerates every POSSIBLE
+    /// sidecar extension regardless of this row's actual precision (e.g. a
+    /// `.threshold` companion no `F32` table ever writes), so most of it is
+    /// legitimately [`crate::storage::DeleteOutcome::Absent`] and never a
+    /// failure — `errored` already carries exactly (and only) the keys whose
+    /// delete attempt hit a real error, with no need to separately compute
+    /// what "should" have existed. The row itself is still `failed` either
+    /// way — only the byte cleanup is incomplete, left for `reconcile` to
+    /// retry.
     pub async fn abort(mut self) -> Result<()> {
         self.done.store(true, Ordering::SeqCst);
         self.stop_heartbeat();
         let cas = self.cas();
         self.store.catalog().fail_building_table(&cas).await?;
-        let expected = self
-            .store
-            .reap_candidate_keys(&self.parquet_url, &self.table_name)
-            .await?;
-        let deleted = self
+        let outcome = self
             .store
             .delete_objects_after_cas(&self.parquet_url, &cas)
             .await?;
-        let failed: std::collections::BTreeSet<&String> = expected.difference(&deleted).collect();
-        if failed.is_empty() {
+        if outcome.errored.is_empty() {
             Ok(())
         } else {
             Err(JammiError::Other(format!(
-                "abort: {} object delete(s) failed for '{}': {failed:?}",
-                failed.len(),
-                self.table_name
+                "abort: {} object delete(s) failed for '{}': {:?}",
+                outcome.errored.len(),
+                self.table_name,
+                outcome.errored
             )))
         }
     }

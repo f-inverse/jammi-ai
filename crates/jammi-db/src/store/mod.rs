@@ -51,7 +51,7 @@ use crate::model_task::ModelTask;
 use crate::storage::index_cache::SegmentIndexCache;
 use crate::storage::sidecar_layout::SidecarKind;
 use crate::storage::{
-    self, JammiObjectStore, ObjectParquetWriter, Scheme, StorageRegistry, StorageUrl,
+    self, DeleteOutcome, JammiObjectStore, ObjectParquetWriter, Scheme, StorageRegistry, StorageUrl,
 };
 use crate::tenant::TenantId;
 use crate::tenant_scope::TenantBinding;
@@ -299,6 +299,28 @@ struct RebuildFailure {
     purged: BTreeSet<String>,
 }
 
+/// Every root-relative key one call to [`ResultStore::delete_objects_after_cas`]
+/// or [`ResultStore::purge_segments`] touched, split by what actually
+/// happened to it — never collapsed into one flat set (esc-484): `deleted`
+/// is exactly [`DeleteOutcome::Deleted`], the ONLY set `reconcile`'s
+/// byte-accounting may ever credit; `errored` is every key whose
+/// `delete_if_exists` hit a REAL object-store error (never a mere
+/// [`DeleteOutcome::Absent`]) and so was left in place. A key that was
+/// merely `Absent` (never written for this row's actual precision/state, or
+/// vanished before this call ran) is in NEITHER set — it is not a failure,
+/// and it was not a deletion. `abort()`'s own completeness check needs
+/// exactly `errored`: [`ResultStore::reap_candidate_keys`]'s superset
+/// intentionally enumerates every POSSIBLE sidecar extension regardless of a
+/// row's actual precision, most of which are legitimately `Absent` and were
+/// never expected to exist — diffing THAT superset against `deleted` alone
+/// would flag every merely-inapplicable extension as a false failure, which
+/// is exactly the bug this type exists to prevent.
+#[derive(Debug, Clone, Default)]
+pub(crate) struct DeletionOutcome {
+    pub deleted: BTreeSet<String>,
+    pub errored: BTreeSet<String>,
+}
+
 /// What one call to [`ResultStore::reconcile_expired_building_row`] learned
 /// about a row's objects — distinguishing "credit this as an ordinary
 /// reclaim" from "this pass's promotion consumed these keys, account for
@@ -374,7 +396,23 @@ pub mod reconcile_test_hooks {
             release: Arc::clone(&state.release),
             released: Arc::clone(&state.released),
         };
-        *slot.lock().expect("reconcile test-hook arm lock") = Some(state);
+        let mut guard = slot.lock().expect("reconcile test-hook arm lock");
+        // An occupied slot means an earlier `RaceHandle` for THIS race point
+        // was never released (or was leaked past its test) before a new
+        // test tried to arm the same point again — silently overwriting it
+        // would strand whatever pass is (or later becomes) parked against
+        // the stale `RaceState` with no `RaceHandle` left able to release
+        // it, hanging that pass out to its own 30s park timeout. Panicking
+        // here (test-hooks only; no production path ever calls `arm`) turns
+        // that into an immediate, attributable test failure instead.
+        assert!(
+            guard.is_none(),
+            "reconcile test-hook: race already armed for table '{}' when arming '{table_name}' \
+             on the same slot — release the earlier RaceHandle before arming again",
+            guard.as_ref().map(|s| s.table_name.as_str()).unwrap_or("")
+        );
+        *guard = Some(state);
+        drop(guard);
         handle
     }
 
@@ -480,6 +518,31 @@ pub mod reconcile_test_hooks {
     /// check passes, before its single read of the Parquet's bytes.
     pub(super) async fn maybe_park_before_parquet_reread(table_name: &str) {
         maybe_park(&PARQUET_ARM, table_name).await
+    }
+
+    static POST_CLAIM_PARQUET_ARM: Mutex<Option<RaceState>> = Mutex::new(None);
+
+    /// Arm the "Parquet vanished after claim, before the post-claim row-count
+    /// read" race for `table_name` (esc-484 advisory): the next time
+    /// [`super::ResultStore::reconcile_expired_building_row`]'s `Promote` arm
+    /// reaches [`maybe_park_before_post_claim_row_count`] for THIS table —
+    /// after `claim_expired` has already succeeded, immediately before its
+    /// `storage::reader::count_parquet_rows` read — it parks (bounded to 30s)
+    /// until [`RaceHandle::release`]: the window in which a test can delete
+    /// the row's Parquet out from under an already-claimed recoverer, pinning
+    /// that this vanish reclassifies the row to a reap (under the CLAIM's own
+    /// CAS) rather than aborting the whole reconcile pass with an
+    /// object-store error. Replaces any previous arm on this same race point.
+    pub fn arm_post_claim_parquet_vanish_race(table_name: &str) -> RaceHandle {
+        arm(&POST_CLAIM_PARQUET_ARM, table_name)
+    }
+
+    /// Park if a post-claim Parquet-vanish race is armed for `table_name` (a
+    /// no-op otherwise, and a no-op for every other test/production build).
+    /// Called by `reconcile_expired_building_row`'s `Promote` arm immediately
+    /// after `claim_expired` succeeds, before its post-claim row-count read.
+    pub(super) async fn maybe_park_before_post_claim_row_count(table_name: &str) {
+        maybe_park(&POST_CLAIM_PARQUET_ARM, table_name).await
     }
 }
 
@@ -1206,7 +1269,36 @@ impl ResultStore {
                     warn!(table = table.table_name, "Recovery: claim lost; skipped");
                     return Ok(ExpiredRowDeletion::Untouched);
                 };
-                let row_count = storage::reader::count_parquet_rows(&parquet_handle).await?;
+                // esc-484 advisory: a further race window opens between the
+                // manifest re-read above (now satisfied) and this row-count
+                // read — the claim is held, but the Parquet itself can still
+                // vanish out from under it before this fetch runs. Never
+                // propagate that as an aborting `Err`; re-classify this row
+                // as `Reap` (the same outcome an already-torn Parquet gets)
+                // under the CLAIM's own CAS, exactly like the manifest-vanish
+                // arm above does under the PRE-claim CAS.
+                #[cfg(feature = "test-hooks")]
+                reconcile_test_hooks::maybe_park_before_post_claim_row_count(&table.table_name)
+                    .await;
+                let row_count = match storage::reader::count_parquet_rows(&parquet_handle).await {
+                    Ok(n) => n,
+                    Err(storage::StorageError::Io {
+                        source: object_store::Error::NotFound { .. },
+                        ..
+                    }) => {
+                        warn!(
+                            table = table.table_name,
+                            "Recovery: classified Promote but its Parquet vanished after claim, \
+                             before the post-claim row-count read; re-classifying as Reap"
+                        );
+                        let reaped = self
+                            .reap_after_fail_cas(&recovered.cas(), &parquet_url)
+                            .await?;
+                        recovered.abandon();
+                        return Ok(ExpiredRowDeletion::Reaped(reaped));
+                    }
+                    Err(e) => return Err(e.into()),
+                };
                 // Rebuild the ANN index as a fresh single segment if this is
                 // an embedding table (self-healing even if its segment set
                 // never landed, or landed torn). Renew before the
@@ -1363,7 +1455,7 @@ impl ResultStore {
             Err(e) => return Err(e),
         }
         match self.delete_objects_after_cas(parquet_url, cas).await {
-            Ok(deleted) => Ok(deleted),
+            Ok(outcome) => Ok(outcome.deleted),
             Err(e) => {
                 warn!(
                     table = cas.table,
@@ -1678,7 +1770,8 @@ impl ResultStore {
     /// [`Self::append_segment`]). Returns the root-relative keys actually
     /// deleted, per extension, tried independently of one another so a
     /// single failed delete never hides whether its siblings succeeded — the
-    /// exact set `reconcile`'s accounting must credit, never a superset.
+    /// exact set `reconcile`'s accounting must credit, never a superset — plus
+    /// every key that hit a REAL delete error (see [`DeletionOutcome`]).
     ///
     /// A catalog `index_segments` row whose `index_path` does not even parse
     /// as a [`StorageUrl`] is corruption, not a row to quietly skip past: this
@@ -1687,8 +1780,9 @@ impl ResultStore {
     /// this table's segment set could not be enumerated, rather than
     /// silently under-deleting (and `reconcile`'s accounting silently
     /// under-crediting) a row whose catalog state is already broken.
-    async fn purge_segments(&self, cas: &ResultTableCas) -> Result<BTreeSet<String>> {
+    async fn purge_segments(&self, cas: &ResultTableCas) -> Result<DeletionOutcome> {
         let mut deleted = BTreeSet::new();
+        let mut errored = BTreeSet::new();
         for seg in self.catalog.list_index_segments(&cas.table).await? {
             let url = StorageUrl::parse(&seg.index_path).map_err(|e| {
                 JammiError::Other(format!(
@@ -1703,25 +1797,38 @@ impl ResultStore {
                     continue;
                 };
                 match handle.delete_if_exists(&path).await {
-                    Ok(()) => {
+                    Ok(DeleteOutcome::Deleted) => {
                         if let Ok(sib) = layout::sidecar_url(&url, ext) {
                             if let Some(rel) = reconcile::relative_to(&self.root, &sib) {
                                 deleted.insert(rel);
                             }
                         }
                     }
-                    Err(e) => warn!(
-                        table = cas.table,
-                        segment = seg.segment_id,
-                        extension = ext,
-                        error = %e,
-                        "purge_segments: sidecar delete failed; left for reconcile to retry"
-                    ),
+                    // Already gone (a concurrent purge, or a race with this
+                    // very reconcile pass) — this call removed nothing, so
+                    // it is never inserted into `deleted`: the caller's
+                    // accounting (`credit_reaped`) must never credit a
+                    // sidecar this call did not actually free.
+                    Ok(DeleteOutcome::Absent) => {}
+                    Err(e) => {
+                        warn!(
+                            table = cas.table,
+                            segment = seg.segment_id,
+                            extension = ext,
+                            error = %e,
+                            "purge_segments: sidecar delete failed; left for reconcile to retry"
+                        );
+                        if let Ok(sib) = layout::sidecar_url(&url, ext) {
+                            if let Some(rel) = reconcile::relative_to(&self.root, &sib) {
+                                errored.insert(rel);
+                            }
+                        }
+                    }
                 }
             }
         }
         self.catalog.delete_index_segments(cas).await?;
-        Ok(deleted)
+        Ok(DeletionOutcome { deleted, errored })
     }
 
     /// Delete a result table's objects — the Parquet, its
@@ -1731,49 +1838,78 @@ impl ResultStore {
     /// `reconcile(apply=true)`): the caller has ALREADY performed the
     /// one-row CAS that licenses this deletion. 404 is not an error.
     ///
-    /// Returns EXACTLY the root-relative keys actually deleted — never a key
-    /// whose `delete_if_exists` errored. Each of the three deletions (Parquet,
-    /// manifest sidecar, segment set) is attempted independently, so one
-    /// failure never suppresses an attempt at the others; `reconcile`'s
-    /// pre-pass accounting credits only what this function reports here,
-    /// which is why the accounting set can never exceed the deletion set.
+    /// Returns a [`DeletionOutcome`] whose `deleted` is EXACTLY the
+    /// root-relative keys [`DeleteOutcome::Deleted`] this call actually
+    /// removed — never a key whose `delete_if_exists` errored, AND never a
+    /// key that was already [`DeleteOutcome::Absent`] (a 404), however that
+    /// came to be: never written, already cleaned by a peer, or vanished in
+    /// the window between whatever classified this row and this very delete
+    /// call (esc-484) — and whose `errored` is every key that hit a REAL
+    /// delete failure (see [`DeletionOutcome`]'s own doc comment for why the
+    /// two are never merged). Each of the three deletions (Parquet, manifest
+    /// sidecar, segment set) is attempted independently, so one failure never
+    /// suppresses an attempt at the others; `reconcile`'s pre-pass accounting
+    /// credits only `deleted`, which is why the accounting set can never
+    /// exceed the TRUE deletion set.
     pub(crate) async fn delete_objects_after_cas(
         &self,
         parquet_url: &StorageUrl,
         cas: &ResultTableCas,
-    ) -> Result<BTreeSet<String>> {
+    ) -> Result<DeletionOutcome> {
         let mut deleted = BTreeSet::new();
+        let mut errored = BTreeSet::new();
         let parquet_handle = self.open_parquet(parquet_url)?;
         let path = parquet_handle.data_path()?;
         match parquet_handle.delete_if_exists(&path).await {
-            Ok(()) => {
+            Ok(DeleteOutcome::Deleted) => {
                 if let Some(rel) = reconcile::relative_to(&self.root, parquet_url) {
                     deleted.insert(rel);
                 }
             }
-            Err(e) => warn!(
-                table = cas.table,
-                error = %e,
-                "delete_objects_after_cas: Parquet delete failed; left for reconcile to retry"
-            ),
+            // Already gone by the time this delete ran (e.g. vanished in the
+            // window between `classify_expired_row`'s read and this CAS-
+            // licensed reap) — this call freed nothing, so the key is never
+            // inserted into `deleted`: crediting it here would report bytes
+            // this pass never actually reclaimed (esc-484).
+            Ok(DeleteOutcome::Absent) => {}
+            Err(e) => {
+                warn!(
+                    table = cas.table,
+                    error = %e,
+                    "delete_objects_after_cas: Parquet delete failed; left for reconcile to retry"
+                );
+                if let Some(rel) = reconcile::relative_to(&self.root, parquet_url) {
+                    errored.insert(rel);
+                }
+            }
         }
         let sidecar = materialization_sidecar_path(&parquet_handle)?;
         match parquet_handle.delete_if_exists(&sidecar).await {
-            Ok(()) => {
+            Ok(DeleteOutcome::Deleted) => {
                 if let Ok(sidecar_url) = layout::sidecar_url(parquet_url, "materialization.json") {
                     if let Some(rel) = reconcile::relative_to(&self.root, &sidecar_url) {
                         deleted.insert(rel);
                     }
                 }
             }
-            Err(e) => warn!(
-                table = cas.table,
-                error = %e,
-                "delete_objects_after_cas: manifest sidecar delete failed; left for reconcile to retry"
-            ),
+            Ok(DeleteOutcome::Absent) => {}
+            Err(e) => {
+                warn!(
+                    table = cas.table,
+                    error = %e,
+                    "delete_objects_after_cas: manifest sidecar delete failed; left for reconcile to retry"
+                );
+                if let Ok(sidecar_url) = layout::sidecar_url(parquet_url, "materialization.json") {
+                    if let Some(rel) = reconcile::relative_to(&self.root, &sidecar_url) {
+                        errored.insert(rel);
+                    }
+                }
+            }
         }
-        deleted.extend(self.purge_segments(cas).await?);
-        Ok(deleted)
+        let segments = self.purge_segments(cas).await?;
+        deleted.extend(segments.deleted);
+        errored.extend(segments.errored);
+        Ok(DeletionOutcome { deleted, errored })
     }
 
     /// The dry-run twin of [`Self::delete_objects_after_cas`] (via
@@ -1821,11 +1957,18 @@ impl ResultStore {
     /// recall (a graph a caller believes is `Int8` reopened as `F32`).
     ///
     /// Returns the root-relative keys [`Self::purge_segments`] actually
-    /// deleted (esc-484): the caller ([`Self::reconcile_expired_building_row`])
-    /// diffs this against the fresh segment `0` it is about to rewrite (or
-    /// never rewrites, for a zero-row Parquet) to compute what this
-    /// promotion truly reclaims, checked against `classify_expired_row`'s
-    /// prediction rather than assumed.
+    /// deleted (esc-484 design revision: a promotion is not a reclaim). The
+    /// caller ([`Self::reconcile_expired_building_row`]) records this set
+    /// verbatim into the pass's `promoted_purged` accumulator — never
+    /// diffed against a fresh segment `0` it is about to rewrite, and never
+    /// checked against `classify_expired_row`'s classification, which
+    /// predicts NOTHING about what this rebuild will purge (its `Promote`
+    /// payload is simply the row's currently-referenced key set). Those keys
+    /// are excluded from this pass's accounting entirely — never `orphans`,
+    /// never `bytes_reclaimed` — because they are the promotion's own
+    /// internal bookkeeping, not bytes this pass reclaimed on the row's
+    /// behalf; a later pass's ordinary age-gated orphan arm is what would
+    /// credit them, and only if `purge_segments` itself failed to delete one.
     ///
     /// On `Err`, the [`RebuildFailure`] payload carries the SAME `purged` set
     /// alongside the error (esc-484 item (b)): `purge_segments` runs BEFORE
@@ -1853,7 +1996,8 @@ impl ResultStore {
             .map_err(|error| RebuildFailure {
                 error,
                 purged: BTreeSet::new(),
-            })?;
+            })?
+            .deleted;
 
         self.write_fresh_segment_zero(recovered, parquet_handle, table, dimensions)
             .await

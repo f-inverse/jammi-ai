@@ -489,7 +489,12 @@ async fn promote_of_a_stale_second_segment_reports_nothing_this_pass() {
 /// `0` used, so the ORIGINAL (unwritten-over, since the write also failed)
 /// segment `0` bytes stay legitimately referenced/protected forever after,
 /// an existing `append_segment` non-atomicity this fix neither causes nor
-/// remedies. Segment `1`'s catalog row has no such replacement — it is
+/// remedies: the catalog row now claims the FRESH row_count (5, the whole
+/// rebuilt table) for bytes that are still the OLD 2-row bundle underneath,
+/// and no reconcile pass detects the desync (`required_row_objects_present`
+/// checks presence only, never the persisted `row_count` against the
+/// bundle's own actual count) — ledgered, not fixed here, as esc-102.
+/// Segment `1`'s catalog row has no such replacement — it is
 /// genuinely unreferenced once its row is purged — so it, alone, is what a
 /// later pass reclaims.
 #[tokio::test]
@@ -1062,6 +1067,11 @@ async fn parquet_vanished_during_the_classify_window_reaps_never_aborts_the_pass
     // reached anyway.
     let (table_name, parquet_local) =
         promotable_building_row_fixture(&store, &catalog, "docs-parquet-race").await;
+    let manifest_local = parquet_local.replace(".parquet", ".materialization.json");
+    // Measured BEFORE the pass ever touches either object — the manifest is
+    // untouched until after the race releases, so this is its true on-disk
+    // size, never a size inferred after the fact.
+    let manifest_size = std::fs::metadata(&manifest_local).unwrap().len();
 
     let race = jammi_db::store::reconcile_test_hooks::arm_parquet_vanish_race(&table_name);
     let store_clone = store.clone();
@@ -1098,6 +1108,93 @@ async fn parquet_vanished_during_the_classify_window_reaps_never_aborts_the_pass
         jammi_db::catalog::status::ResultTableStatus::Failed.to_string(),
         "a Parquet that vanished during the classify window must reap, never abort the pass or \
          yield a manifest-less promotion: {report:?}"
+    );
+
+    // esc-484 (round-8 audit): the Parquet vanished before `delete_if_exists`
+    // ever ran against it — this call removed NOTHING, so it must appear in
+    // NO report field (never `orphans`, never counted into
+    // `bytes_reclaimed`), while the manifest sidecar (still genuinely
+    // present at delete time) is a REAL deletion this pass performed and
+    // must be the ONLY thing credited. A pre-fix build maps the vanished
+    // Parquet's `NotFound` into a false `Deleted`-equivalent credit here,
+    // reporting `bytes_reclaimed` inflated by the Parquet's listed size on
+    // top of the manifest's — this assertion is RED against that build.
+    assert!(
+        !report.orphans.iter().any(|k| k.ends_with(".parquet")),
+        "a Parquet this pass never actually deleted must never appear in `orphans`: {report:?}"
+    );
+    assert!(
+        report
+            .orphans
+            .iter()
+            .any(|k| k.ends_with(".materialization.json")),
+        "the manifest sidecar this pass DID actually delete must be credited: {report:?}"
+    );
+    assert_eq!(
+        report.bytes_reclaimed, manifest_size,
+        "bytes_reclaimed must equal exactly the bytes this pass truly freed (the manifest \
+         sidecar alone) — never the vanished Parquet's listing-snapshot size on top: {report:?}"
+    );
+}
+
+/// esc-484 advisory: a further race window opens between the manifest
+/// re-read succeeding (the claim is already held) and the post-claim
+/// row-count read (`storage::reader::count_parquet_rows`, at `mod.rs`'s
+/// `Promote` arm) — the Parquet can still vanish out from under an
+/// already-claimed recoverer right there. That must re-classify to `Reap`
+/// under the CLAIM's own CAS — never abort the whole pass, and never a
+/// row-count-less promotion. Pinned directly via the `reconcile_test_hooks`
+/// rendezvous (never merely inferred): the Parquet truly exists through the
+/// claim and the manifest re-read, and is deleted only once the pass has
+/// parked at the documented post-claim re-read point.
+#[cfg(feature = "test-hooks")]
+#[tokio::test]
+async fn parquet_vanished_after_claim_before_post_claim_row_count_re_classifies_to_reap() {
+    let dir = tempdir().unwrap();
+    let catalog = Arc::new(Catalog::open(dir.path()).await.unwrap());
+    let store = ResultStore::new(dir.path(), Arc::clone(&catalog), AnnIndexConfig::default())
+        .unwrap()
+        .with_lease_intervals(short_lease());
+
+    let (table_name, parquet_local) =
+        promotable_building_row_fixture(&store, &catalog, "docs-post-claim-race").await;
+
+    let race =
+        jammi_db::store::reconcile_test_hooks::arm_post_claim_parquet_vanish_race(&table_name);
+    let store_clone = store.clone();
+    let handle = tokio::spawn(async move {
+        store_clone
+            .reconcile(ReconcileOptions {
+                apply: true,
+                grace: Duration::from_secs(3),
+            })
+            .await
+    });
+
+    race.wait_parked().await;
+    assert!(
+        race.is_parked(),
+        "the reconcile pass never reached the documented post-claim row-count re-read point"
+    );
+    std::fs::remove_file(&parquet_local).unwrap();
+    race.release();
+
+    let report = handle
+        .await
+        .unwrap()
+        .expect("the pass must complete, never abort, over a benign post-claim vanish");
+
+    let row = store
+        .catalog()
+        .get_result_table(&table_name)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        row.status,
+        jammi_db::catalog::status::ResultTableStatus::Failed.to_string(),
+        "a Parquet that vanished after claim, before the post-claim row-count read, must reap, \
+         never abort the pass or yield a row-count-less promotion: {report:?}"
     );
 }
 

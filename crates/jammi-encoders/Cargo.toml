@@ -43,6 +43,13 @@ thiserror.workspace = true
 [dev-dependencies]
 candle-transformers.workspace = true
 hf-hub.workspace = true
+# `dirs::home_dir()` -- the live-hub-tests harness's non-panicking root
+# fallback (HF_HUB_CACHE -> HF_HOME/hub -> dirs::home_dir() -> a named test
+# failure), so it never reaches `hf_hub::Cache::from_env()`'s own
+# `Cache::default()` panic path. Already resolved transitively through
+# hf-hub 0.5 in Cargo.lock (6.0.0) -- pinned here as a direct dev-dependency
+# only because this test harness now calls it by name.
+dirs = "6"
 # NO `half` here: it is a regular dependency above (the dtype-following mask
 # sentinels), and a `[dependencies]` entry is already visible to tests,
 # benches and examples. A duplicate `[dev-dependencies]` line only invites

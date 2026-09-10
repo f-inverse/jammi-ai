@@ -7,27 +7,53 @@ workspace ships every publishable crate at the same
 ## [Unreleased]
 
 ### Added
-- **`HubSource`'s Hub cache proven warm across a restart, `HF_HOME` proven end-to-end, and
-  `HF_HUB_OFFLINE` honoured as the env fallback for `[models] offline` (#481).**
-  `crates/jammi-ai/tests/it/hub_source.rs` gains two hermetic wiremock oracles:
+- **`HubSource`'s Hub cache proven warm across a restart, `HF_HOME`/`HF_HUB_CACHE` proven
+  end-to-end, and `HF_HUB_OFFLINE`/`TRANSFORMERS_OFFLINE` honoured as the env fallback for
+  `[models] offline` (#481).**
+  `crates/jammi-ai/tests/it/hub_source.rs` gains hermetic wiremock oracles:
   `hf_home_env_drives_the_cache_root_end_to_end` drives `HF_HOME` through
   `HubSource::from_config`'s injected `env` closure (never `std::env::set_var`) and asserts the
-  fetched file lands under `{HF_HOME}/hub/…`; `warm_cache_across_a_second_hub_source_issues_no_requests`
-  builds a SECOND `HubSource` over the same `hub_cache_dir` and asserts it issues ZERO new
-  requests against the mock server, proving a process restart with a mounted cache volume never
-  re-downloads. `ModelsConfig::offline` (`crates/jammi-db/src/config/mod.rs`) moves from `bool` to
+  fetched file lands under `{HF_HOME}/hub/…`; `hf_hub_cache_env_drives_the_cache_root_directly_no_hub_subdir_appended`
+  does the same for `HF_HUB_CACHE`, asserting the fetched file lands directly under
+  `{HF_HUB_CACHE}/models--…` with NO `hub/` subdirectory appended;
+  `warm_cache_across_a_second_hub_source_issues_no_requests` builds a SECOND `HubSource` over the
+  same `hub_cache_dir`, in the SAME process, and asserts it issues ZERO new requests against the
+  mock server — proven scope: a second `HubSource` over the same cache root re-uses it without a
+  fetch, and that stands in faithfully for a process restart with a mounted cache volume because
+  `HubSource` holds nothing process-global (no static/thread-local state; every field is
+  constructed fresh from `[models]`+`env` in `from_config`), so two independently-constructed
+  `HubSource`s in one process and two `HubSource`s across a real restart take the identical code
+  path. `ModelsConfig::offline` (`crates/jammi-db/src/config/mod.rs`) moves from `bool` to
   `Option<bool>`, matching the other three `[models]` fields' own `Option`-typed "config beats
-  env" precedence: `Some(_)` wins outright in either direction over the new `HF_HUB_OFFLINE`
-  environment fallback (accepted values `"1"` or a case-insensitive `"true"`, mirroring
-  `huggingface_hub`'s own convention — hf-hub 0.5, the Rust crate, does not read this variable at
-  all), and only an omitted `offline` key falls back to it. `crates/jammi-encoders/tests/live_real_clap.rs`'s
-  `fetch_real_model` no longer calls raw `hf_hub::api::sync::Api::new()` (which ignored
-  `HF_ENDPOINT`/`HF_TOKEN` and panicked without `HOME`) — it builds the jammi-encoders-local
-  mirror of `HubSource`'s chain inline (`HF_HUB_CACHE`/`HF_HOME`/default cache root,
-  `HF_ENDPOINT`, `HF_TOKEN`), since jammi-encoders cannot depend on jammi-ai. Docs
-  (`docs/guide/src/local-models.md`) gain the `JAMMI_MODELS__HUB_*` env-override tier, the
-  `HF_HUB_OFFLINE` precedence row, and fix the `hub_cache_dir = "/var/cache/jammi/hub"` examples
-  (here and in `crates/jammi-db/src/config/mod.rs`'s own doc comment) that resolved to
+  env" precedence: `Some(_)` wins outright in either direction over the `HF_HUB_OFFLINE`/
+  `TRANSFORMERS_OFFLINE` environment fallback (accepted values are `huggingface_hub`'s own
+  `ENV_VARS_TRUE_VALUES` set — `"1"`, `"on"`, `"yes"`, `"true"`, case-insensitively, whitespace
+  trimmed — not the narrower `"1"`/case-insensitive-`"true"` this landed with first, which
+  rejected `huggingface_hub`-valid spellings like `HF_HUB_OFFLINE=ON` and fell open to a live
+  fetch; `TRANSFORMERS_OFFLINE` is consulted only when `HF_HUB_OFFLINE` is itself unset from the
+  environment, mirroring `huggingface_hub`'s own alias — hf-hub 0.5, the Rust crate, does not
+  read either variable at all), and only an omitted `offline` key falls back to them. The cache
+  root chain gains an `HF_HUB_CACHE` tier between `hub_cache_dir` and `HF_HOME`
+  (`hub_cache_dir` (config, `hub/` appended) → `HF_HUB_CACHE` (used AS the cache root directly,
+  nothing appended, matching `huggingface_hub`'s own `HF_HUB_CACHE` convention) → `HF_HOME`
+  (`hub/` appended) → the platform home directory (`hub/` appended)) — `huggingface_hub` itself
+  honours `HF_HUB_CACHE` above `HF_HOME`, and this branch's own `jammi-encoders` live-hub harness
+  already read it at that precedence, so `HubSource` previously ignored a variable its sibling
+  harness relied on. `crates/jammi-encoders/tests/live_real_clap.rs`'s `fetch_real_model` no
+  longer calls raw `hf_hub::api::sync::Api::new()` (which ignored `HF_ENDPOINT`/`HF_TOKEN`) or
+  `hf_hub::Cache::from_env()` (which still panics via `Cache::default()`'s
+  `dirs::home_dir().expect(..)` when neither `HF_HUB_CACHE` nor `HF_HOME` nor `HOME` resolves) —
+  it now resolves `HF_HUB_CACHE` → `HF_HOME`/`hub` → a checked `dirs::home_dir()` itself, failing
+  with a named-variable test failure instead of a panic when none resolves. This is a SEPARATE
+  jammi-encoders-local implementation, not a shared mirror of `HubSource`'s chain (jammi-encoders
+  cannot depend on jammi-ai), and it disclosably diverges from `HubSource` in two ways: its
+  cache-root fallback is hand-written rather than sharing `HubSource`'s own tested code path, and
+  its token fallback stops at `HF_TOKEN` with no cache-`token`-file tier. Docs
+  (`docs/guide/src/local-models.md`, `docs/guide/src/configuration.md`) gain the
+  `JAMMI_MODELS__HUB_*` env-override tier, the `HF_HUB_CACHE` precedence step, the exact
+  `HF_HUB_OFFLINE`/`TRANSFORMERS_OFFLINE` truthy set and alias, and fix the
+  `hub_cache_dir = "/var/cache/jammi/hub"` examples (here, `configuration.md`, and
+  `crates/jammi-db/src/config/mod.rs`'s own doc comment) that resolved to
   `/var/cache/jammi/hub/hub` once the `hub/` subdirectory `HubSource` appends is accounted for.
 - **A tested Shape B Compose stack, `jammi-server probe`, `jammi-server serve` as the
   default subcommand, a reference-topologies guide page, and supply-chain

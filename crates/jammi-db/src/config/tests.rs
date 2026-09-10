@@ -2009,7 +2009,7 @@ fn models_config_round_trips_and_defaults() {
         r#"
         [models]
         hub_endpoint = "https://huggingface.co"
-        hub_cache_dir = "/var/cache/jammi/hub"
+        hub_cache_dir = "/var/cache/jammi"
         hub_token = "hf_inline"
         offline = true
     "#,
@@ -2022,7 +2022,7 @@ fn models_config_round_trips_and_defaults() {
     );
     assert_eq!(
         cfg.models.hub_cache_dir,
-        Some(PathBuf::from("/var/cache/jammi/hub"))
+        Some(PathBuf::from("/var/cache/jammi"))
     );
     assert!(matches!(
         cfg.models.hub_token,

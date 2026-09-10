@@ -65,26 +65,57 @@ fn row_cosine_min(got: &Tensor, golden: &Tensor) -> candle_core::Result<f32> {
 ///
 /// jammi-encoders cannot depend on jammi-ai (the dependency runs the other
 /// way: jammi-ai depends on jammi-encoders), so this cannot call
-/// `jammi_ai::model::hub::HubSource` — this is the jammi-encoders-LOCAL
-/// mirror of that same three-tier chain, built inline from `hf_hub` directly
+/// `jammi_ai::model::hub::HubSource` directly. This harness is a SEPARATE,
+/// jammi-encoders-local implementation of the same idea (fall back through
+/// `HF_HUB_CACHE`/`HF_HOME`/the platform home directory, in that order,
+/// never `hf_hub`'s own panicking defaults), built inline from `hf_hub`
 /// rather than the bare `hf_hub::api::sync::Api::new()` this replaced (which
 /// ignored `HF_ENDPOINT`/`HF_TOKEN` entirely — hf-hub 0.5 never reads
-/// `HF_TOKEN` on its own — and panics outright via
-/// `hf_hub::Cache::default()`'s `dirs::home_dir().expect(..)` when `HOME` is
-/// unset):
-///   - cache root: `HF_HUB_CACHE` (used directly as the cache dir) ->
-///     `hf_hub::Cache::from_env()` (which itself reads `HF_HOME`, then falls
-///     back to the platform home dir's `.cache/huggingface`)
+/// `HF_TOKEN` on its own). It disclosably diverges from `HubSource` in two
+/// ways: (1) the cache-root fallback below is hand-written rather than
+/// shared code — `resolve_root_with`'s injected-`home_dir` unit-test seam
+/// lives in `jammi-ai`, unreachable from here — and (2) the token fallback
+/// stops at `HF_TOKEN` (no cache `token`-file fallback); neither is a claim
+/// that the two chains behave identically end to end.
+///
+///   - cache root: `HF_HUB_CACHE` (used directly as the cache dir, nothing
+///     appended) -> `HF_HOME` (a `hub/` subdirectory appended) ->
+///     `dirs::home_dir()` (`.cache/huggingface/hub` appended, CHECKED rather
+///     than the `.expect(..)` `hf_hub::Cache::default()` panics with) -> a
+///     named test failure listing all three variables. Never reaches
+///     `hf_hub::Cache::from_env()`/`Cache::default()` at all, so this
+///     harness cannot inherit `hf_hub::Cache::default()`'s own
+///     `dirs::home_dir().expect(..)` panic (hf-hub `lib.rs:202-209`) the way
+///     a direct call to `Cache::from_env()` still would when neither
+///     `HF_HUB_CACHE` nor `HF_HOME` nor a resolvable home directory is
+///     present.
 ///   - endpoint: `HF_ENDPOINT` -> hf-hub's own default
 ///     (`https://huggingface.co`)
 ///   - token: `HF_TOKEN` only -- this harness does not fall back further to
 ///     the cache's own `token` file; `live-hub-tests` runs are expected to
 ///     set `HF_TOKEN` explicitly (or rely on this repo being public)
 fn fetch_real_model() -> (std::path::PathBuf, std::path::PathBuf) {
-    let cache = match std::env::var("HF_HUB_CACHE") {
-        Ok(dir) => hf_hub::Cache::new(std::path::PathBuf::from(dir)),
-        Err(_) => hf_hub::Cache::from_env(),
-    };
+    let root = std::env::var("HF_HUB_CACHE")
+        .ok()
+        .map(std::path::PathBuf::from)
+        .or_else(|| {
+            std::env::var("HF_HOME")
+                .ok()
+                .map(|home| std::path::PathBuf::from(home).join("hub"))
+        })
+        .or_else(|| {
+            dirs::home_dir().map(|home| home.join(".cache").join("huggingface").join("hub"))
+        })
+        .unwrap_or_else(|| {
+            panic!(
+                "cannot resolve a Hugging Face Hub cache root for this live test: \
+                 HF_HUB_CACHE is unset, HF_HOME is unset, and dirs::home_dir() found no home \
+                 directory (HOME/USERPROFILE unset, and no password-database entry for this \
+                 user) -- set one of HF_HUB_CACHE, HF_HOME, or HOME/USERPROFILE explicitly to \
+                 run this live-hub-tests harness"
+            )
+        });
+    let cache = hf_hub::Cache::new(root);
     let mut builder = hf_hub::api::sync::ApiBuilder::from_cache(cache);
     if let Ok(endpoint) = std::env::var("HF_ENDPOINT") {
         builder = builder.with_endpoint(endpoint);

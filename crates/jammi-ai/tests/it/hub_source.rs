@@ -252,6 +252,142 @@ async fn hf_hub_offline_env_refuses_by_name_with_no_config_override() {
     }
 }
 
+/// #481 fix round 2, BLOCK reproducer: `HF_HUB_OFFLINE=ON` — a truthy value
+/// per `huggingface_hub`'s own `ENV_VARS_TRUE_VALUES = {"1","ON","YES","TRUE"}`
+/// (`huggingface_hub/constants.py:12`, `_is_true` at `:16-19`) — must refuse
+/// offline by name, exactly like `HF_HUB_OFFLINE=1` above. Before this fix,
+/// `is_hf_hub_offline_truthy` accepted only `"1"` and a case-insensitive
+/// `"true"`, so `HF_HUB_OFFLINE=ON` silently resolved `offline=false` and the
+/// resolver proceeded to a live fetch — fail-open on the air-gap knob.
+///
+/// RED at 6519633d (this test's own first assertion, `offline_hub.offline()`,
+/// was the failure -- resolution never even reached the resolver):
+/// ```text
+/// thread '...::hf_hub_offline_on_refuses_by_name_with_no_config_override' panicked at crates/jammi-ai/tests/it/hub_source.rs:...:
+/// HF_HUB_OFFLINE=ON must be honoured when [models] offline is unset -- widen is_hf_hub_offline_truthy to accept huggingface_hub's ENV_VARS_TRUE_VALUES
+/// ```
+#[tokio::test]
+async fn hf_hub_offline_on_refuses_by_name_with_no_config_override() {
+    let dir = tempfile::tempdir().unwrap();
+    let catalog = Arc::new(Catalog::open(dir.path()).await.unwrap());
+    let env = |k: &str| (k == "HF_HUB_OFFLINE").then(|| "ON".to_string());
+    let offline_hub = HubSource::from_config(&offline_test_models_config(), &env).unwrap();
+    assert!(
+        offline_hub.offline(),
+        "HF_HUB_OFFLINE=ON must be honoured when [models] offline is unset -- widen \
+         is_hf_hub_offline_truthy to accept huggingface_hub's ENV_VARS_TRUE_VALUES"
+    );
+    let resolver =
+        ModelResolver::new(catalog, crate::common::test_artifact_store(), offline_hub).unwrap();
+
+    let err = match resolver
+        .resolve(
+            &ModelSource::hf("acme/env-only-offline-on"),
+            ModelTask::TextEmbedding,
+            None,
+        )
+        .await
+    {
+        Ok(_) => panic!("expected an offline refusal, got a resolved model"),
+        Err(e) => e,
+    };
+    match err {
+        JammiError::Model { model_id, message } => {
+            assert_eq!(model_id, "acme/env-only-offline-on");
+            assert!(
+                message.contains("offline") && message.contains("acme/env-only-offline-on"),
+                "expected the offline refusal to name the repo id, got: {message}"
+            );
+        }
+        other => panic!("expected JammiError::Model, got {other:?}"),
+    }
+}
+
+/// #481 fix round 2: `TRANSFORMERS_OFFLINE=1`, with `HF_HUB_OFFLINE` and
+/// `[models] offline` both unset, must be honoured as the same fallback
+/// `huggingface_hub` itself applies for this variable.
+#[tokio::test]
+async fn transformers_offline_env_refuses_by_name_with_no_config_override() {
+    let dir = tempfile::tempdir().unwrap();
+    let catalog = Arc::new(Catalog::open(dir.path()).await.unwrap());
+    let env = |k: &str| (k == "TRANSFORMERS_OFFLINE").then(|| "1".to_string());
+    let offline_hub = HubSource::from_config(&offline_test_models_config(), &env).unwrap();
+    assert!(
+        offline_hub.offline(),
+        "TRANSFORMERS_OFFLINE=1 must be honoured when HF_HUB_OFFLINE and [models] offline \
+         are both unset"
+    );
+    let resolver =
+        ModelResolver::new(catalog, crate::common::test_artifact_store(), offline_hub).unwrap();
+
+    let err = match resolver
+        .resolve(
+            &ModelSource::hf("acme/transformers-offline-only"),
+            ModelTask::TextEmbedding,
+            None,
+        )
+        .await
+    {
+        Ok(_) => panic!("expected an offline refusal, got a resolved model"),
+        Err(e) => e,
+    };
+    match err {
+        JammiError::Model { model_id, message } => {
+            assert_eq!(model_id, "acme/transformers-offline-only");
+            assert!(
+                message.contains("offline") && message.contains("acme/transformers-offline-only"),
+                "expected the offline refusal to name the repo id, got: {message}"
+            );
+        }
+        other => panic!("expected JammiError::Model, got {other:?}"),
+    }
+}
+
+/// #481 fix round 2, advisory A4: a fetch driven entirely by `HF_HUB_CACHE`
+/// (no `[models] hub_cache_dir`, no `HF_HOME`) must land the downloaded file
+/// directly under that directory (`models--…` immediately inside it) — no
+/// `hub/` subdirectory appended, matching `huggingface_hub`'s own
+/// `HF_HUB_CACHE` convention.
+#[tokio::test(flavor = "multi_thread")]
+async fn hf_hub_cache_env_drives_the_cache_root_directly_no_hub_subdir_appended() {
+    let server = MockServer::start().await;
+    mount_repo_file(&server, REPO_ID, FILENAME, BODY).await;
+
+    let hf_hub_cache = tempfile::tempdir().unwrap();
+    let hf_hub_cache_path = hf_hub_cache.path().to_path_buf();
+    let config = ModelsConfig {
+        hub_endpoint: Some(server.uri()),
+        hub_cache_dir: None,
+        hub_token: None,
+        offline: None,
+    };
+    let env = move |k: &str| {
+        (k == "HF_HUB_CACHE").then(|| hf_hub_cache_path.to_str().unwrap().to_string())
+    };
+    let hub = HubSource::from_config(&config, &env).unwrap();
+
+    let downloaded = tokio::task::spawn_blocking({
+        let hub = hub.clone();
+        move || hub.api().model(REPO_ID.to_string()).get(FILENAME).unwrap()
+    })
+    .await
+    .unwrap();
+
+    let expected_repo_dir = hf_hub_cache
+        .path()
+        .join(format!("models--{}", REPO_ID.replace('/', "--")));
+    assert!(
+        downloaded.starts_with(&expected_repo_dir),
+        "expected the downloaded file to land directly under {{HF_HUB_CACHE}}/models--… (no \
+         hub/ subdirectory), got {downloaded:?}, expected under {expected_repo_dir:?}"
+    );
+    assert!(
+        !downloaded.starts_with(hf_hub_cache.path().join("hub")),
+        "HF_HUB_CACHE must NOT get a hub/ subdirectory appended -- got {downloaded:?}"
+    );
+    assert_eq!(std::fs::read(&downloaded).unwrap(), BODY);
+}
+
 /// #481 acceptance bullet 3, second control (the direction): `[models]
 /// offline = false` EXPLICIT wins over `HF_HUB_OFFLINE=1` in the environment
 /// — config wins, matching `resolve_root`/`resolve_endpoint`/`resolve_token`'s

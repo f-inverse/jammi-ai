@@ -13,14 +13,18 @@
 //!
 //! # Precedence
 //!
-//! **Cache root** (a `hub/` subdirectory is appended before it becomes the
-//! `hf_hub::Cache`):
-//! 1. `[models] hub_cache_dir`
-//! 2. the `HF_HOME` environment variable
-//! 3. `directories::BaseDirs::home_dir()/.cache/huggingface`
+//! **Cache root:**
+//! 1. `[models] hub_cache_dir` — a `hub/` subdirectory is appended
+//! 2. the `HF_HUB_CACHE` environment variable — used AS the `hf_hub::Cache`
+//!    root directly, with nothing appended, matching `huggingface_hub`'s own
+//!    `HF_HUB_CACHE` convention (it already names the hub cache dir itself,
+//!    not a parent `HF_HOME`-style directory the client appends `hub/` to)
+//! 3. the `HF_HOME` environment variable — a `hub/` subdirectory is appended
+//! 4. `directories::BaseDirs::home_dir()/.cache/huggingface` — a `hub/`
+//!    subdirectory is appended
 //!
-//! If none of the three resolves (no config, no `HF_HOME`, and no home
-//! directory — `HOME`/`USERPROFILE` unset) this is a typed
+//! If none of the four resolves (no config, no `HF_HUB_CACHE`, no `HF_HOME`,
+//! and no home directory — `HOME`/`USERPROFILE` unset) this is a typed
 //! [`JammiError::Config`], **never** the panic `hf_hub::Cache::default()`
 //! raises in the same situation.
 //!
@@ -42,22 +46,32 @@
 //! "the `offline` promise is Hub-only" below for exactly what this refuses):
 //! 1. `[models] offline`, when `Some(_)` — wins outright, in EITHER
 //!    direction: a literal `offline = false` in the TOML forces online even
-//!    when `HF_HUB_OFFLINE` is set in the environment, exactly as a literal
-//!    `offline = true` forces offline even when it is not
+//!    when `HF_HUB_OFFLINE`/`TRANSFORMERS_OFFLINE` is set in the
+//!    environment, exactly as a literal `offline = true` forces offline even
+//!    when neither is set
 //! 2. the `HF_HUB_OFFLINE` environment variable, when `[models] offline` is
-//!    omitted (`None`) — accepted values are `"1"` or a case-insensitive
-//!    `"true"`, matching the `huggingface_hub` Python client's own
-//!    true-value convention for this variable (see
+//!    omitted (`None`); if `HF_HUB_OFFLINE` is itself unset, the
+//!    `TRANSFORMERS_OFFLINE` environment variable, under the identical
+//!    truthy rule — `huggingface_hub` reads `TRANSFORMERS_OFFLINE` as an
+//!    alias precisely when `HF_HUB_OFFLINE` is unset, and this module
+//!    mirrors that. Accepted truthy values, for either variable, are
+//!    `huggingface_hub`'s own `ENV_VARS_TRUE_VALUES` set — `{"1", "ON",
+//!    "YES", "TRUE"}`, matched case-insensitively with surrounding
+//!    whitespace trimmed first (trimming is a strict superset of
+//!    `huggingface_hub`'s own exact-string match, so it can only ever push
+//!    an edge case TOWARD offline, never away from it — see
 //!    <https://huggingface.co/docs/huggingface_hub/en/package_reference/environment_variables#hfhuboffline>;
-//!    hf-hub, the Rust crate this module wraps, does not read
-//!    `HF_HUB_OFFLINE` at all — see this module's private `resolve_offline`)
+//!    hf-hub, the Rust crate this module wraps, does not read either
+//!    variable at all — see this module's private `resolve_offline`/
+//!    `is_hf_hub_offline_truthy`)
 //! 3. `false`
 //!
-//! The `HF_HOME`/`HF_ENDPOINT`/`HF_TOKEN`/`HF_HUB_OFFLINE` fallbacks read the process
-//! environment **here**, through the `env` closure the caller passes — never
-//! inside `jammi_db::config::JammiConfig::load_from` (which stays
-//! process-env-free by construction). Production passes
-//! `&|k: &str| std::env::var(k).ok()`; a test passes a placeholder map.
+//! The `HF_HOME`/`HF_HUB_CACHE`/`HF_ENDPOINT`/`HF_TOKEN`/`HF_HUB_OFFLINE`/
+//! `TRANSFORMERS_OFFLINE` fallbacks read the process environment **here**,
+//! through the `env` closure the caller passes — never inside
+//! `jammi_db::config::JammiConfig::load_from` (which stays process-env-free
+//! by construction). Production passes `&|k: &str| std::env::var(k).ok()`; a
+//! test passes a placeholder map.
 //!
 //! The client is always built with `ApiBuilder::from_cache(..)`, never
 //! `ApiBuilder::from_env()`/`ApiBuilder::new()` — both of those re-derive the
@@ -130,7 +144,7 @@ impl HubSource {
     ) -> Result<Self> {
         let env: &dyn Fn(&str) -> Option<String> = env;
         let root = resolve_root(config, env)?;
-        let cache = Cache::new(root.join("hub"));
+        let cache = Cache::new(root);
 
         let mut builder = ApiBuilder::from_cache(cache.clone());
         if let Some(endpoint) = resolve_endpoint(config, env) {
@@ -164,9 +178,13 @@ impl HubSource {
 }
 
 /// Resolve the cache root per the module docs' precedence: `hub_cache_dir` >
-/// `HF_HOME` > the platform home directory's `.cache/huggingface`. `None` at
-/// every step is a typed [`JammiError::Config`], never
-/// [`hf_hub::Cache::default`]'s panic.
+/// `HF_HUB_CACHE` > `HF_HOME` > the platform home directory's
+/// `.cache/huggingface`. Returns the final [`hf_hub::Cache`] root directly —
+/// `hub_cache_dir`, `HF_HOME`, and the platform-home fallback each get a
+/// `hub/` subdirectory appended; `HF_HUB_CACHE` is used AS the cache root,
+/// with nothing appended, matching `huggingface_hub`'s own convention for
+/// that variable. `None` at every step is a typed [`JammiError::Config`],
+/// never [`hf_hub::Cache::default`]'s panic.
 fn resolve_root(config: &ModelsConfig, env: &dyn Fn(&str) -> Option<String>) -> Result<PathBuf> {
     resolve_root_with(config, env, default_home_dir)
 }
@@ -196,19 +214,23 @@ fn resolve_root_with(
     home_dir: impl FnOnce() -> Option<PathBuf>,
 ) -> Result<PathBuf> {
     if let Some(dir) = &config.hub_cache_dir {
-        return Ok(dir.clone());
+        return Ok(dir.join("hub"));
+    }
+    if let Some(cache_dir) = env("HF_HUB_CACHE") {
+        return Ok(PathBuf::from(cache_dir));
     }
     if let Some(home) = env("HF_HOME") {
-        return Ok(PathBuf::from(home));
+        return Ok(PathBuf::from(home).join("hub"));
     }
     home_dir()
-        .map(|home| home.join(".cache").join("huggingface"))
+        .map(|home| home.join(".cache").join("huggingface").join("hub"))
         .ok_or_else(|| {
             JammiError::Config(
                 "cannot resolve a Hugging Face Hub cache root: `[models] hub_cache_dir` is \
-                 unset, `HF_HOME` is unset, and no home directory could be determined \
-                 (HOME/USERPROFILE unset, and no password-database entry for this user) — \
-                 set `[models] hub_cache_dir` or `HF_HOME` explicitly"
+                 unset, `HF_HUB_CACHE` is unset, `HF_HOME` is unset, and no home directory \
+                 could be determined (HOME/USERPROFILE unset, and no password-database entry \
+                 for this user) — set `[models] hub_cache_dir`, `HF_HUB_CACHE`, or `HF_HOME` \
+                 explicitly"
                     .into(),
             )
         })
@@ -241,29 +263,48 @@ fn resolve_token(
 /// Resolve `[models] offline` per the module docs' "Offline" precedence:
 /// `[models] offline`, when `Some(_)`, wins outright in EITHER direction —
 /// never OR'd with the environment, so a literal `offline = false` silences
-/// `HF_HUB_OFFLINE` exactly as a literal `offline = true` forces it on
-/// regardless of the environment. Only an OMITTED config value (`None`)
-/// falls back to `HF_HUB_OFFLINE`, then to `false`.
+/// `HF_HUB_OFFLINE`/`TRANSFORMERS_OFFLINE` exactly as a literal `offline =
+/// true` forces it on regardless of the environment. Only an OMITTED config
+/// value (`None`) falls back to `HF_HUB_OFFLINE`; if THAT is itself unset
+/// (not merely falsy — `Option::or_else` only tries `TRANSFORMERS_OFFLINE`
+/// when `HF_HUB_OFFLINE` is absent from the environment entirely), it falls
+/// back to `TRANSFORMERS_OFFLINE` under the identical truthy rule, matching
+/// `huggingface_hub`'s own alias; then to `false`.
 fn resolve_offline(config: &ModelsConfig, env: &dyn Fn(&str) -> Option<String>) -> bool {
     if let Some(offline) = config.offline {
         return offline;
     }
     env("HF_HUB_OFFLINE")
+        .or_else(|| env("TRANSFORMERS_OFFLINE"))
         .map(|value| is_hf_hub_offline_truthy(&value))
         .unwrap_or(false)
 }
 
-/// `true` for `"1"` or a case-insensitive `"true"` (surrounding whitespace
-/// ignored); anything else — including empty, `"0"`, `"false"`, or a value
-/// hf-hub/`huggingface_hub` would also treat as false — is not offline. This
-/// mirrors `huggingface_hub`'s own `HF_HUB_OFFLINE` truthy convention (see
-/// the module docs' "Offline" precedence for the citation); hf-hub 0.5, the
-/// Rust crate `HubSource` wraps, does not read `HF_HUB_OFFLINE` at all, so
-/// this crate reads and parses it directly rather than leaving the variable
-/// silently ignored.
+/// `true` for any of `huggingface_hub`'s own `ENV_VARS_TRUE_VALUES` —
+/// `"1"`, `"on"`, `"yes"`, `"true"` — matched case-insensitively with
+/// surrounding whitespace trimmed first; anything else — including empty,
+/// `"0"`, `"false"`, `"off"`, `"no"`, or any other value `huggingface_hub`
+/// would also treat as false — is not offline.
+///
+/// Trimming surrounding whitespace is a strict superset of
+/// `huggingface_hub`'s own exact-string `value.upper() in
+/// ENV_VARS_TRUE_VALUES` match (`huggingface_hub/constants.py`'s `_is_true`)
+/// — it can only ever turn a value `huggingface_hub` itself would reject
+/// (e.g. `" 1 "`) into truthy, never the reverse, so this function only
+/// ever fails TOWARD offline (the safe direction for an air-gap knob), never
+/// away from it.
+///
+/// This mirrors `huggingface_hub`'s own `HF_HUB_OFFLINE`/
+/// `TRANSFORMERS_OFFLINE` truthy convention (see the module docs' "Offline"
+/// precedence for the citation); hf-hub 0.5, the Rust crate `HubSource`
+/// wraps, does not read either variable at all, so this crate reads and
+/// parses them directly rather than leaving them silently ignored.
 fn is_hf_hub_offline_truthy(value: &str) -> bool {
     let trimmed = value.trim();
-    trimmed == "1" || trimmed.eq_ignore_ascii_case("true")
+    trimmed == "1"
+        || trimmed.eq_ignore_ascii_case("on")
+        || trimmed.eq_ignore_ascii_case("yes")
+        || trimmed.eq_ignore_ascii_case("true")
 }
 
 #[cfg(test)]
@@ -275,28 +316,53 @@ mod tests {
         None
     }
 
-    // --- precedence: cache root (config > env > default) ---
+    // --- precedence: cache root (config > HF_HUB_CACHE > HF_HOME > default) ---
 
     #[test]
-    fn root_prefers_config_over_env() {
+    fn root_prefers_config_over_hf_hub_cache_and_hf_home() {
         let config = ModelsConfig {
             hub_cache_dir: Some(PathBuf::from("/configured/root")),
             ..Default::default()
         };
-        let env = |k: &str| (k == "HF_HOME").then(|| "/env/root".to_string());
+        let env = |k: &str| match k {
+            "HF_HUB_CACHE" => Some("/env/hub-cache".to_string()),
+            "HF_HOME" => Some("/env/home".to_string()),
+            _ => None,
+        };
         assert_eq!(
             resolve_root(&config, &env).unwrap(),
-            PathBuf::from("/configured/root")
+            PathBuf::from("/configured/root/hub"),
+            "hub_cache_dir must win over both HF_HUB_CACHE and HF_HOME, with hub/ appended"
+        );
+    }
+
+    /// #481 fix round 2, advisory A4: `HF_HUB_CACHE` (used directly, no
+    /// `hub/` appended) beats `HF_HOME` when `[models] hub_cache_dir` is
+    /// unset — `huggingface_hub` honours `HF_HUB_CACHE` above `HF_HOME`, and
+    /// this branch's own `jammi-encoders` live-hub harness already reads it
+    /// at that precedence.
+    #[test]
+    fn root_falls_back_to_hf_hub_cache_over_hf_home_no_hub_suffix_appended() {
+        let config = ModelsConfig::default();
+        let env = |k: &str| match k {
+            "HF_HUB_CACHE" => Some("/env/hub-cache".to_string()),
+            "HF_HOME" => Some("/env/home".to_string()),
+            _ => None,
+        };
+        assert_eq!(
+            resolve_root(&config, &env).unwrap(),
+            PathBuf::from("/env/hub-cache"),
+            "HF_HUB_CACHE must be used directly as the cache root, with nothing appended"
         );
     }
 
     #[test]
-    fn root_falls_back_to_hf_home_env() {
+    fn root_falls_back_to_hf_home_env_when_hf_hub_cache_absent() {
         let config = ModelsConfig::default();
         let env = |k: &str| (k == "HF_HOME").then(|| "/env/root".to_string());
         assert_eq!(
             resolve_root(&config, &env).unwrap(),
-            PathBuf::from("/env/root")
+            PathBuf::from("/env/root/hub")
         );
     }
 
@@ -305,8 +371,8 @@ mod tests {
         let config = ModelsConfig::default();
         let resolved = resolve_root(&config, &no_env).unwrap();
         assert!(
-            resolved.ends_with(".cache/huggingface"),
-            "expected the platform home-dir fallback, got {resolved:?}"
+            resolved.ends_with(".cache/huggingface/hub"),
+            "expected the platform home-dir fallback with hub/ appended, got {resolved:?}"
         );
     }
 
@@ -475,10 +541,10 @@ mod tests {
             panic!("home_dir() must not be called when hub_cache_dir is configured")
         })
         .unwrap();
-        assert_eq!(resolved, dir.path());
+        assert_eq!(resolved, dir.path().join("hub"));
     }
 
-    // --- precedence: offline (config Some(_) wins outright > HF_HUB_OFFLINE > false) ---
+    // --- precedence: offline (config Some(_) wins outright > HF_HUB_OFFLINE > TRANSFORMERS_OFFLINE > false) ---
 
     #[test]
     fn offline_falls_back_to_hf_hub_offline_env_when_config_is_none() {
@@ -518,21 +584,61 @@ mod tests {
         assert!(resolve_offline(&config, &no_env));
     }
 
+    /// #481 fix round 2, advisory: `TRANSFORMERS_OFFLINE` is honoured only
+    /// when `HF_HUB_OFFLINE` is itself unset from the environment — matching
+    /// `huggingface_hub`'s own alias behaviour.
     #[test]
-    fn hf_hub_offline_truthy_accepts_bare_one_and_case_insensitive_true() {
+    fn offline_falls_back_to_transformers_offline_when_hf_hub_offline_unset() {
+        let config = ModelsConfig::default();
+        let env = |k: &str| (k == "TRANSFORMERS_OFFLINE").then(|| "1".to_string());
+        assert!(resolve_offline(&config, &env));
+    }
+
+    #[test]
+    fn offline_hf_hub_offline_wins_over_transformers_offline_when_both_set() {
+        let config = ModelsConfig::default();
+        let env = |k: &str| match k {
+            "HF_HUB_OFFLINE" => Some("0".to_string()),
+            "TRANSFORMERS_OFFLINE" => Some("1".to_string()),
+            _ => None,
+        };
+        assert!(
+            !resolve_offline(&config, &env),
+            "HF_HUB_OFFLINE, even falsy, must win over TRANSFORMERS_OFFLINE -- the alias is \
+             consulted only when HF_HUB_OFFLINE is absent from the environment entirely"
+        );
+    }
+
+    /// #481 fix round 2, BLOCK fix: the accepted truthy set widens from
+    /// `{"1", "true"}` to `huggingface_hub`'s own `ENV_VARS_TRUE_VALUES` —
+    /// `{"1", "ON", "YES", "TRUE"}`, matched case-insensitively.
+    #[test]
+    fn hf_hub_offline_truthy_accepts_the_huggingface_hub_true_value_set() {
         assert!(is_hf_hub_offline_truthy("1"));
+        assert!(is_hf_hub_offline_truthy("on"));
+        assert!(is_hf_hub_offline_truthy("ON"));
+        assert!(is_hf_hub_offline_truthy("On"));
+        assert!(is_hf_hub_offline_truthy("yes"));
+        assert!(is_hf_hub_offline_truthy("YES"));
+        assert!(is_hf_hub_offline_truthy("Yes"));
         assert!(is_hf_hub_offline_truthy("true"));
         assert!(is_hf_hub_offline_truthy("TRUE"));
         assert!(is_hf_hub_offline_truthy("True"));
         assert!(is_hf_hub_offline_truthy("  true  "));
+        assert!(is_hf_hub_offline_truthy("  ON  "));
     }
 
     #[test]
     fn hf_hub_offline_truthy_rejects_everything_else() {
         assert!(!is_hf_hub_offline_truthy("0"));
         assert!(!is_hf_hub_offline_truthy("false"));
+        assert!(!is_hf_hub_offline_truthy("FALSE"));
+        assert!(!is_hf_hub_offline_truthy("off"));
+        assert!(!is_hf_hub_offline_truthy("OFF"));
+        assert!(!is_hf_hub_offline_truthy("no"));
+        assert!(!is_hf_hub_offline_truthy("NO"));
         assert!(!is_hf_hub_offline_truthy(""));
-        assert!(!is_hf_hub_offline_truthy("yes"));
-        assert!(!is_hf_hub_offline_truthy("on"));
+        assert!(!is_hf_hub_offline_truthy("garbage"));
+        assert!(!is_hf_hub_offline_truthy("2"));
     }
 }

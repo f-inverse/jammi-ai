@@ -1317,8 +1317,11 @@ pub struct ModelsConfig {
     /// the Hub's own default.
     pub hub_endpoint: Option<String>,
     /// Root directory the Hub cache lives under (a `hub/` subdirectory is
-    /// appended). `None` → `HF_HOME`, then
-    /// `directories::BaseDirs::home_dir()/.cache/huggingface`.
+    /// appended). `None` → `HF_HUB_CACHE` (used AS the cache root directly,
+    /// nothing appended, matching `huggingface_hub`'s own convention), then
+    /// `HF_HOME` (`hub/` appended), then
+    /// `directories::BaseDirs::home_dir()/.cache/huggingface` (`hub/`
+    /// appended).
     pub hub_cache_dir: Option<PathBuf>,
     /// Hub bearer token. Kept as an unresolved [`SecretSource`] — not
     /// eagerly resolved into a [`Secret`] at config load — because the
@@ -1327,17 +1330,21 @@ pub struct ModelsConfig {
     pub hub_token: Option<SecretSource>,
     /// Refuse every network fetch: a model loads only from `local:` or an
     /// already-resolved catalog row. `Some(_)` wins outright over the
-    /// `HF_HUB_OFFLINE` environment variable — set `Some(false)` explicitly
-    /// (a literal `offline = false` in the TOML) to force online even when
-    /// `HF_HUB_OFFLINE` is set in the process environment; an OMITTED field
-    /// (`None`, the `#[serde(default)]` value) falls back to
-    /// `HF_HUB_OFFLINE`, then to `false`. `Option<bool>`, not a plain
-    /// `bool`, is what makes "explicitly set to false" distinguishable from
-    /// "never mentioned" — the same reason the other three fields above are
-    /// already `Option`-typed. See `jammi-ai`'s
-    /// `model::hub::HubSource::from_config` (a downstream crate — not
-    /// linkable from here) for the resolution this drives and the accepted
-    /// `HF_HUB_OFFLINE` values.
+    /// `HF_HUB_OFFLINE`/`TRANSFORMERS_OFFLINE` environment variables — set
+    /// `Some(false)` explicitly (a literal `offline = false` in the TOML) to
+    /// force online even when one of them is set in the process
+    /// environment; an OMITTED field (`None`, the `#[serde(default)]`
+    /// value) falls back to `HF_HUB_OFFLINE`, then — only when
+    /// `HF_HUB_OFFLINE` is itself unset — to `TRANSFORMERS_OFFLINE`
+    /// (`huggingface_hub`'s own alias for this variable), then to `false`.
+    /// `Option<bool>`, not a plain `bool`, is what makes "explicitly set to
+    /// false" distinguishable from "never mentioned" — the same reason the
+    /// other three fields above are already `Option`-typed. See
+    /// `jammi-ai`'s `model::hub::HubSource::from_config` (a downstream
+    /// crate — not linkable from here) for the resolution this drives and
+    /// the accepted `HF_HUB_OFFLINE`/`TRANSFORMERS_OFFLINE` truthy values
+    /// (`huggingface_hub`'s own `ENV_VARS_TRUE_VALUES`: `"1"`, `"on"`,
+    /// `"yes"`, `"true"`, case-insensitively).
     pub offline: Option<bool>,
 }
 

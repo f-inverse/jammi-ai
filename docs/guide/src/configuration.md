@@ -271,15 +271,17 @@ every provider's fields, the credential precedence, and the segment layout on
 disk.
 
 **`models`** — the Hugging Face Hub cache root, endpoint, token, and offline
-switch. Default: every field unset (cache root falls back to `HF_HOME`, then
+switch. Default: every field unset (cache root falls back to `HF_HUB_CACHE`
+— used directly as the cache root, nothing appended — then `HF_HOME`, then
 the platform home directory; endpoint falls back to `HF_ENDPOINT`, then the
 Hub's own default; token falls back to `HF_TOKEN`, then the cache's own
-`token` file).
+`token` file; offline falls back to `HF_HUB_OFFLINE`, then `TRANSFORMERS_OFFLINE`
+when `HF_HUB_OFFLINE` is itself unset, then `false`).
 
 ```toml
 [models]
 hub_endpoint = "https://huggingface.co"
-hub_cache_dir = "/var/cache/jammi/hub"
+hub_cache_dir = "/var/cache/jammi"
 hub_token = { file = "/run/secrets/hf-token" }
 offline = false
 ```
@@ -288,7 +290,10 @@ offline = false
 `local:` reference or an already-resolved catalog row (a warm, on-disk Hub
 cache with no catalog row is still a miss). It does not reach the fine-tune
 worker's adapter fetch, which always reads from the artifact store, offline or
-not. See [Use a Local Model Checkpoint](./local-models.md).
+not. `HF_HUB_OFFLINE`/`TRANSFORMERS_OFFLINE` are truthy for any of
+`huggingface_hub`'s own `ENV_VARS_TRUE_VALUES` — `"1"`, `"on"`, `"yes"`,
+`"true"`, case-insensitively, surrounding whitespace trimmed. See
+[Use a Local Model Checkpoint](./local-models.md).
 
 ## Environment variable overrides
 

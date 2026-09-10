@@ -305,8 +305,9 @@ impl Catalog {
     /// `NotFound` unless `if_exists` is set, in which case it is a success no-op.
     ///
     /// The scan and the DELETE run in a single `Serializable` transaction: the
-    /// two no-FK edges have no constraint backstop, so a weaker isolation level
-    /// would admit a concurrent insert between the scan and the delete.
+    /// three no-FK edges (`result_tables.model_id`, `jobs.output_model_id`,
+    /// `jobs.model_source`) have no constraint backstop, so a weaker isolation
+    /// level would admit a concurrent insert between the scan and the delete.
     pub async fn delete_model(
         &self,
         model_id: &str,
@@ -351,9 +352,9 @@ impl Catalog {
                         let tenant_val = SqlValue::from(tenant.map(|t| t.to_string()));
 
                         // Referential scan — each edge keyed by what it stores
-                        // (NAME for the two no-FK edges, PK for the two FK-backed
-                        // ones), tenant-scoped with the same strict predicate as
-                        // the delete below.
+                        // (NAME for the three no-FK edges, PK for the two
+                        // FK-backed ones), tenant-scoped with the same strict
+                        // predicate as the delete below.
                         let referenced_by = scan_model_references(
                             tx,
                             &name,

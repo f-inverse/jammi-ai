@@ -420,8 +420,11 @@ workspace ships every publishable crate at the same
   unbounded); `request_timeout_secs` (default unset; `DEADLINE_EXCEEDED`;
   unary only); `wait_timeout_secs` (default unset; `DEADLINE_EXCEEDED`;
   refuses a `TriggerService.Subscribe` / `JobService.WaitJob` call whose
-  client-requested `grpc-timeout` exceeds the budget, before the stream
-  opens); `max_subscriptions` / `max_job_waits` (defaults 256 / 1024;
+  client-requested `grpc-timeout` exceeds the budget OR carries no
+  `grpc-timeout` at all — an unbounded request is refused exactly like an
+  over-budget one, before the stream opens; `jammi-client`'s `wait_job`/
+  `subscribe` always declare a bounded deadline for this reason);
+  `max_subscriptions` / `max_job_waits` (defaults 256 / 1024;
   `RESOURCE_EXHAUSTED`; the concurrent-stream budget for each of those two
   RPCs, released when the stream ends or the client disconnects; `0` =
   unbounded). Every knob is validated at config load
@@ -790,6 +793,45 @@ workspace ships every publishable crate at the same
   post-commit fan-out across replicas is unordered regardless of transport.
 
 ### Fixed
+- **`JobService.PruneJobs` swept every tenant's terminal rows, not just the
+  caller's (#485, round-2 adversarial audit).** The RPC handler bypassed
+  `scoped(...)` (the tenant-binding path every other `JobService` RPC uses)
+  and `Catalog::prune_jobs` had no tenant predicate at all; the
+  `tenant_isolation_oracle.rs` allowlist entry and `job.proto`'s "global
+  maintenance action" doc rested on a false premise — there is no periodic
+  background sweep, only the one-shot construction-time pass
+  (`InferenceSession::wrap`), which is not an RPC and stays global by design
+  (now via an explicit `with_admin_scope` bypass, rather than accidentally).
+  `prune_jobs` now takes the same STRICT tenant predicate `cancel_request`
+  uses; the allowlist exemption is removed and a cross-tenant-denial oracle
+  case (`assert_prune_jobs_isolated`) is added.
+- **`SubmitJob`'s `idempotency_key` dedupe lived in a process `HashMap` —
+  forgotten on restart, and racy under two concurrent identical submissions
+  (#485).** Migration 030 adds `jobs.idempotency_key` + a partial UNIQUE index
+  keyed on `(COALESCE(tenant_id, ''), idempotency_key)`; `Catalog::
+  submit_job_deduped` folds the dedupe into the SAME `INSERT ... ON CONFLICT
+  ... DO NOTHING RETURNING` statement that creates the row, so two concurrent
+  `SubmitJob` calls racing the same key land exactly one row — never a
+  separate lookup-then-insert race window. `JobServer` carries no map any
+  more; `job.proto`'s `idempotency_key` doc states the durable guarantee.
+- **Two `JammiError` variants raised by the job/compute path
+  (`JobAttemptSuperseded`, `JobCancelled`) — plus four pre-existing ones
+  (`Lexical`, `IncompatibleFormat`, `DependencyCycle`, `NotRecomputable`) —
+  had no wire arm and silently folded to the lossy `JammiError::Other` on a
+  remote client (#485).** `jammi-wire`'s `error.proto`/`error.rs` gain typed
+  arms for all six; a new compile-time-exhaustive match (no catch-all) over
+  every `JammiError` variant makes a future addition fail to compile here
+  until it is triaged as owned-shape (round-trips faithfully) or a genuine
+  foreign fold.
+- **`WaitJob`/`Subscribe` requests carrying NO `grpc-timeout` header at all
+  were let through unbounded whenever `[server.limits] wait_timeout_secs` was
+  configured, contradicting that key's own doc (which already promised an
+  unbounded request is refused exactly like an over-budget one).**
+  `MethodClassLayer` now refuses an absent header the same way it refuses an
+  over-budget one; `jammi-client`'s `wait_job`/`subscribe` always declare a
+  bounded default `grpc-timeout` (with `wait_job_with_timeout` /
+  `subscribe`'s own budget for a caller that wants a different one) so this
+  fix does not regress the shipped client.
 - **`create_result_table`'s `partial_result` compare-and-set could be won by a
   zombie of a requeued-and-re-claimed attempt (#485, esc-107).** A
   `job_id`-only predicate (`WHERE job_id = $1 AND status = 'running' AND
@@ -1265,9 +1307,14 @@ workspace ships every publishable crate at the same
   the seven materializing compute verbs (`GenerateEmbeddings`,
   `ImportEmbeddings`, `BuildNeighborGraph`, `PropagateEmbeddings`,
   `AsofJoin`, `Recompute`, `Infer`) still return their existing per-verb
-  response synchronously rather than a `SubmitJobResponse` handle, and the
-  `[server.limits]` request-bounds/refusal-layer surface (§5) is not yet
-  implemented — see the escape row filed against this PR.
+  response synchronously rather than a `SubmitJobResponse` handle. The
+  `[server.limits]` request-bounds/refusal-layer surface (§5) — message-size,
+  in-flight, per-connection, request/wait-timeout, and stream-budget bounds,
+  refused at the edge with a typed status — SHIPPED in a follow-up unit (see
+  this changelog's own `[server.limits]` entry, `crates/jammi-server/src/
+  limits.rs`); no escape row was left open for it. `SubmitJob`'s
+  `idempotency_key` is likewise now a DURABLE per-tenant dedupe (migration
+  030's `jobs.idempotency_key` + unique index), not merely process-lifetime.
 - **Existing result-table and artifact object keys predating the tenant-prefixed layout
   are unattributed until the table is re-materialized (#484).** `reconcile`'s allowlist
   recognizes only `{seg}/{table}.parquet` and `models/{seg}/{job_id}/…` keys (`seg` a

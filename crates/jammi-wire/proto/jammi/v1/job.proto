@@ -16,15 +16,19 @@ import "jammi/v1/training.proto";
 // `JobService` replaces `TrainingService` (PLAN-C §3): `StartTraining` folds
 // into `SubmitJob`, `TrainingStatus` into `JobStatus`, `ListTrainingJobs` into
 // `ListJobs`. It generalises the training-only queue into a kind-agnostic
-// durable job abstraction every compute verb submits through — `SubmitJob`
-// itself still carries only the three training-kind spec variants (the
-// `oneof`), since every other compute verb keeps its own dedicated request
-// message on its own service and returns a `SubmitJobResponse` in place of its
-// former synchronous result (K4: the terminal payload a caller reads back via
-// `JobStatus`/`WaitJob` is byte-identical to what the embedded, synchronous
-// `run_now` path returns for the same spec). The service reimplements no
-// training, LoRA, sampling, scan, or compute-verb logic; it is purely a wire
-// adapter over `jammi_ai::jobs`.
+// durable job abstraction every compute verb submits through INTERNALLY
+// (`jammi_ai::jobs`, `InferenceSession::run_now`) — but `SubmitJob` itself
+// carries only the three training-kind spec variants (the `oneof`): every
+// other compute verb is SYNCHRONOUS on the wire today. Each keeps its own
+// dedicated request AND response message on its own service (e.g.
+// `PipelineService.BuildNeighborGraph` returns `jammi.v1.embedding.ResultTable`
+// directly) rather than going through `SubmitJobResponse`, so this service's
+// `JobStatus`/`WaitJob` never has a compute-kind row to answer for over the
+// wire (K4: the synchronous response is still byte-identical to what a `jobs`
+// row of the same kind would resolve to, since both paths run through the
+// same `execute_compute` dispatcher). The service reimplements no training,
+// LoRA, sampling, scan, or compute-verb logic; it is purely a wire adapter
+// over `jammi_ai::jobs`.
 //
 // Tenant scope is read from the request's `SessionTenant` extension, set by
 // the single async tenant-binding layer driven by the engine's
@@ -36,7 +40,10 @@ import "jammi/v1/training.proto";
 // codebase — a wrong tenant learns nothing about whether the id exists at
 // all). `ListWorkers` reports process/fleet liveness, not a tenant-owned
 // resource, so it carries no per-tenant filter (control-plane allowlisted in
-// `tenant_isolation_oracle.rs`, alongside `GetServerInfo`).
+// `tenant_isolation_oracle.rs`, alongside `GetServerInfo`). Every OTHER rpc on
+// this service — including `PruneJobs` — IS tenant-scoped: there is no
+// exemption for a maintenance verb (family D/L — tenant scope is a row
+// predicate, not a verb category).
 service JobService {
   // Submit a training job (`fine_tune` / `graph_fine_tune` /
   // `context_predictor`) and return its durable handle. The job is always
@@ -82,12 +89,14 @@ service JobService {
   // metadata, not a tenant-owned resource — see the service doc.
   rpc ListWorkers(ListWorkersRequest) returns (ListWorkersResponse);
 
-  // Eagerly delete terminal (`completed`/`failed`) job rows older than the
-  // deployment's `[jobs] retention_days` — the same sweep the construction
-  // sweep and the worker loop already run in the background (PLAN-C §1);
-  // this RPC only makes that sweep runnable on demand (e.g. `jammi jobs
-  // prune`). A global maintenance action over the deployment's own retention
-  // window, not a tenant-owned resource — see the service doc.
+  // Eagerly delete the CALLER's own terminal (`completed`/`failed`) job rows
+  // older than the deployment's `[jobs] retention_days` — tenant-scoped like
+  // every other rpc here (never a peer tenant's terminal rows, however old);
+  // this RPC only makes that on-demand (e.g. `jammi jobs prune`). Distinct
+  // from the process's construction-time sweep, which is not an rpc: it runs
+  // once per process boot, before any request is tenant-scoped, and stays
+  // global by design (see `InferenceSession::wrap`'s doc) — there is no
+  // periodic background sweep besides that one-shot boot pass.
   rpc PruneJobs(PruneJobsRequest) returns (PruneJobsResponse);
 }
 
@@ -113,10 +122,14 @@ message SubmitJobRequest {
   // second `SubmitJob` carrying the same non-empty key as a still-known prior
   // submission returns that prior job's handle unchanged rather than
   // submitting a duplicate row. Empty (the default) submits unconditionally,
-  // matching every pre-existing caller. The dedupe window is this server
-  // process's lifetime, not a durable catalog guarantee — a process restart
-  // forgets prior keys, so a caller that needs a cross-restart guarantee must
-  // still reconcile by listing/reading back before retrying.
+  // matching every pre-existing caller. DURABLE (migration 030): the key
+  // lives on the `jobs` row itself under a per-tenant unique index, so the
+  // guarantee survives a process restart and a concurrent retry racing the
+  // SAME key — the loser's insert is refused by the same compare-and-set
+  // that creates the row, never a separate lookup-then-insert window. A
+  // pruned row's key is gone with it (nothing resurrects an identity for a
+  // key whose row no longer exists); different tenants may reuse the same
+  // key freely.
   string idempotency_key = 6;
 }
 

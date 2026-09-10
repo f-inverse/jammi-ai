@@ -277,6 +277,53 @@ async fn wait_job_with_a_timeout_within_the_configured_budget_opens_normally() {
         .expect("wait_job frame");
 }
 
+/// RED before the fix: a `WaitJob` call carrying NO `grpc-timeout` header at
+/// all (HTTP/2's own no-deadline default) used to open normally whenever
+/// `wait_timeout_secs` was set, even though
+/// [`jammi_db::config::LimitsConfig::wait_timeout_secs`]'s own doc already
+/// promised an unbounded request is refused exactly like an over-budget one
+/// -- an unbounded caller is precisely the resource risk the cap exists to
+/// close (it would hold a `max_job_waits` permit open forever). GREEN after:
+/// refused at the edge with `DEADLINE_EXCEEDED`, identically to the
+/// over-budget case.
+#[tokio::test]
+async fn wait_job_with_no_timeout_header_is_refused_when_a_budget_is_configured() {
+    let server = start_engine_server_with_limits(LimitsConfig {
+        wait_timeout_secs: Some(1),
+        ..LimitsConfig::default()
+    })
+    .await;
+    let mut client = JobServiceClient::new(channel(server.addr).await);
+
+    let job = client
+        .submit_job(never_runs_job_request())
+        .await
+        .expect("submit_job")
+        .into_inner();
+
+    // No `request.set_timeout(...)` at all -- an unbounded request.
+    let started = std::time::Instant::now();
+    let err = client
+        .wait_job(JobHandle {
+            job_id: job.job_id.clone(),
+        })
+        .await
+        .expect_err("an unbounded WaitJob request must be refused when a budget is configured");
+    assert_eq!(err.code(), Code::DeadlineExceeded);
+    assert!(
+        started.elapsed() < Duration::from_secs(10),
+        "the refusal must happen at the edge, not after waiting out any deadline"
+    );
+    assert_eq!(
+        server
+            .metrics
+            .grpc_refused
+            .with_label_values(&["timeout"])
+            .get(),
+        1
+    );
+}
+
 /// K4: the SAME `max_message_bytes` bound refuses an oversize inbound
 /// message identically on Flight SQL, not only on the `jammi.v1.*` gRPC
 /// plane -- both transports are constructed with the identical

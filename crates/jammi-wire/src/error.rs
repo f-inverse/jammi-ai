@@ -22,9 +22,15 @@
 //! The contract's fidelity boundary is precise, and faithfulness is a property
 //! of the error type — not of any one verb surface — so the mapping is complete
 //! over `JammiError`: every owned-shape variant (the String- and struct-carrying
-//! ones — `Source`, `Model`, `Inference`, `Catalog`, `Schema`, `Config`, `Eval`,
-//! `Tenant`, `FineTune`, `Gpu`, `Backend`, `ChannelAssembly`) reconstructs
-//! exactly, field for field. So do [`JammiError::MutableTable`] and
+//! ones — `Source`, `Model`, `ModelNotFound`, `ModelReferenced`, `Inference`,
+//! `Catalog`, `Schema`, `Config`, `Eval`, `Tenant`, `FineTune`, `Gpu`, `Backend`,
+//! `ChannelAssembly`, `Lexical`, `IncompatibleFormat`, `DependencyCycle`,
+//! `NotRecomputable`, `RowGone`, `TenantMismatch`, `LeaseLost`, `CasFailed`,
+//! `JobAttemptSuperseded`, `JobCancelled`, `SourceBusy`) reconstructs exactly,
+//! field for field — `tests::every_owned_shape_variant_round_trips_to_itself`
+//! is the completeness proof, backed by an exhaustive match with no catch-all
+//! so a NEW owned-shape variant fails to compile here until it is listed. So
+//! do [`JammiError::MutableTable`] and
 //! [`JammiError::ChannelCatalog`]: their inner errors ([`MutableTableError`],
 //! [`ChannelCatalogError`]) are engine-owned and every variant's fields
 //! reconstruct, so they carry structured details ([`pb::MutableTableErrorDetail`]
@@ -140,6 +146,36 @@ impl From<&JammiError> for pb::JammiErrorDetail {
                     table: table.clone(),
                 })
             }
+            JammiError::JobAttemptSuperseded { job_id } => {
+                Variant::JobAttemptSuperseded(pb::JobAttemptSupersededError {
+                    job_id: job_id.clone(),
+                })
+            }
+            JammiError::JobCancelled { job_id } => Variant::JobCancelled(pb::JobCancelledError {
+                job_id: job_id.clone(),
+            }),
+            JammiError::Lexical(message) => Variant::Lexical(pb::StringError {
+                message: message.clone(),
+            }),
+            JammiError::IncompatibleFormat {
+                artifact,
+                found,
+                supported,
+            } => Variant::IncompatibleFormat(pb::IncompatibleFormatError {
+                artifact: artifact.clone(),
+                found: found.clone(),
+                supported: supported.clone(),
+            }),
+            JammiError::DependencyCycle { table } => {
+                Variant::DependencyCycle(pb::DependencyCycleError {
+                    table: table.clone(),
+                })
+            }
+            JammiError::NotRecomputable { table } => {
+                Variant::NotRecomputable(pb::NotRecomputableError {
+                    table: table.clone(),
+                })
+            }
             // The fold reaches ONLY the genuinely-foreign `#[from]` variants
             // (`Io`, `BackendDriver`, `Toml`, `Json`, `DataFusion`, `Trigger`,
             // `Storage`) and the existing `Other`: every owned-shape variant —
@@ -208,6 +244,18 @@ impl From<pb::JammiErrorDetail> for JammiError {
                 source_id: e.source_id,
                 table: e.table,
             },
+            Some(Variant::JobAttemptSuperseded(e)) => {
+                JammiError::JobAttemptSuperseded { job_id: e.job_id }
+            }
+            Some(Variant::JobCancelled(e)) => JammiError::JobCancelled { job_id: e.job_id },
+            Some(Variant::Lexical(e)) => JammiError::Lexical(e.message),
+            Some(Variant::IncompatibleFormat(e)) => JammiError::IncompatibleFormat {
+                artifact: e.artifact,
+                found: e.found,
+                supported: e.supported,
+            },
+            Some(Variant::DependencyCycle(e)) => JammiError::DependencyCycle { table: e.table },
+            Some(Variant::NotRecomputable(e)) => JammiError::NotRecomputable { table: e.table },
             Some(Variant::Other(e)) => JammiError::Other(e.message),
             None => JammiError::Other(String::new()),
         }
@@ -757,6 +805,56 @@ mod tests {
         error_from_status(&status)
     }
 
+    /// Compile-time half of the completeness proof (K4 error-parity oracle):
+    /// exhaustive over EVERY `JammiError` variant, own-shape or genuinely-
+    /// foreign, with NO catch-all arm. A new variant added to `JammiError`
+    /// fails to compile here until it is listed — forcing the author to
+    /// decide, in this same match, whether it is owned-shape (add it to
+    /// `every_owned_shape_variant_round_trips_to_itself`'s `owned` array too)
+    /// or a genuine foreign-source fold (leave it here with no round-trip
+    /// case, mirroring `Io`/`Toml`/`Json`/`DataFusion`/`Trigger`/`Storage`/
+    /// `BackendDriver`). Every arm is a no-op; the value is the match's
+    /// EXHAUSTIVENESS, not its body.
+    fn assert_exhaustive_variant_coverage(err: &JammiError) {
+        match err {
+            JammiError::Config(_)
+            | JammiError::Catalog(_)
+            | JammiError::Source { .. }
+            | JammiError::Model { .. }
+            | JammiError::ModelNotFound { .. }
+            | JammiError::ModelReferenced { .. }
+            | JammiError::Inference(_)
+            | JammiError::FineTune(_)
+            | JammiError::Eval(_)
+            | JammiError::Gpu(_)
+            | JammiError::Backend(_)
+            | JammiError::Io(_)
+            | JammiError::BackendDriver(_)
+            | JammiError::Tenant(_)
+            | JammiError::Toml(_)
+            | JammiError::Json(_)
+            | JammiError::DataFusion(_)
+            | JammiError::ChannelCatalog(_)
+            | JammiError::ChannelAssembly(_)
+            | JammiError::Lexical(_)
+            | JammiError::MutableTable(_)
+            | JammiError::Trigger(_)
+            | JammiError::Storage(_)
+            | JammiError::Schema { .. }
+            | JammiError::IncompatibleFormat { .. }
+            | JammiError::DependencyCycle { .. }
+            | JammiError::NotRecomputable { .. }
+            | JammiError::RowGone { .. }
+            | JammiError::TenantMismatch { .. }
+            | JammiError::LeaseLost { .. }
+            | JammiError::CasFailed { .. }
+            | JammiError::JobAttemptSuperseded { .. }
+            | JammiError::JobCancelled { .. }
+            | JammiError::SourceBusy { .. }
+            | JammiError::Other(_) => {}
+        }
+    }
+
     /// Every owned-shape variant — the String- and struct-carrying ones — must
     /// reconstruct to the IDENTICAL variant and fields after a wire round-trip.
     /// This is the completeness proof: the contract is faithful over the whole
@@ -813,9 +911,29 @@ mod tests {
                 source_id: "src1".into(),
                 table: "src1__text_embedding__m__20260101T000000_deadbeef".into(),
             },
+            JammiError::JobAttemptSuperseded {
+                job_id: "job-fine-tune-1".into(),
+            },
+            JammiError::JobCancelled {
+                job_id: "job-fine-tune-1".into(),
+            },
+            JammiError::Lexical("bm25 sidecar build: tantivy index open failed".into()),
+            JammiError::IncompatibleFormat {
+                artifact: "ann-manifest".into(),
+                found: "3".into(),
+                supported: "2".into(),
+            },
+            JammiError::DependencyCycle {
+                table: "src1__text_embedding__m__20260101T000000_deadbeef".into(),
+            },
+            JammiError::NotRecomputable {
+                table: "src1__text_embedding__m__20260101T000000_deadbeef".into(),
+            },
             JammiError::Other("an error with no more specific shape".into()),
         ];
         for err in &owned {
+            // Compile-time exhaustiveness: see `assert_exhaustive_variant_coverage`.
+            assert_exhaustive_variant_coverage(err);
             let back = round_trip(err);
             assert_eq!(
                 std::mem::discriminant(&back),

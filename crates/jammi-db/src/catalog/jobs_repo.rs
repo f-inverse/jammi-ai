@@ -34,7 +34,7 @@ use std::time::Duration;
 
 use serde::{Deserialize, Serialize};
 
-use super::backend::{now_sortable, BackendKind, Row, SqlValue, TxOptions};
+use super::backend::{now_sortable, BackendError, BackendKind, Row, SqlValue, TxOptions};
 use super::lease::{lease_deadline_expr, lease_expired_clause, stale_before_clause};
 use super::status::{JobExecution, JobStatus};
 use super::Catalog;
@@ -393,7 +393,44 @@ impl Catalog {
     /// [`Self::claim_next`] for `execution = 'queued'`, or by
     /// [`Self::claim_by_id`] for `execution = 'inline'`) performs the
     /// `queued -> running` transition. Tenant bound + asserted (SPEC-03 §7).
+    /// Never deduped — a thin `idempotency_key: None` call onto
+    /// [`Self::submit_job_deduped`], kept as the plain entry point every
+    /// pre-existing caller (every compute verb, every training kind's
+    /// internal submit) uses unchanged.
     pub async fn submit_job(&self, p: SubmitJobParams<'_>) -> Result<()> {
+        self.submit_job_deduped(p, None).await?;
+        Ok(())
+    }
+
+    /// Submit a new job exactly like [`Self::submit_job`], additionally
+    /// deduped by an optional per-tenant `idempotency_key` (migration 030:
+    /// `jobs.idempotency_key` + the partial unique index
+    /// `idx_jobs_tenant_idempotency_key` — see that migration's doc for why
+    /// the index keys on `COALESCE(tenant_id, '')`).
+    ///
+    /// `idempotency_key` of `None` or `""` never dedupes: a plain
+    /// unconditional insert, byte-identical to [`Self::submit_job`] (a `NULL`
+    /// key row is excluded from the partial index entirely, so it can never
+    /// participate in a conflict). `Some(key)` non-empty makes the insert a
+    /// single atomic compare-and-set: `INSERT ... ON CONFLICT ... DO NOTHING`
+    /// inside the SAME statement that creates the row, so two concurrent
+    /// submissions racing the same `(tenant, key)` pair can never both land a
+    /// row — the loser's insert affects zero rows, and this call re-reads the
+    /// winner's `job_id` inside the SAME transaction (no separate
+    /// lookup-then-insert race window a caller could interleave a THIRD write
+    /// into). This is the only durable dedupe surface — there is no
+    /// in-process map to resurrect a pruned row's identity or to forget it on
+    /// a process restart.
+    ///
+    /// Returns the job id OF RECORD: `p.job_id` on a fresh insert (including
+    /// every `None`-key call, which always inserts fresh), or the winning
+    /// prior row's id when `Some(key)` collided — the caller must not assume
+    /// the returned id equals `p.job_id`.
+    pub async fn submit_job_deduped(
+        &self,
+        p: SubmitJobParams<'_>,
+        idempotency_key: Option<&str>,
+    ) -> Result<String> {
         let job_id = p.job_id.to_string();
         let kind = p.kind.to_string();
         let execution = p.execution.to_string();
@@ -404,8 +441,12 @@ impl Catalog {
         let priority = p.priority as i64;
         let tenant = self.current_tenant();
         let now = now_sortable();
+        let key = idempotency_key
+            .filter(|k| !k.is_empty())
+            .map(str::to_string);
 
-        self.backend()
+        let recorded_job_id = self
+            .backend()
             .transaction(TxOptions::default(), |tx| {
                 Box::pin(async move {
                     tx.set_tenant(tenant);
@@ -414,32 +455,81 @@ impl Catalog {
                         "INSERT INTO jobs \
                          (job_id, kind, tenant_id, status, execution, spec, model_ref, \
                           output_model_id, model_source, priority, acceleration_report, \
-                          created_at, updated_at) \
-                         VALUES ($1, $2, $3, '{queued}', $4, $5, $6, $7, $8, $9, $10, $11, $11)",
+                          idempotency_key, created_at, updated_at) \
+                         VALUES ($1, $2, $3, '{queued}', $4, $5, $6, $7, $8, $9, $10, $11, $12, $12) \
+                         ON CONFLICT (COALESCE(tenant_id, ''), idempotency_key) \
+                           WHERE idempotency_key IS NOT NULL \
+                         DO NOTHING \
+                         RETURNING job_id",
                         queued = JobStatus::Queued
                     );
-                    tx.execute(
-                        &sql,
-                        &[
-                            SqlValue::TextOwned(job_id),
-                            SqlValue::TextOwned(kind),
-                            SqlValue::from(tenant.map(|t| t.to_string())),
-                            SqlValue::TextOwned(execution),
-                            SqlValue::TextOwned(spec),
-                            SqlValue::from(model_ref),
-                            SqlValue::from(output_model_id),
-                            SqlValue::from(model_source),
-                            SqlValue::Int(priority),
-                            SqlValue::Text(ACCELERATION_REPORT_PENDING),
-                            SqlValue::TextOwned(now),
-                        ],
-                    )
-                    .await?;
-                    Ok(())
+                    let inserted = tx
+                        .query_opt(
+                            &sql,
+                            &[
+                                SqlValue::TextOwned(job_id.clone()),
+                                SqlValue::TextOwned(kind),
+                                SqlValue::from(tenant.map(|t| t.to_string())),
+                                SqlValue::TextOwned(execution),
+                                SqlValue::TextOwned(spec),
+                                SqlValue::from(model_ref),
+                                SqlValue::from(output_model_id),
+                                SqlValue::from(model_source),
+                                SqlValue::Int(priority),
+                                SqlValue::Text(ACCELERATION_REPORT_PENDING),
+                                SqlValue::from(key.clone()),
+                                SqlValue::TextOwned(now),
+                            ],
+                            |row| row.get::<String>("job_id"),
+                        )
+                        .await?;
+                    match inserted {
+                        Some(id) => Ok(id),
+                        None => {
+                            // The insert's own row was excluded by the ON
+                            // CONFLICT's DO NOTHING only when `key` is
+                            // `Some` (a `NULL`-keyed row is outside the
+                            // partial index and can never conflict) — so a
+                            // `None` reaching this arm would be a backend
+                            // bug, not a caller error.
+                            let key = key.expect(
+                                "a None idempotency_key row is excluded from the partial \
+                                 index and can never hit ON CONFLICT DO NOTHING",
+                            );
+                            let (select_sql, params): (&str, Vec<SqlValue<'static>>) =
+                                match tenant {
+                                    Some(t) => (
+                                        "SELECT job_id FROM jobs \
+                                         WHERE idempotency_key = $1 AND tenant_id = $2",
+                                        vec![
+                                            SqlValue::TextOwned(key),
+                                            SqlValue::TextOwned(t.to_string()),
+                                        ],
+                                    ),
+                                    None => (
+                                        "SELECT job_id FROM jobs \
+                                         WHERE idempotency_key = $1 AND tenant_id IS NULL",
+                                        vec![SqlValue::TextOwned(key)],
+                                    ),
+                                };
+                            let existing = tx
+                                .query_opt(select_sql, &params, |row| row.get::<String>("job_id"))
+                                .await?;
+                            existing.ok_or_else(|| {
+                                BackendError::Execution(
+                                    "submit_job_deduped: ON CONFLICT DO NOTHING fired but no \
+                                     row was found for the (tenant, idempotency_key) pair — \
+                                     the winner must have been deleted inside this same \
+                                     transaction, which never happens on this path"
+                                        .to_string(),
+                                )
+                            })
+                        }
+                    }
                 })
             })
             .await?;
-        Ok(())
+        Ok(recorded_job_id)
     }
 
     /// Get a job by id. Tenant-filtered; inside a
@@ -1509,12 +1599,34 @@ impl Catalog {
     /// Delete terminal (`completed`/`failed`) job rows whose `updated_at` is
     /// at least `retention` in the past. A non-terminal job is never pruned,
     /// regardless of age. Returns the count deleted.
+    ///
+    /// Tenant-scoped with the same STRICT predicate [`Self::cancel_request`]
+    /// uses: a caller prunes only rows whose `tenant_id` equals its own (or
+    /// is `NULL`, the global namespace) — never a peer tenant's terminal
+    /// rows, however old. Inside a
+    /// [`crate::session::JammiSession::with_admin_scope`] closure the
+    /// predicate is dropped and every tenant's terminal rows are eligible;
+    /// `InferenceSession::wrap`'s construction-time sweep is the one
+    /// production caller that runs under that admin bypass (it is not an
+    /// RPC — `JobService::PruneJobs` always calls this under the caller's
+    /// own `scoped(...)` tenant, exactly like every other job RPC).
     pub async fn prune_jobs(&self, retention: Duration) -> Result<usize> {
+        let admin = TenantBinding::is_admin_scope();
         let kind = self.backend().backend_kind();
         let mut params: Vec<SqlValue<'static>> = Vec::new();
         let stale = stale_before_clause("updated_at", kind, retention, &mut params);
         let terminal = JobStatus::terminal_sql_list();
-        let sql = format!("DELETE FROM jobs WHERE status IN ({terminal}) AND {stale}");
+        let tenant = self.current_tenant();
+        let sql = if admin {
+            format!("DELETE FROM jobs WHERE status IN ({terminal}) AND {stale}")
+        } else {
+            params.push(SqlValue::from(tenant.map(|t| t.to_string())));
+            let tenant_bind = params.len();
+            format!(
+                "DELETE FROM jobs WHERE status IN ({terminal}) AND {stale} \
+                   AND (tenant_id = ${tenant_bind} OR (tenant_id IS NULL AND ${tenant_bind} IS NULL))"
+            )
+        };
         let deleted = self
             .backend()
             .transaction(TxOptions::default(), |tx| {

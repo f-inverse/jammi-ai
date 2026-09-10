@@ -254,14 +254,14 @@ compute node should also serve — `services = []` for a pure compute node.
 apiVersion: apps/v1
 kind: Deployment
 metadata:
-  name: jammi-server-train
+  name: jammi-server-compute
 spec:
   replicas: 1
   selector:
-    matchLabels: { app: jammi-server-train }
+    matchLabels: { app: jammi-server-compute }
   template:
     metadata:
-      labels: { app: jammi-server-train }
+      labels: { app: jammi-server-compute }
     spec:
       nodeSelector:
         gpu-node-pool: "true" # your cluster's own GPU node label

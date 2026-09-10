@@ -580,21 +580,34 @@ where
 
         if is_streaming_path(&path) {
             if let Some(cap) = self.layer.wait_timeout {
-                if let Some(requested) = parse_grpc_timeout(req.headers()) {
-                    if requested > cap {
-                        return Box::pin(async move {
-                            Ok(refuse::<ResBody>(
-                                Code::DeadlineExceeded,
-                                format!(
-                                    "requested deadline exceeds server.limits.wait_timeout_secs \
-                                     ({}s)",
-                                    cap.as_secs()
-                                ),
-                                RefusedBound::Timeout,
-                            )
-                            .map(PermitBody::Passthrough))
-                        });
-                    }
+                // [`jammi_db::config::LimitsConfig::wait_timeout_secs`]'s doc
+                // is explicit that BOTH an over-budget requested deadline AND
+                // an unbounded request (no `grpc-timeout` header at all, HTTP/2's
+                // own no-deadline default) are refused at the edge — a caller
+                // that never declares an upper bound is exactly the case this
+                // cap exists to close (an unbounded client would otherwise hold
+                // a `max_job_waits`/`max_subscriptions` permit open forever).
+                let refusal_message = match parse_grpc_timeout(req.headers()) {
+                    Some(requested) if requested > cap => Some(format!(
+                        "requested deadline exceeds server.limits.wait_timeout_secs ({}s)",
+                        cap.as_secs()
+                    )),
+                    Some(_) => None,
+                    None => Some(format!(
+                        "server.limits.wait_timeout_secs ({}s) is set; this rpc requires a \
+                         bounded grpc-timeout header, never an unbounded wait",
+                        cap.as_secs()
+                    )),
+                };
+                if let Some(message) = refusal_message {
+                    return Box::pin(async move {
+                        Ok(refuse::<ResBody>(
+                            Code::DeadlineExceeded,
+                            message,
+                            RefusedBound::Timeout,
+                        )
+                        .map(PermitBody::Passthrough))
+                    });
                 }
             }
 
@@ -1025,6 +1038,26 @@ mod tests {
         assert_not_refused(&resp);
     }
 
+    /// RED before the fix: `mk_req` sends no `grpc-timeout` header at all (an
+    /// unbounded request); the module's own doc for `wait_timeout_secs`
+    /// already promised this is refused exactly like an over-budget one, but
+    /// the code only checked the "header present and over budget" arm.
+    #[tokio::test]
+    async fn method_class_wait_timeout_refuses_a_request_with_no_grpc_timeout_header_at_all() {
+        let limits = LimitsConfig {
+            wait_timeout_secs: Some(5),
+            ..LimitsConfig::default()
+        };
+        let entered = Arc::new(AtomicUsize::new(0));
+        let mut svc = MethodClassLayer::new(&limits).layer(Held {
+            gate: Arc::new(Semaphore::new(0)),
+            entered: Arc::clone(&entered),
+        });
+        let resp = svc.call(mk_req(WAIT_JOB_PATH)).await.unwrap();
+        assert_refused(&resp, RefusedBound::Timeout);
+        assert_eq!(entered.load(Ordering::SeqCst), 0);
+    }
+
     #[tokio::test]
     async fn method_class_wait_timeout_unset_never_refuses_regardless_of_header() {
         let limits = LimitsConfig::default(); // wait_timeout_secs: None
@@ -1201,6 +1234,58 @@ mod tests {
             "/jammi.v1.embedding.EmbeddingService/Search"
         ));
         assert!(!is_streaming_path("/jammi.v1.job.JobService/JobStatus"));
+    }
+
+    /// [`is_streaming_path`]'s hardcoded allowlist is a documented,
+    /// deliberate scope reduction (module docs' "Streaming-path exemption"
+    /// section) -- but nothing catches a THIRD server-streaming rpc landing
+    /// without the list being extended by hand. This DERIVES the actual
+    /// server-streaming method set from the compiled `jammi.v1`
+    /// `FILE_DESCRIPTOR_SET` (`MethodDescriptorProto::server_streaming`) and
+    /// asserts it equals the hardcoded set -- symmetric, so a stale entry (a
+    /// removed rpc still allowlisted) fails just as loudly as a missing one.
+    #[test]
+    fn is_streaming_path_allowlist_matches_the_descriptor_derived_server_streaming_set() {
+        use prost::Message;
+        use prost_types::FileDescriptorSet;
+        use std::collections::BTreeSet;
+
+        const WIRE_PACKAGE_PREFIX: &str = "jammi.v1";
+        let set = FileDescriptorSet::decode(jammi_wire::FILE_DESCRIPTOR_SET)
+            .expect("the compiled jammi.v1 descriptor must decode");
+        let mut derived = BTreeSet::new();
+        for file in &set.file {
+            let package = file.package();
+            // The descriptor also carries `google.*` / `arrow.*` imports
+            // (e.g. `arrow.flight.protocol.FlightService`, itself
+            // server-streaming) -- only `jammi.v1.*` is this bind's scope,
+            // matching `tenant_isolation_oracle.rs`'s `WIRE_PACKAGE_PREFIX`
+            // convention.
+            if package != WIRE_PACKAGE_PREFIX
+                && !package.starts_with(&format!("{WIRE_PACKAGE_PREFIX}."))
+            {
+                continue;
+            }
+            for service in &file.service {
+                for method in &service.method {
+                    if method.server_streaming() {
+                        derived.insert(format!("/{package}.{}/{}", service.name(), method.name()));
+                    }
+                }
+            }
+        }
+
+        let hardcoded: BTreeSet<String> = [WAIT_JOB_PATH.to_string(), SUBSCRIBE_PATH.to_string()]
+            .into_iter()
+            .collect();
+
+        assert_eq!(
+            derived, hardcoded,
+            "is_streaming_path's hardcoded allowlist has drifted from the descriptor-derived \
+             server-streaming rpc set -- a new server-streaming rpc needs WAIT_JOB_PATH/\
+             SUBSCRIBE_PATH's allowlist extended by hand (module docs' 'Streaming-path \
+             exemption' section), or a removed one needs its stale entry dropped"
+        );
     }
 
     #[test]

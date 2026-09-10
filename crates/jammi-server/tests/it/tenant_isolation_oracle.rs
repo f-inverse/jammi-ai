@@ -118,12 +118,12 @@ const CONTROL_PLANE_ALLOWLIST: &[(&str, &str)] = &[
     // which processes run the claim loop. Not a tenant-owned resource, same
     // rationale as `GetServerInfo` above.
     ("JobService", "ListWorkers"),
-    // A global maintenance sweep over the deployment's own `[jobs]
-    // retention_days` window (the same sweep the construction/worker-loop
-    // background pass already runs); it deletes only rows already destined
-    // for deletion by that config-driven age predicate, across every tenant,
-    // so it names no single tenant's row to isolate.
-    ("JobService", "PruneJobs"),
+    // `PruneJobs` is NOT exempt (round-2 adversarial audit): it used to rest on
+    // a false premise — "the same sweep the construction/worker-loop
+    // background pass already runs" — but there is no periodic background
+    // sweep, only the one-shot construction-time pass, which is not an RPC.
+    // `PruneJobs` is now tenant-scoped exactly like every other job RPC and is
+    // covered by a case below, not allowlisted.
     // Lifecycle/auth contract — defined in the shared `jammi.v1` wire
     // descriptor so the candle-free `jammi-admin` / CLI client can call a
     // PLATFORM server that implements them, but NOT served by the OSS engine:
@@ -1148,6 +1148,14 @@ fn cases() -> Vec<IsolationCase> {
             // "no leak, no effect" contract every other cross-tenant write
             // in this codebase gets.
             assert_cancel_job_isolated().await;
+        }),
+        case!("JobService", "PruneJobs", CaseKind::Hermetic, None, {
+            // `prune_jobs` now carries the same STRICT tenant predicate
+            // `cancel_request` uses (F2, round-2 adversarial audit) — a
+            // peer's prune deletes zero rows against another tenant's
+            // terminal job, however old; the caller's own terminal rows are
+            // still pruned normally.
+            assert_prune_jobs_isolated().await;
         }),
         // --- Flight SQL (off-descriptor; explicit case) ----------------------
         case!(
@@ -2366,6 +2374,70 @@ async fn assert_cancel_job_isolated() {
     assert!(
         same_tenant_cancelled,
         "tenant A must be able to cancel its own job"
+    );
+}
+
+/// `PruneJobs`: tenant B's prune must not delete tenant A's terminal
+/// (`completed`) job, however old, while tenant A's own prune deletes it
+/// normally — the exact cross-tenant-denial case the round-2 adversarial
+/// audit found missing (F2): `Catalog::prune_jobs` previously carried NO
+/// tenant predicate at all, so a peer's prune swept every tenant's terminal
+/// rows.
+async fn assert_prune_jobs_isolated() {
+    use jammi_db::catalog::backend::{SqlValue, TxOptions};
+    use std::time::Duration;
+
+    let (_dir, cat_a, cat_b, _g) = ab_catalogs().await;
+    cat_a
+        .submit_job(SubmitJobParams {
+            job_id: "job_prune_a",
+            kind: "fine_tune",
+            execution: JobExecution::Queued,
+            spec: "{}",
+            model_ref: None,
+            output_model_id: None,
+            model_source: None,
+            priority: 0,
+        })
+        .await
+        .unwrap();
+    // Force the row terminal directly (no worker in this hermetic test) so
+    // it is eligible for `prune_jobs`'s age/status predicate — a `retention`
+    // of zero makes every already-terminal row eligible regardless of exact
+    // age, so no backdating is needed.
+    let job_id = "job_prune_a".to_string();
+    cat_a
+        .backend_arc()
+        .transaction(TxOptions::default(), |tx| {
+            Box::pin(async move {
+                tx.execute(
+                    "UPDATE jobs SET status = 'completed' WHERE job_id = $1",
+                    &[SqlValue::TextOwned(job_id)],
+                )
+                .await
+            })
+        })
+        .await
+        .unwrap();
+
+    let cross_tenant_deleted = cat_b.prune_jobs(Duration::from_secs(0)).await.unwrap();
+    assert_eq!(
+        cross_tenant_deleted, 0,
+        "CROSS-TENANT PRUNE: tenant B's prune deleted tenant A's terminal job"
+    );
+    assert!(
+        cat_a.get_job("job_prune_a").await.is_ok(),
+        "tenant A's terminal job must survive tenant B's prune"
+    );
+
+    let same_tenant_deleted = cat_a.prune_jobs(Duration::from_secs(0)).await.unwrap();
+    assert_eq!(
+        same_tenant_deleted, 1,
+        "tenant A must be able to prune its own terminal job"
+    );
+    assert!(
+        cat_a.get_job("job_prune_a").await.is_err(),
+        "tenant A's own prune must have deleted its own terminal job"
     );
 }
 

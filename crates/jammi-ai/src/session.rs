@@ -13,7 +13,7 @@ use jammi_db::store::{ArtifactStore, ResultStore};
 use crate::concurrency::GpuScheduler;
 use crate::eval::runner::EvalRunner;
 use crate::fine_tune::spec::{TrainingCommon, TrainingSpec};
-use crate::fine_tune::training_job::{fine_tuned_model_id, TrainingJob};
+use crate::fine_tune::training_job::{fine_tuned_model_id, resolve_model_id, TrainingJob};
 use crate::fine_tune::{FineTuneConfig, FineTuneMethod};
 use crate::inference::adapter::BackendOutput;
 use crate::inference::observer::InferenceObserver;
@@ -222,7 +222,22 @@ impl InferenceSession {
         catalog
             .prune_instances(lease_intervals.lease().saturating_mul(2))
             .await?;
-        catalog.prune_jobs(inner.config().jobs.retention()).await?;
+        // `Catalog::prune_jobs` is tenant-scoped (F2, issue #485): every
+        // `JobService::PruneJobs` RPC call runs it under the CALLER's own
+        // `scoped(...)` tenant, like every other job RPC. This construction
+        // sweep is not an RPC — it runs once per process boot, before any
+        // request is scoped — and stays global BY DESIGN (a process that
+        // never claims still benefits from reclaiming every tenant's stale
+        // terminal rows), so it explicitly drops the tenant predicate via
+        // `with_admin_scope` rather than silently sweeping only the `NULL`
+        // (unscoped) tenant's rows.
+        {
+            let retention = inner.config().jobs.retention();
+            let catalog = Arc::clone(&catalog);
+            inner
+                .with_admin_scope(|_admin| async move { catalog.prune_jobs(retention).await })
+                .await?;
+        }
 
         // This process's `instances` row + keeper hold — every
         // session upserts and heartbeats one, whether or not it runs a
@@ -1568,29 +1583,67 @@ impl InferenceSession {
     /// from [`Self::training_job_links`], the one derivation `enqueue` and
     /// the context-predictor submit share.
     async fn submit_fine_tune_spec(&self, spec: TrainingSpec) -> Result<TrainingJob> {
+        self.submit_fine_tune_spec_deduped(spec, None).await
+    }
+
+    /// [`Self::submit_fine_tune_spec`], additionally deduped by an optional
+    /// per-tenant `idempotency_key` (migration 030) via
+    /// [`jammi_db::catalog::Catalog::submit_job_deduped`] — see that
+    /// method's doc for the atomicity guarantee. `idempotency_key` of `None`
+    /// always inserts fresh, matching [`Self::submit_fine_tune_spec`]
+    /// byte-for-byte (every embedded caller of that method routes through
+    /// here with `None`). `Some(key)` that collides with a still-known prior
+    /// submission returns THAT job's handle — re-read from its catalog row,
+    /// never the handle this call would have minted — so a caller cannot
+    /// observe two different in-memory handles for what the catalog now
+    /// records as one job.
+    async fn submit_fine_tune_spec_deduped(
+        &self,
+        spec: TrainingSpec,
+        idempotency_key: Option<&str>,
+    ) -> Result<TrainingJob> {
         let job_id = uuid::Uuid::new_v4().to_string();
         let links = self.training_job_links(&spec, &job_id).await?;
         let spec_json = serde_json::to_string(&spec)?;
-        self.inner
+        let recorded_job_id = self
+            .inner
             .catalog()
-            .submit_job(jammi_db::catalog::jobs_repo::SubmitJobParams {
-                job_id: &job_id,
-                kind: spec.kind(),
-                execution: jammi_db::catalog::status::JobExecution::Queued,
-                spec: &spec_json,
-                model_ref: Some(&links.model_ref),
-                output_model_id: Some(&links.output_model_id),
-                model_source: None,
-                priority: 0,
-            })
+            .submit_job_deduped(
+                jammi_db::catalog::jobs_repo::SubmitJobParams {
+                    job_id: &job_id,
+                    kind: spec.kind(),
+                    execution: jammi_db::catalog::status::JobExecution::Queued,
+                    spec: &spec_json,
+                    model_ref: Some(&links.model_ref),
+                    output_model_id: Some(&links.output_model_id),
+                    model_source: None,
+                    priority: 0,
+                },
+                idempotency_key,
+            )
             .await?;
 
-        Ok(TrainingJob::new(
-            job_id,
-            "queued".into(),
-            links.output_model_id,
-            Arc::clone(self.inner.catalog()),
-        ))
+        if recorded_job_id == job_id {
+            Ok(TrainingJob::new(
+                job_id,
+                "queued".into(),
+                links.output_model_id,
+                Arc::clone(self.inner.catalog()),
+            ))
+        } else {
+            // A concurrent or prior call already holds this idempotency key
+            // — the durable row of record, not this call's own (unused)
+            // job_id. Re-read its current state rather than guessing
+            // `"queued"`: a racing caller may observe it already claimed.
+            let record = self.inner.catalog().get_job(&recorded_job_id).await?;
+            let model_id = resolve_model_id(&recorded_job_id, &record)?;
+            Ok(TrainingJob::new(
+                recorded_job_id,
+                record.status,
+                model_id,
+                Arc::clone(self.inner.catalog()),
+            ))
+        }
     }
 
     /// The two model-side links every training kind's `jobs` row carries,
@@ -1725,41 +1778,52 @@ impl InferenceSession {
     /// identical job on either transport. The dispatch lives once, beside the
     /// entry points it calls, rather than being re-written per transport.
     pub async fn run_training_spec(self: &Arc<Self>, spec: TrainingSpec) -> Result<TrainingJob> {
-        match spec {
-            TrainingSpec::FineTune {
-                source,
-                columns,
-                method,
-                task,
-                common,
-            } => {
-                self.fine_tune(
-                    &source,
-                    &common.base_model,
-                    &columns,
-                    method,
-                    task,
-                    Some(common.config),
-                )
-                .await
-            }
+        self.run_training_spec_deduped(spec, None).await
+    }
+
+    /// [`Self::run_training_spec`], additionally deduped by an optional
+    /// per-tenant `idempotency_key` (migration 030) — the seam
+    /// `JobService::submit_job`'s gRPC handler drives (the only caller that
+    /// has a wire-supplied key; [`Self::run_training_spec`] and every other
+    /// caller — the Python binding included — routes through here with
+    /// `None`, byte-identical to before this method existed).
+    ///
+    /// Runs the SAME per-kind validation the embedded entry points
+    /// ([`Self::fine_tune`], [`Self::fine_tune_graph`],
+    /// [`Self::train_context_predictor`]) apply, then submits directly
+    /// through the deduped catalog seam — `spec` is already fully formed
+    /// here (decoded off the wire or handed in by a caller), so there is no
+    /// need to re-destructure it through those entry points' own
+    /// loose-argument constructors only to rebuild the identical spec.
+    pub async fn run_training_spec_deduped(
+        self: &Arc<Self>,
+        spec: TrainingSpec,
+        idempotency_key: Option<&str>,
+    ) -> Result<TrainingJob> {
+        match &spec {
+            TrainingSpec::FineTune { common, .. } => common.config.validate()?,
             TrainingSpec::GraphFineTune {
-                sources,
-                sample_config,
                 common,
+                sample_config,
+                ..
             } => {
-                self.fine_tune_graph(
-                    &sources,
-                    &common.base_model,
-                    sample_config,
-                    Some(common.config),
-                )
-                .await
+                common.config.validate()?;
+                sample_config.validate()?;
             }
+            TrainingSpec::ContextPredictor { predictor_spec, .. } => predictor_spec.validate()?,
+        }
+        match spec {
             TrainingSpec::ContextPredictor {
                 source,
                 predictor_spec,
-            } => self.train_context_predictor(&source, &predictor_spec).await,
+            } => {
+                self.train_context_predictor_deduped(&source, &predictor_spec, idempotency_key)
+                    .await
+            }
+            other => {
+                self.submit_fine_tune_spec_deduped(other, idempotency_key)
+                    .await
+            }
         }
     }
 

@@ -269,7 +269,11 @@ impl ContextPredictorTrainConfig {
     /// Validate the spec independently of any data: the head/objective is
     /// coherent, the test fraction is a proper fraction, `num_heads` divides
     /// `hidden_dim` for the attentive members, and the budget is non-degenerate.
-    fn validate(&self) -> Result<()> {
+    ///
+    /// `pub(crate)`, not private: [`crate::session::InferenceSession::
+    /// run_training_spec_deduped`] validates a fully-decoded spec before
+    /// dispatch, from a different module.
+    pub(crate) fn validate(&self) -> Result<()> {
         self.head.validate()?;
         if self.context_k == 0 {
             return Err(JammiError::FineTune("context_k must be at least 1".into()));
@@ -520,6 +524,22 @@ impl InferenceSession {
         source_id: &str,
         spec: &ContextPredictorTrainConfig,
     ) -> Result<crate::fine_tune::training_job::TrainingJob> {
+        self.train_context_predictor_deduped(source_id, spec, None)
+            .await
+    }
+
+    /// [`Self::train_context_predictor`], additionally deduped by an
+    /// optional per-tenant `idempotency_key` (migration 030) — see
+    /// [`InferenceSession::run_training_spec_deduped`] for the caller and
+    /// [`jammi_db::catalog::Catalog::submit_job_deduped`] for the atomicity
+    /// guarantee. `idempotency_key` of `None` always inserts fresh, matching
+    /// [`Self::train_context_predictor`] byte-for-byte.
+    pub(crate) async fn train_context_predictor_deduped(
+        self: &Arc<Self>,
+        source_id: &str,
+        spec: &ContextPredictorTrainConfig,
+        idempotency_key: Option<&str>,
+    ) -> Result<crate::fine_tune::training_job::TrainingJob> {
         spec.validate()?;
 
         let job_id = uuid::Uuid::new_v4().to_string();
@@ -532,25 +552,43 @@ impl InferenceSession {
         // the source's embedding model's PK, and the predictor's own id.
         let links = self.training_job_links(&training_spec, &job_id).await?;
         let spec_json = serde_json::to_string(&training_spec)?;
-        self.catalog()
-            .submit_job(jammi_db::catalog::jobs_repo::SubmitJobParams {
-                job_id: &job_id,
-                kind: training_spec.kind(),
-                execution: jammi_db::catalog::status::JobExecution::Queued,
-                spec: &spec_json,
-                model_ref: Some(&links.model_ref),
-                output_model_id: Some(&links.output_model_id),
-                model_source: None,
-                priority: 0,
-            })
+        let recorded_job_id = self
+            .catalog()
+            .submit_job_deduped(
+                jammi_db::catalog::jobs_repo::SubmitJobParams {
+                    job_id: &job_id,
+                    kind: training_spec.kind(),
+                    execution: jammi_db::catalog::status::JobExecution::Queued,
+                    spec: &spec_json,
+                    model_ref: Some(&links.model_ref),
+                    output_model_id: Some(&links.output_model_id),
+                    model_source: None,
+                    priority: 0,
+                },
+                idempotency_key,
+            )
             .await?;
 
-        Ok(crate::fine_tune::training_job::TrainingJob::new(
-            job_id,
-            "queued".into(),
-            links.output_model_id,
-            Arc::clone(self.catalog_arc()),
-        ))
+        if recorded_job_id == job_id {
+            Ok(crate::fine_tune::training_job::TrainingJob::new(
+                job_id,
+                "queued".into(),
+                links.output_model_id,
+                Arc::clone(self.catalog_arc()),
+            ))
+        } else {
+            // A concurrent or prior call already holds this idempotency key
+            // — re-read its current state rather than assuming "queued".
+            let record = self.catalog().get_job(&recorded_job_id).await?;
+            let model_id =
+                crate::fine_tune::training_job::resolve_model_id(&recorded_job_id, &record)?;
+            Ok(crate::fine_tune::training_job::TrainingJob::new(
+                recorded_job_id,
+                record.status,
+                model_id,
+                Arc::clone(self.catalog_arc()),
+            ))
+        }
     }
 
     /// The base-model PK a context-predictor job's `model_ref` binds to: the

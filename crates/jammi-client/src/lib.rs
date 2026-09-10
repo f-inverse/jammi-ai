@@ -24,6 +24,7 @@
 use std::collections::{BTreeMap, HashMap};
 use std::pin::Pin;
 use std::sync::Arc;
+use std::time::Duration;
 
 use arrow::array::{ArrayRef, Float32Array, RecordBatch, StringArray};
 use arrow::datatypes::{DataType, Field, Schema};
@@ -415,19 +416,47 @@ impl DataClient {
         self.job_status_response(job_id).await
     }
 
+    /// [`Self::wait_job`]'s default per-call `grpc-timeout` — see that
+    /// method's doc for why one is always set.
+    const WAIT_JOB_DEFAULT_TIMEOUT: Duration = Duration::from_secs(3600);
+
     /// Stream status updates for a job until it reaches a terminal state.
     /// Reconnecting with the same job id resumes the wait — an already
     /// terminal job's stream carries only its terminal `done` frame.
+    ///
+    /// Always carries a `grpc-timeout` (`WAIT_JOB_DEFAULT_TIMEOUT`, one hour)
+    /// — never an unbounded HTTP/2 request: a deployment that sets
+    /// `[server.limits] wait_timeout_secs` refuses ANY `WaitJob` call with no
+    /// declared deadline at all, matching an over-budget one (a caller that
+    /// never bounds its wait is exactly the resource risk that cap exists to
+    /// close). Use [`Self::wait_job_with_timeout`] to declare a different
+    /// deadline — one at or below the deployment's own budget, when known.
     pub async fn wait_job(
         &self,
         job_id: &str,
     ) -> Result<Pin<Box<dyn Stream<Item = Result<JobStatusResponse>> + Send>>> {
+        self.wait_job_with_timeout(job_id, Self::WAIT_JOB_DEFAULT_TIMEOUT)
+            .await
+    }
+
+    /// [`Self::wait_job`], with an explicit `grpc-timeout` rather than the
+    /// default. A reconnect after this deadline lapses (or after any other
+    /// disconnect) resumes the wait — the deadline bounds one connection's
+    /// hold on the server's `max_job_waits` budget, not the job's own
+    /// lifetime.
+    pub async fn wait_job_with_timeout(
+        &self,
+        job_id: &str,
+        timeout: Duration,
+    ) -> Result<Pin<Box<dyn Stream<Item = Result<JobStatusResponse>> + Send>>> {
         use jammi_wire::proto::job::{job_event::Event, JobHandle};
+        let mut request = tonic::Request::new(JobHandle {
+            job_id: job_id.to_string(),
+        });
+        request.set_timeout(timeout);
         let stream = self
             .job_client()
-            .wait_job(JobHandle {
-                job_id: job_id.to_string(),
-            })
+            .wait_job(request)
             .await
             .map_err(|s| error_from_status(&s))?
             .into_inner();
@@ -595,11 +624,24 @@ impl DataClient {
         Ok(Offset::new(resp.offset, committed_at))
     }
 
+    /// [`Self::subscribe`]'s default per-call `grpc-timeout` — see that
+    /// method's doc for why one is always set. Longer than
+    /// [`Self::WAIT_JOB_DEFAULT_TIMEOUT`]: a live tail subscription is
+    /// normally longer-lived than one job's wait.
+    const SUBSCRIBE_DEFAULT_TIMEOUT: Duration = Duration::from_secs(24 * 3600);
+
     /// Subscribe to a topic, returning a transport-neutral stream of delivered
     /// batches. The stream replays from `from_offset` (or the live tail when
     /// `None`) and then tails live, scoped to the session's tenant. When
     /// `replay_only` is set the server drives its finite drain and closes the
     /// stream rather than holding open to tail live batches.
+    ///
+    /// Always carries a `grpc-timeout` (`SUBSCRIBE_DEFAULT_TIMEOUT`), never
+    /// an unbounded HTTP/2 request — see [`Self::wait_job`]'s doc for
+    /// why (the same `[server.limits] wait_timeout_secs` cap governs both
+    /// streaming rpcs). The connection drops once the deadline lapses; a
+    /// caller that needs to keep tailing reconnects with `from_offset` set to
+    /// the last delivered offset, exactly like any other disconnect.
     pub async fn subscribe(
         &self,
         topic: &TopicDefinition,
@@ -610,20 +652,22 @@ impl DataClient {
         Pin<Box<dyn Stream<Item = std::result::Result<DeliveredBatch, TriggerError>> + Send>>,
         TriggerError,
     > {
+        let mut request = tonic::Request::new(SubscribeRequest {
+            topic: Some(TopicName {
+                name: topic.name.clone(),
+            }),
+            // The predicate crosses the wire as the SQL it was parsed from
+            // (empty == match-all); the server re-parses it against the same
+            // topic schema, so the in-process and remote filters are identical.
+            predicate: predicate.source_sql().unwrap_or("").to_string(),
+            from_offset: from_offset.map(|o| o.value()),
+            tenant_id: String::new(),
+            replay_only,
+        });
+        request.set_timeout(Self::SUBSCRIBE_DEFAULT_TIMEOUT);
         let streaming = self
             .trigger_client()
-            .subscribe(SubscribeRequest {
-                topic: Some(TopicName {
-                    name: topic.name.clone(),
-                }),
-                // The predicate crosses the wire as the SQL it was parsed from
-                // (empty == match-all); the server re-parses it against the same
-                // topic schema, so the in-process and remote filters are identical.
-                predicate: predicate.source_sql().unwrap_or("").to_string(),
-                from_offset: from_offset.map(|o| o.value()),
-                tenant_id: String::new(),
-                replay_only,
-            })
+            .subscribe(request)
             .await
             .map_err(|s| trigger_error_from_status(&s))?
             .into_inner();

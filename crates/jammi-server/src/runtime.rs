@@ -861,15 +861,35 @@ impl AssembledChain {
     /// DIRECTLY: it carries the engine's full transport contract, so the consumer
     /// re-applies nothing.
     ///
-    /// CANONICAL LAYER STACK: this applies the SAME stack [`Self::serve`] applies
-    /// — the whole-server [`MetricsLayer`] (outermost, observing every method
-    /// path) wrapping [`GrpcWebTrailersLayer`] (the trailers-only error repair)
-    /// wrapping [`GrpcWebLayer`] (gRPC-web framing) wrapping the routes. axum runs
-    /// the LAST `.layer` call as the OUTERMOST service — the inverse of the tonic
-    /// [`tonic::transport::Server`] builder, where the FIRST `.layer` is
-    /// outermost — so the calls are ordered inner→outer here to land the exact
-    /// same outermost→innermost stack `serve` builds. `accept_http1` has no axum
-    /// analogue: HTTP/1 is implicit in [`axum::serve()`].
+    /// PARTIAL LAYER STACK — this does NOT apply the SAME stack [`Self::serve`]
+    /// applies, despite this method's name; it applies only the gRPC-web +
+    /// metrics framing (the whole-server [`MetricsLayer`], outermost, observing
+    /// every method path, wrapping [`GrpcWebTrailersLayer`] — the trailers-only
+    /// error repair — wrapping [`GrpcWebLayer`], gRPC-web framing, wrapping the
+    /// routes). axum runs the LAST `.layer` call as the OUTERMOST service — the
+    /// inverse of the tonic [`tonic::transport::Server`] builder, where the FIRST
+    /// `.layer` is outermost — so the calls are ordered inner→outer here to land
+    /// the same outermost→innermost gRPC-web/metrics stack `serve` builds.
+    /// `accept_http1` has no axum analogue: HTTP/1 is implicit in
+    /// [`axum::serve()`].
+    ///
+    /// MISSING, relative to [`Self::serve`]: the WHOLE `[server.limits]`
+    /// request-bounds stack — [`crate::limits::RefusalStatusLayer`],
+    /// [`crate::limits::GlobalConcurrencyLimitLayer`],
+    /// [`crate::limits::PerConnectionLimitLayer`], and
+    /// [`crate::limits::MethodClassLayer`] (the message-size cap is unaffected
+    /// — it is applied per-service in `assemble_grpc_chain`, before this split,
+    /// so it rides along either path). `self.limits` is retained on
+    /// [`AssembledChain`] but not consulted here. A downstream serving this
+    /// router on ITS OWN listener therefore gets NO in-flight/per-connection/
+    /// wait-timeout/stream-budget enforcement from this stack unless it
+    /// re-applies `crate::limits`'s layers itself — the per-connection ones in
+    /// particular depend on tonic's own [`tonic::transport::server::
+    /// TcpConnectInfo`] request extension, which this axum path does not
+    /// independently guarantee is populated the same way, so re-applying them
+    /// blind here (rather than leaving this an explicit, documented gap for the
+    /// downstream to close with its own connection-info wiring) risks a
+    /// SILENTLY inert limit — worse than the honest gap this doc now states.
     ///
     /// ERGONOMIC GUARANTEE: the returned value is a plain `axum::Router` (state
     /// `()`, request body [`axum::body::Body`]) that [`axum::serve()`] accepts with

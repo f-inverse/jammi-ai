@@ -5,11 +5,17 @@
 //! `ListTrainingJobs`, and the service adds `WaitJob` (a resumable
 //! server-streaming wait) and `CancelJob`/`ListWorkers`, generalising the
 //! training-only queue into the kind-agnostic durable job abstraction every
-//! compute verb submits through (`jammi_ai::jobs`). This handler carries only
-//! the three training-kind `SubmitJob` variants directly (the oneof); every
-//! other compute verb keeps its own dedicated request message on its own
-//! service and returns a `SubmitJobResponse` in its place, sharing this
-//! service's `JobStatus`/`WaitJob` to retrieve the terminal payload.
+//! compute verb submits through internally (`jammi_ai::jobs`,
+//! `InferenceSession::run_now`). This handler carries only the three
+//! training-kind `SubmitJob` variants directly (the oneof); every other
+//! compute verb is synchronous on the wire TODAY — it keeps its own
+//! dedicated request AND response message on its own service (e.g.
+//! `PipelineService::BuildNeighborGraph`) rather than going through
+//! `SubmitJobResponse`, so this service's `JobStatus`/`WaitJob` never has a
+//! compute-kind row to answer for over the wire (K4: the synchronous
+//! response is still byte-identical to what a `jobs` row of the same kind
+//! would resolve to, since both paths run through the same
+//! `execute_compute` dispatcher).
 //!
 //! Tenant scope is read from the request's [`crate::grpc::session::
 //! SessionTenant`] extension (set upstream by the async tenant-binding layer)
@@ -20,9 +26,8 @@
 //! handler never distinguishes "absent" from "exists under another tenant",
 //! matching every other tenant-scoped read in this codebase.
 
-use std::collections::HashMap;
 use std::pin::Pin;
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
 use std::time::Duration;
 
 use futures::Stream;
@@ -60,48 +65,29 @@ fn is_training_kind(kind: &str) -> bool {
 /// engine session it submits jobs against and reads job records back from.
 pub struct JobServer {
     session: Arc<InferenceSession>,
-    /// `SubmitJob`'s idempotency-key dedupe map (`(tenant, key) -> job_id`).
-    /// Scoped to THIS server process's lifetime — not a durable catalog
-    /// guarantee (see `job.proto`'s `SubmitJobRequest.idempotency_key` doc).
-    idempotency: Mutex<HashMap<(Option<TenantId>, String), String>>,
 }
 
 impl JobServer {
     pub fn new(session: Arc<InferenceSession>) -> Self {
-        Self {
-            session,
-            idempotency: Mutex::new(HashMap::new()),
-        }
-    }
-
-    fn remembered_job_id(&self, tenant: Option<TenantId>, key: &str) -> Option<String> {
-        if key.is_empty() {
-            return None;
-        }
-        self.idempotency
-            .lock()
-            .expect("idempotency mutex poisoned")
-            .get(&(tenant, key.to_string()))
-            .cloned()
-    }
-
-    fn remember(&self, tenant: Option<TenantId>, key: &str, job_id: &str) {
-        if key.is_empty() {
-            return;
-        }
-        self.idempotency
-            .lock()
-            .expect("idempotency mutex poisoned")
-            .insert((tenant, key.to_string()), job_id.to_string());
+        Self { session }
     }
 
     /// Submit a decoded engine [`TrainingSpec`] on the request's session,
-    /// returning the durable [`TrainingJob`] handle. Delegates to the shared
-    /// [`InferenceSession::run_training_spec`] seam — the same dispatch the
-    /// embedded binding drives — so both transports submit an identical job
-    /// from an identical decode.
-    async fn submit(&self, spec: TrainingSpec) -> Result<TrainingJob, JammiError> {
-        self.session.run_training_spec(spec).await
+    /// returning the durable [`TrainingJob`] handle — the caller's own on a
+    /// fresh submission, or the pre-existing job's handle when
+    /// `idempotency_key` is non-empty and collides with a still-known prior
+    /// submission (migration 030's durable per-tenant dedupe; see
+    /// [`InferenceSession::run_training_spec_deduped`]). Delegates to that
+    /// seam — the same dispatch the embedded binding drives (with an empty
+    /// key, which never dedupes) — so both transports submit an identical
+    /// job from an identical decode.
+    async fn submit(
+        &self,
+        spec: TrainingSpec,
+        idempotency_key: &str,
+    ) -> Result<TrainingJob, JammiError> {
+        let key = (!idempotency_key.is_empty()).then_some(idempotency_key);
+        self.session.run_training_spec_deduped(spec, key).await
     }
 
     /// Read a job row by id under the request's tenant scope, applying
@@ -147,34 +133,19 @@ impl JobService for JobServer {
         let req = request.into_inner();
         let idempotency_key = req.idempotency_key.clone();
 
-        if let Some(existing_job_id) = self.remembered_job_id(tenant, &idempotency_key) {
-            // A second `SubmitJob` carrying an already-known key returns the
-            // handle of the job that key first created, unchanged — never a
-            // second submission.
-            if let Ok(record) = self.read_job(tenant, &existing_job_id).await {
-                let output_model_id = if is_training_kind(&record.kind) {
-                    resolve_model_id(&existing_job_id, &record).map_err(map_engine_error)?
-                } else {
-                    String::new()
-                };
-                return Ok(Response::new(pb::SubmitJobResponse {
-                    job_id: existing_job_id,
-                    kind: record.kind,
-                    output_model_id,
-                }));
-            }
-            // The remembered row vanished (pruned) — fall through and submit
-            // fresh, remembering the new id under the same key.
-        }
-
         let spec = training_spec_from_proto(req)?;
         let kind = spec.kind().to_string();
 
-        let job = scoped(&self.session, tenant, || self.submit(spec))
-            .await
-            .map_err(map_engine_error)?;
-
-        self.remember(tenant, &idempotency_key, &job.job_id);
+        // Durable per-tenant dedupe (migration 030) lives inside the engine
+        // seam this delegates to — `submit` reads back the winning row's own
+        // handle when `idempotency_key` collides with a still-known prior
+        // submission, so there is no separate memory-map lookup here (and
+        // nothing for a process restart or a pruned row to forget).
+        let job = scoped(&self.session, tenant, || {
+            self.submit(spec, &idempotency_key)
+        })
+        .await
+        .map_err(map_engine_error)?;
 
         Ok(Response::new(pb::SubmitJobResponse {
             job_id: job.job_id,
@@ -340,19 +311,25 @@ impl JobService for JobServer {
         }))
     }
 
-    #[tracing::instrument(skip(self, _request))]
+    /// Tenant-scoped: this RPC sweeps only the CALLER's own terminal rows,
+    /// through the SAME [`scoped`] path every other `JobService` RPC uses —
+    /// no verb on this wire surface is exempt from row-scoped tenant
+    /// isolation (family D/L). This is DISTINCT from the process's
+    /// construction-time sweep (`InferenceSession::wrap`, not an RPC), which
+    /// stays global-by-design (it runs once at boot, before any request is
+    /// scoped, under an explicit admin bypass) — see that call site's doc.
+    #[tracing::instrument(skip(self, request), fields(tenant_id = tracing::field::Empty))]
     async fn prune_jobs(
         &self,
-        _request: Request<pb::PruneJobsRequest>,
+        request: Request<pb::PruneJobsRequest>,
     ) -> Result<Response<pb::PruneJobsResponse>, Status> {
-        let retention_days = self.session.inner_config().jobs.retention_days;
-        let retention = Duration::from_secs(retention_days as u64 * 86_400);
-        let jobs_deleted = self
-            .session
-            .catalog()
-            .prune_jobs(retention)
-            .await
-            .map_err(map_engine_error)? as u64;
+        let tenant = session_tenant_traced(&request);
+        let retention = self.session.inner_config().jobs.retention();
+        let jobs_deleted = scoped(&self.session, tenant, || {
+            self.session.catalog().prune_jobs(retention)
+        })
+        .await
+        .map_err(map_engine_error)? as u64;
         Ok(Response::new(pb::PruneJobsResponse { jobs_deleted }))
     }
 }

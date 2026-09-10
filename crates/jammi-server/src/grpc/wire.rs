@@ -361,6 +361,38 @@ mod tests {
         ));
     }
 
+    /// K4 (F4, round-2 adversarial audit): `JobAttemptSuperseded`/
+    /// `JobCancelled` used to fold into the lossy `JammiError::Other` at the
+    /// wire boundary — `map_engine_error` already classified them with the
+    /// right gRPC `Code` (`Aborted`/`Cancelled`), but `attach_error_detail`'s
+    /// `pb::JammiErrorDetail::from(&JammiError)` had no arm for either, so a
+    /// remote client's `error_from_status` reconstructed `Other` carrying
+    /// only the `Display` string, never the typed variant with its `job_id`.
+    /// This exercises the SAME `attach_error_detail` → real `tonic::Status`
+    /// (genuine `grpc-status-details-bin` metadata bytes) → `error_from_status`
+    /// round trip a live gRPC call uses — the client-facing seam this bug
+    /// actually broke, not merely the in-memory `From` impl.
+    #[test]
+    fn job_attempt_superseded_and_job_cancelled_round_trip_as_their_typed_variant_not_other() {
+        let superseded = map_engine_error(JammiError::JobAttemptSuperseded {
+            job_id: "job-1".into(),
+        });
+        assert_eq!(superseded.code(), Code::Aborted);
+        assert!(matches!(
+            error_from_status(&superseded),
+            JammiError::JobAttemptSuperseded { job_id } if job_id == "job-1"
+        ));
+
+        let cancelled = map_engine_error(JammiError::JobCancelled {
+            job_id: "job-2".into(),
+        });
+        assert_eq!(cancelled.code(), Code::Cancelled);
+        assert!(matches!(
+            error_from_status(&cancelled),
+            JammiError::JobCancelled { job_id } if job_id == "job-2"
+        ));
+    }
+
     /// esc-089: this wire test pins
     /// ONLY the LAST leg of the chain — a variant, once produced, maps to
     /// the right gRPC code — never a substitute for the it-tests in

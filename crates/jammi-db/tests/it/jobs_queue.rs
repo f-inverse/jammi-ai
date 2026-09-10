@@ -1055,6 +1055,168 @@ async fn prune_jobs_deletes_only_terminal_rows_past_the_window(backend: BackendK
     assert!(catalog.get_job("old-running").await.is_ok());
 }
 
+// ─── F3: `submit_job_deduped`'s durable per-tenant idempotency key (migration
+// 030) ───────────────────────────────────────────────────────────────────
+
+/// RED before migration 030 + `submit_job_deduped`: there was no
+/// `jobs.idempotency_key` column and no way to dedupe a retry durably (the
+/// old dedupe lived in a process `HashMap`, forgotten across a restart and
+/// racy under two concurrent identical submissions).
+///
+/// Sequential retry: a second `submit_job_deduped` call carrying the SAME
+/// non-empty key as a still-known prior submission returns THAT prior job's
+/// id, never its own — the row of record is unchanged, not duplicated.
+#[test_case(BackendKind::Sqlite ; "sqlite")]
+#[cfg_attr(
+    feature = "live-postgres-tests",
+    test_case(BackendKind::Postgres ; "postgres")
+)]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn submit_job_deduped_sequential_retry_returns_the_same_job_id(backend: BackendKind) {
+    let dir = tempdir().unwrap();
+    let (_session, catalog) = queue_catalog!(backend, dir.path());
+
+    let first = catalog
+        .submit_job_deduped(job_params("dedupe-first"), Some("retry-key-1"))
+        .await
+        .unwrap();
+    assert_eq!(first, "dedupe-first", "the first call's own id wins");
+
+    let second = catalog
+        .submit_job_deduped(job_params("dedupe-second"), Some("retry-key-1"))
+        .await
+        .unwrap();
+    assert_eq!(
+        second, first,
+        "a retry carrying the same key must return the FIRST call's job id, \
+         never submit a second row"
+    );
+
+    let all = catalog.list_jobs().await.unwrap();
+    assert_eq!(all.iter().filter(|j| j.job_id == "dedupe-first").count(), 1);
+    assert!(
+        all.iter().all(|j| j.job_id != "dedupe-second"),
+        "the second call's own job_id must never have been inserted"
+    );
+}
+
+/// Concurrent retry: two `submit_job_deduped` calls racing the SAME key via
+/// `tokio::join!` land exactly one row — the atomic `INSERT ... ON CONFLICT
+/// ... DO NOTHING RETURNING` compare-and-set closes the lookup-then-insert
+/// race window a separate reservation step could not.
+#[test_case(BackendKind::Sqlite ; "sqlite")]
+#[cfg_attr(
+    feature = "live-postgres-tests",
+    test_case(BackendKind::Postgres ; "postgres")
+)]
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn submit_job_deduped_concurrent_retry_produces_exactly_one_row(backend: BackendKind) {
+    let dir = tempdir().unwrap();
+    let (_session, catalog) = queue_catalog!(backend, dir.path());
+
+    let cat_1 = Arc::clone(&catalog);
+    let cat_2 = Arc::clone(&catalog);
+    let (r1, r2) = tokio::join!(
+        cat_1.submit_job_deduped(job_params("dedupe-race-a"), Some("race-key")),
+        cat_2.submit_job_deduped(job_params("dedupe-race-b"), Some("race-key")),
+    );
+    let (id1, id2) = (r1.unwrap(), r2.unwrap());
+    assert_eq!(
+        id1, id2,
+        "both concurrent racers must agree on ONE winning job id"
+    );
+    assert!(id1 == "dedupe-race-a" || id1 == "dedupe-race-b");
+
+    let all = catalog.list_jobs().await.unwrap();
+    let race_rows: Vec<_> = all
+        .iter()
+        .filter(|j| j.job_id == "dedupe-race-a" || j.job_id == "dedupe-race-b")
+        .collect();
+    assert_eq!(
+        race_rows.len(),
+        1,
+        "exactly one row must exist for the raced key, never two: {race_rows:?}"
+    );
+}
+
+/// A pruned row does not resurrect an identity for its key — there is no
+/// separate map to resurrect. Submitting with a key, pruning that row away,
+/// then retrying with the SAME key submits a genuinely fresh row rather than
+/// erroring or reattaching to the deleted id.
+#[test_case(BackendKind::Sqlite ; "sqlite")]
+#[cfg_attr(
+    feature = "live-postgres-tests",
+    test_case(BackendKind::Postgres ; "postgres")
+)]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn submit_job_deduped_after_the_row_is_pruned_submits_fresh(backend: BackendKind) {
+    let dir = tempdir().unwrap();
+    let (_session, catalog) = queue_catalog!(backend, dir.path());
+
+    let first = catalog
+        .submit_job_deduped(job_params("dedupe-pruned-first"), Some("prune-key"))
+        .await
+        .unwrap();
+    assert_eq!(first, "dedupe-pruned-first");
+
+    force_job_status_and_age(&catalog, &first, "completed", 31).await;
+    let deleted = catalog
+        .prune_jobs(Duration::from_secs(30 * 86_400))
+        .await
+        .unwrap();
+    assert_eq!(deleted, 1, "the first row must be pruned away");
+    assert!(catalog.get_job(&first).await.is_err());
+
+    let second = catalog
+        .submit_job_deduped(job_params("dedupe-pruned-second"), Some("prune-key"))
+        .await
+        .unwrap();
+    assert_eq!(
+        second, "dedupe-pruned-second",
+        "the key's prior row is gone, so a retry submits fresh under its OWN id"
+    );
+}
+
+/// Different tenants may reuse the same idempotency key: it is scoped by
+/// `(tenant, key)`, not `key` alone.
+#[test_case(BackendKind::Sqlite ; "sqlite")]
+#[cfg_attr(
+    feature = "live-postgres-tests",
+    test_case(BackendKind::Postgres ; "postgres")
+)]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn submit_job_deduped_different_tenants_may_reuse_a_key(backend: BackendKind) {
+    use std::str::FromStr;
+
+    use jammi_db::TenantId;
+
+    let dir = tempdir().unwrap();
+    let session = skip_if_no_backend!(backend, dir.path());
+    let base = Arc::clone(session.catalog());
+    reset_queue(&base).await;
+    register_base_model(&base).await;
+
+    let tenant_a = TenantId::from_str("01906c83-d4c8-7e10-9c4f-3b6f7c5a8e91").unwrap();
+    let tenant_b = TenantId::from_str("01906c83-d4c8-7e10-9c4f-3b6f7c5a8e92").unwrap();
+    let cat_a = base.pinned_to_tenant(Some(tenant_a));
+    let cat_b = base.pinned_to_tenant(Some(tenant_b));
+
+    let id_a = cat_a
+        .submit_job_deduped(job_params("dedupe-tenant-a"), Some("shared-key"))
+        .await
+        .unwrap();
+    let id_b = cat_b
+        .submit_job_deduped(job_params("dedupe-tenant-b"), Some("shared-key"))
+        .await
+        .unwrap();
+    assert_eq!(id_a, "dedupe-tenant-a");
+    assert_eq!(
+        id_b, "dedupe-tenant-b",
+        "tenant B's submission under the SAME key must be its OWN fresh row, \
+         never tenant A's"
+    );
+}
+
 async fn force_job_status_and_age(catalog: &Catalog, job_id: &str, status: &str, days_ago: i64) {
     let cutoff = (chrono::Utc::now() - chrono::Duration::days(days_ago))
         .format("%Y-%m-%dT%H:%M:%S%.9fZ")

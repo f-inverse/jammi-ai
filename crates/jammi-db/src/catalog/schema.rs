@@ -1046,3 +1046,25 @@ FROM training_jobs;
 
 DROP TABLE training_jobs;
 "#;
+
+/// Durable per-tenant `SubmitJob` dedupe key (esc-C2c-F3 / issue #485):
+/// `jobs.idempotency_key` is nullable (unset for every pre-existing caller
+/// and every non-deduped `Catalog::submit_job` call, which never dedupes) and
+/// `idx_jobs_tenant_idempotency_key` is a PARTIAL unique index — it indexes
+/// only rows whose key is set, so a `NULL` key never collides with another
+/// `NULL` key (unlimited un-keyed submissions stay legal). The index key is
+/// `COALESCE(tenant_id, '')`, not the bare column: a bare `(tenant_id, key)`
+/// unique index would let two GLOBAL (`tenant_id IS NULL`) submissions reuse
+/// the same key freely, because SQL's default NULL-is-distinct-from-NULL rule
+/// makes an ordinary unique index a no-op across NULL-tenant rows on both
+/// Postgres and SQLite — the `COALESCE` folds every un-scoped tenant onto the
+/// same `''` bucket so the SAME-tenant dedupe guarantee holds in single-tenant
+/// deployments too, the common case. `Catalog::submit_job_deduped`'s `INSERT
+/// ... ON CONFLICT (COALESCE(tenant_id, ''), idempotency_key) WHERE
+/// idempotency_key IS NOT NULL DO NOTHING` targets this exact index.
+pub(super) const MIGRATION_030_JOBS_IDEMPOTENCY_KEY: &str = r#"
+ALTER TABLE jobs ADD COLUMN idempotency_key TEXT;
+CREATE UNIQUE INDEX idx_jobs_tenant_idempotency_key
+    ON jobs (COALESCE(tenant_id, ''), idempotency_key)
+    WHERE idempotency_key IS NOT NULL;
+"#;

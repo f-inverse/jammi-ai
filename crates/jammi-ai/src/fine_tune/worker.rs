@@ -4850,7 +4850,7 @@ mod tests {
         let offline_hub = HubSource::from_config(
             &jammi_db::config::ModelsConfig {
                 hub_cache_dir: Some(root),
-                offline: true,
+                offline: Some(true),
                 ..Default::default()
             },
             &|_: &str| None,

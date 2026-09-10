@@ -7,6 +7,28 @@ workspace ships every publishable crate at the same
 ## [Unreleased]
 
 ### Added
+- **`HubSource`'s Hub cache proven warm across a restart, `HF_HOME` proven end-to-end, and
+  `HF_HUB_OFFLINE` honoured as the env fallback for `[models] offline` (#481).**
+  `crates/jammi-ai/tests/it/hub_source.rs` gains two hermetic wiremock oracles:
+  `hf_home_env_drives_the_cache_root_end_to_end` drives `HF_HOME` through
+  `HubSource::from_config`'s injected `env` closure (never `std::env::set_var`) and asserts the
+  fetched file lands under `{HF_HOME}/hub/…`; `warm_cache_across_a_second_hub_source_issues_no_requests`
+  builds a SECOND `HubSource` over the same `hub_cache_dir` and asserts it issues ZERO new
+  requests against the mock server, proving a process restart with a mounted cache volume never
+  re-downloads. `ModelsConfig::offline` (`crates/jammi-db/src/config/mod.rs`) moves from `bool` to
+  `Option<bool>`, matching the other three `[models]` fields' own `Option`-typed "config beats
+  env" precedence: `Some(_)` wins outright in either direction over the new `HF_HUB_OFFLINE`
+  environment fallback (accepted values `"1"` or a case-insensitive `"true"`, mirroring
+  `huggingface_hub`'s own convention — hf-hub 0.5, the Rust crate, does not read this variable at
+  all), and only an omitted `offline` key falls back to it. `crates/jammi-encoders/tests/live_real_clap.rs`'s
+  `fetch_real_model` no longer calls raw `hf_hub::api::sync::Api::new()` (which ignored
+  `HF_ENDPOINT`/`HF_TOKEN` and panicked without `HOME`) — it builds the jammi-encoders-local
+  mirror of `HubSource`'s chain inline (`HF_HUB_CACHE`/`HF_HOME`/default cache root,
+  `HF_ENDPOINT`, `HF_TOKEN`), since jammi-encoders cannot depend on jammi-ai. Docs
+  (`docs/guide/src/local-models.md`) gain the `JAMMI_MODELS__HUB_*` env-override tier, the
+  `HF_HUB_OFFLINE` precedence row, and fix the `hub_cache_dir = "/var/cache/jammi/hub"` examples
+  (here and in `crates/jammi-db/src/config/mod.rs`'s own doc comment) that resolved to
+  `/var/cache/jammi/hub/hub` once the `hub/` subdirectory `HubSource` appends is accounted for.
 - **A tested Shape B Compose stack, `jammi-server probe`, `jammi-server serve` as the
   default subcommand, a reference-topologies guide page, and supply-chain
   attestations on the published images (#482).** `deploy/docker-compose.yml`

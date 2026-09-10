@@ -38,7 +38,22 @@
 //! 3. the cache's own `token` file (`{root}/token`, `huggingface-cli login`'s
 //!    file — [`hf_hub::Cache::token`])
 //!
-//! The `HF_HOME`/`HF_ENDPOINT`/`HF_TOKEN` fallbacks read the process
+//! **Offline** (whether `HubSource::offline` refuses a Hub fetch — see
+//! "the `offline` promise is Hub-only" below for exactly what this refuses):
+//! 1. `[models] offline`, when `Some(_)` — wins outright, in EITHER
+//!    direction: a literal `offline = false` in the TOML forces online even
+//!    when `HF_HUB_OFFLINE` is set in the environment, exactly as a literal
+//!    `offline = true` forces offline even when it is not
+//! 2. the `HF_HUB_OFFLINE` environment variable, when `[models] offline` is
+//!    omitted (`None`) — accepted values are `"1"` or a case-insensitive
+//!    `"true"`, matching the `huggingface_hub` Python client's own
+//!    true-value convention for this variable (see
+//!    <https://huggingface.co/docs/huggingface_hub/en/package_reference/environment_variables#hfhuboffline>;
+//!    hf-hub, the Rust crate this module wraps, does not read
+//!    `HF_HUB_OFFLINE` at all — see this module's private `resolve_offline`)
+//! 3. `false`
+//!
+//! The `HF_HOME`/`HF_ENDPOINT`/`HF_TOKEN`/`HF_HUB_OFFLINE` fallbacks read the process
 //! environment **here**, through the `env` closure the caller passes — never
 //! inside `jammi_db::config::JammiConfig::load_from` (which stays
 //! process-env-free by construction). Production passes
@@ -131,7 +146,7 @@ impl HubSource {
 
         Ok(Self {
             api,
-            offline: config.offline,
+            offline: resolve_offline(config, env),
         })
     }
 
@@ -221,6 +236,34 @@ fn resolve_token(
         return Ok(Some(token));
     }
     Ok(cache.token())
+}
+
+/// Resolve `[models] offline` per the module docs' "Offline" precedence:
+/// `[models] offline`, when `Some(_)`, wins outright in EITHER direction —
+/// never OR'd with the environment, so a literal `offline = false` silences
+/// `HF_HUB_OFFLINE` exactly as a literal `offline = true` forces it on
+/// regardless of the environment. Only an OMITTED config value (`None`)
+/// falls back to `HF_HUB_OFFLINE`, then to `false`.
+fn resolve_offline(config: &ModelsConfig, env: &dyn Fn(&str) -> Option<String>) -> bool {
+    if let Some(offline) = config.offline {
+        return offline;
+    }
+    env("HF_HUB_OFFLINE")
+        .map(|value| is_hf_hub_offline_truthy(&value))
+        .unwrap_or(false)
+}
+
+/// `true` for `"1"` or a case-insensitive `"true"` (surrounding whitespace
+/// ignored); anything else — including empty, `"0"`, `"false"`, or a value
+/// hf-hub/`huggingface_hub` would also treat as false — is not offline. This
+/// mirrors `huggingface_hub`'s own `HF_HUB_OFFLINE` truthy convention (see
+/// the module docs' "Offline" precedence for the citation); hf-hub 0.5, the
+/// Rust crate `HubSource` wraps, does not read `HF_HUB_OFFLINE` at all, so
+/// this crate reads and parses it directly rather than leaving the variable
+/// silently ignored.
+fn is_hf_hub_offline_truthy(value: &str) -> bool {
+    let trimmed = value.trim();
+    trimmed == "1" || trimmed.eq_ignore_ascii_case("true")
 }
 
 #[cfg(test)]
@@ -433,5 +476,63 @@ mod tests {
         })
         .unwrap();
         assert_eq!(resolved, dir.path());
+    }
+
+    // --- precedence: offline (config Some(_) wins outright > HF_HUB_OFFLINE > false) ---
+
+    #[test]
+    fn offline_falls_back_to_hf_hub_offline_env_when_config_is_none() {
+        let config = ModelsConfig::default();
+        let env = |k: &str| (k == "HF_HUB_OFFLINE").then(|| "1".to_string());
+        assert!(resolve_offline(&config, &env));
+    }
+
+    #[test]
+    fn offline_is_false_when_neither_config_nor_env_says_so() {
+        let config = ModelsConfig::default();
+        assert!(!resolve_offline(&config, &no_env));
+    }
+
+    /// Direction: explicit `Some(false)` wins over `HF_HUB_OFFLINE=1` — never
+    /// OR'd with the environment. Matches the other three chains' "config
+    /// wins" precedence.
+    #[test]
+    fn offline_config_some_false_wins_over_hf_hub_offline_env() {
+        let config = ModelsConfig {
+            offline: Some(false),
+            ..Default::default()
+        };
+        let env = |k: &str| (k == "HF_HUB_OFFLINE").then(|| "1".to_string());
+        assert!(!resolve_offline(&config, &env));
+    }
+
+    /// Symmetric direction: explicit `Some(true)` wins even when the
+    /// environment says nothing (or would say false) — `HF_HUB_OFFLINE` is
+    /// consulted only when the config is `None`.
+    #[test]
+    fn offline_config_some_true_wins_regardless_of_env() {
+        let config = ModelsConfig {
+            offline: Some(true),
+            ..Default::default()
+        };
+        assert!(resolve_offline(&config, &no_env));
+    }
+
+    #[test]
+    fn hf_hub_offline_truthy_accepts_bare_one_and_case_insensitive_true() {
+        assert!(is_hf_hub_offline_truthy("1"));
+        assert!(is_hf_hub_offline_truthy("true"));
+        assert!(is_hf_hub_offline_truthy("TRUE"));
+        assert!(is_hf_hub_offline_truthy("True"));
+        assert!(is_hf_hub_offline_truthy("  true  "));
+    }
+
+    #[test]
+    fn hf_hub_offline_truthy_rejects_everything_else() {
+        assert!(!is_hf_hub_offline_truthy("0"));
+        assert!(!is_hf_hub_offline_truthy("false"));
+        assert!(!is_hf_hub_offline_truthy(""));
+        assert!(!is_hf_hub_offline_truthy("yes"));
+        assert!(!is_hf_hub_offline_truthy("on"));
     }
 }

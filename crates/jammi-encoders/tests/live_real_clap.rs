@@ -61,10 +61,38 @@ fn row_cosine_min(got: &Tensor, golden: &Tensor) -> candle_core::Result<f32> {
 }
 
 /// Resolve the real checkpoint's weights + config from the HF Hub (cached
-/// on-disk after the first download), mirroring the `hf_hub` pattern in
-/// `crates/jammi-ai/tests/it/models.rs`.
+/// on-disk after the first download).
+///
+/// jammi-encoders cannot depend on jammi-ai (the dependency runs the other
+/// way: jammi-ai depends on jammi-encoders), so this cannot call
+/// `jammi_ai::model::hub::HubSource` — this is the jammi-encoders-LOCAL
+/// mirror of that same three-tier chain, built inline from `hf_hub` directly
+/// rather than the bare `hf_hub::api::sync::Api::new()` this replaced (which
+/// ignored `HF_ENDPOINT`/`HF_TOKEN` entirely — hf-hub 0.5 never reads
+/// `HF_TOKEN` on its own — and panics outright via
+/// `hf_hub::Cache::default()`'s `dirs::home_dir().expect(..)` when `HOME` is
+/// unset):
+///   - cache root: `HF_HUB_CACHE` (used directly as the cache dir) ->
+///     `hf_hub::Cache::from_env()` (which itself reads `HF_HOME`, then falls
+///     back to the platform home dir's `.cache/huggingface`)
+///   - endpoint: `HF_ENDPOINT` -> hf-hub's own default
+///     (`https://huggingface.co`)
+///   - token: `HF_TOKEN` only -- this harness does not fall back further to
+///     the cache's own `token` file; `live-hub-tests` runs are expected to
+///     set `HF_TOKEN` explicitly (or rely on this repo being public)
 fn fetch_real_model() -> (std::path::PathBuf, std::path::PathBuf) {
-    let api = hf_hub::api::sync::Api::new().expect("build hf_hub api");
+    let cache = match std::env::var("HF_HUB_CACHE") {
+        Ok(dir) => hf_hub::Cache::new(std::path::PathBuf::from(dir)),
+        Err(_) => hf_hub::Cache::from_env(),
+    };
+    let mut builder = hf_hub::api::sync::ApiBuilder::from_cache(cache);
+    if let Ok(endpoint) = std::env::var("HF_ENDPOINT") {
+        builder = builder.with_endpoint(endpoint);
+    }
+    if let Ok(token) = std::env::var("HF_TOKEN") {
+        builder = builder.with_token(Some(token));
+    }
+    let api = builder.build().expect("build hf_hub api");
     let repo = api.model(REAL_MODEL_ID.to_string());
     let weights = repo
         .get("model.safetensors")

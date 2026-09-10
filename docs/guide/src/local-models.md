@@ -113,16 +113,24 @@ Hugging Face Hub through one client built once from `[models]`:
 ```toml
 [models]
 hub_endpoint = "https://huggingface.co"
-hub_cache_dir = "/var/cache/jammi/hub"
+hub_cache_dir = "/var/cache/jammi"
 hub_token = { file = "/run/secrets/hf-token" }
 offline = false
 ```
+
+Every field is also settable through the standard `JAMMI_MODELS__HUB_*` /
+`JAMMI_MODELS__OFFLINE` env-override layer (e.g. `JAMMI_MODELS__HUB_CACHE_DIR`,
+`JAMMI_MODELS__OFFLINE=true`) — that tier sits ABOVE the `HF_*` fallbacks
+below: a `JAMMI_*` override behaves exactly like the equivalent TOML key, one
+precedence step above `HF_HOME`/`HF_ENDPOINT`/`HF_TOKEN`/`HF_HUB_OFFLINE`, not
+alongside them.
 
 | Field | Precedence |
 |---|---|
 | Cache root (a `hub/` subdirectory is appended) | `hub_cache_dir` → `HF_HOME` → the platform home directory's `.cache/huggingface` |
 | Endpoint | `hub_endpoint` → `HF_ENDPOINT` → the Hub's own default |
 | Token | `hub_token` → `HF_TOKEN` → the cache's own `token` file (`huggingface-cli login`'s file) |
+| Offline | `offline`, when explicitly set → `HF_HUB_OFFLINE` (`1` or a case-insensitive `true`) → `false` |
 
 No home directory, no `HF_HOME`, and no `hub_cache_dir` is a typed
 `JammiError::Config` at session construction — never a panic. A token that
@@ -135,4 +143,19 @@ catalog row — a warm, on-disk Hub cache directory with no matching catalog
 row is still a miss, because the catalog (not the cache) is offline's source
 of truth. It does not reach the fine-tune worker's adapter fetch for an
 already-trained model, which always reads the adapter bundle from the
-artifact store, offline or not.
+artifact store, offline or not. An explicit `offline = false` wins over
+`HF_HUB_OFFLINE` in the environment (and vice versa for `offline = true`) —
+only an OMITTED `offline` key falls back to `HF_HUB_OFFLINE` at all.
+
+Every `HF_*`/`HF_HUB_OFFLINE` fallback above is read from the **server**
+process's own environment, at session construction — never from a remote
+client's environment (a gRPC/Flight SQL/Python client connecting to a
+running `jammi-server` has no way to influence these; only that server
+process's own `[models]`/env decides resolution).
+
+A configured `hub_endpoint`/mirror is not part of a resolved model's
+identity: two endpoints can serve different bytes for the same repo id (a
+stale or divergent mirror), so once a model resolves, its catalog
+`artifact_path` pins the actual bytes fetched — re-resolving under a
+different endpoint later never silently swaps them out from under an
+already-registered model.

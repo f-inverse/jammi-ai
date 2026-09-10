@@ -1306,7 +1306,7 @@ pub struct LoggingConfig {
 /// ```toml
 /// [models]
 /// hub_endpoint = "https://huggingface.co"
-/// hub_cache_dir = "/var/cache/jammi/hub"
+/// hub_cache_dir = "/var/cache/jammi"
 /// hub_token = { file = "/run/secrets/hf-token" }
 /// offline = false
 /// ```
@@ -1326,8 +1326,19 @@ pub struct ModelsConfig {
     /// read at the `jammi-ai` session choke point, not here (H4).
     pub hub_token: Option<SecretSource>,
     /// Refuse every network fetch: a model loads only from `local:` or an
-    /// already-resolved catalog row. Default: `false`.
-    pub offline: bool,
+    /// already-resolved catalog row. `Some(_)` wins outright over the
+    /// `HF_HUB_OFFLINE` environment variable — set `Some(false)` explicitly
+    /// (a literal `offline = false` in the TOML) to force online even when
+    /// `HF_HUB_OFFLINE` is set in the process environment; an OMITTED field
+    /// (`None`, the `#[serde(default)]` value) falls back to
+    /// `HF_HUB_OFFLINE`, then to `false`. `Option<bool>`, not a plain
+    /// `bool`, is what makes "explicitly set to false" distinguishable from
+    /// "never mentioned" — the same reason the other three fields above are
+    /// already `Option`-typed. See `jammi-ai`'s
+    /// `model::hub::HubSource::from_config` (a downstream crate — not
+    /// linkable from here) for the resolution this drives and the accepted
+    /// `HF_HUB_OFFLINE` values.
+    pub offline: Option<bool>,
 }
 
 // --- Defaults ---

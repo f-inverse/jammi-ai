@@ -119,7 +119,7 @@ pub const DEFAULT_PROPAGATE_MAX_ROWS: usize = 2_000_000;
 /// the symmetric `Â = D̃^{-1/2}(A+I)D̃^{-1/2}` of SGC/APPNP, paired with the
 /// `α`-teleport restart — the PageRank-decay form that keeps propagation
 /// anchored against over-smoothing.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, serde::Serialize, serde::Deserialize)]
 pub enum PropagationWeighting {
     /// Random-walk normalisation `D̃^{-1}Ã`: each node's new vector is the plain
     /// mean of itself and its neighbours. No degree fold needed — the hop is a
@@ -144,7 +144,7 @@ pub enum PropagationWeighting {
 /// [`JumpingKnowledge`](PropagationOutput::JumpingKnowledge) changes the output
 /// dimensionality — concatenating the per-hop blocks yields `(K+1)·d` columns in
 /// their own vector space, a same-space hazard a `bool` would hide.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, serde::Serialize, serde::Deserialize)]
 pub enum PropagationOutput {
     /// Emit only the final `X⁽ᴷ⁾` — a `d`-dimensional embedding table in the
     /// input's vector space.
@@ -160,7 +160,7 @@ pub enum PropagationOutput {
 /// Which declared edge relation to propagate over and how the walk reads it. The
 /// edge source and direction reuse the shared graph-neighbourhood config types;
 /// the loader here is propagation's own bounded, tenant-scoped scan.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct PropagateRequest {
     /// The source whose embedding table holds `X⁽⁰⁾`.
     pub source_id: String,
@@ -272,8 +272,51 @@ struct WeightedNeighbour {
 }
 
 impl InferenceSession {
-    /// Propagate an embedding table's features over a declared graph and
-    /// materialise the result as a new, searchable embedding table.
+    /// Propagate an embedding table's features over a declared graph — the
+    /// thin [`Self::run_now`] wrapper (item 2/K4): submits a
+    /// [`crate::jobs::ComputeSpec::Propagate`] and returns the terminal
+    /// [`ResultTableRecord`] + [`CacheOutcome`](jammi_db::store::CacheOutcome)
+    /// [`Self::run_now`] produced, so a direct call and a queued-and-claimed
+    /// `propagate` job of the same spec run identical code
+    /// (`Self::propagate_embeddings_materialize`, through
+    /// [`crate::jobs::execute_compute`]).
+    pub async fn propagate_embeddings(
+        self: &Arc<Self>,
+        request: &PropagateRequest,
+        cache: jammi_db::store::CachePolicy,
+    ) -> Result<(ResultTableRecord, jammi_db::store::CacheOutcome)> {
+        let spec = crate::jobs::ComputeSpec::Propagate {
+            request: request.clone(),
+            cache,
+        };
+        match self.run_now(spec).await? {
+            crate::jobs::JobResult::Table {
+                table,
+                cache_outcome,
+            } => {
+                let record = self
+                    .catalog()
+                    .get_result_table(&table)
+                    .await?
+                    .ok_or_else(|| {
+                        JammiError::Catalog(format!(
+                            "propagate_embeddings: run_now's own table '{table}' vanished \
+                             before it could be read back"
+                        ))
+                    })?;
+                let outcome = crate::session::parse_cache_outcome(&cache_outcome, &table);
+                Ok((record, outcome))
+            }
+            crate::jobs::JobResult::Model { .. } => Err(JammiError::Other(
+                "propagate_embeddings: run_now returned a training JobResult for a compute spec"
+                    .into(),
+            )),
+        }
+    }
+
+    /// `propagate_embeddings`'s actual materializer — see
+    /// [`InferenceSession::infer_materialize`]'s doc for the `job_attempt`
+    /// convention every `*_materialize` method shares.
     ///
     /// Loads `X⁽⁰⁾` from the source's embedding table and the tenant-scoped edge
     /// relation, then iterates [`PropagateRequest::effective_hops`] hops of the
@@ -289,10 +332,11 @@ impl InferenceSession {
     /// The edge load runs through the generic SQL surface so the tenant-scope
     /// analyzer rule scopes the scan — a cross-tenant endpoint is filtered before
     /// it reaches the adjacency.
-    pub async fn propagate_embeddings(
+    pub(crate) async fn propagate_embeddings_materialize(
         self: &Arc<Self>,
         request: &PropagateRequest,
         cache: jammi_db::store::CachePolicy,
+        job_attempt: Option<jammi_db::catalog::result_repo::JobAttempt<'_>>,
     ) -> Result<(ResultTableRecord, jammi_db::store::CacheOutcome)> {
         let table = self
             .catalog()
@@ -409,6 +453,7 @@ impl InferenceSession {
                 },
                 &rows,
                 jammi_db::store::manifest::Materialization::new(&descriptor, &env, inputs),
+                job_attempt,
             )
             .await?;
         Ok((record, jammi_db::store::CacheOutcome::Computed))

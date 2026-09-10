@@ -273,15 +273,19 @@ impl<'a> EvalRunner<'a> {
                     .await?;
                 let golden = load_classification_golden_from_batches(&batches)?;
 
-                let (results, _) = self
+                let (_table, results, _) = self
                     .session
-                    .infer(
+                    .infer_materialize(
                         source_id,
                         &model_source,
                         crate::model::ModelTask::Classification,
                         columns,
                         "id",
                         jammi_db::store::CachePolicy::Bypass,
+                        // Eval is not itself a job — it materialises directly,
+                        // never through `run_now`, so it carries no job of
+                        // record.
+                        None,
                     )
                     .await?;
 
@@ -326,15 +330,16 @@ impl<'a> EvalRunner<'a> {
                     .await?;
                 let golden = load_ner_golden_from_batches(&batches)?;
 
-                let (results, _) = self
+                let (_table, results, _) = self
                     .session
-                    .infer(
+                    .infer_materialize(
                         source_id,
                         &model_source,
                         crate::model::ModelTask::Ner,
                         columns,
                         "id",
                         jammi_db::store::CachePolicy::Bypass,
+                        None,
                     )
                     .await?;
 

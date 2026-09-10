@@ -151,6 +151,7 @@ async fn meta_session(
             },
             &pairs,
             jammi_db::store::manifest::Materialization::new(&__d, &__e, __i),
+            None,
         )
         .await
         .unwrap();

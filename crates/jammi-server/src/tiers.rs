@@ -9,25 +9,35 @@
 //! - [`ServiceTier::Core`] — **always** mounted: the control-plane
 //!   `CatalogService` (the tenant trio + the `GetServerInfo` handshake, plus the
 //!   sources / models / channels / mutable-tables / topic-admin catalog verbs),
-//!   `EmbeddingService`, `InferenceService`, and `AuditService`. These are the
-//!   serve-path primitives every deployment needs: bind a tenant, embed, infer,
-//!   read result/mutable tables, observe channel state, and read audit records.
+//!   `EmbeddingService`, `InferenceService`, `PipelineService`, `AuditService`,
+//!   and `JobService` — the durable job submission/status/wait surface
+//!   (`SubmitJob` / `JobStatus` / `WaitJob`). These are the serve-path primitives every deployment
+//!   needs: bind a tenant, embed, infer, read result/mutable tables, observe
+//!   channel state, read audit records, submit a job and read its status.
 //!   There is no useful Jammi server without them.
-//! - [`ServiceTier::Train`] — `TrainingService` (`StartTraining` /
-//!   `TrainingStatus`). A serve-only box does not train.
 //! - [`ServiceTier::Event`] — `TriggerService` (publish / subscribe). A
 //!   downstream tier builds on this trigger stream. (Topic *admin* is a
 //!   control-plane catalog verb, always present; only the publish/subscribe
 //!   compute stream is event-gated.)
 //! - [`ServiceTier::Eval`] — `EvalService` (per-query eval arrays). A tooling
-//!   surface, not part of the serve or train hot path.
+//!   surface, not part of the serve hot path.
 //!
-//! The catalog / mutable-table / channel / audit verbs sit in **core**, not in
-//! a tier of their own: they are the control-plane + read/write data primitives
-//! the serve path depends on (a serve-only box that embeds and queries result
-//! tables needs mutable-table reads; audit is introspection every surface
-//! emits), so splitting them out would leave a "serve" deployment unable to
-//! serve. Only `Train`, `Event`, and `Eval` are role-specific enough to gate.
+//! Submitting a job and *running* it are different questions. Submission is
+//! core: every deployment accepts a job and reports its status. Whether THIS
+//! process also claims and executes queued jobs is the `[worker] enabled`
+//! runtime key ([`jammi_db::config::WorkerConfig`]), read by
+//! [`crate::runtime::assemble_grpc_chain`] — not a tier and not a build
+//! feature. A request node runs `[worker] enabled = false` and still accepts
+//! every submission; a compute node runs `services = []` with `[worker]
+//! enabled = true, kinds = [...]` and claims what the request nodes queued.
+//!
+//! The catalog / mutable-table / channel / audit / job-submission verbs sit in
+//! **core**, not in a tier of their own: they are the control-plane +
+//! read/write data primitives the serve path depends on (a serve-only box that
+//! embeds and queries result tables needs mutable-table reads; audit is
+//! introspection every surface emits), so splitting them out would leave a
+//! "serve" deployment unable to serve. Only `Event` and `Eval` are
+//! role-specific enough to gate.
 //!
 //! ## Capability matches deployment
 //!
@@ -35,28 +45,17 @@
 //! [`crate::grpc::proto::catalog::ServerInfo::services`]. Reaching a verb whose
 //! tier was not mounted is a truthful tonic `Unimplemented` — the service-mount
 //! analog of the client `connect(target)` capability-by-build: the box that did
-//! not opt into `train` does not advertise or answer train verbs.
+//! not opt into `eval` does not advertise or answer eval verbs.
 //!
-//! ## Runtime config vs compile features
+//! ## Runtime config, no compile features
 //!
-//! Two independent gates compose, and a tier is mounted **iff both pass**:
-//!
-//! 1. **Compile feature** ([`ServiceTier::compiled_in`]) — a hard ceiling. A
-//!    tier whose code is `#[cfg]`-gated out of the binary *cannot* be mounted,
-//!    no matter what config says; requesting it is a startup error
-//!    ([`TierError::FeatureNotCompiled`]). Today only `Train` carries such a
-//!    gate (the server `train` feature, default-on, which compiles the
-//!    `TrainingService` mount). The mechanism is general: adding a `#[cfg]` to
-//!    any tier's `compiled_in` arm makes a config request for the compiled-out
-//!    tier a truthful error with no other change.
-//! 2. **Runtime config** ([`crate::config`-driven `TierSelection`]) — the
-//!    deployment's choice *under* that ceiling. One binary, many shapes, no
-//!    rebuild: `[server] services` in `jammi.toml` selects the optional tiers.
-//!
-//! This granularity (runtime toggles layered on the existing compile features)
-//! is deliberate: heavy deps stay feature-gated for binary size / build cost,
-//! while a single published image stays flexible across serve-only, train,
-//! event, and all-in-one deployments without a per-shape rebuild.
+//! Every tier compiles into every build. There is no per-tier cargo feature
+//! and therefore no compile ceiling for the runtime selection to hit: `[server]
+//! services` in `jammi.toml` (or `JAMMI_SERVER__SERVICES`) selects the optional
+//! tiers, and the only resolution error is a token naming no tier
+//! ([`TierError::Unknown`]). One binary, many shapes, no rebuild — a single
+//! published image stays flexible across serve-only, event, eval, and
+//! all-in-one deployments without a per-shape rebuild.
 
 use std::collections::BTreeSet;
 use std::fmt;
@@ -68,11 +67,10 @@ use jammi_db::config::ServiceSelection;
 /// `snake_case` token returned by [`Self::as_str`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub enum ServiceTier {
-    /// Always mounted: session/embedding/inference + mutable-table/channel/audit
-    /// + the `GetServerInfo` handshake. Cannot be disabled.
+    /// Always mounted: session/embedding/inference/pipeline + mutable-table/
+    /// channel/audit + job submission + the `GetServerInfo` handshake. Cannot
+    /// be disabled.
     Core,
-    /// `TrainingService` — model training (fine-tune, graph fine-tune, context predictor).
-    Train,
     /// `TriggerService` — topic / publish / subscribe event streams.
     Event,
     /// `EvalService` — per-query evaluation arrays.
@@ -82,30 +80,14 @@ pub enum ServiceTier {
 impl ServiceTier {
     /// The optional tiers — every tier a deployment may turn on or off. `Core`
     /// is excluded: it is always mounted.
-    pub const OPTIONAL: [ServiceTier; 3] =
-        [ServiceTier::Eval, ServiceTier::Event, ServiceTier::Train];
+    pub const OPTIONAL: [ServiceTier; 2] = [ServiceTier::Eval, ServiceTier::Event];
 
     /// The wire/config token for this tier.
     pub fn as_str(self) -> &'static str {
         match self {
             ServiceTier::Core => "core",
-            ServiceTier::Train => "train",
             ServiceTier::Event => "event",
             ServiceTier::Eval => "eval",
-        }
-    }
-
-    /// Whether this tier's mount code is compiled into the running binary.
-    ///
-    /// This is the hard ceiling the runtime config cannot exceed. `Core`,
-    /// `Event`, and `Eval` are always compiled in the OSS build; `Train` is
-    /// gated on the server `train` feature (default-on), so a `--no-default-
-    /// features` serve-only build genuinely carries no `TrainingService` mount
-    /// and honestly reports `train` as uncompilable.
-    pub fn compiled_in(self) -> bool {
-        match self {
-            ServiceTier::Core | ServiceTier::Event | ServiceTier::Eval => true,
-            ServiceTier::Train => cfg!(feature = "train"),
         }
     }
 }
@@ -121,7 +103,6 @@ impl FromStr for ServiceTier {
     fn from_str(s: &str) -> Result<Self, Self::Err> {
         match s {
             "core" => Ok(ServiceTier::Core),
-            "train" => Ok(ServiceTier::Train),
             "event" => Ok(ServiceTier::Event),
             "eval" => Ok(ServiceTier::Eval),
             other => Err(TierError::Unknown(other.to_string())),
@@ -133,20 +114,13 @@ impl FromStr for ServiceTier {
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
 pub enum TierError {
     /// A config token named no known tier.
-    #[error("unknown service tier '{0}'; expected one of: core, train, event, eval")]
+    #[error("unknown service tier '{0}'; expected one of: core, event, eval")]
     Unknown(String),
-    /// A tier was requested in config but its code is not compiled into this
-    /// binary (its feature is off). Truthful refusal rather than a silent drop.
-    #[error(
-        "service tier '{0}' is not compiled into this binary; \
-         rebuild with the '{0}' feature or remove it from `[server] services`"
-    )]
-    FeatureNotCompiled(ServiceTier),
 }
 
 /// The resolved set of tiers a deployment mounts. Always contains
 /// [`ServiceTier::Core`]. Built by [`Self::resolve`] from the optional tiers a
-/// deployment selected, after reconciling each against its compile gate.
+/// deployment selected.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct TierSet {
     tiers: BTreeSet<ServiceTier>,
@@ -155,57 +129,40 @@ pub struct TierSet {
 impl TierSet {
     /// Resolve a selection of *optional* tiers into a mountable set.
     ///
-    /// `Core` is added unconditionally. Each requested optional tier is checked
-    /// against [`ServiceTier::compiled_in`]: a tier whose feature is compiled
-    /// out is a [`TierError::FeatureNotCompiled`] (the runtime config cannot
-    /// exceed the compile ceiling). The result is the truthful set this binary
-    /// will mount and advertise.
-    pub fn resolve(optional: impl IntoIterator<Item = ServiceTier>) -> Result<Self, TierError> {
+    /// `Core` is added unconditionally; an explicit `Core` in the selection is
+    /// harmless. Every tier compiles into every build, so a typed selection
+    /// always resolves — the result is the truthful set this binary will mount
+    /// and advertise.
+    pub fn resolve(optional: impl IntoIterator<Item = ServiceTier>) -> Self {
         let mut tiers = BTreeSet::new();
         tiers.insert(ServiceTier::Core);
-        for tier in optional {
-            if tier == ServiceTier::Core {
-                // Core is implicit; an explicit `core` in the list is harmless.
-                continue;
-            }
-            if !tier.compiled_in() {
-                return Err(TierError::FeatureNotCompiled(tier));
-            }
-            tiers.insert(tier);
-        }
-        Ok(Self { tiers })
+        tiers.extend(optional);
+        Self { tiers }
     }
 
     /// Resolve a deployment's [`ServiceSelection`] into a mountable set.
     ///
-    /// `All` expands to every optional tier compiled into this binary
-    /// (all-in-one). `Only(tokens)` parses each token to a [`ServiceTier`]
-    /// (rejecting unknown names) and resolves under the compile gate. This is
-    /// the single bridge from the engine's raw-token config (`jammi-db` knows no
+    /// `All` expands to every optional tier (all-in-one). `Only(tokens)` parses
+    /// each token to a [`ServiceTier`], rejecting unknown names. This is the
+    /// single bridge from the engine's raw-token config (`jammi-db` knows no
     /// tier vocabulary) to the server's typed tier set.
     pub fn from_config(selection: &ServiceSelection) -> Result<Self, TierError> {
         match selection {
-            ServiceSelection::All(_) => Ok(Self::all_compiled()),
+            ServiceSelection::All(_) => Ok(Self::all()),
             ServiceSelection::Only(tokens) => {
                 let tiers = tokens
                     .iter()
                     .map(|t| ServiceTier::from_str(t))
                     .collect::<Result<Vec<_>, _>>()?;
-                Self::resolve(tiers)
+                Ok(Self::resolve(tiers))
             }
         }
     }
 
-    /// The full set: core plus every optional tier compiled into this binary.
-    /// This is the default deployment shape (all-in-one) and the embedded
-    /// build's capability ceiling.
-    pub fn all_compiled() -> Self {
-        let optional = ServiceTier::OPTIONAL
-            .into_iter()
-            .filter(|t| t.compiled_in());
-        // `resolve` cannot fail here: every tier passed is compiled-in by the
-        // filter above.
-        Self::resolve(optional).expect("compiled-in tiers always resolve")
+    /// The full set: core plus every optional tier. This is the default
+    /// deployment shape (all-in-one).
+    pub fn all() -> Self {
+        Self::resolve(ServiceTier::OPTIONAL)
     }
 
     /// Whether this set mounts `tier`.
@@ -230,15 +187,14 @@ mod tests {
 
     #[test]
     fn core_is_always_present_even_with_an_empty_selection() {
-        let set = TierSet::resolve(std::iter::empty()).expect("empty resolves");
+        let set = TierSet::resolve(std::iter::empty());
         assert!(set.contains(ServiceTier::Core));
         assert_eq!(set.as_wire(), vec!["core".to_string()]);
     }
 
     #[test]
-    fn resolve_adds_requested_compiled_in_tiers() {
-        // Event and Eval are always compiled in.
-        let set = TierSet::resolve([ServiceTier::Event, ServiceTier::Eval]).expect("resolve");
+    fn resolve_adds_requested_tiers() {
+        let set = TierSet::resolve([ServiceTier::Event, ServiceTier::Eval]);
         assert!(set.contains(ServiceTier::Core));
         assert!(set.contains(ServiceTier::Event));
         assert!(set.contains(ServiceTier::Eval));
@@ -250,26 +206,26 @@ mod tests {
 
     #[test]
     fn explicit_core_in_the_selection_is_harmless() {
-        let set = TierSet::resolve([ServiceTier::Core, ServiceTier::Event]).expect("resolve");
+        let set = TierSet::resolve([ServiceTier::Core, ServiceTier::Event]);
         assert_eq!(set.as_wire(), vec!["core".to_string(), "event".to_string()]);
     }
 
     #[test]
-    fn all_compiled_includes_core_and_every_compiled_optional() {
-        let set = TierSet::all_compiled();
+    fn all_includes_core_and_every_optional() {
+        let set = TierSet::all();
         assert!(set.contains(ServiceTier::Core));
-        assert!(set.contains(ServiceTier::Event));
-        assert!(set.contains(ServiceTier::Eval));
-        // Train is present iff its feature is compiled in.
+        for tier in ServiceTier::OPTIONAL {
+            assert!(set.contains(tier), "all() omits {tier}");
+        }
         assert_eq!(
-            set.contains(ServiceTier::Train),
-            ServiceTier::Train.compiled_in()
+            set.as_wire(),
+            vec!["core".to_string(), "eval".to_string(), "event".to_string()]
         );
     }
 
     #[test]
     fn wire_tokens_are_sorted_and_round_trip() {
-        let set = TierSet::all_compiled();
+        let set = TierSet::all();
         let wire = set.as_wire();
         let mut sorted = wire.clone();
         sorted.sort();
@@ -288,10 +244,21 @@ mod tests {
         );
     }
 
+    /// `train` is not a tier: job submission is core and job execution is the
+    /// `[worker] enabled` runtime key, so a config still naming the former
+    /// tier is refused by name rather than silently accepted.
     #[test]
-    fn from_config_all_is_all_compiled() {
+    fn the_former_train_token_is_an_unknown_tier() {
+        assert_eq!(
+            ServiceTier::from_str("train"),
+            Err(TierError::Unknown("train".to_string()))
+        );
+    }
+
+    #[test]
+    fn from_config_all_is_all() {
         let set = TierSet::from_config(&ServiceSelection::default()).expect("default resolves");
-        assert_eq!(set, TierSet::all_compiled());
+        assert_eq!(set, TierSet::all());
     }
 
     #[test]
@@ -314,25 +281,5 @@ mod tests {
         let err = TierSet::from_config(&ServiceSelection::Only(vec!["registry".to_string()]))
             .unwrap_err();
         assert_eq!(err, TierError::Unknown("registry".to_string()));
-    }
-
-    /// When `train` is compiled out, requesting it is a truthful refusal — not a
-    /// silent drop. This is the runtime-vs-feature reconciliation: config cannot
-    /// exceed the compile ceiling.
-    #[cfg(not(feature = "train"))]
-    #[test]
-    fn requesting_a_compiled_out_tier_is_a_truthful_error() {
-        let err = TierSet::resolve([ServiceTier::Train]).unwrap_err();
-        assert_eq!(err, TierError::FeatureNotCompiled(ServiceTier::Train));
-        // `all_compiled` simply omits it — no error, honestly absent.
-        assert!(!TierSet::all_compiled().contains(ServiceTier::Train));
-    }
-
-    /// When `train` IS compiled in (the default build), requesting it mounts it.
-    #[cfg(feature = "train")]
-    #[test]
-    fn requesting_a_compiled_in_train_tier_mounts_it() {
-        let set = TierSet::resolve([ServiceTier::Train]).expect("train resolves when compiled");
-        assert!(set.contains(ServiceTier::Train));
     }
 }

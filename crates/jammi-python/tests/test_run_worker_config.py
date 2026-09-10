@@ -1,8 +1,8 @@
-"""`training.run_worker` reaches the EMBEDDED arm through the same configuration
+"""`worker.enabled` reaches the EMBEDDED arm through the same configuration
 surface the server binary reads (campaign #446, GAP-A-3 embedded leg).
 
 `run_worker` decides whether THIS process runs the training claim loop
-(`jammi_db::config::TrainingConfig::run_worker`). It is a runtime/driver
+(`jammi_db::config::WorkerConfig::enabled`). It is a runtime/driver
 setting, not a build feature and not a server-only knob: the embedded engine a
 caller reaches through `jammi.connect("file://…")` both accepts submissions and
 runs them, so it is exactly the arm that has to be able to stop running them.
@@ -15,7 +15,7 @@ constitution forbids.
 `crates/jammi-server/src/main.rs` makes — so an embedded process resolves its
 config file (explicit `config=` path, `JAMMI_CONFIG`, `./jammi.toml`, the
 platform config dir) and then layers the `JAMMI_*` environment overrides onto
-it, `JAMMI_TRAINING__RUN_WORKER` among them. The explicit `open_local` kwargs
+it, `JAMMI_WORKER__ENABLED` among them. The explicit `open_local` kwargs
 (`artifact_dir=`, `gpu_device=`, `inference_batch_size=`) are applied after the
 load and still win, so `jammi.connect("file://…")`'s directory is unaffected.
 
@@ -52,14 +52,14 @@ pytestmark = pytest.mark.skipif(
     reason="local tiny_bert / training_pairs fixtures not present",
 )
 
-_RUN_WORKER_ENV = "JAMMI_TRAINING__RUN_WORKER"
+_RUN_WORKER_ENV = "JAMMI_WORKER__ENABLED"
 
-# The submission-time acceleration-report marker `Catalog::create_training_job`
+# The submission-time acceleration-report marker `Catalog::submit_job`
 # stamps: "no claimant has computed a determination YET" (esc-075). A job no
 # worker ever claimed must read exactly this, byte for byte, for its whole life.
 _PENDING = {"state": "pending"}
 
-# The default idle poll (`TrainingConfig::idle_poll_secs`) is 1 second: a worker
+# The default idle poll (`WorkerConfig::idle_poll_secs`) is 1 second: a worker
 # with nothing to do sleeps this long between claim attempts. Every
 # "still queued" assertion below has to span comfortably MORE than one such
 # window, or it would pass against a worker that simply had not ticked yet.
@@ -95,7 +95,7 @@ def _connect_with_source(tmp_path: Path):
 def test_embedded_run_worker_false_accepts_the_submission_and_never_claims(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """`JAMMI_TRAINING__RUN_WORKER=false` + `jammi.connect("file://…")`: the
+    """`JAMMI_WORKER__ENABLED=false` + `jammi.connect("file://…")`: the
     submission is accepted and the job stays `queued` forever.
 
     The env var is read by `JammiConfig::load` at open time — the same loader,
@@ -119,7 +119,7 @@ def test_embedded_run_worker_false_accepts_the_submission_and_never_claims(
         # Accepted: the submission surface is untouched by `run_worker` — the
         # job exists, with its deterministic output model id.
         assert job.job_id
-        assert job.model_id.startswith("jammi:fine-tuned:")
+        assert job.output_model_id.startswith("jammi:fine-tuned:")
 
         started = time.monotonic()
         for poll in range(_POLL_ROUNDS):
@@ -169,11 +169,11 @@ def test_embedded_default_config_claims_and_completes_the_same_job(
 
 
 # A successor process that opens the catalog directory with the DEFAULT config
-# (no `JAMMI_TRAINING__RUN_WORKER` in its environment — the parent strips it),
+# (no `JAMMI_WORKER__ENABLED` in its environment — the parent strips it),
 # attaches to the queued job by id and waits for it. It opens the catalog with
 # `jammi_native.open_local` — the legitimate low-level entry, and the very call
 # whose config resolution this file is about — rather than through the
-# `jammi.EmbeddedBackend` wrapper, which does offer the same `training_job`
+# `jammi.EmbeddedBackend` wrapper, which does offer the same `job`
 # attach convenience but would only sit between the test and the arm under test.
 _CLAIMING_SUCCESSOR = textwrap.dedent(
     """
@@ -182,11 +182,11 @@ _CLAIMING_SUCCESSOR = textwrap.dedent(
 
     import jammi_native
 
-    assert "JAMMI_TRAINING__RUN_WORKER" not in os.environ, "parent leaked the knob"
+    assert "JAMMI_WORKER__ENABLED" not in os.environ, "parent leaked the knob"
 
     db = jammi_native.open_local(artifact_dir=sys.argv[1])
     try:
-        job = db.training_job(sys.argv[2])
+        job = db.job(sys.argv[2])
         job.wait()
         print("STATUS " + job.status())
         print("REPORT_STATE " + str(job.acceleration_report()["state"]))
@@ -252,26 +252,26 @@ def test_queued_job_reads_identically_on_the_remote_arm(
 
     Driven hermetically through a stub double (the idiom
     `test_conformance.py::test_remote_rpc_status_errors_map_onto_the_taxonomy`
-    uses): the server fills `TrainingStatusResponse.status` and
+    uses): the server fills `JobStatusResponse.status` and
     `acceleration_report_json` VERBATIM from the same two catalog columns the
-    embedded read decodes (`training.proto` states the verbatim contract for
+    embedded read decodes (`job.proto` states the verbatim contract for
     the JSON field), so pinning the remote client's decode of those exact
     column values against the embedded arm's live read is the parity claim
     minus one hop.
 
     **Where the remaining hop is covered.** The one thing this hermetic test
     cannot show is a live `jammi-server` started with
-    `JAMMI_TRAINING__RUN_WORKER=false` actually holding a job `queued`. That is
+    `JAMMI_WORKER__ENABLED=false` actually holding a job `queued`. That is
     the server leg of this campaign, and it is proven where a server can be
-    run: `clients/python/tests/test_remote_training_job_live.py` starts one with
+    run: `clients/python/tests/test_remote_job_live.py` starts one with
     exactly that environment and compares its reads of the seeded row against
-    the embedded arm's, and the engine's own `grpc_training` it-suite polls the
+    the embedded arm's, and the engine's own `grpc_job` it-suite polls the
     `queued` / `{"state":"pending"}` pair across the idle window. This test
     covers what the Python surface owns without a server — that both clients
     turn the same two column values into the same two Python values.
     """
-    from jammi._database import RemoteTrainingJob
-    from jammi._generated.jammi.v1 import training_pb2
+    from jammi._database import RemoteJob
+    from jammi._generated.jammi.v1 import job_pb2
 
     monkeypatch.setenv(_RUN_WORKER_ENV, "false")
 
@@ -285,18 +285,23 @@ def test_queued_job_reads_identically_on_the_remote_arm(
         db.close()
 
     class _QueuedStub:
-        """A `TrainingServiceStub` double serving the row the engine actually
+        """A `JobServiceStub` double serving the row the engine actually
         committed: the columns are carried across verbatim, never re-encoded."""
 
-        def TrainingStatus(self, _request, metadata=None):  # noqa: N802 - gRPC name
-            return training_pb2.TrainingStatusResponse(
+        def JobStatus(self, _request, metadata=None):  # noqa: N802 - gRPC name
+            return job_pb2.JobStatusResponse(
                 status=embedded_status,
-                model_id=job.model_id,
+                kind=job.kind,
+                output_model_id=job.output_model_id,
                 acceleration_report_json='{"state":"pending"}',
             )
 
-    remote = RemoteTrainingJob(
-        _QueuedStub(), None, job_id=job.job_id, model_id=job.model_id
+    remote = RemoteJob(
+        _QueuedStub(),
+        None,
+        job_id=job.job_id,
+        kind=job.kind,
+        output_model_id=job.output_model_id,
     )
 
     assert embedded_status == "queued"

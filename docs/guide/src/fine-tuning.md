@@ -158,7 +158,7 @@ let model_id = job.model_id();
 
 let embedding = session.encode_text_query(model_id, "quantum computing").await?;
 println!("query embedding has {} dims", embedding.len());
-session.generate_text_embeddings("patents", model_id, &["abstract".into()], "id", CachePolicy::Bypass).await?;
+session.generate_text_embeddings("patents", model_id, &["abstract".into()], "id", CachePolicy::Bypass, None).await?;
 # Ok(()) }
 ```
 
@@ -459,6 +459,6 @@ cheapest to try:
   `batch_size`, or trade batch size for `gradient_accumulation_steps`. (2) A
   smaller `max_seq_length`.
 
-For a fine-tune job whose failure was classified this way, `jammi train
+For a fine-tune job whose failure was classified this way, `jammi jobs
 status` (and the Python `job.status()`) surfaces the rewritten message
 directly, so you don't need to read raw driver output to find the fix.

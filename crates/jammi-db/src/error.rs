@@ -45,7 +45,7 @@ pub enum JammiError {
     /// or more references. Deleting it would orphan those edges, so this is a
     /// precondition failure, not a bad argument — it maps to gRPC
     /// `FailedPrecondition`. `referenced_by` names the blocking edges as generic
-    /// catalog edge names (e.g. `result_tables`, `training_jobs.output_model_id`).
+    /// catalog edge names (e.g. `result_tables`, `jobs.output_model_id`).
     #[error("Model referenced: {model_id}: still referenced by {}", referenced_by.join(", "))]
     ModelReferenced {
         /// Identifier of the referenced model.
@@ -237,6 +237,30 @@ pub enum JammiError {
         table: String,
         /// The row's current status.
         status: String,
+    },
+
+    /// A `create_result_table` call's `jobs.partial_result` compare-and-set
+    /// matched zero rows: the job is either not `running` (a peer
+    /// reclaimed it, the caller's attempt has been superseded) or another
+    /// attempt already recorded a `partial_result` for it first. Either way
+    /// this attempt is not the one of record. The transaction this CAS ran
+    /// inside is rolled back — no `result_tables` row and no bytes are ever
+    /// committed for a superseded attempt.
+    #[error("job `{job_id}`: this attempt has been superseded; no result table was created")]
+    JobAttemptSuperseded {
+        /// The job whose `partial_result` CAS missed.
+        job_id: String,
+    },
+
+    /// A job's executor observed `jobs.cancel_requested` at a checkpoint
+    /// boundary and stopped: the job is recorded `failed` with this message
+    /// and no result is returned. Raised by `InferenceSession::run_now` for
+    /// an inline job and by the worker's claimed-compute path; the request
+    /// itself is `Catalog::cancel_request`.
+    #[error("job `{job_id}`: cancelled at the executor's request checkpoint")]
+    JobCancelled {
+        /// The job whose cancel request was honoured.
+        job_id: String,
     },
 
     /// A source cannot be deleted while a live writer is still materialising a

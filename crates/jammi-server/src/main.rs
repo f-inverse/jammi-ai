@@ -118,7 +118,10 @@ async fn serve(args: ServeArgs) -> ExitCode {
         return ExitCode::FAILURE;
     }
 
-    init_tracing(&config);
+    if let Err(e) = init_tracing(&config) {
+        eprintln!("jammi-server: {e}");
+        return ExitCode::FAILURE;
+    }
 
     let server = match OssServer::new(config).await {
         Ok(s) => s,

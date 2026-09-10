@@ -107,6 +107,41 @@ pub struct CreateResultTableParams<'a> {
     /// clock on Postgres ([`lease_deadline_expr`]), never this process's
     /// clock. `None` when `writer_id` is `None`.
     pub lease: Option<Duration>,
+    /// The job attempt this table is being materialised for (N11), or `None`
+    /// for a table created outside the job machinery (a test fixture, a
+    /// direct `register_table` path). When `Some`, [`Catalog::create_result_table`]
+    /// performs the `jobs.partial_result` compare-and-set — `UPDATE jobs SET
+    /// partial_result = table_name WHERE job_id = $1 AND claimed_by = $2 AND
+    /// status = 'running' AND attempts = $3 AND partial_result IS NULL` —
+    /// inside the SAME transaction as this row's own INSERT, so the two
+    /// either land together or neither lands at all. A zero-row CAS (the
+    /// caller's attempt is not the current lease holder, or a peer
+    /// already recorded a `partial_result`) rolls the whole transaction back
+    /// and returns [`JammiError::JobAttemptSuperseded`] — no `result_tables`
+    /// row and no bytes are ever committed for a superseded attempt.
+    ///
+    /// Bundled as one [`JobAttempt`] rather than three parallel `Option`
+    /// fields (esc-107): a `job_id`-only guard is unsound on its own — see
+    /// [`Catalog::create_result_table`]'s doc for the exact race a
+    /// `job_id`-only CAS admits. Reshaping the type so `job_id` cannot be
+    /// supplied without the attempt identity the CAS needs makes that
+    /// half-supplied state unrepresentable, rather than trusting every call
+    /// site to remember to pass all three together.
+    pub job_attempt: Option<JobAttempt<'a>>,
+}
+
+/// The exact job-attempt identity [`CreateResultTableParams::job_attempt`]'s
+/// CAS matches against `jobs` — the same `(job_id, claimed_by, attempts)`
+/// triple every other lease-guarded write in `crate::catalog::jobs_repo`
+/// requires, so a superseded attempt's call can never win the CAS just
+/// because the job happens to still be `running` under a LATER attempt.
+#[derive(Debug, Clone, Copy)]
+pub struct JobAttempt<'a> {
+    pub job_id: &'a str,
+    /// The instance the CAS matches against `jobs.claimed_by`.
+    pub instance_id: &'a str,
+    /// The attempt the CAS matches against `jobs.attempts`.
+    pub attempts: u32,
 }
 
 /// A row from the `result_tables` catalog table.
@@ -292,6 +327,25 @@ impl ResultTableCas {
         }
     }
 
+    /// The lease keeper's CAS on a live writer's row (N3,
+    /// `crate::catalog::lease_keeper`): [`Owner::Writer`] with an ADMIN
+    /// tenant arm, bypassing the STRICT per-tenant predicate
+    /// [`Self::writer`] bakes in. The keeper thread renews every registration
+    /// this PROCESS holds — possibly spanning several tenants — from a
+    /// dedicated thread with no task-local session scope of its own to
+    /// resolve a single tenant from; the row's `writer_id` match is the
+    /// entire ownership check, exactly as strict as [`Self::writer`]'s own
+    /// `Owner::Writer` arm, just without the additional tenant filter a
+    /// single-tenant session-scoped caller can supply and a cross-tenant
+    /// infrastructure thread cannot.
+    pub fn writer_any_tenant(table: &str, writer_id: &str) -> Self {
+        Self {
+            table: table.to_string(),
+            tenant_arm: TenantArm::Admin,
+            owner: Owner::Writer(writer_id.to_string()),
+        }
+    }
+
     /// Recovery's CAS on a row whose lease is absent or expired AT THE
     /// INSTANT THE STATEMENT RUNS (the catalog backend's own clock — see
     /// [`Owner::ExpiredLease`]), under the binding in force (admin inside
@@ -424,6 +478,46 @@ enum ExcludeGlobalUnderTenantScope {
 impl Catalog {
     /// Insert a new result table record with status = 'building'. Binds
     /// the session's tenant to the row (SPEC-03 §7).
+    ///
+    /// When `p.job_attempt` is `Some`, the SAME transaction also performs the
+    /// `jobs.partial_result` compare-and-set this table's job depends on
+    /// (N11): `UPDATE jobs SET partial_result = table_name WHERE job_id =
+    /// $job_id AND claimed_by = $instance_id AND status = 'running' AND
+    /// attempts = $attempts AND partial_result IS NULL`. Landing it in the
+    /// same transaction as the row's own INSERT means the two either commit
+    /// together or neither does — there is no window where a `result_tables`
+    /// row exists with no job pointing at it, or a job's `partial_result`
+    /// names a table whose INSERT never landed. A zero-row CAS means the
+    /// caller's `(instance_id, attempts)` is not the job's current
+    /// lease holder (a peer reclaimed and re-claimed it: this attempt is
+    /// superseded) or a peer's attempt already recorded a `partial_result`
+    /// first (also superseded — first writer of record wins) — either way
+    /// the whole transaction is rolled back (no `result_tables` row, no
+    /// INSERT) and this call returns [`JammiError::JobAttemptSuperseded`],
+    /// touching no bytes.
+    ///
+    /// This CAS carries the full `(job_id, claimed_by, attempts)` guard every
+    /// other lease-guarded write on `jobs` carries (the same one
+    /// [`Catalog::record_partial_result`], `crate::catalog::jobs_repo`,
+    /// uses) — esc-107: an earlier `job_id`-only predicate (`status =
+    /// 'running' AND partial_result IS NULL`, no `claimed_by`/`attempts`
+    /// check) was UNSOUND, not merely narrower. A zombie of a REQUEUED and
+    /// RE-CLAIMED attempt — its own lease expired, the job went
+    /// `queued -> running` again under a later attempt, all while the
+    /// zombie never learned its lease was gone — still observes the job as
+    /// `running` with `partial_result IS NULL` and would win that weaker
+    /// CAS, recording a DEAD attempt's table as the job's `partial_result`
+    /// out from under the live, current attempt. Pinning `claimed_by` and
+    /// `attempts` closes exactly this window: a zombie's stale identity
+    /// matches zero rows the instant a later attempt has claimed the row,
+    /// the same guarantee every other write in `jobs_repo` already carries.
+    ///
+    /// Rollback is forced, not merely reported: [`BackendError::Busy`] is the
+    /// transaction-internal refusal sentinel every CAS-inside-a-multi-write
+    /// transaction on this catalog uses to unwind writes already issued in
+    /// the SAME closure (the same mechanism
+    /// [`Catalog::delete_result_tables_for_source`]'s `SourceBusy` uses) —
+    /// returning `Ok` here instead would COMMIT the INSERT that already ran.
     pub async fn create_result_table(&self, p: CreateResultTableParams<'_>) -> Result<()> {
         let table_name = p.table_name.to_string();
         let source_id = p.source_id.to_string();
@@ -440,14 +534,23 @@ impl Catalog {
         let created_at = p.created_at;
         let writer_id = p.writer_id.map(str::to_string);
         let lease = p.lease;
+        let job_attempt = p.job_attempt.map(|ja| {
+            (
+                ja.job_id.to_string(),
+                ja.instance_id.to_string(),
+                ja.attempts,
+            )
+        });
         let kind_backend = self.backend().backend_kind();
         let tenant = self.current_tenant();
 
-        self.backend()
+        let outcome = self
+            .backend()
             .transaction(TxOptions::default(), |tx| {
                 Box::pin(async move {
                     tx.set_tenant(tenant);
                     tx.assert_tenant_matches(tenant, "result_tables")?;
+                    let table_name_for_cas = table_name.clone();
                     let mut params: Vec<SqlValue<'static>> = vec![
                         SqlValue::TextOwned(table_name),
                         SqlValue::TextOwned(source_id),
@@ -488,11 +591,40 @@ impl Catalog {
                         &params,
                     )
                     .await?;
-                    Ok(())
+
+                    let Some((job_id, instance_id, attempts)) = job_attempt else {
+                        return Ok(());
+                    };
+                    let running = crate::catalog::status::JobStatus::Running.to_string();
+                    let cas_updated = tx
+                        .execute(
+                            "UPDATE jobs SET partial_result = $1 \
+                             WHERE job_id = $2 AND claimed_by = $3 AND status = $4 \
+                               AND attempts = $5 AND partial_result IS NULL",
+                            &[
+                                SqlValue::TextOwned(table_name_for_cas),
+                                SqlValue::TextOwned(job_id.clone()),
+                                SqlValue::TextOwned(instance_id),
+                                SqlValue::TextOwned(running),
+                                SqlValue::Int(attempts as i64),
+                            ],
+                        )
+                        .await?;
+                    if cas_updated == 1 {
+                        Ok(())
+                    } else {
+                        // `Busy` forces a ROLLBACK of the INSERT that already
+                        // ran in this same transaction — see the doc above.
+                        Err(BackendError::Busy(job_id))
+                    }
                 })
             })
-            .await?;
-        Ok(())
+            .await;
+        match outcome {
+            Ok(()) => Ok(()),
+            Err(BackendError::Busy(job_id)) => Err(JammiError::JobAttemptSuperseded { job_id }),
+            Err(e) => Err(e.into()),
+        }
     }
 
     /// Update a result table's status and row count. Sets `completed_at` when

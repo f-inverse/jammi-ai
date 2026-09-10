@@ -81,10 +81,25 @@ message JammiErrorDetail {
     LeaseLostError lease_lost = 21;
     CasFailedError cas_failed = 22;
     SourceBusyError source_busy = 23;
+    JobAttemptSupersededError job_attempt_superseded = 24;
+    JobCancelledError job_cancelled = 25;
+    // `JammiError::Lexical(String)` — a single human-readable message like
+    // `inference`/`catalog`/`config`, so it reuses `StringError` rather than
+    // a dedicated message.
+    StringError lexical = 26;
+    IncompatibleFormatError incompatible_format = 27;
+    DependencyCycleError dependency_cycle = 28;
+    NotRecomputableError not_recomputable = 29;
   }
   // Tag 15 / `model_retired` are reserved: the wire surface must never reuse a
-  // retired field number or name, so a peer built against either contract reads
-  // an unknown field rather than a silently-reinterpreted one.
+  // retired field number or name, so a peer built against either contract
+  // reads an unknown field rather than a silently-reinterpreted one -- an
+  // older peer decoding a payload that sets a variant it does not know (a
+  // retired tag, or one a newer contract added after this peer was built)
+  // sees `variant` unset. `error_from_status` reconstructs THAT case as
+  // `JammiError::Other` carrying the enclosing `Status`'s message verbatim --
+  // the peer keeps the fault's text even though it cannot keep the fault's
+  // specific shape, never a fabricated empty string.
   reserved 15;
   reserved "model_retired";
 }
@@ -126,6 +141,50 @@ message CasFailedError {
 message SourceBusyError {
   string source_id = 1;
   string table = 2;
+}
+
+// `JammiError::JobAttemptSuperseded { job_id }`. A `create_result_table`
+// call's `jobs.partial_result` compare-and-set matched zero rows: the job is
+// either not `running` (a peer reclaimed it) or another attempt already
+// recorded a `partial_result` for it first. Maps to `Aborted` (the same
+// retryable-conflict family as `LeaseLost`/`CasFailed` — the caller's view of
+// the job's attempt was stale).
+message JobAttemptSupersededError {
+  string job_id = 1;
+}
+
+// `JammiError::JobCancelled { job_id }`. A job's executor observed
+// `jobs.cancel_requested` at a checkpoint boundary and stopped; the job is
+// recorded `failed` with this message. Maps to `Cancelled` — the caller
+// asked for exactly this outcome, so it is not a fault, but it is also not
+// the terminal state the caller's own request expected without checking
+// status.
+message JobCancelledError {
+  string job_id = 1;
+}
+
+// `JammiError::IncompatibleFormat { artifact, found, supported }`. A
+// persisted artifact carries a format stamp this build cannot read (the
+// `.rowmap`, the ANN `.manifest.json` version, or the USearch graph's
+// `backend_version`).
+message IncompatibleFormatError {
+  string artifact = 1;
+  string found = 2;
+  string supported = 3;
+}
+
+// `JammiError::DependencyCycle { table }`. A `derives-from` lineage walk
+// revisited a table it was already descending through — a corruption of the
+// recorded `input_anchors_json`, not a caller condition.
+message DependencyCycleError {
+  string table = 1;
+}
+
+// `JammiError::NotRecomputable { table }`. A `recompute` was asked to
+// re-produce a table the engine has no faithful replay for (a pre-contract
+// table with no recorded descriptor, or an `External`-producer table).
+message NotRecomputableError {
+  string table = 1;
 }
 
 // `JammiError::ChannelCatalog(ChannelCatalogError)`. The inner taxonomy is

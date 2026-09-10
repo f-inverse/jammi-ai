@@ -32,8 +32,8 @@ by every hermetic config test in the workspace — and by the doc example
 below — so nothing here ever touches a real environment variable).
 `JammiConfig::parse_from(toml_src, env)` is the parse-only core underneath
 both: it runs `${VAR}` interpolation, the layering, and deserialization, but
-skips the post-load validation (`storage.cloud.validate()`, the training
-worker-interval invariants) `load_from` runs afterward.
+skips the post-load validation (`storage.cloud.validate()`, the worker
+timing invariants) `load_from` runs afterward.
 
 ## Full reference
 
@@ -114,23 +114,34 @@ duration_secs = 30
 # not drop a live holder's lease. Default: 10.
 heartbeat_secs = 10
 
-[training]
-# Whether THIS process runs the training claim loop. Default: true.
-# true  - the process claims queued jobs, renews the lease while they run,
-#         and reclaims leases that expired under a dead claimant.
-# false - the process still mounts and serves the training surface and still
-#         accepts submissions, but never claims. Submitted jobs stay queued
-#         until some process with run_worker = true opens the catalog. The
-#         SQLite catalog is single-process, so this process must close the
-#         catalog before that one can open it; a Postgres catalog is
+[worker]
+# Whether THIS process runs the job claim loop. Default: true.
+# true  - the process claims queued jobs (of `kinds`, below), renews the
+#         lease while they run, and reclaims leases that expired under a
+#         dead claimant.
+# false - the process still mounts and serves the submission surface and
+#         still accepts submissions, but never claims. Submitted jobs stay
+#         queued until some process with enabled = true opens the catalog.
+#         The SQLite catalog is single-process, so this process must close
+#         the catalog before that one can open it; a Postgres catalog is
 #         multi-process and can run both at once.
-run_worker = true
+enabled = true
+# Which job kinds this worker claims. "all" (the default) claims every kind
+# compiled into the binary; a comma list or array claims only those named.
+kinds = "all"
 # How often an idle worker polls for a queued job (and reclaims expired
 # leases). Must be > 0 - a zero poll is a busy-loop. Default: 1.
-# The lease a claim is held under is `[lease]` above; a `[training]` section
-# still naming the former `lease_duration_secs` / `heartbeat_interval_secs`
+# The lease a claim is held under is `[lease]` above; a `[worker]` section
+# naming the former `lease_duration_secs` / `heartbeat_interval_secs`
 # keys is refused at load (no alias), never silently defaulted.
 idle_poll_secs = 1
+
+[jobs]
+# How many days a terminal (completed/failed) job row survives before the
+# retention sweep may delete it, and before it stops blocking `delete_model`
+# on the model(s) it references. A non-terminal job blocks indefinitely,
+# regardless of age. Default: 30.
+retention_days = 30
 
 [cache]
 # Enable ANN query cache. Default: true.
@@ -150,12 +161,90 @@ flight_listen = "0.0.0.0:8081"
 # Models to preload on server start. Default: [].
 preload_models = ["sentence-transformers/all-MiniLM-L6-v2"]
 
+[server.limits]
+# Request-bounds and refusal policy for the combined gRPC + Flight SQL
+# surface (also applied to the Flight-only listener). A request exceeding
+# any of these is refused at the edge -- before any tenant-scoped catalog
+# read runs, so a refusal never leaks cross-tenant existence -- with a typed
+# gRPC status and a jammi_grpc_refused_total{reason} counter increment.
+# Maximum inbound message size, in bytes. Must be > 0. Default: 67108864
+# (64 MiB). There is no outbound cap.
+max_message_bytes = 67108864
+# Global cap on unary requests in flight across every connection.
+# 0 = unbounded. Default: 256.
+max_in_flight = 256
+# Cap on unary requests in flight on a SINGLE connection. 0 = unbounded;
+# when both this and max_in_flight are non-zero (bounded), this must be
+# <= max_in_flight. Default: 64.
+max_in_flight_per_connection = 64
+# Maximum duration a unary request may run before this server cancels it
+# with DEADLINE_EXCEEDED. Unset (the default) means no server-imposed
+# timeout. Unary methods only -- Subscribe/WaitJob use wait_timeout_secs
+# and the stream budgets below instead.
+# request_timeout_secs = 30
+# Bounds a TriggerService.Subscribe or JobService.WaitJob stream. The
+# server budget bounds the stream; the client imposes no deadline of its
+# own by default (jammi-client's wait_job/subscribe send no grpc-timeout
+# header). Three arms:
+#   * a grpc-timeout header ABOVE this budget is refused at the edge,
+#     before the stream ever opens (DEADLINE_EXCEEDED).
+#   * a grpc-timeout header WITHIN this budget is ENFORCED by the server
+#     itself, at the caller's own declared deadline -- the stream ends
+#     with DEADLINE_EXCEEDED once that (shorter) duration elapses, not
+#     the wider budget. This is deliberate: nothing else bounds a
+#     streaming response body already returned, so a caller that declares
+#     a deadline and then ignores it would otherwise hold the stream open
+#     (and its permit held) past its own declared timeout.
+#   * NO grpc-timeout header at all (the default for jammi-client, and for
+#     any header-less caller) is NOT refused -- this budget itself becomes
+#     the stream's own deadline, ending it with DEADLINE_EXCEEDED once it
+#     elapses, wherever the stream then stands.
+# Unset (the default) means no cap -- a stream runs until terminal
+# (WaitJob) or indefinitely (Subscribe).
+# wait_timeout_secs = 300
+# Cap on concurrently open TriggerService.Subscribe streams. 0 = unbounded.
+# Default: 256.
+max_subscriptions = 256
+# Cap on concurrently open JobService.WaitJob streams. 0 = unbounded.
+# Default: 1024.
+max_job_waits = 1024
+
 [logging]
 # Log level: "trace", "debug", "info", "warn", "error". Default: "info".
 level = "info"
 # Log format: "text" or "json". Default: "text".
 format = "text"
+
+[observability]
+# OTLP/gRPC collector endpoint spans export to. Unset (the default) means:
+# build no exporter and open no network connection at all -- a process with
+# no configured endpoint attempts zero egress for tracing, whether or not
+# the `telemetry-otlp` cargo feature is compiled in.
+# otlp_endpoint = "http://localhost:4317"
+# `service.name` resource attribute stamped on every exported span.
+# Default: "jammi".
+service_name = "jammi"
+# Fraction of traces kept by the parent-based ratio sampler, in [0.0, 1.0].
+# Default: 1.0 (sample everything).
+sample_ratio = 1.0
+
+# [observability.otlp_headers]
+# Request headers the exporter attaches to every export call (e.g. a
+# collector auth token). Each value is a secret -- a plain string inline, or
+# `{ file = "/run/secrets/otlp-token" }` -- and is never logged. Default:
+# empty.
+# x-api-key = { file = "/run/secrets/otlp-token" }
 ```
+
+`JobService.SubmitJob`'s `idempotency_key` is bounded to 256 bytes
+(`MAX_IDEMPOTENCY_KEY_BYTES`, `jammi_db::catalog::jobs_repo`) — a fixed
+engine bound, not a `[server.limits]` key. A longer key is refused with
+`INVALID_ARGUMENT` naming the bound, never the key's own value. This closes
+a real backend divergence: Postgres's btree index has a hard row-size
+ceiling an oversize key can exceed (`index row size ... exceeds btree
+version 4 maximum ...`), while SQLite silently accepts a key of any size —
+without the bound, the same `idempotency_key` would be accepted on one
+backend and refused on the other.
 
 ## Catalog, broker, signing key, storage, and model source
 
@@ -321,8 +410,9 @@ environment value wins field-by-field; see the layering order above and
 **Namespace.** `JAMMI_<X>__<path>` (segments joined by `__`) is **always**
 config: an unknown `X` — one that does not name a top-level `JammiConfig`
 field (`artifact_dir`, `engine`, `gpu`, `inference`, `embedding`,
-`fine_tuning`, `training`, `cache`, `server`, `logging`, `catalog`, `broker`,
-`signing_key`, `storage`, `models`) — is a load-time error naming the
+`fine_tuning`, `lease`, `worker`, `jobs`, `cache`, `server`, `logging`,
+`observability`, `catalog`, `broker`, `signing_key`, `storage`, `models`) — is a load-time
+error naming the
 variable, never a silent no-op (`JAMMI_CATALOG__KIND=postgres`, a typo one
 segment short of `JAMMI_CATALOG__POSTGRES__URL`, refuses rather than quietly
 running SQLite with nothing to explain why). A bare `JAMMI_<X>` with **no**
@@ -330,8 +420,17 @@ running SQLite with nothing to explain why). A bare `JAMMI_<X>` with **no**
 (`JAMMI_ARTIFACT_DIR`, `JAMMI_CATALOG=sqlite`, …); every other `JAMMI_*` name
 is a runtime knob outside this layer's namespace and is silently ignored here
 — `JAMMI_AUDIT_MASTER_KEY`, `JAMMI_CONFIG` (which names the config *file* to
-load, not a field override), `JAMMI_TEST_PG_URL`, and similar single-purpose
-variables all pass through untouched.
+load, not a field override), `JAMMI_WORKER_ID` (below), `JAMMI_TEST_PG_URL`,
+and similar single-purpose variables all pass through untouched.
+
+**`JAMMI_WORKER_ID` is a label.** Every process mints its own
+`instances.instance_id` (a UUID) at session construction — that id is what
+`jobs.claimed_by` records and what the lease/liveness machinery keys on.
+`JAMMI_WORKER_ID`, when set and non-empty (trimmed), is only the
+`instances.label` shown beside that id by `ListWorkers` / `jammi workers` and
+in logs: an operator-chosen, non-unique name (a node, a replica slot). Two
+processes given the same label are two instances, so a replacement process
+never inherits — or keeps alive — a dead namesake's claims.
 
 **Path segments and TOML syntax.** Everything after the first segment is
 lowercased on the way in, matching every config struct's `snake_case` field
@@ -347,7 +446,7 @@ instead of TOML syntax — see below.
 **Refusals name the variable.** An unknown section, an unknown key, or a
 value outside a field's domain is a load-time error naming the offending
 `JAMMI_*` variable — never a silent drop and never a fall-back to the file's
-value or the default. `JAMMI_TRAINING__RUN_WORKER` (boolean) accepts `true`,
+value or the default. `JAMMI_WORKER__ENABLED` (boolean) accepts `true`,
 `false`, `1`, `0`, case-insensitively and with surrounding whitespace
 trimmed; any other value — including an empty one — is refused by name: a
 yes/no question about what the process will do has no safe direction to

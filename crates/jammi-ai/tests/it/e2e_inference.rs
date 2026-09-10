@@ -26,10 +26,10 @@ fn tiny_modernbert_source() -> ModelSource {
     ModelSource::local(common::fixture("tiny_modernbert"))
 }
 
-async fn session_with_patents() -> (InferenceSession, TempDir) {
+async fn session_with_patents() -> (Arc<InferenceSession>, TempDir) {
     let dir = TempDir::new().unwrap();
     let config = common::test_config(dir.path());
-    let session = InferenceSession::new(config).await.unwrap();
+    let session = Arc::new(InferenceSession::new(config).await.unwrap());
     session
         .add_source(
             "patents",
@@ -192,7 +192,7 @@ async fn e2e_provenance_columns_have_correct_values() {
 async fn e2e_null_text_rows_produce_error_status() {
     let dir = TempDir::new().unwrap();
     let config = common::test_config(dir.path());
-    let session = InferenceSession::new(config).await.unwrap();
+    let session = Arc::new(InferenceSession::new(config).await.unwrap());
 
     session
         .add_source(
@@ -255,7 +255,7 @@ async fn e2e_null_text_rows_produce_error_status() {
 async fn e2e_error_rows_have_null_vector_and_error_message() {
     let dir = TempDir::new().unwrap();
     let config = common::test_config(dir.path());
-    let session = InferenceSession::new(config).await.unwrap();
+    let session = Arc::new(InferenceSession::new(config).await.unwrap());
 
     session
         .add_source(
@@ -379,6 +379,7 @@ async fn e2e_systemic_forward_failure_propagates_from_embedding_pipeline() {
             "abstract",
             "id",
             jammi_db::store::CachePolicy::Bypass,
+            None,
         )
         .await
         .expect_err(
@@ -426,7 +427,7 @@ async fn e2e_all_input_invalid_fails_loud_not_empty_ready_table() {
 
     let dir = TempDir::new().unwrap();
     let config = common::test_config(dir.path());
-    let session = InferenceSession::new(config).await.unwrap();
+    let session = Arc::new(InferenceSession::new(config).await.unwrap());
 
     // Every `abstract` is empty; ids are valid so rows are keyed, not
     // key-filtered — the invalidity is purely the empty content.
@@ -477,6 +478,7 @@ async fn e2e_all_input_invalid_fails_loud_not_empty_ready_table() {
             &["abstract".to_string()],
             "id",
             jammi_db::store::CachePolicy::Bypass,
+            None,
         )
         .await
         .expect_err(
@@ -519,12 +521,14 @@ async fn e2e_observer_receives_batch_notifications() {
     let dir = TempDir::new().unwrap();
     let config = common::test_config(dir.path());
     let observer = Arc::new(CountingObserver(AtomicUsize::new(0)));
-    let session = InferenceSession::with_observer(
-        config,
-        Some(observer.clone() as Arc<dyn InferenceObserver>),
-    )
-    .await
-    .unwrap();
+    let session = Arc::new(
+        InferenceSession::with_observer(
+            config,
+            Some(observer.clone() as Arc<dyn InferenceObserver>),
+        )
+        .await
+        .unwrap(),
+    );
 
     session
         .add_source(
@@ -595,7 +599,7 @@ async fn e2e_model_registered_in_catalog_after_inference() {
 async fn embedding_vectors_are_semantically_meaningful_and_reproducible() {
     let dir = TempDir::new().unwrap();
     let config = common::test_config(dir.path());
-    let session = InferenceSession::new(config).await.unwrap();
+    let session = Arc::new(InferenceSession::new(config).await.unwrap());
 
     let model = "local:".to_string() + common::cookbook_fixture("tiny_bert").to_str().unwrap();
 
@@ -720,7 +724,7 @@ async fn e2e_modernbert_embedding_produces_vectors_with_correct_schema() {
 async fn e2e_modernbert_embedding_vectors_are_nonzero_and_reproducible() {
     let dir = TempDir::new().unwrap();
     let config = common::test_config(dir.path());
-    let session = InferenceSession::new(config).await.unwrap();
+    let session = Arc::new(InferenceSession::new(config).await.unwrap());
 
     let model = "local:".to_string() + common::fixture("tiny_modernbert").to_str().unwrap();
 

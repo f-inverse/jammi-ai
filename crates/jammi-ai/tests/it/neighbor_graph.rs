@@ -46,6 +46,7 @@ async fn session_with_embeddings() -> (Arc<InferenceSession>, TempDir) {
             &["abstract".to_string()],
             "id",
             jammi_db::store::CachePolicy::Bypass,
+            None,
         )
         .await
         .unwrap();
@@ -553,6 +554,7 @@ async fn neighbor_graph_is_tenant_scoped() {
             &["abstract".to_string()],
             "id",
             jammi_db::store::CachePolicy::Bypass,
+            None,
         )
         .await
         .unwrap();
@@ -776,6 +778,7 @@ async fn cache_use_does_not_reuse_across_a_recomputed_parent() {
             &["abstract".to_string()],
             "id",
             CachePolicy::Bypass,
+            None,
         )
         .await
         .unwrap();

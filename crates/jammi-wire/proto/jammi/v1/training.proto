@@ -4,51 +4,20 @@ package jammi.v1.training;
 
 import "jammi/v1/inference.proto";
 
-// TrainingService — the wire surface for the engine's training verbs.
+// Training spec vocabulary shared by `JobService`'s training kinds — not a
+// service of its own.
 //
-// `StartTraining` and `TrainingStatus` are imperative session methods, not SQL
-// queries, so they live as typed gRPC RPCs alongside CatalogService /
-// TriggerService / EmbeddingService / InferenceService / EvalService rather
-// than on the Flight SQL surface (which carries query/result only, per ADR-01
-// §3.2). Training is a substrate primitive — meta-learning an adapter or a
-// predictor over a registered source — and names no tenant-domain concept.
-//
-// The service serves all three engine training kinds (`fine_tune`,
-// `graph_fine_tune`, `context_predictor`) behind one verb: `StartTraining`
-// carries a full `TrainingSpec` oneof and dispatches to the matching engine
-// submit verb, returning the durable job id and the (deterministic) output
-// model id. The job runs asynchronously inside the engine; the client polls
-// `TrainingStatus` by id until a terminal state. There is no progress stream —
-// the abstraction exposes none, so this surface invents none. The service
+// `TrainingService` was folded into `JobService` (`jammi/v1/job.proto`):
+// `StartTraining`/`TrainingStatus`/`ListTrainingJobs` are superseded by
+// `JobService.{SubmitJob,JobStatus,WaitJob,ListJobs,CancelJob}`, which serve
+// both the three training kinds below and every compute verb behind one
+// durable job abstraction. This file keeps only the training spec
+// message vocabulary the training kinds still ride inside `SubmitJobRequest`'s
+// `oneof`: `FineTuneSpec`, `GraphFineTuneSpec`, `ContextPredictorSpec`, and
+// their nested configuration messages, byte-for-byte unchanged so a spec
+// captured before this rename still decodes identically. The message vocabulary
 // reimplements no training, LoRA, sampling, or scan logic; it is purely a wire
-// adapter.
-//
-// Tenant scope is read from the request's `SessionTenant` extension, set by
-// the single async tenant-binding layer driven by the engine's
-// `TenantResolver` (default: the `jammi-session-id` header → shared session
-// store) — the one mechanism every gRPC service and Flight SQL bind through.
-service TrainingService {
-  // Submit a training job over a registered source and return its id + output
-  // model id. The job trains asynchronously; poll `TrainingStatus` with the
-  // returned job id. Peer of the engine's `fine_tune` / `fine_tune_graph` /
-  // `train_context_predictor` submit verbs (the spec oneof selects which).
-  rpc StartTraining(StartTrainingRequest) returns (StartTrainingResponse);
-
-  // Read a training job's current status by id, plus its output model id and
-  // the failure message when it failed. Peer of reading back the engine's
-  // `TrainingJob` handle — the output model id and error are what let a remote
-  // `wait()` retrieve the result and a failure reason.
-  rpc TrainingStatus(TrainingStatusRequest) returns (TrainingStatusResponse);
-
-  // List training jobs visible to the session tenant, most recent first. Each
-  // row is the same lifecycle projection `TrainingStatus` reads (status,
-  // output model id, failure error) plus the submit-time identity (kind, base
-  // model, creation time) — a listing of `TrainingStatus` answers, not a
-  // progress surface. There is still no progress stream and no mid-run
-  // metric: the engine persists run metrics only at job finalization, so this
-  // verb exposes none.
-  rpc ListTrainingJobs(ListTrainingJobsRequest) returns (ListTrainingJobsResponse);
-}
+// shape mirroring the engine's `TrainingSpec`.
 
 // Fine-tuning method. Mirrors the engine's `FineTuneMethod`; LoRA is the only
 // method, trained as either an encoder-internal adapter or a projection head
@@ -393,113 +362,4 @@ message ContextPredictorSpec {
   string source = 1;
   // The architecture / objective / episodic / optimisation specification.
   ContextPredictorTrainConfig predictor_spec = 2;
-}
-
-message StartTrainingRequest {
-  // The self-describing training spec — the verb that produces the job. Mirrors
-  // the engine's `TrainingSpec` enum: the variant selects the submit path, and
-  // its fields carry everything a worker reconstructs the run from.
-  oneof spec {
-    FineTuneSpec fine_tune = 1;
-    GraphFineTuneSpec graph_fine_tune = 2;
-    ContextPredictorSpec context_predictor = 3;
-  }
-  // Base encoder to adapt for the two LoRA fine-tune kinds (`local:<path>`, an
-  // HF repo id, or a fine-tuned id). Unused by the context-predictor kind (it
-  // names its source's embedding model implicitly), so it is empty there.
-  string base_model = 4;
-  // Optional fine-tune hyperparameters for the two LoRA fine-tune kinds; unset
-  // applies the engine's defaults. Unused by the context-predictor kind (its
-  // budget rides inside `predictor_spec`).
-  optional FineTuneConfig config = 5;
-}
-
-message StartTrainingResponse {
-  // Server-assigned job id. Poll `TrainingStatus` with it.
-  string job_id = 1;
-  // The deterministic output model id the trained artifact registers under —
-  // the same id the engine's `TrainingJob::model_id` carries at submit time.
-  string model_id = 2;
-}
-
-message TrainingStatusRequest {
-  // Job id returned by a prior StartTraining call.
-  string job_id = 1;
-}
-
-message TrainingStatusResponse {
-  // Current lifecycle status: "queued", "running", "completed", or "failed".
-  string status = 1;
-  // The output model id the trained artifact registers under — populated at
-  // EVERY lifecycle status, never empty because the job has not finished. Once
-  // the job completes this is the id the catalog stamped; before then it is the
-  // same deterministic id `StartTraining` returned at submit time, re-derived
-  // by the engine's own naming rule from the persisted job row. A caller that
-  // attaches to a running job by id therefore reads the identical id the
-  // in-process (embedded) surface reports for that job.
-  //
-  // This is deliberately NOT the contract of `TrainingJobSummary
-  // .output_model_id`, which reports the catalog column verbatim and so IS
-  // empty until completion: that field answers "has this job stamped its
-  // output row yet", this one answers "what will this job's model be called".
-  string model_id = 2;
-  // The failure message when `status` is "failed"; empty otherwise.
-  string error = 3;
-  // Run metrics recorded for this job, as an opaque JSON object — the SAME
-  // blob the catalog's `training_jobs.metrics` column carries and the
-  // embedded surface's `TrainingJob.metrics()` returns (issue #441). Its
-  // schema is documented at the trainer, not on the wire: `final_loss`,
-  // `early_stopping_metric`, `total_steps`, `started_at`, `completed_at`,
-  // and, for a fine-tune run, the `train_loss_curve` / `val_loss_curve`
-  // per-epoch arrays (`crates/jammi-ai/src/fine_tune/trainer.rs`, the
-  // `metrics_json` built at the end of `TrainingLoop::run`). Field presence
-  // (not the empty string) distinguishes "not yet recorded" (still queued or
-  // running before its first stamp) from an already-recorded blob — this
-  // field mirrors the catalog column's `NULL`/`NOT NULL`, never a decoded or
-  // re-encoded value, so both transports serve byte-identical JSON text.
-  optional string metrics_json = 4;
-  // GPU-acceleration determination for this job, as an opaque, self-describing
-  // JSON object — the SAME blob the catalog's `training_jobs.
-  // acceleration_report` column carries and the embedded surface's record
-  // read returns. Its schema is owned by the payload's producer (the engine
-  // at submission, the claiming worker once it runs), not enumerated on the
-  // wire: a `"state"` key is the discriminant callers switch on (e.g.
-  // `"pending"` before a determination exists, `"determined"` once one does),
-  // but the full vocabulary and its evolution live at the producer — mirroring
-  // `metrics_json`'s own schema-at-the-trainer deferral above, not a closed
-  // enum pinned here. Field presence (not the empty string) distinguishes "no
-  // column value" (a legacy row predating this column, `NULL`) from an
-  // already-recorded blob — this field mirrors the catalog column's
-  // `NULL`/`NOT NULL`, never a decoded or re-encoded value, so both
-  // transports serve byte-identical JSON text (esc-075).
-  optional string acceleration_report_json = 5;
-}
-
-message ListTrainingJobsRequest {}
-
-message ListTrainingJobsResponse {
-  // Jobs visible to the session tenant, most recent first.
-  repeated TrainingJobSummary jobs = 1;
-}
-
-// One training job's lifecycle summary: the `TrainingStatus` projection plus
-// the submit-time identity fields a listing needs to tell jobs apart. No
-// mid-run progress fields exist to carry (see the service comment).
-message TrainingJobSummary {
-  // Server-assigned job id — the `TrainingStatus` key.
-  string job_id = 1;
-  // Training-job kind: "fine_tune", "graph_fine_tune", or "context_predictor".
-  string kind = 2;
-  // Current lifecycle status: "queued", "running", "completed", or "failed".
-  string status = 3;
-  // The base model the job trains from — the catalog's registered model id (a
-  // resolved, versioned id, not necessarily the submit-time reference string).
-  string base_model_id = 4;
-  // The output model id the trained artifact registers under; empty until the
-  // job completes.
-  string output_model_id = 5;
-  // Job creation time, as recorded by the catalog (UTC text timestamp).
-  string created_at = 6;
-  // The failure message when `status` is "failed"; empty otherwise.
-  string error = 7;
 }

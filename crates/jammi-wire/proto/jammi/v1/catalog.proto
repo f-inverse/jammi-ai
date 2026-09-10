@@ -234,9 +234,10 @@ message ServerInfo {
   // cloud schemes appear when their driver feature is compiled in), sorted.
   repeated string storage_backends = 3;
   // The gRPC service tiers this deployment mounted, sorted. The core tier
-  // (catalog/embedding/inference + introspection) is always present; the
-  // optional tiers ("train", "event", "eval") appear only when both their
-  // compile feature is present and the deployment's config enabled them. A
+  // (catalog/embedding/inference/job submission + introspection) is always
+  // present; the optional tiers ("event", "eval") appear only when the
+  // deployment's config enabled them. Whether the server RUNS the jobs it
+  // accepts is its `[worker] enabled` setting, not a tier. A
   // client reads this to know which verbs are reachable on *this* server —
   // reaching an unmounted tier returns a truthful "not enabled" error. The
   // embedded (in-process, `file://`) engine mounts no gRPC services, so it

@@ -244,12 +244,16 @@ ConfigMap.
 second Deployment on GPU nodes running the SAME image family, scheduled
 separately.
 
-Today's branch has no dedicated worker-process driver: isolating the
-training claim loop onto its own replica uses the existing service-tier
-mechanism (see [Service tiers](./deploy-server.md#service-tiers)) — narrow
-every query-tier replica's `[server] services` to exclude `train`, and give
-the GPU-node Deployment `services = ["train"]` (`JAMMI_SERVER__SERVICES=train`)
-so only it runs `TrainingService`'s claim loop against the shared catalog.
+Running jobs is not a service tier (see [Service
+tiers](./deploy-server.md#service-tiers)): whether a process *claims and
+executes* the jobs it accepted is `[worker] enabled`. Every query-tier
+replica runs `[worker] enabled = false` (`JAMMI_WORKER__ENABLED=false`) —
+it still mounts `core`/`event`/`eval` and accepts every submission — and the
+GPU-node Deployment runs `[worker] enabled = true` (`JAMMI_WORKER__ENABLED=true`,
+optionally `JAMMI_WORKER__KINDS='["fine_tune", "graph_fine_tune", "context_predictor"]'`
+to claim only the training kinds) so only it runs the job worker's claim
+loop against the shared catalog. Its `[server] services` is whatever the
+compute node should also serve — `services = []` for a pure compute node.
 
 ```yaml
 # sketch: a second Deployment, GPU variant, GPU-node-scheduled -- the compute
@@ -258,14 +262,14 @@ so only it runs `TrainingService`'s claim loop against the shared catalog.
 apiVersion: apps/v1
 kind: Deployment
 metadata:
-  name: jammi-server-train
+  name: jammi-server-compute
 spec:
   replicas: 1
   selector:
-    matchLabels: { app: jammi-server-train }
+    matchLabels: { app: jammi-server-compute }
   template:
     metadata:
-      labels: { app: jammi-server-train }
+      labels: { app: jammi-server-compute }
     spec:
       nodeSelector:
         gpu-node-pool: "true" # your cluster's own GPU node label
@@ -283,7 +287,8 @@ spec:
           envFrom:
             - secretRef: { name: jammi-server-secrets } # same catalog/broker as the query tier
           env:
-            - { name: JAMMI_SERVER__SERVICES, value: "train" }
+            - { name: JAMMI_WORKER__ENABLED, value: "true" }
+            - { name: JAMMI_SERVER__SERVICES, value: "[]" }
           volumeMounts:
             - { name: config, mountPath: /etc/jammi, readOnly: true }
       volumes:
@@ -299,6 +304,12 @@ tag for reproducible GPU-node deploys.
 Very high scale, specialized GPU pools, and a split compliance posture
 (query tier vs. training tier on separate node pools / network policies)
 are the shapes this topology serves.
+
+This single-node-per-replica compute tier is a provisional primitive: it
+claims and runs one job per attempt on the replica that claimed it, with no
+notion of a multi-replica gang for one job. Whether a future multi-node
+training job spans several compute replicas — and what shape that gang
+coordination takes — is #500's to decide, not this topology's.
 
 ## The `jammi-server probe` subcommand
 

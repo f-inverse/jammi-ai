@@ -94,6 +94,14 @@ const MIGRATIONS: &[(&str, &str)] = &[
         "028_topics_next_offset",
         schema::MIGRATION_028_TOPICS_NEXT_OFFSET,
     ),
+    (
+        "029_jobs_instances_workers",
+        schema::MIGRATION_029_JOBS_INSTANCES_WORKERS,
+    ),
+    (
+        "030_jobs_idempotency_key",
+        schema::MIGRATION_030_JOBS_IDEMPOTENCY_KEY,
+    ),
 ];
 
 const APPLIED_MIGRATIONS_DDL: &str = r#"

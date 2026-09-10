@@ -1,4 +1,4 @@
-"""The `Session` / `Backend` / `TrainingJobHandle` protocols.
+"""The `Session` / `Backend` / `JobHandle` protocols.
 
 `connect(target)` returns a :class:`Session` — the transport-agnostic surface a
 caller writes against. Two concrete classes satisfy it structurally: the remote
@@ -25,14 +25,16 @@ from ._capability import Capability
 
 
 @runtime_checkable
-class TrainingJobHandle(Protocol):
-    """A handle to a submitted training job — poll it, or block on it.
+class JobHandle(Protocol):
+    """A handle to a submitted job (training or compute) — poll it, or block
+    on it.
 
-    Both the embedded engine's `TrainingJob` and the remote
-    :class:`~jammi.RemoteTrainingJob` satisfy this, so a caller treats the
-    two interchangeably: read the ids, poll :meth:`status`, or :meth:`wait` for a
-    terminal state (which raises :class:`~jammi.errors.TrainingError` on a
-    failed job with the worker's message).
+    Both the embedded engine's `Job` (`jammi_native.Job`) and the remote
+    :class:`~jammi.RemoteJob` satisfy this, so a caller treats the two
+    interchangeably: read the ids, poll :meth:`status` / :meth:`progress`,
+    request :meth:`cancel`, or :meth:`wait` for a terminal state (which
+    raises :class:`~jammi.errors.TrainingError` on a failed job with the
+    executor's message) and returns the tagged terminal result.
     """
 
     @property
@@ -40,14 +42,33 @@ class TrainingJobHandle(Protocol):
         """The unique id the submit assigned this job."""
 
     @property
-    def model_id(self) -> str:
-        """The deterministic output model id the trained artifact registers under."""
+    def kind(self) -> str:
+        """The `jobs.kind` tag this job submitted under (e.g. `"fine_tune"`)."""
+
+    @property
+    def output_model_id(self) -> str:
+        """The deterministic output model id the trained artifact registers
+        under. Empty for a compute-kind job."""
 
     def status(self) -> str:
         """The job's current status string."""
 
-    def wait(self) -> None:
-        """Block until a terminal state; raise on a failed job."""
+    def wait(self) -> Dict[str, Any]:
+        """Block until a terminal state; raise on a failed job. Returns the
+        tagged terminal result dict."""
+
+    def progress(self) -> Dict[str, Any]:
+        """This job's progress: `{"rows_done", "rows_total", "phase"}`."""
+
+    def cancel(self) -> bool:
+        """Request cancellation. `True` if the request landed on a still
+        non-terminal row; `False` if the job was already terminal or absent."""
+
+    def metrics(self) -> Dict[str, Any]:
+        """Run metrics recorded for this job, as a dict. `{}` until recorded."""
+
+    def acceleration_report(self) -> Optional[Dict[str, Any]]:
+        """GPU-acceleration determination for this job, as a dict, or `None`."""
 
 
 @runtime_checkable
@@ -154,14 +175,19 @@ class Session(Protocol):
     ) -> Any: ...
 
     # --- Training + predict -----------------------------------------------------
-    def fine_tune(self, **kwargs: Any) -> TrainingJobHandle: ...
-    def fine_tune_graph(self, **kwargs: Any) -> TrainingJobHandle: ...
-    def train_context_predictor(self, source: str, **kwargs: Any) -> TrainingJobHandle: ...
+    def fine_tune(self, **kwargs: Any) -> JobHandle: ...
+    def fine_tune_graph(self, **kwargs: Any) -> JobHandle: ...
+    def train_context_predictor(self, source: str, **kwargs: Any) -> JobHandle: ...
     def predict_with_context_predictor(
         self, model_id: str, **kwargs: Any
     ) -> Dict[str, Any]: ...
-    def training_job(self, job_id: str) -> TrainingJobHandle: ...
-    def list_training_jobs(self) -> List[Dict[str, Any]]: ...
+
+    # --- Jobs (generic across every job kind; JobService on the wire) ----------
+    def job(self, job_id: str) -> JobHandle: ...
+    def list_jobs(self) -> List[Dict[str, Any]]: ...
+    def cancel_job(self, job_id: str) -> bool: ...
+    def list_workers(self) -> List[Dict[str, Any]]: ...
+    def prune_jobs(self) -> int: ...
 
     # --- Engine-state pipeline --------------------------------------------------
     def build_neighbor_graph(self, source: str, **kwargs: Any) -> str: ...

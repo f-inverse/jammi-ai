@@ -20,7 +20,7 @@
 //! the call returns, so a close-time capture races the assertion and intermittently
 //! reads an empty buffer — the original flake. Recording-time capture removes that
 //! race entirely. The assertion is non-vacuous: with the handler's `#[instrument]`
-//! gone, no `training_status` span opens, nothing records `tenant_id`, and the
+//! gone, no `job_status` span opens, nothing records `tenant_id`, and the
 //! buffer holds no matching snapshot.
 
 use std::str::FromStr;
@@ -28,10 +28,10 @@ use std::sync::{Arc, Mutex};
 
 use jammi_ai::session::InferenceSession;
 use jammi_db::TenantId;
-use jammi_server::grpc::proto::training as pb;
-use jammi_server::grpc::proto::training::training_service_server::TrainingService;
+use jammi_server::grpc::job::JobServer;
+use jammi_server::grpc::proto::job as pb;
+use jammi_server::grpc::proto::job::job_service_server::JobService;
 use jammi_server::grpc::session::SessionTenant;
-use jammi_server::grpc::training::TrainingServer;
 use jammi_test_utils::test_config;
 use tonic::Request;
 use tracing::field::{Field, Visit};
@@ -157,14 +157,14 @@ fn handler_span_carries_tenant() {
         let session = InferenceSession::open(test_config(dir.path()))
             .await
             .expect("session");
-        let server = TrainingServer::new(Arc::clone(&session));
+        let server = JobServer::new(Arc::clone(&session));
 
         // A request carrying the `SessionTenant` extension exactly as the
         // per-service async tenant-binding layer deposits it post-routing — the only
         // place the tenant is in scope for the handler to read and record.
         let tenant =
             TenantId::from_str("018f5a0e-c4c8-7e10-9c4f-3b6f7c5a8e9a").expect("valid tenant uuid");
-        let mut request = Request::new(pb::TrainingStatusRequest {
+        let mut request = Request::new(pb::JobStatusRequest {
             job_id: "job-tracing-oracle".to_string(),
         });
         request.extensions_mut().insert(SessionTenant(Some(tenant)));
@@ -185,26 +185,26 @@ fn handler_span_carries_tenant() {
         // oracle asserts on. The error outcome is the expected path here (no such
         // job for this tenant), asserted explicitly so the return value is
         // handled, not silently discarded.
-        let outcome = server.training_status(request).await;
+        let outcome = server.job_status(request).await;
         assert!(
             outcome.is_err(),
             "no such job: the handler errors after recording the span tenant"
         );
 
-        // The span name is the handler method (`training_status`). The `tenant_id`
+        // The span name is the handler method (`job_status`). The `tenant_id`
         // field is recorded with `?` (Debug), so the `Option<TenantId>` snapshots
         // as `Some(...)` wrapping the uuid. A captured span with that name carrying
         // exactly this tenant proves the span was emitted with it.
         let spans = captured.lock().unwrap();
         let span = spans.iter().find(|(_, span)| {
-            span.name == "training_status"
+            span.name == "job_status"
                 && span.fields.get("tenant_id").is_some_and(|value| {
                     value.starts_with("Some(") && value.contains(&tenant.to_string())
                 })
         });
         assert!(
             span.is_some(),
-            "expected a captured training_status span carrying \
+            "expected a captured job_status span carrying \
              tenant_id=Some(..{tenant}..); captured spans: {:?}",
             spans
                 .iter()

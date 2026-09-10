@@ -1,8 +1,8 @@
-//! CLI integration tests for `jammi train`.
+//! CLI integration tests for `jammi jobs`.
 //!
-//! `jammi train` is read-only (submission is SDK-only), so these tests can't
-//! drive a job into existence through the CLI itself. They seed a
-//! `training_jobs` row directly with a [`jammi_db::catalog::Catalog`] — and
+//! `jammi jobs list/status` is read-only (submission is SDK-only), so these
+//! tests can't drive a job into existence through the CLI itself. They seed a
+//! `jobs` row directly with a [`jammi_db::catalog::Catalog`] — and
 //! they do it strictly BEFORE the server exists.
 //!
 //! The catalog is single-process (`docs/guide/src/catalog-and-broker.md`), and
@@ -24,7 +24,7 @@
 //! by accident.
 //!
 //! Rows are seeded in a terminal (`completed`) status, never `queued`, so the
-//! server's own background `TrainingWorker` — which claims exclusively
+//! server's own background `JobWorker` — which claims exclusively
 //! `WHERE status = 'queued'` — never mutates a fixture out from under a test.
 
 use jammi_db::catalog::backend::{SqlNullType, SqlValue};
@@ -98,41 +98,55 @@ async fn register_model(catalog: &Catalog, model_id: &str) {
         .expect("register test model");
 }
 
-/// Directly seed a `training_jobs` row in a terminal (`completed`) status.
-/// Mirrors `jammi-server`'s `grpc_training.rs::seed_training_job_row`.
+/// Directly seed a `jobs` row in a terminal (`completed`) status. The
+/// generalised `jobs` schema (migration 029) has no dedicated `metrics`
+/// column — the raw metrics JSON is nested inside the tagged `result`
+/// payload (`jammi_ai::jobs::JobResult::Model.metrics`), the same shape
+/// `JobServer`'s `job_status_response_from_record` decodes back through
+/// `JobStatusResponse.result`'s `Model` arm, so this seed writes it there
+/// rather than to a dedicated metrics column, which this schema has none of.
 async fn seed_completed_job(catalog: &Catalog, fixture: &JobFixture<'_>, base_model_id: &str) {
     let job_id = fixture.job_id.to_string();
     let base_model_id = base_model_id.to_string();
-    let metrics = fixture.metrics.map(str::to_string);
+    let result = fixture.metrics.map(|m| {
+        serde_json::json!({
+            "kind": "model",
+            "model_id": format!("jammi:fine-tuned:{}", fixture.job_id),
+            "artifact_path": "file:///seed/unused",
+            "metrics": m,
+        })
+        .to_string()
+    });
     let acceleration_report = fixture.acceleration_report.map(str::to_string);
+    let now = jammi_db::catalog::backend::now_sortable();
 
     catalog
         .backend_arc()
         .transaction(TxOptions::default(), move |tx| {
             Box::pin(async move {
                 tx.execute(
-                    "INSERT INTO training_jobs \
-                     (job_id, base_model_id, training_source, loss_type, hyperparams, status, \
-                      kind, training_spec, tenant_id, metrics, acceleration_report, claimed_by, \
-                      attempts, lease_expires_at) \
-                     VALUES ($1, $2, 'seed.csv', 'contrastive', '{}', 'completed', \
-                             'fine_tune', $3, $4, $5, $6, $7, 0, $8)",
+                    "INSERT INTO jobs \
+                     (job_id, kind, tenant_id, status, execution, spec, result, \
+                      model_ref, output_model_id, claimed_by, attempts, \
+                      acceleration_report, created_at, updated_at) \
+                     VALUES ($1, 'fine_tune', $2, 'completed', 'queued', '{}', $3, \
+                             $4, $5, $6, 0, $7, $8, $8)",
                     &[
                         SqlValue::TextOwned(job_id),
+                        SqlValue::Null(SqlNullType::Text),
+                        SqlValue::from(result),
                         SqlValue::TextOwned(base_model_id),
                         SqlValue::Null(SqlNullType::Text),
                         SqlValue::Null(SqlNullType::Text),
-                        SqlValue::from(metrics),
                         SqlValue::from(acceleration_report),
-                        SqlValue::Null(SqlNullType::Text),
-                        SqlValue::Null(SqlNullType::Text),
+                        SqlValue::TextOwned(now),
                     ],
                 )
                 .await
             })
         })
         .await
-        .expect("seed training_jobs row");
+        .expect("seed jobs row");
 }
 
 /// Control for the seed-before-spawn ordering the other tests in this module
@@ -166,7 +180,7 @@ async fn cli_train_sees_rows_seeded_before_the_server_spawned() {
 
     let out = server
         .cli()
-        .args(["train", "list"])
+        .args(["jobs", "list"])
         .output()
         .expect("run train list");
     assert!(out.status.success());
@@ -181,7 +195,7 @@ async fn cli_train_sees_rows_seeded_before_the_server_spawned() {
 
     let missing = server
         .cli()
-        .args(["train", "status", "cli-seed-order-never-seeded"])
+        .args(["jobs", "status", "cli-seed-order-never-seeded"])
         .output()
         .expect("run train status for an unseeded id");
     assert!(
@@ -277,7 +291,7 @@ async fn cli_train_status_shows_acceleration_report_when_present() {
 
     let out = server
         .cli()
-        .args(["train", "status", "cli-acc-present"])
+        .args(["jobs", "status", "cli-acc-present"])
         .output()
         .expect("run train status");
     assert!(out.status.success());
@@ -310,7 +324,7 @@ async fn cli_train_status_omits_acceleration_report_when_absent() {
 
     let out = server
         .cli()
-        .args(["train", "status", "cli-acc-legacy"])
+        .args(["jobs", "status", "cli-acc-legacy"])
         .output()
         .expect("run train status");
     assert!(out.status.success());

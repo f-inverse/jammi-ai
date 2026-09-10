@@ -18,6 +18,7 @@ pub mod error;
 pub mod flight;
 pub mod grpc;
 pub mod grpc_web_trailers;
+pub mod limits;
 pub mod metrics_layer;
 pub mod probe;
 pub mod routes;
@@ -25,6 +26,7 @@ pub mod runtime;
 pub mod telemetry;
 pub mod tenant_resolver_layer;
 pub mod tiers;
+pub mod trace_context_layer;
 
 use std::sync::Arc;
 

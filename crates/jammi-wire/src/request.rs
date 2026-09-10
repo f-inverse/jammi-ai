@@ -9,7 +9,13 @@
 /// Which embedding tower an embeddings / encode-query call targets. Unifies the
 /// three per-modality engine verbs (`text`/`image`/`audio`) into one parameter
 /// so the consumer surface carries one embedding verb, not three.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+///
+/// `Serialize`/`Deserialize`: persisted on `jobs.spec` as part of
+/// `jammi_ai::jobs::ComputeSpec::Embedding` — a generate-embeddings call
+/// submitted through `InferenceSession::run_now` must round-trip its
+/// modality byte-for-byte on a fresh process's replay.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
 pub enum Modality {
     /// Dense vectors of input text.
     Text,

@@ -313,6 +313,7 @@ async fn seed_segmented_table(server: &EngineServer, table: &str, segments: &[(i
             storage_precision: jammi_db::config::StoragePrecision::F32,
             oversample: 4,
             created_at: jammi_db::catalog::backend::now_sortable(),
+            job_attempt: None,
         })
         .await
         .expect("create result table");
@@ -478,6 +479,7 @@ async fn remote_list_index_segments_denies_a_peer_tenants_table() {
                     storage_precision: jammi_db::config::StoragePrecision::F32,
                     oversample: 4,
                     created_at: jammi_db::catalog::backend::now_sortable(),
+                    job_attempt: None,
                 })
                 .await
         })

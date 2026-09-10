@@ -46,10 +46,11 @@ async fn transport_only_chain() -> (GrpcChain, TempDir) {
         store: store.clone(),
         trigger: None,
         engine: None,
-        tiers: TierSet::resolve(std::iter::empty()).expect("core-only tier set resolves"),
+        tiers: TierSet::resolve(std::iter::empty()),
         metrics: Arc::new(MetricsRegistry::new().unwrap()),
         tenant_resolver: SessionIdTenantResolver::arc(store),
         admin_authorizer: None,
+        limits: jammi_db::config::LimitsConfig::default(),
     };
     (chain, dir)
 }

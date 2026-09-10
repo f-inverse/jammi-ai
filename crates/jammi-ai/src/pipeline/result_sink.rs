@@ -89,8 +89,9 @@ impl<'a> ResultSink<'a> {
 /// Filter a batch to only OK rows, transform to embedding schema,
 /// and extract `_row_id` + `vector` columns.
 ///
-/// Input schema: `_row_id, _source, _model, _status, _error, _latency_ms, vector`
-/// Output schema: `_row_id, _source_id, _model_id, vector`
+/// Input schema: `_row_id, _ordinal, _source, _model, _status, _error, _latency_ms, vector`
+/// Output schema: `_row_id, _source_id, _model_id, vector` (no `_ordinal` — an
+/// embedding table's `_row_id` is unique by construction)
 pub fn filter_ok_and_extract_vectors(
     batch: &RecordBatch,
 ) -> Result<(RecordBatch, Vec<String>, Vec<Vec<f32>>)> {

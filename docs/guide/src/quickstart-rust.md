@@ -41,6 +41,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         &["title".to_string()],
         "id",
         CachePolicy::Bypass,
+        None,
     ).await?;
     println!("Embedded {} rows", record.row_count);
 

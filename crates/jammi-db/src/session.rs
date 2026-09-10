@@ -1066,6 +1066,18 @@ fn signing_key_store_from_config(config: &JammiConfig) -> Arc<dyn SigningKeyStor
     }
 }
 
+/// Open a fresh [`Catalog`] from `config.catalog` — its own backend pool,
+/// independent of any existing session's. This is the `catalog_connect`
+/// factory [`crate::catalog::lease_keeper::LeaseKeeper::start`] wants: a
+/// dedicated OS thread must open its OWN connection from inside its OWN
+/// runtime (see that module's docs for why a shared pool cannot be reused
+/// there), so a caller reaching for a lease keeper reopens through this
+/// rather than sharing `JammiSession::catalog()`'s handle.
+pub async fn open_catalog_from_config(config: &JammiConfig) -> Result<Catalog> {
+    let backend = build_backend_from_config(config).await?;
+    Ok(Catalog::from_backend(backend))
+}
+
 /// Build a [`BackendImpl`] from `config.catalog`, honouring the SQLite path
 /// default and the Postgres pool options.
 async fn build_backend_from_config(config: &JammiConfig) -> Result<BackendImpl> {

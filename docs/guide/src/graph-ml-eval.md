@@ -39,13 +39,13 @@ table must be built over the **same rows** so the comparison is apples-to-apples
 # async fn ex(session: &InferenceSession, baseline_model: &str, treatment_model: &str) -> jammi_db::error::Result<()> {
 // Baseline: plain text embeddings.
 let (baseline, _) = session
-    .generate_text_embeddings("patents", baseline_model, &["abstract".into()], "id", CachePolicy::Bypass)
+    .generate_text_embeddings("patents", baseline_model, &["abstract".into()], "id", CachePolicy::Bypass, None)
     .await?;
 
 // Treatment: embeddings from a structure-aware model (e.g. a fine-tuned
 // checkpoint), over the same source and key column.
 let (treatment, _) = session
-    .generate_text_embeddings("patents", treatment_model, &["abstract".into()], "id", CachePolicy::Bypass)
+    .generate_text_embeddings("patents", treatment_model, &["abstract".into()], "id", CachePolicy::Bypass, None)
     .await?;
 
 let baseline_table = baseline.table_name;

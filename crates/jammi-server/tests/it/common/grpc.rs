@@ -143,6 +143,11 @@ pub struct EngineServer {
     /// over the wire returns identical results / errors against the *same*
     /// engine.
     pub engine: Arc<InferenceSession>,
+    /// The SAME metrics registry the server's `MetricsLayer` / `crate::limits`
+    /// refusal stack drive — a test asserts `jammi_grpc_refused_total{reason}`
+    /// against this handle rather than scraping an HTTP `/metrics` route (this
+    /// fixture runs no health side-channel).
+    pub metrics: Arc<jammi_server::routes::health::MetricsRegistry>,
 }
 
 impl EngineServer {
@@ -153,34 +158,33 @@ impl EngineServer {
     /// reads a submitted job's pre-claim state while nothing can claim it, then
     /// calls this to let the job actually run, and awaits its terminal state
     /// through the public surface. A worker is a worker regardless of who
-    /// spawned it — this is the identical `EmbeddedWorker` the `train` tier
-    /// starts, over the identical session — so releasing here restores the
-    /// production shape rather than simulating it.
-    #[cfg(feature = "train")]
-    pub fn spawn_training_worker(&self) -> jammi_ai::fine_tune::worker::EmbeddedWorker {
+    /// spawned it — this is the identical `EmbeddedWorker` a `[worker] enabled`
+    /// server starts, over the identical session — so releasing here restores
+    /// the production shape rather than simulating it.
+    pub fn spawn_worker(&self) -> jammi_ai::fine_tune::worker::EmbeddedWorker {
         jammi_ai::fine_tune::worker::EmbeddedWorker::spawn(&self.engine)
             .expect("the test config's worker intervals are valid")
     }
 }
 
 /// Spin up an in-process gRPC server hosting the chain *with* the engine-backed
-/// services, mounting every compiled-in tier **except** the event tier (no
-/// trigger handles). Shared by the `grpc_inference`, `grpc_eval`,
+/// services, mounting every tier **except** the event tier (no trigger
+/// handles). Shared by the `grpc_inference`, `grpc_eval`,
 /// `grpc_introspection`, and `grpc_training` suites so they drive the same
 /// wiring the embedding suite does.
 pub async fn start_engine_server() -> EngineServer {
     start_engine_server_with_tiers(non_event_tiers()).await
 }
 
-/// Every compiled-in optional tier except event — the engine-backed serve +
-/// eval + (when compiled) train surface, without the trigger stream. The tier
-/// set [`start_engine_server`] and [`start_engine_server_worker_quiesced`]
-/// share, so the two fixtures mount the identical surface.
+/// Every optional tier except event — the engine-backed serve + eval surface
+/// (job submission is core), without the trigger stream. The tier set
+/// [`start_engine_server`] and [`start_engine_server_worker_quiesced`] share,
+/// so the two fixtures mount the identical surface.
 fn non_event_tiers() -> jammi_server::tiers::TierSet {
     let optional = jammi_server::tiers::ServiceTier::OPTIONAL
         .into_iter()
-        .filter(|t| *t != jammi_server::tiers::ServiceTier::Event && t.compiled_in());
-    jammi_server::tiers::TierSet::resolve(optional).expect("non-event tiers resolve")
+        .filter(|t| *t != jammi_server::tiers::ServiceTier::Event);
+    jammi_server::tiers::TierSet::resolve(optional)
 }
 
 /// Like [`start_engine_server`] but also mounts the trigger handles (the event
@@ -189,7 +193,7 @@ fn non_event_tiers() -> jammi_server::tiers::TierSet {
 /// tests, which drive those surfaces against the same engine a local `Session`
 /// wraps.
 pub async fn start_engine_server_with_trigger() -> EngineServer {
-    start_engine_server_with_tiers(jammi_server::tiers::TierSet::all_compiled()).await
+    start_engine_server_with_tiers(jammi_server::tiers::TierSet::all()).await
 }
 
 /// Spin up an in-process engine-backed gRPC server mounting exactly `tiers`.
@@ -203,6 +207,7 @@ pub async fn start_engine_server_with_tiers(tiers: jammi_server::tiers::TierSet)
     // the port is held from bind through serve, so `addr` names a port no
     // concurrent test process can have stolen.
     let (chain, engine, dir) = engine_chain_at(ephemeral_addr(), tiers).await;
+    let metrics = Arc::clone(&chain.metrics);
     let (shutdown_tx, shutdown_rx) = oneshot::channel::<()>();
     let (addr, handle) = spawn_bound_chain(chain, shutdown_rx).await;
 
@@ -212,6 +217,7 @@ pub async fn start_engine_server_with_tiers(tiers: jammi_server::tiers::TierSet)
         _dir: dir,
         handle: AbortOnDropHandle(handle),
         engine,
+        metrics,
     }
 }
 
@@ -240,6 +246,7 @@ pub async fn start_engine_server_with_admin(
 ) -> EngineServer {
     let (chain, engine, dir) =
         engine_chain_at_with_admin(ephemeral_addr(), tiers, admin_authorizer).await;
+    let metrics = Arc::clone(&chain.metrics);
     let (shutdown_tx, shutdown_rx) = oneshot::channel::<()>();
     let (addr, handle) = spawn_bound_chain(chain, shutdown_rx).await;
 
@@ -249,6 +256,7 @@ pub async fn start_engine_server_with_admin(
         _dir: dir,
         handle: AbortOnDropHandle(handle),
         engine,
+        metrics,
     }
 }
 
@@ -320,6 +328,11 @@ async fn engine_chain_from_config(
         });
 
     let engine = Arc::clone(&session);
+    // Same source production reads (`OssServer::build_grpc_chain`): the
+    // config the session was actually opened with, so a test that varies
+    // `[server.limits]` through `test_config`/its own override sees that
+    // value reach the wire, not a hardcoded default.
+    let limits = session.inner_config().server.limits;
     let chain = jammi_server::runtime::GrpcChain {
         addr,
         flight_ctx: session.context().clone(),
@@ -331,17 +344,19 @@ async fn engine_chain_from_config(
         metrics: Arc::new(jammi_server::routes::health::MetricsRegistry::new().unwrap()),
         tenant_resolver: jammi_server::grpc::session::SessionIdTenantResolver::arc(store),
         admin_authorizer,
+        limits,
     };
     (chain, engine)
 }
 
 /// Spin up the SAME engine-backed server [`start_engine_server`] does (identical
-/// tier set, identical chain), but with the `train` tier's embedded
-/// `EmbeddedWorker` STOPPED AND JOINED before this returns: the fixture hands
-/// back a server with **no in-process claimant** for the `training_jobs` queue.
+/// tier set, identical chain), but with the engine's embedded `EmbeddedWorker`
+/// STOPPED AND JOINED before this returns: the fixture hands back a server with
+/// **no in-process claimant** for the `jobs` queue.
 ///
-/// Why: `assemble_grpc_chain` spawns that worker as soon as the `train` tier is
-/// mounted, and its loop claims a `queued` row on its very first tick with no
+/// Why: `assemble_grpc_chain` spawns that worker as soon as an engine-backed
+/// chain assembles under `[worker] enabled` (the test config's default), and
+/// its loop claims a `queued` row on its very first tick with no
 /// initial sleep. A test that submits a job and then reads a PRE-CLAIM field of
 /// it (the submission-time `{"state":"pending"}` acceleration marker, the
 /// `queued` status) is therefore racing the worker: on a slow runner the claim
@@ -351,16 +366,15 @@ async fn engine_chain_from_config(
 ///
 /// The worker guard reaches the fixture through the engine's OWN public
 /// composability seam — `AssembledChain::into_layered_axum_router`'s
-/// `ChainParts::train_worker`, documented as a lifetime the downstream owns —
+/// `ChainParts::worker`, documented as a lifetime the downstream owns —
 /// so no test-only construction seam is added to the server.
 /// `EmbeddedWorker::stop_and_join` AWAITS the loop task's return, so once this
 /// fixture returns the loop is provably gone, not merely signalled; nothing
 /// else can claim, because the catalog is this fixture's own temp dir.
 ///
 /// A test releases work when it wants it via
-/// [`EngineServer::spawn_training_worker`], which starts a worker over the very
-/// same engine session the server drives.
-#[cfg(feature = "train")]
+/// [`EngineServer::spawn_worker`], which starts a worker over the very same
+/// engine session the server drives.
 pub async fn start_engine_server_worker_quiesced() -> EngineServer {
     // Bind the listener FIRST and hold it — its address feeds the chain and
     // `axum::serve` serves on the very same held listener, so there is no
@@ -372,6 +386,7 @@ pub async fn start_engine_server_worker_quiesced() -> EngineServer {
     let addr = listener.local_addr().expect("local_addr");
 
     let (chain, engine, dir) = engine_chain_at(addr, non_event_tiers()).await;
+    let metrics = Arc::clone(&chain.metrics);
     // `into_layered_axum_router` is the SAFE-DEFAULT split: the returned router
     // already carries the engine's canonical transport stack (metrics +
     // gRPC-web trailer repair + gRPC-web framing), so what this fixture serves
@@ -379,10 +394,9 @@ pub async fn start_engine_server_worker_quiesced() -> EngineServer {
     let (router, parts) = jammi_server::runtime::assemble_grpc_chain(chain)
         .expect("assemble grpc chain")
         .into_layered_axum_router();
-    // `None` only in a build whose `train` tier is not mounted at all — also
-    // quiesced (no worker was ever spawned), and such a build fails loudly at
-    // the first `StartTraining` rather than silently racing.
-    if let Some(worker) = parts.train_worker {
+    // `None` only if the test config disabled the worker (`[worker] enabled =
+    // false`) — also quiesced, since no worker was ever spawned.
+    if let Some(worker) = parts.worker {
         worker
             .stop_and_join()
             .await
@@ -405,6 +419,7 @@ pub async fn start_engine_server_worker_quiesced() -> EngineServer {
         _dir: dir,
         handle: AbortOnDropHandle(handle),
         engine,
+        metrics,
     }
 }
 
@@ -436,30 +451,29 @@ pub fn with_session(
 }
 
 /// Spin up the SAME engine-backed server [`start_engine_server`] does (identical
-/// tier set — the `train` tier included — identical chain, identical eager
-/// bind), with `[training] run_worker` set to `run_worker` **through a real
-/// `jammi.toml` loaded by `JammiConfig::load`** — the exact path the
-/// `jammi-server` binary takes to its config.
+/// tier set, identical chain, identical eager bind), with `[worker] enabled`
+/// set to `enabled` **through a real `jammi.toml` loaded by
+/// `JammiConfig::load`** — the exact path the `jammi-server` binary takes to
+/// its config.
 ///
 /// This is the parameterised config variant of the fixture, and it is
 /// deliberately NOT a construction seam: nothing here reaches into
-/// [`jammi_server::runtime::ChainParts::train_worker`] or stops a worker after
-/// the fact. Whether a claim loop exists in this process is decided by the one
+/// [`jammi_server::runtime::ChainParts::worker`] or stops a worker after the
+/// fact. Whether a claim loop exists in this process is decided by the one
 /// TOML key, read by [`jammi_server::runtime::assemble_grpc_chain`] off the
 /// session's own config — so a test built on this fixture proves the KNOB, not
 /// the seam.
 ///
 /// The loaded config is asserted to actually carry the requested value before
 /// the session opens: `JammiConfig::load` applies `JAMMI_*` environment
-/// overrides, so an ambient `JAMMI_TRAINING__RUN_WORKER` in the test runner's
+/// overrides, so an ambient `JAMMI_WORKER__ENABLED` in the test runner's
 /// environment would otherwise silently invert the oracle. It fails loud here
 /// instead.
 ///
 /// The rest of the config mirrors `jammi_test_utils::test_config` (CPU device,
 /// small batch, temp artifact dir) so the surface served is the one every other
 /// engine-backed fixture serves.
-#[cfg(feature = "train")]
-pub async fn start_engine_server_with_run_worker(run_worker: bool) -> EngineServer {
+pub async fn start_engine_server_with_worker_enabled(enabled: bool) -> EngineServer {
     let dir = tempfile::tempdir().expect("tempdir");
     let config_path = dir.path().join("jammi.toml");
     std::fs::write(
@@ -476,8 +490,8 @@ pub async fn start_engine_server_with_run_worker(run_worker: bool) -> EngineServ
              [logging]\n\
              level = \"debug\"\n\
              \n\
-             [training]\n\
-             run_worker = {run_worker}\n",
+             [worker]\n\
+             enabled = {enabled}\n",
             artifact_dir = dir.path().display(),
         ),
     )
@@ -486,9 +500,9 @@ pub async fn start_engine_server_with_run_worker(run_worker: bool) -> EngineServ
     let cfg = jammi_db::config::JammiConfig::load(Some(&config_path))
         .expect("the fixture's jammi.toml loads");
     assert_eq!(
-        cfg.training.run_worker, run_worker,
-        "the loaded config must carry the run_worker this fixture asked for — a \
-         mismatch means an ambient JAMMI_TRAINING__RUN_WORKER override is \
+        cfg.worker.enabled, enabled,
+        "the loaded config must carry the `[worker] enabled` this fixture asked \
+         for — a mismatch means an ambient JAMMI_WORKER__ENABLED override is \
          inverting the oracle"
     );
     assert_eq!(
@@ -499,6 +513,7 @@ pub async fn start_engine_server_with_run_worker(run_worker: bool) -> EngineServ
 
     let (chain, engine) =
         engine_chain_from_config(ephemeral_addr(), non_event_tiers(), cfg, None).await;
+    let metrics = Arc::clone(&chain.metrics);
     let (shutdown_tx, shutdown_rx) = oneshot::channel::<()>();
     let (addr, handle) = spawn_bound_chain(chain, shutdown_rx).await;
 
@@ -508,6 +523,76 @@ pub async fn start_engine_server_with_run_worker(run_worker: bool) -> EngineServ
         _dir: dir,
         handle: AbortOnDropHandle(handle),
         engine,
+        metrics,
+    }
+}
+
+/// Like [`start_engine_server_with_worker_enabled`] with the worker always
+/// ON, but ALSO overriding `[lease]` to a fast, test-scale cadence
+/// (`duration_secs`/`heartbeat_secs`) instead of the production default (30s
+/// lease / 10s heartbeat) — for a live it-test that needs to observe a real
+/// claimed job's lease-heartbeat-driven behaviour (e.g. the #485
+/// cancel-request watcher, which polls at the SAME cadence the lease keeper
+/// renews at: `jammi_ai::fine_tune::worker::spawn_cancel_request_watcher`'s
+/// doc) inside a live test's own time budget, with no test-hooks park point
+/// (`jammi_ai::jobs::compute_test_hooks` is not available to this crate's
+/// `it` target — a real small training spec plus a fast REAL cadence is the
+/// only lever this binary has). `heartbeat_secs` must be strictly under half
+/// of `lease_secs` ([`jammi_db::config::LeaseConfig::intervals`]'s own
+/// invariant); the caller picks values that satisfy it.
+pub async fn start_engine_server_with_worker_enabled_and_fast_lease(
+    lease_secs: u64,
+    heartbeat_secs: u64,
+) -> EngineServer {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let config_path = dir.path().join("jammi.toml");
+    std::fs::write(
+        &config_path,
+        format!(
+            "artifact_dir = \"{artifact_dir}\"\n\
+             \n\
+             [gpu]\n\
+             device = -1\n\
+             \n\
+             [inference]\n\
+             batch_size = 8\n\
+             \n\
+             [logging]\n\
+             level = \"debug\"\n\
+             \n\
+             [worker]\n\
+             enabled = true\n\
+             \n\
+             [lease]\n\
+             duration_secs = {lease_secs}\n\
+             heartbeat_secs = {heartbeat_secs}\n",
+            artifact_dir = dir.path().display(),
+        ),
+    )
+    .expect("write the fixture's jammi.toml");
+
+    let cfg = jammi_db::config::JammiConfig::load(Some(&config_path))
+        .expect("the fixture's jammi.toml loads");
+    assert!(
+        cfg.worker.enabled,
+        "this fixture always requests [worker] enabled = true"
+    );
+    assert_eq!(cfg.lease.duration_secs, lease_secs);
+    assert_eq!(cfg.lease.heartbeat_secs, heartbeat_secs);
+
+    let (chain, engine) =
+        engine_chain_from_config(ephemeral_addr(), non_event_tiers(), cfg, None).await;
+    let metrics = Arc::clone(&chain.metrics);
+    let (shutdown_tx, shutdown_rx) = oneshot::channel::<()>();
+    let (addr, handle) = spawn_bound_chain(chain, shutdown_rx).await;
+
+    EngineServer {
+        addr,
+        shutdown: shutdown_tx,
+        _dir: dir,
+        handle: AbortOnDropHandle(handle),
+        engine,
+        metrics,
     }
 }
 
@@ -526,6 +611,7 @@ pub async fn start_engine_server_with_broker(
     cfg.broker = broker;
     let (chain, engine) =
         engine_chain_from_config(ephemeral_addr(), non_event_tiers(), cfg, None).await;
+    let metrics = Arc::clone(&chain.metrics);
     let (shutdown_tx, shutdown_rx) = oneshot::channel::<()>();
     let (addr, handle) = spawn_bound_chain(chain, shutdown_rx).await;
 
@@ -535,5 +621,38 @@ pub async fn start_engine_server_with_broker(
         _dir: dir,
         handle: AbortOnDropHandle(handle),
         engine,
+        metrics,
+    }
+}
+
+/// Spin up the SAME engine-backed server [`start_engine_server`] does
+/// (identical tier set, identical chain, identical eager bind), but with
+/// `[server.limits]` overridden to `limits` instead of the config default,
+/// and `[worker] enabled = false` -- the fixture the `limits` it-suite
+/// (`grpc_limits.rs`) builds its oversize-message / timeout / stream-budget
+/// refusal cases on. The worker is disabled unconditionally: those cases
+/// need a submitted job to stay `queued` forever (no claimant), so a
+/// `WaitJob` stream stays genuinely open across the whole test rather than
+/// racing an embedded worker to completion.
+pub async fn start_engine_server_with_limits(
+    limits: jammi_db::config::LimitsConfig,
+) -> EngineServer {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let mut cfg = test_config(dir.path());
+    cfg.server.limits = limits;
+    cfg.worker.enabled = false;
+    let (chain, engine) =
+        engine_chain_from_config(ephemeral_addr(), non_event_tiers(), cfg, None).await;
+    let metrics = Arc::clone(&chain.metrics);
+    let (shutdown_tx, shutdown_rx) = oneshot::channel::<()>();
+    let (addr, handle) = spawn_bound_chain(chain, shutdown_rx).await;
+
+    EngineServer {
+        addr,
+        shutdown: shutdown_tx,
+        _dir: dir,
+        handle: AbortOnDropHandle(handle),
+        engine,
+        metrics,
     }
 }

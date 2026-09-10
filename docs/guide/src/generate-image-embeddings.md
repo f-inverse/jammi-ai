@@ -21,6 +21,7 @@ let (record, _outcome) = session.generate_image_embeddings(
     "image",       // column containing image data
     "figure_id",   // key column
     CachePolicy::Bypass,
+    None,
 ).await?;
 
 println!("Embedded {} images, {} dimensions", record.row_count, record.dimensions.unwrap());

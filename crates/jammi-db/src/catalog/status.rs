@@ -44,20 +44,65 @@ impl FromStr for ResultTableStatus {
     }
 }
 
-/// Status of a training job.
+/// Status of a job (`jobs.status`) — every kind-agnostic unit of work the
+/// catalog's claim/lease/reclaim machinery drives
+/// ([`crate::catalog::jobs_repo`]), training and compute alike. `Queued` and
+/// `Running` are non-terminal; `Completed` and `Failed` are terminal — the
+/// two states [`crate::catalog::jobs_repo::JobRecord::is_terminal`] and the
+/// retention age-predicate ([`crate::catalog::model_repo`]'s `REFERENCE_EDGES`)
+/// both key on.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum TrainingJobStatus {
-    /// Job created, waiting to start.
+pub enum JobStatus {
+    /// Job created, waiting to be claimed.
     Queued,
-    /// Training in progress.
+    /// Claimed and executing.
     Running,
-    /// Training completed successfully.
+    /// Finished successfully.
     Completed,
-    /// Training failed (divergence, error, etc.).
+    /// Finished unsuccessfully (error, divergence, lease exhaustion, cancel).
     Failed,
 }
 
-impl fmt::Display for TrainingJobStatus {
+impl JobStatus {
+    /// Whether this status is terminal (`Completed` or `Failed`) — a row in
+    /// either state accepts no further lease-guarded write and is eligible
+    /// for retention once past `[jobs] retention_days`.
+    pub fn is_terminal(&self) -> bool {
+        matches!(self, Self::Completed | Self::Failed)
+    }
+
+    /// Every status, in lifecycle order — the one list the SQL-side
+    /// helpers below derive their literals from, so a status added here
+    /// is reflected in every `status IN (...)` predicate without a second
+    /// hand-typed vocabulary.
+    pub const ALL: [JobStatus; 4] = [Self::Queued, Self::Running, Self::Completed, Self::Failed];
+
+    /// The comma-joined, single-quoted SQL literal list of every TERMINAL
+    /// status (`'completed', 'failed'`), for a `status IN (...)` predicate —
+    /// rendered from [`Self::ALL`] and [`Self::is_terminal`], never typed
+    /// by hand at a query site.
+    pub fn terminal_sql_list() -> String {
+        Self::sql_list(|s| s.is_terminal())
+    }
+
+    /// The comma-joined, single-quoted SQL literal list of every
+    /// NON-terminal status (`'queued', 'running'`) — the rows a cancel
+    /// request can still reach.
+    pub fn non_terminal_sql_list() -> String {
+        Self::sql_list(|s| !s.is_terminal())
+    }
+
+    fn sql_list(keep: impl Fn(&JobStatus) -> bool) -> String {
+        Self::ALL
+            .iter()
+            .filter(|s| keep(s))
+            .map(|s| format!("'{s}'"))
+            .collect::<Vec<_>>()
+            .join(", ")
+    }
+}
+
+impl fmt::Display for JobStatus {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Self::Queued => write!(f, "queued"),
@@ -68,7 +113,7 @@ impl fmt::Display for TrainingJobStatus {
     }
 }
 
-impl FromStr for TrainingJobStatus {
+impl FromStr for JobStatus {
     type Err = JammiError;
     fn from_str(s: &str) -> Result<Self, Self::Err> {
         match s {
@@ -77,7 +122,7 @@ impl FromStr for TrainingJobStatus {
             "completed" => Ok(Self::Completed),
             "failed" => Ok(Self::Failed),
             other => Err(JammiError::Catalog(format!(
-                "Unknown training job status: '{other}'"
+                "Unknown job status: '{other}'"
             ))),
         }
     }
@@ -141,9 +186,77 @@ impl FromStr for ModelStatus {
     }
 }
 
+/// Execution mode of a job (`jobs.execution`): whether the poll loop's
+/// `claim_next` may pick it up (`Queued`) or it was claimed exactly once, by
+/// id, inside the submitting call itself (`Inline`) — an inline row is never
+/// selected by `claim_next`'s `WHERE execution = 'queued'` predicate.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum JobExecution {
+    /// Claimable by the poll loop.
+    Queued,
+    /// Claimed once, by id, in the submitting call; invisible to the poll loop.
+    Inline,
+}
+
+impl fmt::Display for JobExecution {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Queued => write!(f, "queued"),
+            Self::Inline => write!(f, "inline"),
+        }
+    }
+}
+
+impl FromStr for JobExecution {
+    type Err = JammiError;
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        match s {
+            "queued" => Ok(Self::Queued),
+            "inline" => Ok(Self::Inline),
+            other => Err(JammiError::Catalog(format!(
+                "Unknown job execution mode: '{other}'"
+            ))),
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn job_status_round_trips_through_display_and_from_str() {
+        for status in [
+            JobStatus::Queued,
+            JobStatus::Running,
+            JobStatus::Completed,
+            JobStatus::Failed,
+        ] {
+            let rendered = status.to_string();
+            let parsed = JobStatus::from_str(&rendered).expect("canonical status parses");
+            assert_eq!(parsed, status, "round-trip must be identity for {status:?}");
+        }
+        assert_eq!(JobStatus::Failed.to_string(), "failed");
+        assert!(JobStatus::from_str("cancelled").is_err());
+    }
+
+    #[test]
+    fn job_status_terminality_matches_the_retention_predicate() {
+        assert!(!JobStatus::Queued.is_terminal());
+        assert!(!JobStatus::Running.is_terminal());
+        assert!(JobStatus::Completed.is_terminal());
+        assert!(JobStatus::Failed.is_terminal());
+    }
+
+    #[test]
+    fn job_execution_round_trips_through_display_and_from_str() {
+        for exec in [JobExecution::Queued, JobExecution::Inline] {
+            let rendered = exec.to_string();
+            let parsed = JobExecution::from_str(&rendered).expect("canonical execution parses");
+            assert_eq!(parsed, exec, "round-trip must be identity for {exec:?}");
+        }
+        assert!(JobExecution::from_str("async").is_err());
+    }
 
     #[test]
     fn model_status_round_trips_through_display_and_from_str() {

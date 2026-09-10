@@ -87,6 +87,7 @@ async fn create_building(store: &ResultStore) -> BuildingTable {
             Some(DIMS as i32),
             Some("_row_id"),
             Some("body"),
+            None,
         )
         .await
         .unwrap()

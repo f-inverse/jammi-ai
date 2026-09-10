@@ -141,11 +141,7 @@ async fn fine_tune_graph_learns_on_gpu() {
 
     // (a) completes on the GPU.
     job.wait().await.unwrap();
-    let record = session
-        .catalog()
-        .get_training_job(&job.job_id)
-        .await
-        .unwrap();
+    let record = session.catalog().get_job(&job.job_id).await.unwrap();
     assert_eq!(
         record.status, "completed",
         "GPU graph fine-tune should complete, got {}",

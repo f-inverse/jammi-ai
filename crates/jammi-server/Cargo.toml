@@ -61,15 +61,25 @@ async-trait.workspace = true
 reqwest.workspace = true
 
 [features]
-# `train` is on by default so the published image and every default build mount
-# the full tier set (all-in-one). It compiles the `FineTuneService` mount (the
-# `train` service tier); a `--no-default-features` serve-only build carries no
-# training surface and the tier mechanism honestly reports `train` as
-# uncompilable. The other optional tiers (`event` = TriggerService, `eval` =
-# EvalService) always compile — they carry no heavy dep beyond the engine — and
-# are gated at runtime via `[server] services`, not at compile time.
-default = ["train"]
-train = []
+# Vendor-neutral OTLP trace export (#486), by-name passthrough to
+# `jammi-ai`'s own `telemetry-otlp` feature (same precedent as `cuda`/
+# `metal`/`flash-attn` below). Default-on: every published `jammi-server`
+# binary and image carries it, so `[observability] otlp_endpoint` works with
+# no rebuild -- the OSS engine's "emit vendor-neutral, the stack is yours"
+# line (philosophy.md) applies to traces the same way it already does to
+# `/metrics` and structured logs. `--no-default-features` (or explicitly
+# `--features -telemetry-otlp`, which cargo does not support removing a
+# default feature that way -- use `--no-default-features --features
+# <the others you want>`) compiles a build that REFUSES to start if
+# `otlp_endpoint` is configured (K2) rather than silently dropping every
+# span.
+telemetry-otlp = ["jammi-ai/telemetry-otlp"]
+default = ["telemetry-otlp"]
+# No feature gates a gRPC service tier: every tier (`core`, `event` =
+# TriggerService, `eval` = EvalService) always compiles, and the optional ones
+# are selected at runtime via `[server] services`. Whether this process also
+# runs the job worker is the `[worker] enabled` runtime key, not a build
+# feature — one binary, every deployment shape, no per-shape rebuild.
 cuda  = ["jammi-ai/cuda"]
 metal = ["jammi-ai/metal"]
 # By-name passthrough to `jammi-ai`'s own `flash-attn` feature — the ONE

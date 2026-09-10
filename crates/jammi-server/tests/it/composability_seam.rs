@@ -134,12 +134,13 @@ async fn transport_only_chain(addr: SocketAddr) -> (GrpcChain, TempDir, Arc<Jamm
         store: jammi_server::grpc::session::SessionStore::new(),
         trigger: None,
         engine: None,
-        tiers: TierSet::resolve(std::iter::empty()).expect("core-only tier set resolves"),
+        tiers: TierSet::resolve(std::iter::empty()),
         metrics: Arc::new(MetricsRegistry::new().unwrap()),
         tenant_resolver: jammi_server::grpc::session::SessionIdTenantResolver::arc(
             jammi_server::grpc::session::SessionStore::new(),
         ),
         admin_authorizer: None,
+        limits: jammi_db::config::LimitsConfig::default(),
     };
     (chain, dir, session)
 }
@@ -405,8 +406,7 @@ async fn into_axum_router_composes_one_listener_with_a_plain_http_route() {
     assert!(!info.version.is_empty());
 
     // Keep the worker guard (if any) alive until after serving, per the contract.
-    #[cfg(feature = "train")]
-    let _keep = parts.train_worker;
+    let _keep = parts.worker;
 
     let _ = shutdown_tx.send(());
     let _ = handle.await;
@@ -504,12 +504,13 @@ async fn into_layered_axum_router_serves_directly_with_grpc_web_trailer_repair()
         store: jammi_server::grpc::session::SessionStore::new(),
         trigger: None,
         engine: Some(session),
-        tiers: TierSet::resolve(std::iter::empty()).expect("core-only tier set resolves"),
+        tiers: TierSet::resolve(std::iter::empty()),
         metrics: Arc::new(MetricsRegistry::new().unwrap()),
         tenant_resolver: jammi_server::grpc::session::SessionIdTenantResolver::arc(
             jammi_server::grpc::session::SessionStore::new(),
         ),
         admin_authorizer: None,
+        limits: jammi_db::config::LimitsConfig::default(),
     };
 
     let assembled = assemble_grpc_chain(chain)
@@ -595,8 +596,7 @@ async fn into_layered_axum_router_serves_directly_with_grpc_web_trailer_repair()
     );
 
     // Hold the worker guard (if any) alive until after serving, per the contract.
-    #[cfg(feature = "train")]
-    let _keep = parts.train_worker;
+    let _keep = parts.worker;
 
     let _ = shutdown_tx.send(());
     let _ = handle.await;
@@ -830,13 +830,14 @@ async fn resolver_seam_scopes_both_transports_and_rejects_missing_credential() {
         store: jammi_server::grpc::session::SessionStore::new(),
         trigger: None,
         engine: Some(session),
-        tiers: TierSet::resolve(std::iter::empty()).expect("core-only tier set resolves"),
+        tiers: TierSet::resolve(std::iter::empty()),
         metrics: Arc::new(MetricsRegistry::new().unwrap()),
         // The seam under test: a downstream supplies its own authenticating
         // resolver, which binds every engine service and the Flight lane through
         // the one tenant-binding mechanism.
         tenant_resolver: Arc::new(BearerTenantResolver),
         admin_authorizer: None,
+        limits: jammi_db::config::LimitsConfig::default(),
     };
 
     let assembled = assemble_grpc_chain(chain).expect("assemble");

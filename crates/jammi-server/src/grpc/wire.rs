@@ -1,7 +1,7 @@
 //! Server-receive helpers shared by the engine-backed gRPC services: the
 //! control-plane `CatalogService` (sources / models / channels / mutable tables
 //! / topic admin) and the data-plane `EmbeddingService`, `InferenceService`,
-//! `EvalService`, `TrainingService`, `AuditService`, and `TriggerService`
+//! `EvalService`, `JobService`, `AuditService`, and `TriggerService`
 //! publish/subscribe verbs.
 //!
 //! These are transport concerns that belong on the receive side, not wire
@@ -209,6 +209,20 @@ pub fn map_engine_error(err: JammiError) -> Status {
             Code::Aborted,
             format!("result table `{table}` is already `{status}`"),
         ),
+        // A job-row attempt guard missed under the caller: a peer's reclaim
+        // superseded this attempt mid-run. `Aborted` — the same "lost the
+        // race, retry from a fresh claim" mapping `LeaseLost`/`CasFailed`
+        // carry for a result-table lease.
+        JammiError::JobAttemptSuperseded { job_id } => (
+            Code::Aborted,
+            format!("job `{job_id}`: this attempt was superseded"),
+        ),
+        // The executor honoured a `cancel_request` at a checkpoint: the
+        // caller asked for exactly this outcome, so it is `Cancelled`, not a
+        // fault.
+        JammiError::JobCancelled { job_id } => {
+            (Code::Cancelled, format!("job `{job_id}` was cancelled"))
+        }
         // `delete_result_tables_for_source`'s atomic guard refused: a live-lease
         // `building` row still references the source. `FailedPrecondition` — a
         // retry once the writer finishes or its lease expires, mirroring
@@ -344,6 +358,38 @@ mod tests {
         assert!(matches!(
             error_from_status(&source_busy),
             JammiError::SourceBusy { source_id, table } if source_id == "src1" && table == "t1"
+        ));
+    }
+
+    /// `JobAttemptSuperseded`/`JobCancelled` must round-trip as their typed
+    /// variant across the wire, never fold into the lossy
+    /// `JammiError::Other`: `map_engine_error` classifies them with the
+    /// right gRPC `Code` (`Aborted`/`Cancelled`), and `attach_error_detail`'s
+    /// `pb::JammiErrorDetail::from(&JammiError)` carries a dedicated arm for
+    /// each, so a remote client's `error_from_status` reconstructs the typed
+    /// variant with its `job_id`, never just the `Display` string.
+    /// This exercises the SAME `attach_error_detail` → real `tonic::Status`
+    /// (genuine `grpc-status-details-bin` metadata bytes) → `error_from_status`
+    /// round trip a live gRPC call uses — the client-facing seam this
+    /// invariant protects, not merely the in-memory `From` impl.
+    #[test]
+    fn job_attempt_superseded_and_job_cancelled_round_trip_as_their_typed_variant_not_other() {
+        let superseded = map_engine_error(JammiError::JobAttemptSuperseded {
+            job_id: "job-1".into(),
+        });
+        assert_eq!(superseded.code(), Code::Aborted);
+        assert!(matches!(
+            error_from_status(&superseded),
+            JammiError::JobAttemptSuperseded { job_id } if job_id == "job-1"
+        ));
+
+        let cancelled = map_engine_error(JammiError::JobCancelled {
+            job_id: "job-2".into(),
+        });
+        assert_eq!(cancelled.code(), Code::Cancelled);
+        assert!(matches!(
+            error_from_status(&cancelled),
+            JammiError::JobCancelled { job_id } if job_id == "job-2"
         ));
     }
 

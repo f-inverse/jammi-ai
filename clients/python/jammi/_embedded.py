@@ -193,7 +193,7 @@ class EmbeddedBackend:
         :class:`~jammi.errors.BackendError` the engine's boundary guard raises,
         never a silent no-op.
 
-        With ``training.run_worker = false`` there is no worker to stop, so only
+        With ``worker.enabled = false`` there is no worker to stop, so only
         the catalog release runs — promptly, with no idle-poll wait and no
         in-flight run to finish. That is the point of the setting on a SQLite
         catalog: this session submits jobs and holds them ``"queued"``, and this
@@ -438,14 +438,15 @@ class EmbeddedBackend:
         """Fuse several ranked retrieval lists by reciprocal-rank fusion."""
         return self._native.rrf_fuse(ranked_lists, k_rrf=k_rrf)
 
-    def training_job(self, job_id: str) -> Any:
-        """Attach to an existing training job by id.
+    def job(self, job_id: str) -> Any:
+        """Attach to an existing job by id (training or compute).
 
         The handle a `fine_tune` call returns is bound to the session that made
         it; this is how a session that never submitted the job reaches it — the
-        peer of :meth:`jammi.RemoteDatabase.training_job`, and the reason a job
+        peer of :meth:`jammi.RemoteDatabase.job`, and the reason a job
         outlives its submitting connection. Every read verb works on the
-        result: `status()`, `metrics()`, `acceleration_report()`, `wait()`.
+        result: `status()`, `progress()`, `metrics()`, `acceleration_report()`,
+        `cancel()`, `wait()`.
 
         A `job_id` with no row VISIBLE TO THIS TENANT raises the typed
         :class:`~jammi.errors.BackendError` — the same class the remote arm
@@ -453,20 +454,38 @@ class EmbeddedBackend:
         raises here. There is no separate existence check to drift from the
         catalog read itself.
         """
-        return self._native.training_job(job_id)
+        return self._native.job(job_id)
 
-    def list_training_jobs(self) -> List[Dict[str, Any]]:
-        """Training jobs visible to the current tenant, most recent first.
+    def list_jobs(self) -> List[Dict[str, Any]]:
+        """Jobs visible to the current tenant, most recent first.
 
-        Each entry carries the wire's `TrainingJobSummary` field set —
-        ``job_id``, ``kind``, ``status``, ``base_model_id``,
-        ``output_model_id``, ``created_at``, ``error`` — with
-        ``output_model_id`` empty until the job completes and ``error`` empty
-        unless it failed. A listing of :meth:`training_job` answers plus the
-        submit-time identity; there is no progress surface here, because the
-        engine records run metrics only at finalization.
+        Each entry carries the wire's `JobSummary` field set — ``job_id``,
+        ``kind``, ``status``, ``base_model_id``, ``output_model_id``,
+        ``created_at``, ``error`` — with ``output_model_id`` empty until a
+        training kind completes (always empty for a compute kind) and
+        ``error`` empty unless it failed. A listing of :meth:`job` answers
+        plus the submit-time identity; read :meth:`job(job_id).progress()
+        <Job.progress>` for the mid-run progress surface.
         """
-        return self._native.list_training_jobs()
+        return self._native.list_jobs()
+
+    def cancel_job(self, job_id: str) -> bool:
+        """Request cancellation of a job by id. `True` when the request landed
+        on a still non-terminal row; `False` when the job was already
+        terminal or absent."""
+        return self._native.cancel_job(job_id)
+
+    def list_workers(self) -> List[Dict[str, Any]]:
+        """The engine processes currently running the claim loop
+        (`[worker] enabled = true`), most recently seen first: each entry
+        carries ``instance_id``, ``label``, ``host``, ``kinds``,
+        ``started_at``, ``last_seen_at``."""
+        return self._native.list_workers()
+
+    def prune_jobs(self) -> int:
+        """Eagerly delete this session's own terminal job rows older than the
+        deployment's `[jobs] retention_days`. Returns the count deleted."""
+        return self._native.prune_jobs()
 
     def fine_tune(
         self,
@@ -506,14 +525,16 @@ class EmbeddedBackend:
         regression_beta: Optional[float] = None,
         quantile_levels: Optional[List[float]] = None,
         keep_last_n_checkpoints: Optional[int] = None,
+        idempotency_key: str = "",
     ):
         """Submit a LoRA fine-tuning job to the in-process engine; poll the handle.
 
-        Returns a `TrainingJob` — same handle shape and verb signature as the
+        Returns a `Job` — same handle shape and verb signature as the
         remote `RemoteDatabase.fine_tune`. The request is assembled with the
         shared `FineTuneSpec` builder and submitted through the engine's wire
         seam; all config kwargs are optional, applying the engine defaults when
-        omitted.
+        omitted. `idempotency_key`, when non-empty, dedupes the submission
+        (migration 030) the same way the remote arm's does.
         """
         request = build_fine_tune_request(
             source=source,
@@ -551,8 +572,11 @@ class EmbeddedBackend:
             regression_beta=regression_beta,
             quantile_levels=quantile_levels,
             keep_last_n_checkpoints=keep_last_n_checkpoints,
+            idempotency_key=idempotency_key,
         )
-        return self._native._start_training_proto(request.SerializeToString())
+        return self._native._start_training_proto(
+            request.SerializeToString(), idempotency_key or None
+        )
 
     def fine_tune_graph(
         self,
@@ -582,16 +606,18 @@ class EmbeddedBackend:
         matryoshka_dims: Optional[List[int]] = None,
         seed: Optional[int] = None,
         keep_last_n_checkpoints: Optional[int] = None,
+        idempotency_key: str = "",
     ):
         """Submit a graph-supervised fine-tune (S11) to the in-process engine.
 
-        Returns a `TrainingJob`, mirroring the remote
-        `RemoteDatabase.fine_tune_graph`. The request is assembled with the
-        shared `GraphFineTuneSpec` builder (which carries the graph-only
-        embedding-loss guard) and submitted through the engine's wire seam.
-        `edge_provenance` is the load-bearing circularity distinction — "declared"
-        external edges teach the metric something new; "similarity" edges are a
-        weak bootstrap only.
+        Returns a `Job`, mirroring the remote `RemoteDatabase.fine_tune_graph`.
+        The request is assembled with the shared `GraphFineTuneSpec` builder
+        (which carries the graph-only embedding-loss guard) and submitted
+        through the engine's wire seam. `edge_provenance` is the load-bearing
+        circularity distinction — "declared" external edges teach the metric
+        something new; "similarity" edges are a weak bootstrap only.
+        `idempotency_key`, when non-empty, dedupes the submission (migration
+        030) the same way the remote arm's does.
         """
         request = build_fine_tune_graph_request(
             node_source=node_source,
@@ -619,8 +645,11 @@ class EmbeddedBackend:
             matryoshka_dims=matryoshka_dims,
             seed=seed,
             keep_last_n_checkpoints=keep_last_n_checkpoints,
+            idempotency_key=idempotency_key,
         )
-        return self._native._start_training_proto(request.SerializeToString())
+        return self._native._start_training_proto(
+            request.SerializeToString(), idempotency_key or None
+        )
 
     def train_context_predictor(
         self,
@@ -645,15 +674,18 @@ class EmbeddedBackend:
         min_task_count: int = 4,
         seed: int = 0,
         model_id: Optional[str] = None,
+        idempotency_key: str = "",
     ):
         """Submit an amortized in-context predictor (S19) meta-training to the
         in-process engine.
 
-        Returns a `TrainingJob`, mirroring the remote
+        Returns a `Job`, mirroring the remote
         `RemoteDatabase.train_context_predictor`. The request is assembled with
         the shared `ContextPredictorSpec` builder (which builds the
         gaussian/quantile predictive head and applies the `output='quantile'
         requires levels` check) and submitted through the engine's wire seam.
+        `idempotency_key`, when non-empty, dedupes the submission (migration
+        030) the same way the remote arm's does.
         """
         request = build_context_predictor_request(
             source,
@@ -676,8 +708,11 @@ class EmbeddedBackend:
             min_task_count=min_task_count,
             seed=seed,
             model_id=model_id,
+            idempotency_key=idempotency_key,
         )
-        return self._native._start_training_proto(request.SerializeToString())
+        return self._native._start_training_proto(
+            request.SerializeToString(), idempotency_key or None
+        )
 
     def infer(
         self,
@@ -1303,8 +1338,8 @@ def _open_embedded(artifact_dir: str, *, config: Optional[str] = None) -> Embedd
     when there is none — the `artifact_dir` passed here is applied after that
     load and always wins.
 
-    One key that resolution carries is `training.run_worker`
-    (``JAMMI_TRAINING__RUN_WORKER``): with it `false`, this session accepts
+    One key that resolution carries is `worker.enabled`
+    (``JAMMI_WORKER__ENABLED``): with it `false`, this session accepts
     training submissions but never claims one, so on a SQLite catalog a
     submitted job stays ``"queued"`` until this session is closed and a claiming
     process opens the directory. See :func:`jammi.connect`.

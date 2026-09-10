@@ -83,6 +83,7 @@ async fn session_with_synthetic_embeddings() -> (Arc<InferenceSession>, TempDir,
             },
             &pairs,
             Materialization::new(&descriptor, &env, inputs),
+            None,
         )
         .await
         .unwrap();
@@ -671,6 +672,7 @@ async fn a_pre_contract_table_is_not_recomputable() {
             Some(DIM as i32),
             Some("_row_id"),
             Some("body"),
+            None,
         )
         .await
         .unwrap();
@@ -798,6 +800,7 @@ async fn recompute_after_model_dir_mutation_changes_the_definition_hash() {
                 &["abstract".to_string()],
                 "id",
                 CachePolicy::Bypass,
+                None,
             )
             .await
             .unwrap();

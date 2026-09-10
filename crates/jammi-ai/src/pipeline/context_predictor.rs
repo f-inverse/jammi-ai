@@ -269,7 +269,11 @@ impl ContextPredictorTrainConfig {
     /// Validate the spec independently of any data: the head/objective is
     /// coherent, the test fraction is a proper fraction, `num_heads` divides
     /// `hidden_dim` for the attentive members, and the budget is non-degenerate.
-    fn validate(&self) -> Result<()> {
+    ///
+    /// `pub(crate)`, not private: [`crate::session::InferenceSession::
+    /// run_training_spec_deduped`] validates a fully-decoded spec before
+    /// dispatch, from a different module.
+    pub(crate) fn validate(&self) -> Result<()> {
         self.head.validate()?;
         if self.context_k == 0 {
             return Err(JammiError::FineTune("context_k must be at least 1".into()));
@@ -508,7 +512,7 @@ impl InferenceSession {
     ///
     /// Like the fine-tune verbs, this persists a self-describing
     /// [`TrainingSpec::ContextPredictor`] into a `queued` catalog job and
-    /// returns; a [`crate::fine_tune::worker::TrainingWorker`] later claims it,
+    /// returns; a [`crate::fine_tune::worker::JobWorker`] later claims it,
     /// re-samples the episodic meta-dataset from the persisted spec
     /// (deterministic task split via the seed), drives the predictor train loop
     /// while heartbeating, and registers the trained predictor. Call
@@ -520,13 +524,80 @@ impl InferenceSession {
         source_id: &str,
         spec: &ContextPredictorTrainConfig,
     ) -> Result<crate::fine_tune::training_job::TrainingJob> {
+        self.train_context_predictor_deduped(source_id, spec, None)
+            .await
+    }
+
+    /// [`Self::train_context_predictor`], additionally deduped by an
+    /// optional per-tenant `idempotency_key` (migration 030) — see
+    /// [`InferenceSession::run_training_spec_deduped`] for the caller and
+    /// [`jammi_db::catalog::Catalog::submit_job_deduped`] for the atomicity
+    /// guarantee. `idempotency_key` of `None` always inserts fresh, matching
+    /// [`Self::train_context_predictor`] byte-for-byte.
+    pub(crate) async fn train_context_predictor_deduped(
+        self: &Arc<Self>,
+        source_id: &str,
+        spec: &ContextPredictorTrainConfig,
+        idempotency_key: Option<&str>,
+    ) -> Result<crate::fine_tune::training_job::TrainingJob> {
         spec.validate()?;
 
-        // The predictor registers under its own model id; the base-model FK on
-        // the job points at the source's embedding model so the row is valid.
-        // The table records the model's bare name; ensure a catalog row exists
-        // for it (an embedding table can be materialised without registering a
-        // model row) and use its PK (`name::version`) for the FK.
+        let job_id = uuid::Uuid::new_v4().to_string();
+        let training_spec = TrainingSpec::ContextPredictor {
+            source: source_id.to_string(),
+            predictor_spec: spec.clone(),
+        };
+        // `model_ref`/`output_model_id` come from the one derivation every
+        // training submitter shares (`InferenceSession::training_job_links`):
+        // the source's embedding model's PK, and the predictor's own id.
+        let links = self.training_job_links(&training_spec, &job_id).await?;
+        let spec_json = serde_json::to_string(&training_spec)?;
+        let recorded_job_id = self
+            .catalog()
+            .submit_job_deduped(
+                jammi_db::catalog::jobs_repo::SubmitJobParams {
+                    job_id: &job_id,
+                    kind: training_spec.kind(),
+                    execution: jammi_db::catalog::status::JobExecution::Queued,
+                    spec: &spec_json,
+                    model_ref: Some(&links.model_ref),
+                    output_model_id: Some(&links.output_model_id),
+                    model_source: None,
+                    priority: 0,
+                },
+                idempotency_key,
+            )
+            .await?;
+
+        if recorded_job_id == job_id {
+            Ok(crate::fine_tune::training_job::TrainingJob::new(
+                job_id,
+                "queued".into(),
+                links.output_model_id,
+                Arc::clone(self.catalog_arc()),
+            ))
+        } else {
+            // A concurrent or prior call already holds this idempotency key
+            // — re-read its current state rather than assuming "queued".
+            let record = self.catalog().get_job(&recorded_job_id).await?;
+            let model_id =
+                crate::fine_tune::training_job::resolve_model_id(&recorded_job_id, &record)?;
+            Ok(crate::fine_tune::training_job::TrainingJob::new(
+                recorded_job_id,
+                record.status,
+                model_id,
+                Arc::clone(self.catalog_arc()),
+            ))
+        }
+    }
+
+    /// The base-model PK a context-predictor job's `model_ref` binds to: the
+    /// predictor registers under its own model id, so the FK points at the
+    /// SOURCE's embedding model, keeping the row valid. The embedding table
+    /// records that model's bare name; a catalog row is registered for it
+    /// when absent (an embedding table can be materialised without one) and
+    /// its PK (`name::version`) is returned.
+    pub(crate) async fn context_predictor_base_model_pk(&self, source_id: &str) -> Result<String> {
         let table = self
             .catalog()
             .resolve_embedding_table(source_id, None)
@@ -558,33 +629,7 @@ impl InferenceSession {
                     .catalog_pk
             }
         };
-        let loss_type = format!("{:?}", spec.head);
-        let hyperparams = serde_json::to_string(spec)?;
-
-        let job_id = uuid::Uuid::new_v4().to_string();
-        let training_spec = TrainingSpec::ContextPredictor {
-            source: source_id.to_string(),
-            predictor_spec: spec.clone(),
-        };
-        let spec_json = serde_json::to_string(&training_spec)?;
-        self.catalog()
-            .create_training_job(jammi_db::catalog::training_repo::CreateTrainingJobParams {
-                job_id: &job_id,
-                base_model_id: &base_model_pk,
-                training_source: source_id,
-                loss_type: &loss_type,
-                hyperparams: &hyperparams,
-                kind: training_spec.kind(),
-                training_spec: &spec_json,
-            })
-            .await?;
-
-        Ok(crate::fine_tune::training_job::TrainingJob::new(
-            job_id,
-            "queued".into(),
-            spec.model_id.clone(),
-            Arc::clone(self.catalog_arc()),
-        ))
+        Ok(base_model_pk)
     }
 
     /// Run an in-context-predictor meta-training to completion: sample the

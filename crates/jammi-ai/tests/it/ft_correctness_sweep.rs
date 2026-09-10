@@ -41,19 +41,24 @@ async fn claimed_loop_env(tag: &str) -> (Arc<jammi_db::catalog::Catalog>, tempfi
         .await
         .unwrap();
     catalog
-        .create_training_job(jammi_db::catalog::training_repo::CreateTrainingJobParams {
+        .submit_job(jammi_db::catalog::jobs_repo::SubmitJobParams {
             job_id: tag,
-            base_model_id: &format!("{model_id}::1"),
-            training_source: "src",
-            loss_type: "cosent",
-            hyperparams: "{}",
             kind: "fine_tune",
-            training_spec: "{}",
+            execution: jammi_db::catalog::status::JobExecution::Queued,
+            spec: "{}",
+            model_ref: Some(&format!("{model_id}::1")),
+            output_model_id: None,
+            model_source: None,
+            priority: 0,
         })
         .await
         .unwrap();
     catalog
-        .claim_next_training_job(&format!("{tag}-worker"), std::time::Duration::from_secs(60))
+        .claim_next(
+            &format!("{tag}-worker"),
+            &["fine_tune"],
+            std::time::Duration::from_secs(60),
+        )
         .await
         .unwrap()
         .expect("queued job claimable");

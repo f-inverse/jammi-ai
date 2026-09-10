@@ -93,7 +93,7 @@ pub(crate) fn seed_for_target(base_seed: u64, target: &str) -> u64 {
 /// Applied at adjacency-build time (an `Undirected` gather inserts both
 /// directions), so the walk itself is direction-agnostic — it simply follows
 /// whatever edges the adjacency holds.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub enum EdgeDirection {
     /// Follow `src → dst` edges (out-neighbours of the target).
     Out,
@@ -219,7 +219,7 @@ fn sample_indices(n: usize, k: usize, rng: &mut SplitMix64) -> Vec<usize> {
 pub const DEFAULT_HOP_CAP: usize = 3;
 
 /// Which declared edge relation to gather over, tenant-scoped.
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
 pub enum EdgeSourceRef {
     /// An S9 `neighbor_graph` result table (`src`/`dst`/`rank`/`similarity`).
     /// `similarity` carries the edge weight; edges are untyped.

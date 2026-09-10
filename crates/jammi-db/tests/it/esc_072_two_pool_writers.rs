@@ -38,8 +38,9 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use jammi_db::catalog::backend::BackendKind;
+use jammi_db::catalog::jobs_repo::SubmitJobParams;
 use jammi_db::catalog::model_repo::RegisterModelParams;
-use jammi_db::catalog::training_repo::CreateTrainingJobParams;
+use jammi_db::catalog::status::JobExecution;
 use jammi_db::catalog::Catalog;
 use jammi_db::session::JammiSession;
 use jammi_db::ModelTask;
@@ -157,17 +158,18 @@ async fn seed(catalog: &Catalog) {
         .expect("register base model");
     for n in 0..JOBS {
         catalog
-            .create_training_job(CreateTrainingJobParams {
+            .submit_job(SubmitJobParams {
                 job_id: &format!("job-{n}"),
-                base_model_id: "base-model::1",
-                training_source: "training_source",
-                loss_type: "cosent",
-                hyperparams: r#"{"lora_rank": 8}"#,
                 kind: "fine_tune",
-                training_spec: "{}",
+                execution: JobExecution::Queued,
+                spec: "{}",
+                model_ref: Some("base-model::1"),
+                output_model_id: None,
+                model_source: None,
+                priority: 0,
             })
             .await
-            .expect("create training job");
+            .expect("submit job");
     }
 }
 
@@ -178,10 +180,10 @@ async fn worker_loop(catalog: Arc<Catalog>, run: Arc<Run>, who: String, started:
     let mut spin: u64 = 0;
     while !run.done(started) {
         run.tick();
-        let claimed = match catalog.claim_next_training_job(&who, LEASE).await {
+        let claimed = match catalog.claim_next(&who, &["fine_tune"], LEASE).await {
             Ok(c) => c,
             Err(err) => {
-                run.record(&who, "claim_next_training_job", err.to_string());
+                run.record(&who, "claim_next", err.to_string());
                 return;
             }
         };
@@ -190,19 +192,19 @@ async fn worker_loop(catalog: Arc<Catalog>, run: Arc<Run>, who: String, started:
             Some(job) => {
                 run.tick();
                 if let Err(err) = catalog
-                    .heartbeat_training_job(&job.job_id, &who, LEASE)
+                    .heartbeat_job(&job.job_id, &who, job.attempts, LEASE)
                     .await
                 {
-                    run.record(&who, "heartbeat_training_job", err.to_string());
+                    run.record(&who, "heartbeat_job", err.to_string());
                     return;
                 }
                 run.tick();
-                let metrics = format!(r#"{{"who": "{who}", "spin": {spin}}}"#);
+                let phase = format!(r#"{{"who": "{who}", "spin": {spin}}}"#);
                 if let Err(err) = catalog
-                    .mark_training_running(&job.job_id, &who, Some(&metrics))
+                    .progress_job(&job.job_id, &who, job.attempts, None, None, Some(&phase))
                     .await
                 {
-                    run.record(&who, "mark_training_running", err.to_string());
+                    run.record(&who, "progress_job", err.to_string());
                     return;
                 }
             }
@@ -210,8 +212,8 @@ async fn worker_loop(catalog: Arc<Catalog>, run: Arc<Run>, who: String, started:
                 // Nothing claimable — sweep expired leases back to `queued`,
                 // which is exactly what the worker's poll loop does.
                 run.tick();
-                if let Err(err) = catalog.reclaim_expired_training_jobs(MAX_ATTEMPTS).await {
-                    run.record(&who, "reclaim_expired_training_jobs", err.to_string());
+                if let Err(err) = catalog.reclaim_expired_jobs(LEASE, MAX_ATTEMPTS).await {
+                    run.record(&who, "reclaim_expired_jobs", err.to_string());
                     return;
                 }
                 tokio::task::yield_now().await;

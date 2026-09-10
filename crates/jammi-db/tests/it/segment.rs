@@ -95,6 +95,7 @@ async fn building_table(store: &ResultStore) -> BuildingTable {
             Some(4),
             Some("_row_id"),
             None,
+            None,
         )
         .await
         .unwrap()
@@ -378,6 +379,7 @@ async fn seed_result_table(session: &jammi_db::session::JammiSession, table: &st
             storage_precision: StoragePrecision::F32,
             oversample: 4,
             created_at: jammi_db::catalog::backend::now_sortable(),
+            job_attempt: None,
         })
         .await
         .unwrap();

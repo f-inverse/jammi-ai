@@ -69,7 +69,7 @@ pub use jammi_db::catalog::channel_repo::{ChannelColumn, ChannelSpec};
 /// other verb delegates straight through.
 pub struct Session {
     engine: Arc<InferenceSession>,
-    /// The embedded training worker, present only on a front-door session
+    /// The embedded job worker, present only on a front-door session
     /// ([`crate::Jammi::open`]) whose config asks this process to claim — the
     /// one drop point that owns the worker for the process's lifetime.
     /// Per-request wrappers (gRPC handlers, the Python `Database`'s internal
@@ -77,7 +77,7 @@ pub struct Session {
     /// spawned per call. Dropping the front-door session stops the worker
     /// (RAII). Held for its `Drop`, not read.
     ///
-    /// `None` is also what a `training.run_worker = false` front door carries
+    /// `None` is also what a `worker.enabled = false` front door carries
     /// (see [`Self::with_configured_worker`]): "no claim loop exists in this
     /// process" is a state the type holds rather than a behaviour a reader has
     /// to infer, and the drop path has correspondingly nothing to signal or
@@ -87,8 +87,8 @@ pub struct Session {
 
 impl Session {
     /// Wrap an existing engine session without an embedded worker. Used by the
-    /// per-request wrappers (gRPC handlers) and any caller that owns the training
-    /// worker elsewhere (the server `train` tier; the Python `Database`). The
+    /// per-request wrappers (gRPC handlers) and any caller that owns the job
+    /// worker elsewhere (the server's worker tier; the Python `Database`). The
     /// [`Self::fine_tune`] verb still submits jobs through this — the worker that
     /// runs them just lives elsewhere.
     pub fn new(engine: Arc<InferenceSession>) -> Self {
@@ -99,9 +99,9 @@ impl Session {
     }
 
     /// Wrap an engine session and spawn the embedded
-    /// [`crate::fine_tune::worker::TrainingWorker`] the resulting session owns —
-    /// **unconditionally**, whatever the session's `[training] run_worker` says.
-    /// The embedded engine both submits training jobs and runs them, and the
+    /// [`crate::fine_tune::worker::JobWorker`] the resulting session owns —
+    /// **unconditionally**, whatever the session's `[worker] enabled` says.
+    /// The embedded engine both submits jobs and runs them, and the
     /// worker stops when this session drops (RAII). Must be called inside a
     /// tokio runtime context (the worker spawns a task).
     ///
@@ -109,13 +109,13 @@ impl Session {
     /// (a test harness that must have a claimant; an embedder that has already
     /// decided out of band). The SDK front door ([`crate::Jammi::open`]) does
     /// **not** use it — it uses [`Self::with_configured_worker`], so that a
-    /// deployment's `training.run_worker` reaches the Rust SDK arm exactly as it
+    /// deployment's `worker.enabled` reaches the Rust SDK arm exactly as it
     /// reaches the server and the Python binding. Reach for this one only when
     /// "spawn regardless of configuration" is what you mean; the name is a
     /// promise it keeps.
     ///
     /// Returns [`jammi_db::error::JammiError::Config`] if the session's
-    /// `[training]` timing violates the worker invariants; the engine's
+    /// `[worker]` timing violates the worker invariants; the engine's
     /// `JammiConfig::load` already validated it for the normal front-door flow.
     pub fn with_embedded_worker(engine: Arc<InferenceSession>) -> Result<Self> {
         let worker = crate::fine_tune::worker::EmbeddedWorker::spawn(&engine)?;
@@ -125,21 +125,21 @@ impl Session {
         })
     }
 
-    /// Wrap an engine session and spawn the embedded training worker **only when
+    /// Wrap an engine session and spawn the embedded job worker **only when
     /// the session's own configuration asks this process to claim** — the SDK
     /// front-door form ([`crate::Jammi::open`]).
     ///
-    /// The decision is one key, [`jammi_db::config::TrainingConfig::run_worker`]
+    /// The decision is one key, [`jammi_db::config::WorkerConfig::enabled`]
     /// (default `true`), read off `engine`'s loaded config — the SAME key the
-    /// server's `train` tier reads before spawning its worker and the same key
+    /// server's worker tier reads before spawning its worker and the same key
     /// the Python `Database` reads before spawning its own, so a wire deployment
     /// and an in-process one answer "does THIS process claim?" identically
     /// rather than by three private conventions:
     ///
     /// * `true` — the claim loop runs here. The embedded engine both submits
-    ///   training jobs and runs them, and the worker stops when this session
+    ///   jobs and runs them, and the worker stops when this session
     ///   drops (RAII).
-    /// * `false` — no worker is spawned at all. The training surface is
+    /// * `false` — no worker is spawned at all. The submission surface is
     ///   unchanged: [`Self::fine_tune`] still submits and
     ///   [`Self::fine_tune_status`] still serves status; this process just never
     ///   claims, so on a single-process catalog (SQLite) a submitted job stays
@@ -151,21 +151,21 @@ impl Session {
     ///
     /// Must be called inside a tokio runtime context when a worker is spawned.
     /// Returns [`jammi_db::error::JammiError::Config`] if the session's
-    /// `[training]` timing violates the worker invariants; the engine's
+    /// `[worker]` timing violates the worker invariants; the engine's
     /// `JammiConfig::load` already validated it for the normal front-door flow.
     pub fn with_configured_worker(engine: Arc<InferenceSession>) -> Result<Self> {
-        if engine.inner_config().training.run_worker {
+        if engine.inner_config().worker.enabled {
             tracing::info!(
-                run_worker = true,
-                "embedded session: training surface available; this process claims queued training jobs"
+                worker_enabled = true,
+                "embedded session: job surface available; this process claims queued jobs"
             );
             Self::with_embedded_worker(engine)
         } else {
             // No worker exists to stop, so teardown has nothing extra to await:
             // the `_worker` slot stays `None` and its drop is a no-op.
             tracing::info!(
-                run_worker = false,
-                "embedded session: training surface available; this process does not claim training jobs"
+                worker_enabled = false,
+                "embedded session: job surface available; this process does not claim jobs"
             );
             Ok(Self::new(engine))
         }
@@ -237,9 +237,10 @@ impl Session {
         version: Option<i32>,
         if_exists: bool,
     ) -> Result<()> {
+        let retention_days = self.engine.inner_config().jobs.retention_days as i64;
         self.engine
             .catalog()
-            .delete_model(model_id, version, if_exists)
+            .delete_model(model_id, version, if_exists, retention_days)
             .await
     }
 
@@ -290,25 +291,9 @@ impl Session {
         modality: Modality,
         cache: jammi_db::store::CachePolicy,
     ) -> Result<(ResultTableRecord, jammi_db::store::CacheOutcome)> {
-        match modality {
-            Modality::Text => {
-                self.engine
-                    .generate_text_embeddings(source_id, model_id, columns, key_column, cache)
-                    .await
-            }
-            Modality::Image => {
-                let image_column = single_column(columns, "image")?;
-                self.engine
-                    .generate_image_embeddings(source_id, model_id, image_column, key_column, cache)
-                    .await
-            }
-            Modality::Audio => {
-                let audio_column = single_column(columns, "audio")?;
-                self.engine
-                    .generate_audio_embeddings(source_id, model_id, audio_column, key_column, cache)
-                    .await
-            }
-        }
+        self.engine
+            .generate_embeddings(source_id, model_id, columns, key_column, modality, cache)
+            .await
     }
 
     /// Register precomputed per-row vectors as a ready `(source, model)`
@@ -563,6 +548,43 @@ impl Session {
         self.engine.recompute(&record, cascade).await
     }
 
+    // --- graph / temporal pipeline verbs ----------------------------------
+
+    /// Build a neighbour-edge table over a source's embedding table. See
+    /// [`InferenceSession::build_neighbor_graph`] for the full contract.
+    pub async fn build_neighbor_graph(
+        &self,
+        source_id: &str,
+        embedding_table: Option<&str>,
+        params: &crate::pipeline::neighbor_graph::BuildNeighborGraph,
+        cache: jammi_db::store::CachePolicy,
+    ) -> Result<(ResultTableRecord, jammi_db::store::CacheOutcome)> {
+        self.engine
+            .build_neighbor_graph(source_id, embedding_table, params, cache)
+            .await
+    }
+
+    /// Propagate an embedding table's features over a declared graph. See
+    /// [`InferenceSession::propagate_embeddings`] for the full contract.
+    pub async fn propagate_embeddings(
+        &self,
+        request: &crate::pipeline::graph_propagation::PropagateRequest,
+        cache: jammi_db::store::CachePolicy,
+    ) -> Result<(ResultTableRecord, jammi_db::store::CacheOutcome)> {
+        self.engine.propagate_embeddings(request, cache).await
+    }
+
+    /// Assemble a point-in-time-correct table. See
+    /// [`InferenceSession::asof_join`] for the full contract.
+    pub async fn asof_join(
+        &self,
+        spine: &str,
+        facts: &str,
+        spec: &crate::pipeline::asof::AsofJoinSpec,
+    ) -> Result<ResultTableRecord> {
+        self.engine.asof_join(spine, facts, spec).await
+    }
+
     // --- fine-tune -------------------------------------------------------
 
     /// Start a fine-tuning job and return its id. Poll completion with
@@ -585,7 +607,7 @@ impl Session {
 
     /// Current status string for a fine-tune job, looked up by id.
     pub async fn fine_tune_status(&self, id: &FineTuneJobId) -> Result<String> {
-        let record = self.engine.catalog().get_training_job(&id.0).await?;
+        let record = self.engine.catalog().get_job(&id.0).await?;
         Ok(record.status)
     }
 
@@ -870,7 +892,7 @@ impl Session {
 /// each take exactly one content column; the unified surface passes a slice, so
 /// reject anything but a one-element slice with a typed error naming the
 /// modality rather than silently using the first column.
-fn single_column<'a>(columns: &'a [String], modality: &str) -> Result<&'a str> {
+pub(crate) fn single_column<'a>(columns: &'a [String], modality: &str) -> Result<&'a str> {
     match columns {
         [single] => Ok(single.as_str()),
         _ => Err(jammi_db::error::JammiError::Inference(format!(

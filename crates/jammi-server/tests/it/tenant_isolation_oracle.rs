@@ -39,9 +39,10 @@ use jammi_ai::Session;
 use jammi_db::catalog::backend_sqlite::SqliteBackend;
 use jammi_db::catalog::channel_repo::{ChannelColumn, ChannelColumnType, ChannelSpec};
 use jammi_db::catalog::eval_repo::EvalRunRecord;
+use jammi_db::catalog::jobs_repo::SubmitJobParams;
 use jammi_db::catalog::model_repo::RegisterModelParams;
 use jammi_db::catalog::result_repo::{CreateResultTableParams, ResultTableKind};
-use jammi_db::catalog::training_repo::CreateTrainingJobParams;
+use jammi_db::catalog::status::JobExecution;
 use jammi_db::catalog::Catalog;
 use jammi_db::session::JammiSession;
 use jammi_db::source::{FileFormat, SourceConnection, SourceType};
@@ -113,6 +114,14 @@ const CONTROL_PLANE_ALLOWLIST: &[(&str, &str)] = &[
     // Handshake metadata — reports the server's mounted service tiers and
     // version. Tenant-independent.
     ("CatalogService", "GetServerInfo"),
+    // Fleet/liveness metadata (migration 029 `instances`/`workers`) — reports
+    // which processes run the claim loop. Not a tenant-owned resource, same
+    // rationale as `GetServerInfo` above.
+    ("JobService", "ListWorkers"),
+    // `PruneJobs` is NOT exempt: there is no periodic background sweep,
+    // only the one-shot construction-time pass, which is not an RPC.
+    // `PruneJobs` is tenant-scoped exactly like every other job RPC and is
+    // covered by a case below, not allowlisted.
     // Lifecycle/auth contract — defined in the shared `jammi.v1` wire
     // descriptor so the candle-free `jammi-admin` / CLI client can call a
     // PLATFORM server that implements them, but NOT served by the OSS engine:
@@ -281,6 +290,7 @@ fn result_params<'a>(
         storage_precision: jammi_db::config::StoragePrecision::F32,
         oversample: 4,
         created_at: jammi_db::catalog::backend::now_sortable(),
+        job_attempt: None,
     }
 }
 
@@ -542,7 +552,7 @@ fn cases() -> Vec<IsolationCase> {
                 .await
                 .unwrap();
             assert!(
-                cat_b.delete_model("m_a", None, false).await.is_err(),
+                cat_b.delete_model("m_a", None, false, 30).await.is_err(),
                 "tenant B must not delete tenant A's model"
             );
             assert!(
@@ -1099,39 +1109,52 @@ fn cases() -> Vec<IsolationCase> {
             assert_recompute_isolated().await;
         }),
         case!(
-            "TrainingService",
-            "StartTraining",
+            "JobService",
+            "SubmitJob",
             CaseKind::ComputeResolver,
             Some(E2E_ISOLATION_TEST),
             {
                 assert_training_create_isolated().await;
             }
         ),
-        case!(
-            "TrainingService",
-            "TrainingStatus",
-            CaseKind::Hermetic,
-            None,
-            {
-                // TrainingStatus reads the job row via the tenant-filtered
-                // `get_training_job` (NOT by an "unguessable" id) — a peer cannot
-                // read another tenant's job status. The shared helper creates a
-                // job under A and asserts that exact read isolation.
-                assert_training_create_isolated().await;
-            }
-        ),
-        case!(
-            "TrainingService",
-            "ListTrainingJobs",
-            CaseKind::Hermetic,
-            None,
-            {
-                // ListTrainingJobs reads via the tenant-filtered
-                // `list_training_jobs` (`tenant_id = $t OR tenant_id IS NULL`)
-                // — a peer's listing never carries another tenant's job.
-                assert_training_list_isolated().await;
-            }
-        ),
+        case!("JobService", "JobStatus", CaseKind::Hermetic, None, {
+            // JobStatus reads the job row via the tenant-filtered `get_job`
+            // (NOT by an "unguessable" id) — a peer cannot read another
+            // tenant's job status; it gets NOT_FOUND, never
+            // PERMISSION_DENIED (the row's existence itself is not leaked).
+            // The shared helper creates a job under A and asserts that exact
+            // read isolation.
+            assert_training_create_isolated().await;
+        }),
+        case!("JobService", "WaitJob", CaseKind::Hermetic, None, {
+            // `WaitJob` reads the SAME tenant-filtered `get_job` `JobStatus`
+            // does (row-scoped, on every poll tick) — a peer's wait resolves
+            // no row for another tenant's job id, so it can observe nothing.
+            assert_training_create_isolated().await;
+        }),
+        case!("JobService", "ListJobs", CaseKind::Hermetic, None, {
+            // ListJobs reads via the tenant-filtered `list_jobs`
+            // (`tenant_id = $t OR tenant_id IS NULL`) — a peer's listing
+            // never carries another tenant's job.
+            assert_training_list_isolated().await;
+        }),
+        case!("JobService", "CancelJob", CaseKind::Hermetic, None, {
+            // `cancel_request`'s SQL carries the same tenant predicate as
+            // every other job write (`WHERE job_id = $1 ... AND (tenant_id =
+            // $t OR (tenant_id IS NULL AND $t IS NULL))`) — a peer's cancel
+            // matches zero rows against another tenant's job, exactly the
+            // "no leak, no effect" contract every other cross-tenant write
+            // in this codebase gets.
+            assert_cancel_job_isolated().await;
+        }),
+        case!("JobService", "PruneJobs", CaseKind::Hermetic, None, {
+            // `prune_jobs` carries the same STRICT tenant predicate
+            // `cancel_request` uses — a
+            // peer's prune deletes zero rows against another tenant's
+            // terminal job, however old; the caller's own terminal rows are
+            // still pruned normally.
+            assert_prune_jobs_isolated().await;
+        }),
         // --- Flight SQL (off-descriptor; explicit case) ----------------------
         case!(
             "arrow.flight.FlightService",
@@ -1698,6 +1721,7 @@ async fn materialize_table_for_tenant_a() -> (Arc<InferenceSession>, Session, St
                     Some(DIMS as i32),
                     Some("_row_id"),
                     Some("body"),
+                    None,
                 )
                 .await
                 .unwrap();
@@ -1987,6 +2011,7 @@ async fn tenant_scoped_reconcile_never_touches_a_global_expired_building_row() {
             created_at: jammi_db::catalog::backend::now_sortable(),
             writer_id: Some("writer-global-dead"),
             lease: Some(std::time::Duration::from_secs(600)),
+            job_attempt: None,
         })
         .await
         .unwrap();
@@ -2248,7 +2273,7 @@ async fn assert_model_resolver_isolated() {
 
 /// StartTraining writes a job row under the session tenant; the create path is
 /// the tenant gate. A peer cannot read the resulting job row (tenant-filtered
-/// `get_training_job`), and the base-model FK resolves only the creating
+/// `get_job`), and the base-model FK resolves only the creating
 /// tenant's model.
 async fn assert_training_create_isolated() {
     let (_dir, cat_a, cat_b, _g) = ab_catalogs().await;
@@ -2258,23 +2283,24 @@ async fn assert_training_create_isolated() {
         .unwrap();
     let base_pk = cat_a.get_model("m_a").await.unwrap().unwrap().catalog_pk;
     cat_a
-        .create_training_job(CreateTrainingJobParams {
+        .submit_job(SubmitJobParams {
             job_id: "job_a",
-            base_model_id: &base_pk,
-            training_source: "src_a",
-            loss_type: "triplet",
-            hyperparams: "{}",
             kind: "fine_tune",
-            training_spec: "{}",
+            execution: JobExecution::Queued,
+            spec: "{}",
+            model_ref: Some(&base_pk),
+            output_model_id: None,
+            model_source: None,
+            priority: 0,
         })
         .await
         .unwrap();
     assert!(
-        cat_a.get_training_job("job_a").await.is_ok(),
+        cat_a.get_job("job_a").await.is_ok(),
         "tenant A must read its own training job"
     );
     assert!(
-        cat_b.get_training_job("job_a").await.is_err(),
+        cat_b.get_job("job_a").await.is_err(),
         "CROSS-TENANT READ LEAK: tenant B reads tenant A's training job"
     );
 }
@@ -2289,26 +2315,125 @@ async fn assert_training_list_isolated() {
         .unwrap();
     let base_pk = cat_a.get_model("m_a").await.unwrap().unwrap().catalog_pk;
     cat_a
-        .create_training_job(CreateTrainingJobParams {
+        .submit_job(SubmitJobParams {
             job_id: "job_a",
-            base_model_id: &base_pk,
-            training_source: "src_a",
-            loss_type: "triplet",
-            hyperparams: "{}",
             kind: "fine_tune",
-            training_spec: "{}",
+            execution: JobExecution::Queued,
+            spec: "{}",
+            model_ref: Some(&base_pk),
+            output_model_id: None,
+            model_source: None,
+            priority: 0,
         })
         .await
         .unwrap();
-    let listed_a = cat_a.list_training_jobs().await.unwrap();
+    let listed_a = cat_a.list_jobs().await.unwrap();
     assert!(
         listed_a.iter().any(|r| r.job_id == "job_a"),
         "tenant A must list its own training job"
     );
-    let listed_b = cat_b.list_training_jobs().await.unwrap();
+    let listed_b = cat_b.list_jobs().await.unwrap();
     assert!(
         listed_b.iter().all(|r| r.job_id != "job_a"),
         "CROSS-TENANT LIST LEAK: tenant B's listing carries tenant A's training job"
+    );
+}
+
+/// `CancelJob`: tenant B's cancel of tenant A's job matches zero rows (the
+/// job stays `queued`, `cancel_requested` unset) while tenant A's own cancel
+/// of the same job succeeds — the attempt has no effect across tenants and
+/// no effect is silently reported as success on the wrong row.
+async fn assert_cancel_job_isolated() {
+    let (_dir, cat_a, cat_b, _g) = ab_catalogs().await;
+    cat_a
+        .submit_job(SubmitJobParams {
+            job_id: "job_cancel_a",
+            kind: "fine_tune",
+            execution: JobExecution::Queued,
+            spec: "{}",
+            model_ref: None,
+            output_model_id: None,
+            model_source: None,
+            priority: 0,
+        })
+        .await
+        .unwrap();
+    let cross_tenant_cancelled = cat_b.cancel_request("job_cancel_a").await.unwrap();
+    assert!(
+        !cross_tenant_cancelled,
+        "CROSS-TENANT CANCEL: tenant B cancelled tenant A's job"
+    );
+    let record = cat_a.get_job("job_cancel_a").await.unwrap();
+    assert!(
+        !record.cancel_requested,
+        "tenant B's cross-tenant cancel must not have set cancel_requested"
+    );
+    let same_tenant_cancelled = cat_a.cancel_request("job_cancel_a").await.unwrap();
+    assert!(
+        same_tenant_cancelled,
+        "tenant A must be able to cancel its own job"
+    );
+}
+
+/// `PruneJobs`: tenant B's prune must not delete tenant A's terminal
+/// (`completed`) job, however old, while tenant A's own prune deletes it
+/// normally — `Catalog::prune_jobs` carries a STRICT tenant predicate so a
+/// peer's prune cannot sweep another tenant's terminal rows.
+async fn assert_prune_jobs_isolated() {
+    use jammi_db::catalog::backend::{SqlValue, TxOptions};
+    use std::time::Duration;
+
+    let (_dir, cat_a, cat_b, _g) = ab_catalogs().await;
+    cat_a
+        .submit_job(SubmitJobParams {
+            job_id: "job_prune_a",
+            kind: "fine_tune",
+            execution: JobExecution::Queued,
+            spec: "{}",
+            model_ref: None,
+            output_model_id: None,
+            model_source: None,
+            priority: 0,
+        })
+        .await
+        .unwrap();
+    // Force the row terminal directly (no worker in this hermetic test) so
+    // it is eligible for `prune_jobs`'s age/status predicate — a `retention`
+    // of zero makes every already-terminal row eligible regardless of exact
+    // age, so no backdating is needed.
+    let job_id = "job_prune_a".to_string();
+    cat_a
+        .backend_arc()
+        .transaction(TxOptions::default(), |tx| {
+            Box::pin(async move {
+                tx.execute(
+                    "UPDATE jobs SET status = 'completed' WHERE job_id = $1",
+                    &[SqlValue::TextOwned(job_id)],
+                )
+                .await
+            })
+        })
+        .await
+        .unwrap();
+
+    let cross_tenant_deleted = cat_b.prune_jobs(Duration::from_secs(0)).await.unwrap();
+    assert_eq!(
+        cross_tenant_deleted, 0,
+        "CROSS-TENANT PRUNE: tenant B's prune deleted tenant A's terminal job"
+    );
+    assert!(
+        cat_a.get_job("job_prune_a").await.is_ok(),
+        "tenant A's terminal job must survive tenant B's prune"
+    );
+
+    let same_tenant_deleted = cat_a.prune_jobs(Duration::from_secs(0)).await.unwrap();
+    assert_eq!(
+        same_tenant_deleted, 1,
+        "tenant A must be able to prune its own terminal job"
+    );
+    assert!(
+        cat_a.get_job("job_prune_a").await.is_err(),
+        "tenant A's own prune must have deleted its own terminal job"
     );
 }
 
@@ -2502,6 +2627,7 @@ async fn materialize_embedding_result_table(engine: &InferenceSession, source: &
             Some(DIMS as i32),
             Some("_row_id"),
             Some("body"),
+            None,
         )
         .await
         .unwrap();
@@ -2587,6 +2713,7 @@ async fn materialize_asof_result_table(
             ResultTableKind::AsofJoin,
             None,
             "asof-model",
+            None,
             None,
             None,
             None,

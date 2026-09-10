@@ -920,6 +920,9 @@ impl InferenceSession {
                 },
                 context.rows,
                 jammi_db::store::manifest::Materialization::new(&descriptor, &env, inputs),
+                // Context-set pooling is not itself a job kind today — no
+                // `partial_result` link.
+                None,
             )
             .await?;
         Ok((record, jammi_db::store::CacheOutcome::Computed))

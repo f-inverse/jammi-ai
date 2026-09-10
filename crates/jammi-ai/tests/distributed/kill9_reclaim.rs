@@ -84,9 +84,11 @@ async fn killed_worker_job_is_reclaimed_and_completed_once() {
     .expect("a running job records its claimer");
 
     // SIGKILL the claimer mid-run — no terminal write, the lease just dies.
+    let first_claimer_label = harness::label_of(&session, &first_claimer).await;
     assert!(
-        fleet.kill9(&first_claimer),
-        "the detected claimer {first_claimer:?} is one of the spawned workers"
+        fleet.kill9(&first_claimer_label),
+        "the detected claimer {first_claimer:?} (label {first_claimer_label:?}) is one of \
+         the spawned workers"
     );
 
     // Poll until a DIFFERENT worker has reclaimed and completed the job. Reclaim

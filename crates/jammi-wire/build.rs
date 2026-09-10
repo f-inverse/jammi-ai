@@ -28,6 +28,7 @@ fn main() {
         proto_root.join("jammi/v1/eval.proto"),
         proto_root.join("jammi/v1/pipeline.proto"),
         proto_root.join("jammi/v1/training.proto"),
+        proto_root.join("jammi/v1/job.proto"),
         proto_root.join("jammi/v1/audit.proto"),
         proto_root.join("jammi/v1/lifecycle.proto"),
     ];

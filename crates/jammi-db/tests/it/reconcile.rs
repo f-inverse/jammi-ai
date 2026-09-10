@@ -8,9 +8,10 @@ use std::time::Duration;
 
 use arrow::array::{FixedSizeListArray, Float32Array, RecordBatch, StringArray};
 use datafusion::prelude::SessionContext;
+use jammi_db::catalog::jobs_repo::SubmitJobParams;
 use jammi_db::catalog::model_repo::RegisterModelParams;
 use jammi_db::catalog::result_repo::ResultTableKind;
-use jammi_db::catalog::training_repo::CreateTrainingJobParams;
+use jammi_db::catalog::status::JobExecution;
 use jammi_db::catalog::Catalog;
 use jammi_db::config::AnnIndexConfig;
 use jammi_db::index::sidecar::SidecarIndex;
@@ -86,6 +87,7 @@ async fn materialize_healthy_table(
             },
             &rows,
             Materialization::new(&descriptor(), &env(), vec![]),
+            None,
         )
         .await
         .unwrap()
@@ -186,6 +188,7 @@ async fn create_building_embedding_with_parquet_and_catalog_dims(
             "test-model",
             catalog_dims,
             Some("_row_id"),
+            None,
             None,
         )
         .await
@@ -941,6 +944,7 @@ async fn classify_expired_row_never_collapses_reap_promote_and_untouched() {
             Some(DIMS as i32),
             Some("_row_id"),
             None,
+            None,
         )
         .await
         .unwrap();
@@ -1295,6 +1299,7 @@ async fn purge_segments_errors_on_an_unparseable_index_path() {
             "test-model",
             Some(DIMS as i32),
             Some("_row_id"),
+            None,
             None,
         )
         .await
@@ -2252,19 +2257,20 @@ async fn running_jobs_artifact_prefix_survives_and_is_never_unattributed() {
 
     let job_id = Uuid::new_v4().to_string();
     catalog
-        .create_training_job(CreateTrainingJobParams {
+        .submit_job(SubmitJobParams {
             job_id: &job_id,
-            base_model_id: "base::1",
-            training_source: "src.csv",
-            loss_type: "contrastive",
-            hyperparams: "{}",
             kind: "fine_tune",
-            training_spec: "{}",
+            execution: JobExecution::Queued,
+            spec: "{}",
+            model_ref: Some("base::1"),
+            output_model_id: None,
+            model_source: None,
+            priority: 0,
         })
         .await
         .unwrap();
     catalog
-        .claim_next_training_job("worker-1", Duration::from_secs(3600))
+        .claim_next("worker-1", &["fine_tune"], Duration::from_secs(3600))
         .await
         .unwrap()
         .expect("the freshly queued job is claimable");

@@ -183,7 +183,7 @@ async fn start_auth_server() -> AuthServer {
     let store = jammi_server::grpc::session::SessionStore::new();
     let catalog = CatalogServer::new(
         store,
-        jammi_server::tiers::TierSet::resolve([]).expect("core tier resolves"),
+        jammi_server::tiers::TierSet::resolve([]),
         Some(Arc::clone(&session)),
         None,
     );
@@ -430,11 +430,12 @@ async fn resolver_seam_binds_the_engine_and_rejects_missing_credential() {
         store: jammi_server::grpc::session::SessionStore::new(),
         trigger: None,
         engine: Some(Arc::clone(&session)),
-        tiers: jammi_server::tiers::TierSet::resolve(std::iter::empty()).expect("core tier"),
+        tiers: jammi_server::tiers::TierSet::resolve(std::iter::empty()),
         metrics: Arc::new(jammi_server::routes::health::MetricsRegistry::new().unwrap()),
         // The consumer's authenticating resolver, plugged into the engine seam.
         tenant_resolver: Arc::new(HmacBearerResolver),
         admin_authorizer: None,
+        limits: jammi_db::config::LimitsConfig::default(),
     };
     let (shutdown_tx, shutdown_rx) = oneshot::channel::<()>();
     let (addr, handle) = super::common::grpc::spawn_bound_chain(chain, shutdown_rx).await;

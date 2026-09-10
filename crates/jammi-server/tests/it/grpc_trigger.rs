@@ -220,13 +220,13 @@ async fn start_grpc_test_server(seeds: &[TopicSeed]) -> ServerFixture {
         store: store_for_server.clone(),
         trigger: Some(trigger),
         engine: None,
-        tiers: jammi_server::tiers::TierSet::resolve([jammi_server::tiers::ServiceTier::Event])
-            .expect("event tier resolves"),
+        tiers: jammi_server::tiers::TierSet::resolve([jammi_server::tiers::ServiceTier::Event]),
         metrics: Arc::new(jammi_server::routes::health::MetricsRegistry::new().unwrap()),
         tenant_resolver: jammi_server::grpc::session::SessionIdTenantResolver::arc(
             store_for_server,
         ),
         admin_authorizer: None,
+        limits: jammi_db::config::LimitsConfig::default(),
     };
     let (addr, handle) = super::common::grpc::spawn_bound_chain(chain, shutdown_rx).await;
 

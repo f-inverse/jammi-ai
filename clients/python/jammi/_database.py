@@ -76,8 +76,8 @@ from ._generated.jammi.v1 import catalog_pb2, catalog_pb2_grpc
 from ._generated.jammi.v1 import embedding_pb2, embedding_pb2_grpc
 from ._generated.jammi.v1 import eval_pb2, eval_pb2_grpc
 from ._generated.jammi.v1 import inference_pb2, inference_pb2_grpc
+from ._generated.jammi.v1 import job_pb2, job_pb2_grpc
 from ._generated.jammi.v1 import pipeline_pb2_grpc
-from ._generated.jammi.v1 import training_pb2, training_pb2_grpc
 from ._generated.jammi.v1 import trigger_pb2, trigger_pb2_grpc
 
 # The header carrying a connection's opaque session id. The server's tenant
@@ -169,15 +169,16 @@ def _source_descriptor_to_dict(d: catalog_pb2.SourceDescriptor) -> Dict[str, Any
     }
 
 
-def _training_job_summary_to_dict(j: training_pb2.TrainingJobSummary) -> Dict[str, Any]:
-    """Project a wire `TrainingJobSummary` into the job dict a caller reads.
+def _job_summary_to_dict(j: job_pb2.JobSummary) -> Dict[str, Any]:
+    """Project a wire `JobSummary` into the job dict a caller reads.
 
     Every field the message carries and nothing else — the embedded
-    `list_training_jobs` builds the same seven keys at its FFI boundary from the
+    `list_jobs` builds the same seven keys at its FFI boundary from the
     catalog record, applying the same two conventions this message documents:
-    `output_model_id` is the empty string until the job completes, `error` is
-    empty unless it failed. Neither arm maps either onto `None`, so a caller
-    branches on one thing on both transports.
+    `output_model_id` is the empty string until a training kind completes
+    (always empty for a compute kind), `error` is empty unless it failed.
+    Neither arm maps either onto `None`, so a caller branches on one thing on
+    both transports.
     """
     return {
         "job_id": j.job_id,
@@ -585,7 +586,7 @@ def _calibration_report_to_dict(
 # accepts, matching the embed binding's `ChannelColumnType::as_str`.
 _CHANNEL_COLUMN_TYPE_NAME = {v: k for k, v in _CHANNEL_COLUMN_TYPE.items()}
 
-# Terminal training-job states, matching the engine's `TrainingJobStatus`.
+# Terminal job states, matching the engine's `JobStatus`.
 _TERMINAL_STATES = {"completed", "failed"}
 
 
@@ -711,49 +712,87 @@ def _channel_spec_to_dict(c: catalog_pb2.Channel) -> Dict[str, Any]:
     }
 
 
-class RemoteTrainingJob:
-    """Handle to a remote training job, polled over `TrainingService`.
+def _job_result_to_dict(resp: job_pb2.JobStatusResponse) -> Dict[str, Any]:
+    """Project a `JobStatusResponse`'s tagged terminal `result` oneof into the
+    dict `RemoteJob.wait()` returns — the SAME shape the embedded `Job.wait()`
+    returns by parsing the catalog's own tagged `jobs.result` JSON
+    (`jammi_ai::jobs::JobResult`'s `#[serde(tag = "kind", rename_all =
+    "snake_case")]` encoding), so the two transports agree byte-for-byte on
+    the terminal payload (K4).
 
-    The pure-Python peer of the embed wheel's `TrainingJob`: same handle shape —
-    ``job_id`` / ``model_id`` properties, a ``status()`` poll, and a ``wait()``
-    that blocks until a terminal state and raises on failure with the wire error.
-    `model_id` is the deterministic output id `StartTraining` returned at submit
-    time; `wait()` polls `TrainingStatus` and, on ``failed``, raises
-    :class:`jammi.TrainingError` carrying the worker's error message —
-    mirroring the embedded `TrainingJob.wait`.
+    A training kind's `model` variant projects to `{"kind": "model",
+    "model_id", "artifact_path", "metrics"}` (`metrics` the raw JSON text of
+    the run-summary blob, or `None` when the run recorded none — read
+    `RemoteJob.metrics()` for the parsed form). A compute kind's `table`
+    variant projects to `{"kind": "table", "table", "cache_outcome"}`.
+    """
+    which = resp.WhichOneof("result")
+    if which == "model":
+        m = resp.model
+        return {
+            "kind": "model",
+            "model_id": m.model_id,
+            "artifact_path": m.artifact_path,
+            "metrics": m.metrics_json if m.HasField("metrics_json") else None,
+        }
+    if which == "table":
+        t = resp.table
+        return {"kind": "table", "table": t.table, "cache_outcome": t.cache_outcome}
+    raise BackendError("JobStatusResponse carried no terminal result")
+
+
+class RemoteJob:
+    """Handle to a remote job (training or compute), polled over `JobService`.
+
+    The pure-Python peer of the embed wheel's `Job`: same handle shape —
+    ``job_id`` / ``kind`` / ``output_model_id`` properties, a ``status()``
+    poll, a ``progress()`` read, a ``cancel()`` request, and a ``wait()``
+    that blocks until a terminal state and returns the tagged terminal result
+    (raising on failure with the wire error). `output_model_id` is the
+    deterministic output id `SubmitJob` returned at submit time; `wait()`
+    polls `JobStatus` and, on ``failed``, raises :class:`jammi.TrainingError`
+    carrying the worker's error message — mirroring the embedded `Job.wait`.
     """
 
-    # Poll interval for `wait()`. Matches the embedded `TrainingJob.wait`'s
-    # 100ms catalog poll, so a remote wait turns around as promptly.
+    # Poll interval for `wait()`. Matches the embedded `Job.wait`'s 100ms
+    # catalog poll, so a remote wait turns around as promptly.
     _POLL_INTERVAL_SECONDS = 0.1
 
     def __init__(
         self,
-        stub: training_pb2_grpc.TrainingServiceStub,
+        stub: job_pb2_grpc.JobServiceStub,
         metadata,
         *,
         job_id: str,
-        model_id: str,
+        kind: str,
+        output_model_id: str,
     ) -> None:
         self._stub = stub
         self._metadata = metadata
         self._job_id = job_id
-        self._model_id = model_id
+        self._kind = kind
+        self._output_model_id = output_model_id
 
     @property
     def job_id(self) -> str:
-        """The unique job id `StartTraining` assigned."""
+        """The unique job id `SubmitJob` assigned."""
         return self._job_id
 
     @property
-    def model_id(self) -> str:
-        """The deterministic output model id the trained artifact registers under."""
-        return self._model_id
+    def kind(self) -> str:
+        """The `jobs.kind` tag this job submitted under (e.g. `"fine_tune"`)."""
+        return self._kind
 
-    def _status_response(self) -> training_pb2.TrainingStatusResponse:
+    @property
+    def output_model_id(self) -> str:
+        """The deterministic output model id the trained artifact registers
+        under. Empty for a compute-kind job."""
+        return self._output_model_id
+
+    def _status_response(self) -> job_pb2.JobStatusResponse:
         try:
-            return self._stub.TrainingStatus(
-                training_pb2.TrainingStatusRequest(job_id=self._job_id),
+            return self._stub.JobStatus(
+                job_pb2.JobStatusRequest(job_id=self._job_id),
                 metadata=self._metadata,
             )
         except grpc.RpcError as exc:
@@ -763,52 +802,82 @@ class RemoteTrainingJob:
             raise _rpc_to_jammi(exc) from exc
 
     def status(self) -> str:
-        """The job's current status string. Maps to `TrainingService.TrainingStatus`."""
+        """The job's current status string. Maps to `JobService.JobStatus`."""
         return self._status_response().status
 
-    def wait(self) -> None:
-        """Block until the job reaches a terminal state; raise on failure.
+    def progress(self) -> Dict[str, Any]:
+        """This job's progress: `{"rows_done", "rows_total", "phase"}` —
+        `rows_done`/`rows_total` are `None` until the executor has recorded
+        any (a legal `0` is distinguished from "not recorded yet"); `phase`
+        is the empty string until the producer names one. Mirrors the
+        embedded `Job.progress`'s shape field-for-field."""
+        p = self._status_response().progress
+        return {
+            "rows_done": p.rows_done if p.HasField("rows_done") else None,
+            "rows_total": p.rows_total if p.HasField("rows_total") else None,
+            "phase": p.phase,
+        }
 
-        Polls `TrainingStatus` until ``completed`` (returns) or ``failed`` (raises
-        :class:`jammi.TrainingError` with the wire error message) — the
-        remote peer of the embedded `TrainingJob.wait`.
+    def cancel(self) -> bool:
+        """Request cancellation. `True` when the request landed on a still
+        non-terminal row; `False` when the job was already terminal or
+        absent. Maps to `JobService.CancelJob`."""
+        try:
+            resp = self._stub.CancelJob(
+                job_pb2.CancelJobRequest(job_id=self._job_id),
+                metadata=self._metadata,
+            )
+        except grpc.RpcError as exc:
+            raise _rpc_to_jammi(exc) from exc
+        return resp.cancelled
+
+    def wait(self) -> Dict[str, Any]:
+        """Block until the job reaches a terminal state; raise on failure.
+        Returns the tagged terminal result dict (see `_job_result_to_dict`).
+
+        Polls `JobStatus` until ``completed`` (returns the result) or
+        ``failed`` (raises :class:`jammi.TrainingError` with the wire error
+        message) — the remote peer of the embedded `Job.wait`.
         """
         while True:
             resp = self._status_response()
             if resp.status == "completed":
-                return
+                return _job_result_to_dict(resp)
             if resp.status == "failed":
-                raise TrainingError(resp.error or "training job failed")
+                raise TrainingError(resp.error or "job failed")
             time.sleep(self._POLL_INTERVAL_SECONDS)
 
     def metrics(self) -> Dict[str, Any]:
         """Run metrics recorded for this job, as a dict.
 
-        The remote peer of the embedded `TrainingJob.metrics`: parses the
-        `TrainingStatusResponse.metrics_json` field the server fills verbatim
-        from the catalog's `training_jobs.metrics` column — the run-summary
-        blob the trainer hands the worker at completion (`final_loss`,
-        `early_stopping_metric`, `total_steps`, `started_at`,
+        The remote peer of the embedded `Job.metrics`: parses the terminal
+        `JobStatusResponse.model.metrics_json` field the server fills
+        verbatim from the catalog's tagged `jobs.result` payload — the
+        run-summary blob the trainer hands the worker at completion
+        (`final_loss`, `early_stopping_metric`, `total_steps`, `started_at`,
         `completed_at`, and the per-epoch `train_loss_curve` /
-        `val_loss_curve` arrays), or the `error_message` blob a failed
-        attempt records instead. Returns ``{}`` for a job that has not yet
-        recorded any metrics (e.g. still queued or running before its first
-        stamp) — `metrics_json` is unset on the wire in that case.
+        `val_loss_curve` arrays). Returns ``{}`` for a job that has not yet
+        recorded any metrics (e.g. still queued or running before
+        completion, or a compute-kind job, which carries no `model` result at
+        all) — `metrics_json` is unset (or the result is not `model`) on the
+        wire in that case.
 
         Raises :class:`jammi.errors.BackendError` if `metrics_json` IS set
         but fails to parse as JSON — a catalog data-integrity fault, never
         silently folded into the "not yet recorded" `{}` case. Mirrors the
-        embedded `TrainingJob.metrics`, which raises the same class for the
+        embedded `Job.metrics`, which raises the same class for the
         same present-but-malformed state.
         """
         resp = self._status_response()
-        if not resp.HasField("metrics_json"):
+        if resp.WhichOneof("result") != "model" or not resp.model.HasField(
+            "metrics_json"
+        ):
             return {}
         try:
-            return json.loads(resp.metrics_json)
+            return json.loads(resp.model.metrics_json)
         except json.JSONDecodeError as exc:
             raise BackendError(
-                f"training job {self._job_id}: metrics blob failed to parse "
+                f"job {self._job_id}: metrics blob failed to parse "
                 f"as JSON: {exc}"
             ) from exc
 
@@ -816,21 +885,20 @@ class RemoteTrainingJob:
         """GPU-acceleration determination for this job, as a dict or ``None``
         (esc-075, campaign #443).
 
-        The remote peer of the embedded `TrainingJob.acceleration_report`:
-        parses the `TrainingStatusResponse.acceleration_report_json` field the
-        server fills verbatim from the catalog's
-        `training_jobs.acceleration_report` column. Its ``"state"`` is one of
-        four values: ``"pending"`` — the submission-time marker, meaning the
-        job exists and no claimant has computed a determination yet — or one
-        of the three determination outcomes ``"determined"``,
-        ``"not_applicable"``, and ``"undetermined"``, the last of which always
-        carries a ``"reason"`` string. ``"pending"`` is a transient marker,
-        not a resting state: a job that reaches a terminal status without a
-        determination has its marker retired to ``"undetermined"`` with a
-        reason naming the edge that retired it, and a requeued job is reset to
-        ``"pending"`` for its next attempt — so a poll mid-training, or after
-        completion, can legitimately land on any of the four. A
-        ``"determined"`` payload is computed by the claiming worker at
+        The remote peer of the embedded `Job.acceleration_report`: parses the
+        `JobStatusResponse.acceleration_report_json` field the server fills
+        verbatim from the catalog's `jobs.acceleration_report` column. Its
+        ``"state"`` is one of four values: ``"pending"`` — the submission-time
+        marker, meaning the job exists and no claimant has computed a
+        determination yet — or one of the three determination outcomes
+        ``"determined"``, ``"not_applicable"``, and ``"undetermined"``, the
+        last of which always carries a ``"reason"`` string. ``"pending"`` is a
+        transient marker, not a resting state: a job that reaches a terminal
+        status without a determination has its marker retired to
+        ``"undetermined"`` with a reason naming the edge that retired it, and a
+        requeued job is reset to ``"pending"`` for its next attempt — so a poll
+        mid-training, or after completion, can legitimately land on any of the
+        four. A ``"determined"`` payload is computed by the claiming worker at
         device-resolution time, before the training loop's first step, and
         carries ``dtype``, ``cuda_compiled``, ``flash_compiled``, a per-op
         ``ops`` map, and a ``flash`` field. Each ``ops``/``flash`` entry is
@@ -847,18 +915,18 @@ class RemoteTrainingJob:
         information, never coerced into `{}` or any acceleration-state claim.
         Deliberately distinct from the ``{"state": "pending"}`` marker every
         job submitted after migration 026 carries. Mirrors the embedded
-        `TrainingJob.acceleration_report`'s own `None`-for-`NULL` contract
-        exactly — the two transports must agree on this tri-state, not merely
-        both "return something" (`metrics()`'s `{}`-for-absent default does
-        NOT apply here: that column's `NULL` and "not recorded yet" are the
-        same state, whereas `acceleration_report`'s `NULL` and `"pending"` are
+        `Job.acceleration_report`'s own `None`-for-`NULL` contract exactly —
+        the two transports must agree on this tri-state, not merely both
+        "return something" (`metrics()`'s `{}`-for-absent default does NOT
+        apply here: that column's `NULL` and "not recorded yet" are the same
+        state, whereas `acceleration_report`'s `NULL` and `"pending"` are
         deliberately two different, distinguishable states).
 
         Raises :class:`jammi.errors.BackendError` if `acceleration_report_json`
         IS set but fails to parse as JSON — a catalog data-integrity fault,
         never silently folded into the "absent" `None` case. Mirrors the
-        embedded `TrainingJob.acceleration_report`, which raises the same
-        class for the same present-but-malformed state.
+        embedded `Job.acceleration_report`, which raises the same class for
+        the same present-but-malformed state.
         """
         resp = self._status_response()
         if not resp.HasField("acceleration_report_json"):
@@ -867,7 +935,7 @@ class RemoteTrainingJob:
             return json.loads(resp.acceleration_report_json)
         except json.JSONDecodeError as exc:
             raise BackendError(
-                f"training job {self._job_id}: acceleration_report blob failed "
+                f"job {self._job_id}: acceleration_report blob failed "
                 f"to parse as JSON: {exc}"
             ) from exc
 
@@ -902,7 +970,7 @@ class RemoteDatabase:
         self._metadata = ((SESSION_HEADER, session_id),)
         self._embedding = embedding_pb2_grpc.EmbeddingServiceStub(channel)
         self._catalog = catalog_pb2_grpc.CatalogServiceStub(channel)
-        self._training = training_pb2_grpc.TrainingServiceStub(channel)
+        self._job = job_pb2_grpc.JobServiceStub(channel)
         self._inference = inference_pb2_grpc.InferenceServiceStub(channel)
         self._pipeline = pipeline_pb2_grpc.PipelineServiceStub(channel)
         self._eval = eval_pb2_grpc.EvalServiceStub(channel)
@@ -1061,8 +1129,8 @@ class RemoteDatabase:
 
         The first three fields are compile-time facts about the build;
         ``services`` is the runtime tier handshake — the gRPC service tiers this
-        deployment mounted (``"core"`` is always present; ``"train"`` /
-        ``"event"`` / ``"eval"`` appear only when this server enabled them). A
+        deployment mounted (``"core"`` is always present; ``"event"`` /
+        ``"eval"`` appear only when this server enabled them). A
         client reads ``services`` to know which verbs are reachable here before
         calling them. ``broker`` is the RUNTIME trigger-broker driver this
         deployment is running (``"in_memory"`` / ``"jet_stream"`` /
@@ -1396,6 +1464,21 @@ class RemoteDatabase:
         breaks) rather than leaking. `predicate` is an optional SQL filter applied
         server-side; `from_offset` starts the replay at an offset (unset == live
         tail only). Maps to `TriggerService.Subscribe`.
+
+        This call sends no `grpc-timeout` header of its own (the header-less
+        shape a deployment's `[server.limits] wait_timeout_secs` budget is
+        meant to bound, per that key's own doc). When a deployment configures
+        that budget, the server itself ends the stream with
+        `DEADLINE_EXCEEDED` once it elapses, wherever the collect then
+        stands — and this method RAISES the mapped :class:`JammiError` at
+        that point (via `_rpc_to_jammi`); it does NOT return whatever batches
+        were collected so far. Those already-collected batches are simply
+        lost — this method has no side channel to hand them back once the
+        exception path is taken, so a caller that needs a partial result on a
+        budget-driven cutoff cannot get one from `subscribe_collect`; use a
+        `max_batches` the budget is known to satisfy, or drive the stream
+        manually instead. With no such budget configured, this genuinely
+        waits until `max_batches` is reached.
         """
         # The streaming lane opens its call directly rather than through `_call`,
         # so the closed-session guard is applied here explicitly.
@@ -1554,11 +1637,11 @@ class RemoteDatabase:
         resp = self._call(self._embedding.Search, request)
         return _hits_to_table(list(resp.hits))
 
-    # --- Training (offloaded to the remote train tier) ---------------------------
+    # --- Training (submitted to the remote server; run where `[worker] enabled`) ---
     #
     # These verbs DO hit the wire: training runs on the remote GPU server, so the
-    # client submits a spec via `TrainingService.StartTraining` and returns a
-    # `RemoteTrainingJob` to poll. The signatures mirror the embed `Database`'s
+    # client submits a spec via `JobService.SubmitJob` and returns a
+    # `RemoteJob` to poll. The signatures mirror the embed `Database`'s
     # so a caller swaps transports without changing the call. `predict` rides
     # `InferenceService.Predict`.
 
@@ -1600,13 +1683,16 @@ class RemoteDatabase:
         regression_beta: Optional[float] = None,
         quantile_levels: Optional[List[float]] = None,
         keep_last_n_checkpoints: Optional[int] = None,
-    ) -> RemoteTrainingJob:
+        idempotency_key: str = "",
+    ) -> RemoteJob:
         """Submit a LoRA fine-tuning job to the remote engine; poll the handle.
 
-        Returns a :class:`RemoteTrainingJob` — same handle shape and verb
+        Returns a :class:`RemoteJob` — same handle shape and verb
         signature as the embed `Database.fine_tune`. Maps to
-        `TrainingService.StartTraining` with the `FineTuneSpec` arm; all config
+        `JobService.SubmitJob` with the `FineTuneSpec` arm; all config
         kwargs are optional, applying the engine defaults when omitted.
+        `idempotency_key`, when non-empty, dedupes the submission (migration
+        030's durable per-tenant key).
         """
         request = build_fine_tune_request(
             source=source,
@@ -1644,8 +1730,9 @@ class RemoteDatabase:
             regression_beta=regression_beta,
             quantile_levels=quantile_levels,
             keep_last_n_checkpoints=keep_last_n_checkpoints,
+            idempotency_key=idempotency_key,
         )
-        return self._start_training(request)
+        return self._submit_job(request)
 
     def fine_tune_graph(
         self,
@@ -1675,14 +1762,17 @@ class RemoteDatabase:
         matryoshka_dims: Optional[List[int]] = None,
         seed: Optional[int] = None,
         keep_last_n_checkpoints: Optional[int] = None,
-    ) -> RemoteTrainingJob:
+        idempotency_key: str = "",
+    ) -> RemoteJob:
         """Submit a graph-supervised fine-tune (S11) to the remote engine.
 
-        Returns a :class:`RemoteTrainingJob`, mirroring the embed
-        `Database.fine_tune_graph`. Maps to `TrainingService.StartTraining` with
+        Returns a :class:`RemoteJob`, mirroring the embed
+        `Database.fine_tune_graph`. Maps to `JobService.SubmitJob` with
         the `GraphFineTuneSpec` arm. `edge_provenance` is the load-bearing
         circularity distinction — "declared" external edges teach the metric
         something new; "similarity" edges are a weak bootstrap only.
+        `idempotency_key`, when non-empty, dedupes the submission (migration
+        030's durable per-tenant key).
         """
         request = build_fine_tune_graph_request(
             node_source=node_source,
@@ -1710,8 +1800,9 @@ class RemoteDatabase:
             matryoshka_dims=matryoshka_dims,
             seed=seed,
             keep_last_n_checkpoints=keep_last_n_checkpoints,
+            idempotency_key=idempotency_key,
         )
-        return self._start_training(request)
+        return self._submit_job(request)
 
     def train_context_predictor(
         self,
@@ -1736,13 +1827,16 @@ class RemoteDatabase:
         min_task_count: int = 4,
         seed: int = 0,
         model_id: Optional[str] = None,
-    ) -> RemoteTrainingJob:
+        idempotency_key: str = "",
+    ) -> RemoteJob:
         """Submit an amortized in-context predictor (S19) meta-training to the
         remote engine.
 
-        Returns a :class:`RemoteTrainingJob`, mirroring the embed
-        `Database.train_context_predictor`. Maps to `TrainingService.StartTraining`
-        with the `ContextPredictorSpec` arm.
+        Returns a :class:`RemoteJob`, mirroring the embed
+        `Database.train_context_predictor`. Maps to `JobService.SubmitJob`
+        with the `ContextPredictorSpec` arm. `idempotency_key`, when
+        non-empty, dedupes the submission (migration 030's durable per-tenant
+        key).
         """
         request = build_context_predictor_request(
             source,
@@ -1765,8 +1859,9 @@ class RemoteDatabase:
             min_task_count=min_task_count,
             seed=seed,
             model_id=model_id,
+            idempotency_key=idempotency_key,
         )
-        return self._start_training(request)
+        return self._submit_job(request)
 
     def predict_with_context_predictor(
         self,
@@ -2423,75 +2518,107 @@ class RemoteDatabase:
         resp = self._call(self._catalog.Reconcile, request)
         return _reconcile_report_to_dict(resp)
 
-    def training_job(self, job_id: str) -> RemoteTrainingJob:
-        """Attach to an existing training job by id.
+    def job(self, job_id: str) -> RemoteJob:
+        """Attach to an existing job by id (training or compute).
 
         The handle a `fine_tune` call returns is bound to the channel that made
         it and dies with it; this is how a session that never submitted the job
         — a later process, a different client — reaches it. The peer of
-        :meth:`jammi.EmbeddedBackend.training_job`; every read verb works on the
-        result (`status()`, `metrics()`, `acceleration_report()`, `wait()`),
-        each of which re-fetches over the wire per call, so the handle carries
-        no snapshot to go stale.
+        :meth:`jammi.EmbeddedBackend.job`; every read verb works on the
+        result (`status()`, `progress()`, `metrics()`, `acceleration_report()`,
+        `cancel()`, `wait()`), each of which re-fetches over the wire per
+        call, so the handle carries no snapshot to go stale.
 
-        Existence is resolved HERE, with one `TrainingStatus` call, rather than
+        Existence is resolved HERE, with one `JobStatus` call, rather than
         handing back a handle that fails on its first read: a `job_id` with no
         row visible to this session's tenant raises the typed
         :class:`~jammi.errors.BackendError`, the same class the embedded arm
         raises for the same miss.
 
-        `model_id` reads the same on both arms at EVERY lifecycle state —
-        queued, running, completed, failed — not only once the job has
+        `output_model_id` reads the same on both arms at EVERY lifecycle state
+        — queued, running, completed, failed — not only once the job has
         finished. It is the id the server resolved for this row
-        (`TrainingStatusResponse.model_id`): the stamped `output_model_id` once
+        (`JobStatusResponse.output_model_id`): the stamped value once
         the job completes, and before then the engine's own re-derivation from
         the persisted spec, which is exactly what the embedded attach reports
         because both call the SAME engine function. This client re-derives
         nothing — the naming rule belongs to the engine, and a second
         implementation here is the drift the conformance suite exists to catch.
+        Empty for a compute-kind job — no compute kind ever registers a model.
 
-        Note that `list_training_jobs()`'s `output_model_id` is a DIFFERENT
-        question and is still empty until completion on both arms: it relays
-        the catalog column verbatim ("has the output row landed"), where
-        `model_id` answers "what will this model be called".
+        Note that `list_jobs()`'s `output_model_id` is the SAME field, relayed
+        verbatim by `JobSummary` too — empty until a training kind completes.
         """
         resp = self._call(
-            self._training.TrainingStatus,
-            training_pb2.TrainingStatusRequest(job_id=job_id),
+            self._job.JobStatus,
+            job_pb2.JobStatusRequest(job_id=job_id),
         )
-        return RemoteTrainingJob(
-            self._training,
+        return RemoteJob(
+            self._job,
             self._metadata,
             job_id=job_id,
-            model_id=resp.model_id,
+            kind=resp.kind,
+            output_model_id=resp.output_model_id,
         )
 
-    def list_training_jobs(self) -> List[Dict[str, Any]]:
-        """Training jobs visible to the current tenant, most recent first.
+    def list_jobs(self) -> List[Dict[str, Any]]:
+        """Jobs visible to the current tenant, most recent first.
 
-        Maps to `TrainingService.ListTrainingJobs`; same dict shape per entry as
-        the embedded :meth:`jammi.EmbeddedBackend.list_training_jobs` — the
-        wire's `TrainingJobSummary` field set, with ``output_model_id`` empty
-        until the job completes and ``error`` empty unless it failed. A listing
-        of :meth:`training_job` answers plus the submit-time identity; there is
-        no progress surface, because the engine records run metrics only at
-        finalization.
+        Maps to `JobService.ListJobs`; same dict shape per entry as
+        the embedded :meth:`jammi.EmbeddedBackend.list_jobs` — the
+        wire's `JobSummary` field set, with ``output_model_id`` empty
+        until a training kind completes (always empty for a compute kind)
+        and ``error`` empty unless it failed. A listing of :meth:`job`
+        answers plus the submit-time identity; read
+        :meth:`job(job_id).progress() <RemoteJob.progress>` for the mid-run
+        progress surface.
         """
-        resp = self._call(
-            self._training.ListTrainingJobs, training_pb2.ListTrainingJobsRequest()
-        )
-        return [_training_job_summary_to_dict(j) for j in resp.jobs]
+        resp = self._call(self._job.ListJobs, job_pb2.ListJobsRequest())
+        return [_job_summary_to_dict(j) for j in resp.jobs]
 
-    def _start_training(
-        self, request: training_pb2.StartTrainingRequest
-    ) -> RemoteTrainingJob:
-        """Submit a `StartTraining` request and wrap the response in a handle."""
-        resp = self._call(self._training.StartTraining, request)
-        return RemoteTrainingJob(
-            self._training,
+    def cancel_job(self, job_id: str) -> bool:
+        """Request cancellation of a job by id. `True` when the request landed
+        on a still non-terminal row; `False` when the job was already
+        terminal or absent. Maps to `JobService.CancelJob`."""
+        resp = self._call(
+            self._job.CancelJob, job_pb2.CancelJobRequest(job_id=job_id)
+        )
+        return resp.cancelled
+
+    def list_workers(self) -> List[Dict[str, Any]]:
+        """The engine processes currently running the claim loop
+        (`[worker] enabled = true`), most recently seen first: each entry
+        carries ``instance_id``, ``label``, ``host``, ``kinds``,
+        ``started_at``, ``last_seen_at``. Maps to `JobService.ListWorkers`."""
+        resp = self._call(self._job.ListWorkers, job_pb2.ListWorkersRequest())
+        return [
+            {
+                "instance_id": w.instance_id,
+                "label": w.label,
+                "host": w.host,
+                "kinds": w.kinds,
+                "started_at": w.started_at,
+                "last_seen_at": w.last_seen_at,
+            }
+            for w in resp.workers
+        ]
+
+    def prune_jobs(self) -> int:
+        """Eagerly delete this tenant's own terminal job rows older than the
+        deployment's `[jobs] retention_days`. Returns the count deleted. Maps
+        to `JobService.PruneJobs`."""
+        resp = self._call(self._job.PruneJobs, job_pb2.PruneJobsRequest())
+        return resp.jobs_deleted
+
+    def _submit_job(self, request: job_pb2.SubmitJobRequest) -> RemoteJob:
+        """Submit a `SubmitJob` request and wrap the response in a handle."""
+        resp = self._call(self._job.SubmitJob, request)
+        return RemoteJob(
+            self._job,
             self._metadata,
             job_id=resp.job_id,
-            model_id=resp.model_id,
+            kind=resp.kind,
+            output_model_id=resp.output_model_id,
         )
 
     # --- Stateless conformal / RRF numerics (computed client-side) ---------------

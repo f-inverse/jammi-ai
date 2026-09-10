@@ -24,6 +24,7 @@
 use std::collections::{BTreeMap, HashMap};
 use std::pin::Pin;
 use std::sync::Arc;
+use std::time::Duration;
 
 use arrow::array::{ArrayRef, Float32Array, RecordBatch, StringArray};
 use arrow::datatypes::{DataType, Field, Schema};
@@ -55,11 +56,12 @@ use jammi_wire::proto::eval as eval_pb;
 use jammi_wire::proto::eval::eval_service_client::EvalServiceClient;
 use jammi_wire::proto::inference::inference_service_client::InferenceServiceClient;
 use jammi_wire::proto::inference::InferRequest;
-use jammi_wire::proto::training::training_service_client::TrainingServiceClient;
-use jammi_wire::proto::training::{
-    start_training_request::Spec as ProtoTrainingSpec, FineTuneSpec, StartTrainingRequest,
-    TrainingStatusRequest,
+use jammi_wire::proto::job::job_service_client::JobServiceClient;
+use jammi_wire::proto::job::{
+    submit_job_request::Spec as ProtoTrainingSpec, CancelJobRequest as JobCancelJobRequest,
+    JobStatusRequest, JobStatusResponse, ListJobsRequest, SubmitJobRequest,
 };
+use jammi_wire::proto::training::FineTuneSpec;
 use jammi_wire::proto::trigger::trigger_service_client::TriggerServiceClient;
 use jammi_wire::proto::trigger::{PublishRequest, SubscribeRequest, TopicName};
 use jammi_wire::request::{FineTuneJobId, Modality, QueryInput, SearchQuery, SearchRequest};
@@ -122,9 +124,8 @@ impl DataClient {
         self.transport.service(EvalServiceClient::with_interceptor)
     }
 
-    fn training_client(&self) -> TrainingServiceClient<SessionChannel> {
-        self.transport
-            .service(TrainingServiceClient::with_interceptor)
+    fn job_client(&self) -> JobServiceClient<SessionChannel> {
+        self.transport.service(JobServiceClient::with_interceptor)
     }
 
     fn trigger_client(&self) -> TriggerServiceClient<SessionChannel> {
@@ -320,10 +321,10 @@ impl DataClient {
         Ok((batches, outcome))
     }
 
-    // --- fine-tune -------------------------------------------------------
+    // --- fine-tune (submits through JobService.SubmitJob) -----------------
 
     /// Start a fine-tuning job and return its id. Poll completion with
-    /// [`Self::fine_tune_status`].
+    /// [`Self::fine_tune_status`], or [`Self::wait_job`] for a resumable wait.
     pub async fn fine_tune(
         &self,
         source: &str,
@@ -333,13 +334,13 @@ impl DataClient {
         task: ModelTask,
         config: Option<FineTuneConfig>,
     ) -> Result<FineTuneJobId> {
-        // The column-source fine-tune is the `FineTuneSpec` arm of the spec
-        // oneof; built inline from the transport-neutral config vocabulary so the
-        // data client (which carries no engine `TrainingSpec`) can still submit
-        // it.
+        // The column-source fine-tune is the `FineTuneSpec` arm of the
+        // `SubmitJob` spec oneof; built inline from the transport-neutral
+        // config vocabulary so the data client (which carries no engine
+        // `TrainingSpec`) can still submit it.
         let resp = self
-            .training_client()
-            .start_training(StartTrainingRequest {
+            .job_client()
+            .submit_job(SubmitJobRequest {
                 spec: Some(ProtoTrainingSpec::FineTune(FineTuneSpec {
                     source: source.to_string(),
                     columns: columns.to_vec(),
@@ -348,6 +349,7 @@ impl DataClient {
                 })),
                 base_model: base_model.to_string(),
                 config: config.as_ref().map(config_to_proto),
+                idempotency_key: String::new(),
             })
             .await
             .map_err(|s| error_from_status(&s))?
@@ -357,37 +359,27 @@ impl DataClient {
 
     /// Current status string for a fine-tune job, looked up by id.
     pub async fn fine_tune_status(&self, id: &FineTuneJobId) -> Result<String> {
-        let resp = self
-            .training_client()
-            .training_status(TrainingStatusRequest {
-                job_id: id.0.clone(),
-            })
-            .await
-            .map_err(|s| error_from_status(&s))?
-            .into_inner();
-        Ok(resp.status)
+        Ok(self.job_status_response(&id.0).await?.status)
     }
 
-    /// Run metrics recorded for a fine-tune job, as the raw JSON blob text the
-    /// catalog's `training_jobs.metrics` column carries (issue #441) — the same
-    /// blob the embedded `TrainingJob`'s catalog-backed metrics read returns.
-    /// `None` for a job that has not yet recorded any metrics (still queued or
-    /// running before its first stamp); this crate carries no `serde_json`
-    /// dependency, so the caller decodes the returned text.
+    /// Run metrics recorded for a fine-tune job, as the raw JSON blob text
+    /// nested inside the wire's terminal `JobStatus.model.metrics_json`
+    /// (issue #441) — the same blob the embedded `TrainingJob`'s
+    /// catalog-backed metrics read returns. `None` for a job that has not
+    /// yet recorded any metrics (still queued or running before its first
+    /// stamp); this crate carries no `serde_json` dependency, so the caller
+    /// decodes the returned text.
     pub async fn fine_tune_metrics(&self, id: &FineTuneJobId) -> Result<Option<String>> {
-        let resp = self
-            .training_client()
-            .training_status(TrainingStatusRequest {
-                job_id: id.0.clone(),
-            })
-            .await
-            .map_err(|s| error_from_status(&s))?
-            .into_inner();
-        Ok(resp.metrics_json)
+        use jammi_wire::proto::job::job_status_response::Result as WireResult;
+        let resp = self.job_status_response(&id.0).await?;
+        Ok(match resp.result {
+            Some(WireResult::Model(m)) => m.metrics_json,
+            _ => None,
+        })
     }
 
     /// GPU-acceleration determination for a fine-tune job, as the raw,
-    /// self-describing JSON blob text the catalog's `training_jobs.
+    /// self-describing JSON blob text the catalog's `jobs.
     /// acceleration_report` column carries (esc-075) — the same blob the
     /// embedded catalog-backed record read returns. `None` for a legacy row
     /// predating the column (SQL `NULL`); otherwise a `"state"`-keyed object
@@ -399,15 +391,122 @@ impl DataClient {
         &self,
         id: &FineTuneJobId,
     ) -> Result<Option<String>> {
+        Ok(self
+            .job_status_response(&id.0)
+            .await?
+            .acceleration_report_json)
+    }
+
+    // --- jobs (JobService; generic across every job kind) -----------------
+
+    async fn job_status_response(&self, job_id: &str) -> Result<JobStatusResponse> {
+        Ok(self
+            .job_client()
+            .job_status(JobStatusRequest {
+                job_id: job_id.to_string(),
+            })
+            .await
+            .map_err(|s| error_from_status(&s))?
+            .into_inner())
+    }
+
+    /// Read a job's current status by id: status, kind, and the resolved
+    /// output model id (training kinds only; empty for a compute kind).
+    pub async fn job_status(&self, job_id: &str) -> Result<JobStatusResponse> {
+        self.job_status_response(job_id).await
+    }
+
+    /// Stream status updates for a job until it reaches a terminal state.
+    /// Reconnecting with the same job id resumes the wait — an already
+    /// terminal job's stream carries only its terminal `done` frame.
+    ///
+    /// Sends no `grpc-timeout` header — no deadline of the client's own. The
+    /// server budget bounds this stream instead: when a deployment configures
+    /// `[server.limits] wait_timeout_secs`, that budget becomes THIS stream's
+    /// deadline (it ends with `DEADLINE_EXCEEDED` once the budget elapses,
+    /// wherever the job then stands — reconnect to resume the wait); a
+    /// deployment with no such budget configured genuinely waits until
+    /// terminal. Use [`Self::wait_job_with_timeout`] to declare an explicit
+    /// deadline of your own instead — one at or below the deployment's
+    /// budget, when known, is ENFORCED by the server: the stream ends with
+    /// `DEADLINE_EXCEEDED` at that declared deadline, never the wider
+    /// budget; a value above the budget is refused at the edge before the
+    /// stream opens.
+    pub async fn wait_job(
+        &self,
+        job_id: &str,
+    ) -> Result<Pin<Box<dyn Stream<Item = Result<JobStatusResponse>> + Send>>> {
+        self.wait_job_inner(job_id, None).await
+    }
+
+    /// [`Self::wait_job`], with an explicit `grpc-timeout` rather than none.
+    /// A reconnect after this deadline lapses (or after any other disconnect)
+    /// resumes the wait — the deadline bounds one connection's hold on the
+    /// server's `max_job_waits` budget, not the job's own lifetime.
+    pub async fn wait_job_with_timeout(
+        &self,
+        job_id: &str,
+        timeout: Duration,
+    ) -> Result<Pin<Box<dyn Stream<Item = Result<JobStatusResponse>> + Send>>> {
+        self.wait_job_inner(job_id, Some(timeout)).await
+    }
+
+    async fn wait_job_inner(
+        &self,
+        job_id: &str,
+        timeout: Option<Duration>,
+    ) -> Result<Pin<Box<dyn Stream<Item = Result<JobStatusResponse>> + Send>>> {
+        use jammi_wire::proto::job::{job_event::Event, JobHandle};
+        let mut request = tonic::Request::new(JobHandle {
+            job_id: job_id.to_string(),
+        });
+        if let Some(timeout) = timeout {
+            request.set_timeout(timeout);
+        }
+        let stream = self
+            .job_client()
+            .wait_job(request)
+            .await
+            .map_err(|s| error_from_status(&s))?
+            .into_inner();
+        let mapped = stream.filter_map(|item| async move {
+            match item {
+                Ok(event) => match event.event {
+                    Some(Event::Done(done)) => Some(Ok(done)),
+                    // Progress frames carry no terminal payload for this
+                    // simplified surface; a caller that needs progress reads
+                    // `JobStatus.progress` directly.
+                    Some(Event::Progress(_)) | None => None,
+                },
+                Err(s) => Some(Err(error_from_status(&s))),
+            }
+        });
+        Ok(Box::pin(mapped))
+    }
+
+    /// Request cancellation of a job by id. `false` when the request had no
+    /// effect (the job was already terminal or absent).
+    pub async fn cancel_job(&self, job_id: &str) -> Result<bool> {
         let resp = self
-            .training_client()
-            .training_status(TrainingStatusRequest {
-                job_id: id.0.clone(),
+            .job_client()
+            .cancel_job(JobCancelJobRequest {
+                job_id: job_id.to_string(),
             })
             .await
             .map_err(|s| error_from_status(&s))?
             .into_inner();
-        Ok(resp.acceleration_report_json)
+        Ok(resp.cancelled)
+    }
+
+    /// List jobs visible to the session tenant, most recent first.
+    pub async fn list_jobs(&self) -> Result<Vec<jammi_wire::proto::job::JobSummary>> {
+        let resp = self
+            .job_client()
+            .list_jobs(ListJobsRequest {})
+            .await
+            .map_err(|s| error_from_status(&s))?
+            .into_inner();
+        Ok(resp.jobs)
     }
 
     // --- eval ------------------------------------------------------------
@@ -539,6 +638,16 @@ impl DataClient {
     /// `None`) and then tails live, scoped to the session's tenant. When
     /// `replay_only` is set the server drives its finite drain and closes the
     /// stream rather than holding open to tail live batches.
+    ///
+    /// Sends no `grpc-timeout` header — no deadline of the client's own; the
+    /// same posture as [`Self::wait_job`], since the same
+    /// `[server.limits] wait_timeout_secs` cap governs both streaming rpcs.
+    /// When configured, that budget becomes THIS stream's deadline (it ends
+    /// with `DEADLINE_EXCEEDED` once the budget elapses); with no such budget
+    /// configured this tails live indefinitely. A caller that needs to keep
+    /// tailing past either kind of disconnect reconnects with `from_offset`
+    /// set to the last delivered offset. Use [`Self::subscribe_with_timeout`]
+    /// to declare an explicit deadline instead.
     pub async fn subscribe(
         &self,
         topic: &TopicDefinition,
@@ -549,20 +658,60 @@ impl DataClient {
         Pin<Box<dyn Stream<Item = std::result::Result<DeliveredBatch, TriggerError>> + Send>>,
         TriggerError,
     > {
+        self.subscribe_inner(topic, predicate, from_offset, replay_only, None)
+            .await
+    }
+
+    /// [`Self::subscribe`], with an explicit `grpc-timeout` rather than none.
+    /// A value at or below the deployment's own `wait_timeout_secs` budget,
+    /// when known, is ENFORCED by the server: the stream ends with
+    /// `DEADLINE_EXCEEDED` at that declared deadline, never the wider
+    /// budget; a value above the budget is refused at the edge before the
+    /// stream opens.
+    pub async fn subscribe_with_timeout(
+        &self,
+        topic: &TopicDefinition,
+        predicate: Predicate,
+        from_offset: Option<Offset>,
+        replay_only: bool,
+        timeout: Duration,
+    ) -> std::result::Result<
+        Pin<Box<dyn Stream<Item = std::result::Result<DeliveredBatch, TriggerError>> + Send>>,
+        TriggerError,
+    > {
+        self.subscribe_inner(topic, predicate, from_offset, replay_only, Some(timeout))
+            .await
+    }
+
+    async fn subscribe_inner(
+        &self,
+        topic: &TopicDefinition,
+        predicate: Predicate,
+        from_offset: Option<Offset>,
+        replay_only: bool,
+        timeout: Option<Duration>,
+    ) -> std::result::Result<
+        Pin<Box<dyn Stream<Item = std::result::Result<DeliveredBatch, TriggerError>> + Send>>,
+        TriggerError,
+    > {
+        let mut request = tonic::Request::new(SubscribeRequest {
+            topic: Some(TopicName {
+                name: topic.name.clone(),
+            }),
+            // The predicate crosses the wire as the SQL it was parsed from
+            // (empty == match-all); the server re-parses it against the same
+            // topic schema, so the in-process and remote filters are identical.
+            predicate: predicate.source_sql().unwrap_or("").to_string(),
+            from_offset: from_offset.map(|o| o.value()),
+            tenant_id: String::new(),
+            replay_only,
+        });
+        if let Some(timeout) = timeout {
+            request.set_timeout(timeout);
+        }
         let streaming = self
             .trigger_client()
-            .subscribe(SubscribeRequest {
-                topic: Some(TopicName {
-                    name: topic.name.clone(),
-                }),
-                // The predicate crosses the wire as the SQL it was parsed from
-                // (empty == match-all); the server re-parses it against the same
-                // topic schema, so the in-process and remote filters are identical.
-                predicate: predicate.source_sql().unwrap_or("").to_string(),
-                from_offset: from_offset.map(|o| o.value()),
-                tenant_id: String::new(),
-                replay_only,
-            })
+            .subscribe(request)
             .await
             .map_err(|s| trigger_error_from_status(&s))?
             .into_inner();
@@ -715,4 +864,282 @@ fn hits_to_batch(resp: SearchResponse, select: &[String]) -> Result<Vec<RecordBa
     let batch = RecordBatch::try_new(schema, arrays)
         .map_err(|e| JammiError::Other(format!("rebuild search batch: {e}")))?;
     Ok(vec![batch])
+}
+
+/// #485: `wait_job`/`subscribe` must send NO
+/// `grpc-timeout` header at all (the server's `[server.limits]
+/// wait_timeout_secs` budget bounds the stream instead — see
+/// `jammi_server::limits`'s module doc's "Streaming-path exemption" section);
+/// `wait_job_with_timeout`/`subscribe_with_timeout` MUST send one, carrying
+/// the caller's declared duration. Proven against the SAME code path
+/// production uses (`wait_job_inner`/`subscribe_inner`, reached only through
+/// the four public entry points above) over a REAL loopback gRPC connection:
+/// request construction and the RPC call are not separable into two steps in
+/// those functions (the request is built and sent in one async fn against a
+/// live channel), so a hand-built `tonic::Request` inspected without ever
+/// sending it would not exercise this code path — this fixture instead reads
+/// the header a genuine server-side handler actually received.
+#[cfg(test)]
+mod grpc_timeout_header_tests {
+    use std::net::SocketAddr;
+    use std::pin::Pin;
+    use std::sync::{Arc, Mutex};
+    use std::task::{Context, Poll};
+    use std::time::Duration;
+
+    use arrow_schema::Schema;
+    use futures::Stream;
+    use tokio::net::{TcpListener, TcpStream};
+    use tonic::transport::{Endpoint, Server};
+    use tonic::{Request, Response, Status};
+
+    use jammi_db::trigger::{Predicate, TopicDefinition, TopicId};
+    use jammi_wire::proto::job::job_service_server::{JobService, JobServiceServer};
+    use jammi_wire::proto::job::{
+        CancelJobRequest, CancelJobResponse, JobEvent, JobHandle, JobStatusRequest,
+        JobStatusResponse, ListJobsRequest, ListJobsResponse, ListWorkersRequest,
+        ListWorkersResponse, PruneJobsRequest, PruneJobsResponse, SubmitJobRequest,
+        SubmitJobResponse,
+    };
+    use jammi_wire::proto::trigger::trigger_service_server::{
+        TriggerService, TriggerServiceServer,
+    };
+    use jammi_wire::proto::trigger::{
+        PublishRequest, PublishResponse, SubscribeRequest, SubscribedBatch,
+    };
+
+    use super::DataClient;
+
+    /// `None` while unset; `Some(header value or None)` once the one request
+    /// this fixture's test drives has landed — a single-request-per-call
+    /// fixture, so one cell suffices without a queue.
+    type Captured = Arc<Mutex<Option<Option<String>>>>;
+
+    /// Read the raw `grpc-timeout` metadata value off an inbound request, if
+    /// present — the ONLY oracle this fixture needs: presence/absence and the
+    /// value, not a parsed `Duration` (that parsing is `limits.rs`'s own
+    /// `parse_grpc_timeout`, exercised elsewhere).
+    fn read_grpc_timeout<T>(request: &Request<T>) -> Option<String> {
+        request
+            .metadata()
+            .get("grpc-timeout")
+            .map(|v| v.to_str().expect("grpc-timeout is ASCII").to_string())
+    }
+
+    /// A minimal [`futures::Stream`] over [`TcpListener::poll_accept`] — lets
+    /// this fixture hand `tonic::transport::Server` a real accepted-connection
+    /// stream without depending on `tokio-stream`'s `net` feature (not enabled
+    /// workspace-wide) for a one-off test-only server.
+    struct AcceptStream(TcpListener);
+
+    impl Stream for AcceptStream {
+        type Item = std::io::Result<TcpStream>;
+
+        fn poll_next(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
+            match self.0.poll_accept(cx) {
+                Poll::Ready(Ok((stream, _peer))) => Poll::Ready(Some(Ok(stream))),
+                Poll::Ready(Err(e)) => Poll::Ready(Some(Err(e))),
+                Poll::Pending => Poll::Pending,
+            }
+        }
+    }
+
+    /// A `JobService` double whose only LIVE method is `wait_job`; every other
+    /// method is unreachable from either test built on this fixture, so a
+    /// wiring mistake panics loudly rather than returning a plausible-looking
+    /// placeholder response.
+    struct HeaderCapturingJobService {
+        wait_job_header: Captured,
+    }
+
+    #[tonic::async_trait]
+    impl JobService for HeaderCapturingJobService {
+        type WaitJobStream = Pin<Box<dyn Stream<Item = Result<JobEvent, Status>> + Send + 'static>>;
+
+        async fn submit_job(
+            &self,
+            _request: Request<SubmitJobRequest>,
+        ) -> Result<Response<SubmitJobResponse>, Status> {
+            unreachable!("not exercised by this fixture")
+        }
+
+        async fn job_status(
+            &self,
+            _request: Request<JobStatusRequest>,
+        ) -> Result<Response<JobStatusResponse>, Status> {
+            unreachable!("not exercised by this fixture")
+        }
+
+        async fn wait_job(
+            &self,
+            request: Request<JobHandle>,
+        ) -> Result<Response<Self::WaitJobStream>, Status> {
+            *self.wait_job_header.lock().unwrap() = Some(read_grpc_timeout(&request));
+            Ok(Response::new(
+                Box::pin(futures::stream::empty()) as Self::WaitJobStream
+            ))
+        }
+
+        async fn list_jobs(
+            &self,
+            _request: Request<ListJobsRequest>,
+        ) -> Result<Response<ListJobsResponse>, Status> {
+            unreachable!("not exercised by this fixture")
+        }
+
+        async fn cancel_job(
+            &self,
+            _request: Request<CancelJobRequest>,
+        ) -> Result<Response<CancelJobResponse>, Status> {
+            unreachable!("not exercised by this fixture")
+        }
+
+        async fn list_workers(
+            &self,
+            _request: Request<ListWorkersRequest>,
+        ) -> Result<Response<ListWorkersResponse>, Status> {
+            unreachable!("not exercised by this fixture")
+        }
+
+        async fn prune_jobs(
+            &self,
+            _request: Request<PruneJobsRequest>,
+        ) -> Result<Response<PruneJobsResponse>, Status> {
+            unreachable!("not exercised by this fixture")
+        }
+    }
+
+    /// A `TriggerService` double whose only LIVE method is `subscribe`.
+    struct HeaderCapturingTriggerService {
+        subscribe_header: Captured,
+    }
+
+    #[tonic::async_trait]
+    impl TriggerService for HeaderCapturingTriggerService {
+        type SubscribeStream =
+            Pin<Box<dyn Stream<Item = Result<SubscribedBatch, Status>> + Send + 'static>>;
+
+        async fn publish(
+            &self,
+            _request: Request<PublishRequest>,
+        ) -> Result<Response<PublishResponse>, Status> {
+            unreachable!("not exercised by this fixture")
+        }
+
+        async fn subscribe(
+            &self,
+            request: Request<SubscribeRequest>,
+        ) -> Result<Response<Self::SubscribeStream>, Status> {
+            *self.subscribe_header.lock().unwrap() = Some(read_grpc_timeout(&request));
+            Ok(Response::new(
+                Box::pin(futures::stream::empty()) as Self::SubscribeStream
+            ))
+        }
+    }
+
+    /// Spin up a loopback tonic server hosting only the two header-capturing
+    /// doubles above (every other `jammi.v1` service `DataClient` composes is
+    /// never dialled by the two calls under test), returning the bound address
+    /// and the two capture cells. The serve task is detached (not joined):
+    /// nothing here needs graceful shutdown, since each test's own process
+    /// teardown reclaims the port.
+    async fn start_capturing_server() -> (SocketAddr, Captured, Captured) {
+        let listener = TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind loopback");
+        let addr = listener.local_addr().expect("local_addr");
+        let wait_job_header: Captured = Arc::new(Mutex::new(None));
+        let subscribe_header: Captured = Arc::new(Mutex::new(None));
+        let job_svc = JobServiceServer::new(HeaderCapturingJobService {
+            wait_job_header: Arc::clone(&wait_job_header),
+        });
+        let trigger_svc = TriggerServiceServer::new(HeaderCapturingTriggerService {
+            subscribe_header: Arc::clone(&subscribe_header),
+        });
+        tokio::spawn(async move {
+            Server::builder()
+                .add_service(job_svc)
+                .add_service(trigger_svc)
+                .serve_with_incoming(AcceptStream(listener))
+                .await
+                .expect("capturing server");
+        });
+        (addr, wait_job_header, subscribe_header)
+    }
+
+    async fn connect(addr: SocketAddr) -> DataClient {
+        let endpoint = Endpoint::from_shared(format!("http://{addr}")).expect("endpoint");
+        DataClient::connect(endpoint)
+            .await
+            .expect("data client connect")
+    }
+
+    /// Guards `wait_job`/`wait_job_with_timeout` against collapsing onto the
+    /// same request-construction path with a default deadline applied
+    /// regardless of caller intent: `wait_job` sends no `grpc-timeout` at
+    /// all (the server-side budget bounds the stream instead — see this
+    /// crate's `wait_job` doc); `wait_job_with_timeout` sends one every time.
+    #[tokio::test]
+    async fn wait_job_sends_no_grpc_timeout_header_but_wait_job_with_timeout_does() {
+        let (addr, wait_job_header, _subscribe_header) = start_capturing_server().await;
+        let client = connect(addr).await;
+
+        let _ = client.wait_job("does-not-matter").await;
+        assert_eq!(
+            wait_job_header.lock().unwrap().take(),
+            Some(None),
+            "wait_job must send NO grpc-timeout header -- the server budget bounds the \
+             stream, never a client-declared deadline"
+        );
+
+        let _ = client
+            .wait_job_with_timeout("does-not-matter", Duration::from_secs(5))
+            .await;
+        let captured = wait_job_header.lock().unwrap().take();
+        assert!(
+            matches!(captured, Some(Some(_))),
+            "wait_job_with_timeout must send a grpc-timeout header, got {captured:?}"
+        );
+    }
+
+    /// The `subscribe`/`subscribe_with_timeout` analogue of
+    /// [`wait_job_sends_no_grpc_timeout_header_but_wait_job_with_timeout_does`].
+    #[tokio::test]
+    async fn subscribe_sends_no_grpc_timeout_header_but_subscribe_with_timeout_does() {
+        let (addr, _wait_job_header, subscribe_header) = start_capturing_server().await;
+        let client = connect(addr).await;
+
+        let topic = TopicDefinition {
+            id: TopicId::new(),
+            name: "does-not-matter".into(),
+            schema: Arc::new(Schema::empty()),
+            tenant: None,
+            broker_metadata: Default::default(),
+        };
+
+        let _ = client
+            .subscribe(&topic, Predicate::match_all(), None, false)
+            .await;
+        assert_eq!(
+            subscribe_header.lock().unwrap().take(),
+            Some(None),
+            "subscribe must send NO grpc-timeout header -- the server budget bounds the \
+             stream, never a client-declared deadline"
+        );
+
+        let _ = client
+            .subscribe_with_timeout(
+                &topic,
+                Predicate::match_all(),
+                None,
+                false,
+                Duration::from_secs(5),
+            )
+            .await;
+        let captured = subscribe_header.lock().unwrap().take();
+        assert!(
+            matches!(captured, Some(Some(_))),
+            "subscribe_with_timeout must send a grpc-timeout header, got {captured:?}"
+        );
+    }
 }

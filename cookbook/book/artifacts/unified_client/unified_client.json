@@ -72,6 +72,7 @@
       "asof_join",
       "assemble_context",
       "build_neighbor_graph",
+      "cancel_job",
       "close",
       "conformalize",
       "conformalize_cqr",
@@ -95,15 +96,18 @@
       "get_server_info",
       "import_embeddings",
       "infer",
+      "job",
       "list_channels",
       "list_index_segments",
+      "list_jobs",
       "list_models",
       "list_mutable_tables",
       "list_sources",
       "list_topics",
-      "list_training_jobs",
+      "list_workers",
       "predict_with_context_predictor",
       "propagate_embeddings",
+      "prune_jobs",
       "publish_topic",
       "recompute",
       "reconcile",
@@ -119,10 +123,9 @@
       "tenant",
       "tenant_scope",
       "train_context_predictor",
-      "training_job",
       "verify_materialization"
     ],
-    "verb_count": 54
+    "verb_count": 57
   },
   "taxonomy": {
     "embedded_bad_arg": {

@@ -322,7 +322,6 @@ pub struct TrainingLoop {
     /// [`TrainingLoopBuilder::attempt`] still gets a valid (if not
     /// production-meaningful) prefix.
     attempt: String,
-    catalog: Arc<Catalog>,
     /// The local directory training scratch (the per-run tempdir holding
     /// checkpoints and the final adapter) is created under. The run owns a
     /// fresh tempdir within it, so two workers training the same `job_id` never
@@ -584,7 +583,16 @@ impl TrainingLoopBuilder {
         let worker_id = self.worker_id.ok_or_else(|| {
             JammiError::FineTune("TrainingLoopBuilder: worker_id required".into())
         })?;
-        let catalog = self
+        // Presence-validated (matching every other required builder field)
+        // but not stored on `TrainingLoop` itself: the generalised `jobs`
+        // schema's claim already stamps `running`, so there is no separate
+        // mid-run catalog write for `TrainingLoop::run` to make and no
+        // reader of a catalog handle inside the run. Kept as a required
+        // builder input anyway so every call site still threads a real,
+        // claimed catalog through construction — the same "the caller
+        // proves it claimed the job before training starts" shape as
+        // `job_id`/`worker_id`.
+        let _catalog = self
             .catalog
             .ok_or_else(|| JammiError::FineTune("TrainingLoopBuilder: catalog required".into()))?;
         let artifact_dir = self.artifact_dir.ok_or_else(|| {
@@ -605,7 +613,6 @@ impl TrainingLoopBuilder {
             job_id,
             worker_id,
             attempt: self.attempt,
-            catalog,
             artifact_dir,
             // Placeholder — `set_training(true)` below overwrites this
             // immediately and is the ONLY thing that makes it meaningful.
@@ -784,18 +791,13 @@ impl TrainingLoop {
         // across legs itself, it is never carried over from a prior one.
         self.media_front_end_wall.set(std::time::Duration::ZERO);
 
-        // Stamp run-start metrics under the lease guard. The claim already set
-        // the status to `running`; this records `started_at` only while this
-        // worker still holds the lease (`claimed_by == worker_id AND status =
-        // 'running'`). A worker whose lease was reclaimed mid-run (a zombie) thus
-        // cannot regress a job the winner already finalized back to `running`.
+        // The claim already set the status to `running` and stamped the
+        // lease; the generalised `jobs` schema has no separate "record
+        // run-start metrics" write (`mark_training_running` is gone with
+        // `training_repo`) — `started_at` is folded into the final
+        // `metrics_json` this function builds at the end of the run instead
+        // (below), never written mid-run under its own lease-guarded CAS.
         let started_at = chrono::Utc::now().to_rfc3339();
-        let metrics_json = serde_json::json!({"started_at": started_at}).to_string();
-        tokio::runtime::Handle::current().block_on(self.catalog.mark_training_running(
-            &self.job_id,
-            &self.worker_id,
-            Some(&metrics_json),
-        ))?;
 
         // Split training/validation
         let total_rows = data_loader.len();
@@ -6021,10 +6023,11 @@ mod test_fixtures {
         guard.model.clone()
     }
 
-    /// A catalog holding a registered model and a training job `tag`
-    /// claimed by `{tag}-worker` — what `run`'s lease-guarded
-    /// `mark_training_running` needs. Returns the catalog and the tempdir
-    /// backing it (also usable as the loop's `artifact_dir`).
+    /// A catalog holding a registered model and a job `tag` claimed by
+    /// `{tag}-worker` — a claimed, `running` row for a `TrainingLoop` builder
+    /// under test to require via its `.catalog(...)` precondition. Returns
+    /// the catalog and the tempdir backing it (also usable as the loop's
+    /// `artifact_dir`).
     pub(super) async fn claimed_job(
         tag: &str,
     ) -> (Arc<jammi_db::catalog::Catalog>, tempfile::TempDir) {
@@ -6045,19 +6048,24 @@ mod test_fixtures {
             .await
             .unwrap();
         catalog
-            .create_training_job(jammi_db::catalog::training_repo::CreateTrainingJobParams {
+            .submit_job(jammi_db::catalog::jobs_repo::SubmitJobParams {
                 job_id: tag,
-                base_model_id: &format!("{model_id}::1"),
-                training_source: "src",
-                loss_type: "mnrl",
-                hyperparams: "{}",
                 kind: "fine_tune",
-                training_spec: "{}",
+                execution: jammi_db::catalog::status::JobExecution::Queued,
+                spec: "{}",
+                model_ref: Some(&format!("{model_id}::1")),
+                output_model_id: None,
+                model_source: None,
+                priority: 0,
             })
             .await
             .unwrap();
         catalog
-            .claim_next_training_job(&format!("{tag}-worker"), std::time::Duration::from_secs(60))
+            .claim_next(
+                &format!("{tag}-worker"),
+                &["fine_tune"],
+                std::time::Duration::from_secs(60),
+            )
             .await
             .unwrap()
             .expect("queued job is claimable");
@@ -7193,19 +7201,24 @@ mod standardization_contract {
             .await
             .unwrap();
         catalog
-            .create_training_job(jammi_db::catalog::training_repo::CreateTrainingJobParams {
+            .submit_job(jammi_db::catalog::jobs_repo::SubmitJobParams {
                 job_id: "oracle-job",
-                base_model_id: "oracle-model::1",
-                training_source: "src",
-                loss_type: "regression",
-                hyperparams: "{}",
                 kind: "fine_tune",
-                training_spec: "{}",
+                execution: jammi_db::catalog::status::JobExecution::Queued,
+                spec: "{}",
+                model_ref: Some("oracle-model::1"),
+                output_model_id: None,
+                model_source: None,
+                priority: 0,
             })
             .await
             .unwrap();
         catalog
-            .claim_next_training_job("oracle-worker", std::time::Duration::from_secs(60))
+            .claim_next(
+                "oracle-worker",
+                &["fine_tune"],
+                std::time::Duration::from_secs(60),
+            )
             .await
             .unwrap()
             .expect("queued job is claimable");
@@ -9068,19 +9081,24 @@ mod determinism_through_forward {
             .await
             .unwrap();
         catalog
-            .create_training_job(jammi_db::catalog::training_repo::CreateTrainingJobParams {
+            .submit_job(jammi_db::catalog::jobs_repo::SubmitJobParams {
                 job_id: "det-job",
-                base_model_id: "det-model::1",
-                training_source: "src",
-                loss_type: "regression",
-                hyperparams: "{}",
                 kind: "fine_tune",
-                training_spec: "{}",
+                execution: jammi_db::catalog::status::JobExecution::Queued,
+                spec: "{}",
+                model_ref: Some("det-model::1"),
+                output_model_id: None,
+                model_source: None,
+                priority: 0,
             })
             .await
             .unwrap();
         catalog
-            .claim_next_training_job("det-worker", std::time::Duration::from_secs(60))
+            .claim_next(
+                "det-worker",
+                &["fine_tune"],
+                std::time::Duration::from_secs(60),
+            )
             .await
             .unwrap()
             .expect("queued job is claimable");
@@ -9391,19 +9409,24 @@ mod resume_invariant {
             .await
             .unwrap();
         catalog
-            .create_training_job(jammi_db::catalog::training_repo::CreateTrainingJobParams {
+            .submit_job(jammi_db::catalog::jobs_repo::SubmitJobParams {
                 job_id: job,
-                base_model_id: "resume-model::1",
-                training_source: "src",
-                loss_type: "regression",
-                hyperparams: "{}",
                 kind: "fine_tune",
-                training_spec: "{}",
+                execution: jammi_db::catalog::status::JobExecution::Queued,
+                spec: "{}",
+                model_ref: Some("resume-model::1"),
+                output_model_id: None,
+                model_source: None,
+                priority: 0,
             })
             .await
             .unwrap();
         catalog
-            .claim_next_training_job("resume-worker", std::time::Duration::from_secs(60))
+            .claim_next(
+                "resume-worker",
+                &["fine_tune"],
+                std::time::Duration::from_secs(60),
+            )
             .await
             .unwrap()
             .expect("queued job is claimable");
@@ -9950,19 +9973,24 @@ mod resume_invariant {
             .await
             .unwrap();
         catalog
-            .create_training_job(jammi_db::catalog::training_repo::CreateTrainingJobParams {
+            .submit_job(jammi_db::catalog::jobs_repo::SubmitJobParams {
                 job_id: job,
-                base_model_id: "r5-model::1",
-                training_source: "src",
-                loss_type: "cosent",
-                hyperparams: "{}",
                 kind: "fine_tune",
-                training_spec: "{}",
+                execution: jammi_db::catalog::status::JobExecution::Queued,
+                spec: "{}",
+                model_ref: Some("r5-model::1"),
+                output_model_id: None,
+                model_source: None,
+                priority: 0,
             })
             .await
             .unwrap();
         catalog
-            .claim_next_training_job("r5-worker", std::time::Duration::from_secs(60))
+            .claim_next(
+                "r5-worker",
+                &["fine_tune"],
+                std::time::Duration::from_secs(60),
+            )
             .await
             .unwrap()
             .unwrap();

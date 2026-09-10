@@ -21,6 +21,7 @@ session.generate_image_embeddings(
     "image",       // column containing image data
     "figure_id",   // key column
     CachePolicy::Bypass,
+    None,
 ).await?;
 # Ok(()) }
 ```

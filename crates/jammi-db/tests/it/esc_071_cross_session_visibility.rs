@@ -11,7 +11,7 @@
 //! The gate this closes: the only pre-existing two-sessions-one-file catalog
 //! test (`tenant_scope.rs:65-125`) is tenant-DISJOINT, so a stale read passes it
 //! vacuously; the single-pool read-after-write coverage in
-//! `fine_tune_job_catalog_crud`, crates/jammi-ai/tests/it/fine_tune.rs:1201-1287
+//! `fine_tune_job_catalog_crud`, crates/jammi-ai/tests/it/fine_tune.rs:1202-1283
 //! never opens a second pool at all (`backend_sqlite.rs:24-41` builds one pool
 //! per session).
 //!
@@ -54,8 +54,9 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use jammi_db::catalog::backend::BackendKind;
+use jammi_db::catalog::jobs_repo::SubmitJobParams;
 use jammi_db::catalog::model_repo::RegisterModelParams;
-use jammi_db::catalog::training_repo::CreateTrainingJobParams;
+use jammi_db::catalog::status::JobExecution;
 use jammi_db::catalog::Catalog;
 use jammi_db::session::JammiSession;
 use jammi_db::ModelTask;
@@ -96,13 +97,13 @@ async fn session_on(dir: &Path) -> JammiSession {
 async fn observed_round(catalog: &Catalog, job_id: &str, who: &str, round: i64) -> i64 {
     let record = must!(
         format!("{who} read of round {round}"),
-        catalog.get_training_job(job_id)
+        catalog.get_job(job_id)
     )
     .unwrap_or_else(|err| {
         panic!("esc-071: {who} read at round {round} failed: {err}");
     });
 
-    let raw = record.metrics.unwrap_or_else(|| {
+    let raw = record.progress_phase.unwrap_or_else(|| {
         panic!("esc-071: {who} read at round {round} saw metrics ABSENT (expected round {round})");
     });
     let parsed: serde_json::Value = serde_json::from_str(&raw).unwrap_or_else(|err| {
@@ -148,23 +149,24 @@ async fn second_session_observes_every_committed_round() {
     .expect("register base model");
 
     must!(
-        "create training job",
-        catalog_b.create_training_job(CreateTrainingJobParams {
+        "submit job",
+        catalog_b.submit_job(SubmitJobParams {
             job_id: "j",
-            base_model_id: "base-model::1",
-            training_source: "training_source",
-            loss_type: "cosent",
-            hyperparams: r#"{"lora_rank": 8}"#,
             kind: "fine_tune",
-            training_spec: "{}",
+            execution: JobExecution::Queued,
+            spec: "{}",
+            model_ref: Some("base-model::1"),
+            output_model_id: None,
+            model_source: None,
+            priority: 0,
         })
     )
-    .expect("create training job");
+    .expect("submit job");
 
     // The metrics write path is lease-guarded, so B claims the job first.
     let claimed = must!(
         "claim job",
-        catalog_b.claim_next_training_job("worker-b", Duration::from_secs(600))
+        catalog_b.claim_next("worker-b", &["fine_tune"], Duration::from_secs(600))
     )
     .expect("claim transaction")
     .expect("the queued job is claimable");
@@ -174,7 +176,7 @@ async fn second_session_observes_every_committed_round() {
     // below are A's 2nd..5th reads — the row's defect is a stale value on the
     // 2nd+ read of an already-warm pooled connection, which a cold-pool-only
     // probe cannot see.
-    let warm = must!("warm read", catalog_a.get_training_job("j")).expect("session A warm read");
+    let warm = must!("warm read", catalog_a.get_job("j")).expect("session A warm read");
     assert_eq!(
         warm.status, "running",
         "esc-071: session A's FIRST read must already observe B's committed claim"
@@ -184,7 +186,7 @@ async fn second_session_observes_every_committed_round() {
         let payload = format!(r#"{{"round": {i}}}"#);
         let landed = must!(
             format!("write round {i}"),
-            catalog_b.mark_training_running("j", "worker-b", Some(&payload))
+            catalog_b.progress_job("j", "worker-b", 1, None, None, Some(&payload))
         )
         .unwrap_or_else(|err| panic!("esc-071: write of round {i} failed: {err}"));
         assert!(landed, "esc-071: write of round {i} matched no row");
@@ -256,7 +258,7 @@ async fn probe_every_warm_pooled_connection_observes_the_write() {
         let payload = format!(r#"{{"round": {i}}}"#);
         let landed = must!(
             format!("write round {i}"),
-            catalog_b.mark_training_running("j", "worker-b", Some(&payload))
+            catalog_b.progress_job("j", "worker-b", 1, None, None, Some(&payload))
         )
         .unwrap_or_else(|err| panic!("esc-071 probe A: write of round {i} failed: {err}"));
         assert!(landed, "esc-071 probe A: write of round {i} matched no row");
@@ -288,7 +290,7 @@ async fn probe_read_beside_a_long_lived_read_transaction_observes_the_write() {
     let catalog_a = session_a.catalog();
 
     seed_claimed_job(catalog_b).await;
-    let warm = must!("warm read", catalog_a.get_training_job("j")).expect("session A warm read");
+    let warm = must!("warm read", catalog_a.get_job("j")).expect("session A warm read");
     assert_eq!(warm.status, "running");
 
     let (ready_tx, ready_rx) = tokio::sync::oneshot::channel::<()>();
@@ -306,11 +308,9 @@ async fn probe_read_beside_a_long_lived_read_transaction_observes_the_write() {
                         // Take the snapshot, then hold this transaction open
                         // across every write below.
                         let _ = tx
-                            .query_opt(
-                                "SELECT job_id FROM training_jobs WHERE job_id = 'j'",
-                                &[],
-                                |r| r.get::<String>("job_id"),
-                            )
+                            .query_opt("SELECT job_id FROM jobs WHERE job_id = 'j'", &[], |r| {
+                                r.get::<String>("job_id")
+                            })
                             .await?;
                         let _ = ready_tx.send(());
                         let _ = done_rx.await;
@@ -328,7 +328,7 @@ async fn probe_read_beside_a_long_lived_read_transaction_observes_the_write() {
         let payload = format!(r#"{{"round": {i}}}"#);
         let landed = must!(
             format!("write round {i}"),
-            catalog_b.mark_training_running("j", "worker-b", Some(&payload))
+            catalog_b.progress_job("j", "worker-b", 1, None, None, Some(&payload))
         )
         .unwrap_or_else(|err| panic!("esc-071 probe B: write of round {i} failed: {err}"));
         assert!(landed, "esc-071 probe B: write of round {i} matched no row");
@@ -368,7 +368,7 @@ async fn probe_foreign_connection_write_is_observed_by_a_warm_pool() {
     let catalog_a = session_a.catalog();
 
     seed_claimed_job(catalog_b).await;
-    let warm = must!("warm read", catalog_a.get_training_job("j")).expect("session A warm read");
+    let warm = must!("warm read", catalog_a.get_job("j")).expect("session A warm read");
     assert_eq!(warm.status, "running");
 
     let db_path = dir.path().join("catalog.db");
@@ -383,7 +383,7 @@ async fn probe_foreign_connection_write_is_observed_by_a_warm_pool() {
             .await
             .expect("foreign connection on the shared catalog file");
         let payload = format!(r#"{{"round": {i}}}"#);
-        sqlx::query("UPDATE training_jobs SET metrics = ?1 WHERE job_id = 'j'")
+        sqlx::query("UPDATE jobs SET progress_phase = ?1 WHERE job_id = 'j'")
             .bind(&payload)
             .execute(&mut foreign)
             .await
@@ -423,21 +423,22 @@ async fn seed_claimed_job(catalog: &Catalog) {
     )
     .expect("register base model");
     must!(
-        "create training job",
-        catalog.create_training_job(CreateTrainingJobParams {
+        "submit job",
+        catalog.submit_job(SubmitJobParams {
             job_id: "j",
-            base_model_id: "base-model::1",
-            training_source: "training_source",
-            loss_type: "cosent",
-            hyperparams: r#"{"lora_rank": 8}"#,
             kind: "fine_tune",
-            training_spec: "{}",
+            execution: JobExecution::Queued,
+            spec: "{}",
+            model_ref: Some("base-model::1"),
+            output_model_id: None,
+            model_source: None,
+            priority: 0,
         })
     )
-    .expect("create training job");
+    .expect("submit job");
     let claimed = must!(
         "claim job",
-        catalog.claim_next_training_job("worker-b", Duration::from_secs(600))
+        catalog.claim_next("worker-b", &["fine_tune"], Duration::from_secs(600))
     )
     .expect("claim transaction")
     .expect("the queued job is claimable");
@@ -454,11 +455,11 @@ async fn fanout_rounds(catalog: &Arc<Catalog>, n: usize, expect_round: i64) -> V
     for _ in 0..n {
         let catalog = Arc::clone(catalog);
         handles.push(tokio::spawn(async move {
-            let record = tokio::time::timeout(OP_TIMEOUT, catalog.get_training_job("j"))
+            let record = tokio::time::timeout(OP_TIMEOUT, catalog.get_job("j"))
                 .await
                 .expect("fan-out read timed out")
                 .expect("fan-out read failed");
-            match record.metrics {
+            match record.progress_phase {
                 None => 0,
                 Some(raw) => serde_json::from_str::<serde_json::Value>(&raw)
                     .expect("metrics parse")

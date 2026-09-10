@@ -23,7 +23,7 @@ use jammi_db::trigger::{Offset, Predicate};
 
 use crate::convert::{batches_to_pyarrow, serializable_to_pydict};
 use crate::error::{status_to_pyerr, to_pyerr};
-use crate::job::PyTrainingJob;
+use crate::job::PyJob;
 
 /// The low-level embedded engine handle, wrapping `Arc<InferenceSession>` with a
 /// shared tokio runtime. Exposed to Python as `_NativeDatabase`: the thin Python
@@ -46,7 +46,7 @@ pub struct PyDatabase {
     /// gracefully and deterministically on `close()` via
     /// `EmbeddedWorker::stop_and_join`.
     ///
-    /// `None` when `training.run_worker` is `false`: this connection still
+    /// `None` when `worker.enabled` is `false`: this connection still
     /// mounts the whole training surface and still accepts submissions, it just
     /// never claims. The absence is represented by the `Option` rather than by a
     /// spawned-but-idle worker, so "no claim loop exists" is a state the type
@@ -68,14 +68,14 @@ impl PyDatabase {
     /// the resulting database shares the tokio runtime that drives every
     /// `InferenceSession` future.
     ///
-    /// # `training.run_worker` — whether this process claims
+    /// # `worker.enabled` — whether this process claims
     ///
     /// The embedded engine both accepts training submissions and runs them, so
     /// it is the arm that has to be able to stop running them. `config`'s
-    /// [`jammi_db::config::TrainingConfig::run_worker`] decides, and it is read
+    /// [`jammi_db::config::WorkerConfig::enabled`] decides, and it is read
     /// here from the SAME configuration the server binary reads (the
     /// `#[pyfunction] open_local` wrapper builds it with `JammiConfig::load`, so
-    /// `JAMMI_TRAINING__RUN_WORKER=false` reaches an embedded process exactly as
+    /// `JAMMI_WORKER__ENABLED=false` reaches an embedded process exactly as
     /// it reaches a server process):
     ///
     /// * `true` (the default) — the claim loop runs here, on the shared runtime.
@@ -90,12 +90,35 @@ impl PyDatabase {
     ///   for this one.
     pub fn open(config: JammiConfig) -> Result<Self, JammiError> {
         let runtime = Arc::new(tokio::runtime::Runtime::new()?);
+        Self::open_with_runtime(config, runtime)
+    }
+
+    /// Like [`Self::open`], but over an already-built runtime rather than
+    /// constructing a fresh one.
+    ///
+    /// `open_local` (#486) needs this: `jammi_ai::telemetry::otlp_layer`
+    /// builds a tonic `Channel` that requires an ACTIVE Tokio reactor merely
+    /// to construct (no connection attempt happens at that point — the
+    /// channel connects lazily — but the executor it wraps still needs
+    /// `Handle::current()` to exist), and that channel must go on living for
+    /// as long as the session it exports spans for, which the runtime
+    /// `Self::open` builds internally and never exposes cannot guarantee
+    /// from the outside. `open_local` therefore builds the runtime FIRST,
+    /// enters it to build the tracing layers (and install the global
+    /// subscriber) BEFORE the session itself exists, then hands that SAME
+    /// runtime in here — one shared `Arc`, so the exporter's channel and the
+    /// session's own futures are driven by the identical reactor for the
+    /// whole connection's lifetime.
+    pub(crate) fn open_with_runtime(
+        config: JammiConfig,
+        runtime: Arc<tokio::runtime::Runtime>,
+    ) -> Result<Self, JammiError> {
         let session = runtime.block_on(InferenceSession::open(config))?;
         // Spawn the embedded training worker on the shared runtime, if this
         // process is configured to run one. The spawn must happen inside the
         // runtime context; the worker holds a `Weak` to the session so it never
         // keeps it alive, and the guard stops it on drop.
-        let worker = if session.inner_config().training.run_worker {
+        let worker = if session.inner_config().worker.enabled {
             let _enter = runtime.enter();
             Some(jammi_ai::fine_tune::worker::EmbeddedWorker::spawn(
                 &session,
@@ -114,7 +137,7 @@ impl PyDatabase {
 
     /// `Err` (the same typed `BackendError` [`PyDatabase::close`] raises for
     /// every later call) once `close()` has run; `Ok(())` otherwise. Every
-    /// pymethod but `close()` and `attach`'s target `training_job` calls this
+    /// pymethod but `close()` and `attach`'s target `job` calls this
     /// first, so a caller who keeps using a handle after `close()` gets a
     /// prompt, typed failure at each call site rather than racing whatever
     /// state the worker/session were left in.
@@ -197,7 +220,7 @@ impl PyDatabase {
     /// release is never made conditional on it, and the join error is
     /// propagated afterwards.
     ///
-    /// # With `training.run_worker = false`
+    /// # With `worker.enabled = false`
     ///
     /// Step 1 has nothing to do — no claim loop was ever started (see
     /// [`PyDatabase::open`]) — so it is skipped rather than joining a worker
@@ -238,7 +261,7 @@ impl PyDatabase {
     /// # Scope of the release
     ///
     /// The pool is SHARED by every handle derived from this connection, by
-    /// design (a `TrainingJob`, the `audit` handle, an `EphemeralSession` each
+    /// design (a `Job`, the `audit` handle, an `EphemeralSession` each
     /// carry a clone of the same session). Releasing the file therefore has to
     /// be, and is, connection-wide: after `close()` those derived handles'
     /// catalog operations fail too, and the pool is never silently reopened —
@@ -281,63 +304,71 @@ impl PyDatabase {
             self.runtime.block_on(async {
                 let stopped = match &self._worker {
                     Some(worker) => worker.stop_and_join().await,
-                    // `training.run_worker = false`: there is no claim loop to
-                    // stop. The pool close below still runs — the catalog
+                    // `worker.enabled = false`: there is no claim loop to
+                    // stop. The session close below still runs — the catalog
                     // release is what a caller closes for, and it must not
                     // depend on this connection having happened to own a worker.
                     None => Ok(()),
                 };
-                let backend = self.session.catalog().backend_arc();
-                backend.close().await;
+                // `InferenceSession::close` shuts the session's lease
+                // keeper (N3) down and joins its dedicated thread — closing
+                // its OWN catalog connection — before closing the shared
+                // pool. Closing only the shared pool without this step
+                // would leave the keeper's connection open, and for the
+                // SQLite backend that connection alone is enough to keep
+                // the `unix-excl` VFS's process-exclusive lock held.
+                self.session.close().await;
                 stopped
             })
         })
         .map_err(to_pyerr)
     }
 
-    /// Attach to an existing training job by id, on a freshly-opened
-    /// connection that never submitted it — the embedded peer of the remote
-    /// client's `RemoteTrainingJob`, which always attaches by id (every one of
-    /// its verbs re-fetches state over the wire per call). Closes the K4
-    /// asymmetry where the embedded engine could otherwise only ever hand out
-    /// a `TrainingJob` at submit time.
+    /// Attach to an existing job by id, on a freshly-opened connection that
+    /// never submitted it — the embedded peer of the remote client's
+    /// `RemoteJob`, which always attaches by id (every one of its verbs
+    /// re-fetches state over the wire per call). Closes the K4 asymmetry
+    /// where the embedded engine could otherwise only ever hand out a `Job`
+    /// at submit time. Works for ANY row the generalised `jobs` table holds
+    /// — a training kind this connection submitted, or a compute-kind row
+    /// created internally by another verb — not only a training job.
     ///
     /// A `job_id` with no matching row raises the SAME typed not-found
     /// [`PyDatabase::sql`] et al. already raise for a missing catalog target —
     /// there is no separate existence check here to drift from the catalog
     /// read itself.
-    fn training_job(&self, job_id: &str) -> PyResult<PyTrainingJob> {
+    fn job(&self, job_id: &str) -> PyResult<PyJob> {
         self.check_open()?;
-        PyTrainingJob::attach(
+        PyJob::attach(
             job_id.to_string(),
             Arc::clone(&self.runtime),
             Arc::clone(&self.session),
         )
     }
 
-    /// List every training job visible to the current tenant, most recent
-    /// first. Each entry is a dict carrying the SAME field set the wire's
-    /// `TrainingJobSummary` carries — `job_id`, `kind`, `status`,
-    /// `base_model_id`, `output_model_id`, `created_at`, `error` — so a caller
-    /// reads one vocabulary regardless of transport. A listing of
-    /// `TrainingJob.status()` answers plus the submit-time identity, not a
-    /// progress surface: the engine persists run metrics only at finalization,
-    /// so there is no mid-run metric here to expose.
+    /// List every job visible to the current tenant, most recent first. Each
+    /// entry is a dict carrying the SAME field set the wire's `JobSummary`
+    /// carries — `job_id`, `kind`, `status`, `base_model_id`,
+    /// `output_model_id`, `created_at`, `error` — so a caller reads one
+    /// vocabulary regardless of transport. A listing of `Job.status()`
+    /// answers plus the submit-time identity, not a progress surface: read
+    /// [`PyJob::progress`] on the individual handle for that.
     ///
-    /// `output_model_id` is the empty string until the job completes and
-    /// `error` is empty unless it failed — the same two conventions
-    /// `TrainingService.ListTrainingJobs` relays, reproduced here rather than
-    /// mapping absence onto `None` on one transport only.
+    /// `output_model_id` is the empty string until a training kind completes
+    /// (and always empty for a compute kind) and `error` is empty unless it
+    /// failed — the same two conventions `JobService.ListJobs` relays,
+    /// reproduced here rather than mapping absence onto `None` on one
+    /// transport only.
     ///
     /// Tenant-scoped by the catalog read itself
     /// (`WHERE tenant_id = $1 OR tenant_id IS NULL`), which is the same call —
-    /// `Catalog::list_training_jobs` — the server's own handler makes, so the
+    /// `Catalog::list_jobs` — the server's own handler makes, so the
     /// two arms cannot drift on which rows are visible.
-    fn list_training_jobs(&self, py: Python<'_>) -> PyResult<Py<PyAny>> {
+    fn list_jobs(&self, py: Python<'_>) -> PyResult<Py<PyAny>> {
         self.check_open()?;
         let records = self
             .runtime
-            .block_on(self.session.catalog().list_training_jobs())
+            .block_on(self.session.catalog().list_jobs())
             .map_err(to_pyerr)?;
         let list = PyList::empty(py);
         for record in &records {
@@ -345,16 +376,64 @@ impl PyDatabase {
             entry.set_item("job_id", &record.job_id)?;
             entry.set_item("kind", &record.kind)?;
             entry.set_item("status", &record.status)?;
-            entry.set_item("base_model_id", &record.base_model_id)?;
+            entry.set_item("base_model_id", record.model_ref.as_deref().unwrap_or(""))?;
             entry.set_item(
                 "output_model_id",
                 record.output_model_id.as_deref().unwrap_or(""),
             )?;
             entry.set_item("created_at", &record.created_at)?;
-            entry.set_item("error", record.error_message.as_deref().unwrap_or(""))?;
+            entry.set_item("error", record.error.as_deref().unwrap_or(""))?;
             list.append(entry)?;
         }
         Ok(list.into_any().unbind())
+    }
+
+    /// Request cancellation of a job by id. `True` when the request landed on
+    /// a still non-terminal row this call's tenant can see; `False` when the
+    /// job was already terminal or absent. Mirrors `JobService.CancelJob`.
+    fn cancel_job(&self, job_id: &str) -> PyResult<bool> {
+        self.check_open()?;
+        self.runtime
+            .block_on(self.session.catalog().cancel_request(job_id))
+            .map_err(to_pyerr)
+    }
+
+    /// List the engine processes currently running the claim loop
+    /// (`[worker] enabled = true`), most recently seen first. Each entry is a
+    /// dict: `{"instance_id", "label", "host", "kinds", "started_at",
+    /// "last_seen_at"}` — the same field set `JobService.ListWorkers` relays.
+    /// Fleet/liveness metadata, not tenant-scoped (mirrors the wire rpc).
+    fn list_workers(&self, py: Python<'_>) -> PyResult<Py<PyAny>> {
+        self.check_open()?;
+        let records = self
+            .runtime
+            .block_on(self.session.catalog().list_workers())
+            .map_err(to_pyerr)?;
+        let list = PyList::empty(py);
+        for w in &records {
+            let entry = PyDict::new(py);
+            entry.set_item("instance_id", &w.instance_id)?;
+            entry.set_item("label", w.label.as_deref().unwrap_or(""))?;
+            entry.set_item("host", w.host.as_deref().unwrap_or(""))?;
+            entry.set_item("kinds", &w.kinds)?;
+            entry.set_item("started_at", &w.started_at)?;
+            entry.set_item("last_seen_at", &w.last_seen_at)?;
+            list.append(entry)?;
+        }
+        Ok(list.into_any().unbind())
+    }
+
+    /// Eagerly delete the CALLER's own terminal (`completed`/`failed`) job
+    /// rows older than the deployment's `[jobs] retention_days`. Returns the
+    /// count deleted. Mirrors `JobService.PruneJobs` — tenant-scoped like
+    /// every other job verb; distinct from the process's construction-time
+    /// sweep, which runs once per process boot and is not reachable here.
+    fn prune_jobs(&self) -> PyResult<usize> {
+        self.check_open()?;
+        let retention = self.session.inner_config().jobs.retention();
+        self.runtime
+            .block_on(self.session.catalog().prune_jobs(retention))
+            .map_err(to_pyerr)
     }
 
     /// Set the sticky tenant scope on this connection.
@@ -1127,27 +1206,43 @@ impl PyDatabase {
         batches_to_pyarrow(py, &batches)
     }
 
-    /// Submit a training job from a serialized `StartTrainingRequest` body.
+    /// Submit a training job from a serialized `SubmitJobRequest` body.
     ///
     /// The thin Python `Database` wrapper builds this request with the same
     /// pure-Python assembly the remote client uses (`jammi._assembly`),
     /// serializes it, and hands the bytes here — so the embedded and remote
-    /// training submits share one request assembly and one decode seam. The body
+    /// job submits share one request assembly and one decode seam. The body
     /// decodes through `jammi_ai::wire::training_spec_from_bytes` into the engine
-    /// [`TrainingSpec`], which the shared [`InferenceSession::run_training_spec`]
-    /// dispatch runs in-process; the embedded worker this connection owns
-    /// executes it. Returns the same `TrainingJob` handle the per-verb embedded
-    /// submits used to return. A malformed or invalid body raises `ValueError`.
-    fn _start_training_proto(&self, proto_bytes: &[u8]) -> PyResult<PyTrainingJob> {
+    /// [`TrainingSpec`], which the shared
+    /// [`InferenceSession::run_training_spec_deduped`] dispatch runs
+    /// in-process; the embedded worker this connection owns executes it.
+    /// Returns the same `Job` handle the per-verb embedded submits return.
+    /// A malformed or invalid body raises `ValueError`.
+    ///
+    /// `idempotency_key`, when non-empty, dedupes the same way the wire's
+    /// `SubmitJob.idempotency_key` does (migration 030's durable per-tenant
+    /// key): a second submit carrying a key that still names a known prior
+    /// submission returns THAT job's handle rather than submitting a
+    /// duplicate — the same seam `JobService::submit_job`'s gRPC handler
+    /// drives.
+    #[pyo3(signature = (proto_bytes, idempotency_key=None))]
+    fn _start_training_proto(
+        &self,
+        proto_bytes: &[u8],
+        idempotency_key: Option<&str>,
+    ) -> PyResult<PyJob> {
         self.check_open()?;
         let spec =
             jammi_ai::wire::training_spec_from_bytes(proto_bytes).map_err(status_to_pyerr)?;
+        let kind = spec.kind().to_string();
+        let key = idempotency_key.filter(|k| !k.is_empty());
         let job = self
             .runtime
-            .block_on(self.session.run_training_spec(spec))
+            .block_on(self.session.run_training_spec_deduped(spec, key))
             .map_err(to_pyerr)?;
-        Ok(PyTrainingJob::new(
+        Ok(PyJob::new(
             job,
+            kind,
             Arc::clone(&self.runtime),
             Arc::clone(&self.session),
         ))

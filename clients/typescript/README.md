@@ -32,8 +32,12 @@ for await (const batch of jammi.trigger.subscribe({ topic: { name: "events" } })
 ```
 
 `connect(endpoint, opts?)` builds the gRPC-web transport and returns a
-`JammiClient` with one client per service (`session`, `embedding`, `inference`,
-`eval`, `fineTune`, `mutableTable`, `channel`, `trigger`, `audit`). Each
+`JammiClient` with one client per service (`catalog`, `embedding`, `inference`,
+`eval`, `pipeline`, `job`, `trigger`, `audit`). `job` carries the durable job
+verbs — `submitJob`/`jobStatus`/`waitJob`/`listJobs`/`cancelJob`/
+`listWorkers`/`pruneJobs` (`JobService`, replacing the old `TrainingService`:
+`submitJob` folds the training-kind submission, `jobStatus`/`waitJob` fold
+status polling). Each
 connection mints an opaque session id (overridable via `opts.sessionId`) and
 injects it as the `jammi-session-id` header on every request — the key the
 server binds tenant state against. Pass extra interceptors via

@@ -55,7 +55,8 @@ use crate::session::InferenceSession;
 pub const DEFAULT_EXACT_MAX_ROWS: usize = 50_000;
 
 /// Parameters for [`InferenceSession::build_neighbor_graph`].
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+#[serde(default)]
 pub struct BuildNeighborGraph {
     /// Number of nearest neighbours per node (required, `>= 1`).
     pub k: usize,
@@ -241,6 +242,7 @@ impl<'a> NeighborGraphPipeline<'a> {
         embedding_table: Option<&str>,
         params: &BuildNeighborGraph,
         cache: CachePolicy,
+        job_attempt: Option<jammi_db::catalog::result_repo::JobAttempt<'_>>,
     ) -> Result<(ResultTableRecord, CacheOutcome)> {
         if params.k == 0 {
             return Err(JammiError::Config(
@@ -291,7 +293,7 @@ impl<'a> NeighborGraphPipeline<'a> {
         let nodes = self.read_nodes(&source_table).await?;
         let edges = self.build_edges(&source_table, &nodes, params).await?;
         let record = self
-            .write_edge_table(&source_table, edges, &descriptor, &env, inputs)
+            .write_edge_table(&source_table, edges, &descriptor, &env, inputs, job_attempt)
             .await?;
         Ok((record, CacheOutcome::Computed))
     }
@@ -420,6 +422,7 @@ impl<'a> NeighborGraphPipeline<'a> {
         descriptor: &jammi_db::store::manifest::ProducingDescriptor,
         env: &jammi_db::store::manifest::MaterializationEnv,
         inputs: Vec<jammi_db::store::manifest::InputAnchor>,
+        job_attempt: Option<jammi_db::catalog::result_repo::JobAttempt<'_>>,
     ) -> Result<ResultTableRecord> {
         // The edge table is a derivation: its `task` rides the source's so the
         // NOT NULL column round-trips, but `kind = NeighborGraph` excludes it
@@ -435,6 +438,7 @@ impl<'a> NeighborGraphPipeline<'a> {
                 None,
                 None,
                 None,
+                job_attempt,
             )
             .await?;
 

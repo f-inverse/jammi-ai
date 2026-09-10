@@ -13,7 +13,7 @@ use jammi_db::store::{ArtifactStore, ResultStore};
 use crate::concurrency::GpuScheduler;
 use crate::eval::runner::EvalRunner;
 use crate::fine_tune::spec::{TrainingCommon, TrainingSpec};
-use crate::fine_tune::training_job::{fine_tuned_model_id, TrainingJob};
+use crate::fine_tune::training_job::{fine_tuned_model_id, resolve_model_id, TrainingJob};
 use crate::fine_tune::{FineTuneConfig, FineTuneMethod};
 use crate::inference::adapter::BackendOutput;
 use crate::inference::observer::InferenceObserver;
@@ -42,6 +42,36 @@ pub struct InferenceSession {
     hub: HubSource,
     /// Registry of open ephemeral sessions, shared with the timeout scanner.
     ephemeral_sessions: jammi_db::ephemeral::ActiveSessions,
+    /// This process's identity in the `instances`/`jobs.claimed_by`
+    /// vocabulary (N3): a UUID minted once at construction
+    /// ([`crate::fine_tune::worker::mint_instance_id`]) and never taken
+    /// from the environment — `JAMMI_WORKER_ID` is only the row's `label`
+    /// ([`crate::fine_tune::worker::worker_label`]), so two processes
+    /// sharing an operator label (a restart, a sibling replica) are two
+    /// `instances` rows and a dead one's inline jobs are reclaimed rather
+    /// than kept alive by its namesake's heartbeat. Every claimant on this
+    /// process (a [`crate::fine_tune::worker::JobWorker`]'s poll loop, a
+    /// [`Self::run_now`] inline claim) shares this one `claimed_by`
+    /// identity, and `catalog::lease_keeper::LeaseTarget::Instance`
+    /// registers the SAME id `jobs.claimed_by` carries.
+    instance_id: String,
+    /// The process's one lease-renewal thread (N3) — every claimed lease
+    /// this session (or a job/table it owns) holds is held open here instead
+    /// of spawning its own `tokio::spawn` heartbeat task, so a CPU-bound
+    /// inline compute job on the main runtime can never starve a renewal.
+    lease_keeper: Arc<jammi_db::catalog::lease_keeper::LeaseKeeper>,
+    /// This session's `instances` row hold — held for its `Drop` (releases
+    /// the keeper renewal when the session drops), never read.
+    _instance_hold: jammi_db::catalog::lease_keeper::LeaseHold,
+}
+
+/// The model-side links a training kind's `jobs` row is submitted with —
+/// see [`InferenceSession::training_job_links`].
+pub(crate) struct TrainingJobLinks {
+    /// `jobs.model_ref`: the base model's catalog PK.
+    pub(crate) model_ref: String,
+    /// `jobs.output_model_id`: the NAME the finished model registers under.
+    pub(crate) output_model_id: String,
 }
 
 impl InferenceSession {
@@ -110,6 +140,30 @@ impl InferenceSession {
     ) -> Result<Self> {
         let inner = Arc::new(inner);
         let catalog = Arc::clone(inner.catalog());
+
+        // N3: one lease-renewal thread per process, started before anything
+        // holds a lease with it (the result store's `BuildingTable`
+        // adoptions below, this session's own `instances` row, and every
+        // job/table lease a `JobWorker`/`run_now` claim holds later).
+        // `catalog_connect` opens a FRESH backend connection from inside the
+        // keeper's own dedicated runtime — never this session's `catalog`
+        // handle — so a CPU-bound inline job saturating the main runtime can
+        // never starve the renewal (see `lease_keeper`'s module docs).
+        let lease_intervals = inner.config().lease.intervals()?;
+        let config_for_keeper = inner.config().clone();
+        // `start` is fallible: it returns only once the keeper thread has
+        // connected and completed its first renewal pass, so no hold this
+        // session later registers can read "live" against a keeper that
+        // never ran (a typed `Catalog`/`Config` error surfaces here instead).
+        let lease_keeper = jammi_db::catalog::lease_keeper::LeaseKeeper::start(
+            move || {
+                let config = config_for_keeper.clone();
+                Box::pin(async move { jammi_db::session::open_catalog_from_config(&config).await })
+            },
+            lease_intervals,
+        )
+        .await?;
+
         // The result store is built first: it owns the session's
         // `ArtifactStore` internally (rooted at `{result_store_root}/models`,
         // one storage knob serving both), so the resolver reads that SAME
@@ -117,8 +171,12 @@ impl InferenceSession {
         // root that could disagree with it. A fine-tuned model's catalog
         // `artifact_path` is an object-store prefix, fetched into a local
         // cache before candle loads it, so an adapter trained on one host
-        // serves on another.
-        let result_store = Arc::new(build_result_store(&inner, Arc::clone(&catalog))?);
+        // serves on another. It registers every `BuildingTable` it adopts
+        // with the keeper above rather than spawning its own heartbeat task.
+        let result_store = Arc::new(
+            build_result_store(&inner, Arc::clone(&catalog))?
+                .with_lease_keeper(Arc::clone(&lease_keeper)),
+        );
         let artifact_store = result_store.artifact_store();
         // The K4 choke point (esc-096): `[models]` -> `HubSource`, exactly
         // once per session. Every downstream Hub call (the resolver's
@@ -145,6 +203,56 @@ impl InferenceSession {
         result_store.recover().await?;
         result_store.load_existing_tables(inner.context()).await?;
 
+        // Item 5's construction sweep: `recover()` (PR-A, above) plus the
+        // jobs-side reclaim and the two retention prunes, unconditionally —
+        // a process that never claims still benefits from reclaiming a dead
+        // peer's expired leases and does no harm running the sweep.
+        catalog
+            .reclaim_expired_jobs(
+                lease_intervals.lease(),
+                crate::fine_tune::worker::MAX_ATTEMPTS,
+            )
+            .await?;
+        // Two windows, two knobs: an `instances` row is stale once it has
+        // missed the same `2 × lease` liveness margin the inline-job
+        // reclaim arm judges it by (a process that has not heartbeated for
+        // two lease windows is dead to every reader), while terminal job
+        // rows live for `[jobs] retention_days` — the retention knob never
+        // decides process liveness.
+        catalog
+            .prune_instances(lease_intervals.lease().saturating_mul(2))
+            .await?;
+        // `Catalog::prune_jobs` is tenant-scoped (F2, issue #485): every
+        // `JobService::PruneJobs` RPC call runs it under the CALLER's own
+        // `scoped(...)` tenant, like every other job RPC. This construction
+        // sweep is not an RPC — it runs once per process boot, before any
+        // request is scoped — and stays global BY DESIGN (a process that
+        // never claims still benefits from reclaiming every tenant's stale
+        // terminal rows), so it explicitly drops the tenant predicate via
+        // `with_admin_scope` rather than silently sweeping only the `NULL`
+        // (unscoped) tenant's rows.
+        {
+            let retention = inner.config().jobs.retention();
+            let catalog = Arc::clone(&catalog);
+            inner
+                .with_admin_scope(|_admin| async move { catalog.prune_jobs(retention).await })
+                .await?;
+        }
+
+        // This process's `instances` row + keeper hold — every
+        // session upserts and heartbeats one, whether or not it runs a
+        // claim loop (only `workers` membership is gated on `[worker]
+        // enabled`, upserted by `EmbeddedWorker::spawn`/`JobWorker`). The
+        // id is minted here; `JAMMI_WORKER_ID` only labels the row.
+        let instance_id = crate::fine_tune::worker::mint_instance_id();
+        let label = crate::fine_tune::worker::worker_label();
+        catalog
+            .upsert_instance(&instance_id, label.as_deref(), None)
+            .await?;
+        let instance_hold = lease_keeper.hold(
+            jammi_db::catalog::lease_keeper::LeaseTarget::Instance(instance_id.clone()),
+        );
+
         let ann_cache_size = inner.config().cache.ann_cache_max_entries as u64;
         let ann_cache = Arc::new(AnnCache::new(ann_cache_size));
 
@@ -158,7 +266,106 @@ impl InferenceSession {
             device_config,
             hub,
             ephemeral_sessions: jammi_db::ephemeral::ActiveSessions::new(),
+            instance_id,
+            lease_keeper,
+            _instance_hold: instance_hold,
         })
+    }
+
+    /// This process's `instances`/`jobs.claimed_by` identity (N3): a UUID
+    /// minted at construction, never `JAMMI_WORKER_ID` (which is only the
+    /// row's label). Shared by every claimant on this session — a
+    /// [`crate::fine_tune::worker::JobWorker`]'s poll loop and
+    /// [`Self::run_now`]'s inline claim alike.
+    pub fn instance_id(&self) -> &str {
+        &self.instance_id
+    }
+
+    /// This process's one lease-renewal thread (N3). A
+    /// [`crate::fine_tune::worker::JobWorker`] and [`Self::run_now`] both
+    /// hold their claimed job leases here rather than spawning their own
+    /// heartbeat task.
+    pub fn lease_keeper(&self) -> &Arc<jammi_db::catalog::lease_keeper::LeaseKeeper> {
+        &self.lease_keeper
+    }
+
+    /// The validated lease/heartbeat/idle-poll timing this session's
+    /// `[lease]`/`[worker]` configuration resolves to.
+    pub fn worker_intervals(&self) -> Result<jammi_db::config::WorkerIntervals> {
+        self.inner
+            .config()
+            .worker
+            .worker_intervals(self.inner.config().lease.intervals()?)
+    }
+
+    /// Release every catalog connection this session holds — its own
+    /// shared backend pool AND the lease keeper's (N3) dedicated
+    /// connection — so a successor process can open the SAME catalog
+    /// directory immediately.
+    ///
+    /// **Dropping the session is not a release point**, for the same
+    /// reason [`jammi_db::session::JammiSession::close`] documents for the
+    /// shared pool, plus one this session adds on top: the lease keeper
+    /// opens its OWN connection on its own dedicated OS thread ([`Self::new`]
+    /// wires it before anything else can hold a lease), entirely
+    /// independent of the shared pool `JammiSession::close` releases.
+    /// Closing only that shared pool while the keeper's thread stays up
+    /// leaves the SQLite `unix-excl` VFS's process-scoped exclusive
+    /// lock held — the keeper's own connection is still open — so a
+    /// successor process opening the same directory is refused within the
+    /// busy timeout even after every OTHER handle has let go.
+    ///
+    /// Order: shut the keeper down and wait — bounded, see
+    /// [`jammi_db::catalog::lease_keeper::LeaseKeeper::shutdown_and_join`] —
+    /// for its thread to close its own connection, THEN close the shared
+    /// pool, so nothing renews a lease against a catalog this call is in
+    /// the middle of tearing down. A keeper that does not exit within the
+    /// shutdown window is logged and does NOT block the shared-pool close
+    /// that follows — this call must never hang, even at the cost of
+    /// leaving the keeper's connection's fate unresolved in that
+    /// (unexpected) case. The window is generous (30 s): the cost of a
+    /// caller's own release call taking that long in the genuinely rare
+    /// case the keeper's thread is slow to exit is far smaller than the
+    /// cost of giving up early and handing back a directory a successor
+    /// process cannot then open.
+    ///
+    /// Idempotent: [`jammi_db::session::JammiSession::close`] is
+    /// idempotent, and shutting down an already-stopped keeper finds no
+    /// thread left to join.
+    pub async fn close(&self) {
+        const KEEPER_SHUTDOWN_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
+        if let Err(e) = self
+            .lease_keeper
+            .shutdown_and_join(KEEPER_SHUTDOWN_TIMEOUT)
+            .await
+        {
+            tracing::error!(
+                error = %e,
+                "InferenceSession::close: the lease keeper did not exit within its shutdown \
+                 window; its own catalog connection may still hold the process-exclusive lock"
+            );
+        }
+        self.inner.close().await;
+    }
+
+    /// Row-scoped on-read reclaim: a caller that just read `record`
+    /// (e.g. `JobService`'s `JobStatus`/`WaitJob`/`ListJobs`) offers it here so
+    /// an expired lease is reaped inline with the read, without waiting for the
+    /// worker loop's or the construction sweep's next pass. Returns the
+    /// reclaimed row when this call performed a requeue-or-fail transition;
+    /// `None` when `record` needed no reclaim (not `running`, or a live
+    /// lease) — the caller keeps using its own `record` in that case. Shares
+    /// `crate::fine_tune::worker::MAX_ATTEMPTS` with the worker loop's own
+    /// `reclaim_expired_jobs` call so both reclaim paths apply the identical
+    /// attempts cap.
+    pub async fn reclaim_job_on_read(
+        &self,
+        record: &jammi_db::catalog::jobs_repo::JobRecord,
+    ) -> Result<Option<jammi_db::catalog::jobs_repo::JobRecord>> {
+        let lease = self.worker_intervals()?.lease;
+        self.catalog()
+            .reclaim_job_on_read(record, lease, crate::fine_tune::worker::MAX_ATTEMPTS)
+            .await
     }
 
     /// Register the engine's compound-query SQL functions on this session's
@@ -617,8 +824,67 @@ impl InferenceSession {
         Ok(output.single_row_or_err(0)?.to_vec())
     }
 
+    /// Generate embeddings for a source with the given model and modality —
+    /// the thin [`Self::run_now`] wrapper (item 2/K4) unifying the three
+    /// modality-specific materializers
+    /// ([`Self::generate_text_embeddings`], [`Self::generate_image_embeddings`],
+    /// [`Self::generate_audio_embeddings`]) behind one
+    /// [`crate::jobs::ComputeSpec::Embedding`]. Submits and executes inline
+    /// under [`Self::run_now`]'s claim/lease/finish path, then returns the
+    /// terminal [`ResultTableRecord`] + [`CacheOutcome`](jammi_db::store::CacheOutcome)
+    /// — so a direct call and a queued-and-claimed `embedding` job of the
+    /// same spec run identical code.
+    pub async fn generate_embeddings(
+        self: &Arc<Self>,
+        source_id: &str,
+        model_id: &str,
+        columns: &[String],
+        key_column: &str,
+        modality: jammi_wire::request::Modality,
+        cache: jammi_db::store::CachePolicy,
+    ) -> Result<(ResultTableRecord, jammi_db::store::CacheOutcome)> {
+        let spec = crate::jobs::ComputeSpec::Embedding {
+            source_id: source_id.to_string(),
+            model_id: model_id.to_string(),
+            columns: columns.to_vec(),
+            key_column: key_column.to_string(),
+            modality,
+            cache,
+        };
+        match self.run_now(spec).await? {
+            crate::jobs::JobResult::Table {
+                table,
+                cache_outcome,
+            } => {
+                let record = self
+                    .catalog()
+                    .get_result_table(&table)
+                    .await?
+                    .ok_or_else(|| {
+                        JammiError::Catalog(format!(
+                            "generate_embeddings: run_now's own table '{table}' vanished \
+                             before it could be read back"
+                        ))
+                    })?;
+                let outcome = parse_cache_outcome(&cache_outcome, &table);
+                Ok((record, outcome))
+            }
+            crate::jobs::JobResult::Model { .. } => Err(JammiError::Inference(
+                "generate_embeddings: run_now returned a training JobResult for a compute spec"
+                    .into(),
+            )),
+        }
+    }
+
     /// Generate embeddings for a source and persist to Jammi DB.
     /// Invalidates the ANN cache for this source after completion.
+    ///
+    /// One of [`Self::generate_embeddings`]'s three modality-specific
+    /// materializers — see that method's doc for the `job_attempt`
+    /// convention every `*_materialize`-shaped method shares (this one is
+    /// not itself suffixed `_materialize` since it is already
+    /// modality-specific, never a public verb name on its own).
+    #[allow(clippy::too_many_arguments)]
     pub async fn generate_text_embeddings(
         &self,
         source_id: &str,
@@ -626,9 +892,10 @@ impl InferenceSession {
         columns: &[String],
         key_column: &str,
         cache: jammi_db::store::CachePolicy,
+        job_attempt: Option<jammi_db::catalog::result_repo::JobAttempt<'_>>,
     ) -> Result<(ResultTableRecord, jammi_db::store::CacheOutcome)> {
         let result = EmbeddingPipeline::new(self, &self.result_store, ModelTask::TextEmbedding)
-            .run(source_id, model_id, columns, key_column, cache)
+            .run(source_id, model_id, columns, key_column, cache, job_attempt)
             .await?;
         self.ann_cache.invalidate_source(source_id)?;
         Ok(result)
@@ -693,7 +960,10 @@ impl InferenceSession {
         Ok(record)
     }
 
-    /// Generate image embeddings for a source and persist to Jammi DB.
+    /// Generate image embeddings for a source and persist to Jammi DB. See
+    /// [`Self::generate_text_embeddings`]'s doc for the `job_attempt`
+    /// convention.
+    #[allow(clippy::too_many_arguments)]
     pub async fn generate_image_embeddings(
         &self,
         source_id: &str,
@@ -701,6 +971,7 @@ impl InferenceSession {
         image_column: &str,
         key_column: &str,
         cache: jammi_db::store::CachePolicy,
+        job_attempt: Option<jammi_db::catalog::result_repo::JobAttempt<'_>>,
     ) -> Result<(ResultTableRecord, jammi_db::store::CacheOutcome)> {
         let result = EmbeddingPipeline::new(self, &self.result_store, ModelTask::ImageEmbedding)
             .run(
@@ -709,6 +980,7 @@ impl InferenceSession {
                 &[image_column.to_string()],
                 key_column,
                 cache,
+                job_attempt,
             )
             .await?;
         self.ann_cache.invalidate_source(source_id)?;
@@ -743,6 +1015,7 @@ impl InferenceSession {
     /// encoded audio bytes or file paths), decodes → resamples → log-mel →
     /// CLAP audio tower, and writes one L2-normalized vector per row. Reuses
     /// the modality-agnostic [`EmbeddingPipeline`] unchanged.
+    #[allow(clippy::too_many_arguments)]
     pub async fn generate_audio_embeddings(
         &self,
         source_id: &str,
@@ -750,6 +1023,7 @@ impl InferenceSession {
         audio_column: &str,
         key_column: &str,
         cache: jammi_db::store::CachePolicy,
+        job_attempt: Option<jammi_db::catalog::result_repo::JobAttempt<'_>>,
     ) -> Result<(ResultTableRecord, jammi_db::store::CacheOutcome)> {
         let result = EmbeddingPipeline::new(self, &self.result_store, ModelTask::AudioEmbedding)
             .run(
@@ -758,6 +1032,7 @@ impl InferenceSession {
                 &[audio_column.to_string()],
                 key_column,
                 cache,
+                job_attempt,
             )
             .await?;
         self.ann_cache.invalidate_source(source_id)?;
@@ -847,7 +1122,56 @@ impl InferenceSession {
         extract_test_column(&output, col_idx)
     }
 
-    /// Run inference on a registered source using a model.
+    /// Run inference on a registered source using a model — the thin
+    /// [`Self::run_now`] wrapper every embedded caller reaches (item 2/K4):
+    /// submits a [`crate::jobs::ComputeSpec::Infer`], executes it inline
+    /// under the same claim/lease/finish path a queued `infer` kind runs,
+    /// and returns the terminal rows read back through the SAME ordered SQL
+    /// `Self::infer_materialize`'s own cache-hit arm uses
+    /// (`ORDER BY _row_id, _ordinal`) — so a `run_now` call and a
+    /// queued-and-claimed `infer` job of the same spec produce byte-identical
+    /// rows in byte-identical order.
+    #[allow(clippy::too_many_arguments)]
+    pub async fn infer(
+        self: &Arc<Self>,
+        source_id: &str,
+        source: &ModelSource,
+        task: ModelTask,
+        content_columns: &[String],
+        key_column: &str,
+        cache: jammi_db::store::CachePolicy,
+    ) -> Result<(Vec<RecordBatch>, jammi_db::store::CacheOutcome)> {
+        let spec = crate::jobs::ComputeSpec::Infer {
+            source_id: source_id.to_string(),
+            model_id: source.to_string(),
+            task,
+            content_columns: content_columns.to_vec(),
+            key_column: key_column.to_string(),
+            cache,
+        };
+        match self.run_now(spec).await? {
+            crate::jobs::JobResult::Table {
+                table,
+                cache_outcome,
+            } => {
+                let batches = self.sql(&infer_ordered_read_back_sql(&table)).await?;
+                let batches = normalize_view_batches(batches)?;
+                let outcome = parse_cache_outcome(&cache_outcome, &table);
+                Ok((batches, outcome))
+            }
+            crate::jobs::JobResult::Model { .. } => Err(JammiError::Inference(
+                "infer: run_now returned a training JobResult for a compute spec".into(),
+            )),
+        }
+    }
+
+    /// `infer`'s actual materializer — dispatched to by
+    /// [`crate::jobs::execute_compute`] (from [`Self::run_now`] or a claimed
+    /// `infer` job) with the claim's [`JobAttempt`](jammi_db::catalog::result_repo::JobAttempt)
+    /// so the result table's `partial_result` CAS lands under the correct
+    /// attempt (N1); every OTHER internal caller that materializes directly
+    /// without a job of record ([`crate::pipeline::recompute`]'s replay,
+    /// [`crate::eval::runner::EvalRunner`]) passes `None`.
     ///
     /// Scans the source, feeds `content_columns` through the model, and
     /// returns RecordBatches with prefix + task-specific columns. The
@@ -858,7 +1182,17 @@ impl InferenceSession {
     /// contiguity/PTX/dtype mismatch, or a model incapable of the requested
     /// task), so it fails this call loudly as an `Err` rather than being
     /// annotated as an all-`_status = "error"` relation.
-    pub async fn infer(
+    ///
+    /// An inference ALWAYS creates its (possibly empty) result table — even a
+    /// zero-row scan is a real, queryable artifact — and every read-back
+    /// (this materialize path's own fresh-compute return, and its cache-hit
+    /// short-circuit above) reads it back through the identical
+    /// `ORDER BY _row_id, _ordinal` query
+    /// ([`infer_ordered_read_back_sql`]), so a caller sees the SAME row order
+    /// regardless of which arm ran and regardless of the order the
+    /// underlying scan or model batches actually arrived in.
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) async fn infer_materialize(
         &self,
         source_id: &str,
         source: &ModelSource,
@@ -866,7 +1200,8 @@ impl InferenceSession {
         content_columns: &[String],
         key_column: &str,
         cache: jammi_db::store::CachePolicy,
-    ) -> Result<(Vec<RecordBatch>, jammi_db::store::CacheOutcome)> {
+        job_attempt: Option<jammi_db::catalog::result_repo::JobAttempt<'_>>,
+    ) -> Result<(String, Vec<RecordBatch>, jammi_db::store::CacheOutcome)> {
         // Validate content columns are not empty
         if content_columns.is_empty() {
             return Err(JammiError::Inference(
@@ -938,12 +1273,17 @@ impl InferenceSession {
                 // A sound hit: return the cached table's rows (not a fresh
                 // compute) and report the reuse. Inference anchors unpinned, so
                 // this never fires today — but the path is correct the moment a
-                // versioned source makes inference cacheable.
+                // versioned source makes inference cacheable. Read back through
+                // the SAME ordered query the fresh-compute arm below uses, so a
+                // cache hit and a cache miss return byte-identical row order.
                 let table = reused.table_name.clone();
-                let batches = self
-                    .sql(&format!("SELECT * FROM \"jammi.{}\"", reused.table_name))
-                    .await?;
-                return Ok((batches, jammi_db::store::CacheOutcome::Reused { table }));
+                let batches = self.sql(&infer_ordered_read_back_sql(&table)).await?;
+                let batches = normalize_view_batches(batches)?;
+                return Ok((
+                    table.clone(),
+                    batches,
+                    jammi_db::store::CacheOutcome::Reused { table },
+                ));
             }
         }
 
@@ -973,46 +1313,66 @@ impl InferenceSession {
             .await
             .map_err(|e| JammiError::Inference(format!("Failed to collect results: {e}")))?;
 
-        // Persist results to Parquet
-        if !batches.is_empty() {
-            let building = self
-                .result_store
-                .create_table(
-                    source_id,
-                    task,
-                    jammi_db::catalog::result_repo::ResultTableKind::Model,
-                    None,
-                    &source.to_string(),
-                    None,
-                    None,
-                    None,
-                )
-                .await?;
-            let schema = batches[0].schema();
-            let mut writer = self
-                .result_store
-                .open_writer(building.parquet_url(), schema)
-                .await?;
-            for batch in &batches {
-                writer.write_batch(batch).await?;
-            }
-            let row_count = writer.close().await?;
-
-            // Finish with the contract built at the top (the same definition +
-            // anchors the cache probe keyed on). Every `?` above unwinds
-            // through the handle's Drop (a best-effort `building -> failed`
-            // CAS, no byte deletion); `finish` is the single `building ->
-            // ready` funnel, renewing the writer's lease before it attests.
-            building
-                .finish(
-                    self.inner.context(),
-                    row_count,
-                    jammi_db::store::manifest::Materialization::new(&descriptor, &env, inputs),
-                )
-                .await?;
+        // An inference always creates its (possibly empty) result table — a
+        // zero-row scan is a real, queryable artifact too, never a case the
+        // producer silently skips materializing. When `batches` is empty
+        // there is no batch to read a schema off, so the plan's OWN output
+        // schema (known regardless of how many rows it ever emits) is the
+        // one the writer opens against.
+        let schema = batches
+            .first()
+            .map(|b| b.schema())
+            .unwrap_or_else(|| inference_exec.schema());
+        let building = self
+            .result_store
+            .create_table(
+                source_id,
+                task,
+                jammi_db::catalog::result_repo::ResultTableKind::Model,
+                None,
+                &source.to_string(),
+                None,
+                None,
+                None,
+                job_attempt,
+            )
+            .await?;
+        let mut writer = self
+            .result_store
+            .open_writer(building.parquet_url(), schema)
+            .await?;
+        for batch in &batches {
+            writer.write_batch(batch).await?;
         }
+        let row_count = writer.close().await?;
 
-        Ok((batches, jammi_db::store::CacheOutcome::Computed))
+        // Finish with the contract built at the top (the same definition +
+        // anchors the cache probe keyed on). Every `?` above unwinds
+        // through the handle's Drop (a best-effort `building -> failed`
+        // CAS, no byte deletion); `finish` is the single `building ->
+        // ready` funnel, renewing the writer's lease before it attests.
+        let record = building
+            .finish(
+                self.inner.context(),
+                row_count,
+                jammi_db::store::manifest::Materialization::new(&descriptor, &env, inputs),
+            )
+            .await?;
+
+        // Read back through the ordered query — see this method's doc for
+        // why the fresh-compute arm re-reads rather than returning the
+        // in-memory `batches` directly: it is the only way the returned row
+        // order is provably identical to the cache-hit arm's, regardless of
+        // how the underlying scan or model batches actually arrived.
+        let ordered = self
+            .sql(&infer_ordered_read_back_sql(&record.table_name))
+            .await?;
+        let ordered = normalize_view_batches(ordered)?;
+        Ok((
+            record.table_name,
+            ordered,
+            jammi_db::store::CacheOutcome::Computed,
+        ))
     }
 
     /// Build a SELECT query for the key + content columns from a source table.
@@ -1053,12 +1413,66 @@ impl InferenceSession {
     }
 
     /// Materialize the k-nearest-neighbour graph of a source's embedding table
-    /// as a queryable edge `result_table`.
+    /// as a queryable edge `result_table` — the thin [`Self::run_now`] wrapper
+    /// (item 2/K4): submits a [`crate::jobs::ComputeSpec::NeighborGraph`] and
+    /// returns the terminal [`ResultTableRecord`] + [`CacheOutcome`](jammi_db::store::CacheOutcome)
+    /// [`Self::run_now`] produced, so a direct call and a queued-and-claimed
+    /// `neighbor_graph` job of the same spec run identical code
+    /// (`Self::build_neighbor_graph_materialize`, through
+    /// [`crate::jobs::execute_compute`]).
     ///
     /// This is for *global-structure* work — clustering, near-duplicate
     /// detection, connected components, graph-aware training-data generation —
     /// where the whole edge set is consumed as a durable artifact. For
     /// "neighbours of *these* rows", compose [`Self::search`] instead.
+    ///
+    /// `cache` opts the build into memoization: under
+    /// [`CachePolicy::Use`](jammi_db::store::CachePolicy::Use) an exact prior
+    /// materialisation (same definition over the same source-table digest) is
+    /// reused instead of rebuilt, and the returned
+    /// [`CacheOutcome`](jammi_db::store::CacheOutcome) reports which path ran. The
+    /// default [`Bypass`](jammi_db::store::CachePolicy::Bypass) always rebuilds.
+    pub async fn build_neighbor_graph(
+        self: &Arc<Self>,
+        source_id: &str,
+        embedding_table: Option<&str>,
+        params: &crate::pipeline::neighbor_graph::BuildNeighborGraph,
+        cache: jammi_db::store::CachePolicy,
+    ) -> Result<(ResultTableRecord, jammi_db::store::CacheOutcome)> {
+        let spec = crate::jobs::ComputeSpec::NeighborGraph {
+            source_id: source_id.to_string(),
+            embedding_table: embedding_table.map(str::to_string),
+            params: params.clone(),
+            cache,
+        };
+        match self.run_now(spec).await? {
+            crate::jobs::JobResult::Table {
+                table,
+                cache_outcome,
+            } => {
+                let record = self
+                    .catalog()
+                    .get_result_table(&table)
+                    .await?
+                    .ok_or_else(|| {
+                        JammiError::Catalog(format!(
+                            "build_neighbor_graph: run_now's own table '{table}' vanished \
+                             before it could be read back"
+                        ))
+                    })?;
+                let outcome = parse_cache_outcome(&cache_outcome, &table);
+                Ok((record, outcome))
+            }
+            crate::jobs::JobResult::Model { .. } => Err(JammiError::Inference(
+                "build_neighbor_graph: run_now returned a training JobResult for a compute spec"
+                    .into(),
+            )),
+        }
+    }
+
+    /// `build_neighbor_graph`'s actual materializer — see
+    /// `Self::infer_materialize`'s doc for the `job_attempt` convention
+    /// every `*_materialize` method shares.
     ///
     /// The build resolves the input embedding table through the same
     /// tenant-scoped catalog path `search` uses: when a tenant is bound it runs
@@ -1070,18 +1484,13 @@ impl InferenceSession {
     /// The default driver is index-assisted and produces an *approximate*,
     /// *non-deterministic* graph; set `BuildNeighborGraph::exact` for a
     /// deterministic, complete one (gated by a row-count ceiling).
-    /// `cache` opts the build into memoization: under
-    /// [`CachePolicy::Use`](jammi_db::store::CachePolicy::Use) an exact prior
-    /// materialisation (same definition over the same source-table digest) is
-    /// reused instead of rebuilt, and the returned
-    /// [`CacheOutcome`](jammi_db::store::CacheOutcome) reports which path ran. The
-    /// default [`Bypass`](jammi_db::store::CachePolicy::Bypass) always rebuilds.
-    pub async fn build_neighbor_graph(
+    pub(crate) async fn build_neighbor_graph_materialize(
         &self,
         source_id: &str,
         embedding_table: Option<&str>,
         params: &crate::pipeline::neighbor_graph::BuildNeighborGraph,
         cache: jammi_db::store::CachePolicy,
+        job_attempt: Option<jammi_db::catalog::result_repo::JobAttempt<'_>>,
     ) -> Result<(ResultTableRecord, jammi_db::store::CacheOutcome)> {
         match self.tenant() {
             // A bound tenant runs the build inside its scope, so the catalog
@@ -1093,7 +1502,7 @@ impl InferenceSession {
                         self,
                         self.result_store.as_ref(),
                     )
-                    .run(source_id, embedding_table, params, cache)
+                    .run(source_id, embedding_table, params, cache, job_attempt)
                     .await
                 })
                 .await
@@ -1103,38 +1512,78 @@ impl InferenceSession {
                     self,
                     self.result_store.as_ref(),
                 )
-                .run(source_id, embedding_table, params, cache)
+                .run(source_id, embedding_table, params, cache, job_attempt)
                 .await
             }
         }
     }
 
-    /// Assemble a point-in-time-correct table: for each row of `spine`, attach
-    /// the `facts` row valid as-of the spine row's temporal key, within each
-    /// equality group. Writes a result table (carrying the materialization
-    /// manifest) and returns its record. Left rows are always preserved;
-    /// unmatched fact columns are null.
+    /// Assemble a point-in-time-correct table — the thin [`Self::run_now`]
+    /// wrapper (item 2/K4): submits a [`crate::jobs::ComputeSpec::AsofJoin`]
+    /// and returns the terminal [`ResultTableRecord`] [`Self::run_now`]
+    /// produced, so a direct call and a queued-and-claimed `asof_join` job of
+    /// the same spec run identical code
+    /// (`Self::asof_join_materialize`, through
+    /// [`crate::jobs::execute_compute`]).
     ///
-    /// `spine` and `facts` are registered source ids. Both are resolved through
-    /// the session's tenant-scoped catalog: when a tenant is bound the join runs
-    /// inside that tenant's scope, so a caller cannot point either side at
-    /// another tenant's relation. The [`AsofJoinSpec`](crate::pipeline::asof::AsofJoinSpec)
-    /// carries the four pinned knobs (direction, boundary, tolerance, tie-break)
-    /// and the equality/temporal key roles.
+    /// `spine` and `facts` are registered source ids. The
+    /// [`AsofJoinSpec`](crate::pipeline::asof::AsofJoinSpec) carries the four
+    /// pinned knobs (direction, boundary, tolerance, tie-break) and the
+    /// equality/temporal key roles. An as-of join always recomputes — it has
+    /// no cache-opt-in surface (every input is honestly `UnpinnedAtInstant`).
     pub async fn asof_join(
-        &self,
+        self: &Arc<Self>,
         spine: &str,
         facts: &str,
         spec: &crate::pipeline::asof::AsofJoinSpec,
     ) -> Result<ResultTableRecord> {
+        let job_spec = crate::jobs::ComputeSpec::AsofJoin {
+            spine: spine.to_string(),
+            facts: facts.to_string(),
+            spec: spec.clone(),
+        };
+        match self.run_now(job_spec).await? {
+            crate::jobs::JobResult::Table { table, .. } => self
+                .catalog()
+                .get_result_table(&table)
+                .await?
+                .ok_or_else(|| {
+                    JammiError::Catalog(format!(
+                        "asof_join: run_now's own table '{table}' vanished before it could be \
+                         read back"
+                    ))
+                }),
+            crate::jobs::JobResult::Model { .. } => Err(JammiError::Inference(
+                "asof_join: run_now returned a training JobResult for a compute spec".into(),
+            )),
+        }
+    }
+
+    /// `asof_join`'s actual materializer — see `Self::infer_materialize`'s
+    /// doc for the `job_attempt` convention every `*_materialize` method
+    /// shares.
+    ///
+    /// Writes a result table (carrying the materialization manifest) and
+    /// returns its record. Left rows are always preserved; unmatched fact
+    /// columns are null. Both relations are resolved through the session's
+    /// tenant-scoped catalog: when a tenant is bound the join runs inside that
+    /// tenant's scope, so a caller cannot point either side at another
+    /// tenant's relation.
+    pub(crate) async fn asof_join_materialize(
+        &self,
+        spine: &str,
+        facts: &str,
+        spec: &crate::pipeline::asof::AsofJoinSpec,
+        job_attempt: Option<jammi_db::catalog::result_repo::JobAttempt<'_>>,
+    ) -> Result<ResultTableRecord> {
         match self.tenant() {
             Some(tenant) => {
                 self.with_tenant_scoped(tenant, |_scope| async move {
-                    crate::pipeline::asof::verb::run(self, spine, facts, spec).await
+                    crate::pipeline::asof::verb::run(self, spine, facts, spec, job_attempt).await
                 })
                 .await
             }
-            None => crate::pipeline::asof::verb::run(self, spine, facts, spec).await,
+            None => crate::pipeline::asof::verb::run(self, spine, facts, spec, job_attempt).await,
         }
     }
 
@@ -1146,7 +1595,7 @@ impl InferenceSession {
     ///
     /// Persists a self-describing [`TrainingSpec::FineTune`] into a `queued`
     /// catalog job and returns a [`TrainingJob`] handle immediately — the
-    /// training runs later under a [`crate::fine_tune::worker::TrainingWorker`]
+    /// training runs later under a [`crate::fine_tune::worker::JobWorker`]
     /// that claims the job under a lease, reconstructs the data loader from the
     /// persisted source + columns, and trains while heartbeating. Call
     /// `job.wait().await` to block until a worker drives the job to a terminal
@@ -1163,7 +1612,6 @@ impl InferenceSession {
         let config = config.unwrap_or_default();
         config.validate()?;
 
-        let loss_type = fine_tune_loss_type(&config, task);
         let spec = TrainingSpec::FineTune {
             source: source.to_string(),
             columns: columns.to_vec(),
@@ -1174,34 +1622,129 @@ impl InferenceSession {
                 config: config.clone(),
             },
         };
-        self.submit_fine_tune_spec(source, base_model, task, &config, &loss_type, spec)
-            .await
+        self.submit_fine_tune_spec(spec).await
     }
 
     /// Submit a job carrying one of the two LoRA fine-tune specs. Shared by the
     /// column-source [`Self::fine_tune`] and the graph [`Self::fine_tune_graph`]
     /// paths — the only thing that differs upstream is which spec variant is
     /// built. No data is read and no model is loaded here; the worker does both
-    /// from the persisted spec.
-    async fn submit_fine_tune_spec(
+    /// from the persisted spec. The row's `model_ref`/`output_model_id` come
+    /// from [`Self::training_job_links`], the one derivation `enqueue` and
+    /// the context-predictor submit share.
+    async fn submit_fine_tune_spec(&self, spec: TrainingSpec) -> Result<TrainingJob> {
+        self.submit_fine_tune_spec_deduped(spec, None).await
+    }
+
+    /// [`Self::submit_fine_tune_spec`], additionally deduped by an optional
+    /// per-tenant `idempotency_key` (migration 030) via
+    /// [`jammi_db::catalog::Catalog::submit_job_deduped`] — see that
+    /// method's doc for the atomicity guarantee. `idempotency_key` of `None`
+    /// always inserts fresh, matching [`Self::submit_fine_tune_spec`]
+    /// byte-for-byte (every embedded caller of that method routes through
+    /// here with `None`). `Some(key)` that collides with a still-known prior
+    /// submission returns THAT job's handle — re-read from its catalog row,
+    /// never the handle this call would have minted — so a caller cannot
+    /// observe two different in-memory handles for what the catalog now
+    /// records as one job.
+    async fn submit_fine_tune_spec_deduped(
         &self,
-        training_source: &str,
-        base_model: &str,
-        task: ModelTask,
-        config: &FineTuneConfig,
-        loss_type: &str,
         spec: TrainingSpec,
+        idempotency_key: Option<&str>,
     ) -> Result<TrainingJob> {
         let job_id = uuid::Uuid::new_v4().to_string();
-        let output_model_id = fine_tuned_model_id(&job_id);
+        let links = self.training_job_links(&spec, &job_id).await?;
+        let spec_json = serde_json::to_string(&spec)?;
+        let recorded_job_id = self
+            .inner
+            .catalog()
+            .submit_job_deduped(
+                jammi_db::catalog::jobs_repo::SubmitJobParams {
+                    job_id: &job_id,
+                    kind: spec.kind(),
+                    execution: jammi_db::catalog::status::JobExecution::Queued,
+                    spec: &spec_json,
+                    model_ref: Some(&links.model_ref),
+                    output_model_id: Some(&links.output_model_id),
+                    model_source: None,
+                    priority: 0,
+                },
+                idempotency_key,
+            )
+            .await?;
 
+        if recorded_job_id == job_id {
+            Ok(TrainingJob::new(
+                job_id,
+                "queued".into(),
+                links.output_model_id,
+                Arc::clone(self.inner.catalog()),
+            ))
+        } else {
+            // A concurrent or prior call already holds this idempotency key
+            // — the durable row of record, not this call's own (unused)
+            // job_id. Re-read its current state rather than guessing
+            // `"queued"`: a racing caller may observe it already claimed.
+            let record = self.inner.catalog().get_job(&recorded_job_id).await?;
+            let model_id = resolve_model_id(&recorded_job_id, &record)?;
+            Ok(TrainingJob::new(
+                recorded_job_id,
+                record.status,
+                model_id,
+                Arc::clone(self.inner.catalog()),
+            ))
+        }
+    }
+
+    /// The two model-side links every training kind's `jobs` row carries,
+    /// derived ONCE for every submitter — the dedicated entry points
+    /// ([`Self::fine_tune`], [`Self::fine_tune_graph`],
+    /// [`Self::train_context_predictor`]) and the generic
+    /// [`Self::enqueue`] alike — so a row cannot be linked differently
+    /// depending on which door it came through. `model_ref` is the base
+    /// model's catalog PK (the row is registered first when absent);
+    /// `output_model_id` is the NAME the finish CAS mints the output under
+    /// (`fine_tuned_model_id(job_id)` for the two LoRA kinds, the spec's
+    /// own `model_id` for a context predictor).
+    pub(crate) async fn training_job_links(
+        &self,
+        spec: &TrainingSpec,
+        job_id: &str,
+    ) -> Result<TrainingJobLinks> {
+        match spec {
+            TrainingSpec::FineTune { task, common, .. } => Ok(TrainingJobLinks {
+                model_ref: self.ensure_base_model_pk(&common.base_model, *task).await?,
+                output_model_id: fine_tuned_model_id(job_id),
+            }),
+            // A graph fine-tune trains a text-embedding metric over the node
+            // source's text; the edges only supervise the pairing.
+            TrainingSpec::GraphFineTune { common, .. } => Ok(TrainingJobLinks {
+                model_ref: self
+                    .ensure_base_model_pk(&common.base_model, ModelTask::TextEmbedding)
+                    .await?,
+                output_model_id: fine_tuned_model_id(job_id),
+            }),
+            TrainingSpec::ContextPredictor {
+                source,
+                predictor_spec,
+            } => Ok(TrainingJobLinks {
+                model_ref: self.context_predictor_base_model_pk(source).await?,
+                output_model_id: predictor_spec.model_id.clone(),
+            }),
+        }
+    }
+
+    /// Resolve `base_model` to its catalog PK, registering the row first
+    /// when the catalog has none (the worker resolves the same row when it
+    /// loads weights). The `jobs.model_ref` FK must bind to the RESOLVED
+    /// row's PK, not a reconstructed `name::version`: a tenant fine-tuning
+    /// a global base model references the global (unqualified) PK, and one
+    /// fine-tuning its own model references its tenant-qualified PK — the
+    /// resolved record's `catalog_pk` carries whichever applies.
+    async fn ensure_base_model_pk(&self, base_model: &str, task: ModelTask) -> Result<String> {
         // Parse model source to get the canonical name (what ModelCache uses for
         // registration).
-        let model_source = ModelSource::parse(base_model);
-        let canonical_name = model_source.to_string();
-
-        // Ensure the base model is registered in the catalog (FK constraint on
-        // training_jobs). The worker resolves the same row when it loads weights.
+        let canonical_name = ModelSource::parse(base_model).to_string();
         if self.catalog().get_model(&canonical_name).await?.is_none() {
             if let Err(e) = self
                 .catalog()
@@ -1220,14 +1763,7 @@ impl InferenceSession {
                 tracing::error!(model_id = %canonical_name, error = %e, "Failed to register base model in catalog");
             }
         }
-
-        let hyperparams = serde_json::to_string(config)?;
-        // The base-model FK must bind to the resolved row's catalog PK, not a
-        // reconstructed `name::version`: a tenant fine-tuning a global base model
-        // references the global (unqualified) PK, and one fine-tuning its own
-        // model references its tenant-qualified PK — the resolved record's
-        // `catalog_pk` carries whichever applies.
-        let base_model_pk = self
+        Ok(self
             .catalog()
             .get_model(&canonical_name)
             .await?
@@ -1236,27 +1772,7 @@ impl InferenceSession {
                     "Base model '{canonical_name}' not registered in catalog"
                 ))
             })?
-            .catalog_pk;
-        let spec_json = serde_json::to_string(&spec)?;
-        self.inner
-            .catalog()
-            .create_training_job(jammi_db::catalog::training_repo::CreateTrainingJobParams {
-                job_id: &job_id,
-                base_model_id: &base_model_pk,
-                training_source,
-                loss_type,
-                hyperparams: &hyperparams,
-                kind: spec.kind(),
-                training_spec: &spec_json,
-            })
-            .await?;
-
-        Ok(TrainingJob::new(
-            job_id,
-            "queued".into(),
-            output_model_id,
-            Arc::clone(self.inner.catalog()),
-        ))
+            .catalog_pk)
     }
 
     /// Graph-supervised fine-tune (S11): learn an embedding metric that encodes
@@ -1292,8 +1808,6 @@ impl InferenceSession {
         // The graph is read and re-sampled by the worker from the persisted
         // sources + seeded sample_config (deterministic), never from in-memory
         // batches carried across the submit boundary.
-        let task = ModelTask::TextEmbedding;
-        let loss_type = fine_tune_loss_type(&config, task);
         let spec = TrainingSpec::GraphFineTune {
             sources: sources.clone(),
             sample_config,
@@ -1302,15 +1816,7 @@ impl InferenceSession {
                 config: config.clone(),
             },
         };
-        self.submit_fine_tune_spec(
-            &sources.node_source,
-            base_model,
-            task,
-            &config,
-            &loss_type,
-            spec,
-        )
-        .await
+        self.submit_fine_tune_spec(spec).await
     }
 
     /// Run a decoded [`TrainingSpec`] on this session, dispatching each variant
@@ -1322,41 +1828,52 @@ impl InferenceSession {
     /// identical job on either transport. The dispatch lives once, beside the
     /// entry points it calls, rather than being re-written per transport.
     pub async fn run_training_spec(self: &Arc<Self>, spec: TrainingSpec) -> Result<TrainingJob> {
-        match spec {
-            TrainingSpec::FineTune {
-                source,
-                columns,
-                method,
-                task,
-                common,
-            } => {
-                self.fine_tune(
-                    &source,
-                    &common.base_model,
-                    &columns,
-                    method,
-                    task,
-                    Some(common.config),
-                )
-                .await
-            }
+        self.run_training_spec_deduped(spec, None).await
+    }
+
+    /// [`Self::run_training_spec`], additionally deduped by an optional
+    /// per-tenant `idempotency_key` (migration 030) — the seam
+    /// `JobService::submit_job`'s gRPC handler drives (the only caller that
+    /// has a wire-supplied key; [`Self::run_training_spec`] and every other
+    /// caller — the Python binding included — routes through here with
+    /// `None`, byte-identical to before this method existed).
+    ///
+    /// Runs the SAME per-kind validation the embedded entry points
+    /// ([`Self::fine_tune`], [`Self::fine_tune_graph`],
+    /// [`Self::train_context_predictor`]) apply, then submits directly
+    /// through the deduped catalog seam — `spec` is already fully formed
+    /// here (decoded off the wire or handed in by a caller), so there is no
+    /// need to re-destructure it through those entry points' own
+    /// loose-argument constructors only to rebuild the identical spec.
+    pub async fn run_training_spec_deduped(
+        self: &Arc<Self>,
+        spec: TrainingSpec,
+        idempotency_key: Option<&str>,
+    ) -> Result<TrainingJob> {
+        match &spec {
+            TrainingSpec::FineTune { common, .. } => common.config.validate()?,
             TrainingSpec::GraphFineTune {
-                sources,
-                sample_config,
                 common,
+                sample_config,
+                ..
             } => {
-                self.fine_tune_graph(
-                    &sources,
-                    &common.base_model,
-                    sample_config,
-                    Some(common.config),
-                )
-                .await
+                common.config.validate()?;
+                sample_config.validate()?;
             }
+            TrainingSpec::ContextPredictor { predictor_spec, .. } => predictor_spec.validate()?,
+        }
+        match spec {
             TrainingSpec::ContextPredictor {
                 source,
                 predictor_spec,
-            } => self.train_context_predictor(&source, &predictor_spec).await,
+            } => {
+                self.train_context_predictor_deduped(&source, &predictor_spec, idempotency_key)
+                    .await
+            }
+            other => {
+                self.submit_fine_tune_spec_deduped(other, idempotency_key)
+                    .await
+            }
         }
     }
 
@@ -1446,6 +1963,105 @@ impl InferenceSession {
         EvalRunner { session: self }
             .eval_calibration(source_id, golden_source, shape, cohorts)
             .await
+    }
+}
+
+/// The ONE query string both `infer` arms (the fresh-compute finish and the
+/// exact-cache-hit short-circuit) issue to read an inference result table
+/// back — a shared function so the two arms cannot drift into two
+/// independently-typed strings that happen to agree today. Orders by
+/// `(_row_id, _ordinal)`: `_row_id` alone is not enough (a source can key
+/// multiple rows under one id), so `_ordinal` — the stream-scoped monotonic
+/// counter [`crate::inference::schema::common_prefix_fields`] documents —
+/// breaks every tie in the order the model actually emitted the rows,
+/// regardless of how the underlying Parquet scan or model batches arrive on
+/// a later read.
+fn infer_ordered_read_back_sql(table: &str) -> String {
+    format!("SELECT * FROM \"jammi.{table}\" ORDER BY _row_id, _ordinal")
+}
+
+/// Normalize every `Utf8View`/`BinaryView` column of `batches` back to the
+/// plain `Utf8`/`Binary` arrow-rs types they were built from —
+/// the registered result-table scan
+/// ([`jammi_db::store::ResultStore::register_table`]'s doc: "the resolved
+/// Arrow schema (Utf8View under the Arrow parquet-reader default) matches")
+/// widens string columns to the View encoding on every read-back, which
+/// [`InferenceSession::infer`]'s ordered read-back (item 6) now takes on
+/// BOTH arms — so without this normalization a caller downcasting `_status`/
+/// `_error`/a string task column to `StringArray` would see a shape it
+/// never saw before this item's read-back-on-every-arm change, purely as an
+/// accidental side effect of routing through SQL rather than returning the
+/// in-memory compute batch. Every OTHER column (including `_ordinal`
+/// itself) passes through unchanged.
+fn normalize_view_columns(batch: &RecordBatch) -> Result<RecordBatch> {
+    let schema = batch.schema();
+    let mut changed = false;
+    let mut fields = Vec::with_capacity(schema.fields().len());
+    let mut columns: Vec<arrow::array::ArrayRef> = Vec::with_capacity(schema.fields().len());
+    for (field, col) in schema.fields().iter().zip(batch.columns()) {
+        let target = match field.data_type() {
+            arrow::datatypes::DataType::Utf8View => Some(arrow::datatypes::DataType::Utf8),
+            arrow::datatypes::DataType::BinaryView => Some(arrow::datatypes::DataType::Binary),
+            _ => None,
+        };
+        match target {
+            Some(target_ty) => {
+                changed = true;
+                let cast = arrow::compute::cast(col, &target_ty).map_err(|e| {
+                    JammiError::Inference(format!(
+                        "infer read-back: normalizing column '{}' from {:?} to {target_ty:?}: {e}",
+                        field.name(),
+                        field.data_type()
+                    ))
+                })?;
+                fields.push(std::sync::Arc::new(arrow::datatypes::Field::new(
+                    field.name(),
+                    target_ty,
+                    field.is_nullable(),
+                )));
+                columns.push(cast);
+            }
+            None => {
+                fields.push(std::sync::Arc::clone(field));
+                columns.push(std::sync::Arc::clone(col));
+            }
+        }
+    }
+    if !changed {
+        return Ok(batch.clone());
+    }
+    let new_schema = std::sync::Arc::new(arrow::datatypes::Schema::new(fields));
+    RecordBatch::try_new(new_schema, columns)
+        .map_err(|e| JammiError::Inference(format!("infer read-back: rebuild batch: {e}")))
+}
+
+/// [`normalize_view_columns`] applied over a whole read-back result set.
+fn normalize_view_batches(batches: Vec<RecordBatch>) -> Result<Vec<RecordBatch>> {
+    batches.iter().map(normalize_view_columns).collect()
+}
+
+/// Parse [`crate::jobs::JobResult::Table::cache_outcome`]'s string encoding
+/// (`"computed"` or `"reused:{table}"`, written by
+/// [`crate::jobs::execute_compute`]'s `table_result`) back into a typed
+/// [`jammi_db::store::CacheOutcome`] — the inverse [`Self::infer`] (and every
+/// other `run_now`-wrapped verb) applies to its `run_now` result before
+/// returning it in the SAME typed shape the direct (pre-`run_now`) call
+/// returned.
+pub(crate) fn parse_cache_outcome(
+    cache_outcome: &str,
+    table: &str,
+) -> jammi_db::store::CacheOutcome {
+    match cache_outcome.strip_prefix("reused:") {
+        Some(reused_table) => jammi_db::store::CacheOutcome::Reused {
+            table: reused_table.to_string(),
+        },
+        None => {
+            debug_assert_eq!(
+                cache_outcome, "computed",
+                "table '{table}': unrecognised cache_outcome encoding '{cache_outcome}'"
+            );
+            jammi_db::store::CacheOutcome::Computed
+        }
     }
 }
 
@@ -1539,26 +2155,6 @@ fn build_result_store(
         None => ResultStore::new(inner.config().artifact_dir.as_path(), catalog, ann),
     }?;
     Ok(store.with_lease_intervals(lease))
-}
-
-/// The `loss_type` string persisted on a fine-tune job — a human-readable tag of
-/// the objective selected by the task + config, recorded in the catalog
-/// alongside the spec. The task selects the family (classification / regression /
-/// embedding) and the config its specific loss.
-fn fine_tune_loss_type(config: &FineTuneConfig, task: ModelTask) -> String {
-    if task == ModelTask::Classification {
-        config
-            .classification_loss
-            .map(|l| format!("{l:?}"))
-            .unwrap_or_else(|| "CrossEntropy".into())
-    } else if task == ModelTask::Regression {
-        format!("{:?}", config.regression_loss.unwrap_or_default())
-    } else {
-        config
-            .embedding_loss
-            .map(|l| format!("{l:?}"))
-            .unwrap_or_else(|| "auto".into())
-    }
 }
 
 #[cfg(test)]

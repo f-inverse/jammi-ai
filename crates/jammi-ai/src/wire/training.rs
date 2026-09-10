@@ -1,11 +1,11 @@
-//! `TrainingService` spec-oneof ↔ engine `TrainingSpec` conversions.
+//! `JobService.SubmitJob` spec-oneof ↔ engine `TrainingSpec` conversions.
 //!
 //! The transport-neutral `FineTuneConfig` / method conversions live on the wire
 //! substrate ([`jammi_wire`]); what stays here are the conversions that touch the
 //! engine spec vocabulary (`TrainingSpec`, the graph sampler, the
 //! context-predictor config), which is only reachable in a `local` build.
 //!
-//! The `StartTraining` spec `oneof` mirrors the engine's [`TrainingSpec`] enum
+//! The `SubmitJob` spec `oneof` mirrors the engine's [`TrainingSpec`] enum
 //! variant-for-variant, field-for-field: a decoded request reconstructs the
 //! identical engine spec, so a remote-submitted job is byte-identical to one
 //! submitted in-process. Validation stays in the engine (the submit verbs call
@@ -21,12 +21,13 @@ use crate::pipeline::context_predictor::{
     ContextArchitecture, ContextPredictorTrainConfig, GaussianObjective, PredictiveHead,
 };
 
-use jammi_wire::proto::training as pb;
+use jammi_wire::proto::job as pb;
+use jammi_wire::proto::training as training_pb;
 use jammi_wire::{
     config_to_proto, method_from_proto, method_to_proto, model_task_from_proto, model_task_to_proto,
 };
 
-// ─── StartTraining spec oneof ↔ engine TrainingSpec ──────────────────────────
+// ─── SubmitJob spec oneof ↔ engine TrainingSpec ──────────────────────────────
 //
 // The `oneof` carries the verb that produced the job; decode reconstructs the
 // engine [`TrainingSpec`] field-for-field so a worker re-runs the identical job.
@@ -34,32 +35,32 @@ use jammi_wire::{
 // common `base_model`/`config` fields (folded into [`TrainingCommon`]); the
 // context-predictor kind carries its full budget inside `predictor_spec`.
 
-/// Decode a serialized [`pb::StartTrainingRequest`] body into the engine
+/// Decode a serialized [`pb::SubmitJobRequest`] body into the engine
 /// [`TrainingSpec`]. The embedded binding builds the request with the same
 /// pure-Python assembly the remote client uses, serializes it, and hands the
 /// bytes here — so the in-process and remote submit paths decode through one
 /// shared seam ([`training_spec_from_proto`]). A body that is not a valid
-/// `StartTrainingRequest` is a client error (`InvalidArgument`), matching how a
+/// `SubmitJobRequest` is a client error (`InvalidArgument`), matching how a
 /// malformed spec is rejected.
 pub fn training_spec_from_bytes(body: &[u8]) -> Result<TrainingSpec, Status> {
-    let req = pb::StartTrainingRequest::decode(body)
-        .map_err(|e| Status::invalid_argument(format!("malformed StartTraining request: {e}")))?;
+    let req = pb::SubmitJobRequest::decode(body)
+        .map_err(|e| Status::invalid_argument(format!("malformed SubmitJob request: {e}")))?;
     training_spec_from_proto(req)
 }
 
-/// Decode a [`pb::StartTrainingRequest`] into the engine [`TrainingSpec`]. The
+/// Decode a [`pb::SubmitJobRequest`] into the engine [`TrainingSpec`]. The
 /// `oneof` selects the variant; `base_model`/`config` fold into the two LoRA
 /// kinds' [`TrainingCommon`]. A request with no spec set is malformed.
-pub fn training_spec_from_proto(req: pb::StartTrainingRequest) -> Result<TrainingSpec, Status> {
-    let pb::StartTrainingRequest {
+pub fn training_spec_from_proto(req: pb::SubmitJobRequest) -> Result<TrainingSpec, Status> {
+    let pb::SubmitJobRequest {
         spec,
         base_model,
         config,
+        idempotency_key: _,
     } = req;
-    let spec =
-        spec.ok_or_else(|| Status::invalid_argument("StartTraining request carries no spec"))?;
+    let spec = spec.ok_or_else(|| Status::invalid_argument("SubmitJob request carries no spec"))?;
     match spec {
-        pb::start_training_request::Spec::FineTune(ft) => {
+        pb::submit_job_request::Spec::FineTune(ft) => {
             let common = lora_common_from_proto(base_model, config)?;
             if ft.source.is_empty() {
                 return Err(Status::invalid_argument("source is required"));
@@ -78,7 +79,7 @@ pub fn training_spec_from_proto(req: pb::StartTrainingRequest) -> Result<Trainin
                 common,
             })
         }
-        pb::start_training_request::Spec::GraphFineTune(g) => {
+        pb::submit_job_request::Spec::GraphFineTune(g) => {
             let common = lora_common_from_proto(base_model, config)?;
             let sources = g.sources.ok_or_else(|| {
                 Status::invalid_argument("graph_fine_tune spec carries no sources")
@@ -92,7 +93,7 @@ pub fn training_spec_from_proto(req: pb::StartTrainingRequest) -> Result<Trainin
                 common,
             })
         }
-        pb::start_training_request::Spec::ContextPredictor(cp) => {
+        pb::submit_job_request::Spec::ContextPredictor(cp) => {
             let predictor_spec = cp.predictor_spec.ok_or_else(|| {
                 Status::invalid_argument("context_predictor spec carries no predictor_spec")
             })?;
@@ -105,11 +106,11 @@ pub fn training_spec_from_proto(req: pb::StartTrainingRequest) -> Result<Trainin
 }
 
 /// Encode the engine [`TrainingSpec`] (plus the common base-model + config the
-/// LoRA kinds carry) onto a [`pb::StartTrainingRequest`] — the inverse of
+/// LoRA kinds carry) onto a [`pb::SubmitJobRequest`] — the inverse of
 /// [`training_spec_from_proto`], for the remote send side. The context-predictor
 /// kind ignores `base_model`/`config` (its budget rides in `predictor_spec`), so
 /// they are left empty there.
-pub fn training_spec_to_proto(spec: &TrainingSpec) -> pb::StartTrainingRequest {
+pub fn training_spec_to_proto(spec: &TrainingSpec) -> pb::SubmitJobRequest {
     match spec {
         TrainingSpec::FineTune {
             source,
@@ -117,9 +118,9 @@ pub fn training_spec_to_proto(spec: &TrainingSpec) -> pb::StartTrainingRequest {
             method,
             task,
             common,
-        } => pb::StartTrainingRequest {
-            spec: Some(pb::start_training_request::Spec::FineTune(
-                pb::FineTuneSpec {
+        } => pb::SubmitJobRequest {
+            spec: Some(pb::submit_job_request::Spec::FineTune(
+                training_pb::FineTuneSpec {
                     source: source.clone(),
                     columns: columns.clone(),
                     method: method_to_proto(*method) as i32,
@@ -128,33 +129,36 @@ pub fn training_spec_to_proto(spec: &TrainingSpec) -> pb::StartTrainingRequest {
             )),
             base_model: common.base_model.clone(),
             config: Some(config_to_proto(&common.config)),
+            idempotency_key: String::new(),
         },
         TrainingSpec::GraphFineTune {
             sources,
             sample_config,
             common,
-        } => pb::StartTrainingRequest {
-            spec: Some(pb::start_training_request::Spec::GraphFineTune(
-                pb::GraphFineTuneSpec {
+        } => pb::SubmitJobRequest {
+            spec: Some(pb::submit_job_request::Spec::GraphFineTune(
+                training_pb::GraphFineTuneSpec {
                     sources: Some(graph_sources_to_proto(sources)),
                     sample_config: Some(graph_sample_config_to_proto(sample_config)),
                 },
             )),
             base_model: common.base_model.clone(),
             config: Some(config_to_proto(&common.config)),
+            idempotency_key: String::new(),
         },
         TrainingSpec::ContextPredictor {
             source,
             predictor_spec,
-        } => pb::StartTrainingRequest {
-            spec: Some(pb::start_training_request::Spec::ContextPredictor(
-                pb::ContextPredictorSpec {
+        } => pb::SubmitJobRequest {
+            spec: Some(pb::submit_job_request::Spec::ContextPredictor(
+                training_pb::ContextPredictorSpec {
                     source: source.clone(),
                     predictor_spec: Some(predictor_config_to_proto(predictor_spec)),
                 },
             )),
             base_model: String::new(),
             config: None,
+            idempotency_key: String::new(),
         },
     }
 }
@@ -164,7 +168,7 @@ pub fn training_spec_to_proto(spec: &TrainingSpec) -> pb::StartTrainingRequest {
 /// client error (the worker has nothing to adapt).
 fn lora_common_from_proto(
     base_model: String,
-    config: Option<pb::FineTuneConfig>,
+    config: Option<training_pb::FineTuneConfig>,
 ) -> Result<TrainingCommon, Status> {
     if base_model.is_empty() {
         return Err(Status::invalid_argument("base_model is required"));
@@ -176,7 +180,9 @@ fn lora_common_from_proto(
     Ok(TrainingCommon { base_model, config })
 }
 
-fn graph_sources_from_proto(s: pb::GraphFineTuneSources) -> Result<GraphFineTuneSources, Status> {
+fn graph_sources_from_proto(
+    s: training_pb::GraphFineTuneSources,
+) -> Result<GraphFineTuneSources, Status> {
     Ok(GraphFineTuneSources {
         node_source: s.node_source,
         id_column: s.id_column,
@@ -188,8 +194,8 @@ fn graph_sources_from_proto(s: pb::GraphFineTuneSources) -> Result<GraphFineTune
     })
 }
 
-fn graph_sources_to_proto(s: &GraphFineTuneSources) -> pb::GraphFineTuneSources {
-    pb::GraphFineTuneSources {
+fn graph_sources_to_proto(s: &GraphFineTuneSources) -> training_pb::GraphFineTuneSources {
+    training_pb::GraphFineTuneSources {
         node_source: s.node_source.clone(),
         id_column: s.id_column.clone(),
         text_column: s.text_column.clone(),
@@ -201,23 +207,23 @@ fn graph_sources_to_proto(s: &GraphFineTuneSources) -> pb::GraphFineTuneSources 
 }
 
 fn edge_provenance_from_proto(p: i32) -> Result<EdgeProvenance, Status> {
-    match pb::EdgeProvenance::try_from(p) {
-        Ok(pb::EdgeProvenance::Declared) => Ok(EdgeProvenance::Declared),
-        Ok(pb::EdgeProvenance::Similarity) => Ok(EdgeProvenance::Similarity),
-        Ok(pb::EdgeProvenance::Unspecified) | Err(_) => Err(Status::invalid_argument(
+    match training_pb::EdgeProvenance::try_from(p) {
+        Ok(training_pb::EdgeProvenance::Declared) => Ok(EdgeProvenance::Declared),
+        Ok(training_pb::EdgeProvenance::Similarity) => Ok(EdgeProvenance::Similarity),
+        Ok(training_pb::EdgeProvenance::Unspecified) | Err(_) => Err(Status::invalid_argument(
             "edge provenance must be DECLARED or SIMILARITY",
         )),
     }
 }
 
-fn edge_provenance_to_proto(p: EdgeProvenance) -> pb::EdgeProvenance {
+fn edge_provenance_to_proto(p: EdgeProvenance) -> training_pb::EdgeProvenance {
     match p {
-        EdgeProvenance::Declared => pb::EdgeProvenance::Declared,
-        EdgeProvenance::Similarity => pb::EdgeProvenance::Similarity,
+        EdgeProvenance::Declared => training_pb::EdgeProvenance::Declared,
+        EdgeProvenance::Similarity => training_pb::EdgeProvenance::Similarity,
     }
 }
 
-fn graph_sample_config_from_proto(c: pb::GraphSampleConfig) -> GraphSampleConfig {
+fn graph_sample_config_from_proto(c: training_pb::GraphSampleConfig) -> GraphSampleConfig {
     GraphSampleConfig {
         walk_length: c.walk_length as usize,
         walks_per_node: c.walks_per_node as usize,
@@ -230,8 +236,8 @@ fn graph_sample_config_from_proto(c: pb::GraphSampleConfig) -> GraphSampleConfig
     }
 }
 
-fn graph_sample_config_to_proto(c: &GraphSampleConfig) -> pb::GraphSampleConfig {
-    pb::GraphSampleConfig {
+fn graph_sample_config_to_proto(c: &GraphSampleConfig) -> training_pb::GraphSampleConfig {
+    training_pb::GraphSampleConfig {
         walk_length: c.walk_length as u32,
         walks_per_node: c.walks_per_node as u32,
         return_p: c.return_p,
@@ -244,7 +250,7 @@ fn graph_sample_config_to_proto(c: &GraphSampleConfig) -> pb::GraphSampleConfig 
 }
 
 fn predictor_config_from_proto(
-    c: pb::ContextPredictorTrainConfig,
+    c: training_pb::ContextPredictorTrainConfig,
 ) -> Result<ContextPredictorTrainConfig, Status> {
     let head = c
         .head
@@ -269,8 +275,10 @@ fn predictor_config_from_proto(
     })
 }
 
-fn predictor_config_to_proto(c: &ContextPredictorTrainConfig) -> pb::ContextPredictorTrainConfig {
-    pb::ContextPredictorTrainConfig {
+fn predictor_config_to_proto(
+    c: &ContextPredictorTrainConfig,
+) -> training_pb::ContextPredictorTrainConfig {
+    training_pb::ContextPredictorTrainConfig {
         model_id: c.model_id.clone(),
         architecture: context_architecture_to_proto(c.architecture) as i32,
         key_column: c.key_column.clone(),
@@ -291,26 +299,28 @@ fn predictor_config_to_proto(c: &ContextPredictorTrainConfig) -> pb::ContextPred
 }
 
 fn context_architecture_from_proto(a: i32) -> Result<ContextArchitecture, Status> {
-    match pb::ContextArchitecture::try_from(a) {
-        Ok(pb::ContextArchitecture::Cnp) => Ok(ContextArchitecture::Cnp),
-        Ok(pb::ContextArchitecture::AttnCnp) => Ok(ContextArchitecture::AttnCnp),
-        Ok(pb::ContextArchitecture::Tnp) => Ok(ContextArchitecture::Tnp),
-        Ok(pb::ContextArchitecture::Unspecified) | Err(_) => Err(Status::invalid_argument(
-            "context predictor architecture must be CNP, ATTN_CNP, or TNP",
-        )),
+    match training_pb::ContextArchitecture::try_from(a) {
+        Ok(training_pb::ContextArchitecture::Cnp) => Ok(ContextArchitecture::Cnp),
+        Ok(training_pb::ContextArchitecture::AttnCnp) => Ok(ContextArchitecture::AttnCnp),
+        Ok(training_pb::ContextArchitecture::Tnp) => Ok(ContextArchitecture::Tnp),
+        Ok(training_pb::ContextArchitecture::Unspecified) | Err(_) => {
+            Err(Status::invalid_argument(
+                "context predictor architecture must be CNP, ATTN_CNP, or TNP",
+            ))
+        }
     }
 }
 
-fn context_architecture_to_proto(a: ContextArchitecture) -> pb::ContextArchitecture {
+fn context_architecture_to_proto(a: ContextArchitecture) -> training_pb::ContextArchitecture {
     match a {
-        ContextArchitecture::Cnp => pb::ContextArchitecture::Cnp,
-        ContextArchitecture::AttnCnp => pb::ContextArchitecture::AttnCnp,
-        ContextArchitecture::Tnp => pb::ContextArchitecture::Tnp,
+        ContextArchitecture::Cnp => training_pb::ContextArchitecture::Cnp,
+        ContextArchitecture::AttnCnp => training_pb::ContextArchitecture::AttnCnp,
+        ContextArchitecture::Tnp => training_pb::ContextArchitecture::Tnp,
     }
 }
 
-fn predictive_head_from_proto(h: pb::PredictiveHead) -> Result<PredictiveHead, Status> {
-    use pb::predictive_head::Head;
+fn predictive_head_from_proto(h: training_pb::PredictiveHead) -> Result<PredictiveHead, Status> {
+    use training_pb::predictive_head::Head;
     match h.head {
         Some(Head::Gaussian(g)) => {
             let objective = g.objective.ok_or_else(|| {
@@ -327,21 +337,27 @@ fn predictive_head_from_proto(h: pb::PredictiveHead) -> Result<PredictiveHead, S
     }
 }
 
-fn predictive_head_to_proto(h: &PredictiveHead) -> pb::PredictiveHead {
-    use pb::predictive_head::Head;
+fn predictive_head_to_proto(h: &PredictiveHead) -> training_pb::PredictiveHead {
+    use training_pb::predictive_head::Head;
     let inner = match h {
-        PredictiveHead::Gaussian { objective } => Head::Gaussian(pb::predictive_head::Gaussian {
-            objective: Some(gaussian_objective_to_proto(*objective)),
-        }),
-        PredictiveHead::Quantile { levels } => Head::Quantile(pb::predictive_head::Quantile {
-            levels: levels.clone(),
-        }),
+        PredictiveHead::Gaussian { objective } => {
+            Head::Gaussian(training_pb::predictive_head::Gaussian {
+                objective: Some(gaussian_objective_to_proto(*objective)),
+            })
+        }
+        PredictiveHead::Quantile { levels } => {
+            Head::Quantile(training_pb::predictive_head::Quantile {
+                levels: levels.clone(),
+            })
+        }
     };
-    pb::PredictiveHead { head: Some(inner) }
+    training_pb::PredictiveHead { head: Some(inner) }
 }
 
-fn gaussian_objective_from_proto(o: pb::GaussianObjective) -> Result<GaussianObjective, Status> {
-    use pb::gaussian_objective::Objective;
+fn gaussian_objective_from_proto(
+    o: training_pb::GaussianObjective,
+) -> Result<GaussianObjective, Status> {
+    use training_pb::gaussian_objective::Objective;
     match o.objective {
         Some(Objective::Nll(n)) => Ok(GaussianObjective::Nll { beta: n.beta }),
         Some(Objective::Crps(_)) => Ok(GaussianObjective::Crps),
@@ -351,13 +367,15 @@ fn gaussian_objective_from_proto(o: pb::GaussianObjective) -> Result<GaussianObj
     }
 }
 
-fn gaussian_objective_to_proto(o: GaussianObjective) -> pb::GaussianObjective {
-    use pb::gaussian_objective::Objective;
+fn gaussian_objective_to_proto(o: GaussianObjective) -> training_pb::GaussianObjective {
+    use training_pb::gaussian_objective::Objective;
     let inner = match o {
-        GaussianObjective::Nll { beta } => Objective::Nll(pb::gaussian_objective::Nll { beta }),
-        GaussianObjective::Crps => Objective::Crps(pb::gaussian_objective::Crps {}),
+        GaussianObjective::Nll { beta } => {
+            Objective::Nll(training_pb::gaussian_objective::Nll { beta })
+        }
+        GaussianObjective::Crps => Objective::Crps(training_pb::gaussian_objective::Crps {}),
     };
-    pb::GaussianObjective {
+    training_pb::GaussianObjective {
         objective: Some(inner),
     }
 }
@@ -366,7 +384,7 @@ fn gaussian_objective_to_proto(o: GaussianObjective) -> pb::GaussianObjective {
 mod tests {
     use super::*;
 
-    /// Re-encode a [`pb::StartTrainingRequest`] into the spec it decoded from —
+    /// Re-encode a [`pb::SubmitJobRequest`] into the spec it decoded from —
     /// `training_spec_to_proto` then `training_spec_from_proto` — so a remote
     /// `GraphFineTune` job is byte-identical to the in-process one. Every field
     /// of the source spec is a distinctive non-default value, and every field of

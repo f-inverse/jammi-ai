@@ -156,6 +156,7 @@ async fn text_embeddings_via_open_clip_share_latent_dim_with_vision() {
             &["abstract".to_string()],
             "id",
             jammi_db::store::CachePolicy::Bypass,
+            None,
         )
         .await
         .unwrap()
@@ -192,10 +193,10 @@ mod live {
     // instances. `#[serial]` forces them to run one at a time so the cache
     // populates cleanly on the first attempt.
 
-    async fn setup_with_patents() -> (InferenceSession, tempfile::TempDir) {
+    async fn setup_with_patents() -> (Arc<InferenceSession>, tempfile::TempDir) {
         let dir = tempdir().unwrap();
         let config = common::test_config(dir.path());
-        let session = InferenceSession::new(config).await.unwrap();
+        let session = Arc::new(InferenceSession::new(config).await.unwrap());
         session
             .add_source(
                 "patents",
@@ -548,6 +549,7 @@ mod live {
                 "img",
                 "fid",
                 jammi_db::store::CachePolicy::Bypass,
+                None,
             )
             .await
             .unwrap()

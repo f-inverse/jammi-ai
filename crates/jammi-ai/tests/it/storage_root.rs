@@ -46,6 +46,7 @@ async fn inference_session_roots_result_tables_at_configured_memory_root() {
             None,
             None,
             None,
+            None,
         )
         .await
         .unwrap();

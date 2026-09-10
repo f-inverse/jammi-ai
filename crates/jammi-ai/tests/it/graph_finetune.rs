@@ -442,11 +442,7 @@ async fn fine_tune_graph_end_to_end_completes() {
 
     job.wait().await.unwrap();
 
-    let record = session
-        .catalog()
-        .get_training_job(&job.job_id)
-        .await
-        .unwrap();
+    let record = session.catalog().get_job(&job.job_id).await.unwrap();
     assert_eq!(
         record.status, "completed",
         "graph fine-tune job should complete, got {}",
@@ -547,10 +543,6 @@ async fn fine_tune_graph_isolated_graph_fails() {
         result.is_err(),
         "an isolated graph (no edges) must drive the job to a typed failure"
     );
-    let record = session
-        .catalog()
-        .get_training_job(&job.job_id)
-        .await
-        .unwrap();
+    let record = session.catalog().get_job(&job.job_id).await.unwrap();
     assert_eq!(record.status, "failed");
 }

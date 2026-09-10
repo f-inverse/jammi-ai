@@ -404,7 +404,7 @@ job.wait()  # raises on divergence/failure rather than returning silently
 print(f"status: {job.status()}")
 assert job.status() == "completed"
 
-model_id = job.model_id
+model_id = job.output_model_id
 assert model_id.startswith("jammi:fine-tuned:")
 print(f"model_id: {model_id}")
 

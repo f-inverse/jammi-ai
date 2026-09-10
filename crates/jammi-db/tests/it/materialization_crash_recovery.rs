@@ -110,6 +110,7 @@ async fn child_workload() {
             Some(DIMS as i32),
             Some("_row_id"),
             Some("body"),
+            None,
         )
         .await
         .unwrap();

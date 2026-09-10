@@ -38,6 +38,16 @@ use crate::tenant_resolver_layer::TenantResolverLayer;
 
 /// Start an Arrow Flight SQL server alone on `addr`. Single-tenant or
 /// in-process embedding shape.
+///
+/// NOT BOUNDED: this standalone entry point does not go through
+/// `assemble_grpc_chain`, so it carries NONE of `[server.limits]` — no
+/// `max_message_bytes` decode cap (unlike every service `assemble_grpc_chain`
+/// mounts, which is built with `.max_decoding_message_size` per N5 in
+/// `crate::limits`'s module docs), no in-flight/per-connection bound, no
+/// wait-timeout or stream-budget enforcement. A deployment that needs those
+/// bounds on its Flight SQL surface should reach it through the full chain
+/// (`assemble_grpc_chain` → [`crate::runtime::AssembledChain`]) instead of
+/// this function.
 pub async fn serve_flight(
     ctx: &SessionContext,
     addr: SocketAddr,
@@ -53,6 +63,13 @@ pub async fn serve_flight(
 /// [`TenantBoundProvider`], the `CatalogService` via the async
 /// [`TenantResolverLayer`] — the same single-binder mechanism the full gRPC
 /// chain uses.
+///
+/// NOT BOUNDED (same caveat as [`serve_flight`]): this is a standalone
+/// `Server::builder()` assembly, not `assemble_grpc_chain`, so it carries none
+/// of `[server.limits]` — no `max_message_bytes` decode cap, no in-flight/
+/// per-connection bound, no wait-timeout or stream-budget enforcement. A
+/// deployment that needs those bounds should reach the engine through the full
+/// chain instead of this function.
 pub async fn serve_flight_with_catalog_service(
     base_ctx: &SessionContext,
     base_tenant_binding: TenantBinding,
@@ -76,7 +93,7 @@ pub async fn serve_flight_with_catalog_service(
     let catalog_svc =
         TenantResolverLayer::new(resolver).layer(CatalogServiceServer::new(CatalogServer::new(
             store,
-            crate::tiers::TierSet::resolve(std::iter::empty())?,
+            crate::tiers::TierSet::resolve(std::iter::empty()),
             None,
             None,
         )));

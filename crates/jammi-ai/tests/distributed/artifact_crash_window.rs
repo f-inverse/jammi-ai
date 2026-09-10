@@ -95,7 +95,11 @@ async fn crash_between_publish_and_finalize_commits_only_the_winner() {
     .await
     .claimed_by
     .expect("a running job records its claimer");
-    assert!(fleet.kill9(&first_claimer), "claimer is a spawned worker");
+    let first_claimer_label = harness::label_of(&session, &first_claimer).await;
+    assert!(
+        fleet.kill9(&first_claimer_label),
+        "claimer {first_claimer:?} (label {first_claimer_label:?}) is a spawned worker"
+    );
 
     // The survivor reclaims and completes; the committed pointer is the winner's.
     let record = harness::await_job(

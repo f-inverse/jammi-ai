@@ -4,8 +4,8 @@
 //! fixed-sleep-free catalog poller.
 //!
 //! The harness is the *submitter and observer*; the spawned child processes are
-//! the *workers*. The harness session is built with no train tier and no
-//! embedded worker, so it never claims a job itself — it only writes queued rows
+//! the *workers*. The harness session is built with `[worker] enabled = false`
+//! and no embedded worker, so it never claims a job itself — it only writes queued rows
 //! (via `fine_tune`) and polls the shared catalog for the children's terminal
 //! writes. This mirrors the production split where a submitting client and the
 //! GPU worker fleet are different processes against one catalog.
@@ -19,7 +19,7 @@ use std::time::{Duration, Instant};
 use jammi_ai::fine_tune::{FineTuneConfig, FineTuneMethod};
 use jammi_ai::model::ModelTask;
 use jammi_ai::session::InferenceSession;
-use jammi_db::config::{CatalogConfig, JammiConfig, LeaseConfig, StorageConfig, TrainingConfig};
+use jammi_db::config::{CatalogConfig, JammiConfig, LeaseConfig, StorageConfig, WorkerConfig};
 use jammi_db::source::{FileFormat, SourceConnection, SourceType};
 use jammi_db::storage::{CloudConfig, S3Config};
 use tempfile::TempDir;
@@ -118,8 +118,9 @@ const HEARTBEAT_SECS: u64 = 1;
 const IDLE_POLL_SECS: u64 = 1;
 
 /// Build the harness's own session against the shared Postgres + MinIO,
-/// rooted at `result_root`. It mounts no train tier and spawns no worker, so it
-/// only submits queued jobs and observes — the spawned children do the claiming.
+/// rooted at `result_root`. It runs `[worker] enabled = false` and spawns no
+/// worker, so it only submits queued jobs and observes — the spawned children
+/// do the claiming.
 ///
 /// Returns the session plus the [`TempDir`] backing its local fetch cache /
 /// artifact_dir, which must outlive the session.
@@ -160,13 +161,31 @@ fn shared_config(backends: &Backends, result_root: &str, artifact_dir: &Path) ->
             duration_secs: LEASE_SECS,
             heartbeat_secs: HEARTBEAT_SECS,
         },
-        training: TrainingConfig {
+        worker: WorkerConfig {
             idle_poll_secs: IDLE_POLL_SECS,
             // These processes are the workers under test — claim loop on.
             ..Default::default()
         },
         ..Default::default()
     }
+}
+
+/// The `JAMMI_WORKER_ID` label of the fleet member whose minted instance id
+/// is `instance_id` — read from the shared catalog's `workers` rows (each
+/// spawned `[worker] enabled` process upserts one, carrying its label).
+/// Panics when no such claimant is listed: a `claimed_by` that is not a
+/// fleet member is exactly the defect the properties exist to catch.
+pub async fn label_of(session: &InferenceSession, instance_id: &str) -> String {
+    let workers = session.catalog().list_workers().await.unwrap();
+    workers
+        .iter()
+        .find(|w| w.instance_id == instance_id)
+        .and_then(|w| w.label.clone())
+        .unwrap_or_else(|| {
+            panic!(
+                "claimed_by {instance_id:?} is not a labelled fleet member; workers = {workers:?}"
+            )
+        })
 }
 
 /// One spawned `jammi-server` worker process and the scratch dir backing its
@@ -198,8 +217,9 @@ pub struct Fleet {
 impl Fleet {
     /// Spawn `n` `jammi-server` workers, each with a distinct `JAMMI_WORKER_ID`
     /// (`worker-1`..`worker-n`), distinct gRPC + health ports, the shared
-    /// catalog + `result_root`, the short worker timing, and the train tier
-    /// mounted. The MinIO credentials are passed through the child env so the
+    /// catalog + `result_root`, the short worker timing, and `[worker] enabled`
+    /// (Shape D's compute node: `services = []`, the worker on). The MinIO
+    /// credentials are passed through the child env so the
     /// worker's S3 driver authenticates exactly as the harness session does.
     pub fn spawn(backends: &Backends, result_root: &str, n: usize) -> Self {
         let exe = jammi_server_binary();
@@ -209,15 +229,18 @@ impl Fleet {
         Self { workers }
     }
 
-    /// The seeded ids of the spawned workers, in spawn order — `worker-1`..`-n`.
-    /// Property assertions match `claimed_by` against these.
-    pub fn worker_ids(&self) -> Vec<&str> {
+    /// The seeded LABELS of the spawned workers, in spawn order —
+    /// `worker-1`..`-n`. A process's `jobs.claimed_by` is its minted
+    /// per-process id, never this label, so a property resolves a
+    /// `claimed_by` to its label through [`label_of`] before matching here.
+    pub fn worker_labels(&self) -> Vec<&str> {
         self.workers.iter().map(|w| w.worker_id.as_str()).collect()
     }
 
-    /// SIGKILL exactly one worker by its seeded id, returning whether it was
-    /// found and signalled. Used by the kill-9 reclaim and artifact-crash-window
-    /// properties to crash a *specific* claimer mid-job.
+    /// SIGKILL exactly one worker by its seeded LABEL, returning whether it
+    /// was found and signalled. Used by the kill-9 reclaim and
+    /// artifact-crash-window properties to crash a *specific* claimer mid-job
+    /// (resolve a `claimed_by` id to its label with [`label_of`] first).
     pub fn kill9(&mut self, worker_id: &str) -> bool {
         let Some(w) = self.workers.iter_mut().find(|w| w.worker_id == worker_id) else {
             return false;
@@ -311,8 +334,8 @@ const TEST_AUDIT_MASTER_KEY: &str =
     "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
 
 /// Spawn one worker process. The worker is configured entirely through a
-/// per-process `jammi.toml` (catalog, storage, training timing, the train tier
-/// and its distinct ports) plus the `JAMMI_WORKER_ID` seed and the `AWS_*`
+/// per-process `jammi.toml` (catalog, storage, worker timing, `[worker]
+/// enabled` and its distinct ports) plus the `JAMMI_WORKER_ID` seed and the `AWS_*`
 /// credentials in its environment. stdout+stderr are redirected to a per-worker
 /// log under its scratch dir so a CI failure can surface the worker's view.
 fn spawn_worker(
@@ -413,15 +436,18 @@ allow_http = {allow_http}
 duration_secs = {LEASE_SECS}
 heartbeat_secs = {HEARTBEAT_SECS}
 
-[training]
+[worker]
+# Shape D's compute node: this process claims and runs submitted jobs of every
+# compiled kind. Job submission itself is core, so no optional tier is needed.
+enabled = true
 idle_poll_secs = {IDLE_POLL_SECS}
 
 [server]
 # Distinct per-worker ports so N servers coexist on one host.
 flight_listen = "127.0.0.1:{flight_port}"
 health_listen = "127.0.0.1:{health_port}"
-# Mount core + the train tier so the worker claims and runs submitted jobs.
-services = ["train"]
+# Core only — the worker, not a tier, is what makes this process a compute node.
+services = []
 "#
     )
 }
@@ -488,12 +514,12 @@ pub async fn await_job(
     job_id: &str,
     tenant: Option<jammi_db::TenantId>,
     label: &str,
-    mut want: impl FnMut(&jammi_db::catalog::training_repo::TrainingJobRecord) -> bool,
-) -> jammi_db::catalog::training_repo::TrainingJobRecord {
+    mut want: impl FnMut(&jammi_db::catalog::jobs_repo::JobRecord) -> bool,
+) -> jammi_db::catalog::jobs_repo::JobRecord {
     let catalog = session.catalog().pinned_to_tenant(tenant);
     let deadline = Instant::now() + TERMINAL_TIMEOUT;
     loop {
-        if let Ok(record) = catalog.get_training_job(job_id).await {
+        if let Ok(record) = catalog.get_job(job_id).await {
             if want(&record) {
                 return record;
             }
@@ -540,19 +566,19 @@ async fn dump_final_job_row(
     match session
         .catalog()
         .pinned_to_tenant(tenant)
-        .get_training_job(job_id)
+        .get_job(job_id)
         .await
     {
         Ok(r) => eprintln!(
             "status={:?} claimed_by={:?} attempts={} output_model_id={:?} \
-             tenant_id={:?} lease_expires_at={:?} error_message={:?}",
+             tenant_id={:?} lease_expires_at={:?} error={:?}",
             r.status,
             r.claimed_by,
             r.attempts,
             r.output_model_id,
             r.tenant_id,
             r.lease_expires_at,
-            r.error_message,
+            r.error,
         ),
         Err(e) => eprintln!("<job row unreadable: {e}>"),
     }

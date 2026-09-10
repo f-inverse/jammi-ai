@@ -98,6 +98,7 @@ async fn result_table_crud_lifecycle() {
             storage_precision: jammi_db::config::StoragePrecision::F32,
             oversample: 4,
             created_at: jammi_db::catalog::backend::now_sortable(),
+            job_attempt: None,
         })
         .await
         .unwrap();
@@ -133,6 +134,7 @@ async fn result_table_crud_lifecycle() {
             storage_precision: jammi_db::config::StoragePrecision::F32,
             oversample: 4,
             created_at: jammi_db::catalog::backend::now_sortable(),
+            job_attempt: None,
         })
         .await
         .unwrap();
@@ -179,6 +181,7 @@ async fn find_result_tables_filters_by_source_and_task() {
                 storage_precision: jammi_db::config::StoragePrecision::F32,
                 oversample: 4,
                 created_at: jammi_db::catalog::backend::now_sortable(),
+                job_attempt: None,
             })
             .await
             .unwrap();
@@ -230,6 +233,7 @@ async fn resolve_embedding_table_latest_explicit_and_missing() {
                 // Explicit, strictly-increasing `created_at` — "new" must
                 // resolve as newest regardless of wall-clock resolution.
                 created_at: sortable_at(seq as u64 + 1),
+                job_attempt: None,
             })
             .await
             .unwrap();
@@ -288,6 +292,7 @@ async fn resolve_embedding_table_accepts_every_embedding_variant() {
                 storage_precision: jammi_db::config::StoragePrecision::F32,
                 oversample: 4,
                 created_at: sortable_at(seq as u64 + 1),
+                job_attempt: None,
             })
             .await
             .unwrap();
@@ -379,6 +384,7 @@ async fn resolve_embedding_table_picks_newest_by_created_at_not_table_name(backe
             storage_precision: jammi_db::config::StoragePrecision::F32,
             oversample: 4,
             created_at: jammi_db::catalog::backend::now_sortable(),
+            job_attempt: None,
         })
         .await
         .unwrap();
@@ -411,6 +417,7 @@ async fn resolve_embedding_table_picks_newest_by_created_at_not_table_name(backe
             storage_precision: jammi_db::config::StoragePrecision::F32,
             oversample: 4,
             created_at: jammi_db::catalog::backend::now_sortable(),
+            job_attempt: None,
         })
         .await
         .unwrap();
@@ -485,6 +492,7 @@ async fn recovery_skips_index_rebuild_for_non_embedding_task() {
             storage_precision: jammi_db::config::StoragePrecision::F32,
             oversample: 4,
             created_at: jammi_db::catalog::backend::now_sortable(),
+            job_attempt: None,
         })
         .await
         .unwrap();
@@ -523,6 +531,7 @@ async fn result_store_create_table_generates_correct_paths() {
             jammi_db::catalog::result_repo::ResultTableKind::Model,
             None,
             "sentence-transformers/all-MiniLM-L6-v2",
+            None,
             None,
             None,
             None,
@@ -583,6 +592,7 @@ async fn binary_precision_table_stamps_precision_specific_oversample() {
             Some(64),
             None,
             None,
+            None,
         )
         .await
         .unwrap();
@@ -627,6 +637,7 @@ async fn binary_precision_table_honors_explicit_oversample_override() {
             Some(64),
             None,
             None,
+            None,
         )
         .await
         .unwrap();
@@ -667,6 +678,7 @@ async fn binary_precision_table_honors_an_explicit_four_not_widened_to_thirty_tw
             None,
             "model",
             Some(64),
+            None,
             None,
             None,
         )
@@ -719,6 +731,7 @@ async fn create_table_couples_rescoring_precision_to_a_present_oversample() {
                 None,
                 "model",
                 Some(64),
+                None,
                 None,
                 None,
             )
@@ -774,6 +787,7 @@ async fn result_store_with_memory_root_roots_and_roundtrips() {
             jammi_db::catalog::result_repo::ResultTableKind::Model,
             None,
             "model",
+            None,
             None,
             None,
             None,
@@ -835,6 +849,7 @@ async fn recovery_marks_missing_parquet_as_failed() {
             storage_precision: jammi_db::config::StoragePrecision::F32,
             oversample: 4,
             created_at: jammi_db::catalog::backend::now_sortable(),
+            job_attempt: None,
         })
         .await
         .unwrap();
@@ -882,6 +897,7 @@ async fn recovery_deletes_invalid_parquet_and_marks_failed() {
             storage_precision: jammi_db::config::StoragePrecision::F32,
             oversample: 4,
             created_at: jammi_db::catalog::backend::now_sortable(),
+            job_attempt: None,
         })
         .await
         .unwrap();
@@ -946,6 +962,7 @@ async fn recovery_promotes_valid_parquet_to_ready() {
             storage_precision: jammi_db::config::StoragePrecision::F32,
             oversample: 4,
             created_at: jammi_db::catalog::backend::now_sortable(),
+            job_attempt: None,
         })
         .await
         .unwrap();
@@ -1030,6 +1047,7 @@ async fn result_table_none_dimensions_round_trips_as_null(backend: BackendKind) 
             storage_precision: jammi_db::config::StoragePrecision::F32,
             oversample: 4,
             created_at: jammi_db::catalog::backend::now_sortable(),
+            job_attempt: None,
         })
         .await
         .unwrap();

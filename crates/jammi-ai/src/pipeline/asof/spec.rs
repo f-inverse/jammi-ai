@@ -17,7 +17,7 @@ use arrow_schema::{DataType, SchemaRef};
 /// `Date32`/`Date64`, or a signed/unsigned integer); a float temporal key is
 /// rejected — NaN has no total order, so "most recent at or before" would be
 /// undefined.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct AsofKey {
     /// Equality ("by") columns that partition the match into independent
     /// groups — e.g. an entity id, an instrument symbol, a subject id.
@@ -37,7 +37,7 @@ pub struct AsofKey {
 /// the first fact at/after; `Nearest` takes the smallest absolute distance,
 /// resolving equidistant candidates toward the past. `Nearest` requires a
 /// numeric temporal key.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub enum MatchDirection {
     /// Most recent fact at/before the spine instant.
     Backward,
@@ -52,7 +52,7 @@ pub enum MatchDirection {
 /// `Inclusive` (default, `<=`/`>=`); `Exclusive` is strict (`<`/`>`). This is
 /// the single most error-prone as-of decision — it is pinned on the spec, never
 /// inferred.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub enum Boundary {
     /// A fact stamped exactly at the spine instant matches.
     Inclusive,
@@ -65,7 +65,7 @@ pub enum Boundary {
 ///
 /// `Duration` (microseconds) for temporal keys; `Steps` for integer keys. The
 /// limit is measured relative to each spine instant, never wall-clock now.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub enum Tolerance {
     /// Microsecond limit for a temporal key.
     Duration(i64),
@@ -78,7 +78,7 @@ pub enum Tolerance {
 /// Silent non-determinism here is a known footgun; this engine refuses it. A
 /// secondary descending column (newest wins) disambiguates late-arriving facts;
 /// absent one, a true duplicate at the matched instant fails loudly.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub enum TieBreak {
     /// Break ties by a secondary column, the maximal value winning — the
     /// transaction-/created-time column. Event time bounds the join; this
@@ -91,7 +91,7 @@ pub enum TieBreak {
 
 /// The frozen descriptor an `asof_join` lowers to. Construct via
 /// [`AsofJoinSpecBuilder`].
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct AsofJoinSpec {
     /// The spine's column roles.
     pub left: AsofKey,

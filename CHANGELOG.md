@@ -7,6 +7,39 @@ workspace ships every publishable crate at the same
 ## [Unreleased]
 
 ### Added
+- **`jobs`/`instances`/`workers`: a generalised, kind-agnostic durable-job
+  queue replaces the training-only queue; a per-process lease keeper (#485).**
+  Migration 029 drops `training_jobs` and adds `jobs` (training AND compute
+  kinds share one claim/lease/reclaim table: `execution` distinguishes a
+  `queued` row a `[worker]` claim loop may pick up from an `inline` row
+  claimed once, by id, in the submitting call itself), `instances` (every
+  process upserts and heartbeats its own row), and `workers` (upserted only
+  by a process actually running the claim loop, naming the kinds it claims).
+  `jammi_ai::jobs::{ComputeSpec, JobSpec, JobResult, JobHandle}` and
+  `InferenceSession::{enqueue, run_now}` are the new entry points:
+  `enqueue` always accepts and returns a handle immediately; `run_now`
+  submits, claims, and executes an inline job in the caller's own task under
+  the same lease/finish machinery a queued job's worker uses, so an embedded
+  synchronous compute call and a claimed queued job of the same kind run
+  identical code. `crate::fine_tune::worker::JobWorker` (renamed from
+  `TrainingWorker`) dispatches every compiled kind — the three training
+  kinds unchanged, plus `neighbor_graph`/`propagate`/`asof_join` through
+  `jammi_ai::jobs::execute_compute` — and validates `[worker] kinds` against
+  the compiled set at startup. Every process's `instances` row and every
+  claimed job/table lease is a registration with one dedicated
+  lease-renewal OS thread (`LeaseKeeper`, its own runtime, its own catalog
+  connection) instead of a per-lease `tokio::spawn` heartbeat task, so a
+  CPU-bound inline compute job on the main runtime cannot starve its
+  own lease renewal. `[worker] { enabled, kinds, idle_poll_secs }` and
+  `[jobs] { retention_days }` (default 30; a terminal job stops blocking
+  `delete_model` once past the window, a non-terminal job blocks
+  indefinitely) replace `[training]`. `Catalog::finish_job_with_model` is a
+  single attempt-guarded (`job_id AND claimed_by AND status AND attempts`)
+  transaction committing the output model's served path, every retained
+  epoch-checkpoint row, and the job's `completed` status together; every
+  terminal write retires a still-`{"state":"pending"}` acceleration-report
+  marker (esc-075) in its own update, generalised from the training-only
+  queue onto every job kind.
 - **`HubSource`'s four `[models]` Hub resolution chains — cache root, offline, token, and
   endpoint — are each config-first and env-overridable through `JAMMI_MODELS__HUB_*`/
   `JAMMI_MODELS__OFFLINE` (#481).** **Cache root:** `[models] hub_cache_dir` (a `hub/`
@@ -442,6 +475,80 @@ workspace ships every publishable crate at the same
   (`crates/jammi-db/src/catalog/backend.rs`), completing the narrower integer/float widths the
   trigger-stream tail replay's row decoding needs; additive only (no existing impl or caller
   changes).
+- **`[server.limits]`: message-size, in-flight concurrency, per-request
+  timeout, and stream budgets, refused at the edge with a typed status and a
+  counted reason (#485).** A request that would exceed any bound
+  is refused BEFORE any tenant-scoped catalog read runs, so a refusal leaks
+  nothing about cross-tenant existence — see `docs/guide/src/operability.md`
+  §"Request bounds" for the full table and `docs/guide/src/configuration.md`
+  for the TOML reference. `max_message_bytes` (default 64 MiB; `OUT_OF_RANGE`
+  — tonic's own per-service `max_decoding_message_size` codec rejection,
+  verified against the vendored tonic 0.14.5 source, NOT
+  `RESOURCE_EXHAUSTED`; applied identically to the combined gRPC + Flight SQL
+  listener, so an oversize Flight SQL query is refused the same way an
+  oversize gRPC message is); `max_in_flight` / `max_in_flight_per_connection`
+  (defaults 256 / 64; `RESOURCE_EXHAUSTED`; unary methods only; `0` =
+  unbounded); `request_timeout_secs` (default unset; `DEADLINE_EXCEEDED`;
+  unary only); `wait_timeout_secs` (default unset; `DEADLINE_EXCEEDED`) bounds
+  a `TriggerService.Subscribe` / `JobService.WaitJob` stream one of three
+  ways, depending on the caller's `grpc-timeout` header: a header ABOVE the
+  budget is refused at the edge, before the stream opens; a header WITHIN
+  the budget is ENFORCED by the server, which closes the stream at the
+  caller's own declared deadline; NO header at all is NOT refused — the
+  configured budget itself becomes the stream's deadline, so a request that
+  declares nothing still ends at the budget rather than running unbounded.
+  `jammi-client`'s `wait_job`/`subscribe` send no `grpc-timeout` of their
+  own, relying on the server's budget; `wait_job_with_timeout`/
+  `subscribe_with_timeout` send an explicit one);
+  `max_subscriptions` / `max_job_waits` (defaults 256 / 1024;
+  `RESOURCE_EXHAUSTED`; the concurrent-stream budget for each of those two
+  RPCs, released when the stream ends or the client disconnects; `0` =
+  unbounded). Every knob is validated at config load
+  (`jammi_db::config::LimitsConfig::validate`, a typed `JammiError::Config`
+  naming the offending key) and env-overridable via the existing
+  `JAMMI_SERVER__LIMITS__<FIELD>` layered loader. `jammi_grpc_refused_total{reason}`
+  (`reason` ∈ `message_size`/`in_flight`/`in_flight_per_connection`/
+  `subscriptions`/`job_waits`/`timeout`) is the new Prometheus counter. New
+  `crates/jammi-server/src/limits.rs`: `RefusalStatusLayer` (the single
+  counting site), `GlobalConcurrencyLimitLayer`, `PerConnectionLimitLayer`
+  (keyed on tonic's own connect-info request extension — deliberately NOT
+  tonic's builder-level `concurrency_limit_per_connection`/`load_shed`
+  knobs, which sit outside every user `.layer()` call and would be both
+  uncounted and un-gRPC-web-framed; see the module's N4 rustdoc), and
+  `MethodClassLayer` (the unary timeout plus both stream budgets), applied
+  on the combined listener between the existing gRPC-web framing layers and
+  the mounted services. No wire/`.proto` change — mechanism-only, applies to
+  every existing RPC uniformly.
+- **`[observability]`: vendor-neutral OTLP trace export, and W3C `traceparent`
+  continuation across the gRPC/Flight chain (#486).** `otlp_endpoint`
+  (default unset — no exporter installed, no network connection attempted at
+  all), `otlp_headers` (a map of request headers the exporter attaches to
+  every export call; each value is a `SecretSource` — inline or
+  `{ file = "…" }` — resolved only at the point the exporter builds the gRPC
+  metadata, never logged), `service_name` (default `"jammi"`), and
+  `sample_ratio` (default `1.0`, domain `[0.0, 1.0]`, a parent-based ratio
+  sampler — a span with an already-sampled remote parent is always kept).
+  `jammi_ai::telemetry::otlp_layer` (behind the new `telemetry-otlp` cargo
+  feature — `opentelemetry`/`opentelemetry_sdk`/`opentelemetry-otlp`/
+  `tracing-opentelemetry`, one tonic: `opentelemetry-otlp`'s `grpc-tonic`
+  transport pins the same tonic 0.14 / prost 0.14 this workspace already
+  carries) is the one factory both `jammi-server`'s `telemetry::install`
+  (now a `Registry` + `fmt` layer + this optional layer, replacing the old
+  bare `fmt()` subscriber) and `jammi-python`'s `open_local` build over —
+  each is default-on (`jammi-server`'s own `telemetry-otlp` feature is in its
+  `default` list; `jammi-python`'s wheel enables `jammi-ai/telemetry-otlp`
+  directly). A configured endpoint this build was compiled without the
+  feature for is a typed `JammiError::Config` startup refusal naming the
+  feature, never a silently-dropped span. A new whole-server tower layer,
+  `crate::trace_context_layer::TraceContextLayer` (mounted beside
+  `MetricsLayer` on every listener path), extracts the incoming W3C
+  `traceparent`/`tracestate` pair from each request's HTTP headers and binds
+  it as the one span this process opens per RPC's OpenTelemetry parent, so
+  the span (and every `#[tracing::instrument]` handler span nested under it)
+  carries the SAME trace id the caller's proxy or gateway already assigned;
+  no `traceparent` header starts a fresh, unparented trace exactly as before.
+  See `docs/guide/src/operability.md`'s new "OTLP trace export" subsection
+  and `docs/guide/src/configuration.md`'s `[observability]` reference.
 - **linux/arm64 server image, CLI/server release tarballs, and manylinux aarch64 wheels
   (#482).** The published `jammi-ai-server` CPU image (`:latest`, semver tags) is now a
   multi-arch index (`linux/amd64` + `linux/arm64`), built as two NATIVE per-arch legs
@@ -853,6 +960,57 @@ workspace ships every publishable crate at the same
   immune to a stray `PGSSLMODE=disable` left in the environment.
 
 ### Fixed
+- **`JobService.PruneJobs` swept every tenant's terminal rows, not just the
+  caller's (#485).** The RPC handler bypassed
+  `scoped(...)` (the tenant-binding path every other `JobService` RPC uses)
+  and `Catalog::prune_jobs` had no tenant predicate at all; the
+  `tenant_isolation_oracle.rs` allowlist entry and `job.proto`'s "global
+  maintenance action" doc rested on a false premise — there is no periodic
+  background sweep, only the one-shot construction-time pass
+  (`InferenceSession::wrap`), which is not an RPC and stays global by design
+  (now via an explicit `with_admin_scope` bypass, rather than accidentally).
+  `prune_jobs` now takes the same STRICT tenant predicate `cancel_request`
+  uses; the allowlist exemption is removed and a cross-tenant-denial oracle
+  case (`assert_prune_jobs_isolated`) is added.
+- **`SubmitJob`'s `idempotency_key` dedupe lived in a process `HashMap` —
+  forgotten on restart, and racy under two concurrent identical submissions
+  (#485).** Migration 030 adds `jobs.idempotency_key` + a partial UNIQUE index
+  keyed on `(COALESCE(tenant_id, ''), idempotency_key)`; `Catalog::
+  submit_job_deduped` folds the dedupe into the SAME `INSERT ... ON CONFLICT
+  ... DO NOTHING RETURNING` statement that creates the row, so two concurrent
+  `SubmitJob` calls racing the same key land exactly one row — never a
+  separate lookup-then-insert race window. `JobServer` carries no map any
+  more; `job.proto`'s `idempotency_key` doc states the durable guarantee.
+- **Two `JammiError` variants raised by the job/compute path
+  (`JobAttemptSuperseded`, `JobCancelled`) — plus four pre-existing ones
+  (`Lexical`, `IncompatibleFormat`, `DependencyCycle`, `NotRecomputable`) —
+  had no wire arm and silently folded to the lossy `JammiError::Other` on a
+  remote client (#485).** `jammi-wire`'s `error.proto`/`error.rs` gain typed
+  arms for all six; a new compile-time-exhaustive match (no catch-all) over
+  every `JammiError` variant makes a future addition fail to compile here
+  until it is triaged as owned-shape (round-trips faithfully) or a genuine
+  foreign fold.
+- **`WaitJob`/`Subscribe` requests carrying NO `grpc-timeout` header at all
+  ran unbounded whenever `[server.limits] wait_timeout_secs` was
+  configured — a header-less stream had no ceiling at all.**
+  `MethodClassLayer` now bounds an absent header by the configured budget
+  itself: the stream opens (never refused for lacking a header) and
+  `PermitBody::Deadlined` closes it once `wait_timeout_secs` elapses, the
+  same mechanism a within-budget header's own deadline uses. `jammi-client`'s
+  `wait_job`/`subscribe` send no `grpc-timeout` of their own, relying on
+  this server-side budget; `wait_job_with_timeout`/`subscribe_with_timeout`
+  send an explicit one, refused at the edge if it exceeds the budget.
+- **`create_result_table`'s `partial_result` compare-and-set could be won by a
+  zombie of a requeued-and-re-claimed attempt (#485, esc-107).** A
+  `job_id`-only predicate (`WHERE job_id = $1 AND status = 'running' AND
+  partial_result IS NULL`) is satisfiable by a dead attempt whose own lease
+  expired: the job genuinely IS `running` again, just under a LATER attempt
+  the zombie never learned about, so it could still record its own table as
+  the job's served `partial_result` out from under the live, current
+  attempt. `CreateResultTableParams.job_id: Option<&str>` is now
+  `job_attempt: Option<JobAttempt<'a>>` (`{ job_id, instance_id, attempts }`)
+  and the CAS carries the full attempt guard every other `jobs`-table write
+  uses, surfacing a loser as the typed `JammiError::JobAttemptSuperseded`.
 - **Two concurrent `migrate()` callers on a fresh Postgres database could both attempt the
   schema DDL, one losing with SQLSTATE `42P07`/`23505` (#479, esc-093).** No cross-process
   mutual exclusion guarded the read-ledger-then-run-DDL window on a backend the guide
@@ -1226,6 +1384,104 @@ workspace ships every publishable crate at the same
   guide page's Shape B section.
 
 ### Breaking
+- **`annotate()`'s SQL-visible columns gain `_ordinal`, and `infer` rows come
+  back ordered by `(_row_id, _ordinal)` (#485).** Every inference result —
+  the `RecordBatch`es `InferenceSession::infer` returns, the result table it
+  registers, and the relation the `annotate(...)` table function exposes to
+  SQL — now carries a `_ordinal UInt64` prefix column directly after
+  `_row_id`: a stream-scoped, 0-based row counter assigned in the order the
+  model emitted the rows, so a source that keys several rows under one id
+  still reads back in one deterministic order. A `SELECT *` over an
+  inference table or an `annotate(...)` relation therefore has one more
+  column than before; a query that enumerates its prefix columns by name
+  (`_row_id, _source, _model, _status, _error, _latency_ms`) is unchanged.
+  Embedding tables (`generate_embeddings`) carry no `_ordinal` — their
+  `_row_id` is unique by construction.
+- **`JAMMI_WORKER_ID` is a label, not the process identity (#485).** A
+  process's `instances.instance_id` / `jobs.claimed_by` is a UUID minted at
+  session construction; `JAMMI_WORKER_ID` (trimmed, non-empty) is only the
+  `instances.label` that `ListWorkers` / `jammi workers` shows beside that
+  id, and it is non-unique by design. Two processes given the same value —
+  a restart, a sibling replica — are two instances, so a dead process's
+  inline jobs are failed by the liveness reclaim instead of being kept
+  alive by its namesake's heartbeat. Anything that matched `claimed_by`
+  against a seeded `JAMMI_WORKER_ID` must resolve the id to its label
+  through `ListWorkers` first.
+- **`[training]` is removed; `training_jobs` and its ten `training_repo`
+  catalog methods are gone with no shim (#485).** `[worker] { enabled, kinds,
+  idle_poll_secs }` and `[jobs] { retention_days }` replace it —
+  `JAMMI_TRAINING__RUN_WORKER` is now a typed `JammiError::Config` load
+  error under the existing namespace rule; the new spelling is
+  `JAMMI_WORKER__ENABLED`. `create_training_job`, `get_training_job`,
+  `finalize_training_job`, `fail_training_job`, `mark_training_running`,
+  `record_acceleration_report`, `list_training_jobs`,
+  `claim_next_training_job`, `heartbeat_training_job`, and
+  `reclaim_expired_training_jobs` are replaced by the generalised
+  `Catalog::{submit_job, get_job, finish_job_with_model, fail_job,
+  record_acceleration_report, list_jobs, claim_next, claim_by_id,
+  reclaim_expired_jobs}` (`jammi_db::catalog::jobs_repo`); `TrainingJobRecord`
+  is `JobRecord` (`base_model_id` → `model_ref`, `error_message` → `error`, no
+  separate `metrics` column — folded into the tagged `result` payload's
+  `JobResult::Model.metrics`). `crate::fine_tune::worker::TrainingWorker` is
+  renamed `JobWorker`. `ResultStore::create_table` and
+  `CreateResultTableParams` gain a trailing `job_attempt:
+  Option<JobAttempt<'_>>` parameter (`None` for every existing call site — a
+  behavior-preserving rename for callers that never passed a job link).
+  `Catalog::delete_model` gains a `retention_days: i64` parameter.
+- **The `train` cargo feature and the `train` service tier are removed (#485).**
+  `jammi-server` declares no `default` feature any more; the durable job
+  service (job submission and status) is core and mounts on every
+  engine-backed deployment, and `ServiceTier` is `Core` / `Event` / `Eval`. Whether a
+  process *runs* the jobs it accepts is the `[worker] enabled` runtime key,
+  not a tier and not a build feature: a request node runs `[worker] enabled
+  = false`, a compute node runs `services = []` with `[worker] enabled =
+  true, kinds = [...]`. `services = ["train"]` (or `JAMMI_SERVER__SERVICES=
+  train`) is now a startup error naming the unknown tier; `ServerInfo.
+  services` never carries `train`. `TierSet::resolve` is infallible,
+  `TierSet::all_compiled` is `TierSet::all`, `ServiceTier::compiled_in` and
+  `TierError::FeatureNotCompiled` are gone, and `ChainParts::train_worker`
+  is `ChainParts::worker`.
+- **`TrainingService` is replaced by `JobService` on the wire; compute-verb
+  clients gain a job-verb surface (#485, #486; pre-1.0
+  amendment — see `docs/guide/src/api-stability.md`).**
+  `StartTraining`→`SubmitJob`, `TrainingStatus`→`JobStatus`,
+  `ListTrainingJobs`→`ListJobs`; `SubmitJob`'s oneof carries the same three
+  training-kind spec variants (`FineTuneSpec`/`GraphFineTuneSpec`/
+  `ContextPredictorSpec`, still defined in `jammi.v1.training`) plus a new
+  optional `idempotency_key` — a second `SubmitJob` carrying an
+  already-known non-empty key returns the SAME job handle rather than
+  submitting a duplicate (a DURABLE per-tenant dedupe, migration 030's
+  `jobs.idempotency_key` + unique index — see below). New rpcs: `WaitJob` (a resumable
+  server-streaming wait — server-side 100ms poll, ends at the terminal
+  frame, a client disconnect ends only the wait) and `CancelJob`,
+  `ListWorkers` (fleet/liveness over `instances`/`workers`), and
+  `PruneJobs` (the `[jobs] retention_days` sweep, runnable on demand).
+  `JobStatusResponse`/`JobSummary`/`JobEvent` generalise the former
+  `TrainingStatusResponse`/`TrainingJobSummary` shape across every job kind
+  (`kind`, `progress`, a `oneof result { ModelResult | TableResult }`
+  in place of the flat `model_id`/`metrics_json` fields — a training
+  kind's metrics now nest inside `result.model.metrics_json`); a
+  cross-tenant `JobStatus`/`WaitJob`/`CancelJob` is `NOT_FOUND`, never
+  `PERMISSION_DENIED` (the row's existence is not leaked). `jammi-admin`'s
+  `CatalogClient::{training_status, list_training_jobs}` are
+  `{job_status, list_jobs}` (plus new `cancel_job`/`list_workers`/
+  `prune_jobs`); `TrainingStatusInfo`/`TrainingJobSummary` are
+  `JobStatusInfo`/`JobSummary` (+ new `WorkerSummary`). `jammi-client`'s
+  `fine_tune`/`fine_tune_status`/`fine_tune_metrics`/
+  `fine_tune_acceleration_report` keep their signatures (now backed by
+  `JobService`) and gain `job_status`/`wait_job`/`cancel_job`/`list_jobs`.
+  `jammi train list/status` is `jammi jobs list/status/cancel/prune` +
+  `jammi workers list`. The seven materializing compute verbs
+  (`GenerateEmbeddings`, `ImportEmbeddings`, `BuildNeighborGraph`,
+  `PropagateEmbeddings`, `AsofJoin`, `Recompute`, `Infer`) still return their
+  existing per-verb response synchronously rather than a `SubmitJobResponse`
+  handle. The `[server.limits]` request-bounds/refusal-layer surface (§5) —
+  message-size, in-flight, per-connection, request/wait-timeout, and
+  stream-budget bounds, refused at the edge with a typed status (see this
+  changelog's own `[server.limits]` entry, `crates/jammi-server/src/
+  limits.rs`) — and `SubmitJob`'s `idempotency_key`, a DURABLE per-tenant
+  dedupe (migration 030's `jobs.idempotency_key` + unique index), apply
+  uniformly across every `JobService` RPC regardless of this scope boundary.
 - **Existing result-table and artifact object keys predating the tenant-prefixed layout
   are unattributed until the table is re-materialized (#484).** `reconcile`'s allowlist
   recognizes only `{seg}/{table}.parquet` and `models/{seg}/{job_id}/…` keys (`seg` a

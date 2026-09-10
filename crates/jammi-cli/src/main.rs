@@ -68,11 +68,18 @@ enum Commands {
         #[command(subcommand)]
         action: commands::mutable::MutableAction,
     },
-    /// Observe training jobs (list, per-job status). Read-only — jobs are
-    /// submitted through the data-plane client / SDK.
-    Train {
+    /// Observe/manage durable jobs (list, per-job status, cancel, prune).
+    /// Jobs are submitted through the data-plane client / SDK — this surface
+    /// is the control-plane read + cancel + prune peer, over every job kind
+    /// (training and compute alike).
+    Jobs {
         #[command(subcommand)]
-        action: commands::train::TrainAction,
+        action: commands::jobs::JobAction,
+    },
+    /// List the engine processes currently running the claim loop.
+    Workers {
+        #[command(subcommand)]
+        action: commands::workers::WorkerAction,
     },
     /// Cross-check the catalog against the object store and report (or
     /// reclaim) drift.
@@ -148,7 +155,8 @@ async fn dispatch(
         Commands::Trigger { action } => commands::trigger::run(client, action).await,
         Commands::Channels { action } => commands::channels::run(client, action).await,
         Commands::Mutable { action } => commands::mutable::run(client, action).await,
-        Commands::Train { action } => commands::train::run(client, action).await,
+        Commands::Jobs { action } => commands::jobs::run(client, action).await,
+        Commands::Workers { action } => commands::workers::run(client, action).await,
         Commands::Reconcile {
             apply,
             grace_secs,

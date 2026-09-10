@@ -124,12 +124,12 @@ def test_no_hard_negative_kwargs_omits_the_message() -> None:
 def _capture_graph_request(**overrides):
     """Build a graph fine-tune request without dialing a channel.
 
-    `fine_tune_graph` touches instance state only at `self._start_training`, so a
+    `fine_tune_graph` touches instance state only at `self._submit_job`, so a
     bare instance with that one method stubbed captures the request it assembled.
     """
     db = RemoteDatabase.__new__(RemoteDatabase)
     captured = {}
-    db._start_training = lambda request: captured.setdefault("request", request)
+    db._submit_job = lambda request: captured.setdefault("request", request)
     kwargs = dict(
         node_source="papers",
         id_column="paper_id",
@@ -146,7 +146,7 @@ def _capture_graph_request(**overrides):
 
 def test_graph_fine_tune_attaches_config_with_hyperparameters() -> None:
     """Regression for #167: remote `fine_tune_graph` must attach the assembled
-    `FineTuneConfig` to the `StartTrainingRequest`. Without it the server falls
+    `FineTuneConfig` to the `SubmitJobRequest`. Without it the server falls
     back to its built-in defaults and silently drops every hyperparameter the
     caller set — loss, epochs, batch size, learning rate, LoRA rank, matryoshka."""
     request = _capture_graph_request(
@@ -238,12 +238,12 @@ def test_unknown_regression_loss_rejected() -> None:
 def _capture_fine_tune_request(**overrides):
     """Build a (non-graph) `fine_tune` request without dialing a channel.
 
-    `fine_tune` touches instance state only at `self._start_training`; stubbing
-    that one method captures the `StartTrainingRequest` it assembled.
+    `fine_tune` touches instance state only at `self._submit_job`; stubbing
+    that one method captures the `SubmitJobRequest` it assembled.
     """
     db = RemoteDatabase.__new__(RemoteDatabase)
     captured = {}
-    db._start_training = lambda request: captured.setdefault("request", request)
+    db._submit_job = lambda request: captured.setdefault("request", request)
     kwargs = dict(
         source="houses",
         base_model="modernbert",

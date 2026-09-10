@@ -93,22 +93,27 @@ service tiers a deployment needs — no per-shape rebuild. The **core** tier is
 always mounted: `CatalogService` (the control plane — tenant binding, the
 `GetServerInfo` handshake, and source / model / channel / mutable-table /
 topic administration), `EmbeddingService`, `InferenceService`,
-`AuditService`, and the Flight SQL surface. Three optional tiers are
-runtime-selectable via `[server] services`:
+`PipelineService`, `AuditService`, `JobService` (durable job submission — every
+deployment accepts a job and reports its status), and the Flight SQL surface.
+Two optional tiers are runtime-selectable via `[server] services`:
 
 | Tier | Service | Role |
 |---|---|---|
-| `train` | `TrainingService` | model training (fine-tune, graph fine-tune, context predictor) |
 | `event` | `TriggerService` | topic / publish / subscribe streams |
 | `eval`  | `EvalService` | per-query evaluation arrays |
 
 ```toml
 [server]
-services = "all"             # all-in-one: every tier compiled in (the default)
+services = "all"             # all-in-one: every tier (the default)
 # services = ["event"]       # serve + event box
-# services = ["train"]       # serve + training box
 # services = []              # serve-only: core tier only
 ```
+
+Running jobs is not a tier. Whether a process *claims and executes* the jobs
+it accepted is `[worker] enabled` (see [Configuration](configuration.md)):
+a request node runs `[worker] enabled = false` and still accepts every
+submission; a compute node runs `services = []` with `[worker] enabled =
+true, kinds = [...]` and works what the request nodes queued.
 
 A deployment advertises exactly the tiers it mounted over the wire, so a client
 can negotiate capability before calling a verb:
@@ -116,22 +121,20 @@ can negotiate capability before calling a verb:
 ```python
 info = db.get_server_info()
 # {"version": "...", "features": [...], "storage_backends": [...],
-#  "services": ["core", "eval", "event", "train"]}
-if "train" in info["services"]:
-    db.fine_tune(...)
+#  "services": ["core", "eval", "event"]}
+if "eval" in info["services"]:
+    db.eval_per_query(...)
 ```
 
 Reaching a verb whose tier was **not** mounted returns a truthful `Unimplemented`
 ("not enabled on this deployment") rather than a misleading success — the
 service-mount analog of the client's build-by-capability `connect(target)`.
 
-**Runtime config vs. compile features.** The `train` tier additionally requires
-the `train` compile feature (on by default). A `--no-default-features`
-serve-only build carries no training surface at all; requesting `train` in
-config on such a build is a startup error, not a silent drop. The `event` and
-`eval` tiers always compile and are gated at runtime only. Override the
-selection with `JAMMI_SERVER__SERVICES` (`all`, or a comma-separated token
-list — empty for serve-only).
+**Runtime config, no compile features.** Every tier compiles into every
+build — no cargo feature gates a tier, so there is no compile ceiling for the
+selection to hit; a token naming no tier is a startup error, not a silent
+drop. Override the selection with `JAMMI_SERVER__SERVICES` (`all`, or a
+comma-separated token list — empty for serve-only).
 
 ## GPU configuration
 
@@ -251,13 +254,13 @@ latency histogram.
 | Generate embeddings | No — use library or Python package | Yes — `EmbeddingService.GenerateEmbeddings` |
 | Semantic vector search | No — use library or Python package | Yes — `EmbeddingService.Search` |
 | Inference | No — use library or Python package | Yes — `InferenceService.Infer` |
-| Fine-tuning (and graph / context-predictor training) | No — use library or Python package | Yes — `TrainingService.StartTraining` (train tier) |
+| Fine-tuning (and graph / context-predictor training) | No — use library or Python package | Yes — `JobService.SubmitJob` (core; runs where `[worker] enabled`) |
 | Context-predictor prediction | No — use library or Python package | Yes — `InferenceService.Predict` |
 | Evaluation | No — use library or Python package | Yes — `EvalService` (eval tier) |
 
 The Flight SQL surface is a **query** interface (read path); the ML operations are not SQL, so they ride the **typed gRPC** surface instead. Set up your data and run training/inference through the Rust library, the `jammi-ai` / `jammi-client` Python package, or — for a remote engine — those same verbs over gRPC, then query the results over Flight SQL. The CLI is a strict gRPC client that registers sources and drives the admin surfaces against a running server; it carries no ML verbs and does not run the engine in-process.
 
-The typed gRPC surface is what an edge runtime speaks (it has no HTTP/2 client for Flight SQL's bidirectional streaming). `EmbeddingService` serves `AddSource`, `GenerateEmbeddings`, `EncodeQuery`, and `Search` over plain gRPC — and, since tonic-web is mounted, over **gRPC-web** — so an edge function running the engine as a sidecar can ingest, encode, **and** search without the library. `Search` accepts a precomputed vector or an existing `row_key` (query-by-example, with the vector resolved inside the engine); see [Semantic Search](./semantic-search.md#search-over-grpc-edge-runtimes). With the **train** tier mounted, `TrainingService` serves all three training kinds over gRPC and `InferenceService.Predict` serves a trained context predictor — so a client can offload training and prediction to a GPU server with the same verb surface the embedded engine exposes.
+The typed gRPC surface is what an edge runtime speaks (it has no HTTP/2 client for Flight SQL's bidirectional streaming). `EmbeddingService` serves `AddSource`, `GenerateEmbeddings`, `EncodeQuery`, and `Search` over plain gRPC — and, since tonic-web is mounted, over **gRPC-web** — so an edge function running the engine as a sidecar can ingest, encode, **and** search without the library. `Search` accepts a precomputed vector or an existing `row_key` (query-by-example, with the vector resolved inside the engine); see [Semantic Search](./semantic-search.md#search-over-grpc-edge-runtimes). `JobService` (core, always mounted) serves all three training kinds over gRPC and `InferenceService.Predict` serves a trained context predictor — so a client can offload training and prediction to a GPU server with the same verb surface the embedded engine exposes.
 
 ## Graceful shutdown
 

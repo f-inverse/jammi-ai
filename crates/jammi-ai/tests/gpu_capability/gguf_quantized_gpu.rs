@@ -668,11 +668,7 @@ async fn qlora_learns_on_gpu_with_gguf_base() {
 
     // (a) completes on the GPU, over a Quantized (GGUF) frozen base.
     job.wait().await.unwrap();
-    let record = session
-        .catalog()
-        .get_training_job(&job.job_id)
-        .await
-        .unwrap();
+    let record = session.catalog().get_job(&job.job_id).await.unwrap();
     assert_eq!(
         record.status, "completed",
         "GPU QLoRA job should complete, got {}",

@@ -38,8 +38,9 @@ Method (hermetic: `cargo metadata --no-deps`, no network, no build):
      (see step 6): accepted iff `jammi-server`'s own `flash-attn` feature
      spec is EXACTLY `["jammi-ai/flash-attn"]` (a verified 1:1 passthrough)
      AND its `default`/`cuda` real selections (checked via the same
-     `_check_exempt_member_real_lanes` helper the member loop uses,
-     including `default = ["train"]`) stay flash-free.
+     `_check_exempt_member_real_lanes` helper the member loop uses; a
+     member with no `default` key simply has no default lane to check)
+     stay flash-free.
   6. Beyond `ROOT`: for EVERY OTHER workspace member (a leak through
      `jammi-bench` or `jammi-python`, both of which reach `jammi-ai` ->
      ... -> `jammi-kernels` transitively, would not be visible from
@@ -699,7 +700,7 @@ def _synthetic(ai_cuda: list[str], kernels_extra: dict | None = None) -> dict:
         "packages": [
             {
                 "name": "jammi-server",
-                "features": {"default": ["train"], "train": [], "cuda": ["jammi-ai/cuda"],
+                "features": {"cuda": ["jammi-ai/cuda"],
                              "jetstream-broker": [], "storage-cloud": []},
                 "dependencies": [
                     {"name": "jammi-ai", "optional": False, "uses_default_features": True, "features": []},
@@ -975,7 +976,7 @@ def self_test() -> int:
 # --------------------------------------------------------------------------- #
 
 _FIXTURE_CRATE_FEATURES = {
-    "jammi-server": ["cuda", "flash-attn", "jetstream-broker", "storage-cloud", "live-gpu-tests", "train"],
+    "jammi-server": ["cuda", "flash-attn", "jetstream-broker", "storage-cloud", "live-gpu-tests"],
     "jammi-ai": ["cuda", "flash-attn", "live-gpu-tests"],
     "jammi-bench": ["cuda", "flash-attn"],
     "jammi-kernels": ["cuda", "flash-attn", "default"],

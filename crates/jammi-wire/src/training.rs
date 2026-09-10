@@ -1,4 +1,5 @@
-//! `TrainingService` proto↔domain conversions for the transport-neutral config.
+//! Transport-neutral training-config proto↔domain conversions, shared by the
+//! `jammi.v1.job` `JobService.SubmitJob` training kinds.
 //!
 //! The request `FineTuneConfig` mirrors the engine's [`FineTuneConfig`] field
 //! for field; decode starts from [`FineTuneConfig::default()`] and overrides a

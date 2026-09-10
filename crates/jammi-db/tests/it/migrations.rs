@@ -18,7 +18,7 @@ use tempfile::tempdir;
 use tokio::sync::Barrier;
 
 /// Every migration name, in ledger order. Mirrors `catalog::migrations::MIGRATIONS`
-/// (K5: append-only, currently ending at 028) -- a new migration is added here
+/// (K5: append-only, currently ending at 030) -- a new migration is added here
 /// in the same change.
 const EXPECTED_MIGRATION_NAMES: &[&str] = &[
     "001_core_tables",
@@ -49,6 +49,8 @@ const EXPECTED_MIGRATION_NAMES: &[&str] = &[
     "026_acceleration_report",
     "027_result_table_lease",
     "028_topics_next_offset",
+    "029_jobs_instances_workers",
+    "030_jobs_idempotency_key",
 ];
 
 async fn open_sqlite_backend(path: &std::path::Path) -> std::sync::Arc<SqliteBackend> {
@@ -64,10 +66,15 @@ async fn migration_005_adds_tenant_id_to_every_table() {
 
     let backend = open_sqlite_backend(&dir.path().join("catalog.db")).await;
     let backend = BackendImpl::Sqlite(backend);
+    // `training_jobs` carried a `tenant_id` column too (migration 005), but
+    // migration 029 later drops the table entirely — its post-005 shape is
+    // not observable after a full open, so it is not in this list; see
+    // `migration_029_creates_jobs_instances_workers_and_drops_training_jobs`
+    // for the current-schema equivalent (`jobs` also carries `tenant_id`).
     for table in [
         "sources",
         "models",
-        "training_jobs",
+        "jobs",
         "eval_runs",
         "result_tables",
         "evidence_channels",
@@ -103,10 +110,13 @@ async fn migration_005_creates_tenant_index_per_table() {
     let _catalog = Catalog::open(dir.path()).await.unwrap();
 
     let backend = BackendImpl::Sqlite(open_sqlite_backend(&dir.path().join("catalog.db")).await);
+    // `jobs` carries `tenant_id` (migration 029) but no dedicated tenant
+    // index of its own — `idx_jobs_claim`/`idx_jobs_lease` already cover its
+    // read paths — so it is not in this list (unlike its `training_jobs`
+    // ancestor, migration 005, which is gone after migration 029 anyway).
     for (table, idx) in [
         ("sources", "idx_sources_tenant"),
         ("models", "idx_models_tenant"),
-        ("training_jobs", "idx_training_jobs_tenant"),
         ("eval_runs", "idx_eval_runs_tenant"),
         ("result_tables", "idx_result_tables_tenant"),
         ("evidence_channels", "idx_evidence_channels_tenant"),
@@ -477,152 +487,6 @@ async fn migration_020_tenant_qualifies_channels() {
     );
 }
 
-/// Migration 015 adds the lease-based job-queue columns and the
-/// `(status, lease_expires_at)` claim index; migration 016 renames the table to
-/// `training_jobs` and the index to `idx_training_jobs_claim`. Asserted against
-/// the post-016 names via `pragma_table_info` and `sqlite_master`.
-#[tokio::test]
-async fn migration_015_adds_job_queue_columns_and_claim_index() {
-    use jammi_db::catalog::backend::SqlValue;
-
-    let dir = tempdir().unwrap();
-    let _catalog = Catalog::open(dir.path()).await.unwrap();
-    let backend = BackendImpl::Sqlite(open_sqlite_backend(&dir.path().join("catalog.db")).await);
-
-    let columns = backend
-        .transaction(
-            TxOptions {
-                read_only: true,
-                ..Default::default()
-            },
-            |tx| {
-                Box::pin(async move {
-                    tx.query::<_, String>(
-                        "SELECT name FROM pragma_table_info('training_jobs')",
-                        &[],
-                        |row| row.get("name"),
-                    )
-                    .await
-                })
-            },
-        )
-        .await
-        .unwrap();
-    for expected in [
-        "kind",
-        "claimed_by",
-        "lease_expires_at",
-        "attempts",
-        "training_spec",
-    ] {
-        assert!(
-            columns.iter().any(|c| c == expected),
-            "training_jobs must have '{expected}' after migrations 015+016; got {columns:?}"
-        );
-    }
-
-    let index_exists = backend
-        .transaction(
-            TxOptions {
-                read_only: true,
-                ..Default::default()
-            },
-            |tx| {
-                Box::pin(async move {
-                    let rows: Vec<i64> = tx
-                        .query(
-                            "SELECT 1 AS one FROM sqlite_master \
-                             WHERE type='index' AND name=$1 AND tbl_name='training_jobs'",
-                            &[SqlValue::TextOwned("idx_training_jobs_claim".into())],
-                            |row| row.get::<i64>("one"),
-                        )
-                        .await?;
-                    Ok(!rows.is_empty())
-                })
-            },
-        )
-        .await
-        .unwrap();
-    assert!(
-        index_exists,
-        "idx_training_jobs_claim must exist after migrations 015+016"
-    );
-}
-
-/// Migration 016 renames the job table `fine_tune_jobs → training_jobs` and its
-/// three indexes (`idx_fine_tune_jobs_{status,tenant,claim} →
-/// idx_training_jobs_{status,tenant,claim}`). After a full open the renamed
-/// table and indexes exist and the old names are gone. Asserted via
-/// `sqlite_master`.
-#[tokio::test]
-async fn migration_016_renames_job_table_and_indexes() {
-    use jammi_db::catalog::backend::SqlValue;
-
-    let dir = tempdir().unwrap();
-    let _catalog = Catalog::open(dir.path()).await.unwrap();
-    let backend = BackendImpl::Sqlite(open_sqlite_backend(&dir.path().join("catalog.db")).await);
-
-    let object_exists = |kind: &'static str, name: &'static str| {
-        let backend = &backend;
-        async move {
-            backend
-                .transaction(
-                    TxOptions {
-                        read_only: true,
-                        ..Default::default()
-                    },
-                    |tx| {
-                        Box::pin(async move {
-                            let rows: Vec<i64> = tx
-                                .query(
-                                    "SELECT 1 AS one FROM sqlite_master \
-                                     WHERE type=$1 AND name=$2",
-                                    &[
-                                        SqlValue::TextOwned(kind.into()),
-                                        SqlValue::TextOwned(name.into()),
-                                    ],
-                                    |row| row.get::<i64>("one"),
-                                )
-                                .await?;
-                            Ok(!rows.is_empty())
-                        })
-                    },
-                )
-                .await
-                .unwrap()
-        }
-    };
-
-    assert!(
-        object_exists("table", "training_jobs").await,
-        "training_jobs table must exist after migration 016"
-    );
-    assert!(
-        !object_exists("table", "fine_tune_jobs").await,
-        "fine_tune_jobs table must be gone after migration 016"
-    );
-    for renamed in [
-        "idx_training_jobs_status",
-        "idx_training_jobs_tenant",
-        "idx_training_jobs_claim",
-    ] {
-        assert!(
-            object_exists("index", renamed).await,
-            "index '{renamed}' must exist after migration 016"
-        );
-    }
-    for old in [
-        "idx_fine_tune_jobs_status",
-        "idx_fine_tune_jobs_tenant",
-        "idx_fine_tune_jobs_claim",
-    ] {
-        assert!(
-            !object_exists("index", old).await,
-            "old index '{old}' must be gone after migration 016"
-        );
-    }
-}
-
 /// Migration 012 rebuilds `topics` so name uniqueness is scoped per tenant
 /// (`UNIQUE(name, tenant_id)`) instead of the global `UNIQUE(name)` migration
 /// 009 created. After the migration, two different tenants must be able to
@@ -879,48 +743,19 @@ async fn migration_023_adds_storage_precision_and_oversample_columns() {
     }
 }
 
-/// Migration 024 adds the claim-policy columns (`priority`, `claimable`) and
-/// the `idx_training_jobs_claim_policy` index to `training_jobs`, on both a
-/// fresh catalog and a catalog migrated up from a pre-024 file — the older
-/// reclaim index (`idx_training_jobs_claim`, migration 016) survives either
-/// way, and a row born under either schema backfills to the same defaults
-/// (`priority = 0`, `claimable = TRUE`).
+/// Migration 029 creates `jobs`/`instances`/`workers` and drops
+/// `training_jobs` (and its predecessor name, `fine_tune_jobs`) entirely — no
+/// shim, no compatibility view. `idx_jobs_claim`, `idx_jobs_lease`, and
+/// `idx_instances_seen` (N10) all exist on a fresh, fully-migrated catalog.
 #[tokio::test]
-async fn migration_024_adds_claim_policy_columns_and_index() {
+async fn migration_029_creates_jobs_instances_workers_and_drops_training_jobs() {
     use jammi_db::catalog::backend::SqlValue;
-    use jammi_db::catalog::model_repo::RegisterModelParams;
-    use jammi_db::catalog::training_repo::CreateTrainingJobParams;
-    use jammi_db::model_task::ModelTask;
 
     let dir = tempdir().unwrap();
-    let catalog = Catalog::open(dir.path()).await.unwrap();
+    let _catalog = Catalog::open(dir.path()).await.unwrap();
     let backend = BackendImpl::Sqlite(open_sqlite_backend(&dir.path().join("catalog.db")).await);
 
-    let table_columns = || {
-        let backend = &backend;
-        async move {
-            backend
-                .transaction(
-                    TxOptions {
-                        read_only: true,
-                        ..Default::default()
-                    },
-                    |tx| {
-                        Box::pin(async move {
-                            tx.query::<_, String>(
-                                "SELECT name FROM pragma_table_info('training_jobs')",
-                                &[],
-                                |row| row.get("name"),
-                            )
-                            .await
-                        })
-                    },
-                )
-                .await
-                .unwrap()
-        }
-    };
-    let index_exists = |name: &'static str| {
+    let object_exists = |kind: &'static str, name: &'static str| {
         let backend = &backend;
         async move {
             backend
@@ -933,9 +768,11 @@ async fn migration_024_adds_claim_policy_columns_and_index() {
                         Box::pin(async move {
                             let rows: Vec<i64> = tx
                                 .query(
-                                    "SELECT 1 AS one FROM sqlite_master \
-                                     WHERE type='index' AND name=$1 AND tbl_name='training_jobs'",
-                                    &[SqlValue::TextOwned(name.into())],
+                                    "SELECT 1 AS one FROM sqlite_master WHERE type=$1 AND name=$2",
+                                    &[
+                                        SqlValue::TextOwned(kind.into()),
+                                        SqlValue::TextOwned(name.into()),
+                                    ],
                                     |row| row.get::<i64>("one"),
                                 )
                                 .await?;
@@ -947,248 +784,98 @@ async fn migration_024_adds_claim_policy_columns_and_index() {
                 .unwrap()
         }
     };
-    let job_claim_policy = |job_id: &'static str| {
-        let backend = &backend;
-        async move {
-            backend
-                .transaction(
-                    TxOptions {
-                        read_only: true,
-                        ..Default::default()
-                    },
-                    |tx| {
-                        Box::pin(async move {
-                            tx.query::<_, (i64, bool)>(
-                                "SELECT priority, claimable FROM training_jobs WHERE job_id = $1",
-                                &[SqlValue::TextOwned(job_id.into())],
-                                |row| Ok((row.get("priority")?, row.get("claimable")?)),
-                            )
-                            .await
-                        })
-                    },
-                )
-                .await
-                .unwrap()
-                .into_iter()
-                .next()
-                .unwrap_or_else(|| panic!("job '{job_id}' must exist"))
-        }
-    };
 
-    // --- Fresh catalog: the columns and the new index exist; the older
-    // reclaim index survives alongside the new one. ---
-    let columns = table_columns().await;
-    for expected in ["priority", "claimable"] {
+    for gone in ["training_jobs", "fine_tune_jobs"] {
         assert!(
-            columns.iter().any(|c| c == expected),
-            "training_jobs must have '{expected}' after migration 024; got {columns:?}"
+            !object_exists("table", gone).await,
+            "'{gone}' must be gone after migration 029"
         );
     }
-    assert!(
-        index_exists("idx_training_jobs_claim_policy").await,
-        "idx_training_jobs_claim_policy must exist after migration 024"
-    );
-    assert!(
-        index_exists("idx_training_jobs_claim").await,
-        "idx_training_jobs_claim (the reclaim index, migration 016) must survive migration 024"
-    );
-
-    // A freshly enqueued row is born at the defaults.
-    catalog
-        .register_model(RegisterModelParams {
-            model_id: "shape-base",
-            version: 1,
-            model_type: "embedding",
-            backend: "candle",
-            task: ModelTask::TextEmbedding,
-            base_model_id: None,
-            artifact_path: None,
-            config_json: None,
-        })
-        .await
-        .unwrap();
-    catalog
-        .create_training_job(CreateTrainingJobParams {
-            job_id: "fresh",
-            base_model_id: "shape-base::1",
-            training_source: "src.csv",
-            loss_type: "contrastive",
-            hyperparams: "{}",
-            kind: "fine_tune",
-            training_spec: "{}",
-        })
-        .await
-        .unwrap();
-    let (priority, claimable) = job_claim_policy("fresh").await;
-    assert_eq!(priority, 0, "a freshly enqueued job defaults to priority 0");
-    assert!(
-        claimable,
-        "a freshly enqueued job defaults to claimable = TRUE"
-    );
-
-    // --- Pre-024-migrated catalog: roll migration 024 back by hand (drop its
-    // index and columns, remove its ledger entry) to reproduce the schema a
-    // pre-024 catalog file would carry, insert a row under that schema, then
-    // reopen — the runner re-applies 024 on top of the existing row and
-    // backfills it to the same defaults, exactly as a real upgrade would. ---
-    backend
-        .transaction(TxOptions::default(), |tx| {
-            Box::pin(async move {
-                tx.execute("DROP INDEX idx_training_jobs_claim_policy", &[])
-                    .await?;
-                tx.execute("ALTER TABLE training_jobs DROP COLUMN claimable", &[])
-                    .await?;
-                tx.execute("ALTER TABLE training_jobs DROP COLUMN priority", &[])
-                    .await?;
-                tx.execute(
-                    "DELETE FROM applied_migrations WHERE name = '024_claim_policy'",
-                    &[],
-                )
-                .await?;
-                Ok(())
-            })
-        })
-        .await
-        .unwrap();
-
-    catalog
-        .create_training_job(CreateTrainingJobParams {
-            job_id: "pre-024",
-            base_model_id: "shape-base::1",
-            training_source: "src.csv",
-            loss_type: "contrastive",
-            hyperparams: "{}",
-            kind: "fine_tune",
-            training_spec: "{}",
-        })
-        .await
-        .unwrap();
-
-    drop(catalog);
-    let _reopened = Catalog::open(dir.path()).await.unwrap();
-
-    let columns_after = table_columns().await;
-    for expected in ["priority", "claimable"] {
+    for table in ["jobs", "instances", "workers"] {
         assert!(
-            columns_after.iter().any(|c| c == expected),
-            "training_jobs must regain '{expected}' after re-applying migration 024; \
-             got {columns_after:?}"
+            object_exists("table", table).await,
+            "'{table}' must exist after migration 029"
         );
     }
-    assert!(
-        index_exists("idx_training_jobs_claim_policy").await,
-        "idx_training_jobs_claim_policy must exist again after re-applying migration 024"
-    );
-    assert!(
-        index_exists("idx_training_jobs_claim").await,
-        "idx_training_jobs_claim must still exist after re-applying migration 024"
-    );
-
-    let (priority, claimable) = job_claim_policy("pre-024").await;
-    assert_eq!(
-        priority, 0,
-        "a row born before migration 024 backfills to priority 0"
-    );
-    assert!(
-        claimable,
-        "a row born before migration 024 backfills to claimable = TRUE"
-    );
+    for idx in ["idx_jobs_claim", "idx_jobs_lease", "idx_instances_seen"] {
+        assert!(
+            object_exists("index", idx).await,
+            "index '{idx}' must exist after migration 029"
+        );
+    }
 }
 
-/// Migration 026 adds the `acceleration_report` column to `training_jobs`
-/// (esc-075). Asserted append-only-append (the column exists on a fresh open,
-/// migrations remain idempotent across a reopen) and the two catalog-owned
-/// states of its producer-owned-payload contract: a row that predates the
-/// migration reads back `NULL` — "unknown" — never a fabricated `pending`,
-/// while a row created after the migration through
-/// [`Catalog::create_training_job`] carries the explicit
-/// `{"state":"pending"}` marker from `INSERT` onward. Every other payload
-/// shape (e.g. `{"state":"determined", ...}`) is the producer's to define and
-/// is exercised in `fine_tune_queue.rs`, not here.
+/// Migration 029 copies every pre-existing `training_jobs` row into `jobs`
+/// with `execution = 'queued'`, then drops `training_jobs`. Exercised by
+/// manufacturing the exact pre-029 state on a fully-migrated catalog (drop the
+/// 029-created tables, recreate `training_jobs` in its final pre-029 shape,
+/// seed one row, clear the ledger's `029_jobs_instances_workers` row) and
+/// reopening — the reopen re-runs the REAL migration 029 DDL (never a
+/// test-duplicated copy of it) against that manufactured state.
 #[tokio::test]
-async fn migration_026_adds_acceleration_report_column_with_tristate_backfill() {
-    use jammi_db::catalog::model_repo::RegisterModelParams;
-    use jammi_db::catalog::training_repo::CreateTrainingJobParams;
-    use jammi_db::model_task::ModelTask;
+async fn migration_029_copies_training_jobs_rows_into_jobs_as_queued() {
+    use jammi_db::catalog::backend::SqlValue;
 
     let dir = tempdir().unwrap();
-    let catalog = Catalog::open(dir.path()).await.unwrap();
+    {
+        let _catalog = Catalog::open(dir.path()).await.unwrap();
+    }
     let backend = BackendImpl::Sqlite(open_sqlite_backend(&dir.path().join("catalog.db")).await);
 
-    // --- Fresh catalog: the column exists. ---
-    let columns = backend
-        .transaction(
-            TxOptions {
-                read_only: true,
-                ..Default::default()
-            },
-            |tx| {
-                Box::pin(async move {
-                    tx.query::<_, String>(
-                        "SELECT name FROM pragma_table_info('training_jobs')",
-                        &[],
-                        |row| row.get("name"),
-                    )
-                    .await
-                })
-            },
-        )
-        .await
-        .unwrap();
-    assert!(
-        columns.iter().any(|c| c == "acceleration_report"),
-        "training_jobs must have 'acceleration_report' after migration 026; got {columns:?}"
-    );
-
-    // A freshly-submitted job carries the explicit pending marker, never NULL.
-    catalog
-        .register_model(RegisterModelParams {
-            model_id: "acc-base",
-            version: 1,
-            model_type: "embedding",
-            backend: "candle",
-            task: ModelTask::TextEmbedding,
-            base_model_id: None,
-            artifact_path: None,
-            config_json: None,
-        })
-        .await
-        .unwrap();
-    catalog
-        .create_training_job(CreateTrainingJobParams {
-            job_id: "acc-fresh",
-            base_model_id: "acc-base::1",
-            training_source: "src.csv",
-            loss_type: "contrastive",
-            hyperparams: "{}",
-            kind: "fine_tune",
-            training_spec: "{}",
-        })
-        .await
-        .unwrap();
-    let fresh = catalog.get_training_job("acc-fresh").await.unwrap();
-    assert_eq!(
-        fresh.acceleration_report.as_deref(),
-        Some(r#"{"state":"pending"}"#),
-        "a freshly submitted job must carry the explicit pending marker"
-    );
-
-    // --- Pre-026-migrated catalog: roll migration 026 back by hand to
-    // reproduce a pre-migration schema, insert a row under that schema (no
-    // acceleration_report column at all, so the eventual backfilled value is
-    // SQL NULL, not an empty string or fabricated pending marker), then
-    // reopen — the runner re-applies 026 and the legacy row reads back NULL
-    // ("unknown"), never "pending" or any other fabricated state. ---
     backend
         .transaction(TxOptions::default(), |tx| {
             Box::pin(async move {
+                tx.execute("DROP TABLE workers", &[]).await?;
+                tx.execute("DROP TABLE instances", &[]).await?;
+                tx.execute("DROP TABLE jobs", &[]).await?;
                 tx.execute(
-                    "ALTER TABLE training_jobs DROP COLUMN acceleration_report",
+                    "DELETE FROM applied_migrations WHERE name = '029_jobs_instances_workers'",
+                    &[],
+                )
+                .await?;
+                // The FK target `jobs.model_ref` (migration 029's DDL)
+                // requires — the copy's `base_model_id -> model_ref` value
+                // must resolve.
+                tx.execute(
+                    "INSERT INTO models (model_id, name, model_type, task) \
+                     VALUES ('base::1', 'base', 'embedding', 'text-embedding')",
                     &[],
                 )
                 .await?;
                 tx.execute(
-                    "DELETE FROM applied_migrations WHERE name = '026_acceleration_report'",
+                    "CREATE TABLE training_jobs ( \
+                         job_id TEXT PRIMARY KEY, \
+                         base_model_id TEXT NOT NULL, \
+                         output_model_id TEXT, \
+                         training_source TEXT NOT NULL, \
+                         loss_type TEXT NOT NULL, \
+                         hyperparams TEXT NOT NULL, \
+                         status TEXT NOT NULL DEFAULT 'queued', \
+                         metrics TEXT, \
+                         created_at TEXT NOT NULL DEFAULT (CAST(CURRENT_TIMESTAMP AS TEXT)), \
+                         updated_at TEXT NOT NULL DEFAULT (CAST(CURRENT_TIMESTAMP AS TEXT)), \
+                         tenant_id TEXT, \
+                         kind TEXT NOT NULL DEFAULT 'fine_tune', \
+                         claimed_by TEXT, \
+                         lease_expires_at TEXT, \
+                         attempts INTEGER NOT NULL DEFAULT 0, \
+                         training_spec TEXT, \
+                         priority INTEGER NOT NULL DEFAULT 0, \
+                         claimable BOOLEAN NOT NULL DEFAULT TRUE, \
+                         acceleration_report TEXT \
+                     )",
+                    &[],
+                )
+                .await?;
+                tx.execute(
+                    "INSERT INTO training_jobs \
+                     (job_id, base_model_id, output_model_id, training_source, loss_type, \
+                      hyperparams, status, kind, training_spec, priority, claimable, \
+                      acceleration_report, created_at, updated_at) \
+                     VALUES ('legacy-1', 'base::1', 'tuned::1', 'src', 'cosine', '{}', \
+                             'queued', 'fine_tune', '{\"lr\":1}', 3, TRUE, \
+                             '{\"state\":\"pending\"}', '2024-01-01T00:00:00.000000Z', \
+                             '2024-01-01T00:00:00.000000Z')",
                     &[],
                 )
                 .await?;
@@ -1197,29 +884,32 @@ async fn migration_026_adds_acceleration_report_column_with_tristate_backfill() 
         })
         .await
         .unwrap();
-    backend
-        .transaction(TxOptions::default(), |tx| {
-            Box::pin(async move {
-                tx.execute(
-                    "INSERT INTO training_jobs \
-                     (job_id, base_model_id, training_source, loss_type, hyperparams, status, kind, \
-                      training_spec) \
-                     VALUES ('acc-legacy', 'acc-base::1', 'src.csv', 'contrastive', '{}', 'queued', \
-                              'fine_tune', '{}')",
-                    &[],
-                )
-                .await
-            })
-        })
-        .await
-        .unwrap();
 
-    drop(catalog);
+    // The reopen re-runs migration 029 for real (the ledger does not name
+    // it) against the manufactured pre-029 state above.
     let reopened = Catalog::open(dir.path()).await.unwrap();
+    let job = reopened.get_job("legacy-1").await.unwrap();
+    assert_eq!(
+        job.execution, "queued",
+        "every copied row is execution='queued'"
+    );
+    assert_eq!(job.status, "queued");
+    assert_eq!(job.kind, "fine_tune");
+    assert_eq!(job.spec, "{\"lr\":1}");
+    assert_eq!(job.model_ref.as_deref(), Some("base::1"));
+    assert_eq!(job.output_model_id.as_deref(), Some("tuned::1"));
+    assert_eq!(job.model_source, None);
+    assert_eq!(job.priority, 3);
+    assert!(job.claimable);
+    assert_eq!(job.partial_result, None);
+    assert_eq!(
+        job.acceleration_report.as_deref(),
+        Some("{\"state\":\"pending\"}")
+    );
 
-    // Idempotent re-open: migrations run again with no error, and the column
-    // is back.
-    let columns_after = backend
+    let raw_backend =
+        BackendImpl::Sqlite(open_sqlite_backend(&dir.path().join("catalog.db")).await);
+    let table_exists = raw_backend
         .transaction(
             TxOptions {
                 read_only: true,
@@ -1227,39 +917,22 @@ async fn migration_026_adds_acceleration_report_column_with_tristate_backfill() 
             },
             |tx| {
                 Box::pin(async move {
-                    tx.query::<_, String>(
-                        "SELECT name FROM pragma_table_info('training_jobs')",
-                        &[],
-                        |row| row.get("name"),
-                    )
-                    .await
+                    let rows: Vec<i64> = tx
+                        .query(
+                            "SELECT 1 AS one FROM sqlite_master WHERE type='table' AND name=$1",
+                            &[SqlValue::TextOwned("training_jobs".into())],
+                            |row| row.get::<i64>("one"),
+                        )
+                        .await?;
+                    Ok(!rows.is_empty())
                 })
             },
         )
         .await
         .unwrap();
     assert!(
-        columns_after.iter().any(|c| c == "acceleration_report"),
-        "training_jobs must regain 'acceleration_report' after re-applying migration 026"
-    );
-
-    let legacy = reopened.get_training_job("acc-legacy").await.unwrap();
-    assert_eq!(
-        legacy.acceleration_report, None,
-        "a row born before migration 026 backfills to NULL ('unknown'), never a \
-         fabricated pending or determined state"
-    );
-
-    // A genuinely idempotent re-open (no manual rollback this time — the
-    // column and the `applied_migrations` row are both already in place):
-    // running the migration set again must be a no-op, leaving the
-    // backfilled legacy row's NULL exactly as it was.
-    drop(reopened);
-    let reopened_again = Catalog::open(dir.path()).await.unwrap();
-    let legacy_after_second_reopen = reopened_again.get_training_job("acc-legacy").await.unwrap();
-    assert_eq!(
-        legacy_after_second_reopen.acceleration_report, None,
-        "a second, genuinely idempotent reopen must not disturb the backfilled NULL"
+        !table_exists,
+        "training_jobs must be dropped by migration 029"
     );
 }
 

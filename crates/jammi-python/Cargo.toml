@@ -29,7 +29,11 @@ jammi-db.workspace = true
 # `local` feature) and `tonic` (only its `Status` type, the decode/validation
 # error this crate maps to a Python exception) ride the wheel transitively. No
 # transport stack (no client stubs, no channel) is linked.
-jammi-ai = { workspace = true }
+# `telemetry-otlp` (#486): the embed wheel carries the same vendor-neutral
+# OTLP export `jammi-server` does, wired in `open_local` — B4, one factory
+# (`jammi_ai::telemetry::otlp_layer`) both consume. The wheel-size cost is
+# noted in the CHANGELOG.
+jammi-ai = { workspace = true, features = ["telemetry-otlp"] }
 # Names only `tonic::Status`: the engine wire-decode seam reports a malformed or
 # invalid request body as a `Status`, mapped to a Python exception in `error.rs`.
 tonic = { workspace = true }

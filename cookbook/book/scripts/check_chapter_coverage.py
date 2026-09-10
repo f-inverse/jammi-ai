@@ -349,12 +349,47 @@ ACCOUNTING: list[tuple[str, ExerciseEntry]] = [
     )),
     # Re-attach + listing, both live in chapter 22 against a real server: the
     # job outlives the connection that submitted it, and the catalog is what
-    # remembers both outcomes.
-    ("training_job", DirectCell(
-        "22-precision/finetune-acceleration.qmd", "remote.training_job(",
+    # remembers both outcomes. `list_jobs`/`job` are ALSO exercised directly
+    # in chapter 20 (recompute) over a cheap, model-free `asof_join` job — the
+    # generalised job queue every compute verb now submits through internally
+    # — but the ACCOUNTING row points at chapter 22's real-server
+    # exercise, the richer of the two live call sites.
+    ("job", DirectCell(
+        "22-precision/finetune-acceleration.qmd", "remote.job(",
     )),
-    ("list_training_jobs", DirectCell(
-        "22-precision/finetune-acceleration.qmd", "remote.list_training_jobs(",
+    ("list_jobs", DirectCell(
+        "22-precision/finetune-acceleration.qmd", "remote.list_jobs(",
+    )),
+    # `cancel_job` / `list_workers` / `prune_jobs` are new job verbs with no
+    # chapter cell yet — a reviewed, dated gap, not a silent one.
+    ("cancel_job", Deferred(
+        reason=(
+            "no cookbook/book/chapters/*.qmd cell or scripts/build_*_cache.py "
+            "calls Database.cancel_job yet; needs a chapter cell (e.g. a "
+            "submit-then-cancel-then-list cell) or a build script + "
+            "load_artifact pairing to close."
+        ),
+        owner="maintainers",
+        date="2026-09-10",
+    )),
+    ("list_workers", Deferred(
+        reason=(
+            "no cookbook/book/chapters/*.qmd cell or scripts/build_*_cache.py "
+            "calls Database.list_workers yet; needs a chapter cell exercising "
+            "the worker-fleet listing (e.g. alongside the run-worker-config "
+            "story) to close."
+        ),
+        owner="maintainers",
+        date="2026-09-10",
+    )),
+    ("prune_jobs", Deferred(
+        reason=(
+            "no cookbook/book/chapters/*.qmd cell or scripts/build_*_cache.py "
+            "calls Database.prune_jobs yet; needs a chapter cell exercising "
+            "the retention sweep to close."
+        ),
+        owner="maintainers",
+        date="2026-09-10",
     )),
     # -- evaluation ------------------------------------------------------------ #
     ("eval_embeddings", CacheLane(

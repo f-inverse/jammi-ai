@@ -14,10 +14,10 @@ fn tiny_bert_model() -> String {
     "local:".to_string() + common::cookbook_fixture("tiny_bert").to_str().unwrap()
 }
 
-async fn session_with_patents() -> (InferenceSession, TempDir) {
+async fn session_with_patents() -> (Arc<InferenceSession>, TempDir) {
     let dir = TempDir::new().unwrap();
     let config = common::test_config(dir.path());
-    let session = InferenceSession::new(config).await.unwrap();
+    let session = Arc::new(InferenceSession::new(config).await.unwrap());
     session
         .add_source(
             "patents",
@@ -49,6 +49,7 @@ async fn generate_embeddings_produces_complete_result() {
             &["abstract".to_string()],
             "id",
             jammi_db::store::CachePolicy::Bypass,
+            None,
         )
         .await
         .unwrap()
@@ -136,6 +137,7 @@ async fn multiple_tables_and_sidecar_fallback() {
             &["abstract".to_string()],
             "id",
             jammi_db::store::CachePolicy::Bypass,
+            None,
         )
         .await
         .unwrap()
@@ -148,6 +150,7 @@ async fn multiple_tables_and_sidecar_fallback() {
             &["title".to_string()],
             "id",
             jammi_db::store::CachePolicy::Bypass,
+            None,
         )
         .await
         .unwrap()
@@ -188,7 +191,7 @@ async fn multiple_tables_and_sidecar_fallback() {
 async fn failed_rows_skipped_in_embedding_output() {
     let dir = TempDir::new().unwrap();
     let config = common::test_config(dir.path());
-    let session = InferenceSession::new(config).await.unwrap();
+    let session = Arc::new(InferenceSession::new(config).await.unwrap());
 
     session
         .add_source(
@@ -210,6 +213,7 @@ async fn failed_rows_skipped_in_embedding_output() {
             &["abstract".to_string()],
             "id",
             jammi_db::store::CachePolicy::Bypass,
+            None,
         )
         .await
         .unwrap()
@@ -264,7 +268,7 @@ async fn existing_tables_loaded_on_new_session() {
 
     // First session: generate embeddings
     {
-        let session = InferenceSession::new(config.clone()).await.unwrap();
+        let session = Arc::new(InferenceSession::new(config.clone()).await.unwrap());
         session
             .add_source(
                 "patents",
@@ -285,6 +289,7 @@ async fn existing_tables_loaded_on_new_session() {
                 &["abstract".to_string()],
                 "id",
                 jammi_db::store::CachePolicy::Bypass,
+                None,
             )
             .await
             .unwrap();
@@ -292,7 +297,7 @@ async fn existing_tables_loaded_on_new_session() {
 
     // Second session: result table should be queryable without re-generating
     {
-        let session = InferenceSession::new(config).await.unwrap();
+        let session = Arc::new(InferenceSession::new(config).await.unwrap());
         let tables = session
             .catalog()
             .find_result_tables("patents", Some(ModelTask::TextEmbedding), None)
@@ -344,6 +349,7 @@ async fn concurrent_embedding_generation_on_same_source() {
                 &["title".to_string()],
                 "id",
                 jammi_db::store::CachePolicy::Bypass,
+                None,
             )
             .await
     });
@@ -358,6 +364,7 @@ async fn concurrent_embedding_generation_on_same_source() {
                 &["abstract".to_string()],
                 "id",
                 jammi_db::store::CachePolicy::Bypass,
+                None,
             )
             .await
     });
@@ -400,7 +407,7 @@ async fn concurrent_embedding_generation_on_same_source() {
 async fn large_batch_embedding_completes_without_oom() {
     let dir = TempDir::new().unwrap();
     let config = common::test_config(dir.path());
-    let session = InferenceSession::new(config).await.unwrap();
+    let session = Arc::new(InferenceSession::new(config).await.unwrap());
 
     // Generate a 5000-row Parquet file
     let texts = [
@@ -471,6 +478,7 @@ async fn large_batch_embedding_completes_without_oom() {
             &["text".to_string()],
             "id",
             jammi_db::store::CachePolicy::Bypass,
+            None,
         )
         .await
         .unwrap()
@@ -499,6 +507,7 @@ async fn cache_use_on_embeddings_always_recomputes_unpinned_source() {
             &["abstract".to_string()],
             "id",
             CachePolicy::Use,
+            None,
         )
         .await
         .unwrap();
@@ -513,6 +522,7 @@ async fn cache_use_on_embeddings_always_recomputes_unpinned_source() {
             &["abstract".to_string()],
             "id",
             CachePolicy::Use,
+            None,
         )
         .await
         .unwrap();

@@ -43,7 +43,7 @@ def _server_on(artifact_dir, *, env_overrides=None):
     `env_overrides` are applied last, over this fixture's own `JAMMI_*` keys —
     the deployment knobs a test needs the server to answer differently, read by
     the server's `JammiConfig::load` exactly as an operator's would be (e.g.
-    `JAMMI_TRAINING__RUN_WORKER=false`, to hold a seeded job `queued` so a read
+    `JAMMI_WORKER__ENABLED=false`, to hold a seeded job `queued` so a read
     is compared against a stable row rather than a moving one).
     """
     flight_port = _free_port()

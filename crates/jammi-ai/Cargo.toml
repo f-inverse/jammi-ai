@@ -118,7 +118,31 @@ chrono.workspace = true
 tonic = { workspace = true, optional = true }
 prost = { workspace = true, optional = true }
 
+# Vendor-neutral OTLP trace export (#486), behind `telemetry-otlp`. `jammi_ai::telemetry`
+# is the one place this crate names any of the five: the factory
+# (`telemetry::otlp_layer`) builds the exporter + tracer provider from
+# `jammi_db::config::ObservabilityConfig`, and the same module's
+# `set_parent_from_headers` continues an incoming W3C `traceparent` — both
+# consumed by `jammi-server`'s `telemetry::install` / `TraceContextLayer` and
+# by `jammi-python`'s `open_local` subscriber (B4: the factory lives in the
+# library, not duplicated per consumer). `tracing-subscriber` rides this
+# feature (rather than being an unconditional dependency) because the
+# `Layer<S>` bound `telemetry::otlp_layer` returns only has a reason to exist
+# under this feature; it is otherwise dev-dependency-only (this crate's own
+# GPU-capability test harness).
+opentelemetry = { workspace = true, optional = true }
+opentelemetry_sdk = { workspace = true, optional = true }
+opentelemetry-otlp = { workspace = true, optional = true }
+tracing-opentelemetry = { workspace = true, optional = true }
+tracing-subscriber = { workspace = true, optional = true }
+http = { workspace = true, optional = true }
+
 [dev-dependencies]
+# This crate's own test targets run with `test-hooks` on (the rendezvous
+# inside `jammi_ai::jobs::execute_compute`); a self dev-dependency is how a
+# package turns a feature on for its tests without a `--features` flag on
+# every `cargo test` invocation. Consumers never see the feature.
+jammi-ai = { path = ".", features = ["test-hooks"] }
 tempfile = "3"
 tokio.workspace = true
 parquet.workspace = true
@@ -139,6 +163,14 @@ rand_distr.workspace = true
 # `avg_train_loss` off its `tracing` events (a `Layer` over the in-process
 # worker) to prove on-device learning — the loss-decrease property. Test-only.
 tracing-subscriber.workspace = true
+# The `telemetry-otlp` RED test's stub OTLP collector: a real (in-process,
+# loopback) tonic server implementing `opentelemetry.proto.collector.trace.v1
+# .TraceService`, generated from the SAME `opentelemetry-proto` version
+# `opentelemetry-otlp` depends on (kept in lockstep so the wire shape the
+# exporter sends and the shape this stub decodes never drift independently).
+# `gen-tonic` for the generated server trait + tonic-prost codec; `trace` for
+# the trace-service message types. Test-only.
+opentelemetry-proto = { version = "0.32", default-features = false, features = ["gen-tonic", "trace"] }
 
 [features]
 default = ["local"]
@@ -174,6 +206,38 @@ local = [
     "jammi-lora/candle",
 ]
 live-hub-tests = []
+# Vendor-neutral OTLP trace export (#486): `jammi_ai::telemetry::otlp_layer`
+# and the incoming-`traceparent` continuation helper. Off by default (so a
+# thin/bench/CLI consumer of this crate pulls no OTel stack); `jammi-server`
+# and `jammi-python` each enable it explicitly in their own `Cargo.toml`
+# (`jammi-ai = { workspace = true, features = ["telemetry-otlp"] }`),
+# matching the `local`/`cuda` by-name-passthrough precedent below rather
+# than folding it into `default`. Implies `dep:tonic` (the OTLP exporter's
+# gRPC transport, and the metadata type `otlp_headers` resolves into) even
+# though this crate's own `local` feature already carries `tonic` for the
+# unrelated wire-decode seam — the two features are independent knobs and
+# each must be self-sufficient.
+telemetry-otlp = [
+    "dep:opentelemetry",
+    "dep:opentelemetry_sdk",
+    "dep:opentelemetry-otlp",
+    "dep:tracing-opentelemetry",
+    "dep:tracing-subscriber",
+    "dep:http",
+    "dep:tonic",
+]
+# Test-only rendezvous hooks inside `jammi_ai::jobs::execute_compute` /
+# `InferenceSession::run_now` (`jammi_ai::jobs::compute_test_hooks`): a test
+# parks a compute job at a documented checkpoint and manufactures a cancel
+# request or a peer's write there. Forwards to the `jammi-db` crate's own
+# `test-hooks` peer (#485: `LeaseKeeper::kill_thread_for_test`
+# is the only way to observe a genuine lease-renewal miss on the SAME hold
+# without a second worker's claim/reclaim ever touching the row, which a
+# claimed-job cancel-vs-lease-loss test needs and no in-crate seam can
+# reach) — a private-dependency feature union that compiles away entirely
+# when this feature is off. On for this crate's own tests via the self
+# dev-dependency above; off for every consumer.
+test-hooks = ["jammi-db/test-hooks"]
 # A gated, multi-process distributed-validation lane: spawns N `jammi-server`
 # worker processes against a shared Postgres catalog + shared object store
 # (MinIO) and asserts the durable-worker fleet-safety properties (exactly-one

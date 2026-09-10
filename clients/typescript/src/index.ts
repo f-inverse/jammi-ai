@@ -27,7 +27,7 @@ import { EmbeddingService } from "./gen/jammi/v1/embedding_pb.js";
 import { InferenceService } from "./gen/jammi/v1/inference_pb.js";
 import { EvalService } from "./gen/jammi/v1/eval_pb.js";
 import { PipelineService } from "./gen/jammi/v1/pipeline_pb.js";
-import { TrainingService } from "./gen/jammi/v1/training_pb.js";
+import { JobService } from "./gen/jammi/v1/job_pb.js";
 import { TriggerService } from "./gen/jammi/v1/trigger_pb.js";
 import { AuditService } from "./gen/jammi/v1/audit_pb.js";
 
@@ -38,6 +38,7 @@ export * from "./gen/jammi/v1/inference_pb.js";
 export * from "./gen/jammi/v1/eval_pb.js";
 export * from "./gen/jammi/v1/pipeline_pb.js";
 export * from "./gen/jammi/v1/training_pb.js";
+export * from "./gen/jammi/v1/job_pb.js";
 export * from "./gen/jammi/v1/trigger_pb.js";
 export * from "./gen/jammi/v1/audit_pb.js";
 export * from "./gen/jammi/v1/error_pb.js";
@@ -80,7 +81,10 @@ export interface JammiClient {
   readonly inference: Client<typeof InferenceService>;
   readonly eval: Client<typeof EvalService>;
   readonly pipeline: Client<typeof PipelineService>;
-  readonly training: Client<typeof TrainingService>;
+  /** Durable jobs — `SubmitJob`/`JobStatus`/`WaitJob`/`ListJobs`/`CancelJob`/
+   *  `ListWorkers`/`PruneJobs` (`JobService`; replaces the old
+   *  `TrainingService`). */
+  readonly job: Client<typeof JobService>;
   readonly trigger: Client<typeof TriggerService>;
   readonly audit: Client<typeof AuditService>;
 }
@@ -122,7 +126,7 @@ export function connect(endpoint: string, opts: ConnectOptions = {}): JammiClien
     inference: createClient(InferenceService, transport),
     eval: createClient(EvalService, transport),
     pipeline: createClient(PipelineService, transport),
-    training: createClient(TrainingService, transport),
+    job: createClient(JobService, transport),
     trigger: createClient(TriggerService, transport),
     audit: createClient(AuditService, transport),
   };

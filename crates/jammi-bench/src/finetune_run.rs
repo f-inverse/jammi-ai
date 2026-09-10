@@ -105,8 +105,9 @@ use jammi_ai::model::arch::{self, EncoderFamily};
 use jammi_ai::model::backend::candle::CandleBackend;
 use jammi_ai::model::backend::{DeviceConfig, ModelBackend};
 use jammi_ai::model::{BackendType, LoadedModel, ModelId, ResolvedModel, TokenizerSource};
+use jammi_db::catalog::jobs_repo::SubmitJobParams;
 use jammi_db::catalog::model_repo::RegisterModelParams;
-use jammi_db::catalog::training_repo::CreateTrainingJobParams;
+use jammi_db::catalog::status::JobExecution;
 use jammi_db::catalog::Catalog;
 use jammi_db::storage::{StorageRegistry, StorageUrl};
 use jammi_db::store::ArtifactStore;
@@ -1824,24 +1825,22 @@ fn run_impl(
         artifact_path: None,
         config_json: None,
     }))?;
-    tokio::runtime::Handle::current().block_on(catalog.create_training_job(
-        CreateTrainingJobParams {
-            job_id: &job_id,
-            base_model_id: &model_catalog_pk,
-            training_source: "jammi-bench finetune-run",
-            loss_type: match params.objective {
-                Objective::Triplet => "triplet",
-                Objective::Mnrl => "multiple_negatives_ranking",
-            },
-            hyperparams: "{}",
-            kind: "fine_tune",
-            training_spec: "{}",
-        },
-    ))?;
+    tokio::runtime::Handle::current().block_on(catalog.submit_job(SubmitJobParams {
+        job_id: &job_id,
+        kind: "fine_tune",
+        execution: JobExecution::Queued,
+        spec: "{}",
+        model_ref: Some(&model_catalog_pk),
+        output_model_id: None,
+        model_source: None,
+        priority: 0,
+    }))?;
     tokio::runtime::Handle::current()
-        .block_on(
-            catalog.claim_next_training_job(&worker_id, std::time::Duration::from_secs(3600)),
-        )?
+        .block_on(catalog.claim_next(
+            &worker_id,
+            &["fine_tune"],
+            std::time::Duration::from_secs(3600),
+        ))?
         .ok_or("finetune-run: the just-created training job was not claimable")?;
 
     // `Objective::Triplet` consumes the fixture's (anchor, positive,

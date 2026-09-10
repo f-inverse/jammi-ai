@@ -131,18 +131,20 @@ async fn f16_embedding_is_valid_and_active_but_close_to_f32() {
 async fn session_at_precision(
     dir: &std::path::Path,
     precision: ComputePrecision,
-) -> jammi_ai::session::InferenceSession {
+) -> Arc<jammi_ai::session::InferenceSession> {
     let mut config = common::test_config(dir);
     config.gpu.compute_precision = precision;
-    jammi_ai::session::InferenceSession::new(config)
-        .await
-        .unwrap()
+    Arc::new(
+        jammi_ai::session::InferenceSession::new(config)
+            .await
+            .unwrap(),
+    )
 }
 
 async fn session_with_patents_at(
     dir: &std::path::Path,
     precision: ComputePrecision,
-) -> jammi_ai::session::InferenceSession {
+) -> Arc<jammi_ai::session::InferenceSession> {
     let session = session_at_precision(dir, precision).await;
     session
         .add_source(
@@ -198,6 +200,7 @@ async fn run_embedding_and_read_definition_hash(
             &["abstract".to_string()],
             "id",
             jammi_db::store::CachePolicy::Bypass,
+            None,
         )
         .await
         .unwrap();

@@ -2,6 +2,7 @@ use std::collections::BTreeMap;
 use std::fmt;
 use std::path::{Path, PathBuf};
 use std::str::FromStr;
+use std::time::Duration;
 
 use serde::{Deserialize, Deserializer, Serialize};
 
@@ -220,15 +221,22 @@ pub struct JammiConfig {
     /// (a training job, a building result table) is owned before it is
     /// reclaimable, and how often its holder renews it.
     pub lease: LeaseConfig,
-    /// Training-worker settings: whether this process runs the claim loop, and
-    /// how often an idle worker polls for work.
-    pub training: TrainingConfig,
+    /// Worker-loop settings: whether this process claims `jobs` rows at all,
+    /// which kinds it claims, and how often an idle worker polls for work.
+    pub worker: WorkerConfig,
+    /// Job retention: how long a terminal `jobs` row survives the sweep.
+    pub jobs: JobsConfig,
     /// Cache layer settings (ANN cache, embedding cache).
     pub cache: CacheConfig,
     /// HTTP and Arrow Flight server bind addresses.
     pub server: ServerConfig,
     /// Tracing/logging configuration.
     pub logging: LoggingConfig,
+    /// Vendor-neutral OTLP trace export: collector endpoint, request headers,
+    /// `service.name`, and sample ratio. Built into an exporter by
+    /// `jammi_ai::telemetry::otlp_layer` (behind the `telemetry-otlp` cargo
+    /// feature); `jammi-db` carries only the raw, typed section.
+    pub observability: ObservabilityConfig,
     /// Catalog backend selection. Default: SQLite under `artifact_dir`.
     pub catalog: CatalogConfig,
     /// Trigger broker selection. Default: in-process [`crate::trigger::InMemoryBroker`].
@@ -999,40 +1007,47 @@ impl LeaseConfig {
     }
 }
 
-/// Training-worker settings: whether this process runs the claim loop at all,
-/// and — when it does — how often an idle worker polls for new work. The lease
-/// a claim is held under and the heartbeat that renews it are the deployment's
-/// one [`LeaseConfig`], shared with every other leased row.
+/// Worker-loop settings: whether this process runs the claim loop at all,
+/// which job kinds it claims, and — when it does — how often an idle worker
+/// polls for new work. The lease a claim is held under and the heartbeat that
+/// renews it are the deployment's one [`LeaseConfig`], shared with every
+/// other leased row.
+///
+/// Replaces the former `[training] run_worker`/`idle_poll_secs`: the
+/// claim loop is not training-specific — a process opts into claiming
+/// any kind-agnostic `jobs` row, training or compute, and `kinds` selects
+/// which. Every key `[training]` carried was worker-related, so the section
+/// is gone entirely rather than left holding nothing.
 ///
 /// Defaults reproduce the engine's built-in timing (1 s idle poll) with the
-/// claim loop on, so a config without a `[training]` section behaves
-/// identically to one that omits it.
+/// claim loop on and every kind claimed, so a config without a `[worker]`
+/// section behaves identically to one that omits it.
 ///
-/// The section rejects unknown keys. In particular the former
-/// `lease_duration_secs` / `heartbeat_interval_secs` keys moved to `[lease]`
-/// as `duration_secs` / `heartbeat_secs`; a TOML still naming them under
-/// `[training]` is a hard load error, never a silent fall-back to the default
-/// timing.
+/// The section rejects unknown keys. In particular the lease keys live only
+/// under `[lease]` (`duration_secs` / `heartbeat_secs`); a TOML naming them
+/// under `[worker]` is a hard load error, never a silent fall-back to the
+/// default timing.
 ///
 /// # TOML
 ///
 /// ```toml
-/// [training]
-/// run_worker = true
+/// [worker]
+/// enabled = true
+/// kinds = "all"
 /// idle_poll_secs = 1
 /// ```
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
 #[serde(default, deny_unknown_fields)]
-pub struct TrainingConfig {
-    /// Whether THIS process runs the training claim loop at all. Default: `true`.
+pub struct WorkerConfig {
+    /// Whether THIS process runs the claim loop at all. Default: `true`.
     ///
     /// `true` — the process opens the catalog and drives the loop: it claims
-    /// queued jobs, renews the lease while they run, and reclaims leases that
-    /// expired under a dead claimant.
+    /// queued jobs of `kinds`, renews the lease while they run, and reclaims
+    /// leases that expired under a dead claimant.
     ///
-    /// `false` — the process still mounts and serves the training surface and
-    /// still accepts submissions, but never claims. Submitted jobs stay
-    /// `queued` until some process configured with `run_worker = true` opens
+    /// `false` — the process still mounts and serves the submission surface
+    /// and still accepts submissions, but never claims. Submitted jobs stay
+    /// `queued` until some process configured with `enabled = true` opens
     /// the catalog. On a single-process catalog (SQLite) that means this
     /// process must close the catalog first; a multi-process catalog
     /// (Postgres) can run both concurrently.
@@ -1044,31 +1059,71 @@ pub struct TrainingConfig {
     /// removes the submission surface — only the claiming.
     ///
     /// The poll below describes the loop this flag gates; it is validated by
-    /// [`Self::worker_intervals`] regardless of `run_worker`, so a config that
+    /// [`Self::worker_intervals`] regardless of `enabled`, so a config that
     /// switches the loop on later cannot smuggle in bad timing.
-    pub run_worker: bool,
+    pub enabled: bool,
+    /// Which job kinds this worker claims. `"all"` (the default) claims every
+    /// kind compiled into the binary; an explicit list claims only those
+    /// named. This layer carries the raw selection only — `jammi-ai` owns
+    /// the kind vocabulary and validates it against the compiled set at
+    /// startup, the same "raw tokens here, validated downstream" split
+    /// [`ServiceSelection`] uses for `[server].services`.
+    pub kinds: WorkerKinds,
     /// How often an idle worker polls for a queued job (and reclaims expired
     /// leases). Must be non-zero — a zero poll is a busy-loop. Default: 1.
     pub idle_poll_secs: u64,
 }
 
-impl Default for TrainingConfig {
+impl Default for WorkerConfig {
     fn default() -> Self {
         Self {
             // Default on: an unconfigured deployment is a whole one — it both
             // accepts jobs and works them. Opting out is the explicit act.
-            run_worker: true,
+            enabled: true,
+            kinds: WorkerKinds::default(),
             idle_poll_secs: 1,
         }
     }
 }
 
-/// The validated, typed training-worker timing the worker drives its loop with.
+/// The worker's job-kind selection: `All` (the default) claims every kind
+/// compiled into this binary; `Only` claims exactly the named kinds (e.g.
+/// `[]` for a claim loop that runs but claims nothing — equivalent to
+/// `enabled = false` for the poll loop's own effect, but distinguishable in
+/// `ListWorkers`). Deserializes through the identical hand-written grammar
+/// [`ServiceSelection`] uses (H7: `"all"`, a comma-separated list, or a TOML
+/// array) — mapped 1:1 rather than duplicating the visitor, since the two
+/// selections share exactly the same shape and differ only in vocabulary
+/// (service tiers vs. job kinds, each validated by its own owning layer).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum WorkerKinds {
+    /// Every kind compiled into this binary.
+    All(AllSentinel),
+    /// Exactly these kinds.
+    Only(Vec<String>),
+}
+
+impl Default for WorkerKinds {
+    fn default() -> Self {
+        WorkerKinds::All(AllSentinel::All)
+    }
+}
+
+impl<'de> Deserialize<'de> for WorkerKinds {
+    fn deserialize<D: Deserializer<'de>>(deserializer: D) -> std::result::Result<Self, D::Error> {
+        Ok(match ServiceSelection::deserialize(deserializer)? {
+            ServiceSelection::All(sentinel) => WorkerKinds::All(sentinel),
+            ServiceSelection::Only(tokens) => WorkerKinds::Only(tokens),
+        })
+    }
+}
+
+/// The validated, typed worker timing the claim loop drives itself with.
 ///
 /// `lease` and `heartbeat` are the deployment's [`LeaseIntervals`] — the single
 /// source of truth for the lease window, so the worker's renew always targets
 /// the same deadline the reclaim path compares against. The constructor
-/// [`TrainingConfig::worker_intervals`] is the only way to build one, so the
+/// [`WorkerConfig::worker_intervals`] is the only way to build one, so the
 /// margin and non-zero-poll invariants hold by construction.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct WorkerIntervals {
@@ -1080,7 +1135,7 @@ pub struct WorkerIntervals {
     pub idle_poll: std::time::Duration,
 }
 
-impl TrainingConfig {
+impl WorkerConfig {
     /// Resolve the typed [`WorkerIntervals`] this timing implies over the
     /// deployment's validated `lease`, enforcing the worker's own invariant:
     /// `idle_poll_secs >= 1` — a zero idle poll is a busy-loop. The lease
@@ -1093,7 +1148,7 @@ impl TrainingConfig {
 
         if self.idle_poll_secs == 0 {
             return Err(JammiError::Config(
-                "training.idle_poll_secs must be > 0 (a zero poll is a busy-loop)".into(),
+                "worker.idle_poll_secs must be > 0 (a zero poll is a busy-loop)".into(),
             ));
         }
         Ok(WorkerIntervals {
@@ -1101,6 +1156,63 @@ impl TrainingConfig {
             heartbeat: lease.heartbeat(),
             idle_poll: Duration::from_secs(self.idle_poll_secs),
         })
+    }
+}
+
+/// Job retention (N9): how long a TERMINAL `jobs` row (`completed` /
+/// `failed`) keeps blocking `delete_model` and survives the retention sweep
+/// (`prune_jobs`) before it is eligible for deletion. A non-terminal job
+/// blocks `delete_model` indefinitely and is never pruned, regardless of age.
+///
+/// # TOML
+///
+/// ```toml
+/// [jobs]
+/// retention_days = 30
+/// ```
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct JobsConfig {
+    /// How many days a terminal job row survives before the sweep may delete
+    /// it (and before `delete_model`'s referential scan stops counting it as
+    /// a blocking reference). Default: 30.
+    pub retention_days: u32,
+}
+
+impl Default for JobsConfig {
+    fn default() -> Self {
+        Self { retention_days: 30 }
+    }
+}
+
+impl JobsConfig {
+    /// The largest `retention_days` accepted at load: ten years. Above it
+    /// the value is almost certainly a units mistake (seconds or hours
+    /// typed into a days field), and it is also where `days * 86_400` as a
+    /// timestamp offset stops being a duration any catalog backend can
+    /// subtract from `now` without overflow.
+    pub const MAX_RETENTION_DAYS: u32 = 3650;
+
+    /// Validate the retention window: `0` is allowed (a terminal job is
+    /// prunable, and stops blocking `delete_model`, as soon as it is
+    /// terminal); anything above [`Self::MAX_RETENTION_DAYS`] is a typed
+    /// [`JammiError::Config`] naming the field, refused at load rather than
+    /// surfacing as a clock overflow in the first retention sweep.
+    pub fn validate(&self) -> Result<()> {
+        if self.retention_days > Self::MAX_RETENTION_DAYS {
+            return Err(JammiError::Config(format!(
+                "[jobs] retention_days = {} exceeds the {}-day cap",
+                self.retention_days,
+                Self::MAX_RETENTION_DAYS
+            )));
+        }
+        Ok(())
+    }
+
+    /// The retention window as a [`Duration`] — the one conversion every
+    /// sweep and reference scan shares.
+    pub fn retention(&self) -> Duration {
+        Duration::from_secs(u64::from(self.retention_days) * 86_400)
     }
 }
 
@@ -1129,18 +1241,21 @@ pub struct ServerConfig {
     /// Model IDs to preload into memory at server startup.
     pub preload_models: Vec<String>,
     /// Optional gRPC service tiers this deployment mounts, beyond the always-on
-    /// core tier. Tokens are `"train"`, `"event"`, `"eval"` (the `jammi-server`
+    /// core tier. Tokens are `"event"`, `"eval"` (the `jammi-server`
     /// service-tier mechanism owns their meaning and validation; this layer
     /// only carries the raw selection so the engine config stays free of
     /// server-tier types). An empty list means serve-only (core only); the
-    /// default mounts every tier compiled into the binary (all-in-one). A token
-    /// naming an unknown tier, or a tier whose feature is compiled out, is a
-    /// startup error surfaced by the server.
+    /// default mounts every tier (all-in-one). A token naming an unknown tier
+    /// is a startup error surfaced by the server. Whether this process runs
+    /// jobs is `[worker] enabled`, not a tier.
     pub services: ServiceSelection,
+    /// Request-bounds and refusal-policy limits for the combined gRPC +
+    /// Flight SQL surface. See [`LimitsConfig`].
+    pub limits: LimitsConfig,
 }
 
 /// The optional service-tier selection for a server deployment. `All` (the
-/// default) mounts every tier the binary compiled in; `Only` mounts core plus
+/// default) mounts every optional tier; `Only` mounts core plus
 /// exactly the named optional tiers. Kept as raw tokens here so `jammi-db` does
 /// not depend on `jammi-server`'s tier vocabulary — the server resolves and
 /// validates them.
@@ -1253,6 +1368,147 @@ impl<'de> Deserialize<'de> for ServiceSelection {
     }
 }
 
+/// Request-bounds and refusal-policy limits for the combined gRPC + Flight
+/// SQL surface: inbound message size, in-flight request concurrency (global
+/// and per TCP connection), an optional per-unary-request timeout, and the
+/// two long-lived-stream budgets (`TriggerService.Subscribe`,
+/// `JobService.WaitJob`). A request that would exceed any of these is
+/// refused at the edge — before a tenant-scoped catalog read ever runs, so a
+/// refusal leaks nothing about cross-tenant existence — with a typed gRPC
+/// status and a `jammi_grpc_refused_total{reason}` counter increment. See
+/// `jammi_server::limits` (the crate that owns the tower layer stack
+/// enforcing this) for the wire contract.
+///
+/// # TOML
+///
+/// ```toml
+/// [server.limits]
+/// max_message_bytes = 67108864
+/// max_in_flight = 256
+/// max_in_flight_per_connection = 64
+/// request_timeout_secs = 30
+/// wait_timeout_secs = 300
+/// max_subscriptions = 256
+/// max_job_waits = 1024
+/// ```
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct LimitsConfig {
+    /// Maximum size, in bytes, of a single INBOUND gRPC/Flight message this
+    /// server will decode — enforced per mounted service via tonic's own
+    /// `max_decoding_message_size`. There is no outbound cap: a large result
+    /// set is never truncated. Must be `> 0`. Default: 64 MiB (67108864).
+    pub max_message_bytes: u64,
+    /// Global cap on the number of unary requests this process serves
+    /// concurrently, across every connection. `0` means unbounded — not
+    /// "refuse everything". Default: 256.
+    pub max_in_flight: usize,
+    /// Cap on the number of unary requests a SINGLE TCP connection may have
+    /// in flight concurrently. `0` means unbounded. When both this and
+    /// `max_in_flight` are non-zero (bounded), this must be `<=
+    /// max_in_flight` — a single connection is never permitted a larger
+    /// budget than the process-wide one. Default: 64.
+    pub max_in_flight_per_connection: usize,
+    /// Maximum wall-clock duration a unary request may run before this
+    /// server cancels it and returns `DEADLINE_EXCEEDED`. `None` (the
+    /// default — the key absent or explicitly unset) means no
+    /// server-imposed timeout. Unary methods only: the two server-streaming
+    /// RPCs (`TriggerService.Subscribe`, `JobService.WaitJob`) are governed
+    /// by `wait_timeout_secs` and the stream budgets below instead, never
+    /// this key. `Some(0)` is rejected at load — a zero timeout would refuse
+    /// every request instantly, never the intent of setting this key.
+    pub request_timeout_secs: Option<u64>,
+    /// Bounds a `TriggerService.Subscribe` or `JobService.WaitJob` stream.
+    /// The SERVER budget bounds the stream; the client imposes no deadline of
+    /// its own by default (`jammi_client::DataClient::wait_job`/`subscribe`
+    /// send no `grpc-timeout` header). Three arms:
+    ///
+    /// * a `grpc-timeout` header ABOVE this budget is refused at the edge —
+    ///   before the stream ever opens — with `DEADLINE_EXCEEDED`.
+    /// * a `grpc-timeout` header WITHIN this budget is ENFORCED by the
+    ///   server itself, at the caller's own declared deadline: the stream
+    ///   ends with `DEADLINE_EXCEEDED` once that (shorter) duration elapses,
+    ///   never the wider budget (`jammi_server::limits::PermitBody::Deadlined`).
+    ///   This is deliberate, not merely "honoured as-is": tonic's own
+    ///   `GrpcTimeout` middleware races only the service future, never a
+    ///   streaming response body already returned, so a caller that declared
+    ///   a deadline and then ignored it would otherwise hold this stream's
+    ///   permit forever.
+    /// * NO `grpc-timeout` header at all (HTTP/2's own no-deadline default —
+    ///   the shape a header-less, e.g. Python-shaped, client sends) is NOT
+    ///   refused: this budget itself becomes the stream's deadline, ending
+    ///   it with `DEADLINE_EXCEEDED` once it elapses, wherever the stream
+    ///   then stands (`jammi_server::limits::PermitBody::Deadlined`).
+    ///
+    /// `None` (the default) means no cap: a stream runs until terminal
+    /// (`WaitJob`) or indefinitely (`Subscribe`), regardless of what a caller
+    /// does or does not declare. `Some(0)` is rejected at load, for the same
+    /// reason as `request_timeout_secs`.
+    pub wait_timeout_secs: Option<u64>,
+    /// Cap on the number of concurrently open `TriggerService.Subscribe`
+    /// streams this process serves. `0` means unbounded. Default: 256.
+    pub max_subscriptions: usize,
+    /// Cap on the number of concurrently open `JobService.WaitJob` streams
+    /// this process serves. `0` means unbounded. Default: 1024.
+    pub max_job_waits: usize,
+}
+
+impl Default for LimitsConfig {
+    fn default() -> Self {
+        Self {
+            max_message_bytes: 64 * 1024 * 1024,
+            max_in_flight: 256,
+            max_in_flight_per_connection: 64,
+            request_timeout_secs: None,
+            wait_timeout_secs: None,
+            max_subscriptions: 256,
+            max_job_waits: 1024,
+        }
+    }
+}
+
+impl LimitsConfig {
+    /// Validate the domain of every knob, naming the offending key in the
+    /// error. `0` is a valid, meaningful value for the four concurrency/
+    /// budget knobs (`max_in_flight`, `max_in_flight_per_connection`,
+    /// `max_subscriptions`, `max_job_waits`) — it means unbounded — so only
+    /// the CROSS-knob relation (`max_in_flight_per_connection <=
+    /// max_in_flight`, when both are bounded) and the two knobs where `0`
+    /// (or an explicit zero timeout) has no sane reading
+    /// (`max_message_bytes`, `request_timeout_secs`, `wait_timeout_secs`)
+    /// are rejected. Negative values and TOML integers that overflow the
+    /// unsigned field types are already refused by `serde`/`toml` below this
+    /// call, naming the same key, before this method ever runs.
+    pub fn validate(&self) -> Result<()> {
+        if self.max_message_bytes == 0 {
+            return Err(JammiError::Config(
+                "server.limits.max_message_bytes must be > 0".into(),
+            ));
+        }
+        if self.max_in_flight_per_connection != 0
+            && self.max_in_flight != 0
+            && self.max_in_flight_per_connection > self.max_in_flight
+        {
+            return Err(JammiError::Config(format!(
+                "server.limits.max_in_flight_per_connection ({}) must be <= \
+                 server.limits.max_in_flight ({}) when both are bounded",
+                self.max_in_flight_per_connection, self.max_in_flight
+            )));
+        }
+        if self.request_timeout_secs == Some(0) {
+            return Err(JammiError::Config(
+                "server.limits.request_timeout_secs must be > 0 when set".into(),
+            ));
+        }
+        if self.wait_timeout_secs == Some(0) {
+            return Err(JammiError::Config(
+                "server.limits.wait_timeout_secs must be > 0 when set".into(),
+            ));
+        }
+        Ok(())
+    }
+}
+
 impl ServerConfig {
     /// Validate server configuration.
     pub fn validate(&self) -> Result<()> {
@@ -1279,6 +1535,7 @@ impl ServerConfig {
                 "health_listen and flight_listen must be different addresses".into(),
             ));
         }
+        self.limits.validate()?;
         Ok(())
     }
 }
@@ -1291,6 +1548,106 @@ pub struct LoggingConfig {
     pub level: String,
     /// Output format. Default: `Text`.
     pub format: LogFormat,
+}
+
+/// Vendor-neutral OTLP trace export (#486): where to send spans, the request
+/// headers the exporter attaches, the resource's `service.name`, and the
+/// fraction of traces to keep.
+///
+/// `jammi-db` carries this raw, typed section only — the exporter itself
+/// (`jammi_ai::telemetry::otlp_layer`, gated behind the `telemetry-otlp`
+/// cargo feature) lives in `jammi-ai`, mirroring [`ModelsConfig::hub_token`]'s
+/// split (H4): a header value stays an unresolved [`SecretSource`] here
+/// rather than an eagerly-read [`Secret`], because resolving it is the
+/// exporter's job at the point it actually builds the gRPC metadata a
+/// resolved value never needs to exist before that.
+///
+/// # TOML
+///
+/// ```toml
+/// [observability]
+/// otlp_endpoint = "http://localhost:4317"
+/// service_name = "jammi"
+/// sample_ratio = 1.0
+/// ```
+#[derive(Debug, Clone, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct ObservabilityConfig {
+    /// The OTLP/gRPC collector endpoint spans export to (e.g.
+    /// `http://localhost:4317`). `None` (the default) means: build no
+    /// exporter and open no connection — a process with no configured
+    /// endpoint attempts zero network egress for tracing, regardless of
+    /// whether the `telemetry-otlp` feature is compiled in.
+    pub otlp_endpoint: Option<String>,
+    /// Request headers the exporter attaches to every export call (e.g. an
+    /// auth token a collector requires). Each value is an unresolved
+    /// [`SecretSource`] — read at the point the exporter builds the gRPC
+    /// metadata, not at config load — so a value is never eagerly resolved
+    /// (and never logged: [`SecretSource`]'s own `Debug` redacts it, and
+    /// this map holds sources, never resolved [`Secret`] text). Default:
+    /// empty.
+    pub otlp_headers: BTreeMap<String, SecretSource>,
+    /// `service.name` resource attribute stamped on every exported span.
+    /// Default: `"jammi"`.
+    pub service_name: String,
+    /// Fraction of traces kept by the parent-based ratio sampler, in
+    /// `[0.0, 1.0]`. `1.0` (the default) samples everything; `0.0` samples
+    /// nothing (but the exporter still installs — set `otlp_endpoint` to
+    /// `None` instead to skip the exporter entirely). A root span always
+    /// defers to this ratio; a span with a sampled remote parent is always
+    /// kept, honouring the incoming decision (the "parent-based" half).
+    pub sample_ratio: f64,
+}
+
+impl Default for ObservabilityConfig {
+    fn default() -> Self {
+        Self {
+            otlp_endpoint: None,
+            otlp_headers: BTreeMap::new(),
+            service_name: "jammi".into(),
+            sample_ratio: 1.0,
+        }
+    }
+}
+
+impl ObservabilityConfig {
+    /// Validate the domain of every knob that can be checked without
+    /// resolving a header (headers stay unresolved here — see the struct
+    /// docs): `sample_ratio` must be a FINITE value within `[0.0, 1.0]`
+    /// (`RangeInclusive::contains`'s `<=`/`>=` comparisons are false against
+    /// a NaN operand on either side, so a NaN ratio already falls into this
+    /// branch — it is never silently treated as in-range); a configured
+    /// `otlp_endpoint` must parse as a URL with an `http`/`https` scheme and
+    /// a host, naming the offending value rather than surfacing as an opaque
+    /// exporter-construction failure deep in `jammi_ai::telemetry::otlp_layer`.
+    pub fn validate(&self) -> Result<()> {
+        if !(0.0..=1.0).contains(&self.sample_ratio) {
+            return Err(JammiError::Config(format!(
+                "observability.sample_ratio = {} must be within [0.0, 1.0]",
+                self.sample_ratio
+            )));
+        }
+        if let Some(endpoint) = &self.otlp_endpoint {
+            let parsed = url::Url::parse(endpoint).map_err(|e| {
+                JammiError::Config(format!(
+                    "observability.otlp_endpoint '{endpoint}' is not a valid URL: {e}"
+                ))
+            })?;
+            if !matches!(parsed.scheme(), "http" | "https") {
+                return Err(JammiError::Config(format!(
+                    "observability.otlp_endpoint '{endpoint}' must use the http or https \
+                     scheme, got '{}'",
+                    parsed.scheme()
+                )));
+            }
+            if parsed.host_str().is_none() {
+                return Err(JammiError::Config(format!(
+                    "observability.otlp_endpoint '{endpoint}' must name a host"
+                )));
+            }
+        }
+        Ok(())
+    }
 }
 
 /// Model source: where the Hugging Face Hub cache lives, which endpoint and
@@ -1384,10 +1741,12 @@ impl Default for JammiConfig {
             embedding: EmbeddingConfig::default(),
             fine_tuning: FineTuningConfig::default(),
             lease: LeaseConfig::default(),
-            training: TrainingConfig::default(),
+            worker: WorkerConfig::default(),
+            jobs: JobsConfig::default(),
             cache: CacheConfig::default(),
             server: ServerConfig::default(),
             logging: LoggingConfig::default(),
+            observability: ObservabilityConfig::default(),
             catalog: CatalogConfig::default(),
             broker: BrokerConfig::default(),
             signing_key: SigningKeyConfig::default(),
@@ -1481,6 +1840,7 @@ impl Default for ServerConfig {
             flight_listen: "0.0.0.0:8081".into(),
             preload_models: Vec::new(),
             services: ServiceSelection::default(),
+            limits: LimitsConfig::default(),
         }
     }
 }
@@ -1626,10 +1986,23 @@ impl JammiConfig {
             cloud.validate()?;
         }
         // Reject a lease timing that violates the heartbeat margin, or a
-        // training poll that is a busy-loop, at load time rather than at
+        // worker poll that is a busy-loop, at load time rather than at
         // worker spawn, deep in a server startup.
         let lease = config.lease.intervals()?;
-        config.training.worker_intervals(lease)?;
+        config.worker.worker_intervals(lease)?;
+        // Reject a retention window past the cap at load, not in the first
+        // sweep's timestamp arithmetic.
+        config.jobs.validate()?;
+        // Reject an out-of-domain `[server.limits]` knob (a zero
+        // `max_message_bytes`, a per-connection budget over the global one, a
+        // zero timeout) at load time, naming the offending key, rather than
+        // at server startup deep inside `OssServer::new`.
+        config.server.limits.validate()?;
+        // Reject an out-of-domain `[observability]` knob (a `sample_ratio`
+        // outside `[0.0, 1.0]`, including NaN, or a malformed/non-http(s)
+        // `otlp_endpoint`) at load time, naming the offending key, rather
+        // than at the first `jammi_ai::telemetry::otlp_layer` call.
+        config.observability.validate()?;
         Ok(config)
     }
 

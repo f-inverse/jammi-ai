@@ -183,6 +183,7 @@ async fn graph_session_with_partitions(
             },
             &pairs,
             jammi_db::store::manifest::Materialization::new(&__d, &__e, __i),
+            None,
         )
         .await
         .unwrap();
@@ -1222,6 +1223,7 @@ async fn origin_keyed_session(
             },
             &pairs,
             jammi_db::store::manifest::Materialization::new(&__d, &__e, __i),
+            None,
         )
         .await
         .unwrap();

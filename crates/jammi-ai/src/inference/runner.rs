@@ -124,6 +124,11 @@ impl InferenceRunner {
         // (the cursor loop replaced the old `step_by`, which panicked on 0) — a
         // silent hang is worse than a loud error, so treat 0 as 1.
         let mut current_batch_size = self.batch_size.max(1);
+        // `_ordinal`'s running counter: one sequence for this WHOLE `run`
+        // invocation (this operator is `Partitioning::UnknownPartitioning(1)`
+        // — exactly one stream, never reset per input batch or per
+        // OOM-halved sub-batch). See `schema::common_prefix_fields`'s doc.
+        let mut next_ordinal: u64 = 0;
         let model_label = self.source.to_string();
         let task = self.task;
         let model = &guard.model;
@@ -147,6 +152,7 @@ impl InferenceRunner {
                 &content,
                 &keys,
                 &mut current_batch_size,
+                &mut next_ordinal,
                 &ctx,
                 tx,
                 |chunk_content| model.forward(chunk_content, task),
@@ -178,6 +184,7 @@ impl InferenceRunner {
         content: &[ArrayRef],
         keys: &ArrayRef,
         current_batch_size: &mut usize,
+        next_ordinal: &mut u64,
         ctx: &OutputContext<'_>,
         tx: &Sender<datafusion::error::Result<RecordBatch>>,
         mut forward: F,
@@ -203,6 +210,7 @@ impl InferenceRunner {
                         &raw_output,
                         chunk_len,
                         latency_ms,
+                        *next_ordinal,
                     )?;
 
                     if let Some(obs) = ctx.observer {
@@ -213,6 +221,12 @@ impl InferenceRunner {
                         // Receiver dropped (query cancelled).
                         return Ok(());
                     }
+                    // Advance the SAME counter `build_output_batch` just read
+                    // — only on a batch that was actually sent (never on the
+                    // OOM-retry arm below, which resends this identical
+                    // slice at a smaller size: retried rows must reuse the
+                    // ordinals their failed attempt never emitted).
+                    *next_ordinal += chunk_len as u64;
                     chunk_start += chunk_len;
                 }
                 Err(e) if Self::is_oom_error(&e) && *current_batch_size > 1 => {
@@ -252,12 +266,14 @@ impl InferenceRunner {
     }
 
     /// Build an output RecordBatch from a successful model forward pass.
+    #[allow(clippy::too_many_arguments)]
     fn build_output_batch(
         ctx: &OutputContext<'_>,
         keys: &ArrayRef,
         raw_output: &BackendOutput,
         row_count: usize,
         latency_ms: f32,
+        ordinal_start: u64,
     ) -> Result<RecordBatch> {
         let prefix = build_prefix_columns(
             keys,
@@ -267,6 +283,7 @@ impl InferenceRunner {
             &raw_output.row_errors,
             latency_ms,
             row_count,
+            ordinal_start,
         )?;
         let task_columns = ctx.adapter.adapt(raw_output, row_count)?;
 
@@ -359,6 +376,84 @@ mod tests {
         ids
     }
 
+    /// Drains every batch off `rx` and returns the `_ordinal` values in the
+    /// order they were sent.
+    async fn drain_ordinals(
+        mut rx: tokio::sync::mpsc::Receiver<datafusion::error::Result<RecordBatch>>,
+    ) -> Vec<u64> {
+        let mut ordinals = Vec::new();
+        while let Some(batch) = rx.recv().await {
+            let batch = batch.expect("no error batches expected on the success path");
+            let col = batch
+                .column_by_name("_ordinal")
+                .expect("_ordinal column")
+                .as_any()
+                .downcast_ref::<arrow::array::UInt64Array>()
+                .expect("_ordinal is UInt64")
+                .clone();
+            ordinals.extend(col.values().iter().copied());
+        }
+        ordinals
+    }
+
+    /// `_ordinal` is a contiguous, gap-free 0-based sequence across EVERY
+    /// sub-batch `run_chunks` sends for one stream — including across an
+    /// OOM-halving retry, which resends the SAME row slice at a smaller
+    /// size: the retried rows must get the ordinals their failed attempt
+    /// never emitted, never a gap and never a value reused. Verified by
+    /// reverting `run_chunks`' "advance only on a batch that was actually
+    /// sent" placement (advancing `next_ordinal` before the OOM-retry check
+    /// instead of after it): this test goes RED with a gap in the sequence
+    /// where the failed, retried attempt's ordinals were burned and never
+    /// reassigned.
+    #[tokio::test]
+    async fn run_chunks_ordinal_is_contiguous_across_an_oom_halving_retry() {
+        let row_count = 300;
+        let keys = test_keys(row_count);
+        let content = test_content(row_count);
+        let adapter = EmbeddingAdapter::new(1);
+        let output_schema = test_output_schema();
+        let ctx = OutputContext {
+            output_schema: &output_schema,
+            adapter: &adapter,
+            source_id: "test-source",
+            model_label: "test-model",
+            observer: None,
+        };
+        let mut current_batch_size = 100;
+        let mut next_ordinal = 0u64;
+        let oom_threshold = 64;
+
+        let (tx, rx) = tokio::sync::mpsc::channel(row_count);
+        InferenceRunner::run_chunks(
+            &content,
+            &keys,
+            &mut current_batch_size,
+            &mut next_ordinal,
+            &ctx,
+            &tx,
+            |chunk| {
+                let len = chunk[0].len();
+                if len > oom_threshold {
+                    Err(JammiError::Inference("out of memory".into()))
+                } else {
+                    Ok(fake_backend_output(len))
+                }
+            },
+        )
+        .await
+        .expect("run_chunks succeeds once the batch size shrinks under the OOM threshold");
+        drop(tx);
+
+        let ordinals = drain_ordinals(rx).await;
+        let expected: Vec<u64> = (0..row_count as u64).collect();
+        assert_eq!(
+            ordinals, expected,
+            "_ordinal must be the contiguous 0..row_count sequence with no gap or repeat, \
+             even though an OOM-halving retry resent one slice more than once"
+        );
+    }
+
     /// #330: a successful OOM-halving retry must resend the FULL slice at the
     /// smaller size, and the cursor loop must read `current_batch_size`
     /// fresh on both the slice length and the advance — so a shrink never
@@ -381,6 +476,7 @@ mod tests {
             observer: None,
         };
         let mut current_batch_size = 100;
+        let mut next_ordinal = 0u64;
         let oom_threshold = 64;
 
         let (tx, rx) = tokio::sync::mpsc::channel(row_count);
@@ -388,6 +484,7 @@ mod tests {
             &content,
             &keys,
             &mut current_batch_size,
+            &mut next_ordinal,
             &ctx,
             &tx,
             |chunk| {
@@ -433,12 +530,14 @@ mod tests {
             observer: None,
         };
         let mut current_batch_size = 4;
+        let mut next_ordinal = 0u64;
 
         let (tx, _rx) = tokio::sync::mpsc::channel(row_count);
         let result = InferenceRunner::run_chunks(
             &content,
             &keys,
             &mut current_batch_size,
+            &mut next_ordinal,
             &ctx,
             &tx,
             |_chunk| Err(JammiError::Inference("out of memory".into())),
@@ -473,12 +572,14 @@ mod tests {
             observer: None,
         };
         let mut current_batch_size = 4;
+        let mut next_ordinal = 0u64;
 
         let (tx, mut rx) = tokio::sync::mpsc::channel(row_count);
         let result = InferenceRunner::run_chunks(
             &content,
             &keys,
             &mut current_batch_size,
+            &mut next_ordinal,
             &ctx,
             &tx,
             |_chunk| Err(JammiError::Inference("shape mismatch".into())),

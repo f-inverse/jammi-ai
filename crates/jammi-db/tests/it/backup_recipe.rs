@@ -91,6 +91,7 @@ async fn close_copy_reopen_preserves_rows() {
             },
             &rows,
             Materialization::new(&descriptor(), &env(), vec![]),
+            None,
         )
         .await
         .unwrap();

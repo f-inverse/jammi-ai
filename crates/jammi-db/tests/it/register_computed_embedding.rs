@@ -133,6 +133,7 @@ async fn happy_path_lands_a_ready_searchable_table_with_provenance_and_lineage(
                 &env(),
                 vec![],
             ),
+            None,
         )
         .await
         .unwrap();

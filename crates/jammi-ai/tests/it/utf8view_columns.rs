@@ -288,6 +288,7 @@ async fn parquet_utf8_path_column_scans_as_utf8view_and_embeds() {
             "image_path",
             "id",
             jammi_db::store::CachePolicy::Bypass,
+            None,
         )
         .await
         .expect(
@@ -392,6 +393,7 @@ async fn parquet_utf8_audio_path_column_scans_as_utf8view_and_embeds() {
             "audio_path",
             "id",
             jammi_db::store::CachePolicy::Bypass,
+            None,
         )
         .await
         .expect(

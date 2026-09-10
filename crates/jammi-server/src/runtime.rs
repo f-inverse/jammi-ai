@@ -44,25 +44,24 @@ use crate::grpc::catalog::{AdminAuthorizer, CatalogServer};
 use crate::grpc::embedding::EmbeddingServer;
 use crate::grpc::eval::EvalServer;
 use crate::grpc::inference::InferenceServer;
+use crate::grpc::job::JobServer;
 use crate::grpc::pipeline::PipelineServer;
 use crate::grpc::proto::audit::audit_service_server::AuditServiceServer;
 use crate::grpc::proto::catalog::catalog_service_server::CatalogServiceServer;
 use crate::grpc::proto::embedding::embedding_service_server::EmbeddingServiceServer;
 use crate::grpc::proto::eval::eval_service_server::EvalServiceServer;
 use crate::grpc::proto::inference::inference_service_server::InferenceServiceServer;
+use crate::grpc::proto::job::job_service_server::JobServiceServer;
 use crate::grpc::proto::pipeline::pipeline_service_server::PipelineServiceServer;
-#[cfg(feature = "train")]
-use crate::grpc::proto::training::training_service_server::TrainingServiceServer;
 use crate::grpc::proto::trigger::trigger_service_server::TriggerServiceServer;
 use crate::grpc::session::{SessionIdTenantResolver, SessionStore, TenantResolver};
-#[cfg(feature = "train")]
-use crate::grpc::training::TrainingServer;
 use crate::grpc::trigger::TriggerServer;
 use crate::grpc_web_trailers::GrpcWebTrailersLayer;
 use crate::metrics_layer::MetricsLayer;
 use crate::routes::health::{self, MetricsRegistry};
 use crate::tenant_resolver_layer::TenantResolverLayer;
 use crate::tiers::{ServiceTier, TierSet};
+use crate::trace_context_layer::TraceContextLayer;
 
 /// Errors `OssServer::run` can surface to the binary's `main`.
 #[derive(Debug, thiserror::Error)]
@@ -286,14 +285,14 @@ impl OssServer {
             .validate()
             .map_err(|e| ServerError::Config(e.to_string()))?;
         // Reject lease timing that violates the heartbeat margin, or a
-        // training poll that is a busy-loop, at construction — before the
-        // train tier spawns its worker or a result table is leased.
+        // worker poll that is a busy-loop, at construction — before the
+        // worker is spawned or a result table is leased.
         let lease = config
             .lease
             .intervals()
             .map_err(|e| ServerError::Config(e.to_string()))?;
         config
-            .training
+            .worker
             .worker_intervals(lease)
             .map_err(|e| ServerError::Config(e.to_string()))?;
 
@@ -359,12 +358,20 @@ impl OssServer {
         let health_router = self.build_health_router();
         let health_listener = TcpListener::bind(self.health_addr).await?;
         let health_addr = health_listener.local_addr()?;
+        // Cloned before `build_grpc_chain`/`assemble_grpc_chain` consume
+        // `self` — `AssembledChain`/`BoundChain` hold their own `Arc` clones
+        // internally (captured by the mounted services), but neither type
+        // carries the session back out as its own field, so this is the one
+        // handle `serve_with_shutdown` has to release the catalog through
+        // once the serve loop drains.
+        let session = Arc::clone(&self.session);
         let grpc = assemble_grpc_chain(self.build_grpc_chain())?.bind().await?;
         Ok(BoundServer {
             grpc,
             health_listener,
             health_addr,
             health_router,
+            session,
         })
     }
 
@@ -442,6 +449,10 @@ impl OssServer {
             // constructing `GrpcChain` directly (this OSS binary's own
             // orchestration path has no seam to configure one yet).
             admin_authorizer: None,
+            // `[server.limits]` from the SAME config the engine session was
+            // opened with — a wire deployment and an in-process one read the
+            // identical knob, exactly as `[worker] enabled` does above.
+            limits: self.session.inner_config().server.limits,
         }
     }
 }
@@ -459,6 +470,14 @@ pub struct BoundServer {
     health_listener: TcpListener,
     health_addr: SocketAddr,
     health_router: Router,
+    /// The engine session, kept alive past [`OssServer::bind`] so
+    /// [`Self::serve_with_shutdown`] can release its catalog connections
+    /// (including the lease keeper's own, N3) once the serve loop has fully
+    /// drained — the graceful-shutdown release point a `SIGTERM`'d
+    /// `jammi-server` needs so a successor process can open the same
+    /// SQLite catalog directory immediately, exactly as the embedded
+    /// engine's `close()` does.
+    session: Arc<InferenceSession>,
 }
 
 impl BoundServer {
@@ -503,6 +522,7 @@ impl BoundServer {
             health_listener,
             health_addr,
             health_router,
+            session,
         } = self;
         tracing::info!(
             address = %health_addr,
@@ -533,6 +553,17 @@ impl BoundServer {
             Ok(r) => r,
             Err(join_err) => Err(ServerError::Io(std::io::Error::other(join_err.to_string()))),
         };
+
+        // Both halves have stopped accepting and finished draining
+        // in-flight requests — the graceful-shutdown release point.
+        // `InferenceSession::close` shuts the lease keeper (N3) down and
+        // joins its dedicated thread (closing its own catalog connection)
+        // before closing the shared pool, so a `SIGTERM`'d `jammi-server`
+        // releases the SQLite `unix-excl` lock exactly as the embedded
+        // engine's `close()` does — a successor process can open the same
+        // catalog directory immediately rather than waiting out the process
+        // exit.
+        session.close().await;
 
         grpc_result.and(health_result)
     }
@@ -591,6 +622,13 @@ pub struct GrpcChain {
     /// cross-tenant pass supplies its own [`AdminAuthorizer`] here. See that
     /// trait's doc for the seam's mechanism-not-policy rationale.
     pub admin_authorizer: Option<Arc<dyn AdminAuthorizer>>,
+    /// `[server.limits]` — message-size, in-flight concurrency, per-request
+    /// timeout, and the two stream budgets. Applied to every service this
+    /// function mounts: the message-size cap via each `*ServiceServer`'s own
+    /// `max_decoding_message_size` (including Flight SQL), the rest via the
+    /// [`crate::limits`] tower layer stack [`BoundChain::serve_with_shutdown`]
+    /// applies at serve time. See [`crate::limits`] for the full contract.
+    pub limits: jammi_db::config::LimitsConfig,
 }
 
 /// The engine's fully-assembled gRPC chain, ready for a downstream to mount
@@ -609,8 +647,9 @@ pub struct GrpcChain {
 /// listener that already frames gRPC-web.
 ///
 /// The transport layer stack (`accept_http1` + `MetricsLayer` +
-/// `GrpcWebTrailersLayer` + `GrpcWebLayer`) is applied by [`Self::serve`], not
-/// baked into the routes — see that method, [`Self::into_layered_axum_router`],
+/// `TraceContextLayer` + `GrpcWebTrailersLayer` + `GrpcWebLayer`) is applied by
+/// [`Self::serve`], not baked into the routes — see that method,
+/// [`Self::into_layered_axum_router`],
 /// and [`Self::into_axum_router`] for the seam contract each path honours.
 pub struct AssembledChain {
     addr: SocketAddr,
@@ -620,42 +659,45 @@ pub struct AssembledChain {
     // because the layer stack is deferred to `serve` — the outermost layer
     // observes every request by method path.
     metrics: Arc<MetricsRegistry>,
+    // `[server.limits]`, needed at serve time to build the `crate::limits`
+    // layer stack (the concurrency/timeout/stream-budget bounds; the
+    // message-size cap was already applied per-service in
+    // `assemble_grpc_chain`, above).
+    limits: jammi_db::config::LimitsConfig,
     // The SAME `TenantResolverLayer` (holding the same `Arc<dyn TenantResolver>`)
     // that wraps every engine service in `assemble_grpc_chain`. Retained
     // (`#[derive(Clone)]`, a cheap `Arc` clone) so `mount_tenant_scoped` can wrap
     // a downstream service through it too — the single-binder invariant holds:
     // there is still exactly ONE resolver, never a second one forked off here.
     tenant_resolver_layer: TenantResolverLayer,
-    // The embedded training worker the `train` tier owns, held RAII for the serve
-    // loop. Owned by the chain (not the assemble frame) so it survives the
-    // assemble→serve split; `serve` keeps it alive across the serve future and
-    // `into_axum_router` hands it onward in [`ChainParts`]. `#[cfg]`-gated so a
-    // serve-only build carries no worker field.
-    #[cfg(feature = "train")]
-    _train_worker: Option<jammi_ai::fine_tune::worker::EmbeddedWorker>,
+    // The embedded job worker this process runs when `[worker] enabled` is
+    // `true`, held RAII for the serve loop. Owned by the chain (not the
+    // assemble frame) so it survives the assemble→serve split; `serve` keeps it
+    // alive across the serve future and `into_axum_router` hands it onward in
+    // [`ChainParts`]. `None` when this process claims nothing.
+    _worker: Option<jammi_ai::fine_tune::worker::EmbeddedWorker>,
 }
 
 /// The non-routing remainder of an [`AssembledChain`] after
 /// [`AssembledChain::into_axum_router`] splits the routes off: the resolved bind
 /// address, the mounted-service ledger (for the downstream's startup log), the
 /// engine metrics handle (so a single-listener downstream can re-apply the
-/// engine's [`MetricsLayer`] on its own listener), and the training-worker guard
-/// the downstream must keep alive for the lifetime of its own serve loop.
+/// engine's [`MetricsLayer`] on its own listener), and the job-worker guard the
+/// downstream must keep alive for the lifetime of its own serve loop.
 pub struct ChainParts {
     pub addr: SocketAddr,
     pub mounted: Vec<String>,
     pub metrics: Arc<MetricsRegistry>,
-    /// The embedded training worker guard. The downstream MUST hold this for the
+    /// The embedded job worker guard. The downstream MUST hold this for the
     /// lifetime of its serve loop — dropping it stops the worker and submitted
     /// jobs stop running.
     ///
-    /// `None` when this process runs no claim loop: either the `train` tier is
-    /// not mounted at all, or it is mounted with `[training] run_worker = false`
-    /// (the mount-without-claiming configuration — `TrainingService` still
-    /// serves, this process just never claims). In both cases there is nothing
-    /// for the downstream to hold and nothing for its shutdown to await.
-    #[cfg(feature = "train")]
-    pub train_worker: Option<jammi_ai::fine_tune::worker::EmbeddedWorker>,
+    /// `None` when this process runs no claim loop — `[worker] enabled =
+    /// false`, the submit-without-claiming configuration: `JobService`
+    /// still serves (it is core), this process just never claims. There is
+    /// then nothing for the downstream to hold and nothing for its shutdown to
+    /// await.
+    pub worker: Option<jammi_ai::fine_tune::worker::EmbeddedWorker>,
 }
 
 impl AssembledChain {
@@ -781,15 +823,15 @@ impl AssembledChain {
             routes: self.routes,
             mounted: self.mounted,
             metrics: self.metrics,
-            #[cfg(feature = "train")]
-            _train_worker: self._train_worker,
+            limits: self.limits,
+            _worker: self._worker,
         })
     }
 
     /// Serve the assembled chain (engine core + any downstream-mounted services)
     /// until `shutdown` resolves. A thin composition of [`Self::bind`] +
     /// [`BoundChain::serve_with_shutdown`] — binds the listener, then serves on
-    /// it; the training-worker guard stays alive for the whole serve loop. The
+    /// it; the job-worker guard stays alive for the whole serve loop. The
     /// transport layer stack is applied by [`BoundChain::serve_with_shutdown`].
     pub async fn serve(
         self,
@@ -830,7 +872,7 @@ impl AssembledChain {
     /// `Routes`' default), so a composing consumer must nest it under a path
     /// prefix or reconcile its own fallback, NOT blind-`.merge()` it.
     ///
-    /// The downstream must hold [`ChainParts`] (specifically its training-worker
+    /// The downstream must hold [`ChainParts`] (specifically its job-worker
     /// guard) alive for the lifetime of its own serve loop.
     pub fn into_axum_router(self) -> (axum::Router, ChainParts) {
         let router = self.routes.into_axum_router();
@@ -838,8 +880,7 @@ impl AssembledChain {
             addr: self.addr,
             mounted: self.mounted,
             metrics: self.metrics,
-            #[cfg(feature = "train")]
-            train_worker: self._train_worker,
+            worker: self._worker,
         };
         (router, parts)
     }
@@ -850,15 +891,38 @@ impl AssembledChain {
     /// DIRECTLY: it carries the engine's full transport contract, so the consumer
     /// re-applies nothing.
     ///
-    /// CANONICAL LAYER STACK: this applies the SAME stack [`Self::serve`] applies
-    /// — the whole-server [`MetricsLayer`] (outermost, observing every method
-    /// path) wrapping [`GrpcWebTrailersLayer`] (the trailers-only error repair)
-    /// wrapping [`GrpcWebLayer`] (gRPC-web framing) wrapping the routes. axum runs
-    /// the LAST `.layer` call as the OUTERMOST service — the inverse of the tonic
-    /// [`tonic::transport::Server`] builder, where the FIRST `.layer` is
-    /// outermost — so the calls are ordered inner→outer here to land the exact
-    /// same outermost→innermost stack `serve` builds. `accept_http1` has no axum
-    /// analogue: HTTP/1 is implicit in [`axum::serve()`].
+    /// PARTIAL LAYER STACK — this does NOT apply the SAME stack [`Self::serve`]
+    /// applies, despite this method's name; it applies only the gRPC-web +
+    /// metrics + trace-context framing (the whole-server [`MetricsLayer`],
+    /// outermost, observing every method path, wrapping
+    /// [`crate::trace_context_layer::TraceContextLayer`] — opens one span per
+    /// request, continuing an incoming W3C `traceparent` — wrapping
+    /// [`GrpcWebTrailersLayer`] — the trailers-only error repair — wrapping
+    /// [`GrpcWebLayer`], gRPC-web framing, wrapping the routes). axum runs the
+    /// LAST `.layer` call as the OUTERMOST service — the
+    /// inverse of the tonic [`tonic::transport::Server`] builder, where the FIRST
+    /// `.layer` is outermost — so the calls are ordered inner→outer here to land
+    /// the same outermost→innermost gRPC-web/metrics stack `serve` builds.
+    /// `accept_http1` has no axum analogue: HTTP/1 is implicit in
+    /// [`axum::serve()`].
+    ///
+    /// MISSING, relative to [`Self::serve`]: the WHOLE `[server.limits]`
+    /// request-bounds stack — [`crate::limits::RefusalStatusLayer`],
+    /// [`crate::limits::GlobalConcurrencyLimitLayer`],
+    /// [`crate::limits::PerConnectionLimitLayer`], and
+    /// [`crate::limits::MethodClassLayer`] (the message-size cap is unaffected
+    /// — it is applied per-service in `assemble_grpc_chain`, before this split,
+    /// so it rides along either path). `self.limits` is retained on
+    /// [`AssembledChain`] but not consulted here. A downstream serving this
+    /// router on ITS OWN listener therefore gets NO in-flight/per-connection/
+    /// wait-timeout/stream-budget enforcement from this stack unless it
+    /// re-applies `crate::limits`'s layers itself — the per-connection ones in
+    /// particular depend on tonic's own [`tonic::transport::server::
+    /// TcpConnectInfo`] request extension, which this axum path does not
+    /// independently guarantee is populated the same way, so re-applying them
+    /// blind here (rather than leaving this an explicit, documented gap for the
+    /// downstream to close with its own connection-info wiring) risks a
+    /// SILENTLY inert limit — worse than the honest gap this doc now states.
     ///
     /// ERGONOMIC GUARANTEE: the returned value is a plain `axum::Router` (state
     /// `()`, request body [`axum::body::Body`]) that [`axum::serve()`] accepts with
@@ -871,7 +935,7 @@ impl AssembledChain {
     /// listener that ALREADY frames gRPC-web — that expert path is layer-free
     /// precisely so it does not double-frame in that case.
     ///
-    /// The downstream must hold [`ChainParts`] (specifically its training-worker
+    /// The downstream must hold [`ChainParts`] (specifically its job-worker
     /// guard) alive for the lifetime of its own serve loop.
     pub fn into_layered_axum_router(self) -> (axum::Router, ChainParts) {
         // The `MetricsLayer` holds a clone; the original moves into `ChainParts`
@@ -880,14 +944,15 @@ impl AssembledChain {
         let metrics = Arc::clone(&self.metrics);
         // Apply the canonical stack in axum's inner→outer call order. axum runs
         // the last `.layer` as the outermost service, so ordering the calls
-        // GrpcWebLayer → GrpcWebTrailersLayer → MetricsLayer reproduces `serve`'s
-        // outermost→innermost stack: Metrics → GrpcWebTrailers → GrpcWebLayer →
-        // routes.
+        // GrpcWebLayer → GrpcWebTrailersLayer → TraceContextLayer → MetricsLayer
+        // reproduces `serve`'s outermost→innermost stack: Metrics →
+        // TraceContext → GrpcWebTrailers → GrpcWebLayer → routes.
         let layered = self
             .routes
             .into_axum_router()
             .layer(GrpcWebLayer::new())
             .layer(GrpcWebTrailersLayer::new())
+            .layer(TraceContextLayer::new())
             .layer(MetricsLayer::new(metrics));
         // Re-nest the layered routes under a fresh `Router` so the returned type
         // is a plain `axum::Router` whose request body is `axum::body::Body` —
@@ -898,8 +963,7 @@ impl AssembledChain {
             addr: self.addr,
             mounted: self.mounted,
             metrics: self.metrics,
-            #[cfg(feature = "train")]
-            train_worker: self._train_worker,
+            worker: self._worker,
         };
         (router, parts)
     }
@@ -921,10 +985,10 @@ pub struct BoundChain {
     routes: tonic::service::Routes,
     mounted: Vec<String>,
     metrics: Arc<MetricsRegistry>,
-    // The embedded training worker guard, held RAII across the serve loop — its
+    limits: jammi_db::config::LimitsConfig,
+    // The embedded job worker guard, held RAII across the serve loop — its
     // lifetime spans bind → serve, exactly as it did on `AssembledChain`.
-    #[cfg(feature = "train")]
-    _train_worker: Option<jammi_ai::fine_tune::worker::EmbeddedWorker>,
+    _worker: Option<jammi_ai::fine_tune::worker::EmbeddedWorker>,
 }
 
 impl BoundChain {
@@ -945,13 +1009,24 @@ impl BoundChain {
     /// resolves. Consumes `self`, keeping the training-worker guard alive for
     /// the whole serve loop.
     ///
-    /// The transport layers apply HERE, in this order: `accept_http1(true)` then
-    /// `MetricsLayer` (outermost — observes every request by method path before
-    /// routing) then `GrpcWebTrailersLayer` (wraps `GrpcWebLayer`, repairing the
-    /// trailers-only error response into the in-body trailer frame a gRPC-web
-    /// client requires) then `GrpcWebLayer`. Every service mounted via
-    /// [`AssembledChain::mount`], engine or downstream, inherits gRPC-web framing
-    /// + trailer repair with no per-service opt-in.
+    /// The transport layers apply HERE, in this order (outermost first):
+    /// `accept_http1(true)` then `MetricsLayer` (observes every request by
+    /// method path before routing) then `TraceContextLayer` (opens one span
+    /// per request, continuing an incoming W3C `traceparent` — see
+    /// `crate::trace_context_layer`) then `GrpcWebTrailersLayer` (wraps
+    /// `GrpcWebLayer`, repairing the trailers-only error response into the
+    /// in-body trailer frame a gRPC-web client requires) then `GrpcWebLayer`
+    /// then the `[server.limits]` request-bounds stack
+    /// ([`crate::limits::RefusalStatusLayer`] →
+    /// [`crate::limits::GlobalConcurrencyLimitLayer`] →
+    /// [`crate::limits::PerConnectionLimitLayer`] →
+    /// [`crate::limits::MethodClassLayer`] — see [`crate::limits`] for the
+    /// full contract and the N4/N5 rationale for this exact position, inside
+    /// the gRPC-web layers). Every service mounted via [`AssembledChain::mount`],
+    /// engine or downstream, inherits every one of these with no per-service
+    /// opt-in — including a downstream's own mounted service, which is
+    /// deliberate: the request-bounds refusal is a whole-listener property,
+    /// not an engine-only one.
     pub async fn serve_with_shutdown(
         self,
         shutdown: impl Future<Output = ()> + Send + 'static,
@@ -966,18 +1041,29 @@ impl BoundChain {
         // `BoundChain`. `Routes` is the layer-free accumulation point;
         // `add_routes` attaches it behind the stack at serve time, then serves
         // on the pre-bound listener via `serve_with_incoming_shutdown`.
+        let refusal_metrics = Arc::clone(&self.metrics);
+        let limits = self.limits;
         let mut server = Server::builder()
             .accept_http1(true)
             .layer(MetricsLayer::new(self.metrics))
+            .layer(TraceContextLayer::new())
             .layer(GrpcWebTrailersLayer::new())
-            .layer(GrpcWebLayer::new());
+            .layer(GrpcWebLayer::new())
+            .layer(crate::limits::RefusalStatusLayer::new(refusal_metrics))
+            .layer(crate::limits::GlobalConcurrencyLimitLayer::new(
+                limits.max_in_flight,
+            ))
+            .layer(crate::limits::PerConnectionLimitLayer::new(
+                limits.max_in_flight_per_connection,
+            ))
+            .layer(crate::limits::MethodClassLayer::new(&limits));
         server
             .add_routes(self.routes)
             .serve_with_incoming_shutdown(self.incoming, shutdown)
             .await
             .map_err(ServerError::from)
-        // `self._train_worker` (train build) is dropped here, after the serve
-        // future resolves — its RAII lifetime spans the whole serve loop.
+        // `self._worker` is dropped here, after the serve future resolves — its
+        // RAII lifetime spans the whole serve loop.
     }
 }
 
@@ -991,19 +1077,19 @@ impl BoundChain {
 /// `GetServerInfo` answer even when no engine is mounted; its catalog /
 /// lifecycle verbs are backed by `engine` when present). When `engine` is
 /// `Some`, the core data-plane services also mount: `EmbeddingService`,
-/// `InferenceService`, `PipelineService`, `AuditService`. These are the
-/// serve-path primitives every deployment needs.
+/// `InferenceService`, `PipelineService`, `AuditService`, and
+/// `JobService` (the job submission surface). These are the serve-path
+/// primitives every deployment needs.
+///
+/// An engine-backed chain also spawns the embedded job worker, unless
+/// `chain.engine`'s `[worker] enabled` is `false`: that key decides whether
+/// THIS process claims queued jobs, and it does NOT change what is mounted or
+/// advertised (`JobService` serves either way, so an `enabled = false`
+/// deployment still accepts submissions and just leaves them `queued` for
+/// whichever process does claim).
 ///
 /// **Mounted by tier** (only when `tiers` selected them):
 /// - `EvalService` ← [`ServiceTier::Eval`]
-/// - `TrainingService` ← [`ServiceTier::Train`] (and only when the `train`
-///   feature is compiled in — the mount code itself is `#[cfg]`-gated). The
-///   tier also spawns the embedded training worker, unless `chain.engine`'s
-///   `[training] run_worker` is `false`: that key decides whether THIS process
-///   claims queued jobs, and it does NOT change what is mounted or advertised
-///   (`TrainingService` serves either way, so a `run_worker = false` deployment
-///   still accepts submissions and just leaves them `queued` for whichever
-///   process does claim).
 /// - `TriggerService` ← [`ServiceTier::Event`], driven by `trigger` being
 ///   `Some` (the caller derives the handles iff the event tier is mounted)
 ///
@@ -1029,7 +1115,17 @@ pub fn assemble_grpc_chain(chain: GrpcChain) -> Result<AssembledChain, ServerErr
         metrics,
         tenant_resolver,
         admin_authorizer,
+        limits,
     } = chain;
+
+    // `[server.limits].max_message_bytes`, applied to every mounted service
+    // below (including Flight SQL) via tonic's own per-service
+    // `max_decoding_message_size` — see `crate::limits`'s N5 rustdoc for why
+    // this is NOT a tower layer. `u64` -> `usize`: a value that would not fit
+    // `usize` (only reachable on a 32-bit target with an absurd config) saturates
+    // to `usize::MAX` (effectively unbounded) rather than panicking or silently
+    // truncating to a SMALLER, surprising cap.
+    let max_message_bytes: usize = usize::try_from(limits.max_message_bytes).unwrap_or(usize::MAX);
 
     // Flight SQL — MUST-FIX 2: cover the `db.sql` lane through the SAME resolver
     // as the gRPC plane. The provider resolves each query's scope and binds it,
@@ -1041,7 +1137,7 @@ pub fn assemble_grpc_chain(chain: GrpcChain) -> Result<AssembledChain, ServerErr
         Arc::clone(&tenant_resolver),
     );
     let flight = FlightSqlService::new_with_provider(Box::new(provider));
-    let flight_svc = FlightServiceServer::new(flight);
+    let flight_svc = FlightServiceServer::new(flight).max_decoding_message_size(max_message_bytes);
 
     // The single binder. One `TenantResolverLayer` (holding the one resolver)
     // wraps every engine service uniformly — no branch, no separate interceptor,
@@ -1053,10 +1149,13 @@ pub fn assemble_grpc_chain(chain: GrpcChain) -> Result<AssembledChain, ServerErr
 
     // Bind one engine service onto `routes` under the resolver layer. `$server`
     // is the bare `*ServiceServer::new(inner)`; the layer forwards its
-    // `NamedService::NAME` so tonic routing keeps it.
+    // `NamedService::NAME` so tonic routing keeps it. Every engine service gets
+    // the SAME `max_message_bytes` inbound decode cap (`[server.limits]`).
     macro_rules! mount_engine {
         ($routes:expr, $mounted:expr, $name:literal, $server:expr) => {{
-            $routes = $routes.add_service(resolver_layer.layer($server));
+            $routes = $routes.add_service(
+                resolver_layer.layer($server.max_decoding_message_size(max_message_bytes)),
+            );
             $mounted.push($name.to_string());
         }};
     }
@@ -1106,11 +1205,10 @@ pub fn assemble_grpc_chain(chain: GrpcChain) -> Result<AssembledChain, ServerErr
         );
     }
 
-    // The embedded training worker the `train` tier owns. Moved into the returned
-    // `AssembledChain` so it outlives the assemble frame and spans the serve loop
-    // (RAII). A serve-only build never sets it.
-    #[cfg(feature = "train")]
-    let mut train_worker: Option<jammi_ai::fine_tune::worker::EmbeddedWorker> = None;
+    // The embedded job worker this process runs when `[worker] enabled`. Moved
+    // into the returned `AssembledChain` so it outlives the assemble frame and
+    // spans the serve loop (RAII). A chain without an engine never sets it.
+    let mut worker: Option<jammi_ai::fine_tune::worker::EmbeddedWorker> = None;
 
     if let Some(session) = engine {
         // Core tier engine services: always mounted when an engine is present.
@@ -1149,51 +1247,45 @@ pub fn assemble_grpc_chain(chain: GrpcChain) -> Result<AssembledChain, ServerErr
             );
         }
 
-        // Train tier: TrainingService (all three training kinds — fine-tune,
-        // graph fine-tune, context-predictor). The mount code is `#[cfg]`-gated on
-        // the `train` feature, so a serve-only build carries no training surface;
-        // `TierSet::resolve` has already guaranteed the tier is not requested when
-        // the feature is compiled out.
-        #[cfg(feature = "train")]
-        if tiers.contains(ServiceTier::Train) {
-            // Whether THIS process also runs the claim loop is configuration, not
-            // a second code path: `[training] run_worker` (default `true`). The
-            // tier still mounts `TrainingService` either way — the surface and
-            // what `GetServerInfo.services` advertises are unchanged, because the
-            // service IS mounted — so a `run_worker = false` deployment still
-            // accepts submissions; it just never claims them. The embedded arm
-            // reads the same key off the same config, so a wire deployment and an
-            // in-process one answer the question identically.
-            if session.inner_config().training.run_worker {
-                // Start the worker that runs submitted jobs: a "GPU worker pool"
-                // is just N processes claiming from the shared catalog, and the
-                // server `train` tier runs one of them. `spawn` borrows `session`
-                // before it is moved into `TrainingServer::new`; the worker is
-                // stored in `AssembledChain` so it stops when the serve future
-                // resolves.
-                train_worker = Some(jammi_ai::fine_tune::worker::EmbeddedWorker::spawn(
-                    &session,
-                )?);
-                tracing::info!(
-                    run_worker = true,
-                    "train tier: TrainingService mounted; this process claims queued training jobs"
-                );
-            } else {
-                // No worker exists to stop, so shutdown has nothing extra to
-                // await: `AssembledChain::_train_worker` stays `None` and its
-                // drop is a no-op.
-                tracing::info!(
-                    run_worker = false,
-                    "train tier: TrainingService mounted; this process does not claim training jobs"
-                );
-            }
-            mount_engine!(
-                routes,
-                mounted,
-                "TrainingService",
-                TrainingServiceServer::new(TrainingServer::new(session))
+        // Core: JobService — the durable job submission/status/wait surface
+        // (replaces TrainingService). `SubmitJob` carries all three
+        // training kinds — fine-tune, graph fine-tune, context-predictor.
+        // Submission is always mounted; whether THIS process also runs the
+        // claim loop is configuration, not a tier and not a build feature:
+        // `[worker] enabled` (default `true`). The surface and what
+        // `GetServerInfo.services` advertises are the same either way, because
+        // the service IS mounted — so a `worker.enabled = false` deployment
+        // still accepts submissions; it just never claims them. The embedded
+        // arm reads the same key off the same config, so a wire deployment and
+        // an in-process one answer the question identically.
+        if session.inner_config().worker.enabled {
+            // Start the worker that runs submitted jobs of every compiled kind:
+            // a "GPU worker pool" is just N processes claiming from the shared
+            // catalog, and this server runs one of them. `spawn` borrows
+            // `session` before it is moved into `JobServer::new`; the
+            // worker is stored in `AssembledChain` so it stops when the serve
+            // future resolves.
+            worker = Some(jammi_ai::fine_tune::worker::EmbeddedWorker::spawn(
+                &session,
+            )?);
+            tracing::info!(
+                worker_enabled = true,
+                "JobService mounted; this process claims queued jobs"
+            );
+        } else {
+            // No worker exists to stop, so shutdown has nothing extra to await:
+            // `AssembledChain::_worker` stays `None` and its drop is a no-op.
+            tracing::info!(
+                worker_enabled = false,
+                "JobService mounted; this process does not claim jobs"
             );
         }
+        mount_engine!(
+            routes,
+            mounted,
+            "JobService",
+            JobServiceServer::new(JobServer::new(session))
+        );
     }
 
     Ok(AssembledChain {
@@ -1201,12 +1293,12 @@ pub fn assemble_grpc_chain(chain: GrpcChain) -> Result<AssembledChain, ServerErr
         routes,
         mounted,
         metrics,
+        limits,
         // The SAME layer `mount_engine!` wrapped every engine service with above
         // — retained so `AssembledChain::mount_tenant_scoped` can wrap a
         // downstream service through the identical single resolver.
         tenant_resolver_layer: resolver_layer,
-        #[cfg(feature = "train")]
-        _train_worker: train_worker,
+        _worker: worker,
     })
 }
 

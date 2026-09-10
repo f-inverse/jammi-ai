@@ -263,8 +263,8 @@ def fine_tune_and_recall(db, papers: str, *, label: str, relevant, query_ids,
         raise
     if job.status() != "completed":
         raise RuntimeError(f"{label} fine-tune did not complete: status={job.status()}")
-    print(f"  model_id: {job.model_id}", flush=True)
-    emb = db.generate_embeddings(source=papers, model=job.model_id,
+    print(f"  model_id: {job.output_model_id}", flush=True)
+    emb = db.generate_embeddings(source=papers, model=job.output_model_id,
                                  columns=["title", "abstract"], key="paper_id")
     ids, vecs = _read_vectors(db, emb)
     r = recall_at_k(ids, vecs, relevant=relevant, query_ids=query_ids, k=RECALL_K)
@@ -274,7 +274,7 @@ def fine_tune_and_recall(db, papers: str, *, label: str, relevant, query_ids,
             pa.table({"_row_id": ids, "vector": [v.tolist() for v in vecs]}),
             ARTIFACTS / f"emb_{label}.parquet",
         )
-    return {"method": label, "model_id": job.model_id, "recall_at_10": round(r, 4),
+    return {"method": label, "model_id": job.output_model_id, "recall_at_10": round(r, 4),
             "dim": int(vecs.shape[1]), "ids": ids, "vecs": vecs}
 
 
@@ -441,13 +441,13 @@ def emit(db) -> None:
     gjob.wait()
     if gjob.status() != "completed":
         raise RuntimeError(f"graph fine-tune did not complete: status={gjob.status()}")
-    print(f"  model_id: {gjob.model_id}", flush=True)
-    g_emb = db.generate_embeddings(source=papers, model=gjob.model_id,
+    print(f"  model_id: {gjob.output_model_id}", flush=True)
+    g_emb = db.generate_embeddings(source=papers, model=gjob.output_model_id,
                                    columns=["title", "abstract"], key="paper_id")
     g_ids, g_vecs = _read_vectors(db, g_emb)
     g_recall = recall_at_k(g_ids, g_vecs, relevant=relevant, query_ids=query_ids, k=RECALL_K)
     print(f"  recall@{RECALL_K} (declared-edge graph FT): {g_recall:.3f}", flush=True)
-    rows.append({"method": "graph_declared", "model_id": gjob.model_id,
+    rows.append({"method": "graph_declared", "model_id": gjob.output_model_id,
                  "recall_at_10": round(g_recall, 4), "dim": int(g_vecs.shape[1])})
 
     # --------------------------------------------------------------------- #

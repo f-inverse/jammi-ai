@@ -667,3 +667,171 @@ async fn a_dropped_run_claimed_jobs_future_leaves_no_leaked_cancel_watcher_or_ca
         tokio::time::sleep(Duration::from_millis(20)).await;
     }
 }
+
+/// unit #485 (round-3 fix-verifier gap): `run_claimed_job`'s shared `cancel`
+/// flag has two writers — the lease keeper's own renewal (a genuine lease
+/// loss) and `spawn_cancel_request_watcher` observing `jobs.cancel_requested`
+/// (an operator's `CancelJob`) — and the `Cancelled` arm tells them apart
+/// with `cancel_requested_seen` so a lease loss is left `running` for reclaim
+/// while a real cancel request lands `failed` with
+/// [`JammiError::JobCancelled`]'s message. `fine_tune.rs`'s
+/// `worker_that_lost_lease_does_not_finalize` and
+/// `cancelled_run_reclaims_epoch_checkpoints_that_actually_existed` both drive
+/// a lease loss by letting a SECOND worker reclaim (and re-claim) the row
+/// before the flag trips — so by the time the first worker's stale attempt
+/// reaches ANY terminal write, `record_failed`'s own ownership CAS (identical
+/// guard columns to the reclaim it raced) already fails on `claimed_by`/
+/// `attempts` alone. Neither test can tell "the lease-lost arm correctly
+/// skipped `record_failed`" apart from "a broken arm called `record_failed`
+/// but its CAS silently no-op'd anyway" — both produce the exact same
+/// observable row. This test closes that gap: NO second worker or reclaim
+/// ever touches the row, so a version of `run_claimed_job` that (wrongly)
+/// treated every `cancel` trip as a cancel request would reach
+/// `record_failed`'s CAS with `claimed_by`/`status`/`attempts` still fully
+/// intact — the CAS would MATCH and the row WOULD land `failed` with the
+/// cancel message. Only the correct branch logic (reading
+/// `cancel_requested_seen`, which stays `false` here) leaves the row
+/// untouched.
+///
+/// The lease loss itself is manufactured with
+/// [`jammi_db::catalog::lease_keeper::LeaseKeeper::kill_thread_for_test`] (the
+/// keeper's own belt-and-braces death hook, forwarded through this crate's
+/// `test-hooks` feature): killing the ONE dedicated keeper thread flips the
+/// job's lease hold's `lost` flag via `ExitGuard` alone, with zero writes to
+/// the `jobs` row — `claimed_by`, `status`, and `attempts` stay exactly what
+/// they were the moment this worker claimed the job, i.e. "no reclaim has
+/// happened" by construction, not by a race that might or might not resolve
+/// that way. No DB-level trick (forcing `lease_expires_at` stale, bumping
+/// `attempts`) can substitute: the keeper's own renewal and `record_failed`'s
+/// CAS share the identical `claimed_by`/`status`/`attempts` guard, so any
+/// mutation that trips the renewal miss would ALSO block `record_failed`'s
+/// CAS — reproducing the exact masking this test exists to avoid.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_lease_loss_on_the_owning_worker_lands_the_lease_lost_outcome_never_the_cancel_message() {
+    let dir = tempfile::TempDir::new().unwrap();
+    let mut config = common::test_config(dir.path());
+    // Same minimum-legal heartbeat/lease margin `cancelled_run_reclaims_epoch_
+    // checkpoints_that_actually_existed` uses: fast enough that the keeper's
+    // death is observed (and the training loop's epoch-boundary check bails)
+    // within a couple of seconds, never a wall-clock gamble.
+    config.lease = jammi_db::config::LeaseConfig {
+        duration_secs: 3,
+        heartbeat_secs: 1,
+    };
+    config.worker = jammi_db::config::WorkerConfig {
+        idle_poll_secs: 1,
+        ..Default::default()
+    };
+    let session = Arc::new(InferenceSession::new(config).await.unwrap());
+    session
+        .add_source(
+            "training",
+            SourceType::File,
+            SourceConnection {
+                url: Some(common::fixture_url("training_pairs.csv")),
+                format: Some(FileFormat::Csv),
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+
+    let handle = session
+        .enqueue(
+            TrainingSpec::FineTune {
+                source: "training".to_string(),
+                columns: vec![
+                    "text_a".to_string(),
+                    "text_b".to_string(),
+                    "score".to_string(),
+                ],
+                method: FineTuneMethod::Lora,
+                task: ModelTask::TextEmbedding,
+                common: TrainingCommon {
+                    base_model: tiny_bert_model(),
+                    config: FineTuneConfig {
+                        // Deliberately large, matching every other lease-loss
+                        // drive in this suite: a tiny real epoch is fast
+                        // enough (single-digit milliseconds) that the count
+                        // must be big enough the run is CERTAINLY still
+                        // training when the keeper thread is killed below.
+                        epochs: 20_000,
+                        batch_size: 8,
+                        lora_rank: 4,
+                        warmup_steps: 0,
+                        ..Default::default()
+                    },
+                },
+            }
+            .into(),
+            0,
+        )
+        .await
+        .unwrap();
+
+    let worker = JobWorker::new(&session).expect("this config clears the worker margin");
+    let claimed = session
+        .catalog()
+        .claim_next(worker.worker_id(), &["fine_tune"], Duration::from_secs(30))
+        .await
+        .unwrap()
+        .expect("the queued job is claimable");
+    let worker_id = worker.worker_id().to_string();
+
+    // Drive the claimed job concurrently so the real lease keeper thread (and
+    // the training loop's own epoch-boundary checks) can actually run while
+    // training is in progress.
+    let session_for_task = Arc::clone(&session);
+    let run = tokio::spawn(async move {
+        worker.run_claimed_job(&session_for_task, claimed).await;
+    });
+
+    // Sanity gate, mirroring every other lease-loss drive in this suite: the
+    // run must still be in flight, or this test cannot distinguish "the fix
+    // works" from "the run happened to finish on its own first".
+    assert!(
+        !run.is_finished(),
+        "the spawned run_claimed_job task already completed before the test could kill the \
+         lease keeper -- raise `epochs` further so this genuinely races a live training run"
+    );
+
+    // Kill the ONE dedicated keeper thread this session's every lease hold
+    // renews on. No second worker, no `reclaim_expired_jobs`, no direct SQL
+    // write to `jobs` — the row is never touched by this step at all.
+    session.lease_keeper().kill_thread_for_test();
+
+    tokio::time::timeout(Duration::from_secs(15), run)
+        .await
+        .expect(
+            "the training loop's next epoch-boundary check must observe the keeper's death \
+             promptly and bail",
+        )
+        .unwrap();
+
+    let row = session.catalog().get_job(&handle.job_id).await.unwrap();
+    assert_eq!(
+        row.status,
+        JobStatus::Running.to_string(),
+        "a lease loss on the owning worker must leave the job `running` for reclaim, never \
+         `failed` or `completed`"
+    );
+    assert_eq!(
+        row.claimed_by.as_deref(),
+        Some(worker_id.as_str()),
+        "no reclaim ever happened -- the row is still claimed by the SAME worker whose lease \
+         died"
+    );
+    assert!(
+        row.error.is_none(),
+        "the lease-lost arm must never record a terminal error, got {:?}",
+        row.error
+    );
+    assert!(
+        row.result.is_none(),
+        "the lease-lost arm must never record a terminal result"
+    );
+    assert!(
+        !row.cancel_requested,
+        "no cancel was ever requested on this row"
+    );
+}

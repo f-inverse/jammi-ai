@@ -182,10 +182,15 @@ live-hub-tests = []
 # Test-only rendezvous hooks inside `jammi_ai::jobs::execute_compute` /
 # `InferenceSession::run_now` (`jammi_ai::jobs::compute_test_hooks`): a test
 # parks a compute job at a documented checkpoint and manufactures a cancel
-# request or a peer's write there. The `jammi-db` crate's `test-hooks` peer.
-# On for this crate's own tests via the self dev-dependency above; off for
-# every consumer.
-test-hooks = []
+# request or a peer's write there. Forwards to the `jammi-db` crate's own
+# `test-hooks` peer (unit #485 round-3: `LeaseKeeper::kill_thread_for_test`
+# is the only way to observe a genuine lease-renewal miss on the SAME hold
+# without a second worker's claim/reclaim ever touching the row, which a
+# claimed-job cancel-vs-lease-loss test needs and no in-crate seam can
+# reach) — a private-dependency feature union that compiles away entirely
+# when this feature is off. On for this crate's own tests via the self
+# dev-dependency above; off for every consumer.
+test-hooks = ["jammi-db/test-hooks"]
 # A gated, multi-process distributed-validation lane: spawns N `jammi-server`
 # worker processes against a shared Postgres catalog + shared object store
 # (MinIO) and asserts the durable-worker fleet-safety properties (exactly-one

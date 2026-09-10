@@ -138,9 +138,9 @@ environment variable above (`HF_HUB_CACHE`, `HF_HOME`, `HF_ENDPOINT`,
 `TRANSFORMERS_OFFLINE`) is treated as unset when it is *present but empty*
 (after trimming whitespace) — the shape a Compose/Kubernetes env block
 produces for a variable named with no value (`HF_HUB_OFFLINE:`), or a shell
-`export HF_TOKEN=`. This closes a fail-open gap where an empty
-`HF_HUB_OFFLINE` used to shadow the `TRANSFORMERS_OFFLINE` alias and silently
-resolve online. The value used downstream is also the TRIMMED string, not
+`export HF_TOKEN=`. Without this rule, an empty `HF_HUB_OFFLINE` would shadow
+the `TRANSFORMERS_OFFLINE` alias and silently resolve online. The value used
+downstream is also the TRIMMED string, not
 the raw one — `HF_HOME=" /data/hf"` resolves to the cache root
 `/data/hf/hub`, never a current-working-directory-relative root the padded,
 untrimmed value would otherwise produce. One case is a genuine divergence,

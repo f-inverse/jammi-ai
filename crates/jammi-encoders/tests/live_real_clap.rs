@@ -103,20 +103,20 @@ fn hf_home_dir() -> Option<std::path::PathBuf> {
 /// home directory for the cache root, and `HF_TOKEN` >
 /// `HUGGING_FACE_HUB_TOKEN` > the token file for the token, never `hf_hub`'s
 /// own panicking defaults), built inline from `hf_hub` rather than the bare
-/// `hf_hub::api::sync::Api::new()` this replaced (which ignored
-/// `HF_ENDPOINT`/`HF_TOKEN` entirely — hf-hub 0.5 never reads `HF_TOKEN` on
-/// its own). "Mirrors by construction" is a claim about the SOURCE — the
-/// same rule, written twice — not a measured cross-implementation parity
-/// claim: this file has no oracle that runs `HubSource`'s own resolver
-/// against the same env and diffs the two outputs, and it is gated behind
-/// `live-hub-tests`, so CI's default `cargo test` never even compiles this
-/// module's assertions against a live network call. It still disclosably
-/// diverges from `HubSource` in one way: the cache-root fallback below is
-/// hand-written rather than shared code — `resolve_root_with`'s
-/// injected-`home_dir` unit-test seam lives in `jammi-ai`, unreachable from
-/// here; that is no longer true of the token fallback, whose SOURCE now
-/// reads identically to `HubSource`'s own (`HF_TOKEN` > `HUGGING_FACE_HUB_TOKEN`
-/// > `HF_TOKEN_PATH` else `<HF_HOME>/token`, independent of `HF_HUB_CACHE`).
+/// `hf_hub::api::sync::Api::new()` (which ignores `HF_ENDPOINT`/`HF_TOKEN`
+/// entirely — hf-hub 0.5 never reads `HF_TOKEN` on its own). "Mirrors by
+/// construction" is a claim about the SOURCE — the same rule, written
+/// twice — not a measured cross-implementation parity claim: this file has
+/// no oracle that runs `HubSource`'s own resolver against the same env and
+/// diffs the two outputs, and it is gated behind `live-hub-tests`, so CI's
+/// default `cargo test` never even compiles this module's assertions
+/// against a live network call. It disclosably diverges from `HubSource` in
+/// one way: the cache-root fallback below is hand-written rather than
+/// shared code — `resolve_root_with`'s injected-`home_dir` unit-test seam
+/// lives in `jammi-ai`, unreachable from here. The token fallback carries no
+/// such divergence: its SOURCE reads identically to `HubSource`'s own
+/// (`HF_TOKEN` > `HUGGING_FACE_HUB_TOKEN` > `HF_TOKEN_PATH` else
+/// `<HF_HOME>/token`, independent of `HF_HUB_CACHE`).
 ///
 ///   - cache root: `HF_HUB_CACHE` (non-empty, used directly as the cache
 ///     dir, nothing appended) -> `HF_HOME` (non-empty, a `hub/`

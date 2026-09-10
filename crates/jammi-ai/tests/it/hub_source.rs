@@ -268,13 +268,13 @@ async fn hf_hub_offline_env_refuses_by_name_with_no_config_override() {
     );
 }
 
-/// #481 fix round 2, BLOCK reproducer: `HF_HUB_OFFLINE=ON` — a truthy value
-/// per `huggingface_hub`'s own `ENV_VARS_TRUE_VALUES = {"1","ON","YES","TRUE"}`
+/// `HF_HUB_OFFLINE=ON` — a truthy value per `huggingface_hub`'s own
+/// `ENV_VARS_TRUE_VALUES = {"1","ON","YES","TRUE"}`
 /// (`huggingface_hub/constants.py:12`, `_is_true` at `:16-19`) — must refuse
-/// offline by name, exactly like `HF_HUB_OFFLINE=1` above. Before this fix,
-/// `is_hf_hub_offline_truthy` accepted only `"1"` and a case-insensitive
-/// `"true"`, so `HF_HUB_OFFLINE=ON` silently resolved `offline=false` and the
-/// resolver proceeded to a live fetch — fail-open on the air-gap knob.
+/// offline by name, exactly like `HF_HUB_OFFLINE=1` above: accepting only
+/// `"1"` and a case-insensitive `"true"` would silently resolve
+/// `offline=false` for `HF_HUB_OFFLINE=ON` and let the resolver proceed to a
+/// live fetch — fail-open on the air-gap knob.
 ///
 /// RED at 6519633d (this test's own first assertion, `offline_hub.offline()`,
 /// was the failure -- resolution never even reached the resolver):
@@ -330,9 +330,9 @@ async fn hf_hub_offline_on_refuses_by_name_with_no_config_override() {
     );
 }
 
-/// #481 fix round 2: `TRANSFORMERS_OFFLINE=1`, with `HF_HUB_OFFLINE` and
-/// `[models] offline` both unset, must be honoured as the same fallback
-/// `huggingface_hub` itself applies for this variable.
+/// `TRANSFORMERS_OFFLINE=1`, with `HF_HUB_OFFLINE` and `[models] offline`
+/// both unset, must be honoured as the same fallback `huggingface_hub`
+/// itself applies for this variable.
 #[tokio::test(flavor = "multi_thread")]
 async fn transformers_offline_env_refuses_by_name_with_no_config_override() {
     let server = MockServer::start().await;
@@ -387,8 +387,8 @@ async fn transformers_offline_env_refuses_by_name_with_no_config_override() {
     );
 }
 
-/// #481 fix round 3, BLOCK 1 reproducer (t1): a present-but-empty
-/// `HF_HUB_OFFLINE` (`HF_HUB_OFFLINE=` in a Compose/K8s env block, which the
+/// A present-but-empty `HF_HUB_OFFLINE` (`HF_HUB_OFFLINE=` in a Compose/K8s
+/// env block, which the
 /// production closure `std::env::var(k).ok()` — `crate::session` —
 /// resolves to `Some("")`) must not shadow `TRANSFORMERS_OFFLINE=1`: the
 /// alias must still be honoured, offline by name, with the mock never
@@ -445,7 +445,7 @@ async fn hf_hub_offline_empty_falls_through_to_transformers_offline_refuses_by_n
     );
 }
 
-/// #481 fix round 2, advisory A4: a fetch driven entirely by `HF_HUB_CACHE`
+/// A fetch driven entirely by `HF_HUB_CACHE`
 /// (no `[models] hub_cache_dir`, no `HF_HOME`) must land the downloaded file
 /// directly under that directory (`models--…` immediately inside it) — no
 /// `hub/` subdirectory appended, matching `huggingface_hub`'s own
@@ -490,29 +490,27 @@ async fn hf_hub_cache_env_drives_the_cache_root_directly_no_hub_subdir_appended(
     assert_eq!(std::fs::read(&downloaded).unwrap(), BODY);
 }
 
-/// #481 acceptance bullet 3, second control (the direction): `[models]
-/// offline = false` EXPLICIT wins over `HF_HUB_OFFLINE=1` in the environment
-/// — config wins, matching `resolve_root`/`resolve_endpoint`/`resolve_token`'s
-/// own "config beats env" precedence.
+/// `[models] offline = false` EXPLICIT wins over `HF_HUB_OFFLINE=1` in the
+/// environment — config wins, matching
+/// `resolve_root`/`resolve_endpoint`/`resolve_token`'s own "config beats
+/// env" precedence.
 ///
-/// Proven by an OBSERVED completed network fetch, not by an error's shape.
-/// An acceptance-verifier BLOCK on the prior version of this test found that
-/// oracle vacuous: at the true pre-esc-096 base, `HF_HUB_OFFLINE` was never
-/// read at all, so "the error message doesn't say offline" passed for the
-/// wrong reason — it cannot distinguish "config correctly overrode the env"
-/// from "the env is simply unimplemented and this genuinely 404s for an
-/// unrelated reason". This version mounts the repo's `config.json` and
-/// `model.safetensors` on the wiremock server exactly like the passing
-/// fetch tests above (`mount_repo_file`, the file's shared mounting
-/// helper), so a real config-wins outcome is observable two ways that a
-/// vacuous "env unimplemented" run cannot fake: (i) `resolve` returns `Ok`
-/// (an unmounted 404 or an actual offline refusal both return `Err`), and
-/// (ii) the mock's `received_requests` is non-empty (the resolve did not
-/// short-circuit before ever reaching the network — the offline refusal
-/// path in `ModelResolver::resolve` returns before building the Hub repo
-/// client at all). The `!hub.offline()` unit-level assertion stays, so this
-/// test still pins the `HubSource`-level precedence directly, not only its
-/// downstream effect.
+/// Proven by an OBSERVED completed network fetch, not by an error's shape:
+/// an error-shape assertion alone is a vacuous oracle here, because it
+/// cannot distinguish "config correctly overrode the env" from "the env is
+/// simply unimplemented and this genuinely 404s for an unrelated reason" —
+/// both present as "the error message doesn't say offline". This test
+/// mounts the repo's `config.json` and `model.safetensors` on the wiremock
+/// server exactly like the passing fetch tests above (`mount_repo_file`,
+/// the file's shared mounting helper), so a real config-wins outcome is
+/// observable two ways that a vacuous "env unimplemented" run cannot fake:
+/// (i) `resolve` returns `Ok` (an unmounted 404 or an actual offline
+/// refusal both return `Err`), and (ii) the mock's `received_requests` is
+/// non-empty (the resolve did not short-circuit before ever reaching the
+/// network — the offline refusal path in `ModelResolver::resolve` returns
+/// before building the Hub repo client at all). The `!hub.offline()`
+/// unit-level assertion stays, so this test still pins the
+/// `HubSource`-level precedence directly, not only its downstream effect.
 #[tokio::test(flavor = "multi_thread")]
 async fn config_offline_false_wins_over_hf_hub_offline_env() {
     let server = MockServer::start().await;
@@ -626,7 +624,7 @@ async fn no_token_no_authorization_header() {
     }
 }
 
-/// #481 fix round 3, BLOCK 2 reproducer (t2): a user with `HF_HOME` set
+/// A user with `HF_HOME` set
 /// (and a `huggingface-cli login` token file there) who ALSO sets
 /// `HF_HUB_CACHE` -- a DIFFERENT directory with no `hub` component to pop
 /// -- must still authenticate: the token comes from `<HF_HOME>/token`,
@@ -683,9 +681,8 @@ async fn hf_home_token_file_used_with_hf_hub_cache_set_file_lands_under_hf_hub_c
     }
 }
 
-/// #481 fix round 3 (t4): a present-but-empty `HF_TOKEN` must fall through
-/// to the `<HF_HOME>/token` file rather than resolving to an empty bearer
-/// token (or none at all).
+/// A present-but-empty `HF_TOKEN` must fall through to the `<HF_HOME>/token`
+/// file rather than resolving to an empty bearer token (or none at all).
 #[tokio::test(flavor = "multi_thread")]
 async fn empty_hf_token_falls_through_to_home_token_file() {
     let server = MockServer::start().await;
@@ -729,13 +726,12 @@ async fn empty_hf_token_falls_through_to_home_token_file() {
     }
 }
 
-/// #481 fix round 4, BLOCK 1: `HF_TOKEN_PATH` names the token file DIRECTLY
-/// -- independent of `HF_HOME`, which here resolves to a directory with NO
-/// `token` file inside it at all. Matches `huggingface_hub`'s own
-/// `HF_TOKEN_PATH` (`constants.py:247-254`); the pre-fix revision (hub.rs
-/// `token_file_path` at 8816fb5b) never read `HF_TOKEN_PATH` at all, so this
-/// request would have carried no `Authorization` header -- a silent 401 on
-/// a gated repo where `huggingface_hub` itself authenticates.
+/// `HF_TOKEN_PATH` names the token file DIRECTLY -- independent of
+/// `HF_HOME`, which here resolves to a directory with NO `token` file
+/// inside it at all. Matches `huggingface_hub`'s own `HF_TOKEN_PATH`
+/// (`constants.py:247-254`); ignoring `HF_TOKEN_PATH` here would carry no
+/// `Authorization` header on this request -- a silent 401 on a gated repo
+/// where `huggingface_hub` itself authenticates.
 ///
 /// RED at 8816fb5b: `req.headers.get("authorization")` is `None`, not
 /// `Some("Bearer path-token")`.
@@ -784,9 +780,9 @@ async fn hf_token_path_env_used_when_hf_home_has_no_token_file() {
     }
 }
 
-/// #481 fix round 4, BLOCK 2: `HUGGING_FACE_HUB_TOKEN` -- `huggingface_hub`'s
-/// own LIVE legacy alias for `HF_TOKEN` (`utils/_auth.py:145-147`, not
-/// deprecated-and-ignored) -- is honoured when `HF_TOKEN` itself is absent.
+/// `HUGGING_FACE_HUB_TOKEN` -- `huggingface_hub`'s own LIVE legacy alias
+/// for `HF_TOKEN` (`utils/_auth.py:145-147`, not deprecated-and-ignored) --
+/// is honoured when `HF_TOKEN` itself is absent.
 ///
 /// RED at 8816fb5b: `resolve_token_with`'s env tier read only `HF_TOKEN`, so
 /// `req.headers.get("authorization")` is `None`, not
@@ -828,7 +824,7 @@ async fn legacy_hugging_face_hub_token_env_used_when_hf_token_absent() {
 // --- offline: hit / miss / warm-cache-miss, decided by the catalog alone ---
 
 /// Hit: a `HuggingFace`-shaped model id whose catalog row already carries a
-/// present, on-disk `artifact_path` (as if resolved online previously) keeps
+/// present, on-disk `artifact_path` (as if already resolved online) keeps
 /// loading under `offline = true` — the catalog lookup in `ModelResolver::resolve`
 /// returns before the offline check is ever reached.
 #[tokio::test]
@@ -931,7 +927,7 @@ async fn offline_miss_refuses_by_name_with_no_catalog_row() {
     );
 }
 
-/// Warm-cache-miss: the Hub cache directory holds real, previously-downloaded
+/// Warm-cache-miss: the Hub cache directory holds real, already-downloaded
 /// bytes for this exact repo (warmed through a genuine, non-offline
 /// `HubSource` against the mock below) but the catalog carries no row for
 /// it. `offline = true` still refuses — the on-disk cache is never consulted

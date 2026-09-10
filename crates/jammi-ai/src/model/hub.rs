@@ -63,11 +63,11 @@
 //!    `parent(HF_HUB_CACHE)/token` instead — this module never makes that
 //!    mistake, matching `huggingface_hub`'s own `HF_TOKEN_PATH` precedence
 //!    (`utils/_auth.py`), which never varies with `HF_HUB_CACHE` either.
-//!    (An earlier revision of this module ignored `HF_TOKEN_PATH` entirely
-//!    and always read `<HF_HOME>/token` — a real divergence, not a
-//!    stricter reading of upstream: with `HF_TOKEN_PATH` set and no token
-//!    under `HF_HOME`, that revision sent no `Authorization` header where
-//!    `huggingface_hub` authenticates, a silent 401 on a gated repo.)
+//!    (Ignoring `HF_TOKEN_PATH` and always reading `<HF_HOME>/token` instead
+//!    would be a real divergence, not a stricter reading of upstream: with
+//!    `HF_TOKEN_PATH` set naming a token file elsewhere and no token under
+//!    `HF_HOME`, that would send no `Authorization` header where
+//!    `huggingface_hub` authenticates — a silent 401 on a gated repo.)
 //!
 //! **Offline** (whether `HubSource::offline` refuses a Hub fetch — see
 //! "the `offline` promise is Hub-only" below for exactly what this refuses):
@@ -391,11 +391,11 @@ fn resolve_token_with(
 /// would then silently lose authentication. This function never takes that
 /// path: it reads `HF_TOKEN_PATH`/`HF_HOME` itself, independently of
 /// whichever tier won the cache-root precedence. Ignoring `HF_TOKEN_PATH`
-/// entirely (an earlier revision of this function did) is the identical
-/// class of bug in a second home: a user who points `HF_TOKEN_PATH` at a
-/// token file outside `HF_HOME` (or with no `HF_HOME`/`hub_cache_dir`
-/// token file at all) would silently authenticate with `huggingface_hub`
-/// but not with `jammi-ai` — a silent 401 on a gated repo, not a loud one.
+/// entirely is the identical class of bug in a second home: a user who
+/// points `HF_TOKEN_PATH` at a token file outside `HF_HOME` (or with no
+/// `HF_HOME`/`hub_cache_dir` token file at all) would silently authenticate
+/// with `huggingface_hub` but not with `jammi-ai` — a silent 401 on a gated
+/// repo, not a loud one.
 fn token_file_path(
     env: &dyn Fn(&str) -> Option<String>,
     home_dir: impl FnOnce() -> Option<PathBuf>,
@@ -496,7 +496,7 @@ mod tests {
         None
     }
 
-    // --- env_nonempty: present-but-empty is absent (#481 fix round 3) ---
+    // --- env_nonempty: present-but-empty is absent ---
 
     #[test]
     fn env_nonempty_treats_present_but_empty_as_absent() {
@@ -540,11 +540,10 @@ mod tests {
         );
     }
 
-    /// #481 fix round 2, advisory A4: `HF_HUB_CACHE` (used directly, no
-    /// `hub/` appended) beats `HF_HOME` when `[models] hub_cache_dir` is
-    /// unset — `huggingface_hub` honours `HF_HUB_CACHE` above `HF_HOME`, and
-    /// this branch's own `jammi-encoders` live-hub harness already reads it
-    /// at that precedence.
+    /// `HF_HUB_CACHE` (used directly, no `hub/` appended) beats `HF_HOME`
+    /// when `[models] hub_cache_dir` is unset — `huggingface_hub` honours
+    /// `HF_HUB_CACHE` above `HF_HOME`, and this branch's own
+    /// `jammi-encoders` live-hub harness reads it at that precedence too.
     #[test]
     fn root_falls_back_to_hf_hub_cache_over_hf_home_no_hub_suffix_appended() {
         let config = ModelsConfig::default();
@@ -580,9 +579,8 @@ mod tests {
         );
     }
 
-    /// #481 fix round 3: a present-but-empty `HF_HUB_CACHE` must fall
-    /// through to `HF_HOME`, not be used as a literal empty/CWD-relative
-    /// cache root.
+    /// A present-but-empty `HF_HUB_CACHE` must fall through to `HF_HOME`,
+    /// not be used as a literal empty/CWD-relative cache root.
     #[test]
     fn root_empty_hf_hub_cache_falls_through_to_hf_home() {
         let config = ModelsConfig::default();
@@ -598,9 +596,9 @@ mod tests {
         );
     }
 
-    /// #481 fix round 3: a present-but-empty `HF_HOME`, with `HF_HUB_CACHE`
-    /// also absent, must fall through to the platform home-dir default
-    /// rather than resolving to a `""`/CWD-relative root.
+    /// A present-but-empty `HF_HOME`, with `HF_HUB_CACHE` also absent, must
+    /// fall through to the platform home-dir default rather than resolving
+    /// to a `""`/CWD-relative root.
     #[test]
     fn root_empty_hf_home_falls_through_to_platform_home_dir() {
         let config = ModelsConfig::default();
@@ -644,8 +642,8 @@ mod tests {
         assert_eq!(resolve_endpoint(&config, &no_env), None);
     }
 
-    /// #481 fix round 3: a present-but-empty `HF_ENDPOINT` must resolve to
-    /// `None` (hf-hub's own default), never to a `""` endpoint URL.
+    /// A present-but-empty `HF_ENDPOINT` must resolve to `None` (hf-hub's
+    /// own default), never to a `""` endpoint URL.
     #[test]
     fn endpoint_empty_env_falls_back_to_none() {
         let config = ModelsConfig::default();
@@ -714,9 +712,9 @@ mod tests {
         assert_eq!(resolve_token(&config, &env).unwrap(), None);
     }
 
-    /// #481 fix round 3, BLOCK 2: the token file resolves from `<HF_HOME>/token`
-    /// -- completely INDEPENDENT of whichever tier won the cache-root
-    /// precedence. `HF_HUB_CACHE` here names a wholly different directory
+    /// The token file resolves from `<HF_HOME>/token` -- completely
+    /// INDEPENDENT of whichever tier won the cache-root precedence.
+    /// `HF_HUB_CACHE` here names a wholly different directory
     /// holding no token file at all; `hf_hub::Cache::token_path`'s own "pop
     /// the cache root's last path component" arithmetic (hf-hub 0.5's
     /// comment: "Remove `\"hub\"`") would derive `parent(HF_HUB_CACHE)/token`
@@ -744,8 +742,7 @@ mod tests {
         );
     }
 
-    /// #481 fix round 3, BLOCK 1 (advisory: `HF_TOKEN` mirror): a
-    /// present-but-empty `HF_TOKEN` must fall through to the token file,
+    /// A present-but-empty `HF_TOKEN` must fall through to the token file,
     /// never resolve to an empty bearer token.
     #[test]
     fn token_empty_hf_token_falls_through_to_home_file() {
@@ -775,14 +772,13 @@ mod tests {
         );
     }
 
-    // --- #481 fix round 4: HF_TOKEN_PATH / HUGGING_FACE_HUB_TOKEN / trimming ---
+    // --- HF_TOKEN_PATH / HUGGING_FACE_HUB_TOKEN / trimming ---
 
-    /// BLOCK 1 (hub.rs:340 pre-fix, `token_file_path` ignored `HF_TOKEN_PATH`
-    /// entirely): a token resolves from the file `HF_TOKEN_PATH` names
-    /// directly, even though `HF_HOME` here resolves to a dir with NO
-    /// `token` file inside it at all -- `huggingface_hub` authenticates in
-    /// this exact shape (`constants.py:247-254`); the pre-fix revision sent
-    /// no `Authorization` header, a silent 401 on a gated repo.
+    /// A token resolves from the file `HF_TOKEN_PATH` names directly, even
+    /// though `HF_HOME` here resolves to a dir with NO `token` file inside
+    /// it at all -- `huggingface_hub` authenticates in this exact shape
+    /// (`constants.py:247-254`); ignoring `HF_TOKEN_PATH` would send no
+    /// `Authorization` header, a silent 401 on a gated repo.
     ///
     /// RED at 8816fb5b: `token_file_path` never reads `HF_TOKEN_PATH`, so
     /// `resolve_token` falls through past the (token-file-less) `HF_HOME`
@@ -847,10 +843,9 @@ mod tests {
         );
     }
 
-    /// BLOCK 2 (hub.rs:319 pre-fix, `resolve_token_with`'s env tier read
-    /// only `HF_TOKEN`): `HUGGING_FACE_HUB_TOKEN` -- `huggingface_hub`'s own
-    /// LIVE legacy alias (`utils/_auth.py:145-147`, not deprecated-and-
-    /// ignored) -- is honoured when `HF_TOKEN` is absent.
+    /// `HUGGING_FACE_HUB_TOKEN` -- `huggingface_hub`'s own LIVE legacy alias
+    /// (`utils/_auth.py:145-147`, not deprecated-and-ignored) -- is honoured
+    /// when `HF_TOKEN` is absent.
     ///
     /// RED at 8816fb5b: `resolve_token_with` never reads
     /// `HUGGING_FACE_HUB_TOKEN` at all -- this assertion fails with `None`.
@@ -1045,9 +1040,9 @@ mod tests {
         assert!(resolve_offline(&config, &no_env));
     }
 
-    /// #481 fix round 2, advisory: `TRANSFORMERS_OFFLINE` is honoured only
-    /// when `HF_HUB_OFFLINE` is itself unset from the environment — matching
-    /// `huggingface_hub`'s own alias behaviour.
+    /// `TRANSFORMERS_OFFLINE` is honoured only when `HF_HUB_OFFLINE` is
+    /// itself unset from the environment — matching `huggingface_hub`'s own
+    /// alias behaviour.
     #[test]
     fn offline_falls_back_to_transformers_offline_when_hf_hub_offline_unset() {
         let config = ModelsConfig::default();
@@ -1070,14 +1065,14 @@ mod tests {
         );
     }
 
-    /// #481 fix round 3, BLOCK 1: a present-but-empty `HF_HUB_OFFLINE`
-    /// (`Some("")`, exactly what `std::env::var("HF_HUB_OFFLINE").ok()`
-    /// yields for `HF_HUB_OFFLINE=` in a Compose/K8s env block) must NOT
-    /// shadow the `TRANSFORMERS_OFFLINE` alias the way `Some("0")` correctly
-    /// does above -- `huggingface_hub` itself resolves this exact shape
-    /// offline (`os.environ.get("HF_HUB_OFFLINE") or
+    /// A present-but-empty `HF_HUB_OFFLINE` (`Some("")`, exactly what
+    /// `std::env::var("HF_HUB_OFFLINE").ok()` yields for `HF_HUB_OFFLINE=`
+    /// in a Compose/K8s env block) must NOT shadow the
+    /// `TRANSFORMERS_OFFLINE` alias the way `Some("0")` correctly does
+    /// above -- `huggingface_hub` itself resolves this exact shape offline
+    /// (`os.environ.get("HF_HUB_OFFLINE") or
     /// os.environ.get("TRANSFORMERS_OFFLINE")`, where Python's `or` skips a
-    /// `""` left side), so jammi fail-open here was a real divergence from
+    /// `""` left side); failing open here would be a real divergence from
     /// upstream, not merely a stricter reading of it.
     ///
     /// RED at 7c581c89 (pre-`env_nonempty`): `env("HF_HUB_OFFLINE")` yields
@@ -1100,9 +1095,9 @@ mod tests {
         );
     }
 
-    /// #481 fix round 2, BLOCK fix: the accepted truthy set widens from
-    /// `{"1", "true"}` to `huggingface_hub`'s own `ENV_VARS_TRUE_VALUES` —
-    /// `{"1", "ON", "YES", "TRUE"}`, matched case-insensitively.
+    /// The accepted truthy set is `huggingface_hub`'s own
+    /// `ENV_VARS_TRUE_VALUES` — `{"1", "ON", "YES", "TRUE"}`, matched
+    /// case-insensitively.
     #[test]
     fn hf_hub_offline_truthy_accepts_the_huggingface_hub_true_value_set() {
         assert!(is_hf_hub_offline_truthy("1"));

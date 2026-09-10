@@ -77,10 +77,27 @@
 //! bounds ([`jammi_db::config::LimitsConfig::max_in_flight`],
 //! `max_in_flight_per_connection`, `request_timeout_secs`) and instead
 //! governs them through [`jammi_db::config::LimitsConfig::wait_timeout_secs`]
-//! (a cap on the CLIENT-requested `grpc-timeout`, refused at the edge before
-//! the stream opens) and their own per-RPC stream budget
-//! (`max_subscriptions` / `max_job_waits`, released when the stream ends or
-//! the connection drops — [`PermitBody`]).
+//! and their own per-RPC stream budget (`max_subscriptions` / `max_job_waits`,
+//! released when the stream ends or the connection drops — [`PermitBody`]).
+//!
+//! `wait_timeout_secs`, when configured, bounds a stream in one of three ways
+//! depending on what the caller's `grpc-timeout` header declares — the SERVER
+//! budget bounds the stream; the client imposes no deadline of its own by
+//! default (see `jammi_client::wait_job`/`subscribe`):
+//!
+//! * a `grpc-timeout` header ABOVE the budget is refused at the edge, before
+//!   the stream ever opens (`DEADLINE_EXCEEDED`, [`RefusedBound::Timeout`]) —
+//!   the caller asked for more than the deployment allows.
+//! * a `grpc-timeout` header WITHIN the budget is honoured as-is: no
+//!   additional server-side deadline is layered on top of the caller's own
+//!   declared one.
+//! * NO `grpc-timeout` header at all (HTTP/2's own no-deadline default — the
+//!   shape a header-less client, e.g. a Python-shaped one with no explicit
+//!   timeout, sends) is NOT refused. Instead the configured budget itself
+//!   becomes the stream's deadline: [`PermitBody::Deadlined`] races the
+//!   response body against a timer armed for the budget, and once it elapses
+//!   with the stream still open, closes it with a `DEADLINE_EXCEEDED` trailer
+//!   — the stream ends at the budget, not at open, and never runs unbounded.
 //!
 //! [`is_streaming_path`] is a hardcoded two-path allowlist rather than a
 //! path→class map derived from the compiled `FILE_DESCRIPTOR_SET` (the
@@ -105,10 +122,11 @@ use jammi_db::config::LimitsConfig;
 use jammi_db::error::JammiError;
 use pin_project::pin_project;
 use tokio::sync::{OwnedSemaphorePermit, Semaphore};
+use tokio::time::Sleep;
 use tonic::codegen::http::{HeaderMap, Request, Response};
 use tonic::codegen::Service;
 use tonic::transport::server::TcpConnectInfo;
-use tonic::Code;
+use tonic::{Code, Status};
 use tower::Layer;
 
 use crate::routes::health::MetricsRegistry;
@@ -167,11 +185,35 @@ pub const MESSAGE_SIZE_LABEL: &str = "message_size";
 /// stamped with `bound` so [`RefusalStatusLayer`] counts it under the right
 /// label.
 fn refuse<ResBody: Default>(code: Code, message: String, bound: RefusedBound) -> Response<ResBody> {
-    let engine_err = JammiError::Config(message.clone());
-    let status = jammi_wire::attach_error_detail(code, message, &engine_err);
+    let status = limits_status(code, message);
     let mut response = status.into_http::<ResBody>();
     response.extensions_mut().insert(bound);
     response
+}
+
+/// Build the [`Status`] a limits refusal or timeout carries, with the typed
+/// wire detail attached exactly like every other refusal in this module
+/// (reusing [`JammiError::Config`] — see [`refuse`]'s doc for why). Shared so
+/// [`refuse`]'s edge refusal and [`PermitBody::Deadlined`]'s mid-stream
+/// timeout trailer both carry the SAME typed annotation a decoding client
+/// reads identically whichever path fired.
+fn limits_status(code: Code, message: String) -> Status {
+    let engine_err = JammiError::Config(message.clone());
+    jammi_wire::attach_error_detail(code, message, &engine_err)
+}
+
+/// The message [`PermitBody::Deadlined`] closes a header-less stream with once
+/// `server.limits.wait_timeout_secs` elapses — mirrors the edge-refusal
+/// message's wording (`server.limits.wait_timeout_secs (Ns)`) so a client sees
+/// the same budget cited whether it was refused up front (an over-budget
+/// header) or timed out mid-stream (no header at all).
+fn deadline_message(cap: Duration) -> String {
+    format!(
+        "server.limits.wait_timeout_secs ({}s) elapsed with no grpc-timeout \
+         header bounding this stream — the configured budget became this \
+         stream's deadline",
+        cap.as_secs()
+    )
 }
 
 // ─── RefusalStatusLayer ─────────────────────────────────────────────────
@@ -579,35 +621,34 @@ where
         let mut inner = std::mem::replace(&mut self.inner, clone);
 
         if is_streaming_path(&path) {
+            // The server budget bounds this stream; the client imposes no
+            // deadline of its own by default. Three arms — see the module
+            // docs' "Streaming-path exemption" section:
+            //   * a header ABOVE the budget is refused at the edge (unchanged);
+            //   * a header WITHIN the budget is honoured as-is (no extra
+            //     server-side deadline layered on top);
+            //   * NO header at all is NOT refused — the budget itself becomes
+            //     this stream's deadline (`deadline`, applied below via
+            //     `PermitBody::Deadlined`).
+            let mut deadline: Option<Duration> = None;
             if let Some(cap) = self.layer.wait_timeout {
-                // [`jammi_db::config::LimitsConfig::wait_timeout_secs`]'s doc
-                // is explicit that BOTH an over-budget requested deadline AND
-                // an unbounded request (no `grpc-timeout` header at all, HTTP/2's
-                // own no-deadline default) are refused at the edge — a caller
-                // that never declares an upper bound is exactly the case this
-                // cap exists to close (an unbounded client would otherwise hold
-                // a `max_job_waits`/`max_subscriptions` permit open forever).
-                let refusal_message = match parse_grpc_timeout(req.headers()) {
-                    Some(requested) if requested > cap => Some(format!(
-                        "requested deadline exceeds server.limits.wait_timeout_secs ({}s)",
-                        cap.as_secs()
-                    )),
-                    Some(_) => None,
-                    None => Some(format!(
-                        "server.limits.wait_timeout_secs ({}s) is set; this rpc requires a \
-                         bounded grpc-timeout header, never an unbounded wait",
-                        cap.as_secs()
-                    )),
-                };
-                if let Some(message) = refusal_message {
-                    return Box::pin(async move {
-                        Ok(refuse::<ResBody>(
-                            Code::DeadlineExceeded,
-                            message,
-                            RefusedBound::Timeout,
-                        )
-                        .map(PermitBody::Passthrough))
-                    });
+                match parse_grpc_timeout(req.headers()) {
+                    Some(requested) if requested > cap => {
+                        return Box::pin(async move {
+                            Ok(refuse::<ResBody>(
+                                Code::DeadlineExceeded,
+                                format!(
+                                    "requested deadline exceeds server.limits.wait_timeout_secs \
+                                     ({}s)",
+                                    cap.as_secs()
+                                ),
+                                RefusedBound::Timeout,
+                            )
+                            .map(PermitBody::Passthrough))
+                        });
+                    }
+                    Some(_) => {}
+                    None => deadline = Some(cap),
                 }
             }
 
@@ -631,15 +672,12 @@ where
             return match budget {
                 None => Box::pin(async move {
                     let response = inner.call(req).await?;
-                    Ok(response.map(PermitBody::Passthrough))
+                    Ok(response.map(|body| PermitBody::new(body, None, deadline)))
                 }),
                 Some(sem) => match sem.try_acquire_owned() {
                     Ok(permit) => Box::pin(async move {
                         let response = inner.call(req).await?;
-                        Ok(response.map(|body| PermitBody::Permitted {
-                            inner: body,
-                            permit: Some(permit),
-                        }))
+                        Ok(response.map(|body| PermitBody::new(body, Some(permit), deadline)))
                     }),
                     Err(_) => Box::pin(async move {
                         Ok(refuse::<ResBody>(
@@ -681,11 +719,20 @@ where
     }
 }
 
-/// Response body for [`MethodClass`]. Either passes the inner body through
-/// unchanged, or holds an [`OwnedSemaphorePermit`] (a `max_subscriptions` /
-/// `max_job_waits` stream-budget permit) released when the body reaches its
-/// end frame OR is dropped (a client disconnect mid-stream, or the connection
-/// dropping) — whichever happens first.
+/// Response body for [`MethodClass`]. Three shapes:
+///
+/// * `Passthrough` — no permit, no deadline; the inner body unchanged.
+/// * `Permitted` — holds an [`OwnedSemaphorePermit`] (a `max_subscriptions` /
+///   `max_job_waits` stream-budget permit) released when the body reaches its
+///   end frame OR is dropped (a client disconnect mid-stream, or the
+///   connection dropping) — whichever happens first.
+/// * `Deadlined` — the same permit release as `Permitted`, PLUS a
+///   `server.limits.wait_timeout_secs` timer racing the inner body: if the
+///   inner body has not reached its end frame once the timer fires, this body
+///   synthesizes a `DEADLINE_EXCEEDED` trailer frame and ends the stream there
+///   — the header-less-request arm of the module docs' "Streaming-path
+///   exemption" section. Once fired, every subsequent poll returns `None`
+///   (`fired`) — a body must not emit a frame after its trailers.
 #[pin_project(project = PermitBodyProj)]
 pub enum PermitBody<B> {
     Passthrough(#[pin] B),
@@ -694,6 +741,40 @@ pub enum PermitBody<B> {
         inner: B,
         permit: Option<OwnedSemaphorePermit>,
     },
+    Deadlined {
+        #[pin]
+        inner: B,
+        permit: Option<OwnedSemaphorePermit>,
+        #[pin]
+        sleep: Sleep,
+        message: String,
+        fired: bool,
+    },
+}
+
+impl<B> PermitBody<B> {
+    /// Build the right variant for a streaming response: no permit and no
+    /// deadline is a bare passthrough; a `deadline` (the header-less-request
+    /// arm) always produces `Deadlined`, with or without a permit; otherwise
+    /// (`permit` alone) `Permitted`, matching the pre-existing shape.
+    fn new(inner: B, permit: Option<OwnedSemaphorePermit>, deadline: Option<Duration>) -> Self {
+        match deadline {
+            Some(cap) => PermitBody::Deadlined {
+                inner,
+                permit,
+                sleep: tokio::time::sleep(cap),
+                message: deadline_message(cap),
+                fired: false,
+            },
+            None => match permit {
+                Some(permit) => PermitBody::Permitted {
+                    inner,
+                    permit: Some(permit),
+                },
+                None => PermitBody::Passthrough(inner),
+            },
+        }
+    }
 }
 
 /// Needed so [`GlobalConcurrencyLimit`] / [`PerConnectionLimit`] can wrap
@@ -728,6 +809,43 @@ where
                 }
                 poll
             }
+            PermitBodyProj::Deadlined {
+                inner,
+                permit,
+                sleep,
+                message,
+                fired,
+            } => {
+                if *fired {
+                    return Poll::Ready(None);
+                }
+                // The inner body wins ties: a frame (including its natural
+                // end) ready in the SAME poll the timer also fires is not a
+                // timeout — the stream finished, full stop.
+                match inner.poll_frame(cx) {
+                    Poll::Ready(Some(frame)) => return Poll::Ready(Some(frame)),
+                    Poll::Ready(None) => {
+                        permit.take();
+                        *fired = true;
+                        return Poll::Ready(None);
+                    }
+                    Poll::Pending => {}
+                }
+                if sleep.poll(cx).is_ready() {
+                    permit.take();
+                    *fired = true;
+                    let status = limits_status(Code::DeadlineExceeded, message.clone());
+                    let mut headers = HeaderMap::new();
+                    // The message is a fixed, ASCII format string (see
+                    // `deadline_message`) — encoding it as a gRPC trailer
+                    // cannot fail; an empty header map on the (unreachable)
+                    // error path still ends the stream, just without the
+                    // typed detail.
+                    let _ = status.add_header(&mut headers);
+                    return Poll::Ready(Some(Ok(Frame::trailers(headers))));
+                }
+                Poll::Pending
+            }
         }
     }
 
@@ -735,6 +853,7 @@ where
         match self {
             PermitBody::Passthrough(body) => body.is_end_stream(),
             PermitBody::Permitted { inner, .. } => inner.is_end_stream(),
+            PermitBody::Deadlined { inner, fired, .. } => *fired || inner.is_end_stream(),
         }
     }
 
@@ -742,6 +861,7 @@ where
         match self {
             PermitBody::Passthrough(body) => body.size_hint(),
             PermitBody::Permitted { inner, .. } => inner.size_hint(),
+            PermitBody::Deadlined { inner, .. } => inner.size_hint(),
         }
     }
 }
@@ -858,6 +978,64 @@ mod tests {
         fn call(&mut self, _req: Request<()>) -> Self::Future {
             Box::pin(async move { Ok(Response::new(TestBody::default())) })
         }
+    }
+
+    /// A body that never emits a frame and never ends on its own -- proves
+    /// [`PermitBody::Deadlined`] closes an otherwise-eternal stream once its
+    /// OWN timer fires, with no reliance on the inner body's behaviour at all.
+    #[derive(Default)]
+    struct NeverEndingBody;
+
+    impl Body for NeverEndingBody {
+        type Data = Bytes;
+        type Error = std::convert::Infallible;
+
+        fn poll_frame(
+            self: Pin<&mut Self>,
+            _cx: &mut Context<'_>,
+        ) -> Poll<Option<Result<Frame<Self::Data>, Self::Error>>> {
+            Poll::Pending
+        }
+    }
+
+    /// The `WaitJob`/`Subscribe` counterpart to [`Immediate`]: a stream that
+    /// stays open forever on its own (see [`NeverEndingBody`]) -- the
+    /// "genuinely live, no natural end" shape a real `WaitJob` on an
+    /// unfinished job has.
+    #[derive(Clone)]
+    struct NeverEnding;
+
+    impl Service<Request<()>> for NeverEnding {
+        type Response = Response<NeverEndingBody>;
+        type Error = std::convert::Infallible;
+        type Future = Pin<Box<dyn Future<Output = Result<Self::Response, Self::Error>> + Send>>;
+
+        fn poll_ready(&mut self, _cx: &mut Context<'_>) -> Poll<Result<(), Self::Error>> {
+            Poll::Ready(Ok(()))
+        }
+
+        fn call(&mut self, _req: Request<()>) -> Self::Future {
+            Box::pin(async move { Ok(Response::new(NeverEndingBody)) })
+        }
+    }
+
+    /// Drain every frame a [`Body`] yields, via `std::future::poll_fn` --
+    /// polling `poll_frame` directly, exactly like a real HTTP/2 stack does.
+    async fn drain_frames<B>(body: B) -> Vec<Frame<Bytes>>
+    where
+        B: Body<Data = Bytes>,
+        B::Error: std::fmt::Debug,
+    {
+        let mut body = Box::pin(body);
+        let mut frames = Vec::new();
+        loop {
+            match std::future::poll_fn(|cx| body.as_mut().poll_frame(cx)).await {
+                Some(Ok(frame)) => frames.push(frame),
+                Some(Err(e)) => panic!("body error: {e:?}"),
+                None => break,
+            }
+        }
+        frames
     }
 
     // ─── GlobalConcurrencyLimit ──────────────────────────────────────────
@@ -1038,24 +1216,56 @@ mod tests {
         assert_not_refused(&resp);
     }
 
-    /// RED before the fix: `mk_req` sends no `grpc-timeout` header at all (an
-    /// unbounded request); the module's own doc for `wait_timeout_secs`
-    /// already promised this is refused exactly like an over-budget one, but
-    /// the code only checked the "header present and over budget" arm.
+    /// RED before the reshape (#485 round 4): `mk_req` sends no `grpc-timeout`
+    /// header at all (a header-less request, the shape a Python-shaped client
+    /// with no explicit timeout sends); this used to be refused at the edge
+    /// exactly like an over-budget header. The reshape: the SERVER budget
+    /// bounds the stream instead -- this arm must NOT be refused at open, and
+    /// the returned body must synthesize its own `DEADLINE_EXCEEDED` trailer
+    /// once the budget elapses, never before it and never left open past it.
     #[tokio::test]
-    async fn method_class_wait_timeout_refuses_a_request_with_no_grpc_timeout_header_at_all() {
-        let limits = LimitsConfig {
-            wait_timeout_secs: Some(5),
-            ..LimitsConfig::default()
-        };
-        let entered = Arc::new(AtomicUsize::new(0));
-        let mut svc = MethodClassLayer::new(&limits).layer(Held {
-            gate: Arc::new(Semaphore::new(0)),
-            entered: Arc::clone(&entered),
-        });
+    async fn method_class_wait_timeout_with_no_header_is_not_refused_but_bounds_the_stream_as_a_deadline(
+    ) {
+        // Bypass `LimitsConfig`'s whole-second granularity for a fast,
+        // deterministic unit test -- this `tests` submodule has field access
+        // to `MethodClassLayer`'s private fields (same defining module tree).
+        let budget = Duration::from_millis(60);
+        let mut svc = MethodClassLayer {
+            request_timeout: None,
+            wait_timeout: Some(budget),
+            subscriptions: None,
+            job_waits: None,
+        }
+        .layer(NeverEnding);
+
+        let started = std::time::Instant::now();
         let resp = svc.call(mk_req(WAIT_JOB_PATH)).await.unwrap();
-        assert_refused(&resp, RefusedBound::Timeout);
-        assert_eq!(entered.load(Ordering::SeqCst), 0);
+        // NOT refused at open: the same success shape every passthrough
+        // response has.
+        assert_not_refused(&resp);
+        assert!(
+            started.elapsed() < budget,
+            "opening the stream must not itself wait out the budget"
+        );
+
+        // `NeverEndingBody` never emits a frame on its own -- the ONLY frame
+        // this body can ever produce is the deadline's synthesized trailer.
+        let frames = drain_frames(resp.into_body()).await;
+        assert_eq!(
+            frames.len(),
+            1,
+            "exactly one synthesized DEADLINE_EXCEEDED trailer frame, then the stream ends"
+        );
+        let trailers = frames[0]
+            .trailers_ref()
+            .expect("the synthesized frame must be a trailers frame");
+        let status = tonic::Status::from_header_map(trailers)
+            .expect("the trailer frame must carry a decodable grpc-status");
+        assert_eq!(status.code(), Code::DeadlineExceeded);
+        assert!(
+            started.elapsed() >= budget,
+            "the deadline must not fire before the budget elapses"
+        );
     }
 
     #[tokio::test]

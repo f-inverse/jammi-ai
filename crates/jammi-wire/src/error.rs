@@ -194,71 +194,82 @@ impl From<&JammiError> for pb::JammiErrorDetail {
     }
 }
 
-/// Reconstruct the engine error from the wire detail. The inverse of the encode
-/// above; a detail with no `variant` set (an older / corrupt payload) maps to
-/// [`JammiError::Other`] carrying the empty marker so decode is total.
-impl From<pb::JammiErrorDetail> for JammiError {
-    fn from(detail: pb::JammiErrorDetail) -> Self {
-        use pb::jammi_error_detail::Variant;
-        match detail.variant {
-            Some(Variant::Source(e)) => JammiError::Source {
-                source_id: e.source_id,
-                message: e.message,
-            },
-            Some(Variant::Model(e)) => JammiError::Model {
-                model_id: e.model_id,
-                message: e.message,
-            },
-            Some(Variant::ModelNotFound(e)) => JammiError::ModelNotFound {
-                model_id: e.model_id,
-            },
-            Some(Variant::ModelReferenced(e)) => JammiError::ModelReferenced {
-                model_id: e.model_id,
-                referenced_by: e.referenced_by,
-            },
-            Some(Variant::Inference(e)) => JammiError::Inference(e.message),
-            Some(Variant::Catalog(e)) => JammiError::Catalog(e.message),
-            Some(Variant::Schema(e)) => JammiError::Schema {
-                table: e.table,
-                column: e.column,
-                expected: e.expected,
-                actual: e.actual,
-            },
-            Some(Variant::Config(e)) => JammiError::Config(e.message),
-            Some(Variant::Eval(e)) => JammiError::Eval(e.message),
-            Some(Variant::Tenant(e)) => JammiError::Tenant(e.message),
-            Some(Variant::FineTune(e)) => JammiError::FineTune(e.message),
-            Some(Variant::Gpu(e)) => JammiError::Gpu(e.message),
-            Some(Variant::Backend(e)) => JammiError::Backend(e.message),
-            Some(Variant::ChannelCatalog(e)) => JammiError::ChannelCatalog(e.into()),
-            Some(Variant::ChannelAssembly(e)) => JammiError::ChannelAssembly(e.message),
-            Some(Variant::MutableTable(e)) => JammiError::MutableTable(e.into()),
-            Some(Variant::RowGone(e)) => JammiError::RowGone { table: e.table },
-            Some(Variant::TenantMismatch(e)) => JammiError::TenantMismatch { table: e.table },
-            Some(Variant::LeaseLost(e)) => JammiError::LeaseLost { table: e.table },
-            Some(Variant::CasFailed(e)) => JammiError::CasFailed {
-                table: e.table,
-                status: e.status,
-            },
-            Some(Variant::SourceBusy(e)) => JammiError::SourceBusy {
-                source_id: e.source_id,
-                table: e.table,
-            },
-            Some(Variant::JobAttemptSuperseded(e)) => {
-                JammiError::JobAttemptSuperseded { job_id: e.job_id }
-            }
-            Some(Variant::JobCancelled(e)) => JammiError::JobCancelled { job_id: e.job_id },
-            Some(Variant::Lexical(e)) => JammiError::Lexical(e.message),
-            Some(Variant::IncompatibleFormat(e)) => JammiError::IncompatibleFormat {
-                artifact: e.artifact,
-                found: e.found,
-                supported: e.supported,
-            },
-            Some(Variant::DependencyCycle(e)) => JammiError::DependencyCycle { table: e.table },
-            Some(Variant::NotRecomputable(e)) => JammiError::NotRecomputable { table: e.table },
-            Some(Variant::Other(e)) => JammiError::Other(e.message),
-            None => JammiError::Other(String::new()),
+/// Reconstruct the engine error from the wire detail. The inverse of the
+/// encode above; `message` is the enclosing `Status`'s own message, threaded
+/// in so a detail whose `variant` is unset (a peer built against a NEWER
+/// contract that added a variant this build's codegen does not know — an
+/// "unknown oneof", NOT the "no detail at all" case [`error_from_status`]
+/// handles separately) reconstructs as [`JammiError::Other`] carrying that
+/// faithful message, never the empty string a bare `String::new()` would
+/// silently substitute. Decode is total either way.
+fn jammi_error_from_detail(detail: pb::JammiErrorDetail, message: &str) -> JammiError {
+    use pb::jammi_error_detail::Variant;
+    match detail.variant {
+        Some(Variant::Source(e)) => JammiError::Source {
+            source_id: e.source_id,
+            message: e.message,
+        },
+        Some(Variant::Model(e)) => JammiError::Model {
+            model_id: e.model_id,
+            message: e.message,
+        },
+        Some(Variant::ModelNotFound(e)) => JammiError::ModelNotFound {
+            model_id: e.model_id,
+        },
+        Some(Variant::ModelReferenced(e)) => JammiError::ModelReferenced {
+            model_id: e.model_id,
+            referenced_by: e.referenced_by,
+        },
+        Some(Variant::Inference(e)) => JammiError::Inference(e.message),
+        Some(Variant::Catalog(e)) => JammiError::Catalog(e.message),
+        Some(Variant::Schema(e)) => JammiError::Schema {
+            table: e.table,
+            column: e.column,
+            expected: e.expected,
+            actual: e.actual,
+        },
+        Some(Variant::Config(e)) => JammiError::Config(e.message),
+        Some(Variant::Eval(e)) => JammiError::Eval(e.message),
+        Some(Variant::Tenant(e)) => JammiError::Tenant(e.message),
+        Some(Variant::FineTune(e)) => JammiError::FineTune(e.message),
+        Some(Variant::Gpu(e)) => JammiError::Gpu(e.message),
+        Some(Variant::Backend(e)) => JammiError::Backend(e.message),
+        Some(Variant::ChannelCatalog(e)) => {
+            JammiError::ChannelCatalog(channel_catalog_error_from_detail(e, message))
         }
+        Some(Variant::ChannelAssembly(e)) => JammiError::ChannelAssembly(e.message),
+        Some(Variant::MutableTable(e)) => {
+            JammiError::MutableTable(mutable_table_error_from_detail(e, message))
+        }
+        Some(Variant::RowGone(e)) => JammiError::RowGone { table: e.table },
+        Some(Variant::TenantMismatch(e)) => JammiError::TenantMismatch { table: e.table },
+        Some(Variant::LeaseLost(e)) => JammiError::LeaseLost { table: e.table },
+        Some(Variant::CasFailed(e)) => JammiError::CasFailed {
+            table: e.table,
+            status: e.status,
+        },
+        Some(Variant::SourceBusy(e)) => JammiError::SourceBusy {
+            source_id: e.source_id,
+            table: e.table,
+        },
+        Some(Variant::JobAttemptSuperseded(e)) => {
+            JammiError::JobAttemptSuperseded { job_id: e.job_id }
+        }
+        Some(Variant::JobCancelled(e)) => JammiError::JobCancelled { job_id: e.job_id },
+        Some(Variant::Lexical(e)) => JammiError::Lexical(e.message),
+        Some(Variant::IncompatibleFormat(e)) => JammiError::IncompatibleFormat {
+            artifact: e.artifact,
+            found: e.found,
+            supported: e.supported,
+        },
+        Some(Variant::DependencyCycle(e)) => JammiError::DependencyCycle { table: e.table },
+        Some(Variant::NotRecomputable(e)) => JammiError::NotRecomputable { table: e.table },
+        Some(Variant::Other(e)) => JammiError::Other(e.message),
+        // The unknown-oneof case (B5): `message` is the enclosing `Status`'s
+        // own text, so the reconstructed error still carries the real fault
+        // description even though this build cannot recover which specific
+        // variant a newer peer set.
+        None => JammiError::Other(message.to_string()),
     }
 }
 
@@ -292,29 +303,32 @@ impl From<&MutableTableError> for pb::MutableTableErrorDetail {
 /// re-validate the id string through [`MutableTableId::new`]; a forged id that
 /// fails validation surfaces as `InvalidId` carrying the offending string,
 /// which is exactly the variant the engine itself produces for such a string,
-/// so decode stays total without a panic. A detail with no variant (an older or
-/// corrupt payload) reconstructs as `Schema(String::new())` — the empty marker
-/// kept inside the engine-owned taxonomy rather than escaping to `Other`.
-impl From<pb::MutableTableErrorDetail> for MutableTableError {
-    fn from(detail: pb::MutableTableErrorDetail) -> Self {
-        use pb::mutable_table_error_detail::Variant;
-        let reconstruct_id = |s: String, wrap: fn(MutableTableId) -> MutableTableError| {
-            match MutableTableId::new(&s) {
-                Ok(id) => wrap(id),
-                Err(_) => MutableTableError::InvalidId(s),
-            }
+/// so decode stays total without a panic. `message` is the enclosing
+/// `Status`'s own text (see [`jammi_error_from_detail`]'s doc): a detail with
+/// no variant set (an unknown oneof — a peer built against a newer contract)
+/// reconstructs as `Schema(message)` — kept inside the engine-owned taxonomy
+/// rather than escaping to `Other`, but carrying the real fault text instead
+/// of a fabricated empty string.
+fn mutable_table_error_from_detail(
+    detail: pb::MutableTableErrorDetail,
+    message: &str,
+) -> MutableTableError {
+    use pb::mutable_table_error_detail::Variant;
+    let reconstruct_id =
+        |s: String, wrap: fn(MutableTableId) -> MutableTableError| match MutableTableId::new(&s) {
+            Ok(id) => wrap(id),
+            Err(_) => MutableTableError::InvalidId(s),
         };
-        match detail.variant {
-            Some(Variant::InvalidId(m)) => MutableTableError::InvalidId(m),
-            Some(Variant::Schema(m)) => MutableTableError::Schema(m),
-            Some(Variant::MissingPrimaryKey(m)) => MutableTableError::MissingPrimaryKey(m),
-            Some(Variant::ReservedColumn(m)) => MutableTableError::ReservedColumn(m),
-            Some(Variant::NotFound(s)) => reconstruct_id(s, MutableTableError::NotFound),
-            Some(Variant::AlreadyExists(s)) => reconstruct_id(s, MutableTableError::AlreadyExists),
-            Some(Variant::NoOrderColumn(_)) => MutableTableError::NoOrderColumn,
-            Some(Variant::Backend(e)) => MutableTableError::Backend(e.into()),
-            None => MutableTableError::Schema(String::new()),
-        }
+    match detail.variant {
+        Some(Variant::InvalidId(m)) => MutableTableError::InvalidId(m),
+        Some(Variant::Schema(m)) => MutableTableError::Schema(m),
+        Some(Variant::MissingPrimaryKey(m)) => MutableTableError::MissingPrimaryKey(m),
+        Some(Variant::ReservedColumn(m)) => MutableTableError::ReservedColumn(m),
+        Some(Variant::NotFound(s)) => reconstruct_id(s, MutableTableError::NotFound),
+        Some(Variant::AlreadyExists(s)) => reconstruct_id(s, MutableTableError::AlreadyExists),
+        Some(Variant::NoOrderColumn(_)) => MutableTableError::NoOrderColumn,
+        Some(Variant::Backend(e)) => MutableTableError::Backend(e.into()),
+        None => MutableTableError::Schema(message.to_string()),
     }
 }
 
@@ -357,45 +371,48 @@ impl From<&ChannelCatalogError> for pb::ChannelCatalogErrorDetail {
     }
 }
 
-/// Reconstruct the [`ChannelCatalogError`] from its wire detail — the inverse of
-/// the encode above. The struct variants re-parse the canonical PascalCase type
-/// token; a forged token that does not parse reconstructs as
-/// `InvalidColumnType` carrying the offending string — exactly the variant the
-/// engine produces for an unknown token, so decode stays total. A detail with no
-/// variant set reconstructs as an empty `NotRegistered` — kept inside the
-/// channel-catalog taxonomy rather than escaping to `Other`.
-impl From<pb::ChannelCatalogErrorDetail> for ChannelCatalogError {
-    fn from(detail: pb::ChannelCatalogErrorDetail) -> Self {
-        use pb::channel_catalog_error_detail::Variant;
-        // A forged or corrupt type token cannot reconstruct a `ChannelColumnType`;
-        // it surfaces as `InvalidColumnType` (carrying the token) — the same
-        // variant the engine yields for an unknown token, keeping decode total.
-        let parse_ty = |token: String| ChannelColumnType::from_sql_str(&token).map_err(|_| token);
-        match detail.variant {
-            Some(Variant::AlreadyExists(c)) => ChannelCatalogError::AlreadyExists(c),
-            Some(Variant::NotRegistered(c)) => ChannelCatalogError::NotRegistered(c),
-            Some(Variant::ColumnAlreadyDeclared(d)) => match parse_ty(d.ty) {
-                Ok(ty) => ChannelCatalogError::ColumnAlreadyDeclared {
-                    channel: d.channel,
-                    column: d.column,
-                    ty,
-                },
-                Err(token) => ChannelCatalogError::InvalidColumnType(token),
+/// Reconstruct the [`ChannelCatalogError`] from its wire detail — the inverse
+/// of the encode above. The struct variants re-parse the canonical PascalCase
+/// type token; a forged token that does not parse reconstructs as
+/// `InvalidColumnType` carrying the offending string — exactly the variant
+/// the engine produces for an unknown token, so decode stays total.
+/// `message` is the enclosing `Status`'s own text (see
+/// [`jammi_error_from_detail`]'s doc): a detail with no variant set (an
+/// unknown oneof) reconstructs as `NotRegistered(message)` — kept inside the
+/// channel-catalog taxonomy rather than escaping to `Other`, carrying the
+/// real fault text instead of a fabricated empty string.
+fn channel_catalog_error_from_detail(
+    detail: pb::ChannelCatalogErrorDetail,
+    message: &str,
+) -> ChannelCatalogError {
+    use pb::channel_catalog_error_detail::Variant;
+    // A forged or corrupt type token cannot reconstruct a `ChannelColumnType`;
+    // it surfaces as `InvalidColumnType` (carrying the token) — the same
+    // variant the engine yields for an unknown token, keeping decode total.
+    let parse_ty = |token: String| ChannelColumnType::from_sql_str(&token).map_err(|_| token);
+    match detail.variant {
+        Some(Variant::AlreadyExists(c)) => ChannelCatalogError::AlreadyExists(c),
+        Some(Variant::NotRegistered(c)) => ChannelCatalogError::NotRegistered(c),
+        Some(Variant::ColumnAlreadyDeclared(d)) => match parse_ty(d.ty) {
+            Ok(ty) => ChannelCatalogError::ColumnAlreadyDeclared {
+                channel: d.channel,
+                column: d.column,
+                ty,
             },
-            Some(Variant::ColumnConflict(d)) => match (parse_ty(d.existing), parse_ty(d.requested))
-            {
-                (Ok(existing), Ok(requested)) => ChannelCatalogError::ColumnConflict {
-                    channel: d.channel,
-                    column: d.column,
-                    existing,
-                    requested,
-                },
-                (Err(token), _) | (_, Err(token)) => ChannelCatalogError::InvalidColumnType(token),
+            Err(token) => ChannelCatalogError::InvalidColumnType(token),
+        },
+        Some(Variant::ColumnConflict(d)) => match (parse_ty(d.existing), parse_ty(d.requested)) {
+            (Ok(existing), Ok(requested)) => ChannelCatalogError::ColumnConflict {
+                channel: d.channel,
+                column: d.column,
+                existing,
+                requested,
             },
-            Some(Variant::InvalidId(m)) => ChannelCatalogError::InvalidId(m),
-            Some(Variant::InvalidColumnType(m)) => ChannelCatalogError::InvalidColumnType(m),
-            None => ChannelCatalogError::NotRegistered(String::new()),
-        }
+            (Err(token), _) | (_, Err(token)) => ChannelCatalogError::InvalidColumnType(token),
+        },
+        Some(Variant::InvalidId(m)) => ChannelCatalogError::InvalidId(m),
+        Some(Variant::InvalidColumnType(m)) => ChannelCatalogError::InvalidColumnType(m),
+        None => ChannelCatalogError::NotRegistered(message.to_string()),
     }
 }
 
@@ -562,38 +579,42 @@ impl From<&TriggerError> for pb::TriggerErrorDetail {
 }
 
 /// Reconstruct the [`TriggerError`] from its wire detail — the inverse of the
-/// encode above. The nested engine-owned details (`backing_table`, `backend`)
-/// reconstruct through their own `From<pb>` impls. A detail with no variant set
-/// (an older / corrupt payload) reconstructs as `TriggerError::Catalog` carrying
-/// the empty marker — kept inside the trigger taxonomy rather than escaping.
-impl From<pb::TriggerErrorDetail> for TriggerError {
-    fn from(detail: pb::TriggerErrorDetail) -> Self {
-        use pb::trigger_error_detail::Variant;
-        match detail.variant {
-            Some(Variant::TopicNotFound(m)) => TriggerError::TopicNotFound(m),
-            Some(Variant::SchemaConflict(c)) => TriggerError::SchemaConflict {
-                topic: c.topic,
-                detail: c.detail,
-            },
-            Some(Variant::UnsupportedSchemaType(u)) => TriggerError::UnsupportedSchemaType {
-                column: u.column,
-                data_type: u.data_type,
-            },
-            Some(Variant::BatchSchemaMismatch(m)) => TriggerError::BatchSchemaMismatch(m),
-            Some(Variant::PublishTenantMismatch(p)) => TriggerError::PublishTenantMismatch {
-                topic: p.topic,
-                topic_tenant: parse_optional_tenant(p.topic_tenant),
-                publish_tenant: parse_optional_tenant(p.publish_tenant),
-            },
-            Some(Variant::PredicateParse(m)) => TriggerError::PredicateParse(m),
-            Some(Variant::PredicateEval(m)) => TriggerError::PredicateEval(m),
-            Some(Variant::PredicateUnsupported(m)) => TriggerError::PredicateUnsupported(m),
-            Some(Variant::BackingTable(e)) => TriggerError::BackingTable(e.into()),
-            Some(Variant::Backend(e)) => TriggerError::Backend(e.into()),
-            Some(Variant::Driver(m)) => TriggerError::Driver(m),
-            Some(Variant::Catalog(m)) => TriggerError::Catalog(m),
-            None => TriggerError::Catalog(String::new()),
+/// encode above. The nested engine-owned `backing_table` reconstructs through
+/// [`mutable_table_error_from_detail`] (also threaded `message`); `backend`
+/// reconstructs through its own `From<pb>` impl (out of this bind's scope —
+/// see the module doc's fidelity-limit note). `message` is the enclosing
+/// `Status`'s own text: a detail with no variant set (an unknown oneof)
+/// reconstructs as `TriggerError::Catalog(message)` — kept inside the trigger
+/// taxonomy rather than escaping, carrying the real fault text instead of a
+/// fabricated empty string.
+fn trigger_error_from_detail(detail: pb::TriggerErrorDetail, message: &str) -> TriggerError {
+    use pb::trigger_error_detail::Variant;
+    match detail.variant {
+        Some(Variant::TopicNotFound(m)) => TriggerError::TopicNotFound(m),
+        Some(Variant::SchemaConflict(c)) => TriggerError::SchemaConflict {
+            topic: c.topic,
+            detail: c.detail,
+        },
+        Some(Variant::UnsupportedSchemaType(u)) => TriggerError::UnsupportedSchemaType {
+            column: u.column,
+            data_type: u.data_type,
+        },
+        Some(Variant::BatchSchemaMismatch(m)) => TriggerError::BatchSchemaMismatch(m),
+        Some(Variant::PublishTenantMismatch(p)) => TriggerError::PublishTenantMismatch {
+            topic: p.topic,
+            topic_tenant: parse_optional_tenant(p.topic_tenant),
+            publish_tenant: parse_optional_tenant(p.publish_tenant),
+        },
+        Some(Variant::PredicateParse(m)) => TriggerError::PredicateParse(m),
+        Some(Variant::PredicateEval(m)) => TriggerError::PredicateEval(m),
+        Some(Variant::PredicateUnsupported(m)) => TriggerError::PredicateUnsupported(m),
+        Some(Variant::BackingTable(e)) => {
+            TriggerError::BackingTable(mutable_table_error_from_detail(e, message))
         }
+        Some(Variant::Backend(e)) => TriggerError::Backend(e.into()),
+        Some(Variant::Driver(m)) => TriggerError::Driver(m),
+        Some(Variant::Catalog(m)) => TriggerError::Catalog(m),
+        None => TriggerError::Catalog(message.to_string()),
     }
 }
 
@@ -648,33 +669,32 @@ impl From<&AuditError> for pb::AuditErrorDetail {
 /// `serde` arm itself reconstructs as `AuditError::Storage` carrying the
 /// original `Display` string — the raw `serde_json::Error` cannot be rebuilt,
 /// so the faithful message lands in the nearest audit-owned string arm rather
-/// than escaping the taxonomy. A detail with no variant reconstructs as an
-/// empty `Storage`.
-impl From<pb::AuditErrorDetail> for AuditError {
-    fn from(detail: pb::AuditErrorDetail) -> Self {
-        use pb::audit_error_detail::Variant;
-        match detail.variant {
-            Some(Variant::LengthMismatch(l)) => AuditError::LengthMismatch {
-                ids: l.ids as usize,
-                scores: l.scores as usize,
-            },
-            Some(Variant::LineageTooLarge(l)) => AuditError::LineageTooLarge {
-                actual: l.actual as usize,
-                max: l.max as usize,
-            },
-            Some(Variant::NoTenantBinding(_)) => AuditError::NoTenantBinding,
-            Some(Variant::SignatureMismatch(id)) => match Uuid::parse_str(&id) {
-                Ok(uuid) => AuditError::SignatureMismatch(uuid),
-                Err(e) => AuditError::Storage(format!(
-                    "signature_mismatch: malformed query id {id:?}: {e}"
-                )),
-            },
-            Some(Variant::MasterKey(m)) => AuditError::MasterKey(m),
-            Some(Variant::Serde(m)) => AuditError::Storage(m),
-            Some(Variant::Storage(m)) => AuditError::Storage(m),
-            Some(Variant::Broker(m)) => AuditError::Broker(m),
-            None => AuditError::Storage(String::new()),
-        }
+/// than escaping the taxonomy. `message` is the enclosing `Status`'s own
+/// text: a detail with no variant set (an unknown oneof) reconstructs as
+/// `Storage(message)` rather than a fabricated empty string.
+fn audit_error_from_detail(detail: pb::AuditErrorDetail, message: &str) -> AuditError {
+    use pb::audit_error_detail::Variant;
+    match detail.variant {
+        Some(Variant::LengthMismatch(l)) => AuditError::LengthMismatch {
+            ids: l.ids as usize,
+            scores: l.scores as usize,
+        },
+        Some(Variant::LineageTooLarge(l)) => AuditError::LineageTooLarge {
+            actual: l.actual as usize,
+            max: l.max as usize,
+        },
+        Some(Variant::NoTenantBinding(_)) => AuditError::NoTenantBinding,
+        Some(Variant::SignatureMismatch(id)) => match Uuid::parse_str(&id) {
+            Ok(uuid) => AuditError::SignatureMismatch(uuid),
+            Err(e) => AuditError::Storage(format!(
+                "signature_mismatch: malformed query id {id:?}: {e}"
+            )),
+        },
+        Some(Variant::MasterKey(m)) => AuditError::MasterKey(m),
+        Some(Variant::Serde(m)) => AuditError::Storage(m),
+        Some(Variant::Storage(m)) => AuditError::Storage(m),
+        Some(Variant::Broker(m)) => AuditError::Broker(m),
+        None => AuditError::Storage(message.to_string()),
     }
 }
 
@@ -747,7 +767,7 @@ pub fn attach_error_detail(code: Code, message: String, err: &JammiError) -> Sta
 /// without a Jammi detail is by construction not an engine `JammiError`.
 pub fn error_from_status(status: &Status) -> JammiError {
     match extract_detail::<pb::JammiErrorDetail>(status) {
-        Some(detail) => JammiError::from(detail),
+        Some(detail) => jammi_error_from_detail(detail, status.message()),
         None => JammiError::Other(status.message().to_string()),
     }
 }
@@ -769,7 +789,7 @@ pub fn attach_trigger_detail(code: Code, message: String, err: &TriggerError) ->
 /// to the faithful variant, never a gRPC-code-category guess.
 pub fn trigger_error_from_status(status: &Status) -> TriggerError {
     match extract_detail::<pb::TriggerErrorDetail>(status) {
-        Some(detail) => TriggerError::from(detail),
+        Some(detail) => trigger_error_from_detail(detail, status.message()),
         None => TriggerError::Driver(status.message().to_string()),
     }
 }
@@ -789,7 +809,7 @@ pub fn attach_audit_detail(code: Code, message: String, err: &AuditError) -> Sta
 /// that by construction carries no audit detail.
 pub fn audit_error_from_status(status: &Status) -> AuditError {
     match extract_detail::<pb::AuditErrorDetail>(status) {
-        Some(detail) => AuditError::from(detail),
+        Some(detail) => audit_error_from_detail(detail, status.message()),
         None => AuditError::Storage(status.message().to_string()),
     }
 }
@@ -968,6 +988,52 @@ mod tests {
                 "the foreign-source fold carries the faithful Display string"
             ),
             other => panic!("a foreign-source variant must fold to Other, got {other:?}"),
+        }
+    }
+
+    /// RED before the fix (B5, #485 round 4): a decodable
+    /// `pb::JammiErrorDetail` whose `variant` oneof is unset -- the shape a
+    /// NEWER peer's payload produces when it sets a oneof tag this build's
+    /// codegen does not know (built here with a synthetic field number no
+    /// `JammiErrorDetail` variant ever uses, so prost's decoder skips it
+    /// rather than erroring, leaving `variant: None` exactly like a real
+    /// cross-version drift would) -- used to reconstruct as
+    /// `JammiError::Other(String::new())`, discarding the enclosing
+    /// `Status`'s own message entirely. GREEN after: the reconstructed error
+    /// carries that message verbatim.
+    #[test]
+    fn unknown_oneof_variant_reconstructs_other_carrying_the_status_message_not_empty() {
+        /// A shadow message sharing NO field number with `pb::JammiErrorDetail`'s
+        /// oneof (1-29, minus the reserved 15) -- decoding its bytes AS a
+        /// `JammiErrorDetail` therefore always leaves `variant` unset, the
+        /// same shape prost produces for a genuinely newer, unrecognized
+        /// oneof tag.
+        #[derive(Clone, PartialEq, ::prost::Message)]
+        struct ShadowDetailFromANewerPeer {
+            #[prost(string, tag = "9001")]
+            a_variant_this_build_does_not_know: String,
+        }
+
+        let shadow = ShadowDetailFromANewerPeer {
+            a_variant_this_build_does_not_know: "payload only a newer peer understands".into(),
+        };
+        let bytes = shadow.encode_to_vec();
+        let detail = pb::JammiErrorDetail::decode(bytes.as_slice())
+            .expect("an unrecognized field number is skipped, not a decode error");
+        assert!(
+            detail.variant.is_none(),
+            "field 9001 is outside JammiErrorDetail's oneof, so decode must leave variant unset"
+        );
+
+        let peer_message = "the real fault text a newer peer attached";
+        let status = attach_detail(Code::Internal, peer_message.to_string(), &detail);
+        match error_from_status(&status) {
+            JammiError::Other(message) => assert_eq!(
+                message, peer_message,
+                "an unknown oneof variant must reconstruct JammiError::Other carrying the \
+                 Status's own message, never an empty string"
+            ),
+            other => panic!("expected JammiError::Other, got {other:?}"),
         }
     }
 
@@ -1217,7 +1283,7 @@ mod tests {
         let detail = pb::AuditErrorDetail {
             variant: Some(Variant::SignatureMismatch(malformed.to_string())),
         };
-        match AuditError::from(detail) {
+        match audit_error_from_detail(detail, "") {
             AuditError::Storage(message) => {
                 assert!(
                     message.contains(malformed),

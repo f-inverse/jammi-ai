@@ -92,8 +92,14 @@ message JammiErrorDetail {
     NotRecomputableError not_recomputable = 29;
   }
   // Tag 15 / `model_retired` are reserved: the wire surface must never reuse a
-  // retired field number or name, so a peer built against either contract reads
-  // an unknown field rather than a silently-reinterpreted one.
+  // retired field number or name, so a peer built against either contract
+  // reads an unknown field rather than a silently-reinterpreted one -- an
+  // older peer decoding a payload that sets a variant it does not know (a
+  // retired tag, or one a newer contract added after this peer was built)
+  // sees `variant` unset. `error_from_status` reconstructs THAT case as
+  // `JammiError::Other` carrying the enclosing `Status`'s message verbatim --
+  // the peer keeps the fault's text even though it cannot keep the fault's
+  // specific shape, never a fabricated empty string.
   reserved 15;
   reserved "model_retired";
 }

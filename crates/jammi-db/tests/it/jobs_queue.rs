@@ -1217,6 +1217,68 @@ async fn submit_job_deduped_different_tenants_may_reuse_a_key(backend: BackendKi
     );
 }
 
+/// RED before the bound (#485 round 4): with no `MAX_IDEMPOTENCY_KEY_BYTES`
+/// assertion, a 257-byte `idempotency_key` was accepted verbatim by SQLite
+/// (which has no index-row-size ceiling) but produced a real live failure on
+/// Postgres -- `index row size 5136 exceeds btree version 4 maximum 2704` --
+/// so the SAME input diverged silently across backends. GREEN after:
+/// `submit_job_deduped` refuses a key one byte over the bound identically on
+/// BOTH backends, with a typed `JammiError::Config` naming the bound (never
+/// the key's own value).
+#[test_case(BackendKind::Sqlite ; "sqlite")]
+#[cfg_attr(
+    feature = "live-postgres-tests",
+    test_case(BackendKind::Postgres ; "postgres")
+)]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn submit_job_deduped_refuses_a_key_one_byte_over_the_bound(backend: BackendKind) {
+    let dir = tempdir().unwrap();
+    let (_session, catalog) = queue_catalog!(backend, dir.path());
+
+    let oversize_key = "x".repeat(jammi_db::catalog::jobs_repo::MAX_IDEMPOTENCY_KEY_BYTES + 1);
+    let err = catalog
+        .submit_job_deduped(job_params("dedupe-oversize-key"), Some(&oversize_key))
+        .await
+        .expect_err("a key one byte over MAX_IDEMPOTENCY_KEY_BYTES must be refused");
+    match err {
+        jammi_db::error::JammiError::Config(message) => {
+            assert!(
+                message.contains("MAX_IDEMPOTENCY_KEY_BYTES"),
+                "the refusal must name the bound, not the key's own value: {message}"
+            );
+            assert!(
+                !message.contains(&oversize_key),
+                "the refusal must never echo the oversize key's own value: {message}"
+            );
+        }
+        other => panic!("expected JammiError::Config naming the bound, got {other:?}"),
+    }
+    assert!(
+        catalog.list_jobs().await.unwrap().is_empty(),
+        "a refused submission must never insert a row"
+    );
+}
+
+/// A key exactly AT the bound is accepted identically on both backends --
+/// the bound is inclusive, not off-by-one in either direction.
+#[test_case(BackendKind::Sqlite ; "sqlite")]
+#[cfg_attr(
+    feature = "live-postgres-tests",
+    test_case(BackendKind::Postgres ; "postgres")
+)]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn submit_job_deduped_accepts_a_key_exactly_at_the_bound(backend: BackendKind) {
+    let dir = tempdir().unwrap();
+    let (_session, catalog) = queue_catalog!(backend, dir.path());
+
+    let at_bound_key = "x".repeat(jammi_db::catalog::jobs_repo::MAX_IDEMPOTENCY_KEY_BYTES);
+    let id = catalog
+        .submit_job_deduped(job_params("dedupe-at-bound-key"), Some(&at_bound_key))
+        .await
+        .expect("a key exactly at MAX_IDEMPOTENCY_KEY_BYTES must be accepted");
+    assert_eq!(id, "dedupe-at-bound-key");
+}
+
 async fn force_job_status_and_age(catalog: &Catalog, job_id: &str, status: &str, days_ago: i64) {
     let cutoff = (chrono::Utc::now() - chrono::Duration::days(days_ago))
         .format("%Y-%m-%dT%H:%M:%S%.9fZ")

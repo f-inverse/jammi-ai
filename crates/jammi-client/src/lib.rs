@@ -416,44 +416,50 @@ impl DataClient {
         self.job_status_response(job_id).await
     }
 
-    /// [`Self::wait_job`]'s default per-call `grpc-timeout` — see that
-    /// method's doc for why one is always set.
-    const WAIT_JOB_DEFAULT_TIMEOUT: Duration = Duration::from_secs(3600);
-
     /// Stream status updates for a job until it reaches a terminal state.
     /// Reconnecting with the same job id resumes the wait — an already
     /// terminal job's stream carries only its terminal `done` frame.
     ///
-    /// Always carries a `grpc-timeout` (`WAIT_JOB_DEFAULT_TIMEOUT`, one hour)
-    /// — never an unbounded HTTP/2 request: a deployment that sets
-    /// `[server.limits] wait_timeout_secs` refuses ANY `WaitJob` call with no
-    /// declared deadline at all, matching an over-budget one (a caller that
-    /// never bounds its wait is exactly the resource risk that cap exists to
-    /// close). Use [`Self::wait_job_with_timeout`] to declare a different
-    /// deadline — one at or below the deployment's own budget, when known.
+    /// Sends no `grpc-timeout` header — no deadline of the client's own. The
+    /// server budget bounds this stream instead: when a deployment configures
+    /// `[server.limits] wait_timeout_secs`, that budget becomes THIS stream's
+    /// deadline (it ends with `DEADLINE_EXCEEDED` once the budget elapses,
+    /// wherever the job then stands — reconnect to resume the wait); a
+    /// deployment with no such budget configured genuinely waits until
+    /// terminal. Use [`Self::wait_job_with_timeout`] to declare an explicit
+    /// deadline of your own instead — one at or below the deployment's
+    /// budget, when known, is honoured as-is.
     pub async fn wait_job(
         &self,
         job_id: &str,
     ) -> Result<Pin<Box<dyn Stream<Item = Result<JobStatusResponse>> + Send>>> {
-        self.wait_job_with_timeout(job_id, Self::WAIT_JOB_DEFAULT_TIMEOUT)
-            .await
+        self.wait_job_inner(job_id, None).await
     }
 
-    /// [`Self::wait_job`], with an explicit `grpc-timeout` rather than the
-    /// default. A reconnect after this deadline lapses (or after any other
-    /// disconnect) resumes the wait — the deadline bounds one connection's
-    /// hold on the server's `max_job_waits` budget, not the job's own
-    /// lifetime.
+    /// [`Self::wait_job`], with an explicit `grpc-timeout` rather than none.
+    /// A reconnect after this deadline lapses (or after any other disconnect)
+    /// resumes the wait — the deadline bounds one connection's hold on the
+    /// server's `max_job_waits` budget, not the job's own lifetime.
     pub async fn wait_job_with_timeout(
         &self,
         job_id: &str,
         timeout: Duration,
     ) -> Result<Pin<Box<dyn Stream<Item = Result<JobStatusResponse>> + Send>>> {
+        self.wait_job_inner(job_id, Some(timeout)).await
+    }
+
+    async fn wait_job_inner(
+        &self,
+        job_id: &str,
+        timeout: Option<Duration>,
+    ) -> Result<Pin<Box<dyn Stream<Item = Result<JobStatusResponse>> + Send>>> {
         use jammi_wire::proto::job::{job_event::Event, JobHandle};
         let mut request = tonic::Request::new(JobHandle {
             job_id: job_id.to_string(),
         });
-        request.set_timeout(timeout);
+        if let Some(timeout) = timeout {
+            request.set_timeout(timeout);
+        }
         let stream = self
             .job_client()
             .wait_job(request)
@@ -624,30 +630,61 @@ impl DataClient {
         Ok(Offset::new(resp.offset, committed_at))
     }
 
-    /// [`Self::subscribe`]'s default per-call `grpc-timeout` — see that
-    /// method's doc for why one is always set. Longer than
-    /// [`Self::WAIT_JOB_DEFAULT_TIMEOUT`]: a live tail subscription is
-    /// normally longer-lived than one job's wait.
-    const SUBSCRIBE_DEFAULT_TIMEOUT: Duration = Duration::from_secs(24 * 3600);
-
     /// Subscribe to a topic, returning a transport-neutral stream of delivered
     /// batches. The stream replays from `from_offset` (or the live tail when
     /// `None`) and then tails live, scoped to the session's tenant. When
     /// `replay_only` is set the server drives its finite drain and closes the
     /// stream rather than holding open to tail live batches.
     ///
-    /// Always carries a `grpc-timeout` (`SUBSCRIBE_DEFAULT_TIMEOUT`), never
-    /// an unbounded HTTP/2 request — see [`Self::wait_job`]'s doc for
-    /// why (the same `[server.limits] wait_timeout_secs` cap governs both
-    /// streaming rpcs). The connection drops once the deadline lapses; a
-    /// caller that needs to keep tailing reconnects with `from_offset` set to
-    /// the last delivered offset, exactly like any other disconnect.
+    /// Sends no `grpc-timeout` header — no deadline of the client's own; the
+    /// same posture as [`Self::wait_job`], since the same
+    /// `[server.limits] wait_timeout_secs` cap governs both streaming rpcs.
+    /// When configured, that budget becomes THIS stream's deadline (it ends
+    /// with `DEADLINE_EXCEEDED` once the budget elapses); with no such budget
+    /// configured this tails live indefinitely. A caller that needs to keep
+    /// tailing past either kind of disconnect reconnects with `from_offset`
+    /// set to the last delivered offset. Use [`Self::subscribe_with_timeout`]
+    /// to declare an explicit deadline instead.
     pub async fn subscribe(
         &self,
         topic: &TopicDefinition,
         predicate: Predicate,
         from_offset: Option<Offset>,
         replay_only: bool,
+    ) -> std::result::Result<
+        Pin<Box<dyn Stream<Item = std::result::Result<DeliveredBatch, TriggerError>> + Send>>,
+        TriggerError,
+    > {
+        self.subscribe_inner(topic, predicate, from_offset, replay_only, None)
+            .await
+    }
+
+    /// [`Self::subscribe`], with an explicit `grpc-timeout` rather than none.
+    /// A value at or below the deployment's own `wait_timeout_secs` budget,
+    /// when known, is honoured as-is; a value above it is refused at the
+    /// edge before the stream opens.
+    pub async fn subscribe_with_timeout(
+        &self,
+        topic: &TopicDefinition,
+        predicate: Predicate,
+        from_offset: Option<Offset>,
+        replay_only: bool,
+        timeout: Duration,
+    ) -> std::result::Result<
+        Pin<Box<dyn Stream<Item = std::result::Result<DeliveredBatch, TriggerError>> + Send>>,
+        TriggerError,
+    > {
+        self.subscribe_inner(topic, predicate, from_offset, replay_only, Some(timeout))
+            .await
+    }
+
+    async fn subscribe_inner(
+        &self,
+        topic: &TopicDefinition,
+        predicate: Predicate,
+        from_offset: Option<Offset>,
+        replay_only: bool,
+        timeout: Option<Duration>,
     ) -> std::result::Result<
         Pin<Box<dyn Stream<Item = std::result::Result<DeliveredBatch, TriggerError>> + Send>>,
         TriggerError,
@@ -664,7 +701,9 @@ impl DataClient {
             tenant_id: String::new(),
             replay_only,
         });
-        request.set_timeout(Self::SUBSCRIBE_DEFAULT_TIMEOUT);
+        if let Some(timeout) = timeout {
+            request.set_timeout(timeout);
+        }
         let streaming = self
             .trigger_client()
             .subscribe(request)

@@ -278,18 +278,21 @@ async fn wait_job_with_a_timeout_within_the_configured_budget_opens_normally() {
 }
 
 /// RED before the fix: a `WaitJob` call carrying NO `grpc-timeout` header at
-/// all (HTTP/2's own no-deadline default) used to open normally whenever
-/// `wait_timeout_secs` was set, even though
-/// [`jammi_db::config::LimitsConfig::wait_timeout_secs`]'s own doc already
-/// promised an unbounded request is refused exactly like an over-budget one
-/// -- an unbounded caller is precisely the resource risk the cap exists to
-/// close (it would hold a `max_job_waits` permit open forever). GREEN after:
-/// refused at the edge with `DEADLINE_EXCEEDED`, identically to the
-/// over-budget case.
-#[tokio::test]
-async fn wait_job_with_no_timeout_header_is_refused_when_a_budget_is_configured() {
+/// all (HTTP/2's own no-deadline default -- the shape a header-less client,
+/// e.g. a Python-shaped one with no explicit timeout, sends) used to be
+/// refused AT THE EDGE whenever `wait_timeout_secs` was configured. The
+/// reshape (#485 round 4): the SERVER budget bounds the stream; the client
+/// imposes no deadline of its own. GREEN after: the stream opens normally
+/// (never refused at open), stays genuinely live past several heartbeat
+/// ticks, then ends with `DEADLINE_EXCEEDED` once the budget elapses -- not
+/// before it, and not indefinitely past it. Renamed from
+/// `wait_job_with_no_timeout_header_is_refused_when_a_budget_is_configured`
+/// (its old name asserted the now-superseded edge-refusal behaviour).
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn wait_job_with_no_timeout_header_is_bounded_by_the_configured_budget_as_the_stream_deadline(
+) {
     let server = start_engine_server_with_limits(LimitsConfig {
-        wait_timeout_secs: Some(1),
+        wait_timeout_secs: Some(2),
         ..LimitsConfig::default()
     })
     .await;
@@ -301,26 +304,45 @@ async fn wait_job_with_no_timeout_header_is_refused_when_a_budget_is_configured(
         .expect("submit_job")
         .into_inner();
 
-    // No `request.set_timeout(...)` at all -- an unbounded request.
+    // No `request.set_timeout(...)` at all -- the header-less, Python-shaped
+    // client this budget exists to bound.
     let started = std::time::Instant::now();
-    let err = client
+    let mut stream = client
         .wait_job(JobHandle {
             job_id: job.job_id.clone(),
         })
         .await
-        .expect_err("an unbounded WaitJob request must be refused when a budget is configured");
-    assert_eq!(err.code(), Code::DeadlineExceeded);
+        .expect("a header-less WaitJob request must open normally, never refused at the edge")
+        .into_inner();
+
+    // The job never goes terminal (no worker claims it), so drain live
+    // progress frames (WAIT_JOB_POLL ticks every 100ms) until the stream
+    // itself ends -- the ONLY way it can end is the budget's own deadline.
+    let mut saw_a_live_frame = false;
+    let terminal_status = loop {
+        match tokio::time::timeout(Duration::from_secs(5), stream.message()).await {
+            Ok(Ok(Some(_))) => saw_a_live_frame = true,
+            Ok(Ok(None)) => {
+                panic!("the stream ended cleanly with no error -- expected DEADLINE_EXCEEDED")
+            }
+            Ok(Err(status)) => break status,
+            Err(_) => panic!("the stream must end at the budget, not hang past it"),
+        }
+    };
+    assert!(
+        saw_a_live_frame,
+        "the stream must be genuinely live before the deadline closes it, not refused at open"
+    );
+    assert_eq!(terminal_status.code(), Code::DeadlineExceeded);
+    assert!(
+        started.elapsed() >= Duration::from_secs(2),
+        "the stream must stay open for the full budget, not end early: {:?}",
+        started.elapsed()
+    );
     assert!(
         started.elapsed() < Duration::from_secs(10),
-        "the refusal must happen at the edge, not after waiting out any deadline"
-    );
-    assert_eq!(
-        server
-            .metrics
-            .grpc_refused
-            .with_label_values(&["timeout"])
-            .get(),
-        1
+        "the stream must end at the budget, not hang indefinitely past it: {:?}",
+        started.elapsed()
     );
 }
 

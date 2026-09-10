@@ -113,7 +113,7 @@ full `[server.limits]` reference and every default.
 | `max_in_flight` (default 256) | `RESOURCE_EXHAUSTED` | `in_flight` | Global, UNARY methods only. `0` = unbounded. |
 | `max_in_flight_per_connection` (default 64) | `RESOURCE_EXHAUSTED` | `in_flight_per_connection` | Per TCP connection, UNARY methods only. `0` = unbounded. |
 | `request_timeout_secs` (default unset) | `DEADLINE_EXCEEDED` | `timeout` | UNARY methods only; unset means no server-imposed timeout. |
-| `wait_timeout_secs` (default unset) | `DEADLINE_EXCEEDED` | `timeout` | Refuses a `TriggerService.Subscribe` / `JobService.WaitJob` call whose client-requested `grpc-timeout` exceeds the budget, BEFORE the stream opens. Unset means no cap. |
+| `wait_timeout_secs` (default unset) | `DEADLINE_EXCEEDED` | `timeout` (edge refusal only) | Bounds a `TriggerService.Subscribe` / `JobService.WaitJob` stream: a `grpc-timeout` ABOVE the budget is refused at the edge (before the stream opens, counted under `timeout`); NO header at all is NOT refused — the budget itself becomes the stream's deadline, ending it with `DEADLINE_EXCEEDED` once elapsed (uncounted — this fires mid-stream, after the edge); a header WITHIN the budget is honoured as-is. Unset means no cap. |
 | `max_subscriptions` (default 256) | `RESOURCE_EXHAUSTED` | `subscriptions` | Concurrently open `TriggerService.Subscribe` streams; released when the stream ends or the client disconnects. `0` = unbounded. |
 | `max_job_waits` (default 1024) | `RESOURCE_EXHAUSTED` | `job_waits` | Concurrently open `JobService.WaitJob` streams; same release rule. `0` = unbounded. |
 

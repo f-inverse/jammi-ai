@@ -388,6 +388,17 @@ fn parse_worker_row(
     })
 }
 
+/// The maximum byte length `submit_job_deduped`'s `idempotency_key` accepts
+/// (migration 030: `jobs.idempotency_key TEXT` + the partial unique index
+/// `idx_jobs_tenant_idempotency_key` — see [`Catalog::submit_job_deduped`]'s
+/// doc). Bounded at the edge (the `SubmitJob` gRPC handler) AND asserted
+/// again here (defence in depth): a live reproducer on Postgres was `index
+/// row size 5136 exceeds btree version 4 maximum 2704` for an oversize key —
+/// SQLite silently accepted the same 8 KiB key, so the two backends diverged
+/// on the exact same input without this bound. Cited by `job.proto`'s
+/// `idempotency_key` field doc and the deployment guide.
+pub const MAX_IDEMPOTENCY_KEY_BYTES: usize = 256;
+
 impl Catalog {
     /// Submit a new job, `status = 'queued'` — the row's own claim (by
     /// [`Self::claim_next`] for `execution = 'queued'`, or by
@@ -444,6 +455,20 @@ impl Catalog {
         let key = idempotency_key
             .filter(|k| !k.is_empty())
             .map(str::to_string);
+        // Defence in depth: the `SubmitJob` gRPC handler already refuses an
+        // over-bound key at the edge with a typed `InvalidArgument`, but this
+        // in-process entry point (every embedded caller, and any future wire
+        // surface) must not rely solely on that -- see
+        // [`MAX_IDEMPOTENCY_KEY_BYTES`]'s doc for the live Postgres/SQLite
+        // divergence this closes.
+        if let Some(k) = &key {
+            if k.len() > MAX_IDEMPOTENCY_KEY_BYTES {
+                return Err(JammiError::Config(format!(
+                    "idempotency_key exceeds the maximum length \
+                     (MAX_IDEMPOTENCY_KEY_BYTES = {MAX_IDEMPOTENCY_KEY_BYTES} bytes)"
+                )));
+            }
+        }
 
         let recorded_job_id = self
             .backend()
@@ -463,69 +488,86 @@ impl Catalog {
                          RETURNING job_id",
                         queued = JobStatus::Queued
                     );
-                    let inserted = tx
-                        .query_opt(
-                            &sql,
-                            &[
-                                SqlValue::TextOwned(job_id.clone()),
-                                SqlValue::TextOwned(kind),
-                                SqlValue::from(tenant.map(|t| t.to_string())),
-                                SqlValue::TextOwned(execution),
-                                SqlValue::TextOwned(spec),
-                                SqlValue::from(model_ref),
-                                SqlValue::from(output_model_id),
-                                SqlValue::from(model_source),
-                                SqlValue::Int(priority),
-                                SqlValue::Text(ACCELERATION_REPORT_PENDING),
-                                SqlValue::from(key.clone()),
-                                SqlValue::TextOwned(now),
-                            ],
-                            |row| row.get::<String>("job_id"),
-                        )
-                        .await?;
-                    match inserted {
-                        Some(id) => Ok(id),
-                        None => {
-                            // The insert's own row was excluded by the ON
-                            // CONFLICT's DO NOTHING only when `key` is
-                            // `Some` (a `NULL`-keyed row is outside the
-                            // partial index and can never conflict) — so a
-                            // `None` reaching this arm would be a backend
-                            // bug, not a caller error.
-                            let key = key.expect(
-                                "a None idempotency_key row is excluded from the partial \
-                                 index and can never hit ON CONFLICT DO NOTHING",
-                            );
-                            let (select_sql, params): (&str, Vec<SqlValue<'static>>) =
-                                match tenant {
-                                    Some(t) => (
-                                        "SELECT job_id FROM jobs \
-                                         WHERE idempotency_key = $1 AND tenant_id = $2",
-                                        vec![
-                                            SqlValue::TextOwned(key),
-                                            SqlValue::TextOwned(t.to_string()),
-                                        ],
-                                    ),
-                                    None => (
-                                        "SELECT job_id FROM jobs \
-                                         WHERE idempotency_key = $1 AND tenant_id IS NULL",
-                                        vec![SqlValue::TextOwned(key)],
-                                    ),
-                                };
-                            let existing = tx
-                                .query_opt(select_sql, &params, |row| row.get::<String>("job_id"))
-                                .await?;
-                            existing.ok_or_else(|| {
-                                BackendError::Execution(
-                                    "submit_job_deduped: ON CONFLICT DO NOTHING fired but no \
-                                     row was found for the (tenant, idempotency_key) pair — \
-                                     the winner must have been deleted inside this same \
-                                     transaction, which never happens on this path"
-                                        .to_string(),
-                                )
-                            })
+                    // The insert is attempted at most twice. The re-read
+                    // below (after `ON CONFLICT DO NOTHING` excludes our own
+                    // row) CAN legitimately find nothing under
+                    // `ReadCommitted`: a concurrent `PruneJobs` can delete
+                    // the winning row between the INSERT's own conflict
+                    // check and this re-read, freeing the (tenant, key) pair
+                    // again for the instant in between -- that is not "never
+                    // happens", it is a real, if rare, race this retry
+                    // closes. A second miss in a row (the retry ALSO losing
+                    // to a conflict whose winner is then ALSO gone by the
+                    // time of ITS re-read) is the genuine, honestly-named
+                    // failure mode below.
+                    for _attempt in 0..2 {
+                        let inserted = tx
+                            .query_opt(
+                                &sql,
+                                &[
+                                    SqlValue::TextOwned(job_id.clone()),
+                                    SqlValue::TextOwned(kind.clone()),
+                                    SqlValue::from(tenant.map(|t| t.to_string())),
+                                    SqlValue::TextOwned(execution.clone()),
+                                    SqlValue::TextOwned(spec.clone()),
+                                    SqlValue::from(model_ref.clone()),
+                                    SqlValue::from(output_model_id.clone()),
+                                    SqlValue::from(model_source.clone()),
+                                    SqlValue::Int(priority),
+                                    SqlValue::Text(ACCELERATION_REPORT_PENDING),
+                                    SqlValue::from(key.clone()),
+                                    SqlValue::TextOwned(now.clone()),
+                                ],
+                                |row| row.get::<String>("job_id"),
+                            )
+                            .await?;
+                        if let Some(id) = inserted {
+                            return Ok(id);
                         }
+                        // The insert's own row was excluded by the ON
+                        // CONFLICT's DO NOTHING only when `key` is `Some` (a
+                        // `NULL`-keyed row is outside the partial index and
+                        // can never conflict) — so a `None` reaching this
+                        // arm would be a backend bug, not a caller error.
+                        let key_str = key.clone().expect(
+                            "a None idempotency_key row is excluded from the partial index and \
+                             can never hit ON CONFLICT DO NOTHING",
+                        );
+                        let (select_sql, params): (&str, Vec<SqlValue<'static>>) = match tenant {
+                            Some(t) => (
+                                "SELECT job_id FROM jobs \
+                                 WHERE idempotency_key = $1 AND tenant_id = $2",
+                                vec![
+                                    SqlValue::TextOwned(key_str),
+                                    SqlValue::TextOwned(t.to_string()),
+                                ],
+                            ),
+                            None => (
+                                "SELECT job_id FROM jobs \
+                                 WHERE idempotency_key = $1 AND tenant_id IS NULL",
+                                vec![SqlValue::TextOwned(key_str)],
+                            ),
+                        };
+                        let existing = tx
+                            .query_opt(select_sql, &params, |row| row.get::<String>("job_id"))
+                            .await?;
+                        if let Some(id) = existing {
+                            return Ok(id);
+                        }
+                        // The first miss loops back and retries the insert
+                        // once (the winner was deleted between the conflict
+                        // check and this re-read, freeing the pair again); a
+                        // second miss falls through to the honest failure
+                        // below.
                     }
+                    Err(BackendError::Execution(
+                        "submit_job_deduped: ON CONFLICT DO NOTHING fired twice with no row \
+                         found for the (tenant, idempotency_key) pair either time -- a \
+                         concurrent PruneJobs deleted the winner between the conflict check and \
+                         the re-read on BOTH the original attempt and its retry, under \
+                         ReadCommitted; a genuine (rare) race, not a bug that never happens"
+                            .to_string(),
+                    ))
                 })
             })
             .await?;

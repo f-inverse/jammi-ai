@@ -42,6 +42,7 @@ use jammi_test_utils::{cookbook_fixture, fixture_url};
 use tonic::transport::Channel;
 
 use super::common::grpc::start_engine_server_with_worker_enabled;
+use super::common::grpc::start_engine_server_with_worker_enabled_and_fast_lease;
 use super::common::grpc::start_engine_server_worker_quiesced;
 use super::common::grpc::{
     channel, start_engine_server, tenant_a, with_session, EngineServer, TENANT_A, TENANT_B,
@@ -1943,6 +1944,105 @@ async fn wait_job_streams_to_exactly_one_terminal_frame() {
         "WaitJob must end with exactly one terminal Done frame"
     );
     assert_eq!(terminal_status.as_deref(), Some("completed"));
+
+    let _ = server.shutdown.send(());
+    let _ = server.handle.await;
+}
+
+/// #485: a TRAINING kind honours a cancel request at its own checkpoint
+/// boundary — `SubmitJob(fine_tune) -> CancelJob -> WaitJob` reports `failed`
+/// carrying `JammiError::JobCancelled`'s message, never silently completing
+/// past a request the worker's cancel-request watcher observed.
+/// `jammi_ai::jobs::compute_test_hooks` is not available to this crate's
+/// `it` target, so this drives the SAME real small fine-tune spec every
+/// other test in this file runs, under a fast REAL `[lease]` cadence
+/// (`start_engine_server_with_worker_enabled_and_fast_lease`) so the
+/// cancel-request watcher's own poll interval — the SAME cadence the lease
+/// keeper renews at — fires well inside this test's own time budget, with no
+/// park-point hook needed.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn training_job_cancel_reports_failed_with_the_cancel_message_over_the_wire() {
+    use jammi_server::grpc::proto::job::{job_event::Event, CancelJobRequest, JobHandle};
+    use jammi_server::grpc::proto::training::FineTuneConfig;
+
+    let server = start_engine_server_with_worker_enabled_and_fast_lease(4, 1).await;
+    add_training_source(
+        channel(server.addr).await,
+        None::<fn(tonic::Request<()>) -> Result<tonic::Request<()>, tonic::Status>>,
+    )
+    .await;
+    let mut client = JobServiceClient::new(channel(server.addr).await);
+
+    // Many more epochs than the engine default (3): the cancel-request
+    // watcher's first check does not fire until a full `heartbeat_secs` has
+    // elapsed (`start_engine_server_with_worker_enabled_and_fast_lease`'s
+    // doc), so the run must still be genuinely in flight at that point --
+    // 3 epochs over this tiny fixture completes well inside that window.
+    let mut request = start_request();
+    request.config = Some(FineTuneConfig {
+        epochs: Some(2_000),
+        ..FineTuneConfig::default()
+    });
+    let start = client
+        .submit_job(request)
+        .await
+        .expect("submit_job")
+        .into_inner();
+
+    // Requested as early as possible, right after submit: whether the row is
+    // still `queued` or has already moved to `running`, `CancelJob` sets
+    // `cancel_requested` on any non-terminal row -- the worker's
+    // cancel-request watcher (armed once the job is claimed) observes it at
+    // its own poll cadence and folds it into a terminal `failed`.
+    let cancelled = client
+        .cancel_job(CancelJobRequest {
+            job_id: start.job_id.clone(),
+        })
+        .await
+        .expect("cancel_job")
+        .into_inner()
+        .cancelled;
+    assert!(
+        cancelled,
+        "cancel_job must report true for a still-non-terminal job"
+    );
+
+    let mut stream = client
+        .wait_job(JobHandle {
+            job_id: start.job_id.clone(),
+        })
+        .await
+        .expect("wait_job")
+        .into_inner();
+
+    // Bounded so a wedged stream fails the test instead of hanging forever.
+    let mut terminal = None;
+    for _ in 0..600 {
+        let Some(frame) = tokio::time::timeout(Duration::from_secs(1), stream.message())
+            .await
+            .expect("wait_job stream produced a frame within the timeout")
+            .expect("wait_job stream frame")
+        else {
+            break; // stream closed
+        };
+        if let Some(Event::Done(done)) = frame.event {
+            terminal = Some(done);
+            break;
+        }
+    }
+    let terminal = terminal.expect("wait_job must reach a terminal Done frame");
+    assert_eq!(
+        terminal.status, "failed",
+        "a cancelled training job must land `failed`, got '{}' (error: {})",
+        terminal.status, terminal.error
+    );
+    assert!(
+        terminal
+            .error
+            .contains("cancelled at the executor's request checkpoint"),
+        "the failure message must be JammiError::JobCancelled's faithful text, got: {}",
+        terminal.error
+    );
 
     let _ = server.shutdown.send(());
     let _ = server.handle.await;

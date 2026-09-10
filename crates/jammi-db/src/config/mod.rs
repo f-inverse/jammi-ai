@@ -1413,15 +1413,26 @@ pub struct LimitsConfig {
     /// this key. `Some(0)` is rejected at load — a zero timeout would refuse
     /// every request instantly, never the intent of setting this key.
     pub request_timeout_secs: Option<u64>,
-    /// Maximum `grpc-timeout` a CLIENT may request on
-    /// `TriggerService.Subscribe` or `JobService.WaitJob`. A client asking
-    /// for a longer deadline than this (or an unbounded one, over HTTP/2's
-    /// own no-deadline default) is refused at the edge — before the stream
-    /// opens — with `DEADLINE_EXCEEDED`, rather than being allowed to hold a
-    /// connection open past the operator's budget. `None` (the default)
-    /// means no cap: any client-requested deadline, or none at all, is
-    /// accepted. `Some(0)` is rejected at load, for the same reason as
-    /// `request_timeout_secs`.
+    /// Bounds a `TriggerService.Subscribe` or `JobService.WaitJob` stream.
+    /// The SERVER budget bounds the stream; the client imposes no deadline of
+    /// its own by default (`jammi_client::DataClient::wait_job`/`subscribe`
+    /// send no `grpc-timeout` header). Three arms:
+    ///
+    /// * a `grpc-timeout` header ABOVE this budget is refused at the edge —
+    ///   before the stream ever opens — with `DEADLINE_EXCEEDED`.
+    /// * NO `grpc-timeout` header at all (HTTP/2's own no-deadline default —
+    ///   the shape a header-less, e.g. Python-shaped, client sends) is NOT
+    ///   refused: this budget itself becomes the stream's deadline, ending
+    ///   it with `DEADLINE_EXCEEDED` once it elapses, wherever the stream
+    ///   then stands (`jammi_server::limits::PermitBody::Deadlined`).
+    /// * a header WITHIN this budget is honoured as-is — no additional
+    ///   server-side deadline is layered on top of the caller's own declared
+    ///   one.
+    ///
+    /// `None` (the default) means no cap: a stream runs until terminal
+    /// (`WaitJob`) or indefinitely (`Subscribe`), regardless of what a caller
+    /// does or does not declare. `Some(0)` is rejected at load, for the same
+    /// reason as `request_timeout_secs`.
     pub wait_timeout_secs: Option<u64>,
     /// Cap on the number of concurrently open `TriggerService.Subscribe`
     /// streams this process serves. `0` means unbounded. Default: 256.

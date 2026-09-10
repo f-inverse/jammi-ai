@@ -129,7 +129,12 @@ message SubmitJobRequest {
   // that creates the row, never a separate lookup-then-insert window. A
   // pruned row's key is gone with it (nothing resurrects an identity for a
   // key whose row no longer exists); different tenants may reuse the same
-  // key freely.
+  // key freely. Bounded to MAX_IDEMPOTENCY_KEY_BYTES (256 bytes,
+  // `jammi_db::catalog::jobs_repo::MAX_IDEMPOTENCY_KEY_BYTES`); a longer key
+  // is refused with `INVALID_ARGUMENT` naming the bound, never the key's own
+  // value -- Postgres's btree index has a hard row-size ceiling an oversize
+  // key can exceed (SQLite has none, so the two backends would otherwise
+  // silently diverge on the exact same input).
   string idempotency_key = 6;
 }
 

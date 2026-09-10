@@ -133,6 +133,25 @@ impl JobService for JobServer {
         let req = request.into_inner();
         let idempotency_key = req.idempotency_key.clone();
 
+        // Refused at the edge, before the spec ever decodes: a typed
+        // `InvalidArgument` naming the bound, never the (potentially
+        // sensitive) key value itself.
+        // `Catalog::submit_job_deduped` asserts the same bound again
+        // (defence in depth) for every OTHER caller of that entry point.
+        if idempotency_key.len() > jammi_db::catalog::jobs_repo::MAX_IDEMPOTENCY_KEY_BYTES {
+            let message = format!(
+                "idempotency_key exceeds the maximum length \
+                 (MAX_IDEMPOTENCY_KEY_BYTES = {} bytes)",
+                jammi_db::catalog::jobs_repo::MAX_IDEMPOTENCY_KEY_BYTES
+            );
+            let engine_err = JammiError::Config(message.clone());
+            return Err(jammi_wire::attach_error_detail(
+                tonic::Code::InvalidArgument,
+                message,
+                &engine_err,
+            ));
+        }
+
         let spec = training_spec_from_proto(req)?;
         let kind = spec.kind().to_string();
 

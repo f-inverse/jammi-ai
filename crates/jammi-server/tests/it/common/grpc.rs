@@ -527,6 +527,75 @@ pub async fn start_engine_server_with_worker_enabled(enabled: bool) -> EngineSer
     }
 }
 
+/// Like [`start_engine_server_with_worker_enabled`] with the worker always
+/// ON, but ALSO overriding `[lease]` to a fast, test-scale cadence
+/// (`duration_secs`/`heartbeat_secs`) instead of the production default (30s
+/// lease / 10s heartbeat) — for a live it-test that needs to observe a real
+/// claimed job's lease-heartbeat-driven behaviour (e.g. the #485
+/// cancel-request watcher, which polls at the SAME cadence the lease keeper
+/// renews at: `jammi_ai::fine_tune::worker::spawn_cancel_request_watcher`'s
+/// doc) inside a live test's own time budget, with no test-hooks park point
+/// (`jammi_ai::jobs::compute_test_hooks` is not available to this crate's
+/// `it` target — a real small training spec plus a fast REAL cadence is the
+/// only lever this binary has). `heartbeat_secs` must be strictly under half
+/// of `lease_secs` ([`jammi_db::config::LeaseConfig::intervals`]'s own
+/// invariant); the caller picks values that satisfy it.
+pub async fn start_engine_server_with_worker_enabled_and_fast_lease(
+    lease_secs: u64,
+    heartbeat_secs: u64,
+) -> EngineServer {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let config_path = dir.path().join("jammi.toml");
+    std::fs::write(
+        &config_path,
+        format!(
+            "artifact_dir = \"{artifact_dir}\"\n\
+             \n\
+             [gpu]\n\
+             device = -1\n\
+             \n\
+             [inference]\n\
+             batch_size = 8\n\
+             \n\
+             [logging]\n\
+             level = \"debug\"\n\
+             \n\
+             [worker]\n\
+             enabled = true\n\
+             \n\
+             [lease]\n\
+             duration_secs = {lease_secs}\n\
+             heartbeat_secs = {heartbeat_secs}\n",
+            artifact_dir = dir.path().display(),
+        ),
+    )
+    .expect("write the fixture's jammi.toml");
+
+    let cfg = jammi_db::config::JammiConfig::load(Some(&config_path))
+        .expect("the fixture's jammi.toml loads");
+    assert!(
+        cfg.worker.enabled,
+        "this fixture always requests [worker] enabled = true"
+    );
+    assert_eq!(cfg.lease.duration_secs, lease_secs);
+    assert_eq!(cfg.lease.heartbeat_secs, heartbeat_secs);
+
+    let (chain, engine) =
+        engine_chain_from_config(ephemeral_addr(), non_event_tiers(), cfg, None).await;
+    let metrics = Arc::clone(&chain.metrics);
+    let (shutdown_tx, shutdown_rx) = oneshot::channel::<()>();
+    let (addr, handle) = spawn_bound_chain(chain, shutdown_rx).await;
+
+    EngineServer {
+        addr,
+        shutdown: shutdown_tx,
+        _dir: dir,
+        handle: AbortOnDropHandle(handle),
+        engine,
+        metrics,
+    }
+}
+
 /// Spin up the SAME engine-backed server [`start_engine_server`] does
 /// (identical tier set, identical chain, identical eager bind), but with
 /// `[broker]` overridden to `broker` instead of the config default

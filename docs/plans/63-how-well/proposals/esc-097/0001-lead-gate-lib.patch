@@ -1,9 +1,10 @@
 --- a/.claude/hooks/lead-gate-lib.py
 +++ b/.claude/hooks/lead-gate-lib.py
-@@ -27,6 +27,59 @@
+@@ -26,6 +26,85 @@
+   armed by a non-empty `class_enumeration` — the data, never the recorded
    `enumeration_missing` flag — and adjacent probing (`probe`, >=2 distinct
    sites outside enumeration+findings) is armed ALWAYS.
- 
++
 +esc-097 (R3, "PROBE THE FIX"): the relay gains ONE further requirement,
 +`fix_head` (a full sha, `re.fullmatch(r"[0-9a-f]{7,40}")`) plus a `probe`
 +entry naming a file the fix actually changed. Armed ONLY from
@@ -23,44 +24,69 @@
 +`acceptance-verifier` PASS clearing an older `adversarial-audit` BLOCK
 +without ever checking R3) is deleted, not merely tightened — a relay
 +lacking `fix_head` entirely could satisfy that arm, because it never ran
-+git at all. Reachability is BOUND and git-free (no `merge-base
-+--is-ancestor`, no lead-named-branch trust): the relay's own `unit_branch`
-+field must `slugify()` to EXACTLY the `unit_slug` this BLOCK's own state
-+file is already filed under — the identity the dispatch itself resolved,
-+never an arbitrary branch the relay merely asserts. A BLOCK row filed under
-+the `UNBOUND` fallback bucket can never be satisfied by any relay (no real
++git at all. Reachability is bound in TWO parts (V18 — round-3 closure):
++the relay's own `unit_branch` field must first `slugify()` to EXACTLY the
++`unit_slug` this BLOCK's own state file is already filed under — the
++identity the dispatch itself resolved, never an arbitrary branch the relay
++merely asserts (this binds the NAME); THEN that same `unit_branch` is
++resolved as a real ref (`git rev-parse --verify --end-of-options
++<name>^{commit}`; a name that merely slugifies to the right string but
++names no real ref fails here too, closing the slugify-collision advisory),
++and `fix_head` must `git merge-base --is-ancestor --end-of-options
++fix_head <resolved tip>` (this binds `fix_head`'s POSITION on that same
++history — the NAME check alone does not: an amended-away, orphaned sha, or
++a sha that is a real commit on some OTHER branch, both slugify-match a
++unit_branch that names the right unit while never being reachable from its
++tip). An amended commit IS on the tip and allows; only a STALE relay naming
++the pre-amend sha is denied — "fix_head <sha> is not on <unit_branch>; if
++the fix was amended, name the amended sha". A BLOCK row filed under the
++`UNBOUND` fallback bucket can never be satisfied by any relay (no real
 +branch name slugifies to the literal string `UNBOUND`); the remedy is to
 +re-dispatch naming the unit so the verdict lands on the unit's own file,
-+then `rm` the stale `UNBOUND.jsonl` row. Arm order: artifact-exists ->
-+schema -> R1 (coverage) -> R2 (proactivity, always) -> CLAUDE_PROJECT_DIR is
-+set -> `row.head_sha` ("block_sha") matches the sha shape and resolves ->
-+relay `unit_branch` slugifies to this BLOCK's own `unit_slug` -> `fix_head`
-+matches the sha shape, resolves, and differs from block_sha -> R3 (>=1
-+probe path names a file the fix actually changed, per `git diff
-+--name-only -z block_sha fix_head` — TRUSTED and COMPUTED, never
-+lead-supplied). git runs ONLY here, ONLY in `$CLAUDE_PROJECT_DIR` (required
-+explicitly), every invocation carrying `--end-of-options` immediately
-+before its revision arguments (git >= 2.24) so a value shaped like an
-+option (e.g. `--output=/tmp/x`) can never be read as one, with a 5s
-+timeout bounding the WHOLE call (`Popen` into its own process group,
-+`Popen.wait(timeout=…)` — never `.communicate()`, never `with Popen(...)`
-+— stdout/stderr captured to `tempfile.TemporaryFile()`s, read back only
-+after `wait()` returns; on timeout, `os.killpg` the WHOLE group, then a
-+bounded second `wait(timeout=1)`, then close the files and `.kill()` if
-+even that does not return); any git failure (non-zero exit, timeout, an
-+unresolvable/malformed sha) DENIES, naming the failing command, and states
-+that `rm .jammi/gate-state/<slug>.*` is the escape hatch but destroys the
-+unit's evidence rather than fixing the underlying git problem. HONEST
-+LIMIT: R3 cannot verify examination, only that a named path is a real
-+member of the fix's own diff — a lead can still satisfy it by pasting a
-+path out of its own change; the substantive rule (design-before-mechanism,
-+one fix round per BLOCK) is a `.claude/agents/lead.md` discipline, not a
-+hook.
-+
++then hand-remove the stale row for this block from `UNBOUND.jsonl` (never
++`rm` the shared file — it holds every other unit's UNBOUND rows too). Arm
++order: artifact-exists -> schema -> R1 (coverage) -> R2 (proactivity,
++always) -> CLAUDE_PROJECT_DIR is set -> `row.head_sha` ("block_sha")
++matches the sha shape and resolves -> relay `unit_branch` slugifies to
++this BLOCK's own `unit_slug` -> that `unit_branch` resolves as a ref ->
++`fix_head` matches the sha shape and differs from block_sha -> `fix_head`
++is an ancestor of `unit_branch`'s resolved tip -> R3 (>=1 probe path names
++a file the fix actually changed, per `git diff --name-only -z block_sha
++fix_head` — TRUSTED and COMPUTED, never lead-supplied). git runs ONLY
++here, ONLY in `$CLAUDE_PROJECT_DIR` (required explicitly), FOUR calls
++total per decision (`cat-file -e` block_sha, `rev-parse --verify`
++unit_branch, `merge-base --is-ancestor`, `diff --name-only`), every
++invocation carrying `--end-of-options` immediately before its revision
++arguments (git >= 2.24) so a value shaped like an option (e.g.
++`--output=/tmp/x`) can never be read as one, ALL FOUR sharing ONE
++per-decision monotonic deadline (`_GIT_BUDGET_S = 5.0`, an absolute
++`time.monotonic()` value threaded through every `_run_git` call, never a
++fresh 5s per call — the whole arm is bounded by 5s total, not 4x5s)
++(`Popen` into its own process group, `Popen.wait(timeout=<time left on the
++shared deadline>)` — never `.communicate()`, never `with Popen(...)` —
++stdout/stderr captured to `tempfile.TemporaryFile()`s, BOTH read back only
++after `wait()` returns, so a failing call's stderr text is appended to the
++deny reason; on timeout, `os.killpg` the WHOLE group, then a bounded
++second `wait(timeout=1)` — this reap tail is a flat 1s, NOT drawn from the
++shared budget — then close the files and `.kill()` if even that does not
++return); any git failure (non-zero exit, timeout, budget exhaustion, an
++unresolvable/malformed sha) DENIES, naming the failing command and its
++stderr, and states that `rm .jammi/gate-state/<slug>.*` is the escape
++hatch but destroys the unit's evidence rather than fixing the underlying
++git problem. HONEST LIMIT: R3 cannot verify examination, only that a named
++path is a real member of the fix's own diff — a lead can still satisfy it
++by pasting a path out of its own change; the substantive rule
++(design-before-mechanism, one fix round per BLOCK) is a
++`.claude/agents/lead.md` discipline, not a hook. A further, PRE-EXISTING
++wrinkle, not introduced by this arm: `_PASS_LIKE` is checked globally when
++classifying a raw verdict value, so an adversarial-audit row whose OWN
++verdict text merely CONTAINS a pass-like token ("verified"/"PROCEED") also
++closes a BLOCK — independent of R3 entirely; out of scope for this
++proposal.
+ 
  Explicitly OUT OF SCOPE by this cut (dropped entirely, not log-only):
  `SendMessage` gating and all message-prose parsing; implementer-dispatch
- binding; the Bash backstop (the mechanical control is `permissions.deny`
-@@ -67,7 +120,11 @@
+@@ -67,7 +146,11 @@
  allow; no `errors="replace"` fallback). `start`/`stop` are best-effort
  writers that never block a subagent lifecycle event and always exit 0.
  
@@ -73,7 +99,7 @@
  """
  
  from __future__ import annotations
-@@ -75,9 +132,18 @@
+@@ -75,9 +158,19 @@
  import json
  import os
  import re
@@ -81,6 +107,7 @@
 +import subprocess
  import sys
 +import tempfile
++import time
  from datetime import datetime, timezone
  from pathlib import Path
 +
@@ -92,7 +119,7 @@
  
  # --------------------------------------------------------------------------
  # Agent-type lattice (closed world, deny-unknown).
-@@ -417,40 +483,26 @@
+@@ -417,40 +510,26 @@
          if "verdict" in r:
              latest[r.get("agent_type") or ""] = (r, i)
      return latest
@@ -144,22 +171,21 @@
          out.append((atype, row, idx))
      return out
  
-@@ -509,11 +561,187 @@
-     import unicodedata
-     cleaned = "".join(ch for ch in s if unicodedata.category(ch) not in ("Cf", "Cc"))
+@@ -511,9 +590,261 @@
      return cleaned.strip()
-+
-+
+ 
+ 
 +# --------------------------------------------------------------------------
 +# esc-097 (R3, "probe the fix"): the ONLY git subprocess in this module, run
 +# ONLY from `_relay_rejection` (in turn reachable ONLY from
 +# `_decide_verifier_dispatch`'s repeat-dispatch branch) — never on a first
 +# dispatch's hot path. `$CLAUDE_PROJECT_DIR` is REQUIRED explicitly here
-+# (this arm never falls back to `repo_root()`'s cwd), with a 5s timeout; any
-+# failure DENIES, naming the failing command.
++# (this arm never falls back to `repo_root()`'s cwd), with a shared,
++# per-decision `_GIT_BUDGET_S` git budget (V18); any failure DENIES, naming
++# the failing command.
 +# --------------------------------------------------------------------------
 +
-+_GIT_TIMEOUT_S = 5.0
++_GIT_BUDGET_S = 5.0
 +_ESCAPE_HATCH_NOTE = (
 +    "rm .jammi/gate-state/<slug>.* is the operator escape hatch, but it "
 +    "destroys the unit's evidence rather than fixing the underlying git problem"
@@ -171,11 +197,26 @@
 +_SHA_RE = re.compile(r"[0-9a-f]{7,40}")
 +
 +
-+def _run_git(args: list[str], cwd: str) -> tuple[bool, str]:
-+    """Runs `git -C <cwd> <args>` with a 5s timeout bounding the WHOLE call.
-+    `(True, stdout)` on success; `(False, reason)` naming the failing
-+    command on any failure (non-zero exit, timeout, or git/the cwd being
-+    unusable) — the caller always turns a `False` into a DENY, never a
++def _new_git_deadline() -> float:
++    """One `_GIT_BUDGET_S`-wide monotonic deadline, minted ONCE per decision
++    (by `_fix_window`) and threaded through every `_run_git` call it makes —
++    a decision that runs four git calls is bounded by `_GIT_BUDGET_S` total,
++    never `4 * _GIT_BUDGET_S` (V18)."""
++    return time.monotonic() + _GIT_BUDGET_S
++
++
++def _run_git(args: list[str], cwd: str, deadline: float) -> tuple[bool, str, int | None]:
++    """Runs `git -C <cwd> <args>`, bounded by the TIME LEFT on the shared,
++    per-decision `deadline` (an absolute `time.monotonic()` value minted
++    once by `_new_git_deadline()`, never a fresh timeout per call) — a
++    decision that makes four such calls is bounded by `_GIT_BUDGET_S`
++    total, not `4 * _GIT_BUDGET_S` (V18). Returns `(True, stdout, rc)` on
++    success (`rc == 0`); `(False, reason, rc)` on any failure — `rc` is
++    git's own exit code when the process ran to completion (so a caller
++    that must distinguish, e.g., `git merge-base --is-ancestor`'s `rc == 1`
++    "not an ancestor" from a real error can inspect it), or `None` when no
++    process ever produced one (budget already exhausted, failed to spawn,
++    or timed out). The caller always turns a `False` into a DENY, never a
 +    silent allow.
 +
 +    Never `with Popen(...)`, never `subprocess.run` (V12): `Popen` is
@@ -198,18 +239,37 @@
 +    benefit for the COMMON case: a hung child that never escaped the group,
 +    e.g. a stuck-but-still-in-group credential helper, is reaped rather
 +    than left running), then a SECOND, independently bounded `wait(timeout=
-+    1)`; if even that does not return, close the temp files ourselves and
-+    `proc.kill()` before giving up. Measured against the escaped-grandchild
-+    shim: this shape returns in ~1.0s (vs. ~30s for the un-timed-drain
-+    shape above); a 540 KB `diff --name-only` output round-trips in ~0.01s
-+    through the temp files."""
++    1)` — this reap tail is a flat 1s, NOT drawn from the shared budget, and
++    is unchanged from the pre-V18 shape; if even that does not return,
++    close the temp files ourselves and `proc.kill()` before giving up.
++
++    Measured at `_GIT_BUDGET_S == T == 5.0` (the value actually shipped;
++    an earlier pressure probe at T=1 had reported "~1.0s", which no longer
++    describes this deadline): against the escaped-grandchild shim
++    (`python3 -c "import os,time;os.setsid();time.sleep(30)" &` then `exec
++    sleep 7`) this shape returns in **~5.00s** (vs. ~30s for the
++    un-timed-drain shape it replaced); against a CHILDLESS shim (`exec
++    sleep 30`, no escaped grandchild at all) it also returns in **~5.00s**
++    — the bound holds regardless of whether a grandchild escapes the group,
++    because nothing is ever read from a pipe either way. A 549 KB `diff
++    --name-only` payload (18000+9000 added files, measured directly, not
++    the earlier "540 KB in ~0.01s" guess) round-trips through the temp
++    files in **~0.02-0.03s**."""
 +    cmd = ["git", "-C", cwd] + list(args)
 +    printable = "git " + " ".join(args)
++    remaining = deadline - time.monotonic()
++    if remaining <= 0:
++        return (
++            False,
++            f"the shared {_GIT_BUDGET_S:g}s git budget for this decision was already "
++            f"exhausted before `{printable}` could run — {_ESCAPE_HATCH_NOTE}",
++            None,
++        )
 +    try:
 +        out_f = tempfile.TemporaryFile()
 +        err_f = tempfile.TemporaryFile()
 +    except OSError as exc:
-+        return False, f"could not open temp files for `{printable}` ({exc}) — {_ESCAPE_HATCH_NOTE}"
++        return False, f"could not open temp files for `{printable}` ({exc}) — {_ESCAPE_HATCH_NOTE}", None
 +    try:
 +        proc = subprocess.Popen(
 +            cmd, stdout=out_f, stderr=err_f, start_new_session=True,
@@ -217,9 +277,9 @@
 +    except OSError as exc:
 +        out_f.close()
 +        err_f.close()
-+        return False, f"`{printable}` failed to run ({exc}) — {_ESCAPE_HATCH_NOTE}"
++        return False, f"`{printable}` failed to run ({exc}) — {_ESCAPE_HATCH_NOTE}", None
 +    try:
-+        rc = proc.wait(timeout=_GIT_TIMEOUT_S)
++        rc = proc.wait(timeout=remaining)
 +    except subprocess.TimeoutExpired:
 +        try:
 +            os.killpg(proc.pid, signal.SIGKILL)
@@ -231,18 +291,26 @@
 +            proc.kill()
 +        out_f.close()
 +        err_f.close()
-+        return False, f"`{printable}` timed out after {_GIT_TIMEOUT_S:g}s — {_ESCAPE_HATCH_NOTE}"
++        return (
++            False,
++            f"`{printable}` timed out (shared {_GIT_BUDGET_S:g}s git budget for this "
++            f"decision) — {_ESCAPE_HATCH_NOTE}",
++            None,
++        )
 +    try:
 +        out_f.seek(0)
 +        out = out_f.read().decode("utf-8", errors="replace")
++        err_f.seek(0)
++        err = err_f.read().decode("utf-8", errors="replace").strip()
 +    finally:
 +        out_f.close()
 +        err_f.close()
 +    if rc != 0:
-+        return False, f"`{printable}` exited {rc} — {_ESCAPE_HATCH_NOTE}"
-+    return True, out.strip()
- 
- 
++        detail = f" ({err})" if err else ""
++        return False, f"`{printable}` exited {rc}{detail} — {_ESCAPE_HATCH_NOTE}", rc
++    return True, out.strip(), rc
++
++
 +# A probe entry's PATH is the first whitespace-delimited token (V17: NOT a
 +# quote- or backtick-span rule — a fix touching only a path containing a
 +# space is a documented limit; no such tracked path exists today), a
@@ -270,31 +338,41 @@
 +    ever called from `_relay_rejection`'s own repeat-dispatch caller, once
 +    R1/R2 have already passed.
 +
-+    esc-097 V16: reachability is BOUND and git-free — the relay's own
-+    `unit_branch` must `slugify()` to EXACTLY this BLOCK's own `unit_slug`
-+    (the identity the dispatch already resolved), never an arbitrary
-+    lead-named branch trusted via `git merge-base --is-ancestor` (the
-+    earlier draft's approach, reverted here: it let a relay claim
-+    reachability from ANY branch it cared to name). A row filed under the
-+    `UNBOUND` fallback bucket can never be satisfied — no real branch name
-+    slugifies to the literal string `UNBOUND`."""
++    esc-097 V18 (round-3 closure; supersedes V16's docstring, not its
++    check): reachability binds TWO things, not one. First, git-free: the
++    relay's own `unit_branch` must `slugify()` to EXACTLY this BLOCK's own
++    `unit_slug` (the identity the dispatch already resolved) — this binds
++    the unit's NAME, never an arbitrary branch the relay merely asserts. A
++    row filed under the `UNBOUND` fallback bucket can never be satisfied —
++    no real branch name slugifies to the literal string `UNBOUND`. Second,
++    binding the name is not enough: `fix_head`'s POSITION on that name's
++    OWN history must also hold, or a relay could name the right unit's
++    branch while citing a `fix_head` that an amend orphaned, or that landed
++    on some unrelated branch — both slugify-match while never being
++    reachable from the named branch's tip. So `unit_branch` is resolved as
++    a real ref (`git rev-parse --verify`; a name that only slugifies right
++    but names no ref fails here too, closing the slugify-collision
++    advisory) and `fix_head` must `git merge-base --is-ancestor` that
++    resolved tip. Four git calls total, each sharing ONE per-decision
++    deadline (`_new_git_deadline()` — `_GIT_BUDGET_S` total, not `4 *
++    _GIT_BUDGET_S`)."""
 +    project_dir = os.environ.get("CLAUDE_PROJECT_DIR")
 +    if not project_dir:
 +        return None, "hook needs CLAUDE_PROJECT_DIR for the relay arm"
 +
++    deadline = _new_git_deadline()
++
 +    block_sha = row.get("head_sha")
 +    if not (isinstance(block_sha, str) and _SHA_RE.fullmatch(block_sha)):
 +        return None, "BLOCK row's head_sha is not a valid sha"
-+    ok, why = _run_git(["cat-file", "-e", "--end-of-options", f"{block_sha}^{{commit}}"], project_dir)
++    ok, why, _rc = _run_git(
++        ["cat-file", "-e", "--end-of-options", f"{block_sha}^{{commit}}"], project_dir, deadline)
 +    if not ok:
 +        return None, f"BLOCK row's head_sha does not resolve (an amend can orphan it) — {why}"
 +
 +    fix_head = data.get("fix_head")
 +    if not (isinstance(fix_head, str) and _SHA_RE.fullmatch(fix_head)):
 +        return None, "relay carries no valid `fix_head` — the lead must write the fix commit's full sha"
-+    ok, why = _run_git(["cat-file", "-e", "--end-of-options", f"{fix_head}^{{commit}}"], project_dir)
-+    if not ok:
-+        return None, f"relay `fix_head` does not resolve — {why}"
 +
 +    if fix_head == block_sha:
 +        return None, "no fix commit since the BLOCK; a second dispatch without a fix is a re-roll"
@@ -306,7 +384,8 @@
 +        return None, (
 +            "this BLOCK was recorded without a unit binding (the UNBOUND fallback bucket) — "
 +            "re-dispatch naming the unit so the verdict lands on the unit's own file, then "
-+            "`rm` the stale UNBOUND.jsonl row for this block"
++            "hand-remove the stale row for this block from UNBOUND.jsonl (never `rm` the "
++            "shared file — it holds every other unit's UNBOUND rows too)"
 +        )
 +    if slugify(relay_ub) != unit_slug:
 +        return None, (
@@ -315,7 +394,29 @@
 +            "BLOCK is filed under, not an arbitrary branch the relay names"
 +        )
 +
-+    ok, out = _run_git(["diff", "--name-only", "-z", "--end-of-options", block_sha, fix_head], project_dir)
++    # V18: the slug equality above binds the NAME; fix_head must also be
++    # bound to that same name's own HISTORY, or a relay could name the
++    # right unit while citing a fix_head an amend orphaned, or one that
++    # landed on some unrelated branch.
++    ok, tip, _rc = _run_git(
++        ["rev-parse", "--verify", "--end-of-options", f"{relay_ub}^{{commit}}"], project_dir, deadline)
++    if not ok:
++        return None, (
++            f"relay `unit_branch` {relay_ub!r} slugifies to this BLOCK's own unit but does not "
++            f"resolve as a real ref — {tip}"
++        )
++    ok, why, rc = _run_git(
++        ["merge-base", "--is-ancestor", "--end-of-options", fix_head, tip], project_dir, deadline)
++    if not ok:
++        if rc == 1:
++            return None, (
++                f"fix_head {fix_head} is not on {relay_ub!r}; if the fix was amended, name "
++                "the amended sha"
++            )
++        return None, f"could not check whether fix_head is on {relay_ub!r} — {why}"
++
++    ok, out, _rc = _run_git(
++        ["diff", "--name-only", "-z", "--end-of-options", block_sha, fix_head], project_dir, deadline)
 +    if not ok:
 +        return None, f"could not compute the fix window: {out}"
 +    return [seg for seg in out.split("\0") if seg], None
@@ -333,7 +434,7 @@
  
      The relay's requirements are a CONJUNCTION, never a two-arm disjunction
      (esc-064): R1 (coverage) is armed by the DATA — a non-empty
-@@ -524,7 +752,6 @@
+@@ -524,7 +855,6 @@
      requirement entirely."""
      agent_type = row.get("agent_type") or ""
      block_ts = row.get("ts") or ""
@@ -341,7 +442,7 @@
      if not block_ts or not agent_type:
          return "BLOCK row carries no ts/agent_type to match a relay against"
      path = relay_artifact_path(sdir, unit_slug, agent_type, block_ts)
-@@ -536,8 +763,6 @@
+@@ -536,8 +866,6 @@
          return "relay artifact is not valid JSON"
      if not isinstance(data, dict):
          return "relay artifact is not a JSON object"
@@ -350,7 +451,7 @@
      if data.get("agent_type") != agent_type:
          return "relay `agent_type` does not match the BLOCK row's"
      if data.get("block_ts") != block_ts:
-@@ -570,11 +795,24 @@
+@@ -570,11 +898,30 @@
                  "own class_enumeration/findings (>=2 required) — restating the enumeration "
                  "is reactive acknowledgment, not adjacent probing; name >=2 sites you "
                  "EXAMINED and found clean (esc-064)")
@@ -367,19 +468,25 @@
 +    probe_paths = {p for p in (_probe_path(e) for e in probe) if p}
 +    if not any(p in fix_changed for p in probe_paths):
 +        n = len(fix_changed)
-+        sample = ", ".join(fix_changed[:3])
 +        block7 = (row.get("head_sha") or "")[:7]
 +        fix_head = data.get("fix_head")
 +        fix7 = fix_head[:7] if isinstance(fix_head, str) else "?"
++        if n:
++            sample = ", ".join(fix_changed[:3])
++            example = f" — e.g. {sample}"
++        else:
++            # An empty fix window (fix_head differs from block_sha, e.g. an
++            # empty/no-op commit) — no dangling "e.g." with nothing after it.
++            example = " — the fix commit changed no files"
 +        return (
 +            f"relay `probe` names none of the {n} files the fix changed "
-+            f"(block {block7}..fix {fix7}); probe the fix, not the neighbourhood — e.g. {sample}"
++            f"(block {block7}..fix {fix7}); probe the fix, not the neighbourhood{example}"
 +        )
 +    return None
  
  
  def _diagnose_row(row: dict) -> str:
-@@ -662,7 +900,17 @@
+@@ -662,7 +1009,17 @@
      of this type is structurally never gated (no prior row exists to
      match). Residual: an unlabeled re-dispatch naming none of the three
      anchors (DODGE-5) — allowed, visible; the tell is a verifier row whose
@@ -398,16 +505,16 @@
      targeted = [
          (unit_slug, row) for unit_slug, atype, row, idx in all_open_blocks(sdir)
          if atype == subtype and _block_named_in_text(prompt, row)
-@@ -673,6 +921,12 @@
+@@ -672,6 +1029,12 @@
+             f"no open {subtype} BLOCK named (worktree/head_sha/unit_branch) in this "
              "dispatch — a first dispatch of this type, or an unlabeled re-dispatch "
              "(the documented visible residual)"
-         )
++        )
 +    if len(targeted) > 1:
 +        names = ", ".join(u for u, _r in targeted)
 +        return False, (
 +            f"R3 is evaluated for one unit per dispatch; this prompt names {names} — "
 +            "dispatch them separately (a scratchpad path under a sibling worktree also names it)"
-+        )
+         )
      unresolved = [(u, r, why) for u, r in targeted
                    for why in [_relay_rejection(sdir, u, r)] if why is not None]
-     if unresolved:

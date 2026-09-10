@@ -12,7 +12,7 @@
  **(1) Coverage** — whenever the BLOCK's `class_enumeration` is non-empty: a `sites`
  object whose keys are an EXACT-STRING SUPERSET of it (no path parsing, no
  normalization — the lead copies the verifier's own strings verbatim, so
-@@ -63,21 +64,74 @@
+@@ -63,21 +64,99 @@
  only shrink the adjacent set) and is therefore NOT the acceptance-easing
  normalization the `sites` rule bans. The `enumeration_missing` field on a verdict
  row is diagnostic only — no gate decision reads it; which requirement has content is
@@ -32,34 +32,52 @@
 +(NUL-split, so a path with a space or non-ASCII byte is still named correctly —
 +trusted, computed, never lead-supplied) and requires `fix_head` to resolve, differ
 +from the BLOCK's own `head_sha` (else "no fix commit since the BLOCK; a second
-+dispatch without a fix is a re-roll"), and the relay's OWN `unit_branch` field to
-+`slugify()` to EXACTLY this BLOCK's own `unit_slug` — reachability is BOUND and
-+git-free (no `merge-base --is-ancestor`, no lead-named-branch trust); a BLOCK row
-+filed under the `UNBOUND` fallback bucket can never be satisfied this way (no real
-+branch slugifies to the literal string `UNBOUND` — re-dispatch naming the unit, then
-+`rm` the stale row). At least one `probe` entry's PATH (the first whitespace-
-+delimited token — never a quote- or backtick-span rule; a fix touching only a
-+space-containing path is a documented limit — a surrounding backtick or parenthesis
-+and trailing punctuation stripped, an optional trailing `:<n>[-<n>][,<n>]*` line spec
-+stripped) must be EXACTLY a member of `fix_changed` — probing the fix's own surface
-+satisfies this even when that file is also a finding location; R2's ≥2-distinct-
-+non-reactive requirement is unchanged and stays conjunctive with R3 (worst case,
-+three probe entries: 2 adjacent + 1 fix-changed, though one entry can double as both
-+when it qualifies for each). **One unit per dispatch.** If the prompt whole-token-
-+names MORE THAN ONE open BLOCK of the same type, the dispatch is denied outright,
-+naming every targeted unit — R3 never silently skips the others; dispatch each named
-+unit separately. **§C5 — the ONE amendment to "no git subprocess anywhere":** git
-+runs ONLY from the repeat-dispatch branch, NEVER on a first dispatch's hot path, and
-+ONLY in `$CLAUDE_PROJECT_DIR` — the documented hook environment contract: the harness
-+always sets this variable for every hook invocation, so `repo_root()`'s cwd fallback
-+is never needed by this arm and is deliberately not reused here — with a 5s timeout
-+bounding the whole call (git >= 2.24 required: every invocation carries
-+`--end-of-options` immediately before its revision arguments, so a value shaped like
-+an option — e.g. `--output=/tmp/x` — can never be read as one; a pre-2.24 git fails
-+that unrecognized-option check and DENIES). Any git failure (non-zero exit, timeout,
-+an unresolvable/malformed sha — an amend can orphan one) DENIES, naming the failing
-+command, and states that `rm .jammi/gate-state/<slug>.*` is the escape hatch but
-+destroys the unit's evidence rather than fixing the underlying git problem.
++dispatch without a fix is a re-roll"). Reachability binds TWO things (V18, round-3
++closure — supersedes the earlier "git-free only" design): FIRST, git-free, the
++relay's OWN `unit_branch` field must `slugify()` to EXACTLY this BLOCK's own
++`unit_slug` — this binds the unit's NAME, never an arbitrary branch the relay merely
++asserts; a BLOCK row filed under the `UNBOUND` fallback bucket can never be satisfied
++this way (no real branch slugifies to the literal string `UNBOUND` — re-dispatch
++naming the unit, then hand-remove the stale row for this block from `UNBOUND.jsonl`,
++never `rm` the shared file, which holds every other unit's rows too). SECOND, that
++same `unit_branch` is resolved as a REAL ref (`git rev-parse --verify`; a name that
++only slugifies right but names no ref fails here too, closing the slugify-collision
++advisory) and `fix_head` must `git merge-base --is-ancestor` that resolved tip — this
++binds `fix_head`'s POSITION on the unit's own history, which the NAME check alone
++does not: an amended-away orphan sha, or a sha that is a real commit on some
++UNRELATED branch, both slugify-match the right unit's name while never being
++reachable from its tip. An amended commit IS on the tip and allows; only a STALE
++relay naming the pre-amend sha is denied — "fix_head <sha> is not on <unit_branch>;
++if the fix was amended, name the amended sha". At least one `probe` entry's PATH (the
++first whitespace-delimited token — never a quote- or backtick-span rule; a fix
++touching only a space-containing path is a documented limit — a surrounding backtick
++or parenthesis and trailing punctuation stripped, an optional trailing
++`:<n>[-<n>][,<n>]*` line spec stripped) must be EXACTLY a member of `fix_changed` —
++probing the fix's own surface satisfies this even when that file is also a finding
++location; R2's ≥2-distinct-non-reactive requirement is unchanged and stays
++conjunctive with R3 (worst case, three probe entries: 2 adjacent + 1 fix-changed,
++though one entry can double as both when it qualifies for each). **One unit per
++dispatch.** If the prompt whole-token-names MORE THAN ONE open BLOCK of the same
++type, the dispatch is denied outright, naming every targeted unit — R3 never
++silently skips the others; dispatch each named unit separately. **§C5 — the ONE
++amendment to "no git subprocess anywhere":** git runs ONLY from the repeat-dispatch
++branch, NEVER on a first dispatch's hot path, and ONLY in `$CLAUDE_PROJECT_DIR` — the
++documented hook environment contract: the harness always sets this variable for
++every hook invocation, so `repo_root()`'s cwd fallback is never needed by this arm
++and is deliberately not reused here — with FOUR git calls per decision (`cat-file -e`
++block_sha, `rev-parse --verify` unit_branch, `merge-base --is-ancestor`, `diff
++--name-only`), all sharing ONE per-decision monotonic deadline (`_GIT_BUDGET_S =
++5.0`, an absolute `time.monotonic()` value threaded through every call, never a
++fresh 5s per call — the whole arm is bounded by 5s total, not 4x5s) (git >= 2.24
++required: every invocation carries `--end-of-options` immediately before its
++revision arguments, so a value shaped like an option — e.g. `--output=/tmp/x` — can
++never be read as one; a pre-2.24 git fails that unrecognized-option check and
++DENIES). Any git failure (non-zero exit, timeout, budget exhaustion, an
++unresolvable/malformed sha — an amend can orphan one) DENIES, naming the failing
++command AND its stderr (read back from the same `tempfile.TemporaryFile()` the
++command's output was captured to, after `wait()` returns — never left unread), and
++states that `rm .jammi/gate-state/<slug>.*` is the escape hatch but destroys the
++unit's evidence rather than fixing the underlying git problem.
 +**Migration.** A relay written to disk before this patch lands (no `fix_head`) stops
 +being acceptable the moment the patch IS applied — an in-flight relay must be
 +rewritten with `fix_head`, or the unit must re-relay; there is no grandfathering.
@@ -71,7 +89,14 @@
 +close the class of "form-satisfied without substance" (esc-097) — the substantive rule
 +(design-before-mechanism, one fix round per BLOCK) is a `.claude/agents/lead.md`
 +discipline, not a hook (citation-checker and the retrospective judge the probes'
-+substance, not this hook).
++substance, not this hook). A further residual: `unit_branch` is CONSTRAINED (bound to
++the unit's own NAME and, as of V18, `fix_head`'s POSITION on it) but the branch name
++itself is still lead-asserted, the same trust boundary `fix_head` already carries — a
++lead who would misname `unit_branch` to game reachability could already misname
++`fix_head` today. A PRE-EXISTING wrinkle, not introduced by R3: `_PASS_LIKE` is
++checked globally when classifying a raw verdict value, so an adversarial-audit row
++whose OWN verdict text merely contains a pass-like token ("verified"/"PROCEED") also
++closes a BLOCK, independent of R3 entirely — out of scope for this proposal.
  The hook only ever READS this file, fresh, on every gate call — it never writes an
  "accepted" row itself, so a DENY can never leave a phantom acceptance behind.
  

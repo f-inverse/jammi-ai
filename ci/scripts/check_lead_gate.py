@@ -32,8 +32,11 @@ Required fixtures (RED when the corresponding hook arm is removed):
   G11 cross-type non-interference: a pressure-tester REFINE does not gate
       the first adversarial-audit dispatch (built non-vacuously)
   G12 a SAME-agent_type PASS clears its own BLOCK
-  G13 a fix-verifier PASS clears an OLDER adversarial-audit BLOCK only when
-      that BLOCK's relay artifact was accepted (not when it wasn't)
+  G13 esc-097 (V10): there is no cross-type clearing arm at all -- a
+      fix-verifier PASS is irrelevant to an adversarial-audit BLOCK's own
+      repeat dispatch; G13a (no relay) still denies, G13b (a relay accepted
+      under the audit's OWN same-type R1+R2+R3 rule) allows regardless of
+      an unrelated fix-verifier PASS on record
   G14 an UNPARSEABLE latest row gates exactly like a BLOCK (`is_open`
       covers both values — audit-r3 finding 5's surviving mutant)
   G15 anchors bind as WHOLE TOKENS, never raw substrings (audit-r3 finding
@@ -85,7 +88,7 @@ Required fixtures (RED when the corresponding hook arm is removed):
   N7  wall time < 1s per invocation
   R10 wiring: SubagentStart/SubagentStop/PreToolUse(Agent|Task) present,
       scripts executable, permissions.deny covers the hook files
-  G20-G35 esc-097 (R3, "probe the fix" — proposal, docs/plans/63-how-well/
+  G20-G38 esc-097 (R3, "probe the fix" — proposal, docs/plans/63-how-well/
       proposals/esc-097-probe-the-fix.md): exercised behind a `RELAY_R3`
       version-marker guard on `.claude/hooks/lead-gate-lib.py` — reported
       SKIPPED (exit 0 for that arm only) until a human applies the
@@ -97,7 +100,16 @@ Required fixtures (RED when the corresponding hook arm is removed):
       dispatch); G33/G34 prove a prompt naming MORE THAN ONE open BLOCK of
       the same type denies outright, naming both, in each name order;
       G35 proves the argv boundary (a `head_sha` shaped like a git option
-      denies and spawns no git that could act on it).
+      denies and spawns no git that could act on it). G36-G38 are the
+      round-3 adversarial reproducers (V18): G25 (rewritten) and G36 both
+      DENY a `fix_head` that resolves as a real object but is reachable
+      from no ref (an amend abandons it); G37 DENIES a `fix_head` that is
+      real and ref-reachable but lives on an UNRELATED branch; all three
+      RED against the 7633b2d6 patch (which trusted the relay's
+      `unit_branch` NAME alone and never checked `fix_head`'s POSITION)
+      and GREEN once V18's `git merge-base --is-ancestor` check lands. G38
+      proves the git subprocess's own stderr text is read and appended to
+      the deny reason, not merely a bare exit code.
 
 Run: `python3 ci/scripts/check_lead_gate.py --self-test`
 """
@@ -131,8 +143,9 @@ def _run(script: str, payload: dict | bytes, project_dir: Path,
          env_overrides: dict | None = None, cwd: Path | None = None) -> subprocess.CompletedProcess:
     """esc-097 (HARD_BLOCK fix): `cwd` is NOT `project_dir` by default — a
     mutant that reduces `repo_root()` to `Path.cwd()` (dropping the
-    `CLAUDE_PROJECT_DIR` env read entirely) previously passed all 45
-    fixtures here BECAUSE every one of them ran with `cwd == project_dir`,
+    `CLAUDE_PROJECT_DIR` env read entirely) under the 8b4e4b9d harness
+    passed all 45 fixtures here BECAUSE every one of them ran with
+    `cwd == project_dir`,
     so cwd-vs-env was never actually distinguished by anything. The default
     `cwd` is now a single, shared, empty DECOY directory (`_DECOY_CWD`,
     minted once at import time) that carries no `.jammi/gate-state` at all —
@@ -212,7 +225,7 @@ _DECOY_CWD = Path(_DECOY_CWD_TD.name)
 # (V5: "every existing DENY fixture must still deny with ITS reason").
 # --------------------------------------------------------------------------
 
-# Mirrors `_GIT_TIMEOUT_S` in the (proposed, patched) hook's `_run_git` —
+# Mirrors `_GIT_BUDGET_S` in the (proposed, patched) hook's `_run_git` —
 # duplicated here rather than imported so this fixture harness states its
 # own budget explicitly, independent of whatever the patched lib currently
 # says.
@@ -509,7 +522,7 @@ def fixture_g12_same_type_pass_clears() -> None:
     _assert(p.returncode == 0, "G12", f"a same-type PASS must clear, got {p.returncode}: {p.stderr}")
 
 
-def fixture_g13_verifier_pass_clears_audited_block_only_with_relay() -> None:
+def fixture_g13_cross_type_pass_irrelevant_only_same_type_relay_governs() -> None:
     """esc-097 (V10): there is no cross-type clearing arm at all — a
     fix-verifier PASS elsewhere is irrelevant to an adversarial-audit
     BLOCK's own repeat dispatch. G13a: no relay at all -> still denied
@@ -1218,8 +1231,9 @@ def fixture_g19_coverage_arm_selected_by_data_not_flag() -> None:
 
 
 # ==========================================================================
-# G20-G35 — esc-097 (R3, "probe the fix"; G32-G35 are the round-2
-# pressure-test reproducers). NOT added to FIXTURES: the hook patch these
+# G20-G38 — esc-097 (R3, "probe the fix"; G32-G35 are the round-2 and
+# G36-G38 the round-3 pressure-test reproducers). NOT added to FIXTURES: the
+# hook patch these
 # exercise is a PROPOSAL (`.claude/hooks/**` is agent-write-denied), so it
 # is not applied in THIS tree. `_g20_28_arm()` (called from `self_test()`,
 # mirroring how N7 already runs outside the FIXTURES loop) detects whether
@@ -1256,14 +1270,15 @@ def fixture_g21_fix_head_equals_block_sha_denies() -> None:
     _assert("re-roll" in p.stderr, "G21", f"deny reason must name the re-roll, got: {p.stderr!r}")
 
 
-def fixture_g22_relay_named_branch_governs_reachability() -> None:
-    """esc-097 V16 (the B3 widening reverted): reachability is BOUND and
-    git-free — the relay's own `unit_branch` must `slugify()` to EXACTLY
-    this BLOCK's own `unit_slug` (the identity the dispatch already
-    resolved), never an arbitrary lead-named branch trusted via `git
-    merge-base --is-ancestor` (the reverted approach). (a) a relay naming
-    the unit's OWN branch (whatever its OWN `fix_head` is) is ALLOWED; (b)
-    on the SAME `fix_head`, a relay naming a DIFFERENT branch is DENIED,
+def fixture_g22_relay_unit_branch_name_binds_reachability() -> None:
+    """esc-097 V16+V18: reachability binds the unit's NAME git-free FIRST —
+    the relay's own `unit_branch` must `slugify()` to EXACTLY this BLOCK's
+    own `unit_slug` (the identity the dispatch already resolved), never an
+    arbitrary branch name alone. (a) a relay naming the unit's OWN branch
+    (whose tip its OWN `fix_head` is reachable from — see G25/G36/G37 for
+    the POSITION half V18 adds on top of this NAME check) is ALLOWED; (b)
+    on the SAME `fix_head`, a relay naming a DIFFERENT branch is DENIED by
+    this NAME check alone, before the POSITION check is ever reached —
     reason says the relay does not name this BLOCK's own unit."""
     root = _temp_repo("feat/g22")
     row = _write_block_row(root, "feat/g22", "a1", "adversarial-audit",
@@ -1319,27 +1334,115 @@ def fixture_g24_probe_names_fix_changed_finding_file_allows() -> None:
             f"a probe naming a fix-changed FINDING file must satisfy R3, got {p.returncode}: {p.stderr}")
 
 
-def fixture_g25_amend_sibling_fix_allows() -> None:
-    """An `--amend` sibling: `block_sha` is NOT an ancestor of `fix_head`
-    (both descend from a common parent) — V2 requires `fix_head` reachable
-    from the UNIT's own tip, never block_sha ancestry, so this still
-    ALLOWS."""
+def fixture_g25_amend_sibling_fix_allows_orphan_denies() -> None:
+    """esc-097 V18 (round-3 closure): `fix_head` must be reachable from the
+    unit branch's own tip (`git merge-base --is-ancestor fix_head
+    <resolved tip>`), not merely resolve to SOME commit object.
+
+    (a) sibling fix ON the unit branch: an `--amend`-style reset+recommit
+    makes the new commit the CURRENT tip of `feat/g25` — `block_sha` is NOT
+    an ancestor of `fix_head` (both descend from a common parent), but
+    `fix_head` IS the branch's own tip, so this still ALLOWS.
+
+    (b) orphaned pre-amend sha: a STALE relay names an EARLIER, now
+    amended-away commit that is neither `block_sha` (which would instead
+    deny as a re-roll) nor the current tip — it still resolves via `git
+    cat-file -e` (the object is not yet gc'd) but is NOT an ancestor of the
+    unit branch's tip — DENY, naming the ancestry failure and the remedy
+    (name the amended sha). This is the round-3 adversarial reproducer:
+    RED against the 7633b2d6 patch (which never checked `fix_head`'s
+    position at all, only the relay's `unit_branch` NAME), GREEN once
+    V18's ancestry check lands."""
     root = _temp_repo("feat/g25")
     row = _write_block_row(root, "feat/g25", "a1", "adversarial-audit",
                             ["a.py:1", "b.py:2"], ["a.py:1"])
     block_sha = row["head_sha"]
     _git(root, "reset", "-q", "--hard", "HEAD~1")  # back to block_sha's own parent
-    fix_head = _commit_fix(root, "d.py")  # a SIBLING of block_sha, not its descendant
-    _assert(fix_head != block_sha, "G25 setup", "the amend must actually produce a different sha")
+    orphan_sha = _commit_fix(root, "e.py")  # an in-between amend, later abandoned
+    _git(root, "reset", "-q", "--hard", "HEAD~1")  # abandon it too, back to the same parent
+    fix_head = _commit_fix(root, "d.py")  # the FINAL amended commit -- the real tip
+    _assert(len({block_sha, orphan_sha, fix_head}) == 3, "G25 setup", "must be three distinct shas")
     p_ancestor = subprocess.run(["git", "-C", str(root), "merge-base", "--is-ancestor", block_sha, fix_head])
     _assert(p_ancestor.returncode != 0, "G25 setup",
             "block_sha must NOT be an ancestor of fix_head (the amend-sibling premise)")
+    p_orphan = subprocess.run(["git", "-C", str(root), "merge-base", "--is-ancestor", orphan_sha, fix_head])
+    _assert(p_orphan.returncode != 0, "G25 setup",
+            "the in-between (abandoned) amend must NOT be an ancestor of the final tip either")
+
+    # (a) sibling fix ON the unit branch's own current tip -> ALLOW.
     _write_relay_exact(root, row, sites={"a.py:1": "fixed", "b.py:2": "fixed"},
                         probe=["c.py:9", "d.py:4"], fix_head=fix_head)
     p = _run("lead-gate-pre.sh", {"tool_name": "Agent", "tool_input": {
         "subagent_type": "adversarial-audit", "prompt": "re-audit unit: feat/g25"}}, root)
-    _assert(p.returncode == 0, "G25",
-            f"an amend-sibling fix (block_sha not an ancestor) must still allow, got {p.returncode}: {p.stderr}")
+    _assert(p.returncode == 0, "G25a",
+            f"an amend-sibling fix ON the unit branch's own tip must allow, got {p.returncode}: {p.stderr}")
+
+    # (b) orphaned pre-amend sha -- resolves (not yet gc'd), but is NOT on
+    # the unit branch's tip -> DENY.
+    _write_relay_exact(root, row, sites={"a.py:1": "fixed", "b.py:2": "fixed"},
+                        probe=["c.py:9", "e.py:4"], fix_head=orphan_sha)
+    p = _run("lead-gate-pre.sh", {"tool_name": "Agent", "tool_input": {
+        "subagent_type": "adversarial-audit", "prompt": "re-audit unit: feat/g25"}}, root)
+    _assert(p.returncode == 2, "G25b",
+            f"an orphaned pre-amend fix_head (resolves, not on the tip) must deny, got {p.returncode}: {p.stderr}")
+    _assert("is not on" in p.stderr, "G25b",
+            f"deny reason must name the ancestry failure: {p.stderr!r}")
+
+
+def fixture_g36_orphaned_sha_reachable_from_no_ref_denies() -> None:
+    """esc-097 V18, round-3 adversarial reproducer: a `fix_head` that
+    resolves as a real commit object (`git cat-file -e` succeeds — not yet
+    gc'd) but is reachable from NO ref at all (a descendant abandoned by
+    resetting the branch back). RED against the 7633b2d6 patch (V16-only:
+    slug equality plus an independent `cat-file -e` resolution for each
+    sha, no ancestry check at all — this shape ALLOWED); GREEN once V18's
+    `git merge-base --is-ancestor` check lands."""
+    root = _temp_repo("feat/g36")
+    row = _write_block_row(root, "feat/g36", "a1", "adversarial-audit",
+                            ["a.py:1", "b.py:2"], ["a.py:1"])
+    block_sha = row["head_sha"]
+    # A commit that's a DESCENDANT of block_sha, then abandoned by resetting
+    # feat/g36's own tip back to block_sha -- dangling, reachable only by
+    # its raw sha, from no ref.
+    orphan_sha = _commit_fix(root, "d.py")
+    _git(root, "reset", "-q", "--hard", block_sha)
+    _assert(orphan_sha != block_sha, "G36 setup", "must be a real, distinct sha")
+    p_cat = subprocess.run(["git", "-C", str(root), "cat-file", "-e", f"{orphan_sha}^{{commit}}"])
+    _assert(p_cat.returncode == 0, "G36 setup", "the orphan sha must still resolve as an object")
+    p_ancestor = subprocess.run(["git", "-C", str(root), "merge-base", "--is-ancestor", orphan_sha, block_sha])
+    _assert(p_ancestor.returncode != 0, "G36 setup",
+            "the orphan sha must NOT be an ancestor of feat/g36's own (reset-back) tip")
+    _write_relay_exact(root, row, sites={"a.py:1": "fixed", "b.py:2": "fixed"},
+                        probe=["c.py:9", "d.py:4"], fix_head=orphan_sha)
+    p = _run("lead-gate-pre.sh", {"tool_name": "Agent", "tool_input": {
+        "subagent_type": "adversarial-audit", "prompt": "re-audit unit: feat/g36"}}, root)
+    _assert(p.returncode == 2, "G36",
+            f"an orphaned fix_head reachable from no ref must deny, got {p.returncode}: {p.stderr}")
+    _assert("is not on" in p.stderr, "G36", f"deny reason must name the ancestry failure: {p.stderr!r}")
+
+
+def fixture_g37_sha_on_unrelated_branch_denies() -> None:
+    """esc-097 V18, round-3 adversarial reproducer: a `fix_head` that is a
+    REAL, ref-reachable commit — just not on THIS unit's own branch. RED
+    against the 7633b2d6 patch (no ancestry check — ANY resolvable sha
+    ALLOWED regardless of which branch it actually lives on); GREEN once
+    V18's `git merge-base --is-ancestor` check lands."""
+    root = _temp_repo("feat/g37")
+    row = _write_block_row(root, "feat/g37", "a1", "adversarial-audit",
+                            ["a.py:1", "b.py:2"], ["a.py:1"])
+    _git(root, "checkout", "-q", "-b", "feat/g37-other")
+    other_fix = _commit_fix(root, "d.py")
+    _git(root, "checkout", "-q", "feat/g37")
+    p_ancestor = subprocess.run(["git", "-C", str(root), "merge-base", "--is-ancestor", other_fix, "feat/g37"])
+    _assert(p_ancestor.returncode != 0, "G37 setup",
+            "the other branch's fix must NOT be an ancestor of feat/g37's own tip")
+    _write_relay_exact(root, row, sites={"a.py:1": "fixed", "b.py:2": "fixed"},
+                        probe=["c.py:9", "d.py:4"], fix_head=other_fix)
+    p = _run("lead-gate-pre.sh", {"tool_name": "Agent", "tool_input": {
+        "subagent_type": "adversarial-audit", "prompt": "re-audit unit: feat/g37"}}, root)
+    _assert(p.returncode == 2, "G37",
+            f"a fix_head on an UNRELATED branch must deny, got {p.returncode}: {p.stderr}")
+    _assert("is not on" in p.stderr, "G37", f"deny reason must name the ancestry failure: {p.stderr!r}")
 
 
 def fixture_g26_claude_project_dir_unset_denies() -> None:
@@ -1608,15 +1711,16 @@ def fixture_g30_env_precedence_over_cwd() -> None:
             f"CLAUDE_PROJECT_DIR must govern over a decoy cwd, got {p.returncode}: {p.stderr}")
 
 
-def fixture_g31_unbound_row_satisfied_by_relay_named_branch() -> None:
+def fixture_g31_unbound_row_never_satisfiable_by_any_relay_branch() -> None:
     """esc-097 V16 (the B3 widening reverted): a BLOCK row whose OWN
     `unit_branch` is empty (the `UNBOUND` fallback bucket — no binding
     resolved at verdict-write time, so it is filed under `UNBOUND.jsonl`)
     can NEVER be satisfied by R3, regardless of what branch the relay
     names — no real branch name `slugify()`s to the literal string
     `UNBOUND`. The deny reason states the remedy: re-dispatch naming the
-    unit so the verdict lands on the unit's own file, then `rm` the stale
-    row."""
+    unit so the verdict lands on the unit's own file, then hand-remove the
+    stale row for this block from `UNBOUND.jsonl` (never `rm` the shared
+    file — it holds every other unit's UNBOUND rows too)."""
     root = _temp_repo("feat/g31-real")
     row = _write_block_row(root, "", "a1", "adversarial-audit",
                             ["a.py:1", "b.py:2"], ["a.py:1"])
@@ -1653,7 +1757,7 @@ def fixture_g32_round2_no_cross_type_clearing() -> None:
             f"a relay with no fix_head must still deny despite two OTHER PASS rows, got {p.returncode}: {p.stderr}")
 
 
-def _g33_g34_setup(order: str) -> tuple[Path, dict, dict]:
+def _g33_g34_setup(order: str) -> tuple[Path, dict, dict, str]:
     root = _temp_repo("feat/g33-a")
     row_a = _write_block_row(root, "feat/g33-a", "a1", "adversarial-audit", ["a.py:1"], ["a.py:1"])
     _git(root, "checkout", "-q", "-b", "feat/g33-b", "feat/g33-a")
@@ -1718,23 +1822,45 @@ def fixture_g35_argv_boundary_head_sha_option_shaped() -> None:
             f"exists={poc_path.exists()}")
 
 
+def fixture_g38_unresolvable_fix_head_deny_reason_includes_git_stderr() -> None:
+    """esc-097 V19: `_run_git` reads `err_f` AFTER `wait()` returns and
+    appends its text to the deny reason — proven with a `fix_head` that is
+    SHA-SHAPED (passes the `re.fullmatch` check) but names no real object
+    at all; `git merge-base`'s own stderr ("Not a valid object name ...")
+    must appear in the hook's deny reason, not merely a bare "exited 128"."""
+    root = _temp_repo("feat/g38")
+    row = _write_block_row(root, "feat/g38", "a1", "adversarial-audit",
+                            ["a.py:1", "b.py:2"], ["a.py:1"])
+    fake_fix_head = "abc1234abc1234abc1234abc1234abc1234abcd"  # sha-shaped, no such object
+    _write_relay_exact(root, row, sites={"a.py:1": "fixed", "b.py:2": "fixed"},
+                        probe=["c.py:9", "d.py:4"], fix_head=fake_fix_head)
+    p = _run("lead-gate-pre.sh", {"tool_name": "Agent", "tool_input": {
+        "subagent_type": "adversarial-audit", "prompt": "re-audit unit: feat/g38"}}, root)
+    _assert(p.returncode == 2, "G38", f"an unresolvable fix_head must deny, got {p.returncode}: {p.stderr}")
+    _assert("not a valid" in p.stderr.lower(), "G38",
+            f"deny reason must include git's own stderr text, not just the exit code: {p.stderr!r}")
+
+
 _G20_28_FIXTURES = [
     ("G20", fixture_g20_no_fix_head_denies),
     ("G21", fixture_g21_fix_head_equals_block_sha_denies),
-    ("G22", fixture_g22_relay_named_branch_governs_reachability),
+    ("G22", fixture_g22_relay_unit_branch_name_binds_reachability),
     ("G23", fixture_g23_no_probe_names_fix_changed_denies),
     ("G24", fixture_g24_probe_names_fix_changed_finding_file_allows),
-    ("G25", fixture_g25_amend_sibling_fix_allows),
+    ("G25", fixture_g25_amend_sibling_fix_allows_orphan_denies),
     ("G26", fixture_g26_claude_project_dir_unset_denies),
     ("G27", fixture_g27_git_timeout_denies),
     ("G28", fixture_g28_real_e1_corpus),
     ("G29", fixture_g29_first_dispatch_stays_git_free_with_hung_shim),
     ("G30", fixture_g30_env_precedence_over_cwd),
-    ("G31", fixture_g31_unbound_row_satisfied_by_relay_named_branch),
+    ("G31", fixture_g31_unbound_row_never_satisfiable_by_any_relay_branch),
     ("G32", fixture_g32_round2_no_cross_type_clearing),
     ("G33", fixture_g33_two_units_denied_order_a),
     ("G34", fixture_g34_two_units_denied_order_b),
     ("G35", fixture_g35_argv_boundary_head_sha_option_shaped),
+    ("G36", fixture_g36_orphaned_sha_reachable_from_no_ref_denies),
+    ("G37", fixture_g37_sha_on_unrelated_branch_denies),
+    ("G38", fixture_g38_unresolvable_fix_head_deny_reason_includes_git_stderr),
 ]
 
 
@@ -1815,7 +1941,7 @@ FIXTURES = [
     ("G10", fixture_g10_dodge5_unlabeled_redispatch_allowed),
     ("G11", fixture_g11_cross_type_non_interference),
     ("G12", fixture_g12_same_type_pass_clears),
-    ("G13", fixture_g13_verifier_pass_clears_audited_block_only_with_relay),
+    ("G13", fixture_g13_cross_type_pass_irrelevant_only_same_type_relay_governs),
     ("G14", fixture_g14_unparseable_row_gates_like_block),
     ("G15", fixture_g15_whole_token_anchors_never_raw_substrings),
     ("G16", fixture_g16_reactive_relay_rejected_when_enumeration_present),

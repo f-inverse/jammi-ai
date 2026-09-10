@@ -1110,7 +1110,7 @@ async fn parquet_vanished_during_the_classify_window_reaps_never_aborts_the_pass
          yield a manifest-less promotion: {report:?}"
     );
 
-    // esc-484 (round-8 audit): the Parquet vanished before `delete_if_exists`
+    // esc-484: the Parquet vanished before `delete_if_exists`
     // ever ran against it — this call removed NOTHING, so it must appear in
     // NO report field (never `orphans`, never counted into
     // `bytes_reclaimed`), while the manifest sidecar (still genuinely
@@ -1202,7 +1202,7 @@ async fn parquet_vanished_after_claim_before_post_claim_row_count_re_classifies_
          never abort the pass or yield a row-count-less promotion: {report:?}"
     );
 
-    // esc-484 (round-8 audit), same accounting the classify-window sibling
+    // esc-484, same accounting the classify-window sibling
     // pins above: the Parquet vanished before `delete_if_exists` ever ran
     // against it, so this call removed NOTHING and must appear in NO report
     // field (never `orphans`, never counted into `bytes_reclaimed`), while

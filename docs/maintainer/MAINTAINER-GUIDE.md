@@ -2961,7 +2961,7 @@ describing a removed surface.
   threaded from `GrpcChain.admin_authorizer: Option<Arc<dyn AdminAuthorizer>>`
   (`runtime.rs:331`'s `build_grpc_chain` — the OSS binary's shipped default,
   `None` — and `:937`'s `assemble_grpc_chain` exhaustive destructure;
-  `flight.rs:77`'s `serve_flight_with_catalog_service` passes `None`). Shipped
+  `flight.rs:56`'s `serve_flight_with_catalog_service` passes `None`). Shipped
   default `None` refuses EVERY `all = true` request with `PERMISSION_DENIED`
   naming `security.md`; `all = false` never consults it. **Gated verb only —
   gRPC-only by construction** (`Reconcile` has no Flight SQL analogue), unlike

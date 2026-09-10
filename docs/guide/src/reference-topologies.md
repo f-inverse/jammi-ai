@@ -257,7 +257,7 @@ spec:
       labels: { app: jammi-server-train }
     spec:
       nodeSelector:
-        cloud.google.com/gke-accelerator: nvidia-l4 # your cluster's own GPU node label
+        gpu-node-pool: "true" # your cluster's own GPU node label
       securityContext:
         runAsNonRoot: true
         runAsUser: 65532

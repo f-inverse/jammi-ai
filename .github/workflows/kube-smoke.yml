@@ -36,6 +36,13 @@ name: Kubernetes smoke (kind)
 # release tarballs are linux-amd64-only, and `helm/kind-action`'s own kind
 # binary is amd64 on `ubuntu-latest`; the arm64 build of the server image is
 # already proven by `compose-smoke.yml`'s arm64 leg.
+#
+# Kubernetes has no `depends_on` analogue (unlike `deploy/docker-compose.yml`,
+# whose `jammi-server` waits on Postgres/NATS healthchecks): the ci overlay's
+# Deployment starts jammi-server alongside the Postgres/NATS StatefulSets and
+# converges by CrashLoopBackOff-and-retry until its catalog/broker
+# dependencies answer, inside the 300s `rollout status` timeout below --
+# there is no ordering gate in the manifests themselves.
 
 on:
   push:
@@ -172,6 +179,11 @@ jobs:
       - name: Validate the ci overlay against the pinned schema (kubeconform --strict, before apply)
         run: |
           set -euo pipefail
+          # actions/cache@v4 only POPULATES this directory on a prior cache
+          # hit's restore; on a cache miss nothing creates it, and
+          # kubeconform v0.8.0 fails hard opening a missing `-cache` folder
+          # instead of just skipping the cache.
+          mkdir -p "$RUNNER_TEMP/kubeconform-cache"
           kustomize build deploy/kubernetes/overlays/ci | kubeconform --strict --summary --kubernetes-version 1.34.11 \
             -schema-location "https://raw.githubusercontent.com/yannh/kubernetes-json-schema/b582a12a09aa9b5d1edad577a964c504130214fc/{{.NormalizedKubernetesVersion}}-standalone{{.StrictSuffix}}/{{.ResourceKind}}{{.KindSuffix}}.json" \
             -cache "$RUNNER_TEMP/kubeconform-cache" -
@@ -195,7 +207,12 @@ jobs:
           # Never` (patch-deployment.yaml) is a comment, not the mechanism.
           built="sha256:$(docker image inspect --format '{{.Id}}' "$JAMMI_IMAGE" | sed 's/^sha256://')"
           digests="$(docker exec kind-control-plane crictl inspecti -o json docker.io/library/jammi-ai-server:pr | jq -r '.status.repoDigests[]')"
-          for id in $(kubectl -n jammi-ci get pod -l app=jammi-server -o jsonpath='{.items[*].status.containerStatuses[*].imageID}'); do
+          ids="$(kubectl -n jammi-ci get pod -l app=jammi-server -o jsonpath='{.items[*].status.containerStatuses[*].imageID}')"
+          if [ -z "$ids" ]; then
+            echo "::error::no jammi-server pod's imageID was returned -- an empty match would vacuously pass the loop below" >&2
+            exit 1
+          fi
+          for id in $ids; do
             if [ "$id" = "$built" ] || grep -qx "$id" <<<"$digests"; then
               echo "pod imageID $id matches the built image ($built) or a crictl repoDigest"
             else

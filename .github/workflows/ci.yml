@@ -2192,7 +2192,7 @@ jobs:
             "https://github.com/kubernetes-sigs/kustomize/releases/download/kustomize%2Fv5.8.1/kustomize_v5.8.1_linux_amd64.tar.gz"
           echo "029a7f0f4e1932c52a0476cf02a0fd855c0bb85694b82c338fc648dcb53a819d  kustomize.tar.gz" | sha256sum -c -
           tar -xzf kustomize.tar.gz
-          install -m 0755 kustomize /usr/local/bin/kustomize
+          sudo install -m 0755 kustomize /usr/local/bin/kustomize
 
       - name: Fetch + verify kubeconform v0.8.0
         run: |
@@ -2201,11 +2201,17 @@ jobs:
             "https://github.com/yannh/kubeconform/releases/download/v0.8.0/kubeconform-linux-amd64.tar.gz"
           echo "9bc2bffbf71f261128533edaf912153948b7ff238f9a531ae6d34466ec287883  kubeconform.tar.gz" | sha256sum -c -
           tar -xzf kubeconform.tar.gz
-          install -m 0755 kubeconform /usr/local/bin/kubeconform
+          sudo install -m 0755 kubeconform /usr/local/bin/kubeconform
 
       - name: kustomize build | kubeconform --strict (base, shape-d, ci)
         run: |
           set -euo pipefail
+          # actions/cache@v4 only POPULATES this directory on a prior cache
+          # hit's restore; on a cache miss (first run ever, or a schema-version
+          # bump that changes the cache key) nothing creates it, and
+          # kubeconform v0.8.0 fails hard opening a missing `-cache` folder
+          # instead of just skipping the cache.
+          mkdir -p "$RUNNER_TEMP/kubeconform-cache"
           for k in base overlays/shape-d overlays/ci; do
             kustomize build "deploy/kubernetes/$k" | kubeconform --strict --summary \
               --kubernetes-version 1.34.11 \

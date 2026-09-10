@@ -24,9 +24,10 @@ server answers again), and both call `run()` here.
      Postgres-backed volume) re-asserts the exact same search result and an
      unchanged index-segment list — durability across the restart.
      `shared_catalog_after_restart` (Kubernetes, an emptyDir — NO durability
-     claim) instead asserts the NEW pod can see what the OLD pod wrote to
-     the shared catalog/broker: the registered source is still visible, the
-     result table's row count is unchanged, and the broker is still
+     claim, and the result table itself is NOT queried: see the callback's
+     own docstring) instead asserts the NEW pod can see what the OLD pod
+     wrote to the shared catalog/broker: the registered source is still
+     visible, the sources count is unchanged, and the broker is still
      `jet_stream`.
 
 Every assertion prints what it compared before raising, so a CI failure log
@@ -76,8 +77,10 @@ class Ctx:
     result table `run()` just built, the same search closure it already
     ran once (so an after-restart callback can re-run the identical
     query), the hits from that first run (to diff against), the index
-    segments observed before the restart, and the source fixture's row
-    count `N`."""
+    segments observed before the restart, the source fixture's row count
+    `N`, and the catalog's `list_sources()` snapshot taken before the
+    restart (so a callback can assert the sources count is unchanged
+    without ever touching the result table)."""
 
     db: Any
     table: str
@@ -86,6 +89,7 @@ class Ctx:
     hit_scores: list[float]
     segments_before: Any
     n: int
+    sources_before: Any
 
 
 def durable_after_restart(ctx: Ctx) -> None:
@@ -113,10 +117,18 @@ def durable_after_restart(ctx: Ctx) -> None:
 
 def shared_catalog_after_restart(ctx: Ctx) -> None:
     """Shape C (Kubernetes): the volume is an emptyDir — NO durability
-    claim. What must hold instead is that a NEW pod, reconnecting to the
-    SAME catalog and broker, sees what the OLD pod wrote: the registered
-    source is visible, the result table's row count is unchanged, and the
-    broker is still `jet_stream`."""
+    claim, for the CATALOG or the RESULT TABLE. The ci overlay's
+    `deploy/kubernetes/overlays/ci/jammi.toml` carries no `[storage]`
+    block, so a result table's Parquet segment lands under `artifact_dir`
+    on the emptyDir; `load_existing_tables` (`crates/jammi-db/src/store/
+    mod.rs`) only registers a `ready` row whose Parquet still `exists` at
+    its `parquet_path`, and a rollout-restart's new pod starts with that
+    path empty. Querying the result table here would therefore assert a
+    property this deployment shape deliberately does not have --
+    deliberately NOT done. What must hold instead is that a NEW pod,
+    reconnecting to the SAME catalog and broker, sees what the OLD pod
+    wrote to the catalog: the registered source is visible, the sources
+    count is unchanged, and the broker is still `jet_stream`."""
     described = ctx.db.describe_source("patents")
     assert described is not None, (
         "expected describe_source('patents') to be visible to the pod after "
@@ -124,11 +136,10 @@ def shared_catalog_after_restart(ctx: Ctx) -> None:
         "pod's catalog"
     )
 
-    result_ident = f'"jammi.{ctx.table}"'
-    result_count_table = ctx.db.sql(f"SELECT count(*) FROM {result_ident}")
-    result_count = result_count_table.column(0)[0].as_py()
-    assert result_count == ctx.n, (
-        f"expected {result_ident} row count == N ({ctx.n}) after restart, got {result_count}"
+    sources_after = ctx.db.list_sources()
+    assert len(sources_after) == len(ctx.sources_before), (
+        f"expected list_sources() count unchanged after restart, "
+        f"before={len(ctx.sources_before)} after={len(sources_after)}"
     )
 
     info = ctx.db.get_server_info()
@@ -220,6 +231,9 @@ def run(
     segments_before = db.list_index_segments(table)
     print(f"list_index_segments({table!r}) before restart: {segments_before}")
 
+    sources_before = db.list_sources()
+    print(f"list_sources() before restart: {sources_before}")
+
     restart()
 
     after_restart(
@@ -231,6 +245,7 @@ def run(
             hit_scores=hit_scores,
             segments_before=segments_before,
             n=n,
+            sources_before=sources_before,
         )
     )
 

@@ -18,18 +18,22 @@ What this proves: readiness after a rollout restart, the runtime oracle on
 `get_server_info().broker`, an exact self-hit search, and — via the
 after-restart callback — that the NEW pod shares the OLD pod's catalog
 (Postgres) and broker (JetStream): the registered source is still visible,
-the result table's row count is unchanged, and the broker is still
-`jet_stream`.
+the sources count is unchanged, and the broker is still `jet_stream`.
 
-What this does NOT prove: result DURABILITY across the restart. The `ci`
-overlay's Deployment mounts `emptyDir` at `/var/lib/jammi` (no persistent
-volume, unlike Shape B's Postgres-backed compose volume) — a rollout
-restart's new pod starts with an EMPTY local index. `durable_after_restart`
-(the Compose driver's callback) would fail here by construction; that is
-why this driver passes `shared_catalog_after_restart` instead. The
-workflow (`.github/workflows/kube-smoke.yml`) queries the Postgres
-StatefulSet directly after this script exits, as the matching runtime
-oracle for the catalog side.
+What this does NOT prove: result-table DURABILITY across the restart, and
+the after-restart callback deliberately never queries the result table to
+find that out. The `ci` overlay's Deployment mounts `emptyDir` at
+`/var/lib/jammi` (no persistent volume, unlike Shape B's Postgres-backed
+compose volume; also no `[storage]` block in the overlay's `jammi.toml`, so
+the result root defaults under that same `emptyDir`) — a rollout restart's
+new pod starts with an EMPTY local index, and the new pod's
+`load_existing_tables` skips registering a `ready` row whose Parquet is
+gone. `durable_after_restart` (the Compose driver's callback) would fail
+here by construction; that is why this driver passes
+`shared_catalog_after_restart` instead. The workflow
+(`.github/workflows/kube-smoke.yml`) queries the Postgres StatefulSet
+directly after this script exits, as the matching runtime oracle for the
+catalog side.
 
 Usage: `python3 tests/compose/shape_c_kube_remote.py
 [--namespace jammi-ci] [--deployment jammi-server] [--service jammi-server]
@@ -45,7 +49,6 @@ from __future__ import annotations
 import argparse
 import subprocess
 import sys
-from typing import Self
 
 import remote_smoke
 from remote_smoke import MODEL, SOURCE_URL
@@ -53,21 +56,14 @@ from remote_smoke import MODEL, SOURCE_URL
 
 class PortForward:
     """Owns one `kubectl port-forward` subprocess for the lifetime of the
-    smoke run. `open()`/`close()` are exposed separately (not just
-    `__enter__`/`__exit__`) because the restart strategy below needs to
-    close and reopen the SAME forward around a rollout restart."""
+    smoke run. `open()`/`close()` are exposed separately (not context-manager
+    methods) because the restart strategy below needs to close and reopen
+    the SAME forward around a rollout restart."""
 
     def __init__(self, namespace: str, service: str) -> None:
         self._namespace = namespace
         self._service = service
         self._proc: subprocess.Popen | None = None
-
-    def __enter__(self) -> Self:
-        self.open()
-        return self
-
-    def __exit__(self, *exc: object) -> None:
-        self.close()
 
     def open(self) -> None:
         argv = [
@@ -85,7 +81,11 @@ class PortForward:
     def close(self) -> None:
         if self._proc is not None:
             self._proc.terminate()
-            self._proc.wait(timeout=10)
+            try:
+                self._proc.wait(timeout=10)
+            except subprocess.TimeoutExpired:
+                self._proc.kill()
+                self._proc.wait(timeout=10)
             self._proc = None
 
 
@@ -98,34 +98,34 @@ def run(
     health_url: str,
 ) -> int:
     pf = PortForward(namespace, service)
-    pf.open()
-    remote_smoke.wait_for_ready(health_url, 60)
-
-    def restart() -> None:
-        pf.close()
-        print(f"=== kubectl -n {namespace} rollout restart deploy/{deployment} ===")
-        subprocess.run(
-            ["kubectl", "-n", namespace, "rollout", "restart", f"deploy/{deployment}"],
-            check=True,
-        )
-        print(f"=== kubectl -n {namespace} rollout status deploy/{deployment} ===")
-        subprocess.run(
-            [
-                "kubectl",
-                "-n",
-                namespace,
-                "rollout",
-                "status",
-                f"deploy/{deployment}",
-                "--timeout=180s",
-            ],
-            check=True,
-        )
+    try:
         pf.open()
         remote_smoke.wait_for_ready(health_url, 60)
-        print(f"{deployment} healthy after rollout restart")
 
-    try:
+        def restart() -> None:
+            pf.close()
+            print(f"=== kubectl -n {namespace} rollout restart deploy/{deployment} ===")
+            subprocess.run(
+                ["kubectl", "-n", namespace, "rollout", "restart", f"deploy/{deployment}"],
+                check=True,
+            )
+            print(f"=== kubectl -n {namespace} rollout status deploy/{deployment} ===")
+            subprocess.run(
+                [
+                    "kubectl",
+                    "-n",
+                    namespace,
+                    "rollout",
+                    "status",
+                    f"deploy/{deployment}",
+                    "--timeout=180s",
+                ],
+                check=True,
+            )
+            pf.open()
+            remote_smoke.wait_for_ready(health_url, 60)
+            print(f"{deployment} healthy after rollout restart")
+
         return remote_smoke.run(
             target,
             health_url,
@@ -180,7 +180,7 @@ def main() -> int:
             "--timeout=180s"
         )
         print("  assert describe_source(\"patents\") is not None")
-        print('  SELECT count(*) FROM "jammi.{table}"  # re-check == N')
+        print("  assert len(list_sources()) unchanged  # NOT the result table -- emptyDir, see docstring")
         print("  assert get_server_info().broker == \"jet_stream\"  # re-check")
         return 0
 

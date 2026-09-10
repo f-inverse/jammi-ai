@@ -45,6 +45,13 @@ kubectl -n <namespace> create secret generic jammi-server-secrets \
   --from-literal=JAMMI_BROKER__JET_STREAM__URL=<...>
 ```
 
+`base/jammi.toml`'s `result_root = "s3://jammi-results/prod"` is an example, not a
+literal to deploy unchanged. The S3 driver reads its credentials from the
+process environment, not from this config file (`AmazonS3Builder::from_env`,
+`crates/jammi-db/src/config/mod.rs`'s `CloudSection::S3` doc) — add
+`AWS_ACCESS_KEY_ID` / `AWS_SECRET_ACCESS_KEY` to the same Secret above when
+using an S3 (or R2) result root.
+
 ## Config precedence
 
 Env wins over the `ConfigMap`: the `JAMMI_<PATH>` env layer resolves after

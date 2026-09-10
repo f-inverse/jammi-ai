@@ -34,8 +34,15 @@ What each case proves:
     restart onto the new pod).
   - `test_shared_catalog_after_restart_raises_on_wrong_broker`: NEGATIVE
     control -- raises when the re-asserted broker is not `jet_stream`.
-  - `test_shared_catalog_after_restart_raises_on_wrong_row_count`:
-    NEGATIVE control -- raises when the result table's row count changed.
+  - `test_shared_catalog_after_restart_raises_on_wrong_sources_count`:
+    NEGATIVE control -- raises when `list_sources()`'s count changed after
+    restart (the emptyDir shape asserts the catalog, never the result
+    table's row count -- there is no row-count oracle here to lock in).
+  - `test_shared_catalog_after_restart_never_queries_sql`: POSITIVE control
+    -- `shared_catalog_after_restart` runs to completion against a fake
+    whose `sql()` raises if called at all, proving the callback never
+    queries the result table (the emptyDir does not survive a pod swap;
+    see the callback's own docstring).
 """
 
 from __future__ import annotations
@@ -92,33 +99,38 @@ class _Scalar:
 
 
 class _FakeDb:
-    def __init__(self, *, describe_source_result, sql_count, broker):
+    def __init__(self, *, describe_source_result, broker, list_sources_result=()):
         self._describe_source_result = describe_source_result
-        self._sql_count = sql_count
         self._broker = broker
-        self.sql_calls = []
+        self._list_sources_result = list(list_sources_result)
 
     def describe_source(self, source_id):
         return self._describe_source_result
 
-    def sql(self, query):
-        self.sql_calls.append(query)
-        return _FakeScalarTable(self._sql_count)
+    def list_sources(self):
+        return list(self._list_sources_result)
 
     def get_server_info(self):
         return {"broker": self._broker}
+
+    def sql(self, query):
+        raise AssertionError(
+            f"the result table must never be queried by an after-restart "
+            f"callback on the emptyDir shape, got sql({query!r})"
+        )
 
 
 class DurableAfterRestartTests(unittest.TestCase):
     def test_key_mismatch_raises_with_both_key_lists(self):
         ctx = remote_smoke.Ctx(
-            db=_FakeDb(describe_source_result=None, sql_count=0, broker="jet_stream"),
+            db=_FakeDb(describe_source_result=None, broker="jet_stream"),
             table="t1",
             do_search=lambda: _FakeHits(["1", "2", "999"], [1.0, 0.9, 0.8]),
             hit_keys=["1", "2", "3"],
             hit_scores=[1.0, 0.9, 0.8],
             segments_before=[{"segment_id": 1}],
             n=3,
+            sources_before=[{"source_id": "patents"}],
         )
         with self.assertRaises(AssertionError) as cm:
             remote_smoke.durable_after_restart(ctx)
@@ -127,7 +139,7 @@ class DurableAfterRestartTests(unittest.TestCase):
         self.assertIn("['1', '2', '999']", msg)
 
     def test_matching_keys_and_segments_pass(self):
-        db = _FakeDb(describe_source_result=None, sql_count=0, broker="jet_stream")
+        db = _FakeDb(describe_source_result=None, broker="jet_stream")
 
         def list_index_segments(_table):
             return [{"segment_id": 1}]
@@ -141,16 +153,26 @@ class DurableAfterRestartTests(unittest.TestCase):
             hit_scores=[1.0, 0.9, 0.8],
             segments_before=[{"segment_id": 1}],
             n=3,
+            sources_before=[{"source_id": "patents"}],
         )
         remote_smoke.durable_after_restart(ctx)  # must not raise
 
 
 class SharedCatalogAfterRestartTests(unittest.TestCase):
-    def _ctx(self, *, describe_source_result, sql_count, broker):
+    def _ctx(
+        self,
+        *,
+        describe_source_result,
+        broker,
+        sources_before=({"source_id": "patents"},),
+        list_sources_result=None,
+    ):
+        if list_sources_result is None:
+            list_sources_result = sources_before
         db = _FakeDb(
             describe_source_result=describe_source_result,
-            sql_count=sql_count,
             broker=broker,
+            list_sources_result=list_sources_result,
         )
         return remote_smoke.Ctx(
             db=db,
@@ -160,34 +182,47 @@ class SharedCatalogAfterRestartTests(unittest.TestCase):
             hit_scores=[1.0],
             segments_before=[],
             n=3,
+            sources_before=list(sources_before),
         )
 
     def test_raises_when_source_missing(self):
-        ctx = self._ctx(describe_source_result=None, sql_count=3, broker="jet_stream")
+        ctx = self._ctx(describe_source_result=None, broker="jet_stream")
         with self.assertRaises(AssertionError) as cm:
             remote_smoke.shared_catalog_after_restart(ctx)
         self.assertIn("describe_source", str(cm.exception))
 
-    def test_raises_on_wrong_row_count(self):
+    def test_raises_on_wrong_sources_count(self):
         ctx = self._ctx(
-            describe_source_result={"id": "patents"}, sql_count=2, broker="jet_stream"
+            describe_source_result={"id": "patents"},
+            broker="jet_stream",
+            sources_before=({"source_id": "patents"},),
+            list_sources_result=(),  # the new pod's catalog lost the source
         )
         with self.assertRaises(AssertionError) as cm:
             remote_smoke.shared_catalog_after_restart(ctx)
-        self.assertIn("row count", str(cm.exception))
+        self.assertIn("list_sources", str(cm.exception))
 
     def test_raises_on_wrong_broker(self):
-        ctx = self._ctx(
-            describe_source_result={"id": "patents"}, sql_count=3, broker="in_memory"
-        )
+        ctx = self._ctx(describe_source_result={"id": "patents"}, broker="in_memory")
         with self.assertRaises(AssertionError) as cm:
             remote_smoke.shared_catalog_after_restart(ctx)
         self.assertIn("jet_stream", str(cm.exception))
 
     def test_passes_when_everything_matches(self):
-        ctx = self._ctx(
-            describe_source_result={"id": "patents"}, sql_count=3, broker="jet_stream"
-        )
+        ctx = self._ctx(describe_source_result={"id": "patents"}, broker="jet_stream")
+        remote_smoke.shared_catalog_after_restart(ctx)  # must not raise
+
+    def test_never_queries_sql(self):
+        """POSITIVE control: `_FakeDb.sql` always raises if called at all
+        (see its definition above), so this passing run is itself the proof
+        that `shared_catalog_after_restart` never queries the result table
+        -- the emptyDir shape has no row-count oracle to lock in (see the
+        callback's own docstring). Run against the OLD callback (before this
+        commit's fix), this control's RED text was:
+        'AssertionError: the result table must never be queried by an
+        after-restart callback on the emptyDir shape, got sql('SELECT
+        count(*) FROM "jammi.t1"')'."""
+        ctx = self._ctx(describe_source_result={"id": "patents"}, broker="jet_stream")
         remote_smoke.shared_catalog_after_restart(ctx)  # must not raise
 
 

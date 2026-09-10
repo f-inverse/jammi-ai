@@ -1,0 +1,20 @@
+# env wins over this file (the JAMMI_<PATH> layer resolves after it); secrets
+# never here -- JAMMI_AUDIT_MASTER_KEY, JAMMI_CATALOG__POSTGRES__URL and
+# JAMMI_BROKER__JET_STREAM__URL come from the Secret this Deployment's
+# envFrom names, never from this ConfigMap.
+
+[storage]
+result_root = "s3://jammi-results/prod"
+
+[storage.cloud.s3]
+region = "us-east-1"
+
+[lease]
+duration_secs = 30
+heartbeat_secs = 10
+
+[server]
+services = ["core", "event", "eval"]
+
+[worker]
+enabled = false

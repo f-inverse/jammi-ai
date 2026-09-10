@@ -226,6 +226,7 @@ impl CatalogClient {
             features: resp.features,
             storage_backends: resp.storage_backends,
             services: resp.services,
+            broker: resp.broker,
         })
     }
 

@@ -242,6 +242,12 @@ message ServerInfo {
   // embedded (in-process, `file://`) engine mounts no gRPC services, so it
   // reports an empty list.
   repeated string services = 4;
+  // The RUNTIME trigger-broker driver this deployment is actually running:
+  // "in_memory" | "jet_stream" | "postgres". Unlike the fields above, an
+  // embedded (in-process) client and a remote server built from the same
+  // config report the IDENTICAL value here -- every engine session holds a
+  // real broker whether or not it also serves gRPC.
+  string broker = 5;
 }
 
 // A tenant identifier carried over the wire. UUID v4 / v7 string per ADR-00;

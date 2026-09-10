@@ -305,6 +305,32 @@ workspace ships every publishable crate at the same
   close-first SQLite recipe, the Postgres `pg_dump`/PITR + object-store-snapshot recipe,
   why `cache/` is always excludable, the storage-then-catalog restore ordering rule, and
   when to run `jammi reconcile`.
+- **A Postgres wake-up trigger broker: `[broker.postgres]`, `ServerInfo.broker` (#490).**
+  `crates/jammi-db/src/trigger/postgres.rs` adds a third `TriggerBroker` driver over
+  `LISTEN`/`NOTIFY` — a transport-only wake-up signal, never a second log: the topic's
+  own mutable backing table stays the durable, authoritative log every driver replays
+  through. No cargo feature (`sqlx`'s `postgres` feature is already unconditional in the
+  workspace); `[broker.postgres] { url: Option<Secret> = catalog.postgres.url,
+  idle_poll_secs: u64 = 5 }`, externally tagged like `[broker.jet_stream]`. Every
+  replica's `url` MUST name the SAME Postgres database (`NOTIFY` is instance-scoped); a
+  lost notification is bounded by `idle_poll_secs`, which wakes every topic and triggers
+  a replay regardless — never data loss. `ServerInfo` gains `string broker = 5`
+  (`crates/jammi-wire/proto/jammi/v1/catalog.proto`): the RUNTIME driver kind
+  (`in_memory`/`jet_stream`/`postgres`) every deployment now reports, identically for an
+  embedded and a remote client built from the same config. Additive public surface this
+  lands alongside the broker: `MutableTableRegistry::definition_for_tenant`
+  (`crates/jammi-db/src/source/mutable.rs`), `Subscription::id`/`SubscriptionId`
+  (`crates/jammi-db/src/trigger/{subscription,ids}.rs`), `PostgresBroker`
+  (`crates/jammi-db/src/trigger/postgres.rs`), and the test-only
+  `PostgresBroker::suppress_next_notify_for_testing` hook.
+- **`BrokerKind` gains `as_str`** (`crates/jammi-db/src/trigger/broker.rs`), the stable
+  lower-case wire/telemetry spelling (`"in_memory"`/`"jet_stream"`/`"postgres"`) `ServerInfo.broker`
+  and the config-parity oracles round-trip through. Additive: an inherent method on an existing
+  enum, no trait or match surface changes.
+- **`FromSqlValue` gains impls for `i16` and `f32`**
+  (`crates/jammi-db/src/catalog/backend.rs`), completing the narrower integer/float widths the
+  trigger-stream tail replay's row decoding needs; additive only (no existing impl or caller
+  changes).
 
 ### Changed
 - **One lease primitive; lease-owned `building` result tables (#479, esc-094).** A
@@ -629,6 +655,16 @@ workspace ships every publishable crate at the same
   target) — its `deny-warnings` input exports a per-target `CARGO_TARGET_<TRIPLE>_RUSTFLAGS=
   -D warnings` instead, which joins with `.cargo/config.toml`'s own per-target `rustflags` (mold and
   the fp16 floor both apply unconditionally, everywhere, local dev and CI alike).
+- **Trigger-stream offset assignment is transactional; multi-replica publish is now correct
+  on every driver (#490).** `Publisher::publish_scoped` (`crates/jammi-db/src/trigger/publisher.rs`)
+  assigns the offset with ONE locking `UPDATE topics SET next_offset = … RETURNING` inside the
+  same transaction that inserts the augmented batch, replacing a per-process `AtomicU64` counter
+  seeded from `MAX(_offset)` that let two engine replicas publishing against the same Postgres
+  catalog compute the same next offset and collide on the backing table's `(_offset, _row_idx)`
+  composite key. `TopicTail` (`crates/jammi-db/src/trigger/tail.rs`) additionally makes this true
+  for every driver, not only Postgres: a driver-delivered batch is fanned out only when it is
+  exactly the tail's cursor + 1, and any gap or regression triggers a replay instead, because
+  post-commit fan-out across replicas is unordered regardless of transport.
 
 ### Fixed
 - **Two concurrent `migrate()` callers on a fresh Postgres database could both attempt the
@@ -754,6 +790,15 @@ workspace ships every publishable crate at the same
   as an invalid Parquet (`Reap`), never an `Err` that aborts the whole reconcile pass — pinned by a
   new park-hook test that manufactures the exact classify-window race. The mismatch counter and its
   test-hook are deleted along with the prediction they audited.
+- **Trigger-stream replay is type-faithful and intra-batch row order is exact (#490).** Replay
+  (`crates/jammi-db/src/source/mutable.rs`) and the mutable-table provider
+  (`crates/jammi-db/src/store/mutable/provider.rs`) previously folded every accepted column type
+  down to Int64/Binary before reconstructing the declared Arrow schema, so a topic column declared
+  Int8/Int16/Int32/UInt8/UInt16/UInt32/UInt64/Float32/Binary failed to replay
+  (`RecordBatch::try_new` against the declared schema); both sites now decode per the storage type
+  and build the exact declared array. `ORDER BY` now always carries the backing table's full
+  primary key (`_offset, _row_idx`) as a tiebreak, so same-`_offset` rows from one publish replay
+  in their original order rather than whatever order the backend happens to return them in.
 - **Config phase-4 hardening: no bare-env whole-struct override without a file layer, `[models]`
   offline honored in the fine-tune worker's HF fallback, and no env value echoed into a config
   error (#483, #481).** `JammiConfig`'s hand-written `Deserialize` refused a bare `JAMMI_<X>='{
@@ -1067,6 +1112,58 @@ workspace ships every publishable crate at the same
   variants. The shape is unchanged (three binary columns) and the modality is now taken from the
   job's declared `ModelTask`, so the same variant covers image and audio. The format is
   column-detected rather than serialized, so nothing on the wire or on disk changes.
+- **`TriggerBroker::subscribe` returns a new driver-level `LiveStream`, item
+  `Result<LiveEvent, TriggerError>` (#490).** A driver implementation must now yield
+  `LiveEvent::Batch(DeliveredBatch)` (a driver carrying the published bytes itself) or
+  `LiveEvent::Wake` (a driver, or a lagging receiver, that carries no payload) — never a bare
+  `DeliveredBatch` stream. `Subscription`/`Subscriber::subscribe_scoped`/`Session::subscribe` are
+  UNCHANGED (item `DeliveredBatch`); this is a driver-authoring-surface break only, not an
+  engine-facing one. Migration for an out-of-tree `TriggerBroker`: wrap deliveries in
+  `LiveEvent::Batch(..)` and route a lagged/history-exhausted case through `LiveEvent::Wake`
+  instead of an error.
+- **`TriggerError::OffsetEvicted` is removed.** A driver that cannot start at or before a
+  requested offset, or whose live tail lagged a receiver, now yields `LiveEvent::Wake` instead of
+  failing the stream; the engine's subscribe seam self-heals by replaying the backing table. The
+  wire enum retires the corresponding oneof field: `error.proto`'s
+  `TriggerErrorDetail.offset_evicted = 9` is `reserved 9; reserved "offset_evicted";` — a client
+  matching that field exhaustively must drop the arm.
+- **`ConsumerOffsetSnapshot` fields are redefined as ENGINE offsets for every driver, and
+  renamed.** `last_delivered_stream_sequence`/`last_ack_stream_sequence` are renamed
+  `last_delivered_offset`/`last_acked_offset` (`crates/jammi-db/src/trigger/consumer.rs`) and now
+  hold the engine `_offset`, not a driver-native sequence, on every driver including JetStream (it
+  now decodes the engine offset from the delivered message's header rather than reporting its own
+  stream sequence) — a native sequence is meaningless across drivers and cannot prime a restored
+  broker's `subscribe(from_offset = …)` correctly. Both fields also change Rust type from `u64` to
+  `Option<u64>`: `None` names a driver that could not resolve an engine offset for a consumer (a
+  message aged out of retention before the translation ran, or — for `PostgresBroker`, whose
+  fan-out is a bare wake-up signal with no delivered offset — a consumer that has never yet
+  observed a NOTIFY payload carrying one) — never a fabricated `0`, which the never-woken case
+  would otherwise be indistinguishable from `_offset = 0` (a real, first-published row).
+  `list_consumers` also changes CARDINALITY: it now enumerates one consumer per `(topic, tenant)`
+  this process has ever served a subscriber for (one `TopicTail`), not one per individual
+  caller-level subscription — `N` engine subscribers of the same topic/tenant share one
+  driver-level consumer.
+- **`BrokerKind` gains a `Postgres` variant** (`crates/jammi-db/src/trigger/broker.rs`). The enum
+  is not `#[non_exhaustive]`, so an exhaustive out-of-tree `match` over it must add the arm.
+- **`CatalogBackend` gains a required trait method `pool_size(&self) -> u32`**
+  (`crates/jammi-db/src/catalog/backend.rs`). Every in-tree backend (SQLite, Postgres) implements
+  it; an out-of-tree `CatalogBackend` impl must add it — it reports the connection pool's
+  `max_connections`, used to size the trigger-stream replay semaphore
+  (`crate::source::mutable::MutableTableRegistry`) so tail replays can never starve publishers of
+  pool connections.
+- **`Publisher::publish_scoped` rejects an empty batch** (`crates/jammi-db/src/trigger/publisher.rs`)
+  with `TriggerError::BatchSchemaMismatch` rather than minting and burning an offset for zero rows
+  — "every offset has at least one row" is now an invariant callers can rely on.
+- **Every column type `register_topic` accepts is now actually publishable and replayable end to
+  end.** Publish (`crates/jammi-db/src/store/mutable/sink.rs::extract_value`) previously rejected
+  Int8/Int16/UInt8/UInt16/UInt32/UInt64 topic columns at write time despite the catalog accepting
+  them at registration, and replay (`crates/jammi-db/src/source/mutable.rs`,
+  `crates/jammi-db/src/store/mutable/provider.rs`) separately failed to reconstruct
+  Int8/Int16/Int32/UInt8/UInt16/Binary columns even when a row did make it into the backing table
+  by another path. A topic declaring any accepted type (Boolean, every signed/unsigned integer
+  width, Float32/64, Utf8, Binary) now round-trips through publish, replay, and every driver's
+  live path byte-for-byte. `UInt64` values above `i64::MAX` are refused at publish (BIGINT is the
+  storage type on both backends) rather than silently wrapped or truncated.
 
 ## [0.49.1] - 2026-09-03
 

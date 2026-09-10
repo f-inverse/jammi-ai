@@ -230,8 +230,8 @@ fn docs_toml_fences_parse_under_the_real_loader() {
     // under `docs/guide/src`.
     assert_eq!(
         selected,
-        24,
-        "selected {selected} config fence(s) under {} -- expected exactly 24; if you \
+        26,
+        "selected {selected} config fence(s) under {} -- expected exactly 26; if you \
          added or removed a JammiConfig-shaped ```toml fence, update this pinned count",
         guide_root().display()
     );

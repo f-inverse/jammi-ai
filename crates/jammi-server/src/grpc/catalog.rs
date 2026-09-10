@@ -163,13 +163,26 @@ impl CatalogService for CatalogServer {
         // `storage_backends`) plus this deployment's *runtime* tier handshake:
         // `services` is the set of gRPC tiers this server actually mounted, not
         // a compile-time fact — so it comes from the injected `TierSet`, not
-        // from `ServerInfo::current` (which leaves it empty).
+        // from `ServerInfo::current` (which leaves it empty). `broker` is
+        // likewise runtime, read straight off the mounted engine's live
+        // `TriggerBroker::driver_kind()` — the SAME call the embedded
+        // `Session::server_info` makes, so an embedded and a remote session
+        // built from the same config report the identical value. An
+        // engine-light deployment (no engine mounted) has no broker to ask
+        // and truthfully reports an empty string, matching
+        // `ServerInfo::current`'s own default.
         let info = jammi_db::ServerInfo::current();
+        let broker = self
+            .session
+            .as_ref()
+            .map(|s| s.trigger_broker().driver_kind().as_str().to_string())
+            .unwrap_or_default();
         Ok(Response::new(pb::ServerInfo {
             version: info.version,
             features: info.features,
             storage_backends: info.storage_backends,
             services: self.tiers.as_wire(),
+            broker,
         }))
     }
 

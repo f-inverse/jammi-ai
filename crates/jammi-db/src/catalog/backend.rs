@@ -89,6 +89,14 @@ pub trait CatalogBackend: Send + Sync {
 
     /// Backend identity for telemetry and dialect-conditional code paths.
     fn backend_kind(&self) -> BackendKind;
+
+    /// The connection pool's `max_connections`. Used to size the concurrent
+    /// tail-replay semaphore owned by
+    /// [`crate::source::mutable::MutableTableRegistry`] (its `replay_permits`
+    /// field) — sized `pool_size - 2` (min 1) — so tail replays can never
+    /// starve publishers of pool connections on either backend (SQLite's pool
+    /// is a hardcoded 8, see `backend_sqlite.rs`'s `open`).
+    fn pool_size(&self) -> u32;
 }
 
 /// Dynamic-dispatch wrapper over the concrete backend implementations. Used
@@ -177,6 +185,14 @@ impl BackendImpl {
         match self {
             BackendImpl::Sqlite(b) => b.backend_kind(),
             BackendImpl::Postgres(b) => b.backend_kind(),
+        }
+    }
+
+    /// Dispatch [`CatalogBackend::pool_size`] to the inner backend.
+    pub fn pool_size(&self) -> u32 {
+        match self {
+            BackendImpl::Sqlite(b) => b.pool_size(),
+            BackendImpl::Postgres(b) => b.pool_size(),
         }
     }
 }
@@ -583,8 +599,15 @@ macro_rules! impl_from_sql_primitive {
 impl_from_sql_primitive!(String);
 impl_from_sql_primitive!(i64);
 impl_from_sql_primitive!(i32);
+// `i16` decodes SMALLINT/INT2 columns (Postgres rejects an `i32` bind
+// against INT2; sqlx's SQLite driver also has a native `i16` mapping).
+// Needed by the storage-typed replay decode path (Int8/Int16 columns).
+impl_from_sql_primitive!(i16);
 impl_from_sql_primitive!(bool);
 impl_from_sql_primitive!(f64);
+// `f32` decodes REAL/FLOAT4 columns — `f64` rejects them on Postgres.
+// Needed by the storage-typed replay decode path (Float32 columns).
+impl_from_sql_primitive!(f32);
 impl_from_sql_primitive!(Vec<u8>);
 
 impl FromSqlValue for uuid::Uuid {

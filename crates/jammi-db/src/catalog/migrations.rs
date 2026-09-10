@@ -90,6 +90,10 @@ const MIGRATIONS: &[(&str, &str)] = &[
         "027_result_table_lease",
         schema::MIGRATION_027_RESULT_TABLE_LEASE,
     ),
+    (
+        "028_topics_next_offset",
+        schema::MIGRATION_028_TOPICS_NEXT_OFFSET,
+    ),
 ];
 
 const APPLIED_MIGRATIONS_DDL: &str = r#"

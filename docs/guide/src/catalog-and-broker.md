@@ -4,7 +4,7 @@ Jammi's catalog (models, sources, eval runs, mutable companion tables) and
 trigger broker (provenance channels, evidence streams) are selected through
 two fields on `JammiConfig`: `catalog` and `broker`. The dev-laptop default
 is SQLite + an in-process broker; production deployments swap one or both
-for Postgres + JetStream.
+for Postgres (catalog and/or broker) or NATS JetStream (broker only).
 
 ## TOML schema
 
@@ -46,6 +46,26 @@ credentials = { file = "/var/run/secrets/nats.creds" }
 `[broker.jet_stream]` requires the `jetstream-broker` cargo feature
 on `jammi-db`; selecting it without the feature returns
 `JammiError::Config` rather than panicking at session construction time.
+
+```toml
+[broker.postgres]
+# url = "postgres://user:pass@host:5432/jammi"   # optional; defaults to
+#                                                 # `catalog.postgres.url`
+idle_poll_secs = 5
+```
+
+`[broker.postgres]` carries no cargo feature: `sqlx`'s `postgres` feature is
+unconditional in the workspace, so this variant always compiles in. It is a
+`LISTEN`/`NOTIFY` **wake-up transport**, not a second log — the topic's own
+mutable backing table is the durable, authoritative log, and this driver
+only tells a subscriber "topic T may have advanced; go check". Every replica
+MUST point `url` at the SAME Postgres database — `NOTIFY` is scoped to one
+instance, and a replica listening elsewhere is not detectable by config; it
+silently degrades to `idle_poll`-only delivery (never data loss, since the
+backing table is still replayed on the next tick). `url` defaults to
+`catalog.postgres.url` when unset and the catalog itself is Postgres; a
+SQLite catalog with no explicit `url` here is a load-time `JammiError::Config`
+naming both keys. `idle_poll_secs` (default 5) must be `>= 1`.
 
 ## Environment variable interpolation
 
@@ -178,19 +198,26 @@ live object-store listing in both directions — see
 maintainer guide (`docs/maintainer/MAINTAINER-GUIDE.md`) for the allowlist
 and deletion-arm detail.
 
-## In-memory vs JetStream broker
+## In-memory vs Postgres vs JetStream broker
 
-| Concern | InMemory | JetStream |
-| --- | --- | --- |
-| Persistence | In-process only; lost on restart. | NATS server retains streams per `retention_seconds`. |
-| Cross-process delivery | None — a publish in process A is invisible to a subscriber in process B. | All subscribers (any process, any host) see every published batch within the retention window. |
-| Auth | None. | Anonymous or NATS `.creds` file contents via `credentials`. |
-| Operational footprint | None. | One NATS server (or cluster). |
+| Concern | InMemory | Postgres | JetStream |
+| --- | --- | --- | --- |
+| Persistence | In-process only; lost on restart. | None of its own — the topic's mutable backing table (already durable) is the log; the driver carries no bytes. | NATS server retains streams per `retention_seconds`. |
+| Cross-process delivery | None — a publish in process A is invisible to a subscriber in process B. | All subscribers (any process, any host) see a wake within `idle_poll_secs` of a publish; the actual rows come from a replay of the shared backing table. | All subscribers (any process, any host) see every published batch within the retention window. |
+| Auth | None. | Whatever `[broker.postgres] url` (or the catalog's) already authenticates with. | Anonymous or NATS `.creds` file contents via `credentials`. |
+| Operational footprint | None. | **None beyond the catalog** — up to three extra connections to the SAME Postgres instance the catalog already uses (or points at); no extra service. | One NATS server (or cluster). |
 
 In-memory is fine for tests, local development, and single-process server
 deployments where every consumer lives in the same `jammi-server` process.
-JetStream is required for any deployment that wants replay across
-restarts or fan-out across multiple `jammi-server` replicas.
+For any deployment that wants replay across restarts or fan-out across
+multiple `jammi-server` replicas (Shapes B and C), **Postgres is the
+recommended broker** whenever the catalog is already Postgres: it adds no
+extra service, only a handful of connections to the database already in the
+topology. Reach for JetStream when the deployment wants a dedicated,
+broker-scoped retention window independent of the catalog's own lifecycle,
+or when the catalog itself stays SQLite (single-process) while the broker
+still needs to fan out beyond one process — a shape Postgres-as-broker
+cannot serve without a Postgres catalog to default its `url` from.
 
 ## Health probe
 

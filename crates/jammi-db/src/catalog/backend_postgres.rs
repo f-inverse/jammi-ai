@@ -14,6 +14,9 @@ use super::backend::{
 /// Postgres-backed catalog. Wraps `sqlx::PgPool`.
 pub struct PostgresBackend {
     pool: PgPool,
+    /// The pool's configured `max_connections`, retained since `sqlx::Pool`
+    /// exposes live connection counts but not the configured ceiling.
+    pool_size: u32,
 }
 
 impl PostgresBackend {
@@ -35,7 +38,7 @@ impl PostgresBackend {
             builder = builder.max_lifetime(Duration::from_secs(secs as u64));
         }
         let pool = builder.connect_with(opts).await.map_err(classify)?;
-        Ok(Arc::new(Self { pool }))
+        Ok(Arc::new(Self { pool, pool_size }))
     }
 }
 
@@ -120,5 +123,9 @@ impl CatalogBackend for PostgresBackend {
 
     fn backend_kind(&self) -> BackendKind {
         BackendKind::Postgres
+    }
+
+    fn pool_size(&self) -> u32 {
+        self.pool_size
     }
 }

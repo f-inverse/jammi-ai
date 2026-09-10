@@ -863,3 +863,18 @@ ALTER TABLE result_tables ADD COLUMN writer_id TEXT;
 ALTER TABLE result_tables ADD COLUMN lease_expires_at TEXT;
 CREATE INDEX idx_result_tables_lease ON result_tables(status, lease_expires_at);
 "#;
+
+/// Migration 028 — `topics.next_offset`: the cross-process monotone offset
+/// counter for the trigger-stream publish path.
+///
+/// `NULL` means "unseeded": a topic registered before this migration (or a
+/// freshly-registered one) has never had an offset assigned through this
+/// column. The publish-time locking statement
+/// (`Publisher::publish_scoped`) seeds it from `COALESCE(MAX("_offset"),
+/// -1) + 1` on the topic's own backing table the first time it is read,
+/// inside the same row-locked `UPDATE` that bumps it — so the seed-then-bump
+/// race is closed by the UPDATE's own row lock rather than an unlocked
+/// read-then-write window. A fresh topic (empty backing table) seeds to `0`.
+pub(super) const MIGRATION_028_TOPICS_NEXT_OFFSET: &str = r#"
+ALTER TABLE topics ADD COLUMN next_offset BIGINT;
+"#;

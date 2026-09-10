@@ -249,12 +249,24 @@ impl Session {
         self.engine.catalog().describe_source(source_id).await
     }
 
-    /// The engine's capabilities handshake: version, compiled feature flags, and
-    /// addressable storage backends. The engine's capabilities are a compile-time
-    /// fact, so this reads them straight off [`ServerInfo::current`]; it is
-    /// `async` only to match the wire-shaped surface (the remote peer round-trips).
+    /// The engine's capabilities handshake: version, compiled feature flags,
+    /// addressable storage backends, and the RUNTIME trigger-broker driver
+    /// this session is actually running. The first three are a compile-time
+    /// fact, read straight off [`ServerInfo::current`]; `broker` is filled in
+    /// from this session's live `TriggerBroker::driver_kind()` — the SAME
+    /// call `jammi-server`'s `GetServerInfo` handler makes, so an embedded
+    /// and a remote session built from the same config report the identical
+    /// value. `async` only to match the wire-shaped surface (the remote peer
+    /// round-trips).
     pub async fn server_info(&self) -> Result<ServerInfo> {
-        Ok(ServerInfo::current())
+        let mut info = ServerInfo::current();
+        info.broker = self
+            .engine
+            .trigger_broker()
+            .driver_kind()
+            .as_str()
+            .to_string();
+        Ok(info)
     }
 
     // --- sql -------------------------------------------------------------

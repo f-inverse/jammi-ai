@@ -18,7 +18,7 @@ use tempfile::tempdir;
 use tokio::sync::Barrier;
 
 /// Every migration name, in ledger order. Mirrors `catalog::migrations::MIGRATIONS`
-/// (K5: append-only, currently ending at 027) -- a new migration is added here
+/// (K5: append-only, currently ending at 028) -- a new migration is added here
 /// in the same change.
 const EXPECTED_MIGRATION_NAMES: &[&str] = &[
     "001_core_tables",
@@ -48,6 +48,7 @@ const EXPECTED_MIGRATION_NAMES: &[&str] = &[
     "025_index_segments",
     "026_acceleration_report",
     "027_result_table_lease",
+    "028_topics_next_offset",
 ];
 
 async fn open_sqlite_backend(path: &std::path::Path) -> std::sync::Arc<SqliteBackend> {

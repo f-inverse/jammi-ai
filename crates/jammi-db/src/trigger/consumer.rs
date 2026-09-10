@@ -4,15 +4,18 @@
 //! The shape mirrors the subset of `async_nats::jetstream::consumer::Info`
 //! that backup/restore needs to capture and re-apply on a fresh broker
 //! instance: a stable identifier per consumer, the topic it is bound to,
-//! and the two stream-sequence positions JetStream tracks (the last
-//! sequence delivered to the consumer, and the ack floor below which
-//! every message has been explicitly acknowledged). Fields are `u64`
-//! because JetStream's sequence numbers are `u64`; truncating to `i64`
-//! would be a silent precision loss at the API boundary.
+//! and the two ENGINE-OFFSET positions every driver tracks (the last engine
+//! offset delivered to the consumer, and the ack floor below which every
+//! event has been explicitly acknowledged) — never a driver-native sequence
+//! (JetStream's stream sequence is translated back to an engine offset via
+//! its `HDR_OFFSET` header; see `jetstream.rs::translate_stream_sequence`).
+//! Fields are `Option<u64>` because a translation can fail to resolve (most
+//! commonly a message aged out of retention before the lookup ran) — `None`
+//! then, never a fabricated `0`.
 //!
 //! The in-memory broker does not implement explicit acks — its
-//! `last_ack_stream_sequence` equals `last_delivered_stream_sequence` so
-//! a backup-restore cycle through the mock round-trips the same value.
+//! `last_acked_offset` equals `last_delivered_offset` so a backup-restore
+//! cycle through the mock round-trips the same value.
 
 use crate::trigger::ids::TopicId;
 
@@ -21,6 +24,14 @@ use crate::trigger::ids::TopicId;
 /// fields that the engine's backup/restore path consumes so the OSS
 /// surface does not leak driver-specific bookkeeping (cluster info,
 /// pause state, push-bound flags, …).
+///
+/// Both fields are **engine `_offset`s**, not a driver-native sequence, for
+/// every driver: a restore primes a fresh broker via
+/// `subscribe(from_offset = engine offset)`, and a native sequence
+/// (JetStream's stream sequence) is meaningless across drivers. `None` means
+/// this driver could not resolve an engine offset for the consumer (e.g. the
+/// underlying message aged out of JetStream's retention before the
+/// translation lookup ran) — never fabricated as `0`.
 ///
 /// [`list_consumers`]: crate::trigger::broker::TriggerBroker::list_consumers
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -33,14 +44,10 @@ pub struct ConsumerOffsetSnapshot {
     pub consumer_name: String,
     /// Topic the consumer is bound to.
     pub topic_id: TopicId,
-    /// The stream-sequence number of the last message the broker has
-    /// delivered to this consumer. Equivalent to JetStream's
-    /// `Info.delivered.stream_sequence`.
-    pub last_delivered_stream_sequence: u64,
-    /// The stream-sequence below which every message has been
-    /// acknowledged. Equivalent to JetStream's
-    /// `Info.ack_floor.stream_sequence`. For brokers without an ack
-    /// model (the in-memory broker), this equals
-    /// `last_delivered_stream_sequence`.
-    pub last_ack_stream_sequence: u64,
+    /// The engine `_offset` of the last event delivered to this consumer.
+    pub last_delivered_offset: Option<u64>,
+    /// The engine `_offset` below which every event has been acknowledged.
+    /// For brokers without an ack model (the in-memory broker), this equals
+    /// `last_delivered_offset`.
+    pub last_acked_offset: Option<u64>,
 }

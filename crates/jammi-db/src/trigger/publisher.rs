@@ -6,9 +6,22 @@
 //! effort delivery accelerator). A broker fan-out failure after commit is
 //! recorded and the RPC still returns `Ok` — subscribers replay from the
 //! backing table on next reconnect.
-
+//!
+//! ## Transactional offset assignment
+//!
+//! The offset is assigned by ONE locking statement — an `UPDATE … RETURNING`
+//! against `topics.next_offset` — inside the SAME transaction that inserts
+//! the augmented batch (see [`Publisher::publish_scoped`]). This closes the
+//! multi-replica defect a per-process `AtomicU64` counter could not: two
+//! engine replicas publishing against the same Postgres database each read
+//! `MAX(_offset)` independently and could compute the SAME next offset,
+//! colliding on the backing table's `(_offset, _row_idx)` composite key (or,
+//! worse, partially colliding on a multi-row batch). `next_offset` makes the
+//! counter a durable, row-locked catalog value: the `UPDATE`'s row lock is
+//! held until commit, so **per topic, offset order == commit order** — the
+//! invariant every watermark-bounded replay (`_offset > watermark`) depends
+//! on for completeness (see `crate::trigger::subscriber`).
 use std::collections::HashMap;
-use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 
 use arrow::array::{ArrayRef, Int64Array, RecordBatch};
@@ -17,7 +30,7 @@ use chrono::Utc;
 use parking_lot::Mutex;
 use tokio::sync::Mutex as AsyncMutex;
 
-use crate::catalog::backend::{BackendImpl, TxOptions};
+use crate::catalog::backend::{BackendImpl, SqlValue, TxOptions};
 use crate::source::mutable::MutableTableRegistry;
 use crate::store::mutable::definition::MutableTableId;
 use crate::tenant::TenantId;
@@ -29,32 +42,18 @@ use crate::trigger::topic::{augment_schema_for_backing, TopicDefinition};
 
 /// Publishes batches to topics using the transactional-outbox pattern.
 ///
-/// Each topic owns one [`AtomicU64`] offset counter, lazily seeded from
-/// `MAX(_offset)` on the backing table the first time the topic is
-/// published. An [`AsyncMutex`] per topic serialises the counter-seed +
-/// insert critical section so concurrent publishes assign contiguous
-/// offsets without leaving gaps on rollback.
+/// Offset assignment lives in the catalog (`topics.next_offset`), not in
+/// process memory — see the module docs. An [`AsyncMutex`] per topic is
+/// RETAINED as the in-process fast-path arm: it serialises concurrent
+/// publishers on the SAME topic within one process so they don't all race
+/// into the same row-locked `UPDATE` simultaneously (harmless on Postgres,
+/// which simply serialises them at the row lock, but avoids piling up
+/// waiters against SQLite's single-writer `BEGIN IMMEDIATE` unnecessarily).
 pub struct Publisher {
     broker: Arc<dyn TriggerBroker>,
     backend: Arc<BackendImpl>,
     mutable: Arc<MutableTableRegistry>,
-    counters: Mutex<HashMap<TopicId, Arc<TopicCounter>>>,
-}
-
-struct TopicCounter {
-    /// Serialises the read-MAX + insert critical section.
-    write_lock: AsyncMutex<()>,
-    /// Next offset to assign. `u64::MAX` means "not yet seeded".
-    next: AtomicU64,
-}
-
-impl TopicCounter {
-    fn new() -> Self {
-        Self {
-            write_lock: AsyncMutex::new(()),
-            next: AtomicU64::new(u64::MAX),
-        }
-    }
+    write_locks: Mutex<HashMap<TopicId, Arc<AsyncMutex<()>>>>,
 }
 
 impl Publisher {
@@ -67,7 +66,7 @@ impl Publisher {
             broker,
             backend,
             mutable,
-            counters: Mutex::new(HashMap::new()),
+            write_locks: Mutex::new(HashMap::new()),
         }
     }
 
@@ -109,6 +108,15 @@ impl Publisher {
         tenant: Option<TenantId>,
         user_batch: RecordBatch,
     ) -> Result<Offset, TriggerError> {
+        // Offsets must be gap-free by construction: an empty batch would
+        // still mint and burn an offset for zero rows, which is pointless
+        // and (worse) makes "every offset has at least one row" stop being
+        // an invariant callers can rely on.
+        if user_batch.num_rows() == 0 {
+            return Err(TriggerError::BatchSchemaMismatch(
+                "publish_scoped rejects an empty batch".to_string(),
+            ));
+        }
         if user_batch.schema().as_ref() != topic.schema.as_ref() {
             return Err(TriggerError::BatchSchemaMismatch(format!(
                 "topic '{}' expected {} columns, got {}",
@@ -132,59 +140,85 @@ impl Publisher {
             }
         }
 
-        let counter = self.counter_for(topic.id);
-        let _guard = counter.write_lock.lock().await;
+        let write_lock = self.write_lock_for(topic.id);
+        let _guard = write_lock.lock().await;
 
         let backing_table_id = MutableTableId::new(topic.backing_table_name())
             .map_err(|e| TriggerError::Catalog(e.to_string()))?;
-
-        // Seed the offset counter on first use by reading MAX(_offset) from
-        // the backing table. Acquiring `write_lock` already serialises
-        // concurrent publishers on this topic, so a single fetch is enough.
-        if counter.next.load(Ordering::Acquire) == u64::MAX {
-            let next = self.read_next_offset(backing_table_id.as_str()).await?;
-            counter.next.store(next, Ordering::Release);
-        }
-
-        let offset_value = counter.next.load(Ordering::Acquire);
+        let topic_id_str = topic.id.to_string();
+        let backing_name = backing_table_id.as_str().to_string();
         let produced_at = Utc::now();
         let produced_at_micros = produced_at.timestamp_micros();
-        let augmented = augment_batch_for_backing(
-            &topic.schema,
-            &user_batch,
-            offset_value,
-            produced_at_micros,
-        )?;
+        let topic_schema = Arc::clone(&topic.schema);
 
         let registry = Arc::clone(&self.mutable);
         let id_for_closure = backing_table_id.clone();
-        let augmented_for_closure = augmented;
-        self.backend
+        let user_batch_for_tx = user_batch.clone();
+        // Seed-and-bump `topics.next_offset` with ONE locking statement, then
+        // insert the augmented batch, all inside the SAME transaction — the
+        // offset does not exist before the transaction opens (it is minted by
+        // the `UPDATE … RETURNING` itself), so `augment_batch_for_backing`
+        // moves inside the closure too. On Postgres the `UPDATE`'s row lock
+        // on this topic's `topics` row is what makes two concurrent
+        // publishers (in-process or cross-replica) serialize on THIS
+        // statement rather than racing an unlocked read-then-write window;
+        // on SQLite `BEGIN IMMEDIATE` already holds the single writer lock.
+        // Same statement text on both backends (sqlx runtime queries).
+        let assigned: Option<u64> = self
+            .backend
             .transaction(TxOptions::default(), move |tx| {
                 let registry = Arc::clone(&registry);
                 let id = id_for_closure.clone();
-                let augmented = augmented_for_closure.clone();
+                let topic_schema = Arc::clone(&topic_schema);
+                let user_batch = user_batch_for_tx.clone();
+                let topic_id_str = topic_id_str.clone();
+                let backing_name = backing_name.clone();
                 Box::pin(async move {
+                    tx.set_tenant(tenant);
+
+                    let sql = format!(
+                        "UPDATE topics SET next_offset = COALESCE(next_offset, \
+                         (SELECT COALESCE(MAX(\"_offset\"), -1) + 1 FROM \"{backing}\")) + 1 \
+                         WHERE topic_id = $1 RETURNING next_offset - 1 AS assigned",
+                        backing = backing_name.replace('"', "\"\"")
+                    );
+                    let assigned_rows: Option<i64> = tx
+                        .query_opt(&sql, &[SqlValue::TextOwned(topic_id_str)], |row| {
+                            row.get::<i64>("assigned")
+                        })
+                        .await?;
+                    // Zero rows means the topic row does not exist (never a
+                    // defaulted offset) — return `None` without inserting;
+                    // the empty transaction commits as a no-op.
+                    let Some(offset_value) = assigned_rows else {
+                        return Ok::<Option<u64>, crate::catalog::backend::BackendError>(None);
+                    };
+                    let offset_value = offset_value as u64;
+
+                    let augmented = augment_batch_for_backing(
+                        &topic_schema,
+                        &user_batch,
+                        offset_value,
+                        produced_at_micros,
+                    )
+                    .map_err(|e| crate::catalog::backend::BackendError::Execution(e.to_string()))?;
                     // Bind the publish-scoped tenant on the transaction so
                     // `MutableTableRegistry::insert_batch` stamps every row's
                     // `tenant_id` slot with `tenant` and its write-side
                     // `assert_tenant_matches` guard agrees.
-                    tx.set_tenant(tenant);
                     registry
                         .insert_batch(tx, &id, &augmented)
                         .await
                         .map_err(|e| {
                             crate::catalog::backend::BackendError::Execution(e.to_string())
                         })?;
-                    Ok::<(), crate::catalog::backend::BackendError>(())
+                    Ok(Some(offset_value))
                 })
             })
             .await?;
 
-        // Only advance the counter after the transaction commits — a rollback
-        // preserves the offset for the next attempt and avoids gaps in the
-        // backing table.
-        counter.next.store(offset_value + 1, Ordering::Release);
+        let offset_value =
+            assigned.ok_or_else(|| TriggerError::TopicNotFound(topic.id.to_string()))?;
 
         // Best-effort fan-out — a broker failure leaves the backing table as
         // the authoritative log and subscribers replay on reconnect.
@@ -206,44 +240,15 @@ impl Publisher {
         }
     }
 
-    fn counter_for(&self, topic_id: TopicId) -> Arc<TopicCounter> {
-        let mut guard = self.counters.lock();
+    /// The in-process fast-path arm — see the struct docs.
+    fn write_lock_for(&self, topic_id: TopicId) -> Arc<AsyncMutex<()>> {
+        let mut guard = self.write_locks.lock();
         if let Some(existing) = guard.get(&topic_id) {
             return Arc::clone(existing);
         }
-        let new = Arc::new(TopicCounter::new());
+        let new = Arc::new(AsyncMutex::new(()));
         guard.insert(topic_id, Arc::clone(&new));
         new
-    }
-
-    /// Read `COALESCE(MAX(_offset), -1) + 1` from the backing table; used to
-    /// seed the in-memory offset counter on first publish (or after a
-    /// process restart).
-    async fn read_next_offset(&self, backing_table: &str) -> Result<u64, TriggerError> {
-        let sql = format!(
-            "SELECT COALESCE(MAX(\"_offset\"), -1) + 1 AS next FROM \"{}\"",
-            backing_table.replace('"', "\"\"")
-        );
-        let result = self
-            .backend
-            .transaction(
-                TxOptions {
-                    read_only: true,
-                    ..Default::default()
-                },
-                move |tx| {
-                    let sql = sql.clone();
-                    Box::pin(async move {
-                        let rows: Vec<i64> =
-                            tx.query(&sql, &[], |row| row.get::<i64>("next")).await?;
-                        Ok::<i64, crate::catalog::backend::BackendError>(
-                            rows.into_iter().next().unwrap_or(0),
-                        )
-                    })
-                },
-            )
-            .await?;
-        Ok(result.max(0) as u64)
     }
 }
 

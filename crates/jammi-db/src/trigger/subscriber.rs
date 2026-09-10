@@ -3,34 +3,30 @@
 //! The publisher commits every batch to the topic's backing table inside one
 //! `CatalogBackend::transaction` and best-effort fans out to the broker. The
 //! subscriber stitches a contiguous stream by routing the historical prefix
-//! through `MutableTableRegistry::scan_after` and the live tail through the
-//! broker's `subscribe`.
+//! through `drain_replay` and the live portion through a shared
+//! `crate::trigger::tail::TopicTail` — one per `(topic, tenant)` per
+//! process, owned by [`Subscriber`]'s tail registry — rather than a private
+//! driver subscription per call to [`Subscriber::subscribe_scoped`].
 //!
 //! ## Keying the replay/live seam by engine `_offset`
 //!
-//! The engine `_offset` (a per-topic monotone counter seeded from
-//! `MAX(_offset)` on the backing table) is the *only* sequence the seam keys
-//! on. A broker's own native sequence (JetStream's stream sequence) is an
+//! The engine `_offset` (a per-topic monotone counter assigned transactionally
+//! by [`crate::trigger::Publisher`]) is the *only* sequence the seam keys on.
+//! A broker's own native sequence (JetStream's stream sequence) is an
 //! independent counter: after any post-commit fan-out failure — the
 //! best-effort path in [`crate::trigger::Publisher`] — the engine offset and
-//! the native sequence skew permanently. Handing an engine offset to a broker
-//! as if it were a native start-sequence would therefore start the live tail
-//! at the wrong position and drop (or duplicate) events at the seam, breaking
-//! the at-least-once guarantee exactly where the design must hold it.
+//! the native sequence skew permanently. The tail never hands an engine
+//! offset to a driver as if it were a native start-sequence; instead its own
+//! driver subscription is always `(Predicate::match_all(), from_offset =
+//! None)` (H3), and every gap or `Wake` self-heals through a replay of the
+//! backing table (`crate::trigger::tail`'s module docs).
 //!
-//! Instead the seam subscribes the live tail with **overlap** — the broker
-//! starts at or before `from_offset` (see
-//! [`crate::trigger::broker::TriggerBroker::subscribe`]) — and the subscriber
-//! **dedups by engine `_offset`**: it yields the whole replay prefix, then for
-//! each live event yields it only when its `_offset` is strictly greater than
-//! the highest offset already yielded. The net contract:
-//!
-//! * replay covers `[from_offset ..= last_replayed]`;
-//! * the live tail overlaps that window and continues past it;
-//! * no engine `_offset >= from_offset` is ever skipped (at-least-once +
-//!   replay-completeness);
-//! * duplicates occur only at the seam (acceptable under at-least-once;
-//!   downstream dedups by the `(_offset, _row_idx)` composite key).
+//! `subscribe_scoped` yields the replay prefix (covering `[from_offset ..=
+//! last_replayed]`), then attaches to the tail's broadcast and yields live
+//! events, deduping by engine `_offset` (only advancing past what replay
+//! already covered) so the replay/live overlap never re-delivers what this
+//! subscriber has already seen. Predicate filtering happens here, in-process,
+//! per subscriber (H3) — the tail itself is predicate-blind.
 
 use std::sync::Arc;
 
@@ -39,6 +35,7 @@ use arrow_schema::SchemaRef;
 use async_stream::try_stream;
 use chrono::DateTime;
 use futures::StreamExt;
+use tokio::sync::broadcast;
 
 use crate::catalog::backend::TxOptions;
 use crate::source::mutable::MutableTableRegistry;
@@ -49,17 +46,26 @@ use crate::trigger::error::TriggerError;
 use crate::trigger::ids::SubscriptionId;
 use crate::trigger::offset::Offset;
 use crate::trigger::predicate::Predicate;
-use crate::trigger::subscription::{DeliveredBatch, LiveEvent, Subscription};
+use crate::trigger::subscription::{DeliveredBatch, Subscription};
+use crate::trigger::tail::TailRegistry;
 use crate::trigger::topic::{TopicDefinition, OFFSET_COLUMN, PRODUCED_AT_COLUMN, ROW_INDEX_COLUMN};
 
 pub struct Subscriber {
     broker: Arc<dyn TriggerBroker>,
     mutable: Arc<MutableTableRegistry>,
+    /// One live tail per `(topic, tenant)` this process has ever served a
+    /// subscriber for (PLAN-F H1/H6/K1) — see `crate::trigger::tail`.
+    tails: TailRegistry,
 }
 
 impl Subscriber {
     pub fn new(broker: Arc<dyn TriggerBroker>, mutable: Arc<MutableTableRegistry>) -> Self {
-        Self { broker, mutable }
+        let pool_size = mutable.backend_arc().catalog_backend().pool_size();
+        Self {
+            broker,
+            mutable,
+            tails: TailRegistry::new(pool_size),
+        }
     }
 
     /// Open a subscription that yields every batch matching `predicate` for
@@ -151,77 +157,71 @@ impl Subscriber {
             None
         };
 
-        // The live tail subscribes at `from_offset` — the *same* engine
-        // `_offset` lower bound the replay used — so it OVERLAPS the replayed
-        // prefix rather than trying to resume strictly above it. Per the
-        // broker contract this is interpreted in engine-offset space, never
-        // as a driver-native start-sequence, so a broker whose native
-        // sequence has skewed from the engine offset cannot land the live tail
-        // at the wrong position. The dedup below discards the overlap.
-        let mut live = self
-            .broker
-            .subscribe(topic.id, predicate.clone(), from_offset)
+        // G3: attach to the tail's broadcast BEFORE reading any watermark —
+        // rows fanned out before this attach have offset <= the watermark
+        // (read just above) and are suppressed by dedup below; rows
+        // committing after the attach are fanned out after it, so nothing
+        // is missed. `_tail_guard` keeps the tail's `Arc` (and therefore its
+        // task and driver subscription) alive for exactly as long as this
+        // subscription is polled (H6).
+        let (tail_guard, mut rx) = self
+            .tails
+            .attach_or_create(&self.broker, &self.mutable, topic, tenant)
             .await?;
 
         let mutable = Arc::clone(&self.mutable);
         let topic_owned = topic.clone();
 
         let stream = try_stream! {
+            let _tail_guard = tail_guard;
             // Highest engine `_offset` already yielded. Seeded with the
             // replay high-water mark (or, for a live-only subscribe, the
             // watermark read above) so live events inside the overlap window
-            // — or a `Wake`-triggered replay — never re-deliver what this
-            // subscriber has already seen or was never asked for.
+            // — or this subscriber's own lag replay — never re-deliver what
+            // it has already seen or was never asked for.
             let mut last_yielded = last_replayed.or(watermark);
             for delivered in replay_delivered {
                 yield delivered;
             }
-            while let Some(item) = live.next().await {
-                match item? {
-                    LiveEvent::Batch(delivered) => {
-                        // Tenant filter on the live tail: a globally-registered
-                        // topic shares one `topic.id` across every tenant, so
-                        // the broker's `subscribe` (tenant-blind by contract)
-                        // delivers every tenant's events indiscriminately.
-                        // Yield only what this subscriber is scoped to see —
-                        // its own tenant's events plus globally-scoped ones
-                        // (`delivered.tenant.is_none()`) — mirroring the
-                        // replay's `tenant_id = $current OR tenant_id IS
-                        // NULL` predicate.
-                        if delivered.tenant != tenant && delivered.tenant.is_some() {
-                            continue;
-                        }
-                        // Dedup the replay/live overlap by engine `_offset`:
-                        // only advance past what replay already covered.
-                        // Equality is a duplicate from the seam overlap;
-                        // anything lower is a stale over-delivery from a
-                        // broker that could not translate the engine offset
-                        // into its own sequence.
+            loop {
+                match rx.recv().await {
+                    Ok(delivered) => {
+                        // The tail is keyed on `(topic, tenant)` and already
+                        // scopes its fan-out to exactly this tenant (H1) —
+                        // no further tenant filter needed here. Dedup by
+                        // engine `_offset` ALWAYS advances on a higher
+                        // offset, independent of the predicate: the tail's
+                        // own driver subscription is `Predicate::match_all`
+                        // (H3), so predicate filtering is this subscriber's
+                        // job, applied in-process, and must not be confused
+                        // with the dedup cursor (a row this predicate
+                        // rejects has still been "seen").
                         if last_yielded.is_none_or(|seen| delivered.offset.value() > seen) {
                             last_yielded = Some(delivered.offset.value());
-                            yield delivered;
+                            if let Some(filtered) = predicate.evaluate(&delivered.batch)? {
+                                yield DeliveredBatch { batch: filtered, ..delivered };
+                            }
                         }
                     }
-                    LiveEvent::Wake => {
-                        // Self-heal: the driver told us the backing table
-                        // MAY have advanced (a lagged in-process receiver, a
-                        // reconnect, or simply "check"). Replay everything
-                        // strictly after the last offset this subscriber has
-                        // seen, through the same tenant/predicate-scoped
-                        // query the initial replay used.
-                        let from = Some(Offset::new(
-                            last_yielded.map(|o| o + 1).unwrap_or(0),
-                            chrono::Utc::now(),
-                        ));
-                        let more = drain_replay(&mutable, &topic_owned, tenant, &predicate, from)
+                    Err(broadcast::error::RecvError::Lagged(_n)) => {
+                        // G4/K2: this subscriber's OWN chunked, group-
+                        // completing replay from its own `last_yielded` —
+                        // never `drain_replay`'s whole-suffix materialisation
+                        // and never the tail's shared cursor (a lag here is
+                        // this receiver's own backlog, not the tail's).
+                        let from = last_yielded.map(|o| o as i64).unwrap_or(-1);
+                        let more = crate::trigger::tail::lag_replay(&mutable, &topic_owned, tenant, from)
                             .await?;
                         for delivered in more {
                             if last_yielded.is_none_or(|seen| delivered.offset.value() > seen) {
                                 last_yielded = Some(delivered.offset.value());
-                                yield delivered;
+                                if let Some(filtered) = predicate.evaluate(&delivered.batch)? {
+                                    yield DeliveredBatch { batch: filtered, ..delivered };
+                                }
                             }
                         }
                     }
+                    Err(broadcast::error::RecvError::Closed) => break,
                 }
             }
         };
@@ -269,10 +269,11 @@ impl Subscriber {
     /// happens inside the underlying scan.
     ///
     /// Delegates to the free [`drain_replay`] function, which takes the
-    /// [`MutableTableRegistry`] handle by `Arc` reference rather than `&self`
-    /// so [`Self::subscribe_scoped`] can call it again from inside its
-    /// `'static` live-tail stream body (on a [`crate::trigger::LiveEvent::Wake`])
-    /// without borrowing `self`.
+    /// [`MutableTableRegistry`] handle by `Arc` reference rather than `&self`,
+    /// matching the shape [`Self::subscribe_scoped`]'s `'static` live-tail
+    /// stream body needs for its own calls into the backing table (a
+    /// subscriber's lag replay, `crate::trigger::tail::lag_replay`) without
+    /// borrowing `self`.
     async fn drain_replay(
         &self,
         topic: &TopicDefinition,
@@ -317,9 +318,14 @@ async fn current_watermark(
 }
 
 /// Free-function form of [`Subscriber::drain_replay`] — see its docs. Exists
-/// so [`Subscriber::subscribe_scoped`]'s live-tail stream body can replay
-/// again on a [`crate::trigger::LiveEvent::Wake`] without holding a `&self`
-/// borrow across the `'static` stream.
+/// so [`Subscriber::subscribe_scoped`]'s `'static` live-tail stream body can
+/// call it for the initial replay prefix without holding a `&self` borrow
+/// across the stream. The live portion no longer calls back into this
+/// function on a lag/gap/wake — that self-healing replay is
+/// `crate::trigger::tail`'s job (the tail's own driver-triggered replay, or
+/// a subscriber's own `crate::trigger::tail::lag_replay`), both of which
+/// reuse `MutableTableRegistry::tail_replay`'s chunked, group-completing
+/// query instead of this function's whole-suffix materialisation.
 async fn drain_replay(
     mutable: &Arc<MutableTableRegistry>,
     topic: &TopicDefinition,
@@ -371,15 +377,20 @@ async fn drain_replay(
 }
 
 /// One reassembled publish from the backing-table replay path.
-struct ReplayEvent {
-    offset: Offset,
-    produced_at: chrono::DateTime<chrono::Utc>,
-    batch: RecordBatch,
+pub(crate) struct ReplayEvent {
+    pub(crate) offset: Offset,
+    pub(crate) produced_at: chrono::DateTime<chrono::Utc>,
+    pub(crate) batch: RecordBatch,
 }
 
 /// Walk the scan_after results — already in ascending `_offset` order — and
 /// reassemble each publish into one `RecordBatch` matching the topic schema.
-fn group_replay_batches(
+///
+/// `pub(crate)`: also used by [`crate::trigger::tail::TopicTail`]'s chunked
+/// replay, which reassembles rows fetched via
+/// [`crate::source::mutable::MutableTableRegistry::tail_replay`] the same
+/// way this subscribe-time replay does.
+pub(crate) fn group_replay_batches(
     batches: &[RecordBatch],
     user_schema: &SchemaRef,
 ) -> Result<Vec<ReplayEvent>, TriggerError> {

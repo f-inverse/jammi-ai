@@ -89,6 +89,12 @@ pub trait CatalogBackend: Send + Sync {
 
     /// Backend identity for telemetry and dialect-conditional code paths.
     fn backend_kind(&self) -> BackendKind;
+
+    /// The connection pool's `max_connections`. Used to size the concurrent
+    /// tail-replay semaphore (`crate::trigger::tail`, K1) so tail replays can
+    /// never starve publishers of pool connections on either backend
+    /// (SQLite's pool is a hardcoded 8, see `backend_sqlite.rs`'s `open`).
+    fn pool_size(&self) -> u32;
 }
 
 /// Dynamic-dispatch wrapper over the concrete backend implementations. Used
@@ -177,6 +183,14 @@ impl BackendImpl {
         match self {
             BackendImpl::Sqlite(b) => b.backend_kind(),
             BackendImpl::Postgres(b) => b.backend_kind(),
+        }
+    }
+
+    /// Dispatch [`CatalogBackend::pool_size`] to the inner backend.
+    pub fn pool_size(&self) -> u32 {
+        match self {
+            BackendImpl::Sqlite(b) => b.pool_size(),
+            BackendImpl::Postgres(b) => b.pool_size(),
         }
     }
 }

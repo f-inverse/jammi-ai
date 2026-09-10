@@ -289,6 +289,74 @@ impl MutableTableRegistry {
         };
         Ok(Box::pin(futures::stream::iter(batches.into_iter().map(Ok))))
     }
+
+    /// Resolve `table`'s definition scoped to `tenant`, without opening any
+    /// transaction. Used by the trigger-stream `TopicTail` actor to cache a
+    /// topic's backing-table definition ONCE, before its replay transaction
+    /// opens (PLAN-F K3: a tail must never hold two connections at once).
+    pub async fn definition_for_tenant(
+        &self,
+        table: &MutableTableId,
+        tenant: Option<TenantId>,
+    ) -> Result<MutableTableDefinition, MutableTableError> {
+        self.catalog
+            .get_mutable_table_for_tenant(table, tenant)
+            .await?
+            .ok_or_else(|| MutableTableError::NotFound(table.clone()))
+    }
+
+    /// One tail-replay round (PLAN-F H2/I2/J1/K1/K3): read the tenant-blind
+    /// head `MAX(order_col)` FIRST, then chunk-fetch tenant-scoped rows in
+    /// `order_col > cursor_before AND order_col <= head` order, in
+    /// `chunk_size`-row groups that never split an `order_col` group across
+    /// chunks — all inside ONE read-only transaction. Returns the matching
+    /// rows (already reassembled into whole-group batches) and the new head;
+    /// the caller advances its cursor to the returned head only once every
+    /// row through it has been fetched (a full drain).
+    ///
+    /// `def` and `order_col` are resolved by the caller ONCE via
+    /// [`Self::definition_for_tenant`], before this call, so a tail never
+    /// holds two connections.
+    pub(crate) async fn tail_replay(
+        &self,
+        def: &MutableTableDefinition,
+        order_col: &str,
+        tenant: Option<TenantId>,
+        cursor_before: i64,
+        chunk_size: usize,
+    ) -> Result<(Vec<RecordBatch>, i64), MutableTableError> {
+        let backend = Arc::clone(&self.backend);
+        let def = def.clone();
+        let order_col = order_col.to_string();
+        self.backend
+            .catalog_backend()
+            .transaction(
+                TxOptions {
+                    read_only: true,
+                    ..Default::default()
+                },
+                move |tx| {
+                    let backend = Arc::clone(&backend);
+                    let def = def.clone();
+                    let order_col = order_col.clone();
+                    Box::pin(async move {
+                        tail_replay_in_tx(
+                            tx,
+                            backend.as_ref(),
+                            &def,
+                            &order_col,
+                            tenant,
+                            cursor_before,
+                            chunk_size,
+                        )
+                        .await
+                        .map_err(map_mutable_err)
+                    })
+                },
+            )
+            .await
+            .map_err(MutableTableError::Backend)
+    }
 }
 
 /// Provision a mutable table inside an already-open transaction: write the
@@ -443,4 +511,225 @@ async fn fetch_scan_after_batch(
 
     RecordBatch::try_new(Arc::clone(&def.schema), arrays)
         .map_err(|e| MutableTableError::Backend(BackendError::Execution(e.to_string())))
+}
+
+/// Render `(tenant_id = '$t' OR tenant_id IS NULL)` for a tenant-scoped
+/// caller, or `tenant_id IS NULL` for a globally-scoped one — the same shape
+/// [`fetch_scan_after_batch`] inlines, factored out so
+/// [`tail_replay_in_tx`] shares it.
+fn tenant_predicate_clause(tenant: Option<TenantId>) -> String {
+    match tenant {
+        Some(t) => format!("(\"tenant_id\" = '{t}' OR \"tenant_id\" IS NULL)"),
+        None => "\"tenant_id\" IS NULL".to_string(),
+    }
+}
+
+/// Transpose a `Vec` of row-major decoded values into column-major order.
+fn transpose_rows(
+    rows: Vec<Vec<crate::store::mutable::provider::DecodedValue>>,
+    n_cols: usize,
+) -> Vec<Vec<crate::store::mutable::provider::DecodedValue>> {
+    let mut transposed: Vec<Vec<crate::store::mutable::provider::DecodedValue>> = (0..n_cols)
+        .map(|_| Vec::with_capacity(rows.len()))
+        .collect();
+    for r in rows {
+        for (i, v) in r.into_iter().enumerate() {
+            transposed[i].push(v);
+        }
+    }
+    transposed
+}
+
+/// Read the `order_col` value out of one decoded row (row-major, as returned
+/// by `decode_row`) as an `i64`. Topic backing tables always declare
+/// `_offset`/`_row_idx` as `Int64` (`augment_schema_for_backing`), so the
+/// decode arm is `Int64` in practice; the narrower integer arms are accepted
+/// too so this helper stays correct if it is ever pointed at a differently
+/// typed order column.
+fn order_value_of(
+    row: &[crate::store::mutable::provider::DecodedValue],
+    columns: &[(String, arrow_schema::DataType)],
+    order_col: &str,
+) -> Result<i64, MutableTableError> {
+    use crate::store::mutable::provider::DecodedValue;
+    let idx = columns
+        .iter()
+        .position(|(name, _)| name == order_col)
+        .ok_or_else(|| {
+            MutableTableError::Backend(BackendError::Execution(format!(
+                "tail replay: order column '{order_col}' missing from column list"
+            )))
+        })?;
+    match &row[idx] {
+        DecodedValue::Int64(v) => Ok(*v),
+        DecodedValue::Int32(v) => Ok(*v as i64),
+        DecodedValue::Int16(v) => Ok(*v as i64),
+        other => Err(MutableTableError::Backend(BackendError::Execution(
+            format!(
+                "tail replay: order column '{order_col}' decoded as non-integer value {other:?}"
+            ),
+        ))),
+    }
+}
+
+/// The body of [`MutableTableRegistry::tail_replay`] — see its docs. A free
+/// function (rather than a method) so it can run entirely inside the
+/// `catalog_backend().transaction` closure without borrowing `&self` across
+/// the closure's `'tx` lifetime.
+async fn tail_replay_in_tx(
+    tx: &mut Transaction<'_>,
+    backend: &dyn MutableBackend,
+    def: &MutableTableDefinition,
+    order_col: &str,
+    tenant: Option<TenantId>,
+    cursor_before: i64,
+    chunk_size: usize,
+) -> Result<(Vec<RecordBatch>, i64), MutableTableError> {
+    use crate::store::mutable::provider::{build_arrays, decode_row};
+    use arrow_schema::DataType;
+
+    // Head FIRST (I2/J1), tenant-blind: everything committed at or below
+    // this value is visible to every replica under READ COMMITTED (G6 — the
+    // offset-assigning UPDATE holds its row lock until commit), so bounding
+    // the chunk loop by it is non-lossy; anything committing after this read
+    // is handled by the next `Wake`/`Batch`.
+    let head_sql = format!(
+        "SELECT MAX(\"{}\") AS m FROM \"{}\"",
+        order_col.replace('"', "\"\""),
+        def.id.as_str().replace('"', "\"\"")
+    );
+    let head: Option<i64> = tx
+        .query(&head_sql, &[], |row| row.try_get::<i64>("m"))
+        .await?
+        .into_iter()
+        .next()
+        .flatten();
+    let Some(head) = head else {
+        // Table has no rows at all yet.
+        return Ok((Vec::new(), cursor_before));
+    };
+    if head <= cursor_before {
+        // Nothing committed above the cursor (a driver `Wake` that raced an
+        // already-observed commit, or a regression — never negative work).
+        return Ok((Vec::new(), cursor_before));
+    }
+
+    let col_names: Vec<&str> = def
+        .schema
+        .fields()
+        .iter()
+        .map(|f| f.name().as_str())
+        .collect();
+    let columns: Vec<(String, DataType)> = def
+        .schema
+        .fields()
+        .iter()
+        .map(|f| (f.name().clone(), f.data_type().clone()))
+        .collect();
+    let tiebreak_cols: Vec<&String> = def
+        .primary_key
+        .iter()
+        .filter(|c| c.as_str() != order_col)
+        .collect();
+    let mut order_by = format!("\"{}\" ASC", order_col.replace('"', "\"\""));
+    for c in &tiebreak_cols {
+        order_by.push_str(&format!(", \"{}\" ASC", c.replace('"', "\"\"")));
+    }
+    let tenant_pred = tenant_predicate_clause(tenant);
+
+    let mut batches: Vec<RecordBatch> = Vec::new();
+    let mut read_from = cursor_before;
+    while read_from < head {
+        let predicate = format!(
+            "\"{oc}\" > {from} AND \"{oc}\" <= {head} AND {tp}",
+            oc = order_col.replace('"', "\"\""),
+            from = read_from,
+            tp = tenant_pred,
+        );
+        let base_sql = backend.scan_dml(def, &col_names, Some(predicate.as_str()), None);
+        // `scan_dml`'s own `limit` param renders LIMIT immediately after the
+        // WHERE clause, before any ORDER BY this call appends — so the probe
+        // limit is appended by hand, after ORDER BY, rather than threaded
+        // through `scan_dml`.
+        let sql = format!("{base_sql} ORDER BY {order_by} LIMIT {}", chunk_size + 1);
+        let raw = tx.query(&sql, &[], |row| decode_row(row, &columns)).await?;
+        if raw.is_empty() {
+            break;
+        }
+        let got = raw.len();
+        if got <= chunk_size {
+            // Bounded by `head`, so this is provably the last chunk: every
+            // row up to `head` is present, whole groups included.
+            let arrays = build_arrays(&columns, transpose_rows(raw, columns.len()))
+                .map_err(|e| MutableTableError::Backend(BackendError::Execution(e.to_string())))?;
+            let batch = RecordBatch::try_new(Arc::clone(&def.schema), arrays)
+                .map_err(|e| MutableTableError::Backend(BackendError::Execution(e.to_string())))?;
+            batches.push(batch);
+            break;
+        }
+        // `got == chunk_size + 1`: the last row is a probe. If it shares
+        // `order_col` with the row we intend to keep as the tail of this
+        // chunk, that group spans the chunk boundary (H2) — fetch the WHOLE
+        // group by exact match instead of taking a truncated slice, WITHOUT
+        // discarding the earlier, already-complete groups this same fetch
+        // returned (every row with a smaller `order_col` value sorts before
+        // every row of the boundary group, so if this fetch reached the
+        // boundary group at all, every row of every smaller group is
+        // already present here).
+        let last_kept = order_value_of(&raw[chunk_size - 1], &columns, order_col)?;
+        let probe = order_value_of(&raw[chunk_size], &columns, order_col)?;
+        if probe == last_kept {
+            let mut raw = raw;
+            let mut boundary_start = chunk_size - 1;
+            while boundary_start > 0
+                && order_value_of(&raw[boundary_start - 1], &columns, order_col)? == last_kept
+            {
+                boundary_start -= 1;
+            }
+            // Keep only the prior, definitely-complete groups; the boundary
+            // group itself (and the discarded probe row) is re-fetched whole
+            // below rather than trusted from this LIMIT-bounded slice.
+            raw.truncate(boundary_start);
+            if !raw.is_empty() {
+                let arrays =
+                    build_arrays(&columns, transpose_rows(raw, columns.len())).map_err(|e| {
+                        MutableTableError::Backend(BackendError::Execution(e.to_string()))
+                    })?;
+                let batch = RecordBatch::try_new(Arc::clone(&def.schema), arrays).map_err(|e| {
+                    MutableTableError::Backend(BackendError::Execution(e.to_string()))
+                })?;
+                batches.push(batch);
+            }
+
+            let exact_predicate = format!(
+                "\"{oc}\" = {v} AND {tp}",
+                oc = order_col.replace('"', "\"\""),
+                v = last_kept,
+                tp = tenant_pred,
+            );
+            let exact_sql = format!(
+                "{} ORDER BY {}",
+                backend.scan_dml(def, &col_names, Some(exact_predicate.as_str()), None),
+                order_by
+            );
+            let exact_raw = tx
+                .query(&exact_sql, &[], |row| decode_row(row, &columns))
+                .await?;
+            let arrays = build_arrays(&columns, transpose_rows(exact_raw, columns.len()))
+                .map_err(|e| MutableTableError::Backend(BackendError::Execution(e.to_string())))?;
+            let batch = RecordBatch::try_new(Arc::clone(&def.schema), arrays)
+                .map_err(|e| MutableTableError::Backend(BackendError::Execution(e.to_string())))?;
+            batches.push(batch);
+            read_from = last_kept;
+            continue;
+        }
+        let kept: Vec<_> = raw.into_iter().take(chunk_size).collect();
+        let arrays = build_arrays(&columns, transpose_rows(kept, columns.len()))
+            .map_err(|e| MutableTableError::Backend(BackendError::Execution(e.to_string())))?;
+        let batch = RecordBatch::try_new(Arc::clone(&def.schema), arrays)
+            .map_err(|e| MutableTableError::Backend(BackendError::Execution(e.to_string())))?;
+        batches.push(batch);
+        read_from = last_kept;
+    }
+    Ok((batches, head))
 }

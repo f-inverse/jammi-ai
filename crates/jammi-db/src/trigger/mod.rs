@@ -15,6 +15,7 @@ pub mod predicate;
 pub mod publisher;
 pub mod subscriber;
 pub mod subscription;
+pub(crate) mod tail;
 pub mod topic;
 
 pub use broker::{BrokerKind, TriggerBroker};

@@ -1,0 +1,463 @@
+//! Per-`(topic, tenant)` live-tail actor.
+//!
+//! `Subscriber` owns one `TopicTail` per `(topic, tenant)` pair it has ever
+//! served a subscriber for. A tail holds the single driver-level
+//! [`crate::trigger::subscription::LiveStream`] subscription for that scope
+//! and fans out a tenant-blind [`DeliveredBatch`] stream to every subscriber
+//! of that `(topic, tenant)` through a `tokio::sync::broadcast` channel —
+//! `N` subscribers of the same topic/tenant cost ONE driver subscription and
+//! ONE replay per wake, not `N`.
+//!
+//! ## Contiguity-checked fan-out (PLAN-F I1/I2/J1-J5)
+//!
+//! The tail keeps a cursor: the last **engine `_offset`** it has delivered or
+//! replayed, in *global* offset space (tenant-blind — J2). A driver
+//! [`LiveEvent::Batch`] is fanned out directly ONLY when its offset equals
+//! `cursor + 1` (then the cursor advances by one); a gap (`offset` more than
+//! one past `cursor`) or regression (`offset` at or below `cursor`) drops the
+//! batch instead, and for a gap, triggers a replay from the cursor. A
+//! [`LiveEvent::Wake`] always replays. Post-commit fan-out across
+//! replicas/drivers is unordered, so this contiguity check — not the
+//! driver's own delivery order — is what makes "multi-replica publish is
+//! correct" true for every driver.
+//!
+//! One task owns the cursor and processes driver events and replays
+//! SERIALLY (J5): a `Batch` arriving mid-replay simply waits in the driver's
+//! own broadcast (overflow there self-heals via `Lagged` → `Wake` →
+//! replay). The cursor can therefore never regress.
+//!
+//! ## Replay (PLAN-F H2/I2/J1/K1-K3)
+//!
+//! A replay opens ONE read-only transaction, reads the tenant-blind head
+//! `MAX(_offset)` = `H` FIRST, then chunk-fetches tenant-scoped rows
+//! `_offset > cursor AND _offset <= H` in groups that never split an
+//! `_offset` publish across chunks, and on a full drain advances the cursor
+//! to `H` (see [`crate::source::mutable::MutableTableRegistry::tail_replay`]
+//! for the SQL). Concurrent tail replays across the process are bounded by a
+//! semaphore (K1) so they can never starve publishers of pool connections.
+//!
+//! ## Tenant scope (PLAN-F H1)
+//!
+//! A tail is keyed on `(topic_id, tenant)`, not on topic alone: there is no
+//! all-tenants replay query (`scan_after_for_tenant(tenant = None)` renders
+//! `tenant_id IS NULL`, i.e. *global rows only*), so each tail's OWN replay
+//! is scoped to its own tenant (tenant rows + global rows) — exactly
+//! `Subscriber::subscribe_scoped`'s existing semantics, now shared across
+//! every subscriber of that tenant instead of computed per subscriber. A
+//! `tenant = None` tail serves globally-scoped subscribers. The driver
+//! subscription underneath every tail is identical —
+//! `(Predicate::match_all(), from_offset = None)` — and tenant-blind (H3);
+//! the tenant filter is applied when a `Batch` is fanned out directly, and
+//! is baked into the SQL for a replay.
+
+use std::collections::HashMap;
+use std::sync::{Arc, Weak};
+
+use arrow_schema::SchemaRef;
+use futures::StreamExt;
+use tokio::sync::{broadcast, Mutex as AsyncMutex, Semaphore};
+use tokio::task::JoinHandle;
+
+use crate::source::mutable::MutableTableRegistry;
+use crate::store::mutable::definition::MutableTableDefinition;
+use crate::store::mutable::MutableTableError;
+use crate::tenant::TenantId;
+use crate::trigger::broker::TriggerBroker;
+use crate::trigger::error::TriggerError;
+use crate::trigger::ids::TopicId;
+use crate::trigger::predicate::Predicate;
+use crate::trigger::subscriber::group_replay_batches;
+use crate::trigger::subscription::{DeliveredBatch, LiveEvent};
+use crate::trigger::topic::TopicDefinition;
+
+/// Broadcast capacity for a tail's fan-out channel. A subscriber that lags
+/// behind this self-heals via its OWN chunked replay from its last-yielded
+/// offset (G4/K2) rather than erroring, so this only needs to absorb short
+/// bursts between a subscriber's `poll_next` calls.
+const TAIL_BROADCAST_CAPACITY: usize = 256;
+
+/// Rows fetched per replay chunk before a group-completion probe (H2). Kept
+/// small enough that one tail replay never holds its pool connection for an
+/// unbounded time under a very wide backlog.
+pub(crate) const REPLAY_CHUNK_SIZE: usize = 500;
+
+/// One `(topic, tenant)` live tail. See the module docs.
+pub(crate) struct TopicTail {
+    sender: broadcast::Sender<DeliveredBatch>,
+    task: JoinHandle<()>,
+}
+
+impl TopicTail {
+    /// Subscribe to this tail's fan-out. Callers attach BEFORE reading any
+    /// watermark (G3) so nothing committed after the attach is missed.
+    pub(crate) fn attach(&self) -> broadcast::Receiver<DeliveredBatch> {
+        self.sender.subscribe()
+    }
+}
+
+impl Drop for TopicTail {
+    fn drop(&mut self) {
+        // H6: dropping the tail only aborts its task (which owns the driver
+        // `LiveStream` and releases it). It never removes the registry's key
+        // — a successor tail may already occupy it by the time this runs;
+        // stale `Weak`s are pruned on the registry's next insert (I4).
+        self.task.abort();
+    }
+}
+
+/// Key a tail is registered under: the topic and the tenant scope its own
+/// replay query is bound to (`None` = the globally-scoped tail — H1).
+type TailKey = (TopicId, Option<TenantId>);
+
+/// Registry of live tails keyed by `(topic_id, tenant)`, owned by
+/// [`crate::trigger::Subscriber`].
+pub(crate) struct TailRegistry {
+    tails: AsyncMutex<HashMap<TailKey, Weak<TopicTail>>>,
+    /// Bounds concurrent tail replays (K1) so they can never starve
+    /// publishers of pool connections on either backend.
+    replay_permits: Arc<Semaphore>,
+}
+
+impl TailRegistry {
+    /// `pool_size` is the catalog backend's `max_connections`; the replay
+    /// semaphore is sized `pool_size - 2` (min 1) per K1, leaving headroom
+    /// for the write path's own connection use.
+    pub(crate) fn new(pool_size: u32) -> Self {
+        let permits = pool_size.saturating_sub(2).max(1) as usize;
+        Self {
+            tails: AsyncMutex::new(HashMap::new()),
+            replay_permits: Arc::new(Semaphore::new(permits)),
+        }
+    }
+
+    /// Get or create the tail for `(topic.id, tenant)` and attach to it,
+    /// returning the strong handle (kept alive by the caller for the
+    /// lifetime of its subscription) and a fresh broadcast receiver.
+    ///
+    /// The whole upgrade-or-create-and-attach sequence runs under ONE lock
+    /// acquisition (G4/H6: "atomic against teardown") — a concurrent
+    /// `TopicTail::drop` running its `Drop` impl cannot race a fresh
+    /// `attach()` into observing a half-torn-down tail, because the
+    /// registry's `Weak` entry is only replaced here, under this same lock.
+    pub(crate) async fn attach_or_create(
+        &self,
+        broker: &Arc<dyn TriggerBroker>,
+        mutable: &Arc<MutableTableRegistry>,
+        topic: &TopicDefinition,
+        tenant: Option<TenantId>,
+    ) -> Result<(Arc<TopicTail>, broadcast::Receiver<DeliveredBatch>), TriggerError> {
+        let key = (topic.id, tenant);
+        let mut tails = self.tails.lock().await;
+        // I4: prune stale `Weak`s (their `TopicTail` already dropped) on
+        // every insert path, not just this key, so the map does not grow
+        // without bound across the lifetime of a long-lived process.
+        tails.retain(|_, w| w.strong_count() > 0);
+        if let Some(existing) = tails.get(&key).and_then(Weak::upgrade) {
+            let rx = existing.attach();
+            return Ok((existing, rx));
+        }
+        let created = spawn_tail(
+            broker,
+            mutable,
+            topic,
+            tenant,
+            Arc::clone(&self.replay_permits),
+        )
+        .await?;
+        let rx = created.attach();
+        tails.insert(key, Arc::downgrade(&created));
+        Ok((created, rx))
+    }
+}
+
+/// Build a fresh [`TopicTail`]: register its driver-level subscription
+/// FIRST (H3: `(Predicate::match_all(), from_offset = None)`, tenant-blind),
+/// resolve the backing-table definition ONCE (K3), read the tenant-blind
+/// initial cursor (J3 — never `0`, or the first `Wake` would replay the
+/// entire history), then spawn the task that owns the cursor for the rest
+/// of the tail's life.
+async fn spawn_tail(
+    broker: &Arc<dyn TriggerBroker>,
+    mutable: &Arc<MutableTableRegistry>,
+    topic: &TopicDefinition,
+    tenant: Option<TenantId>,
+    replay_permits: Arc<Semaphore>,
+) -> Result<Arc<TopicTail>, TriggerError> {
+    let driver = broker
+        .subscribe(topic.id, Predicate::match_all(), None)
+        .await?;
+
+    let backing_id =
+        crate::store::mutable::definition::MutableTableId::new(topic.backing_table_name())
+            .map_err(|e| TriggerError::Catalog(e.to_string()))?;
+    let def = mutable.definition_for_tenant(&backing_id, tenant).await?;
+    let order_col = def.order_column.clone().ok_or_else(|| {
+        TriggerError::Catalog(format!(
+            "topic '{}' backing table has no order_column",
+            topic.name
+        ))
+    })?;
+
+    let initial_cursor = read_tenant_blind_head(mutable, &def, &order_col)
+        .await?
+        .unwrap_or(-1);
+
+    let (sender, _initial_rx) = broadcast::channel(TAIL_BROADCAST_CAPACITY);
+    let sender_for_task = sender.clone();
+    let mutable_for_task = Arc::clone(mutable);
+    let user_schema = Arc::clone(&topic.schema);
+
+    let task = tokio::spawn(run_tail_loop(
+        driver,
+        sender_for_task,
+        mutable_for_task,
+        def,
+        order_col,
+        tenant,
+        user_schema,
+        initial_cursor,
+        replay_permits,
+    ));
+
+    Ok(Arc::new(TopicTail { sender, task }))
+}
+
+/// Read the tenant-blind `MAX(order_col)` on `def`'s backing table, or
+/// `None` if it has no rows yet. Runs its own tiny transaction — this is a
+/// one-shot call at tail creation, not part of the per-wake replay loop.
+async fn read_tenant_blind_head(
+    mutable: &Arc<MutableTableRegistry>,
+    def: &MutableTableDefinition,
+    order_col: &str,
+) -> Result<Option<i64>, TriggerError> {
+    // A dedicated head-only query rather than routing through
+    // `MutableTableRegistry::tail_replay`: that call always fetches at least
+    // one chunk of rows once `cursor_before < head`, which would fetch (and
+    // discard) the entire backing-table history just to read a watermark.
+    let backend = mutable.backend_arc();
+    let sql = format!(
+        "SELECT MAX(\"{}\") AS m FROM \"{}\"",
+        order_col.replace('"', "\"\""),
+        def.id.as_str().replace('"', "\"\"")
+    );
+    let rows: Vec<Option<i64>> = backend
+        .catalog_backend()
+        .transaction(
+            crate::catalog::backend::TxOptions {
+                read_only: true,
+                ..Default::default()
+            },
+            move |tx| {
+                let sql = sql.clone();
+                Box::pin(async move { tx.query(&sql, &[], |row| row.try_get::<i64>("m")).await })
+            },
+        )
+        .await
+        .map_err(TriggerError::Backend)?;
+    Ok(rows.into_iter().next().flatten())
+}
+
+/// Whether a fanned-out row belongs to `tail_tenant`'s scope: a globally
+/// published row (`row_tenant.is_none()`) is visible to every tail, and a
+/// `None` (global) tail only ever fans out globally published rows —
+/// mirroring `Subscriber`'s `tenant_id = $current OR tenant_id IS NULL`
+/// replay predicate.
+fn tenant_visible(tail_tenant: Option<TenantId>, row_tenant: Option<TenantId>) -> bool {
+    row_tenant.is_none() || row_tenant == tail_tenant
+}
+
+/// The tail task body. Owns the cursor for the tail's entire lifetime;
+/// processes driver events and replays serially (J5), so the cursor can
+/// never regress.
+#[allow(clippy::too_many_arguments)]
+async fn run_tail_loop(
+    mut driver: crate::trigger::subscription::LiveStream,
+    sender: broadcast::Sender<DeliveredBatch>,
+    mutable: Arc<MutableTableRegistry>,
+    def: MutableTableDefinition,
+    order_col: String,
+    tenant: Option<TenantId>,
+    user_schema: SchemaRef,
+    initial_cursor: i64,
+    replay_permits: Arc<Semaphore>,
+) {
+    let mut cursor = initial_cursor;
+    loop {
+        match driver.next().await {
+            None => {
+                // The driver's own stream ended (broker shutdown). Nothing
+                // further to deliver; exit rather than spin.
+                return;
+            }
+            Some(Ok(LiveEvent::Batch(delivered))) => {
+                let off = delivered.offset.value() as i64;
+                if off == cursor + 1 {
+                    cursor = off;
+                    if tenant_visible(tenant, delivered.tenant) {
+                        // A closed channel (zero receivers) is not a fan-out
+                        // failure — the same rule `InMemoryBroker::publish`
+                        // documents.
+                        let _ = sender.send(delivered);
+                    }
+                } else if off > cursor + 1 {
+                    cursor = replay_and_fan_out(
+                        &mutable,
+                        &def,
+                        &order_col,
+                        tenant,
+                        cursor,
+                        &user_schema,
+                        &sender,
+                        &replay_permits,
+                    )
+                    .await;
+                }
+                // `off <= cursor`: regression — drop without replay (J4).
+            }
+            Some(Ok(LiveEvent::Wake)) => {
+                cursor = replay_and_fan_out(
+                    &mutable,
+                    &def,
+                    &order_col,
+                    tenant,
+                    cursor,
+                    &user_schema,
+                    &sender,
+                    &replay_permits,
+                )
+                .await;
+            }
+            Some(Err(err)) => {
+                // No driver is documented to emit a bare stream error today
+                // (every driver routes a lag/gap through `Wake` instead —
+                // `broker.rs`'s trait doc). Treat it the same way regardless:
+                // self-heal by replay rather than tearing the tail down, so
+                // a future driver that DOES surface a transient error keeps
+                // the tail alive.
+                tracing::warn!(error = %err, "trigger tail: driver stream error; replaying");
+                cursor = replay_and_fan_out(
+                    &mutable,
+                    &def,
+                    &order_col,
+                    tenant,
+                    cursor,
+                    &user_schema,
+                    &sender,
+                    &replay_permits,
+                )
+                .await;
+            }
+        }
+    }
+}
+
+/// Acquire a replay permit (K1), run one [`MutableTableRegistry::tail_replay`]
+/// round, reassemble the rows into whole-publish [`DeliveredBatch`]es, fan
+/// them out, and return the new cursor. On any replay error the cursor is
+/// left unchanged (never advanced past rows that were never actually
+/// delivered) — the next `Wake` or gap retries.
+#[allow(clippy::too_many_arguments)]
+async fn replay_and_fan_out(
+    mutable: &Arc<MutableTableRegistry>,
+    def: &MutableTableDefinition,
+    order_col: &str,
+    tenant: Option<TenantId>,
+    cursor_before: i64,
+    user_schema: &SchemaRef,
+    sender: &broadcast::Sender<DeliveredBatch>,
+    replay_permits: &Arc<Semaphore>,
+) -> i64 {
+    let _permit = match replay_permits.acquire().await {
+        Ok(p) => p,
+        Err(_) => return cursor_before, // semaphore closed only if the registry itself is gone.
+    };
+    match mutable
+        .tail_replay(def, order_col, tenant, cursor_before, REPLAY_CHUNK_SIZE)
+        .await
+    {
+        Ok((raw_batches, new_cursor)) => {
+            match group_replay_batches(&raw_batches, user_schema) {
+                Ok(events) => {
+                    for event in events {
+                        let delivered = DeliveredBatch {
+                            offset: event.offset,
+                            produced_at: event.produced_at,
+                            batch: event.batch,
+                            // The replay query is already tenant-scoped —
+                            // this tag is informational only, matching
+                            // `Subscriber::drain_replay`'s own replay path.
+                            tenant: None,
+                        };
+                        let _ = sender.send(delivered);
+                    }
+                    new_cursor
+                }
+                Err(err) => {
+                    tracing::warn!(error = %err, "trigger tail: replay group reassembly failed");
+                    cursor_before
+                }
+            }
+        }
+        Err(err) => {
+            let err: TriggerError = match err {
+                MutableTableError::Backend(b) => TriggerError::Backend(b),
+                other => TriggerError::BackingTable(other),
+            };
+            tracing::warn!(error = %err, "trigger tail: replay failed; cursor unchanged");
+            cursor_before
+        }
+    }
+}
+
+/// A single subscriber's own lag recovery (G4/K2): when a subscriber's
+/// broadcast receiver observes `RecvError::Lagged`, it replays from its OWN
+/// `last_yielded` rather than erroring or falling back to
+/// `Subscriber::drain_replay`'s whole-suffix materialisation. This reuses
+/// the SAME chunked, group-completing replay primitive the tail itself uses
+/// for a driver-level `Wake` — never a second, less-bounded code path.
+///
+/// Returns tenant-scoped (already-filtered by the backing query) but NOT
+/// predicate-filtered rows — the caller (`Subscriber::subscribe_scoped`)
+/// applies the predicate uniformly across every source (live relay and lag
+/// replay alike), matching H3's "predicate and dedup are per subscriber,
+/// in-process" rule.
+pub(crate) async fn lag_replay(
+    mutable: &Arc<MutableTableRegistry>,
+    topic: &TopicDefinition,
+    tenant: Option<TenantId>,
+    from_offset_exclusive: i64,
+) -> Result<Vec<DeliveredBatch>, TriggerError> {
+    let backing_id =
+        crate::store::mutable::definition::MutableTableId::new(topic.backing_table_name())
+            .map_err(|e| TriggerError::Catalog(e.to_string()))?;
+    let def = mutable.definition_for_tenant(&backing_id, tenant).await?;
+    let order_col = def.order_column.clone().ok_or_else(|| {
+        TriggerError::Catalog(format!(
+            "topic '{}' backing table has no order_column",
+            topic.name
+        ))
+    })?;
+    let (raw_batches, _new_head) = mutable
+        .tail_replay(
+            &def,
+            &order_col,
+            tenant,
+            from_offset_exclusive,
+            REPLAY_CHUNK_SIZE,
+        )
+        .await
+        .map_err(|e| match e {
+            MutableTableError::Backend(b) => TriggerError::Backend(b),
+            other => TriggerError::BackingTable(other),
+        })?;
+    let events = group_replay_batches(&raw_batches, &topic.schema)?;
+    Ok(events
+        .into_iter()
+        .map(|event| DeliveredBatch {
+            offset: event.offset,
+            produced_at: event.produced_at,
+            batch: event.batch,
+            tenant: None,
+        })
+        .collect())
+}

@@ -1,4 +1,5 @@
 mod audit;
+mod broker_parity;
 mod caching;
 mod catalog_ping;
 mod channels;

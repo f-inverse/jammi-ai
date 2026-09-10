@@ -83,6 +83,7 @@ async fn session_with_synthetic_embeddings() -> (Arc<InferenceSession>, TempDir,
             },
             &pairs,
             Materialization::new(&descriptor, &env, inputs),
+            None,
         )
         .await
         .unwrap();
@@ -799,6 +800,7 @@ async fn recompute_after_model_dir_mutation_changes_the_definition_hash() {
                 &["abstract".to_string()],
                 "id",
                 CachePolicy::Bypass,
+                None,
             )
             .await
             .unwrap();

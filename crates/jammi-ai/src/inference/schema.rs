@@ -1,6 +1,6 @@
 use std::sync::Arc;
 
-use arrow::array::{ArrayRef, Float32Array, StringArray};
+use arrow::array::{ArrayRef, Float32Array, StringArray, UInt64Array};
 use arrow::compute;
 use arrow::datatypes::{DataType, Field, Schema, SchemaRef};
 use jammi_db::error::{JammiError, Result};
@@ -9,9 +9,23 @@ use super::adapter;
 use crate::model::ModelTask;
 
 /// Common prefix columns on every inference output.
+///
+/// `_ordinal` is a stream-scoped monotonic row counter (0-based, assigned by
+/// [`build_prefix_columns`] in emission order across the WHOLE
+/// [`InferenceExec`](crate::operator::inference_exec::InferenceExec)
+/// invocation, never reset per sub-batch) — `InferenceExec` is
+/// `Partitioning::UnknownPartitioning(1)`, so exactly one ordinal sequence
+/// exists per inference run. It exists so a caller can read the result table
+/// back in the SAME order the model actually produced it
+/// (`ORDER BY _row_id, _ordinal`) even when `_row_id` carries duplicate or
+/// non-monotonic keys, and even when the underlying Parquet scan reorders
+/// row groups on read. Embedding tables carry no `_ordinal` — their
+/// read-backs are keyed by `_row_id` alone, per
+/// [`crate::pipeline::embedding::EmbeddingPipeline`]'s schema.
 pub fn common_prefix_fields() -> Vec<Field> {
     vec![
         Field::new("_row_id", DataType::Utf8, false),
+        Field::new("_ordinal", DataType::UInt64, false),
         Field::new("_source", DataType::Utf8, false),
         Field::new("_model", DataType::Utf8, false),
         Field::new("_status", DataType::Utf8, false),
@@ -61,6 +75,13 @@ pub fn build_output_schema(
 /// None of these readers depends on another reader running first: the
 /// runner building the prefix columns before calling the task adapter is
 /// call ordering, not a safety dependency.
+///
+/// `ordinal_start` is the first `_ordinal` value this batch assigns; the
+/// caller (`InferenceRunner`) advances its own running counter by
+/// `row_count` after this call so the sequence stays monotonic and
+/// contiguous across every sub-batch of one stream — see
+/// [`common_prefix_fields`] for why this exists.
+#[allow(clippy::too_many_arguments)]
 pub fn build_prefix_columns(
     keys: &ArrayRef,
     source_id: &str,
@@ -69,6 +90,7 @@ pub fn build_prefix_columns(
     row_errors: &[String],
     latency_ms: f32,
     row_count: usize,
+    ordinal_start: u64,
 ) -> Result<Vec<ArrayRef>> {
     if row_status.len() != row_count {
         return Err(JammiError::Inference(format!(
@@ -110,8 +132,11 @@ pub fn build_prefix_columns(
         compute::cast(keys, &DataType::Utf8).unwrap_or_else(|_| Arc::clone(keys))
     };
 
+    let ordinals: UInt64Array = (ordinal_start..ordinal_start + row_count as u64).collect();
+
     Ok(vec![
         row_ids,                                                               // _row_id
+        Arc::new(ordinals) as ArrayRef,                                        // _ordinal
         Arc::new(StringArray::from(vec![source_id; row_count])) as ArrayRef,   // _source
         Arc::new(StringArray::from(vec![model_id; row_count])) as ArrayRef,    // _model
         Arc::new(status) as ArrayRef,                                          // _status
@@ -146,7 +171,7 @@ mod tests {
             "row 1 failed".to_string(),
             "row 2 failed".to_string(),
         ];
-        let err = build_prefix_columns(&keys, "src", "model", &row_status, &row_errors, 1.0, 3)
+        let err = build_prefix_columns(&keys, "src", "model", &row_status, &row_errors, 1.0, 3, 0)
             .expect_err("a row_status shorter than row_count must be a typed refusal");
         let msg = err.to_string();
         assert!(msg.contains("row_status"), "must name the field: {msg}");
@@ -167,7 +192,7 @@ mod tests {
         let keys: ArrayRef = Arc::new(StringArray::from(vec!["a", "b", "c"]));
         let row_status = vec![true, false, true];
         let row_errors = vec!["row 1 failed".to_string()]; // one entry; row_count is 3
-        let err = build_prefix_columns(&keys, "src", "model", &row_status, &row_errors, 1.0, 3)
+        let err = build_prefix_columns(&keys, "src", "model", &row_status, &row_errors, 1.0, 3, 0)
             .expect_err("a row_errors shorter than row_count must be a typed refusal");
         let msg = err.to_string();
         assert!(msg.contains("row_errors"), "must name the field: {msg}");
@@ -186,14 +211,31 @@ mod tests {
         let keys: ArrayRef = Arc::new(StringArray::from(vec!["a", "b", "c"]));
         let row_status = vec![true, false, true];
         let row_errors = vec![String::new(), "row 1 failed".to_string(), String::new()];
-        let cols = build_prefix_columns(&keys, "src", "model", &row_status, &row_errors, 1.0, 3)
+        let cols = build_prefix_columns(&keys, "src", "model", &row_status, &row_errors, 1.0, 3, 0)
             .expect("mutually consistent lengths must not be refused");
         for (i, col) in cols.iter().enumerate() {
             assert_eq!(col.len(), 3, "column {i} must have one entry per row");
         }
-        let errors = cols[4].as_any().downcast_ref::<StringArray>().unwrap();
+        // cols: [_row_id, _ordinal, _source, _model, _status, _error, _latency_ms]
+        let errors = cols[5].as_any().downcast_ref::<StringArray>().unwrap();
         assert!(errors.is_null(0), "row 0's own recorded status was ok");
         assert_eq!(errors.value(1), "row 1 failed");
         assert!(errors.is_null(2), "row 2's own recorded status was ok");
+    }
+
+    /// `_ordinal` is a contiguous, 0-based sequence starting at whatever
+    /// `ordinal_start` the caller passes — the value
+    /// [`InferenceRunner`](crate::inference::runner::InferenceRunner)
+    /// advances by `row_count` across every sub-batch of one stream, per
+    /// [`common_prefix_fields`]'s doc.
+    #[test]
+    fn build_prefix_columns_ordinal_is_contiguous_from_the_given_start() {
+        let keys: ArrayRef = Arc::new(StringArray::from(vec!["a", "b", "c"]));
+        let row_status = vec![true, true, true];
+        let row_errors = vec![String::new(), String::new(), String::new()];
+        let cols = build_prefix_columns(&keys, "src", "model", &row_status, &row_errors, 1.0, 3, 7)
+            .expect("mutually consistent lengths must not be refused");
+        let ordinals = cols[1].as_any().downcast_ref::<UInt64Array>().unwrap();
+        assert_eq!(ordinals.values(), &[7u64, 8, 9]);
     }
 }

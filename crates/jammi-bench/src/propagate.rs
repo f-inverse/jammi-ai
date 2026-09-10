@@ -415,6 +415,7 @@ async fn graph_session(
             },
             &features,
             jammi_db::store::manifest::Materialization::new(&descriptor, &env, inputs),
+            None,
         )
         .await?;
 

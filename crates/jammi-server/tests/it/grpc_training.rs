@@ -456,6 +456,7 @@ async fn seed_predictor_dataset_under_tenant_a(server: &EngineServer) {
                     },
                     &pairs,
                     jammi_db::store::manifest::Materialization::new(&__d, &__e, __i),
+                    None,
                 )
                 .await
                 .expect("materialize tenant-A embedding table");

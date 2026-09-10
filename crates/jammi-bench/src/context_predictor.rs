@@ -336,6 +336,7 @@ async fn dataset_session(
             },
             &pairs,
             jammi_db::store::manifest::Materialization::new(&descriptor, &env, inputs),
+            None,
         )
         .await?;
 

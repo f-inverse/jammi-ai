@@ -27,6 +27,7 @@ mod hub_source;
 mod import_pipeline;
 mod inference;
 mod jammi;
+mod jobs_compute;
 mod local_session;
 mod media_front_end;
 mod merger;

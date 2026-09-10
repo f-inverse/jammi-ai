@@ -167,6 +167,7 @@ async fn recipe_generate_embeddings() {
             &["abstract".to_string()],
             "id",
             jammi_db::store::CachePolicy::Bypass,
+            None,
         )
         .await
         .unwrap()
@@ -222,6 +223,7 @@ async fn recipe_generate_embeddings() {
             &["title".to_string(), "abstract".to_string()],
             "id",
             jammi_db::store::CachePolicy::Bypass,
+            None,
         )
         .await
         .unwrap()
@@ -258,6 +260,7 @@ async fn recipe_semantic_search() {
             &["abstract".to_string()],
             "id",
             jammi_db::store::CachePolicy::Bypass,
+            None,
         )
         .await
         .unwrap();
@@ -360,6 +363,7 @@ async fn recipe_enrich_results() {
             &["abstract".to_string()],
             "id",
             jammi_db::store::CachePolicy::Bypass,
+            None,
         )
         .await
         .unwrap();
@@ -500,6 +504,7 @@ async fn recipe_fine_tune() {
             &["abstract".into()],
             "id",
             jammi_db::store::CachePolicy::Bypass,
+            None,
         )
         .await
         .unwrap()
@@ -558,6 +563,7 @@ async fn recipe_evaluation() {
             &["abstract".to_string()],
             "id",
             jammi_db::store::CachePolicy::Bypass,
+            None,
         )
         .await
         .unwrap()
@@ -592,6 +598,7 @@ async fn recipe_evaluation() {
             &["title".to_string()],
             "id",
             jammi_db::store::CachePolicy::Bypass,
+            None,
         )
         .await
         .unwrap()
@@ -647,6 +654,7 @@ async fn recipe_modernbert_embeddings() {
             &["abstract".to_string()],
             "id",
             jammi_db::store::CachePolicy::Bypass,
+            None,
         )
         .await
         .unwrap()
@@ -772,6 +780,7 @@ async fn recipe_model_management() {
             &["abstract".to_string()],
             "id",
             jammi_db::store::CachePolicy::Bypass,
+            None,
         )
         .await
         .unwrap();
@@ -801,6 +810,7 @@ async fn recipe_model_management() {
             &["abstract".to_string()],
             "id",
             jammi_db::store::CachePolicy::Bypass,
+            None,
         )
         .await
         .unwrap();
@@ -1129,6 +1139,7 @@ async fn recipe_generate_image_embeddings() {
             "image",
             "figure_id",
             jammi_db::store::CachePolicy::Bypass,
+            None,
         )
         .await
         .unwrap()
@@ -1281,6 +1292,7 @@ async fn recipe_generate_audio_embeddings() {
             "audio",
             "clip_id",
             jammi_db::store::CachePolicy::Bypass,
+            None,
         )
         .await
         .unwrap()

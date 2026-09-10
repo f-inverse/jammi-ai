@@ -41,6 +41,7 @@ pub async fn run(
     spine: &str,
     facts: &str,
     spec: &AsofJoinSpec,
+    job_attempt: Option<jammi_db::catalog::result_repo::JobAttempt<'_>>,
 ) -> Result<ResultTableRecord> {
     let spine_plan = scan_relation(session, spine).await?;
     let facts_plan = scan_relation(session, facts).await?;
@@ -83,7 +84,7 @@ pub async fn run(
             None,
             None,
             None,
-            None,
+            job_attempt,
         )
         .await?;
 

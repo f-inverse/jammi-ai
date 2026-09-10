@@ -421,6 +421,7 @@ pub(crate) async fn serve_embed(
             &[TEXT_COLUMN.to_string()],
             KEY_COLUMN,
             jammi_db::store::CachePolicy::Bypass,
+            None,
         )
         .await?;
     let serve_ms = start.elapsed().as_secs_f64() * 1_000.0;

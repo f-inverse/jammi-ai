@@ -168,6 +168,7 @@ async fn session_with_meta_dataset_named(
             },
             &pairs,
             jammi_db::store::manifest::Materialization::new(&__d, &__e, __i),
+            None,
         )
         .await
         .unwrap();
@@ -545,6 +546,7 @@ async fn session_with_origin_keyed_propagated_table(
             },
             &pairs,
             jammi_db::store::manifest::Materialization::new(&__d, &__e, __i),
+            None,
         )
         .await
         .unwrap();
@@ -859,6 +861,7 @@ async fn train_context_predictor_over_generated_embeddings() {
             &["text".to_string()],
             "_row_id",
             jammi_db::store::CachePolicy::Bypass,
+            None,
         )
         .await
         .unwrap();

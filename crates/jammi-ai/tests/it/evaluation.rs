@@ -359,6 +359,7 @@ async fn session_with_embeddings_and_golden() -> (Arc<InferenceSession>, String,
             &["abstract".to_string()],
             "id",
             jammi_db::store::CachePolicy::Bypass,
+            None,
         )
         .await
         .unwrap()
@@ -816,6 +817,7 @@ async fn eval_compare_distinct_tables_has_nonzero_deltas() {
             &["abstract".to_string()],
             "id",
             jammi_db::store::CachePolicy::Bypass,
+            None,
         )
         .await
         .unwrap()
@@ -827,6 +829,7 @@ async fn eval_compare_distinct_tables_has_nonzero_deltas() {
             &["title".to_string()],
             "id",
             jammi_db::store::CachePolicy::Bypass,
+            None,
         )
         .await
         .unwrap()
@@ -911,6 +914,7 @@ async fn eval_image_embeddings_end_to_end() {
             "image",
             "figure_id",
             jammi_db::store::CachePolicy::Bypass,
+            None,
         )
         .await
         .unwrap()

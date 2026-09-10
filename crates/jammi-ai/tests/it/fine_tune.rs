@@ -1067,6 +1067,7 @@ async fn audio_projection_head_fine_tune_changes_embeddings() {
             "audio",
             "clip_id",
             jammi_db::store::CachePolicy::Bypass,
+            None,
         )
         .await
         .unwrap()
@@ -1130,6 +1131,7 @@ async fn audio_projection_head_fine_tune_changes_embeddings() {
             "audio",
             "clip_id",
             jammi_db::store::CachePolicy::Bypass,
+            None,
         )
         .await
         .unwrap()
@@ -1649,6 +1651,7 @@ async fn fine_tuned_model_produces_measurably_different_search_quality() {
             &["abstract".to_string()],
             "id",
             jammi_db::store::CachePolicy::Bypass,
+            None,
         )
         .await
         .unwrap()
@@ -1692,6 +1695,7 @@ async fn fine_tuned_model_produces_measurably_different_search_quality() {
             &["abstract".to_string()],
             "id",
             jammi_db::store::CachePolicy::Bypass,
+            None,
         )
         .await
         .unwrap()

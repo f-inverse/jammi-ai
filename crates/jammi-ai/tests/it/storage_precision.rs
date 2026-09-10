@@ -69,6 +69,7 @@ async fn session_with_patents_at(
             &["abstract".to_string()],
             "id",
             jammi_db::store::CachePolicy::Bypass,
+            None,
         )
         .await
         .unwrap();

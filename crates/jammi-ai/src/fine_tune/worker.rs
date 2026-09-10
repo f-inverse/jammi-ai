@@ -136,7 +136,9 @@ fn epoch_checkpointing(spec: &TrainingSpec) -> Option<(usize, u32)> {
 /// `resolve_kinds` validates `[worker] kinds` against at startup (item 2).
 /// The three training kinds dispatch through `JobWorker::run_spec`
 /// (unchanged from the removed `TrainingWorker`, renamed `JobWorker`); the
-/// three compute kinds dispatch through [`crate::jobs::execute_compute`].
+/// five compute kinds (item 3: every embedded synchronous compute verb is
+/// now one of [`crate::jobs::ComputeSpec`]'s variants) dispatch through
+/// [`crate::jobs::execute_compute`].
 pub const COMPILED_KINDS: &[&str] = &[
     "fine_tune",
     "graph_fine_tune",
@@ -144,13 +146,18 @@ pub const COMPILED_KINDS: &[&str] = &[
     "neighbor_graph",
     "propagate",
     "asof_join",
+    "embedding",
+    "infer",
 ];
 
 /// Whether `kind` is one of [`crate::jobs::ComputeSpec`]'s variants (dispatched
 /// through [`crate::jobs::execute_compute`]) rather than a [`TrainingSpec`]
 /// variant (dispatched through [`JobWorker::run_spec`]).
 pub(crate) fn is_compute_kind(kind: &str) -> bool {
-    matches!(kind, "neighbor_graph" | "propagate" | "asof_join")
+    matches!(
+        kind,
+        "neighbor_graph" | "propagate" | "asof_join" | "embedding" | "infer"
+    )
 }
 
 /// Resolve `[worker] kinds` against [`COMPILED_KINDS`] (item 2: "`[worker]
@@ -413,8 +420,16 @@ impl JobWorker {
         let catalog = Arc::new(session.catalog().pinned_to_tenant(record.tenant_id));
 
         if is_compute_kind(&record.kind) {
-            self.run_claimed_compute_job(session, &catalog, &job_id, &record.spec, attempt)
-                .await;
+            self.run_claimed_compute_job(
+                session,
+                &catalog,
+                &job_id,
+                &record.spec,
+                attempt,
+                record.partial_result.as_deref(),
+                record.tenant_id,
+            )
+            .await;
             return;
         }
 
@@ -934,12 +949,16 @@ impl JobWorker {
     }
 
     /// Run a claimed compute-kind job (`neighbor_graph`/`propagate`/
-    /// `asof_join`) to a terminal state: registers the job's lease with the
-    /// session's keeper (N3 — no heartbeat task), dispatches through
-    /// [`crate::jobs::execute_compute`], and performs the single lease-guarded
-    /// terminal write. A worker that lost its lease during the compute does
-    /// not finalize (`finish_job`/`fail_job` match zero rows); the job is
-    /// left for [`Catalog::reclaim_expired_jobs`].
+    /// `asof_join`/`embedding`/`infer`) to a terminal state: N1's
+    /// attempt-algorithm dispatch on `jobs.partial_result`
+    /// ([`crate::jobs::dispatch_partial_result`]) first, and only when it
+    /// says to does this register the job's lease with the session's keeper
+    /// (N3 — no heartbeat task) and dispatch through
+    /// [`crate::jobs::execute_compute`] — then performs the single
+    /// lease-guarded terminal write. A worker that lost its lease during the
+    /// compute does not finalize (`finish_job`/`fail_job` match zero rows);
+    /// the job is left for [`Catalog::reclaim_expired_jobs`].
+    #[allow(clippy::too_many_arguments)]
     async fn run_claimed_compute_job(
         &self,
         session: &Arc<InferenceSession>,
@@ -947,6 +966,8 @@ impl JobWorker {
         job_id: &str,
         spec_json: &str,
         attempt: u32,
+        partial_result: Option<&str>,
+        tenant_id: Option<jammi_db::TenantId>,
     ) {
         let spec: crate::jobs::ComputeSpec = match serde_json::from_str(spec_json) {
             Ok(s) => s,
@@ -962,6 +983,66 @@ impl JobWorker {
                 return;
             }
         };
+
+        match crate::jobs::dispatch_partial_result(
+            session,
+            catalog,
+            tenant_id,
+            attempt,
+            partial_result,
+            &self.worker_id,
+        )
+        .await
+        {
+            Ok(crate::jobs::PartialResultDisposition::Ready(result)) => {
+                match serde_json::to_string(&result) {
+                    Ok(result_json) => {
+                        match catalog
+                            .finish_job(jammi_db::catalog::jobs_repo::FinishJobParams {
+                                job_id,
+                                instance_id: &self.worker_id,
+                                attempts: attempt,
+                                result: &result_json,
+                            })
+                            .await
+                        {
+                            Ok(true) => {}
+                            Ok(false) => tracing::debug!(
+                                job_id, worker = %self.worker_id,
+                                "lost lease before finish (partial_result adopt); left for reclaim"
+                            ),
+                            Err(e) => {
+                                tracing::error!(job_id, error = %e, "finish_job failed (partial_result adopt)")
+                            }
+                        }
+                    }
+                    Err(e) => {
+                        record_failed(
+                            catalog,
+                            job_id,
+                            &self.worker_id,
+                            attempt,
+                            format!("result serialisation failed: {e}"),
+                        )
+                        .await;
+                    }
+                }
+                return;
+            }
+            Ok(crate::jobs::PartialResultDisposition::BackOff) => {
+                tracing::debug!(
+                    job_id, worker = %self.worker_id,
+                    "N1: a prior attempt's partial_result table is still building under a \
+                     live lease; backing off without double-producing"
+                );
+                return;
+            }
+            Ok(crate::jobs::PartialResultDisposition::MaterializeAnew) => {}
+            Err(e) => {
+                tracing::error!(job_id, error = %e, "dispatch_partial_result failed; materializing anew");
+            }
+        }
+
         let registration =
             session
                 .lease_keeper()
@@ -970,7 +1051,12 @@ impl JobWorker {
                     instance_id: self.worker_id.clone(),
                     attempts: attempt,
                 });
-        let outcome = crate::jobs::execute_compute(session, &spec).await;
+        let job_attempt = jammi_db::catalog::result_repo::JobAttempt {
+            job_id,
+            instance_id: &self.worker_id,
+            attempts: attempt,
+        };
+        let outcome = crate::jobs::execute_compute(session, &spec, job_attempt).await;
         drop(registration);
 
         match outcome {

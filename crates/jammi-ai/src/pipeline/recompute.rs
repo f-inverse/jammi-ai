@@ -225,6 +225,10 @@ impl InferenceSession {
                             &columns,
                             &key_column,
                             CachePolicy::Bypass,
+                            // Recompute replays the unmodified materialization
+                            // funnel directly — it is not itself a job, so it
+                            // creates no `partial_result` link.
+                            None,
                         )
                         .await?;
                 Ok((record.table_name, outcome))

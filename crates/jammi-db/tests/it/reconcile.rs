@@ -87,6 +87,7 @@ async fn materialize_healthy_table(
             },
             &rows,
             Materialization::new(&descriptor(), &env(), vec![]),
+            None,
         )
         .await
         .unwrap()

@@ -291,25 +291,9 @@ impl Session {
         modality: Modality,
         cache: jammi_db::store::CachePolicy,
     ) -> Result<(ResultTableRecord, jammi_db::store::CacheOutcome)> {
-        match modality {
-            Modality::Text => {
-                self.engine
-                    .generate_text_embeddings(source_id, model_id, columns, key_column, cache)
-                    .await
-            }
-            Modality::Image => {
-                let image_column = single_column(columns, "image")?;
-                self.engine
-                    .generate_image_embeddings(source_id, model_id, image_column, key_column, cache)
-                    .await
-            }
-            Modality::Audio => {
-                let audio_column = single_column(columns, "audio")?;
-                self.engine
-                    .generate_audio_embeddings(source_id, model_id, audio_column, key_column, cache)
-                    .await
-            }
-        }
+        self.engine
+            .generate_embeddings(source_id, model_id, columns, key_column, modality, cache)
+            .await
     }
 
     /// Register precomputed per-row vectors as a ready `(source, model)`
@@ -908,7 +892,7 @@ impl Session {
 /// each take exactly one content column; the unified surface passes a slice, so
 /// reject anything but a one-element slice with a typed error naming the
 /// modality rather than silently using the first column.
-fn single_column<'a>(columns: &'a [String], modality: &str) -> Result<&'a str> {
+pub(crate) fn single_column<'a>(columns: &'a [String], modality: &str) -> Result<&'a str> {
     match columns {
         [single] => Ok(single.as_str()),
         _ => Err(jammi_db::error::JammiError::Inference(format!(

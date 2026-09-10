@@ -1165,6 +1165,7 @@ async fn context_predictor_job_reports_not_applicable_acceleration() {
             &["text".to_string()],
             "_row_id",
             jammi_db::store::CachePolicy::Bypass,
+            None,
         )
         .await
         .unwrap();

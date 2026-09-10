@@ -172,6 +172,7 @@ async fn graph_session(
             },
             &pairs,
             jammi_db::store::manifest::Materialization::new(&desc, &env, inputs),
+            None,
         )
         .await
         .unwrap();

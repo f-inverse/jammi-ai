@@ -51,6 +51,7 @@ impl<'a> EmbeddingPipeline<'a> {
         columns: &[String],
         key_column: &str,
         cache: CachePolicy,
+        job_attempt: Option<jammi_db::catalog::result_repo::JobAttempt<'_>>,
     ) -> Result<(ResultTableRecord, CacheOutcome)> {
         let model_source = ModelSource::parse(model_id);
 
@@ -130,7 +131,7 @@ impl<'a> EmbeddingPipeline<'a> {
                 Some(embedding_dim as i32),
                 Some(key_column),
                 Some(&col_list),
-                None,
+                job_attempt,
             )
             .await?;
 

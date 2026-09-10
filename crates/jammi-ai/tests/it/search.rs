@@ -36,6 +36,7 @@ async fn session_with_embeddings() -> (Arc<InferenceSession>, TempDir) {
             &["abstract".to_string()],
             "id",
             jammi_db::store::CachePolicy::Bypass,
+            None,
         )
         .await
         .unwrap();
@@ -412,6 +413,7 @@ async fn search_resolves_to_latest_embedding_table() {
             &["title".to_string()],
             "id",
             jammi_db::store::CachePolicy::Bypass,
+            None,
         )
         .await
         .unwrap()
@@ -425,6 +427,7 @@ async fn search_resolves_to_latest_embedding_table() {
             &["abstract".to_string()],
             "id",
             jammi_db::store::CachePolicy::Bypass,
+            None,
         )
         .await
         .unwrap()
@@ -523,6 +526,7 @@ async fn search_embedding_table_selector_picks_the_named_table() {
             &["title".to_string()],
             "id",
             jammi_db::store::CachePolicy::Bypass,
+            None,
         )
         .await
         .unwrap()
@@ -534,6 +538,7 @@ async fn search_embedding_table_selector_picks_the_named_table() {
             &["abstract".to_string()],
             "id",
             jammi_db::store::CachePolicy::Bypass,
+            None,
         )
         .await
         .unwrap()
@@ -723,6 +728,7 @@ async fn cross_modal_text_to_image_search() {
             "image",
             "figure_id",
             jammi_db::store::CachePolicy::Bypass,
+            None,
         )
         .await
         .unwrap();

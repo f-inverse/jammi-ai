@@ -38,6 +38,7 @@ async fn smoke_cp3_full_pipeline() {
             &["abstract".to_string()],
             "id",
             jammi_db::store::CachePolicy::Bypass,
+            None,
         )
         .await
         .unwrap()

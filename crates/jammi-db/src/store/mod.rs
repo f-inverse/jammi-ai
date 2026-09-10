@@ -2118,12 +2118,19 @@ impl ResultStore {
     /// input embedding table here so the catalog records the derivation; a caller
     /// pooling from a source's *raw* rows (no single source result table) passes
     /// `None`.
+    ///
+    /// `job_attempt` (N11, esc-105) is threaded straight to
+    /// [`Self::create_table`] — see there for the `jobs.partial_result`
+    /// compare-and-set this performs. `None` for a table created outside the
+    /// job machinery (a test fixture, a recompute replay, or a caller that
+    /// materialises with no job of record).
     pub async fn materialize_embedding_table(
         &self,
         ctx: &SessionContext,
         spec: EmbeddingTableSpec<'_>,
         rows: &[(String, Vec<f32>)],
         materialization: Materialization<'_>,
+        job_attempt: Option<crate::catalog::result_repo::JobAttempt<'_>>,
     ) -> Result<ResultTableRecord> {
         let EmbeddingTableSpec {
             source_id,
@@ -2148,8 +2155,7 @@ impl ResultStore {
                 Some(dimensions as i32),
                 key_column,
                 text_columns,
-                // No job of record for this pooling/derivation wrapper today.
-                None,
+                job_attempt,
             )
             .await?;
 
@@ -2274,6 +2280,10 @@ impl ResultStore {
             spec,
             &normalized,
             Materialization::new(&descriptor, &provenance.env, provenance.inputs),
+            // `import_embeddings` is not one of `jammi_ai::jobs::ComputeSpec`'s
+            // kinds — it is a GPU-free promotion of caller-supplied vectors,
+            // not a job this crate dispatches — so it carries no job of record.
+            None,
         )
         .await
     }

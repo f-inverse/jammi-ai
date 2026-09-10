@@ -156,6 +156,7 @@ async fn text_embeddings_via_open_clip_share_latent_dim_with_vision() {
             &["abstract".to_string()],
             "id",
             jammi_db::store::CachePolicy::Bypass,
+            None,
         )
         .await
         .unwrap()
@@ -548,6 +549,7 @@ mod live {
                 "img",
                 "fid",
                 jammi_db::store::CachePolicy::Bypass,
+                None,
             )
             .await
             .unwrap()

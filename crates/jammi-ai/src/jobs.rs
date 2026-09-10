@@ -29,6 +29,7 @@ use jammi_db::catalog::Catalog;
 use jammi_db::error::{JammiError, Result};
 use jammi_db::store::{CacheOutcome, CachePolicy};
 
+use crate::model::ModelTask;
 use crate::pipeline::asof::AsofJoinSpec;
 use crate::pipeline::graph_propagation::PropagateRequest;
 use crate::pipeline::neighbor_graph::BuildNeighborGraph;
@@ -39,6 +40,16 @@ use crate::session::InferenceSession;
 /// the run from. Persisted as JSON on `jobs.spec`; the variant's serde tag
 /// mirrors into `jobs.kind` — see `crate::fine_tune::worker::is_compute_kind`
 /// for the vocabulary this must stay in sync with.
+///
+/// Every variant now carries its own `cache` (item 3): item 2/K4 routes
+/// EVERY embedded synchronous compute verb through
+/// [`InferenceSession::run_now`], including the three ([`Self::NeighborGraph`],
+/// [`Self::Propagate`]) whose materializer still opts into the
+/// definition-hash cache probe under [`CachePolicy::Use`] — N1's "the
+/// NeighborGraph/Propagate cache probe stays" wording — so the caller's
+/// cache policy has to survive the trip through `jobs.spec` and back, not be
+/// silently forced to [`CachePolicy::Bypass`] the way the pre-item-3
+/// `execute_compute` did for every compute kind.
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum ComputeSpec {
@@ -47,14 +58,38 @@ pub enum ComputeSpec {
         source_id: String,
         embedding_table: Option<String>,
         params: BuildNeighborGraph,
+        cache: CachePolicy,
     },
     /// [`InferenceSession::propagate_embeddings`]'s inputs.
-    Propagate(PropagateRequest),
-    /// [`InferenceSession::asof_join`]'s inputs.
+    Propagate {
+        request: PropagateRequest,
+        cache: CachePolicy,
+    },
+    /// [`InferenceSession::asof_join`]'s inputs. An as-of join has no
+    /// cache-opt-in surface (every input is honestly `UnpinnedAtInstant`),
+    /// so this carries no `cache` field.
     AsofJoin {
         spine: String,
         facts: String,
         spec: AsofJoinSpec,
+    },
+    /// [`InferenceSession::generate_embeddings`]'s inputs.
+    Embedding {
+        source_id: String,
+        model_id: String,
+        columns: Vec<String>,
+        key_column: String,
+        modality: jammi_wire::request::Modality,
+        cache: CachePolicy,
+    },
+    /// [`InferenceSession::infer`]'s inputs.
+    Infer {
+        source_id: String,
+        model_id: String,
+        task: ModelTask,
+        content_columns: Vec<String>,
+        key_column: String,
+        cache: CachePolicy,
     },
 }
 
@@ -67,8 +102,10 @@ impl ComputeSpec {
     pub fn kind(&self) -> &'static str {
         match self {
             ComputeSpec::NeighborGraph { .. } => "neighbor_graph",
-            ComputeSpec::Propagate(_) => "propagate",
+            ComputeSpec::Propagate { .. } => "propagate",
             ComputeSpec::AsofJoin { .. } => "asof_join",
+            ComputeSpec::Embedding { .. } => "embedding",
+            ComputeSpec::Infer { .. } => "infer",
         }
     }
 }
@@ -139,51 +176,235 @@ pub enum JobResult {
     },
 }
 
+/// N1's per-attempt disposition: what a claimed job's worker does BEFORE it
+/// ever calls [`execute_compute`], on every attempt after the first.
+pub(crate) enum PartialResultDisposition {
+    /// A prior attempt's table is `ready` — the job is done; finish it with
+    /// this result, no materialize.
+    Ready(JobResult),
+    /// No usable prior table (absent `partial_result`, a `failed` table, or
+    /// an orphaned `building` row this call just reaped) — fall through to
+    /// the producer's normal path.
+    MaterializeAnew,
+    /// A prior attempt's table is still `building` under a LIVE lease (or a
+    /// PEER reaper won the race to claim the expired one first) — back off;
+    /// do not double-produce. The caller leaves the job `running` and
+    /// returns without finishing or failing it; the job's own lease expiry
+    /// (or a later attempt) will re-check.
+    BackOff,
+}
+
+/// N1: on attempt `N > 1`, read `jobs.partial_result` and dispatch on that
+/// table's status BEFORE running the producer's normal (materialize-anew)
+/// path — `attempt == 1` (every [`InferenceSession::run_now`] inline job;
+/// a queued job's first claim) always falls straight through, since there
+/// is nothing yet to dispatch on. Called only from
+/// [`crate::fine_tune::worker::JobWorker::run_claimed_compute_job`] — a
+/// `run_now` inline job always submits a BRAND NEW `job_id`, so it is
+/// always attempt 1 and never reaches a real dispatch arm (see
+/// [`InferenceSession::run_now`]'s doc).
+///
+/// The `building` + expired-lease arm claims the row
+/// (`Catalog::claim_expired_building_table`) then fails it: no compute
+/// producer in this crate can RESUME a partial
+/// write today (`neighbor_graph`/`propagate`/`asof_join`/`embedding`/`infer`
+/// are each a single-shot write, never checkpointed mid-table — unlike
+/// fine-tune's epoch checkpoints), so "adopt (finish) or fail+delete" always
+/// takes the fail arm here; a future kind with a genuinely resumable
+/// producer would add an adopt arm beside this one. Byte reclaim of the
+/// failed row is left to the existing `ResultStore::recover()` sweep (this
+/// call site has no access to `jammi-db`'s `pub(crate)
+/// delete_objects_after_cas` — the reap-after-fail-CAS pattern
+/// `store/mod.rs`'s recovery path itself uses).
+pub(crate) async fn dispatch_partial_result(
+    session: &Arc<InferenceSession>,
+    catalog: &Catalog,
+    tenant: Option<jammi_db::TenantId>,
+    attempt: u32,
+    partial_result: Option<&str>,
+    instance_id: &str,
+) -> Result<PartialResultDisposition> {
+    if attempt <= 1 {
+        return Ok(PartialResultDisposition::MaterializeAnew);
+    }
+    let Some(table_name) = partial_result else {
+        return Ok(PartialResultDisposition::MaterializeAnew);
+    };
+    let Some(record) = catalog.get_result_table(table_name).await? else {
+        // The row vanished (e.g. a prior fail+delete already reaped it) —
+        // nothing to adopt.
+        return Ok(PartialResultDisposition::MaterializeAnew);
+    };
+    match record.status.as_str() {
+        "ready" => Ok(PartialResultDisposition::Ready(JobResult::Table {
+            table: record.table_name,
+            cache_outcome: "computed".to_string(),
+        })),
+        "building" => {
+            let claim_writer_id = format!("{instance_id}/reclaim-{}", uuid::Uuid::new_v4());
+            let lease = session.worker_intervals()?.lease;
+            let cas = jammi_db::catalog::result_repo::ResultTableCas::expired(table_name, tenant);
+            let claimed = catalog
+                .claim_expired_building_table(&cas, &claim_writer_id, lease)
+                .await?;
+            if !claimed {
+                // Either the writer is still renewing (a live lease), or a
+                // peer reaper already won the claim — either way, do not
+                // double-produce.
+                return Ok(PartialResultDisposition::BackOff);
+            }
+            let fail_cas = jammi_db::catalog::result_repo::ResultTableCas::writer(
+                table_name,
+                &claim_writer_id,
+                tenant,
+            );
+            // Best-effort: a miss here (a peer somehow raced this claim)
+            // changes nothing about THIS attempt's own next step, which is
+            // to materialize its own fresh table either way.
+            catalog.fail_building_table(&fail_cas).await.ok();
+            Ok(PartialResultDisposition::MaterializeAnew)
+        }
+        _ => Ok(PartialResultDisposition::MaterializeAnew),
+    }
+}
+
 /// Execute one [`ComputeSpec`] to a terminal [`JobResult`], with NO catalog
 /// job-row bookkeeping of its own — the caller
 /// ([`InferenceSession::run_now`] for an inline job, or
 /// [`crate::fine_tune::worker::JobWorker`] for a queued one) owns the
-/// claim/lease/finish around this call. Dispatches to the SAME pipeline
-/// entry points the direct `InferenceSession` verbs call
-/// ([`InferenceSession::build_neighbor_graph`],
-/// [`InferenceSession::propagate_embeddings`],
-/// [`InferenceSession::asof_join`]), so a claimed compute job and a direct
-/// embedded call materialise byte-identical tables. Every compute kind
-/// bypasses the exact-match cache (`CachePolicy::Bypass`) here: a job's
-/// caller has already dispatched on `jobs.partial_result` (N1) before
-/// reaching this far, so a second, independent cache probe inside the
-/// pipeline itself would be redundant.
+/// claim/lease/finish around this call, and threads `job_attempt` (the
+/// claim's own identity) into every producer so the result table's
+/// `partial_result` CAS lands under the correct attempt (N1, N11/esc-105).
+///
+/// Dispatches to each verb's `*_materialize` method DIRECTLY, never to the
+/// public `InferenceSession::build_neighbor_graph` /
+/// `propagate_embeddings` / `asof_join` / `generate_embeddings` / `infer`
+/// wrappers — those wrappers themselves call `InferenceSession::run_now`,
+/// which calls back into this function; dispatching to the wrapper here
+/// would recurse forever. A claimed compute job and a direct `run_now`
+/// embedded call both bottom out at the SAME `*_materialize` call, so they
+/// materialise byte-identical tables (K4).
+///
+/// Every kind's [`CachePolicy`] rides in its own `spec` field (item 3):
+/// [`ComputeSpec::NeighborGraph`] and [`ComputeSpec::Propagate`] are pinned
+/// (N1's withdrawn-unpinned-sentence) and genuinely honour `Use`; the other
+/// kinds are unpinned, so `Use` is an honest miss for them, but the caller's
+/// policy is never silently overridden here.
 pub async fn execute_compute(
     session: &Arc<InferenceSession>,
     spec: &ComputeSpec,
+    job_attempt: jammi_db::catalog::result_repo::JobAttempt<'_>,
 ) -> Result<JobResult> {
     match spec {
         ComputeSpec::NeighborGraph {
             source_id,
             embedding_table,
             params,
+            cache,
         } => {
             let (record, outcome) = session
-                .build_neighbor_graph(
+                .build_neighbor_graph_materialize(
                     source_id,
                     embedding_table.as_deref(),
                     params,
-                    CachePolicy::Bypass,
+                    *cache,
+                    Some(job_attempt),
                 )
                 .await?;
             Ok(table_result(record, outcome))
         }
-        ComputeSpec::Propagate(request) => {
+        ComputeSpec::Propagate { request, cache } => {
             let (record, outcome) = session
-                .propagate_embeddings(request, CachePolicy::Bypass)
+                .propagate_embeddings_materialize(request, *cache, Some(job_attempt))
                 .await?;
             Ok(table_result(record, outcome))
         }
         ComputeSpec::AsofJoin { spine, facts, spec } => {
-            let record = session.asof_join(spine, facts, spec).await?;
+            let record = session
+                .asof_join_materialize(spine, facts, spec, Some(job_attempt))
+                .await?;
             Ok(JobResult::Table {
                 table: record.table_name,
                 cache_outcome: "computed".to_string(),
+            })
+        }
+        ComputeSpec::Embedding {
+            source_id,
+            model_id,
+            columns,
+            key_column,
+            modality,
+            cache,
+        } => {
+            let (record, outcome) = match modality {
+                jammi_wire::request::Modality::Text => {
+                    session
+                        .generate_text_embeddings(
+                            source_id,
+                            model_id,
+                            columns,
+                            key_column,
+                            *cache,
+                            Some(job_attempt),
+                        )
+                        .await?
+                }
+                jammi_wire::request::Modality::Image => {
+                    let image_column = crate::local_session::single_column(columns, "image")?;
+                    session
+                        .generate_image_embeddings(
+                            source_id,
+                            model_id,
+                            image_column,
+                            key_column,
+                            *cache,
+                            Some(job_attempt),
+                        )
+                        .await?
+                }
+                jammi_wire::request::Modality::Audio => {
+                    let audio_column = crate::local_session::single_column(columns, "audio")?;
+                    session
+                        .generate_audio_embeddings(
+                            source_id,
+                            model_id,
+                            audio_column,
+                            key_column,
+                            *cache,
+                            Some(job_attempt),
+                        )
+                        .await?
+                }
+            };
+            Ok(table_result(record, outcome))
+        }
+        ComputeSpec::Infer {
+            source_id,
+            model_id,
+            task,
+            content_columns,
+            key_column,
+            cache,
+        } => {
+            let source = crate::model::ModelSource::parse(model_id);
+            let (table, _batches, outcome) = session
+                .infer_materialize(
+                    source_id,
+                    &source,
+                    *task,
+                    content_columns,
+                    key_column,
+                    *cache,
+                    Some(job_attempt),
+                )
+                .await?;
+            let cache_outcome = match outcome {
+                CacheOutcome::Computed => "computed".to_string(),
+                CacheOutcome::Reused { table } => format!("reused:{table}"),
+            };
+            Ok(JobResult::Table {
+                table,
+                cache_outcome,
             })
         }
     }
@@ -346,7 +567,19 @@ impl InferenceSession {
                     instance_id: instance_id.clone(),
                     attempts: claimed.attempts,
                 });
-        let outcome = execute_compute(self, &spec).await;
+        // `run_now` always submits a BRAND NEW `job_id` (never reused across
+        // calls), so `claimed.attempts` is always 1 here — there is no
+        // N1 partial_result to dispatch on (an inline job has no requeue
+        // arm; it is a fresh row every time). `execute_compute` still runs
+        // through the normal producer path with the real `JobAttempt` this
+        // claim just won, so `create_table`'s `partial_result` CAS is
+        // correctly attributed from attempt 1.
+        let job_attempt = jammi_db::catalog::result_repo::JobAttempt {
+            job_id: &job_id,
+            instance_id: &instance_id,
+            attempts: claimed.attempts,
+        };
+        let outcome = execute_compute(self, &spec, job_attempt).await;
         drop(registration);
         match outcome {
             Ok(job_result) => {
@@ -383,12 +616,15 @@ mod tests {
     /// fresh process.
     #[test]
     fn compute_spec_round_trips_through_json() {
-        let spec = ComputeSpec::Propagate(PropagateRequest::new(
-            "src",
-            crate::pipeline::graph_neighbourhood::EdgeSourceRef::NeighborGraph {
-                table_name: "edges".into(),
-            },
-        ));
+        let spec = ComputeSpec::Propagate {
+            request: PropagateRequest::new(
+                "src",
+                crate::pipeline::graph_neighbourhood::EdgeSourceRef::NeighborGraph {
+                    table_name: "edges".into(),
+                },
+            ),
+            cache: CachePolicy::Bypass,
+        };
         let json = serde_json::to_string(&spec).unwrap();
         let back: ComputeSpec = serde_json::from_str(&json).unwrap();
         assert_eq!(back.kind(), "propagate");
@@ -440,6 +676,7 @@ mod tests {
                 k: 5,
                 ..Default::default()
             },
+            cache: CachePolicy::Bypass,
         };
         let json = serde_json::to_string(&ng).unwrap();
         let back: ComputeSpec = serde_json::from_str(&json).unwrap();

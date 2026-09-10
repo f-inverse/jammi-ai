@@ -338,6 +338,14 @@ The OSS server ships as two public Docker images on GHCR:
 - `ghcr.io/f-inverse/jammi-ai-server` — **CPU**, built from a distroless base.
 - `ghcr.io/f-inverse/jammi-ai-server-cu12` — **CUDA**, for GPU-accelerated inference (see [GPU serving](#gpu-serving)).
 
+The generic CPU tags (`:latest`, `:vX.Y.Z`, `:vX.Y`, and their `sha-<sha>`
+equivalents) are multi-arch image indexes: `linux/amd64` and `linux/arm64`,
+so `docker pull`/`docker run` resolves the right member for the host's
+architecture automatically. The self-contained CPU tags
+(`:selfcontained`, `:selfcontained-sha-<sha>`) and the CUDA (`-cu12`) tags
+are `linux/amd64` only, pushed under the same CPU image name in the
+self-contained case.
+
 Both run as the nonroot user (uid `65532`), expose the same `8080` / `8081` ports the local binary listens on, and share the same tag scheme (`:latest`, `:vX.Y.Z`, `:vX.Y`). Both `:latest` tags are re-pointed by every `v*` release tag (never by a prerelease); the CPU `:latest` can additionally be re-pointed to the current `main` by a manual `build-and-push-main` dispatch. The image entrypoint is `jammi-server`, so `docker run <image>` brings up the server with **zero config** — a local SQLite catalog, the in-memory broker, and every service tier, no TOML required. The `jammi` admin CLI also ships in the image for running verbs against the server. The examples below use the CPU image, and bind both published ports to `127.0.0.1`: the server itself performs no authentication (see [The identity seam](#the-identity-seam)), so publishing to every interface would expose an unauthenticated admin surface to the host's whole network — a terminator or reverse proxy that itself binds a public interface is what a deployment fronts these loopback-bound ports with.
 
 ```bash
@@ -455,9 +463,23 @@ CI checks both of these, in two separate steps, on every push job:
 imagetools inspect`) that the pushed digest's own OCI index carries BOTH a
 non-empty SBOM and a non-empty provenance attestation manifest; a positively
 empty accessor fails the job immediately rather than falling back to a
-looser check. A separate `gh attestation verify oci://... --bundle-from-oci`
-step then verifies the Sigstore-signed bundle `attest-build-provenance`
-published as an OCI referrer — the check above never touches that bundle.
+looser check. Which SHAPE each attestation must then match is decided by
+the index's own platform count, read off the raw OCI index, never by the
+attestation's own key spelling: a multi-platform index (the merged CPU
+manifest list, `linux/amd64` + `linux/arm64`) requires the per-platform map,
+its key set checked for exact equality against the index's platform set, so
+an attestation covering only one of the merged legs — the other landed
+unattested — fails the job by name, rather than passing because *some*
+platform was attested. A single-platform push (the CUDA `-cu12` tags, the
+dispatch-only `:selfcontained` build, and each per-arch `sha-<sha>-<arch>`
+leg before it is merged) instead requires the FLAT predicate object buildx
+actually emits for a single platform — `{"SLSA":{...}}` / `{"SPDX":{...}}`
+— since that flat object and the per-platform map are structurally
+indistinguishable by key inspection alone (both are "a non-empty object of
+non-empty objects"); the index's platform count is what breaks the tie. A
+separate `gh attestation verify oci://... --bundle-from-oci` step then
+verifies the Sigstore-signed bundle `attest-build-provenance` published as
+an OCI referrer — the check above never touches that bundle.
 The `compose-smoke` workflow's own build (`load: true`, loaded into the
 runner's daemon, never pushed) carries neither: `sbom` and `provenance` are
 explicitly `false` there, since the stock Docker exporter a `load` build

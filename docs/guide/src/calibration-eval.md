@@ -171,6 +171,9 @@ delta with a confidence interval and a p-value — not a vibe.
 
 ## Determinism
 
-Given the same inputs the report is bit-for-bit reproducible: every scoring
-function is deterministic and the only randomness — the cohort confidence-interval
-bootstrap — runs under a pinned seed.
+Given the same inputs on the same host the report is bit-for-bit reproducible:
+every scoring function is deterministic and the only randomness — the cohort
+confidence-interval bootstrap — runs under a pinned seed. The scoring folds are
+`f32`/`f64` reductions, so they are a same-host guarantee, not a cross-host one
+— a different CPU host can produce the same score at the value level while
+differing in the last float bits.

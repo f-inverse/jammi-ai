@@ -11,10 +11,10 @@ name: Release Binaries
 # gated on the shared GPU-prove verdict — #454 follow-up, operator
 # direction: every release publisher gates on the prove verdict,
 # all-or-nothing, not only the CUDA lanes):
-#   - the CPU `jammi` CLI (`build` matrix: x86_64-linux + aarch64-darwin
-#     builds it, `promote-binaries` matrix uploads it),
-#   - the CPU `jammi-server` tarball (`server-cpu` builds it, x86_64-linux;
-#     `server-cpu-promote` uploads it), and
+#   - the CPU `jammi` CLI (`build` matrix: x86_64-linux + aarch64-linux +
+#     aarch64-darwin builds it, `promote-binaries` matrix uploads it),
+#   - the CPU `jammi-server` tarball (`server-cpu` matrix builds it,
+#     x86_64-linux + aarch64-linux; `server-cpu-promote` matrix uploads it), and
 #   - the CUDA `jammi-server` tarball (`server-cu12-build` builds it,
 #     `server-cu12-promote` uploads it, x86_64-linux) — the binary plus the
 #     CUDA runtime `.so`s it links and an `LD_LIBRARY_PATH` launcher, so it
@@ -68,8 +68,39 @@ env:
   CARGO_TERM_COLOR: always
 
 jobs:
+  # Resolves BOTH mutable CI base-image tags to their index digests ONCE per
+  # workflow run (`.github/actions/resolve-ci-image`), so every leg below --
+  # the Linux CLI/server builds (CPU) and the CUDA server build -- share the
+  # exact same base even if `:latest` is republished mid-run. See
+  # `server-image.yml`'s identical `resolve-base` job for the same rationale.
+  resolve-base:
+    name: Resolve CI base images
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    outputs:
+      image: ${{ steps.cpu.outputs.image }}
+      image_cuda: ${{ steps.cuda.outputs.image }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: docker/setup-buildx-action@8d2750c68a42422c14e847fe6c8ac0403b4cbd6f # v3.12.0
+      - uses: docker/login-action@c94ce9fb468520275223c153574b00df6fe4bcc9 # v3.7.0
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ github.token }}
+      - id: cpu
+        uses: ./.github/actions/resolve-ci-image
+        with:
+          ref: ${{ vars.JAMMI_CI_IMAGE || 'ghcr.io/f-inverse/jammi-ai-ci:latest' }}
+      - id: cuda
+        uses: ./.github/actions/resolve-ci-image
+        with:
+          ref: ${{ vars.JAMMI_CI_IMAGE_CUDA || 'ghcr.io/f-inverse/jammi-ai-ci-cuda:latest' }}
+
   build:
     name: Build ${{ matrix.target }}
+    needs: [resolve-base]
     permissions:
       contents: read
     outputs:
@@ -94,7 +125,7 @@ jobs:
           # gate).
           - target: x86_64-unknown-linux-gnu
             runs-on: ubuntu-latest
-            container: ${{ vars.JAMMI_CI_IMAGE || 'ghcr.io/f-inverse/jammi-ai-ci:latest' }}
+            container: ${{ needs.resolve-base.outputs.image }}
             deny_warnings: "false"
           # Apple-silicon native build. mold is Linux-only (config.toml scopes
           # it to the linux targets) and never applied to this leg either
@@ -103,10 +134,15 @@ jobs:
             runs-on: macos-14
             container: ""
             deny_warnings: "false"
-          # linux-aarch64 is deferred here (not blocked): the arm Linux
-          # runner and the multi-arch CI base image both exist now (#482).
-          # The aarch64 release rows land together with the rest of the
-          # arm64 release lanes, in the unit that adds them.
+          # arm Linux runner, native (no QEMU), same manylinux_2_28 CI base
+          # (glibc 2.28 floor) as the x86_64 leg above -- resolved to the
+          # SAME base digest the x86_64 leg uses (`resolve-base`), so both
+          # halves of one release build on one toolchain. `+fp16` applies
+          # unconditionally from `.cargo/config.toml` (E-1).
+          - target: aarch64-unknown-linux-gnu
+            runs-on: ubuntu-24.04-arm
+            container: ${{ needs.resolve-base.outputs.image }}
+            deny_warnings: "false"
 
     runs-on: ${{ matrix.runs-on }}
     container: ${{ matrix.container }}
@@ -159,7 +195,7 @@ jobs:
       # ONLY job that attaches this asset to a release, and it does so only
       # on a proven tag ref. A unique per-target artifact name is required
       # -- GitHub rejects two artifacts of the same name in one run, and
-      # this matrix has two legs.
+      # this matrix has three legs.
       - uses: actions/upload-artifact@v4
         with:
           name: jammi-${{ matrix.target }}
@@ -184,6 +220,7 @@ jobs:
         include:
           - target: x86_64-unknown-linux-gnu
           - target: aarch64-apple-darwin
+          - target: aarch64-unknown-linux-gnu
     runs-on: ubuntu-latest
     permissions:
       # `gh release create` / `gh release upload` (the release-upload action).
@@ -225,15 +262,30 @@ jobs:
           asset: ${{ steps.locate.outputs.asset }}
 
   # ---- CPU jammi-server tarball ----
-  # Mirrors the CPU `jammi` CLI job above: x86_64-linux, built in the CI base
-  # image (glibc 2.28 floor), with the broker + cloud-storage features that match
-  # the published server image and PyPI wheel.
+  # Mirrors the CPU `jammi` CLI job above: two-leg matrix (x86_64-linux,
+  # aarch64-linux), both built in the CI base image (glibc 2.28 floor), with
+  # the broker + cloud-storage features that match the published server
+  # image and PyPI wheel.
   server-cpu:
-    name: Build jammi-server (CPU)
-    runs-on: ubuntu-latest
-    container: ${{ vars.JAMMI_CI_IMAGE || 'ghcr.io/f-inverse/jammi-ai-ci:latest' }}
+    name: Build jammi-server (CPU, ${{ matrix.target }})
+    needs: [resolve-base]
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - target: x86_64-unknown-linux-gnu
+            runner: ubuntu-latest
+          - target: aarch64-unknown-linux-gnu
+            runner: ubuntu-24.04-arm
+    runs-on: ${{ matrix.runner }}
+    container: ${{ needs.resolve-base.outputs.image }}
     permissions:
       contents: read
+    # BLOCK: matrix-job outputs are ambiguous across legs (the last leg to
+    # finish wins for ALL legs) -- `server-cpu-promote` below never reads
+    # this cross-matrix; it recomputes the exact asset filename by locating
+    # the one file its own downloaded artifact contains, same pattern
+    # `promote-binaries` already uses for the CLI matrix above.
     outputs:
       asset: ${{ steps.package.outputs.asset }}
     steps:
@@ -250,19 +302,21 @@ jobs:
       - name: Package
         id: package
         shell: bash
-        run: bash ci/scripts/package_release_bin.sh jammi-server x86_64-unknown-linux-gnu
+        run: bash ci/scripts/package_release_bin.sh jammi-server "${{ matrix.target }}"
 
       # ALWAYS a workflow artifact -- this job never consults the GPU-prove
       # verdict (it never promotes anything on its own); `server-cpu-
       # promote` below is the only job that attaches this asset to a
-      # release, and only on a proven tag ref.
+      # release, and only on a proven tag ref. A unique per-target artifact
+      # name is required -- GitHub rejects two artifacts of the same name in
+      # one run, and this matrix has two legs.
       - uses: actions/upload-artifact@v4
         with:
-          name: jammi-server-cpu-tarball
+          name: jammi-server-cpu-${{ matrix.target }}
           path: ${{ steps.package.outputs.asset }}
 
   server-cpu-promote:
-    name: Promote jammi-server (CPU) to the release
+    name: Promote jammi-server (CPU, ${{ matrix.target }}) to the release
     # build → proof → promote: uploads to the release ONLY on a `v*` tag ref
     # (push or dispatch-on-tag) whose commit's GPU-prove verdict is green
     # (#454 follow-up, operator direction: every release publisher gates on
@@ -272,6 +326,12 @@ jobs:
     # every dispatch as an artifact-only rehearsal.
     needs: [server-cpu, gpu-proof]
     if: always() && startsWith(github.ref, 'refs/tags/v') && needs.server-cpu.result == 'success' && needs.gpu-proof.result == 'success'
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - target: x86_64-unknown-linux-gnu
+          - target: aarch64-unknown-linux-gnu
     runs-on: ubuntu-latest
     permissions:
       # `gh release create` / `gh release upload` (the release-upload action).
@@ -284,18 +344,32 @@ jobs:
 
       - uses: actions/download-artifact@v4
         with:
-          name: jammi-server-cpu-tarball
+          name: jammi-server-cpu-${{ matrix.target }}
+
+      # Deterministic recompute (see `server-cpu`'s own `outputs.asset`
+      # comment above for why this is not read cross-matrix): the downloaded
+      # artifact's directory holds exactly one file, packaged by
+      # `package_release_bin.sh` as `jammi-server-<version>-${{
+      # matrix.target }}.tar.gz` from this same checked-out commit's
+      # Cargo.toml.
+      - name: Locate the downloaded asset
+        id: locate
+        shell: bash
+        run: |
+          set -euo pipefail
+          asset="$(ls "jammi-server-"*"-${{ matrix.target }}.tar.gz")"
+          echo "asset=$asset" >> "$GITHUB_OUTPUT"
 
       # Before the upload: the attestation's subject is the exact tarball
       # bytes about to be attached to the release.
       - name: Attest build provenance
         uses: actions/attest-build-provenance@4d101475d8b20a2381f78447822ac1eab6504dd8 # v4.2.2
         with:
-          subject-path: ${{ needs.server-cpu.outputs.asset }}
+          subject-path: ${{ steps.locate.outputs.asset }}
 
       - uses: ./.github/actions/release-upload
         with:
-          asset: ${{ needs.server-cpu.outputs.asset }}
+          asset: ${{ steps.locate.outputs.asset }}
 
   # ---- CUDA jammi-server tarball ----
   # Built in the CUDA CI base image (CUDA 12.6 toolkit). The tarball is
@@ -326,8 +400,9 @@ jobs:
   # with `gpu-proof`'s verdict lookup/wait instead of serializing after it.
   server-cu12-build:
     name: Build jammi-server (CUDA)
+    needs: [resolve-base]
     runs-on: ubuntu-latest
-    container: ${{ vars.JAMMI_CI_IMAGE_CUDA || 'ghcr.io/f-inverse/jammi-ai-ci-cuda:latest' }}
+    container: ${{ needs.resolve-base.outputs.image_cuda }}
     permissions:
       contents: read
     outputs:
@@ -397,7 +472,23 @@ jobs:
             [0-9]*.[0-9]*.[0-9]*) ;;
             *) echo "::error::could not parse a semver workspace version out of Cargo.toml (got: '${version}')" >&2; exit 1 ;;
           esac
-          asset="jammi-server-cu12-${version}-x86_64-unknown-linux-gnu.tar.gz"
+          # ONE variable for both the asset name's triple and the
+          # assert's expected arch -- a second hardcoded `x86_64` here
+          # previously could drift from the asset name's triple with no
+          # gate to catch it.
+          triple=x86_64-unknown-linux-gnu
+          arch=${triple%%-*}
+          asset="jammi-server-cu12-${version}-${triple}.tar.gz"
+
+          # Class closure (#482): this tarball's own name asserts
+          # x86_64-unknown-linux-gnu; nothing checked that the just-built
+          # binary's own ELF machine actually is x86_64 before it shipped
+          # under that name. The CPU server leg above gets this for free
+          # via `package_release_bin.sh`'s S4 assert -- this leg is bespoke
+          # (CUDA lib bundling + launcher assembly) and never went through
+          # that script, so it calls the same shared `assert_elf_machine.sh`
+          # directly.
+          bash ci/scripts/assert_elf_machine.sh target/release/jammi-server "$arch"
 
           stage="jammi-server-cu12"
           mkdir -p "${stage}/lib"

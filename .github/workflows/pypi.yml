@@ -31,11 +31,44 @@ permissions:
   contents: read
 
 jobs:
-  build-native-linux:
-    name: Build native wheel (Linux)
+  # Resolves the mutable CI base-image tag to its index digest ONCE per
+  # workflow run (`.github/actions/resolve-ci-image`), so both native-Linux
+  # legs below build against the exact same base even if `:latest` is
+  # republished mid-run.
+  resolve-base:
+    name: Resolve CI base image
     runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    outputs:
+      image: ${{ steps.resolve.outputs.image }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: docker/setup-buildx-action@8d2750c68a42422c14e847fe6c8ac0403b4cbd6f # v3.12.0
+      - uses: docker/login-action@c94ce9fb468520275223c153574b00df6fe4bcc9 # v3.7.0
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ github.token }}
+      - id: resolve
+        uses: ./.github/actions/resolve-ci-image
+        with:
+          ref: ${{ vars.JAMMI_CI_IMAGE || 'ghcr.io/f-inverse/jammi-ai-ci:latest' }}
+
+  build-native-linux:
+    name: Build native wheel (Linux, ${{ matrix.arch }})
+    needs: [resolve-base]
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - arch: x86_64
+            runner: ubuntu-latest
+          - arch: aarch64
+            runner: ubuntu-24.04-arm
+    runs-on: ${{ matrix.runner }}
     container:
-      image: ${{ vars.JAMMI_CI_IMAGE || 'ghcr.io/f-inverse/jammi-ai-ci:latest' }}
+      image: ${{ needs.resolve-base.outputs.image }}
     defaults:
       run:
         working-directory: packaging/native
@@ -47,12 +80,43 @@ jobs:
           # never wanted -D warnings (a wheel-build lane, not the lint gate).
           deny-warnings: false
 
+      # No `--platform-tag` relabel here -- that is `_pypi-server.yml`'s
+      # mechanism only (a prebuilt binary staged into a hatchling wheel).
+      # maturin derives its own platform tag from the container it runs in
+      # (manylinux_2_28_${{ matrix.arch }}).
       - name: Build native wheel
         run: maturin build --release --out dist
 
+      # W3: the sufficient ABI floor assert, run against the cdylib INSIDE
+      # the built wheel (maturin, unlike `_pypi-server.yml`'s staged
+      # binary, never leaves a bare .so at a fixed path -- unzip first).
+      - name: Assert the GLIBC symbol-version floor (manylinux_2_28)
+        id: glibc-floor
+        run: |
+          set -euo pipefail
+          wheel="$(ls dist/*.whl)"
+          workdir="$(mktemp -d)"
+          python3 -m zipfile -e "$wheel" "$workdir"
+          so="$(find "$workdir" -name '*.so' -print -quit)"
+          if [ -z "$so" ]; then
+            echo "::error::no .so found inside $wheel -- cannot assert the GLIBC floor" >&2
+            exit 1
+          fi
+          bash ../../ci/scripts/assert_glibc_floor.sh "$so" 2.28
+          echo "so_path=$so" >> "$GITHUB_OUTPUT"
+
+      # BLOCK 1 (#482): maturin derives the wheel's own platform tag
+      # (manylinux_2_28_${{ matrix.arch }}) from the container it runs in --
+      # nothing re-checks that the built `.so`'s actual machine matches
+      # `matrix.arch` before it ships under that tag. Same shared script
+      # `_pypi-server.yml` and `package_release_bin.sh` use, run against the
+      # `.so` this job already unzipped above.
+      - name: Assert the wheel's .so ELF machine matches matrix.arch
+        run: bash ../../ci/scripts/assert_elf_machine.sh "${{ steps.glibc-floor.outputs.so_path }}" ${{ matrix.arch }}
+
       - uses: actions/upload-artifact@v4
         with:
-          name: wheels-native-linux
+          name: wheels-native-linux-${{ matrix.arch }}
           path: packaging/native/dist
 
   build-native-macos:
@@ -71,9 +135,11 @@ jobs:
           - runner: macos-14
             target: aarch64-apple-darwin
             artifact: wheels-native-macos-arm64
+            assert_arch: aarch64
           - runner: macos-15-intel
             target: x86_64-apple-darwin
             artifact: wheels-native-macos-x86_64
+            assert_arch: x86_64
     steps:
       - uses: actions/checkout@v4
 
@@ -99,6 +165,25 @@ jobs:
           args: --release --out dist
         env:
           RUSTC_WRAPPER: ""
+
+      # Class closure (#482): the Linux legs above assert their wheel's .so
+      # ELF machine matches matrix.arch (BLOCK 1); this leg stamped a
+      # platform tag (`macosx_*_arm64`/`macosx_*_x86_64`, maturin-derived
+      # from `matrix.target`) with nothing checking the built `.so`'s
+      # actual Mach-O machine before it shipped under that tag. Same shared
+      # `assert_elf_machine.sh` every other arch-stamping leg calls.
+      - name: Assert the wheel's .so Mach-O machine matches matrix.target
+        run: |
+          set -euo pipefail
+          wheel="$(ls dist/*.whl)"
+          workdir="$(mktemp -d)"
+          python3 -m zipfile -e "$wheel" "$workdir"
+          so="$(find "$workdir" -name '*.so' -print -quit)"
+          if [ -z "$so" ]; then
+            echo "::error::no .so found inside $wheel -- cannot assert its Mach-O machine" >&2
+            exit 1
+          fi
+          bash ../../ci/scripts/assert_elf_machine.sh "$so" ${{ matrix.assert_arch }}
 
       - uses: actions/upload-artifact@v4
         with:

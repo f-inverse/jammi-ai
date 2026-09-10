@@ -10,9 +10,14 @@ is, and how a reader reacts to a stamp it cannot honour.
 The single principle: **a reader never guesses.** When a stamp is unreadable the
 load fails loud with a typed error; the upgrade path is to **re-emit** the
 artifact from its definition. There is no back-compat reader, no silent
-downgrade, no default-to-version-1. (Re-emitting is cheap and exact: a result
-table is the deterministic output of its producing definition over its pinned
-input anchors — see [The Materialization Contract](./materialization-contract.md).)
+downgrade, no default-to-version-1. (Re-emitting is cheap and exact on the
+producing host: a result table is the deterministic output of its producing
+definition over its pinned input anchors — see
+[The Materialization Contract](./materialization-contract.md). Across hosts a
+CPU-produced result table's identity is the catalog row plus its
+`definition_hash`, not its bytes: a float reduction can move by an ULP between
+hosts of different CPU microarchitecture even though the definition and inputs
+are pinned identically.)
 
 ## The per-format table
 
@@ -155,7 +160,10 @@ For every stamped format above, the recovery from an incompatible stamp is the
 same — **re-emit the artifact from its definition.** The engine ships no
 back-compat reader and no in-place migrator: an ANN sidecar is rebuilt by
 re-running the embedding producer, a tantivy index by re-indexing, a result
-table by re-running its producing definition over its input anchors. Because a
-result table is the deterministic output of a producing definition over pinned
-inputs, re-emission is exact, not lossy. The typed rejection is the signal to
-re-emit; it is never something to paper over with a default.
+table by re-running its producing definition over its input anchors. A result
+table's identity after re-emission is its catalog row and `definition_hash`,
+which are exact and not lossy; on the producing host the bytes are exact too,
+but a re-emission on a different CPU host is not asserted byte-identical to
+the original (see [The Materialization Contract](./materialization-contract.md)).
+The typed rejection is the signal to re-emit; it is never something to paper
+over with a default.

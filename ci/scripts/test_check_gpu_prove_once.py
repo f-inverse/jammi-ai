@@ -239,6 +239,8 @@ def _server_image_yml(
     selfcontained_if: str = (
         "github.event_name == 'workflow_dispatch' && inputs.selfcontained && github.ref_type != 'tag'"
     ),
+    merge_tag_if: str | None = None,
+    merge_main_if: str = "needs.build-and-push-main.result == 'success' && github.ref_type != 'tag'",
 ) -> str:
     jobs = (
         _gate_job("gpu-proof")
@@ -246,6 +248,11 @@ def _server_image_yml(
         + _promoting_job("build-and-push", if_expr=cpu_tag_if)
         + _ungated_job("build-and-push-main", main_if)
         + _ungated_job("build-and-push-selfcontained", selfcontained_if)
+        # S1/T8: the two-arch CPU merge jobs -- `merge-cpu-tag` chains off
+        # `build-and-push` (itself direct-gated), `merge-cpu-main` is a
+        # second "none" row, same shape as `build-and-push-main` above.
+        + _promoting_job("merge-cpu-tag", gate_name="build-and-push", if_expr=merge_tag_if)
+        + _ungated_job("merge-cpu-main", merge_main_if)
     )
     return _wf("v*", jobs)
 

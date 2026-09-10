@@ -92,10 +92,15 @@ The encoder pools through the engine's vector-aggregation functions
 (`vector_mean` / `vector_sum` / `vector_max`) — the *same* element-wise
 aggregation the engine ships for grouped vector reduction. The pool is:
 
-- **permutation-invariant** — shuffling the context rows yields a byte-identical
-  vector (the aggregate folds with a commutative, associative operator);
-- **deterministic** under exact retrieval — the pooled vector is reproducible
-  across runs.
+- **permutation-invariant in value** — shuffling the context rows yields the
+  same vector *value*, but not necessarily byte-identical bits: the pool runs
+  through the engine's vector-aggregation SQL UDAF (`vector_mean`/`vector_sum`/
+  `vector_max`), and `f64` `+` is non-associative, so a different query
+  partitioning can move the last bits even though the aggregate is commutative
+  and associative at the value level;
+- **stable run-to-run** under a fixed execution plan on one host — the pooled
+  vector is reproducible across runs, not asserted byte-identical across an
+  arbitrary re-partitioning or a different host.
 
 `mean` discards set size; `sum` encodes it; `max` is robust but lossy. None is
 universally right, which is why the aggregator is a knob and `context_size` is

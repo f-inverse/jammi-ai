@@ -104,6 +104,7 @@ async fn start_grpc_test_server() -> (
             store_for_server,
         ),
         admin_authorizer: None,
+        limits: jammi_db::config::LimitsConfig::default(),
     };
     let (addr, handle) = super::common::grpc::spawn_bound_chain(chain, shutdown_rx).await;
 

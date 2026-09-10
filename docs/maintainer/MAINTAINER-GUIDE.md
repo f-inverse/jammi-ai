@@ -495,7 +495,7 @@ Every trait/enum/base surface a maintainer extends, with anchors and invariants.
   `true` (default `true`); **not** the unconditional `with_embedded_worker`
   form. This is the SAME key the server's chain assembly and the Python embedded
   arm read before deciding whether THEIR process claims —
-  `worker.enabled` (`crates/jammi-server/src/runtime.rs:1154`) and
+  `worker.enabled` (`crates/jammi-server/src/runtime.rs:1204`) and
   `worker.enabled` (`crates/jammi-python/src/database.rs:98`) — so a wire
   deployment and an in-process one answer "does THIS process claim?"
   identically rather than by three private conventions. `Target`
@@ -3835,6 +3835,18 @@ auto-available to every encoder.)
 - **gRPC-Web layer order is load-bearing.** `GrpcWebTrailersLayer` *before* `GrpcWebLayer`
   (`crates/jammi-server/src/runtime.rs`); reorder and gRPC-Web error handling breaks (raw gRPC
   unaffected).
+- **`[server.limits]`'s layer stack is INSIDE the gRPC-Web layers, never tonic's own
+  `concurrency_limit_per_connection`/`load_shed` builder knobs.** `RefusalStatusLayer` →
+  `GlobalConcurrencyLimitLayer` → `PerConnectionLimitLayer` → `MethodClassLayer` (`crates/
+  jammi-server/src/limits.rs`), added via `.layer()` calls AFTER `GrpcWebLayer` in
+  `BoundChain::serve_with_shutdown` (`crates/jammi-server/src/runtime.rs`). tonic's own
+  per-connection concurrency/load-shed builder methods sit OUTSIDE every user `.layer()`
+  call (`tonic-0.14.5/src/transport/server/mod.rs`'s `MakeSvc::call`) — a refusal from
+  those would be both uncounted (`jammi_grpc_refused_total` never sees it) and never
+  gRPC-Web-framed. Message-size enforcement is NOT a layer at all: every mounted service
+  (including Flight SQL) carries its own `max_decoding_message_size`, and that specific
+  tonic-codec rejection is `OUT_OF_RANGE`, not `RESOURCE_EXHAUSTED` — verified against
+  the vendored tonic 0.14.5 source, not assumed.
 - **`as_wire` must equal what's mounted** — the `ServerInfo.services` handshake; a service
   mounted without a tier update lies in the handshake.
 - **Faithful errors are a contract.** Every `Status` carries the structured detail via

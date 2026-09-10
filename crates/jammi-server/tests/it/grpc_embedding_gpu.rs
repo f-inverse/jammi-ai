@@ -121,6 +121,7 @@ async fn start_gpu_embedding_server() -> Option<(
         metrics: Arc::new(jammi_server::routes::health::MetricsRegistry::new().unwrap()),
         tenant_resolver: jammi_server::grpc::session::SessionIdTenantResolver::arc(store),
         admin_authorizer: None,
+        limits: jammi_db::config::LimitsConfig::default(),
     };
     let (addr, handle) = super::common::grpc::spawn_bound_chain(chain, shutdown_rx).await;
 

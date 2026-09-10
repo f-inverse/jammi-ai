@@ -50,6 +50,7 @@ async fn transport_only_chain() -> (GrpcChain, TempDir) {
         metrics: Arc::new(MetricsRegistry::new().unwrap()),
         tenant_resolver: SessionIdTenantResolver::arc(store),
         admin_authorizer: None,
+        limits: jammi_db::config::LimitsConfig::default(),
     };
     (chain, dir)
 }

@@ -23,6 +23,7 @@ mod grpc_remote_session;
 // as grpc_embedding_gpu above: compiled only under `live-gpu-tests`, skips
 // cleanly without a visible GPU.
 mod grpc_job;
+mod grpc_limits;
 #[cfg(feature = "live-gpu-tests")]
 mod grpc_remote_session_gpu;
 mod grpc_session;

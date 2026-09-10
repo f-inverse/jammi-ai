@@ -2217,3 +2217,183 @@ fn bare_env_artifact_dir_round_trips() {
     .unwrap();
     assert_eq!(cfg.artifact_dir, PathBuf::from("/srv/jammi"));
 }
+
+// ── `[server.limits]` (PLAN-C §5) ─────────────────────────────────────────
+
+#[test]
+fn limits_config_defaults_match_the_documented_values() {
+    let limits = LimitsConfig::default();
+    assert_eq!(limits.max_message_bytes, 64 * 1024 * 1024);
+    assert_eq!(limits.max_in_flight, 256);
+    assert_eq!(limits.max_in_flight_per_connection, 64);
+    assert_eq!(limits.request_timeout_secs, None);
+    assert_eq!(limits.wait_timeout_secs, None);
+    assert_eq!(limits.max_subscriptions, 256);
+    assert_eq!(limits.max_job_waits, 1024);
+    assert!(limits.validate().is_ok());
+}
+
+#[test]
+fn limits_config_round_trips_under_server() {
+    let toml_src = r#"
+        [server.limits]
+        max_message_bytes = 1048576
+        max_in_flight = 8
+        max_in_flight_per_connection = 4
+        request_timeout_secs = 30
+        wait_timeout_secs = 300
+        max_subscriptions = 16
+        max_job_waits = 32
+    "#;
+    let cfg: JammiConfig = toml::from_str(toml_src).unwrap();
+    assert_eq!(
+        cfg.server.limits,
+        LimitsConfig {
+            max_message_bytes: 1_048_576,
+            max_in_flight: 8,
+            max_in_flight_per_connection: 4,
+            request_timeout_secs: Some(30),
+            wait_timeout_secs: Some(300),
+            max_subscriptions: 16,
+            max_job_waits: 32,
+        }
+    );
+}
+
+#[test]
+fn limits_config_rejects_unknown_key() {
+    let err = toml::from_str::<JammiConfig>("[server.limits]\nbogus_field = 1\n").unwrap_err();
+    assert!(err.to_string().contains("bogus_field"), "got: {err}");
+}
+
+#[test]
+fn limits_config_zero_in_flight_knobs_mean_unbounded_not_an_error() {
+    // K2: `0` is a valid, meaningful value for the four concurrency/budget
+    // knobs -- it means unbounded, never "refuse everything".
+    let limits = LimitsConfig {
+        max_in_flight: 0,
+        max_in_flight_per_connection: 0,
+        max_subscriptions: 0,
+        max_job_waits: 0,
+        ..LimitsConfig::default()
+    };
+    assert!(limits.validate().is_ok());
+}
+
+#[test]
+fn limits_config_rejects_zero_max_message_bytes() {
+    let limits = LimitsConfig {
+        max_message_bytes: 0,
+        ..LimitsConfig::default()
+    };
+    let err = limits.validate().unwrap_err();
+    assert!(
+        matches!(&err, JammiError::Config(m) if m.contains("max_message_bytes")),
+        "got {err:?}"
+    );
+}
+
+#[test]
+fn limits_config_rejects_per_connection_over_global() {
+    let limits = LimitsConfig {
+        max_in_flight: 4,
+        max_in_flight_per_connection: 5,
+        ..LimitsConfig::default()
+    };
+    let err = limits.validate().unwrap_err();
+    assert!(
+        matches!(&err, JammiError::Config(m) if m.contains("max_in_flight_per_connection")),
+        "got {err:?}"
+    );
+}
+
+#[test]
+fn limits_config_per_connection_over_global_is_allowed_when_global_is_unbounded() {
+    // `max_in_flight = 0` (unbounded) means the per-connection cap can be
+    // any positive value -- there is no global ceiling to exceed.
+    let limits = LimitsConfig {
+        max_in_flight: 0,
+        max_in_flight_per_connection: 1000,
+        ..LimitsConfig::default()
+    };
+    assert!(limits.validate().is_ok());
+}
+
+#[test]
+fn limits_config_rejects_zero_request_timeout() {
+    let limits = LimitsConfig {
+        request_timeout_secs: Some(0),
+        ..LimitsConfig::default()
+    };
+    let err = limits.validate().unwrap_err();
+    assert!(
+        matches!(&err, JammiError::Config(m) if m.contains("request_timeout_secs")),
+        "got {err:?}"
+    );
+}
+
+#[test]
+fn limits_config_rejects_zero_wait_timeout() {
+    let limits = LimitsConfig {
+        wait_timeout_secs: Some(0),
+        ..LimitsConfig::default()
+    };
+    let err = limits.validate().unwrap_err();
+    assert!(
+        matches!(&err, JammiError::Config(m) if m.contains("wait_timeout_secs")),
+        "got {err:?}"
+    );
+}
+
+#[test]
+fn limits_config_rejects_negative_value() {
+    // A negative TOML integer at an unsigned field is refused by
+    // `serde`/`toml` itself, naming the key, before `LimitsConfig::validate`
+    // ever runs.
+    let err = toml::from_str::<JammiConfig>("[server.limits]\nmax_in_flight = -1\n").unwrap_err();
+    assert!(err.to_string().contains("max_in_flight"), "got: {err}");
+}
+
+#[test]
+fn limits_config_rejects_overflowing_value() {
+    // A TOML integer that overflows `u64` is likewise a typed parse error
+    // naming the key, never a silent wraparound.
+    let err = toml::from_str::<JammiConfig>(
+        "[server.limits]\nmax_message_bytes = 99999999999999999999\n",
+    )
+    .unwrap_err();
+    assert!(
+        err.to_string().contains("max_message_bytes") || err.to_string().contains("invalid"),
+        "got: {err}"
+    );
+}
+
+#[test]
+fn load_from_refuses_an_out_of_domain_limits_knob_at_load_time() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("jammi.toml");
+    std::fs::write(&path, "[server.limits]\nmax_message_bytes = 0\n").unwrap();
+    let err = JammiConfig::load_from(Some(&path), std::iter::empty()).unwrap_err();
+    assert!(
+        matches!(&err, JammiError::Config(m) if m.contains("max_message_bytes")),
+        "got {err:?}"
+    );
+}
+
+#[test]
+fn env_override_limits_lands_through_the_struct_derived_layer() {
+    let cfg = JammiConfig::parse_from(
+        "",
+        vec![(
+            "JAMMI_SERVER__LIMITS__MAX_IN_FLIGHT".to_string(),
+            "8".to_string(),
+        )],
+    )
+    .unwrap();
+    assert_eq!(cfg.server.limits.max_in_flight, 8);
+    // Every sibling field stays at its default.
+    assert_eq!(
+        cfg.server.limits.max_in_flight_per_connection,
+        LimitsConfig::default().max_in_flight_per_connection
+    );
+}

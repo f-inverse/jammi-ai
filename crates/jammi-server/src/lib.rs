@@ -18,6 +18,7 @@ pub mod error;
 pub mod flight;
 pub mod grpc;
 pub mod grpc_web_trailers;
+pub mod limits;
 pub mod metrics_layer;
 pub mod probe;
 pub mod routes;

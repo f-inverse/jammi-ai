@@ -161,6 +161,38 @@ flight_listen = "0.0.0.0:8081"
 # Models to preload on server start. Default: [].
 preload_models = ["sentence-transformers/all-MiniLM-L6-v2"]
 
+[server.limits]
+# Request-bounds and refusal policy for the combined gRPC + Flight SQL
+# surface (also applied to the Flight-only listener). A request exceeding
+# any of these is refused at the edge -- before any tenant-scoped catalog
+# read runs, so a refusal never leaks cross-tenant existence -- with a typed
+# gRPC status and a jammi_grpc_refused_total{reason} counter increment.
+# Maximum inbound message size, in bytes. Must be > 0. Default: 67108864
+# (64 MiB). There is no outbound cap.
+max_message_bytes = 67108864
+# Global cap on unary requests in flight across every connection.
+# 0 = unbounded. Default: 256.
+max_in_flight = 256
+# Cap on unary requests in flight on a SINGLE connection. 0 = unbounded;
+# when both this and max_in_flight are non-zero (bounded), this must be
+# <= max_in_flight. Default: 64.
+max_in_flight_per_connection = 64
+# Maximum duration a unary request may run before this server cancels it
+# with DEADLINE_EXCEEDED. Unset (the default) means no server-imposed
+# timeout. Unary methods only -- Subscribe/WaitJob use wait_timeout_secs
+# and the stream budgets below instead.
+# request_timeout_secs = 30
+# Maximum grpc-timeout a CLIENT may request on TriggerService.Subscribe or
+# JobService.WaitJob; a longer request is refused at the edge, before the
+# stream opens. Unset (the default) means no cap.
+# wait_timeout_secs = 300
+# Cap on concurrently open TriggerService.Subscribe streams. 0 = unbounded.
+# Default: 256.
+max_subscriptions = 256
+# Cap on concurrently open JobService.WaitJob streams. 0 = unbounded.
+# Default: 1024.
+max_job_waits = 1024
+
 [logging]
 # Log level: "trace", "debug", "info", "warn", "error". Default: "info".
 level = "info"

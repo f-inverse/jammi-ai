@@ -440,6 +440,10 @@ impl OssServer {
             // constructing `GrpcChain` directly (this OSS binary's own
             // orchestration path has no seam to configure one yet).
             admin_authorizer: None,
+            // `[server.limits]` from the SAME config the engine session was
+            // opened with — a wire deployment and an in-process one read the
+            // identical knob, exactly as `[worker] enabled` does above.
+            limits: self.session.inner_config().server.limits,
         }
     }
 }
@@ -589,6 +593,13 @@ pub struct GrpcChain {
     /// cross-tenant pass supplies its own [`AdminAuthorizer`] here. See that
     /// trait's doc for the seam's mechanism-not-policy rationale.
     pub admin_authorizer: Option<Arc<dyn AdminAuthorizer>>,
+    /// `[server.limits]` — message-size, in-flight concurrency, per-request
+    /// timeout, and the two stream budgets. Applied to every service this
+    /// function mounts: the message-size cap via each `*ServiceServer`'s own
+    /// `max_decoding_message_size` (including Flight SQL), the rest via the
+    /// [`crate::limits`] tower layer stack [`BoundChain::serve_with_shutdown`]
+    /// applies at serve time. See [`crate::limits`] for the full contract.
+    pub limits: jammi_db::config::LimitsConfig,
 }
 
 /// The engine's fully-assembled gRPC chain, ready for a downstream to mount
@@ -618,6 +629,11 @@ pub struct AssembledChain {
     // because the layer stack is deferred to `serve` — the outermost layer
     // observes every request by method path.
     metrics: Arc<MetricsRegistry>,
+    // `[server.limits]`, needed at serve time to build the `crate::limits`
+    // layer stack (the concurrency/timeout/stream-budget bounds; the
+    // message-size cap was already applied per-service in
+    // `assemble_grpc_chain`, above).
+    limits: jammi_db::config::LimitsConfig,
     // The SAME `TenantResolverLayer` (holding the same `Arc<dyn TenantResolver>`)
     // that wraps every engine service in `assemble_grpc_chain`. Retained
     // (`#[derive(Clone)]`, a cheap `Arc` clone) so `mount_tenant_scoped` can wrap
@@ -777,6 +793,7 @@ impl AssembledChain {
             routes: self.routes,
             mounted: self.mounted,
             metrics: self.metrics,
+            limits: self.limits,
             _worker: self._worker,
         })
     }
@@ -914,6 +931,7 @@ pub struct BoundChain {
     routes: tonic::service::Routes,
     mounted: Vec<String>,
     metrics: Arc<MetricsRegistry>,
+    limits: jammi_db::config::LimitsConfig,
     // The embedded job worker guard, held RAII across the serve loop — its
     // lifetime spans bind → serve, exactly as it did on `AssembledChain`.
     _worker: Option<jammi_ai::fine_tune::worker::EmbeddedWorker>,
@@ -937,13 +955,22 @@ impl BoundChain {
     /// resolves. Consumes `self`, keeping the training-worker guard alive for
     /// the whole serve loop.
     ///
-    /// The transport layers apply HERE, in this order: `accept_http1(true)` then
-    /// `MetricsLayer` (outermost — observes every request by method path before
-    /// routing) then `GrpcWebTrailersLayer` (wraps `GrpcWebLayer`, repairing the
-    /// trailers-only error response into the in-body trailer frame a gRPC-web
-    /// client requires) then `GrpcWebLayer`. Every service mounted via
-    /// [`AssembledChain::mount`], engine or downstream, inherits gRPC-web framing
-    /// + trailer repair with no per-service opt-in.
+    /// The transport layers apply HERE, in this order (outermost first):
+    /// `accept_http1(true)` then `MetricsLayer` (observes every request by
+    /// method path before routing) then `GrpcWebTrailersLayer` (wraps
+    /// `GrpcWebLayer`, repairing the trailers-only error response into the
+    /// in-body trailer frame a gRPC-web client requires) then `GrpcWebLayer`
+    /// then the `[server.limits]` request-bounds stack
+    /// ([`crate::limits::RefusalStatusLayer`] →
+    /// [`crate::limits::GlobalConcurrencyLimitLayer`] →
+    /// [`crate::limits::PerConnectionLimitLayer`] →
+    /// [`crate::limits::MethodClassLayer`] — see [`crate::limits`] for the
+    /// full contract and the N4/N5 rationale for this exact position, inside
+    /// the gRPC-web layers). Every service mounted via [`AssembledChain::mount`],
+    /// engine or downstream, inherits every one of these with no per-service
+    /// opt-in — including a downstream's own mounted service, which is
+    /// deliberate: the request-bounds refusal is a whole-listener property,
+    /// not an engine-only one.
     pub async fn serve_with_shutdown(
         self,
         shutdown: impl Future<Output = ()> + Send + 'static,
@@ -958,11 +985,21 @@ impl BoundChain {
         // `BoundChain`. `Routes` is the layer-free accumulation point;
         // `add_routes` attaches it behind the stack at serve time, then serves
         // on the pre-bound listener via `serve_with_incoming_shutdown`.
+        let refusal_metrics = Arc::clone(&self.metrics);
+        let limits = self.limits;
         let mut server = Server::builder()
             .accept_http1(true)
             .layer(MetricsLayer::new(self.metrics))
             .layer(GrpcWebTrailersLayer::new())
-            .layer(GrpcWebLayer::new());
+            .layer(GrpcWebLayer::new())
+            .layer(crate::limits::RefusalStatusLayer::new(refusal_metrics))
+            .layer(crate::limits::GlobalConcurrencyLimitLayer::new(
+                limits.max_in_flight,
+            ))
+            .layer(crate::limits::PerConnectionLimitLayer::new(
+                limits.max_in_flight_per_connection,
+            ))
+            .layer(crate::limits::MethodClassLayer::new(&limits));
         server
             .add_routes(self.routes)
             .serve_with_incoming_shutdown(self.incoming, shutdown)
@@ -1021,7 +1058,17 @@ pub fn assemble_grpc_chain(chain: GrpcChain) -> Result<AssembledChain, ServerErr
         metrics,
         tenant_resolver,
         admin_authorizer,
+        limits,
     } = chain;
+
+    // `[server.limits].max_message_bytes`, applied to every mounted service
+    // below (including Flight SQL) via tonic's own per-service
+    // `max_decoding_message_size` — see `crate::limits`'s N5 rustdoc for why
+    // this is NOT a tower layer. `u64` -> `usize`: a value that would not fit
+    // `usize` (only reachable on a 32-bit target with an absurd config) saturates
+    // to `usize::MAX` (effectively unbounded) rather than panicking or silently
+    // truncating to a SMALLER, surprising cap.
+    let max_message_bytes: usize = usize::try_from(limits.max_message_bytes).unwrap_or(usize::MAX);
 
     // Flight SQL — MUST-FIX 2: cover the `db.sql` lane through the SAME resolver
     // as the gRPC plane. The provider resolves each query's scope and binds it,
@@ -1033,7 +1080,7 @@ pub fn assemble_grpc_chain(chain: GrpcChain) -> Result<AssembledChain, ServerErr
         Arc::clone(&tenant_resolver),
     );
     let flight = FlightSqlService::new_with_provider(Box::new(provider));
-    let flight_svc = FlightServiceServer::new(flight);
+    let flight_svc = FlightServiceServer::new(flight).max_decoding_message_size(max_message_bytes);
 
     // The single binder. One `TenantResolverLayer` (holding the one resolver)
     // wraps every engine service uniformly — no branch, no separate interceptor,
@@ -1045,10 +1092,13 @@ pub fn assemble_grpc_chain(chain: GrpcChain) -> Result<AssembledChain, ServerErr
 
     // Bind one engine service onto `routes` under the resolver layer. `$server`
     // is the bare `*ServiceServer::new(inner)`; the layer forwards its
-    // `NamedService::NAME` so tonic routing keeps it.
+    // `NamedService::NAME` so tonic routing keeps it. Every engine service gets
+    // the SAME `max_message_bytes` inbound decode cap (`[server.limits]`).
     macro_rules! mount_engine {
         ($routes:expr, $mounted:expr, $name:literal, $server:expr) => {{
-            $routes = $routes.add_service(resolver_layer.layer($server));
+            $routes = $routes.add_service(
+                resolver_layer.layer($server.max_decoding_message_size(max_message_bytes)),
+            );
             $mounted.push($name.to_string());
         }};
     }
@@ -1186,6 +1236,7 @@ pub fn assemble_grpc_chain(chain: GrpcChain) -> Result<AssembledChain, ServerErr
         routes,
         mounted,
         metrics,
+        limits,
         // The SAME layer `mount_engine!` wrapped every engine service with above
         // — retained so `AssembledChain::mount_tenant_scoped` can wrap a
         // downstream service through the identical single resolver.

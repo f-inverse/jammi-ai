@@ -151,6 +151,22 @@ workspace ships every publishable crate at the same
   pushed digest, asserted in the same job
   (`ci/scripts/assert_image_attestations.sh`) and on the release-binaries
   promote legs.
+- **`deploy/kubernetes` kustomize manifests: a query-tier base, a provisional
+  GPU compute-tier overlay, and a CI overlay, validated on every PR and
+  smoke-tested on a real cluster.** `deploy/kubernetes/base` is Shape C's
+  Deployment/Service/ConfigMap; `overlays/shape-d` runs the compute tier on a
+  GPU node pool (`[worker] enabled = true`) and is provisional until
+  [#500](https://github.com/f-inverse/jammi-ai/issues/500) decides the gang
+  primitive for multi-GPU and multi-node training; `overlays/ci` stands the
+  whole stack up against upstream `postgres`/`nats` `StatefulSet`s for the
+  kind smoke. `ci.yml`'s `Guard (kubernetes manifests)` job runs `kustomize
+  build` + `kubeconform --strict --kubernetes-version 1.34.11` over all
+  three kustomizations on every PR; the `kube-smoke` workflow additionally
+  stands the `ci` overlay up on a `kind` cluster (push to `main`, nightly,
+  manual dispatch, and any PR touching the manifests or the smoke scripts).
+  `tests/compose/remote_smoke.py` is the shared smoke oracle behind both the
+  Compose and the Kubernetes smoke; `shape_b_remote.py` and
+  `shape_c_kube_remote.py` are its two drivers.
 - **`[models]`, file-backed secrets, `signing_key.file`, and a fourth config-file
   location (#483, #481, esc-095, esc-096).** `JammiConfig` gains a `[models]`
   section (`hub_endpoint`, `hub_cache_dir`, `hub_token`, `offline`) built

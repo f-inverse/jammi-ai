@@ -9,6 +9,8 @@ on:
       # the READMEs the guide {{#include}}s (cookbook-recipes.md, quickstart-python.md)
       - "cookbook/recipes/**"
       - "cookbook/quickstart/**"
+      # the manifests reference-topologies.md {{#include}}s
+      - "deploy/**"
   pull_request:
     branches: [main]
     paths:
@@ -16,6 +18,8 @@ on:
       - "crates/*/src/**"
       - "cookbook/recipes/**"
       - "cookbook/quickstart/**"
+      # the manifests reference-topologies.md {{#include}}s
+      - "deploy/**"
   # Re-publish when a Cookbook render finishes (its output is the /cookbook subpath
   # we serve). The render is its own workflow — it runs only on schedule / manual
   # dispatch and saves a fresh _book cache — so every completion is worth a

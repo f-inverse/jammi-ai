@@ -57,6 +57,40 @@ inputs:
     description: "Dockerfile path passed to docker/build-push-action."
     required: false
     default: "Dockerfile"
+  load:
+    description: >
+      "true" to `docker load` the built image into the runner's local Docker
+      daemon (tagged `local-tag`) instead of pushing it — the shape a
+      same-runner smoke test needs to run the exact image it just built,
+      never a registry round-trip. Mutually exclusive with `push: "true"` in
+      practice (a caller wanting both should push, then pull).
+    required: false
+    default: "false"
+  local-tag:
+    description: >
+      Tag applied to the image when `load` is "true" (e.g.
+      "jammi-ai-server:pr"). Ignored when `load` is "false".
+    required: false
+    default: ""
+  sbom:
+    description: >
+      "true" to attach an SPDX SBOM to the build (`docker/build-push-action`'s
+      own `sbom` input). A build-only `load` lane sets this "false" — the
+      docker exporter cannot carry attestations on a stock daemon.
+    required: false
+    default: "true"
+  provenance:
+    description: >
+      Provenance mode passed to `docker/build-push-action`'s own `provenance`
+      input (e.g. "mode=max"). A build-only `load` lane sets this "false" for
+      the same reason as `sbom` above.
+    required: false
+    default: "mode=max"
+
+outputs:
+  digest:
+    description: "The built image's digest (docker/build-push-action's own `digest` output)."
+    value: ${{ steps.build.outputs.digest }}
 
 runs:
   using: composite
@@ -99,17 +133,23 @@ runs:
         fi
 
     - name: Build and push
+      id: build
       uses: docker/build-push-action@10e90e3645eae34f1e60eeb005ba3a3d33f178e8 # v6.19.2
       with:
         context: ${{ inputs.context }}
         file: ${{ inputs.file }}
         platforms: linux/amd64
         push: ${{ inputs.push }}
+        # `docker load` into the runner's local daemon under `local-tag`
+        # instead of pushing — a same-runner smoke test's only way to run the
+        # EXACT image this step built, not a registry pull of some other tag.
+        load: ${{ inputs.load }}
+        tags: ${{ inputs.load == 'true' && inputs.local-tag || steps.meta.outputs.tags }}
         build-args: ${{ inputs.build-args }}
-        # Empty when the "Extract metadata" step above was skipped (no
-        # tags-spec) — equivalent to omitting `tags`/`labels` entirely, which
-        # is what the build-only PR lane needs (untagged verification build).
-        tags: ${{ steps.meta.outputs.tags }}
+        # `labels` stays metadata-action's output (or empty on the build-only
+        # PR lane) regardless of `load` — labels carry no registry meaning.
         labels: ${{ steps.meta.outputs.labels }}
+        sbom: ${{ inputs.sbom }}
+        provenance: ${{ inputs.provenance }}
         cache-from: ${{ steps.cache.outputs.from }}
         cache-to: ${{ steps.cache.outputs.to }}

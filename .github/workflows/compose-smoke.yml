@@ -1,0 +1,107 @@
+name: Compose smoke (Shape B)
+
+# Builds the CPU `jammi-ai-server` image from THIS commit's Dockerfile, brings
+# up `deploy/docker-compose.yml` (Shape B: server + Postgres catalog +
+# JetStream broker) with the CI fixture-mount override, and drives it with a
+# remote Python client (`tests/compose/shape_b_remote.py`) — proving the
+# compose file, the image's env-only config resolution, and a restart's
+# result durability together, not any one of them in isolation.
+#
+# Deliberately NOT run on every PR: a cold CPU image build (Dockerfile:28-32)
+# runs ~30 minutes even with cache, a cost not worth paying on every push to
+# every branch. It runs on every push to `main` (catches a regression the
+# moment it lands), nightly (catches drift with no code change at all — a
+# base-image CVE fix, a dependency bump), and on demand
+# (`workflow_dispatch`, the pre-merge proof a human runs against a PR branch
+# before merging a compose/Dockerfile change). It reports to no `ci-summary`
+# job — that job gates the PR merge path, and this workflow deliberately does
+# not run there.
+#
+# No GHCR credentials are ever touched here: the composite build below runs
+# with `push: "false"` — a `docker load` into the runner's own daemon, never
+# a registry write — so this workflow needs no `packages: write` permission
+# and is not a promotion primitive (`check_gpu_prove_once.py`'s P6 rule
+# reads `push:` values other than a literal `false` as a promotion
+# candidate; this workflow's literal `"false"` is deliberately exempt).
+
+on:
+  push:
+    branches: [main]
+  schedule:
+    # 03:00 UTC nightly.
+    - cron: "0 3 * * *"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  compose-smoke:
+    name: Compose smoke (Shape B)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Build the CPU image (load, no push)
+        uses: ./.github/actions/docker-publish
+        with:
+          push: "false"
+          load: "true"
+          local-tag: jammi-ai-server:pr
+          # The docker exporter (what `load: true` uses) cannot carry
+          # attestations on a stock daemon — belt-and-braces: build-push-
+          # action already omits default provenance when `load: true`, and
+          # `sbom: false` is the one that actually matters here.
+          sbom: "false"
+          provenance: "false"
+          cache-scope: cpu
+
+      - name: Bring up Shape B (server + Postgres + JetStream)
+        env:
+          JAMMI_IMAGE: jammi-ai-server:pr
+          # A synthetic key for this ephemeral, throwaway compose stack —
+          # never a real deployment secret.
+          JAMMI_AUDIT_MASTER_KEY: compose-smoke-ephemeral-key
+        run: |
+          set -euo pipefail
+          docker compose -f deploy/docker-compose.yml -f deploy/docker-compose.ci.yml up --wait
+
+      - name: Assert the running container is the image this job built
+        env:
+          JAMMI_IMAGE: jammi-ai-server:pr
+        run: |
+          set -euo pipefail
+          built_id="$(docker image inspect --format '{{.Id}}' "$JAMMI_IMAGE")"
+          container_id="$(docker compose -f deploy/docker-compose.yml -f deploy/docker-compose.ci.yml ps -q jammi-server)"
+          running_id="$(docker inspect --format '{{.Image}}' "$container_id")"
+          if [ "$built_id" != "$running_id" ]; then
+            echo "::error::running container's image ($running_id) is not the image this job built ($built_id) -- a pulled :latest cannot pass this smoke" >&2
+            exit 1
+          fi
+          echo "running container image matches the built image: $built_id"
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      # `grpcio-tools` (needed to regenerate the proto stubs) lives in the
+      # `dev` extra, mirroring ci.yml's `py-client` job.
+      - name: Install clients/python (dev extra) + generate stubs
+        run: |
+          set -euo pipefail
+          python -m pip install --upgrade pip
+          pip install -e 'clients/python[dev]'
+          make -C clients/python generate
+
+      - name: Run the remote Shape B smoke script
+        env:
+          JAMMI_IMAGE: jammi-ai-server:pr
+        run: python3 tests/compose/shape_b_remote.py
+
+      - name: Dump compose logs on failure
+        if: failure()
+        run: docker compose -f deploy/docker-compose.yml -f deploy/docker-compose.ci.yml logs
+
+      - name: Tear down
+        if: always()
+        run: docker compose -f deploy/docker-compose.yml -f deploy/docker-compose.ci.yml down -v

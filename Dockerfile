@@ -117,19 +117,33 @@ COPY --from=builder /tmp/jammi /usr/local/bin/jammi
 # Health side-channel on 8080, gRPC + Flight SQL on 8081.
 EXPOSE 8080 8081
 
-# Turnkey: `docker run <image>` runs `jammi-server`. With no `--config`, the
-# server loads `JammiConfig::default()` (local SQLite catalog, in-memory broker,
-# all tiers) — zero-config. `docker run <image> --config /etc/jammi/jammi.toml`
-# overrides the default `CMD`.
+# Turnkey: `docker run <image>` runs `jammi-server serve`, which resolves its
+# config through the SAME chain the binary uses everywhere else — `--config`
+# (not passed here), `JAMMI_CONFIG`, `./jammi.toml`, `/etc/jammi/jammi.toml`,
+# the platform config dir, finally `JammiConfig::default()` (local SQLite
+# catalog, in-memory broker, all tiers). `WORKDIR /` (set explicitly below,
+# since distroless never sets one) makes `./jammi.toml` mean `/jammi.toml` —
+# a bind mount at that path outranks a baked `/etc/jammi/jammi.toml` (see the
+# self-contained stage below) by this documented order.
+# `docker run <image> --config /etc/jammi/jammi.toml` overrides the default
+# `CMD` (still `serve`, the implicit default subcommand — `--config` is a
+# top-level flag `serve` also accepts, so no `serve` keyword is required).
+WORKDIR /
 ENTRYPOINT ["/usr/local/bin/jammi-server"]
-CMD []
+CMD ["serve"]
 
 # ---- runtime: generic (default) ----
-# The turnkey CPU server image: `docker run <image>` runs `jammi-server` with
-# zero config (inherits ENTRYPOINT/CMD from runtime-base). Operators can still
-# supply their own config — `docker run <image> --config /etc/jammi/jammi.toml`
-# — and mount a volume / bind mount at `/var/lib/jammi`.
+# The turnkey CPU server image: `docker run <image>` runs `jammi-server serve`
+# with zero config (no baked file, no bind mount — the resolution chain falls
+# through to `JammiConfig::default()`). Operators can still supply their own
+# config — `docker run <image> --config /etc/jammi/jammi.toml` — and mount a
+# volume / bind mount at `/var/lib/jammi`.
 FROM runtime-base AS runtime-generic
+
+# Explicit, not merely inherited from runtime-base: every runtime stage
+# states its own boot command so a reader never has to chase an inherited
+# default across a `FROM` boundary to know what `docker run <image>` does.
+CMD ["serve"]
 
 # Persistent state: catalog DB, model weights, indices, and the Hugging Face
 # Hub cache (`HF_HOME`, set below). Zero-config `jammi-server` writes its
@@ -185,9 +199,13 @@ ENV HF_HOME=/tmp/jammi/hf
 
 USER nonroot:nonroot
 
-# Boot the baked config through the `jammi-server` entrypoint inherited from
-# runtime-base (`jammi-server --config …`).
-CMD ["--config", "/etc/jammi/jammi.toml"]
+# Boot with no `--config` at all: `serve`'s resolution chain (`JAMMI_CONFIG`,
+# `./jammi.toml` == `/jammi.toml` under this stage's `WORKDIR /`,
+# `/etc/jammi/jammi.toml`, the platform config dir, finally the built-in
+# defaults) finds the file baked above at `/etc/jammi/jammi.toml` on its
+# third step — the same chain `runtime-generic` walks, just with one more
+# candidate present on disk. A bind-mounted `/jammi.toml` would outrank it.
+CMD ["serve"]
 
 # ---- runtime: cuda ----
 # GPU runtime base. `nvidia/cuda:*-runtime-ubi8` ships `libcudart` (and the rest of the
@@ -245,11 +263,13 @@ ENV HF_HOME=/var/lib/jammi/hf
 # persistent volume amortizes the one-time JIT across restarts.
 ENV CUDA_CACHE_PATH=/var/lib/jammi/.nv-cache
 
-# Turnkey: `docker run --gpus all <image>` runs `jammi-server` with zero config
-# (local SQLite catalog, in-memory broker, all tiers; GPU via the cuda build).
+# Turnkey: `docker run --gpus all <image>` runs `jammi-server serve` with zero
+# config (local SQLite catalog, in-memory broker, all tiers; GPU via the cuda
+# build) — same resolution chain and `WORKDIR /` as the CPU variants above.
 # `docker run --gpus all <image> --config /etc/jammi/jammi.toml` overrides it.
+WORKDIR /
 ENTRYPOINT ["/usr/local/bin/jammi-server"]
-CMD []
+CMD ["serve"]
 
 # ---- final ----
 # Resolve the variant chosen by the global `RUNTIME_VARIANT` arg at the top of this file

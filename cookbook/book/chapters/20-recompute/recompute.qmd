@@ -252,6 +252,7 @@ the job it left behind.
 ```{python}
 import tempfile
 
+import jammi
 import pyarrow as pa
 import pyarrow.parquet as pq
 

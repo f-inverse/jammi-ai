@@ -133,7 +133,7 @@ class LiveServer:
         # invents: the two servers below open the SAME directory in sequence,
         # which is what makes the job queue observably outlive a process.
         self._artifact_dir = artifact_dir
-        # `[training] run_worker` — configuration, not a code path. `False`
+        # `[worker] enabled` — configuration, not a code path. `False`
         # still mounts and serves the training surface (submissions are
         # accepted); it only declines to run the claim loop.
         self._run_worker = run_worker
@@ -148,7 +148,7 @@ class LiveServer:
         )
         env = dict(os.environ)
         env["JAMMI_ARTIFACT_DIR"] = self._artifact_dir
-        env["JAMMI_TRAINING__RUN_WORKER"] = "true" if self._run_worker else "false"
+        env["JAMMI_WORKER__ENABLED"] = "true" if self._run_worker else "false"
         # `:0` on BOTH listeners — the child binds, the kernel assigns, nothing
         # here ever holds-and-releases a port number.
         env["JAMMI_SERVER__FLIGHT_LISTEN"] = "127.0.0.1:0"
@@ -220,7 +220,7 @@ class LiveServer:
 ARTIFACT_DIR = tempfile.mkdtemp(prefix="jammi_srv_ftaccel_")
 
 # Server A: the training surface is mounted and accepts submissions, but this
-# process never claims — `[training] run_worker = false`.
+# process never claims — `[worker] enabled = false`.
 server_a = LiveServer(ARTIFACT_DIR, run_worker=False).__enter__()
 # The literal `grpc://` target — the same public front door every other
 # remote-transport chapter in this book opens, over a real live server this
@@ -273,10 +273,10 @@ why: it never loosened an assertion, it conceded only the **choice** between two
 because a state the chapter could not deterministically observe is a state it must not claim to
 have measured.
 
-What changed is not a code path — it is **configuration**. `TrainingConfig::run_worker`
-(`crates/jammi-db/src/config.rs`) is a runtime setting that answers exactly one question: does
-THIS process run the training claim loop? With `[training] run_worker = false` (or the
-environment override `JAMMI_TRAINING__RUN_WORKER=false`) the process still mounts and serves the
+What changed is not a code path — it is **configuration**. `WorkerConfig::enabled`
+(`crates/jammi-db/src/config/mod.rs`) is a runtime setting that answers exactly one question: does
+THIS process run the claim loop? With `[worker] enabled = false` (or the
+environment override `JAMMI_WORKER__ENABLED=false`) the process still mounts and serves the
 training surface and still accepts submissions — it simply never claims, and submitted jobs stay
 `queued`. Submission and claiming, previously welded together by the tier mount, are separable by
 a deployment knob; and because it is one key read by whatever arm decides whether to spawn the
@@ -291,7 +291,7 @@ Sleeping is precisely what the previous version refused to do, so it is worth be
 why it is correct here. A sleep that widens a race window is a way of *making a flaky assertion
 pass*; a sleep that spans more than the interval a claimant would have woken on is a way of
 *demonstrating that nothing claims*. The first hides a state the chapter cannot observe; the
-second measures one it can. `TrainingConfig`'s default `idle_poll_secs = 1` — the interval an idle
+second measures one it can. `WorkerConfig`'s default `idle_poll_secs = 1` — the interval an idle
 worker polls for a queued job on — is the number that has to be exceeded, and the span below
 exceeds it.
 
@@ -316,7 +316,7 @@ job_a = remote_a.fine_tune(
 JOB_A_ID, JOB_A_MODEL_ID = job_a.job_id, job_a.output_model_id
 print(f"submitted job {JOB_A_ID} to a server that does not claim")
 
-# `TrainingConfig`'s own default idle poll — the interval a CLAIMING process
+# `WorkerConfig`'s own default idle poll — the interval a CLAIMING process
 # wakes on to look for a queued job. The observation span below must EXCEED it,
 # or "still pending" would prove nothing about claiming.
 WORKER_IDLE_POLL_SECONDS = 1.0
@@ -358,13 +358,13 @@ The order below is forced by the store, not chosen for convenience. This render'
 SQLite, a single-process store, so server A must have really exited before server B may open the
 same artifact directory — and the successor's successful open is itself the proof that the
 predecessor released the catalog, rather than a sidecar poll of a lock file or a sleep-and-hope.
-On Postgres the same knob composes differently and better: a multi-process catalog lets a
-`run_worker = false` submission front end and a `run_worker = true` worker run **concurrently**,
+On Postgres the same knob composes differently and better: a multi-process catalog lets an
+`enabled = false` submission front end and an `enabled = true` worker run **concurrently**,
 which is the deployment shape the flag exists for. The strict sequencing here is SQLite's
 constraint showing through, not the flag's.
 
 What survives the process boundary is the queue itself. Server B is today's ordinary all-in-one —
-no override, `run_worker` at its default `true` — and it claims a job it never accepted, submitted
+no override, `enabled` at its default `true` — and it claims a job it never accepted, submitted
 by a process that no longer exists, because the job lives in the catalog rather than in either
 server's memory. On SQLite that is the rule in general: a queued job is claimed by the next
 claiming process that opens the directory.
@@ -377,7 +377,7 @@ server_a.__exit__(None, None, None)
 assert server_a.returncode is not None, "server A did not exit"
 print(f"server A closed (returncode={server_a.returncode})")
 
-# Server B: today's all-in-one, no override, `run_worker` at its default. That
+# Server B: today's all-in-one, no override, `enabled` at its default. That
 # this open SUCCEEDS on the same directory is the release proof.
 server_b = LiveServer(ARTIFACT_DIR).__enter__()
 remote = jammi.connect(f"grpc://127.0.0.1:{server_b.port}")
@@ -772,7 +772,7 @@ honest "no independent signal", never a smoothed-over claim.
 > submission, `{"state": "determined", "ops": {...}, "flash": {...}}` once a worker resolves a
 > device, each entry carrying the SAME `Hold`/`Miss` + `reason` vocabulary the kernel's own
 > admission gate produces. Both halves are observed here over live servers because submission and
-> claiming are separable by **configuration** (`TrainingConfig::run_worker`), not by a second code
+> claiming are separable by **configuration** (`WorkerConfig::enabled`), not by a second code
 > path: one process accepts and never claims, a second opens the same catalog and claims what the
 > first accepted — which also makes the queue's survival across a process boundary a measured
 > fact rather than a design claim. On this render's CPU-only server every `ops` entry this chapter

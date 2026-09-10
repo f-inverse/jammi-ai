@@ -88,6 +88,7 @@ docs/plans/*
 !docs/plans/64-torch-training-twin/
 !docs/plans/65-resolve-witness/
 !docs/plans/66-tower-profile/
+!docs/plans/67-distributed-training/
 docs/superpowers/
 docs/IMPLEMENTATION.md
 docs/specs/

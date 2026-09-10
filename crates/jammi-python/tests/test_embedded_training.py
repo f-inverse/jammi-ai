@@ -134,7 +134,7 @@ def test_embedded_fine_tune_acceleration_report_four_states(tmp_path: Path) -> N
     `jobs.acceleration_report` column, decoded the same way
     `metrics()` decodes its column (issue #441) but preserving THIS column's
     own two-state contract (`JobRecord::acceleration_report`'s doc,
-    migration 026, generalised to the `jobs` schema by PLAN-C §1) rather
+    migration 026, generalised to the `jobs` schema) rather
     than `metrics()`'s "absent means `{}`" default —
     proven against a REAL embedded engine + catalog on all four states:
 

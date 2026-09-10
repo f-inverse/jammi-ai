@@ -477,7 +477,7 @@ workspace ships every publishable crate at the same
   changes).
 - **`[server.limits]`: message-size, in-flight concurrency, per-request
   timeout, and stream budgets, refused at the edge with a typed status and a
-  counted reason (#485, PLAN-C §5).** A request that would exceed any bound
+  counted reason (#485).** A request that would exceed any bound
   is refused BEFORE any tenant-scoped catalog read runs, so a refusal leaks
   nothing about cross-tenant existence — see `docs/guide/src/operability.md`
   §"Request bounds" for the full table and `docs/guide/src/configuration.md`
@@ -1442,7 +1442,7 @@ workspace ships every publishable crate at the same
   `TierError::FeatureNotCompiled` are gone, and `ChainParts::train_worker`
   is `ChainParts::worker`.
 - **`TrainingService` is replaced by `JobService` on the wire; compute-verb
-  clients gain a job-verb surface (#485, #486, PLAN-C §3; pre-1.0
+  clients gain a job-verb surface (#485, #486; pre-1.0
   amendment — see `docs/guide/src/api-stability.md`).**
   `StartTraining`→`SubmitJob`, `TrainingStatus`→`JobStatus`,
   `ListTrainingJobs`→`ListJobs`; `SubmitJob`'s oneof carries the same three

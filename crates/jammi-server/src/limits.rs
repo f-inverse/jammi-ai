@@ -112,8 +112,8 @@
 //!   — the stream ends at the budget, not at open, and never runs unbounded.
 //!
 //! [`is_streaming_path`] is a hardcoded two-path allowlist rather than a
-//! path→class map derived from the compiled `FILE_DESCRIPTOR_SET` (the
-//! literal PLAN-C §5 design): this codebase mounts exactly two
+//! path→class map derived from the compiled `FILE_DESCRIPTOR_SET`: this
+//! codebase mounts exactly two
 //! server-streaming RPCs today, so the derived map's only observable
 //! behaviour over THIS binary is this same two-path set. This is a
 //! documented, deliberate scope reduction — a third server-streaming RPC

@@ -1,7 +1,7 @@
 //! `jammi jobs` subcommand.
 //!
 //! Read-mostly observation over the remote [`CatalogClient`]'s `JobService`
-//! surface (PLAN-C §3, replaces `jammi train list/status`): list the jobs
+//! surface (replaces `jammi train list/status`): list the jobs
 //! visible to the session's tenant, read one job's lifecycle status by id,
 //! request cancellation, or eagerly sweep terminal rows past the
 //! deployment's retention window. Submission stays on the data-plane client

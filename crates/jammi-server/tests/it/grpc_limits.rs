@@ -1,4 +1,4 @@
-//! `[server.limits]` end-to-end over the wire (PLAN-C §5): the ONE oracle
+//! `[server.limits]` end-to-end over the wire: the ONE oracle
 //! this suite owns that `crates/jammi-server/src/limits.rs`'s own unit tests
 //! cannot -- everything that genuinely needs a live socket (an inbound
 //! message tonic's own codec actually decodes and rejects, a

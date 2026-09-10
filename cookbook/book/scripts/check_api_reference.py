@@ -77,7 +77,7 @@ REQUIRED: dict[str, list[str]] = {
         "edge_provenance",
     ],
     # attach-by-id + the tenant-scoped listing (campaign #446, generalised to
-    # every job kind by PLAN-C §4): a job handle outlives the connection
+    # every job kind): a job handle outlives the connection
     # that submitted it, on both arms.
     "job": ["job_id"],
     "list_jobs": [],

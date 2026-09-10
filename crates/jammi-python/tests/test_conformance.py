@@ -127,7 +127,7 @@ _TRAINING_VERBS = {
     # none is a `Capability`, because nothing about a transport makes "look up
     # a job I already have the id of" (or list/cancel/prune it, or list the
     # fleet) unavailable. Generic across every `jobs` row (training or
-    # compute), per `JobService` (PLAN-C §4).
+    # compute), per `JobService`.
     "job",
     "list_jobs",
     "cancel_job",
@@ -1081,8 +1081,8 @@ _METRICS_TEST_TRAINING_PAIRS = (
 def test_remote_and_embedded_job_metrics_agree_on_all_three_states(tmp_path):
     """`RemoteJob.metrics()` and the embedded `Job.metrics()` agree on the
     SAME three states the catalog's `jobs.result` payload's nested `metrics`
-    field can carry (issue #441, generalised to the `jobs` schema by
-    PLAN-C §1) — proven against a REAL embedded engine + catalog on one arm,
+    field can carry (issue #441, generalised to the `jobs` schema) —
+    proven against a REAL embedded engine + catalog on one arm,
     not a stub of both:
 
       * absent (`jobs.result` NULL, or `metrics` unset within it) -> `{}` on

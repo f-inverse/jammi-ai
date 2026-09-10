@@ -11,7 +11,7 @@ import "jammi/v1/inference.proto";
 // `StartTraining`/`TrainingStatus`/`ListTrainingJobs` are superseded by
 // `JobService.{SubmitJob,JobStatus,WaitJob,ListJobs,CancelJob}`, which serve
 // both the three training kinds below and every compute verb behind one
-// durable job abstraction (PLAN-C §3). This file keeps only the training spec
+// durable job abstraction. This file keeps only the training spec
 // message vocabulary the training kinds still ride inside `SubmitJobRequest`'s
 // `oneof`: `FineTuneSpec`, `GraphFineTuneSpec`, `ContextPredictorSpec`, and
 // their nested configuration messages, byte-for-byte unchanged so a spec

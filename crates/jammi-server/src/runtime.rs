@@ -1248,7 +1248,7 @@ pub fn assemble_grpc_chain(chain: GrpcChain) -> Result<AssembledChain, ServerErr
         }
 
         // Core: JobService — the durable job submission/status/wait surface
-        // (PLAN-C §3; replaces TrainingService). `SubmitJob` carries all three
+        // (replaces TrainingService). `SubmitJob` carries all three
         // training kinds — fine-tune, graph fine-tune, context-predictor.
         // Submission is always mounted; whether THIS process also runs the
         // claim loop is configuration, not a tier and not a build feature:

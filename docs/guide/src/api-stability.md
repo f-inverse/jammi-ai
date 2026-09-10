@@ -60,7 +60,7 @@ server that implements it, but answered by no OSS handler):
 | `jammi.v1.error` | the typed wire-error message (no rpcs) |
 | `jammi.v1.eval` | the evaluation rpcs |
 | `jammi.v1.inference` | bulk inference + predict |
-| `jammi.v1.job` | the durable job queue: submit / status / wait / list / cancel / list-workers / prune (`JobService`, PLAN-C §3) |
+| `jammi.v1.job` | the durable job queue: submit / status / wait / list / cancel / list-workers / prune (`JobService`) |
 | `jammi.v1.lifecycle` | license apply / bootstrap / status / login — **contract-only**, answered by a platform server (the OSS engine returns `UNIMPLEMENTED`) |
 | `jammi.v1.pipeline` | graph / context / as-of / recompute / materialization rpcs |
 | `jammi.v1.training` | the training spec message vocabulary `JobService.SubmitJob`'s oneof carries (`FineTuneSpec`/`GraphFineTuneSpec`/`ContextPredictorSpec`/`FineTuneConfig`/…) — no rpcs of its own since `TrainingService` folded into `JobService` |
@@ -114,7 +114,7 @@ Concretely:
   reject-newer guard then makes an old reader fail loud rather than misparse, and
   the recovery is to re-emit (see [Format Stability](./format-stability.md)).
 
-**Pre-1.0 amendment (PLAN-C §3).** Until the 1.0 release, the `jammi.v1` wire
+**Pre-1.0 amendment (#485).** Until the 1.0 release, the `jammi.v1` wire
 contract may still change — including a genuinely breaking rpc rename or
 removal — when BOTH of the following hold in the same PR: the frozen baseline
 (`crates/jammi-server/tests/it/api_freeze_baseline.txt`) is updated to match

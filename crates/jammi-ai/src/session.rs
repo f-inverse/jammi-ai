@@ -348,7 +348,7 @@ impl InferenceSession {
         self.inner.close().await;
     }
 
-    /// Row-scoped on-read reclaim (PLAN-C §2): a caller that just read `record`
+    /// Row-scoped on-read reclaim: a caller that just read `record`
     /// (e.g. `JobService`'s `JobStatus`/`WaitJob`/`ListJobs`) offers it here so
     /// an expired lease is reaped inline with the read, without waiting for the
     /// worker loop's or the construction sweep's next pass. Returns the

@@ -236,8 +236,8 @@ print("\nlineage is one-hop RESULT_DIGEST edges — the relation the sweep walks
 
 ## The generalised job queue underneath (`list_jobs` / `job`)
 
-PLAN-C generalises the training-only queue into a kind-agnostic durable job
-abstraction: every compute verb above — `generate_embeddings`,
+The durable job queue is kind-agnostic, not training-only: every compute verb
+above — `generate_embeddings`,
 `build_neighbor_graph`, `propagate_embeddings` — now submits through the SAME
 engine seam (`InferenceSession::run_now`) a `fine_tune` submission does, and
 records an ordinary row in the generalised `jobs` table (`execution='inline'`

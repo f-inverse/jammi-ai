@@ -21,7 +21,7 @@ PACKAGE jammi.v1.embedding
 PACKAGE jammi.v1.error
 PACKAGE jammi.v1.eval
 PACKAGE jammi.v1.inference
-# ADDED (additive, minor-compatible, PLAN-C §3): the durable job queue's own
+# ADDED (additive, minor-compatible, #485/#486): the durable job queue's own
 # envelope package (SubmitJob/JobStatus/WaitJob/ListJobs/CancelJob/
 # ListWorkers/PruneJobs). Imports the surviving `jammi.v1.training` spec
 # vocabulary (FineTuneSpec/GraphFineTuneSpec/ContextPredictorSpec/
@@ -84,7 +84,7 @@ RPC EvalService/EvalInference
 RPC EvalService/EvalPerQuery
 RPC InferenceService/Infer
 RPC InferenceService/Predict
-# ADDED (additive, minor-compatible, PLAN-C §3): JobService replaces
+# ADDED (additive, minor-compatible, #485/#486): JobService replaces
 # TrainingService — StartTraining folds into SubmitJob, TrainingStatus into
 # JobStatus, ListTrainingJobs into ListJobs. WaitJob (resumable server-stream
 # wait), CancelJob, ListWorkers, and PruneJobs are new (Breaking: see

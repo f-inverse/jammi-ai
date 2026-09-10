@@ -2258,7 +2258,7 @@ fn bare_env_artifact_dir_round_trips() {
     assert_eq!(cfg.artifact_dir, PathBuf::from("/srv/jammi"));
 }
 
-// ── `[server.limits]` (PLAN-C §5) ─────────────────────────────────────────
+// ── `[server.limits]` ──────────────────────────────────────────────────────
 
 #[test]
 fn limits_config_defaults_match_the_documented_values() {

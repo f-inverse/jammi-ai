@@ -1,4 +1,4 @@
-//! `JobService` end-to-end over the wire (PLAN-C §3; replaces `TrainingService`).
+//! `JobService` end-to-end over the wire (replaces `TrainingService`).
 //!
 //! An in-process Tonic server hosts the gRPC chain including `JobService`. A
 //! client registers the shipped `training_pairs.csv` fixture as a source
@@ -1833,7 +1833,7 @@ async fn training_status_model_id_decodes_the_predictor_spec_before_completion()
     let _ = server.handle.await;
 }
 
-// ─── PLAN-C §3 acceptance: idempotency, WaitJob, cross-tenant NOT_FOUND ──────
+// ─── acceptance: idempotency, WaitJob, cross-tenant NOT_FOUND ──────────────
 
 /// A second `SubmitJob` carrying the same non-empty `idempotency_key` as a
 /// still-known prior submission returns THAT job's handle unchanged — never a

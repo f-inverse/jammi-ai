@@ -352,7 +352,7 @@ ACCOUNTING: list[tuple[str, ExerciseEntry]] = [
     # remembers both outcomes. `list_jobs`/`job` are ALSO exercised directly
     # in chapter 20 (recompute) over a cheap, model-free `asof_join` job — the
     # generalised job queue every compute verb now submits through internally
-    # (PLAN-C §4) — but the ACCOUNTING row points at chapter 22's real-server
+    # — but the ACCOUNTING row points at chapter 22's real-server
     # exercise, the richer of the two live call sites.
     ("job", DirectCell(
         "22-precision/finetune-acceleration.qmd", "remote.job(",
@@ -360,8 +360,8 @@ ACCOUNTING: list[tuple[str, ExerciseEntry]] = [
     ("list_jobs", DirectCell(
         "22-precision/finetune-acceleration.qmd", "remote.list_jobs(",
     )),
-    # `cancel_job` / `list_workers` / `prune_jobs` are new job verbs (PLAN-C
-    # §4) with no chapter cell yet — a reviewed, dated gap, not a silent one.
+    # `cancel_job` / `list_workers` / `prune_jobs` are new job verbs with no
+    # chapter cell yet — a reviewed, dated gap, not a silent one.
     ("cancel_job", Deferred(
         reason=(
             "no cookbook/book/chapters/*.qmd cell or scripts/build_*_cache.py "

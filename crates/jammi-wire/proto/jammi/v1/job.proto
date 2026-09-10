@@ -13,7 +13,7 @@ import "jammi/v1/training.proto";
 // InferenceService / PipelineService / EvalService rather than on the Flight
 // SQL surface (which carries query/result only, per ADR-01 §3.2).
 //
-// `JobService` replaces `TrainingService` (PLAN-C §3): `StartTraining` folds
+// `JobService` replaces `TrainingService`: `StartTraining` folds
 // into `SubmitJob`, `TrainingStatus` into `JobStatus`, `ListTrainingJobs` into
 // `ListJobs`. It generalises the training-only queue into a kind-agnostic
 // durable job abstraction every compute verb submits through INTERNALLY
@@ -24,7 +24,7 @@ import "jammi/v1/training.proto";
 // `PipelineService.BuildNeighborGraph` returns `jammi.v1.embedding.ResultTable`
 // directly) rather than going through `SubmitJobResponse`, so this service's
 // `JobStatus`/`WaitJob` never has a compute-kind row to answer for over the
-// wire (K4: the synchronous response is still byte-identical to what a `jobs`
+// wire (the terminal payload read back is byte-identical to what a `jobs`
 // row of the same kind would resolve to, since both paths run through the
 // same `execute_compute` dispatcher). The service reimplements no training,
 // LoRA, sampling, scan, or compute-verb logic; it is purely a wire adapter
@@ -42,8 +42,8 @@ import "jammi/v1/training.proto";
 // resource, so it carries no per-tenant filter (control-plane allowlisted in
 // `tenant_isolation_oracle.rs`, alongside `GetServerInfo`). Every OTHER rpc on
 // this service — including `PruneJobs` — IS tenant-scoped: there is no
-// exemption for a maintenance verb (family D/L — tenant scope is a row
-// predicate, not a verb category).
+// exemption for a maintenance verb — it is tenant-scoped like every other
+// job RPC.
 service JobService {
   // Submit a training job (`fine_tune` / `graph_fine_tune` /
   // `context_predictor`) and return its durable handle. The job is always

@@ -71,7 +71,7 @@ enum Commands {
     /// Observe/manage durable jobs (list, per-job status, cancel, prune).
     /// Jobs are submitted through the data-plane client / SDK — this surface
     /// is the control-plane read + cancel + prune peer, over every job kind
-    /// (training and compute alike, PLAN-C §3).
+    /// (training and compute alike).
     Jobs {
         #[command(subcommand)]
         action: commands::jobs::JobAction,

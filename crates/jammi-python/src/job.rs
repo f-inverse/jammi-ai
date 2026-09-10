@@ -56,7 +56,7 @@ enum JobState {
 }
 
 /// Python `Job` handle: the generalised, kind-agnostic peer of the wire's
-/// `JobService` (PLAN-C §4). Every job this binding can mint or attach today
+/// `JobService`. Every job this binding can mint or attach today
 /// is one of the three training kinds (`_start_training_proto` never submits
 /// a compute spec), but `job(id)`/`list_jobs()` can resolve ANY row the
 /// generalised `jobs` table holds — including a compute-kind row created

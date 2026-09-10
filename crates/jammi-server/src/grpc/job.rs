@@ -1,6 +1,6 @@
 //! `JobService` gRPC implementation.
 //!
-//! `JobService` replaces `TrainingService` (PLAN-C §3): `SubmitJob` folds
+//! `JobService` replaces `TrainingService`: `SubmitJob` folds
 //! `StartTraining`, `JobStatus` folds `TrainingStatus`, `ListJobs` folds
 //! `ListTrainingJobs`, and the service adds `WaitJob` (a resumable
 //! server-streaming wait) and `CancelJob`/`ListWorkers`, generalising the
@@ -47,7 +47,7 @@ use crate::grpc::proto::job as pb;
 use crate::grpc::proto::job::job_service_server::JobService;
 use crate::grpc::wire::{map_engine_error, require_nonempty, scoped, session_tenant_traced};
 
-/// `WaitJob`'s server-side poll interval (PLAN-C §3).
+/// `WaitJob`'s server-side poll interval.
 const WAIT_JOB_POLL: Duration = Duration::from_millis(100);
 /// Bounded so a slow/blocked receiver applies backpressure rather than
 /// buffering unboundedly; small because a frame is produced at most once per
@@ -91,7 +91,7 @@ impl JobServer {
     }
 
     /// Read a job row by id under the request's tenant scope, applying
-    /// row-scoped on-read reclaim (PLAN-C §2) before returning it. An absent
+    /// row-scoped on-read reclaim before returning it. An absent
     /// or cross-tenant id is the only failure `Catalog::get_job` raises
     /// (`JammiError::Catalog`) — mapped to `NOT_FOUND` (never
     /// `PERMISSION_DENIED`, matching every other tenant-scoped read in this

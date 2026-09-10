@@ -229,6 +229,16 @@ PROMOTION_TABLE: dict[str, PromotionRow] = {
         "server-image.yml", "build-and-push-main", None, "none"
     ),  # manual :latest refresh via workflow_dispatch on main (F8 audit fix: server-image.yml carries
     # no push: branches: trigger, so this never fires on a mere merge) -- never a release tag promotion.
+    # ---- server-image.yml's two-arch CPU merge jobs (S1/T8): `docker buildx
+    # imagetools create` merges the two per-arch immutable sources into the
+    # real tags -- itself a promotion, distinct from the per-arch legs above,
+    # which push only their own `sha-<sha>-<arch>` tag (never a real tag).
+    "cpu-image-merge-tag": PromotionRow(
+        "server-image.yml", "merge-cpu-tag", "build-and-push", "chained"
+    ),  # chained off build-and-push (itself direct-gated by gpu-proof) -- same tag-family conjunct.
+    "cpu-image-merge-main": PromotionRow(
+        "server-image.yml", "merge-cpu-main", None, "none"
+    ),  # deliberately UNGATED, same as cpu-image-main above -- never a release tag promotion.
     "cpu-image-selfcontained": PromotionRow(
         "server-image.yml", "build-and-push-selfcontained", None, "none"
     ),  # manual dispatch-only opt-in image (Cloudflare Containers) -- pre-existing behavior, out of this unit's scope.

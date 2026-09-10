@@ -371,6 +371,25 @@ workspace ships every publishable crate at the same
   (`crates/jammi-db/src/catalog/backend.rs`), completing the narrower integer/float widths the
   trigger-stream tail replay's row decoding needs; additive only (no existing impl or caller
   changes).
+- **linux/arm64 server image, CLI/server release tarballs, and manylinux aarch64 wheels
+  (#482).** The published `jammi-ai-server` CPU image (`:latest`, semver tags) is now a
+  multi-arch index (`linux/amd64` + `linux/arm64`), built as two NATIVE per-arch legs
+  (`ubuntu-latest` / `ubuntu-24.04-arm`, no QEMU) each pushing only its own immutable
+  `sha-<sha>-<arch>` tag, merged into the real tags by a verify-then-promote
+  `docker buildx imagetools create` job that dry-runs the merge and asserts the resulting
+  index's platform set BEFORE pushing anything (the self-contained image and the CUDA image
+  stay amd64-only, explicitly). `release-binaries.yml` gains an `aarch64-unknown-linux-gnu`
+  `jammi` CLI leg and a second `jammi-server` tarball leg (two-leg matrix); `pypi-server.yml`
+  publishes both `manylinux_2_28_x86_64` and `manylinux_2_28_aarch64` wheels for
+  `jammi-server` in one release; `pypi.yml`'s native engine wheel gains the same aarch64 Linux
+  leg. Every Linux release binary/wheel is built inside the CI base image resolved to a
+  digest ONCE per workflow run (`resolve-base`, read-only, no repo-variable write) so every
+  leg of one release shares one toolchain, and every `*-linux-gnu` artifact is asserted
+  against the manylinux_2_28 GLIBC symbol-version floor (`ci/scripts/assert_glibc_floor.sh`)
+  in addition to an ELF/Mach-O machine-field assert — building inside the manylinux
+  container is necessary but not sufficient. `compose-smoke.yml` gains a native
+  `ubuntu-24.04-arm` leg (its own within-leg parity assertions only, no cross-arch byte
+  comparison).
 
 ### Changed
 - **The published server images no longer pass `--config`; the Compose

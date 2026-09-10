@@ -27,6 +27,19 @@ inputs:
       entirely — the build-only PR lane pushes nothing, so it needs no tags.
     required: false
     default: ""
+  tag-suffix:
+    description: >
+      When non-empty, passed to docker/metadata-action as `flavor:
+      suffix=-<value>,onlatest=true` — the per-arch immutable leg shape
+      (e.g. "amd64"/"arm64"): a leg tagged this way pushes ONLY its own
+      `sha-<sha>-<arch>` tag, never a bare `latest`/`sha-<sha>` a
+      concurrent leg could race against (`onlatest=true` is required
+      because metadata-action otherwise emits an UNSUFFIXED `latest`
+      regardless of `flavor.suffix`, meta.ts:525-527). Empty (the default)
+      leaves `docker/metadata-action`'s tag/label extraction byte-unaffected
+      for every caller that does not merge per-arch legs.
+    required: false
+    default: ""
   build-args:
     description: >
       Multi-line build-args block passed to docker/build-push-action, e.g.
@@ -86,6 +99,17 @@ inputs:
       the same reason as `sbom` above.
     required: false
     default: "mode=max"
+  platforms:
+    description: >
+      Comma-separated buildx platform list passed straight through to
+      `docker/build-push-action`. Empty (the default) means NATIVE — the
+      builder's own platform, never a hardcoded "linux/amd64" — so a caller
+      running on an arm64 runner builds an arm64 image without asking for
+      one by name. A caller that needs a specific platform regardless of
+      runner arch (e.g. a CUDA image, amd64-only at runtime) passes
+      "linux/amd64" explicitly.
+    required: false
+    default: ""
 
 outputs:
   digest:
@@ -129,6 +153,13 @@ runs:
       with:
         images: ${{ inputs.images }}
         tags: ${{ inputs.tags-spec }}
+        # Empty (the default) leaves flavor unset -- byte-identical to every
+        # caller that predates per-arch legs. Non-empty (a per-arch leg)
+        # suffixes every emitted tag with "-<tag-suffix>" and forces `latest`
+        # to carry the suffix too (`onlatest=true`) so a leg NEVER emits a
+        # bare, unsuffixed real tag -- see this action's own `tag-suffix`
+        # input doc.
+        flavor: ${{ inputs.tag-suffix != '' && format('suffix=-{0},onlatest=true', inputs.tag-suffix) || '' }}
 
     # Resolves the gha cache-from/cache-to strings once so the build-push step
     # below doesn't need conditional expression logic — a scoped cache when
@@ -151,7 +182,7 @@ runs:
       with:
         context: ${{ inputs.context }}
         file: ${{ inputs.file }}
-        platforms: linux/amd64
+        platforms: ${{ inputs.platforms }}
         push: ${{ inputs.push }}
         # `docker load` into the runner's local daemon under `local-tag`
         # instead of pushing — a same-runner smoke test's only way to run the

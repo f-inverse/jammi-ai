@@ -29,6 +29,18 @@ on:
         description: "CI base image the binary is built in (manylinux_2_28 floor)."
         type: string
         required: true
+      runs_on:
+        description: >
+          Runner label for `build-binary` ONLY (`build-wheel` is
+          arch-independent: it stages a prebuilt binary and relabels the
+          wheel's platform tag, never compiles). Default is the CI base
+          image's own native x86_64 runner; an aarch64 caller passes
+          "ubuntu-24.04-arm" (native, no QEMU) so `container_image` (an
+          aarch64 manylinux_2_28 index member) actually matches the
+          runner's own arch.
+        type: string
+        required: false
+        default: "ubuntu-latest"
       cargo_features:
         description: "Comma-separated cargo features for the jammi-server binary build."
         type: string
@@ -84,7 +96,7 @@ env:
 jobs:
   build-binary:
     name: Build jammi-server binary
-    runs-on: ubuntu-latest
+    runs-on: ${{ inputs.runs_on }}
     container: ${{ inputs.container_image }}
     steps:
       - uses: actions/checkout@v4
@@ -115,6 +127,14 @@ jobs:
 
       - name: Strip the binary
         run: strip target/release/jammi-server
+
+      # W3: the sufficient ABI floor assert -- built inside a manylinux_2_28
+      # container does not by itself prove the LINKED symbol versions stay
+      # at or below the floor (a bare-runner fallback, or a future base-image
+      # bump, could silently raise it). `sort -V` (never a lexical sort,
+      # which returns "2.9" over "2.34" -- the exact miss).
+      - name: Assert the GLIBC symbol-version floor (manylinux_2_28)
+        run: bash ci/scripts/assert_glibc_floor.sh target/release/jammi-server 2.28
 
       # Fail here — not on a user's machine at execve — if the binary links a
       # library the wheel's runtime dependencies do not deliver. DT_NEEDED

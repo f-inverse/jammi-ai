@@ -40,9 +40,42 @@ permissions:
   contents: read
 
 jobs:
-  compose-smoke:
-    name: Compose smoke (Shape B)
+  # Resolves the mutable CI base-image tag to its index digest ONCE per
+  # workflow run (`.github/actions/resolve-ci-image`), so both arch legs
+  # below build against the exact same base even if `:latest` is
+  # republished mid-run.
+  resolve-base:
+    name: Resolve CI base image
     runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    outputs:
+      image: ${{ steps.resolve.outputs.image }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: docker/setup-buildx-action@8d2750c68a42422c14e847fe6c8ac0403b4cbd6f # v3.12.0
+      - uses: docker/login-action@c94ce9fb468520275223c153574b00df6fe4bcc9 # v3.7.0
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ github.token }}
+      - id: resolve
+        uses: ./.github/actions/resolve-ci-image
+        with:
+          ref: ${{ vars.JAMMI_CI_IMAGE || 'ghcr.io/f-inverse/jammi-ai-ci:latest' }}
+
+  compose-smoke:
+    name: Compose smoke (Shape B, ${{ matrix.arch }})
+    needs: [resolve-base]
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - arch: amd64
+            runner: ubuntu-latest
+          - arch: arm64
+            runner: ubuntu-24.04-arm
+    runs-on: ${{ matrix.runner }}
     steps:
       - uses: actions/checkout@v4
 
@@ -69,13 +102,19 @@ jobs:
           push: "false"
           load: "true"
           local-tag: jammi-ai-server:pr
+          build-args: |
+            BASE_IMAGE=${{ needs.resolve-base.outputs.image }}
+          # No `platforms` input -- native (the default, per this action's
+          # own doc): each leg's own runner arch is what buildx builds, so
+          # the arm64 leg loads a real arm64 image, never an emulated one
+          # (E10 -- `load: true` is single-platform by design).
           # The docker exporter (what `load: true` uses) cannot carry
           # attestations on a stock daemon — belt-and-braces: build-push-
           # action already omits default provenance when `load: true`, and
           # `sbom: false` is the one that actually matters here.
           sbom: "false"
           provenance: "false"
-          cache-scope: cpu
+          cache-scope: cpu-${{ matrix.arch }}
 
       - name: Bring up Shape B (server + Postgres + JetStream)
         run: |

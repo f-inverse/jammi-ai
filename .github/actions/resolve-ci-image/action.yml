@@ -1,0 +1,49 @@
+name: resolve-ci-image
+description: >
+  Resolves a mutable CI base-image ref (typically ":latest", read from a
+  repo variable with a literal fallback -- e.g. `${{ vars.JAMMI_CI_IMAGE ||
+  'ghcr.io/f-inverse/jammi-ai-ci:latest' }}`) to its index digest ONCE, so
+  every leg of a release-artifact-producing workflow builds against the
+  EXACT SAME multi-arch index even if `:latest` is republished mid-run
+  (`_ci-base-image.yml`'s own header documents this race: nothing rewrites
+  the repo variable to a sha tag, and no PAT exists to do so). Read-only
+  (`docker buildx imagetools inspect`) -- no repo-variable write, no PAT.
+  Must run AFTER `actions/checkout@v4` (local-path composite) and after
+  `docker/setup-buildx-action` is on the runner's PATH.
+
+inputs:
+  ref:
+    description: >
+      The mutable image ref to resolve, e.g.
+      "ghcr.io/f-inverse/jammi-ai-ci:latest". A port-bearing registry ref (a
+      literal ":" after the host, before any "/") is unsupported and fails
+      loudly -- the resolve step's own "${REF%%@*}"/"${image%:*}" parsing
+      assumes at most one ":" outside a digest.
+    required: true
+
+outputs:
+  image:
+    description: >
+      The ref re-pointed at its resolved index digest, e.g.
+      "ghcr.io/f-inverse/jammi-ai-ci@sha256:...".
+    value: ${{ steps.resolve.outputs.image }}
+
+runs:
+  using: composite
+  steps:
+    - name: Resolve the mutable ref to its index digest
+      id: resolve
+      shell: bash
+      env:
+        REF: ${{ inputs.ref }}
+      run: |
+        set -euo pipefail
+        digest="$(docker buildx imagetools inspect "$REF" --format '{{.Manifest.Digest}}')"
+        if ! [[ "$digest" =~ ^sha256:[0-9a-f]{64}$ ]]; then
+          echo "::error::docker buildx imagetools inspect for '$REF' did not return a sha256 digest (got: '$digest')" >&2
+          exit 1
+        fi
+        image="${REF%%@*}"
+        image="${image%:*}@${digest}"
+        echo "image=$image" >> "$GITHUB_OUTPUT"
+        echo "resolved $REF -> $image"

@@ -36,17 +36,57 @@ permissions:
   contents: read
 
 jobs:
-  server-cpu:
-    name: jammi-server (CPU)
+  # Resolves the mutable CI base-image tag to its index digest ONCE per
+  # workflow run (`.github/actions/resolve-ci-image`), so both legs below
+  # (x86_64, aarch64) build against the exact same base even if `:latest`
+  # is republished mid-run.
+  resolve-base:
+    name: Resolve CI base image
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    outputs:
+      image: ${{ steps.resolve.outputs.image }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: docker/setup-buildx-action@8d2750c68a42422c14e847fe6c8ac0403b4cbd6f # v3.12.0
+      - uses: docker/login-action@c94ce9fb468520275223c153574b00df6fe4bcc9 # v3.7.0
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ github.token }}
+      - id: resolve
+        uses: ./.github/actions/resolve-ci-image
+        with:
+          ref: ${{ vars.JAMMI_CI_IMAGE || 'ghcr.io/f-inverse/jammi-ai-ci:latest' }}
+
+  server-cpu-x86_64:
+    name: jammi-server (CPU, x86_64)
+    needs: [resolve-base]
     permissions:
       contents: read
     uses: ./.github/workflows/_pypi-server.yml
     with:
-      container_image: ${{ vars.JAMMI_CI_IMAGE || 'ghcr.io/f-inverse/jammi-ai-ci:latest' }}
+      container_image: ${{ needs.resolve-base.outputs.image }}
       cargo_features: jetstream-broker,storage-cloud
       package_dir: packaging/server-cpu
-      artifact_prefix: server-cpu
+      artifact_prefix: server-cpu-x86_64
       platform_tag: manylinux_2_28_x86_64
+    secrets: inherit
+
+  server-cpu-aarch64:
+    name: jammi-server (CPU, aarch64)
+    needs: [resolve-base]
+    permissions:
+      contents: read
+    uses: ./.github/workflows/_pypi-server.yml
+    with:
+      container_image: ${{ needs.resolve-base.outputs.image }}
+      runs_on: ubuntu-24.04-arm
+      cargo_features: jetstream-broker,storage-cloud
+      package_dir: packaging/server-cpu
+      artifact_prefix: server-cpu-aarch64
+      platform_tag: manylinux_2_28_aarch64
     secrets: inherit
 
   gpu-proof:
@@ -75,16 +115,22 @@ jobs:
     # artifact-only dry run and can never publish. Same recovery contract as
     # `pypi.yml`/`pypi-client.yml` on this lockstep surface. PURE conjunction
     # (no `||`).
-    if: always() && startsWith(github.ref, 'refs/tags/py-v') && needs.server-cpu.result == 'success' && needs.gpu-proof.result == 'success'
-    needs: [server-cpu, gpu-proof]
+    if: always() && startsWith(github.ref, 'refs/tags/py-v') && needs.server-cpu-x86_64.result == 'success' && needs.server-cpu-aarch64.result == 'success' && needs.gpu-proof.result == 'success'
+    needs: [server-cpu-x86_64, server-cpu-aarch64, gpu-proof]
     runs-on: ubuntu-latest
     environment: pypi
     permissions:
       id-token: write
     steps:
+      # A release with a partial platform set (one arch's wheel missing) is
+      # a worse outcome than a failed release -- both legs are `needs:` of
+      # this job, and this ONE job downloads and uploads both wheels
+      # together (`pattern` + `merge-multiple`, the same shape `pypi.yml`'s
+      # publish job already uses).
       - uses: actions/download-artifact@v4
         with:
-          name: server-cpu-dist
+          pattern: server-cpu-*-dist
+          merge-multiple: true
           path: dist
 
       - uses: pypa/gh-action-pypi-publish@dc37677b2e1c63e2034f94d8a5b11f265b73ba33 # v1.14.2 (release/v1)

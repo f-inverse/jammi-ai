@@ -38,6 +38,30 @@ permissions:
   contents: read
 
 jobs:
+  # Resolves the mutable CUDA CI base-image tag to its index digest ONCE per
+  # workflow run (`.github/actions/resolve-ci-image`) -- V3's pinned set
+  # names this workflow explicitly: the CUDA wheel is a release artifact
+  # like every other consumer of the mutable base.
+  resolve-base:
+    name: Resolve CI base image (CUDA)
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    outputs:
+      image: ${{ steps.resolve.outputs.image }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: docker/setup-buildx-action@8d2750c68a42422c14e847fe6c8ac0403b4cbd6f # v3.12.0
+      - uses: docker/login-action@c94ce9fb468520275223c153574b00df6fe4bcc9 # v3.7.0
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ github.token }}
+      - id: resolve
+        uses: ./.github/actions/resolve-ci-image
+        with:
+          ref: ${{ vars.JAMMI_CI_IMAGE_CUDA || 'ghcr.io/f-inverse/jammi-ai-ci-cuda:latest' }}
+
   read-manifest:
     name: Read release feature list
     runs-on: ubuntu-latest
@@ -65,12 +89,12 @@ jobs:
 
   server-cu12:
     name: jammi-server-cu12 (CUDA)
-    needs: [read-manifest]
+    needs: [read-manifest, resolve-base]
     permissions:
       contents: read
     uses: ./.github/workflows/_pypi-server.yml
     with:
-      container_image: ${{ vars.JAMMI_CI_IMAGE_CUDA || 'ghcr.io/f-inverse/jammi-ai-ci-cuda:latest' }}
+      container_image: ${{ needs.resolve-base.outputs.image }}
       cargo_features: ${{ needs.read-manifest.outputs.cargo_features }}
       package_dir: packaging/server-cu12
       artifact_prefix: server-cu12

@@ -179,10 +179,45 @@ async fn create_building_embedding_with_parquet(
     info
 }
 
-// ─── report-count correctness: a key the expired-building pre-pass already
-//     claimed/deleted must never ALSO be counted by this pass's own
-//     orphan/bytes_reclaimed accounting off a listing snapshot taken before
-//     the pre-pass ran ───────────────────────────────────────────────────────
+// ─── report-count correctness: the expired-building pre-pass reports
+//     EVERY byte it reclaims (or, under a dry-run, would reclaim) EXACTLY
+//     ONCE — never zero, never twice. Before this fix (a2bea619's "double-
+//     counted" rationale, which moved the pre-pass BEFORE the listing so a
+//     key it deleted could never appear in `listed` at all) `apply=true`
+//     reaped the row's Parquet but reported it in NO field: `orphans` was
+//     empty and `bytes_reclaimed` was `0` for a pass that had just reclaimed
+//     real bytes. RED against aa117dbf (pasted below) proves the old
+//     oracle pinned exactly that silence, not a real absence of double
+//     counting. ─────────────────────────────────────────────────────────────
+
+/// Build a `building` row whose lease has expired with a valid Parquet but
+/// no manifest sidecar (a torn write before the `building -> ready` flip) —
+/// the exact state [`ResultStore::reconcile`]'s expired-building pre-pass
+/// reaps via `reap_after_fail_cas` (fails the row, deletes the Parquet).
+/// Backdated so the SAME object would also qualify as a past-grace orphan
+/// candidate through the ordinary object→row arm if it were ever (wrongly)
+/// re-listed there — the condition that would double-count it absent the
+/// `reaped` set this fix introduces. Returns the table name and the
+/// Parquet's local filesystem path.
+async fn torn_building_row_fixture(
+    store: &ResultStore,
+    catalog: &Catalog,
+    source_id: &str,
+) -> (String, String) {
+    let info = create_building_embedding_with_parquet(store, source_id, 5).await;
+    let parquet_local = info
+        .parquet_url()
+        .as_str()
+        .trim_start_matches("file://")
+        .to_string();
+    // `abandon_building` asserts the row is `building` under a live lease,
+    // detaches the writer's handle (so no background heartbeat can renew it
+    // out from under the next line), THEN forces the lease into the past.
+    let table_name = jammi_test_utils::abandon_building(catalog, info).await;
+    let table_dir = std::path::Path::new(&parquet_local).parent().unwrap();
+    backdate_dir(table_dir, Duration::from_secs(3600));
+    (table_name, parquet_local)
+}
 
 #[tokio::test]
 async fn pre_pass_deleted_table_is_not_double_counted() {
@@ -192,26 +227,40 @@ async fn pre_pass_deleted_table_is_not_double_counted() {
         .unwrap()
         .with_lease_intervals(short_lease());
 
-    // A `building` row: valid Parquet, no manifest, expired lease — exactly
-    // the state the pre-pass reaps via `reap_after_fail_cas` (fails the row,
-    // deletes the Parquet) under `apply=true`.
-    let info = create_building_embedding_with_parquet(&store, "docs-torn", 5).await;
-    let parquet_local = info
-        .parquet_url()
-        .as_str()
-        .trim_start_matches("file://")
+    let (table_name, parquet_local) =
+        torn_building_row_fixture(&store, &catalog, "docs-torn").await;
+    let true_size = std::fs::metadata(&parquet_local).unwrap().len();
+    let parquet_key = std::path::Path::new(&parquet_local)
+        .file_name()
+        .unwrap()
+        .to_str()
+        .unwrap()
         .to_string();
-    // `abandon_building` asserts the row is `building` under a live lease,
-    // detaches the writer's handle (so no background heartbeat can renew it
-    // out from under the next line), THEN forces the lease into the past.
-    let table_name = jammi_test_utils::abandon_building(&catalog, info).await;
-    // Backdate the Parquet so it would ALSO qualify as a past-grace orphan
-    // candidate if a stale (pre-pre-pass) listing snapshot were checked
-    // against it — the exact condition that would double-count it.
-    let table_dir = std::path::Path::new(&parquet_local).parent().unwrap();
-    backdate_dir(table_dir, Duration::from_secs(3600));
 
-    let report = store
+    // Dry-run FIRST — mutates nothing, so the state `apply=true` sees next
+    // is bit-for-bit identical to what this pass already read.
+    let dry = store
+        .reconcile(ReconcileOptions {
+            apply: false,
+            grace: Duration::from_secs(3),
+        })
+        .await
+        .unwrap();
+    assert!(
+        std::path::Path::new(&parquet_local).exists(),
+        "a dry-run must never delete the torn row's Parquet"
+    );
+    assert!(
+        dry.orphans.iter().any(|o| o.ends_with(&parquet_key)),
+        "a dry-run must PREVIEW the pre-pass's reap, not report it in no field: {dry:?}"
+    );
+    assert_eq!(
+        dry.bytes_reclaimed, true_size,
+        "a dry-run must preview the object's TRUE size, not 0: {dry:?}"
+    );
+
+    // Now apply, on the identical state.
+    let apply = store
         .reconcile(ReconcileOptions {
             apply: true,
             grace: Duration::from_secs(3),
@@ -229,7 +278,7 @@ async fn pre_pass_deleted_table_is_not_double_counted() {
     assert_eq!(
         row.status,
         jammi_db::catalog::status::ResultTableStatus::Failed.to_string(),
-        "{report:?}"
+        "{apply:?}"
     );
     // The pre-pass's own delete actually removed the bytes.
     assert!(
@@ -237,22 +286,181 @@ async fn pre_pass_deleted_table_is_not_double_counted() {
         "the pre-pass must have deleted the torn row's Parquet"
     );
 
-    // The key the pre-pass already deleted must NEVER show up in this SAME
-    // pass's own orphan accounting — it was never listed in the first place
-    // (listing runs AFTER the pre-pass), so it cannot be double-counted.
-    let parquet_key = std::path::Path::new(&parquet_local)
-        .file_name()
-        .unwrap()
-        .to_str()
-        .unwrap()
-        .to_string();
+    // The RED oracle this replaces asserted the exact opposite of both of
+    // the following — pasted verbatim from the pre-fix test body:
+    //   assert!(
+    //       !report.orphans.iter().any(|o| o.ends_with(&parquet_key)),
+    //       "a pre-pass-deleted key must not double-count as this pass's own orphan: {report:?}"
+    //   );
+    //   assert_eq!(
+    //       report.bytes_reclaimed, 0,
+    //       "the pre-pass's own delete must not be double-counted in bytes_reclaimed: {report:?}"
+    //   );
+    // Reproduced at aa117dbf: apply=true reaped 1 object of `true_size`
+    // bytes and reported `orphans: []`, `bytes_reclaimed: 0` — the reap was
+    // real, the report was silent. The honest oracle: apply reports the
+    // reaped key exactly once, with its true size — the SAME key and size
+    // the preceding dry-run already reported on the identical state.
     assert!(
-        !report.orphans.iter().any(|o| o.ends_with(&parquet_key)),
-        "a pre-pass-deleted key must not double-count as this pass's own orphan: {report:?}"
+        apply.orphans.iter().any(|o| o.ends_with(&parquet_key)),
+        "apply must report the key it actually reaped, exactly once: {apply:?}"
+    );
+    assert_eq!(apply.orphan_count, 1, "{apply:?}");
+    assert_eq!(
+        apply.bytes_reclaimed, true_size,
+        "apply must report the TRUE bytes it reclaimed, not 0: {apply:?}"
     );
     assert_eq!(
-        report.bytes_reclaimed, 0,
-        "the pre-pass's own delete must not be double-counted in bytes_reclaimed: {report:?}"
+        dry.orphans, apply.orphans,
+        "dry-run and apply must agree on the identical state: {dry:?} vs {apply:?}"
+    );
+    assert_eq!(
+        dry.bytes_reclaimed, apply.bytes_reclaimed,
+        "{dry:?} vs {apply:?}"
+    );
+}
+
+// ─── dry-run previews EXACTLY what the matching apply pass reclaims, field
+//     by field, across every arm this pass has: the expired-building
+//     pre-pass, the ready-row completeness arm, a healthy untouched table,
+//     and an unattributed key (reported in neither arm, at any `apply`) ────
+
+#[tokio::test]
+async fn dry_run_previews_exactly_what_apply_reclaims() {
+    let dir = tempdir().unwrap();
+    let catalog = Arc::new(Catalog::open(dir.path()).await.unwrap());
+    let store = ResultStore::new(dir.path(), Arc::clone(&catalog), AnnIndexConfig::default())
+        .unwrap()
+        .with_lease_intervals(short_lease());
+    let ctx = SessionContext::new();
+
+    // (1) Expired-building table with bytes (the pre-pass arm).
+    let (_torn_table, torn_parquet) =
+        torn_building_row_fixture(&store, &catalog, "docs-torn").await;
+
+    // (2) A `ready` row with a missing manifest — the row->object
+    // completeness arm; backdated so its now-unreferenced objects (once the
+    // row fails) are unambiguously past grace, never merely `pending`.
+    let missing_manifest_record = materialize_healthy_table(&store, &ctx, "docs-nomanifest").await;
+    let mm_parquet_local = missing_manifest_record
+        .parquet_path
+        .trim_start_matches("file://")
+        .to_string();
+    let (mm_stem, _ext) = mm_parquet_local.rsplit_once('.').unwrap();
+    std::fs::remove_file(format!("{mm_stem}.materialization.json")).unwrap();
+    let mm_table_dir = std::path::Path::new(&mm_parquet_local).parent().unwrap();
+    backdate_dir(mm_table_dir, Duration::from_secs(3600));
+
+    // (3) A healthy table: must survive both passes untouched.
+    let healthy_record = materialize_healthy_table(&store, &ctx, "docs-healthy").await;
+
+    // (4) An unattributed key — never reported by any scoped pass, but this
+    // test runs `reconcile_all` (admin), which does see it.
+    let root = dir.path().join("jammi_db");
+    std::fs::create_dir_all(&root).unwrap();
+    std::fs::write(root.join("pre_layout.parquet"), b"stray-pre-layout").unwrap();
+    backdate_dir(&root, Duration::from_secs(3600));
+
+    // Dry-run FIRST — mutates nothing.
+    let dry = store
+        .reconcile_all(ReconcileOptions {
+            apply: false,
+            grace: Duration::from_secs(3),
+        })
+        .await
+        .unwrap();
+
+    // Sanity: the fixture actually exercises every arm (a vacuous "both
+    // empty" pass would pass any field-by-field comparison trivially).
+    assert!(
+        dry.rows_failed
+            .contains(&missing_manifest_record.table_name),
+        "{dry:?}"
+    );
+    assert!(!dry.orphans.is_empty(), "{dry:?}");
+    assert!(dry.bytes_reclaimed > 0, "{dry:?}");
+    assert!(
+        dry.unattributed
+            .iter()
+            .any(|u| u.ends_with("pre_layout.parquet")),
+        "{dry:?}"
+    );
+
+    // Nothing was actually touched by the dry-run.
+    assert!(std::path::Path::new(&torn_parquet).exists());
+    assert!(std::path::Path::new(&mm_parquet_local).exists());
+    assert!(root.join("pre_layout.parquet").exists());
+    let healthy_still_ready = store
+        .catalog()
+        .get_result_table(&healthy_record.table_name)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        healthy_still_ready.status,
+        jammi_db::catalog::status::ResultTableStatus::Ready.to_string()
+    );
+
+    // Now apply, on the identical state.
+    let apply = store
+        .reconcile_all(ReconcileOptions {
+            apply: true,
+            grace: Duration::from_secs(3),
+        })
+        .await
+        .unwrap();
+
+    // RED-first: at aa117dbf, `dry.orphans`/`dry.bytes_reclaimed` under-
+    // reported relative to `apply`'s on two counts at once — the pre-pass
+    // silence this test's sibling above pins directly, and the ready-row
+    // arm's `!apply` branch keeping a would-be-failed row's objects in
+    // `still_ready` (so a dry-run never previewed them as reclaimable at
+    // all, even though the matching `apply` pass deletes them). Every field
+    // but `applied` must agree.
+    assert_eq!(dry.scope, apply.scope);
+    assert_eq!(dry.rows_failed, apply.rows_failed, "{dry:?} vs {apply:?}");
+    assert_eq!(
+        dry.rows_failed_count, apply.rows_failed_count,
+        "{dry:?} vs {apply:?}"
+    );
+    assert_eq!(dry.orphans, apply.orphans, "{dry:?} vs {apply:?}");
+    assert_eq!(dry.orphan_count, apply.orphan_count, "{dry:?} vs {apply:?}");
+    assert_eq!(dry.pending, apply.pending, "{dry:?} vs {apply:?}");
+    assert_eq!(
+        dry.pending_count, apply.pending_count,
+        "{dry:?} vs {apply:?}"
+    );
+    assert_eq!(dry.unattributed, apply.unattributed, "{dry:?} vs {apply:?}");
+    assert_eq!(
+        dry.unattributed_count, apply.unattributed_count,
+        "{dry:?} vs {apply:?}"
+    );
+    assert_eq!(dry.damaged, apply.damaged, "{dry:?} vs {apply:?}");
+    assert_eq!(
+        dry.damaged_count, apply.damaged_count,
+        "{dry:?} vs {apply:?}"
+    );
+    assert_eq!(
+        dry.bytes_reclaimed, apply.bytes_reclaimed,
+        "{dry:?} vs {apply:?}"
+    );
+    assert!(!dry.applied);
+    assert!(apply.applied);
+
+    // And apply actually did what it previewed: the reclaimed bytes are
+    // gone, the healthy table and the unattributed key survive.
+    assert!(!std::path::Path::new(&torn_parquet).exists());
+    assert!(!std::path::Path::new(&mm_parquet_local).exists());
+    assert!(root.join("pre_layout.parquet").exists());
+    let healthy_after = store
+        .catalog()
+        .get_result_table(&healthy_record.table_name)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        healthy_after.status,
+        jammi_db::catalog::status::ResultTableStatus::Ready.to_string()
     );
 }
 

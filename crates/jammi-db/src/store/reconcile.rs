@@ -23,12 +23,20 @@
 //! every object's true referencer at the moment of listing (a table
 //! materialising concurrently with a reconcile pass always has its `building`
 //! row visible by the time reconcile reads rows, because the row is written
-//! before any byte the row→object check would look for). The one exception
-//! is the expired-building pre-pass, which runs BEFORE the listing on
-//! purpose (report-count correctness, not the row-completeness rule above):
-//! it physically deletes bytes for whatever it reaps, so listing only after
-//! it has run keeps a key it just deleted from ever appearing — and being
-//! double-counted — in this pass's own `orphans`/`bytes_reclaimed`.
+//! before any byte the row→object check would look for). This holds for the
+//! expired-building pre-pass too — it now runs AFTER the listing, exactly
+//! like every other row read this pass performs. The pre-pass still
+//! physically deletes bytes (under `apply`) for whatever it reaps, but it
+//! never double-counts them: it looks each candidate object up in the
+//! listing snapshot taken a moment earlier (so it reports the object's TRUE
+//! size, not a size implied after the fact) and records every key it
+//! accounts for in a `reaped` set; the object→row loop further down skips
+//! any key already in `reaped` — structurally, by set membership, not by
+//! ordering — so a key can never be counted twice no matter which arm
+//! touches it first. Under `apply=false` the pre-pass claims and deletes
+//! nothing, but performs the identical read-only classification and reports
+//! the SAME objects and sizes `apply=true` would reclaim (see
+//! [`ReconcileOptions::apply`]'s pinned dry-run/apply parity invariant).
 
 use std::collections::BTreeSet;
 use std::str::FromStr;
@@ -56,6 +64,17 @@ pub struct ReconcileOptions {
     /// incomplete `ready` row to `failed`); `false` (the default a caller
     /// should reach for first) reports everything a pass WOULD do without
     /// mutating anything.
+    ///
+    /// **Pinned invariant**: for the same catalog+object-store state and the
+    /// same [`ReconcileOptions::grace`], `apply=false` and `apply=true`
+    /// report the identical [`ReconcileReport::rows_failed`],
+    /// [`ReconcileReport::orphans`], every `*_count` field, and
+    /// [`ReconcileReport::bytes_reclaimed`] — `apply=true`'s numbers are what
+    /// it actually did; `apply=false`'s are what it would have done. Only
+    /// [`ReconcileReport::applied`] itself, and whatever the catalog/object
+    /// store actually look like afterward, differ between the two. A dry-run
+    /// that under-reports what the matching `apply` pass would reclaim is a
+    /// bug in the dry-run arm, not a looser contract for it.
     pub apply: bool,
     /// An orphan candidate younger than this is `pending`, never deleted —
     /// the window a concurrent writer's just-landed bytes have to grow a
@@ -144,8 +163,12 @@ pub struct ReconcileReport {
     /// to [`REPORT_LIST_CAP`] entries — the corresponding `*_count` field is
     /// still the true total either way.
     pub truncated: bool,
-    /// Total bytes actually reclaimed (`orphans` deleted this pass; `0` when
-    /// `!applied`).
+    /// Total bytes reclaimed by [`Self::orphans`] — under `apply=true`, the
+    /// bytes this pass ACTUALLY deleted; under `apply=false`, the bytes the
+    /// matching `apply=true` pass, on the identical state, WOULD delete (see
+    /// the pinned dry-run/apply parity invariant on
+    /// [`ReconcileOptions::apply`]). Never `0` merely because `!applied` —
+    /// only because nothing was reclaimable.
     pub bytes_reclaimed: u64,
 }
 
@@ -254,7 +277,15 @@ impl ResultStore {
     /// `apply = true` requires `grace >= ` this store's configured lease
     /// duration — a reclaim window shorter than the window a live writer's
     /// lease may legitimately run under would race a healthy in-progress
-    /// materialization.
+    /// materialization. Called unconditionally at the top of BOTH
+    /// [`Self::reconcile`] (tenant-scoped) and [`Self::reconcile_all`]
+    /// (admin-scoped) — every mode this store exposes runs through this ONE
+    /// gate, never a copy of it. `apply=false` deliberately tolerates any
+    /// `grace`: a dry-run's classification of a given object as `orphan` vs
+    /// `pending` still uses whatever `grace` the caller passed (that is the
+    /// dry-run/apply parity [`ReconcileOptions::apply`] pins), but a dry-run
+    /// never deletes anything, so an operationally-too-short `grace` is not
+    /// yet a hazard the way it is the moment `apply=true` would act on it.
     fn check_apply_grace(&self, opts: &ReconcileOptions) -> Result<()> {
         if opts.apply && opts.grace < self.lease.lease() {
             return Err(JammiError::Config(format!(
@@ -285,42 +316,6 @@ impl ResultStore {
         let root_path = root_handle.data_path()?;
         let root_prefix = format!("{root_path}/");
 
-        // Expired-building pre-pass (esc-094 follow-up): an expired-lease
-        // `building` row's objects are NEVER reaped through this pass's
-        // orphan arm below (no claim, no CAS) — they are reconciled through
-        // the SAME recovery arm `ResultStore::recover` uses: claim first
-        // (fencing whatever writer is or was alive), then promote-or-fail,
-        // then delete only after that CAS. Only under `apply` — `apply=false`
-        // mutates nothing (an expired row's objects are still reported, as an
-        // ordinary orphan candidate, exactly as before this fix); the SAME
-        // `list_expired_building_tables` call already respects the binding in
-        // force, so a tenant-scoped `reconcile()` reconciles only its own
-        // tenant's expired rows and the admin-scoped `reconcile_all()` (via
-        // `TenantBinding::admin_scope`) covers every tenant's.
-        //
-        // Runs BEFORE the object listing below — report-count correctness,
-        // not the ordering rule that governs `ready_rows`/`live_building`
-        // further down. This pre-pass physically DELETES bytes for whatever
-        // it reaps; if the listing ran first, a key it then deleted would
-        // still sit in a now-stale `listed` snapshot, and the orphan-
-        // candidate arm below would count it a SECOND time in
-        // `orphans`/`orphan_count`/`bytes_reclaimed` even though no bytes
-        // were actually freed the second time (`delete_relative` no-ops on
-        // an already-gone object). Listing AFTER this pre-pass makes a
-        // reaped key simply absent from `listed`, so it can never be
-        // double-counted. This does not weaken the module-level list-first
-        // rule below: that rule protects the invariant that a row set is a
-        // superset of every listed object's true referencer, which only
-        // requires the listing to precede `list_result_tables_by_status`/
-        // `list_live_building_tables` — this pre-pass's own row read
-        // (`list_expired_building_tables`) never inspects `listed` at all,
-        // so reordering it changes nothing about which rows it reaps.
-        if opts.apply {
-            for table in self.catalog.list_expired_building_tables().await? {
-                self.reconcile_expired_building_row(table).await?;
-            }
-        }
-
         let listed = root_handle
             .list(&root_path)
             .await?
@@ -334,6 +329,65 @@ impl ResultStore {
                 })
             })
             .collect::<Vec<_>>();
+
+        // Expired-building pre-pass (esc-094 follow-up): an expired-lease
+        // `building` row's objects are NEVER reaped through this pass's
+        // orphan arm below (no claim, no CAS) — under `apply` they are
+        // reconciled through the SAME recovery arm `ResultStore::recover`
+        // uses: claim first (fencing whatever writer is or was alive), then
+        // promote-or-fail, then delete only after that CAS. The SAME
+        // `list_expired_building_tables` call already respects the binding
+        // in force, so a tenant-scoped `reconcile()` reconciles only its own
+        // tenant's expired rows and the admin-scoped `reconcile_all()` (via
+        // `TenantBinding::admin_scope`) covers every tenant's.
+        //
+        // Runs AFTER the object listing above, like every other row read
+        // this pass performs — `reaped` (built here) records every key this
+        // arm accounts for (with the TRUE size the listing snapshot already
+        // captured, before any delete), and the object→row loop further down
+        // skips any key already in `reaped`: a key can never be counted
+        // twice, by construction, regardless of which arm ran first. Under
+        // `apply=true` a row's candidate objects are counted iff the row was
+        // ACTUALLY reaped (the fail-CAS + delete arm ran); under
+        // `apply=false` nothing is claimed or deleted, but the identical
+        // read-only classification (`Self::expired_row_would_reap`) decides
+        // whether this row's objects are previewed — the dry-run/apply
+        // parity invariant pinned on [`ReconcileOptions::apply`].
+        //
+        // `orphans`/`orphan_count`/`bytes_reclaimed`/`truncated` are declared
+        // HERE (rather than beside `pending`/`unattributed`/`damaged` further
+        // down) because this pre-pass is their first writer; every other
+        // report accumulator is declared where it was before.
+        let mut orphans = Vec::new();
+        let mut orphan_count = 0u64;
+        let mut bytes_reclaimed = 0u64;
+        let mut truncated = false;
+        let mut reaped: BTreeSet<String> = BTreeSet::new();
+        for table in self.catalog.list_expired_building_tables().await? {
+            let candidate_keys = self
+                .referenced_result_keys(std::slice::from_ref(&table), &[])
+                .await?;
+            let candidates: Vec<(String, u64)> = listed
+                .iter()
+                .filter(|o| candidate_keys.contains(&o.rel))
+                .map(|o| (o.rel.clone(), o.size))
+                .collect();
+
+            let was_or_would_be_reaped = if opts.apply {
+                self.reconcile_expired_building_row(table).await?
+            } else {
+                self.expired_row_would_reap(&table).await?
+            };
+
+            if was_or_would_be_reaped {
+                for (key, size) in candidates {
+                    if reaped.insert(key.clone()) {
+                        push_capped(&mut orphans, &mut orphan_count, &mut truncated, key);
+                        bytes_reclaimed += size;
+                    }
+                }
+            }
+        }
 
         // Rows are read AFTER the listing above (ordering rule): the row set
         // this pass checks against is a superset of every listed object's
@@ -367,16 +421,19 @@ impl ResultStore {
         let live_building = self.catalog.list_live_building_tables().await?;
 
         // row -> object: a `ready` row missing a required object is driven
-        // to `failed` FIRST (ONLY when `apply`, matching "apply=false
-        // mutates nothing" — a dry-run pass still REPORTS the row in
-        // `rows_failed`, but never performs the CAS), so its bytes fall out
-        // of the referenced set built below (the standard
-        // `failed`-rows-are-orphans rule, A12). Under `!apply` the row stays
-        // in `still_ready` so its objects remain protected — nothing new
-        // becomes reclaimable from a pass that changed nothing.
+        // to `failed` FIRST (ONLY the CAS is skipped when `!apply`,
+        // matching "apply=false mutates nothing" — the catalog row itself
+        // is untouched), so its bytes fall out of the referenced set built
+        // below (the standard `failed`-rows-are-orphans rule, A12) in BOTH
+        // modes. Removing the row from `still_ready` under `!apply` too
+        // (never re-adding it, matching the `apply` arm exactly) is what
+        // makes the dry-run/apply parity invariant on
+        // [`ReconcileOptions::apply`] hold here: the object→row loop further
+        // down then classifies this row's now-unreferenced objects through
+        // the IDENTICAL orphan/pending age gate apply would use, rather than
+        // protecting them from ever being previewed as reclaimable.
         let mut rows_failed = Vec::new();
         let mut rows_failed_count = 0u64;
-        let mut truncated = false;
         let mut still_ready = Vec::with_capacity(ready_rows.len());
         for table in ready_rows.drain(..) {
             if self.required_row_objects_present(&table).await? {
@@ -384,17 +441,16 @@ impl ResultStore {
                 continue;
             }
             if !opts.apply {
-                // Dry run: reported, but the row stays `still_ready` (never
-                // removed from the protected set) — "apply=false mutates
-                // nothing" extends to what a later step in THIS SAME pass
-                // considers reclaimable.
+                // Dry run: reported, and — matching what `apply` would do —
+                // the row is NOT kept in the protected `still_ready` set, so
+                // its objects fall through to the orphan/pending age gate
+                // below exactly as they would under `apply=true`.
                 push_capped(
                     &mut rows_failed,
                     &mut rows_failed_count,
                     &mut truncated,
                     table.table_name.clone(),
                 );
-                still_ready.push(table);
                 continue;
             }
             if self
@@ -454,21 +510,27 @@ impl ResultStore {
             .filter_map(|u| relative_to(&self.root, &u))
             .collect();
 
-        let mut orphans = Vec::new();
-        let mut orphan_count = 0u64;
         let mut pending = Vec::new();
         let mut pending_count = 0u64;
         let mut unattributed = Vec::new();
         let mut unattributed_count = 0u64;
         let mut damaged = Vec::new();
         let mut damaged_count = 0u64;
-        // `truncated` is shared with the ready-row loop above: a cap hit on
-        // ANY list (including `rows_failed`) sets the one report-wide flag.
-        let mut bytes_reclaimed = 0u64;
+        // `orphans`/`orphan_count`/`bytes_reclaimed`/`truncated` are shared
+        // with the expired-building pre-pass above: a cap hit on ANY list
+        // (including `rows_failed`) sets the one report-wide flag, and a key
+        // that pass already accounted for is skipped below (`reaped`).
         let cutoff =
             Utc::now() - chrono::Duration::from_std(opts.grace).unwrap_or(chrono::Duration::MAX);
 
         for obj in &listed {
+            if reaped.contains(&obj.rel) {
+                // Already accounted for by the expired-building pre-pass
+                // above (reaped under `apply`, or previewed under a
+                // dry-run) — never re-classified here, so it can never be
+                // counted a second time no matter which arm ran first.
+                continue;
+            }
             let attribution = attribute(&obj.rel);
             let in_scope = match (&own_seg, &attribution) {
                 (None, _) => true, // admin pass: every tenant in scope
@@ -585,7 +647,14 @@ impl ResultStore {
                 }
             }
 
-            // Orphan candidate: age-gate against `grace`.
+            // Orphan candidate: age-gate against `grace`. `bytes_reclaimed`
+            // is credited here in BOTH modes — under `apply=true` the delete
+            // below must actually succeed first (a failed delete leaves the
+            // object `pending` for the next pass, never counted as
+            // reclaimed); under `apply=false` a dry-run cannot know whether
+            // a future delete would fail, so it credits the size the same
+            // way every other preview in this pass does (see the pinned
+            // dry-run/apply parity invariant on [`ReconcileOptions::apply`]).
             let key = obj.rel.clone();
             if obj.last_modified <= cutoff {
                 if opts.apply {
@@ -594,8 +663,8 @@ impl ResultStore {
                         push_capped(&mut pending, &mut pending_count, &mut truncated, key);
                         continue;
                     }
-                    bytes_reclaimed += obj.size;
                 }
+                bytes_reclaimed += obj.size;
                 push_capped(&mut orphans, &mut orphan_count, &mut truncated, key);
             } else {
                 push_capped(&mut pending, &mut pending_count, &mut truncated, key);

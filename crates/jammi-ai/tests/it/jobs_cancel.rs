@@ -366,3 +366,143 @@ async fn enqueue_derives_the_model_links_like_the_dedicated_entry_points() {
     let row = session.catalog().get_job(&handle.job_id).await.unwrap();
     assert_eq!(row.model_source, None);
 }
+
+/// unit #485 (round-2 adversarial BLOCK F1): before this unit, a training
+/// kind's branch of `JobWorker::run_claimed_job` threaded only the
+/// lease-lost flag into `run_spec` — `jobs.cancel_requested` was never read
+/// anywhere on that branch, so `CancelJob`/`JobHandle::cancel` on a real
+/// training job was recorded on the row and then silently ignored: the run
+/// trained to completion regardless. This drives a REAL, tiny LoRA fine-tune
+/// (few epochs is not enough to guarantee the run is still in flight when
+/// the cancel lands — `epochs` is deliberately large, mirroring
+/// `fine_tune.rs`'s `cancelled_run_reclaims_epoch_checkpoints_that_actually_
+/// existed`'s own reasoning for the same problem) through the real claimed-job
+/// path, requests a cancel once the claim has landed, and asserts the row
+/// reaches `failed` with `JammiError::JobCancelled`'s message within the
+/// worker's own heartbeat cadence — never `completed`, and never silently
+/// still `running`.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_claimed_training_jobs_cancel_request_is_honoured_at_the_next_epoch_boundary() {
+    let dir = tempfile::TempDir::new().unwrap();
+    let mut config = common::test_config(dir.path());
+    // A short heartbeat (1s, with a real >2x lease margin) so the watcher
+    // this unit adds polls `cancel_requested` promptly — the SAME cadence
+    // the lease keeper itself renews at, per `spawn_cancel_request_watcher`'s
+    // doc.
+    config.lease = jammi_db::config::LeaseConfig {
+        duration_secs: 30,
+        heartbeat_secs: 1,
+    };
+    config.worker = jammi_db::config::WorkerConfig {
+        idle_poll_secs: 1,
+        ..Default::default()
+    };
+    let session = Arc::new(InferenceSession::new(config).await.unwrap());
+    session
+        .add_source(
+            "training",
+            SourceType::File,
+            SourceConnection {
+                url: Some(common::fixture_url("training_pairs.csv")),
+                format: Some(FileFormat::Csv),
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+
+    let handle = session
+        .enqueue(
+            TrainingSpec::FineTune {
+                source: "training".to_string(),
+                columns: vec![
+                    "text_a".to_string(),
+                    "text_b".to_string(),
+                    "score".to_string(),
+                ],
+                method: FineTuneMethod::Lora,
+                task: ModelTask::TextEmbedding,
+                common: TrainingCommon {
+                    base_model: tiny_bert_model(),
+                    config: FineTuneConfig {
+                        // Deliberately large, matching `fine_tune.rs`'s own
+                        // lease-loss test: a tiny real epoch is fast enough
+                        // (single-digit milliseconds) that the count must be
+                        // big enough the run is CERTAINLY still training
+                        // when the cancel request lands below.
+                        epochs: 20_000,
+                        batch_size: 8,
+                        lora_rank: 4,
+                        warmup_steps: 0,
+                        ..Default::default()
+                    },
+                },
+            }
+            .into(),
+            0,
+        )
+        .await
+        .unwrap();
+
+    let worker = JobWorker::new(&session).expect("this config clears the worker margin");
+    let claimed = session
+        .catalog()
+        .claim_next(worker.worker_id(), &["fine_tune"], Duration::from_secs(30))
+        .await
+        .unwrap()
+        .expect("the queued job is claimable");
+
+    // Drive the claimed job concurrently, not awaited inline, so the
+    // spawned cancel-request watcher's own poll tick can actually run while
+    // training is in progress — a synchronous "claim, then run to
+    // completion" drive would never leave a window to request a cancel
+    // before the run finishes on its own.
+    let session_for_task = Arc::clone(&session);
+    let run = tokio::spawn(async move {
+        worker.run_claimed_job(&session_for_task, claimed).await;
+    });
+
+    // Sanity gate: the run must still be in flight when the cancel lands, or
+    // this test cannot distinguish "the fix works" from "the run happened to
+    // finish and complete anyway" — a large `epochs` makes this vanishingly
+    // unlikely; if it fires, the fix is to raise `epochs` further, never to
+    // delete the gate.
+    assert!(
+        !run.is_finished(),
+        "the spawned run_claimed_job task already completed before the test could request a \
+         cancel -- raise `epochs` further so this genuinely races a live training run"
+    );
+
+    assert!(
+        session
+            .catalog()
+            .cancel_request(&handle.job_id)
+            .await
+            .unwrap(),
+        "a cancel on the running training job is recorded"
+    );
+
+    tokio::time::timeout(Duration::from_secs(15), run)
+        .await
+        .expect("the cancel-request watcher's next poll tick observes the request promptly")
+        .unwrap();
+
+    let row = session.catalog().get_job(&handle.job_id).await.unwrap();
+    assert_eq!(
+        row.status,
+        JobStatus::Failed.to_string(),
+        "the cancelled training job must land `failed`, not stay `running` or reach `completed`"
+    );
+    assert!(
+        row.error
+            .as_deref()
+            .unwrap_or("")
+            .contains("cancelled at the executor's request checkpoint"),
+        "the row must record JammiError::JobCancelled's message, got {:?}",
+        row.error
+    );
+    assert!(
+        row.cancel_requested,
+        "the request stays recorded on the row"
+    );
+}

@@ -31,11 +31,26 @@
 //! [`jammi_db::catalog::lease_keeper::LeaseKeeper`] (N3) — a dedicated OS
 //! thread renews it, immune to this runtime being starved by the training
 //! itself — and the hold's own `lost` flag (via
-//! [`jammi_db::catalog::lease_keeper::LeaseHold::lost_flag`]) doubles as
-//! the shared cancel flag the training loop checks at every epoch boundary
-//! (no separate `tokio::spawn` heartbeat task anywhere in this crate). The
-//! loop then bails, leaving the job `running` for the next
-//! `reclaim_expired_jobs` to re-queue.
+//! [`jammi_db::catalog::lease_keeper::LeaseHold::lost_flag`]) is the shared
+//! cancel flag the training loop checks at every epoch boundary (no separate
+//! `tokio::spawn` heartbeat task anywhere in this crate).
+//!
+//! That flag has TWO writers (unit #485), not one: the lease keeper flips it
+//! directly on a missed renewal (a genuine lease loss), and
+//! `spawn_cancel_request_watcher` flips the SAME flag, at the SAME
+//! heartbeat cadence, when it observes `jobs.cancel_requested` set on this
+//! job's row (an operator's `CancelJob`/`JobHandle::cancel`). Both writers
+//! only ever store `true`, so there is no race to arbitrate — but they mean
+//! different outcomes once the training loop bails, so
+//! [`JobWorker::run_claimed_job`] tells them apart with a SECOND, one-way
+//! flag the watcher alone sets right before it flips the shared one: when
+//! that second flag is set, the cancellation was requested, not a lease
+//! loss, and the job is recorded `failed` with
+//! [`jammi_db::error::JammiError::JobCancelled`]'s message (the SAME message
+//! the compute path and `InferenceSession::run_now` already record for a
+//! request observed at their own checkpoints); when it is unset, the flag
+//! tripped on a lease loss, and the loop bails leaving the job `running` for
+//! the next `reclaim_expired_jobs` to re-queue, exactly as before this unit.
 //!
 //! Cancellation is checked only at epoch boundaries, so a worker can still lose
 //! its lease in the window between the last check and finalization. The terminal
@@ -48,6 +63,7 @@
 
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Weak};
+use std::time::Duration;
 
 use arrow::array::RecordBatch;
 use bytes::Bytes;
@@ -370,10 +386,14 @@ impl JobWorker {
     /// | 9 | `spawn_blocking` panic (caught) or join error | `Err(Failed)` → `record_failed` |
     /// | 10 | final-artifact publish failure | `record_failed` |
     /// | 11 | `register_model` failure | `record_failed` |
+    /// | 12 (#485) | `Err(Cancelled)` where `spawn_cancel_request_watcher` set `cancel_requested_seen` (a `CancelJob`/`JobHandle::cancel` request, not a lease loss) | `Err(Cancelled)` + `cancel_requested_seen` → `record_failed` with [`jammi_db::error::JammiError::JobCancelled`]'s message |
     ///
-    /// The ONE deliberate exception is `Err(WorkerJobError::Cancelled)` (the
-    /// lease was lost, or a genuine error coincided with a lost lease — see
-    /// `classify`): this writes NO terminal status, because a different
+    /// The deliberate exception is `Err(WorkerJobError::Cancelled)` on a
+    /// genuine lease loss (row 12 above is the OTHER half — #485 gave
+    /// `Cancelled` two distinguishable causes, not two terminal-write rules):
+    /// when `spawn_cancel_request_watcher` never saw `cancel_requested`
+    /// (the lease was lost, or a genuine error coincided with a lost lease —
+    /// see `classify`), this writes NO terminal status, because a different
     /// worker now owns the job. Its `pending` marker is retired by the OTHER
     /// half of the same catalog-edge rule —
     /// `Catalog::reclaim_expired_jobs`' exhausted arm writes
@@ -381,7 +401,12 @@ impl JobWorker {
     /// and its requeue arm RESETS the column to `pending` for the fresh
     /// attempt that will re-probe. Adding a `record_failed` here would be
     /// wrong twice over: it would stamp `failed` over a job the re-claiming
-    /// worker is running, and its lease guard would not match anyway.
+    /// worker is running, and its lease guard would not match anyway. A
+    /// `Cancelled` the watcher DID attribute to a cancel request is not this
+    /// case: no other worker is coming to reclaim it, so it takes row 12's
+    /// `record_failed` instead, which retires the same `pending` marker
+    /// through the identical lease-guarded edge every other `record_failed`
+    /// call in this table does.
     ///
     /// `Self::publish_and_finalize`'s own `finish_job_with_model`
     /// `Ok(false)`/`Err` arms likewise leave the job `running` for reclaim, so
@@ -492,6 +517,29 @@ impl JobWorker {
             });
         let cancel = hold.lost_flag();
 
+        // #485: `cancel` (the lease-lost flag above) is not the ONLY source
+        // that must be able to trip the training loop's epoch-boundary
+        // check — a `CancelJob`/`JobHandle::cancel` request sets
+        // `jobs.cancel_requested`, which nothing on this branch previously
+        // read at all (only the compute path's `check_cancel` did). This
+        // watcher polls that column at the SAME cadence the lease keeper
+        // renews at (`self.intervals.heartbeat` — never per-step, staying
+        // out of the hot loop) and, on an observed request, flips the
+        // identical `cancel` flag so the trainer's existing epoch-boundary
+        // check (no new check needed there) bails exactly as it does on a
+        // lease loss. `cancel_requested_seen` is a SEPARATE one-way flag the
+        // watcher sets first, so the match below can tell "the flag tripped
+        // because of a request" apart from "the flag tripped because the
+        // lease was lost" and land the right terminal write for each.
+        let cancel_requested_seen = Arc::new(AtomicBool::new(false));
+        let cancel_watcher = spawn_cancel_request_watcher(
+            Arc::clone(&catalog),
+            job_id.clone(),
+            Arc::clone(&cancel),
+            Arc::clone(&cancel_requested_seen),
+            self.intervals.heartbeat,
+        );
+
         // Run the whole job in its own tenant scope. The claim is intentionally
         // unscoped (one worker drains every tenant's queue), so inside the run
         // the session's tenant binding is `None` — and the reconstruction's
@@ -523,8 +571,12 @@ impl JobWorker {
 
         // Stop renewing this attempt's lease regardless of outcome — the
         // job is about to reach a terminal write (or be left for reclaim),
-        // so no further renewal is wanted either way.
+        // so no further renewal is wanted either way. The watcher is stopped
+        // alongside it: aborting an already-finished task is a harmless
+        // no-op, and there is nothing left for it to watch once the run has
+        // returned.
         drop(hold);
+        cancel_watcher.abort();
 
         match outcome {
             Ok(artifact) => {
@@ -539,13 +591,12 @@ impl JobWorker {
                 .await;
             }
             Err(WorkerJobError::Cancelled) => {
-                // Lease lost: leave the job `running` for reclaim to re-queue.
-                // Do not record a terminal status — a different worker now owns,
-                // or will own, this job. No `TrainedArtifact` was ever built on
-                // this path (the run bailed mid-training, or never even
-                // finished the blocking call), so any epoch checkpoints this
-                // attempt wrote are reachable only by DERIVING their prefixes
-                // — never from an in-memory vec that does not exist here.
+                // No `TrainedArtifact` was ever built on this path (the run
+                // bailed mid-training, or never even finished the blocking
+                // call), so any epoch checkpoints this attempt wrote are
+                // reachable only by DERIVING their prefixes — never from an
+                // in-memory vec that does not exist here. GC'd on both the
+                // lease-lost and the cancel-requested arm below.
                 Self::gc_epoch_checkpoints(
                     &session.artifact_store(),
                     catalog.current_tenant(),
@@ -555,7 +606,33 @@ impl JobWorker {
                     epoch_checkpoint_bound,
                 )
                 .await;
-                tracing::warn!(job_id = %job_id, worker = %self.worker_id, "training cancelled (lease lost); left for reclaim");
+                if cancel_requested_seen.load(Ordering::SeqCst) {
+                    // #485: the flag tripped because `spawn_cancel_request_
+                    // watcher` observed `jobs.cancel_requested`, not because
+                    // the lease was lost — this run is not going to be
+                    // reclaimed and retried, so it must land a terminal
+                    // `failed` here, with the SAME message the compute path
+                    // and `run_now` already record for a request honoured at
+                    // their own checkpoints (`JammiError::JobCancelled`),
+                    // never the lease-lost log line below.
+                    tracing::warn!(job_id = %job_id, worker = %self.worker_id, "training cancelled (cancel requested); recording failed");
+                    record_failed(
+                        &catalog,
+                        &job_id,
+                        &self.worker_id,
+                        attempt,
+                        JammiError::JobCancelled {
+                            job_id: job_id.clone(),
+                        }
+                        .to_string(),
+                    )
+                    .await;
+                } else {
+                    // Lease lost: leave the job `running` for reclaim to
+                    // re-queue. Do not record a terminal status — a
+                    // different worker now owns, or will own, this job.
+                    tracing::warn!(job_id = %job_id, worker = %self.worker_id, "training cancelled (lease lost); left for reclaim");
+                }
             }
             Err(WorkerJobError::Failed(msg)) => {
                 tracing::error!(job_id = %job_id, error = %msg, "training job failed");
@@ -2400,6 +2477,61 @@ fn panic_message(payload: &(dyn std::any::Any + Send)) -> String {
     } else {
         "<unknown panic payload>".into()
     }
+}
+
+/// #485: poll `jobs.cancel_requested` for `job_id` at `poll_interval` — the
+/// SAME cadence the lease keeper renews this job's lease at
+/// (`JobWorker`'s own `self.intervals.heartbeat`), never per training step —
+/// and, on an observed request, flip `cancel_requested_seen` (a one-way
+/// marker, set FIRST) then the shared `cancel` flag the training loop already
+/// checks at every epoch boundary ([`JobWorker::run_claimed_job`]'s doc). The
+/// SAME shared `cancel` flag is also the lease keeper's own `lost` flag
+/// (`LeaseHold::lost_flag`): both writers only ever store `true`, so a second
+/// writer here is never a race to arbitrate, only a second way to reach the
+/// one outcome the training loop's check already understands — but it lets
+/// [`JobWorker::run_claimed_job`] read `cancel_requested_seen` afterward to
+/// tell the two causes apart and land the right terminal write for each.
+///
+/// One-shot: the task returns as soon as it has flipped the flag itself, or
+/// as soon as it observes `cancel` already `true` for any other reason (a
+/// lease loss — nothing left here to watch for). The caller aborts this
+/// task once the run it watches has returned, so it never outlives the job
+/// attempt it was spawned for. A transient `get_job` error is logged and
+/// retried at the next tick rather than treated as an observed request or a
+/// reason to stop watching — a catalog hiccup must not silently disable
+/// cancellation for the rest of the run.
+fn spawn_cancel_request_watcher(
+    catalog: Arc<Catalog>,
+    job_id: String,
+    cancel: Arc<AtomicBool>,
+    cancel_requested_seen: Arc<AtomicBool>,
+    poll_interval: Duration,
+) -> tokio::task::JoinHandle<()> {
+    tokio::spawn(async move {
+        loop {
+            tokio::time::sleep(poll_interval).await;
+            if cancel.load(Ordering::SeqCst) {
+                // Already tripped by some other path (a lease loss) — nothing
+                // left for this watcher to contribute.
+                return;
+            }
+            match catalog.get_job(&job_id).await {
+                Ok(record) if record.cancel_requested => {
+                    cancel_requested_seen.store(true, Ordering::SeqCst);
+                    cancel.store(true, Ordering::SeqCst);
+                    return;
+                }
+                Ok(_) => {}
+                Err(e) => {
+                    tracing::debug!(
+                        job_id = %job_id,
+                        error = %e,
+                        "cancel-request watcher: get_job failed; retrying at the next poll"
+                    );
+                }
+            }
+        }
+    })
 }
 
 /// Record a terminal `Failed` status for a job this worker owns, surfacing

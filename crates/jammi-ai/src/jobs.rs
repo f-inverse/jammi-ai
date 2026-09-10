@@ -34,8 +34,8 @@
 //! kind) and a `Table` (every compute kind).
 //!
 //! **Cancellation.** `Catalog::cancel_request` sets `jobs.cancel_requested`;
-//! the executor observes it at three checkpoint boundaries — after the
-//! claim ([`crate::session::InferenceSession::run_now`],
+//! the COMPUTE executor observes it at three checkpoint boundaries — after
+//! the claim ([`crate::session::InferenceSession::run_now`],
 //! `JobWorker::run_claimed_compute_job`) and before dispatch
 //! ([`crate::jobs::execute_compute`]) — through [`crate::jobs::check_cancel`],
 //! failing the row with [`jammi_db::error::JammiError::JobCancelled`]'s message. Every compute producer is a
@@ -43,6 +43,18 @@
 //! after the producer has started is honoured only in the sense that it
 //! stays recorded on the row: the run completes and the row finishes
 //! `completed`.
+//!
+//! A TRAINING kind (`fine_tune`/`graph_fine_tune`/`context_predictor`) is
+//! checkpointed mid-run, so it is checked differently and more often than
+//! once: a watcher (`spawn_cancel_request_watcher`, private to
+//! [`crate::fine_tune::worker`]) polls the same column at the worker's
+//! lease-heartbeat cadence and folds an observed request into the SAME
+//! cancel flag the trainer's own epoch-boundary check already reads for a
+//! lost lease, so the SAME [`crate::fine_tune::worker::JobWorker::
+//! run_claimed_job`] that already stops training on a lost lease also stops
+//! it — and fails the row with [`jammi_db::error::JammiError::JobCancelled`]'s
+//! message — on a genuine cancel request. See that module's
+//! cooperative-cancellation doc.
 
 use std::sync::Arc;
 
@@ -721,10 +733,35 @@ impl InferenceSession {
                 Ok(job_result)
             }
             Err(e) => {
-                self.catalog()
+                // #485: a swallowed `Err` here (the old `.ok()`) could leave
+                // this inline row `running` for the process lifetime — this
+                // function never retries and nothing else finalizes an
+                // inline row's lease, so a lost write here is not "left for
+                // reclaim" the way a queued job's would be. `Ok(false)` is
+                // the benign race (a peer somehow holds this attempt's
+                // lease already) and stays a debug log; a genuine catalog
+                // `Err` is surfaced at error level so it is never silent.
+                match self
+                    .catalog()
                     .fail_job(&job_id, &instance_id, claimed.attempts, &e.to_string())
                     .await
-                    .ok();
+                {
+                    Ok(true) => {}
+                    Ok(false) => {
+                        tracing::debug!(
+                            job_id = %job_id,
+                            "run_now: lost the lease before recording the failure"
+                        );
+                    }
+                    Err(fail_err) => {
+                        tracing::error!(
+                            job_id = %job_id,
+                            error = %fail_err,
+                            "run_now: failed to record the job's terminal failure -- the row \
+                             would otherwise stay `running` for the process lifetime"
+                        );
+                    }
+                }
                 Err(e)
             }
         }

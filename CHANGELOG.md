@@ -7,6 +7,77 @@ workspace ships every publishable crate at the same
 ## [Unreleased]
 
 ### Added
+- **`HubSource`'s four `[models]` Hub resolution chains — cache root, offline, token, and
+  endpoint — are each config-first and env-overridable through `JAMMI_MODELS__HUB_*`/
+  `JAMMI_MODELS__OFFLINE` (#481).** **Cache root:** `[models] hub_cache_dir` (a `hub/`
+  subdirectory is appended) > `HF_HUB_CACHE` (used AS the cache root directly, nothing
+  appended, matching `huggingface_hub`'s own `HF_HUB_CACHE` convention) > `HF_HOME` (`hub/`
+  appended) > the platform home directory's `.cache/huggingface` (`hub/` appended). **Offline:**
+  `[models] offline` (`Option<bool>`; `Some(_)` wins outright, in either direction, over the
+  environment) > `HF_HUB_OFFLINE` > `TRANSFORMERS_OFFLINE` (consulted only when `HF_HUB_OFFLINE`
+  is itself absent), with truthy values for either variable being `huggingface_hub`'s own
+  `ENV_VARS_TRUE_VALUES` set — `1`, `on`, `yes`, `true` — matched case-insensitively with
+  surrounding whitespace trimmed. **Token:** `[models] hub_token` > `HF_TOKEN` (non-empty,
+  trimmed) > `HUGGING_FACE_HUB_TOKEN` (`huggingface_hub`'s own live legacy alias for `HF_TOKEN`,
+  not deprecated) > the token file (`HF_TOKEN_PATH` naming the file directly, else
+  `<HF_HOME>/token`, contents trimmed) — resolved independently of whichever tier won the
+  cache-root precedence, never through `hf_hub::Cache::token`/`token_path` (which derives the
+  token file by popping the cache root's last path component, an arithmetic only correct when
+  the root was actually built as `<HF_HOME>/hub`; with `HF_HUB_CACHE` set it silently derives
+  `parent(HF_HUB_CACHE)/token` instead). **Endpoint:** `[models] hub_endpoint` > `HF_ENDPOINT` >
+  the client default.
+
+  A value that is present but empty — or, for `HF_HOME`/`HF_ENDPOINT`, whitespace-only after
+  trimming — is treated as absent everywhere in `HubSource`, through one helper (`env_nonempty`)
+  shared by all eight env reads (`HF_HUB_OFFLINE`, `TRANSFORMERS_OFFLINE`, `HF_HUB_CACHE`,
+  `HF_HOME`, `HF_ENDPOINT`, `HF_TOKEN`, `HUGGING_FACE_HUB_TOKEN`, `HF_TOKEN_PATH`), which also
+  returns the trimmed value rather than the raw one, so `HF_HOME=" /data/hf"` resolves to the
+  cache root `/data/hf/hub`, never a leading-space path that would silently root the cache (and
+  the token file) under the current working directory instead. Every empty-value fallback fails
+  toward the safe default — the home cache, the default endpoint, no token, offline resolved
+  from the non-empty variable only — never toward the network and never toward a nonsense
+  relative path. One divergence from `huggingface_hub` is disclosed rather than closed, and it
+  fails in opposite directions: a whitespace-only `HF_HUB_OFFLINE=" "` is present-but-blank
+  after trimming here and falls through to `TRANSFORMERS_OFFLINE` (failing toward offline, the
+  safe direction for an air-gap knob), whereas `huggingface_hub`'s own
+  `os.environ.get("HF_HUB_OFFLINE") or os.environ.get("TRANSFORMERS_OFFLINE")` treats a
+  whitespace-only string as truthy in Python and stops at the first variable, resolving online
+  regardless of the second.
+
+  `crates/jammi-ai/tests/it/hub_source.rs` mounts a `MockServer` for every chain: the four
+  "refuses by name" integration tests assert `received_requests()` comes back empty, every
+  empty-value edge for all eight variables is covered,
+  `hf_home_env_drives_the_cache_root_end_to_end` and
+  `hf_hub_cache_env_drives_the_cache_root_directly_no_hub_subdir_appended` drive `HF_HOME`/
+  `HF_HUB_CACHE` through `HubSource::from_config`'s injected `env` closure (never
+  `std::env::set_var`) and assert the fetched file lands under `{HF_HOME}/hub/…` or directly
+  under `{HF_HUB_CACHE}/models--…` with no `hub/` subdirectory, and two oracles assert a
+  resolved token reaches the mock server as the literal `Authorization: Bearer <token>` header,
+  not merely that `resolve_token` returns the right `String`.
+  `warm_cache_across_a_second_hub_source_issues_no_requests` builds a second `HubSource` over
+  the same `hub_cache_dir`, in the same process, and asserts it issues zero new requests against
+  the mock server — this stands in for a process restart with a mounted cache volume because
+  `HubSource` holds nothing process-global (no static/thread-local state; every field is
+  constructed fresh from `[models]`+`env` in `from_config`), so two independently-constructed
+  `HubSource`s in one process and two `HubSource`s across a real restart take the identical code
+  path.
+
+  `crates/jammi-encoders/tests/live_real_clap.rs`'s `fetch_real_model` is a separate,
+  jammi-encoders-local implementation (jammi-encoders cannot depend on jammi-ai) that resolves
+  `HF_HUB_CACHE` > `HF_HOME`/`hub` > a checked `dirs::home_dir()`, failing with a named-variable
+  test failure rather than a panic when none resolve, and carries the identical
+  `HF_TOKEN_PATH`/`HUGGING_FACE_HUB_TOKEN`/trimming token chain and `env_nonempty` rule by
+  construction — the same rule written twice, not a measured cross-implementation parity result,
+  since this harness runs only behind the `live-hub-tests` feature and never inside CI's default
+  `cargo test`. It disclosably diverges from `HubSource` in one remaining way: its cache-root
+  fallback is hand-written rather than sharing `HubSource`'s own tested code path.
+
+  Docs (`docs/guide/src/local-models.md`, `docs/guide/src/configuration.md`) state the
+  `JAMMI_MODELS__HUB_*` env-override tier, the `HF_HUB_CACHE` precedence step, and the exact
+  `HF_HUB_OFFLINE`/`TRANSFORMERS_OFFLINE` truthy set and alias. The `hub_cache_dir` examples
+  (here, `configuration.md`, and `crates/jammi-db/src/config/mod.rs`'s own doc comment) name a
+  root one level above the `hub/` subdirectory `HubSource` appends, so
+  `hub_cache_dir = "/var/cache/jammi/hub"` resolves models under `/var/cache/jammi/hub/hub`.
 - **A tested Shape B Compose stack, `jammi-server probe`, `jammi-server serve` as the
   default subcommand, a reference-topologies guide page, and supply-chain
   attestations on the published images (#482).** `deploy/docker-compose.yml`

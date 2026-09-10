@@ -60,11 +60,117 @@ fn row_cosine_min(got: &Tensor, golden: &Tensor) -> candle_core::Result<f32> {
     cos.min(0)?.to_scalar::<f32>()
 }
 
+/// Present-but-empty is absent for every env read this harness makes
+/// (`HF_HUB_CACHE`, `HF_HOME`, `HF_ENDPOINT`, `HF_TOKEN`,
+/// `HUGGING_FACE_HUB_TOKEN`, `HF_TOKEN_PATH`) — the SAME rule `jammi-ai`'s
+/// `model::hub::env_nonempty` applies (see that module's "empty values are
+/// absent, and every value is trimmed" doc section for the exact
+/// rationale): a Compose/K8s env block naming a variable with no value, or
+/// an operator's `export HF_TOKEN=`, both yield `Ok("")` from
+/// `std::env::var`, not `Err`, and every fallback below must treat that
+/// identically to the variable being unset. The returned value is the
+/// TRIMMED string, not the raw one — a padded `HF_HOME` must not silently
+/// resolve to a current-working-directory-relative cache root the same way
+/// `jammi-ai`'s helper now guards against.
+fn env_nonempty(key: &str) -> Option<String> {
+    std::env::var(key)
+        .ok()
+        .map(|value| value.trim().to_string())
+        .filter(|value| !value.is_empty())
+}
+
+/// `HF_HOME`, resolved on its own (non-empty env value, else
+/// `dirs::home_dir()/.cache/huggingface`) — used both as the cache-root
+/// fallback (with `hub/` appended) and, independently, as the token-file
+/// fallback's DEFAULT (with `token` appended, mirroring `huggingface_hub`'s
+/// own `HF_TOKEN_PATH` convention) when `HF_TOKEN_PATH` itself is absent.
+/// `None` only when `HF_HOME` is unset/empty AND `dirs::home_dir()` itself
+/// found nothing.
+fn hf_home_dir() -> Option<std::path::PathBuf> {
+    env_nonempty("HF_HOME")
+        .map(std::path::PathBuf::from)
+        .or_else(|| dirs::home_dir().map(|home| home.join(".cache").join("huggingface")))
+}
+
 /// Resolve the real checkpoint's weights + config from the HF Hub (cached
-/// on-disk after the first download), mirroring the `hf_hub` pattern in
-/// `crates/jammi-ai/tests/it/models.rs`.
+/// on-disk after the first download).
+///
+/// jammi-encoders cannot depend on jammi-ai (the dependency runs the other
+/// way: jammi-ai depends on jammi-encoders), so this cannot call
+/// `jammi_ai::model::hub::HubSource` directly. This harness is a SEPARATE,
+/// jammi-encoders-local implementation that MIRRORS `HubSource`'s env chain
+/// BY CONSTRUCTION (fall back through `HF_HUB_CACHE`/`HF_HOME`/the platform
+/// home directory for the cache root, and `HF_TOKEN` >
+/// `HUGGING_FACE_HUB_TOKEN` > the token file for the token, never `hf_hub`'s
+/// own panicking defaults), built inline from `hf_hub` rather than the bare
+/// `hf_hub::api::sync::Api::new()` (which ignores `HF_ENDPOINT`/`HF_TOKEN`
+/// entirely — hf-hub 0.5 never reads `HF_TOKEN` on its own). "Mirrors by
+/// construction" is a claim about the SOURCE — the same rule, written
+/// twice — not a measured cross-implementation parity claim: this file has
+/// no oracle that runs `HubSource`'s own resolver against the same env and
+/// diffs the two outputs, and it is gated behind `live-hub-tests`, so CI's
+/// default `cargo test` never even compiles this module's assertions
+/// against a live network call. It disclosably diverges from `HubSource` in
+/// one way: the cache-root fallback below is hand-written rather than
+/// shared code — `resolve_root_with`'s injected-`home_dir` unit-test seam
+/// lives in `jammi-ai`, unreachable from here. The token fallback carries no
+/// such divergence: its SOURCE reads identically to `HubSource`'s own
+/// (`HF_TOKEN` > `HUGGING_FACE_HUB_TOKEN` > `HF_TOKEN_PATH` else
+/// `<HF_HOME>/token`, independent of `HF_HUB_CACHE`).
+///
+///   - cache root: `HF_HUB_CACHE` (non-empty, used directly as the cache
+///     dir, nothing appended) -> `HF_HOME` (non-empty, a `hub/`
+///     subdirectory appended) -> `dirs::home_dir()` (`.cache/huggingface/hub`
+///     appended, CHECKED rather than the `.expect(..)` `hf_hub::Cache::default()`
+///     panics with) -> a named test failure listing all three variables.
+///     Never reaches `hf_hub::Cache::from_env()`/`Cache::default()` at all,
+///     so this harness cannot inherit `hf_hub::Cache::default()`'s own
+///     `dirs::home_dir().expect(..)` panic (hf-hub `lib.rs:202-209`) the way
+///     a direct call to `Cache::from_env()` still would when neither
+///     `HF_HUB_CACHE` nor `HF_HOME` nor a resolvable home directory is
+///     present.
+///   - endpoint: `HF_ENDPOINT` (non-empty) -> hf-hub's own default
+///     (`https://huggingface.co`)
+///   - token: `HF_TOKEN` (non-empty) -> `HUGGING_FACE_HUB_TOKEN`
+///     (non-empty, `huggingface_hub`'s own live legacy alias,
+///     `utils/_auth.py:145-147`) -> the token FILE (`HF_TOKEN_PATH`, when
+///     non-empty, names the file directly; otherwise `<HF_HOME>/token`),
+///     read directly and trimmed, independent of whichever tier won the
+///     cache-root precedence above (the same independence `HubSource`'s own
+///     token-file resolution keeps, and for the identical reason:
+///     `HF_HUB_CACHE` has no `hub` component to pop)
 fn fetch_real_model() -> (std::path::PathBuf, std::path::PathBuf) {
-    let api = hf_hub::api::sync::Api::new().expect("build hf_hub api");
+    let root = env_nonempty("HF_HUB_CACHE")
+        .map(std::path::PathBuf::from)
+        .or_else(|| hf_home_dir().map(|home| home.join("hub")))
+        .unwrap_or_else(|| {
+            panic!(
+                "cannot resolve a Hugging Face Hub cache root for this live test: \
+                 HF_HUB_CACHE is unset (or empty), HF_HOME is unset (or empty), and \
+                 dirs::home_dir() found no home directory (HOME/USERPROFILE unset, and no \
+                 password-database entry for this user) -- set one of HF_HUB_CACHE, HF_HOME, \
+                 or HOME/USERPROFILE explicitly to run this live-hub-tests harness"
+            )
+        });
+    let cache = hf_hub::Cache::new(root);
+    let mut builder = hf_hub::api::sync::ApiBuilder::from_cache(cache);
+    if let Some(endpoint) = env_nonempty("HF_ENDPOINT") {
+        builder = builder.with_endpoint(endpoint);
+    }
+    let token = env_nonempty("HF_TOKEN")
+        .or_else(|| env_nonempty("HUGGING_FACE_HUB_TOKEN"))
+        .or_else(|| {
+            env_nonempty("HF_TOKEN_PATH")
+                .map(std::path::PathBuf::from)
+                .or_else(|| hf_home_dir().map(|home| home.join("token")))
+                .and_then(|path| std::fs::read_to_string(path).ok())
+                .map(|contents| contents.trim().to_string())
+                .filter(|token| !token.is_empty())
+        });
+    if let Some(token) = token {
+        builder = builder.with_token(Some(token));
+    }
+    let api = builder.build().expect("build hf_hub api");
     let repo = api.model(REAL_MODEL_ID.to_string());
     let weights = repo
         .get("model.safetensors")

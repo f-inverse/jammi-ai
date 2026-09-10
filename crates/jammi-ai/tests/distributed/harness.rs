@@ -4,8 +4,8 @@
 //! fixed-sleep-free catalog poller.
 //!
 //! The harness is the *submitter and observer*; the spawned child processes are
-//! the *workers*. The harness session is built with no train tier and no
-//! embedded worker, so it never claims a job itself — it only writes queued rows
+//! the *workers*. The harness session is built with `[worker] enabled = false`
+//! and no embedded worker, so it never claims a job itself — it only writes queued rows
 //! (via `fine_tune`) and polls the shared catalog for the children's terminal
 //! writes. This mirrors the production split where a submitting client and the
 //! GPU worker fleet are different processes against one catalog.
@@ -118,8 +118,9 @@ const HEARTBEAT_SECS: u64 = 1;
 const IDLE_POLL_SECS: u64 = 1;
 
 /// Build the harness's own session against the shared Postgres + MinIO,
-/// rooted at `result_root`. It mounts no train tier and spawns no worker, so it
-/// only submits queued jobs and observes — the spawned children do the claiming.
+/// rooted at `result_root`. It runs `[worker] enabled = false` and spawns no
+/// worker, so it only submits queued jobs and observes — the spawned children
+/// do the claiming.
 ///
 /// Returns the session plus the [`TempDir`] backing its local fetch cache /
 /// artifact_dir, which must outlive the session.
@@ -198,8 +199,9 @@ pub struct Fleet {
 impl Fleet {
     /// Spawn `n` `jammi-server` workers, each with a distinct `JAMMI_WORKER_ID`
     /// (`worker-1`..`worker-n`), distinct gRPC + health ports, the shared
-    /// catalog + `result_root`, the short worker timing, and the train tier
-    /// mounted. The MinIO credentials are passed through the child env so the
+    /// catalog + `result_root`, the short worker timing, and `[worker] enabled`
+    /// (Shape D's compute node: `services = []`, the worker on). The MinIO
+    /// credentials are passed through the child env so the
     /// worker's S3 driver authenticates exactly as the harness session does.
     pub fn spawn(backends: &Backends, result_root: &str, n: usize) -> Self {
         let exe = jammi_server_binary();
@@ -304,8 +306,8 @@ fn sigkill(child: &mut Child) {
 }
 
 /// Spawn one worker process. The worker is configured entirely through a
-/// per-process `jammi.toml` (catalog, storage, training timing, the train tier
-/// and its distinct ports) plus the `JAMMI_WORKER_ID` seed and the `AWS_*`
+/// per-process `jammi.toml` (catalog, storage, worker timing, `[worker]
+/// enabled` and its distinct ports) plus the `JAMMI_WORKER_ID` seed and the `AWS_*`
 /// credentials in its environment. stdout+stderr are redirected to a per-worker
 /// log under its scratch dir so a CI failure can surface the worker's view.
 fn spawn_worker(
@@ -406,15 +408,18 @@ allow_http = {allow_http}
 duration_secs = {LEASE_SECS}
 heartbeat_secs = {HEARTBEAT_SECS}
 
-[training]
+[worker]
+# Shape D's compute node: this process claims and runs submitted jobs of every
+# compiled kind. Job submission itself is core, so no optional tier is needed.
+enabled = true
 idle_poll_secs = {IDLE_POLL_SECS}
 
 [server]
 # Distinct per-worker ports so N servers coexist on one host.
 flight_listen = "127.0.0.1:{flight_port}"
 health_listen = "127.0.0.1:{health_port}"
-# Mount core + the train tier so the worker claims and runs submitted jobs.
-services = ["train"]
+# Core only — the worker, not a tier, is what makes this process a compute node.
+services = []
 "#
     )
 }

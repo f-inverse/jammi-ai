@@ -15,24 +15,26 @@ artifact_dir = "/var/lib/jammi"
 # HTTP side-channel: `/healthz`, `/readyz`, `/metrics`.
 health_listen = "0.0.0.0:8080"
 # gRPC + Flight SQL surface. The core tier (CatalogService, EmbeddingService,
-# InferenceService, PipelineService, AuditService) and Flight SQL are always
-# mounted; the optional tiers below are runtime-selectable.
+# InferenceService, PipelineService, AuditService, TrainingService — the job
+# submission surface) and Flight SQL are always mounted; the optional tiers
+# below are runtime-selectable.
 flight_listen = "0.0.0.0:8081"
 # Models to preload into memory at startup. Empty by default.
 preload_models = []
 # Service tiers this deployment mounts, beyond the always-on core tier. One
 # binary scales to many shapes without a rebuild:
 #
-#   services = "all"             # all-in-one: every tier compiled in (default)
+#   services = "all"             # all-in-one: every tier (default)
 #   services = ["event"]         # serve + event box (TriggerService)
-#   services = ["train"]         # serve + training box (TrainingService)
 #   services = ["eval"]          # serve + eval tooling (EvalService)
 #   services = []                # serve-only: core tier only
 #
-# A tier requested here whose feature is compiled out (e.g. `train` on a
-# `--no-default-features` build) is a startup error, not a silent drop. The
-# mounted set is reported over the wire via `CatalogService.GetServerInfo`
-# (`services`), so a client knows which verbs are reachable. Defaults to "all".
+# Every tier compiles into every build; a token naming no tier is a startup
+# error, not a silent drop. Whether this process RUNS the jobs it accepts is
+# `[worker] enabled` below, not a tier — a compute node is `services = []`
+# plus `[worker] enabled = true`. The mounted set is reported over the wire
+# via `CatalogService.GetServerInfo` (`services`), so a client knows which
+# verbs are reachable. Defaults to "all".
 services = "all"
 
 [logging]
@@ -53,17 +55,27 @@ duration_secs = 30
 # How often the holder renews the lease.
 heartbeat_secs = 10
 
-# Training-worker settings for the `train` tier: whether this process runs the
-# claim loop, and how often an idle worker polls. idle_poll_secs must be > 0.
-# The former `lease_duration_secs` / `heartbeat_interval_secs` keys moved to
-# `[lease]`; naming them here is a startup error, never a silent default.
-[training]
+# Job-worker settings: whether this process runs the claim loop, which job
+# kinds it claims, and how often an idle worker polls. idle_poll_secs must be
+# > 0. The former `lease_duration_secs` / `heartbeat_interval_secs` keys moved
+# to `[lease]`; naming them here is a startup error, never a silent default.
+[worker]
 # Whether THIS process runs the claim loop. `false` still mounts and serves
 # TrainingService (submissions are accepted and stay `queued`); it only stops
 # this process from claiming, so another process configured `true` works them.
-run_worker = true
+# Overridable per process with `JAMMI_WORKER__ENABLED`.
+enabled = true
+# Which job kinds this worker claims: "all" (default, every kind compiled in)
+# or a list of kind names.
+kinds = "all"
 # How often an idle worker polls for a queued job (and reclaims expired leases).
 idle_poll_secs = 1
+
+# Job retention: how many days a terminal (completed/failed) job row survives
+# before the sweep may delete it and it stops blocking `delete_model` on the
+# model it references. A non-terminal job blocks indefinitely.
+[jobs]
+retention_days = 30
 
 # ─── Catalog and broker selection ───────────────────────────────────
 #

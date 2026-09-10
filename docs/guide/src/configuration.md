@@ -311,8 +311,9 @@ environment value wins field-by-field; see the layering order above and
 **Namespace.** `JAMMI_<X>__<path>` (segments joined by `__`) is **always**
 config: an unknown `X` — one that does not name a top-level `JammiConfig`
 field (`artifact_dir`, `engine`, `gpu`, `inference`, `embedding`,
-`fine_tuning`, `training`, `cache`, `server`, `logging`, `catalog`, `broker`,
-`signing_key`, `storage`, `models`) — is a load-time error naming the
+`fine_tuning`, `lease`, `worker`, `jobs`, `cache`, `server`, `logging`,
+`catalog`, `broker`, `signing_key`, `storage`, `models`) — is a load-time
+error naming the
 variable, never a silent no-op (`JAMMI_CATALOG__KIND=postgres`, a typo one
 segment short of `JAMMI_CATALOG__POSTGRES__URL`, refuses rather than quietly
 running SQLite with nothing to explain why). A bare `JAMMI_<X>` with **no**
@@ -337,7 +338,7 @@ instead of TOML syntax — see below.
 **Refusals name the variable.** An unknown section, an unknown key, or a
 value outside a field's domain is a load-time error naming the offending
 `JAMMI_*` variable — never a silent drop and never a fall-back to the file's
-value or the default. `JAMMI_TRAINING__RUN_WORKER` (boolean) accepts `true`,
+value or the default. `JAMMI_WORKER__ENABLED` (boolean) accepts `true`,
 `false`, `1`, `0`, case-insensitively and with surrounding whitespace
 trimmed; any other value — including an empty one — is refused by name: a
 yes/no question about what the process will do has no safe direction to

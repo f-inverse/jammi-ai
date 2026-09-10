@@ -1,8 +1,8 @@
-"""`training.run_worker` reaches the EMBEDDED arm through the same configuration
+"""`worker.enabled` reaches the EMBEDDED arm through the same configuration
 surface the server binary reads (campaign #446, GAP-A-3 embedded leg).
 
 `run_worker` decides whether THIS process runs the training claim loop
-(`jammi_db::config::TrainingConfig::run_worker`). It is a runtime/driver
+(`jammi_db::config::WorkerConfig::enabled`). It is a runtime/driver
 setting, not a build feature and not a server-only knob: the embedded engine a
 caller reaches through `jammi.connect("file://…")` both accepts submissions and
 runs them, so it is exactly the arm that has to be able to stop running them.
@@ -15,7 +15,7 @@ constitution forbids.
 `crates/jammi-server/src/main.rs` makes — so an embedded process resolves its
 config file (explicit `config=` path, `JAMMI_CONFIG`, `./jammi.toml`, the
 platform config dir) and then layers the `JAMMI_*` environment overrides onto
-it, `JAMMI_TRAINING__RUN_WORKER` among them. The explicit `open_local` kwargs
+it, `JAMMI_WORKER__ENABLED` among them. The explicit `open_local` kwargs
 (`artifact_dir=`, `gpu_device=`, `inference_batch_size=`) are applied after the
 load and still win, so `jammi.connect("file://…")`'s directory is unaffected.
 
@@ -52,14 +52,14 @@ pytestmark = pytest.mark.skipif(
     reason="local tiny_bert / training_pairs fixtures not present",
 )
 
-_RUN_WORKER_ENV = "JAMMI_TRAINING__RUN_WORKER"
+_RUN_WORKER_ENV = "JAMMI_WORKER__ENABLED"
 
 # The submission-time acceleration-report marker `Catalog::create_training_job`
 # stamps: "no claimant has computed a determination YET" (esc-075). A job no
 # worker ever claimed must read exactly this, byte for byte, for its whole life.
 _PENDING = {"state": "pending"}
 
-# The default idle poll (`TrainingConfig::idle_poll_secs`) is 1 second: a worker
+# The default idle poll (`WorkerConfig::idle_poll_secs`) is 1 second: a worker
 # with nothing to do sleeps this long between claim attempts. Every
 # "still queued" assertion below has to span comfortably MORE than one such
 # window, or it would pass against a worker that simply had not ticked yet.
@@ -95,7 +95,7 @@ def _connect_with_source(tmp_path: Path):
 def test_embedded_run_worker_false_accepts_the_submission_and_never_claims(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """`JAMMI_TRAINING__RUN_WORKER=false` + `jammi.connect("file://…")`: the
+    """`JAMMI_WORKER__ENABLED=false` + `jammi.connect("file://…")`: the
     submission is accepted and the job stays `queued` forever.
 
     The env var is read by `JammiConfig::load` at open time — the same loader,
@@ -169,7 +169,7 @@ def test_embedded_default_config_claims_and_completes_the_same_job(
 
 
 # A successor process that opens the catalog directory with the DEFAULT config
-# (no `JAMMI_TRAINING__RUN_WORKER` in its environment — the parent strips it),
+# (no `JAMMI_WORKER__ENABLED` in its environment — the parent strips it),
 # attaches to the queued job by id and waits for it. It opens the catalog with
 # `jammi_native.open_local` — the legitimate low-level entry, and the very call
 # whose config resolution this file is about — rather than through the
@@ -182,7 +182,7 @@ _CLAIMING_SUCCESSOR = textwrap.dedent(
 
     import jammi_native
 
-    assert "JAMMI_TRAINING__RUN_WORKER" not in os.environ, "parent leaked the knob"
+    assert "JAMMI_WORKER__ENABLED" not in os.environ, "parent leaked the knob"
 
     db = jammi_native.open_local(artifact_dir=sys.argv[1])
     try:
@@ -261,7 +261,7 @@ def test_queued_job_reads_identically_on_the_remote_arm(
 
     **Where the remaining hop is covered.** The one thing this hermetic test
     cannot show is a live `jammi-server` started with
-    `JAMMI_TRAINING__RUN_WORKER=false` actually holding a job `queued`. That is
+    `JAMMI_WORKER__ENABLED=false` actually holding a job `queued`. That is
     the server leg of this campaign, and it is proven where a server can be
     run: `clients/python/tests/test_remote_training_job_live.py` starts one with
     exactly that environment and compares its reads of the seeded row against

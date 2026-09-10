@@ -129,9 +129,9 @@ def connect(
     opened *with* `config` is a caller error, rejected as an
     :class:`InvalidArgument` before any channel is opened.
 
-    **`training.run_worker` on a `file://` target.** An embedded session both
-    accepts training submissions and RUNS them; ``training.run_worker = false``
-    (env ``JAMMI_TRAINING__RUN_WORKER=false``) keeps the first and drops the
+    **`worker.enabled` on a `file://` target.** An embedded session both
+    accepts training submissions and RUNS them; ``worker.enabled = false``
+    (env ``JAMMI_WORKER__ENABLED=false``) keeps the first and drops the
     second, through the same configuration a server reads. Such a session still
     accepts `fine_tune` et al. and still serves their status, but never claims a
     job. On a SQLite catalog — single-process, so exactly one process holds the

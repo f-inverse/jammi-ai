@@ -277,9 +277,9 @@ async fn remote_eval_reconstructs_the_exact_error_variant() {
 /// it persists a `queued` job and returns a job id immediately — the format
 /// detection that the patents corpus (no training-format columns) fails now
 /// happens in the worker, surfacing as a *failed job*, not a synchronous error
-/// from the submit call. The engine-backed server mounts the train tier, which
-/// runs an embedded worker against the shared engine, so the submitted job is
-/// claimed, fails format detection, and lands `failed`.
+/// from the submit call. The engine-backed server runs an embedded worker
+/// (`[worker] enabled`, the test config's default) against the shared engine,
+/// so the submitted job is claimed, fails format detection, and lands `failed`.
 ///
 /// Both transports submit against the same engine, so this pins the current
 /// (deferred-error) contract: submit returns `Ok` from either transport, and
@@ -337,7 +337,7 @@ async fn remote_fine_tune_start_defers_failure_to_the_worker() {
         .await
         .expect("remote fine_tune submit returns Ok (failure is deferred to the worker)");
 
-    // The shared engine's embedded worker (train tier) claims each job and fails
+    // The shared engine's embedded worker claims each job and fails
     // format detection on patents. Poll each transport's status until terminal;
     // both must reach `failed`. (The rich variant/message is NOT carried over
     // the wire yet — that lands in T3; here we assert only the failed status.)

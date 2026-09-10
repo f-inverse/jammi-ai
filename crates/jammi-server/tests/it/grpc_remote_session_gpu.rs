@@ -183,7 +183,7 @@ async fn start_gpu_engine_server() -> Option<GpuEngineServer> {
         store: store.clone(),
         trigger: None,
         engine: Some(session),
-        tiers: jammi_server::tiers::TierSet::all_compiled(),
+        tiers: jammi_server::tiers::TierSet::all(),
         metrics: Arc::new(jammi_server::routes::health::MetricsRegistry::new().unwrap()),
         tenant_resolver: jammi_server::grpc::session::SessionIdTenantResolver::arc(store),
         admin_authorizer: None,

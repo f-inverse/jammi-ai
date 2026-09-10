@@ -86,7 +86,7 @@ async fn open_local_yields_a_working_embedded_session() {
 // claim training jobs?" by reading the SAME configuration key — not by three
 // private conventions. The server arm is proven in
 // `crates/jammi-server/tests/it/grpc_training.rs`
-// (`train_tier_with_run_worker_{false,true}_*`) and the Python arm in
+// (`worker_{disabled,enabled}_*`) and the Python arm in
 // `crates/jammi-python`; these are the Rust SDK arm's peers, driven through the
 // SAME `jammi.toml` -> `JammiConfig::load` path a real embedding binary takes,
 // never through a struct literal (a literal would prove only that a field can
@@ -289,7 +289,7 @@ async fn front_door_with_run_worker_false_leaves_the_job_queued_and_pending_stab
 
 /// THE CONTROL for the oracle above, and the pin on the DEFAULT direction: the
 /// same front door, the same submission, from a `jammi.toml` with no
-/// `[training]` section at all. The job LEAVES `queued`.
+/// `[worker]` section at all. The job LEAVES `queued`.
 ///
 /// Without this, the stable-`queued` assertion above would pass just as well
 /// against a front door that could never run anything (a broken worker, a

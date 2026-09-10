@@ -7,7 +7,7 @@ claim here is that a caller who swaps transports reads the same values.
 
 The job is held `queued` on BOTH sides by configuration — the submitting
 embedded session and the server are each started with
-`JAMMI_TRAINING__RUN_WORKER=false`, so nothing claims it and the row a test
+`JAMMI_WORKER__ENABLED=false`, so nothing claims it and the row a test
 reads twice does not move underneath the comparison. That is also the whole
 attach story in miniature: a job submitted by a process that is gone, read by a
 process that never submitted it.
@@ -42,7 +42,7 @@ pytestmark = pytest.mark.skipif(
 # exactly `queued`, which is the state under comparison.
 _ABSENT_MODEL = "/nonexistent/jammi/attach-parity/model"
 
-_NO_CLAIM = {"JAMMI_TRAINING__RUN_WORKER": "false"}
+_NO_CLAIM = {"JAMMI_WORKER__ENABLED": "false"}
 
 _SUMMARY_KEYS = {
     "job_id",
@@ -61,7 +61,7 @@ def _seed(artifact_dir: Path, monkeypatch) -> tuple[str, dict, dict, str]:
 
     Returns `(job_id, embedded_summary, embedded_report, embedded_status)`.
     """
-    monkeypatch.setenv("JAMMI_TRAINING__RUN_WORKER", "false")
+    monkeypatch.setenv("JAMMI_WORKER__ENABLED", "false")
     csv = artifact_dir.parent / "pairs.csv"
     csv.write_text("text_a,text_b,score\na,b,1.0\nc,d,0.0\n")
 
@@ -87,7 +87,7 @@ def _seed(artifact_dir: Path, monkeypatch) -> tuple[str, dict, dict, str]:
         summaries = db.list_training_jobs()
     finally:
         db.close()
-    monkeypatch.delenv("JAMMI_TRAINING__RUN_WORKER", raising=False)
+    monkeypatch.delenv("JAMMI_WORKER__ENABLED", raising=False)
 
     assert status == "queued"
     assert len(summaries) == 1, summaries
@@ -161,13 +161,13 @@ def test_remote_and_embedded_attach_model_id_agree_before_completion(
     artifact_dir.mkdir()
     job_id, _, _, _ = _seed(artifact_dir, monkeypatch)
 
-    monkeypatch.setenv("JAMMI_TRAINING__RUN_WORKER", "false")
+    monkeypatch.setenv("JAMMI_WORKER__ENABLED", "false")
     embedded = jammi.connect(f"file://{artifact_dir}")
     try:
         embedded_model_id = embedded.training_job(job_id).model_id
     finally:
         embedded.close()
-    monkeypatch.delenv("JAMMI_TRAINING__RUN_WORKER", raising=False)
+    monkeypatch.delenv("JAMMI_WORKER__ENABLED", raising=False)
 
     with live_server_on(artifact_dir, env_overrides=_NO_CLAIM) as endpoint:
         remote = jammi.connect(endpoint)

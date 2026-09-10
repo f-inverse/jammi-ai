@@ -1091,6 +1091,19 @@ workspace ships every publishable crate at the same
   Option<JobAttempt<'_>>` parameter (`None` for every existing call site — a
   behavior-preserving rename for callers that never passed a job link).
   `Catalog::delete_model` gains a `retention_days: i64` parameter.
+- **The `train` cargo feature and the `train` service tier are removed (#485).**
+  `jammi-server` declares no `default` feature any more; `TrainingService`
+  (job submission and status) is core and mounts on every engine-backed
+  deployment, and `ServiceTier` is `Core` / `Event` / `Eval`. Whether a
+  process *runs* the jobs it accepts is the `[worker] enabled` runtime key,
+  not a tier and not a build feature: a request node runs `[worker] enabled
+  = false`, a compute node runs `services = []` with `[worker] enabled =
+  true, kinds = [...]`. `services = ["train"]` (or `JAMMI_SERVER__SERVICES=
+  train`) is now a startup error naming the unknown tier; `ServerInfo.
+  services` never carries `train`. `TierSet::resolve` is infallible,
+  `TierSet::all_compiled` is `TierSet::all`, `ServiceTier::compiled_in` and
+  `TierError::FeatureNotCompiled` are gone, and `ChainParts::train_worker`
+  is `ChainParts::worker`.
 - **Existing result-table and artifact object keys predating the tenant-prefixed layout
   are unattributed until the table is re-materialized (#484).** `reconcile`'s allowlist
   recognizes only `{seg}/{table}.parquet` and `models/{seg}/{job_id}/…` keys (`seg` a

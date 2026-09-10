@@ -1204,18 +1204,18 @@ pub struct ServerConfig {
     /// Model IDs to preload into memory at server startup.
     pub preload_models: Vec<String>,
     /// Optional gRPC service tiers this deployment mounts, beyond the always-on
-    /// core tier. Tokens are `"train"`, `"event"`, `"eval"` (the `jammi-server`
+    /// core tier. Tokens are `"event"`, `"eval"` (the `jammi-server`
     /// service-tier mechanism owns their meaning and validation; this layer
     /// only carries the raw selection so the engine config stays free of
     /// server-tier types). An empty list means serve-only (core only); the
-    /// default mounts every tier compiled into the binary (all-in-one). A token
-    /// naming an unknown tier, or a tier whose feature is compiled out, is a
-    /// startup error surfaced by the server.
+    /// default mounts every tier (all-in-one). A token naming an unknown tier
+    /// is a startup error surfaced by the server. Whether this process runs
+    /// jobs is `[worker] enabled`, not a tier.
     pub services: ServiceSelection,
 }
 
 /// The optional service-tier selection for a server deployment. `All` (the
-/// default) mounts every tier the binary compiled in; `Only` mounts core plus
+/// default) mounts every optional tier; `Only` mounts core plus
 /// exactly the named optional tiers. Kept as raw tokens here so `jammi-db` does
 /// not depend on `jammi-server`'s tier vocabulary — the server resolves and
 /// validates them.

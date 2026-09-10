@@ -193,7 +193,7 @@ class EmbeddedBackend:
         :class:`~jammi.errors.BackendError` the engine's boundary guard raises,
         never a silent no-op.
 
-        With ``training.run_worker = false`` there is no worker to stop, so only
+        With ``worker.enabled = false`` there is no worker to stop, so only
         the catalog release runs — promptly, with no idle-poll wait and no
         in-flight run to finish. That is the point of the setting on a SQLite
         catalog: this session submits jobs and holds them ``"queued"``, and this
@@ -1303,8 +1303,8 @@ def _open_embedded(artifact_dir: str, *, config: Optional[str] = None) -> Embedd
     when there is none — the `artifact_dir` passed here is applied after that
     load and always wins.
 
-    One key that resolution carries is `training.run_worker`
-    (``JAMMI_TRAINING__RUN_WORKER``): with it `false`, this session accepts
+    One key that resolution carries is `worker.enabled`
+    (``JAMMI_WORKER__ENABLED``): with it `false`, this session accepts
     training submissions but never claims one, so on a SQLite catalog a
     submitted job stays ``"queued"`` until this session is closed and a claiming
     process opens the directory. See :func:`jammi.connect`.

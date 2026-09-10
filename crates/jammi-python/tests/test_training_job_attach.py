@@ -23,7 +23,7 @@ The cross-transport value parity of the same three lives in
 `clients/python/tests/test_remote_training_job_live.py` (it needs a real
 `jammi-server`).
 
-The submit-then-attach split is driven through `training.run_worker`: the
+The submit-then-attach split is driven through `worker.enabled`: the
 submitting connection runs no claim loop, so the job is still `queued` when the
 successor connection attaches — the attach is then observably an attach, not a
 race against a worker that already finished the job in the submitting process.
@@ -50,7 +50,7 @@ pytestmark = pytest.mark.skipif(
     reason="local tiny_bert / training_pairs fixtures not present",
 )
 
-_RUN_WORKER_ENV = "JAMMI_TRAINING__RUN_WORKER"
+_RUN_WORKER_ENV = "JAMMI_WORKER__ENABLED"
 
 # The `TrainingJobSummary` field set, verbatim from `jammi/v1/training.proto`.
 # The embedded listing must carry exactly these keys, so a caller reads one

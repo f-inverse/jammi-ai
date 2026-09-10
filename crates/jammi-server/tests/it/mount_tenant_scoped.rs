@@ -150,7 +150,7 @@ async fn probe_chain(addr: SocketAddr, resolver: Arc<dyn TenantResolver>) -> (Gr
         store: SessionStore::new(),
         trigger: None,
         engine: None,
-        tiers: TierSet::resolve(std::iter::empty()).expect("core-only tier set resolves"),
+        tiers: TierSet::resolve(std::iter::empty()),
         metrics: Arc::new(MetricsRegistry::new().unwrap()),
         tenant_resolver: resolver,
         admin_authorizer: None,

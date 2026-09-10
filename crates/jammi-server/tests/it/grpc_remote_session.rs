@@ -494,8 +494,7 @@ async fn remote_reconcile_reports_like_local() {
     use prost::Message;
 
     let server = start_engine_server_with_admin(
-        jammi_server::tiers::TierSet::resolve(std::iter::empty())
-            .expect("core-only tier set resolves"),
+        jammi_server::tiers::TierSet::resolve(std::iter::empty()),
         Some(Arc::new(AllowAllAdmin) as Arc<dyn AdminAuthorizer>),
     )
     .await;

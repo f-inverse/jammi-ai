@@ -96,7 +96,7 @@ async fn start_fixture() -> Fixture {
         store: store.clone(),
         trigger: Some(trigger),
         engine: Some(session),
-        tiers: jammi_server::tiers::TierSet::all_compiled(),
+        tiers: jammi_server::tiers::TierSet::all(),
         metrics: Arc::new(jammi_server::routes::health::MetricsRegistry::new().unwrap()),
         tenant_resolver: jammi_server::grpc::session::SessionIdTenantResolver::arc(store),
         admin_authorizer: None,

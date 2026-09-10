@@ -105,8 +105,7 @@ async fn start_flight_test_server() -> (SocketAddr, TempDir, tokio::task::JoinHa
         store: store.clone(),
         trigger: None,
         engine: None,
-        tiers: jammi_server::tiers::TierSet::resolve(std::iter::empty())
-            .expect("core-only tier set resolves"),
+        tiers: jammi_server::tiers::TierSet::resolve(std::iter::empty()),
         metrics: Arc::new(jammi_server::routes::health::MetricsRegistry::new().unwrap()),
         tenant_resolver: jammi_server::grpc::session::SessionIdTenantResolver::arc(store),
         admin_authorizer: None,

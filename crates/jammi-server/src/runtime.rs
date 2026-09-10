@@ -50,11 +50,9 @@ use crate::grpc::proto::embedding::embedding_service_server::EmbeddingServiceSer
 use crate::grpc::proto::eval::eval_service_server::EvalServiceServer;
 use crate::grpc::proto::inference::inference_service_server::InferenceServiceServer;
 use crate::grpc::proto::pipeline::pipeline_service_server::PipelineServiceServer;
-#[cfg(feature = "train")]
 use crate::grpc::proto::training::training_service_server::TrainingServiceServer;
 use crate::grpc::proto::trigger::trigger_service_server::TriggerServiceServer;
 use crate::grpc::session::{SessionIdTenantResolver, SessionStore, TenantResolver};
-#[cfg(feature = "train")]
 use crate::grpc::training::TrainingServer;
 use crate::grpc::trigger::TriggerServer;
 use crate::grpc_web_trailers::GrpcWebTrailersLayer;
@@ -162,8 +160,8 @@ impl OssServer {
             .validate()
             .map_err(|e| ServerError::Config(e.to_string()))?;
         // Reject lease timing that violates the heartbeat margin, or a
-        // training poll that is a busy-loop, at construction — before the
-        // train tier spawns its worker or a result table is leased.
+        // worker poll that is a busy-loop, at construction — before the
+        // worker is spawned or a result table is leased.
         let lease = config
             .lease
             .intervals()
@@ -502,36 +500,34 @@ pub struct AssembledChain {
     // a downstream service through it too — the single-binder invariant holds:
     // there is still exactly ONE resolver, never a second one forked off here.
     tenant_resolver_layer: TenantResolverLayer,
-    // The embedded training worker the `train` tier owns, held RAII for the serve
-    // loop. Owned by the chain (not the assemble frame) so it survives the
-    // assemble→serve split; `serve` keeps it alive across the serve future and
-    // `into_axum_router` hands it onward in [`ChainParts`]. `#[cfg]`-gated so a
-    // serve-only build carries no worker field.
-    #[cfg(feature = "train")]
-    _train_worker: Option<jammi_ai::fine_tune::worker::EmbeddedWorker>,
+    // The embedded job worker this process runs when `[worker] enabled` is
+    // `true`, held RAII for the serve loop. Owned by the chain (not the
+    // assemble frame) so it survives the assemble→serve split; `serve` keeps it
+    // alive across the serve future and `into_axum_router` hands it onward in
+    // [`ChainParts`]. `None` when this process claims nothing.
+    _worker: Option<jammi_ai::fine_tune::worker::EmbeddedWorker>,
 }
 
 /// The non-routing remainder of an [`AssembledChain`] after
 /// [`AssembledChain::into_axum_router`] splits the routes off: the resolved bind
 /// address, the mounted-service ledger (for the downstream's startup log), the
 /// engine metrics handle (so a single-listener downstream can re-apply the
-/// engine's [`MetricsLayer`] on its own listener), and the training-worker guard
-/// the downstream must keep alive for the lifetime of its own serve loop.
+/// engine's [`MetricsLayer`] on its own listener), and the job-worker guard the
+/// downstream must keep alive for the lifetime of its own serve loop.
 pub struct ChainParts {
     pub addr: SocketAddr,
     pub mounted: Vec<String>,
     pub metrics: Arc<MetricsRegistry>,
-    /// The embedded training worker guard. The downstream MUST hold this for the
+    /// The embedded job worker guard. The downstream MUST hold this for the
     /// lifetime of its serve loop — dropping it stops the worker and submitted
     /// jobs stop running.
     ///
-    /// `None` when this process runs no claim loop: either the `train` tier is
-    /// not mounted at all, or it is mounted with `[worker] enabled = false`
-    /// (the mount-without-claiming configuration — `TrainingService` still
-    /// serves, this process just never claims). In both cases there is nothing
-    /// for the downstream to hold and nothing for its shutdown to await.
-    #[cfg(feature = "train")]
-    pub train_worker: Option<jammi_ai::fine_tune::worker::EmbeddedWorker>,
+    /// `None` when this process runs no claim loop — `[worker] enabled =
+    /// false`, the submit-without-claiming configuration: `TrainingService`
+    /// still serves (it is core), this process just never claims. There is
+    /// then nothing for the downstream to hold and nothing for its shutdown to
+    /// await.
+    pub worker: Option<jammi_ai::fine_tune::worker::EmbeddedWorker>,
 }
 
 impl AssembledChain {
@@ -657,15 +653,14 @@ impl AssembledChain {
             routes: self.routes,
             mounted: self.mounted,
             metrics: self.metrics,
-            #[cfg(feature = "train")]
-            _train_worker: self._train_worker,
+            _worker: self._worker,
         })
     }
 
     /// Serve the assembled chain (engine core + any downstream-mounted services)
     /// until `shutdown` resolves. A thin composition of [`Self::bind`] +
     /// [`BoundChain::serve_with_shutdown`] — binds the listener, then serves on
-    /// it; the training-worker guard stays alive for the whole serve loop. The
+    /// it; the job-worker guard stays alive for the whole serve loop. The
     /// transport layer stack is applied by [`BoundChain::serve_with_shutdown`].
     pub async fn serve(
         self,
@@ -706,7 +701,7 @@ impl AssembledChain {
     /// `Routes`' default), so a composing consumer must nest it under a path
     /// prefix or reconcile its own fallback, NOT blind-`.merge()` it.
     ///
-    /// The downstream must hold [`ChainParts`] (specifically its training-worker
+    /// The downstream must hold [`ChainParts`] (specifically its job-worker
     /// guard) alive for the lifetime of its own serve loop.
     pub fn into_axum_router(self) -> (axum::Router, ChainParts) {
         let router = self.routes.into_axum_router();
@@ -714,8 +709,7 @@ impl AssembledChain {
             addr: self.addr,
             mounted: self.mounted,
             metrics: self.metrics,
-            #[cfg(feature = "train")]
-            train_worker: self._train_worker,
+            worker: self._worker,
         };
         (router, parts)
     }
@@ -747,7 +741,7 @@ impl AssembledChain {
     /// listener that ALREADY frames gRPC-web — that expert path is layer-free
     /// precisely so it does not double-frame in that case.
     ///
-    /// The downstream must hold [`ChainParts`] (specifically its training-worker
+    /// The downstream must hold [`ChainParts`] (specifically its job-worker
     /// guard) alive for the lifetime of its own serve loop.
     pub fn into_layered_axum_router(self) -> (axum::Router, ChainParts) {
         // The `MetricsLayer` holds a clone; the original moves into `ChainParts`
@@ -774,8 +768,7 @@ impl AssembledChain {
             addr: self.addr,
             mounted: self.mounted,
             metrics: self.metrics,
-            #[cfg(feature = "train")]
-            train_worker: self._train_worker,
+            worker: self._worker,
         };
         (router, parts)
     }
@@ -797,10 +790,9 @@ pub struct BoundChain {
     routes: tonic::service::Routes,
     mounted: Vec<String>,
     metrics: Arc<MetricsRegistry>,
-    // The embedded training worker guard, held RAII across the serve loop — its
+    // The embedded job worker guard, held RAII across the serve loop — its
     // lifetime spans bind → serve, exactly as it did on `AssembledChain`.
-    #[cfg(feature = "train")]
-    _train_worker: Option<jammi_ai::fine_tune::worker::EmbeddedWorker>,
+    _worker: Option<jammi_ai::fine_tune::worker::EmbeddedWorker>,
 }
 
 impl BoundChain {
@@ -852,8 +844,8 @@ impl BoundChain {
             .serve_with_incoming_shutdown(self.incoming, shutdown)
             .await
             .map_err(ServerError::from)
-        // `self._train_worker` (train build) is dropped here, after the serve
-        // future resolves — its RAII lifetime spans the whole serve loop.
+        // `self._worker` is dropped here, after the serve future resolves — its
+        // RAII lifetime spans the whole serve loop.
     }
 }
 
@@ -867,19 +859,19 @@ impl BoundChain {
 /// `GetServerInfo` answer even when no engine is mounted; its catalog /
 /// lifecycle verbs are backed by `engine` when present). When `engine` is
 /// `Some`, the core data-plane services also mount: `EmbeddingService`,
-/// `InferenceService`, `PipelineService`, `AuditService`. These are the
-/// serve-path primitives every deployment needs.
+/// `InferenceService`, `PipelineService`, `AuditService`, and
+/// `TrainingService` (the job submission surface). These are the serve-path
+/// primitives every deployment needs.
+///
+/// An engine-backed chain also spawns the embedded job worker, unless
+/// `chain.engine`'s `[worker] enabled` is `false`: that key decides whether
+/// THIS process claims queued jobs, and it does NOT change what is mounted or
+/// advertised (`TrainingService` serves either way, so an `enabled = false`
+/// deployment still accepts submissions and just leaves them `queued` for
+/// whichever process does claim).
 ///
 /// **Mounted by tier** (only when `tiers` selected them):
 /// - `EvalService` ← [`ServiceTier::Eval`]
-/// - `TrainingService` ← [`ServiceTier::Train`] (and only when the `train`
-///   feature is compiled in — the mount code itself is `#[cfg]`-gated). The
-///   tier also spawns the embedded training worker, unless `chain.engine`'s
-///   `[worker] enabled` is `false`: that key decides whether THIS process
-///   claims queued jobs, and it does NOT change what is mounted or advertised
-///   (`TrainingService` serves either way, so a `enabled = false` deployment
-///   still accepts submissions and just leaves them `queued` for whichever
-///   process does claim).
 /// - `TriggerService` ← [`ServiceTier::Event`], driven by `trigger` being
 ///   `Some` (the caller derives the handles iff the event tier is mounted)
 ///
@@ -982,11 +974,10 @@ pub fn assemble_grpc_chain(chain: GrpcChain) -> Result<AssembledChain, ServerErr
         );
     }
 
-    // The embedded training worker the `train` tier owns. Moved into the returned
-    // `AssembledChain` so it outlives the assemble frame and spans the serve loop
-    // (RAII). A serve-only build never sets it.
-    #[cfg(feature = "train")]
-    let mut train_worker: Option<jammi_ai::fine_tune::worker::EmbeddedWorker> = None;
+    // The embedded job worker this process runs when `[worker] enabled`. Moved
+    // into the returned `AssembledChain` so it outlives the assemble frame and
+    // spans the serve loop (RAII). A chain without an engine never sets it.
+    let mut worker: Option<jammi_ai::fine_tune::worker::EmbeddedWorker> = None;
 
     if let Some(session) = engine {
         // Core tier engine services: always mounted when an engine is present.
@@ -1025,51 +1016,44 @@ pub fn assemble_grpc_chain(chain: GrpcChain) -> Result<AssembledChain, ServerErr
             );
         }
 
-        // Train tier: TrainingService (all three training kinds — fine-tune,
-        // graph fine-tune, context-predictor). The mount code is `#[cfg]`-gated on
-        // the `train` feature, so a serve-only build carries no training surface;
-        // `TierSet::resolve` has already guaranteed the tier is not requested when
-        // the feature is compiled out.
-        #[cfg(feature = "train")]
-        if tiers.contains(ServiceTier::Train) {
-            // Whether THIS process also runs the claim loop is configuration, not
-            // a second code path: `[worker] enabled` (default `true`). The
-            // tier still mounts `TrainingService` either way — the surface and
-            // what `GetServerInfo.services` advertises are unchanged, because the
-            // service IS mounted — so a `worker.enabled = false` deployment still
-            // accepts submissions; it just never claims them. The embedded arm
-            // reads the same key off the same config, so a wire deployment and an
-            // in-process one answer the question identically.
-            if session.inner_config().worker.enabled {
-                // Start the worker that runs submitted jobs: a "GPU worker pool"
-                // is just N processes claiming from the shared catalog, and the
-                // server `train` tier runs one of them. `spawn` borrows `session`
-                // before it is moved into `TrainingServer::new`; the worker is
-                // stored in `AssembledChain` so it stops when the serve future
-                // resolves.
-                train_worker = Some(jammi_ai::fine_tune::worker::EmbeddedWorker::spawn(
-                    &session,
-                )?);
-                tracing::info!(
-                    run_worker = true,
-                    "train tier: TrainingService mounted; this process claims queued training jobs"
-                );
-            } else {
-                // No worker exists to stop, so shutdown has nothing extra to
-                // await: `AssembledChain::_train_worker` stays `None` and its
-                // drop is a no-op.
-                tracing::info!(
-                    run_worker = false,
-                    "train tier: TrainingService mounted; this process does not claim training jobs"
-                );
-            }
-            mount_engine!(
-                routes,
-                mounted,
-                "TrainingService",
-                TrainingServiceServer::new(TrainingServer::new(session))
+        // Core: TrainingService — the job submission surface (all three training
+        // kinds — fine-tune, graph fine-tune, context-predictor). Submission is
+        // always mounted; whether THIS process also runs the claim loop is
+        // configuration, not a tier and not a build feature: `[worker] enabled`
+        // (default `true`). The surface and what `GetServerInfo.services`
+        // advertises are the same either way, because the service IS mounted —
+        // so a `worker.enabled = false` deployment still accepts submissions; it
+        // just never claims them. The embedded arm reads the same key off the
+        // same config, so a wire deployment and an in-process one answer the
+        // question identically.
+        if session.inner_config().worker.enabled {
+            // Start the worker that runs submitted jobs of every compiled kind:
+            // a "GPU worker pool" is just N processes claiming from the shared
+            // catalog, and this server runs one of them. `spawn` borrows
+            // `session` before it is moved into `TrainingServer::new`; the
+            // worker is stored in `AssembledChain` so it stops when the serve
+            // future resolves.
+            worker = Some(jammi_ai::fine_tune::worker::EmbeddedWorker::spawn(
+                &session,
+            )?);
+            tracing::info!(
+                worker_enabled = true,
+                "TrainingService mounted; this process claims queued jobs"
+            );
+        } else {
+            // No worker exists to stop, so shutdown has nothing extra to await:
+            // `AssembledChain::_worker` stays `None` and its drop is a no-op.
+            tracing::info!(
+                worker_enabled = false,
+                "TrainingService mounted; this process does not claim jobs"
             );
         }
+        mount_engine!(
+            routes,
+            mounted,
+            "TrainingService",
+            TrainingServiceServer::new(TrainingServer::new(session))
+        );
     }
 
     Ok(AssembledChain {
@@ -1081,8 +1065,7 @@ pub fn assemble_grpc_chain(chain: GrpcChain) -> Result<AssembledChain, ServerErr
         // — retained so `AssembledChain::mount_tenant_scoped` can wrap a
         // downstream service through the identical single resolver.
         tenant_resolver_layer: resolver_layer,
-        #[cfg(feature = "train")]
-        _train_worker: train_worker,
+        _worker: worker,
     })
 }
 

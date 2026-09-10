@@ -271,13 +271,13 @@ vector built alongside each `add_service`.
 | `PipelineService` | when `engine.is_some()` (Core) |
 | `AuditService` | when `engine.is_some()` (Core) |
 | `EvalService` | engine + `ServiceTier::Eval` |
-| `TrainingService` | engine + `ServiceTier::Train`, `#[cfg(feature="train")]` |
+| `TrainingService` | when `engine.is_some()` (Core — job submission; the embedded worker is spawned beside it iff `[worker] enabled`) |
 
 The `mounted` `Vec` itself is only a `tracing::info!` log line
 (`crates/jammi-server/src/runtime.rs`), not the wire advertisement. The handshake
 advertises the *tier tokens*, not the service list: `TierSet::as_wire`
 (`crates/jammi-server/src/tiers.rs`, [§2.8]) returns the mounted tiers as sorted
-wire tokens (`core`/`event`/`eval`/`train`) for `ServerInfo.services`. The
+wire tokens (`core`/`event`/`eval`) for `ServerInfo.services`. The
 **invariant: advertised (tiers) == mounted (services)** is the caller's
 responsibility (`serve_grpc_chain` doc,
 `crates/jammi-server/src/runtime.rs`), since the tier set is resolved separately
@@ -493,9 +493,9 @@ Every trait/enum/base surface a maintainer extends, with anchors and invariants.
   (`with_configured_worker` (`crates/jammi-ai/src/local_session.rs:156`)) — the
   worker is spawned only when the loaded config's `[worker] enabled` is
   `true` (default `true`); **not** the unconditional `with_embedded_worker`
-  form. This is the SAME key the server `train` tier and the Python embedded
+  form. This is the SAME key the server's chain assembly and the Python embedded
   arm read before deciding whether THEIR process claims —
-  `worker.enabled` (`crates/jammi-server/src/runtime.rs:1043`) and
+  `worker.enabled` (`crates/jammi-server/src/runtime.rs:1029`) and
   `worker.enabled` (`crates/jammi-python/src/database.rs:98`) — so a wire
   deployment and an in-process one answer "does THIS process claim?"
   identically rather than by three private conventions. `Target`
@@ -507,17 +507,17 @@ Every trait/enum/base surface a maintainer extends, with anchors and invariants.
   - `Session::with_configured_worker(engine) -> Result<Self>`
     (`with_configured_worker` (`crates/jammi-ai/src/local_session.rs:156`)):
     the **front-door** form (`Jammi::open` threads to this one, not to
-    `with_embedded_worker`). Reads `TrainingConfig::run_worker` (default
+    `with_embedded_worker`). Reads `WorkerConfig::enabled` (default
     `true`) off `engine`'s loaded config: `true` spawns the worker
     (`Some(worker)`, RAII; stops on drop) by calling into
     `with_embedded_worker` below; `false` spawns nothing and the session
     carries `None`, same as `Session::new`. Must run inside a tokio runtime
-    when a worker is spawned. Returns `JammiError::Config` if `[training]`
+    when a worker is spawned. Returns `JammiError::Config` if `[worker]`
     timing violates worker invariants.
   - `Session::with_embedded_worker(engine) -> Result<Self>`
     (`with_embedded_worker` (`crates/jammi-ai/src/local_session.rs:120`)):
     the **explicit, spawn-regardless** form — carries `Some(worker)`
-    **unconditionally**, whatever `[training] run_worker` says. For a caller
+    **unconditionally**, whatever `[worker] enabled` says. For a caller
     that owns the claim decision itself out of band (test harnesses that must
     have a claimant); the front door does not call this directly. Same
     runtime/`Config`-error contract as `with_configured_worker`.
@@ -619,8 +619,8 @@ Every trait/enum/base surface a maintainer extends, with anchors and invariants.
   construction), `lease_expired_clause(col, bind) -> "(col IS NULL OR col <
   $bind)"` — the one SQL fragment every expiry-scoped enumeration and CAS
   shares. Config: `[lease] duration_secs = 30, heartbeat_secs = 10`
-  (`config::LeaseConfig`, `#[serde(deny_unknown_fields)]`); `[training]` keeps
-  `run_worker`/`idle_poll_secs` and refuses (no alias) the former
+  (`config::LeaseConfig`, `#[serde(deny_unknown_fields)]`); `[worker]` carries
+  `enabled`/`kinds`/`idle_poll_secs` and refuses (no alias) the former
   `lease_duration_secs`/`heartbeat_interval_secs` keys.
 - **Lease-owned building result tables** — `ResultStore` mints
   `writer_id = "writer-{uuid}"` per instance; `create_table` stamps it plus a

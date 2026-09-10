@@ -1061,8 +1061,8 @@ class RemoteDatabase:
 
         The first three fields are compile-time facts about the build;
         ``services`` is the runtime tier handshake — the gRPC service tiers this
-        deployment mounted (``"core"`` is always present; ``"train"`` /
-        ``"event"`` / ``"eval"`` appear only when this server enabled them). A
+        deployment mounted (``"core"`` is always present; ``"event"`` /
+        ``"eval"`` appear only when this server enabled them). A
         client reads ``services`` to know which verbs are reachable here before
         calling them. ``broker`` is the RUNTIME trigger-broker driver this
         deployment is running (``"in_memory"`` / ``"jet_stream"`` /
@@ -1554,7 +1554,7 @@ class RemoteDatabase:
         resp = self._call(self._embedding.Search, request)
         return _hits_to_table(list(resp.hits))
 
-    # --- Training (offloaded to the remote train tier) ---------------------------
+    # --- Training (submitted to the remote server; run where `[worker] enabled`) ---
     #
     # These verbs DO hit the wire: training runs on the remote GPU server, so the
     # client submits a spec via `TrainingService.StartTraining` and returns a

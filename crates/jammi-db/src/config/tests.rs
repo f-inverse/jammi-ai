@@ -1843,10 +1843,10 @@ fn services_grammar_all_forms() {
     let shout: Holder = toml::from_str("services = \"ALL\"").unwrap();
     assert_eq!(shout.services, ServiceSelection::Only(vec!["ALL".into()]));
 
-    let list: Holder = toml::from_str("services = \"train,event\"").unwrap();
+    let list: Holder = toml::from_str("services = \"eval,event\"").unwrap();
     assert_eq!(
         list.services,
-        ServiceSelection::Only(vec!["train".into(), "event".into()])
+        ServiceSelection::Only(vec!["eval".into(), "event".into()])
     );
 
     let empty: Holder = toml::from_str("services = []").unwrap();
@@ -1901,13 +1901,13 @@ fn env_services_all_and_comma_list() {
         "",
         vec![(
             "JAMMI_SERVER__SERVICES".to_string(),
-            "train,event".to_string(),
+            "eval,event".to_string(),
         )],
     )
     .unwrap();
     assert_eq!(
         list.server.services,
-        ServiceSelection::Only(vec!["train".into(), "event".into()])
+        ServiceSelection::Only(vec!["eval".into(), "event".into()])
     );
 }
 

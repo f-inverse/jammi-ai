@@ -175,8 +175,7 @@ async fn shape_c_multi_tenant_server_isolates_two_tenants_across_primitives() {
         store: store.clone(),
         trigger: Some(trigger),
         engine: None,
-        tiers: jammi_server::tiers::TierSet::resolve([jammi_server::tiers::ServiceTier::Event])
-            .expect("event tier resolves"),
+        tiers: jammi_server::tiers::TierSet::resolve([jammi_server::tiers::ServiceTier::Event]),
         metrics: Arc::new(jammi_server::routes::health::MetricsRegistry::new().unwrap()),
         tenant_resolver: jammi_server::grpc::session::SessionIdTenantResolver::arc(store),
         admin_authorizer: None,

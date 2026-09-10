@@ -49,8 +49,7 @@ async fn start_session_only_server() -> (
         store: store_for_server.clone(),
         trigger: None,
         engine: None,
-        tiers: jammi_server::tiers::TierSet::resolve(std::iter::empty())
-            .expect("core-only tier set resolves"),
+        tiers: jammi_server::tiers::TierSet::resolve(std::iter::empty()),
         metrics: Arc::new(jammi_server::routes::health::MetricsRegistry::new().unwrap()),
         tenant_resolver: jammi_server::grpc::session::SessionIdTenantResolver::arc(
             store_for_server,

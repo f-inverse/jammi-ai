@@ -76,7 +76,7 @@ pub async fn serve_flight_with_catalog_service(
     let catalog_svc =
         TenantResolverLayer::new(resolver).layer(CatalogServiceServer::new(CatalogServer::new(
             store,
-            crate::tiers::TierSet::resolve(std::iter::empty())?,
+            crate::tiers::TierSet::resolve(std::iter::empty()),
             None,
             None,
         )));

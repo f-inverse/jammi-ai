@@ -357,12 +357,20 @@ impl OssServer {
         let health_router = self.build_health_router();
         let health_listener = TcpListener::bind(self.health_addr).await?;
         let health_addr = health_listener.local_addr()?;
+        // Cloned before `build_grpc_chain`/`assemble_grpc_chain` consume
+        // `self` — `AssembledChain`/`BoundChain` hold their own `Arc` clones
+        // internally (captured by the mounted services), but neither type
+        // carries the session back out as its own field, so this is the one
+        // handle `serve_with_shutdown` has to release the catalog through
+        // once the serve loop drains.
+        let session = Arc::clone(&self.session);
         let grpc = assemble_grpc_chain(self.build_grpc_chain())?.bind().await?;
         Ok(BoundServer {
             grpc,
             health_listener,
             health_addr,
             health_router,
+            session,
         })
     }
 
@@ -461,6 +469,14 @@ pub struct BoundServer {
     health_listener: TcpListener,
     health_addr: SocketAddr,
     health_router: Router,
+    /// The engine session, kept alive past [`OssServer::bind`] so
+    /// [`Self::serve_with_shutdown`] can release its catalog connections
+    /// (including the lease keeper's own, N3) once the serve loop has fully
+    /// drained — the graceful-shutdown release point a `SIGTERM`'d
+    /// `jammi-server` needs so a successor process can open the same
+    /// SQLite catalog directory immediately, exactly as the embedded
+    /// engine's `close()` does.
+    session: Arc<InferenceSession>,
 }
 
 impl BoundServer {
@@ -505,6 +521,7 @@ impl BoundServer {
             health_listener,
             health_addr,
             health_router,
+            session,
         } = self;
         tracing::info!(
             address = %health_addr,
@@ -535,6 +552,17 @@ impl BoundServer {
             Ok(r) => r,
             Err(join_err) => Err(ServerError::Io(std::io::Error::other(join_err.to_string()))),
         };
+
+        // Both halves have stopped accepting and finished draining
+        // in-flight requests — the graceful-shutdown release point.
+        // `InferenceSession::close` shuts the lease keeper (N3) down and
+        // joins its dedicated thread (closing its own catalog connection)
+        // before closing the shared pool, so a `SIGTERM`'d `jammi-server`
+        // releases the SQLite `unix-excl` lock exactly as the embedded
+        // engine's `close()` does — a successor process can open the same
+        // catalog directory immediately rather than waiting out the process
+        // exit.
+        session.close().await;
 
         grpc_result.and(health_result)
     }

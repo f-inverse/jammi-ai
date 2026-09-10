@@ -370,3 +370,72 @@ async fn a_holds_last_renewed_at_advances_with_each_landed_renewal() {
     );
     assert!(!hold.lost());
 }
+
+/// `shutdown_and_join` closes the keeper's OWN catalog connection —
+/// independent of, and never released by, closing any OTHER handle on the
+/// same directory (the keeper opens its own connection on its own
+/// dedicated thread; see the module docs). Before this method existed the
+/// only way to stop the keeper was `Drop`, which is flag-only and never
+/// waits for the thread to exit — so this connection stayed open for as
+/// long as the process ran, and for the SQLite backend that alone is
+/// enough to keep the `unix-excl` VFS's process-scoped exclusive lock held,
+/// refusing a successor even after every other handle had let go.
+///
+/// Proven with a FRESH `Catalog::open` on the same directory immediately
+/// after `shutdown_and_join` returns: it must land well inside the 5 s
+/// busy timeout a still-open keeper connection would force it to wait out
+/// (`backend_sqlite`'s `busy_timeout(Duration::from_secs(5))`) — the same
+/// distinction the Python
+/// `test_close_hands_the_catalog_directory_to_a_successor_process` oracle
+/// measures cross-process.
+///
+/// `shutdown_and_join`'s own timeout is generous (60 s), not the ~1 s a
+/// `Notify`-woken thread normally takes: this suite runs hundreds of
+/// SQLite pools open-and-close in one process, back to back, and the
+/// actual OS-level `join()` this call performs (via `spawn_blocking`,
+/// never `JoinHandle::is_finished` polling — see that method's own doc for
+/// why) was measured to occasionally take 30+ real seconds under that
+/// accumulated load, while still genuinely completing and genuinely
+/// releasing the lock (proven by the reopen below landing well under its
+/// own bound regardless). A single production process never reaches that
+/// load shape — this generous window is a test-harness accommodation, not
+/// evidence the mechanism itself is slow.
+#[tokio::test]
+async fn shutdown_and_join_releases_the_keepers_own_catalog_connection() {
+    let dir = tempdir().unwrap();
+    let intervals = fast_intervals();
+    let keeper = keeper_for(dir.path().to_path_buf(), intervals).await;
+    // A live hold, so the keeper is doing real renewal work over the
+    // connection this test proves gets closed — not merely an idle thread
+    // that happens to have one open.
+    let _hold = keeper.hold(LeaseTarget::Instance("closing-probe".to_string()));
+
+    keeper
+        .shutdown_and_join(Duration::from_secs(60))
+        .await
+        .expect("the keeper thread must exit and close its connection within the window");
+    assert!(
+        !keeper.is_alive(),
+        "shutdown_and_join must leave the keeper reporting dead"
+    );
+
+    let reopen_started = std::time::Instant::now();
+    let reopened = Catalog::open(dir.path()).await.expect(
+        "a fresh open on the same directory must succeed once the keeper's own \
+         connection is closed",
+    );
+    let reopen_elapsed = reopen_started.elapsed();
+    reopened.close().await;
+    assert!(
+        reopen_elapsed < Duration::from_secs(2),
+        "the reopen took {reopen_elapsed:?} — the keeper's own connection must not still \
+         be holding the process-exclusive lock (that would force this open to wait out \
+         the 5 s busy timeout instead of landing almost immediately)"
+    );
+
+    // Idempotent: a second call finds no thread left to join.
+    keeper
+        .shutdown_and_join(Duration::from_secs(1))
+        .await
+        .expect("a second shutdown_and_join on an already-stopped keeper is Ok");
+}

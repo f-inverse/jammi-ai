@@ -92,3 +92,56 @@ async fn two_sessions_given_one_worker_id_mint_distinct_ids_and_share_the_label(
     })
     .await;
 }
+
+/// `InferenceSession::close()` releases every catalog connection the
+/// session holds — including the lease keeper's (N3) OWN connection, opened
+/// independently on its own dedicated thread at construction
+/// ([`InferenceSession::new`]) and never touched by closing the session's
+/// shared pool alone.
+///
+/// Before `close()` shut the keeper down and joined it, that connection
+/// stayed open for as long as the keeper thread ran (unbounded past a plain
+/// `Drop`, since `LeaseKeeper::drop` is flag-only and never waits for the
+/// thread to exit) — so for the SQLite backend it alone kept the
+/// `unix-excl` VFS's process-scoped exclusive lock held, and a successor
+/// process opening the SAME catalog directory was refused within the 5 s
+/// busy timeout even though every other handle had let go.
+///
+/// Proven here by timing a fresh [`jammi_db::catalog::Catalog::open`] on the
+/// SAME directory immediately after `close()` returns: in isolation this
+/// lands in single-digit milliseconds (the connection is genuinely gone,
+/// not merely flagged), and the bound below is a generous multiple of that
+/// — chosen so it is comfortably inside the 5 s busy timeout a still-open
+/// keeper connection would force the reopen to wait out, without being a
+/// false negative under this binary's own accumulated load (hundreds of
+/// `InferenceSession`s across this suite each leave an un-joined keeper OS
+/// thread behind on `Drop`, exactly like `Drop`'s own doc describes).
+/// Landing inside the bound is only possible once every connection in the
+/// process this session opened — the shared pool AND the keeper's own —
+/// has actually released the file.
+#[tokio::test]
+async fn close_releases_the_lease_keepers_own_connection_so_a_fresh_open_is_fast() {
+    let (session, dir) = session().await;
+    // The session is doing real work over its keeper-held instance lease —
+    // not an idle keeper that happens to have a connection open.
+    assert!(session.lease_keeper().is_alive());
+
+    session.close().await;
+    assert!(
+        !session.lease_keeper().is_alive(),
+        "close() must leave the lease keeper reporting dead"
+    );
+
+    let started = std::time::Instant::now();
+    let reopened = jammi_db::catalog::Catalog::open(dir.path())
+        .await
+        .expect("a fresh open on the same directory must succeed once close() has returned");
+    let elapsed = started.elapsed();
+    reopened.close().await;
+    assert!(
+        elapsed < Duration::from_secs(2),
+        "the reopen took {elapsed:?} — a connection this process still held (the lease \
+         keeper's own, in particular) would force it to wait out the 5 s busy timeout \
+         instead of landing almost immediately"
+    );
+}

@@ -298,6 +298,56 @@ impl InferenceSession {
             .worker_intervals(self.inner.config().lease.intervals()?)
     }
 
+    /// Release every catalog connection this session holds — its own
+    /// shared backend pool AND the lease keeper's (N3) dedicated
+    /// connection — so a successor process can open the SAME catalog
+    /// directory immediately.
+    ///
+    /// **Dropping the session is not a release point**, for the same
+    /// reason [`jammi_db::session::JammiSession::close`] documents for the
+    /// shared pool, plus one this session adds on top: the lease keeper
+    /// opens its OWN connection on its own dedicated OS thread ([`Self::new`]
+    /// wires it before anything else can hold a lease), entirely
+    /// independent of the shared pool `JammiSession::close` releases.
+    /// Closing only that shared pool while the keeper's thread stayed up
+    /// used to leave the SQLite `unix-excl` VFS's process-scoped exclusive
+    /// lock held — the keeper's own connection was still open — so a
+    /// successor process opening the same directory was refused within the
+    /// busy timeout even after every OTHER handle had let go.
+    ///
+    /// Order: shut the keeper down and wait — bounded, see
+    /// [`jammi_db::catalog::lease_keeper::LeaseKeeper::shutdown_and_join`] —
+    /// for its thread to close its own connection, THEN close the shared
+    /// pool, so nothing renews a lease against a catalog this call is in
+    /// the middle of tearing down. A keeper that does not exit within the
+    /// shutdown window is logged and does NOT block the shared-pool close
+    /// that follows — this call must never hang, even at the cost of
+    /// leaving the keeper's connection's fate unresolved in that
+    /// (unexpected) case. The window is generous (30 s): the cost of a
+    /// caller's own release call taking that long in the genuinely rare
+    /// case the keeper's thread is slow to exit is far smaller than the
+    /// cost of giving up early and handing back a directory a successor
+    /// process is then refused to open.
+    ///
+    /// Idempotent: [`jammi_db::session::JammiSession::close`] is
+    /// idempotent, and shutting down an already-stopped keeper finds no
+    /// thread left to join.
+    pub async fn close(&self) {
+        const KEEPER_SHUTDOWN_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
+        if let Err(e) = self
+            .lease_keeper
+            .shutdown_and_join(KEEPER_SHUTDOWN_TIMEOUT)
+            .await
+        {
+            tracing::error!(
+                error = %e,
+                "InferenceSession::close: the lease keeper did not exit within its shutdown \
+                 window; its own catalog connection may still hold the process-exclusive lock"
+            );
+        }
+        self.inner.close().await;
+    }
+
     /// Row-scoped on-read reclaim (PLAN-C §2): a caller that just read `record`
     /// (e.g. `JobService`'s `JobStatus`/`WaitJob`/`ListJobs`) offers it here so
     /// an expired lease is reaped inline with the read, without waiting for the

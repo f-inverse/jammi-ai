@@ -212,6 +212,12 @@ pub struct LeaseKeeper {
     holds: Arc<Mutex<HashMap<u64, HeldState>>>,
     next_id: AtomicU64,
     shutdown: Arc<AtomicBool>,
+    /// Wakes the thread's sleep the instant [`Self::shutdown_and_join`] (or
+    /// `Drop`) signals `shutdown`, rather than leaving it to notice on the
+    /// next heartbeat tick (which, at the engine's default 10 s heartbeat,
+    /// would make a caller waiting to release the catalog file wait up to
+    /// 10 s for nothing).
+    wake: Arc<tokio::sync::Notify>,
     liveness: Arc<Liveness>,
     #[cfg(feature = "test-hooks")]
     kill: Arc<AtomicBool>,
@@ -244,6 +250,7 @@ impl LeaseKeeper {
         let connect: CatalogConnect = Box::new(move || Box::pin(catalog_connect()));
         let holds: Arc<Mutex<HashMap<u64, HeldState>>> = Arc::new(Mutex::new(HashMap::new()));
         let shutdown = Arc::new(AtomicBool::new(false));
+        let wake = Arc::new(tokio::sync::Notify::new());
         let liveness = Arc::new(Liveness {
             epoch: Instant::now(),
             alive: AtomicBool::new(false),
@@ -256,6 +263,7 @@ impl LeaseKeeper {
 
         let thread_holds = Arc::clone(&holds);
         let thread_shutdown = Arc::clone(&shutdown);
+        let thread_wake = Arc::clone(&wake);
         let thread_liveness = Arc::clone(&liveness);
         #[cfg(feature = "test-hooks")]
         let thread_kill = Arc::clone(&kill);
@@ -296,8 +304,27 @@ impl LeaseKeeper {
                     thread_liveness.alive.store(true, Ordering::SeqCst);
                     let _ = ready_tx.send(Ok(()));
                     loop {
-                        tokio::time::sleep(intervals.heartbeat()).await;
+                        // Wake on whichever comes first: the next heartbeat
+                        // tick, or a shutdown signal — so
+                        // `shutdown_and_join`'s wait is bounded by a
+                        // scheduling quantum, never a full heartbeat
+                        // interval (the engine's default is 10 s).
+                        tokio::select! {
+                            _ = tokio::time::sleep(intervals.heartbeat()) => {},
+                            _ = thread_wake.notified() => {},
+                        }
                         if thread_shutdown.load(Ordering::SeqCst) {
+                            // The keeper's own catalog connection is closed
+                            // HERE, on the thread that owns it, before the
+                            // thread exits — the one bounded release point
+                            // `shutdown_and_join` waits for. Never rely on
+                            // this connection's `Drop`: closing a `Catalog`
+                            // without awaiting `close()` returns nothing to
+                            // the pool for an unbounded time (see
+                            // `Catalog::close`'s doc), which for the SQLite
+                            // backend is exactly the connection the
+                            // process-exclusive `unix-excl` lock is held by.
+                            catalog.close().await;
                             return;
                         }
                         #[cfg(feature = "test-hooks")]
@@ -326,6 +353,7 @@ impl LeaseKeeper {
             holds,
             next_id: AtomicU64::new(0),
             shutdown,
+            wake,
             liveness,
             #[cfg(feature = "test-hooks")]
             kill,
@@ -386,21 +414,115 @@ impl LeaseKeeper {
     pub fn kill_thread_for_test(&self) {
         self.kill.store(true, Ordering::SeqCst);
     }
+
+    /// Signal the keeper thread to stop, wait — bounded by `timeout` — for
+    /// it to actually exit, and reap its `JoinHandle`.
+    ///
+    /// Unlike `Drop` ("best-effort … not joined synchronously"), this is
+    /// the ONE path that guarantees the keeper's own catalog connection is
+    /// gone by the time it returns `Ok(())`: the thread closes that
+    /// connection itself (see the `shutdown` branch inside [`Self::start`]'s
+    /// loop) before it exits, so observing `Ok(())` here is the caller's
+    /// evidence that whatever process-exclusive lock that connection held
+    /// (the SQLite `unix-excl` VFS, in particular) has actually been
+    /// released — never merely that a flag was set.
+    ///
+    /// The thread is woken immediately via a `Notify` rather than left to
+    /// notice on its next heartbeat tick, so in practice this returns within
+    /// a scheduling quantum, not the full heartbeat interval (10 s by
+    /// default). The actual `std::thread::JoinHandle::join` is a blocking
+    /// OS call, so it runs on tokio's blocking pool (`spawn_blocking`)
+    /// rather than on this async fn's own executor thread — and NOT via
+    /// `JoinHandle::is_finished` polling, which was measured on this
+    /// platform to lag the thread's real exit by seconds under load (the
+    /// std docs make no bounded-latency promise for it; a genuine blocking
+    /// `join` does not have that hazard).
+    ///
+    /// Idempotent: a second call — after the first already took the
+    /// handle (whether it went on to succeed, time out, or observe a
+    /// panicked thread) — finds no handle left and returns `Ok(())` at
+    /// once, without waiting on whatever the first call's `join` is still
+    /// doing.
+    ///
+    /// # Errors
+    ///
+    /// [`JammiError::Catalog`] when the thread has not exited within
+    /// `timeout` — never a hang — or when it exited via a panic (its
+    /// shutdown branch may never have run, so this call cannot promise the
+    /// connection is closed). Either way `shutdown` stays set, so the
+    /// thread's own progress (if it is still running) continues toward
+    /// closing its connection regardless of this call having given up on
+    /// waiting for it.
+    pub async fn shutdown_and_join(&self, timeout: Duration) -> Result<()> {
+        self.shutdown.store(true, Ordering::SeqCst);
+        self.wake.notify_one();
+        let handle = self
+            .thread
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .take();
+        let Some(handle) = handle else {
+            // Already taken by an earlier call (or a concurrent one) — the
+            // thread has exited or is being waited on elsewhere.
+            return Ok(());
+        };
+        match tokio::time::timeout(timeout, tokio::task::spawn_blocking(move || handle.join()))
+            .await
+        {
+            Ok(Ok(Ok(()))) => Ok(()),
+            Ok(Ok(Err(panic))) => {
+                // The thread panicked (e.g. the `test-hooks` kill switch, or
+                // a genuine defect) rather than reaching its own `shutdown`
+                // branch — its catalog connection may still be open. The
+                // payload is `Box<dyn Any + Send>`, which carries neither
+                // `Debug` nor `Display`; extract the message the same way
+                // `std`'s own default panic hook does, for the two payload
+                // shapes `panic!`/`assert!` actually produce.
+                let message = panic
+                    .downcast_ref::<&str>()
+                    .map(|s| s.to_string())
+                    .or_else(|| panic.downcast_ref::<String>().cloned())
+                    .unwrap_or_else(|| "<non-string panic payload>".to_string());
+                error!(
+                    panic = %message,
+                    "lease keeper: thread panicked during shutdown; its catalog connection may \
+                     still be open"
+                );
+                Err(JammiError::Catalog(format!(
+                    "lease keeper: thread panicked before it could close its own catalog \
+                     connection: {message}"
+                )))
+            }
+            Ok(Err(join_err)) => Err(JammiError::Catalog(format!(
+                "lease keeper: internal error joining its thread: {join_err}"
+            ))),
+            Err(_elapsed) => Err(JammiError::Catalog(format!(
+                "lease keeper: thread did not exit within the {timeout:?} shutdown window; \
+                 its own catalog connection may still be open"
+            ))),
+        }
+    }
 }
 
 impl Drop for LeaseKeeper {
     fn drop(&mut self) {
         self.shutdown.store(true, Ordering::SeqCst);
+        self.wake.notify_one();
         if let Some(handle) = self
             .thread
             .lock()
             .unwrap_or_else(PoisonError::into_inner)
             .take()
         {
-            // Best-effort: the thread wakes at the next heartbeat tick and
-            // exits. Not joined synchronously here — `Drop` runs on whatever
-            // thread drops the last `Arc<LeaseKeeper>`, which may itself be
-            // an async task that must not block on a `std::thread::join`.
+            // Best-effort: the thread wakes (immediately, via `wake`, rather
+            // than waiting for its next heartbeat tick) and exits, closing
+            // its own catalog connection on its own time. Not joined
+            // synchronously here — `Drop` runs on whatever thread drops the
+            // last `Arc<LeaseKeeper>`, which may itself be an async task
+            // that must not block on a `std::thread::join`, so a caller that
+            // needs the connection actually gone by a bounded point must
+            // call `shutdown_and_join` — dropping this handle is NOT that
+            // release point.
             drop(handle);
         }
     }

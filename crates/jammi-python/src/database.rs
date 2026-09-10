@@ -282,13 +282,19 @@ impl PyDatabase {
                 let stopped = match &self._worker {
                     Some(worker) => worker.stop_and_join().await,
                     // `worker.enabled = false`: there is no claim loop to
-                    // stop. The pool close below still runs — the catalog
+                    // stop. The session close below still runs — the catalog
                     // release is what a caller closes for, and it must not
                     // depend on this connection having happened to own a worker.
                     None => Ok(()),
                 };
-                let backend = self.session.catalog().backend_arc();
-                backend.close().await;
+                // `InferenceSession::close` shuts the session's lease
+                // keeper (N3) down and joins its dedicated thread — closing
+                // its OWN catalog connection — before closing the shared
+                // pool. Closing only the shared pool (as this used to)
+                // left the keeper's connection open, and for the SQLite
+                // backend that connection alone is enough to keep the
+                // `unix-excl` VFS's process-exclusive lock held.
+                self.session.close().await;
                 stopped
             })
         })

@@ -55,6 +55,7 @@ const TOP_LEVEL_FIELDS: &[&str] = &[
     "cache",
     "server",
     "logging",
+    "observability",
     "catalog",
     "broker",
     "signing_key",

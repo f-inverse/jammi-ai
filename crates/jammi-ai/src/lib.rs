@@ -47,6 +47,15 @@ pub mod query;
 #[cfg(feature = "local")]
 pub mod session;
 
+/// Vendor-neutral OTLP trace export (#486) and W3C `traceparent` continuation
+/// — the factory `jammi-server`'s `telemetry::install`/`TraceContextLayer`
+/// and `jammi-python`'s `open_local` both build on (B4). Unconditional at
+/// the module level (not gated on `local`): [`telemetry::refuse_if_endpoint_without_feature`]
+/// must exist in every build so a consumer without the `telemetry-otlp`
+/// feature still gets a typed refusal rather than a missing symbol; the
+/// exporter/propagation machinery inside is gated on that feature alone.
+pub mod telemetry;
+
 /// The engine's residual wire surface: the engine-spec proto↔domain conversions
 /// the candle-free `jammi-wire` substrate cannot home (`TrainingSpec`, the
 /// declared-edge gather, the served distribution, the pipeline request/response

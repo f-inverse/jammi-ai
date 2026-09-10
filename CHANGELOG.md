@@ -443,6 +443,36 @@ workspace ships every publishable crate at the same
   on the combined listener between the existing gRPC-web framing layers and
   the mounted services. No wire/`.proto` change — mechanism-only, applies to
   every existing RPC uniformly.
+- **`[observability]`: vendor-neutral OTLP trace export, and W3C `traceparent`
+  continuation across the gRPC/Flight chain (#486).** `otlp_endpoint`
+  (default unset — no exporter installed, no network connection attempted at
+  all), `otlp_headers` (a map of request headers the exporter attaches to
+  every export call; each value is a `SecretSource` — inline or
+  `{ file = "…" }` — resolved only at the point the exporter builds the gRPC
+  metadata, never logged), `service_name` (default `"jammi"`), and
+  `sample_ratio` (default `1.0`, domain `[0.0, 1.0]`, a parent-based ratio
+  sampler — a span with an already-sampled remote parent is always kept).
+  `jammi_ai::telemetry::otlp_layer` (behind the new `telemetry-otlp` cargo
+  feature — `opentelemetry`/`opentelemetry_sdk`/`opentelemetry-otlp`/
+  `tracing-opentelemetry`, one tonic: `opentelemetry-otlp`'s `grpc-tonic`
+  transport pins the same tonic 0.14 / prost 0.14 this workspace already
+  carries) is the one factory both `jammi-server`'s `telemetry::install`
+  (now a `Registry` + `fmt` layer + this optional layer, replacing the old
+  bare `fmt()` subscriber) and `jammi-python`'s `open_local` build over —
+  each is default-on (`jammi-server`'s own `telemetry-otlp` feature is in its
+  `default` list; `jammi-python`'s wheel enables `jammi-ai/telemetry-otlp`
+  directly). A configured endpoint this build was compiled without the
+  feature for is a typed `JammiError::Config` startup refusal naming the
+  feature, never a silently-dropped span. A new whole-server tower layer,
+  `crate::trace_context_layer::TraceContextLayer` (mounted beside
+  `MetricsLayer` on every listener path), extracts the incoming W3C
+  `traceparent`/`tracestate` pair from each request's HTTP headers and binds
+  it as the one span this process opens per RPC's OpenTelemetry parent, so
+  the span (and every `#[tracing::instrument]` handler span nested under it)
+  carries the SAME trace id the caller's proxy or gateway already assigned;
+  no `traceparent` header starts a fresh, unparented trace exactly as before.
+  See `docs/guide/src/operability.md`'s new "OTLP trace export" subsection
+  and `docs/guide/src/configuration.md`'s `[observability]` reference.
 
 ### Changed
 - **The published server images no longer pass `--config`; the Compose

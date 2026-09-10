@@ -176,6 +176,13 @@ tower = "0.5"
 # Low-level HTTP body framing — the gRPC-Web trailers-only repair layer builds
 # the in-body trailer frame `tonic-web` omits for a trailers-only error.
 http-body = "1"
+# The `TraceContextLayer` reads incoming request headers (the W3C
+# `traceparent`/`tracestate` pair) at the tower layer level, before tonic
+# decodes gRPC metadata — the same `http` crate `tonic`'s own `Request<Body>`
+# re-exports as `tonic::codegen::http`, pinned directly here so
+# `jammi_ai::telemetry`'s header-extraction helper does not have to reach
+# through that re-export.
+http = "1"
 pin-project = "1"
 
 # CLI
@@ -202,6 +209,19 @@ uuid = { version = "1", features = ["v4", "v7", "serde"] }
 chrono = { version = "0.4", features = ["serde"] }
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter", "json"] }
+# Vendor-neutral OTLP trace export (#486), behind `jammi-ai`'s `telemetry-otlp`
+# feature. One tonic: `opentelemetry-otlp`'s `grpc-tonic` transport pins tonic
+# `^0.14.1` / prost `^0.14`, matching this workspace's own `tonic = "0.14"` /
+# `prost = "0.14"` pins exactly, so enabling it adds no second tonic build.
+# `default-features = false` on every member of this family: each pulls in
+# only the `trace` (+ `grpc-tonic` for the exporter) surface, never the
+# metrics/logs half of the OTel SDK this engine does not use here (Prometheus
+# `/metrics` is the metrics story; see philosophy.md's "emit vendor-neutral,
+# the stack is yours").
+opentelemetry = { version = "0.32", default-features = false, features = ["trace"] }
+opentelemetry_sdk = { version = "0.32.1", default-features = false, features = ["trace"] }
+opentelemetry-otlp = { version = "0.32", default-features = false, features = ["grpc-tonic", "trace"] }
+tracing-opentelemetry = { version = "0.33", default-features = false }
 backon = "1"
 moka = { version = "0.12", features = ["future"] }
 seahash = "4"

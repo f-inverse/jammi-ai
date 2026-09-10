@@ -232,6 +232,11 @@ pub struct JammiConfig {
     pub server: ServerConfig,
     /// Tracing/logging configuration.
     pub logging: LoggingConfig,
+    /// Vendor-neutral OTLP trace export: collector endpoint, request headers,
+    /// `service.name`, and sample ratio. Built into an exporter by
+    /// `jammi_ai::telemetry::otlp_layer` (behind the `telemetry-otlp` cargo
+    /// feature); `jammi-db` carries only the raw, typed section.
+    pub observability: ObservabilityConfig,
     /// Catalog backend selection. Default: SQLite under `artifact_dir`.
     pub catalog: CatalogConfig,
     /// Trigger broker selection. Default: in-process [`crate::trigger::InMemoryBroker`].
@@ -1545,6 +1550,106 @@ pub struct LoggingConfig {
     pub format: LogFormat,
 }
 
+/// Vendor-neutral OTLP trace export (#486): where to send spans, the request
+/// headers the exporter attaches, the resource's `service.name`, and the
+/// fraction of traces to keep.
+///
+/// `jammi-db` carries this raw, typed section only — the exporter itself
+/// (`jammi_ai::telemetry::otlp_layer`, gated behind the `telemetry-otlp`
+/// cargo feature) lives in `jammi-ai`, mirroring [`ModelsConfig::hub_token`]'s
+/// split (H4): a header value stays an unresolved [`SecretSource`] here
+/// rather than an eagerly-read [`Secret`], because resolving it is the
+/// exporter's job at the point it actually builds the gRPC metadata a
+/// resolved value never needs to exist before that.
+///
+/// # TOML
+///
+/// ```toml
+/// [observability]
+/// otlp_endpoint = "http://localhost:4317"
+/// service_name = "jammi"
+/// sample_ratio = 1.0
+/// ```
+#[derive(Debug, Clone, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct ObservabilityConfig {
+    /// The OTLP/gRPC collector endpoint spans export to (e.g.
+    /// `http://localhost:4317`). `None` (the default) means: build no
+    /// exporter and open no connection — a process with no configured
+    /// endpoint attempts zero network egress for tracing, regardless of
+    /// whether the `telemetry-otlp` feature is compiled in.
+    pub otlp_endpoint: Option<String>,
+    /// Request headers the exporter attaches to every export call (e.g. an
+    /// auth token a collector requires). Each value is an unresolved
+    /// [`SecretSource`] — read at the point the exporter builds the gRPC
+    /// metadata, not at config load — so a value is never eagerly resolved
+    /// (and never logged: [`SecretSource`]'s own `Debug` redacts it, and
+    /// this map holds sources, never resolved [`Secret`] text). Default:
+    /// empty.
+    pub otlp_headers: BTreeMap<String, SecretSource>,
+    /// `service.name` resource attribute stamped on every exported span.
+    /// Default: `"jammi"`.
+    pub service_name: String,
+    /// Fraction of traces kept by the parent-based ratio sampler, in
+    /// `[0.0, 1.0]`. `1.0` (the default) samples everything; `0.0` samples
+    /// nothing (but the exporter still installs — set `otlp_endpoint` to
+    /// `None` instead to skip the exporter entirely). A root span always
+    /// defers to this ratio; a span with a sampled remote parent is always
+    /// kept, honouring the incoming decision (the "parent-based" half).
+    pub sample_ratio: f64,
+}
+
+impl Default for ObservabilityConfig {
+    fn default() -> Self {
+        Self {
+            otlp_endpoint: None,
+            otlp_headers: BTreeMap::new(),
+            service_name: "jammi".into(),
+            sample_ratio: 1.0,
+        }
+    }
+}
+
+impl ObservabilityConfig {
+    /// Validate the domain of every knob that can be checked without
+    /// resolving a header (headers stay unresolved here — see the struct
+    /// docs): `sample_ratio` must be a FINITE value within `[0.0, 1.0]`
+    /// (`RangeInclusive::contains`'s `<=`/`>=` comparisons are false against
+    /// a NaN operand on either side, so a NaN ratio already falls into this
+    /// branch — it is never silently treated as in-range); a configured
+    /// `otlp_endpoint` must parse as a URL with an `http`/`https` scheme and
+    /// a host, naming the offending value rather than surfacing as an opaque
+    /// exporter-construction failure deep in `jammi_ai::telemetry::otlp_layer`.
+    pub fn validate(&self) -> Result<()> {
+        if !(0.0..=1.0).contains(&self.sample_ratio) {
+            return Err(JammiError::Config(format!(
+                "observability.sample_ratio = {} must be within [0.0, 1.0]",
+                self.sample_ratio
+            )));
+        }
+        if let Some(endpoint) = &self.otlp_endpoint {
+            let parsed = url::Url::parse(endpoint).map_err(|e| {
+                JammiError::Config(format!(
+                    "observability.otlp_endpoint '{endpoint}' is not a valid URL: {e}"
+                ))
+            })?;
+            if !matches!(parsed.scheme(), "http" | "https") {
+                return Err(JammiError::Config(format!(
+                    "observability.otlp_endpoint '{endpoint}' must use the http or https \
+                     scheme, got '{}'",
+                    parsed.scheme()
+                )));
+            }
+            if parsed.host_str().is_none() {
+                return Err(JammiError::Config(format!(
+                    "observability.otlp_endpoint '{endpoint}' must name a host"
+                )));
+            }
+        }
+        Ok(())
+    }
+}
+
 /// Model source: where the Hugging Face Hub cache lives, which endpoint and
 /// token it talks to, and whether the process may reach the network at all.
 ///
@@ -1605,6 +1710,7 @@ impl Default for JammiConfig {
             cache: CacheConfig::default(),
             server: ServerConfig::default(),
             logging: LoggingConfig::default(),
+            observability: ObservabilityConfig::default(),
             catalog: CatalogConfig::default(),
             broker: BrokerConfig::default(),
             signing_key: SigningKeyConfig::default(),
@@ -1856,6 +1962,11 @@ impl JammiConfig {
         // zero timeout) at load time, naming the offending key, rather than
         // at server startup deep inside `OssServer::new`.
         config.server.limits.validate()?;
+        // Reject an out-of-domain `[observability]` knob (a `sample_ratio`
+        // outside `[0.0, 1.0]`, including NaN, or a malformed/non-http(s)
+        // `otlp_endpoint`) at load time, naming the offending key, rather
+        // than at the first `jammi_ai::telemetry::otlp_layer` call.
+        config.observability.validate()?;
         Ok(config)
     }
 

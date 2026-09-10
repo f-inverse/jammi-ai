@@ -34,6 +34,24 @@ pub async fn count_parquet_rows(handle: &JammiObjectStore) -> Result<usize, Stor
     Ok(builder.metadata().file_metadata().num_rows() as usize)
 }
 
+/// [`is_valid_parquet`] and [`count_parquet_rows`] fused into ONE object-store
+/// fetch: `Some(row_count)` when the object's bytes parse as Parquet (the
+/// footer read both functions perform separately), `None` when they do not.
+/// The object's `exists()` is still the caller's own check to make first (as
+/// with [`is_valid_parquet`]) — this never probes existence itself. Exists
+/// specifically for a caller (`ResultStore::classify_expired_row`) that needs
+/// BOTH the validity check and, on a later branch, the row count, and must
+/// never fetch the same bytes from the object store twice to get them.
+pub async fn validate_and_count_parquet_rows(
+    handle: &JammiObjectStore,
+) -> Result<Option<usize>, StorageError> {
+    let path = handle.data_path()?;
+    let bytes = handle.get_bytes(&path).await?;
+    Ok(ParquetRecordBatchReaderBuilder::try_new(bytes)
+        .ok()
+        .map(|builder| builder.metadata().file_metadata().num_rows() as usize))
+}
+
 /// Read every byte of the underlying object into memory. Used by the
 /// sidecar-index loader, which then hands the bytes to USearch via a
 /// temp-file shim.

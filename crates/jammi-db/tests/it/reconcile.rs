@@ -133,6 +133,23 @@ async fn create_building_embedding_with_parquet(
     source_id: &str,
     n: usize,
 ) -> BuildingTable {
+    create_building_embedding_with_parquet_and_catalog_dims(store, source_id, n, Some(DIMS as i32))
+        .await
+}
+
+/// Same construction as [`create_building_embedding_with_parquet`], but the
+/// catalog row's own `dimensions` column is `catalog_dims` — independent of
+/// the Parquet's PHYSICAL vector width, which is always [`DIMS`] here. Lets a
+/// test manufacture the degenerate `dimensions == 0` / `NULL` catalog state
+/// (esc-484) without needing a real zero-width vector column, which nothing
+/// downstream of `classify_expired_row`'s `dimensions == 0` early return ever
+/// reads.
+async fn create_building_embedding_with_parquet_and_catalog_dims(
+    store: &ResultStore,
+    source_id: &str,
+    n: usize,
+    catalog_dims: Option<i32>,
+) -> BuildingTable {
     let info = store
         .create_table(
             source_id,
@@ -140,7 +157,7 @@ async fn create_building_embedding_with_parquet(
             ResultTableKind::Model,
             None,
             "test-model",
-            Some(DIMS as i32),
+            catalog_dims,
             Some("_row_id"),
             None,
         )
@@ -362,6 +379,10 @@ async fn dry_run_previews_promote_arm_reclaim_of_a_stale_second_segment() {
 
     backdate_dir(&table_dir, Duration::from_secs(3600));
 
+    #[cfg(feature = "test-hooks")]
+    let mismatch_before =
+        jammi_db::store::reconcile_test_hooks::promote_arm_reclaim_mismatch_count();
+
     let dry = store
         .reconcile(ReconcileOptions {
             apply: false,
@@ -443,6 +464,21 @@ async fn dry_run_previews_promote_arm_reclaim_of_a_stale_second_segment() {
         dry.bytes_reclaimed, apply.bytes_reclaimed,
         "{dry:?} vs {apply:?}"
     );
+
+    // esc-484 (#484 follow-up): `classify_expired_row`'s prediction and the
+    // rebuild's ACTUAL deletion must agree on this reproducer — the
+    // ERROR-level "promote-arm reclaim mismatch" branch must never fire.
+    // Before the fix, `keeps`/`reclaims` were diffed against
+    // `referenced_result_keys`'s protect-side superset (which also carries
+    // each segment's phantom base `index_path` key), so this branch fired on
+    // EVERY promote-with-reclaim case despite the dry-run/apply parity
+    // asserted above staying green.
+    #[cfg(feature = "test-hooks")]
+    assert_eq!(
+        jammi_db::store::reconcile_test_hooks::promote_arm_reclaim_mismatch_count(),
+        mismatch_before,
+        "classify_expired_row's prediction must match the rebuild's actual deletion"
+    );
 }
 
 /// One segment already appended, but the row's CURRENT Parquet carries ZERO
@@ -479,6 +515,10 @@ async fn dry_run_previews_promote_arm_reclaim_of_a_stale_segment_over_a_zero_row
     let seg0_files = segment_sidecar_files(&table_dir, &table_name, 0);
 
     backdate_dir(&table_dir, Duration::from_secs(3600));
+
+    #[cfg(feature = "test-hooks")]
+    let mismatch_before =
+        jammi_db::store::reconcile_test_hooks::promote_arm_reclaim_mismatch_count();
 
     let dry = store
         .reconcile(ReconcileOptions {
@@ -549,6 +589,147 @@ async fn dry_run_previews_promote_arm_reclaim_of_a_stale_segment_over_a_zero_row
     assert_eq!(
         dry.bytes_reclaimed, apply.bytes_reclaimed,
         "{dry:?} vs {apply:?}"
+    );
+
+    // esc-484 (#484 follow-up): same oracle as the two-segment sibling above
+    // — the classify/perform mismatch branch must never fire on this
+    // zero-row reproducer either.
+    #[cfg(feature = "test-hooks")]
+    assert_eq!(
+        jammi_db::store::reconcile_test_hooks::promote_arm_reclaim_mismatch_count(),
+        mismatch_before,
+        "classify_expired_row's prediction must match the rebuild's actual deletion"
+    );
+}
+
+/// esc-484 follow-up: a `dimensions == 0` catalog row is the SAME early
+/// return `rebuild_index_from_parquet` itself takes — `purge_segments` is
+/// never even called, so the row's WHOLE current segment set is left
+/// exactly where it is. `classify_expired_row`'s `keeps` gate must mirror
+/// that early return, not just the `is_embedding` / row-count pair: a stale
+/// segment's sidecars must never be previewed OR actually reclaimed for such
+/// a row, in EITHER mode.
+#[tokio::test]
+async fn dimensions_zero_row_is_untouched_for_reclaim_in_both_modes() {
+    let dir = tempdir().unwrap();
+    let catalog = Arc::new(Catalog::open(dir.path()).await.unwrap());
+    let store = ResultStore::new(dir.path(), Arc::clone(&catalog), AnnIndexConfig::default())
+        .unwrap()
+        .with_lease_intervals(short_lease());
+
+    // Catalog `dimensions = 0` (the degenerate/NULL-ish boundary), a valid
+    // 5-row Parquet, and TWO stale segments appended anyway (the shape a
+    // crash right before `dimensions` was ever meaningfully set could
+    // leave). Two segments — not one — so a `keeps` gate that mirrors only
+    // `is_embedding && row_count > 0` (dropping the `dimensions == 0` early
+    // return) is distinguishable from the correct gate: such a gate would
+    // still add segment 0 to `keeps` (mistaking this row for the ordinary
+    // "rewrite segment 0" case) while leaving segment 1 as a predicted
+    // reclaim — a real disagreement with the actual rebuild, which never
+    // purges ANYTHING for a `dimensions == 0` row.
+    let info = create_building_embedding_with_parquet_and_catalog_dims(
+        &store,
+        "docs-dims-zero",
+        5,
+        Some(0),
+    )
+    .await;
+    info.append_segment(&built_segment_index(2)).await.unwrap();
+    info.append_segment(&built_segment_index(3)).await.unwrap();
+    jammi_test_utils::write_manifest_sidecar_for(
+        &store,
+        info.parquet_url(),
+        "docs-dims-zero",
+        DIMS,
+    )
+    .await;
+    let parquet_local = info
+        .parquet_url()
+        .as_str()
+        .trim_start_matches("file://")
+        .to_string();
+    let table_dir = std::path::Path::new(&parquet_local)
+        .parent()
+        .unwrap()
+        .to_path_buf();
+    let table_name = jammi_test_utils::abandon_building(&catalog, info).await;
+
+    let seg0_files = segment_sidecar_files(&table_dir, &table_name, 0);
+    let seg1_files = segment_sidecar_files(&table_dir, &table_name, 1);
+
+    backdate_dir(&table_dir, Duration::from_secs(3600));
+
+    #[cfg(feature = "test-hooks")]
+    let mismatch_before =
+        jammi_db::store::reconcile_test_hooks::promote_arm_reclaim_mismatch_count();
+
+    let dry = store
+        .reconcile(ReconcileOptions {
+            apply: false,
+            grace: Duration::from_secs(3),
+        })
+        .await
+        .unwrap();
+
+    for (name, _) in seg0_files.iter().chain(seg1_files.iter()) {
+        assert!(
+            !dry.orphans.iter().any(|o| o.ends_with(name.as_str())),
+            "dimensions == 0: nothing about the current segment set is ever touched, so a \
+             dry-run must never preview it as reclaimed: {dry:?}"
+        );
+    }
+    assert_eq!(
+        dry.bytes_reclaimed, 0,
+        "dimensions == 0: no bytes are ever reclaimed from this row: {dry:?}"
+    );
+
+    let apply = store
+        .reconcile(ReconcileOptions {
+            apply: true,
+            grace: Duration::from_secs(3),
+        })
+        .await
+        .unwrap();
+
+    let promoted = store
+        .catalog()
+        .get_result_table(&table_name)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        promoted.status,
+        jammi_db::catalog::status::ResultTableStatus::Ready.to_string(),
+        "a dimensions == 0 row is still promoted, never reaped: {apply:?}"
+    );
+    for (name, _) in seg0_files.iter().chain(seg1_files.iter()) {
+        assert!(
+            table_dir.join(name).exists(),
+            "dimensions == 0: apply must never delete stale sidecar '{name}' — \
+             `rebuild_index_from_parquet` never calls `purge_segments` at all for this row"
+        );
+    }
+    let segs = store
+        .catalog()
+        .list_index_segments(&table_name)
+        .await
+        .unwrap();
+    assert_eq!(
+        segs.len(),
+        2,
+        "both stale segments' catalog rows must survive untouched too: {segs:?}"
+    );
+
+    assert_eq!(dry.orphans, apply.orphans, "{dry:?} vs {apply:?}");
+    assert_eq!(
+        dry.bytes_reclaimed, apply.bytes_reclaimed,
+        "{dry:?} vs {apply:?}"
+    );
+    #[cfg(feature = "test-hooks")]
+    assert_eq!(
+        jammi_db::store::reconcile_test_hooks::promote_arm_reclaim_mismatch_count(),
+        mismatch_before,
+        "classify_expired_row's prediction must match the rebuild's actual (non-)deletion"
     );
 }
 
@@ -673,6 +854,179 @@ async fn classify_expired_row_never_collapses_reap_promote_and_untouched() {
                 .unwrap()
         )),
         "the Promote row's Parquet must never be credited as reclaimed: {apply:?}"
+    );
+}
+
+/// esc-484 item "manifest vanished between classify and perform": a row
+/// genuinely classified `Promote` (valid Parquet AND manifest sidecar both
+/// present at classify time) whose manifest sidecar is deleted out from
+/// under `reconcile_expired_building_row` in the exact window between that
+/// classification and its own re-read must re-classify to `Reap` — never
+/// abort the whole pass, and never a manifest-less promotion. Pinned
+/// directly via the `reconcile_test_hooks` rendezvous (never merely
+/// inferred): the manifest truly exists when `classify_expired_row` reads
+/// it, and is deleted only once the pass has parked at the documented
+/// re-read point.
+#[cfg(feature = "test-hooks")]
+#[tokio::test]
+async fn manifest_vanished_between_classify_and_perform_re_classifies_to_reap() {
+    let dir = tempdir().unwrap();
+    let catalog = Arc::new(Catalog::open(dir.path()).await.unwrap());
+    let store = ResultStore::new(dir.path(), Arc::clone(&catalog), AnnIndexConfig::default())
+        .unwrap()
+        .with_lease_intervals(short_lease());
+
+    let (table_name, parquet_local) =
+        promotable_building_row_fixture(&store, &catalog, "docs-manifest-race").await;
+    let manifest_path = parquet_local.replace(".parquet", ".materialization.json");
+    assert!(
+        std::path::Path::new(&manifest_path).exists(),
+        "fixture sanity: the manifest sidecar must exist before the race"
+    );
+
+    let race = jammi_db::store::reconcile_test_hooks::arm_manifest_vanish_race(&table_name);
+    let store_clone = store.clone();
+    let handle = tokio::spawn(async move {
+        store_clone
+            .reconcile(ReconcileOptions {
+                apply: true,
+                grace: Duration::from_secs(3),
+            })
+            .await
+    });
+
+    race.wait_parked().await;
+    assert!(
+        race.is_parked(),
+        "the recovery pass never reached the documented manifest re-read point"
+    );
+    std::fs::remove_file(&manifest_path).unwrap();
+    race.release();
+
+    let report = handle.await.unwrap().unwrap();
+
+    let row = store
+        .catalog()
+        .get_result_table(&table_name)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        row.status,
+        jammi_db::catalog::status::ResultTableStatus::Failed.to_string(),
+        "a manifest that vanished between classify and perform must re-classify to Reap, never \
+         a manifest-less promotion: {report:?}"
+    );
+    assert!(
+        !std::path::Path::new(&parquet_local).exists(),
+        "the re-classified Reap arm must actually delete the Parquet"
+    );
+}
+
+/// esc-484 item (c): a catalog `index_segments` row whose `index_path` does
+/// not even parse as a [`jammi_db::storage::StorageUrl`] is corruption —
+/// `purge_segments` must hard-error rather than silently skip past it,
+/// so the caller (here, `abort`) learns loudly that this table's segment
+/// set could not be enumerated.
+#[tokio::test]
+async fn purge_segments_errors_on_an_unparseable_index_path() {
+    let dir = tempdir().unwrap();
+    let catalog = Arc::new(Catalog::open(dir.path()).await.unwrap());
+    let store = ResultStore::new(dir.path(), Arc::clone(&catalog), AnnIndexConfig::default())
+        .unwrap()
+        .with_lease_intervals(short_lease());
+
+    let info = store
+        .create_table(
+            "docs-bad-segment-path",
+            ModelTask::TextEmbedding,
+            ResultTableKind::Model,
+            None,
+            "test-model",
+            Some(DIMS as i32),
+            Some("_row_id"),
+            None,
+        )
+        .await
+        .unwrap();
+    // A raw catalog row naming a scheme `StorageUrl::parse` does not know —
+    // the shape of on-disk/catalog corruption, never something a real
+    // `append_segment` call could produce.
+    let inserted = catalog
+        .insert_index_segment(&info.cas(), 0, "bogus-scheme://wherever/seg0", 5)
+        .await
+        .unwrap();
+    assert!(inserted, "fixture sanity: the segment row must land");
+
+    let err = info.abort().await.unwrap_err();
+    let message = err.to_string();
+    assert!(
+        message.contains("unparseable index_path"),
+        "expected purge_segments' own corruption error, got: {message}"
+    );
+}
+
+/// esc-484 item (c): a REAL `delete_if_exists` I/O failure (never a mere
+/// 404) during `abort`'s byte cleanup must surface as ONE aggregated error
+/// naming every key that failed to delete — not a silent `Ok(())` over a
+/// half-cleaned row. Manufactured with an unwritable table directory
+/// (`chmod 555`), which makes `unlink` fail with `EACCES` for every object
+/// underneath, rather than any storage-failure test hook (none exists for
+/// this path today).
+#[tokio::test]
+async fn abort_aggregates_a_real_delete_failure_into_one_error() {
+    let dir = tempdir().unwrap();
+    let catalog = Arc::new(Catalog::open(dir.path()).await.unwrap());
+    let store = ResultStore::new(dir.path(), Arc::clone(&catalog), AnnIndexConfig::default())
+        .unwrap()
+        .with_lease_intervals(short_lease());
+
+    let info = create_building_embedding_with_parquet(&store, "docs-abort-fail", 3).await;
+    info.append_segment(&built_segment_index(2)).await.unwrap();
+    let table_name = info.table_name().to_string();
+    let parquet_local = info
+        .parquet_url()
+        .as_str()
+        .trim_start_matches("file://")
+        .to_string();
+    let table_dir = std::path::Path::new(&parquet_local)
+        .parent()
+        .unwrap()
+        .to_path_buf();
+
+    // Deleting a file requires WRITE permission on its containing
+    // directory (POSIX `unlink` semantics) — strip it so every
+    // `delete_if_exists` underneath fails with a real I/O error, never a
+    // 404.
+    use std::os::unix::fs::PermissionsExt;
+    std::fs::set_permissions(&table_dir, std::fs::Permissions::from_mode(0o555)).unwrap();
+
+    let result = info.abort().await;
+
+    // Restore write permission unconditionally (before any assertion can
+    // panic) so the tempdir's own Drop can clean up.
+    std::fs::set_permissions(&table_dir, std::fs::Permissions::from_mode(0o755)).unwrap();
+
+    let err = result.unwrap_err();
+    let message = err.to_string();
+    assert!(
+        message.contains("abort:") && message.contains("object delete(s) failed"),
+        "expected abort's aggregated-failure error, got: {message}"
+    );
+    assert!(
+        std::path::Path::new(&parquet_local).exists(),
+        "a real delete failure must leave the Parquet in place for reconcile to retry"
+    );
+    let row = store
+        .catalog()
+        .get_result_table(&table_name)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        row.status,
+        jammi_db::catalog::status::ResultTableStatus::Failed.to_string(),
+        "abort's own CAS still flips the row to failed — only the byte cleanup is incomplete"
     );
 }
 

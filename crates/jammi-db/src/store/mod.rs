@@ -296,6 +296,163 @@ pub(crate) enum ExpiredRowOutcome {
     Untouched,
 }
 
+/// [`ResultStore::rebuild_index_from_parquet`]'s `Err` payload (esc-484 item
+/// (b)): the underlying error, PAIRED with the root-relative keys its own
+/// `purge_segments` call had already deleted before whatever failed next
+/// (reading the Parquet's batches, decoding a vector, writing the fresh
+/// segment). Empty `purged` when `purge_segments` itself is what failed —
+/// nothing is known to have been deleted in that case. The sole caller
+/// ([`ResultStore::reconcile_expired_building_row`]) credits `purged` into
+/// its own reclaim accounting even on this `Err` arm: those bytes are gone
+/// from storage regardless of what failed downstream of the purge, and
+/// losing track of them here would silently under-report what a
+/// half-completed rebuild actually reclaimed.
+struct RebuildFailure {
+    error: JammiError,
+    purged: BTreeSet<String>,
+}
+
+/// Test-only introspection into the promote arm's classify/perform
+/// agreement (esc-484 / #484): [`ResultStore::classify_expired_row`]'s
+/// `keeps`/`reclaims` prediction and [`ResultStore::reconcile_expired_building_row`]'s
+/// ACTUAL rebuild deletion are derived from the SAME deletion-side
+/// enumeration ([`ResultStore::segment_ann_sidecar_keys`]) and must always
+/// agree; this counter is incremented on the rare disagreement so a test can
+/// assert it directly rather than scraping tracing output. Compiled only
+/// under `feature = "test-hooks"`; no production code path observes it.
+#[cfg(feature = "test-hooks")]
+pub mod reconcile_test_hooks {
+    use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+
+    static PROMOTE_ARM_RECLAIM_MISMATCH_COUNT: AtomicU64 = AtomicU64::new(0);
+
+    pub(super) fn record_promote_arm_reclaim_mismatch() {
+        PROMOTE_ARM_RECLAIM_MISMATCH_COUNT.fetch_add(1, Ordering::SeqCst);
+    }
+
+    /// The current mismatch count, process-wide (never reset — a test reads
+    /// it before and after the case under test and compares, since a sibling
+    /// test in the same binary may already have incremented it).
+    pub fn promote_arm_reclaim_mismatch_count() -> u64 {
+        PROMOTE_ARM_RECLAIM_MISMATCH_COUNT.load(Ordering::SeqCst)
+    }
+
+    use std::sync::{Arc, Mutex};
+
+    use tokio::sync::Notify;
+
+    /// One-shot rendezvous state for [`arm_manifest_vanish_race`], keyed by
+    /// table name so only the armed table's own recovery pass ever parks.
+    struct RaceState {
+        table_name: String,
+        parked: Arc<AtomicBool>,
+        parked_notify: Arc<Notify>,
+        release: Arc<Notify>,
+        released: Arc<AtomicBool>,
+    }
+
+    static ARM: Mutex<Option<RaceState>> = Mutex::new(None);
+
+    /// The test's handle on an armed manifest-vanish race: wait for the
+    /// recovery pass to park, then release it. Dropping the handle releases
+    /// a parked writer (if any) so a panicking test never hangs the pass out
+    /// to [`maybe_park_before_manifest_reread`]'s bound.
+    pub struct ManifestVanishRace {
+        parked: Arc<AtomicBool>,
+        parked_notify: Arc<Notify>,
+        release: Arc<Notify>,
+        released: Arc<AtomicBool>,
+    }
+
+    /// Arm the esc-484 "manifest vanished between classify and perform" race
+    /// for `table_name`: the next time
+    /// [`super::ResultStore::reconcile_expired_building_row`]'s `Promote` arm
+    /// reaches [`maybe_park_before_manifest_reread`] for THIS table, it parks
+    /// (bounded to 30s) until [`ManifestVanishRace::release`] — the window in
+    /// which a test can delete the row's manifest sidecar out from under it,
+    /// pinning the exact TOCTOU the production re-read guards against.
+    /// Replaces any previous arm.
+    pub fn arm_manifest_vanish_race(table_name: &str) -> ManifestVanishRace {
+        let state = RaceState {
+            table_name: table_name.to_string(),
+            parked: Arc::new(AtomicBool::new(false)),
+            parked_notify: Arc::new(Notify::new()),
+            release: Arc::new(Notify::new()),
+            released: Arc::new(AtomicBool::new(false)),
+        };
+        let handle = ManifestVanishRace {
+            parked: Arc::clone(&state.parked),
+            parked_notify: Arc::clone(&state.parked_notify),
+            release: Arc::clone(&state.release),
+            released: Arc::clone(&state.released),
+        };
+        *ARM.lock().expect("reconcile test-hook arm lock") = Some(state);
+        handle
+    }
+
+    impl ManifestVanishRace {
+        /// Wait (bounded to 5s) until the recovery pass has parked at the
+        /// armed point.
+        pub async fn wait_parked(&self) {
+            let notified = self.parked_notify.notified();
+            tokio::pin!(notified);
+            notified.as_mut().enable();
+            if self.parked.load(Ordering::SeqCst) {
+                return;
+            }
+            let _ = tokio::time::timeout(std::time::Duration::from_secs(5), notified).await;
+        }
+
+        /// Whether the recovery pass is currently parked at the armed
+        /// point.
+        pub fn is_parked(&self) -> bool {
+            self.parked.load(Ordering::SeqCst)
+        }
+
+        /// Release the parked pass (idempotent).
+        pub fn release(&self) {
+            self.released.store(true, Ordering::SeqCst);
+            self.release.notify_waiters();
+        }
+    }
+
+    impl Drop for ManifestVanishRace {
+        fn drop(&mut self) {
+            self.release();
+        }
+    }
+
+    /// Park if a [`ManifestVanishRace`] is armed for `table_name` (a no-op
+    /// otherwise, and a no-op for every other test/production build). Called
+    /// by `reconcile_expired_building_row`'s `Promote` arm right after
+    /// `classify_expired_row` returns `Promote` for this row, immediately
+    /// before its own re-read of the manifest sidecar — the exact window the
+    /// esc-484 race lands in.
+    pub(super) async fn maybe_park_before_manifest_reread(table_name: &str) {
+        let taken = {
+            let mut slot = ARM.lock().expect("reconcile test-hook arm lock");
+            if slot.as_ref().is_some_and(|s| s.table_name == table_name) {
+                slot.take()
+            } else {
+                None
+            }
+        };
+        let Some(state) = taken else {
+            return;
+        };
+        state.parked.store(true, Ordering::SeqCst);
+        state.parked_notify.notify_waiters();
+        if !state.released.load(Ordering::SeqCst) {
+            let released = state.release.notified();
+            tokio::pin!(released);
+            released.as_mut().enable();
+            if !state.released.load(Ordering::SeqCst) {
+                let _ = tokio::time::timeout(std::time::Duration::from_secs(30), released).await;
+            }
+        }
+    }
+}
+
 impl ResultStore {
     /// Construct a result-store rooted at a local artifact directory. The
     /// directory is created if absent. Roots result tables at
@@ -870,9 +1027,24 @@ impl ResultStore {
     /// ([`Self::reconcile_expired_building_row`]) and the dry-run preview
     /// share for what [`Self::rebuild_index_from_parquet`]'s destructive
     /// purge will and will not rewrite. Uses the SAME row-count oracle that
-    /// function itself branches on (`storage::reader::count_parquet_rows`),
-    /// never the row's stale catalog metadata, so a zero-row Parquet is
-    /// never assumed to carry a segment it does not.
+    /// function itself branches on (a single shared Parquet read via
+    /// [`storage::reader::validate_and_count_parquet_rows`]), never the
+    /// row's stale catalog metadata, so a zero-row Parquet is never assumed
+    /// to carry a segment it does not.
+    ///
+    /// The candidate set this diffs against `keeps` is
+    /// [`Self::segment_ann_sidecar_keys`] — the DELETION-side enumeration
+    /// [`Self::purge_segments`] itself deletes from — never
+    /// [`Self::referenced_result_keys`]'s `exact` set. The two have
+    /// different semantics and must never be differenced against one
+    /// another: `referenced_result_keys` is a protect-side superset that
+    /// ALSO inserts each segment's own base `index_path` key (a naming stem
+    /// no writer creates and no deleter deletes, there only so a listed
+    /// object under that stem is never mistaken for unattributed); a
+    /// promote-arm reclaim computed by differencing `keeps` out of THAT set
+    /// would carry that phantom base key as a "reclaim" forever, since
+    /// neither this classification nor the real `purge_segments` delete
+    /// ever touches it — exactly the esc-484 defect this fixes.
     async fn classify_expired_row(&self, table: &ResultTableRecord) -> Result<ExpiredRowOutcome> {
         let parquet_url = StorageUrl::parse(&table.parquet_path)?;
         let parquet_handle = self.open_parquet(&parquet_url)?;
@@ -880,9 +1052,15 @@ impl ResultStore {
         if !parquet_handle.exists(&parquet_path).await? {
             return Ok(ExpiredRowOutcome::Untouched);
         }
-        if !storage::reader::is_valid_parquet(&parquet_handle).await? {
-            return Ok(ExpiredRowOutcome::Reap);
-        }
+        // One fetch of the Parquet's bytes serves both the validity check
+        // and (only if valid) the row count `rebuild_index_from_parquet`
+        // itself branches on — never two round trips through the object
+        // store for the same file.
+        let row_count =
+            match storage::reader::validate_and_count_parquet_rows(&parquet_handle).await? {
+                None => return Ok(ExpiredRowOutcome::Reap),
+                Some(n) => n,
+            };
         if self
             .read_materialization_manifest(&parquet_url)
             .await?
@@ -900,33 +1078,84 @@ impl ResultStore {
                 keeps.insert(rel);
             }
         }
-        // `rebuild_index_from_parquet` rewrites a fresh segment 0 IF AND
-        // ONLY IF the table is an embedding task AND the Parquet carries at
-        // least one row — mirror BOTH conditions exactly.
-        if table.task.is_embedding()
-            && storage::reader::count_parquet_rows(&parquet_handle).await? > 0
-        {
-            let seg0_url = layout::segment_url(&parquet_url, 0)?;
-            if let Some(rel) = reconcile::relative_to(&self.root, &seg0_url) {
-                keeps.insert(rel);
+
+        // The deletion-side candidate set: every key `purge_segments` would
+        // attempt to delete for this table's CURRENT segment rows, right
+        // now.
+        let would_purge = self.segment_ann_sidecar_keys(&table.table_name).await?;
+
+        // Mirror BOTH of `rebuild_index_from_parquet`'s gates exactly: it
+        // calls `purge_segments` at all ONLY when the table is an embedding
+        // task AND its `dimensions` is nonzero (the function's own early
+        // `dimensions == 0` return skips the purge entirely) — a row that
+        // fails either condition has its whole current segment set left
+        // untouched, so every one of its candidate keys survives right
+        // where it is. Only when the purge WILL run does a fresh segment 0
+        // get rewritten at the same key, and only when the Parquet carries
+        // at least one row.
+        let dimensions = table.dimensions.unwrap_or(0);
+        let reclaims = if !(table.task.is_embedding() && dimensions != 0) {
+            keeps.extend(would_purge);
+            BTreeSet::new()
+        } else {
+            if row_count > 0 {
+                let seg0_url = layout::segment_url(&parquet_url, 0)?;
+                if let Some(rel) = reconcile::relative_to(&self.root, &seg0_url) {
+                    keeps.insert(rel);
+                }
+                for ext in storage::sidecar_layout::sidecar_extensions(SidecarKind::Ann) {
+                    if let Ok(sib) = layout::sidecar_url(&seg0_url, ext) {
+                        if let Some(rel) = reconcile::relative_to(&self.root, &sib) {
+                            keeps.insert(rel);
+                        }
+                    }
+                }
             }
+            would_purge.difference(&keeps).cloned().collect()
+        };
+
+        // Lexical directory-shaped prefixes are never a `purge_segments`
+        // candidate (it is ANN-only) — always kept, computed through the
+        // ordinary protect-side enumeration since there is no deletion-side
+        // equivalent to derive them from.
+        let dir_prefixes = self
+            .referenced_result_keys(std::slice::from_ref(table), &[])
+            .await?
+            .dir_prefixes;
+        Ok(ExpiredRowOutcome::Promote {
+            keeps,
+            reclaims,
+            dir_prefixes,
+        })
+    }
+
+    /// The root-relative ANN sidecar-sibling keys a table's CURRENT
+    /// `index_segments` rows name RIGHT NOW — the exact per-segment
+    /// enumeration [`Self::purge_segments`] deletes from and
+    /// [`Self::reap_candidate_keys`] previews (both call this rather than
+    /// hand-copying the loop). Never includes a segment's own base
+    /// `index_path` key: no writer creates a file there and no deleter ever
+    /// deletes one (see [`Self::classify_expired_row`]'s doc comment on why
+    /// that key must never be treated as a deletion-side candidate). A
+    /// segment whose `index_path` does not parse as a [`StorageUrl`] is
+    /// silently excluded here (this is a candidate PREVIEW, not the
+    /// destructive delete `purge_segments` performs — that still hard-errors
+    /// on the same row, per its own doc comment).
+    async fn segment_ann_sidecar_keys(&self, table_name: &str) -> Result<BTreeSet<String>> {
+        let mut keys = BTreeSet::new();
+        for seg in self.catalog.list_index_segments(table_name).await? {
+            let Ok(seg_url) = StorageUrl::parse(&seg.index_path) else {
+                continue;
+            };
             for ext in storage::sidecar_layout::sidecar_extensions(SidecarKind::Ann) {
-                if let Ok(sib) = layout::sidecar_url(&seg0_url, ext) {
+                if let Ok(sib) = layout::sidecar_url(&seg_url, ext) {
                     if let Some(rel) = reconcile::relative_to(&self.root, &sib) {
-                        keeps.insert(rel);
+                        keys.insert(rel);
                     }
                 }
             }
         }
-        let existing = self
-            .referenced_result_keys(std::slice::from_ref(table), &[])
-            .await?;
-        let reclaims: BTreeSet<String> = existing.exact.difference(&keeps).cloned().collect();
-        Ok(ExpiredRowOutcome::Promote {
-            keeps,
-            reclaims,
-            dir_prefixes: existing.dir_prefixes,
-        })
+        Ok(keys)
     }
 
     /// Returns the root-relative keys this row's objects were ACTUALLY
@@ -989,6 +1218,8 @@ impl ResultStore {
                 // abort the WHOLE reconcile pass over that race; re-classify
                 // this row as `Reap` (exactly what `classify_expired_row`
                 // itself would return with no manifest present) instead.
+                #[cfg(feature = "test-hooks")]
+                reconcile_test_hooks::maybe_park_before_manifest_reread(&table.table_name).await;
                 let Some(manifest) = self.read_materialization_manifest(&parquet_url).await? else {
                     warn!(
                         table = table.table_name,
@@ -1040,6 +1271,8 @@ impl ResultStore {
                             let actual: BTreeSet<String> =
                                 purged.difference(&keeps).cloned().collect();
                             if actual != reclaims {
+                                #[cfg(feature = "test-hooks")]
+                                reconcile_test_hooks::record_promote_arm_reclaim_mismatch();
                                 tracing::error!(
                                     table = table.table_name,
                                     predicted = ?reclaims,
@@ -1050,7 +1283,7 @@ impl ResultStore {
                             }
                             reclaimed = actual;
                         }
-                        Err(e) => {
+                        Err(RebuildFailure { error: e, purged }) => {
                             if is_cas_miss(&e) {
                                 warn!(table = table.table_name, outcome = %e, "Recovery: claim lost during rebuild; skipped");
                                 recovered.abandon();
@@ -1059,8 +1292,18 @@ impl ResultStore {
                             warn!(
                                 table = table.table_name,
                                 error = %e,
-                                "Recovery: failed to rebuild index, proceeding without"
+                                "Recovery: failed to rebuild index, proceeding without; \
+                                 crediting the segments its purge already deleted"
                             );
+                            // esc-484 item (b): a later step (reading the
+                            // Parquet's batches, building the index, writing
+                            // the fresh segment) can fail AFTER
+                            // `purge_segments` already ran — those bytes are
+                            // gone from storage regardless, so `purged` must
+                            // still be credited here, never dropped on the
+                            // floor because SOMETHING downstream of the
+                            // purge failed.
+                            reclaimed = purged.difference(&keeps).cloned().collect();
                         }
                     }
                 }
@@ -1594,18 +1837,7 @@ impl ResultStore {
                 keys.insert(rel);
             }
         }
-        for seg in self.catalog.list_index_segments(table_name).await? {
-            let Ok(seg_url) = StorageUrl::parse(&seg.index_path) else {
-                continue;
-            };
-            for ext in storage::sidecar_layout::sidecar_extensions(SidecarKind::Ann) {
-                if let Ok(sib) = layout::sidecar_url(&seg_url, ext) {
-                    if let Some(rel) = reconcile::relative_to(&self.root, &sib) {
-                        keys.insert(rel);
-                    }
-                }
-            }
-        }
+        keys.extend(self.segment_ann_sidecar_keys(table_name).await?);
         Ok(keys)
     }
 
@@ -1629,12 +1861,20 @@ impl ResultStore {
     /// never rewrites, for a zero-row Parquet) to compute what this
     /// promotion truly reclaims, checked against `classify_expired_row`'s
     /// prediction rather than assumed.
+    ///
+    /// On `Err`, the [`RebuildFailure`] payload carries the SAME `purged` set
+    /// alongside the error (esc-484 item (b)): `purge_segments` runs BEFORE
+    /// the Parquet is read and the fresh segment is built, so a later step
+    /// failing (a torn Parquet read, a bad vector, the segment write itself)
+    /// still leaves those bytes genuinely deleted from storage — the caller
+    /// must credit `purged` even when this returns `Err`, never only on
+    /// `Ok`.
     async fn rebuild_index_from_parquet(
         &self,
         recovered: &BuildingTable,
         parquet_handle: &JammiObjectStore,
         table: &ResultTableRecord,
-    ) -> Result<BTreeSet<String>> {
+    ) -> std::result::Result<BTreeSet<String>, RebuildFailure> {
         let dimensions = table.dimensions.unwrap_or(0) as usize;
         if dimensions == 0 {
             return Ok(BTreeSet::new());
@@ -1642,8 +1882,35 @@ impl ResultStore {
 
         // Replace any stale segment set from the interrupted attempt — a
         // deletion, so it runs under the claim the recoverer just took.
-        let purged = self.purge_segments(&recovered.cas()).await?;
+        let purged = self
+            .purge_segments(&recovered.cas())
+            .await
+            .map_err(|error| RebuildFailure {
+                error,
+                purged: BTreeSet::new(),
+            })?;
 
+        self.write_fresh_segment_zero(recovered, parquet_handle, table, dimensions)
+            .await
+            .map_err(|error| RebuildFailure {
+                error,
+                purged: purged.clone(),
+            })?;
+        Ok(purged)
+    }
+
+    /// The read-Parquet / build-index / write-segment-0 tail of
+    /// [`Self::rebuild_index_from_parquet`], split out so its ordinary `?`
+    /// short-circuiting stays readable — the caller is solely responsible
+    /// for pairing any error here with the `purged` set the destructive
+    /// purge already produced.
+    async fn write_fresh_segment_zero(
+        &self,
+        recovered: &BuildingTable,
+        parquet_handle: &JammiObjectStore,
+        table: &ResultTableRecord,
+        dimensions: usize,
+    ) -> Result<()> {
         let precision = table.storage_precision.unwrap_or_default();
         let batches = storage::reader::read_all_record_batches(parquet_handle).await?;
         let mut index = SidecarIndex::new(dimensions, &self.ann, precision)?;
@@ -1674,7 +1941,7 @@ impl ResultStore {
             index.build()?;
             recovered.append_segment(&index).await?;
         }
-        Ok(purged)
+        Ok(())
     }
 
     /// Materialise pre-pooled per-key vectors into a normal embedding-shaped

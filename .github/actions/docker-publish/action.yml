@@ -132,6 +132,40 @@ runs:
           exit 1
         fi
 
+    # Self-check: an explicitly-passed-but-empty `--build-arg NAME=` silently
+    # overrides a Dockerfile ARG's own default with blank -- for a global ARG
+    # consumed by a FROM line, BuildKit fails closed on that ("base name
+    # should not be blank"), but a build-arg feeding anything else (a RUN, an
+    # ENV) would instead blank the value silently and keep building. Refuse
+    # closed here, naming the arg, rather than letting either failure mode
+    # happen downstream: `build-args` is a caller-controlled multi-line
+    # `KEY=VALUE` block (this action's own doc above), so a blank VALUE is
+    # always a caller bug -- a build-arg the caller genuinely doesn't need to
+    # override should be OMITTED (the Dockerfile's own default applies), never
+    # passed empty.
+    - name: Refuse an empty build-arg value
+      shell: bash
+      env:
+        BUILD_ARGS: ${{ inputs.build-args }}
+      run: |
+        set -euo pipefail
+        while IFS= read -r line; do
+          [ -n "$line" ] || continue
+          case "$line" in
+            *=*) ;;
+            *)
+              echo "::error::build-args line '$line' is not KEY=VALUE" >&2
+              exit 1
+              ;;
+          esac
+          name="${line%%=*}"
+          value="${line#*=}"
+          if [ -z "$value" ]; then
+            echo "::error::build-arg '$name' was passed with an empty value -- this silently overrides the Dockerfile's own ARG default with blank; omit the line entirely if the caller doesn't need to override it, or pass a real value" >&2
+            exit 1
+          fi
+        done <<< "$BUILD_ARGS"
+
     - name: Set up Docker Buildx
       uses: docker/setup-buildx-action@8d2750c68a42422c14e847fe6c8ac0403b4cbd6f # v3.12.0
 

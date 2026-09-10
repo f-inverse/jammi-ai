@@ -20,10 +20,24 @@ ARG RUNTIME_VARIANT=runtime-generic
 # mutable `:latest` index each default names, exactly the pre-arm64 behavior;
 # CI overrides both with a digest-pinned ref resolved once per run
 # (`resolve-base`/`resolve-ci-image`, one read, no repo-variable write, no
-# PAT) so every leg of one release build shares one toolchain. Each is
-# redeclared inside its own builder stage below (a pre-FROM global ARG does
-# not cross a FROM boundary) so `--build-arg BASE_IMAGE[_CUDA]=...` is seen
-# there.
+# PAT) so every leg of one release build shares one toolchain.
+#
+# BASE_IMAGE feeds the very next FROM (immediately below, the first FROM in
+# this file) so this single declaration -- default AND all -- is already in
+# scope for it; a Dockerfile MUST NOT redeclare `ARG BASE_IMAGE` a second
+# time before that FROM. A bare `ARG BASE_IMAGE` with no `=value` there would
+# be a second pre-first-FROM declaration of the same name, and BuildKit
+# resolves a FROM's base name against the LAST such declaration -- a
+# no-default second one silently blanks the default from the line above,
+# even for a build whose target stage never depends on `builder` (BuildKit
+# resolves every stage's FROM name up front, before dead-stage pruning, so a
+# blank base name here fails any build that never even reaches this stage).
+# BASE_IMAGE_CUDA, by contrast, feeds `builder-cuda`'s FROM below, which is
+# NOT the first FROM in the file -- a pre-FROM global ARG does not cross a
+# FROM boundary, so BASE_IMAGE_CUDA is correctly redeclared (bare, no
+# `=value`) right before that later FROM, inside the `builder` stage's span,
+# where it is the FIRST and only redeclaration of that name and safely
+# reimports the default set here.
 ARG BASE_IMAGE=ghcr.io/f-inverse/jammi-ai-ci:latest
 ARG BASE_IMAGE_CUDA=ghcr.io/f-inverse/jammi-ai-ci-cuda:latest
 
@@ -34,7 +48,6 @@ ARG BASE_IMAGE_CUDA=ghcr.io/f-inverse/jammi-ai-ci-cuda:latest
 # inherits that update lockstep with the workspace. `:latest` now resolves
 # to a multi-arch index (linux/amd64 + linux/arm64); each puller's own
 # container runtime selects the manifest matching its own host arch.
-ARG BASE_IMAGE
 FROM ${BASE_IMAGE} AS builder
 
 WORKDIR /workspace

@@ -204,7 +204,9 @@ USER nonroot:nonroot
 # `/etc/jammi/jammi.toml`, the platform config dir, finally the built-in
 # defaults) finds the file baked above at `/etc/jammi/jammi.toml` on its
 # third step — the same chain `runtime-generic` walks, just with one more
-# candidate present on disk. A bind-mounted `/jammi.toml` would outrank it.
+# candidate present on disk. A bind-mounted `/jammi.toml`, or `JAMMI_CONFIG`
+# pointing at a mounted config file elsewhere, would each outrank it (both
+# precede `./jammi.toml` in the chain above).
 CMD ["serve"]
 
 # ---- runtime: cuda ----

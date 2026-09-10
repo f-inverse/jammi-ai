@@ -7,11 +7,15 @@ name: Compose smoke (Shape B)
 # compose file, the image's env-only config resolution, and a restart's
 # result durability together, not any one of them in isolation.
 #
-# Deliberately NOT run on every PR: a cold CPU image build (Dockerfile:28-32)
-# runs ~30 minutes even with cache, a cost not worth paying on every push to
-# every branch. It runs on every push to `main` (catches a regression the
-# moment it lands), nightly (catches drift with no code change at all — a
-# base-image CVE fix, a dependency bump), and on demand
+# Deliberately NOT run on every PR: not because the build is slow (a warm
+# rebuild is ~3 minutes, Dockerfile:27-29 — the ~30-minute figure only
+# applies to a cold gha cache), but because the per-PR lanes already build
+# and test the binary itself, and a Docker + Postgres + JetStream stack on
+# every push to every branch is runner-minute cost with no incremental
+# coverage over the already-cached-build case. It runs on every push to
+# `main` (catches a regression the moment it lands), nightly (catches drift
+# with no code change at all — a base-image CVE fix, a dependency bump), and
+# on demand
 # (`workflow_dispatch`, the pre-merge proof a human runs against a PR branch
 # before merging a compose/Dockerfile change). It reports to no `ci-summary`
 # job — that job gates the PR merge path, and this workflow deliberately does
@@ -42,6 +46,23 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
+      - name: Generate the ephemeral compose env (job-wide)
+        run: |
+          set -euo pipefail
+          # Compose interpolates `${JAMMI_AUDIT_MASTER_KEY:?…}` against every
+          # subcommand this job runs, not just "up" — `ps -q`, `logs`,
+          # `down -v`, and the smoke script's own `docker compose restart`
+          # all fail the same "required variable ... is missing a value"
+          # unless the key is in the environment for the whole job. Generate
+          # it once here and export it via `$GITHUB_ENV` so every later step
+          # (including the ones the Python script subprocesses) inherits it.
+          # A synthetic key for this ephemeral, throwaway compose stack —
+          # never a real deployment secret.
+          key="$(openssl rand -hex 32)"
+          echo "::add-mask::${key}"
+          echo "JAMMI_AUDIT_MASTER_KEY=${key}" >> "$GITHUB_ENV"
+          echo "JAMMI_IMAGE=jammi-ai-server:pr" >> "$GITHUB_ENV"
+
       - name: Build the CPU image (load, no push)
         uses: ./.github/actions/docker-publish
         with:
@@ -57,18 +78,11 @@ jobs:
           cache-scope: cpu
 
       - name: Bring up Shape B (server + Postgres + JetStream)
-        env:
-          JAMMI_IMAGE: jammi-ai-server:pr
-          # A synthetic key for this ephemeral, throwaway compose stack —
-          # never a real deployment secret.
-          JAMMI_AUDIT_MASTER_KEY: compose-smoke-ephemeral-key
         run: |
           set -euo pipefail
           docker compose -f deploy/docker-compose.yml -f deploy/docker-compose.ci.yml up --wait
 
       - name: Assert the running container is the image this job built
-        env:
-          JAMMI_IMAGE: jammi-ai-server:pr
         run: |
           set -euo pipefail
           built_id="$(docker image inspect --format '{{.Id}}' "$JAMMI_IMAGE")"
@@ -94,9 +108,18 @@ jobs:
           make -C clients/python generate
 
       - name: Run the remote Shape B smoke script
-        env:
-          JAMMI_IMAGE: jammi-ai-server:pr
         run: python3 tests/compose/shape_b_remote.py
+
+      - name: Assert the Postgres catalog and JetStream broker were exercised at runtime
+        run: |
+          set -euo pipefail
+          catalog_count="$(docker compose -f deploy/docker-compose.yml -f deploy/docker-compose.ci.yml exec -T postgres \
+            psql -U jammi -d jammi -tAc 'select count(*) from sources')"
+          echo "postgres catalog sources row count: ${catalog_count}"
+          if [ "${catalog_count}" -lt 1 ]; then
+            echo "::error::expected at least 1 row in the Postgres 'sources' table after shape_b_remote.py's add_source call, got ${catalog_count} -- the compose file's JAMMI_CATALOG__POSTGRES__URL is not actually backing the catalog" >&2
+            exit 1
+          fi
 
       - name: Dump compose logs on failure
         if: failure()

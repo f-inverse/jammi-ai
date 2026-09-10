@@ -9,14 +9,19 @@ brought the stack up healthy. Deliberately outside `tests/uat/` — ci.yml's
 on every PR against the EMBEDDED engine; this script needs a running remote
 server + Postgres + JetStream, which only this workflow provisions.
 
-Connects to the published gRPC/Flight SQL ports (8081), registers the
+Connects to the published gRPC/Flight SQL ports (8081), asserts the running
+deployment's `get_server_info().broker` is actually `"jet_stream"` (a
+runtime oracle — the compile-time `features` list alone would still pass
+with the JetStream URL deleted from the compose file), registers the
 bundled `patents.parquet` fixture (bind-mounted by the CI compose override
 at `/fixtures/patents.parquet`), embeds one column with the bundled
 `tiny_bert` fixture, searches for the stored vector's own nearest neighbor
 (an exact self-hit), restarts the server container, and repeats the same
 search — asserting the segment bundle on the Postgres-backed volume survives
 a restart untouched (Shape B durability), not merely that the server
-answers again.
+answers again. The workflow (`.github/workflows/compose-smoke.yml`) queries
+the Postgres container directly after this script exits, as the matching
+runtime oracle for the catalog side.
 
 Every assertion prints what it compared before raising, so a CI failure log
 shows the mismatch without a re-run.
@@ -95,9 +100,26 @@ def run(target: str, health_url: str) -> int:
     db = jammi.connect(target)
 
     info = db.get_server_info()
+
+    # Compile-time capability check only: this build was compiled with the
+    # jetstream-broker feature. It does NOT prove the RUNNING deployment is
+    # actually using JetStream as its broker -- deleting the broker URL from
+    # the compose file would still leave this assertion passing.
     features = info["features"]
     assert "jetstream-broker" in features, (
         f"expected 'jetstream-broker' in get_server_info().features, got {features}"
+    )
+
+    # Runtime oracle: the broker this session is ACTUALLY running, per
+    # `BrokerKind::as_str` (crates/jammi-db/src/trigger/broker.rs). Unlike
+    # `features` above, this would fail if the compose file's
+    # `JAMMI_BROKER__JET_STREAM__URL` were deleted (the server would fall
+    # back to the in-memory broker and report `"in_memory"` here instead).
+    broker = info["broker"]
+    assert broker == "jet_stream", (
+        f"expected get_server_info().broker == 'jet_stream', got {broker!r} -- "
+        "the running deployment is not actually backed by the compose file's "
+        "JetStream service"
     )
 
     db.add_source("patents", url=SOURCE_URL, format="parquet")
@@ -189,6 +211,7 @@ def main() -> int:
         print(f"  health url   = {args.health_url}")
         print(f"  source url   = {SOURCE_URL}")
         print(f"  model        = {MODEL}")
+        print("  assert get_server_info().broker == \"jet_stream\"")
         print("  add_source(\"patents\", url=SOURCE_URL, format=\"parquet\")")
         print("  SELECT count(*) FROM patents.public.patents")
         print(

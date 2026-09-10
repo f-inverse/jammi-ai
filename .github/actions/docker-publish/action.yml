@@ -95,6 +95,19 @@ outputs:
 runs:
   using: composite
   steps:
+    - name: Validate load/push/local-tag combination
+      shell: bash
+      run: |
+        set -euo pipefail
+        if [ "${{ inputs.load }}" = "true" ] && [ -z "${{ inputs.local-tag }}" ]; then
+          echo "::error::load is \"true\" but local-tag is empty -- a load with no tag has nothing to load the image as" >&2
+          exit 1
+        fi
+        if [ "${{ inputs.load }}" = "true" ] && [ "${{ inputs.push }}" = "true" ]; then
+          echo "::error::load and push are both \"true\" -- mutually exclusive (see the load input's own description); push then pull instead" >&2
+          exit 1
+        fi
+
     - name: Set up Docker Buildx
       uses: docker/setup-buildx-action@8d2750c68a42422c14e847fe6c8ac0403b4cbd6f # v3.12.0
 

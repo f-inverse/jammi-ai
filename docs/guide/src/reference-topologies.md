@@ -64,8 +64,11 @@ through the same `JAMMI_<PATH>` layer every deployment shape uses:
 - `JAMMI_SERVER__SERVICES` — `all` here (every compiled-in service tier); see
   [Service tiers](./deploy-server.md#service-tiers) for narrower selections.
 - `JAMMI_AUDIT_MASTER_KEY` — read from `deploy/.env` (copy
-  `deploy/.env.example`); a missing key fails `docker compose up` loudly
-  rather than starting a server with signing disabled.
+  `deploy/.env.example`); an absent key makes Compose itself refuse to come
+  up (`${JAMMI_AUDIT_MASTER_KEY:?…}`) before the container ever starts.
+  Signing is not a "disabled" mode: it stays configured and, unset, only
+  fails at the first audit write; a present-but-malformed key instead makes
+  `jammi-server` refuse to start.
 
 The healthcheck is exec-form `jammi-server probe` (see [`jammi-server
 probe`](#the-jammi-server-probe-subcommand) below) — the runtime image is
@@ -279,6 +282,11 @@ spec:
         - name: config
           configMap: { name: jammi-server-config }
 ```
+
+`ghcr.io/f-inverse/jammi-ai-server-cu12:latest` tracks the latest **release**
+tag (`v*`) — it is published only alongside a tagged CPU release, never from
+`main` — whereas the CPU image's own `:latest` above tracks `main`. Pin an
+exact `:vX.Y.Z` tag for reproducible GPU-node deploys.
 
 Very high scale, specialized GPU pools, and a split compliance posture
 (query tier vs. training tier on separate node pools / network policies)

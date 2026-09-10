@@ -104,11 +104,24 @@ jobs:
           subject-digest: ${{ steps.publish.outputs.digest }}
           push-to-registry: true
 
-      - name: Assert provenance + SBOM attestations are attached
+      - name: Assert BuildKit provenance + SBOM are in the image index
         shell: bash
         env:
           REF: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}@${{ steps.publish.outputs.digest }}
         run: bash ci/scripts/assert_image_attestations.sh
+
+      # `assert_image_attestations.sh` above only proves BuildKit wrote
+      # attestation manifests into the image's own OCI index -- it never
+      # touches the Sigstore bundle the `attest-build-provenance` step just
+      # published as an OCI referrer (`push-to-registry: true`). Verify that
+      # bundle for real: `--bundle-from-oci` fetches it from the registry
+      # (GHCR login already happened above) rather than the GitHub API, and
+      # `--owner` pins the signing identity to this org.
+      - name: Verify the Sigstore attestation bundle (gh attestation verify)
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh attestation verify "oci://${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}@${{ steps.publish.outputs.digest }}" --owner f-inverse --bundle-from-oci
 
   # CPU image, tag arm: pushed from `v*` tag refs (semver tags) only — a tag
   # push, or a recovery dispatch run on the tag — behind the shared
@@ -148,11 +161,20 @@ jobs:
           subject-digest: ${{ steps.publish.outputs.digest }}
           push-to-registry: true
 
-      - name: Assert provenance + SBOM attestations are attached
+      - name: Assert BuildKit provenance + SBOM are in the image index
         shell: bash
         env:
           REF: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}@${{ steps.publish.outputs.digest }}
         run: bash ci/scripts/assert_image_attestations.sh
+
+      # See build-and-push-main's identical comment: the assert step above
+      # never verifies the Sigstore OCI-referrer bundle `attest-build-
+      # provenance` just published.
+      - name: Verify the Sigstore attestation bundle (gh attestation verify)
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh attestation verify "oci://${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}@${{ steps.publish.outputs.digest }}" --owner f-inverse --bundle-from-oci
 
   # Self-contained variant: opt-in, dispatch-only. Builds the
   # `runtime-selfcontained` stage (baked config + encoder) from the
@@ -200,11 +222,20 @@ jobs:
           subject-digest: ${{ steps.publish.outputs.digest }}
           push-to-registry: true
 
-      - name: Assert provenance + SBOM attestations are attached
+      - name: Assert BuildKit provenance + SBOM are in the image index
         shell: bash
         env:
           REF: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}@${{ steps.publish.outputs.digest }}
         run: bash ci/scripts/assert_image_attestations.sh
+
+      # See build-and-push-main's identical comment: the assert step above
+      # never verifies the Sigstore OCI-referrer bundle `attest-build-
+      # provenance` just published.
+      - name: Verify the Sigstore attestation bundle (gh attestation verify)
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh attestation verify "oci://${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}@${{ steps.publish.outputs.digest }}" --owner f-inverse --bundle-from-oci
 
   # CUDA image `jammi-ai-server-cu12`: pushed from `v*` tag refs only (tag
   # push, or a recovery dispatch run on the tag), always behind the shared
@@ -285,8 +316,16 @@ jobs:
         id: publish
         with:
           images: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME_CU12 }}
+          # `enable=true`, not `enable={{is_default_branch}}`: this job's own
+          # `if:` above already restricts every run to a `refs/tags/v*` push,
+          # so `is_default_branch` is always false here and `latest` would
+          # never publish. `latest` on THIS job means "the most recent
+          # release tag" (the CPU image's `:latest` above tracks main
+          # instead) -- `enable=true` makes that true unconditionally, which
+          # is correct because the job-level `if:` is the only gate `latest`
+          # needs.
           tags-spec: |
-            type=raw,value=latest,enable={{is_default_branch}}
+            type=raw,value=latest,enable=true
             type=semver,pattern={{version}}
             type=semver,pattern={{major}}.{{minor}}
             type=sha,format=long
@@ -303,11 +342,20 @@ jobs:
           subject-digest: ${{ steps.publish.outputs.digest }}
           push-to-registry: true
 
-      - name: Assert provenance + SBOM attestations are attached
+      - name: Assert BuildKit provenance + SBOM are in the image index
         shell: bash
         env:
           REF: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME_CU12 }}@${{ steps.publish.outputs.digest }}
         run: bash ci/scripts/assert_image_attestations.sh
+
+      # See build-and-push-main's identical comment: the assert step above
+      # never verifies the Sigstore OCI-referrer bundle `attest-build-
+      # provenance` just published.
+      - name: Verify the Sigstore attestation bundle (gh attestation verify)
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh attestation verify "oci://${{ env.REGISTRY }}/${{ env.IMAGE_NAME_CU12 }}@${{ steps.publish.outputs.digest }}" --owner f-inverse --bundle-from-oci
 
   # Build-only verification for the CUDA image on pull requests that touch the
   # Dockerfile or this workflow. GPU runtime can't be exercised in CI (no GPU on

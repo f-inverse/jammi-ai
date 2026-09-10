@@ -23,12 +23,44 @@ fi
 provenance="$(docker buildx imagetools inspect "$REF" --format '{{json .Provenance}}' 2>/dev/null || true)"
 sbom="$(docker buildx imagetools inspect "$REF" --format '{{json .SBOM}}' 2>/dev/null || true)"
 
-if [ -n "$provenance" ] && [ "$provenance" != "null" ] && [ -n "$sbom" ] && [ "$sbom" != "null" ]; then
+# `--format {{json .Provenance}}` / `{{json .SBOM}}` print the JSON literal
+# `{}` -- not `null`, not the empty string -- when the accessor's attestation
+# is absent, so presence must be a shape test, not a non-emptiness test on
+# the printed string. A multi-platform attestation is keyed by "os/arch"
+# (each value itself a non-empty object); a single-platform attestation is a
+# flat non-empty object. Either way, an absent attestation prints `{}`.
+non_empty_attestation() {
+  jq -e '
+    def is_platform_map: (type == "object") and (length > 0) and (to_entries | all(.value | type == "object"));
+    if is_platform_map then
+      (to_entries | all(.value | (type == "object") and (length > 0)))
+    else
+      (type == "object") and (length > 0)
+    end
+  ' >/dev/null 2>&1
+}
+
+provenance_ok=0
+sbom_ok=0
+if [ -n "$provenance" ] && printf '%s' "$provenance" | non_empty_attestation; then
+  provenance_ok=1
+fi
+if [ -n "$sbom" ] && printf '%s' "$sbom" | non_empty_attestation; then
+  sbom_ok=1
+fi
+
+if [ "$provenance_ok" -eq 1 ] && [ "$sbom_ok" -eq 1 ]; then
   echo "provenance and SBOM confirmed via imagetools .Provenance/.SBOM accessors for $REF"
   exit 0
 fi
 
-echo "::notice::imagetools .Provenance/.SBOM accessors unavailable on this runner's buildx for $REF -- falling back to --raw + jq"
+if [ "$provenance_ok" -eq 1 ] && [ "$sbom_ok" -eq 0 ]; then
+  echo "::notice::provenance confirmed but SBOM missing (or accessor unavailable) via imagetools for $REF -- falling back to --raw + jq"
+elif [ "$provenance_ok" -eq 0 ] && [ "$sbom_ok" -eq 1 ]; then
+  echo "::notice::SBOM confirmed but provenance missing (or accessor unavailable) via imagetools for $REF -- falling back to --raw + jq"
+else
+  echo "::notice::imagetools .Provenance/.SBOM accessors unavailable on this runner's buildx for $REF -- falling back to --raw + jq"
+fi
 
 raw="$(docker buildx imagetools inspect "$REF" --raw)"
 att_digests="$(echo "$raw" | jq -r '.manifests[]? | select(.annotations["vnd.docker.reference.type"] == "attestation-manifest") | .digest')"

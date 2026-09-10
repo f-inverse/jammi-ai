@@ -24,7 +24,10 @@ workspace ships every publishable crate at the same
   search for a stored vector's own nearest neighbor, restart the server
   container, and assert identical result ids/scores plus an unchanged
   `list_index_segments` — and runs on every push to `main`, nightly, and on
-  demand (not on every PR: a cold CPU image build is ~30 minutes). `jammi-server`
+  demand (not on every PR: the per-PR lanes already build and test the
+  binary, and a Docker + Postgres + JetStream stack on every push is runner-
+  minute cost with no incremental coverage — a warm rebuild is ~3 minutes;
+  ~30 minutes only applies to a cold gha cache). `jammi-server`
   gains a `probe [--url] [--config] [--timeout-secs]` subcommand — a
   generic readiness check (GET `/readyz` once, exit `0` on HTTP `200`, `1`
   otherwise, never following a redirect) in the same shape as Postgres's

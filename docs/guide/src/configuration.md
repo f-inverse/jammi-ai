@@ -198,6 +198,26 @@ max_job_waits = 1024
 level = "info"
 # Log format: "text" or "json". Default: "text".
 format = "text"
+
+[observability]
+# OTLP/gRPC collector endpoint spans export to. Unset (the default) means:
+# build no exporter and open no network connection at all -- a process with
+# no configured endpoint attempts zero egress for tracing, whether or not
+# the `telemetry-otlp` cargo feature is compiled in.
+# otlp_endpoint = "http://localhost:4317"
+# `service.name` resource attribute stamped on every exported span.
+# Default: "jammi".
+service_name = "jammi"
+# Fraction of traces kept by the parent-based ratio sampler, in [0.0, 1.0].
+# Default: 1.0 (sample everything).
+sample_ratio = 1.0
+
+# [observability.otlp_headers]
+# Request headers the exporter attaches to every export call (e.g. a
+# collector auth token). Each value is a secret -- a plain string inline, or
+# `{ file = "/run/secrets/otlp-token" }` -- and is never logged. Default:
+# empty.
+# x-api-key = { file = "/run/secrets/otlp-token" }
 ```
 
 ## Catalog, broker, signing key, storage, and model source
@@ -344,7 +364,7 @@ environment value wins field-by-field; see the layering order above and
 config: an unknown `X` — one that does not name a top-level `JammiConfig`
 field (`artifact_dir`, `engine`, `gpu`, `inference`, `embedding`,
 `fine_tuning`, `lease`, `worker`, `jobs`, `cache`, `server`, `logging`,
-`catalog`, `broker`, `signing_key`, `storage`, `models`) — is a load-time
+`observability`, `catalog`, `broker`, `signing_key`, `storage`, `models`) — is a load-time
 error naming the
 variable, never a silent no-op (`JAMMI_CATALOG__KIND=postgres`, a typo one
 segment short of `JAMMI_CATALOG__POSTGRES__URL`, refuses rather than quietly

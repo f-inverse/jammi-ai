@@ -26,6 +26,7 @@ pub mod runtime;
 pub mod telemetry;
 pub mod tenant_resolver_layer;
 pub mod tiers;
+pub mod trace_context_layer;
 
 use std::sync::Arc;
 

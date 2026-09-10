@@ -58,9 +58,10 @@ jammi_search_latency_seconds_count 418
 
 ### Tracing
 
-The server installs a global `tracing` subscriber. Spans carry the correlation
-fields that let you follow a request across the gRPC surface and the worker
-fleet:
+The server installs a global `tracing` subscriber (a `Registry` layered with
+the `fmt` formatter and, when configured, an OTLP export layer). Spans carry
+the correlation fields that let you follow a request across the gRPC surface
+and the worker fleet:
 
 - **gRPC handler spans** carry `tenant_id` — recorded once the handler has
   resolved the request's tenant scope.
@@ -78,6 +79,32 @@ terminal.
 ```json
 {"timestamp":"2026-06-15T04:17:33.114Z","level":"INFO","fields":{"message":"job completed"},"target":"jammi_ai::fine_tune::worker","span":{"job_id":"job-7af3","worker_id":"worker-2","tenant_id":"acme","name":"run_claimed_job"}}
 ```
+
+#### OTLP trace export
+
+Setting `[observability] otlp_endpoint` sends spans to any vendor-neutral OTLP
+collector over gRPC (`opentelemetry-otlp`, tonic transport). Every span from
+this process carries the `service.name` resource attribute (default
+`"jammi"`), and the parent-based ratio sampler keeps `sample_ratio` (default
+`1.0`, i.e. everything) of the traces this process ROOTS — a span whose parent
+was already sampled by the caller is always kept, regardless of the local
+ratio. Request headers a collector requires (an auth token, a tenant header)
+go under `[observability.otlp_headers]`; each value is a secret — inline or
+`{ file = "…" }` — and is never logged (see [Configuration](./configuration.md)).
+
+Leaving `otlp_endpoint` unset installs no exporter and opens no network
+connection for tracing at all — the zero-egress default. The exporter lives
+behind the `telemetry-otlp` cargo feature (on by default in every published
+`jammi-server` build and in the `jammi-python` embed wheel); a build compiled
+WITHOUT the feature refuses to start with a typed configuration error if
+`otlp_endpoint` is set, rather than silently dropping every span.
+
+A whole-server tower layer extracts the incoming W3C `traceparent` (and
+`tracestate`) from every gRPC/Flight request's HTTP headers and continues that
+trace: the span this process opens for the request shares the CALLER's trace
+id, so a request that entered through an edge proxy or gateway stays one trace
+end-to-end across process boundaries. A request with no `traceparent` header
+starts a fresh, unparented trace, exactly as today.
 
 ## Graceful shutdown
 

@@ -7,13 +7,65 @@ mod job;
 pub mod model_task;
 
 use pyo3::prelude::*;
-use tracing_subscriber::EnvFilter;
+use tracing_subscriber::layer::SubscriberExt;
+use tracing_subscriber::util::SubscriberInitExt;
+use tracing_subscriber::{EnvFilter, Layer, Registry};
 
 use jammi_db::config::JammiConfig;
+use jammi_db::error::Result as JammiResult;
 
 use crate::error::to_pyerr;
 use crate::job::PyTrainingJob;
 use crate::model_task::PyModelTask;
+
+/// Keeps the OTLP tracer-provider's background flush thread and gRPC
+/// channel alive for the process, once [`build_tracing_layers`] configures
+/// one — mirrors `jammi-server`'s `telemetry::OTLP_PROVIDER_HANDLE`.
+/// `open_local` may run many times in one process (a script that calls
+/// `jammi.connect` more than once); only the FIRST call's handle is kept
+/// (`OnceLock::set` on a later call is a no-op) — the exporter it drives
+/// stays alive regardless, and every `otlp_layer` built afterwards from an
+/// identically-configured endpoint would behave the same either way.
+static OTLP_PROVIDER_HANDLE: std::sync::OnceLock<jammi_ai::telemetry::OtlpProviderHandle> =
+    std::sync::OnceLock::new();
+
+/// Build the tracing layers `open_local` installs: the `fmt` formatter (to
+/// stderr, filtered by `RUST_LOG` or a `jammi_ai=info,jammi_db=info`
+/// default) plus — when `[observability] otlp_endpoint` is configured — the
+/// OTLP export layer (#486), via the SAME `jammi_ai::telemetry::otlp_layer`
+/// factory `jammi-server`'s `telemetry::install` uses (B4).
+///
+/// Factored out of `open_local` (private -- a `#[pyfunction]`, not a `pub`
+/// Rust item) so a test can build the identical
+/// composition over a scoped subscriber
+/// (`tracing::subscriber::set_default`) rather than the process-global
+/// `try_init()`, which only ever succeeds once per process and so cannot be
+/// exercised repeatably from a test. `pub` (rather than `pub(crate)`)
+/// specifically so `tests/it.rs` — an external integration test, per this
+/// crate's `rlib` crate-type — can drive it directly.
+pub fn build_tracing_layers(
+    config: &JammiConfig,
+) -> JammiResult<Vec<Box<dyn Layer<Registry> + Send + Sync>>> {
+    // K2: refuse a configured endpoint this build cannot honour, before
+    // building anything else.
+    jammi_ai::telemetry::refuse_if_endpoint_without_feature(&config.observability)?;
+
+    let filter = EnvFilter::try_from_default_env()
+        .unwrap_or_else(|_| EnvFilter::new("jammi_ai=info,jammi_db=info"));
+    let fmt_layer: Box<dyn Layer<Registry> + Send + Sync> = Box::new(
+        tracing_subscriber::fmt::layer()
+            .with_writer(std::io::stderr)
+            .with_filter(filter),
+    );
+    let mut layers: Vec<Box<dyn Layer<Registry> + Send + Sync>> = vec![fmt_layer];
+
+    if let Some(otlp) = jammi_ai::telemetry::otlp_layer(&config.observability)? {
+        let _ = OTLP_PROVIDER_HANDLE.set(otlp.provider_handle());
+        layers.push(Box::new(otlp.layer));
+    }
+
+    Ok(layers)
+}
 
 /// The `_NativeDatabase` pyclass: the low-level embedded engine handle. The
 /// user-facing surface is the thin Python wrapper (`jammi._embedded.EmbeddedBackend`)
@@ -81,16 +133,6 @@ fn open_local(
     gpu_device: Option<i32>,
     inference_batch_size: Option<usize>,
 ) -> PyResult<PyDatabase> {
-    // Install a stderr tracing subscriber the first time connect() is called.
-    // Reads RUST_LOG; falls back to showing INFO from jammi crates only.
-    // try_init() is a no-op if a subscriber was already installed.
-    let filter = EnvFilter::try_from_default_env()
-        .unwrap_or_else(|_| EnvFilter::new("jammi_ai=info,jammi_db=info"));
-    let _ = tracing_subscriber::fmt()
-        .with_env_filter(filter)
-        .with_writer(std::io::stderr)
-        .try_init();
-
     // One call, whether or not a path was given (`load` falls back to
     // `JAMMI_CONFIG` / `./jammi.toml` / the platform config dir and then applies
     // the `JAMMI_*` overrides) — the server's own resolution, not a private
@@ -108,5 +150,29 @@ fn open_local(
         cfg.inference.batch_size = bs;
     }
 
-    PyDatabase::open(cfg).map_err(to_pyerr)
+    // Build the runtime `PyDatabase::open_with_runtime` will drive the
+    // session on — BEFORE installing tracing, not after: the OTLP export
+    // layer's tonic `Channel` (built inside `build_tracing_layers`) needs an
+    // active Tokio reactor merely to construct, and needs to keep living
+    // for as long as the connection does, so it must be built on the SAME
+    // runtime the session itself will run on, entered here, not a
+    // throwaway one that would be dropped before the channel is ever used.
+    let runtime = tokio::runtime::Runtime::new()
+        .map_err(|e| to_pyerr(jammi_db::error::JammiError::from(e)))?;
+    let runtime = std::sync::Arc::new(runtime);
+
+    // Install a stderr tracing subscriber (+ the OTLP export layer per
+    // `[observability]`, #486) the first time connect() is called. Reads
+    // RUST_LOG; falls back to showing INFO from jammi crates only.
+    // try_init() is a no-op if a subscriber was already installed — an
+    // endpoint misconfiguration this build cannot honour (K2) still
+    // surfaces as a Python exception either way, since
+    // `build_tracing_layers` runs its refusal check before `try_init`.
+    let layers = {
+        let _enter = runtime.enter();
+        build_tracing_layers(&cfg).map_err(to_pyerr)?
+    };
+    let _ = tracing_subscriber::registry().with(layers).try_init();
+
+    PyDatabase::open_with_runtime(cfg, runtime).map_err(to_pyerr)
 }

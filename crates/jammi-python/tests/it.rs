@@ -96,3 +96,50 @@ fn session_arc_shares_session_state_with_pydatabase() {
         "unbinding through one Arc must clear the shared state",
     );
 }
+
+// ── OTLP wiring (#486): `open_local`'s subscriber composition ──────────────
+//
+// A Python-level test would need to observe an in-process wheel install and
+// its own tracing subscriber install (`open_local`'s `try_init()` can only
+// ever succeed once per process), which the `pytest` harness cannot exercise
+// repeatably. This Rust-side test drives the SAME composition function
+// `open_local` calls (`jammi_native::build_tracing_layers`) directly, scoped
+// to the current thread via `tracing::subscriber::set_default` rather than
+// the process-global `try_init()`.
+
+#[test]
+fn build_tracing_layers_with_no_endpoint_is_fmt_only() {
+    use tracing_subscriber::layer::SubscriberExt;
+
+    let config = test_config(tempdir().expect("tempdir").path());
+    let layers = jammi_native::build_tracing_layers(&config).expect("no endpoint must not error");
+    assert_eq!(layers.len(), 1, "no otlp_endpoint -> the fmt layer alone");
+
+    // Scoped install (not global): proves the composed subscriber actually
+    // accepts spans/events without panicking, without touching the
+    // process-global default any other test in this binary might rely on.
+    let subscriber = tracing_subscriber::registry().with(layers);
+    let _guard = tracing::subscriber::set_default(subscriber);
+    tracing::info!("build_tracing_layers_with_no_endpoint_is_fmt_only smoke event");
+}
+
+// Building the tonic `Channel` (lazily -- no connection attempt, just the
+// client machinery) needs an active Tokio reactor.
+#[tokio::test]
+async fn build_tracing_layers_with_an_endpoint_adds_the_otlp_layer() {
+    use tracing_subscriber::layer::SubscriberExt;
+
+    let mut config = test_config(tempdir().expect("tempdir").path());
+    config.observability.otlp_endpoint = Some("http://127.0.0.1:4317".to_string());
+    let layers =
+        jammi_native::build_tracing_layers(&config).expect("a well-formed endpoint must build");
+    assert_eq!(
+        layers.len(),
+        2,
+        "a configured otlp_endpoint -> fmt layer + otlp layer"
+    );
+
+    let subscriber = tracing_subscriber::registry().with(layers);
+    let _guard = tracing::subscriber::set_default(subscriber);
+    tracing::info!("build_tracing_layers_with_an_endpoint_adds_the_otlp_layer smoke event");
+}

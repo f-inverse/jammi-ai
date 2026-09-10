@@ -90,6 +90,29 @@ impl PyDatabase {
     ///   for this one.
     pub fn open(config: JammiConfig) -> Result<Self, JammiError> {
         let runtime = Arc::new(tokio::runtime::Runtime::new()?);
+        Self::open_with_runtime(config, runtime)
+    }
+
+    /// Like [`Self::open`], but over an already-built runtime rather than
+    /// constructing a fresh one.
+    ///
+    /// `open_local` (#486) needs this: `jammi_ai::telemetry::otlp_layer`
+    /// builds a tonic `Channel` that requires an ACTIVE Tokio reactor merely
+    /// to construct (no connection attempt happens at that point — the
+    /// channel connects lazily — but the executor it wraps still needs
+    /// `Handle::current()` to exist), and that channel must go on living for
+    /// as long as the session it exports spans for, which the runtime
+    /// `Self::open` builds internally and never exposes cannot guarantee
+    /// from the outside. `open_local` therefore builds the runtime FIRST,
+    /// enters it to build the tracing layers (and install the global
+    /// subscriber) BEFORE the session itself exists, then hands that SAME
+    /// runtime in here — one shared `Arc`, so the exporter's channel and the
+    /// session's own futures are driven by the identical reactor for the
+    /// whole connection's lifetime.
+    pub(crate) fn open_with_runtime(
+        config: JammiConfig,
+        runtime: Arc<tokio::runtime::Runtime>,
+    ) -> Result<Self, JammiError> {
         let session = runtime.block_on(InferenceSession::open(config))?;
         // Spawn the embedded training worker on the shared runtime, if this
         // process is configured to run one. The spawn must happen inside the

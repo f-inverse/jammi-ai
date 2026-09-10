@@ -2190,6 +2190,7 @@ fn top_level_fields_matches_jammi_config() {
         "cache",
         "server",
         "logging",
+        "observability",
         "catalog",
         "broker",
         "signing_key",
@@ -2395,5 +2396,139 @@ fn env_override_limits_lands_through_the_struct_derived_layer() {
     assert_eq!(
         cfg.server.limits.max_in_flight_per_connection,
         LimitsConfig::default().max_in_flight_per_connection
+    );
+}
+
+// ── `[observability]` (#486 OTLP export) ──────────────────────────────────
+
+#[test]
+fn observability_config_defaults_match_the_documented_values() {
+    let obs = ObservabilityConfig::default();
+    assert_eq!(obs.otlp_endpoint, None);
+    assert!(obs.otlp_headers.is_empty());
+    assert_eq!(obs.service_name, "jammi");
+    assert_eq!(obs.sample_ratio, 1.0);
+    assert!(obs.validate().is_ok());
+}
+
+#[test]
+fn observability_config_round_trips_under_jammi_config() {
+    let toml_src = r#"
+        [observability]
+        otlp_endpoint = "http://collector.internal:4317"
+        service_name = "my-service"
+        sample_ratio = 0.25
+
+        [observability.otlp_headers]
+        x-api-key = "s3cr3t"
+    "#;
+    let cfg = JammiConfig::parse_from(toml_src, std::iter::empty::<(String, String)>()).unwrap();
+    assert_eq!(
+        cfg.observability.otlp_endpoint.as_deref(),
+        Some("http://collector.internal:4317")
+    );
+    assert_eq!(cfg.observability.service_name, "my-service");
+    assert_eq!(cfg.observability.sample_ratio, 0.25);
+    let header = cfg.observability.otlp_headers.get("x-api-key").unwrap();
+    assert_eq!(header.resolve().unwrap().expose(), "s3cr3t");
+}
+
+#[test]
+fn observability_config_rejects_an_unknown_key() {
+    let err = JammiConfig::parse_from(
+        "[observability]\nbogus_field = 1\n",
+        std::iter::empty::<(String, String)>(),
+    )
+    .expect_err("an unknown observability key must be refused");
+    assert!(err.to_string().contains("bogus_field"));
+}
+
+#[test]
+fn observability_sample_ratio_above_one_is_rejected_at_load() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("jammi.toml");
+    std::fs::write(&path, "[observability]\nsample_ratio = 1.5\n").unwrap();
+    let err = JammiConfig::load_from(Some(&path), std::iter::empty())
+        .expect_err("sample_ratio above 1.0 must be refused");
+    assert!(err.to_string().contains("sample_ratio"));
+}
+
+#[test]
+fn observability_sample_ratio_below_zero_is_rejected_at_load() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("jammi.toml");
+    std::fs::write(&path, "[observability]\nsample_ratio = -0.1\n").unwrap();
+    let err = JammiConfig::load_from(Some(&path), std::iter::empty())
+        .expect_err("a negative sample_ratio must be refused");
+    assert!(err.to_string().contains("sample_ratio"));
+}
+
+#[test]
+fn observability_sample_ratio_nan_is_rejected_not_silently_treated_as_in_range() {
+    // Family D: `RangeInclusive::contains` compares with `<=`/`>=`, both of
+    // which are `false` against NaN on either side -- a NaN ratio must not
+    // slip through as "in range" the way `x.is_nan() == false` naively might
+    // suggest to a reader who forgets IEEE-754 comparison semantics.
+    let cfg = ObservabilityConfig {
+        sample_ratio: f64::NAN,
+        ..ObservabilityConfig::default()
+    };
+    assert!(cfg.validate().is_err(), "NaN sample_ratio must be rejected");
+}
+
+#[test]
+fn observability_otlp_endpoint_without_a_scheme_is_rejected() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("jammi.toml");
+    std::fs::write(&path, "[observability]\notlp_endpoint = \"not a url\"\n").unwrap();
+    let err = JammiConfig::load_from(Some(&path), std::iter::empty())
+        .expect_err("a malformed otlp_endpoint must be refused");
+    assert!(err.to_string().contains("otlp_endpoint"));
+}
+
+#[test]
+fn observability_otlp_endpoint_with_a_non_http_scheme_is_rejected() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("jammi.toml");
+    std::fs::write(
+        &path,
+        "[observability]\notlp_endpoint = \"ftp://collector:4317\"\n",
+    )
+    .unwrap();
+    let err = JammiConfig::load_from(Some(&path), std::iter::empty())
+        .expect_err("a non-http(s) otlp_endpoint scheme must be refused");
+    assert!(err.to_string().contains("otlp_endpoint"));
+}
+
+#[test]
+fn observability_debug_never_prints_a_header_secret() {
+    let cfg = ObservabilityConfig {
+        otlp_headers: BTreeMap::from([(
+            "x-api-key".to_string(),
+            SecretSource::Inline("super-secret-value".to_string()),
+        )]),
+        ..ObservabilityConfig::default()
+    };
+    let rendered = format!("{cfg:?}");
+    assert!(
+        !rendered.contains("super-secret-value"),
+        "Debug output leaked a header secret: {rendered}"
+    );
+}
+
+#[test]
+fn env_override_observability_lands_through_the_struct_derived_layer() {
+    let cfg = JammiConfig::parse_from(
+        "",
+        vec![(
+            "JAMMI_OBSERVABILITY__SERVICE_NAME".to_string(),
+            "env-service".to_string(),
+        )],
+    )
+    .unwrap();
+    assert_eq!(cfg.observability.service_name, "env-service");
+    assert_eq!(
+        cfg.observability.sample_ratio,
+        ObservabilityConfig::default().sample_ratio
     );
 }

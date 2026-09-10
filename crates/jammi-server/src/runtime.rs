@@ -61,6 +61,7 @@ use crate::metrics_layer::MetricsLayer;
 use crate::routes::health::{self, MetricsRegistry};
 use crate::tenant_resolver_layer::TenantResolverLayer;
 use crate::tiers::{ServiceTier, TierSet};
+use crate::trace_context_layer::TraceContextLayer;
 
 /// Errors `OssServer::run` can surface to the binary's `main`.
 #[derive(Debug, thiserror::Error)]
@@ -618,8 +619,9 @@ pub struct GrpcChain {
 /// listener that already frames gRPC-web.
 ///
 /// The transport layer stack (`accept_http1` + `MetricsLayer` +
-/// `GrpcWebTrailersLayer` + `GrpcWebLayer`) is applied by [`Self::serve`], not
-/// baked into the routes — see that method, [`Self::into_layered_axum_router`],
+/// `TraceContextLayer` + `GrpcWebTrailersLayer` + `GrpcWebLayer`) is applied by
+/// [`Self::serve`], not baked into the routes — see that method,
+/// [`Self::into_layered_axum_router`],
 /// and [`Self::into_axum_router`] for the seam contract each path honours.
 pub struct AssembledChain {
     addr: SocketAddr,
@@ -863,10 +865,13 @@ impl AssembledChain {
     ///
     /// PARTIAL LAYER STACK — this does NOT apply the SAME stack [`Self::serve`]
     /// applies, despite this method's name; it applies only the gRPC-web +
-    /// metrics framing (the whole-server [`MetricsLayer`], outermost, observing
-    /// every method path, wrapping [`GrpcWebTrailersLayer`] — the trailers-only
-    /// error repair — wrapping [`GrpcWebLayer`], gRPC-web framing, wrapping the
-    /// routes). axum runs the LAST `.layer` call as the OUTERMOST service — the
+    /// metrics + trace-context framing (the whole-server [`MetricsLayer`],
+    /// outermost, observing every method path, wrapping
+    /// [`crate::trace_context_layer::TraceContextLayer`] — opens one span per
+    /// request, continuing an incoming W3C `traceparent` — wrapping
+    /// [`GrpcWebTrailersLayer`] — the trailers-only error repair — wrapping
+    /// [`GrpcWebLayer`], gRPC-web framing, wrapping the routes). axum runs the
+    /// LAST `.layer` call as the OUTERMOST service — the
     /// inverse of the tonic [`tonic::transport::Server`] builder, where the FIRST
     /// `.layer` is outermost — so the calls are ordered inner→outer here to land
     /// the same outermost→innermost gRPC-web/metrics stack `serve` builds.
@@ -911,14 +916,15 @@ impl AssembledChain {
         let metrics = Arc::clone(&self.metrics);
         // Apply the canonical stack in axum's inner→outer call order. axum runs
         // the last `.layer` as the outermost service, so ordering the calls
-        // GrpcWebLayer → GrpcWebTrailersLayer → MetricsLayer reproduces `serve`'s
-        // outermost→innermost stack: Metrics → GrpcWebTrailers → GrpcWebLayer →
-        // routes.
+        // GrpcWebLayer → GrpcWebTrailersLayer → TraceContextLayer → MetricsLayer
+        // reproduces `serve`'s outermost→innermost stack: Metrics →
+        // TraceContext → GrpcWebTrailers → GrpcWebLayer → routes.
         let layered = self
             .routes
             .into_axum_router()
             .layer(GrpcWebLayer::new())
             .layer(GrpcWebTrailersLayer::new())
+            .layer(TraceContextLayer::new())
             .layer(MetricsLayer::new(metrics));
         // Re-nest the layered routes under a fresh `Router` so the returned type
         // is a plain `axum::Router` whose request body is `axum::body::Body` —
@@ -977,7 +983,9 @@ impl BoundChain {
     ///
     /// The transport layers apply HERE, in this order (outermost first):
     /// `accept_http1(true)` then `MetricsLayer` (observes every request by
-    /// method path before routing) then `GrpcWebTrailersLayer` (wraps
+    /// method path before routing) then `TraceContextLayer` (opens one span
+    /// per request, continuing an incoming W3C `traceparent` — see
+    /// `crate::trace_context_layer`) then `GrpcWebTrailersLayer` (wraps
     /// `GrpcWebLayer`, repairing the trailers-only error response into the
     /// in-body trailer frame a gRPC-web client requires) then `GrpcWebLayer`
     /// then the `[server.limits]` request-bounds stack
@@ -1010,6 +1018,7 @@ impl BoundChain {
         let mut server = Server::builder()
             .accept_http1(true)
             .layer(MetricsLayer::new(self.metrics))
+            .layer(TraceContextLayer::new())
             .layer(GrpcWebTrailersLayer::new())
             .layer(GrpcWebLayer::new())
             .layer(crate::limits::RefusalStatusLayer::new(refusal_metrics))

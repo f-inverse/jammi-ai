@@ -495,8 +495,8 @@ Every trait/enum/base surface a maintainer extends, with anchors and invariants.
   `true` (default `true`); **not** the unconditional `with_embedded_worker`
   form. This is the SAME key the server's chain assembly and the Python embedded
   arm read before deciding whether THEIR process claims —
-  `worker.enabled` (`crates/jammi-server/src/runtime.rs:1224`) and
-  `worker.enabled` (`crates/jammi-python/src/database.rs:98`) — so a wire
+  `worker.enabled` (`crates/jammi-server/src/runtime.rs:1233`) and
+  `worker.enabled` (`crates/jammi-python/src/database.rs:121`) — so a wire
   deployment and an in-process one answer "does THIS process claim?"
   identically rather than by three private conventions. `Target`
   is **Local-only** (`crates/jammi-ai/src/jammi.rs`, the `Target` enum); remote is
@@ -3835,6 +3835,16 @@ auto-available to every encoder.)
 - **gRPC-Web layer order is load-bearing.** `GrpcWebTrailersLayer` *before* `GrpcWebLayer`
   (`crates/jammi-server/src/runtime.rs`); reorder and gRPC-Web error handling breaks (raw gRPC
   unaffected).
+- **`TraceContextLayer` sits between `MetricsLayer` and the gRPC-Web layers, on every
+  listener path (#486).** `MetricsLayer` → `TraceContextLayer` → `GrpcWebTrailersLayer` →
+  `GrpcWebLayer` → … (`crates/jammi-server/src/runtime.rs`, both
+  `BoundChain::serve_with_shutdown` and `AssembledChain::into_layered_axum_router`). It opens
+  one span per request and continues an incoming W3C `traceparent` via
+  `jammi_ai::telemetry::set_parent_from_headers` — reading the raw `http::HeaderMap` BEFORE
+  tonic decodes gRPC metadata from the same headers, non-destructively, so tonic's own decode
+  downstream is unaffected regardless of layer position; the ordering relative to
+  `MetricsLayer`/the gRPC-Web layers is a style choice (mirrors `MetricsLayer`'s placement), not
+  a correctness dependency the way the gRPC-Web pair above is.
 - **`[server.limits]`'s layer stack is INSIDE the gRPC-Web layers, never tonic's own
   `concurrency_limit_per_connection`/`load_shed` builder knobs.** `RefusalStatusLayer` →
   `GlobalConcurrencyLimitLayer` → `PerConnectionLimitLayer` → `MethodClassLayer` (`crates/

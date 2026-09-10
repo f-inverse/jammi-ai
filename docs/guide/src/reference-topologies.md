@@ -283,10 +283,10 @@ spec:
           configMap: { name: jammi-server-config }
 ```
 
-`ghcr.io/f-inverse/jammi-ai-server-cu12:latest` tracks the latest **release**
-tag (`v*`) — it is published only alongside a tagged CPU release, never from
-`main` — whereas the CPU image's own `:latest` above tracks `main`. Pin an
-exact `:vX.Y.Z` tag for reproducible GPU-node deploys.
+Both `:latest` tags are re-pointed by every `v*` release tag (never by a
+prerelease); the CPU `:latest` can additionally be re-pointed to the current
+`main` by a manual `build-and-push-main` dispatch. Pin an exact `:vX.Y.Z`
+tag for reproducible GPU-node deploys.
 
 Very high scale, specialized GPU pools, and a split compliance posture
 (query tier vs. training tier on separate node pools / network policies)

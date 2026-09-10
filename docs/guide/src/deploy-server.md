@@ -291,7 +291,7 @@ The OSS server ships as two public Docker images on GHCR:
 - `ghcr.io/f-inverse/jammi-ai-server` — **CPU**, built from a distroless base.
 - `ghcr.io/f-inverse/jammi-ai-server-cu12` — **CUDA**, for GPU-accelerated inference (see [GPU serving](#gpu-serving)).
 
-Both run as the nonroot user (uid `65532`), expose the same `8080` / `8081` ports the local binary listens on, and share the same tag scheme (`:latest`, `:vX.Y.Z`, `:vX.Y`). The image entrypoint is `jammi-server`, so `docker run <image>` brings up the server with **zero config** — a local SQLite catalog, the in-memory broker, and every service tier, no TOML required. The `jammi` admin CLI also ships in the image for running verbs against the server. The examples below use the CPU image.
+Both run as the nonroot user (uid `65532`), expose the same `8080` / `8081` ports the local binary listens on, and share the same tag scheme (`:latest`, `:vX.Y.Z`, `:vX.Y`). Both `:latest` tags are re-pointed by every `v*` release tag (never by a prerelease); the CPU `:latest` can additionally be re-pointed to the current `main` by a manual `build-and-push-main` dispatch. The image entrypoint is `jammi-server`, so `docker run <image>` brings up the server with **zero config** — a local SQLite catalog, the in-memory broker, and every service tier, no TOML required. The `jammi` admin CLI also ships in the image for running verbs against the server. The examples below use the CPU image.
 
 ```bash
 # Turnkey: zero config, no TOML.
@@ -344,7 +344,7 @@ catalog and JetStream broker.
 
 ### GPU serving
 
-The `jammi-ai-server-cu12` image builds with candle's CUDA backend on an NVIDIA CUDA 12.6 runtime base, so `libcudart` and the rest of the CUDA runtime libraries are present in the image. It carries the same turnkey `jammi` CLI as the CPU image. Run it on a host with the [NVIDIA Container Toolkit](https://docs.nvidia.com/datacenter/cloud-native/container-toolkit/) and pass `--gpus all`. `-cu12:latest` tracks the latest release tag (`v*`), unlike the CPU image's `:latest`, which tracks `main` — pin an exact `:vX.Y.Z` tag for a reproducible GPU-node deploy:
+The `jammi-ai-server-cu12` image builds with candle's CUDA backend on an NVIDIA CUDA 12.6 runtime base, so `libcudart` and the rest of the CUDA runtime libraries are present in the image. It carries the same turnkey `jammi` CLI as the CPU image. Run it on a host with the [NVIDIA Container Toolkit](https://docs.nvidia.com/datacenter/cloud-native/container-toolkit/) and pass `--gpus all`. Both `:latest` tags are re-pointed by every `v*` release tag (never by a prerelease); the CPU `:latest` can additionally be re-pointed to the current `main` by a manual `build-and-push-main` dispatch — pin an exact `:vX.Y.Z` tag for a reproducible GPU-node deploy:
 
 ```bash
 # Turnkey: zero config, GPU inference.
@@ -403,9 +403,15 @@ gh attestation verify oci://ghcr.io/f-inverse/jammi-ai-server@sha256:<digest> \
   --repo f-inverse/jammi-ai
 ```
 
-CI checks this on every push job itself
-(`ci/scripts/assert_image_attestations.sh`, via `docker buildx imagetools
-inspect`). The `compose-smoke` workflow's own build (`load: true`, loaded
-into the runner's daemon, never pushed) carries neither: `sbom` and
-`provenance` are explicitly `false` there, since the stock Docker exporter
-a `load` build uses cannot carry attestations.
+CI checks both of these, in two separate steps, on every push job:
+`ci/scripts/assert_image_attestations.sh` asserts (via `docker buildx
+imagetools inspect`) that the pushed digest's own OCI index carries BOTH a
+non-empty SBOM and a non-empty provenance attestation manifest; a positively
+empty accessor fails the job immediately rather than falling back to a
+looser check. A separate `gh attestation verify oci://... --bundle-from-oci`
+step then verifies the Sigstore-signed bundle `attest-build-provenance`
+published as an OCI referrer — the check above never touches that bundle.
+The `compose-smoke` workflow's own build (`load: true`, loaded into the
+runner's daemon, never pushed) carries neither: `sbom` and `provenance` are
+explicitly `false` there, since the stock Docker exporter a `load` build
+uses cannot carry attestations.

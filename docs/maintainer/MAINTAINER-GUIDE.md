@@ -4064,7 +4064,9 @@ here can retroactively un-push a tag. Then tag both `v*` and `py-v*`
   chains off `publish`) + `.github/workflows/npm.yml` (build+test unconditional; the `Publish` step
   itself is prove-gated) + `.github/workflows/server-image.yml` (the manual `:latest` CPU refresh via
   `workflow_dispatch` on `main` is intentionally ungated — `build-and-push-main`; `server-image.yml`
-  carries no `push: branches:` trigger, so this never fires on a mere merge; the CPU and CUDA TAG
+  carries no `push: branches:` trigger, so this never fires on a mere merge; both `:latest` tags are
+  separately re-pointed by every `v*` release tag itself, via `docker/metadata-action`'s default
+  `flavor: latest=auto`, so the CPU `:latest` is never main-only; the CPU and CUDA TAG
   promotions — `build-and-push` and `build-and-push-cu12` — are both prove-gated) +
   `.github/workflows/release-binaries.yml` (every asset family — the CLI matrix, the CPU tarball, the
   CUDA tarball — is split into an ungated build leg that always runs and a prove-gated promote leg

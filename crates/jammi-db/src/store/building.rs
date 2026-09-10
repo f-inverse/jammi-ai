@@ -9,7 +9,7 @@
 //! `building` row, and the writer's unguarded promote then flipped the reaped
 //! row to `ready` over deleted bytes (esc-094, issue #479). This handle is the
 //! writer's side of the fix: it owns the row's `writer_id`, keeps the lease
-//! renewed by registering with the process's [`crate::catalog::lease_keeper::LeaseKeeper`] (N3), and routes
+//! renewed by holding it with the process's [`crate::catalog::lease_keeper::LeaseKeeper`] (N3), and routes
 //! every transition on the row through the [`ResultTableCas`] predicate naming
 //! that writer, so a peer's recovery (which touches only rows whose lease is
 //! absent or expired) and a live writer can never both act on one row.
@@ -28,7 +28,7 @@ use std::sync::Arc;
 use datafusion::prelude::SessionContext;
 use tracing::warn;
 
-use crate::catalog::lease_keeper::{LeaseTarget, Registration};
+use crate::catalog::lease_keeper::{LeaseHold, LeaseTarget};
 use crate::catalog::result_repo::{ResultTableCas, ResultTableRecord};
 use crate::catalog::status::ResultTableStatus;
 use crate::config::StoragePrecision;
@@ -46,7 +46,7 @@ use crate::tenant::TenantId;
 /// `(table_name, writer_id, status = 'building')` with the tenant arm the
 /// binding in force selects ([`crate::catalog::result_repo::TenantArm`]).
 /// When [`ResultStore`] carries a [`crate::catalog::lease_keeper::LeaseKeeper`] handle, this table's row is
-/// one of that keeper's registrations: a renew that matches zero rows
+/// one of that keeper's holds: a renew that matches zero rows
 /// (recovery claimed the row after the lease expired, or the row went
 /// terminal underneath the writer) flips [`Self::is_live`] to `false` — a
 /// writer checks it at each batch boundary and aborts. With no keeper
@@ -59,13 +59,13 @@ use crate::tenant::TenantId;
 /// optimisation does.
 ///
 /// Dropping the handle without [`Self::finish`], [`Self::abort`], or
-/// [`Self::detach`] unregisters the keeper registration (if any) and, when a
+/// [`Self::detach`] releases the keeper hold (if any) and, when a
 /// tokio runtime is current, spawns a best-effort `building -> failed` CAS
 /// (no byte deletion — reconcile reaps the objects later); with no runtime
 /// the lease simply expires and recovery reaps the row. After
 /// `finish`/`abort`/`detach` the drop is a no-op by construction: the
 /// `status = 'building'` predicate no longer matches, or (`detach`) the
-/// registration is already gone and no CAS is issued at all.
+/// hold is already gone and no CAS is issued at all.
 pub struct BuildingTable {
     store: ResultStore,
     table_name: String,
@@ -74,7 +74,7 @@ pub struct BuildingTable {
     writer_id: String,
     storage_precision: StoragePrecision,
     done: Arc<AtomicBool>,
-    registration: Option<Registration>,
+    hold: Option<LeaseHold>,
 }
 
 impl std::fmt::Debug for BuildingTable {
@@ -85,14 +85,14 @@ impl std::fmt::Debug for BuildingTable {
             .field("tenant", &self.tenant)
             .field("writer_id", &self.writer_id)
             .field("done", &self.done.load(Ordering::SeqCst))
-            .field("lost", &self.registration.as_ref().map(Registration::lost))
+            .field("lost", &self.hold.as_ref().map(LeaseHold::lost))
             .finish()
     }
 }
 
 impl BuildingTable {
     /// Take ownership of the `building` row `table_name` for `writer_id` and,
-    /// when `store` carries a [`crate::catalog::lease_keeper::LeaseKeeper`], register it for renewal.
+    /// when `store` carries a [`crate::catalog::lease_keeper::LeaseKeeper`], hold it open for renewal.
     /// Called by [`ResultStore::create_table`] right after the row's INSERT,
     /// and by recovery right after
     /// [`crate::catalog::Catalog::claim_expired_building_table`] stamped the
@@ -109,8 +109,8 @@ impl BuildingTable {
         writer_id: String,
         storage_precision: StoragePrecision,
     ) -> Self {
-        let registration = store.lease_keeper().map(|keeper| {
-            keeper.register(LeaseTarget::ResultTable {
+        let hold = store.lease_keeper().map(|keeper| {
+            keeper.hold(LeaseTarget::ResultTable {
                 table: table_name.clone(),
                 writer_id: writer_id.clone(),
             })
@@ -123,7 +123,7 @@ impl BuildingTable {
             writer_id,
             storage_precision,
             done: Arc::new(AtomicBool::new(false)),
-            registration,
+            hold,
         }
     }
 
@@ -157,7 +157,7 @@ impl BuildingTable {
         self.storage_precision
     }
 
-    /// `true` while the keeper registration (if any) still owns the lease and
+    /// `true` while the keeper hold (if any) still owns the lease and
     /// the handle has not finished/aborted/detached. Flips to `false` the
     /// first time the keeper's renew matches zero rows (the row was claimed
     /// by recovery or went terminal underneath the writer). A writer checks
@@ -169,11 +169,7 @@ impl BuildingTable {
         if self.done.load(Ordering::SeqCst) {
             return false;
         }
-        !self
-            .registration
-            .as_ref()
-            .map(Registration::lost)
-            .unwrap_or(false)
+        !self.hold.as_ref().map(LeaseHold::lost).unwrap_or(false)
     }
 
     /// The compare-and-set predicate for this writer's row under the tenant
@@ -275,9 +271,9 @@ impl BuildingTable {
             )
             .await;
         // Whatever the promote said, this handle's row is no longer `building`
-        // under this writer: unregister from the keeper and make Drop a no-op.
+        // under this writer: release the keeper hold and make Drop a no-op.
         self.done.store(true, Ordering::SeqCst);
-        self.unregister();
+        self.release_hold();
         let owner = match promoted {
             Ok(owner) => owner,
             Err(JammiError::CasFailed { status, .. })
@@ -332,7 +328,7 @@ impl BuildingTable {
     /// retry.
     pub async fn abort(mut self) -> Result<()> {
         self.done.store(true, Ordering::SeqCst);
-        self.unregister();
+        self.release_hold();
         let cas = self.cas();
         self.store.catalog().fail_building_table(&cas).await?;
         let outcome = self
@@ -352,7 +348,7 @@ impl BuildingTable {
     }
 
     /// Detach the handle from its row with NO catalog transition (N2): stop
-    /// renewing (unregister from the keeper), mark the handle done, issue no
+    /// renewing (release the keeper hold), mark the handle done, issue no
     /// CAS, delete nothing. The state a job that lost its lease — or whose
     /// attempt was superseded by a reclaim — leaves behind: the row stays
     /// `building` under this writer's id with a lease that then simply
@@ -370,7 +366,7 @@ impl BuildingTable {
     /// decide the row's fate.
     pub fn detach(mut self) {
         self.done.store(true, Ordering::SeqCst);
-        self.unregister();
+        self.release_hold();
     }
 
     /// Test-only: detach the handle AND force the row's lease into the past,
@@ -390,22 +386,18 @@ impl BuildingTable {
         catalog.expire_lease_for_test(&cas).await
     }
 
-    /// Drop the keeper registration (if any), stopping renewal. Mirrors the
+    /// Drop the keeper hold (if any), stopping renewal. Mirrors the
     /// old `stop_heartbeat`'s name at every call site above; the mechanism is
-    /// now "drop the `Registration`" rather than "abort a `JoinHandle`".
-    fn unregister(&mut self) {
-        self.registration.take();
+    /// now "drop the `LeaseHold`" rather than "abort a `JoinHandle`".
+    fn release_hold(&mut self) {
+        self.hold.take();
     }
 }
 
 impl Drop for BuildingTable {
     fn drop(&mut self) {
-        let already_lost = self
-            .registration
-            .as_ref()
-            .map(Registration::lost)
-            .unwrap_or(false);
-        self.unregister();
+        let already_lost = self.hold.as_ref().map(LeaseHold::lost).unwrap_or(false);
+        self.release_hold();
         if self.done.load(Ordering::SeqCst) || already_lost {
             return;
         }

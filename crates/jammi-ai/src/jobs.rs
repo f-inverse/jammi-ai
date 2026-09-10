@@ -560,13 +560,13 @@ impl InferenceSession {
                     "run_now: failed to claim its own freshly-submitted inline job '{job_id}'"
                 ))
             })?;
-        let registration =
-            self.lease_keeper()
-                .register(jammi_db::catalog::lease_keeper::LeaseTarget::Job {
-                    job_id: job_id.clone(),
-                    instance_id: instance_id.clone(),
-                    attempts: claimed.attempts,
-                });
+        let hold = self
+            .lease_keeper()
+            .hold(jammi_db::catalog::lease_keeper::LeaseTarget::Job {
+                job_id: job_id.clone(),
+                instance_id: instance_id.clone(),
+                attempts: claimed.attempts,
+            });
         // `run_now` always submits a BRAND NEW `job_id` (never reused across
         // calls), so `claimed.attempts` is always 1 here — there is no
         // N1 partial_result to dispatch on (an inline job has no requeue
@@ -580,7 +580,7 @@ impl InferenceSession {
             attempts: claimed.attempts,
         };
         let outcome = execute_compute(self, &spec, job_attempt).await;
-        drop(registration);
+        drop(hold);
         match outcome {
             Ok(job_result) => {
                 let result_json = serde_json::to_string(&job_result)?;

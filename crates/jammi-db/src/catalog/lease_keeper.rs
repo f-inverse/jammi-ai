@@ -1,6 +1,6 @@
 //! One lease-renewal thread per process (N3): a dedicated OS thread running
 //! its own `current_thread` tokio runtime and its OWN catalog connection,
-//! renewing every lease the process holds from a registration list.
+//! renewing every lease the process holds from a hold list.
 //!
 //! **Why a dedicated thread, not a `tokio::spawn`'d task.** A lease
 //! heartbeat that runs as a task on the process's MAIN runtime competes for
@@ -35,7 +35,7 @@ use super::result_repo::ResultTableCas;
 use super::Catalog;
 use crate::error::{JammiError, Result};
 
-/// What one [`Registration`] renews.
+/// What one [`LeaseHold`] renews.
 #[derive(Debug, Clone)]
 pub enum LeaseTarget {
     /// This process's own `instances` row — renewed via
@@ -54,48 +54,48 @@ pub enum LeaseTarget {
     ResultTable { table: String, writer_id: String },
 }
 
-/// A live registration with a [`LeaseKeeper`]. Renewed every `heartbeat`
-/// interval until this handle is dropped, at which point the target is
-/// removed from the keeper's list and renewed no more — "unregister on
-/// drop".
-pub struct Registration {
+/// A live hold on a lease target with a [`LeaseKeeper`]. Renewed every
+/// `heartbeat` interval until this handle is dropped, at which point the
+/// target is removed from the keeper's list and renewed no more — "release
+/// on drop".
+pub struct LeaseHold {
     id: u64,
-    registrations: Arc<Mutex<HashMap<u64, RegistrationState>>>,
+    holds: Arc<Mutex<HashMap<u64, HeldState>>>,
     lost: Arc<AtomicBool>,
 }
 
-impl Registration {
-    /// `true` once a renew for this registration matched zero rows — the row
-    /// was claimed by a peer, or went terminal, underneath this holder. A
+impl LeaseHold {
+    /// `true` once a renew for this hold matched zero rows — the row was
+    /// claimed by a peer, or went terminal, underneath this holder. A
     /// holder observing `true` must treat its claim as gone: it no longer
     /// owns the row and must not act as though it does.
     pub fn lost(&self) -> bool {
         self.lost.load(Ordering::SeqCst)
     }
 
-    /// A clone of this registration's own `lost` flag — for a caller that
-    /// already threads an `Arc<AtomicBool>` cancellation flag through a deep
-    /// call chain (a training loop's epoch-boundary check) and wants the
+    /// A clone of this hold's own `lost` flag — for a caller that already
+    /// threads an `Arc<AtomicBool>` cancellation flag through a deep call
+    /// chain (a training loop's epoch-boundary check) and wants the
     /// keeper's renewal outcome to set that SAME flag directly, with no
     /// separate polling task: the flag this returns is flipped by the
     /// keeper's own dedicated thread on the very next renewal that misses,
     /// exactly as [`Self::lost`] observes it, just reachable by identity
-    /// rather than by asking this handle. The registration itself must
-    /// still be kept alive (not dropped) for as long as the lease should
-    /// keep renewing — dropping it unregisters, but does not retroactively
-    /// un-flip a flag a caller is still holding a clone of.
+    /// rather than by asking this handle. The hold itself must still be
+    /// kept alive (not dropped) for as long as the lease should keep
+    /// renewing — dropping it releases the hold, but does not
+    /// retroactively un-flip a flag a caller is still holding a clone of.
     pub fn lost_flag(&self) -> Arc<AtomicBool> {
         Arc::clone(&self.lost)
     }
 }
 
-impl Drop for Registration {
+impl Drop for LeaseHold {
     fn drop(&mut self) {
-        self.registrations.lock().unwrap().remove(&self.id);
+        self.holds.lock().unwrap().remove(&self.id);
     }
 }
 
-struct RegistrationState {
+struct HeldState {
     target: LeaseTarget,
     lost: Arc<AtomicBool>,
 }
@@ -111,7 +111,7 @@ type CatalogConnect =
 /// dedicated thread and a dedicated connection, rather than a `tokio::spawn`
 /// task on the caller's own runtime.
 pub struct LeaseKeeper {
-    registrations: Arc<Mutex<HashMap<u64, RegistrationState>>>,
+    holds: Arc<Mutex<HashMap<u64, HeldState>>>,
     next_id: AtomicU64,
     shutdown: Arc<AtomicBool>,
     thread: Mutex<Option<std::thread::JoinHandle<()>>>,
@@ -131,11 +131,10 @@ impl LeaseKeeper {
         Fut: Future<Output = Result<Catalog>> + Send + 'static,
     {
         let connect: CatalogConnect = Box::new(move || Box::pin(catalog_connect()));
-        let registrations: Arc<Mutex<HashMap<u64, RegistrationState>>> =
-            Arc::new(Mutex::new(HashMap::new()));
+        let holds: Arc<Mutex<HashMap<u64, HeldState>>> = Arc::new(Mutex::new(HashMap::new()));
         let shutdown = Arc::new(AtomicBool::new(false));
 
-        let thread_registrations = Arc::clone(&registrations);
+        let thread_holds = Arc::clone(&holds);
         let thread_shutdown = Arc::clone(&shutdown);
         let thread = std::thread::spawn(move || {
             let rt = match tokio::runtime::Builder::new_current_thread()
@@ -161,36 +160,36 @@ impl LeaseKeeper {
                     if thread_shutdown.load(Ordering::SeqCst) {
                         return;
                     }
-                    renew_all(&catalog, &thread_registrations, intervals).await;
+                    renew_all(&catalog, &thread_holds, intervals).await;
                 }
             });
         });
 
         Arc::new(Self {
-            registrations,
+            holds,
             next_id: AtomicU64::new(0),
             shutdown,
             thread: Mutex::new(Some(thread)),
         })
     }
 
-    /// Register a new lease target for renewal on this keeper's thread.
-    /// Renewal starts on the NEXT tick (at most one `heartbeat` interval
-    /// away, never blocking the caller); stops when the returned
-    /// [`Registration`] is dropped.
-    pub fn register(&self, target: LeaseTarget) -> Registration {
+    /// Hold a lease target open, renewed on this keeper's thread. Renewal
+    /// starts on the NEXT tick (at most one `heartbeat` interval away, never
+    /// blocking the caller); stops when the returned [`LeaseHold`] is
+    /// dropped.
+    pub fn hold(&self, target: LeaseTarget) -> LeaseHold {
         let id = self.next_id.fetch_add(1, Ordering::SeqCst);
         let lost = Arc::new(AtomicBool::new(false));
-        self.registrations.lock().unwrap().insert(
+        self.holds.lock().unwrap().insert(
             id,
-            RegistrationState {
+            HeldState {
                 target,
                 lost: Arc::clone(&lost),
             },
         );
-        Registration {
+        LeaseHold {
             id,
-            registrations: Arc::clone(&self.registrations),
+            holds: Arc::clone(&self.holds),
             lost,
         }
     }
@@ -209,21 +208,21 @@ impl Drop for LeaseKeeper {
     }
 }
 
-/// One renewal pass over every current registration. A registration whose
-/// renew misses (matches zero rows) has its `lost` flag set; every other
-/// outcome (including a transient backend error, logged and retried next
-/// tick) leaves it unset. Registrations added or removed mid-pass are not
-/// raced against: the snapshot is taken once at the top of the pass, and a
-/// [`Registration`]'s `Drop` removing it from the map does not affect a
-/// renewal already in flight for it — the renewal simply writes to a row no
-/// one observes the outcome of.
+/// One renewal pass over every current hold. A hold whose renew misses
+/// (matches zero rows) has its `lost` flag set; every other outcome
+/// (including a transient backend error, logged and retried next tick)
+/// leaves it unset. Holds added or removed mid-pass are not raced against:
+/// the snapshot is taken once at the top of the pass, and a [`LeaseHold`]'s
+/// `Drop` removing it from the map does not affect a renewal already in
+/// flight for it — the renewal simply writes to a row no one observes the
+/// outcome of.
 async fn renew_all(
     catalog: &Catalog,
-    registrations: &Arc<Mutex<HashMap<u64, RegistrationState>>>,
+    holds: &Arc<Mutex<HashMap<u64, HeldState>>>,
     intervals: LeaseIntervals,
 ) {
     let snapshot: Vec<(LeaseTarget, Arc<AtomicBool>)> = {
-        let regs = registrations.lock().unwrap();
+        let regs = holds.lock().unwrap();
         regs.values()
             .map(|r| (r.target.clone(), Arc::clone(&r.lost)))
             .collect()

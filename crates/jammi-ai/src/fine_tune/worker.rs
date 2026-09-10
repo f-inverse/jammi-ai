@@ -27,11 +27,11 @@
 //! ## Cooperative cancellation
 //!
 //! A `spawn_blocking` training thread cannot be force-aborted, so cancellation
-//! is cooperative: the job's lease is a registration with the session's
+//! is cooperative: the job's lease is a hold with the session's
 //! [`jammi_db::catalog::lease_keeper::LeaseKeeper`] (N3) — a dedicated OS
 //! thread renews it, immune to this runtime being starved by the training
-//! itself — and the registration's own `lost` flag (via
-//! [`jammi_db::catalog::lease_keeper::Registration::lost_flag`]) doubles as
+//! itself — and the hold's own `lost` flag (via
+//! [`jammi_db::catalog::lease_keeper::LeaseHold::lost_flag`]) doubles as
 //! the shared cancel flag the training loop checks at every epoch boundary
 //! (no separate `tokio::spawn` heartbeat task anywhere in this crate). The
 //! loop then bails, leaving the job `running` for the next
@@ -467,23 +467,22 @@ impl JobWorker {
         let epoch_checkpointing = epoch_checkpointing(&spec);
         let epoch_checkpoint_bound = epoch_checkpointing.map(|(b, _)| b).unwrap_or(0);
 
-        // N3: the job's lease is a keeper registration, not a `tokio::spawn`
+        // N3: the job's lease is a keeper hold, not a `tokio::spawn`
         // heartbeat task — the dedicated keeper thread renews it, immune to
         // this runtime being starved by CPU-bound training. `cancel` IS the
-        // registration's own `lost` flag (identity, not a poll copy): the
+        // hold's own `lost` flag (identity, not a poll copy): the
         // keeper flips it directly on the next renewal that misses, and both
         // training paths' epoch-boundary checks read it exactly as they read
-        // the old heartbeat-task-set flag. `registration` must outlive the
+        // the old heartbeat-task-set flag. `hold` must outlive the
         // run (held below) — dropping it early would stop renewal.
-        let registration =
-            session
-                .lease_keeper()
-                .register(jammi_db::catalog::lease_keeper::LeaseTarget::Job {
-                    job_id: job_id.clone(),
-                    instance_id: self.worker_id.clone(),
-                    attempts: attempt,
-                });
-        let cancel = registration.lost_flag();
+        let hold = session
+            .lease_keeper()
+            .hold(jammi_db::catalog::lease_keeper::LeaseTarget::Job {
+                job_id: job_id.clone(),
+                instance_id: self.worker_id.clone(),
+                attempts: attempt,
+            });
+        let cancel = hold.lost_flag();
 
         // Run the whole job in its own tenant scope. The claim is intentionally
         // unscoped (one worker drains every tenant's queue), so inside the run
@@ -517,7 +516,7 @@ impl JobWorker {
         // Stop renewing this attempt's lease regardless of outcome — the
         // job is about to reach a terminal write (or be left for reclaim),
         // so no further renewal is wanted either way.
-        drop(registration);
+        drop(hold);
 
         match outcome {
             Ok(artifact) => {
@@ -1043,21 +1042,20 @@ impl JobWorker {
             }
         }
 
-        let registration =
-            session
-                .lease_keeper()
-                .register(jammi_db::catalog::lease_keeper::LeaseTarget::Job {
-                    job_id: job_id.to_string(),
-                    instance_id: self.worker_id.clone(),
-                    attempts: attempt,
-                });
+        let hold = session
+            .lease_keeper()
+            .hold(jammi_db::catalog::lease_keeper::LeaseTarget::Job {
+                job_id: job_id.to_string(),
+                instance_id: self.worker_id.clone(),
+                attempts: attempt,
+            });
         let job_attempt = jammi_db::catalog::result_repo::JobAttempt {
             job_id,
             instance_id: &self.worker_id,
             attempts: attempt,
         };
         let outcome = crate::jobs::execute_compute(session, &spec, job_attempt).await;
-        drop(registration);
+        drop(hold);
 
         match outcome {
             Ok(result) => match serde_json::to_string(&result) {

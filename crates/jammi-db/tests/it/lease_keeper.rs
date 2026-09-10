@@ -1,4 +1,4 @@
-//! `LeaseKeeper` (N3): a dedicated OS thread that renews every registered
+//! `LeaseKeeper` (N3): a dedicated OS thread that renews every held
 //! lease from its OWN runtime and OWN catalog connection, immune to the
 //! caller's main runtime being starved by CPU-bound work.
 
@@ -60,11 +60,11 @@ async fn seeded_catalog(dir: &std::path::Path) -> Catalog {
 }
 
 /// N+1 CPU-bound tasks (no `.await` inside their loop) saturate an N-thread
-/// runtime for a real wall-clock window; the keeper's registration for a
+/// runtime for a real wall-clock window; the keeper's hold for a
 /// claimed job still renews `lease_expires_at` during that window — proving
 /// it runs from a thread the busy runtime cannot starve.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn registrations_renew_from_a_thread_while_the_callers_runtime_is_blocked() {
+async fn holds_renew_from_a_thread_while_the_callers_runtime_is_blocked() {
     const WORKER_THREADS: usize = 2;
     const BUSY_TASKS: usize = WORKER_THREADS + 1;
     let busy_for = Duration::from_millis(2_200); // > 2 heartbeat ticks at 1s
@@ -96,7 +96,7 @@ async fn registrations_renew_from_a_thread_while_the_callers_runtime_is_blocked(
 
     let intervals = fast_intervals();
     let keeper = keeper_for(dir.path().to_path_buf(), intervals);
-    let registration = keeper.register(LeaseTarget::Job {
+    let hold = keeper.hold(LeaseTarget::Job {
         job_id: claimed.job_id.clone(),
         instance_id: "instance-a".to_string(),
         attempts: claimed.attempts,
@@ -128,8 +128,8 @@ async fn registrations_renew_from_a_thread_while_the_callers_runtime_is_blocked(
     }
 
     assert!(
-        !registration.lost(),
-        "the registration must not have been marked lost during the busy window"
+        !hold.lost(),
+        "the hold must not have been marked lost during the busy window"
     );
     let after = catalog
         .get_job("kept-alive")
@@ -144,12 +144,12 @@ async fn registrations_renew_from_a_thread_while_the_callers_runtime_is_blocked(
     );
 }
 
-/// `lost()` flips to `true` once a peer's write makes the registration's own
+/// `lost()` flips to `true` once a peer's write makes the hold's own
 /// renew CAS miss (here manufactured directly: a peer steals `claimed_by`,
 /// exactly the shape a real reclaim leaves behind) — observed within one
 /// heartbeat tick, with no action from the caller.
 #[tokio::test]
-async fn lost_flag_sets_after_a_peer_reclaims_the_registered_job() {
+async fn lost_flag_sets_after_a_peer_reclaims_the_held_job() {
     let dir = tempdir().unwrap();
     let catalog = seeded_catalog(dir.path()).await;
     catalog
@@ -173,15 +173,15 @@ async fn lost_flag_sets_after_a_peer_reclaims_the_registered_job() {
 
     let intervals = fast_intervals();
     let keeper = keeper_for(dir.path().to_path_buf(), intervals);
-    let registration = keeper.register(LeaseTarget::Job {
+    let hold = keeper.hold(LeaseTarget::Job {
         job_id: claimed.job_id.clone(),
         instance_id: "instance-a".to_string(),
         attempts: claimed.attempts,
     });
-    assert!(!registration.lost(), "must not start lost");
+    assert!(!hold.lost(), "must not start lost");
 
     // A peer's reclaim, manufactured directly: steal `claimed_by` so this
-    // registration's own `WHERE claimed_by = 'instance-a'` renew CAS matches
+    // hold's own `WHERE claimed_by = 'instance-a'` renew CAS matches
     // zero rows on the keeper's next tick — exactly the state a real
     // `reclaim_expired_jobs` requeue-then-reclaim would leave behind.
     use jammi_db::catalog::backend::TxOptions;
@@ -201,7 +201,7 @@ async fn lost_flag_sets_after_a_peer_reclaims_the_registered_job() {
 
     tokio::time::sleep(Duration::from_millis(1_500)).await;
     assert!(
-        registration.lost(),
-        "the registration must observe the peer's steal within one heartbeat tick"
+        hold.lost(),
+        "the hold must observe the peer's steal within one heartbeat tick"
     );
 }

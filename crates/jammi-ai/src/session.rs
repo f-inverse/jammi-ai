@@ -54,13 +54,13 @@ pub struct InferenceSession {
     /// id `jobs.claimed_by` carries.
     instance_id: String,
     /// The process's one lease-renewal thread (N3) — every claimed lease
-    /// this session (or a job/table it owns) holds registers here instead of
-    /// spawning its own `tokio::spawn` heartbeat task, so a CPU-bound inline
-    /// compute job on the main runtime can never starve a renewal.
+    /// this session (or a job/table it owns) holds is held open here instead
+    /// of spawning its own `tokio::spawn` heartbeat task, so a CPU-bound
+    /// inline compute job on the main runtime can never starve a renewal.
     lease_keeper: Arc<jammi_db::catalog::lease_keeper::LeaseKeeper>,
-    /// This session's `instances` row registration — held for its `Drop`
-    /// (unregisters the keeper renewal when the session drops), never read.
-    _instance_registration: jammi_db::catalog::lease_keeper::Registration,
+    /// This session's `instances` row hold — held for its `Drop` (releases
+    /// the keeper renewal when the session drops), never read.
+    _instance_hold: jammi_db::catalog::lease_keeper::LeaseHold,
 }
 
 impl InferenceSession {
@@ -131,9 +131,9 @@ impl InferenceSession {
         let catalog = Arc::clone(inner.catalog());
 
         // N3: one lease-renewal thread per process, started before anything
-        // that registers a lease with it (the result store's `BuildingTable`
+        // holds a lease with it (the result store's `BuildingTable`
         // adoptions below, this session's own `instances` row, and every
-        // job/table lease a `JobWorker`/`run_now` claim registers later).
+        // job/table lease a `JobWorker`/`run_now` claim holds later).
         // `catalog_connect` opens a FRESH backend connection from inside the
         // keeper's own dedicated runtime — never this session's `catalog`
         // handle — so a CPU-bound inline job saturating the main runtime can
@@ -202,7 +202,7 @@ impl InferenceSession {
         catalog.prune_instances(retention).await?;
         catalog.prune_jobs(retention).await?;
 
-        // This process's `instances` row + keeper registration — every
+        // This process's `instances` row + keeper hold — every
         // session upserts and heartbeats one, whether or not it runs a
         // claim loop (only `workers` membership is gated on `[worker]
         // enabled`, upserted by `EmbeddedWorker::spawn`/`JobWorker`).
@@ -214,7 +214,7 @@ impl InferenceSession {
                 None,
             )
             .await?;
-        let instance_registration = lease_keeper.register(
+        let instance_hold = lease_keeper.hold(
             jammi_db::catalog::lease_keeper::LeaseTarget::Instance(instance_id.clone()),
         );
 
@@ -233,7 +233,7 @@ impl InferenceSession {
             ephemeral_sessions: jammi_db::ephemeral::ActiveSessions::new(),
             instance_id,
             lease_keeper,
-            _instance_registration: instance_registration,
+            _instance_hold: instance_hold,
         })
     }
 
@@ -247,7 +247,7 @@ impl InferenceSession {
 
     /// This process's one lease-renewal thread (N3). A
     /// [`crate::fine_tune::worker::JobWorker`] and [`Self::run_now`] both
-    /// register their claimed job leases here rather than spawning their own
+    /// hold their claimed job leases here rather than spawning their own
     /// heartbeat task.
     pub fn lease_keeper(&self) -> &Arc<jammi_db::catalog::lease_keeper::LeaseKeeper> {
         &self.lease_keeper

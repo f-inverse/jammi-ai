@@ -183,7 +183,7 @@ pub struct ResultStore {
     /// live relative to result tables.
     artifact_store: Arc<ArtifactStore>,
     /// The process's lease-renewal thread (N3) every [`BuildingTable`] this
-    /// store creates or recovery adopts registers its row with, in place of
+    /// store creates or recovery adopts holds its row with, in place of
     /// the per-table `tokio::spawn` heartbeat task earlier revisions ran.
     /// `None` — the default — means a table this store hands out is renewed
     /// by NOTHING beyond its initial lease window: correct but non-renewing,
@@ -650,7 +650,7 @@ impl ResultStore {
 
     /// Attach the process's lease-renewal thread (N3): every
     /// [`BuildingTable`] this store creates or recovery adopts from this
-    /// point on registers its row with `keeper` instead of running its own
+    /// point on holds its row open with `keeper` instead of running its own
     /// heartbeat task. The session choke point calls this once, right after
     /// constructing both, before the store serves any `create_table` call.
     pub fn with_lease_keeper(
@@ -684,7 +684,7 @@ impl ResultStore {
     }
 
     /// The process's lease-renewal keeper this store's `building` tables
-    /// register with, if one has been attached via
+    /// hold with, if one has been attached via
     /// [`Self::with_lease_keeper`].
     pub(crate) fn lease_keeper(&self) -> Option<Arc<crate::catalog::lease_keeper::LeaseKeeper>> {
         self.keeper.clone()

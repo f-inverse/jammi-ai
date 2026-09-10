@@ -1,8 +1,12 @@
 name: resolve-ci-image
 description: >
-  Resolves a mutable CI base-image ref (typically ":latest", read from a
-  repo variable with a literal fallback -- e.g. `${{ vars.JAMMI_CI_IMAGE ||
-  'ghcr.io/f-inverse/jammi-ai-ci:latest' }}`) to its index digest ONCE, so
+  Resolves a mutable CI base-image ref (typically ":latest", read by the
+  CALLER from the vars.JAMMI_CI_IMAGE repo variable with a literal fallback
+  of "ghcr.io/f-inverse/jammi-ai-ci:latest" -- a composite action's own YAML
+  cannot read the vars context, so this file itself must never contain a
+  literal double-curly expression naming it; every caller resolves that
+  fallback in its own workflow-level `with: ref:` before invoking this
+  action) to its index digest ONCE, so
   every leg of a release-artifact-producing workflow builds against the
   EXACT SAME multi-arch index even if `:latest` is republished mid-run
   (`_ci-base-image.yml`'s own header documents this race: nothing rewrites

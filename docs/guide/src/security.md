@@ -109,8 +109,10 @@ and the [Design Philosophy](./philosophy.md) already state:
   wants one, lives in the terminator or the proxy in front, not at the
   seam described under [The identity seam](./deploy-server.md#the-identity-seam).
   The CLI's `--target` refuses `grpcs://` and `https://` with a typed error
-  naming the accepted schemes (`crates/jammi-cli/src/main.rs:170-187`;
-  `CHANGELOG.md:1171`) rather than advertising a transport it cannot speak
+  naming the accepted schemes (`crates/jammi-cli/src/main.rs:170-187`; the
+  CHANGELOG's "drop `grpcs://` and `https://` as accepted `--target`
+  schemes" entry (#480), commit `616bb6d4`) rather than advertising a
+  transport it cannot speak
   — put a TLS-terminating proxy in front and point `--target` at it in
   plaintext (`grpc://`/`http://`). This is an asymmetry between the two
   clients: the Python SDK's `RemoteTarget` legitimately keeps

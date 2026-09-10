@@ -577,13 +577,23 @@ impl PyDatabase {
     }
 
     /// The engine's capabilities handshake: a dict with `version`, `features`
-    /// (compiled feature flags), and `storage_backends` (addressable storage
-    /// URL schemes). A compile-time fact about the running build. Named to match
-    /// the bundled `jammi`'s `get_server_info` (and `SessionService.
-    /// GetServerInfo`) so the embedded and remote surfaces agree.
+    /// (compiled feature flags), `storage_backends` (addressable storage URL
+    /// schemes), and `broker` (the RUNTIME trigger-broker driver this session
+    /// is running). The first three are compile-time facts; `broker` is
+    /// filled in from this session's live `TriggerBroker::driver_kind()`.
+    /// Named to match the bundled `jammi`'s `get_server_info` (and
+    /// `CatalogService.GetServerInfo`) so the embedded and remote surfaces
+    /// agree.
     fn get_server_info(&self, py: Python<'_>) -> PyResult<Py<PyAny>> {
         self.check_open()?;
-        serializable_to_pydict(py, &jammi_db::ServerInfo::current())
+        let mut info = jammi_db::ServerInfo::current();
+        info.broker = self
+            .session
+            .trigger_broker()
+            .driver_kind()
+            .as_str()
+            .to_string();
+        serializable_to_pydict(py, &info)
     }
 
     /// Execute a SQL query. Returns a `pyarrow.Table`.

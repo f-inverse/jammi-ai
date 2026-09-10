@@ -290,9 +290,15 @@ async fn remote_server_info_like_local() {
     // actually mounted. `start_engine_server` mounts the engine core + the
     // engine-backed optional tiers (eval, and train when compiled) but no
     // trigger, so `event` is absent while `core`/`eval` are present.
+    //
+    // `broker`, unlike `services`, does NOT legitimately differ: both sides
+    // hold a real `TriggerBroker` over the SAME engine `Arc` (`local(server)`
+    // wraps `server.engine` directly), so `ServerInfo::current` (which has no
+    // live session to ask) is compared against every field EXCEPT `broker`.
+    let mut current_with_broker = ServerInfo::current();
+    current_with_broker.broker = local_info.broker.clone();
     assert_eq!(
-        local_info,
-        ServerInfo::current(),
+        local_info, current_with_broker,
         "the local session's self-description carries no mounted services"
     );
     assert!(
@@ -310,6 +316,17 @@ async fn remote_server_info_like_local() {
     assert!(
         !remote_info.services.contains(&"event".to_string()),
         "this fixture mounts no trigger, so the event tier is absent"
+    );
+
+    // K4: embedded and remote report the IDENTICAL runtime broker fact — the
+    // test fixture's config defaults to the in-process broker.
+    assert_eq!(
+        local_info.broker, remote_info.broker,
+        "embedded and remote must report the same broker over the same engine"
+    );
+    assert_eq!(
+        local_info.broker, "in_memory",
+        "this fixture's config selects the default in-process broker"
     );
 
     let _ = server.shutdown.send(());

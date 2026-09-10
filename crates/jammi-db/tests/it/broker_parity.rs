@@ -1,16 +1,26 @@
 //! Cross-driver parity suite (PLAN-F §5/J6/K6, contract item 2).
 //!
-//! Parameterised over [`Arm::InMemory`] (always) and [`Arm::JetStream`]
-//! (`live-broker-tests`, requiring `JAMMI_TEST_NATS_URL`; `JAMMI_REQUIRE_NATS`
-//! turns an unset URL into a hard failure rather than a silent skip — the
-//! same require-gate shape `recovery.rs`'s `require_live_pg` uses). Every
-//! arm exercises the SAME engine-facing surface
-//! (`Subscriber`/`Publisher`/`TopicRepo`) over a fresh SQLite catalog, so a
-//! passing suite proves the `Subscriber`/`TopicTail` seam behaves
-//! identically regardless of which driver sits underneath it. The
+//! Parameterised over [`Arm::InMemory`] (always), [`Arm::Postgres`]
+//! (`JAMMI_TEST_PG_URL`; runs in the `test-pg` job, no cargo feature — F2 §4),
+//! and [`Arm::JetStream`] (`live-broker-tests`, requiring
+//! `JAMMI_TEST_NATS_URL`; `JAMMI_REQUIRE_NATS` turns an unset URL into a hard
+//! failure rather than a silent skip — the same require-gate shape
+//! `recovery.rs`'s `require_live_pg` uses). Every arm exercises the SAME
+//! engine-facing surface (`Subscriber`/`Publisher`/`TopicRepo`) over a fresh
+//! SQLite catalog, so a passing suite proves the `Subscriber`/`TopicTail`
+//! seam behaves identically regardless of which driver sits underneath it —
+//! the Postgres arm's backing table stays on SQLite; only the broker (a
+//! wake-up transport, never the log) is real Postgres `LISTEN`/`NOTIFY`. The
 //! offset-order == commit-order oracle (K5/G6) runs against a real Postgres
 //! catalog instead (two sessions sharing one database), gated by
 //! `live-postgres-tests`.
+//!
+//! Two Postgres-only oracles below are not test-case-parameterised because
+//! they need the CONCRETE `PostgresBroker` type (a test-only hook /
+//! `pg_terminate_backend`), not the `Arc<dyn TriggerBroker>` trait object
+//! `broker_for` returns: `postgres_listener_killed_recovers_via_replay`
+//! (F5/PLAN-F §5(d)) and `postgres_suppressed_notify_recovers_via_idle_tick`
+//! (G9/PLAN-F §5(g)).
 
 use std::collections::BTreeMap;
 use std::str::FromStr;
@@ -36,8 +46,8 @@ use jammi_db::tenant_scope::TenantBinding;
 #[cfg(feature = "jetstream-broker")]
 use jammi_db::trigger::JetStreamBroker;
 use jammi_db::trigger::{
-    InMemoryBroker, Offset, Predicate, Publisher, Subscriber, TopicDefinition, TopicId,
-    TriggerBroker,
+    InMemoryBroker, Offset, PostgresBroker, Predicate, Publisher, Subscriber, TopicDefinition,
+    TopicId, TriggerBroker,
 };
 use test_case::test_case;
 
@@ -67,16 +77,38 @@ fn require_live_pg(test_name: &str) {
 #[derive(Clone, Copy)]
 enum Arm {
     InMemory,
+    Postgres,
     #[cfg(feature = "jetstream-broker")]
     JetStream,
 }
 
-/// Build the driver for `arm`, or `None` for the JetStream arm when
-/// `JAMMI_TEST_NATS_URL` is unset (never `#[ignore]`).
+/// `idle_poll` for every `Arm::Postgres` broker built in this suite: short
+/// enough that the idle-tick fallback (used by every replay-triggered
+/// assertion below, not only the dedicated idle-tick oracle) never makes a
+/// test wait long, without being so short it flakes under CI scheduling
+/// jitter.
+const TEST_IDLE_POLL: Duration = Duration::from_secs(1);
+
+/// Build the driver for `arm`, or `None` for a live-broker arm whose env var
+/// is unset (never `#[ignore]`).
 #[cfg_attr(not(feature = "jetstream-broker"), allow(unused_variables))]
 async fn broker_for(arm: Arm, test_name: &str) -> Option<Arc<dyn TriggerBroker>> {
     match arm {
         Arm::InMemory => Some(Arc::new(InMemoryBroker::new()) as Arc<dyn TriggerBroker>),
+        Arm::Postgres => {
+            let url = match jammi_test_utils::pg_url_for_tests() {
+                Some(u) => u,
+                None => {
+                    eprintln!("skipping {test_name}: JAMMI_TEST_PG_URL unset");
+                    require_live_pg(test_name);
+                    return None;
+                }
+            };
+            let broker = PostgresBroker::connect(&url, TEST_IDLE_POLL)
+                .await
+                .expect("connect to Postgres broker");
+            Some(Arc::new(broker) as Arc<dyn TriggerBroker>)
+        }
         #[cfg(feature = "jetstream-broker")]
         Arm::JetStream => {
             let url = match std::env::var("JAMMI_TEST_NATS_URL") {
@@ -197,6 +229,7 @@ where
 /// (a) Live tail after subscribe delivers every published offset exactly
 /// once, in ascending order.
 #[test_case(Arm::InMemory ; "in_memory")]
+#[test_case(Arm::Postgres ; "postgres")]
 #[cfg_attr(feature = "jetstream-broker", test_case(Arm::JetStream ; "jetstream"))]
 #[tokio::test]
 async fn live_tail_delivers_every_offset_exactly_once_in_order(arm: Arm) {
@@ -241,6 +274,7 @@ async fn live_tail_delivers_every_offset_exactly_once_in_order(arm: Arm) {
 /// (never delivery order) that must still deliver a gap-free, in-order,
 /// exactly-once stream.
 #[test_case(Arm::InMemory ; "in_memory")]
+#[test_case(Arm::Postgres ; "postgres")]
 #[cfg_attr(feature = "jetstream-broker", test_case(Arm::JetStream ; "jetstream"))]
 #[tokio::test]
 async fn two_publishers_over_one_broker_deliver_gap_free_in_order(arm: Arm) {
@@ -312,6 +346,7 @@ async fn two_publishers_over_one_broker_deliver_gap_free_in_order(arm: Arm) {
 /// overlap, and the seam must dedup that overlap so no offset is delivered
 /// twice.
 #[test_case(Arm::InMemory ; "in_memory")]
+#[test_case(Arm::Postgres ; "postgres")]
 #[cfg_attr(feature = "jetstream-broker", test_case(Arm::JetStream ; "jetstream"))]
 #[tokio::test]
 async fn from_offset_in_past_replay_and_live_overlap_no_duplicates(arm: Arm) {
@@ -370,6 +405,7 @@ async fn from_offset_in_past_replay_and_live_overlap_no_duplicates(arm: Arm) {
 /// (`TopicDefinition::tenant == None`), so one `topic.id` is shared across
 /// tenants.
 #[test_case(Arm::InMemory ; "in_memory")]
+#[test_case(Arm::Postgres ; "postgres")]
 #[cfg_attr(feature = "jetstream-broker", test_case(Arm::JetStream ; "jetstream"))]
 #[tokio::test]
 async fn tenant_scoped_subscriber_never_sees_another_tenants_rows(arm: Arm) {
@@ -430,6 +466,7 @@ async fn tenant_scoped_subscriber_never_sees_another_tenants_rows(arm: Arm) {
 /// publish wider than one replay chunk (H2's group-completion probe) back
 /// into ONE `DeliveredBatch` in original row order.
 #[test_case(Arm::InMemory ; "in_memory")]
+#[test_case(Arm::Postgres ; "postgres")]
 #[cfg_attr(feature = "jetstream-broker", test_case(Arm::JetStream ; "jetstream"))]
 #[tokio::test]
 async fn subscriber_lag_self_heals_via_chunked_group_completing_replay(arm: Arm) {
@@ -521,6 +558,7 @@ async fn subscriber_lag_self_heals_via_chunked_group_completing_replay(arm: Arm)
 /// attached to a tail. Each subscriber must still see exactly its own
 /// predicate's matches.
 #[test_case(Arm::InMemory ; "in_memory")]
+#[test_case(Arm::Postgres ; "postgres")]
 #[cfg_attr(feature = "jetstream-broker", test_case(Arm::JetStream ; "jetstream"))]
 #[tokio::test]
 async fn two_predicate_subscribers_share_one_driver_subscription(arm: Arm) {
@@ -584,6 +622,7 @@ async fn two_predicate_subscribers_share_one_driver_subscription(arm: Arm) {
 /// subscribe (not just replay), registered through `TopicRepo::register_topic`
 /// so the oracle pins the persisted type-name table.
 #[test_case(Arm::InMemory ; "in_memory")]
+#[test_case(Arm::Postgres ; "postgres")]
 #[cfg_attr(feature = "jetstream-broker", test_case(Arm::JetStream ; "jetstream"))]
 #[tokio::test]
 async fn every_accepted_type_round_trips_through_live_subscribe(arm: Arm) {
@@ -771,5 +810,140 @@ async fn offset_order_equals_commit_order_two_sessions_one_postgres() {
         replay_seq, expected_seq,
         "replay order (by `_offset`) must equal the true commit order recorded by the shared \
          commit log -- this is the invariant the offset-assigning UPDATE's row lock provides"
+    );
+}
+
+/// `application_name` `PostgresBroker`'s dedicated listener connection tags
+/// itself with — must match `crate::trigger::postgres::LISTENER_APPLICATION_NAME`
+/// (a private constant; duplicated here rather than exposed only for a test).
+const LISTENER_APPLICATION_NAME: &str = "jammi-trigger-listener";
+
+/// Terminate every Postgres backend tagged with [`LISTENER_APPLICATION_NAME`]
+/// (never this connection's own backend) — simulates a `PostgresBroker`'s
+/// dedicated listener connection dying out from under it, so the next
+/// `try_recv()` observes a connection-reset error and self-heals via sqlx's
+/// own eager-reconnect contract (F5).
+async fn kill_broker_listener_backends(url: &str) {
+    let pool = sqlx::postgres::PgPoolOptions::new()
+        .max_connections(1)
+        .connect(url)
+        .await
+        .expect("connect to kill the listener backend");
+    sqlx::query(
+        "SELECT pg_terminate_backend(pid) FROM pg_stat_activity \
+         WHERE application_name = $1 AND pid <> pg_backend_pid()",
+    )
+    .bind(LISTENER_APPLICATION_NAME)
+    .fetch_all(&pool)
+    .await
+    .expect("pg_terminate_backend query");
+}
+
+/// (d)/F5: killing the broker's dedicated listener backend loses whatever
+/// NOTIFYs arrive during the reconnect window, but every offset still arrives
+/// -- via `Ok(None)`'s wake-every-topic fallback (and, as a second net, the
+/// idle tick) driving the engine's own replay.
+#[tokio::test]
+async fn postgres_listener_killed_recovers_via_replay() {
+    let Some(url) = jammi_test_utils::pg_url_for_tests() else {
+        eprintln!("skipping postgres_listener_killed_recovers_via_replay: JAMMI_TEST_PG_URL unset");
+        require_live_pg("postgres_listener_killed_recovers_via_replay");
+        return;
+    };
+    let broker: Arc<dyn TriggerBroker> = Arc::new(
+        PostgresBroker::connect(&url, TEST_IDLE_POLL)
+            .await
+            .expect("connect to Postgres broker"),
+    );
+    let h = build_harness(Arc::clone(&broker)).await;
+    let topic = topic_def(&format!(
+        "parity.pg_listener_killed.{}",
+        jammi_test_utils::unique_suffix()
+    ));
+    h.broker.register_topic(&topic).await.unwrap();
+    h.topic_repo.register_topic(&topic).await.unwrap();
+
+    let mut sub = h
+        .subscriber
+        .subscribe(&topic, Predicate::match_all(), None)
+        .await
+        .unwrap();
+
+    h.publisher
+        .publish_scoped(&topic, None, batch_of(&[1]))
+        .await
+        .unwrap();
+    let d1 = next_with_timeout(&mut sub).await.unwrap().unwrap();
+    assert_eq!(seq_column(&d1.batch), vec![1]);
+
+    kill_broker_listener_backends(&url).await;
+
+    // Publish more rows while the listener may still be mid-reconnect; any
+    // NOTIFY lost in that window is covered by `Ok(None)`'s wake-every-topic
+    // fallback once reconnected, and by the idle tick as a second net.
+    for i in 2..=5i64 {
+        h.publisher
+            .publish_scoped(&topic, None, batch_of(&[i]))
+            .await
+            .unwrap();
+    }
+
+    let mut seen: Vec<i64> = vec![1];
+    while seen.len() < 5 {
+        let d = next_with_timeout(&mut sub).await.unwrap().unwrap();
+        seen.extend(seq_column(&d.batch));
+    }
+    assert_eq!(
+        seen,
+        vec![1, 2, 3, 4, 5],
+        "every offset must arrive via replay after the listener's own backend is killed"
+    );
+}
+
+/// (g)/G9: a NOTIFY the broker itself never sends (simulating one Postgres
+/// silently drops) is still covered within `idle_poll` by the idle tick — no
+/// error, no permanent loss.
+#[tokio::test]
+async fn postgres_suppressed_notify_recovers_via_idle_tick() {
+    let Some(url) = jammi_test_utils::pg_url_for_tests() else {
+        eprintln!(
+            "skipping postgres_suppressed_notify_recovers_via_idle_tick: JAMMI_TEST_PG_URL unset"
+        );
+        require_live_pg("postgres_suppressed_notify_recovers_via_idle_tick");
+        return;
+    };
+    let concrete = Arc::new(
+        PostgresBroker::connect(&url, Duration::from_millis(300))
+            .await
+            .expect("connect to Postgres broker"),
+    );
+    let broker: Arc<dyn TriggerBroker> = Arc::clone(&concrete) as Arc<dyn TriggerBroker>;
+    let h = build_harness(broker).await;
+    let topic = topic_def(&format!(
+        "parity.pg_suppressed_notify.{}",
+        jammi_test_utils::unique_suffix()
+    ));
+    h.broker.register_topic(&topic).await.unwrap();
+    h.topic_repo.register_topic(&topic).await.unwrap();
+
+    let mut sub = h
+        .subscriber
+        .subscribe(&topic, Predicate::match_all(), None)
+        .await
+        .unwrap();
+
+    concrete.suppress_next_notify_for_testing();
+    h.publisher
+        .publish_scoped(&topic, None, batch_of(&[7]))
+        .await
+        .unwrap();
+
+    // No NOTIFY was ever sent for this publish; only the idle tick (300ms)
+    // can surface it. `next_with_timeout`'s 5s budget comfortably covers it.
+    let d = next_with_timeout(&mut sub).await.unwrap().unwrap();
+    assert_eq!(
+        seq_column(&d.batch),
+        vec![7],
+        "a suppressed NOTIFY must still be delivered within idle_poll via the idle tick"
     );
 }

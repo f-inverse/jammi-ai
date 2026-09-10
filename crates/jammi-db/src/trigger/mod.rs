@@ -11,6 +11,7 @@ pub mod in_memory;
 #[cfg(feature = "jetstream-broker")]
 pub mod jetstream;
 pub mod offset;
+pub mod postgres;
 pub mod predicate;
 pub mod publisher;
 pub mod subscriber;
@@ -26,6 +27,7 @@ pub use in_memory::InMemoryBroker;
 #[cfg(feature = "jetstream-broker")]
 pub use jetstream::JetStreamBroker;
 pub use offset::Offset;
+pub use postgres::PostgresBroker;
 pub use predicate::Predicate;
 pub use publisher::Publisher;
 pub use subscriber::Subscriber;

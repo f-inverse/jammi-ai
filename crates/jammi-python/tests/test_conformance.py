@@ -686,6 +686,7 @@ def _client_server_info_keys() -> set:
         features = []
         storage_backends = []
         services = []
+        broker = "in_memory"
 
     class _StubCatalog:
         def GetServerInfo(self, *_a, **_k):

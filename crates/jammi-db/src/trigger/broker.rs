@@ -115,4 +115,21 @@ pub trait TriggerBroker: Send + Sync + 'static {
 pub enum BrokerKind {
     InMemory,
     JetStream,
+    /// [`crate::trigger::PostgresBroker`] — a wake-up transport over
+    /// `LISTEN`/`NOTIFY`; the topic's mutable backing table is the
+    /// authoritative log (see `crate::trigger::postgres`'s module docs).
+    Postgres,
+}
+
+impl BrokerKind {
+    /// The runtime string `ServerInfo::broker` reports and the
+    /// `[broker.<kind>]` config section tag uses for this kind:
+    /// `"in_memory"` | `"jet_stream"` | `"postgres"`.
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            Self::InMemory => "in_memory",
+            Self::JetStream => "jet_stream",
+            Self::Postgres => "postgres",
+        }
+    }
 }

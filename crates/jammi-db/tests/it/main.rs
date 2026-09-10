@@ -1,5 +1,6 @@
 mod audit;
 mod broker_parity;
+mod broker_postgres_config;
 mod caching;
 mod catalog_ping;
 mod channels;

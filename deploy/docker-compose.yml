@@ -32,8 +32,13 @@ services:
       JAMMI_SERVER__SERVICES: all
       JAMMI_AUDIT_MASTER_KEY: ${JAMMI_AUDIT_MASTER_KEY:?set it in .env}
     ports:
-      - "8081:8081" # gRPC + Flight SQL
-      - "8080:8080" # HTTP side-channel (/healthz, /readyz, /metrics)
+      # Loopback-bound deliberately: the deployer publishes these for a
+      # TLS-terminating proxy running on the same host to reach (see
+      # `docs/guide/src/security.md`'s transport-encryption section), never
+      # for direct exposure to an untrusted network. TLS termination is the
+      # deployer's runtime, not this compose file's job.
+      - "127.0.0.1:8081:8081" # gRPC + Flight SQL
+      - "127.0.0.1:8080:8080" # HTTP side-channel (/healthz, /readyz, /metrics)
     volumes:
       # Artifacts (indices, materialized Parquet, `index_cache`) and the
       # Hugging Face Hub cache (`HF_HOME`, set by the image) — a named

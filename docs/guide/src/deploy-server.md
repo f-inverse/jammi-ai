@@ -278,6 +278,12 @@ not duplicate that contract a second time; see:
   `assemble_grpc_chain` once, authenticates both the gRPC control plane and
   the Flight `db.sql` lane.
 
+Transport encryption is a separate decision from the identity seam above —
+see [Security
+Posture](./security.md#transport-encryption-is-the-deployers-runtime-not-the-engines)
+for why the engine ships no TLS code path and how a deployer's runtime
+terminates it in front.
+
 Run the server where only trusted clients can reach it (a private network /
 VPC with the gRPC + health ports, `8081` / `8080`, closed to the public
 internet; network policy or a firewall; or an authenticating reverse proxy) —

@@ -373,6 +373,14 @@ workspace ships every publishable crate at the same
   changes).
 
 ### Changed
+- **`deploy/docker-compose.yml`'s published ports are loopback-bound (#480).**
+  `8081` (gRPC + Flight SQL) and `8080` (the HTTP side-channel) now publish
+  as `127.0.0.1:8081:8081` / `127.0.0.1:8080:8080` rather than
+  `0.0.0.0`-equivalent bare `8081:8081` / `8080:8080` — the deployer
+  publishes them deliberately for a TLS-terminating proxy on the same host
+  to reach, never for direct exposure to an untrusted network. The compose
+  smoke workflow is unaffected: `tests/compose/shape_b_remote.py` already
+  targets `127.0.0.1`.
 - **The published server images no longer pass `--config`; the Compose
   healthcheck is `jammi-server probe` (#482).** Every runtime stage's `CMD`
   is now `["serve"]`, resolved through the config chain `serve` always
@@ -719,6 +727,17 @@ workspace ships every publishable crate at the same
   for every driver, not only Postgres: a driver-delivered batch is fanned out only when it is
   exactly the tail's cursor + 1, and any gap or regression triggers a replay instead, because
   post-commit fan-out across replicas is unordered regardless of transport.
+
+### Docs
+- **Transport encryption is the deployer's runtime, not the engine's (#480).**
+  `security.md` gains a normative section closing out engine-side TLS: B4
+  constrains what the engine forks on, not what fronts it; the boundary
+  table is the second gate past the discipline test; `[server] tls` is
+  already a typed `deny_unknown_fields` startup refusal, never a silent
+  plaintext fallback; and a Caddy/nginx example terminates TLS in front of
+  the loopback-bound reference Compose listeners. `deploy-server.md` and
+  `reference-topologies.md` point at the decision from the identity seam
+  and the Compose section respectively.
 
 ### Fixed
 - **Two concurrent `migrate()` callers on a fresh Postgres database could both attempt the

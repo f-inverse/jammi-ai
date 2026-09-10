@@ -236,12 +236,50 @@ jobs:
           docker buildx imagetools create --dry-run "${tag_args[@]}" "${sources[@]}" \
             | bash ci/scripts/check_merged_index_platforms.sh "linux/amd64,linux/arm64"
 
+          # Capture the PRE-CREATE digest of the immutable `sha-<sha>` tag
+          # BEFORE the real (mutating) create below -- if the post-push
+          # confirm fails, this is the exact digest to restore to. Same
+          # not-found-vs-any-other-failure split as `_ci-base-image.yml`'s
+          # `promote` step (:345-378): a genuine first publish has nothing
+          # to restore to; any other read failure means this step cannot
+          # even confirm what it would be overwriting.
+          set +e
+          previous_digest="$(docker buildx imagetools inspect "${IMAGE}:${SHA_TAG}" --format '{{.Manifest.Digest}}' 2>/tmp/merge-cpu-main-inspect-stderr.txt)"
+          inspect_rc=$?
+          set -e
+          inspect_stderr="$(cat /tmp/merge-cpu-main-inspect-stderr.txt)"
+          if [ "$inspect_rc" -ne 0 ]; then
+            if [[ "$inspect_stderr" == *"${IMAGE}:${SHA_TAG}: not found"* ]]; then
+              previous_digest=""
+              echo "pre-create digest read: ${IMAGE}:${SHA_TAG} does not exist yet (first publish) -- nothing to restore to"
+            else
+              echo "::error::pre-create digest read for ${IMAGE}:${SHA_TAG} failed with something other than a not-found result -- refusing to promote: $inspect_stderr" >&2
+              exit 1
+            fi
+          elif [[ ! "$previous_digest" =~ ^sha256:[0-9a-f]{64}$ ]]; then
+            echo "::error::pre-create digest read for ${IMAGE}:${SHA_TAG} succeeded but returned an unexpected value ('$previous_digest', not a sha256 digest) -- refusing to promote" >&2
+            exit 1
+          fi
+          echo "previous_digest=$previous_digest" >> "$GITHUB_OUTPUT"
+
           docker buildx imagetools create "${tag_args[@]}" "${sources[@]}"
 
-          first_tag="$(head -n1 <<< "$TAGS")"
-          digest="$(docker buildx imagetools inspect "$first_tag" --format '{{.Manifest.Digest}}')"
-          docker buildx imagetools inspect "$first_tag" --format '{{json .Manifest}}' \
-            | bash ci/scripts/check_merged_index_platforms.sh "linux/amd64,linux/arm64"
+          # V4: re-read the IMMUTABLE `sha-<sha>` tag, not a mutable tag off
+          # $TAGS -- the digest this step attests, and the digest the
+          # attestation checks below verify, must be the one the merge
+          # itself just wrote, not whatever a later push re-points a
+          # mutable tag to.
+          if ! digest="$(docker buildx imagetools inspect "${IMAGE}:${SHA_TAG}" --format '{{.Manifest.Digest}}')" \
+              || ! docker buildx imagetools inspect "${IMAGE}:${SHA_TAG}" --format '{{json .Manifest}}' \
+                | bash ci/scripts/check_merged_index_platforms.sh "linux/amd64,linux/arm64"; then
+            if [ -n "$previous_digest" ]; then
+              restore_ref="${IMAGE}@${previous_digest}"
+              echo "::error::post-push confirm failed for ${IMAGE}:${SHA_TAG} -- the re-read merged index is missing or wrong; previous digest was $previous_digest; restore with: docker buildx imagetools create -t ${IMAGE}:${SHA_TAG} $restore_ref" >&2
+            else
+              echo "::error::post-push confirm failed for ${IMAGE}:${SHA_TAG} -- the re-read merged index is missing or wrong, and this was the first publish of this tag, so there is no previous digest to restore to; investigate directly" >&2
+            fi
+            exit 1
+          fi
           echo "digest=$digest" >> "$GITHUB_OUTPUT"
         id: merge
 
@@ -251,6 +289,23 @@ jobs:
           subject-name: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}
           subject-digest: ${{ steps.merge.outputs.digest }}
           push-to-registry: true
+
+      # BLOCK 3 (#482): every OTHER push job in this workflow runs both
+      # checks below against its own pushed digest; this merge job attested
+      # the merged index above but never verified it -- the exact
+      # "attested, not verified" gap `deploy-server.md`'s "on every push
+      # job" claim requires closed.
+      - name: Assert BuildKit provenance + SBOM are in the image index
+        shell: bash
+        env:
+          REF: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}@${{ steps.merge.outputs.digest }}
+        run: bash ci/scripts/assert_image_attestations.sh
+
+      - name: Verify the Sigstore attestation bundle (gh attestation verify)
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh attestation verify "oci://${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}@${{ steps.merge.outputs.digest }}" --owner ${{ github.repository_owner }} --bundle-from-oci
 
   # CPU image, tag arm: pushed from `v*` tag refs (semver tags) only — a tag
   # push, or a recovery dispatch run on the tag — behind the shared
@@ -377,12 +432,50 @@ jobs:
           docker buildx imagetools create --dry-run "${tag_args[@]}" "${sources[@]}" \
             | bash ci/scripts/check_merged_index_platforms.sh "linux/amd64,linux/arm64"
 
+          # Capture the PRE-CREATE digest of the immutable `sha-<sha>` tag
+          # BEFORE the real (mutating) create below -- if the post-push
+          # confirm fails, this is the exact digest to restore to. Same
+          # not-found-vs-any-other-failure split as `_ci-base-image.yml`'s
+          # `promote` step (:345-378): a genuine first publish has nothing
+          # to restore to; any other read failure means this step cannot
+          # even confirm what it would be overwriting.
+          set +e
+          previous_digest="$(docker buildx imagetools inspect "${IMAGE}:${SHA_TAG}" --format '{{.Manifest.Digest}}' 2>/tmp/merge-cpu-tag-inspect-stderr.txt)"
+          inspect_rc=$?
+          set -e
+          inspect_stderr="$(cat /tmp/merge-cpu-tag-inspect-stderr.txt)"
+          if [ "$inspect_rc" -ne 0 ]; then
+            if [[ "$inspect_stderr" == *"${IMAGE}:${SHA_TAG}: not found"* ]]; then
+              previous_digest=""
+              echo "pre-create digest read: ${IMAGE}:${SHA_TAG} does not exist yet (first publish) -- nothing to restore to"
+            else
+              echo "::error::pre-create digest read for ${IMAGE}:${SHA_TAG} failed with something other than a not-found result -- refusing to promote: $inspect_stderr" >&2
+              exit 1
+            fi
+          elif [[ ! "$previous_digest" =~ ^sha256:[0-9a-f]{64}$ ]]; then
+            echo "::error::pre-create digest read for ${IMAGE}:${SHA_TAG} succeeded but returned an unexpected value ('$previous_digest', not a sha256 digest) -- refusing to promote" >&2
+            exit 1
+          fi
+          echo "previous_digest=$previous_digest" >> "$GITHUB_OUTPUT"
+
           docker buildx imagetools create "${tag_args[@]}" "${sources[@]}"
 
-          first_tag="$(head -n1 <<< "$TAGS")"
-          digest="$(docker buildx imagetools inspect "$first_tag" --format '{{.Manifest.Digest}}')"
-          docker buildx imagetools inspect "$first_tag" --format '{{json .Manifest}}' \
-            | bash ci/scripts/check_merged_index_platforms.sh "linux/amd64,linux/arm64"
+          # V4: re-read the IMMUTABLE `sha-<sha>` tag, not a mutable tag off
+          # $TAGS -- the digest this step attests, and the digest the
+          # attestation checks below verify, must be the one the merge
+          # itself just wrote, not whatever a later push re-points a
+          # mutable tag to.
+          if ! digest="$(docker buildx imagetools inspect "${IMAGE}:${SHA_TAG}" --format '{{.Manifest.Digest}}')" \
+              || ! docker buildx imagetools inspect "${IMAGE}:${SHA_TAG}" --format '{{json .Manifest}}' \
+                | bash ci/scripts/check_merged_index_platforms.sh "linux/amd64,linux/arm64"; then
+            if [ -n "$previous_digest" ]; then
+              restore_ref="${IMAGE}@${previous_digest}"
+              echo "::error::post-push confirm failed for ${IMAGE}:${SHA_TAG} -- the re-read merged index is missing or wrong; previous digest was $previous_digest; restore with: docker buildx imagetools create -t ${IMAGE}:${SHA_TAG} $restore_ref" >&2
+            else
+              echo "::error::post-push confirm failed for ${IMAGE}:${SHA_TAG} -- the re-read merged index is missing or wrong, and this was the first publish of this tag, so there is no previous digest to restore to; investigate directly" >&2
+            fi
+            exit 1
+          fi
           echo "digest=$digest" >> "$GITHUB_OUTPUT"
 
       - name: Attest build provenance (the merged index)
@@ -391,6 +484,23 @@ jobs:
           subject-name: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}
           subject-digest: ${{ steps.merge.outputs.digest }}
           push-to-registry: true
+
+      # BLOCK 3 (#482): every OTHER push job in this workflow runs both
+      # checks below against its own pushed digest; this merge job attested
+      # the merged index above but never verified it -- the exact
+      # "attested, not verified" gap `deploy-server.md`'s "on every push
+      # job" claim requires closed.
+      - name: Assert BuildKit provenance + SBOM are in the image index
+        shell: bash
+        env:
+          REF: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}@${{ steps.merge.outputs.digest }}
+        run: bash ci/scripts/assert_image_attestations.sh
+
+      - name: Verify the Sigstore attestation bundle (gh attestation verify)
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh attestation verify "oci://${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}@${{ steps.merge.outputs.digest }}" --owner ${{ github.repository_owner }} --bundle-from-oci
 
   # Self-contained variant: opt-in, dispatch-only. Builds the
   # `runtime-selfcontained` stage (baked config + encoder) from the
@@ -589,6 +699,7 @@ jobs:
   # no GHCR write.
   build-cuda-pr:
     if: github.event_name == 'pull_request'
+    needs: [resolve-base]
     runs-on: ubuntu-latest
     permissions:
       contents: read
@@ -617,6 +728,7 @@ jobs:
           build-args: |
             RUNTIME_VARIANT=runtime-cuda
             CARGO_FEATURES=${{ steps.manifest.outputs.cargo_features }}
+            BASE_IMAGE_CUDA=${{ needs.resolve-base.outputs.image_cuda }}
           # T7: same explicit-amd64 rule as the pushing CUDA leg above --
           # this build-only verification stays byte-identical in platform
           # coverage to what actually ships.

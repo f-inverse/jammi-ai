@@ -291,10 +291,13 @@ The OSS server ships as two public Docker images on GHCR:
 - `ghcr.io/f-inverse/jammi-ai-server` — **CPU**, built from a distroless base.
 - `ghcr.io/f-inverse/jammi-ai-server-cu12` — **CUDA**, for GPU-accelerated inference (see [GPU serving](#gpu-serving)).
 
-Each pushed CPU tag is a multi-arch image index: `linux/amd64` and
-`linux/arm64`, so `docker pull`/`docker run` resolves the right member for the
-host's architecture automatically. The CUDA (`-cu12`) image is `linux/amd64`
-only.
+The generic CPU tags (`:latest`, `:vX.Y.Z`, `:vX.Y`, and their `sha-<sha>`
+equivalents) are multi-arch image indexes: `linux/amd64` and `linux/arm64`,
+so `docker pull`/`docker run` resolves the right member for the host's
+architecture automatically. The self-contained CPU tags
+(`:selfcontained`, `:selfcontained-sha-<sha>`) and the CUDA (`-cu12`) tags
+are `linux/amd64` only, pushed under the same CPU image name in the
+self-contained case.
 
 Both run as the nonroot user (uid `65532`), expose the same `8080` / `8081` ports the local binary listens on, and share the same tag scheme (`:latest`, `:vX.Y.Z`, `:vX.Y`). Both `:latest` tags are re-pointed by every `v*` release tag (never by a prerelease); the CPU `:latest` can additionally be re-pointed to the current `main` by a manual `build-and-push-main` dispatch. The image entrypoint is `jammi-server`, so `docker run <image>` brings up the server with **zero config** — a local SQLite catalog, the in-memory broker, and every service tier, no TOML required. The `jammi` admin CLI also ships in the image for running verbs against the server. The examples below use the CPU image.
 

@@ -91,6 +91,7 @@ jobs:
       # the built wheel (maturin, unlike `_pypi-server.yml`'s staged
       # binary, never leaves a bare .so at a fixed path -- unzip first).
       - name: Assert the GLIBC symbol-version floor (manylinux_2_28)
+        id: glibc-floor
         run: |
           set -euo pipefail
           wheel="$(ls dist/*.whl)"
@@ -102,6 +103,16 @@ jobs:
             exit 1
           fi
           bash ../../ci/scripts/assert_glibc_floor.sh "$so" 2.28
+          echo "so_path=$so" >> "$GITHUB_OUTPUT"
+
+      # BLOCK 1 (#482): maturin derives the wheel's own platform tag
+      # (manylinux_2_28_${{ matrix.arch }}) from the container it runs in --
+      # nothing re-checks that the built `.so`'s actual machine matches
+      # `matrix.arch` before it ships under that tag. Same shared script
+      # `_pypi-server.yml` and `package_release_bin.sh` use, run against the
+      # `.so` this job already unzipped above.
+      - name: Assert the wheel's .so ELF machine matches matrix.arch
+        run: bash ../../ci/scripts/assert_elf_machine.sh "${{ steps.glibc-floor.outputs.so_path }}" ${{ matrix.arch }}
 
       - uses: actions/upload-artifact@v4
         with:

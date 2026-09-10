@@ -3998,6 +3998,20 @@ base image: `.docker/ci.Dockerfile` (= `jammi-ai-ci`), a multi-arch index (`linu
 `linux/arm64`, one native leg per platform, merged by `_ci-base-image.yml`); the CUDA image extends
 it and stays `linux/amd64`-only.
 
+Every multi-arch image this workspace publishes (the CI base image above, and the CPU
+`jammi-ai-server` image) is built the same two-leg-plus-merge way, never a single `docker buildx
+build --platform linux/amd64,linux/arm64` (which would need QEMU emulation for the non-native
+arch): one job per arch, on that arch's own NATIVE runner (`ubuntu-latest` / `ubuntu-24.04-arm`, no
+QEMU), each pushing ONLY its own immutable per-arch tag (`sha-<sha>-<arch>`) — never a real,
+consumer-facing tag. A separate merge job then combines those two immutable per-arch sources into
+the real tags with `docker buildx imagetools create`, dry-running the merge first and asserting the
+resulting index's platform set BEFORE the real (pushing) `imagetools create` runs — verify-then-
+promote, not promote-then-hope. That merge job is the ONLY job that ever moves a real tag; the two
+per-arch build legs never do. `server-image.yml`'s CPU image runs this pattern twice — once
+ungated (`build-and-push-main` → `merge-cpu-main`, `main`-dispatch only, `:latest`/`sha-<sha>`) and
+once prove-gated (`build-and-push` → `merge-cpu-tag`, `v*` tags only, semver/`:latest`/`sha-<sha>`)
+— mirroring `_ci-base-image.yml`'s own single merge job for the CI base image itself.
+
 **Run before pushing (the local gate, mirrors `check`):**
 - `cargo fmt --all -- --check`
 - `cargo clippy --workspace --all-targets -- -D warnings`
@@ -4078,11 +4092,18 @@ here can retroactively un-push a tag. Then tag both `v*` and `py-v*`
   topological order, skip already-published, block on sparse-index propagation; `github-release`
   chains off `publish`) + `.github/workflows/npm.yml` (build+test unconditional; the `Publish` step
   itself is prove-gated) + `.github/workflows/server-image.yml` (the manual `:latest` CPU refresh via
-  `workflow_dispatch` on `main` is intentionally ungated — `build-and-push-main`; `server-image.yml`
-  carries no `push: branches:` trigger, so this never fires on a mere merge; both `:latest` tags are
+  `workflow_dispatch` on `main` is intentionally ungated — `build-and-push-main` pushes each arch's
+  own immutable `sha-<sha>-<arch>` leg, `merge-cpu-main` merges them into the real `:latest`/`sha-<sha>`
+  tags via `docker buildx imagetools create`, `gate_kind` "none"; `server-image.yml` carries no
+  `push: branches:` trigger, so this arm never fires on a mere merge; both `:latest` tags are
   separately re-pointed by every `v*` release tag itself, via `docker/metadata-action`'s default
-  `flavor: latest=auto`, so the CPU `:latest` is never main-only; the CPU and CUDA TAG
-  promotions — `build-and-push` and `build-and-push-cu12` — are both prove-gated) +
+  `flavor: latest=auto`, so the CPU `:latest` is never main-only. Publishing an image under a `v*`
+  tag is a two-leg + merge pattern (CPU only — the CUDA image builds and pushes in one amd64-only
+  job, no merge needed): `build-and-push` pushes ONLY each arch's own immutable
+  `sha-<sha>-<arch>` leg (never a real tag), then `merge-cpu-tag` — gated on `build-and-push`'s own
+  success — is the ONLY job that ever moves the real semver/`:latest`/`sha-<sha>` tags this arm
+  publishes, via the same dry-run-then-`imagetools create` shape as `merge-cpu-main`. The prove-gated
+  tag promotions are `build-and-push`, `merge-cpu-tag`, and `build-and-push-cu12`) +
   `.github/workflows/release-binaries.yml` (every asset family — the CLI matrix, the CPU tarball, the
   CUDA tarball — is split into an ungated build leg that always runs and a prove-gated promote leg
   that only attaches to the release on a tag).

@@ -327,10 +327,13 @@ only on a custom build that opts into it explicitly; do not read this
 image's Postgres-catalog support as evidence that source federation is
 available.
 
-**Node architecture.** The CPU image (`ghcr.io/f-inverse/jammi-ai-server`) is
-a multi-arch index — `linux/amd64` and `linux/arm64` — so Shapes B/C's query
-tier and Shape D's disaggregated query tier can schedule onto either an amd64
-or an arm64 node pool without a per-arch tag; `docker pull`/Kubernetes resolve
-the right member automatically. Shape D's GPU compute tier is unaffected by
-this: the CUDA image (`-cu12`) is `linux/amd64` only, so the GPU node pool
-stays amd64.
+**Node architecture.** The CPU image's generic tags (`ghcr.io/f-inverse/jammi-ai-server:latest`/`:vX.Y.Z`/`:vX.Y`
+and their `sha-<sha>` equivalents) are a multi-arch index — `linux/amd64` and
+`linux/arm64` — so Shapes B/C's query tier and Shape D's disaggregated query
+tier can schedule onto either an amd64 or an arm64 node pool without a
+per-arch tag; `docker pull`/Kubernetes resolve the right member
+automatically. Shape D's GPU compute tier is unaffected by this: the CUDA
+image (`-cu12`) is `linux/amd64` only, so the GPU node pool stays amd64. The
+same CPU image name's self-contained tags (`:selfcontained`,
+`:selfcontained-sha-<sha>`) are also `linux/amd64` only — never schedule
+those onto an arm64 node pool.

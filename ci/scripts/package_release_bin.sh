@@ -33,19 +33,17 @@ bin_path="target/release/${bin}"
 # S4: assert the binary's own ELF/Mach-O machine field matches the triple's
 # arch -- a mismatched leg (wrong runner, wrong cross-target) fails here,
 # before packaging, rather than shipping a binary that cannot exec on the
-# host its filename promises.
+# host its filename promises. Delegates to the shared
+# `assert_elf_machine.sh` (#482) -- the same script `_pypi-server.yml`'s
+# wheel-tagging step and `pypi.yml`'s native Linux legs call, so every leg
+# that stamps an architecture onto an artifact runs one identical check
+# instead of a per-caller reimplementation.
 case "$triple" in
-  x86_64-*-linux-gnu)
-    want_machine="X86-64"
+  x86_64-*-linux-gnu | x86_64-apple-darwin)
+    want_arch="x86_64"
     ;;
-  aarch64-*-linux-gnu)
-    want_machine="AArch64"
-    ;;
-  aarch64-apple-darwin)
-    want_machine="arm64"
-    ;;
-  x86_64-apple-darwin)
-    want_machine="x86_64"
+  aarch64-*-linux-gnu | aarch64-apple-darwin)
+    want_arch="aarch64"
     ;;
   *)
     echo "::error::package_release_bin.sh: no known machine-assert mapping for triple '${triple}'" >&2
@@ -53,23 +51,7 @@ case "$triple" in
     ;;
 esac
 
-case "$triple" in
-  *-apple-darwin)
-    got_machine="$(file -b "$bin_path")"
-    if [[ "$got_machine" != *"$want_machine"* ]]; then
-      echo "::error::package_release_bin.sh: ${bin_path} (file: '${got_machine}') does not report '${want_machine}' -- expected for triple ${triple}" >&2
-      exit 1
-    fi
-    ;;
-  *)
-    got_machine="$(readelf -h "$bin_path" | grep -i '^ *Machine:')"
-    if [[ "$got_machine" != *"$want_machine"* ]]; then
-      echo "::error::package_release_bin.sh: ${bin_path} (readelf: '${got_machine}') does not report '${want_machine}' -- expected for triple ${triple}" >&2
-      exit 1
-    fi
-    ;;
-esac
-echo "package_release_bin.sh: machine assert OK for ${triple} (${got_machine})"
+bash "$(dirname "${BASH_SOURCE[0]}")/assert_elf_machine.sh" "$bin_path" "$want_arch"
 
 # W3/V2: the sufficient ABI floor assert for every *-linux-gnu triple --
 # building inside the manylinux_2_28 CI container is necessary but not

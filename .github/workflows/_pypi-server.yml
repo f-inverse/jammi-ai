@@ -173,6 +173,26 @@ jobs:
           cp artifact/jammi-server ${{ inputs.package_dir }}/jammi_server/bin/jammi-server
           chmod +x ${{ inputs.package_dir }}/jammi_server/bin/jammi-server
 
+      # BLOCK 1 (#482): `python -m wheel tags --platform-tag` below STAMPS
+      # an architecture nothing else in this job asserts -- the staged
+      # binary's actual arch was decided by `build-binary`'s `runs_on` and
+      # the resolved base-image index digest, never re-checked here. Assert
+      # the staged binary's own ELF machine matches the arch `platform_tag`
+      # implies BEFORE tagging it as such, same shared script
+      # `package_release_bin.sh` uses for the release tarball leg.
+      - name: Assert the staged binary's ELF machine matches platform_tag's arch
+        run: |
+          set -euo pipefail
+          case "${{ inputs.platform_tag }}" in
+            *_x86_64) want_arch="x86_64" ;;
+            *_aarch64) want_arch="aarch64" ;;
+            *)
+              echo "::error::_pypi-server.yml: platform_tag '${{ inputs.platform_tag }}' has no known arch suffix (expected *_x86_64 or *_aarch64)" >&2
+              exit 1
+              ;;
+          esac
+          bash ci/scripts/assert_elf_machine.sh "${{ inputs.package_dir }}/jammi_server/bin/jammi-server" "$want_arch"
+
       - name: Build the wheel
         working-directory: ${{ inputs.package_dir }}
         run: |

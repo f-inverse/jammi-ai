@@ -1502,7 +1502,7 @@ fn build_result_store(
             // local filesystem even when `root` is a cloud scheme — and
             // `{local_cache_dir}/artifact`, the model-artifact fetch cache
             // its own internal `ArtifactStore` uses). Rooted under the local
-            // artifact dir's `cache/` sub-prefix (A7): relocated OUT of the
+            // artifact dir's `cache/` sub-prefix: relocated OUT of the
             // `jammi_db/` result-table root so a `reconcile`/backup pass over
             // that root never walks scratch cache state.
             let local_cache_dir = inner.config().artifact_dir.join("cache");

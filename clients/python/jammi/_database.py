@@ -209,19 +209,30 @@ def _index_segment_to_dict(s: catalog_pb2.IndexSegment) -> Dict[str, Any]:
 def _reconcile_report_to_dict(r: catalog_pb2.ReconcileReport) -> Dict[str, Any]:
     """Project a wire `ReconcileReport` into the dict a caller reads.
 
-    The whole report and nothing else — `scope` / `applied` / `rows_failed` /
-    `orphans` / `pending` / `unattributed` / `bytes_reclaimed` — the same keys,
-    spelled the same way, the embedded `Database.reconcile` produces by
-    serializing the identical engine struct. Every list is already sorted by
-    the engine; this projection does not re-sort.
+    The whole report and nothing else — all 14 fields, the same keys, spelled
+    the same way, the embedded `Database.reconcile` produces by serializing
+    the identical engine struct: `scope`, `applied`, `rows_failed`,
+    `rows_failed_count`, `orphans`, `orphan_count`, `pending`, `pending_count`,
+    `unattributed`, `unattributed_count`, `damaged`, `damaged_count`,
+    `truncated`, `bytes_reclaimed`. Every list is already sorted by the
+    engine; this projection does not re-sort. Every `*_count` field is the
+    true total independent of whether its list was capped; `truncated` says
+    whether any list was.
     """
     return {
         "scope": r.scope,
         "applied": r.applied,
         "rows_failed": list(r.rows_failed),
+        "rows_failed_count": r.rows_failed_count,
         "orphans": list(r.orphans),
+        "orphan_count": r.orphan_count,
         "pending": list(r.pending),
+        "pending_count": r.pending_count,
         "unattributed": list(r.unattributed),
+        "unattributed_count": r.unattributed_count,
+        "damaged": list(r.damaged),
+        "damaged_count": r.damaged_count,
+        "truncated": r.truncated,
         "bytes_reclaimed": r.bytes_reclaimed,
     }
 
@@ -2394,9 +2405,12 @@ class RemoteDatabase:
         :class:`~jammi.errors.BackendError`.
 
         Returns the same dict shape the embedded ``Database.reconcile``
-        produces, tagged ``{"scope", "applied", "rows_failed", "orphans",
-        "pending", "unattributed", "bytes_reclaimed"}``. Maps to
-        `CatalogService.Reconcile`.
+        produces, tagged ``{"scope", "applied", "rows_failed",
+        "rows_failed_count", "orphans", "orphan_count", "pending",
+        "pending_count", "unattributed", "unattributed_count", "damaged",
+        "damaged_count", "truncated", "bytes_reclaimed"}`` — all 14 fields of
+        the engine's ``ReconcileReport``, byte-for-byte the same key set the
+        embedded PyO3 arm projects. Maps to `CatalogService.Reconcile`.
         """
         request = catalog_pb2.ReconcileRequest(
             apply=apply, grace_secs=grace_secs, all=all

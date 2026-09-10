@@ -546,7 +546,7 @@ async fn remote_reconcile_reports_like_local() {
             .any(|o| o.ends_with("stray.parquet")),
         "the divergence-prone fixture must actually plant an orphan: {remote_report:?}"
     );
-    // Block #4: a tenant-scoped pass reports NO unattributed entries at all —
+    // A tenant-scoped pass reports NO unattributed entries at all —
     // an unattributed key is store-wide by definition, so only the admin
     // `all=true` arm below may ever list it.
     assert!(

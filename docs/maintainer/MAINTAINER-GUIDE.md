@@ -697,17 +697,28 @@ Every trait/enum/base surface a maintainer extends, with anchors and invariants.
   `sidecar_extensions(kind)` superset (referenced-if-present, deliberately
   more generous than the required-side check, since this side must never
   delete a legitimately-present object) of every `ready` row and every
-  live-lease `building` row's CURRENT `index_segments` rows (A21: segments are
+  live-lease `building` row's CURRENT `index_segments` rows (segments are
   referenced by rows, never by filename pattern — a `{base}__segN.*` object
   with no row is an orphan candidate); a `running` job's checkpoints and every
   `models.artifact_path`-named prefix (via `ArtifactStore::expected_objects`)
-  are referenced too; else an orphan
-  candidate, aged against `grace` (`apply=true` requires `grace >=` the
-  configured lease duration — a typed refusal otherwise) before deletion,
-  `pending` if younger. `ReconcileReport { scope, applied, rows_failed,
-  orphans, pending, unattributed, bytes_reclaimed }`, every list sorted.
-  `reconcile` runs under the store's own binding (tenant-bound → its
-  `{seg}/`; unbound → `_global` only); `reconcile_all` wraps the WHOLE pass in
+  are referenced too; a present-but-unreadable `models.artifact_path` manifest
+  is reported `damaged`, never orphaned, and never aborts the whole pass;
+  else an orphan candidate, aged against `grace` (`apply=true` requires
+  `grace >=` the configured lease duration — a typed refusal otherwise)
+  before deletion, `pending` if younger. A tenant-scoped pass filters its own
+  `ready`-row enumeration to its own tenant BEFORE either the dry-run report
+  or the apply CAS, so it never reports (dry-run) or acts on (apply) a GLOBAL
+  row it cannot touch — only `reconcile_all` ever does. The expired-building
+  pre-pass runs BEFORE the object listing (not after, unlike every other row
+  read here) so a key it deletes can never be double-counted by this same
+  pass's own orphan accounting. `ReconcileReport { scope, applied,
+  rows_failed, rows_failed_count, orphans, orphan_count, pending,
+  pending_count, unattributed, unattributed_count, damaged, damaged_count,
+  truncated, bytes_reclaimed }`, every list sorted and capped at
+  `REPORT_LIST_CAP` (10,000 entries; `truncated` says whether any list hit the
+  cap, `*_count` is always the true total). `reconcile` runs under the
+  store's own binding (tenant-bound → its `{seg}/`; unbound → `_global`
+  only); `reconcile_all` wraps the WHOLE pass in
   `TenantBinding::admin_scope` and covers every tenant. Wire: `CatalogService.
   Reconcile` [§1.4 RPC table]; CLI: `jammi reconcile [--apply] [--grace-secs
   N] [--all]` (`crates/jammi-cli/src/commands/reconcile.rs`); Python:

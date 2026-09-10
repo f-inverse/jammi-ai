@@ -223,7 +223,7 @@ impl ResultStore {
     /// `{artifact_dir}/jammi_db/` (unchanged from the historical layout) with
     /// the ANN segment cache and the artifact fetch cache relocated OUT of
     /// that root, at `{artifact_dir}/cache/index` and
-    /// `{artifact_dir}/cache/artifact` respectively (A7): the caches are
+    /// `{artifact_dir}/cache/artifact` respectively: the caches are
     /// content-addressed scratch state, not result-table data, so they no
     /// longer sit inside the directory a `reconcile` or backup walks as the
     /// table root. Equivalent to
@@ -768,7 +768,7 @@ impl ResultStore {
     /// (fencing whatever writer is or was alive), then drive it to exactly
     /// one terminal state, deleting bytes only after the CAS that licenses
     /// it. Shared by [`Self::recover_inner`] (the admin-scoped, cross-tenant
-    /// startup sweep) and [`crate::store::reconcile`]'s pass (block #1: an
+    /// startup sweep) and [`crate::store::reconcile`]'s pass (esc-094: an
     /// expired-lease `building` row is reaped through THIS arm — claim, then
     /// fail-CAS or promote, then delete — never through reconcile's orphan
     /// arm, which performs no claim and no CAS at all). The binding in force
@@ -899,7 +899,7 @@ impl ResultStore {
         table: &ResultTableRecord,
         tenant: Option<TenantId>,
     ) -> Result<Option<BuildingTable>> {
-        // Block #3 (phase-4 fix): a FRESH id per claim, never this process's
+        // A FRESH id per claim, never this process's
         // OWN `self.writer_id` — if the row this claim targets happens to be
         // THIS process's own lapsed writer, re-stamping the SAME id would
         // leave the lapsed `BuildingTable` handle's `Owner::Writer(self.writer_id)`

@@ -592,6 +592,25 @@ workspace ships every publishable crate at the same
   stays in the referenced set instead of being counted as this pass's fail; a
   present-but-unreadable model-artifact manifest is reported `damaged` rather than aborting
   the whole reconcile pass.
+- **Closing round on the above (#479, #484): the remote `Database.reconcile` projection carried
+  only 7 of `ReconcileReport`'s 14 fields, a tenant-scoped `reconcile(apply=false)` could report a
+  GLOBAL ready row's fail in `rows_failed` that the matching `apply=true` pass silently could not
+  act on, `remove_source`'s dead FK-conflict arm (no foreign key has referenced `sources` since
+  migration 004) left a stale `SourceBusy` classification live, and the reconcile object listing
+  double-counted a key its own expired-building pre-pass had already deleted.** Fixed:
+  `clients/python/jammi/_database.py::_reconcile_report_to_dict` now projects all 14 fields, byte-
+  for-byte matching the embedded PyO3 arm's key set; `ResultStore::reconcile`'s ready-row
+  enumeration is filtered to the binding's own tenant segment before either the dry-run report or
+  the apply CAS, so a scoped pass's dry-run and apply agree on the identical state and a GLOBAL row
+  is visible only to `reconcile_all`; `remove_source`'s FK-conflict classify arm and its
+  `SourceBusy { table: "<created after ...>" }` placeholder are removed (the still-open
+  create-between-passes race is ledgered as a new `.jammi/escapes.jsonl` row, not fixed here); the
+  orphan/`bytes_reclaimed` accounting excludes keys the expired-building pre-pass already claimed.
+  **Disclosed and pinned separately: `reclaim_expired_training_jobs` reclaiming a `running` row with
+  an ABSENT lease is deliberate, the same one-primitive rule ("absent or expired is reclaimable")
+  `Owner::ExpiredLease` already documents on the result-table side — every claim path stamps a
+  non-NULL lease, so a running row with no lease can never arise through this engine's own claim
+  path, and restoring an `IS NOT NULL` guard would strand such a row `running` forever.**
 - **`jammi-encoders`' unit-test binary now serializes every writer of EVERY process-wide fusible-seam
   dispatch counter through the SAME lock the exact-count census oracle's reader holds (esc-092 /
   #476).** The class is "every training-arm admission site this crate owns", not just the three

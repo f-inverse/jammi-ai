@@ -707,25 +707,17 @@ impl JammiSession {
             }
         }
 
-        // 3. Delete the source row from the catalog. A table CREATED for
-        // this source in the window between step 1's atomic delete and
-        // this statement (a genuine race — the source row was live until
-        // this exact instant) leaves a foreign-key violation here, not a
-        // silent success; remap it to the same typed `SourceBusy` refusal
-        // step 1 uses, so the caller gets a retryable precondition failure
-        // rather than an opaque backend constraint error.
-        if let Err(e) = self.catalog.remove_source(source_id).await {
-            if matches!(
-                &e,
-                JammiError::BackendDriver(crate::catalog::backend::BackendError::Constraint { .. })
-            ) {
-                return Err(JammiError::SourceBusy {
-                    source_id: source_id.to_string(),
-                    table: "<created after this remove_source's own delete pass>".to_string(),
-                });
-            }
-            return Err(e);
-        }
+        // 3. Delete the source row from the catalog. `result_tables.source_id`
+        // carries no foreign key back to `sources` (the only FK that ever
+        // referenced this table lived on the long-dropped `embedding_sets`,
+        // removed by migration 004), so this statement cannot itself observe
+        // — let alone refuse — a table CREATED for this source in the window
+        // between step 1's atomic delete and this statement. That race is
+        // still open and is tracked as an escape (`.jammi/escapes.jsonl`),
+        // not fixed here: the still-live consequence is an orphan
+        // `result_tables` row whose source is gone, left for a `reconcile`
+        // pass to eventually reap by the ordinary orphan-object rule.
+        self.catalog.remove_source(source_id).await?;
 
         // 4. Deregister the source's result tables from the tenant-gating
         //    result-table schema so post-removal queries resolve not-found,

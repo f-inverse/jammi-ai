@@ -417,11 +417,29 @@ _RECONCILE_REPORT_DICT_KEYS = {
 
 def test_reconcile_report_projection_is_the_whole_row_and_nothing_more():
     """The wire `ReconcileReport` message — the single source of the
-    client-facing report shape — carries exactly the projected fields. Pinned
-    against the proto descriptor, so a field added to the engine's
-    `ReconcileReport` without a matching wire/projection update fails here.
+    client-facing report shape — carries exactly the projected fields, AND
+    the remote client's own projection function actually produces that shape
+    (not merely the proto descriptor, which a stale/unused projection could
+    still pass vacuously against).
 
-    Hermetic: reads the generated proto descriptor, never dialing a server."""
+    Pinned two ways:
+    1. The proto descriptor's field set matches `_RECONCILE_REPORT_DICT_KEYS`
+       — a field added to the engine's `ReconcileReport` without a matching
+       wire update fails here.
+    2. `jammi._database._reconcile_report_to_dict` is actually CALLED on a
+       fully-populated `ReconcileReport` (every list non-empty, `truncated`
+       True, a `damaged` entry present, every `*_count` deliberately NOT
+       equal to its list's length so a projection that derived a count from
+       `len(list)` instead of projecting the wire field would be caught) and
+       its result's key set matches — byte-for-byte — the embedded PyO3 arm's
+       key set (`_RECONCILE_REPORT_DICT_KEYS`, independently pinned against
+       `crates/jammi-python/src/database.rs`'s `reconcile` doc comment by
+       `test_embed_reconcile_both_arms_return_the_report_shape`), with every
+       value round-tripping unchanged.
+
+    Hermetic: reads the generated proto descriptor and calls a pure-Python
+    projection function, never dialing a server."""
+    from jammi._database import _reconcile_report_to_dict
     from jammi._generated.jammi.v1 import catalog_pb2
 
     proto_fields = {f.name for f in catalog_pb2.ReconcileReport.DESCRIPTOR.fields}
@@ -429,6 +447,45 @@ def test_reconcile_report_projection_is_the_whole_row_and_nothing_more():
         f"wire ReconcileReport fields {proto_fields} != the client projection "
         f"{_RECONCILE_REPORT_DICT_KEYS}"
     )
+
+    report = catalog_pb2.ReconcileReport(
+        scope="tenant:11111111-1111-4111-8111-111111111111",
+        applied=True,
+        rows_failed=["t1", "t2"],
+        rows_failed_count=99,
+        orphans=["o1"],
+        orphan_count=50,
+        pending=["p1", "p2", "p3"],
+        pending_count=77,
+        unattributed=["u1"],
+        unattributed_count=12,
+        damaged=["d1"],
+        damaged_count=33,
+        truncated=True,
+        bytes_reclaimed=123456,
+    )
+    projected = _reconcile_report_to_dict(report)
+
+    assert set(projected) == _RECONCILE_REPORT_DICT_KEYS, (
+        f"_reconcile_report_to_dict returned {set(projected)} != "
+        f"{_RECONCILE_REPORT_DICT_KEYS} (the whole row, and nothing more)"
+    )
+    assert projected == {
+        "scope": "tenant:11111111-1111-4111-8111-111111111111",
+        "applied": True,
+        "rows_failed": ["t1", "t2"],
+        "rows_failed_count": 99,
+        "orphans": ["o1"],
+        "orphan_count": 50,
+        "pending": ["p1", "p2", "p3"],
+        "pending_count": 77,
+        "unattributed": ["u1"],
+        "unattributed_count": 12,
+        "damaged": ["d1"],
+        "damaged_count": 33,
+        "truncated": True,
+        "bytes_reclaimed": 123456,
+    }, f"every field must round-trip unchanged: {projected}"
 
 
 def test_embed_reconcile_both_arms_return_the_report_shape(tmp_path):

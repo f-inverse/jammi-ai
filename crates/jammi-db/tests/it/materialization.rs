@@ -436,7 +436,7 @@ async fn recovery_promotes_a_building_row_whose_manifest_landed(backend: Backend
         .unwrap()
         .unwrap();
     assert_eq!(record.status, "ready");
-    // Block #3 (phase-4 fix): a claim mints a FRESH id, `"{store.writer_id()}
+    // A claim mints a FRESH id, `"{store.writer_id()}
     // /claim-{uuid}"` — never the store's raw process-wide id.
     assert!(
         record

@@ -1850,7 +1850,7 @@ async fn assert_reconcile_isolated() {
         .set_modified(backdated)
         .unwrap();
 
-    // Block #4, RED first: a genuinely UNATTRIBUTED key — its own first path
+    // RED first: a genuinely UNATTRIBUTED key — its own first path
     // segment does not even parse as a `TenantSegment` — planted directly at
     // the store root (no tenant prefix at all), so it is store-wide by
     // definition. Before the fix, tenant B's own SCOPED reconcile listed
@@ -1932,7 +1932,7 @@ async fn assert_reconcile_isolated() {
     );
 }
 
-/// Block #2, RED first: a GLOBAL (`tenant_id IS NULL`) `building` row whose
+/// RED first (esc-094 follow-up): a GLOBAL (`tenant_id IS NULL`) `building` row whose
 /// lease has expired must NEVER be claimed/failed/deleted by a TENANT-scoped
 /// `reconcile(apply=true)` — only the admin `reconcile_all` pass may ever
 /// touch it. Before the fix, the expired-building pre-pass's enumeration

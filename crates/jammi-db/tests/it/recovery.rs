@@ -569,8 +569,8 @@ async fn building_with_valid_parquet_promotes_with_true_count(kind: BackendKind)
     // I5: promoted row_count is the TRUE footer count, not the writer's intent.
     assert_eq!(rec.row_count, 7, "I5: row_count == actual Parquet rows");
     // Recovery claimed the row before rebuilding and promoting: the recoverer
-    // is the writer of record, the dead writer's id is history. Block #3
-    // (phase-4 fix): the claim mints a FRESH id, `"{peer.writer_id()}
+    // is the writer of record, the dead writer's id is history. The claim
+    // mints a FRESH id, `"{peer.writer_id()}
     // /claim-{uuid}"` — never `peer`'s raw process-wide id.
     assert!(rec
         .writer_id
@@ -1051,7 +1051,7 @@ async fn live_writer_survives_peer_recover_w2(kind: BackendKind) {
     assert_eq!(select_count(&ctx_a, &table_name).await, N);
 }
 
-/// U2 (block #1, phase-4 fix): the SAME two-writer shape as W2, but the peer
+/// U2 (esc-094 follow-up): the SAME two-writer shape as W2, but the peer
 /// runs `reconcile(apply=true)` instead of the startup `recover()` sweep — a
 /// live-lease `building` row's bytes must survive a reconcile pass exactly as
 /// they survive recovery. `own_seg` scoping means the peer must reconcile
@@ -1149,7 +1149,7 @@ async fn live_writer_survives_peer_reconcile_apply_u2(kind: BackendKind) {
     assert_eq!(rec.row_count, N);
 }
 
-/// U2b (block #1, phase-4 fix, RED first): an EXPIRED-lease `building` row is
+/// U2b (esc-094 follow-up, RED first): an EXPIRED-lease `building` row is
 /// reconciled through the RECOVERY arm — claimed (its `writer_id` changes)
 /// BEFORE its bytes go — never through the orphan arm with no claim/CAS at
 /// all. Before this fix, `reconcile`'s orphan loop reaped such a row's
@@ -1232,7 +1232,7 @@ async fn expired_lease_building_row_is_claimed_before_reconcile_reaps_it_u2b(kin
     );
 }
 
-/// Block #3 (phase-4 fix, RED first): `reconcile`'s claim of an expired-lease
+/// RED first: `reconcile`'s claim of an expired-lease
 /// row must NEVER re-stamp the SAME `writer_id` a lapsed writer in THIS
 /// SAME session still holds — that would leave the lapsed writer's own
 /// `Owner::Writer(self.writer_id)` CAS still matching post-claim (no fence
@@ -1804,7 +1804,7 @@ async fn remove_source_refuses_live_building_row(kind: BackendKind) {
     assert!(catalog.get_result_table(&name).await.unwrap().is_none());
 }
 
-/// Block #6: `delete_result_tables_for_source` is ONE atomic statement, not a
+/// `delete_result_tables_for_source` is ONE atomic statement, not a
 /// SELECT-then-DELETE — pinned by an interleaving this source has TWO rows
 /// for: a terminal (`ready`) row the DELETE's own `WHERE` would otherwise
 /// happily remove, and a live-lease `building` row it must refuse. A
@@ -1924,7 +1924,7 @@ async fn two_recoverers_race_on_one_expired_row(kind: BackendKind) {
         .writer_id
         .as_deref()
         .expect("the winner is the writer of record");
-    // Block #3 (phase-4 fix): a claim mints a FRESH id, `"{store.writer_id()}
+    // A claim mints a FRESH id, `"{store.writer_id()}
     // /claim-{uuid}"` — never the recoverer's raw process-wide id — so the
     // winner's identity is checked by PREFIX.
     assert!(

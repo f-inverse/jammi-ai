@@ -2,6 +2,8 @@ use std::str::FromStr;
 use std::time::Duration;
 
 use crate::catalog::backend::{BackendError, BackendKind, Row, SqlValue, Transaction, TxOptions};
+#[cfg(feature = "test-hooks")]
+use crate::catalog::lease::LEASE_TS_FORMAT;
 use crate::catalog::lease::{lease_deadline_expr, lease_expired_clause};
 use crate::catalog::status::ResultTableStatus;
 use crate::catalog::Catalog;
@@ -408,11 +410,11 @@ pub(crate) enum CasOutcome<T> {
 }
 
 /// Whether [`Catalog::building_tables_by_lease_liveness`]'s non-admin arm
-/// drops a GLOBAL (`tenant_id IS NULL`) row entirely (block #2 — an
-/// enumeration that feeds a MUTATING pass must never hand a tenant-bound
-/// caller a `_global/` row) or reads it the same way every other read on
-/// this table does (`tenant_id = $t OR tenant_id IS NULL` — safe for a
-/// READ-ONLY protective set).
+/// drops a GLOBAL (`tenant_id IS NULL`) row entirely — an enumeration that
+/// feeds a MUTATING pass must never hand a tenant-bound caller a `_global/`
+/// row (esc-094) — or reads it the same way every other read on this table
+/// does (`tenant_id = $t OR tenant_id IS NULL` — safe for a READ-ONLY
+/// protective set).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum ExcludeGlobalUnderTenantScope {
     Yes,
@@ -607,7 +609,7 @@ impl Catalog {
     }
 
     /// Classify a building-row CAS that matched zero rows into exactly one
-    /// typed error, status-first (esc-094 amendment A1):
+    /// typed error, status-first (esc-094):
     ///
     /// 1. no row → [`JammiError::RowGone`] (nothing to delete);
     /// 2. a non-admin binding and the row's tenant differs →
@@ -766,15 +768,33 @@ impl Catalog {
     /// Runs as `cas`'s own CAS (typically [`Owner::Writer`]), so it fails
     /// loudly rather than silently leaving a live lease if the row is not the
     /// caller's own `building` row.
+    ///
+    /// The SQLite arm binds a [`LEASE_TS_FORMAT`]-shaped
+    /// timestamp (through the application clock, matching every other SQLite
+    /// lease stamp) rather than SQLite's OWN `datetime()` rendering
+    /// (space-separated, no fractional seconds): comparing the two shapes
+    /// would be "expired" by construction regardless of the actual instants
+    /// involved (`' ' < 'T'` lexicographically, always), never by the real
+    /// contract [`lease_expired_clause`] evaluates elsewhere.
     #[cfg(feature = "test-hooks")]
     pub async fn expire_lease_for_test(&self, cas: &ResultTableCas) -> Result<()> {
         let kind = self.backend().backend_kind();
-        let expr = match kind {
-            BackendKind::Postgres => "(now() - interval '1 second')::text".to_string(),
-            BackendKind::Sqlite => "datetime('now', '-1 second')".to_string(),
+        let (set_clause, set_params): (String, Vec<SqlValue<'static>>) = match kind {
+            BackendKind::Postgres => (
+                "lease_expires_at = (now() - interval '1 second')::text".to_string(),
+                Vec::new(),
+            ),
+            BackendKind::Sqlite => {
+                let past = (chrono::Utc::now() - chrono::Duration::seconds(1))
+                    .format(LEASE_TS_FORMAT)
+                    .to_string();
+                (
+                    "lease_expires_at = $1".to_string(),
+                    vec![SqlValue::TextOwned(past)],
+                )
+            }
         };
-        self.building_row_cas(cas, &format!("lease_expires_at = {expr}"), Vec::new())
-            .await
+        self.building_row_cas(cas, &set_clause, set_params).await
     }
 
     /// Flip the building row `cas` names `building -> ready` **and** persist
@@ -852,11 +872,11 @@ impl Catalog {
     /// application timestamp on Postgres) — the enumeration BOTH
     /// `recover()`'s admin-scoped sweep and a tenant-scoped
     /// [`crate::store::ResultStore::reconcile`]'s expired-building pre-pass
-    /// (block #1) claim/fail/delete against. A row under a live lease
+    /// (esc-094) claim/fail/delete against. A row under a live lease
     /// belongs to a live writer and is never listed here.
     ///
     /// **Never includes a GLOBAL (`tenant_id IS NULL`) row under a
-    /// non-admin binding** (block #2) — unlike every other read on this
+    /// non-admin binding** — unlike every other read on this
     /// table, which treats GLOBAL as "visible to every tenant" because
     /// reading a shared row leaks nothing. THIS enumeration feeds a MUTATING
     /// pass (claim, then promote-or-fail, then delete): a tenant-bound
@@ -875,9 +895,9 @@ impl Catalog {
 
     /// Every `building` row under a LIVE (unexpired) lease at the instant the
     /// query runs — the rows a reconcile pass must never treat as an orphan
-    /// candidate (block #1: an expired-lease `building` row is recovery's to
-    /// claim-then-reap; only a row a live writer still owns is protected
-    /// here). Inside an admin scope every tenant's rows are returned; outside
+    /// candidate (an expired-lease `building` row is recovery's to
+    /// claim-then-reap, esc-094; only a row a live writer still owns is
+    /// protected here). Inside an admin scope every tenant's rows are returned; outside
     /// it the enumeration is tenant-scoped like every other READ on this
     /// table (GLOBAL included) — this is a READ-ONLY protective set (it only
     /// ever widens what a listed object is considered "referenced" by,
@@ -898,7 +918,7 @@ impl Catalog {
     /// through so the tenant bind that follows numbers correctly regardless
     /// of backend). `live` selects expired (`false`) vs. live (`true`);
     /// `exclude_global` selects whether a non-admin binding's query drops
-    /// `tenant_id IS NULL` rows entirely (block #2) or reads them the same
+    /// `tenant_id IS NULL` rows entirely or reads them the same
     /// way every other table read does.
     async fn building_tables_by_lease_liveness(
         &self,

@@ -1034,12 +1034,29 @@ impl Catalog {
         Ok(updated == 1)
     }
 
-    /// Reclaim running jobs whose lease has expired. For each `running` job
-    /// with `lease_expires_at < now`: re-queue it (clearing `claimed_by` and
-    /// `lease_expires_at`) when `attempts < max_attempts`, otherwise mark it
-    /// `failed` and record the lease-exhaustion reason in `metrics`. Returns
-    /// the number of jobs actioned across both branches. Not tenant-scoped —
-    /// it sweeps every tenant's expired leases.
+    /// Reclaim running jobs whose lease is ABSENT OR EXPIRED
+    /// ([`lease_expired_clause`]'s `col IS NULL OR col < now()` — one
+    /// predicate, not two cases). For each such `running` job: re-queue it
+    /// (clearing `claimed_by` and `lease_expires_at`) when
+    /// `attempts < max_attempts`, otherwise mark it `failed` and record the
+    /// lease-exhaustion reason in `metrics`. Returns the number of jobs
+    /// actioned across both branches. Not tenant-scoped — it sweeps every
+    /// tenant's expired leases.
+    ///
+    /// **A `running` job with a NULL lease is reclaimable, the same as an
+    /// expired one.** This is deliberate, not a missing `lease_expires_at IS
+    /// NOT NULL` guard: [`Self::claim_next_training_job`] ALWAYS stamps
+    /// `lease_expires_at` on the row it hands back `running`, so a `running`
+    /// row with no lease can never arise through this engine's own claim
+    /// path — the only way to observe one is a hand-authored row or a schema
+    /// migration that leaves a legacy `running` row lease-less. Either way,
+    /// "no lease" can never mean "a live writer holds this without a
+    /// deadline"; it can only mean "no live writer is actually enforcing
+    /// one", which is exactly the state
+    /// [`Owner::ExpiredLease`](super::result_repo::Owner::ExpiredLease)'s
+    /// contract already treats as reclaimable on the result-table side of
+    /// this same catalog. Restoring an `IS NOT NULL` guard here would strand
+    /// such a row `running` forever.
     ///
     /// Both arms also move `acceleration_report`, in their OWN `UPDATE` (never
     /// a read-then-write): the claimant whose report this column describes is

@@ -793,16 +793,6 @@ pub fn classify(err: sqlx::Error) -> BackendError {
             table: db_err.table().unwrap_or("<unknown>").to_string(),
             detail: db_err.message().to_string(),
         },
-        // A foreign-key violation — e.g. a `sources` row deleted while a
-        // NEW `result_tables` row referencing it was created concurrently
-        // (advisory: `JammiSession::remove_source`'s step 3 remaps this
-        // specific case to `JammiError::SourceBusy`) — is the same
-        // "a concurrent write made this DELETE unsafe" shape as a unique
-        // violation, so it classifies through the same `Constraint` arm.
-        Database(db_err) if db_err.is_foreign_key_violation() => BackendError::Constraint {
-            table: db_err.table().unwrap_or("<unknown>").to_string(),
-            detail: db_err.message().to_string(),
-        },
         Database(db_err) if db_err.code().as_deref() == Some("40001") => {
             BackendError::Retry(db_err.message().to_string())
         }

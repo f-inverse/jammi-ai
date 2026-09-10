@@ -297,7 +297,7 @@ mod tests {
         assert_eq!(bad.code(), Code::InvalidArgument);
     }
 
-    /// The building-row CAS zero-row classification (block #4, phase-4 fix)
+    /// The building-row CAS zero-row classification (esc-094 follow-up)
     /// each maps to a DISTINCT gRPC code, never the generic `Internal` the
     /// catch-all arm gave them before: `RowGone` → `NotFound`,
     /// `TenantMismatch` → `PermissionDenied`, `LeaseLost` / `CasFailed` →

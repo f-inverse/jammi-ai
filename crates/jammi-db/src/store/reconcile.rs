@@ -23,7 +23,12 @@
 //! every object's true referencer at the moment of listing (a table
 //! materialising concurrently with a reconcile pass always has its `building`
 //! row visible by the time reconcile reads rows, because the row is written
-//! before any byte the row→object check would look for).
+//! before any byte the row→object check would look for). The one exception
+//! is the expired-building pre-pass, which runs BEFORE the listing on
+//! purpose (report-count correctness, not the row-completeness rule above):
+//! it physically deletes bytes for whatever it reaps, so listing only after
+//! it has run keeps a key it just deleted from ever appearing — and being
+//! double-counted — in this pass's own `orphans`/`bytes_reclaimed`.
 
 use std::collections::BTreeSet;
 use std::str::FromStr;
@@ -117,7 +122,8 @@ pub struct ReconcileReport {
     /// allowlist at all — reported, never deleted at any grace or `apply`.
     /// Reported ONLY by an admin-scoped pass ([`ResultStore::reconcile_all`]);
     /// a tenant-scoped [`ResultStore::reconcile`] never lists another
-    /// tenant's (or nobody's) stray keys (block #4). Capped at
+    /// tenant's (or nobody's) stray keys — a scoped pass reports NOTHING it
+    /// cannot attribute to its own prefix. Capped at
     /// [`REPORT_LIST_CAP`]; see [`Self::unattributed_count`].
     pub unattributed: Vec<String>,
     /// The true count of unattributed keys found this pass, independent of
@@ -125,8 +131,8 @@ pub struct ReconcileReport {
     pub unattributed_count: u64,
     /// A prefix named by a `models` row (a trained-model artifact bundle)
     /// whose `manifest.json` is absent: the row says this bundle exists, but
-    /// its attestation does not — never reclaimed, at any grace or `apply`
-    /// (block #3), because the referencing row is still live. Distinct from
+    /// its attestation does not — never reclaimed, at any grace or `apply`,
+    /// because the referencing row is still live. Distinct from
     /// [`Self::orphans`], whose entries have NO referencing row at all.
     /// Capped at [`REPORT_LIST_CAP`]; see [`Self::damaged_count`].
     pub damaged: Vec<String>,
@@ -265,8 +271,8 @@ impl ResultStore {
     /// `own_seg`, when `Some`, restricts the pass to objects whose own key
     /// attributes to exactly that tenant segment — a key that fails the
     /// allowlist outright (`Attribution::Unattributed`) is store-wide by
-    /// definition, so a `Some` (scoped) pass reports NONE of it (block #4):
-    /// only `None` (from [`Self::reconcile_all`], already under admin scope,
+    /// definition, so a `Some` (scoped) pass reports NONE of it: only `None`
+    /// (from [`Self::reconcile_all`], already under admin scope,
     /// covering every tenant's prefix) ever populates
     /// [`ReconcileReport::unattributed`].
     async fn reconcile_inner(
@@ -278,6 +284,43 @@ impl ResultStore {
         let root_handle = self.open_index(&self.root)?;
         let root_path = root_handle.data_path()?;
         let root_prefix = format!("{root_path}/");
+
+        // Expired-building pre-pass (esc-094 follow-up): an expired-lease
+        // `building` row's objects are NEVER reaped through this pass's
+        // orphan arm below (no claim, no CAS) — they are reconciled through
+        // the SAME recovery arm `ResultStore::recover` uses: claim first
+        // (fencing whatever writer is or was alive), then promote-or-fail,
+        // then delete only after that CAS. Only under `apply` — `apply=false`
+        // mutates nothing (an expired row's objects are still reported, as an
+        // ordinary orphan candidate, exactly as before this fix); the SAME
+        // `list_expired_building_tables` call already respects the binding in
+        // force, so a tenant-scoped `reconcile()` reconciles only its own
+        // tenant's expired rows and the admin-scoped `reconcile_all()` (via
+        // `TenantBinding::admin_scope`) covers every tenant's.
+        //
+        // Runs BEFORE the object listing below — report-count correctness,
+        // not the ordering rule that governs `ready_rows`/`live_building`
+        // further down. This pre-pass physically DELETES bytes for whatever
+        // it reaps; if the listing ran first, a key it then deleted would
+        // still sit in a now-stale `listed` snapshot, and the orphan-
+        // candidate arm below would count it a SECOND time in
+        // `orphans`/`orphan_count`/`bytes_reclaimed` even though no bytes
+        // were actually freed the second time (`delete_relative` no-ops on
+        // an already-gone object). Listing AFTER this pre-pass makes a
+        // reaped key simply absent from `listed`, so it can never be
+        // double-counted. This does not weaken the module-level list-first
+        // rule below: that rule protects the invariant that a row set is a
+        // superset of every listed object's true referencer, which only
+        // requires the listing to precede `list_result_tables_by_status`/
+        // `list_live_building_tables` — this pre-pass's own row read
+        // (`list_expired_building_tables`) never inspects `listed` at all,
+        // so reordering it changes nothing about which rows it reaps.
+        if opts.apply {
+            for table in self.catalog.list_expired_building_tables().await? {
+                self.reconcile_expired_building_row(table).await?;
+            }
+        }
+
         let listed = root_handle
             .list(&root_path)
             .await?
@@ -292,26 +335,6 @@ impl ResultStore {
             })
             .collect::<Vec<_>>();
 
-        // Block #1 (esc-094 follow-up): an expired-lease `building` row's
-        // objects are NEVER reaped through this pass's orphan arm below (no
-        // claim, no CAS) — they are reconciled through the SAME recovery arm
-        // `ResultStore::recover` uses: claim first (fencing whatever writer
-        // is or was alive), then promote-or-fail, then delete only after
-        // that CAS. Runs BEFORE this pass reads `ready` / live `building`
-        // rows, so a row this step promotes or fails is read back in its new
-        // terminal state below. Only under `apply` — `apply=false` mutates
-        // nothing (an expired row's objects are still reported, as an
-        // ordinary orphan candidate, exactly as before this fix); the SAME
-        // `list_expired_building_tables` call already respects the binding
-        // in force, so a tenant-scoped `reconcile()` reconciles only its own
-        // tenant's expired rows and the admin-scoped `reconcile_all()` (via
-        // `TenantBinding::admin_scope`) covers every tenant's.
-        if opts.apply {
-            for table in self.catalog.list_expired_building_tables().await? {
-                self.reconcile_expired_building_row(table).await?;
-            }
-        }
-
         // Rows are read AFTER the listing above (ordering rule): the row set
         // this pass checks against is a superset of every listed object's
         // true referencer at listing time. `list_live_building_tables`
@@ -319,11 +342,28 @@ impl ResultStore {
         // (never a bound application timestamp — `catalog::lease`'s module
         // docs), so this pass never trusts a Rust-side string compare that a
         // Postgres deployment's stored lease text would not even be shaped
-        // for after block #2's fix.
+        // for.
         let mut ready_rows = self
             .catalog
             .list_result_tables_by_status(ResultTableStatus::Ready)
             .await?;
+        if let Some(seg) = own_seg.as_deref() {
+            // A scoped pass reports NOTHING it cannot act on.
+            // `list_result_tables_by_status` is an ordinary READ (GLOBAL rows
+            // visible to every tenant, like every other read on this table),
+            // but THIS enumeration feeds a MUTATING pass immediately below
+            // (`fail_ready_result_table`'s CAS, `Strict` on the caller's own
+            // tenant — it never matches a GLOBAL row for a tenant-bound
+            // caller). Left unfiltered, a tenant-scoped dry-run would REPORT
+            // a GLOBAL row in `rows_failed` while the matching `apply` pass's
+            // CAS silently missed it, so dry-run and apply would disagree on
+            // the identical state. Filter to the binding's own segment HERE,
+            // before either branch below reads `ready_rows` — the same rule
+            // `list_expired_building_tables` already applies to its own
+            // enumeration. Only `reconcile_all` (`own_seg = None`, already
+            // under admin scope) ever acts on or reports a GLOBAL ready row.
+            ready_rows.retain(|t| t.tenant_id.as_deref().unwrap_or("_global") == seg);
+        }
         let live_building = self.catalog.list_live_building_tables().await?;
 
         // row -> object: a `ready` row missing a required object is driven
@@ -432,7 +472,7 @@ impl ResultStore {
             let attribution = attribute(&obj.rel);
             let in_scope = match (&own_seg, &attribution) {
                 (None, _) => true, // admin pass: every tenant in scope
-                // Block #4: a tenant-scoped pass reports NOTHING it cannot
+                // A tenant-scoped pass reports NOTHING it cannot
                 // attribute to its OWN prefix — an unattributed (stray) key
                 // is store-wide by definition, so only an admin-scoped pass
                 // (`own_seg = None`, from `reconcile_all`) may ever list it.
@@ -522,12 +562,12 @@ impl ResultStore {
                                     continue;
                                 }
                                 // A valid manifest exists but does not name
-                                // this key: outside block #3's scope, falls
-                                // through to the orphan-candidate arm below
-                                // (age-gated, never immediate).
+                                // this key: falls through to the
+                                // orphan-candidate arm below (age-gated,
+                                // never immediate).
                             }
                             None => {
-                                // Block #3: a `models` row names this prefix
+                                // A `models` row names this prefix
                                 // but its `manifest.json` is absent — the row
                                 // is still live, so this is NEVER reclaimable
                                 // through the orphan arm at any grace or
@@ -639,15 +679,16 @@ impl ResultStore {
     /// this side must never delete a legitimately-present object), and every
     /// sidecar sibling of every CURRENT `index_segments` row — enumerated
     /// over the FULL [`SidecarKind`] superset (`Ann` AND `Lexical`), not one
-    /// kind (block #7), since a segment's actual kind is not itself recorded
+    /// kind, since a segment's actual kind is not itself recorded
     /// on the `index_segments` row and this side must never under-protect. A
     /// directory-shaped sibling (`Lexical`'s `.tantivy`) is referenced by
     /// PREFIX — every key under `{base}.tantivy/…`, not only a key that
-    /// equals `{base}.tantivy` exactly (A3) — while a plain-file sibling is
+    /// equals `{base}.tantivy` exactly — while a plain-file sibling is
     /// still matched exactly.
-    /// (A21: segments are referenced by ROWS, not by filename pattern — a
+    ///
+    /// Segments are referenced by ROWS, not by filename pattern — a
     /// `{base}__segN.*` object with no row is an orphan candidate, e.g. the
-    /// late-landing sidecar of a purge a recoverer's claim already ran.)
+    /// late-landing sidecar of a purge a recoverer's claim already ran.
     async fn referenced_result_keys(
         &self,
         ready: &[ResultTableRecord],
@@ -721,7 +762,7 @@ impl ReferencedKeys {
 /// (`SidecarKind::Lexical`'s `.tantivy` today — sidecar_layout.rs's own
 /// doc comment names it the one directory-shaped sibling) rather than a
 /// single file, so callers matching a listed object against it must match
-/// by PREFIX (`{base}.{ext}/…`), never by exact equality alone (A3).
+/// by PREFIX (`{base}.{ext}/…`), never by exact equality alone.
 fn is_directory_sidecar_extension(ext: &str) -> bool {
     ext == "tantivy"
 }

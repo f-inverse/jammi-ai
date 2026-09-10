@@ -6,8 +6,10 @@
 use std::sync::Arc;
 use std::time::Duration;
 
+use arrow::array::{FixedSizeListArray, Float32Array, RecordBatch, StringArray};
 use datafusion::prelude::SessionContext;
 use jammi_db::catalog::model_repo::RegisterModelParams;
+use jammi_db::catalog::result_repo::ResultTableKind;
 use jammi_db::catalog::training_repo::CreateTrainingJobParams;
 use jammi_db::catalog::Catalog;
 use jammi_db::config::AnnIndexConfig;
@@ -16,7 +18,10 @@ use jammi_db::store::manifest::{
     ComputeDevice, ComputePrecision, MaterializationEnv, ModelContentDigest, ModelIdentity,
     ProducingDescriptor,
 };
-use jammi_db::store::{EmbeddingTableSpec, Materialization, ReconcileOptions, ResultStore};
+use jammi_db::store::schema::embedding_table_schema;
+use jammi_db::store::{
+    BuildingTable, EmbeddingTableSpec, Materialization, ReconcileOptions, ResultStore,
+};
 use jammi_db::TenantId;
 use tempfile::tempdir;
 use uuid::Uuid;
@@ -113,6 +118,142 @@ fn short_lease() -> jammi_db::catalog::lease::LeaseIntervals {
     }
     .intervals()
     .unwrap()
+}
+
+/// Register a `building` embedding row and write a valid, closed Parquet
+/// under it directly — bypassing the catalog's `building -> ready` flip, so
+/// the row stays `building` with real bytes on disk and NO
+/// `.materialization.json` sidecar: the "torn write before manifest" shape
+/// [`ResultStore::recover`]'s expired-building pre-pass reaps via
+/// `reap_after_fail_cas` (fails the row, then deletes the Parquet).
+async fn create_building_embedding_with_parquet(
+    store: &ResultStore,
+    source_id: &str,
+    n: usize,
+) -> BuildingTable {
+    let info = store
+        .create_table(
+            source_id,
+            ModelTask::TextEmbedding,
+            ResultTableKind::Model,
+            None,
+            "test-model",
+            Some(DIMS as i32),
+            Some("_row_id"),
+            None,
+        )
+        .await
+        .unwrap();
+
+    let schema = embedding_table_schema(DIMS);
+    let row_ids: Vec<String> = (0..n).map(|i| format!("row-{i}")).collect();
+    let row_id_arr = StringArray::from_iter_values(row_ids.iter().map(|s| s.as_str()));
+    let source_arr = StringArray::from_iter_values((0..n).map(|_| source_id));
+    let model_arr = StringArray::from_iter_values((0..n).map(|_| "test-model"));
+    let flat: Vec<f32> = (0..n)
+        .flat_map(|i| (0..DIMS).map(move |d| (i * DIMS + d) as f32))
+        .collect();
+    let item = Arc::new(arrow_schema::Field::new(
+        "item",
+        arrow_schema::DataType::Float32,
+        false,
+    ));
+    let vectors =
+        FixedSizeListArray::try_new(item, DIMS as i32, Arc::new(Float32Array::from(flat)), None)
+            .unwrap();
+    let batch = RecordBatch::try_new(
+        schema.clone(),
+        vec![
+            Arc::new(row_id_arr),
+            Arc::new(source_arr),
+            Arc::new(model_arr),
+            Arc::new(vectors),
+        ],
+    )
+    .unwrap();
+    let mut writer = store.open_writer(info.parquet_url(), schema).await.unwrap();
+    if n > 0 {
+        writer.write_batch(&batch).await.unwrap();
+    }
+    writer.close().await.unwrap();
+    info
+}
+
+// ─── report-count correctness: a key the expired-building pre-pass already
+//     claimed/deleted must never ALSO be counted by this pass's own
+//     orphan/bytes_reclaimed accounting off a listing snapshot taken before
+//     the pre-pass ran ───────────────────────────────────────────────────────
+
+#[tokio::test]
+async fn pre_pass_deleted_table_is_not_double_counted() {
+    let dir = tempdir().unwrap();
+    let catalog = Arc::new(Catalog::open(dir.path()).await.unwrap());
+    let store = ResultStore::new(dir.path(), Arc::clone(&catalog), AnnIndexConfig::default())
+        .unwrap()
+        .with_lease_intervals(short_lease());
+
+    // A `building` row: valid Parquet, no manifest, expired lease — exactly
+    // the state the pre-pass reaps via `reap_after_fail_cas` (fails the row,
+    // deletes the Parquet) under `apply=true`.
+    let info = create_building_embedding_with_parquet(&store, "docs-torn", 5).await;
+    let parquet_local = info
+        .parquet_url()
+        .as_str()
+        .trim_start_matches("file://")
+        .to_string();
+    // `abandon_building` asserts the row is `building` under a live lease,
+    // detaches the writer's handle (so no background heartbeat can renew it
+    // out from under the next line), THEN forces the lease into the past.
+    let table_name = jammi_test_utils::abandon_building(&catalog, info).await;
+    // Backdate the Parquet so it would ALSO qualify as a past-grace orphan
+    // candidate if a stale (pre-pre-pass) listing snapshot were checked
+    // against it — the exact condition that would double-count it.
+    let table_dir = std::path::Path::new(&parquet_local).parent().unwrap();
+    backdate_dir(table_dir, Duration::from_secs(3600));
+
+    let report = store
+        .reconcile(ReconcileOptions {
+            apply: true,
+            grace: Duration::from_secs(3),
+        })
+        .await
+        .unwrap();
+
+    // The pre-pass reaped the row: it is `failed`, not still `building`.
+    let row = store
+        .catalog()
+        .get_result_table(&table_name)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        row.status,
+        jammi_db::catalog::status::ResultTableStatus::Failed.to_string(),
+        "{report:?}"
+    );
+    // The pre-pass's own delete actually removed the bytes.
+    assert!(
+        !std::path::Path::new(&parquet_local).exists(),
+        "the pre-pass must have deleted the torn row's Parquet"
+    );
+
+    // The key the pre-pass already deleted must NEVER show up in this SAME
+    // pass's own orphan accounting — it was never listed in the first place
+    // (listing runs AFTER the pre-pass), so it cannot be double-counted.
+    let parquet_key = std::path::Path::new(&parquet_local)
+        .file_name()
+        .unwrap()
+        .to_str()
+        .unwrap()
+        .to_string();
+    assert!(
+        !report.orphans.iter().any(|o| o.ends_with(&parquet_key)),
+        "a pre-pass-deleted key must not double-count as this pass's own orphan: {report:?}"
+    );
+    assert_eq!(
+        report.bytes_reclaimed, 0,
+        "the pre-pass's own delete must not be double-counted in bytes_reclaimed: {report:?}"
+    );
 }
 
 // ─── S1: a healthy F32 indexed `ready` table survives `apply=true` ─────────
@@ -292,7 +433,7 @@ async fn young_orphan_is_pending_not_deleted() {
 // ─── an unattributed key survives even at the SHORTEST valid grace under
 //     `apply=true` (unattributed is skipped before the age gate at all,
 //     so this holds independent of the object's age) — reported ONLY by
-//     the admin cross-tenant pass (block #4: a scoped pass, even an
+//     the admin cross-tenant pass (a scoped pass, even an
 //     unscoped/GLOBAL one, reports NOTHING it cannot attribute to its own
 //     prefix; an unattributed key is store-wide by definition) ───────────
 
@@ -329,7 +470,7 @@ async fn unattributed_key_never_deleted_regardless_of_grace() {
     assert!(root.join("pre_layout_table.parquet").exists());
 }
 
-/// Block #4, RED first: the SAME stray key as above, but seen through the
+/// RED first: the SAME stray key as above, but seen through the
 /// SCOPED arm (`ResultStore::reconcile`, even on an unscoped/GLOBAL store —
 /// scoped is scoped regardless of which tenant) — must report NOTHING for
 /// it. Before the fix this failed: a scoped pass listed every unattributed
@@ -489,6 +630,126 @@ async fn tenant_scoped_reconcile_never_touches_another_tenants_prefix() {
         .is_some());
 }
 
+// ─── a scoped pass reports NOTHING it cannot act on: a GLOBAL ready row
+//     with a missing required object is invisible to a tenant-scoped
+//     dry-run AND apply alike — only an admin (`all=true`) pass ever
+//     touches it. RED before the fix: `list_result_tables_by_status` (an
+//     ordinary READ — GLOBAL visible to every tenant, like any other read on
+//     this table) fed straight into the row->object CAS below it, so a
+//     tenant-scoped dry-run REPORTED the GLOBAL row in `rows_failed` while
+//     the matching `apply` pass's `fail_ready_result_table` CAS (`Strict` on
+//     the caller's own tenant) missed it entirely — dry-run and apply
+//     disagreed on the identical state. ─────────────────────────────────────
+
+#[tokio::test]
+async fn scoped_pass_reports_nothing_for_a_global_row_it_cannot_act_on() {
+    let dir = tempdir().unwrap();
+    let base_catalog = Arc::new(Catalog::open(dir.path()).await.unwrap());
+    let tenant_b = fresh_tenant();
+    let catalog_b = Arc::new(base_catalog.pinned_to_tenant(Some(tenant_b)));
+
+    let store_global = ResultStore::new(
+        dir.path(),
+        Arc::clone(&base_catalog),
+        AnnIndexConfig::default(),
+    )
+    .unwrap()
+    .with_lease_intervals(short_lease());
+    let store_b = ResultStore::new(
+        dir.path(),
+        Arc::clone(&catalog_b),
+        AnnIndexConfig::default(),
+    )
+    .unwrap()
+    .with_lease_intervals(short_lease());
+    let ctx = SessionContext::new();
+    let record = materialize_healthy_table(&store_global, &ctx, "docs-global").await;
+
+    // Remove the GLOBAL row's `.materialization.json` sidecar so it fails
+    // `required_row_objects_present` — a missing required object, exactly
+    // the condition that would (incorrectly) drive a scoped dry-run to
+    // report it.
+    let parquet_local = record.parquet_path.trim_start_matches("file://");
+    let (stem, _ext) = parquet_local.rsplit_once('.').unwrap();
+    let mat_path = format!("{stem}.materialization.json");
+    assert!(
+        std::path::Path::new(&mat_path).exists(),
+        "fixture must actually produce a materialization sidecar to remove"
+    );
+    std::fs::remove_file(&mat_path).unwrap();
+
+    // Tenant B's dry-run: reports NOTHING for the GLOBAL row.
+    let dry = store_b
+        .reconcile(ReconcileOptions {
+            apply: false,
+            grace: Duration::from_secs(3600),
+        })
+        .await
+        .unwrap();
+    assert!(dry.rows_failed.is_empty(), "{dry:?}");
+    assert_eq!(dry.rows_failed_count, 0, "{dry:?}");
+
+    // Tenant B's apply: agrees with its own dry-run on the same state.
+    let apply = store_b
+        .reconcile(ReconcileOptions {
+            apply: true,
+            grace: Duration::from_secs(3600),
+        })
+        .await
+        .unwrap();
+    assert!(apply.rows_failed.is_empty(), "{apply:?}");
+    assert_eq!(apply.rows_failed_count, 0, "{apply:?}");
+
+    // The GLOBAL row stayed `ready` through both of tenant B's passes.
+    let row = store_global
+        .catalog()
+        .get_result_table(&record.table_name)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        row.status,
+        jammi_db::catalog::status::ResultTableStatus::Ready.to_string(),
+        "a scoped pass must never flip a row it cannot even report on"
+    );
+
+    // An admin (`all=true`) pass sees and reports it in BOTH modes.
+    let admin_dry = store_b
+        .reconcile_all(ReconcileOptions {
+            apply: false,
+            grace: Duration::from_secs(3600),
+        })
+        .await
+        .unwrap();
+    assert!(
+        admin_dry.rows_failed.contains(&record.table_name),
+        "{admin_dry:?}"
+    );
+
+    let admin_apply = store_b
+        .reconcile_all(ReconcileOptions {
+            apply: true,
+            grace: Duration::from_secs(3600),
+        })
+        .await
+        .unwrap();
+    assert!(
+        admin_apply.rows_failed.contains(&record.table_name),
+        "{admin_apply:?}"
+    );
+    let row_after = store_global
+        .catalog()
+        .get_result_table(&record.table_name)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        row_after.status,
+        jammi_db::catalog::status::ResultTableStatus::Failed.to_string(),
+        "the admin apply pass must actually act on the row it reported"
+    );
+}
+
 // ─── artifact arm: a running job's checkpoints survive; a canonical-UUID
 //     job id never lands in `unattributed` ─────────────────────────────────
 
@@ -571,7 +832,7 @@ async fn running_jobs_artifact_prefix_survives_and_is_never_unattributed() {
         .exists());
 }
 
-// ─── block #3, RED first: a `models` row names a prefix whose `manifest.json`
+// ─── RED first: a `models` row names a prefix whose `manifest.json`
 //     is absent — the row is still live, so the prefix is NEVER reclaimed
 //     through the orphan arm, at any grace or `apply`; it is reported as
 //     `damaged` instead (row present, manifest absent) ────────────────────

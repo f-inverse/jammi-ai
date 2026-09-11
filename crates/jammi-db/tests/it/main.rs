@@ -7,6 +7,7 @@ mod catalog_ping;
 mod channels;
 mod common;
 mod concurrent_writers;
+mod datafusion_version;
 mod docs_config_fences;
 mod ephemeral;
 mod esc_071_cross_session_visibility;

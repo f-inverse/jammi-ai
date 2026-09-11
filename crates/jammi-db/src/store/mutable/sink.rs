@@ -8,7 +8,6 @@
 //! `INSERT … VALUES (…), (…), …` statement built from the backend's
 //! [`crate::store::mutable::MutableBackend::insert_dml`] renderer.
 
-use std::any::Any;
 use std::fmt;
 use std::sync::Arc;
 
@@ -70,10 +69,6 @@ impl DisplayAs for MutableTableSink {
 
 #[async_trait]
 impl DataSink for MutableTableSink {
-    fn as_any(&self) -> &dyn Any {
-        self
-    }
-
     fn schema(&self) -> &SchemaRef {
         &self.def.schema
     }

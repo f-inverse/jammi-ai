@@ -3270,7 +3270,7 @@ never collapsed), and a parseable-but-incomplete config (missing `head`/`archite
 manifest-verified bundle missing `model.safetensors`
 (`crates/jammi-ai/src/pipeline/context_predictor.rs:1387`) — matches `CandleBackend::load`'s
 peer refusal for a fine-tuned model's weights file, `"Failed to load safetensors: {e}"`
-(`crates/jammi-ai/src/model/backend/candle.rs:2762`), instead of its own
+(`crates/jammi-ai/src/model/backend/candle.rs:2767`), instead of its own
 `JammiError::Inference`.
 
 At the gRPC edge, `map_engine_error` (`crates/jammi-server/src/grpc/wire.rs:109`) maps

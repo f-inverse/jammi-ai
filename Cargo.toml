@@ -68,19 +68,24 @@ jammi-encoders = { version = "0.49.1", path = "crates/jammi-encoders" }
 jammi-test-utils = { path = "crates/jammi-test-utils" }
 
 # Query engine
-datafusion = "52.3"
-datafusion-federation = "0.5"
-arrow = "57"
-arrow-flight = { version = "57", features = ["flight-sql"] }
-arrow-schema = "57"
-arrow-array = "57"
-arrow-ipc = "57"
+# One DataFusion line, workspace-wide (the `datafusion_version` oracle in
+# jammi-db's `it` suite asserts it). `datafusion-federation` is pinned
+# EXACTLY: 0.5.5 is the last 0.5.x on DataFusion 54 (0.5.6 pulls DataFusion
+# 55), so a caret req would let `cargo update` drag a second DataFusion into
+# the graph.
+datafusion = "54.1"
+datafusion-federation = "=0.5.5"
+arrow = "58.3"
+arrow-flight = { version = "58.3", features = ["flight-sql"] }
+arrow-schema = "58.3"
+arrow-array = "58.3"
+arrow-ipc = "58.3"
 
 # Storage
 # The `object_store` feature pulls in `ParquetObjectWriter`, the async sink
 # Jammi uses for every result-table write. Without it the writer falls back
 # to a sync `File` path that can't target S3 / GCS / Azure.
-parquet = { version = "57", features = ["object_store"] }
+parquet = { version = "58.3", features = ["object_store"] }
 # No `macros` feature: `sqlx::query!`/`query_as!` and the `FromRow`/`Type`
 # derives are unused workspace-wide (every row-mapping call site is the
 # runtime `sqlx::query`/`query_as::<_, T>` form) and `macros` is the ONLY
@@ -98,10 +103,10 @@ parquet = { version = "57", features = ["object_store"] }
 # using the compile-time macros, and if it does, that call site is a
 # workspace-crate concern to coordinate before flipping this back on.
 sqlx = { version = "0.8", default-features = false, features = ["runtime-tokio-rustls", "sqlite", "postgres", "uuid", "chrono", "json"] }
-# Object-store pin matches the transitive version DataFusion 52.3 carries
-# (see Cargo.lock: object_store 0.12.5). Mismatching this would force
+# Object-store pin matches the transitive version DataFusion 54 carries
+# (see Cargo.lock: object_store 0.13.2). Mismatching this would force
 # duplicate crates in the dep graph and break ListingTableUrl interop.
-object_store = { version = "0.12", default-features = false }
+object_store = { version = "0.13", default-features = false }
 
 # ML inference
 candle-core = "0.11"
@@ -152,11 +157,11 @@ symphonia = { version = "0.5", default-features = false, features = ["wav", "pcm
 # default `cargo test --workspace` lane lets the integration test binary
 # link against libpython without unresolved symbols.
 pyo3 = { version = "0.28", default-features = false, features = ["abi3-py39", "macros"] }
-pyo3-arrow = { version = "0.16", default-features = false }
+pyo3-arrow = { version = "0.17", default-features = false }
 
 # HTTP / server
 axum = "0.8"
-datafusion-flight-sql-server = "0.4"
+datafusion-flight-sql-server = "0.4.18"
 prometheus = { version = "0.14", default-features = false }
 reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
 tonic = "0.14"

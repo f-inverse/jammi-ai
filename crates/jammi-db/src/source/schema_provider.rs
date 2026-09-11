@@ -1,4 +1,3 @@
-use std::any::Any;
 use std::collections::HashMap;
 use std::sync::{Arc, RwLock};
 
@@ -67,10 +66,6 @@ impl JammiSchemaProvider {
 
 #[async_trait]
 impl SchemaProvider for JammiSchemaProvider {
-    fn as_any(&self) -> &dyn Any {
-        self
-    }
-
     fn table_names(&self) -> Vec<String> {
         self.tables
             .read()

@@ -653,13 +653,17 @@ fn build_per_query_rows(
     per_query
         .iter()
         .map(|rec| {
-            let mut metrics = serde_json::Map::new();
+            // Key-sorted on purpose: `metrics_json` is persisted text, and a
+            // `serde_json::Map` keeps insertion order whenever any dependency
+            // enables `preserve_order`.
+            let mut metrics = std::collections::BTreeMap::new();
             for (k, recall) in &rec.recall_at_ks {
                 metrics.insert(format!("recall@{k}"), serde_json::Value::from(*recall));
             }
             metrics.insert("mrr".into(), serde_json::Value::from(rec.metrics.mrr));
             metrics.insert("ndcg".into(), serde_json::Value::from(rec.metrics.ndcg));
             metrics.insert("distance".into(), serde_json::Value::from(rec.distance));
+            let metrics: serde_json::Map<String, serde_json::Value> = metrics.into_iter().collect();
 
             Ok(PerQueryEvalRecord {
                 eval_run_id: eval_run_id.to_string(),
@@ -684,7 +688,8 @@ fn build_calibration_per_record_rows(
     per_record
         .iter()
         .map(|rec| {
-            let mut metrics = serde_json::Map::new();
+            // Key-sorted on purpose, as in `build_per_query_rows` above.
+            let mut metrics = std::collections::BTreeMap::new();
             metrics.insert("crps".into(), serde_json::Value::from(rec.crps));
             metrics.insert("nll".into(), serde_json::Value::from(rec.nll));
             metrics.insert("pit".into(), serde_json::Value::from(rec.pit));
@@ -696,6 +701,7 @@ fn build_calibration_per_record_rows(
                 "interval_width".into(),
                 serde_json::Value::from(rec.interval_width),
             );
+            let metrics: serde_json::Map<String, serde_json::Value> = metrics.into_iter().collect();
 
             Ok(PerQueryEvalRecord {
                 eval_run_id: eval_run_id.to_string(),

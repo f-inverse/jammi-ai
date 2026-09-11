@@ -111,6 +111,7 @@ impl QueryBuilder {
                 None,
                 PartitionMode::CollectLeft,
                 NullEquality::NullEqualsNothing,
+                false,
             )
             .map_err(|e| JammiError::Other(format!("Hydration join: {e}")))?;
 
@@ -245,6 +246,7 @@ impl QueryBuilder {
             None,
             PartitionMode::CollectLeft,
             NullEquality::NullEqualsNothing,
+            false,
         )
         .map_err(|e| JammiError::Other(format!("Join: {e}")))?;
 

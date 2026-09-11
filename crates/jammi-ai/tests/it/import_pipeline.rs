@@ -5,13 +5,17 @@
 //! `ResultStore::materialize_embedding_table` directly. That mechanism moved
 //! into the generic `ResultStore::materialize_computed_embedding_table` verb;
 //! `ImportPipeline::run` now just builds the caller-side provenance and calls
-//! it. This file pins that the refactor is **byte-identical** in the two ways
-//! that carry no workspace-version dependence:
+//! it. This file pins that the refactor is **byte-identical** in two ways,
+//! neither of which folds the workspace's own version:
 //!
 //! 1. the output Parquet artifact digest (the `_row_id`/`_source_id`/
 //!    `_model_id`/`vector` bytes) — checked against a committed golden
-//!    constant captured by running this exact test against `main @ 3164644`
-//!    (before the refactor landed);
+//!    constant captured by running this exact test. The bytes DO depend on
+//!    the `parquet` crate line the workspace pins: the writer stamps its own
+//!    `created_by` string into the footer and its ZSTD codec chooses the
+//!    frame header, so the constant is re-captured on a parquet line bump —
+//!    only after proving, by decoding both artifacts, that the schema,
+//!    row-group/column-chunk metadata, statistics and data are equal;
 //! 2. the manifest's `ProducingDescriptor::External` — the producer id and
 //!    every param, including the content digest of the normalized rows —
 //!    checked against an independently hand-built reference descriptor, never
@@ -46,9 +50,14 @@ use jammi_db::store::manifest::{ArtifactDigest, ProducingDescriptor};
 
 use crate::common;
 
-/// Golden output Parquet artifact digest (SHA-256 hex) captured the same way.
+/// Golden output Parquet artifact digest (SHA-256 hex) captured the same way,
+/// on the `parquet` 58 line (`created_by = "parquet-rs version 58.4.0"`;
+/// ZSTD single-segment frames with the content size in the frame header).
+/// The `parquet` 57 bytes hashed to
+/// `1093bebfee3cf0ac31368b4cc1c94de117e4bced8bebc481efbefadc00e883e8`
+/// and decode to the identical table.
 const GOLDEN_ARTIFACT_DIGEST: &str =
-    "1093bebfee3cf0ac31368b4cc1c94de117e4bced8bebc481efbefadc00e883e8";
+    "e5b6f05d8b844e80e3aeef6b35724f90aedced0694eb198a4f7b427ce731b8de";
 
 /// Golden content digest (SHA-256 hex) of the fixture's normalized
 /// `(_row_id, vector)` rows, captured the same way as

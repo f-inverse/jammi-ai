@@ -1,4 +1,3 @@
-use std::any::Any;
 use std::sync::Arc;
 
 use datafusion::catalog::{CatalogProvider, SchemaProvider};
@@ -29,10 +28,6 @@ impl SourceCatalog {
 }
 
 impl CatalogProvider for SourceCatalog {
-    fn as_any(&self) -> &dyn Any {
-        self
-    }
-
     fn schema_names(&self) -> Vec<String> {
         vec!["public".to_string()]
     }

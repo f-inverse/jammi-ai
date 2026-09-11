@@ -81,6 +81,15 @@ jobs:
       - name: Clippy (gated test surfaces — compile-only feature closure)
         run: cargo clippy -p jammi-ai --tests --features live-gpu-tests,live-distributed-tests -- -D warnings
 
+      # jammi-db's `postgres` / `mysql` features compile `source/postgres.rs`
+      # and `source/mysql.rs` (the `datafusion-table-providers` compat
+      # surface) and nothing else on the merge path activates them, so the
+      # workspace clippy above never sees those files. A coverage lane, not
+      # a `required-features` closure: `ci/scripts/check_lint_surface_closure.py`
+      # credits it like every other `cargo clippy ... -D warnings` line here.
+      - name: Clippy jammi-db --features postgres,mysql --all-targets (source-provider feature surface)
+        run: cargo clippy -p jammi-db --features postgres,mysql --all-targets -- -D warnings
+
   test:
     name: Test (hermetic)
     runs-on: ubuntu-latest

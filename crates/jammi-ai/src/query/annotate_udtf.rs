@@ -40,7 +40,6 @@
 //! the requested task), never a per-row event, so it fails the whole query
 //! loudly rather than being served as an all-`_status = "error"` relation.
 
-use std::any::Any;
 use std::fmt;
 use std::sync::{Arc, Weak};
 
@@ -208,10 +207,6 @@ impl fmt::Debug for AnnotateTable {
 
 #[async_trait]
 impl TableProvider for AnnotateTable {
-    fn as_any(&self) -> &dyn Any {
-        self
-    }
-
     fn schema(&self) -> SchemaRef {
         Arc::clone(&self.schema)
     }

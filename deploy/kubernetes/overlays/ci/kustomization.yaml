@@ -1,0 +1,32 @@
+apiVersion: kustomize.config.k8s.io/v1beta1
+kind: Kustomization
+
+# The workflow creates this namespace imperatively (once, before the Secret)
+# -- no namespace.yaml here; kustomize's `namespace:` stamps it onto every
+# namespaced resource below.
+namespace: jammi-ci
+
+resources:
+  - ../../base
+  - postgres.yaml
+  - nats.yaml
+
+# The kind smoke never pulls from a registry -- it loads the image the
+# workflow already built into the kind cluster and pins the tag kustomize
+# rewrites the base Deployment to reference.
+images:
+  - name: ghcr.io/f-inverse/jammi-ai-server
+    newName: jammi-ai-server
+    newTag: pr
+
+patches:
+  - path: patch-deployment.yaml
+
+configMapGenerator:
+  - name: jammi-server-config
+    behavior: replace
+    files:
+      - jammi.toml
+
+generatorOptions:
+  disableNameSuffixHash: true

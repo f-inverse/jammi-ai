@@ -1,0 +1,54 @@
+# Shape C's query tier -- the artifact the guide's Kubernetes section
+# (docs/guide/src/reference-topologies.md) includes directly. See
+# `deploy/kubernetes/README.md` for the boundary this file does and does not
+# cover.
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: jammi-server
+spec:
+  # Every replica runs the identical config against the same Postgres catalog
+  # and JetStream broker; the one lease + advisory-lock mechanism
+  # (docs/guide/src/reference-topologies.md#shape-c--multi-tenant-server,
+  # docs/guide/src/catalog-and-broker.md#multi-writer-safety; #479 closed)
+  # is what makes concurrent replicas safe. Raise or lower freely.
+  replicas: 3
+  selector:
+    matchLabels: { app: jammi-server }
+  template:
+    metadata:
+      labels: { app: jammi-server }
+    spec:
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 65532
+        # The scratch emptyDir below must be writable by uid 65532 without
+        # relying on kubelet's default 0777 volume permissions.
+        fsGroup: 65532
+      containers:
+        - name: jammi-server
+          # Pin-advice: `:latest` is re-pointed by every `v*` release tag.
+          # Pin an exact `:vX.Y.Z` tag for reproducible deploys.
+          image: ghcr.io/f-inverse/jammi-ai-server:latest
+          ports:
+            - { containerPort: 8081, name: flight }
+            - { containerPort: 8080, name: health }
+          readinessProbe:
+            httpGet: { path: /readyz, port: 8080 }
+            periodSeconds: 5
+          livenessProbe:
+            httpGet: { path: /healthz, port: 8080 }
+            periodSeconds: 10
+          envFrom:
+            # JAMMI_AUDIT_MASTER_KEY, JAMMI_CATALOG__POSTGRES__URL,
+            # JAMMI_BROKER__JET_STREAM__URL -- no Secret manifest ships in
+            # git; create it out-of-band (see the README).
+            - secretRef: { name: jammi-server-secrets, optional: false }
+          volumeMounts:
+            - { name: config, mountPath: /etc/jammi, readOnly: true }
+            - { name: scratch, mountPath: /var/lib/jammi }
+      volumes:
+        - name: config
+          configMap: { name: jammi-server-config } # the non-secret knobs only
+        - name: scratch
+          emptyDir: {} # local scratch only -- the catalog/broker/result-root carry the durable state

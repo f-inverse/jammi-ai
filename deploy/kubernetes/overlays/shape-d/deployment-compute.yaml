@@ -1,0 +1,56 @@
+# PROVISIONAL: a plain Deployment today. #500 (multi-GPU / multi-node gangs
+# as engine mechanism) decides the gang primitive; once ranks need stable
+# per-rank identity and ordered startup this becomes a StatefulSet or an
+# indexed Job. The Shape C base (../../base) is unaffected.
+# https://github.com/f-inverse/jammi-ai/issues/500
+#
+# kubeconform-validated only -- no GPU node is available in CI, so this
+# Deployment never runs a real pod in the kind smoke.
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: jammi-server-compute
+spec:
+  replicas: 1
+  selector:
+    matchLabels: { app: jammi-server-compute }
+  template:
+    metadata:
+      labels: { app: jammi-server-compute }
+    spec:
+      nodeSelector:
+        gpu-node-pool: "true" # your cluster's own GPU node label
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 65532
+        fsGroup: 65532
+      containers:
+        - name: jammi-server
+          # amd64 only. Pin-advice: `:latest` is re-pointed by every `v*`
+          # release tag; pin an exact `:vX.Y.Z` tag for reproducible
+          # GPU-node deploys.
+          image: ghcr.io/f-inverse/jammi-ai-server-cu12:latest
+          resources:
+            limits: { nvidia.com/gpu: 1 }
+          ports:
+            - { containerPort: 8081, name: flight }
+            - { containerPort: 8080, name: health }
+          readinessProbe:
+            httpGet: { path: /readyz, port: 8080 }
+            periodSeconds: 5
+          livenessProbe:
+            httpGet: { path: /healthz, port: 8080 }
+            periodSeconds: 10
+          envFrom:
+            # Same catalog/broker Secret as the query tier.
+            - secretRef: { name: jammi-server-secrets, optional: false }
+          volumeMounts:
+            - { name: config, mountPath: /etc/jammi, readOnly: true }
+            - { name: scratch, mountPath: /var/lib/jammi }
+      volumes:
+        - name: config
+          configMap: { name: jammi-compute-config }
+        - name: scratch
+          # The cu12 image also keeps CUDA_CACHE_PATH under /var/lib/jammi
+          # alongside HF_HOME -- local scratch only, no durable state here.
+          emptyDir: {}

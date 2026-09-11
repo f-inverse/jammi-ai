@@ -6,7 +6,7 @@ different code path: each shape is a point on the [backend-driver
 configuration surface](./philosophy.md#how-it-deploys-one-binary-pluggable-backends)
 (catalog, trigger broker, object storage) plus a process count. This page
 pins each shape to the concrete artifact that realises it: a config, a
-tested `deploy/` Compose file, or an orchestration sketch.
+tested `deploy/` Compose file, or a kustomize manifest tree.
 
 ## Shape A — single-process embedded
 
@@ -81,7 +81,12 @@ distroless and ships no shell, so a `curl`/`wget`-based `HEALTHCHECK` is not
 an option; `probe` is the same generic-CLI shape as Postgres's own
 `pg_isready`.
 
-**What the smoke proves.** `tests/compose/shape_b_remote.py` asserts
+**What the smoke proves.** `tests/compose/remote_smoke.py` is the shared
+smoke oracle; `shape_b_remote.py` (this Compose shape) and
+`shape_c_kube_remote.py` (the Kubernetes shape below) are its two drivers,
+differing only in how they restart the server and in what they assert
+afterwards — durability on the Compose volume here, the shared catalog on
+the emptyDir pods there. The oracle asserts
 `get_server_info().broker == "jet_stream"` — the RUNTIME driver kind, which
 fails if `JAMMI_BROKER__JET_STREAM__URL` were ever dropped from the compose
 file, unlike the compile-time `features` list alone — registers the bundled
@@ -121,7 +126,10 @@ duration_secs = 30
 heartbeat_secs = 10
 
 [server]
-services = "all"
+services = ["core", "event", "eval"]
+
+[worker]
+enabled = false
 ```
 
 The env-only equivalent (see [Deploy as a Server: a production shape,
@@ -152,91 +160,62 @@ by `jammi reconcile`; migrations are serialised by an advisory lock.
 timing knob every leased catalog row shares across the fleet — see
 [Configuration](./configuration.md) for its full field reference.
 
-### Kubernetes (sketch, not a shipped manifest)
+### Kubernetes (deploy/kubernetes)
 
 Orchestration — which scheduler, how replicas are placed, ingress, TLS
 termination, autoscaling — is the deployer's runtime, not the engine's (see
 ["How it deploys"](./philosophy.md#how-it-deploys-one-binary-pluggable-backends)).
-The engine ships no Helm chart and no manifest tree; the sketch below shows
-only the shape — a Deployment running the published image against the
-config above, wired to the two knobs the engine itself cares about
-(`readinessProbe` against `/readyz`, `runAsNonRoot`) — for a reader assembling
-their own cluster's manifests.
+`deploy/kubernetes/base` is the whole shape the engine cares about — a
+Deployment with `readinessProbe` against `/readyz` and `runAsNonRoot`, a
+Service, a ConfigMap of the non-secret knobs, an `emptyDir` for scratch;
+ingress, TLS, autoscaling, network policy and each cloud's managed-service
+annotations are the deployer's overlay, and the seam is a kustomize patch on
+the Deployment/Service metadata, never a change to the engine's knobs. Every
+PR validates `kustomize build` + `kubeconform --strict --kubernetes-version
+1.34.11` over every kustomization in the tree, in `ci.yml`'s `Guard
+(kubernetes manifests)`; the `kube-smoke` workflow additionally stands the
+`ci` overlay up on a real `kind` cluster on push to `main`, nightly, on
+manual dispatch, and on any pull request that touches
+`deploy/kubernetes/**` or `tests/compose/**`.
 
 ```yaml
-# sketch, not a shipped manifest -- orchestration is your runtime.
-apiVersion: apps/v1
-kind: Deployment
-metadata:
-  name: jammi-server
-spec:
-  replicas: 3
-  selector:
-    matchLabels: { app: jammi-server }
-  template:
-    metadata:
-      labels: { app: jammi-server }
-    spec:
-      securityContext:
-        runAsNonRoot: true
-        runAsUser: 65532
-      containers:
-        - name: jammi-server
-          image: ghcr.io/f-inverse/jammi-ai-server:latest
-          ports:
-            - { containerPort: 8081, name: flight }
-            - { containerPort: 8080, name: health }
-          readinessProbe:
-            httpGet: { path: /readyz, port: 8080 }
-            periodSeconds: 5
-          livenessProbe:
-            httpGet: { path: /healthz, port: 8080 }
-            periodSeconds: 10
-          envFrom:
-            - secretRef: { name: jammi-server-secrets } # JAMMI_CATALOG__POSTGRES__URL, JAMMI_BROKER__JET_STREAM__URL, JAMMI_AUDIT_MASTER_KEY, ...
-          volumeMounts:
-            - { name: config, mountPath: /etc/jammi, readOnly: true }
-            - { name: scratch, mountPath: /var/lib/jammi }
-      volumes:
-        - name: config
-          configMap: { name: jammi-server-config } # the non-secret knobs only
-        - name: scratch
-          emptyDir: {} # local scratch only -- the catalog/broker/result-root carry the durable state
----
-apiVersion: v1
-kind: Service
-metadata:
-  name: jammi-server
-spec:
-  # No `type:` -> ClusterIP (the default): cluster-internal only, reachable
-  # from other pods/Services on this cluster, not from outside it -- pair
-  # with an Ingress/Gateway and a TLS terminator to reach it externally.
-  selector: { app: jammi-server }
-  ports:
-    - { name: flight, port: 8081, targetPort: 8081 }
-    - { name: health, port: 8080, targetPort: 8080 }
----
-apiVersion: v1
-kind: ConfigMap
-metadata:
-  name: jammi-server-config
-data:
-  jammi.toml: |
-    [storage]
-    result_root = "s3://jammi-results/prod"
+{{#include ../../../deploy/kubernetes/base/deployment.yaml}}
+```
 
-    [storage.cloud.s3]
-    region = "us-east-1"
+```yaml
+{{#include ../../../deploy/kubernetes/base/service.yaml}}
+```
 
-    [server]
-    services = "all"
+```toml
+{{#include ../../../deploy/kubernetes/base/jammi.toml}}
 ```
 
 `jammi-server-secrets` is a `Secret` carrying the same env keys the Compose
 and bare-env forms above use — `JAMMI_CATALOG__POSTGRES__URL`,
 `JAMMI_BROKER__JET_STREAM__CREDENTIALS__FILE` (or `__URL`),
 `JAMMI_AUDIT_MASTER_KEY` — mounted as env vars, never baked into the
-ConfigMap.
+ConfigMap. No `Secret` manifest ships in git; create it out-of-band, once per
+cluster namespace:
+
+```bash
+kubectl -n <namespace> create secret generic jammi-server-secrets \
+  --from-literal=JAMMI_AUDIT_MASTER_KEY=<...> \
+  --from-literal=JAMMI_CATALOG__POSTGRES__URL=<...> \
+  --from-literal=JAMMI_BROKER__JET_STREAM__URL=<...>
+```
+
+never in git.
+
+**What `kube-smoke` proves.** Against the `ci` overlay on a real `kind`
+cluster: readiness (`kubectl rollout status`), `get_server_info().broker ==
+"jet_stream"`, the Postgres `sources` table's row count via `psql` against
+the `postgres` StatefulSet, one-hop image identity — every pod's
+`containerStatuses[].imageID` traces back to the image `kind load`ed, never
+a registry pull — and a `rollout restart` after which the new pod still
+sees the source the pod it replaced registered. What it does NOT prove:
+durability across that restart — the scratch volume is an `emptyDir`, so the
+Postgres catalog and the JetStream broker, not the pod's local disk, carry
+the state a fresh pod recovers.
 
 ## Shape D — disaggregated
 
@@ -255,45 +234,19 @@ to claim only the training kinds) so only it runs the job worker's claim
 loop against the shared catalog. Its `[server] services` is whatever the
 compute node should also serve — `services = []` for a pure compute node.
 
+The compute tier is a plain Deployment today and is **provisional**:
+[#500](https://github.com/f-inverse/jammi-ai/issues/500) decides the gang
+primitive for multi-GPU and multi-node training; once ranks need stable
+per-rank identity and ordered startup, this overlay becomes a `StatefulSet`
+or an indexed `Job`. The Shape C base is unaffected. This overlay is
+validated by `kubeconform` only — CI has no GPU node.
+
 ```yaml
-# sketch: a second Deployment, GPU variant, GPU-node-scheduled -- the compute
-# tier. Not a shipped manifest; see the Kubernetes sketch above for the
-# query tier and the shared Secret/ConfigMap this Deployment reuses.
-apiVersion: apps/v1
-kind: Deployment
-metadata:
-  name: jammi-server-compute
-spec:
-  replicas: 1
-  selector:
-    matchLabels: { app: jammi-server-compute }
-  template:
-    metadata:
-      labels: { app: jammi-server-compute }
-    spec:
-      nodeSelector:
-        gpu-node-pool: "true" # your cluster's own GPU node label
-      securityContext:
-        runAsNonRoot: true
-        runAsUser: 65532
-      containers:
-        - name: jammi-server
-          image: ghcr.io/f-inverse/jammi-ai-server-cu12:latest
-          resources:
-            limits: { nvidia.com/gpu: 1 }
-          readinessProbe:
-            httpGet: { path: /readyz, port: 8080 }
-            periodSeconds: 5
-          envFrom:
-            - secretRef: { name: jammi-server-secrets } # same catalog/broker as the query tier
-          env:
-            - { name: JAMMI_WORKER__ENABLED, value: "true" }
-            - { name: JAMMI_SERVER__SERVICES, value: "[]" }
-          volumeMounts:
-            - { name: config, mountPath: /etc/jammi, readOnly: true }
-      volumes:
-        - name: config
-          configMap: { name: jammi-server-config }
+{{#include ../../../deploy/kubernetes/overlays/shape-d/deployment-compute.yaml}}
+```
+
+```toml
+{{#include ../../../deploy/kubernetes/overlays/shape-d/jammi-compute.toml}}
 ```
 
 Both `:latest` tags are re-pointed by every `v*` release tag (never by a
@@ -304,12 +257,6 @@ tag for reproducible GPU-node deploys.
 Very high scale, specialized GPU pools, and a split compliance posture
 (query tier vs. training tier on separate node pools / network policies)
 are the shapes this topology serves.
-
-This single-node-per-replica compute tier is a provisional primitive: it
-claims and runs one job per attempt on the replica that claimed it, with no
-notion of a multi-replica gang for one job. Whether a future multi-node
-training job spans several compute replicas — and what shape that gang
-coordination takes — is #500's to decide, not this topology's.
 
 ## The `jammi-server probe` subcommand
 

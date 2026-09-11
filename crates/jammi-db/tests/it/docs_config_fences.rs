@@ -29,6 +29,17 @@
 //! `file = "…"` path is rewritten to one shared placeholder file this test
 //! creates, before `parse_from` ever sees the fence. The doc's own text is
 //! never touched; only the string handed to the loader in-memory is.
+//!
+//! # `{{#include …}}` fences
+//!
+//! A fence whose body is a single `{{#include <relpath>}}` line (mdbook's
+//! include syntax) is resolved before selection: `<relpath>` is joined
+//! against the `.md` file's own directory and that file's contents replace
+//! the fence body, so a manifest included this way is walked and parsed
+//! exactly like a fence typed directly into the guide. `file`/`line` still
+//! point at the fence in the guide (not the included file), so a failure
+//! still names the guide location a reader would look at first; the
+//! resolved include path is appended to the failure message.
 use std::collections::BTreeMap;
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -115,6 +126,36 @@ fn extract_toml_fences(path: &Path) -> Vec<Fence> {
         });
     }
     fences
+}
+
+/// If `body`'s only non-blank line is `{{#include <relpath>}}` (mdbook's
+/// include syntax), resolve `<relpath>` against `md_file`'s own directory,
+/// read that file, and return its contents in place of `body`, along with
+/// the resolved path (for the failure message). Otherwise return `body`
+/// unchanged and `None` — a fence typed directly into the guide is never
+/// touched.
+fn resolve_include(md_file: &Path, body: &str) -> (String, Option<PathBuf>) {
+    let non_blank: Vec<&str> = body.lines().filter(|l| !l.trim().is_empty()).collect();
+    let [line] = non_blank[..] else {
+        return (body.to_string(), None);
+    };
+    let line = line.trim();
+    let Some(relpath) = line
+        .strip_prefix("{{#include ")
+        .and_then(|rest| rest.strip_suffix("}}"))
+    else {
+        return (body.to_string(), None);
+    };
+    let relpath = relpath.trim();
+    let dir = md_file.parent().unwrap_or_else(|| Path::new("."));
+    let resolved = dir.join(relpath);
+    let included = fs::read_to_string(&resolved).unwrap_or_else(|e| {
+        panic!(
+            "resolving {{{{#include {relpath}}}}} from {}: {e}",
+            md_file.display()
+        )
+    });
+    (included, Some(resolved))
 }
 
 /// Whether `body`'s first non-blank, non-comment line names a top-level
@@ -212,14 +253,19 @@ fn docs_toml_fences_parse_under_the_real_loader() {
     let mut failures = Vec::new();
     for file in &files {
         for fence in extract_toml_fences(file) {
-            if !is_selected(&fence.body) {
+            let (resolved_body, included_from) = resolve_include(&fence.file, &fence.body);
+            if !is_selected(&resolved_body) {
                 continue;
             }
             selected += 1;
-            let neutralized = neutralize_secret_files(&fence.body, &placeholder);
+            let neutralized = neutralize_secret_files(&resolved_body, &placeholder);
             let env = placeholder_env(&neutralized);
             if let Err(e) = JammiConfig::parse_from(&neutralized, env) {
-                failures.push(format!("{}:{}: {e}", fence.file.display(), fence.line));
+                let mut msg = format!("{}:{}: {e}", fence.file.display(), fence.line);
+                if let Some(included_from) = &included_from {
+                    msg.push_str(&format!(" (included from {})", included_from.display()));
+                }
+                failures.push(msg);
             }
         }
     }
@@ -229,12 +275,17 @@ fn docs_toml_fences_parse_under_the_real_loader() {
     // just as much a coverage regression as selecting zero fences, and
     // `> 0` alone would stay green through it. Bump this number in the same
     // commit that adds (or removes) a `JammiConfig`-shaped ```toml fence
-    // under `docs/guide/src`.
+    // under `docs/guide/src` -- including one that arrives only as a
+    // resolved `{{#include}}`. 27 direct fences + 2 includes
+    // (`deploy/kubernetes/base/jammi.toml`, `deploy/kubernetes/overlays/shape-d/jammi-compute.toml`)
+    // = 29; `deploy/kubernetes/overlays/ci/jammi.toml` is not included by
+    // the guide, so it is not counted here.
     assert_eq!(
         selected,
-        27,
-        "selected {selected} config fence(s) under {} -- expected exactly 27; if you \
-         added or removed a JammiConfig-shaped ```toml fence, update this pinned count",
+        29,
+        "selected {selected} config fence(s) under {} -- expected exactly 29; if you \
+         added or removed a JammiConfig-shaped ```toml fence (directly or via {{{{#include}}}}), \
+         update this pinned count",
         guide_root().display()
     );
     assert!(

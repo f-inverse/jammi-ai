@@ -1,0 +1,24 @@
+# Strategic-merge patch on the base Deployment for the kind smoke: single
+# replica, never pull from a registry (a comment, not the identity
+# mechanism -- the workflow's own image-identity assertion is), and the
+# bundled tiny fixtures the remote smoke script reads (mirrors
+# deploy/docker-compose.ci.yml's bind mounts).
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: jammi-server
+spec:
+  replicas: 1
+  template:
+    spec:
+      containers:
+        - name: jammi-server
+          imagePullPolicy: Never
+          volumeMounts:
+            - { name: fixtures-model, mountPath: /fixtures/tiny_bert, readOnly: true }
+            - { name: fixtures-data, mountPath: /fixtures/patents.parquet, readOnly: true }
+      volumes:
+        - name: fixtures-model
+          hostPath: { path: /fixtures/tiny_bert, type: Directory }
+        - name: fixtures-data
+          hostPath: { path: /fixtures/patents.parquet, type: File }

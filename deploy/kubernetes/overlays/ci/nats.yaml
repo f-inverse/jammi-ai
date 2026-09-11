@@ -1,0 +1,38 @@
+# Upstream NATS with JetStream, mirroring deploy/docker-compose.yml's `nats`
+# service -- the kind smoke's broker backend, never a production shape.
+apiVersion: apps/v1
+kind: StatefulSet
+metadata:
+  name: nats
+spec:
+  serviceName: nats
+  replicas: 1
+  selector:
+    matchLabels: { app: nats }
+  template:
+    metadata:
+      labels: { app: nats }
+    spec:
+      containers:
+        - name: nats
+          image: nats:2.10-alpine
+          imagePullPolicy: IfNotPresent
+          args: ["-js", "-m", "8222"]
+          ports:
+            - { containerPort: 4222, name: client }
+            - { containerPort: 8222, name: monitor }
+          readinessProbe:
+            # Kubernetes probes HTTP itself -- no `wget` needed, unlike
+            # Compose's exec-form healthcheck.
+            httpGet: { path: /healthz, port: 8222 }
+            periodSeconds: 5
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: nats
+spec:
+  selector: { app: nats }
+  ports:
+    - { name: client, port: 4222, targetPort: 4222 }
+    - { name: monitor, port: 8222, targetPort: 8222 }

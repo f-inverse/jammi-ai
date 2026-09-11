@@ -1,0 +1,16 @@
+# Rendered by `envsubst` into a real kind-config.yaml in the kube-smoke
+# workflow (${GITHUB_WORKSPACE} is the only substituted variable). The two
+# fixtures are a directory (116K) and a single file (8K) -- too fiddly for a
+# ConfigMap only because of the directory, so hostPath is kind's documented
+# way to hand a runner-checked-out path into a node.
+kind: Cluster
+apiVersion: kind.x-k8s.io/v1alpha4
+nodes:
+  - role: control-plane
+    extraMounts:
+      - hostPath: ${GITHUB_WORKSPACE}/cookbook/fixtures/tiny_bert
+        containerPath: /fixtures/tiny_bert
+        readOnly: true
+      - hostPath: ${GITHUB_WORKSPACE}/tests/fixtures/patents.parquet
+        containerPath: /fixtures/patents.parquet
+        readOnly: true

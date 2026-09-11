@@ -31,6 +31,7 @@ mod grpc_tracing_span;
 mod grpc_trigger;
 mod grpc_web;
 mod health;
+mod liveness;
 mod mount_tenant_scoped;
 mod probe;
 mod serve_bind_race;

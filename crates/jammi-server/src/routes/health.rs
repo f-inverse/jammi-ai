@@ -1,7 +1,8 @@
 //! HTTP side-channel endpoints — `/healthz`, `/readyz`, and `/metrics`.
 //!
-//! Liveness (`/healthz`) is a single, dependency-free probe: if the
-//! process is up and the Axum router is serving, the answer is `200`.
+//! Liveness (`/healthz`) is a dependency-free, in-memory probe: `200`
+//! while the process's lease keeper thread is alive and its claim loop (if
+//! any) has not panicked, `503` otherwise.
 //! Readiness (`/readyz`) goes one step further and pings the catalog
 //! backend the engine session was built around — that's the substrate
 //! resource Jammi can't serve without. Metrics (`/metrics`) emit a
@@ -26,21 +27,45 @@ use prometheus::{
     Encoder, Gauge, Histogram, HistogramOpts, IntCounter, IntCounterVec, IntGauge, IntGaugeVec,
     Opts, Registry, TextEncoder,
 };
-use serde_json::{json, Value};
+use serde_json::json;
 
-use crate::runtime::ReadinessProbe;
+use crate::runtime::{LivenessProbe, ReadinessProbe};
 
 /// `GET /healthz` — liveness probe.
 ///
-/// Returns `{"status": "ok", "version": "<workspace version>"}` without
-/// touching any downstream dependency. A `200` here means the process
-/// is alive; orchestration platforms use this to decide whether to
-/// restart the container, not whether to route traffic to it.
-pub async fn healthz() -> Json<Value> {
-    Json(json!({
-        "status": "ok",
-        "version": env!("CARGO_PKG_VERSION"),
-    }))
+/// `200 {"status":"ok","version":…,"lease_keeper":true,"claim_loop":…}`
+/// while the process can keep its leases and its claim loop alive; `503
+/// {"status":"unhealthy","lease_keeper":bool,"claim_loop":"running|stopped|
+/// aborted|failed|none"}` when the lease keeper thread is dead (every lease
+/// this process holds is lost) or the claim loop task panicked. A stopped
+/// or aborted loop, a process with no loop, and a DRAIN in progress are all
+/// `200`: liveness decides restarts, never routing (`/readyz` does that),
+/// and no slow-step detection exists — the runtime owns "how long is too
+/// long". Touches no downstream dependency: both facts are in-memory.
+pub async fn healthz(State(liveness): State<Arc<LivenessProbe>>) -> Response {
+    let report = liveness.check();
+    if report.healthy() {
+        (
+            StatusCode::OK,
+            Json(json!({
+                "status": "ok",
+                "version": env!("CARGO_PKG_VERSION"),
+                "lease_keeper": report.lease_keeper,
+                "claim_loop": report.claim_loop,
+            })),
+        )
+            .into_response()
+    } else {
+        (
+            StatusCode::SERVICE_UNAVAILABLE,
+            Json(json!({
+                "status": "unhealthy",
+                "lease_keeper": report.lease_keeper,
+                "claim_loop": report.claim_loop,
+            })),
+        )
+            .into_response()
+    }
 }
 
 /// `GET /readyz` — readiness probe.

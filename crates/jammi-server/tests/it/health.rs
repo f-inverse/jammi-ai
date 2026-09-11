@@ -9,7 +9,7 @@ use async_trait::async_trait;
 use axum::body::Body;
 use axum::http::{Request, StatusCode};
 use jammi_server::routes::health::MetricsRegistry;
-use jammi_server::runtime::{ReadinessCheck, ReadinessProbe};
+use jammi_server::runtime::{LivenessProbe, ReadinessCheck, ReadinessProbe};
 use tower::ServiceExt;
 
 /// Always-ready stub used by happy-path readiness tests.
@@ -35,7 +35,7 @@ impl ReadinessCheck for AlwaysDown {
 fn router(readiness: Arc<dyn ReadinessCheck>) -> axum::Router {
     let probe = Arc::new(ReadinessProbe::new(readiness));
     let metrics = Arc::new(MetricsRegistry::new().expect("metrics registry"));
-    jammi_server::build_health_router(probe, metrics)
+    jammi_server::build_health_router(probe, metrics, Arc::new(LivenessProbe::always_healthy()))
 }
 
 #[tokio::test]
@@ -158,7 +158,11 @@ async fn metrics_reflects_counter_increments() {
     metrics.grpc_requests.inc();
     metrics.flight_queries.inc();
 
-    let app = jammi_server::build_health_router(probe, Arc::clone(&metrics));
+    let app = jammi_server::build_health_router(
+        probe,
+        Arc::clone(&metrics),
+        Arc::new(LivenessProbe::always_healthy()),
+    );
     let resp = app
         .oneshot(
             Request::builder()

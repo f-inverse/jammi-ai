@@ -22,7 +22,6 @@ use std::sync::{Arc, Weak};
 
 use arrow_flight::flight_service_server::FlightServiceServer;
 use async_trait::async_trait;
-use axum::routing::get;
 use axum::Router;
 use datafusion::execution::context::SessionContext;
 use datafusion_flight_sql_server::service::FlightSqlService;
@@ -37,7 +36,6 @@ use tonic::transport::Server;
 use tonic_web::GrpcWebLayer;
 use tower::Layer;
 
-use crate::error::fallback_handler;
 use crate::flight::TenantBoundProvider;
 use crate::grpc::audit::AuditServer;
 use crate::grpc::catalog::{AdminAuthorizer, CatalogServer};
@@ -58,7 +56,7 @@ use crate::grpc::session::{SessionIdTenantResolver, SessionStore, TenantResolver
 use crate::grpc::trigger::TriggerServer;
 use crate::grpc_web_trailers::GrpcWebTrailersLayer;
 use crate::metrics_layer::MetricsLayer;
-use crate::routes::health::{self, MetricsRegistry};
+use crate::routes::health::MetricsRegistry;
 use crate::tenant_resolver_layer::TenantResolverLayer;
 use crate::tiers::{ServiceTier, TierSet};
 use crate::trace_context_layer::TraceContextLayer;
@@ -279,6 +277,103 @@ impl ReadinessCheck for CatalogPingProbe {
     }
 }
 
+/// A liveness probe (`/healthz`): can this process keep its leases and its
+/// claim loop alive? Behind a trait so tests substitute a stub; the
+/// production implementation is [`EngineLiveness`].
+pub trait LivenessCheck: Send + Sync {
+    fn check(&self) -> LivenessReport;
+}
+
+/// What `/healthz` reports. Unhealthy (503) exactly when the lease keeper
+/// thread is dead (every lease this process holds is already lost) or the
+/// claim loop task panicked (`failed`); a loop that stopped, was aborted
+/// (a RELEASE) or never existed is not a fault, and neither is draining.
+/// No slow-step detection: the runtime owns "how long is too long".
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct LivenessReport {
+    /// `LeaseKeeper::is_alive`.
+    pub lease_keeper: bool,
+    /// `running` / `stopped` / `aborted` / `failed`, or `none` on a process
+    /// with no claim loop.
+    pub claim_loop: &'static str,
+}
+
+impl LivenessReport {
+    pub fn healthy(&self) -> bool {
+        self.lease_keeper && self.claim_loop != "failed"
+    }
+}
+
+/// Wrapper that holds the active [`LivenessCheck`] behind an `Arc` so Axum
+/// can share it across handlers via `State`.
+pub struct LivenessProbe {
+    inner: Arc<dyn LivenessCheck>,
+}
+
+impl LivenessProbe {
+    pub fn new(inner: Arc<dyn LivenessCheck>) -> Self {
+        Self { inner }
+    }
+
+    /// A probe that always reports healthy with no claim loop — for a
+    /// router with no engine behind it (`crate::build_router`, fixtures).
+    pub fn always_healthy() -> Self {
+        struct AlwaysAlive;
+        impl LivenessCheck for AlwaysAlive {
+            fn check(&self) -> LivenessReport {
+                LivenessReport {
+                    lease_keeper: true,
+                    claim_loop: "none",
+                }
+            }
+        }
+        Self::new(Arc::new(AlwaysAlive))
+    }
+
+    pub fn check(&self) -> LivenessReport {
+        self.inner.check()
+    }
+}
+
+/// The production liveness: the session's lease keeper and, when this
+/// process runs a claim loop, the loop's shared state (a `Weak`, so the
+/// probe never keeps it alive; a gone state reads `stopped`).
+pub struct EngineLiveness {
+    keeper: Arc<jammi_db::catalog::lease_keeper::LeaseKeeper>,
+    worker: Option<Weak<jammi_ai::fine_tune::worker::WorkerShared>>,
+}
+
+impl EngineLiveness {
+    pub fn new(
+        keeper: Arc<jammi_db::catalog::lease_keeper::LeaseKeeper>,
+        worker: Option<Weak<jammi_ai::fine_tune::worker::WorkerShared>>,
+    ) -> Self {
+        Self { keeper, worker }
+    }
+}
+
+impl LivenessCheck for EngineLiveness {
+    fn check(&self) -> LivenessReport {
+        use jammi_ai::fine_tune::worker::LoopState;
+        let claim_loop = match &self.worker {
+            None => "none",
+            Some(weak) => match weak.upgrade() {
+                None => "stopped",
+                Some(shared) => match shared.loop_state() {
+                    LoopState::Running => "running",
+                    LoopState::Stopped => "stopped",
+                    LoopState::Aborted => "aborted",
+                    LoopState::Failed => "failed",
+                },
+            },
+        };
+        LivenessReport {
+            lease_keeper: self.keeper.is_alive(),
+            claim_loop,
+        }
+    }
+}
+
 /// The OSS server instance. Constructed via [`Self::new`] and consumed
 /// by [`Self::run`]. Holds every long-lived dependency the binary
 /// orchestrates — bind addresses, the engine session, the shared
@@ -380,7 +475,6 @@ impl OssServer {
     /// ([`BoundServer::flight_addr`] / [`BoundServer::health_addr`]) while the
     /// listeners stay bound, with no observable release-then-rebind window.
     pub async fn bind(self) -> Result<BoundServer, ServerError> {
-        let health_router = self.build_health_router();
         let health_listener = TcpListener::bind(self.health_addr).await?;
         let health_addr = health_listener.local_addr()?;
         // Cloned before `build_grpc_chain`/`assemble_grpc_chain` consume
@@ -401,6 +495,14 @@ impl OssServer {
         if let Some(w) = &worker {
             self.metrics.attach_worker(w.shared())?;
         }
+        // Liveness reads the keeper and (when present) the loop's state, so
+        // the side-channel router is built once the worker guard is known.
+        let liveness = Arc::new(LivenessProbe::new(Arc::new(EngineLiveness::new(
+            Arc::clone(session.lease_keeper()),
+            worker.as_ref().map(|w| w.shared()),
+        ))));
+        let health_router =
+            crate::build_health_router(Arc::clone(&readiness), Arc::clone(&self.metrics), liveness);
         Ok(BoundServer {
             grpc,
             health_listener,
@@ -427,24 +529,6 @@ impl OssServer {
         shutdown: impl Future<Output = ()> + Send + 'static,
     ) -> Result<(), ServerError> {
         self.bind().await?.serve_with_shutdown(shutdown).await
-    }
-
-    fn build_health_router(&self) -> Router {
-        // Two sub-routers keep the State types separated — Axum requires
-        // every route in a Router to share the same State type, so the
-        // readiness handler and the metrics handler are merged here
-        // after each one's State is applied.
-        let readyz = Router::new()
-            .route("/readyz", get(health::readyz))
-            .with_state(Arc::clone(&self.readiness));
-        let metrics = Router::new()
-            .route("/metrics", get(health::metrics))
-            .with_state(Arc::clone(&self.metrics));
-        Router::new()
-            .route("/healthz", get(health::healthz))
-            .merge(readyz)
-            .merge(metrics)
-            .fallback(fallback_handler)
     }
 
     /// Assemble the engine's [`GrpcChain`] from this server's config and engine

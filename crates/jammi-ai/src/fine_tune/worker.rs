@@ -755,6 +755,8 @@ impl JobWorker {
         }
 
         loop {
+            #[cfg(feature = "test-hooks")]
+            loop_test_hooks::maybe_panic(&self.worker_id);
             if shared.stop_requested() {
                 break;
             }
@@ -2507,6 +2509,34 @@ pub mod loop_test_hooks {
         armed.parked_notify.notify_one();
         while !armed.released.load(Ordering::SeqCst) {
             armed.release_notify.notified().await;
+        }
+    }
+
+    fn panic_armed() -> &'static Mutex<Vec<String>> {
+        static ARMED: OnceLock<Mutex<Vec<String>>> = OnceLock::new();
+        ARMED.get_or_init(|| Mutex::new(Vec::new()))
+    }
+
+    /// Make the loop task of `instance_id` panic at the top of its next tick
+    /// — the way a defect inside the loop would kill it — so a test can
+    /// prove the exit guard reports `LoopState::Failed` and `/healthz` reads
+    /// 503. One-shot.
+    pub fn arm_panic_at_next_tick(instance_id: &str) {
+        panic_armed()
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .push(instance_id.to_string());
+    }
+
+    pub(super) fn maybe_panic(instance_id: &str) {
+        let armed = {
+            let mut list = panic_armed().lock().unwrap_or_else(PoisonError::into_inner);
+            list.iter()
+                .position(|i| i == instance_id)
+                .map(|i| list.remove(i))
+        };
+        if armed.is_some() {
+            panic!("claim loop: task killed by test hook");
         }
     }
 

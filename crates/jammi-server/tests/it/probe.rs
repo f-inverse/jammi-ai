@@ -92,7 +92,11 @@ async fn check_is_ok_only_on_200() {
     let ready = Arc::new(AtomicBool::new(true));
     let readiness = Arc::new(ReadinessProbe::new(Arc::new(Toggle(ready.clone()))));
     let metrics = Arc::new(MetricsRegistry::new().expect("metrics registry"));
-    let app = jammi_server::build_health_router(readiness, metrics);
+    let app = jammi_server::build_health_router(
+        readiness,
+        metrics,
+        Arc::new(jammi_server::runtime::LivenessProbe::always_healthy()),
+    );
 
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
         .await

@@ -235,10 +235,17 @@ curl http://localhost:8080/metrics
 # jammi_search_latency_seconds_bucket{...} 0
 ```
 
-`/healthz` is a liveness probe — a `200` means the process is running.
-`/readyz` is a readiness probe — `200` means the catalog backend
-responded; `503` means it didn't and traffic should be drained from
-this instance. Point your load balancer at `/readyz`.
+`/healthz` is a liveness probe — `200` while the process can keep its
+leases and its claim loop alive; `503 {"status":"unhealthy","lease_keeper":
+false|true,"claim_loop":"…"}` when the lease keeper thread is dead (every
+lease this process holds is lost) or the claim loop task panicked
+(`claim_loop: "failed"`). A stopped or aborted loop, a process with no loop,
+and a DRAIN in progress are all `200` — liveness decides restarts, never
+routing, and there is no slow-step detection (the runtime owns "how long is
+too long"). `/readyz` is a readiness probe — `200` means the catalog backend
+responded; `503` means it didn't, or the server is draining (`"detail":
+"draining"`), and traffic should be drained from this instance. Point your
+load balancer at `/readyz`.
 
 `/metrics` exposes a small, substrate-level set of Prometheus counters
 (gRPC requests, Flight SQL queries, eval invocations, refusals at the

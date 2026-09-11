@@ -347,14 +347,91 @@ print("OK" if (m.get("adopted") is True and m.get("seed_dir") is None
   fi
 
   # --verify: a log WITH a Fresh jammi-* line fails (the poisoned-clone case).
+  # The Fresh line sits FIRST (cargo prints Fresh units before anything
+  # else) with 1,320,035 B of filler AFTER it — the portable trigger for
+  # the SIGPIPE'd `printf | grep -q` shape this guards against is ONE PIPE
+  # BUFFER (64 KiB), not any specific "cargo log" byte count, so this
+  # fixture clears it by >20x. A smaller (~70-byte) fixture fits in one
+  # pipe write and would pass even against the buggy shape, silently
+  # under-covering a regression.
   DIRTY_LOG="$SANDBOX/b_dirty.log"
-  { echo "       Fresh jammi-kernels v0.47.0"; echo "   Compiling jammi-bench v0.47.0"; } > "$DIRTY_LOG"
+  {
+    echo "       Fresh jammi-kernels v0.47.0"
+    awk 'BEGIN{for(i=0;i<40000;i++) print "   Compiling jammi-bench v0.47.0"}'
+  } > "$DIRTY_LOG"
   bash "$CLONE_SH" "" "" --verify < "$DIRTY_LOG" > "$SANDBOX/b5.out" 2>&1
   rc=$?
   if [ "$rc" -ne 0 ] && grep -q 'Fresh' "$SANDBOX/b5.out"; then
     ok "(b) --verify FAILS a log carrying a Fresh jammi-* unit (poisoned-clone detection)"
   else
     bad "(b) --verify should have failed on a Fresh jammi-* line (rc=$rc): $(cat "$SANDBOX/b5.out")"
+  fi
+
+  # --verify against a genuinely UNCREATABLE/UNWRITABLE temp log, fed the
+  # SAME poisoned DIRTY_LOG on stdin, must REFUSE (non-zero, naming the
+  # real cause) — never silently fall through and report the poisoned
+  # clone as clean. A PATH stub forcing `mktemp`/`cat` to fail (not an
+  # invalid $TMPDIR: bare `mktemp` on some userlands silently falls back
+  # to another directory instead of erroring, so that would not reliably
+  # reproduce this) is the portable repro across GNU and BSD. Pre-fix,
+  # `log_file="$(mktemp)"` and `cat > "$log_file"` were unchecked: a
+  # failed mktemp left `log_file` empty, the detection `grep` then errored
+  # against a nonexistent path, and the unchecked `if grep -Eq …; then`
+  # read that error the SAME as "no match" — this exact DIRTY_LOG (a real
+  # `Fresh jammi-*` line) reported "clone verify OK", exit 0.
+  B_STUB_MKTEMP="$SANDBOX/b_stub_mktemp_fail"
+  mkdir -p "$B_STUB_MKTEMP"
+  cat > "$B_STUB_MKTEMP/mktemp" <<'STUB'
+#!/usr/bin/env bash
+exit 1
+STUB
+  chmod +x "$B_STUB_MKTEMP/mktemp"
+  PATH="$B_STUB_MKTEMP:$PATH" bash "$CLONE_SH" "" "" --verify < "$DIRTY_LOG" > "$SANDBOX/b6.out" 2>&1
+  rc=$?
+  if [ "$rc" -eq 2 ] && grep -q 'could not create a temp file' "$SANDBOX/b6.out"; then
+    ok "(b/mktemp-failure) --verify against an uncreatable temp log REFUSES (exit 2), never reads a poisoned log as clean"
+  else
+    bad "(b/mktemp-failure) expected exit 2 naming 'could not create a temp file' (rc=$rc): $(cat "$SANDBOX/b6.out")"
+  fi
+
+  B_STUB_CAT="$SANDBOX/b_stub_cat_fail"
+  mkdir -p "$B_STUB_CAT"
+  cat > "$B_STUB_CAT/cat" <<'STUB'
+#!/usr/bin/env bash
+exit 1
+STUB
+  chmod +x "$B_STUB_CAT/cat"
+  PATH="$B_STUB_CAT:$PATH" bash "$CLONE_SH" "" "" --verify < "$DIRTY_LOG" > "$SANDBOX/b7.out" 2>&1
+  rc=$?
+  if [ "$rc" -eq 2 ] && grep -q 'could not write the --verify log' "$SANDBOX/b7.out"; then
+    ok "(b/cat-write-failure) --verify against an unwritable temp log REFUSES (exit 2), never reads a poisoned log as clean"
+  else
+    bad "(b/cat-write-failure) expected exit 2 naming 'could not write the --verify log' (rc=$rc): $(cat "$SANDBOX/b7.out")"
+  fi
+
+  # --verify with the DETECTION grep itself failing (a genuine read
+  # failure on the already-written, already-poisoned log_file — distinct
+  # from the two fixtures above, which fail BEFORE log_file has any real
+  # content). A PATH-stubbed `grep` that always exits 2 forces exactly the
+  # `grep_rc` value neither "poisoned" (0) nor "clean" (1) covers; the
+  # fixed script's third `if`/`elif`/`else` arm must refuse (exit 2,
+  # naming the real cause) rather than falling through to "clean" the way
+  # a naive `if grep_rc -eq 0 … else clean fi` (only two arms, no
+  # standalone case for "other") would. Same poisoned DIRTY_LOG as input —
+  # this fixture exists specifically to prove that arm is load-bearing.
+  B_STUB_GREP="$SANDBOX/b_stub_grep_fail"
+  mkdir -p "$B_STUB_GREP"
+  cat > "$B_STUB_GREP/grep" <<'STUB'
+#!/usr/bin/env bash
+exit 2
+STUB
+  chmod +x "$B_STUB_GREP/grep"
+  PATH="$B_STUB_GREP:$PATH" bash "$CLONE_SH" "" "" --verify < "$DIRTY_LOG" > "$SANDBOX/b8.out" 2>&1
+  rc=$?
+  if [ "$rc" -eq 2 ] && grep -q 'could not read the --verify log' "$SANDBOX/b8.out"; then
+    ok "(b/grep-read-failure) --verify whose detection grep itself errors REFUSES (exit 2), never reads a poisoned log as clean"
+  else
+    bad "(b/grep-read-failure) expected exit 2 naming 'could not read the --verify log' (rc=$rc): $(cat "$SANDBOX/b8.out")"
   fi
 }
 

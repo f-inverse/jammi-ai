@@ -764,7 +764,7 @@ rp_target_preflight_lines() {
 if [ ! -d '${target_dir}' ]; then
   echo GPU_DEV_TARGET_STATE=MISSING
 elif [ ! -f '${target_dir}/.jammi-clone-of-seed' ]; then
-  if ls '${target_dir}/debug/.fingerprint' '${target_dir}/release/.fingerprint' 2>/dev/null | grep -q '^jammi'; then # tripwire-ok: a missing debug//release/ .fingerprint dir is a real, checked state -- it IS the cold answer this if/else selects, never a silent pass
+  if ls '${target_dir}/debug/.fingerprint' '${target_dir}/release/.fingerprint' 2>/dev/null | grep -c '^jammi' >/dev/null; then # tripwire-ok: '-c' (never '-q') so a huge fingerprint listing can't SIGPIPE the 'ls' writer on an early match -- PRE-EXISTING, fail-closed asymmetry, not this line's own claim: the real call site (gpu-dev.sh's \`rp_run_remote <<EOF / set -uo pipefail\` wrapper) runs this under pipefail, so when only ONE of debug/release exists, 'ls' itself exits nonzero for the missing side and poisons the pipeline regardless of what grep found -- a debug-only or release-only WARM dir reads UNMARKED_COLD, never the reverse (a genuinely cold dir never reads WARM); the safe direction (a needless full rebuild) is the one this asymmetry falls on
     echo GPU_DEV_TARGET_STATE=UNMARKED_WARM
   else
     echo GPU_DEV_TARGET_STATE=UNMARKED_COLD

@@ -75,6 +75,7 @@ use jammi_numerics::distance::cosine_distance;
 
 use crate::config::StoragePrecision;
 use crate::error::{JammiError, Result};
+use crate::index::first_inadmissible_hit;
 use crate::index::peer::SegmentSearchPhase;
 use crate::index::sidecar::SidecarIndex;
 use crate::index::VectorIndex;
@@ -138,21 +139,61 @@ pub(crate) type SegmentExactLookup<'a> = dyn Fn(SegmentId, &str) -> Result<Optio
 /// hits are returned as the graph produced them (`F32` exact, or `F16` /
 /// `Int8` approximate candidates for an `Approximate` phase).
 pub fn search_unit(
+    segment: SegmentId,
     index: &SidecarIndex,
     query: &[f32],
     width: usize,
     phase: SegmentSearchPhase,
     exact: &ExactLookup<'_>,
 ) -> Result<Vec<(String, f32)>> {
+    verify_query_width(segment, index, query)?;
     if width == 0 {
         return Ok(Vec::new());
     }
     let hits = index.search(query, width)?;
     if phase == SegmentSearchPhase::Final && index.storage_precision().needs_rescore() {
-        rescore(hits, exact, query)
+        rescore(segment, hits, exact, query)
     } else {
-        Ok(hits)
+        admissible_or_err(segment, hits)
     }
+}
+
+/// The query must be exactly as wide as the index it is searched against.
+///
+/// Checked at the SEARCH ENTRY, against the INDEX's own width — the
+/// authoritative one — rather than the catalog's `dimensions` column, which
+/// is `Option<i32>` metadata with a live `None` branch. A wrong-width query
+/// is a CALLER fault, and without this it surfaces as something else
+/// entirely: at `Binary` the query packs to `ceil(len/8)` bytes, so an
+/// over-long query passes usearch untouched and reaches `cosine_distance`,
+/// which is where it panics.
+pub fn verify_query_width(segment: SegmentId, index: &SidecarIndex, query: &[f32]) -> Result<()> {
+    if query.len() != index.dimensions() {
+        return Err(JammiError::Schema {
+            table: format!("segment {}", segment.0),
+            column: "query".into(),
+            expected: format!("{} dimensions", index.dimensions()),
+            actual: format!("{} dimensions", query.len()),
+        });
+    }
+    Ok(())
+}
+
+/// Every distance a LOCAL kernel produces must be admissible
+/// ([`distance_is_admissible`]). A violation here is a broken index — a
+/// non-finite component in a stored vector, or a backend that stopped
+/// guarding zero magnitude — not a peer's fault, so it is a typed engine
+/// error naming the poisoned SEGMENT rather than a ladder failure.
+fn admissible_or_err(segment: SegmentId, hits: Vec<(String, f32)>) -> Result<Vec<(String, f32)>> {
+    if let Some((row_id, distance)) = first_inadmissible_hit(&hits) {
+        return Err(JammiError::Other(format!(
+            "segment {}: row '{row_id}' has a non-finite distance ({distance:?}) — the index or \
+             its stored vectors are corrupt; a distance is the merge's sort key and the \
+             user-visible similarity, so it is refused rather than ranked",
+            segment.0
+        )));
+    }
+    Ok(hits)
 }
 
 /// The merge kernel: concatenate every unit, order by `(distance ASC, row_id
@@ -201,6 +242,7 @@ pub(crate) fn merge(
 /// silent drop: a result set that quietly shrank would read as "fewer matches
 /// exist" rather than "the index is broken".
 pub fn rescore(
+    segment: SegmentId,
     candidates: Vec<(String, f32)>,
     exact: &ExactLookup<'_>,
     query: &[f32],
@@ -213,11 +255,22 @@ pub fn rescore(
                  companion (corrupted or torn sidecar bundle)"
             ))
         })?;
+        // The stored vector is the authority on width here (this kernel may
+        // be reached with no index in hand), so the mismatch is typed before
+        // `cosine_distance` — which now refuses it — can be called.
+        if vector.len() != query.len() {
+            return Err(JammiError::Schema {
+                table: format!("segment {}", segment.0),
+                column: "query".into(),
+                expected: format!("{} dimensions", vector.len()),
+                actual: format!("{} dimensions", query.len()),
+            });
+        }
         let distance = cosine_distance(query, &vector);
         rescored.push((row_id, distance));
     }
     rescored.sort_by(|a, b| a.1.total_cmp(&b.1).then_with(|| a.0.cmp(&b.0)));
-    Ok(rescored)
+    admissible_or_err(segment, rescored)
 }
 
 /// A loaded segment paired with its catalog id (the merge's final tie-break
@@ -374,7 +427,19 @@ impl SegmentedIndex {
             base
         };
         loop {
-            let hits = seg.index.search(query, w)?;
+            // Through `search_unit` at the CANDIDATE phase (never rescored
+            // here — today's behaviour exactly), so the width guard and the
+            // admissibility check apply to the masked/versioned path too:
+            // these raw per-segment distances are the merge's sort key, and
+            // for `F32` they are also the final answer.
+            let hits = search_unit(
+                seg.id,
+                &seg.index,
+                query,
+                w,
+                SegmentSearchPhase::Approximate,
+                &|row_id| seg.index.get_exact(row_id),
+            )?;
             let live: Vec<(String, f32, SegmentId)> = hits
                 .into_iter()
                 .filter(|(k, _)| !self.mask.is_masked(k, seg.version))
@@ -507,7 +572,12 @@ impl SegmentedIndex {
                 }
                 let mut rescored: Vec<(String, f32)> = Vec::with_capacity(candidate_k);
                 for (segment, group) in by_segment {
-                    rescored.extend(rescore(group, &|row_id| exact(segment, row_id), query)?);
+                    rescored.extend(rescore(
+                        segment,
+                        group,
+                        &|row_id| exact(segment, row_id),
+                        query,
+                    )?);
                 }
                 rescored.sort_by(|a, b| a.1.total_cmp(&b.1).then_with(|| a.0.cmp(&b.0)));
                 rescored.truncate(k);
@@ -522,7 +592,8 @@ impl SegmentedIndex {
                         .into_iter()
                         .map(|(row_id, distance, _)| (row_id, distance))
                         .collect();
-                    let rescored = rescore(live, &|row_id| exact(seg.id, row_id), query)?;
+                    let rescored =
+                        rescore(seg.id, live, &|row_id| exact(seg.id, row_id), query)?;
                     units.push((seg.id, rescored));
                 }
                 Ok(merge(units, k)
@@ -1026,6 +1097,153 @@ mod tests {
                     "{precision:?} N={n}: the counted composition is the production entry"
                 );
                 assert_eq!(hits.len(), k);
+            }
+        }
+    }
+
+    /// A non-finite distance produced LOCALLY is a broken index, not a peer
+    /// fault, so it is a typed engine error naming the poisoned SEGMENT
+    /// rather than a ladder failure. The producer is a non-finite COMPONENT
+    /// in a stored vector: `cosine_distance` guards zero magnitude but not
+    /// that, so `denom` is NaN and the distance is NaN.
+    #[test]
+    fn a_non_finite_local_distance_is_a_typed_segment_error() {
+        let query = corpus()[0].1.clone();
+        for poison in [f32::NAN, -f32::NAN, f32::INFINITY, f32::NEG_INFINITY] {
+            let mut stored = vec![0.0f32; 8];
+            stored[0] = poison;
+            // The rescore kernel, reached with no index in hand.
+            let err = rescore(
+                SegmentId(7),
+                vec![("x".to_string(), 0.0)],
+                &|_| Ok(Some(stored.clone())),
+                &query,
+            )
+            .unwrap_err();
+            let text = err.to_string();
+            assert!(
+                text.contains("segment 7") && text.contains("non-finite"),
+                "{poison:?}: must name the poisoned segment: {text}"
+            );
+
+            // …and the search kernel, whose `Final` phase rescores in place.
+            let rows = corpus();
+            let index = segment(&rows, StoragePrecision::Int8);
+            let err = search_unit(
+                SegmentId(3),
+                &index,
+                &query,
+                2,
+                SegmentSearchPhase::Final,
+                &|_| Ok(Some(stored.clone())),
+            )
+            .unwrap_err();
+            assert!(err.to_string().contains("segment 3"), "{poison:?}: {}", err);
+        }
+    }
+
+    /// A wrong-width query is refused at the SEARCH ENTRY with a typed error
+    /// naming both widths — never a panic, and never a silent answer over a
+    /// prefix. `Binary` is the case that used to panic: the query packs to
+    /// `ceil(len/8)` bytes, so usearch accepts an over-long query and the
+    /// fault only surfaces inside `cosine_distance`.
+    #[test]
+    fn a_wrong_width_query_is_a_typed_refusal_on_every_precision() {
+        let rows = corpus(); // 8-wide
+        for precision in [
+            StoragePrecision::F32,
+            StoragePrecision::F16,
+            StoragePrecision::Int8,
+            StoragePrecision::Binary,
+        ] {
+            let index = segment(&rows, precision);
+            for width in [7usize, 9, 0] {
+                let q = vec![0.5f32; width];
+                let err = search_unit(
+                    SegmentId(2),
+                    &index,
+                    &q,
+                    2,
+                    SegmentSearchPhase::Final,
+                    &|row_id| index.get_exact(row_id),
+                )
+                .unwrap_err();
+                let text = err.to_string();
+                assert!(
+                    text.contains("segment 2") && text.contains("8 dimensions"),
+                    "{precision:?} width {width}: {text}"
+                );
+            }
+            // The whole-set entry refuses it too (this is the path a
+            // coordinator re-runs in process after a local load).
+            let seg = segmented(vec![(&rows, precision)]);
+            assert!(
+                seg.search_final(&[0.5f32; 9], 1, 1).is_err(),
+                "{precision:?}: search_final must refuse a 9-wide query on an 8-wide set"
+            );
+            assert!(
+                seg.search(&[0.5f32; 9], 1).is_err(),
+                "{precision:?}: the raw candidate entry refuses it as well"
+            );
+        }
+    }
+
+    /// usearch 2.25.1's `metric_cos_gt` carries an explicit zero-magnitude    /// usearch 2.25.1's `metric_cos_gt` carries an explicit zero-magnitude
+    /// guard (zero-vs-nonzero → 1, zero-vs-zero → 0), so a zero corpus row —
+    /// the case that would otherwise divide by zero — never yields a
+    /// non-finite distance on ANY precision. Measured and pinned per
+    /// precision so a usearch bump that drops the guard fails here rather
+    /// than silently poisoning the merge's sort key. `Binary` is Hamming, not
+    /// cosine, so it is pinned as "finite" rather than to a cosine value.
+    ///
+    /// This is also usearch's half of the zero-vs-zero divergence
+    /// jammi-numerics pins in `distance.rs`: for a ZERO query against a zero
+    /// row usearch answers 0.0 where `cosine_distance` answers 1.0. The
+    /// divergence is documented on both sides, never normalised away.
+    #[test]
+    fn a_zero_corpus_row_is_finite_on_every_precision() {
+        let zero = vec![0.0f32; 8];
+        let probe = {
+            let mut v = vec![0.0f32; 8];
+            v[0] = 1.0;
+            v
+        };
+        for (precision, expected) in [
+            (StoragePrecision::F32, Some(1.0f32)),
+            (StoragePrecision::F16, Some(1.0)),
+            // 0.5 was the contract's figure on ITS fixture; measured here on
+            // an 8-d corpus it is 0.6464466. The load-bearing property is the
+            // same on every precision: FINITE, never NaN.
+            (StoragePrecision::Int8, Some(0.646_446_6)),
+            (StoragePrecision::Binary, None),
+        ] {
+            let rows: Vec<(&str, Vec<f32>)> =
+                vec![("zero", zero.clone()), ("probe", probe.clone())];
+            let index = segment(&rows, precision);
+            let hits = index.search(&probe, 2).unwrap();
+            let zero_hit = hits
+                .iter()
+                .find(|(id, _)| id == "zero")
+                .expect("the zero row is indexed");
+            assert!(
+                zero_hit.1.is_finite(),
+                "{precision:?}: a zero corpus row must not yield a non-finite distance, got {:?}",
+                zero_hit.1
+            );
+            if let Some(expected) = expected {
+                assert!(
+                    (zero_hit.1 - expected).abs() < 1e-6,
+                    "{precision:?}: usearch's measured zero-row distance moved: {:?} vs {expected}",
+                    zero_hit.1
+                );
+            }
+            // Zero query against the zero row — usearch's zero-vs-zero arm.
+            let zq = index.search(&zero, 2).unwrap();
+            for (id, d) in &zq {
+                assert!(
+                    d.is_finite(),
+                    "{precision:?}: zero query on '{id}' gave {d:?}"
+                );
             }
         }
     }

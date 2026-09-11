@@ -138,9 +138,14 @@ async fn segment_search_over_peer_bind_equals_in_process_search_unit() {
 
     // In-process reference on the very same bundle.
     let index = load_segment(&store, &table_name, 0, StoragePrecision::F32).await;
-    let want = search_unit(&index, &q, 3, SegmentSearchPhase::Final, &|id| {
-        index.get_exact(id)
-    })
+    let want = search_unit(
+        jammi_db::index::SegmentId(0),
+        &index,
+        &q,
+        3,
+        SegmentSearchPhase::Final,
+        &|id| index.get_exact(id),
+    )
     .unwrap();
     assert_eq!(want.len(), 3);
 
@@ -268,6 +273,7 @@ async fn exact_rescore_over_peer_bind_equals_in_process_rescore() {
 
     let index = load_segment(&store, &table_name, 0, StoragePrecision::Int8).await;
     let want = rescore(
+        jammi_db::index::SegmentId(0),
         vec![
             ("d".to_string(), 0.0),
             ("a".to_string(), 0.0),

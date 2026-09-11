@@ -23,10 +23,14 @@ use crate::store::vectors::extend_with_fixed_size_list_f32;
 /// the unique row id, never by scan or batch arrival order.
 ///
 /// `partial_cmp` on the distances falls back to [`Ordering::Equal`] for the
-/// `NaN` case. `cosine_distance` never produces `NaN` (a zero-magnitude vector
-/// short-circuits to `1.0`), but the fallback is retained so the comparator is
-/// total for every `f32` rather than relying on that invariant from across a
-/// crate boundary.
+/// `NaN` case, and that fallback is LOAD-BEARING, not belt-and-braces:
+/// `cosine_distance` guards zero MAGNITUDE (short-circuiting to `1.0`) but not
+/// a non-finite COMPONENT — a `NaN`/`inf` inside a stored vector makes `denom`
+/// `NaN`, `NaN < EPSILON` is false, and the distance is `NaN` (measured). The
+/// earlier claim here that `cosine_distance` never produces `NaN` was false.
+/// This is the one path with no index behind it, so the index-side
+/// admissibility check ([`crate::index::distance_is_admissible`]) cannot reach
+/// it; the comparator stays total for every `f32` instead.
 fn candidate_order(a: &(String, f32), b: &(String, f32)) -> Ordering {
     a.1.partial_cmp(&b.1)
         .unwrap_or(Ordering::Equal)

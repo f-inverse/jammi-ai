@@ -36,6 +36,7 @@ use jammi_db::config::StoragePrecision;
 use jammi_db::error::JammiError;
 use jammi_db::index::segment::{rescore, search_unit};
 use jammi_db::index::sidecar::SidecarIndex;
+use jammi_db::index::SegmentId;
 use jammi_db::storage::StorageUrl;
 use jammi_db::store::ResultStore;
 use jammi_wire::peer::{phase_from_proto, precision_from_proto};
@@ -234,7 +235,7 @@ impl PeerService for PeerServer {
             )
             .await?;
             verify_query_width(&req.table_name, id, &req.query, &index)?;
-            let unit = search_unit(&index, &req.query, width, phase, &|row_id| {
+            let unit = search_unit(SegmentId(id), &index, &req.query, width, phase, &|row_id| {
                 index.get_exact(row_id)
             })
             .map_err(|e| torn(&req.table_name, id, e))?;
@@ -276,8 +277,13 @@ impl PeerService for PeerServer {
             verify_query_width(&req.table_name, id, &req.query, &index)?;
             verify_row_ids(&req.table_name, id, &group.row_ids, &index)?;
             let candidates = group.row_ids.into_iter().map(|r| (r, 0.0f32)).collect();
-            let rescored = rescore(candidates, &|row_id| index.get_exact(row_id), &req.query)
-                .map_err(|e| torn(&req.table_name, id, e))?;
+            let rescored = rescore(
+                SegmentId(id),
+                candidates,
+                &|row_id| index.get_exact(row_id),
+                &req.query,
+            )
+            .map_err(|e| torn(&req.table_name, id, e))?;
             out.extend(rescored);
         }
         Ok(Response::new(ExactRescoreResponse { hits: hits(out) }))

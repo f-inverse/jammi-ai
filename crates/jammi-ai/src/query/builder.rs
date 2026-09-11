@@ -62,6 +62,29 @@ impl QueryBuilder {
             .resolve_embedding_table(source_id, embedding_table)
             .await?;
 
+        // The EARLIEST point a wrong-width query can be refused: the first
+        // place the table — and therefore any width at all — is known. The
+        // wire edge (`grpc::embedding`'s decode) has no catalog access, and
+        // every guard below this one is downstream of placement, so without
+        // this a caller fault traverses the whole failure ladder: the owner
+        // refuses it (`Refused`), the coordinator retries at the next
+        // candidate, pays a full segment download at the local-load rung, and
+        // only then re-runs the kernel in-process and reproduces the fault it
+        // could have named here. `dimensions` is `Option<i32>` catalog
+        // metadata; `None` (a pre-column row, or a table that grew no index)
+        // is an explicit pass-through — the index-side guard still covers it.
+        if let Some(dimensions) = table.dimensions {
+            let expected = usize::try_from(dimensions).unwrap_or(0);
+            if expected != 0 && query_vec.len() != expected {
+                return Err(JammiError::Schema {
+                    table: table.table_name.clone(),
+                    column: "query".into(),
+                    expected: format!("{expected} dimensions"),
+                    actual: format!("{} dimensions", query_vec.len()),
+                });
+            }
+        }
+
         let result_store = session.result_store();
 
         let ann = AnnSearchExec::new(

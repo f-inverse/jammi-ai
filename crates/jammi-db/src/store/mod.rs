@@ -226,6 +226,34 @@ pub struct ResultStore {
     keeper: Option<Arc<crate::catalog::lease_keeper::LeaseKeeper>>,
 }
 
+/// The width guard for the NO-INDEX exact fallback — the one search path with
+/// no [`SidecarIndex`] behind it, so the authoritative
+/// [`crate::index::segment::verify_query_width`] cannot reach it. Here the
+/// only width on record is the catalog's `dimensions` column.
+///
+/// `dimensions` is `Option<i32>`, and `None` is a live state (a row written
+/// before the column existed, or a non-embedding table). `None` is therefore
+/// an EXPLICIT PASS-THROUGH: there is nothing to check the query against, and
+/// refusing would break tables that work today. The scan below is safe either
+/// way — `cosine_distance` now refuses a length mismatch outright rather than
+/// reading past a vector — so this check buys a TYPED, table-named error
+/// instead of a panic, not memory safety.
+fn verify_query_width_against_catalog(table: &ResultTableRecord, query: &[f32]) -> Result<()> {
+    let Some(dimensions) = table.dimensions else {
+        return Ok(());
+    };
+    let expected = usize::try_from(dimensions).unwrap_or(0);
+    if expected != 0 && query.len() != expected {
+        return Err(JammiError::Schema {
+            table: table.table_name.clone(),
+            column: "query".into(),
+            expected: format!("{expected} dimensions"),
+            actual: format!("{} dimensions", query.len()),
+        });
+    }
+    Ok(())
+}
+
 /// Mint a fresh writer identity.
 fn new_writer_id() -> Arc<str> {
     Arc::from(format!("writer-{}", uuid::Uuid::new_v4()).as_str())
@@ -2007,6 +2035,7 @@ impl ResultStore {
                 index.search_final_placed(query, k, oversample).await
             }
             None => {
+                verify_query_width_against_catalog(table, query)?;
                 crate::index::exact::exact_vector_search(ctx, &table.table_name, query, k).await
             }
         }
@@ -2031,6 +2060,7 @@ impl ResultStore {
                 index.search_final(query, k, oversample)
             }
             None => {
+                verify_query_width_against_catalog(table, query)?;
                 crate::index::exact::exact_vector_search(ctx, &table.table_name, query, k).await
             }
         }

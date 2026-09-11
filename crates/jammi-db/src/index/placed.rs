@@ -27,6 +27,7 @@ use crate::index::peer::{
 };
 use crate::index::segment::{merge, over_fetch, rescore, search_unit};
 use crate::index::sidecar::SidecarIndex;
+use crate::index::{distance_is_admissible, first_inadmissible_hit};
 use crate::index::{SegmentId, SegmentedIndex, VectorIndex};
 use crate::storage::index_cache::SegmentIndexCache;
 use crate::storage::StorageUrl;
@@ -330,7 +331,7 @@ impl PlacedIndex {
         for (id, index) in local {
             units.push((
                 *id,
-                search_unit(index, query, width, phase, &|row_id| {
+                search_unit(*id, index, query, width, phase, &|row_id| {
                     index.get_exact(row_id)
                 })?,
             ));
@@ -369,7 +370,7 @@ impl PlacedIndex {
                         let index = self.load_locally(seg, &mut loaded_this_query, last).await?;
                         units.push((
                             seg.segment_id,
-                            search_unit(&index, query, width, phase, &|row_id| {
+                            search_unit(seg.segment_id, &index, query, width, phase, &|row_id| {
                                 index.get_exact(row_id)
                             })?,
                         ));
@@ -409,6 +410,7 @@ impl PlacedIndex {
         for (segment, candidates) in by_segment {
             if let Some(index) = resident(segment) {
                 rescored.extend(rescore(
+                    segment,
                     candidates,
                     &|row_id| index.get_exact(row_id),
                     query,
@@ -475,6 +477,7 @@ impl PlacedIndex {
                             })?;
                         let index = self.load_locally(seg, &mut loaded_this_query, last).await?;
                         rescored.extend(rescore(
+                            *segment,
                             row_ids.iter().map(|id| (id.clone(), 0.0)).collect(),
                             &|row_id| index.get_exact(row_id),
                             query,
@@ -597,7 +600,8 @@ type RowIdsBySegment = Vec<(SegmentId, Vec<String>)>;
 
 /// Reconcile a `SegmentSearch` answer against its request: exactly one unit
 /// per requested segment id, none for an id that was not requested, none
-/// twice; no unit wider than the requested `width`; and no row id twice
+/// twice; no unit wider than the requested `width`; every distance
+/// ADMISSIBLE ([`distance_is_admissible`] — finite); and no row id twice
 /// ACROSS THE WHOLE ANSWER, not merely within one unit — segments are
 /// row-disjoint by the append invariant (`segment.rs`'s module contract), so
 /// one id in two units is knowably impossible and the coordinator refuses it
@@ -646,6 +650,11 @@ fn reconcile_units(
         {
             return Err(malformed());
         }
+        // The distance is the merge's sort key and the user-visible
+        // similarity: `-NaN` / `-inf` would take the whole top-k.
+        if first_inadmissible_hit(&unit.hits).is_some() {
+            return Err(malformed());
+        }
     }
     if seen.len() != requested.len() {
         return Err(malformed());
@@ -654,7 +663,7 @@ fn reconcile_units(
 }
 
 /// Reconcile an `ExactRescore` answer against its request: exactly the rows
-/// that were named, each once. A short answer would silently return fewer
+/// that were named, each once, every distance admissible. A short answer would silently return fewer
 /// than `k`; a long one would inject rows the merge never selected; a
 /// duplicate would score one row twice. Any of these is
 /// [`PeerFailureReason::Malformed`].
@@ -678,8 +687,11 @@ fn reconcile_rescore(
         .flat_map(|(_, ids)| ids.iter().map(String::as_str))
         .collect();
     let mut seen = std::collections::BTreeSet::new();
-    for (row_id, _) in &rows {
+    for (row_id, distance) in &rows {
         if !requested.contains(row_id.as_str()) || !seen.insert(row_id.as_str()) {
+            return Err(malformed());
+        }
+        if !distance_is_admissible(*distance) {
             return Err(malformed());
         }
     }
@@ -946,6 +958,9 @@ mod tests {
         /// Two units of ONE answer naming the same row id — segments are
         /// row-disjoint by construction, so this is knowably impossible.
         DuplicateRowAcrossUnits,
+        /// A hit carrying a non-finite distance — the merge's sort key, so
+        /// `-NaN` / `-inf` take the whole top-k from every honest hit.
+        NonFinite(f32),
     }
 
     /// What the fake owner answers an `ExactRescore` with.
@@ -958,6 +973,8 @@ mod tests {
         Unrequested,
         /// A requested row twice.
         Duplicate,
+        /// A rescored row carrying a non-finite distance.
+        NonFinite(f32),
     }
 
     struct FakeOwner {
@@ -1017,6 +1034,7 @@ mod tests {
                     let last = units.len() - 1;
                     units[last].hits[0] = dup;
                 }
+                SearchAnswer::NonFinite(d) => units[0].hits[0].1 = d,
             }
             Ok(units)
         }
@@ -1043,6 +1061,7 @@ mod tests {
                     let dup = rows[0].clone();
                     rows.push(dup);
                 }
+                RescoreAnswer::NonFinite(d) => rows[0].1 = d,
             }
             Ok(rows)
         }
@@ -1220,6 +1239,46 @@ mod tests {
             "{:?}",
             counters.snapshot()
         );
+    }
+
+    /// A non-finite distance is inadmissible, on either rpc. It is the
+    /// merge's sort key (`total_cmp`) and the user-visible similarity, and
+    /// `-NaN` / `-inf` sort BEFORE every honest distance — so a skewed peer
+    /// would take the whole top-k with no counter moving. The domain is
+    /// exactly `is_finite`: no range bound (an honest self-hit measures
+    /// `-1.19e-7`, which a `[0, 2]` check would reject) and no normalisation.
+    #[tokio::test]
+    async fn non_finite_distances_from_a_peer_are_a_typed_ladder_failure() {
+        for poison in [f32::NAN, -f32::NAN, f32::INFINITY, f32::NEG_INFINITY] {
+            // Phase 1: a `SegmentSearch` hit.
+            let owner = fake(SearchAnswer::NonFinite(poison), RescoreAnswer::Conforming);
+            let (placed, counters, _dir) =
+                mixed_with_fake(StoragePrecision::F32, Arc::clone(&owner));
+            let q = corpus()[0].1.clone();
+            let err = placed
+                .search_final_placed(&q, 3, 1)
+                .await
+                .expect_err("a non-finite distance must never reach the merge");
+            assert!(
+                matches!(&err, JammiError::Unavailable { resource, .. } if resource == "segment t/1"),
+                "{poison}: {err:?}"
+            );
+            assert_eq!(counters.get("malformed"), Some(2), "{poison}");
+
+            // Phase 2: an `ExactRescore` row.
+            let owner = fake(SearchAnswer::Conforming, RescoreAnswer::NonFinite(poison));
+            let (placed, counters, _dir) =
+                mixed_with_fake(StoragePrecision::Int8, Arc::clone(&owner));
+            let err = placed
+                .search_final_placed(&q, 3, 4)
+                .await
+                .expect_err("a non-finite rescore distance must never reach the merge");
+            assert!(
+                matches!(&err, JammiError::Unavailable { resource, .. } if resource == "segment t/1"),
+                "{poison}: {err:?}"
+            );
+            assert_eq!(counters.get("malformed"), Some(2), "{poison}");
+        }
     }
 
     /// A non-conforming `ExactRescore` answer — short, an unrequested row, a

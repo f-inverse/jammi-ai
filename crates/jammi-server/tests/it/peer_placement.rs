@@ -417,6 +417,107 @@ async fn placed_search_over_two_instances_equals_all_local_and_brute_force() {
 }
 
 // ---------------------------------------------------------------------------
+// A caller's width fault never traverses the ladder
+// ---------------------------------------------------------------------------
+
+/// A wrong-width query is the CALLER's fault, and the coordinator knows it
+/// before it dials anyone. Two halves, both asserting ZERO `SegmentSearch`
+/// served by B — the observable that no fan-out happened — and neither
+/// panicking:
+///
+///  * the placed entry on a 4-wide BINARY table, the case that used to PANIC
+///    at the coordinator: `pack_threshold_bits` takes `ceil(len/8)` bytes, so
+///    an over-long query passes usearch untouched, and the fault surfaced
+///    only inside `cosine_distance` — after the owner had refused it
+///    (`Refused`), the retry had failed, and the local-load rung had pulled
+///    the whole remote segment down;
+///  * the public `Search` verb, refused at `QueryBuilder::new` — the first
+///    point at which any width is known at all.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_caller_width_fault_is_refused_before_any_fan_out() {
+    let b = start_engine_server_with_peer_bind().await;
+    let dir = dir_of(&b);
+    let owner = PeerAddr(b.peer_addr.to_string());
+    let placement = TestPlacement::default();
+    let a = open_a(&dir, StoragePrecision::Binary, None, placement.clone()).await;
+    let store = a.result_store();
+
+    // --- the placed entry, 4-wide Binary, segment 1 owned by B ---
+    let (table, record) = two_segment_table(&store, "src_width", Some(4)).await;
+    placement.set(&record.table_name, 1, vec![owner.clone()]);
+    let served_before = served(&b, "SegmentSearch");
+    let counters_before = snapshot(&store);
+
+    let placed = store.resolve_search_mode(&record).await.unwrap().unwrap();
+    let err = placed
+        .search_final_placed(&[1.0, 0.0, 0.0, 0.0, 0.0], 3, 4)
+        .await
+        .expect_err("a 5-wide query on a 4-wide Binary table must be a typed refusal");
+    let text = err.to_string();
+    assert!(
+        text.contains("5 dimensions") && text.contains("4 dimensions"),
+        "the refusal names both widths: {text}"
+    );
+    assert_eq!(
+        served(&b, "SegmentSearch"),
+        served_before,
+        "a caller fault must not reach an owner"
+    );
+    let counters_after = snapshot(&store);
+    for (label, _) in &counters_before {
+        assert_eq!(
+            delta(&counters_before, &counters_after, label),
+            0,
+            "a caller fault must not move the ladder counter {label}"
+        );
+    }
+
+    // --- the public Search verb, refused at QueryBuilder::new ---
+    let imported = import_table(&a, &dir, "docs_width").await;
+    placement.set(&imported.table_name, 0, vec![owner.clone()]);
+    let served_before = served(&b, "SegmentSearch");
+    let err = Session::new(Arc::clone(&a))
+        .search(search_request(
+            "docs_width",
+            vec![1.0, 0.0, 0.0, 0.0, 0.0],
+            1,
+        ))
+        .await
+        .expect_err("a 5-wide query on a 4-wide table must be refused at the entry");
+    let text = err.to_string();
+    assert!(
+        text.contains(&imported.table_name) && text.contains("5 dimensions"),
+        "the refusal names the table and the width: {text}"
+    );
+    assert!(
+        !matches!(err, JammiError::Unavailable { .. }),
+        "a caller fault is not a peer outage: {err:?}"
+    );
+    assert_eq!(
+        served(&b, "SegmentSearch"),
+        served_before,
+        "the caller fault never traversed the ladder"
+    );
+    // The honest query on the same table still serves, through the same owner.
+    let hits = Session::new(Arc::clone(&a))
+        .search(search_request("docs_width", e(1), 1))
+        .await
+        .expect("a conforming query still fans out");
+    assert_eq!(hits.iter().map(|b| b.num_rows()).sum::<usize>(), 1);
+    assert!(
+        served(&b, "SegmentSearch") > served_before,
+        "…and reached B"
+    );
+
+    table.abort().await.unwrap();
+    a.close().await;
+    let _ = b.shutdown.send(());
+    let _ = b.handle.await;
+}
+
+// ---------------------------------------------------------------------------
+// A9 — the ladder
+// ---------------------------------------------------------------------------// ---------------------------------------------------------------------------
 // A9 — the ladder
 // ---------------------------------------------------------------------------
 

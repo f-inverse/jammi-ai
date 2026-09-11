@@ -1,5 +1,6 @@
 mod audit;
 mod backup_recipe;
+mod bans_names_resolve;
 mod broker_parity;
 mod broker_postgres_config;
 mod caching;
@@ -37,6 +38,7 @@ mod reconcile;
 mod recovery;
 mod register_computed_embedding;
 mod segment;
+mod serde_json_preserve_order;
 mod sources;
 mod sqlite_single_process_seam;
 mod storage_cloud;

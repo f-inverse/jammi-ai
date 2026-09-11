@@ -50,12 +50,14 @@ use jammi_db::store::manifest::{ArtifactDigest, ProducingDescriptor};
 
 use crate::common;
 
-/// Golden output Parquet artifact digest (SHA-256 hex) captured the same way,
-/// on the `parquet` 58 line (`created_by = "parquet-rs version 58.4.0"`;
-/// ZSTD single-segment frames with the content size in the frame header).
-/// The `parquet` 57 bytes hashed to
-/// `1093bebfee3cf0ac31368b4cc1c94de117e4bced8bebc481efbefadc00e883e8`
-/// and decode to the identical table.
+/// Golden output Parquet artifact digest (SHA-256 hex), re-captured on the
+/// `parquet` 58 line; on the `parquet` 57 line these bytes hashed to
+/// `1093bebfee3cf0ac31368b4cc1c94de117e4bced8bebc481efbefadc00e883e8`. The
+/// rows the pipeline PRODUCES did not move across that bump:
+/// [`GOLDEN_CONTENT_DIGEST`] below — folded from the normalized `(key, vector)`
+/// rows as they are handed to the writer (`store/mod.rs`, `content_digest`),
+/// never from a decode of the written artifact — is unchanged, and this test
+/// asserts it on every run.
 const GOLDEN_ARTIFACT_DIGEST: &str =
     "e5b6f05d8b844e80e3aeef6b35724f90aedced0694eb198a4f7b427ce731b8de";
 

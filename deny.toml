@@ -9,11 +9,21 @@
 #     blanket.
 #   * licenses   — an allowlist of permissive / acceptable licenses. A crate
 #     whose license is not on the list reds CI, so a copyleft or unknown license
-#     cannot enter the OSS engine unnoticed.
+#     cannot enter the engine unnoticed.
 #   * bans + sources — formalizes the engine's one-way dependency direction: the
-#     OSS engine depends only on crates.io crates (no git / private registry),
+#     engine depends only on crates.io crates (no git / private registry),
 #     which is the lockfile half of the `dep-direction` / `oss-only-build`
 #     guards already in CI.
+#
+# Every lane binds exactly the feature graph its invocation builds, so the
+# `dep-audit` job runs all four TWICE: over the DEFAULT-feature graph (the
+# `jammi-server` crate as published to crates.io and the CPU-only `pip install`
+# wheel) and over `--all-features` (which is what covers the release image and
+# the CUDA lanes — both build `jetstream-broker` + `storage-cloud`, see
+# `Dockerfile` and `ci/release-feature-manifest.json` — and jammi-db's
+# `postgres`/`mysql` backends). A copyleft license, a git source, a second
+# engine line or an advisory hiding behind an optional feature is caught by the
+# second run; the default-only run cannot see it.
 
 # ---------------------------------------------------------------------------
 # Advisories — the RustSec lane.
@@ -51,6 +61,33 @@ ignore = [
     # calls `new_closure` nowhere (grep-verified), so the unsound path is not
     # reachable. Sequenced with RUSTSEC-2026-0176 for the post-freeze upgrade.
     "RUSTSEC-2026-0177",
+    # --- Feature-gated paths, surfaced by the `--all-features` advisory lane ---
+    # These reach the tree only through a cargo feature, so the DEFAULT-feature
+    # graph — the `jammi-server` crate as published to crates.io and the
+    # CPU-only `pip install` wheel — is advisory-clean without them. That is
+    # NOT the shipped posture: the release image (`Dockerfile`: `--features
+    # jammi-server/jetstream-broker,jammi-server/storage-cloud`) and all three
+    # CUDA lanes (`ci/release-feature-manifest.json`: `cargo_features` include
+    # `jetstream-broker` and `storage-cloud`) build BOTH features and ARE
+    # exposed to every entry below that they carry. That is exactly why the
+    # `--all-features` advisories lane is a merge gate: a new advisory on one
+    # of these paths reds the PR instead of shipping in the image unseen.
+    #
+    # quick-xml 0.39.4 — quadratic duplicate-attribute scan (0194) and unbounded
+    # namespace-declaration allocation (0195), both reachable when parsing a
+    # HOSTILE XML document. Reached only via `object_store`'s aws/gcp/azure
+    # backends, i.e. jammi-db's `storage-s3`/`storage-gcs`/`storage-azure`/
+    # `storage-r2` features, where the XML parsed is an object-store API
+    # response. EXPOSURE: the release image and the CUDA lanes ship
+    # `storage-cloud`; any deployment of them whose object-store endpoint is
+    # attacker-controlled (or MITM'd) can be driven to CPU/memory exhaustion.
+    # NO UPSTREAM FIX REACHABLE: the patched line is
+    # quick-xml >= 0.41, which requires object_store >= 0.14.1, which requires
+    # leaving the DataFusion 54 line (datafusion 54.1 pins object_store
+    # ^0.13.2). Clears when the workspace moves to the DataFusion line that
+    # carries object_store 0.14.
+    "RUSTSEC-2026-0194",
+    "RUSTSEC-2026-0195",
 ]
 
 # ---------------------------------------------------------------------------
@@ -97,6 +134,62 @@ ignore = true
 # (transitive minor skews); the dep-direction guard, not version-deduping, is
 # the boundary that matters here.
 multiple-versions = "allow"
+# The ENGINE LINE is the exception to the allowance above. DataFusion, arrow,
+# parquet, object_store, sqlparser and prost determine engine bytes (plan
+# shapes, Arrow IPC, Parquet footers, Flight/gRPC frames), so exactly ONE
+# version of each must resolve — a second line sneaks in the moment a
+# `cargo update` walks a caret pin or a sibling crate drags its own DataFusion.
+#
+# WHICH GRAPH ENFORCES THIS: `cargo deny` evaluates the feature graph it is
+# given, so these entries bind exactly the graph the invocation builds. The
+# `dep-audit` CI job therefore runs the bans lane TWICE: once with default
+# features (the crates.io `jammi-server` and the CPU-only wheel) and once with
+# `--all-features` (the release image and the CUDA lanes, which build
+# `jetstream-broker` + `storage-cloud`). The second run is the load-bearing one for the optional
+# backends: every crate reachable only through jammi-db's `postgres`/`mysql`
+# features — the whole `datafusion-table-providers{,-common,-mysql,-postgres}`
+# subtree, the likeliest carrier of a second DataFusion — is ABSENT from the
+# default graph, so a default-only run reports `bans ok` while the lockfile
+# holds two DataFusion lines.
+#
+# cargo-deny 0.20 matches `name` literally (no globs; probed with `hashbr*`,
+# which matched nothing), so the arrow/datafusion families are listed by the
+# members this workspace depends on DIRECTLY — in `Cargo.toml`
+# `[workspace.dependencies]` AND in a member crate's own manifest
+# (`datafusion-table-providers` is jammi-db's, not the workspace's); every
+# other family member is a same-version transitive of one of these. A name
+# matching nothing produces NO diagnostic, so `bans_deny_names_resolve` in
+# jammi-db's `it` suite asserts every name below resolves in `Cargo.lock`
+# (which also catches an upstream rename, as the version fences cannot).
+# The two version fences keep the line at DataFusion 54 / arrow 58: a bump to
+# the next line edits the fences, the workspace pins, and jammi-db's
+# `datafusion_version` oracle together.
+# ESCAPE HATCH for a legitimate, feature-only duplicate (an optional backend
+# that resolves an older line under a non-default feature): add the older
+# version to `skip = [...]` (one crate version) or `skip-tree = [...]` (that
+# crate and its subtree) with a written rationale — never widen the global
+# `multiple-versions`.
+deny = [
+    { name = "datafusion", deny-multiple-versions = true },
+    { name = "datafusion-federation", deny-multiple-versions = true },
+    { name = "datafusion-flight-sql-server", deny-multiple-versions = true },
+    { name = "datafusion-table-providers", deny-multiple-versions = true },
+    { name = "arrow", deny-multiple-versions = true },
+    { name = "arrow-array", deny-multiple-versions = true },
+    { name = "arrow-schema", deny-multiple-versions = true },
+    { name = "arrow-ipc", deny-multiple-versions = true },
+    { name = "arrow-flight", deny-multiple-versions = true },
+    { name = "parquet", deny-multiple-versions = true },
+    { name = "object_store", deny-multiple-versions = true },
+    { name = "sqlparser", deny-multiple-versions = true },
+    { name = "prost", deny-multiple-versions = true },
+    { name = "prost-types", deny-multiple-versions = true },
+    # Version fences: the workspace is on the DataFusion 54 / arrow 58 line.
+    { name = "datafusion", version = ">=55.0.0" },
+    { name = "datafusion", version = "<54.0.0" },
+    { name = "arrow", version = ">=59.0.0" },
+    { name = "arrow", version = "<58.0.0" },
+]
 # A wildcard version requirement on a published (crates.io) dependency reds CI —
 # it is a release footgun. First-party workspace crates referenced by `path` are
 # exempt (`allow-wildcard-paths`): they are not published wildcards, they are the

@@ -958,6 +958,28 @@ jobs:
       - name: cargo deny (advisories + licenses + bans + sources)
         run: cargo deny check advisories licenses bans sources
 
+      # `cargo deny` evaluates the feature graph the invocation builds, and the
+      # step above builds the DEFAULT one — which excludes every crate reachable
+      # only through an optional feature: the whole
+      # `datafusion-table-providers{,-common,-mysql,-postgres}` subtree behind
+      # jammi-db's `postgres`/`mysql`, `async-nats` behind `jetstream-broker`,
+      # and `object_store`'s aws/gcp/azure backends behind `storage-*`. Those
+      # are precisely where a second DataFusion line or an unseen advisory can
+      # hide: with `datafusion-substrait = "55"` added behind jammi-db's
+      # `postgres` feature, the lockfile carries DataFusion 54 AND 55 and the
+      # step above still prints `bans ok`, while this one reports 8 errors.
+      # The `--all-features` graph is the SHIPPED one for the release image
+      # and the CUDA lanes (both build `jetstream-broker` + `storage-cloud`),
+      # so all four lanes run over it — licenses and sources included: an LGPL
+      # crate or a git-sourced crate behind jammi-db's `postgres` feature
+      # passes the default lanes (rc=0) and fails only here (rc=4 / rc=8).
+      # Run as a separate step (not `[graph] all-features = true` in
+      # deny.toml) so the default graph keeps its own verdict: the two graphs
+      # carry different advisory sets, and the feature-gated ones are listed as
+      # documented `[advisories] ignore` exceptions with their exposure.
+      - name: cargo deny --all-features (bans + advisories + licenses + sources — shipped-feature graph)
+        run: cargo deny --all-features check bans advisories licenses sources
+
   ts-client:
     name: TS client (@f-inverse/jammi-client)
     runs-on: ubuntu-latest

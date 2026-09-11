@@ -203,7 +203,23 @@ serde = { version = "1", features = ["derive"] }
 # metrics blob can disagree by 1 ulp — a cross-surface parity defect, not a
 # test nicety. Proven by CI run 33447230995's bit-identity failure
 # (0.42201741678374155 -> 0.4220174167837415) and a minimal two-arm repro.
-serde_json = { version = "1", features = ["float_roundtrip"] }
+# `preserve_order`: a `serde_json::Map` keeps INSERTION order (indexmap) instead
+# of sorting keys (BTreeMap). Declared here so the semantic is a workspace
+# decision, not an accident of the graph. Measured fact before this line
+# (`cargo tree <scope> -e features -i serde_json`): `--workspace` builds and
+# `-p jammi-server` resolved it ON (substrait 0.63, a hard dependency via
+# datafusion-substrait 54 -> datafusion-flight-sql-server, enables it) while
+# `-p jammi-db`, `-p jammi-ai`, `-p jammi-cli` and `-p jammi-python` (the
+# maturin wheel) resolved it OFF — so the shipped CLI/wheel and the tested
+# binaries disagreed on map order. With the declaration every scope resolves
+# it ON, one-directionally. Persisted/hashed JSON does not
+# depend on it either way (`manifest.rs canonicalize_json` and
+# `audit/record.rs canonicalize_value` sort before insert; the classifier's
+# `all_scores_json` and eval `metrics_json` sort explicitly); a producer that
+# persists a `Map`/`json!` object it did NOT sort is order-sensitive and must
+# sort — jammi-db's `serde_json_preserve_order` it-test and
+# crates/jammi-python/tests/test_serde_json_preserve_order.py are the oracles.
+serde_json = { version = "1", features = ["float_roundtrip", "preserve_order"] }
 toml = "0.8"
 # Path-carrying deserialization errors for the jammi-db layered config
 # loader (esc-095): a `deny_unknown_fields` refusal or a type mismatch
@@ -245,7 +261,7 @@ hex = "0.4"
 futures = "0.3"
 async-stream = "0.3"
 parking_lot = "0.12"
-async-nats = "0.41"
+async-nats = "0.50"
 
 # Numerics (jammi-numerics) — pure-math kernels for stats, GP+EI, divergence,
 # eval metrics, distance, and Pareto. rand is pinned to 0.8 to keep

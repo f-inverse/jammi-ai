@@ -113,3 +113,20 @@ Lead's grep verification of the fold (recorded here in place of a fourth round):
 and U7b; `serde(default)` and `wire/training.rs` under U4a; `main.rs` under U5b; the three
 citations corrected. Verdict of record: the plan is **PROCEED-equivalent** — the last standing
 findings were consistency edits, verified closed.
+
+## v4 (2026-09-10) — rebase on the jobs-fleet branch, 68 reconciliation, U8 as an extension unit
+
+### Phase 0.5 (gap-analyzer on BRIEF-v4): invariant-crossing — B4, B5, B6, B1, B2, K5, K4, K7, K2, K6, K1, K3; 30 ambiguities
+
+Every ambiguity is ruled in README rulings 26–46. Highlights: training kinds eligible for a gang
+(r26); a peer is a fleet worker with a busy slot, no new worker state (r27); membership is 68's
+(r28); three migrations (r30); the training set is not a partial result (r31); I-GANG authorization
+on the peer listener with its own allowlist bucket (r34); released-vs-failed and the `releases`
+counter (r36); the watchdog under the actuator rule (r37); `jammi-ballista` is a non-leaf crate, no
+feature, publishable (r38); roles as listener knobs (r39); retries off globally (r40); one gang
+mechanism (r41); `expire_dead_executors` as membership liveness (r42); the seam table and the one
+upstream gap (r43); device pinning and bytes (r44); pre-swept names (r45); PR-C before PR-A (r46).
+v3.1 rulings 9, 11 (tenant-scoped mount), 17 (`[training]` knobs), 18 (one migration) and 19's
+ordering are superseded.
+
+### Round 4 (on v4) — recorded below after the re-dispatch

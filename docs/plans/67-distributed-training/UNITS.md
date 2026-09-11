@@ -174,23 +174,35 @@ per-step `$?`. Naming per README ruling 23.
 - **lane**: gate scripts. **depends_on**: U7a, S4. **size**: M.
 - **cost ceiling**: ≤ 1 h × 4 GPU × $1.59 ≈ $6.4 per run; label-only until a flake-free streak.
 
-## U5a — `gang.proto`; `GangService`; `FetchPartition`; authorization (PR-C commit 2)
+## U5a — `GangService` on `peer_bind`; I-GANG authorization (PR-C commit 2)
 
 - **files_in_scope**: (wire-server) `crates/jammi-wire/proto/jammi/v1/gang.proto`
-  (`RunRank(RankAssignment) returns (stream RankEvent)`; `FetchPartition(PartitionRequest)
-  returns (stream ArrowIpc)`), `crates/jammi-wire/build.rs:22-33` (hand-listed proto files),
-  `crates/jammi-wire/src/{lib.rs, gang.rs}`,
-  `crates/jammi-server/src/grpc/gang.rs` (tenant-scoped mount via `mount_tenant_scoped`; the
-  job/lease/claimed_by verification; ids resolved through the catalog; #485 bounds),
-  `crates/jammi-server/src/runtime.rs`, `crates/jammi-server/tests/it/{gang_partition.rs,
-  gang_authz.rs}`. (db) `config/mod.rs` (`peers`, `rank_timeout_secs`).
-- **invariants_to_preserve**: B5, K2, B1 (no `stage`/`register` stems), B6.
-- **acceptance**: (a) the streamed bytes of partition r equal the local read of partition r
-  (RED at base); (b) `RunRank` for a job that is not running / not claimed by the named worker
-  / lease expired is refused with a typed status (RED at base); (c) fence on `job_id`: a
-  lesser-or-equal attempt is refused; a greater one aborts every local runner of that job at a
-  lower attempt, whatever rank it held (RED at base).
-- **lane**: hermetic + server it-suite. **depends_on**: U4a. **size**: L.
+  (`RunRank(RankAssignment) returns (stream RankEvent)` with `RankEvent::Released`;
+  `FetchPartition(PartitionRequest) returns (stream ArrowIpc)`), `crates/jammi-wire/build.rs:22-33`,
+  `crates/jammi-wire/src/{lib.rs, gang.rs}`, `crates/jammi-server/src/grpc/gang.rs` (handler on
+  the **peer listener** — 68 DIST D7's routes built outside `assemble_grpc_chain`; the I-GANG
+  verification: `jobs` row by primary key, `status = 'running'`, `claimed_by`, live lease, tenant
+  derived from the row and pinned; `FetchPartition` belongs-to-job check; `JobSlot` try-lock;
+  attempt fence on `job_id`; #485 bounds), `crates/jammi-server/src/runtime.rs` (mount on the peer
+  routes), `crates/jammi-server/tests/it/{api_freeze_baseline.txt (RPC + PACKAGE lines),
+  api_freeze.rs (package count prose), tenant_isolation_oracle.rs (`GANG_LISTENER_ALLOWLIST`,
+  unioned into `covered_on_wire` and the partition assertion; public-listener `UNIMPLEMENTED`
+  probe), gang_partition.rs, gang_authz.rs}`. (ai-core) `fine_tune/worker.rs` (`JobSlot` taken by
+  the claim loop before `claim_next`, `wt-C: worker.rs:346`). (db) `config/mod.rs` (`rank_timeout_secs`
+  if not already in U4a).
+- **invariants_to_preserve**: B5 (I-GANG written invariant; no double binder — never mounted under
+  `TenantResolverLayer`), K2, B1 (no `stage`/`register` stems), B6, OPS D6 (no abort while a claim
+  may be in flight — the slot is taken outside the transaction).
+- **acceptance**: (a) the streamed bytes of partition r equal the local read of partition r (RED
+  at base); (b) `RunRank` for a job not running / not claimed by the named instance / lease
+  expired / wrong `FetchPartition` table is refused with a typed status (RED at base); (c) fence:
+  lesser-or-equal attempt refused, greater aborts the older (RED at base); (d) a peer whose slot
+  is busy refuses with `Unavailable` and the claim loop never claims while a rank runs (RED at
+  base); (e) `api_freeze` and `every_rpc_is_covered` green with the new lines; the public listener
+  answers `UNIMPLEMENTED` for `GangService/*` (invariant oracle).
+- **lane**: hermetic + server it-suite. **depends_on**: U4a, **68 DIST unit 1** (the
+  `peer_bind` listener; if unmerged, its listener commit is carried verbatim as this unit's first
+  commit, co-owned). **size**: L.
 
 ## U6 — Partition-aware inference operator; distributed frozen forward (PR-C commit 3)
 
@@ -206,54 +218,90 @@ per-step `$?`. Naming per README ruling 23.
 - **lane**: hermetic. **depends_on**: U2b, U5a. **size**: L (operator repartitioning, peer
   fan-out client, ordered sink).
 
-## U5b — Coordinator; `Peer` collective; attempt fence; chaos (PR-C commit 4)
+## U5b — Coordinator; `Peer` collective; membership; released-vs-failed; chaos (PR-C commit 4)
 
-- **files_in_scope** (ai-core): `fine_tune/collective/peer.rs`, `fine_tune/worker.rs`
-  (coordinator: peer resolution, id mint, dispatch, watchdog, attempt abort),
-  `tests/distributed/{main.rs (mod lines), harness.rs (peer TOML, `[training] peers`),
-  gang_deterministic.rs, gang_chaos.rs}`, `.github/workflows/distributed.yml` (three new test names). (wire-server)
-  `grpc/gang.rs` peer-side rank runner and attempt fence.
-- **invariants_to_preserve**: K4 real (W=1 via the gang path == embedded bytes), B4, K2, B6.
-- **acceptance**: (a) server it-suite: W=1 coordinator dispatching to itself → bytes identical
-  to the in-process trainer (RED at base); (b) distributed deterministic leg: 2 processes, W=2,
+- **files_in_scope** (ai-core): `fine_tune/collective/peer.rs`, `fine_tune/worker.rs` (coordinator
+  on the `JobWorker`: member resolution from `workers.kinds` × `instances.peer_addr` × freshness
+  (× `workers.devices` from U8b), id mint, dispatch, watchdog, `Released` → `release_job_lease`
+  vs error → `fail_job`, attempt abort), `tests/distributed/{main.rs, harness.rs (peer TOML with
+  `peer_bind`/`peer_advertise`), gang_deterministic.rs, gang_chaos.rs, gang_forward.rs}`,
+  `.github/workflows/distributed.yml` (test names). (wire-server) `grpc/gang.rs` peer-side rank
+  runner and the drain hook that emits `Released`. (db) `catalog/jobs_repo.rs` (member listing,
+  sorted in Rust).
+- **invariants_to_preserve**: K4 real (W=1 via the gang path == embedded bytes), B4, K2, B6,
+  OPS D10 (a peer-tier rolling restart costs zero net attempts).
+- **acceptance**: (a) server it-suite: W=1 coordinator dispatching to itself → bytes identical to
+  the in-process trainer (RED at base); (b) distributed deterministic leg: 2 processes, W=2,
   `Peer` → bytes identical to the single-process W=2 `Local` run (RED at base); (c) chaos:
-  SIGKILL a peer → requeued with `attempts+1`, completed by a new gang from the checkpoint,
-  exactly one model, no orphan prefix promoted; SIGKILL the coordinator → same via lease; split
-  brain: attempt N+1 dispatched while N is live → N aborted, N+1 completes (RED at base); (d)
-  cluster leg: 2 pods × 2 GPUs, W=4, `Nccl` `from_rank` → digest pair + deltas against the
-  pre-registered ε; artifact as PR-C commit 5; (e) distributed: 2 workers compute disjoint
-  halves of a head-target feature table via `FetchPartition` and the merged table equals the
-  single-worker table (U6's operator; RED at base). Test targets: `distributed`
-  (`live-distributed-tests`) for process tests; `gpu_capability` for the cluster leg.
+  SIGKILL a peer → `attempts+1`, completed by a new gang from the checkpoint, one model, no
+  orphan prefix; SIGKILL the coordinator → same via lease; split brain → older attempt aborted;
+  SIGTERM (drain) on a peer host → `Released`, `releases+1`, `attempts` unchanged net, job
+  completes (RED at base); (d) cluster leg: 2 pods × 2 GPUs, W=4, `Nccl` `from_rank` → digest
+  pair + deltas against the pre-registered ε; artifact as PR-C commit 5; (e) two workers compute
+  disjoint halves of a head-target feature table via `FetchPartition`, merged table equals the
+  single-worker table (U6's operator; RED at base). Test targets: `distributed`; `gpu_capability`
+  for the cluster leg.
 - **lane**: hermetic + distributed (dispatched manually; deterministic leg green before merge;
-  chaos advisory as today) + gpu-gang cluster leg. **depends_on**: U4b, U5a, U6 (for (e)),
-  S1. **size**: XL.
+  chaos advisory as today) + gpu-gang cluster leg. **depends_on**: U4b, U5a, U6, **68 DIST unit
+  2** (`instances.peer_addr`), **68 OPS** (`release_job_lease`, drain hooks), S1. **size**: XL.
 
-## U8 — Ballista scheduler/executor roles + extension codec (PR-D commit 1; mandatory, last)
+## U8a — `jammi-ballista`: crate, codecs, execution engine, role knobs (PR-D commit 1)
 
-- **files_in_scope**: (wire-server) `crates/jammi-server/Cargo.toml` (`ballista` feature:
-  `ballista-core`/`-scheduler`/`-executor` 54.x, `datafusion-proto 54`), `runtime.rs` (roles
-  `scheduler`/`executor` via `[server] services` and `ServiceTier`), `ballista/{codec.rs,
-  roles.rs}` (codec for `InferenceExec`, `AnnSearchExec`, `AsofJoinExec`, `GangExec` ↔ U5
-  descriptor messages; task retry attempts = 0 for gang jobs), `tests/it/ballista_codec.rs`.
-  (ai-core) `operator/gang_exec.rs` (single-partition operator whose `execute` runs the U5b
-  coordinator), `tests/distributed/{main.rs (mod), harness.rs (scheduler/executor TOML),
-  ballista_parity.rs}`. (docs-ci) `ci.yml` gated-surface clippy for `ballista`;
-  `.github/workflows/distributed.yml` matrix entries for the three-process arm.
-- **invariants_to_preserve**: B4, K4, B6, K6, B1.
-- **acceptance**: hermetic: codec round-trip for every operator (RED at base). Distributed
-  (three processes, one binary): (a) an embedding job via `submit_physical_plan` across two
-  executors → bytes identical to U6's peer path (RED at base); (b) a W=2 gang job through the
-  scheduler → bytes identical to U5b's, never task-retried (RED at base); (c) killing an
-  executor mid-gang fails the job and it requeues through jammi's lease path.
-- **lane**: hermetic codec arm + distributed three-process arm. **depends_on**: U1, U5b, U6,
-  S2. **size**: L.
+- **files_in_scope**: (wire-server; new crate) `crates/jammi-ballista/{Cargo.toml (ballista-core /
+  -scheduler / -executor 54.x, datafusion-proto 54; depends on jammi-ai, jammi-db, jammi-wire;
+  publishable, lockstep), src/{lib.rs, codec.rs (`JammiCodec`: `InferenceExec`, `AnnSearchExec`,
+  `AsofJoinExec`, `GangExec` ↔ U5 descriptor messages), engine.rs (`JammiExecutionEngine`:
+  model cache across plans, device pinned to `[gpu] devices`, shuffle reader rewrite + writer
+  wrap), roles.rs (scheduler via `start_server(cluster, …)` with Ballista's in-memory cluster;
+  executor via `ExecutorProcessConfig { override_execution_engine, override_*_codec }`;
+  `task_max_failures = stage_max_failures = 0`), config.rs (`BallistaConfig { scheduler_bind:
+  Option, executor: Option<{scheduler_address, work_dir}> }`)}}`, `Cargo.toml` (workspace member;
+  `deny.toml`), `crates/jammi-server/{Cargo.toml (depends on jammi-ballista, no feature),
+  src/runtime.rs (host the roles from config)}`, `crates/jammi-db/src/config/mod.rs`
+  (`[ballista]` section, `deny_unknown_fields`, listener collision checks). (ai-core)
+  `crates/jammi-ai/src/operator/gang_exec.rs` (single-partition operator whose `execute` runs the
+  U5b coordinator). `tests/distributed/{main.rs, harness.rs (scheduler/executor TOML),
+  ballista_parity.rs}`; `.github/workflows/distributed.yml` matrix entries; `ci/scripts/
+  check_dep_direction.py` expectations (jammi-ballista sits between the engine and the server).
+- **invariants_to_preserve**: B4 (roles are config; no cargo feature; the library keeps the
+  capability through the crate), B2 (dep direction), K4 (bytes through Ballista == bytes through
+  the peer path), B6, K6 (publishable, lockstep), B1 (pre-swept names, README r45).
+- **acceptance**: hermetic: codec round-trip for every operator (RED at base); config: `[ballista]`
+  parses, unset = no roles, `scheduler_bind == peer_bind/flight_listen/health_listen` refused (RED
+  at base). Distributed (three processes, one binary): (a) an embedding job via
+  `submit_physical_plan` across two executors → bytes identical to U6's peer path (RED at base);
+  (b) a W=2 gang job through the scheduler → bytes identical to U5b's, never task-retried (RED at
+  base); (c) killing an executor mid-gang fails the job and requeues it through jammi's lease path.
+- **lane**: hermetic + distributed. **depends_on**: U1, U5b, U6, S6. **size**: L.
+
+## U8b — Catalog-backed cluster state; device-aware placement (PR-D commit 2; the completion gate)
+
+- **files_in_scope**: (wire-server) `crates/jammi-ballista/src/{cluster.rs (`CatalogClusterState`,
+  `CatalogJobState` over jammi's catalog), placement.rs (`DevicePlacement`: executor id ↔
+  `workers.devices`; a GPU stage binds only to a device-bearing executor; installed through
+  `bind_schedulable_tasks` / `TaskDistributionPolicy::Custom`)}`. (db) `catalog/{schema.rs,
+  migrations.rs}` (`ballista_state`: executor registrations/heartbeats, job graphs — tables owned
+  by jammi-ballista, not the `jobs` table, not a lease class; number at rebase), `catalog/
+  ballista_repo.rs` (new). Tests in `tests/distributed/ballista_state.rs`.
+- **invariants_to_preserve**: K5, B4, K4, B6, the actuator rule disposition (README r42: executor
+  liveness is membership; retries stay off), OPS D6 (the executor role stops polling before the
+  worker drain sequence; no claim transaction is involved).
+- **acceptance**: (a) restart the scheduler process: registered executors and in-flight job state
+  survive (RED at base: in-memory); (b) two schedulers over one catalog serve one cluster (RED at
+  base); (c) a GPU stage never binds to an executor whose `devices` is empty; a device-less-only
+  cluster refuses the stage with a typed error (RED at base); (d) the gang job of U8a (b) still
+  byte-matches U5b under catalog state.
+- **lane**: distributed. **depends_on**: U8a, U4a (`workers.devices`). **size**: L.
 
 ## U9 — Docs (PR-D commit 2)
 
 - **files_in_scope** (docs-ci / doc-updater): `docs/guide/src/{philosophy.md,
-  reference-topologies.md, fine-tune pages}`, `docs/maintainer/MAINTAINER-GUIDE.md`
-  (prose; the `PRODUCING-DESCRIPTOR-VARIANTS` block itself lands with U2a and U3),
-  `CHANGELOG.md`, `deploy/` note.
-- **acceptance**: docs gates green; reference-topologies states the StatefulSet consequence.
-- **lane**: docs. **depends_on**: all. **size**: S.
+  reference-topologies.md, configuration.md ([worker]/[ballista] knobs), fine-tune pages}`,
+  `docs/maintainer/MAINTAINER-GUIDE.md` (prose; the `PRODUCING-DESCRIPTOR-VARIANTS` block itself
+  lands with U2a and U3), `CHANGELOG.md`, `deploy/kubernetes/overlays/shape-d/**` (68 K's
+  compute Deployment becomes a StatefulSet with a headless service and `nvidia.com/gpu: N`;
+  K's own comment invites this edit; co-owned, K first), `deploy/docker-compose*.yml` note.
+- **acceptance**: docs gates green; reference-topologies states the StatefulSet consequence;
+  kubeconform strict on the amended overlay; the K README's `issues/500` provisional note is
+  replaced, not duplicated.
+- **lane**: docs + kubeconform. **depends_on**: all, 68 K merged. **size**: M.

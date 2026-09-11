@@ -1,8 +1,9 @@
-# DESIGN — distributed training on DataFusion (#500), v3
+# DESIGN — distributed training on DataFusion (#500), v4
 
 Companion to `README.md` (rulings) and `UNITS.md` (contracts). Every mechanism names the
-principle it derives from and the code it lands on. Citations are read against main at
-`7561658e` (2026-09-10) and were re-verified by the lead and by two pressure-testers.
+principle it derives from and the code it lands on. Citations without a prefix are read against
+main at `7561658e`; citations prefixed `wt-C:` are read against the jobs-fleet branch at
+`95993a06`, which v4 is rebased on (its `jobs` table, `JobWorker`, `[worker]` config).
 
 ## 1. What MLlib did to Spark, and what that means here
 
@@ -123,10 +124,16 @@ reaped only when no model row references it (reconcile attribution,
 
 ## 4. The gang
 
-**Roles.** The worker that claims the job (`claim_next_training_job`,
-`training_repo.rs:951`) is the coordinator and rank 0; it holds the only lease and heartbeat.
-It materializes or reuses the training set, computes the scaler, resolves `W−1` peers from
-`[training] peers`, mints the NCCL id when the collective is `nccl`, and sends each peer:
+**Roles (on the jobs fleet).** A training-kind job (`fine_tune`, `graph_fine_tune`) is claimed
+by a `JobWorker` through `claim_next` (`wt-C: crates/jammi-db/src/catalog/jobs_repo.rs:658-719`,
+`FOR UPDATE SKIP LOCKED`, `attempts + 1`); that process is the coordinator and rank 0 and holds
+the only lease (`heartbeat_job`, `wt-C: jobs_repo.rs:772`, driven by the lease keeper).
+`context_predictor` is refused at `world_size > 1`. The coordinator materializes or reuses the
+training set (with `job_attempt: None` — a shared producer output, never this attempt's
+`partial_result`), computes the scaler, resolves `W−1` **members** from the catalog
+(`workers.kinds` ∋ kind, `instances.peer_addr` set — 68 DIST unit 2's column — `last_seen_at`
+fresh, and from U8b `workers.devices` sufficient), mints the NCCL id when the collective is
+`nccl`, and sends each member:
 
 ```
 RankAssignment { job_id, tenant, attempt, coordinator_worker_id, rank, world_size,
@@ -137,13 +144,26 @@ RankAssignment { job_id, tenant, attempt, coordinator_worker_id, rank, world_siz
 No URL travels on the wire: the peer resolves the table and the base model by id through the
 tenant-scoped catalog and derives storage URLs itself.
 
-**Authorization.** Before running, a peer verifies through a tenant-scoped, read-only catalog
-read that `job_id` is `running`, `claimed_by == coordinator_worker_id`, and the lease is live;
-otherwise `RunRank` is refused with a typed status. Peers fence on **`job_id`**: a `RunRank`
-at attempt N aborts every local runner of that job with attempt < N, whatever rank it held
-(the rank→peer mapping may differ between attempts); a lesser or equal attempt is refused;
-`(job_id, rank)` is the runner's identity only. `FetchPartition` takes a result-table id and a partition index, resolved the same way.
-Mutual transport auth stays the deployer's runtime, as for every surface today.
+**A peer is a fleet worker with a busy slot.** `RunRank` takes the worker's single job slot
+(`JobSlot`, a mutex the claim loop also takes *before* `claim_next`, so a peer never claims while
+it runs a rank and never aborts a claim transaction — 68 OPS D6's rule); a busy peer refuses with
+a typed `Unavailable` and the coordinator picks another member or fails the attempt. No new
+worker state.
+
+**Authorization (invariant I-GANG: the job row is the capability).** The service is mounted on
+the internal `[server] peer_bind` listener (68 DIST D7), never on the tenant-scoped public chain.
+The peer reads the `jobs` row by primary key with no caller tenant, verifies `status = 'running'`,
+`claimed_by = coordinator_instance_id` and a live lease, then **derives the tenant from the row**
+(`jobs.tenant_id`) and pins every subsequent catalog read to it; no URL and no tenant is trusted
+from the wire. `FetchPartition` takes a result-table id and partition index and verifies the table
+belongs to the job's training set (the analogue of D7's segment-belongs-to-table check). The
+RPCs sit in their own `GANG_LISTENER_ALLOWLIST` bucket in `tenant_isolation_oracle.rs` (text:
+"served only on peer_bind; tenant derived from the verified job row; deliberately not
+caller-scoped"), unioned like D7's, with the public-listener `UNIMPLEMENTED` assertion, and their
+`api_freeze_baseline.txt` lines land in the same commit. Peers fence on **`job_id`**: a `RunRank`
+at attempt N aborts every local runner of that job with attempt < N; a lesser or equal attempt is
+refused; `(job_id, rank)` is the runner's identity only. Mutual transport auth stays the
+deployer's runtime, as for every surface today.
 
 **Collective.** One trait, four implementations, selected by configuration:
 
@@ -197,10 +217,15 @@ abort, early stopping and epoch exit are decided by `all_reduce_max_flags` at th
 boundary on every rank (validation loss is computed by rank 0 and the stop flag broadcast).
 No rank can reach a collective a different number of times than its peers.
 
-**Failure.** Any `RankEvent::error`, stream drop, or rank silent for `rank_timeout_secs` fails
-the attempt: the coordinator cancels every rank (stream close + NCCL communicator abort),
-aborts the attempt (no publish, no finalize), and the job returns to `queued` with
-`attempts + 1` through the existing fail/reclaim path. Coordinator death expires the lease.
+**Failure and release.** Any `RankEvent::error`, stream drop, or rank silent for
+`rank_timeout_secs` fails the attempt: the coordinator cancels every rank (stream close + NCCL
+communicator abort), aborts the attempt (no publish, no finalize), and the job returns to
+`queued` with `attempts + 1` through `fail_job`. A rank ended by a DRAIN/RELEASE on its host
+(68 OPS) sends `RankEvent::Released`; the coordinator then aborts the attempt through OPS's
+`release_job_lease` (`releases + 1`), so a rolling restart of the peer tier costs zero net
+attempts. Coordinator death expires the lease. The per-attempt watchdog is the lease keeper's
+shape — bounded by the attempt it belongs to, retiring only that attempt — and is allowed under
+the actuator rule (`recompute.rs:29-35`; 68 DIST D5).
 Either way the next attempt resumes from the job-level resume checkpoint
 (`{tenant}/{job_id}/_resume/`, `artifact.rs:300-323`), which a zombie writer cannot regress
 (the write is gated on the held lease, `trainer.rs:3601`). No per-task retry anywhere.
@@ -241,11 +266,14 @@ single-process table (K4 shape).
 
 ```
 [gpu]      device = 0 ; devices = [0, 1]
-[training] world_size = 1 ; peers = [] ; rank_timeout_secs = 120 ; collective = "auto"   # auto|nccl|cpu
+[worker]   enabled = true ; kinds = "all" ; world_size = 1 ; rank_timeout_secs = 120 ; collective = "auto"   # auto|nccl|cpu
+[server]   peer_bind = "..." ; peer_advertise = "..."          # 68 DIST: members are catalog rows, not a list
+[ballista] scheduler_bind = "..." ; executor = { scheduler_address = "...", work_dir = "..." }   # U8a
 ```
-Per-job `world_size` lives in `TrainingCommon` (identity-relevant). Placement is the deployer's
-runtime: Kubernetes runs the compute tier as a StatefulSet with a headless service (or an
-indexed Job); Compose lists services; Slurm and Ray are placement options only (#482).
+Per-job `world_size` lives in `TrainingCommon` (identity-relevant; `#[serde(default)]` = 1).
+Placement is the deployer's runtime: Kubernetes runs the compute tier as a StatefulSet with a
+headless service (or an indexed Job) with `nvidia.com/gpu: N`; Compose lists services; Slurm
+and Ray are placement options only (#482; owned by U9 after 68 K merges).
 
 ## 8. Non-goals (declared)
 
@@ -253,6 +281,47 @@ Sharded model or optimizer state (FSDP-like); elastic gangs; SGD or gradient exc
 DataFusion operators or aggregates; `ContextPredictor` on a gang; hard-negative mining and
 GradCache at `world_size > 1` (typed refusal in this plan); a sixth pluggable backend; a GPU
 byte-equality claim before S5.
+
+## 9. The Ballista extension (U8a, U8b)
+
+**Discipline.** `jammi-kernels` extends candle at the seam candle exposes (`CustomOp1/2/3`), keeps
+one call path, vendors verbatim at a pinned version only where no seam exists
+(`third_party/flash-attention`, `VENDORED.md`), and believes nothing before its oracles pass.
+`jammi-ballista` follows the same discipline; the crate is not a leaf (it encodes jammi
+operators and hosts the model cache and catalog) — it sits between `jammi-ai`/`jammi-db` and
+`jammi-server`, publishable and lockstep, with no cargo feature.
+
+**Seams used (Ballista 54.1, read from source 2026-09-10).**
+
+| Gap 68 named | Seam | What jammi installs |
+|---|---|---|
+| operators cross the wire | `SchedulerConfig.override_{logical,physical}_codec`, `ExecutorProcessConfig.override_*_codec` | `JammiCodec`: `InferenceExec`, `AnnSearchExec`, `AsofJoinExec`, `GangExec` ↔ the U5 descriptor messages |
+| no executor-side state across plans | `ExecutorProcessConfig.override_execution_engine: Option<Arc<dyn ExecutionEngine>>`; `create_query_stage_exec(job, stage, task, partitions, plan, work_dir, config)` rewrites `ShuffleReaderExec` nodes and wraps the writer | `JammiExecutionEngine`: model cache held across plans, device pinned to `[gpu] devices`, shuffle writer/reader chosen here (object-store shuffle is at this seam) |
+| cluster state in memory only | `ClusterState` + `JobState` traits; `BallistaCluster::new(Arc<dyn ClusterState>, Arc<dyn JobState>)`; `start_server(cluster, addr, config)` | U8a: Ballista's in-memory state. U8b: `CatalogClusterState`/`CatalogJobState` over jammi's catalog (tables from the `ballista_state` migration) — persistent, multi-scheduler (Spice's HA at the seam) |
+| no accelerator dimension | `ClusterState::bind_schedulable_tasks(distribution, active_jobs, executors) -> Vec<BoundTask>`; `TaskDistributionPolicy::Custom(Arc<dyn DistributionPolicy>)` | `DevicePlacement`: executor id ↔ `workers.devices`; a GPU stage binds only to a device-bearing executor. The `ExecutorSpecification { vcores }` proto has no attribute slot: the accelerator dimension is the one upstream PR 67 owes |
+| task retry rejoins a dead gang | `SchedulerConfig.task_max_failures`, `stage_max_failures` (global) | both 0: retries are the jobs table's |
+| scheduler control loop | `expire_dead_executors` starts in `init()` | membership liveness, the class of `reclaim_expired_jobs`/`prune_instances`; with retries off it never makes consumer work runnable |
+| push launching, transport | `TaskLauncher`, `override_create_grpc_client_endpoint`, `use_tls` | as needed; not in v1 |
+
+**Roles.** Listener-shaped knobs: a replica hosts a scheduler iff `[ballista] scheduler_bind` is
+set, an executor iff `[ballista] executor.scheduler_address` is set; both may be set on one
+process; unset = single node. Same class as `peer_bind` and `health_listen`.
+
+**Gang under Ballista.** One task: `GangExec` (single partition) whose `execute` runs the U5b
+coordinator; `DevicePlacement` puts it on a device-bearing executor; the ranks are fleet members
+reached over `peer_bind` as in U5b. Bytes equal U5b's (K4 shape). A gang stage kind in Ballista
+stays a future upstream option, not a dependency.
+
+**Oracles.** Codec round-trip for every operator; an embedding job via `submit_physical_plan`
+across two executors byte-identical to U6's peer path; a W=2 gang job through the scheduler
+byte-identical to U5b's and never task-retried; killing an executor mid-gang fails the job and
+requeues it through jammi's lease path; U8b: scheduler restart keeps executors and jobs; a GPU
+stage never binds to a device-less executor.
+
+**Spice's fork, for the record.** Multi-active HA via object-store state, object-store shuffle,
+mTLS, bidirectional control streams, catalog/UDF sync, their own shuffle format; one binary with
+`--role scheduler`; batch only; no GPU; upstreaming planned, none landed. jammi's version keeps
+HA state at the `ClusterState` seam on the catalog and forks nothing.
 
 ## References
 
@@ -265,4 +334,6 @@ byte-equality claim before S5.
 - datafusion-distributed — https://github.com/datafusion-contrib/datafusion-distributed
 - cudarc `nccl` — https://docs.rs/cudarc/latest/cudarc/nccl/index.html ; candle-core 0.11 `nccl = ["cuda", "cudarc/nccl"]`
 - candle `llama_multiprocess` — https://github.com/huggingface/candle/blob/main/candle-examples/examples/llama_multiprocess/main.rs
+- Ballista 54.1 seams (read from source 2026-09-10): `ballista/scheduler/src/cluster/mod.rs` (`ClusterState`, `JobState`, `DistributionPolicy`), `scheduler/src/config.rs` (`TaskDistributionPolicy::Custom`, `task_max_failures`), `scheduler/src/scheduler_process.rs` (`start_server(cluster, …)`), `scheduler/src/scheduler_server/mod.rs` (`new_with_task_launcher`, `expire_dead_executors`), `executor/src/executor_process.rs` (`override_execution_engine`), `executor/src/execution_engine.rs` (`ExecutionEngine`, reader rewrite), `core/src/serde/scheduler/mod.rs` (`ExecutorSpecification`)
+- Apache Ballista at Spice AI — https://spice.ai/blog/apache-ballista-at-spice-ai
 - Gather-with-local-backward for in-batch-negative losses under data parallelism: the pattern behind sentence-transformers' cached/gathered MNRL and `torch.distributed.nn.all_gather` usage; here each rank computes the full loss, so no backward communication is needed.

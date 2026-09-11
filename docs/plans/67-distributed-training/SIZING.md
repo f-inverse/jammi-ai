@@ -1,113 +1,70 @@
-# SIZING — how the units were cut, ordered and grouped (#500), v3
+# SIZING — how the units were cut, ordered and grouped (#500), v4
 
-The user asked for the sizing itself to go through the rigor chain. This file records the
-dimensions, the alternatives, the choice, and what the sizing pressure-test changed (PRESSURE.md).
+v3.1's dimensions D1–D10, alternatives 1–6 and the producer/consumer cuts stand (PRESSURE.md
+records them). v4 adds the sibling-plan edges, the substrate change and the Ballista extension.
 
-## Dimensions
+## Order against the sibling work (measured)
 
-| # | Dimension | What it decides |
-|---|---|---|
-| D1 | Seam overlap (files, crates) | Units sharing files ship as ordered commits of one PR; never split a file across **concurrently open** PRs; a file crossing sequential PRs carries a recorded co-ownership row with its order. |
-| D2 | Independent RED oracle | A unit is the smallest change whose acceptance is RED at base and GREEN after, asserting a criterion. The producer/consumer seam is a valid cut. |
-| D3 | Lane | Hermetic / cookbook / distributed (manual dispatch, nightly) / gpu-gang pod / gpu-gang cluster. A unit whose proof needs a lane is committed after the lane unit. |
-| D4 | Dependency edges | Topological order; waves. |
-| D5 | Risk-first | Premises that could kill the design are reproduced by spikes before the expensive units. |
-| D6 | Bisectability | One commit per unit; each commit passes the full gate. Artifacts produced by a lane land in a follow-up commit of the lane unit, never inside the compute unit's commit. |
-| D7 | CI iteration cost | Few PRs. |
-| D8 | Concurrency | Seam-disjoint units run in separate worktrees by different owners; no unit hides a serial handoff inside itself. |
-| D9 | Hardware cost and availability | GPU legs label-triggered; cluster leg after the pod leg is green; A100 cluster stock MEDIUM on 2026-09-10. |
-| D10 | Greenfield blast radius | Identity changes are breaking for existing catalogs; migrations append-only (K5); no shims. |
+`feat/deploy-shapes-C-jobs` @ 95993a06 versus main 7561658e: 242 files, +21 704 / −7 921 lines,
+both `Cargo.toml` and `Cargo.lock`, seven crates (`jammi-ai` 71 files, `jammi-server` 39,
+`jammi-db` 39, `jammi-python` 11, `jammi-wire` 10, …). Every 68 unit cuts after it.
 
-## Alternatives considered
-
-1. **One PR for everything.** Rejected: a long-lived shared base branch would force every
-   unit's worktree off `main` for the whole program (D8), and the hardware artifacts would
-   have nowhere to land between proofs (D6). (The earlier "two API lines" reason was wrong —
-   ordered commits already prevent that — and is withdrawn.)
-2. **One PR per unit (thirteen PRs).** Rejected on D7 and D1: U2b/U3/U4b share `trainer.rs`,
-   `worker.rs` and `manifest.rs`; U5b/U6 share `worker.rs` and the harness.
-3. **Ladder-per-PR** with the training-set and identity rebuild folded into the multi-GPU PR.
-   Chosen. Honest reasons per boundary: PR-A because a base branch carrying a workspace-wide
-   API bump must not be the parent of every other worktree; PR-B and PR-C on reviewability
-   (each ≈ 6–7 commits) plus hardware-proof adjacency (the pod leg proves PR-B, the cluster leg
-   proves PR-C); PR-D because U8 introduces a new optional dependency tree (Ballista crates,
-   `deny.toml`, a new clippy lane) best reviewed in isolation and is the user's completion gate.
-   A lead who prefers may fold PR-D into PR-C; nothing requires the split by construction.
-4. **Gang first, identity later.** Rejected on D1 (double write of `trainer.rs`/`worker.rs`),
-   not on oracle definability: U4a's oracles need no loader and are scheduled early; U4b's
-   need the partition rule, which is U2b.
-5. **Skip the DataFusion upgrade until Ballista.** Rejected: arrow 57 → 58 crosses every
-   `RecordBatch` site U2 and U6 touch (`worker.rs:1620-1762`, the operator layer); the upgrade
-   is isolated and goes first, sized by S3.
-6. **No cut inside U2/U4/U5.** Rejected by the sizing pressure-test: the producer/consumer
-   seam (U2a/U2b), the trait/rank-context seam (U4a/U4b) and the service/coordinator seam
-   (U5a/U5b) each yield a compiling, gate-passing, bisectable intermediate with its own RED
-   oracle and restore real concurrency (U4a ∥ U2a; U7b ∥ U5a).
-
-## The schedule
+- **PR-C first, then PR-A.** U1 is mechanical and cheap to redo on top of PR-C; asking PR-C's
+  26 commits to rebase onto a workspace-wide API bump is the expensive direction. (D1, D7.)
+- **Edges into 68**: U5a needs DIST unit 1 (`peer_bind`); U5b needs DIST unit 2
+  (`instances.peer_addr`) and OPS (`release_job_lease`, drain hooks); U9 needs K (the shape-d
+  overlay). U2a no longer needs OPS C1 (`job_attempt: None`).
+- **Migrations**: 67 appends three (`model_materialization` U3, `workers_devices` U4a,
+  `ballista_state` U8b), numbered at rebase after 68's five; K5 renumber-on-second-merge.
 
 ```
-PR-A  [U1]                                            S3 sizes it; S1, S2, S4, S5 run concurrently (no PR)
-PR-B  U7a ∥ U2a ∥ U4a  →  U2b ∥ U3  →  U4b  →  artifact      commits: U7a, U2a, U4a, U2b, U3, U4b, artifact
-PR-C  U7b ∥ U5a  →  U6  →  U5b  →  artifact                   commits: U7b, U5a, U6, U5b, artifact
-PR-D  U8 → U9                                                  U8 is the completion gate
+PR-C(68) → PR-A [U1] → K, DIST-1 (68) → PR-B [U7a ∥ U2a ∥ U4a → U2b ∥ U3 → U4b → artifact]
+        → DIST-2, OPS (68) → PR-C(67) [U7b ∥ U5a → U6 → U5b → artifact]
+        → PR-D [U8a → U8b → U9]           (DELTA, GRAPH (68) are independent of 67)
 ```
 
-Serial edges: U1 → everything (API line); U2a → U2b, U3; U4a → U2b (the `world` argument);
-U2b + U3 + U4a → U4b; U4a → U5a; U2b + U5a → U6; U4b + U5a + U6 → U5b; U5b + U6 → U8.
+Serial edges: PR-C(68) → U1 → everything; U2a → U2b, U3; U4a → U2b (the `world` argument);
+U2b + U3 + U4a → U4b; U4a + DIST-1 → U5a; U2b + U5a → U6; U4b + U5a + U6 + DIST-2 + OPS → U5b;
+U1 + U5b + U6 + S6 → U8a; U8a + U4a → U8b; K → U9.
 
-Co-ownership recorded (order = commit order): `manifest.rs` (U2a, U3, U4b — U3's completeness
-test is extended by U4b); `pipeline/recompute.rs` (U2a re-materialize arm, U3 retrain arm);
-`worker.rs` (U2a/U2b own `run_spec`; U4b adds the rank spawn in `run_spec`; U3 owns
-`publish_and_finalize`; U5b owns the coordinator region; U6 owns the head-target arm at
-`run_fine_tune_blocking`); `trainer.rs` (U2b, U4b); `fine_tune/collective/mod.rs` (U4a creates,
-U5b adds `peer.rs`); `config/mod.rs` (U4a then U5a); `runpod_lib.sh`, `gpu-gang.yml` and the reachability
-allowlist (U7a then U7b); `wire/training.rs` + `training.proto` (U4a, wire-server co-owner); `crates/jammi-server/src/runtime.rs` (U5a mount, U8 roles);
-`tests/distributed/{main.rs, harness.rs}` and `distributed.yml` (U5b, then U8);
-`docs/maintainer/MAINTAINER-GUIDE.md` variant block (U2a, U3; U9 prose only);
-`crates/jammi-wire/src/embedding.rs` (U2a) and `crates/jammi-wire/build.rs` (U5a).
+## Alternatives added in v4
 
-PR bases: PR-A from `main`; PR-B from `main` after PR-A merges; PR-C after PR-B; PR-D after
-PR-C. No PR stacks on an unmerged PR. Parallel worktrees inside a PR are rebased onto the PR
-branch in the stated commit order before the gate run that counts.
+7. **PR-A before PR-C.** Rejected on the measurement above.
+8. **Static peer list in `[worker]`.** Rejected: 68 DIST D9 already owns membership
+   (`peer_advertise` → `instances.peer_addr`); two membership mechanisms would be a knob 67 does
+   not need. Cost: U5b waits for DIST unit 2.
+9. **Keep U8 as one unit / demote it to a conformance proof.** Rejected: the seams verified at
+   source carry the codec + engine + roles (U8a) and the persistent, device-aware cluster state
+   (U8b) as two RED-able units, and the user's decision keeps Ballista mandatory. The
+   demotion proposal is withdrawn.
+10. **`jammi-ballista` as a `jammi-server` module or behind a cargo feature.** Rejected: B4's
+    anchor forbids a library-vs-server feature gate; a crate lets a library embedder host the
+    roles too; publishable and lockstep like every workspace crate.
+11. **Gang ranks as Ballista tasks with all-or-nothing binding.** Rejected for v1: it would be a
+    second gang mechanism with its own K4 oracle; the gang is one placed task (README r41).
 
-## Size and owner map
+## Size and owner map (deltas from v3.1)
 
-| Unit | Size | Owners | Worktree |
+| Unit | Size | Owners | Note |
 |---|---|---|---|
-| U1 | L (XL if S3 needs API rework) | docs-ci + db + every crate owner for fixes | one shared worktree, one commit |
-| U7a | L | docs-ci | own |
-| U2a | M | db + ai-core + wire-server (enum mirror) | own |
-| U4a | L | ai-core (+ db config) | own |
-| U2b | XL | ai-core (+ db reader) | own |
-| U3 | L | db + ai-core | own |
-| U4b | XL | ai-core | own |
-| U7b | M | docs-ci | own |
-| U5a | L | wire-server (+ db config) | own |
-| U6 | L | ai-core (+ db sink) | own |
-| U5b | XL | ai-core + wire-server | own |
-| U8 | L | wire-server + ai-core + docs-ci | own |
-| U9 | S | docs-ci / doc-updater | own |
+| U4a | L | ai-core + db (+ wire-server co-owner for the spec field) | adds the `workers_devices` migration |
+| U5a | L | wire-server + ai-core | on the peer listener; carries DIST's listener commit only if DIST-1 is unmerged |
+| U5b | XL | ai-core + wire-server + db | membership, released-vs-failed |
+| U8a | L | wire-server + ai-core + docs-ci | new crate |
+| U8b | L | wire-server + db | the completion gate |
+| U9 | M | docs-ci / doc-updater | shape-d overlay after K |
 
-U2b and U5b remain XL because their acceptance criteria are not separable further: a loader
-that streams for some heads is not an acceptance; a coordinator without the chaos leg has no
-failure oracle.
+Co-ownership additions: `crates/jammi-db/src/config/mod.rs` (68 DIST `peer_bind`, then 67 U4a
+`[worker]` fields, then U8a `[ballista]`); `crates/jammi-server/src/runtime.rs` (DIST peer routes,
+then U5a, then U8a); `crates/jammi-server/tests/it/tenant_isolation_oracle.rs` and
+`api_freeze_baseline.txt` (DIST's PEER bucket, then U5a's GANG bucket);
+`deploy/kubernetes/overlays/shape-d/**` (K, then U9); `crates/jammi-db/src/catalog/jobs_repo.rs`
+(OPS `release_job_lease`, then U5b reads, then U4a `WorkerRecord.devices`).
 
-## Spikes (results in the ledger before the dependent unit is briefed)
+## Spikes
 
-- **S1** (→ U4a, U5b): `candle-core = { features = ["cuda", "nccl"] }` on the S4 2-GPU pod;
-  `Comm::from_devices` over two candle CUDA devices; `all_reduce_in_place` on a candle tensor's
-  storage equals the CPU sum for f32 sums of two operands; `all_gather` on a candle tensor's
-  storage with equal and unequal counts in rank-ordered concat layout; a two-process
-  `Comm::from_rank` rendezvous (id passed out of band) on the same pod.
-- **S2** (→ U8): a scratch crate on Ballista 54.1 registers a `PhysicalExtensionCodec` via
-  `with_ballista_physical_extension_codec`, executes a custom `ExecutionPlan` on an executor
-  process, and sets task retry attempts to 0 per job.
-- **S3** (→ U1): a throwaway workspace compile on datafusion 54 / arrow 58 / object_store 0.13
-  including `-p jammi-db --features postgres,mysql` and `pyo3-arrow`; record the delta.
-- **S4** (→ U7a/U7b): one 2-GPU pod through a `gpuCount: 2` variant of `rp_deploy_live`; a
-  create-cluster reachability and teardown probe (≈ one $3 pod-hour + cluster minutes; spends
-  real money — human-approved before it runs).
-- **S5** (→ U4b/U5b GPU oracles): CUDA bit-reproducibility with the flash deterministic path
-  forced, `CUBLAS_WORKSPACE_CONFIG` set and NCCL channels pinned; decides whether GPU byte
-  oracles are promoted from digest-pair records.
+S1, S3 (on top of PR-C), S4, S5 as in v3.1; **S6** (supersedes S2): a scratch crate on Ballista
+54.1 installing `override_execution_engine`, a custom `ClusterState`/`JobState` through
+`start_server(cluster, …)`, and the codec; run a custom `ExecutionPlan` on one scheduler + two
+executors; confirm `task_max_failures = 0` disables retry and that `expire_dead_executors` only
+removes executors. Results in the ledger before U8a is briefed.

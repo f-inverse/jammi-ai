@@ -284,6 +284,86 @@ async fn stop_and_join_returns_within_idle_poll_when_idle() {
 }
 
 // ---------------------------------------------------------------------------
+// O2 — a cancelled `stop_and_join` must not detach the loop task
+// ---------------------------------------------------------------------------
+
+/// F1's embedded (non-server) arm. `stop_and_join` awaits the in-flight
+/// job's own terminal `LoopState` for however long that job takes (D4) —
+/// exactly the shape a `tokio::select!`/`tokio::time::timeout` can cancel
+/// mid-await, the way `runtime.rs`'s RELEASE arm cancels a DRAIN's
+/// `stop_and_join` when a second signal races it. Cancelling it here (via
+/// `timeout`, the library-level equivalent of that `select!`) must NOT
+/// detach the loop task: dropping the guard afterwards must still find it
+/// and abort it — never a bare `None` with nothing left to do. `nothing
+/// outlives session.close()`: closing the session after the abort does not
+/// hang, and the row is left exactly where the abort left it (no detached
+/// finalize lands afterward).
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn dropping_the_guard_after_a_cancelled_stop_and_join_aborts_the_task() {
+    let (session, _dir) = session(FAST_TIMING).await;
+    let handle = session.enqueue(fine_tune(20_000), 0).await.unwrap();
+    let worker = spawn_worker(&session);
+    let shared = shared_of(&worker);
+    wait_in_flight(&shared, 1).await;
+
+    // Cancel `stop_and_join` long before a 20 000-epoch job could possibly
+    // finish: its future is dropped while suspended awaiting the loop's
+    // terminal state.
+    let cancelled = tokio::time::timeout(Duration::from_millis(200), worker.stop_and_join()).await;
+    assert!(
+        cancelled.is_err(),
+        "the job must still be running well past 200ms; stop_and_join must not have completed"
+    );
+    assert_eq!(
+        shared.loop_state(),
+        LoopState::Running,
+        "the cancelled call alone must not touch the loop -- only Drop (or a later \
+         release_and_stop) may abort it"
+    );
+
+    // The sole `Arc` on the guard — dropping it runs `EmbeddedWorker::drop`,
+    // which must find `LoopTask::Abandoned` (not a lost, bare `None`) and
+    // abort the task.
+    assert_eq!(
+        Arc::strong_count(&worker),
+        1,
+        "the test must hold the only strong reference for `drop` below to actually run"
+    );
+    drop(worker);
+
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(FAST_TIMING.heartbeat + 10);
+    loop {
+        if shared.loop_state() != LoopState::Running {
+            break;
+        }
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "the loop task was never aborted -- it is still running, detached"
+        );
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    assert_eq!(
+        shared.loop_state(),
+        LoopState::Aborted,
+        "Drop must ABORT a handle it reclaims from an abandoned stop attempt, not let it \
+         return cooperatively"
+    );
+
+    let row = session.catalog().get_job(&handle.job_id).await.unwrap();
+    assert_eq!(
+        row.status,
+        JobStatus::Running.to_string(),
+        "the abort leaves the row exactly where it was -- no detached finalize lands"
+    );
+
+    // Nothing outlives `session.close()`: closing does not hang on the
+    // aborted loop's still-running `spawn_blocking` trainer.
+    tokio::time::timeout(Duration::from_secs(30), session.close())
+        .await
+        .expect("session.close() must not hang on the aborted loop's detached trainer");
+}
+
+// ---------------------------------------------------------------------------
 // RELEASE — in flight
 // ---------------------------------------------------------------------------
 

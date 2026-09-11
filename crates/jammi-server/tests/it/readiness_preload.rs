@@ -380,3 +380,48 @@ async fn signal_during_preload_exits_without_serving() {
         park.release();
     }
 }
+
+/// O4/W2: `ShutdownOutcome::Released` must come from a path that actually
+/// issued the release mechanism — not merely from whichever signal happened
+/// to preempt the preload. Arms the `ReleaseAt2e` rendezvous (the first
+/// statement of `EmbeddedWorker::release_and_stop`'s 2e) before sending the
+/// release signal: base called `stop_and_join` unconditionally on this arm,
+/// so 2e is never reached and the rendezvous never fires, even though the
+/// returned outcome already read `Released`.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn release_signal_during_preload_actually_releases() {
+    let dir = tempfile::TempDir::new().unwrap();
+    let source_key = ModelSource::parse(&tiny_bert()).to_string();
+    let load_park = preload_test_hooks::arm(&source_key, preload_test_hooks::ParkPoint::BeforeLoad);
+    let served = serve(config(
+        dir.path(),
+        vec![PreloadEntry {
+            id: tiny_bert(),
+            task: Some(ModelTask::TextEmbedding),
+        }],
+    ))
+    .await;
+    load_park.wait_parked().await;
+    wait_worker_state(&served.session, "warming").await;
+    let instance_id = served.session.instance_id().to_string();
+    let release_fired = jammi_ai::fine_tune::worker::loop_test_hooks::arm_rendezvous(
+        &instance_id,
+        jammi_ai::fine_tune::worker::loop_test_hooks::Rendezvous::ReleaseAt2e,
+    );
+
+    let _ = served.release_tx.send(true);
+
+    tokio::time::timeout(Duration::from_secs(10), release_fired.wait_fired())
+        .await
+        .expect(
+            "the preload-exit RELEASE arm must call release_and_stop (2e fires the rendezvous), \
+             not stop_and_join",
+        );
+    let outcome = tokio::time::timeout(Duration::from_secs(60), served.task)
+        .await
+        .unwrap()
+        .unwrap()
+        .unwrap();
+    assert_eq!(outcome, ShutdownOutcome::Released);
+    load_park.release();
+}

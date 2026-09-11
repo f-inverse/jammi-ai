@@ -899,12 +899,26 @@ impl BoundServer {
             };
             if let Some(early) = early {
                 readiness.begin_drain();
+                // W2: `ShutdownOutcome::Released` is only honest coming from
+                // a path that actually issued the release statements — the
+                // gate was closed throughout preload so nothing was ever
+                // claimed, but the outcome still must reflect what this arm
+                // DID, not merely which signal fired.
+                let is_release = matches!(early, Ok(ShutdownOutcome::Released));
                 if let Some(w) = worker.as_ref() {
                     // The gate is closed, so the loop returns without a
-                    // claim; the join orders the row's delete after the
-                    // task's own upsert.
-                    if let Err(e) = w.stop_and_join().await {
+                    // claim; the join (or release) orders the row's delete
+                    // after the task's own upsert.
+                    if is_release {
+                        if let Err(e) = w.release_and_stop().await {
+                            tracing::error!(error = %e, "preload exit: the worker release failed");
+                        }
+                    } else if let Err(e) = w.stop_and_join().await {
                         tracing::error!(error = %e, "preload exit: the worker join failed");
+                    }
+                } else if is_release {
+                    if let Err(e) = session.release_job_leases().await {
+                        tracing::error!(error = %e, "preload exit: releasing this worker-less process's leases failed");
                     }
                 }
                 let _ = health_stop_tx.send(());

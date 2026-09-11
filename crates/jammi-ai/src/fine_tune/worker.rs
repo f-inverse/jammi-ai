@@ -253,7 +253,7 @@ impl WorkerPhase {
 }
 
 /// What the loop task is doing, as observed through a `watch` the in-task
-/// [`LoopExitGuard`] writes on EVERY exit path — a writer placed after the
+/// `LoopExitGuard` writes on EVERY exit path — a writer placed after the
 /// loop's `.await` would never run when the task is aborted or panics, a
 /// `Drop` guard always does. `Stopped` is the cooperative return (the stop
 /// flag, the gate refusing, or the session dropping); `Aborted` is the task
@@ -277,8 +277,8 @@ pub enum LoopState {
 ///   so a stop set during the sleep wakes the loop at once and a receiver
 ///   subscribed after the send still resolves — a wakeup cannot be lost.
 /// * `in_flight` counts loop-claimed jobs running under a live hold
-///   (incremented by [`register_job_hold_or_release`] on its `Some` path,
-///   decremented by the [`InFlightGuard`] bound beside the hold). Invariant:
+///   (incremented by `register_job_hold_or_release` on its `Some` path,
+///   decremented by the `InFlightGuard` bound beside the hold). Invariant:
 ///   `in_flight > 0` ⇒ the loop is inside a job, not inside `claim_next`.
 ///   An inline `run_now` registers its own hold and never touches this.
 /// * `state` is the [`LoopState`] watch the exit guard writes.
@@ -2048,6 +2048,141 @@ impl JobWorker {
     }
 }
 
+/// The loop task's lifecycle as tracked by its owning [`EmbeddedWorker`].
+///
+/// A bare `Mutex<Option<JoinHandle>>` collapses two different states into
+/// one `None`: "already gracefully joined, nothing to abort" and "taken by
+/// a `stop_and_join`/`release_and_stop` whose own future was then cancelled
+/// by ITS caller — e.g. `tokio::select!` dropping a `stop_and_join` future
+/// the instant a RELEASE signal races a DRAIN already in flight — the task
+/// is still running (or was, at the moment we lost track of it) and an
+/// abort is exactly what is owed. A bare `JoinHandle` drop DETACHES rather
+/// than aborts, so that collapse let the loop run on, undetected, past a
+/// DRAIN-then-RELEASE (SIGTERM-then-SIGINT): `release_and_stop`'s 2e found
+/// `None` (already taken, never restored) and skipped its abort arm
+/// entirely, and `Drop` found `None` too.
+///
+/// [`TakenHandle`] is the only way to read a `JoinHandle` out of this type:
+/// on ordinary completion (join or an explicit synchronous abort) it leaves
+/// the slot `Joined`; if the `TakenHandle`'s OWN holder is dropped before
+/// that — the caller's future was itself cancelled while suspended on it —
+/// its `Drop` puts the handle back as `Abandoned`, never losing it to a
+/// bare detach.
+enum LoopTask {
+    /// The task is (as far as this guard knows) still running, and nothing
+    /// has yet tried to stop it.
+    Running(tokio::task::JoinHandle<()>),
+    /// The handle was fully disposed of — cooperatively joined, or aborted
+    /// synchronously by whichever caller last held it. Nothing owed.
+    Joined,
+    /// A previous attempt to stop the task (`stop_and_join` or
+    /// `release_and_stop`) was itself cancelled while it held the handle,
+    /// before it could join or abort it. The task's exact state is now
+    /// unknown, so the next caller that observes this must abort
+    /// unconditionally rather than retry the cooperative dance — always
+    /// safe here (an abort can only land before a claim's `COMMIT`, which
+    /// always rolls back, or between `COMMIT` and hold registration, which
+    /// the reclaim path recovers with `attempts + 1`, never `failed`;
+    /// §3.4 2e / §3.5 outcome (iii)).
+    Abandoned(tokio::task::JoinHandle<()>),
+}
+
+/// Takes the current [`LoopTask`]'s handle out of `slot` for direct
+/// manipulation (join or abort), replacing the slot with `Joined`
+/// provisionally. Implements [`Future`](std::future::Future) so `.await`ing
+/// one directly resolves once the underlying task returns; if the future
+/// awaiting it is itself dropped first (a `tokio::select!` losing a race),
+/// [`Drop`] restores the handle into the slot as `LoopTask::Abandoned`
+/// rather than letting the bare `JoinHandle` drop DETACH the task. Calling
+/// [`Self::abort_now`] instead performs a synchronous abort with no `.await`
+/// in between the take and the abort, so no external cancellation can land
+/// in the gap.
+struct TakenHandle<'a> {
+    slot: &'a std::sync::Mutex<LoopTask>,
+    handle: Option<tokio::task::JoinHandle<()>>,
+    /// Whether this handle was reclaimed from a previously `Abandoned`
+    /// slot, as opposed to a fresh `Running` one — `release_and_stop`'s 2e
+    /// always aborts a reclaimed handle rather than re-attempting the
+    /// cooperative wait, since the task's state is unknown.
+    reclaimed: bool,
+}
+
+impl<'a> TakenHandle<'a> {
+    /// `None` when the slot is already `Joined` (nothing to take).
+    fn take(slot: &'a std::sync::Mutex<LoopTask>) -> Option<Self> {
+        let mut guard = slot
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let (handle, reclaimed) = match std::mem::replace(&mut *guard, LoopTask::Joined) {
+            LoopTask::Running(h) => (Some(h), false),
+            LoopTask::Abandoned(h) => (Some(h), true),
+            LoopTask::Joined => (None, false),
+        };
+        drop(guard);
+        handle.map(|handle| Self {
+            slot,
+            handle: Some(handle),
+            reclaimed,
+        })
+    }
+
+    /// Whether this handle came from a slot a previous caller abandoned
+    /// mid-stop.
+    fn reclaimed(&self) -> bool {
+        self.reclaimed
+    }
+
+    /// Abort the task now, synchronously — no `.await` between taking the
+    /// handle and issuing the abort, so this cannot itself be interrupted
+    /// by an external cancellation. Leaves the slot `Joined`.
+    fn abort_now(mut self) {
+        if let Some(handle) = self.handle.take() {
+            handle.abort();
+        }
+    }
+}
+
+impl<'a> std::future::Future for TakenHandle<'a> {
+    type Output = std::result::Result<(), tokio::task::JoinError>;
+
+    fn poll(
+        self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<Self::Output> {
+        // `TakenHandle` is `Unpin` (every field is), so projecting through
+        // the pin is just a reborrow.
+        let this = self.get_mut();
+        let handle = this
+            .handle
+            .as_mut()
+            .expect("TakenHandle polled after its handle was already taken");
+        match std::pin::Pin::new(handle).poll(cx) {
+            std::task::Poll::Ready(result) => {
+                // Consumed to completion: `Drop` below finds `None` and
+                // leaves the slot `Joined` (already set at `take`).
+                this.handle = None;
+                std::task::Poll::Ready(result)
+            }
+            std::task::Poll::Pending => std::task::Poll::Pending,
+        }
+    }
+}
+
+impl<'a> Drop for TakenHandle<'a> {
+    fn drop(&mut self) {
+        if let Some(handle) = self.handle.take() {
+            // Still holding an un-joined, un-aborted handle: our OWN holder
+            // (the `stop_and_join`/`release_and_stop` future this lived
+            // inside) was cancelled before finishing with it. Restore it
+            // rather than letting it detach.
+            *self
+                .slot
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner) = LoopTask::Abandoned(handle);
+        }
+    }
+}
+
 /// An RAII guard owning an embedded [`JobWorker`]'s background task, and
 /// the process's handle on its two shutdown modes.
 ///
@@ -2066,16 +2201,17 @@ impl JobWorker {
 ///   only cancels it at the next `.await` point; a run already on the
 ///   blocking pool proceeds to completion and writes its terminal status
 ///   (the lease-guarded finalize) *after* this guard has dropped — detached
-///   from the guard's lifetime. After either graceful path `Drop` finds no
-///   task left and no-ops.
+///   from the guard's lifetime. After either graceful path, or a reclaimed
+///   `Abandoned` handle, `Drop` aborts it (or finds `Joined` and no-ops).
 pub struct EmbeddedWorker {
-    /// `None` once [`Self::stop_and_join`] or [`Self::release_and_stop`] has
-    /// taken it — the marker `Drop` checks to skip its own abort. Guarded by
-    /// a `Mutex` rather than consuming `self` because both take `&self`: the
-    /// owning `Database` binding wants to signal-and-await without giving up
-    /// the guard itself (its `Drop` must still run at the connection's own
-    /// end of life).
-    handle: std::sync::Mutex<Option<tokio::task::JoinHandle<()>>>,
+    /// [`LoopTask::Joined`] once [`Self::stop_and_join`] or
+    /// [`Self::release_and_stop`] has fully disposed of the handle — the
+    /// state `Drop` checks to skip its own abort. Guarded by a `Mutex`
+    /// rather than consuming `self` because both take `&self`: the owning
+    /// `Database` binding wants to signal-and-await without giving up the
+    /// guard itself (its `Drop` must still run at the connection's own end
+    /// of life).
+    handle: std::sync::Mutex<LoopTask>,
     /// The state shared with the loop task: phase, stop, in-flight count,
     /// loop state.
     shared: Arc<WorkerShared>,
@@ -2131,7 +2267,7 @@ impl EmbeddedWorker {
             every,
         ));
         Ok(Self {
-            handle: std::sync::Mutex::new(Some(handle)),
+            handle: std::sync::Mutex::new(LoopTask::Running(handle)),
             shared,
             catalog: Arc::clone(session.catalog_arc()),
             instance_id: session.instance_id().to_string(),
@@ -2158,13 +2294,6 @@ impl EmbeddedWorker {
     /// owner.
     pub fn shared(&self) -> Weak<WorkerShared> {
         Arc::downgrade(&self.shared)
-    }
-
-    fn take_handle(&self) -> Option<tokio::task::JoinHandle<()>> {
-        self.handle
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .take()
     }
 
     /// Begin a DRAIN: phase `Draining` (a later RELEASE still wins), stop
@@ -2220,9 +2349,15 @@ impl EmbeddedWorker {
     /// as a claimant (the `instances` row stays — the process itself is
     /// alive). Ordered after the loop task's own `upsert_worker` by
     /// construction: the task has exited before the delete runs.
+    ///
+    /// Cancel-safe: if THIS future is dropped before it returns (a caller's
+    /// `tokio::select!` losing a race — e.g. a RELEASE signal preempting a
+    /// DRAIN already awaiting this), the handle is never lost to a bare
+    /// detach. `TakenHandle` restores it as `LoopTask::Abandoned`, and the
+    /// next `release_and_stop` (2e) or `Drop` aborts it unconditionally.
     pub async fn stop_and_join(&self) -> Result<StopOutcome> {
         self.shared.request_stop();
-        let Some(handle) = self.take_handle() else {
+        let Some(taken) = TakenHandle::take(&self.handle) else {
             return Ok(StopOutcome::NothingToJoin);
         };
         let mut state_rx = self.shared.state_receiver();
@@ -2233,7 +2368,7 @@ impl EmbeddedWorker {
         // a panic — the guard reports `Failed`) or the task having been
         // aborted by a concurrent `Drop` — either is a genuine defect worth
         // surfacing, not swallowing.
-        handle
+        taken
             .await
             .map_err(|e| JammiError::FineTune(format!("training worker task join error: {e}")))?;
         self.stop_sampler();
@@ -2249,7 +2384,7 @@ impl EmbeddedWorker {
     /// In order:
     ///
     /// * **2a** phase `Releasing` — from this instant a claim that lands runs
-    ///   into [`register_job_hold_or_release`], which self-releases instead of
+    ///   into `register_job_hold_or_release`, which self-releases instead of
     ///   dispatching.
     /// * **2b** the keeper releases every `Job` hold it holds
     ///   (`LeaseKeeper::release_job_holds`, bounded by one heartbeat): the
@@ -2259,21 +2394,28 @@ impl EmbeddedWorker {
     ///   let a detached trainer write a doomed epoch into the shared
     ///   `_resume` prefix. `ResultTable` holds are never touched (2c).
     /// * **2c** sweep #1: the jobs sweep, then the jobs-linked building-table
-    ///   sweep ([`release_sweep`]) — covering a claim or a building row that
+    ///   sweep (`release_sweep`) — covering a claim or a building row that
     ///   committed after 2b snapshotted. The loop's own `ResultTable` hold
     ///   flips `lost` through the keeper's guarded renewal within one
     ///   heartbeat.
     /// * **2d** stop — the loop cannot enter a new `claim_next`; a claim
     ///   already in flight began before this.
-    /// * **2e** `in_flight == 0`: the loop is idle, inside
-    ///   `reclaim_expired_jobs`/`claim_next`, or in the claim→hold prologue —
-    ///   never abort while a claim transaction can be in flight; wait one
-    ///   heartbeat for the cooperative exit, joining the task on it. On
-    ///   timeout, abort (outcome (iii): a claim between COMMIT and hold
-    ///   registration keeps its live lease and is recovered by the expiry
-    ///   path with `attempts + 1`, never `failed`). `in_flight > 0`: the loop
-    ///   is inside a job under a hold, not inside `claim_next` — abort now;
-    ///   the dropped future runs the hold's and the watcher's `Drop`.
+    /// * **2e** total match on the loop task's state: a handle `Abandoned`
+    ///   by a previous stop attempt this process's own caller cancelled
+    ///   (F1 — e.g. a DRAIN's `stop_and_join` preempted by this RELEASE) is
+    ///   aborted unconditionally, since its true state is unknown and an
+    ///   abort is always safe here. A `Running` handle with `in_flight ==
+    ///   0` (the loop is idle, inside `reclaim_expired_jobs`/`claim_next`,
+    ///   or in the claim→hold prologue) is never aborted while a claim
+    ///   transaction can be in flight; wait one heartbeat for the
+    ///   cooperative exit, joining the task on it. On timeout, abort
+    ///   (outcome (iii): a claim between COMMIT and hold registration keeps
+    ///   its live lease and is recovered by the expiry path with `attempts
+    ///   + 1`, never `failed`). `in_flight > 0`: the loop is inside a job
+    ///   under a hold, not inside `claim_next` — abort now; the dropped
+    ///   future runs the hold's and the watcher's `Drop`. `Joined` is a
+    ///   no-op — nothing left to take, since a concurrent `stop_and_join`
+    ///     already completed cooperatively.
     /// * **2f** observe the terminal [`LoopState`] (the in-task guard reports
     ///   on every path).
     /// * **2g** sweep #2, unconditionally — idempotent, catches a claim or a
@@ -2308,8 +2450,19 @@ impl EmbeddedWorker {
             "the loop runs one job at a time; in_flight = {in_flight}"
         );
         let mut state_rx = self.shared.state_receiver();
-        if let Some(handle) = self.take_handle() {
-            if in_flight == 0 {
+        if let Some(taken) = TakenHandle::take(&self.handle) {
+            if taken.reclaimed() {
+                // A previous stop attempt (this process's own caller
+                // cancelled it) left the task's fate unresolved rather than
+                // losing it to a bare `JoinHandle` drop. Abort it
+                // unconditionally — see `LoopTask::Abandoned`'s doc for why
+                // this is always safe.
+                tracing::warn!(
+                    "RELEASE: a previous stop attempt was itself cancelled before observing \
+                     the loop's terminal state; aborting the loop task now"
+                );
+                taken.abort_now();
+            } else if in_flight == 0 {
                 // The watch `Ref` is dropped before the join below: a guard
                 // held across an `.await` would make this future `!Send`.
                 let exited = tokio::time::timeout(
@@ -2319,7 +2472,7 @@ impl EmbeddedWorker {
                 .await
                 .is_ok();
                 if exited {
-                    if let Err(e) = handle.await {
+                    if let Err(e) = taken.await {
                         tracing::error!(error = %e, "RELEASE: the loop task ended with a join error");
                     }
                 } else {
@@ -2327,12 +2480,10 @@ impl EmbeddedWorker {
                         bound = ?self.heartbeat,
                         "RELEASE: the loop did not exit within one heartbeat; aborting it"
                     );
-                    handle.abort();
-                    drop(handle);
+                    taken.abort_now();
                 }
             } else {
-                handle.abort();
-                drop(handle);
+                taken.abort_now();
             }
         }
         // 2f
@@ -2374,13 +2525,25 @@ impl Drop for EmbeddedWorker {
     /// type doc).
     ///
     /// No-ops the abort when [`Self::stop_and_join`] or
-    /// [`Self::release_and_stop`] already took the handle — there is nothing
-    /// left to abort, and aborting a handle that already returned would be a
-    /// silent no-op anyway, but the explicit check keeps the intent legible.
+    /// [`Self::release_and_stop`] already fully joined the task (the slot
+    /// reads `LoopTask::Joined`) — there is nothing left to abort, and
+    /// aborting a handle that already returned would be a silent no-op
+    /// anyway, but the explicit check keeps the intent legible. A
+    /// `LoopTask::Abandoned` handle — left behind by a stop attempt this
+    /// process's own caller cancelled before it could join or abort it (F1)
+    /// — is aborted here too: total match, nothing is ever silently lost to
+    /// a bare `JoinHandle` drop (which would DETACH rather than abort).
     fn drop(&mut self) {
         self.shared.request_stop();
         self.stop_sampler();
-        if let Some(handle) = self.take_handle() {
+        let task = std::mem::replace(
+            &mut *self
+                .handle
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner),
+            LoopTask::Joined,
+        );
+        if let LoopTask::Running(handle) | LoopTask::Abandoned(handle) = task {
             handle.abort();
             // The loop is gone, so the claimant row must go too. `Drop` is
             // synchronous: the delete rides a detached task on the current
@@ -6885,8 +7048,8 @@ mod tests {
         // arm directly (via the field it shares with `stop_and_join`) rather
         // than only trusting that dropping `worker` at scope-end never panics.
         assert!(
-            worker.handle.lock().unwrap().is_none(),
-            "stop_and_join must take the handle so a later Drop finds nothing to abort"
+            matches!(*worker.handle.lock().unwrap(), LoopTask::Joined),
+            "stop_and_join must leave the slot Joined so a later Drop finds nothing to abort"
         );
 
         // Idempotent: a second call finds no handle left and returns

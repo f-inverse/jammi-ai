@@ -22,6 +22,7 @@ Hermetic: the local `tiny_bert` fixture + `training_pairs.csv`, on CPU.
 from __future__ import annotations
 
 import inspect
+import json
 import sqlite3
 import subprocess
 import sys
@@ -43,25 +44,50 @@ pytestmark = pytest.mark.skipif(
 )
 
 # The successor: opens the released directory with the DEFAULT config (a
-# claiming worker, 1 s idle poll), waits long enough for its own loop to claim
+# claiming worker, 1 s idle poll), waits for ITS OWN worker to actually claim
 # the released row, then RELEASES it again and exits. It reports nothing —
 # the parent reads the row it leaves behind.
+#
+# `job.status()` cannot tell "claimed by the original instance" from "claimed
+# by this successor" -- a release never changes `status` away from
+# `"running"` (D9/D11: no status is invented for a release), and the row can
+# also reach `"completed"` on its own within a few seconds once tiny-bert's
+# early stopping converges the run, well inside any fixed sleep bound. The
+# reliable, mechanism-grounded signal is `acceleration_report`
+# (`crates/jammi-python/src/job.rs`'s `Job.acceleration_report()`): a
+# released row is reclaimed by `reclaim_expired_jobs`' arm 1a, which resets
+# `acceleration_report` to the `"pending"` marker for the NEW attempt before
+# `claim_next` claims it (`crates/jammi-db/src/catalog/jobs_repo.rs`, the
+# comment beside `ACCELERATION_REPORT_PENDING` in arm 1a) -- so a report that
+# both DIFFERS from the value read before this successor started AND is no
+# longer `"pending"` can only be this successor's own fresh probe for its own
+# new attempt, never a stale read of the original attempt's row.
 _RELEASING_SUCCESSOR = textwrap.dedent(
     """
+    import json
     import sys
     import time
 
     import jammi_native
 
-    db = jammi_native.open_local(artifact_dir=sys.argv[1])
+    artifact_dir, job_id, original_report_json = sys.argv[1], sys.argv[2], sys.argv[3]
+    original_report = json.loads(original_report_json)
+
+    db = jammi_native.open_local(artifact_dir=artifact_dir)
     try:
-        job = db.job(sys.argv[2])
+        job = db.job(job_id)
         deadline = time.monotonic() + 60
-        # A released row already reads `running`; the successor's own claim
-        # is visible only through the row, so give the loop more than one
-        # idle poll to take it before releasing again.
-        time.sleep(4)
-        assert job.status() == "running", job.status()
+        report = original_report
+        while time.monotonic() < deadline:
+            report = job.acceleration_report()
+            if report != original_report and (report or {}).get("state") != "pending":
+                break
+            time.sleep(0.05)
+        else:
+            raise AssertionError(
+                "this worker never claimed and re-probed the released job "
+                f"(acceleration_report stayed {report!r})"
+            )
     finally:
         db.close(release=True)
     """
@@ -112,6 +138,10 @@ def test_close_release_true_leaves_the_job_claimable(
     )
     job_id = job.job_id
     _wait_running(job)
+    # Read BEFORE close(): the successor subprocess needs this attempt's
+    # value to detect its own fresh claim (see `_RELEASING_SUCCESSOR`'s
+    # doc); every verb on `job`/`db` raises once this connection closes.
+    original_report = job.acceleration_report()
 
     started = time.monotonic()
     db.close(release=True)
@@ -132,7 +162,14 @@ def test_close_release_true_leaves_the_job_claimable(
 
     # A successor process claims it within one idle poll and releases again.
     proc = subprocess.run(
-        [sys.executable, "-c", _RELEASING_SUCCESSOR, str(tmp_path), job_id],
+        [
+            sys.executable,
+            "-c",
+            _RELEASING_SUCCESSOR,
+            str(tmp_path),
+            job_id,
+            json.dumps(original_report),
+        ],
         capture_output=True,
         text=True,
         timeout=300,

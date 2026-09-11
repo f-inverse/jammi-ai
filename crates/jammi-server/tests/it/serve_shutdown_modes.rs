@@ -9,7 +9,7 @@
 //! shutdown rows are read through a fresh `Catalog` over the same directory.
 
 use std::path::Path;
-use std::sync::Arc;
+use std::sync::{Arc, Weak};
 use std::time::Duration;
 
 use futures::StreamExt;
@@ -78,6 +78,15 @@ struct Served {
     /// The server's own metrics registry — readable after the side-channel
     /// has stopped.
     metrics: Arc<jammi_server::routes::health::MetricsRegistry>,
+    /// A weak handle on the embedded worker's shared state, captured BEFORE
+    /// `serve_with_signals` takes ownership of the `EmbeddedWorker` guard —
+    /// `WorkerShared` stays alive for the guard's whole lifetime (owned by
+    /// both the guard and the loop task itself), so this stays upgradable
+    /// for as long as `task` has not returned, letting a test observe
+    /// [`jammi_ai::fine_tune::worker::LoopState`] directly rather than
+    /// inferring it from elapsed wall-clock time (O1). `None` when the
+    /// fixture disabled the worker.
+    worker_shared: Option<Weak<jammi_ai::fine_tune::worker::WorkerShared>>,
     flight_addr: std::net::SocketAddr,
     health_addr: std::net::SocketAddr,
     drain_tx: watch::Sender<bool>,
@@ -98,6 +107,47 @@ impl Served {
             .expect("the serve task must end within the bound")
             .expect("the serve task must not panic")
     }
+
+    /// Poll-until-predicate (never a blind sleep) for the loop task's OWN
+    /// reported [`LoopState`](jammi_ai::fine_tune::worker::LoopState) to
+    /// leave `Running` — O1's mechanism assertion: the loop task's actual
+    /// termination, not merely that some bounded amount of wall-clock time
+    /// has passed (a skipped-abort defect and a real abort both satisfy a
+    /// wall-clock bound when the timeout backstop is one heartbeat; only
+    /// the mechanism distinguishes them). Panics with the observed state
+    /// (or "no worker") if `bound` elapses first — the RED signal at base,
+    /// where the loop never leaves `Running` because nothing ever aborts
+    /// it.
+    async fn wait_loop_state_left_running(
+        &self,
+        bound: Duration,
+    ) -> jammi_ai::fine_tune::worker::LoopState {
+        let shared = self
+            .worker_shared
+            .as_ref()
+            .expect("this fixture always spawns a worker")
+            .clone();
+        let deadline = tokio::time::Instant::now() + bound;
+        loop {
+            let Some(shared) = shared.upgrade() else {
+                panic!(
+                    "the worker's shared state vanished before its loop state was ever observed \
+                     as non-Running -- the guard (and the loop task's own Arc) is gone without \
+                     the loop ever reporting termination"
+                );
+            };
+            let state = shared.loop_state();
+            if state != jammi_ai::fine_tune::worker::LoopState::Running {
+                return state;
+            }
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "the loop task's own LoopState never left Running within {bound:?} -- it is \
+                 still running (or detached), not aborted"
+            );
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    }
 }
 
 async fn serve(dir: &Path, timing: Timing) -> Served {
@@ -111,6 +161,9 @@ async fn serve_with_config(cfg: JammiConfig) -> Served {
     let bound = server.bind().await.expect("bind");
     let flight_addr = bound.flight_addr();
     let health_addr = bound.health_addr();
+    // Captured BEFORE `serve_with_signals` consumes `bound` — see the
+    // field doc on `Served::worker_shared`.
+    let worker_shared = bound.worker_shared();
     let (drain_tx, drain_rx) = watch::channel(false);
     let (release_tx, release_rx) = watch::channel(false);
     let task = tokio::spawn(bound.serve_with_signals(drain_rx, release_rx));
@@ -133,6 +186,7 @@ async fn serve_with_config(cfg: JammiConfig) -> Served {
     Served {
         session,
         metrics,
+        worker_shared,
         flight_addr,
         health_addr,
         drain_tx,
@@ -536,6 +590,30 @@ async fn sigint_while_draining_releases_and_returns_released_within_two_heartbea
     tokio::time::sleep(Duration::from_millis(300)).await;
     let released_at = tokio::time::Instant::now();
     served.release();
+
+    // O1: this RELEASE preempts the DRAIN's `stop_and_join`, which was
+    // suspended awaiting the in-flight job's own terminal state (D4) — the
+    // exact SIGTERM-then-SIGINT hazard F1 names. Assert on the loop task's
+    // OWN reported termination, never on elapsed wall-clock time alone: a
+    // skipped-abort defect (the handle lost to `stop_and_join`'s cancelled
+    // future) and a genuine abort both return `Released` within the same
+    // few seconds, because 2f's own observation is bounded by a one-
+    // heartbeat timeout regardless of whether anything was actually
+    // aborted — only the loop's own `LoopState` tells them apart. Base
+    // (`cbd427b4`): this call times out, because 2e's `if let Some(handle)
+    // = self.take_handle()` finds `None` (already lost) and never aborts
+    // anything, so the loop runs on forever, detached, and its LoopState
+    // never leaves `Running`.
+    let loop_state = served
+        .wait_loop_state_left_running(Duration::from_secs(FAST_TIMING.heartbeat + 3))
+        .await;
+    assert_eq!(
+        loop_state,
+        jammi_ai::fine_tune::worker::LoopState::Aborted,
+        "the loop task must be ABORTED by the RELEASE that preempted the DRAIN's \
+         stop_and_join, not left running detached"
+    );
+
     let outcome = served
         .finish(Duration::from_secs(2 * FAST_TIMING.heartbeat + 8))
         .await
@@ -652,6 +730,240 @@ async fn release_preempts_a_drain_blocked_on_an_in_flight_unary() {
         "an inline row is never released"
     );
     assert_eq!(row.releases, 0);
+}
+
+// ---------------------------------------------------------------------------
+// K4 / D19 / O3 — the release write is identical on the library and server
+// ---------------------------------------------------------------------------
+
+/// A comparable projection of a released `jobs` row: every `SELECT_COLS`
+/// field the RELEASE mechanism can affect or must leave alone, EXCLUDING
+/// `job_id` and `claimed_by` (a fresh id per fixture by construction),
+/// `spec`/`model_ref`/`output_model_id` (carry the fixture's own temp-dir
+/// paths), and the two timestamps. A struct rather than a tuple — a tuple
+/// past 12 elements has neither `Debug` nor `PartialEq`.
+#[derive(Debug, PartialEq)]
+struct ReleasedRowShape {
+    kind: String,
+    tenant_id: Option<String>,
+    status: String,
+    execution: String,
+    partial_result: Option<String>,
+    result: Option<String>,
+    error: Option<String>,
+    progress_rows_done: Option<i64>,
+    progress_rows_total: Option<i64>,
+    progress_phase: Option<String>,
+    cancel_requested: bool,
+    attempts: u32,
+    releases: u32,
+    // `Some`/`None` only — the exact timestamp differs across fixtures.
+    lease_expires_at: bool,
+    priority: i32,
+    claimable: bool,
+    acceleration_report: Option<String>,
+    parent_id: Option<String>,
+    has_deps: bool,
+}
+
+fn released_row_shape(row: &JobRecord) -> ReleasedRowShape {
+    ReleasedRowShape {
+        kind: row.kind.clone(),
+        tenant_id: row.tenant_id.as_ref().map(|t| t.to_string()),
+        status: row.status.clone(),
+        execution: row.execution.clone(),
+        partial_result: row.partial_result.clone(),
+        result: row.result.clone(),
+        error: row.error.clone(),
+        progress_rows_done: row.progress_rows_done,
+        progress_rows_total: row.progress_rows_total,
+        progress_phase: row.progress_phase.clone(),
+        cancel_requested: row.cancel_requested,
+        attempts: row.attempts,
+        releases: row.releases,
+        lease_expires_at: row.lease_expires_at.is_some(),
+        priority: row.priority,
+        claimable: row.claimable,
+        acceleration_report: row.acceleration_report.clone(),
+        parent_id: row.parent_id.clone(),
+        has_deps: row.has_deps,
+    }
+}
+
+async fn submit_fine_tune_from(ch: Channel, source: &str, epochs: u32) -> String {
+    JobServiceClient::new(ch)
+        .submit_job(SubmitJobRequest {
+            spec: Some(Spec::FineTune(FineTuneSpec {
+                source: source.into(),
+                columns: vec!["text_a".into(), "text_b".into(), "score".into()],
+                method: FineTuneMethod::Lora as i32,
+                task: ModelTask::TextEmbedding as i32,
+            })),
+            base_model: tiny_bert_model_id(),
+            config: Some(FineTuneConfig {
+                epochs: Some(epochs),
+                batch_size: Some(8),
+                lora_rank: Some(4),
+                warmup_steps: Some(0),
+                ..Default::default()
+            }),
+            idempotency_key: String::new(),
+            depends_on: Vec::new(),
+            parent_id: String::new(),
+        })
+        .await
+        .expect("submit_job")
+        .into_inner()
+        .job_id
+}
+
+fn with_catalog(mut cfg: JammiConfig, pg_url: Option<&str>) -> JammiConfig {
+    if let Some(url) = pg_url {
+        cfg.catalog = jammi_db::config::CatalogConfig::Postgres {
+            url: jammi_db::config::Secret::from(url.to_string()),
+            pool_size: 8,
+            max_lifetime_secs: None,
+        };
+    }
+    cfg
+}
+
+/// K4/D19: RELEASE ships on more than one arm — the bare library call
+/// (`EmbeddedWorker::release_and_stop`) and the server's `BoundServer::
+/// serve_with_signals` RELEASE branch, which calls the SAME method — but
+/// nothing ever compared their post-release rows (F2). Runs an identical
+/// fine-tune job to `running` on each: one released through the bare
+/// library call with no server involved, the other through a real server
+/// shutdown (the exact SIGINT-equivalent path), and asserts the resulting
+/// rows agree on every field the RELEASE mechanism touches or leaves
+/// alone. `source_id` is unique per call so the Postgres arm — one shared
+/// database across the whole matrix — never collides with a sibling call.
+/// RED at base: this oracle does not exist anywhere in the tree.
+async fn release_write_is_identical_on_library_and_server_over(pg_url: Option<&str>) {
+    let source = format!("training-{}", uuid::Uuid::new_v4().simple());
+
+    // ----- library arm: no gRPC, no server -----
+    let lib_dir = TempDir::new().unwrap();
+    let lib_session = Arc::new(
+        InferenceSession::new(with_catalog(
+            server_config(lib_dir.path(), FAST_TIMING, true),
+            pg_url,
+        ))
+        .await
+        .unwrap(),
+    );
+    lib_session
+        .add_source(
+            &source,
+            jammi_db::source::SourceType::File,
+            jammi_db::source::SourceConnection {
+                url: Some(fixture_url("training_pairs.csv")),
+                format: Some(jammi_db::source::FileFormat::Csv),
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+    let lib_spec: jammi_ai::jobs::JobSpec = jammi_ai::fine_tune::spec::TrainingSpec::FineTune {
+        source: source.clone(),
+        columns: vec!["text_a".into(), "text_b".into(), "score".into()],
+        method: jammi_ai::fine_tune::FineTuneMethod::Lora,
+        task: jammi_ai::model::ModelTask::TextEmbedding,
+        common: jammi_ai::fine_tune::spec::TrainingCommon {
+            base_model: tiny_bert_model_id(),
+            config: jammi_ai::fine_tune::FineTuneConfig {
+                epochs: 20_000,
+                batch_size: 8,
+                lora_rank: 4,
+                warmup_steps: 0,
+                ..Default::default()
+            },
+        },
+    }
+    .into();
+    let lib_handle = lib_session.enqueue(lib_spec, 0).await.unwrap();
+    let lib_worker = jammi_ai::fine_tune::worker::EmbeddedWorker::spawn(&lib_session).unwrap();
+    wait_status(
+        lib_session.catalog(),
+        &lib_handle.job_id,
+        &JobStatus::Running.to_string(),
+        Duration::from_secs(120),
+    )
+    .await;
+    lib_worker.release_and_stop().await.unwrap();
+    let lib_row = lib_session
+        .catalog()
+        .get_job(&lib_handle.job_id)
+        .await
+        .unwrap();
+    drop(lib_worker);
+    lib_session.close().await;
+
+    // ----- server arm: the exact SIGINT-equivalent path -----
+    let srv_dir = TempDir::new().unwrap();
+    let served = serve_with_config(with_catalog(
+        server_config(srv_dir.path(), FAST_TIMING, true),
+        pg_url,
+    ))
+    .await;
+    add_source(
+        channel(served.flight_addr).await,
+        &source,
+        "training_pairs.csv",
+        FileFormat::Csv,
+    )
+    .await;
+    let srv_job_id =
+        submit_fine_tune_from(channel(served.flight_addr).await, &source, 20_000).await;
+    wait_status(
+        served.session.catalog(),
+        &srv_job_id,
+        &JobStatus::Running.to_string(),
+        Duration::from_secs(120),
+    )
+    .await;
+    served.release();
+    let outcome = served
+        .finish(Duration::from_secs(2 * FAST_TIMING.heartbeat + 8))
+        .await
+        .unwrap();
+    assert_eq!(outcome, ShutdownOutcome::Released);
+    let srv_row = if let Some(url) = pg_url {
+        // A Postgres-backed session must be re-opened through the SAME
+        // live database, not a fresh on-disk directory.
+        let backend = jammi_db::catalog::backend::BackendImpl::postgres_from_url(url, 8, None)
+            .await
+            .expect("reopen the postgres catalog");
+        Catalog::from_backend(backend)
+            .get_job(&srv_job_id)
+            .await
+            .unwrap()
+    } else {
+        reopen(srv_dir.path())
+            .await
+            .get_job(&srv_job_id)
+            .await
+            .unwrap()
+    };
+
+    assert_eq!(
+        released_row_shape(&lib_row),
+        released_row_shape(&srv_row),
+        "library release: {lib_row:#?}\nserver release: {srv_row:#?}"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn release_write_is_identical_on_library_and_server() {
+    release_write_is_identical_on_library_and_server_over(None).await;
+    if let Some(url) = jammi_test_utils::pg_url_for_tests() {
+        release_write_is_identical_on_library_and_server_over(Some(&url)).await;
+    } else {
+        eprintln!(
+            "skipping the Postgres arm of release_write_is_identical_on_library_and_server: \
+             JAMMI_TEST_PG_URL unset"
+        );
+    }
 }
 
 /// The released server never finalizes the aborted job: after the detached

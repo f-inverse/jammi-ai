@@ -113,6 +113,7 @@ Same as text embeddings:
 | `_source_id` | Utf8 | Source identifier |
 | `_model_id` | Utf8 | Model identifier |
 | `vector` | FixedSizeList(Float32, N) | L2-normalized embedding vector (N = `embed_dim`) |
+| `_content_hash` | Utf8 (nullable) | Hex SHA-256 over the embedded source columns as the model read them (the image bytes, or the path string for a path-valued column — the file behind a path is not hashed); `NULL` on an imported table |
 
 ## Search
 

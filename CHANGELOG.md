@@ -57,6 +57,37 @@ workspace ships every publishable crate at the same
   takes the row's initial `WorkerState`. The reclaim cap now compares
   `attempts - releases`, and `heartbeat_job` carries `lease_expires_at IS
   NOT NULL`.
+- **Incremental embedding refresh: `refresh_embeddings`, `compact_embeddings`,
+  `expire_versions` (#482).** An embedding table is now versioned in place:
+  `refresh_embeddings(table, deletes = tombstone | retain)` diffs the source
+  against the current version by the new nullable `_content_hash` column
+  (hex SHA-256 over the embedded columns as the model read them, the fifth
+  column of every embedding table), re-embeds only the added and changed
+  rows into one fragment + one ANN segment stamped with a monotonically
+  allocated version number, masks superseded and deleted keys through a
+  cumulative per-version deletion mask, and publishes with one
+  compare-and-set — a reader sees exactly one version, the previous one
+  stays live until the swap, and a never-refreshed table is byte-identical
+  to before. A refresh with nothing to do is `no_change` and leaves every
+  downstream anchor `Fresh`. Migration 032 adds `result_table_versions` and
+  `result_tables.current_version/next_version`; `index_segments.version`
+  stamps segments. `compact_embeddings` rewrites the live rows as one
+  fragment + one segment (no inference); `expire_versions(before)` reaps
+  old versions and never touches the allocator. The version identity is a
+  hash chain (parent identity, definition, delta descriptor, fragment and
+  mask digests) that `verify_materialization` recomputes and `staleness`
+  anchors on. The verbs are on `Session`, both Python bindings, and
+  `EmbeddingService.{RefreshEmbeddings, CompactEmbeddings, ExpireVersions}`.
+  Base embedding output is now written in key order (`CAST(key AS Utf8)`,
+  then `_content_hash`) so the artifact digest is identical across
+  `execution_threads`; a `NULL` key is the typed `InvalidKey { column,
+  null_count }` on `generate_embeddings`, refresh and `infer` before any
+  model call; new typed errors `NonUniqueKey`, `DefinitionDrift`,
+  `NotRefreshable`, `VersionUnavailable` (wire, Python leaf classes); a
+  storage object vanishing under a scan is the typed
+  `Storage(StorageError::Io { NotFound })` and every other DataFusion error
+  keeps its `source()` under `JammiError::DataFusion`. Guide:
+  `incremental-refresh.md`.
 - **`jobs`/`instances`/`workers`: a generalised, kind-agnostic durable-job
   queue replaces the training-only queue; a per-process lease keeper (#485).**
   Migration 029 drops `training_jobs` and adds `jobs` (training AND compute

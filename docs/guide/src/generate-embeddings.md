@@ -73,6 +73,8 @@ Failed rows (null or empty text) are excluded — only successfully embedded row
 
 A `NULL` in the **key** column is not a per-row failure: the whole call is refused with the typed `InvalidKey { column, null_count }` before the model runs (the null count is exact; zero rows are embedded and nothing is written). Every row needs a key.
 
+`_content_hash` is what makes the table refreshable: after the source changes, `refresh_embeddings` re-embeds only the rows whose hash differs and publishes a new version of the same table — see [Refresh an Embedding Table Incrementally](./incremental-refresh.md).
+
 ## Text column format
 
 A text column can be:

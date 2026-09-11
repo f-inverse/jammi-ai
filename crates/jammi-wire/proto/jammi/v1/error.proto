@@ -90,6 +90,10 @@ message JammiErrorDetail {
     IncompatibleFormatError incompatible_format = 27;
     DependencyCycleError dependency_cycle = 28;
     NotRecomputableError not_recomputable = 29;
+    // `JammiError::Unavailable { resource, reason }` — a placed segment whose
+    // owner, retry candidate and local load all failed. Maps to gRPC
+    // `UNAVAILABLE`.
+    UnavailableError unavailable = 30;
     InvalidKeyError invalid_key = 32;
     VersionUnavailableError version_unavailable = 33;
     NotRefreshableError not_refreshable = 34;
@@ -190,6 +194,13 @@ message DependencyCycleError {
 // table with no recorded descriptor, or an `External`-producer table).
 message NotRecomputableError {
   string table = 1;
+}
+
+// `JammiError::Unavailable`: the resource that could not be served (`segment
+// {table}/{id}`) and why the last rung of the failure ladder failed.
+message UnavailableError {
+  string resource = 1;
+  string reason = 2;
 }
 
 // `JammiError::InvalidKey { column, null_count }`. A `NULL` in the key column

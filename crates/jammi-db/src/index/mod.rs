@@ -6,7 +6,7 @@ pub mod sidecar;
 
 pub use peer::{
     AllLocal, NoPeers, PeerAddr, PeerError, PeerFailureCounters, PeerFailureReason, PeerTransport,
-    SegmentPlacement, SegmentSearchPhase, StaticPlacement, PEER_RPC_DEADLINE,
+    SegmentPlacement, SegmentSearchPhase, StaticPlacement, PEER_FAILURE_LABELS, PEER_RPC_DEADLINE,
 };
 pub use placed::{PlacedIndex, SegmentSource};
 pub use segment::{SegmentId, SegmentedIndex, DEFAULT_SEGMENT_OVERFETCH_FACTOR};

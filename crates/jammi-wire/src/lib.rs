@@ -44,6 +44,7 @@ pub const FILE_DESCRIPTOR_SET: &[u8] =
 pub mod embedding_refresh;
 pub mod eval;
 pub mod fine_tune;
+pub mod peer;
 pub mod request;
 mod transport;
 

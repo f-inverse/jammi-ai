@@ -1,0 +1,111 @@
+syntax = "proto3";
+
+package jammi.v1.peer;
+
+// PeerService — the engine-internal segment-search seam between replicas of
+// one deployment. A coordinator (any replica, or a library process holding a
+// placement) fans one query out to the replicas that own the table's
+// segments; each owner searches its segments and returns `(row_id, distance)`
+// hits — ids and distances, never vectors. The merge across owners runs at
+// the coordinator, over the same kernels a single node merges its own
+// segments with.
+//
+// Served ONLY on the separate internal `[server] peer_bind` listener — never
+// on the public gRPC + Flight SQL listener (which answers UNIMPLEMENTED for
+// these paths), never wrapped by the tenant-binding layer, never advertised
+// by `GetServerInfo`. Tenant scope is enforced by the COORDINATOR alone: it
+// resolves the table through its own tenant-scoped catalog read before any
+// fan-out. The owner is deliberately tenant-free — the request carries no
+// tenant — and enforces exactly one thing at its input edge: every requested
+// segment id belongs to the named table (else INVALID_ARGUMENT for the whole
+// request, never a partial unit) and the bundle's stamped precision matches
+// the requested one (else refused). Invariant I-PEER: every client of
+// `peer_bind` is a jammi coordinator; binding it on a routable interface
+// without network policy / mTLS exposes cross-tenant reads. Default unset.
+service PeerService {
+  // Search the named segments of one table at `width`, in `phase`. All of one
+  // owner's segments go in ONE request. Unary: a response is at most
+  // `N_owner * width` hits, and the caller's per-RPC deadline rides as the
+  // gRPC deadline directly.
+  rpc SegmentSearch(SegmentSearchRequest) returns (SegmentSearchResponse);
+
+  // The second stage of the APPROXIMATE protocol (F16 / Int8): rescore the
+  // named candidates against their exact vectors at the owner, returning
+  // exact cosine distances. A candidate with no exact vector (a torn bundle)
+  // is DATA_LOSS for the whole request, never a silent drop.
+  rpc ExactRescore(ExactRescoreRequest) returns (ExactRescoreResponse);
+}
+
+// The precision a table's segments are stored at — mirrors the engine's
+// `StoragePrecision`. The owner's strict load refuses a bundle stamped
+// otherwise.
+enum StoragePrecision {
+  STORAGE_PRECISION_UNSPECIFIED = 0;
+  STORAGE_PRECISION_F32 = 1;
+  STORAGE_PRECISION_F16 = 2;
+  STORAGE_PRECISION_INT8 = 3;
+  STORAGE_PRECISION_BINARY = 4;
+}
+
+// Which stage of the per-precision protocol a SegmentSearch runs. F32 and
+// Binary run one FINAL phase (the owner returns exact distances — Binary after
+// rescoring every hit locally, since per-segment Hamming distances are fit
+// against each segment's own threshold and are not comparable across
+// segments); F16 / Int8 run APPROXIMATE (the owner returns approximate
+// candidates, the coordinator merges and truncates, then issues one
+// ExactRescore per owner).
+enum SegmentSearchPhase {
+  SEGMENT_SEARCH_PHASE_UNSPECIFIED = 0;
+  SEGMENT_SEARCH_PHASE_APPROXIMATE = 1;
+  SEGMENT_SEARCH_PHASE_FINAL = 2;
+}
+
+// One `(row_id, distance)` hit.
+message Hit {
+  string row_id = 1;
+  float distance = 2;
+}
+
+// One segment's hits for one query.
+message SegmentUnit {
+  int64 segment_id = 1;
+  repeated Hit hits = 2;
+}
+
+message SegmentSearchRequest {
+  // The table the segments belong to; the owner verifies every id below
+  // against this table's catalog segment list.
+  string table_name = 1;
+  // Every segment of `table_name` this owner should search.
+  repeated int64 segment_ids = 2;
+  // The table's persisted precision.
+  StoragePrecision storage_precision = 3;
+  // The query vector.
+  repeated float query = 4;
+  // The per-segment fetch width.
+  uint64 width = 5;
+  // Which stage of the protocol this search is.
+  SegmentSearchPhase phase = 6;
+}
+
+message SegmentSearchResponse {
+  repeated SegmentUnit units = 1;
+}
+
+// The candidates to rescore that one segment owns.
+message SegmentRowIds {
+  int64 segment_id = 1;
+  repeated string row_ids = 2;
+}
+
+message ExactRescoreRequest {
+  string table_name = 1;
+  StoragePrecision storage_precision = 2;
+  repeated float query = 3;
+  repeated SegmentRowIds row_ids_by_segment = 4;
+}
+
+message ExactRescoreResponse {
+  // `(row_id, exact_cosine_distance)` for every requested candidate.
+  repeated Hit hits = 1;
+}

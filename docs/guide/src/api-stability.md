@@ -47,10 +47,12 @@ would carry elsewhere.
 
 ### 2. The wire contract — `package jammi.v1.*`
 
-The gRPC/Flight SQL wire surface is the eleven `jammi.v1.*` proto packages (ten
-served by the OSS engine; `jammi.v1.lifecycle` is a **contract-only** surface —
-defined in the wire descriptor so the candle-free client can call a platform
-server that implements it, but answered by no OSS handler):
+The gRPC/Flight SQL wire surface is the twelve `jammi.v1.*` proto packages (ten
+served on the public listener; one, `jammi.v1.peer`, served **only on the
+internal `[server] peer_bind` listener** — the public listener answers
+`UNIMPLEMENTED` for its rpcs; `jammi.v1.lifecycle` is a **contract-only**
+surface — defined in the wire descriptor so the candle-free client can call a
+platform server that implements it, but answered by no OSS handler):
 
 | Package | Surface |
 |---|---|
@@ -62,6 +64,7 @@ server that implements it, but answered by no OSS handler):
 | `jammi.v1.inference` | bulk inference + predict |
 | `jammi.v1.job` | the durable job queue: submit / status / wait / list / cancel / list-workers / prune (`JobService`) |
 | `jammi.v1.lifecycle` | license apply / bootstrap / status / login — **contract-only**, answered by a platform server (the OSS engine returns `UNIMPLEMENTED`) |
+| `jammi.v1.peer` | the engine-internal segment-search seam between replicas (`PeerService.SegmentSearch` / `ExactRescore`) — served **only on `peer_bind`**, never on the public listener; deliberately tenant-free (the coordinator enforces tenant scope; see [Security Posture](./security.md#the-peer-listener-i-peer)) |
 | `jammi.v1.pipeline` | graph / context / as-of / recompute / materialization rpcs |
 | `jammi.v1.training` | the training spec message vocabulary `JobService.SubmitJob`'s oneof carries (`FineTuneSpec`/`GraphFineTuneSpec`/`ContextPredictorSpec`/`FineTuneConfig`/…) — no rpcs of its own since `TrainingService` folded into `JobService` |
 | `jammi.v1.trigger` | topic publish + subscribe |

@@ -8,8 +8,10 @@
 //! - the Axum side-channel router (`/healthz`, `/readyz`, `/metrics`)
 //! - one Tonic server hosting `FlightSqlService + CatalogService +
 //!   TriggerService` on a single port
-//! - graceful shutdown wired to SIGINT/SIGTERM via a
-//!   [`tokio::sync::broadcast`] so every component drains in parallel
+//! - two-mode graceful shutdown (DRAIN on SIGTERM, RELEASE on SIGINT or a
+//!   second signal) wired through [`tokio::sync::watch`], so every listener
+//!   — HTTP side-channel, gRPC/Flight, and the internal peer listener when
+//!   bound — drains in parallel off the same signal
 //!
 //! The structure is intentionally flat: no `runtime/` directory, no
 //! per-component sub-modules. When a second binary materialises the same
@@ -43,6 +45,7 @@ use crate::grpc::embedding::EmbeddingServer;
 use crate::grpc::eval::EvalServer;
 use crate::grpc::inference::InferenceServer;
 use crate::grpc::job::JobServer;
+use crate::grpc::peer::PeerServer;
 use crate::grpc::pipeline::PipelineServer;
 use crate::grpc::proto::audit::audit_service_server::AuditServiceServer;
 use crate::grpc::proto::catalog::catalog_service_server::CatalogServiceServer;
@@ -50,6 +53,7 @@ use crate::grpc::proto::embedding::embedding_service_server::EmbeddingServiceSer
 use crate::grpc::proto::eval::eval_service_server::EvalServiceServer;
 use crate::grpc::proto::inference::inference_service_server::InferenceServiceServer;
 use crate::grpc::proto::job::job_service_server::JobServiceServer;
+use crate::grpc::proto::peer::peer_service_server::PeerServiceServer;
 use crate::grpc::proto::pipeline::pipeline_service_server::PipelineServiceServer;
 use crate::grpc::proto::trigger::trigger_service_server::TriggerServiceServer;
 use crate::grpc::session::{SessionIdTenantResolver, SessionStore, TenantResolver};
@@ -428,6 +432,9 @@ impl LivenessCheck for EngineLiveness {
 pub struct OssServer {
     flight_addr: SocketAddr,
     health_addr: SocketAddr,
+    /// `[server] peer_bind`: the internal peer listener's address, `Some`
+    /// iff this replica is a segment owner. `None` = no third listener.
+    peer_addr: Option<SocketAddr>,
     session: Arc<InferenceSession>,
     session_store: SessionStore,
     metrics: Arc<MetricsRegistry>,
@@ -462,6 +469,12 @@ impl OssServer {
 
         let flight_addr: SocketAddr = config.server.flight_listen.parse()?;
         let health_addr: SocketAddr = config.server.health_listen.parse()?;
+        let peer_addr: Option<SocketAddr> = config
+            .server
+            .peer_bind
+            .as_deref()
+            .map(str::parse)
+            .transpose()?;
 
         // Resolve the mounted tier set before constructing the engine: a config
         // that names an unknown tier or one whose feature is compiled out is a
@@ -485,6 +498,11 @@ impl OssServer {
         // Every process has a keeper: `jammi_lease_heartbeat_age_seconds` is
         // present on every server.
         metrics.attach_keeper(Arc::clone(session.lease_keeper()))?;
+        // The placed-search failure-ladder counters live in the engine's
+        // result store; the registry reads them at scrape as
+        // `jammi_peer_search_failures_total{reason}`. Registered here, once,
+        // additively — `MetricsRegistry::new` keeps its arity.
+        metrics.register_peer_failures(session.result_store().peer_failures())?;
         let readiness = Arc::new(ReadinessProbe::new(Arc::new(CatalogPingProbe::new(
             Arc::clone(&session),
         ))));
@@ -492,6 +510,7 @@ impl OssServer {
         Ok(Self {
             flight_addr,
             health_addr,
+            peer_addr,
             session,
             session_store,
             metrics,
@@ -532,6 +551,28 @@ impl OssServer {
     pub async fn bind(self) -> Result<BoundServer, ServerError> {
         let health_listener = TcpListener::bind(self.health_addr).await?;
         let health_addr = health_listener.local_addr()?;
+        // The THIRD listener: `PeerService` on `[server] peer_bind`, built
+        // OUTSIDE `assemble_grpc_chain` — never added to the public `Routes`,
+        // never wrapped by the `TenantResolverLayer`, never advertised by
+        // `GetServerInfo`. The public listener answers UNIMPLEMENTED for its
+        // paths. Its routes are a plain `tonic::service::Routes`, so a second
+        // internal service can be mounted beside `PeerService` here later. The
+        // registry is cloned now because `MetricsLayer::new(self.metrics)`
+        // moves the `Arc` into the public chain below.
+        let peer = match self.peer_addr {
+            Some(addr) => {
+                let listener = TcpListener::bind(addr).await?;
+                let routes = tonic::service::Routes::new(PeerServiceServer::new(PeerServer::new(
+                    Arc::clone(&self.session),
+                )));
+                Some((listener, routes, Arc::clone(&self.metrics)))
+            }
+            None => None,
+        };
+        let peer_addr = match &peer {
+            Some((listener, _, _)) => Some(listener.local_addr()?),
+            None => None,
+        };
         // Cloned before `build_grpc_chain`/`assemble_grpc_chain` consume
         // `self` — `AssembledChain`/`BoundChain` hold their own `Arc` clones
         // internally (captured by the mounted services), but neither type
@@ -563,6 +604,8 @@ impl OssServer {
             health_listener,
             health_addr,
             health_router,
+            peer,
+            peer_addr,
             session,
             worker,
             readiness,
@@ -642,6 +685,12 @@ pub struct BoundServer {
     health_listener: TcpListener,
     health_addr: SocketAddr,
     health_router: Router,
+    /// The bound internal peer listener with its layer-free routes and the
+    /// registry its own `MetricsLayer` is built from at serve time. `None`
+    /// when `[server] peer_bind` is unset.
+    peer: Option<(TcpListener, tonic::service::Routes, Arc<MetricsRegistry>)>,
+    /// The ACTUAL peer listener address (the real port for a `:0` request).
+    peer_addr: Option<SocketAddr>,
     /// The engine session, kept alive past [`OssServer::bind`] so
     /// [`Self::serve_with_signals`] can release its catalog connections
     /// (including the lease keeper's own, N3) once the serve loop has fully
@@ -699,6 +748,13 @@ impl BoundServer {
     /// worker) — what the gauges and liveness read; exposed for oracles.
     pub fn worker_shared(&self) -> Option<Weak<jammi_ai::fine_tune::worker::WorkerShared>> {
         self.worker.as_ref().map(|w| w.shared())
+    }
+
+    /// The ACTUAL address the internal `PeerService` listener is bound to —
+    /// `Some` iff `[server] peer_bind` was set (the real port for a `:0`
+    /// request).
+    pub fn peer_addr(&self) -> Option<SocketAddr> {
+        self.peer_addr
     }
 
     /// Serve both halves on the already-bound listeners until `shutdown`
@@ -759,6 +815,8 @@ impl BoundServer {
             health_listener,
             health_addr,
             health_router,
+            peer,
+            peer_addr,
             session,
             worker,
             readiness,
@@ -771,6 +829,37 @@ impl BoundServer {
         // The health side-channel stays up through a DRAIN (D13) — it is
         // signalled only at the very end, on its own channel.
         let (health_stop_tx, health_stop_rx) = oneshot::channel::<()>();
+        // The peer listener: its own tonic server over the pre-bound
+        // `TcpListener` (a `TcpListenerStream` — deliberately without the
+        // public chain's nodelay tuning: internal unary RPC), carrying only
+        // the `MetricsLayer` so `jammi_grpc_requests_total` /
+        // `jammi_peer_requests_total{rpc}` count peer calls like any
+        // `/jammi.v1.*` request. No tenant layer, no gRPC-web framing, no
+        // `[server.limits]` stack — its clients are coordinators (I-PEER).
+        // It stays up through a DRAIN exactly like the health side-channel
+        // (D13's analogue: a coordinator's fan-out to this owner is never cut
+        // early) and is signalled only at the very end, on its own oneshot.
+        let (peer_stop_tx, peer_stop_rx) = oneshot::channel::<()>();
+        let peer_task = peer.map(|(listener, routes, registry)| {
+            tokio::spawn(async move {
+                tracing::info!(
+                    address = ?peer_addr,
+                    "peer listener listening (jammi.v1.peer.PeerService)"
+                );
+                Server::builder()
+                    .layer(MetricsLayer::new(registry))
+                    .add_routes(routes)
+                    .serve_with_incoming_shutdown(
+                        tokio_stream::wrappers::TcpListenerStream::new(listener),
+                        async move {
+                            let _ = peer_stop_rx.await;
+                        },
+                    )
+                    .await
+                    .map_err(ServerError::from)
+            })
+        });
+
         let health_task = tokio::spawn(async move {
             axum::serve(health_listener, health_router)
                 .with_graceful_shutdown(async move {
@@ -918,10 +1007,31 @@ impl BoundServer {
             Ok(r) => r,
             Err(join_err) => Err(ServerError::Io(std::io::Error::other(join_err.to_string()))),
         };
+        let _ = peer_stop_tx.send(());
+        let peer_result = match peer_task {
+            Some(task) => match task.await {
+                Ok(r) => r,
+                Err(join_err) => Err(ServerError::Io(std::io::Error::other(join_err.to_string()))),
+            },
+            None => Ok(()),
+        };
+
+        // Every listener has stopped accepting and finished draining
+        // in-flight requests — the graceful-shutdown release point.
+        // `InferenceSession::close` shuts the lease keeper (N3) down and
+        // joins its dedicated thread (closing its own catalog connection)
+        // before closing the shared pool, so a `SIGTERM`'d `jammi-server`
+        // releases the SQLite `unix-excl` lock exactly as the embedded
+        // engine's `close()` does — a successor process can open the same
+        // catalog directory immediately rather than waiting out the process
+        // exit.
         session.close().await;
         crate::telemetry::flush_otlp();
 
-        result.and(health_result).map(|()| outcome)
+        result
+            .and(health_result)
+            .and(peer_result)
+            .map(|()| outcome)
     }
 
     /// Serve both halves until an OS signal arrives — the binary entry

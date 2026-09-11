@@ -195,7 +195,12 @@ impl Catalog {
     /// Not independently tenant-filtered: a caller reaches this only with a
     /// `table_name` it already resolved through the tenant-scoped
     /// `result_tables` read, so the segment set is scoped by its parent exactly
-    /// as reading a column off that already-scoped row was.
+    /// as reading a column off that already-scoped row was. The one exception
+    /// is I-PEER: the peer OWNER handler (`jammi-server`'s `PeerService`,
+    /// served only on `[server] peer_bind`) reaches this with a table name the
+    /// COORDINATOR resolved through its own tenant-scoped read before fanning
+    /// out — the owner binds no tenant and uses this list solely to verify
+    /// that every requested segment id belongs to the named table.
     pub async fn list_index_segments(&self, table_name: &str) -> Result<Vec<IndexSegment>> {
         self.list_segments_where(table_name, "").await
     }

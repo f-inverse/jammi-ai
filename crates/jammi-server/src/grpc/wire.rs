@@ -265,6 +265,14 @@ pub fn map_engine_error(err: JammiError) -> Status {
             Code::InvalidArgument,
             format!("result table `{table}`: {total} non-unique key(s) in the {scan} scan"),
         ),
+        // The placed-search failure ladder was exhausted for a segment another
+        // replica owns: the owner, its retry candidate and the local load all
+        // failed. `Unavailable` — gRPC's code for "the service is currently
+        // unavailable; retry with backoff" — naming the segment, so a peer
+        // outage is visible and never masked by a silent full scan.
+        JammiError::Unavailable { resource, reason } => {
+            (Code::Unavailable, format!("{resource}: {reason}"))
+        }
         other => (Code::Internal, other.to_string()),
     };
     attach_error_detail(code, message, &err)

@@ -1110,6 +1110,81 @@ fn server_peer_local_load_bytes_parses_and_zero_is_refused() {
     );
 }
 
+// Commit-2 oracle (a): `[server] peer_bind` parses (RED at base: `deny_unknown_fields`
+// refuses the key), and unset means no third listener.
+#[test]
+fn server_peer_bind_parses_and_defaults_unset() {
+    let cfg = JammiConfig::parse_from("[server]\n", vec![]).unwrap();
+    assert_eq!(
+        cfg.server.peer_bind, None,
+        "unset = not mounted = single node"
+    );
+    let cfg = JammiConfig::parse_from("[server]\npeer_bind = \"127.0.0.1:0\"\n", vec![]).unwrap();
+    assert_eq!(cfg.server.peer_bind.as_deref(), Some("127.0.0.1:0"));
+    assert!(cfg.server.validate().is_ok());
+    let cfg = JammiConfig::parse_from(
+        "",
+        vec![(
+            "JAMMI_SERVER__PEER_BIND".to_string(),
+            "10.0.0.1:8082".to_string(),
+        )],
+    )
+    .unwrap();
+    assert_eq!(cfg.server.peer_bind.as_deref(), Some("10.0.0.1:8082"));
+}
+
+// Commit-2 oracle (b): the 3-way fixed-address collision check. `peer_bind ==
+// flight_listen` or `== health_listen` (fixed ports) is refused; identical `:0`
+// requests are allowed (the kernel assigns each bind a distinct port); an
+// unparseable address is refused naming the key.
+#[test]
+fn server_peer_bind_collisions_are_refused_and_ephemeral_is_allowed() {
+    let base = ServerConfig {
+        health_listen: "0.0.0.0:8080".into(),
+        flight_listen: "0.0.0.0:8081".into(),
+        ..Default::default()
+    };
+    let with_flight = ServerConfig {
+        peer_bind: Some("0.0.0.0:8081".into()),
+        ..base.clone()
+    };
+    let err = with_flight.validate().unwrap_err().to_string();
+    assert!(
+        err.contains("peer_bind") && err.contains("flight_listen"),
+        "peer_bind == flight_listen must be refused naming both: {err}"
+    );
+    let with_health = ServerConfig {
+        peer_bind: Some("0.0.0.0:8080".into()),
+        ..base.clone()
+    };
+    let err = with_health.validate().unwrap_err().to_string();
+    assert!(
+        err.contains("peer_bind") && err.contains("health_listen"),
+        "peer_bind == health_listen must be refused naming both: {err}"
+    );
+    let distinct = ServerConfig {
+        peer_bind: Some("0.0.0.0:8082".into()),
+        ..base.clone()
+    };
+    assert!(distinct.validate().is_ok());
+    let ephemeral = ServerConfig {
+        health_listen: "127.0.0.1:0".into(),
+        flight_listen: "127.0.0.1:0".into(),
+        peer_bind: Some("127.0.0.1:0".into()),
+        ..Default::default()
+    };
+    assert!(
+        ephemeral.validate().is_ok(),
+        "three identical :0 requests are allowed (distinct ports at bind)"
+    );
+    let bad = ServerConfig {
+        peer_bind: Some("not-an-address".into()),
+        ..base
+    };
+    let err = bad.validate().unwrap_err().to_string();
+    assert!(err.contains("peer_bind"), "must name the key: {err}");
+}
+
 #[test]
 fn env_override_lease_unknown_field_refuses() {
     // `deny_unknown_fields` holds through the env layer too: the former

@@ -35,8 +35,8 @@
 //! `ChannelAssembly`, `Lexical`, `IncompatibleFormat`, `DependencyCycle`,
 //! `NotRecomputable`, `RowGone`, `TenantMismatch`, `LeaseLost`, `CasFailed`,
 //! `JobAttemptSuperseded`, `JobCancelled`, `SourceBusy`, `InvalidKey`,
-//! `VersionUnavailable`, `NotRefreshable`, `DefinitionDrift`, `NonUniqueKey`)
-//! reconstructs exactly,
+//! `VersionUnavailable`, `NotRefreshable`, `DefinitionDrift`, `NonUniqueKey`,
+//! `Unavailable`) reconstructs exactly,
 //! field for field — `tests::every_owned_shape_variant_round_trips_to_itself`
 //! is the completeness proof, backed by an exhaustive match with no catch-all
 //! so a NEW owned-shape variant fails to compile here until it is listed. So
@@ -230,6 +230,12 @@ impl From<&JammiError> for pb::JammiErrorDetail {
                     .collect(),
                 total: *total,
             }),
+            JammiError::Unavailable { resource, reason } => {
+                Variant::Unavailable(pb::UnavailableError {
+                    resource: resource.clone(),
+                    reason: reason.clone(),
+                })
+            }
             // The fold reaches ONLY the genuinely-foreign `#[from]` variants
             // (`Io`, `BackendDriver`, `Toml`, `Json`, `DataFusion`, `Trigger`,
             // `Storage`) and the existing `Other`: every owned-shape variant —
@@ -349,6 +355,10 @@ fn jammi_error_from_detail(detail: pb::JammiErrorDetail, message: &str) -> Jammi
                 total: e.total,
             },
             None => JammiError::Other(message.to_string()),
+        },
+        Some(Variant::Unavailable(e)) => JammiError::Unavailable {
+            resource: e.resource,
+            reason: e.reason,
         },
         Some(Variant::Other(e)) => JammiError::Other(e.message),
         // The unknown-oneof case (B5): `message` is the enclosing `Status`'s
@@ -1071,6 +1081,10 @@ mod tests {
                 scan: NonUniqueScan::Source,
                 keys: vec![("k1".into(), 2), ("k2".into(), 3)],
                 total: 2,
+            },
+            JammiError::Unavailable {
+                resource: "segment src1__text_embedding__m__20260101T000000_deadbeef/1".into(),
+                reason: "unreachable".into(),
             },
             JammiError::Other("an error with no more specific shape".into()),
         ];

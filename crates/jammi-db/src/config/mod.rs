@@ -1273,6 +1273,14 @@ pub struct ServerConfig {
     /// Request-bounds and refusal-policy limits for the combined gRPC +
     /// Flight SQL surface. See [`LimitsConfig`].
     pub limits: LimitsConfig,
+    /// The INTERNAL peer listener for beyond-one-node retrieval: the address
+    /// this replica serves `jammi.v1.peer.PeerService` on, to other replicas
+    /// of the same deployment. `None` (the default) = no third listener =
+    /// single node; a replica is a segment owner iff this is set. Validated
+    /// like `health_listen` / `flight_listen`: parseable, and distinct from
+    /// both at a fixed port (`:0` never collides). Served outside the tenant
+    /// layer (I-PEER): every client of it is a jammi coordinator.
+    pub peer_bind: Option<String>,
     /// MARGINAL-LOAD ADMISSION per query, in bytes: the maximum estimated
     /// bytes ONE query may load locally for segments it does not own, when
     /// their owners are unreachable (the last rung of the placed-search
@@ -1651,6 +1659,25 @@ impl ServerConfig {
                 "health_listen and flight_listen must be different addresses".into(),
             ));
         }
+        // The third listener, when set, joins the same fixed-address rule
+        // against BOTH of the others (a 3-way check).
+        if let Some(raw) = &self.peer_bind {
+            let peer: SocketAddr = raw.parse().map_err(|e| {
+                crate::error::JammiError::Config(format!("Invalid peer_bind address '{raw}': {e}"))
+            })?;
+            if peer.port() != 0 {
+                if peer == flight {
+                    return Err(crate::error::JammiError::Config(
+                        "peer_bind and flight_listen must be different addresses".into(),
+                    ));
+                }
+                if peer == health {
+                    return Err(crate::error::JammiError::Config(
+                        "peer_bind and health_listen must be different addresses".into(),
+                    ));
+                }
+            }
+        }
         if self.peer_local_load_bytes == Some(0) {
             return Err(crate::error::JammiError::Config(
                 "server.peer_local_load_bytes must be > 0 when set (unset = unbounded)".into(),
@@ -1962,6 +1989,7 @@ impl Default for ServerConfig {
             preload_models: Vec::new(),
             services: ServiceSelection::default(),
             limits: LimitsConfig::default(),
+            peer_bind: None,
             peer_local_load_bytes: None,
         }
     }

@@ -99,6 +99,25 @@ impl InferenceSession {
         Ok(session)
     }
 
+    /// [`Self::open`] with an explicit segment placement — which process owns
+    /// which ANN index segment, read by the result store at every online
+    /// search resolve. `open` passes [`jammi_db::index::AllLocal`] (every
+    /// segment is this process's — a single node); a library process that
+    /// knows its topology passes a [`jammi_db::index::StaticPlacement`] and
+    /// becomes a full coordinator over the gRPC peer transport
+    /// (`jammi_wire::peer::GrpcPeerTransport`, wired by the store builder).
+    /// Precondition for any non-local placement: `storage.result_root` (or a
+    /// shared local `artifact_dir`) is a root every replica can read.
+    pub async fn open_with_placement(
+        config: JammiConfig,
+        placement: Arc<dyn jammi_db::index::SegmentPlacement>,
+    ) -> Result<Arc<Self>> {
+        let inner = JammiSession::new(config).await?;
+        let session = Arc::new(Self::wrap_with(inner, None, placement).await?);
+        session.register_query_functions();
+        Ok(session)
+    }
+
     /// Create a new session with an optional inference observer.
     pub async fn with_observer(
         config: JammiConfig,
@@ -144,6 +163,14 @@ impl InferenceSession {
         inner: JammiSession,
         observer: Option<Arc<dyn InferenceObserver>>,
     ) -> Result<Self> {
+        Self::wrap_with(inner, observer, Arc::new(jammi_db::index::AllLocal)).await
+    }
+
+    async fn wrap_with(
+        inner: JammiSession,
+        observer: Option<Arc<dyn InferenceObserver>>,
+        placement: Arc<dyn jammi_db::index::SegmentPlacement>,
+    ) -> Result<Self> {
         let inner = Arc::new(inner);
         let catalog = Arc::clone(inner.catalog());
 
@@ -180,7 +207,7 @@ impl InferenceSession {
         // serves on another. It registers every `BuildingTable` it adopts
         // with the keeper above rather than spawning its own heartbeat task.
         let result_store = Arc::new(
-            build_result_store(&inner, Arc::clone(&catalog))?
+            build_result_store(&inner, Arc::clone(&catalog), placement)?
                 .with_lease_keeper(Arc::clone(&lease_keeper)),
         );
         let artifact_store = result_store.artifact_store();
@@ -2209,6 +2236,7 @@ fn extract_test_column(output: &BackendOutput, col_idx: usize) -> Result<Vec<f32
 fn build_result_store(
     inner: &JammiSession,
     catalog: Arc<jammi_db::catalog::Catalog>,
+    placement: Arc<dyn jammi_db::index::SegmentPlacement>,
 ) -> Result<ResultStore> {
     let ann = inner.config().embedding.ann;
     // The one lease timing every leased row shares: the store's building
@@ -2239,6 +2267,12 @@ fn build_result_store(
     }?;
     Ok(store
         .with_lease_intervals(lease)
+        // The placed-search seams: who owns which segment (`AllLocal` unless
+        // the session was opened with a placement), and the gRPC transport a
+        // remote segment is searched through — the same client whether this
+        // process is a server replica or a library coordinator.
+        .with_placement(placement)
+        .with_peer_transport(Arc::new(jammi_wire::peer::GrpcPeerTransport::new()))
         // `[server] peer_local_load_bytes`: the marginal-load admission
         // budget of the placed-search failure ladder. Read by the store
         // (the only reader), from the same config a wire deployment and an

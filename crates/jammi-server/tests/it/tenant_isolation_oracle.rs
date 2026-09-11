@@ -139,6 +139,33 @@ const CONTROL_PLANE_ALLOWLIST: &[(&str, &str)] = &[
     ("LifecycleService", "Status"),
 ];
 
+/// Rpcs served ONLY on the internal `[server] peer_bind` listener — the first
+/// data-plane, handler-bearing, deliberately tenant-free entries, so they get
+/// their own bucket rather than riding the control-plane one. Each entry's
+/// text is the invariant: served only on peer_bind; tenant enforced by the
+/// coordinator; deliberately tenant-free.
+///
+/// The exemption's premise — that these paths are NOT reachable on the public
+/// listener — is proven in this file by
+/// [`peer_service_is_unimplemented_on_the_public_listener`]: the public
+/// `Routes` answer `UNIMPLEMENTED` for `/jammi.v1.peer.PeerService/*`, so no
+/// tenant-bearing caller can reach a tenant-free handler through the tenant
+/// layer. The coordinator (any `Search` caller) resolves the table through its
+/// own tenant-scoped catalog read before any fan-out; the owner verifies only
+/// segment-belongs-to-table at its input edge (I-PEER).
+const PEER_LISTENER_ALLOWLIST: &[(&str, &str, &str)] = &[
+    (
+        "PeerService",
+        "SegmentSearch",
+        "served only on peer_bind; tenant enforced by the coordinator; deliberately tenant-free",
+    ),
+    (
+        "PeerService",
+        "ExactRescore",
+        "served only on peer_bind; tenant enforced by the coordinator; deliberately tenant-free",
+    ),
+];
+
 // ---------------------------------------------------------------------------
 // Case model
 // ---------------------------------------------------------------------------
@@ -3083,6 +3110,9 @@ fn covered_on_wire(cases: &[IsolationCase]) -> BTreeSet<String> {
     for (service, rpc) in CONTROL_PLANE_ALLOWLIST {
         covered.insert(format!("{service}/{rpc}"));
     }
+    for (service, rpc, _why) in PEER_LISTENER_ALLOWLIST {
+        covered.insert(format!("{service}/{rpc}"));
+    }
     covered
 }
 
@@ -3139,6 +3169,11 @@ fn allowlist_and_cases_partition_the_wire_surface() {
     let allow_rpcs: BTreeSet<String> = CONTROL_PLANE_ALLOWLIST
         .iter()
         .map(|(s, r)| format!("{s}/{r}"))
+        .chain(
+            PEER_LISTENER_ALLOWLIST
+                .iter()
+                .map(|(s, r, _why)| format!("{s}/{r}")),
+        )
         .collect();
 
     // No rpc is both a case and allowlisted.
@@ -3197,4 +3232,48 @@ fn repo_root() -> std::path::PathBuf {
         .nth(2)
         .expect("workspace root is two levels above the crate manifest dir")
         .to_path_buf()
+}
+
+// ---------------------------------------------------------------------------
+// The peer-listener exemption's premise (A6 / commit-2 oracle (d))
+// ---------------------------------------------------------------------------
+
+/// The PUBLIC listener answers `UNIMPLEMENTED` for `/jammi.v1.peer.PeerService/*`:
+/// the peer routes are built outside `assemble_grpc_chain` and are never added
+/// to the public `Routes`, so tonic's router fallback refuses them. This is the
+/// invariant that makes [`PEER_LISTENER_ALLOWLIST`] sound — a tenant-bearing
+/// caller cannot reach the tenant-free owner handler through the public
+/// tenant layer. Holds at base and after: the invariant oracle, not a RED one.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn peer_service_is_unimplemented_on_the_public_listener() {
+    use jammi_wire::proto::peer::peer_service_client::PeerServiceClient;
+    use jammi_wire::proto::peer::{SegmentSearchRequest, StoragePrecision};
+
+    let server = crate::common::grpc::start_engine_server().await;
+    let channel = crate::common::grpc::channel(server.addr).await;
+    let mut client = PeerServiceClient::new(channel);
+    let err = client
+        .segment_search(SegmentSearchRequest {
+            table_name: "any".into(),
+            segment_ids: vec![0],
+            storage_precision: StoragePrecision::F32 as i32,
+            query: vec![1.0],
+            width: 1,
+            phase: jammi_wire::proto::peer::SegmentSearchPhase::Final as i32,
+        })
+        .await
+        .expect_err("the public listener must not serve PeerService");
+    assert_eq!(
+        err.code(),
+        tonic::Code::Unimplemented,
+        "public listener must answer UNIMPLEMENTED for PeerService/SegmentSearch: {err:?}"
+    );
+    for (service, rpc, why) in PEER_LISTENER_ALLOWLIST {
+        assert!(
+            why.contains("served only on peer_bind")
+                && why.contains("tenant enforced by the coordinator")
+                && why.contains("deliberately tenant-free"),
+            "{service}/{rpc}: the allowlist entry must carry the I-PEER text"
+        );
+    }
 }

@@ -23,6 +23,9 @@ use std::sync::{OnceLock, Weak};
 
 use jammi_ai::fine_tune::worker::{LoopState, WorkerShared};
 use jammi_db::catalog::lease_keeper::LeaseKeeper;
+use jammi_db::index::{PeerFailureCounters, PEER_FAILURE_LABELS};
+use prometheus::core::{Collector, Desc};
+use prometheus::proto::{Counter, LabelPair, Metric, MetricFamily, MetricType};
 use prometheus::{
     Encoder, Gauge, Histogram, HistogramOpts, IntCounter, IntCounterVec, IntGauge, IntGaugeVec,
     Opts, Registry, TextEncoder,
@@ -139,6 +142,12 @@ pub struct MetricsRegistry {
     /// `jammi_lease_heartbeat_age_seconds` — registered by
     /// [`Self::attach_keeper`] on every process that has a session.
     keeper: OnceLock<KeeperGauge>,
+    /// `PeerService` requests served on this replica's `[server] peer_bind`
+    /// listener as a segment OWNER, labelled by `rpc` (`SegmentSearch`,
+    /// `ExactRescore`). Driven by the whole-server [`crate::metrics_layer`]
+    /// on the peer listener — the observable that a coordinator's fan-out
+    /// actually reached this owner.
+    pub peer_requests: IntCounterVec,
 }
 
 /// The worker families and the `Weak` they are copied from on a scrape.
@@ -202,6 +211,16 @@ impl MetricsRegistry {
         )?;
         inner.register(Box::new(grpc_refused.clone()))?;
 
+        let peer_requests = IntCounterVec::new(
+            Opts::new(
+                "jammi_peer_requests_total",
+                "Total number of jammi.v1.peer.PeerService requests served on this replica's \
+                 [server] peer_bind listener, labelled by rpc.",
+            ),
+            &["rpc"],
+        )?;
+        inner.register(Box::new(peer_requests.clone()))?;
+
         Ok(Self {
             inner,
             grpc_requests,
@@ -211,6 +230,7 @@ impl MetricsRegistry {
             grpc_refused,
             worker: OnceLock::new(),
             keeper: OnceLock::new(),
+            peer_requests,
         })
     }
 
@@ -323,6 +343,21 @@ impl MetricsRegistry {
         }
     }
 
+    /// Register the placed-search failure-ladder counters
+    /// ([`PeerFailureCounters`], owned by the engine's result store) as
+    /// `jammi_peer_search_failures_total{reason}`, read at scrape. ADDITIVE:
+    /// `prometheus::Registry::register` takes `&self`, so this is called on
+    /// the shared registry after construction (by `OssServer::new`, with the
+    /// session's counters) and [`Self::new`]'s arity is unchanged. Registering
+    /// twice on one registry is the usual name-collision error.
+    pub fn register_peer_failures(
+        &self,
+        counters: Arc<PeerFailureCounters>,
+    ) -> Result<(), prometheus::Error> {
+        self.inner
+            .register(Box::new(PeerFailureCollector::new(counters)?))
+    }
+
     /// Borrow the underlying `prometheus::Registry`. Tests that want to
     /// scrape metrics directly use this to call `.gather()`.
     pub fn inner(&self) -> &Registry {
@@ -335,5 +370,61 @@ impl MetricsRegistry {
     /// apart.
     pub fn record_refusal(&self, reason: &str) {
         self.grpc_refused.with_label_values(&[reason]).inc();
+    }
+}
+
+/// The scrape-time adapter over the engine's [`PeerFailureCounters`]: one
+/// `jammi_peer_search_failures_total{reason}` sample per ladder outcome, read
+/// from the atomics at every `gather()` — the engine crate holds plain
+/// atomics and knows nothing of prometheus.
+struct PeerFailureCollector {
+    desc: Desc,
+    counters: Arc<PeerFailureCounters>,
+}
+
+impl PeerFailureCollector {
+    const NAME: &'static str = "jammi_peer_search_failures_total";
+    const HELP: &'static str = "Total number of placed-search failure-ladder outcomes on this \
+        replica as a coordinator, labelled by reason (deadline, unreachable, refused, torn, \
+        transport, retry_ok, local_load, unavailable).";
+
+    fn new(counters: Arc<PeerFailureCounters>) -> Result<Self, prometheus::Error> {
+        let desc = Desc::new(
+            Self::NAME.to_string(),
+            Self::HELP.to_string(),
+            vec!["reason".to_string()],
+            std::collections::HashMap::new(),
+        )?;
+        Ok(Self { desc, counters })
+    }
+}
+
+impl Collector for PeerFailureCollector {
+    fn desc(&self) -> Vec<&Desc> {
+        vec![&self.desc]
+    }
+
+    fn collect(&self) -> Vec<MetricFamily> {
+        let metrics = PEER_FAILURE_LABELS
+            .iter()
+            .map(|label| {
+                let mut pair = LabelPair::default();
+                pair.set_name("reason".to_string());
+                pair.set_value((*label).to_string());
+                let mut counter = Counter::default();
+                counter
+                    .set_value(self.counters.get(label).expect("label is in the fixed set") as f64);
+                let mut metric = Metric::default();
+                metric.set_label(vec![pair]);
+                metric.set_counter(counter);
+                metric
+            })
+            .collect();
+        let mut family = MetricFamily::default();
+        family.set_name(Self::NAME.to_string());
+        family.set_help(Self::HELP.to_string());
+        family.set_field_type(MetricType::COUNTER);
+        family.set_metric(metrics);
+        vec![family]
     }
 }

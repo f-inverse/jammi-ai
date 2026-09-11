@@ -6,7 +6,10 @@
 //! one `CatalogService` holding every catalog / metadata / lifecycle /
 //! observability verb, including the tenant trio. The data plane is the
 //! per-capability services (embedding / inference / job / eval / pipeline /
-//! trigger / audit). Both Flight SQL and the gRPC services share a
+//! trigger / audit). [`peer::PeerServer`] is the one service NOT on that
+//! listener: it is served only on the internal `[server] peer_bind` listener,
+//! outside the tenant layer (see its module docs). Both Flight SQL and the
+//! gRPC services share a
 //! [`session::SessionStore`] via the async tenant-binding layer
 //! ([`crate::tenant_resolver_layer`]) so a tenant
 //! bound through `CatalogService.SetTenant` is observable on any downstream
@@ -24,6 +27,7 @@ pub mod embedding;
 pub mod eval;
 pub mod inference;
 pub mod job;
+pub mod peer;
 pub mod pipeline;
 pub mod session;
 pub mod trigger;

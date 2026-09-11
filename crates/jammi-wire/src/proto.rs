@@ -39,3 +39,6 @@ pub mod audit {
 pub mod lifecycle {
     tonic::include_proto!("jammi.v1.lifecycle");
 }
+pub mod peer {
+    tonic::include_proto!("jammi.v1.peer");
+}

@@ -167,6 +167,11 @@ pub enum RefusedBound {
     Subscriptions,
     JobWaits,
     Timeout,
+    /// A server-streaming response ended by the server's DRAIN with an
+    /// `UNAVAILABLE` "server draining" trailer ([`PermitBody::Draining`]) —
+    /// counted from inside the body, never through [`RefusalStatusLayer`]
+    /// (the response headers were sent long before the drain).
+    Draining,
 }
 
 impl RefusedBound {
@@ -178,9 +183,14 @@ impl RefusedBound {
             RefusedBound::Subscriptions => "subscriptions",
             RefusedBound::JobWaits => "job_waits",
             RefusedBound::Timeout => "timeout",
+            RefusedBound::Draining => "draining",
         }
     }
 }
+
+/// The message [`PermitBody::Draining`] closes a stream with when the
+/// server begins its DRAIN.
+pub const DRAINING_MESSAGE: &str = "server draining";
 
 /// The label [`RefusalStatusLayer`] counts an unlabeled `RESOURCE_EXHAUSTED`
 /// response under — see the module docs' N5 section.
@@ -597,6 +607,11 @@ pub struct MethodClassLayer {
     wait_timeout: Option<Duration>,
     subscriptions: Option<Arc<Semaphore>>,
     job_waits: Option<Arc<Semaphore>>,
+    /// The server's drain watch and the registry the drain-ended streams are
+    /// counted in — `Some` on the server's serve path, `None` for a chain
+    /// served without a drain signal (streams then end only by their own
+    /// deadline or their natural end).
+    drain: Option<(tokio::sync::watch::Receiver<bool>, Arc<MetricsRegistry>)>,
 }
 
 impl MethodClassLayer {
@@ -608,7 +623,23 @@ impl MethodClassLayer {
                 .then(|| Arc::new(Semaphore::new(limits.max_subscriptions))),
             job_waits: (limits.max_job_waits != 0)
                 .then(|| Arc::new(Semaphore::new(limits.max_job_waits))),
+            drain: None,
         }
+    }
+
+    /// Attach the server's drain watch: from the moment it reads `true`,
+    /// every open `WaitJob`/`Subscribe` body ends with an `UNAVAILABLE`
+    /// [`DRAINING_MESSAGE`] trailer and is counted under
+    /// `jammi_grpc_refused_total{reason="draining"}` in `metrics`. Composes
+    /// with the stream deadline: a stream carries both, and whichever fires
+    /// first ends it.
+    pub fn with_drain(
+        mut self,
+        drain: tokio::sync::watch::Receiver<bool>,
+        metrics: Arc<MetricsRegistry>,
+    ) -> Self {
+        self.drain = Some((drain, metrics));
+        self
     }
 }
 
@@ -713,15 +744,17 @@ where
                 "max_subscriptions"
             };
 
+            let drain = self.layer.drain.clone();
             return match budget {
                 None => Box::pin(async move {
                     let response = inner.call(req).await?;
-                    Ok(response.map(|body| PermitBody::new(body, None, deadline)))
+                    Ok(response.map(|body| PermitBody::new(body, None, deadline, drain)))
                 }),
                 Some(sem) => match sem.try_acquire_owned() {
                     Ok(permit) => Box::pin(async move {
                         let response = inner.call(req).await?;
-                        Ok(response.map(|body| PermitBody::new(body, Some(permit), deadline)))
+                        Ok(response
+                            .map(|body| PermitBody::new(body, Some(permit), deadline, drain)))
                     }),
                     Err(_) => Box::pin(async move {
                         Ok(refuse::<ResBody>(
@@ -797,20 +830,56 @@ pub enum PermitBody<B> {
         message: String,
         fired: bool,
     },
+    /// The server's streaming body: the permit and (optional) deadline of
+    /// the shapes above, PLUS the drain ender — when the server's drain watch
+    /// reads `true` and the inner body has not ended, this synthesizes an
+    /// `UNAVAILABLE` [`DRAINING_MESSAGE`] trailer, counts the stream under
+    /// `jammi_grpc_refused_total{reason="draining"}`, and ends the stream, so
+    /// an idle `WaitJob`/`Subscribe` never holds a DRAIN open. Deadline and
+    /// drain compose: whichever fires first ends the stream.
+    Draining {
+        #[pin]
+        inner: B,
+        permit: Option<OwnedSemaphorePermit>,
+        deadline: Option<(Pin<Box<Sleep>>, String)>,
+        drain: Pin<Box<dyn Future<Output = ()> + Send>>,
+        metrics: Arc<MetricsRegistry>,
+        fired: bool,
+    },
 }
 
 impl<B> PermitBody<B> {
-    /// Build the right variant for a streaming response: no permit and no
-    /// deadline is a bare passthrough; a `deadline` (the header-less-request
-    /// arm, OR the within-budget-header arm — either way a `(duration,
-    /// arm-appropriate message)` pair) always produces `Deadlined`, with or
-    /// without a permit; otherwise (`permit` alone) `Permitted`, matching the
-    /// pre-existing shape.
+    /// Build the right variant for a streaming response. With a drain watch
+    /// (the server's serve path) always `Draining`, carrying whatever permit
+    /// and deadline apply. Without one: no permit and no deadline is a bare
+    /// passthrough; a `deadline` (the header-less-request arm, OR the
+    /// within-budget-header arm — either way a `(duration, arm-appropriate
+    /// message)` pair) always produces `Deadlined`, with or without a
+    /// permit; otherwise (`permit` alone) `Permitted`.
     fn new(
         inner: B,
         permit: Option<OwnedSemaphorePermit>,
         deadline: Option<(Duration, String)>,
+        drain: Option<(tokio::sync::watch::Receiver<bool>, Arc<MetricsRegistry>)>,
     ) -> Self {
+        if let Some((mut rx, metrics)) = drain {
+            let drain = Box::pin(async move {
+                // A closed sender means the server can never drain — the
+                // stream then ends only by deadline or its natural end.
+                if rx.wait_for(|v| *v).await.is_err() {
+                    std::future::pending::<()>().await;
+                }
+            });
+            return PermitBody::Draining {
+                inner,
+                permit,
+                deadline: deadline
+                    .map(|(cap, message)| (Box::pin(tokio::time::sleep(cap)), message)),
+                drain,
+                metrics,
+                fired: false,
+            };
+        }
         match deadline {
             Some((cap, message)) => PermitBody::Deadlined {
                 inner,
@@ -828,6 +897,17 @@ impl<B> PermitBody<B> {
             },
         }
     }
+}
+
+/// The terminal trailer frame a streaming body synthesizes when it ends a
+/// stream itself (a deadline, a drain): a [`tonic::Status`] with the limits
+/// detail encoded as `grpc-status` headers. See the `Deadlined` arm of
+/// `poll_frame` for why the header encode's `Result` is not `expect`ed.
+fn synthesized_trailers(code: Code, message: String) -> HeaderMap {
+    let status = limits_status(code, message);
+    let mut headers = HeaderMap::new();
+    let _ = status.add_header(&mut headers);
+    headers
 }
 
 /// Needed so [`GlobalConcurrencyLimit`] / [`PerConnectionLimit`] can wrap
@@ -887,22 +967,60 @@ where
                 if sleep.poll(cx).is_ready() {
                     permit.take();
                     *fired = true;
-                    let status = limits_status(Code::DeadlineExceeded, message.clone());
-                    let mut headers = HeaderMap::new();
                     // The message is a fixed, ASCII format string built by
                     // this module (`deadline_message` / `declared_deadline_message`)
                     // — encoding it as a gRPC trailer cannot fail in practice, so
-                    // this path is unreachable. The `let _ =` is not "degrades
-                    // gracefully": an empty `HeaderMap` here would carry NO
-                    // `grpc-status` at all (not merely a status without the
-                    // typed detail) — the stream would end with no decodable
-                    // terminal code, a real client-visible fault, not a lesser
-                    // but still-honest one. Kept infallible-by-construction on
-                    // purpose rather than a `.expect(...)`: a panic inside
-                    // `poll_frame` would abort the whole connection, a strictly
-                    // worse failure mode than the (unreachable) missing-trailer
-                    // shape this comment now names honestly.
-                    let _ = status.add_header(&mut headers);
+                    // the encode's error path is unreachable. The `let _ =` inside
+                    // `synthesized_trailers` is not "degrades gracefully": an
+                    // empty `HeaderMap` here would carry NO `grpc-status` at all
+                    // (not merely a status without the typed detail) — the
+                    // stream would end with no decodable terminal code, a real
+                    // client-visible fault, not a lesser but still-honest one.
+                    // Kept infallible-by-construction on purpose rather than a
+                    // `.expect(...)`: a panic inside `poll_frame` would abort the
+                    // whole connection, a strictly worse failure mode than the
+                    // (unreachable) missing-trailer shape this comment names
+                    // honestly.
+                    let headers = synthesized_trailers(Code::DeadlineExceeded, message.clone());
+                    return Poll::Ready(Some(Ok(Frame::trailers(headers))));
+                }
+                Poll::Pending
+            }
+            PermitBodyProj::Draining {
+                inner,
+                permit,
+                deadline,
+                drain,
+                metrics,
+                fired,
+            } => {
+                if *fired {
+                    return Poll::Ready(None);
+                }
+                // The inner body wins ties, exactly as in `Deadlined`.
+                match inner.poll_frame(cx) {
+                    Poll::Ready(Some(frame)) => return Poll::Ready(Some(frame)),
+                    Poll::Ready(None) => {
+                        permit.take();
+                        *fired = true;
+                        return Poll::Ready(None);
+                    }
+                    Poll::Pending => {}
+                }
+                if let Some((sleep, message)) = deadline.as_mut() {
+                    if sleep.as_mut().poll(cx).is_ready() {
+                        permit.take();
+                        *fired = true;
+                        let headers = synthesized_trailers(Code::DeadlineExceeded, message.clone());
+                        return Poll::Ready(Some(Ok(Frame::trailers(headers))));
+                    }
+                }
+                if drain.as_mut().poll(cx).is_ready() {
+                    permit.take();
+                    *fired = true;
+                    metrics.record_refusal(RefusedBound::Draining.label());
+                    let headers =
+                        synthesized_trailers(Code::Unavailable, DRAINING_MESSAGE.to_string());
                     return Poll::Ready(Some(Ok(Frame::trailers(headers))));
                 }
                 Poll::Pending
@@ -915,6 +1033,7 @@ where
             PermitBody::Passthrough(body) => body.is_end_stream(),
             PermitBody::Permitted { inner, .. } => inner.is_end_stream(),
             PermitBody::Deadlined { inner, fired, .. } => *fired || inner.is_end_stream(),
+            PermitBody::Draining { inner, fired, .. } => *fired || inner.is_end_stream(),
         }
     }
 
@@ -923,6 +1042,7 @@ where
             PermitBody::Passthrough(body) => body.size_hint(),
             PermitBody::Permitted { inner, .. } => inner.size_hint(),
             PermitBody::Deadlined { inner, .. } => inner.size_hint(),
+            PermitBody::Draining { inner, .. } => inner.size_hint(),
         }
     }
 }
@@ -1296,6 +1416,7 @@ mod tests {
             wait_timeout: Some(budget),
             subscriptions: None,
             job_waits: None,
+            drain: None,
         }
         .layer(NeverEnding);
 
@@ -1358,6 +1479,7 @@ mod tests {
             wait_timeout: Some(budget),
             subscriptions: None,
             job_waits: Some(Arc::clone(&job_waits)),
+            drain: None,
         }
         .layer(NeverEnding);
 

@@ -296,19 +296,39 @@ impl PyDatabase {
     /// Idempotent — calling `close()` again is a no-op that returns `None`,
     /// never an error. Every OTHER method on this handle raises
     /// `jammi.errors.BackendError` once this has run.
-    fn close(&self, py: Python<'_>) -> PyResult<()> {
+    ///
+    /// `release=False` (the default) is DRAIN: the embedded worker finishes
+    /// its in-flight job, then the catalog is released. `release=True` is
+    /// RELEASE — the engine's `EmbeddedWorker::release_and_stop` (or, with no
+    /// worker, `InferenceSession::release_job_leases`): every job lease this
+    /// process holds is handed back to the catalog at once and the loop is
+    /// stopped, so the in-flight job is claimable by a successor within one
+    /// idle poll and costs no attempt; then the catalog is released. The
+    /// honest limit of the library arm: Python cannot exit its host process,
+    /// so a training thread already running keeps running until its next
+    /// epoch boundary, where it bails without writing a bundle (its lease is
+    /// gone); if that thread reaches finalize before a successor claims, the
+    /// attempt-guarded CAS may still land `completed` — the one named
+    /// divergence from the server, which exits the process.
+    #[pyo3(signature = (release = false))]
+    fn close(&self, py: Python<'_>, release: bool) -> PyResult<()> {
         if self.closed.swap(true, std::sync::atomic::Ordering::AcqRel) {
             return Ok(());
         }
         py.detach(|| {
             self.runtime.block_on(async {
-                let stopped = match &self._worker {
-                    Some(worker) => worker.stop_and_join().await,
+                let stopped: Result<(), JammiError> = match (&self._worker, release) {
+                    (Some(worker), false) => worker.stop_and_join().await.map(|_| ()),
+                    (Some(worker), true) => worker.release_and_stop().await.map(|_| ()),
                     // `worker.enabled = false`: there is no claim loop to
-                    // stop. The session close below still runs — the catalog
+                    // stop. A release still runs the session's own (no-op by
+                    // construction) sweep so the surface is uniform. The
+                    // session close below runs either way — the catalog
                     // release is what a caller closes for, and it must not
-                    // depend on this connection having happened to own a worker.
-                    None => Ok(()),
+                    // depend on this connection having happened to own a
+                    // worker.
+                    (None, true) => self.session.release_job_leases().await.map(|_| ()),
+                    (None, false) => Ok(()),
                 };
                 // `InferenceSession::close` shuts the session's lease
                 // keeper (N3) down and joins its dedicated thread — closing
@@ -400,7 +420,7 @@ impl PyDatabase {
 
     /// List the engine processes currently running the claim loop
     /// (`[worker] enabled = true`), most recently seen first. Each entry is a
-    /// dict: `{"instance_id", "label", "host", "kinds", "started_at",
+    /// dict: `{"instance_id", "label", "host", "kinds", "state", "started_at",
     /// "last_seen_at"}` — the same field set `JobService.ListWorkers` relays.
     /// Fleet/liveness metadata, not tenant-scoped (mirrors the wire rpc).
     fn list_workers(&self, py: Python<'_>) -> PyResult<Py<PyAny>> {
@@ -416,6 +436,7 @@ impl PyDatabase {
             entry.set_item("label", w.label.as_deref().unwrap_or(""))?;
             entry.set_item("host", w.host.as_deref().unwrap_or(""))?;
             entry.set_item("kinds", &w.kinds)?;
+            entry.set_item("state", &w.state)?;
             entry.set_item("started_at", &w.started_at)?;
             entry.set_item("last_seen_at", &w.last_seen_at)?;
             list.append(entry)?;

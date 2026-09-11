@@ -101,11 +101,18 @@ class Session(Protocol):
     def supports(self, capability: Capability) -> bool:
         """Whether this backend carries a one-sided :class:`Capability`."""
 
-    def close(self) -> None:
+    def close(self, release: bool = False) -> None:
         """Release the session. Idempotent, and a REAL release on both transports:
         the gRPC + Flight channels remote, the catalog file (an awaited handshake,
         not a drop) embedded. Every verb afterwards raises
-        :class:`~jammi.errors.BackendError` on either transport."""
+        :class:`~jammi.errors.BackendError` on either transport.
+
+        ``release=True`` is the embedded engine's RELEASE mode: every job lease
+        this process holds is handed back to the catalog at once (the in-flight
+        job is claimable by a successor within one idle poll and costs no
+        attempt) before the catalog is released. The default is DRAIN: the
+        in-flight job finishes first. The remote arm accepts the flag and
+        ignores it — the leases live in the server process."""
 
     def __enter__(self) -> "Session": ...
     def __exit__(self, *exc: object) -> Optional[bool]: ...

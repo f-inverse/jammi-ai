@@ -7,6 +7,28 @@ workspace ships every publishable crate at the same
 ## [Unreleased]
 
 ### Added
+- **Two-mode shutdown — SIGTERM = DRAIN, SIGINT = RELEASE — on the server,
+  the Rust library and Python (#482).** A DRAIN finishes the in-flight job
+  (every epoch bundle lands, `completed` under the same attempt), ends idle
+  `WaitJob`/`Subscribe` streams with `UNAVAILABLE` "server draining"
+  (`jammi_grpc_refused_total{reason="draining"}`), flips `/readyz` to 503
+  "draining", and exits 0 — bounded only by the runtime's grace period. A
+  RELEASE (SIGINT, Ctrl+C, a second SIGTERM, or the new `jammi-server
+  release [--pid N]` subcommand) hands every job lease back at once — the
+  row stays `running` with a NULL lease and `releases + 1`, a compute job's
+  linked building-table lease with it — stops the loop and exits 0; a
+  successor claims within one idle poll and the job costs no attempt.
+  `EmbeddedWorker::{begin_drain, stop_and_join -> StopOutcome,
+  release_and_stop -> ReleaseReport, shared}`, `WorkerShared`, `LoopState`,
+  `InferenceSession::{release_job_leases, close_worker_gate,
+  open_worker_gate, worker_gate_receiver}`, `BoundServer::{serve_with_signals,
+  has_worker}`, `ShutdownOutcome`, `BoundChain::{take_worker,
+  serve_with_drain}`, `MethodClassLayer::with_drain`, `RefusedBound::Draining`;
+  Python `close(release=False)` on `Session`/`EmbeddedBackend`/
+  `RemoteDatabase` (the remote arm accepts and ignores it); `WorkerSummary`
+  and `ListWorkers` carry `state` (`warming`/`claiming`/`draining`), written
+  by the loop task in that order. The loop's idle sleep is interruptible, so a
+  drain of an idle worker never waits out `idle_poll_secs`.
 - **`jammi_db::catalog::result_repo::ResultTableCas` gains the `pub` field
   `lease_present: bool` (#482).** The struct is a re-exported pub struct
   with pub fields, so every literal `ResultTableCas { .. }` construction in

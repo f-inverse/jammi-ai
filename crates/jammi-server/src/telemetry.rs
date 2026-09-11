@@ -116,6 +116,25 @@ where
     Ok(())
 }
 
+/// Flush and stop the OTLP exporter at shutdown, when one was configured:
+/// `force_flush` (every buffered span sent, or the exporter's own timeout)
+/// then `shutdown` (the batch processor's thread and gRPC channel released).
+/// The `OnceLock` handle itself is never dropped. A no-op without the
+/// `telemetry-otlp` feature or without a configured endpoint. Called by
+/// both shutdown arms after the session has closed — the last
+/// span-producing work is done by then.
+pub fn flush_otlp() {
+    #[cfg(feature = "telemetry-otlp")]
+    if let Some(handle) = OTLP_PROVIDER_HANDLE.get() {
+        if let Err(e) = handle.force_flush() {
+            tracing::warn!(error = %e, "OTLP force_flush at shutdown failed");
+        }
+        if let Err(e) = handle.shutdown() {
+            tracing::warn!(error = %e, "OTLP shutdown failed");
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use std::io;

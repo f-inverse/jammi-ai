@@ -487,3 +487,170 @@ async fn n1_reclaimed_attempt_adopts_the_ready_partial_result_table() {
         "exactly one result table must exist for this job — no duplicate materialization"
     );
 }
+
+/// The escape `esc-110`'s own RED, on today's EXPIRY path (no RELEASE): a
+/// compute job's first attempt is parked inside `BuildingTable::finish`
+/// (its building row `building` under a live lease, `partial_result`
+/// recorded), its job lease expires and its building lease is expired; the
+/// second attempt's dispatch takes the claim-and-fail arm (`MaterializeAnew`),
+/// clears the stale `partial_result`, and the attempt runs to `completed`
+/// with its OWN `ready` table. Base: the second attempt's `create_result_table`
+/// CAS (`… AND partial_result IS NULL`) matches 0 rows against the
+/// once-written column → `JobAttemptSuperseded` → terminal `failed`.
+#[serial_test::serial(materialization_park)]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn expired_compute_attempt_re_materializes_on_the_successor() {
+    use jammi_db::catalog::result_repo::ResultTableCas;
+    use jammi_db::store::mutable::test_hook::{arm, MaterializationPoint};
+
+    let (session, _dir) = session_with_patents().await;
+    let lease = Duration::from_millis(60);
+    let writer_id = session.result_store().writer_id().to_string();
+
+    let spec = ComputeSpec::Embedding {
+        source_id: "patents".to_string(),
+        model_id: tiny_bert_model(),
+        columns: vec!["abstract".to_string()],
+        key_column: "id".to_string(),
+        modality: jammi_wire::request::Modality::Text,
+        cache: CachePolicy::Bypass,
+    };
+    let job_id = uuid::Uuid::new_v4().to_string();
+    let spec_json = serde_json::to_string(&spec).unwrap();
+    session
+        .catalog()
+        .submit_job(SubmitJobParams {
+            job_id: &job_id,
+            kind: spec.kind(),
+            execution: JobExecution::Queued,
+            spec: &spec_json,
+            model_ref: None,
+            output_model_id: None,
+            model_source: None,
+            priority: 0,
+        })
+        .await
+        .unwrap();
+
+    // Attempt 1 (a peer instance): claimed under a short lease; its producer
+    // parks inside `finish` with the building row leased and
+    // `partial_result` pointing at it.
+    let parked = arm(MaterializationPoint::Materialization, &writer_id);
+    let worker_a_id = format!("{}-a", session.instance_id());
+    let claimed1 = session
+        .catalog()
+        .claim_next(&worker_a_id, &[spec.kind()], lease)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(claimed1.attempts, 1);
+    let attempt1 = {
+        let session = Arc::clone(&session);
+        let spec = spec.clone();
+        let job_id = job_id.clone();
+        let worker_a_id = worker_a_id.clone();
+        tokio::spawn(async move {
+            execute_compute(
+                &session,
+                session.catalog(),
+                &spec,
+                JobAttempt {
+                    job_id: &job_id,
+                    instance_id: &worker_a_id,
+                    attempts: 1,
+                },
+            )
+            .await
+        })
+    };
+    parked
+        .wait_parked()
+        .await
+        .expect("attempt 1 parks inside finish");
+    let mid = session.catalog().get_job(&job_id).await.unwrap();
+    let table1 = mid
+        .partial_result
+        .clone()
+        .expect("attempt 1 recorded its building table");
+
+    // Both leases expire: the job's by time, the building row's through the
+    // test-only expiry (the catalog's own clock).
+    tokio::time::sleep(lease * 4).await;
+    session
+        .catalog()
+        .expire_lease_for_test(&ResultTableCas::writer(&table1, &writer_id, None))
+        .await
+        .unwrap();
+    session
+        .catalog()
+        .reclaim_expired_jobs(lease, 5)
+        .await
+        .unwrap();
+
+    // Attempt 2 under this session's own identity, driven through the real
+    // worker dispatch.
+    let claimed2 = session
+        .catalog()
+        .claim_next(
+            session.instance_id(),
+            &[spec.kind()],
+            Duration::from_secs(30),
+        )
+        .await
+        .unwrap()
+        .expect("the requeued job is claimable");
+    assert_eq!(claimed2.attempts, 2);
+    assert_eq!(claimed2.partial_result.as_deref(), Some(table1.as_str()));
+    let worker = JobWorker::with_intervals_and_kinds(
+        &session,
+        session.worker_intervals().unwrap(),
+        vec![spec.kind().to_string()],
+    );
+    worker.run_claimed_job(&session, claimed2).await;
+
+    let finished = session.catalog().get_job(&job_id).await.unwrap();
+    assert_eq!(
+        finished.status, "completed",
+        "the successor must re-materialize, got {:?} ({:?})",
+        finished.status, finished.error
+    );
+    let table2 = finished
+        .partial_result
+        .clone()
+        .expect("the successor recorded its own table");
+    assert_ne!(
+        table2, table1,
+        "a fresh table, never the failed predecessor's"
+    );
+    assert_eq!(
+        session
+            .catalog()
+            .get_result_table(&table2)
+            .await
+            .unwrap()
+            .unwrap()
+            .status,
+        "ready"
+    );
+    assert_eq!(
+        session
+            .catalog()
+            .get_result_table(&table1)
+            .await
+            .unwrap()
+            .unwrap()
+            .status,
+        "failed",
+        "the predecessor's row was claimed and failed by the successor's dispatch"
+    );
+
+    // Let attempt 1's parked writer go: its own promote misses (the row is
+    // `failed` under another owner) and the abandoned attempt errors out
+    // without touching the successor's result.
+    parked.release();
+    let _ = attempt1.await.unwrap();
+    assert_eq!(
+        session.catalog().get_job(&job_id).await.unwrap().status,
+        "completed"
+    );
+}

@@ -721,6 +721,8 @@ impl Catalog {
         let running = JobStatus::Running.to_string();
         let queued_execution = JobExecution::Queued.to_string();
         let instance_id = instance_id.to_string();
+        #[cfg(feature = "test-hooks")]
+        let instance_for_hook = instance_id.clone();
         let now = now_sortable();
         let kind = self.backend().backend_kind();
 
@@ -765,7 +767,22 @@ impl Catalog {
 
         self.backend()
             .transaction(TxOptions::default(), |tx| {
-                Box::pin(async move { tx.query_opt(&sql, &params, parse_row).await })
+                Box::pin(async move {
+                    let claimed = tx.query_opt(&sql, &params, parse_row).await?;
+                    // Test-only: hold a landed claim open before COMMIT (the
+                    // shutdown oracles' "claim in flight" window). A no-op
+                    // unless armed for this instance; never parks an empty
+                    // claim, so an idle loop's ticks cannot consume the arm.
+                    #[cfg(feature = "test-hooks")]
+                    if claimed.is_some() {
+                        super::claim_test_hooks::maybe_park(
+                            &instance_for_hook,
+                            super::claim_test_hooks::ParkPoint::ClaimBeforeCommit,
+                        )
+                        .await;
+                    }
+                    Ok(claimed)
+                })
             })
             .await
             .map_err(Into::into)

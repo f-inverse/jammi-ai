@@ -2589,7 +2589,8 @@ class RemoteDatabase:
         """The engine processes currently running the claim loop
         (`[worker] enabled = true`), most recently seen first: each entry
         carries ``instance_id``, ``label``, ``host``, ``kinds``,
-        ``started_at``, ``last_seen_at``. Maps to `JobService.ListWorkers`."""
+        ``state``, ``started_at``, ``last_seen_at``. Maps to
+        `JobService.ListWorkers`."""
         resp = self._call(self._job.ListWorkers, job_pb2.ListWorkersRequest())
         return [
             {
@@ -2599,6 +2600,7 @@ class RemoteDatabase:
                 "kinds": w.kinds,
                 "started_at": w.started_at,
                 "last_seen_at": w.last_seen_at,
+                "state": w.state,
             }
             for w in resp.workers
         ]
@@ -2792,8 +2794,13 @@ class RemoteDatabase:
 
     # --- Lifecycle ---------------------------------------------------------------
 
-    def close(self) -> None:
+    def close(self, release: bool = False) -> None:
         """Close the underlying channels. Idempotent.
+
+        ``release`` is accepted for surface parity with the embedded arm and
+        ignored: the leases live in the SERVER process, which hands them back
+        on its own RELEASE (SIGINT / `jammi-server release`), never through a
+        client's channel close.
 
         A TRANSPORT release, and only that: the remote arm holds no catalog
         file. The server owns the catalog and whatever single-process lock its

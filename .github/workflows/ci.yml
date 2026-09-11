@@ -78,8 +78,16 @@ jobs:
       # a prospective gap, not a live one; if it needs closing, it needs a
       # macro-aware (or item-doc-scoped) checker, not a reinstated line-shape
       # scanner with the over/under-approximation problems above.
+      #
+      # jammi-server's `test-hooks` arm: its test targets (and the
+      # `CARGO_BIN_EXE_jammi-server` they spawn) are built with the engine's
+      # rendezvous hooks through the `jammi-ai = { features = ["test-hooks"] }`
+      # dev-dependency union (`crates/jammi-server/Cargo.toml`); the explicit
+      # feature here lints that closure by name, beside the jammi-ai line.
       - name: Clippy (gated test surfaces — compile-only feature closure)
-        run: cargo clippy -p jammi-ai --tests --features live-gpu-tests,live-distributed-tests -- -D warnings
+        run: |
+          cargo clippy -p jammi-ai --tests --features live-gpu-tests,live-distributed-tests -- -D warnings
+          cargo clippy -p jammi-server --tests --features test-hooks -- -D warnings
 
   test:
     name: Test (hermetic)

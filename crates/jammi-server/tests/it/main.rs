@@ -35,6 +35,7 @@ mod mount_tenant_scoped;
 mod probe;
 mod serve_bind_race;
 mod serve_e2e;
+mod serve_shutdown_modes;
 mod server;
 mod service_tiers;
 mod tenant_isolation_oracle;

@@ -30,6 +30,7 @@ mod instance_identity;
 mod jammi;
 mod jobs_cancel;
 mod jobs_compute;
+mod jobs_shutdown;
 mod local_session;
 mod media_front_end;
 mod merger;

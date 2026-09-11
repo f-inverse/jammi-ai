@@ -63,6 +63,12 @@ pub struct InferenceSession {
     /// This session's `instances` row hold — held for its `Drop` (releases
     /// the keeper renewal when the session drops), never read.
     _instance_hold: jammi_db::catalog::lease_keeper::LeaseHold,
+    /// The worker gate (warm-before-claim): a claim loop spawned over this
+    /// session waits for `true` before its first claim. Open by default —
+    /// fixtures and library callers never touch it; a server closes it
+    /// ([`Self::close_worker_gate`]) before binding while it preloads models
+    /// and opens it ([`Self::open_worker_gate`]) once warm.
+    worker_gate: tokio::sync::watch::Sender<bool>,
 }
 
 /// The model-side links a training kind's `jobs` row is submitted with —
@@ -256,6 +262,8 @@ impl InferenceSession {
         let ann_cache_size = inner.config().cache.ann_cache_max_entries as u64;
         let ann_cache = Arc::new(AnnCache::new(ann_cache_size));
 
+        let (worker_gate, _) = tokio::sync::watch::channel(true);
+
         Ok(Self {
             inner,
             model_cache,
@@ -269,7 +277,58 @@ impl InferenceSession {
             instance_id,
             lease_keeper,
             _instance_hold: instance_hold,
+            worker_gate,
         })
+    }
+
+    /// Close the worker gate: a claim loop over this session (spawned
+    /// before or after this call) parks before its first claim, with its
+    /// `workers` row reading `warming`, until [`Self::open_worker_gate`].
+    /// A server closes it while `preload_models` loads, so `/readyz` never
+    /// says "preloading" while this process is already claiming.
+    pub fn close_worker_gate(&self) {
+        self.worker_gate.send_replace(false);
+    }
+
+    /// Open the worker gate (the default state): a parked loop passes its
+    /// wait, flips its row to `claiming` and claims.
+    pub fn open_worker_gate(&self) {
+        self.worker_gate.send_replace(true);
+    }
+
+    /// A receiver on the worker gate — what a claim loop `wait_for(|open|
+    /// *open)`s before its first claim.
+    pub fn worker_gate_receiver(&self) -> tokio::sync::watch::Receiver<bool> {
+        self.worker_gate.subscribe()
+    }
+
+    /// RELEASE this session's job leases without a loop to stop — the
+    /// library's `release_and_stop` when no worker was spawned, and the
+    /// server's when `[worker] enabled = false`: 2b (the keeper releases
+    /// every `LeaseTarget::Job` hold it holds — inline holds return
+    /// `Ok(false)` and are left alone) then 2c (the jobs sweep and the
+    /// jobs-linked building sweep). With no loop-claimed row on this
+    /// instance every statement matches nothing by construction, so on a
+    /// worker-less process this is a no-op that keeps the surface uniform.
+    /// Returns `(holds released, sweep counts)`.
+    pub async fn release_job_leases(
+        &self,
+    ) -> Result<(usize, crate::fine_tune::worker::ReleaseSweep)> {
+        let heartbeat = self.worker_intervals()?.heartbeat;
+        let holds = match self.lease_keeper.release_job_holds(heartbeat).await {
+            Ok(n) => n,
+            Err(e) => {
+                tracing::warn!(error = %e, "release_job_leases: the keeper's per-hold pass failed");
+                0
+            }
+        };
+        let sweep = crate::fine_tune::worker::release_sweep(
+            self.catalog(),
+            &self.instance_id,
+            self.result_store.writer_id(),
+        )
+        .await;
+        Ok((holds, sweep))
     }
 
     /// This process's `instances`/`jobs.claimed_by` identity (N3): a UUID

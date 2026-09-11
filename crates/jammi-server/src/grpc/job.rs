@@ -325,6 +325,7 @@ impl JobService for JobServer {
                     kinds: w.kinds,
                     started_at: w.started_at,
                     last_seen_at: w.last_seen_at,
+                    state: w.state,
                 })
                 .collect(),
         }))

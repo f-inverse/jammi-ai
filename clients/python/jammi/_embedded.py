@@ -165,8 +165,19 @@ class EmbeddedBackend:
         """Remote-only: the embedded engine has no per-connection session id."""
         raise NotSupportedOnBackend(Capability.SESSION_ID)
 
-    def close(self) -> None:
+    def close(self, release: bool = False) -> None:
         """Stop this session's training worker and RELEASE the catalog file.
+
+        ``release=False`` (the default) is DRAIN: the worker finishes the job
+        it is running, then the catalog is released. ``release=True`` is the
+        engine's RELEASE mode (`EmbeddedWorker::release_and_stop`): every job
+        lease this process holds is handed back to the catalog at once — the
+        row stays ``running`` with a NULL lease and ``releases + 1``, so a
+        successor process claims it within one idle poll (not one lease
+        window) and the job costs no attempt — then the loop is stopped and
+        the catalog released. Python cannot exit its host process, so a
+        training thread already running keeps running until its next epoch
+        boundary, where it bails without writing a bundle.
 
         The embedded peer of :meth:`~jammi.RemoteDatabase.close`, and the only
         bounded point at which the artifact directory becomes somebody else's to
@@ -200,7 +211,7 @@ class EmbeddedBackend:
         call is the moment its directory, queued jobs and all, becomes a
         claiming process's to open. See :func:`jammi.connect`.
         """
-        self._native.close()
+        self._native.close(release)
 
     def __enter__(self) -> "EmbeddedBackend":
         return self
@@ -479,7 +490,7 @@ class EmbeddedBackend:
         """The engine processes currently running the claim loop
         (`[worker] enabled = true`), most recently seen first: each entry
         carries ``instance_id``, ``label``, ``host``, ``kinds``,
-        ``started_at``, ``last_seen_at``."""
+        ``state``, ``started_at``, ``last_seen_at``."""
         return self._native.list_workers()
 
     def prune_jobs(self) -> int:

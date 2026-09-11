@@ -35,19 +35,20 @@ pub async fn run(
 
 fn print_header() {
     println!(
-        "{:<38} {:<16} {:<20} {:<12} {:<26} Last Seen",
-        "Instance ID", "Label", "Host", "Kinds", "Started"
+        "{:<38} {:<16} {:<20} {:<12} {:<9} {:<26} Last Seen",
+        "Instance ID", "Label", "Host", "Kinds", "State", "Started"
     );
-    println!("{}", "-".repeat(130));
+    println!("{}", "-".repeat(140));
 }
 
 fn print_row(w: &WorkerSummary) {
     println!(
-        "{:<38} {:<16} {:<20} {:<12} {:<26} {}",
+        "{:<38} {:<16} {:<20} {:<12} {:<9} {:<26} {}",
         w.instance_id,
         if w.label.is_empty() { "—" } else { &w.label },
         w.host,
         w.kinds,
+        w.state,
         w.started_at,
         w.last_seen_at,
     );

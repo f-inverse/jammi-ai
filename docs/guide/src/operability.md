@@ -42,7 +42,7 @@ SQL layer, and request-bounds layer stack feed:
 | `jammi_flight_queries_total`    | counter   | A Flight SQL `DoGet` query.                                 |
 | `jammi_eval_invocations_total`  | counter   | An `EvalService/*` RPC.                                     |
 | `jammi_search_latency_seconds`  | histogram | End-to-end `EmbeddingService/Search` request latency.       |
-| `jammi_grpc_refused_total{reason}` | counter | A request refused by `[server.limits]` — `reason` ∈ `message_size`, `in_flight`, `in_flight_per_connection`, `subscriptions`, `job_waits`, `timeout`. See [Request bounds](#request-bounds-serverlimits). |
+| `jammi_grpc_refused_total{reason}` | counter | A request refused by `[server.limits]` — `reason` ∈ `message_size`, `in_flight`, `in_flight_per_connection`, `subscriptions`, `job_waits`, `timeout`, `draining` (a `WaitJob`/`Subscribe` stream ended by the server's DRAIN — see [Shutdown](./deploy-server.md#shutdown-drain-and-release)). See [Request bounds](#request-bounds-serverlimits). |
 
 ```text
 # HELP jammi_grpc_requests_total Total number of gRPC requests served across all jammi.v1 services.

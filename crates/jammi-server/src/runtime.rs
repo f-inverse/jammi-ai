@@ -31,7 +31,7 @@ use jammi_db::audit::{ensure_master_key_present, EnvSigningKeyStore, FileSigning
 use jammi_db::config::{JammiConfig, SigningKeyConfig};
 use tokio::net::TcpListener;
 use tokio::signal;
-use tokio::sync::broadcast;
+use tokio::sync::{oneshot, watch};
 use tonic::transport::server::TcpIncoming;
 use tonic::transport::Server;
 use tonic_web::GrpcWebLayer;
@@ -217,17 +217,39 @@ pub trait ReadinessCheck: Send + Sync {
 }
 
 /// Wrapper that holds the active [`ReadinessCheck`] behind an `Arc` so
-/// Axum can share it across handlers via `State`.
+/// Axum can share it across handlers via `State`, plus the process-level
+/// readiness phases a probe cannot know on its own: draining (a shutdown
+/// began — `/readyz` 503 `"draining"` so a balancer stops routing here while
+/// in-flight work finishes).
 pub struct ReadinessProbe {
     inner: Arc<dyn ReadinessCheck>,
+    draining: std::sync::atomic::AtomicBool,
 }
 
 impl ReadinessProbe {
     pub fn new(inner: Arc<dyn ReadinessCheck>) -> Self {
-        Self { inner }
+        Self {
+            inner,
+            draining: std::sync::atomic::AtomicBool::new(false),
+        }
+    }
+
+    /// `/readyz` reports 503 `"draining"` from now on — set by the DRAIN and
+    /// RELEASE arms of [`BoundServer::serve_with_signals`].
+    pub fn begin_drain(&self) {
+        self.draining
+            .store(true, std::sync::atomic::Ordering::SeqCst);
+    }
+
+    /// Whether a shutdown has begun.
+    pub fn is_draining(&self) -> bool {
+        self.draining.load(std::sync::atomic::Ordering::SeqCst)
     }
 
     pub async fn check(&self) -> Result<(), String> {
+        if self.is_draining() {
+            return Err("draining".to_string());
+        }
         self.inner.check().await
     }
 }
@@ -365,25 +387,29 @@ impl OssServer {
         // handle `serve_with_shutdown` has to release the catalog through
         // once the serve loop drains.
         let session = Arc::clone(&self.session);
-        let grpc = assemble_grpc_chain(self.build_grpc_chain())?.bind().await?;
+        let readiness = Arc::clone(&self.readiness);
+        let mut grpc = assemble_grpc_chain(self.build_grpc_chain())?.bind().await?;
+        // Hoist the worker guard out of the chain (D3): ownership decides
+        // who can DRAIN or RELEASE, and the server's two-mode shutdown needs
+        // the guard alive past the gRPC serve future, which the chain would
+        // otherwise drop it with.
+        let worker = grpc.take_worker();
         Ok(BoundServer {
             grpc,
             health_listener,
             health_addr,
             health_router,
             session,
+            worker,
+            readiness,
         })
     }
 
-    /// Drive the server until SIGINT / SIGTERM arrives. Both the HTTP
-    /// side-channel and the gRPC surface drain in parallel; the call
-    /// returns when both have stopped accepting new connections and
-    /// finished serving in-flight requests.
+    /// Drive the server until a shutdown signal arrives — SIGTERM = DRAIN,
+    /// SIGINT (or any signal while draining) = RELEASE; see
+    /// [`BoundServer::serve`].
     pub async fn run(self) -> Result<(), ServerError> {
-        self.bind()
-            .await?
-            .serve_with_shutdown(shutdown_signal())
-            .await
+        self.bind().await?.serve().await.map(|_| ())
     }
 
     /// Variant of [`Self::run`] that accepts a caller-provided
@@ -471,13 +497,35 @@ pub struct BoundServer {
     health_addr: SocketAddr,
     health_router: Router,
     /// The engine session, kept alive past [`OssServer::bind`] so
-    /// [`Self::serve_with_shutdown`] can release its catalog connections
+    /// [`Self::serve_with_signals`] can release its catalog connections
     /// (including the lease keeper's own, N3) once the serve loop has fully
     /// drained — the graceful-shutdown release point a `SIGTERM`'d
     /// `jammi-server` needs so a successor process can open the same
     /// SQLite catalog directory immediately, exactly as the embedded
     /// engine's `close()` does.
     session: Arc<InferenceSession>,
+    /// The embedded job worker guard, hoisted out of the chain at bind (D3)
+    /// so the two-mode shutdown owns it: `None` when `[worker] enabled =
+    /// false`.
+    worker: Option<jammi_ai::fine_tune::worker::EmbeddedWorker>,
+    /// The readiness probe, so a shutdown can flip `/readyz` to 503.
+    readiness: Arc<ReadinessProbe>,
+}
+
+/// How [`BoundServer::serve_with_signals`] ended.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ShutdownOutcome {
+    /// DRAIN completed: the gRPC surface drained and the worker (if any)
+    /// finished its in-flight job and was joined.
+    Drained {
+        /// `true` when a worker loop was actually stopped and joined;
+        /// `false` on a worker-less process.
+        worker_joined: bool,
+    },
+    /// RELEASE completed: every lease this process held was handed back and
+    /// the loop stopped; `main` exits the process at once (a detached
+    /// training thread may still be running).
+    Released,
 }
 
 impl BoundServer {
@@ -495,84 +543,198 @@ impl BoundServer {
         self.health_addr
     }
 
+    /// Whether this server owns an embedded worker guard (`[worker]
+    /// enabled`).
+    pub fn has_worker(&self) -> bool {
+        self.worker.is_some()
+    }
+
     /// Serve both halves on the already-bound listeners until `shutdown`
-    /// resolves. The HTTP side-channel and the gRPC surface drain in parallel;
-    /// the call returns when both have stopped accepting new connections and
-    /// finished serving in-flight requests.
+    /// resolves, then DRAIN: the gRPC surface drains and — concurrently,
+    /// gated on the same signal so the worker is never stopped at t = 0 —
+    /// the embedded worker finishes its in-flight job and is joined. A
+    /// RELEASE is never requested on this entry; [`Self::serve_with_signals`]
+    /// is the two-signal form.
     pub async fn serve_with_shutdown(
         self,
         shutdown: impl Future<Output = ()> + Send + 'static,
     ) -> Result<(), ServerError> {
-        // Fan out one shutdown signal to both servers. A `broadcast`
-        // channel gives every subscriber an independent receiver and
-        // does not require the futures to share lifetimes.
-        let (shutdown_tx, _) = broadcast::channel::<()>(1);
-        let mut shutdown_health_rx = shutdown_tx.subscribe();
-        let mut shutdown_grpc_rx = shutdown_tx.subscribe();
-        let shutdown_tx_for_signal = shutdown_tx.clone();
+        let (drain_tx, drain_rx) = watch::channel(false);
+        // Dropped with the task: a closed release sender reads as "never".
+        let (_release_tx, release_rx) = watch::channel(false);
         tokio::spawn(async move {
             shutdown.await;
-            // Receivers may already be gone if the servers errored
-            // first; either way the broadcast send is best-effort.
-            let _ = shutdown_tx_for_signal.send(());
+            let _ = drain_tx.send(true);
         });
+        self.serve_with_signals(drain_rx, release_rx)
+            .await
+            .map(|_| ())
+    }
 
+    /// Serve both halves until a signal arrives on `drain_rx` (DRAIN) or
+    /// `release_rx` (RELEASE) — the two-mode shutdown, PostgreSQL's mapping
+    /// (SIGTERM smart, SIGINT fast). A closed sender on either watch reads as
+    /// "that signal never comes".
+    ///
+    /// **DRAIN** (`drain_rx` → `true`): `/readyz` flips to 503 `"draining"`;
+    /// tonic's graceful shutdown closes the listener and finishes in-flight
+    /// requests while every idle `WaitJob`/`Subscribe` stream is ended with a
+    /// typed `UNAVAILABLE` "server draining" trailer (counted under
+    /// `jammi_grpc_refused_total{reason="draining"}`); concurrently the
+    /// worker's `begin_drain` + `stop_and_join` lets the in-flight job finish
+    /// (keeper alive, every epoch bundle lands) and joins the loop. Then the
+    /// health task stops, the session closes, OTLP flushes, and this returns
+    /// [`ShutdownOutcome::Drained`]. No engine-side timeout: the runtime's
+    /// grace period (`terminationGracePeriodSeconds`, `stop_grace_period`)
+    /// bounds it. An in-flight UNARY (including an inline `run_now`) is
+    /// bounded only by that grace.
+    ///
+    /// **RELEASE** (`release_rx` → `true`, at any time — it races the whole
+    /// DRAIN sequence): the gRPC serve future is dropped (connections
+    /// severed; an inline `run_now` future dies here and its row is left to
+    /// the inline liveness reclaim), then `EmbeddedWorker::release_and_stop`
+    /// hands every lease back and stops the loop (or, with no worker,
+    /// `InferenceSession::release_job_leases`, a no-op by construction), then
+    /// the same health/session/OTLP tail, and this returns
+    /// [`ShutdownOutcome::Released`] — the binary exits the process at once.
+    pub async fn serve_with_signals(
+        self,
+        drain_rx: watch::Receiver<bool>,
+        release_rx: watch::Receiver<bool>,
+    ) -> Result<ShutdownOutcome, ServerError> {
         let BoundServer {
             grpc,
             health_listener,
             health_addr,
             health_router,
             session,
+            worker,
+            readiness,
         } = self;
         tracing::info!(
             address = %health_addr,
             "HTTP side-channel listening (/healthz, /readyz, /metrics)"
         );
 
+        // The health side-channel stays up through a DRAIN (D13) — it is
+        // signalled only at the very end, on its own channel.
+        let (health_stop_tx, health_stop_rx) = oneshot::channel::<()>();
         let health_task = tokio::spawn(async move {
             axum::serve(health_listener, health_router)
                 .with_graceful_shutdown(async move {
-                    let _ = shutdown_health_rx.recv().await;
+                    let _ = health_stop_rx.await;
                 })
                 .await
                 .map_err(ServerError::from)
         });
 
-        // Run both halves to completion. If either errors out we still
-        // wait for the other to drain — abandoning a running server
-        // mid-shutdown corrupts in-flight connections.
-        let grpc_result = grpc
-            .serve_with_shutdown(async move {
-                let _ = shutdown_grpc_rx.recv().await;
-            })
-            .await;
-        if grpc_result.is_err() {
-            let _ = shutdown_tx.send(());
+        enum Arm {
+            Drained {
+                grpc: Result<(), ServerError>,
+                worker_joined: bool,
+            },
+            Release,
         }
+
+        let arm = {
+            let grpc_serve = grpc.serve_with_drain(drain_rx.clone());
+            let mut drain_gate = drain_rx.clone();
+            let worker_ref = worker.as_ref();
+            let readiness_ref = Arc::clone(&readiness);
+            // The gated join half: nothing here runs until DRAIN is
+            // signalled, so the worker is never stopped at t = 0.
+            let gated_join = async move {
+                let _ = drain_gate.wait_for(|v| *v).await;
+                readiness_ref.begin_drain();
+                match worker_ref {
+                    Some(w) => {
+                        w.begin_drain().await;
+                        match w.stop_and_join().await {
+                            Ok(jammi_ai::fine_tune::worker::StopOutcome::Joined) => true,
+                            Ok(jammi_ai::fine_tune::worker::StopOutcome::NothingToJoin) => false,
+                            Err(e) => {
+                                tracing::error!(error = %e, "DRAIN: the worker join failed");
+                                false
+                            }
+                        }
+                    }
+                    None => false,
+                }
+            };
+            let drain_sequence = async { tokio::join!(grpc_serve, gated_join) };
+            let mut release_rx = release_rx;
+            let release_wait = async move {
+                if release_rx.wait_for(|v| *v).await.is_err() {
+                    std::future::pending::<()>().await;
+                }
+            };
+            tokio::select! {
+                (grpc, worker_joined) = drain_sequence => Arm::Drained { grpc, worker_joined },
+                () = release_wait => Arm::Release,
+            }
+        };
+
+        let (result, outcome) = match arm {
+            Arm::Drained {
+                grpc,
+                worker_joined,
+            } => (grpc, ShutdownOutcome::Drained { worker_joined }),
+            Arm::Release => {
+                // Step 1 already happened: `select!` dropped the drain
+                // sequence, and with it the gRPC serve future — connections
+                // severed. Step 2: the one release mechanism.
+                readiness.begin_drain();
+                let released = match worker.as_ref() {
+                    Some(w) => w.release_and_stop().await.map(|report| {
+                        tracing::info!(
+                            ?report.loop_state,
+                            holds_released = report.holds_released,
+                            ?report.sweep_one,
+                            ?report.sweep_two,
+                            "RELEASE: leases handed back; the loop is stopped"
+                        );
+                    }),
+                    None => session.release_job_leases().await.map(|(holds, sweep)| {
+                        tracing::info!(
+                            holds_released = holds,
+                            ?sweep,
+                            "RELEASE on a worker-less process: nothing loop-claimed to release"
+                        );
+                    }),
+                };
+                (
+                    released.map_err(ServerError::from),
+                    ShutdownOutcome::Released,
+                )
+            }
+        };
+
+        // The tail both arms share: stop the health side-channel, release
+        // the catalog (the keeper's own connection included, N3 — a
+        // successor process can open the same SQLite catalog directory at
+        // once), flush telemetry.
+        let _ = health_stop_tx.send(());
         let health_result = match health_task.await {
             Ok(r) => r,
             Err(join_err) => Err(ServerError::Io(std::io::Error::other(join_err.to_string()))),
         };
-
-        // Both halves have stopped accepting and finished draining
-        // in-flight requests — the graceful-shutdown release point.
-        // `InferenceSession::close` shuts the lease keeper (N3) down and
-        // joins its dedicated thread (closing its own catalog connection)
-        // before closing the shared pool, so a `SIGTERM`'d `jammi-server`
-        // releases the SQLite `unix-excl` lock exactly as the embedded
-        // engine's `close()` does — a successor process can open the same
-        // catalog directory immediately rather than waiting out the process
-        // exit.
         session.close().await;
+        crate::telemetry::flush_otlp();
 
-        grpc_result.and(health_result)
+        result.and(health_result).map(|()| outcome)
     }
 
-    /// Serve both halves until SIGINT / SIGTERM arrives. The binary entry
-    /// point ([`OssServer::run`] and `main`) reaches graceful shutdown through
-    /// this.
-    pub async fn serve(self) -> Result<(), ServerError> {
-        self.serve_with_shutdown(shutdown_signal()).await
+    /// Serve both halves until an OS signal arrives — the binary entry
+    /// point. One task owns both signal streams from this point on (tokio
+    /// coalesces signals only before a stream's first poll): the first
+    /// SIGTERM is DRAIN; SIGINT at any time, or any later SIGTERM, is
+    /// RELEASE. Ctrl+C on a laptop therefore releases the running job and
+    /// exits promptly, exactly as `kill -INT` does in a container.
+    pub async fn serve(self) -> Result<ShutdownOutcome, ServerError> {
+        let (drain_tx, drain_rx) = watch::channel(false);
+        let (release_tx, release_rx) = watch::channel(false);
+        tokio::spawn(signal_watcher(drain_tx, release_tx));
+        self.serve_with_signals(drain_rx, release_rx).await
     }
 }
 
@@ -1005,6 +1167,15 @@ impl BoundChain {
         &self.mounted
     }
 
+    /// Take the embedded worker guard out of the chain, so a caller that
+    /// needs it to outlive the gRPC serve future (the server's two-mode
+    /// shutdown) owns it. After this the chain's own serve paths hold no
+    /// worker and their `Drop` stops nothing. `None` when this process runs
+    /// no claim loop, or when it was already taken.
+    pub fn take_worker(&mut self) -> Option<jammi_ai::fine_tune::worker::EmbeddedWorker> {
+        self._worker.take()
+    }
+
     /// Serve the bound chain on its already-open listener until `shutdown`
     /// resolves. Consumes `self`, keeping the training-worker guard alive for
     /// the whole serve loop.
@@ -1031,6 +1202,25 @@ impl BoundChain {
         self,
         shutdown: impl Future<Output = ()> + Send + 'static,
     ) -> Result<(), ServerError> {
+        let (drain_tx, drain_rx) = watch::channel(false);
+        tokio::spawn(async move {
+            shutdown.await;
+            let _ = drain_tx.send(true);
+        });
+        self.serve_with_drain(drain_rx).await
+    }
+
+    /// [`Self::serve_with_shutdown`] on a drain watch: tonic's graceful
+    /// shutdown (listener closed, in-flight requests finished) begins when
+    /// `drain_rx` reads `true`, and the same watch feeds
+    /// [`crate::limits::MethodClassLayer`]'s stream ender, so an idle
+    /// `WaitJob`/`Subscribe` stream is ended with `UNAVAILABLE` "server
+    /// draining" instead of holding the drain open forever. A closed sender
+    /// reads as "never drain".
+    pub async fn serve_with_drain(
+        self,
+        drain_rx: watch::Receiver<bool>,
+    ) -> Result<(), ServerError> {
         tracing::info!(
             "gRPC chain ({}) listening on {}",
             self.mounted.join(" + "),
@@ -1042,7 +1232,14 @@ impl BoundChain {
         // `add_routes` attaches it behind the stack at serve time, then serves
         // on the pre-bound listener via `serve_with_incoming_shutdown`.
         let refusal_metrics = Arc::clone(&self.metrics);
+        let drain_metrics = Arc::clone(&self.metrics);
         let limits = self.limits;
+        let mut shutdown_rx = drain_rx.clone();
+        let shutdown = async move {
+            if shutdown_rx.wait_for(|v| *v).await.is_err() {
+                std::future::pending::<()>().await;
+            }
+        };
         let mut server = Server::builder()
             .accept_http1(true)
             .layer(MetricsLayer::new(self.metrics))
@@ -1056,14 +1253,16 @@ impl BoundChain {
             .layer(crate::limits::PerConnectionLimitLayer::new(
                 limits.max_in_flight_per_connection,
             ))
-            .layer(crate::limits::MethodClassLayer::new(&limits));
+            .layer(
+                crate::limits::MethodClassLayer::new(&limits).with_drain(drain_rx, drain_metrics),
+            );
         server
             .add_routes(self.routes)
             .serve_with_incoming_shutdown(self.incoming, shutdown)
             .await
             .map_err(ServerError::from)
-        // `self._worker` is dropped here, after the serve future resolves — its
-        // RAII lifetime spans the whole serve loop.
+        // `self._worker` (if not taken) is dropped here, after the serve
+        // future resolves — its RAII lifetime spans the whole serve loop.
     }
 }
 
@@ -1319,39 +1518,80 @@ pub async fn serve_grpc_chain(
     assemble_grpc_chain(chain)?.serve(shutdown).await
 }
 
-/// Install OS shutdown handlers and resolve when SIGINT or SIGTERM
-/// arrives. Mirrors the existing `lib.rs` behaviour so the binary
-/// shuts down on Ctrl+C and on `docker stop` (which sends SIGTERM).
-async fn shutdown_signal() {
-    let ctrl_c = async {
-        match signal::ctrl_c().await {
-            Ok(()) => {}
-            Err(e) => tracing::error!("Failed to install Ctrl+C handler: {e}"),
-        }
-    };
-
+/// The one task that owns both OS signal streams for the process's
+/// lifetime (tokio coalesces a signal only before its stream's first poll;
+/// after that every delivery is an item): the first SIGTERM sends DRAIN on
+/// `drain_tx`; SIGINT at any time, or any SIGTERM after the first, sends
+/// RELEASE on `release_tx` and the task ends. PostgreSQL's mapping — SIGTERM
+/// smart, SIGINT fast — and the reason RELEASE is reachable by a distinct
+/// signal: an orchestrator sends one stop signal then SIGKILL, so a second
+/// SIGTERM never arrives from it; `jammi-server release` (a preStop hook)
+/// and Ctrl+C send SIGINT.
+async fn signal_watcher(drain_tx: watch::Sender<bool>, release_tx: watch::Sender<bool>) {
     #[cfg(unix)]
-    let terminate = async {
-        match signal::unix::signal(signal::unix::SignalKind::terminate()) {
-            Ok(mut sig) => {
-                sig.recv().await;
+    {
+        let mut interrupt = match signal::unix::signal(signal::unix::SignalKind::interrupt()) {
+            Ok(s) => Some(s),
+            Err(e) => {
+                tracing::error!("Failed to install SIGINT handler: {e}");
+                None
             }
+        };
+        let mut terminate = match signal::unix::signal(signal::unix::SignalKind::terminate()) {
+            Ok(s) => Some(s),
             Err(e) => {
                 tracing::error!("Failed to install SIGTERM handler: {e}");
-                std::future::pending::<()>().await;
+                None
+            }
+        };
+        let mut draining = false;
+        loop {
+            let on_interrupt = async {
+                match interrupt.as_mut() {
+                    Some(s) => {
+                        s.recv().await;
+                    }
+                    None => std::future::pending::<()>().await,
+                }
+            };
+            let on_terminate = async {
+                match terminate.as_mut() {
+                    Some(s) => {
+                        s.recv().await;
+                    }
+                    None => std::future::pending::<()>().await,
+                }
+            };
+            tokio::select! {
+                () = on_interrupt => {
+                    tracing::info!("SIGINT received: RELEASE — handing leases back and exiting");
+                    let _ = release_tx.send(true);
+                    return;
+                }
+                () = on_terminate => {
+                    if draining {
+                        tracing::info!("second SIGTERM while draining: RELEASE");
+                        let _ = release_tx.send(true);
+                        return;
+                    }
+                    draining = true;
+                    tracing::info!("SIGTERM received: DRAIN — finishing in-flight work");
+                    let _ = drain_tx.send(true);
+                }
             }
         }
-    };
-
-    #[cfg(not(unix))]
-    let terminate = std::future::pending::<()>();
-
-    tokio::select! {
-        () = ctrl_c => {},
-        () = terminate => {},
     }
-
-    tracing::info!("Shutdown signal received, draining connections...");
+    #[cfg(not(unix))]
+    {
+        let _ = &drain_tx;
+        match signal::ctrl_c().await {
+            Ok(()) => {
+                tracing::info!("Ctrl+C received: RELEASE");
+                let _ = release_tx.send(true);
+            }
+            Err(e) => tracing::error!("Failed to install Ctrl+C handler: {e}"),
+        }
+    }
 }
 
 #[cfg(test)]

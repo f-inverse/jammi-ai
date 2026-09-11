@@ -4375,6 +4375,7 @@ dependencies = [
  "jammi-numerics",
  "jammi-test-utils",
  "jammi-wire",
+ "libc",
  "object_store",
  "parquet",
  "pin-project",

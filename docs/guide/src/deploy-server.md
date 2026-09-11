@@ -262,9 +262,58 @@ The Flight SQL surface is a **query** interface (read path); the ML operations a
 
 The typed gRPC surface is what an edge runtime speaks (it has no HTTP/2 client for Flight SQL's bidirectional streaming). `EmbeddingService` serves `AddSource`, `GenerateEmbeddings`, `EncodeQuery`, and `Search` over plain gRPC — and, since tonic-web is mounted, over **gRPC-web** — so an edge function running the engine as a sidecar can ingest, encode, **and** search without the library. `Search` accepts a precomputed vector or an existing `row_key` (query-by-example, with the vector resolved inside the engine); see [Semantic Search](./semantic-search.md#search-over-grpc-edge-runtimes). `JobService` (core, always mounted) serves all three training kinds over gRPC and `InferenceService.Predict` serves a trained context predictor — so a client can offload training and prediction to a GPU server with the same verb surface the embedded engine exposes.
 
-## Graceful shutdown
+## Shutdown: DRAIN and RELEASE
 
-The server drains active connections on SIGTERM / Ctrl+C before exiting. In-flight queries complete; long-running operations started via the library are unaffected.
+The server has two shutdown modes, PostgreSQL's mapping: **SIGTERM = DRAIN**
+(smart) and **SIGINT = RELEASE** (fast); any signal received while draining
+is a RELEASE. There is no engine-side drain timeout — the runtime's grace
+period (`terminationGracePeriodSeconds`, `stop_grace_period`) bounds a
+DRAIN, then SIGKILL.
+
+**DRAIN** (`kill -TERM`, `docker stop`, a Kubernetes pod deletion):
+`/readyz` flips to `503 {"status":"not_ready","detail":"draining"}`; the
+listener closes and in-flight requests finish; every idle `WaitJob` /
+`Subscribe` stream is ended with `UNAVAILABLE` "server draining" (counted
+under `jammi_grpc_refused_total{reason="draining"}`); the embedded worker
+finishes the job it is running — its lease keeps renewing, every epoch
+bundle lands, the job reaches `completed` under the same attempt — and
+claims no more. Then the catalog is released and the process exits 0. An
+in-flight **unary** (an inline `run_now` such as `GenerateEmbeddings`) is
+bounded only by the grace period. A DRAIN that outlives the grace is
+SIGKILLed: the running job's lease then expires after one `[lease]
+duration_secs`, a successor requeues it (resuming from its last epoch
+bundle) and it consumes one attempt.
+
+**RELEASE** (`kill -INT`, Ctrl+C, `jammi-server release`, or a second
+SIGTERM): connections are severed at once; every job lease this process
+holds is handed back — the row stays `running` under this instance with
+`lease_expires_at = NULL` and `releases + 1`, and a compute job's linked
+building-table lease is NULLed with it — the loop is stopped (cooperatively
+while no job is under a hold, by abort while one is), the `workers` row is
+deleted, the catalog released, and the process exits 0 at once. A released
+row is claimable by any other worker within one `[worker] idle_poll_secs`,
+never one lease window; the reclaim cap counts `attempts - releases`, so a
+rollout storm of releases never burns the three attempts a genuine crash
+does. The abandoned training thread never finalizes: its lease is gone and
+its next epoch boundary bails without a bundle, so the `_resume` manifest
+epoch never advances past the last landed one. Two named exceptions (§3.5 of
+the design): a claim caught between its COMMIT and its hold registration
+past one heartbeat keeps its live lease and is recovered by the expiry path
+(one lease window, `attempts + 1`, never `failed`); and a compute job whose
+linked building sweep errored while the jobs sweep succeeded makes the
+successor back off once (one lease window) before it re-materializes.
+
+`jammi-server release [--pid N]` sends SIGINT to `N` (default 1, the
+container entrypoint) and exits 0 when the signal was sent — the uniform
+RELEASE actuator for a `preStop` hook, since the distroless images carry no
+shell for `kill`. It knows nothing about jobs. The library reaches the same
+mechanism through `EmbeddedWorker::release_and_stop` and Python's
+`close(release=True)`; there the process survives, so a thread that reaches
+finalize before a successor claims may still land `completed` — the one
+documented divergence from the server, which exits.
+
+`ListWorkers` / `jammi workers` show each claim loop's `state`: `warming`
+(the process is preloading; nothing claimed yet), `claiming`, or `draining`.
 
 ## The identity seam
 

@@ -18,7 +18,7 @@ use tempfile::tempdir;
 use tokio::sync::Barrier;
 
 /// Every migration name, in ledger order. Mirrors `catalog::migrations::MIGRATIONS`
-/// (K5: append-only, currently ending at 031) -- a new migration is added here
+/// (K5: append-only, currently ending at 032) -- a new migration is added here
 /// in the same change.
 const EXPECTED_MIGRATION_NAMES: &[&str] = &[
     "001_core_tables",
@@ -52,6 +52,7 @@ const EXPECTED_MIGRATION_NAMES: &[&str] = &[
     "029_jobs_instances_workers",
     "030_jobs_idempotency_key",
     "031_jobs_releases_workers_state",
+    "032_result_table_versions",
 ];
 
 async fn open_sqlite_backend(path: &std::path::Path) -> std::sync::Arc<SqliteBackend> {
@@ -1068,7 +1069,6 @@ async fn concurrent_migrate_on_fresh_sqlite_is_safe() {
 /// Require-gate (KO-7) mirroring `recovery.rs`: an unset `JAMMI_TEST_PG_URL`
 /// silently skips the Postgres arm by default, but a lane that sets
 /// `JAMMI_REQUIRE_PG` must run it, so the skip becomes a loud failure there.
-#[cfg(feature = "live-postgres-tests")]
 fn require_live_pg(test_name: &str) {
     if std::env::var_os("JAMMI_REQUIRE_PG").is_some() {
         panic!(
@@ -1388,4 +1388,178 @@ async fn migration_031_is_ordered_after_030_and_adds_releases_and_workers_state(
         1,
         "idx_jobs_kind_status must exist on jobs"
     );
+}
+
+/// Migration 032 creates `result_table_versions` (with its lease index),
+/// adds the nullable `current_version` and the `NOT NULL DEFAULT 0`
+/// `next_version` to `result_tables`, and the nullable `version` stamp to
+/// `index_segments` — on both backends.
+#[test_case::test_case(jammi_db::catalog::backend::BackendKind::Sqlite ; "sqlite")]
+#[cfg_attr(
+    feature = "live-postgres-tests",
+    test_case::test_case(jammi_db::catalog::backend::BackendKind::Postgres ; "postgres")
+)]
+#[tokio::test]
+async fn migration_032_creates_result_table_versions(
+    kind: jammi_db::catalog::backend::BackendKind,
+) {
+    use jammi_db::catalog::backend::BackendKind;
+    let dir = tempdir().unwrap();
+    let backend = match kind {
+        BackendKind::Sqlite => {
+            BackendImpl::Sqlite(open_sqlite_backend(&dir.path().join("catalog.db")).await)
+        }
+        BackendKind::Postgres => {
+            let Some(url) = jammi_test_utils::pg_url_for_tests() else {
+                require_live_pg("migration_032_creates_result_table_versions");
+                eprintln!("skipping postgres: JAMMI_TEST_PG_URL unset");
+                return;
+            };
+            BackendImpl::Postgres(
+                jammi_db::catalog::backend_postgres::PostgresBackend::open_with_options(
+                    &url, 4, None,
+                )
+                .await
+                .unwrap(),
+            )
+        }
+    };
+    backend.migrate().await.unwrap();
+
+    // The table exists and holds no row for a table this test never created
+    // (the Postgres lane shares one database with every other test, so a
+    // global emptiness assertion would be a test-ordering fact, not a
+    // migration fact).
+    let probe = format!("mig032_probe_{}", jammi_test_utils::unique_suffix());
+    let count: i64 = backend
+        .transaction(
+            TxOptions {
+                read_only: true,
+                ..Default::default()
+            },
+            |tx| {
+                let probe = probe.clone();
+                Box::pin(async move {
+                    tx.query_opt(
+                        "SELECT count(*) AS c FROM result_table_versions WHERE table_name = $1",
+                        &[jammi_db::catalog::backend::SqlValue::TextOwned(probe)],
+                        |row| row.get::<i64>("c"),
+                    )
+                    .await
+                    .map(|c| c.unwrap_or(-1))
+                })
+            },
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        count, 0,
+        "result_table_versions must exist (and be queryable)"
+    );
+
+    // The three ADD COLUMNs: nullable current_version, NOT NULL DEFAULT 0
+    // next_version, nullable index_segments.version — read through the
+    // backend's own catalog so both dialects answer the same question.
+    let columns: Vec<(String, String, bool)> = backend
+        .transaction(
+            TxOptions {
+                read_only: true,
+                ..Default::default()
+            },
+            |tx| {
+                Box::pin(async move {
+                    match kind {
+                        BackendKind::Sqlite => {
+                            let mut out = Vec::new();
+                            for table in ["result_tables", "index_segments"] {
+                                let rows = tx
+                                    .query(
+                                        &format!(
+                                            "SELECT name, \"notnull\" FROM pragma_table_info('{table}')"
+                                        ),
+                                        &[],
+                                        |row| {
+                                            let name: String = row.get("name")?;
+                                            let notnull: i32 = row.get("notnull")?;
+                                            Ok((table.to_string(), name, notnull == 1))
+                                        },
+                                    )
+                                    .await?;
+                                out.extend(rows);
+                            }
+                            Ok(out)
+                        }
+                        BackendKind::Postgres => {
+                            tx.query(
+                                "SELECT table_name, column_name, is_nullable \
+                                 FROM information_schema.columns \
+                                 WHERE table_name IN ('result_tables', 'index_segments')",
+                                &[],
+                                |row| {
+                                    let table: String = row.get("table_name")?;
+                                    let name: String = row.get("column_name")?;
+                                    let nullable: String = row.get("is_nullable")?;
+                                    Ok((table, name, nullable == "NO"))
+                                },
+                            )
+                            .await
+                        }
+                    }
+                })
+            },
+        )
+        .await
+        .unwrap();
+    let has = |t: &str, c: &str, notnull: bool| {
+        columns
+            .iter()
+            .any(|(tt, cc, nn)| tt == t && cc == c && *nn == notnull)
+    };
+    assert!(
+        has("result_tables", "current_version", false),
+        "result_tables.current_version must be nullable; got {columns:?}"
+    );
+    assert!(
+        has("result_tables", "next_version", true),
+        "result_tables.next_version must be NOT NULL; got {columns:?}"
+    );
+    assert!(
+        has("index_segments", "version", false),
+        "index_segments.version must be nullable; got {columns:?}"
+    );
+
+    // A pre-existing row reads `next_version = 0` through the default.
+    let dflt: i64 = backend
+        .transaction(TxOptions::default(), |tx| {
+            Box::pin(async move {
+                let name = format!("mig032_{}", jammi_test_utils::unique_suffix());
+                tx.execute(
+                    "INSERT INTO result_tables (table_name, source_id, model_id, task, \
+                     parquet_path, created_at) VALUES ($1, 's', 'm', 'text_embedding', 'p', 'now')",
+                    &[jammi_db::catalog::backend::SqlValue::TextOwned(
+                        name.clone(),
+                    )],
+                )
+                .await?;
+                let v = tx
+                    .query_opt(
+                        "SELECT next_version FROM result_tables WHERE table_name = $1",
+                        &[jammi_db::catalog::backend::SqlValue::TextOwned(
+                            name.clone(),
+                        )],
+                        |row| row.get::<i32>("next_version"),
+                    )
+                    .await?
+                    .unwrap_or(-1);
+                tx.execute(
+                    "DELETE FROM result_tables WHERE table_name = $1",
+                    &[jammi_db::catalog::backend::SqlValue::TextOwned(name)],
+                )
+                .await?;
+                Ok(i64::from(v))
+            })
+        })
+        .await
+        .unwrap();
+    assert_eq!(dflt, 0, "next_version defaults to 0");
 }

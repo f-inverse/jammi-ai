@@ -395,16 +395,19 @@ async fn remote_list_index_segments_matches_local_byte_for_byte() {
                 segment_id: 0,
                 index_path: "file:///idx/segmented_rt-0".to_string(),
                 row_count: 3,
+                version: None,
             },
             IndexSegment {
                 segment_id: 1,
                 index_path: "file:///idx/segmented_rt-1".to_string(),
                 row_count: 7,
+                version: None,
             },
             IndexSegment {
                 segment_id: 2,
                 index_path: "file:///idx/segmented_rt-2".to_string(),
                 row_count: 11,
+                version: None,
             },
         ],
         "both transports must carry every segment, ordered by segment_id"

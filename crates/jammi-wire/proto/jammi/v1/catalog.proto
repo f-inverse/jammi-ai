@@ -563,6 +563,9 @@ message IndexSegment {
   string index_path = 2;
   // The number of rows this segment indexes.
   uint64 row_count = 3;
+  // The version (a refresh or compaction of the table) that produced this
+  // segment; unset for a base segment written while the table was building.
+  optional int64 version = 4;
 }
 
 message ListIndexSegmentsResponse {

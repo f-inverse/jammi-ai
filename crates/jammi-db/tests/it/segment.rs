@@ -428,11 +428,13 @@ async fn session_lists_a_tables_segments_in_segment_id_order() {
                 segment_id: 0,
                 index_path: "file:///idx/seg-0".to_string(),
                 row_count: 3,
+                version: None,
             },
             IndexSegment {
                 segment_id: 1,
                 index_path: "file:///idx/seg-1".to_string(),
                 row_count: 7,
+                version: None,
             },
         ],
         "the session verb must return every segment of the table, ordered by segment_id"
@@ -532,4 +534,243 @@ async fn session_hides_another_tenants_segments_and_an_unknown_table_alike() {
         1,
         "the catalog-level read is parent-scoped, not independently tenant-filtered"
     );
+}
+
+/// Promote a `building` fixture table to `ready` the way every versioned-table
+/// test needs one: the row is `ready`, `current_version` NULL, `next_version`
+/// 0 (a never-refreshed table).
+async fn ready_table(store: &ResultStore) -> ResultTableRecord {
+    let table = building_table(store).await;
+    let name = table.table_name().to_string();
+    table.detach();
+    store
+        .catalog()
+        .update_result_table_status(
+            &name,
+            jammi_db::catalog::status::ResultTableStatus::Ready,
+            0,
+        )
+        .await
+        .unwrap();
+    store
+        .catalog()
+        .get_result_table(&name)
+        .await
+        .unwrap()
+        .unwrap()
+}
+
+// C2 — the version allocator is monotonic and never reuses a number: two
+// allocations take 0 and 1; failing 1 keeps it; the next allocation takes 2;
+// expiring 1 never lowers `next_version`. A segment appended under a version
+// is stamped with it (excluded from the base set) and reaped with it; the
+// base publish and the publish CAS swap `current_version` exactly once.
+#[cfg_attr(test, test_case(BackendKind::Sqlite ; "sqlite"))]
+#[cfg_attr(
+    all(test, feature = "live-postgres-tests"),
+    test_case(BackendKind::Postgres ; "postgres")
+)]
+#[tokio::test]
+async fn allocation_is_monotonic_and_never_reused(kind: BackendKind) {
+    use jammi_db::catalog::version_repo::{PublishVersion, VersionCas};
+
+    let dir = tempdir().unwrap();
+    let Some(backend) = open_backend(kind, dir.path()).await else {
+        eprintln!("skipping {kind:?}: JAMMI_TEST_PG_URL unset");
+        require_live_pg("allocation_is_monotonic_and_never_reused");
+        return;
+    };
+    let catalog = fresh_catalog(backend).await;
+    let store = store(dir.path(), Arc::clone(&catalog), StoragePrecision::F32);
+    let table = ready_table(&store).await;
+    assert_eq!(table.current_version, None);
+    assert_eq!(table.next_version, 0);
+
+    // Two allocations on the same parent: 0 then 1, both parent None.
+    let v0 = store.allocate_version(&table).await.unwrap();
+    assert_eq!((v0.version(), v0.parent_version()), (0, None));
+    let v1 = store.allocate_version(&table).await.unwrap();
+    assert_eq!((v1.version(), v1.parent_version()), (1, None));
+    assert!(
+        v1.manifest_url()
+            .as_str()
+            .ends_with(&format!("{}__v1.version.json", table.table_name)),
+        "manifest path embeds the version: {}",
+        v1.manifest_url()
+    );
+
+    // A segment appended under version 1 is stamped 1, excluded from the
+    // base set, and listed under its version.
+    let seg = v1
+        .append_segment(&built_index(
+            &[("k", [1.0, 0.0, 0.0, 0.0])],
+            StoragePrecision::F32,
+        ))
+        .await
+        .unwrap();
+    let all = catalog
+        .list_index_segments(&table.table_name)
+        .await
+        .unwrap();
+    assert_eq!(all.len(), 1);
+    assert_eq!(all[0].segment_id, seg.0);
+    assert_eq!(all[0].version, Some(1));
+    assert!(catalog
+        .list_base_index_segments(&table.table_name)
+        .await
+        .unwrap()
+        .is_empty());
+    assert_eq!(
+        catalog
+            .list_index_segments_for_version(&table.table_name, 1)
+            .await
+            .unwrap()
+            .len(),
+        1
+    );
+    let seg_usearch = jammi_test_utils::url_to_path(&all[0].index_path).with_extension("usearch");
+    assert!(seg_usearch.exists());
+
+    // Fail 1 (abort): the row is `failed`, its bundle and segment row reaped,
+    // the number kept; the next allocation is 2.
+    v1.abort().await.unwrap();
+    let row1 = catalog
+        .get_result_table_version(&table.table_name, 1)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(row1.status, "failed");
+    assert!(
+        !seg_usearch.exists(),
+        "the aborted version's bundle is reaped"
+    );
+    assert!(catalog
+        .list_index_segments(&table.table_name)
+        .await
+        .unwrap()
+        .is_empty());
+    let v2 = store.allocate_version(&table).await.unwrap();
+    assert_eq!(v2.version(), 2);
+    let after = catalog
+        .get_result_table(&table.table_name)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(after.next_version, 3);
+
+    // Expiring the failed row never lowers `next_version`.
+    assert!(catalog
+        .delete_result_table_version(&table.table_name, 1)
+        .await
+        .unwrap());
+    let after = catalog
+        .get_result_table(&table.table_name)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(after.next_version, 3);
+    assert_eq!(
+        catalog
+            .list_result_table_versions(&table.table_name)
+            .await
+            .unwrap()
+            .iter()
+            .map(|v| v.version)
+            .collect::<Vec<_>>(),
+        vec![0, 2]
+    );
+    v0.detach();
+    v2.detach();
+
+    // The base publish is a CAS on `current_version IS NULL AND next_version
+    // = $B`: on a fresh table it takes B = 0 and lands the ready row.
+    let fresh = ready_table(&store).await;
+    catalog
+        .publish_base_version(&fresh.table_name, 0, "mem://base.version.json", "id0", 7)
+        .await
+        .unwrap();
+    let fresh_row = catalog
+        .get_result_table(&fresh.table_name)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        (fresh_row.current_version, fresh_row.next_version),
+        (Some(0), 1)
+    );
+    let base = catalog
+        .get_result_table_version(&fresh.table_name, 0)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        (base.status.as_str(), base.live_rows, base.masked_rows),
+        ("ready", Some(7), Some(0))
+    );
+    // A second base publish misses the CAS (current_version is no longer NULL).
+    let miss = catalog
+        .publish_base_version(&fresh.table_name, 1, "mem://x", "id1", 7)
+        .await
+        .expect_err("a second base publish must miss");
+    assert!(
+        matches!(miss, jammi_db::error::JammiError::CasFailed { .. }),
+        "{miss:?}"
+    );
+
+    // publish_version: the delta allocated on parent 0 swaps current_version
+    // to 1; a second allocation whose parent is 0 then misses at publish.
+    let d1 = store.allocate_version(&fresh_row).await.unwrap();
+    assert_eq!((d1.version(), d1.parent_version()), (1, Some(0)));
+    let d2 = store.allocate_version(&fresh_row).await.unwrap();
+    assert_eq!((d2.version(), d2.parent_version()), (2, Some(0)));
+    let cas1 = VersionCas::writer(&fresh.table_name, 1, store.writer_id(), None);
+    catalog
+        .publish_version(PublishVersion {
+            cas: &cas1,
+            lease: std::time::Duration::from_secs(30),
+            parent: Some(0),
+            identity: "id-v1",
+            live_rows: 8,
+            masked_rows: 1,
+            anchors_json: "[]",
+        })
+        .await
+        .unwrap();
+    let cas2 = VersionCas::writer(&fresh.table_name, 2, store.writer_id(), None);
+    let miss = catalog
+        .publish_version(PublishVersion {
+            cas: &cas2,
+            lease: std::time::Duration::from_secs(30),
+            parent: Some(0),
+            identity: "id-v2",
+            live_rows: 8,
+            masked_rows: 1,
+            anchors_json: "[]",
+        })
+        .await
+        .expect_err("the second publisher on a stale parent must miss");
+    assert!(
+        matches!(miss, jammi_db::error::JammiError::CasFailed { .. }),
+        "{miss:?}"
+    );
+    let row = catalog
+        .get_result_table(&fresh.table_name)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        (row.current_version, row.row_count, row.next_version),
+        (Some(1), 8, 3)
+    );
+    let v2row = catalog
+        .get_result_table_version(&fresh.table_name, 2)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        v2row.status, "building",
+        "a missed publish rolls back the whole transaction"
+    );
+    d1.detach();
+    d2.detach();
 }

@@ -1,5 +1,6 @@
 pub mod artifact;
 pub mod building;
+pub mod building_version;
 pub mod content_hash;
 pub mod freshness;
 pub mod layout;
@@ -12,6 +13,7 @@ pub mod vectors;
 
 pub use artifact::{ArtifactStore, LocalArtifact};
 pub use building::BuildingTable;
+pub use building_version::BuildingVersion;
 pub use freshness::{
     CacheOutcome, CachePolicy, CurrentAnchor, DerivesFromEdge, StaleReason, Staleness,
 };
@@ -1795,6 +1797,186 @@ impl ResultStore {
             // Lost the race for `next` (another appender inserted it first);
             // re-read the max and retry at the new next id.
         }
+    }
+
+    /// Allocate the next version of the READY table `table` under this
+    /// store's writer id and lease: the catalog's monotonic allocation
+    /// ([`Catalog::allocate_result_table_version`]) plus the lease-held handle
+    /// every refresh/compaction write routes through. The handle carries the
+    /// table's persisted precision (every segment it appends must match) and
+    /// the row's own tenant.
+    pub async fn allocate_version(&self, table: &ResultTableRecord) -> Result<BuildingVersion> {
+        let parquet_url = StorageUrl::parse(&table.parquet_path)?;
+        let allocated = self
+            .catalog
+            .allocate_result_table_version(&table.table_name, &self.writer_id, self.lease.lease())
+            .await?;
+        let manifest_url = StorageUrl::parse(&allocated.manifest_path)?;
+        let tenant = parse_owner(table)?;
+        Ok(BuildingVersion::adopt(
+            self.clone(),
+            table.table_name.clone(),
+            parquet_url,
+            allocated.version,
+            allocated.parent,
+            manifest_url,
+            tenant,
+            self.writer_id.to_string(),
+            table.storage_precision.unwrap_or_default(),
+        ))
+    }
+
+    /// Persist a fully-built [`SidecarIndex`] as a NEW immutable segment
+    /// stamped with `version`'s number, registered under the version's lease
+    /// — the same read-max / insert / collision-retry loop as
+    /// [`Self::append_segment`], with the version row (not the table row) as
+    /// the lease check ([`Catalog::insert_index_segment_for_version`]); the
+    /// bundle is saved second so a save failure leaves a row with an absent
+    /// bundle for the version's own reap. Precision must equal the table's.
+    pub async fn append_segment_for_version(
+        &self,
+        version: &BuildingVersion,
+        index: &SidecarIndex,
+    ) -> Result<SegmentId> {
+        let precision = version.storage_precision();
+        if index.storage_precision() != precision {
+            return Err(JammiError::Other(format!(
+                "append_segment_for_version: index built at {:?} but table '{}' is persisted at \
+                 {:?} — a segment must match its table's precision",
+                index.storage_precision(),
+                version.table_name(),
+                precision
+            )));
+        }
+        let row_count = index.len();
+        let cas = version.cas();
+        loop {
+            let next = self
+                .catalog
+                .max_index_segment_id(version.table_name())
+                .await?
+                .map_or(0, |m| m + 1);
+            let seg_url = layout::segment_url(version.parquet_url(), next)?;
+            if self
+                .catalog
+                .insert_index_segment_for_version(&cas, next, seg_url.as_str(), row_count)
+                .await?
+            {
+                self.save_sidecar(&seg_url, index).await?;
+                return Ok(SegmentId(next));
+            }
+        }
+    }
+
+    /// Reap every artifact stamped with `version` of the table at
+    /// `parquet_url`: `__v{N}.parquet`, `__v{N}.deletes.parquet`,
+    /// `__v{N}.version.json`, and every `version = N` segment (bundle siblings
+    /// then catalog rows, [`Self::purge_segments_for_version`]). NEVER the
+    /// base Parquet, its `.materialization.json`, or a `version IS NULL`
+    /// segment. The caller has already performed the CAS that licenses this
+    /// (the version row's `failed`, or expiry's row delete). 404 is not an
+    /// error; a real delete failure lands in `errored`, never swallowed.
+    pub(crate) async fn reap_version_artifacts(
+        &self,
+        parquet_url: &StorageUrl,
+        table_name: &str,
+        version: i64,
+    ) -> Result<DeletionOutcome> {
+        let mut deleted = BTreeSet::new();
+        let mut errored = BTreeSet::new();
+        for url in [
+            layout::version_fragment_url(parquet_url, version)?,
+            layout::version_deletes_url(parquet_url, version)?,
+            layout::version_manifest_url(parquet_url, version)?,
+        ] {
+            let handle = self.open_parquet(&url)?;
+            let path = handle.data_path()?;
+            match handle.delete_if_exists(&path).await {
+                Ok(DeleteOutcome::Deleted) => {
+                    if let Some(rel) = reconcile::relative_to(&self.root, &url) {
+                        deleted.insert(rel);
+                    }
+                }
+                Ok(DeleteOutcome::Absent) => {}
+                Err(e) => {
+                    warn!(
+                        table = table_name,
+                        version,
+                        object = %url,
+                        error = %e,
+                        "reap_version_artifacts: delete failed; left for reconcile to retry"
+                    );
+                    if let Some(rel) = reconcile::relative_to(&self.root, &url) {
+                        errored.insert(rel);
+                    }
+                }
+            }
+        }
+        let segments = self.purge_segments_for_version(table_name, version).await?;
+        deleted.extend(segments.deleted);
+        errored.extend(segments.errored);
+        Ok(DeletionOutcome { deleted, errored })
+    }
+
+    /// Delete the bundles and catalog rows of every segment stamped with
+    /// `version` — the version-scoped peer of `purge_segments`, which stays
+    /// table-scoped and reachable only from the table-level building/failed
+    /// arms (a versioned table's base set is never purged by a version).
+    pub(crate) async fn purge_segments_for_version(
+        &self,
+        table_name: &str,
+        version: i64,
+    ) -> Result<DeletionOutcome> {
+        let mut deleted = BTreeSet::new();
+        let mut errored = BTreeSet::new();
+        for seg in self
+            .catalog
+            .list_index_segments_for_version(table_name, version)
+            .await?
+        {
+            let url = StorageUrl::parse(&seg.index_path).map_err(|e| {
+                JammiError::Other(format!(
+                    "purge_segments_for_version: table '{table_name}' segment {} has an \
+                     unparseable index_path '{}': {e}",
+                    seg.segment_id, seg.index_path
+                ))
+            })?;
+            let handle = self.open_index(&url)?;
+            for ext in storage::sidecar_layout::sidecar_extensions(SidecarKind::Ann) {
+                let Ok(path) = handle.sibling_path(ext) else {
+                    continue;
+                };
+                match handle.delete_if_exists(&path).await {
+                    Ok(DeleteOutcome::Deleted) => {
+                        if let Ok(sib) = layout::sidecar_url(&url, ext) {
+                            if let Some(rel) = reconcile::relative_to(&self.root, &sib) {
+                                deleted.insert(rel);
+                            }
+                        }
+                    }
+                    Ok(DeleteOutcome::Absent) => {}
+                    Err(e) => {
+                        warn!(
+                            table = table_name,
+                            version,
+                            segment = seg.segment_id,
+                            extension = ext,
+                            error = %e,
+                            "purge_segments_for_version: sidecar delete failed; left for reconcile"
+                        );
+                        if let Ok(sib) = layout::sidecar_url(&url, ext) {
+                            if let Some(rel) = reconcile::relative_to(&self.root, &sib) {
+                                errored.insert(rel);
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        self.catalog
+            .delete_index_segments_for_version(table_name, version)
+            .await?;
+        Ok(DeletionOutcome { deleted, errored })
     }
 
     /// Persist a fully-built sidecar index bundle at `url` (its base, no

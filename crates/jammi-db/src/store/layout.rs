@@ -135,6 +135,32 @@ pub fn segment_url(parquet_url: &StorageUrl, n: i64) -> Result<StorageUrl> {
     sibling_url(parquet_url, &format!("{base}__seg{n}.idx"))
 }
 
+/// The stem every artifact of version `n` of a table shares:
+/// `{table_name}__v{n}` beside the table's own Parquet.
+fn version_stem(parquet_url: &StorageUrl, n: i64) -> Result<String> {
+    Ok(format!("{}__v{n}", parquet_stem(parquet_url)?))
+}
+
+/// The key of version `n`'s manifest: `{parent}/{table_name}__v{n}.version.json`.
+pub fn version_manifest_url(parquet_url: &StorageUrl, n: i64) -> Result<StorageUrl> {
+    let stem = version_stem(parquet_url, n)?;
+    sibling_url(parquet_url, &format!("{stem}.version.json"))
+}
+
+/// The key of version `n`'s data fragment (a refresh's delta rows, or a
+/// compaction's live rows): `{parent}/{table_name}__v{n}.parquet`.
+pub fn version_fragment_url(parquet_url: &StorageUrl, n: i64) -> Result<StorageUrl> {
+    let stem = version_stem(parquet_url, n)?;
+    sibling_url(parquet_url, &format!("{stem}.parquet"))
+}
+
+/// The key of version `n`'s cumulative deletion mask:
+/// `{parent}/{table_name}__v{n}.deletes.parquet`.
+pub fn version_deletes_url(parquet_url: &StorageUrl, n: i64) -> Result<StorageUrl> {
+    let stem = version_stem(parquet_url, n)?;
+    sibling_url(parquet_url, &format!("{stem}.deletes.parquet"))
+}
+
 /// The key of a sidecar object sharing a URL's own stem and parent prefix
 /// but a different extension (e.g. a Parquet's `materialization.json`, or a
 /// segment bundle's `usearch`/`rowmap`/`manifest.json`/…):

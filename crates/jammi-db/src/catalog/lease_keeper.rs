@@ -69,6 +69,16 @@ pub enum LeaseTarget {
     /// A `building` `result_tables` row — renewed via
     /// [`Catalog::renew_lease`] under [`ResultTableCas::writer_any_tenant`].
     ResultTable { table: String, writer_id: String },
+    /// A `building` `result_table_versions` row (an in-flight refresh or
+    /// compaction of a ready table) — renewed via
+    /// [`Catalog::renew_version_lease`] under the writer's own CAS with no
+    /// tenant arm, for the same reason `ResultTable` uses
+    /// `writer_any_tenant`.
+    ResultTableVersion {
+        table: String,
+        version: i64,
+        writer_id: String,
+    },
 }
 
 /// The keeper thread's liveness, shared by the keeper handle and every
@@ -727,6 +737,28 @@ async fn renew_all(
                     ) => Some(false),
                     Err(e) => {
                         warn!(table, error = %e, "lease keeper: result-table heartbeat failed");
+                        None
+                    }
+                }
+            }
+            LeaseTarget::ResultTableVersion {
+                table,
+                version,
+                writer_id,
+            } => {
+                let cas = crate::catalog::version_repo::VersionCas::writer_any_tenant(
+                    table, *version, writer_id,
+                );
+                match catalog.renew_version_lease(&cas, intervals.lease()).await {
+                    Ok(()) => Some(true),
+                    Err(
+                        JammiError::RowGone { .. }
+                        | JammiError::TenantMismatch { .. }
+                        | JammiError::LeaseLost { .. }
+                        | JammiError::CasFailed { .. },
+                    ) => Some(false),
+                    Err(e) => {
+                        warn!(table, version, error = %e, "lease keeper: version heartbeat failed");
                         None
                     }
                 }

@@ -17,6 +17,7 @@ pub mod segment_repo;
 pub mod source_repo;
 pub mod status;
 pub mod topic_repo;
+pub mod version_repo;
 
 use std::path::Path;
 use std::sync::Arc;

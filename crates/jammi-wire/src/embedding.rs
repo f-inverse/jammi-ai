@@ -212,5 +212,11 @@ pub fn result_table_from_proto(table: pb::ResultTable) -> Result<ResultTableReco
         // a wire result is a `ready` table, so neither field is carried.
         writer_id: None,
         lease_expires_at: None,
+        // The versioned-table bookkeeping (the bound version and the
+        // monotonic allocator) is server-side state a remote consumer never
+        // reads back through this projection; a refresh's report carries the
+        // version it published.
+        current_version: None,
+        next_version: 0,
     })
 }

@@ -206,6 +206,16 @@ pub struct ResultTableRecord {
     /// the row is terminal, and `None` on a pre-027 `building` row (recovery
     /// reads that as an absent lease and reconciles it as before).
     pub lease_expires_at: Option<String>,
+    /// The published version of a refreshed table (`result_table_versions`
+    /// row), or `None` for a never-refreshed table — today's table with zero
+    /// behaviour change (the base Parquet and base segment set are read
+    /// directly). Advanced only by the single publish compare-and-set.
+    pub current_version: Option<i64>,
+    /// The monotonic version allocator: the next number a refresh, a base
+    /// publish or a compaction will take. Allocated exactly once per number,
+    /// never reused, never decremented (a failed version keeps its number;
+    /// expiry deletes rows and artifacts and never touches this).
+    pub next_version: i64,
 }
 
 fn parse_row(row: &Row<'_>) -> std::result::Result<ResultTableRecord, BackendError> {
@@ -252,6 +262,8 @@ fn parse_row(row: &Row<'_>) -> std::result::Result<ResultTableRecord, BackendErr
         oversample,
         writer_id: row.try_get("writer_id")?,
         lease_expires_at: row.try_get("lease_expires_at")?,
+        current_version: row.try_get::<i32>("current_version")?.map(i64::from),
+        next_version: i64::from(row.get::<i32>("next_version")?),
     })
 }
 
@@ -460,9 +472,9 @@ impl ResultTableCas {
 /// classify the miss.
 #[derive(Debug, Clone)]
 pub(crate) struct CasTarget {
-    tenant_id: Option<String>,
-    status: String,
-    writer_id: Option<String>,
+    pub(crate) tenant_id: Option<String>,
+    pub(crate) status: String,
+    pub(crate) writer_id: Option<String>,
 }
 
 /// Re-read the CAS target by primary key inside the same transaction.

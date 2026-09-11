@@ -19,6 +19,13 @@ spec:
     metadata:
       labels: { app: jammi-server }
     spec:
+      # Termination grace is the Kubernetes default (30 s): SIGTERM drains —
+      # in-flight requests finish, an idle WaitJob/Subscribe stream ends with
+      # UNAVAILABLE "server draining" — then SIGKILL. A training job still in
+      # flight past the grace resumes from its last epoch bundle after one
+      # lease window and consumes one attempt; raise the grace to the compute
+      # overlay's value (overlays/shape-d) when this base runs training in
+      # earnest.
       securityContext:
         runAsNonRoot: true
         runAsUser: 65532

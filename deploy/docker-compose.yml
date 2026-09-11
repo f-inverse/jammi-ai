@@ -51,6 +51,11 @@ services:
       nats:
         condition: service_healthy
     restart: unless-stopped
+    # `docker stop` / `docker compose down` send SIGTERM (DRAIN: the in-flight
+    # job finishes) and SIGKILL after this grace; 120 s covers a small epoch.
+    # `docker compose kill -s SIGINT jammi-server` is RELEASE — the job's lease
+    # is handed back at once and the restarted container reclaims it.
+    stop_grace_period: 120s
     healthcheck:
       test: ["CMD", "/usr/local/bin/jammi-server", "probe"]
       interval: 10s

@@ -76,6 +76,63 @@ never inspects `ConfigMap.data` — the `jammi.toml` bodies are proven by the
 guide's own fence test against the real config loader
 (`docs/guide/src/reference-topologies.md`), not by this validation.
 
+## Shutdown: DRAIN and RELEASE
+
+`jammi-server` has two shutdown modes (PostgreSQL's mapping): **SIGTERM =
+DRAIN** — the in-flight job finishes, the lease keeps renewing, every epoch
+bundle lands, then the process exits 0 — and **SIGINT = RELEASE** — every job
+lease is handed back to the catalog at once (the row stays `running` with a
+NULL lease and `releases + 1`; a compute job's building-table lease with it),
+the loop stops and the process exits 0, so a successor claims the job within
+one `[worker] idle_poll_secs` and it costs no attempt. Any signal while
+draining is a RELEASE. There is no engine-side timeout: the pod's
+`terminationGracePeriodSeconds` bounds a DRAIN, then SIGKILL.
+
+**Operative rule:** the grace must cover one epoch's wall time, or the drain
+never lands its final bundle before SIGKILL and the job takes the expiry
+path — one `[lease] duration_secs` window before a successor requeues it,
+and one attempt consumed. The compute overlay ships **600 s**: the
+cluster-autoscaler's `--max-graceful-termination-sec` default, the upper
+anchor a scale-down honours; a larger value is honoured only by rollouts and
+`kubectl delete`, so raise both together. The Shape C base keeps the
+Kubernetes default (30 s) — its query replicas hold no training job.
+
+**Rollout arithmetic** at 3 compute replicas: the Deployment defaults
+(`maxSurge` 25% rounds up to 1, `maxUnavailable` 25% rounds down to 0) make
+the rollout serial, so the worst case is 3 × 600 s = 30 min of drains;
+`maxSurge: 100%` / `maxUnavailable: 0` drains all three at once — 10 min at
+double GPU demand. Caps a DRAIN cannot cross: kubelet graceful node shutdown
+is off by default (0 s); AWS Spot gives a 2-minute interruption notice; GCP
+Spot ≤ 30 s. On spot capacity use RELEASE instead — the job is claimable at
+once and no attempt burns:
+
+```yaml
+lifecycle:
+  preStop:
+    exec:
+      # The uniform actuator: sends SIGINT to pid 1. Works on every image.
+      command: ["/usr/local/bin/jammi-server", "release"]
+```
+
+```yaml
+lifecycle:
+  preStop:
+    exec:
+      # cu12 only — that image is ubi8 and has a shell; the CPU images are
+      # distroless and do not.
+      command: ["/bin/sh", "-c", "kill -INT 1"]
+```
+
+A `preStop` hook runs before SIGTERM is sent and inside the grace countdown.
+Alternatives: a derived image with `STOPSIGNAL SIGINT`; `lifecycle.stopSignal`
+once the `ContainerStopSignals` feature gate leaves alpha; and, outside
+Kubernetes, `docker kill --signal=INT` / `docker compose kill -s SIGINT`.
+
+**Autoscaling** input: `jammi_jobs_queued{kind}` on `/metrics` (a worker
+process samples it from the catalog every `[worker] metrics_sample_secs`) is
+the HPA/KEDA signal for the compute tier; `jammi_worker_jobs_in_flight` says
+whether a replica is busy.
+
 ## Image pin advice
 
 `:latest` is re-pointed by every `v*` release tag. Pin an exact `:vX.Y.Z`

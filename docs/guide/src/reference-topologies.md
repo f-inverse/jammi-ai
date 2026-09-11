@@ -234,6 +234,16 @@ to claim only the training kinds) so only it runs the job worker's claim
 loop against the shared catalog. Its `[server] services` is whatever the
 compute node should also serve — `services = []` for a pure compute node.
 
+The compute tier's Deployment carries `terminationGracePeriodSeconds: 600`
+— SIGTERM drains (the in-flight training job finishes, every epoch bundle
+lands) and SIGKILL follows the grace; SIGINT, or `jammi-server release` from
+a `preStop` hook, RELEASES — the job's lease is handed back at once and any
+other replica claims it within one idle poll at no attempt cost. The grace
+must cover one epoch's wall time; on spot capacity use RELEASE. The operative
+rule, the rollout arithmetic and both `preStop` recipes are in
+`deploy/kubernetes/README.md` ("Shutdown: DRAIN and RELEASE"); the modes
+themselves are in [Shutdown](./deploy-server.md#shutdown-drain-and-release).
+
 The compute tier is a plain Deployment today and is **provisional**:
 [#500](https://github.com/f-inverse/jammi-ai/issues/500) decides the gang
 primitive for multi-GPU and multi-node training; once ranks need stable

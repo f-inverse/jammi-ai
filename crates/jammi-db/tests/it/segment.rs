@@ -774,3 +774,63 @@ async fn allocation_is_monotonic_and_never_reused(kind: BackendKind) {
     d1.detach();
     d2.detach();
 }
+
+// §6.14 — shard-ordering property: segments appended to one building version
+// in either order yield an identical masked merge; masking depends only on
+// the version stamps, never on segment id order.
+#[tokio::test]
+async fn masked_merge_is_independent_of_segment_id_order() {
+    use jammi_db::index::segment::{SegmentId, SegmentedIndex};
+    use jammi_db::store::deletes::DeletionMask;
+
+    let dir = tempdir().unwrap();
+    let catalog = Arc::new(Catalog::open(dir.path()).await.unwrap());
+    let store = store(dir.path(), Arc::clone(&catalog), StoragePrecision::F32);
+    let shard_a = [("a1", [1.0, 0.0, 0.0, 0.0]), ("k", [0.9, 0.1, 0.0, 0.0])];
+    let shard_b = [("b1", [0.0, 1.0, 0.0, 0.0]), ("b2", [0.0, 0.0, 1.0, 0.0])];
+    let base = [("k", [0.0, 0.0, 0.0, 1.0]), ("z", [0.5, 0.5, 0.0, 0.0])];
+    let query = [0.9, 0.1, 0.0, 0.0];
+
+    let mut results = Vec::new();
+    for order in [[&shard_a[..], &shard_b[..]], [&shard_b[..], &shard_a[..]]] {
+        let table = ready_table(&store).await;
+        // The base is stamped with its own (earlier) version number; the
+        // shards land in the next one.
+        let base_version = store.allocate_version(&table).await.unwrap();
+        let base_stamp = base_version.version();
+        base_version.detach();
+        let version = store.allocate_version(&table).await.unwrap();
+        assert!(version.version() > base_stamp);
+        let mut loaded = vec![(
+            SegmentId(0),
+            base_stamp,
+            built_index(&base, StoragePrecision::F32),
+        )];
+        for shard in order {
+            let seg = version
+                .append_segment(&built_index(shard, StoragePrecision::F32))
+                .await
+                .unwrap();
+            loaded.push((
+                seg,
+                version.version(),
+                built_index(shard, StoragePrecision::F32),
+            ));
+        }
+        // The base K is superseded by the shard's K: mask `(k, base_stamp)`.
+        let mask = Arc::new(DeletionMask::from_entries([("k".to_string(), base_stamp)]));
+        let index = SegmentedIndex::new_masked(loaded, mask).unwrap();
+        let hits = index.search_final(&query, 6, 4).unwrap();
+        assert_eq!(hits[0].0, "k");
+        assert!(
+            hits[0].1 < 1e-4,
+            "the shard's K, never the masked base K: {hits:?}"
+        );
+        results.push(hits);
+        version.detach();
+    }
+    assert_eq!(
+        results[0], results[1],
+        "the merge is independent of segment id order"
+    );
+}

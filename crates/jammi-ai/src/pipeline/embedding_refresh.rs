@@ -32,6 +32,7 @@ use jammi_db::catalog::result_repo::{ResultTableKind, ResultTableRecord};
 use jammi_db::catalog::status::ResultTableStatus;
 use jammi_db::error::{JammiError, NonUniqueScan, NotRefreshableReason, Result};
 use jammi_db::index::sidecar::SidecarIndex;
+use jammi_db::index::VectorIndex;
 use jammi_db::model_task::ModelTask;
 use jammi_db::storage::StorageUrl;
 use jammi_db::store::content_hash::ContentHash;
@@ -86,6 +87,16 @@ pub struct RefreshReport {
     pub live_rows: u64,
     pub masked_rows: u64,
     pub outcome: RefreshOutcome,
+}
+
+/// What `expire_versions` removed.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
+pub struct ExpiryReport {
+    pub table: String,
+    /// The version rows deleted, ascending.
+    pub expired_versions: Vec<i64>,
+    /// The objects (fragments, deletes, manifests, segment siblings) deleted.
+    pub objects_deleted: u64,
 }
 
 /// Test-only rendezvous points inside a refresh (`test-hooks`): a test parks
@@ -993,4 +1004,260 @@ impl InferenceSession {
         self.ann_cache().invalidate_source(source_id)?;
         Ok(())
     }
+
+    /// Rewrite the current version's live rows as one fragment + one segment
+    /// (no inference), publishing a new version whose chain identity folds
+    /// the parent's. The threshold is the consumer's; `live_rows` /
+    /// `masked_rows` on every report are the inputs to that decision.
+    pub async fn compact_embeddings(self: &Arc<Self>, table: &str) -> Result<RefreshReport> {
+        let store = self.result_store();
+        let ctx = self.context();
+        let record = self.refreshable_record(table).await?;
+        let descriptor = store.producing_descriptor(&record).await?;
+        let params = embedding_params(table, &descriptor)?;
+        let record = self.ensure_base_version(&store, record, &params).await?;
+        let parent_version = record
+            .current_version
+            .expect("a base version is published before any compaction");
+        let parquet_url = StorageUrl::parse(&record.parquet_path)?;
+        let parent = store
+            .read_version_manifest(&record.table_name, &parquet_url, parent_version)
+            .await?
+            .ok_or_else(|| JammiError::VersionUnavailable {
+                table: record.table_name.clone(),
+                version: parent_version,
+            })?;
+        let dimensions = params.dimensions;
+
+        let mut version = store.allocate_version(&record).await?;
+        let n = version.version();
+
+        // Every live row, in `_row_id` order, through the masked provider.
+        let batches = ctx
+            .sql(&format!(
+                "SELECT * FROM \"jammi.{}\" ORDER BY _row_id",
+                record.table_name
+            ))
+            .await
+            .map_err(JammiError::from)?
+            .collect()
+            .await
+            .map_err(JammiError::from)?;
+        let schema = jammi_db::store::schema::embedding_table_schema(dimensions);
+        let fragment_url = version.fragment_url()?;
+        let mut writer = store
+            .open_writer(&fragment_url, Arc::clone(&schema))
+            .await?;
+        let mut index =
+            SidecarIndex::new(dimensions, store.ann_config(), version.storage_precision())?;
+        let mut rows = 0usize;
+        for batch in &batches {
+            let batch = coerce_to_embedding_schema(batch, &schema)?;
+            writer.write_batch(&batch).await?;
+            let ids = batch
+                .column(0)
+                .as_any()
+                .downcast_ref::<StringArray>()
+                .unwrap();
+            let mut vectors = Vec::new();
+            jammi_db::store::vectors::extend_with_fixed_size_list_f32(
+                &batch,
+                &record.table_name,
+                "vector",
+                &mut vectors,
+            )?;
+            for (i, v) in vectors.iter().enumerate() {
+                index.add(ids.value(i), v)?;
+            }
+            rows += batch.num_rows();
+        }
+        writer.close().await?;
+        let handle = store.open_parquet(&fragment_url)?;
+        let bytes = handle.get_bytes(&handle.data_path()?).await?;
+        let digest = ArtifactDigest::of_bytes(&bytes);
+        let mut segments = Vec::new();
+        if rows > 0 {
+            index.build()?;
+            let seg = version.append_segment(&index).await?;
+            segments.push(SegmentRef {
+                segment_id: seg.0,
+                version: n,
+            });
+        }
+        let fragments = vec![FragmentRef {
+            url: fragment_url.as_str().to_string(),
+            version: n,
+            rows,
+            digest,
+        }];
+        let descriptor = ProducingDescriptor::EmbeddingCompaction {
+            model_id: params.model_id.clone(),
+            task: params.task,
+            source_id: params.source_id.clone(),
+            columns: params.columns.clone(),
+            key_column: params.key_column.clone(),
+            dimensions,
+            parent_version,
+            parent_identity: parent.identity.clone(),
+        };
+        let definition_hash = DefinitionHash(record.definition_hash.clone().unwrap_or_default());
+        let identity = VersionManifest::compute_identity(
+            &parent.identity,
+            &definition_hash,
+            &descriptor,
+            &fragments,
+            None,
+        )?;
+        let anchors = vec![InputAnchor::result_digest(
+            &record.table_name,
+            &ArtifactDigest(parent.identity.clone()),
+        )];
+        let manifest = VersionManifest {
+            version_format: jammi_db::store::version::VERSION_FORMAT,
+            table: record.table_name.clone(),
+            version: n,
+            parent: Some(parent_version),
+            definition_hash,
+            delta: VersionDelta {
+                descriptor,
+                input_anchors: anchors,
+            },
+            fragments,
+            segments,
+            deletes: None,
+            live_rows: rows,
+            masked_rows: 0,
+            identity,
+            produced_by: jammi_db::store::run_id().to_string(),
+            produced_at: chrono::Utc::now().to_rfc3339(),
+            engine_version: env!("CARGO_PKG_VERSION").to_string(),
+        };
+        store
+            .write_version_manifest(&parquet_url, &manifest)
+            .await?;
+        // `result_tables.input_anchors_json` stays the parent's: a compaction
+        // reads no source.
+        let anchors_json = record
+            .input_anchors_json
+            .clone()
+            .unwrap_or_else(|| "[]".into());
+        if let Err(e) = version
+            .publish(&manifest.identity, rows, 0, &anchors_json)
+            .await
+        {
+            if let Err(abort_err) = version.abort().await {
+                tracing::warn!(table = record.table_name, version = n, error = %abort_err, "compact: abort after a missed publish did not complete");
+            }
+            return Err(e);
+        }
+        self.after_publish(&store, &record.table_name, &params.source_id)
+            .await?;
+        Ok(RefreshReport {
+            table: record.table_name.clone(),
+            version: Some(n),
+            parent_version: Some(parent_version),
+            inferred_rows: 0,
+            added: 0,
+            changed: 0,
+            deleted: 0,
+            unchanged: rows as u64,
+            dropped_rows: 0,
+            live_rows: rows as u64,
+            masked_rows: 0,
+            outcome: RefreshOutcome::Published,
+        })
+    }
+
+    /// Delete every version row `< before` that is not the current version
+    /// (`ready` or `failed`), then reap its manifest, deletes and every
+    /// fragment / segment stamped with it that the CURRENT manifest does not
+    /// list. `{table}.parquet`, `.materialization.json` and `next_version` are
+    /// never touched.
+    pub async fn expire_versions(
+        self: &Arc<Self>,
+        table: &str,
+        before: i64,
+    ) -> Result<ExpiryReport> {
+        let store = self.result_store();
+        let record = self.refreshable_record(table).await?;
+        let Some(current) = record.current_version else {
+            return Ok(ExpiryReport {
+                table: table.to_string(),
+                expired_versions: Vec::new(),
+                objects_deleted: 0,
+            });
+        };
+        let parquet_url = StorageUrl::parse(&record.parquet_path)?;
+        let manifest = store
+            .read_version_manifest(&record.table_name, &parquet_url, current)
+            .await?
+            .ok_or_else(|| JammiError::VersionUnavailable {
+                table: record.table_name.clone(),
+                version: current,
+            })?;
+        let retained_fragments: HashSet<String> =
+            manifest.fragments.iter().map(|f| f.url.clone()).collect();
+        let retained_segments: HashSet<i64> =
+            manifest.segments.iter().map(|s| s.segment_id).collect();
+        let mut expired = Vec::new();
+        let mut objects_deleted = 0u64;
+        for row in self.catalog().list_result_table_versions(table).await? {
+            if row.version >= before
+                || row.version == current
+                || !(row.status == ResultTableStatus::Ready.to_string()
+                    || row.status == ResultTableStatus::Failed.to_string())
+            {
+                continue;
+            }
+            if !self
+                .catalog()
+                .delete_result_table_version(table, row.version)
+                .await?
+            {
+                continue;
+            }
+            objects_deleted += store
+                .reap_expired_version(
+                    &parquet_url,
+                    &record.table_name,
+                    row.version,
+                    &retained_fragments,
+                    &retained_segments,
+                )
+                .await? as u64;
+            expired.push(row.version);
+        }
+        expired.sort_unstable();
+        Ok(ExpiryReport {
+            table: table.to_string(),
+            expired_versions: expired,
+            objects_deleted,
+        })
+    }
+}
+
+/// A `SELECT *` over the masked provider comes back with the scan's view
+/// types (`Utf8View`) and the reader's field nullability; a compaction writes
+/// the table's canonical embedding schema, so every column is cast to it.
+fn coerce_to_embedding_schema(
+    batch: &RecordBatch,
+    schema: &arrow::datatypes::SchemaRef,
+) -> Result<RecordBatch> {
+    let mut columns = Vec::with_capacity(schema.fields().len());
+    for field in schema.fields() {
+        let col = batch
+            .column_by_name(field.name())
+            .ok_or_else(|| JammiError::Schema {
+                table: String::new(),
+                column: field.name().clone(),
+                expected: format!("{}", field.data_type()),
+                actual: "missing".into(),
+            })?;
+        columns.push(
+            arrow::compute::cast(col, field.data_type())
+                .map_err(|e| JammiError::Other(format!("compaction: cast: {e}")))?,
+        );
+    }
+    RecordBatch::try_new(Arc::clone(schema), columns)
+        .map_err(|e| JammiError::Other(format!("compaction: build batch: {e}")))
 }

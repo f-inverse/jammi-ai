@@ -1394,3 +1394,165 @@ async fn verify_follows_the_refreshed_version() {
         other => panic!("a tampered fragment must be a Mismatch, got {other:?}"),
     }
 }
+
+/// §6.3(b) — `compact_embeddings` rewrites the live rows as ONE fragment +
+/// ONE segment stamped with the new version, no deletes, the same ranking,
+/// an identity distinct from the parent's; `expire_versions(before = N)`
+/// then removes the older rows and every unreferenced fragment / segment /
+/// deletes / manifest while the base Parquet, its manifest and
+/// `next_version` stay, and search is unchanged.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn compact_yields_single_fragment_value_equivalent() {
+    let h = harness(150).await;
+    let mut edited = rows(150);
+    edited[4].1 = "edited four".into();
+    edited[9].1 = "edited nine".into();
+    edited.retain(|(id, _)| *id != Some(30));
+    write_parquet(&h.source_path, &edited);
+    let delta = h.refresh().await.unwrap();
+    assert_eq!(delta.outcome, RefreshOutcome::Published);
+    let parent = h
+        .session
+        .catalog()
+        .get_result_table_version(&h.table, delta.version.unwrap())
+        .await
+        .unwrap()
+        .unwrap();
+    let store = h.session.result_store();
+    let record = h.record().await;
+    let parquet_url = StorageUrl::parse(&record.parquet_path).unwrap();
+    let before_rank: Vec<std::collections::BTreeMap<String, u32>> = {
+        let mut v = Vec::new();
+        for q in [0i64, 4, 9, 77] {
+            let query = h.vector_of(&q.to_string()).await.unwrap();
+            v.push(
+                h.search(&query, 149)
+                    .await
+                    .into_iter()
+                    .map(|(id, d)| (id, d.to_bits()))
+                    .collect(),
+            );
+        }
+        v
+    };
+
+    let report = h.session.compact_embeddings(&h.table).await.unwrap();
+    let n = report.version.unwrap();
+    assert_eq!(report.parent_version, Some(parent.version));
+    assert_eq!((report.live_rows, report.masked_rows), (149, 0));
+    let manifest = store
+        .read_version_manifest(&h.table, &parquet_url, n)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(manifest.fragments.len(), 1);
+    assert_eq!(manifest.fragments[0].version, n);
+    assert_eq!(manifest.segments.len(), 1);
+    assert_eq!(manifest.segments[0].version, n);
+    assert!(manifest.deletes.is_none());
+    assert_ne!(manifest.identity, parent.identity.clone().unwrap());
+    assert!(matches!(
+        manifest.delta.descriptor,
+        ProducingDescriptor::EmbeddingCompaction { .. }
+    ));
+    let record = h.record().await;
+    assert_eq!(record.current_version, Some(n));
+    assert_eq!(record.row_count, 149);
+    for (i, q) in [0i64, 4, 9, 77].iter().enumerate() {
+        let query = h.vector_of(&q.to_string()).await.unwrap();
+        let after: std::collections::BTreeMap<String, u32> = h
+            .search(&query, 149)
+            .await
+            .into_iter()
+            .map(|(id, d)| (id, d.to_bits()))
+            .collect();
+        assert_eq!(
+            after, before_rank[i],
+            "the compaction carries the vectors byte-for-byte (query {q})"
+        );
+    }
+
+    // Expire everything below the compaction.
+    let next_before = record.next_version;
+    let old_versions: Vec<i64> = h
+        .session
+        .catalog()
+        .list_result_table_versions(&h.table)
+        .await
+        .unwrap()
+        .iter()
+        .map(|v| v.version)
+        .filter(|v| *v < n)
+        .collect();
+    let expiry = h.session.expire_versions(&h.table, n).await.unwrap();
+    assert_eq!(expiry.expired_versions, old_versions);
+    assert!(expiry.objects_deleted > 0);
+    let remaining: Vec<i64> = h
+        .session
+        .catalog()
+        .list_result_table_versions(&h.table)
+        .await
+        .unwrap()
+        .iter()
+        .map(|v| v.version)
+        .collect();
+    assert_eq!(remaining, vec![n]);
+    for v in &old_versions {
+        assert!(!common::url_to_path(
+            layout::version_manifest_url(&parquet_url, *v)
+                .unwrap()
+                .as_str()
+        )
+        .exists());
+        assert!(!common::url_to_path(
+            layout::version_deletes_url(&parquet_url, *v)
+                .unwrap()
+                .as_str()
+        )
+        .exists());
+        assert!(!h.fragment_exists(&record, *v));
+        assert!(h
+            .session
+            .catalog()
+            .list_index_segments_for_version(&h.table, *v)
+            .await
+            .unwrap()
+            .is_empty());
+    }
+    let segments = h
+        .session
+        .catalog()
+        .list_index_segments(&h.table)
+        .await
+        .unwrap();
+    assert!(segments.iter().any(|s| s.version == Some(n)));
+    assert!(
+        segments.iter().any(|s| s.version.is_none()),
+        "the base segment is never reaped: {segments:?}"
+    );
+    assert!(common::url_to_path(&record.parquet_path).exists());
+    assert!(common::url_to_path(
+        layout::sidecar_url(&parquet_url, "materialization.json")
+            .unwrap()
+            .as_str()
+    )
+    .exists());
+    let record = h.record().await;
+    assert_eq!(
+        record.next_version, next_before,
+        "expiry never touches the allocator"
+    );
+    for (i, q) in [0i64, 4, 9, 77].iter().enumerate() {
+        let query = h.vector_of(&q.to_string()).await.unwrap();
+        let after: std::collections::BTreeMap<String, u32> = h
+            .search(&query, 149)
+            .await
+            .into_iter()
+            .map(|(id, d)| (id, d.to_bits()))
+            .collect();
+        assert_eq!(
+            after, before_rank[i],
+            "search unchanged after expiry (query {q})"
+        );
+    }
+}

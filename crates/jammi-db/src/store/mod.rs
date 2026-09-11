@@ -1044,6 +1044,59 @@ impl ResultStore {
         self.load_deletion_mask(table, manifest).await
     }
 
+    /// Expiry's reap of one deleted version row's artifacts: its manifest and
+    /// deletes always; its fragment and every segment stamped with it only
+    /// when the CURRENT manifest does not list them (a fragment retained by
+    /// reference stays). Returns the number of objects deleted.
+    pub async fn reap_expired_version(
+        &self,
+        parquet_url: &StorageUrl,
+        table_name: &str,
+        version: i64,
+        retained_fragments: &std::collections::HashSet<String>,
+        retained_segments: &std::collections::HashSet<i64>,
+    ) -> Result<usize> {
+        let mut deleted = 0usize;
+        let mut urls = vec![
+            layout::version_manifest_url(parquet_url, version)?,
+            layout::version_deletes_url(parquet_url, version)?,
+        ];
+        let fragment = layout::version_fragment_url(parquet_url, version)?;
+        if !retained_fragments.contains(fragment.as_str()) {
+            urls.push(fragment);
+        }
+        for url in urls {
+            let handle = self.open_parquet(&url)?;
+            if handle.delete_if_exists(&handle.data_path()?).await? == DeleteOutcome::Deleted {
+                deleted += 1;
+            }
+        }
+        for seg in self
+            .catalog
+            .list_index_segments_for_version(table_name, version)
+            .await?
+        {
+            if retained_segments.contains(&seg.segment_id) {
+                continue;
+            }
+            let url = StorageUrl::parse(&seg.index_path)?;
+            let handle = self.open_index(&url)?;
+            for ext in storage::sidecar_layout::sidecar_extensions(SidecarKind::Ann) {
+                let Ok(path) = handle.sibling_path(ext) else {
+                    continue;
+                };
+                if handle.delete_if_exists(&path).await? == DeleteOutcome::Deleted {
+                    deleted += 1;
+                }
+            }
+            self.catalog
+                .delete_index_segment_row(table_name, seg.segment_id)
+                .await?;
+        }
+        self.segment_sets.evict_table(table_name);
+        Ok(deleted)
+    }
+
     /// Read a result table's `.materialization.json` sidecar, if present.
     ///
     /// Returns `Ok(None)` when no sidecar exists — a pre-contract table, or one

@@ -428,6 +428,41 @@ impl Catalog {
     }
 }
 
+impl Catalog {
+    /// Delete one segment row by id under the STRICT tenant arm in force —
+    /// expiry's per-segment catalog half (the bundle is deleted beside it).
+    pub async fn delete_index_segment_row(&self, table_name: &str, segment_id: i64) -> Result<u64> {
+        let table_name = table_name.to_string();
+        let tenant = self.current_tenant();
+        let arm = TenantArm::in_force(tenant);
+        Ok(self
+            .backend()
+            .transaction(TxOptions::default(), |tx| {
+                Box::pin(async move {
+                    tx.set_tenant(tenant);
+                    let mut params: Vec<SqlValue<'static>> =
+                        vec![SqlValue::TextOwned(table_name), SqlValue::Int(segment_id)];
+                    let arm_sql = match &arm {
+                        TenantArm::Admin => String::new(),
+                        TenantArm::Strict(t) => {
+                            params.push(SqlValue::from(t.map(|t| t.to_string())));
+                            let n = params.len();
+                            format!(" AND (tenant_id = ${n} OR (tenant_id IS NULL AND ${n} IS NULL))")
+                        }
+                    };
+                    tx.execute(
+                        &format!(
+                            "DELETE FROM index_segments WHERE table_name = $1 AND segment_id = $2{arm_sql}"
+                        ),
+                        &params,
+                    )
+                    .await
+                })
+            })
+            .await?)
+    }
+}
+
 /// Outcome of the version-stamped segment insert's lease check.
 enum VersionInsertOutcome {
     Applied(bool),

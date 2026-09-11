@@ -617,6 +617,7 @@ assert "bf16" in refused["error"], refused["error"]
 # The field set is the wire's, exactly — no arm adds or drops a key.
 SUMMARY_KEYS = {
     "job_id", "kind", "status", "base_model_id", "output_model_id", "created_at", "error",
+    "parent_id",
 }
 for j in jobs:
     assert set(j) == SUMMARY_KEYS, sorted(set(j) ^ SUMMARY_KEYS)

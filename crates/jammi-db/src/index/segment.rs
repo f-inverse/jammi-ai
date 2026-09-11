@@ -49,6 +49,7 @@
 //! structural fix.
 
 use std::collections::HashSet;
+use std::sync::Arc;
 
 use jammi_numerics::distance::cosine_distance;
 
@@ -56,6 +57,7 @@ use crate::config::StoragePrecision;
 use crate::error::{JammiError, Result};
 use crate::index::sidecar::SidecarIndex;
 use crate::index::VectorIndex;
+use crate::store::deletes::DeletionMask;
 
 /// A segment's position in its table's segment sequence — the `segment_id`
 /// catalog column, starting at `0` for the first segment a fresh embedding
@@ -97,17 +99,31 @@ fn over_fetch(m: usize, n_segments: usize) -> usize {
     }
 }
 
-/// A loaded segment paired with its catalog id (the id is the merge's final
-/// tie-break and identifies which bundle owns a given row).
+/// A loaded segment paired with its catalog id (the merge's final tie-break
+/// and the owner of a candidate's exact vector) and its producing version
+/// (the horizon the deletion mask is compared against).
 struct Segment {
     id: SegmentId,
+    version: i64,
     index: SidecarIndex,
+    /// `|{K : mask[K] >= version ∧ contains(K)}|`, computed once at
+    /// construction — how many of this segment's rows the mask hides, which
+    /// sizes the widened fetch.
+    dead: usize,
 }
 
 /// The read-side handle over a table's whole segment set. Built by
 /// [`crate::store::ResultStore::resolve_search_mode`] from the segments loaded
 /// through the content-addressed segment cache; searched through
 /// [`Self::search_final`] by every final-results consumer.
+///
+/// A versioned table's set carries the version's [`DeletionMask`]: a hit
+/// `K` from a segment stamped `v` is dropped when `mask[K] >= v`, so a
+/// superseded or deleted key never surfaces from the segment that still
+/// indexes it while the segment that re-embedded it (stamped later) serves it
+/// unmasked. A never-refreshed table's set carries an empty mask and every
+/// segment at version `0`, so nothing is filtered and each segment is searched
+/// exactly once at today's width (the N=1 byte-identity contract).
 pub struct SegmentedIndex {
     segments: Vec<Segment>,
     /// The table-level storage precision. Uniform across segments *by
@@ -116,11 +132,13 @@ pub struct SegmentedIndex {
     /// reaches this constructor, so every segment here loaded at the same
     /// precision — the one this field reports.
     storage_precision: StoragePrecision,
+    mask: Arc<DeletionMask>,
 }
 
 impl SegmentedIndex {
-    /// Assemble a segmented index from the segments loaded for one table, in
-    /// `segment_id` order.
+    /// Assemble a segmented index from the segments loaded for one
+    /// never-refreshed table, in `segment_id` order: no mask, every segment
+    /// at version `0`.
     ///
     /// The set must be non-empty (a table with no segments resolves to the
     /// exact-search fallback upstream, never to an empty `SegmentedIndex`) and
@@ -129,16 +147,31 @@ impl SegmentedIndex {
     /// that bypasses it cannot silently assemble a mixed-precision set whose
     /// merge would compare distances on different scales.
     pub fn new(segments: Vec<(SegmentId, SidecarIndex)>) -> Result<Self> {
+        Self::new_masked(
+            segments.into_iter().map(|(id, idx)| (id, 0, idx)).collect(),
+            Arc::new(DeletionMask::empty()),
+        )
+    }
+
+    /// Assemble a versioned table's set: every segment with its stamped
+    /// version, under the version's cumulative deletion mask.
+    pub fn new_masked(
+        segments: Vec<(SegmentId, i64, SidecarIndex)>,
+        mask: Arc<DeletionMask>,
+    ) -> Result<Self> {
         let mut iter = segments.into_iter();
-        let (first_id, first) = iter.next().ok_or_else(|| {
+        let (first_id, first_version, first) = iter.next().ok_or_else(|| {
             JammiError::Other("SegmentedIndex requires at least one segment".into())
         })?;
         let storage_precision = first.storage_precision();
+        let dead = Self::count_dead(&mask, first_version, &first);
         let mut out = vec![Segment {
             id: first_id,
+            version: first_version,
             index: first,
+            dead,
         }];
-        for (id, index) in iter {
+        for (id, version, index) in iter {
             if index.storage_precision() != storage_precision {
                 return Err(JammiError::Other(format!(
                     "SegmentedIndex: segment {} loaded at {:?} but the set is {:?} — \
@@ -148,12 +181,25 @@ impl SegmentedIndex {
                     storage_precision
                 )));
             }
-            out.push(Segment { id, index });
+            let dead = Self::count_dead(&mask, version, &index);
+            out.push(Segment {
+                id,
+                version,
+                index,
+                dead,
+            });
         }
         Ok(Self {
             segments: out,
             storage_precision,
+            mask,
         })
+    }
+
+    fn count_dead(mask: &DeletionMask, version: i64, index: &SidecarIndex) -> usize {
+        mask.entries()
+            .filter(|(k, h)| *h >= version && index.contains(k))
+            .count()
     }
 
     /// The precision every segment in this set was built and loaded at.
@@ -161,7 +207,8 @@ impl SegmentedIndex {
         self.storage_precision
     }
 
-    /// Total number of rows across every segment.
+    /// Total number of rows across every segment (physical rows, masked
+    /// included).
     pub fn len(&self) -> usize {
         self.segments.iter().map(|s| s.index.len()).sum()
     }
@@ -171,10 +218,79 @@ impl SegmentedIndex {
         self.len() == 0
     }
 
-    /// The RAW candidate merge primitive: search each segment at the over-fetch
-    /// width, concatenate, order by `(distance ASC, row_id ASC, segment_id
-    /// ASC)`, dedup by row id keeping the nearest occurrence, and truncate to
-    /// `m`.
+    /// The version's mask.
+    pub fn mask(&self) -> &Arc<DeletionMask> {
+        &self.mask
+    }
+
+    /// Per segment: the live candidates for a global top-`m` — the segment's
+    /// own search at the over-fetch width, masked; when the segment has dead
+    /// rows the width is scaled by `1 / (1 - dead / len)`, capped at the
+    /// segment's length, and doubled until `m` live hits survive or the whole
+    /// segment has been asked for. A segment with no dead rows is searched
+    /// exactly once at today's width.
+    fn live_candidates(
+        &self,
+        seg: &Segment,
+        query: &[f32],
+        m: usize,
+    ) -> Result<Vec<(String, f32, SegmentId)>> {
+        let len = seg.index.len();
+        let base = over_fetch(m, self.segments.len());
+        let mut w = if seg.dead > 0 && len > seg.dead {
+            let live_fraction = 1.0 - (seg.dead as f32 / len as f32);
+            let scaled = (base as f32 / live_fraction).ceil() as usize;
+            scaled.max(base).min(len)
+        } else if seg.dead > 0 {
+            len
+        } else {
+            base
+        };
+        loop {
+            let hits = seg.index.search(query, w)?;
+            let live: Vec<(String, f32, SegmentId)> = hits
+                .into_iter()
+                .filter(|(k, _)| !self.mask.is_masked(k, seg.version))
+                .map(|(k, d)| (k, d, seg.id))
+                .collect();
+            if seg.dead == 0 || live.len() >= m || w >= len {
+                return Ok(live);
+            }
+            w = (w * 2).min(len);
+        }
+    }
+
+    /// The RAW candidate merge primitive: search each segment (masked), order
+    /// by `(distance ASC, row_id ASC, segment_id ASC)`, dedup by row id keeping
+    /// the nearest occurrence, and truncate to `m`. Each candidate carries the
+    /// segment that owns it.
+    fn search_candidates(&self, query: &[f32], m: usize) -> Result<Vec<(String, f32, SegmentId)>> {
+        if m == 0 {
+            return Ok(Vec::new());
+        }
+        let mut merged: Vec<(String, f32, SegmentId)> = Vec::new();
+        for seg in &self.segments {
+            merged.extend(self.live_candidates(seg, query, m)?);
+        }
+        merged.sort_by(|a, b| {
+            a.1.total_cmp(&b.1)
+                .then_with(|| a.0.cmp(&b.0))
+                .then_with(|| a.2.cmp(&b.2))
+        });
+        let mut seen: HashSet<String> = HashSet::new();
+        let mut out: Vec<(String, f32, SegmentId)> = Vec::with_capacity(m.min(merged.len()));
+        for (row_id, distance, segment) in merged {
+            if out.len() == m {
+                break;
+            }
+            if seen.insert(row_id.clone()) {
+                out.push((row_id, distance, segment));
+            }
+        }
+        Ok(out)
+    }
+
+    /// The RAW candidate merge as `(row_id, distance)`.
     ///
     /// For an `F32` set the distances are exact cosine and comparable across
     /// segments, so this order is final. For a quantized / `Binary` set they
@@ -182,39 +298,15 @@ impl SegmentedIndex {
     /// for a stable candidate set, but **not** a final answer; only
     /// [`Self::search_final`] consumes them, feeding the exact rescore that
     /// makes the final order comparable. The dedup keeps the merge correct over
-    /// the row-id space even though the append-disjoint-rows invariant means
-    /// no row id spans two segments today; which segment's vector wins for a
-    /// re-embedded row is a compaction/retire concern, seamed, not built.
+    /// the row-id space: a key present in two segments (re-embedded by a
+    /// refresh) is masked in the older one by version, so the dedup is defence
+    /// only.
     pub fn search(&self, query: &[f32], m: usize) -> Result<Vec<(String, f32)>> {
-        if m == 0 {
-            return Ok(Vec::new());
-        }
-        let per_segment = over_fetch(m, self.segments.len());
-        let mut merged: Vec<(String, f32, SegmentId)> = Vec::new();
-        for seg in &self.segments {
-            for (row_id, distance) in seg.index.search(query, per_segment)? {
-                merged.push((row_id, distance, seg.id));
-            }
-        }
-        merged.sort_by(|a, b| {
-            a.1.total_cmp(&b.1)
-                .then_with(|| a.0.cmp(&b.0))
-                .then_with(|| a.2.cmp(&b.2))
-        });
-        // Dedup by row id keeping the nearest: after the sort the first
-        // occurrence of each id is its nearest, so a set-membership pass keeps
-        // that one and drops the rest, stopping once `m` survivors are collected.
-        let mut seen: HashSet<String> = HashSet::new();
-        let mut out: Vec<(String, f32)> = Vec::with_capacity(m.min(merged.len()));
-        for (row_id, distance, _segment) in merged {
-            if out.len() == m {
-                break;
-            }
-            if seen.insert(row_id.clone()) {
-                out.push((row_id, distance));
-            }
-        }
-        Ok(out)
+        Ok(self
+            .search_candidates(query, m)?
+            .into_iter()
+            .map(|(k, d, _)| (k, d))
+            .collect())
     }
 
     /// THE single final-results entry. Returns the exact top-`k` in a total
@@ -222,20 +314,16 @@ impl SegmentedIndex {
     ///
     /// On a set that [`needs_rescore`](StoragePrecision::needs_rescore)
     /// (quantized or `Binary`) this is a two-stage retrieve→rescore: retrieve
-    /// `k * oversample` candidates through [`Self::search`] (the merge
-    /// over-fetch nests *under* this candidate width by construction), read each
-    /// candidate's exact `f32` vector via `get_exact`, recompute cosine
-    /// distance against the query, then re-rank by `(distance, row_id)` and
-    /// truncate to `k`. The exact re-rank is corpus-independent, so a candidate
-    /// drawn from any segment lands in one global order — the property a raw
-    /// `search` cannot give a quantized multi-segment table. On an `F32` set the
-    /// merge is already exact and final, so this is `search(query, k)` and
-    /// `oversample` is unused.
+    /// `k * oversample` candidates through the masked merge, read each
+    /// candidate's exact `f32` vector from the segment that OWNS it (never
+    /// the first segment that happens to index the same key), recompute
+    /// cosine distance against the query, then re-rank by `(distance, row_id)`
+    /// and truncate to `k`. On an `F32` set the merge is already exact and
+    /// final, so this is `search(query, k)` and `oversample` is unused.
     ///
     /// A candidate whose exact vector is missing (present in a graph but absent
     /// from its rescore companion — a torn bundle) is a hard error, never a
-    /// silent drop: a result set that quietly shrank below `k` would read as
-    /// "fewer matches exist" rather than "the index is broken".
+    /// silent drop.
     pub fn search_final(
         &self,
         query: &[f32],
@@ -246,10 +334,10 @@ impl SegmentedIndex {
             return self.search(query, k);
         }
         let candidate_k = k.saturating_mul(oversample).max(k);
-        let candidates = self.search(query, candidate_k)?;
+        let candidates = self.search_candidates(query, candidate_k)?;
         let mut rescored: Vec<(String, f32)> = Vec::with_capacity(candidates.len());
-        for (row_id, _approx) in candidates {
-            let exact = self.get_exact(&row_id)?.ok_or_else(|| {
+        for (row_id, _approx, segment) in candidates {
+            let exact = self.get_exact_in(segment, &row_id)?.ok_or_else(|| {
                 JammiError::Other(format!(
                     "rescore: candidate '{row_id}' has no exact vector in its segment's rescore \
                      companion (corrupted or torn sidecar bundle)"
@@ -263,18 +351,12 @@ impl SegmentedIndex {
         Ok(rescored)
     }
 
-    /// The exact `f32` vector for `row_id`, dispatched to the segment that owns
-    /// it. Segments are row-disjoint, so at most one returns `Some`; the first
-    /// hit wins. `None` when no segment indexes the id. Internal to the crate:
-    /// the only consumer is [`Self::search_final`]'s rescore stage — callers ask
-    /// for final results, not raw exact vectors.
-    pub(crate) fn get_exact(&self, row_id: &str) -> Result<Option<Vec<f32>>> {
-        for seg in &self.segments {
-            if let Some(vector) = seg.index.get_exact(row_id)? {
-                return Ok(Some(vector));
-            }
+    /// The exact `f32` vector for `row_id` from the segment `owner`.
+    fn get_exact_in(&self, owner: SegmentId, row_id: &str) -> Result<Option<Vec<f32>>> {
+        match self.segments.iter().find(|s| s.id == owner) {
+            Some(seg) => seg.index.get_exact(row_id),
+            None => Ok(None),
         }
-        Ok(None)
     }
 }
 

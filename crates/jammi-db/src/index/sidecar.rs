@@ -470,6 +470,13 @@ impl SidecarIndex {
     /// paper over) is a hard error: silently falling back to [`Self::get`]
     /// here would hand the caller USearch's own **lossy** reconstruction under
     /// the name "exact", corrupting every rescore that reads it.
+    /// Whether this segment indexes `row_id` (an O(1) `row_index` lookup) —
+    /// the membership test a version's deletion mask is intersected with to
+    /// count a segment's dead rows once per load.
+    pub fn contains(&self, row_id: &str) -> bool {
+        self.row_index.contains_key(row_id)
+    }
+
     pub fn get_exact(&self, row_id: &str) -> Result<Option<Vec<f32>>> {
         let Some(&key) = self.row_index.get(row_id) else {
             return Ok(None);

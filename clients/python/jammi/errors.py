@@ -167,3 +167,13 @@ class BackendError(JammiError, RuntimeError):
     capability, nor a failed training job. Refines :class:`RuntimeError` for the
     same reason :class:`InvalidArgument` refines :class:`ValueError`.
     """
+
+
+class VersionUnavailable(BackendError):
+    """A versioned result table's CURRENT version cannot be served.
+
+    Its version row is ``failed`` or its ``.version.json`` manifest is absent;
+    the table row itself is untouched and the remedy is ``recompute`` (a new
+    table). Refines :class:`BackendError` (the class the remote transport
+    raises for the same ``NOT_FOUND`` status).
+    """

@@ -2,18 +2,23 @@ pub mod artifact;
 pub mod building;
 pub mod building_version;
 pub mod content_hash;
+pub mod deletes;
 pub mod freshness;
 pub mod layout;
 pub mod manifest;
+pub mod masked_provider;
 pub mod mutable;
 pub mod reconcile;
 pub mod result_schema;
 pub mod schema;
+pub mod segment_set_cache;
 pub mod vectors;
+pub mod version;
 
 pub use artifact::{ArtifactStore, LocalArtifact};
 pub use building::BuildingTable;
 pub use building_version::BuildingVersion;
+pub use deletes::DeletionMask;
 pub use freshness::{
     CacheOutcome, CachePolicy, CurrentAnchor, DerivesFromEdge, StaleReason, Staleness,
 };
@@ -25,6 +30,7 @@ pub use manifest::{
 };
 pub use reconcile::{ReconcileOptions, ReconcileReport};
 pub use result_schema::ResultTableSchemaProvider;
+pub use version::VersionManifest;
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::Path;
@@ -56,6 +62,8 @@ use crate::storage::sidecar_layout::SidecarKind;
 use crate::storage::{
     self, DeleteOutcome, JammiObjectStore, ObjectParquetWriter, Scheme, StorageRegistry, StorageUrl,
 };
+use crate::store::masked_provider::{MaskedFragment, MaskedTableProvider, PlaceholderProvider};
+use crate::store::segment_set_cache::{LoadedSegmentSet, SegmentSetCache};
 use crate::tenant::TenantId;
 use crate::tenant_scope::TenantBinding;
 
@@ -171,6 +179,8 @@ pub struct ResultStore {
     /// USearch can open, once per immutable segment; a `file://` bundle loads
     /// in place. Shares the store's [`StorageRegistry`].
     segment_cache: SegmentIndexCache,
+    /// Loaded segment sets and version manifests per `(table, version)`.
+    segment_sets: Arc<SegmentSetCache>,
     /// This store's writer identity, stamped on every `building` row it
     /// creates and named by every transition on that row.
     writer_id: Arc<str>,
@@ -644,6 +654,7 @@ impl ResultStore {
             ann,
             result_schema,
             segment_cache,
+            segment_sets: Arc::new(SegmentSetCache::new()),
             writer_id: new_writer_id(),
             lease: LeaseIntervals::default(),
             artifact_store,
@@ -903,7 +914,7 @@ impl ResultStore {
         url: &StorageUrl,
         owner: Option<TenantId>,
     ) -> Result<()> {
-        let provider = build_result_table_provider(ctx, &self.registry, url).await?;
+        let provider = build_result_table_provider(ctx, &self.registry, url, None).await?;
         self.install_result_schema(ctx)?;
         self.result_schema
             .add_result_table(format!("jammi.{name}"), provider, owner);
@@ -1647,13 +1658,11 @@ impl ResultStore {
                 },
                 None => None,
             };
+            let _ = owner;
             let handle = self.open_parquet(&url)?;
             let path = handle.data_path()?;
             if handle.exists(&path).await? {
-                if let Err(e) = self
-                    .register_table(ctx, &table.table_name, &url, owner)
-                    .await
-                {
+                if let Err(e) = self.bind_result_table(ctx, &table).await {
                     warn!(
                         table = table.table_name,
                         error = %e,
@@ -1709,33 +1718,299 @@ impl ResultStore {
     pub async fn resolve_search_mode(
         &self,
         table: &ResultTableRecord,
-    ) -> Result<Option<SegmentedIndex>> {
-        let segments = self.catalog.list_index_segments(&table.table_name).await?;
-        if segments.is_empty() {
-            return Ok(None);
-        }
+    ) -> Result<Option<Arc<SegmentedIndex>>> {
         let expected_precision = table.storage_precision.unwrap_or_default();
-        let mut loaded = Vec::with_capacity(segments.len());
-        for seg in segments {
-            let url = StorageUrl::parse(&seg.index_path)?;
-            match self
-                .segment_cache
-                .load_segment(&url, &self.ann, expected_precision)
-                .await
-            {
-                Ok(index) => loaded.push((SegmentId(seg.segment_id), index)),
-                Err(e) => {
-                    warn!(
-                        table = table.table_name,
-                        segment = seg.segment_id,
-                        error = %e,
-                        "Segment index unavailable, falling back to whole-table exact search"
-                    );
+        match table.current_version {
+            None => {
+                // A never-refreshed table: today's path over the base set
+                // (`version IS NULL`), cached once the table is `ready` (its
+                // base set is frozen from then on).
+                let cacheable = table.status == ResultTableStatus::Ready.to_string();
+                if cacheable {
+                    if let Some(set) = self.segment_sets.get(&table.table_name, None) {
+                        return Ok(Some(Arc::clone(&set.index)));
+                    }
+                }
+                let segments = self
+                    .catalog
+                    .list_base_index_segments(&table.table_name)
+                    .await?;
+                if segments.is_empty() {
                     return Ok(None);
                 }
+                let mut loaded = Vec::with_capacity(segments.len());
+                for seg in segments {
+                    let url = StorageUrl::parse(&seg.index_path)?;
+                    match self
+                        .segment_cache
+                        .load_segment(&url, &self.ann, expected_precision)
+                        .await
+                    {
+                        Ok(index) => loaded.push((SegmentId(seg.segment_id), index)),
+                        Err(e) => {
+                            warn!(
+                                table = table.table_name,
+                                segment = seg.segment_id,
+                                error = %e,
+                                "Segment index unavailable, falling back to whole-table exact search"
+                            );
+                            return Ok(None);
+                        }
+                    }
+                }
+                let index = Arc::new(SegmentedIndex::new(loaded)?);
+                if cacheable {
+                    self.segment_sets.insert(
+                        &table.table_name,
+                        None,
+                        Arc::new(LoadedSegmentSet {
+                            index: Arc::clone(&index),
+                            mask: Arc::new(deletes::DeletionMask::empty()),
+                        }),
+                    );
+                }
+                Ok(Some(index))
+            }
+            Some(version) => {
+                if let Some(set) = self.segment_sets.get(&table.table_name, Some(version)) {
+                    return Ok(Some(Arc::clone(&set.index)));
+                }
+                // Manifest resolution: definitive absence or a failed row is
+                // the typed `VersionUnavailable`; an `exists()` error propagates.
+                let manifest = self.resolve_version_manifest(table, version).await?;
+                let mask = Arc::new(
+                    self.load_deletion_mask(&table.table_name, &manifest)
+                        .await?,
+                );
+                let parquet_url = StorageUrl::parse(&table.parquet_path)?;
+                let mut loaded = Vec::with_capacity(manifest.segments.len());
+                for seg in &manifest.segments {
+                    let url = layout::segment_url(&parquet_url, seg.segment_id)?;
+                    match self
+                        .segment_cache
+                        .load_segment(&url, &self.ann, expected_precision)
+                        .await
+                    {
+                        Ok(index) => loaded.push((SegmentId(seg.segment_id), seg.version, index)),
+                        Err(e) => {
+                            warn!(
+                                table = table.table_name,
+                                version,
+                                segment = seg.segment_id,
+                                error = %e,
+                                "Segment index unavailable, falling back to masked exact search"
+                            );
+                            return Ok(None);
+                        }
+                    }
+                }
+                if loaded.is_empty() {
+                    return Ok(None);
+                }
+                let index = Arc::new(SegmentedIndex::new_masked(loaded, Arc::clone(&mask))?);
+                self.segment_sets.insert(
+                    &table.table_name,
+                    Some(version),
+                    Arc::new(LoadedSegmentSet {
+                        index: Arc::clone(&index),
+                        mask,
+                    }),
+                );
+                Ok(Some(index))
             }
         }
-        Ok(Some(SegmentedIndex::new(loaded)?))
+    }
+
+    /// The loaded-set cache (evicted per table on bind / publish / delete).
+    pub fn segment_sets(&self) -> &Arc<SegmentSetCache> {
+        &self.segment_sets
+    }
+
+    /// Read a version's `.version.json` through the per-table cache. `Ok(None)`
+    /// when the object is definitively absent; an `exists()` error propagates.
+    pub async fn read_version_manifest(
+        &self,
+        table: &str,
+        parquet_url: &StorageUrl,
+        version: i64,
+    ) -> Result<Option<Arc<VersionManifest>>> {
+        if let Some(m) = self.segment_sets.get_manifest(table, version) {
+            return Ok(Some(m));
+        }
+        let url = layout::version_manifest_url(parquet_url, version)?;
+        let handle = self.open_parquet(&url)?;
+        let path = handle.data_path()?;
+        if !handle.exists(&path).await? {
+            return Ok(None);
+        }
+        let bytes = handle.get_bytes(&path).await?;
+        let manifest = Arc::new(VersionManifest::from_json_bytes(&bytes)?);
+        self.segment_sets
+            .insert_manifest(table, version, Arc::clone(&manifest));
+        Ok(Some(manifest))
+    }
+
+    /// Write a version's `.version.json` (idempotent re-PUT at the same path).
+    pub async fn write_version_manifest(
+        &self,
+        parquet_url: &StorageUrl,
+        manifest: &VersionManifest,
+    ) -> Result<StorageUrl> {
+        let url = layout::version_manifest_url(parquet_url, manifest.version)?;
+        let handle = self.open_parquet(&url)?;
+        let path = handle.data_path()?;
+        handle
+            .put_bytes(&path, manifest.to_json_bytes()?.into())
+            .await?;
+        Ok(url)
+    }
+
+    /// Resolve the CURRENT version's manifest for a read: the version row
+    /// must be `ready` and the manifest present, else the typed
+    /// [`JammiError::VersionUnavailable`] (D14(i)). Runs the row read under
+    /// admin scope: the caller already resolved `table` through the
+    /// tenant-scoped table read, and a version inherits its table's owner.
+    async fn resolve_version_manifest(
+        &self,
+        table: &ResultTableRecord,
+        version: i64,
+    ) -> Result<Arc<VersionManifest>> {
+        let unavailable = || JammiError::VersionUnavailable {
+            table: table.table_name.clone(),
+            version,
+        };
+        let row = TenantBinding::admin_scope(
+            self.catalog
+                .get_result_table_version(&table.table_name, version),
+        )
+        .await?;
+        match row {
+            Some(r) if r.status == ResultTableStatus::Ready.to_string() => {}
+            _ => return Err(unavailable()),
+        }
+        let parquet_url = StorageUrl::parse(&table.parquet_path)?;
+        self.read_version_manifest(&table.table_name, &parquet_url, version)
+            .await?
+            .ok_or_else(unavailable)
+    }
+
+    /// Load a manifest's deletion mask (empty when the manifest lists none).
+    async fn load_deletion_mask(
+        &self,
+        table: &str,
+        manifest: &VersionManifest,
+    ) -> Result<deletes::DeletionMask> {
+        match &manifest.deletes {
+            None => Ok(deletes::DeletionMask::empty()),
+            Some(d) => {
+                let url = StorageUrl::parse(&d.url)?;
+                let handle = self.open_parquet(&url)?;
+                deletes::DeletionMask::read(&handle, table).await
+            }
+        }
+    }
+
+    /// The ONE registration path for a ready table (D8): `current_version`
+    /// `None` → today's single `ListingTable` over the base Parquet;
+    /// `Some(N)` → the [`MaskedTableProvider`] over version `N`'s fragments
+    /// under its deletion mask; a version whose manifest cannot be resolved →
+    /// the [`PlaceholderProvider`] (planning succeeds, every scan is the typed
+    /// `VersionUnavailable`), registered under the row's owner so a peer
+    /// tenant still resolves not-found. Evicts the table's loaded segment
+    /// sets. Called by startup, `BuildingTable::finish` and `publish_version`.
+    pub async fn bind_result_table(
+        &self,
+        ctx: &SessionContext,
+        record: &ResultTableRecord,
+    ) -> Result<()> {
+        let owner = parse_owner(record)?;
+        let url = StorageUrl::parse(&record.parquet_path)?;
+        self.segment_sets.evict_table(&record.table_name);
+        let Some(version) = record.current_version else {
+            return self
+                .register_table(ctx, &record.table_name, &url, owner)
+                .await;
+        };
+        let Some(dimensions) = record.dimensions else {
+            return Err(JammiError::Catalog(format!(
+                "result table '{}' is versioned (current_version = {version}) but carries no                  dimensions — a catalog invariant violation",
+                record.table_name
+            )));
+        };
+        let manifest = match self.resolve_version_manifest(record, version).await {
+            Ok(m) => m,
+            Err(JammiError::VersionUnavailable { .. }) => {
+                warn!(
+                    table = record.table_name,
+                    version,
+                    "current version manifest unresolvable; registering a placeholder provider"
+                );
+                let provider = Arc::new(PlaceholderProvider::new(
+                    record.table_name.clone(),
+                    version,
+                    crate::store::schema::embedding_table_schema(dimensions.max(0) as usize),
+                ));
+                self.install_result_schema(ctx)?;
+                self.result_schema.add_result_table(
+                    format!("jammi.{}", record.table_name),
+                    provider,
+                    owner,
+                );
+                return Ok(());
+            }
+            Err(e) => return Err(e),
+        };
+        let provider = self.build_masked_provider(ctx, record, &manifest).await?;
+        self.install_result_schema(ctx)?;
+        self.result_schema.add_result_table(
+            format!("jammi.{}", record.table_name),
+            provider,
+            owner,
+        );
+        Ok(())
+    }
+
+    /// The [`MaskedTableProvider`] for `manifest` — one `ListingTable` per
+    /// fragment, every non-base fragment pinned to the base fragment's
+    /// inferred schema, under the manifest's deletion mask. Unregistered: the
+    /// caller registers it (`bind_result_table`) or reads through it directly
+    /// (a not-yet-published manifest's live-row count).
+    pub async fn build_masked_provider(
+        &self,
+        ctx: &SessionContext,
+        record: &ResultTableRecord,
+        manifest: &VersionManifest,
+    ) -> Result<Arc<dyn TableProvider>> {
+        let mask = Arc::new(
+            self.load_deletion_mask(&record.table_name, manifest)
+                .await?,
+        );
+        let mut fragments = Vec::with_capacity(manifest.fragments.len());
+        let mut pinned: Option<arrow::datatypes::SchemaRef> = None;
+        for fragment in &manifest.fragments {
+            let url = StorageUrl::parse(&fragment.url)?;
+            let provider =
+                build_result_table_provider(ctx, &self.registry, &url, pinned.clone()).await?;
+            if pinned.is_none() {
+                pinned = Some(provider.schema());
+            }
+            fragments.push(MaskedFragment {
+                provider,
+                version: fragment.version,
+            });
+        }
+        let schema = pinned.ok_or_else(|| {
+            JammiError::Catalog(format!(
+                "result table '{}' version {} lists no fragments",
+                record.table_name, manifest.version
+            ))
+        })?;
+        Ok(Arc::new(MaskedTableProvider::new(
+            record.table_name.clone(),
+            fragments,
+            mask,
+            schema,
+        )))
     }
 
     /// Persist a fully-built [`SidecarIndex`] as a NEW immutable segment of
@@ -2583,6 +2858,7 @@ async fn build_result_table_provider(
     ctx: &SessionContext,
     registry: &StorageRegistry,
     url: &StorageUrl,
+    pinned_schema: Option<arrow::datatypes::SchemaRef>,
 ) -> Result<Arc<dyn TableProvider>> {
     use datafusion::datasource::file_format::options::ParquetReadOptions;
 
@@ -2601,9 +2877,17 @@ async fn build_result_table_provider(
     let listing_options =
         ParquetReadOptions::default().to_listing_options(&config, ctx.copied_table_options());
     let table_path = ListingTableUrl::parse(url.as_str())?;
-    let resolved_schema = listing_options
-        .infer_schema(&ctx.state(), &table_path)
-        .await?;
+    // A versioned table's fragments are pinned to the base fragment's
+    // inferred schema so the union's schema is one shape; a fragment whose
+    // file disagrees surfaces as a typed schema error at read.
+    let resolved_schema = match pinned_schema {
+        Some(s) => s,
+        None => {
+            listing_options
+                .infer_schema(&ctx.state(), &table_path)
+                .await?
+        }
+    };
     let table_config = ListingTableConfig::new(table_path)
         .with_listing_options(listing_options)
         .with_schema(resolved_schema);

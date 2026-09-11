@@ -748,7 +748,7 @@ impl ProducingDescriptor {
     /// Canonical bytes for hashing: a JSON encoding with object keys sorted, so
     /// the byte stream is independent of struct field declaration order and
     /// stable across serde versions. Pure; no I/O.
-    fn canonical_bytes(&self) -> Result<Vec<u8>, ManifestError> {
+    pub(crate) fn canonical_bytes(&self) -> Result<Vec<u8>, ManifestError> {
         let value = serde_json::to_value(self)
             .map_err(|e| ManifestError::UncanonicalDescriptor(e.to_string()))?;
         let canonical = canonicalize_json(&value);

@@ -91,6 +91,7 @@ message JammiErrorDetail {
     DependencyCycleError dependency_cycle = 28;
     NotRecomputableError not_recomputable = 29;
     InvalidKeyError invalid_key = 32;
+    VersionUnavailableError version_unavailable = 33;
   }
   // Tag 15 / `model_retired` are reserved: the wire surface must never reuse a
   // retired field number or name, so a peer built against either contract
@@ -195,6 +196,15 @@ message NotRecomputableError {
 message InvalidKeyError {
   string column = 1;
   uint64 null_count = 2;
+}
+
+// `JammiError::VersionUnavailable { table, version }`. A versioned result
+// table whose CURRENT version cannot be served (its version row is `failed`
+// or its manifest is definitively absent). The absent-resource convention:
+// maps to `NotFound`.
+message VersionUnavailableError {
+  string table = 1;
+  int64 version = 2;
 }
 
 // `JammiError::ChannelCatalog(ChannelCatalogError)`. The inner taxonomy is

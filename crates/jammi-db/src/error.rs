@@ -299,6 +299,22 @@ pub enum JammiError {
         null_count: u64,
     },
 
+    /// A versioned result table whose CURRENT version cannot be served: the
+    /// version row is `failed`, or its `.version.json` manifest is
+    /// definitively absent on an `exists()` probe. Raised by the ANN and SQL
+    /// read paths alike (the SQL path through the placeholder provider and
+    /// the structural error classifier). The table row itself is untouched;
+    /// the remedy is `recompute` (a new table).
+    #[error(
+        "result table `{table}` version {version} is unavailable (its manifest cannot be resolved)"
+    )]
+    VersionUnavailable {
+        /// The table whose current version is unavailable.
+        table: String,
+        /// The unavailable version.
+        version: i64,
+    },
+
     /// Catch-all for errors that don't fit another variant.
     #[error("{0}")]
     Other(String),

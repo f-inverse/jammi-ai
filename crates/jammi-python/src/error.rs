@@ -78,6 +78,7 @@ fn jammi_error_class(err: &JammiError) -> &'static str {
         // (each subclasses the class the remote mapper produces for its gRPC
         // code, so one `except` holds on both transports).
         JammiError::InvalidKey { .. } => "InvalidKey",
+        JammiError::VersionUnavailable { .. } => "VersionUnavailable",
         _ => "BackendError",
     }
 }

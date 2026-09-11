@@ -34,7 +34,8 @@
 //! `Catalog`, `Schema`, `Config`, `Eval`, `Tenant`, `FineTune`, `Gpu`, `Backend`,
 //! `ChannelAssembly`, `Lexical`, `IncompatibleFormat`, `DependencyCycle`,
 //! `NotRecomputable`, `RowGone`, `TenantMismatch`, `LeaseLost`, `CasFailed`,
-//! `JobAttemptSuperseded`, `JobCancelled`, `SourceBusy`, `InvalidKey`) reconstructs exactly,
+//! `JobAttemptSuperseded`, `JobCancelled`, `SourceBusy`, `InvalidKey`,
+//! `VersionUnavailable`) reconstructs exactly,
 //! field for field — `tests::every_owned_shape_variant_round_trips_to_itself`
 //! is the completeness proof, backed by an exhaustive match with no catch-all
 //! so a NEW owned-shape variant fails to compile here until it is listed. So
@@ -190,6 +191,12 @@ impl From<&JammiError> for pb::JammiErrorDetail {
                     null_count: *null_count,
                 })
             }
+            JammiError::VersionUnavailable { table, version } => {
+                Variant::VersionUnavailable(pb::VersionUnavailableError {
+                    table: table.clone(),
+                    version: *version,
+                })
+            }
             // The fold reaches ONLY the genuinely-foreign `#[from]` variants
             // (`Io`, `BackendDriver`, `Toml`, `Json`, `DataFusion`, `Trigger`,
             // `Storage`) and the existing `Other`: every owned-shape variant —
@@ -281,6 +288,10 @@ fn jammi_error_from_detail(detail: pb::JammiErrorDetail, message: &str) -> Jammi
         Some(Variant::InvalidKey(e)) => JammiError::InvalidKey {
             column: e.column,
             null_count: e.null_count,
+        },
+        Some(Variant::VersionUnavailable(e)) => JammiError::VersionUnavailable {
+            table: e.table,
+            version: e.version,
         },
         Some(Variant::Other(e)) => JammiError::Other(e.message),
         // The unknown-oneof case (B5): `message` is the enclosing `Status`'s
@@ -898,6 +909,7 @@ mod tests {
             | JammiError::JobCancelled { .. }
             | JammiError::SourceBusy { .. }
             | JammiError::InvalidKey { .. }
+            | JammiError::VersionUnavailable { .. }
             | JammiError::Other(_) => {}
         }
     }
@@ -979,6 +991,10 @@ mod tests {
             JammiError::InvalidKey {
                 column: "id".into(),
                 null_count: 3,
+            },
+            JammiError::VersionUnavailable {
+                table: "patents__embedding__m".into(),
+                version: 4,
             },
             JammiError::Other("an error with no more specific shape".into()),
         ];

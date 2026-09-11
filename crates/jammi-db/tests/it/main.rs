@@ -22,6 +22,7 @@ mod freshness;
 mod index;
 mod jobs_queue;
 mod lease_keeper;
+mod masked_read;
 mod materialization;
 #[cfg(feature = "test-hooks")]
 mod materialization_crash_recovery;

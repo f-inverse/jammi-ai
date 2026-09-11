@@ -132,7 +132,7 @@ pub trait NeighborGraphStrategy {
 /// Index-assisted driver: each query goes to the table's whole segment set,
 /// loaded once. Queries `k + 1` and drops the self-hit so a full `k` survive.
 struct IndexAssisted {
-    index: jammi_db::index::SegmentedIndex,
+    index: std::sync::Arc<jammi_db::index::SegmentedIndex>,
     /// The retrieve→rescore oversample, resolved once from the table's stamped
     /// default. Unused for an `F32` table (its merged order is already exact);
     /// governs candidate breadth for a quantized / `Binary` one.

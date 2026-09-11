@@ -238,6 +238,12 @@ pub fn map_engine_error(err: JammiError) -> Status {
             Code::InvalidArgument,
             format!("key column `{column}` has {null_count} null value(s)"),
         ),
+        // The current version of a versioned table cannot be served — the
+        // absent-resource convention `ModelNotFound` / `RowGone` follow.
+        JammiError::VersionUnavailable { table, version } => (
+            Code::NotFound,
+            format!("result table `{table}` version {version} is unavailable"),
+        ),
         other => (Code::Internal, other.to_string()),
     };
     attach_error_detail(code, message, &err)

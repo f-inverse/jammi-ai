@@ -42,27 +42,27 @@ dimensions, the alternatives, the choice, and what the sizing pressure-test chan
 6. **No cut inside U2/U4/U5.** Rejected by the sizing pressure-test: the producer/consumer
    seam (U2a/U2b), the trait/rank-context seam (U4a/U4b) and the service/coordinator seam
    (U5a/U5b) each yield a compiling, gate-passing, bisectable intermediate with its own RED
-   oracle and restore real concurrency (U4a ∥ U2a; U6 ∥ U5b).
+   oracle and restore real concurrency (U4a ∥ U2a; U7b ∥ U5a).
 
 ## The schedule
 
 ```
 PR-A  [U1]                                            S3 sizes it; S1, S2, S4, S5 run concurrently (no PR)
 PR-B  U7a ∥ U2a ∥ U4a  →  U2b ∥ U3  →  U4b  →  artifact      commits: U7a, U2a, U4a, U2b, U3, U4b, artifact
-PR-C  U7b ∥ U5a  →  U6 ∥ U5b  →  artifact                    commits: U7b, U5a, U6, U5b, artifact
+PR-C  U7b ∥ U5a  →  U6  →  U5b  →  artifact                   commits: U7b, U5a, U6, U5b, artifact
 PR-D  U8 → U9                                                  U8 is the completion gate
 ```
 
-Serial edges: U1 → everything (API line); U2a → U2b, U3; U2b + U3 + U4a → U4b; U4a → U5a;
-U4b + U5a → U5b; U2b + U5a → U6; U5b + U6 → U8.
+Serial edges: U1 → everything (API line); U2a → U2b, U3; U4a → U2b (the `world` argument);
+U2b + U3 + U4a → U4b; U4a → U5a; U2b + U5a → U6; U4b + U5a + U6 → U5b; U5b + U6 → U8.
 
 Co-ownership recorded (order = commit order): `manifest.rs` (U2a, U3, U4b — U3's completeness
 test is extended by U4b); `pipeline/recompute.rs` (U2a re-materialize arm, U3 retrain arm);
 `worker.rs` (U2a/U2b own `run_spec`; U4b adds the rank spawn in `run_spec`; U3 owns
 `publish_and_finalize`; U5b owns the coordinator region; U6 owns the head-target arm at
 `run_fine_tune_blocking`); `trainer.rs` (U2b, U4b); `fine_tune/collective/mod.rs` (U4a creates,
-U5b adds `peer.rs`); `config/mod.rs` (U4a then U5a); `runpod_lib.sh` and `gpu-gang.yml` (U7a
-then U7b); `crates/jammi-server/src/runtime.rs` (U5a mount, U8 roles);
+U5b adds `peer.rs`); `config/mod.rs` (U4a then U5a); `runpod_lib.sh`, `gpu-gang.yml` and the reachability
+allowlist (U7a then U7b); `wire/training.rs` + `training.proto` (U4a, wire-server co-owner); `crates/jammi-server/src/runtime.rs` (U5a mount, U8 roles);
 `tests/distributed/{main.rs, harness.rs}` and `distributed.yml` (U5b, then U8);
 `docs/maintainer/MAINTAINER-GUIDE.md` variant block (U2a, U3; U9 prose only);
 `crates/jammi-wire/src/embedding.rs` (U2a) and `crates/jammi-wire/build.rs` (U5a).

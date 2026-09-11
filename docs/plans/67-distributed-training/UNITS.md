@@ -76,9 +76,13 @@ per-step `$?`. Naming per README ruling 23.
   `model/cache.rs` (`CacheKey { model_id, device, task: Option, backend: Option }` — shared
   shape with plan 65, recorded in both ledgers), `model/backend/mod.rs` (`DeviceConfig` plural),
   `concurrency/gpu_scheduler.rs` (per device), `session.rs`, `fine_tune/spec.rs`
-  (`TrainingCommon.world_size` — the field lands here so the refusals below are testable at
-  this commit), `jammi-ai/Cargo.toml` (`cuda` adds `candle-core/nccl`). (db) `config/mod.rs`
-  (`[gpu] devices`, `[training] world_size`, `collective`), tests. Test targets: hermetic
+  (`TrainingCommon.world_size`, `#[serde(default)]` = 1 — the field lands here so the
+  refusals below are testable at this commit; queued specs still deserialize), every
+  `TrainingCommon { .. }` construction site (`wire/training.rs:176`, `session.rs:1172`,
+  `:1300`, the `tests/it` sites), `jammi-ai/Cargo.toml` (`cuda` adds `candle-core/nccl`).
+  (wire-server, co-owner) `proto/jammi/v1/training.proto` + `crates/jammi-wire/src/training.rs`
+  (the per-job `world_size` field, append-only). (db) `config/mod.rs` (`[gpu] devices`,
+  `[training] world_size`, `collective`), tests. Test targets: hermetic
   tests in the crate's unit tests; the `Nccl` smoke in the existing `gpu_capability` target.
 - **invariants_to_preserve**: B4 (topology is configuration), K2 (`world_size > devices`,
   `nccl` without CUDA, `world_size > 1` with `cached == true` or `hard_negatives.mine == true`
@@ -88,7 +92,8 @@ per-step `$?`. Naming per README ruling 23.
   (b) each refusal above (RED at base); (c) two devices in one session hold two cache entries
   for one model id (RED at base: keyed by id alone). (pod leg smoke) `Nccl` over 2 devices
   reduces a known vector.
-- **lane**: hermetic (+ pod leg smoke). **depends_on**: S1. **size**: L. No loader contact.
+- **lane**: hermetic (+ pod leg smoke). **depends_on**: S1. **size**: L. No loader contact;
+  U2b takes `world` as a partition-rule argument fed from this field (U4a → U2b).
 
 ## U2b — Streaming loader; partition rule; scaler; whole-set arms (PR-B commit 4)
 
@@ -109,7 +114,7 @@ per-step `$?`. Naming per README ruling 23.
   (d) mining/GradCache runs at W=1 produce bytes identical to base; (e) order: the streamed
   row order equals the committed materialization order for `target_partitions ∈ {1, N}` from
   the row-group reader, with no blocking sort (RED at base).
-- **lane**: hermetic + cookbook. **depends_on**: U2a. **size**: XL.
+- **lane**: hermetic + cookbook. **depends_on**: U2a, U4a (the `world` argument). **size**: XL.
 
 ## U3 — `FineTune` producer; migration 029; cache reuse (PR-B commit 5, concurrent with U2b)
 
@@ -140,8 +145,9 @@ per-step `$?`. Naming per README ruling 23.
   with per-rank `dropout_positions` gathered), `fine_tune/resume.rs` (per-rank positions,
   schema-version bump), `fine_tune/target.rs` (per-rank dropout seed derivation),
   `fine_tune/optimizer.rs` (zero-filled reduce set), `fine_tune/worker.rs::run_spec` (spawn W
-  local ranks), `store/manifest.rs` (topology fields; extends U3's completeness test), tests.
-  Test targets: hermetic tests in the crate's unit tests; pod-leg tests in `gpu_capability`.
+  local ranks), tests. (db, co-owned with U2a/U3) `store/manifest.rs` (topology fields;
+  extends U3's completeness test). Test targets: hermetic tests in the crate's unit tests;
+  pod-leg tests in `gpu_capability`.
 - **invariants_to_preserve**: B4, K7, K2, K4, B6.
 - **acceptance** (hermetic, `Local`): (a) W=2 twice → identical bytes, including across a
   resume (kill at epoch k, resume, compare to uninterrupted) (RED at base); (b) gather
@@ -160,8 +166,11 @@ per-step `$?`. Naming per README ruling 23.
 
 - **files_in_scope** (docs-ci): `ci/scripts/runpod_lib.sh` (cluster create/teardown primitive
   with deadline), `ci/scripts/runpod_gpu_gang.sh` (cluster leg: TRAINING cluster, 2 pods × 2
-  GPUs), `.github/workflows/gpu-reap.yml` (clusters enumerated and reaped), `gpu-gang.yml`.
-- **acceptance**: reap enumerates clusters (RED at base: pods only); P1 rules; guard wiring.
+  GPUs), `ci/scripts/execution_surface_reachability_allowlist.txt` (the cluster-leg tuples;
+  U7a's rows re-verified if their command lines change), `.github/workflows/gpu-reap.yml`
+  (clusters enumerated and reaped), `gpu-gang.yml`.
+- **acceptance**: reap enumerates clusters (RED at base: pods only); P1 rules; guard wiring;
+  `check_execution_surface_reachability.py` green with the cluster-leg tuples allowlisted.
 - **lane**: gate scripts. **depends_on**: U7a, S4. **size**: M.
 - **cost ceiling**: ≤ 1 h × 4 GPU × $1.59 ≈ $6.4 per run; label-only until a flake-free streak.
 
@@ -201,8 +210,8 @@ per-step `$?`. Naming per README ruling 23.
 
 - **files_in_scope** (ai-core): `fine_tune/collective/peer.rs`, `fine_tune/worker.rs`
   (coordinator: peer resolution, id mint, dispatch, watchdog, attempt abort),
-  `tests/distributed/{harness.rs (peer TOML, `[training] peers`), gang_deterministic.rs,
-  gang_chaos.rs}`, `.github/workflows/distributed.yml` (three new test names). (wire-server)
+  `tests/distributed/{main.rs (mod lines), harness.rs (peer TOML, `[training] peers`),
+  gang_deterministic.rs, gang_chaos.rs}`, `.github/workflows/distributed.yml` (three new test names). (wire-server)
   `grpc/gang.rs` peer-side rank runner and attempt fence.
 - **invariants_to_preserve**: K4 real (W=1 via the gang path == embedded bytes), B4, K2, B6.
 - **acceptance**: (a) server it-suite: W=1 coordinator dispatching to itself → bytes identical

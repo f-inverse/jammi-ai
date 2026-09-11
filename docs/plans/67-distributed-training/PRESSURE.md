@@ -93,4 +93,23 @@ Verified by the lead before folding: `trainer.rs:2676-2679` (classify inside los
 `check_doc_parity.py:127-136`, `execution_surface_reachability_allowlist.txt` (162 lines),
 `jammi-wire/build.rs:22-33`.
 
-## Round 3 (on v3) — disposition check
+## Round 3 (2026-09-10, on v3 db5dd701) — disposition check: REFINE, consistency only
+
+Every round-1 and round-2 disposition was found present and consistent except three
+consistency slips introduced by the v3 fold, plus citation slips. All were text edits with no
+mechanism change; folded into v3.1 and verified by the lead by grep (no round 4):
+
+| # | Finding | Disposition |
+|---|---|---|
+| 1 | U6 → U5b edge present in UNITS only; README table/hand-off and SIZING still said `U6 ∥ U5b` | README unit table, hand-off step 6, SIZING schedule/edges/alternative 6 corrected |
+| 2 | Reachability allowlist missing from U7b scope/acceptance and the co-ownership row | Added to U7b; row extended |
+| 3 | `TrainingCommon.world_size` in U4a without its construction sites, serde default, or the wire field | `#[serde(default)]` = 1 (D10); construction sites (`wire/training.rs:176`, `session.rs:1172`, `:1300`, `tests/it`) and `training.proto`/`jammi-wire/src/training.rs` in U4a with wire-server co-owner; README r17 |
+| A4 | Citations: `fine_tune.rs:237-267` → `:237-445`; `runpod_lib.sh:1263` → `:1264`; `optimizer.rs:612` (correct as cited) | Corrected |
+| A5 | U5b omitted `tests/distributed/main.rs`; U4b listed `store/manifest.rs` under ai-core | Corrected |
+| A6 | U4a → U2b edge (the `world` argument) unstated | Stated in README table, U2b, SIZING edges |
+
+Lead's grep verification of the fold (recorded here in place of a fourth round): every
+"U6 ∥ U5b" removed; `U6` in U5b's dependency column; the allowlist string present under U7a
+and U7b; `serde(default)` and `wire/training.rs` under U4a; `main.rs` under U5b; the three
+citations corrected. Verdict of record: the plan is **PROCEED-equivalent** — the last standing
+findings were consistency edits, verified closed.

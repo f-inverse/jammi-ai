@@ -1,6 +1,6 @@
 # 67 — Multi-GPU and multi-node training as engine mechanism, on DataFusion (#500)
 
-**Status:** PLANNED, v3 — scoped (gap-analyzer: invariant-crossing, 2026-09-10), pressure-tested
+**Status:** PLANNED, v3.1 — scoped (gap-analyzer: invariant-crossing, 2026-09-10), pressure-tested
 in three rounds (design lens and sizing lens; rounds 1 and 2 REFINE, every finding folded;
 round 3 is the disposition check — see `PRESSURE.md`), NOT implemented. This directory is the hand-off artifact for the lead that
 implements it in a fresh session: read this file, then `DESIGN.md`, then `UNITS.md`, then
@@ -177,7 +177,10 @@ jammi binary and executing the same operators unchanged through a physical exten
     the first gating run** (derivation: S5, or the max delta over ≥ 3 same-seed baseline runs
     on that box). (Feasibility.)
 17. **Config surface is topology, not a sixth backend.** `[gpu] devices`, `[training]
-    world_size`, `peers`, `rank_timeout_secs`, `collective`; per-job `world_size` in the spec.
+    world_size`, `peers`, `rank_timeout_secs`, `collective`; per-job `world_size` in the spec
+    (`TrainingCommon.world_size`, `#[serde(default)]` = 1 so queued specs still deserialize —
+    D10 — set from the wire through `training.proto`/`jammi-wire/src/training.rs`, owned by U4a
+    with wire-server as a co-owner).
 18. **Exactly one migration, 029 `model_materialization`.** Migrations end at 028; the issue's
     029/030 claim was false and is corrected in its body.
 19. **DataFusion 54 upgrade is a unit, first**, sized by spike S3. Compatible third-party lines
@@ -187,7 +190,7 @@ jammi binary and executing the same operators unchanged through a physical exten
 20. **Committed artifact means the repo's proof convention**: a `gpu-gang.yml` lane modeled on
     `gpu-prove.yml` (label, nightly, manual; off the merge path), sha-stamped JSON under
     `crates/jammi-kernels/artifacts/cuda-runs/`. Box A100-SXM4-80GB; cluster 2 pods × 2 GPUs.
-    `ci/scripts/runpod_lib.sh` hardcodes `gpuCount: 1` (line 1263) and has no cluster
+    `ci/scripts/runpod_lib.sh` hardcodes `gpuCount: 1` (line 1264) and has no cluster
     primitive, so the lane unit owns those changes and spike S4 proves provisioning first.
     Every `cargo` invocation in a non-merge-path script must be allowlisted in
     `ci/scripts/execution_surface_reachability_allowlist.txt` (the registry is derived from
@@ -214,14 +217,14 @@ jammi binary and executing the same operators unchanged through a physical exten
 | B | 1 | U7a | `gpu-gang.yml` pod leg; `runpod_lib.sh` gpuCount; artifact schema | gate scripts | S4 |
 | B | 2 | U2a | `TrainingSet` producer (worker still reads into today's loader) | hermetic + cookbook | U1 |
 | B | 3 | U4a | `Collective` trait + `Noop`/`Local`/`Nccl`; device-plural session; `CacheKey`; config refusals | hermetic (+ pod leg for `Nccl` smoke) | S1 |
-| B | 4 | U2b | Streaming loader; partition rule; scaler over train prefix; mining/GradCache adaptation | hermetic + cookbook | U2a |
+| B | 4 | U2b | Streaming loader; partition rule; scaler over train prefix; mining/GradCache adaptation | hermetic + cookbook | U2a, U4a (the `world` argument of the partition rule) |
 | B | 5 | U3 | `FineTune` producer; migration 029; cache reuse | hermetic | U2a |
 | B | 6 | U4b | Rank context; gather rule; lockstep control; single-node gang | hermetic + gpu-gang pod leg | U2b, U3, U4a |
 | B | 7 | — | pod-leg artifact JSON (lane unit follow-up) | gpu-gang | U4b |
 | C | 1 | U7b | cluster leg + cluster reap primitive | gate scripts | U7a, S4 |
 | C | 2 | U5a | `gang.proto`; `GangService` mount; `FetchPartition`; authorization | hermetic + server it-suite | U4a |
 | C | 3 | U6 | Partition-aware inference operator; distributed frozen forward | hermetic (the two-worker leg is U5b's (e)) | U2b, U5a |
-| C | 4 | U5b | Coordinator; `Peer` collective; attempt fence; chaos | distributed (manual dispatch before merge) + cluster leg | U4b, U5a |
+| C | 4 | U5b | Coordinator; `Peer` collective; attempt fence; chaos; two-worker forward leg | distributed (manual dispatch before merge) + cluster leg | U4b, U5a, U6 |
 | C | 5 | — | cluster-leg artifact JSON | gpu-gang | U5b |
 | D | 1 | U8 | Ballista scheduler/executor roles + extension codec (mandatory, last) | hermetic codec round-trip + distributed three-process arm | U1, U5b, U6, S2 |
 | D | 2 | U9 | Docs (guide, reference topologies, maintainer guide, CHANGELOG) | docs gates | all |
@@ -256,7 +259,8 @@ NCCL channels pinned (decides whether GPU byte oracles are promoted).
    U2b owns `data.rs`, `trainer.rs`, `worker.rs::run_spec`); U4b last (it extends U3's
    hash-flip test with the topology fields and touches `manifest.rs` — co-ownership recorded).
    Label the PR to fire the pod leg; the artifact lands as commit 7.
-6. PR-C in the commit order above. Concurrency: U7b ∥ U5a; U6 ∥ U5b after U5a.
+6. PR-C in the commit order above. Concurrency: U7b ∥ U5a; then U6, then U5b (U5b's
+   acceptance (e) uses U6's operator, so U6 → U5b is a serial edge).
    `distributed.yml` is dispatched manually and must be green on the deterministic leg before
    merge (it has no PR trigger).
 7. PR-D: U8 then U9. U8 is the completion gate.

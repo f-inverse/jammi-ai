@@ -799,7 +799,9 @@ async fn release_job_holds_on_thread(
                     *attempts,
                     Arc::clone(&r.lost),
                 )),
-                LeaseTarget::Instance(_) | LeaseTarget::ResultTable { .. } => None,
+                LeaseTarget::Instance(_)
+                | LeaseTarget::ResultTable { .. }
+                | LeaseTarget::ResultTableVersion { .. } => None,
             })
             .collect()
     };

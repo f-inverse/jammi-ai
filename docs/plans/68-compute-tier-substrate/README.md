@@ -98,7 +98,7 @@ attempt (NULL `partial_result`) records its table and completes.
   state (67 r27).
 - The actuator rule (D5) has no constitution ID; 67 proposes a human-merged constitution row as
   a follow-on.
-- Migration numbering: 67 appends three after 68's four (OPS, GRAPH, DELTA, DIST unit 2; 67 r30).
+- Migration numbering: OPS, GRAPH and DELTA append one each; 67 appends three (`model_materialization`, `instances_peer_addr` — U5b-1's, which DIST's placement consumes — and `compute_cluster_state`); no number is reserved (67 r30).
 - `instances.peer_addr` does double duty: a replica that sets `peer_advertise` to be
   gang-reachable also joins DIST's retrieval ring (unit 2's ring is every row with `peer_addr`
   set, no capability filter). Capability-scoping the ring is a 68 follow-on to consider.

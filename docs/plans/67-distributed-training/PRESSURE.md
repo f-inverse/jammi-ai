@@ -155,4 +155,15 @@ tree -d` covers tonic/prost; U9 split (U9a docs, U9b overlay); PR-D merge condit
 
 ### Consolidation (2026-09-10): both plans owned by one lead; single schedule in `../68-compute-tier-substrate/PROGRAM.md`
 
-### Round 5 (on the consolidated plans) — disposition check, recorded below
+### Round 5 (2026-09-10, on ae512fe7) — disposition check: REFINE, consistency only; folded into v4.3 and grep-verified by the lead (no round 6)
+
+Every round-4 disposition and every tree fact reproduced (`fail_job` terminal, reclaim arm 1a, the
+lease-lost arm, `get_job` tenant filter, `list_workers` without `devices`, the migration pin sites,
+`publish_crates.sh`, the swarm bijection's total partition). Seven sites the folds had not reached:
+hand-off step 5 gave PR-B a false 68 precondition; U5a's `depends_on` still carried the deleted
+fallback and lacked OPS/GRAPH; U3 still named "029"; U8a lacked the card-glob and dep-DAG sites;
+`instances.peer_addr` was owned twice (68 README, DIST D9/K5, DESIGN §4/§7); one reference to the
+deleted reconciliation file; DESIGN's unprefixed citations were anchored pre-#501 (measured shifts
+now stated at DESIGN:5). Advisories folded: U8a → U5b-1; PR-B is also an admin merge (U7a edits a
+`check_*.py`); the dep-DAG lane is advisory by standing; U9b owns the StatefulSet consequence;
+`tests/distributed/cluster_state.rs`.

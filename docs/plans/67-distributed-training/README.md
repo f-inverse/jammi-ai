@@ -156,12 +156,13 @@ those still in force are restated here in their v4 form. Principle in parenthese
     depends on `jammi-ai`, `jammi-db`, `jammi-wire` and the Ballista crates and is depended on by
     `jammi-server`; publishable, lockstep (K6); no cargo feature (B4's "no library-vs-server
     gate"): the library never loses the capability because a library embedder adds the same
-    crate. No vendored subtree in v1. A new workspace crate has three registration sites that
-    red at merge: the domain card's `owns:` globs (`.claude/agents/wire-server.md` takes
+    crate. No vendored subtree in v1. A new workspace crate has three registration sites, two
+    of which red at merge: the domain card's `owns:` globs (`.claude/agents/wire-server.md` takes
     `crates/jammi-ballista/**`; `check_swarm_bijection.py` asserts a total partition, and editing
     a card trips `SWARM_GATE_TOUCHED` → **PR-D needs an admin merge**), `ci/scripts/publish_crates.sh`'s
-    ordered publish list (insert before `jammi-server`), and the generated dep-DAG block in
-    `docs/maintainer/MAINTAINER-GUIDE.md` (`gen_dep_dag.py`, diffed by `dep-dag.yml`).
+    ordered publish list (insert before `jammi-server`), and — advisory by standing, `dep-dag.yml`
+    is outside `ci-summary` — the generated dep-DAG block in `docs/maintainer/MAINTAINER-GUIDE.md`
+    (`gen_dep_dag.py`).
     `check_dep_direction.py` encodes no layering and is not touched.
 39. **Roles are listener-shaped knobs, like `peer_bind`**: a replica hosts the scheduler iff
     `[ballista] scheduler_bind` is set, and an executor iff `[ballista] executor.scheduler_address`
@@ -268,7 +269,9 @@ the custom state; **run two schedulers** over one state store; print the executo
 3. Run S3 on `main` (it carries #501); S1, S4, S5, S6 concurrently.
 4. PR-A (U1) from `main` now; one worktree, one commit. 68's PR-K is in CI and may merge
    before PR-A — rebase, no ordering constraint between them.
-5. PR-B after 68 K and DIST unit 1 merge (U5a's listener). Commit order as in the table;
+5. PR-B after PR-A merges; no 68 dependency. Commit order as in the table; PR-B edits
+   `ci/scripts/check_cuda_run_artifacts.py` (U7a), which trips `SWARM_GATE_TOUCHED`, so PR-B is
+   an admin merge too;
    U7a ∥ U2a ∥ U4a; U2b ∥ U3; U4b last; label the PR for the pod leg.
 6. PR-C(67) after DIST unit 1, OPS and GRAPH merge (they rewrite the claim loop and
    `claim_next`). U7b ∥ U5a; U6; U5b-1; U5b-2; `distributed.yml` dispatched manually,

@@ -1,10 +1,13 @@
 # DESIGN — distributed training on DataFusion (#500), v4
 
 Companion to `README.md` (rulings) and `UNITS.md` (contracts). Every mechanism names the
-principle it derives from and the code it lands on. Citations without a prefix are read against
-main at `7561658e`; citations prefixed `wt-C:` were read against the jobs-fleet branch at
-`95993a06`, now merged into `main` as PR #501 (`4ecc0230`) with those files byte-unchanged, so
-they hold on `main` at the same lines.
+principle it derives from and the code it lands on. Citations without a prefix were read against
+main at `7561658e` (pre-#501) and are re-derived at briefing time; #501 shifted `trainer.rs` by
+up to +28 lines (measured on `4ecc0230`: `classify` 2892→2894, `pairwise_ordering_loss`
+3862→3864, `mnrl_loss` 4110→4112, the CoSENT default 4356→4358, `head_forward` 2245→2247, the
+`.mine` gate 1451→1473) and other cited files by ≤ a few lines. Citations prefixed `wt-C:` were
+read against the jobs-fleet branch at `95993a06`, now merged as #501 with those files
+byte-unchanged, so they hold on `main` at the same lines.
 
 ## 1. What MLlib did to Spark, and what that means here
 
@@ -133,7 +136,7 @@ the only lease (`heartbeat_job`, `wt-C: jobs_repo.rs:772`, driven by the lease k
 `context_predictor` is refused at `world_size > 1`. The coordinator materializes or reuses the
 training set (with `job_attempt: None` — a shared producer output, never this attempt's
 `partial_result`), computes the scaler, resolves `W−1` **members** from the catalog
-(`workers.kinds` ∋ kind, `instances.peer_addr` set — 68 DIST unit 2's column — `last_seen_at`
+(`workers.kinds` ∋ kind, `instances.peer_addr` set — the column U5b-1 appends and DIST's placement consumes — `last_seen_at`
 fresh, and from U8b `workers.devices` sufficient), mints the NCCL id when the collective is
 `nccl`, and sends each member:
 
@@ -286,13 +289,13 @@ single-process table (K4 shape).
 ```
 [gpu]      device = 0 ; devices = [0, 1]
 [worker]   enabled = true ; kinds = "all" ; world_size = 1 ; rank_timeout_secs = 120 ; collective = "auto"   # auto|nccl|cpu
-[server]   peer_bind = "..." ; peer_advertise = "..."          # 68 DIST: members are catalog rows, not a list
+[server]   peer_bind = "..." ; peer_advertise = "..."          # peer_bind: 68 DIST-1; peer_advertise + instances.peer_addr: 67 U5b-1; members are catalog rows, not a list
 [ballista] scheduler_bind = "..." ; executor = { scheduler_address = "...", work_dir = "..." }   # U8a
 ```
 Per-job `world_size` lives in `TrainingCommon` (identity-relevant; `#[serde(default)]` = 1).
 Placement is the deployer's runtime: Kubernetes runs the compute tier as a StatefulSet with a
 headless service (or an indexed Job) with `nvidia.com/gpu: N`; Compose lists services; Slurm
-and Ray are placement options only (#482; owned by U9 after 68 K merges).
+and Ray are placement options only (#482; owned by U9b after 68 K and OPS merge).
 
 ## 8. Non-goals (declared)
 

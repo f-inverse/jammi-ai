@@ -642,6 +642,7 @@ fn lease_and_worker_config_round_trip() {
             enabled: true,
             kinds: WorkerKinds::All(AllSentinel::All),
             idle_poll_secs: 1,
+            metrics_sample_secs: 5,
         }
     );
     let intervals = cfg

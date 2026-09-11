@@ -7,6 +7,24 @@ workspace ships every publishable crate at the same
 ## [Unreleased]
 
 ### Added
+- **`jammi_db::catalog::result_repo::ResultTableCas` gains the `pub` field
+  `lease_present: bool` (#482).** The struct is a re-exported pub struct
+  with pub fields, so every literal `ResultTableCas { .. }` construction in
+  downstream code must add the field (`false` reproduces the previous
+  predicate; the builders `writer` / `writer_any_tenant` / `expired` set it
+  `false`, `with_lease_present()` sets it). When set, the building-row CAS
+  additionally requires `lease_expires_at IS NOT NULL`; `Catalog::renew_lease`
+  always carries it, so a RELEASED building lease is never re-armed by any
+  holder's renewal. Migration `031_jobs_releases_workers_state` adds
+  `jobs.releases`, `workers.state` and the gauge index `idx_jobs_kind_status`;
+  `Catalog::{release_job_lease, release_jobs_claimed_by,
+  release_building_tables_of_claimant, clear_partial_result,
+  set_worker_state, count_jobs_by_kind_status}`, `WorkerState`,
+  `LeaseKeeper::release_job_holds` and `[worker] metrics_sample_secs`
+  (default 5) are the lease-release substrate; `Catalog::upsert_worker`
+  takes the row's initial `WorkerState`. The reclaim cap now compares
+  `attempts - releases`, and `heartbeat_job` carries `lease_expires_at IS
+  NOT NULL`.
 - **`jobs`/`instances`/`workers`: a generalised, kind-agnostic durable-job
   queue replaces the training-only queue; a per-process lease keeper (#485).**
   Migration 029 drops `training_jobs` and adds `jobs` (training AND compute

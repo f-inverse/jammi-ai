@@ -439,3 +439,240 @@ async fn shutdown_and_join_releases_the_keepers_own_catalog_connection() {
         .await
         .expect("a second shutdown_and_join on an already-stopped keeper is Ok");
 }
+
+// ---------------------------------------------------------------------------
+// OPS (#482) — the keeper under RELEASE: a Job hold registered after its row
+// was released never re-arms the lease (the SQL `IS NOT NULL` guard, not a
+// per-hold flag, is the guarantee), and `release_job_holds` releases
+// `LeaseTarget::Job` holds only — an inline row's hold and a `ResultTable`
+// hold are left alone.
+// ---------------------------------------------------------------------------
+
+macro_rules! skip_if_no_backend {
+    ($backend:expr, $dir:expr) => {
+        match jammi_test_utils::make_test_session($backend, $dir).await {
+            Some(s) => s,
+            None => {
+                eprintln!("skipping {:?}: JAMMI_TEST_PG_URL unset", $backend);
+                return;
+            }
+        }
+    };
+}
+
+/// A hold registered AFTER the row's lease was released (the §3.4 2a helper
+/// racing 2c's sweep, or a peer's stale registration) renews 0 rows: two
+/// heartbeats later the lease is still NULL and the hold reads `lost`
+/// through the zero-row renewal. Base: the heartbeat re-arms the NULLed
+/// lease and the hold stays live.
+#[test_case::test_case(jammi_db::catalog::backend::BackendKind::Sqlite ; "sqlite")]
+#[cfg_attr(
+    feature = "live-postgres-tests",
+    test_case::test_case(jammi_db::catalog::backend::BackendKind::Postgres ; "postgres")
+)]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_hold_registered_after_release_never_re_arms_the_lease(
+    backend: jammi_db::catalog::backend::BackendKind,
+) {
+    let dir = tempdir().unwrap();
+    let session = skip_if_no_backend!(backend, dir.path());
+    let catalog = Arc::clone(session.catalog());
+    let job_id = format!("rearm-{}", jammi_test_utils::unique_suffix());
+    catalog
+        .submit_job(SubmitJobParams {
+            job_id: &job_id,
+            kind: "embedding",
+            execution: JobExecution::Queued,
+            spec: "{}",
+            model_ref: None,
+            output_model_id: None,
+            model_source: None,
+            priority: 0,
+        })
+        .await
+        .unwrap();
+    let instance = format!("inst-{}", jammi_test_utils::unique_suffix());
+    let claimed = catalog
+        .claim_next(&instance, &["embedding"], Duration::from_secs(3))
+        .await
+        .unwrap()
+        .expect("job claimed");
+    assert_eq!(claimed.job_id, job_id);
+    assert!(catalog
+        .release_job_lease(&job_id, &instance, claimed.attempts)
+        .await
+        .unwrap());
+
+    let keeper =
+        crate::common::keeper_for_backend(backend, dir.path().to_path_buf(), fast_intervals())
+            .await;
+    let hold = keeper.hold(LeaseTarget::Job {
+        job_id: job_id.clone(),
+        instance_id: instance.clone(),
+        attempts: claimed.attempts,
+    });
+    tokio::time::sleep(Duration::from_millis(2_200)).await;
+    let row = catalog.get_job(&job_id).await.unwrap();
+    assert!(
+        row.lease_expires_at.is_none(),
+        "two heartbeats after registering on a released row the lease is still NULL, \
+         got {:?}",
+        row.lease_expires_at
+    );
+    assert_eq!(row.releases, 1);
+    assert!(
+        hold.lost(),
+        "the zero-row renewal flips the hold's lost flag"
+    );
+    drop(hold);
+    keeper
+        .shutdown_and_join(Duration::from_secs(10))
+        .await
+        .unwrap();
+}
+
+/// `release_job_holds` releases exactly the `LeaseTarget::Job` holds whose
+/// rows are loop-claimed (`execution = 'queued'`): that row's lease goes
+/// NULL and its hold reads lost; an inline row's Job hold is left alone
+/// (`release_job_lease` returns `Ok(false)` on it) and keeps renewing; a
+/// `ResultTable` hold is never touched by this call at all — its building
+/// lease stays live and keeps renewing.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn release_job_holds_flips_lost_and_skips_inline_holds() {
+    use jammi_db::catalog::result_repo::{CreateResultTableParams, JobAttempt, ResultTableKind};
+
+    let dir = tempdir().unwrap();
+    let catalog = seeded_catalog(dir.path()).await;
+    let job = |id: &'static str, execution: JobExecution| SubmitJobParams {
+        job_id: id,
+        kind: "fine_tune",
+        execution,
+        spec: "{}",
+        model_ref: Some("keeper-base::1"),
+        output_model_id: None,
+        model_source: None,
+        priority: 0,
+    };
+    catalog
+        .submit_job(job("rjh-queued", JobExecution::Queued))
+        .await
+        .unwrap();
+    catalog
+        .submit_job(job("rjh-inline", JobExecution::Inline))
+        .await
+        .unwrap();
+    let lease = Duration::from_secs(3);
+    let queued = catalog
+        .claim_next("me", &["fine_tune"], lease)
+        .await
+        .unwrap()
+        .expect("queued claimed");
+    let inline = catalog
+        .claim_by_id("rjh-inline", "me", lease)
+        .await
+        .unwrap()
+        .expect("inline claimed");
+    catalog
+        .create_result_table(CreateResultTableParams {
+            table_name: "rjh_building",
+            source_id: "src",
+            model_id: "keeper-base",
+            task: ModelTask::TextEmbedding,
+            kind: ResultTableKind::Model,
+            derived_from: None,
+            parquet_path: "file:///tmp/rjh.parquet",
+            dimensions: Some(4),
+            key_column: None,
+            text_columns: None,
+            storage_precision: jammi_db::config::StoragePrecision::F32,
+            oversample: 4,
+            created_at: jammi_db::catalog::backend::now_sortable(),
+            writer_id: Some("writer-rjh"),
+            lease: Some(lease),
+            job_attempt: Some(JobAttempt {
+                job_id: "rjh-queued",
+                instance_id: "me",
+                attempts: queued.attempts,
+            }),
+        })
+        .await
+        .unwrap();
+
+    let keeper = keeper_for(dir.path().to_path_buf(), fast_intervals()).await;
+    let queued_hold = keeper.hold(LeaseTarget::Job {
+        job_id: "rjh-queued".into(),
+        instance_id: "me".into(),
+        attempts: queued.attempts,
+    });
+    let inline_hold = keeper.hold(LeaseTarget::Job {
+        job_id: "rjh-inline".into(),
+        instance_id: "me".into(),
+        attempts: inline.attempts,
+    });
+    let table_hold = keeper.hold(LeaseTarget::ResultTable {
+        table: "rjh_building".into(),
+        writer_id: "writer-rjh".into(),
+    });
+    let building_lease_before = catalog
+        .get_result_table("rjh_building")
+        .await
+        .unwrap()
+        .unwrap()
+        .lease_expires_at
+        .expect("building row leased");
+
+    let released = keeper
+        .release_job_holds(fast_intervals().heartbeat())
+        .await
+        .unwrap();
+    assert_eq!(released, 1, "exactly the loop-claimed Job hold is released");
+
+    let queued_row = catalog.get_job("rjh-queued").await.unwrap();
+    assert!(queued_row.lease_expires_at.is_none());
+    assert_eq!(queued_row.releases, 1);
+    assert!(queued_hold.lost(), "the released hold reads lost at once");
+
+    let inline_row = catalog.get_job("rjh-inline").await.unwrap();
+    assert!(inline_row.lease_expires_at.is_some());
+    assert_eq!(inline_row.releases, 0);
+    assert!(!inline_hold.lost(), "an inline hold is untouched");
+    assert!(!table_hold.lost(), "a ResultTable hold is untouched");
+    assert!(catalog
+        .get_result_table("rjh_building")
+        .await
+        .unwrap()
+        .unwrap()
+        .lease_expires_at
+        .is_some());
+
+    // Both untouched holds keep renewing across the next tick; the released
+    // one is skipped and its lease stays NULL.
+    tokio::time::sleep(Duration::from_millis(1_500)).await;
+    assert!(!inline_hold.lost());
+    assert!(!table_hold.lost());
+    let building_lease_after = catalog
+        .get_result_table("rjh_building")
+        .await
+        .unwrap()
+        .unwrap()
+        .lease_expires_at
+        .expect("building row still leased");
+    assert!(
+        building_lease_after > building_lease_before,
+        "the ResultTable hold's renewal keeps landing"
+    );
+    assert!(catalog
+        .get_job("rjh-queued")
+        .await
+        .unwrap()
+        .lease_expires_at
+        .is_none());
+
+    drop(queued_hold);
+    drop(inline_hold);
+    drop(table_hold);
+    keeper
+        .shutdown_and_join(Duration::from_secs(10))
+        .await
+        .unwrap();
+}

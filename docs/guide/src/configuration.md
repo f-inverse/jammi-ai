@@ -135,6 +135,11 @@ kinds = "all"
 # naming the former `lease_duration_secs` / `heartbeat_interval_secs`
 # keys is refused at load (no alias), never silently defaulted.
 idle_poll_secs = 1
+# How often a worker-enabled process samples the queue-depth gauges
+# (`jammi_jobs_queued{kind}` / `jammi_jobs_running{kind}`) from the catalog:
+# one grouped count per tick on a dedicated task, never on a `/metrics`
+# scrape and never on the claim loop. Must be >= 1. Default: 5.
+metrics_sample_secs = 5
 
 [jobs]
 # How many days a terminal (completed/failed) job row survives before the

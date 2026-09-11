@@ -27,7 +27,7 @@ use std::time::Duration;
 
 use jammi_db::catalog::backend::{BackendKind, SqlValue, TxOptions};
 use jammi_db::catalog::jobs_repo::{
-    EpochCheckpointRow, FinishJobParams, FinishJobWithModelParams, SubmitJobParams,
+    EpochCheckpointRow, FinishJobParams, FinishJobWithModelParams, SubmitJobParams, WorkerState,
 };
 use jammi_db::catalog::model_repo::RegisterModelParams;
 use jammi_db::catalog::result_repo::{CreateResultTableParams, JobAttempt, ResultTableKind};
@@ -2466,4 +2466,660 @@ async fn create_result_table_cas_rejects_a_zombies_stale_attempt_across_a_reclai
         Some(live_table.as_str()),
         "the live attempt's own table is the one recorded as partial_result"
     );
+}
+
+// ---------------------------------------------------------------------------
+// OPS (#482) — lease RELEASE on the jobs class: `release_job_lease` /
+// `release_jobs_claimed_by` (the heartbeat CAS + `lease_expires_at = NULL,
+// releases = releases + 1`, both carrying `AND lease_expires_at IS NOT NULL`),
+// the release-aware reclaim cap (`attempts - releases`), the re-arm guard on
+// `heartbeat_job`, `clear_partial_result`, the gauge sample query, and
+// `workers.state`.
+// ---------------------------------------------------------------------------
+
+/// A compute-kind queued job (no FK model) with the given id.
+fn compute_job_params(job_id: &str) -> SubmitJobParams<'_> {
+    SubmitJobParams {
+        kind: "embedding",
+        model_ref: None,
+        ..job_params(job_id)
+    }
+}
+
+/// A released job (jobs lease NULL, `releases + 1`) is requeued by the very
+/// next reclaim pass — with the FULL, unexpired lease window — instead of
+/// waiting out `[lease] duration_secs`; a heartbeat can never re-arm the
+/// released lease in between. Base: `reclaim_expired_jobs` matches 0 rows
+/// until the lease deadline passes.
+#[test_case(BackendKind::Sqlite ; "sqlite")]
+#[cfg_attr(
+    feature = "live-postgres-tests",
+    test_case(BackendKind::Postgres ; "postgres")
+)]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn released_job_is_requeued_by_the_next_reclaim_without_waiting_for_expiry(
+    backend: BackendKind,
+) {
+    let dir = tempdir().unwrap();
+    let (_session, catalog) = queue_catalog!(backend, dir.path());
+    let lease = Duration::from_secs(3600);
+
+    catalog.submit_job(job_params("rel")).await.unwrap();
+    catalog.submit_job(job_params("live")).await.unwrap();
+    let claimed = catalog
+        .claim_next("me", KINDS, lease)
+        .await
+        .unwrap()
+        .expect("job claimed");
+    assert_eq!(claimed.job_id, "rel");
+    assert_eq!(claimed.attempts, 1);
+    assert_eq!(claimed.releases, 0, "a fresh claim has no releases");
+    let live = catalog
+        .claim_next("me", KINDS, lease)
+        .await
+        .unwrap()
+        .expect("second job claimed");
+    assert_eq!(live.job_id, "live");
+
+    // Control: nothing is released yet, and the leases are hours away —
+    // the reclaim sweep sees no expired row.
+    let actioned = catalog.reclaim_expired_jobs(lease, 3).await.unwrap();
+    assert_eq!(actioned, 0, "a live, unreleased lease is never reclaimed");
+
+    let released = catalog.release_job_lease("rel", "me", 1).await.unwrap();
+    assert!(released, "the owner releases its own live lease");
+    let row = catalog.get_job("rel").await.unwrap();
+    assert_eq!(row.status, JobStatus::Running.to_string());
+    assert_eq!(row.claimed_by.as_deref(), Some("me"));
+    assert!(row.lease_expires_at.is_none(), "release NULLs the lease");
+    assert_eq!(row.releases, 1);
+    assert_eq!(row.attempts, 1, "release never touches attempts");
+
+    // The re-arm guard: the heartbeat CAS carries `lease_expires_at IS NOT
+    // NULL`, so the old holder's next renewal matches zero rows.
+    let renewed = catalog.heartbeat_job("rel", "me", 1, lease).await.unwrap();
+    assert!(!renewed, "a heartbeat must never re-arm a released lease");
+    assert!(
+        catalog
+            .get_job("rel")
+            .await
+            .unwrap()
+            .lease_expires_at
+            .is_none(),
+        "the released lease stays NULL after the heartbeat"
+    );
+
+    // The next reclaim requeues it at once, under the full lease window.
+    let actioned = catalog.reclaim_expired_jobs(lease, 3).await.unwrap();
+    assert_eq!(actioned, 1, "exactly the released row is requeued");
+    let requeued = catalog.get_job("rel").await.unwrap();
+    assert_eq!(requeued.status, JobStatus::Queued.to_string());
+    assert!(requeued.claimed_by.is_none());
+    assert_eq!(
+        requeued.releases, 1,
+        "the release count survives the requeue"
+    );
+    assert_eq!(requeued.attempts, 1);
+    let untouched = catalog.get_job("live").await.unwrap();
+    assert_eq!(untouched.status, JobStatus::Running.to_string());
+    assert!(untouched.lease_expires_at.is_some());
+    assert_eq!(untouched.releases, 0);
+}
+
+/// The reclaim cap compares `attempts - releases` against `MAX_ATTEMPTS`
+/// (3): a deploy storm of three releases leaves the job claimable at
+/// `attempts 4, releases 3`; three genuine expiries fail it; 3 claims / 2
+/// releases with the third lease expired is requeued, not failed.
+#[test_case(BackendKind::Sqlite ; "sqlite")]
+#[cfg_attr(
+    feature = "live-postgres-tests",
+    test_case(BackendKind::Postgres ; "postgres")
+)]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn reclaim_cap_counts_attempts_minus_releases(backend: BackendKind) {
+    let dir = tempdir().unwrap();
+    let (_session, catalog) = queue_catalog!(backend, dir.path());
+    const MAX: u32 = 3;
+    let lease = Duration::from_secs(3600);
+
+    // Three releases: attempts 4, releases 3, still claimable.
+    catalog.submit_job(job_params("storm")).await.unwrap();
+    for round in 1..=3u32 {
+        let claimed = catalog
+            .claim_next("me", KINDS, lease)
+            .await
+            .unwrap()
+            .expect("storm claimed");
+        assert_eq!(claimed.attempts, round);
+        assert!(catalog
+            .release_job_lease("storm", "me", round)
+            .await
+            .unwrap());
+        assert_eq!(catalog.reclaim_expired_jobs(lease, MAX).await.unwrap(), 1);
+        let row = catalog.get_job("storm").await.unwrap();
+        assert_eq!(
+            row.status,
+            JobStatus::Queued.to_string(),
+            "release {round} must leave the job claimable, never failed"
+        );
+        assert_eq!(row.releases, round);
+    }
+    let fourth = catalog
+        .claim_next("me", KINDS, lease)
+        .await
+        .unwrap()
+        .expect("still claimable after three releases");
+    assert_eq!((fourth.attempts, fourth.releases), (4, 3));
+    // Park it terminal so the sweeps below never see it.
+    assert!(catalog
+        .finish_job(FinishJobParams {
+            job_id: "storm",
+            instance_id: "me",
+            attempts: 4,
+            result: "{}",
+        })
+        .await
+        .unwrap());
+
+    // Three genuine expiries (no releases) still fail the job.
+    catalog.submit_job(job_params("exp")).await.unwrap();
+    for round in 1..=2u32 {
+        let claimed = catalog
+            .claim_next("me", KINDS, Duration::from_secs(0))
+            .await
+            .unwrap()
+            .expect("exp claimed");
+        assert_eq!(claimed.attempts, round);
+        assert_eq!(
+            catalog
+                .reclaim_expired_jobs(Duration::from_secs(0), MAX)
+                .await
+                .unwrap(),
+            1
+        );
+        assert_eq!(
+            catalog.get_job("exp").await.unwrap().status,
+            JobStatus::Queued.to_string()
+        );
+    }
+    let third = catalog
+        .claim_next("me", KINDS, Duration::from_secs(0))
+        .await
+        .unwrap()
+        .expect("exp claimed a third time");
+    assert_eq!(third.attempts, 3);
+    assert_eq!(
+        catalog
+            .reclaim_expired_jobs(Duration::from_secs(0), MAX)
+            .await
+            .unwrap(),
+        1
+    );
+    let failed = catalog.get_job("exp").await.unwrap();
+    assert_eq!(failed.status, JobStatus::Failed.to_string());
+    assert_eq!((failed.attempts, failed.releases), (3, 0));
+
+    // 3 claims / 2 releases, the third lease expired: requeued (3 - 2 < 3).
+    catalog.submit_job(job_params("mix")).await.unwrap();
+    for round in 1..=2u32 {
+        let claimed = catalog
+            .claim_next("me", KINDS, lease)
+            .await
+            .unwrap()
+            .expect("mix claimed");
+        assert_eq!(claimed.attempts, round);
+        assert!(catalog.release_job_lease("mix", "me", round).await.unwrap());
+        assert_eq!(catalog.reclaim_expired_jobs(lease, MAX).await.unwrap(), 1);
+    }
+    let third = catalog
+        .claim_next("me", KINDS, Duration::from_secs(0))
+        .await
+        .unwrap()
+        .expect("mix claimed a third time");
+    assert_eq!((third.attempts, third.releases), (3, 2));
+    assert_eq!(
+        catalog
+            .reclaim_expired_jobs(Duration::from_secs(0), MAX)
+            .await
+            .unwrap(),
+        1
+    );
+    let mixed = catalog.get_job("mix").await.unwrap();
+    assert_eq!(
+        mixed.status,
+        JobStatus::Queued.to_string(),
+        "attempts - releases = 1 < 3: requeued, never failed"
+    );
+    assert_eq!((mixed.attempts, mixed.releases), (3, 2));
+}
+
+/// Every release statement is idempotent by `lease_expires_at IS NOT NULL`:
+/// a second `release_job_lease` matches zero rows and `releases` stays 1; a
+/// `release_jobs_claimed_by` sweep after either matches 0 rows; and an
+/// inline row claimed by the same instance is never released by either
+/// (both carry `execution = 'queued'`).
+#[test_case(BackendKind::Sqlite ; "sqlite")]
+#[cfg_attr(
+    feature = "live-postgres-tests",
+    test_case(BackendKind::Postgres ; "postgres")
+)]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_double_release_increments_releases_once(backend: BackendKind) {
+    let dir = tempdir().unwrap();
+    let (_session, catalog) = queue_catalog!(backend, dir.path());
+    let lease = Duration::from_secs(3600);
+
+    catalog.submit_job(job_params("dbl")).await.unwrap();
+    catalog
+        .submit_job(inline_job_params("dbl-inline"))
+        .await
+        .unwrap();
+    let claimed = catalog
+        .claim_next("me", KINDS, lease)
+        .await
+        .unwrap()
+        .expect("dbl claimed");
+    let inline = catalog
+        .claim_by_id("dbl-inline", "me", lease)
+        .await
+        .unwrap()
+        .expect("inline claimed");
+    assert!(inline.lease_expires_at.is_some());
+
+    assert!(catalog
+        .release_job_lease("dbl", "me", claimed.attempts)
+        .await
+        .unwrap());
+    assert!(
+        !catalog
+            .release_job_lease("dbl", "me", claimed.attempts)
+            .await
+            .unwrap(),
+        "the second release matches zero rows"
+    );
+    assert_eq!(catalog.get_job("dbl").await.unwrap().releases, 1);
+    assert_eq!(
+        catalog.release_jobs_claimed_by("me").await.unwrap(),
+        0,
+        "a sweep after a per-row release matches nothing"
+    );
+
+    // The inline row: neither statement touches it.
+    assert!(
+        !catalog
+            .release_job_lease("dbl-inline", "me", inline.attempts)
+            .await
+            .unwrap(),
+        "an inline row is never released"
+    );
+    let inline_after = catalog.get_job("dbl-inline").await.unwrap();
+    assert!(inline_after.lease_expires_at.is_some());
+    assert_eq!(inline_after.releases, 0);
+
+    // The sweep form on a fresh claim: exactly one row, then zero.
+    catalog.submit_job(job_params("dbl-2")).await.unwrap();
+    catalog
+        .claim_next("me", KINDS, lease)
+        .await
+        .unwrap()
+        .expect("dbl-2 claimed");
+    assert_eq!(catalog.release_jobs_claimed_by("me").await.unwrap(), 1);
+    assert_eq!(catalog.release_jobs_claimed_by("me").await.unwrap(), 0);
+    assert_eq!(catalog.get_job("dbl-2").await.unwrap().releases, 1);
+    assert!(
+        catalog
+            .get_job("dbl-inline")
+            .await
+            .unwrap()
+            .lease_expires_at
+            .is_some(),
+        "the sweep leaves the inline row's lease live"
+    );
+}
+
+/// `clear_partial_result` is the attempt-guarded inverse of
+/// `create_result_table`'s `partial_result` CAS: after the successor's
+/// claim-and-fail arm clears the column, the SAME attempt's own
+/// `create_result_table` records its fresh table instead of landing
+/// `JobAttemptSuperseded` (the pre-existing defect the 68 README records,
+/// escape `esc-110`). A stale attempt or a different table name clears
+/// nothing.
+#[test_case(BackendKind::Sqlite ; "sqlite")]
+#[cfg_attr(
+    feature = "live-postgres-tests",
+    test_case(BackendKind::Postgres ; "postgres")
+)]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn clear_partial_result_lets_the_next_attempt_record_its_own_table(backend: BackendKind) {
+    let dir = tempdir().unwrap();
+    let (_session, catalog) = queue_catalog!(backend, dir.path());
+    let suffix = run_suffix();
+    let t1 = format!("cpr_t1_{suffix}");
+    let t2 = format!("cpr_t2_{suffix}");
+
+    catalog.submit_job(compute_job_params("cpr")).await.unwrap();
+    let claimed = catalog
+        .claim_next("me", &["embedding"], Duration::from_secs(3600))
+        .await
+        .unwrap()
+        .expect("cpr claimed");
+    let attempt = JobAttempt {
+        job_id: "cpr",
+        instance_id: "me",
+        attempts: claimed.attempts,
+    };
+    catalog
+        .create_result_table(result_table_params(&t1, attempt))
+        .await
+        .unwrap();
+    assert_eq!(
+        catalog
+            .get_job("cpr")
+            .await
+            .unwrap()
+            .partial_result
+            .as_deref(),
+        Some(t1.as_str())
+    );
+
+    // Guards: a stale attempt, or the wrong table, clears nothing.
+    assert!(!catalog
+        .clear_partial_result("cpr", "me", claimed.attempts + 1, &t1)
+        .await
+        .unwrap());
+    assert!(!catalog
+        .clear_partial_result("cpr", "me", claimed.attempts, &t2)
+        .await
+        .unwrap());
+    assert_eq!(
+        catalog
+            .get_job("cpr")
+            .await
+            .unwrap()
+            .partial_result
+            .as_deref(),
+        Some(t1.as_str()),
+        "a guarded miss leaves the column"
+    );
+
+    assert!(catalog
+        .clear_partial_result("cpr", "me", claimed.attempts, &t1)
+        .await
+        .unwrap());
+    assert!(catalog
+        .get_job("cpr")
+        .await
+        .unwrap()
+        .partial_result
+        .is_none());
+    // Idempotent: a second clear matches zero rows.
+    assert!(!catalog
+        .clear_partial_result("cpr", "me", claimed.attempts, &t1)
+        .await
+        .unwrap());
+
+    // The same attempt now records its own fresh table.
+    catalog
+        .create_result_table(result_table_params(&t2, attempt))
+        .await
+        .expect("the cleared column lets the attempt record its next table");
+    assert_eq!(
+        catalog
+            .get_job("cpr")
+            .await
+            .unwrap()
+            .partial_result
+            .as_deref(),
+        Some(t2.as_str())
+    );
+}
+
+/// The finalize CAS is `claimed_by / status / attempts`, never the lease
+/// (`jobs_repo.rs` finish/fail): a released row can still be finished by
+/// its old holder — the named library-only divergence (D19), pinned here as
+/// a fact rather than left implicit.
+#[test_case(BackendKind::Sqlite ; "sqlite")]
+#[cfg_attr(
+    feature = "live-postgres-tests",
+    test_case(BackendKind::Postgres ; "postgres")
+)]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn finalize_cas_still_matches_a_released_lease(backend: BackendKind) {
+    let dir = tempdir().unwrap();
+    let (_session, catalog) = queue_catalog!(backend, dir.path());
+    let lease = Duration::from_secs(3600);
+
+    // `finish_job` (the compute finalize).
+    catalog
+        .submit_job(compute_job_params("fin-c"))
+        .await
+        .unwrap();
+    let c = catalog
+        .claim_next("me", &["embedding"], lease)
+        .await
+        .unwrap()
+        .expect("fin-c claimed");
+    assert!(catalog
+        .release_job_lease("fin-c", "me", c.attempts)
+        .await
+        .unwrap());
+    assert!(
+        catalog
+            .finish_job(FinishJobParams {
+                job_id: "fin-c",
+                instance_id: "me",
+                attempts: c.attempts,
+                result: "{}",
+            })
+            .await
+            .unwrap(),
+        "the finalize CAS ignores the lease"
+    );
+    let done = catalog.get_job("fin-c").await.unwrap();
+    assert_eq!(done.status, JobStatus::Completed.to_string());
+    assert_eq!(done.releases, 1);
+
+    // `finish_job_with_model` (the training finalize).
+    let model = format!("jammi:fine-tuned:fin-{}", run_suffix());
+    catalog
+        .register_model(RegisterModelParams {
+            model_id: &model,
+            version: 1,
+            model_type: "fine-tuned",
+            backend: "candle",
+            task: ModelTask::TextEmbedding,
+            base_model_id: Some("q-base::1"),
+            artifact_path: None,
+            config_json: None,
+        })
+        .await
+        .unwrap();
+    catalog
+        .submit_job(SubmitJobParams {
+            output_model_id: Some(&model),
+            ..job_params("fin-t")
+        })
+        .await
+        .unwrap();
+    let t = catalog
+        .claim_next("me", KINDS, lease)
+        .await
+        .unwrap()
+        .expect("fin-t claimed");
+    assert!(catalog
+        .release_job_lease("fin-t", "me", t.attempts)
+        .await
+        .unwrap());
+    assert!(
+        catalog
+            .finish_job_with_model(FinishJobWithModelParams {
+                job_id: "fin-t",
+                instance_id: "me",
+                attempts: t.attempts,
+                result: "{}",
+                output_model_id: &model,
+                output_model_version: 1,
+                artifact_path: "file:///artifacts/fin-t/me/1",
+                epoch_checkpoints: &[],
+            })
+            .await
+            .unwrap(),
+        "finish_job_with_model's CAS ignores the lease too"
+    );
+    assert_eq!(
+        catalog.get_job("fin-t").await.unwrap().status,
+        JobStatus::Completed.to_string()
+    );
+}
+
+/// The gauge sample query counts `execution = 'queued'` rows in `queued` /
+/// `running` per kind — inline and terminal rows excluded, a held
+/// (`claimable = false`) row still counted as queued — and returns them
+/// sorted in Rust.
+#[test_case(BackendKind::Sqlite ; "sqlite")]
+#[cfg_attr(
+    feature = "live-postgres-tests",
+    test_case(BackendKind::Postgres ; "postgres")
+)]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn count_jobs_by_kind_status_matches_row_counts(backend: BackendKind) {
+    let dir = tempdir().unwrap();
+    let (_session, catalog) = queue_catalog!(backend, dir.path());
+    let lease = Duration::from_secs(3600);
+
+    assert!(
+        catalog
+            .count_jobs_by_kind_status()
+            .await
+            .unwrap()
+            .is_empty(),
+        "an empty queue samples to no rows"
+    );
+
+    catalog.submit_job(job_params("cnt-ft-1")).await.unwrap();
+    catalog.submit_job(job_params("cnt-ft-2")).await.unwrap();
+    catalog.submit_job(job_params("cnt-ft-held")).await.unwrap();
+    set_claim_policy(&catalog, "cnt-ft-held", 0, false).await;
+    catalog
+        .submit_job(compute_job_params("cnt-emb"))
+        .await
+        .unwrap();
+    catalog
+        .submit_job(inline_job_params("cnt-inline"))
+        .await
+        .unwrap();
+    catalog.submit_job(job_params("cnt-done")).await.unwrap();
+
+    // cnt-ft-1 running; cnt-done completed; cnt-inline claimed inline.
+    let running = catalog
+        .claim_next("me", KINDS, lease)
+        .await
+        .unwrap()
+        .expect("cnt-ft-1 claimed");
+    assert_eq!(running.job_id, "cnt-ft-1");
+    let done = catalog
+        .claim_next("me", KINDS, lease)
+        .await
+        .unwrap()
+        .expect("cnt-ft-2 claimed");
+    assert_eq!(done.job_id, "cnt-ft-2");
+    assert!(catalog
+        .finish_job(FinishJobParams {
+            job_id: "cnt-ft-2",
+            instance_id: "me",
+            attempts: 1,
+            result: "{}",
+        })
+        .await
+        .unwrap());
+    catalog
+        .claim_by_id("cnt-inline", "me", lease)
+        .await
+        .unwrap()
+        .expect("inline claimed");
+
+    let counts = catalog.count_jobs_by_kind_status().await.unwrap();
+    assert_eq!(
+        counts,
+        vec![
+            ("embedding".to_string(), "queued".to_string(), 1),
+            // cnt-done (queued) + cnt-ft-held (queued, claimable = false).
+            ("fine_tune".to_string(), "queued".to_string(), 2),
+            ("fine_tune".to_string(), "running".to_string(), 1),
+        ],
+        "queued/running counts per kind over execution = 'queued' rows only"
+    );
+}
+
+/// `workers.state` round-trips through `upsert_worker` / `set_worker_state`
+/// / `list_workers` in the `warming -> claiming -> draining` order the loop
+/// task writes it; a state write on an absent row matches nothing.
+#[test_case(BackendKind::Sqlite ; "sqlite")]
+#[cfg_attr(
+    feature = "live-postgres-tests",
+    test_case(BackendKind::Postgres ; "postgres")
+)]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn set_worker_state_round_trips_through_list_workers(backend: BackendKind) {
+    let dir = tempdir().unwrap();
+    let (_session, catalog) = queue_catalog!(backend, dir.path());
+    let state_of = |workers: Vec<jammi_db::catalog::jobs_repo::WorkerRecord>| {
+        workers
+            .into_iter()
+            .find(|w| w.instance_id == "w-state")
+            .map(|w| w.state)
+    };
+
+    catalog
+        .upsert_instance("w-state", Some("lbl"), Some("host"))
+        .await
+        .unwrap();
+    catalog
+        .upsert_worker("w-state", "all", WorkerState::Warming)
+        .await
+        .unwrap();
+    assert_eq!(
+        state_of(catalog.list_workers().await.unwrap()).as_deref(),
+        Some("warming")
+    );
+    assert!(catalog
+        .set_worker_state("w-state", WorkerState::Claiming)
+        .await
+        .unwrap());
+    assert_eq!(
+        state_of(catalog.list_workers().await.unwrap()).as_deref(),
+        Some("claiming")
+    );
+    assert!(catalog
+        .set_worker_state("w-state", WorkerState::Draining)
+        .await
+        .unwrap());
+    assert_eq!(
+        state_of(catalog.list_workers().await.unwrap()).as_deref(),
+        Some("draining")
+    );
+    // A re-upsert (a restarted loop on the same instance) resets the state.
+    catalog
+        .upsert_worker("w-state", "fine_tune", WorkerState::Warming)
+        .await
+        .unwrap();
+    let again = catalog
+        .list_workers()
+        .await
+        .unwrap()
+        .into_iter()
+        .find(|w| w.instance_id == "w-state")
+        .expect("row present");
+    assert_eq!(
+        (again.state.as_str(), again.kinds.as_str()),
+        ("warming", "fine_tune")
+    );
+    assert!(
+        !catalog
+            .set_worker_state("w-absent", WorkerState::Claiming)
+            .await
+            .unwrap(),
+        "no row, no state write"
+    );
+    assert!(catalog.delete_worker("w-state").await.unwrap());
 }

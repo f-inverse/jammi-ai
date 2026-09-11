@@ -1462,6 +1462,7 @@ async fn strict_tenant_predicate_on_promote(kind: BackendKind) {
         table: name.clone(),
         tenant_arm: TenantArm::Strict(Some(tenant_b())),
         owner: Owner::Writer(info.writer_id().to_string()),
+        lease_present: false,
     };
     let err = catalog
         .promote_result_table_with_manifest(

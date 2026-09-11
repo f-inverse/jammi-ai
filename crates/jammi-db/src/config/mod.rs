@@ -1035,6 +1035,7 @@ impl LeaseConfig {
 /// enabled = true
 /// kinds = "all"
 /// idle_poll_secs = 1
+/// metrics_sample_secs = 5
 /// ```
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
 #[serde(default, deny_unknown_fields)]
@@ -1072,6 +1073,13 @@ pub struct WorkerConfig {
     /// How often an idle worker polls for a queued job (and reclaims expired
     /// leases). Must be non-zero — a zero poll is a busy-loop. Default: 1.
     pub idle_poll_secs: u64,
+    /// How often a worker-enabled process samples the queue gauges
+    /// (`jammi_jobs_queued{kind}` / `jammi_jobs_running{kind}`) from the
+    /// catalog — one `GROUP BY kind, status` statement per tick, on a
+    /// dedicated task, never on a `/metrics` scrape and never on the claim
+    /// loop (a scrape storm must not become a catalog storm). Must be
+    /// `>= 1`. Default: 5.
+    pub metrics_sample_secs: u64,
 }
 
 impl Default for WorkerConfig {
@@ -1082,6 +1090,7 @@ impl Default for WorkerConfig {
             enabled: true,
             kinds: WorkerKinds::default(),
             idle_poll_secs: 1,
+            metrics_sample_secs: 5,
         }
     }
 }
@@ -1149,6 +1158,11 @@ impl WorkerConfig {
         if self.idle_poll_secs == 0 {
             return Err(JammiError::Config(
                 "worker.idle_poll_secs must be > 0 (a zero poll is a busy-loop)".into(),
+            ));
+        }
+        if self.metrics_sample_secs == 0 {
+            return Err(JammiError::Config(
+                "worker.metrics_sample_secs must be >= 1 (a zero interval is a busy-loop)".into(),
             ));
         }
         Ok(WorkerIntervals {

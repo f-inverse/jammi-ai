@@ -41,7 +41,7 @@
 use std::collections::HashMap;
 use std::future::Future;
 use std::pin::Pin;
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, PoisonError};
 use std::time::{Duration, Instant};
 
@@ -169,6 +169,23 @@ struct HeldState {
     target: LeaseTarget,
     lost: Arc<AtomicBool>,
     last_renewed_ms: Arc<AtomicU64>,
+    /// Set by [`LeaseKeeper::release_job_holds`] once this hold's row was
+    /// RELEASED (`Catalog::release_job_lease` returned `Ok(true)`) — only
+    /// ever on a [`LeaseTarget::Job`] hold. `renew_all` skips a released
+    /// hold; an optimisation only — the SQL `lease_expires_at IS NOT NULL`
+    /// arm on `heartbeat_job` is the guarantee that a released lease is
+    /// never re-armed, and a hold registered AFTER the release (which has
+    /// no flag) misses through that same arm and flips `lost`.
+    released: bool,
+}
+
+/// The one-shot handshake behind [`LeaseKeeper::release_job_holds`]: the
+/// caller sets `requested` and wakes the thread; the thread runs the release
+/// pass on its own connection, publishes the count, and notifies `done`.
+struct ReleaseRequest {
+    requested: AtomicBool,
+    released: AtomicUsize,
+    done: tokio::sync::Notify,
 }
 
 /// A future-returning catalog-connection factory: called from inside the
@@ -219,6 +236,7 @@ pub struct LeaseKeeper {
     /// 10 s for nothing).
     wake: Arc<tokio::sync::Notify>,
     liveness: Arc<Liveness>,
+    release: Arc<ReleaseRequest>,
     #[cfg(feature = "test-hooks")]
     kill: Arc<AtomicBool>,
     thread: Mutex<Option<std::thread::JoinHandle<()>>>,
@@ -257,6 +275,11 @@ impl LeaseKeeper {
             last_pass_ms: AtomicU64::new(0),
             lease: intervals.lease(),
         });
+        let release = Arc::new(ReleaseRequest {
+            requested: AtomicBool::new(false),
+            released: AtomicUsize::new(0),
+            done: tokio::sync::Notify::new(),
+        });
         #[cfg(feature = "test-hooks")]
         let kill = Arc::new(AtomicBool::new(false));
         let (ready_tx, ready_rx) = tokio::sync::oneshot::channel::<Result<()>>();
@@ -265,6 +288,7 @@ impl LeaseKeeper {
         let thread_shutdown = Arc::clone(&shutdown);
         let thread_wake = Arc::clone(&wake);
         let thread_liveness = Arc::clone(&liveness);
+        let thread_release = Arc::clone(&release);
         #[cfg(feature = "test-hooks")]
         let thread_kill = Arc::clone(&kill);
         let thread = std::thread::Builder::new()
@@ -331,6 +355,15 @@ impl LeaseKeeper {
                         if thread_kill.load(Ordering::SeqCst) {
                             panic!("lease keeper: thread killed by test hook");
                         }
+                        // A RELEASE request runs here, on this thread and
+                        // this connection, serialised with the renewal pass
+                        // that follows it — so no renewal of a hold this
+                        // pass releases can be in flight beside it.
+                        if thread_release.requested.swap(false, Ordering::SeqCst) {
+                            let n = release_job_holds_on_thread(&catalog, &thread_holds).await;
+                            thread_release.released.store(n, Ordering::SeqCst);
+                            thread_release.done.notify_waiters();
+                        }
                         renew_all(&catalog, &thread_holds, &thread_liveness, intervals).await;
                     }
                 });
@@ -355,6 +388,7 @@ impl LeaseKeeper {
             shutdown,
             wake,
             liveness,
+            release,
             #[cfg(feature = "test-hooks")]
             kill,
             thread: Mutex::new(Some(thread)),
@@ -381,6 +415,7 @@ impl LeaseKeeper {
                     target,
                     lost: Arc::clone(&lost),
                     last_renewed_ms: Arc::clone(&last_renewed_ms),
+                    released: false,
                 },
             );
         LeaseHold {
@@ -389,6 +424,62 @@ impl LeaseKeeper {
             lost,
             last_renewed_ms,
             liveness: Arc::clone(&self.liveness),
+        }
+    }
+
+    /// RELEASE every [`LeaseTarget::Job`] hold this keeper currently holds
+    /// — the per-hold half of a two-mode shutdown's RELEASE arm — and wait,
+    /// bounded by `bound` (one heartbeat), for the pass to complete.
+    /// Returns how many holds were released.
+    ///
+    /// The pass runs ON THE KEEPER THREAD, on its own connection, serialised
+    /// with `renew_all`: for every registered `Job` hold not already
+    /// released it issues `Catalog::release_job_lease(job_id, instance_id,
+    /// attempts)`; `Ok(true)` flips the hold's `lost` flag (so a training
+    /// loop polling it bails at its next epoch boundary without writing a
+    /// bundle) and marks the hold released; `Ok(false)` — an INLINE row
+    /// (`execution = 'inline'` never matches), a row a peer already took,
+    /// or a lease already released — leaves the hold untouched, as does an
+    /// `Err` (logged; the expiry path covers it). Runs BEFORE any loop task
+    /// is aborted, so every live hold's `lost` flips while the hold still
+    /// exists.
+    ///
+    /// ONLY the `Job` class. A [`LeaseTarget::ResultTable`] hold — the
+    /// second lease class a compute job holds — is never touched here:
+    /// every `BuildingTable` on a session is adopted under the store's one
+    /// `writer_id`, so from this map a loop-claimed materialization's table,
+    /// an inline `run_now`'s and a library materialization's are
+    /// indistinguishable, and a per-target release would NULL the wrong
+    /// lease. That class is released solely by the jobs-linked sweep
+    /// (`Catalog::release_building_tables_of_claimant`), after which the
+    /// loop's own `ResultTable` hold flips `lost` through the guarded
+    /// renewal (`Catalog::renew_lease`'s lease-present arm) within one
+    /// heartbeat.
+    ///
+    /// # Errors
+    ///
+    /// [`JammiError::Catalog`] when the keeper thread is dead (nothing can
+    /// run the pass — every hold already reads lost) or when the pass has
+    /// not completed within `bound` — never a hang.
+    pub async fn release_job_holds(&self, bound: Duration) -> Result<usize> {
+        if !self.is_alive() {
+            return Err(JammiError::Catalog(
+                "lease keeper: cannot release job holds, its thread is dead".into(),
+            ));
+        }
+        // Register interest BEFORE requesting, so a `notify_waiters` that
+        // lands between the two cannot be missed (`Notify::notify_waiters`
+        // stores no permit).
+        let done = self.release.done.notified();
+        tokio::pin!(done);
+        done.as_mut().enable();
+        self.release.requested.store(true, Ordering::SeqCst);
+        self.wake.notify_one();
+        match tokio::time::timeout(bound, done).await {
+            Ok(()) => Ok(self.release.released.load(Ordering::SeqCst)),
+            Err(_elapsed) => Err(JammiError::Catalog(format!(
+                "lease keeper: release_job_holds did not complete within {bound:?}"
+            ))),
         }
     }
 
@@ -589,6 +680,9 @@ async fn renew_all(
     let snapshot: Vec<(LeaseTarget, Arc<AtomicBool>, Arc<AtomicU64>)> = {
         let regs = holds.lock().unwrap_or_else(PoisonError::into_inner);
         regs.values()
+            // A released Job hold is never renewed again (its row's lease is
+            // NULL and `heartbeat_job`'s `IS NOT NULL` arm would miss anyway).
+            .filter(|r| !r.released)
             .map(|r| {
                 (
                     r.target.clone(),
@@ -645,4 +739,60 @@ async fn renew_all(
         }
     }
     liveness.stamp(&liveness.last_pass_ms);
+}
+
+/// The RELEASE pass [`LeaseKeeper::release_job_holds`] runs on the keeper
+/// thread: release every not-yet-released [`LeaseTarget::Job`] hold's row
+/// through `Catalog::release_job_lease`, flipping `lost` and marking the
+/// hold released on `Ok(true)`. Returns the count released. The snapshot is
+/// taken once; a hold dropped mid-pass simply has its row released to no
+/// observer.
+async fn release_job_holds_on_thread(
+    catalog: &Catalog,
+    holds: &Arc<Mutex<HashMap<u64, HeldState>>>,
+) -> usize {
+    let snapshot: Vec<(u64, String, String, u32, Arc<AtomicBool>)> = {
+        let regs = holds.lock().unwrap_or_else(PoisonError::into_inner);
+        regs.iter()
+            .filter(|(_, r)| !r.released)
+            .filter_map(|(id, r)| match &r.target {
+                LeaseTarget::Job {
+                    job_id,
+                    instance_id,
+                    attempts,
+                } => Some((
+                    *id,
+                    job_id.clone(),
+                    instance_id.clone(),
+                    *attempts,
+                    Arc::clone(&r.lost),
+                )),
+                LeaseTarget::Instance(_) | LeaseTarget::ResultTable { .. } => None,
+            })
+            .collect()
+    };
+    let mut released = 0;
+    for (id, job_id, instance_id, attempts, lost) in snapshot {
+        match catalog
+            .release_job_lease(&job_id, &instance_id, attempts)
+            .await
+        {
+            Ok(true) => {
+                lost.store(true, Ordering::SeqCst);
+                if let Some(held) = holds
+                    .lock()
+                    .unwrap_or_else(PoisonError::into_inner)
+                    .get_mut(&id)
+                {
+                    held.released = true;
+                }
+                released += 1;
+            }
+            Ok(false) => {}
+            Err(e) => {
+                warn!(job_id, error = %e, "lease keeper: job lease release failed; left to expiry");
+            }
+        }
+    }
+    released
 }

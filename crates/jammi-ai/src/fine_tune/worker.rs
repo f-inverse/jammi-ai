@@ -1639,7 +1639,14 @@ impl EmbeddedWorker {
         // process can appear to have claimed anything" holds without
         // blocking `spawn` itself on catalog I/O.
         tokio::spawn(async move {
-            if let Err(e) = catalog.upsert_worker(&instance_id, &kinds).await {
+            if let Err(e) = catalog
+                .upsert_worker(
+                    &instance_id,
+                    &kinds,
+                    jammi_db::catalog::jobs_repo::WorkerState::Claiming,
+                )
+                .await
+            {
                 tracing::error!(error = %e, "failed to upsert this process's `workers` row");
             }
         });

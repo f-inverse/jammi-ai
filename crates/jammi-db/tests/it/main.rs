@@ -35,6 +35,7 @@ mod read_vectors;
 mod reconcile;
 mod recovery;
 mod register_computed_embedding;
+mod result_tables;
 mod segment;
 mod sources;
 mod sqlite_single_process_seam;

@@ -1068,3 +1068,29 @@ CREATE UNIQUE INDEX idx_jobs_tenant_idempotency_key
     ON jobs (COALESCE(tenant_id, ''), idempotency_key)
     WHERE idempotency_key IS NOT NULL;
 "#;
+
+/// Migration 031 (OPS, #482): lease RELEASE bookkeeping and the worker's
+/// lifecycle state.
+///
+///   * `jobs.releases` — how many times a claimant handed this job's lease
+///     back on purpose (`Catalog::release_job_lease` /
+///     `release_jobs_claimed_by`: a two-mode shutdown's RELEASE arm, never
+///     an expiry). The reclaim cap compares `attempts - releases` against
+///     the attempts limit, so a rollout storm of releases never burns the
+///     cap a genuine crash does; `attempts` still bumps on every claim.
+///   * `idx_jobs_kind_status(status, execution, kind)` — the index the
+///     gauge sampler's `GROUP BY kind, status` over `execution = 'queued'`
+///     rows reads (`Catalog::count_jobs_by_kind_status`) so a metrics tick
+///     is an index-only aggregate, not a heap scan; `idx_jobs_claim` lacks
+///     `kind`.
+///   * `workers.state` — `warming` (the loop task's row exists but the
+///     process is not yet warm / its worker gate is closed), `claiming`
+///     (the claim loop is live), `draining` (a DRAIN is in progress). The
+///     CHECK pins the vocabulary at the SQL edge (K2). Every pre-existing
+///     row is a live claimant, hence the default.
+pub(super) const MIGRATION_031_JOBS_RELEASES_WORKERS_STATE: &str = r#"
+ALTER TABLE jobs ADD COLUMN releases INTEGER NOT NULL DEFAULT 0;
+CREATE INDEX idx_jobs_kind_status ON jobs(status, execution, kind);
+ALTER TABLE workers ADD COLUMN state TEXT NOT NULL DEFAULT 'claiming'
+    CHECK (state IN ('warming', 'claiming', 'draining'));
+"#;

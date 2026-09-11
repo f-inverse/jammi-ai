@@ -18,7 +18,7 @@ use tempfile::tempdir;
 use tokio::sync::Barrier;
 
 /// Every migration name, in ledger order. Mirrors `catalog::migrations::MIGRATIONS`
-/// (K5: append-only, currently ending at 030) -- a new migration is added here
+/// (K5: append-only, currently ending at 031) -- a new migration is added here
 /// in the same change.
 const EXPECTED_MIGRATION_NAMES: &[&str] = &[
     "001_core_tables",
@@ -51,6 +51,7 @@ const EXPECTED_MIGRATION_NAMES: &[&str] = &[
     "028_topics_next_offset",
     "029_jobs_instances_workers",
     "030_jobs_idempotency_key",
+    "031_jobs_releases_workers_state",
 ];
 
 async fn open_sqlite_backend(path: &std::path::Path) -> std::sync::Arc<SqliteBackend> {
@@ -809,9 +810,10 @@ async fn migration_029_creates_jobs_instances_workers_and_drops_training_jobs() 
 /// with `execution = 'queued'`, then drops `training_jobs`. Exercised by
 /// manufacturing the exact pre-029 state on a fully-migrated catalog (drop the
 /// 029-created tables, recreate `training_jobs` in its final pre-029 shape,
-/// seed one row, clear the ledger's `029_jobs_instances_workers` row) and
-/// reopening — the reopen re-runs the REAL migration 029 DDL (never a
-/// test-duplicated copy of it) against that manufactured state.
+/// seed one row, clear the ledger's `029_jobs_instances_workers` row and
+/// every later row that alters the dropped tables) and reopening — the
+/// reopen re-runs the REAL migration 029 DDL (never a test-duplicated copy
+/// of it), then 030 and 031, against that manufactured state.
 #[tokio::test]
 async fn migration_029_copies_training_jobs_rows_into_jobs_as_queued() {
     use jammi_db::catalog::backend::SqlValue;
@@ -828,8 +830,16 @@ async fn migration_029_copies_training_jobs_rows_into_jobs_as_queued() {
                 tx.execute("DROP TABLE workers", &[]).await?;
                 tx.execute("DROP TABLE instances", &[]).await?;
                 tx.execute("DROP TABLE jobs", &[]).await?;
+                // Every later migration that ALTERs the dropped `jobs` /
+                // `workers` tables must replay too (030's idempotency key,
+                // 031's `releases` / `workers.state`), or the reopen would
+                // rebuild a 029-shaped table the current `SELECT_COLS`
+                // cannot read — the manufactured state is pre-029, so the
+                // ledger must say so for everything from 029 onwards.
                 tx.execute(
-                    "DELETE FROM applied_migrations WHERE name = '029_jobs_instances_workers'",
+                    "DELETE FROM applied_migrations WHERE name IN ( \
+                       '029_jobs_instances_workers', '030_jobs_idempotency_key', \
+                       '031_jobs_releases_workers_state')",
                     &[],
                 )
                 .await?;
@@ -1275,5 +1285,107 @@ async fn migration_027_adds_result_table_lease_columns_nullable() {
     assert!(
         indexes.iter().any(|i| i == "idx_result_tables_lease"),
         "migration 027 must create idx_result_tables_lease; got {indexes:?}"
+    );
+}
+
+/// OPS (#482) — migration `031_jobs_releases_workers_state` is present and
+/// ordered AFTER `030_jobs_idempotency_key` (K5: relative position, never
+/// `.last()`, so the lead's renumber-on-second-merge keeps this green), and
+/// a fresh catalog carries what it adds: `jobs.releases`, `workers.state`,
+/// and the gauge index `idx_jobs_kind_status`.
+#[tokio::test]
+async fn migration_031_is_ordered_after_030_and_adds_releases_and_workers_state() {
+    let position = |name: &str| {
+        EXPECTED_MIGRATION_NAMES
+            .iter()
+            .position(|m| *m == name)
+            .unwrap_or_else(|| panic!("{name} missing from EXPECTED_MIGRATION_NAMES"))
+    };
+    assert!(
+        position("031_jobs_releases_workers_state") > position("030_jobs_idempotency_key"),
+        "the OPS migration must follow 030"
+    );
+
+    let dir = tempdir().unwrap();
+    let _catalog = Catalog::open(dir.path()).await.unwrap();
+    let backend = BackendImpl::Sqlite(open_sqlite_backend(&dir.path().join("catalog.db")).await);
+
+    let applied = backend
+        .transaction(
+            TxOptions {
+                read_only: true,
+                ..Default::default()
+            },
+            |tx| {
+                Box::pin(async move {
+                    tx.query::<_, String>(
+                        "SELECT name FROM applied_migrations ORDER BY name",
+                        &[],
+                        |row| row.get("name"),
+                    )
+                    .await
+                })
+            },
+        )
+        .await
+        .unwrap();
+    let ledger_position = |name: &str| {
+        applied
+            .iter()
+            .position(|m| m == name)
+            .unwrap_or_else(|| panic!("{name} missing from the applied ledger: {applied:?}"))
+    };
+    assert!(
+        ledger_position("031_jobs_releases_workers_state")
+            > ledger_position("030_jobs_idempotency_key")
+    );
+
+    for (table, column) in [("jobs", "releases"), ("workers", "state")] {
+        let sql = format!("SELECT name FROM pragma_table_info('{table}')");
+        let columns = backend
+            .transaction(
+                TxOptions {
+                    read_only: true,
+                    ..Default::default()
+                },
+                |tx| {
+                    let sql = sql.clone();
+                    Box::pin(async move {
+                        tx.query::<_, String>(&sql, &[], |row| row.get("name"))
+                            .await
+                    })
+                },
+            )
+            .await
+            .unwrap();
+        assert!(
+            columns.iter().any(|c| c == column),
+            "{table}.{column} must exist after migration 031; got {columns:?}"
+        );
+    }
+    let index_present = backend
+        .transaction(
+            TxOptions {
+                read_only: true,
+                ..Default::default()
+            },
+            |tx| {
+                Box::pin(async move {
+                    tx.query::<_, i64>(
+                        "SELECT 1 AS one FROM sqlite_master WHERE type='index' \
+                         AND name='idx_jobs_kind_status' AND tbl_name='jobs'",
+                        &[],
+                        |row| row.get("one"),
+                    )
+                    .await
+                })
+            },
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        index_present.len(),
+        1,
+        "idx_jobs_kind_status must exist on jobs"
     );
 }

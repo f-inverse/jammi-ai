@@ -433,6 +433,19 @@ impl SidecarIndex {
         self.storage_precision
     }
 
+    /// The embedding width every vector in this index has — the width a
+    /// query must have before any kernel runs against it.
+    pub fn dimensions(&self) -> usize {
+        self.dimensions
+    }
+
+    /// Whether `row_id` is indexed here — the membership check an input edge
+    /// runs before asking for a row's exact vector, so an unknown id is a
+    /// caller fault and never mistaken for a torn bundle.
+    pub fn contains_row(&self, row_id: &str) -> bool {
+        self.row_index.contains_key(row_id)
+    }
+
     /// Fetch the stored vector for `row_id`, or `None` if the id is not indexed.
     ///
     /// Reads the vector USearch already holds rather than asking the caller to

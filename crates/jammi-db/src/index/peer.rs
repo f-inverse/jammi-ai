@@ -131,6 +131,13 @@ pub enum PeerFailureReason {
     Torn,
     /// Any other transport-level failure.
     Transport,
+    /// The owner answered, but the answer does not reconcile with the request
+    /// it was for: a unit for a segment the coordinator never asked for, a
+    /// requested segment with no unit or two, a rescore row the coordinator
+    /// never named, a named row missing or duplicated. A non-conforming or
+    /// version-skewed peer, classified at the coordinator's edge — never a
+    /// panic, never a silently short or polluted result.
+    Malformed,
 }
 
 impl PeerFailureReason {
@@ -142,6 +149,7 @@ impl PeerFailureReason {
             Self::Refused => "refused",
             Self::Torn => "torn",
             Self::Transport => "transport",
+            Self::Malformed => "malformed",
         }
     }
 }
@@ -153,7 +161,8 @@ impl std::fmt::Display for PeerFailureReason {
 }
 
 /// One failed peer call, naming the segment, the owner it was addressed to,
-/// and why.
+/// and why. Also the shape a non-conforming ANSWER is reported as
+/// ([`PeerFailureReason::Malformed`]).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PeerError {
     /// The segment the call was for (the first requested id of a multi-segment
@@ -296,6 +305,8 @@ pub struct PeerFailureCounters {
     pub torn: AtomicU64,
     /// Any other transport failure.
     pub transport: AtomicU64,
+    /// A peer's answer did not reconcile with the request it was for.
+    pub malformed: AtomicU64,
     /// The retry at the second rendezvous candidate succeeded.
     pub retry_ok: AtomicU64,
     /// A remote segment was loaded locally under the admission budget.
@@ -305,12 +316,13 @@ pub struct PeerFailureCounters {
 }
 
 /// The label set [`PeerFailureCounters`] exposes, in a stable order.
-pub const PEER_FAILURE_LABELS: [&str; 8] = [
+pub const PEER_FAILURE_LABELS: [&str; 9] = [
     "deadline",
     "unreachable",
     "refused",
     "torn",
     "transport",
+    "malformed",
     "retry_ok",
     "local_load",
     "unavailable",
@@ -325,6 +337,7 @@ impl PeerFailureCounters {
             PeerFailureReason::Refused => &self.refused,
             PeerFailureReason::Torn => &self.torn,
             PeerFailureReason::Transport => &self.transport,
+            PeerFailureReason::Malformed => &self.malformed,
         };
         counter.fetch_add(1, Ordering::Relaxed);
     }
@@ -338,6 +351,7 @@ impl PeerFailureCounters {
             "refused" => &self.refused,
             "torn" => &self.torn,
             "transport" => &self.transport,
+            "malformed" => &self.malformed,
             "retry_ok" => &self.retry_ok,
             "local_load" => &self.local_load,
             "unavailable" => &self.unavailable,

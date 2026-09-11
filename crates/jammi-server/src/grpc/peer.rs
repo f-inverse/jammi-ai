@@ -9,12 +9,16 @@
 //! carries no tenant, and this handler reads no `result_tables` row. Tenant
 //! scope was enforced by the COORDINATOR, which resolved the table through its
 //! own tenant-scoped catalog read before fanning out. What the owner enforces,
-//! at its input edge, is the one thing the coordinator cannot: (1) every
-//! requested segment id belongs to the named table (else `INVALID_ARGUMENT`
-//! naming the first unknown id — the whole request is refused, never a
-//! partial unit) and (2) the bundle's stamped precision matches the requested
-//! one (the segment cache's strict load refuses otherwise →
-//! `FAILED_PRECONDITION`). It then runs the same pure kernels a single node
+//! at its input edge, is everything the request claims about the owner's own
+//! data: (1) every requested segment id belongs to the named table, is named
+//! once, and at least one is named (else `INVALID_ARGUMENT` — the whole
+//! request is refused, never a partial unit); (2) the bundle's stamped
+//! precision matches the requested one (the segment cache's strict load
+//! refuses otherwise → `FAILED_PRECONDITION`); (3) the query is exactly as
+//! wide as the segment (else `INVALID_ARGUMENT`, before any kernel can index
+//! past a vector or score a prefix); (4) every `ExactRescore` row id is
+//! indexed by its segment and named once (else `INVALID_ARGUMENT`, never
+//! mistaken for a torn bundle). It then runs the same pure kernels a single node
 //! runs ([`jammi_db::index::segment::search_unit`] / [`rescore`]) per segment
 //! and returns `(row_id, distance)` units — ids and distances, never vectors.
 //! A torn bundle (a candidate with no exact vector) is `DATA_LOSS`.
@@ -95,33 +99,102 @@ impl PeerServer {
     }
 }
 
-/// Every requested id must be in the table's segment list; the first unknown
-/// id refuses the WHOLE request.
+/// Every requested id must be in the table's segment list, named once, and
+/// at least one must be named; the first violation refuses the WHOLE
+/// request (a unit-less or partial answer would be a silent shrink at the
+/// coordinator).
 fn verify_membership(
     table_name: &str,
     requested: &[i64],
     segments: &[IndexSegment],
 ) -> Result<(), Status> {
-    if let Some(unknown) = requested
-        .iter()
-        .find(|id| !segments.iter().any(|s| s.segment_id == **id))
-    {
+    if requested.is_empty() {
         return Err(Status::invalid_argument(format!(
-            "segment {unknown} is not a segment of table '{table_name}'"
+            "no segment of table '{table_name}' was named"
+        )));
+    }
+    let mut seen = std::collections::BTreeSet::new();
+    for id in requested {
+        if !seen.insert(*id) {
+            return Err(Status::invalid_argument(format!(
+                "segment {id} of table '{table_name}' is named more than once"
+            )));
+        }
+        if !segments.iter().any(|s| s.segment_id == *id) {
+            return Err(Status::invalid_argument(format!(
+                "segment {id} is not a segment of table '{table_name}'"
+            )));
+        }
+    }
+    Ok(())
+}
+
+/// The query must be exactly as wide as the segment it is searched against:
+/// a longer query would index past the stored vector in `cosine_distance`
+/// (a panic), a shorter one would be silently scored over a prefix. Checked
+/// BEFORE any kernel runs, against the loaded segment's own width.
+fn verify_query_width(
+    table_name: &str,
+    segment_id: i64,
+    query: &[f32],
+    index: &SidecarIndex,
+) -> Result<(), Status> {
+    if query.len() != index.dimensions() {
+        return Err(Status::invalid_argument(format!(
+            "query has width {} but segment {table_name}/{segment_id} has width {}",
+            query.len(),
+            index.dimensions()
         )));
     }
     Ok(())
 }
 
-fn segment(segments: &[IndexSegment], id: i64) -> &IndexSegment {
-    segments
-        .iter()
-        .find(|s| s.segment_id == id)
-        .expect("membership verified above")
+/// Every row id an `ExactRescore` names must be indexed by the segment it is
+/// named under, and named once — an unknown or duplicated id is a caller
+/// fault at the input edge, never mistaken for a torn bundle by the rescore
+/// kernel (whose `Ok(None)` is reserved for a row the graph holds but the
+/// companion lost).
+fn verify_row_ids(
+    table_name: &str,
+    segment_id: i64,
+    row_ids: &[String],
+    index: &SidecarIndex,
+) -> Result<(), Status> {
+    let mut seen = std::collections::BTreeSet::new();
+    for row_id in row_ids {
+        if !seen.insert(row_id.as_str()) {
+            return Err(Status::invalid_argument(format!(
+                "row '{row_id}' of segment {table_name}/{segment_id} is named more than once"
+            )));
+        }
+        if !index.contains_row(row_id) {
+            return Err(Status::invalid_argument(format!(
+                "row '{row_id}' is not indexed by segment {table_name}/{segment_id}"
+            )));
+        }
+    }
+    Ok(())
 }
 
-/// A kernel failure after a successful load — a candidate with no exact
-/// vector, a companion read fault — is a torn bundle at this owner.
+/// The catalog row for a requested id. Membership was verified above, but
+/// the id is a wire value, so a miss is a typed refusal — never a panic.
+fn segment<'a>(
+    table_name: &str,
+    segments: &'a [IndexSegment],
+    id: i64,
+) -> Result<&'a IndexSegment, Status> {
+    segments.iter().find(|s| s.segment_id == id).ok_or_else(|| {
+        Status::invalid_argument(format!(
+            "segment {id} is not a segment of table '{table_name}'"
+        ))
+    })
+}
+
+/// A kernel failure after a successful load AND after the input edge above
+/// accepted the request — a row the graph holds but the companion lost, a
+/// companion read fault, a graph search fault — is a torn bundle at this
+/// owner. Caller faults never reach here: width, membership and row ids are
+/// refused first.
 fn torn(table_name: &str, segment_id: i64, e: JammiError) -> Status {
     Status::data_loss(format!("segment {table_name}/{segment_id}: {e}"))
 }
@@ -153,8 +226,14 @@ impl PeerService for PeerServer {
 
         let mut units = Vec::with_capacity(req.segment_ids.len());
         for id in req.segment_ids {
-            let index =
-                Self::load(&store, &req.table_name, segment(&segments, id), precision).await?;
+            let index = Self::load(
+                &store,
+                &req.table_name,
+                segment(&req.table_name, &segments, id)?,
+                precision,
+            )
+            .await?;
+            verify_query_width(&req.table_name, id, &req.query, &index)?;
             let unit = search_unit(&index, &req.query, width, phase, &|row_id| {
                 index.get_exact(row_id)
             })
@@ -187,8 +266,15 @@ impl PeerService for PeerServer {
         let mut out = Vec::new();
         for group in req.row_ids_by_segment {
             let id = group.segment_id;
-            let index =
-                Self::load(&store, &req.table_name, segment(&segments, id), precision).await?;
+            let index = Self::load(
+                &store,
+                &req.table_name,
+                segment(&req.table_name, &segments, id)?,
+                precision,
+            )
+            .await?;
+            verify_query_width(&req.table_name, id, &req.query, &index)?;
+            verify_row_ids(&req.table_name, id, &group.row_ids, &index)?;
             let candidates = group.row_ids.into_iter().map(|r| (r, 0.0f32)).collect();
             let rescored = rescore(candidates, &|row_id| index.get_exact(row_id), &req.query)
                 .map_err(|e| torn(&req.table_name, id, e))?;

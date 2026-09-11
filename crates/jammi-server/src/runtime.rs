@@ -502,7 +502,7 @@ impl OssServer {
         // result store; the registry reads them at scrape as
         // `jammi_peer_search_failures_total{reason}`. Registered here, once,
         // additively — `MetricsRegistry::new` keeps its arity.
-        metrics.register_peer_failures(session.result_store().peer_failures())?;
+        metrics.install_peer_failures(session.result_store().peer_failures())?;
         let readiness = Arc::new(ReadinessProbe::new(Arc::new(CatalogPingProbe::new(
             Arc::clone(&session),
         ))));

@@ -23,7 +23,7 @@ use crate::config::{AnnIndexConfig, StoragePrecision};
 use crate::error::{JammiError, Result};
 use crate::index::peer::{
     ExactRescoreRequest, PeerAddr, PeerError, PeerFailureCounters, PeerFailureReason,
-    PeerTransport, SegmentSearchPhase, SegmentSearchRequest, PEER_RPC_DEADLINE,
+    PeerTransport, SegmentSearchPhase, SegmentSearchRequest, SegmentUnit, PEER_RPC_DEADLINE,
 };
 use crate::index::segment::{merge, over_fetch, rescore, search_unit};
 use crate::index::sidecar::SidecarIndex;
@@ -286,6 +286,12 @@ impl PlacedIndex {
     ///   hits locally and returns exact distances; `merge(units, k)` on final
     ///   distance. 1 RTT; `N·width` exact reads, paid only here.
     ///
+    /// Every answer is reconciled against the request it was for at this
+    /// edge ([`reconcile_units`] / [`reconcile_rescore`]) — so every
+    /// [`PeerTransport`] implementation is covered — and a non-conforming
+    /// answer is a [`PeerFailureReason::Malformed`] failure of that rung, not
+    /// a result.
+    ///
     /// The ladder per remote segment (per phase): the owner under
     /// [`PEER_RPC_DEADLINE`] → one retry at the next rendezvous candidate →
     /// a local load through the segment cache under `2 × PEER_RPC_DEADLINE`,
@@ -341,9 +347,11 @@ impl PlacedIndex {
             };
             let req = &req;
             self.call_with_retry(group, |owner| async move {
-                self.transport
+                let units = self
+                    .transport
                     .segment_search(&owner, req, PEER_RPC_DEADLINE)
-                    .await
+                    .await?;
+                reconcile_units(&owner, req, units)
             })
             .await
         });
@@ -407,10 +415,19 @@ impl PlacedIndex {
                 )?);
                 continue;
             }
+            // Every non-resident survivor came from a unit `reconcile_units`
+            // bound to a requested segment of one remote group; a miss here
+            // is an engine invariant failure, reported, never a panic.
             let group = groups
                 .iter()
                 .find(|g| g.segments.iter().any(|s| s.segment_id == segment))
-                .expect("every non-resident survivor came from a remote group");
+                .ok_or_else(|| {
+                    JammiError::Other(format!(
+                        "placed search: survivor from segment {} of table '{}' belongs to no \
+                         placement group",
+                        segment.0, self.table_name
+                    ))
+                })?;
             let row_ids: Vec<String> = candidates.into_iter().map(|(id, _)| id).collect();
             match remote_groups
                 .iter_mut()
@@ -429,9 +446,11 @@ impl PlacedIndex {
             };
             let req = &req;
             self.call_with_retry(group, |owner| async move {
-                self.transport
+                let rows = self
+                    .transport
                     .exact_rescore(&owner, req, PEER_RPC_DEADLINE)
-                    .await
+                    .await?;
+                reconcile_rescore(&owner, req, rows)
             })
             .await
         });
@@ -441,11 +460,19 @@ impl PlacedIndex {
                 Ok(hits) => rescored.extend(hits),
                 Err(last) => {
                     for (segment, row_ids) in rows {
+                        // `rows` was grouped under `group` by segment id above;
+                        // a miss is an engine invariant failure, never a panic.
                         let seg = group
                             .segments
                             .iter()
                             .find(|s| s.segment_id == *segment)
-                            .expect("the survivor's segment is in its group");
+                            .ok_or_else(|| {
+                                JammiError::Other(format!(
+                                    "placed search: rescore group names segment {} of table \
+                                     '{}' outside its owner group",
+                                    segment.0, self.table_name
+                                ))
+                            })?;
                         let index = self.load_locally(seg, &mut loaded_this_query, last).await?;
                         rescored.extend(rescore(
                             row_ids.iter().map(|id| (id.clone(), 0.0)).collect(),
@@ -567,6 +594,100 @@ impl PlacedIndex {
 /// The survivors an `ExactRescore` names, grouped by the segment that owns
 /// each.
 type RowIdsBySegment = Vec<(SegmentId, Vec<String>)>;
+
+/// Reconcile a `SegmentSearch` answer against its request: exactly one unit
+/// per requested segment id, none for an id that was not requested, none
+/// twice; no unit wider than the requested `width`; and no row id twice
+/// ACROSS THE WHOLE ANSWER, not merely within one unit — segments are
+/// row-disjoint by the append invariant (`segment.rs`'s module contract), so
+/// one id in two units is knowably impossible and the coordinator refuses it
+/// here. Letting it through would be silently expensive: [`merge`] dedups by
+/// id but keeps the winning occurrence's segment attribution, so phase 2
+/// would ask an owner to rescore a row it does not hold, be correctly
+/// refused there, retry, pay a full segment download at the local-load rung,
+/// and finally surface as a bogus "corrupted or torn sidecar bundle" against
+/// a perfectly healthy local bundle.
+///
+/// Anything else is [`PeerFailureReason::Malformed`] for the first
+/// requested segment (the failure the ladder counts, warns and retries),
+/// never a result — an unrequested unit would inject a peer's rows into the
+/// merge, a missing one would silently shrink it. (WHICH rows a segment
+/// holds is the owner's own knowledge; the coordinator has nothing to check
+/// an individual hit's row id against and trusts it as the owner's data —
+/// I-PEER. That the same id is not in two of them is a property of the
+/// answer alone, which is why it IS checked.)
+fn reconcile_units(
+    owner: &PeerAddr,
+    req: &SegmentSearchRequest,
+    units: Vec<SegmentUnit>,
+) -> std::result::Result<Vec<SegmentUnit>, PeerError> {
+    let malformed = || PeerError {
+        segment: req.segment_ids.first().copied().unwrap_or(SegmentId(-1)),
+        owner: owner.clone(),
+        reason: PeerFailureReason::Malformed,
+    };
+    let requested: std::collections::BTreeSet<SegmentId> =
+        req.segment_ids.iter().copied().collect();
+    let mut seen = std::collections::BTreeSet::new();
+    // One set for the WHOLE answer: a row id repeated across two units is
+    // the case that costs a wrong-owner rescore and a wasted download.
+    let mut rows = std::collections::BTreeSet::new();
+    for unit in &units {
+        if !requested.contains(&unit.segment_id) || !seen.insert(unit.segment_id) {
+            return Err(malformed());
+        }
+        if unit.hits.len() > req.width {
+            return Err(malformed());
+        }
+        if !unit
+            .hits
+            .iter()
+            .all(|(row_id, _)| rows.insert(row_id.as_str()))
+        {
+            return Err(malformed());
+        }
+    }
+    if seen.len() != requested.len() {
+        return Err(malformed());
+    }
+    Ok(units)
+}
+
+/// Reconcile an `ExactRescore` answer against its request: exactly the rows
+/// that were named, each once. A short answer would silently return fewer
+/// than `k`; a long one would inject rows the merge never selected; a
+/// duplicate would score one row twice. Any of these is
+/// [`PeerFailureReason::Malformed`].
+fn reconcile_rescore(
+    owner: &PeerAddr,
+    req: &ExactRescoreRequest,
+    rows: Vec<(String, f32)>,
+) -> std::result::Result<Vec<(String, f32)>, PeerError> {
+    let malformed = || PeerError {
+        segment: req
+            .row_ids_by_segment
+            .first()
+            .map(|(s, _)| *s)
+            .unwrap_or(SegmentId(-1)),
+        owner: owner.clone(),
+        reason: PeerFailureReason::Malformed,
+    };
+    let requested: std::collections::BTreeSet<&str> = req
+        .row_ids_by_segment
+        .iter()
+        .flat_map(|(_, ids)| ids.iter().map(String::as_str))
+        .collect();
+    let mut seen = std::collections::BTreeSet::new();
+    for (row_id, _) in &rows {
+        if !requested.contains(row_id.as_str()) || !seen.insert(row_id.as_str()) {
+            return Err(malformed());
+        }
+    }
+    if seen.len() != requested.len() {
+        return Err(malformed());
+    }
+    Ok(rows)
+}
 
 /// Remote segments sharing one owner list, so they ride ONE request per
 /// phase and retry together.
@@ -800,5 +921,335 @@ mod tests {
         );
         // Binary pads to whole bytes.
         assert_eq!(local_load_estimate(1, 12, StoragePrecision::Binary), 2 + 96);
+    }
+
+    // ---- Response reconciliation at the coordinator (a fake transport) ----
+
+    use std::sync::Mutex;
+    use std::time::Duration;
+
+    /// What the fake owner answers a `SegmentSearch` with.
+    #[derive(Clone)]
+    enum SearchAnswer {
+        /// Exactly one conforming unit per requested id (hits `r0..r3`).
+        Conforming,
+        /// A unit for a segment id the coordinator never asked for.
+        UnrequestedSegment,
+        /// One requested id produces no unit.
+        MissingUnit,
+        /// One requested id produces two units.
+        DuplicateUnit,
+        /// A unit with more hits than the requested width.
+        OverWidth,
+        /// A unit naming one row twice.
+        DuplicateRow,
+        /// Two units of ONE answer naming the same row id — segments are
+        /// row-disjoint by construction, so this is knowably impossible.
+        DuplicateRowAcrossUnits,
+    }
+
+    /// What the fake owner answers an `ExactRescore` with.
+    #[derive(Clone)]
+    enum RescoreAnswer {
+        Conforming,
+        /// Fewer rows than requested.
+        Short,
+        /// A row the coordinator never named.
+        Unrequested,
+        /// A requested row twice.
+        Duplicate,
+    }
+
+    struct FakeOwner {
+        search: SearchAnswer,
+        rescore: RescoreAnswer,
+        calls: Mutex<(usize, usize)>,
+    }
+
+    #[async_trait::async_trait]
+    impl PeerTransport for FakeOwner {
+        async fn segment_search(
+            &self,
+            _owner: &PeerAddr,
+            req: &SegmentSearchRequest,
+            _deadline: Duration,
+        ) -> std::result::Result<Vec<SegmentUnit>, PeerError> {
+            self.calls.lock().unwrap().0 += 1;
+            // Row ids are SEGMENT-SCOPED, like a real owner's: segments are
+            // row-disjoint by the append invariant, so a conforming answer
+            // never repeats an id across its units.
+            let hits = |s: SegmentId, n: usize| -> Vec<(String, f32)> {
+                (0..n)
+                    .map(|i| (format!("s{}r{i}", s.0), 0.1 * i as f32))
+                    .collect()
+            };
+            let mut units: Vec<SegmentUnit> = req
+                .segment_ids
+                .iter()
+                .map(|s| SegmentUnit {
+                    segment_id: *s,
+                    hits: hits(*s, req.width.min(4)),
+                })
+                .collect();
+            match self.search {
+                SearchAnswer::Conforming => {}
+                SearchAnswer::UnrequestedSegment => units.push(SegmentUnit {
+                    segment_id: SegmentId(99),
+                    hits: hits(SegmentId(99), 2),
+                }),
+                SearchAnswer::MissingUnit => {
+                    units.pop();
+                }
+                SearchAnswer::DuplicateUnit => {
+                    let dup = units[0].clone();
+                    units.push(dup);
+                }
+                SearchAnswer::OverWidth => {
+                    let first = units[0].segment_id;
+                    units[0].hits = hits(first, req.width + 1);
+                }
+                SearchAnswer::DuplicateRow => {
+                    let dup = units[0].hits[0].clone();
+                    units[0].hits.push(dup);
+                }
+                SearchAnswer::DuplicateRowAcrossUnits => {
+                    let dup = units[0].hits[0].clone();
+                    let last = units.len() - 1;
+                    units[last].hits[0] = dup;
+                }
+            }
+            Ok(units)
+        }
+
+        async fn exact_rescore(
+            &self,
+            _owner: &PeerAddr,
+            req: &ExactRescoreRequest,
+            _deadline: Duration,
+        ) -> std::result::Result<Vec<(String, f32)>, PeerError> {
+            self.calls.lock().unwrap().1 += 1;
+            let mut rows: Vec<(String, f32)> = req
+                .row_ids_by_segment
+                .iter()
+                .flat_map(|(_, ids)| ids.iter().map(|id| (id.clone(), 0.5)))
+                .collect();
+            match self.rescore {
+                RescoreAnswer::Conforming => {}
+                RescoreAnswer::Short => {
+                    rows.pop();
+                }
+                RescoreAnswer::Unrequested => rows.push(("stranger".into(), 0.0)),
+                RescoreAnswer::Duplicate => {
+                    let dup = rows[0].clone();
+                    rows.push(dup);
+                }
+            }
+            Ok(rows)
+        }
+    }
+
+    /// A placed index with one local segment (rows `a..l` even half) and one
+    /// REMOTE segment owned by the fake, whose bundle URL points nowhere
+    /// (so the local-load rung can never succeed) and a budget of 1 byte.
+    fn mixed_with_fake(
+        precision: StoragePrecision,
+        fake: Arc<FakeOwner>,
+    ) -> (PlacedIndex, Arc<PeerFailureCounters>, tempfile::TempDir) {
+        mixed_with_fake_n_remote(precision, fake, 1)
+    }
+
+    /// [`mixed_with_fake`] with `n_remote` remote segments sharing ONE owner
+    /// list — so a single `SegmentSearch` request carries several ids and its
+    /// answer carries several units, the shape a cross-unit violation needs.
+    fn mixed_with_fake_n_remote(
+        precision: StoragePrecision,
+        fake: Arc<FakeOwner>,
+        n_remote: i64,
+    ) -> (PlacedIndex, Arc<PeerFailureCounters>, tempfile::TempDir) {
+        let rows = corpus();
+        let (left, _right) = rows.split_at(6);
+        let dir = tempfile::tempdir().unwrap();
+        let loader = Arc::new(
+            SegmentIndexCache::new(StorageRegistry::new(), dir.path().join("index")).unwrap(),
+        );
+        let counters = Arc::new(PeerFailureCounters::default());
+        let mut sources = vec![SegmentSource::Local(SegmentId(0), segment(left, precision))];
+        for id in 1..=n_remote {
+            sources.push(SegmentSource::Remote {
+                segment_id: SegmentId(id),
+                owners: vec![
+                    PeerAddr("127.0.0.1:1".into()),
+                    PeerAddr("127.0.0.1:2".into()),
+                ],
+                row_count: 6,
+                index_url: StorageUrl::parse(
+                    dir.path()
+                        .join("missing")
+                        .join(format!("seg{id}.idx"))
+                        .to_str()
+                        .unwrap(),
+                )
+                .unwrap(),
+            });
+        }
+        let placed = PlacedIndex::with_sources(
+            sources,
+            "t",
+            precision,
+            fake,
+            loader,
+            AnnIndexConfig::default(),
+            Some(1),
+            Some(8),
+            Arc::clone(&counters),
+        )
+        .unwrap();
+        (placed, counters, dir)
+    }
+
+    fn fake(search: SearchAnswer, rescore: RescoreAnswer) -> Arc<FakeOwner> {
+        Arc::new(FakeOwner {
+            search,
+            rescore,
+            calls: Mutex::new((0, 0)),
+        })
+    }
+
+    /// Sanity: the conforming fake yields a full answer (k rows) and no
+    /// failure counter moves — the reconciliation does not refuse a good peer.
+    #[tokio::test]
+    async fn conforming_fake_owner_serves_without_any_failure_counter() {
+        let owner = fake(SearchAnswer::Conforming, RescoreAnswer::Conforming);
+        let (placed, counters, _dir) = mixed_with_fake(StoragePrecision::Int8, Arc::clone(&owner));
+        let q = corpus()[0].1.clone();
+        let hits = placed.search_final_placed(&q, 3, 4).await.unwrap();
+        assert_eq!(hits.len(), 3);
+        assert!(
+            counters.snapshot().iter().all(|(_, v)| *v == 0),
+            "{:?}",
+            counters.snapshot()
+        );
+        assert_eq!(*owner.calls.lock().unwrap(), (1, 1));
+    }
+
+    /// A non-conforming `SegmentSearch` answer — an unrequested segment id, a
+    /// missing unit, a duplicated unit, a unit wider than `width`, a row named
+    /// twice in a unit — is a typed ladder failure: counted
+    /// under `malformed`, warned, retried at the second candidate, then the
+    /// local-load rung (refused by the 1-byte budget) → `Unavailable`. Never
+    /// a panic, never a silently short or polluted result.
+    #[tokio::test]
+    async fn non_conforming_search_units_are_a_typed_ladder_failure() {
+        for answer in [
+            SearchAnswer::UnrequestedSegment,
+            SearchAnswer::MissingUnit,
+            SearchAnswer::DuplicateUnit,
+            SearchAnswer::OverWidth,
+            SearchAnswer::DuplicateRow,
+        ] {
+            let owner = fake(answer.clone(), RescoreAnswer::Conforming);
+            let (placed, counters, _dir) =
+                mixed_with_fake(StoragePrecision::F32, Arc::clone(&owner));
+            let q = corpus()[0].1.clone();
+            let err = placed
+                .search_final_placed(&q, 3, 1)
+                .await
+                .expect_err("a non-conforming peer answer must not become a result");
+            assert!(
+                matches!(&err, JammiError::Unavailable { resource, .. } if resource == "segment t/1"),
+                "{err:?}"
+            );
+            assert_eq!(
+                counters.get("malformed"),
+                Some(2),
+                "both candidates answered malformed"
+            );
+            assert_eq!(counters.get("unavailable"), Some(1));
+            assert_eq!(counters.get("local_load"), Some(0));
+            assert_eq!(owner.calls.lock().unwrap().0, 2, "owner then the one retry");
+        }
+    }
+
+    /// One row id in TWO units of a single answer is knowably impossible:
+    /// segments are row-disjoint by the append invariant, so the coordinator
+    /// refuses it rather than letting `merge` dedup it into the WRONG
+    /// segment attribution — which would send phase 2's rescore to an owner
+    /// that does not hold the row, be correctly refused there, and cost a
+    /// retry plus a full segment download before surfacing as a bogus "torn
+    /// bundle" against a healthy local bundle.
+    #[tokio::test]
+    async fn duplicate_row_across_units_is_a_typed_ladder_failure() {
+        let owner = fake(
+            SearchAnswer::DuplicateRowAcrossUnits,
+            RescoreAnswer::Conforming,
+        );
+        let (placed, counters, _dir) =
+            mixed_with_fake_n_remote(StoragePrecision::F32, Arc::clone(&owner), 2);
+        let q = corpus()[0].1.clone();
+        let err = placed
+            .search_final_placed(&q, 3, 1)
+            .await
+            .expect_err("one row id across two units must not become a result");
+        assert!(
+            matches!(&err, JammiError::Unavailable { resource, .. } if resource == "segment t/1"),
+            "{err:?}"
+        );
+        assert_eq!(
+            counters.get("malformed"),
+            Some(2),
+            "both candidates answered malformed"
+        );
+        assert_eq!(counters.get("unavailable"), Some(1));
+        assert_eq!(counters.get("local_load"), Some(0));
+        assert_eq!(owner.calls.lock().unwrap().0, 2, "owner then the one retry");
+    }
+
+    /// The two-remote-segment fixture itself is sound: a conforming answer
+    /// over two units serves, so the test above pins the cross-unit rule and
+    /// not the fixture's shape.
+    #[tokio::test]
+    async fn conforming_two_unit_answer_serves() {
+        let owner = fake(SearchAnswer::Conforming, RescoreAnswer::Conforming);
+        let (placed, counters, _dir) =
+            mixed_with_fake_n_remote(StoragePrecision::F32, Arc::clone(&owner), 2);
+        let q = corpus()[0].1.clone();
+        let hits = placed.search_final_placed(&q, 3, 1).await.unwrap();
+        assert_eq!(hits.len(), 3);
+        assert!(
+            counters.snapshot().iter().all(|(_, v)| *v == 0),
+            "{:?}",
+            counters.snapshot()
+        );
+    }
+
+    /// A non-conforming `ExactRescore` answer — short, an unrequested row, a
+    /// duplicated row — is the same typed ladder failure in phase 2.
+    #[tokio::test]
+    async fn non_conforming_rescore_rows_are_a_typed_ladder_failure() {
+        for answer in [
+            RescoreAnswer::Short,
+            RescoreAnswer::Unrequested,
+            RescoreAnswer::Duplicate,
+        ] {
+            let owner = fake(SearchAnswer::Conforming, answer.clone());
+            let (placed, counters, _dir) =
+                mixed_with_fake(StoragePrecision::Int8, Arc::clone(&owner));
+            let q = corpus()[0].1.clone();
+            let err = placed
+                .search_final_placed(&q, 3, 4)
+                .await
+                .expect_err("a non-conforming rescore answer must not become a result");
+            assert!(
+                matches!(&err, JammiError::Unavailable { resource, .. } if resource == "segment t/1"),
+                "{err:?}"
+            );
+            assert_eq!(counters.get("malformed"), Some(2));
+            assert_eq!(counters.get("unavailable"), Some(1));
+            assert_eq!(
+                *owner.calls.lock().unwrap(),
+                (1, 2),
+                "one search, owner + retry rescore"
+            );
+        }
     }
 }

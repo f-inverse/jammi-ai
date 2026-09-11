@@ -343,14 +343,18 @@ impl MetricsRegistry {
         }
     }
 
-    /// Register the placed-search failure-ladder counters
-    /// ([`PeerFailureCounters`], owned by the engine's result store) as
-    /// `jammi_peer_search_failures_total{reason}`, read at scrape. ADDITIVE:
-    /// `prometheus::Registry::register` takes `&self`, so this is called on
-    /// the shared registry after construction (by `OssServer::new`, with the
-    /// session's counters) and [`Self::new`]'s arity is unchanged. Registering
-    /// twice on one registry is the usual name-collision error.
-    pub fn register_peer_failures(
+    /// Install the placed-search failure-ladder counters
+    /// ([`PeerFailureCounters`], owned by the engine's result store) into this
+    /// registry as `jammi_peer_search_failures_total{reason}`, read at scrape.
+    /// ADDITIVE: `prometheus::Registry::register` takes `&self`, so this is
+    /// called on the shared registry after construction (by `OssServer::new`,
+    /// with the session's counters) and [`Self::new`]'s arity is unchanged.
+    /// Installing twice on one registry is the usual name-collision error.
+    /// (Named `install_*` like [`ResultStore::install_result_schema`]: it
+    /// mounts a collector into a registry — mechanism, not governance.)
+    ///
+    /// [`ResultStore::install_result_schema`]: jammi_db::store::ResultStore::install_result_schema
+    pub fn install_peer_failures(
         &self,
         counters: Arc<PeerFailureCounters>,
     ) -> Result<(), prometheus::Error> {
@@ -386,7 +390,7 @@ impl PeerFailureCollector {
     const NAME: &'static str = "jammi_peer_search_failures_total";
     const HELP: &'static str = "Total number of placed-search failure-ladder outcomes on this \
         replica as a coordinator, labelled by reason (deadline, unreachable, refused, torn, \
-        transport, retry_ok, local_load, unavailable).";
+        transport, malformed, retry_ok, local_load, unavailable).";
 
     fn new(counters: Arc<PeerFailureCounters>) -> Result<Self, prometheus::Error> {
         let desc = Desc::new(

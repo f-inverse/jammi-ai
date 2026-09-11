@@ -453,34 +453,52 @@ fn drop_column(
 /// handed through the stream machinery as a `Shared(Arc<_>)` — so the typed
 /// variant is unwrapped here rather than flattened into a string: a typed
 /// refusal such as [`JammiError::Unavailable`] keeps its variant (and its
-/// gRPC code) across `Search`. Any other DataFusion error keeps the
-/// `"{stage}: {error}"` text it always had.
+/// gRPC code) across `Search`. The wrappers are walked only to FIND a typed
+/// engine error; when none is found the ORIGINAL error's own `Display` text
+/// — its context description and `caused by` chain included — is kept
+/// exactly, under the `"{stage}: "` prefix it always had.
 fn plan_error(stage: &str, e: datafusion::error::DataFusionError) -> JammiError {
-    use datafusion::error::DataFusionError;
-    match e {
-        DataFusionError::External(boxed) => match boxed.downcast::<JammiError>() {
-            Ok(engine) => *engine,
-            Err(other) => {
-                JammiError::Other(format!("{stage}: {}", DataFusionError::External(other)))
-            }
-        },
-        DataFusionError::Context(_, inner) => plan_error(stage, *inner),
-        DataFusionError::Shared(arc) => match Arc::try_unwrap(arc) {
-            Ok(inner) => plan_error(stage, inner),
-            // Still shared elsewhere: the one typed refusal this seam must
-            // carry is rebuilt by reference; everything else keeps the text.
-            Err(arc) => match unavailable_by_ref(&arc) {
-                Some(engine) => engine,
-                None => JammiError::Other(format!("{stage}: {arc}")),
-            },
-        },
-        other => JammiError::Other(format!("{stage}: {other}")),
+    match extract_engine_error(e) {
+        Ok(engine) => engine,
+        Err(original) => JammiError::Other(format!("{stage}: {original}")),
     }
 }
 
-/// Rebuild a [`JammiError::Unavailable`] found anywhere under `e` (through
-/// `Context` / `Shared` wrappers) — `JammiError` is not `Clone`, so this is
-/// the one variant reconstructed from a borrowed error.
+/// Take the typed [`JammiError`] out of `e` if one is boxed anywhere under
+/// it; otherwise hand `e` back UNCHANGED (rebuilt with the same wrappers) so
+/// its `Display` text is exactly what it was.
+fn extract_engine_error(
+    e: datafusion::error::DataFusionError,
+) -> std::result::Result<JammiError, datafusion::error::DataFusionError> {
+    use datafusion::error::DataFusionError;
+    match e {
+        DataFusionError::External(boxed) => match boxed.downcast::<JammiError>() {
+            Ok(engine) => Ok(*engine),
+            Err(other) => Err(DataFusionError::External(other)),
+        },
+        DataFusionError::Context(description, inner) => match extract_engine_error(*inner) {
+            Ok(engine) => Ok(engine),
+            Err(inner) => Err(DataFusionError::Context(description, Box::new(inner))),
+        },
+        DataFusionError::Shared(arc) => match Arc::try_unwrap(arc) {
+            Ok(inner) => extract_engine_error(inner)
+                .map_err(|inner| DataFusionError::Shared(Arc::new(inner))),
+            // Still shared elsewhere: `JammiError` is not `Clone`, so the one
+            // typed refusal this seam must carry is rebuilt by reference;
+            // everything else keeps the original text.
+            Err(arc) => match unavailable_by_ref(&arc) {
+                Some(engine) => Ok(engine),
+                None => Err(DataFusionError::Shared(arc)),
+            },
+        },
+        other => Err(other),
+    }
+}
+
+/// FIND a [`JammiError::Unavailable`] anywhere under `e` (through `Context` /
+/// `Shared` wrappers) and rebuild it by reference — the only variant that can
+/// be reconstructed from a borrowed error. A finder only: it never produces
+/// text, so a `Context` description is never dropped by it.
 fn unavailable_by_ref(e: &datafusion::error::DataFusionError) -> Option<JammiError> {
     use datafusion::error::DataFusionError;
     match e {
@@ -494,5 +512,58 @@ fn unavailable_by_ref(e: &datafusion::error::DataFusionError) -> Option<JammiErr
         DataFusionError::Context(_, inner) => unavailable_by_ref(inner),
         DataFusionError::Shared(arc) => unavailable_by_ref(arc),
         _ => None,
+    }
+}
+
+#[cfg(test)]
+mod plan_error_tests {
+    use super::*;
+    use datafusion::error::DataFusionError;
+
+    fn ctx_err() -> DataFusionError {
+        DataFusionError::Plan("bad plan".into()).context("while planning the scan")
+    }
+
+    /// A non-engine `Context` error keeps its own `Display` text exactly —
+    /// the description AND the `caused by` chain — under the stage prefix.
+    #[test]
+    fn non_engine_context_error_keeps_its_full_display_text() {
+        let expected = format!("Search execute: {}", ctx_err());
+        assert!(expected.contains("while planning the scan"));
+        assert!(expected.contains("caused by"));
+        let got = plan_error("Search execute", ctx_err());
+        assert_eq!(got.to_string(), expected);
+        assert!(matches!(got, JammiError::Other(_)));
+    }
+
+    /// The same shape for a `Shared` non-engine error: text kept verbatim.
+    #[test]
+    fn non_engine_shared_context_error_keeps_its_full_display_text() {
+        let shared = DataFusionError::Shared(Arc::new(ctx_err()));
+        let expected = format!("Search collect: {shared}");
+        let got = plan_error("Search collect", shared);
+        assert_eq!(got.to_string(), expected);
+    }
+
+    /// A typed engine error under `Context` / `Shared` is recovered as itself.
+    #[test]
+    fn engine_error_under_context_and_shared_is_recovered_typed() {
+        let mk = || {
+            DataFusionError::External(Box::new(JammiError::Unavailable {
+                resource: "segment t/1".into(),
+                reason: "unreachable".into(),
+            }))
+            .context("leaf")
+        };
+        assert!(matches!(
+            plan_error("Search collect", mk()),
+            JammiError::Unavailable { .. }
+        ));
+        let arc = Arc::new(mk());
+        let _still_shared = Arc::clone(&arc);
+        assert!(matches!(
+            plan_error("Search collect", DataFusionError::Shared(arc)),
+            JammiError::Unavailable { .. }
+        ));
     }
 }

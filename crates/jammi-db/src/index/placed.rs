@@ -61,7 +61,11 @@ pub(crate) struct RemoteSegment {
 /// The two shapes a placed table takes.
 pub(crate) enum Placed {
     /// Every segment is resident: the sync all-local index, searched as-is.
-    AllLocal(SegmentedIndex),
+    /// An `Arc` so the force-local entry's ([`crate::store::ResultStore::
+    /// resolve_search_mode_local`]) cached, version-aware, masked
+    /// [`SegmentedIndex`] can be wrapped without a copy — the ONLINE entry
+    /// never rebuilds an unmasked set out from under it.
+    AllLocal(Arc<SegmentedIndex>),
     /// At least one segment is owned by a peer.
     Mixed {
         local: Vec<(SegmentId, SidecarIndex)>,
@@ -168,7 +172,7 @@ impl PlacedIndex {
                     index.storage_precision(),
                 )));
             }
-            Placed::AllLocal(index)
+            Placed::AllLocal(Arc::new(index))
         };
         Ok(Self {
             inner,
@@ -181,6 +185,38 @@ impl PlacedIndex {
             dimensions,
             counters,
         })
+    }
+
+    /// Wrap an already-resolved, version-aware all-local [`SegmentedIndex`]
+    /// (from [`crate::store::ResultStore::resolve_search_mode_local`]) as a
+    /// [`PlacedIndex`], for [`crate::store::ResultStore::resolve_search_mode`]'s
+    /// every-segment-local arm: the ONLINE entry must load exactly what the
+    /// force-local entry loads — mask, `current_version` and all — never a
+    /// second, unmasked read through [`Self::with_sources`]'s flat segment
+    /// list. The precision is read off `index` rather than re-asserted: the
+    /// force-local resolver already enforces the set's own uniformity.
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn from_local(
+        index: Arc<SegmentedIndex>,
+        table_name: &str,
+        transport: Arc<dyn PeerTransport>,
+        loader: Arc<SegmentIndexCache>,
+        ann: AnnIndexConfig,
+        budget: Option<u64>,
+        dimensions: Option<i32>,
+        counters: Arc<PeerFailureCounters>,
+    ) -> Self {
+        Self {
+            storage_precision: index.storage_precision(),
+            inner: Placed::AllLocal(index),
+            table_name: table_name.to_string(),
+            transport,
+            loader,
+            ann,
+            budget,
+            dimensions,
+            counters,
+        }
     }
 
     /// The precision every segment in this set is stored at.

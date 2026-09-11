@@ -2069,15 +2069,27 @@ impl ResultStore {
             );
         }
         let precision = table.storage_precision.unwrap_or_default();
-        let sources = if owners.iter().all(Vec::is_empty) {
-            match self.load_all_local(table, &segments).await? {
-                Some(loaded) => loaded
-                    .into_iter()
-                    .map(|(id, index)| SegmentSource::Local(id, index))
-                    .collect(),
-                None => return Ok(None),
-            }
-        } else {
+        if owners.iter().all(Vec::is_empty) {
+            // Every segment is local: identical to the force-local entry,
+            // including its version-aware masked load — a `PlacedIndex` never
+            // bypasses the mask the online search verb promises. `sources`
+            // (a flat, unversioned `list_index_segments` load) is not used on
+            // this arm; the versioned resolver owns segment selection.
+            return Ok(self
+                .resolve_search_mode_local(table)
+                .await?
+                .map(|index| PlacedIndex::from_local(
+                    index,
+                    &table.table_name,
+                    Arc::clone(&self.peer_transport),
+                    Arc::clone(&self.segment_cache),
+                    self.ann,
+                    self.peer_local_load_bytes,
+                    table.dimensions,
+                    Arc::clone(&self.peer_failures),
+                )));
+        }
+        let sources = {
             let first_remote = segments
                 .iter()
                 .zip(&owners)

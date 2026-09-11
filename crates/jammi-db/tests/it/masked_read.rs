@@ -567,7 +567,7 @@ async fn masked_ann_merge_over_the_versioned_set() {
     let f = fixture().await;
     let index = f
         .store
-        .resolve_search_mode(&f.record)
+        .resolve_search_mode_local(&f.record)
         .await
         .unwrap()
         .expect("the segment set loads");

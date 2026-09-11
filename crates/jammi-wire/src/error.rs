@@ -970,6 +970,7 @@ mod tests {
             | JammiError::NotRefreshable { .. }
             | JammiError::DefinitionDrift { .. }
             | JammiError::NonUniqueKey { .. }
+            | JammiError::Unavailable { .. }
             | JammiError::Other(_) => {}
         }
     }

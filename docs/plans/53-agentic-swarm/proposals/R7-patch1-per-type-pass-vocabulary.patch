@@ -1,0 +1,169 @@
+diff --git a/.claude/hooks/README.md b/.claude/hooks/README.md
+index ef39482..68fdc8c 100644
+--- a/.claude/hooks/README.md
++++ b/.claude/hooks/README.md
+@@ -225,7 +225,15 @@ re-dispatch naming neither the recorded worktree, head_sha, nor unit_branch (DOD
+ (3) `disableAllHooks` in local settings (a verifier verdict in the transcript with no
+ hook-written state row is the tell); (4) a relay whose `probe` sites are
+ asserted but never examined — mechanically indistinguishable here; the tell is a
+-probe site the next round's citation-checker cannot corroborate.
++probe site the next round's citation-checker cannot corroborate; (5) a HAND-APPENDED
++verdict row in `.jammi/gate-state/<slug>.jsonl` itself — the directory carries no
++`permissions.deny` entry and the lead already writes into it by design (the relay
++artifact), so an appended row is indistinguishable, at the hook, from a real
++verifier's own `SubagentStop` write; the tell is that it has no matching `hook.log`
++`SubagentStop` entry and never lands in a committed, human-reviewed record (this
++residual is true today, independent of any of the above, and is the reason a
++COMMITTED rigor record — never the gitignored state directory alone — is what a
++human at merge can actually trust; see `docs/plans/53-agentic-swarm/proposals/`).
+ 
+ ### `build-env-guard.sh` — `PreToolUse(Bash)`, opt-in, fail-open
+ Warns (stderr only, **always exit 0**) when a Bash command carries a build-env hazard
+diff --git a/.claude/hooks/lead-gate-lib.py b/.claude/hooks/lead-gate-lib.py
+index 9aab288..23921e7 100755
+--- a/.claude/hooks/lead-gate-lib.py
++++ b/.claude/hooks/lead-gate-lib.py
+@@ -131,12 +131,14 @@ underlying git problem. HONEST LIMIT: R3 cannot verify examination, only that a
+ path is a real member of the fix's own diff — a lead can still satisfy it
+ by pasting a path out of its own change; the substantive rule
+ (design-before-mechanism, one fix round per BLOCK) is a
+-`.claude/agents/lead.md` discipline, not a hook. A further, PRE-EXISTING
+-wrinkle, not introduced by this arm: `_PASS_LIKE` is checked globally when
+-classifying a raw verdict value, so an adversarial-audit row whose OWN
+-verdict text merely CONTAINS a pass-like token ("verified"/"PROCEED") also
+-closes a BLOCK — independent of R3 entirely; out of scope for this
+-proposal.
++`.claude/agents/lead.md` discipline, not a hook. A PRE-EXISTING wrinkle
++this arm never introduced is now CLOSED (esc-lead-gate-R7d): the PASS
++vocabulary used to be checked as one GLOBAL set (`_PASS_LIKE`), so an
++adversarial-audit row whose OWN verdict text was literally "verified" or
++"PROCEED" — words that clear a DIFFERENT card's row, never this one's —
++also closed a BLOCK, independent of R3 entirely. `_pass_word_for(agent_type)`
++(below) replaces the pooled set with a PER-AGENT-TYPE map, so a raw value
++only clears when it is that type's OWN card spelling.
+ 
+ Explicitly OUT OF SCOPE by this cut (dropped entirely, not log-only):
+ `SendMessage` gating and all message-prose parsing; implementer-dispatch
+@@ -235,10 +237,36 @@ HARNESS_BUILTIN_TYPES = {"general-purpose", "Explore", "Plan", "claude", "status
+ # Verdict normalization — parse the JSON field, never substring-grep.
+ # --------------------------------------------------------------------------
+ 
+-# "_PASS_LIKE = exactly each card's PASS vocabulary" — "PASS" is every card
+-# except fix-verifier ("verified") and pressure-tester ("PROCEED"). Any
+-# other value defaults to BLOCK.
+-_PASS_LIKE = {"PASS", "verified", "PROCEED"}
++# esc-lead-gate-R7d: the PASS vocabulary is PER AGENT TYPE, never pooled —
++# a global set let an adversarial-audit row whose raw verdict text was
++# literally "verified" (fix-verifier's own spelling) or "PROCEED"
++# (pressure-tester's own spelling) also clear an adversarial-audit BLOCK,
++# independent of anything R3 checks. `_PASS_LIKE_BY_AGENT_TYPE` maps a TYPE
++# to the ONE literal string its own card spells as PASS; every type not
++# listed (adversarial-audit, citation-checker, discipline-test-auditor,
++# oracle, and any type outside STOP_MATCH_TYPES) defaults to "PASS" — the
++# closed-world membership check that decides whether a type is gated AT ALL
++# happens elsewhere, at dispatch time (GATED_TYPES/NEVER_GATED_TYPES), never
++# here. Confirmed against all seven STOP_MATCH_TYPES cards' own verdict
++# vocabularies and a census of every live verdict row: every real clearing
++# already uses its own card's spelling, so no clearing depended on the
++# pooled set.
++_PASS_LIKE_BY_AGENT_TYPE: dict[str, str] = {
++    "fix-verifier": "verified",
++    "acceptance-verifier": "verified",
++    "pressure-tester": "PROCEED",
++}
++_DEFAULT_PASS_WORD = "PASS"
++
++
++def _pass_word_for(agent_type: str) -> str:
++    """The ONE literal string `agent_type`'s own card spells as its
++    PASS-equivalent verdict. Every STOP_MATCH_TYPES card not in
++    `_PASS_LIKE_BY_AGENT_TYPE` (adversarial-audit, citation-checker,
++    discipline-test-auditor, oracle) spells it "PASS"; an unrecognized
++    agent_type also defaults to "PASS" — never a KeyError, since the
++    closed-world membership check belongs to `_decide_dispatch`, not here."""
++    return _PASS_LIKE_BY_AGENT_TYPE.get(agent_type, _DEFAULT_PASS_WORD)
+ _TEMPLATE_UNIT_BRANCH = "_branch_"
+ 
+ # The verdict is the LAST fenced ```json block — or, for one release, the
+@@ -405,9 +433,13 @@ def extract_verdict_json(last_assistant_message: str) -> tuple[dict | None, str
+     return None, "unparseable"
+ 
+ 
+-def normalize_verdict(data: dict | None) -> tuple[str, str | None]:
++def normalize_verdict(data: dict | None, agent_type: str) -> tuple[str, str | None]:
+     """Returns `(verdict, verdict_raw)`; `verdict` is one of "PASS" |
+-    "BLOCK" | "UNPARSEABLE"."""
++    "BLOCK" | "UNPARSEABLE". `agent_type` is the CALLER's own trusted value
++    (`handle_stop`'s SubagentStop payload field, or a stored row's own
++    `agent_type` via `_diagnose_row`) — never read out of `data` itself,
++    which is verifier-authored prose the same way every other verdict field
++    is (esc-lead-gate-R7d: PASS-like is PER CARD, never pooled)."""
+     if data is None:
+         return "UNPARSEABLE", None
+     raw = data.get("verdict")
+@@ -417,7 +449,7 @@ def normalize_verdict(data: dict | None) -> tuple[str, str | None]:
+         return "UNPARSEABLE", None
+     if not isinstance(raw, str):
+         return "BLOCK", repr(raw)
+-    if raw in _PASS_LIKE:
++    if raw == _pass_word_for(agent_type):
+         return "PASS", raw
+     return "BLOCK", raw
+ 
+@@ -1067,7 +1099,7 @@ def _diagnose_row(row: dict) -> str:
+     # reported as "unrecognized ... defaulted to BLOCK"; that label is for
+     # a raw value outside a card's own vocabulary, not the vocabulary's own
+     # BLOCK spelling normalizing to the BLOCK verdict by construction.
+-    if raw is not None and raw != "BLOCK" and raw not in _PASS_LIKE:
++    if raw is not None and raw != "BLOCK" and raw != _pass_word_for(row.get("agent_type") or ""):
+         return f" [unrecognized verdict value {raw!r} defaulted to BLOCK]"
+     if row.get("_corrupted"):
+         return " [state row corrupted — treated as BLOCK]"
+@@ -1345,7 +1377,7 @@ def handle_stop(payload: dict, sdir: Path) -> None:
+ 
+     data, invalid_reason = extract_verdict_json(last_msg)
+     fields = parse_verdict_fields(data)
+-    verdict, verdict_raw = normalize_verdict(data)
++    verdict, verdict_raw = normalize_verdict(data, agent_type)
+ 
+     # UNPARSEABLE rows are filed under the agent's SubagentStart binding,
+     # never under a shared "UNBOUND" bucket, unless no binding exists
+diff --git a/ci/scripts/check_lead_gate.py b/ci/scripts/check_lead_gate.py
+index 7595f4e..ee72098 100644
+--- a/ci/scripts/check_lead_gate.py
++++ b/ci/scripts/check_lead_gate.py
+@@ -67,7 +67,13 @@ Required fixtures (RED when the corresponding hook arm is removed):
+       row IS written, never silently dropped
+   V3  an unrecognized raw verdict value defaults to BLOCK and the deny
+       reason names the raw value
+-  V4/V5/V6  `_PASS_LIKE` pinned individually: "PASS", "verified", "PROCEED"
++  V4/V5/V6  the per-agent-type PASS vocabulary (esc-lead-gate-R7d) is pinned
++      individually: "PASS" (adversarial-audit), "verified" (fix-verifier),
++      "PROCEED" (pressure-tester) each clear THEIR OWN card's row; three
++      negatives pin the fix itself — adversarial-audit "verified",
++      adversarial-audit "PROCEED", and oracle "verified" must NOT clear,
++      because none is that card's own spelling (the pooled global set used
++      to let all three clear)
+   V7  a `</verdict>` (or a stray `}`) inside the verdict's own `notes`
+       STRING does not truncate/corrupt the region (round-2 finding 6)
+   V8  an UNPARSEABLE verdict is filed under the agent's SubagentStart
+@@ -891,6 +897,19 @@ def fixture_v4_v5_v6_pass_like_pinned() -> None:
+         msg = "```json\n" + json.dumps(v) + "\n```"
+         row = _stop_and_read(root, msg, agent_type=agent_type)
+         _assert(row["verdict"] == "PASS", f"V4-6[{raw}]", f"{raw!r} must normalize to PASS, got {row['verdict']!r}")
++    # esc-lead-gate-R7d: the vocabulary is PER AGENT TYPE, never pooled — a
++    # raw value that is PASS-like for ONE card must NOT clear a DIFFERENT
++    # card's row. All three reproduced true against the round-1/round-2
++    # pooled `_PASS_LIKE` set (KILL verdicts tasks/abe09018c16727106.output
++    # finding 7, tasks/a51ebcc1234dd552f.output premise "R6c").
++    for raw, agent_type in (("verified", "adversarial-audit"), ("PROCEED", "adversarial-audit"),
++                             ("verified", "oracle")):
++        root = _fresh_root()
++        v = {"kind": "verdict", "verdict": raw, "unit_branch": f"feat/neg-{raw}-{agent_type}", "findings": []}
++        msg = "```json\n" + json.dumps(v) + "\n```"
++        row = _stop_and_read(root, msg, agent_type=agent_type)
++        _assert(row["verdict"] == "BLOCK", f"V4-6neg[{agent_type}/{raw}]",
++                f"{raw!r} is not {agent_type}'s own PASS spelling and must NOT clear, got {row['verdict']!r}")
+ 
+ 
+ def fixture_v7_tag_inside_notes_string_does_not_corrupt() -> None:

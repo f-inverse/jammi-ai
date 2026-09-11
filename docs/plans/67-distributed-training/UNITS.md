@@ -116,7 +116,7 @@ per-step `$?`. Naming per README ruling 23.
   the row-group reader, with no blocking sort (RED at base).
 - **lane**: hermetic + cookbook. **depends_on**: U2a, U4a (the `world` argument). **size**: XL.
 
-## U3 — `FineTune` producer; migration 029; cache reuse (PR-B commit 5, concurrent with U2b)
+## U3 — `FineTune` producer; `model_materialization` migration; cache reuse (PR-B commit 5, concurrent with U2b)
 
 - **files_in_scope**: (db) `store/manifest.rs` (`ProducingDescriptor::FineTune`;
   `MaterializationEnv` kernel-profile), `catalog/{schema.rs, migrations.rs}` (029, nullable
@@ -181,25 +181,31 @@ per-step `$?`. Naming per README ruling 23.
   `FetchPartition(PartitionRequest) returns (stream ArrowIpc)`), `crates/jammi-wire/build.rs:22-33`,
   `crates/jammi-wire/src/{lib.rs, gang.rs}`, `crates/jammi-server/src/grpc/gang.rs` (handler on
   the **peer listener** — 68 DIST D7's routes built outside `assemble_grpc_chain`; the I-GANG
-  verification: `jobs` row by primary key, `status = 'running'`, `claimed_by`, live lease, tenant
-  derived from the row and pinned; `FetchPartition` belongs-to-job check; `JobSlot` try-lock;
-  attempt fence on `job_id`; #485 bounds), `crates/jammi-server/src/runtime.rs` (mount on the peer
+  verification through `get_job_for_rank`, `status = 'running'`, `claimed_by`, live lease, tenant
+  derived from the row and pinned; peer addresses resolved from `instances.peer_addr` by
+  instance id; `FetchPartition` belongs-to-job check; handler order fence-then-slot; #485
+  bounds), (db) `crates/jammi-db/src/catalog/jobs_repo.rs` (`get_job_for_rank(job_id)`: primary
+  key, no tenant predicate, never admin scope; `list_gang_members(kind)`), `crates/jammi-server/src/runtime.rs` (mount on the peer
   routes), `crates/jammi-server/tests/it/{api_freeze_baseline.txt (RPC + PACKAGE lines),
   api_freeze.rs (package count prose), tenant_isolation_oracle.rs (`GANG_LISTENER_ALLOWLIST`,
   unioned into `covered_on_wire` and the partition assertion; public-listener `UNIMPLEMENTED`
-  probe), gang_partition.rs, gang_authz.rs}`. (ai-core) `fine_tune/worker.rs` (`JobSlot` taken by
-  the claim loop before `claim_next`, `wt-C: worker.rs:346`). (db) `config/mod.rs` (`rank_timeout_secs`
+  probe), gang_partition.rs, gang_authz.rs}`. (ai-core) `fine_tune/worker.rs` (`JobSlot`: taken before
+  `claim_next` (`wt-C: worker.rs:346`), held across `run_claimed_job` (`:355`), released before
+  the idle sleep (`:363`)). (db) `config/mod.rs` (`rank_timeout_secs`
   if not already in U4a).
 - **invariants_to_preserve**: B5 (I-GANG written invariant; no double binder — never mounted under
   `TenantResolverLayer`), K2, B1 (no `stage`/`register` stems), B6, OPS D6 (no abort while a claim
   may be in flight — the slot is taken outside the transaction).
 - **acceptance**: (a) the streamed bytes of partition r equal the local read of partition r (RED
   at base); (b) `RunRank` for a job not running / not claimed by the named instance / lease
-  expired / wrong `FetchPartition` table is refused with a typed status (RED at base); (c) fence:
-  lesser-or-equal attempt refused, greater aborts the older (RED at base); (d) a peer whose slot
-  is busy refuses with `Unavailable` and the claim loop never claims while a rank runs (RED at
-  base); (e) `api_freeze` and `every_rpc_is_covered` green with the new lines; the public listener
-  answers `UNIMPLEMENTED` for `GangService/*` (invariant oracle).
+  expired / wrong `FetchPartition` table is refused with a typed status (RED at base); (c) fence
+  before slot: a greater attempt for the job whose stale runner holds the slot aborts it and
+  takes the slot; lesser-or-equal refused (RED at base); (d) a peer busy with its *own* claimed
+  job refuses with `Unavailable`; an idle peer accepts; the claim loop never claims while a rank
+  runs (RED at base); (e) `api_freeze` and `every_rpc_is_covered` green with the new lines; the
+  public listener answers `UNIMPLEMENTED` for `GangService/*`; `get_job_for_rank` is unreachable
+  from any public RPC and ignores any caller tenant (invariant oracles); (f) an assignment naming
+  an instance id that is not a fresh member is refused (RED at base).
 - **lane**: hermetic + server it-suite. **depends_on**: U4a, **68 DIST unit 1** (the
   `peer_bind` listener; if unmerged, its listener commit is carried verbatim as this unit's first
   commit, co-owned). **size**: L.
@@ -221,22 +227,26 @@ per-step `$?`. Naming per README ruling 23.
 ## U5b — Coordinator; `Peer` collective; membership; released-vs-failed; chaos (PR-C commit 4)
 
 - **files_in_scope** (ai-core): `fine_tune/collective/peer.rs`, `fine_tune/worker.rs` (coordinator
-  on the `JobWorker`: member resolution from `workers.kinds` × `instances.peer_addr` × freshness
-  (× `workers.devices` from U8b), id mint, dispatch, watchdog, `Released` → `release_job_lease`
-  vs error → `fail_job`, attempt abort), `tests/distributed/{main.rs, harness.rs (peer TOML with
+  on the `JobWorker`: members via `list_gang_members` (× `workers.devices` from U8b), id mint,
+  dispatch by instance id, watchdog, attempt abort with **no terminal write** — flip the hold's
+  `lost` flag so the run exits through the leave-for-reclaim arm (`wt-C: worker.rs:670-676`);
+  `Released` → `release_job_lease` first, then the same flag; a live same-named `building`
+  training-set row → `BackOff`), `tests/distributed/{main.rs, harness.rs (peer TOML with
   `peer_bind`/`peer_advertise`), gang_deterministic.rs, gang_chaos.rs, gang_forward.rs}`,
   `.github/workflows/distributed.yml` (test names). (wire-server) `grpc/gang.rs` peer-side rank
   runner and the drain hook that emits `Released`. (db) `catalog/jobs_repo.rs` (member listing,
   sorted in Rust).
 - **invariants_to_preserve**: K4 real (W=1 via the gang path == embedded bytes), B4, K2, B6,
   OPS D10 (a peer-tier rolling restart costs zero net attempts).
-- **acceptance**: (a) server it-suite: W=1 coordinator dispatching to itself → bytes identical to
-  the in-process trainer (RED at base); (b) distributed deterministic leg: 2 processes, W=2,
-  `Peer` → bytes identical to the single-process W=2 `Local` run (RED at base); (c) chaos:
-  SIGKILL a peer → `attempts+1`, completed by a new gang from the checkpoint, one model, no
-  orphan prefix; SIGKILL the coordinator → same via lease; split brain → older attempt aborted;
-  SIGTERM (drain) on a peer host → `Released`, `releases+1`, `attempts` unchanged net, job
-  completes (RED at base); (d) cluster leg: 2 pods × 2 GPUs, W=4, `Nccl` `from_rank` → digest
+- **acceptance**: (a) K4 real: 2 processes, W=2, `Peer` → bytes identical to the single-process
+  W=2 `Local` run (RED at base; rank 0 is always in-process, so W=1 never crosses the wire);
+  (b) the coordinator's abort lands no terminal write: after a rank failure the row is `running`
+  until reclaim requeues it, then `attempts+1` at the successor's claim (RED at base); (c) chaos:
+  SIGKILL a peer → requeued by reclaim within the lease window, completed by a new gang from the
+  checkpoint, one model, no orphan prefix; SIGKILL the coordinator → same via lease; split brain
+  → older attempt aborted; SIGTERM (drain) on a peer host → `Released`, `releases+1`, net
+  attempts unchanged, job completes; a crashed coordinator's live `building` training-set row →
+  successor backs off and reclaims after expiry (RED at base); (d) cluster leg: 2 pods × 2 GPUs, W=4, `Nccl` `from_rank` → digest
   pair + deltas against the pre-registered ε; artifact as PR-C commit 5; (e) two workers compute
   disjoint halves of a head-target feature table via `FetchPartition`, merged table equals the
   single-worker table (U6's operator; RED at base). Test targets: `distributed`; `gpu_capability`
@@ -261,11 +271,14 @@ per-step `$?`. Naming per README ruling 23.
   (`[ballista]` section, `deny_unknown_fields`, listener collision checks). (ai-core)
   `crates/jammi-ai/src/operator/gang_exec.rs` (single-partition operator whose `execute` runs the
   U5b coordinator). `tests/distributed/{main.rs, harness.rs (scheduler/executor TOML),
-  ballista_parity.rs}`; `.github/workflows/distributed.yml` matrix entries; `ci/scripts/
-  check_dep_direction.py` expectations (jammi-ballista sits between the engine and the server).
+  ballista_parity.rs}`; `.github/workflows/distributed.yml` matrix entries;
+  `ci/scripts/publish_crates.sh:40-50` (`jammi-ballista` inserted before `jammi-server` in the
+  topological publish list — a `v*` tag would otherwise half-publish). Shuffle stays Ballista's
+  local `work_dir` (no object-store shuffle in v1).
 - **invariants_to_preserve**: B4 (roles are config; no cargo feature; the library keeps the
   capability through the crate), B2 (dep direction), K4 (bytes through Ballista == bytes through
-  the peer path), B6, K6 (publishable, lockstep), B1 (pre-swept names, README r45).
+  the peer path), B6, K6 (publishable, lockstep, in `publish_crates.sh`'s ordered list), B1
+  (pre-swept names, README r45).
 - **acceptance**: hermetic: codec round-trip for every operator (RED at base); config: `[ballista]`
   parses, unset = no roles, `scheduler_bind == peer_bind/flight_listen/health_listen` refused (RED
   at base). Distributed (three processes, one binary): (a) an embedding job via
@@ -278,8 +291,10 @@ per-step `$?`. Naming per README ruling 23.
 
 - **files_in_scope**: (wire-server) `crates/jammi-ballista/src/{cluster.rs (`CatalogClusterState`,
   `CatalogJobState` over jammi's catalog), placement.rs (`DevicePlacement`: executor id ↔
-  `workers.devices`; a GPU stage binds only to a device-bearing executor; installed through
-  `bind_schedulable_tasks` / `TaskDistributionPolicy::Custom`)}`. (db) `catalog/{schema.rs,
+  `workers.devices`; a task is GPU-bound iff its stage plan — read from `active_jobs`' execution
+  graph and decoded through `JammiCodec` — contains a `GangExec` or an `InferenceExec` whose
+  descriptor names a CUDA device; such a task binds only to a device-bearing executor; installed
+  through `bind_schedulable_tasks` / `TaskDistributionPolicy::Custom`)}`. (db) `catalog/{schema.rs,
   migrations.rs}` (`ballista_state`: executor registrations/heartbeats, job graphs — tables owned
   by jammi-ballista, not the `jobs` table, not a lease class; number at rebase), `catalog/
   ballista_repo.rs` (new). Tests in `tests/distributed/ballista_state.rs`.

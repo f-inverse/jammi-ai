@@ -137,8 +137,8 @@ fresh, and from U8b `workers.devices` sufficient), mints the NCCL id when the co
 `nccl`, and sends each member:
 
 ```
-RankAssignment { job_id, tenant, attempt, coordinator_worker_id, rank, world_size,
-                 peers[rank -> address], collective, nccl_id?, training_set_table_id,
+RankAssignment { job_id, attempt, coordinator_instance_id, rank, world_size,
+                 peers[rank -> instance_id], collective, nccl_id?, training_set_table_id,
                  base_model_id, spec, partition_rule, scaler?, resume_from_checkpoint: bool }
 ```
 
@@ -146,17 +146,27 @@ No URL travels on the wire: the peer resolves the table and the base model by id
 tenant-scoped catalog and derives storage URLs itself.
 
 **A peer is a fleet worker with a busy slot.** `RunRank` takes the worker's single job slot
-(`JobSlot`, a mutex the claim loop also takes *before* `claim_next`, so a peer never claims while
-it runs a rank and never aborts a claim transaction — 68 OPS D6's rule); a busy peer refuses with
-a typed `Unavailable` and the coordinator picks another member or fails the attempt. No new
-worker state.
+(`JobSlot`): the claim loop takes it **before** `claim_next`, **holds it across** the inline
+`run_claimed_job` (`wt-C: worker.rs:355`) and **releases it before** the idle sleep (`:363`), so a
+peer never claims while it runs a rank, never aborts a claim transaction (68 OPS D6), never
+receives a rank while training its own job, and is reachable whenever idle. Handler order: same
+`job_id` with a lesser attempt → abort that runner and take the slot; lesser-or-equal → refuse;
+otherwise try-lock; busy → typed `Unavailable`. No new worker state. Membership is read through
+`list_gang_members(kind)` (a new joined listing over `workers ⋈ instances`: `kinds` split on `,`
+and compared as whole tokens in Rust; `peer_addr` set; `last_seen_at` within `[lease]
+duration_secs`; from U8b `devices` sufficient).
 
 **Authorization (invariant I-GANG: the job row is the capability).** The service is mounted on
 the internal `[server] peer_bind` listener (68 DIST D7), never on the tenant-scoped public chain.
-The peer reads the `jobs` row by primary key with no caller tenant, verifies `status = 'running'`,
-`claimed_by = coordinator_instance_id` and a live lease, then **derives the tenant from the row**
-(`jobs.tenant_id`) and pins every subsequent catalog read to it; no URL and no tenant is trusted
-from the wire. `FetchPartition` takes a result-table id and partition index and verifies the table
+The peer reads the `jobs` row through a new db-owned verb `get_job_for_rank(job_id)` — by
+primary key, no tenant predicate, never admin scope (`get_job` is tenant-filtered, `wt-C:
+jobs_repo.rs:580-596`; D7 forbids `with_admin_scope` on the peer path), reachable only from the
+gang handler — verifies `status = 'running'`, `claimed_by = coordinator_instance_id` and a live
+lease, then **derives the tenant from the row** (`jobs.tenant_id`) and pins every subsequent
+catalog read to it. Nothing dialable travels on the wire: the assignment carries
+`peers[rank → instance_id]`; each peer resolves addresses through `instances.peer_addr` and
+refuses a rank whose instance is not a fresh member (the NCCL id, an opaque secret, is the only
+out-of-band value). `FetchPartition` takes a result-table id and partition index and verifies the table
 belongs to the job's training set (the analogue of D7's segment-belongs-to-table check). The
 RPCs sit in their own `GANG_LISTENER_ALLOWLIST` bucket in `tenant_isolation_oracle.rs` (text:
 "served only on peer_bind; tenant derived from the verified job row; deliberately not
@@ -218,13 +228,20 @@ abort, early stopping and epoch exit are decided by `all_reduce_max_flags` at th
 boundary on every rank (validation loss is computed by rank 0 and the stop flag broadcast).
 No rank can reach a collective a different number of times than its peers.
 
-**Failure and release.** Any `RankEvent::error`, stream drop, or rank silent for
-`rank_timeout_secs` fails the attempt: the coordinator cancels every rank (stream close + NCCL
-communicator abort), aborts the attempt (no publish, no finalize), and the job returns to
-`queued` with `attempts + 1` through `fail_job`. A rank ended by a DRAIN/RELEASE on its host
-(68 OPS) sends `RankEvent::Released`; the coordinator then aborts the attempt through OPS's
-`release_job_lease` (`releases + 1`), so a rolling restart of the peer tier costs zero net
-attempts. Coordinator death expires the lease. The per-attempt watchdog is the lease keeper's
+**Failure and release.** `fail_job` is terminal (`wt-C: jobs_repo.rs:1057-1100`); the fleet's
+only requeue path is the leave-`running`-for-reclaim arm (`wt-C: worker.rs:670-676`) → reclaim
+arm 1a (`jobs_repo.rs:1380-1407`) → `attempts + 1` at the successor's claim (`:709`). So any
+`RankEvent::error`, stream drop, or rank silent for `rank_timeout_secs` fails the attempt like
+this: the coordinator cancels every rank (stream close + NCCL communicator abort), aborts the
+attempt (no publish, no finalize), and flips its hold's `lost` flag (`cancel` *is*
+`hold.lost_flag()`, `wt-C: worker.rs:531-547`) so its own run exits through that arm with no
+terminal write; reclaim requeues the job within the remaining lease window (≤ `[lease]
+duration_secs`). A rank ended by a DRAIN/RELEASE on its host (68 OPS) sends
+`RankEvent::Released`; the coordinator first calls OPS's `release_job_lease` (`releases + 1`,
+lease NULL; the CAS admits the holder) and then flips the same flag, so a rolling restart of the
+peer tier costs zero net attempts (OPS D10). Coordinator death expires the lease. A live
+same-named `building` training-set row left by a crashed coordinator is met with the `BackOff`
+disposition and reclaimed through `claim_expired_building_table` after expiry (README r31). The per-attempt watchdog is the lease keeper's
 shape — bounded by the attempt it belongs to, retiring only that attempt — and is allowed under
 the actuator rule (`recompute.rs:29-35`; 68 DIST D5).
 Either way the next attempt resumes from the job-level resume checkpoint
@@ -253,7 +270,7 @@ single-process table (K4 shape).
 | Oracle | Kind | Where |
 |---|---|---|
 | **Refactor parity**: W=1 with the new loader, scaler-over-train-prefix and `Noop` produces adapter bytes identical to the base commit on every cookbook fine-tune fixture (`cookbook/book/artifacts/finetune_*/checksums.json`) | byte | cookbook 6.5; hermetic |
-| **K4 (real)**: W=1 through the gang path (coordinator dispatching to itself) equals the in-process trainer | byte | server it-suite |
+| **K4 (real)**: W=2 over the wire (`Peer`, two processes) equals W=2 in-process (`Local`), byte-for-byte; rank 0 is always in-process, so W=1 never crosses the wire and is covered by the `Noop` parity row | byte | distributed lane |
 | **Equal-topology reproducibility**: two runs, same W and plan → identical bytes; also across a resume (kill at epoch k, resume, compare to uninterrupted) | byte on `Local`/`Peer` (hermetic); on GPU legs the digest pair is recorded (never a failure until S5 promotes) and the per-step loss delta is compared to an ε pre-registered per leg before the first gating run (S5, or the max delta over ≥ 3 same-seed baseline runs on that box) | hermetic; gpu-gang |
 | **W-invariance**: W × B versus W=1 × W·B, identical loss per step within ε, at `lora_dropout = 0` and a pinned bucket rung; ε measured on the leg that gates (CPU ε never inherited by GPU) | tolerance | hermetic; gpu-gang |
 | **Gather exactness**: for CoSENT, AnglE, MNRL, **classification** and **quantile regression**, the W=2 global loss and the summed adapter gradient at step t equal the W=1 loss and gradient on the same rows bit-for-bit on CPU, on a fixture whose `train_count` is not a multiple of W·B (a zero-row rank occurs) | byte | hermetic |
@@ -297,9 +314,9 @@ operators and hosts the model cache and catalog) — it sits between `jammi-ai`/
 | Gap 68 named | Seam | What jammi installs |
 |---|---|---|
 | operators cross the wire | `SchedulerConfig.override_{logical,physical}_codec`, `ExecutorProcessConfig.override_*_codec` | `JammiCodec`: `InferenceExec`, `AnnSearchExec`, `AsofJoinExec`, `GangExec` ↔ the U5 descriptor messages |
-| no executor-side state across plans | `ExecutorProcessConfig.override_execution_engine: Option<Arc<dyn ExecutionEngine>>`; `create_query_stage_exec(job, stage, task, partitions, plan, work_dir, config)` rewrites `ShuffleReaderExec` nodes and wraps the writer | `JammiExecutionEngine`: model cache held across plans, device pinned to `[gpu] devices`, shuffle writer/reader chosen here (object-store shuffle is at this seam) |
+| no executor-side state across plans | `ExecutorProcessConfig.override_execution_engine: Option<Arc<dyn ExecutionEngine>>`; `create_query_stage_exec(job, stage, task, partitions, plan, work_dir, config)` rewrites `ShuffleReaderExec` nodes and wraps the writer | `JammiExecutionEngine`: model cache held across plans, device pinned to `[gpu] devices`. Shuffle stays Ballista's local `work_dir` in v1; this seam is where an object-store shuffle would go once a spike proves the cross-executor read (D2's condition 3 stands) |
 | cluster state in memory only | `ClusterState` + `JobState` traits; `BallistaCluster::new(Arc<dyn ClusterState>, Arc<dyn JobState>)`; `start_server(cluster, addr, config)` | U8a: Ballista's in-memory state. U8b: `CatalogClusterState`/`CatalogJobState` over jammi's catalog (tables from the `ballista_state` migration) — persistent, multi-scheduler (Spice's HA at the seam) |
-| no accelerator dimension | `ClusterState::bind_schedulable_tasks(distribution, active_jobs, executors) -> Vec<BoundTask>`; `TaskDistributionPolicy::Custom(Arc<dyn DistributionPolicy>)` | `DevicePlacement`: executor id ↔ `workers.devices`; a GPU stage binds only to a device-bearing executor. The `ExecutorSpecification { vcores }` proto has no attribute slot: the accelerator dimension is the one upstream PR 67 owes |
+| no accelerator dimension | `ClusterState::bind_schedulable_tasks(distribution, active_jobs, executors) -> Vec<BoundTask>`; `TaskDistributionPolicy::Custom(Arc<dyn DistributionPolicy>)` | `DevicePlacement`: executor id ↔ `workers.devices`; a task is GPU-bound iff its stage plan (from `active_jobs`' execution graph, decoded through `JammiCodec`) contains a `GangExec` or an `InferenceExec` whose descriptor names a CUDA device; such a task binds only to a device-bearing executor. The `ExecutorSpecification { vcores }` proto has no attribute slot: the accelerator dimension is the one upstream PR 67 owes |
 | task retry rejoins a dead gang | `SchedulerConfig.task_max_failures`, `stage_max_failures` (global) | both 0: retries are the jobs table's |
 | scheduler control loop | `expire_dead_executors` starts in `init()` | membership liveness, the class of `reclaim_expired_jobs`/`prune_instances`; with retries off it never makes consumer work runnable |
 | push launching, transport | `TaskLauncher`, `override_create_grpc_client_endpoint`, `use_tls` | as needed; not in v1 |
@@ -312,6 +329,11 @@ process; unset = single node. Same class as `peer_bind` and `health_listen`.
 coordinator; `DevicePlacement` puts it on a device-bearing executor; the ranks are fleet members
 reached over `peer_bind` as in U5b. Bytes equal U5b's (K4 shape). A gang stage kind in Ballista
 stays a future upstream option, not a dependency.
+
+**Publishing.** `ci/scripts/publish_crates.sh:40-50` enumerates publishable crates by name in
+topological order; `jammi-ballista` is inserted before `jammi-server` in the same commit (a
+`v*` tag would otherwise half-publish). `check_dep_direction.py` encodes no layering and is
+not touched.
 
 **Oracles.** Codec round-trip for every operator; an embedding job via `submit_physical_plan`
 across two executors byte-identical to U6's peer path; a W=2 gang job through the scheduler

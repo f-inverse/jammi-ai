@@ -59,23 +59,39 @@ those still in force are restated here in their v4 form. Principle in parenthese
     `graph_fine_tune`; `context_predictor` is refused at `world_size > 1` (K2, typed, at submit).
 27. **A peer is a fleet worker with a busy slot.** A peer is a `JobWorker` process whose
     `[worker] kinds` include the job's kind and whose `peer_bind` is set. `RunRank` takes the
-    worker's single job slot (a `JobSlot` mutex the claim loop also takes *before* `claim_next`,
-    so a peer never claims while it runs a rank and never aborts a claim transaction — OPS D6);
-    a busy peer refuses `RunRank` with a typed `Unavailable` and the coordinator picks another
-    member or fails the attempt. No new worker state. (B1: no governance verb; OPS D6.)
+    worker's single job slot: a `JobSlot` mutex the claim loop takes **before** `claim_next`,
+    **holds across** the inline `run_claimed_job` (`worker.rs:355`), and **releases before** the
+    idle sleep (`:363`) — so a peer never claims while it runs a rank, never aborts a claim
+    transaction (OPS D6), never receives a rank while training its own job, and is reachable
+    whenever idle. Handler order: same `job_id` with a lesser attempt → abort that runner and
+    take the slot; lesser-or-equal attempt → refuse; otherwise try-lock; busy → typed
+    `Unavailable`, and the coordinator picks another member or fails the attempt. No new worker
+    state. (B1; OPS D6.)
 28. **Membership is 68's.** Peers are resolved from the catalog: `workers.kinds` ∋ kind,
-    `instances.peer_addr` set (DIST unit 2's column), `last_seen_at` fresh, and — from U8b on —
-    `workers.devices` sufficient. No static peer list. (One membership mechanism; DIST D9.)
+    `instances.peer_addr` set (DIST unit 2's column), `last_seen_at` within `[lease]
+    duration_secs` (DIST unit 2's ring window), and — from U8b on — `workers.devices`
+    sufficient — through a new joined listing `list_gang_members(kind)` that splits
+    `workers.kinds` on `,` and compares whole tokens in Rust (`fine_tune` must not match
+    `graph_fine_tune`). No static peer list. Consequence recorded in 68's reconciliation: a
+    replica that sets `peer_advertise` to be gang-reachable also joins DIST's retrieval ring;
+    capability-scoping the ring is a 68 follow-on. (One membership mechanism; DIST D9.)
 29. **Knobs.** `[gpu] devices = [..]`; `[worker] world_size = 1`, `rank_timeout_secs = 120`,
     `collective = "auto"`; per-job `world_size` on `TrainingCommon` (`#[serde(default)]` = 1).
     `[training]` no longer exists on the branch.
 30. **Migrations.** 67 appends exactly three, numbered at rebase after 68's: `model_materialization`
     (U3), `workers_devices` (U4a: `workers.devices TEXT` JSON list of `{kind, ordinal, memory}`),
-    `ballista_state` (U8b). 68's five units contend for 031; renumber-on-second-merge (K5).
+    `ballista_state` (U8b). Four 68 units (OPS, GRAPH, DELTA, DIST unit 2) contend for 031;
+    renumber-on-second-merge (K5). No plan text names a number.
 31. **The training set is not this attempt's partial result.** U2a materializes it with
     `job_attempt: None`: it is a shared producer output reused by definition hash, not an
     attempt-owned table, so the `jobs.partial_result` attempt≥2 defect (68 OPS C1) is never
-    reached. The model artifact remains the job's result through `finish_job_with_model`.
+    reached. It is still lease-guarded (`writer_id`/`lease_expires_at` are independent of the
+    jobs CAS, `result_repo.rs:99-130`) but outside OPS's linked release sweep, so a crashed or
+    released coordinator leaves a live `building` row: the successor (or a second job over the
+    same training set) that finds a live same-named `building` row **backs off** — returns the
+    `BackOff` disposition (`jobs.rs:248-261`), leaving the job `running` for the next tick — and
+    reclaims it through `claim_expired_building_table` (`store/mod.rs:1443-1470`) once the
+    lease expires. The model artifact remains the job's result through `finish_job_with_model`.
 32. **Row order from the catalog is never trusted.** No 67 query consumes `RETURNING` order;
     every listing sorts in Rust (68 cross-cutting fact).
 
@@ -100,11 +116,18 @@ those still in force are restated here in their v4 form. Principle in parenthese
 
 **Operability (68 OPS)**
 
-36. **A released rank is a release, not a failure.** DRAIN/RELEASE on a peer host ends the rank
-    with `RankEvent::Released`; the coordinator aborts the attempt and requeues through OPS's
-    `release_job_lease` (`releases + 1`) instead of `fail_job`, so a rolling restart of the peer
-    tier costs zero net attempts (OPS D10). Any other rank end is a failure (`attempts + 1`).
-    U5b depends on OPS having merged.
+36. **An aborted attempt lands no terminal write.** `fail_job` is terminal (`jobs_repo.rs:
+    1057-1100`: `status = 'failed'`, no attempt bump); the only requeue path on the fleet is the
+    leave-`running`-for-reclaim arm (`worker.rs:670-676`) → reclaim arm 1a → `attempts + 1` at
+    the successor's claim. So on any rank failure the coordinator cancels every rank, aborts the
+    attempt (no publish, no finalize), flips its hold's `lost` flag (the cancel flag *is*
+    `hold.lost_flag()`, `worker.rs:531-547`) so its own run exits through that arm, and the job
+    is requeued by reclaim within the remaining lease window (≤ `[lease] duration_secs`, 30 s
+    default) — no new verb. **A released rank is a release, not a failure**: DRAIN/RELEASE on a
+    peer host ends the rank with `RankEvent::Released`; the coordinator first calls OPS's
+    `release_job_lease` (`releases + 1`, lease NULL — the CAS admits the holder), then flips the
+    same flag; the keeper's `lease_present` guard would flip it within one heartbeat anyway. A
+    peer-tier rolling restart costs zero net attempts (OPS D10). U5b depends on OPS.
 37. **The watchdog is allowed under the actuator rule.** It is per attempt, bounded by the
     attempt's lifetime, created by the claimant for the job it holds, and only retires that
     attempt (requeue is the pre-existing reclaim semantics) — the lease keeper's shape, not a
@@ -135,15 +158,22 @@ those still in force are restated here in their v4 form. Principle in parenthese
 42. **Executor liveness is membership, not an engine control loop.** `expire_dead_executors`
     (started unconditionally in `SchedulerServer::init`) sweeps Ballista executor heartbeats —
     the same class as `reclaim_expired_jobs` and `prune_instances` the fleet already runs each
-    tick. With retries off (r40) it never makes consumer work runnable. This disposes 68 DIST
-    D2's third ground for jammi's compute plane; DIST's decision for the data plane is untouched.
+    tick. With retries off (r40) it never makes consumer work runnable. This disposes the
+    control-loop ground of 68 DIST D2 for jammi's compute plane (D2's numbered future-option
+    conditions are the accelerator dimension, pluggable cluster storage and object-store
+    shuffle); DIST's decision for the data plane is untouched.
 43. **The seams and the one true gap.** Codecs (`override_{logical,physical}_codec`); the
-    `ExecutionEngine` (`override_execution_engine`; rewrites `ShuffleReaderExec` and wraps the
-    writer, so object-store shuffle is at the seam); `BallistaCluster::new(Arc<dyn ClusterState>,
-    Arc<dyn JobState>)` + `start_server(cluster, …)` (persistent, multi-scheduler state at the
-    seam — Spice's HA without the fork); `TaskDistributionPolicy::Custom`; `TaskLauncher`. The
-    accelerator dimension has no seam (`ExecutorSpecification { vcores }`); jammi carries it
-    out of band in `workers.devices`, and the upstream PR is the only one 67 owes.
+    `ExecutionEngine` (`override_execution_engine`; receives each stage's plan, rewrites
+    `ShuffleReaderExec` nodes and wraps the writer — the seam an object-store shuffle would use,
+    **not adopted in v1**: shuffle stays Ballista's local `work_dir`, and D2's object-store-shuffle
+    condition stands until a spike proves the cross-executor read); `BallistaCluster::new(Arc<dyn
+    ClusterState>, Arc<dyn JobState>)` + `start_server(cluster, …)` (persistent, multi-scheduler
+    state at the seam — Spice's HA without the fork); `TaskDistributionPolicy::Custom`;
+    `TaskLauncher`. `DevicePlacement` learns that a task is GPU-bound from the stage's physical
+    plan in `active_jobs`' execution graph, decoded through `JammiCodec` (a `GangExec` or an
+    `InferenceExec` whose descriptor names a CUDA device); S6 proves that read. The accelerator
+    dimension has no seam (`ExecutorSpecification { vcores }`); jammi carries it out of band in
+    `workers.devices`, and the upstream PR is the only one 67 owes.
 44. **Device pinning does not move bytes.** The executor process runs on its configured
     `[gpu] devices`; device *kind* is already in `MaterializationEnv`; the ordinal is not
     output-affecting; the shuffle writer never reorders a partition-ordered sink. K4 and K7 hold
@@ -200,7 +230,9 @@ create-cluster probe — spends money, human-approved. **S5** (→ GPU byte orac
 bit-reproducibility pin. **S6** (→ U8a/U8b; supersedes S2) a scratch crate on Ballista 54.1 with
 `override_execution_engine`, a custom `ClusterState`/`JobState` passed to `start_server`, and the
 codec, running a custom `ExecutionPlan` on one scheduler + two executors; confirm
-`task_max_failures = 0` disables retry.
+`task_max_failures = 0` disables retry, that `expire_dead_executors` only removes executors, and
+that a custom `bind_schedulable_tasks` can read the stage plan from `active_jobs` to decide
+placement.
 
 ## Hand-off: how a fresh lead kicks this off
 

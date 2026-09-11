@@ -80,6 +80,12 @@ pub enum ServerError {
     AddrParse(#[from] std::net::AddrParseError),
     #[error("{0}")]
     AuditMasterKey(String),
+    /// A `[server] preload_models` entry could not be loaded at startup —
+    /// the model failed to load, a bare id has no `models` row to take its
+    /// task from, or the task could not be resolved. The server exits
+    /// non-zero instead of serving.
+    #[error("preload_models: `{id}`: {reason}")]
+    Preload { id: String, reason: String },
 }
 
 /// Fail-closed startup check for the audit signing key.
@@ -222,6 +228,11 @@ pub trait ReadinessCheck: Send + Sync {
 pub struct ReadinessProbe {
     inner: Arc<dyn ReadinessCheck>,
     draining: std::sync::atomic::AtomicBool,
+    /// Warm-before-ready: `false` until every `[server] preload_models`
+    /// entry is cached (`/readyz` 503 `"preloading i/n"` meanwhile).
+    warm: std::sync::atomic::AtomicBool,
+    preloaded: std::sync::atomic::AtomicUsize,
+    preload_total: std::sync::atomic::AtomicUsize,
 }
 
 impl ReadinessProbe {
@@ -229,7 +240,35 @@ impl ReadinessProbe {
         Self {
             inner,
             draining: std::sync::atomic::AtomicBool::new(false),
+            warm: std::sync::atomic::AtomicBool::new(true),
+            preloaded: std::sync::atomic::AtomicUsize::new(0),
+            preload_total: std::sync::atomic::AtomicUsize::new(0),
         }
+    }
+
+    /// Enter the preloading phase: `/readyz` reports 503 `"preloading 0/n"`
+    /// until [`Self::set_warm`].
+    pub fn begin_preload(&self, total: usize) {
+        use std::sync::atomic::Ordering;
+        self.preload_total.store(total, Ordering::SeqCst);
+        self.preloaded.store(0, Ordering::SeqCst);
+        self.warm.store(false, Ordering::SeqCst);
+    }
+
+    /// One more entry cached.
+    pub fn note_preloaded(&self) {
+        self.preloaded
+            .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+    }
+
+    /// Every entry cached: `/readyz` may report ready.
+    pub fn set_warm(&self) {
+        self.warm.store(true, std::sync::atomic::Ordering::SeqCst);
+    }
+
+    /// Whether the preload phase has completed (or never existed).
+    pub fn is_warm(&self) -> bool {
+        self.warm.load(std::sync::atomic::Ordering::SeqCst)
     }
 
     /// `/readyz` reports 503 `"draining"` from now on — set by the DRAIN and
@@ -245,8 +284,16 @@ impl ReadinessProbe {
     }
 
     pub async fn check(&self) -> Result<(), String> {
+        use std::sync::atomic::Ordering;
         if self.is_draining() {
             return Err("draining".to_string());
+        }
+        if !self.is_warm() {
+            return Err(format!(
+                "preloading {}/{}",
+                self.preloaded.load(Ordering::SeqCst),
+                self.preload_total.load(Ordering::SeqCst)
+            ));
         }
         self.inner.check().await
     }
@@ -425,6 +472,14 @@ impl OssServer {
         // DataFusion context — the Flight SQL surface needs it. It already returns
         // an `Arc<InferenceSession>`.
         let session = InferenceSession::open(config).await?;
+        // Warm-before-ready: with models to preload, the claim loop must not
+        // claim before they are cached — close the session's worker gate
+        // before the worker is spawned at bind; `serve_with_signals` opens
+        // it once warm. An empty list leaves the gate open (existing
+        // deployments unchanged).
+        if !session.inner_config().server.preload_models.is_empty() {
+            session.close_worker_gate();
+        }
         let session_store = SessionStore::new();
         let metrics = Arc::new(MetricsRegistry::new()?);
         // Every process has a keeper: `jammi_lease_heartbeat_age_seconds` is
@@ -724,6 +779,54 @@ impl BoundServer {
                 .await
                 .map_err(ServerError::from)
         });
+
+        // Warm-before-ready: preload every listed model inline, `/readyz`
+        // 503 "preloading i/n" meanwhile and the claim loop parked at its
+        // gate (`workers.state = warming`), raced against both signals. A
+        // signal aborts the preload and the server never serves; a preload
+        // error is a startup error. On both exits the worker is stopped and
+        // joined (its row deleted) BEFORE the session closes.
+        let entries = session.inner_config().server.preload_models.clone();
+        if !entries.is_empty() {
+            readiness.begin_preload(entries.len());
+            let preload = preload_models(&session, &readiness, &entries);
+            let mut drain_wait = drain_rx.clone();
+            let mut release_wait = release_rx.clone();
+            let outcome = tokio::select! {
+                result = preload => Some(result),
+                _ = drain_wait.wait_for(|v| *v) => None,
+                _ = release_wait.wait_for(|v| *v) => None,
+            };
+            let early: Option<Result<ShutdownOutcome, ServerError>> = match outcome {
+                Some(Ok(())) => None,
+                Some(Err(e)) => Some(Err(e)),
+                None => Some(Ok(if *release_rx.borrow() {
+                    ShutdownOutcome::Released
+                } else {
+                    ShutdownOutcome::Drained {
+                        worker_joined: worker.is_some(),
+                    }
+                })),
+            };
+            if let Some(early) = early {
+                readiness.begin_drain();
+                if let Some(w) = worker.as_ref() {
+                    // The gate is closed, so the loop returns without a
+                    // claim; the join orders the row's delete after the
+                    // task's own upsert.
+                    if let Err(e) = w.stop_and_join().await {
+                        tracing::error!(error = %e, "preload exit: the worker join failed");
+                    }
+                }
+                let _ = health_stop_tx.send(());
+                let _ = health_task.await;
+                session.close().await;
+                crate::telemetry::flush_otlp();
+                return early;
+            }
+        }
+        readiness.set_warm();
+        session.open_worker_gate();
 
         enum Arm {
             Drained {
@@ -1613,6 +1716,51 @@ pub async fn serve_grpc_chain(
     shutdown: impl Future<Output = ()> + Send + 'static,
 ) -> Result<(), ServerError> {
     assemble_grpc_chain(chain)?.serve(shutdown).await
+}
+
+/// Preload every `[server] preload_models` entry into the session's model
+/// cache, in order: `ModelSource::parse(id)`; the task is the entry's
+/// explicit one, else the catalog's `models` row for the id, else a typed
+/// [`ServerError::Preload`] ("no models row; give { id, task }"); a load
+/// failure is the same typed error. Each cached entry advances `/readyz`'s
+/// "preloading i/n".
+async fn preload_models(
+    session: &Arc<InferenceSession>,
+    readiness: &ReadinessProbe,
+    entries: &[jammi_db::config::PreloadEntry],
+) -> Result<(), ServerError> {
+    for entry in entries {
+        let source = jammi_ai::model::ModelSource::parse(&entry.id);
+        let task = match entry.task {
+            Some(task) => task,
+            None => match session.catalog().get_model(&entry.id).await {
+                Ok(Some(record)) => record.task,
+                Ok(None) => {
+                    return Err(ServerError::Preload {
+                        id: entry.id.clone(),
+                        reason: "no models row; give { id, task }".to_string(),
+                    })
+                }
+                Err(e) => {
+                    return Err(ServerError::Preload {
+                        id: entry.id.clone(),
+                        reason: format!("models row lookup failed: {e}"),
+                    })
+                }
+            },
+        };
+        tracing::info!(model = %entry.id, ?task, "preloading model");
+        session
+            .model_cache()
+            .preload(&source, task, None)
+            .await
+            .map_err(|e| ServerError::Preload {
+                id: entry.id.clone(),
+                reason: e.to_string(),
+            })?;
+        readiness.note_preloaded();
+    }
+    Ok(())
 }
 
 /// The one task that owns both OS signal streams for the process's

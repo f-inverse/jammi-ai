@@ -6,6 +6,16 @@ workspace ships every publishable crate at the same
 
 ## [Unreleased]
 
+### BREAKING
+- **`[server] preload_models` is now honoured (#482).** It was documented and
+  dormant; a config that already lists it flips from starting to exiting
+  non-zero if a listed model cannot load, a bare id has no `models` row (its
+  task is resolved from that row at the startup edge), or a task token is
+  unknown. Entries are a bare id or `{ id, task }`
+  (`jammi_db::config::PreloadEntry`); `/readyz` reports 503 "preloading i/n"
+  and the claim loop waits at the session's worker gate (`workers.state =
+  warming`) until every entry is cached.
+
 ### Added
 - **Two-mode shutdown — SIGTERM = DRAIN, SIGINT = RELEASE — on the server,
   the Rust library and Python (#482).** A DRAIN finishes the in-flight job

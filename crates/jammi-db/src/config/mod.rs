@@ -1252,8 +1252,15 @@ pub struct ServerConfig {
     pub health_listen: String,
     /// Arrow Flight listen address. Default: `"0.0.0.0:8081"`.
     pub flight_listen: String,
-    /// Model IDs to preload into memory at server startup.
-    pub preload_models: Vec<String>,
+    /// Models to load into the cache at server startup, BEFORE `/readyz`
+    /// reports ready and before this process's claim loop claims anything
+    /// (warm-before-ready). Each entry is a bare model id string, whose
+    /// task is resolved from the catalog's `models` row at the server's
+    /// startup edge, or a `{ id, task }` table naming the task explicitly
+    /// (a `local:` path has no row). A listed model that cannot load, a
+    /// bare id with no `models` row, or an unknown task token is a startup
+    /// error: the server exits non-zero instead of serving. Default: `[]`.
+    pub preload_models: Vec<PreloadEntry>,
     /// Optional gRPC service tiers this deployment mounts, beyond the always-on
     /// core tier. Tokens are `"event"`, `"eval"` (the `jammi-server`
     /// service-tier mechanism owns their meaning and validation; this layer
@@ -1520,6 +1527,92 @@ impl LimitsConfig {
             ));
         }
         Ok(())
+    }
+}
+
+/// One `[server] preload_models` entry: `"id"` (task from the `models`
+/// row) or `{ id = "…", task = "text_embedding" }` (explicit task —
+/// required for a `local:` path, which has no row). Deserialized from either
+/// shape by hand so the layer's typed-error contract holds under
+/// `deny_unknown_fields`: an unknown key or task token is a load-time
+/// `JammiError::Config` naming it, never a silent default.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PreloadEntry {
+    /// The model id (`local:<path>`, an HF repo id, or a catalog model name).
+    pub id: String,
+    /// The task to load under; `None` = resolve from the `models` row.
+    pub task: Option<crate::model_task::ModelTask>,
+}
+
+impl<'de> Deserialize<'de> for PreloadEntry {
+    fn deserialize<D: Deserializer<'de>>(deserializer: D) -> std::result::Result<Self, D::Error> {
+        struct PreloadEntryVisitor;
+
+        impl<'de> serde::de::Visitor<'de> for PreloadEntryVisitor {
+            type Value = PreloadEntry;
+
+            fn expecting(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+                f.write_str("a model id string or { id, task }")
+            }
+
+            fn visit_str<E: serde::de::Error>(
+                self,
+                v: &str,
+            ) -> std::result::Result<PreloadEntry, E> {
+                if v.trim().is_empty() {
+                    return Err(E::custom("preload_models: a model id must not be empty"));
+                }
+                Ok(PreloadEntry {
+                    id: v.to_string(),
+                    task: None,
+                })
+            }
+
+            fn visit_map<M: serde::de::MapAccess<'de>>(
+                self,
+                mut map: M,
+            ) -> std::result::Result<PreloadEntry, M::Error> {
+                let mut id: Option<String> = None;
+                let mut task: Option<crate::model_task::ModelTask> = None;
+                while let Some(key) = map.next_key::<String>()? {
+                    match key.as_str() {
+                        "id" => {
+                            if id.is_some() {
+                                return Err(serde::de::Error::duplicate_field("id"));
+                            }
+                            id = Some(map.next_value()?);
+                        }
+                        "task" => {
+                            if task.is_some() {
+                                return Err(serde::de::Error::duplicate_field("task"));
+                            }
+                            let token: String = map.next_value()?;
+                            task = Some(
+                                crate::model_task::ModelTask::try_from_db_str(&token).map_err(
+                                    |e| {
+                                        serde::de::Error::custom(format!(
+                                            "preload_models: unknown task `{token}`: {e}"
+                                        ))
+                                    },
+                                )?,
+                            );
+                        }
+                        other => {
+                            return Err(serde::de::Error::unknown_field(other, &["id", "task"]));
+                        }
+                    }
+                }
+                let id = id.ok_or_else(|| serde::de::Error::missing_field("id"))?;
+                if id.trim().is_empty() {
+                    return Err(serde::de::Error::custom(
+                        "preload_models: a model id must not be empty",
+                    ));
+                }
+                Ok(PreloadEntry { id, task })
+            }
+        }
+
+        deserializer.deserialize_any(PreloadEntryVisitor)
     }
 }
 

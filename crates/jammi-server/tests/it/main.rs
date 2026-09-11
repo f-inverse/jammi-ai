@@ -34,6 +34,7 @@ mod health;
 mod liveness;
 mod mount_tenant_scoped;
 mod probe;
+mod readiness_preload;
 mod serve_bind_race;
 mod serve_e2e;
 mod serve_shutdown_modes;

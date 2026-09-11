@@ -495,7 +495,7 @@ Every trait/enum/base surface a maintainer extends, with anchors and invariants.
   `true` (default `true`); **not** the unconditional `with_embedded_worker`
   form. This is the SAME key the server's chain assembly and the Python embedded
   arm read before deciding whether THEIR process claims —
-  `worker.enabled` (`crates/jammi-server/src/runtime.rs:1261`) and
+  `worker.enabled` (`crates/jammi-server/src/runtime.rs:1660`) and
   `worker.enabled` (`crates/jammi-python/src/database.rs:121`) — so a wire
   deployment and an in-process one answer "does THIS process claim?"
   identically rather than by three private conventions. `Target`
@@ -2704,11 +2704,14 @@ note below.
   left); an entry that is idle by ref-count but still has an outstanding guard-held clone
   is skipped, not removed.
   `ModelCache::preload` is a thin `get_or_load`-then-`drop` warmer taking an *explicit*
-  `(source, task, backend_hint)` — it does **not** read any config list, and it is called
-  only from a test (`crates/jammi-ai/tests/it/models.rs`). `config.preload_models`
-  (`crates/jammi-db/src/config/mod.rs`) is **dormant**: documented as "preload at server
-  startup" but has no reader anywhere in the engine (defaults empty; no `jammi-server`
-  startup wiring consumes it).
+  `(source, task, backend_hint)` — it reads no config list itself. Its callers are the
+  server's warm-before-ready step (`crates/jammi-server/src/runtime.rs`
+  `preload_models`, driven by `[server] preload_models: Vec<PreloadEntry>` — a bare id
+  whose task is resolved from the `models` row at the startup edge, or `{ id, task }`;
+  `/readyz` is 503 "preloading i/n" and the claim loop is parked at the session's worker
+  gate until every entry is cached; a failed entry is `ServerError::Preload`, exit
+  non-zero) and the Python `preload_model` verb. The cache key is task-free, so the head
+  is chosen from the task the preload names — never guessed.
 - **`ModelSource` / `ModelId`** — `crates/jammi-ai/src/model/mod.rs` (`ModelId` and
   `ModelSource`): `HuggingFace(String)` | `Local(PathBuf)`. **`ModelId` = `Display` of the
   source is the entire cache key** — `task` and `backend_hint` are NOT part of it [§5

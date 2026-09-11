@@ -778,13 +778,21 @@ impl ModelCache {
         ))
     }
 
-    /// Preload a model without running inference.
+    /// Preload a model without running inference — the server's
+    /// warm-before-ready step (`[server] preload_models`) and the Python
+    /// `preload_model` verb.
     pub async fn preload(
         &self,
         source: &ModelSource,
         task: ModelTask,
         backend_hint: Option<BackendType>,
     ) -> Result<()> {
+        #[cfg(feature = "test-hooks")]
+        preload_test_hooks::maybe_park(
+            &source.to_string(),
+            preload_test_hooks::ParkPoint::BeforeLoad,
+        )
+        .await;
         let guard = self.get_or_load(source, task, backend_hint).await?;
         drop(guard);
         Ok(())
@@ -2240,5 +2248,109 @@ mod esc_089_bookkeeping_tests {
             "a catalog read error must skip the write entirely, never fall through to \
              attempting (and separately failing) a `register_model` call; captured logs:\n{logs}"
         );
+    }
+}
+
+/// Test-only rendezvous inside [`ModelCache::preload`] (`feature =
+/// "test-hooks"`; mirrors `crate::jobs::compute_test_hooks`): a test arms
+/// [`ParkPoint::BeforeLoad`] for a model source's canonical string and the
+/// next preload of that source parks — before any bytes load — until
+/// released, so a server's warm-before-ready window (`/readyz` 503
+/// "preloading", the claim loop parked at `warming`) is observable at a
+/// documented point rather than raced. The cache's own pause handle is
+/// `#[cfg(test)]`, unreachable from another crate's tests. No production
+/// path observes anything here beyond the `maybe_park` call.
+#[cfg(feature = "test-hooks")]
+pub mod preload_test_hooks {
+    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::sync::{Arc, Mutex, OnceLock, PoisonError};
+
+    use tokio::sync::Notify;
+
+    /// Where a preload parks.
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    pub enum ParkPoint {
+        /// Inside `ModelCache::preload`, before the load.
+        BeforeLoad,
+    }
+
+    struct Armed {
+        key: String,
+        point: ParkPoint,
+        parked: Arc<AtomicBool>,
+        parked_notify: Arc<Notify>,
+        released: Arc<AtomicBool>,
+        release_notify: Arc<Notify>,
+    }
+
+    fn armed() -> &'static Mutex<Vec<Armed>> {
+        static ARMED: OnceLock<Mutex<Vec<Armed>>> = OnceLock::new();
+        ARMED.get_or_init(|| Mutex::new(Vec::new()))
+    }
+
+    /// The test's side of one armed park.
+    pub struct ParkHandle {
+        parked: Arc<AtomicBool>,
+        parked_notify: Arc<Notify>,
+        released: Arc<AtomicBool>,
+        release_notify: Arc<Notify>,
+    }
+
+    impl ParkHandle {
+        /// Resolve once the preload has reached the park point.
+        pub async fn wait_parked(&self) {
+            while !self.parked.load(Ordering::SeqCst) {
+                self.parked_notify.notified().await;
+            }
+        }
+
+        /// Let the parked preload continue.
+        pub fn release(&self) {
+            self.released.store(true, Ordering::SeqCst);
+            self.release_notify.notify_one();
+        }
+    }
+
+    /// Arm one park for the next preload whose source's canonical string
+    /// (`ModelSource`'s `Display`) is `key`. One-shot.
+    pub fn arm(key: &str, point: ParkPoint) -> ParkHandle {
+        let parked = Arc::new(AtomicBool::new(false));
+        let parked_notify = Arc::new(Notify::new());
+        let released = Arc::new(AtomicBool::new(false));
+        let release_notify = Arc::new(Notify::new());
+        armed()
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .push(Armed {
+                key: key.to_string(),
+                point,
+                parked: Arc::clone(&parked),
+                parked_notify: Arc::clone(&parked_notify),
+                released: Arc::clone(&released),
+                release_notify: Arc::clone(&release_notify),
+            });
+        ParkHandle {
+            parked,
+            parked_notify,
+            released,
+            release_notify,
+        }
+    }
+
+    pub(super) async fn maybe_park(key: &str, point: ParkPoint) {
+        let taken = {
+            let mut list = armed().lock().unwrap_or_else(PoisonError::into_inner);
+            list.iter()
+                .position(|a| a.key == key && a.point == point)
+                .map(|i| list.remove(i))
+        };
+        let Some(armed) = taken else {
+            return;
+        };
+        armed.parked.store(true, Ordering::SeqCst);
+        armed.parked_notify.notify_one();
+        while !armed.released.load(Ordering::SeqCst) {
+            armed.release_notify.notified().await;
+        }
     }
 }

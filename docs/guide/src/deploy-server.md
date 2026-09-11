@@ -76,13 +76,23 @@ format = "json"    # structured logging for production
 
 ### Preloading models
 
-Models listed in `preload_models` are downloaded and loaded into memory at startup. This ensures the session is warm before the server accepts connections.
+Models listed in `preload_models` are loaded into the cache at startup,
+BEFORE `/readyz` reports ready — it answers `503 {"status":"not_ready",
+"detail":"preloading i/n"}` meanwhile, `/healthz` stays `200` (no
+`startupProbe` needed), and this process's claim loop waits at its gate
+with its `workers.state` row reading `warming`, so no job is claimed by a
+cold process. An entry is a bare id, whose task comes from the catalog's
+`models` row, or `{ id, task }` naming the task explicitly — required for a
+`local:` path, which has no row. A listed model that cannot load, a bare id
+with no `models` row, or an unknown task token is a **startup error**: the
+server exits non-zero instead of serving. A shutdown signal during the
+preload exits 0 without ever serving.
 
 ```toml
 [server]
 preload_models = [
     "sentence-transformers/all-MiniLM-L6-v2",
-    "BAAI/bge-small-en-v1.5",
+    { id = "local:/models/bge-small", task = "text_embedding" },
 ]
 ```
 

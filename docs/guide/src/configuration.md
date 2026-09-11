@@ -163,8 +163,15 @@ embedding_cache_size = "1GB"
 health_listen = "0.0.0.0:8080"
 # Arrow Flight SQL listen address. Default: "0.0.0.0:8081".
 flight_listen = "0.0.0.0:8081"
-# Models to preload on server start. Default: [].
-preload_models = ["sentence-transformers/all-MiniLM-L6-v2"]
+# Models to load into the cache before /readyz reports ready and before this
+# process's claim loop claims anything. A bare id takes its task from the
+# catalog's `models` row; `{ id, task }` names it (required for a `local:`
+# path). A model that cannot load, a bare id with no row, or an unknown task
+# token is a startup error (the server exits non-zero). Default: [].
+preload_models = [
+    "sentence-transformers/all-MiniLM-L6-v2",
+    { id = "local:/models/bge-small", task = "text_embedding" },
+]
 
 [server.limits]
 # Request-bounds and refusal policy for the combined gRPC + Flight SQL

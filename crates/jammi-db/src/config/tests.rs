@@ -2572,3 +2572,79 @@ fn env_override_observability_lands_through_the_struct_derived_layer() {
         ObservabilityConfig::default().sample_ratio
     );
 }
+
+// ---------------------------------------------------------------------------
+// OPS (#482) — `[server] preload_models` entries: a bare id (task from the
+// `models` row) or `{ id, task }`; an unknown task token or key is a typed
+// load-time error naming it.
+// ---------------------------------------------------------------------------
+
+#[test]
+fn preload_entries_parse_as_bare_ids_or_id_task_tables() {
+    let cfg = JammiConfig::parse_from(
+        r#"
+[server]
+preload_models = [
+    "sentence-transformers/all-MiniLM-L6-v2",
+    { id = "local:/models/tiny", task = "text_embedding" },
+]
+"#,
+        std::collections::BTreeMap::new(),
+    )
+    .unwrap();
+    assert_eq!(
+        cfg.server.preload_models,
+        vec![
+            PreloadEntry {
+                id: "sentence-transformers/all-MiniLM-L6-v2".into(),
+                task: None,
+            },
+            PreloadEntry {
+                id: "local:/models/tiny".into(),
+                task: Some(crate::model_task::ModelTask::TextEmbedding),
+            },
+        ]
+    );
+    assert!(
+        JammiConfig::parse_from("", std::collections::BTreeMap::new())
+            .unwrap()
+            .server
+            .preload_models
+            .is_empty()
+    );
+}
+
+#[test]
+fn preload_entry_rejects_an_unknown_task_token_with_a_typed_error() {
+    let err = JammiConfig::parse_from(
+        r#"
+[server]
+preload_models = [{ id = "local:/models/tiny", task = "bogus_task" }]
+"#,
+        std::collections::BTreeMap::new(),
+    )
+    .expect_err("an unknown task token must be refused at load");
+    let text = err.to_string();
+    assert!(
+        matches!(err, JammiError::Config(_)) && text.contains("bogus_task"),
+        "the error must be typed and name the token, got {text}"
+    );
+    let err = JammiConfig::parse_from(
+        r#"
+[server]
+preload_models = [{ id = "x", tsk = "text_embedding" }]
+"#,
+        std::collections::BTreeMap::new(),
+    )
+    .expect_err("an unknown key must be refused at load");
+    assert!(err.to_string().contains("tsk"), "{err}");
+    let err = JammiConfig::parse_from(
+        r#"
+[server]
+preload_models = [{ task = "text_embedding" }]
+"#,
+        std::collections::BTreeMap::new(),
+    )
+    .expect_err("a missing id must be refused at load");
+    assert!(err.to_string().contains("id"), "{err}");
+}

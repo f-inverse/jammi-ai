@@ -34,12 +34,32 @@
 //! returned raw `search` output as final would surface per-segment
 //! non-comparable distances as if they were a global ranking.
 //!
+//! ## Kernels
+//!
+//! `search_final` is expressed over three pure, sync kernels that carry no
+//! transport: [`search_unit`] (one segment's hits at a width, rescored at the
+//! segment for a `Final` phase on a quantized precision), [`merge`] (the total
+//! order + dedup over units, keeping the winning segment id) and [`rescore`]
+//! (exact cosine over named candidates; a missing exact vector is a hard
+//! error). The same kernels run at a segment owner and at a coordinator
+//! ([`crate::index::placed::PlacedIndex`]) — a placed search over `N` nodes is
+//! the same merge, fanned out. The exact-vector lookup is a closure, so an
+//! exact-read count is observable without instrumenting [`SidecarIndex`].
+//!
+//! Per precision: `F32` is one `Final` phase (no rescore). `F16` / `Int8`
+//! approximate distances are comparable across segments (usearch scales each
+//! vector by its own magnitude), so they retrieve at width, merge, truncate to
+//! `k · oversample`, then rescore exactly those survivors — `candidate_k`
+//! exact reads. `Binary` per-segment Hamming distances are fit against each
+//! segment's own τ and are NOT on one scale, so every segment rescores its own
+//! `width` hits before the merge and the merge runs on final distance —
+//! `N · width` exact reads, paid only here, where a raw-Hamming truncation
+//! would keep the wrong segment's row.
+//!
 //! ## Deferred seams
 //!
-//! Several extensions fit this shape but are not built here: scatter-gather /
-//! cross-node segment placement (each segment is independently loadable, so a
-//! future distributed reader fans out the same merge); an mmap `view()` of a
-//! segment's vectors; re-quantization or compaction of the segment set (merging
+//! Several extensions fit this shape but are not built here: an mmap `view()`
+//! of a segment's vectors; re-quantization or compaction of the segment set (merging
 //! many small segments into one, at which point the
 //! authoritative-vector-on-re-embed question below becomes live); and a
 //! compaction *policy*. A small appended segment — especially a `Binary` one,
@@ -55,6 +75,7 @@ use jammi_numerics::distance::cosine_distance;
 
 use crate::config::StoragePrecision;
 use crate::error::{JammiError, Result};
+use crate::index::peer::SegmentSearchPhase;
 use crate::index::sidecar::SidecarIndex;
 use crate::index::VectorIndex;
 use crate::store::deletes::DeletionMask;
@@ -91,12 +112,112 @@ pub const DEFAULT_SEGMENT_OVERFETCH_FACTOR: f32 = 2.0;
 /// top-`m` *is* the global top-`m`, so no over-fetch — this is what makes `N=1`
 /// byte-identical to a lone [`SidecarIndex::search`]); more than one is asked
 /// for `ceil(m * DEFAULT_SEGMENT_OVERFETCH_FACTOR)`.
-fn over_fetch(m: usize, n_segments: usize) -> usize {
+pub(crate) fn over_fetch(m: usize, n_segments: usize) -> usize {
     if n_segments <= 1 {
         m
     } else {
         (m as f32 * DEFAULT_SEGMENT_OVERFETCH_FACTOR).ceil() as usize
     }
+}
+
+/// The exact-vector lookup a rescore reads through: `Ok(None)` when the id is
+/// not indexed by the segment the lookup is bound to.
+pub type ExactLookup<'a> = dyn Fn(&str) -> Result<Option<Vec<f32>>> + 'a;
+
+/// An [`ExactLookup`] dispatched by segment: called as `(winning_segment,
+/// row_id)` for every exact read a multi-segment `search_final` makes.
+pub(crate) type SegmentExactLookup<'a> = dyn Fn(SegmentId, &str) -> Result<Option<Vec<f32>>> + 'a;
+
+/// One segment's hits for one query at `width` — the per-segment kernel.
+///
+/// Searches the graph at `width` (capped at the segment's row count by the
+/// index itself, never padded). For a [`SegmentSearchPhase::Final`] phase on a
+/// precision that [`needs_rescore`](StoragePrecision::needs_rescore), every
+/// hit is rescored through `exact` + cosine so the returned distances are
+/// final and comparable across segments (the `Binary` protocol); otherwise the
+/// hits are returned as the graph produced them (`F32` exact, or `F16` /
+/// `Int8` approximate candidates for an `Approximate` phase).
+pub fn search_unit(
+    index: &SidecarIndex,
+    query: &[f32],
+    width: usize,
+    phase: SegmentSearchPhase,
+    exact: &ExactLookup<'_>,
+) -> Result<Vec<(String, f32)>> {
+    if width == 0 {
+        return Ok(Vec::new());
+    }
+    let hits = index.search(query, width)?;
+    if phase == SegmentSearchPhase::Final && index.storage_precision().needs_rescore() {
+        rescore(hits, exact, query)
+    } else {
+        Ok(hits)
+    }
+}
+
+/// The merge kernel: concatenate every unit, order by `(distance ASC, row_id
+/// ASC, segment_id ASC)`, dedup by row id keeping the nearest occurrence, and
+/// truncate to `m`. Each survivor carries the segment id that won it — the
+/// segment its exact vector is read from.
+pub(crate) fn merge(
+    units: Vec<(SegmentId, Vec<(String, f32)>)>,
+    m: usize,
+) -> Vec<(String, f32, SegmentId)> {
+    if m == 0 {
+        return Vec::new();
+    }
+    let mut merged: Vec<(String, f32, SegmentId)> = units
+        .into_iter()
+        .flat_map(|(segment, hits)| {
+            hits.into_iter()
+                .map(move |(row_id, distance)| (row_id, distance, segment))
+        })
+        .collect();
+    merged.sort_by(|a, b| {
+        a.1.total_cmp(&b.1)
+            .then_with(|| a.0.cmp(&b.0))
+            .then_with(|| a.2.cmp(&b.2))
+    });
+    // Dedup by row id keeping the nearest: after the sort the first
+    // occurrence of each id is its nearest, so a set-membership pass keeps
+    // that one and drops the rest, stopping once `m` survivors are collected.
+    let mut seen: HashSet<String> = HashSet::new();
+    let mut out: Vec<(String, f32, SegmentId)> = Vec::with_capacity(m.min(merged.len()));
+    for (row_id, distance, segment) in merged {
+        if out.len() == m {
+            break;
+        }
+        if seen.insert(row_id.clone()) {
+            out.push((row_id, distance, segment));
+        }
+    }
+    out
+}
+
+/// The rescore kernel: read every candidate's exact vector through `exact`,
+/// recompute cosine distance against `query`, and order by `(distance,
+/// row_id)`. A candidate whose exact vector is missing (present in a graph but
+/// absent from its rescore companion — a torn bundle) is a hard error, never a
+/// silent drop: a result set that quietly shrank would read as "fewer matches
+/// exist" rather than "the index is broken".
+pub fn rescore(
+    candidates: Vec<(String, f32)>,
+    exact: &ExactLookup<'_>,
+    query: &[f32],
+) -> Result<Vec<(String, f32)>> {
+    let mut rescored: Vec<(String, f32)> = Vec::with_capacity(candidates.len());
+    for (row_id, _approx) in candidates {
+        let vector = exact(&row_id)?.ok_or_else(|| {
+            JammiError::Other(format!(
+                "rescore: candidate '{row_id}' has no exact vector in its segment's rescore \
+                 companion (corrupted or torn sidecar bundle)"
+            ))
+        })?;
+        let distance = cosine_distance(query, &vector);
+        rescored.push((row_id, distance));
+    }
+    rescored.sort_by(|a, b| a.1.total_cmp(&b.1).then_with(|| a.0.cmp(&b.0)));
+    Ok(rescored)
 }
 
 /// A loaded segment paired with its catalog id (the merge's final tie-break
@@ -210,7 +331,13 @@ impl SegmentedIndex {
     /// Total number of rows across every segment (physical rows, masked
     /// included).
     pub fn len(&self) -> usize {
-        self.segments.iter().map(|s| s.index.len()).sum()
+        self.segments().map(|(_, index)| index.len()).sum()
+    }
+
+    /// Every segment with its id, in `segment_id` order — the local sources a
+    /// placed search fans in-process.
+    pub(crate) fn segments(&self) -> impl Iterator<Item = (SegmentId, &SidecarIndex)> {
+        self.segments.iter().map(|s| (s.id, &s.index))
     }
 
     /// Whether the whole set indexes zero rows.
@@ -310,50 +437,109 @@ impl SegmentedIndex {
     }
 
     /// THE single final-results entry. Returns the exact top-`k` in a total
-    /// order comparable across every segment.
+    /// order comparable across every segment. Sync, all-local: every segment
+    /// here is resident in this process.
     ///
-    /// On a set that [`needs_rescore`](StoragePrecision::needs_rescore)
-    /// (quantized or `Binary`) this is a two-stage retrieve→rescore: retrieve
-    /// `k * oversample` candidates through the masked merge, read each
-    /// candidate's exact `f32` vector from the segment that OWNS it (never
-    /// the first segment that happens to index the same key), recompute
-    /// cosine distance against the query, then re-rank by `(distance, row_id)`
-    /// and truncate to `k`. On an `F32` set the merge is already exact and
-    /// final, so this is `search(query, k)` and `oversample` is unused.
+    /// Per precision (the module docs' protocol, over the kernels), every
+    /// stage routed through [`Self::live_candidates`]'s masked, dead-row
+    /// widened fetch — a masked or superseded key is never counted against a
+    /// live `k`:
     ///
-    /// A candidate whose exact vector is missing (present in a graph but absent
-    /// from its rescore companion — a torn bundle) is a hard error, never a
-    /// silent drop.
+    /// - `F32`: the merge is already exact and final, so this is
+    ///   `search(query, k)` and `oversample` is unused.
+    /// - `F16` / `Int8`: retrieve `k * oversample` masked candidates through
+    ///   [`Self::search_candidates`] (the over-fetch nests *under* this
+    ///   candidate width by construction), read each survivor's exact `f32`
+    ///   vector from the segment that OWNS it (never the first segment that
+    ///   happens to index the same key), recompute cosine distance against
+    ///   the query, then re-rank by `(distance, row_id)` and truncate to `k`
+    ///   — exactly `candidate_k` exact reads.
+    /// - `Binary`: each segment rescores its own masked
+    ///   `over_fetch(candidate_k, N)` hits BEFORE the merge, and the merge
+    ///   runs on final distance — per-segment Hamming distances are fit
+    ///   against each segment's own τ and are not on one scale, so a merge
+    ///   that truncated on them would keep the wrong segment's row. At `N = 1`
+    ///   with an empty mask this is the same bytes as the quantized path
+    ///   (`width = candidate_k`, one rescore of the same set).
+    ///
+    /// A candidate whose exact vector is missing (present in a graph but
+    /// absent from its rescore companion — a torn bundle) is a hard error,
+    /// never a silent drop (see [`rescore`]).
     pub fn search_final(
         &self,
         query: &[f32],
         k: usize,
         oversample: usize,
     ) -> Result<Vec<(String, f32)>> {
-        if !self.storage_precision.needs_rescore() {
-            return self.search(query, k);
-        }
-        let candidate_k = k.saturating_mul(oversample).max(k);
-        let candidates = self.search_candidates(query, candidate_k)?;
-        let mut rescored: Vec<(String, f32)> = Vec::with_capacity(candidates.len());
-        for (row_id, _approx, segment) in candidates {
-            let exact = self.get_exact_in(segment, &row_id)?.ok_or_else(|| {
-                JammiError::Other(format!(
-                    "rescore: candidate '{row_id}' has no exact vector in its segment's rescore \
-                     companion (corrupted or torn sidecar bundle)"
-                ))
-            })?;
-            let distance = cosine_distance(query, &exact);
-            rescored.push((row_id, distance));
-        }
-        rescored.sort_by(|a, b| a.1.total_cmp(&b.1).then_with(|| a.0.cmp(&b.0)));
-        rescored.truncate(k);
-        Ok(rescored)
+        self.search_final_with(query, k, oversample, &|segment, row_id| {
+            self.exact_in(segment, row_id)
+        })
     }
 
-    /// The exact `f32` vector for `row_id` from the segment `owner`.
-    fn get_exact_in(&self, owner: SegmentId, row_id: &str) -> Result<Option<Vec<f32>>> {
-        match self.segments.iter().find(|s| s.id == owner) {
+    /// [`Self::search_final`] with the exact-vector lookup injected: `exact`
+    /// is called as `(winning_segment, row_id)` for every exact read the
+    /// protocol makes, so a caller can count reads without instrumenting the
+    /// segments. Production calls this with [`Self::exact_in`].
+    pub(crate) fn search_final_with(
+        &self,
+        query: &[f32],
+        k: usize,
+        oversample: usize,
+        exact: &SegmentExactLookup<'_>,
+    ) -> Result<Vec<(String, f32)>> {
+        if k == 0 {
+            return Ok(Vec::new());
+        }
+        match self.storage_precision {
+            StoragePrecision::F32 => self.search(query, k),
+            StoragePrecision::F16 | StoragePrecision::Int8 => {
+                let candidate_k = k.saturating_mul(oversample).max(k);
+                let survivors = self.search_candidates(query, candidate_k)?;
+                // Group by winning segment so each group rescores through the
+                // one segment that owns it — the same shape a coordinator uses
+                // when the groups are split between local and remote owners.
+                let mut by_segment: Vec<(SegmentId, Vec<(String, f32)>)> = Vec::new();
+                for (row_id, approx, segment) in survivors {
+                    match by_segment.iter_mut().find(|(s, _)| *s == segment) {
+                        Some((_, group)) => group.push((row_id, approx)),
+                        None => by_segment.push((segment, vec![(row_id, approx)])),
+                    }
+                }
+                let mut rescored: Vec<(String, f32)> = Vec::with_capacity(candidate_k);
+                for (segment, group) in by_segment {
+                    rescored.extend(rescore(group, &|row_id| exact(segment, row_id), query)?);
+                }
+                rescored.sort_by(|a, b| a.1.total_cmp(&b.1).then_with(|| a.0.cmp(&b.0)));
+                rescored.truncate(k);
+                Ok(rescored)
+            }
+            StoragePrecision::Binary => {
+                let candidate_k = k.saturating_mul(oversample).max(k);
+                let mut units = Vec::with_capacity(self.segments.len());
+                for seg in &self.segments {
+                    let live: Vec<(String, f32)> = self
+                        .live_candidates(seg, query, candidate_k)?
+                        .into_iter()
+                        .map(|(row_id, distance, _)| (row_id, distance))
+                        .collect();
+                    let rescored = rescore(live, &|row_id| exact(seg.id, row_id), query)?;
+                    units.push((seg.id, rescored));
+                }
+                Ok(merge(units, k)
+                    .into_iter()
+                    .map(|(row_id, distance, _segment)| (row_id, distance))
+                    .collect())
+            }
+        }
+    }
+
+    /// The exact `f32` vector for `row_id` read from `segment` — the segment
+    /// the merge said owns the row. `None` when that segment does not index
+    /// the id (or the id names no segment of this set). Internal to the crate:
+    /// the only consumer is the rescore stage — callers ask for final results,
+    /// not raw exact vectors.
+    pub(crate) fn exact_in(&self, segment: SegmentId, row_id: &str) -> Result<Option<Vec<f32>>> {
+        match self.segments.iter().find(|s| s.id == segment) {
             Some(seg) => seg.index.get_exact(row_id),
             None => Ok(None),
         }
@@ -524,6 +710,51 @@ mod tests {
         }
     }
 
+    // Test 9b (A1) — the Binary two-segment `search_final` at `k = 1`,
+    // `oversample = 1` (so `candidate_k = 1`, `width = over_fetch(1, 2) = 2`).
+    // Per-segment Hamming distances are fit against each segment's OWN τ, so
+    // they are not on one scale: a merge that truncates the candidate set on
+    // raw Hamming before any rescore keeps the wrong segment's row. The
+    // fixture is constructed so the true nearest row (`b0`, cosine ≈ 0.001)
+    // sits at Hamming 1 in segment B while a far row (`a0`, cosine ≈ 0.667)
+    // sits at Hamming 0 in segment A — `search_final` must return `b0`.
+    #[test]
+    fn two_segment_binary_search_final_rescores_per_segment_before_the_merge() {
+        // dim 8, only the first four dims non-zero.
+        let seg_a: Vec<(&str, Vec<f32>)> = vec![
+            ("a0", vec![0.4, 0.4, 0.2, 0.0, 0.0, 0.0, 0.0, 0.0]),
+            ("a1", vec![0.6, 0.6, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0]),
+            ("a2", vec![0.5, 0.5, 0.1, 0.0, 0.0, 0.0, 0.0, 0.0]),
+        ];
+        let seg_b: Vec<(&str, Vec<f32>)> = vec![
+            ("b0", vec![0.0, 0.0, 1.0, 0.05, 0.0, 0.0, 0.0, 0.0]),
+            ("b1", vec![0.0, 1.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0]),
+            ("b2", vec![1.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0]),
+        ];
+        let rows: Vec<(&str, Vec<f32>)> = seg_a.iter().chain(seg_b.iter()).cloned().collect();
+        let q = vec![0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 0.0, 0.0];
+        let seg = segmented(vec![
+            (&seg_a, StoragePrecision::Binary),
+            (&seg_b, StoragePrecision::Binary),
+        ]);
+        // Fixture premise, asserted so a usearch ordering change is loud: the
+        // raw per-segment Hamming order puts `a0` (Hamming 0 under τ_A) ahead
+        // of `b0` (Hamming 1 under τ_B) — the cross-segment incomparability
+        // the final-distance merge must not be fooled by.
+        let raw = seg.search(&q, 1).unwrap();
+        assert_eq!(
+            ids(&raw),
+            vec!["a0".to_string()],
+            "fixture premise: raw Hamming merge keeps a0 (distance 0 under τ_A)"
+        );
+        assert_eq!(
+            ids(&seg.search_final(&q, 1, 1).unwrap()),
+            brute_force(&rows, &q, 1),
+            "2-segment Binary search_final must equal exact brute-force top-1 even when \
+             candidate_k = 1: each segment rescores before the merge"
+        );
+    }
+
     // Test 9 (correctness under truncation) — a two-segment quantized
     // `search_final` returns the exact brute-force top-k over the union even when
     // the candidate stage truncates *below* the corpus size, so the rescore does
@@ -623,6 +854,180 @@ mod tests {
             expected.iter().all(|id| id.starts_with("near")),
             "the true top-k are the five near rows"
         );
+    }
+
+    // A3 (sync entry) — N=1 byte identity at EVERY precision: `search_final`
+    // over one segment returns the identical `(row_id, distance)` bytes a
+    // manual retrieve→rescore over the lone `SidecarIndex` produces
+    // (`over_fetch(m, 1) = m`, one rescore of the same candidate set, the same
+    // `(distance, row_id)` order). The Binary twin is the one the per-segment
+    // rescore fix must not move: at N=1, `width = candidate_k`, so "rescore
+    // per segment then merge" and "merge then rescore" are the same bytes.
+    #[test]
+    fn n1_search_final_is_byte_identical_to_the_lone_sidecar_at_every_precision() {
+        let rows = corpus();
+        for precision in [
+            StoragePrecision::F32,
+            StoragePrecision::F16,
+            StoragePrecision::Int8,
+            StoragePrecision::Binary,
+        ] {
+            let lone = segment(&rows, precision);
+            let seg = segmented(vec![(&rows, precision)]);
+            for q in [&rows[0].1, &rows[6].1, &rows[11].1] {
+                for (k, oversample) in [(1usize, 1usize), (3, 4), (5, 32)] {
+                    let reference: Vec<(String, f32)> = if precision.needs_rescore() {
+                        let cand = lone.search(q, k.saturating_mul(oversample).max(k)).unwrap();
+                        let mut manual: Vec<(String, f32)> = cand
+                            .into_iter()
+                            .map(|(id, _)| {
+                                let exact = lone.get_exact(&id).unwrap().unwrap();
+                                (id, cosine_distance(q, &exact))
+                            })
+                            .collect();
+                        manual.sort_by(|a, b| a.1.total_cmp(&b.1).then_with(|| a.0.cmp(&b.0)));
+                        manual.truncate(k);
+                        manual
+                    } else {
+                        lone.search(q, k).unwrap()
+                    };
+                    assert_eq!(
+                        seg.search_final(q, k, oversample).unwrap(),
+                        reference,
+                        "{precision:?} k={k} oversample={oversample}: N=1 search_final must be \
+                         byte-identical to the lone sidecar"
+                    );
+                }
+            }
+        }
+    }
+
+    /// A 128-row, 32-d corpus with 5 near rows and 123 far rows (test 9's
+    /// generator), split even/odd into two 64-row halves — sized so the
+    /// exact-read equalities below are reachable (`search` caps at the
+    /// segment's row count and never pads).
+    type Rows = Vec<(String, Vec<f32>)>;
+
+    fn wide_corpus() -> (Rows, Rows, Vec<f32>) {
+        fn normalize(mut v: Vec<f32>) -> Vec<f32> {
+            let norm = v.iter().map(|x| x * x).sum::<f32>().sqrt();
+            for x in &mut v {
+                *x /= norm;
+            }
+            v
+        }
+        let dim = 32;
+        let mut query = vec![0.0f32; dim];
+        query[0] = 1.0;
+        let mut all: Vec<(String, Vec<f32>)> = Vec::new();
+        for i in 0..5 {
+            let mut v = vec![0.0f32; dim];
+            v[0] = 1.0;
+            v[1] = 0.08 * i as f32;
+            all.push((format!("near{i}"), normalize(v)));
+        }
+        for r in 0..123 {
+            let mut v = vec![0.0f32; dim];
+            v[2 + (r % 28)] = 1.0;
+            v[3 + (r % 28)] += 0.01 * ((r % 5) as f32);
+            all.push((format!("far{r:03}"), normalize(v)));
+        }
+        let mut a = Vec::new();
+        let mut b = Vec::new();
+        for (idx, row) in all.into_iter().enumerate() {
+            if idx % 2 == 0 {
+                a.push(row);
+            } else {
+                b.push(row);
+            }
+        }
+        (a, b, query)
+    }
+
+    fn wide_segment(rows: &[(String, Vec<f32>)], precision: StoragePrecision) -> SidecarIndex {
+        let mut idx = SidecarIndex::new(32, &AnnIndexConfig::default(), precision).unwrap();
+        for (id, v) in rows {
+            idx.add(id, v).unwrap();
+        }
+        idx.build().unwrap();
+        idx
+    }
+
+    /// Run `search_final` through a counting exact-vector closure and return
+    /// `(hits, exact_reads)`.
+    fn count_exact_reads(
+        seg: &SegmentedIndex,
+        query: &[f32],
+        k: usize,
+        oversample: usize,
+    ) -> (Vec<(String, f32)>, usize) {
+        let reads = std::cell::Cell::new(0usize);
+        let hits = seg
+            .search_final_with(query, k, oversample, &|segment, row_id| {
+                reads.set(reads.get() + 1);
+                seg.exact_in(segment, row_id)
+            })
+            .unwrap();
+        (hits, reads.get())
+    }
+
+    // A2 — the exact-read count per precision, on the kernels through a
+    // counting closure (no `SidecarIndex` instrumentation). `k = 5`,
+    // `oversample = 4` → `candidate_k = 20`:
+    //   F16 / Int8 at N=1 and N=2 → exactly 20 (rescore only the merge's
+    //     survivors — today's count);
+    //   Binary at N=2 → `2 · over_fetch(20, 2) = 80` (every segment rescores
+    //     its own width before the merge — the multiplier is paid only here);
+    //   F32 → 0.
+    // The counted call is the production `search_final` composition, so the
+    // bytes it returns are asserted against the uncounted entry too.
+    #[test]
+    fn exact_read_count_per_precision() {
+        let (a, b, query) = wide_corpus();
+        let all: Vec<(String, Vec<f32>)> = a.iter().chain(b.iter()).cloned().collect();
+        let (k, oversample) = (5usize, 4usize);
+        let candidate_k = k * oversample;
+        assert_eq!(over_fetch(candidate_k, 2), 40);
+        assert!(
+            a.len() >= 40 && b.len() >= 40,
+            "≥ 40 rows per Binary segment"
+        );
+
+        let expect = |precision: StoragePrecision, n: usize| -> usize {
+            match precision {
+                StoragePrecision::F32 => 0,
+                StoragePrecision::F16 | StoragePrecision::Int8 => candidate_k,
+                StoragePrecision::Binary => n * over_fetch(candidate_k, n),
+            }
+        };
+        for precision in [
+            StoragePrecision::F32,
+            StoragePrecision::F16,
+            StoragePrecision::Int8,
+            StoragePrecision::Binary,
+        ] {
+            let n1 =
+                SegmentedIndex::new(vec![(SegmentId(0), wide_segment(&all, precision))]).unwrap();
+            let n2 = SegmentedIndex::new(vec![
+                (SegmentId(0), wide_segment(&a, precision)),
+                (SegmentId(1), wide_segment(&b, precision)),
+            ])
+            .unwrap();
+            for (n, seg) in [(1usize, &n1), (2usize, &n2)] {
+                let (hits, reads) = count_exact_reads(seg, &query, k, oversample);
+                assert_eq!(
+                    reads,
+                    expect(precision, n),
+                    "{precision:?} N={n}: exact-read count"
+                );
+                assert_eq!(
+                    hits,
+                    seg.search_final(&query, k, oversample).unwrap(),
+                    "{precision:?} N={n}: the counted composition is the production entry"
+                );
+                assert_eq!(hits.len(), k);
+            }
+        }
     }
 
     // Test 5 — uniform total order including ties: two rows with an identical

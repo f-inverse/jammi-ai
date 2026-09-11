@@ -1,7 +1,14 @@
 pub mod exact;
+pub mod peer;
+pub mod placed;
 pub mod segment;
 pub mod sidecar;
 
+pub use peer::{
+    AllLocal, NoPeers, PeerAddr, PeerError, PeerFailureCounters, PeerFailureReason, PeerTransport,
+    SegmentPlacement, SegmentSearchPhase, StaticPlacement, PEER_RPC_DEADLINE,
+};
+pub use placed::{PlacedIndex, SegmentSource};
 pub use segment::{SegmentId, SegmentedIndex, DEFAULT_SEGMENT_OVERFETCH_FACTOR};
 
 use crate::error::Result;

@@ -171,7 +171,7 @@ async fn append_does_not_rebuild_prior_segments() {
 
     // Both segments' rows are searchable through the merged index.
     let index = store
-        .resolve_search_mode(&record_of(&store, &table).await)
+        .resolve_search_mode_local(&record_of(&store, &table).await)
         .await
         .unwrap()
         .unwrap();

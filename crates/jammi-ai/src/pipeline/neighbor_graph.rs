@@ -387,7 +387,10 @@ impl<'a> NeighborGraphPipeline<'a> {
         nodes: &[Node],
         params: &BuildNeighborGraph,
     ) -> Result<Box<dyn NeighborGraphStrategy>> {
-        let index = self.result_store.resolve_search_mode(table).await?;
+        // FORCE-LOCAL: a batch build holds the whole table's segment set
+        // resident on the building replica for the entire build and never
+        // fans out per node — placement is ignored here by design.
+        let index = self.result_store.resolve_search_mode_local(table).await?;
 
         if params.exact || index.is_none() {
             if params.exact && nodes.len() > params.exact_max_rows {

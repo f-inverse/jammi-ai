@@ -596,7 +596,7 @@ async fn building_with_valid_parquet_promotes_with_true_count(kind: BackendKind)
     );
     assert_eq!(segs[0].segment_id, 0);
     let index = store
-        .resolve_search_mode(&rec)
+        .resolve_search_mode_local(&rec)
         .await
         .unwrap()
         .expect("I6: sidecar rebuilt from Parquet");

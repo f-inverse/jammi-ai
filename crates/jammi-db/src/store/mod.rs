@@ -54,6 +54,8 @@ use crate::catalog::status::ResultTableStatus;
 use crate::catalog::Catalog;
 use crate::config::AnnIndexConfig;
 use crate::error::{JammiError, Result};
+use crate::index::peer::{AllLocal, NoPeers, PeerFailureCounters, PeerTransport, SegmentPlacement};
+use crate::index::placed::{PlacedIndex, SegmentSource};
 use crate::index::segment::{SegmentId, SegmentedIndex};
 use crate::index::sidecar::SidecarIndex;
 use crate::index::VectorIndex;
@@ -178,10 +180,26 @@ pub struct ResultStore {
     /// The content-addressed local cache every ANN index segment is loaded
     /// through. Materialises a remote segment bundle into a local directory
     /// USearch can open, once per immutable segment; a `file://` bundle loads
-    /// in place. Shares the store's [`StorageRegistry`].
-    segment_cache: SegmentIndexCache,
+    /// in place. Shares the store's [`StorageRegistry`]. An `Arc` so a
+    /// [`PlacedIndex`] and a peer owner handler can hold the same cache.
+    segment_cache: Arc<SegmentIndexCache>,
     /// Loaded segment sets and version manifests per `(table, version)`.
     segment_sets: Arc<SegmentSetCache>,
+    /// Which process owns which segment, read at every
+    /// [`Self::resolve_search_mode`]. Default [`AllLocal`]: every segment is
+    /// this process's — a single node.
+    placement: Arc<dyn SegmentPlacement>,
+    /// The transport a placed search fans remote segments out through.
+    /// Default [`NoPeers`]: every remote call is unreachable, so a store
+    /// without a transport is exactly a single-node store.
+    peer_transport: Arc<dyn PeerTransport>,
+    /// `[server] peer_local_load_bytes` — the marginal-load admission budget
+    /// one query may spend loading segments it does not own. `None` =
+    /// unbounded.
+    peer_local_load_bytes: Option<u64>,
+    /// The failure-ladder counters every placed search increments; scraped as
+    /// `jammi_peer_search_failures_total{reason}`.
+    peer_failures: Arc<PeerFailureCounters>,
     /// This store's writer identity, stamped on every `building` row it
     /// creates and named by every transition on that row.
     writer_id: Arc<str>,
@@ -641,8 +659,10 @@ impl ResultStore {
                 .tenant_binding()
                 .unwrap_or_else(TenantBinding::unscoped),
         ));
-        let segment_cache =
-            SegmentIndexCache::new(registry.clone(), local_cache_dir.join("index"))?;
+        let segment_cache = Arc::new(SegmentIndexCache::new(
+            registry.clone(),
+            local_cache_dir.join("index"),
+        )?);
         let artifact_store = Arc::new(ArtifactStore::with_root(
             models_root(&root)?,
             registry.clone(),
@@ -656,6 +676,10 @@ impl ResultStore {
             result_schema,
             segment_cache,
             segment_sets: Arc::new(SegmentSetCache::new()),
+            placement: Arc::new(AllLocal),
+            peer_transport: Arc::new(NoPeers),
+            peer_local_load_bytes: None,
+            peer_failures: Arc::new(PeerFailureCounters::default()),
             writer_id: new_writer_id(),
             lease: LeaseIntervals::default(),
             artifact_store,
@@ -696,6 +720,39 @@ impl ResultStore {
     /// The lease timing this store's building tables are held under.
     pub fn lease_intervals(&self) -> LeaseIntervals {
         self.lease
+    }
+
+    /// Set which process owns which segment (read at every
+    /// [`Self::resolve_search_mode`]). Defaults to [`AllLocal`].
+    pub fn with_placement(mut self, placement: Arc<dyn SegmentPlacement>) -> Self {
+        self.placement = placement;
+        self
+    }
+
+    /// Set the transport a placed search fans remote segments out through.
+    /// Defaults to [`NoPeers`].
+    pub fn with_peer_transport(mut self, transport: Arc<dyn PeerTransport>) -> Self {
+        self.peer_transport = transport;
+        self
+    }
+
+    /// Set `[server] peer_local_load_bytes` — the marginal-load admission
+    /// budget one query may spend loading segments it does not own when their
+    /// owners are unreachable. `None` (the default) = unbounded.
+    pub fn with_peer_local_load_bytes(mut self, budget: Option<u64>) -> Self {
+        self.peer_local_load_bytes = budget;
+        self
+    }
+
+    /// The content-addressed segment cache every segment of this store loads
+    /// through — shared with a [`PlacedIndex`] and a peer owner handler.
+    pub fn segment_cache(&self) -> &Arc<SegmentIndexCache> {
+        &self.segment_cache
+    }
+
+    /// The placed-search failure-ladder counters this store increments.
+    pub fn peer_failures(&self) -> Arc<PeerFailureCounters> {
+        Arc::clone(&self.peer_failures)
     }
 
     /// The process's lease-renewal keeper this store's `building` tables
@@ -1926,15 +1983,17 @@ impl ResultStore {
         Ok(())
     }
 
-    /// Search an embedding table for the nearest neighbors of a query vector.
-    /// Uses the segmented ANN index when available, falls back to exact
-    /// brute-force search over the whole Parquet otherwise.
+    /// Search an embedding table for the nearest neighbors of a query vector —
+    /// the PLACED entry, for the online consumers (the `Search` leaf's peer,
+    /// the context-set single-shot retrieval). Uses the placed ANN index when
+    /// available, falls back to exact brute-force search over the whole
+    /// Parquet otherwise.
     ///
-    /// Routes through [`SegmentedIndex::search_final`], so a multi-segment
+    /// Routes through [`PlacedIndex::search_final_placed`], so a multi-segment
     /// quantized / `Binary` table returns the exact-rescored, cross-segment
-    /// comparable top-`k` — never raw per-segment candidate distances. The
-    /// oversample is the table's own stamped default (no per-request override
-    /// on this lane).
+    /// comparable top-`k` — never raw per-segment candidate distances — and a
+    /// segment a peer owns is searched at that peer. The oversample is the
+    /// table's own stamped default (no per-request override on this lane).
     pub async fn search_vectors(
         &self,
         ctx: &SessionContext,
@@ -1943,6 +2002,30 @@ impl ResultStore {
         k: usize,
     ) -> Result<Vec<(String, f32)>> {
         match self.resolve_search_mode(table).await? {
+            Some(index) => {
+                let oversample = self.ann.resolve_oversample(None, table.oversample);
+                index.search_final_placed(query, k, oversample).await
+            }
+            None => {
+                crate::index::exact::exact_vector_search(ctx, &table.table_name, query, k).await
+            }
+        }
+    }
+
+    /// [`Self::search_vectors`]'s FORCE-LOCAL twin, for the batch consumers
+    /// (the eval runner's per-query loop): ignores placement, loads every
+    /// segment locally through [`Self::resolve_search_mode_local`] and
+    /// searches the sync [`SegmentedIndex::search_final`]. Any replica can
+    /// (the content-addressed cache over the shared root); a batch build never
+    /// fans out per node.
+    pub async fn search_vectors_local(
+        &self,
+        ctx: &SessionContext,
+        table: &ResultTableRecord,
+        query: &[f32],
+        k: usize,
+    ) -> Result<Vec<(String, f32)>> {
+        match self.resolve_search_mode_local(table).await? {
             Some(index) => {
                 let oversample = self.ann.resolve_oversample(None, table.oversample);
                 index.search_final(query, k, oversample)
@@ -1954,9 +2037,77 @@ impl ResultStore {
     }
 
     /// Resolve whether a table's ANN index (its whole segment set) can serve a
-    /// search, or whether the caller must fall back to exact brute-force.
-    /// Returns `Some(SegmentedIndex)` merging every segment, `None` for exact
-    /// fallback.
+    /// PLACED search, or whether the caller must fall back to exact
+    /// brute-force. Returns `Some(PlacedIndex)` over every segment, `None` for
+    /// exact fallback. The online entry: placement is read here, at every
+    /// call, for every segment.
+    ///
+    /// A table with no segments resolves to `None`. When every segment's
+    /// owner list is empty (this process owns them all — the [`AllLocal`]
+    /// default, or a single node) the set is loaded exactly as
+    /// [`Self::resolve_search_mode_local`] loads it, including its whole-table
+    /// exact fallback on any load failure, and searched through the same sync
+    /// kernels. When at least one segment is owned by a peer the set is
+    /// `Mixed`: local segments are loaded, remote ones are recorded with their
+    /// owners and never loaded here; a local load failure in that shape is
+    /// [`JammiError::Unavailable`] — a multi-node table is never exact-scanned
+    /// silently.
+    pub async fn resolve_search_mode(
+        &self,
+        table: &ResultTableRecord,
+    ) -> Result<Option<PlacedIndex>> {
+        let segments = self.catalog.list_index_segments(&table.table_name).await?;
+        if segments.is_empty() {
+            return Ok(None);
+        }
+        let mut owners = Vec::with_capacity(segments.len());
+        for seg in &segments {
+            owners.push(
+                self.placement
+                    .owners(&table.table_name, SegmentId(seg.segment_id))
+                    .await,
+            );
+        }
+        let precision = table.storage_precision.unwrap_or_default();
+        let sources = if owners.iter().all(Vec::is_empty) {
+            match self.load_all_local(table, &segments).await? {
+                Some(loaded) => loaded
+                    .into_iter()
+                    .map(|(id, index)| SegmentSource::Local(id, index))
+                    .collect(),
+                None => return Ok(None),
+            }
+        } else {
+            let first_remote = segments
+                .iter()
+                .zip(&owners)
+                .find(|(_, o)| !o.is_empty())
+                .map(|(s, _)| s.segment_id)
+                .unwrap_or(-1);
+            return Err(JammiError::Unavailable {
+                resource: format!("segment {}/{first_remote}", table.table_name),
+                reason: "placed search over remote segments is not built".into(),
+            });
+        };
+        Ok(Some(PlacedIndex::with_sources(
+            sources,
+            &table.table_name,
+            precision,
+            Arc::clone(&self.peer_transport),
+            Arc::clone(&self.segment_cache),
+            self.ann,
+            self.peer_local_load_bytes,
+            table.dimensions,
+            Arc::clone(&self.peer_failures),
+        )?))
+    }
+
+    /// Resolve whether a table's ANN index (its whole segment set) can serve a
+    /// FORCE-LOCAL search, or whether the caller must fall back to exact
+    /// brute-force. Returns `Some(SegmentedIndex)` merging every segment, `None`
+    /// for exact fallback. The batch consumers' entry (the neighbor-graph
+    /// build holds the returned index across a whole build): placement is
+    /// ignored and every segment is loaded here.
     ///
     /// A table with no segments resolves to `None`. If *any* segment fails to
     /// load — a torn bundle, or a drifted-precision segment failing
@@ -1967,7 +2118,7 @@ impl ResultStore {
     /// loaded through the content-addressed segment cache; the catalog row's own
     /// persisted precision — never the deployment default — is what each load
     /// verifies against.
-    pub async fn resolve_search_mode(
+    pub async fn resolve_search_mode_local(
         &self,
         table: &ResultTableRecord,
     ) -> Result<Option<Arc<SegmentedIndex>>> {
@@ -2071,6 +2222,39 @@ impl ResultStore {
                 Ok(Some(index))
             }
         }
+    }
+
+    /// Load every segment of `table` through the cache. `Ok(None)` (with a
+    /// `warn!`) on any load failure — the whole-table exact fallback both
+    /// resolve entries share for an all-local set. An unparseable segment URL
+    /// is a catalog fault and stays a hard error.
+    async fn load_all_local(
+        &self,
+        table: &ResultTableRecord,
+        segments: &[crate::catalog::segment_repo::IndexSegment],
+    ) -> Result<Option<Vec<(SegmentId, SidecarIndex)>>> {
+        let expected_precision = table.storage_precision.unwrap_or_default();
+        let mut loaded = Vec::with_capacity(segments.len());
+        for seg in segments {
+            let url = StorageUrl::parse(&seg.index_path)?;
+            match self
+                .segment_cache
+                .load_segment(&url, &self.ann, expected_precision)
+                .await
+            {
+                Ok(index) => loaded.push((SegmentId(seg.segment_id), index)),
+                Err(e) => {
+                    warn!(
+                        table = table.table_name,
+                        segment = seg.segment_id,
+                        error = %e,
+                        "Segment index unavailable, falling back to whole-table exact search"
+                    );
+                    return Ok(None);
+                }
+            }
+        }
+        Ok(Some(loaded))
     }
 
     /// The loaded-set cache (evicted per table on bind / publish / delete).

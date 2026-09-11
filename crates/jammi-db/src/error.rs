@@ -362,6 +362,20 @@ pub enum JammiError {
         total: u64,
     },
 
+    /// A resource the request needs could not be reached after the bounded
+    /// failure ladder: a placed segment whose owner and retry candidate both
+    /// failed and whose local load was not admitted (or not attempted). Names
+    /// the resource (`segment {table}/{id}`) and the last failure's reason. A
+    /// peer outage is visible — never masked by a silent full scan of a
+    /// larger-than-memory table. Maps to gRPC `Unavailable`.
+    #[error("unavailable: {resource}: {reason}")]
+    Unavailable {
+        /// The resource that could not be served.
+        resource: String,
+        /// Why the last rung of the ladder failed.
+        reason: String,
+    },
+
     /// Catch-all for errors that don't fit another variant.
     #[error("{0}")]
     Other(String),

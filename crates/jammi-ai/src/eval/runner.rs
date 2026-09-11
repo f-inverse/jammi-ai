@@ -145,8 +145,10 @@ impl<'a> EvalRunner<'a> {
                 }
             };
 
+            // FORCE-LOCAL: eval is a batch per-query loop; it loads every
+            // segment locally and never fans out per node.
             let search_results = result_store
-                .search_vectors(self.session.context(), &table, &query_vec, k)
+                .search_vectors_local(self.session.context(), &table, &query_vec, k)
                 .await?;
 
             let retrieved_ids: Vec<String> =

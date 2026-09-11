@@ -150,7 +150,8 @@ impl ExecutionPlan for AnnSearchExec {
                         .ann_config()
                         .resolve_oversample(oversample_override, table.oversample);
                     index
-                        .search_final(&query, k, oversample)
+                        .search_final_placed(&query, k, oversample)
+                        .await
                         .map_err(|e| datafusion::error::DataFusionError::External(Box::new(e)))?
                 }
                 None => exact_vector_search(&ctx, &table.table_name, &query, k)

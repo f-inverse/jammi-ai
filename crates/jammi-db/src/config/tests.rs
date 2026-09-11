@@ -1078,6 +1078,39 @@ fn env_override_lease_violating_margin_is_a_typed_load_error() {
 }
 
 #[test]
+fn server_peer_local_load_bytes_parses_and_zero_is_refused() {
+    // Unset = unbounded (today's behaviour).
+    let cfg = JammiConfig::parse_from("[server]\n", vec![]).unwrap();
+    assert_eq!(cfg.server.peer_local_load_bytes, None);
+    assert!(cfg.server.validate().is_ok());
+
+    // A plain integer byte count parses and validates.
+    let cfg = JammiConfig::parse_from("[server]\npeer_local_load_bytes = 1\n", vec![]).unwrap();
+    assert_eq!(cfg.server.peer_local_load_bytes, Some(1));
+    assert!(cfg.server.validate().is_ok());
+
+    // The env layer spells it the same way.
+    let cfg = JammiConfig::parse_from(
+        "",
+        vec![(
+            "JAMMI_SERVER__PEER_LOCAL_LOAD_BYTES".to_string(),
+            "4096".to_string(),
+        )],
+    )
+    .unwrap();
+    assert_eq!(cfg.server.peer_local_load_bytes, Some(4096));
+
+    // K2: `Some(0)` has no sane reading (a budget that admits nothing is not
+    // "unbounded") and is refused, naming the key.
+    let cfg = JammiConfig::parse_from("[server]\npeer_local_load_bytes = 0\n", vec![]).unwrap();
+    let err = cfg.server.validate().unwrap_err();
+    assert!(
+        matches!(&err, JammiError::Config(m) if m.contains("peer_local_load_bytes")),
+        "got {err:?}"
+    );
+}
+
+#[test]
 fn env_override_lease_unknown_field_refuses() {
     // `deny_unknown_fields` holds through the env layer too: the former
     // `[training]` spelling of the lease keys is not an alias under

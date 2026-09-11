@@ -2237,7 +2237,13 @@ fn build_result_store(
         }
         None => ResultStore::new(inner.config().artifact_dir.as_path(), catalog, ann),
     }?;
-    Ok(store.with_lease_intervals(lease))
+    Ok(store
+        .with_lease_intervals(lease)
+        // `[server] peer_local_load_bytes`: the marginal-load admission
+        // budget of the placed-search failure ladder. Read by the store
+        // (the only reader), from the same config a wire deployment and an
+        // in-process one share.
+        .with_peer_local_load_bytes(inner.config().server.peer_local_load_bytes))
 }
 
 #[cfg(test)]

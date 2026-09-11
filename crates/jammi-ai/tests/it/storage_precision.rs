@@ -324,7 +324,7 @@ async fn per_request_oversample_overrides_table_default() {
 
     let index = session
         .result_store()
-        .resolve_search_mode(&table)
+        .resolve_search_mode_local(&table)
         .await
         .unwrap()
         .expect("the Int8 sidecar index must load");

@@ -172,6 +172,26 @@ preload_models = [
     "sentence-transformers/all-MiniLM-L6-v2",
     { id = "local:/models/bge-small", task = "text_embedding" },
 ]
+# MARGINAL-LOAD ADMISSION per query, in bytes (a plain integer): the maximum
+# estimated bytes ONE query may load locally for segments it does not own,
+# when their owners are unreachable -- the last rung of the placed-search
+# failure ladder (see "Beyond one node" in reference-topologies.md). Unset
+# (the default) = unbounded, today's behaviour. It is NOT a memory cap: the
+# segment cache never evicts, earlier queries' loads are invisible to the
+# check (each query loads afresh and frees on completion; the on-disk copy of
+# a remote bundle persists), distinct remote segments accumulate on disk, and
+# concurrent queries admit independently, so peak heap is
+# concurrency x budget. The estimate per segment is
+# row_count x (dimensions x bytes(precision) + 32 + 64) -- 4 (F32) / 2 (F16)
+# / 1 (Int8) / ceil(d/8)/d (Binary) bytes per component, 32 bytes of row-id
+# strings and 64 bytes of graph link overhead per row -- a LOWER bound for
+# the quantized precisions: the rawf32 companion is excluded (it is a
+# positioned read, never resident), but usearch's level-0 links and the
+# row-id HashMap are unmodelled, so the true resident size exceeds it.
+# Prescribe headroom: set the budget to at most half the memory you are
+# willing to give one query's fallback loads. 0 is refused. Read by the
+# result store; a library embedder sets it through the same config.
+# peer_local_load_bytes = 268435456
 
 [server.limits]
 # Request-bounds and refusal policy for the combined gRPC + Flight SQL

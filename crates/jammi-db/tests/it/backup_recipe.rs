@@ -138,7 +138,7 @@ async fn close_copy_reopen_preserves_rows() {
         .await
         .unwrap();
     let index = restored_store
-        .resolve_search_mode(&restored)
+        .resolve_search_mode_local(&restored)
         .await
         .unwrap()
         .expect("the ANN sidecar survived the copy too");

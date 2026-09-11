@@ -1273,6 +1273,15 @@ pub struct ServerConfig {
     /// Request-bounds and refusal-policy limits for the combined gRPC +
     /// Flight SQL surface. See [`LimitsConfig`].
     pub limits: LimitsConfig,
+    /// MARGINAL-LOAD ADMISSION per query, in bytes: the maximum estimated
+    /// bytes ONE query may load locally for segments it does not own, when
+    /// their owners are unreachable (the last rung of the placed-search
+    /// failure ladder). Unset (the default) = unbounded. NOT a memory cap: the
+    /// segment cache never evicts, earlier queries' loads are invisible to the
+    /// check, and concurrent queries admit independently, so peak heap is
+    /// concurrency × budget. Read by the result store; a library embedder sets
+    /// it through the same config. `Some(0)` is refused.
+    pub peer_local_load_bytes: Option<u64>,
 }
 
 /// The optional service-tier selection for a server deployment. `All` (the
@@ -1642,6 +1651,11 @@ impl ServerConfig {
                 "health_listen and flight_listen must be different addresses".into(),
             ));
         }
+        if self.peer_local_load_bytes == Some(0) {
+            return Err(crate::error::JammiError::Config(
+                "server.peer_local_load_bytes must be > 0 when set (unset = unbounded)".into(),
+            ));
+        }
         self.limits.validate()?;
         Ok(())
     }
@@ -1948,6 +1962,7 @@ impl Default for ServerConfig {
             preload_models: Vec::new(),
             services: ServiceSelection::default(),
             limits: LimitsConfig::default(),
+            peer_local_load_bytes: None,
         }
     }
 }

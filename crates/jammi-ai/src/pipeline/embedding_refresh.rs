@@ -75,6 +75,10 @@ pub mod refresh_test_hooks {
         /// transaction — the window §6.13 (concurrent visibility) and §6.12
         /// (an expired version lease beside a live table row) observe.
         BeforePublish,
+        /// Before `ensure_base_version`'s own `publish_base_version` CAS —
+        /// the window a concurrent base publisher (DELTA fix round 2, F1)
+        /// wins in.
+        BeforeBasePublish,
     }
 
     struct Armed {
@@ -231,8 +235,10 @@ fn embedding_params(table: &str, descriptor: &ProducingDescriptor) -> Result<Emb
 /// `parent`'s OWN masked provider (`build_masked_provider`) — never the
 /// process-locally bound `ctx.table("jammi.{table}")`, whose registration a
 /// second process or a stale session may not have re-bound past `parent`
-/// (F2): the delta must be computed against the exact state the CAS in step 6
-/// will pin `current_version` to, not whatever this process happens to have
+/// (F2, and see [`ResultStore::bind_result_table`]'s doc for the full
+/// staleness residual this read is one instance of): the delta must be
+/// computed against the exact state the CAS in step 6 will pin
+/// `current_version` to, not whatever this process happens to have
 /// registered. Duplicate keys → `NonUniqueKey { Parent }`; a NULL or
 /// malformed hash → `NotRefreshable { MissingContentHash }`.
 ///
@@ -353,14 +359,13 @@ impl InferenceSession {
             .expect("a base version is published before any delta");
 
         // ── step 2: the parent manifest ────────────────────────────────────
+        // `resolve_version_manifest`, not `read_version_manifest` directly:
+        // it also checks the version row exists and is `ready` — the same
+        // check `bind_result_table` performs on the path this replaces.
         let parquet_url = StorageUrl::parse(&record.parquet_path)?;
         let parent = store
-            .read_version_manifest(&record.table_name, &parquet_url, parent_version)
-            .await?
-            .ok_or_else(|| JammiError::VersionUnavailable {
-                table: record.table_name.clone(),
-                version: parent_version,
-            })?;
+            .resolve_version_manifest(&record, parent_version)
+            .await?;
 
         // ── step 3: the current state ──────────────────────────────────────
         let current = current_state(&store, ctx, &record, &parent).await?;
@@ -707,6 +712,9 @@ impl InferenceSession {
         let manifest_url = store
             .write_version_manifest(&parquet_url, &manifest)
             .await?;
+        #[cfg(feature = "test-hooks")]
+        refresh_test_hooks::maybe_park(&table, refresh_test_hooks::ParkPoint::BeforeBasePublish)
+            .await;
         match self
             .catalog()
             .publish_base_version(
@@ -719,8 +727,13 @@ impl InferenceSession {
             .await
         {
             Ok(()) => {}
-            Err(JammiError::CasFailed { .. }) => {
+            Err(JammiError::ParentMoved { .. }) => {
                 // A concurrent base publisher won: proceed with its version.
+                // `classify_ready_cas_miss` unifies every ready-row parent
+                // mismatch under `ParentMoved` (never `CasFailed`, whose
+                // `status` payload would misname a `ready` row as "left
+                // building") — this is the base-publish arm of that SAME
+                // classification, not a separate spelling to widen for.
             }
             Err(e) => return Err(e),
         }
@@ -732,10 +745,17 @@ impl InferenceSession {
                 table: table.clone(),
             })?;
         let Some(current) = record.current_version else {
-            return Err(JammiError::CasFailed {
-                table,
-                status: record.status,
-            });
+            // Unreachable by construction post-unification: `Ok(())` means
+            // this call's own CAS landed `current_version`; the absorbed
+            // `ParentMoved` arm above only fires when the re-read found
+            // `current_version = Some(_)` (a `ready` row whose parent moved),
+            // and `current_version` only ever increases (never reset back to
+            // `NULL`). A catalog invariant violation, not a lost race.
+            return Err(JammiError::Catalog(format!(
+                "result table '{table}' has no current_version immediately \
+                 after its own or an absorbed concurrent base publish — a \
+                 catalog invariant violation"
+            )));
         };
         // Idempotent: the winner's manifest must exist at its path.
         let winner_url = jammi_db::store::layout::version_manifest_url(&parquet_url, current)?;
@@ -996,14 +1016,13 @@ impl InferenceSession {
         let parent_version = record
             .current_version
             .expect("a base version is published before any compaction");
+        // `resolve_version_manifest`, not `read_version_manifest` directly:
+        // it also checks the version row exists and is `ready` — the same
+        // check `bind_result_table` performs on the path this replaces.
         let parquet_url = StorageUrl::parse(&record.parquet_path)?;
         let parent = store
-            .read_version_manifest(&record.table_name, &parquet_url, parent_version)
-            .await?
-            .ok_or_else(|| JammiError::VersionUnavailable {
-                table: record.table_name.clone(),
-                version: parent_version,
-            })?;
+            .resolve_version_manifest(&record, parent_version)
+            .await?;
         let dimensions = params.dimensions;
 
         let mut version = store.allocate_version(&record).await?;

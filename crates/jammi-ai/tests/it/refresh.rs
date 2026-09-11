@@ -806,6 +806,85 @@ async fn concurrent_refreshes_on_one_parent_publish_exactly_once() {
     );
 }
 
+/// DELTA fix round 2 (audit a98bf51479b523692 F1 / design round a1492adfcf0d0f8e6
+/// item 1c) — a concurrent BASE publish must not fail the whole refresh. Two
+/// sessions on the SAME root/catalog both race `ensure_base_version` on a
+/// never-based table; session 1 is parked right before its own
+/// `publish_base_version` CAS, session 2 (unparked — the arm is one-shot, so
+/// a second refresh passes straight through) publishes the base to
+/// completion, then session 1 is released. Session 1's base-publish CAS now
+/// misses on `current_version` no longer `NULL` — the SAME lost-race shape
+/// `ParentMoved` already names for the allocation and publish-table-row
+/// misses — so `ensure_base_version`'s absorb arm must treat it exactly like
+/// that: absorb, adopt the winner's version 0, and let the refresh proceed
+/// to its own (empty) delta as `NoChange`, never fail the whole refresh.
+/// Before the fix (F1 unified the base-publish miss into `ParentMoved` but
+/// left the absorb arm matching only the old `CasFailed` spelling), this
+/// returns `Err(ParentMoved { .. })`.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn concurrent_base_publish_does_not_fail_the_refresh() {
+    use jammi_ai::pipeline::embedding_refresh::refresh_test_hooks::{arm, ParkPoint};
+
+    let h = harness(20).await;
+    assert_eq!(
+        h.record().await.current_version,
+        None,
+        "a fresh table has no base version yet"
+    );
+
+    let park = arm(&h.table, ParkPoint::BeforeBasePublish);
+    let session1 = Arc::clone(&h.session);
+    let table = h.table.clone();
+    let parked = tokio::spawn(async move {
+        session1
+            .refresh_embeddings(&table, RefreshOptions::default())
+            .await
+    });
+    park.wait_parked().await;
+    assert!(park.is_parked());
+
+    // Session 2: a second `InferenceSession` on the SAME root/catalog. Its
+    // own `refresh_embeddings` reaches the same park point, finds the arm
+    // already taken (one-shot), passes through, and publishes the base to
+    // completion.
+    let session2 = open_session(&h.root, 1).await;
+    let report2 = session2
+        .refresh_embeddings(&h.table, RefreshOptions::default())
+        .await
+        .unwrap();
+    assert_eq!(report2.outcome, RefreshOutcome::NoChange);
+    assert_eq!(report2.version, Some(0));
+    assert_eq!(h.record().await.current_version, Some(0));
+
+    park.release();
+    let report1 = parked
+        .await
+        .unwrap()
+        .expect("a concurrent base publish must not fail session 1's refresh");
+    assert_eq!(report1.outcome, RefreshOutcome::NoChange);
+    assert_eq!(
+        report1.version,
+        Some(0),
+        "session 1 adopts the winner's version"
+    );
+
+    // Exactly one base row — session 1's absorbed loss never inserted a
+    // second version row (its whole `publish_base_version` transaction
+    // rolled back at the miss, before any INSERT).
+    let versions = h
+        .session
+        .catalog()
+        .list_result_table_versions(&h.table)
+        .await
+        .unwrap();
+    assert_eq!(
+        versions.iter().map(|v| v.version).collect::<Vec<_>>(),
+        vec![0],
+        "exactly one base row: {versions:?}"
+    );
+    assert_eq!(versions[0].status, "ready");
+}
+
 /// O2 (DELTA fix round 1, audit a25424e2aa5e91337 F2) — two SESSIONS on one
 /// catalog: session 1 is at version 0 (having just published the base);
 /// session 2, a SECOND `InferenceSession` opened on the SAME root/catalog,
@@ -861,8 +940,9 @@ async fn stale_process_binding_does_not_corrupt_a_concurrent_refresh() {
     // read through the CURRENT version's OWN masked provider (never
     // session 1's stale `ctx` — a `SELECT` through `ctx` is a DIFFERENT,
     // pre-existing staleness class this fix does not close, see
-    // `current_state`'s doc comment), must be exactly 25, not 30 (25 real
-    // rows plus 5 duplicates from a re-inferred fragment).
+    // `ResultStore::bind_result_table`'s doc comment for the full
+    // read-class/persist-class residual), must be exactly 25, not 30 (25
+    // real rows plus 5 duplicates from a re-inferred fragment).
     let record = h.record().await;
     let manifest = h
         .session
@@ -882,6 +962,79 @@ async fn stale_process_binding_does_not_corrupt_a_concurrent_refresh() {
         .await
         .unwrap();
     assert_eq!(live, 25, "count_live_rows must be exact, no duplicate rows");
+}
+
+/// DELTA fix round 2 (audit a98bf51479b523692 F3 / design round
+/// a1492adfcf0d0f8e6 "the persisting residual") —
+/// `ResultStore::current_version_provider` is the ONE new read seam the five
+/// persisting producers (neighbor_graph, recompute, context_set,
+/// graph_propagation, context_predictor) now route through instead of a
+/// session's registered `jammi.{table}`, precisely so a producer that
+/// resolves its artifact's provenance from a FRESH catalog read (e.g.
+/// `result_digest_anchor`, which reads `table.current_version`) reads
+/// content that agrees with it.
+///
+/// Same two-session staleness shape as
+/// `stale_process_binding_does_not_corrupt_a_concurrent_refresh` (O2):
+/// session 1 publishes v0 (20 rows); session 2 (a SECOND `InferenceSession`
+/// on the SAME root/catalog) refreshes to v1, adding 5 rows. Session 1's own
+/// `ctx` is never rebound past v0 (only the PUBLISHING session's own
+/// `bind_result_table` call touches its `ctx`) — a raw SQL scan over session
+/// 1 still serves 20 rows. `current_version_provider`, given session 1's
+/// `ctx` but a freshly re-read record (`current_version = Some(1)`), must
+/// read v1's full 25 rows regardless of session 1's stale registration.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn current_version_provider_reads_the_catalog_version_not_the_stale_session() {
+    let h = harness(20).await;
+    let base = h.refresh().await.unwrap();
+    assert_eq!(base.outcome, RefreshOutcome::NoChange);
+    assert_eq!(h.record().await.current_version, Some(0));
+
+    let session2 = open_session(&h.root, 1).await;
+    let mut rows25 = rows(20);
+    rows25.extend((20..25).map(|i| (Some(i), text_for(i))));
+    write_parquet(&h.source_path, &rows25);
+    let report2 = session2
+        .refresh_embeddings(&h.table, RefreshOptions::default())
+        .await
+        .unwrap();
+    assert_eq!(report2.outcome, RefreshOutcome::Published);
+    assert_eq!(h.record().await.current_version, Some(1));
+
+    // Session 1's own registration is still v0 — a raw SQL scan proves it,
+    // the exact staleness `bind_result_table`'s doc now names.
+    let stale_batches = h
+        .session
+        .sql(&format!("SELECT _row_id FROM \"jammi.{}\"", h.table))
+        .await
+        .unwrap();
+    let stale_rows: usize = stale_batches.iter().map(|b| b.num_rows()).sum();
+    assert_eq!(stale_rows, 20, "session 1's own registration is still v0");
+
+    // A FRESH catalog read (current_version = Some(1)) fed into
+    // `current_version_provider`, through session 1's OWN `ctx`, must read
+    // v1's 25 rows — never session 1's stale 20.
+    let fresh_record = h.record().await;
+    assert_eq!(fresh_record.current_version, Some(1));
+    let provider = h
+        .session
+        .result_store()
+        .current_version_provider(h.session.context(), &fresh_record)
+        .await
+        .unwrap();
+    let batches = h
+        .session
+        .context()
+        .read_table(provider)
+        .unwrap()
+        .collect()
+        .await
+        .unwrap();
+    let fresh_rows: usize = batches.iter().map(|b| b.num_rows()).sum();
+    assert_eq!(
+        fresh_rows, 25,
+        "current_version_provider reads the catalog's current version, not the stale session"
+    );
 }
 
 /// O2 (DELTA fix round 1, audit a25424e2aa5e91337 F2/V2) — the compaction

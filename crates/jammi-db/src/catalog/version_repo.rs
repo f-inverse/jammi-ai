@@ -224,12 +224,24 @@ impl Catalog {
     /// `ParentMoved { expected, found }` — the row IS `ready` but its
     /// `current_version` disagrees with the parent the caller derived its
     /// write from (a concurrent publisher won the race; this is the ONE
-    /// classification for both the allocation miss and the publish
-    /// table-row miss, so the lost-race condition never gets two typed
-    /// spellings depending on which gate caught it) — or `CasFailed {
+    /// classification for the allocation miss, the publish table-row miss
+    /// AND the base-publish miss, so the lost-race condition never gets two
+    /// typed spellings depending on which gate caught it) — or `CasFailed {
     /// status }` for every other non-`ready` shape. Owner-less on purpose: a
     /// `result_tables` row a concurrent recovery flipped to `building` must
     /// never read as `LeaseLost` to a refresher.
+    ///
+    /// This models exactly ONE conjunct: `current_version == expected_parent`.
+    /// The base publish's OWN CAS (`publish_base_version`) additionally
+    /// requires `next_version = $B`; a miss on THAT conjunct alone (someone
+    /// else allocated a version — moved `next_version` — while
+    /// `current_version` is still `NULL`, so this classifier's modelled
+    /// conjunct still matches and it falls through to `CasFailed`) is a real
+    /// blind spot, but reachable only through `Self::allocate_result_table_version`
+    /// on a never-based record — a shape no production caller produces
+    /// (`refresh_embeddings`/`compact_embeddings` always call
+    /// `ensure_base_version`, which publishes the base, before ever
+    /// allocating). Documented here rather than given its own wire variant.
     pub(crate) fn classify_ready_cas_miss(
         table: &str,
         arm: &TenantArm,
@@ -534,6 +546,34 @@ impl Catalog {
     /// `current_version`, or the row is not `ready`). Nothing is visible
     /// before this commits.
     pub async fn publish_version(&self, p: PublishVersion<'_>) -> Result<()> {
+        // Monotonicity precondition, moved OUT of the SQL swap below (was
+        // `AND current_version < $1` beside the exact-match `current_version
+        // = $5`): given that exact match, `current_version < cas.version`
+        // reduces to `parent < cas.version` — both caller-supplied constants
+        // known before the transaction even opens, so this needs no
+        // database round-trip at all. Refusing here ALSO closes a
+        // classifier blind spot: the SQL conjunct's miss fell through
+        // `classify_ready_cas_miss` to `CasFailed { status: "ready" }` (the
+        // row's own `current_version` still equals `expected_parent`, so the
+        // `ParentMoved` arm never fired), the exact misnaming-for-a-ready-row
+        // lie `ParentMoved` was invented to stop. This precondition protects
+        // ONLY this swap's own CAS; strict monotonicity of
+        // `result_tables.current_version` as a WRITER-SET property (today
+        // exactly two writers, `publish_base_version` and this swap, both
+        // strictly increasing) is not re-derivable from a single call's
+        // arguments and needs its own source-level enumeration if a third
+        // writer (a future pin/revert verb) is ever added.
+        if let Some(pv) = p.parent {
+            if pv >= p.cas.version {
+                return Err(JammiError::Catalog(format!(
+                    "result table '{}': publish parent version {pv} is not \
+                     strictly less than the version being published ({}) — \
+                     a catalog invariant violation (current_version must \
+                     only increase)",
+                    p.cas.table, p.cas.version
+                )));
+            }
+        }
         let cas = p.cas.clone();
         let cas_in_tx = cas.clone();
         let lease = p.lease;
@@ -595,20 +635,16 @@ impl Catalog {
                         SqlValue::TextOwned(anchors_json),
                         SqlValue::TextOwned(cas.table.clone()),
                     ];
+                    // The monotonicity guard (`parent < cas.version`) is now
+                    // the precondition at the top of this function, refused
+                    // before this transaction ever opens — see its comment
+                    // for why the SQL-side conjunct this arm used to carry
+                    // has been dropped: it was reachable only via a
+                    // classifier blind spot that mis-typed the refusal.
                     let parent_arm = match parent {
-                        // `AND current_version < $1` is a monotonicity guard
-                        // beyond the exact-match above: soundness of a
-                        // pinned-parent CAS rests on `current_version` only
-                        // ever increasing (two writers total, `:437` and
-                        // this one, both strictly greater than the old
-                        // value; no rollback/pin verb exists). Redundant
-                        // today because `pv` is always the allocator's own
-                        // prior read, but it turns the FIRST future
-                        // "pin/revert to version k" verb into a refused CAS
-                        // instead of a silently reopened F1.
                         Some(pv) => {
                             params.push(SqlValue::Int(pv));
-                            format!("current_version = ${} AND current_version < $1", params.len())
+                            format!("current_version = ${}", params.len())
                         }
                         None => "current_version IS NULL".to_string(),
                     };

@@ -403,8 +403,10 @@ impl InferenceSession {
     /// Pool the stored vectors of `context_keys` from `table`'s embedding
     /// Parquet into one fixed-width vector via the vector-aggregation UDAF.
     ///
-    /// Filters the registered embedding table to the context keys and runs
-    /// `vector_<agg>(vector)` over them — the aggregate's *value* is
+    /// Reads through [`jammi_db::store::ResultStore::current_version_provider`]
+    /// — `table`'s OWN `current_version`, never the session's registered
+    /// `jammi.{table}` (see that method's doc) — filtered to the context keys,
+    /// then runs `vector_<agg>(vector)` over them — the aggregate's *value* is
     /// permutation-invariant by construction, so it does not depend on the order
     /// the keys arrive in. Under a fixed execution plan the pooled vector is also
     /// stable run-to-run; it is not byte-identical across arbitrary partitionings
@@ -438,20 +440,18 @@ impl InferenceSession {
                 ))
             })?;
 
-        // Result tables register under the single bare literal `jammi.{name}`
-        // (`ResultStore::register_table`), so reach this one through
-        // `TableReference::bare` — a `&str` would be re-parsed and split on the
-        // dot, missing the registered table whenever the name carries a hyphen
-        // from a sanitized local model path.
-        let table_ref =
-            datafusion::sql::TableReference::bare(format!("jammi.{}", table.table_name));
         let keys: Vec<datafusion::prelude::Expr> =
             context_keys.iter().map(|k| lit(k.as_str())).collect();
-        let pooled = self
-            .context()
-            .table(table_ref.clone())
-            .await
-            .map_err(|e| JammiError::Other(format!("Context pool: resolve '{table_ref}': {e}")))?
+        let ctx = self.context();
+        let provider = self
+            .result_store()
+            .current_version_provider(ctx, table)
+            .await?;
+        let pooled = ctx
+            .read_table(provider)
+            .map_err(|e| {
+                JammiError::Other(format!("Context pool: resolve '{}': {e}", table.table_name))
+            })?
             // Typed IN-list over the keys — the arbitrary row keys are bound
             // values, never interpolated into SQL text.
             .filter(col("_row_id").in_list(keys, false))

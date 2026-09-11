@@ -809,10 +809,15 @@ impl InferenceSession {
     }
 
     /// Read the stored `vector` of each key from the embedding table, in the
-    /// given (retrieval) order, through the generic SQL surface — a typed
-    /// `_row_id IN (keys)` scan of `jammi.{table}`, the per-member read the
-    /// attentive members attend over. The keys are bound IN-list values, never
-    /// interpolated, so an arbitrary key is not an injection vector.
+    /// given (retrieval) order — a typed `_row_id IN (keys)` scan of
+    /// `table`'s OWN `current_version`
+    /// ([`jammi_db::store::ResultStore::current_version_provider`]), never
+    /// the session's registered `jammi.{table}` (see that method's doc): the
+    /// trained predictor this member scan feeds into is a persisted
+    /// checkpoint, so its training rows must match the table's catalog-known
+    /// current state, not whatever a stale session registration still
+    /// serves. The keys are bound IN-list values, never interpolated, so an
+    /// arbitrary key is not an injection vector.
     async fn read_member_vectors(
         &self,
         table: &ResultTableRecord,
@@ -823,16 +828,26 @@ impl InferenceSession {
         }
         use datafusion::prelude::{col, lit};
 
-        let table_ref =
-            datafusion::sql::TableReference::bare(format!("jammi.{}", table.table_name));
         let keys: Vec<datafusion::prelude::Expr> =
             context_keys.iter().map(|k| lit(k.as_str())).collect();
-        let batches = self
-            .context()
-            .table(table_ref.clone())
+        let ctx = self.context();
+        let provider = self
+            .result_store()
+            .current_version_provider(ctx, table)
             .await
             .map_err(|e| {
-                JammiError::FineTune(format!("member-vectors resolve '{table_ref}': {e}"))
+                JammiError::FineTune(format!(
+                    "member-vectors resolve '{}': {e}",
+                    table.table_name
+                ))
+            })?;
+        let batches = ctx
+            .read_table(provider)
+            .map_err(|e| {
+                JammiError::FineTune(format!(
+                    "member-vectors resolve '{}': {e}",
+                    table.table_name
+                ))
             })?
             .filter(col("_row_id").in_list(keys, false))
             .map_err(|e| JammiError::FineTune(format!("member-vectors filter: {e}")))?

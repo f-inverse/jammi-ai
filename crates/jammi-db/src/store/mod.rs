@@ -2329,12 +2329,17 @@ impl ResultStore {
         Ok(url)
     }
 
-    /// Resolve the CURRENT version's manifest for a read: the version row
-    /// must be `ready` and the manifest present, else the typed
+    /// Resolve a version's manifest for a read: the version row must be
+    /// `ready` and the manifest present, else the typed
     /// [`JammiError::VersionUnavailable`] (D14(i)). Runs the row read under
     /// admin scope: the caller already resolved `table` through the
     /// tenant-scoped table read, and a version inherits its table's owner.
-    async fn resolve_version_manifest(
+    /// `pub` so a caller that reads a specific version's manifest directly
+    /// (rather than through [`Self::bind_result_table`] /
+    /// [`Self::current_version_provider`]) still performs this same
+    /// "row exists and is ready" check instead of going straight to
+    /// [`Self::read_version_manifest`], which performs no such check.
+    pub async fn resolve_version_manifest(
         &self,
         table: &ResultTableRecord,
         version: i64,
@@ -2382,6 +2387,32 @@ impl ResultStore {
     /// `VersionUnavailable`), registered under the row's owner so a peer
     /// tenant still resolves not-found. Evicts the table's loaded segment
     /// sets. Called by startup, `BuildingTable::finish` and `publish_version`.
+    ///
+    /// **Known staleness residual.** This is the ONLY writer of a session's
+    /// `jammi.{table}` registration for a versioned table, and it runs ONLY at
+    /// session open and after THIS store's own publish — never for a table a
+    /// sibling store (a second process, or a second `InferenceSession` on the
+    /// same catalog) publishes. So `ctx.table("jammi.{table}")` /
+    /// `SessionContext::sql` over a versioned table is NOT reliably the
+    /// catalog's `current_version`; it is whatever this session last bound.
+    /// Two classes of caller are affected differently:
+    ///   - **Read class** (an ad-hoc `SELECT`, `search_vectors`'/
+    ///     `search_vectors_local`'s exact fallback, the generic SQL surface):
+    ///     serves a stale-but-retryable answer. Pre-existing, not a regression
+    ///     — closing it means resolving the registration from the catalog's
+    ///     `current_version` at query time, out of scope here, tracked as its
+    ///     own issue.
+    ///   - **Persist class** (a producer that materializes a DURABLE artifact
+    ///     whose provenance names this table, e.g. via
+    ///     [`ResultStore::result_digest_anchor`]): reading the stale
+    ///     registration would persist an artifact whose provenance names one
+    ///     version while its content came from another, cache it under the
+    ///     newer version's identity, and have the freshness check read it as
+    ///     fresh — every later, correctly-bound process then gets a cache HIT
+    ///     on the wrong artifact (self-propagating, not merely stale). Every
+    ///     such producer MUST read through
+    ///     [`ResultStore::current_version_provider`] instead, never through
+    ///     this session's registration.
     pub async fn bind_result_table(
         &self,
         ctx: &SessionContext,
@@ -2475,6 +2506,42 @@ impl ResultStore {
             mask,
             schema,
         )))
+    }
+
+    /// The read a producer that PERSISTS a derived artifact must use for the
+    /// source rows its artifact's provenance names — see the staleness
+    /// residual documented on [`Self::bind_result_table`]. Resolves
+    /// `table.current_version` (the SAME field a catalog-resolved anchor
+    /// such as [`Self::result_digest_anchor`] reads) via
+    /// [`Self::resolve_version_manifest`] and returns its masked provider;
+    /// `None` (no base version published yet) falls back to a fresh
+    /// `ListingTable` over the base Parquet, the same fallback
+    /// `bind_result_table` takes. UNREGISTERED: the caller reads it via
+    /// `ctx.read_table(provider)`, never registers it under `jammi.{table}`
+    /// — that would race the session's own binding of the same name.
+    ///
+    /// `table` itself is not re-read from the catalog here: the caller is
+    /// expected to have just resolved it (e.g. via
+    /// `Catalog::resolve_embedding_table` / `Catalog::get_result_table`)
+    /// immediately before computing its artifact's anchor, so `table`'s own
+    /// `current_version` field already IS the fresh catalog value the
+    /// anchor names — this method's only job is to make the READ agree with
+    /// it instead of falling back to a stale session-bound registration.
+    pub async fn current_version_provider(
+        &self,
+        ctx: &SessionContext,
+        table: &ResultTableRecord,
+    ) -> Result<Arc<dyn TableProvider>> {
+        match table.current_version {
+            None => {
+                let url = StorageUrl::parse(&table.parquet_path)?;
+                build_result_table_provider(ctx, &self.registry, &url, None).await
+            }
+            Some(version) => {
+                let manifest = self.resolve_version_manifest(table, version).await?;
+                self.build_masked_provider(ctx, table, &manifest).await
+            }
+        }
     }
 
     /// Persist a fully-built [`SidecarIndex`] as a NEW immutable segment of

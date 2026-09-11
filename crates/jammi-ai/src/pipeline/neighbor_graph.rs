@@ -299,16 +299,26 @@ impl<'a> NeighborGraphPipeline<'a> {
     }
 
     /// Read every `(_row_id, vector)` pair from the embedding table's Parquet,
-    /// in the order the engine scans it. Reuses the registered DataFusion table
-    /// so cloud credentials and the tenant-scoped registration are inherited.
+    /// in the order the engine scans it. Reads through
+    /// [`ResultStore::current_version_provider`] — `table`'s OWN
+    /// `current_version` (the same field `result_digest_anchor` above just
+    /// resolved), never the session's registered `jammi.{table}` — so the
+    /// edges this build writes are computed over exactly the rows its
+    /// `ResultDigest` anchor names, never a session-stale prior version.
     async fn read_nodes(&self, table: &ResultTableRecord) -> Result<Vec<Node>> {
-        let batches = self
-            .session
-            .sql(&format!(
-                "SELECT _row_id, vector FROM \"jammi.{}\"",
-                table.table_name
-            ))
+        let ctx = self.session.context();
+        let provider = self
+            .result_store
+            .current_version_provider(ctx, table)
             .await?;
+        let batches = ctx
+            .read_table(provider)
+            .map_err(JammiError::from)?
+            .select_columns(&["_row_id", "vector"])
+            .map_err(JammiError::from)?
+            .collect()
+            .await
+            .map_err(JammiError::from)?;
 
         let mut nodes = Vec::new();
         for batch in &batches {

@@ -793,6 +793,119 @@ async fn allocation_is_monotonic_and_never_reused(kind: BackendKind) {
     d2.detach();
 }
 
+// DELTA fix round 2 (audit a98bf51479b523692 advisory / design round
+// a1492adfcf0d0f8e6 item 3) — the monotonicity guard's refused direction:
+// `publish_version`'s parent must be strictly less than the version being
+// published. Two allocations off parent 0 (versions 1 and 2, the same
+// fixture `allocation_is_monotonic_and_never_reused` uses); publish v2
+// FIRST (parent 0, the always-true direction), THEN attempt to publish v1
+// with `parent: Some(2)` — the refused direction (`2 >= 1`). Before the
+// guard moved into Rust, the SQL conjunct's miss fell through
+// `classify_ready_cas_miss` to `CasFailed { status: "ready" }` (the row's
+// `current_version` (2) equals `expected_parent` (2), so `ParentMoved`
+// never fired) — the same misnaming-for-a-ready-row shape `ParentMoved`
+// exists to stop. The precondition now refuses typed, deterministically,
+// before any transaction opens, on both backends, with no concurrency
+// required.
+#[cfg_attr(test, test_case(BackendKind::Sqlite ; "sqlite"))]
+#[cfg_attr(
+    all(test, feature = "live-postgres-tests"),
+    test_case(BackendKind::Postgres ; "postgres")
+)]
+#[tokio::test]
+async fn publish_refuses_a_non_monotonic_parent(kind: BackendKind) {
+    use jammi_db::catalog::version_repo::{PublishVersion, VersionCas};
+
+    let dir = tempdir().unwrap();
+    let Some(backend) = open_backend(kind, dir.path()).await else {
+        eprintln!("skipping {kind:?}: JAMMI_TEST_PG_URL unset");
+        return;
+    };
+    let catalog = fresh_catalog(backend).await;
+    let store = store(dir.path(), Arc::clone(&catalog), StoragePrecision::F32);
+    let table = ready_table(&store).await;
+    catalog
+        .publish_base_version(&table.table_name, 0, "mem://base.version.json", "id0", 5)
+        .await
+        .unwrap();
+    let base = catalog
+        .get_result_table(&table.table_name)
+        .await
+        .unwrap()
+        .unwrap();
+
+    let d1 = store.allocate_version(&base).await.unwrap();
+    assert_eq!((d1.version(), d1.parent_version()), (1, Some(0)));
+    let d2 = store.allocate_version(&base).await.unwrap();
+    assert_eq!((d2.version(), d2.parent_version()), (2, Some(0)));
+
+    // v2 publishes first — the always-true direction (0 < 2).
+    let cas2 = VersionCas::writer(&table.table_name, 2, store.writer_id(), None);
+    catalog
+        .publish_version(PublishVersion {
+            cas: &cas2,
+            lease: std::time::Duration::from_secs(30),
+            parent: Some(0),
+            identity: "id-v2",
+            live_rows: 5,
+            masked_rows: 0,
+            anchors_json: "[]",
+        })
+        .await
+        .unwrap();
+    let after_v2 = catalog
+        .get_result_table(&table.table_name)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(after_v2.current_version, Some(2));
+
+    // v1 attempts to publish with parent: Some(2) — the refused direction
+    // (2 >= 1). A caller can only construct this by naming a parent NEWER
+    // than the version it is publishing; no production caller does, but the
+    // primitive itself must refuse it, typed, not silently corrupt state or
+    // silently misname the cause.
+    let cas1 = VersionCas::writer(&table.table_name, 1, store.writer_id(), None);
+    let err = catalog
+        .publish_version(PublishVersion {
+            cas: &cas1,
+            lease: std::time::Duration::from_secs(30),
+            parent: Some(2),
+            identity: "id-v1",
+            live_rows: 5,
+            masked_rows: 0,
+            anchors_json: "[]",
+        })
+        .await
+        .expect_err("a non-monotonic parent must refuse");
+    assert!(
+        matches!(err, jammi_db::error::JammiError::Catalog(_)),
+        "{err:?}"
+    );
+    assert!(
+        !matches!(err, jammi_db::error::JammiError::CasFailed { .. }),
+        "must not misname the cause as a ready-row CAS miss: {err:?}"
+    );
+
+    // Refused BEFORE the transaction opens: current_version is untouched and
+    // v1's `building` row is untouched (never re-read, never renewed).
+    let after = catalog
+        .get_result_table(&table.table_name)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(after.current_version, Some(2), "unchanged by the refusal");
+    let v1row = catalog
+        .get_result_table_version(&table.table_name, 1)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(v1row.status, "building", "v1's row is untouched");
+
+    d1.detach();
+    d2.detach();
+}
+
 // O1 (DELTA fix round 1, audit a25424e2aa5e91337 F1) — the serialized
 // interleaving the pre-fix §6.7 oracle could never build: A publishes
 // FULLY (allocates AND publishes) from parent P, THEN B — still holding

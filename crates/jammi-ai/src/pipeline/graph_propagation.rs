@@ -467,12 +467,23 @@ impl InferenceSession {
         table: &ResultTableRecord,
         dimensions: usize,
     ) -> Result<Vec<NodeFeatures>> {
-        let batches = self
-            .sql(&format!(
-                "SELECT _row_id, vector FROM \"jammi.{}\"",
-                table.table_name
-            ))
+        // Reads through `current_version_provider` — `table`'s OWN
+        // `current_version`, the same field its `ResultDigest` anchor above
+        // just resolved — never the session's registered `jammi.{table}`
+        // (see that method's doc for why the two can disagree).
+        let ctx = self.context();
+        let provider = self
+            .result_store()
+            .current_version_provider(ctx, table)
             .await?;
+        let batches = ctx
+            .read_table(provider)
+            .map_err(JammiError::from)?
+            .select_columns(&["_row_id", "vector"])
+            .map_err(JammiError::from)?
+            .collect()
+            .await
+            .map_err(JammiError::from)?;
 
         let mut nodes: Vec<NodeFeatures> = Vec::new();
         for batch in &batches {

@@ -457,15 +457,25 @@ impl InferenceSession {
     }
 
     /// Read every `(_row_id, vector)` of an embedding table into owned rows — the
-    /// targets a ContextSet recompute re-pools over. Reuses the registered
-    /// DataFusion table so tenant scope and cloud credentials are inherited.
+    /// targets a ContextSet recompute re-pools over. Reads through
+    /// [`jammi_db::store::ResultStore::current_version_provider`] — `table`'s
+    /// OWN `current_version`, never the session's registered `jammi.{table}` —
+    /// so a recompute pools over exactly the source's current rows, never a
+    /// session-stale prior version.
     async fn read_target_rows(&self, table: &ResultTableRecord) -> Result<Vec<(String, Vec<f32>)>> {
-        let batches = self
-            .sql(&format!(
-                "SELECT _row_id, vector FROM \"jammi.{}\"",
-                table.table_name
-            ))
+        let ctx = self.context();
+        let provider = self
+            .result_store()
+            .current_version_provider(ctx, table)
             .await?;
+        let batches = ctx
+            .read_table(provider)
+            .map_err(JammiError::from)?
+            .select_columns(&["_row_id", "vector"])
+            .map_err(JammiError::from)?
+            .collect()
+            .await
+            .map_err(JammiError::from)?;
 
         let mut rows = Vec::new();
         for batch in &batches {

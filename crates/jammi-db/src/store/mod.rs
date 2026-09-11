@@ -2105,10 +2105,8 @@ impl ResultStore {
             // bypasses the mask the online search verb promises. `sources`
             // (a flat, unversioned `list_index_segments` load) is not used on
             // this arm; the versioned resolver owns segment selection.
-            return Ok(self
-                .resolve_search_mode_local(table)
-                .await?
-                .map(|index| PlacedIndex::from_local(
+            return Ok(self.resolve_search_mode_local(table).await?.map(|index| {
+                PlacedIndex::from_local(
                     index,
                     &table.table_name,
                     Arc::clone(&self.peer_transport),
@@ -2117,7 +2115,8 @@ impl ResultStore {
                     self.peer_local_load_bytes,
                     table.dimensions,
                     Arc::clone(&self.peer_failures),
-                )));
+                )
+            }));
         }
         // `Mixed`: load what this process owns, record what a peer owns. A
         // local load failure here is `Unavailable` — a multi-node table is

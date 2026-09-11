@@ -592,8 +592,7 @@ impl SegmentedIndex {
                         .into_iter()
                         .map(|(row_id, distance, _)| (row_id, distance))
                         .collect();
-                    let rescored =
-                        rescore(seg.id, live, &|row_id| exact(seg.id, row_id), query)?;
+                    let rescored = rescore(seg.id, live, &|row_id| exact(seg.id, row_id), query)?;
                     units.push((seg.id, rescored));
                 }
                 Ok(merge(units, k)

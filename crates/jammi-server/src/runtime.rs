@@ -1028,10 +1028,7 @@ impl BoundServer {
         session.close().await;
         crate::telemetry::flush_otlp();
 
-        result
-            .and(health_result)
-            .and(peer_result)
-            .map(|()| outcome)
+        result.and(health_result).and(peer_result).map(|()| outcome)
     }
 
     /// Serve both halves until an OS signal arrives — the binary entry

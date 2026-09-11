@@ -23,7 +23,7 @@ files. Base: `main` @ `4ecc0230` (PR #501, the jobs fleet, merged). PR-K = #502 
 - `crates/jammi-server/src/runtime.rs`: DIST-1 peer routes, OPS C2–C5, U5a, U8a.
 - `crates/jammi-server/tests/it/{tenant_isolation_oracle.rs, api_freeze_baseline.txt, main.rs}`: DIST-1 PEER bucket, then U5a GANG bucket; mod lines DIST/OPS/U5a.
 - `crates/jammi-db/src/catalog/{migrations.rs, ../../tests/it/migrations.rs}`: every migration-appending unit (OPS, GRAPH, DELTA, U3, U5b-1, U8b) — next free number at rebase, both pin sites, second merger renumbers.
-- `crates/jammi-wire/proto/jammi/v1/error.proto` + `src/error.rs`: DIST-1 `unavailable = 24`, DELTA 24–28, then 67's typed refusals at the next free tags.
+- `crates/jammi-wire/proto/jammi/v1/error.proto` + `src/error.rs`: DIST-1 `unavailable = 30`, DELTA 32–36, GRAPH 37–38, then 67's typed refusals at the next free tags.
 - `crates/jammi-db/src/catalog/jobs_repo.rs`: OPS `release_job_lease`, GRAPH `claim_next`, U5a `get_job_for_rank`, U5b-1 `upsert_instance`/`list_gang_members`, U8b `WorkerRecord.devices`.
 - `deploy/kubernetes/overlays/shape-d/**`: K, OPS C6, then U9b (StatefulSet, `nvidia.com/gpu: N`).
 

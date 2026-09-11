@@ -303,6 +303,19 @@ for the failure ladder). Three facts fix the shape:
   graph, eval) never fan out: they load the whole table's segment set on the
   building replica.
 
+**A REFRESHED table's `Mixed` arm is not version-aware.** The single-node
+(`AllLocal`, every segment this replica's own) search path always resolves a
+versioned table's CURRENT version before searching it. The multi-node
+`Mixed` arm — reached only when `peer_bind` is set and this table's segments
+span more than one replica — does not: it plans off `list_index_segments`'
+flat, unversioned segment set, the same limitation the single-node path
+carried before its own version-aware resolution was added. If a Shape D
+deployment places a table `refresh_embeddings` has since published a new
+version of across more than one owning replica, a `Search` served through
+peers can surface rows from a version older than the table's current one;
+keep a refreshed table's segments on a single owning replica (or force-local
+it) until this closes.
+
 ## The `jammi-server probe` subcommand
 
 Every shape above that runs `jammi-server` — B, C, D — uses the same

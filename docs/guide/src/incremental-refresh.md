@@ -4,7 +4,11 @@ An embedding table produced by `generate_embeddings` is a function of its
 source: `D(S)`. When the source changes, `refresh_embeddings` re-embeds only
 the rows whose content changed and publishes the result as a new **version**
 of the same table — the table keeps its name, its ANN index and every
-downstream anchor, and a reader sees exactly one version at a time.
+downstream anchor, and a reader sees exactly one version at a time. "Publish"
+here is the storage-commit sense — the catalog's `publish_version` CAS that
+makes a `building` version the table's current one — distinct from the
+domain-lifecycle "publish/install/bind" a consumer builds on top of Jammi's
+primitives (see [Philosophy](./philosophy.md#where-the-line-falls)).
 
 ```python
 db.generate_embeddings("docs", model="sentence-transformers/all-MiniLM-L6-v2",

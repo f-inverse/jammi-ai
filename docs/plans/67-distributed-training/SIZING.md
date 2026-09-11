@@ -75,7 +75,7 @@ U8a `[ballista]`). `crates/jammi-server/src/runtime.rs` (DIST peer routes, OPS C
 `tenant_isolation_oracle.rs` + `api_freeze_baseline.txt` (DIST PEER bucket, then U5a GANG bucket).
 `crates/jammi-server/tests/it/main.rs` mod lines (DIST, OPS, U5a). `crates/jammi-db/src/catalog/
 {migrations.rs, tests/it/migrations.rs}` (every migration-appending unit; two pin sites).
-`jammi-wire` error-tag space (DIST takes `unavailable = 24`, DELTA 24–28 — 67's typed refusals
+`jammi-wire` error-tag space (DIST takes `unavailable = 30`, DELTA 32–36, GRAPH 37–38 — 67's typed refusals
 take the next free tags at rebase; `error.proto` + `src/error.rs`). `jobs_repo.rs` (OPS
 `release_job_lease`, GRAPH `claim_next`, U5a `get_job_for_rank`, U5b-1 `upsert_instance` /
 `list_gang_members`, U8b `WorkerRecord.devices`). `deploy/kubernetes/overlays/shape-d/**` (K, OPS

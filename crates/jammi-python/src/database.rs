@@ -630,6 +630,9 @@ impl PyDatabase {
             entry.set_item("segment_id", segment.segment_id)?;
             entry.set_item("index_path", &segment.index_path)?;
             entry.set_item("row_count", segment.row_count)?;
+            // The producing version of a refreshed table's segment; `None` on
+            // a base segment (the same nullable the wire carries).
+            entry.set_item("version", segment.version)?;
             list.append(entry)?;
         }
         Ok(list.into_any().unbind())
@@ -1625,6 +1628,57 @@ impl PyDatabase {
             .block_on(self.local_session().recompute(&args.table, args.cascade))
             .map_err(to_pyerr)?;
         let bytes = jammi_ai::wire::recompute_report_to_bytes(report);
+        Ok(pyo3::types::PyBytes::new(py, &bytes).into())
+    }
+
+    /// Re-embed only the changed rows of a versioned embedding table from a
+    /// serialized `RefreshEmbeddingsRequest` body (the same request assembly
+    /// and decode seam the remote client uses,
+    /// `jammi_ai::wire::refresh_embeddings_from_bytes`). Returns the
+    /// serialized `RefreshReport`.
+    fn _refresh_embeddings_proto(&self, py: Python<'_>, proto_bytes: &[u8]) -> PyResult<Py<PyAny>> {
+        self.check_open()?;
+        let args =
+            jammi_ai::wire::refresh_embeddings_from_bytes(proto_bytes).map_err(status_to_pyerr)?;
+        let report = self
+            .runtime
+            .block_on(
+                self.local_session()
+                    .refresh_embeddings(&args.table, args.options),
+            )
+            .map_err(to_pyerr)?;
+        let bytes = jammi_ai::wire::refresh_report_to_bytes(&report);
+        Ok(pyo3::types::PyBytes::new(py, &bytes).into())
+    }
+
+    /// Compact a versioned embedding table from a serialized
+    /// `CompactEmbeddingsRequest` body. Returns the serialized `RefreshReport`.
+    fn _compact_embeddings_proto(&self, py: Python<'_>, proto_bytes: &[u8]) -> PyResult<Py<PyAny>> {
+        self.check_open()?;
+        let table =
+            jammi_ai::wire::compact_embeddings_from_bytes(proto_bytes).map_err(status_to_pyerr)?;
+        let report = self
+            .runtime
+            .block_on(self.local_session().compact_embeddings(&table))
+            .map_err(to_pyerr)?;
+        let bytes = jammi_ai::wire::refresh_report_to_bytes(&report);
+        Ok(pyo3::types::PyBytes::new(py, &bytes).into())
+    }
+
+    /// Expire a versioned embedding table's old versions from a serialized
+    /// `ExpireVersionsRequest` body. Returns the serialized `ExpiryReport`.
+    fn _expire_versions_proto(&self, py: Python<'_>, proto_bytes: &[u8]) -> PyResult<Py<PyAny>> {
+        self.check_open()?;
+        let args =
+            jammi_ai::wire::expire_versions_from_bytes(proto_bytes).map_err(status_to_pyerr)?;
+        let report = self
+            .runtime
+            .block_on(
+                self.local_session()
+                    .expire_versions(&args.table, args.before),
+            )
+            .map_err(to_pyerr)?;
+        let bytes = jammi_ai::wire::expiry_report_to_bytes(&report);
         Ok(pyo3::types::PyBytes::new(py, &bytes).into())
     }
 

@@ -73,9 +73,15 @@ RPC CatalogService/RemoveSource
 RPC CatalogService/SetTenant
 RPC CatalogService/Staleness
 RPC CatalogService/VerifyMaterialization
+# ADDED (additive, minor-compatible, #482): the incremental-embedding
+# actuators over a versioned embedding table — refresh only the changed rows,
+# compact the live rows, expire old versions.
+RPC EmbeddingService/CompactEmbeddings
 RPC EmbeddingService/EncodeQuery
+RPC EmbeddingService/ExpireVersions
 RPC EmbeddingService/GenerateEmbeddings
 RPC EmbeddingService/ImportEmbeddings
+RPC EmbeddingService/RefreshEmbeddings
 RPC EmbeddingService/Search
 RPC EvalService/EvalCalibration
 RPC EvalService/EvalCompare

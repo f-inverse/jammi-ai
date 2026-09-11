@@ -65,6 +65,24 @@ service EmbeddingService {
   // gRPC surface edge runtimes reach (gRPC-web); it adds no new consumption
   // model, only an additional transport for the existing capability.
   rpc Search(SearchRequest) returns (SearchResponse);
+
+  // Re-embed only the source rows whose content hash changed since the
+  // table's current version and publish the result as a new version (a
+  // never-refreshed table first publishes its base version). Every refusal is
+  // typed (`InvalidKey`, `NonUniqueKey`, `DefinitionDrift`, `NotRefreshable`,
+  // `VersionUnavailable`) and leaves the previous version live. Peer of the
+  // abstraction's `refresh_embeddings`.
+  rpc RefreshEmbeddings(RefreshEmbeddingsRequest) returns (RefreshReport);
+
+  // Rewrite the table's live rows as one fragment + one ANN segment (no
+  // inference) and publish it as a new version; the threshold is the
+  // caller's. Peer of the abstraction's `compact_embeddings`.
+  rpc CompactEmbeddings(CompactEmbeddingsRequest) returns (RefreshReport);
+
+  // Delete every non-current version of the table numbered below `before`
+  // and reap its unreferenced artifacts. Peer of the abstraction's
+  // `expire_versions`.
+  rpc ExpireVersions(ExpireVersionsRequest) returns (ExpiryReport);
 }
 
 // Which embedding tower a GenerateEmbeddings / EncodeQuery call targets.
@@ -234,4 +252,64 @@ message SearchHit {
   float score = 2;
   // Projected scalar columns, stringified, when `select` is non-empty.
   map<string, string> columns = 3;
+}
+
+// What a refresh does with a key the source no longer has. UNSPECIFIED maps
+// to the engine default (`TOMBSTONE`).
+enum DeletePolicy {
+  DELETE_POLICY_UNSPECIFIED = 0;
+  // The key is masked out of every prior fragment and segment.
+  TOMBSTONE = 1;
+  // The key's current row is kept (a rolling-window table).
+  RETAIN = 2;
+}
+
+// Whether a refresh published a new version or found nothing to do.
+enum RefreshOutcome {
+  REFRESH_OUTCOME_UNSPECIFIED = 0;
+  PUBLISHED = 1;
+  NO_CHANGE = 2;
+}
+
+message RefreshEmbeddingsRequest {
+  // The embedding result table to refresh, by registered name.
+  string table = 1;
+  DeletePolicy deletes = 2;
+}
+
+message CompactEmbeddingsRequest {
+  string table = 1;
+}
+
+message ExpireVersionsRequest {
+  string table = 1;
+  // Every non-current version numbered below this is expired.
+  int64 before = 2;
+}
+
+// What a refresh or compaction did — realized counts: `inferred_rows` is the
+// number of rows the model ran on, `dropped_rows` the keys asked for that the
+// model did not realize (a per-row input failure).
+message RefreshReport {
+  string table = 1;
+  // The published version (PUBLISHED), or the current one (NO_CHANGE).
+  optional int64 version = 2;
+  optional int64 parent_version = 3;
+  uint64 inferred_rows = 4;
+  uint64 added = 5;
+  uint64 changed = 6;
+  uint64 deleted = 7;
+  uint64 unchanged = 8;
+  uint64 dropped_rows = 9;
+  uint64 live_rows = 10;
+  uint64 masked_rows = 11;
+  RefreshOutcome outcome = 12;
+}
+
+message ExpiryReport {
+  string table = 1;
+  // The version rows deleted, ascending.
+  repeated int64 expired_versions = 2;
+  // The objects (fragments, deletes, manifests, segment siblings) deleted.
+  uint64 objects_deleted = 3;
 }

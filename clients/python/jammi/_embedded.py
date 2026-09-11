@@ -77,8 +77,13 @@ from ._assembly import (
     build_register_topic_request,
     build_search_request,
     recompute_report_to_dict,
+    build_refresh_embeddings_request,
+    build_compact_embeddings_request,
+    build_expire_versions_request,
+    refresh_report_to_dict,
+    expiry_report_to_dict,
 )
-from ._generated.jammi.v1 import pipeline_pb2
+from ._generated.jammi.v1 import embedding_pb2, pipeline_pb2
 
 
 class _TenantScope:
@@ -909,6 +914,59 @@ class EmbeddedBackend:
         report = pipeline_pb2.RecomputeReport()
         report.ParseFromString(self._native._recompute_proto(request.SerializeToString()))
         return recompute_report_to_dict(report)
+
+    def refresh_embeddings(
+        self,
+        table: str,
+        *,
+        deletes: Optional[str] = None,
+    ) -> Dict[str, Any]:
+        """Re-embed only the source rows whose content changed since ``table``'s
+        current version and publish the result as a new version.
+
+        ``deletes`` is ``"tombstone"`` (default: a key the source no longer has
+        is masked out) or ``"retain"``. A never-refreshed table first publishes
+        its base version. Every refusal is typed (:class:`~jammi.errors.InvalidKey`,
+        :class:`~jammi.errors.NonUniqueKey`, :class:`~jammi.errors.DefinitionDrift`,
+        :class:`~jammi.errors.NotRefreshable`, :class:`~jammi.errors.VersionUnavailable`)
+        and leaves the previous version live. Mirrors the remote
+        `RemoteDatabase.refresh_embeddings`; the request is assembled with the
+        shared builder and submitted through the engine's wire seam. Returns the
+        report dict ``{"table", "version", "parent_version", "inferred_rows",
+        "added", "changed", "deleted", "unchanged", "dropped_rows", "live_rows",
+        "masked_rows", "outcome"}``.
+        """
+        request = build_refresh_embeddings_request(table, deletes=deletes)
+        report = embedding_pb2.RefreshReport()
+        report.ParseFromString(
+            self._native._refresh_embeddings_proto(request.SerializeToString())
+        )
+        return refresh_report_to_dict(report)
+
+    def compact_embeddings(self, table: str) -> Dict[str, Any]:
+        """Rewrite ``table``'s live rows as one fragment + one ANN segment (no
+        inference) and publish it as a new version. The threshold is the
+        caller's (``live_rows`` / ``masked_rows`` on every report are its
+        inputs). Same report dict as :meth:`refresh_embeddings`.
+        """
+        request = build_compact_embeddings_request(table)
+        report = embedding_pb2.RefreshReport()
+        report.ParseFromString(
+            self._native._compact_embeddings_proto(request.SerializeToString())
+        )
+        return refresh_report_to_dict(report)
+
+    def expire_versions(self, table: str, *, before: int) -> Dict[str, Any]:
+        """Delete every non-current version of ``table`` numbered below
+        ``before`` and reap its unreferenced artifacts. Returns
+        ``{"table", "expired_versions", "objects_deleted"}``.
+        """
+        request = build_expire_versions_request(table, before=before)
+        report = embedding_pb2.ExpiryReport()
+        report.ParseFromString(
+            self._native._expire_versions_proto(request.SerializeToString())
+        )
+        return expiry_report_to_dict(report)
 
     def assemble_context(
         self,

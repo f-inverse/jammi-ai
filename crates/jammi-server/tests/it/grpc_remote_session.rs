@@ -1077,3 +1077,193 @@ fn keys_and_scores(batches: Vec<arrow::record_batch::RecordBatch>) -> Vec<(Strin
     }
     out
 }
+
+/// K4 for the incremental-embedding verbs: the SAME edit refreshed through a
+/// local `Session` and through the data-plane client, on one engine, one host,
+/// with the batch cadence pinned by the shared config, yields equal version
+/// identities, fragment digests, deletes digests and counts; only
+/// `produced_by` / `produced_at` may differ (here they are equal by
+/// construction — one process).
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn remote_refresh_matches_local_identity() {
+    use jammi_db::storage::StorageUrl;
+    use jammi_db::store::layout;
+    use jammi_wire::embedding_refresh::{RefreshOptions, RefreshOutcome};
+
+    fn write_rows(path: &std::path::Path, rows: &[(i64, String)]) {
+        let schema: SchemaRef = Arc::new(Schema::new(vec![
+            Field::new("id", DataType::Int64, false),
+            Field::new("text", DataType::Utf8, false),
+        ]));
+        let batch = RecordBatch::try_new(
+            schema.clone(),
+            vec![
+                Arc::new(Int64Array::from(
+                    rows.iter().map(|(i, _)| *i).collect::<Vec<_>>(),
+                )),
+                Arc::new(StringArray::from(
+                    rows.iter().map(|(_, t)| t.clone()).collect::<Vec<_>>(),
+                )),
+            ],
+        )
+        .unwrap();
+        let tmp = path.with_extension("tmp");
+        let file = std::fs::File::create(&tmp).unwrap();
+        let mut w = parquet::arrow::ArrowWriter::try_new(file, schema, None).unwrap();
+        w.write(&batch).unwrap();
+        w.close().unwrap();
+        std::fs::rename(tmp, path).unwrap();
+    }
+    let words = [
+        "apple", "river", "engine", "violet", "quartz", "harbor", "meadow",
+    ];
+    let rows: Vec<(i64, String)> = (0..60)
+        .map(|i| {
+            let n = 2 + (i % 5) as usize;
+            let text: Vec<&str> = (0..n)
+                .map(|k| words[((i as usize) * (k + 3) + k) % words.len()])
+                .collect();
+            (i, format!("{} number {i}", text.join(" ")))
+        })
+        .collect();
+
+    let server = start_engine_server().await;
+    let remote = remote(&server).await;
+    let local = local(&server);
+    let model_id = tiny_bert_model_id();
+    let dir = tempfile::tempdir().unwrap();
+    let source_path = dir.path().join("src.parquet");
+    write_rows(&source_path, &rows);
+    local
+        .add_source(
+            "refresh_src",
+            SourceType::File,
+            SourceConnection {
+                url: Some(format!("file://{}", source_path.display())),
+                format: Some(FileFormat::Parquet),
+                ..Default::default()
+            },
+        )
+        .await
+        .expect("add_source");
+    // Two identical base tables over one source (equal artifact digests by
+    // the deterministic write order and cadence).
+    let mut tables = Vec::new();
+    for _ in 0..2 {
+        let (record, _) = local
+            .generate_embeddings(
+                "refresh_src",
+                &model_id,
+                &["text".to_string()],
+                "id",
+                Modality::Text,
+                jammi_db::store::CachePolicy::Bypass,
+            )
+            .await
+            .expect("embed");
+        tables.push(record);
+    }
+    let mut edited = rows.clone();
+    edited[7].1 = "an edited sentence for the parity oracle".into();
+    edited.retain(|(i, _)| *i != 11);
+    write_rows(&source_path, &edited);
+
+    let via_local = local
+        .refresh_embeddings(&tables[0].table_name, RefreshOptions::default())
+        .await
+        .expect("local refresh");
+    let via_remote = remote
+        .refresh_embeddings(&tables[1].table_name, RefreshOptions::default())
+        .await
+        .expect("remote refresh");
+    assert_eq!(via_local.outcome, RefreshOutcome::Published);
+    assert_eq!(via_remote.outcome, RefreshOutcome::Published);
+    assert_eq!(
+        (
+            via_local.inferred_rows,
+            via_local.added,
+            via_local.changed,
+            via_local.deleted,
+            via_local.dropped_rows,
+            via_local.live_rows,
+            via_local.masked_rows
+        ),
+        (
+            via_remote.inferred_rows,
+            via_remote.added,
+            via_remote.changed,
+            via_remote.deleted,
+            via_remote.dropped_rows,
+            via_remote.live_rows,
+            via_remote.masked_rows
+        ),
+        "counts agree: {via_local:?} vs {via_remote:?}"
+    );
+    let store = server.engine.result_store();
+    let mut manifests = Vec::new();
+    for (record, report) in tables.iter().zip([&via_local, &via_remote]) {
+        let parquet_url = StorageUrl::parse(&record.parquet_path).unwrap();
+        let url = layout::version_manifest_url(&parquet_url, report.version.unwrap()).unwrap();
+        let handle = store.open_parquet(&url).unwrap();
+        let bytes = handle
+            .get_bytes(&handle.data_path().unwrap())
+            .await
+            .unwrap();
+        manifests.push(jammi_db::store::VersionManifest::from_json_bytes(&bytes).unwrap());
+    }
+    let (a, b) = (&manifests[0], &manifests[1]);
+    assert_eq!(
+        a.identity, b.identity,
+        "version identity is transport-invariant"
+    );
+    assert_eq!(
+        a.fragments
+            .iter()
+            .map(|f| (&f.digest, f.rows))
+            .collect::<Vec<_>>(),
+        b.fragments
+            .iter()
+            .map(|f| (&f.digest, f.rows))
+            .collect::<Vec<_>>()
+    );
+    assert_eq!(
+        a.deletes.as_ref().map(|d| (&d.digest, d.entries)),
+        b.deletes.as_ref().map(|d| (&d.digest, d.entries))
+    );
+    assert_eq!((a.live_rows, a.masked_rows), (b.live_rows, b.masked_rows));
+
+    // The remote report is the local report (one shape, one value).
+    let compact_remote = remote
+        .compact_embeddings(&tables[1].table_name)
+        .await
+        .expect("remote compact");
+    let compact_local = local
+        .compact_embeddings(&tables[0].table_name)
+        .await
+        .expect("local compact");
+    assert_eq!(
+        (compact_remote.live_rows, compact_remote.masked_rows),
+        (compact_local.live_rows, compact_local.masked_rows)
+    );
+    let expiry = remote
+        .expire_versions(&tables[1].table_name, compact_remote.version.unwrap())
+        .await
+        .expect("remote expire");
+    assert_eq!(expiry.expired_versions, vec![0, 1]);
+
+    // Error parity: a refresh of a table that cannot be resolved is the same
+    // typed variant on both transports.
+    let remote_err = remote
+        .refresh_embeddings("no_such_table", RefreshOptions::default())
+        .await
+        .expect_err("remote refresh of an absent table fails");
+    let local_err = local
+        .refresh_embeddings("no_such_table", RefreshOptions::default())
+        .await
+        .expect_err("local refresh of an absent table fails");
+    assert_eq!(
+        std::mem::discriminant(&remote_err),
+        std::mem::discriminant(&local_err),
+        "remote {remote_err:?} vs local {local_err:?}"
+    );
+}

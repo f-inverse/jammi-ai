@@ -44,6 +44,7 @@ use jammi_db::catalog::model_repo::RegisterModelParams;
 use jammi_db::catalog::result_repo::{CreateResultTableParams, ResultTableKind};
 use jammi_db::catalog::status::JobExecution;
 use jammi_db::catalog::Catalog;
+use jammi_db::error::JammiError;
 use jammi_db::session::JammiSession;
 use jammi_db::source::{FileFormat, SourceConnection, SourceType};
 use jammi_db::store::mutable::definition::{MutableTableDefinitionBuilder, MutableTableId};
@@ -1042,6 +1043,37 @@ fn cases() -> Vec<IsolationCase> {
                 assert_import_isolated().await;
             }
         ),
+        // The three incremental-embedding actuators share one step-0 gate: the
+        // tenant-scoped table read, then the STRICT tenant pair BEFORE the
+        // model load (a peer resolves not-found; a scoped tenant can read a
+        // GLOBAL table but never refresh/compact/expire it). §6.22.
+        case!(
+            "EmbeddingService",
+            "RefreshEmbeddings",
+            CaseKind::Hermetic,
+            None,
+            {
+                assert_refresh_isolated(RefreshVerb::Refresh).await;
+            }
+        ),
+        case!(
+            "EmbeddingService",
+            "CompactEmbeddings",
+            CaseKind::Hermetic,
+            None,
+            {
+                assert_refresh_isolated(RefreshVerb::Compact).await;
+            }
+        ),
+        case!(
+            "EmbeddingService",
+            "ExpireVersions",
+            CaseKind::Hermetic,
+            None,
+            {
+                assert_refresh_isolated(RefreshVerb::Expire).await;
+            }
+        ),
         case!(
             "InferenceService",
             "Infer",
@@ -1817,6 +1849,135 @@ async fn materialize_table_for_tenant_a() -> (Arc<InferenceSession>, Session, St
     (engine, session, table_name, dir)
 }
 
+/// The GLOBAL (unscoped) twin of [`materialize_table_for_tenant_a`].
+async fn materialize_global_table() -> (Arc<InferenceSession>, Session, String, TempDir) {
+    use jammi_db::store::manifest::{
+        ComputeDevice, ComputePrecision, InputAnchor, Materialization, MaterializationEnv,
+        ModelContentDigest, ModelIdentity, ProducingDescriptor,
+    };
+
+    const DIMS: usize = 4;
+    let model_id = "sensing-model";
+    let source_id = "sensing-src";
+
+    let dir = tempdir().unwrap();
+    let engine = Arc::new(
+        InferenceSession::new(test_config(dir.path()))
+            .await
+            .unwrap(),
+    );
+    let session = Session::new(Arc::clone(&engine));
+
+    // `create_table` stamps the catalog row with the scoped tenant (A), so the
+    // resulting row is private to A.
+    let table_name = async {
+        let store = engine.result_store();
+        let info = store
+            .create_table(
+                source_id,
+                ModelTask::TextEmbedding,
+                ResultTableKind::Model,
+                None,
+                model_id,
+                Some(DIMS as i32),
+                Some("_row_id"),
+                Some("body"),
+                None,
+            )
+            .await
+            .unwrap();
+
+        // Write a real embedding Parquet so the digest the funnel attests is
+        // the digest the verify path recomputes.
+        let schema = jammi_db::store::schema::embedding_table_schema(DIMS);
+        let n = 3usize;
+        let row_id = StringArray::from_iter_values((0..n).map(|i| format!("row-{i}")));
+        let src = StringArray::from_iter_values((0..n).map(|_| source_id));
+        let model = StringArray::from_iter_values((0..n).map(|_| model_id));
+        let flat: Vec<f32> = (0..n)
+            .flat_map(|i| (0..DIMS).map(move |d| (i * DIMS + d) as f32))
+            .collect();
+        let item = Arc::new(Field::new("item", DataType::Float32, false));
+        let vectors = FixedSizeListArray::try_new(
+            item,
+            DIMS as i32,
+            Arc::new(Float32Array::from(flat)),
+            None,
+        )
+        .unwrap();
+        let batch = RecordBatch::try_new(
+            schema.clone(),
+            vec![
+                Arc::new(row_id),
+                Arc::new(src),
+                Arc::new(model),
+                Arc::new(vectors),
+                jammi_db::store::content_hash::null_hash_column(n),
+            ],
+        )
+        .unwrap();
+        let mut writer = store.open_writer(info.parquet_url(), schema).await.unwrap();
+        writer.write_batch(&batch).await.unwrap();
+        let rows = writer.close().await.unwrap();
+
+        // One real ANN segment over the written rows, appended under the
+        // writer's lease while the row is still `building` — the only
+        // moment a segment can be registered (segment 0, stamped with A's
+        // tenant from the parent row).
+        {
+            use jammi_db::index::VectorIndex;
+            let mut index = jammi_db::index::sidecar::SidecarIndex::new(
+                DIMS,
+                store.ann_config(),
+                info.storage_precision(),
+            )
+            .unwrap();
+            for i in 0..n {
+                let v: Vec<f32> = (0..DIMS).map(|d| (i * DIMS + d) as f32).collect();
+                index.add(&format!("row-{i}"), &v).unwrap();
+            }
+            index.build().unwrap();
+            info.append_segment(&index).await.unwrap();
+        }
+
+        let descriptor = ProducingDescriptor::Embedding {
+            model_id: model_id.into(),
+            task: ModelTask::TextEmbedding,
+            source_id: source_id.into(),
+            columns: vec!["body".into()],
+            key_column: "_row_id".into(),
+            dimensions: DIMS,
+        };
+        let env = MaterializationEnv::new(
+            ComputeDevice::Cpu,
+            vec![ModelIdentity {
+                model_id: model_id.into(),
+                backend: "candle".into(),
+                compute_precision: ComputePrecision::F32,
+                content_digest: ModelContentDigest::Sha256("cpu-fixture-digest".into()),
+                quantization: None,
+            }],
+        );
+        let ctx = SessionContext::new();
+        let table_name = info.table_name().to_string();
+        info.finish(
+            &ctx,
+            rows,
+            Materialization::new(
+                &descriptor,
+                &env,
+                vec![InputAnchor::mutable_version(source_id, 1)],
+            ),
+        )
+        .await
+        .unwrap();
+        table_name
+    }
+    .await;
+
+    (engine, session, table_name, dir)
+}
+
 async fn assert_verify_materialization_isolated() {
     use jammi_db::store::manifest::MatchVerdict;
 
@@ -2250,6 +2411,88 @@ async fn assert_recompute_isolated() {
             "tenant A must resolve its OWN table (not a not-found refusal), got: {a_err}"
         );
     }
+}
+
+/// Which incremental-embedding actuator [`assert_refresh_isolated`] drives.
+#[derive(Clone, Copy)]
+enum RefreshVerb {
+    Refresh,
+    Compact,
+    Expire,
+}
+
+async fn run_refresh_verb(
+    session: &Session,
+    verb: RefreshVerb,
+    table: &str,
+) -> Result<(), JammiError> {
+    use jammi_wire::embedding_refresh::RefreshOptions;
+    match verb {
+        RefreshVerb::Refresh => session
+            .refresh_embeddings(table, RefreshOptions::default())
+            .await
+            .map(|_| ()),
+        RefreshVerb::Compact => session.compact_embeddings(table).await.map(|_| ()),
+        RefreshVerb::Expire => session.expire_versions(table, 0).await.map(|_| ()),
+    }
+}
+
+/// The refresh / compact / expire step-0 gate: tenant B is refused at
+/// resolution (not-found — no disclosure); a GLOBAL table is refused to a
+/// scoped tenant with the typed `TenantMismatch` before any model load; tenant
+/// A gets past the gate (its synthetic model is unloadable, so a refresh or
+/// compaction fails later with a model error, never a resolution refusal, and
+/// an expiry of a never-refreshed table is a no-op `Ok`).
+async fn assert_refresh_isolated(verb: RefreshVerb) {
+    let (engine, session, table_name, _dir) = materialize_table_for_tenant_a().await;
+
+    let b_err = engine
+        .with_tenant_scoped(tenant_b(), |_scope| {
+            run_refresh_verb(&session, verb, &table_name)
+        })
+        .await
+        .expect_err("CROSS-TENANT LEAK: tenant B refreshed (or resolved) tenant A's table");
+    assert!(
+        b_err.to_string().contains("not found"),
+        "tenant B must be refused at resolution (not-found), got: {b_err}"
+    );
+
+    let a_result = engine
+        .with_tenant_scoped(tenant_a(), |_scope| {
+            run_refresh_verb(&session, verb, &table_name)
+        })
+        .await;
+    if let Err(a_err) = a_result {
+        // The synthetic model is unloadable, so a refresh / compaction may fail
+        // later with a model or gate error — never the table-resolution
+        // refusal B hit, never a tenant refusal.
+        assert!(
+            !a_err.to_string().contains("Result table '"),
+            "tenant A must resolve its OWN table (not a not-found refusal), got: {a_err}"
+        );
+        assert!(
+            !matches!(a_err, JammiError::TenantMismatch { .. }),
+            "tenant A is the owner: {a_err:?}"
+        );
+    }
+
+    // A GLOBAL table (unscoped create) is readable by a scoped tenant but
+    // never refreshable by one.
+    let (engine, session, global_table, _dir2) = materialize_global_table().await;
+    let scoped_err = engine
+        .with_tenant_scoped(tenant_b(), |_scope| {
+            run_refresh_verb(&session, verb, &global_table)
+        })
+        .await
+        .expect_err("a scoped tenant must not refresh a GLOBAL table");
+    assert!(
+        matches!(scoped_err, JammiError::TenantMismatch { .. }),
+        "expected TenantMismatch, got {scoped_err:?}"
+    );
+    let count = scan_count(&engine, tenant_b(), &global_table)
+        .await
+        .expect("a scoped tenant can still SELECT from the GLOBAL table");
+    assert!(count > 0);
 }
 
 /// Infer / Predict / EncodeQuery / GenerateEmbeddings resolve the model through

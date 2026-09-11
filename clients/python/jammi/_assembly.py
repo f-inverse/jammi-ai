@@ -1530,3 +1530,82 @@ def build_eval_calibration_request(
     for record_id, tags in (cohorts or {}).items():
         request.cohorts[record_id].tags.update(tags)
     return request
+
+
+# --- incremental embedding -----------------------------------------------
+
+_DELETE_POLICY = {
+    "tombstone": embedding_pb2.DeletePolicy.TOMBSTONE,
+    "retain": embedding_pb2.DeletePolicy.RETAIN,
+}
+
+_REFRESH_OUTCOME_NAME = {
+    embedding_pb2.RefreshOutcome.PUBLISHED: "published",
+    embedding_pb2.RefreshOutcome.NO_CHANGE: "no_change",
+}
+
+
+def build_refresh_embeddings_request(
+    table: str,
+    *,
+    deletes: Optional[str] = None,
+) -> embedding_pb2.RefreshEmbeddingsRequest:
+    """Assemble the `RefreshEmbeddingsRequest` from the binding's flat kwargs.
+
+    `deletes` is `"tombstone"` (default, left unset so the engine resolves it) or
+    `"retain"` (keep a key's current row when the source no longer has it).
+    """
+    request = embedding_pb2.RefreshEmbeddingsRequest(table=table)
+    if deletes is not None:
+        try:
+            request.deletes = _DELETE_POLICY[deletes]
+        except KeyError:
+            raise ValueError(
+                f"deletes must be 'tombstone' or 'retain' (got {deletes!r})"
+            ) from None
+    return request
+
+
+def build_compact_embeddings_request(table: str) -> embedding_pb2.CompactEmbeddingsRequest:
+    """Assemble the `CompactEmbeddingsRequest`."""
+    return embedding_pb2.CompactEmbeddingsRequest(table=table)
+
+
+def build_expire_versions_request(
+    table: str, *, before: int
+) -> embedding_pb2.ExpireVersionsRequest:
+    """Assemble the `ExpireVersionsRequest`."""
+    return embedding_pb2.ExpireVersionsRequest(table=table, before=int(before))
+
+
+def refresh_report_to_dict(report: embedding_pb2.RefreshReport) -> Dict[str, Any]:
+    """Shape a `RefreshReport` into the plain dict the binding returns —
+    identical whether it crossed the gRPC wire or came back from the
+    in-process engine. `version` / `parent_version` are `None` when unset;
+    `outcome` is `"published"` or `"no_change"`.
+    """
+    return {
+        "table": report.table,
+        "version": report.version if report.HasField("version") else None,
+        "parent_version": (
+            report.parent_version if report.HasField("parent_version") else None
+        ),
+        "inferred_rows": report.inferred_rows,
+        "added": report.added,
+        "changed": report.changed,
+        "deleted": report.deleted,
+        "unchanged": report.unchanged,
+        "dropped_rows": report.dropped_rows,
+        "live_rows": report.live_rows,
+        "masked_rows": report.masked_rows,
+        "outcome": _REFRESH_OUTCOME_NAME.get(report.outcome, "published"),
+    }
+
+
+def expiry_report_to_dict(report: embedding_pb2.ExpiryReport) -> Dict[str, Any]:
+    """Shape an `ExpiryReport` into the plain dict the binding returns."""
+    return {
+        "table": report.table,
+        "expired_versions": list(report.expired_versions),
+        "objects_deleted": report.objects_deleted,
+    }

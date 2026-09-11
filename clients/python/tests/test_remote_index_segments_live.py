@@ -139,11 +139,13 @@ def test_remote_and_embedded_list_index_segments_agree(tmp_path, live_server_on)
         "segment_id": 1,
         "index_path": f"file:///idx/{table}-1",
         "row_count": 7,
+        "version": None,
     }
     assert embedded[2] == {
         "segment_id": 2,
         "index_path": f"file:///idx/{table}-2",
         "row_count": 11,
+        "version": None,
     }
     assert embedded[0]["segment_id"] == 0
     assert embedded[0]["row_count"] == N_CORPUS

@@ -57,6 +57,11 @@ from ._assembly import (
     build_register_topic_request,
     build_search_request,
     recompute_report_to_dict,
+    build_refresh_embeddings_request,
+    build_compact_embeddings_request,
+    build_expire_versions_request,
+    refresh_report_to_dict,
+    expiry_report_to_dict,
 )
 from ._capability import Capability
 from ._credentials import (
@@ -194,16 +199,19 @@ def _job_summary_to_dict(j: job_pb2.JobSummary) -> Dict[str, Any]:
 def _index_segment_to_dict(s: catalog_pb2.IndexSegment) -> Dict[str, Any]:
     """Project a wire `IndexSegment` into the segment dict a caller reads.
 
-    The whole row and nothing else — `segment_id`, `index_path`, `row_count` —
-    the same three keys, spelled the same way, that the embedded
+    The whole row and nothing else — `segment_id`, `index_path`, `row_count`,
+    `version` — the same four keys, spelled the same way, that the embedded
     `list_index_segments` builds at its FFI boundary. `row_count` rides the wire
     as a `uint64` and lands as a plain Python `int`, which is unbounded, so the
     widening the engine does on the send side has no narrowing peer here.
+    `version` is the producing version of a refreshed table's segment and
+    `None` on a base segment (an unset optional on the wire).
     """
     return {
         "segment_id": s.segment_id,
         "index_path": s.index_path,
         "row_count": s.row_count,
+        "version": s.version if s.HasField("version") else None,
     }
 
 
@@ -2147,6 +2155,39 @@ class RemoteDatabase:
         request = build_recompute_request(table, cascade=cascade)
         resp = self._call(self._pipeline.Recompute, request)
         return recompute_report_to_dict(resp)
+
+    def refresh_embeddings(
+        self,
+        table: str,
+        *,
+        deletes: Optional[str] = None,
+    ) -> Dict[str, Any]:
+        """Re-embed only the source rows whose content changed since ``table``'s
+        current version and publish the result as a new version. ``deletes`` is
+        ``"tombstone"`` (default) or ``"retain"``. Maps to
+        `EmbeddingService.RefreshEmbeddings`; the report is the same dict the
+        embedded engine returns.
+        """
+        request = build_refresh_embeddings_request(table, deletes=deletes)
+        resp = self._call(self._embedding.RefreshEmbeddings, request)
+        return refresh_report_to_dict(resp)
+
+    def compact_embeddings(self, table: str) -> Dict[str, Any]:
+        """Rewrite ``table``'s live rows as one fragment + one segment and
+        publish it as a new version. Maps to `EmbeddingService.CompactEmbeddings`.
+        """
+        request = build_compact_embeddings_request(table)
+        resp = self._call(self._embedding.CompactEmbeddings, request)
+        return refresh_report_to_dict(resp)
+
+    def expire_versions(self, table: str, *, before: int) -> Dict[str, Any]:
+        """Delete every non-current version of ``table`` numbered below
+        ``before`` and reap its unreferenced artifacts. Maps to
+        `EmbeddingService.ExpireVersions`.
+        """
+        request = build_expire_versions_request(table, before=before)
+        resp = self._call(self._embedding.ExpireVersions, request)
+        return expiry_report_to_dict(resp)
 
     def assemble_context(
         self,

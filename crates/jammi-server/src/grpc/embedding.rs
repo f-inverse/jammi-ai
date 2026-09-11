@@ -44,8 +44,9 @@ use arrow::util::display::{ArrayFormatter, FormatOptions};
 
 use crate::grpc::proto::embedding::embedding_service_server::EmbeddingService;
 use crate::grpc::proto::embedding::{
-    EncodeQueryRequest, EncodeQueryResponse, GenerateEmbeddingsRequest, ImportEmbeddingsRequest,
-    ResultTable, SearchHit, SearchRequest, SearchResponse,
+    CompactEmbeddingsRequest, EncodeQueryRequest, EncodeQueryResponse, ExpireVersionsRequest,
+    ExpiryReport, GenerateEmbeddingsRequest, ImportEmbeddingsRequest, RefreshEmbeddingsRequest,
+    RefreshReport, ResultTable, SearchHit, SearchRequest, SearchResponse,
 };
 use crate::grpc::wire::{map_engine_error, scoped, session_tenant_traced};
 
@@ -155,6 +156,60 @@ impl EmbeddingService for EmbeddingServer {
         .map_err(map_engine_error)?;
 
         Ok(Response::new(EncodeQueryResponse { embedding }))
+    }
+
+    #[tracing::instrument(skip(self, request), fields(tenant_id = tracing::field::Empty))]
+    async fn refresh_embeddings(
+        &self,
+        request: Request<RefreshEmbeddingsRequest>,
+    ) -> Result<Response<RefreshReport>, Status> {
+        let tenant = session_tenant_traced(&request);
+        // The same decode seam the embedded binding's `_refresh_embeddings_proto`
+        // drives, so both transports validate one request shape.
+        let args = jammi_ai::wire::refresh_embeddings_from_proto(request.into_inner())?;
+        let session = self.local();
+        let report = scoped(&self.session, tenant, || {
+            session.refresh_embeddings(&args.table, args.options)
+        })
+        .await
+        .map_err(map_engine_error)?;
+        Ok(Response::new(
+            jammi_wire::embedding_refresh::refresh_report_to_proto(&report),
+        ))
+    }
+
+    #[tracing::instrument(skip(self, request), fields(tenant_id = tracing::field::Empty))]
+    async fn compact_embeddings(
+        &self,
+        request: Request<CompactEmbeddingsRequest>,
+    ) -> Result<Response<RefreshReport>, Status> {
+        let tenant = session_tenant_traced(&request);
+        let table = jammi_ai::wire::compact_embeddings_from_proto(request.into_inner())?;
+        let session = self.local();
+        let report = scoped(&self.session, tenant, || session.compact_embeddings(&table))
+            .await
+            .map_err(map_engine_error)?;
+        Ok(Response::new(
+            jammi_wire::embedding_refresh::refresh_report_to_proto(&report),
+        ))
+    }
+
+    #[tracing::instrument(skip(self, request), fields(tenant_id = tracing::field::Empty))]
+    async fn expire_versions(
+        &self,
+        request: Request<ExpireVersionsRequest>,
+    ) -> Result<Response<ExpiryReport>, Status> {
+        let tenant = session_tenant_traced(&request);
+        let args = jammi_ai::wire::expire_versions_from_proto(request.into_inner())?;
+        let session = self.local();
+        let report = scoped(&self.session, tenant, || {
+            session.expire_versions(&args.table, args.before)
+        })
+        .await
+        .map_err(map_engine_error)?;
+        Ok(Response::new(
+            jammi_wire::embedding_refresh::expiry_report_to_proto(&report),
+        ))
     }
 
     #[tracing::instrument(skip(self, request), fields(tenant_id = tracing::field::Empty))]

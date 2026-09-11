@@ -53,51 +53,11 @@ use crate::pipeline::embedding::{embedding_definition, EmbeddingDefinition};
 use crate::pipeline::result_sink::ResultSink;
 use crate::session::InferenceSession;
 
-/// The options of one refresh.
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
-pub struct RefreshOptions {
-    /// What a key the source no longer has becomes (default: tombstoned).
-    pub deletes: DeletePolicy,
-}
-
-/// Whether a refresh published a new version or found nothing to do.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize)]
-#[serde(rename_all = "snake_case")]
-pub enum RefreshOutcome {
-    Published,
-    NoChange,
-}
-
-/// What a refresh or compaction did. Realized counts: `inferred_rows` is the
-/// number of rows the model was invoked on, `dropped_rows` the keys asked for
-/// that the model did not realize (a per-row input failure), so `inferred_rows
-/// - dropped_rows` is the fragment's row count.
-#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
-pub struct RefreshReport {
-    pub table: String,
-    /// The published version (`Published`), or the current one (`NoChange`).
-    pub version: Option<i64>,
-    pub parent_version: Option<i64>,
-    pub inferred_rows: u64,
-    pub added: u64,
-    pub changed: u64,
-    pub deleted: u64,
-    pub unchanged: u64,
-    pub dropped_rows: u64,
-    pub live_rows: u64,
-    pub masked_rows: u64,
-    pub outcome: RefreshOutcome,
-}
-
-/// What `expire_versions` removed.
-#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
-pub struct ExpiryReport {
-    pub table: String,
-    /// The version rows deleted, ascending.
-    pub expired_versions: Vec<i64>,
-    /// The objects (fragments, deletes, manifests, segment siblings) deleted.
-    pub objects_deleted: u64,
-}
+// The report vocabulary lives on the wire substrate so the remote client and
+// a local session hand a caller the identical value.
+pub use jammi_wire::embedding_refresh::{
+    ExpiryReport, RefreshOptions, RefreshOutcome, RefreshReport,
+};
 
 /// Test-only rendezvous points inside a refresh (`test-hooks`): a test parks
 /// a refresh at a documented point and observes the catalog / read paths

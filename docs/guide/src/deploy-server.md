@@ -241,8 +241,20 @@ responded; `503` means it didn't and traffic should be drained from
 this instance. Point your load balancer at `/readyz`.
 
 `/metrics` exposes a small, substrate-level set of Prometheus counters
-(gRPC requests, Flight SQL queries, eval invocations) plus a search-
-latency histogram.
+(gRPC requests, Flight SQL queries, eval invocations, refusals at the
+`[server.limits]` edge) plus a search-latency histogram, and five gauges:
+
+| Gauge | Present on | Source |
+|---|---|---|
+| `jammi_jobs_queued{kind}` | worker-enabled processes | the catalog, sampled every `[worker] metrics_sample_secs` (default 5) by a dedicated task — one `GROUP BY kind, status` per tick, never on a scrape; a held (`claimable = false`) row counts as queued |
+| `jammi_jobs_running{kind}` | worker-enabled processes | the same sample |
+| `jammi_worker_jobs_in_flight` | worker-enabled processes | loop-claimed jobs running under a live lease hold (0 or 1); an inline `run_now` is never counted |
+| `jammi_worker_claim_loop_up` | worker-enabled processes | 1 while the claim loop task runs, 0 once it stopped, aborted or failed |
+| `jammi_lease_heartbeat_age_seconds` | every process | seconds since the lease keeper last completed a renewal pass |
+
+A process without a claim loop omits the worker families (absent, never 0).
+No gauge carries a tenant label. `jammi_jobs_queued{kind}` is the
+autoscaling input for a compute tier; a scrape issues no catalog statement.
 
 ## What the server can and cannot do
 

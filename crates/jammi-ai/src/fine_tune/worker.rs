@@ -80,7 +80,7 @@
 //! row (`jobs.cancel_requested` remains `true`) — the run completes and the
 //! row finishes `completed`, never retroactively `failed`.
 
-use std::sync::atomic::{AtomicBool, AtomicU8, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicU8, AtomicUsize, Ordering};
 use std::sync::{Arc, Weak};
 use std::time::Duration;
 
@@ -288,6 +288,24 @@ pub struct WorkerShared {
     in_flight: AtomicUsize,
     state_tx: watch::Sender<LoopState>,
     instance_id: String,
+    /// The gauge sampler's last catalog snapshot (`/metrics` copies it on a
+    /// scrape; the sampler task writes it every `[worker]
+    /// metrics_sample_secs`).
+    sample: std::sync::RwLock<WorkerSample>,
+    /// How many catalog samples the sampler has taken — the oracle that a
+    /// scrape issues no catalog statement of its own.
+    samples_taken: AtomicU64,
+}
+
+/// The queue-depth snapshot the gauge sampler last read from the catalog:
+/// `(kind, count)` for `queued` and for `running` loop-claimable rows
+/// (`execution = 'queued'`; a held `claimable = false` row counts as
+/// queued). A kind present in the previous sample but absent now is carried
+/// at 0, so its gauge falls to zero instead of going stale.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct WorkerSample {
+    pub queued: Vec<(String, i64)>,
+    pub running: Vec<(String, i64)>,
 }
 
 impl WorkerShared {
@@ -302,7 +320,53 @@ impl WorkerShared {
             in_flight: AtomicUsize::new(0),
             state_tx,
             instance_id,
+            sample: std::sync::RwLock::new(WorkerSample::default()),
+            samples_taken: AtomicU64::new(0),
         })
+    }
+
+    /// The sampler's last snapshot (a copy).
+    pub fn sample(&self) -> WorkerSample {
+        self.sample
+            .read()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone()
+    }
+
+    /// How many catalog samples the sampler has taken so far.
+    pub fn samples_taken(&self) -> u64 {
+        self.samples_taken.load(Ordering::SeqCst)
+    }
+
+    /// Fold one `count_jobs_by_kind_status` result into the snapshot,
+    /// carrying every kind of the previous snapshot at 0 when absent now.
+    fn record_sample(&self, rows: Vec<(String, String, i64)>) {
+        let mut guard = self
+            .sample
+            .write()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let previous = std::mem::take(&mut *guard);
+        let mut queued: std::collections::BTreeMap<String, i64> =
+            previous.queued.into_iter().map(|(k, _)| (k, 0)).collect();
+        let mut running: std::collections::BTreeMap<String, i64> =
+            previous.running.into_iter().map(|(k, _)| (k, 0)).collect();
+        for (kind, status, n) in rows {
+            match status.as_str() {
+                "queued" => {
+                    queued.insert(kind, n);
+                }
+                "running" => {
+                    running.insert(kind, n);
+                }
+                _ => {}
+            }
+        }
+        *guard = WorkerSample {
+            queued: queued.into_iter().collect(),
+            running: running.into_iter().collect(),
+        };
+        drop(guard);
+        self.samples_taken.fetch_add(1, Ordering::SeqCst);
     }
 
     /// The `claimed_by` identity of the loop this state belongs to.
@@ -499,6 +563,24 @@ pub(crate) async fn release_sweep(
         }
     };
     ReleaseSweep { jobs, building }
+}
+
+/// The gauge sampler: one `count_jobs_by_kind_status` per `every`, on its
+/// own task — never on a `/metrics` scrape (a scrape storm must not become a
+/// catalog storm) and never on the claim loop (which does not tick during a
+/// run). Ends when the loop's shared state is gone.
+async fn sample_loop(catalog: Arc<Catalog>, shared: Weak<WorkerShared>, every: Duration) {
+    loop {
+        let Some(shared) = shared.upgrade() else {
+            return;
+        };
+        match catalog.count_jobs_by_kind_status().await {
+            Ok(rows) => shared.record_sample(rows),
+            Err(e) => tracing::warn!(error = %e, "gauge sampler: count_jobs_by_kind_status failed"),
+        }
+        drop(shared);
+        tokio::time::sleep(every).await;
+    }
 }
 
 /// What a graceful stop found to stop.
@@ -2009,6 +2091,8 @@ pub struct EmbeddedWorker {
     /// The heartbeat interval: the bound on 2b's keeper pass and on 2e's
     /// cooperative wait.
     heartbeat: Duration,
+    /// The gauge sampler task; aborted with the loop on every stop path.
+    sampler: std::sync::Mutex<Option<tokio::task::JoinHandle<()>>>,
 }
 
 impl EmbeddedWorker {
@@ -2038,6 +2122,12 @@ impl EmbeddedWorker {
         let heartbeat = worker.intervals.heartbeat;
         let task_shared = Arc::clone(&shared);
         let handle = tokio::spawn(async move { worker.run_until(task_shared).await });
+        let every = Duration::from_secs(session.inner_config().worker.metrics_sample_secs.max(1));
+        let sampler = tokio::spawn(sample_loop(
+            Arc::clone(session.catalog_arc()),
+            Arc::downgrade(&shared),
+            every,
+        ));
         Ok(Self {
             handle: std::sync::Mutex::new(Some(handle)),
             shared,
@@ -2046,7 +2136,19 @@ impl EmbeddedWorker {
             keeper: Arc::clone(session.lease_keeper()),
             writer_id: session.result_store().writer_id().to_string(),
             heartbeat,
+            sampler: std::sync::Mutex::new(Some(sampler)),
         })
+    }
+
+    fn stop_sampler(&self) {
+        if let Some(sampler) = self
+            .sampler
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .take()
+        {
+            sampler.abort();
+        }
     }
 
     /// A weak handle on the loop's shared state, for observers (`/healthz`,
@@ -2132,6 +2234,7 @@ impl EmbeddedWorker {
         handle
             .await
             .map_err(|e| JammiError::FineTune(format!("training worker task join error: {e}")))?;
+        self.stop_sampler();
         self.catalog.delete_worker(&self.instance_id).await?;
         Ok(StopOutcome::Joined)
     }
@@ -2251,6 +2354,7 @@ impl EmbeddedWorker {
         // 2g
         let sweep_two = release_sweep(&self.catalog, &self.instance_id, &self.writer_id).await;
         // 2h
+        self.stop_sampler();
         self.catalog.delete_worker(&self.instance_id).await?;
         Ok(ReleaseReport {
             loop_state,
@@ -2273,6 +2377,7 @@ impl Drop for EmbeddedWorker {
     /// silent no-op anyway, but the explicit check keeps the intent legible.
     fn drop(&mut self) {
         self.shared.request_stop();
+        self.stop_sampler();
         if let Some(handle) = self.take_handle() {
             handle.abort();
             // The loop is gone, so the claimant row must go too. `Drop` is

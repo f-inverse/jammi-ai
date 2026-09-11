@@ -18,7 +18,7 @@
 
 use std::future::Future;
 use std::net::SocketAddr;
-use std::sync::Arc;
+use std::sync::{Arc, Weak};
 
 use arrow_flight::flight_service_server::FlightServiceServer;
 use async_trait::async_trait;
@@ -332,6 +332,9 @@ impl OssServer {
         let session = InferenceSession::open(config).await?;
         let session_store = SessionStore::new();
         let metrics = Arc::new(MetricsRegistry::new()?);
+        // Every process has a keeper: `jammi_lease_heartbeat_age_seconds` is
+        // present on every server.
+        metrics.attach_keeper(Arc::clone(session.lease_keeper()))?;
         let readiness = Arc::new(ReadinessProbe::new(Arc::new(CatalogPingProbe::new(
             Arc::clone(&session),
         ))));
@@ -394,6 +397,10 @@ impl OssServer {
         // the guard alive past the gRPC serve future, which the chain would
         // otherwise drop it with.
         let worker = grpc.take_worker();
+        // The worker gauge families exist only where a claim loop does.
+        if let Some(w) = &worker {
+            self.metrics.attach_worker(w.shared())?;
+        }
         Ok(BoundServer {
             grpc,
             health_listener,
@@ -547,6 +554,12 @@ impl BoundServer {
     /// enabled`).
     pub fn has_worker(&self) -> bool {
         self.worker.is_some()
+    }
+
+    /// A weak handle on the embedded worker's shared state (`None` without a
+    /// worker) — what the gauges and liveness read; exposed for oracles.
+    pub fn worker_shared(&self) -> Option<Weak<jammi_ai::fine_tune::worker::WorkerShared>> {
+        self.worker.as_ref().map(|w| w.shared())
     }
 
     /// Serve both halves on the already-bound listeners until `shutdown`

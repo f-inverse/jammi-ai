@@ -1,4 +1,4 @@
-# SIZING — how the units were cut, ordered and grouped (#500), v2
+# SIZING — how the units were cut, ordered and grouped (#500), v3
 
 The user asked for the sizing itself to go through the rigor chain. This file records the
 dimensions, the alternatives, the choice, and what the sizing pressure-test changed (PRESSURE.md).
@@ -7,7 +7,7 @@ dimensions, the alternatives, the choice, and what the sizing pressure-test chan
 
 | # | Dimension | What it decides |
 |---|---|---|
-| D1 | Seam overlap (files, crates) | Units sharing files ship as ordered commits of one PR; never split a file across PRs. |
+| D1 | Seam overlap (files, crates) | Units sharing files ship as ordered commits of one PR; never split a file across **concurrently open** PRs; a file crossing sequential PRs carries a recorded co-ownership row with its order. |
 | D2 | Independent RED oracle | A unit is the smallest change whose acceptance is RED at base and GREEN after, asserting a criterion. The producer/consumer seam is a valid cut. |
 | D3 | Lane | Hermetic / cookbook / distributed (manual dispatch, nightly) / gpu-gang pod / gpu-gang cluster. A unit whose proof needs a lane is committed after the lane unit. |
 | D4 | Dependency edges | Topological order; waves. |
@@ -56,10 +56,20 @@ PR-D  U8 → U9                                                  U8 is the compl
 Serial edges: U1 → everything (API line); U2a → U2b, U3; U2b + U3 + U4a → U4b; U4a → U5a;
 U4b + U5a → U5b; U2b + U5a → U6; U5b + U6 → U8.
 
-Co-ownership recorded: `manifest.rs` (U2a, U3, U4b — U3's completeness test is extended by
-U4b), `worker.rs` (U2a/U2b own `run_spec`; U3 owns `publish_and_finalize`; U5b owns the
-coordinator region; U6 owns the head-target arm at `run_fine_tune_blocking`), `runpod_lib.sh`
-(U7a then U7b), `config/mod.rs` (U4a then U5a).
+Co-ownership recorded (order = commit order): `manifest.rs` (U2a, U3, U4b — U3's completeness
+test is extended by U4b); `pipeline/recompute.rs` (U2a re-materialize arm, U3 retrain arm);
+`worker.rs` (U2a/U2b own `run_spec`; U4b adds the rank spawn in `run_spec`; U3 owns
+`publish_and_finalize`; U5b owns the coordinator region; U6 owns the head-target arm at
+`run_fine_tune_blocking`); `trainer.rs` (U2b, U4b); `fine_tune/collective/mod.rs` (U4a creates,
+U5b adds `peer.rs`); `config/mod.rs` (U4a then U5a); `runpod_lib.sh` and `gpu-gang.yml` (U7a
+then U7b); `crates/jammi-server/src/runtime.rs` (U5a mount, U8 roles);
+`tests/distributed/{main.rs, harness.rs}` and `distributed.yml` (U5b, then U8);
+`docs/maintainer/MAINTAINER-GUIDE.md` variant block (U2a, U3; U9 prose only);
+`crates/jammi-wire/src/embedding.rs` (U2a) and `crates/jammi-wire/build.rs` (U5a).
+
+PR bases: PR-A from `main`; PR-B from `main` after PR-A merges; PR-C after PR-B; PR-D after
+PR-C. No PR stacks on an unmerged PR. Parallel worktrees inside a PR are rebased onto the PR
+branch in the stated commit order before the gate run that counts.
 
 ## Size and owner map
 
@@ -67,14 +77,14 @@ coordinator region; U6 owns the head-target arm at `run_fine_tune_blocking`), `r
 |---|---|---|---|
 | U1 | L (XL if S3 needs API rework) | docs-ci + db + every crate owner for fixes | one shared worktree, one commit |
 | U7a | L | docs-ci | own |
-| U2a | M | db + ai-core | own |
+| U2a | M | db + ai-core + wire-server (enum mirror) | own |
 | U4a | L | ai-core (+ db config) | own |
 | U2b | XL | ai-core (+ db reader) | own |
-| U3 | M | db + ai-core | own |
-| U4b | L | ai-core | own |
+| U3 | L | db + ai-core | own |
+| U4b | XL | ai-core | own |
 | U7b | M | docs-ci | own |
 | U5a | L | wire-server (+ db config) | own |
-| U6 | M | ai-core (+ db sink) | own |
+| U6 | L | ai-core (+ db sink) | own |
 | U5b | XL | ai-core + wire-server | own |
 | U8 | L | wire-server + ai-core + docs-ci | own |
 | U9 | S | docs-ci / doc-updater | own |
@@ -85,16 +95,19 @@ failure oracle.
 
 ## Spikes (results in the ledger before the dependent unit is briefed)
 
-- **S1** (→ U4a): `candle-core = { features = ["cuda", "nccl"] }` on a 2-GPU pod;
+- **S1** (→ U4a, U5b): `candle-core = { features = ["cuda", "nccl"] }` on the S4 2-GPU pod;
   `Comm::from_devices` over two candle CUDA devices; `all_reduce_in_place` on a candle tensor's
-  storage equals the CPU sum for f32 sums of two operands.
+  storage equals the CPU sum for f32 sums of two operands; `all_gather` on a candle tensor's
+  storage with equal and unequal counts in rank-ordered concat layout; a two-process
+  `Comm::from_rank` rendezvous (id passed out of band) on the same pod.
 - **S2** (→ U8): a scratch crate on Ballista 54.1 registers a `PhysicalExtensionCodec` via
   `with_ballista_physical_extension_codec`, executes a custom `ExecutionPlan` on an executor
   process, and sets task retry attempts to 0 per job.
 - **S3** (→ U1): a throwaway workspace compile on datafusion 54 / arrow 58 / object_store 0.13
   including `-p jammi-db --features postgres,mysql` and `pyo3-arrow`; record the delta.
 - **S4** (→ U7a/U7b): one 2-GPU pod through a `gpuCount: 2` variant of `rp_deploy_live`; a
-  create-cluster reachability and teardown probe (≈ one $3 pod-hour + cluster minutes).
+  create-cluster reachability and teardown probe (≈ one $3 pod-hour + cluster minutes; spends
+  real money — human-approved before it runs).
 - **S5** (→ U4b/U5b GPU oracles): CUDA bit-reproducibility with the flash deterministic path
   forced, `CUBLAS_WORKSPACE_CONFIG` set and NCCL channels pinned; decides whether GPU byte
   oracles are promoted from digest-pair records.

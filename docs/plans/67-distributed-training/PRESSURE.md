@@ -47,4 +47,50 @@ scaler), `:1120`/`:1616-1626` (mining, GradCache), `data.rs:477-481` (split arit
 (`FineTuneConfig` fields), `docs/plans/65-resolve-witness/README.md:23-26` (cache rekey),
 `flash_bwd_kernel.h:122-123` (deterministic path), `crates/jammi-db/Cargo.toml:55` (0.10.1).
 
-## Round 2 (on v2) — recorded below by the lead after the re-dispatch
+## Round 2 (2026-09-10, on v2 fd543451) — two lenses, both REFINE; every disposition in v3
+
+### Design lens — 8 block, 3 advisory
+
+| # | Finding | Disposition |
+|---|---|---|
+| 1 | "Sum, don't average" is exact only if no trainable parameter consumes gathered remote slots; classification applies the head inside the loss (`trainer.rs:2676-2679`) | Invariant stated; per-arm gather points (logits for classification; head output for regression; encoder outputs otherwise). README r6; DESIGN §4; U4b (b) adds classification + quantile regression |
+| 2 | Refusal predicate `refresh_every > 0` is true by default (`fine_tune.rs:212-231`) — every W>1 job would be refused | Predicate is `hard_negatives.mine` or `cached`. README r2; DESIGN §2; U4a |
+| 3 | Per-rank dropout RNG (`resume.rs:107`) unmodelled — resume of a gang not reproducible | Per-rank `dropout_positions` gathered to rank 0; seed `f(seed, rank)`; oracle across a resume. README r8; DESIGN §4, §6; U4b |
+| 4 | Descriptor cannot hold `jammi-wire`/`jammi-ai` types (`jammi-db` depends on `jammi-numerics` only) | Opaque versioned canonical encoding; completeness test in the owning crate. README r5; DESIGN §3; U2a/U3 |
+| 5 | `batches_per_epoch` ambiguous between B and W·B; LR horizon and trailing scale follow | `ceil(train_count / (W·B))`; every step quantity indexed by global batch; U2b lands it. README r3/r7; DESIGN §2 |
+| 6 | Zero-row ranks in the trailing global batch unstated | Kept; 0-row tensors, zero counts; fixture with `train_count` not a multiple of W·B. README r3; DESIGN §2; U2b (b), U4b (b) |
+| 7 | `Precomputed` arm splits by batch count (`data.rs:493-497`) | Tests-only arm stays outside the table path, unchanged. README r3; DESIGN §2; U2b |
+| 8 | "Streams into the reduction" is not bit-identical (`from_targets` two-pass) | One collected `Vec<f32>`, `from_targets` once; named 4 B/row exemption. README r4; DESIGN §2; U2b |
+| A9 | Fence keyed `(job_id, rank)` misses a rank that moved hosts; "lesser" vs "lesser or equal" | Fence on `job_id`; lesser-or-equal refused. README r8; DESIGN §4; U5a (c) |
+| A10 | GPU ε chosen after the run | ε pre-registered per leg before the first gating run; digest pair never a failure until S5. README r16; DESIGN §6; U7a schema |
+| A11 | Seven governance stems, not two; `CacheKey` `None` semantics; `in_flight` map | All seven quoted; `None` distinct; `in_flight` rekeyed. README r14, r23; DESIGN §4 |
+
+### Sizing lens — 6 block, 8 advisory
+
+| # | Finding | Disposition |
+|---|---|---|
+| 1 | U2a does not compile: `ResultTableKind` wire mirror (`jammi-wire/src/embedding.rs:95-116`, proto) | In U2a scope; wire-server owner; B5 |
+| 2 | Doc-parity gate runs every PR; guide variant block was in U9 | Block lands with U2a and U3; U9 prose only |
+| 3 | U6 (c) needs U5b's harness and matrix entry | Moved to U5b (e); U5b depends on U6 |
+| 4 | Reachability registry is derived from every `ci/scripts` file; `runpod_gpu_gang.sh` reds it | Allowlist in U7a/U7b scope + acceptance |
+| 5 | No order-determinism criterion in either half of U2 | U2a (d) ordered read-back on a >1-row-group fixture; U2b (e) streamed order == committed for `target_partitions ∈ {1,N}` |
+| 6 | S1 never probes `all_gather` or `from_rank` | S1 extended; bound to U4a and U5b |
+| A7 | U1's clippy step is a coverage lane, not RED at base | Labeled; version test is the oracle; base run recorded |
+| A8 | `jammi-wire/build.rs` hand-lists protos | In U5a scope |
+| A9 | Co-ownership map incomplete | Rows added (SIZING) |
+| A10 | D1 contradicted by sequential crossings | D1 restated |
+| A11 | PR bases unstated | Stated (SIZING, README hand-off) |
+| A12 | U3, U6 = M; U4b = L understated | L, L, XL |
+| A13 | GPU/gang test targets unnamed | Existing `gpu_capability` / `distributed` targets; no new `[[test]]` |
+| A14 | S4 cost/approval and ledger path not on the README | Added; `runpod_lib.sh:1263` fixed |
+
+Verified by the lead before folding: `trainer.rs:2676-2679` (classify inside loss), `:2245`
+(regression head pre-loss), `fine_tune.rs:212-231` (`mine: false`, `refresh_every: 1`),
+`:590-601` (`refresh_every == 0` refused when mining), `trainer.rs:1451` (`.mine` gate),
+`data.rs:439-442`/`:493-497` (Precomputed tests-only, batch split), `cache.rs:43-45`
+(`in_flight` keyed by id), `resume.rs:107`, `crates/jammi-db/Cargo.toml:44`,
+`trainer.rs:843-852`, `jammi-wire/src/embedding.rs:95-101`, `embedding.proto:108-109`,
+`check_doc_parity.py:127-136`, `execution_surface_reachability_allowlist.txt` (162 lines),
+`jammi-wire/build.rs:22-33`.
+
+## Round 3 (on v3) — disposition check

@@ -1,4 +1,4 @@
-# DESIGN — distributed training on DataFusion (#500), v2
+# DESIGN — distributed training on DataFusion (#500), v3
 
 Companion to `README.md` (rulings) and `UNITS.md` (contracts). Every mechanism names the
 principle it derives from and the code it lands on. Citations are read against main at
@@ -46,8 +46,13 @@ source anchors. `GraphFineTune` materializes its seeded, deterministic sampled p
 
 **Split.** The job's `validation_fraction` defines the train prefix exactly as today
 (`data.rs:477-481`): `val_count = round(rows × fraction)`, train rows `[0, rows − val_count)`,
-validation rows after. `batches_per_epoch` derives from `train_count` and the batch size (the
-trailing-window scale at `trainer.rs:2505-2514` is unchanged in form).
+validation rows after. The tests-only `Precomputed` loader arm (`data.rs:439-442`; split by
+batch count at `:493-497`) hands tensors straight to the trainer and stays outside the table
+path and the residency bound, unchanged. Every step quantity is a function of the **global**
+batch: `batches_per_epoch = ceil(train_count / (W·B))`; `global_step`, the LR horizon
+(`trainer.rs:843-852`, `compute_lr`) and the trailing-window loss scale (`:2505-2514`) all
+index by global batch, so W ranks take exactly the steps W=1 takes at batch W·B. U2b lands
+the formula at W=1.
 
 **Loader.** `TrainingDataLoader` (`data.rs:200`, today `Vec<TrainingRow>`) becomes a per-epoch
 `RecordBatch` stream over the table's row groups with a prefetch bound; each head's constructor
@@ -57,21 +62,28 @@ and slices (a reader concern; no materialization alignment).
 **Partition rule v1 ("block-by-global-batch")** over the train prefix: with per-rank batch B
 and world W, global batch t is rows `[t·W·B, (t+1)·W·B)`; rank r reads
 `[t·W·B + r·B, t·W·B + (r+1)·B)`. The union over ranks at step t is exactly the W=1 batch of
-size W·B at step t. The trailing global batch may be short; ranks then hold unequal counts and
-every rank knows every count from the rule. Sequence bucketing (`batch_bucket.rs`) runs per
-rank batch; the W-invariance oracle pins the bucket rung (§6).
+size W·B at step t. The trailing global batch is **kept** (today keeps and specially scales
+it, so drop-last would change W=1 bytes); ranks then hold unequal counts, and when
+`train_count mod (W·B) ≤ r·B` rank r holds **zero** rows: it encodes nothing and contributes a
+0-row tensor to every gather of that step, with a zero in the counts vector every rank derives
+from the rule. Sequence bucketing (`batch_bucket.rs`) runs per rank batch; the W-invariance
+oracle pins the bucket rung (§6).
 
-**`TargetScaler`** (K3): rank 0 streams the target column of the train prefix in committed
-order into the same `from_targets` reduction (`regression_loss.rs:169`) — bit-identical to
-today (`trainer.rs:824-836`) — and ships μ/σ in the `RankAssignment`; it persists for resume as
-today.
+**`TargetScaler`** (K3): rank 0 collects the target column of the train prefix, in committed
+order, into **one** `Vec<f32>` on the trainer's device and calls `from_targets` **once**
+(`regression_loss.rs:169-190` is a two-pass whole-tensor reduction; f32 summation is
+grouping-sensitive, so a chunked accumulation would move the low bits) — bit-identical to
+today (`trainer.rs:824-836`). A named exemption from the residency bound (4 bytes per row).
+μ/σ ship in the `RankAssignment` and persist for resume as today.
 
 **Whole-set arms.** Hard-negative mining (`trainer.rs:1120`, a mined loader rebuilt at each
 refresh epoch from the model) and GradCache (`trainer.rs:1616-1626`, the whole train prefix as
 one in-batch-negative batch) are structurally whole-set consumers. In this plan they run at
-W=1 only: `world_size > 1` with `hard_negatives.refresh_every > 0` or `cached = true` is a
-typed K2 refusal at submit time, and the residency bound exempts them (they stream the table in
-but hold what they need). The gather primitive (§4) is what lifts this later.
+W=1 only: `world_size > 1` with `hard_negatives.mine == true` or `cached == true` is a typed
+K2 refusal at submit time (`mine` is the real gate, `trainer.rs:1451`; `refresh_every` defaults
+to 1 and `== 0` is already refused when mining), and the residency bound exempts them (they
+stream the table in but hold what they need). The gather primitive (§4) is what lifts this
+later.
 
 ## 3. A trained model is a producer
 
@@ -86,9 +98,17 @@ but hold what they need). The gather primitive (§4) is what lifts this later.
 | `world_size`, per-rank batch, partition rule version, collective backend, reduction policy | the summation order and the batch layout |
 | `MaterializationEnv` (engine version, device kind, model identities) | as for every producer |
 
-U3's completeness test is an **exhaustive destructuring** of `FineTuneConfig`, `TrainingCommon`
-and the descriptor (no `..`), so a new field fails compilation instead of escaping the hash;
-U4b extends the same test with the topology fields when they appear.
+**Crate layering.** `jammi-db` depends on no jammi crate but `jammi-numerics`
+(`crates/jammi-db/Cargo.toml:44`), and every existing variant holds primitives and db-local
+types (`manifest.rs:305-345`). `FineTuneConfig` is `jammi-wire`, `TrainingSpec`/`TrainingCommon`
+are `jammi-ai` (`spec.rs:33-63`), `TrainingFormat` is `jammi-ai` (`data.rs:59`). So both new
+variants carry an **opaque, versioned canonical encoding** — `spec_canonical: String`
+(sorted-key canonical JSON) with `spec_schema_version: u32` — produced by `jammi-ai` from the
+owning types, plus db-local primitives (`ModelTask`, ids, digests, the topology fields).
+`TrainingSet.format` is likewise a canonical string. The **exhaustive destructuring**
+completeness test (no `..`) lives in `jammi-ai` (and `jammi-wire` for `FineTuneConfig`), so a
+new field fails compilation instead of escaping the hash; U4b extends it with the topology
+fields.
 
 The catalog name `jammi:fine-tuned:{job_id}` stays as the handle and re-claim idempotency key
 (`worker.rs:1176-1184`). Migration 029 `model_materialization` adds nullable
@@ -119,9 +139,10 @@ tenant-scoped catalog and derives storage URLs itself.
 
 **Authorization.** Before running, a peer verifies through a tenant-scoped, read-only catalog
 read that `job_id` is `running`, `claimed_by == coordinator_worker_id`, and the lease is live;
-otherwise `RunRank` is refused with a typed status. Peers key running ranks by `(job_id, rank)`
-and fence on `attempt`: a strictly greater attempt aborts the older; a lesser or equal one is
-refused. `FetchPartition` takes a result-table id and a partition index, resolved the same way.
+otherwise `RunRank` is refused with a typed status. Peers fence on **`job_id`**: a `RunRank`
+at attempt N aborts every local runner of that job with attempt < N, whatever rank it held
+(the rank→peer mapping may differ between attempts); a lesser or equal attempt is refused;
+`(job_id, rank)` is the runner's identity only. `FetchPartition` takes a result-table id and a partition index, resolved the same way.
 Mutual transport auth stays the deployer's runtime, as for every surface today.
 
 **Collective.** One trait, four implementations, selected by configuration:
@@ -146,17 +167,29 @@ the rank environment). `Nccl` compiles under the existing `cuda` feature; the tr
 `cfg`-forked.
 
 **Step (the gather rule).** Per global batch t, each rank encodes its slice, then
-`all_gather`s each representation column and the scores using the counts every rank derives
-from the partition rule. Every rank computes the **identical global loss** over the gathered
+`all_gather`s the step's tensors using the counts every rank derives from the partition rule.
+**Invariant: the gather point is downstream of every trainable parameter; nothing trainable
+consumes a gathered remote slot** — otherwise the summed gradient of that parameter is W× too
+large. Gather points per `TrainingBatch` arm: contrastive / pairs / triplet gather the encoder
+outputs (post-projection, `trainer.rs:2195-2225`) and the scores; **classification gathers the
+logits from `classify()`** (the trainable head is applied inside the loss today,
+`trainer.rs:2676-2679`, head at `:2892-2897`), never `embeddings`; regression gathers the head
+output (`head_forward` already runs pre-loss, `:2245-2262`) and the targets; NER stays refused
+as today (`:2231`). Every rank then computes the **identical global loss** over the gathered
 batch through the existing loss functions (`dispatch_contrastive_loss`, `trainer.rs:4343-4356`,
-`mnrl_loss`, classification/regression heads) — batch-coupled objectives keep exactly their
-W=1 semantics. Backward runs through a gather whose backward keeps only the local slots (rank
+`mnrl_loss`, `cross_entropy_loss`, the regression/quantile losses) — batch-coupled objectives
+keep exactly their W=1 semantics, and each loss's own 1/n runs over the global n. Matryoshka
+prefixes narrow dim 1 only (`:4360-4405`) and are orthogonal to a dim-0 gather. Backward runs through a gather whose backward keeps only the local slots (rank
 r's own rows), so no gradient crosses the wire; at each optimizer-step boundary the adapter
 `GradStore` is laid out in the canonical `trainable_vars` order with zeros for absent entries
 (`optimizer.rs:600-611` documents absent entries as a real shape), `all_reduce_sum`med, then
 `clip_and_step` (`optimizer.rs:612`). Gradient accumulation counts global batches. Every rank
 holds identical weights after the step. Rank 0 alone writes the resume checkpoint at epoch
-boundaries and publishes; other ranks' checkpoint calls are no-ops.
+boundaries and publishes; other ranks' checkpoint calls are no-ops — except that each rank's
+dropout Philox position (`resume.rs:107` `dropout_positions`, per process today) is gathered
+to rank 0 at the epoch boundary and stored **per rank** in the bundle, and each rank's dropout
+seed derives as `f(seed, rank)`; a resumed gang at equal topology therefore reproduces an
+uninterrupted one, and W=1 keeps today's single-entry shape.
 
 **Lockstep control flow.** The step boundary is the global batch index, never a rank-local
 counter. Divergence (`loss.is_nan() || loss > 100`, `trainer.rs:2560-2567`), the 3-strikes
@@ -174,7 +207,9 @@ Either way the next attempt resumes from the job-level resume checkpoint
 
 **Device-plural session.** `[gpu] devices = [..]` gives one `GpuScheduler` per device and a
 `ModelCache` keyed by a `CacheKey { model_id, device, task: Option<_>, backend: Option<_> }`
-shared with plan 65's rekey; `Local` ranks are threads pinned to devices.
+shared with plan 65's rekey — `None` is a distinct key value, never a wildcard — applied to
+both the entries map and the single-flight `in_flight` map (`cache.rs:43-45`); `Local` ranks
+are threads pinned to devices.
 
 ## 5. The distributed frozen forward (head target) and the partition-aware operator
 
@@ -193,9 +228,9 @@ single-process table (K4 shape).
 |---|---|---|
 | **Refactor parity**: W=1 with the new loader, scaler-over-train-prefix and `Noop` produces adapter bytes identical to the base commit on every cookbook fine-tune fixture (`cookbook/book/artifacts/finetune_*/checksums.json`) | byte | cookbook 6.5; hermetic |
 | **K4 (real)**: W=1 through the gang path (coordinator dispatching to itself) equals the in-process trainer | byte | server it-suite |
-| **Equal-topology reproducibility**: two runs, same W and plan → identical bytes | byte on `Local`/`Peer` (hermetic); digest pair + per-step loss delta ≤ ε on GPU legs until S5 promotes | hermetic; gpu-gang |
+| **Equal-topology reproducibility**: two runs, same W and plan → identical bytes; also across a resume (kill at epoch k, resume, compare to uninterrupted) | byte on `Local`/`Peer` (hermetic); on GPU legs the digest pair is recorded (never a failure until S5 promotes) and the per-step loss delta is compared to an ε pre-registered per leg before the first gating run (S5, or the max delta over ≥ 3 same-seed baseline runs on that box) | hermetic; gpu-gang |
 | **W-invariance**: W × B versus W=1 × W·B, identical loss per step within ε, at `lora_dropout = 0` and a pinned bucket rung; ε measured on the leg that gates (CPU ε never inherited by GPU) | tolerance | hermetic; gpu-gang |
-| **Gather exactness**: for CoSENT, AnglE and MNRL, the W=2 global loss at step t equals the W=1 loss on the same rows bit-for-bit on CPU (same expression, same inputs) | byte | hermetic |
+| **Gather exactness**: for CoSENT, AnglE, MNRL, **classification** and **quantile regression**, the W=2 global loss and the summed adapter gradient at step t equal the W=1 loss and gradient on the same rows bit-for-bit on CPU, on a fixture whose `train_count` is not a multiple of W·B (a zero-row rank occurs) | byte | hermetic |
 | **Lockstep**: one rank's batch forced to diverge; one rank's batch yields no gradient for a Var; the gang completes | property | hermetic |
 | **Gang failure**: kill −9 a peer → job requeued, completed by a new gang from the checkpoint, exactly one model, no orphan prefix promoted; kill −9 the coordinator → same via lease; split-brain: attempt N+1 dispatched while N is live on the peer → N aborted, N+1 runs | property | distributed lane |
 | **Authorization**: `RunRank` for a job not running / not claimed by the caller / lease expired is refused | property | server it-suite |

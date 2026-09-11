@@ -143,6 +143,20 @@ message CasFailedError {
   string status = 2;
 }
 
+// `JammiError::ParentMoved { table, expected, found }`. A parent-pinned
+// version CAS (the allocation UPDATE or the publish table-row swap) matched
+// no row because `current_version` no longer equals the parent the caller's
+// delta was derived from — a concurrent refresh/compaction published first.
+// The ONE classification for both the allocation miss and the publish
+// table-row miss. Maps to `Aborted` (the same retryable-conflict family as
+// `CasFailed`/`LeaseLost`). `expected`/`found` are absent only for the base
+// publish's `current_version IS NULL` CAS.
+message ParentMovedError {
+  string table = 1;
+  optional int64 expected = 2;
+  optional int64 found = 3;
+}
+
 // `JammiError::SourceBusy { source_id, table }`. A source delete was refused
 // because a live-lease `building` row still references it. Maps to
 // `FailedPrecondition` — a retry once the writer finishes or its lease

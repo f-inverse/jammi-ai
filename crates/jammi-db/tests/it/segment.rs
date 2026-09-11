@@ -707,13 +707,24 @@ async fn allocation_is_monotonic_and_never_reused(kind: BackendKind) {
         (base.status.as_str(), base.live_rows, base.masked_rows),
         ("ready", Some(7), Some(0))
     );
-    // A second base publish misses the CAS (current_version is no longer NULL).
+    // A second base publish misses the CAS (current_version is no longer
+    // NULL): the ready row's `current_version` disagrees with the expected
+    // parent (`None`), the same lost-race shape `ParentMoved` names for the
+    // allocation and publish-table-row misses below — ONE classifier for
+    // every ready-row parent mismatch, never `CasFailed`'s "left building".
     let miss = catalog
         .publish_base_version(&fresh.table_name, 1, "mem://x", "id1", 7)
         .await
         .expect_err("a second base publish must miss");
     assert!(
-        matches!(miss, jammi_db::error::JammiError::CasFailed { .. }),
+        matches!(
+            miss,
+            jammi_db::error::JammiError::ParentMoved {
+                expected: None,
+                found: Some(0),
+                ..
+            }
+        ),
         "{miss:?}"
     );
 
@@ -750,7 +761,14 @@ async fn allocation_is_monotonic_and_never_reused(kind: BackendKind) {
         .await
         .expect_err("the second publisher on a stale parent must miss");
     assert!(
-        matches!(miss, jammi_db::error::JammiError::CasFailed { .. }),
+        matches!(
+            miss,
+            jammi_db::error::JammiError::ParentMoved {
+                expected: Some(0),
+                found: Some(1),
+                ..
+            }
+        ),
         "{miss:?}"
     );
     let row = catalog
@@ -773,6 +791,157 @@ async fn allocation_is_monotonic_and_never_reused(kind: BackendKind) {
     );
     d1.detach();
     d2.detach();
+}
+
+// O1 (DELTA fix round 1, audit a25424e2aa5e91337 F1) — the serialized
+// interleaving the pre-fix §6.7 oracle could never build: A publishes
+// FULLY (allocates AND publishes) from parent P, THEN B — still holding
+// its OWN read of P from before A's publish — attempts to allocate. Before
+// this fix, `allocate_result_table_version` re-read `current_version`
+// itself and handed it back as B's parent, so B's allocation silently
+// SUCCEEDED against A's new current_version and B's manifest would later
+// disagree with its own `parent_version` (K7 broken). The fix pins the
+// allocating UPDATE's WHERE clause to the caller's `expected_parent`: B's
+// allocation now refuses typed (`ParentMoved`) BEFORE `next_version`
+// increments, so B's stale attempt consumes no version number and inserts
+// no `building` row (no manifest, no fragment ever gets a chance to be
+// written for it). `refresh_embeddings` and `compact_embeddings` both
+// allocate through this exact `ResultStore::allocate_version` /
+// `Catalog::allocate_result_table_version` pair, so this one test covers
+// the allocation-time guard both actuators share.
+#[cfg_attr(test, test_case(BackendKind::Sqlite ; "sqlite"))]
+#[cfg_attr(
+    all(test, feature = "live-postgres-tests"),
+    test_case(BackendKind::Postgres ; "postgres")
+)]
+#[tokio::test]
+async fn allocation_refuses_when_the_parent_moved(kind: BackendKind) {
+    use jammi_db::catalog::version_repo::{PublishVersion, VersionCas};
+
+    let dir = tempdir().unwrap();
+    let Some(backend) = open_backend(kind, dir.path()).await else {
+        eprintln!("skipping {kind:?}: JAMMI_TEST_PG_URL unset");
+        require_live_pg("allocation_refuses_when_the_parent_moved");
+        return;
+    };
+    let catalog = fresh_catalog(backend).await;
+    let store = store(dir.path(), Arc::clone(&catalog), StoragePrecision::F32);
+    let table = ready_table(&store).await;
+
+    // A publishes the base FULLY.
+    catalog
+        .publish_base_version(&table.table_name, 0, "mem://base.version.json", "id0", 5)
+        .await
+        .unwrap();
+
+    // B's own read of the parent, captured BEFORE A's next (delta) publish:
+    // `current_version = Some(0)`.
+    let record_b = catalog
+        .get_result_table(&table.table_name)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(record_b.current_version, Some(0));
+
+    // A now publishes FULLY again — a refresh from parent 0 to version 1.
+    let a_version = store.allocate_version(&record_b).await.unwrap();
+    assert_eq!(
+        (a_version.version(), a_version.parent_version()),
+        (1, Some(0))
+    );
+    let cas_a = VersionCas::writer(&table.table_name, 1, store.writer_id(), None);
+    catalog
+        .publish_version(PublishVersion {
+            cas: &cas_a,
+            lease: std::time::Duration::from_secs(30),
+            parent: Some(0),
+            identity: "id-a1",
+            live_rows: 5,
+            masked_rows: 0,
+            anchors_json: "[]",
+        })
+        .await
+        .unwrap();
+    a_version.detach();
+    let after_a = catalog
+        .get_result_table(&table.table_name)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(after_a.current_version, Some(1), "A fully published");
+    let next_before = after_a.next_version;
+
+    // B, STILL holding `record_b` (current_version = Some(0)), now attempts
+    // to allocate — AFTER A has fully published. The allocation must refuse
+    // typed, BEFORE `next_version` increments.
+    let miss = store
+        .allocate_version(&record_b)
+        .await
+        .expect_err("B's allocation from the older parent must refuse");
+    assert!(
+        matches!(
+            miss,
+            jammi_db::error::JammiError::ParentMoved {
+                expected: Some(0),
+                found: Some(1),
+                ..
+            }
+        ),
+        "{miss:?}"
+    );
+
+    // No version number was consumed and no `building` row was inserted for
+    // B's refused attempt.
+    let after_miss = catalog
+        .get_result_table(&table.table_name)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        after_miss.next_version, next_before,
+        "a refused allocation must not burn a version number"
+    );
+    assert!(
+        catalog
+            .get_result_table_version(&table.table_name, next_before)
+            .await
+            .unwrap()
+            .is_none(),
+        "a refused allocation must insert no building row"
+    );
+
+    // A re-derived B — reading the CURRENT parent — allocates and publishes
+    // normally.
+    let record_b2 = catalog
+        .get_result_table(&table.table_name)
+        .await
+        .unwrap()
+        .unwrap();
+    let b2_version = store.allocate_version(&record_b2).await.unwrap();
+    assert_eq!(
+        (b2_version.version(), b2_version.parent_version()),
+        (next_before, Some(1))
+    );
+    let cas_b2 = VersionCas::writer(&table.table_name, next_before, store.writer_id(), None);
+    catalog
+        .publish_version(PublishVersion {
+            cas: &cas_b2,
+            lease: std::time::Duration::from_secs(30),
+            parent: Some(1),
+            identity: "id-b2",
+            live_rows: 5,
+            masked_rows: 0,
+            anchors_json: "[]",
+        })
+        .await
+        .unwrap();
+    b2_version.detach();
+    let final_row = catalog
+        .get_result_table(&table.table_name)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(final_row.current_version, Some(next_before));
 }
 
 // §6.14 — shard-ordering property: segments appended to one building version

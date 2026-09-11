@@ -469,12 +469,17 @@ impl ResultTableCas {
 }
 
 /// The row a zero-row CAS re-reads by primary key (no tenant predicate) to
-/// classify the miss.
+/// classify the miss. `current_version` lets `classify_ready_cas_miss`
+/// distinguish a genuinely superseded row (`CasFailed`) from one whose
+/// `current_version` moved out from under a parent-pinned allocation or
+/// publish CAS (`ParentMoved`) — the same field the allocation and publish
+/// predicates themselves compare against.
 #[derive(Debug, Clone)]
 pub(crate) struct CasTarget {
     pub(crate) tenant_id: Option<String>,
     pub(crate) status: String,
     pub(crate) writer_id: Option<String>,
+    pub(crate) current_version: Option<i64>,
 }
 
 /// Re-read the CAS target by primary key inside the same transaction.
@@ -483,13 +488,15 @@ pub(crate) async fn read_cas_target(
     table: &str,
 ) -> std::result::Result<Option<CasTarget>, BackendError> {
     tx.query_opt(
-        "SELECT tenant_id, status, writer_id FROM result_tables WHERE table_name = $1",
+        "SELECT tenant_id, status, writer_id, current_version FROM result_tables \
+         WHERE table_name = $1",
         &[SqlValue::TextOwned(table.to_string())],
         |row| {
             Ok(CasTarget {
                 tenant_id: row.try_get("tenant_id")?,
                 status: row.get("status")?,
                 writer_id: row.try_get("writer_id")?,
+                current_version: row.try_get::<i32>("current_version")?.map(i64::from),
             })
         },
     )
@@ -882,7 +889,7 @@ impl Catalog {
     /// renewal — so a RELEASED building lease (`lease_expires_at IS NULL`,
     /// [`Self::release_building_tables_of_claimant`]) renews zero rows and
     /// surfaces as [`JammiError::CasFailed`] with `status = "building"`
-    /// (cause 5 of [`Self::classify_cas_miss`]): the keeper flips the hold's
+    /// (cause 5 of `Self::classify_cas_miss`): the keeper flips the hold's
     /// `lost`, the writer's `finish` errors instead of promoting, and
     /// recovery purges nothing.
     pub async fn renew_lease(&self, cas: &ResultTableCas, lease: Duration) -> Result<()> {

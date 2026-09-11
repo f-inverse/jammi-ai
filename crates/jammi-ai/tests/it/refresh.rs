@@ -755,8 +755,11 @@ async fn concurrent_reads_see_the_parent_until_publish() {
 }
 
 /// §6.7 — two refreshes on one parent allocate distinct numbers; exactly one
-/// publishes; the other's publish is `CasFailed`, its row `failed` and its
-/// artifacts reaped.
+/// publishes; the other's publish is `ParentMoved` (the table-row swap's
+/// `current_version` no longer equals the parent it allocated against — the
+/// SAME lost-race classification an allocation miss gets, never `CasFailed`,
+/// whose `status` payload would misname the cause since the row IS `ready`),
+/// its row `failed` and its artifacts reaped.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn concurrent_refreshes_on_one_parent_publish_exactly_once() {
     use jammi_ai::pipeline::embedding_refresh::refresh_test_hooks::{arm, ParkPoint};
@@ -780,7 +783,7 @@ async fn concurrent_refreshes_on_one_parent_publish_exactly_once() {
         .await
         .unwrap()
         .expect_err("the first publisher must miss");
-    assert!(matches!(err, JammiError::CasFailed { .. }), "{err:?}");
+    assert!(matches!(err, JammiError::ParentMoved { .. }), "{err:?}");
 
     let record = h.record().await;
     assert_eq!(record.current_version, second.version);
@@ -801,6 +804,142 @@ async fn concurrent_refreshes_on_one_parent_publish_exactly_once() {
         !h.fragment_exists(&record, loser.version),
         "the loser's artifacts are reaped"
     );
+}
+
+/// O2 (DELTA fix round 1, audit a25424e2aa5e91337 F2) — two SESSIONS on one
+/// catalog: session 1 is at version 0 (having just published the base);
+/// session 2, a SECOND `InferenceSession` opened on the SAME root/catalog,
+/// publishes version 1 adding new keys via its own refresh. Session 1's
+/// DataFusion `ctx` is never re-bound past v0 — `bind_result_table` only
+/// ever rebinds the PUBLISHING session's own `ctx` (`ensure_base_version` /
+/// `after_publish`), never a sibling session's — which is the exact F2
+/// stale-binding shape. Session 1 then refreshes with no further source
+/// edits: before this fix, step 3 read session 1's own stale `ctx.table(..)`
+/// (still v0), so it would classify v1's already-added keys as `Added`
+/// again, re-infer them into a THIRD fragment with no mask entry, and
+/// publish a bogus version 2 with two live physical rows under each of
+/// those `_row_id`s. After the fix, step 3 reads PARENT's own masked
+/// provider (loaded fresh from the catalog's `current_version`, not from
+/// `ctx`), so session 1 sees v1's rows as already current and the refresh is
+/// a genuine `NoChange`.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn stale_process_binding_does_not_corrupt_a_concurrent_refresh() {
+    let h = harness(20).await;
+    // Session 1 publishes the base (v = 0) via a no-op refresh.
+    let base = h.refresh().await.unwrap();
+    assert_eq!(base.outcome, RefreshOutcome::NoChange);
+    assert_eq!(h.record().await.current_version, Some(0));
+
+    // Session 2: a second `InferenceSession` on the SAME root/catalog. Its
+    // own `refresh_embeddings` call publishes v = 1 after 5 new rows are
+    // added to the source.
+    let session2 = open_session(&h.root, 1).await;
+    let mut rows25 = rows(20);
+    rows25.extend((20..25).map(|i| (Some(i), text_for(i))));
+    write_parquet(&h.source_path, &rows25);
+    let report2 = session2
+        .refresh_embeddings(&h.table, RefreshOptions::default())
+        .await
+        .unwrap();
+    assert_eq!(report2.outcome, RefreshOutcome::Published);
+    assert_eq!(report2.added, 5);
+    assert_eq!(h.record().await.current_version, Some(1));
+
+    // Session 1's ctx was never told about v = 1 — only session 2's own
+    // `bind_result_table` call touched session 2's ctx. Session 1 now
+    // refreshes with NO further source edits: its delta must already see
+    // the 5 keys session 2 added as part of the CURRENT state, never as new
+    // `Added` keys to re-infer.
+    let report1 = h.refresh().await.unwrap();
+    assert_eq!(
+        report1.outcome,
+        RefreshOutcome::NoChange,
+        "session 1's delta must already see v1's rows as current, not `Added`: {report1:?}"
+    );
+
+    // No duplicate physical row under any key: the exact live-row count,
+    // read through the CURRENT version's OWN masked provider (never
+    // session 1's stale `ctx` — a `SELECT` through `ctx` is a DIFFERENT,
+    // pre-existing staleness class this fix does not close, see
+    // `current_state`'s doc comment), must be exactly 25, not 30 (25 real
+    // rows plus 5 duplicates from a re-inferred fragment).
+    let record = h.record().await;
+    let manifest = h
+        .session
+        .result_store()
+        .read_version_manifest(
+            &record.table_name,
+            &StorageUrl::parse(&record.parquet_path).unwrap(),
+            record.current_version.unwrap(),
+        )
+        .await
+        .unwrap()
+        .unwrap();
+    let live = h
+        .session
+        .result_store()
+        .count_live_rows(h.session.context(), &record, &manifest)
+        .await
+        .unwrap();
+    assert_eq!(live, 25, "count_live_rows must be exact, no duplicate rows");
+}
+
+/// O2 (DELTA fix round 1, audit a25424e2aa5e91337 F2/V2) — the compaction
+/// arm: the MORE DANGEROUS half of the same defect. Session 1 publishes
+/// version 0; session 2 (a second `InferenceSession` on the SAME
+/// root/catalog) refreshes to version 1, adding new rows. Session 1's `ctx`
+/// is never rebound past v0. Session 1 then COMPACTS: before this fix,
+/// `compact_embeddings` rewrote the live rows it is about to republish by
+/// scanning `ctx.sql("SELECT * FROM \"jammi.{t}\"")` over session 1's stale
+/// v0 binding, so the compacted fragment would carry ONLY v0's rows —
+/// silently and PERMANENTLY discarding every row session 2 added, while the
+/// K7 chain records the result as a legitimate compaction of v1. After the
+/// fix, compaction reads through v1's OWN masked provider (loaded fresh from
+/// the catalog, never `ctx`), so nothing is lost.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn stale_process_binding_does_not_lose_rows_on_compaction() {
+    let h = harness(20).await;
+    let base = h.refresh().await.unwrap();
+    assert_eq!(base.outcome, RefreshOutcome::NoChange);
+    assert_eq!(h.record().await.current_version, Some(0));
+
+    let session2 = open_session(&h.root, 1).await;
+    let mut rows25 = rows(20);
+    rows25.extend((20..25).map(|i| (Some(i), text_for(i))));
+    write_parquet(&h.source_path, &rows25);
+    let report2 = session2
+        .refresh_embeddings(&h.table, RefreshOptions::default())
+        .await
+        .unwrap();
+    assert_eq!(report2.outcome, RefreshOutcome::Published);
+    assert_eq!(h.record().await.current_version, Some(1));
+
+    // Session 1, still bound at v0, compacts.
+    let report = h.session.compact_embeddings(&h.table).await.unwrap();
+    assert_eq!(
+        report.live_rows, 25,
+        "compaction must not silently drop the rows session 2 added: {report:?}"
+    );
+
+    let record = h.record().await;
+    let manifest = h
+        .session
+        .result_store()
+        .read_version_manifest(
+            &record.table_name,
+            &StorageUrl::parse(&record.parquet_path).unwrap(),
+            record.current_version.unwrap(),
+        )
+        .await
+        .unwrap()
+        .unwrap();
+    let live = h
+        .session
+        .result_store()
+        .count_live_rows(h.session.context(), &record, &manifest)
+        .await
+        .unwrap();
+    assert_eq!(live, 25, "no row lost by the compaction");
 }
 
 /// §6.8 — the model changed under the table (its content digest moved): the

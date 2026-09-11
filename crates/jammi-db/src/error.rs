@@ -248,6 +248,34 @@ pub enum JammiError {
         status: String,
     },
 
+    /// A parent-pinned version CAS — the allocation UPDATE or the publish
+    /// table-row swap — matched no row because `result_tables.current_version`
+    /// no longer equals the parent the caller's delta was derived from: a
+    /// concurrent refresh or compaction published between the caller's read
+    /// and this CAS. ONE classification for both misses (the allocation
+    /// miss and the publish table-row miss are the same lost race and must
+    /// not get two typed spellings): raised by `classify_ready_cas_miss`
+    /// ahead of its `CasFailed` fallback whenever the row IS `ready` but its
+    /// `current_version` disagrees with `expected`. `expected`/`found` are
+    /// both `None` only for the base publish's `current_version IS NULL`
+    /// CAS; a concurrent refresh's version row is left `building` (allocation
+    /// miss) or rolled back to `building` (publish miss) and neither
+    /// `next_version` nor `current_version` is touched by the loser. The
+    /// caller re-reads the table row and retries from the new parent, or
+    /// gives up; the previous version stays live either way.
+    #[error(
+        "result table `{table}`: parent moved (expected {expected:?}, found {found:?}); a \
+         concurrent refresh or compaction published first"
+    )]
+    ParentMoved {
+        /// The table whose parent-pinned CAS missed.
+        table: String,
+        /// The parent the caller's delta was derived from.
+        expected: Option<i64>,
+        /// The table's actual `current_version` at the CAS.
+        found: Option<i64>,
+    },
+
     /// A `create_result_table` call's `jobs.partial_result` compare-and-set
     /// matched zero rows: the job is either not `running` (a peer
     /// reclaimed it, the caller's attempt has been superseded) or another

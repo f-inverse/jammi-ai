@@ -34,9 +34,9 @@
 //! `Catalog`, `Schema`, `Config`, `Eval`, `Tenant`, `FineTune`, `Gpu`, `Backend`,
 //! `ChannelAssembly`, `Lexical`, `IncompatibleFormat`, `DependencyCycle`,
 //! `NotRecomputable`, `RowGone`, `TenantMismatch`, `LeaseLost`, `CasFailed`,
-//! `JobAttemptSuperseded`, `JobCancelled`, `SourceBusy`, `InvalidKey`,
-//! `VersionUnavailable`, `NotRefreshable`, `DefinitionDrift`, `NonUniqueKey`,
-//! `Unavailable`) reconstructs exactly,
+//! `ParentMoved`, `JobAttemptSuperseded`, `JobCancelled`, `SourceBusy`,
+//! `InvalidKey`, `VersionUnavailable`, `NotRefreshable`, `DefinitionDrift`,
+//! `NonUniqueKey`, `Unavailable`) reconstructs exactly,
 //! field for field — `tests::every_owned_shape_variant_round_trips_to_itself`
 //! is the completeness proof, backed by an exhaustive match with no catch-all
 //! so a NEW owned-shape variant fails to compile here until it is listed. So
@@ -149,6 +149,15 @@ impl From<&JammiError> for pb::JammiErrorDetail {
             JammiError::CasFailed { table, status } => Variant::CasFailed(pb::CasFailedError {
                 table: table.clone(),
                 status: status.clone(),
+            }),
+            JammiError::ParentMoved {
+                table,
+                expected,
+                found,
+            } => Variant::ParentMoved(pb::ParentMovedError {
+                table: table.clone(),
+                expected: *expected,
+                found: *found,
             }),
             JammiError::SourceBusy { source_id, table } => {
                 Variant::SourceBusy(pb::SourceBusyError {
@@ -307,6 +316,11 @@ fn jammi_error_from_detail(detail: pb::JammiErrorDetail, message: &str) -> Jammi
         Some(Variant::CasFailed(e)) => JammiError::CasFailed {
             table: e.table,
             status: e.status,
+        },
+        Some(Variant::ParentMoved(e)) => JammiError::ParentMoved {
+            table: e.table,
+            expected: e.expected,
+            found: e.found,
         },
         Some(Variant::SourceBusy(e)) => JammiError::SourceBusy {
             source_id: e.source_id,
@@ -972,6 +986,7 @@ mod tests {
             | JammiError::TenantMismatch { .. }
             | JammiError::LeaseLost { .. }
             | JammiError::CasFailed { .. }
+            | JammiError::ParentMoved { .. }
             | JammiError::JobAttemptSuperseded { .. }
             | JammiError::JobCancelled { .. }
             | JammiError::SourceBusy { .. }
@@ -1036,6 +1051,11 @@ mod tests {
             JammiError::CasFailed {
                 table: "src1__text_embedding__m__20260101T000000_deadbeef".into(),
                 status: "ready".into(),
+            },
+            JammiError::ParentMoved {
+                table: "patents__embedding__m".into(),
+                expected: Some(3),
+                found: Some(4),
             },
             JammiError::SourceBusy {
                 source_id: "src1".into(),

@@ -227,13 +227,30 @@ fn embedding_params(table: &str, descriptor: &ProducingDescriptor) -> Result<Emb
     }
 }
 
-/// The current version's row set: `_row_id → content hash`, read through the
-/// bound (masked) provider. Duplicate keys → `NonUniqueKey { Parent }`; a NULL
-/// or malformed hash → `NotRefreshable { MissingContentHash }`.
-async fn current_state(ctx: &SessionContext, table: &str) -> Result<HashMap<String, ContentHash>> {
-    use datafusion::sql::TableReference;
-    let table_ref = TableReference::bare(format!("jammi.{table}"));
-    let df = ctx.table(table_ref).await.map_err(JammiError::from)?;
+/// The current version's row set: `_row_id → content hash`, read through
+/// `parent`'s OWN masked provider (`build_masked_provider`) — never the
+/// process-locally bound `ctx.table("jammi.{table}")`, whose registration a
+/// second process or a stale session may not have re-bound past `parent`
+/// (F2): the delta must be computed against the exact state the CAS in step 6
+/// will pin `current_version` to, not whatever this process happens to have
+/// registered. Duplicate keys → `NonUniqueKey { Parent }`; a NULL or
+/// malformed hash → `NotRefreshable { MissingContentHash }`.
+///
+/// Cost note: the SCAN is identical to the bound-provider read, but building
+/// the provider is NOT free — one `ListingTable` + schema inference per
+/// fragment (`build_masked_provider`) — and a refresh builds one 2-3 times
+/// per run (here, the delta's own live-row count, and `bind_result_table` at
+/// publish), so this is "the same scan plus one provider build", not "the
+/// same read".
+async fn current_state(
+    store: &ResultStore,
+    ctx: &SessionContext,
+    record: &ResultTableRecord,
+    parent: &VersionManifest,
+) -> Result<HashMap<String, ContentHash>> {
+    let table = record.table_name.as_str();
+    let provider = store.build_masked_provider(ctx, record, parent).await?;
+    let df = ctx.read_table(provider).map_err(JammiError::from)?;
     if df
         .schema()
         .field_with_unqualified_name(CONTENT_HASH_COLUMN)
@@ -346,7 +363,7 @@ impl InferenceSession {
             })?;
 
         // ── step 3: the current state ──────────────────────────────────────
-        let current = current_state(ctx, &record.table_name).await?;
+        let current = current_state(&store, ctx, &record, &parent).await?;
 
         // ── step 4: the source scan, classified ────────────────────────────
         let source_query = self.source_query_for(&params)?;
@@ -992,13 +1009,21 @@ impl InferenceSession {
         let mut version = store.allocate_version(&record).await?;
         let n = version.version();
 
-        // Every live row, in `_row_id` order, through the masked provider.
+        // Every live row, in `_row_id` order, through PARENT's OWN masked
+        // provider — never `ctx.sql` over the process-locally bound
+        // `jammi.{table}` table. This is the more dangerous half of F2/V2:
+        // under a stale binding, a `ctx.sql` scan here would rewrite an OLD
+        // version's live rows as the new current version's single fragment
+        // — not a duplicate-row poisoning like a stale refresh, but the
+        // SILENT, PERMANENT LOSS of every row added since the stale binding,
+        // recorded in the K7 chain as a legitimate compaction of `parent`.
+        // Cost note: the scan is identical, building the provider is not
+        // free (one `ListingTable` + schema inference per fragment).
+        let provider = store.build_masked_provider(ctx, &record, &parent).await?;
         let batches = ctx
-            .sql(&format!(
-                "SELECT * FROM \"jammi.{}\" ORDER BY _row_id",
-                record.table_name
-            ))
-            .await
+            .read_table(provider)
+            .map_err(JammiError::from)?
+            .sort(vec![datafusion::prelude::col("_row_id").sort(true, false)])
             .map_err(JammiError::from)?
             .collect()
             .await

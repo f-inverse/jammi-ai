@@ -2541,14 +2541,23 @@ impl ResultStore {
     /// Allocate the next version of the READY table `table` under this
     /// store's writer id and lease: the catalog's monotonic allocation
     /// ([`Catalog::allocate_result_table_version`]) plus the lease-held handle
-    /// every refresh/compaction write routes through. The handle carries the
-    /// table's persisted precision (every segment it appends must match) and
-    /// the row's own tenant.
+    /// every refresh/compaction write routes through. `table.current_version`
+    /// is passed as the allocation's expected parent — the value the caller's
+    /// delta was derived from — so a concurrent publish that moved
+    /// `current_version` since `table` was read refuses the allocation
+    /// (`ParentMoved`) instead of silently handing back a stale parent. The
+    /// handle carries the table's persisted precision (every segment it
+    /// appends must match) and the row's own tenant.
     pub async fn allocate_version(&self, table: &ResultTableRecord) -> Result<BuildingVersion> {
         let parquet_url = StorageUrl::parse(&table.parquet_path)?;
         let allocated = self
             .catalog
-            .allocate_result_table_version(&table.table_name, &self.writer_id, self.lease.lease())
+            .allocate_result_table_version(
+                &table.table_name,
+                &self.writer_id,
+                self.lease.lease(),
+                table.current_version,
+            )
             .await?;
         let manifest_url = StorageUrl::parse(&allocated.manifest_path)?;
         let tenant = parse_owner(table)?;

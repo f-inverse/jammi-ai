@@ -209,6 +209,20 @@ pub fn map_engine_error(err: JammiError) -> Status {
             Code::Aborted,
             format!("result table `{table}` is already `{status}`"),
         ),
+        // A parent-pinned version CAS (allocation or publish) lost a race
+        // against a concurrent refresh/compaction that published first: the
+        // same "the caller's view was already stale" shape `LeaseLost` /
+        // `CasFailed` carry, so the same retryable `Aborted` code.
+        JammiError::ParentMoved {
+            table,
+            expected,
+            found,
+        } => (
+            Code::Aborted,
+            format!(
+                "result table `{table}`: parent moved (expected {expected:?}, found {found:?})"
+            ),
+        ),
         // A job-row attempt guard missed under the caller: a peer's reclaim
         // superseded this attempt mid-run. `Aborted` — the same "lost the
         // race, retry from a fresh claim" mapping `LeaseLost`/`CasFailed`
@@ -400,6 +414,22 @@ mod tests {
         assert!(matches!(
             error_from_status(&source_busy),
             JammiError::SourceBusy { source_id, table } if source_id == "src1" && table == "t1"
+        ));
+
+        // A parent-pinned version CAS lost the race the same way `CasFailed`
+        // does — the same retryable `Aborted` code, but its own typed
+        // variant carrying `expected`/`found` rather than `CasFailed`'s
+        // `status`, which would misname the cause (the row IS `ready`).
+        let parent_moved = map_engine_error(JammiError::ParentMoved {
+            table: "t1".into(),
+            expected: Some(3),
+            found: Some(4),
+        });
+        assert_eq!(parent_moved.code(), Code::Aborted);
+        assert!(matches!(
+            error_from_status(&parent_moved),
+            JammiError::ParentMoved { table, expected, found }
+                if table == "t1" && expected == Some(3) && found == Some(4)
         ));
     }
 

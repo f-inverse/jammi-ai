@@ -220,15 +220,20 @@ fn completed_now() -> String {
 impl Catalog {
     /// Classify a zero-row compare-and-set on a READY `result_tables` row
     /// (the allocation UPDATE, the base CAS, the publish CAS) from its
-    /// re-read: `RowGone`, `TenantMismatch` (the STRICT arm refused), or
-    /// `CasFailed { status }` — the row is not `ready`, or it IS `ready` but
-    /// its `current_version` / `next_version` arm moved under the caller (a
-    /// concurrent publisher). Owner-less on purpose: a `result_tables` row a
-    /// concurrent recovery flipped to `building` must never read as
-    /// `LeaseLost` to a refresher.
+    /// re-read: `RowGone`, `TenantMismatch` (the STRICT arm refused),
+    /// `ParentMoved { expected, found }` — the row IS `ready` but its
+    /// `current_version` disagrees with the parent the caller derived its
+    /// write from (a concurrent publisher won the race; this is the ONE
+    /// classification for both the allocation miss and the publish
+    /// table-row miss, so the lost-race condition never gets two typed
+    /// spellings depending on which gate caught it) — or `CasFailed {
+    /// status }` for every other non-`ready` shape. Owner-less on purpose: a
+    /// `result_tables` row a concurrent recovery flipped to `building` must
+    /// never read as `LeaseLost` to a refresher.
     pub(crate) fn classify_ready_cas_miss(
         table: &str,
         arm: &TenantArm,
+        expected_parent: Option<i64>,
         target: Option<CasTarget>,
     ) -> JammiError {
         let table = table.to_string();
@@ -239,6 +244,15 @@ impl Catalog {
             if row.tenant_id != t.map(|t| t.to_string()) {
                 return JammiError::TenantMismatch { table };
             }
+        }
+        if row.status == ResultTableStatus::Ready.to_string()
+            && row.current_version != expected_parent
+        {
+            return JammiError::ParentMoved {
+                table,
+                expected: expected_parent,
+                found: row.current_version,
+            };
         }
         JammiError::CasFailed {
             table,
@@ -273,17 +287,30 @@ impl Catalog {
 
     /// Allocate the next version number of a `ready` table and insert its
     /// `building` row under `writer_id`'s lease, in ONE transaction whose
-    /// first statement is the allocating UPDATE (see the module doc). The
-    /// row's `manifest_path` is `{table}__v{N}.version.json` beside the
-    /// table's Parquet, its `tenant_id` the table row's own, its
-    /// `parent_version` the table's `current_version` at allocation. A
-    /// zero-row UPDATE (the table is not `ready`, gone, or another tenant's)
-    /// rolls back and is classified by `classify_ready_cas_miss`.
+    /// FIRST statement is the allocating UPDATE, gated on `expected_parent`
+    /// (see the module doc): the caller passes the `current_version` its
+    /// delta was DERIVED from (the read it made before scanning the source
+    /// and the parent's masked current state), and the UPDATE's WHERE
+    /// clause requires `current_version` to still equal it. A concurrent
+    /// publish that moved `current_version` between the caller's read and
+    /// this call therefore makes the UPDATE match zero rows — refused
+    /// BEFORE `next_version` increments, so a refusal never burns a version
+    /// number and never inserts a `building` row whose manifest would be
+    /// derived from a parent the CAS no longer agrees with (this is what
+    /// keeps a version row's `parent_version` and its manifest's `parent` /
+    /// `parent_identity` the same value by construction). The row's
+    /// `manifest_path` is `{table}__v{N}.version.json` beside the table's
+    /// Parquet, its `tenant_id` the table row's own, its `parent_version`
+    /// `expected_parent` (re-read in the same transaction, so it is
+    /// necessarily unchanged). A zero-row UPDATE (the table is not `ready`,
+    /// gone, another tenant's, or the parent moved) rolls back and is
+    /// classified by `classify_ready_cas_miss`.
     pub async fn allocate_result_table_version(
         &self,
         table: &str,
         writer_id: &str,
         lease: Duration,
+        expected_parent: Option<i64>,
     ) -> Result<AllocatedVersion> {
         let table_name = table.to_string();
         let writer = writer_id.to_string();
@@ -299,12 +326,20 @@ impl Catalog {
                     tx.set_tenant(tenant);
                     let mut params: Vec<SqlValue<'static>> =
                         vec![SqlValue::TextOwned(table_name.clone())];
+                    let parent_predicate = match expected_parent {
+                        Some(p) => {
+                            params.push(SqlValue::Int(p));
+                            format!("current_version = ${}", params.len())
+                        }
+                        None => "current_version IS NULL".to_string(),
+                    };
                     let arm_sql = tenant_arm_sql(&arm_in_tx, "", &mut params);
                     let affected = tx
                         .execute(
                             &format!(
                                 "UPDATE result_tables SET next_version = next_version + 1 \
-                                 WHERE table_name = $1 AND status = 'ready'{arm_sql}"
+                                 WHERE table_name = $1 AND status = 'ready' \
+                                   AND {parent_predicate}{arm_sql}"
                             ),
                             &params,
                         )
@@ -377,7 +412,12 @@ impl Catalog {
             Ok(v) => Ok(v),
             Err(BackendError::Busy(_)) => {
                 let target = self.read_ready_target(table).await?;
-                Err(Self::classify_ready_cas_miss(table, &arm, target))
+                Err(Self::classify_ready_cas_miss(
+                    table,
+                    &arm,
+                    expected_parent,
+                    target,
+                ))
             }
             Err(e) => Err(e.into()),
         }
@@ -476,7 +516,7 @@ impl Catalog {
             Ok(()) => Ok(()),
             Err(BackendError::Busy(_)) => {
                 let target = self.read_ready_target(table).await?;
-                Err(Self::classify_ready_cas_miss(table, &arm, target))
+                Err(Self::classify_ready_cas_miss(table, &arm, None, target))
             }
             Err(e) => Err(e.into()),
         }
@@ -556,9 +596,19 @@ impl Catalog {
                         SqlValue::TextOwned(cas.table.clone()),
                     ];
                     let parent_arm = match parent {
+                        // `AND current_version < $1` is a monotonicity guard
+                        // beyond the exact-match above: soundness of a
+                        // pinned-parent CAS rests on `current_version` only
+                        // ever increasing (two writers total, `:437` and
+                        // this one, both strictly greater than the old
+                        // value; no rollback/pin verb exists). Redundant
+                        // today because `pv` is always the allocator's own
+                        // prior read, but it turns the FIRST future
+                        // "pin/revert to version k" verb into a refused CAS
+                        // instead of a silently reopened F1.
                         Some(pv) => {
                             params.push(SqlValue::Int(pv));
-                            format!("current_version = ${}", params.len())
+                            format!("current_version = ${} AND current_version < $1", params.len())
                         }
                         None => "current_version IS NULL".to_string(),
                     };
@@ -593,6 +643,7 @@ impl Catalog {
                 Err(Self::classify_ready_cas_miss(
                     &cas.table,
                     &cas.tenant_arm,
+                    parent,
                     target,
                 ))
             }

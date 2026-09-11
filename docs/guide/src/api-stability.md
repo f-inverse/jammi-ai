@@ -85,7 +85,7 @@ version with reject-newer (or strict) semantics — the full contract is on the
 | Materialization manifest (`.materialization.json`) | `MANIFEST_VERSION` | `3` |
 | ANN row map (`.rowmap`) | `ROWMAP_VERSION` | `1` |
 | ANN sidecar manifest (`.manifest.json`) | `ANN_MANIFEST_VERSION` | `3` |
-| Catalog schema | append-only migration ledger | through `023` |
+| Catalog schema | append-only migration ledger | see `crates/jammi-db/src/catalog/migrations.rs` |
 
 The catalog migration ledger is **append-only**: a migration is never edited or
 removed once shipped, only a new numbered migration is appended. The other three

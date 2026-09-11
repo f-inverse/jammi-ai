@@ -1,8 +1,9 @@
 # 67 — Multi-GPU and multi-node training as engine mechanism, on DataFusion (#500)
 
-**Status:** PLANNED, v4 — rebased on the jobs-fleet branch (`feat/deploy-shapes-C-jobs` @
-95993a06, unpushed at the time of writing), reconciled with `docs/plans/68-compute-tier-substrate/`,
-U8 reshaped as a Ballista **extension** unit. Scoped twice (gap-analyzer 2026-09-10, v1 and v4
+**Status:** PLANNED, v4 — rebased on the jobs fleet, which is now on `main` (PR #501, merge
+`4ecc0230`, 2026-09-10: `jobs` table, migrations 029/030, `[worker]`, `JobService`; the #485/#486
+work), reconciled with `docs/plans/68-compute-tier-substrate/` (its PR-K is in CI), U8 reshaped as
+a Ballista **extension** unit. Scoped twice (gap-analyzer 2026-09-10, v1 and v4
 briefs), pressure-tested in four rounds (`PRESSURE.md`), NOT implemented. Hand-off order: this
 file, `DESIGN.md`, `UNITS.md`, `SIZING.md`, `PRESSURE.md`; then `68-compute-tier-substrate/README.md`
 for the sibling units 67 depends on.
@@ -163,16 +164,18 @@ trainer, four collectives (r13); the shared `CacheKey` (r14); K4 is remote-equal
 in r46); committed-artifact convention (r20); StatefulSet consequence, now owned by U9 after
 68 K merges (r21); split rubric (r22); naming (r23); ContextPredictor out of gang scope (r24).
 
-46. **Order against the sibling work.** PR-C merges first (26 unpushed commits; every 68 unit
-    cuts after it; its diff touches both manifests and seven crates, 242 files), then PR-A (U1, mechanical, cheap
-    to redo on top), then 68's K and DIST unit 1, then PR-B; PR-C(67) needs DIST unit 2 and OPS;
-    PR-D needs K. `SIZING.md` carries the edge list.
+46. **Order against the sibling work.** PR-C(68) merged as #501 (242 files, both manifests, seven
+    crates) before any 67 unit — so PR-A (U1) starts now from `main`; 68's K (PR in CI) and DIST
+    unit 1 precede PR-B; PR-C(67) needs DIST unit 2 and OPS; PR-D needs K. `SIZING.md` carries
+    the edge list. Correction to v3.1 ruling 18: the issue's "jobs table, migrations 029/030"
+    was describing #485/#486's branch, which is now merged; only the "#485 is unrelated" remark
+    in the 2026-09-10 issue comment was wrong.
 
 ## Units and order
 
 | PR | Commit | Unit | Name | Lane | Depends on |
 |---|---|---|---|---|---|
-| A | 1 | U1 | DataFusion 54 line upgrade (workspace-atomic) | hermetic + cookbook + db-features clippy lane | PR-C merged; S3 |
+| A | 1 | U1 | DataFusion 54 line upgrade (workspace-atomic) | hermetic + cookbook + db-features clippy lane | S3 (main already carries #501) |
 | B | 1 | U7a | `gpu-gang.yml` pod leg; `runpod_lib.sh` gpuCount; allowlist; artifact schema | gate scripts | S4 |
 | B | 2 | U2a | `TrainingSet` producer (`job_attempt: None`; wire mirror; guide block) | hermetic + cookbook | U1 |
 | B | 3 | U4a | `Collective` trait; device-plural session; `CacheKey`; `workers.devices` migration; refusals | hermetic (+ pod smoke) | S1 |
@@ -206,8 +209,9 @@ codec, running a custom `ExecutionPlan` on one scheduler + two executors; confir
    preconditions).
 2. Ledger: `.jammi/ledger/distributed-training-500-<date>.jsonl`; this session's rows are in
    `distributed-training-500-20260910.jsonl` (gitignored).
-3. Confirm PR-C has merged. Run S3 on top of it; S1, S4, S5, S6 concurrently.
-4. PR-A (U1) from `main` after PR-C; one worktree, one commit.
+3. Run S3 on `main` (it carries #501); S1, S4, S5, S6 concurrently.
+4. PR-A (U1) from `main` now; one worktree, one commit. 68's PR-K is in CI and may merge
+   before PR-A — rebase, no ordering constraint between them.
 5. PR-B after 68 K and DIST unit 1 merge (U5a's listener). Commit order as in the table;
    U7a ∥ U2a ∥ U4a; U2b ∥ U3; U4b last; label the PR for the pod leg.
 6. PR-C(67) after DIST unit 2 and OPS merge. U7b ∥ U5a; U6; U5b; `distributed.yml` dispatched

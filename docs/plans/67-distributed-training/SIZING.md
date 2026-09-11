@@ -5,12 +5,14 @@ records them). v4 adds the sibling-plan edges, the substrate change and the Ball
 
 ## Order against the sibling work (measured)
 
-`feat/deploy-shapes-C-jobs` @ 95993a06 versus main 7561658e: 242 files, +21 704 / −7 921 lines,
-both `Cargo.toml` and `Cargo.lock`, seven crates (`jammi-ai` 71 files, `jammi-server` 39,
-`jammi-db` 39, `jammi-python` 11, `jammi-wire` 10, …). Every 68 unit cuts after it.
+PR #501 (`feat/deploy-shapes-C-jobs` @ 95993a06 → merge `4ecc0230`, 2026-09-10) versus the
+previous main 7561658e: 242 files, +21 704 / −7 921 lines, both `Cargo.toml` and `Cargo.lock`,
+seven crates. It is merged; every 68 unit cuts after it and so does every 67 unit.
 
-- **PR-C first, then PR-A.** U1 is mechanical and cheap to redo on top of PR-C; asking PR-C's
-  26 commits to rebase onto a workspace-wide API bump is the expensive direction. (D1, D7.)
+- **PR-A starts now from `main`.** The earlier fork (PR-A before or after PR-C) is closed by the
+  merge; had it been open, PR-C first was right — U1 is mechanical and cheap to redo on top,
+  a 26-commit branch rebasing onto a workspace-wide API bump is not. 68's PR-K is in CI; PR-A
+  and PR-K have no ordering constraint (disjoint files; rebase whichever lands second).
 - **Edges into 68**: U5a needs DIST unit 1 (`peer_bind`); U5b needs DIST unit 2
   (`instances.peer_addr`) and OPS (`release_job_lease`, drain hooks); U9 needs K (the shape-d
   overlay). U2a no longer needs OPS C1 (`job_attempt: None`).
@@ -18,18 +20,18 @@ both `Cargo.toml` and `Cargo.lock`, seven crates (`jammi-ai` 71 files, `jammi-se
   `ballista_state` U8b), numbered at rebase after 68's five; K5 renumber-on-second-merge.
 
 ```
-PR-C(68) → PR-A [U1] → K, DIST-1 (68) → PR-B [U7a ∥ U2a ∥ U4a → U2b ∥ U3 → U4b → artifact]
+#501 (merged) → PR-A [U1] ∥ K (in CI) → DIST-1 (68) → PR-B [U7a ∥ U2a ∥ U4a → U2b ∥ U3 → U4b → artifact]
         → DIST-2, OPS (68) → PR-C(67) [U7b ∥ U5a → U6 → U5b → artifact]
         → PR-D [U8a → U8b → U9]           (DELTA, GRAPH (68) are independent of 67)
 ```
 
-Serial edges: PR-C(68) → U1 → everything; U2a → U2b, U3; U4a → U2b (the `world` argument);
+Serial edges: #501 → U1 → everything; U2a → U2b, U3; U4a → U2b (the `world` argument);
 U2b + U3 + U4a → U4b; U4a + DIST-1 → U5a; U2b + U5a → U6; U4b + U5a + U6 + DIST-2 + OPS → U5b;
 U1 + U5b + U6 + S6 → U8a; U8a + U4a → U8b; K → U9.
 
 ## Alternatives added in v4
 
-7. **PR-A before PR-C.** Rejected on the measurement above.
+7. **PR-A before PR-C.** Moot: #501 merged first. Recorded because the measurement decided it.
 8. **Static peer list in `[worker]`.** Rejected: 68 DIST D9 already owns membership
    (`peer_advertise` → `instances.peer_addr`); two membership mechanisms would be a knob 67 does
    not need. Cost: U5b waits for DIST unit 2.

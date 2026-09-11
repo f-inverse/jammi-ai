@@ -1,4 +1,4 @@
-# UNITS — per-unit phase-2 contracts (#500), v3
+# UNITS — per-unit phase-2 contracts (#500), v4 (on the jobs fleet, `main` @ 4ecc0230 = PR #501; `wt-C:` citations hold at the same lines)
 
 Each unit: `files_in_scope` (write-owner), `invariants_to_preserve`, `acceptance` (RED at the
 base commit, GREEN on the branch, asserting a criterion), `lane`, `depends_on`, `size` (S/M/L/XL

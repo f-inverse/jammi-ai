@@ -2,8 +2,9 @@
 
 Companion to `README.md` (rulings) and `UNITS.md` (contracts). Every mechanism names the
 principle it derives from and the code it lands on. Citations without a prefix are read against
-main at `7561658e`; citations prefixed `wt-C:` are read against the jobs-fleet branch at
-`95993a06`, which v4 is rebased on (its `jobs` table, `JobWorker`, `[worker]` config).
+main at `7561658e`; citations prefixed `wt-C:` were read against the jobs-fleet branch at
+`95993a06`, now merged into `main` as PR #501 (`4ecc0230`) with those files byte-unchanged, so
+they hold on `main` at the same lines.
 
 ## 1. What MLlib did to Spark, and what that means here
 

@@ -95,8 +95,17 @@ pub enum JammiError {
     Json(#[from] serde_json::Error),
 
     /// DataFusion query-engine error.
+    ///
+    /// `#[source]` (not `#[from]`): the conversion from a
+    /// [`DataFusionError`](datafusion::error::DataFusionError) is the manual
+    /// `impl From` at the bottom of this file — the structural classifier that
+    /// restores a typed engine error a plan node raised (`External(Box<JammiError>)`,
+    /// even nested under `Context`/`ArrowError`/`ParquetError`) and types a
+    /// mid-scan object-store not-found as [`Self::Storage`]. Every `?` that
+    /// converts a DataFusion error routes through it by construction. The
+    /// attribute keeps `source()` intact (thiserror's `#[from]` implied it).
     #[error("DataFusion error: {0}")]
-    DataFusion(#[from] datafusion::error::DataFusionError),
+    DataFusion(#[source] datafusion::error::DataFusionError),
 
     /// A channel-catalog operation (register a channel, append columns) failed
     /// with a caller-facing condition the gRPC surface must distinguish
@@ -277,10 +286,187 @@ pub enum JammiError {
         table: String,
     },
 
+    /// A `NULL` in the key column of a source scanned for embedding /
+    /// inference / refresh: refused typed at the input edge (K2), never
+    /// skipped and counted, never a stringly Arrow error after model calls.
+    /// Raised by the `KeyCheckExec` plan node below the blocking sort, so the
+    /// count is exact and the model is invoked zero times.
+    #[error("key column `{column}` has {null_count} null value(s); every row needs a key")]
+    InvalidKey {
+        /// The source key column the caller named.
+        column: String,
+        /// The exact number of null keys in the scanned source.
+        null_count: u64,
+    },
+
     /// Catch-all for errors that don't fit another variant.
     #[error("{0}")]
     Other(String),
 }
 
+/// The structural classifier: how EVERY DataFusion error becomes a
+/// [`JammiError`].
+///
+/// Two shapes, in order. **(a) owned passthrough** — an
+/// `External(Box<JammiError>)` payload (a typed error a plan node, provider or
+/// UDF raised) is destructured BY VALUE back into the inner `JammiError`, also
+/// when nested under `Context`, `ArrowError(ExternalError)` or
+/// `ParquetError(External)`; a miss rebuilds the original unchanged. **(b) a
+/// borrowed `source()` walk** — an `object_store::Error::NotFound` found at any
+/// depth (the parquet reader wraps it under `ParquetError::External`, which
+/// neither a top-level `ObjectStore` arm nor DataFusion's `find_root` reaches)
+/// becomes [`JammiError::Storage`] with the existing `StorageError::Io { source:
+/// NotFound { .. } }` spelling every reader already matches. Everything else
+/// keeps the shape [`JammiError::DataFusion`] with `source()` intact.
+/// `Shared(Arc<_>)` cannot yield ownership and is a stated fidelity limit of
+/// shape (a); shape (b) still walks it.
+impl From<datafusion::error::DataFusionError> for JammiError {
+    fn from(e: datafusion::error::DataFusionError) -> Self {
+        match unwrap_jammi(e) {
+            Ok(inner) => inner,
+            Err(e) => match not_found_path(&e) {
+                Some((path, original)) => JammiError::Storage(crate::storage::StorageError::Io {
+                    path: path.clone(),
+                    source: object_store::Error::NotFound {
+                        path,
+                        source: Box::<dyn std::error::Error + Send + Sync>::from(original),
+                    },
+                }),
+                None => JammiError::DataFusion(e),
+            },
+        }
+    }
+}
+
+/// Shape (a): destructure `e` by value looking for an `External(Box<JammiError>)`
+/// payload, recursing through the three Box-carrying wrappers and rebuilding the
+/// original on a miss.
+fn unwrap_jammi(
+    e: datafusion::error::DataFusionError,
+) -> std::result::Result<JammiError, datafusion::error::DataFusionError> {
+    use datafusion::error::DataFusionError as DF;
+    match e {
+        DF::External(b) => match b.downcast::<JammiError>() {
+            Ok(j) => Ok(*j),
+            Err(b) => Err(DF::External(b)),
+        },
+        DF::Context(msg, inner) => match unwrap_jammi(*inner) {
+            Ok(j) => Ok(j),
+            Err(back) => Err(DF::Context(msg, Box::new(back))),
+        },
+        DF::ArrowError(b, bt) => match *b {
+            arrow::error::ArrowError::ExternalError(inner) => {
+                match inner.downcast::<JammiError>() {
+                    Ok(j) => Ok(*j),
+                    Err(inner) => Err(DF::ArrowError(
+                        Box::new(arrow::error::ArrowError::ExternalError(inner)),
+                        bt,
+                    )),
+                }
+            }
+            other => Err(DF::ArrowError(Box::new(other), bt)),
+        },
+        DF::ParquetError(b) => match *b {
+            parquet::errors::ParquetError::External(inner) => {
+                match inner.downcast::<JammiError>() {
+                    Ok(j) => Ok(*j),
+                    Err(inner) => Err(DF::ParquetError(Box::new(
+                        parquet::errors::ParquetError::External(inner),
+                    ))),
+                }
+            }
+            other => Err(DF::ParquetError(Box::new(other))),
+        },
+        other => Err(other),
+    }
+}
+
+/// Shape (b): walk `source()` from `e` and return the first
+/// `object_store::Error::NotFound` (its `path` and the original's `Display`).
+fn not_found_path(e: &datafusion::error::DataFusionError) -> Option<(String, String)> {
+    let mut cur: Option<&(dyn std::error::Error + 'static)> = Some(e);
+    while let Some(err) = cur {
+        if let Some(object_store::Error::NotFound { path, .. }) =
+            err.downcast_ref::<object_store::Error>()
+        {
+            return Some((path.clone(), err.to_string()));
+        }
+        cur = err.source();
+    }
+    None
+}
+
 /// Convenience alias for `std::result::Result<T, JammiError>`.
 pub type Result<T> = std::result::Result<T, JammiError>;
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use datafusion::error::DataFusionError as DF;
+
+    fn not_found(path: &str) -> object_store::Error {
+        object_store::Error::NotFound {
+            path: path.to_string(),
+            source: Box::<dyn std::error::Error + Send + Sync>::from("gone"),
+        }
+    }
+
+    /// Shape (a): a typed engine error a plan node raised, wrapped by the
+    /// optimizer's `Context`, comes back as the exact variant.
+    #[test]
+    fn classifier_restores_a_nested_external_jammi_error() {
+        let e = DF::Context(
+            "opt".into(),
+            Box::new(DF::External(Box::new(JammiError::InvalidKey {
+                column: "id".into(),
+                null_count: 3,
+            }))),
+        );
+        match JammiError::from(e) {
+            JammiError::InvalidKey { column, null_count } => {
+                assert_eq!(column, "id");
+                assert_eq!(null_count, 3);
+            }
+            other => panic!("expected InvalidKey, got {other:?}"),
+        }
+    }
+
+    /// Shape (b): an object-store not-found nested under the parquet reader's
+    /// `External` (where no top-level arm reaches) becomes the typed `Storage`
+    /// not-found every reader already matches, naming the path.
+    #[test]
+    fn classifier_types_a_nested_object_store_not_found() {
+        let e = DF::ParquetError(Box::new(parquet::errors::ParquetError::External(Box::new(
+            not_found("t__v1.parquet"),
+        ))));
+        match JammiError::from(e) {
+            JammiError::Storage(crate::storage::StorageError::Io {
+                path,
+                source: object_store::Error::NotFound { path: inner, .. },
+            }) => {
+                assert_eq!(path, "t__v1.parquet");
+                assert_eq!(inner, "t__v1.parquet");
+            }
+            other => panic!("expected Storage(Io(NotFound)), got {other:?}"),
+        }
+    }
+
+    /// Everything else keeps the `DataFusion` shape with `source()` intact —
+    /// the `#[source]` attribute survived dropping `#[from]`.
+    #[test]
+    fn classifier_keeps_other_errors_as_datafusion_with_source() {
+        match JammiError::from(DF::Plan("x".into())) {
+            JammiError::DataFusion(DF::Plan(m)) => assert_eq!(m, "x"),
+            other => panic!("expected DataFusion(Plan), got {other:?}"),
+        }
+        let j = JammiError::from(DF::ArrowError(
+            Box::new(arrow::error::ArrowError::SchemaError("x".into())),
+            None,
+        ));
+        assert!(matches!(j, JammiError::DataFusion(_)), "got {j:?}");
+        assert!(
+            std::error::Error::source(&j).is_some(),
+            "`source()` must survive on the public type"
+        );
+    }
+}

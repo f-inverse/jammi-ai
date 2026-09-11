@@ -35,6 +35,8 @@ pub struct InferenceExec {
     /// Served regression head's persisted distribution form, for schema
     /// construction. `None` for non-regression tasks.
     regression_form: Option<DistributionForm>,
+    /// Input columns copied verbatim to the end of every output batch.
+    passthrough: Vec<String>,
     properties: PlanProperties,
 }
 
@@ -62,6 +64,7 @@ pub struct InferenceExecBuilder {
     observer: Option<Arc<dyn InferenceObserver>>,
     embedding_dim: Option<usize>,
     regression_form: Option<DistributionForm>,
+    passthrough: Vec<String>,
 }
 
 impl InferenceExecBuilder {
@@ -87,7 +90,16 @@ impl InferenceExecBuilder {
             observer: None,
             embedding_dim: None,
             regression_form: None,
+            passthrough: Vec::new(),
         }
+    }
+
+    /// Copy the named input columns verbatim to the end of every output
+    /// batch (after the task columns), keeping their input fields. The
+    /// embedding pipeline passes `["_content_hash"]`.
+    pub fn passthrough(mut self, columns: Vec<String>) -> Self {
+        self.passthrough = columns;
+        self
     }
 
     pub fn batch_size(mut self, batch_size: usize) -> Self {
@@ -117,6 +129,7 @@ impl InferenceExecBuilder {
             &self.key_column,
             self.embedding_dim,
             self.regression_form.as_ref(),
+            &self.passthrough,
         )?;
         let properties = InferenceExec::compute_properties(output_schema);
         Ok(InferenceExec {
@@ -132,6 +145,7 @@ impl InferenceExecBuilder {
             observer: self.observer,
             embedding_dim: self.embedding_dim,
             regression_form: self.regression_form,
+            passthrough: self.passthrough,
             properties,
         })
     }
@@ -193,6 +207,7 @@ impl ExecutionPlan for InferenceExec {
             .observer(self.observer.clone())
             .embedding_dim(self.embedding_dim)
             .regression_form(self.regression_form.clone())
+            .passthrough(self.passthrough.clone())
             .build()
             .map_err(|e| datafusion::error::DataFusionError::External(Box::new(e)))?,
         ))
@@ -221,7 +236,8 @@ impl ExecutionPlan for InferenceExec {
             self.backend,
             self.batch_size,
             self.observer.clone(),
-        );
+        )
+        .with_passthrough(self.passthrough.clone());
 
         builder.spawn(async move { runner.run(input_stream, tx, output_schema).await });
 

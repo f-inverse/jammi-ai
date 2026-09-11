@@ -34,6 +34,17 @@ class InvalidArgument(JammiError, ValueError):
     """
 
 
+class InvalidKey(InvalidArgument):
+    """A ``NULL`` in the key column of a source scanned for embedding,
+    inference or an incremental refresh.
+
+    The engine refuses at the input edge, before any model call, naming the
+    column and the exact null count. Refines :class:`InvalidArgument` (the
+    class the remote transport raises for the same ``INVALID_ARGUMENT``
+    status), so ``except InvalidArgument`` holds on both transports.
+    """
+
+
 class NotSupportedOnBackend(JammiError):
     """A one-sided operation was invoked on a backend that does not carry it.
 

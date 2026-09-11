@@ -1023,18 +1023,24 @@ impl JammiSession {
         // DataFusion would re-parse into a `jammi` schema reference (see
         // `ResultStore::register_table`).
         let table_ref = TableReference::bare(format!("jammi.{}", table.table_name));
+        // Every DataFusion error here routes through `JammiError::from` —
+        // the structural classifier — so a typed engine error a provider
+        // raised from inside the scan (a versioned table whose current
+        // manifest is unavailable) reaches `search_by_id`'s caller as that
+        // typed variant, and a mid-scan object vanish as a typed `Storage`
+        // not-found, never a stringified `Other`.
         let batches = self
             .ctx
             .table(table_ref.clone())
             .await
-            .map_err(|e| JammiError::Other(format!("Resolve embedding table '{table_ref}': {e}")))?
+            .map_err(JammiError::from)?
             .filter(col("_row_id").eq(lit(row_key)))
-            .map_err(|e| JammiError::Other(format!("Vector-by-key filter: {e}")))?
+            .map_err(JammiError::from)?
             .select_columns(&["vector"])
-            .map_err(|e| JammiError::Other(format!("Vector-by-key projection: {e}")))?
+            .map_err(JammiError::from)?
             .collect()
             .await
-            .map_err(|e| JammiError::Other(format!("Vector-by-key scan: {e}")))?;
+            .map_err(JammiError::from)?;
 
         let mut out: Vec<Vec<f32>> = Vec::new();
         for batch in &batches {

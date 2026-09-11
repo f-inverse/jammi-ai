@@ -1,5 +1,6 @@
 pub mod artifact;
 pub mod building;
+pub mod content_hash;
 pub mod freshness;
 pub mod layout;
 pub mod manifest;
@@ -2289,8 +2290,9 @@ impl ResultStore {
     }
 }
 
-/// Build the `(_row_id, _source_id, _model_id, vector)` batch for a
-/// materialised embedding table from per-key vectors.
+/// Build the `(_row_id, _source_id, _model_id, vector, _content_hash)` batch
+/// for a materialised embedding table from per-key vectors — a NULL hash in
+/// every row, since no producer that lands here embedded a source row.
 fn embedding_batch(
     schema: &arrow::datatypes::SchemaRef,
     source_id: &str,
@@ -2298,43 +2300,9 @@ fn embedding_batch(
     rows: &[(String, Vec<f32>)],
     dimensions: usize,
 ) -> Result<arrow::array::RecordBatch> {
-    use arrow::array::{FixedSizeListArray, Float32Array, StringArray};
-    use arrow::datatypes::{DataType, Field};
-
-    for (key, vector) in rows {
-        if vector.len() != dimensions {
-            return Err(JammiError::Schema {
-                table: model_id.to_string(),
-                column: "vector".into(),
-                expected: format!("FixedSizeList<Float32> width {dimensions}"),
-                actual: format!("row '{key}' has width {}", vector.len()),
-            });
-        }
-    }
-
-    let row_ids = StringArray::from_iter_values(rows.iter().map(|(k, _)| k.as_str()));
-    let source_ids = StringArray::from_iter_values(rows.iter().map(|_| source_id));
-    let model_ids = StringArray::from_iter_values(rows.iter().map(|_| model_id));
-    let flat: Vec<f32> = rows.iter().flat_map(|(_, v)| v.iter().copied()).collect();
-    let item = Arc::new(Field::new("item", DataType::Float32, false));
-    let vectors = FixedSizeListArray::try_new(
-        item,
-        dimensions as i32,
-        Arc::new(Float32Array::from(flat)),
-        None,
+    crate::store::schema::embedding_batch_with_null_hash(
+        schema, source_id, model_id, rows, dimensions,
     )
-    .map_err(|e| JammiError::Other(format!("materialize: build vector column: {e}")))?;
-
-    arrow::array::RecordBatch::try_new(
-        Arc::clone(schema),
-        vec![
-            Arc::new(row_ids),
-            Arc::new(source_ids),
-            Arc::new(model_ids),
-            Arc::new(vectors),
-        ],
-    )
-    .map_err(|e| JammiError::Other(format!("materialize: build batch: {e}")))
 }
 
 /// A stable content digest over normalized embedding rows: the hex of a

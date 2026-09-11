@@ -52,6 +52,7 @@ async fn register_embedding_table(
             Arc::new(StringArray::from(vec!["src"; n])),
             Arc::new(StringArray::from(vec!["model"; n])),
             Arc::new(fixed_size_list_from(vectors, dim)),
+            jammi_db::store::content_hash::null_hash_column(n),
         ],
     )
     .unwrap();
@@ -116,6 +117,7 @@ async fn register_embedding_table_chunked(
                 Arc::new(StringArray::from(vec!["src"; n])),
                 Arc::new(StringArray::from(vec!["model"; n])),
                 Arc::new(fixed_size_list_from(vecs_chunk, dim)),
+                jammi_db::store::content_hash::null_hash_column(n),
             ],
         )
         .unwrap();

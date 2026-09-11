@@ -90,7 +90,6 @@ pub fn arrow_to_texts(columns: &[ArrayRef]) -> Result<Vec<String>> {
 /// null-handling contract this function does not disturb.
 fn validate_text_column(col: &ArrayRef) -> Result<ArrayRef> {
     match col.data_type() {
-        DataType::Utf8 | DataType::LargeUtf8 | DataType::Utf8View => Ok(std::sync::Arc::clone(col)),
         DataType::Binary
         | DataType::LargeBinary
         | DataType::BinaryView
@@ -100,6 +99,26 @@ fn validate_text_column(col: &ArrayRef) -> Result<ArrayRef> {
                  every row",
             dt = col.data_type()
         ))),
+        _ => render_content_column(col),
+    }
+}
+
+/// The runner's ONE content rendering, shared with the `jammi_content_hash`
+/// UDF so a row's content hash is computed over exactly the text the model
+/// reads: the string families pass through unchanged; the binary families
+/// pass through as bytes (the image/audio towers read them, and the text
+/// tower refuses them one level up in `validate_text_column`); every other
+/// type is cast to `Utf8`, refusing a cast that introduces a null the source
+/// did not have (the fabricated empty string that would otherwise read).
+pub fn render_content_column(col: &ArrayRef) -> Result<ArrayRef> {
+    match col.data_type() {
+        DataType::Utf8
+        | DataType::LargeUtf8
+        | DataType::Utf8View
+        | DataType::Binary
+        | DataType::LargeBinary
+        | DataType::BinaryView
+        | DataType::FixedSizeBinary(_) => Ok(std::sync::Arc::clone(col)),
         other => {
             let casted = arrow::compute::cast(col.as_ref(), &DataType::Utf8).map_err(|e| {
                 JammiError::Inference(format!(

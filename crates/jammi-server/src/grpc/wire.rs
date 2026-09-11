@@ -231,6 +231,13 @@ pub fn map_engine_error(err: JammiError) -> Status {
             Code::FailedPrecondition,
             format!("source `{source_id}` is busy: result table `{table}` is being built"),
         ),
+        // A null key in the scanned source is a data-shape fault of the
+        // caller's input — the same `InvalidArgument` convention `Schema` and
+        // `Source` follow above.
+        JammiError::InvalidKey { column, null_count } => (
+            Code::InvalidArgument,
+            format!("key column `{column}` has {null_count} null value(s)"),
+        ),
         other => (Code::Internal, other.to_string()),
     };
     attach_error_detail(code, message, &err)

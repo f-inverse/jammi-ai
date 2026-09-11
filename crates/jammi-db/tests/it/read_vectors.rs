@@ -74,6 +74,7 @@ async fn read_vectors_returns_input_rows_byte_for_byte(backend: BackendKind) {
             Arc::new(StringArray::from(source)),
             Arc::new(StringArray::from(model)),
             Arc::new(vectors),
+            jammi_db::store::content_hash::null_hash_column(n),
         ],
     )
     .unwrap();

@@ -151,8 +151,12 @@ impl<'a> EmbeddingPipeline<'a> {
             .create_physical_plan()
             .await
             .map_err(|e| JammiError::Inference(format!("Failed to create scan plan: {e}")))?;
+        // One plan shape at every model-facing site: coalesce → null-key
+        // check → the deterministic total order (see `operator::ordered_input`).
+        let input_plan = crate::operator::ordered_input::ordered_input(input_plan, key_column)?;
 
-        // Create InferenceExec
+        // Create InferenceExec — the source scan's `_content_hash` projection
+        // rides through to the sink as the table's fifth column.
         let inference_exec = InferenceExecBuilder::new(
             input_plan,
             model_source,
@@ -165,6 +169,9 @@ impl<'a> EmbeddingPipeline<'a> {
         .batch_size(self.session.inner_config().inference.batch_size)
         .observer(self.session.observer().clone())
         .embedding_dim(Some(embedding_dim))
+        .passthrough(vec![
+            jammi_db::store::schema::CONTENT_HASH_COLUMN.to_string()
+        ])
         .build()?;
 
         // Create ResultSink
@@ -184,13 +191,17 @@ impl<'a> EmbeddingPipeline<'a> {
 
         // Execute and stream results through sink
         let task_ctx = self.session.context().task_ctx();
+        // Both through the structural classifier (`JammiError::from`): a typed
+        // refusal raised inside the plan (`InvalidKey` from `KeyCheckExec`, a
+        // rendering refusal from the hash UDF) reaches the caller as that
+        // variant, never stringified.
         let stream = inference_exec
             .execute(0, task_ctx)
-            .map_err(|e| JammiError::Inference(format!("InferenceExec failed: {e}")))?;
+            .map_err(JammiError::from)?;
 
         let batches = datafusion::physical_plan::common::collect(stream)
             .await
-            .map_err(|e| JammiError::Inference(format!("Failed to collect results: {e}")))?;
+            .map_err(JammiError::from)?;
 
         // Fail loud when there is nothing to embed. A systemic model failure (a
         // broken kernel / arch / dtype — #277/#319/#326, any non-OOM
@@ -245,7 +256,9 @@ impl<'a> EmbeddingPipeline<'a> {
                     Err(e) => e,
                 });
             }
-            sink.write_batch(batch).await?;
+            // The realized ids are the refresh path's concern (its
+            // `dropped_rows`); the base embed writes every ok row.
+            let _realized = sink.write_batch(batch).await?;
         }
 
         let (row_count, index) = sink.finalize().await?;

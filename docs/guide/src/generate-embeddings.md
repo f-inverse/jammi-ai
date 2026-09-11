@@ -52,7 +52,7 @@ Each call creates a timestamped Parquet file plus a sidecar ANN index bundle:
 └── patents__embedding__all-MiniLM-L6-v2__20260325T120000.manifest.json
 ```
 
-- **Parquet file** — source of truth. Contains `_row_id`, `_source_id`, `_model_id`, `vector`. Readable by external tools (DuckDB, Polars, pandas).
+- **Parquet file** — source of truth. Contains `_row_id`, `_source_id`, `_model_id`, `vector`, `_content_hash`. Readable by external tools (DuckDB, Polars, pandas).
 - **`.usearch`** — USearch HNSW graph for ANN search.
 - **`.rowmap`** — maps internal USearch keys to `_row_id` strings.
 - **`.manifest.json`** — metadata (dimensions, count, metric, backend).
@@ -67,8 +67,11 @@ The sidecar files are disposable — deleting them falls back to brute-force exa
 | `_source_id` | Utf8 | Source identifier |
 | `_model_id` | Utf8 | Model identifier |
 | `vector` | FixedSizeList(Float32, N) | L2-normalized embedding vector |
+| `_content_hash` | Utf8 (nullable) | Hex SHA-256 over the embedded source columns, in `columns` order, rendered exactly as the model read them (`jammi.content_hash.v1`); `NULL` on a table no embedding pipeline produced (an import, a context set, a propagation) |
 
-Failed rows (null or empty text) are excluded — only successfully embedded rows appear in the output.
+Failed rows (null or empty text) are excluded — only successfully embedded rows appear in the output. Rows are written in key order: `CAST(key AS Utf8)` ascending, ties broken by `_content_hash`, so the table's bytes are identical across `engine.execution_threads`.
+
+A `NULL` in the **key** column is not a per-row failure: the whole call is refused with the typed `InvalidKey { column, null_count }` before the model runs (the null count is exact; zero rows are embedded and nothing is written). Every row needs a key.
 
 ## Text column format
 
@@ -296,7 +299,11 @@ validation**, applied before the model ever runs:
 | Empty text | `"error"` | `"Empty or null text input"` | null |
 
 The batch continues processing even when individual rows fail this
-validation. A model-forward failure itself — a broken kernel, a
+validation. A null **key** is the one input fault that is never per-row:
+`infer`, `generate_embeddings` and an incremental refresh all refuse the
+whole call with `InvalidKey { column, null_count }` before any model call —
+`_row_id` is non-nullable by contract, so a silent drop would break the
+per-row disclosure this table promises. A model-forward failure itself — a broken kernel, a
 contiguity/PTX/dtype mismatch, or a model incapable of the requested task —
 is always systemic (every row fails identically), never a per-row event, so
 it fails the whole `infer`/embedding call with an error rather than being

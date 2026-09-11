@@ -1751,6 +1751,7 @@ async fn materialize_table_for_tenant_a() -> (Arc<InferenceSession>, Session, St
                     Arc::new(src),
                     Arc::new(model),
                     Arc::new(vectors),
+                    jammi_db::store::content_hash::null_hash_column(n),
                 ],
             )
             .unwrap();
@@ -2651,6 +2652,7 @@ async fn materialize_embedding_result_table(engine: &InferenceSession, source: &
             Arc::new(src),
             Arc::new(model),
             Arc::new(vectors),
+            jammi_db::store::content_hash::null_hash_column(n),
         ],
     )
     .unwrap();

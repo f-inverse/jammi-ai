@@ -340,6 +340,7 @@ async fn write_closed_embedding_parquet(store: &ResultStore, info: &BuildingTabl
             Arc::new(source_arr),
             Arc::new(model_arr),
             Arc::new(vectors),
+            jammi_db::store::content_hash::null_hash_column(n),
         ],
     )
     .unwrap();

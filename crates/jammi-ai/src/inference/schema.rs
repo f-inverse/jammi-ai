@@ -41,16 +41,32 @@ pub fn common_prefix_fields() -> Vec<Field> {
 /// [`DistributionForm`](adapter::DistributionForm) so the planned schema matches
 /// the runtime adapter's columns (a quantile head's schema is its level
 /// columns, not the Gaussian default of `mean`/`std`). `None` form ⇒ Gaussian.
+///
+/// `passthrough` names input columns copied verbatim to the END of every
+/// output batch (after the task columns), each keeping its input field
+/// (type and nullability). The embedding pipeline passes `["_content_hash"]`
+/// so the hash the source scan computed lands beside the vector; `infer`
+/// passes nothing (its output schema is fixed). A name absent from the input
+/// is a typed refusal here, at plan build, never a runtime column miss.
 pub fn build_output_schema(
     task: &ModelTask,
-    _input_schema: &SchemaRef,
+    input_schema: &SchemaRef,
     _key_column: &str,
     embedding_dim: Option<usize>,
     regression_form: Option<&adapter::DistributionForm>,
+    passthrough: &[String],
 ) -> Result<SchemaRef> {
     let mut fields = common_prefix_fields();
     let task_adapter = adapter::create_adapter_for_schema(*task, embedding_dim, regression_form);
     fields.extend(task_adapter.output_schema());
+    for name in passthrough {
+        let field = input_schema.field_with_name(name).map_err(|_| {
+            JammiError::Inference(format!(
+                "passthrough column '{name}' is not in the inference input schema"
+            ))
+        })?;
+        fields.push(field.clone());
+    }
     Ok(Arc::new(Schema::new(fields)))
 }
 

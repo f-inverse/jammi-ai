@@ -46,9 +46,12 @@ use jammi_db::store::manifest::{ArtifactDigest, ProducingDescriptor};
 
 use crate::common;
 
-/// Golden output Parquet artifact digest (SHA-256 hex) captured the same way.
+/// Golden output Parquet artifact digest (SHA-256 hex) captured the same way,
+/// over the five-column embedding schema (`_row_id, _source_id, _model_id,
+/// vector, _content_hash` — the hash column is NULL on an imported table,
+/// which embeds no source row).
 const GOLDEN_ARTIFACT_DIGEST: &str =
-    "1093bebfee3cf0ac31368b4cc1c94de117e4bced8bebc481efbefadc00e883e8";
+    "191fc6213528e7237b9cd890431d7b25db7b442a365f995e1da7154ad852ed0a";
 
 /// Golden content digest (SHA-256 hex) of the fixture's normalized
 /// `(_row_id, vector)` rows, captured the same way as

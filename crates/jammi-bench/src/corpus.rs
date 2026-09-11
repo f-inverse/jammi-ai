@@ -22,7 +22,7 @@
 use std::path::Path;
 use std::sync::Arc;
 
-use arrow::array::{Array, ArrayRef, FixedSizeListArray, Float32Array, RecordBatch, StringArray};
+use arrow::array::{Array, RecordBatch, StringArray};
 use arrow::compute::cast;
 use arrow::datatypes::DataType;
 use datafusion::prelude::SessionContext;
@@ -30,7 +30,7 @@ use datafusion::sql::TableReference;
 use futures::TryStreamExt;
 
 use jammi_db::storage::{JammiObjectStore, ObjectParquetWriter, StorageRegistry, StorageUrl};
-use jammi_db::store::schema::embedding_table_schema;
+use jammi_db::store::schema::{embedding_batch_with_null_hash, embedding_table_schema};
 use jammi_db::store::vectors::extend_with_fixed_size_list_f32;
 
 /// A 64-bit LCG (Numerical-Recipes constants) mapped to `f32` in `[-1, 1)`.
@@ -70,35 +70,20 @@ pub fn lcg_query(seed: u64, dim: usize) -> Vec<f32> {
 /// not read by the search, only the schema requires them present.
 fn batch(start_row: usize, count: usize, dim: usize, lcg: &mut Lcg) -> RecordBatch {
     let schema = embedding_table_schema(dim);
-    let mut row_ids: Vec<String> = Vec::with_capacity(count);
-    let mut flat: Vec<f32> = Vec::with_capacity(count * dim);
-    for r in 0..count {
-        // Zero-padded so lexical `_row_id` order matches numeric order, which
-        // keeps the deterministic tie-break order legible.
-        row_ids.push(format!("row_{:09}", start_row + r));
-        for _ in 0..dim {
-            flat.push(lcg.next_f32());
-        }
-    }
-    let id_refs: Vec<&str> = row_ids.iter().map(String::as_str).collect();
-    let values = Arc::new(Float32Array::from(flat));
-    let item = Arc::new(arrow::datatypes::Field::new(
-        "item",
-        arrow::datatypes::DataType::Float32,
-        false,
-    ));
-    let vectors = FixedSizeListArray::try_new(item, dim as i32, values, None)
-        .expect("fixed-size list build is total over a flat f32 buffer of count*dim");
-    RecordBatch::try_new(
-        schema,
-        vec![
-            Arc::new(StringArray::from(id_refs)) as ArrayRef,
-            Arc::new(StringArray::from(vec!["src"; count])),
-            Arc::new(StringArray::from(vec!["model"; count])),
-            Arc::new(vectors),
-        ],
-    )
-    .expect("record batch matches the embedding schema by construction")
+    let rows: Vec<(String, Vec<f32>)> = (0..count)
+        .map(|r| {
+            // Zero-padded so lexical `_row_id` order matches numeric order, which
+            // keeps the deterministic tie-break order legible.
+            let id = format!("row_{:09}", start_row + r);
+            let v: Vec<f32> = (0..dim).map(|_| lcg.next_f32()).collect();
+            (id, v)
+        })
+        .collect();
+    // `_source_id`/`_model_id` are constant — they are not read by the search,
+    // only the schema requires them present; `_content_hash` is NULL (no
+    // source row was embedded) through the engine's one null-hash builder.
+    embedding_batch_with_null_hash(&schema, "src", "model", &rows, dim)
+        .expect("record batch matches the embedding schema by construction")
 }
 
 /// Generate `rows` LCG vectors of width `dim` and write them to a Parquet
@@ -157,24 +142,7 @@ pub async fn write_vectors(
     let handle = JammiObjectStore::new(driver, url.clone());
     let mut writer = ObjectParquetWriter::open(&handle, Arc::clone(&schema)).await?;
 
-    let id_refs: Vec<&str> = rows.iter().map(|(id, _)| id.as_str()).collect();
-    let flat: Vec<f32> = rows.iter().flat_map(|(_, v)| v.iter().copied()).collect();
-    let values = Arc::new(Float32Array::from(flat));
-    let item = Arc::new(arrow::datatypes::Field::new(
-        "item",
-        arrow::datatypes::DataType::Float32,
-        false,
-    ));
-    let vectors = FixedSizeListArray::try_new(item, dim as i32, values, None)?;
-    let batch = RecordBatch::try_new(
-        Arc::clone(&schema),
-        vec![
-            Arc::new(StringArray::from(id_refs)) as ArrayRef,
-            Arc::new(StringArray::from(vec!["src"; rows.len()])),
-            Arc::new(StringArray::from(vec!["model"; rows.len()])),
-            Arc::new(vectors),
-        ],
-    )?;
+    let batch = embedding_batch_with_null_hash(&schema, "src", "model", rows, dim)?;
     writer.write_batch(&batch).await?;
     writer.close().await?;
     Ok(url)

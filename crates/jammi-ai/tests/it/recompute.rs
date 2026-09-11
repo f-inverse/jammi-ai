@@ -699,6 +699,7 @@ async fn a_pre_contract_table_is_not_recomputable() {
             Arc::new(src),
             Arc::new(model),
             Arc::new(vectors),
+            jammi_db::store::content_hash::null_hash_column(1),
         ],
     )
     .unwrap();

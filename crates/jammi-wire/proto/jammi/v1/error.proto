@@ -90,6 +90,7 @@ message JammiErrorDetail {
     IncompatibleFormatError incompatible_format = 27;
     DependencyCycleError dependency_cycle = 28;
     NotRecomputableError not_recomputable = 29;
+    InvalidKeyError invalid_key = 32;
   }
   // Tag 15 / `model_retired` are reserved: the wire surface must never reuse a
   // retired field number or name, so a peer built against either contract
@@ -185,6 +186,15 @@ message DependencyCycleError {
 // table with no recorded descriptor, or an `External`-producer table).
 message NotRecomputableError {
   string table = 1;
+}
+
+// `JammiError::InvalidKey { column, null_count }`. A `NULL` in the key column
+// of a source scanned for embedding / inference / refresh — refused typed at
+// the input edge before any model call, with the exact null count. A
+// data-shape fault, so it maps to `InvalidArgument`.
+message InvalidKeyError {
+  string column = 1;
+  uint64 null_count = 2;
 }
 
 // `JammiError::ChannelCatalog(ChannelCatalogError)`. The inner taxonomy is

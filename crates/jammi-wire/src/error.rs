@@ -34,7 +34,7 @@
 //! `Catalog`, `Schema`, `Config`, `Eval`, `Tenant`, `FineTune`, `Gpu`, `Backend`,
 //! `ChannelAssembly`, `Lexical`, `IncompatibleFormat`, `DependencyCycle`,
 //! `NotRecomputable`, `RowGone`, `TenantMismatch`, `LeaseLost`, `CasFailed`,
-//! `JobAttemptSuperseded`, `JobCancelled`, `SourceBusy`) reconstructs exactly,
+//! `JobAttemptSuperseded`, `JobCancelled`, `SourceBusy`, `InvalidKey`) reconstructs exactly,
 //! field for field — `tests::every_owned_shape_variant_round_trips_to_itself`
 //! is the completeness proof, backed by an exhaustive match with no catch-all
 //! so a NEW owned-shape variant fails to compile here until it is listed. So
@@ -184,6 +184,12 @@ impl From<&JammiError> for pb::JammiErrorDetail {
                     table: table.clone(),
                 })
             }
+            JammiError::InvalidKey { column, null_count } => {
+                Variant::InvalidKey(pb::InvalidKeyError {
+                    column: column.clone(),
+                    null_count: *null_count,
+                })
+            }
             // The fold reaches ONLY the genuinely-foreign `#[from]` variants
             // (`Io`, `BackendDriver`, `Toml`, `Json`, `DataFusion`, `Trigger`,
             // `Storage`) and the existing `Other`: every owned-shape variant —
@@ -272,6 +278,10 @@ fn jammi_error_from_detail(detail: pb::JammiErrorDetail, message: &str) -> Jammi
         },
         Some(Variant::DependencyCycle(e)) => JammiError::DependencyCycle { table: e.table },
         Some(Variant::NotRecomputable(e)) => JammiError::NotRecomputable { table: e.table },
+        Some(Variant::InvalidKey(e)) => JammiError::InvalidKey {
+            column: e.column,
+            null_count: e.null_count,
+        },
         Some(Variant::Other(e)) => JammiError::Other(e.message),
         // The unknown-oneof case (B5): `message` is the enclosing `Status`'s
         // own text, so the reconstructed error still carries the real fault
@@ -887,6 +897,7 @@ mod tests {
             | JammiError::JobAttemptSuperseded { .. }
             | JammiError::JobCancelled { .. }
             | JammiError::SourceBusy { .. }
+            | JammiError::InvalidKey { .. }
             | JammiError::Other(_) => {}
         }
     }
@@ -964,6 +975,10 @@ mod tests {
             },
             JammiError::NotRecomputable {
                 table: "src1__text_embedding__m__20260101T000000_deadbeef".into(),
+            },
+            JammiError::InvalidKey {
+                column: "id".into(),
+                null_count: 3,
             },
             JammiError::Other("an error with no more specific shape".into()),
         ];

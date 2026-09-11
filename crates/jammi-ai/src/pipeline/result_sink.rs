@@ -50,9 +50,14 @@ impl<'a> ResultSink<'a> {
         }
     }
 
-    /// Write a batch: filter OK rows (for embeddings), write to Parquet, feed index.
-    pub async fn write_batch(&mut self, batch: &RecordBatch) -> Result<()> {
+    /// Write a batch: filter OK rows (for embeddings), write to Parquet, feed
+    /// index. Returns the `_row_id`s it REALIZED — the ok rows written (an
+    /// embedding sink) — so an incremental refresh can count the keys it
+    /// asked for but did not land (`dropped_rows`). An inference sink writes
+    /// every row and reports none.
+    pub async fn write_batch(&mut self, batch: &RecordBatch) -> Result<Vec<String>> {
         self.batch_num += 1;
+        let mut realized = Vec::new();
         if self.is_embedding {
             let (ok_batch, row_ids, vectors) = filter_ok_and_extract_vectors(batch)?;
             if ok_batch.num_rows() > 0 {
@@ -62,6 +67,7 @@ impl<'a> ResultSink<'a> {
                         index.add(id, vec)?;
                     }
                 }
+                realized = row_ids;
             }
         } else {
             self.writer.write_batch(batch).await?;
@@ -69,7 +75,7 @@ impl<'a> ResultSink<'a> {
         if self.checkpoint_interval > 0 && self.batch_num.is_multiple_of(self.checkpoint_interval) {
             self.building.set_checkpoint(self.batch_num).await?;
         }
-        Ok(())
+        Ok(realized)
     }
 
     /// Close the writer and build the index (if embedding).
@@ -90,8 +96,10 @@ impl<'a> ResultSink<'a> {
 /// and extract `_row_id` + `vector` columns.
 ///
 /// Input schema: `_row_id, _ordinal, _source, _model, _status, _error, _latency_ms, vector`
-/// Output schema: `_row_id, _source_id, _model_id, vector` (no `_ordinal` — an
-/// embedding table's `_row_id` is unique by construction)
+/// plus, when the plan passed it through, `_content_hash`.
+/// Output schema: `_row_id, _source_id, _model_id, vector, _content_hash` (no
+/// `_ordinal` — an embedding table's `_row_id` is unique by construction; the
+/// hash is NULL when the input carried none)
 pub fn filter_ok_and_extract_vectors(
     batch: &RecordBatch,
 ) -> Result<(RecordBatch, Vec<String>, Vec<Vec<f32>>)> {
@@ -129,6 +137,16 @@ pub fn filter_ok_and_extract_vectors(
         .map_err(|e| JammiError::Other(format!("Arrow take: {e}")))?;
     let filtered_vector = arrow::compute::take(vector_col.as_ref(), &indices, None)
         .map_err(|e| JammiError::Other(format!("Arrow take: {e}")))?;
+    let filtered_hash: arrow::array::ArrayRef =
+        match batch.column_by_name(jammi_db::store::schema::CONTENT_HASH_COLUMN) {
+            Some(col) => {
+                let taken = arrow::compute::take(col.as_ref(), &indices, None)
+                    .map_err(|e| JammiError::Other(format!("Arrow take: {e}")))?;
+                arrow::compute::cast(&taken, &arrow::datatypes::DataType::Utf8)
+                    .map_err(|e| JammiError::Other(format!("Arrow cast _content_hash: {e}")))?
+            }
+            None => jammi_db::store::content_hash::null_hash_column(indices.len()),
+        };
 
     // Get dimensions from the vector column to build the embedding schema
     let dims = vector_col
@@ -150,6 +168,7 @@ pub fn filter_ok_and_extract_vectors(
         filtered_source,
         filtered_model,
         filtered_vector,
+        filtered_hash,
     ];
     debug_assert_eq!(
         embedding_schema.fields().len(),

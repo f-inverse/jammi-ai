@@ -73,6 +73,11 @@ fn jammi_error_class(err: &JammiError) -> &'static str {
         JammiError::ChannelCatalog(
             ChannelCatalogError::InvalidId(_) | ChannelCatalogError::InvalidColumnType(_),
         ) => "InvalidArgument",
+        // The leaf classes `jammi.errors` refines from `InvalidArgument` /
+        // `BackendError` for the typed refusals the embedded engine raises
+        // (each subclasses the class the remote mapper produces for its gRPC
+        // code, so one `except` holds on both transports).
+        JammiError::InvalidKey { .. } => "InvalidKey",
         _ => "BackendError",
     }
 }

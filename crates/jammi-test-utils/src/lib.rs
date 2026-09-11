@@ -9,6 +9,11 @@ use jammi_db::catalog::backend::{BackendImpl, BackendKind};
 use jammi_db::catalog::backend_postgres::PostgresBackend;
 use jammi_db::session::JammiSession;
 
+// The one null-hash embedding-batch builder every hand-built fixture routes
+// through (the fifth `_content_hash` column is NULL on every table no
+// embedding pipeline produced).
+pub use jammi_db::store::schema::embedding_batch_with_null_hash;
+
 /// Env var inspected by [`pg_url_for_tests`] and [`make_test_session`] to
 /// reach a live Postgres instance. CI sets this for the `test-pg` job; local
 /// runs can leave it unset.

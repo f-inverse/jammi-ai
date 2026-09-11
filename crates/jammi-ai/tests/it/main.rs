@@ -9,6 +9,7 @@ mod common;
 mod compute_precision;
 mod conformal;
 mod content_digest;
+mod content_hash;
 mod context_predictor;
 mod context_set;
 mod cookbook;

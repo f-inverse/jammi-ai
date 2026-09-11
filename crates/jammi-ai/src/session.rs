@@ -206,6 +206,11 @@ impl InferenceSession {
         // resolutions honour the catalog owner on every read lane and source
         // removal can find the provider to clear.
         result_store.install_result_schema(inner.context())?;
+        // Every model-facing source scan projects `jammi_content_hash(...)`
+        // (`build_source_query`), so the UDF is part of the session's base
+        // context — not of the opt-in compound-query set
+        // (`register_query_functions`), which a plain `new` never installs.
+        crate::query::register_content_hash_udf(inner.context());
         result_store.recover().await?;
         result_store.load_existing_tables(inner.context()).await?;
 
@@ -1279,6 +1284,11 @@ impl InferenceSession {
             .create_physical_plan()
             .await
             .map_err(|e| JammiError::Inference(format!("Failed to create scan plan: {e}")))?;
+        // The same plan shape the embedding pipeline uses (coalesce →
+        // null-key check → total order), so `infer` refuses a null key typed
+        // before any model call and its output is deterministic across
+        // `execution_threads`.
+        let input_plan = crate::operator::ordered_input::ordered_input(input_plan, key_column)?;
 
         // Pre-load the model to get embedding dimensions for schema construction.
         // This also warms the cache so execute() hits a cache hit.
@@ -1362,15 +1372,17 @@ impl InferenceSession {
         .regression_form(regression_form)
         .build()?;
 
-        // Execute and collect results
+        // Execute and collect results — both through the structural
+        // classifier so a typed refusal raised inside the plan reaches the
+        // caller as that variant.
         let task_ctx = self.inner.context().task_ctx();
         let stream = inference_exec
             .execute(0, task_ctx)
-            .map_err(|e| JammiError::Inference(format!("InferenceExec failed: {e}")))?;
+            .map_err(JammiError::from)?;
 
         let batches = datafusion::physical_plan::common::collect(stream)
             .await
-            .map_err(|e| JammiError::Inference(format!("Failed to collect results: {e}")))?;
+            .map_err(JammiError::from)?;
 
         // An inference always creates its (possibly empty) result table — a
         // zero-row scan is a real, queryable artifact too, never a case the
@@ -1450,8 +1462,20 @@ impl InferenceSession {
             .map(|c| quote_ident(c))
             .collect::<Vec<_>>()
             .join(", ");
+        // The per-row content hash over the RAW content columns, computed by
+        // the `jammi_content_hash` UDF with the runner's own rendering (never
+        // a SQL `CAST`), carried by every model-facing scan — the embedding
+        // pipeline persists it as the table's `_content_hash`, `infer`
+        // ignores it, and an incremental refresh classifies rows by it.
+        let hash_args = content_columns
+            .iter()
+            .map(|c| quote_ident(c))
+            .collect::<Vec<_>>()
+            .join(", ");
         format!(
-            "SELECT {select_list} FROM {}",
+            "SELECT {select_list}, {}({hash_args}) AS {} FROM {}",
+            crate::query::CONTENT_HASH_UDF_NAME,
+            jammi_db::store::schema::CONTENT_HASH_COLUMN,
             source_relation(source_id, table_name)
         )
     }

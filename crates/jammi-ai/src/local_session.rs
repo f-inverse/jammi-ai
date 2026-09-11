@@ -548,6 +548,17 @@ impl Session {
         self.engine.recompute(&record, cascade).await
     }
 
+    /// Re-embed only the source rows whose content changed since `table`'s
+    /// current version and publish the result as a new version. See
+    /// [`InferenceSession::refresh_embeddings`] for the full contract.
+    pub async fn refresh_embeddings(
+        &self,
+        table: &str,
+        options: crate::pipeline::embedding_refresh::RefreshOptions,
+    ) -> Result<crate::pipeline::embedding_refresh::RefreshReport> {
+        self.engine.refresh_embeddings(table, options).await
+    }
+
     // --- graph / temporal pipeline verbs ----------------------------------
 
     /// Build a neighbour-edge table over a source's embedding table. See

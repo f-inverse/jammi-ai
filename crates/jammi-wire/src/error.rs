@@ -35,7 +35,8 @@
 //! `ChannelAssembly`, `Lexical`, `IncompatibleFormat`, `DependencyCycle`,
 //! `NotRecomputable`, `RowGone`, `TenantMismatch`, `LeaseLost`, `CasFailed`,
 //! `JobAttemptSuperseded`, `JobCancelled`, `SourceBusy`, `InvalidKey`,
-//! `VersionUnavailable`) reconstructs exactly,
+//! `VersionUnavailable`, `NotRefreshable`, `DefinitionDrift`, `NonUniqueKey`)
+//! reconstructs exactly,
 //! field for field — `tests::every_owned_shape_variant_round_trips_to_itself`
 //! is the completeness proof, backed by an exhaustive match with no catch-all
 //! so a NEW owned-shape variant fails to compile here until it is listed. So
@@ -55,7 +56,7 @@
 
 use jammi_db::catalog::backend::BackendError;
 use jammi_db::catalog::channel_repo::{ChannelCatalogError, ChannelColumnType};
-use jammi_db::error::JammiError;
+use jammi_db::error::{JammiError, NonUniqueScan, NotRefreshableReason};
 use jammi_db::store::mutable::{MutableTableError, MutableTableId};
 use jammi_db::trigger::TriggerError;
 use jammi_db::{AuditError, TenantId};
@@ -197,6 +198,38 @@ impl From<&JammiError> for pb::JammiErrorDetail {
                     version: *version,
                 })
             }
+            JammiError::NotRefreshable { table, reason } => {
+                Variant::NotRefreshable(pb::NotRefreshableError {
+                    table: table.clone(),
+                    reason: reason.as_str().to_string(),
+                })
+            }
+            JammiError::DefinitionDrift {
+                table,
+                recorded,
+                current,
+            } => Variant::DefinitionDrift(pb::DefinitionDriftError {
+                table: table.clone(),
+                recorded: recorded.clone(),
+                current: current.clone(),
+            }),
+            JammiError::NonUniqueKey {
+                table,
+                scan,
+                keys,
+                total,
+            } => Variant::NonUniqueKey(pb::NonUniqueKeyError {
+                table: table.clone(),
+                scan: scan.as_str().to_string(),
+                keys: keys
+                    .iter()
+                    .map(|(key, count)| pb::KeyCount {
+                        key: key.clone(),
+                        count: *count,
+                    })
+                    .collect(),
+                total: *total,
+            }),
             // The fold reaches ONLY the genuinely-foreign `#[from]` variants
             // (`Io`, `BackendDriver`, `Toml`, `Json`, `DataFusion`, `Trigger`,
             // `Storage`) and the existing `Other`: every owned-shape variant —
@@ -292,6 +325,30 @@ fn jammi_error_from_detail(detail: pb::JammiErrorDetail, message: &str) -> Jammi
         Some(Variant::VersionUnavailable(e)) => JammiError::VersionUnavailable {
             table: e.table,
             version: e.version,
+        },
+        // An unknown `reason` / `scan` token (a newer peer) reconstructs as
+        // `Other` carrying the Status message, the same total-decode stance
+        // as the unknown-oneof arm — never a fabricated token.
+        Some(Variant::NotRefreshable(e)) => match NotRefreshableReason::parse(&e.reason) {
+            Some(reason) => JammiError::NotRefreshable {
+                table: e.table,
+                reason,
+            },
+            None => JammiError::Other(message.to_string()),
+        },
+        Some(Variant::DefinitionDrift(e)) => JammiError::DefinitionDrift {
+            table: e.table,
+            recorded: e.recorded,
+            current: e.current,
+        },
+        Some(Variant::NonUniqueKey(e)) => match NonUniqueScan::parse(&e.scan) {
+            Some(scan) => JammiError::NonUniqueKey {
+                table: e.table,
+                scan,
+                keys: e.keys.into_iter().map(|k| (k.key, k.count)).collect(),
+                total: e.total,
+            },
+            None => JammiError::Other(message.to_string()),
         },
         Some(Variant::Other(e)) => JammiError::Other(e.message),
         // The unknown-oneof case (B5): `message` is the enclosing `Status`'s
@@ -910,6 +967,9 @@ mod tests {
             | JammiError::SourceBusy { .. }
             | JammiError::InvalidKey { .. }
             | JammiError::VersionUnavailable { .. }
+            | JammiError::NotRefreshable { .. }
+            | JammiError::DefinitionDrift { .. }
+            | JammiError::NonUniqueKey { .. }
             | JammiError::Other(_) => {}
         }
     }
@@ -995,6 +1055,21 @@ mod tests {
             JammiError::VersionUnavailable {
                 table: "patents__embedding__m".into(),
                 version: 4,
+            },
+            JammiError::NotRefreshable {
+                table: "patents__embedding__m".into(),
+                reason: NotRefreshableReason::MissingContentHash,
+            },
+            JammiError::DefinitionDrift {
+                table: "patents__embedding__m".into(),
+                recorded: "abc".into(),
+                current: "def".into(),
+            },
+            JammiError::NonUniqueKey {
+                table: "patents__embedding__m".into(),
+                scan: NonUniqueScan::Source,
+                keys: vec![("k1".into(), 2), ("k2".into(), 3)],
+                total: 2,
             },
             JammiError::Other("an error with no more specific shape".into()),
         ];

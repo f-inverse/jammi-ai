@@ -42,6 +42,7 @@ mod pipeline;
 mod pooling_config;
 mod read_vectors;
 mod recompute;
+mod refresh;
 mod regression_surface;
 mod scheduling;
 mod search;

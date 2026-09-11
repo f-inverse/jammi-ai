@@ -14,7 +14,10 @@ use jammi_db::store::BuildingTable;
 pub struct ResultSink<'a> {
     writer: ObjectParquetWriter,
     index: Option<SidecarIndex>,
-    building: &'a BuildingTable,
+    /// The table row checkpoints land on; `None` for a version fragment (a
+    /// refresh never touches the table row — its lease lives on the version
+    /// row, checked by the caller per batch).
+    building: Option<&'a BuildingTable>,
     is_embedding: bool,
     checkpoint_interval: usize,
     batch_num: usize,
@@ -31,9 +34,22 @@ impl<'a> ResultSink<'a> {
         Self {
             writer,
             index: Some(index),
-            building,
+            building: Some(building),
             is_embedding: true,
             checkpoint_interval,
+            batch_num: 0,
+        }
+    }
+
+    /// Create a sink for a refresh's or compaction's version fragment: ok
+    /// rows only, an index, no table-row checkpoints.
+    pub fn for_version_fragment(writer: ObjectParquetWriter, index: SidecarIndex) -> Self {
+        Self {
+            writer,
+            index: Some(index),
+            building: None,
+            is_embedding: true,
+            checkpoint_interval: 0,
             batch_num: 0,
         }
     }
@@ -43,7 +59,7 @@ impl<'a> ResultSink<'a> {
         Self {
             writer,
             index: None,
-            building,
+            building: Some(building),
             is_embedding: false,
             checkpoint_interval: 0,
             batch_num: 0,
@@ -72,8 +88,12 @@ impl<'a> ResultSink<'a> {
         } else {
             self.writer.write_batch(batch).await?;
         }
-        if self.checkpoint_interval > 0 && self.batch_num.is_multiple_of(self.checkpoint_interval) {
-            self.building.set_checkpoint(self.batch_num).await?;
+        if let Some(building) = self.building {
+            if self.checkpoint_interval > 0
+                && self.batch_num.is_multiple_of(self.checkpoint_interval)
+            {
+                building.set_checkpoint(self.batch_num).await?;
+            }
         }
         Ok(realized)
     }

@@ -244,6 +244,27 @@ pub fn map_engine_error(err: JammiError) -> Status {
             Code::NotFound,
             format!("result table `{table}` version {version} is unavailable"),
         ),
+        // "Fix state, then retry" — the `ModelReferenced` / `SourceBusy`
+        // convention: the table must be recomputed (or its version restored)
+        // before a refresh can proceed.
+        JammiError::NotRefreshable { table, reason } => (
+            Code::FailedPrecondition,
+            format!("result table `{table}` is not refreshable: {reason}"),
+        ),
+        // The environment (model / device), not the argument, must change
+        // before a retry.
+        JammiError::DefinitionDrift { table, .. } => (
+            Code::FailedPrecondition,
+            format!("result table `{table}`: definition drift; recompute it"),
+        ),
+        // A non-unique key space is a data-shape fault of the caller's
+        // input, like `InvalidKey`.
+        JammiError::NonUniqueKey {
+            table, scan, total, ..
+        } => (
+            Code::InvalidArgument,
+            format!("result table `{table}`: {total} non-unique key(s) in the {scan} scan"),
+        ),
         other => (Code::Internal, other.to_string()),
     };
     attach_error_detail(code, message, &err)

@@ -1007,10 +1007,43 @@ impl ResultStore {
     ) -> Result<ReferencedKeys> {
         let mut exact = BTreeSet::new();
         let mut dir_prefixes = BTreeSet::new();
+        // Every LIVE-building version row protects its deterministic
+        // `__v{N}*` keys; an expired-lease building version is unreferenced
+        // (recovery's version arm reaps it).
+        let live_versions: BTreeSet<(String, i64)> = self
+            .catalog
+            .list_live_building_versions()
+            .await?
+            .into_iter()
+            .map(|v| (v.table_name, v.version))
+            .collect();
         for table in ready.iter().chain(live_building.iter()) {
             let parquet_url = StorageUrl::parse(&table.parquet_path)?;
             if let Some(rel) = relative_to(&self.root, &parquet_url) {
                 exact.insert(rel);
+            }
+            for v in self
+                .catalog
+                .list_result_table_versions(&table.table_name)
+                .await?
+            {
+                let referenced = v.status == ResultTableStatus::Ready.to_string()
+                    || live_versions.contains(&(v.table_name.clone(), v.version));
+                if !referenced {
+                    continue;
+                }
+                for url in [
+                    layout::version_manifest_url(&parquet_url, v.version),
+                    layout::version_fragment_url(&parquet_url, v.version),
+                    layout::version_deletes_url(&parquet_url, v.version),
+                ]
+                .into_iter()
+                .flatten()
+                {
+                    if let Some(rel) = relative_to(&self.root, &url) {
+                        exact.insert(rel);
+                    }
+                }
             }
             if let Ok(sidecar_url) = layout::sidecar_url(&parquet_url, "materialization.json") {
                 if let Some(rel) = relative_to(&self.root, &sidecar_url) {

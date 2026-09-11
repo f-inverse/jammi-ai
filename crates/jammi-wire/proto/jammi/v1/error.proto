@@ -92,6 +92,9 @@ message JammiErrorDetail {
     NotRecomputableError not_recomputable = 29;
     InvalidKeyError invalid_key = 32;
     VersionUnavailableError version_unavailable = 33;
+    NotRefreshableError not_refreshable = 34;
+    DefinitionDriftError definition_drift = 35;
+    NonUniqueKeyError non_unique_key = 36;
   }
   // Tag 15 / `model_retired` are reserved: the wire surface must never reuse a
   // retired field number or name, so a peer built against either contract
@@ -205,6 +208,42 @@ message InvalidKeyError {
 message VersionUnavailableError {
   string table = 1;
   int64 version = 2;
+}
+
+// `JammiError::NotRefreshable { table, reason }`. A refresh/compaction of a
+// table it cannot serve incrementally; `reason` is the engine's stable token
+// (`missing_content_hash` / `current_version_unavailable` / `not_ready` /
+// `not_embedding_table`). "Fix state, then retry" → `FailedPrecondition`.
+message NotRefreshableError {
+  string table = 1;
+  string reason = 2;
+}
+
+// `JammiError::DefinitionDrift { table, recorded, current }`. The definition
+// a refresh would run under no longer hashes to the table's recorded
+// `definition_hash` (a model or environment change). The environment, not the
+// argument, must change before a retry → `FailedPrecondition`.
+message DefinitionDriftError {
+  string table = 1;
+  string recorded = 2;
+  string current = 3;
+}
+
+// One duplicated key and its exact count.
+message KeyCount {
+  string key = 1;
+  uint64 count = 2;
+}
+
+// `JammiError::NonUniqueKey { table, scan, keys, total }`. A refresh found
+// the same key more than once on a complete scan (`scan` is `source` or
+// `parent`); `keys` carries at most ten. A data-shape fault →
+// `InvalidArgument`.
+message NonUniqueKeyError {
+  string table = 1;
+  string scan = 2;
+  repeated KeyCount keys = 3;
+  uint64 total = 4;
 }
 
 // `JammiError::ChannelCatalog(ChannelCatalogError)`. The inner taxonomy is

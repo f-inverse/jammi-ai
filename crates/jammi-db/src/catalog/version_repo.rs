@@ -909,6 +909,42 @@ impl Catalog {
             .await?)
     }
 
+    /// Recovery's `ready -> failed` on a version row whose manifest is
+    /// definitively absent (D14(i)): a status-arm CAS under the tenant arm in
+    /// force; `Ok(false)` when it matched nothing. The table row and
+    /// `current_version` are untouched.
+    pub async fn fail_ready_version(&self, table: &str, version: i64) -> Result<bool> {
+        let table = table.to_string();
+        let tenant = self.current_tenant();
+        let arm = TenantArm::in_force(tenant);
+        let completed_at = completed_now();
+        Ok(self
+            .backend()
+            .transaction(TxOptions::default(), |tx| {
+                Box::pin(async move {
+                    tx.set_tenant(tenant);
+                    let mut params: Vec<SqlValue<'static>> = vec![
+                        SqlValue::TextOwned(completed_at),
+                        SqlValue::TextOwned(table),
+                        SqlValue::Int(version),
+                    ];
+                    let arm_sql = tenant_arm_sql(&arm, "", &mut params);
+                    let affected = tx
+                        .execute(
+                            &format!(
+                                "UPDATE result_table_versions SET status = 'failed', \
+                                 completed_at = $1 WHERE table_name = $2 AND version = $3 \
+                                 AND status = 'ready'{arm_sql}"
+                            ),
+                            &params,
+                        )
+                        .await?;
+                    Ok(affected == 1)
+                })
+            })
+            .await?)
+    }
+
     /// Test-only: force the `building` version row `cas` names into an
     /// already-expired lease on the catalog backend's own clock, the version
     /// peer of `expire_lease_for_test`.

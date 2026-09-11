@@ -315,9 +315,134 @@ pub enum JammiError {
         version: i64,
     },
 
+    /// A refresh or compaction was asked of a table it cannot serve
+    /// incrementally: not `ready`, not an embedding table, its current
+    /// version row not `ready`, or its rows carry no `_content_hash` (a table
+    /// produced before the hash column existed, or by a producer that writes
+    /// none). The remedy is `recompute` once (a fresh table carries hashes).
+    #[error("result table `{table}` is not refreshable: {reason}")]
+    NotRefreshable {
+        /// The table the verb targeted.
+        table: String,
+        /// Why.
+        reason: NotRefreshableReason,
+    },
+
+    /// The definition a refresh would run under (the table's recorded
+    /// embedding parameters over the model as loaded NOW, device included)
+    /// no longer hashes to the table's recorded `definition_hash` — a model or
+    /// environment change, which no per-row content hash can see. Refused
+    /// before any version is allocated; the consumer runs `recompute`.
+    #[error("result table `{table}`: definition drift (recorded {recorded}, current {current})")]
+    DefinitionDrift {
+        table: String,
+        /// The table's recorded `definition_hash`.
+        recorded: String,
+        /// The definition hash the refresh computed.
+        current: String,
+    },
+
+    /// A refresh found the same key more than once on a COMPLETE scan — of
+    /// the source (`Source`) or of the parent version's current state
+    /// (`Parent`, two physical rows under one `_row_id`). A delta over a
+    /// non-unique key space is ambiguous, so it is refused before any new
+    /// version is allocated; the initial embed still tolerates duplicates,
+    /// and `recompute` once yields a table a refresh can proceed from.
+    #[error(
+        "result table `{table}`: {total} non-unique key(s) in the {scan} scan (first {}: {keys:?})",
+        keys.len()
+    )]
+    NonUniqueKey {
+        table: String,
+        /// Which scan carried the duplicates.
+        scan: NonUniqueScan,
+        /// Up to ten offending keys with their exact counts.
+        keys: Vec<(String, u64)>,
+        /// The total number of non-unique keys.
+        total: u64,
+    },
+
     /// Catch-all for errors that don't fit another variant.
     #[error("{0}")]
     Other(String),
+}
+
+/// Why a table is [`JammiError::NotRefreshable`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum NotRefreshableReason {
+    /// The rows carry no (or a NULL / malformed) `_content_hash`.
+    MissingContentHash,
+    /// The table's current version row is not `ready`.
+    CurrentVersionUnavailable,
+    /// The table row is not `ready`.
+    NotReady,
+    /// Not an embedding table produced by the embedding pipeline.
+    NotEmbeddingTable,
+}
+
+impl std::fmt::Display for NotRefreshableReason {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+
+impl NotRefreshableReason {
+    /// The stable wire token.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::MissingContentHash => "missing_content_hash",
+            Self::CurrentVersionUnavailable => "current_version_unavailable",
+            Self::NotReady => "not_ready",
+            Self::NotEmbeddingTable => "not_embedding_table",
+        }
+    }
+
+    /// Parse the wire token; `None` for an unknown one.
+    pub fn parse(s: &str) -> Option<Self> {
+        match s {
+            "missing_content_hash" => Some(Self::MissingContentHash),
+            "current_version_unavailable" => Some(Self::CurrentVersionUnavailable),
+            "not_ready" => Some(Self::NotReady),
+            "not_embedding_table" => Some(Self::NotEmbeddingTable),
+            _ => None,
+        }
+    }
+}
+
+/// Which scan a [`JammiError::NonUniqueKey`] found its duplicates on.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum NonUniqueScan {
+    /// The source scan.
+    Source,
+    /// The parent version's current-state scan.
+    Parent,
+}
+
+impl std::fmt::Display for NonUniqueScan {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+
+impl NonUniqueScan {
+    /// The stable wire token.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Source => "source",
+            Self::Parent => "parent",
+        }
+    }
+
+    /// Parse the wire token; `None` for an unknown one.
+    pub fn parse(s: &str) -> Option<Self> {
+        match s {
+            "source" => Some(Self::Source),
+            "parent" => Some(Self::Parent),
+            _ => None,
+        }
+    }
 }
 
 /// The structural classifier: how EVERY DataFusion error becomes a

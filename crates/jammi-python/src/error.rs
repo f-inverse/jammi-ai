@@ -79,6 +79,9 @@ fn jammi_error_class(err: &JammiError) -> &'static str {
         // code, so one `except` holds on both transports).
         JammiError::InvalidKey { .. } => "InvalidKey",
         JammiError::VersionUnavailable { .. } => "VersionUnavailable",
+        JammiError::NotRefreshable { .. } => "NotRefreshable",
+        JammiError::DefinitionDrift { .. } => "DefinitionDrift",
+        JammiError::NonUniqueKey { .. } => "NonUniqueKey",
         _ => "BackendError",
     }
 }

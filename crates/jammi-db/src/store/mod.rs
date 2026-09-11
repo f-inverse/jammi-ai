@@ -24,9 +24,10 @@ pub use freshness::{
 };
 pub use layout::TenantSegment;
 pub use manifest::{
-    AnchorKind, AnchorValue, ArtifactDigest, ComputeDevice, DefinitionHash, InputAnchor,
-    ManifestError, MatchVerdict, Materialization, MaterializationEnv, MaterializationManifest,
-    ModelContentDigest, ModelContentDigestUnavailableReason, ModelIdentity, ProducingDescriptor,
+    AnchorKind, AnchorValue, ArtifactDigest, ComputeDevice, DefinitionHash, DeletePolicy,
+    InputAnchor, ManifestError, MatchVerdict, Materialization, MaterializationEnv,
+    MaterializationManifest, ModelContentDigest, ModelContentDigestUnavailableReason,
+    ModelIdentity, ProducingDescriptor,
 };
 pub use reconcile::{ReconcileOptions, ReconcileReport};
 pub use result_schema::ResultTableSchemaProvider;
@@ -973,6 +974,15 @@ impl ResultStore {
     /// to recomputing it from the input's Parquet bytes for a pre-contract
     /// source table that carries no manifest.
     pub async fn result_digest_anchor(&self, table: &ResultTableRecord) -> Result<InputAnchor> {
+        // A versioned table's anchor is its CURRENT version's identity (the
+        // base version's identity is the base artifact hex, so publishing
+        // the base moves no anchor).
+        if let Some(identity) = self.current_version_identity(table).await? {
+            return Ok(InputAnchor::result_digest(
+                &table.table_name,
+                &ArtifactDigest(identity),
+            ));
+        }
         let parquet_url = StorageUrl::parse(&table.parquet_path)?;
         let digest = match self.read_materialization_manifest(&parquet_url).await? {
             Some(m) => m.artifact,
@@ -984,6 +994,54 @@ impl ResultStore {
             }
         };
         Ok(InputAnchor::result_digest(&table.table_name, &digest))
+    }
+
+    /// The identity of `table`'s current version (`None` for a never-refreshed
+    /// table), read off the version row under admin scope (the table was
+    /// already resolved through the tenant-scoped read).
+    pub async fn current_version_identity(
+        &self,
+        table: &ResultTableRecord,
+    ) -> Result<Option<String>> {
+        let Some(version) = table.current_version else {
+            return Ok(None);
+        };
+        let row = TenantBinding::admin_scope(
+            self.catalog
+                .get_result_table_version(&table.table_name, version),
+        )
+        .await?;
+        match row {
+            Some(r) if r.status == ResultTableStatus::Ready.to_string() => {
+                Ok(Some(r.identity.unwrap_or_default()))
+            }
+            _ => Err(JammiError::VersionUnavailable {
+                table: table.table_name.clone(),
+                version,
+            }),
+        }
+    }
+
+    /// `COUNT(*)` over the masked provider of a (possibly unpublished)
+    /// version manifest — the exact live-row count a publish records.
+    pub async fn count_live_rows(
+        &self,
+        ctx: &SessionContext,
+        record: &ResultTableRecord,
+        manifest: &VersionManifest,
+    ) -> Result<usize> {
+        let provider = self.build_masked_provider(ctx, record, manifest).await?;
+        let df = ctx.read_table(provider)?;
+        Ok(df.count().await?)
+    }
+
+    /// Read a manifest's deletion mask (empty when it lists none).
+    pub async fn read_deletion_mask(
+        &self,
+        table: &str,
+        manifest: &VersionManifest,
+    ) -> Result<deletes::DeletionMask> {
+        self.load_deletion_mask(table, manifest).await
     }
 
     /// Read a result table's `.materialization.json` sidecar, if present.
@@ -1059,7 +1117,84 @@ impl ResultStore {
             }
         }
 
-        let unpinned = manifest.unpinned_inputs();
+        // A versioned table (§3.6): the base check above is unchanged; then
+        // every fragment digest and the deletes digest of the CURRENT version
+        // are recomputed from the bytes, the identity chain is recomputed from
+        // the parent's recorded identity, and both the version manifest's
+        // identity and the catalog row's are compared. A mismatch names the
+        // artifact that diverged.
+        let mut unpinned = manifest.unpinned_inputs();
+        if let Some(version) = table.current_version {
+            let Some(vm) = self
+                .read_version_manifest(&table.table_name, &parquet_url, version)
+                .await?
+            else {
+                return Err(JammiError::VersionUnavailable {
+                    table: table.table_name.clone(),
+                    version,
+                });
+            };
+            for fragment in &vm.fragments {
+                let found = if fragment.url == table.parquet_path {
+                    recomputed.clone()
+                } else {
+                    let url = StorageUrl::parse(&fragment.url)?;
+                    let handle = self.open_parquet(&url)?;
+                    let bytes = handle.get_bytes(&handle.data_path()?).await?;
+                    ArtifactDigest::of_bytes(&bytes)
+                };
+                if found != fragment.digest {
+                    return Ok(MatchVerdict::Mismatch {
+                        expected: fragment.digest.0.clone(),
+                        found: found.0,
+                    });
+                }
+            }
+            if let Some(deletes) = &vm.deletes {
+                let url = StorageUrl::parse(&deletes.url)?;
+                let handle = self.open_parquet(&url)?;
+                let bytes = handle.get_bytes(&handle.data_path()?).await?;
+                let found = ArtifactDigest::of_bytes(&bytes);
+                if found != deletes.digest {
+                    return Ok(MatchVerdict::Mismatch {
+                        expected: deletes.digest.0.clone(),
+                        found: found.0,
+                    });
+                }
+            }
+            let expected_identity = match vm.delta.descriptor.parent_identity() {
+                // The base version: its identity IS the base artifact hex (D3).
+                None => manifest.artifact.0.clone(),
+                Some(parent_identity) => VersionManifest::compute_identity(
+                    parent_identity,
+                    &vm.definition_hash,
+                    &vm.delta.descriptor,
+                    &vm.fragments,
+                    vm.deletes.as_ref(),
+                )?,
+            };
+            if expected_identity != vm.identity {
+                return Ok(MatchVerdict::Mismatch {
+                    expected: expected_identity,
+                    found: vm.identity.clone(),
+                });
+            }
+            if let Some(recorded) = self.current_version_identity(table).await? {
+                if recorded != vm.identity {
+                    return Ok(MatchVerdict::Mismatch {
+                        expected: vm.identity.clone(),
+                        found: recorded,
+                    });
+                }
+            }
+            for anchor in &vm.delta.input_anchors {
+                if anchor.kind == AnchorKind::UnpinnedAtInstant
+                    && !unpinned.contains(&anchor.source)
+                {
+                    unpinned.push(anchor.source.clone());
+                }
+            }
+        }
         if unpinned.is_empty() {
             Ok(MatchVerdict::Match)
         } else {
@@ -1150,8 +1285,54 @@ impl ResultStore {
         for table in expired {
             self.reconcile_expired_building_row(table).await?;
         }
-
+        self.recover_expired_versions().await?;
         self.reconcile_ready_manifests().await?;
+        Ok(())
+    }
+
+    /// The version arm of recovery: every `building` VERSION row whose lease
+    /// expired is claimed (fencing its writer), failed by CAS, and its
+    /// artifacts stamped with that number reaped — never promoted (a delta is
+    /// cheap to redo), never touching the table row or the base artifacts.
+    async fn recover_expired_versions(&self) -> Result<()> {
+        for v in self.catalog.list_expired_building_versions().await? {
+            let Some(table) = self.catalog.get_result_table(&v.table_name).await? else {
+                continue;
+            };
+            if !self
+                .catalog
+                .claim_expired_building_version(
+                    &v.table_name,
+                    v.version,
+                    &self.writer_id,
+                    self.lease.lease(),
+                )
+                .await?
+            {
+                continue;
+            }
+            let cas = crate::catalog::version_repo::VersionCas::writer(
+                &v.table_name,
+                v.version,
+                &self.writer_id,
+                parse_owner(&table)?,
+            );
+            match self.catalog.fail_building_version(&cas).await {
+                Ok(()) => {}
+                Err(e) if is_cas_miss(&e) => {
+                    warn!(table = v.table_name, version = v.version, outcome = %e, "Recovery: version row moved on; nothing deleted");
+                    continue;
+                }
+                Err(e) => return Err(e),
+            }
+            let parquet_url = StorageUrl::parse(&table.parquet_path)?;
+            if let Err(e) = self
+                .reap_version_artifacts(&parquet_url, &v.table_name, v.version)
+                .await
+            {
+                warn!(table = v.table_name, version = v.version, error = %e, "Recovery: version artifact reap did not complete; reconcile reaps it");
+            }
+        }
         Ok(())
     }
 
@@ -1554,6 +1735,24 @@ impl ResultStore {
                 continue;
             }
             let parquet_url = StorageUrl::parse(&table.parquet_path)?;
+            // The version arm (D14(i)): a current version whose manifest is
+            // definitively absent fails the VERSION row only — the table row
+            // and its base artifacts are untouched; reads see the placeholder.
+            if let Some(version) = table.current_version {
+                let manifest_url = layout::version_manifest_url(&parquet_url, version)?;
+                let vh = self.open_parquet(&manifest_url)?;
+                if !vh.exists(&vh.data_path()?).await? {
+                    warn!(
+                        table = table.table_name,
+                        version,
+                        "Recovery: current version manifest is absent; failing the version row"
+                    );
+                    self.catalog
+                        .fail_ready_version(&table.table_name, version)
+                        .await?;
+                    self.segment_sets.evict_table(&table.table_name);
+                }
+            }
             let handle = self.open_parquet(&parquet_url)?;
             let sidecar = materialization_sidecar_path(&handle)?;
             if handle.exists(&sidecar).await? {
@@ -2782,7 +2981,9 @@ fn content_digest(rows: &[(String, Vec<f32>)]) -> String {
 /// The per-process producing-run identity stamped on every manifest's
 /// `produced_by`. Provenance only — never the reproducibility anchor (that is
 /// the input anchors). One id per engine process, generated on first use.
-fn run_id() -> &'static str {
+/// This process's producing-run id — `produced_by` on every manifest it
+/// writes (provenance, never a hash input).
+pub fn run_id() -> &'static str {
     static RUN_ID: std::sync::OnceLock<String> = std::sync::OnceLock::new();
     RUN_ID.get_or_init(|| uuid::Uuid::new_v4().simple().to_string())
 }

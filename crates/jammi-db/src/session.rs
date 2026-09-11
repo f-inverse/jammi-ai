@@ -976,6 +976,35 @@ impl JammiSession {
         &self,
         table: &crate::catalog::result_repo::ResultTableRecord,
     ) -> Result<Vec<Vec<f32>>> {
+        // A versioned table is read through its bound (masked) provider in
+        // `_row_id` order — the documented key order; a never-refreshed table
+        // keeps today's raw base-bytes read, byte- and order-identical.
+        if table.current_version.is_some() {
+            use datafusion::sql::TableReference;
+            let table_ref = TableReference::bare(format!("jammi.{}", table.table_name));
+            let batches = self
+                .ctx
+                .table(table_ref)
+                .await
+                .map_err(JammiError::from)?
+                .select_columns(&["_row_id", "vector"])
+                .map_err(JammiError::from)?
+                .sort(vec![datafusion::prelude::col("_row_id").sort(true, false)])
+                .map_err(JammiError::from)?
+                .collect()
+                .await
+                .map_err(JammiError::from)?;
+            let mut out = Vec::new();
+            for batch in &batches {
+                crate::store::vectors::extend_with_fixed_size_list_f32(
+                    batch,
+                    &table.table_name,
+                    "vector",
+                    &mut out,
+                )?;
+            }
+            return Ok(out);
+        }
         let url = StorageUrl::parse(&table.parquet_path)?;
         let driver = self.storage_registry.driver_for(&url, None)?;
         let handle = crate::storage::JammiObjectStore::new(driver, url);

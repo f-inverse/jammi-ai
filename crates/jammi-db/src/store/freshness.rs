@@ -444,6 +444,12 @@ impl ResultStore {
                 let Some(parent) = self.catalog().get_result_table(&anchor.source).await? else {
                     return Ok(CurrentAnchor::Vanished);
                 };
+                // A versioned parent's current anchor is its current version's
+                // identity — a refresh that changed content advances it, one
+                // that did not leaves every dependent `Fresh`.
+                if let Some(identity) = self.current_version_identity(&parent).await? {
+                    return Ok(CurrentAnchor::ResultDigest(identity));
+                }
                 let parquet_url = StorageUrl::parse(&parent.parquet_path)?;
                 match self.read_materialization_manifest(&parquet_url).await? {
                     Some(manifest) => Ok(CurrentAnchor::ResultDigest(manifest.artifact.0)),
@@ -483,6 +489,21 @@ impl ResultStore {
         table: &ResultTableRecord,
     ) -> Result<ProducingDescriptor> {
         let parquet_url = StorageUrl::parse(&table.parquet_path)?;
+        // A versioned table's producer is its CURRENT version's delta
+        // descriptor (`Embedding` at the base, `EmbeddingDelta` after a
+        // refresh, `EmbeddingCompaction` after a compaction). When that
+        // manifest is unavailable (the `VersionUnavailable` state) the base
+        // manifest's descriptor stands in: `recompute` is the documented
+        // remedy for an unavailable version, and every embedding-family
+        // descriptor in the chain replays as the same full embed.
+        if let Some(version) = table.current_version {
+            if let Some(m) = self
+                .read_version_manifest(&table.table_name, &parquet_url, version)
+                .await?
+            {
+                return Ok(m.delta.descriptor.clone());
+            }
+        }
         match self.read_materialization_manifest(&parquet_url).await? {
             Some(manifest) => Ok(manifest.descriptor),
             None => Err(JammiError::NotRecomputable {

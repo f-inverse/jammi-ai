@@ -237,6 +237,37 @@ impl InferenceSession {
                         .await?;
                 Ok((record.table_name, outcome))
             }
+            // A versioned table's replay is a full embed of the current source
+            // into a NEW table (D9): value-equivalent, a new chain root.
+            ProducingDescriptor::EmbeddingDelta {
+                model_id,
+                task,
+                source_id,
+                columns,
+                key_column,
+                ..
+            }
+            | ProducingDescriptor::EmbeddingCompaction {
+                model_id,
+                task,
+                source_id,
+                columns,
+                key_column,
+                ..
+            } => {
+                let (record, outcome) =
+                    EmbeddingPipeline::new(self.as_ref(), &self.result_store(), task)
+                        .run(
+                            &source_id,
+                            &model_id,
+                            &columns,
+                            &key_column,
+                            CachePolicy::Bypass,
+                            None,
+                        )
+                        .await?;
+                Ok((record.table_name, outcome))
+            }
             ProducingDescriptor::NeighborGraph {
                 source_table,
                 k,

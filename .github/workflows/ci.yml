@@ -1515,6 +1515,19 @@ jobs:
           # stdin, which only the real workflow run can produce.
           - name: merged index platforms self-test
             cmd: bash ci/scripts/check_merged_index_platforms.sh --self-test
+          # `check_client_deps.sh`'s own suite: proves its artifact-stream
+          # assertions against synthetic ~1 MB compiler-artifact fixtures —
+          # measured large enough to genuinely, reliably reproduce the
+          # SIGPIPE a `printf | grep -q` pipeline suffers under `pipefail`
+          # (a match near the front of a stream too big for one pipe write
+          # kills the writer, and `pipefail` promotes its SIGPIPE status
+          # over a succeeding `grep -q`'s own 0 — flipping the verdict; the
+          # portable trigger is ONE PIPE BUFFER, 64 KiB, not any specific
+          # "cargo output" byte count, so >1 MB clears it by more than 15x).
+          # No cargo, no network; the real cargo-build lanes run in
+          # `test-clients`.
+          - name: check_client_deps.sh self-test
+            cmd: bash ci/scripts/check_client_deps.sh --self-test
           # The verdict CONSUMER's own suite: every esc-084 control (b)
           # degenerate record, the recency/revocation rule, and the wait
           # state machine, driven with a fake fetch/clock — no network.

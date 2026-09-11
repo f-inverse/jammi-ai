@@ -1647,11 +1647,11 @@ def _self_test_lexer() -> list[str]:
     )
     # `${var#pattern}`: the strip-operator `#` sits inside PARAM -- never a
     # comment, decidable, code unchanged (false-strip case,
-    # `test_pod_substrate.sh:1170`'s real shape).
+    # `test_pod_substrate.sh:1247`'s real shape).
     check(
         lex_one('rsync ${rsync_flags_line#rsync } "$X"')[0],
         _LineLex('rsync ${rsync_flags_line#rsync } "$X"', False),
-        "parameter-expansion strip-operator # (test_pod_substrate.sh:1170 shape)",
+        "parameter-expansion strip-operator # (test_pod_substrate.sh:1247 shape)",
     )
     # A single-quoted region genuinely spanning multiple physical lines: a
     # line that CLOSES a quote opened several lines earlier, with real
@@ -1727,11 +1727,29 @@ def _self_test_corpus_lexer_agreement(repo_root: Path) -> list[str]:
     # two live fail-opens (a closing quote misread as opening one, so a
     # real trailing comment was never stripped) and three false-strips (a
     # non-comment `#` misread as a comment marker, truncating real code).
+    # `test_pod_substrate.sh`'s two cases are NOT heredoc bodies: the first
+    # is a nested `$(bash -c "…\"\${…}\"…")` command substitution with
+    # escaped-quote nesting, followed by a genuine trailing `# tripwire-ok:`
+    # comment (asserted `undecidable=False`, comment correctly stripped);
+    # the second is the `rsync ${var#pattern}` parameter-expansion
+    # strip-operator false-strip.
+    #
+    # LOCATED BY TEXT, never by line number: a bare `(path, lineno, …)`
+    # lookup is fragile to any insertion ABOVE the pinned line in an
+    # UNRELATED edit — the exact failure mode that cost this line-pin two
+    # separate CI reds and a 34-citation repo-wide sweep after an earlier,
+    # unrelated fixture grew inside this same file. Each case is instead
+    # asserted to match EXACTLY ONE line's lexed (code, undecidable) shape
+    # anywhere in the file — zero matches means the case rotted (the line
+    # was edited/removed), more than one means the fixture is no longer
+    # unique enough to pin a specific behaviour. The recorded line number
+    # is kept ONLY as a human-readable hint in the failure message, never
+    # as the lookup key.
     named_cases = [
         ("ci/scripts/pod_push_stamp.sh", 353, False, '\' "$stamp" 2>/dev/null)" '),
         (
             "ci/scripts/test_pod_substrate.sh",
-            1118,
+            1195,
             False,
             '  bsha_reverted_value="$(bash -c "${bsha_reverted_text}; printf \'%s\' \\"\\${JAMMI_BUILD_SHA:-}\\"" '
             '2>/dev/null)" ',
@@ -1740,20 +1758,26 @@ def _self_test_corpus_lexer_agreement(repo_root: Path) -> list[str]:
         ("ci/scripts/runpod_lib.sh", 173, False, "RP_INACTIVITY=$((10#$RP_INACTIVITY))"),
         (
             "ci/scripts/test_pod_substrate.sh",
-            1170,
+            1247,
             False,
             '  rsync ${rsync_flags_line#rsync } "${EXCLUDE_ARGS[@]}" "$SRC_REPO/" "$TREE_DEST/" > '
             '"$SANDBOX/i_push.out" 2>&1',
         ),
     ]
-    for rel, lineno, expect_undecidable, expect_code in named_cases:
+    for rel, hint_lineno, expect_undecidable, expect_code in named_cases:
         path = repo_root / rel
         lines = path.read_text(encoding="utf-8", errors="replace").splitlines()
-        got = _lex_stream(lines)[lineno - 1]
-        if got.undecidable != expect_undecidable or got.code != expect_code:
+        lexed = _lex_stream(lines)
+        matches = [
+            i + 1
+            for i, lx in enumerate(lexed)
+            if lx.undecidable == expect_undecidable and lx.code == expect_code
+        ]
+        if len(matches) != 1:
             failures.append(
-                f"named case FAILED: {rel}:{lineno} expected _LineLex(code={expect_code!r}, "
-                f"undecidable={expect_undecidable}), got {got!r}"
+                f"named case FAILED: {rel} (line-number HINT only, currently {hint_lineno}) expected "
+                f"EXACTLY ONE line lexing to _LineLex(code={expect_code!r}, undecidable={expect_undecidable}); "
+                f"found {len(matches)} such line(s){f' at {matches}' if matches else ''}"
             )
     return failures
 

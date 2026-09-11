@@ -27,6 +27,7 @@
 //! other test and every production build), each hook is a single
 //! early-returning check. No production code path observes this module.
 
+use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
@@ -138,7 +139,7 @@ pub async fn maybe_signal_lifecycle(op: &str) {
 pub const MATERIALIZATION_CHECKPOINT_ENV: &str = "JAMMI_TEST_MATERIALIZATION_CHECKPOINT";
 
 /// The named result-table lifecycle points a test can park a writer at.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum MaterializationPoint {
     /// After `create_table`'s INSERT committed and the heartbeat started; no
     /// bytes yet (the W1 window of esc-094).
@@ -166,13 +167,6 @@ impl MaterializationPoint {
             _ => None,
         }
     }
-
-    fn index(self) -> usize {
-        match self {
-            Self::TableCreated => 0,
-            Self::Materialization => 1,
-        }
-    }
 }
 
 /// Longest a writer parked by an in-process [`arm`] waits for
@@ -184,26 +178,37 @@ pub const IN_PROCESS_PARK_TIMEOUT: Duration = Duration::from_secs(30);
 /// Longest [`Armed::wait_parked`] waits for the writer to reach its point.
 pub const WAIT_PARKED_TIMEOUT: Duration = Duration::from_secs(30);
 
-/// Per-point in-process arming state, keyed by the writer it is armed for.
-/// One-shot per point: the first call by THAT writer takes the arm; every other
-/// writer in the process (a sibling test's, a recovery claim's) passes straight
-/// through.
+/// Per-`(point, writer)` in-process arming state. One-shot per key: the
+/// first (and only) call by that writer at that point takes the arm; every
+/// other writer in the process (a sibling test's, a recovery claim's) passes
+/// straight through untouched.
 struct ArmState {
-    writer_id: String,
     parked: Arc<AtomicBool>,
     parked_notify: Arc<Notify>,
     release: Arc<Notify>,
     released: Arc<AtomicBool>,
 }
 
-static ARMS: [Mutex<Option<ArmState>>; 2] = [Mutex::new(None), Mutex::new(None)];
+/// The registry of live in-process arms, keyed by `(point, writer_id)` so
+/// sibling tests that arm the SAME point for DIFFERENT writers (or different
+/// tests running concurrently in this `it` binary) never evict one another —
+/// each key names exactly one arm, not one arm per point. A `HashMap` rather
+/// than the fixed-size array this replaced: the writer set is unbounded
+/// (one UUID per `ResultStore`), so a keyed map is the only shape that can
+/// hold more than one live arm per point at a time.
+static ARMS: OnceLock<Mutex<HashMap<(MaterializationPoint, String), ArmState>>> = OnceLock::new();
+
+fn arms() -> &'static Mutex<HashMap<(MaterializationPoint, String), ArmState>> {
+    ARMS.get_or_init(|| Mutex::new(HashMap::new()))
+}
 
 /// The test's handle on an in-process arm: wait for the writer to park, then
 /// release it. Dropping the handle releases the writer (if it is parked) and
-/// disarms the point, so a panicking test never leaves a writer waiting out
-/// the park timeout.
+/// disarms this `(point, writer_id)` key, so a panicking test never leaves a
+/// writer waiting out the park timeout.
 pub struct Armed {
     point: MaterializationPoint,
+    writer_id: String,
     parked: Arc<AtomicBool>,
     parked_notify: Arc<Notify>,
     release: Arc<Notify>,
@@ -233,11 +238,19 @@ impl std::error::Error for WaitParkedTimeout {}
 /// Arm `point` for the same-process two-writer tests: the next time the store
 /// whose id is `writer_id` reaches it, that writer parks (bounded by
 /// [`IN_PROCESS_PARK_TIMEOUT`]) until [`Armed::release`] — or the returned
-/// handle is dropped. Keyed by writer so sibling tests running in the same
-/// binary never take each other's arm. Replaces any previous arm on the point.
+/// handle is dropped. Keyed by `(point, writer_id)` so sibling tests running
+/// in the same binary — including two tests that both arm the same point,
+/// for different writers, concurrently — never take each other's arm.
+///
+/// Panics if `(point, writer_id)` is already armed: since `writer_id` is a
+/// fresh UUID per [`crate::store::ResultStore`], a collision can only mean an
+/// earlier [`Armed`] for the SAME store was never released (or leaked past
+/// its test) before this call — silently replacing it would strand whatever
+/// writer is (or later becomes) parked against the stale state with no
+/// handle left able to release it, hanging that writer out to its own park
+/// timeout. A loud, attributable panic here beats a silent hang.
 pub fn arm(point: MaterializationPoint, writer_id: &str) -> Armed {
     let state = ArmState {
-        writer_id: writer_id.to_string(),
         parked: Arc::new(AtomicBool::new(false)),
         parked_notify: Arc::new(Notify::new()),
         release: Arc::new(Notify::new()),
@@ -245,12 +258,21 @@ pub fn arm(point: MaterializationPoint, writer_id: &str) -> Armed {
     };
     let handle = Armed {
         point,
+        writer_id: writer_id.to_string(),
         parked: Arc::clone(&state.parked),
         parked_notify: Arc::clone(&state.parked_notify),
         release: Arc::clone(&state.release),
         released: Arc::clone(&state.released),
     };
-    *ARMS[point.index()].lock().expect("test-hook arm lock") = Some(state);
+    let mut map = arms().lock().expect("test-hook arm lock");
+    let key = (point, writer_id.to_string());
+    assert!(
+        !map.contains_key(&key),
+        "test-hook: `{}` already armed for writer `{writer_id}` — release the \
+         earlier `Armed` handle before arming again",
+        point.env_name()
+    );
+    map.insert(key, state);
     handle
 }
 
@@ -295,14 +317,14 @@ impl Armed {
 impl Drop for Armed {
     fn drop(&mut self) {
         self.release();
-        if let Ok(mut slot) = ARMS[self.point.index()].lock() {
-            // Only disarm our own arm, not a newer one on the same point.
-            if slot
-                .as_ref()
-                .is_some_and(|s| Arc::ptr_eq(&s.parked, &self.parked))
-            {
-                *slot = None;
-            }
+        // `arm` panics rather than replacing an occupied `(point, writer_id)`
+        // key, so between our own `arm` call and this `drop` nothing else
+        // could have inserted under our key — whatever is there (if
+        // `maybe_signal_point` has not already removed it) is unambiguously
+        // ours. No ptr-equality check needed, unlike the point-only scheme
+        // this replaced.
+        if let Ok(mut map) = arms().lock() {
+            map.remove(&(self.point, self.writer_id.clone()));
         }
     }
 }
@@ -313,14 +335,12 @@ impl Drop for Armed {
 /// [`READY_FILE_ENV`] (write the ready file and park forever — the SIGKILL
 /// harness; not writer-keyed). Otherwise a single early-returning check.
 pub async fn maybe_signal_point(point: MaterializationPoint, writer_id: &str) {
-    // In-process arm: one-shot — take it only for the writer it was armed for.
+    // In-process arm: one-shot — take it only for the (point, writer) key it
+    // was armed under. A different writer's arm on the same point is simply
+    // not in the map under this key, so it is never matched here.
     let taken = {
-        let mut slot = ARMS[point.index()].lock().expect("test-hook arm lock");
-        if slot.as_ref().is_some_and(|s| s.writer_id == writer_id) {
-            slot.take()
-        } else {
-            None
-        }
+        let mut map = arms().lock().expect("test-hook arm lock");
+        map.remove(&(point, writer_id.to_string()))
     };
     if let Some(state) = taken {
         state.parked.store(true, Ordering::SeqCst);

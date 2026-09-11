@@ -66,15 +66,53 @@ TREE_DIR_FOR_METADATA="${ARGS[2]:-/root/jammi-ai}"
 
 if [ "$VERIFY" = "1" ]; then
   # Reads a `cargo build -v` log from stdin (the caller already ran the
-  # clone's first build); this branch does no cloning of its own.
-  LOG="$(cat)"
-  if printf '%s\n' "$LOG" | grep -Eq '^[[:space:]]*Fresh[[:space:]]+jammi-'; then
+  # clone's first build); this branch does no cloning of its own. The log
+  # goes to a FILE and every grep below reads that file directly, never a
+  # variable piped through `printf | grep -q`: cargo prints `Fresh` units
+  # FIRST, so on a real multi-MB `-v` log a `Fresh jammi-*` match lands near
+  # the front and `grep -q` exits immediately, SIGPIPE-ing `printf` while it
+  # is still writing the rest — under `pipefail` (line 16) that promotes
+  # printf's SIGPIPE status over grep's own successful exit, flipping this
+  # `if` to the "no Fresh unit" branch on a POISONED clone — the portable
+  # trigger is ONE PIPE BUFFER, 64 KiB, not any particular byte count of
+  # "cargo output"; once the stream exceeds that, `printf` can still be
+  # blocked mid-write when `grep -q` exits. A file has no writer to kill.
+  #
+  # This script has no `set -e` (line 43: `-uo pipefail` only, never `-e` —
+  # `--verify`/`--adopt` legitimately want SOME failures to fall through to
+  # their own named checks below), so every step that populates `log_file`
+  # is guarded explicitly, the repo's own idiom (`runpod_lib.sh:279-280`):
+  # an unchecked `mktemp`/`cat` here would leave `log_file` empty or
+  # half-written, and the two greps below would then either error against a
+  # nonexistent path or scan a truncated log — either way silently reading
+  # as "no Fresh line found", reporting the boundary green on evidence the
+  # guard never actually had — the same doctrine
+  # `must never be the same state` (`ci/scripts/check_client_deps.sh:71`)
+  # states for its own empty-stream refusal ("Parsed zero artifacts" and
+  # "no ML dep found" must never be the same state): "could not read the
+  # evidence" must never collapse into "the evidence says clean".
+  log_file="$(mktemp)" \
+    || { echo "::error::could not create a temp file to capture the --verify log — refusing to report the boundary green" >&2; exit 2; }
+  trap 'rm -f "$log_file"' EXIT
+  cat > "$log_file" \
+    || { echo "::error::could not write the --verify log to ${log_file} — refusing to report the boundary green" >&2; exit 2; }
+  grep -Eq '^[[:space:]]*Fresh[[:space:]]+jammi-' "$log_file"
+  grep_rc=$?
+  if [ "$grep_rc" -eq 0 ]; then
     echo "::error::clone verify FAILED — a member unit reported Fresh on its first build (seed poisoned the clone with a member artifact):" >&2
-    printf '%s\n' "$LOG" | grep -E '^[[:space:]]*Fresh[[:space:]]+jammi-' >&2
+    grep -E '^[[:space:]]*Fresh[[:space:]]+jammi-' "$log_file" >&2
     exit 1
+  elif [ "$grep_rc" -eq 1 ]; then
+    echo "clone verify OK — no Fresh jammi-* unit on the clone's first build"
+    exit 0
+  else
+    # grep's own exit 2 (or any other non-0/1 status): a genuine read
+    # failure on `log_file` itself — NEVER "no match found". Conflating
+    # this with exit 1 is exactly the fail-open this guard exists to
+    # refuse.
+    echo "::error::could not read the --verify log at ${log_file} (grep exit ${grep_rc}) — refusing to report the boundary green" >&2
+    exit 2
   fi
-  echo "clone verify OK — no Fresh jammi-* unit on the clone's first build"
-  exit 0
 fi
 
 if [ "$ADOPT" = "1" ]; then

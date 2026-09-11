@@ -326,6 +326,45 @@ ACCOUNTING: list[tuple[str, ExerciseEntry]] = [
         "build_recompute_cache.py", "db.verify_materialization(",
         "20-recompute/recompute.qmd", 'load_artifact("recompute.',
     )),
+    # `refresh_embeddings` / `compact_embeddings` / `expire_versions` are the
+    # versioned-embedding-table incremental-refresh verbs (DELTA, issue
+    # #482) — a distinct model from `recompute` (full re-derivation): a
+    # deletion mask over immutable segments, CAS-published versions,
+    # compaction and expiry horizons. A reviewed, dated gap, not a silent
+    # one — deliberately NOT folded into 20-recompute/recompute.qmd, whose
+    # own contrast (full recompute vs. incremental delta) a bolted-on cell
+    # would blur; tracked as a follow-up chapter (issue filed).
+    ("refresh_embeddings", Deferred(
+        reason=(
+            "no cookbook/book/chapters/*.qmd cell or scripts/build_*_cache.py "
+            "calls Database.refresh_embeddings yet; needs its own chapter "
+            "(edit-one-row and delete-one-key refresh over a versioned table) "
+            "to close — see the filed follow-up issue."
+        ),
+        owner="unassigned",
+        date="2026-09-11",
+    )),
+    ("compact_embeddings", Deferred(
+        reason=(
+            "no cookbook/book/chapters/*.qmd cell or scripts/build_*_cache.py "
+            "calls Database.compact_embeddings yet; needs a chapter cell "
+            "exercising fragment/segment compaction of a versioned table's "
+            "live rows to close — see the filed follow-up issue."
+        ),
+        owner="unassigned",
+        date="2026-09-11",
+    )),
+    ("expire_versions", Deferred(
+        reason=(
+            "no cookbook/book/chapters/*.qmd cell or scripts/build_*_cache.py "
+            "calls Database.expire_versions yet; needs a chapter cell "
+            "exercising old-version GC (reaping unreferenced fragments/"
+            "segments/deletes/manifests) to close — see the filed follow-up "
+            "issue."
+        ),
+        owner="unassigned",
+        date="2026-09-11",
+    )),
     # -- point-in-time -------------------------------------------------------- #
     ("asof_join", DirectCell("19-point-in-time/point-in-time.qmd", "db.asof_join(")),
     # The segmented-ANN producer asks the LIVE engine for the table's segment

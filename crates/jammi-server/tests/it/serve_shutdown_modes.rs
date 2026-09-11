@@ -565,6 +565,32 @@ async fn drain_runs_rpc_drain_and_worker_join_concurrently() {
 /// Acceptance 2: a second signal while draining releases within two
 /// heartbeats — the row `running`/lease NULL/`releases 1` — and a fresh
 /// process's `reclaim + claim_next` claims it at once with `attempts 2`.
+///
+/// R5 (round-2 REFINE, #482): O1 is made DETERMINISTIC by parking the loop
+/// at `ParkPoint::BeforeHold` (the claim→hold prologue, after the claim's
+/// own COMMIT, before the hold is registered) instead of racing a wall
+/// clock against a real training run. Parked there, the loop cannot bail
+/// COOPERATIVELY — the trainer never starts, so it can never reach an
+/// epoch boundary and report `Stopped` — only an unconditional abort can
+/// end it, on EITHER of two arms: DRAIN's `stop_and_join` takes the handle
+/// and suspends on the parked loop's own terminal state; when RELEASE
+/// preempts it, `tokio::select!` drops that suspended future, and
+/// `TakenHandle::drop` restores the handle as `LoopTask::Abandoned` rather
+/// than losing it to a bare detach (the F1 defect this state type closes);
+/// `release_and_stop`'s 2e then finds `Abandoned`, `taken.reclaimed()` is
+/// true, and aborts it unconditionally. Base (`cbd427b4`, prior to the
+/// state-type fix): the same preemption instead loses the handle to a bare
+/// `Option::take()` cancelled mid-await, so 2e's `if let Some(handle) =
+/// self.take_handle()` finds `None` and skips its abort arm entirely — the
+/// parked loop then runs on forever, detached, and its own `LoopState`
+/// never leaves `Running` until this test's bound times out. (The prior
+/// version of this oracle raced a real 20 000-epoch trainer against a
+/// 300 ms `DRAIN`→`RELEASE` gap instead of a park, and — because the
+/// trainer CAN legitimately bail cooperatively at its next epoch boundary
+/// once 2b's keeper pass flips its hold `lost` before any abort lands —
+/// flaked once in 33 paired runs asserting `Aborted` when the relay's own
+/// recorded base run observed `Stopped`; that recorded run is what the
+/// comment above described, not a fabricated narrative.)
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn sigint_while_draining_releases_and_returns_released_within_two_heartbeats() {
     let dir = TempDir::new().unwrap();
@@ -577,33 +603,29 @@ async fn sigint_while_draining_releases_and_returns_released_within_two_heartbea
     )
     .await;
     let job_id = submit_fine_tune(channel(served.flight_addr).await, 20_000).await;
-    wait_status(
-        served.session.catalog(),
+    // Armed immediately after submit returns, before the already-running
+    // loop's NEXT poll tick (bounded below by `[worker] idle_poll_secs`,
+    // default 1 s — the loop is already sleeping out its current tick with
+    // an empty queue, so this always wins the race in practice).
+    let park = jammi_ai::fine_tune::worker::loop_test_hooks::arm(
         &job_id,
-        &JobStatus::Running.to_string(),
-        Duration::from_secs(120),
-    )
-    .await;
+        jammi_ai::fine_tune::worker::loop_test_hooks::ParkPoint::BeforeHold,
+    );
+    tokio::time::timeout(Duration::from_secs(30), park.wait_parked())
+        .await
+        .expect("the loop must reach the claim-to-hold prologue for this job");
     let instance_id = served.session.instance_id().to_string();
 
     served.drain();
+    // Lets DRAIN's `gated_join` actually reach and suspend inside
+    // `stop_and_join`'s `state_rx.wait_for(..)` before RELEASE preempts it
+    // — the exact SIGTERM-then-SIGINT hazard F1 names.
     tokio::time::sleep(Duration::from_millis(300)).await;
     let released_at = tokio::time::Instant::now();
     served.release();
 
-    // O1: this RELEASE preempts the DRAIN's `stop_and_join`, which was
-    // suspended awaiting the in-flight job's own terminal state (D4) — the
-    // exact SIGTERM-then-SIGINT hazard F1 names. Assert on the loop task's
-    // OWN reported termination, never on elapsed wall-clock time alone: a
-    // skipped-abort defect (the handle lost to `stop_and_join`'s cancelled
-    // future) and a genuine abort both return `Released` within the same
-    // few seconds, because 2f's own observation is bounded by a one-
-    // heartbeat timeout regardless of whether anything was actually
-    // aborted — only the loop's own `LoopState` tells them apart. Base
-    // (`cbd427b4`): this call times out, because 2e's `if let Some(handle)
-    // = self.take_handle()` finds `None` (already lost) and never aborts
-    // anything, so the loop runs on forever, detached, and its LoopState
-    // never leaves `Running`.
+    // O1's mechanism assertion: the loop task's OWN reported termination,
+    // never elapsed wall-clock time alone.
     let loop_state = served
         .wait_loop_state_left_running(Duration::from_secs(FAST_TIMING.heartbeat + 3))
         .await;
@@ -730,240 +752,6 @@ async fn release_preempts_a_drain_blocked_on_an_in_flight_unary() {
         "an inline row is never released"
     );
     assert_eq!(row.releases, 0);
-}
-
-// ---------------------------------------------------------------------------
-// K4 / D19 / O3 — the release write is identical on the library and server
-// ---------------------------------------------------------------------------
-
-/// A comparable projection of a released `jobs` row: every `SELECT_COLS`
-/// field the RELEASE mechanism can affect or must leave alone, EXCLUDING
-/// `job_id` and `claimed_by` (a fresh id per fixture by construction),
-/// `spec`/`model_ref`/`output_model_id` (carry the fixture's own temp-dir
-/// paths), and the two timestamps. A struct rather than a tuple — a tuple
-/// past 12 elements has neither `Debug` nor `PartialEq`.
-#[derive(Debug, PartialEq)]
-struct ReleasedRowShape {
-    kind: String,
-    tenant_id: Option<String>,
-    status: String,
-    execution: String,
-    partial_result: Option<String>,
-    result: Option<String>,
-    error: Option<String>,
-    progress_rows_done: Option<i64>,
-    progress_rows_total: Option<i64>,
-    progress_phase: Option<String>,
-    cancel_requested: bool,
-    attempts: u32,
-    releases: u32,
-    // `Some`/`None` only — the exact timestamp differs across fixtures.
-    lease_expires_at: bool,
-    priority: i32,
-    claimable: bool,
-    acceleration_report: Option<String>,
-    parent_id: Option<String>,
-    has_deps: bool,
-}
-
-fn released_row_shape(row: &JobRecord) -> ReleasedRowShape {
-    ReleasedRowShape {
-        kind: row.kind.clone(),
-        tenant_id: row.tenant_id.as_ref().map(|t| t.to_string()),
-        status: row.status.clone(),
-        execution: row.execution.clone(),
-        partial_result: row.partial_result.clone(),
-        result: row.result.clone(),
-        error: row.error.clone(),
-        progress_rows_done: row.progress_rows_done,
-        progress_rows_total: row.progress_rows_total,
-        progress_phase: row.progress_phase.clone(),
-        cancel_requested: row.cancel_requested,
-        attempts: row.attempts,
-        releases: row.releases,
-        lease_expires_at: row.lease_expires_at.is_some(),
-        priority: row.priority,
-        claimable: row.claimable,
-        acceleration_report: row.acceleration_report.clone(),
-        parent_id: row.parent_id.clone(),
-        has_deps: row.has_deps,
-    }
-}
-
-async fn submit_fine_tune_from(ch: Channel, source: &str, epochs: u32) -> String {
-    JobServiceClient::new(ch)
-        .submit_job(SubmitJobRequest {
-            spec: Some(Spec::FineTune(FineTuneSpec {
-                source: source.into(),
-                columns: vec!["text_a".into(), "text_b".into(), "score".into()],
-                method: FineTuneMethod::Lora as i32,
-                task: ModelTask::TextEmbedding as i32,
-            })),
-            base_model: tiny_bert_model_id(),
-            config: Some(FineTuneConfig {
-                epochs: Some(epochs),
-                batch_size: Some(8),
-                lora_rank: Some(4),
-                warmup_steps: Some(0),
-                ..Default::default()
-            }),
-            idempotency_key: String::new(),
-            depends_on: Vec::new(),
-            parent_id: String::new(),
-        })
-        .await
-        .expect("submit_job")
-        .into_inner()
-        .job_id
-}
-
-fn with_catalog(mut cfg: JammiConfig, pg_url: Option<&str>) -> JammiConfig {
-    if let Some(url) = pg_url {
-        cfg.catalog = jammi_db::config::CatalogConfig::Postgres {
-            url: jammi_db::config::Secret::from(url.to_string()),
-            pool_size: 8,
-            max_lifetime_secs: None,
-        };
-    }
-    cfg
-}
-
-/// K4/D19: RELEASE ships on more than one arm — the bare library call
-/// (`EmbeddedWorker::release_and_stop`) and the server's `BoundServer::
-/// serve_with_signals` RELEASE branch, which calls the SAME method — but
-/// nothing ever compared their post-release rows (F2). Runs an identical
-/// fine-tune job to `running` on each: one released through the bare
-/// library call with no server involved, the other through a real server
-/// shutdown (the exact SIGINT-equivalent path), and asserts the resulting
-/// rows agree on every field the RELEASE mechanism touches or leaves
-/// alone. `source_id` is unique per call so the Postgres arm — one shared
-/// database across the whole matrix — never collides with a sibling call.
-/// RED at base: this oracle does not exist anywhere in the tree.
-async fn release_write_is_identical_on_library_and_server_over(pg_url: Option<&str>) {
-    let source = format!("training-{}", uuid::Uuid::new_v4().simple());
-
-    // ----- library arm: no gRPC, no server -----
-    let lib_dir = TempDir::new().unwrap();
-    let lib_session = Arc::new(
-        InferenceSession::new(with_catalog(
-            server_config(lib_dir.path(), FAST_TIMING, true),
-            pg_url,
-        ))
-        .await
-        .unwrap(),
-    );
-    lib_session
-        .add_source(
-            &source,
-            jammi_db::source::SourceType::File,
-            jammi_db::source::SourceConnection {
-                url: Some(fixture_url("training_pairs.csv")),
-                format: Some(jammi_db::source::FileFormat::Csv),
-                ..Default::default()
-            },
-        )
-        .await
-        .unwrap();
-    let lib_spec: jammi_ai::jobs::JobSpec = jammi_ai::fine_tune::spec::TrainingSpec::FineTune {
-        source: source.clone(),
-        columns: vec!["text_a".into(), "text_b".into(), "score".into()],
-        method: jammi_ai::fine_tune::FineTuneMethod::Lora,
-        task: jammi_ai::model::ModelTask::TextEmbedding,
-        common: jammi_ai::fine_tune::spec::TrainingCommon {
-            base_model: tiny_bert_model_id(),
-            config: jammi_ai::fine_tune::FineTuneConfig {
-                epochs: 20_000,
-                batch_size: 8,
-                lora_rank: 4,
-                warmup_steps: 0,
-                ..Default::default()
-            },
-        },
-    }
-    .into();
-    let lib_handle = lib_session.enqueue(lib_spec, 0).await.unwrap();
-    let lib_worker = jammi_ai::fine_tune::worker::EmbeddedWorker::spawn(&lib_session).unwrap();
-    wait_status(
-        lib_session.catalog(),
-        &lib_handle.job_id,
-        &JobStatus::Running.to_string(),
-        Duration::from_secs(120),
-    )
-    .await;
-    lib_worker.release_and_stop().await.unwrap();
-    let lib_row = lib_session
-        .catalog()
-        .get_job(&lib_handle.job_id)
-        .await
-        .unwrap();
-    drop(lib_worker);
-    lib_session.close().await;
-
-    // ----- server arm: the exact SIGINT-equivalent path -----
-    let srv_dir = TempDir::new().unwrap();
-    let served = serve_with_config(with_catalog(
-        server_config(srv_dir.path(), FAST_TIMING, true),
-        pg_url,
-    ))
-    .await;
-    add_source(
-        channel(served.flight_addr).await,
-        &source,
-        "training_pairs.csv",
-        FileFormat::Csv,
-    )
-    .await;
-    let srv_job_id =
-        submit_fine_tune_from(channel(served.flight_addr).await, &source, 20_000).await;
-    wait_status(
-        served.session.catalog(),
-        &srv_job_id,
-        &JobStatus::Running.to_string(),
-        Duration::from_secs(120),
-    )
-    .await;
-    served.release();
-    let outcome = served
-        .finish(Duration::from_secs(2 * FAST_TIMING.heartbeat + 8))
-        .await
-        .unwrap();
-    assert_eq!(outcome, ShutdownOutcome::Released);
-    let srv_row = if let Some(url) = pg_url {
-        // A Postgres-backed session must be re-opened through the SAME
-        // live database, not a fresh on-disk directory.
-        let backend = jammi_db::catalog::backend::BackendImpl::postgres_from_url(url, 8, None)
-            .await
-            .expect("reopen the postgres catalog");
-        Catalog::from_backend(backend)
-            .get_job(&srv_job_id)
-            .await
-            .unwrap()
-    } else {
-        reopen(srv_dir.path())
-            .await
-            .get_job(&srv_job_id)
-            .await
-            .unwrap()
-    };
-
-    assert_eq!(
-        released_row_shape(&lib_row),
-        released_row_shape(&srv_row),
-        "library release: {lib_row:#?}\nserver release: {srv_row:#?}"
-    );
-}
-
-#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn release_write_is_identical_on_library_and_server() {
-    release_write_is_identical_on_library_and_server_over(None).await;
-    if let Some(url) = jammi_test_utils::pg_url_for_tests() {
-        release_write_is_identical_on_library_and_server_over(Some(&url)).await;
-    } else {
-        eprintln!(
-            "skipping the Postgres arm of release_write_is_identical_on_library_and_server: \
-             JAMMI_TEST_PG_URL unset"
-        );
-    }
 }
 
 /// The released server never finalizes the aborted job: after the detached

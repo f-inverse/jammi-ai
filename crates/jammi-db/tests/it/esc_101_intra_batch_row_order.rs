@@ -41,15 +41,6 @@ use jammi_db::trigger::{
 };
 use test_case::test_case;
 
-fn require_live_pg(test_name: &str) {
-    if std::env::var_os("JAMMI_REQUIRE_PG").is_some() {
-        panic!(
-            "{test_name}: JAMMI_REQUIRE_PG is set but JAMMI_TEST_PG_URL is unset -- this lane \
-             must run the real Postgres arm, not skip it"
-        );
-    }
-}
-
 fn topic_schema() -> SchemaRef {
     Arc::new(Schema::new(vec![Field::new("seq", DataType::Int64, false)]))
 }
@@ -69,7 +60,6 @@ async fn intra_batch_row_order_survives_replay(backend: BackendKind) {
         BackendKind::Postgres => {
             let Some(url) = jammi_test_utils::pg_url_for_tests() else {
                 eprintln!("skipping postgres: JAMMI_TEST_PG_URL unset");
-                require_live_pg("intra_batch_row_order_survives_replay");
                 return;
             };
             let pg = PostgresBackend::open_with_options(&url, 8, None)
@@ -204,7 +194,6 @@ async fn intra_batch_row_order_survives_update_churn_on_an_early_row_postgres() 
             "skipping intra_batch_row_order_survives_update_churn_on_an_early_row_postgres: \
              JAMMI_TEST_PG_URL unset"
         );
-        require_live_pg("intra_batch_row_order_survives_update_churn_on_an_early_row_postgres");
         return;
     };
     let pg = PostgresBackend::open_with_options(&url, 8, None)

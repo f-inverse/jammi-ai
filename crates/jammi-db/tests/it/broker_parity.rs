@@ -5,7 +5,8 @@
 //! and [`Arm::JetStream`] (`live-broker-tests`, requiring
 //! `JAMMI_TEST_NATS_URL`; `JAMMI_REQUIRE_NATS` turns an unset URL into a hard
 //! failure rather than a silent skip — the same require-gate shape
-//! `recovery.rs`'s `require_live_pg` uses). Every arm exercises the SAME
+//! `jammi_test_utils::pg_url_for_tests`'s `JAMMI_REQUIRE_PG` gate uses).
+//! Every arm exercises the SAME
 //! engine-facing surface (`Subscriber`/`Publisher`/`TopicRepo`) over a fresh
 //! SQLite catalog, so a passing suite proves the `Subscriber`/`TopicTail`
 //! seam behaves identically regardless of which driver sits underneath it —
@@ -65,15 +66,6 @@ fn require_live_nats(test_name: &str) {
     }
 }
 
-fn require_live_pg(test_name: &str) {
-    if std::env::var_os("JAMMI_REQUIRE_PG").is_some() {
-        panic!(
-            "{test_name}: JAMMI_REQUIRE_PG is set but JAMMI_TEST_PG_URL is unset -- this lane \
-             must run the real Postgres arm, not skip it"
-        );
-    }
-}
-
 /// Driver arm selector.
 #[derive(Clone, Copy)]
 enum Arm {
@@ -101,7 +93,6 @@ async fn broker_for(arm: Arm, test_name: &str) -> Option<Arc<dyn TriggerBroker>>
                 Some(u) => u,
                 None => {
                     eprintln!("skipping {test_name}: JAMMI_TEST_PG_URL unset");
-                    require_live_pg(test_name);
                     return None;
                 }
             };
@@ -799,7 +790,6 @@ async fn every_accepted_type_round_trips_through_live_subscribe(arm: Arm) {
 async fn offset_order_equals_commit_order_two_sessions_one_postgres() {
     let Some(url) = jammi_test_utils::pg_url_for_tests() else {
         eprintln!("skipping offset_order_equals_commit_order_two_sessions_one_postgres: JAMMI_TEST_PG_URL unset");
-        require_live_pg("offset_order_equals_commit_order_two_sessions_one_postgres");
         return;
     };
     let pg = PostgresBackend::open_with_options(&url, 8, None)
@@ -930,7 +920,6 @@ async fn every_accepted_type_round_trips_through_postgres_backing_table() {
             "skipping every_accepted_type_round_trips_through_postgres_backing_table: \
              JAMMI_TEST_PG_URL unset"
         );
-        require_live_pg("every_accepted_type_round_trips_through_postgres_backing_table");
         return;
     };
     let pg = PostgresBackend::open_with_options(&url, 4, None)
@@ -1120,7 +1109,6 @@ async fn kill_broker_listener_backends(url: &str) {
 async fn postgres_listener_killed_recovers_via_replay() {
     let Some(url) = jammi_test_utils::pg_url_for_tests() else {
         eprintln!("skipping postgres_listener_killed_recovers_via_replay: JAMMI_TEST_PG_URL unset");
-        require_live_pg("postgres_listener_killed_recovers_via_replay");
         return;
     };
     let broker: Arc<dyn TriggerBroker> = Arc::new(
@@ -1193,7 +1181,6 @@ async fn postgres_list_consumers_reports_none_until_a_notify_is_seen() {
             "skipping postgres_list_consumers_reports_none_until_a_notify_is_seen: \
              JAMMI_TEST_PG_URL unset"
         );
-        require_live_pg("postgres_list_consumers_reports_none_until_a_notify_is_seen");
         return;
     };
     let broker = PostgresBroker::connect(&url, TEST_IDLE_POLL)
@@ -1258,7 +1245,6 @@ async fn postgres_suppressed_notify_recovers_via_idle_tick() {
         eprintln!(
             "skipping postgres_suppressed_notify_recovers_via_idle_tick: JAMMI_TEST_PG_URL unset"
         );
-        require_live_pg("postgres_suppressed_notify_recovers_via_idle_tick");
         return;
     };
     let concrete = Arc::new(
@@ -1456,8 +1442,8 @@ async fn from_offset_lower_bound_holds_on_first_live_event_with_empty_replay_win
 /// `cursor_before > 0` — must yield exactly the 151 offsets from the wide
 /// group onward.
 ///
-/// Skips (or, under `JAMMI_REQUIRE_PG`, panics) without `JAMMI_TEST_PG_URL`,
-/// the `require_live_pg` shape.
+/// Skips (or, under `JAMMI_REQUIRE_PG`, panics) without `JAMMI_TEST_PG_URL`
+/// — `jammi_test_utils::pg_url_for_tests`'s own require-gate.
 #[tokio::test]
 async fn postgres_backing_multistep_replay_keeps_boundary_group_whole() {
     let Some(url) = jammi_test_utils::pg_url_for_tests() else {
@@ -1465,7 +1451,6 @@ async fn postgres_backing_multistep_replay_keeps_boundary_group_whole() {
             "skipping postgres_backing_multistep_replay_keeps_boundary_group_whole: \
              JAMMI_TEST_PG_URL unset"
         );
-        require_live_pg("postgres_backing_multistep_replay_keeps_boundary_group_whole");
         return;
     };
     let pg = PostgresBackend::open_with_options(&url, 8, None)

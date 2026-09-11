@@ -305,6 +305,7 @@ async fn dropping_the_guard_after_a_cancelled_stop_and_join_aborts_the_task() {
     let worker = spawn_worker(&session);
     let shared = shared_of(&worker);
     wait_in_flight(&shared, 1).await;
+    let threads_before = training_test_hooks::training_threads_finished();
 
     // Cancel `stop_and_join` long before a 20 000-epoch job could possibly
     // finish: its future is dropped while suspended awaiting the loop's
@@ -348,6 +349,23 @@ async fn dropping_the_guard_after_a_cancelled_stop_and_join_aborts_the_task() {
         "Drop must ABORT a handle it reclaims from an abandoned stop attempt, not let it \
          return cooperatively"
     );
+
+    // R8/F7: wait for the abandoned training thread to actually RETURN
+    // before reading the row -- the loop task's own `LoopState` (observed
+    // above) says nothing about the `spawn_blocking` trainer it detached
+    // from; reading the row immediately after the abort would assert "no
+    // detached finalize lands" before the detached thread ever had the
+    // chance to land one, which is vacuous. The same rendezvous is used at
+    // `release_and_stop_leaves_running_with_null_lease_and_no_new_bundle`
+    // in this file for exactly this reason.
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(FAST_TIMING.heartbeat + 120);
+    while training_test_hooks::training_threads_finished() <= threads_before {
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "the abandoned training thread never returned"
+        );
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
 
     let row = session.catalog().get_job(&handle.job_id).await.unwrap();
     assert_eq!(
@@ -829,6 +847,146 @@ async fn run_now_under_release_and_stop_does_not_change_in_flight() {
             .releases,
         0
     );
+}
+
+// ---------------------------------------------------------------------------
+// R3 (round-2 REFINE, #482) -- the pair that actually differs
+// ---------------------------------------------------------------------------
+
+/// The deleted `release_write_is_identical_on_library_and_server` compared
+/// two calls that funnel into the SAME function (`release_and_stop` on both
+/// arms) and so had zero true-positive capacity. The doc's own claim
+/// (`OPS-COMPUTE-TIER-OPERABILITY.md`, "Library") is STATEMENT identity
+/// between `EmbeddedWorker::release_and_stop` (2a-2h) and
+/// `InferenceSession::release_job_leases` (2b+2c) -- the pair that
+/// genuinely differs, since one drives a real loop task through 2a/2d-2h
+/// around the shared 2b/2c core and the other is bare 2b+2c with no loop
+/// at all. Pinned here on their REPORTS, never on row equality (no row
+/// shape is common to both scenarios -- a loop-claimed `queued` job and a
+/// worker-less inline job are not the same row to begin with, which is
+/// exactly what a row-equality oracle got wrong).
+///
+/// Worker-owning arm: `release_and_stop`'s own `ReleaseReport` shows 2b
+/// (the keeper's per-hold release) as the ACTUAL releaser -- `holds_released
+/// == 1` -- so by the time 2c's sweep (`sweep_two`, the final,
+/// unconditional one) runs, the row's lease is already NULL and the sweep
+/// itself matches zero ADDITIONAL rows: `sweep_two.jobs == Some(0)`. This
+/// is the same 2b-before-2c ordering `release_job_leases` uses.
+///
+/// Worker-less arm: an inline `run_now` job's hold is never released by 2b
+/// (`release_job_lease`'s own SQL carries `execution = 'queued'`, which an
+/// inline row never satisfies) and never swept by 2c either (the jobs
+/// sweep's same `execution = 'queued'` guard, and the linked building sweep
+/// which only ranges over `queued` jobs) -- so `release_job_leases` on a
+/// worker-less session with only an inline job in flight is a COMPLETE
+/// no-op: `holds == 0`, `sweep == ReleaseSweep { jobs: Some(0), building:
+/// Some(0) }`, matching the doc's own "no-op by construction" claim.
+/// A second row, claimed by a DIFFERENT instance with a live lease, is
+/// asserted completely untouched -- the call must never reach past its own
+/// instance's rows.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn release_and_stop_report_matches_release_job_leases_on_the_pair_that_actually_differs() {
+    // ----- worker-owning arm: release_and_stop's 2a-2h -----
+    let (owning_session, _owning_dir) = session(FAST_TIMING).await;
+    let owning_handle = owning_session.enqueue(fine_tune(20_000), 0).await.unwrap();
+    let worker = spawn_worker(&owning_session);
+    let shared = shared_of(&worker);
+    wait_in_flight(&shared, 1).await;
+
+    let report = tokio::time::timeout(Duration::from_secs(10), worker.release_and_stop())
+        .await
+        .expect("RELEASE is bounded by two heartbeats")
+        .unwrap();
+    assert_eq!(
+        report.holds_released, 1,
+        "2b's per-hold release is the actual releaser: {report:?}"
+    );
+    assert_eq!(
+        report.sweep_two.jobs,
+        Some(0),
+        "2c's sweep must match zero ADDITIONAL rows once 2b already released the hold: \
+         {report:?}"
+    );
+    let owning_row = owning_session
+        .catalog()
+        .get_job(&owning_handle.job_id)
+        .await
+        .unwrap();
+    assert!(owning_row.lease_expires_at.is_none(), "{owning_row:?}");
+    assert_eq!(owning_row.releases, 1, "{owning_row:?}");
+    owning_session.close().await;
+
+    // ----- worker-less arm: release_job_leases's bare 2b+2c -----
+    let (leases_session, _leases_dir) = session(DEFAULT_TIMING).await;
+    let source = unique_patents(&leases_session).await;
+    let park = compute_test_hooks::arm(&source, compute_test_hooks::ParkPoint::BeforeDispatch);
+    let runner = Arc::clone(&leases_session);
+    let spec = never_dispatched_infer(&source);
+    let run = tokio::spawn(async move { runner.run_now(spec).await });
+    park.wait_parked().await;
+    let inline = leases_session
+        .catalog()
+        .list_jobs(None)
+        .await
+        .unwrap()
+        .into_iter()
+        .find(|j| j.execution == "inline")
+        .expect("the inline row exists while parked");
+    assert!(inline.lease_expires_at.is_some());
+
+    // A row claimed by a DIFFERENT instance -- never touched by this call.
+    let other_handle = leases_session.enqueue(fine_tune(1), 0).await.unwrap();
+    let other_lease = Duration::from_secs(3600);
+    let other_claimed = leases_session
+        .catalog()
+        .claim_next("a-different-instance", &["fine_tune"], other_lease)
+        .await
+        .unwrap()
+        .expect("claimed by a different instance");
+    assert_ne!(
+        other_claimed.claimed_by,
+        Some(leases_session.instance_id().to_string())
+    );
+
+    let (holds, sweep) = leases_session.release_job_leases().await.unwrap();
+    assert_eq!(holds, 0, "an inline hold is never released by 2b");
+    assert_eq!(
+        sweep.jobs,
+        Some(0),
+        "the inline row is never swept: {sweep:?}"
+    );
+    assert_eq!(sweep.building, Some(0), "{sweep:?}");
+
+    let inline_after = leases_session
+        .catalog()
+        .get_job(&inline.job_id)
+        .await
+        .unwrap();
+    assert!(
+        inline_after.lease_expires_at.is_some(),
+        "the inline row's lease stays live"
+    );
+    assert_eq!(inline_after.releases, 0);
+
+    let other_after = leases_session
+        .catalog()
+        .get_job(&other_handle.job_id)
+        .await
+        .unwrap();
+    assert_eq!(
+        other_after.lease_expires_at, other_claimed.lease_expires_at,
+        "a different instance's live lease must be untouched: {other_after:?}"
+    );
+    assert_eq!(other_after.releases, 0, "{other_after:?}");
+    assert_eq!(
+        other_after.claimed_by,
+        Some("a-different-instance".to_string()),
+        "{other_after:?}"
+    );
+
+    park.release();
+    let _ = run.await.unwrap();
+    leases_session.close().await;
 }
 
 /// R5(d)'s sibling: an inline `run_now` materialization (its `ResultTable`

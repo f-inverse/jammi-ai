@@ -22,7 +22,6 @@ Hermetic: the local `tiny_bert` fixture + `training_pairs.csv`, on CPU.
 from __future__ import annotations
 
 import inspect
-import json
 import sqlite3
 import subprocess
 import sys
@@ -58,35 +57,40 @@ pytestmark = pytest.mark.skipif(
 # released row is reclaimed by `reclaim_expired_jobs`' arm 1a, which resets
 # `acceleration_report` to the `"pending"` marker for the NEW attempt before
 # `claim_next` claims it (`crates/jammi-db/src/catalog/jobs_repo.rs`, the
-# comment beside `ACCELERATION_REPORT_PENDING` in arm 1a) -- so a report that
-# both DIFFERS from the value read before this successor started AND is no
-# longer `"pending"` can only be this successor's own fresh probe for its own
-# new attempt, never a stale read of the original attempt's row.
+# comment beside `ACCELERATION_REPORT_PENDING` in arm 1a). R7: the reliable
+# key is the successor's OWN attempt number, read absolutely rather than
+# differentially against a snapshot — `record_acceleration_report`'s guard
+# pins `attempts = $6` (`jobs_repo.rs`), so once THIS successor's reclaim
+# bumps `attempts` a differing (predecessor's, or the pending marker's own)
+# write matches zero rows, and the successor's own payload carries its own
+# `"attempt"` (`build_acceleration_report_json`, `worker.rs`). A snapshot
+# taken before the predecessor's own probe landed -- the prior key -- could
+# be satisfied by that late write instead of this successor's, since the
+# pending marker (`ACCELERATION_REPORT_PENDING`) carries no `attempt` field
+# to compare against at all.
 _RELEASING_SUCCESSOR = textwrap.dedent(
     """
-    import json
     import sys
     import time
 
     import jammi_native
 
-    artifact_dir, job_id, original_report_json = sys.argv[1], sys.argv[2], sys.argv[3]
-    original_report = json.loads(original_report_json)
+    artifact_dir, job_id, expected_attempt = sys.argv[1], sys.argv[2], int(sys.argv[3])
 
     db = jammi_native.open_local(artifact_dir=artifact_dir)
     try:
         job = db.job(job_id)
         deadline = time.monotonic() + 60
-        report = original_report
+        report = None
         while time.monotonic() < deadline:
             report = job.acceleration_report()
-            if report != original_report and (report or {}).get("state") != "pending":
+            if (report or {}).get("attempt") == expected_attempt:
                 break
             time.sleep(0.05)
         else:
             raise AssertionError(
-                "this worker never claimed and re-probed the released job "
-                f"(acceleration_report stayed {report!r})"
+                f"this worker never claimed and re-probed the released job at its "
+                f"own attempt {expected_attempt} (acceleration_report stayed {report!r})"
             )
     finally:
         db.close(release=True)
@@ -138,10 +142,6 @@ def test_close_release_true_leaves_the_job_claimable(
     )
     job_id = job.job_id
     _wait_running(job)
-    # Read BEFORE close(): the successor subprocess needs this attempt's
-    # value to detect its own fresh claim (see `_RELEASING_SUCCESSOR`'s
-    # doc); every verb on `job`/`db` raises once this connection closes.
-    original_report = job.acceleration_report()
 
     started = time.monotonic()
     db.close(release=True)
@@ -160,7 +160,9 @@ def test_close_release_true_leaves_the_job_claimable(
     db.close(release=True)
     db.close()
 
-    # A successor process claims it within one idle poll and releases again.
+    # A successor process claims it within one idle poll and releases again;
+    # `attempts + 1` (R7) is the expected attempt number ITS OWN claim (and
+    # the acceleration probe it runs under that claim) will carry.
     proc = subprocess.run(
         [
             sys.executable,
@@ -168,7 +170,7 @@ def test_close_release_true_leaves_the_job_claimable(
             _RELEASING_SUCCESSOR,
             str(tmp_path),
             job_id,
-            json.dumps(original_report),
+            str(attempts + 1),
         ],
         capture_output=True,
         text=True,

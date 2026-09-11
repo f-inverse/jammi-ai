@@ -191,6 +191,22 @@ async fn serve(args: ServeArgs) -> ExitCode {
             tracing::info!("OSS server released its leases; exiting now");
             std::process::exit(0)
         }
+        Ok(ShutdownOutcome::ReleaseDegraded) => {
+            // R6: a degraded release still exits the process at once, exactly
+            // like `Released` — the earlier release-side error was already
+            // logged where it happened (`runtime::release_outcome`), and
+            // mapping it to `ExitCode::FAILURE` instead would return through
+            // the normal path below, waiting on the tokio runtime drop for
+            // the same detached training thread `Released` above exists to
+            // never wait for; that would turn a degraded release (its
+            // affected lease falls to the expiry path, recovered within one
+            // lease window) into a SIGKILL past the grace period.
+            tracing::warn!(
+                "OSS server RELEASE could not confirm every lease was handed back; \
+                 exiting now regardless"
+            );
+            std::process::exit(0)
+        }
         Err(e) => {
             tracing::error!(error = %e, "OSS server exited with error");
             ExitCode::FAILURE

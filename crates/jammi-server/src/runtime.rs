@@ -717,10 +717,101 @@ pub enum ShutdownOutcome {
         /// `false` on a worker-less process.
         worker_joined: bool,
     },
-    /// RELEASE completed: every lease this process held was handed back and
-    /// the loop stopped; `main` exits the process at once (a detached
+    /// RELEASE completed and its evidence CONFIRMS every held lease was
+    /// handed back: the release call returned `Ok` and its authoritative
+    /// sweep's `jobs`/`building` fields both read `Some` (see
+    /// [`release_outcome`]). `main` exits the process at once (a detached
     /// training thread may still be running).
     Released,
+    /// RELEASE was attempted but its own evidence does NOT confirm every
+    /// held lease was handed back — the release call itself errored, or
+    /// one of its sweep statements did (`jammi_ai::fine_tune::worker::
+    /// ReleaseSweep::jobs`/`building` read `None`, a swallowed statement
+    /// failure, never fabricated into a claim of success). The affected
+    /// lease(s) fall to the expiry path instead of being handed back, so a
+    /// successor reclaims them within one lease window rather than one
+    /// idle poll. `main` still exits the process at once, exactly like
+    /// [`Self::Released`] — R6: an `Err` here must never propagate through
+    /// the normal return path, which would hang on a detached trainer past
+    /// its grace period and turn a degraded release into a kill.
+    ReleaseDegraded,
+}
+
+/// Whether a [`jammi_ai::fine_tune::worker::ReleaseSweep`]'s own evidence
+/// supports believing its two RELEASE statements actually ran: `jobs` and
+/// `building` both `Some`, never a swallowed statement error read back as
+/// `None` (`release_sweep`'s own doc — a failed statement is logged and
+/// folded into `Ok(None)`, never an `Err`, so `None` is the only signal
+/// left that it failed).
+fn sweep_confirms_release(sweep: &jammi_ai::fine_tune::worker::ReleaseSweep) -> bool {
+    sweep.jobs.is_some() && sweep.building.is_some()
+}
+
+/// One RELEASE call's raw result, from either surface that can issue it —
+/// the input to [`release_outcome`].
+enum ReleaseAttempt {
+    /// `EmbeddedWorker::release_and_stop`: two sweeps (2c, 2g); the FINAL
+    /// one (2g, unconditional, idempotent, run after the loop has stopped)
+    /// is the authoritative word on what actually got released, so it is
+    /// what evidence is read from — sweep #1 can legitimately read `None`
+    /// on a transient race and still have the release land via #2.
+    Worker(Result<jammi_ai::fine_tune::worker::ReleaseReport, jammi_db::error::JammiError>),
+    /// `InferenceSession::release_job_leases`: the worker-less peer, one
+    /// sweep.
+    SessionOnly(
+        Result<(usize, jammi_ai::fine_tune::worker::ReleaseSweep), jammi_db::error::JammiError>,
+    ),
+}
+
+/// R6's ONE outcome-evidence helper: the preload-exit early return and the
+/// main RELEASE arm both call this rather than each constructing
+/// [`ShutdownOutcome::Released`] merely from "the RELEASE signal fired".
+/// Logs the call's own report (unchanged from the pre-existing per-arm
+/// logging) and returns [`ShutdownOutcome::Released`] only when the call
+/// succeeded AND [`sweep_confirms_release`] on its authoritative sweep;
+/// [`ShutdownOutcome::ReleaseDegraded`] otherwise. Never panics and never
+/// itself surfaces an `Err` — a degraded release is a value, not a
+/// propagated failure (see [`ShutdownOutcome::ReleaseDegraded`]'s doc).
+fn release_outcome(attempt: ReleaseAttempt) -> ShutdownOutcome {
+    match attempt {
+        ReleaseAttempt::Worker(Ok(report)) => {
+            tracing::info!(
+                ?report.loop_state,
+                holds_released = report.holds_released,
+                ?report.sweep_one,
+                ?report.sweep_two,
+                "RELEASE: leases handed back; the loop is stopped"
+            );
+            if sweep_confirms_release(&report.sweep_two) {
+                ShutdownOutcome::Released
+            } else {
+                ShutdownOutcome::ReleaseDegraded
+            }
+        }
+        ReleaseAttempt::Worker(Err(e)) => {
+            tracing::error!(error = %e, "RELEASE: the worker release failed");
+            ShutdownOutcome::ReleaseDegraded
+        }
+        ReleaseAttempt::SessionOnly(Ok((holds, sweep))) => {
+            tracing::info!(
+                holds_released = holds,
+                ?sweep,
+                "RELEASE on a worker-less process: nothing loop-claimed to release"
+            );
+            if sweep_confirms_release(&sweep) {
+                ShutdownOutcome::Released
+            } else {
+                ShutdownOutcome::ReleaseDegraded
+            }
+        }
+        ReleaseAttempt::SessionOnly(Err(e)) => {
+            tracing::error!(
+                error = %e,
+                "RELEASE on a worker-less process: releasing leases failed"
+            );
+            ShutdownOutcome::ReleaseDegraded
+        }
+    }
 }
 
 impl BoundServer {
@@ -886,43 +977,70 @@ impl BoundServer {
                 _ = drain_wait.wait_for(|v| *v) => None,
                 _ = release_wait.wait_for(|v| *v) => None,
             };
-            let early: Option<Result<ShutdownOutcome, ServerError>> = match outcome {
+            let preempted: Option<Result<(), ServerError>> = match outcome {
                 Some(Ok(())) => None,
                 Some(Err(e)) => Some(Err(e)),
-                None => Some(Ok(if *release_rx.borrow() {
-                    ShutdownOutcome::Released
-                } else {
-                    ShutdownOutcome::Drained {
-                        worker_joined: worker.is_some(),
-                    }
-                })),
+                None => Some(Ok(())),
             };
-            if let Some(early) = early {
+            if let Some(preempted) = preempted {
                 readiness.begin_drain();
-                // W2: `ShutdownOutcome::Released` is only honest coming from
-                // a path that actually issued the release statements — the
-                // gate was closed throughout preload so nothing was ever
-                // claimed, but the outcome still must reflect what this arm
-                // DID, not merely which signal fired.
-                let is_release = matches!(early, Ok(ShutdownOutcome::Released));
-                if let Some(w) = worker.as_ref() {
-                    // The gate is closed, so the loop returns without a
-                    // claim; the join (or release) orders the row's delete
-                    // after the task's own upsert.
-                    if is_release {
-                        if let Err(e) = w.release_and_stop().await {
-                            tracing::error!(error = %e, "preload exit: the worker release failed");
+                // W2/R6: the outcome must reflect what THIS arm actually
+                // DID, never merely which signal fired. On EITHER exit — a
+                // signal preempting the preload, or the preload itself
+                // erroring — the worker is still stopped and joined (its
+                // row deleted) before the session closes; a preload `Err`
+                // is never a release (`is_release` is `false` on it), so
+                // that arm always joins, never releases. The computed
+                // `outcome` is discarded on the `Err` arm below — only the
+                // join's SIDE EFFECT (the row delete) matters there — and
+                // is constructed only from its own evidence
+                // ([`release_outcome`]) on the `Ok` arm.
+                let is_release = matches!(preempted, Ok(())) && *release_rx.borrow();
+                let outcome = if is_release {
+                    match worker.as_ref() {
+                        Some(w) => {
+                            release_outcome(ReleaseAttempt::Worker(w.release_and_stop().await))
                         }
-                    } else if let Err(e) = w.stop_and_join().await {
-                        tracing::error!(error = %e, "preload exit: the worker join failed");
+                        None => release_outcome(ReleaseAttempt::SessionOnly(
+                            session.release_job_leases().await,
+                        )),
                     }
-                } else if is_release {
-                    if let Err(e) = session.release_job_leases().await {
-                        tracing::error!(error = %e, "preload exit: releasing this worker-less process's leases failed");
-                    }
-                }
+                } else {
+                    // The gate is closed, so the loop returns without a
+                    // claim; the join orders the row's delete after the
+                    // task's own upsert. `worker_joined` is the call's own
+                    // `StopOutcome` (F4b), never `worker.is_some()` — that
+                    // would read `true` even when the join itself errored
+                    // or found nothing left to join.
+                    let worker_joined = match worker.as_ref() {
+                        Some(w) => match w.stop_and_join().await {
+                            Ok(jammi_ai::fine_tune::worker::StopOutcome::Joined) => true,
+                            Ok(jammi_ai::fine_tune::worker::StopOutcome::NothingToJoin) => false,
+                            Err(e) => {
+                                tracing::error!(error = %e, "preload exit: the worker join failed");
+                                false
+                            }
+                        },
+                        None => false,
+                    };
+                    ShutdownOutcome::Drained { worker_joined }
+                };
+                let early: Result<ShutdownOutcome, ServerError> = match preempted {
+                    Err(e) => Err(e),
+                    Ok(()) => Ok(outcome),
+                };
+                // R6: the tail this early return shares with the main one —
+                // health side-channel, then the PEER listener (previously
+                // skipped here entirely: dropping the sender starts its
+                // graceful shutdown but nothing established it finished
+                // before the session closed — the same divergence class as
+                // the outcome itself), then the session and OTLP.
                 let _ = health_stop_tx.send(());
                 let _ = health_task.await;
+                let _ = peer_stop_tx.send(());
+                if let Some(task) = peer_task {
+                    let _ = task.await;
+                }
                 session.close().await;
                 crate::telemetry::flush_otlp();
                 return early;
@@ -985,30 +1103,22 @@ impl BoundServer {
             Arm::Release => {
                 // Step 1 already happened: `select!` dropped the drain
                 // sequence, and with it the gRPC serve future — connections
-                // severed. Step 2: the one release mechanism.
+                // severed. Step 2: the one release mechanism, whose outcome
+                // is constructed only from its own evidence (R6:
+                // [`release_outcome`]) — never surfaced as an `Err` here: a
+                // degraded release still exits the process at once, exactly
+                // like a confirmed one (see [`ShutdownOutcome::
+                // ReleaseDegraded`]'s doc for why propagating it as an `Err`
+                // would instead hang on a detached trainer past the grace
+                // period).
                 readiness.begin_drain();
-                let released = match worker.as_ref() {
-                    Some(w) => w.release_and_stop().await.map(|report| {
-                        tracing::info!(
-                            ?report.loop_state,
-                            holds_released = report.holds_released,
-                            ?report.sweep_one,
-                            ?report.sweep_two,
-                            "RELEASE: leases handed back; the loop is stopped"
-                        );
-                    }),
-                    None => session.release_job_leases().await.map(|(holds, sweep)| {
-                        tracing::info!(
-                            holds_released = holds,
-                            ?sweep,
-                            "RELEASE on a worker-less process: nothing loop-claimed to release"
-                        );
-                    }),
+                let outcome = match worker.as_ref() {
+                    Some(w) => release_outcome(ReleaseAttempt::Worker(w.release_and_stop().await)),
+                    None => release_outcome(ReleaseAttempt::SessionOnly(
+                        session.release_job_leases().await,
+                    )),
                 };
-                (
-                    released.map_err(ServerError::from),
-                    ShutdownOutcome::Released,
-                )
+                (Ok(()), outcome)
             }
         };
 

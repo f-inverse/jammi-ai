@@ -1066,18 +1066,6 @@ async fn concurrent_migrate_on_fresh_sqlite_is_safe() {
     b.close().await;
 }
 
-/// Require-gate (KO-7) mirroring `recovery.rs`: an unset `JAMMI_TEST_PG_URL`
-/// silently skips the Postgres arm by default, but a lane that sets
-/// `JAMMI_REQUIRE_PG` must run it, so the skip becomes a loud failure there.
-fn require_live_pg(test_name: &str) {
-    if std::env::var_os("JAMMI_REQUIRE_PG").is_some() {
-        panic!(
-            "{test_name}: JAMMI_REQUIRE_PG is set but JAMMI_TEST_PG_URL is unset -- this lane \
-             must run the real Postgres arm, not skip it"
-        );
-    }
-}
-
 /// Env var that arms the migration runner's ledger-read rendezvous; the
 /// runner's hook reads the same name (`test_hook::MIGRATION_LEDGER_BARRIER_ENV`).
 #[cfg(all(feature = "live-postgres-tests", feature = "test-hooks"))]
@@ -1137,7 +1125,6 @@ async fn concurrent_migrate_on_fresh_postgres_is_safe() {
 
     const TEST_NAME: &str = "concurrent_migrate_on_fresh_postgres_is_safe";
     let Some(admin_url) = pg_url_for_tests() else {
-        require_live_pg(TEST_NAME);
         return;
     };
 
@@ -1411,7 +1398,6 @@ async fn migration_032_creates_result_table_versions(
         }
         BackendKind::Postgres => {
             let Some(url) = jammi_test_utils::pg_url_for_tests() else {
-                require_live_pg("migration_032_creates_result_table_versions");
                 eprintln!("skipping postgres: JAMMI_TEST_PG_URL unset");
                 return;
             };

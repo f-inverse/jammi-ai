@@ -2566,6 +2566,113 @@ async fn released_job_is_requeued_by_the_next_reclaim_without_waiting_for_expiry
     assert_eq!(untouched.releases, 0);
 }
 
+/// R2 (round-2 REFINE, #482): the release write's own per-arm effect,
+/// pinned as a before/after DELTA rather than a cross-arm row-equality
+/// claim (the deleted `release_write_is_identical_on_library_and_server`
+/// had zero true-positive capacity — both its arms funnelled into the
+/// SAME `release_and_stop` call, and the design's own outcome (iii)
+/// permits the two rows it compared to differ). `release_job_lease`'s SQL
+/// (`jobs_repo.rs`) sets exactly three columns —
+/// `lease_expires_at = NULL, releases = releases + 1, updated_at = $now`
+/// — so this asserts that delta EXACTLY: every other `JobRecord` field is
+/// byte-identical across the snapshot taken immediately before the
+/// release and the one taken immediately after, field by field (a struct
+/// comparison would need `PartialEq` on `JobRecord`, which this crate
+/// does not derive — asserting field-by-field is also the more legible
+/// failure on a mismatch). A second row, claimed by a DIFFERENT instance,
+/// is asserted completely untouched (not merely its `releases`/lease) —
+/// the release write must never touch a row it was not asked to release.
+#[test_case(BackendKind::Sqlite ; "sqlite")]
+#[cfg_attr(
+    feature = "live-postgres-tests",
+    test_case(BackendKind::Postgres ; "postgres")
+)]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn release_job_lease_write_is_exactly_lease_null_releases_plus_one_and_timestamp(
+    backend: BackendKind,
+) {
+    let dir = tempdir().unwrap();
+    let (_session, catalog) = queue_catalog!(backend, dir.path());
+    let lease = Duration::from_secs(3600);
+
+    catalog.submit_job(job_params("delta")).await.unwrap();
+    catalog.submit_job(job_params("other-owner")).await.unwrap();
+    catalog
+        .claim_next("me", KINDS, lease)
+        .await
+        .unwrap()
+        .expect("the first job claimed by `me`");
+    let other = catalog
+        .claim_next("someone-else", KINDS, lease)
+        .await
+        .unwrap()
+        .expect("the second job claimed by a DIFFERENT instance");
+    assert_eq!(other.job_id, "other-owner");
+    let other_before = catalog.get_job("other-owner").await.unwrap();
+
+    // A timestamp column stored with second-or-finer resolution needs a
+    // strictly later `now` to observe as "bumped" on some backends — a
+    // fixed sleep here is not a race (this crate's own timestamp fixtures,
+    // e.g. `claim_returns_oldest_queued_job_first` above, do the same).
+    tokio::time::sleep(Duration::from_millis(1100)).await;
+
+    let before = catalog.get_job("delta").await.unwrap();
+    assert!(before.lease_expires_at.is_some(), "a fresh claim is leased");
+    let released = catalog.release_job_lease("delta", "me", 1).await.unwrap();
+    assert!(released, "the owner releases its own live lease");
+    let after = catalog.get_job("delta").await.unwrap();
+
+    // The three-field delta, exactly.
+    assert!(after.lease_expires_at.is_none(), "{after:?}");
+    assert_eq!(after.releases, before.releases + 1, "{after:?}");
+    assert!(
+        after.updated_at > before.updated_at,
+        "updated_at must be bumped: before {:?}, after {:?}",
+        before.updated_at,
+        after.updated_at
+    );
+
+    // Every OTHER field byte-identical -- field by field (`JobRecord`
+    // derives no `PartialEq`).
+    assert_eq!(after.job_id, before.job_id);
+    assert_eq!(after.kind, before.kind);
+    assert_eq!(after.tenant_id, before.tenant_id);
+    assert_eq!(after.status, before.status);
+    assert_eq!(after.execution, before.execution);
+    assert_eq!(after.spec, before.spec);
+    assert_eq!(after.partial_result, before.partial_result);
+    assert_eq!(after.result, before.result);
+    assert_eq!(after.error, before.error);
+    assert_eq!(after.progress_rows_done, before.progress_rows_done);
+    assert_eq!(after.progress_rows_total, before.progress_rows_total);
+    assert_eq!(after.progress_phase, before.progress_phase);
+    assert_eq!(after.cancel_requested, before.cancel_requested);
+    assert_eq!(after.model_ref, before.model_ref);
+    assert_eq!(after.output_model_id, before.output_model_id);
+    assert_eq!(after.model_source, before.model_source);
+    assert_eq!(after.claimed_by, before.claimed_by);
+    assert_eq!(
+        after.attempts, before.attempts,
+        "release never touches attempts"
+    );
+    assert_eq!(after.priority, before.priority);
+    assert_eq!(after.claimable, before.claimable);
+    assert_eq!(after.acceleration_report, before.acceleration_report);
+    assert_eq!(after.parent_id, before.parent_id);
+    assert_eq!(after.has_deps, before.has_deps);
+    assert_eq!(after.created_at, before.created_at);
+
+    // A row claimed by a DIFFERENT instance: completely untouched, not
+    // merely its lease/`releases`.
+    let other_after = catalog.get_job("other-owner").await.unwrap();
+    assert_eq!(other_after.lease_expires_at, other_before.lease_expires_at);
+    assert_eq!(other_after.releases, other_before.releases);
+    assert_eq!(other_after.updated_at, other_before.updated_at);
+    assert_eq!(other_after.claimed_by, other_before.claimed_by);
+    assert_eq!(other_after.attempts, other_before.attempts);
+    assert_eq!(other_after.status, other_before.status);
+}
+
 /// The reclaim cap compares `attempts - releases` against `MAX_ATTEMPTS`
 /// (3): a deploy storm of three releases leaves the job claimable at
 /// `attempts 4, releases 3`; three genuine expiries fail it; 3 claims / 2

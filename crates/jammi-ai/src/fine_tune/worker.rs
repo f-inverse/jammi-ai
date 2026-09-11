@@ -2204,13 +2204,19 @@ impl<'a> Drop for TakenHandle<'a> {
 ///   from the guard's lifetime. After either graceful path, or a reclaimed
 ///   `Abandoned` handle, `Drop` aborts it (or finds `Joined` and no-ops).
 pub struct EmbeddedWorker {
-    /// [`LoopTask::Joined`] once [`Self::stop_and_join`] or
-    /// [`Self::release_and_stop`] has fully disposed of the handle — the
-    /// state `Drop` checks to skip its own abort. Guarded by a `Mutex`
-    /// rather than consuming `self` because both take `&self`: the owning
-    /// `Database` binding wants to signal-and-await without giving up the
-    /// guard itself (its `Drop` must still run at the connection's own end
-    /// of life).
+    /// [`LoopTask::Joined`] whenever nothing is available to take: either
+    /// [`Self::stop_and_join`] or [`Self::release_and_stop`] has fully
+    /// disposed of the handle, OR one of them is CURRENTLY holding it
+    /// inside a live [`TakenHandle`] — [`TakenHandle::take`] writes `Joined`
+    /// provisionally for the whole take window, before the handle is
+    /// joined, aborted, or (if the taker's own future is itself cancelled
+    /// first) restored as `Abandoned`. So `Joined` alone does not mean the
+    /// handle has been fully disposed of; it means this slot has nothing
+    /// left to hand out to a concurrent caller. `Drop` reads it to skip its
+    /// own abort. Guarded by a `Mutex` rather than consuming `self` because
+    /// both take `&self`: the owning `Database` binding wants to
+    /// signal-and-await without giving up the guard itself (its `Drop` must
+    /// still run at the connection's own end of life).
     handle: std::sync::Mutex<LoopTask>,
     /// The state shared with the loop task: phase, stop, in-flight count,
     /// loop state.

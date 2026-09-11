@@ -19,13 +19,36 @@ pub use jammi_db::store::schema::embedding_batch_with_null_hash;
 /// runs can leave it unset.
 pub const PG_URL_ENV: &str = "JAMMI_TEST_PG_URL";
 
+/// Env var that upgrades an unset [`PG_URL_ENV`] from a silent skip into a
+/// loud `panic!`: a lane that wants the real Postgres arm to actually run
+/// sets this so it can never silently not run.
+pub const REQUIRE_PG_ENV: &str = "JAMMI_REQUIRE_PG";
+
 /// Return the configured Postgres URL when both `JAMMI_TEST_PG_URL` is set
 /// and the value is non-empty. Tests that need a live Postgres backend call
 /// this to decide whether to skip (without `#[ignore]`, which CLAUDE.md
-/// forbids — instead they early-return with a `tracing::warn` so CI logs
-/// surface the skip).
+/// forbids — instead they early-return with a `tracing::warn`/`eprintln!` so
+/// CI logs surface the skip).
+///
+/// R4 (#482): the require-gate is FOLDED IN HERE rather than left as a
+/// per-caller opt-in — `JAMMI_REQUIRE_PG` set with the URL unset panics
+/// before this can ever return `None`, so a lane that needs the real
+/// Postgres arm to run cannot obtain "skip" out of this accessor at all.
+/// This used to be twelve independent copy-pasted `fn require_live_pg`
+/// definitions across `jammi-db`'s and `jammi-server`'s test suites, none of
+/// them beside the accessor they guarded — a guard a caller could only get
+/// by remembering to also call it. Folding it into the ONE function that
+/// produces the URL means every existing and every future caller is gated
+/// for free, with no second call to remember.
 pub fn pg_url_for_tests() -> Option<String> {
-    std::env::var(PG_URL_ENV).ok().filter(|s| !s.is_empty())
+    let url = std::env::var(PG_URL_ENV).ok().filter(|s| !s.is_empty());
+    if url.is_none() && std::env::var_os(REQUIRE_PG_ENV).is_some() {
+        panic!(
+            "{REQUIRE_PG_ENV} is set but {PG_URL_ENV} is unset -- this lane must run the \
+             real Postgres arm, not skip it"
+        );
+    }
+    url
 }
 
 /// Build a [`JammiSession`] backed by `kind` for parameterized integration

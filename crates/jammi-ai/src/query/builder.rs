@@ -284,11 +284,11 @@ impl QueryBuilder {
         let stream = self
             .plan
             .execute(0, task_ctx)
-            .map_err(|e| JammiError::Other(format!("Search execute: {e}")))?;
+            .map_err(|e| plan_error("Search execute", e))?;
         let batches: Vec<RecordBatch> = stream
             .try_collect()
             .await
-            .map_err(|e| JammiError::Other(format!("Search collect: {e}")))?;
+            .map_err(|e| plan_error("Search collect", e))?;
 
         let inference = ChannelId::new("inference")?;
         let retrieved: Vec<ChannelId> = self
@@ -444,4 +444,55 @@ fn drop_column(
     let projection = ProjectionExec::try_new(exprs, plan)
         .map_err(|e| JammiError::Other(format!("drop_column projection: {e}")))?;
     Ok(Arc::new(projection))
+}
+
+/// The engine error a plan raised, recovered across the DataFusion boundary.
+///
+/// A plan leaf (the ANN search leaf) boxes its `JammiError` into
+/// [`DataFusionError::External`] — possibly under a `Context` wrapper, and
+/// handed through the stream machinery as a `Shared(Arc<_>)` — so the typed
+/// variant is unwrapped here rather than flattened into a string: a typed
+/// refusal such as [`JammiError::Unavailable`] keeps its variant (and its
+/// gRPC code) across `Search`. Any other DataFusion error keeps the
+/// `"{stage}: {error}"` text it always had.
+fn plan_error(stage: &str, e: datafusion::error::DataFusionError) -> JammiError {
+    use datafusion::error::DataFusionError;
+    match e {
+        DataFusionError::External(boxed) => match boxed.downcast::<JammiError>() {
+            Ok(engine) => *engine,
+            Err(other) => {
+                JammiError::Other(format!("{stage}: {}", DataFusionError::External(other)))
+            }
+        },
+        DataFusionError::Context(_, inner) => plan_error(stage, *inner),
+        DataFusionError::Shared(arc) => match Arc::try_unwrap(arc) {
+            Ok(inner) => plan_error(stage, inner),
+            // Still shared elsewhere: the one typed refusal this seam must
+            // carry is rebuilt by reference; everything else keeps the text.
+            Err(arc) => match unavailable_by_ref(&arc) {
+                Some(engine) => engine,
+                None => JammiError::Other(format!("{stage}: {arc}")),
+            },
+        },
+        other => JammiError::Other(format!("{stage}: {other}")),
+    }
+}
+
+/// Rebuild a [`JammiError::Unavailable`] found anywhere under `e` (through
+/// `Context` / `Shared` wrappers) — `JammiError` is not `Clone`, so this is
+/// the one variant reconstructed from a borrowed error.
+fn unavailable_by_ref(e: &datafusion::error::DataFusionError) -> Option<JammiError> {
+    use datafusion::error::DataFusionError;
+    match e {
+        DataFusionError::External(boxed) => match boxed.downcast_ref::<JammiError>() {
+            Some(JammiError::Unavailable { resource, reason }) => Some(JammiError::Unavailable {
+                resource: resource.clone(),
+                reason: reason.clone(),
+            }),
+            _ => None,
+        },
+        DataFusionError::Context(_, inner) => unavailable_by_ref(inner),
+        DataFusionError::Shared(arc) => unavailable_by_ref(arc),
+        _ => None,
+    }
 }

@@ -16,11 +16,16 @@
 //! remote source cannot reach a sync path by construction — there is no
 //! `SegmentedIndex` that contains a `Remote` source.
 
+use std::sync::atomic::Ordering;
 use std::sync::Arc;
 
 use crate::config::{AnnIndexConfig, StoragePrecision};
 use crate::error::{JammiError, Result};
-use crate::index::peer::{PeerAddr, PeerFailureCounters, PeerTransport};
+use crate::index::peer::{
+    ExactRescoreRequest, PeerAddr, PeerError, PeerFailureCounters, PeerFailureReason,
+    PeerTransport, SegmentSearchPhase, SegmentSearchRequest, PEER_RPC_DEADLINE,
+};
+use crate::index::segment::{merge, over_fetch, rescore, search_unit};
 use crate::index::sidecar::SidecarIndex;
 use crate::index::{SegmentId, SegmentedIndex, VectorIndex};
 use crate::storage::index_cache::SegmentIndexCache;
@@ -48,9 +53,6 @@ pub enum SegmentSource {
 }
 
 /// A segment a peer owns, as [`Placed::Mixed`] holds it.
-// The owners and bundle URL are read by the `Mixed` search arm (the protocol
-// and ladder), which lands in the next commit.
-#[allow(dead_code)]
 pub(crate) struct RemoteSegment {
     pub(crate) segment_id: SegmentId,
     pub(crate) owners: Vec<PeerAddr>,
@@ -75,9 +77,6 @@ pub(crate) enum Placed {
 
 /// The read-side handle over a table's whole placed segment set. Opaque: the
 /// only search entry is [`Self::search_final_placed`].
-// The transport / loader / budget fields are read by the `Mixed` search arm
-// (the protocol and ladder), which lands in the next commit.
-#[allow(dead_code)]
 pub struct PlacedIndex {
     pub(crate) inner: Placed,
     pub(crate) storage_precision: StoragePrecision,
@@ -266,21 +265,353 @@ impl PlacedIndex {
         }
     }
 
-    /// The `Mixed` arm: the protocol and ladder land in the next commit.
+    /// The `Mixed` arm: the per-precision protocol over the transport plus
+    /// the bounded failure ladder, per remote segment, per phase.
+    ///
+    /// `N` = local + remote segment count; `candidate_k = max(k, k·oversample)`
+    /// for a rescoring precision and `k` for `F32`; `width = over_fetch(candidate_k, N)`.
+    /// Remote segments sharing one owner list go in ONE request per phase, in
+    /// parallel across owners; local sources run [`search_unit`] in-process.
+    ///
+    /// - `F32` — one `Final` phase: every source returns its top-`width` exact
+    ///   hits; `merge(units, k)`. 1 RTT.
+    /// - `F16` / `Int8` — `Approximate` then `ExactRescore`: every source
+    ///   returns approximate candidates (comparable across segments);
+    ///   `merge(units, candidate_k)` truncates on approximate distance;
+    ///   survivors are grouped by winning segment — local ones rescore through
+    ///   [`rescore`] with the local exact lookup, remote ones in ONE
+    ///   `ExactRescore` per owner; the coordinator sorts by `(distance,
+    ///   row_id)` and truncates to `k`. 2 RTT; exactly `candidate_k` exact reads.
+    /// - `Binary` — one `Final` phase: every source rescores all its `width`
+    ///   hits locally and returns exact distances; `merge(units, k)` on final
+    ///   distance. 1 RTT; `N·width` exact reads, paid only here.
+    ///
+    /// The ladder per remote segment (per phase): the owner under
+    /// [`PEER_RPC_DEADLINE`] → one retry at the next rendezvous candidate →
+    /// a local load through the segment cache under `2 × PEER_RPC_DEADLINE`,
+    /// admitted only by the marginal-load budget with the table's dimensions
+    /// known → [`JammiError::Unavailable`] naming the segment. Every rung emits
+    /// a `warn!` and increments its counter.
     async fn search_mixed(
         &self,
-        _local: &[(SegmentId, SidecarIndex)],
+        local: &[(SegmentId, SidecarIndex)],
         remote: &[RemoteSegment],
-        _query: &[f32],
-        _k: usize,
-        _oversample: usize,
+        query: &[f32],
+        k: usize,
+        oversample: usize,
     ) -> Result<Vec<(String, f32)>> {
-        let segment = remote.first().map(|r| r.segment_id.0).unwrap_or(-1);
-        Err(JammiError::Unavailable {
-            resource: format!("segment {}/{segment}", self.table_name),
-            reason: "placed search over remote segments is not built".into(),
-        })
+        if k == 0 {
+            return Ok(Vec::new());
+        }
+        let precision = self.storage_precision;
+        let n = local.len() + remote.len();
+        let candidate_k = if precision.needs_rescore() {
+            k.saturating_mul(oversample).max(k)
+        } else {
+            k
+        };
+        let width = over_fetch(candidate_k, n);
+        let phase = SegmentSearchPhase::for_precision(precision);
+        // Bytes this query has loaded at the local-load rung so far — the
+        // marginal-load admission runs per query, sequentially.
+        let mut loaded_this_query: u64 = 0;
+        // Remote segments this query loaded locally (rung 3): searched and
+        // rescored here from now on.
+        let mut locally_loaded: Vec<(SegmentId, SidecarIndex)> = Vec::new();
+
+        // ---- Phase 1: per-segment units at `width` ----
+        let mut units: Vec<(SegmentId, Vec<(String, f32)>)> = Vec::with_capacity(n);
+        for (id, index) in local {
+            units.push((
+                *id,
+                search_unit(index, query, width, phase, &|row_id| {
+                    index.get_exact(row_id)
+                })?,
+            ));
+        }
+        let groups = owner_groups(remote);
+        let searches = groups.iter().map(|group| async move {
+            let req = SegmentSearchRequest {
+                table_name: self.table_name.clone(),
+                segment_ids: group.segments.iter().map(|s| s.segment_id).collect(),
+                storage_precision: precision,
+                query: query.to_vec(),
+                width,
+                phase,
+            };
+            let req = &req;
+            self.call_with_retry(group, |owner| async move {
+                self.transport
+                    .segment_search(&owner, req, PEER_RPC_DEADLINE)
+                    .await
+            })
+            .await
+        });
+        let results = futures::future::join_all(searches).await;
+        for (group, result) in groups.iter().zip(results) {
+            match result {
+                Ok(remote_units) => {
+                    for unit in remote_units {
+                        units.push((unit.segment_id, unit.hits));
+                    }
+                }
+                Err(last) => {
+                    // Rung 3, per segment of the failed group.
+                    for seg in &group.segments {
+                        let index = self.load_locally(seg, &mut loaded_this_query, last).await?;
+                        units.push((
+                            seg.segment_id,
+                            search_unit(&index, query, width, phase, &|row_id| {
+                                index.get_exact(row_id)
+                            })?,
+                        ));
+                        locally_loaded.push((seg.segment_id, index));
+                    }
+                }
+            }
+        }
+
+        // ---- Final phases merge on final distance and are done ----
+        if phase == SegmentSearchPhase::Final {
+            return Ok(merge(units, k)
+                .into_iter()
+                .map(|(row_id, distance, _segment)| (row_id, distance))
+                .collect());
+        }
+
+        // ---- Phase 2 (Approximate): merge, truncate, rescore the survivors ----
+        let survivors = merge(units, candidate_k);
+        let mut by_segment: Vec<(SegmentId, Vec<(String, f32)>)> = Vec::new();
+        for (row_id, approx, segment) in survivors {
+            match by_segment.iter_mut().find(|(s, _)| *s == segment) {
+                Some((_, group)) => group.push((row_id, approx)),
+                None => by_segment.push((segment, vec![(row_id, approx)])),
+            }
+        }
+        let resident = |segment: SegmentId| -> Option<&SidecarIndex> {
+            local
+                .iter()
+                .chain(locally_loaded.iter())
+                .find(|(id, _)| *id == segment)
+                .map(|(_, index)| index)
+        };
+        let mut rescored: Vec<(String, f32)> = Vec::with_capacity(candidate_k);
+        // Remote survivors, grouped by the owner list of their segment.
+        let mut remote_groups: Vec<(&OwnerGroup<'_>, RowIdsBySegment)> = Vec::new();
+        for (segment, candidates) in by_segment {
+            if let Some(index) = resident(segment) {
+                rescored.extend(rescore(
+                    candidates,
+                    &|row_id| index.get_exact(row_id),
+                    query,
+                )?);
+                continue;
+            }
+            let group = groups
+                .iter()
+                .find(|g| g.segments.iter().any(|s| s.segment_id == segment))
+                .expect("every non-resident survivor came from a remote group");
+            let row_ids: Vec<String> = candidates.into_iter().map(|(id, _)| id).collect();
+            match remote_groups
+                .iter_mut()
+                .find(|(g, _)| std::ptr::eq(*g, group))
+            {
+                Some((_, groups_rows)) => groups_rows.push((segment, row_ids)),
+                None => remote_groups.push((group, vec![(segment, row_ids)])),
+            }
+        }
+        let rescores = remote_groups.iter().map(|(group, rows)| async move {
+            let req = ExactRescoreRequest {
+                table_name: self.table_name.clone(),
+                storage_precision: precision,
+                query: query.to_vec(),
+                row_ids_by_segment: rows.clone(),
+            };
+            let req = &req;
+            self.call_with_retry(group, |owner| async move {
+                self.transport
+                    .exact_rescore(&owner, req, PEER_RPC_DEADLINE)
+                    .await
+            })
+            .await
+        });
+        let results = futures::future::join_all(rescores).await;
+        for ((group, rows), result) in remote_groups.iter().zip(results) {
+            match result {
+                Ok(hits) => rescored.extend(hits),
+                Err(last) => {
+                    for (segment, row_ids) in rows {
+                        let seg = group
+                            .segments
+                            .iter()
+                            .find(|s| s.segment_id == *segment)
+                            .expect("the survivor's segment is in its group");
+                        let index = self.load_locally(seg, &mut loaded_this_query, last).await?;
+                        rescored.extend(rescore(
+                            row_ids.iter().map(|id| (id.clone(), 0.0)).collect(),
+                            &|row_id| index.get_exact(row_id),
+                            query,
+                        )?);
+                    }
+                }
+            }
+        }
+        rescored.sort_by(|a, b| a.1.total_cmp(&b.1).then_with(|| a.0.cmp(&b.0)));
+        rescored.truncate(k);
+        Ok(rescored)
     }
+
+    /// Rungs 1–2 of the ladder for one owner group: the owner, then one retry
+    /// at the next rendezvous candidate. `Err` carries the last failure's
+    /// reason for rung 3's message.
+    async fn call_with_retry<T, F, Fut>(
+        &self,
+        group: &OwnerGroup<'_>,
+        call: F,
+    ) -> std::result::Result<T, PeerFailureReason>
+    where
+        F: Fn(PeerAddr) -> Fut,
+        Fut: std::future::Future<Output = std::result::Result<T, PeerError>>,
+    {
+        let mut last = PeerFailureReason::Unreachable;
+        for (rung, owner) in group.owners.iter().take(2).enumerate() {
+            match call(owner.clone()).await {
+                Ok(value) => {
+                    if rung == 1 {
+                        self.counters.retry_ok.fetch_add(1, Ordering::Relaxed);
+                    }
+                    return Ok(value);
+                }
+                Err(e) => {
+                    self.counters.record(e.reason);
+                    tracing::warn!(
+                        table = self.table_name,
+                        segment = e.segment.0,
+                        owner = %e.owner,
+                        reason = %e.reason,
+                        rung = rung + 1,
+                        "peer segment search failed"
+                    );
+                    last = e.reason;
+                }
+            }
+        }
+        Err(last)
+    }
+
+    /// Rung 3: load `seg` locally through the segment cache under
+    /// `2 × PEER_RPC_DEADLINE`, admitted iff the table records its dimensions
+    /// and `loaded_this_query + estimate(seg) ≤ budget`. Every refusal or
+    /// failure is [`JammiError::Unavailable`] naming the segment.
+    async fn load_locally(
+        &self,
+        seg: &RemoteSegment,
+        loaded_this_query: &mut u64,
+        last: PeerFailureReason,
+    ) -> Result<SidecarIndex> {
+        let resource = format!("segment {}/{}", self.table_name, seg.segment_id.0);
+        let unavailable = |reason: String| {
+            self.counters.unavailable.fetch_add(1, Ordering::Relaxed);
+            tracing::warn!(
+                table = self.table_name,
+                segment = seg.segment_id.0,
+                owner = ?seg.owners.first(),
+                reason = %reason,
+                "placed segment unavailable"
+            );
+            JammiError::Unavailable {
+                resource: resource.clone(),
+                reason,
+            }
+        };
+        let Some(dimensions) = self.dimensions else {
+            return Err(unavailable(format!(
+                "{last}; local load skipped: the table records no dimensions"
+            )));
+        };
+        let estimate = local_load_estimate(seg.row_count, dimensions, self.storage_precision);
+        if let Some(budget) = self.budget {
+            if loaded_this_query.saturating_add(estimate) > budget {
+                return Err(unavailable(format!(
+                    "{last}; local load of ~{estimate} bytes refused by peer_local_load_bytes = \
+                     {budget} ({loaded_this_query} already loaded by this query)"
+                )));
+            }
+        }
+        let load = self
+            .loader
+            .load_segment(&seg.index_url, &self.ann, self.storage_precision);
+        match tokio::time::timeout(2 * PEER_RPC_DEADLINE, load).await {
+            Ok(Ok(index)) => {
+                *loaded_this_query += estimate;
+                self.counters.local_load.fetch_add(1, Ordering::Relaxed);
+                tracing::warn!(
+                    table = self.table_name,
+                    segment = seg.segment_id.0,
+                    owner = ?seg.owners.first(),
+                    reason = %last,
+                    estimate_bytes = estimate,
+                    "placed segment loaded locally after its owners failed"
+                );
+                Ok(index)
+            }
+            Ok(Err(e)) => Err(unavailable(format!("{last}; local load failed: {e}"))),
+            Err(_elapsed) => Err(unavailable(format!(
+                "{last}; local load exceeded {:?}",
+                2 * PEER_RPC_DEADLINE
+            ))),
+        }
+    }
+}
+
+/// The survivors an `ExactRescore` names, grouped by the segment that owns
+/// each.
+type RowIdsBySegment = Vec<(SegmentId, Vec<String>)>;
+
+/// Remote segments sharing one owner list, so they ride ONE request per
+/// phase and retry together.
+struct OwnerGroup<'a> {
+    owners: &'a [PeerAddr],
+    segments: Vec<&'a RemoteSegment>,
+}
+
+fn owner_groups(remote: &[RemoteSegment]) -> Vec<OwnerGroup<'_>> {
+    let mut groups: Vec<OwnerGroup<'_>> = Vec::new();
+    for seg in remote {
+        match groups
+            .iter_mut()
+            .find(|g| g.owners == seg.owners.as_slice())
+        {
+            Some(group) => group.segments.push(seg),
+            None => groups.push(OwnerGroup {
+                owners: &seg.owners,
+                segments: vec![seg],
+            }),
+        }
+    }
+    groups
+}
+
+/// The local-load estimate for a segment: `row_count × (d × bytes(precision)
+/// + 32 + 64)` — 4 (F32) / 2 (F16) / 1 (Int8) / `ceil(d/8)` total (Binary)
+/// bytes of stored vector, 32 bytes of row-id strings (`row_map` +
+/// `row_index`) and 64 bytes of per-node graph link overhead. A LOWER bound
+/// for the quantized precisions: the rawf32 companion is excluded (an fd read
+/// by `pread`, never resident); usearch's level-0 links and the row-id
+/// `HashMap` are unmodelled.
+pub(crate) fn local_load_estimate(
+    row_count: usize,
+    dimensions: i32,
+    precision: StoragePrecision,
+) -> u64 {
+    let d = u64::try_from(dimensions).unwrap_or(0);
+    let vector_bytes = match precision {
+        StoragePrecision::F32 => d * 4,
+        StoragePrecision::F16 => d * 2,
+        StoragePrecision::Int8 => d,
+        StoragePrecision::Binary => d.div_ceil(8),
+    };
+    (row_count as u64).saturating_mul(vector_bytes + 32 + 64)
 }
 
 #[cfg(test)]
@@ -446,5 +777,28 @@ mod tests {
             "AllLocal shape re-asserts uniformity"
         );
         assert!(build(true).is_err(), "Mixed shape re-asserts uniformity");
+    }
+
+    #[test]
+    fn local_load_estimate_per_precision() {
+        // 1000 rows × 128 dims: vector bytes + 96 per row.
+        assert_eq!(
+            local_load_estimate(1000, 128, StoragePrecision::F32),
+            1000 * (512 + 96)
+        );
+        assert_eq!(
+            local_load_estimate(1000, 128, StoragePrecision::F16),
+            1000 * (256 + 96)
+        );
+        assert_eq!(
+            local_load_estimate(1000, 128, StoragePrecision::Int8),
+            1000 * (128 + 96)
+        );
+        assert_eq!(
+            local_load_estimate(1000, 128, StoragePrecision::Binary),
+            1000 * (16 + 96)
+        );
+        // Binary pads to whole bytes.
+        assert_eq!(local_load_estimate(1, 12, StoragePrecision::Binary), 2 + 96);
     }
 }

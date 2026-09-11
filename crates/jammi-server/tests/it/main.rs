@@ -33,6 +33,7 @@ mod grpc_web;
 mod health;
 mod liveness;
 mod mount_tenant_scoped;
+mod peer_placement;
 mod peer_service;
 mod probe;
 mod readiness_preload;

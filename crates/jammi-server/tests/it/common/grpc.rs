@@ -317,7 +317,19 @@ async fn engine_chain_from_config(
     // production `OssServer` builds, and what the Flight SQL `annotate` test
     // exercises.
     let session = InferenceSession::open(cfg).await.expect("session");
+    chain_over_session(addr, tiers, session, admin_authorizer)
+}
 
+/// The chain-building half of [`engine_chain_from_config`] over an ALREADY
+/// OPEN engine session — so a test that opened its session itself (e.g. with
+/// [`InferenceSession::open_with_placement`]) serves the identical surface
+/// every other fixture serves. Returns the chain plus the shared engine handle.
+pub fn chain_over_session(
+    addr: SocketAddr,
+    tiers: jammi_server::tiers::TierSet,
+    session: Arc<InferenceSession>,
+    admin_authorizer: Option<Arc<dyn jammi_server::grpc::catalog::AdminAuthorizer>>,
+) -> (jammi_server::runtime::GrpcChain, Arc<InferenceSession>) {
     let store = SessionStore::new();
     let trigger = tiers
         .contains(jammi_server::tiers::ServiceTier::Event)
@@ -741,4 +753,17 @@ pub async fn start_engine_server_with_peer_bind() -> PeerEngineServer {
     let dir = tempfile::tempdir().expect("tempdir");
     let cfg = peer_bind_config(dir.path());
     start_engine_server_from_config(cfg, Some(dir)).await
+}
+
+/// Serve the engine chain (every tier except event) over an ALREADY OPEN
+/// engine session on a loopback ephemeral port — the public listener a test
+/// drives `Search` through against a session it opened itself. Returns the
+/// bound address, the shutdown trigger and the abort-on-drop serve handle.
+pub async fn start_engine_server_over_session(
+    session: Arc<InferenceSession>,
+) -> (SocketAddr, oneshot::Sender<()>, AbortOnDropHandle<()>) {
+    let (chain, _engine) = chain_over_session(ephemeral_addr(), non_event_tiers(), session, None);
+    let (shutdown_tx, shutdown_rx) = oneshot::channel::<()>();
+    let (addr, handle) = spawn_bound_chain(chain, shutdown_rx).await;
+    (addr, shutdown_tx, AbortOnDropHandle(handle))
 }

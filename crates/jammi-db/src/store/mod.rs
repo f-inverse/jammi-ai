@@ -2089,17 +2089,37 @@ impl ResultStore {
                     Arc::clone(&self.peer_failures),
                 )));
         }
+        // `Mixed`: load what this process owns, record what a peer owns. A
+        // local load failure here is `Unavailable` — a multi-node table is
+        // never silently exact-scanned. (Not version-aware: a versioned
+        // table's placed/Mixed path is `list_index_segments`' flat,
+        // unversioned segment set — the same limitation `resolve_search_mode`
+        // carried before the all-local arm above was closed. Multi-node
+        // deployments of a versioned, refreshed table are out of scope here.)
         let sources = {
-            let first_remote = segments
-                .iter()
-                .zip(&owners)
-                .find(|(_, o)| !o.is_empty())
-                .map(|(s, _)| s.segment_id)
-                .unwrap_or(-1);
-            return Err(JammiError::Unavailable {
-                resource: format!("segment {}/{first_remote}", table.table_name),
-                reason: "placed search over remote segments is not built".into(),
-            });
+            let mut sources = Vec::with_capacity(segments.len());
+            for (seg, owners) in segments.iter().zip(owners) {
+                let index_url = StorageUrl::parse(&seg.index_path)?;
+                if owners.is_empty() {
+                    let index = self
+                        .segment_cache
+                        .load_segment(&index_url, &self.ann, precision)
+                        .await
+                        .map_err(|e| JammiError::Unavailable {
+                            resource: format!("segment {}/{}", table.table_name, seg.segment_id),
+                            reason: format!("local load failed on a placed table: {e}"),
+                        })?;
+                    sources.push(SegmentSource::Local(SegmentId(seg.segment_id), index));
+                } else {
+                    sources.push(SegmentSource::Remote {
+                        segment_id: SegmentId(seg.segment_id),
+                        owners,
+                        row_count: seg.row_count,
+                        index_url,
+                    });
+                }
+            }
+            sources
         };
         Ok(Some(PlacedIndex::with_sources(
             sources,
@@ -2234,39 +2254,6 @@ impl ResultStore {
                 Ok(Some(index))
             }
         }
-    }
-
-    /// Load every segment of `table` through the cache. `Ok(None)` (with a
-    /// `warn!`) on any load failure — the whole-table exact fallback both
-    /// resolve entries share for an all-local set. An unparseable segment URL
-    /// is a catalog fault and stays a hard error.
-    async fn load_all_local(
-        &self,
-        table: &ResultTableRecord,
-        segments: &[crate::catalog::segment_repo::IndexSegment],
-    ) -> Result<Option<Vec<(SegmentId, SidecarIndex)>>> {
-        let expected_precision = table.storage_precision.unwrap_or_default();
-        let mut loaded = Vec::with_capacity(segments.len());
-        for seg in segments {
-            let url = StorageUrl::parse(&seg.index_path)?;
-            match self
-                .segment_cache
-                .load_segment(&url, &self.ann, expected_precision)
-                .await
-            {
-                Ok(index) => loaded.push((SegmentId(seg.segment_id), index)),
-                Err(e) => {
-                    warn!(
-                        table = table.table_name,
-                        segment = seg.segment_id,
-                        error = %e,
-                        "Segment index unavailable, falling back to whole-table exact search"
-                    );
-                    return Ok(None);
-                }
-            }
-        }
-        Ok(Some(loaded))
     }
 
     /// The loaded-set cache (evicted per table on bind / publish / delete).

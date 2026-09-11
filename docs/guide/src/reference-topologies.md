@@ -268,6 +268,41 @@ Very high scale, specialized GPU pools, and a split compliance posture
 (query tier vs. training tier on separate node pools / network policies)
 are the shapes this topology serves.
 
+### Beyond-one-node retrieval
+
+A query-tier replica answers `Search` over a table whose ANN index segments
+it does not all hold by fanning the query out to the replicas that own
+them: each owner searches its segments and returns `(row_id, distance)`
+hits — never vectors — and the coordinator merges them under the same total
+order a single node merges its own segments with (the distributed data
+plane; see [Security Posture](./security.md#the-peer-listener-i-peer) for
+the I-PEER invariant and [Operability](./operability.md#failure-mode-matrix)
+for the failure ladder). Three facts fix the shape:
+
+- **The default is `AllLocal`.** With `[server] peer_bind` unset — every
+  shape above — every segment is this replica's, there is no third listener,
+  and the search is exactly the single-node search (the same kernels, the
+  same bytes, the same exact-read count at every segment count). Nothing on
+  this page changes until a deployment opts in.
+- **`peer_bind` makes a replica an owner.** Setting `[server] peer_bind`
+  (`JAMMI_SERVER__PEER_BIND`) opens the internal `PeerService` listener on
+  that replica. Bind it on a private interface behind network policy / mTLS
+  from the runtime — its clients are other jammi coordinators and it
+  authenticates nothing itself.
+- **Precondition: a shared, replica-readable `result_root`.** A segment an
+  owner serves must be a bundle every replica can reach: `[storage]
+  result_root` on an object store every replica reads (a local
+  `artifact_dir` is one node's). Placement — which replica owns which
+  segment — is derived at query time from the live replica ring
+  (`[server] peer_advertise` + the catalog's `instances` rows, rendezvous-
+  hashed over `(table, segment)`), never declared; the membership half of
+  that ring is the compute-tier substrate's (`peer_advertise`,
+  `instances.peer_addr`), and until it lands a library process supplies an
+  explicit `StaticPlacement` through
+  `InferenceSession::open_with_placement`. Batch builders (the neighbor
+  graph, eval) never fan out: they load the whole table's segment set on the
+  building replica.
+
 ## The `jammi-server probe` subcommand
 
 Every shape above that runs `jammi-server` — B, C, D — uses the same

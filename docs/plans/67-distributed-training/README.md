@@ -67,10 +67,14 @@ those still in force are restated here in their v4 form. Principle in parenthese
     take the slot; lesser-or-equal attempt → refuse; otherwise try-lock; busy → typed
     `Unavailable`, and the coordinator picks another member or fails the attempt. No new worker
     state. (B1; OPS D6.)
-28. **Membership is 68's.** Peers are resolved from the catalog: `workers.kinds` ∋ kind,
-    `instances.peer_addr` set (DIST unit 2's column), `last_seen_at` within `[lease]
-    duration_secs` (DIST unit 2's ring window), and — from U8b on — `workers.devices`
-    sufficient — through a new joined listing `list_gang_members(kind)` that splits
+28. **Membership substrate is built by 67, used by both plans.** 68 DIST "unit 2" is a design
+    sketch (`DIST-DATA-PLANE.md:208-215`), not a plannable unit, so U5b-1 lands the substrate it
+    sketches: `[server] peer_advertise` (validate: `peer_advertise ⇒ peer_bind ⇒ result_root`),
+    the `instances.peer_addr` column (migration, numbered at rebase), the `upsert_instance`
+    signature and the session write site (`session.rs:247-251`). DIST's `RendezvousPlacement`
+    builds on it later. Peers are resolved from the catalog: `workers.kinds` ∋ kind,
+    `instances.peer_addr` set, `last_seen_at` within `[lease] duration_secs`, and — from U8b on —
+    `workers.devices` sufficient — through a new joined listing `list_gang_members(kind)` that splits
     `workers.kinds` on `,` and compares whole tokens in Rust (`fine_tune` must not match
     `graph_fine_tune`). No static peer list. Consequence recorded in 68's reconciliation: a
     replica that sets `peer_advertise` to be gang-reachable also joins DIST's retrieval ring;
@@ -78,10 +82,14 @@ those still in force are restated here in their v4 form. Principle in parenthese
 29. **Knobs.** `[gpu] devices = [..]`; `[worker] world_size = 1`, `rank_timeout_secs = 120`,
     `collective = "auto"`; per-job `world_size` on `TrainingCommon` (`#[serde(default)]` = 1).
     `[training]` no longer exists on the branch.
-30. **Migrations.** 67 appends exactly three, numbered at rebase after 68's: `model_materialization`
-    (U3), `workers_devices` (U4a: `workers.devices TEXT` JSON list of `{kind, ordinal, memory}`),
-    `ballista_state` (U8b). Four 68 units (OPS, GRAPH, DELTA, DIST unit 2) contend for 031;
-    renumber-on-second-merge (K5). No plan text names a number.
+30. **Migrations.** 67 appends exactly three: `model_materialization` (U3, PR-B),
+    `instances_peer_addr` (U5b-1, PR-C), `compute_cluster_state` (U8b, PR-D — distributor-neutral
+    name and columns; `workers.devices` rides in it, since U8b is its first reader). No plan
+    reserves a number: each PR takes the next free number at rebase and updates **both pin
+    sites** — the const list in `crates/jammi-db/src/catalog/migrations.rs` and
+    `EXPECTED_MIGRATION_NAMES` in `crates/jammi-db/tests/it/migrations.rs:23-54` (exact-equality
+    asserts) — and OPS's relative-position oracle; the second merger renumbers (K5). Three 68
+    units (OPS, GRAPH, DELTA) also append one each.
 31. **The training set is not this attempt's partial result.** U2a materializes it with
     `job_attempt: None`: it is a shared producer output reused by definition hash, not an
     attempt-owned table, so the `jobs.partial_result` attempt≥2 defect (68 OPS C1) is never
@@ -98,15 +106,21 @@ those still in force are restated here in their v4 form. Principle in parenthese
 **Peer surface (68's listener)**
 
 33. **`GangService` is a second service on `[server] peer_bind`** (DIST D7's third listener),
-    never on the tenant-scoped public chain, never advertised by `GetServerInfo`. U5a depends on
-    DIST unit 1 having merged; if it has not when U5a is briefed, U5a carries DIST's listener
-    commit verbatim as its first commit (identical spec, co-owned).
+    never on the tenant-scoped public chain, never advertised by `GetServerInfo`. **68 DIST unit
+    1 merged is a hard precondition of U5a** (its listener commit is ~22 files on top of ~10;
+    there is no verbatim-carry fallback). PR-C(67) also waits for OPS and GRAPH, because OPS C2
+    rewrites the claim loop U5a's `JobSlot` wraps and GRAPH rewrites `claim_next`.
 34. **Authorization: the job row is the capability (invariant I-GANG).** The peer reads the
-    `jobs` row by primary key without a caller tenant, verifies `status = 'running'`,
-    `claimed_by = coordinator_instance_id`, lease live, and **derives the tenant from the row**
-    (`jobs.tenant_id`), pinning every subsequent catalog read to it. No URL and no tenant is
-    trusted from the wire; `FetchPartition` verifies the named table belongs to the job's training
-    set (the analogue of D7's segment-belongs-to-table check). The RPCs get their own
+    `jobs` row through a **new db-owned verb `get_job_for_rank(job_id)`** — by primary key, no
+    tenant predicate, never admin scope (`get_job` is tenant-filtered, `jobs_repo.rs:580-596`,
+    and D7 forbids `with_admin_scope` on the peer path), reachable only from the gang handler —
+    verifies `status = 'running'`, `claimed_by = coordinator_instance_id`, lease live, and
+    **derives the tenant from the row** (`jobs.tenant_id`), pinning every subsequent catalog
+    read to it. Nothing dialable travels on the wire: the assignment carries
+    `peers[rank → instance_id]` and each peer resolves addresses through `instances.peer_addr`,
+    refusing a rank whose instance is not a fresh member (the NCCL id, an opaque secret, is the
+    only out-of-band value). `FetchPartition` verifies the named table belongs to the job's
+    training set (the analogue of D7's segment-belongs-to-table check). The RPCs get their own
     `GANG_LISTENER_ALLOWLIST` bucket in `tenant_isolation_oracle.rs` (text: "served only on
     peer_bind; tenant derived from the verified job row; deliberately not caller-scoped"),
     unioned like D7's, with the public-listener `UNIMPLEMENTED` assertion, and their
@@ -142,8 +156,13 @@ those still in force are restated here in their v4 form. Principle in parenthese
     depends on `jammi-ai`, `jammi-db`, `jammi-wire` and the Ballista crates and is depended on by
     `jammi-server`; publishable, lockstep (K6); no cargo feature (B4's "no library-vs-server
     gate"): the library never loses the capability because a library embedder adds the same
-    crate. No vendored subtree in v1 (the shuffle reader rewrite is at the `ExecutionEngine`
-    seam).
+    crate. No vendored subtree in v1. A new workspace crate has three registration sites that
+    red at merge: the domain card's `owns:` globs (`.claude/agents/wire-server.md` takes
+    `crates/jammi-ballista/**`; `check_swarm_bijection.py` asserts a total partition, and editing
+    a card trips `SWARM_GATE_TOUCHED` → **PR-D needs an admin merge**), `ci/scripts/publish_crates.sh`'s
+    ordered publish list (insert before `jammi-server`), and the generated dep-DAG block in
+    `docs/maintainer/MAINTAINER-GUIDE.md` (`gen_dep_dag.py`, diffed by `dep-dag.yml`).
+    `check_dep_direction.py` encodes no layering and is not touched.
 39. **Roles are listener-shaped knobs, like `peer_bind`**: a replica hosts the scheduler iff
     `[ballista] scheduler_bind` is set, and an executor iff `[ballista] executor.scheduler_address`
     is set. Not a tier, not a CLI role. Topology is configuration. (B4; DIST D7's "owner iff
@@ -208,7 +227,7 @@ in r46); committed-artifact convention (r20); StatefulSet consequence, now owned
 | A | 1 | U1 | DataFusion 54 line upgrade (workspace-atomic) | hermetic + cookbook + db-features clippy lane | S3 (main already carries #501) |
 | B | 1 | U7a | `gpu-gang.yml` pod leg; `runpod_lib.sh` gpuCount; allowlist; artifact schema | gate scripts | S4 |
 | B | 2 | U2a | `TrainingSet` producer (`job_attempt: None`; wire mirror; guide block) | hermetic + cookbook | U1 |
-| B | 3 | U4a | `Collective` trait; device-plural session; `CacheKey`; `workers.devices` migration; refusals | hermetic (+ pod smoke) | S1 |
+| B | 3 | U4a | `Collective` trait; device-plural session; `CacheKey`; refusals | hermetic (+ pod smoke) | S1 |
 | B | 4 | U2b | Streaming loader; partition rule; scaler; whole-set arms | hermetic + cookbook | U2a, U4a |
 | B | 5 | U3 | `FineTune` producer; `model_materialization` migration; cache reuse | hermetic | U2a |
 | B | 6 | U4b | Rank context; gather rule; lockstep; single-node gang | hermetic + pod leg | U2b, U3, U4a, S1 |
@@ -216,11 +235,13 @@ in r46); committed-artifact convention (r20); StatefulSet consequence, now owned
 | C | 1 | U7b | cluster leg + cluster reap | gate scripts | U7a, S4 |
 | C | 2 | U5a | `GangService` on `peer_bind`; I-GANG authorization; allowlist + freeze lines | hermetic + server it-suite | U4a, 68 DIST unit 1 |
 | C | 3 | U6 | Partition-aware inference operator | hermetic | U2b, U5a |
-| C | 4 | U5b | Coordinator; `Peer` collective; membership; released-vs-failed; chaos; two-worker forward leg | distributed + cluster leg | U4b, U5a, U6, 68 DIST unit 2, 68 OPS, S1 |
-| C | 5 | — | cluster-leg artifact | gpu-gang | U5b |
-| D | 1 | U8a | `jammi-ballista`: crate, codecs, `JammiExecutionEngine`, role knobs; in-memory cluster | hermetic + distributed three-process arm | U1, U5b, U6, S6 |
-| D | 2 | U8b | `CatalogClusterState`/`CatalogJobState`, `DevicePlacement`, `ballista_state` migration, gang as one placed task | distributed | U8a |
-| D | 3 | U9 | Docs; shape-d overlay → StatefulSet + `nvidia.com/gpu: N` (after 68 K) | docs gates | all, 68 K |
+| C | 4 | U5b-1 | Coordinator; `Peer` collective; membership substrate (`peer_advertise`, `instances.peer_addr`, `list_gang_members`); determinism; two-worker forward leg | distributed | U4b, U5a, U6, S1 |
+| C | 5 | U5b-2 | Watchdog; abort with no terminal write; released-vs-failed; chaos; cluster leg | distributed + cluster leg | U5b-1, 68 OPS |
+| C | 6 | — | cluster-leg artifact | gpu-gang | U5b-2 |
+| D | 1 | U8a | `jammi-ballista`: crate (+ card globs, publish list, dep-DAG), codecs, `JammiExecutionEngine`, role knobs; in-memory cluster | hermetic + distributed three-process arm | U1, U5b-1, U6, S6 |
+| D | 2 | U8b | `CatalogClusterState`/`CatalogJobState`, `DevicePlacement`, `compute_cluster_state` migration (+ `workers.devices`), gang as one placed task | distributed | U8a, S6 |
+| D | 3 | U9a | Docs (guide, maintainer, CHANGELOG) | docs gates | all |
+| D | 4 | U9b | shape-d overlay → StatefulSet + headless service + `nvidia.com/gpu: N` (after 68 K, keeping OPS C6's grace) | kubeconform + kind smoke | 68 K, 68 OPS |
 
 Spikes (no PR; results in the ledger before the dependent unit is briefed): **S1** (→ U4a,
 U5b) `candle-core/nccl` under the `cuda` feature; `Comm::from_devices`; `all_gather` equal and
@@ -230,9 +251,12 @@ create-cluster probe — spends money, human-approved. **S5** (→ GPU byte orac
 bit-reproducibility pin. **S6** (→ U8a/U8b; supersedes S2) a scratch crate on Ballista 54.1 with
 `override_execution_engine`, a custom `ClusterState`/`JobState` passed to `start_server`, and the
 codec, running a custom `ExecutionPlan` on one scheduler + two executors; confirm
-`task_max_failures = 0` disables retry, that `expire_dead_executors` only removes executors, and
-that a custom `bind_schedulable_tasks` can read the stage plan from `active_jobs` to decide
-placement.
+`task_max_failures = 0` disables retry and that `expire_dead_executors` only removes executors;
+**kill and restart the scheduler** and assert registrations and an in-flight job survive from
+the custom state; **run two schedulers** over one state store; print the executor identity a
+`TaskDistributionPolicy::Custom` receives and confirm the stage plan is readable from
+`active_jobs`. U8b is gated on all of these. **S3** also records `cargo tree -d` for `tonic` and
+`prost` with the OpenTelemetry family #501 added.
 
 ## Hand-off: how a fresh lead kicks this off
 
@@ -246,8 +270,11 @@ placement.
    before PR-A — rebase, no ordering constraint between them.
 5. PR-B after 68 K and DIST unit 1 merge (U5a's listener). Commit order as in the table;
    U7a ∥ U2a ∥ U4a; U2b ∥ U3; U4b last; label the PR for the pod leg.
-6. PR-C(67) after DIST unit 2 and OPS merge. U7b ∥ U5a; U6; U5b; `distributed.yml` dispatched
-   manually, deterministic leg green before merge.
-7. PR-D after 68 K: U8a, U8b (the completion gate), U9.
+6. PR-C(67) after DIST unit 1, OPS and GRAPH merge (they rewrite the claim loop and
+   `claim_next`). U7b ∥ U5a; U6; U5b-1; U5b-2; `distributed.yml` dispatched manually,
+   deterministic leg green before merge.
+7. PR-D after 68 K: U8a, U8b (the completion gate), U9a, U9b. `distributed.yml` dispatched
+   manually with the three-process arm green before merge. PR-D edits a swarm domain card, so it
+   needs an admin merge (`SWARM_GATE_TOUCHED`).
 8. Every commit runs phases 3–6.5; every PR runs phase 7; amend subagent commits with the
    session trailers. PR bases: each PR from `main` after its preconditions merged; never stacked.

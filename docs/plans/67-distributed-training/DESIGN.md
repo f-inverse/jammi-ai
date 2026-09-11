@@ -113,7 +113,8 @@ new field fails compilation instead of escaping the hash; U4b extends it with th
 fields.
 
 The catalog name `jammi:fine-tuned:{job_id}` stays as the handle and re-claim idempotency key
-(`worker.rs:1176-1184`). Migration 029 `model_materialization` adds nullable
+(`worker.rs:1176-1184`). The `model_materialization` migration (numbered at
+rebase) adds nullable
 `models.definition_hash`, `models.input_anchors`, `models.manifest_path` (append-only, K5;
 nullable because `ContextPredictor` has no materialization; the probe never matches NULL). The
 manifest is written last into the artifact prefix by the coordinator before the finalize CAS.
@@ -315,7 +316,7 @@ operators and hosts the model cache and catalog) — it sits between `jammi-ai`/
 |---|---|---|
 | operators cross the wire | `SchedulerConfig.override_{logical,physical}_codec`, `ExecutorProcessConfig.override_*_codec` | `JammiCodec`: `InferenceExec`, `AnnSearchExec`, `AsofJoinExec`, `GangExec` ↔ the U5 descriptor messages |
 | no executor-side state across plans | `ExecutorProcessConfig.override_execution_engine: Option<Arc<dyn ExecutionEngine>>`; `create_query_stage_exec(job, stage, task, partitions, plan, work_dir, config)` rewrites `ShuffleReaderExec` nodes and wraps the writer | `JammiExecutionEngine`: model cache held across plans, device pinned to `[gpu] devices`. Shuffle stays Ballista's local `work_dir` in v1; this seam is where an object-store shuffle would go once a spike proves the cross-executor read (D2's condition 3 stands) |
-| cluster state in memory only | `ClusterState` + `JobState` traits; `BallistaCluster::new(Arc<dyn ClusterState>, Arc<dyn JobState>)`; `start_server(cluster, addr, config)` | U8a: Ballista's in-memory state. U8b: `CatalogClusterState`/`CatalogJobState` over jammi's catalog (tables from the `ballista_state` migration) — persistent, multi-scheduler (Spice's HA at the seam) |
+| cluster state in memory only | `ClusterState` + `JobState` traits; `BallistaCluster::new(Arc<dyn ClusterState>, Arc<dyn JobState>)`; `start_server(cluster, addr, config)` | U8a: Ballista's in-memory state. U8b: `CatalogClusterState`/`CatalogJobState` in `jammi-ballista` over jammi-db's public backend, on distributor-neutral tables from the `compute_cluster_state` migration (executor registrations, heartbeats, job graphs) — persistent, multi-scheduler (Spice's HA at the seam); restart and two-scheduler behaviour proven by S6 before U8b is briefed |
 | no accelerator dimension | `ClusterState::bind_schedulable_tasks(distribution, active_jobs, executors) -> Vec<BoundTask>`; `TaskDistributionPolicy::Custom(Arc<dyn DistributionPolicy>)` | `DevicePlacement`: executor id ↔ `workers.devices`; a task is GPU-bound iff its stage plan (from `active_jobs`' execution graph, decoded through `JammiCodec`) contains a `GangExec` or an `InferenceExec` whose descriptor names a CUDA device; such a task binds only to a device-bearing executor. The `ExecutorSpecification { vcores }` proto has no attribute slot: the accelerator dimension is the one upstream PR 67 owes |
 | task retry rejoins a dead gang | `SchedulerConfig.task_max_failures`, `stage_max_failures` (global) | both 0: retries are the jobs table's |
 | scheduler control loop | `expire_dead_executors` starts in `init()` | membership liveness, the class of `reclaim_expired_jobs`/`prune_instances`; with retries off it never makes consumer work runnable |

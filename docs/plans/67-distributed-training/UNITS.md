@@ -224,36 +224,51 @@ per-step `$?`. Naming per README ruling 23.
 - **lane**: hermetic. **depends_on**: U2b, U5a. **size**: L (operator repartitioning, peer
   fan-out client, ordered sink).
 
-## U5b — Coordinator; `Peer` collective; membership; released-vs-failed; chaos (PR-C commit 4)
+## U5b-1 — Coordinator; `Peer` collective; membership substrate; determinism (PR-C commit 4)
 
 - **files_in_scope** (ai-core): `fine_tune/collective/peer.rs`, `fine_tune/worker.rs` (coordinator
-  on the `JobWorker`: members via `list_gang_members` (× `workers.devices` from U8b), id mint,
-  dispatch by instance id, watchdog, attempt abort with **no terminal write** — flip the hold's
-  `lost` flag so the run exits through the leave-for-reclaim arm (`wt-C: worker.rs:670-676`);
-  `Released` → `release_job_lease` first, then the same flag; a live same-named `building`
-  training-set row → `BackOff`), `tests/distributed/{main.rs, harness.rs (peer TOML with
-  `peer_bind`/`peer_advertise`), gang_deterministic.rs, gang_chaos.rs, gang_forward.rs}`,
-  `.github/workflows/distributed.yml` (test names). (wire-server) `grpc/gang.rs` peer-side rank
-  runner and the drain hook that emits `Released`. (db) `catalog/jobs_repo.rs` (member listing,
-  sorted in Rust).
-- **invariants_to_preserve**: K4 real (W=1 via the gang path == embedded bytes), B4, K2, B6,
-  OPS D10 (a peer-tier rolling restart costs zero net attempts).
+  on the `JobWorker`: members via `list_gang_members`, id mint, dispatch by instance id),
+  `session.rs` (`instances.peer_addr` write site, `wt-C: session.rs:247-251`),
+  `tests/distributed/{main.rs, harness.rs (peer TOML with `peer_bind`/`peer_advertise`),
+  gang_deterministic.rs, gang_forward.rs}`, `.github/workflows/distributed.yml` (test names).
+  (db) `config/mod.rs` (`[server] peer_advertise`; validate `peer_advertise ⇒ peer_bind ⇒
+  storage.result_root`), `catalog/{schema.rs, migrations.rs}` (`instances_peer_addr`, number at
+  rebase, both pin sites), `catalog/jobs_repo.rs` (`upsert_instance` gains `peer_addr`;
+  `list_gang_members(kind)`: `workers ⋈ instances`, kinds split on `,` in Rust, `peer_addr` set,
+  `last_seen_at` within `[lease] duration_secs`, sorted in Rust). (docs-ci) configuration.md for
+  `peer_advertise`. This is the substrate 68 DIST §5.8 sketches; DIST's `RendezvousPlacement`
+  builds on it later (recorded in `68/RECONCILIATION-WITH-67.md`).
+- **invariants_to_preserve**: K4 real, B4, K2 (validate chain), K5, B6.
 - **acceptance**: (a) K4 real: 2 processes, W=2, `Peer` → bytes identical to the single-process
-  W=2 `Local` run (RED at base; rank 0 is always in-process, so W=1 never crosses the wire);
-  (b) the coordinator's abort lands no terminal write: after a rank failure the row is `running`
-  until reclaim requeues it, then `attempts+1` at the successor's claim (RED at base); (c) chaos:
-  SIGKILL a peer → requeued by reclaim within the lease window, completed by a new gang from the
-  checkpoint, one model, no orphan prefix; SIGKILL the coordinator → same via lease; split brain
-  → older attempt aborted; SIGTERM (drain) on a peer host → `Released`, `releases+1`, net
-  attempts unchanged, job completes; a crashed coordinator's live `building` training-set row →
-  successor backs off and reclaims after expiry (RED at base); (d) cluster leg: 2 pods × 2 GPUs, W=4, `Nccl` `from_rank` → digest
-  pair + deltas against the pre-registered ε; artifact as PR-C commit 5; (e) two workers compute
-  disjoint halves of a head-target feature table via `FetchPartition`, merged table equals the
-  single-worker table (U6's operator; RED at base). Test targets: `distributed`; `gpu_capability`
-  for the cluster leg.
-- **lane**: hermetic + distributed (dispatched manually; deterministic leg green before merge;
-  chaos advisory as today) + gpu-gang cluster leg. **depends_on**: U4b, U5a, U6, **68 DIST unit
-  2** (`instances.peer_addr`), **68 OPS** (`release_job_lease`, drain hooks), S1. **size**: XL.
+  W=2 `Local` run (RED at base; rank 0 is always in-process); (b) `list_gang_members` excludes a
+  stale instance, an instance without `peer_addr`, and a worker whose kinds contain only
+  `graph_fine_tune` when `fine_tune` is asked (RED at base); (c) `peer_advertise` without
+  `peer_bind` or without `result_root` is refused at load (RED at base); (d) two workers compute
+  disjoint halves of a head-target feature table via `FetchPartition` and the merged table
+  equals the single-worker table (U6's operator; RED at base). Test target: `distributed`.
+- **lane**: hermetic + distributed (dispatched manually; deterministic leg green before merge).
+  **depends_on**: U4b, U5a, U6, S1. **size**: L.
+
+## U5b-2 — Watchdog; abort with no terminal write; released-vs-failed; chaos (PR-C commit 5)
+
+- **files_in_scope** (ai-core): `fine_tune/worker.rs` (watchdog; attempt abort by flipping the
+  hold's `lost` flag so the run exits through the leave-for-reclaim arm, `wt-C: worker.rs:670-676`;
+  `Released` → `release_job_lease` first, then the flag; `BackOff` on a live same-named
+  `building` training-set row), `tests/distributed/gang_chaos.rs`. (wire-server) `grpc/gang.rs`
+  (the drain hook that emits `RankEvent::Released`).
+- **invariants_to_preserve**: OPS D6 (no abort while a claim may be in flight), OPS D10 (a
+  peer-tier rolling restart costs zero net attempts), B6.
+- **acceptance**: (a) after a rank failure the row is `running` (no terminal write) until reclaim
+  requeues it, then `attempts+1` at the successor's claim (RED at base); (b) chaos: SIGKILL a
+  peer → requeued within the lease window, completed by a new gang from the checkpoint, one
+  model, no orphan prefix; SIGKILL the coordinator → same via lease; split brain → older attempt
+  aborted; SIGTERM (drain) on a peer host → `Released`, `releases+1`, net attempts unchanged, job
+  completes; a crashed coordinator's live `building` row → successor backs off and reclaims after
+  expiry (RED at base); (c) cluster leg: 2 pods × 2 GPUs, W=4, `Nccl` `from_rank` → digest pair +
+  deltas against the pre-registered ε; artifact as PR-C commit 6. Test targets: `distributed`;
+  `gpu_capability` for the cluster leg.
+- **lane**: distributed (chaos advisory as today) + gpu-gang cluster leg. **depends_on**: U5b-1,
+  **68 OPS merged** (`release_job_lease`, drain hooks, C2's loop shape). **size**: L.
 
 ## U8a — `jammi-ballista`: crate, codecs, execution engine, role knobs (PR-D commit 1)
 
@@ -290,23 +305,27 @@ per-step `$?`. Naming per README ruling 23.
 ## U8b — Catalog-backed cluster state; device-aware placement (PR-D commit 2; the completion gate)
 
 - **files_in_scope**: (wire-server) `crates/jammi-ballista/src/{cluster.rs (`CatalogClusterState`,
-  `CatalogJobState` over jammi's catalog), placement.rs (`DevicePlacement`: executor id ↔
-  `workers.devices`; a task is GPU-bound iff its stage plan — read from `active_jobs`' execution
-  graph and decoded through `JammiCodec` — contains a `GangExec` or an `InferenceExec` whose
-  descriptor names a CUDA device; such a task binds only to a device-bearing executor; installed
-  through `bind_schedulable_tasks` / `TaskDistributionPolicy::Custom`)}`. (db) `catalog/{schema.rs,
-  migrations.rs}` (`ballista_state`: executor registrations/heartbeats, job graphs — tables owned
-  by jammi-ballista, not the `jobs` table, not a lease class; number at rebase), `catalog/
-  ballista_repo.rs` (new). Tests in `tests/distributed/ballista_state.rs`.
-- **invariants_to_preserve**: K5, B4, K4, B6, the actuator rule disposition (README r42: executor
-  liveness is membership; retries stay off), OPS D6 (the executor role stops polling before the
-  worker drain sequence; no claim transaction is involved).
+  `CatalogJobState` over jammi-db's public backend — the Ballista-shaped repo lives here, not in
+  jammi-db), placement.rs (`DevicePlacement`: executor id ↔ `workers.devices`; a task is GPU-bound
+  iff its stage plan — read from `active_jobs`' execution graph and decoded through `JammiCodec` —
+  contains a `GangExec` or an `InferenceExec` whose descriptor names a CUDA device; installed
+  through `bind_schedulable_tasks` / `TaskDistributionPolicy::Custom`)}`. (db)
+  `catalog/{schema.rs, migrations.rs}` (`compute_cluster_state`: distributor-neutral tables —
+  `compute_executors(executor_id, instance_id, heartbeat_at, slots)`, `compute_jobs(job_id,
+  graph, status)` — plus `workers.devices TEXT` JSON `[{kind, ordinal, memory}]` written by
+  `upsert_worker` from the session's device list, `wt-C: jobs_repo.rs:1556`; number at rebase,
+  both pin sites), `catalog/jobs_repo.rs` (`WorkerRecord.devices`), `catalog/compute_repo.rs`
+  (new, generic CRUD). Tests in `tests/distributed/ballista_state.rs`.
+- **invariants_to_preserve**: K5 (neutral names; append-only), B1/B2 (no distributor vocabulary
+  in the engine's catalog), B4, K4, B6, the actuator-rule disposition (README r42), OPS D6.
 - **acceptance**: (a) restart the scheduler process: registered executors and in-flight job state
   survive (RED at base: in-memory); (b) two schedulers over one catalog serve one cluster (RED at
-  base); (c) a GPU stage never binds to an executor whose `devices` is empty; a device-less-only
-  cluster refuses the stage with a typed error (RED at base); (d) the gang job of U8a (b) still
-  byte-matches U5b under catalog state.
-- **lane**: distributed. **depends_on**: U8a, U4a (`workers.devices`). **size**: L.
+  base); (c) a GPU-bound task never binds to an executor whose `devices` is empty; a device-less
+  cluster refuses it with a typed error (RED at base); (d) `list_workers` returns `devices` as
+  registered (RED at base); (e) the gang job of U8a (b) still byte-matches U5b-1 under catalog
+  state.
+- **lane**: distributed. **depends_on**: U8a, S6 (restart, two-scheduler and executor-identity
+  probes recorded). **size**: L.
 
 ## U9 — Docs (PR-D commit 2)
 

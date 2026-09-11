@@ -81,6 +81,20 @@ jobs:
       - name: Clippy (gated test surfaces — compile-only feature closure)
         run: cargo clippy -p jammi-ai --tests --features live-gpu-tests,live-distributed-tests -- -D warnings
 
+      # `openssl-sys` (pulled in transitively by `native-tls`, which
+      # `datafusion-table-providers`'s `postgres`/`mysql` subcrates depend on
+      # unconditionally — there is no rustls alternative at this version)
+      # needs OpenSSL development headers to build. This image deliberately
+      # omits `openssl-devel` from the shared build substrate: it protects
+      # manylinux wheel linkage, and the image's builder toolchain resolves
+      # `libssl` to the 1.1 SONAME while the published runtime image ships
+      # only the 3 series, so an image-wide install would let a build LINK
+      # against 1.1 here and then FAIL TO LOAD there. The requirement
+      # belongs to this one feature surface, not to the image, so it is
+      # scoped to this step.
+      - name: OpenSSL headers (openssl-sys build script, source-provider lint only)
+        run: yum install -y openssl-devel
+
       # jammi-db's `postgres` / `mysql` features compile `source/postgres.rs`
       # and `source/mysql.rs` (the `datafusion-table-providers` compat
       # surface) and nothing else on the merge path activates them, so the

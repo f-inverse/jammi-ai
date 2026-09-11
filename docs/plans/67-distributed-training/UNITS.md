@@ -81,8 +81,7 @@ per-step `$?`. Naming per README ruling 23.
   `TrainingCommon { .. }` construction site (`wire/training.rs:176`, `session.rs:1172`,
   `:1300`, the `tests/it` sites), `jammi-ai/Cargo.toml` (`cuda` adds `candle-core/nccl`).
   (wire-server, co-owner) `proto/jammi/v1/training.proto` + `crates/jammi-wire/src/training.rs`
-  (the per-job `world_size` field, append-only). (db) `config/mod.rs` (`[gpu] devices`,
-  `[training] world_size`, `collective`), tests. Test targets: hermetic
+  (the per-job `world_size` field, append-only). (db) `config/mod.rs` (`[gpu] devices`; `[worker] world_size`, `collective`), tests. Test targets: hermetic
   tests in the crate's unit tests; the `Nccl` smoke in the existing `gpu_capability` target.
 - **invariants_to_preserve**: B4 (topology is configuration), K2 (`world_size > devices`,
   `nccl` without CUDA, `world_size > 1` with `cached == true` or `hard_negatives.mine == true`
@@ -327,15 +326,22 @@ per-step `$?`. Naming per README ruling 23.
 - **lane**: distributed. **depends_on**: U8a, S6 (restart, two-scheduler and executor-identity
   probes recorded). **size**: L.
 
-## U9 — Docs (PR-D commit 2)
+## U9a — Docs (PR-D commit 3)
 
 - **files_in_scope** (docs-ci / doc-updater): `docs/guide/src/{philosophy.md,
-  reference-topologies.md, configuration.md ([worker]/[ballista] knobs), fine-tune pages}`,
-  `docs/maintainer/MAINTAINER-GUIDE.md` (prose; the `PRODUCING-DESCRIPTOR-VARIANTS` block itself
-  lands with U2a and U3), `CHANGELOG.md`, `deploy/kubernetes/overlays/shape-d/**` (68 K's
-  compute Deployment becomes a StatefulSet with a headless service and `nvidia.com/gpu: N`;
-  K's own comment invites this edit; co-owned, K first), `deploy/docker-compose*.yml` note.
-- **acceptance**: docs gates green; reference-topologies states the StatefulSet consequence;
-  kubeconform strict on the amended overlay; the K README's `issues/500` provisional note is
-  replaced, not duplicated.
-- **lane**: docs + kubeconform. **depends_on**: all, 68 K merged. **size**: M.
+  reference-topologies.md, configuration.md ([worker]/[ballista]/peer_advertise knobs), fine-tune
+  pages}`, `docs/maintainer/MAINTAINER-GUIDE.md` (prose; the `PRODUCING-DESCRIPTOR-VARIANTS` block
+  lands with U2a and U3), `CHANGELOG.md`.
+- **acceptance**: docs gates green; reference-topologies states the StatefulSet consequence.
+- **lane**: docs. **depends_on**: all. **size**: M.
+
+## U9b — shape-d overlay (PR-D commit 4)
+
+- **files_in_scope** (docs-ci): `deploy/kubernetes/overlays/shape-d/**` (68 K's compute
+  Deployment becomes a StatefulSet with a headless service and `nvidia.com/gpu: N`, keeping OPS
+  C6's `terminationGracePeriodSeconds` observable green; K's own header invites this edit),
+  `deploy/docker-compose*.yml` note, the K README's `issues/500` provisional note (replaced, not
+  duplicated).
+- **acceptance**: kubeconform strict + kind smoke on the amended overlay; K3/K4b guards green;
+  the `issues/500` note count as K's oracle expects after replacement.
+- **lane**: kubeconform + kind smoke. **depends_on**: 68 K merged, 68 OPS merged. **size**: M.

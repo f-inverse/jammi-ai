@@ -89,6 +89,7 @@ docs/plans/*
 !docs/plans/65-resolve-witness/
 !docs/plans/66-tower-profile/
 !docs/plans/67-distributed-training/
+!docs/plans/68-compute-tier-substrate/
 docs/superpowers/
 docs/IMPLEMENTATION.md
 docs/specs/

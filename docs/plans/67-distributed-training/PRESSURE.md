@@ -129,4 +129,30 @@ upstream gap (r43); device pinning and bytes (r44); pre-swept names (r45); PR-C 
 v3.1 rulings 9, 11 (tenant-scoped mount), 17 (`[training]` knobs), 18 (one migration) and 19's
 ordering are superseded.
 
-### Round 4 (on v4) — recorded below after the re-dispatch
+### Round 4 (2026-09-10, on v4 56d31443) — two lenses, both REFINE; folded into v4.1/v4.2
+
+Design lens (11 block, 3 advisory): `fail_job` is terminal → abort lands no terminal write, reclaim
+requeues (r36); `Released` → `release_job_lease` then the lost flag; `JobSlot` held across the run
+and released before idle, fence before slot (r27); the W=1 self-dispatch K4 row replaced by the
+W=2 wire-vs-local row; tenant-free read is a new verb `get_job_for_rank` (r34); `peers[rank →
+instance_id]`, no addresses on the wire; a live `building` row → `BackOff` + reclaim after expiry
+(r31); `publish_crates.sh` is the K6 registry, `check_dep_direction.py` dropped; object-store
+shuffle out of v1 (D2 condition 3 stands); `DevicePlacement` predicate named (stage plan via
+`JammiCodec`) and added to S6; `list_gang_members` with whole-token kinds; `peer_addr` double duty
+recorded; D2 ground numbering and the stale "029" fixed.
+
+Sizing lens (10 block, 4 advisory): the "unpushed PR-C" premise was overtaken by the #501 merge —
+re-anchored to `main` @ 4ecc0230; DIST "unit 2" is a sketch → U5b-1 builds the membership
+substrate; U5a's verbatim-carry fallback deleted (DIST-1 hard precondition; OPS and GRAPH before
+PR-C(67) because they rewrite the claim loop); `ballista_state` → distributor-neutral
+`compute_cluster_state` with the repo in `jammi-ballista`; U8a's three registration sites (domain
+card → admin merge, publish list, dep-DAG); S6 extended with restart / two-scheduler / identity
+probes gating U8b; `workers.devices` moves to U8b; U5b split (U5b-1 membership + determinism;
+U5b-2 failure semantics + chaos); migration rule restated (no reserved numbers, two pin sites);
+co-ownership rows added (worker.rs/claim_next ordering, session.rs, migration pins, error tags,
+tests main.rs); U4a `[training]` leftover fixed; U1's pin-guard test authored by U1 and `cargo
+tree -d` covers tonic/prost; U9 split (U9a docs, U9b overlay); PR-D merge condition stated.
+
+### Consolidation (2026-09-10): both plans owned by one lead; single schedule in `../68-compute-tier-substrate/PROGRAM.md`
+
+### Round 5 (on the consolidated plans) — disposition check, recorded below

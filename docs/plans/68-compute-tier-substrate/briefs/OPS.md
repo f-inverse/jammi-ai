@@ -1,0 +1,31 @@
+# Brief OPS — compute-tier operability: drain on shutdown, lease release, queue and liveness gauges, warm-before-ready
+
+Unit: feature. Cuts after PR-C merges (touches the worker, the lease keeper, the jobs repo — all on wt-C). One PR, commits by capability.
+
+## The user-visible defects this removes
+D1. A rolling update or node drain loses in-flight training. Verified: SIGTERM → serve loop drains RPCs → `session.close()` (wt-C crates/jammi-server/src/runtime.rs ~:476-566) → `stop_and_join` stops the LOOP only (wt-C crates/jammi-ai/src/fine_tune/worker.rs ~:1657-1720: "never force-cancels an in-flight training run") → process exits → the `spawn_blocking` thread dies with it → the lease expires (`[lease] duration_secs`) → `reclaim_expired_jobs` re-queues it → it restarts from the beginning on another worker (`attempts` capped by `MAX_ATTEMPTS`). Epoch checkpointing exists as an artifact-retention option (worker.rs `epoch_checkpointing`), not as resume-on-reclaim. Reproduce all of this on wt-C and cite it.
+D2. The successor waits a full lease duration before it can reclaim, even when the dying process knew it was dying.
+D3. Nothing scrapeable says how deep the queue is or whether this worker is busy, so autoscaling the compute tier on demand is impossible. `/metrics` today registers grpc_requests, flight_queries, eval_invocations, search_latency only (main crates/jammi-server/src/routes/health.rs:107-134). `ListJobs`/`ListWorkers` exist on the wire (wt-C job.proto) but an autoscaler keys on a metrics endpoint.
+D4. A hung training thread with a live keeper looks healthy forever; `/healthz` is a static 200 and `/readyz` pings the catalog (health.rs:1-46).
+D5. A query-tier replica reports ready before it has loaded the models it will serve; the first requests after every rollout are cold. `preload_models` exists in server config (wt-C config/mod.rs ~:1241) — find whether readiness waits for it; if it does not, that is the defect.
+
+## Decisions taken (validate or refute with the principle)
+- Shutdown has exactly two modes, modelled on PostgreSQL's smart/fast shutdown (verify via postgresql.org docs and cite): first SIGTERM = DRAIN (stop claiming, keep heartbeating every held lease, finish in-flight jobs, then exit); a second SIGTERM/SIGINT while draining = RELEASE (mark every held lease released so a successor claims immediately, then exit — the in-flight thread dies with the process exactly as today, but the successor does not wait for expiry). No engine-side drain timeout: the runtime bounds drain (Kubernetes terminationGracePeriodSeconds, systemd TimeoutStopSec, docker stop -t) — a second timeout inside the engine would duplicate the runtime's and the engine cannot abort a spawn_blocking thread anyway. Same two modes on the library: `close()` drains; `close(release=True)` (or equivalent) releases — the library is never less capable than the server. State the exact API on every surface (Rust session, Python, server signal handling) and what a job's row looks like after each mode.
+- RELEASE must be a lease-level mechanism (release = set lease_expires_at to now-or-null under the same CAS the keeper uses), never a job-status transition invented for shutdown; `attempts` increments as any reclaim does. Say whether a released job should count an attempt (recommend: yes, it is a real restart; but a deploy storm must not burn MAX_ATTEMPTS — decide and justify; consider a `release` reason column vs. not counting).
+- Gauges: on `/metrics`, `jammi_jobs_queued{kind}` and `jammi_jobs_running{kind}` sampled at each worker tick from the catalog (never computed on scrape: a scrape storm must not become a catalog storm), exposed only by worker-enabled processes; per-process `jammi_worker_jobs_in_flight`, `jammi_lease_heartbeat_age_seconds`, `jammi_worker_claim_loop_up`. Name every metric with the label set and the exact source of its value. Prometheus naming conventions: verify against prometheus.io/docs/practices/naming and cite.
+- Liveness: `/healthz` on a worker-enabled process returns 503 when the keeper thread is dead or the claim loop task has exited abnormally (PR-C's keeper-liveness surface: find it on wt-C — `LeaseHold::lost` / `is_alive`). It does NOT try to detect a slow training step (speculative; state why).
+- Warm-before-ready: readiness stays 503 until `preload_models` are loaded; a `[server] preload_models` failure is a startup error, never a silent skip (K2). If readiness already waits, drop D5 and say so.
+- Manifests: the compute overlay gains `terminationGracePeriodSeconds` sized to the longest job the deployer accepts to wait for (a documented number, not a magic default) and a comment naming DRAIN/RELEASE; a `spot` example paragraph in the README (tolerations + the same grace period) — an overlay only if it is a shape the engine cares about, else a paragraph. These manifest edits ride THIS PR (B6), applied on top of PR-K's tree.
+
+## Forks for the planner
+F1. Where does DRAIN state live — a flag on the worker loop, or the `workers` catalog row (so `ListWorkers` shows "draining")? Recommend: both; the row is the truth other processes can see.
+F2. Should DRAIN also refuse new RPC submissions? No — the submission surface stays up (the query tier may be the same process in Shape B); only claiming stops. Confirm against tiers.
+F3. The gauge sampling cadence vs. `[worker]` poll interval; cost of `count(*) group by kind` on Postgres and SQLite; index coverage (idx_jobs_claim).
+F4. Whether `jammi_jobs_queued` should be tenant-labelled. Recommend NO (cardinality; tenant scope is a listing predicate, not a metrics dimension — B5).
+
+## Acceptance to make falsifiable
+- A worker mid-job receiving SIGTERM finishes the job and exits 0; the job lands `completed` with the same result as an uninterrupted run (hermetic test with a fast fixture, both backends).
+- A second SIGTERM while draining exits promptly; the job is claimable by a second process within one poll interval, not one lease duration.
+- `/metrics` on a worker process shows the queued count change after a SubmitJob, within one tick.
+- `/healthz` flips to 503 within one heartbeat interval after the keeper thread is killed (test hook exists on wt-C: `kill_thread_for_test`).
+- `/readyz` is 503 while preload runs and 200 after (or the D5 refutation).

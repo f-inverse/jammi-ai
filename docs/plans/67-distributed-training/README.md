@@ -11,8 +11,8 @@ for the sibling units 67 depends on.
 **Posture:** greenfield. Nothing that exists is a constraint; whatever needs rebuilding the
 right way is rebuilt. Every fork is resolved by deriving from `docs/guide/src/philosophy.md`
 and `docs/swarm/CONSTITUTION.md` and from solid outside references (`DESIGN.md` §References),
-never by asking. Sibling plan 68 is modified in place and additively only (its units are not
-re-planned); see `68-compute-tier-substrate/RECONCILIATION-WITH-67.md`.
+never by asking. Plans 67 and 68 are owned together from 2026-09-10; 68's five units keep their PROCEED
+verdicts unchanged, and the single cross-plan schedule is `68-compute-tier-substrate/PROGRAM.md`.
 
 ## The ask (issue #500)
 

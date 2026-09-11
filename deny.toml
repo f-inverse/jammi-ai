@@ -1,6 +1,6 @@
 # cargo-deny configuration — the dependency-supply-chain gate.
 #
-# Three lanes, run in CI on every PR (see `.github/workflows/ci.yml`, the
+# Four lanes, run in CI on every PR (see `.github/workflows/ci.yml`, the
 # `dep-audit` job):
 #
 #   * advisories — the live RustSec advisory DB. A new vulnerability/unsound
@@ -16,14 +16,18 @@
 #     guards already in CI.
 #
 # Every lane binds exactly the feature graph its invocation builds, so the
-# `dep-audit` job runs all four TWICE: over the DEFAULT-feature graph (the
-# `jammi-server` crate as published to crates.io and the CPU-only `pip install`
-# wheel) and over `--all-features` (which is what covers the release image and
-# the CUDA lanes — both build `jetstream-broker` + `storage-cloud`, see
-# `Dockerfile` and `ci/release-feature-manifest.json` — and jammi-db's
-# `postgres`/`mysql` backends). A copyleft license, a git source, a second
-# engine line or an advisory hiding behind an optional feature is caught by the
-# second run; the default-only run cannot see it.
+# `dep-audit` job runs all four TWICE: over the DEFAULT-feature graph (only
+# the bare `jammi-server` crate as published to crates.io, built with no
+# `--features` at all) and over `--all-features` (which covers every OTHER
+# shipped family — the CPU PyPI wheel, the CPU tarball, the CPU container
+# image and all three CUDA lanes, every one of which builds `jetstream-broker`
+# + `storage-cloud`; see `.github/workflows/pypi-server.yml`,
+# `release-binaries.yml`, `Dockerfile` and `ci/release-feature-manifest.json`
+# — plus jammi-db's `postgres`/`mysql` backends). A copyleft license, a git
+# source, a second engine line or an advisory hiding behind an optional
+# feature is caught by the second run; the default-only run cannot see it.
+# `crates/jammi-db/tests/it/shipped_feature_exposure.rs` derives and gates the
+# exact per-family feature list so this paragraph cannot drift from it again.
 
 # ---------------------------------------------------------------------------
 # Advisories — the RustSec lane.
@@ -63,24 +67,35 @@ ignore = [
     "RUSTSEC-2026-0177",
     # --- Feature-gated paths, surfaced by the `--all-features` advisory lane ---
     # These reach the tree only through a cargo feature, so the DEFAULT-feature
-    # graph — the `jammi-server` crate as published to crates.io and the
-    # CPU-only `pip install` wheel — is advisory-clean without them. That is
-    # NOT the shipped posture: the release image (`Dockerfile`: `--features
-    # jammi-server/jetstream-broker,jammi-server/storage-cloud`) and all three
-    # CUDA lanes (`ci/release-feature-manifest.json`: `cargo_features` include
-    # `jetstream-broker` and `storage-cloud`) build BOTH features and ARE
-    # exposed to every entry below that they carry. That is exactly why the
-    # `--all-features` advisories lane is a merge gate: a new advisory on one
-    # of these paths reds the PR instead of shipping in the image unseen.
+    # graph — the bare `jammi-server` crate as published to crates.io, built
+    # with no `--features` at all — is advisory-clean without them. That is
+    # NOT the shipped posture of every OTHER family: the CPU PyPI wheel and
+    # CPU tarball (`.github/workflows/pypi-server.yml`,
+    # `release-binaries.yml`: `jetstream-broker,storage-cloud`), the CPU
+    # container image (`Dockerfile`: `--features
+    # jammi-server/jetstream-broker,jammi-server/storage-cloud`), and all
+    # three CUDA lanes (`ci/release-feature-manifest.json`: `cargo_features`
+    # include `jetstream-broker` and `storage-cloud`) all build these features
+    # and ARE exposed to every entry below that they carry. That is exactly
+    # why the `--all-features` advisories lane is a merge gate: a new advisory
+    # on one of these paths reds the PR instead of shipping in a build unseen.
     #
     # quick-xml 0.39.4 — quadratic duplicate-attribute scan (0194) and unbounded
     # namespace-declaration allocation (0195), both reachable when parsing a
     # HOSTILE XML document. Reached only via `object_store`'s aws/gcp/azure
     # backends, i.e. jammi-db's `storage-s3`/`storage-gcs`/`storage-azure`/
     # `storage-r2` features, where the XML parsed is an object-store API
-    # response. EXPOSURE: the release image and the CUDA lanes ship
-    # `storage-cloud`; any deployment of them whose object-store endpoint is
+    # response, gated by jammi-server's `storage-cloud` feature. The two
+    # EXPOSURE lines below are GENERATED and gated:
+    # `crates/jammi-db/tests/it/shipped_feature_exposure.rs` asserts them
+    # byte-equal to every shipped family whose cargo_features carries
+    # `storage-cloud` today — a shipped family gaining the feature reds that
+    # test until this block is regenerated to match, and a family losing it
+    # reds the same way (never silently over- or under-stated). Any
+    # deployment of a listed family whose object-store endpoint is
     # attacker-controlled (or MITM'd) can be driven to CPU/memory exhaustion.
+    # EXPOSURE[RUSTSEC-2026-0194] = cpu-wheel, cpu-tarball, cpu-image, cu12-tarball, cu12-wheel, cu12-image
+    # EXPOSURE[RUSTSEC-2026-0195] = cpu-wheel, cpu-tarball, cpu-image, cu12-tarball, cu12-wheel, cu12-image
     # NO UPSTREAM FIX REACHABLE: the patched line is
     # quick-xml >= 0.41, which requires object_store >= 0.14.1, which requires
     # leaving the DataFusion 54 line (datafusion 54.1 pins object_store
@@ -143,8 +158,9 @@ multiple-versions = "allow"
 # WHICH GRAPH ENFORCES THIS: `cargo deny` evaluates the feature graph it is
 # given, so these entries bind exactly the graph the invocation builds. The
 # `dep-audit` CI job therefore runs the bans lane TWICE: once with default
-# features (the crates.io `jammi-server` and the CPU-only wheel) and once with
-# `--all-features` (the release image and the CUDA lanes, which build
+# features (only the bare crates.io `jammi-server` crate) and once with
+# `--all-features` (the CPU PyPI wheel, the CPU tarball, the CPU container
+# image and all three CUDA lanes, every one of which builds
 # `jetstream-broker` + `storage-cloud`). The second run is the load-bearing one for the optional
 # backends: every crate reachable only through jammi-db's `postgres`/`mysql`
 # features — the whole `datafusion-table-providers{,-common,-mysql,-postgres}`

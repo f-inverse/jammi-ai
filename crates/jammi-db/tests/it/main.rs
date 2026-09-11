@@ -39,6 +39,7 @@ mod recovery;
 mod register_computed_embedding;
 mod segment;
 mod serde_json_preserve_order;
+mod shipped_feature_exposure;
 mod sources;
 mod sqlite_single_process_seam;
 mod storage_cloud;

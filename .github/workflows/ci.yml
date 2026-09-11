@@ -968,9 +968,12 @@ jobs:
       # hide: with `datafusion-substrait = "55"` added behind jammi-db's
       # `postgres` feature, the lockfile carries DataFusion 54 AND 55 and the
       # step above still prints `bans ok`, while this one reports 8 errors.
-      # The `--all-features` graph is the SHIPPED one for the release image
-      # and the CUDA lanes (both build `jetstream-broker` + `storage-cloud`),
-      # so all four lanes run over it — licenses and sources included: an LGPL
+      # The `--all-features` graph is the SHIPPED one for every family except
+      # the bare crates.io crate: the CPU PyPI wheel, the CPU tarball, the CPU
+      # container image and the CUDA lanes all build `jetstream-broker` +
+      # `storage-cloud` (`crates/jammi-db/tests/it/shipped_feature_exposure.rs`
+      # derives and gates the exact per-family list), so all four lanes run
+      # over it — licenses and sources included: an LGPL
       # crate or a git-sourced crate behind jammi-db's `postgres` feature
       # passes the default lanes (rc=0) and fails only here (rc=4 / rc=8).
       # Run as a separate step (not `[graph] all-features = true` in

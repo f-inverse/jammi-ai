@@ -973,8 +973,8 @@ async fn stale_process_binding_does_not_corrupt_a_concurrent_refresh() {
 /// graph_propagation, context_predictor) now route through instead of a
 /// session's registered `jammi.{table}`, precisely so a producer that
 /// resolves its artifact's provenance from a FRESH catalog read (e.g.
-/// `result_digest_anchor`, which reads `table.current_version`) reads
-/// content that agrees with it.
+/// `pin_current_version`'s anchor, which reads `table.current_version`)
+/// reads content that agrees with it.
 ///
 /// Same two-session staleness shape as
 /// `stale_process_binding_does_not_corrupt_a_concurrent_refresh` (O2):
@@ -1112,9 +1112,10 @@ async fn pin_current_version_survives_a_publish_race_between_pin_and_read() {
     let fresh_anchor = h
         .session
         .result_store()
-        .result_digest_anchor(&h.record().await)
+        .pin_current_version(h.record().await)
         .await
-        .unwrap();
+        .unwrap()
+        .input_anchor();
     assert_ne!(
         fresh_anchor, pinned_anchor,
         "v1 published a new identity; the v0 pin must not have followed it"
@@ -1180,9 +1181,19 @@ async fn pin_current_version_survives_a_publish_race_between_pin_and_read() {
 /// the still-public primitives its two legs were built from — not against
 /// `ebb1c9e6`, which predates `PinnedSource` and where the round-4 oracle
 /// cannot even compile:
-/// - the anchor leg: `result_digest_anchor` (the safe, still-public
-///   replacement for the now-crate-private `current_version_identity`;
-///   identical output for this call shape).
+/// - the anchor leg: `result_digest_anchor` computed the SAME value this
+///   test now gets from `pin_current_version(record).input_anchor()` for
+///   this call shape — the round-5 shape routed through
+///   `pin_current_version` internally for a versioned table, so calling it
+///   directly here is byte-identical. `result_digest_anchor` itself was
+///   REMOVED in round 6 (M1): it returned a bare `InputAnchor` with the
+///   resolution that produced it discarded, so a caller held an anchor with
+///   no way to get the matching content back without a second, independent
+///   resolve — precisely the shape this test's LATE resolution below
+///   reconstructs on purpose. Getting the EARLY anchor from
+///   `pin_current_version` instead does not change what this test proves:
+///   the divergence this oracle catches is between the EARLY resolution and
+///   the LATE one, never between two ways of asking for the early one.
 /// - the read leg: `resolve_version_manifest` + `build_masked_provider` —
 ///   literally `current_version_provider`'s old body, still public because
 ///   `embedding_refresh.rs`'s delta/compaction producers legitimately
@@ -1205,9 +1216,10 @@ async fn old_two_call_shape_straddles_a_publish_race_pin_current_version_does_no
     let early_anchor = h
         .session
         .result_store()
-        .result_digest_anchor(&early_record)
+        .pin_current_version(early_record.clone())
         .await
-        .unwrap();
+        .unwrap()
+        .input_anchor();
     let pin = h
         .session
         .result_store()
@@ -1217,7 +1229,7 @@ async fn old_two_call_shape_straddles_a_publish_race_pin_current_version_does_no
     assert_eq!(
         pin.input_anchor(),
         early_anchor,
-        "one resolution names one anchor, whichever public entry point asks for it"
+        "two independent early resolutions of the same record name the same anchor"
     );
 
     // THE RACE: a version publishes BETWEEN the early anchor above and the

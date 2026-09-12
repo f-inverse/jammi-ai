@@ -455,8 +455,9 @@ impl ResultStore {
                     Some(manifest) => Ok(CurrentAnchor::ResultDigest(manifest.artifact.0)),
                     // A resolvable result table with no manifest is a pre-contract
                     // parent: its current digest is recomputed from its bytes, the
-                    // same fall-back `result_digest_anchor` uses, so the comparison
-                    // is against the parent's true present content.
+                    // same fall-back `pin_current_version`'s unversioned arm uses,
+                    // so the comparison is against the parent's true present
+                    // content.
                     None => {
                         let handle = self.open_parquet(&parquet_url)?;
                         let path = handle.data_path()?;

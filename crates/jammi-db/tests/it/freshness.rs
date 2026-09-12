@@ -215,7 +215,11 @@ async fn fresh_when_definition_and_inputs_are_unchanged(backend: BackendKind) {
 
     // A parent result table, then a child that anchors on the parent's digest.
     let (parent, _) = materialize(&store, &ctx, vec![]).await;
-    let parent_anchor = store.result_digest_anchor(&parent).await.unwrap();
+    let parent_anchor = store
+        .pin_current_version(parent.clone())
+        .await
+        .unwrap()
+        .input_anchor();
     let (child, def) = materialize(&store, &ctx, vec![parent_anchor]).await;
 
     assert_eq!(
@@ -268,7 +272,11 @@ async fn stale_when_a_parent_is_recomputed_to_a_new_digest(backend: BackendKind)
 
     // Parent v1; child anchors on parent's CURRENT digest.
     let (parent, _) = materialize(&store, &ctx, vec![]).await;
-    let parent_anchor = store.result_digest_anchor(&parent).await.unwrap();
+    let parent_anchor = store
+        .pin_current_version(parent.clone())
+        .await
+        .unwrap()
+        .input_anchor();
     let recorded_digest = parent_anchor.anchor.0.clone();
     let (child, def) = materialize(&store, &ctx, vec![parent_anchor]).await;
     assert_eq!(
@@ -528,7 +536,11 @@ async fn derives_from_reports_the_one_hop_dependents(backend: BackendKind) {
     let ctx = SessionContext::new();
 
     let (parent, _) = materialize(&store, &ctx, vec![]).await;
-    let parent_anchor = store.result_digest_anchor(&parent).await.unwrap();
+    let parent_anchor = store
+        .pin_current_version(parent.clone())
+        .await
+        .unwrap()
+        .input_anchor();
     let (child, _) = materialize(&store, &ctx, vec![parent_anchor.clone()]).await;
     // A second, unrelated table anchored on a DIFFERENT source must NOT appear.
     let (_other, _) = materialize(
@@ -555,9 +567,17 @@ async fn derives_from_closure_walks_transitively(backend: BackendKind) {
 
     // A → B → C chain via ResultDigest anchors.
     let (a, _) = materialize(&store, &ctx, vec![]).await;
-    let a_anchor = store.result_digest_anchor(&a).await.unwrap();
+    let a_anchor = store
+        .pin_current_version(a.clone())
+        .await
+        .unwrap()
+        .input_anchor();
     let (b, _) = materialize(&store, &ctx, vec![a_anchor]).await;
-    let b_anchor = store.result_digest_anchor(&b).await.unwrap();
+    let b_anchor = store
+        .pin_current_version(b.clone())
+        .await
+        .unwrap()
+        .input_anchor();
     let (c, _) = materialize(&store, &ctx, vec![b_anchor]).await;
 
     let closure = store.derives_from_closure(&a.table_name).await.unwrap();
@@ -585,7 +605,11 @@ async fn derives_from_closure_is_stack_safe_on_a_deep_chain(backend: BackendKind
     let (root, _) = materialize(&store, &ctx, vec![]).await;
     let mut prev = root.clone();
     for _ in 0..DEPTH {
-        let anchor = store.result_digest_anchor(&prev).await.unwrap();
+        let anchor = store
+            .pin_current_version(prev.clone())
+            .await
+            .unwrap()
+            .input_anchor();
         let (next, _) = materialize(&store, &ctx, vec![anchor]).await;
         prev = next;
     }
@@ -664,11 +688,23 @@ async fn derives_from_closure_collects_a_diamond_descendant_once(backend: Backen
 
     // root feeds P1 and P2; both P1 and P2 feed the shared child C.
     let (root, _) = materialize(&store, &ctx, vec![]).await;
-    let root_anchor = store.result_digest_anchor(&root).await.unwrap();
+    let root_anchor = store
+        .pin_current_version(root.clone())
+        .await
+        .unwrap()
+        .input_anchor();
     let (p1, _) = materialize(&store, &ctx, vec![root_anchor.clone()]).await;
     let (p2, _) = materialize(&store, &ctx, vec![root_anchor]).await;
-    let p1_anchor = store.result_digest_anchor(&p1).await.unwrap();
-    let p2_anchor = store.result_digest_anchor(&p2).await.unwrap();
+    let p1_anchor = store
+        .pin_current_version(p1.clone())
+        .await
+        .unwrap()
+        .input_anchor();
+    let p2_anchor = store
+        .pin_current_version(p2.clone())
+        .await
+        .unwrap()
+        .input_anchor();
     // C anchors on BOTH P1 and P2 — the re-converging node.
     let (c, _) = materialize(&store, &ctx, vec![p1_anchor, p2_anchor]).await;
 

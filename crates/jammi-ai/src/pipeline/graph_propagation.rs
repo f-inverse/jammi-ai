@@ -811,6 +811,13 @@ impl InferenceSession {
     /// (`ResultDigest`); a `Registered` external source has no version surface in
     /// open-core, so it is anchored as `UnpinnedAtInstant` — honest about the
     /// reproducibility gap rather than fabricating a pin.
+    ///
+    /// Round 6 (M1): resolves through [`jammi_db::store::ResultStore::pin_current_version`]
+    /// rather than the now-removed `result_digest_anchor` — same value (a
+    /// `NeighborGraph` table is excluded from embedding refresh, so it can
+    /// never carry a `current_version`; both routes took the unversioned,
+    /// hash-the-Parquet arm), but the anchor no longer has a public shape a
+    /// caller could get without also being able to get the matching content.
     async fn edge_source_anchor(
         self: &Arc<Self>,
         edge_source: &EdgeSourceRef,
@@ -826,7 +833,11 @@ impl InferenceSession {
                             "propagate: edge relation '{table_name}' not found in the catalog"
                         ))
                     })?;
-                self.result_store().result_digest_anchor(&record).await
+                Ok(self
+                    .result_store()
+                    .pin_current_version(record)
+                    .await?
+                    .input_anchor())
             }
             EdgeSourceRef::Registered { source_id, .. } => {
                 Ok(jammi_db::store::manifest::InputAnchor::unpinned_at_instant(

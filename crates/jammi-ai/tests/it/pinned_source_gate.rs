@@ -43,8 +43,16 @@
 use std::collections::HashSet;
 use std::path::{Path, PathBuf};
 
-/// `(file name, allowed count)`. Every entry here was reviewed as reading an
-/// UNVERSIONED edge/source relation, never the pinned embedding table:
+/// `(path relative to `src/pipeline/`, allowed count)`. Every entry here was
+/// reviewed as reading an UNVERSIONED edge/source relation, never the pinned
+/// embedding table.
+///
+/// **Keyed on the PATH, not the bare file name (round 6 advisory).** The
+/// walk this gate checks against is recursive (round 5, M3), so a bare file
+/// name would let a same-named file in a DIFFERENT subdirectory (e.g. a
+/// future `src/pipeline/asof/graph_propagation.rs`) silently inherit an
+/// allowance reviewed for a wholly different file, with no new review at
+/// all. A path is unique per file; a bare name is not.
 const ALLOWED: &[(&str, usize)] = &[
     // `edge_scan_sql`'s S9 neighbor_graph edge scan — the EDGE relation, not
     // the embedding table `PinnedSource` covers. Reviewed in the DELTA
@@ -129,28 +137,32 @@ fn no_new_unpinned_jammi_table_literal_in_pipeline() {
             .replace(std::path::MAIN_SEPARATOR, "/");
         reached.insert(rel);
 
-        let file_name = path
-            .file_name()
-            .and_then(|n| n.to_str())
-            .expect("utf8 file name")
-            .to_string();
+        // Keyed on the path relative to `src/pipeline/` (round 6 advisory),
+        // never the bare file name — see `ALLOWED`'s own doc.
+        let pipeline_relative = path
+            .strip_prefix(&dir)
+            .expect("file under src/pipeline")
+            .to_str()
+            .expect("utf8 path")
+            .replace(std::path::MAIN_SEPARATOR, "/");
         let text = std::fs::read_to_string(path).expect("read pipeline source file");
         let count = count_bare_jammi_table_literal(&text);
         let allowed = ALLOWED
             .iter()
-            .find(|(f, _)| *f == file_name)
+            .find(|(f, _)| *f == pipeline_relative)
             .map(|(_, n)| *n)
             .unwrap_or(0);
         assert!(
             count <= allowed,
-            "{file_name}: {count} occurrence(s) of the bare `jammi.{{table}}` literal, {allowed} \
-             audited/allowed. A NEW site must read through \
+            "{pipeline_relative}: {count} occurrence(s) of the bare `jammi.{{table}}` literal, \
+             {allowed} audited/allowed. A NEW site must read through \
              `ResultStore::pin_current_version`/`pinned_provider`, never construct the \
              session-registered `jammi.{{table}}` reference directly (see \
              `ResultStore::bind_result_table`'s staleness-residual doc). If this site IS an \
              audited exception (an unversioned edge/source relation, not the pinned embedding \
-             table), add it to this test's `ALLOWED` list with the same review its existing \
-             entries had — a site list alone is not this gate."
+             table), add it to this test's `ALLOWED` list — keyed on this same path, never the \
+             bare file name — with the same review its existing entries had; a site list alone \
+             is not this gate."
         );
     }
 
@@ -184,15 +196,15 @@ fn allowed_entries_are_still_present_and_at_their_audited_count() {
     // should shrink with it rather than sit as permanent dead slack that
     // could hide a LATER, different unpinned read reusing the same budget.
     let dir = Path::new(concat!(env!("CARGO_MANIFEST_DIR"), "/src/pipeline"));
-    for (file_name, allowed) in ALLOWED {
-        let text = std::fs::read_to_string(dir.join(file_name))
-            .unwrap_or_else(|e| panic!("read {file_name}: {e}"));
+    for (relative_path, allowed) in ALLOWED {
+        let text = std::fs::read_to_string(dir.join(relative_path))
+            .unwrap_or_else(|e| panic!("read {relative_path}: {e}"));
         let count = count_bare_jammi_table_literal(&text);
         assert_eq!(
             count, *allowed,
-            "{file_name}: expected exactly {allowed} audited occurrence(s) of `jammi.{{`, found \
-             {count} — update this allowlist to match, with the same review its other entries \
-             had"
+            "{relative_path}: expected exactly {allowed} audited occurrence(s) of `jammi.{{`, \
+             found {count} — update this allowlist to match, with the same review its other \
+             entries had"
         );
     }
 }

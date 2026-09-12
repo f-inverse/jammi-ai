@@ -8,7 +8,7 @@ use bytes::Bytes;
 use chrono::{DateTime, Utc};
 use futures::TryStreamExt;
 use object_store::path::Path as ObjectPath;
-use object_store::ObjectStore;
+use object_store::{ObjectStore, ObjectStoreExt};
 
 use super::builder::DynObjectStore;
 use super::error::StorageError;

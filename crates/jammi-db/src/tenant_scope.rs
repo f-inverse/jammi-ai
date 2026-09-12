@@ -426,7 +426,7 @@ mod tests {
             other => panic!("expected column inside Cast, got {other:?}"),
         };
         assert_eq!(lhs_col.name, col_name);
-        assert_eq!(lhs_cast.data_type, arrow_schema::DataType::Utf8);
+        assert_eq!(lhs_cast.field.data_type(), &arrow_schema::DataType::Utf8);
         let rhs_lit = match eq.right.as_ref() {
             Expr::Literal(ScalarValue::Utf8(Some(s)), _) => s.clone(),
             other => panic!("expected Utf8 literal on left arm rhs, got {other:?}"),

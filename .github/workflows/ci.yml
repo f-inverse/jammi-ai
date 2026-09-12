@@ -89,6 +89,29 @@ jobs:
           cargo clippy -p jammi-ai --tests --features live-gpu-tests,live-distributed-tests -- -D warnings
           cargo clippy -p jammi-server --tests --features test-hooks -- -D warnings
 
+      # `openssl-sys` (pulled in transitively by `native-tls`, which
+      # `datafusion-table-providers`'s `postgres`/`mysql` subcrates depend on
+      # unconditionally — there is no rustls alternative at this version)
+      # needs OpenSSL development headers to build. This image deliberately
+      # omits `openssl-devel` from the shared build substrate: it protects
+      # manylinux wheel linkage, and the image's builder toolchain resolves
+      # `libssl` to the 1.1 SONAME while the published runtime image ships
+      # only the 3 series, so an image-wide install would let a build LINK
+      # against 1.1 here and then FAIL TO LOAD there. The requirement
+      # belongs to this one feature surface, not to the image, so it is
+      # scoped to this step.
+      - name: OpenSSL headers (openssl-sys build script, source-provider lint only)
+        run: yum install -y openssl-devel
+
+      # jammi-db's `postgres` / `mysql` features compile `source/postgres.rs`
+      # and `source/mysql.rs` (the `datafusion-table-providers` compat
+      # surface) and nothing else on the merge path activates them, so the
+      # workspace clippy above never sees those files. A coverage lane, not
+      # a `required-features` closure: `ci/scripts/check_lint_surface_closure.py`
+      # credits it like every other `cargo clippy ... -D warnings` line here.
+      - name: Clippy jammi-db --features postgres,mysql --all-targets (source-provider feature surface)
+        run: cargo clippy -p jammi-db --features postgres,mysql --all-targets -- -D warnings
+
   test:
     name: Test (hermetic)
     runs-on: ubuntu-latest
@@ -956,6 +979,31 @@ jobs:
         run: cargo install cargo-deny --locked
       - name: cargo deny (advisories + licenses + bans + sources)
         run: cargo deny check advisories licenses bans sources
+
+      # `cargo deny` evaluates the feature graph the invocation builds, and the
+      # step above builds the DEFAULT one — which excludes every crate reachable
+      # only through an optional feature: the whole
+      # `datafusion-table-providers{,-common,-mysql,-postgres}` subtree behind
+      # jammi-db's `postgres`/`mysql`, `async-nats` behind `jetstream-broker`,
+      # and `object_store`'s aws/gcp/azure backends behind `storage-*`. Those
+      # are precisely where a second DataFusion line or an unseen advisory can
+      # hide: with `datafusion-substrait = "55"` added behind jammi-db's
+      # `postgres` feature, the lockfile carries DataFusion 54 AND 55 and the
+      # step above still prints `bans ok`, while this one reports 8 errors.
+      # The `--all-features` graph is the SHIPPED one for every family except
+      # the bare crates.io crate: the CPU PyPI wheel, the CPU tarball, the CPU
+      # container image and the CUDA lanes all build `jetstream-broker` +
+      # `storage-cloud` (`crates/jammi-db/tests/it/shipped_feature_exposure.rs`
+      # derives and gates the exact per-family list), so all four lanes run
+      # over it — licenses and sources included: an LGPL
+      # crate or a git-sourced crate behind jammi-db's `postgres` feature
+      # passes the default lanes (rc=0) and fails only here (rc=4 / rc=8).
+      # Run as a separate step (not `[graph] all-features = true` in
+      # deny.toml) so the default graph keeps its own verdict: the two graphs
+      # carry different advisory sets, and the feature-gated ones are listed as
+      # documented `[advisories] ignore` exceptions with their exposure.
+      - name: cargo deny --all-features (bans + advisories + licenses + sources — shipped-feature graph)
+        run: cargo deny --all-features check bans advisories licenses sources
 
   ts-client:
     name: TS client (@f-inverse/jammi-client)

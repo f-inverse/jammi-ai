@@ -13,7 +13,6 @@
 //! carried as `DataFusionError::External`, which the structural classifier
 //! (`impl From<DataFusionError> for JammiError`) restores for every caller.
 
-use std::any::Any;
 use std::sync::Arc;
 
 use arrow::datatypes::DataType;
@@ -57,10 +56,6 @@ impl std::hash::Hash for ContentHashUdf {
 }
 
 impl ScalarUDFImpl for ContentHashUdf {
-    fn as_any(&self) -> &dyn Any {
-        self
-    }
-
     fn name(&self) -> &str {
         CONTENT_HASH_UDF_NAME
     }

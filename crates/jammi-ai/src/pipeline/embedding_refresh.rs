@@ -929,6 +929,10 @@ impl InferenceSession {
             None,
             PartitionMode::CollectLeft,
             datafusion::common::NullEquality::NullEqualsNothing,
+            // `null_aware` (new on the DataFusion 54 line). false is both the
+            // builder's default and the only legal value here: the engine
+            // rejects true for any join type other than LeftAnti.
+            false,
         )?);
         let input = ordered_input(join, &params.key_column)?;
         let inference_exec = InferenceExecBuilder::new(

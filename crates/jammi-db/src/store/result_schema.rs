@@ -18,7 +18,6 @@
 //! that already scope on the catalog owner. It is not a hostile-principal
 //! boundary — the trusted-network + BYO-auth posture is unchanged.
 
-use std::any::Any;
 use std::collections::HashMap;
 use std::sync::{Arc, RwLock};
 
@@ -116,10 +115,6 @@ impl ResultTableSchemaProvider {
 
 #[async_trait]
 impl SchemaProvider for ResultTableSchemaProvider {
-    fn as_any(&self) -> &dyn Any {
-        self
-    }
-
     fn table_names(&self) -> Vec<String> {
         match self.tables.read() {
             Ok(guard) => guard
@@ -207,7 +202,7 @@ where
     let Some(schema) = catalog.schema(&catalog_opts.default_schema) else {
         return;
     };
-    let Some(provider) = schema.as_any().downcast_ref::<ResultTableSchemaProvider>() else {
+    let Some(provider) = schema.downcast_ref::<ResultTableSchemaProvider>() else {
         return;
     };
     for name in table_names {

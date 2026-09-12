@@ -37,7 +37,6 @@
 //! fixed-order caller uses. Adding a fourth reduction is a new enum arm and a
 //! new registration, not a new accumulator.
 
-use std::any::Any;
 use std::sync::Arc;
 
 use arrow::array::{Array, ArrayRef, FixedSizeListArray, Float32Array, Float64Array, UInt64Array};
@@ -210,10 +209,6 @@ fn vector_field(name: &str, width: i32) -> FieldRef {
 }
 
 impl AggregateUDFImpl for VectorAggUdaf {
-    fn as_any(&self) -> &dyn Any {
-        self
-    }
-
     fn name(&self) -> &str {
         self.reduce.udaf_name()
     }

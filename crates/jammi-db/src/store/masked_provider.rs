@@ -21,7 +21,6 @@
 //! surface a stringly planner not-found, registering the base provider would
 //! resurrect deleted rows.
 
-use std::any::Any;
 use std::fmt::{self, Formatter};
 use std::sync::Arc;
 
@@ -94,10 +93,6 @@ impl MaskedTableProvider {
 
 #[async_trait]
 impl TableProvider for MaskedTableProvider {
-    fn as_any(&self) -> &dyn Any {
-        self
-    }
-
     fn schema(&self) -> SchemaRef {
         Arc::clone(&self.schema)
     }
@@ -183,7 +178,7 @@ pub struct MaskExec {
     mask: Arc<DeletionMask>,
     row_id_index: usize,
     table_name: String,
-    properties: PlanProperties,
+    properties: Arc<PlanProperties>,
 }
 
 impl MaskExec {
@@ -206,7 +201,7 @@ impl MaskExec {
             mask,
             row_id_index,
             table_name,
-            properties,
+            properties: Arc::new(properties),
         }
     }
 
@@ -245,11 +240,7 @@ impl ExecutionPlan for MaskExec {
         "MaskExec"
     }
 
-    fn as_any(&self) -> &dyn Any {
-        self
-    }
-
-    fn properties(&self) -> &PlanProperties {
+    fn properties(&self) -> &Arc<PlanProperties> {
         &self.properties
     }
 
@@ -327,10 +318,6 @@ impl PlaceholderProvider {
 
 #[async_trait]
 impl TableProvider for PlaceholderProvider {
-    fn as_any(&self) -> &dyn Any {
-        self
-    }
-
     fn schema(&self) -> SchemaRef {
         Arc::clone(&self.schema)
     }

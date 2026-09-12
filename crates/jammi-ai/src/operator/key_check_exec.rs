@@ -13,7 +13,6 @@
 //! `with_fetch` (default `None`): a fetch must stay above it, never be pushed
 //! into a node that must see every row to count.
 
-use std::any::Any;
 use std::fmt::{self, Formatter};
 use std::pin::Pin;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -36,7 +35,7 @@ pub struct KeyCheckExec {
     input: Arc<dyn ExecutionPlan>,
     key_column: String,
     key_index: usize,
-    properties: PlanProperties,
+    properties: Arc<PlanProperties>,
 }
 
 impl KeyCheckExec {
@@ -54,7 +53,7 @@ impl KeyCheckExec {
             input,
             key_column: key_column.to_string(),
             key_index,
-            properties,
+            properties: Arc::new(properties),
         })
     }
 
@@ -75,11 +74,7 @@ impl ExecutionPlan for KeyCheckExec {
         "KeyCheckExec"
     }
 
-    fn as_any(&self) -> &dyn Any {
-        self
-    }
-
-    fn properties(&self) -> &PlanProperties {
+    fn properties(&self) -> &Arc<PlanProperties> {
         &self.properties
     }
 

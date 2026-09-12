@@ -15,7 +15,6 @@
 //! advances a single pointer per `by`-group. "At most one match" is what lets
 //! the merge never backtrack.
 
-use std::any::Any;
 use std::fmt::{self, Formatter};
 use std::sync::Arc;
 
@@ -46,7 +45,7 @@ pub struct AsofJoinExec {
     /// `spec.project` expands to every non-`by`, non-`time` right column).
     project: Vec<usize>,
     out_schema: SchemaRef,
-    properties: PlanProperties,
+    properties: Arc<PlanProperties>,
 }
 
 impl AsofJoinExec {
@@ -79,7 +78,7 @@ impl AsofJoinExec {
             spec,
             project,
             out_schema,
-            properties,
+            properties: Arc::new(properties),
         })
     }
 
@@ -175,11 +174,7 @@ impl ExecutionPlan for AsofJoinExec {
         "AsofJoinExec"
     }
 
-    fn as_any(&self) -> &dyn Any {
-        self
-    }
-
-    fn properties(&self) -> &PlanProperties {
+    fn properties(&self) -> &Arc<PlanProperties> {
         &self.properties
     }
 

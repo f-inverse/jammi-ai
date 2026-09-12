@@ -29,7 +29,7 @@ impl ObjectParquetWriter {
         let path = handle.data_path()?;
         let props = WriterProperties::builder()
             .set_compression(Compression::ZSTD(ZstdLevel::default()))
-            .set_max_row_group_size(65_536)
+            .set_max_row_group_row_count(Some(65_536))
             .build();
         let inner = ParquetObjectWriter::new(handle.driver(), path.clone());
         let writer = AsyncArrowWriter::try_new(inner, schema, Some(props)).map_err(|e| {

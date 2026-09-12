@@ -348,7 +348,7 @@ this image unconditionally: `sqlx`'s Postgres driver is not gated behind any
 cargo feature, so it is not a `features` entry at all — it is simply always
 present.
 
-The separate `postgres` **cargo feature** (`datafusion-table-providers/postgres-federation`)
+The separate `postgres` **cargo feature** (`datafusion-table-providers/postgres`)
 is a different capability — querying a remote Postgres database as a
 federated SQL *source*, not the catalog backend — and is **not** compiled
 into the published image. It would appear in `features` as `"postgres"`

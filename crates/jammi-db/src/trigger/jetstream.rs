@@ -133,6 +133,16 @@ fn credential_options(credentials: &str) -> Result<async_nats::ConnectOptions, T
 #[async_trait]
 impl TriggerBroker for JetStreamBroker {
     async fn register_topic(&self, topic: &TopicDefinition) -> Result<(), TriggerError> {
+        // `..Default::default()` pulls in every `stream::Config` field the workspace's
+        // async-nats 0.50 default features add (`server_2_10`/`_2_11`/`_2_12`/`_2_14`), not
+        // just the four named above. Measured against the crate source: every one of those
+        // added fields is `#[serde(skip_serializing_if = ...)]`-omitted at its default value
+        // EXCEPT `consumer_limits` (`server_2_10`), which carries only `deserialize_with` --
+        // so the outgoing `create_stream` JSON carries one extra `"consumer_limits":null` key
+        // beyond what the tree shipped against an older async-nats line. This is NOT byte-
+        // identical, but IS wire-safe against the shipped `nats:2.10` server: the live
+        // JetStream suite below (`trigger_jetstream.rs`, `live-broker-tests`) round-trips
+        // `register_topic`/`drop_topic` against a real `nats:2.10` container and passes.
         let cfg = StreamConfig {
             name: Self::stream_name(topic.id),
             subjects: vec![Self::subject_for(topic.id)],
@@ -214,6 +224,11 @@ impl TriggerBroker for JetStreamBroker {
 
         let deliver_policy = deliver_policy_for(from_offset);
 
+        // Unlike `stream::Config` above, every `consumer::pull::Config` field the same
+        // default features add (`filter_subjects`, `metadata`, `priority_policy`,
+        // `priority_groups`, `pause_until`) IS `skip_serializing_if`-omitted at its default
+        // value with no exception (measured against the crate source), so `..Default::
+        // default()` here genuinely reproduces the pre-newer-server request byte for byte.
         let consumer = stream
             .create_consumer(consumer::pull::Config {
                 deliver_policy,

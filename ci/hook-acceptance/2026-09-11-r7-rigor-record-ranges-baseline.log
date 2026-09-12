@@ -1,0 +1,23 @@
+merge   | subject                                                      | armed | no_op_reason | n_armed_paths | has_contract_in_range | human_authored
+4ecc023 | Merge pull request #501 from f-inverse/feat/deploy-shapes-C- | True  |              | 189           | False                 | False         
+95993a0 | merge: feature-gated test surfaces compile against the JobAt | True  |              | 7             | False                 | False         
+72efe52 | merge: main (#497 #498 #499) into feat/deploy-shapes-C-jobs  | True  |              | 27            | False                 | False         
+5da54ed | merge: C3 OTLP trace export and traceparent continuation (c6 | True  |              | 21            | False                 | False         
+a46bf86 | merge: fix(server,wire): #485 a declared stream deadline is  | True  |              | 7             | False                 | False         
+0f889ca | merge: test(ai): #485 a lease loss on the owning worker land | True  |              | 2             | False                 | False         
+165e4e4 | merge: C4 Python/TS Job handle and job verbs (ca91c355) into | True  |              | 9             | False                 | False         
+7b11434 | merge: C round-4 watcher half (37e5534d) into feat/deploy-sh | True  |              | 2             | False                 | False         
+7561658 | Merge pull request #497 from f-inverse/feat/deploy-shapes-E2 | True  |              | 16            | False                 | False         
+0c946e5 | Merge pull request #499 from f-inverse/feat/481-hub-delta    | True  |              | 8             | False                 | False         
+dbd8cfd | merge: C2c training-cancel half (6f0ba349) into feat/deploy- | True  |              | 3             | False                 | False         
+fee47b1 | merge: main (#498 transport and seam docs) into feat/deploy- | True  |              | 4             | False                 | False         
+04e06a3 | merge: C2b [server.limits] request bounds + refusal layer in | True  |              | 23            | False                 | False         
+6232121 | Merge pull request #498 from f-inverse/feat/480-487-transpor | True  |              | 4             | False                 | False         
+dd99311 | merge: main (#493 deploy-shape consistency, #494 deployment  | True  |              | 16            | False                 | False         
+2e37544 | Merge pull request #494 from f-inverse/feat/deploy-shapes-D- | True  |              | 16            | False                 | False         
+34298a4 | Merge pull request #493 from f-inverse/feat/deploy-shapes-A- | True  |              | 97            | False                 | False         
+bdb49ec | merge: main (Postgres broker #490) into feat/deploy-shapes-A | True  |              | 51            | False                 | False         
+f1435b7 | merge: #490 Postgres wake-up broker -- the catalog is the lo | True  |              | 51            | False                 | False         
+227ce61 | merge: main (esc-097 lead-gate proposal) into feat/broker-po | True  |              | 1             | True                  | False         
+
+20 merge(s) replayed; 20 would ARM under R7b; 19 of those carry NO contract file in their own range (expected — no unit has authored one under this scheme yet).

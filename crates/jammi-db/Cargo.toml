@@ -16,8 +16,12 @@ default = []
 # headers on the build host (e.g. `libssl-dev`/`openssl-devel`, or `openssl`
 # + `pkg-config` on macOS via Homebrew) — a requirement this crate does not
 # vendor or otherwise satisfy for a consumer of the published crate.
-postgres = ["datafusion-table-providers/postgres-federation"]
-mysql = ["datafusion-table-providers/mysql-federation"]
+#
+# Each source feature turns on the matching `datafusion-table-providers`
+# backend (whose own `federation` default pushes the query down) plus the
+# driver crate `source/{postgres,mysql}.rs` uses directly for table discovery.
+postgres = ["datafusion-table-providers/postgres", "dep:tokio-postgres", "dep:secrecy"]
+mysql = ["datafusion-table-providers/mysql", "dep:mysql_async", "dep:secrecy"]
 # Gates tests that require a live Postgres instance (JAMMI_TEST_PG_URL).
 live-postgres-tests = []
 # Compiles the JetStream broker driver and the live broker tests; both
@@ -58,7 +62,10 @@ arrow-array.workspace = true
 arrow-ipc = { workspace = true, optional = true }
 
 # External sources (feature-gated — not a workspace dep to avoid sqlite3 links conflict)
-datafusion-table-providers = { version = "0.10.1", default-features = false, optional = true }
+datafusion-table-providers = { version = "0.13.1", default-features = false, optional = true }
+secrecy = { version = "0.10", optional = true }
+tokio-postgres = { version = "0.7", optional = true }
+mysql_async = { version = "0.37", optional = true }
 
 # Storage
 parquet.workspace = true

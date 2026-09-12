@@ -1,4 +1,3 @@
-use std::any::Any;
 use std::fmt::{self, Formatter};
 use std::sync::Arc;
 
@@ -37,7 +36,7 @@ pub struct InferenceExec {
     regression_form: Option<DistributionForm>,
     /// Input columns copied verbatim to the end of every output batch.
     passthrough: Vec<String>,
-    properties: PlanProperties,
+    properties: Arc<PlanProperties>,
 }
 
 impl std::fmt::Debug for InferenceExec {
@@ -146,7 +145,7 @@ impl InferenceExecBuilder {
             embedding_dim: self.embedding_dim,
             regression_form: self.regression_form,
             passthrough: self.passthrough,
-            properties,
+            properties: Arc::new(properties),
         })
     }
 }
@@ -177,11 +176,7 @@ impl ExecutionPlan for InferenceExec {
         "InferenceExec"
     }
 
-    fn as_any(&self) -> &dyn Any {
-        self
-    }
-
-    fn properties(&self) -> &PlanProperties {
+    fn properties(&self) -> &Arc<PlanProperties> {
         &self.properties
     }
 

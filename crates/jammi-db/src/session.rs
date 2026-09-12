@@ -732,7 +732,7 @@ impl JammiSession {
         // 5. Clear the DataFusion schema provider so queries return "not found".
         if let Some(catalog) = self.ctx.catalog(source_id) {
             if let Some(schema) = catalog.schema("public") {
-                if let Some(provider) = schema.as_any().downcast_ref::<JammiSchemaProvider>() {
+                if let Some(provider) = schema.downcast_ref::<JammiSchemaProvider>() {
                     if let Err(e) = provider.clear() {
                         tracing::warn!("Failed to clear schema provider for '{source_id}': {e}");
                     }

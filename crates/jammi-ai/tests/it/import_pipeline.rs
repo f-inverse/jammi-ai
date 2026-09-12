@@ -5,13 +5,17 @@
 //! `ResultStore::materialize_embedding_table` directly. That mechanism moved
 //! into the generic `ResultStore::materialize_computed_embedding_table` verb;
 //! `ImportPipeline::run` now just builds the caller-side provenance and calls
-//! it. This file pins that the refactor is **byte-identical** in the two ways
-//! that carry no workspace-version dependence:
+//! it. This file pins that the refactor is **byte-identical** in two ways,
+//! neither of which folds the workspace's own version:
 //!
 //! 1. the output Parquet artifact digest (the `_row_id`/`_source_id`/
 //!    `_model_id`/`vector` bytes) — checked against a committed golden
-//!    constant captured by running this exact test against `main @ 3164644`
-//!    (before the refactor landed);
+//!    constant captured by running this exact test. The bytes DO depend on
+//!    the `parquet` crate line the workspace pins: the writer stamps its own
+//!    `created_by` string into the footer and its ZSTD codec chooses the
+//!    frame header, so the constant is re-captured on a parquet line bump —
+//!    only after proving, by decoding both artifacts, that the schema,
+//!    row-group/column-chunk metadata, statistics and data are equal;
 //! 2. the manifest's `ProducingDescriptor::External` — the producer id and
 //!    every param, including the content digest of the normalized rows —
 //!    checked against an independently hand-built reference descriptor, never
@@ -46,12 +50,20 @@ use jammi_db::store::manifest::{ArtifactDigest, ProducingDescriptor};
 
 use crate::common;
 
-/// Golden output Parquet artifact digest (SHA-256 hex) captured the same way,
-/// over the five-column embedding schema (`_row_id, _source_id, _model_id,
-/// vector, _content_hash` — the hash column is NULL on an imported table,
-/// which embeds no source row).
-const GOLDEN_ARTIFACT_DIGEST: &str =
-    "191fc6213528e7237b9cd890431d7b25db7b442a365f995e1da7154ad852ed0a";
+/// Golden output Parquet artifact digest (SHA-256 hex). Re-captured on the
+/// merged tree: BOTH inputs to these bytes moved independently. This branch
+/// added a fifth column to the embedding schema (`_row_id, _source_id,
+/// _model_id, vector, _content_hash` — NULL on an imported table, which embeds
+/// no source row), and `main` moved the writer to the `parquet` 58 line. So
+/// neither side's constant is correct here and this value is measured on the
+/// merge, not carried from either parent.
+///
+/// What did NOT move, and is the reason an artifact-digest change is safe to
+/// accept: [`GOLDEN_CONTENT_DIGEST`] below is folded from the normalized
+/// `(key, vector)` rows as they are handed to the writer, never from a decode
+/// of the written artifact, so it is invariant to both the encoder line and
+/// the schema's null column. This test asserts it on every run.
+const GOLDEN_ARTIFACT_DIGEST: &str = "57219fe5253e751d6627cb15c4688fe97f2099f99487cbf0e79c2aa2417dd222";
 
 /// Golden content digest (SHA-256 hex) of the fixture's normalized
 /// `(_row_id, vector)` rows, captured the same way as

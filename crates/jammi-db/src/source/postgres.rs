@@ -51,7 +51,7 @@ pub async fn create_postgres_tables(
     let table_names = discover_table_names(source_id, url).await?;
     let mut tables = Vec::new();
     for name in table_names {
-        let table_ref = TableReference::bare(&name);
+        let table_ref = TableReference::bare(name.as_str());
         let provider = factory
             .table_provider(table_ref)
             .await

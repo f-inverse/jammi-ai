@@ -1,8 +1,9 @@
 diff --git a/.claude/hooks/lead-gate-lib.py b/.claude/hooks/lead-gate-lib.py
+index c5751795..2e7e9c77 100755
 --- a/.claude/hooks/lead-gate-lib.py
 +++ b/.claude/hooks/lead-gate-lib.py
-@@ -1394,8 +1394,46 @@
-         pass
+@@ -1876,13 +1876,47 @@ def cmd_export(argv: list[str]) -> int:
+     return 0
  
  
 +def cmd_export_oracle(argv: list[str]) -> int:
@@ -15,13 +16,11 @@ diff --git a/.claude/hooks/lead-gate-lib.py b/.claude/hooks/lead-gate-lib.py
 +    The lead runs `python3 .claude/hooks/lead-gate-lib.py --export-oracle
 +    <slug> > docs/rigor/<slug>.oracle.jsonl` and commits the result — the
 +    carrier `ci/scripts/check_oracle_gate.py` reads. Deliberately narrower
-+    than a general `--export` (it exports only oracle rows, to a distinct
++    than the general `--export` (it exports only oracle rows, to a distinct
 +    `*.oracle.jsonl` path) so this addition never collides with
-+    `docs/plans/53-agentic-swarm/proposals/R7-patch1-per-type-pass-
-+    vocabulary.patch`'s own `cmd_export`/`--export`, whether or not that
-+    proposal has landed — both may coexist; a human may later fold this
-+    into the general form once R7 lands, which is not required for this
-+    one to work today."""
++    `cmd_export`'s own `--export` form — both coexist; a human may later
++    fold this into the general form, which is not required for this one
++    to work today."""
 +    if len(argv) < 3 or not argv[2].strip():
 +        sys.stderr.write("lead-gate-lib: usage: lead-gate-lib.py --export-oracle <unit_slug>\n")
 +        return 2
@@ -42,10 +41,13 @@ diff --git a/.claude/hooks/lead-gate-lib.py b/.claude/hooks/lead-gate-lib.py
  def main(argv: list[str]) -> int:
 +    if len(argv) >= 2 and argv[1] == "--export-oracle":
 +        return cmd_export_oracle(argv)
+     if len(argv) >= 2 and argv[1] == "--export":
+         return cmd_export(argv)
      if len(argv) < 2 or argv[1] not in ("start", "stop", "pre"):
--        sys.stderr.write("lead-gate-lib: usage: lead-gate-lib.py {start|stop|pre} < payload.json\n")
-+        sys.stderr.write(
-+            "lead-gate-lib: usage: lead-gate-lib.py {start|stop|pre} < payload.json "
-+            "| --export-oracle <unit_slug>\n")
+         sys.stderr.write(
+             "lead-gate-lib: usage: lead-gate-lib.py {start|stop|pre} < payload.json "
+-            "| --export <unit_slug>\n")
++            "| --export <unit_slug> | --export-oracle <unit_slug>\n")
          return 2
      cmd = argv[1]
+ 

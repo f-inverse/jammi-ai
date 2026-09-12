@@ -3,10 +3,22 @@
 Status: PROPOSED. Four patch files, proven applying IN SEQUENCE (mech1, then the
 three mech2 patches, in the order below) against a pristine, independently-cloned
 copy of `main` (`0fc0370edf4b71dc47bc0826064162e48aafd462`) — see "Proven", below.
-No file is edited directly in this PR; every change ships as a `.patch` (agent
-cards, `.claude/hooks/lead-gate-lib.py`, and `.github/workflows/swarm.yml` are all
-human-amend-only per `SWARM_GATE_TOUCHED`/the constitution, so the diff a human
-reviews at merge IS the patch, never a fait-accompli edit):
+**Corrected**: `mech2-lead-gate-lib-export-oracle.patch` and
+`mech2-swarm-yml-wiring.patch` are cut against the REAL merge-order base, not
+bare `main` — `main` carries R7's and R11's designs only as `.patch` FILES, not
+applied; a human applying this proposal in practice applies `R7-patch{1,2,3}`
+and `R11-patch1` first (they are the shipped, prior proposals touching the same
+two files, `.claude/hooks/lead-gate-lib.py` and `.github/workflows/swarm.yml`),
+so these two patches are rebuilt against that real, fully-applied base and
+re-verified there (see "Proven" and "A base-mismatch class this program
+measured", below). The design is unchanged by the correction: the narrow
+`--export-oracle` command (never reusing R7's not-yet-landed `cmd_export`) and
+the separate `docs/rigor/<slug>.oracle.jsonl` record path remain exactly as
+designed. No file is edited directly in this PR; every change ships as a
+`.patch` (agent cards, `.claude/hooks/lead-gate-lib.py`, and
+`.github/workflows/swarm.yml` are all human-amend-only per
+`SWARM_GATE_TOUCHED`/the constitution, so the diff a human reviews at merge IS
+the patch, never a fait-accompli edit):
 
 - `docs/plans/53-agentic-swarm/proposals/LEAD-INVARIANTS-mech1-agent-cards.patch`
   → all 9 implementer agent cards (`ai-core`, `bench`, `cli`, `cookbook`, `db`,
@@ -374,6 +386,20 @@ Every command above and its real exit code were captured directly, per
 `scratchpad/CONTRACT-RULES.md` R-A — no step is narrated without having been
 run.
 
+5. **Corrected re-verification against the REAL 8-patch merge order**
+   (`R7-patch1`, `R7-patch2`, `R7-patch3`, `R11-patch1`, then this proposal's
+   own four, in that order), on a pristine clone of `origin/main`
+   (`0fc0370edf4b71dc47bc0826064162e48aafd462`): all eight `git apply
+   --check`/`git apply` pairs clean, in sequence — including the two patches
+   this correction rebuilt, which FAILED in this exact sequence before the
+   rebuild (`mech2-lead-gate-lib-export-oracle` conflicted with R7-patch2's
+   own addition of `cmd_export`/the `main()` dispatch at
+   `.claude/hooks/lead-gate-lib.py:1394`; `mech2-swarm-yml-wiring` conflicted
+   with R7-patch2's own appended self-test and guard steps at
+   `.github/workflows/swarm.yml:70`/`:113`). Reproduced via
+   `scratchpad/apply-swarm-proposals.sh --dry-run` — see the fix commit's own
+   record for the exact output.
+
 ## What I could not verify myself, asked for explicitly
 
 - **Mechanism 2's arming scope** (`crates/**`/`cookbook/**` only, not
@@ -392,6 +418,50 @@ run.
   git-diff-scoped guards is what makes `origin/<base>` resolvable for this
   check too; I did not independently re-verify GitHub Actions' own checkout
   behavior beyond reading the existing job's `with: fetch-depth: 0`.
+
+## A base-mismatch class this program measured, and a cheap mechanical check for it
+
+Verifying each of this proposal's four patches by applying it, alone, to a
+pristine `main` is exactly what let two of them (`mech2-lead-gate-lib-export-
+oracle`, `mech2-swarm-yml-wiring`) pass that check and then fail to apply in
+the order a human actually runs: `R7-patch{1,2,3}` and `R11-patch1` are
+shipped, prior proposals that also edit `.claude/hooks/lead-gate-lib.py` and
+`.github/workflows/swarm.yml`, and `main` carries their DESIGN as `.patch`
+files without applying them (see "The problem, measured against the real
+tree," above, for the identical observation about R7 specifically). A human
+merging this stack applies those first, so the real base for this proposal's
+two overlapping patches is "main + R7 + R11," not bare main — and nothing
+before this correction checked that.
+
+This is a real, general property of shipping enforcement as patch files
+rather than direct commits, not an artifact of this one proposal: a patch is
+cut against A base; two sibling proposals that touch the same file go stale
+against EACH OTHER the moment either one's base assumption stops holding
+(one lands, or a third proposal lands between them), and nothing currently
+re-checks that the declared apply order still holds once it is written down.
+A per-patch "does this apply to pristine main" check cannot catch it by
+construction — it is checking the wrong base.
+
+**A cheap mechanical fix exists, and this proposal ships a first cut of it
+rather than leaving the ordering to memory**: `scratchpad/apply-swarm-
+proposals.sh` (untracked — this repo's own `/scratchpad/` convention for
+session-local tooling, per `.gitignore:112-113`) takes a declared
+`name:ref:path` SEQUENCE, sandboxes at `origin/main` in a throwaway clone, and
+re-applies every patch in order, reading each one's text from its OWN
+proposal branch via `git show <ref>:<path>` — never assuming a not-yet-merged
+patch's text already lives on `main`. It is cheap because the entire check is
+`git apply --check` in a loop; no compilation, no toolchain. The residual is
+that the SEQUENCE itself is still hand-maintained (a new sibling proposal must
+be added to it by a human), which is a strictly smaller memory burden than
+re-deriving the correct order from scratch every time, and — unlike the
+un-checked assumption this correction fixes — a missing or wrong entry in a
+committed sequence is a visible diff at review time, not a silent one. Folding
+this into a required CI gate (so the sequence is asserted fresh on every push
+to any `proposal/*` branch, the same "always runs, detects its own touched set"
+shape `swarm.yml`'s other gates already use) is a natural next step, not done
+here: it would need the SEQUENCE to live in a committed, human-amend-only
+manifest rather than a gitignored script, and deciding that manifest's home is
+a scope question for whoever picks this up, not answered by this proposal.
 
 ## Ledger lifecycle
 

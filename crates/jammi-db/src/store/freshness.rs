@@ -449,8 +449,12 @@ impl ResultStore {
     /// function's type stops a future caller from pairing the value with an
     /// independently-resolved read and persisting the pair. Tracked as a
     /// live, reviewed exception in `crates/jammi-ai/tests/it/pinned_source_gate.rs`'s
-    /// `ANCHOR_RETURN_ALLOWED` (the gate that enumerates every such function
-    /// across this crate and `jammi-ai` mechanically), not silently absorbed.
+    /// `ANCHOR_RETURN_ALLOWED` (the gate that mechanically enumerates, across
+    /// this crate and `jammi-ai`, every function whose return type carries
+    /// `InputAnchor`/`CurrentAnchor` verbatim — a strictly narrower, textual
+    /// predicate than "every such function" in the semantic sense above; see
+    /// that file's own module doc for the other three patterns it also
+    /// checks), not silently absorbed.
     pub async fn current_anchor(&self, anchor: &InputAnchor) -> Result<CurrentAnchor> {
         match anchor.kind {
             AnchorKind::ResultDigest => {

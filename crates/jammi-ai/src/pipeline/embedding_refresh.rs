@@ -567,6 +567,15 @@ impl InferenceSession {
     /// Step 0's catalog gates: the tenant-scoped read, the STRICT tenant pair
     /// (a scoped tenant can read a GLOBAL table but never refresh it), `ready`,
     /// an embedding table, and a `ready` current version.
+    ///
+    /// Disclosed, not closed (round 8's audit, D1): this resolves `table`'s
+    /// record ITSELF from a bare name and reads `.current_version` off it —
+    /// the self-fetched-record shape `crates/jammi-ai/tests/it/pinned_source_gate.rs`'s
+    /// `SELF_FETCHED_RECORD_ALLOWED` names as a reviewed exception. That read
+    /// is used only for this readiness check; every anchor/content pairing
+    /// this function's one caller (`refresh_embeddings`) later performs comes
+    /// from a SEPARATE, later resolution (`ensure_base_version`'s own
+    /// re-fetch). See that allowlist entry for the full review.
     pub(crate) async fn refreshable_record(&self, table: &str) -> Result<ResultTableRecord> {
         let record = self
             .catalog()

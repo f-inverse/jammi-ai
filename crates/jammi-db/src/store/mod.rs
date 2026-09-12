@@ -2705,23 +2705,24 @@ impl ResultStore {
     /// `current_version_identity` (the anchor leg of the same seam)
     /// is crate-private (M1, round 5).
     ///
-    /// **Enforcement (round 7).** This module used to carry a hand-written
-    /// prose sweep here, enumerating "every `pub`/`pub(crate)` function in
-    /// this module" against the property above. That sweep is DELETED, not
-    /// corrected: across six rounds it missed live members every time,
-    /// including three sites the unit's own plan document had already
-    /// listed together as one reader class, because its quantifier ("this
-    /// module") never matched the property's ("no public interface"), and a
-    /// hand-typed enumeration cannot be checked against anything but itself.
-    /// The property is now enforced by
+    /// **Enforcement (round 7, patterns widened round 8).** This module used
+    /// to carry a hand-written prose sweep here, enumerating "every
+    /// `pub`/`pub(crate)` function in this module" against the property
+    /// above. That sweep is DELETED, not corrected: across six rounds it
+    /// missed live members every time, including three sites the unit's own
+    /// plan document had already listed together as one reader class,
+    /// because its quantifier ("this module") never matched the property's
+    /// ("no public interface"), and a hand-typed enumeration cannot be
+    /// checked against anything but itself. The property is now enforced by
     /// `crates/jammi-ai/tests/it/pinned_source_gate.rs`, which derives its
     /// scanned surface from `git ls-files` over this whole crate and
     /// `jammi-ai` (not one module, not by hand) and requires every function
-    /// matching one of three straddle-shaped patterns — an anchor-shaped
-    /// return type, a bare-record version branch, or a session-registration
-    /// literal — to be either safe by construction or a reviewed, disclosed
-    /// exception in that file's own allowlists. Read that file, not this
-    /// comment, for the current enumeration; it is machine-checked on every
+    /// matching one of four straddle-shaped patterns — an anchor-shaped
+    /// return type, a bare-record version branch, a session-registration
+    /// literal, or (round 8) a self-fetched record's version read — to be
+    /// either safe by construction or a reviewed, disclosed exception in
+    /// that file's own allowlists. Read that file, not this comment, for the
+    /// current enumeration; it is machine-checked on every
     /// `cargo test -p jammi-ai`, this comment is not.
     ///
     /// **Residual — candidate SELECTION is not pinned (M4; scope widened

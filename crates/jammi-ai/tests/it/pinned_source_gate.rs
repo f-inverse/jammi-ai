@@ -1,4 +1,37 @@
-//! The DELTA contract's source gate — round 7 (`CONTRACT-DELTA-fix7.md`).
+//! The DELTA contract's source gate — round 8 (`CONTRACT-DELTA-fix8.md`,
+//! closing two measured defects the round-7 audit found by compiling this
+//! file's own detector functions into a standalone harness and driving
+//! synthetic producers through them).
+//!
+//! **Round 8, D1 — the escape.** Every round-7 detector required the
+//! straddle-shaped function to receive the table's [`ResultTableRecord`] as
+//! a PARAMETER. A producer that instead takes a bare table NAME and resolves
+//! the record itself through the catalog (`self.catalog.get_result_table(name)`
+//! — the prevailing in-tree idiom) before reading `.current_version` off the
+//! record it just fetched was invisible to all three: measured empty against
+//! every one. This is not hypothetical — [`self_fetched_record_version_hits`]
+//! (pattern 4, below) finds `InferenceSession::refreshable_record`
+//! (`crates/jammi-ai/src/pipeline/embedding_refresh.rs`) already doing
+//! exactly this on the surface as it stands today, undetected by any of the
+//! first three patterns.
+//!
+//! **Round 8, D2 — the parser bug.** [`find_fn_regions`]'s optional generic
+//! parameter list used to be matched with the SAME depth-counter
+//! [`find_matching`] uses for parens and braces, which does not know that
+//! the `>` in a closure/`Fn`-trait bound's `->` return arrow is not a
+//! closing angle bracket. A function written
+//! `fn f<F: Fn(&str) -> String>(&self, rec: &ResultTableRecord) -> Result<InputAnchor>`
+//! had its generic list close at the arrow, which desynchronized the scan
+//! from `(` and dropped the WHOLE function — invisible to every detector,
+//! including the anchor-shaped-return one, despite a return type that is
+//! literally `Result<InputAnchor>`. [`find_matching_angle`] now treats a
+//! `->` as a single unit that never changes angle-bracket depth. Checked,
+//! not assumed: an independent `fn <ident>` token count over today's surface
+//! (4136) equals the number of regions `find_fn_regions` produces both
+//! before and after this fix, so no live function was affected — the bug
+//! was latent, not live, but it was a silent fail-OPEN in the shared parsing
+//! layer of what round 7 made the sole enforcement, and the comment that
+//! used to sit above the old match asserted the opposite.
 //!
 //! **The ruling this file exists to satisfy.** Six rounds tried to close the
 //! straddle class — a producer that resolves a result table's version once
@@ -35,7 +68,7 @@
 //! closing anything). Every detector below scans every function regardless
 //! of visibility.
 //!
-//! **The three patterns, not one string literal.** Each is a shape that
+//! **The four patterns, not one string literal.** Each is a shape that
 //! reproduces the straddle, independent of which public/private API a
 //! producer happens to use:
 //!
@@ -56,10 +89,22 @@
 //!    as a parameter — the shape that let `read_vectors` reach an unpinned,
 //!    version-branched content read through the session's own registration,
 //!    outside the module the old sweep ever looked at.
-//! 3. [`session_registration_literal_counts`] — the session-registered
+//! 3. [`session_registration_literal_sites`] — the session-registered
 //!    `jammi.{table}` reference spelled out directly in source text (the
 //!    original round-3/5/6 gate's own check), now over the WHOLE two-crate
-//!    surface rather than one crate's `src/pipeline/` directory.
+//!    surface rather than one crate's `src/pipeline/` directory, and (round
+//!    8, D3) bound to its enclosing function rather than to the file as a
+//!    whole.
+//! 4. [`self_fetched_record_version_hits`] (round 8, D1) — a function that
+//!    does NOT take a [`jammi_db::catalog::result_repo::ResultTableRecord`]
+//!    as a parameter (pattern 2's precondition) but instead resolves one
+//!    itself in its own body via the catalog idiom `.get_result_table(` and
+//!    then reads the `.current_version` FIELD off the record it just
+//!    fetched — the parameter shape and the self-fetch shape partition the
+//!    surface between patterns 2 and 4 rather than overlapping it. This is
+//!    pattern 2's own precondition inverted, closing exactly the gap the
+//!    round-7 audit measured: all three of the original detectors return
+//!    empty on this shape.
 //!
 //! **What this file does NOT claim.** It is source-text pattern matching
 //! over a hand-written (but string/char/comment-literal-aware — see
@@ -71,13 +116,33 @@
 //! have its interior treated as code); a function-pointer type parameter
 //! written with unconventional spacing (`fn (i32) -> bool`, a space after
 //! `fn`) would be mistaken for a function item — checked: `grep -rn "fn (["
-//! crates/jammi-db/src crates/jammi-ai/src` finds none; and the two
-//! detectors below do not follow a value ACROSS function boundaries (a
-//! helper that reads `.current_version` from a bare record and hands the
-//! bare version to a second, separately-reviewed function is invisible to
-//! detector 2 unless the second function is itself reviewed — which is why
-//! every hit, closed or not, is enumerated in an `ALLOWED` list below with
-//! its own review note, rather than silently passing).
+//! crates/jammi-db/src crates/jammi-ai/src` finds none; and detectors 2 and
+//! 4 do not follow a value ACROSS function boundaries (a helper that reads
+//! `.current_version` — off a parameter for pattern 2, off a self-fetched
+//! record for pattern 4 — and hands the bare version to a second,
+//! separately-reviewed function is invisible to that detector unless the
+//! second function is itself reviewed — which is why every hit, closed or
+//! not, is enumerated in an `ALLOWED` list below with its own review note,
+//! rather than silently passing). Pattern 4 additionally requires an EXACT
+//! field-boundary match on `.current_version` (not merely the substring —
+//! see [`reads_current_version_field`]'s doc) precisely so this cross-
+//! function case (e.g. a self-fetching function that only calls
+//! `.current_version_identity(...)`, never reads the field itself) is not
+//! mistaken for a direct field read by coincidence of one identifier
+//! prefixing another.
+//!
+//! **What this file's surface is NOT (round 8, D4 — disclosure, not a
+//! claim of absolute fail-closed).** [`tracked_rs_files`] derives the
+//! scanned surface from `git ls-files`, so a new `.rs` file present on disk
+//! but not yet `git add`ed is invisible to every check here — this process
+//! passes locally on code it has never read. The "hard failure naming the
+//! file" property below is about a file `git ls-files` DOES list that this
+//! process then cannot read (deleted on disk without being staged, or a
+//! worktree race), not about a file `git ls-files` never lists at all. In
+//! continuous integration the working tree IS the committed tree, so every
+//! `.rs` file under either surface directory is necessarily tracked and this
+//! gap does not exist there; this note is about a local `cargo test` run
+//! against an uncommitted new file, not about the enforcement CI relies on.
 //!
 //! Every entry in every `ALLOWED` list below is a site this gate's own scan
 //! finds TODAY (verified by running the scan without an allowlist and
@@ -345,13 +410,58 @@ fn find_matching(chars: &[char], open_idx: usize, open: char, close: char) -> Op
     None
 }
 
-/// One `fn` item found in a masked source: its name, 1-based source line,
-/// its parameter-list text (masked), and — when it has a body rather than a
+/// Find the index just past the `>` matching the `<` at `chars[open_idx]`
+/// (a generic parameter list), depth-counting `<`/`>` the way [`find_matching`]
+/// counts parens/braces — with ONE exception (round 8, D2): the `>` of a
+/// `->` return arrow, e.g. a closure/`Fn`-trait bound written
+/// `Fn(&str) -> String`, is never treated as a closing angle bracket. Before
+/// this exception existed, `find_matching(chars, m, '<', '>')` closed the
+/// list at that arrow, desynchronized the scan from the following `(`, and
+/// dropped the WHOLE function from [`find_fn_regions`]'s output — invisible
+/// to every detector below even when its own return type carried
+/// `InputAnchor` verbatim. Reachability was checked, not assumed: an
+/// independent `fn <ident>` token count over the real surface (4136) equals
+/// the number of regions produced with or without this fix, so no function
+/// on today's tree used this shape — the bug was latent, not live — but it
+/// was a silent fail-OPEN in the only enforcement, so it is fixed rather
+/// than left as a disclosed limit.
+fn find_matching_angle(chars: &[char], open_idx: usize) -> Option<usize> {
+    debug_assert_eq!(chars[open_idx], '<');
+    let mut depth = 1i64;
+    let mut j = open_idx + 1;
+    while j < chars.len() {
+        if chars[j] == '-' && j + 1 < chars.len() && chars[j + 1] == '>' {
+            // The arrow is one token; skip both characters without
+            // touching depth so its `>` can never close the list early.
+            j += 2;
+            continue;
+        }
+        if chars[j] == '<' {
+            depth += 1;
+        } else if chars[j] == '>' {
+            depth -= 1;
+            if depth == 0 {
+                return Some(j + 1);
+            }
+        }
+        j += 1;
+    }
+    None
+}
+
+/// One `fn` item found in a masked source: its name, 1-based source line of
+/// the `fn` keyword, the 1-based source line of its LAST character (the
+/// closing `}` for a function with a body, or the terminating `;` for a
+/// trait declaration — used to bind a whole-file textual hit, such as a
+/// session-registration literal, to its enclosing function rather than to
+/// the file as a whole; see [`session_registration_literal_sites`]), its
+/// parameter-list text (masked), and — when it has a body rather than a
 /// trait-declaration `;` — its return-type text and its body text (both
 /// masked).
 struct FnRegion {
     name: String,
     line: usize,
+    end_line: usize,
     params: String,
     return_type: Option<String>,
     body: Option<String>,
@@ -394,11 +504,12 @@ fn find_fn_regions(masked: &str) -> Vec<FnRegion> {
                 while m < n && chars[m].is_whitespace() {
                     m += 1;
                 }
-                // Optional generic parameter list `<...>` (angle-bracket
-                // depth counted the same way `find_matching` counts
-                // parens/braces).
+                // Optional generic parameter list `<...>` — see
+                // `find_matching_angle`'s doc for why this is NOT the same
+                // depth-counter `find_matching` uses for parens/braces (a
+                // `->` inside a `Fn` bound must not close it early).
                 if m < n && chars[m] == '<' {
-                    if let Some(after) = find_matching(&chars, m, '<', '>') {
+                    if let Some(after) = find_matching_angle(&chars, m) {
                         m = after;
                         while m < n && chars[m].is_whitespace() {
                             m += 1;
@@ -431,16 +542,35 @@ fn find_fn_regions(masked: &str) -> Vec<FnRegion> {
                         if let Some(term) = terminator {
                             let sig: String = chars[params_end..term].iter().collect();
                             let return_type = sig.split_once("->").map(|(_, rt)| rt.to_string());
-                            let body = if chars[term] == '{' {
-                                find_matching(&chars, term, '{', '}')
-                                    .map(|end| chars[term + 1..end - 1].iter().collect())
+                            // The region's own end: one past the closing
+                            // `}` for a function with a body, or one past
+                            // the terminating `;` for a trait declaration.
+                            // A brace this file's own `find_matching` cannot
+                            // match (malformed/unclosed source) falls back
+                            // to end-of-file rather than leaving the region
+                            // unbounded, so a downstream line-range lookup
+                            // (`session_registration_literal_sites`) never
+                            // panics on an out-of-order range.
+                            let (body, region_end) = if chars[term] == '{' {
+                                match find_matching(&chars, term, '{', '}') {
+                                    Some(end) => {
+                                        (Some(chars[term + 1..end - 1].iter().collect()), end)
+                                    }
+                                    None => (None, n),
+                                }
                             } else {
-                                None
+                                (None, term + 1)
                             };
                             let line = chars[..fn_start].iter().filter(|c| **c == '\n').count() + 1;
+                            let end_line = chars[..region_end.min(n)]
+                                .iter()
+                                .filter(|c| **c == '\n')
+                                .count()
+                                + 1;
                             regions.push(FnRegion {
                                 name,
                                 line,
+                                end_line,
                                 params,
                                 return_type,
                                 body,
@@ -505,36 +635,138 @@ fn bare_record_version_branch_hits(surface: &[(String, String)]) -> Vec<Hit> {
     hits
 }
 
+/// True when `body` reads the `.current_version` FIELD, not merely a longer
+/// identifier that happens to start with the same text — `.current_version`
+/// is also a PREFIX of `.current_version_identity(` and
+/// `.current_version_provider(`, two already-reviewed helper methods
+/// (`RECORD_VERSION_BRANCH_ALLOWED`'s own entries) that a self-fetching
+/// caller can delegate to without ever reading the field itself (the
+/// disclosed cross-function limit this file's module doc names for pattern
+/// 4). A field access is never followed by an identifier character; a
+/// longer method name always is. Without this boundary check,
+/// `self_fetched_record_version_hits` would flag `ResultStore::current_anchor`
+/// (which only calls `self.current_version_identity(&parent)`, never reads
+/// the field) as a false positive of pattern 4 — checked directly: with the
+/// boundary check, it does not appear in `self_fetched_record_version_hits`'s
+/// output; a bare `.contains(".current_version")` substring check does flag
+/// it.
+fn reads_current_version_field(body: &str) -> bool {
+    let chars: Vec<char> = body.chars().collect();
+    let needle: Vec<char> = ".current_version".chars().collect();
+    let n = chars.len();
+    let m = needle.len();
+    if n < m {
+        return false;
+    }
+    for i in 0..=(n - m) {
+        if chars[i..i + m] == needle[..] && !(i + m < n && is_ident_char(chars[i + m])) {
+            return true;
+        }
+    }
+    false
+}
+
+/// Pattern 4 (round 8, D1) — the escape the round-7 audit measured: a
+/// function that does NOT take a bare `ResultTableRecord` as a parameter
+/// (pattern 2's own precondition, excluded here via `!region.params.contains(
+/// "ResultTableRecord")` so patterns 2 and 4 partition the surface instead
+/// of double-flagging the same site under two different names) but instead
+/// resolves one itself, in its own body, via the catalog idiom
+/// `.get_result_table(` — the prevailing in-tree idiom, not this crate's
+/// only one, but the one every known instance of this shape uses — and then
+/// reads the resolved record's `.current_version` FIELD (see
+/// [`reads_current_version_field`]'s doc for why this must be a field match,
+/// not a substring one). See this file's module doc for why patterns 1–3
+/// alone cannot see this shape.
+fn self_fetched_record_version_hits(surface: &[(String, String)]) -> Vec<Hit> {
+    let mut hits = Vec::new();
+    for (file, text) in surface {
+        let masked = mask_non_code(text);
+        for region in find_fn_regions(&masked) {
+            if region.params.contains("ResultTableRecord") {
+                continue;
+            }
+            if let Some(body) = &region.body {
+                if body.contains(".get_result_table(") && reads_current_version_field(body) {
+                    hits.push(Hit {
+                        file: file.clone(),
+                        name: region.name,
+                        line: region.line,
+                    });
+                }
+            }
+        }
+    }
+    hits
+}
+
 /// Non-comment-line occurrences of the session-registered literal
 /// `"jammi.{` (the ingredient common to `TableReference::bare(format!(
 /// "jammi.{table}"))`, `ctx.table("jammi.{table}")`, and a raw
-/// `.sql(&format!("... \"jammi.{table}\" ..."))`) per file, over the WHOLE
-/// two-crate surface (round 7 widens this from the original round-3 gate's
-/// `crates/jammi-ai/src/pipeline/` only). Deliberately narrower than a bare
-/// `"jammi.` substring check: `"jammi.toml"`, `"jammi.audit.search.v1"`,
-/// `"jammi.topic.{}.batch"` and this crate's other domain-separator/config
-/// literals all contain `"jammi.` but are never followed immediately by
-/// `{` — only a session table-reference literal spells the table name as an
-/// interpolation directly after the dot. Verified against every `"jammi.`
-/// occurrence in this surface (`grep -rn '"jammi\.' crates/jammi-db/src
-/// crates/jammi-ai/src`) before narrowing: every non-`"jammi.{` hit is one
-/// of the domain/config literals above, and every session-registration site
-/// this file's own module doc and the round-6 audit named is `"jammi.{`.
-fn session_registration_literal_counts(
+/// `.sql(&format!("... \"jammi.{table}\" ..."))`), bound to the enclosing
+/// FUNCTION rather than to the file as a whole (round 8, D3 — the round-7
+/// audit's advisory: a per-file `usize` allowance is fungible across every
+/// site inside that file, so a NEW unpinned read added to an already-
+/// allowlisted file passes review-free as long as an existing one is
+/// deleted in the same commit; the site was discarded before the old
+/// per-file allowlist ever saw it). This is the same site-binding
+/// [`anchor_shaped_return_hits`] and [`bare_record_version_branch_hits`]
+/// already use, keyed on `(file, function name)` instead of `file` alone.
+///
+/// The narrowing itself is unchanged from round 7: deliberately narrower
+/// than a bare `"jammi.` substring check — `"jammi.toml"`,
+/// `"jammi.audit.search.v1"`, `"jammi.topic.{}.batch"` and this crate's
+/// other domain-separator/config literals all contain `"jammi.` but are
+/// never followed immediately by `{` — only a session table-reference
+/// literal spells the table name as an interpolation directly after the
+/// dot. Verified against every `"jammi.` occurrence in this surface
+/// (`grep -rn '"jammi\.' crates/jammi-db/src crates/jammi-ai/src`) before
+/// narrowing: every non-`"jammi.{` hit is one of the domain/config literals
+/// above, and every session-registration site this file's own module doc
+/// and the round-6 audit named is `"jammi.{`.
+///
+/// Attribution runs on the ORIGINAL, unmasked text (the literal itself is a
+/// string, which [`mask_non_code`] would blank), using [`find_fn_regions`]'s
+/// `(line, end_line)` only to find which function's line range contains a
+/// given hit line — the innermost (smallest-range) containing region wins,
+/// so a hit inside a nested function is never double-counted against its
+/// enclosing one too. A hit whose line falls inside no region at all (a
+/// module-level literal, which does not occur on today's surface) is bound
+/// to the sentinel site `"<module-scope>"`, which no `ALLOWED` entry ever
+/// names, so it fails loudly rather than being silently mis-attributed.
+fn session_registration_literal_sites(
     surface: &[(String, String)],
-) -> std::collections::HashMap<String, usize> {
+) -> std::collections::HashMap<(String, String), usize> {
     let mut counts = std::collections::HashMap::new();
     for (file, text) in surface {
-        let mut n = 0usize;
-        for line in text.lines() {
+        let masked = mask_non_code(text);
+        let regions = find_fn_regions(&masked);
+        for (line_idx, line) in text.lines().enumerate() {
+            let line_no = line_idx + 1;
             let trimmed = line.trim_start();
             if trimmed.starts_with("//") {
                 continue;
             }
-            n += line.matches("\"jammi.{").count();
-        }
-        if n > 0 {
-            counts.insert(file.clone(), n);
+            let hits = line.matches("\"jammi.{").count();
+            if hits == 0 {
+                continue;
+            }
+            let mut best: Option<&FnRegion> = None;
+            for region in &regions {
+                if region.line <= line_no && line_no <= region.end_line {
+                    let is_smaller = match best {
+                        None => true,
+                        Some(b) => (region.end_line - region.line) < (b.end_line - b.line),
+                    };
+                    if is_smaller {
+                        best = Some(region);
+                    }
+                }
+            }
+            let site = best
+                .map(|r| r.name.clone())
+                .unwrap_or_else(|| "<module-scope>".to_string());
+            *counts.entry((file.clone(), site)).or_insert(0) += hits;
         }
     }
     counts
@@ -580,6 +812,20 @@ const ANCHOR_RETURN_ALLOWED: &[(&str, &str)] = &[
         // onto `pin_current_version`) is out of round 7's scope (the ruling:
         // "Folds, small ... Nothing else"); this entry is the gate's record
         // that the residual is real, watched, and not silently absorbed.
+        //
+        // **Round 8, D3 disclosure:** the "only in-tree callers" claim above
+        // is a POINT-IN-TIME grep result (re-verified at round 8:
+        // `grep -rn 'current_anchor(' crates/jammi-db/src crates/jammi-ai/src`
+        // still shows only `freshness.rs`'s own `staleness`), not a
+        // machine-checked invariant — nothing in this file re-runs that grep
+        // or otherwise re-derives it, so a future commit that adds a second
+        // caller would not turn any test here red. This allowlist entry
+        // clears the SHAPE (an anchor-shaped return), not the callers; the
+        // callers claim is carried in prose, in an artifact whose purpose is
+        // to replace prose claims with machine ones. Cheaply machine-
+        // checking "no OTHER caller persists this value" would require call-
+        // graph analysis this file's source-text matching does not attempt
+        // (see the module doc's "not a call-graph or dataflow analysis").
     ),
     (
         "crates/jammi-ai/src/pipeline/graph_propagation.rs",
@@ -590,7 +836,7 @@ const ANCHOR_RETURN_ALLOWED: &[(&str, &str)] = &[
         // resolve. The residual here is one level up, at this function's own
         // caller: `edge_scan_sql` reads the SAME edge table's content
         // through an unpinned, session-registered scan
-        // (`session_registration_literal_counts`'s allowlist entry for this
+        // (`session_registration_literal_sites`'s allowlist entry for this
         // same file), so the anchor and the edge content are NOT from one
         // resolution. This is the already-disclosed, reviewed exception for
         // the S9 edge relation (never the pinned embedding table) from the
@@ -680,6 +926,15 @@ const RECORD_VERSION_BRANCH_ALLOWED: &[(&str, &str)] = &[
         // function still re-derives `table.current_version` from a bare
         // record) is out of round 7's scope; recorded here rather than
         // silently absorbed.
+        //
+        // **Round 8, D3 disclosure:** the "callers use it only to select a
+        // replay target" claim is a POINT-IN-TIME grep result (re-verified
+        // at round 8: `grep -rn 'producing_descriptor(' crates/jammi-db/src
+        // crates/jammi-ai/src` shows exactly the two callers named above),
+        // not a machine-checked invariant this file re-derives on every run
+        // — see `current_anchor`'s entry above for the same disclosure and
+        // why closing it would need call-graph analysis this file does not
+        // attempt.
     ),
     (
         "crates/jammi-db/src/session.rs",
@@ -688,7 +943,7 @@ const RECORD_VERSION_BRANCH_ALLOWED: &[(&str, &str)] = &[
         // reader-class member: `DELTA-INCREMENTAL-EMBEDDING.md:180`). The
         // versioned arm reads content through this SESSION's own
         // `jammi.{table}` registration (see
-        // `session_registration_literal_counts`'s allowlist entry for this
+        // `session_registration_literal_sites`'s allowlist entry for this
         // same file) rather than through `pinned_provider` — an unpinned,
         // version-branched content read, re-exported publicly at
         // `jammi-ai/src/session.rs:1018` and
@@ -701,6 +956,13 @@ const RECORD_VERSION_BRANCH_ALLOWED: &[(&str, &str)] = &[
         // caller-supplied `PinnedSource`) is out of round 7's scope; the
         // straddle this function makes constructible is exactly the class
         // this contract names as real and unclosed.
+        //
+        // **Round 8, D3 disclosure:** re-verified rather than re-argued
+        // (the grep above was re-run at round 8 with the same two-caller
+        // result), but still a POINT-IN-TIME claim, not a machine-checked
+        // one — nothing here re-runs it on a future commit; see
+        // `current_anchor`'s entry above for the general shape of this
+        // disclosure.
     ),
     (
         "crates/jammi-ai/src/pipeline/embedding_refresh.rs",
@@ -712,80 +974,127 @@ const RECORD_VERSION_BRANCH_ALLOWED: &[(&str, &str)] = &[
     ),
 ];
 
-/// Pattern 3 — `(file, allowed occurrence count)`. Keyed on the path, never
-/// a bare file name (round 6 advisory: a same-named file in a different
-/// subdirectory must not silently inherit an allowance reviewed for a
-/// wholly different file).
-const SESSION_LITERAL_ALLOWED: &[(&str, usize)] = &[
+/// Pattern 4 (round 8, D1) — `(file, function name)`, same shape as
+/// `ANCHOR_RETURN_ALLOWED`/`RECORD_VERSION_BRANCH_ALLOWED`.
+const SELF_FETCHED_RECORD_ALLOWED: &[(&str, &str)] = &[(
+    "crates/jammi-ai/src/pipeline/embedding_refresh.rs",
+    "refreshable_record",
+    // `InferenceSession::refreshable_record` — step 0's readiness GATE,
+    // and the round-8 audit's own escape shape found LIVE on this
+    // surface: it self-fetches the record from a bare table name via
+    // `self.catalog().get_result_table(table)`, then reads
+    // `record.current_version` to reject a table whose CURRENT version
+    // row is not `ready` (`NotRefreshableReason::CurrentVersionUnavailable`).
+    // That read is used ONLY for this readiness check — it is never
+    // returned, never becomes an anchor, and never pairs with a content
+    // read here. Its one in-tree caller (`refresh_embeddings`) performs
+    // every later anchor/content pairing from a SEPARATE, later
+    // resolution: `ensure_base_version` re-fetches the record itself
+    // (`RECORD_VERSION_BRANCH_ALLOWED`'s own entry for that function),
+    // and `refresh_embeddings` reads `parent_version` off THAT fresh
+    // record, not this one's. A version publish landing between this
+    // gate and that later resolution can only make this gate stale
+    // (reject a table that just became refreshable, or admit one whose
+    // checked version has since moved and gets re-validated downstream
+    // by `resolve_version_manifest`) — never mint a mismatched
+    // anchor/content pair. Same disclosed-residual shape as
+    // `bind_result_table`'s "Read class" note, not closed by this round.
+)];
+
+/// Pattern 3 — `(file, function name, allowed occurrence count)`. Keyed on
+/// the (path, function) SITE (round 8, D3 — the round-7 audit's advisory: a
+/// per-file `usize` allowance let a NEW unpinned read inside an already-
+/// allowlisted file pass review-free whenever an existing one in a
+/// DIFFERENT function of that same file was deleted in the same commit),
+/// never a bare file name (round 6 advisory: a same-named file in a
+/// different subdirectory must not silently inherit an allowance reviewed
+/// for a wholly different file).
+const SESSION_LITERAL_ALLOWED: &[(&str, &str, usize)] = &[
     (
         "crates/jammi-ai/src/pipeline/graph_propagation.rs",
+        "edge_scan_sql",
         1,
-        // `edge_scan_sql`'s S9 `neighbor_graph` edge scan — the EDGE
-        // relation, never the pinned embedding table `PinnedSource` covers.
-        // Reviewed in the DELTA round-4 contract (M2's
-        // `graph_propagation.rs:816` carve-out); see this same file's
-        // `edge_source_anchor` note in `ANCHOR_RETURN_ALLOWED` for the
-        // anchor/content pairing this residual leaves open.
+        // The S9 `neighbor_graph` edge scan — the EDGE relation, never the
+        // pinned embedding table `PinnedSource` covers. Reviewed in the
+        // DELTA round-4 contract (M2's `graph_propagation.rs:816` carve-out);
+        // see this same file's `edge_source_anchor` note in
+        // `ANCHOR_RETURN_ALLOWED` for the anchor/content pairing this
+        // residual leaves open.
     ),
     (
         "crates/jammi-ai/src/pipeline/graph_neighbourhood.rs",
+        "load_neighbor_graph_edges",
         1,
-        // `load_neighbor_graph_edges` — same class, the S9 edge relation.
+        // Same class, the S9 edge relation.
     ),
     (
         "crates/jammi-db/src/index/exact.rs",
+        "exact_vector_search",
         1,
-        // `exact_vector_search` — the exact-match ANN fallback, reading THIS
-        // session's own registration. `pin_current_version`'s own doc names
-        // this exact function as the disclosed "candidate SELECTION is not
-        // pinned" residual (M4): a pinned producer's pooled vectors are
-        // single-version, but the candidate set this function returns may
-        // have been chosen from a different, unpinned view.
+        // The exact-match ANN fallback, reading THIS session's own
+        // registration. `pin_current_version`'s own doc names this exact
+        // function as the disclosed "candidate SELECTION is not pinned"
+        // residual (M4): a pinned producer's pooled vectors are single-
+        // version, but the candidate set this function returns may have
+        // been chosen from a different, unpinned view.
     ),
     (
         "crates/jammi-db/src/session.rs",
-        2,
-        // `read_vectors` (see `RECORD_VERSION_BRANCH_ALLOWED`'s entry for
-        // this same function) and `read_vector_by_key` — both build a
-        // `TableReference::bare(format!("jammi.{table}"))` to read through
-        // this session's own registration rather than a pin. Disclosed, not
-        // closed; see `read_vectors`'s note.
+        "read_vectors",
+        1,
+        // See `RECORD_VERSION_BRANCH_ALLOWED`'s entry for this same
+        // function — builds a `TableReference::bare(format!("jammi.{table}"))`
+        // to read through this session's own registration rather than a
+        // pin. Disclosed, not closed.
+    ),
+    (
+        "crates/jammi-db/src/session.rs",
+        "read_vector_by_key",
+        1,
+        // Same shape as `read_vectors`, a different function in the same
+        // file — kept as its own site so the two allowances cannot be
+        // spent interchangeably.
     ),
     (
         "crates/jammi-db/src/store/mod.rs",
-        3,
-        // `register_table` (the registration write itself — defines what
-        // `jammi.{name}` maps to, never a read) and `bind_result_table`'s
-        // two `add_result_table` calls (its documented "Read class"
-        // residual — see `RECORD_VERSION_BRANCH_ALLOWED`'s entry).
+        "register_table",
+        1,
+        // The registration write itself — defines what `jammi.{name}` maps
+        // to, never a read.
+    ),
+    (
+        "crates/jammi-db/src/store/mod.rs",
+        "bind_result_table",
+        2,
+        // Its two `add_result_table` calls (its documented "Read class"
+        // residual — see `RECORD_VERSION_BRANCH_ALLOWED`'s entry). Both
+        // sites live in this one function, so the site-bound count here is
+        // 2, not 1 — round 8 binds the allowance to the FUNCTION, not to
+        // each individual occurrence, so two reviewed sites in one already-
+        // reviewed function still share one entry.
     ),
     (
         "crates/jammi-db/src/store/result_schema.rs",
+        "deregister_result_tables",
         1,
-        // `deregister_result_tables` — REMOVES a registration
-        // (`provider.remove`); not a read of any kind.
+        // REMOVES a registration (`provider.remove`); not a read of any
+        // kind.
     ),
     (
         "crates/jammi-ai/src/session.rs",
+        "infer_ordered_read_back_sql",
         1,
-        // `infer_ordered_read_back_sql` — an INFERENCE task-result table's
-        // own read-back of what `InferenceSession::infer` just wrote in the
-        // same call, immediately after the write, in-process. This is a
-        // different table kind (task results, never a `current_version`-
-        // bearing embedding table `PinnedSource` covers) and a different
-        // hazard shape (read-your-own-write, not a version straddle across
-        // two independent resolutions) — listed here because the literal
-        // check cannot distinguish table kinds, not because it shares the
-        // embedding-provenance risk this contract is about.
+        // An INFERENCE task-result table's own read-back of what
+        // `InferenceSession::infer` just wrote in the same call, immediately
+        // after the write, in-process. This is a different table kind (task
+        // results, never a `current_version`-bearing embedding table
+        // `PinnedSource` covers) and a different hazard shape (read-your-
+        // own-write, not a version straddle across two independent
+        // resolutions) — listed here because the literal check cannot
+        // distinguish table kinds, not because it shares the embedding-
+        // provenance risk this contract is about.
     ),
 ];
-
-fn find_allowed<'a, T>(allowed: &'a [(&str, T)], file: &str) -> Option<&'a T>
-where
-    T: 'a,
-{
-    allowed.iter().find(|(f, _)| *f == file).map(|(_, v)| v)
-}
 
 #[test]
 fn no_new_anchor_shaped_return_without_review() {
@@ -830,35 +1139,64 @@ fn no_new_bare_record_version_branch_without_review() {
 }
 
 #[test]
-fn no_new_unpinned_session_registration_literal() {
+fn no_new_self_fetched_record_version_without_review() {
     let surface = scan_surface();
-    let counts = session_registration_literal_counts(&surface);
-    for (file, count) in &counts {
-        let allowed = find_allowed(SESSION_LITERAL_ALLOWED, file)
-            .copied()
-            .unwrap_or(0);
+    let hits = self_fetched_record_version_hits(&surface);
+    for hit in &hits {
+        let allowed_name = SELF_FETCHED_RECORD_ALLOWED
+            .iter()
+            .find(|(f, n)| *f == hit.file && *n == hit.name);
         assert!(
-            *count <= allowed,
-            "{file}: {count} occurrence(s) of the bare session-registration literal \
-             `\"jammi.{{`, {allowed} audited/allowed. A NEW site must read through \
-             `ResultStore::pin_current_version`/`pinned_provider`, never construct the session-\
-             registered `jammi.{{table}}` reference directly. If this IS an audited exception, \
-             add it to `SESSION_LITERAL_ALLOWED` — keyed on this same path — with the same review \
-             its existing entries had."
+            allowed_name.is_some(),
+            "{}:{} `fn {}` resolves a `ResultTableRecord` itself in its own body via \
+             `.get_result_table(` and reads the resolved record's `.current_version` field, \
+             rather than taking an already-resolved record/version/manifest/`PinnedSource` as a \
+             parameter (pattern 2's shape) or content read (pattern 3's shape). This is either a \
+             NEW straddle-shaped site (route it through `ResultStore::pin_current_version` \
+             instead) or a reviewed exception that belongs in `SELF_FETCHED_RECORD_ALLOWED`, \
+             keyed on (file, function name), with the same review its existing entry carries.",
+            hit.file,
+            hit.line,
+            hit.name
         );
     }
 }
 
-// ── Falsification (R-A): these prove the three detectors and the mask they
-// share actually fire on the shapes they claim to catch, on synthetic
-// snippets that never touch git or the real tree — the file-scan tests
-// above already prove the real surface is reached; these prove the
+#[test]
+fn no_new_unpinned_session_registration_literal() {
+    let surface = scan_surface();
+    let sites = session_registration_literal_sites(&surface);
+    for ((file, name), count) in &sites {
+        let allowed = SESSION_LITERAL_ALLOWED
+            .iter()
+            .find(|(f, n, _)| f == file && n == name)
+            .map(|(_, _, c)| *c)
+            .unwrap_or(0);
+        assert!(
+            *count <= allowed,
+            "{file}: fn {name} has {count} occurrence(s) of the bare session-registration \
+             literal `\"jammi.{{`, {allowed} audited/allowed for THIS SITE (function) — an \
+             allowance in a DIFFERENT function of the same file never covers this one. A NEW \
+             site must read through `ResultStore::pin_current_version`/`pinned_provider`, never \
+             construct the session-registered `jammi.{{table}}` reference directly. If this IS \
+             an audited exception, add it to `SESSION_LITERAL_ALLOWED` — keyed on this same \
+             (path, function name) — with the same review its existing entries had."
+        );
+    }
+}
+
+// ── Falsification (R-A): these prove the four detectors and the mask/region
+// finder they share actually fire on the shapes they claim to catch, on
+// synthetic snippets that never touch git or the real tree — the file-scan
+// tests above already prove the real surface is reached; these prove the
 // PATTERN LOGIC itself is not vacuous. Each was run against the detector
 // BEFORE any allowlist existed for the synthetic name, confirmed red, then
 // this comment and the assertion were written — there is no allowlist
-// entry anywhere for `sneaky_anchor`/`sneaky_read`/`__probe__.rs`, so a
-// regression that made a detector stop firing would fail these directly,
-// not merely by coincidence of what the real tree happens to contain today.
+// entry anywhere for `sneaky_anchor`/`sneaky_read`/`anchor_identity_for`/
+// `anchor_with`/`__probe__.rs`, so a regression that made a detector (or
+// `find_fn_regions`'s generic-list matching) stop firing would fail these
+// directly, not merely by coincidence of what the real tree happens to
+// contain today.
 
 #[test]
 fn falsification_anchor_shaped_return_is_detected() {
@@ -954,15 +1292,209 @@ fn falsification_bare_record_version_branch_ignores_explicit_version_param() {
 }
 
 #[test]
+fn falsification_self_fetched_record_version_is_detected() {
+    // The round-7 audit's own escape shape ("P2 EVASION" in its harness at
+    // `scratchpad/audit-r7/harness.rs`, reused verbatim per the round-8
+    // contract): a producer that takes a bare table NAME, resolves the
+    // record itself through the catalog, reads `.current_version` off the
+    // record it just fetched, and returns the version identity as a plain
+    // `String`. Measured by the round-7 audit with the gate's own detector
+    // code compiled standalone: patterns 1-3 all return empty on this exact
+    // shape.
+    let src = r#"
+        impl ResultStore {
+            pub async fn anchor_identity_for(&self, table_name: &str) -> Result<Option<String>> {
+                let record = self.catalog.get_result_table(table_name).await?.unwrap();
+                let Some(version) = record.current_version else { return Ok(None); };
+                let row = self.catalog.get_result_table_version(table_name, version).await?;
+                Ok(row.and_then(|r| r.identity))
+            }
+        }
+    "#;
+    let surface = vec![("__probe__.rs".to_string(), src.to_string())];
+    let hits = self_fetched_record_version_hits(&surface);
+    assert_eq!(
+        hits.iter().map(|h| h.name.as_str()).collect::<Vec<_>>(),
+        vec!["anchor_identity_for"],
+        "the self-fetched-record-version detector did not fire on a synthetic function that \
+         resolves a `ResultTableRecord` itself via `.get_result_table(` from a bare table name \
+         and reads `.current_version` off it — this is the round-7 audit's own escape shape"
+    );
+    // The property this new detector exists to close, re-verified rather
+    // than asserted: patterns 1 and 2 are confirmed still blind to this
+    // exact shape (its return type is `Result<Option<String>>`, not
+    // anchor-shaped; it never takes `ResultTableRecord` as a parameter) — a
+    // change here would mean the escape has moved, not closed.
+    assert!(
+        anchor_shaped_return_hits(&surface).is_empty(),
+        "pattern 1 must not fire on this shape"
+    );
+    assert!(
+        bare_record_version_branch_hits(&surface).is_empty(),
+        "pattern 2 must not fire on this shape"
+    );
+}
+
+#[test]
+fn falsification_self_fetched_record_version_ignores_reviewed_delegation_and_parameterized_shapes()
+{
+    // Negative control 1 (family F): self-fetches the record but delegates
+    // the version branch to a SEPARATELY REVIEWED helper
+    // (`current_version_identity`, `RECORD_VERSION_BRANCH_ALLOWED`'s own
+    // entry) rather than reading the `.current_version` field itself.
+    // Without `reads_current_version_field`'s exact field-boundary check,
+    // the substring `.current_version` inside `.current_version_identity(`
+    // would false-positive here — this is exactly `ResultStore::current_anchor`'s
+    // real shape on today's surface.
+    let src_delegates = r#"
+        impl ResultStore {
+            pub async fn wraps_identity(&self, table_name: &str) -> Result<Option<String>> {
+                let record = self.catalog.get_result_table(table_name).await?.unwrap();
+                self.current_version_identity(&record).await
+            }
+        }
+    "#;
+    let surface = vec![("__probe__.rs".to_string(), src_delegates.to_string())];
+    let hits = self_fetched_record_version_hits(&surface);
+    assert!(
+        hits.is_empty(),
+        "a function that self-fetches a record and delegates its version branch to a \
+         separately-reviewed helper (never reading `.current_version` itself) must not be \
+         flagged: {hits:?}"
+    );
+
+    // Negative control 2: takes the record as a PARAMETER (pattern 2's own
+    // precondition) rather than self-fetching it. Must not ALSO fire
+    // pattern 4 — the two patterns partition the surface, they do not both
+    // claim the same site.
+    let src_parameterized = r#"
+        async fn sneaky_read(&self, table: &ResultTableRecord) -> Result<Vec<u8>> {
+            if let Some(v) = table.current_version {
+                return read_version(v).await;
+            }
+            Ok(vec![])
+        }
+    "#;
+    let surface2 = vec![("__probe__.rs".to_string(), src_parameterized.to_string())];
+    let hits2 = self_fetched_record_version_hits(&surface2);
+    assert!(
+        hits2.is_empty(),
+        "a function that takes `&ResultTableRecord` as a parameter (pattern 2's own shape) must \
+         not also be flagged by pattern 4: {hits2:?}"
+    );
+}
+
+#[test]
+fn falsification_generic_arrow_bound_region_is_found() {
+    // Round 8, D2: before `find_matching_angle` existed, the `->` inside
+    // this `Fn` trait bound closed the generic parameter list early via the
+    // depth-counter parens/braces use, desynchronized the scan from the
+    // following `(`, and dropped this WHOLE function from
+    // `find_fn_regions`'s output — invisible to every detector despite a
+    // return type that is literally `Result<InputAnchor>` (the round-7
+    // audit's "P4 EVASION", reused verbatim).
+    let src = r#"
+        impl ResultStore {
+            pub async fn anchor_with<F: Fn(&str) -> String>(&self, rec: &ResultTableRecord, f: F) -> Result<InputAnchor> {
+                let v = rec.current_version.unwrap();
+                Ok(InputAnchor::result_digest(f(&rec.table_name), v))
+            }
+        }
+    "#;
+    let masked = mask_non_code(src);
+    let regions = find_fn_regions(&masked);
+    assert_eq!(
+        regions.iter().map(|r| r.name.as_str()).collect::<Vec<_>>(),
+        vec!["anchor_with"],
+        "a function whose generic bound contains a `->` return arrow must still be found as a \
+         region — before the fix this function vanished entirely"
+    );
+    let surface = vec![("__probe__.rs".to_string(), src.to_string())];
+    assert_eq!(
+        anchor_shaped_return_hits(&surface)
+            .iter()
+            .map(|h| h.name.as_str())
+            .collect::<Vec<_>>(),
+        vec!["anchor_with"],
+        "pattern 1 must fire on this function's `Result<InputAnchor>` return type now that the \
+         region is found"
+    );
+    assert_eq!(
+        bare_record_version_branch_hits(&surface)
+            .iter()
+            .map(|h| h.name.as_str())
+            .collect::<Vec<_>>(),
+        vec!["anchor_with"],
+        "pattern 2 must also fire (it takes `&ResultTableRecord` and reads `.current_version`)"
+    );
+}
+
+#[test]
+fn falsification_generic_arrow_bound_does_not_break_plain_generics() {
+    // Negative-control regression: an ordinary generic parameter list with
+    // no arrow (this file's own real surface carries plenty, e.g.
+    // `find_matching<T>` a few hundred lines up) must still close at its
+    // own `>`, not run away looking for a `->` that never comes.
+    let src = r#"
+        impl Foo {
+            pub fn plain<T: Clone, U>(&self, a: T, b: U) -> Result<InputAnchor> {
+                todo!()
+            }
+        }
+    "#;
+    let masked = mask_non_code(src);
+    let regions = find_fn_regions(&masked);
+    assert_eq!(
+        regions.iter().map(|r| r.name.as_str()).collect::<Vec<_>>(),
+        vec!["plain"],
+        "an ordinary generic parameter list with no arrow must still be found as one region"
+    );
+}
+
+#[test]
 fn falsification_session_registration_literal_is_detected() {
     let src = "let table_ref = TableReference::bare(format!(\"jammi.{}\", table.table_name));\n";
-    let counts =
-        session_registration_literal_counts(&[("__probe__.rs".to_string(), src.to_string())]);
+    let sites =
+        session_registration_literal_sites(&[("__probe__.rs".to_string(), src.to_string())]);
     assert_eq!(
-        counts.get("__probe__.rs"),
+        sites.get(&("__probe__.rs".to_string(), "<module-scope>".to_string())),
         Some(&1),
         "the session-registration-literal detector did not fire on a synthetic \
-         `TableReference::bare(format!(\"jammi.{{}}\", ..))` call"
+         `TableReference::bare(format!(\"jammi.{{}}\", ..))` call at module scope"
+    );
+}
+
+#[test]
+fn falsification_session_registration_literal_binds_to_its_enclosing_function() {
+    // Round 8, D3: the SAME literal shape, once inside a named function,
+    // must be bound to that function's SITE, not to the file (or to
+    // "<module-scope>") — proving the site-binding fix actually attributes
+    // the hit correctly rather than merely still finding it somewhere.
+    let src = concat!(
+        "fn one(table: &str) {\n",
+        "    let a = TableReference::bare(format!(\"jammi.{}\", table));\n",
+        "}\n",
+        "fn two(table: &str) {\n",
+        "    let b = TableReference::bare(format!(\"jammi.{}\", table));\n",
+        "    let c = TableReference::bare(format!(\"jammi.{}\", table));\n",
+        "}\n",
+    );
+    let sites =
+        session_registration_literal_sites(&[("__probe__.rs".to_string(), src.to_string())]);
+    assert_eq!(
+        sites.get(&("__probe__.rs".to_string(), "one".to_string())),
+        Some(&1),
+        "fn `one`'s single occurrence must be bound to `one`, not to the file total: {sites:?}"
+    );
+    assert_eq!(
+        sites.get(&("__probe__.rs".to_string(), "two".to_string())),
+        Some(&2),
+        "fn `two`'s two occurrences must be bound to `two`, and only `two`: {sites:?}"
+    );
+    assert!(
+        !sites.contains_key(&("__probe__.rs".to_string(), "<module-scope>".to_string())),
+        "no occurrence here is outside a function, so the module-scope sentinel must not appear: \
+         {sites:?}"
     );
 }
 
@@ -979,12 +1511,12 @@ fn falsification_session_registration_literal_ignores_unrelated_jammi_dot_litera
         "let s = format!(\"jammi.topic.{}.batch\", id);\n",
         "h.update(b\"jammi.version.identity.v1\");\n",
     );
-    let counts =
-        session_registration_literal_counts(&[("__probe__.rs".to_string(), src.to_string())]);
+    let sites =
+        session_registration_literal_sites(&[("__probe__.rs".to_string(), src.to_string())]);
     assert!(
-        counts.is_empty(),
+        sites.is_empty(),
         "a domain-separator/config literal that merely starts with `jammi.` must not be counted \
-         as a session-registration reference: {counts:?}"
+         as a session-registration reference: {sites:?}"
     );
 }
 
@@ -1019,7 +1551,7 @@ fn mask_non_code_ignores_comments_and_string_braces() {
 
 #[test]
 fn allowlists_match_current_hits_exactly() {
-    // The inverse control (round 6 advisory, generalized to all three
+    // The inverse control (round 6 advisory, generalized to all four
     // patterns): an allowance whose site no longer produces that hit — the
     // code was fixed, renamed, or removed — must shrink with it. A
     // permanent allowance is dead slack a LATER, different site could spend
@@ -1052,13 +1584,28 @@ fn allowlists_match_current_hits_exactly() {
         );
     }
 
-    let literal_counts = session_registration_literal_counts(&surface);
-    for (file, allowed) in SESSION_LITERAL_ALLOWED {
-        let current = literal_counts.get(*file).copied().unwrap_or(0);
+    let self_fetched_hits: HashSet<(String, String)> = self_fetched_record_version_hits(&surface)
+        .into_iter()
+        .map(|h| (h.file, h.name))
+        .collect();
+    for (file, name) in SELF_FETCHED_RECORD_ALLOWED {
+        assert!(
+            self_fetched_hits.contains(&(file.to_string(), name.to_string())),
+            "SELF_FETCHED_RECORD_ALLOWED lists {file}:{name}, but the current scan no longer \
+             finds a self-fetched-record version read there — shrink this list to match."
+        );
+    }
+
+    let literal_sites = session_registration_literal_sites(&surface);
+    for (file, name, allowed) in SESSION_LITERAL_ALLOWED {
+        let current = literal_sites
+            .get(&(file.to_string(), name.to_string()))
+            .copied()
+            .unwrap_or(0);
         assert_eq!(
             current, *allowed,
-            "{file}: SESSION_LITERAL_ALLOWED expects exactly {allowed} occurrence(s) of \
-             `\"jammi.{{`, the current scan finds {current} — update this allowlist to match."
+            "{file}: fn {name}: SESSION_LITERAL_ALLOWED expects exactly {allowed} occurrence(s) \
+             of `\"jammi.{{`, the current scan finds {current} — update this allowlist to match."
         );
     }
 }

@@ -63,7 +63,8 @@ use crate::common;
 /// `(key, vector)` rows as they are handed to the writer, never from a decode
 /// of the written artifact, so it is invariant to both the encoder line and
 /// the schema's null column. This test asserts it on every run.
-const GOLDEN_ARTIFACT_DIGEST: &str = "57219fe5253e751d6627cb15c4688fe97f2099f99487cbf0e79c2aa2417dd222";
+const GOLDEN_ARTIFACT_DIGEST: &str =
+    "57219fe5253e751d6627cb15c4688fe97f2099f99487cbf0e79c2aa2417dd222";
 
 /// Golden content digest (SHA-256 hex) of the fixture's normalized
 /// `(_row_id, vector)` rows, captured the same way as

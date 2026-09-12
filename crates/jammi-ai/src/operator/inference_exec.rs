@@ -1,4 +1,3 @@
-use std::any::Any;
 use std::fmt::{self, Formatter};
 use std::sync::Arc;
 
@@ -35,7 +34,7 @@ pub struct InferenceExec {
     /// Served regression head's persisted distribution form, for schema
     /// construction. `None` for non-regression tasks.
     regression_form: Option<DistributionForm>,
-    properties: PlanProperties,
+    properties: Arc<PlanProperties>,
 }
 
 impl std::fmt::Debug for InferenceExec {
@@ -132,7 +131,7 @@ impl InferenceExecBuilder {
             observer: self.observer,
             embedding_dim: self.embedding_dim,
             regression_form: self.regression_form,
-            properties,
+            properties: Arc::new(properties),
         })
     }
 }
@@ -163,11 +162,7 @@ impl ExecutionPlan for InferenceExec {
         "InferenceExec"
     }
 
-    fn as_any(&self) -> &dyn Any {
-        self
-    }
-
-    fn properties(&self) -> &PlanProperties {
+    fn properties(&self) -> &Arc<PlanProperties> {
         &self.properties
     }
 

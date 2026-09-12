@@ -2411,13 +2411,18 @@ impl CandleModel {
                     .cloned()
                     .unwrap_or_else(|| format!("LABEL_{max_idx}"));
 
-                // Build JSON of all scores
+                // Build JSON of all scores, keys sorted by label: `id2label` is
+                // a `HashMap`, and a `serde_json::Map` keeps insertion order
+                // whenever any dependency enables `preserve_order`, so the
+                // order is fixed here rather than left to either map type.
                 let scores_map: serde_json::Map<String, serde_json::Value> = id2label
                     .iter()
                     .map(|(&idx, name)| {
                         let score = row_probs.get(idx as usize).copied().unwrap_or(0.0);
                         (name.clone(), serde_json::Value::from(score))
                     })
+                    .collect::<std::collections::BTreeMap<_, _>>()
+                    .into_iter()
                     .collect();
                 let scores_json = serde_json::Value::Object(scores_map).to_string();
 

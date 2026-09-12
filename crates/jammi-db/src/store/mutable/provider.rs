@@ -6,7 +6,6 @@
 //! when straightforward; otherwise DataFusion's planner handles them above
 //! the scan node.
 
-use std::any::Any;
 use std::fmt;
 use std::sync::Arc;
 
@@ -146,10 +145,6 @@ impl MutableTableProvider {
 
 #[async_trait]
 impl TableProvider for MutableTableProvider {
-    fn as_any(&self) -> &dyn Any {
-        self
-    }
-
     fn schema(&self) -> SchemaRef {
         Arc::clone(&self.def.schema)
     }

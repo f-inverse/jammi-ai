@@ -1,4 +1,3 @@
-use std::any::Any;
 use std::fmt::{self, Formatter};
 use std::sync::Arc;
 
@@ -43,7 +42,7 @@ pub struct AnnSearchExec {
     oversample_override: Option<usize>,
     result_store: Arc<ResultStore>,
     session_ctx: datafusion::prelude::SessionContext,
-    properties: PlanProperties,
+    properties: Arc<PlanProperties>,
 }
 
 impl AnnSearchExec {
@@ -69,7 +68,7 @@ impl AnnSearchExec {
             oversample_override,
             result_store,
             session_ctx,
-            properties,
+            properties: Arc::new(properties),
         })
     }
 
@@ -106,11 +105,7 @@ impl ExecutionPlan for AnnSearchExec {
         "AnnSearchExec"
     }
 
-    fn as_any(&self) -> &dyn Any {
-        self
-    }
-
-    fn properties(&self) -> &PlanProperties {
+    fn properties(&self) -> &Arc<PlanProperties> {
         &self.properties
     }
 

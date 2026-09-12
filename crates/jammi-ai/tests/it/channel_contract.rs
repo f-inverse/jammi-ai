@@ -5,6 +5,7 @@
 //! `inference` channels participate, so future refactors that drift the
 //! shape are caught at test time.
 
+use std::collections::BTreeMap;
 use std::sync::Arc;
 
 use arrow::array::{ArrayRef, Float32Array, RecordBatch, StringArray};
@@ -143,15 +144,21 @@ async fn vector_and_inference_reexpressed_produce_byte_identical_recordbatch() {
 /// it serializes private metadata that may shift across Arrow versions
 /// without changing observational shape.
 fn schema_to_canonical_json(schema: &Schema) -> String {
-    let entries: Vec<serde_json::Value> = schema
+    // Canonical means key-sorted: a `BTreeMap` per entry fixes the order
+    // regardless of whether `serde_json` was compiled with `preserve_order`
+    // (a feature any dependency can switch on for the whole workspace).
+    let entries: Vec<BTreeMap<&str, serde_json::Value>> = schema
         .fields()
         .iter()
         .map(|f| {
-            serde_json::json!({
-                "name": f.name(),
-                "dtype": format!("{:?}", f.data_type()),
-                "nullable": f.is_nullable(),
-            })
+            BTreeMap::from([
+                ("name", serde_json::Value::from(f.name().as_str())),
+                (
+                    "dtype",
+                    serde_json::Value::from(format!("{:?}", f.data_type())),
+                ),
+                ("nullable", serde_json::Value::from(f.is_nullable())),
+            ])
         })
         .collect();
     serde_json::to_string_pretty(&entries).unwrap()

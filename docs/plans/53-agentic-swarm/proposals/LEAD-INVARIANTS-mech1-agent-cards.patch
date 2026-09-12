@@ -1,0 +1,153 @@
+diff --git a/.claude/agents/ai-core.md b/.claude/agents/ai-core.md
+index 0b55bef5..cb0172c2 100644
+--- a/.claude/agents/ai-core.md
++++ b/.claude/agents/ai-core.md
+@@ -28,8 +28,11 @@ You are a subagent. Every "user" message is your caller (the lead). The lead see
+ 
+ ## Pre-flight
+ 
+-1. Work in your isolated worktree with a **unique** `CARGO_TARGET_DIR` (e.g. `target/wt-ai-core-$$`). Do **not** override `RUSTC_WRAPPER`/`RUSTFLAGS`. Never `git checkout -b` in a shared checkout.
++1. **Build into your worktree's own `CARGO_TARGET_DIR`** (e.g. `target/wt-<worktree-basename>`), **shared by every agent working THIS worktree** — the isolation boundary is the worktree, not the dispatch: a fresh private directory per agent (`target/wt-ai-core-$$`) means a cold rebuild of the whole workspace on every dispatch. Use a genuinely private directory only for a genuinely different tree (an archive, a separate clone, a checkout at another commit) — never for a second agent sharing this SAME worktree. Do **not** override `RUSTC_WRAPPER`/`RUSTFLAGS`. Never `git checkout -b` in a shared checkout.
+ 2. Load the constitution invariants the contract crosses.
++3. **Scope your gates to what you changed.** A markdown-only or single-surface edit does not need the full workspace suite — run the acceptance gate for the crate(s)/surface(s) the diff actually touches, not the whole tree by default.
++4. **On a shared worktree: commit by explicit pathspec, re-read `HEAD` in the same command as any amend, and verify the commit's contents again at the end of the task.** `git commit -- <files>` (never a bare `git commit -a` / `git add -A`, which can sweep up another agent's unsaved edit on the same worktree); `git rev-parse HEAD && git commit --amend …` in ONE invocation (a `HEAD` read from an earlier turn can be stale by the time the amend runs — another agent on this worktree may have moved it); `git show --stat HEAD` / `git diff HEAD~1 HEAD -- <files>` once more before you report done. Two agents sharing a worktree have damaged each other's work this way: one amended past a moved `HEAD`, one overwrote an edit no one had committed yet.
++5. **Never pipe a build or test through another command when you read its exit status.** `cargo test … | tail` (or any pipe) hands you the LAST command's `$?`, never the build/test's own — run it un-piped, or capture the real command's exit status explicitly (`$PIPESTATUS`/a saved `$?` from the exact command whose result you report), never the pipeline's.
+ 
+ ## Acceptance
+ 
+diff --git a/.claude/agents/bench.md b/.claude/agents/bench.md
+index a6f66276..7054165e 100644
+--- a/.claude/agents/bench.md
++++ b/.claude/agents/bench.md
+@@ -27,8 +27,11 @@ You are a subagent. Every "user" message is your caller (the lead). The lead see
+ 
+ ## Pre-flight
+ 
+-1. Work in your isolated worktree with a **unique** `CARGO_TARGET_DIR` (e.g. `target/wt-bench-$$`). Do **not** override `RUSTC_WRAPPER`/`RUSTFLAGS`. Never `git checkout -b` in a shared checkout.
++1. **Build into your worktree's own `CARGO_TARGET_DIR`** (e.g. `target/wt-<worktree-basename>`), **shared by every agent working THIS worktree** — the isolation boundary is the worktree, not the dispatch: a fresh private directory per agent (`target/wt-bench-$$`) means a cold rebuild of the whole workspace on every dispatch. Use a genuinely private directory only for a genuinely different tree (an archive, a separate clone, a checkout at another commit) — never for a second agent sharing this SAME worktree. Do **not** override `RUSTC_WRAPPER`/`RUSTFLAGS`. Never `git checkout -b` in a shared checkout.
+ 2. Load the constitution invariants the contract crosses.
++3. **Scope your gates to what you changed.** A markdown-only or single-surface edit does not need the full workspace suite — run the acceptance gate for the crate(s)/surface(s) the diff actually touches, not the whole tree by default.
++4. **On a shared worktree: commit by explicit pathspec, re-read `HEAD` in the same command as any amend, and verify the commit's contents again at the end of the task.** `git commit -- <files>` (never a bare `git commit -a` / `git add -A`, which can sweep up another agent's unsaved edit on the same worktree); `git rev-parse HEAD && git commit --amend …` in ONE invocation (a `HEAD` read from an earlier turn can be stale by the time the amend runs — another agent on this worktree may have moved it); `git show --stat HEAD` / `git diff HEAD~1 HEAD -- <files>` once more before you report done. Two agents sharing a worktree have damaged each other's work this way: one amended past a moved `HEAD`, one overwrote an edit no one had committed yet.
++5. **Never pipe a build or test through another command when you read its exit status.** `cargo test … | tail` (or any pipe) hands you the LAST command's `$?`, never the build/test's own — run it un-piped, or capture the real command's exit status explicitly (`$PIPESTATUS`/a saved `$?` from the exact command whose result you report), never the pipeline's.
+ 
+ ## Acceptance
+ 
+diff --git a/.claude/agents/cli.md b/.claude/agents/cli.md
+index b176f46a..4fd86f1c 100644
+--- a/.claude/agents/cli.md
++++ b/.claude/agents/cli.md
+@@ -27,8 +27,11 @@ You are a subagent. Every "user" message is your caller (the lead). The lead see
+ 
+ ## Pre-flight
+ 
+-1. Work in your isolated worktree with a **unique** `CARGO_TARGET_DIR` (e.g. `target/wt-cli-$$`). Do **not** override `RUSTC_WRAPPER`/`RUSTFLAGS`. Never `git checkout -b` in a shared checkout.
++1. **Build into your worktree's own `CARGO_TARGET_DIR`** (e.g. `target/wt-<worktree-basename>`), **shared by every agent working THIS worktree** — the isolation boundary is the worktree, not the dispatch: a fresh private directory per agent (`target/wt-cli-$$`) means a cold rebuild of the whole workspace on every dispatch. Use a genuinely private directory only for a genuinely different tree (an archive, a separate clone, a checkout at another commit) — never for a second agent sharing this SAME worktree. Do **not** override `RUSTC_WRAPPER`/`RUSTFLAGS`. Never `git checkout -b` in a shared checkout.
+ 2. Load the constitution invariants the contract crosses.
++3. **Scope your gates to what you changed.** A markdown-only or single-surface edit does not need the full workspace suite — run the acceptance gate for the crate(s)/surface(s) the diff actually touches, not the whole tree by default.
++4. **On a shared worktree: commit by explicit pathspec, re-read `HEAD` in the same command as any amend, and verify the commit's contents again at the end of the task.** `git commit -- <files>` (never a bare `git commit -a` / `git add -A`, which can sweep up another agent's unsaved edit on the same worktree); `git rev-parse HEAD && git commit --amend …` in ONE invocation (a `HEAD` read from an earlier turn can be stale by the time the amend runs — another agent on this worktree may have moved it); `git show --stat HEAD` / `git diff HEAD~1 HEAD -- <files>` once more before you report done. Two agents sharing a worktree have damaged each other's work this way: one amended past a moved `HEAD`, one overwrote an edit no one had committed yet.
++5. **Never pipe a build or test through another command when you read its exit status.** `cargo test … | tail` (or any pipe) hands you the LAST command's `$?`, never the build/test's own — run it un-piped, or capture the real command's exit status explicitly (`$PIPESTATUS`/a saved `$?` from the exact command whose result you report), never the pipeline's.
+ 
+ ## Acceptance
+ 
+diff --git a/.claude/agents/cookbook.md b/.claude/agents/cookbook.md
+index ec8513d7..0188162f 100644
+--- a/.claude/agents/cookbook.md
++++ b/.claude/agents/cookbook.md
+@@ -34,8 +34,11 @@ When dispatched at phase 6.5, given the diff's changed engine files:
+ 
+ ## Pre-flight
+ 
+-1. Work in your isolated worktree with a **unique** `CARGO_TARGET_DIR` (e.g. `target/wt-cookbook-$$`) and emit into a fresh temp output dir. Do **not** override `RUSTC_WRAPPER`/`RUSTFLAGS`. Never `git checkout -b` in a shared checkout.
++1. **Build into your worktree's own `CARGO_TARGET_DIR`** (e.g. `target/wt-<worktree-basename>`), **shared by every agent working THIS worktree**, and emit into a fresh temp output dir — the isolation boundary is the worktree, not the dispatch: a fresh private target directory per agent (`target/wt-cookbook-$$`) means a cold rebuild of the whole workspace on every dispatch. Use a genuinely private target directory only for a genuinely different tree (an archive, a separate clone, a checkout at another commit) — never for a second agent sharing this SAME worktree. Do **not** override `RUSTC_WRAPPER`/`RUSTFLAGS`. Never `git checkout -b` in a shared checkout.
+ 2. Load the constitution invariants the contract crosses.
++3. **Scope your gates to what you changed.** A markdown-only or single-surface edit does not need the full workspace suite — run the acceptance gate for the crate(s)/surface(s) the diff actually touches, not the whole tree by default.
++4. **On a shared worktree: commit by explicit pathspec, re-read `HEAD` in the same command as any amend, and verify the commit's contents again at the end of the task.** `git commit -- <files>` (never a bare `git commit -a` / `git add -A`, which can sweep up another agent's unsaved edit on the same worktree); `git rev-parse HEAD && git commit --amend …` in ONE invocation (a `HEAD` read from an earlier turn can be stale by the time the amend runs — another agent on this worktree may have moved it); `git show --stat HEAD` / `git diff HEAD~1 HEAD -- <files>` once more before you report done. Two agents sharing a worktree have damaged each other's work this way: one amended past a moved `HEAD`, one overwrote an edit no one had committed yet.
++5. **Never pipe a build or test through another command when you read its exit status.** `cargo test … | tail` (or any pipe) hands you the LAST command's `$?`, never the build/test's own — run it un-piped, or capture the real command's exit status explicitly (`$PIPESTATUS`/a saved `$?` from the exact command whose result you report), never the pipeline's.
+ 
+ ## Acceptance
+ 
+diff --git a/.claude/agents/db.md b/.claude/agents/db.md
+index 754a011d..1b4536e7 100644
+--- a/.claude/agents/db.md
++++ b/.claude/agents/db.md
+@@ -30,8 +30,11 @@ You are a subagent. Every "user" message is your caller (the lead). The lead see
+ 
+ ## Pre-flight
+ 
+-1. Work in your isolated worktree with a **unique** `CARGO_TARGET_DIR` (e.g. `target/wt-db-$$`); never share a target dir (a shared one serves stale artifacts, so the audit tests the wrong code). Do **not** override `RUSTC_WRAPPER`/`RUSTFLAGS` (sccache key miss → ~100-min recompile). Never `git checkout -b` in a shared checkout.
++1. **Build into your worktree's own `CARGO_TARGET_DIR`** (e.g. `target/wt-<worktree-basename>`), **shared by every agent working THIS worktree** — the isolation boundary is the worktree, not the dispatch: a fresh private directory per agent (`target/wt-db-$$`) means a cold rebuild of the whole workspace on every dispatch. Never share it ACROSS worktrees (a DIFFERENT worktree, archive, clone, or checkout at another commit serves stale artifacts, so the audit tests the wrong code) — sharing within the SAME worktree is exactly what the directory is for. Do **not** override `RUSTC_WRAPPER`/`RUSTFLAGS` (sccache key miss → ~100-min recompile). Never `git checkout -b` in a shared checkout.
+ 2. Load the constitution invariants the contract crosses.
++3. **Scope your gates to what you changed.** A markdown-only or single-surface edit does not need the full workspace suite — run the acceptance gate for the crate(s)/surface(s) the diff actually touches, not the whole tree by default.
++4. **On a shared worktree: commit by explicit pathspec, re-read `HEAD` in the same command as any amend, and verify the commit's contents again at the end of the task.** `git commit -- <files>` (never a bare `git commit -a` / `git add -A`, which can sweep up another agent's unsaved edit on the same worktree); `git rev-parse HEAD && git commit --amend …` in ONE invocation (a `HEAD` read from an earlier turn can be stale by the time the amend runs — another agent on this worktree may have moved it); `git show --stat HEAD` / `git diff HEAD~1 HEAD -- <files>` once more before you report done. Two agents sharing a worktree have damaged each other's work this way: one amended past a moved `HEAD`, one overwrote an edit no one had committed yet.
++5. **Never pipe a build or test through another command when you read its exit status.** `cargo test … | tail` (or any pipe) hands you the LAST command's `$?`, never the build/test's own — run it un-piped, or capture the real command's exit status explicitly (`$PIPESTATUS`/a saved `$?` from the exact command whose result you report), never the pipeline's.
+ 
+ ## Acceptance
+ 
+diff --git a/.claude/agents/docs-ci.md b/.claude/agents/docs-ci.md
+index 51229af8..5df19de0 100644
+--- a/.claude/agents/docs-ci.md
++++ b/.claude/agents/docs-ci.md
+@@ -52,8 +52,11 @@ You are a subagent. Every "user" message is your caller (the lead). The lead see
+ 
+ ## Pre-flight
+ 
+-1. Work in your isolated worktree with a **unique** `CARGO_TARGET_DIR` (e.g. `target/wt-docs-ci-$$`) when a change compiles anything. Do **not** override `RUSTC_WRAPPER`/`RUSTFLAGS`. Never `git checkout -b` in a shared checkout.
++1. **Build into your worktree's own `CARGO_TARGET_DIR`** (e.g. `target/wt-<worktree-basename>`) when a change compiles anything, **shared by every agent working THIS worktree** — the isolation boundary is the worktree, not the dispatch: a fresh private directory per agent (`target/wt-docs-ci-$$`) means a cold rebuild of the whole workspace on every dispatch. Use a genuinely private directory only for a genuinely different tree (an archive, a separate clone, a checkout at another commit) — never for a second agent sharing this SAME worktree. Do **not** override `RUSTC_WRAPPER`/`RUSTFLAGS`. Never `git checkout -b` in a shared checkout.
+ 2. Load the constitution invariants the contract crosses.
++3. **Scope your gates to what you changed.** A markdown-only or single-surface edit does not need the full workspace suite — run the acceptance gate for the crate(s)/surface(s) the diff actually touches, not the whole tree by default.
++4. **On a shared worktree: commit by explicit pathspec, re-read `HEAD` in the same command as any amend, and verify the commit's contents again at the end of the task.** `git commit -- <files>` (never a bare `git commit -a` / `git add -A`, which can sweep up another agent's unsaved edit on the same worktree); `git rev-parse HEAD && git commit --amend …` in ONE invocation (a `HEAD` read from an earlier turn can be stale by the time the amend runs — another agent on this worktree may have moved it); `git show --stat HEAD` / `git diff HEAD~1 HEAD -- <files>` once more before you report done. Two agents sharing a worktree have damaged each other's work this way: one amended past a moved `HEAD`, one overwrote an edit no one had committed yet.
++5. **Never pipe a build or test through another command when you read its exit status.** `cargo test … | tail` (or any pipe) hands you the LAST command's `$?`, never the build/test's own — run it un-piped, or capture the real command's exit status explicitly (`$PIPESTATUS`/a saved `$?` from the exact command whose result you report), never the pipeline's.
+ 
+ ## Acceptance
+ 
+diff --git a/.claude/agents/numerics.md b/.claude/agents/numerics.md
+index 6f9bc9b3..090afe63 100644
+--- a/.claude/agents/numerics.md
++++ b/.claude/agents/numerics.md
+@@ -31,8 +31,11 @@ You are a subagent. Every "user" message is your caller (the lead). The lead see
+ 
+ ## Pre-flight
+ 
+-1. Work in your isolated worktree with a **unique** `CARGO_TARGET_DIR` (e.g. `target/wt-numerics-$$`). Do **not** override `RUSTC_WRAPPER`/`RUSTFLAGS`. Never `git checkout -b` in a shared checkout.
++1. **Build into your worktree's own `CARGO_TARGET_DIR`** (e.g. `target/wt-<worktree-basename>`), **shared by every agent working THIS worktree** — the isolation boundary is the worktree, not the dispatch: a fresh private directory per agent (`target/wt-numerics-$$`) means a cold rebuild of the whole workspace on every dispatch. Use a genuinely private directory only for a genuinely different tree (an archive, a separate clone, a checkout at another commit) — never for a second agent sharing this SAME worktree. Do **not** override `RUSTC_WRAPPER`/`RUSTFLAGS`. Never `git checkout -b` in a shared checkout.
+ 2. Load the constitution invariants the contract crosses.
++3. **Scope your gates to what you changed.** A markdown-only or single-surface edit does not need the full workspace suite — run the acceptance gate for the crate(s)/surface(s) the diff actually touches, not the whole tree by default.
++4. **On a shared worktree: commit by explicit pathspec, re-read `HEAD` in the same command as any amend, and verify the commit's contents again at the end of the task.** `git commit -- <files>` (never a bare `git commit -a` / `git add -A`, which can sweep up another agent's unsaved edit on the same worktree); `git rev-parse HEAD && git commit --amend …` in ONE invocation (a `HEAD` read from an earlier turn can be stale by the time the amend runs — another agent on this worktree may have moved it); `git show --stat HEAD` / `git diff HEAD~1 HEAD -- <files>` once more before you report done. Two agents sharing a worktree have damaged each other's work this way: one amended past a moved `HEAD`, one overwrote an edit no one had committed yet.
++5. **Never pipe a build or test through another command when you read its exit status.** `cargo test … | tail` (or any pipe) hands you the LAST command's `$?`, never the build/test's own — run it un-piped, or capture the real command's exit status explicitly (`$PIPESTATUS`/a saved `$?` from the exact command whose result you report), never the pipeline's.
+ 
+ ## Acceptance
+ 
+diff --git a/.claude/agents/python.md b/.claude/agents/python.md
+index 072418f7..f0afd657 100644
+--- a/.claude/agents/python.md
++++ b/.claude/agents/python.md
+@@ -27,8 +27,11 @@ You are a subagent. Every "user" message is your caller (the lead). The lead see
+ 
+ ## Pre-flight
+ 
+-1. Work in your isolated worktree with a **unique** `CARGO_TARGET_DIR` (e.g. `target/wt-python-$$`) and a **pinned `PYTHONPATH`** pointing at this worktree's build output. Do **not** override `RUSTC_WRAPPER`/`RUSTFLAGS`. Never `git checkout -b` in a shared checkout.
++1. **Build into your worktree's own `CARGO_TARGET_DIR`** (e.g. `target/wt-<worktree-basename>`), **shared by every agent working THIS worktree**, and a **pinned `PYTHONPATH`** pointing at this worktree's build output — the isolation boundary is the worktree, not the dispatch: a fresh private target directory per agent (`target/wt-python-$$`) means a cold rebuild of the whole workspace on every dispatch. Use a genuinely private target directory only for a genuinely different tree (an archive, a separate clone, a checkout at another commit) — never for a second agent sharing this SAME worktree. Do **not** override `RUSTC_WRAPPER`/`RUSTFLAGS`. Never `git checkout -b` in a shared checkout.
+ 2. Load the constitution invariants the contract crosses.
++3. **Scope your gates to what you changed.** A markdown-only or single-surface edit does not need the full workspace suite — run the acceptance gate for the crate(s)/surface(s) the diff actually touches, not the whole tree by default.
++4. **On a shared worktree: commit by explicit pathspec, re-read `HEAD` in the same command as any amend, and verify the commit's contents again at the end of the task.** `git commit -- <files>` (never a bare `git commit -a` / `git add -A`, which can sweep up another agent's unsaved edit on the same worktree); `git rev-parse HEAD && git commit --amend …` in ONE invocation (a `HEAD` read from an earlier turn can be stale by the time the amend runs — another agent on this worktree may have moved it); `git show --stat HEAD` / `git diff HEAD~1 HEAD -- <files>` once more before you report done. Two agents sharing a worktree have damaged each other's work this way: one amended past a moved `HEAD`, one overwrote an edit no one had committed yet.
++5. **Never pipe a build or test through another command when you read its exit status.** `cargo test … | tail` (or any pipe) hands you the LAST command's `$?`, never the build/test's own — run it un-piped, or capture the real command's exit status explicitly (`$PIPESTATUS`/a saved `$?` from the exact command whose result you report), never the pipeline's.
+ 
+ ## Acceptance
+ 
+diff --git a/.claude/agents/wire-server.md b/.claude/agents/wire-server.md
+index 5c8faee5..66aad6c7 100644
+--- a/.claude/agents/wire-server.md
++++ b/.claude/agents/wire-server.md
+@@ -30,8 +30,11 @@ You are a subagent. Every "user" message is your caller (the lead). The lead see
+ 
+ ## Pre-flight
+ 
+-1. Work in your isolated worktree with a **unique** `CARGO_TARGET_DIR` (e.g. `target/wt-wire-server-$$`). Do **not** override `RUSTC_WRAPPER`/`RUSTFLAGS`. Never `git checkout -b` in a shared checkout.
++1. **Build into your worktree's own `CARGO_TARGET_DIR`** (e.g. `target/wt-<worktree-basename>`), **shared by every agent working THIS worktree** — the isolation boundary is the worktree, not the dispatch: a fresh private directory per agent (`target/wt-wire-server-$$`) means a cold rebuild of the whole workspace on every dispatch. Use a genuinely private directory only for a genuinely different tree (an archive, a separate clone, a checkout at another commit) — never for a second agent sharing this SAME worktree. Do **not** override `RUSTC_WRAPPER`/`RUSTFLAGS`. Never `git checkout -b` in a shared checkout.
+ 2. Load the constitution invariants the contract crosses.
++3. **Scope your gates to what you changed.** A markdown-only or single-surface edit does not need the full workspace suite — run the acceptance gate for the crate(s)/surface(s) the diff actually touches, not the whole tree by default.
++4. **On a shared worktree: commit by explicit pathspec, re-read `HEAD` in the same command as any amend, and verify the commit's contents again at the end of the task.** `git commit -- <files>` (never a bare `git commit -a` / `git add -A`, which can sweep up another agent's unsaved edit on the same worktree); `git rev-parse HEAD && git commit --amend …` in ONE invocation (a `HEAD` read from an earlier turn can be stale by the time the amend runs — another agent on this worktree may have moved it); `git show --stat HEAD` / `git diff HEAD~1 HEAD -- <files>` once more before you report done. Two agents sharing a worktree have damaged each other's work this way: one amended past a moved `HEAD`, one overwrote an edit no one had committed yet.
++5. **Never pipe a build or test through another command when you read its exit status.** `cargo test … | tail` (or any pipe) hands you the LAST command's `$?`, never the build/test's own — run it un-piped, or capture the real command's exit status explicitly (`$PIPESTATUS`/a saved `$?` from the exact command whose result you report), never the pipeline's.
+ 
+ ## Acceptance
+ 

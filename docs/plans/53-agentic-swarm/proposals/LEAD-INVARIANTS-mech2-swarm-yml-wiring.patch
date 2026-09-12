@@ -1,0 +1,43 @@
+diff --git a/.github/workflows/swarm.yml b/.github/workflows/swarm.yml
+--- a/.github/workflows/swarm.yml
++++ b/.github/workflows/swarm.yml
+@@ -70,6 +70,15 @@
+         if: ${{ !cancelled() }}
+         run: python3 ci/scripts/test_check_lead_gate.py
+ 
++      # esc-lead-invariants-2: the phase-5 oracle-freshness check's own
++      # hermetic self-test — real scratch git repos (a real `origin` + a
++      # real feature-branch clone), never against this checkout's own
++      # history. Runs unconditionally, matching check_lead_gate.py's own
++      # self-test above.
++      - name: Assert the phase-5 oracle-freshness gate fires correctly on fixtures
++        if: ${{ !cancelled() }}
++        run: python3 ci/scripts/check_oracle_gate.py --self-test
++
+       # --- Human-amend-only guards (git-diff-scoped; PRs only) ----------------
+       # Each detects its touched set inside the job and exits green when untouched,
+       # red (admin-merge required) when touched. Every constitution/gate edit —
+@@ -113,3 +122,23 @@
+             exit 1
+           fi
+           echo "SWARM_GATE_TOUCHED: clean — no swarm gate definition changed."
++
++      # esc-lead-invariants-2: ARMED BY THE DIFF (crates/**, cookbook/**),
++      # SATISFIED BY DISCLOSURE, JUDGED BY THE HUMAN — never described any
++      # other way. Requires a committed docs/rigor/<unit-slug>.oracle.jsonl
++      # record carrying a FRESH oracle PASS row (head_sha's tree matches
++      # HEAD outside docs/rigor/**) whenever base...HEAD touches a path
++      # phase-5 (oracle) reviews — see the script's own module doc for the
++      # full rule and its stated residual.
++      - name: Guard — a source-code change carries a fresh, committed phase-5 oracle PASS (esc-lead-invariants-2)
++        if: ${{ !cancelled() && github.event_name == 'pull_request' }}
++        env:
++          GITHUB_EVENT_NAME: ${{ github.event_name }}
++          GITHUB_BASE_REF: ${{ github.base_ref }}
++          GITHUB_HEAD_REF: ${{ github.head_ref }}
++          GITHUB_ACTOR: ${{ github.actor }}
++        run: python3 ci/scripts/check_oracle_gate.py
++
++      - name: Guard — the oracle-gate exemption allowlist only shrinks
++        if: ${{ !cancelled() && github.event_name == 'pull_request' }}
++        run: python3 ci/scripts/check_oracle_gate.py --check-allowlist-only-shrinks

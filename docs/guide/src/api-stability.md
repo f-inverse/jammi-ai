@@ -143,6 +143,46 @@ that is not yet ready to freeze does not appear on the public client at all; it
 stays internal until it is ready to enter the frozen set. The freeze is total
 across the published surface, which is what the terminal-0.x bar requires.
 
+## Published-crate Rust APIs
+
+`jammi-db` and `jammi-numerics` are published Rust crates: their public items
+(types, functions, trait signatures, struct field visibility) are a real
+compile-time surface for any consumer outside this workspace, distinct from
+the three CI-enforced surfaces above. This surface carries **no CI freeze
+guard** — there is no descriptor to decode or conformance set to pin a bare
+Rust signature against — so a breaking change here is caught only by review,
+and is recorded as a **BREAKING** entry in the CHANGELOG the same way every
+other breaking change in this workspace is, naming the item, what changed,
+and what the caller does instead.
+
+Two such changes are current state as of this release:
+
+- **The vector-search API takes a validated query type, not a bare slice.**
+  `jammi_numerics::query::ValidatedQuery` is the only type
+  `jammi_numerics::distance::{cosine_distance, cosine_similarity}`,
+  `jammi_db::index::VectorIndex::search`,
+  `jammi_db::index::segment::{search_unit, rescore}`,
+  `jammi_db::index::segment::SegmentedIndex::{search, search_final}`, and
+  `jammi_db::index::exact::exact_vector_search` accept for a query vector.
+  Construct one with `jammi_db::index::validate_query(values, expected_width,
+  source)` (re-exported from `jammi_numerics::query`), where `source` is a
+  `jammi_db::index::QuerySource::{Caller, Stored { table }}`.
+  `exact_vector_search` also gained a `catalog_dimensions: Option<usize>`
+  parameter (a cross-check against the scan's own width; `None` when there is
+  none on record). `jammi_db::index::peer::{SegmentSearchRequest,
+  ExactRescoreRequest}`'s `query` field is a `ValidatedQuery`, not a
+  `Vec<f32>`; `PeerFailureReason` gained the `CallerFault` variant,
+  `PeerError` gained a `message: String` field, and `PEER_FAILURE_LABELS` is
+  `[&str; 10]`.
+- **`jammi_db::catalog::result_repo::ResultTableRecord::dimensions` is a
+  method, not a field.** It returns `Option<std::num::NonZeroUsize>` — a
+  non-positive stored value and an absent one are both `None`.
+  `dimensions_raw() -> Option<i32>` returns the stored column verbatim, for a
+  caller that must round-trip it unfiltered. A caller that built a
+  `ResultTableRecord` field-by-field from outside this crate now goes through
+  `ResultTableRecord::from_wire_projection`, the crate's sole cross-crate
+  constructor.
+
 ## Enforcement: the freeze-guard
 
 The freeze is a **CI guard**, not a promise in prose. Two checks run on every PR:

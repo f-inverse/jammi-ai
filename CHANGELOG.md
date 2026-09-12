@@ -15,6 +15,31 @@ workspace ships every publishable crate at the same
   (`jammi_db::config::PreloadEntry`); `/readyz` reports 503 "preloading i/n"
   and the claim loop waits at the session's worker gate (`workers.state =
   warming`) until every entry is cached.
+- **The vector-search API takes a validated query type, not a bare slice
+  (#482).** `jammi_numerics::query::ValidatedQuery` is the only type
+  `jammi_numerics::distance::{cosine_distance, cosine_similarity}`,
+  `jammi_db::index::VectorIndex::search`,
+  `jammi_db::index::segment::{search_unit, rescore}`,
+  `jammi_db::index::segment::SegmentedIndex::{search, search_final}`, and
+  `jammi_db::index::exact::exact_vector_search` accept for a query vector.
+  Construct one with `jammi_db::index::validate_query(values, expected_width,
+  source)` (re-exported from `jammi_numerics::query`), where `source` is a
+  `jammi_db::index::QuerySource::{Caller, Stored { table }}`.
+  `exact_vector_search` also gained a `catalog_dimensions: Option<usize>`
+  parameter — a cross-check against the scan's own width; pass `None` when
+  there is none on record. `jammi_db::index::peer::{SegmentSearchRequest,
+  ExactRescoreRequest}`'s `query` field is a `ValidatedQuery`, not a
+  `Vec<f32>`; `PeerFailureReason` gained the `CallerFault` variant,
+  `PeerError` gained a `message: String` field, and `PEER_FAILURE_LABELS` is
+  now `[&str; 10]`.
+- **`jammi_db::catalog::result_repo::ResultTableRecord::dimensions` is a
+  method, not a field (#482).** It returns `Option<std::num::NonZeroUsize>`
+  — a non-positive stored value and an absent one are both `None`.
+  `dimensions_raw() -> Option<i32>` returns the stored column verbatim, for a
+  caller that must round-trip it unfiltered. A caller building a
+  `ResultTableRecord` field-by-field from outside this crate uses
+  `ResultTableRecord::from_wire_projection`, the crate's sole cross-crate
+  constructor.
 
 ### Added
 - **Two-mode shutdown — SIGTERM = DRAIN, SIGINT = RELEASE — on the server,

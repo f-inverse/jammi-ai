@@ -192,14 +192,21 @@ struct HeldState {
 /// The outcome of one RELEASE pass over every not-yet-released [`LeaseTarget::Job`]
 /// hold this keeper held when the pass began: every hold attempted lands in
 /// EXACTLY one of the three counts below — the totality invariant
-/// `released + not_required + failed == attempted`, checked by the release
-/// pass itself (`release_job_holds_on_thread`, this module's private
-/// keeper-thread helper). `failed` is the determinant a bare `usize` return
-/// could never represent: a hold whose release attempt itself errored has
-/// exactly the operator-visible consequence a whole-pass error has (its
-/// `lost` flag never flips, so a doomed epoch can still land in the shared
-/// `_resume` prefix), and is not the same fact as "there was no such hold"
-/// (`not_required`) or "it was handed back" (`released`).
+/// `released + not_required + failed == attempted`. `attempted` is the
+/// snapshot size taken BEFORE the loop runs (`release_job_holds_on_thread`,
+/// this module's private keeper-thread helper), carried on the value
+/// itself rather than kept as a function-local the loop checks against
+/// only its own bookkeeping — a consumer of [`HoldRelease`] (not just the
+/// pass that produced it) can now tell "every hold this pass started with
+/// is accounted for" from "some holds were silently dropped without being
+/// counted at all", which `released + not_required + failed` alone cannot
+/// distinguish from a smaller starting snapshot. `failed` is the
+/// determinant a bare `usize` return could never represent: a hold whose
+/// release attempt itself errored has exactly the operator-visible
+/// consequence a whole-pass error has (its `lost` flag never flips, so a
+/// doomed epoch can still land in the shared `_resume` prefix), and is not
+/// the same fact as "there was no such hold" (`not_required`) or "it was
+/// handed back" (`released`).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub struct HoldRelease {
     /// Rows released this pass (`Catalog::release_job_lease` returned
@@ -213,6 +220,14 @@ pub struct HoldRelease {
     /// to the expiry path. Distinct from `not_required`: this hold WAS
     /// attempted and did NOT succeed.
     pub failed: usize,
+    /// The number of holds this pass started with (the snapshot taken
+    /// before any release call ran) — the independent quantity
+    /// `released + not_required + failed` is checked against. Carried so a
+    /// consumer can evaluate "no hold went unattempted" itself rather than
+    /// trusting the three counts alone, which a future early-exit inside
+    /// the pass could make sum to less than the true starting count with
+    /// no observable difference.
+    pub attempted: usize,
 }
 
 /// The one-shot handshake behind [`LeaseKeeper::release_job_holds`]: the
@@ -853,7 +868,10 @@ async fn release_job_holds_on_thread(
             .collect()
     };
     let attempted = snapshot.len();
-    let mut outcome = HoldRelease::default();
+    let mut outcome = HoldRelease {
+        attempted,
+        ..HoldRelease::default()
+    };
     for (id, job_id, instance_id, attempts, lost) in snapshot {
         match catalog
             .release_job_lease(&job_id, &instance_id, attempts)
@@ -879,9 +897,15 @@ async fn release_job_holds_on_thread(
             }
         }
     }
-    debug_assert_eq!(
+    // A real assert, not `debug_assert_eq!`: this pass runs at most once per
+    // RELEASE (never in a hot loop), and `HoldRelease::attempted` is now a
+    // value consumers evaluate `confirms_release()` against — a corrupted
+    // count must never reach a caller silently in a release build (contract
+    // `CONTRACT-OPS-fix4.md` M5: a check compiled out in release build is
+    // not a check).
+    assert_eq!(
         outcome.released + outcome.not_required + outcome.failed,
-        attempted,
+        outcome.attempted,
         "every attempted hold must land in exactly one of released/not_required/failed"
     );
     outcome

@@ -77,8 +77,11 @@ workspace ships every publishable crate at the same
   RELEASE (SIGINT, Ctrl+C, a second SIGTERM, or the new `jammi-server
   release [--pid N]` subcommand) hands every job lease back at once — the
   row stays `running` with a NULL lease and `releases + 1`, a compute job's
-  linked building-table lease with it — stops the loop and exits 0; a
-  successor claims within one idle poll and the job costs no attempt.
+  linked building-table lease with it — stops the loop and exits 0 when its
+  own evidence confirms every lease was handed back, or exit code 3 when it
+  does not (the affected lease then falls to the expiry path instead); a
+  successor claims within one idle poll (exit 0) or one lease window (exit
+  3), and the job costs no attempt either way.
   `EmbeddedWorker::{begin_drain, stop_and_join -> StopOutcome,
   release_and_stop -> ReleaseReport, shared}`, `WorkerShared`, `LoopState`,
   `InferenceSession::{release_job_leases, close_worker_gate,

@@ -631,6 +631,7 @@ async fn release_job_holds_flips_lost_and_skips_inline_holds() {
             released: 1,
             not_required: 1,
             failed: 0,
+            attempted: 2,
         },
         "exactly the loop-claimed Job hold is released; the inline hold did not require it"
     );

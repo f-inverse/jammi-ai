@@ -613,11 +613,20 @@ pub enum HoldReleaseOutcome {
 }
 
 impl HoldReleaseOutcome {
-    /// P-2B: `true` iff the pass was observed AND no hold's release attempt
-    /// itself failed. `false` on `Unobserved` (unobserved is not success)
-    /// and on `Observed` with `failed > 0`.
+    /// P-2B: `true` iff the pass was observed, no hold's release attempt
+    /// itself failed, AND every hold the pass started with is accounted
+    /// for (`released + not_required + failed == attempted` — see
+    /// [`HoldRelease::attempted`]'s doc for why this is checked here, at
+    /// the consumer, rather than trusted from the pass's own internal
+    /// assert alone). `false` on `Unobserved` (unobserved is not success),
+    /// on `Observed` with `failed > 0`, and on an `Observed` value whose
+    /// three counts do not sum to `attempted` (a hold silently dropped
+    /// without being counted at all — the pass's own `assert_eq!` should
+    /// already have caught this before it ever reaches a caller, but a
+    /// consumer must not simply trust that).
     pub fn confirms_release(&self) -> bool {
-        matches!(self, Self::Observed(hr) if hr.failed == 0)
+        matches!(self, Self::Observed(hr) if hr.failed == 0
+            && hr.released + hr.not_required + hr.failed == hr.attempted)
     }
 }
 
@@ -7129,5 +7138,37 @@ mod tests {
             .await
             .expect("a second stop_and_join must not hang")
             .expect("a second stop_and_join on an already-joined worker is Ok");
+    }
+
+    /// Contract `CONTRACT-OPS-fix4.md` M5: `confirms_release()` checks
+    /// totality (`released + not_required + failed == attempted`), not just
+    /// `failed == 0` — a `HoldRelease` whose three counts undercount its own
+    /// `attempted` (a hold silently dropped without being counted at all)
+    /// must degrade the release even though `failed` reads zero. The
+    /// production pass's own `assert_eq!` should already refuse to hand out
+    /// such a value, but a consumer of the type must not simply trust that.
+    #[test]
+    fn confirms_release_catches_an_undercounted_attempted() {
+        let undercounted = HoldReleaseOutcome::Observed(HoldRelease {
+            released: 1,
+            not_required: 0,
+            failed: 0,
+            attempted: 2,
+        });
+        assert!(
+            !undercounted.confirms_release(),
+            "one of the two attempted holds is unaccounted for; this must not confirm release"
+        );
+
+        let consistent = HoldReleaseOutcome::Observed(HoldRelease {
+            released: 1,
+            not_required: 1,
+            failed: 0,
+            attempted: 2,
+        });
+        assert!(
+            consistent.confirms_release(),
+            "every attempted hold is accounted for and none failed"
+        );
     }
 }

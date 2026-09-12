@@ -3172,13 +3172,13 @@ fn assert_softmax_parity_f16(cuda: &Device, rows: usize, last: usize, sv: &[f32]
         assert_finite_f16(*h, &format!("softmax f16 dscores[{i}]"));
     }
     let dx_floor = measured_near_zero_floor_f16(&dx_cpu_v); // no-producer: the digits the checker sees here are from the `f16` in `measured_near_zero_floor_f16`, not a numeric literal -- the floor is that function's own live per-run output
-    // Three additive terms, one per mechanism, none of them a widened `k`:
-    // `k = 2` for this leg's own rounding (each arm's single final cast to
-    // f16, guide §3.10's "dscores bwd is 1"), plus the FORWARD's own
-    // within-bound `Δy` after this op's cancellation amplifies it, plus the
-    // `dot` reduction's fold-order difference between the two arms. See
-    // [`softmax_f16_dscores_propagation_terms`] and
-    // [`softmax_f16_dscores_dot_fold_terms`].
+                                                            // Three additive terms, one per mechanism, none of them a widened `k`:
+                                                            // `k = 2` for this leg's own rounding (each arm's single final cast to
+                                                            // f16, guide §3.10's "dscores bwd is 1"), plus the FORWARD's own
+                                                            // within-bound `Δy` after this op's cancellation amplifies it, plus the
+                                                            // `dot` reduction's fold-order difference between the two arms. See
+                                                            // [`softmax_f16_dscores_propagation_terms`] and
+                                                            // [`softmax_f16_dscores_dot_fold_terms`].
     let dx_prop =
         softmax_f16_dscores_propagation_terms(&out_cpu_v, &out_gpu_v, &dy_seed_f, rows, last);
     let dx_fold = softmax_f16_dscores_dot_fold_terms(&out_cpu_v, &dy_seed_f, rows, last);
@@ -6086,9 +6086,9 @@ fn lora_linear_dx_abs_floor(cuda: &Device) -> f64 {
     // PENDING, not yet committed to the tree) -- see this function's own
     // doc.
     const TIGHT_FLOOR: f64 = 3e-1; // no-producer: sm80/sm86/sm90's pre-sweep tight floor, unchanged by the pending artifact
-    // sm89 (L40S)-derived: 1.2414983 (measured, 40/40-deterministic
-    // required_floor) * 1.5 (margin) = 1.86224745, rounded up to 2.0 --
-    // see this function's own doc for the full arithmetic.
+                                   // sm89 (L40S)-derived: 1.2414983 (measured, 40/40-deterministic
+                                   // required_floor) * 1.5 (margin) = 1.86224745, rounded up to 2.0 --
+                                   // see this function's own doc for the full arithmetic.
     const SM89_FLOOR: f64 = 2.0; // no-producer: derived by the arithmetic in this fn's own doc from a pod sweep whose cuda-runs artifact is PENDING
     match probe_cuda_compute_capability(cuda) {
         Some(cap) if cap == ComputeCapability::new(8, 9) => SM89_FLOOR,

@@ -424,6 +424,7 @@ async fn release_and_stop_leaves_running_with_null_lease_and_no_new_bundle() {
             released: 1,
             not_required: 0,
             failed: 0,
+            attempted: 1,
         }),
         "{report:?}"
     );
@@ -843,6 +844,7 @@ async fn run_now_under_release_and_stop_does_not_change_in_flight() {
             released: 0,
             not_required: 1,
             failed: 0,
+            attempted: 1,
         }),
         "the inline hold is registered but never released: {report:?}"
     );
@@ -925,6 +927,7 @@ async fn release_and_stop_report_matches_release_job_leases_on_the_pair_that_act
             released: 1,
             not_required: 0,
             failed: 0,
+            attempted: 1,
         }),
         "2b's per-hold release is the actual releaser: {report:?}"
     );
@@ -982,6 +985,7 @@ async fn release_and_stop_report_matches_release_job_leases_on_the_pair_that_act
             released: 0,
             not_required: 1,
             failed: 0,
+            attempted: 1,
         }),
         "an inline hold is registered but never released by 2b"
     );

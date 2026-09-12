@@ -2329,10 +2329,112 @@ mod audit_master_key_tests {
 /// the predicate to `true` and reverting the paired change still left an
 /// 18-of-18 green suite. This module reaches the private `release_outcome`
 /// directly (an in-crate `#[cfg(test)]` table test — no server, no signals,
-/// no tokio runtime needed) and demonstrates it RED by construction: every
-/// test below fails if `release_outcome` is reverted to "success iff the
-/// call returned `Ok`", which is exactly the predicate the round-2 audit
-/// showed was unobservable.
+/// no tokio runtime needed).
+///
+/// **What actually goes RED, measured, not asserted** (contract
+/// `CONTRACT-OPS-fix4.md` M3 — the round-3 audit found this doc previously
+/// overstated its own module's capacity: it claimed "every test below
+/// fails" against the round-2 revert, when the round-4 audit performed that
+/// exact revert and only a minority did). Reverting BOTH arms' predicates to
+/// "success iff the call returned `Ok`" (round 2's predicate) turns every
+/// test that pins a determinant *this* module folds in RED, and leaves every
+/// must-be-`Released` pin and every outer-`Err` pin GREEN — a weaker
+/// predicate can only ever be MORE permissive on the `Ok` arms than a
+/// stronger one, never less, so a "must be `Released`" or "must be
+/// `Degraded`-on-`Err`" pin cannot be falsified by weakening a conjunct on
+/// `Ok`. Only the determinant-pinning tests can, and do, go red under that
+/// revert; see each test's own doc for which determinant it pins. Measured
+/// at this module's current 15 tests: 7 go red, 8 stay green (re-run
+/// yourself before trusting this number — it is a property of the test
+/// count at the time this sentence was written, not a promise about a
+/// future edit to this module).
+///
+/// # M1 — the determinant enumeration (contract `CONTRACT-OPS-fix4.md`)
+///
+/// This table test's oracles construct every determinant as a LITERAL — it
+/// establishes the predicate reads each determinant correctly, never that
+/// any real producer ever emits a failing one. The round-4 audit proved by
+/// mutation that the producer half was entirely unobserved: applying all
+/// four producer-side collapses at once (forcing `stop_witnessed` constant
+/// `true`, re-collapsing the worker's and the session's per-hold `Err` back
+/// into `Observed(HoldRelease::default())`, and folding the keeper's
+/// per-hold `Err` back into `not_required`) left the WHOLE crate's suite
+/// green, counts identical to baseline. Every determinant, enumerated, and
+/// where its producer-driven oracle lives or why one does not exist yet:
+///
+/// * **P-2B, `HoldReleaseOutcome::Unobserved`** (the keeper's per-hold pass
+///   could not be confirmed to run at all): producer-driven in
+///   `jammi-server`'s `crates/jammi-server/tests/it/liveness.rs`
+///   (`healthz_flips_to_503_within_one_heartbeat_after_the_keeper_thread_dies`)
+///   — the test kills the real keeper thread with
+///   `LeaseKeeper::kill_thread_for_test`, then drives a real DRAIN+RELEASE
+///   through `serve_with_signals`, and asserts the outcome the running
+///   system actually returns is `ReleaseDegraded`. No literal `HoldRelease`
+///   or `HoldReleaseOutcome` is constructed anywhere in that test.
+/// * **P-2B, `HoldRelease.failed > 0`** (a per-hold release attempt itself
+///   returning `Err` from `Catalog::release_job_lease`): NOT producer-driven.
+///   This requires a genuine backend/transaction failure on the keeper's own
+///   dedicated connection, and this codebase has no fault-injecting
+///   `CatalogBackend` implementation and no reliable way to force one from
+///   outside — sqlite's connection pool holds already-open file descriptors
+///   whose permission checks happened at `open()`, so an OS-level chmod
+///   fault (the technique `crates/jammi-db/tests/it/reconcile.rs` uses for
+///   filesystem writes) is not established to reach an already-pooled sqlite
+///   write path, and building a fault-injecting backend double is new test
+///   infrastructure this fix round does not add. Covered only by the
+///   literal `a_failed_hold_degrades_even_with_confirmed_sweeps` /
+///   `session_only_failed_hold_degrades` below.
+/// * **P-2B, `HoldRelease.not_required`** (a hold that provably did not need
+///   releasing): producer-driven in
+///   `crates/jammi-db/tests/it/lease_keeper.rs`
+///   (`release_job_holds_flips_lost_and_skips_inline_holds`) — a real
+///   inline-claimed row's hold produces a genuine `Ok(false)` from
+///   `Catalog::release_job_lease`.
+/// * **P-2B totality** (`released + not_required + failed == attempted`,
+///   `HoldRelease::attempted` — M5): the production pass's own `assert_eq!`
+///   (`crates/jammi-db/src/catalog/lease_keeper.rs`) is not itself bypassable
+///   from a test without corrupting the pass, so this is checked at the type
+///   level (`confirms_release_catches_an_undercounted_attempted` in
+///   `crates/jammi-ai/src/fine_tune/worker.rs`) with a literal — the pass
+///   that could produce an inconsistent value by construction refuses to
+///   emit one, which is the property, not a gap.
+/// * **P-2F, `stop_witnessed == true`** via a genuine abort or join
+///   (`stop_resolved`): producer-driven throughout
+///   `crates/jammi-server/tests/it/serve_shutdown_modes.rs` (e.g. the
+///   sigint-while-draining and abort scenarios) and by the liveness test
+///   above (a `Stopped` loop after the keeper dies still resolves the task).
+/// * **P-2F, `stop_witnessed == false`** (2e found nothing to take AND 2f's
+///   own observation fell back to the last-known proxy read): NOT
+///   producer-driven, and the design round's own falsifier attempting to
+///   construct this case was refuted by execution (round-4 audit,
+///   `probe-a.log`: asserting `stop_witnessed && holds.confirms_release()`
+///   inside `release_and_stop`/`release_job_leases` over the whole `ai` +
+///   `server` corpus never fired). `stop_resolved` is `true` on every arm
+///   where `TakenHandle::take` returns `Some` — including both abort arms —
+///   so the only path to `NothingToTake` is a handle already `Joined` by a
+///   prior stop attempt, and the in-task guard publishes its terminal state
+///   on every path before the task returns, so the watch's CURRENT value is
+///   already the terminal one by the time a second caller reads it — 2f's
+///   `wait_for` resolves on the current value with no need to observe a
+///   fresh transition. Reaching `state_witnessed == false` in that window
+///   would require the guard's publish and the task's return to be
+///   observably out of order, which the loop's own structure does not
+///   permit today. Covered only by the literal `an_unwitnessed_stop_degrades`
+///   below; if a future refactor ever reorders that publish, this predicate
+///   conjunct is the only thing standing between that regression and a
+///   silently-`Released` degraded shutdown.
+/// * **Sweep confirmation, `ReleaseSweep` field `None`** (a sweep statement
+///   itself returning `Err`): NOT producer-driven, for the same reason as
+///   the per-hold `failed` case above — `release_sweep`'s two `Err` arms
+///   require a genuine backend failure with no injection point in this
+///   codebase. Covered only by the literal `an_unconfirmed_second_sweep_
+///   degrades` / `session_only_unconfirmed_sweep_degrades` below.
+/// * **Outer `Err`** (`ReleaseAttempt::Worker(Err(_))` /
+///   `SessionOnly(Err(_))`): a single unconditional match arm with no
+///   conjunct to collapse — a mutation deleting either arm's body is caught
+///   by any test that exercises it at all, so this is lower-value to drive
+///   from a producer; covered by the literal `worker_err_is_degraded` /
+///   `session_only_err_is_degraded` below.
 #[cfg(test)]
 mod release_outcome_tests {
     use jammi_ai::fine_tune::worker::{HoldReleaseOutcome, LoopState, ReleaseReport, ReleaseSweep};
@@ -2378,6 +2480,7 @@ mod release_outcome_tests {
                 released: 1,
                 not_required: 0,
                 failed: 0,
+                attempted: 1,
             }),
             true,
             confirmed_sweep(),
@@ -2419,6 +2522,67 @@ mod release_outcome_tests {
     }
 
     // -------------------------------------------------------------------
+    // Contract `CONTRACT-OPS-fix4.md` M2: the `SessionOnly` arm's own P-2B
+    // conjunct (`holds.confirms_release() &&`, folded in this round exactly
+    // like the Worker arm's) had NO oracle — the round-4 audit found
+    // deleting it left `release_outcome_tests` 12/12 green AND the whole
+    // `jammi-server` crate 285/285 green. These pin it, mirroring the two
+    // cases already proven load-bearing on the Worker arm
+    // (`an_unobserved_hold_pass_degrades`, `a_failed_hold_degrades_even_with_
+    // confirmed_sweeps`) rather than adding only the single case the audit
+    // wrote out.
+    // -------------------------------------------------------------------
+
+    /// The keeper's per-hold pass itself unobserved (a dead keeper) must
+    /// degrade a `SessionOnly` release exactly as it does a `Worker` one,
+    /// even though the outer call and the sweep are both fine.
+    #[test]
+    fn session_only_unobserved_hold_pass_degrades() {
+        let holds = HoldReleaseOutcome::Unobserved;
+        assert_eq!(
+            release_outcome(ReleaseAttempt::SessionOnly(Ok((holds, confirmed_sweep())))),
+            ShutdownOutcome::ReleaseDegraded
+        );
+    }
+
+    /// A per-hold failure degrades a `SessionOnly` release even though the
+    /// outer call succeeded and the sweep confirms.
+    #[test]
+    fn session_only_failed_hold_degrades() {
+        let holds = HoldReleaseOutcome::Observed(HoldRelease {
+            released: 0,
+            not_required: 0,
+            failed: 1,
+            attempted: 1,
+        });
+        assert_eq!(
+            release_outcome(ReleaseAttempt::SessionOnly(Ok((holds, confirmed_sweep())))),
+            ShutdownOutcome::ReleaseDegraded
+        );
+    }
+
+    /// Sibling check on the OTHER conjunct of the same arm's predicate
+    /// (`sweep_confirms_release`, pre-existing but never pinned for
+    /// `SessionOnly` specifically): an unconfirmed sweep degrades a
+    /// `SessionOnly` release even with a fully confirmed hold pass.
+    #[test]
+    fn session_only_unconfirmed_sweep_degrades() {
+        let holds = HoldReleaseOutcome::Observed(HoldRelease {
+            released: 0,
+            not_required: 0,
+            failed: 0,
+            attempted: 0,
+        });
+        assert_eq!(
+            release_outcome(ReleaseAttempt::SessionOnly(Ok((
+                holds,
+                sweep(Some(0), None)
+            )))),
+            ShutdownOutcome::ReleaseDegraded
+        );
+    }
+
+    // -------------------------------------------------------------------
     // The newly folded determinants (P-2B, P-2F, P-EXCLUSION) — each of
     // these fails against the round-2 predicate ("success iff `Ok`").
     // -------------------------------------------------------------------
@@ -2435,6 +2599,7 @@ mod release_outcome_tests {
                 released: 0,
                 not_required: 0,
                 failed: 1,
+                attempted: 1,
             }),
             true,
             confirmed_sweep(),
@@ -2496,6 +2661,7 @@ mod release_outcome_tests {
                 released: 1,
                 not_required: 0,
                 failed: 0,
+                attempted: 1,
             }),
             true,
             sweep(None, None),
@@ -2517,6 +2683,7 @@ mod release_outcome_tests {
                 released: 1,
                 not_required: 0,
                 failed: 0,
+                attempted: 1,
             }),
             true,
             confirmed_sweep(),
@@ -2568,6 +2735,7 @@ mod release_outcome_tests {
                 released: 1,
                 not_required: 0,
                 failed: 0,
+                attempted: 1,
             }),
             true,
             confirmed_sweep(),
@@ -2592,6 +2760,7 @@ mod release_outcome_tests {
                 released: 1,
                 not_required: 0,
                 failed: 0,
+                attempted: 1,
             }),
             true,
             confirmed_sweep(),

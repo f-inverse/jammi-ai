@@ -83,8 +83,12 @@ DRAIN** — the in-flight job finishes, the lease keeps renewing, every epoch
 bundle lands, then the process exits 0 — and **SIGINT = RELEASE** — every job
 lease is handed back to the catalog at once (the row stays `running` with a
 NULL lease and `releases + 1`; a compute job's building-table lease with it),
-the loop stops and the process exits 0, so a successor claims the job within
-one `[worker] idle_poll_secs` and it costs no attempt. Any signal while
+the loop stops and the process exits **0 when its own evidence confirms
+every lease was handed back, or exit code 3 when it does not** (the affected
+lease then falls to the expiry path instead of the idle-poll one — see
+`docs/guide/src/deploy-server.md`'s RELEASE section), so a successor claims
+the job within one `[worker] idle_poll_secs` (exit 0) or one `[lease]
+duration_secs` (exit 3), and it costs no attempt either way. Any signal while
 draining is a RELEASE. There is no engine-side timeout: the pod's
 `terminationGracePeriodSeconds` bounds a DRAIN, then SIGKILL.
 

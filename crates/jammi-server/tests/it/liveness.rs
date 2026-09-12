@@ -125,7 +125,23 @@ async fn healthz_flips_to_503_within_one_heartbeat_after_the_keeper_thread_dies(
 
     let _ = served.drain_tx.send(true);
     let _ = served.release_tx.send(true);
-    let _ = tokio::time::timeout(Duration::from_secs(60), served.task).await;
+    // Producer-driven P-2B oracle (contract CONTRACT-OPS-fix4.md M1): the
+    // keeper thread is dead, so its per-hold pass can never be confirmed to
+    // have run — `release_outcome` must read that as `ReleaseDegraded`, not
+    // `Released`, even though the RELEASE call itself returns `Ok`. This is
+    // NOT a literal constructing `HoldReleaseOutcome::Unobserved`; the dead
+    // keeper is what actually produces it, end to end through
+    // `LeaseKeeper::release_job_holds` and `EmbeddedWorker::release_and_stop`.
+    let outcome = tokio::time::timeout(Duration::from_secs(60), served.task)
+        .await
+        .unwrap()
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        outcome,
+        ShutdownOutcome::ReleaseDegraded,
+        "a RELEASE after the keeper thread died must report degraded, not released"
+    );
 }
 
 /// A DRAIN is not a fault: `/healthz` stays 200 (loop `running`, a job in

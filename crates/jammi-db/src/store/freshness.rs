@@ -438,6 +438,19 @@ impl ResultStore {
     ///   [`CurrentAnchor::Undecidable`]: there is no current-resolution surface
     ///   to read a live version from (see the module docs). This is honest, not
     ///   a fabricated read against a surface that does not exist.
+    ///
+    /// **Disclosed residual (round 7, not closed):** for a versioned parent,
+    /// [`CurrentAnchor::ResultDigest`] carries the SAME identity value
+    /// [`ResultStore::pin_current_version`]'s anchor would for that table —
+    /// a version-resolved digest with no paired content read. This function's
+    /// only in-tree callers ([`Self::staleness`], same file) compare it
+    /// against a *recorded* anchor and then discard it, never persist it as
+    /// new provenance, so nothing straddles today; but nothing in this
+    /// function's type stops a future caller from pairing the value with an
+    /// independently-resolved read and persisting the pair. Tracked as a
+    /// live, reviewed exception in `crates/jammi-ai/tests/it/pinned_source_gate.rs`'s
+    /// `ANCHOR_RETURN_ALLOWED` (the gate that enumerates every such function
+    /// across this crate and `jammi-ai` mechanically), not silently absorbed.
     pub async fn current_anchor(&self, anchor: &InputAnchor) -> Result<CurrentAnchor> {
         match anchor.kind {
             AnchorKind::ResultDigest => {

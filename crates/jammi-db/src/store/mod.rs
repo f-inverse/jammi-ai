@@ -235,18 +235,32 @@ pub struct ResultStore {
 /// current version; the anchor it records and every row it reads derive
 /// from that resolution.*
 ///
-/// **Round 6, M1: `PinnedSource::input_anchor` is this crate's ONLY public
-/// source of an [`InputAnchor`] over a [`ResultTableRecord`].** No public
-/// function returns a bare `InputAnchor` for one — the round-5 shape,
-/// `result_digest_anchor`, resolved a version and then discarded the
-/// resolution before returning, which meant a caller could never get the
-/// content that anchor named without a second, independent resolve; it was
-/// removed rather than narrowed (see the removal note where it used to
-/// live, just above `ResultStore::current_version_identity`'s doc). This is
-/// now a literal, checkable fact about this module's public surface, not a
-/// call-site convention: grep `-> Result<InputAnchor>` and `-> InputAnchor`
-/// across this file's `pub` signatures and [`Self::input_anchor`] is the
-/// only match.
+/// **`PinnedSource::input_anchor` is the SANCTIONED way to obtain an anchor
+/// guaranteed to agree with its own read** — the identity (or, for a
+/// never-refreshed table, the base artifact digest) it returns was resolved
+/// in the SAME [`ResultStore::pin_current_version`] call that also resolved
+/// [`ResultStore::pinned_provider`]'s rows, so the two can never disagree. The
+/// round-5 shape this replaced, `result_digest_anchor`, resolved a version
+/// and then discarded the resolution before returning, which meant a caller
+/// could never get the content that anchor named without a second,
+/// independent resolve; it was removed rather than narrowed (see the
+/// removal note where it used to live, just above
+/// `ResultStore::current_version_identity`'s doc).
+///
+/// **This is NOT a claim that no other function in this crate can yield an
+/// anchor-equivalent value** — round 6 made exactly that claim here ("this
+/// crate's ONLY public source... checkable by grep... the only match"), and
+/// round 7's audit disproved it in three lines of published API
+/// ([`ResultStore::current_anchor`], one module over, also returns a
+/// version-resolved digest). A prose "only" checked by one grep is a
+/// mechanism claim standing in for a property; the enforcement for this
+/// property now lives in `crates/jammi-ai/tests/it/pinned_source_gate.rs`,
+/// which enumerates every function across this crate and `jammi-ai` whose
+/// return type carries [`InputAnchor`]/[`CurrentAnchor`] mechanically
+/// (derived from `git ls-files`, not by hand) and requires each one to be
+/// either this accessor's safe-by-construction shape or a reviewed,
+/// disclosed exception — see that file's `ANCHOR_RETURN_ALLOWED` for the
+/// current, honest list.
 ///
 /// [`Self::input_anchor`] is INFALLIBLE — no second catalog read, no second
 /// failure mode — precisely because the identity (or, for a never-refreshed
@@ -2691,90 +2705,24 @@ impl ResultStore {
     /// `current_version_identity` (the anchor leg of the same seam)
     /// is crate-private (M1, round 5).
     ///
-    /// **The property, restated round 6 so a mechanism claim can never stand
-    /// in for it again, and the sweep of every `pub`/`pub(crate)` function in
-    /// this module that takes a [`ResultTableRecord`] (bare or `&`) or an
-    /// explicit version/manifest, done by enumeration, not by naming the
-    /// members the class was previously known by:**
-    ///
-    /// 1. No function in this module — public or crate-private — returns a
-    ///    bare [`InputAnchor`] for a [`ResultTableRecord`]. This clause is
-    ///    now checkable by grep, not merely argued:
-    ///    [`PinnedSource::input_anchor`] is the only function in this crate
-    ///    whose return type is `InputAnchor` / `Result<InputAnchor>`.
-    ///    `result_digest_anchor`, the round-5 shape that violated this by
-    ///    resolving a version and discarding the resolution, is REMOVED
-    ///    (round 6, M1) rather than narrowed to `pub(crate)` — every one of
-    ///    its callers (same-crate and cross-crate) needed only the anchor
-    ///    and now calls [`Self::pin_current_version`] directly.
-    /// 2. Every function that yields a version-RESOLVED read (a manifest, a
-    ///    masked provider, or an ANN index scoped to one) either (a) takes
-    ///    that resolution as an explicit parameter the caller already holds
-    ///    (never a bare record it re-derives `current_version` from), or (b)
-    ///    is one of the two DISCLOSED exceptions below, which this sentence
-    ///    does NOT claim to close.
-    ///
-    /// Per function:
-    ///   - `current_version_identity` (pub(crate), M1) — the anchor
-    ///     leg; its only callers are same-crate freshness comparisons of a
-    ///     *recorded* anchor against the *current* one, never a persisted
-    ///     anchor. Clause 1: does not return a bare `InputAnchor`.
-    ///   - [`Self::resolve_version_manifest`] (pub) — clause 2(a): takes an
-    ///     explicit `version: i64` the caller already decided; does not read
-    ///     `record.current_version` itself. This is the shared
-    ///     row-exists-and-ready primitive [`Self::pin_current_version`]
-    ///     itself now calls (M9), so a caller that resolves the SAME
-    ///     manifest once and threads it to both an anchor and a read (as
-    ///     the delta-refresh and compaction producers in
-    ///     `crates/jammi-ai/src/pipeline/embedding_refresh.rs` do) gets the
-    ///     same one-resolution guarantee `PinnedSource` does, without
-    ///     forcing every caller through `PinnedSource`'s shape. **Not
-    ///     foreclosed:** nothing stops an external caller from reading
-    ///     `record.current_version` itself and passing it here, which
-    ///     reproduces the private `current_version_provider`'s exact shape
-    ///     one level up — this module's contract is that a PERSISTING
-    ///     producer must not do that (route through
-    ///     [`Self::pin_current_version`] instead), not that the type system
-    ///     forbids it. Stated here as a residual, not claimed closed.
-    ///   - [`Self::build_masked_provider`] / [`Self::count_live_rows`]
-    ///     (pub) — clause 2(a): take an already-resolved `&VersionManifest`,
-    ///     never a bare version number or a bare record; they cannot
-    ///     themselves decide which version to read. Same "not foreclosed"
-    ///     note as above applies to whatever resolved the manifest they were
-    ///     handed.
-    ///   - [`Self::pin_current_version`] / [`Self::pinned_provider`] (pub) —
-    ///     the seam itself; both clauses hold by construction.
-    ///   - [`Self::bind_result_table`] (pub) — clause 2(b), the documented
-    ///     "Read class" residual on its own doc: serves a possibly-stale
-    ///     session-bound registration, never persists an anchor.
-    ///   - [`Self::search_vectors`] / `search_vectors_local` /
-    ///     `resolve_search_mode` / `resolve_search_mode_local` (pub) —
-    ///     clause 2(b), the candidate-selection residual M4 discloses below.
-    ///     `resolve_search_mode_local`'s versioned arm literally re-resolves
-    ///     `table.current_version` via [`Self::resolve_version_manifest`]
-    ///     from a bare `&ResultTableRecord` — this is the live instance of
-    ///     the pattern clause 2 otherwise closes, disclosed rather than
-    ///     hidden behind a "none" that would be false.
-    ///   - [`Self::verify_materialization`] (pub) — compares a version's
-    ///     recorded identity against its recomputed one; a read-only
-    ///     integrity check, never a persisted anchor. Clause 1: n/a (returns
-    ///     a [`MatchVerdict`], not an anchor).
-    ///   - [`Self::allocate_version`] (pub) — takes `table.current_version`
-    ///     only as the CAS's expected parent (refuses with `ParentMoved` on
-    ///     mismatch rather than silently reading under a moved parent);
-    ///     never reads content under a version it resolves itself. Clause 1:
-    ///     n/a (returns a [`BuildingVersion`] handle, not an anchor).
-    ///   - [`Self::reap_expired_version`] (pub) — takes an explicit
-    ///     `version: i64`, the caller's own expiry-scan target, never a bare
-    ///     record it re-derives a version from. Clause 1: n/a (returns a
-    ///     deletion count).
-    ///   - [`Self::materialize_embedding_table`] /
-    ///     [`Self::materialize_computed_embedding_table`] (pub) — construct
-    ///     a NEW base table (`current_version = None`) from caller-supplied
-    ///     rows and (for the computed verb) caller-supplied provenance
-    ///     anchors; neither reads an EXISTING table's `current_version`.
-    ///     Clause 1: n/a (return the new [`ResultTableRecord`], not an
-    ///     anchor).
+    /// **Enforcement (round 7).** This module used to carry a hand-written
+    /// prose sweep here, enumerating "every `pub`/`pub(crate)` function in
+    /// this module" against the property above. That sweep is DELETED, not
+    /// corrected: across six rounds it missed live members every time,
+    /// including three sites the unit's own plan document had already
+    /// listed together as one reader class, because its quantifier ("this
+    /// module") never matched the property's ("no public interface"), and a
+    /// hand-typed enumeration cannot be checked against anything but itself.
+    /// The property is now enforced by
+    /// `crates/jammi-ai/tests/it/pinned_source_gate.rs`, which derives its
+    /// scanned surface from `git ls-files` over this whole crate and
+    /// `jammi-ai` (not one module, not by hand) and requires every function
+    /// matching one of three straddle-shaped patterns — an anchor-shaped
+    /// return type, a bare-record version branch, or a session-registration
+    /// literal — to be either safe by construction or a reviewed, disclosed
+    /// exception in that file's own allowlists. Read that file, not this
+    /// comment, for the current enumeration; it is machine-checked on every
+    /// `cargo test -p jammi-ai`, this comment is not.
     ///
     /// **Residual — candidate SELECTION is not pinned (M4; scope widened
     /// round 5, M6/M7).** This closes "the artifact's anchor and its rows

@@ -38,7 +38,7 @@
 //!
 //! `search_final` is expressed over three pure, sync kernels that carry no
 //! transport: [`search_unit`] (one segment's hits at a width, rescored at the
-//! segment for a `Final` phase on a quantized precision), [`merge`] (the total
+//! segment for a `Final` phase on a quantized precision), `merge` (the total
 //! order + dedup over units, keeping the winning segment id) and [`rescore`]
 //! (exact cosine over named candidates; a missing exact vector is a hard
 //! error). The same kernels run at a segment owner and at a coordinator
@@ -502,14 +502,14 @@ impl SegmentedIndex {
     /// here is resident in this process.
     ///
     /// Per precision (the module docs' protocol, over the kernels), every
-    /// stage routed through [`Self::live_candidates`]'s masked, dead-row
+    /// stage routed through `Self::live_candidates`'s masked, dead-row
     /// widened fetch — a masked or superseded key is never counted against a
     /// live `k`:
     ///
     /// - `F32`: the merge is already exact and final, so this is
     ///   `search(query, k)` and `oversample` is unused.
     /// - `F16` / `Int8`: retrieve `k * oversample` masked candidates through
-    ///   [`Self::search_candidates`] (the over-fetch nests *under* this
+    ///   `Self::search_candidates` (the over-fetch nests *under* this
     ///   candidate width by construction), read each survivor's exact `f32`
     ///   vector from the segment that OWNS it (never the first segment that
     ///   happens to index the same key), recompute cosine distance against

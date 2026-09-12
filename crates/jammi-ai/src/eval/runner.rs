@@ -146,11 +146,20 @@ impl<'a> EvalRunner<'a> {
             };
 
             // The encoder's output for this query is the query the run
-            // supplied — validated (finite) before it meets an index, which
-            // enforces the width.
+            // supplied — checked against the AUTHORITY here (the resolved
+            // table's recorded width), the same pattern `QueryBuilder::new`
+            // uses for a Caller-provenance query. The table is already in
+            // hand at this entry, so the authority is not deferred to
+            // whatever artifact `search_vectors_local` happens to meet
+            // first: deferring here would mean a genuine model/table width
+            // mismatch is discovered downstream, against an artifact, and
+            // `require_width` (unlike this entry-time check) cannot express
+            // a caller fault — a user width mistake would be reported as
+            // the table being corrupt instead of the caller's request being
+            // wrong.
             let query_vec = jammi_db::index::validate_query(
                 query_vec,
-                None,
+                table.dimensions().map(std::num::NonZeroUsize::get),
                 jammi_db::index::QuerySource::Caller,
             )?;
             // FORCE-LOCAL: eval is a batch per-query loop; it loads every

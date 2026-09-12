@@ -161,22 +161,37 @@ is, naming the item, what changed, and what the caller does instead.
 prior round of this same section missed at least seven breaking changes,
 including a `pub fn` removed with no entry anywhere, and its own scope
 sentence named 2 of these 11 crates. Enumerate every public item whose
-signature, visibility, or existence changed across the range instead:
+signature, visibility, or existence changed across the range instead. **The
+range is a set of commits, not a contiguous `<base>..<head>` span**: this
+unit's commits are interleaved on the branch with other units' commits (a
+plain `git diff <base> <head>` between the oldest and newest of this unit's
+own commits also picks up whatever any OTHER unit changed in between — that
+is how a sibling unit's own unannounced removal was mistaken for this
+section's gap in a prior round). Derive the exact commit set from the
+commit-message tag every round of this unit's own history carries, and diff
+the UNION of those commits, never a span:
 
 ```
-git diff --name-only <base> <head> | grep '^crates/.*/src/.*\.rs$'
-# for each changed file, diff its `pub fn|struct|enum|trait|type|const|
-# static|use` items between <base> and <head> — a struct/enum/trait's full
-# brace-balanced body, a fn/const/static/type/use's signature up to its
-# body or `;` — and treat a normalized-text change as added-old +
-# added-new (catches a removal with no replacement, not just a same-line
-# diff hunk). Cross-check the crate list above against every
-# `crates/*/Cargo.toml` lacking `publish = false`.
+# Every commit belonging to THIS unit (adjust the grep to the unit's own
+# tag, e.g. '#482 DIST'), oldest first:
+commits=$(git log --oneline --reverse --grep='#482 DIST' | cut -d' ' -f1)
+for c in $commits; do
+  git diff --name-only "$c"^.."$c" | grep '^crates/.*/src/.*\.rs$'
+  # for each changed file, diff its `pub fn|struct|enum|trait|type|const|
+  # static|use` items between "$c"^ and "$c" — a struct/enum/trait's full
+  # brace-balanced body, a fn/const/static/type/use's signature up to its
+  # body or `;` — and treat a normalized-text change as added-old +
+  # added-new (catches a removal with no replacement, not just a same-line
+  # diff hunk).
+done
+# Cross-check the crate list above against every `crates/*/Cargo.toml`
+# lacking `publish = false`.
 ```
 
-Six commits are current state as of this release (the range this section has
-covered started as three, was five, and is six as of this round's own
-whose-fault fix — state the true count rather than repeating a stale one):
+Nine commits are current state as of this release (the range this section
+has covered started as three, was five, was six, was seven, was eight as of
+DELTA round 6's own fold, and is nine as of DIST round 7's own fold — state
+the true count rather than repeating a stale one):
 
 - **The vector-search API takes a validated query type, not a bare slice.**
   `jammi_numerics::query::ValidatedQuery` is the only type
@@ -226,12 +241,33 @@ whose-fault fix — state the true count rather than repeating a stale one):
   `artifact: impl Into<String>` and never reads the query's own
   `QuerySource` — a mismatch it finds is always attributed to the named
   artifact, never the caller, because by the time a query reaches any
-  consumer an entry has already checked it once. The one call site that
-  still attributes by the query's own provenance (the placement entry's
-  all-remote shape, checking a query with no width in hand against the
-  catalog's recorded width) uses the new `ValidatedQuery::require_authority_width`
-  instead, which keeps the OLD `require_width` behaviour under a name that
-  says why it is different.
+  consumer an entry has already checked it once against an authority it had
+  in hand. TWO call sites still attribute by the query's own provenance
+  (the placement entry's all-remote shape, and `exact_vector_search`'s
+  no-catalog-width fallback), both checking a query with no width in hand
+  against the only authority available to that call; both use the new
+  `ValidatedQuery::require_authority_width` instead, which keeps the OLD
+  `require_width` behaviour under a name that says why it is different.
+  `QuerySource` gained a third variant, `Artifact { name }`: `require_width`
+  reports the artifact it disagreed with under this variant, never under
+  `Stored`, so `QueryValidationError::source()` and its `Display` text never
+  assert a caller's query was read from a table it never came from. Any
+  exhaustive match on `QuerySource` needs a new arm.
+- **`jammi_db::store::ResultStore::result_digest_anchor` is removed with no
+  replacement.** It resolved a result table's current version and then
+  discarded the resolution, returning a bare `InputAnchor` a caller could
+  not get the matching content back from without a second, independent
+  resolve — a version publish landing between the two could straddle.
+  Call `ResultStore::pin_current_version(record).await?.input_anchor()`
+  instead; the versioned arm already delegated to exactly that internally,
+  so the returned value is unchanged. (This item predates the compute-tier
+  substrate epic — it shipped in an earlier release — so its removal here
+  is a genuine breaking change to an already-released surface, not internal
+  churn within this epic's own unreleased history; the two DELTA-round
+  functions that went `pub` → private/`pub(crate)` entirely within this
+  epic's own unreleased commits, `current_version_provider` and
+  `current_version_identity`, never shipped as `pub` in any release and so
+  carry no such entry.)
 
 ## Enforcement: the freeze-guard
 

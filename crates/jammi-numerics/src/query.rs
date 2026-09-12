@@ -17,13 +17,23 @@
 //! the CALLER supplied is the caller's fault (a schema-class error, the same
 //! class as a width mismatch); a vector read back from STORAGE (a
 //! query-by-example row, a neighbour-graph node, a scanned corpus row) is a
-//! corrupt artifact, named by its table.
+//! corrupt artifact, named by its table. A third variant,
+//! [`QuerySource::Artifact`], is never a query's own provenance — it is what
+//! [`ValidatedQuery::require_width`] reports in its error instead of
+//! borrowing `Stored`, so the accessor and the error text never assert a
+//! false provenance for a `Caller`-provenance query.
 //!
 //! **Whose fault a width mismatch is depends on WHERE it is discovered, not
 //! only on `QuerySource`.** A query is checked against the authority exactly
-//! once — at [`validate_query`] when `expected_width` is known, or, for the
-//! one entry that defers a `None`-width query, at
-//! [`ValidatedQuery::require_authority_width`]. Every OTHER width check a
+//! once, EVERY entry that has an authority in hand at construction supplies
+//! it as [`validate_query`]'s `expected_width`; an entry with no authority
+//! in hand defers by passing `None` and calling
+//! [`ValidatedQuery::require_authority_width`] itself, once, as soon as an
+//! authority becomes available (today, the placement entry's all-remote
+//! shape and `jammi_db::index::exact::exact_vector_search`'s
+//! no-catalog-width fallback, in the downstream crate that has both — TWO
+//! call sites, not one; do not let this comment or any published surface
+//! drift back to claiming one). Every OTHER width check a
 //! query meets afterwards — an index's declared dimensions, a scan's
 //! `FixedSizeList` length, a stored vector's own length — is downstream of
 //! that authority check by construction, so a mismatch there is the
@@ -31,7 +41,32 @@
 //! own `QuerySource` happens to be `Caller`. [`ValidatedQuery::require_width`]
 //! is that downstream check: it does not read `self.source()` at all, so
 //! there is no argument that makes it express a caller fault. Only
-//! `require_authority_width` can, and it exists for exactly one call site.
+//! `require_authority_width` can.
+//!
+//! **This depends on every entry actually using the authority it has in
+//! hand.** An entry that resolves a table (or another width-bearing
+//! authority) and then constructs a `Caller`-provenance query with
+//! `expected_width: None` anyway defers to whatever artifact the query
+//! happens to meet downstream — silently converting a caller's width
+//! mistake into a `require_width` artifact-fault. Nothing in the type
+//! system catches this today: `expected_width: Option<usize>` accepts
+//! `None` from an entry with an authority in scope exactly as readily as
+//! from one with none, so this obligation is enforced by review, not by the
+//! compiler or this constructor — the same shape of gap that has cost this
+//! module multiple rounds. A full fix would give "authority checked" vs.
+//! "authority deferred" a distinct type threaded through every consumer
+//! (`ValidatedQuery` is accepted uniformly today by every kernel and search
+//! entry precisely so a new producer cannot skip validation, and the
+//! deferred case is not confined to a fixed set of call sites — it is a
+//! runtime branch of ordinary authority-bearing entries, taken whenever the
+//! authority happens to be absent, and the authority itself sometimes does
+//! not exist until a downstream artifact loads, e.g. the scan's own width
+//! in `exact_vector_search`'s no-catalog-width fallback — so the type-state
+//! split would have to reach every consumer in the call graph, a
+//! frozen-surface reshape disproportionate to a single fix). Until that
+//! ships, every entry that resolves an authority MUST pass it to
+//! `validate_query` rather than deferring — this is a review obligation,
+//! stated here so the next entry is at least reviewed against it.
 
 use std::fmt;
 use std::ops::Deref;
@@ -47,6 +82,17 @@ pub enum QuerySource {
     Stored {
         /// The table the vector was read from.
         table: String,
+    },
+    /// NEVER a query's own provenance — reported by
+    /// [`ValidatedQuery::require_width`] instead of borrowing [`Self::Stored`]
+    /// for a query it did not read from that table. Names the downstream
+    /// artifact (an index, a segment, a scan) a query disagreed with,
+    /// regardless of whether the query's own provenance is `Caller` or
+    /// `Stored`.
+    Artifact {
+        /// What disagreed with the query (an index, a segment, a scan) —
+        /// never the query's own source table.
+        name: String,
     },
 }
 
@@ -75,7 +121,13 @@ pub enum QueryValidationError {
 }
 
 impl QueryValidationError {
-    /// The provenance of the refused query.
+    /// The refused query's own provenance ([`QuerySource::Caller`] /
+    /// [`QuerySource::Stored`]) — EXCEPT for an error
+    /// [`ValidatedQuery::require_width`] raised, where this is
+    /// [`QuerySource::Artifact`], the downstream artifact the query
+    /// disagreed with, never the query's own source. Despite the name, do
+    /// not read this as "where the query came from" unconditionally; match
+    /// on the variant.
     pub fn source(&self) -> &QuerySource {
         match self {
             Self::NonFinite { source, .. } | Self::Width { source, .. } => source,
@@ -114,6 +166,7 @@ fn describe(source: &QuerySource) -> String {
     match source {
         QuerySource::Caller => "supplied by the caller".to_string(),
         QuerySource::Stored { table } => format!("read from table '{table}'"),
+        QuerySource::Artifact { name } => format!("checked against '{name}'"),
     }
 }
 
@@ -175,16 +228,20 @@ impl ValidatedQuery {
     /// mismatch to the caller, no matter which [`QuerySource`] this query
     /// carries. By the time a query reaches any consumer it has already
     /// been checked against the authority once — either at construction
-    /// (`validate_query`'s `expected_width`) or at the one placement entry
-    /// that defers a `None`-width query to [`Self::require_authority_width`]
-    /// — so a mismatch discovered here is provably the artifact's own drift,
-    /// never the query's. This is what makes the wrong attribution
+    /// (`validate_query`'s `expected_width`) or, for an entry that defers a
+    /// `None`-width query, at [`Self::require_authority_width`] — so a
+    /// mismatch discovered here is provably the artifact's own drift, never
+    /// the query's. This is what makes the wrong attribution
     /// unconstructible: there is no `expected: usize` overload of this
     /// method that can express "blame the caller", so a new downstream call
     /// site cannot reintroduce the misattribution by picking the wrong
     /// argument — it would have to call [`Self::require_authority_width`]
     /// instead, a different, deliberately narrower-named method reserved for
-    /// the one site that needs it.
+    /// the entries that need it. The error's own [`QuerySource`] is
+    /// [`QuerySource::Artifact`] — `artifact` itself, never `self.source()`
+    /// — so the reported provenance is never the query's, even for a
+    /// `Stored`-provenance query checked against a different table's
+    /// artifact.
     pub fn require_width(
         &self,
         expected: usize,
@@ -194,8 +251,8 @@ impl ValidatedQuery {
             return Err(QueryValidationError::Width {
                 expected,
                 actual: self.values.len(),
-                source: QuerySource::Stored {
-                    table: artifact.into(),
+                source: QuerySource::Artifact {
+                    name: artifact.into(),
                 },
             });
         }
@@ -203,16 +260,20 @@ impl ValidatedQuery {
     }
 
     /// Enforce `expected` against the AUTHORITY an entry validates a query
-    /// against (the catalog's recorded width) — reserved for the ONE call
-    /// site (the placement entry's all-remote shape) that has no other
-    /// opportunity to check a query built with `expected_width = None`
-    /// before it would otherwise fan out to an owner unguarded. Attributes
-    /// by `self.source()`, exactly like `validate_query`'s own
-    /// construction-time check: a genuine caller mistake caught HERE is
-    /// still the caller's fault, because nothing downstream of this call has
-    /// been consulted yet. Every OTHER width check — reached only after this
-    /// one (or `validate_query`'s) has already passed — uses
-    /// [`Self::require_width`] instead, which cannot express a caller fault.
+    /// against (the catalog's recorded width) — reserved for an entry that
+    /// has no other opportunity to check a query built with
+    /// `expected_width = None` before it would otherwise reach a downstream
+    /// artifact unguarded. TWO production call sites use this today (the
+    /// placement entry's all-remote shape, and `exact_vector_search`'s
+    /// no-catalog-width fallback in `jammi-db`) — do not let this doc drift
+    /// back to claiming one; recheck the call count in the same commit that
+    /// adds or removes one. Attributes by `self.source()`, exactly like
+    /// `validate_query`'s own construction-time check: a genuine caller
+    /// mistake caught HERE is still the caller's fault, because nothing
+    /// downstream of this call has been consulted yet. Every OTHER width
+    /// check — reached only after this one (or `validate_query`'s) has
+    /// already passed — uses [`Self::require_width`] instead, which cannot
+    /// express a caller fault.
     pub fn require_authority_width(&self, expected: usize) -> Result<(), QueryValidationError> {
         if self.values.len() != expected {
             return Err(QueryValidationError::Width {
@@ -271,17 +332,21 @@ mod tests {
     fn require_width_never_attributes_to_the_caller() {
         let q = caller(vec![1.0, 0.0, 0.5], None).unwrap();
         let err = q.require_width(4, "segment 7").unwrap_err();
+        // `QuerySource::Artifact`, NEVER `Stored`: the query is `Caller`-
+        // provenance, and `require_width`'s error must not assert it was
+        // read from a table it never came from.
         assert_eq!(
             err.source(),
-            &QuerySource::Stored {
-                table: "segment 7".into()
+            &QuerySource::Artifact {
+                name: "segment 7".into()
             }
         );
-        assert!(err.to_string().contains("read from table 'segment 7'"));
+        assert!(err.to_string().contains("checked against 'segment 7'"));
 
         // A Stored-provenance query behaves the same way: the artifact named
         // by `require_width` wins over the query's own table, since the
-        // check is specifically about the artifact it just met.
+        // check is specifically about the artifact it just met — and it is
+        // still `Artifact`, not the query's own `Stored { table: "docs" }`.
         let stored = validate_query(
             vec![1.0, 0.0, 0.5],
             None,
@@ -293,8 +358,8 @@ mod tests {
         let err = stored.require_width(4, "segment 7").unwrap_err();
         assert_eq!(
             err.source(),
-            &QuerySource::Stored {
-                table: "segment 7".into()
+            &QuerySource::Artifact {
+                name: "segment 7".into()
             }
         );
     }

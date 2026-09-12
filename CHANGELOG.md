@@ -60,12 +60,25 @@ workspace ships every publishable crate at the same
 - **A downstream width check never attributes to the caller, regardless of
   the query's own provenance (#482).** `ValidatedQuery::require_width` now
   takes an `artifact: impl Into<String>` and does not read the query's
-  `QuerySource` at all — every call downstream of an entry (an index's
-  declared dimensions, a scan's width, a stored vector's own length) is
-  engine-fault by construction. The one entry that still attributes by the
-  query's own provenance (the placement entry's all-remote shape) uses the
+  `QuerySource` at all — every call downstream of an entry an authority has
+  already checked (an index's declared dimensions, a scan's width, a stored
+  vector's own length) is engine-fault by construction. TWO entries still
+  attribute by the query's own provenance (the placement entry's all-remote
+  shape, and `exact_vector_search`'s no-catalog-width fallback) and use the
   new `ValidatedQuery::require_authority_width`, the old `require_width`
-  behaviour under a name that says why it is different.
+  behaviour under a name that says why it is different. `QuerySource`
+  gained a third variant, `Artifact { name }`, which `require_width` reports
+  instead of borrowing `Stored` for a query it did not read from that
+  table — an exhaustive match on `QuerySource` needs a new arm.
+- **`jammi_db::store::ResultStore::result_digest_anchor` is removed with no
+  replacement (#482).** It resolved a result table's current version and
+  then discarded the resolution, returning a bare `InputAnchor` a caller
+  could not get the matching content back from without a second,
+  independent resolve — the exact shape a version publish landing between
+  the two calls can straddle. Call
+  `ResultStore::pin_current_version(record).await?.input_anchor()` instead;
+  for a versioned table this method already delegated to exactly that
+  internally, so the returned value is unchanged.
 
 ### Added
 - **Two-mode shutdown — SIGTERM = DRAIN, SIGINT = RELEASE — on the server,

@@ -554,6 +554,14 @@ impl From<jammi_numerics::query::QueryValidationError> for JammiError {
                 found: actual,
                 supported: expected,
             },
+            // A downstream artifact `require_width` disagreed with —
+            // engine-fault by construction, identically to `Stored`,
+            // regardless of the query's own provenance.
+            QuerySource::Artifact { name } => JammiError::IncompatibleFormat {
+                artifact: format!("{name}.vector"),
+                found: actual,
+                supported: expected,
+            },
         }
     }
 }

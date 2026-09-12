@@ -1360,7 +1360,7 @@ async fn stored_width_drift_answered_by_an_owner_ladders_to_a_named_refusal() {
     match &err {
         JammiError::IncompatibleFormat { artifact, .. } => {
             assert!(
-                artifact.contains('1'),
+                artifact.contains("segment 1"),
                 "names the drifted segment: {artifact}"
             )
         }
@@ -1407,7 +1407,7 @@ async fn stored_width_drift_answered_by_an_owner_ladders_to_a_named_refusal() {
     match &err {
         JammiError::IncompatibleFormat { artifact, .. } => {
             assert!(
-                artifact.contains('1'),
+                artifact.contains("segment 1"),
                 "names the drifted segment: {artifact}"
             )
         }

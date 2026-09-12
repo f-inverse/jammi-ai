@@ -916,9 +916,15 @@ async fn ladder_retries_then_loads_locally_or_refuses_unavailable() {
     assert_eq!(delta(&d0, &d1, "unavailable"), 1);
     assert_eq!(delta(&d0, &d1, "local_load"), 0);
 
-    // `dimensions = None` on the record skips rung 3 → Unavailable.
+    // `dimensions = None` on the record skips rung 3 → Unavailable. The
+    // assertion is about the WIDTH `resolve_search_mode`/`PlacedIndex` will
+    // see (the non-zero accessor `dimensions()`, which is what actually
+    // feeds `PlacedIndex`'s width field and gates rung 3) — not the raw
+    // signed column (`dimensions_raw()`), which happens to be `None` here
+    // too only because the fixture's own input was `None` rather than a
+    // corrupt `Some(0)`/`Some(-1)`.
     let (table_nodims, record_nodims) = two_segment_table(&store2, "src_nodims", None).await;
-    assert_eq!(record_nodims.dimensions, None);
+    assert_eq!(record_nodims.dimensions(), None);
     placement.set(
         &record_nodims.table_name,
         1,

@@ -714,6 +714,7 @@ async fn ready_table_with_poisoned_row(
             Arc::new(StringArray::from(vec![source_id; 3])),
             Arc::new(StringArray::from(vec!["test-model"; 3])),
             Arc::new(vectors),
+            jammi_db::store::content_hash::null_hash_column(3),
         ],
     )
     .unwrap();

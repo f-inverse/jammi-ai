@@ -541,10 +541,16 @@ async fn owner_refuses_non_conforming_requests() {
 }
 
 // Input-edge reconciliation at the OWNER: every value that arrives over the
-// peer seam is checked against what the owner knows before any kernel runs.
-// A caller fault is INVALID_ARGUMENT — never a panic, never a silent
-// prefix-scored answer, never DATA_LOSS (which would drive the coordinator's
-// local-load rung for a fault the coordinator itself caused).
+// peer seam is checked against what the owner knows before any kernel runs
+// — never a panic, never a silent prefix-scored answer, never DATA_LOSS
+// (which would drive the coordinator's local-load rung for a fault the
+// coordinator itself caused). The class splits on WHOSE fault it is: a
+// width mismatch against THIS OWNER's own loaded segment, and an unknown
+// row id THIS OWNER's segment does not index, are own-data —
+// FAILED_PRECONDITION, which ladders (this owner's segment can drift from
+// the coordinator's authority, or be reloaded between phases); a
+// duplicated row id, a duplicated or empty segment list, are genuine
+// request malformation — INVALID_ARGUMENT, terminal at the coordinator.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn owner_refuses_non_conforming_requests_with_invalid_argument() {
     let dir = tempfile::tempdir().unwrap();
@@ -578,12 +584,13 @@ async fn owner_refuses_non_conforming_requests_with_invalid_argument() {
         row_ids: ids.iter().map(|s| s.to_string()).collect(),
     };
 
-    // A LONGER query than the segment's dimensions (5 vs 4): SegmentSearch.
+    // A LONGER query than the segment's dimensions (5 vs 4): own-data — this
+    // owner's loaded segment disagrees with the coordinator's authority.
     let err = client
         .segment_search(search(vec![1.0, 0.0, 0.0, 0.0, 0.0], vec![0]))
         .await
-        .expect_err("a 5-wide query against a 4-wide segment is a caller fault");
-    assert_eq!(err.code(), Code::InvalidArgument, "{err:?}");
+        .expect_err("a 5-wide query against a 4-wide segment is own-data");
+    assert_eq!(err.code(), Code::FailedPrecondition, "{err:?}");
     assert!(
         err.message().contains('5') && err.message().contains('4'),
         "{err:?}"
@@ -596,34 +603,36 @@ async fn owner_refuses_non_conforming_requests_with_invalid_argument() {
         ))
         .await
         .expect_err("a longer query must be refused, never panic");
-    assert_eq!(err.code(), Code::InvalidArgument, "{err:?}");
+    assert_eq!(err.code(), Code::FailedPrecondition, "{err:?}");
     // A SHORTER query (3 vs 4): refused, never silently scored over a prefix.
     let err = client
         .segment_search(search(vec![1.0, 0.0, 0.0], vec![0]))
         .await
-        .expect_err("a 3-wide query is a caller fault");
-    assert_eq!(err.code(), Code::InvalidArgument, "{err:?}");
+        .expect_err("a 3-wide query is own-data");
+    assert_eq!(err.code(), Code::FailedPrecondition, "{err:?}");
     let err = client
         .exact_rescore(rescore_req(vec![1.0, 0.0, 0.0], vec![rows(&["a"])]))
         .await
-        .expect_err("a 3-wide query is a caller fault");
-    assert_eq!(err.code(), Code::InvalidArgument, "{err:?}");
+        .expect_err("a 3-wide query is own-data");
+    assert_eq!(err.code(), Code::FailedPrecondition, "{err:?}");
     // An EMPTY query is the same fault.
     let err = client
         .segment_search(search(vec![], vec![0]))
         .await
-        .expect_err("an empty query is a caller fault");
-    assert_eq!(err.code(), Code::InvalidArgument, "{err:?}");
+        .expect_err("an empty query is own-data");
+    assert_eq!(err.code(), Code::FailedPrecondition, "{err:?}");
 
-    // A row id the segment does not index is a CALLER fault, not a torn bundle.
+    // A row id the segment does not index is own-data (this owner reloads
+    // its segment per RPC, so a rebuild between phases can move ids out
+    // from under it) — never mistaken for a torn bundle.
     let err = client
         .exact_rescore(rescore_req(
             vec![1.0, 0.0, 0.0, 0.0],
             vec![rows(&["a", "ghost"])],
         ))
         .await
-        .expect_err("an unknown row id is a caller fault");
-    assert_eq!(err.code(), Code::InvalidArgument, "{err:?}");
+        .expect_err("an unknown row id is own-data");
+    assert_eq!(err.code(), Code::FailedPrecondition, "{err:?}");
     assert!(err.message().contains("ghost"), "{err:?}");
     // A row id named twice in one group is refused too.
     let err = client

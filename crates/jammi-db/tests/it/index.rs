@@ -269,6 +269,7 @@ async fn exact_table(
             Arc::new(StringArray::from(vec!["src"; n])),
             Arc::new(StringArray::from(vec!["model"; n])),
             Arc::new(vector_col),
+            jammi_db::store::content_hash::null_hash_column(n),
         ],
     )
     .unwrap();

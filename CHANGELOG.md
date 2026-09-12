@@ -93,10 +93,15 @@ workspace ships every publishable crate at the same
   linked building-table lease with it — stops the loop and exits 0 when its
   own evidence confirms every lease was handed back, or exit code 3 when it
   does not; a successor claims a CONFIRMED release within one idle poll at
-  no attempt cost (`releases` offsets it in the `attempts - releases` cap),
-  while a DEGRADED release's affected lease instead falls to the expiry
-  path and costs one attempt (`attempts + 1`, `releases` untouched) within
-  one lease window.
+  no attempt cost (`releases` offsets it in the `attempts - releases` cap).
+  Whether a DEGRADED release (exit 3) still hands a given lease back is
+  conditional on which determinant degraded: when the sweep statement for
+  that lease's own table itself failed, the lease was never written and
+  falls to the expiry path, costing one attempt (`attempts + 1`, `releases`
+  untouched) within one lease window; but when the sweep confirms and only
+  the hold-observation or stop-witness evidence is missing, the lease was
+  already handed back (`releases + 1`, lease NULLed) and a successor claims
+  it within one idle poll at no attempt cost, same as a CONFIRMED release.
   `EmbeddedWorker::{begin_drain, stop_and_join -> StopOutcome,
   release_and_stop -> ReleaseReport, shared}`, `WorkerShared`, `LoopState`,
   `InferenceSession::{release_job_leases, close_worker_gate,

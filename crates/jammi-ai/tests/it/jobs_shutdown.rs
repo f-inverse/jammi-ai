@@ -1213,6 +1213,63 @@ async fn release_and_stops_second_sweep_reports_jobs_none_building_some_from_a_r
     );
 }
 
+/// Producer-driven `ReleaseSweep { jobs: Some(_), building: None }` — the
+/// mirror image of the test above (contract `CONTRACT-OPS-fix6.md`, round
+/// 6, correcting round 5): the round-5 enumeration declared this arm "NOT
+/// producer-driven ... no OTHER injection point into this statement is
+/// established", reasoning only about the COLUMN
+/// `release_building_tables_of_claimant`'s `UPDATE` WRITES
+/// (`result_tables.lease_expires_at`). That statement also NAMES a second
+/// table it reads FROM, `result_tables` itself, and a fault on that table
+/// is separable from the `jobs.releases` fault above because
+/// `release_jobs_claimed_by` never touches `result_tables`. `ALTER TABLE
+/// result_tables DROP COLUMN lease_expires_at` is rejected by the table's
+/// own `idx_result_tables_lease` index, so this renames the table out from
+/// under the statement instead — the same public `SqliteBackend::open` +
+/// `CatalogBackend::transaction` surface the test above uses. No worker
+/// and no enqueued job: `InferenceSession::release_job_leases` reaches
+/// `release_sweep` directly, and the statement runs (and can fault) with
+/// nothing claimed.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn release_job_leases_second_sweep_reports_building_none_jobs_some_from_a_real_fault() {
+    use jammi_db::catalog::backend::{BackendImpl, TxOptions};
+    use jammi_db::catalog::backend_sqlite::SqliteBackend;
+
+    let (session, dir) = session(FAST_TIMING).await;
+
+    let fault_conn = BackendImpl::Sqlite(
+        SqliteBackend::open(&dir.path().join("catalog.db"))
+            .await
+            .expect("second handle on the same catalog.db"),
+    );
+    fault_conn
+        .transaction(TxOptions::default(), |tx| {
+            Box::pin(async move {
+                tx.execute(
+                    "ALTER TABLE result_tables RENAME TO result_tables_gone",
+                    &[],
+                )
+                .await?;
+                Ok(())
+            })
+        })
+        .await
+        .expect("inject the fault");
+
+    let (_holds, sweep) = session.release_job_leases().await.unwrap();
+    assert_eq!(
+        sweep.building, None,
+        "the building sweep statement itself must error once its table is \
+         renamed out from under it: {sweep:?}"
+    );
+    assert!(
+        sweep.jobs.is_some(),
+        "and the jobs sweep never touches result_tables, so it must still \
+         confirm -- the mirror of the jobs-None/building-Some fault above: \
+         {sweep:?}"
+    );
+}
+
 /// R5(d)'s sibling: an inline `run_now` materialization (its `ResultTable`
 /// hold on the shared keeper, adopted under the SAME `writer_id` the loop's
 /// tables use, parked inside `finish`) survives a RELEASE: its building

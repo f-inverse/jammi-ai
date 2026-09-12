@@ -335,10 +335,23 @@ one heartbeat keeps its live lease and is recovered by the expiry path (one
 lease window, `attempts + 1`, never `failed`); a compute job whose linked
 building sweep errored while the jobs sweep succeeded makes the successor
 back off once (one lease window) before it re-materializes; and a RELEASE
-whose own evidence does not confirm every lease was handed back — the
-affected lease falls to the expiry path and a successor reclaims it within
-one `[lease] duration_secs` rather than one idle poll, and the process still
-exits at once (exit code 3).
+whose own **sweep statement for a given lease's table** itself errored (that
+statement's own `Err`, read back as `None`) — that lease was never written
+and falls to the expiry path, so a successor reclaims it within one
+`[lease] duration_secs` rather than one idle poll.
+
+Exit code 3 (DEGRADED) does not by itself mean every lease fell to the
+expiry path — the process exits 3 whenever ANY determinant of a confirmed
+release is missing, and two of those determinants are evidence gaps, not
+release failures: when the keeper's per-hold pass could not be confirmed to
+run (`Unobserved`) or the loop's terminal state was not genuinely witnessed
+while its sweep statements both still confirm, the `UPDATE`s that hand the
+lease back already committed, so every such lease IS NULL with
+`releases + 1` and a successor claims it within one idle poll at no attempt
+cost — degraded exit code, confirmed release. Only when the sweep statement
+itself is what failed (the exception above) does the affected lease truly
+remain live and cost an attempt on the expiry path. The process still exits
+at once either way (exit code 3, never a hang).
 
 `jammi-server release [--pid N]` sends SIGINT to `N` (default 1, the
 container entrypoint) and exits 0 when the signal was sent — that is ALL its

@@ -84,14 +84,19 @@ bundle lands, then the process exits 0 — and **SIGINT = RELEASE** — every jo
 lease is handed back to the catalog at once (the row stays `running` with a
 NULL lease and `releases + 1`; a compute job's building-table lease with it),
 the loop stops and the process exits **0 when its own evidence confirms
-every lease was handed back, or exit code 3 when it does not** (the affected
-lease then falls to the expiry path instead of the idle-poll one — see
+every lease was handed back, or exit code 3 when it does not** (see
 `docs/guide/src/deploy-server.md`'s RELEASE section), so a successor claims
 a CONFIRMED release (exit 0) within one `[worker] idle_poll_secs` at no
-attempt cost (`releases` offsets it in the `attempts - releases` cap); a
-DEGRADED release (exit 3) instead falls to the expiry path and costs one
-attempt (`attempts + 1`, `releases` untouched) within one `[lease]
-duration_secs`. Any signal while
+attempt cost (`releases` offsets it in the `attempts - releases` cap). A
+DEGRADED release (exit 3) does not universally cost an attempt: whether a
+given lease falls to the expiry path depends on WHICH determinant degraded
+— when the sweep statement for that lease's own table itself failed, the
+lease was never written, falls to the expiry path, and costs one attempt
+(`attempts + 1`, `releases` untouched) within one `[lease] duration_secs`;
+but when the sweep confirms and only the hold-observation or stop-witness
+evidence is missing, the lease was already handed back (`releases + 1`,
+lease NULLed) and a successor claims it within one idle poll at no attempt
+cost, exactly as a CONFIRMED release. Any signal while
 draining is a RELEASE. There is no engine-side timeout: the pod's
 `terminationGracePeriodSeconds` bounds a DRAIN, then SIGKILL.
 

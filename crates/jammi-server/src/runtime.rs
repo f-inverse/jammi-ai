@@ -733,14 +733,24 @@ pub enum ShutdownOutcome {
     /// neither certainly resolved nor genuinely observed, or one of its
     /// sweep statements failed (`jammi_ai::fine_tune::worker::
     /// ReleaseSweep::jobs`/`building` read `None`, a swallowed statement
-    /// failure, never fabricated into a claim of success). The affected
-    /// lease(s) fall to the expiry path instead of being handed back, so a
-    /// successor reclaims them within one lease window rather than one
-    /// idle poll. `main` still exits the process at once (exit code 3,
-    /// distinct from [`Self::Released`]'s 0) — R6: an `Err` here must never
-    /// propagate through the normal return path, which would hang on a
-    /// detached trainer past its grace period and turn a degraded release
-    /// into a kill.
+    /// failure, never fabricated into a claim of success). Whether a lease
+    /// still gets handed back is CONDITIONAL on which determinant degraded,
+    /// never universal (contract `CONTRACT-OPS-fix6.md`, round 6, correcting
+    /// round 5's operator sentence): when it is a sweep statement for that
+    /// lease's own table that read `None`, the lease truly was not written
+    /// and falls to the expiry path, so a successor reclaims it within one
+    /// lease window rather than one idle poll — but when the sweep itself
+    /// confirms (both fields `Some`) and only the hold-observation or
+    /// stop-witness evidence is missing (`Unobserved` holds, or
+    /// `stop_witnessed == false`), the `UPDATE` that hands the lease back
+    /// already ran and committed, so the lease IS NULL with `releases + 1`
+    /// and a successor claims it within one idle poll at no attempt cost —
+    /// the evidence gap is about hold bookkeeping or loop synchronization,
+    /// not about whether the row was released. `main` still exits the
+    /// process at once (exit code 3, distinct from [`Self::Released`]'s 0)
+    /// — R6: an `Err` here must never propagate through the normal return
+    /// path, which would hang on a detached trainer past its grace period
+    /// and turn a degraded release into a kill.
     ReleaseDegraded,
 }
 
@@ -1073,32 +1083,45 @@ impl BoundServer {
                 // this exit precedes the worker gate opening, so no job is
                 // claimed and no detached trainer exists to wait on.
                 //
-                // UNCOVERED (contract `CONTRACT-OPS-fix5.md`, round 5): no
-                // test drives `health_task` or `peer_task` to `Err` on this
-                // exact preload-exit path, so this fold's own behavioural
-                // difference from discarding is unobserved — reverting it
-                // to `let _ = health_result; let _ = peer_result; return
-                // early;` (`early` already carries `outcome`) passes the
-                // whole `jammi-server` suite. The arm itself IS reached
+                // UNREACHABLE AT THE PINNED VERSIONS, established by reading
+                // both crates rather than argued (contract
+                // `CONTRACT-OPS-fix6.md`, round 6, correcting round 5's
+                // `CONTRACT-OPS-fix5.md`): no test drives `health_task` or
+                // `peer_task` to `Err` on this exact preload-exit path
+                // because, at the pinned dependency versions, NEITHER serve
+                // future can return `Err` from a live socket at all — this
+                // is not a tooling gap, it is a fact about the pinned
+                // dependencies. `axum::serve(..).with_graceful_shutdown(..)`'s
+                // `IntoFuture` is literally `{ self.run().await; Ok(()) }`
+                // (`axum-0.8.8/src/serve/mod.rs:344-348`), and its
+                // `Listener::accept` loop for a `TcpListener` never returns
+                // on error — an EMFILE from descriptor exhaustion is logged
+                // and slept on for 1s, then retried
+                // (`axum-0.8.8/src/serve/listener.rs:30-36,140-158`).
+                // Tonic's `Server::serve_with_incoming_shutdown` loop does
+                // `Some(Err(e)) => { trace!(..); continue; }` on an accept
+                // error, and its only fallible call is `MakeSvc::call`,
+                // which is `future::ready(Ok(svc))`
+                // (`tonic-0.14.5/src/transport/server/mod.rs:841-845,1250`).
+                // Both futures return `Ok(())` on every path, so raw-fd
+                // manipulation or a lowered `RLIMIT_NOFILE` — the routes a
+                // prior round named and declined to build — would not have
+                // produced an `Err` either; the arm is unreachable by
+                // construction, not by a missing fault-injection technique.
+                // The arm itself IS still reached
                 // (`signal_during_preload_exits_without_serving`,
                 // `release_signal_during_preload_actually_releases`,
                 // `preload_of_an_unloadable_model_is_a_startup_error` all
-                // enter it), so this is not dead code — what is missing is a
-                // producer for either task's `Err`, which requires the
-                // listener's own accept loop to fail (`axum::serve` /
-                // tonic's `Server::serve_with_incoming_shutdown` returning
-                // `Err` from a live socket, not a task panic — the `Err`
-                // join arms above are already covered separately). ATTEMPTED:
-                // this codebase's only established OS-level fault-injection
-                // technique is `chmod` on a file
-                // (`crates/jammi-db/tests/it/reconcile.rs`), which does not
-                // apply to a TCP listener; forcing an accept-loop failure
-                // needs either raw-fd manipulation or a lowered
-                // `RLIMIT_NOFILE` on the whole test process, both of which
-                // are new fault-injection infrastructure this fix round does
-                // not add (and the rlimit route risks starving unrelated
-                // concurrently-running tests in the same process). Left
-                // uncovered rather than argued safe.
+                // enter it) — this fold is dead only for `Err`, live for
+                // `Ok`, and never dead code — but the fold this comment
+                // defends is defence against a FUTURE change to the pinned
+                // `axum`/`tonic` versions that makes one of these serve
+                // futures fallible on accept-loop exhaustion, not against a
+                // producer that exists in the tree today. Whether either
+                // task's join-error (`Err(join_err)`) arm just below is
+                // covered by anything in this suite is UNMEASURED — a grep
+                // for a test that panics either task found none — and is
+                // left that way rather than asserted.
                 let _ = health_stop_tx.send(());
                 let health_result = match health_task.await {
                     Ok(r) => r,
@@ -2478,11 +2501,20 @@ mod audit_master_key_tests {
 ///   None`, so dropping the `jobs` conjunct out of `sweep_confirms_release`
 ///   went unnoticed by every test in this file until this round.
 /// * **Sweep confirmation, `ReleaseSweep.building == None`** (the linked
-///   building-table sweep statement itself returning `Err`): NOT
-///   producer-driven — `release_building_tables_of_claimant`'s `UPDATE`
-///   writes only `result_tables.lease_expires_at`, so the `jobs.releases`
-///   schema fault above does not reach it, and no OTHER injection point into
-///   this statement is established. Covered only by the literal
+///   building-table sweep statement itself returning `Err`): producer-driven
+///   in `crates/jammi-ai/tests/it/jobs_shutdown.rs`
+///   (`release_job_leases_second_sweep_reports_building_none_jobs_some_from_a_real_fault`).
+///   A round-5 version of this doc declared this arm "NOT producer-driven
+///   ... no OTHER injection point into this statement is established",
+///   reasoning only about the COLUMN `release_building_tables_of_claimant`'s
+///   `UPDATE` WRITES (`result_tables.lease_expires_at`); that argument is
+///   retracted — the statement also NAMES a second table it reads FROM,
+///   `result_tables` itself, and renaming that table out from under the
+///   statement (the same public `SqliteBackend::open` +
+///   `CatalogBackend::transaction` surface the `jobs`-fault test above
+///   uses) faults it while `release_jobs_claimed_by` — which never touches
+///   `result_tables` — still confirms: the mirror image of the asymmetric
+///   shape above. Covered at the predicate itself by the literal
 ///   `an_unconfirmed_second_sweep_degrades` / `session_only_unconfirmed_
 ///   sweep_degrades` below.
 /// * **Outer `Err`** (`ReleaseAttempt::Worker(Err(_))` /

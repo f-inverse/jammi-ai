@@ -2673,6 +2673,154 @@ async fn release_job_lease_write_is_exactly_lease_null_releases_plus_one_and_tim
     assert_eq!(other_after.status, other_before.status);
 }
 
+/// Every OTHER `JobRecord` field, byte-identical, field by field (no
+/// `PartialEq` derive) — the shared assertion body for the sweep delta
+/// oracle below, near-copied from
+/// `release_job_lease_write_is_exactly_lease_null_releases_plus_one_and_timestamp`'s
+/// inline comparison rather than factored out there too, so each oracle
+/// stays independently readable.
+fn assert_only_release_columns_changed(
+    before: &jammi_db::catalog::jobs_repo::JobRecord,
+    after: &jammi_db::catalog::jobs_repo::JobRecord,
+) {
+    assert!(after.lease_expires_at.is_none(), "{after:?}");
+    assert_eq!(after.releases, before.releases + 1, "{after:?}");
+    assert!(
+        after.updated_at > before.updated_at,
+        "updated_at must be bumped: before {:?}, after {:?}",
+        before.updated_at,
+        after.updated_at
+    );
+    assert_eq!(after.job_id, before.job_id);
+    assert_eq!(after.kind, before.kind);
+    assert_eq!(after.tenant_id, before.tenant_id);
+    assert_eq!(after.status, before.status);
+    assert_eq!(after.execution, before.execution);
+    assert_eq!(after.spec, before.spec);
+    assert_eq!(after.partial_result, before.partial_result);
+    assert_eq!(after.result, before.result);
+    assert_eq!(after.error, before.error);
+    assert_eq!(after.progress_rows_done, before.progress_rows_done);
+    assert_eq!(after.progress_rows_total, before.progress_rows_total);
+    assert_eq!(after.progress_phase, before.progress_phase);
+    assert_eq!(after.cancel_requested, before.cancel_requested);
+    assert_eq!(after.model_ref, before.model_ref);
+    assert_eq!(after.output_model_id, before.output_model_id);
+    assert_eq!(after.model_source, before.model_source);
+    assert_eq!(after.claimed_by, before.claimed_by);
+    assert_eq!(
+        after.attempts, before.attempts,
+        "release never touches attempts"
+    );
+    assert_eq!(after.priority, before.priority);
+    assert_eq!(after.claimable, before.claimable);
+    assert_eq!(after.acceleration_report, before.acceleration_report);
+    assert_eq!(after.parent_id, before.parent_id);
+    assert_eq!(after.has_deps, before.has_deps);
+    assert_eq!(after.created_at, before.created_at);
+}
+
+/// The sweep form's (`release_jobs_claimed_by`) OWN column-level delta,
+/// exactly, on EVERY row it matches — its twin
+/// `release_job_lease_write_is_exactly_lease_null_releases_plus_one_and_timestamp`
+/// pins the same SQL (`jobs_repo.rs`: `lease_expires_at = NULL, releases =
+/// releases + 1, updated_at = $now`) for the single-row statement, but until
+/// now this statement — the ONLY writer on the worker-less RELEASE arm (no
+/// loop, so `release_job_holds`'s per-hold pass never touches an inline
+/// row's `Job` hold either) — had only a row-COUNT oracle
+/// (`a_double_release_increments_releases_once` et al.), never a
+/// column-level one. Two rows claimed by `me` are swept in one call; an
+/// inline row claimed by `me` (never matches `execution = 'queued'`) and a
+/// row claimed by a DIFFERENT instance are both asserted COMPLETELY
+/// untouched, not merely their lease/`releases`.
+#[test_case(BackendKind::Sqlite ; "sqlite")]
+#[cfg_attr(
+    feature = "live-postgres-tests",
+    test_case(BackendKind::Postgres ; "postgres")
+)]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn release_jobs_claimed_by_write_is_exactly_lease_null_releases_plus_one_and_timestamp(
+    backend: BackendKind,
+) {
+    let dir = tempdir().unwrap();
+    let (_session, catalog) = queue_catalog!(backend, dir.path());
+    let lease = Duration::from_secs(3600);
+
+    catalog.submit_job(job_params("sweep-a")).await.unwrap();
+    catalog.submit_job(job_params("sweep-b")).await.unwrap();
+    catalog
+        .submit_job(inline_job_params("sweep-inline"))
+        .await
+        .unwrap();
+    catalog.submit_job(job_params("sweep-other")).await.unwrap();
+
+    catalog
+        .claim_next("me", KINDS, lease)
+        .await
+        .unwrap()
+        .expect("sweep-a claimed by me");
+    catalog
+        .claim_next("me", KINDS, lease)
+        .await
+        .unwrap()
+        .expect("sweep-b claimed by me");
+    catalog
+        .claim_by_id("sweep-inline", "me", lease)
+        .await
+        .unwrap()
+        .expect("sweep-inline claimed by me");
+    catalog
+        .claim_next("someone-else", KINDS, lease)
+        .await
+        .unwrap()
+        .expect("sweep-other claimed by a DIFFERENT instance");
+
+    // A timestamp column stored with second-or-finer resolution needs a
+    // strictly later `now` to observe as "bumped" — see the twin oracle's
+    // identical comment.
+    tokio::time::sleep(Duration::from_millis(1100)).await;
+
+    let a_before = catalog.get_job("sweep-a").await.unwrap();
+    let b_before = catalog.get_job("sweep-b").await.unwrap();
+    let inline_before = catalog.get_job("sweep-inline").await.unwrap();
+    let other_before = catalog.get_job("sweep-other").await.unwrap();
+    assert!(a_before.lease_expires_at.is_some());
+    assert!(b_before.lease_expires_at.is_some());
+
+    let swept = catalog.release_jobs_claimed_by("me").await.unwrap();
+    assert_eq!(swept, 2, "exactly the two queued rows claimed by `me`");
+
+    let a_after = catalog.get_job("sweep-a").await.unwrap();
+    let b_after = catalog.get_job("sweep-b").await.unwrap();
+    assert_only_release_columns_changed(&a_before, &a_after);
+    assert_only_release_columns_changed(&b_before, &b_after);
+
+    // The inline row claimed by the SAME instance: completely untouched
+    // (`execution = 'queued'` never matches it).
+    let inline_after = catalog.get_job("sweep-inline").await.unwrap();
+    assert_eq!(
+        inline_after.lease_expires_at,
+        inline_before.lease_expires_at
+    );
+    assert_eq!(inline_after.releases, inline_before.releases);
+    assert_eq!(inline_after.updated_at, inline_before.updated_at);
+    assert_eq!(inline_after.claimed_by, inline_before.claimed_by);
+    assert_eq!(inline_after.attempts, inline_before.attempts);
+    assert_eq!(inline_after.status, inline_before.status);
+
+    // A row claimed by a DIFFERENT instance: completely untouched.
+    let other_after = catalog.get_job("sweep-other").await.unwrap();
+    assert_eq!(other_after.lease_expires_at, other_before.lease_expires_at);
+    assert_eq!(other_after.releases, other_before.releases);
+    assert_eq!(other_after.updated_at, other_before.updated_at);
+    assert_eq!(other_after.claimed_by, other_before.claimed_by);
+    assert_eq!(other_after.attempts, other_before.attempts);
+    assert_eq!(other_after.status, other_before.status);
+
+    // Idempotent: a second sweep matches neither row again.
+    assert_eq!(catalog.release_jobs_claimed_by("me").await.unwrap(), 0);
+}
+
 /// The reclaim cap compares `attempts - releases` against `MAX_ATTEMPTS`
 /// (3): a deploy storm of three releases leaves the job claimable at
 /// `attempts 4, releases 3`; three genuine expiries fail it; 3 claims / 2

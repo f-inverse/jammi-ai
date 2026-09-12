@@ -593,15 +593,53 @@ pub enum StopOutcome {
     NothingToJoin,
 }
 
+/// P-2B's determinant (contract `CONTRACT-OPS-fix3.md`): the keeper's
+/// per-hold RELEASE pass (2b) either completed — carrying [`HoldRelease`]'s
+/// totality-checked counts — or could not be confirmed to run at all (the
+/// keeper thread was dead, or the pass did not complete within the bound).
+/// The latter is UNOBSERVED, never folded into a count of zero: "no hold
+/// failed" and "we don't know whether any hold failed" are different facts,
+/// and collapsing them is exactly the defect this type exists to close. The
+/// underlying error is logged at the call site ([`EmbeddedWorker::release_and_stop`]
+/// / [`crate::session::InferenceSession::release_job_leases`]); this report
+/// only needs to know the pass ran.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum HoldReleaseOutcome {
+    /// The pass completed; `Ok` from [`LeaseKeeper::release_job_holds`].
+    Observed(HoldRelease),
+    /// The pass could not be confirmed to run; `Err` from
+    /// [`LeaseKeeper::release_job_holds`].
+    Unobserved,
+}
+
+impl HoldReleaseOutcome {
+    /// P-2B: `true` iff the pass was observed AND no hold's release attempt
+    /// itself failed. `false` on `Unobserved` (unobserved is not success)
+    /// and on `Observed` with `failed > 0`.
+    pub fn confirms_release(&self) -> bool {
+        matches!(self, Self::Observed(hr) if hr.failed == 0)
+    }
+}
+
 /// What [`EmbeddedWorker::release_and_stop`] did, for the caller's log and
 /// for the oracles that pin each arm of §3.4.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct ReleaseReport {
     /// The loop's terminal state: `Stopped` on the cooperative arm,
     /// `Aborted` on the in-flight and timeout arms, `Failed` on a panic.
+    /// May be a last-known/fallback read rather than a certain observation
+    /// — see `stop_witnessed`.
     pub loop_state: LoopState,
-    /// `Job` holds the keeper released (2b).
-    pub holds_released: usize,
+    /// `Job` holds the keeper released (2b) — P-2B's determinant.
+    pub holds: HoldReleaseOutcome,
+    /// P-2F's determinant: `true` iff no further claim by this loop can
+    /// land after sweep #2 — witnessed either by 2e having resolved the
+    /// task with certainty (joined, or aborted on any of its three abort
+    /// arms) or by `loop_state` itself being an OBSERVED terminal state
+    /// (the state-change watch fired within the bound), never the
+    /// fallback/proxy read alone. A bare `loop_state != Running` comparison
+    /// cannot make this distinction — see the contract's falsifier.
+    pub stop_witnessed: bool,
     /// Sweep #1 (2c).
     pub sweep_one: ReleaseSweep,
     /// Sweep #2 (2g).
@@ -2398,7 +2436,12 @@ impl EmbeddedWorker {
     ///   still exists, so a training thread bails at its next epoch boundary
     ///   WITHOUT writing a bundle — before any abort could drop the hold and
     ///   let a detached trainer write a doomed epoch into the shared
-    ///   `_resume` prefix. `ResultTable` holds are never touched (2c).
+    ///   `_resume` prefix. `ResultTable` holds are never touched (2c). P-2B
+    ///   (the report's `holds` field): the pass either completed, in which
+    ///   case a per-hold failure is a genuine, separately-counted
+    ///   determinant, distinct from `not_required` (no such hold existed),
+    ///   or it could not be confirmed to run at all, which is UNOBSERVED
+    ///   rather than a count of zero.
     /// * **2c** sweep #1: the jobs sweep, then the jobs-linked building-table
     ///   sweep (`release_sweep`) — covering a claim or a building row that
     ///   committed after 2b snapshotted. The loop's own `ResultTable` hold
@@ -2420,10 +2463,16 @@ impl EmbeddedWorker {
     ///   + 1`, never `failed`). `in_flight > 0`: the loop is inside a job
     ///   under a hold, not inside `claim_next` — abort now; the dropped
     ///   future runs the hold's and the watcher's `Drop`. `Joined` is a
-    ///   no-op — nothing left to take, since a concurrent `stop_and_join`
-    ///     already completed cooperatively.
+    ///   no-op — nothing left to take; see `TakenHandle`'s own doc for why
+    ///   this alone does not witness P-2F (a concurrent `stop_and_join` may
+    ///     still be mid-flight holding the handle).
     /// * **2f** observe the terminal [`LoopState`] (the in-task guard reports
-    ///   on every path).
+    ///   on every path). `stop_witnessed` (P-2F) is `true` when 2e itself
+    ///   resolved the task (joined or aborted, any arm) OR this observation
+    ///   is a genuine watch-fired transition — never when it fell back to
+    ///   the last-known proxy read on a timeout/closed channel, which alone
+    ///   can read `Running` on a genuine abort whose guard has not published
+    ///   yet.
     /// * **2g** sweep #2, unconditionally — idempotent, catches a claim or a
     ///   building row that committed after sweep #1.
     /// * **2h** delete the `workers` row — AFTER sweep #2, so the row outlives
@@ -2436,11 +2485,11 @@ impl EmbeddedWorker {
         // 2a
         self.shared.set_phase(WorkerPhase::Releasing);
         // 2b
-        let holds_released = match self.keeper.release_job_holds(self.heartbeat).await {
-            Ok(n) => n,
+        let holds = match self.keeper.release_job_holds(self.heartbeat).await {
+            Ok(hr) => HoldReleaseOutcome::Observed(hr),
             Err(e) => {
                 tracing::warn!(error = %e, "RELEASE: the keeper's per-hold release pass failed");
-                0
+                HoldReleaseOutcome::Unobserved
             }
         };
         // 2c
@@ -2456,7 +2505,14 @@ impl EmbeddedWorker {
             "the loop runs one job at a time; in_flight = {in_flight}"
         );
         let mut state_rx = self.shared.state_receiver();
-        if let Some(taken) = TakenHandle::take(&self.handle) {
+        // P-2F's first disjunct: whether THIS call resolved the task with
+        // certainty (joined, or aborted on any arm). `NothingToTake` — the
+        // handle was already taken by a concurrent caller — is NOT itself a
+        // certain witness (see `TakenHandle`'s own doc: `Joined` alone does
+        // not mean the handle was fully disposed of, only that this slot had
+        // nothing left to hand out); P-2F then falls through to the second
+        // disjunct below (2f's OBSERVED terminal state, never its fallback).
+        let stop_resolved = if let Some(taken) = TakenHandle::take(&self.handle) {
             if taken.reclaimed() {
                 // A previous stop attempt (this process's own caller
                 // cancelled it) left the task's fate unresolved rather than
@@ -2491,7 +2547,10 @@ impl EmbeddedWorker {
             } else {
                 taken.abort_now();
             }
-        }
+            true
+        } else {
+            false
+        };
         // 2f
         let observed = tokio::time::timeout(
             self.heartbeat,
@@ -2499,17 +2558,22 @@ impl EmbeddedWorker {
         )
         .await
         .map(|r| r.map(|state| *state));
-        let loop_state = match observed {
-            Ok(Ok(state)) => state,
+        let (loop_state, state_witnessed) = match observed {
+            Ok(Ok(state)) => (state, true),
             Ok(Err(_)) | Err(_) => {
                 let observed = self.shared.loop_state();
                 tracing::warn!(
                     ?observed,
                     "RELEASE: the loop's terminal state was not observed within one heartbeat"
                 );
-                observed
+                (observed, false)
             }
         };
+        // P-2F: resolved with certainty by 2e, OR the terminal state above
+        // was itself an OBSERVED transition (never the fallback proxy read
+        // alone — see the contract's falsifier on a bare `loop_state !=
+        // Running` comparison).
+        let stop_witnessed = stop_resolved || state_witnessed;
         // 2g
         let sweep_two = release_sweep(&self.catalog, &self.instance_id, &self.writer_id).await;
         // 2h
@@ -2517,7 +2581,8 @@ impl EmbeddedWorker {
         self.catalog.delete_worker(&self.instance_id).await?;
         Ok(ReleaseReport {
             loop_state,
-            holds_released,
+            holds,
+            stop_witnessed,
             sweep_one,
             sweep_two,
         })

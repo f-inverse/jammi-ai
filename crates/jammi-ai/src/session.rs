@@ -342,16 +342,23 @@ impl InferenceSession {
     /// jobs-linked building sweep). With no loop-claimed row on this
     /// instance every statement matches nothing by construction, so on a
     /// worker-less process this is a no-op that keeps the surface uniform.
-    /// Returns `(holds released, sweep counts)`.
+    /// Returns `(2b's outcome, sweep counts)` — see
+    /// [`crate::fine_tune::worker::HoldReleaseOutcome`] for why a bare count
+    /// cannot stand in for 2b's own result: `Unobserved` (the keeper's pass
+    /// itself could not be confirmed to run) is a different fact from "zero
+    /// holds were held".
     pub async fn release_job_leases(
         &self,
-    ) -> Result<(usize, crate::fine_tune::worker::ReleaseSweep)> {
+    ) -> Result<(
+        crate::fine_tune::worker::HoldReleaseOutcome,
+        crate::fine_tune::worker::ReleaseSweep,
+    )> {
         let heartbeat = self.worker_intervals()?.heartbeat;
         let holds = match self.lease_keeper.release_job_holds(heartbeat).await {
-            Ok(n) => n,
+            Ok(hr) => crate::fine_tune::worker::HoldReleaseOutcome::Observed(hr),
             Err(e) => {
                 tracing::warn!(error = %e, "release_job_leases: the keeper's per-hold pass failed");
-                0
+                crate::fine_tune::worker::HoldReleaseOutcome::Unobserved
             }
         };
         let sweep = crate::fine_tune::worker::release_sweep(

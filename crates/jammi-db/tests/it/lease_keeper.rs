@@ -625,7 +625,15 @@ async fn release_job_holds_flips_lost_and_skips_inline_holds() {
         .release_job_holds(fast_intervals().heartbeat())
         .await
         .unwrap();
-    assert_eq!(released, 1, "exactly the loop-claimed Job hold is released");
+    assert_eq!(
+        released,
+        jammi_db::catalog::lease_keeper::HoldRelease {
+            released: 1,
+            not_required: 1,
+            failed: 0,
+        },
+        "exactly the loop-claimed Job hold is released; the inline hold did not require it"
+    );
 
     let queued_row = catalog.get_job("rjh-queued").await.unwrap();
     assert!(queued_row.lease_expires_at.is_none());

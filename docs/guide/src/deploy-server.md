@@ -319,27 +319,42 @@ holds is handed back — the row stays `running` under this instance with
 `lease_expires_at = NULL` and `releases + 1`, and a compute job's linked
 building-table lease is NULLed with it — the loop is stopped (cooperatively
 while no job is under a hold, by abort while one is), the `workers` row is
-deleted, the catalog released, and the process exits 0 at once. A released
-row is claimable by any other worker within one `[worker] idle_poll_secs`,
-never one lease window; the reclaim cap counts `attempts - releases`, so a
-rollout storm of releases never burns the three attempts a genuine crash
-does. The abandoned training thread never finalizes: its lease is gone and
-its next epoch boundary bails without a bundle, so the `_resume` manifest
-epoch never advances past the last landed one. Two named exceptions (§3.5 of
-the design): a claim caught between its COMMIT and its hold registration
-past one heartbeat keeps its live lease and is recovered by the expiry path
-(one lease window, `attempts + 1`, never `failed`); and a compute job whose
-linked building sweep errored while the jobs sweep succeeded makes the
-successor back off once (one lease window) before it re-materializes.
+deleted, the catalog released, and the process exits **0 at once, or exit
+code 3 when its own evidence does not confirm every lease was handed
+back** (see below). A released row is claimable by any other worker within
+one `[worker] idle_poll_secs`, never one lease window; the reclaim cap
+counts `attempts - releases`, so a rollout storm of releases never burns the
+three attempts a genuine crash does. The abandoned training thread never
+finalizes: its lease is gone and its next epoch boundary bails without a
+bundle, so the `_resume` manifest epoch never advances past the last landed
+one **PROVIDED the RELEASE confirmed** (exit 0) — under a degraded RELEASE
+(exit 3) one further epoch bundle may still land before the affected hold's
+`lost` flag flips at its next renewal. Three named exceptions (§3.5 of the
+design): a claim caught between its COMMIT and its hold registration past
+one heartbeat keeps its live lease and is recovered by the expiry path (one
+lease window, `attempts + 1`, never `failed`); a compute job whose linked
+building sweep errored while the jobs sweep succeeded makes the successor
+back off once (one lease window) before it re-materializes; and a RELEASE
+whose own evidence does not confirm every lease was handed back — the
+affected lease falls to the expiry path and a successor reclaims it within
+one `[lease] duration_secs` rather than one idle poll, and the process still
+exits at once (exit code 3).
 
 `jammi-server release [--pid N]` sends SIGINT to `N` (default 1, the
-container entrypoint) and exits 0 when the signal was sent — the uniform
-RELEASE actuator for a `preStop` hook, since the distroless images carry no
-shell for `kill`. It knows nothing about jobs. The library reaches the same
-mechanism through `EmbeddedWorker::release_and_stop` and Python's
-`close(release=True)`; there the process survives, so a thread that reaches
-finalize before a successor claims may still land `completed` — the one
-documented divergence from the server, which exits.
+container entrypoint) and exits 0 when the signal was sent — that is ALL its
+own exit code means; it signals a process that is not its child, so it
+cannot wait on the RELEASE it triggered and never reports that outcome. It
+is the uniform RELEASE actuator for a `preStop` hook, since the distroless
+images carry no shell for `kill`, and it knows nothing about jobs. The
+RELEASE outcome itself (confirmed or degraded) is read from the **serving**
+process's own exit code (0 or 3) via the supervisor
+(`lastState.terminated.exitCode`, `docker inspect --format='{{.State.ExitCode}}'`)
+— under `restartPolicy: Always` (or equivalent), exit code 3 restarts
+identically to 0. The library reaches the same mechanism through
+`EmbeddedWorker::release_and_stop` and Python's `close(release=True)`; there
+the process survives, so a thread that reaches finalize before a successor
+claims may still land `completed` — the one documented divergence from the
+server, which exits.
 
 `ListWorkers` / `jammi workers` show each claim loop's `state`: `warming`
 (the process is preloading; nothing claimed yet), `claiming`, or `draining`.

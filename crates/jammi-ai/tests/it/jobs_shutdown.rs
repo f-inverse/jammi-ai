@@ -20,14 +20,15 @@ use std::time::Duration;
 
 use jammi_ai::fine_tune::spec::{TrainingCommon, TrainingSpec};
 use jammi_ai::fine_tune::worker::{
-    loop_test_hooks, training_test_hooks, EmbeddedWorker, JobWorker, LoopState, StopOutcome,
-    WorkerShared,
+    loop_test_hooks, training_test_hooks, EmbeddedWorker, HoldReleaseOutcome, JobWorker, LoopState,
+    StopOutcome, WorkerShared,
 };
 use jammi_ai::fine_tune::{FineTuneConfig, FineTuneMethod};
 use jammi_ai::jobs::{compute_test_hooks, ComputeSpec, JobResult, JobSpec};
 use jammi_ai::model::ModelTask;
 use jammi_ai::session::InferenceSession;
 use jammi_db::catalog::claim_test_hooks;
+use jammi_db::catalog::lease_keeper::HoldRelease;
 use jammi_db::catalog::status::JobStatus;
 use jammi_db::source::{FileFormat, SourceConnection, SourceType};
 use jammi_db::store::mutable::test_hook::{arm as arm_materialization, MaterializationPoint};
@@ -417,7 +418,15 @@ async fn release_and_stop_leaves_running_with_null_lease_and_no_new_bundle() {
         .expect("RELEASE is bounded by two heartbeats")
         .unwrap();
     assert_eq!(report.loop_state, LoopState::Aborted, "{report:?}");
-    assert_eq!(report.holds_released, 1, "{report:?}");
+    assert_eq!(
+        report.holds,
+        HoldReleaseOutcome::Observed(HoldRelease {
+            released: 1,
+            not_required: 0,
+            failed: 0,
+        }),
+        "{report:?}"
+    );
     let epoch_at_release = resume_epoch(&session, &handle.job_id)
         .await
         .expect("the bundle is still there");
@@ -728,7 +737,7 @@ async fn release_with_the_loop_paused_in_the_claim_to_hold_prologue_self_release
 /// R5(c): the prologue park is held PAST the heartbeat bound, so 2e's wait
 /// times out and RELEASE takes its abort arm — the ONLY path where the loop
 /// is aborted with `in_flight == 0`. The loop reports `Aborted`; no hold was
-/// ever registered (`holds_released 0`); the row the abort left is the
+/// ever registered (`holds == Observed(HoldRelease::default())`); the row the abort left is the
 /// honest one: the claim had COMMITTED before the park, so sweep #1 (2c,
 /// which precedes 2e) already handed its lease back — `running` under this
 /// instance, lease NULL, `releases 1`, `attempts 1` — and sweep #2 matched
@@ -758,7 +767,11 @@ async fn release_timeout_arm_leaves_the_honest_row_recovered_by_arm_1a() {
         "the cooperative wait runs to its heartbeat bound first"
     );
     assert_eq!(report.loop_state, LoopState::Aborted, "{report:?}");
-    assert_eq!(report.holds_released, 0, "{report:?}");
+    assert_eq!(
+        report.holds,
+        HoldReleaseOutcome::Observed(HoldRelease::default()),
+        "no hold was ever registered: {report:?}"
+    );
     assert_eq!(report.sweep_one.jobs, Some(1), "{report:?}");
     assert_eq!(report.sweep_two.jobs, Some(0), "{report:?}");
     let row = session.catalog().get_job(&handle.job_id).await.unwrap();
@@ -825,8 +838,13 @@ async fn run_now_under_release_and_stop_does_not_change_in_flight() {
     let report = worker.release_and_stop().await.unwrap();
     assert_eq!(report.loop_state, LoopState::Stopped, "{report:?}");
     assert_eq!(
-        report.holds_released, 0,
-        "the inline hold is never released"
+        report.holds,
+        HoldReleaseOutcome::Observed(HoldRelease {
+            released: 0,
+            not_required: 1,
+            failed: 0,
+        }),
+        "the inline hold is registered but never released: {report:?}"
     );
     assert_eq!(shared.in_flight(), 0);
     let after = session.catalog().get_job(&inline.job_id).await.unwrap();
@@ -867,20 +885,24 @@ async fn run_now_under_release_and_stop_does_not_change_in_flight() {
 /// exactly what a row-equality oracle got wrong).
 ///
 /// Worker-owning arm: `release_and_stop`'s own `ReleaseReport` shows 2b
-/// (the keeper's per-hold release) as the ACTUAL releaser -- `holds_released
-/// == 1` -- so by the time 2c's sweep (`sweep_two`, the final,
-/// unconditional one) runs, the row's lease is already NULL and the sweep
-/// itself matches zero ADDITIONAL rows: `sweep_two.jobs == Some(0)`. This
-/// is the same 2b-before-2c ordering `release_job_leases` uses.
+/// (the keeper's per-hold release) as the ACTUAL releaser -- `holds ==
+/// Observed(HoldRelease { released: 1, .. })` -- so by the time 2c's sweep
+/// (`sweep_two`, the final, unconditional one) runs, the row's lease is
+/// already NULL and the sweep itself matches zero ADDITIONAL rows:
+/// `sweep_two.jobs == Some(0)`. This is the same 2b-before-2c ordering
+/// `release_job_leases` uses.
 ///
-/// Worker-less arm: an inline `run_now` job's hold is never released by 2b
+/// Worker-less arm: an inline `run_now` job's hold IS registered (`run_now`
+/// holds every claim through the keeper) but never RELEASED by 2b
 /// (`release_job_lease`'s own SQL carries `execution = 'queued'`, which an
-/// inline row never satisfies) and never swept by 2c either (the jobs
-/// sweep's same `execution = 'queued'` guard, and the linked building sweep
-/// which only ranges over `queued` jobs) -- so `release_job_leases` on a
-/// worker-less session with only an inline job in flight is a COMPLETE
-/// no-op: `holds == 0`, `sweep == ReleaseSweep { jobs: Some(0), building:
-/// Some(0) }`, matching the doc's own "no-op by construction" claim.
+/// inline row never satisfies, so it counts `not_required`) and never swept
+/// by 2c either (the jobs sweep's same `execution = 'queued'` guard, and the
+/// linked building sweep which only ranges over `queued` jobs) -- so
+/// `release_job_leases` on a worker-less session with only an inline job in
+/// flight releases nothing: `holds == Observed(HoldRelease { released: 0,
+/// not_required: 1, failed: 0 })`, `sweep == ReleaseSweep { jobs: Some(0),
+/// building: Some(0) }`, matching the doc's own "no-op by construction"
+/// claim for the actual RELEASE effect (the row itself is untouched).
 /// A second row, claimed by a DIFFERENT instance with a live lease, is
 /// asserted completely untouched -- the call must never reach past its own
 /// instance's rows.
@@ -898,7 +920,12 @@ async fn release_and_stop_report_matches_release_job_leases_on_the_pair_that_act
         .expect("RELEASE is bounded by two heartbeats")
         .unwrap();
     assert_eq!(
-        report.holds_released, 1,
+        report.holds,
+        HoldReleaseOutcome::Observed(HoldRelease {
+            released: 1,
+            not_required: 0,
+            failed: 0,
+        }),
         "2b's per-hold release is the actual releaser: {report:?}"
     );
     assert_eq!(
@@ -949,7 +976,15 @@ async fn release_and_stop_report_matches_release_job_leases_on_the_pair_that_act
     );
 
     let (holds, sweep) = leases_session.release_job_leases().await.unwrap();
-    assert_eq!(holds, 0, "an inline hold is never released by 2b");
+    assert_eq!(
+        holds,
+        HoldReleaseOutcome::Observed(HoldRelease {
+            released: 0,
+            not_required: 1,
+            failed: 0,
+        }),
+        "an inline hold is registered but never released by 2b"
+    );
     assert_eq!(
         sweep.jobs,
         Some(0),

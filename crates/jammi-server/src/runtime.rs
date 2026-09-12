@@ -718,22 +718,29 @@ pub enum ShutdownOutcome {
         worker_joined: bool,
     },
     /// RELEASE completed and its evidence CONFIRMS every held lease was
-    /// handed back: the release call returned `Ok` and its authoritative
-    /// sweep's `jobs`/`building` fields both read `Some` (see
-    /// [`release_outcome`]). `main` exits the process at once (a detached
+    /// handed back — P-RELEASE: the release call returned `Ok`, its
+    /// per-hold pass (P-2B, see `release_outcome`'s doc) was observed with
+    /// no per-hold failure, its loop (if any) is certainly no longer able to
+    /// claim (P-2F), and its authoritative sweep's `jobs`/`building` fields
+    /// both read `Some`. `main` exits the process at once (a detached
     /// training thread may still be running).
     Released,
     /// RELEASE was attempted but its own evidence does NOT confirm every
-    /// held lease was handed back — the release call itself errored, or
-    /// one of its sweep statements did (`jammi_ai::fine_tune::worker::
+    /// held lease was handed back — ANY determinant of P-RELEASE was
+    /// unobserved or reported failure: the release call itself errored, its
+    /// per-hold pass could not be confirmed to run or found a hold it
+    /// attempted and failed to release, its loop's terminal state was
+    /// neither certainly resolved nor genuinely observed, or one of its
+    /// sweep statements failed (`jammi_ai::fine_tune::worker::
     /// ReleaseSweep::jobs`/`building` read `None`, a swallowed statement
     /// failure, never fabricated into a claim of success). The affected
     /// lease(s) fall to the expiry path instead of being handed back, so a
     /// successor reclaims them within one lease window rather than one
-    /// idle poll. `main` still exits the process at once, exactly like
-    /// [`Self::Released`] — R6: an `Err` here must never propagate through
-    /// the normal return path, which would hang on a detached trainer past
-    /// its grace period and turn a degraded release into a kill.
+    /// idle poll. `main` still exits the process at once (exit code 3,
+    /// distinct from [`Self::Released`]'s 0) — R6: an `Err` here must never
+    /// propagate through the normal return path, which would hang on a
+    /// detached trainer past its grace period and turn a degraded release
+    /// into a kill.
     ReleaseDegraded,
 }
 
@@ -757,32 +764,58 @@ enum ReleaseAttempt {
     /// on a transient race and still have the release land via #2.
     Worker(Result<jammi_ai::fine_tune::worker::ReleaseReport, jammi_db::error::JammiError>),
     /// `InferenceSession::release_job_leases`: the worker-less peer, one
-    /// sweep.
+    /// sweep, no loop (so P-2F is vacuously satisfied — there is no further
+    /// claim any loop could make).
     SessionOnly(
-        Result<(usize, jammi_ai::fine_tune::worker::ReleaseSweep), jammi_db::error::JammiError>,
+        Result<
+            (
+                jammi_ai::fine_tune::worker::HoldReleaseOutcome,
+                jammi_ai::fine_tune::worker::ReleaseSweep,
+            ),
+            jammi_db::error::JammiError,
+        >,
     ),
 }
 
 /// R6's ONE outcome-evidence helper: the preload-exit early return and the
 /// main RELEASE arm both call this rather than each constructing
 /// [`ShutdownOutcome::Released`] merely from "the RELEASE signal fired".
-/// Logs the call's own report (unchanged from the pre-existing per-arm
-/// logging) and returns [`ShutdownOutcome::Released`] only when the call
-/// succeeded AND [`sweep_confirms_release`] on its authoritative sweep;
-/// [`ShutdownOutcome::ReleaseDegraded`] otherwise. Never panics and never
-/// itself surfaces an `Err` — a degraded release is a value, not a
-/// propagated failure (see [`ShutdownOutcome::ReleaseDegraded`]'s doc).
+///
+/// Implements **P-RELEASE** (contract `CONTRACT-OPS-fix3.md`):
+/// [`ShutdownOutcome::Released`] iff EVERY determinant of "this RELEASE
+/// handed back every lease this instance held" was both observed and
+/// reports success — [`ShutdownOutcome::ReleaseDegraded`] whenever ANY
+/// determinant is unobserved or reports failure. The determinants:
+///
+/// * **P-2B** — the call itself succeeded (`Ok`) AND its keeper pass
+///   [`jammi_ai::fine_tune::worker::HoldReleaseOutcome::confirms_release`]
+///   (observed, no per-hold failure).
+/// * **P-2F** (`Worker` only) — [`jammi_ai::fine_tune::worker::ReleaseReport::stop_witnessed`]:
+///   no further claim by this loop can land. Vacuously true on
+///   `SessionOnly` (no loop exists).
+/// * **P-EXCLUSION** — only the FINAL sweep (`sweep_two` / the `SessionOnly`
+///   sweep) is a determinant; [`sweep_confirms_release`] is never called on
+///   `sweep_one`, whose `None` is legitimate on a transient race superseded
+///   by the idempotent final sweep.
+///
+/// Never panics and never itself surfaces an `Err` — a degraded release is
+/// a value, not a propagated failure (see [`ShutdownOutcome::ReleaseDegraded`]'s
+/// doc).
 fn release_outcome(attempt: ReleaseAttempt) -> ShutdownOutcome {
     match attempt {
         ReleaseAttempt::Worker(Ok(report)) => {
             tracing::info!(
                 ?report.loop_state,
-                holds_released = report.holds_released,
+                ?report.holds,
+                stop_witnessed = report.stop_witnessed,
                 ?report.sweep_one,
                 ?report.sweep_two,
                 "RELEASE: leases handed back; the loop is stopped"
             );
-            if sweep_confirms_release(&report.sweep_two) {
+            if report.holds.confirms_release()
+                && report.stop_witnessed
+                && sweep_confirms_release(&report.sweep_two)
+            {
                 ShutdownOutcome::Released
             } else {
                 ShutdownOutcome::ReleaseDegraded
@@ -794,11 +827,11 @@ fn release_outcome(attempt: ReleaseAttempt) -> ShutdownOutcome {
         }
         ReleaseAttempt::SessionOnly(Ok((holds, sweep))) => {
             tracing::info!(
-                holds_released = holds,
+                ?holds,
                 ?sweep,
                 "RELEASE on a worker-less process: nothing loop-claimed to release"
             );
-            if sweep_confirms_release(&sweep) {
+            if holds.confirms_release() && sweep_confirms_release(&sweep) {
                 ShutdownOutcome::Released
             } else {
                 ShutdownOutcome::ReleaseDegraded
@@ -1034,16 +1067,31 @@ impl BoundServer {
                 // skipped here entirely: dropping the sender starts its
                 // graceful shutdown but nothing established it finished
                 // before the session closed — the same divergence class as
-                // the outcome itself), then the session and OTLP.
+                // the outcome itself), then the session and OTLP. FOLDED,
+                // never discarded (the main tail's own `result.and(health_
+                // result).and(peer_result)`): no hang risk in folding here —
+                // this exit precedes the worker gate opening, so no job is
+                // claimed and no detached trainer exists to wait on.
                 let _ = health_stop_tx.send(());
-                let _ = health_task.await;
+                let health_result = match health_task.await {
+                    Ok(r) => r,
+                    Err(join_err) => {
+                        Err(ServerError::Io(std::io::Error::other(join_err.to_string())))
+                    }
+                };
                 let _ = peer_stop_tx.send(());
-                if let Some(task) = peer_task {
-                    let _ = task.await;
-                }
+                let peer_result = match peer_task {
+                    Some(task) => match task.await {
+                        Ok(r) => r,
+                        Err(join_err) => {
+                            Err(ServerError::Io(std::io::Error::other(join_err.to_string())))
+                        }
+                    },
+                    None => Ok(()),
+                };
                 session.close().await;
                 crate::telemetry::flush_otlp();
-                return early;
+                return early.and(health_result).and(peer_result).map(|()| outcome);
             }
         }
         readiness.set_warm();
@@ -2270,6 +2318,288 @@ mod audit_master_key_tests {
         assert!(
             msg.contains(path.to_str().unwrap()),
             "error must name the unreadable path, got: {msg}"
+        );
+    }
+}
+
+/// OPS round 3 (contract `CONTRACT-OPS-fix3.md`) — the non-negotiable test
+/// capacity over `release_outcome`'s predicate: round 2 shipped a predicate
+/// change (the parity-oracle deletion + evidence-based outcome) with ZERO
+/// observing oracle, and the round-3 audit proved it by mutation — forcing
+/// the predicate to `true` and reverting the paired change still left an
+/// 18-of-18 green suite. This module reaches the private `release_outcome`
+/// directly (an in-crate `#[cfg(test)]` table test — no server, no signals,
+/// no tokio runtime needed) and demonstrates it RED by construction: every
+/// test below fails if `release_outcome` is reverted to "success iff the
+/// call returned `Ok`", which is exactly the predicate the round-2 audit
+/// showed was unobservable.
+#[cfg(test)]
+mod release_outcome_tests {
+    use jammi_ai::fine_tune::worker::{HoldReleaseOutcome, LoopState, ReleaseReport, ReleaseSweep};
+    use jammi_db::catalog::lease_keeper::HoldRelease;
+    use jammi_db::error::JammiError;
+
+    use super::{release_outcome, ReleaseAttempt, ShutdownOutcome};
+
+    fn sweep(jobs: Option<usize>, building: Option<usize>) -> ReleaseSweep {
+        ReleaseSweep { jobs, building }
+    }
+
+    /// A sweep whose own evidence confirms it ran (both fields `Some`).
+    fn confirmed_sweep() -> ReleaseSweep {
+        sweep(Some(0), Some(0))
+    }
+
+    fn report(
+        loop_state: LoopState,
+        holds: HoldReleaseOutcome,
+        stop_witnessed: bool,
+        sweep_one: ReleaseSweep,
+        sweep_two: ReleaseSweep,
+    ) -> ReleaseReport {
+        ReleaseReport {
+            loop_state,
+            holds,
+            stop_witnessed,
+            sweep_one,
+            sweep_two,
+        }
+    }
+
+    // -------------------------------------------------------------------
+    // The four arms of `ReleaseAttempt` / `release_outcome`.
+    // -------------------------------------------------------------------
+
+    #[test]
+    fn worker_ok_fully_confirmed_is_released() {
+        let r = report(
+            LoopState::Stopped,
+            HoldReleaseOutcome::Observed(HoldRelease {
+                released: 1,
+                not_required: 0,
+                failed: 0,
+            }),
+            true,
+            confirmed_sweep(),
+            confirmed_sweep(),
+        );
+        assert_eq!(
+            release_outcome(ReleaseAttempt::Worker(Ok(r))),
+            ShutdownOutcome::Released
+        );
+    }
+
+    #[test]
+    fn worker_err_is_degraded() {
+        assert_eq!(
+            release_outcome(ReleaseAttempt::Worker(Err(JammiError::Catalog(
+                "lease keeper: cannot release job holds, its thread is dead".into()
+            )))),
+            ShutdownOutcome::ReleaseDegraded
+        );
+    }
+
+    #[test]
+    fn session_only_ok_fully_confirmed_is_released() {
+        let holds = HoldReleaseOutcome::Observed(HoldRelease::default());
+        assert_eq!(
+            release_outcome(ReleaseAttempt::SessionOnly(Ok((holds, confirmed_sweep())))),
+            ShutdownOutcome::Released
+        );
+    }
+
+    #[test]
+    fn session_only_err_is_degraded() {
+        assert_eq!(
+            release_outcome(ReleaseAttempt::SessionOnly(Err(JammiError::Catalog(
+                "boom".into()
+            )))),
+            ShutdownOutcome::ReleaseDegraded
+        );
+    }
+
+    // -------------------------------------------------------------------
+    // The newly folded determinants (P-2B, P-2F, P-EXCLUSION) — each of
+    // these fails against the round-2 predicate ("success iff `Ok`").
+    // -------------------------------------------------------------------
+
+    /// P-2B: a per-hold failure degrades the outcome even though the OUTER
+    /// call succeeded and both sweeps confirm — the collapse this round's
+    /// contract closes at the producer (`lease_keeper.rs`), pinned here at
+    /// the predicate that reads it.
+    #[test]
+    fn a_failed_hold_degrades_even_with_confirmed_sweeps() {
+        let r = report(
+            LoopState::Aborted,
+            HoldReleaseOutcome::Observed(HoldRelease {
+                released: 0,
+                not_required: 0,
+                failed: 1,
+            }),
+            true,
+            confirmed_sweep(),
+            confirmed_sweep(),
+        );
+        assert_eq!(
+            release_outcome(ReleaseAttempt::Worker(Ok(r))),
+            ShutdownOutcome::ReleaseDegraded
+        );
+    }
+
+    /// P-2B: the keeper's per-hold pass itself UNOBSERVED (a dead keeper or
+    /// a bound exceeded) is never treated as "zero holds released" —
+    /// degraded, never released, even though the outer call and both
+    /// sweeps are fine. This is the exact collapse a bare `usize` could not
+    /// represent.
+    #[test]
+    fn an_unobserved_hold_pass_degrades() {
+        let r = report(
+            LoopState::Stopped,
+            HoldReleaseOutcome::Unobserved,
+            true,
+            confirmed_sweep(),
+            confirmed_sweep(),
+        );
+        assert_eq!(
+            release_outcome(ReleaseAttempt::Worker(Ok(r))),
+            ShutdownOutcome::ReleaseDegraded
+        );
+    }
+
+    /// P-2F: an unwitnessed stop (2e found nothing to take AND 2f fell back
+    /// to the last-known proxy read) degrades even with a confirmed hold
+    /// pass and confirmed sweeps.
+    #[test]
+    fn an_unwitnessed_stop_degrades() {
+        let r = report(
+            LoopState::Running,
+            HoldReleaseOutcome::Observed(HoldRelease::default()),
+            false,
+            confirmed_sweep(),
+            confirmed_sweep(),
+        );
+        assert_eq!(
+            release_outcome(ReleaseAttempt::Worker(Ok(r))),
+            ShutdownOutcome::ReleaseDegraded
+        );
+    }
+
+    /// P-EXCLUSION: sweep #1 unconfirmed (`None`) must NEVER degrade the
+    /// outcome on its own — folding it in would manufacture a false
+    /// degraded on a transient race the idempotent sweep #2 already
+    /// superseded.
+    #[test]
+    fn an_unconfirmed_first_sweep_alone_never_degrades() {
+        let r = report(
+            LoopState::Stopped,
+            HoldReleaseOutcome::Observed(HoldRelease {
+                released: 1,
+                not_required: 0,
+                failed: 0,
+            }),
+            true,
+            sweep(None, None),
+            confirmed_sweep(),
+        );
+        assert_eq!(
+            release_outcome(ReleaseAttempt::Worker(Ok(r))),
+            ShutdownOutcome::Released
+        );
+    }
+
+    /// Sweep #2 unconfirmed still degrades — the pre-existing behaviour,
+    /// pinned so this round's changes cannot regress it.
+    #[test]
+    fn an_unconfirmed_second_sweep_degrades() {
+        let r = report(
+            LoopState::Stopped,
+            HoldReleaseOutcome::Observed(HoldRelease {
+                released: 1,
+                not_required: 0,
+                failed: 0,
+            }),
+            true,
+            confirmed_sweep(),
+            sweep(Some(0), None),
+        );
+        assert_eq!(
+            release_outcome(ReleaseAttempt::Worker(Ok(r))),
+            ShutdownOutcome::ReleaseDegraded
+        );
+    }
+
+    // -------------------------------------------------------------------
+    // False-positive pins: a normal cooperative release and a normal abort
+    // release must both still report `Released` — the contract's own
+    // stop-rule condition (a regression here that only a mutation test
+    // would catch is exactly what ends this unit's wave-1 participation).
+    // -------------------------------------------------------------------
+
+    /// A normal cooperative release: 2e joined the task after observing
+    /// its exit (`stop_witnessed = true`), `loop_state` `Stopped`, no
+    /// holds needed, both sweeps confirm.
+    #[test]
+    fn a_normal_cooperative_release_is_released() {
+        let r = report(
+            LoopState::Stopped,
+            HoldReleaseOutcome::Observed(HoldRelease::default()),
+            true,
+            confirmed_sweep(),
+            confirmed_sweep(),
+        );
+        assert_eq!(
+            release_outcome(ReleaseAttempt::Worker(Ok(r))),
+            ShutdownOutcome::Released
+        );
+    }
+
+    /// A normal abort release: 2e aborted the task directly
+    /// (`stop_witnessed = true` via 2e's own certain resolution), a held
+    /// lease released, both sweeps confirm — this is
+    /// `serve_shutdown_modes::sigint_while_draining_releases_and_returns_
+    /// released_within_two_heartbeats`'s (O1's) own scenario, pinned here
+    /// at the unit level so a predicate regression is caught without the
+    /// full server harness.
+    #[test]
+    fn a_normal_abort_release_is_released() {
+        let r = report(
+            LoopState::Aborted,
+            HoldReleaseOutcome::Observed(HoldRelease {
+                released: 1,
+                not_required: 0,
+                failed: 0,
+            }),
+            true,
+            confirmed_sweep(),
+            confirmed_sweep(),
+        );
+        assert_eq!(
+            release_outcome(ReleaseAttempt::Worker(Ok(r))),
+            ShutdownOutcome::Released
+        );
+    }
+
+    /// The falsifier the design round handed forward, demonstrated
+    /// directly: an abort whose in-task guard has not published within one
+    /// heartbeat (`loop_state` reads a stale `Running`, the fallback proxy
+    /// read) must NOT spuriously degrade a release that 2e itself already
+    /// resolved with certainty.
+    #[test]
+    fn stop_witnessed_via_2e_survives_a_stale_running_read() {
+        let r = report(
+            LoopState::Running,
+            HoldReleaseOutcome::Observed(HoldRelease {
+                released: 1,
+                not_required: 0,
+                failed: 0,
+            }),
+            true,
+            confirmed_sweep(),
+            confirmed_sweep(),
+        );
+        assert_eq!(
+            release_outcome(ReleaseAttempt::Worker(Ok(r))),
+            ShutdownOutcome::Released
         );
     }
 }

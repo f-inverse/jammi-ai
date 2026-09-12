@@ -1021,7 +1021,7 @@ async fn jumping_knowledge_concats_every_hop_normalizes_blocks_and_is_searchable
         .unwrap()
         .0;
     assert_eq!(
-        table.dimensions,
+        table.dimensions_raw(),
         Some((DIM * blocks) as i32),
         "JK output dim = (K+1)·d — one block per hop plus X⁰"
     );
@@ -1134,7 +1134,7 @@ async fn evaluable_through_r1_eval_embeddings() {
         .await
         .unwrap();
     assert_eq!(resolved.key_column.as_deref(), Some("_row_id"));
-    assert_eq!(resolved.dimensions, Some(DIM as i32));
+    assert_eq!(resolved.dimensions_raw(), Some(DIM as i32));
 
     // The eval runner's per-query loop runs `search_vectors` over the resolved
     // table — exercise exactly that read path (the R1 hook) without a live

@@ -142,7 +142,7 @@ async fn remote_round_trips_embeddings_and_search_like_local() {
 
     assert_eq!(remote_table.status, "ready");
     assert!(remote_table.row_count > 0, "patents corpus embeds rows");
-    assert!(remote_table.dimensions.is_some(), "dimensions recorded");
+    assert!(remote_table.dimensions().is_some(), "dimensions recorded");
     assert_eq!(remote_table.source_id, "patents");
     // The remote arm reconstructs `task` from the requested modality (the wire
     // omits it as server-internal bookkeeping); it must match the tower.

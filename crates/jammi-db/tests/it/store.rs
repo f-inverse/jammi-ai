@@ -90,7 +90,7 @@ async fn result_table_crud_lifecycle() {
 
     let record = catalog.get_result_table("t1").await.unwrap().unwrap();
     assert_eq!(record.status, "building");
-    assert_eq!(record.dimensions, Some(384));
+    assert_eq!(record.dimensions_raw(), Some(384));
     assert_eq!(record.row_count, 0);
 
     catalog
@@ -1041,7 +1041,8 @@ async fn result_table_none_dimensions_round_trips_as_null(backend: BackendKind) 
         .unwrap()
         .unwrap();
     assert_eq!(
-        record.dimensions, None,
+        record.dimensions_raw(),
+        None,
         "a dimensionless result table must round-trip NULL, not error binding a typed null"
     );
 }

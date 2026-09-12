@@ -75,10 +75,7 @@ impl QueryBuilder {
             .await?;
 
         let width = match &source {
-            QuerySource::Caller => table
-                .dimensions
-                .and_then(|d| usize::try_from(d).ok())
-                .filter(|d| *d > 0),
+            QuerySource::Caller => table.dimensions().map(std::num::NonZeroUsize::get),
             QuerySource::Stored { .. } => None,
         };
         let query_vec = validate_query(query_vec, width, source)?;

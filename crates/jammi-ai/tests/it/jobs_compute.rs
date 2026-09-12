@@ -144,7 +144,7 @@ async fn embedding_run_now_and_a_claimed_job_are_byte_identical() {
          regardless of which entry point ran it"
     );
     assert_eq!(record_a.row_count, record_b.row_count);
-    assert_eq!(record_a.dimensions, record_b.dimensions);
+    assert_eq!(record_a.dimensions_raw(), record_b.dimensions_raw());
 
     let vectors_a = session.read_vectors(&record_a).await.unwrap();
     let vectors_b = session.read_vectors(&record_b).await.unwrap();

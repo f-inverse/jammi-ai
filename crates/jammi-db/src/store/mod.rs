@@ -234,10 +234,7 @@ pub struct ResultStore {
 /// cross-check", never a pass-through of the query width itself — the scan
 /// width is enforced on the query regardless.
 fn catalog_width(table: &ResultTableRecord) -> Option<usize> {
-    table
-        .dimensions
-        .and_then(|d| usize::try_from(d).ok())
-        .filter(|d| *d > 0)
+    table.dimensions().map(std::num::NonZeroUsize::get)
 }
 
 /// Mint a fresh writer identity.
@@ -2111,15 +2108,12 @@ impl ResultStore {
                     Arc::clone(&self.segment_cache),
                     self.ann,
                     self.peer_local_load_bytes,
-                    // The one conversion point: a non-positive catalog
-                    // `dimensions` is a corrupt row, never a width to search
-                    // or estimate against, so it becomes `None` here — never
-                    // a `0` or negative value threaded into `PlacedIndex`,
-                    // which cannot represent one.
-                    table
-                        .dimensions
-                        .and_then(|d| usize::try_from(d).ok())
-                        .and_then(std::num::NonZeroUsize::new),
+                    // `ResultTableRecord::dimensions` is the one site the
+                    // "non-positive catalog dimensions is a corrupt row"
+                    // predicate is applied — never a `0` or negative value
+                    // threaded into `PlacedIndex`, which cannot represent
+                    // one.
+                    table.dimensions(),
                     Arc::clone(&self.peer_failures),
                 )
             }));
@@ -2164,14 +2158,11 @@ impl ResultStore {
             Arc::clone(&self.segment_cache),
             self.ann,
             self.peer_local_load_bytes,
-            // The one conversion point: a non-positive catalog `dimensions`
-            // is a corrupt row, never a width to search or estimate
-            // against, so it becomes `None` here — never a `0` or negative
-            // value threaded into `PlacedIndex`, which cannot represent one.
-            table
-                .dimensions
-                .and_then(|d| usize::try_from(d).ok())
-                .and_then(std::num::NonZeroUsize::new),
+            // `ResultTableRecord::dimensions` is the one site the
+            // "non-positive catalog dimensions is a corrupt row" predicate
+            // is applied — never a `0` or negative value threaded into
+            // `PlacedIndex`, which cannot represent one.
+            table.dimensions(),
             Arc::clone(&self.peer_failures),
         )?))
     }
@@ -2439,7 +2430,7 @@ impl ResultStore {
                 .register_table(ctx, &record.table_name, &url, owner)
                 .await;
         };
-        let Some(dimensions) = record.dimensions else {
+        let Some(dimensions) = record.dimensions() else {
             return Err(JammiError::Catalog(format!(
                 "result table '{}' is versioned (current_version = {version}) but carries no                  dimensions — a catalog invariant violation",
                 record.table_name
@@ -2456,7 +2447,7 @@ impl ResultStore {
                 let provider = Arc::new(PlaceholderProvider::new(
                     record.table_name.clone(),
                     version,
-                    crate::store::schema::embedding_table_schema(dimensions.max(0) as usize),
+                    crate::store::schema::embedding_table_schema(dimensions.get()),
                 ));
                 self.install_result_schema(ctx)?;
                 self.result_schema.add_result_table(
@@ -3041,10 +3032,15 @@ impl ResultStore {
         parquet_handle: &JammiObjectStore,
         table: &ResultTableRecord,
     ) -> std::result::Result<BTreeSet<String>, RebuildFailure> {
-        let dimensions = table.dimensions.unwrap_or(0) as usize;
-        if dimensions == 0 {
+        // `ResultTableRecord::dimensions` is the one site the "non-positive
+        // catalog dimensions is a corrupt row" predicate is applied: a
+        // `None` catalog value AND a defensively-rejected non-positive one
+        // both take this early return, never a raw `unwrap_or(0) as usize`
+        // that would sign-extend `-1` into `usize::MAX` and slip past its
+        // own zero-check.
+        let Some(dimensions) = table.dimensions().map(std::num::NonZeroUsize::get) else {
             return Ok(BTreeSet::new());
-        }
+        };
 
         // Replace any stale segment set from the interrupted attempt — a
         // deletion, so it runs under the claim the recoverer just took.

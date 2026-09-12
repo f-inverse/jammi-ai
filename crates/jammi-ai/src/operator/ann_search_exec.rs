@@ -162,10 +162,7 @@ impl ExecutionPlan for AnnSearchExec {
                     k,
                     // The catalog width is a CROSS-CHECK against the scan's own
                     // width inside; `None` means nothing to cross-check.
-                    table
-                        .dimensions
-                        .and_then(|d| usize::try_from(d).ok())
-                        .filter(|d| *d > 0),
+                    table.dimensions().map(std::num::NonZeroUsize::get),
                 )
                 .await
                 .map_err(|e| datafusion::error::DataFusionError::External(Box::new(e)))?,

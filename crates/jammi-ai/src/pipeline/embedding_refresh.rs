@@ -654,7 +654,7 @@ impl InferenceSession {
         }
         let table = record.table_name.clone();
         let parquet_url = StorageUrl::parse(&record.parquet_path)?;
-        if record.dimensions.is_none() {
+        if record.dimensions().is_none() {
             return Err(JammiError::NotRefreshable {
                 table,
                 reason: NotRefreshableReason::NotEmbeddingTable,
@@ -1104,7 +1104,18 @@ impl InferenceSession {
             parent_version,
             parent_identity: parent.identity.clone(),
         };
-        let definition_hash = DefinitionHash(record.definition_hash.clone().unwrap_or_default());
+        // Same typed refusal as the delta-refresh arm above (esc-057's
+        // identity chain is one chain with two producers): an absent
+        // `definition_hash` must never fold in as an empty string — that
+        // would silently accept a pre-contract row into a post-contract
+        // chain and hash "no definition" the same as any other producer
+        // that legitimately hashes to that value.
+        let definition_hash = DefinitionHash(record.definition_hash.clone().ok_or_else(|| {
+            JammiError::NotRefreshable {
+                table: record.table_name.clone(),
+                reason: NotRefreshableReason::MissingContentHash,
+            }
+        })?);
         let identity = VersionManifest::compute_identity(
             &parent.identity,
             &definition_hash,

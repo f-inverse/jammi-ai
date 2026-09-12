@@ -381,10 +381,7 @@ impl InferenceSession {
         // as wide as the catalog records when it does) before any search.
         let query = jammi_db::index::validate_query(
             query.to_vec(),
-            table
-                .dimensions
-                .and_then(|d| usize::try_from(d).ok())
-                .filter(|d| *d > 0),
+            table.dimensions().map(std::num::NonZeroUsize::get),
             jammi_db::index::QuerySource::Caller,
         )?;
         let neighbours = self

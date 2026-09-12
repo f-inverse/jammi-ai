@@ -422,11 +422,14 @@ impl InferenceSession {
             .catalog()
             .resolve_embedding_table(source_id, None)
             .await?;
-        let feature_dim = table.dimensions.ok_or_else(|| {
-            JammiError::FineTune(format!(
-                "source '{source_id}' embedding table carries no vector dimension"
-            ))
-        })? as usize;
+        let feature_dim = table
+            .dimensions()
+            .ok_or_else(|| {
+                JammiError::FineTune(format!(
+                    "source '{source_id}' embedding table carries no vector dimension"
+                ))
+            })?
+            .get();
 
         let mut tasks = self.distinct_tasks(source_id, &spec.task_column).await?;
         if tasks.len() < spec.min_task_count {
@@ -669,11 +672,14 @@ impl InferenceSession {
             .catalog()
             .resolve_embedding_table(source_id, None)
             .await?;
-        let feature_dim = table.dimensions.ok_or_else(|| {
-            JammiError::FineTune(format!(
-                "source '{source_id}' embedding table carries no vector dimension"
-            ))
-        })? as usize;
+        let feature_dim = table
+            .dimensions()
+            .ok_or_else(|| {
+                JammiError::FineTune(format!(
+                    "source '{source_id}' embedding table carries no vector dimension"
+                ))
+            })?
+            .get();
         let device = crate::model::backend::candle::select_device(self.device_config())?;
 
         let varmap = VarMap::new();
@@ -950,7 +956,7 @@ impl InferenceSession {
         let config_json = serde_json::json!({
             "architecture": format!("{:?}", spec.architecture),
             "context_k": spec.context_k,
-            "feature_dim": table.dimensions,
+            "feature_dim": table.dimensions().map(std::num::NonZeroUsize::get),
             "hidden_dim": spec.hidden_dim,
             "num_heads": spec.num_heads,
             "num_layers": spec.num_layers,
@@ -1287,11 +1293,14 @@ impl InferenceSession {
             .catalog()
             .resolve_embedding_table(source_id, None)
             .await?;
-        let serve_dim = table.dimensions.ok_or_else(|| {
-            JammiError::Inference(format!(
-                "serving source '{source_id}' embedding table carries no vector dimension"
-            ))
-        })? as usize;
+        let serve_dim = table
+            .dimensions()
+            .ok_or_else(|| {
+                JammiError::Inference(format!(
+                    "serving source '{source_id}' embedding table carries no vector dimension"
+                ))
+            })?
+            .get();
         if serve_dim != feature_dim {
             return Err(JammiError::Inference(format!(
                 "context predictor '{model_id}' was trained on feature_dim {feature_dim} but \

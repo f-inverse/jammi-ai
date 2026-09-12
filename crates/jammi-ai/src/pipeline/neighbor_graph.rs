@@ -343,10 +343,7 @@ impl<'a> NeighborGraphPipeline<'a> {
                 "vector",
                 &mut vectors,
             )?;
-            let width = table
-                .dimensions
-                .and_then(|d| usize::try_from(d).ok())
-                .filter(|d| *d > 0);
+            let width = table.dimensions().map(std::num::NonZeroUsize::get);
             for (i, vector) in vectors.into_iter().enumerate() {
                 let vector = validate_query(
                     vector,

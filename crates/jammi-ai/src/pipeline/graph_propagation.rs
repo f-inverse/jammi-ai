@@ -342,12 +342,15 @@ impl InferenceSession {
             .catalog()
             .resolve_embedding_table(&request.source_id, request.embedding_table.as_deref())
             .await?;
-        let dimensions = table.dimensions.ok_or_else(|| {
-            JammiError::Other(format!(
-                "propagate_embeddings: embedding table '{}' carries no dimensions",
-                table.table_name
-            ))
-        })? as usize;
+        let dimensions = table
+            .dimensions()
+            .ok_or_else(|| {
+                JammiError::Other(format!(
+                    "propagate_embeddings: embedding table '{}' carries no dimensions",
+                    table.table_name
+                ))
+            })?
+            .get();
 
         // Top-of-producer cache probe, before the expensive load+propagate. The
         // output width is knowable now (`Final` keeps one block, `JumpingKnowledge`

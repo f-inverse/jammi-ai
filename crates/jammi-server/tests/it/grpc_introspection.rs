@@ -90,7 +90,7 @@ fn descriptor_shape(d: &SourceDescriptor) -> DescriptorShape {
                 t.table_name.clone(),
                 t.status.clone(),
                 t.row_count,
-                t.dimensions,
+                t.dimensions_raw(),
                 t.task,
                 t.kind,
                 t.derived_from.clone(),
@@ -133,7 +133,7 @@ async fn remote_list_and_describe_sources_like_local() {
         .0;
     assert_eq!(table.status, "ready");
     assert!(table.row_count > 0, "patents corpus embeds rows");
-    assert!(table.dimensions.is_some(), "dimensions recorded");
+    assert!(table.dimensions().is_some(), "dimensions recorded");
 
     // A neighbor graph derived from that embedding table — a second result
     // table under the same source, of a DIFFERENT kind, with real provenance
@@ -194,7 +194,7 @@ async fn remote_list_and_describe_sources_like_local() {
         .expect("the model-output embedding table");
     assert_eq!(rt.status, "ready");
     assert_eq!(rt.row_count, table.row_count);
-    assert_eq!(rt.dimensions, table.dimensions);
+    assert_eq!(rt.dimensions_raw(), table.dimensions_raw());
     assert_eq!(rt.task, jammi_db::ModelTask::TextEmbedding);
     assert_eq!(rt.kind, ResultTableKind::Model);
     assert_eq!(rt.derived_from, None);

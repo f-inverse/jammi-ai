@@ -163,7 +163,7 @@ async fn text_embeddings_via_open_clip_share_latent_dim_with_vision() {
         .0;
     assert_eq!(record.status, "ready");
     assert_eq!(
-        record.dimensions,
+        record.dimensions_raw(),
         Some(16),
         "text-embedding result table must carry the shared embed_dim"
     );
@@ -557,7 +557,7 @@ mod live {
 
         assert_eq!(record.status, "ready");
         assert_eq!(record.row_count, 2);
-        assert_eq!(record.dimensions, Some(512));
+        assert_eq!(record.dimensions_raw(), Some(512));
     }
 
     // ── Real CLAP (laion/clap-htsat-fused) audio embedding ──────────────────

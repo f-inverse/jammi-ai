@@ -154,7 +154,18 @@ pub struct ResultTableRecord {
     pub kind: ResultTableKind,
     pub derived_from: Option<String>,
     pub parquet_path: String,
-    pub dimensions: Option<i32>,
+    /// The catalog row's raw, unvalidated embedding width. PRIVATE: a
+    /// non-positive value here is a corrupt row, never a width to search,
+    /// estimate, or validate against, and every read used to re-derive that
+    /// filter at the call site (`.and_then(|d| usize::try_from(d).ok())
+    /// .filter(|d| *d > 0)`, copy-pasted at six sites) while six more read
+    /// the field raw — one of them (`unwrap_or(0) as usize`) let a
+    /// negative width sign-extend into `usize::MAX`, silently passing its
+    /// own zero-check. [`Self::dimensions`] is now the ONE site the
+    /// positivity predicate is applied; [`Self::dimensions_raw`] is the
+    /// escape hatch for the writer/serialization sites that must round-trip
+    /// the signed column verbatim.
+    dimensions: Option<i32>,
     pub distance_metric: String,
     pub row_count: usize,
     pub status: String,
@@ -216,6 +227,83 @@ pub struct ResultTableRecord {
     /// never reused, never decremented (a failed version keeps its number;
     /// expiry deletes rows and artifacts and never touches this).
     pub next_version: i64,
+}
+
+impl ResultTableRecord {
+    /// The catalog row's recorded embedding width, applying "a non-positive
+    /// `dimensions` is a corrupt row, never a width to search, estimate, or
+    /// validate against" exactly once. `None` covers a pre-column row, a
+    /// non-embedding table, AND a corrupt non-positive value — every caller
+    /// treats the three identically ("nothing to cross-check / no known
+    /// width"), which is the correct behaviour every guarded call site used
+    /// to hand-derive with `.and_then(|d| usize::try_from(d).ok())
+    /// .filter(|d| *d > 0)`.
+    pub fn dimensions(&self) -> Option<std::num::NonZeroUsize> {
+        self.dimensions
+            .and_then(|d| usize::try_from(d).ok())
+            .and_then(std::num::NonZeroUsize::new)
+    }
+
+    /// The raw signed catalog value, exactly as stored — never filtered.
+    /// For the writer (re-persisting a row's value verbatim) and
+    /// serialization sites that must round-trip the column's on-disk
+    /// representation bit-for-bit. Every OTHER caller wants
+    /// [`Self::dimensions`], the one site the positivity predicate is
+    /// applied.
+    pub fn dimensions_raw(&self) -> Option<i32> {
+        self.dimensions
+    }
+
+    /// Reconstruct a bare record from the fields a `GenerateEmbeddings` /
+    /// `DescribeSource` wire response carries — the sole authorized
+    /// cross-crate constructor: `dimensions`'s privacy otherwise closes off
+    /// building a record field-by-field from outside this module. Every
+    /// field the wire message does not carry (storage/index paths,
+    /// timestamps, tenant, lease, version bookkeeping) is left at its "not
+    /// carried" value, matching `jammi-wire`'s reconstruction exactly.
+    /// `dimensions_raw` is the wire `int32` verbatim; `0` collapses to
+    /// `None` here as it always has (never filtered on sign — that is
+    /// [`Self::dimensions`]'s job on every later read).
+    #[allow(clippy::too_many_arguments)]
+    pub fn from_wire_projection(
+        table_name: String,
+        source_id: String,
+        model_id: String,
+        task: ModelTask,
+        kind: ResultTableKind,
+        derived_from: Option<String>,
+        dimensions_raw: i32,
+        row_count: usize,
+        status: String,
+        key_column: Option<String>,
+    ) -> Self {
+        Self {
+            table_name,
+            source_id,
+            model_id,
+            task,
+            kind,
+            derived_from,
+            parquet_path: String::new(),
+            dimensions: (dimensions_raw != 0).then_some(dimensions_raw),
+            distance_metric: String::new(),
+            row_count,
+            status,
+            key_column,
+            text_columns: None,
+            created_at: String::new(),
+            completed_at: None,
+            tenant_id: None,
+            definition_hash: None,
+            input_anchors_json: None,
+            storage_precision: None,
+            oversample: None,
+            writer_id: None,
+            lease_expires_at: None,
+            current_version: None,
+            next_version: 0,
+        }
+    }
 }
 
 fn parse_row(row: &Row<'_>) -> std::result::Result<ResultTableRecord, BackendError> {

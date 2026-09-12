@@ -917,7 +917,7 @@ async fn ladder_retries_then_loads_locally_or_refuses_unavailable() {
 
     // `dimensions = None` on the record skips rung 3 → Unavailable.
     let (table_nodims, record_nodims) = two_segment_table(&store2, "src_nodims", None).await;
-    assert_eq!(record_nodims.dimensions(), None);
+    assert_eq!(record_nodims.dimensions, None);
     placement.set(
         &record_nodims.table_name,
         1,

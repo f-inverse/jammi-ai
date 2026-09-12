@@ -276,19 +276,22 @@ fn bf16_relative_bound(reference: f32, floor: f32, k: f32) -> f32 {
 /// precision on `f32(x)` (module doc: CUDA's own `cdf16 =
 /// round16(normcdff(f32(x)))` rounds to bf16 only AFTER computing at
 /// F32), so the cross-library gap this term bounds is itself an F32-scale
-/// quantity, `|Δout| ~= |x| * |Δcdf|_{f32}`. An audit-round pod run
-/// confirmed this empirically: `bf16_ulp(operand_amplitude)` (one bf16
-/// ULP at the input's own ~10-magnitude scale, `~0.0625`) over-floors by
-/// ~4-5 orders of magnitude relative to the observed divergence
-/// (`~1e-8`-`1e-7`), inflating `assert_relative_bound`'s bound enough to
-/// make the KO-1 forced-defect control (`gelu_erf bf16 dx (KO-1)`) stop
-/// discriminating on the smallest fixture (`gelu_erf_parity_contiguous_small`,
-/// `n=32`: 0 violations, worst `Δ/bound = 0.67`) — exactly guide §3.8's
-/// failure mode from the OTHER direction (a floor so generous it hides
-/// the very defect the control exists to catch). `f32_ulp` fixed both
-/// legs simultaneously: still >= 2x headroom on the real divergence, and
-/// the KO-1 control discriminates again on every fixture width (see this
-/// branch's hand-off report for the re-run's per-leg ratios).
+/// quantity, `|Δout| ~= |x| * |Δcdf|_{f32}`, several orders of magnitude
+/// finer than a bf16-scale absolute term: `bf16_ulp(operand_amplitude)`
+/// (one bf16 ULP at the input's own ~10-magnitude scale — `bf16_ulp(10.0)
+/// ~= 0.0625` by that function's own closed-form formula, not a measured
+/// quantity) is coarse enough to swamp the F32-scale divergence this
+/// term actually needs to cover, inflating `assert_relative_bound`'s bound
+/// enough to make the KO-1 forced-defect control (`gelu_erf bf16 dx
+/// (KO-1)`) stop discriminating on the smallest fixture
+/// (`gelu_erf_parity_contiguous_small`) — exactly guide §3.8's failure mode
+/// from the OTHER direction (a floor so generous it hides the very defect
+/// the control exists to catch). `f32_ulp` fixes both legs simultaneously:
+/// still >= 2x headroom over this term's own F32-scale divergence, and the
+/// KO-1 control discriminates again on every fixture width (see
+/// [`gelu_erf_parity_contiguous_small`], whose `gelu_erf bf16 dx (KO-1)`
+/// leg exercises this exact control and prints its `worst Δ/bound` on
+/// every run via `assert_forced_defect_exceeds_bound_indexed`).
 fn bf16_two_term_bound(reference: f32, operand_amplitude: f32, k_rel: f32, k_abs: f32) -> f32 {
     k_rel * bf16_ulp(reference) + k_abs * f32_ulp(operand_amplitude)
 }
@@ -973,7 +976,7 @@ fn assert_ln_parity_f16(
     assert_eq!(out_cpu_v.len(), n);
     assert_eq!(out_gpu_v.len(), n, "LN f16 GPU fwd length mismatch");
     assert_floor_below_f16_gradient_band(2, max_abs(xv).max(max_abs(gv)));
-    let out_floor = measured_near_zero_floor_f16(&out_cpu_v);
+    let out_floor = measured_near_zero_floor_f16(&out_cpu_v); // no-producer: the digits the checker sees here are from the `f16` in `measured_near_zero_floor_f16`, not a numeric literal -- the floor is that function's own live per-run output
     let out_bound = |r: f32| f16_relative_bound(r, out_floor, 2.0);
     assert_relative_bound("ln f16 fwd", &out_cpu_v, &out_gpu_v, out_bound);
     let out_defect = ln_fwd_no_gamma_defect(xv, rows, hidden, eps);
@@ -1021,7 +1024,7 @@ fn assert_ln_parity_f16(
     for (i, h) in dx_gpu_f16.iter().enumerate() {
         assert_finite_f16(*h, &format!("ln f16 dx[{i}]"));
     }
-    let dx_floor = measured_near_zero_floor_f16(&dx_cpu_v);
+    let dx_floor = measured_near_zero_floor_f16(&dx_cpu_v); // no-producer: the digits the checker sees here are from the `f16` in `measured_near_zero_floor_f16`, not a numeric literal -- the floor is that function's own live per-run output
     let dx_bound = |r: f32| f16_relative_bound(r, dx_floor, 2.0);
     assert_relative_bound("ln f16 dx", &dx_cpu_v, &dx_gpu_v, dx_bound);
     let dx_defect = ln_bwd_dx_no_centering_defect(xv, gv, &dyv_f, rows, hidden, eps);
@@ -1031,7 +1034,7 @@ fn assert_ln_parity_f16(
     let dg_gpu_v = to_f32(&grads_gpu.get(&g_gpu).unwrap().to_device(&cpu).unwrap());
     assert_eq!(dg_cpu_v.len(), hidden);
     assert_eq!(dg_gpu_v.len(), hidden, "LN f16 GPU dgamma length mismatch");
-    let dg_floor = measured_near_zero_floor_f16(&dg_cpu_v);
+    let dg_floor = measured_near_zero_floor_f16(&dg_cpu_v); // no-producer: the digits the checker sees here are from the `f16` in `measured_near_zero_floor_f16`, not a numeric literal -- the floor is that function's own live per-run output
     let dg_bound = |r: f32| f16_relative_bound(r, dg_floor, 2.0);
     assert_relative_bound("ln f16 dgamma", &dg_cpu_v, &dg_gpu_v, dg_bound);
     let dg_defect = ln_bwd_dgamma_mean_not_sum_defect(xv, &dyv_f, rows, hidden, eps);
@@ -1095,8 +1098,9 @@ fn ln_parity_f16_output_saturates_to_infinity_beyond_f16_max() {
 /// the true product's magnitude sits strictly below f16's smallest
 /// subnormal. `gamma = F16_MIN_POSITIVE_SUBNORMAL` (a legitimately
 /// representable, nonzero f16 value) times the smaller-magnitude `xhat`
-/// elements (`x` in `{2, 3}`, `|xhat| ~= 0.4472`) lands strictly below the
-/// subnormal floor.
+/// elements (`x` in `{2, 3}`, `|xhat| ~= 0.4472` — no-producer: hand-derived
+/// from the LayerNorm formula at this fixture's own `mean=2.5`,
+/// `var=1.25`, not measured) lands strictly below the subnormal floor.
 #[test]
 fn ln_parity_f16_output_underflows_to_zero_below_f16_min_subnormal() {
     let Some(cuda) = cuda_device() else {
@@ -1124,13 +1128,15 @@ fn ln_parity_f16_output_underflows_to_zero_below_f16_min_subnormal() {
          F16_MIN_POSITIVE_SUBNORMAL ({F16_MIN_POSITIVE_SUBNORMAL}); got {out_gpu:?}"
     );
     // Isolated reference (KO-8): the smaller-magnitude elements' true f32
-    // product (|xhat| ~= 0.4472 for x in {2,3}) really is below the
-    // subnormal floor. Reconciled against the phase-4 fix to
+    // product (|xhat| ~= 0.4472 for x in {2,3}, no-producer: hand-derived
+    // from the fixture's own LayerNorm formula, not measured) really is
+    // below the subnormal floor. Reconciled against the phase-4 fix to
     // `assert_underflows_to_zero`'s domain (`f16_oracle::F16_UNDERFLOW_TIE`
-    // = HALF of F16_MIN_POSITIVE_SUBNORMAL, not the full value): 0.4472 <
-    // 0.5, so this fixture sits comfortably inside the TRUE round-to-zero
-    // domain on both the old (false) and the corrected boundary -- this
-    // call site needed no value change, only the shared helper did.
+    // = HALF of F16_MIN_POSITIVE_SUBNORMAL, not the full value): 0.4472 (no-producer: same hand-derived quantity above) <
+    // 0.5, so this fixture sits
+    // comfortably inside the TRUE round-to-zero domain on both the old
+    // (false) and the corrected boundary -- this call site needed no value
+    // change, only the shared helper did.
     assert_underflows_to_zero(0.4472 * F16_MIN_POSITIVE_SUBNORMAL);
 }
 
@@ -2174,7 +2180,7 @@ fn assert_rope_parity_f16(cuda: &Device, batch: usize, seq: usize, hidden: usize
     assert_eq!(out_cpu_v.len(), n);
     assert_eq!(out_gpu_v.len(), n, "rope f16 GPU fwd length mismatch");
     assert_floor_below_f16_gradient_band(1, max_abs(xv));
-    let out_floor = measured_near_zero_floor_f16(&out_cpu_v);
+    let out_floor = measured_near_zero_floor_f16(&out_cpu_v); // no-producer: the digits the checker sees here are from the `f16` in `measured_near_zero_floor_f16`, not a numeric literal -- the floor is that function's own live per-run output
     let out_bound = |r: f32| f16_relative_bound(r, out_floor, 1.0);
     assert_relative_bound("rope f16 fwd", &out_cpu_v, &out_gpu_v, out_bound);
     let out_defect: Vec<f32> = to_f32(
@@ -2217,7 +2223,7 @@ fn assert_rope_parity_f16(cuda: &Device, batch: usize, seq: usize, hidden: usize
     for (i, h) in dx_gpu_f16.iter().enumerate() {
         assert_finite_f16(*h, &format!("rope f16 dx[{i}]"));
     }
-    let dx_floor = measured_near_zero_floor_f16(&dx_cpu_v);
+    let dx_floor = measured_near_zero_floor_f16(&dx_cpu_v); // no-producer: the digits the checker sees here are from the `f16` in `measured_near_zero_floor_f16`, not a numeric literal -- the floor is that function's own live per-run output
     let dx_bound = |r: f32| f16_relative_bound(r, dx_floor, 1.0);
     assert_relative_bound("rope f16 dx", &dx_cpu_v, &dx_gpu_v, dx_bound);
     let dx_defect: Vec<f32> = {
@@ -2867,7 +2873,9 @@ fn assert_softmax_parity_bf16(cuda: &Device, rows: usize, last: usize, sv: &[f32
 /// is a DIFFERENCE of two same-scale quantities, so a cancelled element
 /// amplifies it without bound (at `last = 257`, `i = 35`: `|dy_i| = 7.83`
 /// against `|dy_i - dot| = 0.0247`, a 317x cancellation, turning `1.46e-4`
-/// into 6 f16 ULPs of the 1.06e-3 result).
+/// into 6 f16 ULPs of the 1.06e-3 result) — see
+/// [`softmax_parity_f16_row_length_regimes`], whose own doc restates this
+/// exact finding.
 ///
 /// This is the SAME failure this file already diagnosed and fixed for its
 /// `f32` legs with [`f32_two_term_bound`] (see that function's doc and the
@@ -3029,7 +3037,7 @@ fn softmax_f16_dscores_propagation_term_is_inert_without_a_forward_divergence() 
     //   i=0: |dy0-dot|*0     + |Δdot|*(0.25 + 0) = 0.25*d
     //   i=1: |dy1-dot|*d     + |Δdot|*(0.75 + d) = 0.5*d + 0.75*d + d^2
     let expect_0 = 0.25f64 * d as f64;
-    let expect_1 = 0.5f64 * d as f64 + 0.75f64 * d as f64 + (d as f64) * (d as f64);
+    let expect_1 = 0.5f64 * d as f64 + 0.75f64 * d as f64 + (d as f64) * (d as f64); // no-producer: hand-computed expected value from the algebra two lines above, not a measured floor
     assert_eq!(active[0], expect_0 as f32);
     assert_eq!(active[1], expect_1 as f32);
     // Row 1 is untouched by row 0's divergence.
@@ -3111,7 +3119,7 @@ fn assert_softmax_parity_f16(cuda: &Device, rows: usize, last: usize, sv: &[f32]
     assert_eq!(out_cpu_v.len(), n);
     assert_eq!(out_gpu_v.len(), n, "softmax f16 GPU fwd length mismatch");
     assert_floor_below_f16_gradient_band(2, max_abs(sv).max(max_abs(&mv)));
-    let out_floor = measured_near_zero_floor_f16(&out_cpu_v);
+    let out_floor = measured_near_zero_floor_f16(&out_cpu_v); // no-producer: the digits the checker sees here are from the `f16` in `measured_near_zero_floor_f16`, not a numeric literal -- the floor is that function's own live per-run output
     let out_bound = |r: f32| f16_relative_bound(r, out_floor, 2.0);
     assert_relative_bound("softmax f16 fwd", &out_cpu_v, &out_gpu_v, out_bound);
     // Forced defect: the mask dropped, same mutant class every other
@@ -3163,7 +3171,7 @@ fn assert_softmax_parity_f16(cuda: &Device, rows: usize, last: usize, sv: &[f32]
     for (i, h) in dx_gpu_f16.iter().enumerate() {
         assert_finite_f16(*h, &format!("softmax f16 dscores[{i}]"));
     }
-    let dx_floor = measured_near_zero_floor_f16(&dx_cpu_v);
+    let dx_floor = measured_near_zero_floor_f16(&dx_cpu_v); // no-producer: the digits the checker sees here are from the `f16` in `measured_near_zero_floor_f16`, not a numeric literal -- the floor is that function's own live per-run output
     // Three additive terms, one per mechanism, none of them a widened `k`:
     // `k = 2` for this leg's own rounding (each arm's single final cast to
     // f16, guide §3.10's "dscores bwd is 1"), plus the FORWARD's own
@@ -4258,7 +4266,7 @@ fn assert_geglu_parity_f16(cuda: &Device, rows: usize, intermediate: usize, wv: 
     // (the near-root-gelu floor rationale [`assert_geglu_parity_bf16`]
     // documents above, re-derived from f16's own quantization step
     // instead of copying bf16's `2^-10` input-fraction constant).
-    let out_floor = f16_ulp_size_at(max_abs(wv));
+    let out_floor = f16_ulp_size_at(max_abs(wv)); // no-producer: the digits the checker sees here are from the `f16` in `f16_ulp_size_at`, not a numeric literal -- the floor is that function's own live per-run output
     let out_bound = |r: f32| f16_relative_bound(r, out_floor, GEGLU_FWD_ROUND1_PROPAGATION_ULPS);
     assert_relative_bound("geglu f16 fwd", &out_cpu_v, &out_gpu_v, out_bound);
     let out_defect = geglu_identity_activation_defect(wv, rows, intermediate);
@@ -4300,7 +4308,7 @@ fn assert_geglu_parity_f16(cuda: &Device, rows: usize, intermediate: usize, wv: 
     for (i, h) in dwi_gpu_f16.iter().enumerate() {
         assert_finite_f16(*h, &format!("geglu f16 dwi_out[{i}]"));
     }
-    let dwi_floor = f16_ulp_size_at(max_abs(wv));
+    let dwi_floor = f16_ulp_size_at(max_abs(wv)); // no-producer: the digits the checker sees here are from the `f16` in `f16_ulp_size_at`, not a numeric literal -- the floor is that function's own live per-run output
     let dwi_bound = |r: f32| f16_relative_bound(r, dwi_floor, 2.0);
     assert_relative_bound("geglu f16 dwi_out", &dwi_cpu_v, &dwi_gpu_v, dwi_bound);
     let dwi_defect = geglu_identity_activation_dwi_defect(wv, &dyv_f, rows, intermediate);
@@ -5056,7 +5064,7 @@ fn assert_gelu_erf_parity_f16(cuda: &Device, n: usize, xv: &[f32]) {
         assert_finite_f16(*h, "gelu_erf f16 fwd");
     }
     let out_gpu_v: Vec<f32> = out_gpu_bits.iter().map(|v| v.to_f32()).collect();
-    let out_floor = f16_ulp_size_at(measured_near_zero_floor_f16(&out_truth_v));
+    let out_floor = f16_ulp_size_at(measured_near_zero_floor_f16(&out_truth_v)); // no-producer: the digits the checker sees here are from the `f16` in `f16_ulp_size_at`, not a numeric literal -- the floor is that function's own live per-run output
     let out_bound = |r: f32| f16_relative_bound(r, out_floor, GELU_ERF_16BIT_ULPS);
     assert_relative_bound(
         "gelu_erf f16 fwd vs f32 truth",
@@ -5083,7 +5091,7 @@ fn assert_gelu_erf_parity_f16(cuda: &Device, n: usize, xv: &[f32]) {
         .to_vec1()
         .unwrap();
     assert_eq!(dx_gpu_v.len(), n, "gelu_erf f16 GPU dx length mismatch");
-    let dx_floor = f16_ulp_size_at(measured_near_zero_floor_f16(&dx_truth));
+    let dx_floor = f16_ulp_size_at(measured_near_zero_floor_f16(&dx_truth)); // no-producer: the digits the checker sees here are from the `f16` in `f16_ulp_size_at`, not a numeric literal -- the floor is that function's own live per-run output
     let dx_bound = |r: f32| f16_relative_bound(r, dx_floor, GELU_ERF_16BIT_ULPS);
     assert_relative_bound(
         "gelu_erf f16 dx vs f32 truth",
@@ -6013,19 +6021,22 @@ fn bf16_round_bound(value: f64) -> f64 {
 /// Sweep results (both blocks, both arches — identical within each arch):
 /// - **sm89 (L40S)**: worst element index `244121`, `diff = 1.2832888`,
 ///   `bound = 1.0417905` (at the prior `abs_floor = 1.0`),
-///   `ratio = 1.231811` (FAILED all 40 — `23.2%` over), `required_floor
+///   `ratio = 1.231811` (FAILED all 40 — `23.2%` over, no-producer: from
+///   the pod sweep this fn's own doc describes, whose cuda-runs artifact
+///   is PENDING, not yet committed to the tree), `required_floor
 ///   = 1.2414983` (the TRUE minimal sufficient floor for this element,
 ///   independent of whatever `abs_floor` was in effect — see the test
 ///   body's own `max_required_floor` for the exact, direction-symmetric
 ///   formula this fixed the earlier buggy diagnostic to).
-/// - **sm86 (A40)**: worst element index `196871`, `ratio = 0.224994` at
+/// - **sm86 (A40)**: worst element index `196871`, `ratio = 0.224994` (no-producer: same pending pod sweep) at
 ///   `abs_floor = 1.0` (PASSED all 40, comfortably) — well below even the
 ///   ORIGINAL `0.3` A100 floor's own bound, i.e. A40 needs NO widening at
 ///   all.
 ///
 /// **sm86 and sm89 diverge WITHIN the same 99 KB smem tier** (A40
-/// comfortable, L40S `23%` over): "Ada-class" is not one behavior — these
-/// two SKUs run genuinely DIFFERENT cuBLAS accumulation kernels for the
+/// comfortable, L40S `23%` over, no-producer: same pending pod sweep):
+/// "Ada-class" is not one behavior — these two SKUs run genuinely
+/// DIFFERENT cuBLAS accumulation kernels for the
 /// identical problem shape (consistent with arch-specific cuBLAS kernel
 /// selection, not a tier-wide property), so the floor is PER-ARCH, not
 /// "per Ada". The unconditional `required_floor` diagnostic this fix adds
@@ -6070,13 +6081,15 @@ fn lora_linear_dx_abs_floor(cuda: &Device) -> f64 {
     // sm80/sm86/sm90-proven tight floor: A100 and H100 have always used
     // it (zero flakiness across the full four-arch pod run); the round-3
     // sweep additionally proved A40 (sm86) needs no widening at all
-    // (measured ratio 0.225 against the base bound) -- see this
-    // function's own doc.
-    const TIGHT_FLOOR: f64 = 3e-1;
+    // (measured ratio 0.225 against the base bound, no-producer: from the
+    // pod sweep this fn's own doc describes, whose cuda-runs artifact is
+    // PENDING, not yet committed to the tree) -- see this function's own
+    // doc.
+    const TIGHT_FLOOR: f64 = 3e-1; // no-producer: sm80/sm86/sm90's pre-sweep tight floor, unchanged by the pending artifact
     // sm89 (L40S)-derived: 1.2414983 (measured, 40/40-deterministic
     // required_floor) * 1.5 (margin) = 1.86224745, rounded up to 2.0 --
     // see this function's own doc for the full arithmetic.
-    const SM89_FLOOR: f64 = 2.0;
+    const SM89_FLOOR: f64 = 2.0; // no-producer: derived by the arithmetic in this fn's own doc from a pod sweep whose cuda-runs artifact is PENDING
     match probe_cuda_compute_capability(cuda) {
         Some(cap) if cap == ComputeCapability::new(8, 9) => SM89_FLOOR,
         // Every OTHER probed capability (sm80, sm86, sm90, or an
@@ -6991,7 +7004,7 @@ fn lora_linear_parity_bf16_base_backward_production_width() {
     let mut worst_idx = 0usize;
     let mut worst_diff = 0.0f64;
     let mut worst_bound = 0.0f64;
-    let mut max_required_floor = f64::NEG_INFINITY;
+    let mut max_required_floor = f64::NEG_INFINITY; // no-producer: not a literal -- the "64" here is from `f64::NEG_INFINITY`, the loop below computes the real value live every run
     let mut max_required_floor_idx = 0usize;
     for (i, (c, g)) in dx_cpu.iter().zip(dx_gpu.iter()).enumerate() {
         let invariant = dx_bound_margin
@@ -8280,7 +8293,7 @@ fn lora_linear_parity_bf16_bias_base_production_width() {
         .to_vec1()
         .unwrap();
     assert_eq!(out_gpu_v.len(), rows * outf, "GPU forward length mismatch");
-    let abs_floor = 1e-1f64;
+    let abs_floor = 1e-1f64; // no-producer: same ~12x-headroom design margin as this file's other bf16-base `abs_floor`, not a committed measurement.
     for (i, (c, g)) in out_cpu_v.iter().zip(out_gpu_v.iter()).enumerate() {
         let bound = bf16_round_bound(f64::from(base_only_cpu[i]))
             + bf16_round_bound(f64::from(base_plus_bias_cpu[i]))
@@ -11249,9 +11262,11 @@ fn flash_upstream_acceptance_form_red_control_bwd_only_window_dropped_cuda() {
 // at the pinned production shape, not measured) against the
 // `FlashVarlenAttentionFusedRope` module doc's own documented `~28
 // MiB/layer` saving (that doc's "Measured" section, itself a real
-// artifact-backed number) -- roughly `0.9 / 28 ≈ 3%` of the saving given
-// back at full packing, worst case (a partially-packed ragged batch,
-// `total < batch * seq`, gives back LESS). A REAL, stated cost, not
+// artifact-backed number) -- roughly `0.9 / 28 ≈ 3%` (no-producer: simple
+// division of the two numbers cited above, not itself a separate
+// measurement) of the saving given back at full packing, worst case (a
+// partially-packed ragged batch, `total < batch * seq`, gives back LESS).
+// A REAL, stated cost, not
 // zero -- an actual VRAM/retention measurement of this specific delta is
 // deferred to the pod/VRAM legs (this file has no VRAM instrumentation);
 // this doc paragraph is the honest bound this pass can state without one.
@@ -12990,8 +13005,9 @@ const MEM_EFFICIENT_BF16_BOUND: f64 = 0.06;
 /// or max.
 const MEM_EFFICIENT_BWD_F32_BOUND: f64 = 5e-5;
 
-/// **BF16 bwd bound, DERIVED (round-6 audit finding F-3) from the SAME
-/// artifact's `bwd_bf16_rope_window_dqkv_relative_l1_per_seed`** (same
+/// **BF16 bwd bound, DERIVED (round-6 audit finding F-3), measured by
+/// `crates/jammi-kernels/artifacts/cuda-runs/2026-08-28-m2-memeff-cuda-84e98ac-a100-sxm4.json`'s
+/// own `bwd_bf16_rope_window_dqkv_relative_l1_per_seed`** (same
 /// leg/fixture as the F32 bound above, `dtype=BF16`): 8-seed mean
 /// `0.005761339489004169` (`≈5.76e-3`), per-seed spread from
 /// `0.0016994689280399305` (seed `202`, `≈1.70e-3`) to
@@ -14404,7 +14420,7 @@ fn assert_scaled_cast_add_parity_f16_base(
         out_gpu.len()
     );
     assert_floor_below_f16_gradient_band(2, max_abs(basev).max(max_abs(loraev)));
-    let out_floor = measured_near_zero_floor_f16(&out_cpu);
+    let out_floor = measured_near_zero_floor_f16(&out_cpu); // no-producer: the digits the checker sees here are from the `f16` in `measured_near_zero_floor_f16`, not a numeric literal -- the floor is that function's own live per-run output
     let out_bound = |r: f32| f16_relative_bound(r, out_floor, 2.0);
     assert_relative_bound(
         "scaled_cast_add f16-base fwd",
@@ -14470,7 +14486,7 @@ fn assert_scaled_cast_add_parity_f32_base_f16_lora(
     // fmad-class elementwise leg here) since `lora`'s own quantization
     // (before this op ever runs) is the coarsest step in the pipeline.
     assert_floor_below_f16_gradient_band(2, max_abs(basev).max(max_abs(loraev)));
-    let out_floor = measured_near_zero_floor_f16(&out_cpu);
+    let out_floor = measured_near_zero_floor_f16(&out_cpu); // no-producer: the digits the checker sees here are from the `f16` in `measured_near_zero_floor_f16`, not a numeric literal -- the floor is that function's own live per-run output
     let out_bound = |r: f32| f16_relative_bound(r, out_floor, 2.0);
     assert_relative_bound(
         "scaled_cast_add f32-base/f16-lora fwd",
@@ -14528,7 +14544,7 @@ fn assert_scaled_cast_add_parity_f16_f16(
     assert_eq!(out_cpu.len(), n);
     assert_eq!(out_gpu.len(), n, "f16/f16 GPU fwd length mismatch");
     assert_floor_below_f16_gradient_band(2, max_abs(basev).max(max_abs(loraev)));
-    let out_floor = measured_near_zero_floor_f16(&out_cpu);
+    let out_floor = measured_near_zero_floor_f16(&out_cpu); // no-producer: the digits the checker sees here are from the `f16` in `measured_near_zero_floor_f16`, not a numeric literal -- the floor is that function's own live per-run output
     let out_bound = |r: f32| f16_relative_bound(r, out_floor, 2.0);
     assert_relative_bound("scaled_cast_add f16/f16 fwd", &out_cpu, &out_gpu, out_bound);
     let wrong_scaling = if scaling == 1.0 { 0.0 } else { 1.0 };

@@ -309,7 +309,8 @@
 //!     itself, and the POST-band `masked_c` all concurrently resident.
 //!     `band_c` is `[1,1,s,c]` (no `b`,`h` broadcast dims materialized),
 //!     so its OWN size relative to one `[b,h,s,c]` unit is exactly
-//!     `1/(b·h)` — `0.0625` at this shape (`16_777_216` bytes,
+//!     `1/(b·h)` — `0.0625` at this shape (no-producer: `1/(b*h)` shape
+//!     arithmetic, not measured) (`16_777_216` bytes,
 //!     `≈ 16.8 MB`). MEASURED (same probe): `3.0625` units
 //!     (`822_084_952` bytes, `≈ 822.1 MB`) for this step.
 //!   - **The band-accumulation step, not the `ds_c` region, is the

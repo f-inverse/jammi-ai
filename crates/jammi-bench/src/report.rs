@@ -1918,9 +1918,10 @@ pub struct EpochHeldOut {
 /// CONTRACT H4/Frame: `d_i` (the C16/H2 paired sign test's per-seed datum)
 /// is the FINAL-epoch `evaluate_held_out().mean` — [`Self::held_out_example_mean`],
 /// paired with [`Self::final_epoch`]. [`Self::final_loss_diagnostic`] is
-/// `TrainingResult::final_loss` (`best_val_loss`, a MIN-over-epochs order
-/// statistic, `trainer.rs:1038/1048`) — recorded for comparison ONLY, never
-/// the quantity a downstream merger should read as `d_i`.
+/// `TrainingResult::final_loss` (`jammi_ai::fine_tune::trainer`'s own
+/// `best_val_loss`, a MIN-over-epochs order statistic) — recorded for
+/// comparison ONLY, never the quantity a downstream merger should read as
+/// `d_i`.
 ///
 /// ## Identity vs provenance (E3's disjoint convention, followed here)
 ///
@@ -2578,7 +2579,7 @@ pub struct FinetuneRunTier {
     // mutant-dose-ladder merge mode reads these three keys BY THESE EXACT
     // NAMES to attribute a dose column's legs to a specific, auditable
     // mutant patch.
-    /// `--mutant-id`: the mutant's own label (e.g. `"eps-0.10"`).
+    /// `--mutant-id`: the mutant's own label (e.g. `"eps-0.10"` — no-producer: an illustrative example label, not a measurement).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub mutant_id: Option<String>,
     /// `--mutant-base-sha`: the git commit sha this mutant's patch was cut

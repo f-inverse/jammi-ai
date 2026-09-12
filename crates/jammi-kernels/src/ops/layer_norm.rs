@@ -1841,7 +1841,7 @@ mod tests {
         for (i, (o, e)) in out.iter().zip(expected.iter()).enumerate() {
             let xhat_g = (((xf[i] - mean) * invvar) as f32).abs();
             let beta_abs = bh[i].to_f32().abs();
-            let bound = (xhat_g + beta_abs) * 2.5e-3 + 1.25e-3;
+            let bound = (xhat_g + beta_abs) * 2.5e-3 + 1.25e-3; // no-producer: derived from bf16's own 2e-2/1e-2 coefficients scaled by the analytic F16/BF16 ULP ratio (1/8) -- see this fn's own doc comment for the arithmetic, not measured
             assert!(
                 o.to_f32().is_finite() && (o.to_f32() - e).abs() < bound,
                 "{o} vs {e} (bound {bound})"

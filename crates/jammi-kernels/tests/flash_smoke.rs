@@ -1523,17 +1523,14 @@ fn abi_sizes_match_between_rust_and_c() {
     let bwd = unsafe { raw::jammi_flash_sizeof_bwd_args() };
     assert_eq!(fwd, std::mem::size_of::<raw::FwdArgs>());
     assert_eq!(bwd, std::mem::size_of::<raw::BwdArgs>());
-    // Campaign #443 D2 appended one `int32_t dtype` field to BOTH structs
+    // Both structs end with a trailing `int32_t dtype` field
     // (`raw::FwdArgs`/`raw::BwdArgs`'s own doc: "MUST be the LAST field").
-    // Pre-D2 these pins were 112/184 (both structs' own field sum with no
-    // `dtype` at all, 8-byte-aligned throughout since every struct starts
-    // with pointers/i64 fields) — a stale literal left over from THAT
-    // widening (never updated to match the new field) is exactly the bug
-    // this test caught on a real pod run: the trailing `dtype: i32` adds 4
-    // bytes of data, and the struct's own 8-byte alignment (driven by its
-    // leading pointer/`i64` fields) then pads that up to the next multiple
-    // of 8 — `112 + 4 -> 116 -> 120` for `FwdArgs`, `184 + 4 -> 188 -> 192`
-    // for `BwdArgs`. These two literals are a REDUNDANT pin on top of the
+    // Adding a field that changes a struct's total byte count without
+    // updating its size pin below is exactly the class of stale-literal
+    // bug the two hardcoded sizes exist to catch: every field before
+    // `dtype` is a pointer/`i64`, so the struct is 8-byte-aligned
+    // throughout, and `dtype`'s own 4 bytes get padded up to the next
+    // multiple of 8. These two literals are a REDUNDANT pin on top of the
     // two `assert_eq!` calls above (which already prove Rust and C agree
     // with EACH OTHER); they exist so a future field reordering or size
     // change that moves BOTH sides identically (e.g. an accidental extra

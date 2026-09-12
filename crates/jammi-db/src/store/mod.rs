@@ -58,6 +58,7 @@ use crate::index::peer::{AllLocal, NoPeers, PeerFailureCounters, PeerTransport, 
 use crate::index::placed::{PlacedIndex, SegmentSource};
 use crate::index::segment::{SegmentId, SegmentedIndex};
 use crate::index::sidecar::SidecarIndex;
+use crate::index::ValidatedQuery;
 use crate::index::VectorIndex;
 use crate::model_task::ModelTask;
 use crate::storage::index_cache::SegmentIndexCache;
@@ -226,32 +227,17 @@ pub struct ResultStore {
     keeper: Option<Arc<crate::catalog::lease_keeper::LeaseKeeper>>,
 }
 
-/// The width guard for the NO-INDEX exact fallback — the one search path with
-/// no [`SidecarIndex`] behind it, so the authoritative
-/// [`crate::index::segment::verify_query_width`] cannot reach it. Here the
-/// only width on record is the catalog's `dimensions` column.
-///
-/// `dimensions` is `Option<i32>`, and `None` is a live state (a row written
-/// before the column existed, or a non-embedding table). `None` is therefore
-/// an EXPLICIT PASS-THROUGH: there is nothing to check the query against, and
-/// refusing would break tables that work today. The scan below is safe either
-/// way — `cosine_distance` now refuses a length mismatch outright rather than
-/// reading past a vector — so this check buys a TYPED, table-named error
-/// instead of a panic, not memory safety.
-fn verify_query_width_against_catalog(table: &ResultTableRecord, query: &[f32]) -> Result<()> {
-    let Some(dimensions) = table.dimensions else {
-        return Ok(());
-    };
-    let expected = usize::try_from(dimensions).unwrap_or(0);
-    if expected != 0 && query.len() != expected {
-        return Err(JammiError::Schema {
-            table: table.table_name.clone(),
-            column: "query".into(),
-            expected: format!("{expected} dimensions"),
-            actual: format!("{} dimensions", query.len()),
-        });
-    }
-    Ok(())
+/// The catalog row's recorded width, as the cross-check
+/// [`crate::index::exact::exact_vector_search`] runs against the scan's own
+/// `FixedSizeList` width. `dimensions` is `Option<i32>` catalog metadata;
+/// `None` (a pre-column row, or a non-embedding table) means "nothing to
+/// cross-check", never a pass-through of the query width itself — the scan
+/// width is enforced on the query regardless.
+fn catalog_width(table: &ResultTableRecord) -> Option<usize> {
+    table
+        .dimensions
+        .and_then(|d| usize::try_from(d).ok())
+        .filter(|d| *d > 0)
 }
 
 /// Mint a fresh writer identity.
@@ -2026,7 +2012,7 @@ impl ResultStore {
         &self,
         ctx: &SessionContext,
         table: &ResultTableRecord,
-        query: &[f32],
+        query: &ValidatedQuery,
         k: usize,
     ) -> Result<Vec<(String, f32)>> {
         match self.resolve_search_mode(table).await? {
@@ -2035,8 +2021,14 @@ impl ResultStore {
                 index.search_final_placed(query, k, oversample).await
             }
             None => {
-                verify_query_width_against_catalog(table, query)?;
-                crate::index::exact::exact_vector_search(ctx, &table.table_name, query, k).await
+                crate::index::exact::exact_vector_search(
+                    ctx,
+                    &table.table_name,
+                    query,
+                    k,
+                    catalog_width(table),
+                )
+                .await
             }
         }
     }
@@ -2051,7 +2043,7 @@ impl ResultStore {
         &self,
         ctx: &SessionContext,
         table: &ResultTableRecord,
-        query: &[f32],
+        query: &ValidatedQuery,
         k: usize,
     ) -> Result<Vec<(String, f32)>> {
         match self.resolve_search_mode_local(table).await? {
@@ -2060,8 +2052,14 @@ impl ResultStore {
                 index.search_final(query, k, oversample)
             }
             None => {
-                verify_query_width_against_catalog(table, query)?;
-                crate::index::exact::exact_vector_search(ctx, &table.table_name, query, k).await
+                crate::index::exact::exact_vector_search(
+                    ctx,
+                    &table.table_name,
+                    query,
+                    k,
+                    catalog_width(table),
+                )
+                .await
             }
         }
     }
@@ -2113,7 +2111,15 @@ impl ResultStore {
                     Arc::clone(&self.segment_cache),
                     self.ann,
                     self.peer_local_load_bytes,
-                    table.dimensions,
+                    // The one conversion point: a non-positive catalog
+                    // `dimensions` is a corrupt row, never a width to search
+                    // or estimate against, so it becomes `None` here — never
+                    // a `0` or negative value threaded into `PlacedIndex`,
+                    // which cannot represent one.
+                    table
+                        .dimensions
+                        .and_then(|d| usize::try_from(d).ok())
+                        .and_then(std::num::NonZeroUsize::new),
                     Arc::clone(&self.peer_failures),
                 )
             }));
@@ -2158,7 +2164,14 @@ impl ResultStore {
             Arc::clone(&self.segment_cache),
             self.ann,
             self.peer_local_load_bytes,
-            table.dimensions,
+            // The one conversion point: a non-positive catalog `dimensions`
+            // is a corrupt row, never a width to search or estimate
+            // against, so it becomes `None` here — never a `0` or negative
+            // value threaded into `PlacedIndex`, which cannot represent one.
+            table
+                .dimensions
+                .and_then(|d| usize::try_from(d).ok())
+                .and_then(std::num::NonZeroUsize::new),
             Arc::clone(&self.peer_failures),
         )?))
     }

@@ -45,6 +45,7 @@ use arrow::datatypes::{DataType, Field, Schema, SchemaRef};
 
 use jammi_db::catalog::result_repo::{ResultTableKind, ResultTableRecord};
 use jammi_db::error::{JammiError, Result};
+use jammi_db::index::{distance_is_admissible, validate_query, QuerySource, ValidatedQuery};
 use jammi_db::store::{CacheOutcome, CachePolicy, ResultStore};
 
 use crate::session::InferenceSession;
@@ -102,11 +103,15 @@ impl Default for BuildNeighborGraph {
 pub struct Node {
     /// The node's `_row_id` (the stringified `key_column` value).
     pub row_id: String,
-    /// The node's embedding vector.
-    pub vector: Vec<f32>,
+    /// The node's embedding vector, validated at read time as a STORED
+    /// vector (finite; the table's width when recorded) — a non-finite
+    /// component is a corrupt artifact named by the table, refused before a
+    /// single edge is computed.
+    pub vector: ValidatedQuery,
 }
 
 /// A directed, weighted edge before it is filtered and serialized.
+#[derive(Debug)]
 struct Edge {
     src: String,
     dst: String,
@@ -165,16 +170,24 @@ struct Exact {
 
 impl NeighborGraphStrategy for Exact {
     fn neighbours(&self, node: &Node, k: usize) -> Result<Vec<(String, f32)>> {
+        // Every node comes from the SAME scan and the same file schema's
+        // `FixedSizeList` width today, so this never fires in practice — but
+        // `cosine_distance` itself only `assert!`s on a width mismatch, and
+        // an assert is not a guard a caller can rely on if that invariant
+        // ever loosens (a schema migration, a heterogeneous node set built
+        // by a future caller). Enforced here, typed, rather than left to the
+        // kernel's panic.
         let mut scored: Vec<(String, f32)> = self
             .nodes
             .iter()
             .map(|other| {
-                (
+                node.vector.require_width(other.vector.len())?;
+                Ok::<_, JammiError>((
                     other.row_id.clone(),
                     jammi_numerics::distance::cosine_distance(&node.vector, &other.vector),
-                )
+                ))
             })
-            .collect();
+            .collect::<Result<Vec<(String, f32)>>>()?;
         // Stable, total order: distance ascending, then row_id ascending to
         // break ties — this is what makes the exact driver reproducible.
         scored.sort_by(|a, b| {
@@ -330,7 +343,18 @@ impl<'a> NeighborGraphPipeline<'a> {
                 "vector",
                 &mut vectors,
             )?;
+            let width = table
+                .dimensions
+                .and_then(|d| usize::try_from(d).ok())
+                .filter(|d| *d > 0);
             for (i, vector) in vectors.into_iter().enumerate() {
+                let vector = validate_query(
+                    vector,
+                    width,
+                    QuerySource::Stored {
+                        table: table.table_name.clone(),
+                    },
+                )?;
                 nodes.push(Node {
                     row_id: row_ids[i].clone(),
                     vector,
@@ -349,37 +373,7 @@ impl<'a> NeighborGraphPipeline<'a> {
         params: &BuildNeighborGraph,
     ) -> Result<Vec<Edge>> {
         let strategy = self.resolve_strategy(table, nodes, params).await?;
-
-        let mut edges: Vec<Edge> = Vec::new();
-        for node in nodes {
-            // `self_exclude = false` keeps the self-edge: the driver already
-            // dropped the self-hit, so ask for one extra and prepend the
-            // self-reference at rank 0 → distance 0 → similarity 1.0.
-            let want = if params.self_exclude {
-                params.k
-            } else {
-                params.k.saturating_sub(1)
-            };
-            let mut neighbours = strategy.neighbours(node, want)?;
-            if !params.self_exclude {
-                neighbours.insert(0, (node.row_id.clone(), 0.0));
-            }
-
-            for (rank0, (dst, distance)) in neighbours.into_iter().enumerate() {
-                let similarity = 1.0 - distance;
-                if let Some(floor) = params.min_similarity {
-                    if similarity < floor {
-                        continue;
-                    }
-                }
-                edges.push(Edge {
-                    src: node.row_id.clone(),
-                    dst,
-                    rank: (rank0 as i32) + 1,
-                    similarity,
-                });
-            }
-        }
+        let mut edges = emit_edges(&table.table_name, nodes, strategy.as_ref(), params)?;
 
         if params.mutual {
             edges = keep_mutual(edges);
@@ -553,6 +547,65 @@ fn read_row_id_column(batch: &arrow::array::RecordBatch, table: &str) -> Result<
 /// length for the catalog and the storage path.
 const NEIGHBOR_GRAPH_MODEL_ID: &str = "neighbor_graph";
 
+/// Run `strategy` over every node and emit the raw edge list — the SINK at
+/// which every distance a driver produced is admitted
+/// ([`distance_is_admissible`]) before it becomes a persisted `similarity`.
+///
+/// Both drivers feed this: the index-assisted one through the segment
+/// kernels (already admitted there) and the exact one through
+/// `cosine_distance` over stored vectors. A non-finite distance here is a
+/// corrupt vector in the table, refused as a typed, table-named error — never
+/// written as an edge. Without this the `min_similarity` filter fails OPEN
+/// for `NaN` (`NaN < floor` is false) and a poisoned edge lands in the table.
+fn emit_edges(
+    table_name: &str,
+    nodes: &[Node],
+    strategy: &dyn NeighborGraphStrategy,
+    params: &BuildNeighborGraph,
+) -> Result<Vec<Edge>> {
+    let mut edges: Vec<Edge> = Vec::new();
+    for node in nodes {
+        // `self_exclude = false` keeps the self-edge: the driver already
+        // dropped the self-hit, so ask for one extra and prepend the
+        // self-reference at rank 0 → distance 0 → similarity 1.0.
+        let want = if params.self_exclude {
+            params.k
+        } else {
+            params.k.saturating_sub(1)
+        };
+        let mut neighbours = strategy.neighbours(node, want)?;
+        if !params.self_exclude {
+            neighbours.insert(0, (node.row_id.clone(), 0.0));
+        }
+
+        for (rank0, (dst, distance)) in neighbours.into_iter().enumerate() {
+            if !distance_is_admissible(distance) {
+                return Err(JammiError::IncompatibleFormat {
+                    artifact: format!("{table_name}.vector"),
+                    found: format!(
+                        "edge {} -> {dst} has a non-finite distance ({distance:?})",
+                        node.row_id
+                    ),
+                    supported: "finite f32 components".into(),
+                });
+            }
+            let similarity = 1.0 - distance;
+            if let Some(floor) = params.min_similarity {
+                if similarity < floor {
+                    continue;
+                }
+            }
+            edges.push(Edge {
+                src: node.row_id.clone(),
+                dst,
+                rank: (rank0 as i32) + 1,
+                similarity,
+            });
+        }
+    }
+    Ok(edges)
+}
+
 /// Shallow-copy the nodes into an owned vec the exact driver can hold behind an
 /// `Arc` for the duration of the build.
 fn clone_nodes(nodes: &[Node]) -> Vec<Node> {
@@ -602,4 +655,65 @@ fn edges_to_batch(edges: Vec<Edge>, schema: SchemaRef) -> Result<RecordBatch> {
         ],
     )
     .map_err(|e| JammiError::Other(format!("Edge RecordBatch build: {e}")))
+}
+
+#[cfg(test)]
+mod emit_edges_tests {
+    use super::*;
+
+    /// A driver that answers a fixed neighbour list — the seam through which
+    /// a non-finite distance would reach the persisted `similarity` column.
+    struct Fixed(Vec<(String, f32)>);
+
+    impl NeighborGraphStrategy for Fixed {
+        fn neighbours(&self, _node: &Node, _k: usize) -> Result<Vec<(String, f32)>> {
+            Ok(self.0.clone())
+        }
+        fn is_exact(&self) -> bool {
+            true
+        }
+    }
+
+    fn node(id: &str) -> Node {
+        Node {
+            row_id: id.into(),
+            vector: validate_query(vec![1.0, 0.0], None, QuerySource::Caller).unwrap(),
+        }
+    }
+
+    /// B-e — the `min_similarity` filter fails OPEN for `NaN` (`NaN < floor`
+    /// is false), so without the sink a poisoned edge is WRITTEN. The sink
+    /// admits every distance at the emission boundary: a non-finite one is a
+    /// typed, table-named corrupt-vector error and no edge at all is emitted.
+    #[test]
+    fn a_non_finite_distance_never_becomes_an_edge() {
+        let params = BuildNeighborGraph {
+            k: 2,
+            min_similarity: Some(0.5),
+            ..Default::default()
+        };
+        for poison in [f32::NAN, -f32::NAN, f32::INFINITY, f32::NEG_INFINITY] {
+            let driver = Fixed(vec![("b".into(), 0.1), ("c".into(), poison)]);
+            let err = emit_edges("docs_embeddings", &[node("a")], &driver, &params)
+                .expect_err("a non-finite distance must not become an edge");
+            match &err {
+                JammiError::IncompatibleFormat {
+                    artifact, found, ..
+                } => {
+                    assert!(artifact.contains("docs_embeddings"), "{artifact}");
+                    assert!(found.contains("a -> c"), "{found}");
+                }
+                other => panic!("{poison:?}: expected the corrupt-artifact variant, got {other:?}"),
+            }
+        }
+        // The honest list still emits, with the floor applied.
+        let driver = Fixed(vec![("b".into(), 0.1), ("c".into(), 0.9)]);
+        let edges = emit_edges("docs_embeddings", &[node("a")], &driver, &params).unwrap();
+        assert_eq!(
+            edges.len(),
+            1,
+            "0.9 distance → 0.1 similarity is below the 0.5 floor"
+        );
+        assert_eq!(edges[0].dst, "b");
+    }
 }

@@ -1,3 +1,4 @@
+use jammi_test_utils::vq;
 use std::sync::Arc;
 
 use arrow::array::{ArrayRef, FixedSizeListArray, Float32Array, RecordBatch, StringArray};
@@ -27,7 +28,7 @@ fn sidecar_add_search_and_edge_cases() {
 
     assert_eq!(index.len(), 3);
 
-    let results = index.search(&[1.0, 0.0, 0.0], 2).unwrap();
+    let results = index.search(&vq(&[1.0, 0.0, 0.0]), 2).unwrap();
     assert_eq!(results.len(), 2);
     assert_eq!(results[0].0, "row_a", "Nearest should be row_a");
     assert!(
@@ -36,12 +37,12 @@ fn sidecar_add_search_and_edge_cases() {
     );
 
     // Edge: k > count returns all
-    let results = index.search(&[1.0, 0.0, 0.0], 100).unwrap();
+    let results = index.search(&vq(&[1.0, 0.0, 0.0]), 100).unwrap();
     assert_eq!(results.len(), 3);
 
     // Edge: empty index
     let empty = SidecarIndex::new(3, &AnnIndexConfig::default(), StoragePrecision::F32).unwrap();
-    assert!(empty.search(&[1.0, 0.0, 0.0], 5).unwrap().is_empty());
+    assert!(empty.search(&vq(&[1.0, 0.0, 0.0]), 5).unwrap().is_empty());
     assert!(empty.is_empty());
 }
 
@@ -119,7 +120,7 @@ fn sidecar_save_load_roundtrip() {
     )
     .unwrap();
     assert_eq!(loaded.len(), 3);
-    let results = loaded.search(&[1.0, 0.0, 0.0], 1).unwrap();
+    let results = loaded.search(&vq(&[1.0, 0.0, 0.0]), 1).unwrap();
     assert_eq!(results[0].0, "id_1");
 }
 
@@ -226,7 +227,7 @@ async fn exact_search_resolves_row_ids_under_default_schema() {
 
     // Query points along the "near" direction; expect "near" ranked first and
     // every row id resolved (not lost to a failed downcast).
-    let results = exact_vector_search(&ctx, table_name, &[1.0, 0.0, 0.0, 0.0], 4)
+    let results = exact_vector_search(&ctx, table_name, &vq(&[1.0, 0.0, 0.0, 0.0]), 4, None)
         .await
         .expect("exact search must resolve _row_id under default schema");
 
@@ -239,5 +240,162 @@ async fn exact_search_resolves_row_ids_under_default_schema() {
             resolved.contains(id.as_str()),
             "row id '{id}' must be resolved from the Utf8View column"
         );
+    }
+}
+
+// ─── The exact path: the query is validated against the SCAN width; a
+// corrupt stored row is refused at the top-k SINK ───────────────────────────
+
+/// Write a 4-wide embedding parquet with the given rows and register it into
+/// a fresh context under `jammi.{name}` — the no-index exact fallback's
+/// input, hand-built so a row can carry a non-finite component.
+async fn exact_table(
+    dir: &std::path::Path,
+    name: &str,
+    rows: &[(&str, [f32; 4])],
+) -> SessionContext {
+    let dim = 4_i32;
+    let schema = embedding_table_schema(dim as usize);
+    let n = rows.len();
+    let flat: Vec<f32> = rows.iter().flat_map(|(_, v)| v.iter().copied()).collect();
+    let item = Arc::new(Field::new("item", DataType::Float32, false));
+    let vector_col =
+        FixedSizeListArray::try_new(item, dim, Arc::new(Float32Array::from(flat)), None).unwrap();
+    let ids: Vec<String> = rows.iter().map(|(id, _)| id.to_string()).collect();
+    let batch = RecordBatch::try_new(
+        Arc::clone(&schema),
+        vec![
+            Arc::new(StringArray::from(ids)) as ArrayRef,
+            Arc::new(StringArray::from(vec!["src"; n])),
+            Arc::new(StringArray::from(vec!["model"; n])),
+            Arc::new(vector_col),
+        ],
+    )
+    .unwrap();
+    let url = StorageUrl::parse(dir.join(format!("{name}.parquet")).to_str().unwrap()).unwrap();
+    let registry = StorageRegistry::new();
+    let handle = JammiObjectStore::new(registry.driver_for(&url, None).unwrap(), url.clone());
+    let mut writer = ObjectParquetWriter::open(&handle, Arc::clone(&schema))
+        .await
+        .unwrap();
+    writer.write_batch(&batch).await.unwrap();
+    writer.close().await.unwrap();
+    let ctx = SessionContext::new();
+    ctx.register_parquet(
+        TableReference::bare(format!("jammi.{name}")),
+        url.as_str(),
+        ParquetReadOptions::default(),
+    )
+    .await
+    .unwrap();
+    ctx
+}
+
+const FOUR_ROWS: [(&str, [f32; 4]); 4] = [
+    ("far", [0.0, 1.0, 0.0, 0.0]),
+    ("near", [1.0, 0.0, 0.0, 0.0]),
+    ("mid", [0.7, 0.7, 0.0, 0.0]),
+    ("opp", [-1.0, 0.0, 0.0, 0.0]),
+];
+
+// A1 — a wrong-width query on the NO-INDEX exact path is a typed `Schema`
+// error, never a panic. The width comes from the scan schema's
+// `FixedSizeList` length (the authority on this path), so it holds even with
+// no catalog width in hand (`None`).
+#[tokio::test]
+async fn exact_search_refuses_a_wrong_width_query_typed_not_panic() {
+    let dir = tempdir().unwrap();
+    let ctx = exact_table(dir.path(), "exact_width", &FOUR_ROWS).await;
+    for width in [5usize, 3, 0] {
+        let q = vq(&vec![1.0f32; width]);
+        let err = exact_vector_search(&ctx, "exact_width", &q, 4, None)
+            .await
+            .expect_err("a wrong-width query must be refused, not panic");
+        assert!(
+            matches!(err, jammi_db::error::JammiError::Schema { .. }),
+            "width {width}: {err:?}"
+        );
+        assert!(err.to_string().contains("4"), "{err}");
+    }
+    // The catalog width is a CROSS-CHECK against the scan: a disagreement is
+    // its own typed, table-named error.
+    let err = exact_vector_search(&ctx, "exact_width", &vq(&[1.0, 0.0, 0.0, 0.0]), 4, Some(5))
+        .await
+        .expect_err("catalog width 5 disagrees with the scan's 4");
+    assert!(
+        matches!(&err, jammi_db::error::JammiError::IncompatibleFormat { artifact, .. } if artifact.contains("exact_width")),
+        "{err:?}"
+    );
+    // The conforming query still serves.
+    let hits = exact_vector_search(&ctx, "exact_width", &vq(&[1.0, 0.0, 0.0, 0.0]), 4, Some(4))
+        .await
+        .unwrap();
+    assert_eq!(hits[0].0, "near");
+}
+
+// B-c — a stored row with a non-finite component yields a non-finite
+// distance; the top-k SINK refuses it as a typed, table-named error. Never a
+// top-k slot (the comparator is non-transitive under NaN and could rank it
+// first), never a silently dropped row (which would read as "fewer matches").
+#[tokio::test]
+async fn exact_search_refuses_a_corrupt_stored_row_at_the_sink() {
+    let dir = tempdir().unwrap();
+    for poison in [f32::NAN, f32::INFINITY, f32::NEG_INFINITY] {
+        let rows = [
+            ("ok", [1.0, 0.0, 0.0, 0.0]),
+            ("poisoned", [poison, 0.0, 0.0, 0.0]),
+            ("other", [0.0, 1.0, 0.0, 0.0]),
+        ];
+        let name = format!(
+            "exact_poison_{}",
+            if poison.is_nan() {
+                "nan"
+            } else if poison > 0.0 {
+                "inf"
+            } else {
+                "ninf"
+            }
+        );
+        let ctx = exact_table(dir.path(), &name, &rows).await;
+        let err = exact_vector_search(&ctx, &name, &vq(&[1.0, 0.0, 0.0, 0.0]), 3, None)
+            .await
+            .expect_err("a corrupt stored row must not become a result");
+        match &err {
+            jammi_db::error::JammiError::IncompatibleFormat {
+                artifact, found, ..
+            } => {
+                assert!(artifact.contains(&name), "names the table: {artifact}");
+                assert!(found.contains("poisoned"), "names the row: {found}");
+            }
+            other => panic!("expected the corrupt-artifact variant, got {other:?}"),
+        }
+    }
+}
+
+// A5 (provenance, unit level) — the SAME non-finite vector is a caller fault
+// when the caller supplied it and a corrupt artifact named by its table when
+// it was read back from storage.
+#[test]
+fn provenance_decides_the_error_class() {
+    use jammi_db::error::JammiError;
+    use jammi_db::index::{validate_query, QuerySource};
+    let caller: JammiError = validate_query(vec![f32::NAN, 0.0], None, QuerySource::Caller)
+        .unwrap_err()
+        .into();
+    assert!(matches!(caller, JammiError::Schema { .. }), "{caller:?}");
+    let stored: JammiError = validate_query(
+        vec![f32::NAN, 0.0],
+        None,
+        QuerySource::Stored {
+            table: "docs_embeddings".into(),
+        },
+    )
+    .unwrap_err()
+    .into();
+    match &stored {
+        JammiError::IncompatibleFormat { artifact, .. } => {
+            assert!(artifact.contains("docs_embeddings"), "{artifact}")
+        }
+        other => panic!("a stored NaN is a corrupt artifact, got {other:?}"),
     }
 }

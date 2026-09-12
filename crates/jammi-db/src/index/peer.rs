@@ -26,7 +26,7 @@ use std::time::Duration;
 use async_trait::async_trait;
 
 use crate::config::StoragePrecision;
-use crate::index::SegmentId;
+use crate::index::{SegmentId, ValidatedQuery};
 
 /// The address a coordinator dials an owner at (`host:port`, plaintext gRPC —
 /// transport encryption is the runtime's, never the engine's).
@@ -93,8 +93,9 @@ pub struct SegmentSearchRequest {
     /// The table's persisted precision; the owner's strict load refuses a
     /// bundle stamped otherwise.
     pub storage_precision: StoragePrecision,
-    /// The query vector.
-    pub query: Vec<f32>,
+    /// The query vector — validated (finite) before it ever crosses the seam;
+    /// the owner re-validates what it receives at its own edge.
+    pub query: ValidatedQuery,
     /// The per-segment fetch width (`over_fetch(candidate_k, N)`).
     pub width: usize,
     /// Which stage of the protocol this search is.
@@ -109,8 +110,8 @@ pub struct ExactRescoreRequest {
     pub table_name: String,
     /// The table's persisted precision.
     pub storage_precision: StoragePrecision,
-    /// The query vector.
-    pub query: Vec<f32>,
+    /// The query vector (validated, as above).
+    pub query: ValidatedQuery,
     /// The candidates to rescore, grouped by the segment that owns each.
     pub row_ids_by_segment: Vec<(SegmentId, Vec<String>)>,
 }
@@ -138,6 +139,12 @@ pub enum PeerFailureReason {
     /// version-skewed peer, classified at the coordinator's edge — never a
     /// panic, never a silently short or polluted result.
     Malformed,
+    /// The owner refused the REQUEST as invalid (`INVALID_ARGUMENT`): a
+    /// caller fault the coordinator missed at its own edge. TERMINAL — a
+    /// caller fault is never a ladder rung: no retry at the next candidate,
+    /// no local load, no `Unavailable`. Counted so a coordinator that keeps
+    /// sending bad requests is visible.
+    CallerFault,
 }
 
 impl PeerFailureReason {
@@ -150,6 +157,7 @@ impl PeerFailureReason {
             Self::Torn => "torn",
             Self::Transport => "transport",
             Self::Malformed => "malformed",
+            Self::CallerFault => "caller_fault",
         }
     }
 }
@@ -172,6 +180,11 @@ pub struct PeerError {
     pub owner: PeerAddr,
     /// The classified failure.
     pub reason: PeerFailureReason,
+    /// The owner's own message, when the failure carries one (a real `Status`
+    /// the owner returned). Empty for a reason with no owner-side text (a
+    /// transport failure, a reconciliation fault the COORDINATOR detected).
+    /// [`PeerFailureReason::CallerFault`]'s surfaced error names it.
+    pub message: String,
 }
 
 impl std::fmt::Display for PeerError {
@@ -180,7 +193,11 @@ impl std::fmt::Display for PeerError {
             f,
             "peer {} for segment {}: {}",
             self.owner, self.segment.0, self.reason
-        )
+        )?;
+        if !self.message.is_empty() {
+            write!(f, " ({})", self.message)?;
+        }
+        Ok(())
     }
 }
 
@@ -226,6 +243,7 @@ impl PeerTransport for NoPeers {
             segment: req.segment_ids.first().copied().unwrap_or(SegmentId(-1)),
             owner: owner.clone(),
             reason: PeerFailureReason::Unreachable,
+            message: String::new(),
         })
     }
 
@@ -243,6 +261,7 @@ impl PeerTransport for NoPeers {
                 .unwrap_or(SegmentId(-1)),
             owner: owner.clone(),
             reason: PeerFailureReason::Unreachable,
+            message: String::new(),
         })
     }
 }
@@ -307,6 +326,8 @@ pub struct PeerFailureCounters {
     pub transport: AtomicU64,
     /// A peer's answer did not reconcile with the request it was for.
     pub malformed: AtomicU64,
+    /// An owner refused the request as invalid — terminal, never a rung.
+    pub caller_fault: AtomicU64,
     /// The retry at the second rendezvous candidate succeeded.
     pub retry_ok: AtomicU64,
     /// A remote segment was loaded locally under the admission budget.
@@ -316,13 +337,14 @@ pub struct PeerFailureCounters {
 }
 
 /// The label set [`PeerFailureCounters`] exposes, in a stable order.
-pub const PEER_FAILURE_LABELS: [&str; 9] = [
+pub const PEER_FAILURE_LABELS: [&str; 10] = [
     "deadline",
     "unreachable",
     "refused",
     "torn",
     "transport",
     "malformed",
+    "caller_fault",
     "retry_ok",
     "local_load",
     "unavailable",
@@ -338,6 +360,7 @@ impl PeerFailureCounters {
             PeerFailureReason::Torn => &self.torn,
             PeerFailureReason::Transport => &self.transport,
             PeerFailureReason::Malformed => &self.malformed,
+            PeerFailureReason::CallerFault => &self.caller_fault,
         };
         counter.fetch_add(1, Ordering::Relaxed);
     }
@@ -352,6 +375,7 @@ impl PeerFailureCounters {
             "torn" => &self.torn,
             "transport" => &self.transport,
             "malformed" => &self.malformed,
+            "caller_fault" => &self.caller_fault,
             "retry_ok" => &self.retry_ok,
             "local_load" => &self.local_load,
             "unavailable" => &self.unavailable,
@@ -401,7 +425,8 @@ mod tests {
             table_name: "t".into(),
             segment_ids: vec![SegmentId(3)],
             storage_precision: StoragePrecision::F32,
-            query: vec![1.0],
+            query: crate::index::validate_query(vec![1.0], None, crate::index::QuerySource::Caller)
+                .unwrap(),
             width: 1,
             phase: SegmentSearchPhase::Final,
         };

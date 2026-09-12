@@ -78,6 +78,7 @@ use crate::error::{JammiError, Result};
 use crate::index::first_inadmissible_hit;
 use crate::index::peer::SegmentSearchPhase;
 use crate::index::sidecar::SidecarIndex;
+use crate::index::ValidatedQuery;
 use crate::index::VectorIndex;
 use crate::store::deletes::DeletionMask;
 
@@ -141,12 +142,14 @@ pub(crate) type SegmentExactLookup<'a> = dyn Fn(SegmentId, &str) -> Result<Optio
 pub fn search_unit(
     segment: SegmentId,
     index: &SidecarIndex,
-    query: &[f32],
+    query: &ValidatedQuery,
     width: usize,
     phase: SegmentSearchPhase,
     exact: &ExactLookup<'_>,
 ) -> Result<Vec<(String, f32)>> {
-    verify_query_width(segment, index, query)?;
+    // The index enforces the width itself inside `search`; checked here too
+    // so the `width == 0` early return cannot skip it.
+    query.require_width(index.dimensions())?;
     if width == 0 {
         return Ok(Vec::new());
     }
@@ -156,27 +159,6 @@ pub fn search_unit(
     } else {
         admissible_or_err(segment, hits)
     }
-}
-
-/// The query must be exactly as wide as the index it is searched against.
-///
-/// Checked at the SEARCH ENTRY, against the INDEX's own width — the
-/// authoritative one — rather than the catalog's `dimensions` column, which
-/// is `Option<i32>` metadata with a live `None` branch. A wrong-width query
-/// is a CALLER fault, and without this it surfaces as something else
-/// entirely: at `Binary` the query packs to `ceil(len/8)` bytes, so an
-/// over-long query passes usearch untouched and reaches `cosine_distance`,
-/// which is where it panics.
-pub fn verify_query_width(segment: SegmentId, index: &SidecarIndex, query: &[f32]) -> Result<()> {
-    if query.len() != index.dimensions() {
-        return Err(JammiError::Schema {
-            table: format!("segment {}", segment.0),
-            column: "query".into(),
-            expected: format!("{} dimensions", index.dimensions()),
-            actual: format!("{} dimensions", query.len()),
-        });
-    }
-    Ok(())
 }
 
 /// Every distance a LOCAL kernel produces must be admissible
@@ -245,7 +227,7 @@ pub fn rescore(
     segment: SegmentId,
     candidates: Vec<(String, f32)>,
     exact: &ExactLookup<'_>,
-    query: &[f32],
+    query: &ValidatedQuery,
 ) -> Result<Vec<(String, f32)>> {
     let mut rescored: Vec<(String, f32)> = Vec::with_capacity(candidates.len());
     for (row_id, _approx) in candidates {
@@ -256,16 +238,8 @@ pub fn rescore(
             ))
         })?;
         // The stored vector is the authority on width here (this kernel may
-        // be reached with no index in hand), so the mismatch is typed before
-        // `cosine_distance` — which now refuses it — can be called.
-        if vector.len() != query.len() {
-            return Err(JammiError::Schema {
-                table: format!("segment {}", segment.0),
-                column: "query".into(),
-                expected: format!("{} dimensions", vector.len()),
-                actual: format!("{} dimensions", query.len()),
-            });
-        }
+        // be reached with no index in hand): typed, before `cosine_distance`.
+        query.require_width(vector.len())?;
         let distance = cosine_distance(query, &vector);
         rescored.push((row_id, distance));
     }
@@ -412,7 +386,7 @@ impl SegmentedIndex {
     fn live_candidates(
         &self,
         seg: &Segment,
-        query: &[f32],
+        query: &ValidatedQuery,
         m: usize,
     ) -> Result<Vec<(String, f32, SegmentId)>> {
         let len = seg.index.len();
@@ -456,7 +430,11 @@ impl SegmentedIndex {
     /// by `(distance ASC, row_id ASC, segment_id ASC)`, dedup by row id keeping
     /// the nearest occurrence, and truncate to `m`. Each candidate carries the
     /// segment that owns it.
-    fn search_candidates(&self, query: &[f32], m: usize) -> Result<Vec<(String, f32, SegmentId)>> {
+    fn search_candidates(
+        &self,
+        query: &ValidatedQuery,
+        m: usize,
+    ) -> Result<Vec<(String, f32, SegmentId)>> {
         if m == 0 {
             return Ok(Vec::new());
         }
@@ -493,7 +471,7 @@ impl SegmentedIndex {
     /// the row-id space: a key present in two segments (re-embedded by a
     /// refresh) is masked in the older one by version, so the dedup is defence
     /// only.
-    pub fn search(&self, query: &[f32], m: usize) -> Result<Vec<(String, f32)>> {
+    pub fn search(&self, query: &ValidatedQuery, m: usize) -> Result<Vec<(String, f32)>> {
         Ok(self
             .search_candidates(query, m)?
             .into_iter()
@@ -532,7 +510,7 @@ impl SegmentedIndex {
     /// never a silent drop (see [`rescore`]).
     pub fn search_final(
         &self,
-        query: &[f32],
+        query: &ValidatedQuery,
         k: usize,
         oversample: usize,
     ) -> Result<Vec<(String, f32)>> {
@@ -547,7 +525,7 @@ impl SegmentedIndex {
     /// segments. Production calls this with [`Self::exact_in`].
     pub(crate) fn search_final_with(
         &self,
-        query: &[f32],
+        query: &ValidatedQuery,
         k: usize,
         oversample: usize,
         exact: &SegmentExactLookup<'_>,
@@ -620,6 +598,14 @@ impl SegmentedIndex {
 mod tests {
     use super::*;
     use crate::config::AnnIndexConfig;
+    use crate::index::{validate_query, QuerySource};
+
+    /// A test query: validated (finite) with no width in hand — the index or
+    /// scan it meets enforces the width.
+    fn vq(v: &[f32]) -> ValidatedQuery {
+        validate_query(v.to_vec(), None, QuerySource::Caller).unwrap()
+    }
+
     use crate::index::VectorIndex;
 
     /// Build one segment (a fully-built [`SidecarIndex`]) over `rows` at
@@ -653,7 +639,7 @@ mod tests {
     fn brute_force(rows: &[(&str, Vec<f32>)], query: &[f32], k: usize) -> Vec<String> {
         let mut scored: Vec<(String, f32)> = rows
             .iter()
-            .map(|(id, v)| (id.to_string(), cosine_distance(query, v)))
+            .map(|(id, v)| (id.to_string(), cosine_distance(&vq(query), v)))
             .collect();
         scored.sort_by(|a, b| a.1.total_cmp(&b.1).then_with(|| a.0.cmp(&b.0)));
         scored.truncate(k);
@@ -693,7 +679,7 @@ mod tests {
         let rows = corpus();
         let lone = segment(&rows, StoragePrecision::F32);
         let seg = segmented(vec![(&rows, StoragePrecision::F32)]);
-        for q in [&rows[0].1, &rows[6].1, &rows[11].1] {
+        for q in &[vq(&rows[0].1), vq(&rows[6].1), vq(&rows[11].1)] {
             for k in [1usize, 3, 5] {
                 assert_eq!(
                     ids(&seg.search(q, k).unwrap()),
@@ -713,7 +699,7 @@ mod tests {
         let lone = segment(&rows, StoragePrecision::Int8);
         let seg = segmented(vec![(&rows, StoragePrecision::Int8)]);
         let oversample = 4;
-        for q in [&rows[0].1, &rows[6].1] {
+        for q in &[vq(&rows[0].1), vq(&rows[6].1)] {
             for k in [1usize, 3, 5] {
                 // Manual reference: raw candidates, exact-rescored, sorted.
                 let cand = lone.search(q, k.saturating_mul(oversample).max(k)).unwrap();
@@ -745,7 +731,7 @@ mod tests {
             (left, StoragePrecision::F32),
             (right, StoragePrecision::F32),
         ]);
-        for q in [&rows[0].1, &rows[3].1, &rows[9].1] {
+        for q in &[vq(&rows[0].1), vq(&rows[3].1), vq(&rows[9].1)] {
             for k in [1usize, 3, 6] {
                 assert_eq!(
                     ids(&seg.search_final(q, k, 4).unwrap()),
@@ -769,7 +755,7 @@ mod tests {
         ]);
         // A wide oversample covers the whole 12-row corpus so the coarse Hamming
         // stage cannot drop a true neighbour before the exact rescore.
-        for q in [&rows[0].1, &rows[6].1, &rows[11].1] {
+        for q in &[vq(&rows[0].1), vq(&rows[6].1), vq(&rows[11].1)] {
             for k in [1usize, 3] {
                 assert_eq!(
                     ids(&seg.search_final(q, k, 32).unwrap()),
@@ -811,14 +797,14 @@ mod tests {
         // raw per-segment Hamming order puts `a0` (Hamming 0 under τ_A) ahead
         // of `b0` (Hamming 1 under τ_B) — the cross-segment incomparability
         // the final-distance merge must not be fooled by.
-        let raw = seg.search(&q, 1).unwrap();
+        let raw = seg.search(&vq(&q), 1).unwrap();
         assert_eq!(
             ids(&raw),
             vec!["a0".to_string()],
             "fixture premise: raw Hamming merge keeps a0 (distance 0 under τ_A)"
         );
         assert_eq!(
-            ids(&seg.search_final(&q, 1, 1).unwrap()),
+            ids(&seg.search_final(&vq(&q), 1, 1).unwrap()),
             brute_force(&rows, &q, 1),
             "2-segment Binary search_final must equal exact brute-force top-1 even when \
              candidate_k = 1: each segment rescores before the merge"
@@ -902,7 +888,7 @@ mod tests {
         // rescore-everything.
         let k = 5;
         let got: Vec<String> = seg
-            .search_final(&query, k, 4)
+            .search_final(&vq(&query), k, 4)
             .unwrap()
             .into_iter()
             .map(|(id, _)| id)
@@ -910,7 +896,7 @@ mod tests {
 
         let mut scored: Vec<(String, f32)> = all
             .iter()
-            .map(|(id, v)| (id.clone(), cosine_distance(&query, v)))
+            .map(|(id, v)| (id.clone(), cosine_distance(&vq(&query), v)))
             .collect();
         scored.sort_by(|a, b| a.1.total_cmp(&b.1).then_with(|| a.0.cmp(&b.0)));
         let expected: Vec<String> = scored.into_iter().take(k).map(|(id, _)| id).collect();
@@ -944,7 +930,7 @@ mod tests {
         ] {
             let lone = segment(&rows, precision);
             let seg = segmented(vec![(&rows, precision)]);
-            for q in [&rows[0].1, &rows[6].1, &rows[11].1] {
+            for q in &[vq(&rows[0].1), vq(&rows[6].1), vq(&rows[11].1)] {
                 for (k, oversample) in [(1usize, 1usize), (3, 4), (5, 32)] {
                     let reference: Vec<(String, f32)> = if precision.needs_rescore() {
                         let cand = lone.search(q, k.saturating_mul(oversample).max(k)).unwrap();
@@ -1033,7 +1019,7 @@ mod tests {
     ) -> (Vec<(String, f32)>, usize) {
         let reads = std::cell::Cell::new(0usize);
         let hits = seg
-            .search_final_with(query, k, oversample, &|segment, row_id| {
+            .search_final_with(&vq(query), k, oversample, &|segment, row_id| {
                 reads.set(reads.get() + 1);
                 seg.exact_in(segment, row_id)
             })
@@ -1092,7 +1078,7 @@ mod tests {
                 );
                 assert_eq!(
                     hits,
-                    seg.search_final(&query, k, oversample).unwrap(),
+                    seg.search_final(&vq(&query), k, oversample).unwrap(),
                     "{precision:?} N={n}: the counted composition is the production entry"
                 );
                 assert_eq!(hits.len(), k);
@@ -1116,7 +1102,7 @@ mod tests {
                 SegmentId(7),
                 vec![("x".to_string(), 0.0)],
                 &|_| Ok(Some(stored.clone())),
-                &query,
+                &vq(&query),
             )
             .unwrap_err();
             let text = err.to_string();
@@ -1131,7 +1117,7 @@ mod tests {
             let err = search_unit(
                 SegmentId(3),
                 &index,
-                &query,
+                &vq(&query),
                 2,
                 SegmentSearchPhase::Final,
                 &|_| Ok(Some(stored.clone())),
@@ -1161,7 +1147,7 @@ mod tests {
                 let err = search_unit(
                     SegmentId(2),
                     &index,
-                    &q,
+                    &vq(&q),
                     2,
                     SegmentSearchPhase::Final,
                     &|row_id| index.get_exact(row_id),
@@ -1169,7 +1155,9 @@ mod tests {
                 .unwrap_err();
                 let text = err.to_string();
                 assert!(
-                    text.contains("segment 2") && text.contains("8 dimensions"),
+                    matches!(err, JammiError::Schema { .. })
+                        && text.contains("8 dimensions")
+                        && text.contains(&format!("{width} dimensions")),
                     "{precision:?} width {width}: {text}"
                 );
             }
@@ -1177,11 +1165,11 @@ mod tests {
             // coordinator re-runs in process after a local load).
             let seg = segmented(vec![(&rows, precision)]);
             assert!(
-                seg.search_final(&[0.5f32; 9], 1, 1).is_err(),
+                seg.search_final(&vq(&[0.5f32; 9]), 1, 1).is_err(),
                 "{precision:?}: search_final must refuse a 9-wide query on an 8-wide set"
             );
             assert!(
-                seg.search(&[0.5f32; 9], 1).is_err(),
+                seg.search(&vq(&[0.5f32; 9]), 1).is_err(),
                 "{precision:?}: the raw candidate entry refuses it as well"
             );
         }
@@ -1219,7 +1207,7 @@ mod tests {
             let rows: Vec<(&str, Vec<f32>)> =
                 vec![("zero", zero.clone()), ("probe", probe.clone())];
             let index = segment(&rows, precision);
-            let hits = index.search(&probe, 2).unwrap();
+            let hits = index.search(&vq(&probe), 2).unwrap();
             let zero_hit = hits
                 .iter()
                 .find(|(id, _)| id == "zero")
@@ -1237,7 +1225,7 @@ mod tests {
                 );
             }
             // Zero query against the zero row — usearch's zero-vs-zero arm.
-            let zq = index.search(&zero, 2).unwrap();
+            let zq = index.search(&vq(&zero), 2).unwrap();
             for (id, d) in &zq {
                 assert!(
                     d.is_finite(),
@@ -1267,8 +1255,8 @@ mod tests {
         ]);
         let expected = brute_force(&rows, &query, 4);
         // The tie between y and z must resolve y-before-z (row_id order) in both.
-        assert_eq!(ids(&n1.search(&query, 4).unwrap()), expected);
-        assert_eq!(ids(&n2.search(&query, 4).unwrap()), expected);
+        assert_eq!(ids(&n1.search(&vq(&query), 4).unwrap()), expected);
+        assert_eq!(ids(&n2.search(&vq(&query), 4).unwrap()), expected);
         let y = expected.iter().position(|id| id == "y").unwrap();
         let z = expected.iter().position(|id| id == "z").unwrap();
         assert!(y < z, "row_id tiebreak orders y before z");
@@ -1290,8 +1278,8 @@ mod tests {
             (right, StoragePrecision::F32),
         ]);
         assert_eq!(
-            ids(&a.search(query, 6).unwrap()),
-            ids(&b.search(query, 6).unwrap())
+            ids(&a.search(&vq(query), 6).unwrap()),
+            ids(&b.search(&vq(query), 6).unwrap())
         );
     }
 
@@ -1312,7 +1300,7 @@ mod tests {
             (&left, StoragePrecision::F32),
             (&right, StoragePrecision::F32),
         ]);
-        let hits = seg.search(&[1.0, 0.0, 0.0, 0.0], 4).unwrap();
+        let hits = seg.search(&vq(&[1.0, 0.0, 0.0, 0.0]), 4).unwrap();
         let shared_count = hits.iter().filter(|(id, _)| id == "shared").count();
         assert_eq!(
             shared_count, 1,

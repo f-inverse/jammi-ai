@@ -27,7 +27,7 @@ use crate::index::peer::{
 };
 use crate::index::segment::{merge, over_fetch, rescore, search_unit};
 use crate::index::sidecar::SidecarIndex;
-use crate::index::{distance_is_admissible, first_inadmissible_hit};
+use crate::index::{distance_is_admissible, first_inadmissible_hit, ValidatedQuery};
 use crate::index::{SegmentId, SegmentedIndex, VectorIndex};
 use crate::storage::index_cache::SegmentIndexCache;
 use crate::storage::StorageUrl;
@@ -90,8 +90,12 @@ pub struct PlacedIndex {
     /// unbounded.
     pub(crate) budget: Option<u64>,
     /// The table's embedding width, for the local-load estimate. `None` skips
-    /// the local-load rung.
-    pub(crate) dimensions: Option<i32>,
+    /// the local-load rung. `NonZeroUsize` by construction (converted ONCE,
+    /// here, from the catalog's `Option<i32>`): a non-positive catalog row is
+    /// a corrupt row, never a width to search or estimate against, and the
+    /// compiler — not a reviewer re-deriving a `.filter(|d| *d > 0)` at every
+    /// read — proves every site downstream can never see `0` or negative.
+    pub(crate) dimensions: Option<std::num::NonZeroUsize>,
     pub(crate) counters: Arc<PeerFailureCounters>,
 }
 
@@ -114,7 +118,7 @@ impl PlacedIndex {
         loader: Arc<SegmentIndexCache>,
         ann: AnnIndexConfig,
         budget: Option<u64>,
-        dimensions: Option<i32>,
+        dimensions: Option<std::num::NonZeroUsize>,
         counters: Arc<PeerFailureCounters>,
     ) -> Result<Self> {
         if sources.is_empty() {
@@ -203,7 +207,7 @@ impl PlacedIndex {
         loader: Arc<SegmentIndexCache>,
         ann: AnnIndexConfig,
         budget: Option<u64>,
-        dimensions: Option<i32>,
+        dimensions: Option<std::num::NonZeroUsize>,
         counters: Arc<PeerFailureCounters>,
     ) -> Self {
         Self {
@@ -254,7 +258,7 @@ impl PlacedIndex {
     /// per-precision protocol over the transport plus the failure ladder.
     pub async fn search_final_placed(
         &self,
-        query: &[f32],
+        query: &ValidatedQuery,
         k: usize,
         oversample: usize,
     ) -> Result<Vec<(String, f32)>> {
@@ -303,10 +307,33 @@ impl PlacedIndex {
         &self,
         local: &[(SegmentId, SidecarIndex)],
         remote: &[RemoteSegment],
-        query: &[f32],
+        query: &ValidatedQuery,
         k: usize,
         oversample: usize,
     ) -> Result<Vec<(String, f32)>> {
+        // The width rule for the shape with NO local segment: a local source
+        // enforces the index's own width before any fan-out (the units loop
+        // below runs first), but an all-remote placement has no index in hand
+        // and `index_segments` records no width — so the catalog's
+        // `dimensions` is the only width on record. With it, the query is
+        // enforced against it here; without it, the search is refused rather
+        // than fanned out unguarded (a caller fault must never reach an
+        // owner, let alone the ladder).
+        if local.is_empty() {
+            match self.dimensions {
+                Some(width) => query.require_width(width.get())?,
+                None => {
+                    return Err(JammiError::Schema {
+                        table: self.table_name.clone(),
+                        column: "dimensions".into(),
+                        expected: "a recorded width (every segment is remote, so the catalog \
+                                   row is the only width on record)"
+                            .into(),
+                        actual: "none".into(),
+                    })
+                }
+            }
+        }
         if k == 0 {
             return Ok(Vec::new());
         }
@@ -342,7 +369,7 @@ impl PlacedIndex {
                 table_name: self.table_name.clone(),
                 segment_ids: group.segments.iter().map(|s| s.segment_id).collect(),
                 storage_precision: precision,
-                query: query.to_vec(),
+                query: query.clone(),
                 width,
                 phase,
             };
@@ -364,7 +391,8 @@ impl PlacedIndex {
                         units.push((unit.segment_id, unit.hits));
                     }
                 }
-                Err(last) => {
+                Err(RungFailure::CallerFault(e)) => return Err(self.caller_fault(&e)),
+                Err(RungFailure::Exhausted(last)) => {
                     // Rung 3, per segment of the failed group.
                     for seg in &group.segments {
                         let index = self.load_locally(seg, &mut loaded_this_query, last).await?;
@@ -443,7 +471,7 @@ impl PlacedIndex {
             let req = ExactRescoreRequest {
                 table_name: self.table_name.clone(),
                 storage_precision: precision,
-                query: query.to_vec(),
+                query: query.clone(),
                 row_ids_by_segment: rows.clone(),
             };
             let req = &req;
@@ -460,7 +488,8 @@ impl PlacedIndex {
         for ((group, rows), result) in remote_groups.iter().zip(results) {
             match result {
                 Ok(hits) => rescored.extend(hits),
-                Err(last) => {
+                Err(RungFailure::CallerFault(e)) => return Err(self.caller_fault(&e)),
+                Err(RungFailure::Exhausted(last)) => {
                     for (segment, row_ids) in rows {
                         // `rows` was grouped under `group` by segment id above;
                         // a miss is an engine invariant failure, never a panic.
@@ -498,7 +527,7 @@ impl PlacedIndex {
         &self,
         group: &OwnerGroup<'_>,
         call: F,
-    ) -> std::result::Result<T, PeerFailureReason>
+    ) -> std::result::Result<T, RungFailure>
     where
         F: Fn(PeerAddr) -> Fut,
         Fut: std::future::Future<Output = std::result::Result<T, PeerError>>,
@@ -511,6 +540,21 @@ impl PlacedIndex {
                         self.counters.retry_ok.fetch_add(1, Ordering::Relaxed);
                     }
                     return Ok(value);
+                }
+                // TERMINAL: the owner refused the REQUEST as invalid. That is
+                // the coordinator's own fault (an entry missed a check), and
+                // the rule that closes the harm whatever the entry was: no
+                // retry at the next candidate, no local load, no `Unavailable`.
+                // Counted under its own label so the missed entry is visible.
+                Err(e) if e.reason == PeerFailureReason::CallerFault => {
+                    self.counters.record(e.reason);
+                    tracing::warn!(
+                        table = self.table_name,
+                        segment = e.segment.0,
+                        owner = %e.owner,
+                        "owner refused the request as invalid — a caller fault, not a rung"
+                    );
+                    return Err(RungFailure::CallerFault(e));
                 }
                 Err(e) => {
                     self.counters.record(e.reason);
@@ -526,7 +570,29 @@ impl PlacedIndex {
                 }
             }
         }
-        Err(last)
+        Err(RungFailure::Exhausted(last))
+    }
+
+    /// The error a caller fault surfaces as at the coordinator.
+    ///
+    /// Every own-data disagreement an owner can report ladders (F1): the
+    /// owner's `INVALID_ARGUMENT` is TERMINAL only for a request the
+    /// COORDINATOR itself built — width and finiteness are enforced against
+    /// an authority (a local index or the catalog's recorded `dimensions`)
+    /// before any fan-out, so a genuine caller-side fault is already refused
+    /// at the entry, never reaching here. What DOES reach here is an ENGINE
+    /// invariant violation: this coordinator's own construction produced a
+    /// malformed request an owner had to catch. That is never the end
+    /// user's query — `JammiError::Schema` on column `query` would bill a
+    /// coordinator bug to the caller as a 400 and hide it from the 5xx
+    /// error budget — so this is `Other` (gRPC `Internal`), naming the
+    /// owner, the segment, and the owner's own message.
+    fn caller_fault(&self, e: &PeerError) -> JammiError {
+        JammiError::Other(format!(
+            "table '{}': owner {} refused segment {} as invalid — this coordinator built a \
+             malformed request: {}",
+            self.table_name, e.owner, e.segment.0, e.message
+        ))
     }
 
     /// Rung 3: load `seg` locally through the segment cache under
@@ -598,6 +664,15 @@ impl PlacedIndex {
 /// each.
 type RowIdsBySegment = Vec<(SegmentId, Vec<String>)>;
 
+/// How rungs 1–2 ended for one owner group.
+enum RungFailure {
+    /// Both candidates failed with a ladder reason; rung 3 (local load) is
+    /// next, with the last reason for its message.
+    Exhausted(PeerFailureReason),
+    /// An owner refused the request as INVALID: terminal, never a rung.
+    CallerFault(PeerError),
+}
+
 /// Reconcile a `SegmentSearch` answer against its request: exactly one unit
 /// per requested segment id, none for an id that was not requested, none
 /// twice; no unit wider than the requested `width`; every distance
@@ -629,6 +704,7 @@ fn reconcile_units(
         segment: req.segment_ids.first().copied().unwrap_or(SegmentId(-1)),
         owner: owner.clone(),
         reason: PeerFailureReason::Malformed,
+        message: "the answer did not reconcile with the SegmentSearch request".into(),
     };
     let requested: std::collections::BTreeSet<SegmentId> =
         req.segment_ids.iter().copied().collect();
@@ -680,6 +756,7 @@ fn reconcile_rescore(
             .unwrap_or(SegmentId(-1)),
         owner: owner.clone(),
         reason: PeerFailureReason::Malformed,
+        message: "the answer did not reconcile with the ExactRescore request".into(),
     };
     let requested: std::collections::BTreeSet<&str> = req
         .row_ids_by_segment
@@ -734,10 +811,10 @@ fn owner_groups(remote: &[RemoteSegment]) -> Vec<OwnerGroup<'_>> {
 /// `HashMap` are unmodelled.
 pub(crate) fn local_load_estimate(
     row_count: usize,
-    dimensions: i32,
+    dimensions: std::num::NonZeroUsize,
     precision: StoragePrecision,
 ) -> u64 {
-    let d = u64::try_from(dimensions).unwrap_or(0);
+    let d = dimensions.get() as u64;
     let vector_bytes = match precision {
         StoragePrecision::F32 => d * 4,
         StoragePrecision::F16 => d * 2,
@@ -751,6 +828,14 @@ pub(crate) fn local_load_estimate(
 mod tests {
     use super::*;
     use crate::index::peer::NoPeers;
+    use crate::index::{validate_query, QuerySource};
+
+    /// A test query: validated (finite) with no width in hand — the index or
+    /// scan it meets enforces the width.
+    fn vq(v: &[f32]) -> ValidatedQuery {
+        validate_query(v.to_vec(), None, QuerySource::Caller).unwrap()
+    }
+
     use crate::storage::StorageRegistry;
 
     fn segment(rows: &[(&str, Vec<f32>)], precision: StoragePrecision) -> SidecarIndex {
@@ -780,6 +865,19 @@ mod tests {
         ]
     }
 
+    /// A non-zero test width — the constructor's one conversion point in
+    /// production takes `Option<i32>` from the catalog; tests build the
+    /// already-converted type directly.
+    fn nz(n: usize) -> Option<std::num::NonZeroUsize> {
+        std::num::NonZeroUsize::new(n)
+    }
+
+    /// [`nz`], unwrapped — for [`local_load_estimate`]'s own non-`Option`
+    /// parameter.
+    fn w(n: usize) -> std::num::NonZeroUsize {
+        std::num::NonZeroUsize::new(n).unwrap()
+    }
+
     fn placed(sources: Vec<SegmentSource>, precision: StoragePrecision) -> PlacedIndex {
         let dir = tempfile::tempdir().unwrap();
         let loader = Arc::new(
@@ -793,7 +891,7 @@ mod tests {
             loader,
             AnnIndexConfig::default(),
             None,
-            Some(8),
+            nz(8),
             Arc::new(PeerFailureCounters::default()),
         )
         .unwrap()
@@ -835,7 +933,7 @@ mod tests {
                 assert!(!placed.has_remote());
                 assert_eq!(placed.len(), sync.len());
                 assert_eq!(placed.storage_precision(), precision);
-                for q in [&rows[0].1, &rows[6].1, &rows[11].1] {
+                for q in &[vq(&rows[0].1), vq(&rows[6].1), vq(&rows[11].1)] {
                     for (k, oversample) in [(1usize, 1usize), (3, 4), (5, 32)] {
                         let want = sync.search_final(q, k, oversample).unwrap();
                         let got = placed.search_final_placed(q, k, oversample).await.unwrap();
@@ -916,23 +1014,26 @@ mod tests {
     fn local_load_estimate_per_precision() {
         // 1000 rows × 128 dims: vector bytes + 96 per row.
         assert_eq!(
-            local_load_estimate(1000, 128, StoragePrecision::F32),
+            local_load_estimate(1000, w(128), StoragePrecision::F32),
             1000 * (512 + 96)
         );
         assert_eq!(
-            local_load_estimate(1000, 128, StoragePrecision::F16),
+            local_load_estimate(1000, w(128), StoragePrecision::F16),
             1000 * (256 + 96)
         );
         assert_eq!(
-            local_load_estimate(1000, 128, StoragePrecision::Int8),
+            local_load_estimate(1000, w(128), StoragePrecision::Int8),
             1000 * (128 + 96)
         );
         assert_eq!(
-            local_load_estimate(1000, 128, StoragePrecision::Binary),
+            local_load_estimate(1000, w(128), StoragePrecision::Binary),
             1000 * (16 + 96)
         );
         // Binary pads to whole bytes.
-        assert_eq!(local_load_estimate(1, 12, StoragePrecision::Binary), 2 + 96);
+        assert_eq!(
+            local_load_estimate(1, w(12), StoragePrecision::Binary),
+            2 + 96
+        );
     }
 
     // ---- Response reconciliation at the coordinator (a fake transport) ----
@@ -1119,7 +1220,7 @@ mod tests {
             loader,
             AnnIndexConfig::default(),
             Some(1),
-            Some(8),
+            nz(8),
             Arc::clone(&counters),
         )
         .unwrap();
@@ -1140,7 +1241,7 @@ mod tests {
     async fn conforming_fake_owner_serves_without_any_failure_counter() {
         let owner = fake(SearchAnswer::Conforming, RescoreAnswer::Conforming);
         let (placed, counters, _dir) = mixed_with_fake(StoragePrecision::Int8, Arc::clone(&owner));
-        let q = corpus()[0].1.clone();
+        let q = vq(&corpus()[0].1);
         let hits = placed.search_final_placed(&q, 3, 4).await.unwrap();
         assert_eq!(hits.len(), 3);
         assert!(
@@ -1169,7 +1270,7 @@ mod tests {
             let owner = fake(answer.clone(), RescoreAnswer::Conforming);
             let (placed, counters, _dir) =
                 mixed_with_fake(StoragePrecision::F32, Arc::clone(&owner));
-            let q = corpus()[0].1.clone();
+            let q = vq(&corpus()[0].1);
             let err = placed
                 .search_final_placed(&q, 3, 1)
                 .await
@@ -1204,7 +1305,7 @@ mod tests {
         );
         let (placed, counters, _dir) =
             mixed_with_fake_n_remote(StoragePrecision::F32, Arc::clone(&owner), 2);
-        let q = corpus()[0].1.clone();
+        let q = vq(&corpus()[0].1);
         let err = placed
             .search_final_placed(&q, 3, 1)
             .await
@@ -1231,7 +1332,7 @@ mod tests {
         let owner = fake(SearchAnswer::Conforming, RescoreAnswer::Conforming);
         let (placed, counters, _dir) =
             mixed_with_fake_n_remote(StoragePrecision::F32, Arc::clone(&owner), 2);
-        let q = corpus()[0].1.clone();
+        let q = vq(&corpus()[0].1);
         let hits = placed.search_final_placed(&q, 3, 1).await.unwrap();
         assert_eq!(hits.len(), 3);
         assert!(
@@ -1254,7 +1355,7 @@ mod tests {
             let owner = fake(SearchAnswer::NonFinite(poison), RescoreAnswer::Conforming);
             let (placed, counters, _dir) =
                 mixed_with_fake(StoragePrecision::F32, Arc::clone(&owner));
-            let q = corpus()[0].1.clone();
+            let q = vq(&corpus()[0].1);
             let err = placed
                 .search_final_placed(&q, 3, 1)
                 .await
@@ -1293,7 +1394,7 @@ mod tests {
             let owner = fake(SearchAnswer::Conforming, answer.clone());
             let (placed, counters, _dir) =
                 mixed_with_fake(StoragePrecision::Int8, Arc::clone(&owner));
-            let q = corpus()[0].1.clone();
+            let q = vq(&corpus()[0].1);
             let err = placed
                 .search_final_placed(&q, 3, 4)
                 .await
@@ -1310,5 +1411,69 @@ mod tests {
                 "one search, owner + retry rescore"
             );
         }
+    }
+
+    /// The all-remote shape with NO width on record refuses instead of
+    /// fanning out unguarded — `index_segments` carries no dimensions column,
+    /// so the catalog row is the only width there is; and with a width on
+    /// record the query is enforced against it BEFORE any owner is dialled.
+    #[tokio::test]
+    async fn all_remote_placement_enforces_the_catalog_width_before_fan_out() {
+        let owner = fake(SearchAnswer::Conforming, RescoreAnswer::Conforming);
+        let dir = tempfile::tempdir().unwrap();
+        let loader = Arc::new(
+            SegmentIndexCache::new(StorageRegistry::new(), dir.path().join("index")).unwrap(),
+        );
+        let remote = || SegmentSource::Remote {
+            segment_id: SegmentId(1),
+            owners: vec![PeerAddr("127.0.0.1:1".into())],
+            row_count: 6,
+            index_url: StorageUrl::parse(
+                dir.path()
+                    .join("missing")
+                    .join("seg1.idx")
+                    .to_str()
+                    .unwrap(),
+            )
+            .unwrap(),
+        };
+        let build = |dimensions: Option<std::num::NonZeroUsize>| {
+            PlacedIndex::with_sources(
+                vec![remote()],
+                "t",
+                StoragePrecision::F32,
+                Arc::clone(&owner) as Arc<dyn PeerTransport>,
+                Arc::clone(&loader),
+                AnnIndexConfig::default(),
+                Some(1),
+                dimensions,
+                Arc::new(PeerFailureCounters::default()),
+            )
+            .unwrap()
+        };
+        // No width on record: refused, no fan-out.
+        let err = build(None)
+            .search_final_placed(&vq(&[1.0; 8]), 3, 1)
+            .await
+            .expect_err("no width on record → refuse, never fan out");
+        assert!(
+            matches!(&err, JammiError::Schema { column, .. } if column == "dimensions"),
+            "{err:?}"
+        );
+        assert_eq!(owner.calls.lock().unwrap().0, 0, "no owner was dialled");
+        // Width on record: a wrong-width query is refused before fan-out…
+        let err = build(nz(8))
+            .search_final_placed(&vq(&[1.0; 5]), 3, 1)
+            .await
+            .expect_err("5-wide against a recorded 8 → refuse");
+        assert!(matches!(&err, JammiError::Schema { .. }), "{err:?}");
+        assert_eq!(owner.calls.lock().unwrap().0, 0, "still no owner dialled");
+        // …and the conforming one fans out.
+        let hits = build(nz(8))
+            .search_final_placed(&vq(&[1.0; 8]), 3, 1)
+            .await
+            .unwrap();
+        assert_eq!(hits.len(), 3);
+        assert_eq!(owner.calls.lock().unwrap().0, 1);
     }
 }

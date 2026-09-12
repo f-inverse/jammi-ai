@@ -49,6 +49,7 @@
 //! reset-then-populate cannot race a sibling — important because `recover()` is
 //! a cross-tenant admin scan that would otherwise see a sibling's rows).
 
+use jammi_test_utils::vq;
 use std::path::Path;
 use std::str::FromStr;
 use std::sync::Arc;
@@ -582,7 +583,7 @@ async fn building_with_valid_parquet_promotes_with_true_count(kind: BackendKind)
         .await
         .unwrap()
         .expect("I6: sidecar rebuilt from Parquet");
-    let hits = index.search(&[0.0, 1.0, 2.0, 3.0], 1).unwrap();
+    let hits = index.search(&vq(&[0.0, 1.0, 2.0, 3.0]), 1).unwrap();
     assert_eq!(hits.len(), 1, "I6: rebuilt index is queryable");
 
     // I1/I3: a Ready table whose bytes exist IS registered.

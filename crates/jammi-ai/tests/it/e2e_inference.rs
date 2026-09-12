@@ -13,6 +13,7 @@ use jammi_ai::model::{ModelSource, ModelTask};
 use jammi_ai::session::InferenceSession;
 use jammi_db::source::{FileFormat, SourceConnection, SourceType};
 use jammi_numerics::distance::cosine_distance;
+use jammi_test_utils::vq;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
@@ -671,14 +672,14 @@ async fn embedding_vectors_are_semantically_meaningful_and_reproducible() {
     );
 
     // Semantic coherence: within-category distance should be small
-    let dist_physics = cosine_distance(&vec_physics_1, &vec_physics_2);
+    let dist_physics = cosine_distance(&vq(&vec_physics_1), &vec_physics_2);
     assert!(
         dist_physics < 0.5,
         "Within-category (physics-to-physics) cosine distance should be < 0.5, got {dist_physics}"
     );
 
     // Cross-category distance should be larger than within-category distance
-    let dist_cross = cosine_distance(&vec_physics_1, &vec_biology);
+    let dist_cross = cosine_distance(&vq(&vec_physics_1), &vec_biology);
     assert!(
         dist_cross > dist_physics,
         "Cross-category distance ({dist_cross}) should exceed within-category distance ({dist_physics})"

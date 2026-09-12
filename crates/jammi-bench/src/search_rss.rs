@@ -47,6 +47,7 @@ use tempfile::tempdir;
 use tokio::process::Command;
 
 use jammi_db::index::exact::exact_vector_search;
+use jammi_db::index::{validate_query, QuerySource};
 use jammi_db::store::vectors::extend_with_fixed_size_list_f32;
 use jammi_numerics::distance::cosine_distance;
 
@@ -225,10 +226,11 @@ async fn naive_collect_all_search(
         extend_with_fixed_size_list_f32(&batch, table_name, "vector", &mut vectors)?;
     }
 
+    let query = validate_query(query.to_vec(), None, QuerySource::Caller)?;
     let mut scored: Vec<(String, f32)> = row_ids
         .into_iter()
         .zip(vectors.iter())
-        .map(|(id, v)| (id, cosine_distance(query, v)))
+        .map(|(id, v)| (id, cosine_distance(&query, v)))
         .collect();
     scored.sort_by(|a, b| {
         a.1.partial_cmp(&b.1)
@@ -283,7 +285,16 @@ pub async fn measure_once(
         }
         Variant::Streamed | Variant::Naive => {
             let result = match variant {
-                Variant::Streamed => exact_vector_search(&ctx, table, &query, K).await?,
+                Variant::Streamed => {
+                    exact_vector_search(
+                        &ctx,
+                        table,
+                        &validate_query(query.to_vec(), None, QuerySource::Caller)?,
+                        K,
+                        None,
+                    )
+                    .await?
+                }
                 Variant::Naive => naive_collect_all_search(&ctx, table, &query, K).await?,
                 Variant::ScanOnly => unreachable!("scan-only handled above"),
             };

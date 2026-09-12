@@ -636,4 +636,38 @@ mod tests {
             other => panic!("expected ModelNotFound to round-trip, got {other:?}"),
         }
     }
+
+    /// W — the Caller finiteness refusal crosses the wire as
+    /// `INVALID_ARGUMENT`: the same code (and the same Python exception,
+    /// `InvalidArgument` / `ValueError`) as a width mismatch. Before the
+    /// query was typed, a non-finite query landed on `Other` → `Internal` → a
+    /// different exception class. The Stored twin is `Internal`, naming the
+    /// table: a corrupt artifact is never the caller's fault.
+    #[test]
+    fn query_finiteness_refusal_codes_follow_provenance() {
+        use jammi_db::index::{validate_query, QuerySource};
+        let caller: JammiError = validate_query(vec![f32::NAN], None, QuerySource::Caller)
+            .unwrap_err()
+            .into();
+        let status = map_engine_error(caller);
+        assert_eq!(status.code(), Code::InvalidArgument, "{status:?}");
+        // …and it round-trips as the same schema-class variant a width
+        // mismatch would.
+        assert!(matches!(
+            error_from_status(&status),
+            JammiError::Schema { .. }
+        ));
+        let stored: JammiError = validate_query(
+            vec![f32::NAN],
+            None,
+            QuerySource::Stored {
+                table: "docs_embeddings".into(),
+            },
+        )
+        .unwrap_err()
+        .into();
+        let status = map_engine_error(stored);
+        assert_eq!(status.code(), Code::Internal, "{status:?}");
+        assert!(status.message().contains("docs_embeddings"), "{status:?}");
+    }
 }

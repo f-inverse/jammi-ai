@@ -10,6 +10,7 @@ use futures::TryStreamExt;
 use jammi_numerics::distance::cosine_distance;
 
 use crate::error::{JammiError, Result};
+use crate::index::{distance_is_admissible, ValidatedQuery};
 use crate::store::vectors::extend_with_fixed_size_list_f32;
 
 /// Total order over scored candidates: ascending cosine distance, ties broken
@@ -125,17 +126,57 @@ impl BoundedTopK {
 /// `k` `(row_id, distance)` pairs are resident at once. Peak memory is therefore
 /// `O(k + batch_rows · d)`, independent of the corpus size `N`, rather than the
 /// `O(N · d)` of materialising every vector before scoring.
+/// `catalog_dimensions` is the catalog row's recorded width, when the caller
+/// has one: it is a CROSS-CHECK against the scan's own `FixedSizeList`
+/// width (the authority here — this is the one path with no index behind
+/// it), and a disagreement is itself a typed, table-named error. The query's
+/// width is enforced against the scan width before any distance is computed,
+/// so the kernel's own width assert is unreachable from here.
 pub async fn exact_vector_search(
     ctx: &SessionContext,
     table_name: &str,
-    query: &[f32],
+    query: &ValidatedQuery,
     k: usize,
+    catalog_dimensions: Option<usize>,
 ) -> Result<Vec<(String, f32)>> {
     let df = ctx
         .sql(&format!(
             "SELECT _row_id, vector FROM \"jammi.{table_name}\""
         ))
         .await?;
+    // The scan schema's `FixedSizeList` width is the width every row below
+    // has, by construction of the column type.
+    let scan_width = match df.schema().field_with_unqualified_name("vector") {
+        Ok(field) => match field.data_type() {
+            DataType::FixedSizeList(_, n) => usize::try_from(*n).unwrap_or(0),
+            other => {
+                return Err(JammiError::Schema {
+                    table: table_name.to_string(),
+                    column: "vector".into(),
+                    expected: "FixedSizeList<Float32>".into(),
+                    actual: format!("{other:?}"),
+                })
+            }
+        },
+        Err(_) => {
+            return Err(JammiError::Schema {
+                table: table_name.to_string(),
+                column: "vector".into(),
+                expected: "FixedSizeList<Float32>".into(),
+                actual: "missing".into(),
+            })
+        }
+    };
+    if let Some(catalog) = catalog_dimensions {
+        if catalog != scan_width {
+            return Err(JammiError::IncompatibleFormat {
+                artifact: format!("{table_name}.vector"),
+                found: format!("scan width {scan_width}"),
+                supported: format!("catalog width {catalog}"),
+            });
+        }
+    }
+    query.require_width(scan_width)?;
     // `execute_stream` yields a single merged stream over all partitions. The
     // `(dist, _row_id)` total order makes the partition layout irrelevant — the
     // retained set is identical regardless of how the scan is partitioned — so
@@ -172,6 +213,20 @@ pub async fn exact_vector_search(
         // row, so the batch's vectors map 1:1 with `row_ids`.
         for (offset, vec) in vectors.iter().enumerate() {
             let dist = cosine_distance(query, vec);
+            // The SINK: a non-finite distance here means a corrupt stored
+            // row (the query is finite by type). Typed and table-named —
+            // never a silently dropped row, which would read as "fewer
+            // matches exist", and never a top-k slot.
+            if !distance_is_admissible(dist) {
+                return Err(JammiError::IncompatibleFormat {
+                    artifact: format!("{table_name}.vector"),
+                    found: format!(
+                        "row '{}' yields a non-finite distance ({dist:?})",
+                        row_ids.value(offset)
+                    ),
+                    supported: "finite f32 components".into(),
+                });
+            }
             top_k.offer(row_ids.value(offset).to_string(), dist);
         }
     }

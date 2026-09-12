@@ -377,9 +377,19 @@ impl InferenceSession {
         exclude_self: bool,
     ) -> Result<Vec<String>> {
         let fetch_k = if exclude_self { k.saturating_add(1) } else { k };
+        // The request's vector is the CALLER's; validated here (finite, and
+        // as wide as the catalog records when it does) before any search.
+        let query = jammi_db::index::validate_query(
+            query.to_vec(),
+            table
+                .dimensions
+                .and_then(|d| usize::try_from(d).ok())
+                .filter(|d| *d > 0),
+            jammi_db::index::QuerySource::Caller,
+        )?;
         let neighbours = self
             .result_store()
-            .search_vectors(self.context(), table, query, fetch_k)
+            .search_vectors(self.context(), table, &query, fetch_k)
             .await?;
         Ok(neighbours
             .into_iter()

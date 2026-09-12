@@ -814,6 +814,7 @@ impl InferenceSession {
             k,
             embedding_table,
             oversample,
+            jammi_db::index::QuerySource::Caller,
         )
         .await
     }
@@ -842,8 +843,21 @@ impl InferenceSession {
             .resolve_embedding_table(source_id, embedding_table)
             .await?;
         let query = self.inner.read_vector_by_key(&table, row_key).await?;
-        self.search(source_id, query, k, embedding_table, oversample)
-            .await
+        // The vector was READ BACK from the table: its provenance is
+        // `Stored`, so a non-finite component is a corrupt artifact named by
+        // the table (gRPC `Internal`), never the caller's fault.
+        QueryBuilder::new(
+            Arc::clone(self),
+            source_id,
+            query,
+            k,
+            embedding_table,
+            oversample,
+            jammi_db::index::QuerySource::Stored {
+                table: table.table_name.clone(),
+            },
+        )
+        .await
     }
 
     /// Run a model over `columns` of an arbitrary input plan, appending the

@@ -10,6 +10,12 @@ readme = "README.md"
 
 [features]
 default = []
+# `postgres` and `mysql` pull `datafusion-table-providers`'s federation
+# drivers, which link a native TLS stack (`native-tls` -> OpenSSL) rather than
+# `rustls`. Building either feature therefore requires OpenSSL's development
+# headers on the build host (e.g. `libssl-dev`/`openssl-devel`, or `openssl`
+# + `pkg-config` on macOS via Homebrew) — a requirement this crate does not
+# vendor or otherwise satisfy for a consumer of the published crate.
 postgres = ["datafusion-table-providers/postgres-federation"]
 mysql = ["datafusion-table-providers/mysql-federation"]
 # Gates tests that require a live Postgres instance (JAMMI_TEST_PG_URL).

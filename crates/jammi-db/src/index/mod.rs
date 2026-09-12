@@ -10,6 +10,9 @@ pub use peer::{
 };
 pub use placed::{PlacedIndex, SegmentSource};
 
+pub use jammi_numerics::query::{
+    validate_query, QuerySource, QueryValidationError, ValidatedQuery,
+};
 pub use segment::{SegmentId, SegmentedIndex, DEFAULT_SEGMENT_OVERFETCH_FACTOR};
 
 use crate::error::Result;
@@ -72,7 +75,9 @@ pub trait VectorIndex: Send + Sync {
     fn build(&mut self) -> Result<()>;
 
     /// Search for the `k` nearest neighbors, returning `(row_id, cosine_distance)` sorted ascending.
-    fn search(&self, query: &[f32], k: usize) -> Result<Vec<(String, f32)>>;
+    /// The query is a [`ValidatedQuery`] (finite); the index enforces its own
+    /// width on it and refuses a mismatch as a typed error.
+    fn search(&self, query: &ValidatedQuery, k: usize) -> Result<Vec<(String, f32)>>;
 
     /// Persist the index to disk.
     fn save(&self, path: &std::path::Path) -> Result<()>;

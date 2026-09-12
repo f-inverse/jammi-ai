@@ -11,6 +11,7 @@
 //! property (two materializations sharing every scalar param but different
 //! vectors get different `DefinitionHash`es).
 
+use jammi_test_utils::vq;
 use std::collections::BTreeMap;
 use std::sync::Arc;
 
@@ -208,7 +209,7 @@ async fn happy_path_lands_a_ready_searchable_table_with_provenance_and_lineage(
     // uses: the query is the (already-unit) first row, so it is its own
     // nearest neighbour at distance ~0.
     let top1 = store
-        .search_vectors(&ctx, &record, &[1.0, 0.0, 0.0], 1)
+        .search_vectors(&ctx, &record, &vq(&[1.0, 0.0, 0.0]), 1)
         .await
         .unwrap();
     assert_eq!(top1.len(), 1);

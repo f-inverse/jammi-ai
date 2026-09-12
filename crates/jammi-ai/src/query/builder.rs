@@ -15,6 +15,7 @@ use futures::TryStreamExt;
 
 use jammi_db::catalog::Catalog;
 use jammi_db::error::{JammiError, Result};
+use jammi_db::index::{validate_query, QuerySource};
 use jammi_db::sql::source_relation;
 use jammi_db::ChannelId;
 
@@ -49,6 +50,16 @@ impl QueryBuilder {
     ///
     /// Creates an ANN search plan, then automatically hydrates results
     /// by joining back to the source table to include all original columns.
+    /// `source` is the query's provenance and decides whose fault a bad one
+    /// is: a caller's vector fails as a schema-class error (`InvalidArgument`
+    /// on the wire); a vector read back from storage (query-by-example) fails
+    /// as a corrupt artifact named by its table. This is the EARLIEST point a
+    /// query can be refused — the first place any width is known — so a
+    /// caller fault never reaches placement, let alone the failure ladder.
+    /// The catalog width is applied to a CALLER's vector when recorded; a
+    /// STORED vector gets the finiteness check only (it came from the same
+    /// column as the corpus, so a catalog/data drift must not refuse a valid
+    /// self-query). Every entry downstream enforces the width it knows.
     pub(crate) async fn new(
         session: Arc<InferenceSession>,
         source_id: &str,
@@ -56,34 +67,21 @@ impl QueryBuilder {
         k: usize,
         embedding_table: Option<&str>,
         oversample: Option<usize>,
+        source: QuerySource,
     ) -> Result<Self> {
         let table = session
             .catalog()
             .resolve_embedding_table(source_id, embedding_table)
             .await?;
 
-        // The EARLIEST point a wrong-width query can be refused: the first
-        // place the table — and therefore any width at all — is known. The
-        // wire edge (`grpc::embedding`'s decode) has no catalog access, and
-        // every guard below this one is downstream of placement, so without
-        // this a caller fault traverses the whole failure ladder: the owner
-        // refuses it (`Refused`), the coordinator retries at the next
-        // candidate, pays a full segment download at the local-load rung, and
-        // only then re-runs the kernel in-process and reproduces the fault it
-        // could have named here. `dimensions` is `Option<i32>` catalog
-        // metadata; `None` (a pre-column row, or a table that grew no index)
-        // is an explicit pass-through — the index-side guard still covers it.
-        if let Some(dimensions) = table.dimensions {
-            let expected = usize::try_from(dimensions).unwrap_or(0);
-            if expected != 0 && query_vec.len() != expected {
-                return Err(JammiError::Schema {
-                    table: table.table_name.clone(),
-                    column: "query".into(),
-                    expected: format!("{expected} dimensions"),
-                    actual: format!("{} dimensions", query_vec.len()),
-                });
-            }
-        }
+        let width = match &source {
+            QuerySource::Caller => table
+                .dimensions
+                .and_then(|d| usize::try_from(d).ok())
+                .filter(|d| *d > 0),
+            QuerySource::Stored { .. } => None,
+        };
+        let query_vec = validate_query(query_vec, width, source)?;
 
         let result_store = session.result_store();
 
@@ -497,7 +495,14 @@ fn extract_engine_error(
     match e {
         DataFusionError::External(boxed) => match boxed.downcast::<JammiError>() {
             Ok(engine) => Ok(*engine),
-            Err(other) => Err(DataFusionError::External(other)),
+            // The stream machinery can re-wrap a DataFusion error as
+            // `External(Box<DataFusionError>)`: walk through it, rebuilding
+            // the wrapper on a miss so the text is unchanged.
+            Err(other) => match other.downcast::<DataFusionError>() {
+                Ok(nested) => extract_engine_error(*nested)
+                    .map_err(|inner| DataFusionError::External(Box::new(inner))),
+                Err(other) => Err(DataFusionError::External(other)),
+            },
         },
         DataFusionError::Context(description, inner) => match extract_engine_error(*inner) {
             Ok(engine) => Ok(engine),
@@ -506,10 +511,11 @@ fn extract_engine_error(
         DataFusionError::Shared(arc) => match Arc::try_unwrap(arc) {
             Ok(inner) => extract_engine_error(inner)
                 .map_err(|inner| DataFusionError::Shared(Arc::new(inner))),
-            // Still shared elsewhere: `JammiError` is not `Clone`, so the one
-            // typed refusal this seam must carry is rebuilt by reference;
-            // everything else keeps the original text.
-            Err(arc) => match unavailable_by_ref(&arc) {
+            // Still shared elsewhere (the hydration join keeps its build
+            // side's error alive): `JammiError` is not `Clone`, so the typed
+            // variants the leaf raises are rebuilt by reference; everything
+            // else keeps the original text.
+            Err(arc) => match engine_error_by_ref(&arc) {
                 Some(engine) => Ok(engine),
                 None => Err(DataFusionError::Shared(arc)),
             },
@@ -518,24 +524,63 @@ fn extract_engine_error(
     }
 }
 
-/// FIND a [`JammiError::Unavailable`] anywhere under `e` (through `Context` /
-/// `Shared` wrappers) and rebuild it by reference — the only variant that can
-/// be reconstructed from a borrowed error. A finder only: it never produces
-/// text, so a `Context` description is never dropped by it.
-fn unavailable_by_ref(e: &datafusion::error::DataFusionError) -> Option<JammiError> {
+/// FIND a typed engine error anywhere under `e` (through `Context` / `Shared`
+/// / nested `External` wrappers) and rebuild it BY REFERENCE — the arm for a
+/// `Shared(Arc<_>)` that is still shared elsewhere (the hydration join keeps
+/// its build side's error alive), where the box cannot be moved out.
+/// `JammiError` is not `Clone`, so this rebuilds field by field the variants
+/// the search leaf raises: a `Schema` refusal, a corrupt-artifact
+/// `IncompatibleFormat`, a peer-ladder `Unavailable`, and the string-carrying
+/// engine faults. Anything else keeps the original text. A finder only: it
+/// never produces text, so a `Context` description is never dropped by it.
+fn engine_error_by_ref(e: &datafusion::error::DataFusionError) -> Option<JammiError> {
     use datafusion::error::DataFusionError;
     match e {
         DataFusionError::External(boxed) => match boxed.downcast_ref::<JammiError>() {
-            Some(JammiError::Unavailable { resource, reason }) => Some(JammiError::Unavailable {
-                resource: resource.clone(),
-                reason: reason.clone(),
-            }),
-            _ => None,
+            Some(engine) => rebuild_engine_error(engine),
+            None => boxed
+                .downcast_ref::<DataFusionError>()
+                .and_then(engine_error_by_ref),
         },
-        DataFusionError::Context(_, inner) => unavailable_by_ref(inner),
-        DataFusionError::Shared(arc) => unavailable_by_ref(arc),
+        DataFusionError::Context(_, inner) => engine_error_by_ref(inner),
+        DataFusionError::Shared(arc) => engine_error_by_ref(arc),
         _ => None,
     }
+}
+
+/// Field-by-field rebuild of the engine variants a plan leaf raises.
+fn rebuild_engine_error(e: &JammiError) -> Option<JammiError> {
+    Some(match e {
+        JammiError::Unavailable { resource, reason } => JammiError::Unavailable {
+            resource: resource.clone(),
+            reason: reason.clone(),
+        },
+        JammiError::Schema {
+            table,
+            column,
+            expected,
+            actual,
+        } => JammiError::Schema {
+            table: table.clone(),
+            column: column.clone(),
+            expected: expected.clone(),
+            actual: actual.clone(),
+        },
+        JammiError::IncompatibleFormat {
+            artifact,
+            found,
+            supported,
+        } => JammiError::IncompatibleFormat {
+            artifact: artifact.clone(),
+            found: found.clone(),
+            supported: supported.clone(),
+        },
+        JammiError::Catalog(m) => JammiError::Catalog(m.clone()),
+        JammiError::Config(m) => JammiError::Config(m.clone()),
+        JammiError::Inference(m) => JammiError::Inference(m.clone()),
+        JammiError::Other(m) => JammiError::Other(m.clone()),
+        _ => return None,
+    })
 }
 
 #[cfg(test)]
@@ -566,6 +611,55 @@ mod plan_error_tests {
         let expected = format!("Search collect: {shared}");
         let got = plan_error("Search collect", shared);
         assert_eq!(got.to_string(), expected);
+    }
+
+    /// The stream machinery's `External(Box<DataFusionError>)` re-wrap is
+    /// walked through too — the exact-path sink's typed error must survive
+    /// `Search collect` as itself, not as `Other("External error: …")`.
+    #[test]
+    fn engine_error_under_a_nested_external_is_recovered_typed() {
+        let inner = DataFusionError::External(Box::new(JammiError::IncompatibleFormat {
+            artifact: "t.vector".into(),
+            found: "row 'x' yields a non-finite distance".into(),
+            supported: "finite f32 components".into(),
+        }));
+        let outer = DataFusionError::External(Box::new(inner));
+        assert!(matches!(
+            plan_error("Search collect", outer),
+            JammiError::IncompatibleFormat { .. }
+        ));
+        // A non-engine nested External keeps its text verbatim.
+        let plain = DataFusionError::External(Box::new(DataFusionError::Plan("bad".into())));
+        let expected = format!("Search collect: {plain}");
+        assert_eq!(plan_error("Search collect", plain).to_string(), expected);
+    }
+
+    /// A `Shared(Arc<_>)` that is STILL SHARED (the hydration join's build
+    /// side) cannot be moved out of; the leaf's typed variants are rebuilt by
+    /// reference — the corrupt-artifact and schema classes included, not only
+    /// `Unavailable`.
+    #[test]
+    fn still_shared_engine_errors_are_rebuilt_by_reference() {
+        for engine in [
+            JammiError::IncompatibleFormat {
+                artifact: "t.vector".into(),
+                found: "row 'x' yields a non-finite distance".into(),
+                supported: "finite f32 components".into(),
+            },
+            JammiError::Schema {
+                table: "query".into(),
+                column: "query".into(),
+                expected: "4 dimensions".into(),
+                actual: "5 dimensions".into(),
+            },
+        ] {
+            let expected_text = engine.to_string();
+            let arc = Arc::new(DataFusionError::External(Box::new(engine)));
+            let _still_shared = Arc::clone(&arc);
+            let got = plan_error("Search collect", DataFusionError::Shared(arc));
+            assert_eq!(got.to_string(), expected_text, "{got:?}");
+            assert!(!matches!(got, JammiError::Other(_)), "{got:?}");
+        }
     }
 
     /// A typed engine error under `Context` / `Shared` is recovered as itself.

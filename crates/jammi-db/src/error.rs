@@ -521,6 +521,43 @@ impl From<datafusion::error::DataFusionError> for JammiError {
     }
 }
 
+/// A refused query vector, classified by its provenance
+/// ([`jammi_numerics::query::QuerySource`]): a CALLER's vector is the caller's
+/// fault — the schema class every width mismatch already maps to (gRPC
+/// `InvalidArgument`); a vector read back from STORAGE is a corrupt artifact
+/// named by its table (the same class an unreadable sidecar maps to, gRPC
+/// `Internal`).
+impl From<jammi_numerics::query::QueryValidationError> for JammiError {
+    fn from(e: jammi_numerics::query::QueryValidationError) -> Self {
+        use jammi_numerics::query::{QuerySource, QueryValidationError};
+        let (expected, actual) = match &e {
+            QueryValidationError::NonFinite { index, value, .. } => (
+                "finite f32 components".to_string(),
+                format!("component {index} is {value:?}"),
+            ),
+            QueryValidationError::Width {
+                expected, actual, ..
+            } => (
+                format!("{expected} dimensions"),
+                format!("{actual} dimensions"),
+            ),
+        };
+        match e.source() {
+            QuerySource::Caller => JammiError::Schema {
+                table: "query".into(),
+                column: "query".into(),
+                expected,
+                actual,
+            },
+            QuerySource::Stored { table } => JammiError::IncompatibleFormat {
+                artifact: format!("{table}.vector"),
+                found: actual,
+                supported: expected,
+            },
+        }
+    }
+}
+
 /// Shape (a): destructure `e` by value looking for an `External(Box<JammiError>)`
 /// payload, recursing through the three Box-carrying wrappers and rebuilding the
 /// original on a miss.

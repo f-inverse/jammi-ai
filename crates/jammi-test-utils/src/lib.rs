@@ -354,3 +354,13 @@ pub async fn abandon_building(
         .unwrap();
     name
 }
+
+/// A test query vector: validated (every component finite) with NO width in
+/// hand — the index or scan it meets enforces the width. The one way a test
+/// turns a literal into the [`jammi_db::index::ValidatedQuery`] every search
+/// entry takes; a test that wants a width fault validates with a width, or
+/// lets the entry refuse it.
+pub fn vq(v: &[f32]) -> jammi_db::index::ValidatedQuery {
+    jammi_db::index::validate_query(v.to_vec(), None, jammi_db::index::QuerySource::Caller)
+        .expect("a finite literal test query validates")
+}

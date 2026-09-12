@@ -145,6 +145,14 @@ impl<'a> EvalRunner<'a> {
                 }
             };
 
+            // The encoder's output for this query is the query the run
+            // supplied — validated (finite) before it meets an index, which
+            // enforces the width.
+            let query_vec = jammi_db::index::validate_query(
+                query_vec,
+                None,
+                jammi_db::index::QuerySource::Caller,
+            )?;
             // FORCE-LOCAL: eval is a batch per-query loop; it loads every
             // segment locally and never fans out per node.
             let search_results = result_store

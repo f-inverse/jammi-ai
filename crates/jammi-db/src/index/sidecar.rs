@@ -6,7 +6,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::config::{AnnIndexConfig, StoragePrecision};
 use crate::error::{JammiError, Result};
-use crate::index::VectorIndex;
+use crate::index::{ValidatedQuery, VectorIndex};
 
 /// Current rowmap format version.
 const ROWMAP_VERSION: u32 = 1;
@@ -843,7 +843,11 @@ impl VectorIndex for SidecarIndex {
         Ok(())
     }
 
-    fn search(&self, query: &[f32], k: usize) -> Result<Vec<(String, f32)>> {
+    fn search(&self, query: &ValidatedQuery, k: usize) -> Result<Vec<(String, f32)>> {
+        // The index is the authority on width: a `ValidatedQuery` validated
+        // with no width in hand meets it here, typed, before any kernel.
+        query.require_width(self.dimensions)?;
+        let query: &[f32] = query;
         if self.row_map.is_empty() {
             return Ok(Vec::new());
         }
@@ -895,6 +899,14 @@ impl VectorIndex for SidecarIndex {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::index::{validate_query, QuerySource};
+
+    /// A test query: validated (finite) with no width in hand — the index or
+    /// scan it meets enforces the width.
+    fn vq(v: &[f32]) -> ValidatedQuery {
+        validate_query(v.to_vec(), None, QuerySource::Caller).unwrap()
+    }
+
     use tempfile::tempdir;
 
     // USearch's built-in HNSW defaults — what a `0` knob resolves to. Pinned
@@ -1342,7 +1354,7 @@ mod tests {
         }
         idx.build().unwrap();
 
-        let query = vectors[5].clone();
+        let query = vq(&vectors[5]);
         let hits = idx.search(&query, 1).unwrap();
         assert_eq!(hits.len(), 1);
         assert_eq!(hits[0].0, "row-5");
@@ -1403,6 +1415,7 @@ mod tests {
         let oversample = StoragePrecision::Binary.default_oversample();
         let candidate_k = (k * oversample).min(vectors.len());
 
+        let query = vq(&query);
         let candidates = idx.search(&query, candidate_k).unwrap();
         assert_eq!(
             candidates.len(),
@@ -1590,7 +1603,7 @@ mod tests {
         use jammi_numerics::distance::cosine_distance;
         let mut ranked: Vec<(String, f32)> = corpus
             .iter()
-            .map(|(id, v)| (id.clone(), cosine_distance(query, v)))
+            .map(|(id, v)| (id.clone(), cosine_distance(&vq(query), v)))
             .collect();
         ranked.sort_by(|a, b| a.1.total_cmp(&b.1).then_with(|| a.0.cmp(&b.0)));
         ranked.truncate(k);
@@ -1627,7 +1640,7 @@ mod tests {
             .into_iter()
             .map(|(id, _)| {
                 let v = &corpus.iter().find(|(cid, _)| cid == &id).unwrap().1;
-                (id, cosine_distance(query, v))
+                (id, cosine_distance(&vq(query), v))
             })
             .collect();
         rescored.sort_by(|a, b| a.1.total_cmp(&b.1).then_with(|| a.0.cmp(&b.0)));
@@ -1645,12 +1658,12 @@ mod tests {
         candidate_k: usize,
     ) -> Vec<String> {
         use jammi_numerics::distance::cosine_distance;
-        let candidates = index.search(query, candidate_k).unwrap();
+        let candidates = index.search(&vq(query), candidate_k).unwrap();
         let mut rescored: Vec<(String, f32)> = candidates
             .into_iter()
             .map(|(id, _)| {
                 let exact = index.get_exact(&id).unwrap().unwrap();
-                (id, cosine_distance(query, &exact))
+                (id, cosine_distance(&vq(query), &exact))
             })
             .collect();
         rescored.sort_by(|a, b| a.1.total_cmp(&b.1).then_with(|| a.0.cmp(&b.0)));
@@ -1846,7 +1859,7 @@ mod tests {
         // bit-identical to a corpus row (post-threshold) is its own nearest
         // neighbour at Hamming 0 whether we search the freshly-built or the
         // reloaded index.
-        let query = vectors[7].clone();
+        let query = vq(&vectors[7]);
         let hits_built = idx.search(&query, 1).unwrap();
         let hits_loaded = loaded.search(&query, 1).unwrap();
         assert_eq!(hits_built, hits_loaded);
@@ -1883,7 +1896,7 @@ mod tests {
 
         // Same τ implies identical packed codes, so an identical query
         // returns identical results both times.
-        let query = vectors[10].1.clone();
+        let query = vq(&vectors[10].1);
         assert_eq!(
             idx_a.search(&query, 5).unwrap(),
             idx_b.search(&query, 5).unwrap()
@@ -1919,7 +1932,7 @@ mod tests {
             .iter()
             .map(|(id, _)| idx.get_exact(id).unwrap().unwrap())
             .collect();
-        let query = vectors[3].1.clone();
+        let query = vq(&vectors[3].1);
         let candidates_with_fitted = idx.search(&query, vectors.len()).unwrap();
 
         // Swap in a DIFFERENT threshold (the pre-fix all-zero one) directly

@@ -9,19 +9,36 @@
 //! carries no tenant, and this handler reads no `result_tables` row. Tenant
 //! scope was enforced by the COORDINATOR, which resolved the table through its
 //! own tenant-scoped catalog read before fanning out. What the owner enforces,
-//! at its input edge, is everything the request claims about the owner's own
-//! data: (1) every requested segment id belongs to the named table, is named
-//! once, and at least one is named (else `INVALID_ARGUMENT` — the whole
-//! request is refused, never a partial unit); (2) the bundle's stamped
-//! precision matches the requested one (the segment cache's strict load
-//! refuses otherwise → `FAILED_PRECONDITION`); (3) the query is exactly as
-//! wide as the segment (else `INVALID_ARGUMENT`, before any kernel can index
-//! past a vector or score a prefix); (4) every `ExactRescore` row id is
-//! indexed by its segment and named once (else `INVALID_ARGUMENT`, never
-//! mistaken for a torn bundle). It then runs the same pure kernels a single node
-//! runs ([`jammi_db::index::segment::search_unit`] / [`rescore`]) per segment
-//! and returns `(row_id, distance)` units — ids and distances, never vectors.
-//! A torn bundle (a candidate with no exact vector) is `DATA_LOSS`.
+//! at its input edge, splits on WHOSE fault a refusal is — never on how it
+//! looks at a glance:
+//!
+//! - Genuine REQUEST malformation is `INVALID_ARGUMENT`, TERMINAL at the
+//!   coordinator (never a ladder rung): an empty or duplicated segment id in
+//!   the requested set, a duplicated `ExactRescore` row id, a query component
+//!   that is not finite, a `width` that does not fit `usize`, and a
+//!   precision/phase enum whose raw value is `0` (`UNSPECIFIED` — explicitly
+//!   not set).
+//! - A disagreement about the OWNER's OWN DATA — never the coordinator's
+//!   fault — is `FAILED_PRECONDITION`, which LADDERS (a retry, then a local
+//!   load): a requested segment id absent from this owner's own segment list
+//!   (its `list_index_segments` read can race a concurrent
+//!   `purge_segments`/append); the bundle's stamped precision not matching
+//!   the requested one (the segment cache's strict load); the query's width
+//!   not matching the loaded segment's own width (the coordinator
+//!   authoritatively enforces width against ITS OWN index or catalog row
+//!   before any fan-out, so a mismatch reported BY AN OWNER can only be this
+//!   owner's segment drifting from that authority — never the caller's
+//!   fault); an `ExactRescore` row id this owner's segment does not index
+//!   (this owner reloads its segment per RPC, so a rebuild between phases can
+//!   move ids out from under it); and a precision/phase enum raw value this
+//!   build's generated `enum` has no variant for but is non-zero (a value a
+//!   NEWER coordinator knows and this owner does not — rolling-upgrade
+//!   version skew, not malformation).
+//!
+//! It then runs the same pure kernels a single node runs
+//! ([`jammi_db::index::segment::search_unit`] / [`rescore`]) per segment and
+//! returns `(row_id, distance)` units — ids and distances, never vectors. A
+//! torn bundle (a candidate with no exact vector) is `DATA_LOSS`.
 //!
 //! Segments are loaded per RPC exactly as a coordinator loads per query —
 //! through the content-addressed segment cache (a `file://` bundle loads in
@@ -36,10 +53,10 @@ use jammi_db::config::StoragePrecision;
 use jammi_db::error::JammiError;
 use jammi_db::index::segment::{rescore, search_unit};
 use jammi_db::index::sidecar::SidecarIndex;
-use jammi_db::index::SegmentId;
+use jammi_db::index::{validate_query, QuerySource, SegmentId, SegmentSearchPhase};
 use jammi_db::storage::StorageUrl;
 use jammi_db::store::ResultStore;
-use jammi_wire::peer::{phase_from_proto, precision_from_proto};
+use jammi_wire::peer::{phase_from_proto, precision_from_proto, ProtoEnumDecode};
 use tonic::{Request, Response, Status};
 
 use crate::grpc::proto::peer::peer_service_server::PeerService;
@@ -100,10 +117,13 @@ impl PeerServer {
     }
 }
 
-/// Every requested id must be in the table's segment list, named once, and
-/// at least one must be named; the first violation refuses the WHOLE
-/// request (a unit-less or partial answer would be a silent shrink at the
-/// coordinator).
+/// Every requested id must be named once and at least one must be named
+/// (request malformation, `INVALID_ARGUMENT`); each named id must ALSO be in
+/// this owner's own segment list — own-data, `FAILED_PRECONDITION`, since the
+/// owner's `list_index_segments` read can race a concurrent
+/// `purge_segments`/append and disagree with the coordinator's. The first
+/// violation refuses the WHOLE request (a unit-less or partial answer would
+/// be a silent shrink at the coordinator).
 fn verify_membership(
     table_name: &str,
     requested: &[i64],
@@ -122,7 +142,7 @@ fn verify_membership(
             )));
         }
         if !segments.iter().any(|s| s.segment_id == *id) {
-            return Err(Status::invalid_argument(format!(
+            return Err(Status::failed_precondition(format!(
                 "segment {id} is not a segment of table '{table_name}'"
             )));
         }
@@ -133,7 +153,12 @@ fn verify_membership(
 /// The query must be exactly as wide as the segment it is searched against:
 /// a longer query would index past the stored vector in `cosine_distance`
 /// (a panic), a shorter one would be silently scored over a prefix. Checked
-/// BEFORE any kernel runs, against the loaded segment's own width.
+/// BEFORE any kernel runs, against the loaded segment's own width. The
+/// coordinator authoritatively enforces width against its own local index or
+/// the catalog's recorded `dimensions` before ANY fan-out, so a mismatch
+/// reported BY AN OWNER can only mean this owner's segment has drifted from
+/// that authority — own-data, `FAILED_PRECONDITION`, never the caller's
+/// fault.
 fn verify_query_width(
     table_name: &str,
     segment_id: i64,
@@ -141,7 +166,7 @@ fn verify_query_width(
     index: &SidecarIndex,
 ) -> Result<(), Status> {
     if query.len() != index.dimensions() {
-        return Err(Status::invalid_argument(format!(
+        return Err(Status::failed_precondition(format!(
             "query has width {} but segment {table_name}/{segment_id} has width {}",
             query.len(),
             index.dimensions()
@@ -150,11 +175,13 @@ fn verify_query_width(
     Ok(())
 }
 
-/// Every row id an `ExactRescore` names must be indexed by the segment it is
-/// named under, and named once — an unknown or duplicated id is a caller
-/// fault at the input edge, never mistaken for a torn bundle by the rescore
-/// kernel (whose `Ok(None)` is reserved for a row the graph holds but the
-/// companion lost).
+/// Every row id an `ExactRescore` names must be named once (request
+/// malformation, `INVALID_ARGUMENT`) and indexed by the segment it is named
+/// under — an id this owner's segment does not index is own-data,
+/// `FAILED_PRECONDITION`, since this owner reloads its segment per RPC and a
+/// rebuild between phases can move ids out from under it. Never mistaken for
+/// a torn bundle by the rescore kernel (whose `Ok(None)` is reserved for a
+/// row the graph holds but the companion lost).
 fn verify_row_ids(
     table_name: &str,
     segment_id: i64,
@@ -169,7 +196,7 @@ fn verify_row_ids(
             )));
         }
         if !index.contains_row(row_id) {
-            return Err(Status::invalid_argument(format!(
+            return Err(Status::failed_precondition(format!(
                 "row '{row_id}' is not indexed by segment {table_name}/{segment_id}"
             )));
         }
@@ -178,14 +205,16 @@ fn verify_row_ids(
 }
 
 /// The catalog row for a requested id. Membership was verified above, but
-/// the id is a wire value, so a miss is a typed refusal — never a panic.
+/// the id is a wire value re-looked-up against this owner's own segment
+/// list, so a miss is own-data — `FAILED_PRECONDITION`, the same class as
+/// [`verify_membership`]'s — never a panic.
 fn segment<'a>(
     table_name: &str,
     segments: &'a [IndexSegment],
     id: i64,
 ) -> Result<&'a IndexSegment, Status> {
     segments.iter().find(|s| s.segment_id == id).ok_or_else(|| {
-        Status::invalid_argument(format!(
+        Status::failed_precondition(format!(
             "segment {id} is not a segment of table '{table_name}'"
         ))
     })
@@ -207,6 +236,37 @@ fn hits(pairs: Vec<(String, f32)>) -> Vec<Hit> {
         .collect()
 }
 
+/// Decode `raw`'s storage precision, split on WHOSE fault an unrecognised
+/// value is: `0` (`UNSPECIFIED`) is the wire's explicit "not set" — request
+/// malformation, `INVALID_ARGUMENT`; a non-zero value this owner's generated
+/// `enum` has no variant for is a value a NEWER coordinator knows and this
+/// (older) owner does not — rolling-upgrade version skew, own-data,
+/// `FAILED_PRECONDITION` (ladders).
+fn decode_precision(raw: i32) -> Result<StoragePrecision, Status> {
+    match precision_from_proto(raw) {
+        ProtoEnumDecode::Known(precision) => Ok(precision),
+        ProtoEnumDecode::Unspecified => {
+            Err(Status::invalid_argument("storage_precision is unspecified"))
+        }
+        ProtoEnumDecode::Unknown => Err(Status::failed_precondition(format!(
+            "storage_precision {raw} is not a value this owner's build recognises (likely a \
+             newer coordinator's value during a rolling upgrade)"
+        ))),
+    }
+}
+
+/// Decode `raw`'s search phase, split the same way as [`decode_precision`].
+fn decode_phase(raw: i32) -> Result<SegmentSearchPhase, Status> {
+    match phase_from_proto(raw) {
+        ProtoEnumDecode::Known(phase) => Ok(phase),
+        ProtoEnumDecode::Unspecified => Err(Status::invalid_argument("phase is unspecified")),
+        ProtoEnumDecode::Unknown => Err(Status::failed_precondition(format!(
+            "phase {raw} is not a value this owner's build recognises (likely a newer \
+             coordinator's value during a rolling upgrade)"
+        ))),
+    }
+}
+
 #[tonic::async_trait]
 impl PeerService for PeerServer {
     #[tracing::instrument(skip(self, request))]
@@ -215,12 +275,16 @@ impl PeerService for PeerServer {
         request: Request<SegmentSearchRequest>,
     ) -> Result<Response<SegmentSearchResponse>, Status> {
         let req = request.into_inner();
-        let precision = precision_from_proto(req.storage_precision)
-            .ok_or_else(|| Status::invalid_argument("storage_precision is unspecified"))?;
-        let phase = phase_from_proto(req.phase)
-            .ok_or_else(|| Status::invalid_argument("phase is unspecified"))?;
+        let precision = decode_precision(req.storage_precision)?;
+        let phase = decode_phase(req.phase)?;
         let width = usize::try_from(req.width)
             .map_err(|_| Status::invalid_argument("width does not fit usize"))?;
+        // The wire vector becomes a `ValidatedQuery` HERE, at the owner's
+        // edge, as a CALLER's vector: a non-finite component is
+        // `INVALID_ARGUMENT` (a coordinator that sent it missed its own check),
+        // never a torn bundle. The width is enforced per segment below.
+        let query = validate_query(req.query.clone(), None, QuerySource::Caller)
+            .map_err(|e| map_engine_error(JammiError::from(e)))?;
         let store = self.session.result_store();
         let segments = self.segments_of(&store, &req.table_name).await?;
         verify_membership(&req.table_name, &req.segment_ids, &segments)?;
@@ -234,8 +298,8 @@ impl PeerService for PeerServer {
                 precision,
             )
             .await?;
-            verify_query_width(&req.table_name, id, &req.query, &index)?;
-            let unit = search_unit(SegmentId(id), &index, &req.query, width, phase, &|row_id| {
+            verify_query_width(&req.table_name, id, &query, &index)?;
+            let unit = search_unit(SegmentId(id), &index, &query, width, phase, &|row_id| {
                 index.get_exact(row_id)
             })
             .map_err(|e| torn(&req.table_name, id, e))?;
@@ -253,8 +317,9 @@ impl PeerService for PeerServer {
         request: Request<ExactRescoreRequest>,
     ) -> Result<Response<ExactRescoreResponse>, Status> {
         let req = request.into_inner();
-        let precision = precision_from_proto(req.storage_precision)
-            .ok_or_else(|| Status::invalid_argument("storage_precision is unspecified"))?;
+        let precision = decode_precision(req.storage_precision)?;
+        let query = validate_query(req.query.clone(), None, QuerySource::Caller)
+            .map_err(|e| map_engine_error(JammiError::from(e)))?;
         let store = self.session.result_store();
         let segments = self.segments_of(&store, &req.table_name).await?;
         let requested: Vec<i64> = req
@@ -274,14 +339,14 @@ impl PeerService for PeerServer {
                 precision,
             )
             .await?;
-            verify_query_width(&req.table_name, id, &req.query, &index)?;
+            verify_query_width(&req.table_name, id, &query, &index)?;
             verify_row_ids(&req.table_name, id, &group.row_ids, &index)?;
             let candidates = group.row_ids.into_iter().map(|r| (r, 0.0f32)).collect();
             let rescored = rescore(
                 SegmentId(id),
                 candidates,
                 &|row_id| index.get_exact(row_id),
-                &req.query,
+                &query,
             )
             .map_err(|e| torn(&req.table_name, id, e))?;
             out.extend(rescored);

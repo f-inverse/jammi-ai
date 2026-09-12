@@ -4,12 +4,15 @@
 //! - A4: `peer_bind` unset → no third listener; set → bound, ephemeral.
 //! - A5 / commit-2 (c): `SegmentSearch` over `peer_bind` byte-equals the
 //!   in-process `search_unit` on the same segment; an id outside the table's
-//!   segment list is refused `INVALID_ARGUMENT` (the whole request, never an
-//!   empty unit); a precision that mismatches the bundle is refused
-//!   (`FAILED_PRECONDITION`); `ExactRescore` equals the in-process `rescore`;
-//!   a query of the wrong width, an unknown or duplicated row id, a
-//!   duplicated or empty segment list are `INVALID_ARGUMENT` at the input
-//!   edge (`owner_refuses_non_conforming_requests_with_invalid_argument`).
+//!   segment list, a query of the wrong width, and an unknown row id are all
+//!   own-data — `FAILED_PRECONDITION` (the whole request refused, never an
+//!   empty unit; this owner's own data disagreeing with the coordinator's,
+//!   never the caller's fault, so it ladders); a precision that mismatches
+//!   the bundle is refused the same way; `ExactRescore` equals the
+//!   in-process `rescore`; a duplicated row id, a duplicated or empty
+//!   segment list, and a non-finite component are genuine request
+//!   malformation — `INVALID_ARGUMENT`, terminal at the coordinator
+//!   (`owner_refuses_non_conforming_requests`).
 //! - A6 / commit-2 (d): the PUBLIC listener of the same server answers
 //!   `UNIMPLEMENTED` for `PeerService/*`.
 //! - Observability: `jammi_peer_requests_total{rpc}` counts the served
@@ -27,6 +30,7 @@ use jammi_db::index::{SegmentSearchPhase, VectorIndex};
 use jammi_db::model_task::ModelTask;
 use jammi_db::storage::StorageUrl;
 use jammi_db::store::{BuildingTable, ResultStore};
+use jammi_test_utils::vq;
 use jammi_wire::proto::peer::peer_service_client::PeerServiceClient;
 use jammi_wire::proto::peer::{
     self as pb, ExactRescoreRequest, SegmentRowIds, SegmentSearchRequest,
@@ -141,7 +145,7 @@ async fn segment_search_over_peer_bind_equals_in_process_search_unit() {
     let want = search_unit(
         jammi_db::index::SegmentId(0),
         &index,
-        &q,
+        &vq(&q),
         3,
         SegmentSearchPhase::Final,
         &|id| index.get_exact(id),
@@ -184,7 +188,11 @@ async fn segment_search_over_peer_bind_equals_in_process_search_unit() {
         })
         .await
         .expect_err("segment 7 is not a segment of the table");
-    assert_eq!(err.code(), Code::InvalidArgument, "{err:?}");
+    // Own-data: the owner's OWN segment list disagrees with what the
+    // coordinator named — never the caller's fault. `FAILED_PRECONDITION`,
+    // which ladders (a retry, then a local load), unlike a genuine request
+    // fault.
+    assert_eq!(err.code(), Code::FailedPrecondition, "{err:?}");
     assert!(
         err.message().contains('7') && err.message().contains(&table_name),
         "{err:?}"
@@ -204,7 +212,8 @@ async fn segment_search_over_peer_bind_equals_in_process_search_unit() {
         .expect_err("an F32 bundle is not an Int8 bundle");
     assert_eq!(err.code(), Code::FailedPrecondition, "{err:?}");
 
-    // Unspecified enums are refused, never defaulted.
+    // Unspecified enums (raw 0) are request malformation — refused, never
+    // defaulted.
     let err = client
         .segment_search(SegmentSearchRequest {
             table_name: table_name.clone(),
@@ -217,6 +226,35 @@ async fn segment_search_over_peer_bind_equals_in_process_search_unit() {
         .await
         .expect_err("unspecified precision");
     assert_eq!(err.code(), Code::InvalidArgument, "{err:?}");
+
+    // An UNRECOGNISED non-zero raw enum value is NOT the same fault: it is a
+    // value a newer coordinator knows and this owner's build does not —
+    // rolling-upgrade version skew, own-data, `FAILED_PRECONDITION` (ladders).
+    // `0` and an unrecognised non-zero value must never collapse.
+    let err = client
+        .segment_search(SegmentSearchRequest {
+            table_name: table_name.clone(),
+            segment_ids: vec![0],
+            storage_precision: 99,
+            query: q.to_vec(),
+            width: 3,
+            phase: pb::SegmentSearchPhase::Final as i32,
+        })
+        .await
+        .expect_err("an unrecognised non-zero precision value");
+    assert_eq!(err.code(), Code::FailedPrecondition, "{err:?}");
+    let err = client
+        .segment_search(SegmentSearchRequest {
+            table_name: table_name.clone(),
+            segment_ids: vec![0],
+            storage_precision: pb::StoragePrecision::F32 as i32,
+            query: q.to_vec(),
+            width: 3,
+            phase: 99,
+        })
+        .await
+        .expect_err("an unrecognised non-zero phase value");
+    assert_eq!(err.code(), Code::FailedPrecondition, "{err:?}");
 
     // (d) The SAME server's PUBLIC listener answers UNIMPLEMENTED.
     let mut public = PeerServiceClient::new(channel(server.public_addr).await);
@@ -280,7 +318,7 @@ async fn exact_rescore_over_peer_bind_equals_in_process_rescore() {
             ("b".to_string(), 0.0),
         ],
         &|id| index.get_exact(id),
-        &q,
+        &vq(&q),
     )
     .unwrap();
 
@@ -313,10 +351,13 @@ async fn exact_rescore_over_peer_bind_equals_in_process_rescore() {
             }],
         })
         .await
-        .expect_err("a row id the segment does not index is a caller fault");
-    // NOT `DATA_LOSS`: an unknown id is refused at the input edge, so it can
-    // never drive the coordinator's local-load rung as a "torn" owner would.
-    assert_eq!(err.code(), Code::InvalidArgument, "{err:?}");
+        .expect_err("a row id the segment does not index is own-data, not a caller fault");
+    // Own-data, NOT `DATA_LOSS` and not the caller's fault: this owner
+    // reloads its segment per RPC, so a rebuild between phases can move ids
+    // out from under it — `FAILED_PRECONDITION`, which ladders, never drives
+    // the coordinator's local-load rung with the wrong reason a `DATA_LOSS`
+    // "torn" classification would.
+    assert_eq!(err.code(), Code::FailedPrecondition, "{err:?}");
 
     let err = client
         .exact_rescore(ExactRescoreRequest {
@@ -330,7 +371,169 @@ async fn exact_rescore_over_peer_bind_equals_in_process_rescore() {
         })
         .await
         .expect_err("segment 3 is not a segment of the table");
+    // Own-data: the same class as the SegmentSearch case above.
+    assert_eq!(err.code(), Code::FailedPrecondition, "{err:?}");
+
+    table.abort().await.unwrap();
+    let _ = server.shutdown.send(());
+    let _ = server.handle.await;
+}
+
+// Input-edge reconciliation at the OWNER: every value that arrives over the
+// peer seam is checked against what the owner knows before any kernel runs
+// — never a panic, never a silent prefix-scored answer, never `DATA_LOSS`
+// (which would drive the coordinator's local-load rung for a fault the
+// coordinator itself caused). The class splits on WHOSE fault it is: a
+// genuinely malformed request (an empty or duplicated segment id, a
+// duplicated row id, a non-finite component) is `INVALID_ARGUMENT`,
+// TERMINAL at the coordinator; a width or row-id mismatch against THIS
+// OWNER's own loaded segment is own-data — `FAILED_PRECONDITION`, which
+// ladders — because the coordinator authoritatively enforces width against
+// its own index or the catalog before any fan-out, so an owner-reported
+// width mismatch can only be this owner's segment drifting from that
+// authority, never the caller's fault.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn owner_refuses_non_conforming_requests() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut cfg = peer_bind_config(dir.path());
+    cfg.embedding.ann.storage_precision = StoragePrecision::Int8;
+    let server = start_engine_server_from_config(cfg, Some(dir)).await;
+    let store = server.engine.result_store();
+    let table = building_table(&store, "src_edge").await;
+    table
+        .append_segment(&built_index(&ROWS, StoragePrecision::Int8))
+        .await
+        .unwrap();
+    let table_name = table.table_name().to_string();
+    let mut client = PeerServiceClient::new(channel(server.peer_addr).await);
+    let search = |query: Vec<f32>, segment_ids: Vec<i64>| SegmentSearchRequest {
+        table_name: table_name.clone(),
+        segment_ids,
+        storage_precision: pb::StoragePrecision::Int8 as i32,
+        query,
+        width: 3,
+        phase: pb::SegmentSearchPhase::Approximate as i32,
+    };
+    let rescore_req = |query: Vec<f32>, groups: Vec<SegmentRowIds>| ExactRescoreRequest {
+        table_name: table_name.clone(),
+        storage_precision: pb::StoragePrecision::Int8 as i32,
+        query,
+        row_ids_by_segment: groups,
+    };
+    let rows = |ids: &[&str]| SegmentRowIds {
+        segment_id: 0,
+        row_ids: ids.iter().map(|s| s.to_string()).collect(),
+    };
+
+    // A LONGER query than the segment's dimensions (5 vs 4): SegmentSearch.
+    // Own-data: the coordinator authoritatively enforces width before any
+    // fan-out, so an owner-reported mismatch can only be THIS owner's
+    // segment drifting from that authority.
+    let err = client
+        .segment_search(search(vec![1.0, 0.0, 0.0, 0.0, 0.0], vec![0]))
+        .await
+        .expect_err("a 5-wide query against a 4-wide segment is own-data, not a caller fault");
+    assert_eq!(err.code(), Code::FailedPrecondition, "{err:?}");
+    assert!(
+        err.message().contains('5') && err.message().contains('4'),
+        "{err:?}"
+    );
+    // … and ExactRescore (this one indexes past the stored vector in `cosine_distance`).
+    let err = client
+        .exact_rescore(rescore_req(
+            vec![1.0, 0.0, 0.0, 0.0, 0.0],
+            vec![rows(&["a"])],
+        ))
+        .await
+        .expect_err("a longer query must be refused, never panic");
+    assert_eq!(err.code(), Code::FailedPrecondition, "{err:?}");
+    // A SHORTER query (3 vs 4): refused, never silently scored over a prefix.
+    let err = client
+        .segment_search(search(vec![1.0, 0.0, 0.0], vec![0]))
+        .await
+        .expect_err("a 3-wide query is own-data, not a caller fault");
+    assert_eq!(err.code(), Code::FailedPrecondition, "{err:?}");
+    let err = client
+        .exact_rescore(rescore_req(vec![1.0, 0.0, 0.0], vec![rows(&["a"])]))
+        .await
+        .expect_err("a 3-wide query is own-data, not a caller fault");
+    assert_eq!(err.code(), Code::FailedPrecondition, "{err:?}");
+    // An EMPTY query is the same fault.
+    let err = client
+        .segment_search(search(vec![], vec![0]))
+        .await
+        .expect_err("an empty query is own-data, not a caller fault");
+    assert_eq!(err.code(), Code::FailedPrecondition, "{err:?}");
+
+    // A4 — a NON-FINITE component is a CALLER fault at the owner's edge:
+    // `INVALID_ARGUMENT` on both rpcs, never `DATA_LOSS` (which would count
+    // as `torn` at the coordinator and drive its local-load rung).
+    for poison in [f32::NAN, f32::INFINITY, f32::NEG_INFINITY] {
+        let err = client
+            .segment_search(search(vec![poison, 0.0, 0.0, 0.0], vec![0]))
+            .await
+            .expect_err("a non-finite query component is a caller fault");
+        assert_eq!(err.code(), Code::InvalidArgument, "{poison:?}: {err:?}");
+        let err = client
+            .exact_rescore(rescore_req(vec![poison, 0.0, 0.0, 0.0], vec![rows(&["a"])]))
+            .await
+            .expect_err("a non-finite query component is a caller fault");
+        assert_eq!(err.code(), Code::InvalidArgument, "{poison:?}: {err:?}");
+    }
+
+    // A row id the segment does not index is own-data (this owner reloads
+    // its segment per RPC; a rebuild between phases can move ids out from
+    // under it), never the caller's fault and never a torn bundle.
+    let err = client
+        .exact_rescore(rescore_req(
+            vec![1.0, 0.0, 0.0, 0.0],
+            vec![rows(&["a", "ghost"])],
+        ))
+        .await
+        .expect_err("an unknown row id is own-data, not a caller fault");
+    assert_eq!(err.code(), Code::FailedPrecondition, "{err:?}");
+    assert!(err.message().contains("ghost"), "{err:?}");
+    // A row id named twice in one group is refused too.
+    let err = client
+        .exact_rescore(rescore_req(
+            vec![1.0, 0.0, 0.0, 0.0],
+            vec![rows(&["a", "a"])],
+        ))
+        .await
+        .expect_err("a duplicated row id is a caller fault");
     assert_eq!(err.code(), Code::InvalidArgument, "{err:?}");
+    // A segment named twice in one request (either RPC) is refused.
+    let err = client
+        .segment_search(search(vec![1.0, 0.0, 0.0, 0.0], vec![0, 0]))
+        .await
+        .expect_err("a duplicated segment id is a caller fault");
+    assert_eq!(err.code(), Code::InvalidArgument, "{err:?}");
+    let err = client
+        .exact_rescore(rescore_req(
+            vec![1.0, 0.0, 0.0, 0.0],
+            vec![rows(&["a"]), rows(&["b"])],
+        ))
+        .await
+        .expect_err("a duplicated segment group is a caller fault");
+    assert_eq!(err.code(), Code::InvalidArgument, "{err:?}");
+    // An empty segment list is refused (a unit-less answer would be a silent shrink).
+    let err = client
+        .segment_search(search(vec![1.0, 0.0, 0.0, 0.0], vec![]))
+        .await
+        .expect_err("an empty segment list is a caller fault");
+    assert_eq!(err.code(), Code::InvalidArgument, "{err:?}");
+
+    // The conforming request still serves — the edge refuses, it does not
+    // shadow the happy path.
+    let ok = client
+        .exact_rescore(rescore_req(
+            vec![1.0, 0.0, 0.0, 0.0],
+            vec![rows(&["a", "d"])],
+        ))
+        .await
+        .expect("a conforming ExactRescore serves")
+        .into_inner();
+    assert_eq!(ok.hits.len(), 2);
 
     table.abort().await.unwrap();
     let _ = server.shutdown.send(());

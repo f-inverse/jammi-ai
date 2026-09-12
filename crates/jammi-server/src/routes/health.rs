@@ -390,7 +390,7 @@ impl PeerFailureCollector {
     const NAME: &'static str = "jammi_peer_search_failures_total";
     const HELP: &'static str = "Total number of placed-search failure-ladder outcomes on this \
         replica as a coordinator, labelled by reason (deadline, unreachable, refused, torn, \
-        transport, malformed, retry_ok, local_load, unavailable).";
+        transport, malformed, caller_fault, retry_ok, local_load, unavailable).";
 
     fn new(counters: Arc<PeerFailureCounters>) -> Result<Self, prometheus::Error> {
         let desc = Desc::new(

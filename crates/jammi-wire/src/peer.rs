@@ -40,15 +40,49 @@ pub fn precision_to_proto(precision: StoragePrecision) -> pb::StoragePrecision {
     }
 }
 
-/// Decode a wire precision (the raw `i32` prost carries). `None` for
-/// `UNSPECIFIED` or an unknown value — the receiver refuses, never defaults.
-pub fn precision_from_proto(raw: i32) -> Option<StoragePrecision> {
-    match pb::StoragePrecision::try_from(raw).ok()? {
-        pb::StoragePrecision::F32 => Some(StoragePrecision::F32),
-        pb::StoragePrecision::F16 => Some(StoragePrecision::F16),
-        pb::StoragePrecision::Int8 => Some(StoragePrecision::Int8),
-        pb::StoragePrecision::Binary => Some(StoragePrecision::Binary),
-        pb::StoragePrecision::Unspecified => None,
+/// The outcome of decoding a wire enum whose raw `i32` may fail to name a
+/// value this build recognises. The two failure shapes are NOT the same
+/// fault: `UNSPECIFIED` (raw `0`) is the wire's explicit "not set" — real
+/// request malformation, the caller's own fault. Any other raw value this
+/// build's generated `enum` has no variant for is a value a NEWER build
+/// (coordinator or owner) knows and THIS build does not — version skew
+/// during a rolling upgrade, not malformation. The owner classifies the two
+/// differently (`INVALID_ARGUMENT` vs `FAILED_PRECONDITION`); this split is
+/// what makes that decision possible without re-deriving it from the raw
+/// integer at every call site.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ProtoEnumDecode<T> {
+    /// A value this build recognises.
+    Known(T),
+    /// The wire's explicit "not set" (raw value `0`).
+    Unspecified,
+    /// A non-zero raw value this build's generated `enum` has no variant
+    /// for.
+    Unknown,
+}
+
+impl<T> ProtoEnumDecode<T> {
+    /// `Some` for a recognised value, `None` for either refusal shape — the
+    /// shape a caller that does not need to distinguish them wants.
+    pub fn known(self) -> Option<T> {
+        match self {
+            ProtoEnumDecode::Known(value) => Some(value),
+            ProtoEnumDecode::Unspecified | ProtoEnumDecode::Unknown => None,
+        }
+    }
+}
+
+/// Decode a wire precision (the raw `i32` prost carries), split so
+/// `UNSPECIFIED` and an unrecognised non-zero value are never collapsed —
+/// see [`ProtoEnumDecode`].
+pub fn precision_from_proto(raw: i32) -> ProtoEnumDecode<StoragePrecision> {
+    match pb::StoragePrecision::try_from(raw) {
+        Ok(pb::StoragePrecision::F32) => ProtoEnumDecode::Known(StoragePrecision::F32),
+        Ok(pb::StoragePrecision::F16) => ProtoEnumDecode::Known(StoragePrecision::F16),
+        Ok(pb::StoragePrecision::Int8) => ProtoEnumDecode::Known(StoragePrecision::Int8),
+        Ok(pb::StoragePrecision::Binary) => ProtoEnumDecode::Known(StoragePrecision::Binary),
+        Ok(pb::StoragePrecision::Unspecified) => ProtoEnumDecode::Unspecified,
+        Err(_) => ProtoEnumDecode::Unknown,
     }
 }
 
@@ -60,28 +94,36 @@ pub fn phase_to_proto(phase: SegmentSearchPhase) -> pb::SegmentSearchPhase {
     }
 }
 
-/// Decode a wire phase. `None` for `UNSPECIFIED` or an unknown value.
-pub fn phase_from_proto(raw: i32) -> Option<SegmentSearchPhase> {
-    match pb::SegmentSearchPhase::try_from(raw).ok()? {
-        pb::SegmentSearchPhase::Approximate => Some(SegmentSearchPhase::Approximate),
-        pb::SegmentSearchPhase::Final => Some(SegmentSearchPhase::Final),
-        pb::SegmentSearchPhase::Unspecified => None,
+/// Decode a wire phase, split the same way — see [`ProtoEnumDecode`].
+pub fn phase_from_proto(raw: i32) -> ProtoEnumDecode<SegmentSearchPhase> {
+    match pb::SegmentSearchPhase::try_from(raw) {
+        Ok(pb::SegmentSearchPhase::Approximate) => {
+            ProtoEnumDecode::Known(SegmentSearchPhase::Approximate)
+        }
+        Ok(pb::SegmentSearchPhase::Final) => ProtoEnumDecode::Known(SegmentSearchPhase::Final),
+        Ok(pb::SegmentSearchPhase::Unspecified) => ProtoEnumDecode::Unspecified,
+        Err(_) => ProtoEnumDecode::Unknown,
     }
 }
 
 /// Classify a failed peer call. `DEADLINE_EXCEEDED` is the owner's own
 /// deadline; `UNAVAILABLE` is tonic's transport-level failure (connection
-/// refused, reset, no route); the owner's input-edge refusals
-/// (`INVALID_ARGUMENT` for an unknown segment id, `FAILED_PRECONDITION` for a
-/// precision the bundle is not stamped with) are `Refused`; `DATA_LOSS` is a
-/// torn bundle at the owner; everything else is a generic transport fault.
+/// refused, reset, no route); `INVALID_ARGUMENT` is the owner refusing the
+/// REQUEST — a caller fault of the coordinator's own, TERMINAL (never a
+/// ladder rung: no retry, no local load); the owner's other input-edge
+/// refusals — `FAILED_PRECONDITION` for a precision the bundle is not stamped
+/// with, for a segment/row disagreement between the owner's own data and the
+/// coordinator's, or for an enum value a newer coordinator knows and this
+/// owner does not; `NOT_FOUND` — are `Refused` and DO ladder: they are about
+/// the owner's OWN data (or this owner's own vintage), never the request.
+/// `DATA_LOSS` is a torn bundle at the owner; everything else is a generic
+/// transport fault.
 pub fn classify_status(status: &Status) -> PeerFailureReason {
     match status.code() {
         Code::DeadlineExceeded => PeerFailureReason::Deadline,
         Code::Unavailable => PeerFailureReason::Unreachable,
-        Code::InvalidArgument | Code::FailedPrecondition | Code::NotFound => {
-            PeerFailureReason::Refused
-        }
+        Code::InvalidArgument => PeerFailureReason::CallerFault,
+        Code::FailedPrecondition | Code::NotFound => PeerFailureReason::Refused,
         Code::DataLoss => PeerFailureReason::Torn,
         _ => PeerFailureReason::Transport,
     }
@@ -122,14 +164,20 @@ impl GrpcPeerTransport {
 
 /// Run one unary call under `deadline`: the header the owner honours plus a
 /// client-side timeout, so an owner that never answers is `Deadline` too.
-async fn bounded<T, F>(deadline: Duration, call: F) -> Result<T, PeerFailureReason>
+/// The error carries the owner's own `Status` message alongside its
+/// classified reason — [`PeerFailureReason::CallerFault`]'s surfaced error
+/// names it, so it must survive past classification.
+async fn bounded<T, F>(deadline: Duration, call: F) -> Result<T, (PeerFailureReason, String)>
 where
     F: std::future::Future<Output = Result<tonic::Response<T>, Status>>,
 {
     match tokio::time::timeout(deadline, call).await {
         Ok(Ok(response)) => Ok(response.into_inner()),
-        Ok(Err(status)) => Err(classify_status(&status)),
-        Err(_elapsed) => Err(PeerFailureReason::Deadline),
+        Ok(Err(status)) => Err((classify_status(&status), status.message().to_string())),
+        Err(_elapsed) => Err((
+            PeerFailureReason::Deadline,
+            format!("no response within {deadline:?}"),
+        )),
     }
 }
 
@@ -142,10 +190,11 @@ impl PeerTransport for GrpcPeerTransport {
         deadline: Duration,
     ) -> Result<Vec<SegmentUnit>, PeerError> {
         let first = req.segment_ids.first().copied().unwrap_or(SegmentId(-1));
-        let fail = |reason| PeerError {
+        let fail = |reason: PeerFailureReason| PeerError {
             segment: first,
             owner: owner.clone(),
             reason,
+            message: String::new(),
         };
         let channel = self.channel(owner).map_err(fail)?;
         let mut client = PeerServiceClient::new(channel);
@@ -153,14 +202,19 @@ impl PeerTransport for GrpcPeerTransport {
             table_name: req.table_name.clone(),
             segment_ids: req.segment_ids.iter().map(|s| s.0).collect(),
             storage_precision: precision_to_proto(req.storage_precision) as i32,
-            query: req.query.clone(),
+            query: req.query.as_slice().to_vec(),
             width: req.width as u64,
             phase: phase_to_proto(req.phase) as i32,
         });
         request.set_timeout(deadline);
         let response: pb::SegmentSearchResponse = bounded(deadline, client.segment_search(request))
             .await
-            .map_err(fail)?;
+            .map_err(|(reason, message)| PeerError {
+                segment: first,
+                owner: owner.clone(),
+                reason,
+                message,
+            })?;
         Ok(response
             .units
             .into_iter()
@@ -182,17 +236,18 @@ impl PeerTransport for GrpcPeerTransport {
             .first()
             .map(|(s, _)| *s)
             .unwrap_or(SegmentId(-1));
-        let fail = |reason| PeerError {
+        let fail = |reason: PeerFailureReason| PeerError {
             segment: first,
             owner: owner.clone(),
             reason,
+            message: String::new(),
         };
         let channel = self.channel(owner).map_err(fail)?;
         let mut client = PeerServiceClient::new(channel);
         let mut request = Request::new(pb::ExactRescoreRequest {
             table_name: req.table_name.clone(),
             storage_precision: precision_to_proto(req.storage_precision) as i32,
-            query: req.query.clone(),
+            query: req.query.as_slice().to_vec(),
             row_ids_by_segment: req
                 .row_ids_by_segment
                 .iter()
@@ -205,7 +260,12 @@ impl PeerTransport for GrpcPeerTransport {
         request.set_timeout(deadline);
         let response: pb::ExactRescoreResponse = bounded(deadline, client.exact_rescore(request))
             .await
-            .map_err(fail)?;
+            .map_err(|(reason, message)| PeerError {
+                segment: first,
+                owner: owner.clone(),
+                reason,
+                message,
+            })?;
         Ok(response
             .hits
             .into_iter()
@@ -219,21 +279,46 @@ mod tests {
     use super::*;
 
     #[test]
-    fn precision_and_phase_round_trip_and_refuse_unspecified() {
+    fn precision_and_phase_round_trip() {
         for p in [
             StoragePrecision::F32,
             StoragePrecision::F16,
             StoragePrecision::Int8,
             StoragePrecision::Binary,
         ] {
-            assert_eq!(precision_from_proto(precision_to_proto(p) as i32), Some(p));
+            assert_eq!(
+                precision_from_proto(precision_to_proto(p) as i32),
+                ProtoEnumDecode::Known(p)
+            );
         }
-        assert_eq!(precision_from_proto(0), None);
-        assert_eq!(precision_from_proto(99), None);
         for ph in [SegmentSearchPhase::Approximate, SegmentSearchPhase::Final] {
-            assert_eq!(phase_from_proto(phase_to_proto(ph) as i32), Some(ph));
+            assert_eq!(
+                phase_from_proto(phase_to_proto(ph) as i32),
+                ProtoEnumDecode::Known(ph)
+            );
         }
-        assert_eq!(phase_from_proto(0), None);
+    }
+
+    /// `UNSPECIFIED` (raw `0`, real malformation) and an unrecognised
+    /// non-zero raw value (version skew — a value a NEWER build knows and
+    /// this one does not) must never collapse to the same outcome: the
+    /// owner classifies them `INVALID_ARGUMENT` vs `FAILED_PRECONDITION`.
+    #[test]
+    fn unspecified_and_unknown_are_never_collapsed() {
+        assert_eq!(
+            precision_from_proto(0),
+            ProtoEnumDecode::Unspecified,
+            "raw 0 is UNSPECIFIED, not unknown"
+        );
+        assert_eq!(
+            precision_from_proto(99),
+            ProtoEnumDecode::Unknown,
+            "an unrecognised non-zero raw value is unknown, not unspecified"
+        );
+        assert_eq!(precision_from_proto(0).known(), None);
+        assert_eq!(precision_from_proto(99).known(), None);
+        assert_eq!(phase_from_proto(0), ProtoEnumDecode::Unspecified);
+        assert_eq!(phase_from_proto(99), ProtoEnumDecode::Unknown);
     }
 
     #[test]
@@ -246,9 +331,11 @@ mod tests {
             classify_status(&Status::unavailable("x")),
             PeerFailureReason::Unreachable
         );
+        // TERMINAL: an owner's INVALID_ARGUMENT is the coordinator's own
+        // caller fault — never a rung.
         assert_eq!(
             classify_status(&Status::invalid_argument("x")),
-            PeerFailureReason::Refused
+            PeerFailureReason::CallerFault
         );
         assert_eq!(
             classify_status(&Status::failed_precondition("x")),
@@ -277,7 +364,12 @@ mod tests {
             table_name: "t".into(),
             segment_ids: vec![SegmentId(7)],
             storage_precision: StoragePrecision::F32,
-            query: vec![1.0],
+            query: jammi_db::index::validate_query(
+                vec![1.0],
+                None,
+                jammi_db::index::QuerySource::Caller,
+            )
+            .unwrap(),
             width: 1,
             phase: SegmentSearchPhase::Final,
         };

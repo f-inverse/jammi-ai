@@ -24,7 +24,7 @@ let (record, _outcome) = session.generate_text_embeddings(
     None,
 ).await?;
 
-println!("Embedded {} rows, {} dimensions", record.row_count, record.dimensions.unwrap());
+println!("Embedded {} rows, {} dimensions", record.row_count, record.dimensions().unwrap());
 # Ok(()) }
 ```
 
@@ -175,7 +175,7 @@ let record = session.import_embeddings(
     384,
 ).await?;
 
-println!("Imported {} rows, {} dimensions", record.row_count, record.dimensions.unwrap());
+println!("Imported {} rows, {} dimensions", record.row_count, record.dimensions().unwrap());
 # Ok(()) }
 ```
 

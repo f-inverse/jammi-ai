@@ -1204,12 +1204,34 @@ class RustCommentLexerCoverageTests(unittest.TestCase):
     """
 
     def test_every_naive_comment_only_line_is_covered_by_the_real_lexer(self):
+        # `also_string_literals=True`: the naive `line.lstrip().startswith
+        # ("//")` heuristic below has no notion of lexical state, so a
+        # fixture that holds Rust source as DATA inside a string literal
+        # (e.g. a `concat!(r#"... // one ..."#)` block built to test this
+        # checker's own tooling) reads, to the naive check, exactly like a
+        # real comment line. The real lexer is correct to exclude that
+        # line -- it is string content, not comment prose a citation could
+        # legitimately live in -- so this scan's own opt-in string-literal
+        # coverage (see `_rust_comment_line_spans`'s docstring) is asked
+        # for here too, and a line inside a string literal counts as
+        # accounted-for rather than a lexer gap.
         crates_dir = cc.REPO_ROOT / "crates"
         missed: list[str] = []
         for path in sorted(crates_dir.rglob("*.rs")):
             text = path.read_text(encoding="utf-8", errors="ignore")
-            spans = cc._rust_comment_line_spans(text)
-            covered_line_nos = {text.count("\n", 0, start) + 1 for start, _end in spans}
+            spans = cc._rust_comment_line_spans(text, also_string_literals=True)
+            # A span's OWN start line is not the whole story: a multi-line
+            # span (a doc block comment, a `#[doc = "..."]` attribute string,
+            # or -- now that `also_string_literals` is on -- a multi-line
+            # string/raw-string literal) covers every line its byte range
+            # touches, not just the line the span happens to open on. Taking
+            # only the start line under-covers every later line of such a
+            # span and reports it as a lexer gap it never was.
+            covered_line_nos: set[int] = set()
+            for start, end in spans:
+                first_line = text.count("\n", 0, start) + 1
+                last_line = text.count("\n", 0, max(start, end - 1)) + 1
+                covered_line_nos.update(range(first_line, last_line + 1))
             for line_no, line in enumerate(text.splitlines(), start=1):
                 if line.lstrip().startswith("//") and line_no not in covered_line_nos:
                     missed.append(f"{path.relative_to(cc.REPO_ROOT)}:{line_no}")

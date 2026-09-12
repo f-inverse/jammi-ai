@@ -24,7 +24,7 @@ let (record, _outcome) = session.generate_image_embeddings(
     None,
 ).await?;
 
-println!("Embedded {} images, {} dimensions", record.row_count, record.dimensions.unwrap());
+println!("Embedded {} images, {} dimensions", record.row_count, record.dimensions().unwrap());
 # Ok(()) }
 ```
 

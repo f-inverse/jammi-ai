@@ -1284,8 +1284,8 @@ const RECORD_VERSION_BRANCH_ALLOWED: &[(&str, &str, usize)] = &[
            // `session_registration_literal_sites`'s allowlist entry for this
            // same file) rather than through `pinned_provider` — an unpinned,
            // version-branched content read, re-exported publicly at
-           // `jammi-ai/src/session.rs:1018` and
-           // `jammi-ai/src/local_session.rs:363`. `READ_VECTORS_CALLERS` above
+           // `read_vectors`, `jammi-ai/src/session.rs:1008` and
+           // `read_vectors`, `jammi-ai/src/local_session.rs:363`. `READ_VECTORS_CALLERS` above
            // is the machine-checked claim (round 9, M1): its only two in-tree
            // callers are those two forwarding wrappers, each a one-line
            // delegate, never a provenance-persisting producer. Closing this
@@ -1564,7 +1564,8 @@ const SESSION_LITERAL_ALLOWED: &[(&str, &str, usize, usize)] = &[
         // gate's finding seriously rather than reach for the allowlist
         // unexamined.
         //
-        // Read in full (`crates/jammi-db/src/store/result_schema.rs:193-211`
+        // Read in full (`deregister_result_tables`,
+        // `crates/jammi-db/src/store/result_schema.rs:193-211`
         // today): this function makes exactly ONE call against the schema
         // provider it resolves — `provider.remove(&format!("jammi.{name}"))`
         // (line 209) — and no other. It never calls `.table(`/

@@ -166,7 +166,7 @@ async fn intra_batch_row_order_survives_replay(backend: BackendKind) {
 /// thread id, a run-specific value, elided):
 ///
 /// ```text
-/// thread 'esc_101_intra_batch_row_order::intra_batch_row_order_survives_update_churn_on_an_early_row_postgres' panicked at `assert_eq!`, crates/jammi-db/tests/it/esc_101_intra_batch_row_order.rs:306:5:
+/// thread 'esc_101_intra_batch_row_order::intra_batch_row_order_survives_update_churn_on_an_early_row_postgres' panicked at `assert_eq!`, crates/jammi-db/tests/it/esc_101_intra_batch_row_order.rs:295:5:
 /// assertion `left == right` failed: intra-batch row order must survive an UPDATE that
 /// physically reorders a row on Postgres's heap -- the ORDER BY _offset, _row_idx tiebreak
 /// must pin logical order regardless of physical row placement

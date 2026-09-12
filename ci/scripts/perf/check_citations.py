@@ -1628,13 +1628,34 @@ _DOC_ATTR_RE = re.compile(
 )
 
 
-def _rust_comment_line_spans(text: str) -> list[tuple[int, int]]:
+def _rust_comment_line_spans(text: str, *, also_string_literals: bool = False) -> list[tuple[int, int]]:
     """Character-offset `(start, end)` ranges in `text` that are Rust
     DOC/COMMENT prose: line comment content ("//", "///", "//!" -- the
     substring strictly after the leading slashes, up to the newline), the
     content of a DOC block comment (`/** ... */`, `/*! ... */` -- never an
     ordinary `/* ... */`, see below), and the string content of a `#[doc =
     "..."]`/`#![doc = "..."]` attribute.
+
+    `also_string_literals`, when true, additionally includes the CONTENT
+    spans of ordinary and raw string literals (never char literals, which
+    are single-character and load-bearing for THIS scan's own state, not a
+    place a multi-line fixture lives). The default (false) preserves this
+    function's original contract exactly for its production caller (full-
+    path citation scanning over genuine comment prose only): a `//`-shaped
+    substring sitting inside a string literal must never be scanned for a
+    citation, so the production path never wants string content folded in.
+    The flag exists for `RustCommentLexerCoverageTests`, whose naive `//`
+    heuristic has no notion of lexical state at all -- it will flag a line
+    like `// one` inside a multi-line `r#"..."#` fixture (source text held
+    as DATA, not read as Rust) as a "comment" the real lexer must cover, and
+    the real lexer is correct to exclude it (it is not comment prose; it is
+    string content). Without this flag that self-test would have no way to
+    tell "the real lexer is right to skip this" from "the real lexer has a
+    genuine gap," and the only way to make it pass without one would be
+    hand-listing individual line numbers as an allowlist that will fight the
+    next fixture the same way this one did -- see `crates/jammi-ai/tests/it/
+    pinned_source_gate.rs`'s `src_after` `concat!` fixture for the case that
+    surfaced this.
 
     A lightweight structural scan, not a full parser: it tracks just enough
     Rust lexical state -- ordinary string literals, raw strings (`r"..."`,
@@ -1677,6 +1698,7 @@ def _rust_comment_line_spans(text: str) -> list[tuple[int, int]]:
     block_depth = 0
     block_is_doc = False
     block_doc_start = 0
+    string_content_start = 0
     while i < n:
         c = text[i]
         if state == NORMAL:
@@ -1724,6 +1746,7 @@ def _rust_comment_line_spans(text: str) -> list[tuple[int, int]]:
             if c == '"':
                 state = STRING
                 i += 1
+                string_content_start = i
                 continue
             plen = _rust_string_prefix_len(text, i, n)
             if plen:
@@ -1741,6 +1764,7 @@ def _rust_comment_line_spans(text: str) -> list[tuple[int, int]]:
                     else:
                         state = STRING
                     i = k + 1
+                    string_content_start = i
                     continue
             i += 1
         elif state == STRING:
@@ -1749,6 +1773,8 @@ def _rust_comment_line_spans(text: str) -> list[tuple[int, int]]:
                 continue
             if c == '"':
                 state = NORMAL
+                if also_string_literals:
+                    spans.append((string_content_start, i))
             i += 1
         elif state == RAW_STRING:
             if c == '"':
@@ -1759,6 +1785,8 @@ def _rust_comment_line_spans(text: str) -> list[tuple[int, int]]:
                     k += 1
                 if cnt == raw_hashes:
                     state = NORMAL
+                    if also_string_literals:
+                        spans.append((string_content_start, i))
                     i = k
                     continue
             i += 1
@@ -1776,6 +1804,12 @@ def _rust_comment_line_spans(text: str) -> list[tuple[int, int]]:
                     state = NORMAL
                 continue
             i += 1
+
+    if also_string_literals and state in (STRING, RAW_STRING):
+        # Unterminated string at EOF -- everything from the opening quote
+        # to the end of the file is still string content, never comment
+        # prose the naive `//` heuristic could legitimately expect covered.
+        spans.append((string_content_start, n))
 
     for m in _DOC_ATTR_RE.finditer(text):
         if m.group("raw") is not None:

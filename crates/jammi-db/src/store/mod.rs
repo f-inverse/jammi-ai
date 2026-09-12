@@ -2742,7 +2742,7 @@ impl ResultStore {
     ///     single-version; its MEMBER SET may still have been chosen from a
     ///     different, unpinned view.
     ///   - the neighbor-graph producer
-    ///     (`crates/jammi-ai/src/pipeline/neighbor_graph.rs:275-308`): its
+    ///     (`run`, `crates/jammi-ai/src/pipeline/neighbor_graph.rs:253-261`): its
     ///     PERSISTED artifact carries the pinned anchor, but its edge
     ///     candidates come from an unpinned segment set
     ///     (`resolve_search_mode_local`, `neighbor_graph.rs:394`) — the same
@@ -2763,7 +2763,7 @@ impl ResultStore {
         // plus a hash over every byte — O(table size), not O(rows the
         // caller actually wants) — and it runs on EVERY call to
         // `InferenceSession::assemble_context` (unpinned) — served per RPC
-        // at `jammi-server/src/grpc/pipeline.rs:111` and per prediction at
+        // at `assemble_context`, `jammi-server/src/grpc/pipeline.rs:111` and per prediction at
         // `context_predictor.rs`'s serve path — even though neither caller
         // ever reads the anchor `assemble_context` discards it into.
         //

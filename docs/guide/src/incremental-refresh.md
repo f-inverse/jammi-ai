@@ -20,10 +20,16 @@ report = db.refresh_embeddings("docs__embedding__all-MiniLM-L6-v2__...")
 #  'live_rows': 9999, 'masked_rows': 3, 'outcome': 'published'}
 ```
 
-```rust
-use jammi_ai::pipeline::embedding_refresh::RefreshOptions;
-
-let report = session.refresh_embeddings(&table, RefreshOptions::default()).await?;
+```rust,no_run
+# extern crate jammi_ai;
+# extern crate jammi_db;
+# extern crate tokio;
+# use jammi_ai::Session;
+# use jammi_ai::pipeline::embedding_refresh::RefreshOptions;
+# async fn ex(session: &Session, table: &str) -> jammi_db::error::Result<()> {
+let report = session.refresh_embeddings(table, RefreshOptions::default()).await?;
+# let _ = report;
+# Ok(()) }
 ```
 
 Every transport exposes the same three verbs with the same report:

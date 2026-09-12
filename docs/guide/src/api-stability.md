@@ -171,7 +171,7 @@ section's gap in a prior round). Derive the exact commit set from the
 commit-message tag every round of this unit's own history carries, and diff
 the UNION of those commits, never a span:
 
-```
+```bash
 # Every commit belonging to THIS unit, oldest first. NOT a literal
 # '#482 DIST' substring match: this unit's own history also carries the tag
 # as 'DIST-1' and 'DELTA/DIST' (a hyphen or a slash immediately after

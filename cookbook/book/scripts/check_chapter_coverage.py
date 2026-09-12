@@ -265,10 +265,10 @@ ExerciseEntry = DirectCell | CacheLane | WrapperLane | Deferred
 # Python dict-literal semantics silently keeping only the last entry (the
 # same discipline `check_gpu_parity_matrix.py`'s SILICON_ACCOUNTING uses).
 #
-# 50 of the 51 REQUIRED / MODULE_FUNCTIONS surfaces are exercised today; the
-# lone gap (`encode_query`) is a reviewed, dated Deferred row — see the
-# module docstring's "Three exercise LANES" section for how each row below
-# was verified (grep, not assumption) at authoring time (2026-08-31).
+# 53 of the 57 REQUIRED / MODULE_FUNCTIONS surfaces are exercised today; the
+# remaining 4 (`encode_query`, `cancel_job`, `list_workers`, `prune_jobs`) are
+# reviewed, dated Deferred rows — see the module docstring's "Three exercise
+# LANES" section for how each row below was verified (grep, not assumption).
 # --------------------------------------------------------------------------- #
 ACCOUNTING: list[tuple[str, ExerciseEntry]] = [
     # -- module-level ---------------------------------------------------- #
@@ -330,40 +330,20 @@ ACCOUNTING: list[tuple[str, ExerciseEntry]] = [
     # versioned-embedding-table incremental-refresh verbs (DELTA, issue
     # #482) — a distinct model from `recompute` (full re-derivation): a
     # deletion mask over immutable segments, CAS-published versions,
-    # compaction and expiry horizons. A reviewed, dated gap, not a silent
-    # one — deliberately NOT folded into 20-recompute/recompute.qmd, whose
-    # own contrast (full recompute vs. incremental delta) a bolted-on cell
-    # would blur; tracked as a follow-up chapter (issue filed).
-    ("refresh_embeddings", Deferred(
-        reason=(
-            "no cookbook/book/chapters/*.qmd cell or scripts/build_*_cache.py "
-            "calls Database.refresh_embeddings yet; needs its own chapter "
-            "(edit-one-row and delete-one-key refresh over a versioned table) "
-            "to close — see the filed follow-up issue."
-        ),
-        owner="unassigned",
-        date="2026-09-11",
+    # compaction and expiry horizons. Deliberately NOT folded into
+    # 20-recompute/recompute.qmd, whose own contrast (full recompute vs.
+    # incremental delta) a bolted-on cell would blur — its own LIVE_COMPUTE
+    # chapter (issue #506) walks one table through an edit-one-row refresh,
+    # a delete-one-key refresh, a compaction, and an expiry in sequence,
+    # asserting the report and the segment listing at every step.
+    ("refresh_embeddings", DirectCell(
+        "25-incremental-refresh/incremental-refresh.qmd", "db.refresh_embeddings(",
     )),
-    ("compact_embeddings", Deferred(
-        reason=(
-            "no cookbook/book/chapters/*.qmd cell or scripts/build_*_cache.py "
-            "calls Database.compact_embeddings yet; needs a chapter cell "
-            "exercising fragment/segment compaction of a versioned table's "
-            "live rows to close — see the filed follow-up issue."
-        ),
-        owner="unassigned",
-        date="2026-09-11",
+    ("compact_embeddings", DirectCell(
+        "25-incremental-refresh/incremental-refresh.qmd", "db.compact_embeddings(",
     )),
-    ("expire_versions", Deferred(
-        reason=(
-            "no cookbook/book/chapters/*.qmd cell or scripts/build_*_cache.py "
-            "calls Database.expire_versions yet; needs a chapter cell "
-            "exercising old-version GC (reaping unreferenced fragments/"
-            "segments/deletes/manifests) to close — see the filed follow-up "
-            "issue."
-        ),
-        owner="unassigned",
-        date="2026-09-11",
+    ("expire_versions", DirectCell(
+        "25-incremental-refresh/incremental-refresh.qmd", "db.expire_versions(",
     )),
     # -- point-in-time -------------------------------------------------------- #
     ("asof_join", DirectCell("19-point-in-time/point-in-time.qmd", "db.asof_join(")),

@@ -2658,8 +2658,6 @@ async fn release_job_lease_write_is_exactly_lease_null_releases_plus_one_and_tim
     assert_eq!(after.priority, before.priority);
     assert_eq!(after.claimable, before.claimable);
     assert_eq!(after.acceleration_report, before.acceleration_report);
-    assert_eq!(after.parent_id, before.parent_id);
-    assert_eq!(after.has_deps, before.has_deps);
     assert_eq!(after.created_at, before.created_at);
 
     // A row claimed by a DIFFERENT instance: completely untouched, not
@@ -2715,8 +2713,6 @@ fn assert_only_release_columns_changed(
     assert_eq!(after.priority, before.priority);
     assert_eq!(after.claimable, before.claimable);
     assert_eq!(after.acceleration_report, before.acceleration_report);
-    assert_eq!(after.parent_id, before.parent_id);
-    assert_eq!(after.has_deps, before.has_deps);
     assert_eq!(after.created_at, before.created_at);
 }
 

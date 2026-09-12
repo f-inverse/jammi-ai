@@ -957,7 +957,7 @@ async fn release_and_stop_report_matches_release_job_leases_on_the_pair_that_act
     park.wait_parked().await;
     let inline = leases_session
         .catalog()
-        .list_jobs(None)
+        .list_jobs()
         .await
         .unwrap()
         .into_iter()

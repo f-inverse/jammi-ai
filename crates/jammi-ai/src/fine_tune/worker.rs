@@ -87,7 +87,7 @@ use std::time::Duration;
 use arrow::array::RecordBatch;
 use bytes::Bytes;
 use jammi_db::catalog::jobs_repo::WorkerState;
-use jammi_db::catalog::lease_keeper::{LeaseHold, LeaseKeeper, LeaseTarget};
+use jammi_db::catalog::lease_keeper::{HoldRelease, LeaseHold, LeaseKeeper, LeaseTarget};
 use jammi_db::catalog::Catalog;
 use jammi_db::config::WorkerIntervals;
 use jammi_db::error::{JammiError, Result};

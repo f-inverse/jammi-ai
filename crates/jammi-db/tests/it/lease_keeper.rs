@@ -718,7 +718,6 @@ async fn release_job_holds_reports_failed_from_a_real_backend_fault() {
         output_model_id: None,
         model_source: None,
         priority: 0,
-        ..Default::default()
     };
     catalog
         .submit_job(job("rjhf-queued", JobExecution::Queued))

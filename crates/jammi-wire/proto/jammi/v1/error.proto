@@ -99,6 +99,15 @@ message JammiErrorDetail {
     NotRefreshableError not_refreshable = 34;
     DefinitionDriftError definition_drift = 35;
     NonUniqueKeyError non_unique_key = 36;
+    // `JammiError::ParentMoved { table, expected, found }` — a parent-pinned
+    // version CAS (allocation or publish) lost a race against a concurrent
+    // refresh/compaction that published first. Maps to `Aborted`, the same
+    // retryable-conflict code as `CasFailed`/`LeaseLost`.
+    //
+    // Tags 37 and 38 are intentionally vacant: they belonged to the job-graph
+    // unit, deferred to #515 and recoverable by cherry-pick. Leaving them
+    // reserved means that recovery cannot collide with this field.
+    ParentMovedError parent_moved = 39;
   }
   // Tag 15 / `model_retired` are reserved: the wire surface must never reuse a
   // retired field number or name, so a peer built against either contract

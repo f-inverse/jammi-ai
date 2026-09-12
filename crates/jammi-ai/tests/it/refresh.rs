@@ -1051,12 +1051,23 @@ async fn current_version_provider_reads_the_catalog_version_not_the_stale_sessio
 /// pinned read, and assert the persisted anchor AND the pinned read's
 /// content both still name the version pinned at, never a mix where the
 /// anchor names the OLD version while a read straddles onto the NEW one.
-/// RED at `ebb1c9e6` (round 3): `current_version_identity` (the anchor leg)
-/// and `current_version_provider` (the read leg) each independently
-/// re-resolve `table.current_version` off the caller's record, so nothing
-/// stops the read from serving whatever published in between — this test
-/// pins BEFORE the race and would show the read's content moving to v1
-/// while the anchor comment claims v0, on that shape.
+///
+/// **Correction (round 5, M4/F4):** this test does NOT go RED against the
+/// pre-fix shape, and the earlier docstring's claim that it did was false —
+/// the round-5 audit measured it. It threads ONE record snapshot
+/// (`h.record()`, taken once, before the race) through both the anchor and
+/// the read: even the pre-fix `current_version_identity`/
+/// `current_version_provider` pair, called on that SAME frozen record,
+/// would resolve the SAME version number for both legs (a version's
+/// content is immutable once published), so old and new code are
+/// indistinguishable in this exact scenario. What THIS test verifies —
+/// correctly, and still worth keeping — is `PinnedSource`'s own invariant:
+/// a resolution taken once stays fixed even if the catalog's
+/// `current_version` moves later. The divergence-PRODUCING input (two
+/// SEPARATE resolutions, one early and one late, straddling the race) is
+/// built in
+/// `old_two_call_shape_straddles_a_publish_race_pin_current_version_does_not`
+/// below, which is the actual M4 root-cause oracle.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn pin_current_version_survives_a_publish_race_between_pin_and_read() {
     use datafusion::prelude::{col, lit};
@@ -1150,6 +1161,148 @@ async fn pin_current_version_survives_a_publish_race_between_pin_and_read() {
     assert_eq!(
         pinned_read_vectors[0], v0_vector,
         "the pinned read must still serve v0's content, not v1's re-embedded row \"0\""
+    );
+}
+
+/// DELTA round-5 M4 — the ROOT-CAUSE divergence oracle. The round-4 oracle
+/// above threads ONE record snapshot through both legs, which is exactly
+/// the case where any anchor/read pair — pre-fix or post-fix — agrees, so
+/// it proves nothing about the straddle (round-5 audit, F4). The actual
+/// divergence-producing input needs TWO INDEPENDENT resolutions straddling
+/// a publish: an anchor taken EARLY, a read taken LATE, off a record
+/// re-fetched after the race — this is what a pre-`PinnedSource` producer
+/// naturally did (compute the anchor, do other work, read the rows), and it
+/// is also exactly the shape M2 found live at `context_predictor.rs:812`
+/// and `:1537` (a caller holding one pin and calling the unpinned twin,
+/// which resolves a second one).
+///
+/// The pre-fix mechanism is reconstructed BY HAND, in the CURRENT tree, from
+/// the still-public primitives its two legs were built from — not against
+/// `ebb1c9e6`, which predates `PinnedSource` and where the round-4 oracle
+/// cannot even compile:
+/// - the anchor leg: `result_digest_anchor` (the safe, still-public
+///   replacement for the now-crate-private `current_version_identity`;
+///   identical output for this call shape).
+/// - the read leg: `resolve_version_manifest` + `build_masked_provider` —
+///   literally `current_version_provider`'s old body, still public because
+///   `embedding_refresh.rs`'s delta/compaction producers legitimately
+///   thread ONE `resolve_version_manifest` call to both their anchor and
+///   their read (round 5's M9 fold). This test is what happens when the
+///   two calls are NOT threaded from the same resolution.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn old_two_call_shape_straddles_a_publish_race_pin_current_version_does_not() {
+    use datafusion::prelude::{col, lit};
+
+    let h = harness(10).await;
+    let base = h.refresh().await.unwrap();
+    assert_eq!(base.outcome, RefreshOutcome::NoChange);
+    assert_eq!(h.record().await.current_version, Some(0));
+    let v0_vector = h.vector_of("0").await.expect("row 0 has a v0 vector");
+
+    // EARLY resolution: the anchor, and — for the fix's own control — a
+    // `PinnedSource` from the SAME record snapshot.
+    let early_record = h.record().await;
+    let early_anchor = h
+        .session
+        .result_store()
+        .result_digest_anchor(&early_record)
+        .await
+        .unwrap();
+    let pin = h
+        .session
+        .result_store()
+        .pin_current_version(early_record.clone())
+        .await
+        .unwrap();
+    assert_eq!(
+        pin.input_anchor(),
+        early_anchor,
+        "one resolution names one anchor, whichever public entry point asks for it"
+    );
+
+    // THE RACE: a version publishes BETWEEN the early anchor above and the
+    // late read below — a second session re-embeds row "0".
+    let session2 = open_session(&h.root, 1).await;
+    let mut edited = rows(10);
+    edited[0].1 = format!("{}-EDITED", edited[0].1);
+    write_parquet(&h.source_path, &edited);
+    let report2 = session2
+        .refresh_embeddings(&h.table, RefreshOptions::default())
+        .await
+        .unwrap();
+    assert_eq!(report2.outcome, RefreshOutcome::Published);
+
+    // LATE resolution: a FRESH `table.current_version` read (a caller
+    // re-fetching its record between the anchor and the artifact's rows —
+    // exactly what a multi-step producer naturally does), then that
+    // version's own manifest — `current_version_provider`'s exact old body.
+    let late_record = h.record().await;
+    let late_version = late_record
+        .current_version
+        .expect("refresh published a version");
+    assert_ne!(
+        Some(late_version),
+        early_record.current_version,
+        "the race must have advanced the current version"
+    );
+    let late_manifest = h
+        .session
+        .result_store()
+        .resolve_version_manifest(&late_record, late_version)
+        .await
+        .unwrap();
+
+    // THE DIVERGENCE this oracle exists to catch: the anchor computed
+    // EARLY names a DIFFERENT identity than the manifest the OLD two-call
+    // shape reads LATE. A producer built this way would persist an
+    // artifact whose provenance names the pre-race version while every row
+    // it read came from the post-race one — the exact mislabel
+    // `PinnedSource` exists to make unrepresentable for a caller that uses
+    // it correctly (one resolution, not two).
+    assert_ne!(
+        early_anchor.anchor.0, late_manifest.identity,
+        "the old two-call shape (anchor resolved early, read resolved late) straddled the \
+         publish race: the anchor names the pre-race identity while the independently-resolved \
+         read already serves the post-race version"
+    );
+
+    // THE FIX, same race, same early anchor: `pin` (resolved at the SAME
+    // early point as `early_anchor`) still serves the PRE-edit row "0"
+    // vector when read via `pinned_provider` AFTER the race — verified by
+    // content, not merely by "did not panic".
+    let provider = h
+        .session
+        .result_store()
+        .pinned_provider(h.session.context(), &pin)
+        .await
+        .unwrap();
+    let batches = h
+        .session
+        .context()
+        .read_table(provider)
+        .unwrap()
+        .filter(col("_row_id").eq(lit("0")))
+        .unwrap()
+        .select_columns(&["vector"])
+        .unwrap()
+        .collect()
+        .await
+        .unwrap();
+    let mut pinned_vectors = Vec::new();
+    for batch in &batches {
+        jammi_db::store::vectors::extend_with_fixed_size_list_f32(
+            batch,
+            &h.table,
+            "vector",
+            &mut pinned_vectors,
+        )
+        .unwrap();
+    }
+    assert_eq!(pinned_vectors.len(), 1, "exactly one row for key \"0\"");
+    assert_eq!(
+        pinned_vectors[0], v0_vector,
+        "pin_current_version + pinned_provider must still serve v0's content even read AFTER \
+         the race, unlike the old two-call shape above"
     );
 }
 

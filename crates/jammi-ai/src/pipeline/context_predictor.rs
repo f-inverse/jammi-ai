@@ -796,7 +796,14 @@ impl InferenceSession {
             request.split = Some(split.clone());
             request.aggregator = SetAggregator::Mean;
             request.value_columns = vec![env.spec.value_column.clone()];
-            let rep = self.assemble_context(&request).await?;
+            // M2 (round 5): `env.table` is already a held `PinnedSource` (see
+            // its field doc); calling `assemble_context` here would resolve a
+            // SECOND, independent pin for the member set/vectors/value rows
+            // while `target_x` above and `member_x` below read through the
+            // FIRST — a publish landing between the two pins straddles the
+            // target against its own context. `assemble_context_pinned`
+            // shares the one pin already in scope instead.
+            let rep = self.assemble_context_pinned(&request, env.table).await?;
 
             // Per-member x-vectors via the generic SQL surface, keyed by the
             // leakage-scoped member keys assemble_context surfaced (same order as
@@ -1521,7 +1528,12 @@ impl InferenceSession {
         // did, so the live predict hydrates the value column exactly as the
         // episodic sampler did.
         request.value_columns = vec![served.value_column.clone()];
-        let rep = self.assemble_context(&request).await?;
+        // M2 (round 5): `pin` above is the one resolution `target_x` and
+        // `member_x` below both read through; `assemble_context` would take
+        // a SECOND, independent pin for the member set/vectors/value rows,
+        // reopening the exact straddle this serve pins once to close.
+        // `assemble_context_pinned` shares `pin` instead.
+        let rep = self.assemble_context_pinned(&request, &pin).await?;
         let source = rep.source;
         let context_keys = rep.context_keys.clone();
         let member_x = self.read_member_vectors(&pin, &rep.context_keys).await?;

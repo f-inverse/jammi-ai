@@ -180,6 +180,37 @@ dependent to `Stale { InputAdvanced }` and a `no_change` refresh leaves it
 `Fresh`. `recompute` of a versioned table produces a **new** table with a
 fresh chain root.
 
+## Pinned reads for a persisting producer
+
+Any producer that persists a durable artifact whose provenance NAMES this
+table as an input — an embedding delta/compaction, a context set, a
+propagated table, a neighbor graph — must resolve the table's anchor and
+every row it reads from the SAME catalog resolution, never two independent
+reads of `current_version`: a version publish landing between them would
+persist an artifact whose provenance names one version while its content
+came from another. `ResultStore::pin_current_version` is that one
+resolution; `PinnedSource::input_anchor` (infallible, no second catalog
+read) and `ResultStore::pinned_provider` both derive from it.
+
+**Disclosed residual — candidate SELECTION is not pinned.** Pinning closes
+"the artifact's anchor and the rows it reads agree on one version" for a
+producer that already holds its candidate key set. It does not make "every
+row read anywhere in the producer's pipeline came from this one version"
+true end-to-end for every producer:
+
+- The three context producers (`context_set`, `context_predictor`,
+  `recompute`) pin the POOLED VECTOR read; the candidate SET is chosen
+  upstream by `ResultStore::search_vectors`, which serves ANN from the
+  catalog's live segment set (or, on the exact-search fallback, this
+  session's own registration) — neither leg is pinned.
+- The neighbor-graph producer persists an artifact whose provenance carries
+  the pinned anchor, while its edge candidates come from an unpinned
+  segment set (`resolve_search_mode_local`).
+
+Closing this means threading a pin into the search/candidate-selection path
+— out of scope for the seam above; tracked as a residual, not silently
+absorbed into "reads through `pin_current_version`" claims elsewhere.
+
 ## Errors
 
 | Error | Meaning | Remedy |

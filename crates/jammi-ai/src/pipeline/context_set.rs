@@ -265,13 +265,26 @@ impl InferenceSession {
         self.assemble_context_pinned(request, &pin).await
     }
 
-    /// [`Self::assemble_context`]'s pinned twin: the candidate set, the
-    /// pooled vector, and the hydrated value rows all come from `pin`'s one
-    /// resolution rather than each resolving `current_version` for itself.
+    /// [`Self::assemble_context`]'s pinned twin. **Only the POOLED VECTOR**
+    /// comes from `pin`'s one resolution rather than a fresh
+    /// `current_version` resolve of its own (round 5, M5: an earlier
+    /// revision of this doc claimed the candidate set and the hydrated
+    /// value rows did too, which round 4 explicitly forbade re-asserting
+    /// and which was false on both counts — corrected here):
+    ///   - the CANDIDATE SET is chosen by `gather_candidates` →
+    ///     `ann_candidates` → `ResultStore::search_vectors`, which is
+    ///     UNPINNED (the very next doc block below names this as the M4
+    ///     residual — the two statements must not contradict each other
+    ///     again).
+    ///   - the HYDRATED VALUE ROWS come from the EXTERNAL source relation
+    ///     (`hydrate_value_columns`'s `ctx.sql` scan of the source catalog
+    ///     table), never from the pinned embedding table at all — `pin` has
+    ///     no bearing on them.
+    ///
     /// A caller looping over many targets against the SAME source table
     /// (`recompute.rs`) pins ONCE and calls this per target — every target
-    /// in the batch reads the identical version, and the schema/mask memo
-    /// (M3) hits for every target after the first.
+    /// in the batch reads the pooled vector off the identical version, and
+    /// the schema/mask memo (M3) hits for every target after the first.
     ///
     /// **Residual (M4):** this pins the POOL read, not candidate SELECTION —
     /// see [`jammi_db::store::ResultStore::pin_current_version`]'s doc.

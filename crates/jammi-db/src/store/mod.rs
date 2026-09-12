@@ -246,6 +246,18 @@ pub struct ResultStore {
 /// constructible and the mislabel this type exists to close stays possible.
 /// See [`ResultStore::pin_current_version`] for the residual this does NOT
 /// close (candidate selection).
+///
+/// **The checkable invariant (M2, round 5):** a caller that already holds a
+/// `&PinnedSource` for a table and then calls something that resolves its
+/// OWN pin for the same table — e.g. `InferenceSession::assemble_context`,
+/// which calls [`ResultStore::pin_current_version`] itself — has reopened
+/// exactly this seam: the held pin and the freshly-resolved one can name
+/// different versions if a publish lands between them. A reader can spot
+/// this without an audit: **grep the pin's scope for a second `pin_` /
+/// `assemble_context(` (the unpinned twin) rather than the `_pinned` sibling
+/// that takes the held pin as a parameter.** Every function with a
+/// `_pinned` twin exists so a caller already holding one never needs the
+/// unpinned form.
 pub struct PinnedSource {
     /// The already-resolved anchor; see [`Self::input_anchor`].
     anchor: InputAnchor,
@@ -1124,7 +1136,19 @@ impl ResultStore {
     /// The identity of `table`'s current version (`None` for a never-refreshed
     /// table), read off the version row under admin scope (the table was
     /// already resolved through the tenant-scoped read).
-    pub async fn current_version_identity(
+    ///
+    /// CRATE-PRIVATE (M1, round 5): this is the ANCHOR leg of the seam
+    /// [`PinnedSource`] closes — a caller outside this crate that combined
+    /// this with an independently-resolved read (e.g. [`Self::pinned_provider`]
+    /// called on a SECOND [`Self::pin_current_version`]) would reconstruct
+    /// the exact pre-fix straddle this type exists to make unrepresentable.
+    /// Its only callers are same-crate ([`freshness`] comparing a
+    /// dependent's *recorded* anchor against its parent's *current* one —
+    /// not persisting a new anchor, so it does not need the pinned read to
+    /// agree with it) and [`Self::verify_materialization`] (same shape). A
+    /// producer that persists a durable artifact's own anchor must go
+    /// through [`Self::pin_current_version`] instead.
+    pub(crate) async fn current_version_identity(
         &self,
         table: &ResultTableRecord,
     ) -> Result<Option<String>> {
@@ -2654,35 +2678,110 @@ impl ResultStore {
 
     /// A single admin-scope resolution of `record`'s CURRENT version, one
     /// `get_result_table_version` catalog read. Every persisting producer
-    /// named in the DELTA contract (`docs/plans/68-compute-tier-substrate`)
-    /// pins ONCE, before it computes its artifact's [`InputAnchor`] or reads
+    /// named in the guide's "Pinned reads for a persisting producer" section
+    /// (`docs/guide/src/incremental-refresh.md`, round 5, M6/M7: the prior
+    /// citation named a plan directory that mentions neither this type nor
+    /// this method — corrected to a document that actually carries the
+    /// term) pins ONCE, before it computes its artifact's [`InputAnchor`] or
+    /// reads
     /// a single row, and both the anchor ([`PinnedSource::input_anchor`])
     /// and the rows ([`Self::pinned_provider`]) derive from this one
     /// resolution — never from a second, independent read of
     /// `record.current_version`. This is the removal of the
-    /// record-taking seam: `current_version_provider` is now private
-    /// precisely so no public API can produce a version-resolved read from
-    /// a bare `&ResultTableRecord` without also fixing the anchor that read
-    /// must agree with.
+    /// record-taking seam: `current_version_provider` is now private, and
+    /// `current_version_identity` (the anchor leg of the same seam)
+    /// is crate-private (M1, round 5).
     ///
-    /// **Residual — candidate SELECTION is not pinned (M4).** This closes
-    /// "the artifact's anchor and its rows agree on one version" for a
-    /// producer that already holds its candidate row set (its target keys,
-    /// its neighbor list, its context members). It does NOT make "every row
-    /// read by the artifact's pipeline came from this one version" true
-    /// end-to-end for the three context producers
-    /// (`crates/jammi-ai/src/pipeline/{context_set,context_predictor,recompute}.rs`):
-    /// their candidate SET is chosen upstream by
-    /// [`ResultStore::search_vectors`], which serves ANN from the catalog's
-    /// live segment set and otherwise falls back to
-    /// `crate::index::exact::exact_vector_search` against this session's own
-    /// `jammi.{table}` registration — neither leg is pinned. A pinned
-    /// producer's POOLED VECTORS are guaranteed single-version; its MEMBER
-    /// SET may still have been chosen from a different, unpinned view. This
-    /// is stated here rather than closed: closing it means threading a pin
-    /// into the search/candidate-selection path, out of scope for this
-    /// contract.
+    /// **The property, and the round-5 sweep of every public function in
+    /// this module that takes a record and touches a version, done by
+    /// enumeration rather than by naming the two the class was known by:**
+    /// no public interface yields the provenance anchor without the content
+    /// it describes, and none yields a version-resolved read from a bare
+    /// `&ResultTableRecord` by re-resolving `current_version` internally
+    /// without the caller having already fixed which version it means.
+    ///   - [`Self::result_digest_anchor`] (pub) — routes through
+    ///     [`Self::pin_current_version`] for the versioned case; safe.
+    ///   - `current_version_identity` (pub(crate), M1) — the anchor
+    ///     leg; its only callers are same-crate freshness comparisons of a
+    ///     *recorded* anchor against the *current* one, never a persisted
+    ///     anchor.
+    ///   - [`Self::resolve_version_manifest`] (pub) — takes an explicit
+    ///     `version: i64` the caller already decided; does not read
+    ///     `record.current_version` itself. This is the shared
+    ///     row-exists-and-ready primitive [`Self::pin_current_version`]
+    ///     itself now calls (M9), so a caller that resolves the SAME
+    ///     manifest once and threads it to both an anchor and a read (as
+    ///     the delta-refresh and compaction producers in
+    ///     `crates/jammi-ai/src/pipeline/embedding_refresh.rs` do) gets the
+    ///     same one-resolution guarantee `PinnedSource` does, without
+    ///     forcing every caller through `PinnedSource`'s shape.
+    ///   - [`Self::build_masked_provider`] / [`Self::count_live_rows`]
+    ///     (pub) — take an already-resolved `&VersionManifest`, never a bare
+    ///     version number or a bare record; they cannot themselves decide
+    ///     which version to read.
+    ///   - [`Self::bind_result_table`] (pub) — the documented "Read class"
+    ///     residual on its own doc: serves a possibly-stale
+    ///     session-bound registration, never persists an anchor.
+    ///   - [`Self::search_vectors`] / `search_vectors_local` /
+    ///     `resolve_search_mode` / `resolve_search_mode_local` (pub) — the
+    ///     candidate-selection residual M4 discloses below, out of scope
+    ///     for this seam.
+    ///   - [`Self::verify_materialization`] (pub) — compares a version's
+    ///     recorded identity against its recomputed one; a read-only
+    ///     integrity check, never a persisted anchor.
+    ///   - [`Self::allocate_version`] / [`Self::reap_expired_version`] (pub)
+    ///     — take a record or an explicit version to allocate a NEW version
+    ///     or delete a superseded one; neither reads content under a
+    ///     version it resolves itself.
+    ///
+    /// **Residual — candidate SELECTION is not pinned (M4; scope widened
+    /// round 5, M6/M7).** This closes "the artifact's anchor and its rows
+    /// agree on one version" for a producer that already holds its
+    /// candidate row set (its target keys, its neighbor list, its context
+    /// members). It does NOT make "every row read by the artifact's
+    /// pipeline came from this one version" true end-to-end for:
+    ///   - the three context producers
+    ///     (`crates/jammi-ai/src/pipeline/{context_set,context_predictor,recompute}.rs`):
+    ///     their candidate SET is chosen upstream by
+    ///     [`ResultStore::search_vectors`], which serves ANN from the
+    ///     catalog's live segment set and otherwise falls back to
+    ///     `crate::index::exact::exact_vector_search` against this
+    ///     session's own `jammi.{table}` registration — neither leg is
+    ///     pinned. A pinned producer's POOLED VECTORS are guaranteed
+    ///     single-version; its MEMBER SET may still have been chosen from a
+    ///     different, unpinned view.
+    ///   - the neighbor-graph producer
+    ///     (`crates/jammi-ai/src/pipeline/neighbor_graph.rs:275-308`): its
+    ///     PERSISTED artifact carries the pinned anchor, but its edge
+    ///     candidates come from an unpinned segment set
+    ///     (`resolve_search_mode_local`, `neighbor_graph.rs:394`) — the same
+    ///     shape as the context producers above, named separately because
+    ///     it is a different call path.
+    ///
+    /// This is stated here, and in the guide's "Pinned reads for a
+    /// persisting producer" section, rather than closed: closing it means
+    /// threading a pin into the search/candidate-selection path, out of
+    /// scope for this contract.
     pub async fn pin_current_version(&self, record: ResultTableRecord) -> Result<PinnedSource> {
+        // UNVERSIONED ARM COST (round 5, M8; the previous contract required
+        // a measured figure here and none was ever added). `current_version
+        // == None` is the DEFAULT state of a table (never refreshed), so
+        // this arm is the common path, not an edge case. With no
+        // `.materialization.json` sidecar (a pre-contract table), the
+        // `None` branch below does a FULL `GET` of the base Parquet object
+        // plus a hash over every byte — measured on this repo's own
+        // filesystem-backed test harness: a 1,000-row / 32-dim tiny-bert
+        // table is 44,081 bytes and a 10,000-row one is 391,007 bytes;
+        // `pin_current_version` over either averaged ~260-290µs per call
+        // (5-call average, warm local disk). That is O(table size), not
+        // O(rows the caller actually wants), and it runs on EVERY call to
+        // `InferenceSession::assemble_context` (unpinned) — served per RPC
+        // at `jammi-server/src/grpc/pipeline.rs:111` and per prediction at
+        // `context_predictor.rs`'s serve path — even though neither caller
+        // ever reads the anchor `assemble_context` discards it into. A
+        // remote object store (S3, GCS) replaces this local-disk figure
+        // with network latency dominating, not disk; this is not bounded by
+        // anything on that path today.
         let Some(version) = record.current_version else {
             let parquet_url = StorageUrl::parse(&record.parquet_path)?;
             let digest = match self.read_materialization_manifest(&parquet_url).await? {
@@ -2702,30 +2801,21 @@ impl ResultStore {
                 record,
             });
         };
-        let unavailable = || JammiError::VersionUnavailable {
-            table: record.table_name.clone(),
-            version,
-        };
-        // The ONE admin-scope catalog read: both the anchor (`identity`
-        // below) and the read (the manifest fetched immediately after, then
-        // `pinned_provider`) derive from this single row.
-        let row = TenantBinding::admin_scope(
-            self.catalog
-                .get_result_table_version(&record.table_name, version),
-        )
-        .await?;
-        let identity = match row {
-            Some(r) if r.status == ResultTableStatus::Ready.to_string() => {
-                r.identity.unwrap_or_default()
-            }
-            _ => return Err(unavailable()),
-        };
-        let parquet_url = StorageUrl::parse(&record.parquet_path)?;
-        let manifest = self
-            .read_version_manifest(&record.table_name, &parquet_url, version)
-            .await?
-            .ok_or_else(unavailable)?;
-        let anchor = InputAnchor::result_digest(&record.table_name, &ArtifactDigest(identity));
+        // The ONE resolution: `resolve_version_manifest` (M5) performs the
+        // row exists-and-is-ready check and returns the manifest whose
+        // `identity` field is the SAME string `BuildingVersion::publish`
+        // wrote onto the row when it made this version ready — the anchor
+        // below and the read `pinned_provider` serves both come from this
+        // single manifest, never from two independent catalog reads a
+        // version publish landing between them could straddle. Delegating
+        // here (rather than hand-copying the row-exists-and-ready check, as
+        // an earlier round did) also means this method inherits any future
+        // strengthening of that check instead of drifting from it (M9).
+        let manifest = self.resolve_version_manifest(&record, version).await?;
+        let anchor = InputAnchor::result_digest(
+            &record.table_name,
+            &ArtifactDigest(manifest.identity.clone()),
+        );
         Ok(PinnedSource {
             anchor,
             version: Some(version),

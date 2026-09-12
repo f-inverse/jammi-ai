@@ -268,6 +268,11 @@ impl<'a> NeighborGraphPipeline<'a> {
             .catalog()
             .resolve_embedding_table(source_id, embedding_table)
             .await?;
+        // ONE resolution of the source table's current version (M1): its
+        // anchor (below) and every row `read_nodes` reads both derive from
+        // this single pin, so a version publish racing this build can never
+        // straddle the two the way two independent resolves could.
+        let pin = self.result_store.pin_current_version(source_table).await?;
 
         // Top-of-producer cache probe, before the expensive read+build. The
         // descriptor and the sole `ResultDigest` input anchor are both knowable
@@ -276,16 +281,12 @@ impl<'a> NeighborGraphPipeline<'a> {
         // records at finalize. A neighbor-graph is anchored on an immutable
         // result table, so it is genuinely cacheable: the same build over the
         // same parent yields the same edges.
-        let descriptor = neighbor_graph_descriptor(&source_table, params);
+        let descriptor = neighbor_graph_descriptor(pin.record(), params);
         let env = jammi_db::store::manifest::MaterializationEnv::new(
             self.session.compute_device(),
             Vec::new(),
         );
-        let inputs = vec![
-            self.result_store
-                .result_digest_anchor(&source_table)
-                .await?,
-        ];
+        let inputs = vec![pin.input_anchor()];
 
         if cache == CachePolicy::Use {
             let def_hash = jammi_db::store::manifest::MaterializationManifest::definition_of(
@@ -303,27 +304,26 @@ impl<'a> NeighborGraphPipeline<'a> {
             }
         }
 
-        let nodes = self.read_nodes(&source_table).await?;
-        let edges = self.build_edges(&source_table, &nodes, params).await?;
+        let nodes = self.read_nodes(&pin).await?;
+        let edges = self.build_edges(pin.record(), &nodes, params).await?;
         let record = self
-            .write_edge_table(&source_table, edges, &descriptor, &env, inputs, job_attempt)
+            .write_edge_table(pin.record(), edges, &descriptor, &env, inputs, job_attempt)
             .await?;
         Ok((record, CacheOutcome::Computed))
     }
 
     /// Read every `(_row_id, vector)` pair from the embedding table's Parquet,
     /// in the order the engine scans it. Reads through
-    /// [`ResultStore::current_version_provider`] — `table`'s OWN
-    /// `current_version` (the same field `result_digest_anchor` above just
-    /// resolved), never the session's registered `jammi.{table}` — so the
-    /// edges this build writes are computed over exactly the rows its
-    /// `ResultDigest` anchor names, never a session-stale prior version.
-    async fn read_nodes(&self, table: &ResultTableRecord) -> Result<Vec<Node>> {
+    /// [`ResultStore::pinned_provider`] — the SAME resolution `pin`'s anchor
+    /// was computed from, never a second, independent read of
+    /// `current_version` — so the edges this build writes are computed over
+    /// exactly the rows its `ResultDigest` anchor names, never a
+    /// session-stale prior version or a version that published after the
+    /// anchor was taken.
+    async fn read_nodes(&self, pin: &jammi_db::store::PinnedSource) -> Result<Vec<Node>> {
+        let table = pin.record();
         let ctx = self.session.context();
-        let provider = self
-            .result_store
-            .current_version_provider(ctx, table)
-            .await?;
+        let provider = self.result_store.pinned_provider(ctx, pin).await?;
         let batches = ctx
             .read_table(provider)
             .map_err(JammiError::from)?

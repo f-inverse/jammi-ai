@@ -254,12 +254,39 @@ impl InferenceSession {
             .catalog()
             .resolve_embedding_table(&request.source_id, request.embedding_table.as_deref())
             .await?;
+        // The served, wire-facing entry resolves its own pin per call rather
+        // than taking one as a parameter — the per-RPC cost this leaves is
+        // the M3 schema/mask memo's to close, not M1's; see
+        // `PinnedSource`'s doc for why a caller that already holds a pin
+        // (the `recompute`/per-target producers) should call
+        // `assemble_context_pinned` directly instead of resolving a second
+        // one here.
+        let pin = self.result_store().pin_current_version(table).await?;
+        self.assemble_context_pinned(request, &pin).await
+    }
+
+    /// [`Self::assemble_context`]'s pinned twin: the candidate set, the
+    /// pooled vector, and the hydrated value rows all come from `pin`'s one
+    /// resolution rather than each resolving `current_version` for itself.
+    /// A caller looping over many targets against the SAME source table
+    /// (`recompute.rs`) pins ONCE and calls this per target — every target
+    /// in the batch reads the identical version, and the schema/mask memo
+    /// (M3) hits for every target after the first.
+    ///
+    /// **Residual (M4):** this pins the POOL read, not candidate SELECTION —
+    /// see [`jammi_db::store::ResultStore::pin_current_version`]'s doc.
+    pub async fn assemble_context_pinned(
+        self: &Arc<Self>,
+        request: &ContextRequest,
+        pin: &jammi_db::store::PinnedSource,
+    ) -> Result<ContextRepresentation> {
+        let table = pin.record();
 
         // The candidate set — the only part that differs by source. Everything
         // after this is the one shared tail (exclude-self → split → truncate →
         // pool → hydrate), so ANN, edge, and hybrid contexts are leakage-scoped
         // and pooled identically.
-        let mut context_keys = self.gather_candidates(request, &table).await?;
+        let mut context_keys = self.gather_candidates(request, table).await?;
 
         // Self-exclusion (the leakage guard): drop every neighbour whose key
         // matches the target's own key. A free-vector query carries no key, so
@@ -297,7 +324,7 @@ impl InferenceSession {
         }
 
         let context_vector = self
-            .pool_context_vectors(&table, &context_keys, request.aggregator)
+            .pool_context_vectors(pin, &context_keys, request.aggregator)
             .await?;
 
         let value_rows = if request.value_columns.is_empty() {
@@ -407,23 +434,24 @@ impl InferenceSession {
         })
     }
 
-    /// Pool the stored vectors of `context_keys` from `table`'s embedding
+    /// Pool the stored vectors of `context_keys` from `pin`'s embedding
     /// Parquet into one fixed-width vector via the vector-aggregation UDAF.
     ///
-    /// Reads through [`jammi_db::store::ResultStore::current_version_provider`]
-    /// — `table`'s OWN `current_version`, never the session's registered
-    /// `jammi.{table}` (see that method's doc) — filtered to the context keys,
-    /// then runs `vector_<agg>(vector)` over them — the aggregate's *value* is
-    /// permutation-invariant by construction, so it does not depend on the order
-    /// the keys arrive in. Under a fixed execution plan the pooled vector is also
-    /// stable run-to-run; it is not byte-identical across arbitrary partitionings
+    /// Reads through [`jammi_db::store::ResultStore::pinned_provider`] — the
+    /// SAME resolution `pin` names, never a second, independent read of
+    /// `current_version` (see [`jammi_db::store::PinnedSource`]'s doc) —
+    /// filtered to the context keys, then runs `vector_<agg>(vector)` over
+    /// them — the aggregate's *value* is permutation-invariant by
+    /// construction, so it does not depend on the order the keys arrive in.
+    /// Under a fixed execution plan the pooled vector is also stable
+    /// run-to-run; it is not byte-identical across arbitrary partitionings
     /// (`f64` `+` is non-associative — see the vector-aggregation UDAF), which the
     /// downstream conformal calibration tolerates (sub-rounding differences are
     /// immaterial). An empty key set yields `None` rather than a pool over
     /// nothing.
     async fn pool_context_vectors(
         &self,
-        table: &ResultTableRecord,
+        pin: &jammi_db::store::PinnedSource,
         context_keys: &[String],
         aggregator: SetAggregator,
     ) -> Result<Option<Vec<f32>>> {
@@ -450,14 +478,11 @@ impl InferenceSession {
         let keys: Vec<datafusion::prelude::Expr> =
             context_keys.iter().map(|k| lit(k.as_str())).collect();
         let ctx = self.context();
-        let provider = self
-            .result_store()
-            .current_version_provider(ctx, table)
-            .await?;
+        let provider = self.result_store().pinned_provider(ctx, pin).await?;
         let pooled = ctx
             .read_table(provider)
             .map_err(|e| {
-                JammiError::Other(format!("Context pool: resolve '{}': {e}", table.table_name))
+                JammiError::Other(format!("Context pool: resolve '{}': {e}", pin.table_name()))
             })?
             // Typed IN-list over the keys — the arbitrary row keys are bound
             // values, never interpolated into SQL text.
@@ -469,7 +494,7 @@ impl InferenceSession {
             .await
             .map_err(|e| JammiError::Other(format!("Context pool: collect: {e}")))?;
 
-        extract_single_vector(&pooled, &table.table_name)
+        extract_single_vector(&pooled, pin.table_name())
     }
 
     /// Keep only the candidate keys whose source row satisfies `split`,

@@ -740,22 +740,6 @@ impl InferenceSession {
         crate::model::backend::candle::effective_compute_device(&self.device_config)
     }
 
-    /// Resolve a single member row's stored `vector` from an embedding result
-    /// table by key, or `None` when no row matches — the per-member read the
-    /// episodic context sampler builds its tensors from, reusing the engine's
-    /// typed vector-by-key SQL path rather than a raw-vector verb.
-    pub(crate) async fn read_vector_by_key(
-        &self,
-        table: &ResultTableRecord,
-        row_key: &str,
-    ) -> Result<Option<Vec<f32>>> {
-        match self.inner.read_vector_by_key(table, row_key).await {
-            Ok(v) => Ok(Some(v)),
-            Err(JammiError::Catalog(_)) => Ok(None),
-            Err(e) => Err(e),
-        }
-    }
-
     /// Access the DataFusion session context.
     pub fn context(&self) -> &datafusion::prelude::SessionContext {
         self.inner.context()

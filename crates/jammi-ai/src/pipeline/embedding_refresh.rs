@@ -437,9 +437,11 @@ impl InferenceSession {
         for key in classified.changed.iter().chain(classified.deleted.iter()) {
             mask.raise(key.clone(), n - 1);
         }
-        for key in &realized {
-            debug_assert!(!mask.is_masked(key, n), "a key of fragment {n} is masked");
-        }
+        // M6: a typed refusal, not a release-vanishing `debug_assert!`. See
+        // `refuse_if_realized_key_is_masked`'s doc for the reasoning. Raised
+        // BEFORE `mask.write` and any manifest write, so the abort leaves
+        // the previous version live and writes no terminal state.
+        refuse_if_realized_key_is_masked(&mask, &record.table_name, n, &realized)?;
         let deletes = if mask.is_empty() {
             None
         } else {
@@ -1203,13 +1205,18 @@ impl InferenceSession {
             });
         };
         let parquet_url = StorageUrl::parse(&record.parquet_path)?;
-        let manifest = store
-            .read_version_manifest(&record.table_name, &parquet_url, current)
-            .await?
-            .ok_or_else(|| JammiError::VersionUnavailable {
-                table: record.table_name.clone(),
-                version: current,
-            })?;
+        // M5: `resolve_version_manifest`, not `read_version_manifest`
+        // directly — the same idiom as the refresh/compact arms above. This
+        // manifest IS the retention set the loop below reaps every
+        // OTHER version against (`reap_expired_version`, a PERMANENT
+        // delete), so skipping the row-exists-and-is-ready check `resolve_`
+        // performs and going straight to the raw manifest read would reap
+        // real fragments/segments against a manifest whose current-version
+        // row might not even be ready, or might not exist at all. Failing
+        // safe here means an unresolvable or non-ready current version
+        // refuses the expiry instead of reaping against an unchecked
+        // manifest.
+        let manifest = store.resolve_version_manifest(&record, current).await?;
         let retained_fragments: HashSet<String> =
             manifest.fragments.iter().map(|f| f.url.clone()).collect();
         let retained_segments: HashSet<i64> =
@@ -1251,6 +1258,43 @@ impl InferenceSession {
     }
 }
 
+/// M6: refuse to publish a version whose OWN newly realized keys are already
+/// masked by its parent's mask — the state a non-monotonic parent yields.
+/// `mask.raise(key, n - 1)` (the classify step just above this call) sets
+/// `is_masked(key, v) ⇔ horizon(key) >= v` (`store::deletes::DeletionMask`),
+/// so `is_masked(key, n)` firing for a key THIS fragment `n` just realized
+/// means the parent's horizon already reaches `n` — impossible for a
+/// monotonically-advancing parent, and exactly the failure this refresh's
+/// own publish precondition exists to refuse.
+///
+/// Previously a `debug_assert!`, which is release-vanishing: in a release
+/// build the check compiles out entirely, and `mask.write` / the version
+/// manifest write that follow would publish a version that hides its OWN
+/// newly realized rows under its own mask — silent row loss recorded as a
+/// successful refresh, and that version then becomes the parent of the next
+/// one. Calling this BEFORE `mask.write` and any manifest write means the
+/// refusal aborts before any terminal state is written, leaving the
+/// previous version live. Cost: O(|realized|) hash lookups, once per
+/// refresh.
+fn refuse_if_realized_key_is_masked(
+    mask: &jammi_db::store::deletes::DeletionMask,
+    table: &str,
+    n: i64,
+    realized: &HashSet<String>,
+) -> Result<()> {
+    for key in realized {
+        if mask.is_masked(key, n) {
+            return Err(JammiError::Catalog(format!(
+                "result table '{table}' fragment {n} realized key '{key}' but the \
+                 parent mask's horizon already covers fragment {n} — a \
+                 non-monotonic parent, refusing to publish a version that \
+                 would hide its own newly realized rows"
+            )));
+        }
+    }
+    Ok(())
+}
+
 /// A `SELECT *` over the masked provider comes back with the scan's view
 /// types (`Utf8View`) and the reader's field nullability; a compaction writes
 /// the table's canonical embedding schema, so every column is cast to it.
@@ -1275,4 +1319,54 @@ fn coerce_to_embedding_schema(
     }
     RecordBatch::try_new(Arc::clone(schema), columns)
         .map_err(|e| JammiError::Other(format!("compaction: build batch: {e}")))
+}
+
+#[cfg(test)]
+mod m6_masked_realized_key {
+    use super::*;
+
+    /// DELTA round-4 M6 oracle. A parent whose mask horizon already covers
+    /// fragment `n` (constructed directly here — the state a non-monotonic
+    /// parent yields) must refuse, naming the key and the fragment, rather
+    /// than let the caller publish a version that hides its own newly
+    /// realized rows. This is a plain `#[test]` (no `cfg(debug_assertions)`
+    /// anywhere in `refuse_if_realized_key_is_masked`), so it is exactly as
+    /// RED under `cargo test --release` as under a debug build — the
+    /// property a `debug_assert!` could never have, since it compiles out
+    /// of a release binary entirely.
+    #[test]
+    fn refuses_a_key_the_parent_mask_already_covers() {
+        let mut mask = jammi_db::store::deletes::DeletionMask::empty();
+        // A non-monotonic parent: its horizon for "k1" already reaches
+        // fragment 5, so realizing "k1" INTO fragment 5 would be hidden by
+        // its own parent's mask.
+        mask.raise("k1".to_string(), 5);
+        let mut realized = HashSet::new();
+        realized.insert("k1".to_string());
+
+        let err = refuse_if_realized_key_is_masked(&mask, "my_table", 5, &realized)
+            .expect_err("a key the parent mask already covers at this fragment must refuse");
+        match err {
+            JammiError::Catalog(msg) => {
+                assert!(msg.contains("my_table"), "{msg}");
+                assert!(msg.contains("k1"), "{msg}");
+                assert!(msg.contains('5'), "{msg}");
+            }
+            other => panic!("expected JammiError::Catalog, got {other:?}"),
+        }
+    }
+
+    /// The honest negative: a monotonic parent (horizon below `n`) never
+    /// refuses a key it realizes into `n`.
+    #[test]
+    fn a_monotonic_parent_is_never_refused() {
+        let mut mask = jammi_db::store::deletes::DeletionMask::empty();
+        mask.raise("k1".to_string(), 3);
+        let mut realized = HashSet::new();
+        realized.insert("k1".to_string());
+        realized.insert("k2".to_string());
+
+        refuse_if_realized_key_is_masked(&mask, "my_table", 5, &realized)
+            .expect("a monotonic parent's mask must never refuse its own fragment's realized keys");
+    }
 }

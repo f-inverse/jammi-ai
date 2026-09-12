@@ -19,7 +19,7 @@ use jammi_ai::pipeline::recompute::Cascade;
 use jammi_ai::session::InferenceSession;
 use jammi_ai::Session;
 use jammi_db::catalog::result_repo::ResultTableRecord;
-use jammi_db::error::{JammiError, NonUniqueScan};
+use jammi_db::error::{JammiError, NonUniqueScan, NotRefreshableReason};
 use jammi_db::index::sidecar::SidecarIndex;
 use jammi_db::source::{FileFormat, SourceConnection, SourceType};
 use jammi_db::storage::StorageUrl;
@@ -1013,15 +1013,22 @@ async fn current_version_provider_reads_the_catalog_version_not_the_stale_sessio
     let stale_rows: usize = stale_batches.iter().map(|b| b.num_rows()).sum();
     assert_eq!(stale_rows, 20, "session 1's own registration is still v0");
 
-    // A FRESH catalog read (current_version = Some(1)) fed into
-    // `current_version_provider`, through session 1's OWN `ctx`, must read
-    // v1's 25 rows — never session 1's stale 20.
+    // A FRESH catalog read (current_version = Some(1)) pinned (M1) and read
+    // through `pinned_provider`, through session 1's OWN `ctx`, must read
+    // v1's 25 rows — never session 1's stale 20. (`current_version_provider`
+    // itself left the public surface with M1 — this is its replacement.)
     let fresh_record = h.record().await;
     assert_eq!(fresh_record.current_version, Some(1));
+    let pin = h
+        .session
+        .result_store()
+        .pin_current_version(fresh_record)
+        .await
+        .unwrap();
     let provider = h
         .session
         .result_store()
-        .current_version_provider(h.session.context(), &fresh_record)
+        .pinned_provider(h.session.context(), &pin)
         .await
         .unwrap();
     let batches = h
@@ -1035,7 +1042,114 @@ async fn current_version_provider_reads_the_catalog_version_not_the_stale_sessio
     let fresh_rows: usize = batches.iter().map(|b| b.num_rows()).sum();
     assert_eq!(
         fresh_rows, 25,
-        "current_version_provider reads the catalog's current version, not the stale session"
+        "pinned_provider reads the catalog's current version, not the stale session"
+    );
+}
+
+/// DELTA round-4 straddle oracle (`CONTRACT-DELTA-fix3.md`'s Oracles
+/// section): publish a NEW version BETWEEN `pin_current_version` and the
+/// pinned read, and assert the persisted anchor AND the pinned read's
+/// content both still name the version pinned at, never a mix where the
+/// anchor names the OLD version while a read straddles onto the NEW one.
+/// RED at `ebb1c9e6` (round 3): `current_version_identity` (the anchor leg)
+/// and `current_version_provider` (the read leg) each independently
+/// re-resolve `table.current_version` off the caller's record, so nothing
+/// stops the read from serving whatever published in between — this test
+/// pins BEFORE the race and would show the read's content moving to v1
+/// while the anchor comment claims v0, on that shape.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn pin_current_version_survives_a_publish_race_between_pin_and_read() {
+    use datafusion::prelude::{col, lit};
+
+    let h = harness(10).await;
+    let base = h.refresh().await.unwrap();
+    assert_eq!(base.outcome, RefreshOutcome::NoChange);
+    assert_eq!(h.record().await.current_version, Some(0));
+    let v0_vector = h.vector_of("0").await.expect("row 0 has a v0 vector");
+
+    // Pin v0 — ONE resolution; the anchor and the read both derive from it.
+    let pin = h
+        .session
+        .result_store()
+        .pin_current_version(h.record().await)
+        .await
+        .unwrap();
+    assert_eq!(pin.version(), Some(0));
+    let pinned_anchor = pin.input_anchor();
+
+    // THE RACE: a version publishes BETWEEN the pin and the read — a second
+    // session on the same catalog/root re-embeds row "0" as v1.
+    let session2 = open_session(&h.root, 1).await;
+    let mut edited = rows(10);
+    edited[0].1 = format!("{}-EDITED", edited[0].1);
+    write_parquet(&h.source_path, &edited);
+    let report2 = session2
+        .refresh_embeddings(&h.table, RefreshOptions::default())
+        .await
+        .unwrap();
+    assert_eq!(report2.outcome, RefreshOutcome::Published);
+    assert_eq!(h.record().await.current_version, Some(1));
+
+    // The anchor: infallible and unchanged (no second catalog read), and it
+    // DIFFERS from a fresh anchor computed against the now-current v1 — the
+    // pin did not silently follow the race.
+    assert_eq!(
+        pin.input_anchor(),
+        pinned_anchor,
+        "input_anchor is infallible and idempotent"
+    );
+    let fresh_anchor = h
+        .session
+        .result_store()
+        .result_digest_anchor(&h.record().await)
+        .await
+        .unwrap();
+    assert_ne!(
+        fresh_anchor, pinned_anchor,
+        "v1 published a new identity; the v0 pin must not have followed it"
+    );
+
+    // The read: `pinned_provider` still serves v0's content — row "0"'s
+    // PRE-edit vector, never v1's re-embedded one — even though the
+    // catalog's `current_version` moved to 1 in between the pin and this
+    // read. This is the property itself: the anchor and every row the pin
+    // reads derive from the SAME resolution.
+    let provider = h
+        .session
+        .result_store()
+        .pinned_provider(h.session.context(), &pin)
+        .await
+        .unwrap();
+    let batches = h
+        .session
+        .context()
+        .read_table(provider)
+        .unwrap()
+        .filter(col("_row_id").eq(lit("0")))
+        .unwrap()
+        .select_columns(&["vector"])
+        .unwrap()
+        .collect()
+        .await
+        .unwrap();
+    let mut pinned_read_vectors = Vec::new();
+    for batch in &batches {
+        jammi_db::store::vectors::extend_with_fixed_size_list_f32(
+            batch,
+            &h.table,
+            "vector",
+            &mut pinned_read_vectors,
+        )
+        .unwrap();
+    }
+    assert_eq!(
+        pinned_read_vectors.len(),
+        1,
+        "exactly one row for key \"0\" in the pinned v0 read"
+    );
+    assert_eq!(
+        pinned_read_vectors[0], v0_vector,
+        "the pinned read must still serve v0's content, not v1's re-embedded row \"0\""
     );
 }
 
@@ -1849,4 +1963,95 @@ async fn compact_yields_single_fragment_value_equivalent() {
             "search unchanged after expiry (query {q})"
         );
     }
+}
+
+/// DELTA round-4 M5 oracle: a non-ready current version must refuse
+/// `expire_versions` rather than reap against an unchecked manifest.
+///
+/// Honest scope note: this black-box path is ALSO refused earlier, by the
+/// pre-existing `refreshable_record` gate at step 0 (`NotRefreshable {
+/// CurrentVersionUnavailable }`), so this test proves the CALLER-VISIBLE
+/// property the contract names ("a non-ready current version → refuses,
+/// `reap_expired_version` never runs") but does not, by itself, isolate the
+/// specific `read_version_manifest` → `resolve_version_manifest` swap this
+/// same commit makes at `expire_versions`'s OWN manifest read further down —
+/// that conversion's independent value is closing the narrower TOCTOU race
+/// where the row is still `ready` at `refreshable_record`'s check and only
+/// transitions to non-ready before the later read, which needs a park-point
+/// test hook this commit does not add. Recorded here rather than claimed as
+/// fully isolated.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn expire_versions_refuses_a_non_ready_current_version() {
+    let h = harness(20).await;
+    let mut edited = rows(20);
+    edited[0].1 = "edited zero".into();
+    write_parquet(&h.source_path, &edited);
+    let report = h.refresh().await.unwrap();
+    assert_eq!(report.outcome, RefreshOutcome::Published);
+    let n = report.version.unwrap();
+
+    // Break v_n's manifest and let recovery mark its version row `failed`
+    // while the table's `current_version` keeps pointing at it — the
+    // "non-ready current version" state this oracle targets (the same
+    // recovery behaviour `current_manifest_loss_is_typed_unavailable_and_recomputable`
+    // proves elsewhere).
+    let record = h.record().await;
+    let parquet_url = StorageUrl::parse(&record.parquet_path).unwrap();
+    let manifest_url = layout::version_manifest_url(&parquet_url, n).unwrap();
+    std::fs::remove_file(common::url_to_path(manifest_url.as_str())).unwrap();
+    h.session.result_store().recover().await.unwrap();
+    let row = h
+        .session
+        .catalog()
+        .get_result_table_version(&h.table, n)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        row.status, "failed",
+        "recovery marks the broken version failed"
+    );
+    let record = h.record().await;
+    assert_eq!(
+        record.current_version,
+        Some(n),
+        "current_version is unchanged by recovery — a non-ready CURRENT version"
+    );
+
+    let before_versions = h
+        .session
+        .catalog()
+        .list_result_table_versions(&h.table)
+        .await
+        .unwrap();
+
+    let err = h
+        .session
+        .expire_versions(&h.table, n + 1)
+        .await
+        .expect_err("a non-ready current version must refuse expiry, never reap against it");
+    assert!(
+        matches!(
+            err,
+            JammiError::NotRefreshable {
+                reason: NotRefreshableReason::CurrentVersionUnavailable,
+                ..
+            }
+        ),
+        "{err:?}"
+    );
+
+    // `reap_expired_version` was never reached: the refused call deleted no
+    // catalog version row.
+    let after_versions = h
+        .session
+        .catalog()
+        .list_result_table_versions(&h.table)
+        .await
+        .unwrap();
+    assert_eq!(
+        before_versions.len(),
+        after_versions.len(),
+        "a refused expiry deletes no version row"
+    );
 }

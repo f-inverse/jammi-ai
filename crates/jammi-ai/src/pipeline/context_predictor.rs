@@ -351,7 +351,11 @@ pub struct SampledEpisodes {
 /// one borrow rather than a long argument list.
 struct EpisodeSampling<'a> {
     source_id: &'a str,
-    table: &'a ResultTableRecord,
+    /// The pinned source embedding table (M1): the target vector and the
+    /// context members' vectors both read through this ONE resolution
+    /// (`ResultStore::pinned_provider`), so a trained checkpoint's rows
+    /// can never straddle a version publish mid-run.
+    table: &'a jammi_db::store::PinnedSource,
     spec: &'a ContextPredictorTrainConfig,
     feature_dim: usize,
     scaler: &'a TargetScaler,
@@ -422,7 +426,14 @@ impl InferenceSession {
             .catalog()
             .resolve_embedding_table(source_id, None)
             .await?;
-        let feature_dim = table
+        // ONE resolution of the source table's current version (M1): the
+        // per-target target vector and member vectors below both read
+        // through this pin, never a second, independent resolve of
+        // `current_version` — a trained checkpoint's rows can never
+        // straddle a version publish mid-run.
+        let pin = self.result_store().pin_current_version(table).await?;
+        let feature_dim = pin
+            .record()
             .dimensions()
             .ok_or_else(|| {
                 JammiError::FineTune(format!(
@@ -462,7 +473,7 @@ impl InferenceSession {
 
         let env = EpisodeSampling {
             source_id,
-            table: &table,
+            table: &pin,
             spec,
             feature_dim,
             scaler: &scaler,
@@ -754,15 +765,23 @@ impl InferenceSession {
 
         let mut contexts = Vec::with_capacity(targets.len());
         for (target_key, target_y) in &targets {
-            // The target's own stored vector is the retrieval query — an ordinary
-            // SQL-surface read, not a raw-vector verb.
+            // The target's own stored vector, read through the SAME pin
+            // (M1) `read_member_vectors` below reads the context members
+            // through — a one-key slice, rather than `read_vector_by_key`
+            // (that helper is `search_by_id`'s read path, out of class for
+            // a persisting producer): the target's vector and its context
+            // members must agree on one version, or the checkpoint this
+            // episode trains could learn from a target/member pair that
+            // straddled a version publish.
             let target_x = self
-                .read_vector_by_key(env.table, target_key)
+                .read_member_vectors(env.table, std::slice::from_ref(target_key))
                 .await?
+                .into_iter()
+                .next()
                 .ok_or_else(|| {
                     JammiError::FineTune(format!(
                         "target '{target_key}' has no stored vector in '{}'",
-                        env.table.table_name
+                        env.table.table_name()
                     ))
                 })?;
 
@@ -815,18 +834,18 @@ impl InferenceSession {
     }
 
     /// Read the stored `vector` of each key from the embedding table, in the
-    /// given (retrieval) order — a typed `_row_id IN (keys)` scan of
-    /// `table`'s OWN `current_version`
-    /// ([`jammi_db::store::ResultStore::current_version_provider`]), never
-    /// the session's registered `jammi.{table}` (see that method's doc): the
-    /// trained predictor this member scan feeds into is a persisted
-    /// checkpoint, so its training rows must match the table's catalog-known
-    /// current state, not whatever a stale session registration still
-    /// serves. The keys are bound IN-list values, never interpolated, so an
-    /// arbitrary key is not an injection vector.
+    /// given (retrieval) order — a typed `_row_id IN (keys)` scan through
+    /// `pin` (`jammi_db::store::ResultStore::pinned_provider`), the SAME
+    /// resolution every other read against this pin agrees with, never the
+    /// session's registered `jammi.{table}`: the trained predictor this
+    /// member scan feeds into is a persisted checkpoint, so its training
+    /// rows must match the table's catalog-known current state, not
+    /// whatever a stale session registration still serves. The keys are
+    /// bound IN-list values, never interpolated, so an arbitrary key is not
+    /// an injection vector.
     async fn read_member_vectors(
         &self,
-        table: &ResultTableRecord,
+        pin: &jammi_db::store::PinnedSource,
         context_keys: &[String],
     ) -> Result<Vec<Vec<f32>>> {
         if context_keys.is_empty() {
@@ -836,25 +855,16 @@ impl InferenceSession {
 
         let keys: Vec<datafusion::prelude::Expr> =
             context_keys.iter().map(|k| lit(k.as_str())).collect();
+        let table = pin.table_name();
         let ctx = self.context();
         let provider = self
             .result_store()
-            .current_version_provider(ctx, table)
+            .pinned_provider(ctx, pin)
             .await
-            .map_err(|e| {
-                JammiError::FineTune(format!(
-                    "member-vectors resolve '{}': {e}",
-                    table.table_name
-                ))
-            })?;
+            .map_err(|e| JammiError::FineTune(format!("member-vectors resolve '{table}': {e}")))?;
         let batches = ctx
             .read_table(provider)
-            .map_err(|e| {
-                JammiError::FineTune(format!(
-                    "member-vectors resolve '{}': {e}",
-                    table.table_name
-                ))
-            })?
+            .map_err(|e| JammiError::FineTune(format!("member-vectors resolve '{table}': {e}")))?
             .filter(col("_row_id").in_list(keys, false))
             .map_err(|e| JammiError::FineTune(format!("member-vectors filter: {e}")))?
             .select_columns(&["_row_id", "vector"])
@@ -863,7 +873,7 @@ impl InferenceSession {
             .await
             .map_err(|e| JammiError::FineTune(format!("member-vectors scan: {e}")))?;
 
-        order_vectors_by_keys(&batches, &table.table_name, context_keys)
+        order_vectors_by_keys(&batches, table, context_keys)
     }
 
     /// Distinct values of the task column, in scan order.
@@ -1474,13 +1484,26 @@ impl InferenceSession {
         served: &ServedContextPredictor,
         target_key: &str,
     ) -> Result<PredictionWithProvenance> {
+        // `current_version_provider` left the public surface with M1 (no API
+        // may produce a version-resolved read from a bare
+        // `&ResultTableRecord`), so this serve — like the training sampler —
+        // pins once per call: the target's own vector and every context
+        // member below read through the SAME resolution, never two
+        // independent reads of `served.table.current_version` that a
+        // version publish between them could straddle.
+        let pin = self
+            .result_store()
+            .pin_current_version(served.table.clone())
+            .await?;
         let target_x = self
-            .read_vector_by_key(&served.table, target_key)
+            .read_member_vectors(&pin, std::slice::from_ref(&target_key.to_string()))
             .await?
+            .into_iter()
+            .next()
             .ok_or_else(|| {
                 JammiError::Inference(format!(
                     "target '{target_key}' has no stored vector in '{}'",
-                    served.table.table_name
+                    pin.table_name()
                 ))
             })?;
 
@@ -1501,9 +1524,7 @@ impl InferenceSession {
         let rep = self.assemble_context(&request).await?;
         let source = rep.source;
         let context_keys = rep.context_keys.clone();
-        let member_x = self
-            .read_member_vectors(&served.table, &rep.context_keys)
-            .await?;
+        let member_x = self.read_member_vectors(&pin, &rep.context_keys).await?;
         let member_y = extract_value_column(&rep.value_rows, &served.value_column)?;
         if member_x.len() != member_y.len() {
             return Err(JammiError::Inference(format!(

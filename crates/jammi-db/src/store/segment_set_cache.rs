@@ -7,6 +7,22 @@
 //! requires the table `building`), so it caches under `(table, None)`.
 //! Eviction is by table: on `bind_result_table`, on publish, on table delete.
 //! Version manifests are cached beside the sets (small JSON, immutable).
+//!
+//! The inferred base [`arrow::datatypes::SchemaRef`] and loaded
+//! [`DeletionMask`] `crate::store::ResultStore::build_masked_provider` needs
+//! per call are cached here too, under the same `(table, version)` key: both
+//! are per-version-IMMUTABLE IO products (a fragment's schema and a
+//! version's deletion mask never change once the version is `ready`), so
+//! re-reading them on every `build_masked_provider` call — an object-store
+//! list plus a Parquet footer read for the schema, an object read for the
+//! mask — buys nothing but cost. This is the M3 cost fix; it is never a
+//! substitute for [`crate::store::PinnedSource`]'s correctness fix, which
+//! closes a different bug (a straddled resolve, not a cache miss). The
+//! `Arc<dyn datafusion::datasource::TableProvider>` itself is deliberately
+//! NOT cached here: `build_result_table_provider` registers the fragment
+//! URL's object store on the `SessionContext` it is passed, so a provider
+//! built for one session and reused under another could scan without that
+//! registration ever having run.
 
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex, PoisonError};
@@ -28,6 +44,13 @@ type SetKey = (String, Option<i64>);
 pub struct SegmentSetCache {
     sets: Mutex<HashMap<SetKey, Arc<LoadedSegmentSet>>>,
     manifests: Mutex<HashMap<(String, i64), Arc<VersionManifest>>>,
+    /// The inferred base schema of a masked provider's fragments, keyed
+    /// `(table, version)`. See the module doc for why this is safe to cache
+    /// forever (until [`Self::evict_table`]) rather than per-call.
+    masked_schemas: Mutex<HashMap<(String, i64), arrow::datatypes::SchemaRef>>,
+    /// A version's loaded [`DeletionMask`], keyed `(table, version)`. Same
+    /// immutability argument as `masked_schemas`.
+    masked_masks: Mutex<HashMap<(String, i64), Arc<DeletionMask>>>,
 }
 
 impl std::fmt::Debug for SegmentSetCache {
@@ -71,13 +94,65 @@ impl SegmentSetCache {
             .insert((table.to_string(), version), manifest);
     }
 
-    /// Drop every entry (sets and manifests) of `table`.
+    /// The cached inferred base schema for `(table, version)`'s masked
+    /// provider, if this process has already built one.
+    pub fn get_masked_schema(
+        &self,
+        table: &str,
+        version: i64,
+    ) -> Option<arrow::datatypes::SchemaRef> {
+        self.masked_schemas
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .get(&(table.to_string(), version))
+            .cloned()
+    }
+
+    pub fn insert_masked_schema(
+        &self,
+        table: &str,
+        version: i64,
+        schema: arrow::datatypes::SchemaRef,
+    ) {
+        self.masked_schemas
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .insert((table.to_string(), version), schema);
+    }
+
+    /// The cached [`DeletionMask`] for `(table, version)`, if this process
+    /// has already loaded one.
+    pub fn get_masked_mask(&self, table: &str, version: i64) -> Option<Arc<DeletionMask>> {
+        self.masked_masks
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .get(&(table.to_string(), version))
+            .cloned()
+    }
+
+    pub fn insert_masked_mask(&self, table: &str, version: i64, mask: Arc<DeletionMask>) {
+        self.masked_masks
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .insert((table.to_string(), version), mask);
+    }
+
+    /// Drop every entry (sets, manifests, and the masked-provider schema/mask
+    /// memo) of `table`.
     pub fn evict_table(&self, table: &str) {
         self.sets
             .lock()
             .unwrap_or_else(PoisonError::into_inner)
             .retain(|(t, _), _| t != table);
         self.manifests
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .retain(|(t, _), _| t != table);
+        self.masked_schemas
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .retain(|(t, _), _| t != table);
+        self.masked_masks
             .lock()
             .unwrap_or_else(PoisonError::into_inner)
             .retain(|(t, _), _| t != table);

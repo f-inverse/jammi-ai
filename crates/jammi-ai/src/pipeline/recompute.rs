@@ -420,14 +420,21 @@ impl InferenceSession {
             .catalog()
             .resolve_embedding_table(&recipe.source_id, recipe.embedding_table.as_deref())
             .await?;
-        let targets = self.read_target_rows(&table).await?;
+        // ONE resolution of the source table's current version (M1), shared
+        // by every target in the loop below: `read_target_rows` and every
+        // `assemble_context_pinned` call read the SAME version, so a
+        // version publish racing this recompute can never straddle across
+        // targets, and the schema/mask memo (M3) hits for every target
+        // after the first.
+        let pin = self.result_store().pin_current_version(table).await?;
+        let targets = self.read_target_rows(&pin).await?;
 
         let mut rows: Vec<(String, Vec<f32>)> = Vec::new();
         for (row_id, query) in targets {
             let mut request = recipe.clone();
             request.query = query;
             request.exclude_key = Some(row_id.clone());
-            let representation = self.assemble_context(&request).await?;
+            let representation = self.assemble_context_pinned(&request, &pin).await?;
             // A degenerate context (no neighbour survived exclusion/split) has no
             // pooled vector. The original materialisation could only have
             // recorded a row for a target whose context was non-empty, so a
@@ -448,7 +455,7 @@ impl InferenceSession {
                     // table, so every key here IS one of that table's `_row_id`
                     // values — the one caller position that can honestly claim
                     // the table's own origin column for its targets.
-                    key_column: table.key_column.as_deref(),
+                    key_column: pin.record().key_column.as_deref(),
                 },
                 CachePolicy::Bypass,
             )
@@ -458,16 +465,19 @@ impl InferenceSession {
 
     /// Read every `(_row_id, vector)` of an embedding table into owned rows — the
     /// targets a ContextSet recompute re-pools over. Reads through
-    /// [`jammi_db::store::ResultStore::current_version_provider`] — `table`'s
-    /// OWN `current_version`, never the session's registered `jammi.{table}` —
-    /// so a recompute pools over exactly the source's current rows, never a
-    /// session-stale prior version.
-    async fn read_target_rows(&self, table: &ResultTableRecord) -> Result<Vec<(String, Vec<f32>)>> {
+    /// [`jammi_db::store::ResultStore::pinned_provider`] — the SAME
+    /// resolution every per-target `assemble_context_pinned` call in the
+    /// loop above reads from, never a second, independent read of
+    /// `current_version` — so a recompute pools over exactly one snapshot of
+    /// the source's current rows, never a session-stale prior version and
+    /// never a version straddled mid-loop.
+    async fn read_target_rows(
+        &self,
+        pin: &jammi_db::store::PinnedSource,
+    ) -> Result<Vec<(String, Vec<f32>)>> {
+        let table = pin.record();
         let ctx = self.context();
-        let provider = self
-            .result_store()
-            .current_version_provider(ctx, table)
-            .await?;
+        let provider = self.result_store().pinned_provider(ctx, pin).await?;
         let batches = ctx
             .read_table(provider)
             .map_err(JammiError::from)?

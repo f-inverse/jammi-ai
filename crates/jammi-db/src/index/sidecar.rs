@@ -269,11 +269,21 @@ impl RawVectorCompanion {
     /// records concatenated in internal-key order (i.e. exactly the buffer
     /// [`SidecarIndex::add`] accumulates).
     fn write(path: &Path, dimensions: usize, vectors: &[f32]) -> Result<()> {
-        debug_assert_eq!(
-            vectors.len() % dimensions.max(1),
-            0,
-            "rescore companion buffer must hold whole records"
-        );
+        // Same class as the DELTA contract's M6 (`embedding_refresh.rs`): a
+        // release-vanishing `debug_assert!` here is reachable, not
+        // decorative — a caller bug that hands a non-whole-record buffer
+        // would, in release, silently write a misaligned companion file,
+        // and every later `pread` (`Self::get`) is a fixed-offset seek into
+        // it, so a short/misaligned write corrupts reads at every OTHER
+        // key too, not just the truncated last record. Typed refusal, not
+        // an assert: the write never lands.
+        let width = dimensions.max(1);
+        if !vectors.len().is_multiple_of(width) {
+            return Err(JammiError::Other(format!(
+                "rescore companion buffer holds {} f32 values, not a whole multiple of dimensions {width} — refusing to write a misaligned companion file",
+                vectors.len()
+            )));
+        }
         std::fs::write(path, bytemuck::cast_slice(vectors))?;
         Ok(())
     }

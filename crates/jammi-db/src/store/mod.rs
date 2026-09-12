@@ -227,6 +227,59 @@ pub struct ResultStore {
     keeper: Option<Arc<crate::catalog::lease_keeper::LeaseKeeper>>,
 }
 
+/// The result of ONE [`ResultStore::pin_current_version`] resolution of a
+/// result table's current version — the type that makes the DELTA
+/// contract's property a compile-time shape rather than a call-site
+/// convention: *every durable artifact whose provenance names a source
+/// result table is produced from exactly one resolution of that table's
+/// current version; the anchor it records and every row it reads derive
+/// from that resolution, and no API yields one without the other.*
+///
+/// [`Self::input_anchor`] is INFALLIBLE — no second catalog read, no second
+/// failure mode — precisely because the identity (or, for a never-refreshed
+/// table, the base artifact digest) it returns was already resolved by
+/// [`ResultStore::pin_current_version`]. [`ResultStore::pinned_provider`]
+/// reads rows from the SAME resolution (the same `manifest`, for a
+/// versioned table). A bare `Arc<dyn TableProvider>` was refused as this
+/// type's shape: a provider carries neither a version nor an identity, so
+/// threading one still leaves a second `result_digest_anchor(&record)`
+/// constructible and the mislabel this type exists to close stays possible.
+/// See [`ResultStore::pin_current_version`] for the residual this does NOT
+/// close (candidate selection).
+pub struct PinnedSource {
+    /// The already-resolved anchor; see [`Self::input_anchor`].
+    anchor: InputAnchor,
+    /// `None` for a never-refreshed (base-only) table.
+    version: Option<i64>,
+    /// `Some` iff `version` is `Some` — the SAME manifest fetched during the
+    /// one resolve, never re-resolved by [`ResultStore::pinned_provider`].
+    manifest: Option<Arc<VersionManifest>>,
+    record: ResultTableRecord,
+}
+
+impl PinnedSource {
+    /// The [`InputAnchor`] this resolution names. Infallible: no catalog
+    /// read, no I/O, no failure mode — the whole point of pinning once
+    /// rather than resolving the anchor and the read as two independent
+    /// catalog calls that a version publish can straddle.
+    pub fn input_anchor(&self) -> InputAnchor {
+        self.anchor.clone()
+    }
+
+    /// The pinned version, or `None` for a never-refreshed table.
+    pub fn version(&self) -> Option<i64> {
+        self.version
+    }
+
+    pub fn table_name(&self) -> &str {
+        &self.record.table_name
+    }
+
+    pub fn record(&self) -> &ResultTableRecord {
+        &self.record
+    }
+}
+
 /// The catalog row's recorded width, as the cross-check
 /// [`crate::index::exact::exact_vector_search`] runs against the scan's own
 /// `FixedSizeList` width. `dimensions` is `Option<i32>` catalog metadata;
@@ -1044,12 +1097,16 @@ impl ResultStore {
     pub async fn result_digest_anchor(&self, table: &ResultTableRecord) -> Result<InputAnchor> {
         // A versioned table's anchor is its CURRENT version's identity (the
         // base version's identity is the base artifact hex, so publishing
-        // the base moves no anchor).
-        if let Some(identity) = self.current_version_identity(table).await? {
-            return Ok(InputAnchor::result_digest(
-                &table.table_name,
-                &ArtifactDigest(identity),
-            ));
+        // the base moves no anchor). Routed through `pin_current_version`
+        // (M1) rather than `current_version_identity` directly: a caller
+        // that only wants the anchor still resolves it through the ONE
+        // seam that also yields the matching read, so this method can never
+        // drift back into a second, independently-resolving anchor leg.
+        if table.current_version.is_some() {
+            return Ok(self
+                .pin_current_version(table.clone())
+                .await?
+                .input_anchor());
         }
         let parquet_url = StorageUrl::parse(&table.parquet_path)?;
         let digest = match self.read_materialization_manifest(&parquet_url).await? {
@@ -2340,7 +2397,7 @@ impl ResultStore {
     /// tenant-scoped table read, and a version inherits its table's owner.
     /// `pub` so a caller that reads a specific version's manifest directly
     /// (rather than through [`Self::bind_result_table`] /
-    /// [`Self::current_version_provider`]) still performs this same
+    /// `current_version_provider`) still performs this same
     /// "row exists and is ready" check instead of going straight to
     /// [`Self::read_version_manifest`], which performs no such check.
     pub async fn resolve_version_manifest(
@@ -2414,9 +2471,11 @@ impl ResultStore {
     ///     newer version's identity, and have the freshness check read it as
     ///     fresh — every later, correctly-bound process then gets a cache HIT
     ///     on the wrong artifact (self-propagating, not merely stale). Every
-    ///     such producer MUST read through
-    ///     [`ResultStore::current_version_provider`] instead, never through
-    ///     this session's registration.
+    ///     such producer MUST read through [`Self::pin_current_version`] /
+    ///     [`Self::pinned_provider`] instead, never through this session's
+    ///     registration — see [`PinnedSource`] for why the anchor and the
+    ///     read must come from the SAME resolution, not just the same
+    ///     `current_version` field read twice.
     pub async fn bind_result_table(
         &self,
         ctx: &SessionContext,
@@ -2474,18 +2533,47 @@ impl ResultStore {
     /// inferred schema, under the manifest's deletion mask. Unregistered: the
     /// caller registers it (`bind_result_table`) or reads through it directly
     /// (a not-yet-published manifest's live-row count).
+    ///
+    /// **Cost (M3).** Before this cache, every call paid one deletion-mask
+    /// object read plus one `infer_schema` (an object-store LIST plus a
+    /// Parquet footer read) for the first fragment, on top of the per-call
+    /// per-target loops this is served from (`recompute.rs`'s per-target
+    /// pass, `context_predictor.rs`'s per-target-per-task pass, and the
+    /// `assemble_context` RPC). The mask and the inferred base schema are
+    /// both per-version-IMMUTABLE IO products (see
+    /// `SegmentSetCache`'s module doc), so both are memoised beside the
+    /// existing manifest cache, keyed `(table, version)`: a cache HIT turns
+    /// this call into zero object-store IO for the mask and zero schema
+    /// inference for every fragment (each fragment's `ListingTable` is still
+    /// (re)built per call from the cached schema — `ListingTable::try_new`
+    /// with an explicit schema performs no IO — because the fragment
+    /// PROVIDER itself is never cached: `build_result_table_provider`
+    /// registers the fragment URL's object store on the `SessionContext` it
+    /// is passed, so a provider built for one session and reused under
+    /// another could scan without that registration ever having run. The
+    /// per-call catalog `SELECT` in [`Self::resolve_version_manifest`] (the
+    /// freshness/ready check) is unaffected by this cache and is a stated
+    /// residual — see [`PinnedSource`]'s doc.
     pub async fn build_masked_provider(
         &self,
         ctx: &SessionContext,
         record: &ResultTableRecord,
         manifest: &VersionManifest,
     ) -> Result<Arc<dyn TableProvider>> {
-        let mask = Arc::new(
-            self.load_deletion_mask(&record.table_name, manifest)
-                .await?,
-        );
+        let table = record.table_name.as_str();
+        let version = manifest.version;
+        let mask = match self.segment_sets.get_masked_mask(table, version) {
+            Some(mask) => mask,
+            None => {
+                let mask = Arc::new(self.load_deletion_mask(table, manifest).await?);
+                self.segment_sets
+                    .insert_masked_mask(table, version, Arc::clone(&mask));
+                mask
+            }
+        };
+        let cached_schema = self.segment_sets.get_masked_schema(table, version);
         let mut fragments = Vec::with_capacity(manifest.fragments.len());
-        let mut pinned: Option<arrow::datatypes::SchemaRef> = None;
+        let mut pinned: Option<arrow::datatypes::SchemaRef> = cached_schema.clone();
         for fragment in &manifest.fragments {
             let url = StorageUrl::parse(&fragment.url)?;
             let provider =
@@ -2504,6 +2592,10 @@ impl ResultStore {
                 record.table_name, manifest.version
             ))
         })?;
+        if cached_schema.is_none() {
+            self.segment_sets
+                .insert_masked_schema(table, version, Arc::clone(&schema));
+        }
         Ok(Arc::new(MaskedTableProvider::new(
             record.table_name.clone(),
             fragments,
@@ -2531,7 +2623,19 @@ impl ResultStore {
     /// `current_version` field already IS the fresh catalog value the
     /// anchor names — this method's only job is to make the READ agree with
     /// it instead of falling back to a stale session-bound registration.
-    pub async fn current_version_provider(
+    ///
+    /// PRIVATE (M1): this alone is exactly the shape that permitted the
+    /// straddle this module's [`PinnedSource`] closes — it re-resolves
+    /// `table.current_version` on every call, independently of whatever
+    /// resolved the artifact's anchor, so two calls (one for the anchor via
+    /// the old `current_version_identity`, one for the read here) could
+    /// straddle a version publish that lands between them. It survives only
+    /// as [`Self::pinned_provider`]'s helper for the UNVERSIONED arm, where
+    /// there is no version to straddle. A caller that persists a durable
+    /// artifact must go through [`Self::pin_current_version`] /
+    /// [`Self::pinned_provider`] instead, which resolve the anchor and the
+    /// read from the SAME admin-scope row fetch.
+    async fn current_version_provider(
         &self,
         ctx: &SessionContext,
         table: &ResultTableRecord,
@@ -2545,6 +2649,105 @@ impl ResultStore {
                 let manifest = self.resolve_version_manifest(table, version).await?;
                 self.build_masked_provider(ctx, table, &manifest).await
             }
+        }
+    }
+
+    /// A single admin-scope resolution of `record`'s CURRENT version, one
+    /// `get_result_table_version` catalog read. Every persisting producer
+    /// named in the DELTA contract (`docs/plans/68-compute-tier-substrate`)
+    /// pins ONCE, before it computes its artifact's [`InputAnchor`] or reads
+    /// a single row, and both the anchor ([`PinnedSource::input_anchor`])
+    /// and the rows ([`Self::pinned_provider`]) derive from this one
+    /// resolution — never from a second, independent read of
+    /// `record.current_version`. This is the removal of the
+    /// record-taking seam: `current_version_provider` is now private
+    /// precisely so no public API can produce a version-resolved read from
+    /// a bare `&ResultTableRecord` without also fixing the anchor that read
+    /// must agree with.
+    ///
+    /// **Residual — candidate SELECTION is not pinned (M4).** This closes
+    /// "the artifact's anchor and its rows agree on one version" for a
+    /// producer that already holds its candidate row set (its target keys,
+    /// its neighbor list, its context members). It does NOT make "every row
+    /// read by the artifact's pipeline came from this one version" true
+    /// end-to-end for the three context producers
+    /// (`crates/jammi-ai/src/pipeline/{context_set,context_predictor,recompute}.rs`):
+    /// their candidate SET is chosen upstream by
+    /// [`ResultStore::search_vectors`], which serves ANN from the catalog's
+    /// live segment set and otherwise falls back to
+    /// `crate::index::exact::exact_vector_search` against this session's own
+    /// `jammi.{table}` registration — neither leg is pinned. A pinned
+    /// producer's POOLED VECTORS are guaranteed single-version; its MEMBER
+    /// SET may still have been chosen from a different, unpinned view. This
+    /// is stated here rather than closed: closing it means threading a pin
+    /// into the search/candidate-selection path, out of scope for this
+    /// contract.
+    pub async fn pin_current_version(&self, record: ResultTableRecord) -> Result<PinnedSource> {
+        let Some(version) = record.current_version else {
+            let parquet_url = StorageUrl::parse(&record.parquet_path)?;
+            let digest = match self.read_materialization_manifest(&parquet_url).await? {
+                Some(m) => m.artifact,
+                None => {
+                    let handle = self.open_parquet(&parquet_url)?;
+                    let path = handle.data_path()?;
+                    let bytes = handle.get_bytes(&path).await?;
+                    ArtifactDigest::of_bytes(&bytes)
+                }
+            };
+            let anchor = InputAnchor::result_digest(&record.table_name, &digest);
+            return Ok(PinnedSource {
+                anchor,
+                version: None,
+                manifest: None,
+                record,
+            });
+        };
+        let unavailable = || JammiError::VersionUnavailable {
+            table: record.table_name.clone(),
+            version,
+        };
+        // The ONE admin-scope catalog read: both the anchor (`identity`
+        // below) and the read (the manifest fetched immediately after, then
+        // `pinned_provider`) derive from this single row.
+        let row = TenantBinding::admin_scope(
+            self.catalog
+                .get_result_table_version(&record.table_name, version),
+        )
+        .await?;
+        let identity = match row {
+            Some(r) if r.status == ResultTableStatus::Ready.to_string() => {
+                r.identity.unwrap_or_default()
+            }
+            _ => return Err(unavailable()),
+        };
+        let parquet_url = StorageUrl::parse(&record.parquet_path)?;
+        let manifest = self
+            .read_version_manifest(&record.table_name, &parquet_url, version)
+            .await?
+            .ok_or_else(unavailable)?;
+        let anchor = InputAnchor::result_digest(&record.table_name, &ArtifactDigest(identity));
+        Ok(PinnedSource {
+            anchor,
+            version: Some(version),
+            manifest: Some(manifest),
+            record,
+        })
+    }
+
+    /// The read every [`PinnedSource`] holder uses: rows that agree with
+    /// [`PinnedSource::input_anchor`] by construction, because both came
+    /// from [`Self::pin_current_version`]'s one resolve. UNREGISTERED, same
+    /// as the private `current_version_provider` this delegates to
+    /// for the unversioned arm: the caller reads it via
+    /// `ctx.read_table(provider)`, never registers it under `jammi.{table}`.
+    pub async fn pinned_provider(
+        &self,
+        ctx: &SessionContext,
+        pin: &PinnedSource,
+    ) -> Result<Arc<dyn TableProvider>> {
+        match &pin.manifest {
+            None => self.current_version_provider(ctx, &pin.record).await,
+            Some(manifest) => self.build_masked_provider(ctx, &pin.record, manifest).await,
         }
     }
 

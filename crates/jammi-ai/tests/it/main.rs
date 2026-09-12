@@ -38,6 +38,7 @@ mod merger;
 mod models;
 mod neighbor_graph;
 mod parallel_train;
+mod pinned_source_gate;
 mod pipeline;
 mod pooling_config;
 mod read_vectors;

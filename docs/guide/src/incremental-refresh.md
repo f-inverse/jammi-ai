@@ -67,10 +67,10 @@ same version identity, fragment digests and counts (K4).
 7. **Publish.** The version's manifest is written and one catalog transaction
    flips the version `building → ready` and moves the table's
    `current_version` forward. Two refreshes of one parent both allocate a
-   number; the second to publish fails with `CasFailed`, its version row is
-   marked `failed` and its artifacts are reaped. The previous version stays
-   live until the swap, so a refused or failed refresh never changes what a
-   reader sees.
+   number; the second to publish a BASE version finds its parent already
+   moved (`ParentMoved`) and absorbs it, proceeding with the concurrent
+   winner's version rather than failing. The previous version stays live
+   until the swap, so a refused refresh never changes what a reader sees.
 
 ## `RefreshReport`
 
@@ -189,7 +189,7 @@ fresh chain root.
 | `DefinitionDrift { recorded, current }` | The environment would produce a different definition | `recompute` |
 | `NotRefreshable { reason }` | No content hash, not ready, not an embedding table, or the current version is unavailable | `recompute` |
 | `VersionUnavailable { table, version }` | The current version's manifest cannot be resolved | `recompute` |
-| `CasFailed` | Another refresh published first | Retry; the other refresh's result is current |
+| `ParentMoved { .. }` | Another refresh already published against this parent | The base-publish arm absorbs it and proceeds with the concurrent winner's version — no retry needed |
 
 A storage object that vanishes under a running scan is the typed
 `Storage(StorageError::Io { source: object_store::Error::NotFound })`, never a

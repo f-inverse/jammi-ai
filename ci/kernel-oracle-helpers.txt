@@ -10,21 +10,48 @@
 #
 # Each entry is verified at gate time to have the CANONICAL shape: a real
 # RUNTIME env-read (std::env::var_os/var — option_env! is a COMPILE-TIME
-# read and is never accepted) of a JAMMI_REQUIRE_* name, via `if` or
-# `match` (an `if` condition must be exactly `<read>.is_some()`/`.is_ok()`
-# — no trailing/leading condition; a `match` arm must be unguarded), whose
+# read and is never accepted) of a JAMMI_REQUIRE_* name — a literal, or a
+# bare identifier resolved, same-file, to a `const NAME: &str = "...";`
+# whose value carries that prefix — via `if` or `match` (an `if` condition
+# may carry additional `&&`-joined conjuncts in ANY position — e.g. a
+# require-gate FOLDED INTO its own accessor legitimately leads with the
+# accessor's own not-already-satisfied check — but never a `||`, and never
+# a literal `true`/`false` conjunct; a `match` arm must be unguarded), whose
 # taken-when-set branch is EXACTLY ONE panic!/unreachable! statement — no
-# .expect(, no closures, nothing else. Verification is (file, fn)-SCOPED:
-# an entry only reviews the fn named `fn_name` DEFINED IN `file` itself
-# (never a same-named fn elsewhere), and fails if that file defines more
-# than one fn with that name (ambiguous — this scanner does not track
-# `mod` boundaries). A line that fails is a registry FAIL naming the
-# file:line and why. An exact duplicate `<file>::<fn_name>` line fails too.
-# Adding a line here is a reviewed PR diff, same discipline as a citation
-# or a `no-producer:` opt-out — the registry may only grow by entries the
-# shape-check accepts. A file that wants to call a SHARED helper it does
-# not itself define registers its own thin local wrapper of the same
-# canonical shape (gating is never cross-file by name alone).
+# .expect(, no closures, nothing else, however the condition is shaped.
+# Verification is (file, fn)-SCOPED: an entry only reviews the fn named
+# `fn_name` DEFINED IN `file` itself (never a same-named fn elsewhere), and
+# fails if that file defines more than one fn with that name (ambiguous —
+# this scanner does not track `mod` boundaries). A line that fails is a
+# registry FAIL naming the file:line and why. An exact duplicate
+# `<file>::<fn_name>` line fails too. Adding a line here is a reviewed PR
+# diff, same discipline as a citation or a `no-producer:` opt-out — the
+# registry may only grow by entries the shape-check accepts.
+#
+# `file` may carry a leading `shared:` prefix (`shared:<file>::<fn_name>`)
+# to opt a helper into CROSS-FILE gating: any OTHER file's skip may be
+# gated by a BARE call to the name (provided that calling file does not
+# itself define a same-named local fn — an unregistered local decoy must
+# never "borrow" the shared review) or by a CRATE-QUALIFIED call whose
+# qualifier is exactly the declaring file's own crate name (accepted
+# regardless of a local decoy, since the qualifier disambiguates). This is
+# for a require-gate FOLDED INTO the ONE accessor it guards — every caller
+# is gated for free, with no per-file wrapper to remember (the twelve-copy
+# duplication this gate exists to prevent in the first place). Two files
+# may never both register the same name `shared:` — ambiguous, a registry
+# FAIL. A file that wants to call a helper it does not itself define, and
+# that helper is NOT registered `shared:`, still registers its own thin
+# local wrapper of the same canonical shape (gating stays file-scoped by
+# default — `shared:` is an explicit, reviewed opt-in, never the default).
+#
+# An entry whose OWN body does not carry the canonical shape may still
+# verify by DELEGATION, one hop: a bare, SAME-FILE call to another name
+# that IS verified for that file (from an entry ABOVE it in this same
+# registry). This is for a same-file convenience wrapper that FORWARDS to
+# the real accessor (`let url = pg_url_for_tests()?;`) rather than reading
+# the env a second, independent time — the wrapper is exactly as safe a
+# skip-guard as the accessor it calls. One hop only; a wrapper of a
+# wrapper does not chain.
 # Known, deliberate, fail-CLOSED limitation (round-5 audit A2): gating
 # looks for a literal, BARE call to the registered NAME — `let g =
 # cuda_device; g();` (a same-file ALIAS binding, then calling the alias)
@@ -82,3 +109,32 @@ crates/jammi-kernels/tests/flash_torch_parity_f16.rs::f16_fixtures_present_or_sk
 crates/jammi-encoders/tests/esc076_comparable_eager_control.rs::esc076_trace_gate
 crates/jammi-bench/tests/finetune_run_media_smoke.rs::media_producer_require_gate
 crates/jammi-encoders/tests/bits_snapshot.rs::k4_snapshot_require_gate
+# #513: the require-gate for a live Postgres backend, FOLDED INTO the ONE
+# accessor every Postgres-backed test calls to obtain the URL at all
+# (jammi_test_utils::pg_url_for_tests) — replaces twelve copy-pasted
+# `require_live_pg`-shaped wrapper fns across jammi-db's and jammi-server's
+# test suites, none of them beside the accessor they guarded. `shared:`
+# because every one of those twelve (and future) callers must be gated
+# for free, with nothing to remember — reintroducing a per-file wrapper
+# here is exactly the failure mode this registration replaces.
+shared:crates/jammi-test-utils/src/lib.rs::pg_url_for_tests
+# `make_test_session` is a same-file convenience wrapper that FORWARDS to
+# `pg_url_for_tests` (`let url = pg_url_for_tests()?;`) rather than reading
+# the env itself — verified by DELEGATION (one hop to the entry directly
+# above, same file), not by its own body carrying a second, independent
+# env-read. `shared:` for the same reason as `pg_url_for_tests` — every
+# `#[test_case(BackendKind::Postgres)]`-parameterized caller across
+# jammi-db's test suite goes through this one fn.
+shared:crates/jammi-test-utils/src/lib.rs::make_test_session
+# Per-file `open_backend`/`build_backend`/`build_harness_with_*` wrappers —
+# each file's OWN copy, verified by DELEGATION (a bare or crate-qualified
+# call to the `shared:` `pg_url_for_tests`/`make_test_session` entries
+# above, possibly through another same-file wrapper — see
+# check_kernel_oracles.py's `verify_helper_registry` "delegation, resolved
+# to a FIXED POINT" doc). Not `shared:` — each is called only within its
+# own file.
+crates/jammi-db/tests/it/recovery.rs::open_backend
+crates/jammi-db/tests/it/segment.rs::open_backend
+crates/jammi-db/tests/it/sources.rs::build_backend
+crates/jammi-db/tests/it/trigger.rs::build_harness_with_broker
+crates/jammi-db/tests/it/trigger.rs::build_harness_with_in_memory_broker

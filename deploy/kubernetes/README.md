@@ -87,8 +87,11 @@ the loop stops and the process exits **0 when its own evidence confirms
 every lease was handed back, or exit code 3 when it does not** (the affected
 lease then falls to the expiry path instead of the idle-poll one — see
 `docs/guide/src/deploy-server.md`'s RELEASE section), so a successor claims
-the job within one `[worker] idle_poll_secs` (exit 0) or one `[lease]
-duration_secs` (exit 3), and it costs no attempt either way. Any signal while
+a CONFIRMED release (exit 0) within one `[worker] idle_poll_secs` at no
+attempt cost (`releases` offsets it in the `attempts - releases` cap); a
+DEGRADED release (exit 3) instead falls to the expiry path and costs one
+attempt (`attempts + 1`, `releases` untouched) within one `[lease]
+duration_secs`. Any signal while
 draining is a RELEASE. There is no engine-side timeout: the pod's
 `terminationGracePeriodSeconds` bounds a DRAIN, then SIGKILL.
 

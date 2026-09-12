@@ -15,6 +15,7 @@
 //! * a released training job is never finalized by the abandoned thread and
 //!   its `_resume` manifest epoch never advances.
 
+use std::future::Future;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -1026,6 +1027,190 @@ async fn release_and_stop_report_matches_release_job_leases_on_the_pair_that_act
     park.release();
     let _ = run.await.unwrap();
     leases_session.close().await;
+}
+
+/// Producer-driven P-2F "false" arm (contract `CONTRACT-OPS-fix5.md`,
+/// round 5): `stop_witnessed == false` requires BOTH `stop_resolved ==
+/// false` (this call's own `TakenHandle::take` lost the race — the handle
+/// was already taken) AND `state_witnessed == false` (the terminal-state
+/// watch fell back to the proxy read within one heartbeat). This is exactly
+/// "any signal while draining is a RELEASE" (`deploy-server.md`): a DRAIN
+/// (`stop_and_join`) already holds the handle and is waiting -- unbounded,
+/// by design -- for the in-flight job to finish, so a RELEASE racing it
+/// loses the handle and then times out waiting for a transition that the
+/// still-running DRAIN has not produced.
+///
+/// BOTH halves are made deterministic, never a wall-clock/scheduler race:
+/// the loop is parked mid-materialization with a REAL hold registered
+/// (`in_flight == 1`), keyed on this session's own `writer_id`
+/// (`jammi_db::store::mutable::test_hook`, the same mechanism and
+/// `#[serial_test::serial(materialization_park)]` key
+/// `release_mid_materialization_resumes_on_the_successor_without_backoff`
+/// uses above) rather than the process-global one-shot
+/// `training_test_hooks::arm_pause_before_spawn_blocking`, whose lack of
+/// per-test scoping was measured to let a DIFFERENT concurrently-running
+/// fine-tune test steal this test's park under full-suite load, silently
+/// turning the parked job into an ordinary one that finishes normally. And
+/// "the DRAIN wins the handle" is not left to whichever task the runtime
+/// happens to schedule first -- `stop_and_join`'s future is polled EXACTLY
+/// ONCE by hand, off the runtime, with a no-op waker. Its own body runs
+/// `request_stop()` then `TakenHandle::take()` synchronously, with no
+/// `.await` before the first one (`state_rx.wait_for(..).await`), so one
+/// poll is guaranteed to execute the take and then return `Pending` — this
+/// test's proof that the handle was actually taken, not an assumption about
+/// scheduling order. This is not a literal `stop_witnessed: false`
+/// construction; both booleans come from a real, running `EmbeddedWorker`.
+#[serial_test::serial(materialization_park)]
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_release_racing_an_in_flight_drain_reads_stop_unwitnessed() {
+    let (session, _dir) = session(FAST_TIMING).await;
+    let source = unique_patents(&session).await;
+    let writer_id = session.result_store().writer_id().to_string();
+    let parked = arm_materialization(MaterializationPoint::Materialization, &writer_id);
+    session
+        .enqueue(embedding_spec(&source).into(), 0)
+        .await
+        .unwrap();
+    let worker = spawn_worker(&session);
+    let shared = shared_of(&worker);
+    parked
+        .wait_parked()
+        .await
+        .expect("the loop's writer parks inside finish");
+    assert_eq!(
+        shared.in_flight(),
+        1,
+        "a real hold must be registered before this test's race means anything"
+    );
+
+    // The DRAIN: unbounded by design (`stop_and_join` waits for the
+    // in-flight job to finish). Polled exactly once, by hand, so the
+    // handle is DETERMINISTICALLY taken before `release_and_stop` ever
+    // runs -- exactly the state a genuine "SIGTERM then SIGINT before the
+    // drain lands" sequence produces, without racing the scheduler for it.
+    // Scoped in its own block: `std::pin::pin!`'s hidden local otherwise
+    // outlives this function's tail, keeping `worker` borrowed past the
+    // `drop(worker)` below.
+    let report = {
+        let mut drain_fut = std::pin::pin!(worker.stop_and_join());
+        let waker = std::task::Waker::noop();
+        let mut cx = std::task::Context::from_waker(waker);
+        assert!(
+            matches!(drain_fut.as_mut().poll(&mut cx), std::task::Poll::Pending),
+            "stop_and_join's synchronous prefix (request_stop + TakenHandle::take) \
+             must run to completion on its first poll and then suspend on the \
+             still-parked loop's watch -- it must not resolve immediately"
+        );
+
+        tokio::time::timeout(Duration::from_secs(5), worker.release_and_stop())
+            .await
+            .expect(
+                "a RELEASE that loses the handle race is bounded by one heartbeat, \
+                 never by the DRAIN it lost to",
+            )
+            .unwrap()
+        // `drain_fut` drops here, holding the taken handle right up to this
+        // point (the parked materialization never resumes on its own) --
+        // dropping it restores the loop task as `Abandoned` for
+        // `EmbeddedWorker::drop` to reap.
+    };
+    assert!(
+        !report.stop_witnessed,
+        "a RELEASE that lost the handle race to a still-running DRAIN must read \
+         stop UNWITNESSED, never fall back to a default `true`: {report:?}"
+    );
+
+    drop(worker);
+    parked.release();
+}
+
+/// Producer-driven `HoldReleaseOutcome::Unobserved` on the SESSION arm
+/// (contract `CONTRACT-OPS-fix5.md`, round 5): `runtime.rs`'s M1 table cites
+/// only `jammi-server`'s `liveness.rs` `healthz_flips_to_503_...` test for
+/// this determinant, and that test drives the WORKER arm
+/// (`EmbeddedWorker::release_and_stop`) only -- `InferenceSession::
+/// release_job_leases`'s identical `Err => Unobserved` collapse has no
+/// producer-driven oracle of its own. This drives it with the SAME
+/// technique `liveness.rs` uses on the worker arm (`LeaseKeeper::
+/// kill_thread_for_test`, a real dead keeper thread), applied to the
+/// worker-less session path, never a literal `HoldReleaseOutcome`
+/// construction.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn release_job_leases_is_unobserved_when_the_keeper_thread_is_dead() {
+    let (session, _dir) = session(FAST_TIMING).await;
+    assert!(session.lease_keeper().is_alive());
+    session.lease_keeper().kill_thread_for_test();
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+    while session.lease_keeper().is_alive() {
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "the keeper thread never died within the bound"
+        );
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+
+    let (holds, _sweep) = session.release_job_leases().await.unwrap();
+    assert_eq!(
+        holds,
+        HoldReleaseOutcome::Unobserved,
+        "a dead keeper thread must read as UNOBSERVED on the session arm too, \
+         never a zero-count `Observed`: {holds:?}"
+    );
+}
+
+/// Producer-driven `ReleaseSweep { jobs: None, building: Some(_) }`
+/// (contract `CONTRACT-OPS-fix5.md`, round 5): every existing sweep test
+/// that reaches an unconfirmed `ReleaseSweep` drops the `building` sweep
+/// (a linked building table); none drives the `jobs` sweep statement's own
+/// `Err` arm while `building` still confirms. This forces exactly that
+/// asymmetric shape from a REAL producer -- dropping the `jobs.releases`
+/// column (the same schema-level fault `lease_keeper.rs`'s
+/// `release_job_holds_reports_failed_from_a_real_backend_fault` uses) fails
+/// only `release_jobs_claimed_by`'s `UPDATE` (which writes that column);
+/// `release_building_tables_of_claimant`'s `UPDATE` touches
+/// `result_tables.lease_expires_at`, never `jobs.releases`, so it still
+/// succeeds and confirms.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn release_and_stops_second_sweep_reports_jobs_none_building_some_from_a_real_fault() {
+    use jammi_db::catalog::backend::{BackendImpl, TxOptions};
+    use jammi_db::catalog::backend_sqlite::SqliteBackend;
+
+    let (session, dir) = session(FAST_TIMING).await;
+    session.enqueue(fine_tune(1), 0).await.unwrap();
+    let worker = spawn_worker(&session);
+    let shared = shared_of(&worker);
+    wait_in_flight(&shared, 1).await;
+
+    let fault_conn = BackendImpl::Sqlite(
+        SqliteBackend::open(&dir.path().join("catalog.db"))
+            .await
+            .expect("second handle on the same catalog.db"),
+    );
+    fault_conn
+        .transaction(TxOptions::default(), |tx| {
+            Box::pin(async move {
+                tx.execute("ALTER TABLE jobs DROP COLUMN releases", &[])
+                    .await?;
+                Ok(())
+            })
+        })
+        .await
+        .expect("inject the fault");
+
+    let report = tokio::time::timeout(Duration::from_secs(10), worker.release_and_stop())
+        .await
+        .expect("RELEASE is bounded by two heartbeats")
+        .unwrap();
+    assert_eq!(
+        report.sweep_two.jobs, None,
+        "the jobs sweep statement itself must error under the real fault: {report:?}"
+    );
+    assert_eq!(
+        report.sweep_two.building,
+        Some(0),
+        "the building sweep never touches the dropped column, so it must \
+         still confirm: {report:?}"
+    );
 }
 
 /// R5(d)'s sibling: an inline `run_now` materialization (its `ResultTable`

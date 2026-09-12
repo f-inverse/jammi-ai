@@ -685,3 +685,109 @@ async fn release_job_holds_flips_lost_and_skips_inline_holds() {
         .await
         .unwrap();
 }
+
+/// Producer-driven `HoldRelease.failed > 0` (contract `CONTRACT-OPS-fix5.md`,
+/// round 5): the OPS round-4 enumeration in
+/// `crates/jammi-server/src/runtime.rs`'s M1 table declared this determinant
+/// (and the sibling `ReleaseSweep` `Err` arm below) NOT producer-driven,
+/// citing the absence of "a fault-injecting `CatalogBackend` implementation"
+/// and "no reliable way to force one from outside". Both claims are false:
+/// this test forces a genuine backend failure on the keeper's own
+/// already-pooled connection using ONLY surfaces this test tree already uses
+/// for schema-level fault injection
+/// (`crates/jammi-db/tests/it/migrations.rs`'s `DROP TABLE`/`ALTER TABLE`
+/// pattern, through the public `SqliteBackend::open` + `CatalogBackend::
+/// transaction`), with no new test double. Dropping the `releases` column
+/// makes every `release_job_lease` `UPDATE` fail at prepare time on the
+/// keeper's own connection — nothing else the keeper does (`renew_lease`)
+/// touches that column — so this drives the keeper's real per-hold `Err`
+/// arm, never a literal `HoldRelease` construction.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn release_job_holds_reports_failed_from_a_real_backend_fault() {
+    use jammi_db::catalog::backend::{BackendImpl, TxOptions};
+    use jammi_db::catalog::backend_sqlite::SqliteBackend;
+
+    let dir = tempdir().unwrap();
+    let catalog = seeded_catalog(dir.path()).await;
+    let job = |id: &'static str, execution: JobExecution| SubmitJobParams {
+        job_id: id,
+        kind: "fine_tune",
+        execution,
+        spec: "{}",
+        model_ref: Some("keeper-base::1"),
+        output_model_id: None,
+        model_source: None,
+        priority: 0,
+        ..Default::default()
+    };
+    catalog
+        .submit_job(job("rjhf-queued", JobExecution::Queued))
+        .await
+        .unwrap();
+    let lease = Duration::from_secs(3);
+    let queued = catalog
+        .claim_next("me", &["fine_tune"], lease)
+        .await
+        .unwrap()
+        .expect("queued claimed");
+
+    let keeper = keeper_for(dir.path().to_path_buf(), fast_intervals()).await;
+    let queued_hold = keeper.hold(LeaseTarget::Job {
+        job_id: "rjhf-queued".into(),
+        instance_id: "me".into(),
+        attempts: queued.attempts,
+    });
+
+    // The fault: drop the column the RELEASE `UPDATE` writes. A second
+    // handle onto the same file, exactly the technique
+    // `migrations.rs`'s DDL tests already use.
+    let fault_conn = BackendImpl::Sqlite(
+        SqliteBackend::open(&dir.path().join("catalog.db"))
+            .await
+            .expect("second handle on the same catalog.db"),
+    );
+    fault_conn
+        .transaction(TxOptions::default(), |tx| {
+            Box::pin(async move {
+                tx.execute("ALTER TABLE jobs DROP COLUMN releases", &[])
+                    .await?;
+                Ok(())
+            })
+        })
+        .await
+        .expect("inject the fault");
+
+    let outcome = keeper
+        .release_job_holds(fast_intervals().heartbeat())
+        .await
+        .expect("the pass itself still completes: this is a per-hold Err, not a pass Err");
+    assert_eq!(
+        outcome,
+        jammi_db::catalog::lease_keeper::HoldRelease {
+            released: 0,
+            not_required: 0,
+            failed: 1,
+            attempted: 1,
+        },
+        "a REAL backend failure on the release UPDATE must count as `failed`, \
+         never silently fold into `not_required`: {outcome:?}"
+    );
+    assert!(
+        !queued_hold.lost(),
+        "a failed release leaves the hold's lost flag unflipped — the exact \
+         operator-visible consequence the type exists to represent"
+    );
+
+    // The SAME fault, driving the sibling determinant the enumeration also
+    // declared uncoverable: the jobs sweep's own `Err` arm
+    // (`ReleaseSweep.jobs == None`) — `release_jobs_claimed_by`'s `UPDATE`
+    // writes the identical column.
+    let sweep = catalog.release_jobs_claimed_by("me").await;
+    assert!(
+        sweep.is_err(),
+        "the jobs sweep statement itself must error under the same fault, \
+         so `ReleaseSweep.jobs` reads `None` from a real producer: {sweep:?}"
+    );
+
+    keeper.shutdown_and_join(Duration::from_secs(10)).await.ok();
+}

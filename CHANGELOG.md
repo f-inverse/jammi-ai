@@ -92,9 +92,11 @@ workspace ships every publishable crate at the same
   row stays `running` with a NULL lease and `releases + 1`, a compute job's
   linked building-table lease with it — stops the loop and exits 0 when its
   own evidence confirms every lease was handed back, or exit code 3 when it
-  does not (the affected lease then falls to the expiry path instead); a
-  successor claims within one idle poll (exit 0) or one lease window (exit
-  3), and the job costs no attempt either way.
+  does not; a successor claims a CONFIRMED release within one idle poll at
+  no attempt cost (`releases` offsets it in the `attempts - releases` cap),
+  while a DEGRADED release's affected lease instead falls to the expiry
+  path and costs one attempt (`attempts + 1`, `releases` untouched) within
+  one lease window.
   `EmbeddedWorker::{begin_drain, stop_and_join -> StopOutcome,
   release_and_stop -> ReleaseReport, shared}`, `WorkerShared`, `LoopState`,
   `InferenceSession::{release_job_leases, close_worker_gate,

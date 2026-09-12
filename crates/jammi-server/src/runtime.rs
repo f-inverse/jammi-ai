@@ -1072,6 +1072,33 @@ impl BoundServer {
                 // result).and(peer_result)`): no hang risk in folding here —
                 // this exit precedes the worker gate opening, so no job is
                 // claimed and no detached trainer exists to wait on.
+                //
+                // UNCOVERED (contract `CONTRACT-OPS-fix5.md`, round 5): no
+                // test drives `health_task` or `peer_task` to `Err` on this
+                // exact preload-exit path, so this fold's own behavioural
+                // difference from discarding is unobserved — reverting it
+                // to `let _ = health_result; let _ = peer_result; return
+                // early;` (`early` already carries `outcome`) passes the
+                // whole `jammi-server` suite. The arm itself IS reached
+                // (`signal_during_preload_exits_without_serving`,
+                // `release_signal_during_preload_actually_releases`,
+                // `preload_of_an_unloadable_model_is_a_startup_error` all
+                // enter it), so this is not dead code — what is missing is a
+                // producer for either task's `Err`, which requires the
+                // listener's own accept loop to fail (`axum::serve` /
+                // tonic's `Server::serve_with_incoming_shutdown` returning
+                // `Err` from a live socket, not a task panic — the `Err`
+                // join arms above are already covered separately). ATTEMPTED:
+                // this codebase's only established OS-level fault-injection
+                // technique is `chmod` on a file
+                // (`crates/jammi-db/tests/it/reconcile.rs`), which does not
+                // apply to a TCP listener; forcing an accept-loop failure
+                // needs either raw-fd manipulation or a lowered
+                // `RLIMIT_NOFILE` on the whole test process, both of which
+                // are new fault-injection infrastructure this fix round does
+                // not add (and the rlimit route risks starving unrelated
+                // concurrently-running tests in the same process). Left
+                // uncovered rather than argued safe.
                 let _ = health_stop_tx.send(());
                 let health_result = match health_task.await {
                     Ok(r) => r,
@@ -2359,11 +2386,16 @@ mod audit_master_key_tests {
 /// `true`, re-collapsing the worker's and the session's per-hold `Err` back
 /// into `Observed(HoldRelease::default())`, and folding the keeper's
 /// per-hold `Err` back into `not_required`) left the WHOLE crate's suite
-/// green, counts identical to baseline. Every determinant, enumerated, and
-/// where its producer-driven oracle lives or why one does not exist yet:
+/// green, counts identical to baseline. The round-5 audit then measured
+/// each of those four collapses SEPARATELY (never combined) and found the
+/// producer half was in fact 1 of 4 observed, and refuted two of this
+/// table's own "NOT producer-driven" claims by execution in ~2 seconds
+/// using a technique already in this test tree — closed below. Every
+/// determinant, enumerated, and where its producer-driven oracle lives or
+/// why one does not exist yet:
 ///
-/// * **P-2B, `HoldReleaseOutcome::Unobserved`** (the keeper's per-hold pass
-///   could not be confirmed to run at all): producer-driven in
+/// * **P-2B, `HoldReleaseOutcome::Unobserved` (`Worker` arm)** (the keeper's
+///   per-hold pass could not be confirmed to run at all): producer-driven in
 ///   `jammi-server`'s `crates/jammi-server/tests/it/liveness.rs`
 ///   (`healthz_flips_to_503_within_one_heartbeat_after_the_keeper_thread_dies`)
 ///   — the test kills the real keeper thread with
@@ -2371,19 +2403,26 @@ mod audit_master_key_tests {
 ///   through `serve_with_signals`, and asserts the outcome the running
 ///   system actually returns is `ReleaseDegraded`. No literal `HoldRelease`
 ///   or `HoldReleaseOutcome` is constructed anywhere in that test.
+/// * **P-2B, `HoldReleaseOutcome::Unobserved` (`SessionOnly` arm)** — a
+///   SEPARATE producer from the bullet above, which drives the `Worker` arm
+///   only: producer-driven in `crates/jammi-ai/tests/it/jobs_shutdown.rs`
+///   (`release_job_leases_is_unobserved_when_the_keeper_thread_is_dead`),
+///   the identical `LeaseKeeper::kill_thread_for_test` technique applied to
+///   `InferenceSession::release_job_leases`'s own collapse.
 /// * **P-2B, `HoldRelease.failed > 0`** (a per-hold release attempt itself
-///   returning `Err` from `Catalog::release_job_lease`): NOT producer-driven.
-///   This requires a genuine backend/transaction failure on the keeper's own
-///   dedicated connection, and this codebase has no fault-injecting
+///   returning `Err` from `Catalog::release_job_lease`): producer-driven in
+///   `crates/jammi-db/tests/it/lease_keeper.rs`
+///   (`release_job_holds_reports_failed_from_a_real_backend_fault`). A prior
+///   round of this doc claimed this was uncoverable — "no fault-injecting
 ///   `CatalogBackend` implementation and no reliable way to force one from
-///   outside — sqlite's connection pool holds already-open file descriptors
-///   whose permission checks happened at `open()`, so an OS-level chmod
-///   fault (the technique `crates/jammi-db/tests/it/reconcile.rs` uses for
-///   filesystem writes) is not established to reach an already-pooled sqlite
-///   write path, and building a fault-injecting backend double is new test
-///   infrastructure this fix round does not add. Covered only by the
-///   literal `a_failed_hold_degrades_even_with_confirmed_sweeps` /
-///   `session_only_failed_hold_degrades` below.
+///   outside" — which was FALSE: a schema-level fault (`ALTER TABLE jobs
+///   DROP COLUMN releases`, through the public `SqliteBackend::open` +
+///   `CatalogBackend::transaction`, exactly the pattern
+///   `crates/jammi-db/tests/it/migrations.rs` already uses) makes every
+///   `release_job_lease` `UPDATE` fail at prepare time on the keeper's own
+///   pooled connection, with no new test double. The claim was closed in
+///   prose while the code stayed unobserved; the fix is the test, not the
+///   sentence.
 /// * **P-2B, `HoldRelease.not_required`** (a hold that provably did not need
 ///   releasing): producer-driven in
 ///   `crates/jammi-db/tests/it/lease_keeper.rs`
@@ -2404,31 +2443,48 @@ mod audit_master_key_tests {
 ///   sigint-while-draining and abort scenarios) and by the liveness test
 ///   above (a `Stopped` loop after the keeper dies still resolves the task).
 /// * **P-2F, `stop_witnessed == false`** (2e found nothing to take AND 2f's
-///   own observation fell back to the last-known proxy read): NOT
-///   producer-driven, and the design round's own falsifier attempting to
-///   construct this case was refuted by execution (round-4 audit,
-///   `probe-a.log`: asserting `stop_witnessed && holds.confirms_release()`
-///   inside `release_and_stop`/`release_job_leases` over the whole `ai` +
-///   `server` corpus never fired). `stop_resolved` is `true` on every arm
-///   where `TakenHandle::take` returns `Some` — including both abort arms —
-///   so the only path to `NothingToTake` is a handle already `Joined` by a
-///   prior stop attempt, and the in-task guard publishes its terminal state
-///   on every path before the task returns, so the watch's CURRENT value is
-///   already the terminal one by the time a second caller reads it — 2f's
-///   `wait_for` resolves on the current value with no need to observe a
-///   fresh transition. Reaching `state_witnessed == false` in that window
-///   would require the guard's publish and the task's return to be
-///   observably out of order, which the loop's own structure does not
-///   permit today. Covered only by the literal `an_unwitnessed_stop_degrades`
-///   below; if a future refactor ever reorders that publish, this predicate
-///   conjunct is the only thing standing between that regression and a
-///   silently-`Released` degraded shutdown.
-/// * **Sweep confirmation, `ReleaseSweep` field `None`** (a sweep statement
-///   itself returning `Err`): NOT producer-driven, for the same reason as
-///   the per-hold `failed` case above — `release_sweep`'s two `Err` arms
-///   require a genuine backend failure with no injection point in this
-///   codebase. Covered only by the literal `an_unconfirmed_second_sweep_
-///   degrades` / `session_only_unconfirmed_sweep_degrades` below.
+///   own observation fell back to the last-known proxy read): producer-driven
+///   in `crates/jammi-ai/tests/it/jobs_shutdown.rs`
+///   (`a_release_racing_an_in_flight_drain_reads_stop_unwitnessed`) — exactly
+///   "any signal while draining is a RELEASE" (`deploy-server.md`): a DRAIN
+///   (`stop_and_join`, unbounded by design) takes the handle — deterministically,
+///   via a single hand-driven poll rather than a scheduler race — and waits
+///   on an in-flight job the test parks mid-materialization with a real hold
+///   registered (`jammi_db::store::mutable::test_hook`, never a wall clock or
+///   the process-global `training_test_hooks::arm_pause_before_spawn_blocking`,
+///   which is not scoped per test and was measured to let a concurrently
+///   running fine-tune test steal the park), and a concurrent RELEASE loses
+///   the handle race (`stop_resolved == false`) and then times out at 2f
+///   within one heartbeat (`state_witnessed == false`) because the
+///   still-parked loop never transitions. A prior round of this doc claimed
+///   this arm was structurally unreachable; that argument is retracted in
+///   favour of the test — the reasoning was never wrong about the
+///   SINGLE-caller path, only about there being no second caller.
+/// * **Sweep confirmation, `ReleaseSweep.jobs == None`** (the jobs sweep
+///   statement itself returning `Err`): producer-driven in
+///   `crates/jammi-db/tests/it/lease_keeper.rs`
+///   (`release_job_holds_reports_failed_from_a_real_backend_fault`, which
+///   also asserts `Catalog::release_jobs_claimed_by` errors under the same
+///   fault) and end-to-end through a real `EmbeddedWorker::release_and_stop`
+///   in `crates/jammi-ai/tests/it/jobs_shutdown.rs`
+///   (`release_and_stops_second_sweep_reports_jobs_none_building_some_from_a_real_fault`),
+///   which also confirms `ReleaseSweep.building` is UNAFFECTED by the same
+///   fault (a different table, a different column) — the asymmetric shape
+///   `sweep_confirms_release`'s two conjuncts read independently. Pinned at
+///   the predicate itself by the literal
+///   `a_jobs_only_unconfirmed_second_sweep_degrades` /
+///   `session_only_jobs_only_unconfirmed_sweep_degrades` below: every
+///   PRE-EXISTING unconfirmed-sweep pin in this table used `building ==
+///   None`, so dropping the `jobs` conjunct out of `sweep_confirms_release`
+///   went unnoticed by every test in this file until this round.
+/// * **Sweep confirmation, `ReleaseSweep.building == None`** (the linked
+///   building-table sweep statement itself returning `Err`): NOT
+///   producer-driven — `release_building_tables_of_claimant`'s `UPDATE`
+///   writes only `result_tables.lease_expires_at`, so the `jobs.releases`
+///   schema fault above does not reach it, and no OTHER injection point into
+///   this statement is established. Covered only by the literal
+///   `an_unconfirmed_second_sweep_degrades` / `session_only_unconfirmed_
+///   sweep_degrades` below.
 /// * **Outer `Err`** (`ReleaseAttempt::Worker(Err(_))` /
 ///   `SessionOnly(Err(_))`): a single unconditional match arm with no
 ///   conjunct to collapse — a mutation deleting either arm's body is caught
@@ -2582,6 +2638,26 @@ mod release_outcome_tests {
         );
     }
 
+    /// The `SessionOnly` peer of `a_jobs_only_unconfirmed_second_sweep_
+    /// degrades`: the same asymmetric arm (`jobs == None`, `building ==
+    /// Some(_)`) no existing `SessionOnly` pin exercises either.
+    #[test]
+    fn session_only_jobs_only_unconfirmed_sweep_degrades() {
+        let holds = HoldReleaseOutcome::Observed(HoldRelease {
+            released: 0,
+            not_required: 0,
+            failed: 0,
+            attempted: 0,
+        });
+        assert_eq!(
+            release_outcome(ReleaseAttempt::SessionOnly(Ok((
+                holds,
+                sweep(None, Some(0))
+            )))),
+            ShutdownOutcome::ReleaseDegraded
+        );
+    }
+
     // -------------------------------------------------------------------
     // The newly folded determinants (P-2B, P-2F, P-EXCLUSION) — each of
     // these fails against the round-2 predicate ("success iff `Ok`").
@@ -2688,6 +2764,33 @@ mod release_outcome_tests {
             true,
             confirmed_sweep(),
             sweep(Some(0), None),
+        );
+        assert_eq!(
+            release_outcome(ReleaseAttempt::Worker(Ok(r))),
+            ShutdownOutcome::ReleaseDegraded
+        );
+    }
+
+    /// `sweep_confirms_release`'s TWO conjuncts fail independently
+    /// (contract `CONTRACT-OPS-fix5.md`, round 5): every existing
+    /// unconfirmed-sweep pin above (and `session_only_unconfirmed_sweep_
+    /// degrades` below) drops `building` and leaves `jobs` `Some`, so
+    /// dropping the `jobs` conjunct out of `sweep_confirms_release`
+    /// entirely went unnoticed. Pinned here on the arm none of those
+    /// exercise: `jobs == None`, `building == Some(_)`.
+    #[test]
+    fn a_jobs_only_unconfirmed_second_sweep_degrades() {
+        let r = report(
+            LoopState::Stopped,
+            HoldReleaseOutcome::Observed(HoldRelease {
+                released: 1,
+                not_required: 0,
+                failed: 0,
+                attempted: 1,
+            }),
+            true,
+            confirmed_sweep(),
+            sweep(None, Some(0)),
         );
         assert_eq!(
             release_outcome(ReleaseAttempt::Worker(Ok(r))),

@@ -334,6 +334,81 @@ async fn exact_search_refuses_a_wrong_width_query_typed_not_panic() {
     assert_eq!(hits[0].0, "near");
 }
 
+// A1b — a ZERO-width `FixedSizeList` scan column (a corrupt schema, not a
+// user query) is refused with a typed error naming the COLUMN, never
+// silently treated as a width of `0` against the query. The query here is
+// deliberately NON-EMPTY: an empty query would trivially match a width-0
+// column under the old, buggy conversion too (0 == 0), so it would prove
+// nothing. A non-empty query against a 0-width column is exactly the case
+// the old `usize::try_from(*n).unwrap_or(0)` mishandled — it would refuse
+// the query as "expected 0 dimensions" (blaming the CALLER's width, column
+// "query"), when the true defect is the corrupt scan schema itself (column
+// "vector"). Those are different failures; only the second is the fix.
+#[tokio::test]
+async fn exact_search_refuses_a_zero_width_scan_column_typed_not_a_width_of_zero() {
+    let dir = tempdir().unwrap();
+    let schema = embedding_table_schema(0);
+    // Only the SCHEMA's `FixedSizeList` width matters to the check under
+    // test (`exact_vector_search` inspects the scan's schema before reading
+    // any row), so an empty (zero-row) batch is enough — a zero-size list
+    // array's own length is ambiguous with any non-zero row count.
+    let item = Arc::new(Field::new("item", DataType::Float32, false));
+    let vector_col = FixedSizeListArray::try_new(
+        item,
+        0,
+        Arc::new(Float32Array::from(Vec::<f32>::new())),
+        None,
+    )
+    .unwrap();
+    let batch = RecordBatch::try_new(
+        Arc::clone(&schema),
+        vec![
+            Arc::new(StringArray::from(Vec::<String>::new())) as ArrayRef,
+            Arc::new(StringArray::from(Vec::<String>::new())),
+            Arc::new(StringArray::from(Vec::<String>::new())),
+            Arc::new(vector_col),
+            jammi_db::store::content_hash::null_hash_column(0),
+        ],
+    )
+    .unwrap();
+    let url = StorageUrl::parse(dir.path().join("zero_width.parquet").to_str().unwrap()).unwrap();
+    let registry = StorageRegistry::new();
+    let handle = JammiObjectStore::new(registry.driver_for(&url, None).unwrap(), url.clone());
+    let mut writer = ObjectParquetWriter::open(&handle, Arc::clone(&schema))
+        .await
+        .unwrap();
+    writer.write_batch(&batch).await.unwrap();
+    writer.close().await.unwrap();
+    let ctx = SessionContext::new();
+    ctx.register_parquet(
+        TableReference::bare("jammi.zero_width"),
+        url.as_str(),
+        ParquetReadOptions::default(),
+    )
+    .await
+    .unwrap();
+
+    // Non-empty: 4 components, against the corrupt 0-width scan column.
+    let err = exact_vector_search(&ctx, "zero_width", &vq(&[1.0, 0.0, 0.0, 0.0]), 1, None)
+        .await
+        .expect_err("a zero-width scan column must be refused, never treated as width 0");
+    match &err {
+        jammi_db::error::JammiError::Schema {
+            column, expected, ..
+        } => {
+            assert_eq!(
+                column, "vector",
+                "must name the corrupt SCAN column, not \"query\" (the old, wrong shape): {err:?}"
+            );
+            assert!(
+                expected.contains("positive"),
+                "names the corrupt column's own defect, not a query width like \"0 dimensions\": {expected}"
+            );
+        }
+        other => panic!("expected a typed Schema error naming the column: {other:?}"),
+    }
+}
+
 // B-c — a stored row with a non-finite component yields a non-finite
 // distance; the top-k SINK refuses it as a typed, table-named error. Never a
 // top-k slot (the comparator is non-transitive under NaN and could rank it

@@ -1230,8 +1230,15 @@ async fn release_and_stops_second_sweep_reports_jobs_none_building_some_from_a_r
 /// and no enqueued job: `InferenceSession::release_job_leases` reaches
 /// `release_sweep` directly, and the statement runs (and can fault) with
 /// nothing claimed.
+///
+/// Named `one_sweep`, never `second_sweep` (round 7): `release_job_leases`
+/// runs `release_sweep` exactly ONCE — there is no sweep #1 on this path to
+/// be "second" after — so this drives `ReleaseSweep.building == None` on
+/// the `SessionOnly` arm only. `EmbeddedWorker::release_and_stop`'s own
+/// sweep #2 (2g) reaching `building == None` from a real backend fault has
+/// no producer in this tree; that gap is still open.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn release_job_leases_second_sweep_reports_building_none_jobs_some_from_a_real_fault() {
+async fn release_job_leases_one_sweep_reports_building_none_jobs_some_from_a_real_fault() {
     use jammi_db::catalog::backend::{BackendImpl, TxOptions};
     use jammi_db::catalog::backend_sqlite::SqliteBackend;
 

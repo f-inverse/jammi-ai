@@ -733,21 +733,42 @@ pub enum ShutdownOutcome {
     /// neither certainly resolved nor genuinely observed, or one of its
     /// sweep statements failed (`jammi_ai::fine_tune::worker::
     /// ReleaseSweep::jobs`/`building` read `None`, a swallowed statement
-    /// failure, never fabricated into a claim of success). Whether a lease
-    /// still gets handed back is CONDITIONAL on which determinant degraded,
-    /// never universal (contract `CONTRACT-OPS-fix6.md`, round 6, correcting
-    /// round 5's operator sentence): when it is a sweep statement for that
-    /// lease's own table that read `None`, the lease truly was not written
-    /// and falls to the expiry path, so a successor reclaims it within one
-    /// lease window rather than one idle poll — but when the sweep itself
-    /// confirms (both fields `Some`) and only the hold-observation or
-    /// stop-witness evidence is missing (`Unobserved` holds, or
-    /// `stop_witnessed == false`), the `UPDATE` that hands the lease back
-    /// already ran and committed, so the lease IS NULL with `releases + 1`
-    /// and a successor claims it within one idle poll at no attempt cost —
-    /// the evidence gap is about hold bookkeeping or loop synchronization,
-    /// not about whether the row was released. `main` still exits the
-    /// process at once (exit code 3, distinct from [`Self::Released`]'s 0)
+    /// failure, never fabricated into a claim of success). Which lease, if
+    /// any, still gets handed back is CONDITIONAL on which determinant
+    /// degraded, and a degraded determinant is a state defined by MISSING
+    /// evidence — it gets a definite consequence only where the evidence
+    /// actually establishes one (contract `CONTRACT-OPS-fix7.md`, round 7,
+    /// correcting round 6's own conditional, whose second branch asserted a
+    /// confirmed lease state for an arm whose defining property is that the
+    /// lease state is not established):
+    ///
+    /// * the release call itself errored — nothing further is established;
+    ///   whether any lease this instance held was handed back is unknown.
+    /// * a sweep statement for a lease's own table read `None` (the one
+    ///   case with a definite, table-specific cost): that lease truly was
+    ///   not written by this release and falls to the expiry path. A `jobs`
+    ///   row costs one attempt (`attempts + 1`, `releases` untouched); the
+    ///   linked `building` row lives in `result_tables`, which carries no
+    ///   `attempts`/`releases` columns at all, so its cost is a one-time
+    ///   back-off, never an attempt.
+    /// * the per-hold pass is `Unobserved`, or reports a per-hold failure,
+    ///   while both sweep fields still read `Some`: every row the sweep
+    ///   itself matched — not under an active hold — IS released, since
+    ///   that is what its `UPDATE`'s own commit reports. Nothing is
+    ///   established about a row under an active hold at that moment; the
+    ///   sweep predicate never matches a held row, and the pass whose job
+    ///   it was to release that hold is exactly the one whose evidence is
+    ///   missing.
+    /// * `stop_witnessed == false` while both sweep fields still read
+    ///   `Some`: every row the sweep matched by the time it ran IS
+    ///   released. Nothing is established about a claim that commits AFTER
+    ///   the sweep runs — `stop_witnessed == false` means precisely that
+    ///   such a claim is not ruled out, and it is outside the sweep's
+    ///   predicate: a live lease with `releases` untouched, falling to the
+    ///   expiry path.
+    ///
+    /// `main` still exits the process at once (exit code 3, distinct from
+    /// [`Self::Released`]'s 0)
     /// — R6: an `Err` here must never propagate through the normal return
     /// path, which would hang on a detached trainer past its grace period
     /// and turn a degraded release into a kill.
@@ -2453,13 +2474,19 @@ mod audit_master_key_tests {
 ///   inline-claimed row's hold produces a genuine `Ok(false)` from
 ///   `Catalog::release_job_lease`.
 /// * **P-2B totality** (`released + not_required + failed == attempted`,
-///   `HoldRelease::attempted` — M5): the production pass's own `assert_eq!`
-///   (`crates/jammi-db/src/catalog/lease_keeper.rs`) is not itself bypassable
-///   from a test without corrupting the pass, so this is checked at the type
-///   level (`confirms_release_catches_an_undercounted_attempted` in
-///   `crates/jammi-ai/src/fine_tune/worker.rs`) with a literal — the pass
-///   that could produce an inconsistent value by construction refuses to
-///   emit one, which is the property, not a gap.
+///   `HoldRelease::attempted` — M5): whether the production pass's own
+///   `assert_eq!` (`crates/jammi-db/src/catalog/lease_keeper.rs`) can be
+///   bypassed from a test without corrupting the pass is UNCOVERED (R-A) —
+///   no test attempts it; the claim that it cannot is prose, not an
+///   executed falsification. The consumer-side check IS driven with a
+///   literal (`confirms_release_catches_an_undercounted_attempted` in
+///   `crates/jammi-ai/src/fine_tune/worker.rs`), which is what this bullet
+///   can actually stand behind: every iteration of
+///   `release_job_holds_on_thread` increments exactly one of
+///   `released`/`not_required`/`failed` against an `attempted` fixed before
+///   the loop starts, so a producer that reaches the consumer without
+///   panicking cannot emit an inconsistent value — but that is read from
+///   the pass's source, not measured by an attempt to break it.
 /// * **P-2F, `stop_witnessed == true`** via a genuine abort or join
 ///   (`stop_resolved`): producer-driven throughout
 ///   `crates/jammi-server/tests/it/serve_shutdown_modes.rs` (e.g. the
@@ -2502,21 +2529,27 @@ mod audit_master_key_tests {
 ///   went unnoticed by every test in this file until this round.
 /// * **Sweep confirmation, `ReleaseSweep.building == None`** (the linked
 ///   building-table sweep statement itself returning `Err`): producer-driven
-///   in `crates/jammi-ai/tests/it/jobs_shutdown.rs`
-///   (`release_job_leases_second_sweep_reports_building_none_jobs_some_from_a_real_fault`).
-///   A round-5 version of this doc declared this arm "NOT producer-driven
-///   ... no OTHER injection point into this statement is established",
-///   reasoning only about the COLUMN `release_building_tables_of_claimant`'s
-///   `UPDATE` WRITES (`result_tables.lease_expires_at`); that argument is
-///   retracted — the statement also NAMES a second table it reads FROM,
-///   `result_tables` itself, and renaming that table out from under the
-///   statement (the same public `SqliteBackend::open` +
-///   `CatalogBackend::transaction` surface the `jobs`-fault test above
-///   uses) faults it while `release_jobs_claimed_by` — which never touches
-///   `result_tables` — still confirms: the mirror image of the asymmetric
-///   shape above. Covered at the predicate itself by the literal
-///   `an_unconfirmed_second_sweep_degrades` / `session_only_unconfirmed_
-///   sweep_degrades` below.
+///   ON THE `SessionOnly` ARM ONLY, in `crates/jammi-ai/tests/it/jobs_shutdown.rs`
+///   (`release_job_leases_one_sweep_reports_building_none_jobs_some_from_a_real_fault`
+///   — named `one_sweep`, round 7, because `InferenceSession::release_job_leases`
+///   runs `release_sweep` exactly once; there is no sweep #1 on that path for
+///   this to be "second" after). A round-5 version of this doc declared this
+///   arm "NOT producer-driven ... no OTHER injection point into this
+///   statement is established", reasoning only about the COLUMN
+///   `release_building_tables_of_claimant`'s `UPDATE` WRITES
+///   (`result_tables.lease_expires_at`); that argument is retracted — the
+///   statement also NAMES a second table it reads FROM, `result_tables`
+///   itself, and renaming that table out from under the statement (the same
+///   public `SqliteBackend::open` + `CatalogBackend::transaction` surface
+///   the `jobs`-fault test above uses) faults it while
+///   `release_jobs_claimed_by` — which never touches `result_tables` —
+///   still confirms: the mirror image of the asymmetric shape above.
+///   STILL UNDRIVEN: `EmbeddedWorker::release_and_stop`'s own sweep #2 (2g)
+///   reaching `building == None` from a real backend fault, through a real
+///   worker loop — no test in this tree does that; only the `SessionOnly`
+///   arm's single sweep is producer-driven for this determinant. Covered at
+///   the predicate itself by the literal `an_unconfirmed_second_sweep_degrades`
+///   / `session_only_unconfirmed_sweep_degrades` below.
 /// * **Outer `Err`** (`ReleaseAttempt::Worker(Err(_))` /
 ///   `SessionOnly(Err(_))`): a single unconditional match arm with no
 ///   conjunct to collapse — a mutation deleting either arm's body is caught

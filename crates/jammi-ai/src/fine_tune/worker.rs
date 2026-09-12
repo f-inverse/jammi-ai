@@ -2432,7 +2432,12 @@ impl EmbeddedWorker {
     /// RELEASE — the one mechanism, identical on the library and the server
     /// (§3.4 2a–2h): hand every lease this loop holds back to the catalog and
     /// stop the loop at once, so a successor claims the in-flight job within
-    /// one idle poll (never one lease window) and the job costs no attempt.
+    /// one idle poll (never one lease window) and the job costs no attempt
+    /// — WHEN every determinant of the returned [`ReleaseReport`] confirms.
+    /// When one does not, whether a given lease was in fact handed back
+    /// depends on which determinant degraded and is not universal; see
+    /// [`ReleaseReport`]'s own fields and, for the exit-code consumer, the
+    /// server's `ShutdownOutcome::ReleaseDegraded` doc.
     ///
     /// In order:
     ///

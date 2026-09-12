@@ -300,11 +300,16 @@ impl PyDatabase {
     /// `release=False` (the default) is DRAIN: the embedded worker finishes
     /// its in-flight job, then the catalog is released. `release=True` is
     /// RELEASE — the engine's `EmbeddedWorker::release_and_stop` (or, with no
-    /// worker, `InferenceSession::release_job_leases`): every job lease this
+    /// worker, `InferenceSession::release_job_leases`): WHEN every
+    /// determinant of that call's report confirms, every job lease this
     /// process holds is handed back to the catalog at once and the loop is
     /// stopped, so the in-flight job is claimable by a successor within one
-    /// idle poll and costs no attempt; then the catalog is released. The
-    /// honest limit of the library arm: Python cannot exit its host process,
+    /// idle poll and costs no attempt; then the catalog is released. That
+    /// promise is not universal — whether a given lease was in fact handed
+    /// back on a call whose report does NOT confirm depends on which
+    /// determinant did not, never one outcome for every lease (see
+    /// `deploy-server.md`'s RELEASE section for the breakdown). The honest
+    /// limit of the library arm: Python cannot exit its host process,
     /// so a training thread already running keeps running until its next
     /// epoch boundary, where it bails without writing a bundle (its lease is
     /// gone); if that thread reaches finalize before a successor claims, the

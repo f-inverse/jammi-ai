@@ -94,14 +94,20 @@ workspace ships every publishable crate at the same
   own evidence confirms every lease was handed back, or exit code 3 when it
   does not; a successor claims a CONFIRMED release within one idle poll at
   no attempt cost (`releases` offsets it in the `attempts - releases` cap).
-  Whether a DEGRADED release (exit 3) still hands a given lease back is
-  conditional on which determinant degraded: when the sweep statement for
-  that lease's own table itself failed, the lease was never written and
-  falls to the expiry path, costing one attempt (`attempts + 1`, `releases`
-  untouched) within one lease window; but when the sweep confirms and only
-  the hold-observation or stop-witness evidence is missing, the lease was
-  already handed back (`releases + 1`, lease NULLed) and a successor claims
-  it within one idle poll at no attempt cost, same as a CONFIRMED release.
+  Whether a DEGRADED release (exit 3) still hands a given lease back depends
+  on WHICH determinant degraded, and a degraded determinant is defined by
+  missing evidence — it gets a definite consequence only where the evidence
+  establishes one: when the sweep statement for that lease's own table
+  itself failed, the lease was never written and falls to the expiry path,
+  costing one attempt (`attempts + 1`, `releases` untouched) for `jobs`, or
+  a one-time back-off for the linked `result_tables` row (which carries no
+  `attempts`/`releases` columns to increment); but when the sweep confirms and only
+  the hold-observation or stop-witness evidence is missing, every row the
+  sweep itself matched was already handed back (`releases + 1`, lease
+  NULLed) and a successor claims it within one idle poll at no attempt
+  cost — nothing is established about a row still under an active hold, or
+  about a claim that commits after the sweep runs; either keeps a live
+  lease and falls to the expiry path instead.
   `EmbeddedWorker::{begin_drain, stop_and_join -> StopOutcome,
   release_and_stop -> ReleaseReport, shared}`, `WorkerShared`, `LoopState`,
   `InferenceSession::{release_job_leases, close_worker_gate,

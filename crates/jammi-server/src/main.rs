@@ -196,9 +196,11 @@ async fn serve(args: ServeArgs) -> ExitCode {
             // through the normal return path below — mapping it to
             // `ExitCode::FAILURE` there would wait on the tokio runtime drop
             // for the same detached training thread `Released` above exists
-            // to never wait for; that would turn a degraded release (its
-            // affected lease falls to the expiry path, recovered within one
-            // lease window) into a SIGKILL past the grace period. Exit code
+            // to never wait for; that would turn a degraded release (whose
+            // per-lease outcome depends on WHICH determinant degraded —
+            // never a single universal one, see
+            // `ShutdownOutcome::ReleaseDegraded`'s doc) into a SIGKILL past
+            // the grace period. Exit code
             // 3 (distinct from 0/`Released`, 1/`FAILURE`, and the signal
             // codes) restores the machine-readable signal a plain `exit(0)`
             // here would otherwise erase: the only channel that survives

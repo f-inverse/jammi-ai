@@ -340,18 +340,39 @@ statement's own `Err`, read back as `None`) — that lease was never written
 and falls to the expiry path, so a successor reclaims it within one
 `[lease] duration_secs` rather than one idle poll.
 
-Exit code 3 (DEGRADED) does not by itself mean every lease fell to the
-expiry path — the process exits 3 whenever ANY determinant of a confirmed
-release is missing, and two of those determinants are evidence gaps, not
-release failures: when the keeper's per-hold pass could not be confirmed to
-run (`Unobserved`) or the loop's terminal state was not genuinely witnessed
-while its sweep statements both still confirm, the `UPDATE`s that hand the
-lease back already committed, so every such lease IS NULL with
-`releases + 1` and a successor claims it within one idle poll at no attempt
-cost — degraded exit code, confirmed release. Only when the sweep statement
-itself is what failed (the exception above) does the affected lease truly
-remain live and cost an attempt on the expiry path. The process still exits
-at once either way (exit code 3, never a hang).
+Exit code 3 (DEGRADED) does not by itself say which lease, if any, is still
+live — it means at least one determinant of a confirmed release is missing,
+and WHICH determinant is missing decides what is and is not established;
+there is no single consequence for "degraded":
+
+- The RELEASE call itself returned an error: nothing further is
+  established — whether any lease this instance held was handed back is
+  unknown.
+- A sweep statement for a given lease's own table itself failed (the
+  exception above): that is the one case with a definite, table-specific
+  cost. The `jobs` table costs one attempt (`attempts + 1`, `releases`
+  untouched) within one `[lease] duration_secs`; the linked `building` row
+  lives in `result_tables`, which carries no `attempts`/`releases` columns
+  at all, so its cost is the "backs off once" recovery documented above,
+  never an attempt.
+- The keeper's per-hold pass could not be confirmed to run (`Unobserved`),
+  or reported a per-hold failure, while both sweep statements still
+  confirm: every row the sweep itself matched — queued, not under an active
+  hold — is confirmed released, since that `UPDATE`'s own commit is what
+  the sweep's `Some` count reports. Nothing is established about a job
+  under an active hold at that moment: the sweep predicate never matches a
+  held row, and the pass whose job it was to release that hold is exactly
+  the one whose evidence is missing.
+- The loop's terminal state was not genuinely witnessed
+  (`stop_witnessed == false`) while both sweep statements still confirm:
+  every row the sweep matched by the time it ran is confirmed released.
+  Nothing is established about a claim that commits AFTER the sweep runs —
+  `stop_witnessed == false` means precisely that such a claim is not ruled
+  out, and a claim like that is outside the sweep's predicate, keeping a
+  live lease with `releases` untouched and falling to the expiry path, the
+  same shape as the exception above.
+
+The process still exits at once either way (exit code 3, never a hang).
 
 `jammi-server release [--pid N]` sends SIGINT to `N` (default 1, the
 container entrypoint) and exits 0 when the signal was sent — that is ALL its

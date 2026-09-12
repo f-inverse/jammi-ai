@@ -93,6 +93,24 @@ yum install protobuf-compiler gcc gcc-c++ pkg-config
 
 All other native libraries (lzma, zstd, zlib, sqlite) are vendored and compiled from source automatically. These tools are pre-installed in the devcontainer and CI images.
 
+Building `jammi-db` with the `postgres` or `mysql` source feature additionally
+requires OpenSSL's development headers: these features link a native TLS
+stack (`native-tls` -> OpenSSL) rather than `rustls`, and jammi-db does not
+vendor OpenSSL.
+
+```bash
+# Debian/Ubuntu
+apt-get install libssl-dev
+
+# RHEL/AlmaLinux
+yum install openssl-devel
+
+# macOS (Homebrew)
+brew install openssl pkg-config
+```
+
+See [Connect to PostgreSQL / MySQL](./external-sources.md#feature-flags).
+
 ## Python
 
 ```bash

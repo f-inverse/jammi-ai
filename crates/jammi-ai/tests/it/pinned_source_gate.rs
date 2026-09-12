@@ -1592,16 +1592,20 @@ fn no_new_unpinned_session_registration_literal() {
 
 #[test]
 fn falsification_anchor_shaped_return_is_detected() {
-    let src = r#"
+    let src = concat!(
+        r#"
         impl ResultStore {
-            pub async fn sneaky_anchor(
+"#,
+        // kernel-oracles: fn-in-literal reviewed: falsification fixture for `anchor_shaped_return_hits` — synthetic producer text fed to that detector, not real code in this file
+        r#"            pub async fn sneaky_anchor(
                 &self,
                 t: &ResultTableRecord,
             ) -> Result<InputAnchor> {
                 Ok(InputAnchor::result_digest("x", &digest))
             }
         }
-    "#;
+    "#,
+    );
     let surface = vec![("__probe__.rs".to_string(), src.to_string())];
     let hits = anchor_shaped_return_hits(&surface);
     assert_eq!(
@@ -1619,14 +1623,20 @@ fn falsification_anchor_shaped_return_ignores_non_anchor_signatures() {
     // as a PARAMETER (not a return type) and returns something else must
     // NOT fire — otherwise the detector would be vacuously triggered by any
     // function mentioning the identifier at all.
-    let src = r#"
-        pub async fn compare_anchor(&self, anchor: &InputAnchor) -> Result<CurrentAnchor> {
+    let src = concat!(
+        r#"
+"#,
+        // kernel-oracles: fn-in-literal reviewed: falsification fixture for `anchor_shaped_return_hits`'s negative control — synthetic producer text, not real code in this file
+        r#"        pub async fn compare_anchor(&self, anchor: &InputAnchor) -> Result<CurrentAnchor> {
             Ok(CurrentAnchor::Undecidable)
         }
-        pub fn benign(&self, anchor: &InputAnchor) -> bool {
+"#,
+        // kernel-oracles: fn-in-literal reviewed: same negative-control fixture's second synthetic function — not real code in this file
+        r#"        pub fn benign(&self, anchor: &InputAnchor) -> bool {
             true
         }
-    "#;
+    "#,
+    );
     let surface = vec![("__probe__.rs".to_string(), src.to_string())];
     let hits = anchor_shaped_return_hits(&surface);
     let names: Vec<&str> = hits.iter().map(|h| h.name.as_str()).collect();
@@ -1640,14 +1650,18 @@ fn falsification_anchor_shaped_return_ignores_non_anchor_signatures() {
 
 #[test]
 fn falsification_bare_record_version_branch_is_detected() {
-    let src = r#"
-        async fn sneaky_read(&self, table: &ResultTableRecord) -> Result<Vec<u8>> {
+    let src = concat!(
+        r#"
+"#,
+        // kernel-oracles: fn-in-literal reviewed: falsification fixture for `bare_record_version_branch_hits` — synthetic producer text fed to that detector, not real code in this file
+        r#"        async fn sneaky_read(&self, table: &ResultTableRecord) -> Result<Vec<u8>> {
             if let Some(v) = table.current_version {
                 return read_version(v).await;
             }
             Ok(vec![])
         }
-    "#;
+    "#,
+    );
     let surface = vec![("__probe__.rs".to_string(), src.to_string())];
     let hits = bare_record_version_branch_hits(&surface);
     assert_eq!(
@@ -1665,15 +1679,19 @@ fn falsification_bare_record_version_branch_ignores_explicit_version_param() {
     // re-deriving `.current_version` from a bare record) must not fire —
     // this is `resolve_version_manifest`'s own shape, clause 2(a), safe by
     // construction.
-    let src = r#"
-        pub async fn resolve_version_manifest(
+    let src = concat!(
+        r#"
+"#,
+        // kernel-oracles: fn-in-literal reviewed: falsification fixture for the explicit-version negative control — synthetic producer text fed to `bare_record_version_branch_hits`, not real code in this file
+        r#"        pub async fn resolve_version_manifest(
             &self,
             table: &ResultTableRecord,
             version: i64,
         ) -> Result<VersionManifest> {
             self.read_version_manifest(&table.table_name, version).await
         }
-    "#;
+    "#,
+    );
     let surface = vec![("__probe__.rs".to_string(), src.to_string())];
     let hits = bare_record_version_branch_hits(&surface);
     assert!(
@@ -1693,16 +1711,20 @@ fn falsification_self_fetched_record_version_is_detected() {
     // `String`. Measured by the round-7 audit with the gate's own detector
     // code compiled standalone: patterns 1-3 all return empty on this exact
     // shape.
-    let src = r#"
+    let src = concat!(
+        r#"
         impl ResultStore {
-            pub async fn anchor_identity_for(&self, table_name: &str) -> Result<Option<String>> {
+"#,
+        // kernel-oracles: fn-in-literal reviewed: falsification fixture for the self-fetched-record-version detector (round-7 audit's own escape shape) — synthetic producer text, not real code in this file
+        r#"            pub async fn anchor_identity_for(&self, table_name: &str) -> Result<Option<String>> {
                 let record = self.catalog.get_result_table(table_name).await?.unwrap();
                 let Some(version) = record.current_version else { return Ok(None); };
                 let row = self.catalog.get_result_table_version(table_name, version).await?;
                 Ok(row.and_then(|r| r.identity))
             }
         }
-    "#;
+    "#,
+    );
     let surface = vec![("__probe__.rs".to_string(), src.to_string())];
     let hits = self_fetched_record_version_hits(&surface);
     assert_eq!(
@@ -1750,14 +1772,18 @@ fn falsification_self_fetched_record_version_ignores_reviewed_delegation_and_par
     // as what it is: pattern 4 has a disclosed, uncovered blind spot for
     // ANY delegation to a differently-named helper (the module doc's own
     // "cross-function" limit), not a proof this shape is safe.
-    let src_delegates = r#"
+    let src_delegates = concat!(
+        r#"
         impl ResultStore {
-            pub async fn wraps_identity(&self, table_name: &str) -> Result<Option<String>> {
+"#,
+        // kernel-oracles: fn-in-literal reviewed: falsification fixture for pattern 4's reviewed-delegation control — synthetic producer text, not real code in this file
+        r#"            pub async fn wraps_identity(&self, table_name: &str) -> Result<Option<String>> {
                 let record = self.catalog.get_result_table(table_name).await?.unwrap();
                 self.current_version_identity(&record).await
             }
         }
-    "#;
+    "#,
+    );
     let surface = vec![("__probe__.rs".to_string(), src_delegates.to_string())];
     let hits = self_fetched_record_version_hits(&surface);
     assert!(
@@ -1787,14 +1813,18 @@ fn falsification_self_fetched_record_version_ignores_reviewed_delegation_and_par
     // precondition) rather than self-fetching it. Must not ALSO fire
     // pattern 4 — the two patterns partition the surface, they do not both
     // claim the same site.
-    let src_parameterized = r#"
-        async fn sneaky_read(&self, table: &ResultTableRecord) -> Result<Vec<u8>> {
+    let src_parameterized = concat!(
+        r#"
+"#,
+        // kernel-oracles: fn-in-literal reviewed: falsification fixture for pattern 4's negative control 2 — synthetic producer text fed to `self_fetched_record_version_hits`, not real code in this file
+        r#"        async fn sneaky_read(&self, table: &ResultTableRecord) -> Result<Vec<u8>> {
             if let Some(v) = table.current_version {
                 return read_version(v).await;
             }
             Ok(vec![])
         }
-    "#;
+    "#,
+    );
     let surface2 = vec![("__probe__.rs".to_string(), src_parameterized.to_string())];
     let hits2 = self_fetched_record_version_hits(&surface2);
     assert!(
@@ -1813,14 +1843,18 @@ fn falsification_generic_arrow_bound_region_is_found() {
     // `find_fn_regions`'s output — invisible to every detector despite a
     // return type that is literally `Result<InputAnchor>` (the round-7
     // audit's "P4 EVASION", reused verbatim).
-    let src = r#"
+    let src = concat!(
+        r#"
         impl ResultStore {
-            pub async fn anchor_with<F: Fn(&str) -> String>(&self, rec: &ResultTableRecord, f: F) -> Result<InputAnchor> {
+"#,
+        // kernel-oracles: fn-in-literal reviewed: falsification fixture for the generic-arrow-bound region finder — synthetic producer text (a `Fn(&str) -> String` trait bound), not real code in this file
+        r#"            pub async fn anchor_with<F: Fn(&str) -> String>(&self, rec: &ResultTableRecord, f: F) -> Result<InputAnchor> {
                 let v = rec.current_version.unwrap();
                 Ok(InputAnchor::result_digest(f(&rec.table_name), v))
             }
         }
-    "#;
+    "#,
+    );
     let masked = mask_non_code(src);
     let regions = find_fn_regions(&masked);
     assert_eq!(
@@ -1855,13 +1889,17 @@ fn falsification_generic_arrow_bound_does_not_break_plain_generics() {
     // no arrow (this file's own real surface carries plenty, e.g.
     // `find_matching<T>` a few hundred lines up) must still close at its
     // own `>`, not run away looking for a `->` that never comes.
-    let src = r#"
+    let src = concat!(
+        r#"
         impl Foo {
-            pub fn plain<T: Clone, U>(&self, a: T, b: U) -> Result<InputAnchor> {
+"#,
+        // kernel-oracles: fn-in-literal reviewed: falsification fixture for the plain-generics negative control — synthetic producer text, not real code in this file
+        r#"            pub fn plain<T: Clone, U>(&self, a: T, b: U) -> Result<InputAnchor> {
                 todo!()
             }
         }
-    "#;
+    "#,
+    );
     let masked = mask_non_code(src);
     let regions = find_fn_regions(&masked);
     assert_eq!(
@@ -1891,9 +1929,11 @@ fn falsification_session_registration_literal_binds_to_its_enclosing_function() 
     // "<module-scope>") — proving the site-binding fix actually attributes
     // the hit correctly rather than merely still finding it somewhere.
     let src = concat!(
+        // kernel-oracles: fn-in-literal reviewed: falsification fixture for the site-binding fix — synthetic producer text fed to `session_registration_literal_sites`, not real code in this file
         "fn one(table: &str) {\n",
         "    let a = TableReference::bare(format!(\"jammi.{}\", table));\n",
         "}\n",
+        // kernel-oracles: fn-in-literal reviewed: same site-binding fixture's second synthetic function — not real code in this file
         "fn two(table: &str) {\n",
         "    let b = TableReference::bare(format!(\"jammi.{}\", table));\n",
         "    let c = TableReference::bare(format!(\"jammi.{}\", table));\n",
@@ -1951,6 +1991,7 @@ fn mask_non_code_ignores_comments_and_string_braces() {
     // corrupting where `real`'s body is judged to end.
     let src = concat!(
         "// fn ignored_in_comment(x: ResultTableRecord) { x.current_version }\n",
+        // kernel-oracles: fn-in-literal reviewed: falsification fixture for `mask_non_code`'s brace-counting — synthetic producer text, not real code in this file
         "fn real(x: i32) -> i32 {\n",
         "    let s = format!(\"jammi.{}\", x);\n",
         "    let t = format!(\"{v}\", v = x);\n",

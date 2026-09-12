@@ -82,6 +82,12 @@ External source support requires feature flags when building from source:
 | MySQL | `mysql` |
 
 These are enabled by default in published crates and pre-built binaries.
+Building either feature from source links a native TLS stack
+(`native-tls` -> OpenSSL) rather than `rustls`, so it additionally requires
+OpenSSL's development headers on the build host — `libssl-dev` on
+Debian/Ubuntu, `openssl-devel` on RHEL/AlmaLinux, or `openssl` + `pkg-config`
+on macOS via Homebrew. See [Build dependencies
+(Linux)](./installation.md#build-dependencies-linux).
 
 ## Supported source types
 
